@@ -1510,7 +1510,9 @@ task_create_internal(
 
 	new_task->affinity_space = NULL;
 
+#if KPC
 	new_task->t_kpc = 0;
+#endif /* KPC */
 
 	new_task->pidsuspended = FALSE;
 	new_task->frozen = FALSE;
