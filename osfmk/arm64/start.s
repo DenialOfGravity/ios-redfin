@@ -463,6 +463,25 @@ LEXT(start_first_cpu)
 	mov		x20, x0
 	mov		x21, #0
 
+#if defined(SWEET)
+	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+	MOV64	x0, (0x9c000000 + 2368 * 4320)
+	mov		w1, #-1
+	mov		x2, #32
+	mov		x4, #4320
+Lsweet_mark_row:
+	mov		x3, #64
+	mov		x5, x0
+Lsweet_mark_pixel:
+	str		w1, [x5], #4
+	subs	x3, x3, #1
+	b.ne	Lsweet_mark_pixel
+	add		x0, x0, x4
+	subs	x2, x2, #1
+	b.ne	Lsweet_mark_row
+	dsb		sy
+#endif
+
 	// Set low reset vector before attempting any loads
 	adrp	x0, EXT(LowExceptionVectorBase)@page
 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
@@ -608,6 +627,23 @@ Lkernelcache_base_found:
 	/* Setup the KVA bootstrap mapping */
 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+
+#if defined(SWEET)
+	/*
+	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+	 * create_bootstrap_mapping would replace the RAM L2 table.
+	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+	 */
+	MOV64	x10, 0x9c000000
+	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+	orr		x11, x11, x10
+	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+	add		x13, x25, #(2 * PGBYTES)
+	str		x11, [x13, x12, lsl #TTE_SHIFT]
+#endif
 
 	/* Ensure TTEs are visible */
 	dsb		ish

@@ -56,6 +56,7 @@
 #include <pexpert/arm/consistent_debug.h>
 #include <pexpert/device_tree.h>
 #include <arm64/proc_reg.h>
+#include <arm64/sweet_early.h>
 #include <arm/pmap.h>
 #include <arm/caches_internal.h>
 #include <arm/cpu_internal.h>
@@ -346,6 +347,8 @@ arm_init(
 	DTEntry chosen = NULL;
 	unsigned int dt_entry_size = 0;
 
+	sweet_early_mark(1, "arm_init entered (MMU on)");
+
 	arm_setup_pre_sign();
 
 	arm_slide_rebase_and_sign_image();
@@ -362,6 +365,7 @@ arm_init(
 #endif /* defined(HAS_APPLE_PAC) */
 
 	PE_init_platform(FALSE, args); /* Get platform expert set up */
+	sweet_early_mark(2, "PE_init_platform done");
 
 #if __arm64__
 	configure_timer_apple_regs();
@@ -423,6 +427,7 @@ arm_init(
 #endif
 
 	ml_parse_cpu_topology();
+	sweet_early_mark(3, "ml_parse_cpu_topology done");
 
 
 	master_cpu = ml_get_boot_cpu_number();
@@ -453,11 +458,13 @@ arm_init(
 	 */
 	thread->machine.preemption_count = 0;
 	cpu_bootstrap();
+	sweet_early_mark(4, "cpu_bootstrap done");
 
 	rtclock_early_init();
 
 	kernel_debug_string_early("kernel_startup_bootstrap");
 	kernel_startup_bootstrap();
+	sweet_early_mark(5, "kernel_startup_bootstrap done");
 
 	/*
 	 * Initialize the timer callout world
@@ -466,6 +473,7 @@ arm_init(
 
 	cpu_init();
 
+	sweet_early_mark(6, "cpu_init done");
 	processor_bootstrap();
 
 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
@@ -513,6 +521,7 @@ arm_init(
 	__builtin_arm_wsr("pan", 1);
 #endif  /* __ARM_PAN_AVAILABLE__ */
 
+	sweet_early_mark(7, "entering arm_vm_init");
 	arm_vm_init(xmaxmem, args);
 
 	if (debug_boot_arg) {

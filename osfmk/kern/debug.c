@@ -84,6 +84,9 @@
 #include <stdatomic.h>
 #include <sys/pgo.h>
 #include <console/serial_protos.h>
+#if defined(__arm64__)
+#include <arm64/sweet_early.h>
+#endif
 #include <IOKit/IOBSD.h>
 
 #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
@@ -1068,6 +1071,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
     uint64_t panic_options_mask, void *panic_data_ptr, unsigned long panic_caller)
 {
 #pragma clang diagnostic pop
+
+#if defined(SWEET)
+	/* No CPU/thread/debugger state is required for this first panic copy. */
+	sweet_early_panic(panic_format_str, panic_args);
+#endif
 
 #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
 	read_lbr();

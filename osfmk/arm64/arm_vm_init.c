@@ -41,6 +41,7 @@
 #include <machine/atomic.h>
 #include <arm64/proc_reg.h>
 #include <arm64/lowglobals.h>
+#include <arm64/sweet_early.h>
 #include <arm/cpu_data_internal.h>
 #include <arm/misc_protos.h>
 #include <pexpert/arm64/boot.h>
@@ -2145,6 +2146,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	ml_enable_monitor();
 
+	/* The framebuffer VA=PA mapping belongs to the outgoing TTBR0. */
+	sweet_early_disable();
 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
 
 	flush_mmu_tlb();
