@@ -47,7 +47,8 @@ typedef enum serial_device {
 	SERIAL_DOCKCHANNEL=0x2,
 	SERIAL_PI3_UART=0x4,
 	SERIAL_VMAPPLE_UART=0x8,
-	SERIAL_DCC_UART=0x10
+	SERIAL_DCC_UART=0x10,
+	SERIAL_SWEET_FBCON=0x20
 } serial_device_t;
 
 kern_return_t serial_irq_enable(serial_device_t device);
