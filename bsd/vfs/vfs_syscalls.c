@@ -7264,7 +7264,7 @@ readlinkat_internal(vfs_context_t ctx, int fd, vnode_t lnk_vp, user_addr_t path,
 	uio_t auio;
 	int error;
 	struct nameidata nd;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	bool put_vnode;
 
 	if (bufsize > INT32_MAX) {
@@ -10317,7 +10317,7 @@ getdirentries_common(int fd, user_addr_t bufp, user_size_t bufsize, ssize_t *byt
 	int spacetype = proc_is64bit(vfs_context_proc(&context)) ? UIO_USERSPACE64 : UIO_USERSPACE32;
 	off_t loff;
 	int error, numdirent;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 get_from_fd:
 	error = fp_getfvp(vfs_context_proc(&context), fd, &fp, &vp);
@@ -10616,7 +10616,7 @@ getdirentriesattr(proc_t p, struct getdirentriesattr_args *uap, int32_t *retval)
 	struct attrlist attributelist;
 	vfs_context_t ctx = vfs_context_current();
 	int fd = uap->fd;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	kauth_action_t action;
 
 	AUDIT_ARG(fd, fd);
@@ -10957,7 +10957,7 @@ searchfs(proc_t p, struct searchfs_args *uap, __unused int32_t *retval)
 	size_t mallocsize;
 	uint32_t nameiflags;
 	vfs_context_t ctx = vfs_context_current();
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 	/* Start by copying in fsearchblock parameter list */
 	if (IS_64BIT_PROCESS(p)) {
@@ -12909,7 +12909,7 @@ getxattr(proc_t p, struct getxattr_args *uap, user_ssize_t *retval)
 	size_t namelen;
 	u_int32_t nameiflags;
 	int error;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 	if (uap->options & (XATTR_NOSECURITY | XATTR_NODEFAULT)) {
 		return EINVAL;
@@ -12993,7 +12993,7 @@ fgetxattr(proc_t p, struct fgetxattr_args *uap, user_ssize_t *retval)
 	size_t attrsize = 0;
 	size_t namelen;
 	int error;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
 		return EINVAL;
@@ -13041,7 +13041,7 @@ out:
 struct setxattr_ctx {
 	struct nameidata nd;
 	char attrname[XATTR_MAXNAMELEN + 1];
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 };
 
 /*
@@ -13137,7 +13137,7 @@ fsetxattr(proc_t p, struct fsetxattr_args *uap, int *retval)
 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
 	size_t namelen;
 	int error;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
 		return EINVAL;
@@ -13314,7 +13314,7 @@ listxattr(proc_t p, struct listxattr_args *uap, user_ssize_t *retval)
 	size_t attrsize = 0;
 	u_int32_t nameiflags;
 	int error;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 	if (uap->options & (XATTR_NOSECURITY | XATTR_NODEFAULT)) {
 		return EINVAL;
@@ -13356,7 +13356,7 @@ flistxattr(proc_t p, struct flistxattr_args *uap, user_ssize_t *retval)
 	int spacetype = proc_is64bit(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
 	size_t attrsize = 0;
 	int error;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 
 	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
 		return EINVAL;

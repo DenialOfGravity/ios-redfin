@@ -303,7 +303,7 @@ dofileread(vfs_context_t ctx, struct fileproc *fp,
     user_addr_t bufp, user_size_t nbyte, off_t offset, int flags,
     user_ssize_t *retval)
 {
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	uio_t uio;
 	int spacetype;
 
@@ -350,7 +350,7 @@ static int
 read_internal(struct proc *p, int fd, user_addr_t buf, user_size_t nbyte,
     off_t offset, int flags, user_ssize_t *retval)
 {
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	uio_t uio;
 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
 
@@ -631,7 +631,7 @@ dofilewrite(vfs_context_t ctx, struct fileproc *fp,
     user_addr_t bufp, user_size_t nbyte, off_t offset, int flags,
     user_ssize_t *retval)
 {
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	uio_t uio;
 	int spacetype;
 
@@ -678,7 +678,7 @@ int
 write_internal(struct proc *p, int fd, user_addr_t buf, user_size_t nbyte,
     off_t offset, int flags, guardid_t *puguard, user_ssize_t *retval)
 {
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	uio_t uio;
 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
 

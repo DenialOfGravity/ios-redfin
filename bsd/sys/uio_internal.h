@@ -172,6 +172,14 @@ __END_DECLS
 
 typedef char __attribute__((aligned(_Alignof(union iovecs)))) uio_stackbuf_t;
 
+/*
+ * UIO_STACKBUF - declare a correctly sized and aligned stack buffer for
+ *	uio_createwithbuffer(). Backported from later xnu: newer clang rejects
+ *	arrays of the over-aligned uio_stackbuf_t.
+ */
+#define UIO_STACKBUF(name, niov) \
+	uint64_t name[(UIO_SIZEOF(niov) + sizeof(uint64_t) - 1) / sizeof(uint64_t)]
+
 #define UIO_IS_USER_SPACE32( a_uio_t )  \
 	( (a_uio_t)->uio_segflg == UIO_USERSPACE32 || (a_uio_t)->uio_segflg == UIO_PHYS_USERSPACE32 || \
 	  (a_uio_t)->uio_segflg == UIO_USERISPACE32 )

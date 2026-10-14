@@ -878,7 +878,7 @@ static int
 setattrlist_setfinderinfo(vnode_t vp, char *fndrinfo, struct vfs_context *ctx)
 {
 	uio_t   auio;
-	uio_stackbuf_t    uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	int     error;
 
 	if ((auio = uio_createwithbuffer(1, 0, UIO_SYSSPACE, UIO_WRITE, uio_buf, sizeof(uio_buf))) == NULL) {
@@ -1847,7 +1847,7 @@ attr_pack_common(vfs_context_t ctx, mount_t mp, vnode_t vp, struct attrlist *alp
 		error = 0;
 		if (vp && !is_bulk) {
 			uio_t   auio;
-			uio_stackbuf_t    uio_buf[UIO_SIZEOF(1)];
+			UIO_STACKBUF(uio_buf, 1);
 
 			if ((auio = uio_createwithbuffer(1, 0, UIO_SYSSPACE,
 			    UIO_READ, uio_buf, sizeof(uio_buf))) == NULL) {
@@ -3120,7 +3120,7 @@ getattrlist_internal(vfs_context_t ctx, vnode_t vp, struct attrlist  *alp,
 	int             pack_invalid;
 	int             vtype = 0;
 	uio_t           auio;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	// must be true for fork attributes to be used as new common attributes
 	const int use_fork = (options & FSOPT_ATTR_CMN_EXTENDED) != 0;
 
@@ -3474,7 +3474,7 @@ refill_fd_direntries(vfs_context_t ctx, vnode_t dvp, struct fd_vn_data *fvd,
     int *eofflagp)
 {
 	uio_t rdir_uio;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	size_t rdirbufsiz;
 	size_t rdirbufused;
 	int eofflag;
@@ -4048,7 +4048,7 @@ getattrlistbulk(proc_t p, struct getattrlistbulk_args *uap, int32_t *retval)
 	enum uio_seg segflg;
 	int count;
 	uio_t auio = NULL;
-	uio_stackbuf_t uio_buf[UIO_SIZEOF(1)];
+	UIO_STACKBUF(uio_buf, 1);
 	kauth_action_t action;
 	int eofflag;
 	uint64_t options;
