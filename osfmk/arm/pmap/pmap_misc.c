@@ -38,6 +38,19 @@
  */
 
 
+#if SCHED_HYGIENE_DEBUG && (DEVELOPMENT || DEBUG) && !XNU_MONITOR
+/*
+ * sweet: pmap.h declares this out of line for these configs, but the only
+ * definition ships in Apple's closed per-SoC pmap. Without the PPL there is
+ * no extra state to check.
+ */
+bool
+pmap_pending_preemption(void)
+{
+	return _pmap_pending_preemption_real();
+}
+#endif /* SCHED_HYGIENE_DEBUG && (DEVELOPMENT || DEBUG) && !XNU_MONITOR */
+
 void
 pmap_abandon_measurement(void)
 {

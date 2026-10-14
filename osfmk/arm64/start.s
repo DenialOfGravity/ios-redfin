@@ -198,8 +198,8 @@ Lskip_cpu_reset_handler:
 	.align 3
 	.global EXT(LowResetVectorEnd)
 LEXT(LowResetVectorEnd)
-	.global	EXT(SleepToken)
 #if WITH_CLASSIC_S2R
+	.global	EXT(SleepToken)
 LEXT(SleepToken)
 	.space	(stSize_NUM),0
 #endif

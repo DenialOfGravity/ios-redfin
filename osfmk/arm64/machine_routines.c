@@ -2164,6 +2164,18 @@ ml_get_decrementer(void)
 	return dec;
 }
 
+#if defined(SWEET)
+/*
+ * sweet: arm_vm_init() calls this unconditionally; Apple's definition (it
+ * enters the PPL/monitor) ships only in the closed per-SoC library. There is
+ * no monitor on SWEET.
+ */
+void
+ml_enable_monitor(void)
+{
+}
+#endif /* SWEET */
+
 boolean_t
 ml_get_timer_pending(void)
 {
