@@ -442,7 +442,7 @@ struct pmap {
 #if HAS_APPLE_PAC
 	bool disable_jop;
 #else
-	bool reserved10;
+	bool reserved10b;       /* was a second "reserved10": clashes when !CONFIG_ROSETTA */
 #endif /* HAS_APPLE_PAC */
 
 	bool reserved11;
