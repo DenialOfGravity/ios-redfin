@@ -745,11 +745,11 @@ common_start:
 	MSR_SCTLR_EL1_X0
 	isb		sy
 
-#if !VMAPPLE
+#if !VMAPPLE && !defined(SWEET)
 	MOV64   x1, SCTLR_EL1_DEFAULT
 	cmp		x0, x1
 	bne		.
-#endif /* !VMAPPLE */
+#endif /* !VMAPPLE && !SWEET */
 
 #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
 	/* Watchtower

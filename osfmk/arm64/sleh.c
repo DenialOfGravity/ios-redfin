@@ -32,6 +32,7 @@
 #include <arm/misc_protos.h>
 #include <arm/thread.h>
 #include <arm/rtclock.h>
+#include <arm/machine_cpu.h>
 #include <arm/trap.h> /* for IS_ARM_GDB_TRAP() et al */
 #include <arm64/proc_reg.h>
 #include <arm64/machine_machdep.h>
@@ -1855,6 +1856,42 @@ sleh_irq(arm_saved_state_t *state)
 #endif
 
 
+#if defined(SWEET)
+	/*
+	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+	 */
+	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+
+	if (intid >= 1020 && intid <= 1023) {
+		return; /* spurious */
+	}
+	if (intid == SWEET_VTIMER_INTID) {
+		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+		cdp->cpu_decrementer = -1; /* Large */
+		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+		rtclock_intr(TRUE);
+		INTERRUPT_MASKED_DEBUG_END();
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+	} else if (intid < 16) {
+		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+		/* Ack before handling so an IPI raised meanwhile is not lost */
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+		__builtin_arm_isb(ISB_SY);
+		cpu_signal_handler();
+	} else {
+		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+		if (cdp->interrupt_handler) {
+			cdp->interrupt_handler(cdp->interrupt_target,
+			    cdp->interrupt_refCon,
+			    cdp->interrupt_nub,
+			    intid);
+		}
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+	}
+	__builtin_arm_isb(ISB_SY);
+#else
 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
 
 #if USE_APPLEARMSMP
@@ -1866,6 +1903,7 @@ sleh_irq(arm_saved_state_t *state)
 	    cdp->interrupt_nub,
 	    cdp->interrupt_source);
 #endif
+#endif /* SWEET */
 
 	entropy_collect();
 

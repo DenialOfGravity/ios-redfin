@@ -141,11 +141,25 @@ pe_init_fiq()
 		}
 	}
 
+#if defined(SWEET)
+	/*
+	 * Real hardware with two security states: Group 0 is TrustZone's and
+	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
+	 * from the non-secure side even after this write; delivery still works.
+	 */
+	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
+	for (unsigned int i = 0; i < 32; i += 4) {
+		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+	}
+	gicr_write32(GICR_ISENABLER0, (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
+#else
 	// Configure timers and legacy FIQ to be group 0
 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
 
 	// Enable PPI 27
 	gicr_write32(GICR_ISENABLER0, (1 << 27));
+#endif /* SWEET */
 
 	// Enable system register access
 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
@@ -153,8 +167,12 @@ pe_init_fiq()
 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
 	__builtin_arm_isb(ISB_SY);
 
+#if defined(SWEET)
+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+#else
 	// Set priority masks and binary point for group 0
 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
+#endif /* SWEET */
 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
 
 	// Set EOI mode of this processor
@@ -162,12 +180,24 @@ pe_init_fiq()
 	icc_ctlr &= ~ICC_CTLR_EOIMODE;
 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
 
+#if defined(SWEET)
+	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
+	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
+	gicd_write32(GICD_CTLR, gicd_ctlr);
+	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+		;
+	}
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+	__builtin_arm_isb(ISB_SY);
+#else
 	// Enable the forwarding of the vtimer interrupt
 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
 	gicd_write32(GICD_CTLR, gicd_ctlr);
 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
 	__builtin_arm_isb(ISB_SY);
+#endif /* SWEET */
 }
 #else
 void

@@ -97,6 +97,17 @@
 #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
 #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
 
+#ifdef ARM64_BOARD_CONFIG_SWEET
+#include <pexpert/arm64/SWEET.h>
+
+#define MAX_L2_CLINE                   6
+#define MAX_CPUS                       8
+#define MAX_CPU_CLUSTERS               1
+
+#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+
+#endif  /* ARM64_BOARD_CONFIG_SWEET */
+
 #ifdef ARM64_BOARD_CONFIG_VMAPPLE
 #include <pexpert/arm64/VMAPPLE.h>
 
