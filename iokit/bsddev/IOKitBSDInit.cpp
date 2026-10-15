@@ -766,6 +766,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
 		}
 	}
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+//
+//	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+//
+	if (strcmp(rdBootVar, "ufsroot0") == 0) {
+		extern int sweet_ufs_rootdev(dev_t *dev);
+		OSSafeReleaseNULL(matching);
+		int ufs_error = sweet_ufs_rootdev(root);
+		if (ufs_error) {
+			panic("IOFindBSDRoot: SWEET UFS root %s unavailable: %d", rdBootVar, ufs_error);
+		}
+		strlcpy(rootName, rdBootVar, rootNameSize);
+		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+		*oflags = 0;
+		goto iofrootx;
+	}
+#endif
+
 //
 //	Now check if we are trying to root on a memory device
 //
