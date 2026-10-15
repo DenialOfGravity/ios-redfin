@@ -38,6 +38,9 @@
 #include <sys/malloc.h>
 #include <sys/mount_internal.h>
 #include <sys/vnode_internal.h>
+#include <sys/buf.h>
+#include <mach-o/loader.h>
+#include <mach-o/fat.h>
 
 static LCK_GRP_DECLARE(mockfs_mtx_grp, "mockfs-mutex");
 
@@ -61,6 +64,43 @@ int mockfs_init(__unused struct vfsconf * vfsc);
  *
  * Returns 0 on success, or an error.
  */
+/*
+ * mockfs_check_macho:
+ *   mockfs serves the whole root device as one executable, so it would claim
+ *   any device. Accept only a Mach-O (thin or fat) image, so that a device
+ *   holding a real filesystem is left to the next filesystem in mountroot.
+ */
+static int
+mockfs_check_macho(vnode_t rvp)
+{
+	buf_t bp = NULL;
+	uint32_t magic = 0;
+	int error;
+
+	error = (int)buf_meta_bread(rvp, 0, DEV_BSIZE, NOCRED, &bp);
+	if (!error) {
+		memcpy(&magic, (const void *)buf_dataptr(bp), sizeof(magic));
+		switch (magic) {
+		case MH_MAGIC:
+		case MH_CIGAM:
+		case MH_MAGIC_64:
+		case MH_CIGAM_64:
+		case FAT_MAGIC:
+		case FAT_CIGAM:
+			break;
+		default:
+			error = EINVAL;
+			break;
+		}
+	}
+	if (bp) {
+		/* Do not leave a DEV_BSIZE block cached for the next filesystem's reads. */
+		buf_markinvalid(bp);
+		buf_brelse(bp);
+	}
+	return error;
+}
+
 int
 mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
 {
@@ -72,9 +112,12 @@ mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
 	dk_memdev_info_t memdev_info;
 
 	/*
-	 * TODO: Validate that the device at least LOOKS like a mach-o (has a sane header); this would prevent us
-	 *   from causing EBADMACHO panics further along the boot path.
+	 * Validate that the device at least LOOKS like a mach-o (has a sane header); this prevents us from
+	 *   claiming devices that hold real filesystems, and from causing EBADMACHO panics further along the boot path.
 	 */
+	if ((rvalue = mockfs_check_macho(rvp))) {
+		return rvalue;
+	}
 
 	/*
 	 * There are no M_MOCKFS* definitions at the moment, just use M_TEMP.

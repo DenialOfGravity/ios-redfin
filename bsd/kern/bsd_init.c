@@ -691,6 +691,12 @@ bsd_init(void)
 	bsd_init_kprintf("calling vfsinit\n");
 	vfsinit();
 
+#if SWEET_HFS
+	/* HFS is built in on SWEET: register it like its kext would, before mounting root. */
+	extern void sweet_hfs_register(void);
+	sweet_hfs_register();
+#endif
+
 #if CONFIG_PROC_UUID_POLICY
 	/* Initial proc_uuid_policy subsystem */
 	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
