@@ -32,10 +32,21 @@
 #include <corecrypto/ccaes.h>
 #include <kern/debug.h>
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/* SWEET has a built-in portable AES provider for the legacy CBC/ECB API. */
+extern const struct ccmode_cbc sweet_aes_cbc_encrypt;
+extern const struct ccmode_cbc sweet_aes_cbc_decrypt;
+#define AES_CBC_ENCRYPT_MODE (&sweet_aes_cbc_encrypt)
+#define AES_CBC_DECRYPT_MODE (&sweet_aes_cbc_decrypt)
+#else
+#define AES_CBC_ENCRYPT_MODE (g_crypto_funcs->ccaes_cbc_encrypt)
+#define AES_CBC_DECRYPT_MODE (g_crypto_funcs->ccaes_cbc_decrypt)
+#endif
+
 aes_rval
 aes_encrypt_key(const unsigned char *key, int key_len, aes_encrypt_ctx cx[1])
 {
-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
+	const struct ccmode_cbc *cbc = AES_CBC_ENCRYPT_MODE;
 
 	/* Make sure the context size for the mode fits in the one we have */
 	if (cbc->size > sizeof(aes_encrypt_ctx)) {
@@ -49,7 +60,7 @@ aes_rval
 aes_encrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
     unsigned char *out_blk, aes_encrypt_ctx cx[1])
 {
-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
+	const struct ccmode_cbc *cbc = AES_CBC_ENCRYPT_MODE;
 	cccbc_iv_decl(cbc->block_size, ctx_iv);
 
 	int rc = cccbc_set_iv(cbc, ctx_iv, in_iv);
@@ -72,7 +83,7 @@ aes_encrypt(const unsigned char *in_blk, unsigned char *out_blk, aes_encrypt_ctx
 aes_rval
 aes_decrypt_key(const unsigned char *key, int key_len, aes_decrypt_ctx cx[1])
 {
-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
+	const struct ccmode_cbc *cbc = AES_CBC_DECRYPT_MODE;
 
 	/* Make sure the context size for the mode fits in the one we have */
 	if (cbc->size > sizeof(aes_decrypt_ctx)) {
@@ -86,7 +97,7 @@ aes_rval
 aes_decrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
     unsigned char *out_blk, aes_decrypt_ctx cx[1])
 {
-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
+	const struct ccmode_cbc *cbc = AES_CBC_DECRYPT_MODE;
 	cccbc_iv_decl(cbc->block_size, ctx_iv);
 
 	int rc = cccbc_set_iv(cbc, ctx_iv, in_iv);

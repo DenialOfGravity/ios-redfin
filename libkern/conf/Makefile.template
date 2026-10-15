@@ -19,6 +19,24 @@ include $(MakeInc_def)
 CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
 SFLAGS+= -include meta_features.h
 
+ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+SWEET_AES_ROOT = $(SRCROOT)/libkern/crypto/sweet_bearssl
+SWEET_AES_INC = -I$(SWEET_AES_ROOT)/inc -I$(SWEET_AES_ROOT)/src
+sweet_aes.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_aes_ct.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_aes_ct_enc.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_aes_ct_dec.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_aes_ct_cbcenc.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_aes_ct_cbcdec.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_aes.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_aes_ct.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_aes_ct_enc.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_aes_ct_dec.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_aes_ct_cbcenc.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_aes_ct_cbcdec.o_CFLAGS_ADD += -mgeneral-regs-only
+corecrypto_aes.o_CFLAGS_ADD += -mgeneral-regs-only
+endif
+
 # Runtime support functions don't interact well with LTO (9294679)
 stack_protector.o_CFLAGS_ADD += $(CFLAGS_NOLTO_FLAG)
 
