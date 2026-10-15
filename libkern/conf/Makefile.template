@@ -35,6 +35,15 @@ sweet_aes_ct_dec.o_CFLAGS_ADD += -mgeneral-regs-only
 sweet_aes_ct_cbcenc.o_CFLAGS_ADD += -mgeneral-regs-only
 sweet_aes_ct_cbcdec.o_CFLAGS_ADD += -mgeneral-regs-only
 corecrypto_aes.o_CFLAGS_ADD += -mgeneral-regs-only
+# BearSSL MD5 behind the legacy MD5Init/Update/Final API (corecrypto_md5.c).
+sweet_md5.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_dec32le.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_enc32le.o_INCFLAGS = $(SWEET_AES_INC)
+corecrypto_md5.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_md5.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_dec32le.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_enc32le.o_CFLAGS_ADD += -mgeneral-regs-only
+corecrypto_md5.o_CFLAGS_ADD += -mgeneral-regs-only
 endif
 
 # Runtime support functions don't interact well with LTO (9294679)

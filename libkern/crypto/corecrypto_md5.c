@@ -17,6 +17,62 @@ setCount(MD5_CTX *ctx, uint64_t count)
 }
 
 /* Copy a ccdigest ctx into a legacy MD5 context */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * SWEET has no corecrypto kext (g_crypto_funcs stays NULL). MD5 uses
+ * BearSSL's portable implementation (libkern/crypto/sweet_md5.c), with
+ * MD5_CTX carrying exactly its state: chaining value, byte count and the
+ * partial block, converted around each call like the corecrypto path does.
+ */
+#include "sweet_bearssl/inc/bearssl_hash.h"
+
+static void
+MD5ToBr(MD5_CTX *md5_ctx, br_md5_context *br_ctx)
+{
+	br_md5_init(br_ctx);
+	memcpy(br_ctx->val, md5_ctx->state, sizeof(br_ctx->val));
+	br_ctx->count = getCount(md5_ctx);
+	memcpy(br_ctx->buf, md5_ctx->buffer, sizeof(br_ctx->buf));
+}
+
+static void
+BrToMD5(const br_md5_context *br_ctx, MD5_CTX *md5_ctx)
+{
+	memcpy(md5_ctx->state, br_ctx->val, sizeof(md5_ctx->state));
+	setCount(md5_ctx, br_ctx->count);
+	memcpy(md5_ctx->buffer, br_ctx->buf, sizeof(md5_ctx->buffer));
+}
+
+void
+MD5Init(MD5_CTX *ctx)
+{
+	br_md5_context br_ctx;
+
+	br_md5_init(&br_ctx);
+	BrToMD5(&br_ctx, ctx);
+}
+
+void
+MD5Update(MD5_CTX *ctx, const void *data, unsigned int len)
+{
+	br_md5_context br_ctx;
+
+	MD5ToBr(ctx, &br_ctx);
+	br_md5_update(&br_ctx, data, len);
+	BrToMD5(&br_ctx, ctx);
+}
+
+void
+MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
+{
+	br_md5_context br_ctx;
+
+	MD5ToBr(ctx, &br_ctx);
+	br_md5_out(&br_ctx, digest);
+}
+
+#else /* !ARM64_BOARD_CONFIG_SWEET */
+
 static void
 DiToMD5(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, MD5_CTX *md5_ctx)
 {
@@ -68,3 +124,5 @@ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
 	MD5ToDi(di, ctx, di_ctx);
 	ccdigest_final(di, di_ctx, digest);
 }
+
+#endif /* !ARM64_BOARD_CONFIG_SWEET */
