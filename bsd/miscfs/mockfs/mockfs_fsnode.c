@@ -345,7 +345,8 @@ mockfs_fsnode_vnode(mockfs_fsnode_t fsnp, vnode_t * vpp)
 				panic("mockfs_fsvnode failed to get ubc_mem_object for a new vnode");
 			}
 
-			rvalue = pager_map_to_phys_contiguous(ubc_mem_object, 0, (mockfs_mnt->mockfs_memdev_base << PAGE_SHIFT), fsnp->size);
+			/* memdev counts in 4K pages, independent of the kernel's PAGE_SHIFT. */
+			rvalue = pager_map_to_phys_contiguous(ubc_mem_object, 0, ((uint64_t)mockfs_mnt->mockfs_memdev_base << 12), fsnp->size);
 
 			if (rvalue) {
 				panic("mockfs_fsnode_vnode failed to create fictitious pages for a memory-backed device; rvalue = %d", rvalue);

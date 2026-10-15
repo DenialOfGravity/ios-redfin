@@ -102,7 +102,12 @@ mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
 		 * For the moment, we won't try to optimize when mi_phys is true.
 		 */
 		if (!mockfs_mount_data->mockfs_physical_memory) {
-			mockfs_mount_data->mockfs_memory_backed = memdev_info.mi_mdev;
+			/*
+			 * Only a physical memory device has an address the pager can map
+			 * directly; a virtual one (IOKit's RAMDisk) goes through normal
+			 * device I/O. mi_base is a physical page number only when mi_phys.
+			 */
+			mockfs_mount_data->mockfs_memory_backed = memdev_info.mi_mdev && memdev_info.mi_phys;
 			mockfs_mount_data->mockfs_physical_memory = memdev_info.mi_phys;
 			mockfs_mount_data->mockfs_memdev_base = memdev_info.mi_base;
 			mockfs_mount_data->mockfs_memdev_size = memdev_info.mi_size;
