@@ -34,6 +34,14 @@
 
 const char * gIOKernelConfigTables =
     "("
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+    "   {"
+    "     'IOClass'         = SweetPlatformExpert;"
+    "     'IOProviderClass' = IOPlatformExpertDevice;"
+    "     'IONameMatch'     = 'xiaomi,sweet';"
+    "     'IOProbeScore'    = 10000:32;"
+    "   },"
+#endif
     "   {"
     "     'IOClass'         = IOPanicPlatform;"
     "     'IOProviderClass' = IOPlatformExpertDevice;"
