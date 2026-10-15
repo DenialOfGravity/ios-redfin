@@ -5179,7 +5179,17 @@ IOService::setRootMedia(IOService * root)
 	bool unhide;
 
 	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	/*
+	 * SWEET has no IOStorageFamily, so no service can be a block storage
+	 * driver: the root (e.g. a RAM disk) is not block media, as for image boot.
+	 */
+	if (!ioblockstoragedriverClass) {
+		root = NULL;
+	}
+#else
 	assert(ioblockstoragedriverClass);
+#endif
 
 	while (root) {
 		if (root->metaCast(ioblockstoragedriverClass)) {
