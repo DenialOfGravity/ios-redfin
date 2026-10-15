@@ -361,6 +361,9 @@ bsd/security/audit/audit_syscalls.c		standard
 bsd/security/audit/audit_worker.c		optional config_audit
 
 bsd/pthread/pthread_shims.c		standard
+bsd/pthread/sweet_pthread_init.c	standard
+bsd/pthread/sweet_pthread_support.c	standard
+bsd/pthread/sweet_pthread_synch.c	standard
 bsd/pthread/pthread_priority.c		standard
 bsd/pthread/pthread_workqueue.c		standard
 

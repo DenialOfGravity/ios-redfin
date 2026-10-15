@@ -44,6 +44,15 @@ CFLAGS+= -include meta_features.h -DDRIVER_PRIVATE \
         -Warray-bounds-pointer-arithmetic
 SFLAGS+= -include meta_features.h
 
+# This provider is built into SWEET; other boards use their normal kext.
+ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+sweet_pthread_support.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+sweet_pthread_synch.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+endif
+
 #
 # Directories for mig generated files
 #
