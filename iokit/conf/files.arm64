@@ -8,3 +8,5 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
 
 # SWEET device-tree platform (empty translation unit on other boards)
 iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+
+iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp

@@ -41,6 +41,12 @@ const char * gIOKernelConfigTables =
     "     'IONameMatch'     = 'xiaomi,sweet';"
     "     'IOProbeScore'    = 10000:32;"
     "   },"
+    "   {"
+    "     'IOClass'         = SweetCPU;"
+    "     'IOProviderClass' = IOPlatformDevice;"
+    "     'IONameMatch'     = 'qcom,kryo470';"
+    "     'IOProbeScore'    = 10000:32;"
+    "   },"
 #endif
     "   {"
     "     'IOClass'         = IOPanicPlatform;"
