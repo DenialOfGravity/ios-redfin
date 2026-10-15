@@ -5126,7 +5126,9 @@ IOService::publishHiddenMedia(IOService * parent)
 	bool                wasHiding;
 
 	iomediaClass = OSMetaClass::getMetaClassWithName(gIOMediaKey);
+#if !defined(ARM64_BOARD_CONFIG_SWEET)
 	assert(iomediaClass);
+#endif
 
 	LOCKWRITENOTIFY();
 	wasHiding = gIOServiceHideIOMedia;
@@ -5134,6 +5136,13 @@ IOService::publishHiddenMedia(IOService * parent)
 		gIOServiceHideIOMedia = false;
 	}
 	UNLOCKNOTIFY();
+
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	/* SWEET has no IOStorageFamily: without the IOMedia class no media exists to unhide. */
+	if (!iomediaClass) {
+		wasHiding = false;
+	}
+#endif
 
 	FindRootMediaContext ctx = { .services = NULL, .parent = parent };
 
