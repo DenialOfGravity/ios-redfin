@@ -40,6 +40,10 @@
 #include <machine/machine_routines.h>
 #include <libkern/section_keywords.h>
 #include <sys/cdefs.h>
+#if defined(SWEET)
+#include <corecrypto/ccdigest.h>
+#include <corecrypto/ccsha2.h>
+#endif
 
 // The number of samples we can hold in an entropy buffer.
 #define ENTROPY_MAX_SAMPLE_COUNT (2048)
@@ -93,13 +97,14 @@ typedef struct entropy_data {
 	// State for a SHA256 computation. This is used to accumulate
 	// entropy samples from across all CPUs. It is finalized when
 	// entropy is provided to the consumer of this module.
+#if defined(SWEET)
+	ccdigest_ctx_decl(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, sha256_ctx);
+#else
 	SHA256_CTX sha256_ctx;
+#endif
 
-	// Since the corecrypto kext is not loaded when this module is
-	// initialized, we cannot initialize the SHA256 state at that
-	// time. Instead, we initialize it lazily during entropy
-	// consumption. This flag tracks whether initialization is
-	// complete.
+	// Initialize the hash lazily during entropy consumption. On Apple
+	// platforms this also waits for the corecrypto kext to be loaded.
 	bool sha256_ctx_init;
 
 	// A buffer to hold a bitmap with one bit per sample of an entropy
@@ -473,6 +478,38 @@ entropy_health_test(uint32_t sample_count, entropy_sample_t *samples, __assert_o
 	return result;
 }
 
+/* SWEET uses the same built-in digest as early_random, without a kext. */
+static void
+entropy_hash_init(void)
+{
+#if defined(SWEET)
+	ccdigest_init(&ccsha256_ltc_di, entropy_data.sha256_ctx);
+#else
+	SHA256_Init(&entropy_data.sha256_ctx);
+#endif
+}
+
+static void
+entropy_hash_update(const void *data, size_t nbytes)
+{
+#if defined(SWEET)
+	ccdigest_update(&ccsha256_ltc_di, entropy_data.sha256_ctx, nbytes, data);
+#else
+	SHA256_Update(&entropy_data.sha256_ctx, data, nbytes);
+#endif
+}
+
+static void
+entropy_hash_final(void *out)
+{
+#if defined(SWEET)
+	ccdigest_final(&ccsha256_ltc_di, entropy_data.sha256_ctx, out);
+	ccdigest_ctx_clear(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, entropy_data.sha256_ctx);
+#else
+	SHA256_Final(out, &entropy_data.sha256_ctx);
+#endif
+}
+
 int32_t
 entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
 {
@@ -485,12 +522,13 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
 	int32_t sample_count = 0;
 	*entropy_size = 0;
 
-	// The first call to this function comes while the corecrypto kext
-	// is being loaded. We require SHA256 to accumulate entropy
-	// samples.
+	// Apple platforms need the corecrypto kext's SHA256 implementation.
+	// SWEET links the digest into the kernel instead.
+#if !defined(SWEET)
 	if (__improbable(!crypto_init)) {
 		return sample_count;
 	}
+#endif
 
 	// There is only one consumer (the kernel PRNG), but they could
 	// try to consume entropy from different threads. We simply fail
@@ -499,11 +537,9 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
 		return sample_count;
 	}
 
-	// This only happens on the first call to this function. We cannot
-	// perform this initialization in entropy_init because the
-	// corecrypto kext is not loaded yet.
+	// Initialize the accumulator on first use, after SHA256 is available.
 	if (__improbable(!entropy_data.sha256_ctx_init)) {
-		SHA256_Init(&entropy_data.sha256_ctx);
+		entropy_hash_init();
 		entropy_data.sha256_ctx_init = true;
 	}
 
@@ -539,7 +575,7 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
 		// We accumulate the samples regardless of whether the test
 		// failed or a particular sample was filtered. It cannot hurt.
 		entropy_data.total_sample_count += filtered_sample_count;
-		SHA256_Update(&entropy_data.sha256_ctx, e->samples, cpu_sample_count * sizeof(e->samples[0]));
+		entropy_hash_update(e->samples, cpu_sample_count * sizeof(e->samples[0]));
 
 		// "Drain" the per-CPU buffer by resetting its sample count.
 		os_atomic_store(&e->sample_count, 0, relaxed);
@@ -576,8 +612,8 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
 		goto out;
 	}
 
-	SHA256_Final(entropy, &entropy_data.sha256_ctx);
-	SHA256_Init(&entropy_data.sha256_ctx);
+	entropy_hash_final(entropy);
+	entropy_hash_init();
 	entropy_data.read_sample_count = entropy_data.total_sample_count;
 
 	sample_count = n;
