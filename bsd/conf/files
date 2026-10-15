@@ -381,6 +381,7 @@ bsd/kern/kern_core.c			optional config_coredump
 bsd/kern/kern_credential.c		standard
 bsd/kern/kern_crossarch.c		standard
 bsd/kern/kern_cs.c			standard
+bsd/kern/sweet_amfi.c			standard
 bsd/kern/kern_csr.c			optional config_csr
 bsd/kern/kern_debug.c			standard
 bsd/kern/kern_symfile.c			standard
