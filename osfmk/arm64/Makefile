@@ -40,6 +40,7 @@ EXPORT_MD_LIST = \
 	monotonic.h \
 	perfmon_arm64_regs.h \
 	proc_reg.h \
+	sweet_early.h \
 	asm.h \
 	tlb.h \
 	pal_hibernate.h

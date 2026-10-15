@@ -26,6 +26,7 @@
 #include <pexpert/arm/consistent_debug.h>
 #include <pexpert/arm64/board_config.h>
 #include <arm64/proc_reg.h>
+#include <arm64/sweet_early.h>
 #include <pexpert/arm/protos.h>
 #include <kern/sched_prim.h>
 #if HIBERNATION
@@ -833,7 +834,9 @@ fbcon_probe(void)
 	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
 		return;
 	}
+	sweet_early_mark(17, "fbcon config read; mapping");
 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+	sweet_early_mark(18, "fbcon mapping returned");
 	if (fbcon_base != NULL) {
 		register_serial_functions(&sweet_fbcon_serial_functions);
 	}

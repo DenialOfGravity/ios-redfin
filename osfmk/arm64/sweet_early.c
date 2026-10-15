@@ -2,7 +2,8 @@
  * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
  * per-CPU state: panic() can reach this before a current thread exists.
  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
- * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
+ * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+ * retain this console until the normal framebuffer serial console is ready.
  */
 #include <arm64/sweet_early.h>
 
@@ -10,7 +11,8 @@
 #include <stdint.h>
 #include <kern/misc_protos.h>
 
-#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x9c000000)
+static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+#define EARLY_FB early_fb
 #define EARLY_WIDTH 1080u
 #define EARLY_HEIGHT 2400u
 #define EARLY_STRIDE (4320u / 4)
@@ -87,18 +89,21 @@ sweet_early_string(const char *s)
 void
 sweet_early_mark(unsigned int stage, const char *label)
 {
-	if (early_disabled || stage > 8) {
+	if (early_disabled || stage > 20) {
 		return;
 	}
-	uint32_t color = 0xff00ff00u | (stage * 28u << 16);
+	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
 	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
-		for (unsigned int x = stage * 64; x < (stage + 1) * 64; x++) {
+		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
 			EARLY_FB[y * EARLY_STRIDE + x] = color;
 		}
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	sweet_early_string("SWEET EARLY ");
-	sweet_early_putc((char)('0' + stage));
+	if (stage >= 10) {
+		sweet_early_putc((char)('0' + stage / 10));
+	}
+	sweet_early_putc((char)('0' + stage % 10));
 	sweet_early_string(": ");
 	sweet_early_string(label);
 	sweet_early_putc('\n');
@@ -121,9 +126,17 @@ sweet_early_panic(const char *fmt, va_list *args)
 }
 
 void
-sweet_early_disable(void)
+sweet_early_relocate(uint64_t base)
 {
 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+	early_fb = (volatile uint32_t *)(uintptr_t)base;
+	__asm__ volatile("dsb sy" ::: "memory");
+	sweet_early_mark(9, "kernel framebuffer VA live");
+}
+
+void
+sweet_early_disable(void)
+{
 	early_disabled = 1;
 	__asm__ volatile("dsb sy" ::: "memory");
 }
