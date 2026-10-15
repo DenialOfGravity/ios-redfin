@@ -3,6 +3,7 @@
  */
 
 #include <stdint.h>
+#include <libkern/section_keywords.h>
 #include <arm64/proc_reg.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
@@ -15,6 +16,11 @@
 #if HAS_GIC_V3
 #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
 MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
+
+#if defined(SWEET)
+/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
+#endif
 
 static vm_offset_t gicd_base;
 static vm_offset_t gicr_base;
@@ -96,6 +102,23 @@ pe_init_fiq()
 			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
 		}
 
+#if defined(SWEET)
+		/* Read only on the boot CPU, before the GIC and RO-late lockdown. */
+		void const *timer_prop;
+		unsigned int timer_size;
+		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
+			if (timer_size != sizeof(uint32_t)) {
+				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
+			}
+			uint32_t intid = *(const uint32_t *)timer_prop;
+			if (intid < 16 || intid >= 32) {
+				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
+			}
+			sweet_vtimer_intid = intid;
+		}
+		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
+#endif
+
 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
 
 		uint64_t const gicd_base_prop = ((uint64_t const *) prop)[0];
@@ -152,7 +175,7 @@ pe_init_fiq()
 	for (unsigned int i = 0; i < 32; i += 4) {
 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
 	}
-	gicr_write32(GICR_ISENABLER0, (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
+	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
 #else
 	// Configure timers and legacy FIQ to be group 0
 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);

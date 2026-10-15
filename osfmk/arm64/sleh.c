@@ -1867,7 +1867,7 @@ sleh_irq(arm_saved_state_t *state)
 	if (intid >= 1020 && intid <= 1023) {
 		return; /* spurious */
 	}
-	if (intid == SWEET_VTIMER_INTID) {
+	if (intid == sweet_vtimer_intid) {
 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
 		cdp->cpu_decrementer = -1; /* Large */
 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);

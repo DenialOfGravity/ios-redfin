@@ -36,6 +36,9 @@ void uart_putc_options(char, bool);
 int uart_getc(void);
 
 void pe_init_fiq(void);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+extern uint32_t sweet_vtimer_intid;
+#endif
 
 #ifdef PRIVATE
 /**
