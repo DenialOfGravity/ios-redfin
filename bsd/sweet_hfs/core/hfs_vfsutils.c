@@ -202,10 +202,22 @@ OSErr hfs_MountHFSPlusVolume(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
 	/* don't mount a writable volume if its dirty, it must be cleaned by fsck_hfs */
 	if ((hfsmp->hfs_flags & HFS_READ_ONLY) == 0 && hfsmp->jnl == NULL &&
 	    (SWAP_BE32(vhp->attributes) & kHFSVolumeUnmountedMask) == 0) {
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+		/*
+		 * SWEET never unmounts its root (no clean shutdown yet), and
+		 * there is no fsck_hfs before the root mount: take it anyway.
+		 */
+		if (vfs_flags(hfsmp->hfs_mp) & MNT_ROOTFS) {
+			printf("hfs_mounthfsplus: SWEET: mounting dirty non-journaled root read-write\n");
+		} else {
+#endif
 		if (HFS_MOUNT_DEBUG) {
 			printf("hfs_mounthfsplus: cannot mount dirty non-journaled volumes\n");
 		}
 		return (EINVAL);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+		}
+#endif
 	}
 
 	/* Make sure we can live with the physical block size. */
