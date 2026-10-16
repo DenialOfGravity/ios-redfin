@@ -820,6 +820,60 @@ exception_triage(
 	return exception_triage_thread(exception, code, codeCnt, thread);
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+#include <vm/vm_shared_region.h>
+#include <arm/thread.h>
+
+/*
+ * SWEET crash report on the console. The phone has no way to get crash
+ * logs off the device, and corpses stop after a few crashes, so print what
+ * symbolication needs: user registers, a frame-pointer backtrace, the
+ * shared cache slide (unslid = pc - slide) and the main binary's Mach-O
+ * header (offset = pc - mh). Called from proc_prepareexit on the exiting
+ * (crashing) thread.
+ */
+void sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
+
+void
+sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
+{
+	thread_t thread = current_thread();
+	task_t task = current_task();
+	arm_saved_state_t *ss = find_user_regs(thread);
+	uint64_t slide = 0, mh = task->mach_header_vm_address;
+
+	vm_shared_region_t sr = vm_shared_region_get(task);
+	if (sr != NULL) {
+		slide = sr->sr_slide;
+		vm_shared_region_deallocate(sr);
+	}
+	printf("CRASH %s[%d] sig %d code 0x%llx sub 0x%llx slide 0x%llx mh 0x%llx\n",
+	    name, pid, sig, code, subcode, slide, mh);
+	if (ss == NULL || !is_saved_state64(ss)) {
+		return;
+	}
+	uint64_t fp = get_saved_state_fp(ss);
+	printf("CRASH %s pc 0x%llx lr 0x%llx sp 0x%llx fp 0x%llx far 0x%llx\n", name,
+	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
+	    (uint64_t)saved_state64(ss)->far);
+
+	char line[200];
+	int n = snprintf(line, sizeof(line), "CRASH %s bt", name);
+	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+		uint64_t frame[2];
+		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
+			break;
+		}
+		n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+		if (frame[0] <= fp) {
+			break;
+		}
+		fp = frame[0];
+	}
+	printf("%s\n", line);
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */
+
 kern_return_t
 bsd_exception(
 	exception_type_t        exception,
