@@ -5,12 +5,19 @@
  * provides entitlements through the closed CoreEntitlements library. SWEET
  * has neither, and code signing reaches it on every exec (ubc_cs_blob_add).
  *
- * This provider honestly reports that no entitlements exist: code signature
- * blobs get no OSEntitlements object (csb_entitlements stays NULL, which the
- * kernel already handles), every entitlement query fails and every copy
- * returns nothing. Nothing is granted. Code signature and page hash
- * validation stay with the kernel. Trust caches remain unavailable (no
- * Image4), so the TrustCache interface is left at version 0.
+ * Entitlements: when a code signature is added, its XML entitlements blob
+ * (already checked against the code directory) is parsed into a
+ * SweetEntitlements object (iokit/Kernel/arm/SweetEntitlements.cpp), set as
+ * the blob's csb_entitlements, and every query is answered from it. DER-only
+ * signatures get none. Code signature and page hash validation stay with the
+ * kernel. Trust caches remain unavailable (no Image4), so the TrustCache
+ * interface is left at version 0.
+ *
+ * Platform binaries: AMFI marks binaries whose cdhash is in a trust cache
+ * as platform binaries from its vnode_check_signature MAC hook. Without
+ * trust caches, the SWEET policy below marks every binary on the root
+ * filesystem instead (the iOS system binaries are ad-hoc signed and are
+ * platform binaries only through the static trust cache).
  *
  * Interfaces no kernel path uses on SWEET (they serve other Apple kexts)
  * panic with a clear message instead of being NULL.
@@ -20,19 +27,45 @@
 #include <kern/startup.h>
 #include <libkern/amfi/amfi.h>
 #include <mach/kern_return.h>
+#include <sys/codesign.h>
+#include <sys/mount.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
+#include <sys/ubc_internal.h>
+#include <sys/vnode.h>
+#include <security/mac_policy.h>
+
+/* iokit/Kernel/arm/SweetEntitlements.cpp */
+void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+void *sweet_entitlements_copy_dict(const void *ent);
+bool sweet_entitlements_copy_xml(const void *ent, CS_GenericBlob **out);
+bool sweet_entitlements_bool(const void *ent, const char *name);
+bool sweet_entitlements_string(const void *ent, const char *name, const char *value);
+void *sweet_entitlements_copy_object(const void *ent, const char *name);
+unsigned int sweet_entitlements_count(const void *ent);
+extern void osobject_release(void *object);
+
+/* boot-arg sweet_amfi_debug=1: log the entitlements attached to each signature. */
+static TUNABLE(uint32_t, sweet_amfi_debug, "sweet_amfi_debug", 0);
+
+/* The entitlements object of a process's main binary, or NULL. */
+static void *
+sweet_proc_entitlements(proc_t proc)
+{
+	struct cs_blob *blob = csproc_get_blob(proc);
+	return blob != NULL ? csblob_os_entitlements_get(blob) : NULL;
+}
 
 static void
 sweet_amfi_entitlements_invalidate(__unused void *os_entitlements)
 {
-	/* No OSEntitlements objects are ever created. */
+	/* Queries already require a valid signature (csblob_get_entitlements). */
 }
 
 static void *
-sweet_amfi_entitlements_as_dict(__unused void *os_entitlements)
+sweet_amfi_entitlements_as_dict(void *os_entitlements)
 {
-	return NULL;
+	return sweet_entitlements_copy_dict(os_entitlements);
 }
 
 static CEError_t
@@ -51,10 +84,9 @@ sweet_amfi_entitlements_get_transmuted(__unused void *os_entitlements,
 }
 
 static bool
-sweet_amfi_entitlements_get_xml(__unused void *os_entitlements,
-    __unused CS_GenericBlob **blob)
+sweet_amfi_entitlements_get_xml(void *os_entitlements, CS_GenericBlob **blob)
 {
-	return false;
+	return sweet_entitlements_copy_xml(os_entitlements, blob);
 }
 
 static bool
@@ -85,60 +117,100 @@ sweet_amfi_adjust_with_monitor(__unused void *os_entitlements,
 	return KERN_NOT_SUPPORTED;
 }
 
+/*
+ * Attach the parsed XML entitlements to a code signature being added. This
+ * must happen in the vnode_check_signature MAC hook, like AMFI does: later,
+ * converting a 4K-page signature to multilevel hashes drops the XML blob.
+ * Nothing is granted when the blob is missing, unreadable or does not match
+ * its code directory hash.
+ */
+static void
+sweet_amfi_attach_entitlements(struct cs_blob *code_signing_blob)
+{
+	void *xml = NULL;
+	size_t xml_len = 0;
+
+	if (csblob_get_entitlements(code_signing_blob, &xml, &xml_len) != 0) {
+		printf("SWEET AMFI: %s: entitlements do not match the code directory, granting none\n",
+		    csblob_get_identity(code_signing_blob));
+		return;
+	}
+	if (xml == NULL) {
+		return;                 /* no XML entitlements */
+	}
+	void *ent = sweet_entitlements_create(xml, xml_len);
+	if (ent == NULL) {
+		printf("SWEET AMFI: %s: unreadable entitlements (%zu bytes), granting none\n",
+		    csblob_get_identity(code_signing_blob), xml_len);
+		return;
+	}
+	if (sweet_amfi_debug) {
+		/* The test keys only exist in tools/mkinit.py test signatures. */
+		printf("SWEET AMFI: %s: %u entitlements (test: bool %d string %d array %d)\n",
+		    csblob_get_identity(code_signing_blob), sweet_entitlements_count(ent),
+		    sweet_entitlements_bool(ent, "com.apple.private.sweet.test-bool"),
+		    sweet_entitlements_string(ent, "com.apple.private.sweet.test-string", "hello"),
+		    sweet_entitlements_string(ent, "com.apple.private.sweet.test-array", "two"));
+	}
+	csblob_os_entitlements_set(code_signing_blob, ent);    /* takes a reference */
+	osobject_release(ent);
+}
+
 static kern_return_t
 sweet_amfi_adjust_without_monitor(__unused void *os_entitlements,
     __unused struct cs_blob *code_signing_blob)
 {
-	/* Leave the blob without an entitlements context: it has none. */
+	/* Entitlements were attached in sweet_amfi_vnode_check_signature. */
 	return KERN_SUCCESS;
 }
 
 static kern_return_t
-sweet_amfi_query_boolean(__unused const void *os_entitlements,
-    __unused const char *entitlement_name)
+sweet_amfi_query_boolean(const void *os_entitlements, const char *entitlement_name)
 {
-	return KERN_DENIED;
+	return sweet_entitlements_bool(os_entitlements, entitlement_name) ? KERN_SUCCESS : KERN_DENIED;
 }
 
 static kern_return_t
-sweet_amfi_query_boolean_with_proc(__unused const proc_t proc,
-    __unused const char *entitlement_name)
+sweet_amfi_query_boolean_with_proc(const proc_t proc, const char *entitlement_name)
 {
-	return KERN_DENIED;
+	return sweet_amfi_query_boolean(sweet_proc_entitlements(proc), entitlement_name);
 }
 
 static kern_return_t
-sweet_amfi_query_string(__unused const void *os_entitlements,
-    __unused const char *entitlement_name, __unused const char *entitlement_value)
+sweet_amfi_query_string(const void *os_entitlements,
+    const char *entitlement_name, const char *entitlement_value)
 {
-	return KERN_DENIED;
+	return sweet_entitlements_string(os_entitlements, entitlement_name, entitlement_value) ?
+	       KERN_SUCCESS : KERN_DENIED;
 }
 
 static kern_return_t
-sweet_amfi_query_string_with_proc(__unused const proc_t proc,
-    __unused const char *entitlement_name, __unused const char *entitlement_value)
+sweet_amfi_query_string_with_proc(const proc_t proc,
+    const char *entitlement_name, const char *entitlement_value)
 {
-	return KERN_DENIED;
+	return sweet_amfi_query_string(sweet_proc_entitlements(proc), entitlement_name,
+	           entitlement_value);
 }
 
 static kern_return_t
-sweet_amfi_copy_object(__unused const void *os_entitlements,
-    __unused const char *entitlement_name, void **entitlement_object)
+sweet_amfi_copy_object(const void *os_entitlements,
+    const char *entitlement_name, void **entitlement_object)
 {
+	void *obj = sweet_entitlements_copy_object(os_entitlements, entitlement_name);
 	if (entitlement_object) {
-		*entitlement_object = NULL;
+		*entitlement_object = obj;
+	} else if (obj) {
+		osobject_release(obj);
 	}
-	return KERN_NOT_FOUND;
+	return obj ? KERN_SUCCESS : KERN_NOT_FOUND;
 }
 
 static kern_return_t
-sweet_amfi_copy_object_with_proc(__unused const proc_t proc,
-    __unused const char *entitlement_name, void **entitlement_object)
+sweet_amfi_copy_object_with_proc(const proc_t proc,
+    const char *entitlement_name, void **entitlement_object)
 {
-	if (entitlement_object) {
-		*entitlement_object = NULL;
-	}
-	return KERN_NOT_FOUND;
+	return sweet_amfi_copy_object(sweet_proc_entitlements(proc), entitlement_name,
+	           entitlement_object);
 }
 
 static const amfi_t sweet_amfi = {
@@ -170,7 +242,52 @@ static void
 sweet_amfi_register(void)
 {
 	amfi_interface_register(&sweet_amfi);
-	printf("SWEET AMFI: built-in interface registered (no entitlements)\n");
+	printf("SWEET AMFI: built-in interface registered (XML entitlements)\n");
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, sweet_amfi_register);
+
+/*
+ * Every signed binary on the root filesystem is a platform binary. New
+ * signatures (ubc_cs_blob_add passes its writable copy; revalidation passes
+ * the read-only blob itself) get their entitlements here.
+ */
+static int
+sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+    __unused cpu_type_t cpu_type, struct cs_blob *cs_blob,
+    unsigned int *cs_flags, __unused unsigned int *signer_type,
+    __unused int flags, __unused unsigned int platform,
+    __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
+{
+	mount_t mp = vnode_mount(vp);
+	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+		*cs_flags |= CS_PLATFORM_BINARY;
+	}
+	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+		sweet_amfi_attach_entitlements(cs_blob);
+	}
+	return 0;
+}
+
+static const struct mac_policy_ops sweet_amfi_mac_ops = {
+	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+};
+
+static struct mac_policy_conf sweet_amfi_mac_conf = {
+	.mpc_name = "SWEET AMFI",
+	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+	.mpc_ops = &sweet_amfi_mac_ops,
+};
+
+static mac_policy_handle_t sweet_amfi_mac_handle;
+
+/* Called from bsd_init once MAC policies can register, before any exec. */
+void sweet_amfi_policy_register(void);
+
+void
+sweet_amfi_policy_register(void)
+{
+	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+	printf("SWEET AMFI: platform binary policy %s (%d)\n",
+	    error ? "NOT registered" : "registered", error);
+}
 #endif /* ARM64_BOARD_CONFIG_SWEET */

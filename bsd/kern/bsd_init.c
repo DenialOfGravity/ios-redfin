@@ -691,6 +691,12 @@ bsd_init(void)
 	bsd_init_kprintf("calling vfsinit\n");
 	vfsinit();
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+	extern void sweet_amfi_policy_register(void);
+	sweet_amfi_policy_register();
+#endif
+
 #if SWEET_HFS
 	/* HFS is built in on SWEET: register it like its kext would, before mounting root. */
 	extern void sweet_hfs_register(void);
