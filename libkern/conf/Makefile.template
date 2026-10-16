@@ -44,6 +44,15 @@ sweet_md5.o_CFLAGS_ADD += -mgeneral-regs-only
 sweet_dec32le.o_CFLAGS_ADD += -mgeneral-regs-only
 sweet_enc32le.o_CFLAGS_ADD += -mgeneral-regs-only
 corecrypto_md5.o_CFLAGS_ADD += -mgeneral-regs-only
+# BearSSL SHA-1 behind the legacy SHA1Init/Update/Final API (corecrypto_sha1.c).
+sweet_sha1.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_dec32be.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_enc32be.o_INCFLAGS = $(SWEET_AES_INC)
+corecrypto_sha1.o_INCFLAGS = $(SWEET_AES_INC)
+sweet_sha1.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_dec32be.o_CFLAGS_ADD += -mgeneral-regs-only
+sweet_enc32be.o_CFLAGS_ADD += -mgeneral-regs-only
+corecrypto_sha1.o_CFLAGS_ADD += -mgeneral-regs-only
 endif
 
 # Runtime support functions don't interact well with LTO (9294679)

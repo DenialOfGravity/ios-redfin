@@ -106,6 +106,9 @@ libkern/crypto/sweet_aes_ct_cbcdec.c	optional crypto
 libkern/crypto/sweet_md5.c	optional crypto
 libkern/crypto/sweet_dec32le.c	optional crypto
 libkern/crypto/sweet_enc32le.c	optional crypto
+libkern/crypto/sweet_sha1.c	optional crypto
+libkern/crypto/sweet_dec32be.c	optional crypto
+libkern/crypto/sweet_enc32be.c	optional crypto
 libkern/crypto/corecrypto_aesxts.c		optional crypto
 libkern/crypto/corecrypto_rand.c		optional crypto
 libkern/crypto/corecrypto_rsa.c		    optional crypto

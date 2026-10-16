@@ -16,6 +16,62 @@ setCount(SHA1_CTX *ctx, uint64_t count)
 	ctx->c.b64[0] = count;
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * SWEET has no corecrypto kext (g_crypto_funcs stays NULL). SHA-1 uses
+ * BearSSL's portable implementation (libkern/crypto/sweet_sha1.c), with
+ * SHA1_CTX carrying exactly its state: chaining value, byte count and the
+ * partial block, converted around each call like the corecrypto path does.
+ */
+#include "sweet_bearssl/inc/bearssl_hash.h"
+
+static void
+SHA1ToBr(SHA1_CTX *sha1_ctx, br_sha1_context *br_ctx)
+{
+	br_sha1_init(br_ctx);
+	memcpy(br_ctx->val, sha1_ctx->h.b32, sizeof(br_ctx->val));
+	br_ctx->count = getCount(sha1_ctx);
+	memcpy(br_ctx->buf, sha1_ctx->m.b8, sizeof(br_ctx->buf));
+}
+
+static void
+BrToSHA1(const br_sha1_context *br_ctx, SHA1_CTX *sha1_ctx)
+{
+	memcpy(sha1_ctx->h.b32, br_ctx->val, sizeof(sha1_ctx->h.b32));
+	setCount(sha1_ctx, br_ctx->count);
+	memcpy(sha1_ctx->m.b8, br_ctx->buf, sizeof(sha1_ctx->m.b8));
+}
+
+void
+SHA1Init(SHA1_CTX *ctx)
+{
+	br_sha1_context br_ctx;
+
+	br_sha1_init(&br_ctx);
+	BrToSHA1(&br_ctx, ctx);
+}
+
+void
+SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
+{
+	br_sha1_context br_ctx;
+
+	SHA1ToBr(ctx, &br_ctx);
+	br_sha1_update(&br_ctx, data, len);
+	BrToSHA1(&br_ctx, ctx);
+}
+
+void
+SHA1Final(void *digest, SHA1_CTX *ctx)
+{
+	br_sha1_context br_ctx;
+
+	SHA1ToBr(ctx, &br_ctx);
+	br_sha1_out(&br_ctx, digest);
+}
+
+#else /* !ARM64_BOARD_CONFIG_SWEET */
+
 /* Copy a ccdigest ctx into a legacy SHA1 context */
 static void
 DiToSHA1(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, SHA1_CTX *sha1_ctx)
@@ -68,6 +124,8 @@ SHA1Final(void *digest, SHA1_CTX *ctx)
 	SHA1ToDi(di, ctx, di_ctx);
 	ccdigest_final(di, di_ctx, digest);
 }
+
+#endif /* !ARM64_BOARD_CONFIG_SWEET */
 
 /* This is not publicised in header, but exported in libkern.exports */
 void SHA1Final_r(SHA1_CTX *context, void *digest);
