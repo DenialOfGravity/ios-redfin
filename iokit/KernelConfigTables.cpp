@@ -47,6 +47,11 @@ const char * gIOKernelConfigTables =
     "     'IONameMatch'     = 'qcom,kryo470';"
     "     'IOProbeScore'    = 10000:32;"
     "   },"
+    "   {"
+    "     'IOClass'         = AppleKeyStore;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = AppleKeyStore;"
+    "   },"
 #endif
     "   {"
     "     'IOClass'         = IOPanicPlatform;"

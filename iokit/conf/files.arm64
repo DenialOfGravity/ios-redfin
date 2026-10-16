@@ -11,3 +11,4 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
 
 iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
 iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
