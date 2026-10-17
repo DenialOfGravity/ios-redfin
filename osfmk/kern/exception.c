@@ -995,7 +995,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
 	task_lock(task);
 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
 		arm_saved_state_t *ss = find_user_regs(thread);
-		char line[220];
+		char line[400];
 		int n;
 		uint64_t fp;
 
@@ -1005,7 +1005,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
 		fp = get_saved_state_fp(ss);
 		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
-		for (int i = 0; i < 8 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
 			uint64_t frame[2];
 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
 				break;
