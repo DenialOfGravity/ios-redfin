@@ -873,14 +873,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
 	}
 	printf("%s\n", line);
 
-	if (sig == 6) {
+	if (sig == 6 || sig == 5) {
 		sweet_crash_strings(name);
 	}
 }
 
 /*
- * SWEET: for an aborting process named in boot-arg sweetscan (comma
- * separated, default "backboardd"; "-" = off) print the printable text runs
+ * SWEET: for a process named in boot-arg sweetscan (comma separated,
+ * default "backboardd,SpringBoard"; "-" = off) that dies with SIGABRT or
+ * SIGTRAP (BSAssert / NSAssert style failures) print the printable text runs
  * (>= 24 characters, at least 2 spaces) found in its malloc heap as
  * "STR text", at most 700 lines. An uncaught NSException's reason string
  * is among them: the abort message only carries the exception's type.
@@ -897,7 +898,7 @@ sweet_crash_strings(const char *name)
 	char last[96] = "";
 
 	if (!PE_parse_boot_argn("sweetscan", names, sizeof(names))) {
-		strlcpy(names, "backboardd", sizeof(names));
+		strlcpy(names, "backboardd,SpringBoard", sizeof(names));
 	}
 	size_t n = strlen(name), found = 0;
 	for (const char *t = names; *t;) {
