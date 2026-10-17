@@ -4459,6 +4459,20 @@ vn_rename(struct vnode *fdvp, struct vnode **fvpp, struct componentname *fcnp, s
 					_err = VNOP_RENAME(fdvp, *fvpp, fcnp, tdvp, *tvpp, tcnp, ctx);
 				}
 			}
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+			/*
+			 * SWEET: HFS has no RENAME_SWAP, which Foundation's atomic
+			 * writes use (usermanagerd: "Failed to atomically swap writing
+			 * file: Operation not supported"). Swapping two regular files
+			 * on one volume is what exchangedata does: each name ends up
+			 * with the other file's data and attributes.
+			 */
+			if (_err == ENOTSUP && flags == VFS_RENAME_SWAP && *tvpp != NULLVP &&
+			    vnode_isreg(*fvpp) && vnode_isreg(*tvpp) &&
+			    vnode_mount(*fvpp) == vnode_mount(*tvpp)) {
+				_err = VNOP_EXCHANGE(*fvpp, *tvpp, 0, ctx);
+			}
+#endif
 		} else {
 			_err = VNOP_RENAME(fdvp, *fvpp, fcnp, tdvp, *tvpp, tcnp, ctx);
 		}
