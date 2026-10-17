@@ -62,6 +62,18 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
 		cpus->release();
 	}
 	createNubs(this, IODTFindMatchingEntries(root, kIODTExclusive, excludeList()));
+
+	/*
+	 * No AppleARMIO driver publishes the /arm-io children: do it here so
+	 * built-in drivers (the display, AppleCLCD) can match them. The GIC is
+	 * driven by the platform code and gets no nub. The nubs hang off this
+	 * platform expert: IOPlatformDevice::compareName asks its provider.
+	 */
+	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
+	if (armio != NULL) {
+		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
+		armio->release();
+	}
 }
 
 bool

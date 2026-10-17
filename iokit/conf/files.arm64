@@ -13,3 +13,5 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
 iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
 iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
 iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
