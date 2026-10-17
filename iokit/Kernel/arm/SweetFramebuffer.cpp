@@ -217,12 +217,17 @@ get32(const uint8_t *p, uint32_t off)
 }
 
 static uint32_t sweet_fb_swaps_logged;
+static uint64_t sweet_fb_swap_count;
 
 /* Copy each enabled layer's surface into the panel memory (no scaling). */
 void
 AppleCLCD::swap(const uint8_t *rec)
 {
 	uint32_t mask = get32(rec, 0x104);
+
+	if ((++sweet_fb_swap_count % 100) == 0) {
+		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+	}
 
 	if (!fConsolePaused) {
 		int quiet = 0;

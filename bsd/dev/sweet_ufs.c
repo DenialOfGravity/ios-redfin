@@ -46,6 +46,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
 extern int hz;
 static void sweet_log_start(void);
+extern void sweet_sample_start(void);
 
 #define REG_CAP         0x00
 #define REG_IS          0x20
@@ -597,6 +598,7 @@ sweet_ufs_init(void)
 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
 	    su.writable ? "read-write" : "read-only", su.dma_pa);
 	sweet_log_start();
+	sweet_sample_start();
 	return 0;
 }
 

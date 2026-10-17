@@ -971,6 +971,56 @@ sweet_crash_strings(const char *name)
 	printf("STR done: %llu KiB scanned, %d strings\n", scanned >> 10, lines);
 	kfree_data(buf, 65536);
 }
+/*
+ * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
+ * pointer backtrace of every thread of a task, from the saved user state.
+ */
+void sweet_sample_task(const char *name, int pid, task_t task);
+
+void
+sweet_sample_task(const char *name, int pid, task_t task)
+{
+	vm_map_t map = get_task_map(task);
+	uint64_t slide = 0;
+	int tn = 0;
+	thread_t thread;
+	vm_shared_region_t sr = vm_shared_region_get(task);
+
+	if (sr != NULL) {
+		slide = sr->sr_slide;
+		vm_shared_region_deallocate(sr);
+	}
+	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
+
+	task_lock(task);
+	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+		arm_saved_state_t *ss = find_user_regs(thread);
+		char line[220];
+		int n;
+		uint64_t fp;
+
+		if (ss == NULL || !is_saved_state64(ss)) {
+			continue;
+		}
+		fp = get_saved_state_fp(ss);
+		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+		for (int i = 0; i < 8 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+			uint64_t frame[2];
+			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+				break;
+			}
+			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+			if (frame[0] <= fp) {
+				break;
+			}
+			fp = frame[0];
+		}
+		printf("%s\n", line);
+	}
+	task_unlock(task);
+}
+
 #endif /* ARM64_BOARD_CONFIG_SWEET */
 
 kern_return_t

@@ -2603,7 +2603,7 @@ static
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 /*
  * SWEET IOKit trace: registry and matching calls made by the processes
- * named in boot-arg sweetiolog (comma separated, default "backboardd";
+ * named in boot-arg sweetiolog (comma separated, default "backboardd,SpringBoard";
  * "-" turns it off) are printed as "IOK name: ...", at most 400 lines per
  * boot, to find out what a daemon looks for before it gives up.
  */
@@ -2616,7 +2616,7 @@ sweet_iolog(char *name, size_t len)
 {
 	if (!sweet_iolog_parsed) {
 		if (!PE_parse_boot_argn("sweetiolog", sweet_iolog_names, sizeof(sweet_iolog_names))) {
-			strlcpy(sweet_iolog_names, "backboardd", sizeof(sweet_iolog_names));
+			strlcpy(sweet_iolog_names, "backboardd,SpringBoard", sizeof(sweet_iolog_names));
 		}
 		sweet_iolog_parsed = 1;
 	}
