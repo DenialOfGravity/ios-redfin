@@ -700,6 +700,36 @@ sweet_log_append(const char *c, int size)
 	}
 }
 
+/*
+ * Copy console bytes [*pos, total) (at most max) for live log streaming
+ * (sweet_usb.c). A reader that fell more than the ring behind skips ahead.
+ * Returns the byte count; *pos advances.
+ */
+uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+
+uint32_t
+sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
+{
+	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+	if (total - *pos > SWEET_LOG_SIZE) {
+		*pos = total - SWEET_LOG_SIZE;
+	}
+	uint32_t n = (uint32_t)MIN((uint64_t)max, total - *pos);
+	for (uint32_t i = 0; i < n; i++) {
+		out[i] = sweet_log_ring[(*pos + i) % SWEET_LOG_SIZE];
+	}
+	*pos += n;
+	return n;
+}
+
+uint64_t sweet_log_position(void);
+
+uint64_t
+sweet_log_position(void)
+{
+	return os_atomic_load(&sweet_log_total, relaxed);
+}
+
 struct sweet_log_header {
 	char magic[8];
 	uint32_t version, size;
