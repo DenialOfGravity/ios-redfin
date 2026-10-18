@@ -17,6 +17,9 @@
 
 #define SWEET                     1
 
+/* Six homogeneous A55s; cpus=N is clamped here until A76/AMP is audited. */
+#define SWEET_SMP_MAX_CPUS         6
+
 #define ARM_ARCH_TIMER
 #define __ARM_ARCH__              8
 #define __ARM_VMSA__              8

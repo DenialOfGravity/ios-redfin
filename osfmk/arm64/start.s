@@ -143,8 +143,8 @@ LEXT(reset_vector)
 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
 	add		x19, x19, EXT(ResetHandlerData)@pageoff
 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
-#if HAS_CLUSTER
-	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
+#if HAS_CLUSTER || defined(SWEET)
+	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (SWEET: core in Aff1)
 #else
 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
 #endif
@@ -279,6 +279,56 @@ LEXT(LowExceptionVectorBase)
 LEXT(bootstrap_instructions)
 
 #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+#if defined(SWEET)
+/* PSCI CPU_ON entry (physical): x0=context_id, no stack, MMU/caches off.
+ * Keep this separate from __start (which requires x0=boot_args PA).
+ * Firmware may return at EL1 or EL2; check before accessing EL1 state.
+ * The EL2 path assumes no resident hypervisor and CNTVOFF_EL2=0 on boot.
+ */
+	.align 2
+	.globl EXT(sweet_secondary_entry)
+LEXT(sweet_secondary_entry)
+	msr		DAIFSet, #0xf
+	mrs		x1, CurrentEL
+	cmp		x1, #0x4
+	b.eq	Lsweet_secondary_el1
+	cmp		x1, #0x8
+	b.ne	Lsweet_secondary_bad_el
+	adrp	x1, EXT(LowExceptionVectorBase)@page
+	add		x1, x1, EXT(LowExceptionVectorBase)@pageoff
+	msr		VBAR_EL2, x1
+	/* No stage 2, AArch64 EL1, no EL2 interrupt or FP/debug traps. */
+	mov		x1, #(1 << 31)
+	msr		HCR_EL2, x1
+	msr		VTTBR_EL2, xzr
+	msr		CPTR_EL2, xzr
+	msr		MDCR_EL2, xzr
+	mov		x1, #3
+	msr		CNTHCTL_EL2, x1
+	msr		CNTVOFF_EL2, xzr
+	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+	mrs		x1, ICC_SRE_EL2
+	orr		x1, x1, #1
+	orr		x1, x1, #8
+	msr		ICC_SRE_EL2, x1
+	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+	MOV64	x1, 0x30d00800
+	msr		SCTLR_EL1, x1
+	isb
+	adrp	x1, Lsweet_secondary_el1@page
+	add		x1, x1, Lsweet_secondary_el1@pageoff
+	msr		ELR_EL2, x1
+	mov		x1, #0x3c5			// DAIF masked, AArch64 EL1h
+	msr		SPSR_EL2, x1
+	eret
+Lsweet_secondary_bad_el:
+	b		.
+Lsweet_secondary_el1:
+	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
+	msr		SPSel, #1
+	b		EXT(LowResetVectorBase)
+#endif /* SWEET */
+
 	.align 2
 	.globl EXT(resume_idle_cpu)
 LEXT(resume_idle_cpu)
@@ -741,6 +791,12 @@ common_start:
 	 */
 	tlbi	vmalle1
 	ic		iallu
+#endif
+
+#if defined(SWEET)
+	/* Complete local TLB/I-cache invalidation before enabling the MMU. */
+	dsb		sy
+	isb
 #endif
 
 	/* If x21 is not 0, then this is either the start_cpu path or

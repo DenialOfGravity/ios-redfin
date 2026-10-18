@@ -954,6 +954,16 @@ ml_parse_cpu_topology(void)
 	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
 
+#if defined(SWEET)
+	/* Opt in to SMP. Never expose the A76s to this A55-only configuration. */
+	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
+		cpu_boot_arg = 1;
+	}
+	if (cpu_boot_arg > SWEET_SMP_MAX_CPUS) {
+		cpu_boot_arg = SWEET_SMP_MAX_CPUS;
+	}
+#endif
+
 	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
 	// so that we trigger a panic later in the boot process, once serial is enabled.
 	if (cpus_boot_arg_present && cpumask_boot_arg_present) {
@@ -1077,8 +1087,14 @@ ml_parse_cpu_topology(void)
 		}
 #endif
 
+#if defined(SWEET)
+		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
+		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
+#else
 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", MPIDR_CLUSTER_ID(cpu->phys_id));
 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", MPIDR_CPU_ID(cpu->phys_id));
+#endif
 
 		cluster->num_cpus++;
 		cluster->cpu_mask |= 1ULL << cpu->cpu_id;

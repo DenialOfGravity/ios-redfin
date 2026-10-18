@@ -922,6 +922,19 @@ cpu_start(int cpu)
 
 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
+#if defined(SWEET)
+		/* The reset stub loads these through physical addresses with caches off.
+		 * Use VA range cleans to PoC, including on coherent-I/O builds. */
+		extern uint8_t bootstrap_pagetables[BOOTSTRAP_TABLE_SIZE];
+		CleanPoC_DcacheRegion_Force((vm_offset_t)CpuDataEntries, sizeof(CpuDataEntries));
+		CleanPoC_DcacheRegion_Force((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
+		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
+		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
+		CleanPoC_DcacheRegion_Force((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore));
+		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
+		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
+		__builtin_arm_dsb(DSB_SY);
+#endif
 #if defined(KERNEL_INTEGRITY_CTRR)
 
 		/* First CPU being started within a cluster goes ahead to lock CTRR for cluster;
@@ -948,6 +961,21 @@ cpu_start(int cpu)
 
 	return KERN_SUCCESS;
 }
+
+
+#if defined(SWEET)
+/* Bring-up observer: the self-SGI clears SIGPdisabled after IRQs unmask. */
+boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+boolean_t
+sweet_cpu_signal_is_enabled(unsigned int cpu)
+{
+	if (cpu >= MAX_CPUS) {
+		return FALSE;
+	}
+	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
+	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
+}
+#endif
 
 
 void
