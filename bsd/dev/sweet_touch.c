@@ -1,8 +1,8 @@
 /*
  * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
  * Call once after the scheduler is running; all work runs on one thread.
- * Requires ABL-loaded GENI I2C firmware and an already powered L11C rail.
- * No firmware/config upload, RPMh votes or PMIC writes. Only IC data write:
+ * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+ * No firmware/config upload or direct PMIC writes. Only IC data write:
  * zero to GT9896's event status after reading a report. See hw-report.md.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -18,6 +18,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 /* Mach MIG declaration is not included by BSD's exported thread.h. */
 extern kern_return_t thread_terminate(thread_t);
+extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
 void sweet_touch_init(void);
 
@@ -105,14 +106,14 @@ touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
 }
 
 static void
-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out)
+touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
 {
 	uint32_t off = TOUCH_GPIO_CFG(pin);
 	uint32_t cfg = touch_rd(st.gpio, off);
 	if (out) {
-		/* Set the output latch before enabling output, avoiding a reset pulse. */
+		/* Set the desired latch before enabling output (reset is active low). */
 		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
-		    touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) | 2u);
+		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
 	}
 	cfg &= ~0x3ffu;
 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
@@ -490,16 +491,26 @@ touch_thread(void *arg, wait_result_t result)
 	if (!touch_clocks() || !touch_se_init()) {
 		goto out;
 	}
-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; L11C must be powered by firmware\n",
+	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
-	touch_gpio(6, 1, 0, 0, false); /* qup11 SDA/SCL, 2 mA, no internal pull */
-	touch_gpio(7, 1, 0, 0, false);
-	touch_gpio(9, 0, 3, 3, false); /* interrupt input, 8 mA, pull-up */
-	touch_gpio(90, 0, 0, 0, true); /* board digital power enable, high */
-	touch_wait(10);
-	touch_gpio(8, 0, 3, 3, true);  /* release reset; no reset-low pulse */
-	touch_wait(300);
+	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+	touch_gpio(8, 0, 3, 3, true, false);
+	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
+	if (power_error) {
+		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+		goto out;
+	}
+	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+	touch_wait(10); /* conservative rail settling; not a DT timing value */
+	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+	touch_gpio(7, 1, 0, 0, false, false);
+	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+	touch_gpio(8, 0, 3, 3, true, false);
+	touch_wait(2);
+	touch_gpio(8, 0, 3, 3, true, true);
+	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
 	uint8_t gid[12] = {0}, fid1 = 0, fid2 = 0;
 	int ge = touch_read(0x5d, 0x4022, true, gid, sizeof(gid));
 	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",

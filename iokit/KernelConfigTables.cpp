@@ -77,6 +77,11 @@ const char * gIOKernelConfigTables =
     "     'IOProviderClass' = IOResources;"
     "     'IOMatchCategory' = SweetHIDTouch;"
     "   },"
+    "   {"
+    "     'IOClass'         = SweetBattery;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = SweetBattery;"
+    "   },"
 #endif
     "   {"
     "     'IOClass'         = IOPanicPlatform;"

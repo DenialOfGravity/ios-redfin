@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
 iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
 iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
 iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
