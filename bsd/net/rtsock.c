@@ -510,6 +510,25 @@ route_output(struct mbuf *m, struct socket *so)
 		SIN6(info.rti_info[RTAX_DST])->sin6_addr.s6_addr16[1] = 0;
 	}
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	/* SWEET: which process changes IPv4 routes (network bring-up). */
+	if ((rtm->rtm_type == RTM_ADD || rtm->rtm_type == RTM_DELETE || rtm->rtm_type == RTM_CHANGE) &&
+	    info.rti_info[RTAX_DST] != NULL && info.rti_info[RTAX_DST]->sa_family == AF_INET) {
+		static int sweet_rt_logged;
+		if (sweet_rt_logged++ < 200) {
+			const uint8_t *d = (const uint8_t *)&SIN(info.rti_info[RTAX_DST])->sin_addr;
+			const uint8_t *g = (info.rti_info[RTAX_GATEWAY] != NULL &&
+			    info.rti_info[RTAX_GATEWAY]->sa_family == AF_INET) ?
+			    (const uint8_t *)&SIN(info.rti_info[RTAX_GATEWAY])->sin_addr : NULL;
+			char pname[20];
+			proc_selfname(pname, sizeof(pname));
+			printf("SWEET NET: %s route %s %u.%u.%u.%u gw %u.%u.%u.%u ifindex %u flags 0x%x\n", pname,
+			    rtm->rtm_type == RTM_ADD ? "add" : rtm->rtm_type == RTM_DELETE ? "delete" : "change",
+			    d[0], d[1], d[2], d[3], g ? g[0] : 0, g ? g[1] : 0, g ? g[2] : 0, g ? g[3] : 0,
+			    rtm->rtm_index, rtm->rtm_flags);
+		}
+	}
+#endif
 	switch (rtm->rtm_type) {
 	case RTM_ADD:
 		if (info.rti_info[RTAX_GATEWAY] == NULL) {
