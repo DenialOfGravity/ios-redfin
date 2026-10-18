@@ -359,6 +359,7 @@ protected:
 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
 private:
 	IOLock *fLock;
+	int fLogicalW, fLogicalH, fOffX, fOffY;
 	bool fDown[SWEET_TOUCH_FINGERS];
 	IOFixed fX[SWEET_TOUCH_FINGERS];
 	IOFixed fY[SWEET_TOUCH_FINGERS];
@@ -422,6 +423,12 @@ SweetHIDTouch::start(IOService *provider)
 	if (!fLock || !IOHIDEventService::start(provider)) {
 		return false;
 	}
+	int native = 0;
+	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+	fLogicalW = native ? 1080 : 1125;
+	fLogicalH = native ? 2400 : 2436;
+	fOffX = (fLogicalW - 1080) / 2;
+	fOffY = (fLogicalH - 2400) / 2;
 	/* The digitizer covers the main display (backboardd maps it 1:1). */
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
@@ -447,8 +454,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
-	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
-	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2400);
+	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
 	if (was == down && !moved) {
 		IOLockUnlock(fLock);

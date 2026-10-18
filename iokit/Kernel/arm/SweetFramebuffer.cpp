@@ -61,7 +61,17 @@ enum {
 #define SWEET_FB_NOTIFY_TYPES           8
 #define SWEET_FB_NOTIFY_VSYNC           5
 #define SWEET_FB_VSYNC_US               16667
-#define SWEET_FB_DOT_PITCH              395     /* ppi, 6.67" 1080x2400 */
+#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+/*
+ * The iOS userland only has status bar / layout data for real iPhone
+ * screens (UIKit: "No status bar visual provider for screen", the red
+ * rdar://45025538 bar for 360x800 points). The display is therefore
+ * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+ * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+ * Boot-arg sweetfb_native=1 presents the real panel size instead.
+ */
+#define SWEET_FB_LOGICAL_W              1125
+#define SWEET_FB_LOGICAL_H              2436
 #define SWEET_FB_FORMAT_BGRA            0x42475241
 
 class IOMobileFramebuffer : public IOService {
@@ -84,6 +94,8 @@ class AppleCLCD : public IOMobileFramebuffer {
 public:
 	uint64_t      fPhys;
 	uint32_t      fWidth, fHeight, fRowBytes;
+	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+	int32_t       fOffX, fOffY;             /* logical origin of the panel */
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -144,6 +156,16 @@ AppleCLCD::start(IOService *provider)
 		IOLog("SWEET FB: no boot framebuffer\n");
 		return false;
 	}
+	int native = 0;
+	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+	fLogicalW = fWidth;
+	fLogicalH = fHeight;
+	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+		fLogicalW = SWEET_FB_LOGICAL_W;
+		fLogicalH = SWEET_FB_LOGICAL_H;
+	}
+	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
@@ -169,8 +191,8 @@ AppleCLCD::start(IOService *provider)
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
 	registerService();
-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
+	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
 	return true;
 }
 
@@ -309,6 +331,19 @@ AppleCLCD::present(const uint8_t *rec)
 		if (dx < 0 || dy < 0) {
 			dx = dy = 0;
 		}
+		/* Logical (presented) display coordinates -> panel coordinates. */
+		dx -= fOffX;
+		dy -= fOffY;
+		if (dx < 0) {
+			sx -= dx;
+			w += dx;
+			dx = 0;
+		}
+		if (dy < 0) {
+			sy -= dy;
+			h += dy;
+			dy = 0;
+		}
 		if (w > (int32_t)s->width - sx) {
 			w = (int32_t)s->width - sx;
 		}
@@ -444,8 +479,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		outCount = 1;
 		break;
 	case kSweetFBGetDisplaySize:
-		out[0] = fFB->fWidth;
-		out[1] = fFB->fHeight;
+		out[0] = fFB->fLogicalW;
+		out[1] = fFB->fLogicalH;
 		outCount = 2;
 		break;
 	case kSweetFBIsMainDisplay:
