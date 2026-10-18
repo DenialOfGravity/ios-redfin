@@ -18,8 +18,6 @@ public:
 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
-	bool getTargetName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
-	bool getProductName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
@@ -76,23 +74,9 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
 	}
 }
 
-bool
-SweetPlatformExpert::getTargetName(char *name, int maxLength)
-{
-	if (name == NULL || maxLength <= 0) {
-		return false;
-	}
-	strlcpy(name, "sweet", (size_t)maxLength);
-	return true;
-}
-
-bool
-SweetPlatformExpert::getProductName(char *name, int maxLength)
-{
-	if (name == NULL || maxLength <= 0) {
-		return false;
-	}
-	strlcpy(name, "Redmi Note 10 Pro", (size_t)maxLength);
-	return true;
-}
+/*
+ * hw.target / hw.product come from IODTPlatformExpert: the first root
+ * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
+ * is what the iPhone userland (MobileGestalt) expects.
+ */
 #endif /* SWEET */

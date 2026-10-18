@@ -518,7 +518,9 @@ sysctl_hw_generic(__unused struct sysctl_oid *oidp, void *arg1,
 		 * Deprecated variables.  We still support these for
 		 * backwards compatibility purposes only.
 		 */
-#if XNU_TARGET_OS_OSX && defined(__arm64__)
+#if XNU_TARGET_OS_OSX && defined(__arm64__) && !defined(ARM64_BOARD_CONFIG_SWEET)
+	/* SWEET: the macOS config runs the iOS userland, which wants the
+	 * device-tree names (hw.machine iPhone10,3, hw.model D22AP). */
 	/* The following two are kludged for backward
 	 * compatibility. Use hw.product/hw.target for something
 	 * consistent instead. */
