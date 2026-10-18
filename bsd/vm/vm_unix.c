@@ -1755,7 +1755,12 @@ out:
 	return error;
 }
 
-#if !XNU_TARGET_OS_OSX
+#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * SWEET runs the iOS userland on the macOS config: SpringBoard calls
+ * pid_hibernate when an app leaves the foreground, and nosys (SIGSYS)
+ * killed it. Without CONFIG_FREEZE this returns 0, as on iOS.
+ */
 /*
  * Freeze the specified process (provided in args->pid), or find and freeze a PID.
  * When a process is specified, this call is blocking, otherwise we wake up the
@@ -1817,7 +1822,7 @@ out:
 	*ret = error;
 	return error;
 }
-#endif /* !XNU_TARGET_OS_OSX */
+#endif /* !XNU_TARGET_OS_OSX || SWEET */
 
 #if SOCKETS
 int

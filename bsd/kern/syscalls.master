@@ -650,7 +650,7 @@
 432	AUE_NULL	ALL	{ int audit_session_port(au_asid_t asid, user_addr_t portnamep); }
 433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
 434	AUE_NULL	ALL	{ int pid_resume(int pid); }
-#if CONFIG_EMBEDDED
+#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)
 435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
 #else
 435     AUE_NULL        ALL     { int nosys(void); }
