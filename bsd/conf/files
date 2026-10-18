@@ -106,6 +106,8 @@ bsd/dev/random/randomdev.c		standard
 bsd/dev/memdev.c			standard
 bsd/dev/sweet_ufs.c			standard
 bsd/dev/sweet_sample.c			standard
+bsd/dev/sweet_keys.c			standard
+bsd/dev/sweet_touch.c			standard
 bsd/dev/mem.c				standard
 bsd/dev/munge.c 			optional config_requires_u32_munging
 bsd/dev/unix_startup.c			standard

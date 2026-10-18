@@ -47,6 +47,8 @@ extern void thread_deallocate(thread_t);
 extern int hz;
 static void sweet_log_start(void);
 extern void sweet_sample_start(void);
+extern void sweet_keys_init(void);
+extern void sweet_touch_init(void);
 
 #define REG_CAP         0x00
 #define REG_IS          0x20
@@ -599,6 +601,9 @@ sweet_ufs_init(void)
 	    su.writable ? "read-write" : "read-only", su.dma_pa);
 	sweet_log_start();
 	sweet_sample_start();
+	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+	sweet_keys_init();
+	sweet_touch_init();
 	return 0;
 }
 
