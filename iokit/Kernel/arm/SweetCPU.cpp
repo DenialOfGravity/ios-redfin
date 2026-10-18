@@ -73,9 +73,10 @@ SweetCPU::start(IOService *provider)
 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
 		return false;
 	}
-	if (cpu->phys_id > 0x500 || (cpu->phys_id & 0xff) != 0 ||
+	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
-		panic("SWEET CPU: invalid A55 topology cpu=%u mpidr=0x%x count=%u",
+		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
 	}
 	if (!IOCPU::start(provider)) {
@@ -127,7 +128,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint32_t requested = 1;
 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
-	IOLog("SWEET CPU: requested=%u selected=%u (A55 limit=%u)\n",
+	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
 
 	uint64_t deadline;

@@ -955,7 +955,7 @@ ml_parse_cpu_topology(void)
 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
 
 #if defined(SWEET)
-	/* Opt in to SMP. Never expose the A76s to this A55-only configuration. */
+	/* Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; cores 6-7 are the A76s). */
 	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
 		cpu_boot_arg = 1;
 	}

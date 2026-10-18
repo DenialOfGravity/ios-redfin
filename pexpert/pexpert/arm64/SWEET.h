@@ -17,8 +17,13 @@
 
 #define SWEET                     1
 
-/* Six homogeneous A55s; cpus=N is clamped here until A76/AMP is audited. */
-#define SWEET_SMP_MAX_CPUS         6
+/*
+ * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+ * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+ * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+ * clusters yet).
+ */
+#define SWEET_SMP_MAX_CPUS         8
 
 #define ARM_ARCH_TIMER
 #define __ARM_ARCH__              8
