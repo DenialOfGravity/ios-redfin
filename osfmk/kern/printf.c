@@ -908,12 +908,26 @@ vprintf(const char *fmt, va_list ap)
 	return vprintf_internal(fmt, ap, __builtin_return_address(0));
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * The paniclog (backtraces, register dumps) bypasses the console's log ring
+ * (unbuffered output, or console output disabled): put it in the persistent
+ * log ring too (bsd/dev/sweet_ufs.c, lock-free), so the RAM rescue keeps it.
+ */
+extern void sweet_log_append(const char *c, int size);
+#endif
+
 void
 consdebug_putc(char c)
 {
 	if (!disableConsoleOutput) {
 		console_write_char(c);
 	}
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	else {
+		sweet_log_append(&c, 1);
+	}
+#endif
 
 	debug_putc(c);
 
@@ -928,6 +942,10 @@ consdebug_putc_unbuffered(char c)
 	if (!disableConsoleOutput) {
 		console_write_unbuffered(c);
 	}
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	/* console_write_unbuffered goes straight to _cnputc, past the log ring in _cnputs. */
+	sweet_log_append(&c, 1);
+#endif
 
 	debug_putc(c);
 

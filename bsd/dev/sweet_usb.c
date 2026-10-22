@@ -882,7 +882,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
 /*
  * Command server on 192.168.7.2:5141 (UDP): each datagram is poke script
  * text (bsd/dev/sweet_poke.c: r/w/m/p/s lines), run at once in this
- * thread, results in the console (and so in the live log); "reboot" resets
+ * thread, results in the console (and so in the live log); "panic" panics
+ * (to test the panic path); "reboot" resets
  * the phone with PSCI (the shim already set the PMIC reason to
  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
  */
@@ -933,6 +934,10 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
 			if (cmd[0] == 's') {
 				continue;
 			}
+		}
+		if (strncmp(cmd, "panic", 5) == 0) {
+			/* Tests the panic path: backtraces must reach the persistent log. */
+			panic("SWEET CMD: panic requested over USB");
 		}
 		if (strncmp(cmd, "reboot", 6) == 0) {
 			ud_sleep_ms(1000);      /* let HFS finish the journal writes */
