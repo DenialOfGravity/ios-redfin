@@ -38,6 +38,7 @@
 #include <sys/kern_event.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 void sweet_usb_probe(void);
 static void sweet_usb_gadget_start(vm_offset_t dwc);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -256,9 +257,16 @@ dwc_rd(uint32_t off)
 	return usb_rd(ud.dwc, off);
 }
 
+static bool ud_dma_uncached;
+static vm_offset_t ud_smmu_cb;  /* our apps SMMU context bank (flame), for fault logging */
+
 static void
 ud_sync(uint32_t off, uint32_t len)
 {
+	if (ud_dma_uncached) {
+		__asm__ volatile ("dsb sy" ::: "memory");
+		return;
+	}
 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
 }
 
@@ -798,10 +806,83 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
 			}
 			dwc_wr(GEVNTCOUNT, count);
 		}
-		if ((++ticks % 30000) == 0) {
-			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+		if ((++ticks % 10000) == 0) {
+			volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+			volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+			ud_sync(UD_TRB_RX, 16);
+			ud_sync(UD_TRB_TX, 16);
+			printf("SWEET USB: ue0 rx %llu tx %llu frames, events %llu; rx trb %08x %08x tx trb %08x %08x busy %d DSTS %08x\n",
+			    ud.rx_frames, ud.tx_frames, (unsigned long long)ud.events, rt[2], rt[3], tt[2], tt[3],
+			    ud.tx_busy, dwc_rd(DSTS));
+		}
+		if (ticks <= 60000 && (ticks % 5000) == 0) {
+			printf("SWEET USB: t=%us DCFG %08x DCTL %08x DSTS %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x GCTL %08x GSTS %08x EVCNT %x\n",
+			    ticks / 1000, dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(0xc200),
+			    dwc_rd(0xc2c0), dwc_rd(GCTL), dwc_rd(0xc118), dwc_rd(GEVNTCOUNT));
+			if (ud_smmu_cb) {
+				printf("SWEET USB: busERR addr %08x%08x; SMMU cb fsr %x far %08x%08x fsynr0 %x fsynr1 %x\n",
+				    dwc_rd(0xc134), dwc_rd(0xc130), usb_rd(ud_smmu_cb, 0x58),
+				    usb_rd(ud_smmu_cb, 0x64), usb_rd(ud_smmu_cb, 0x60),
+				    usb_rd(ud_smmu_cb, 0x68), usb_rd(ud_smmu_cb, 0x6c));
+			}
 		}
 		ud_sleep_ms(1);
+	}
+}
+
+/*
+ * Command server on 192.168.7.2:5141 (UDP): each datagram is poke script
+ * text (bsd/dev/sweet_poke.c: r/w/m/p/s lines), run at once in this
+ * thread, results in the console (and so in the live log); "reboot" resets
+ * the phone with PSCI (the shim already set the PMIC reason to
+ * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
+ */
+extern void sweet_poke_run(const char *text, unsigned len);
+
+static void
+ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	static char cmd[1400];
+	socket_t so = NULL;
+	struct sockaddr_in me;
+
+	for (int tries = 0; so == NULL; tries++) {
+		if (sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+			so = NULL;
+			ud_sleep_ms(1000);
+			continue;
+		}
+		bzero(&me, sizeof(me));
+		me.sin_len = sizeof(me);
+		me.sin_family = AF_INET;
+		me.sin_port = htons(5141);
+		me.sin_addr.s_addr = htonl(INADDR_ANY);
+		if (sock_bind(so, (struct sockaddr *)&me) != 0) {
+			sock_close(so);
+			so = NULL;
+			ud_sleep_ms(1000);
+		}
+	}
+	printf("SWEET CMD: listening on udp 5141 (poke lines, \"reboot\")\n");
+	for (;;) {
+		struct iovec iov = { .iov_base = cmd, .iov_len = sizeof(cmd) - 1 };
+		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+		size_t got = 0;
+		if (sock_receive(so, &msg, 0, &got) != 0 || got == 0) {
+			ud_sleep_ms(10);
+			continue;
+		}
+		cmd[got] = 0;
+		printf("SWEET CMD: %u bytes: %.60s\n", (unsigned)got, cmd);
+		if (strncmp(cmd, "reboot", 6) == 0) {
+			printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
+			ud_sleep_ms(500);       /* let the log go out */
+			register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+			continue;
+		}
+		sweet_poke_run(cmd, (unsigned)got);
+		printf("SWEET CMD: done\n");
 	}
 }
 
@@ -853,23 +934,265 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 }
 
+/*
+ * flame: the DWC3 masters through the apps SMMU (MMU-500 at 0x15000000) as
+ * stream 0x140 (DT iommus). ABL removes its stream-match entry when it
+ * leaves fastboot, and the SMMU faults unmatched streams (sCR0.USFCFG), so
+ * the first DMA (the ep0 TRB fetch) raised a global fault and the SoC
+ * reset. A bypass S2CR is refused (it reads back as type 2, fault: the
+ * hypervisor's policy), so, like Linux, the stream gets its own stage-1
+ * context bank: our tables identity-map the 2 MB block holding the DMA
+ * buffers (below 4 GB, see sweetusbdma), as Normal non-cacheable.
+ */
+#define AS_PA           0x15000000ULL
+#define AS_SIZE         0x100000
+#define UD_PT_OFF       0x100000        /* page tables 1 MB above the DMA buffers */
+
+static int
+ud_smmu_setup(uint64_t dma_pa)
+{
+	vm_offset_t as = ml_io_map(AS_PA, AS_SIZE);
+	if (!as) {
+		return -1;
+	}
+	uint32_t idr0 = usb_rd(as, 0x20), idr1 = usb_rd(as, 0x24);
+	unsigned nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
+	uint32_t pagesz = (idr1 >> 31) ? 0x10000 : 0x1000;
+	uint32_t cbbase = (1u << (((idr1 >> 28) & 7) + 1)) * pagesz;
+	uint64_t used[2] = {0, 0};
+	int free_smr = -1, cb = -1;
+	for (unsigned i = 0; i < nsmr; i++) {
+		uint32_t m = usb_rd(as, 0x800 + 4 * i), c = usb_rd(as, 0xc00 + 4 * i);
+		if (!(m >> 31)) {
+			if (free_smr < 0) {
+				free_smr = (int)i;
+			}
+			continue;
+		}
+		if (((c >> 16) & 3) == 0) {
+			used[(c & 0xff) / 64] |= 1ULL << ((c & 0xff) % 64);
+		}
+		if (((0x140 ^ (m & 0x7fff)) & ~((m >> 16) & 0x7fff) & 0x7fff) == 0) {
+			printf("SWEET USB: SMMU smr%u %x already matches 0x140 (s2cr %x)\n", i, m, c);
+			return -1;
+		}
+	}
+	/* Lowest free bank, as Linux allocates: the top banks may be secure (sCR1.NSNUMCBO). */
+	for (int c = 0; c < (int)ncb; c++) {
+		if (!(used[c / 64] & (1ULL << (c % 64))) && !(usb_rd(as, cbbase + c * pagesz) & 1) &&
+		    usb_rd(as, pagesz + 4 * c) == 0) {
+			cb = c;
+			break;
+		}
+	}
+	/*
+	 * ABL's own DMA streams (UFS 0x300 etc., SMR0-3) point at banks with
+	 * CBAR 0x1f000 (S1, S2 bypass), CBA2R 1 and SCTLR 0xe0: translation
+	 * OFF, i.e. physical addresses, the bypass the hypervisor refuses to
+	 * take as an S2CR type (poke dump, 2026-10-20). Do the same for 0x140.
+	 * (Pointing 0x140 at the UFS bank itself stalled this thread; our own
+	 * bank with tables gave translation faults.) sweetusbsmmu=1: tables.
+	 */
+	int mode = 0;
+	PE_parse_boot_argn("sweetusbsmmu", &mode, sizeof(mode));
+	if (mode == 0 && free_smr >= 0 && cb >= 0) {
+		vm_offset_t cbv = as + cbbase + cb * pagesz;
+		*(volatile uint32_t *)(cbv + 0x00) = 0xe0;                      /* SCTLR: M=0, like ABL */
+		*(volatile uint32_t *)(as + pagesz + 0x800 + 4 * cb) = 1;      /* CBA2R: AArch64 */
+		*(volatile uint32_t *)(as + pagesz + 4 * cb) = 0x1f000;        /* CBAR as ABL's banks */
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(as + 0xc00 + 4 * free_smr) = (uint32_t)cb;
+		*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | 0x140;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		ud_smmu_cb = cbv;
+		printf("SWEET USB: SMMU smr%d %x s2cr %x -> cb%d cbar %x cba2r %x sctlr %x (translation off, as ABL)\n",
+		    free_smr, usb_rd(as, 0x800 + 4 * free_smr), usb_rd(as, 0xc00 + 4 * free_smr), cb,
+		    usb_rd(as, pagesz + 4 * cb), usb_rd(as, pagesz + 0x800 + 4 * cb), usb_rd(cbv, 0));
+		return 0;
+	}
+	if (free_smr < 0 || cb < 0 || (dma_pa >> 39)) {
+		printf("SWEET USB: SMMU: smr %d cb %d dma 0x%llx unusable\n", free_smr, cb, dma_pa);
+		return -1;
+	}
+	/*
+	 * Tables in kernel memory (like the GPU SMMU setup that works, whose
+	 * tables were in high RAM): L1 (T0SZ 25, 39-bit input) -> L2 -> one
+	 * 2 MB identity block holding the DMA buffers. Walks non-cacheable;
+	 * the tables are cleaned to the point of coherency.
+	 */
+	vm_offset_t pt = 0;
+	if (kmem_alloc_contig(kernel_map, &pt, 0x2000, PAGE_MASK, 0, 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return -1;
+	}
+	uint64_t pt_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)pt)) + (pt & PAGE_MASK);
+	uint64_t pt2_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(pt + 0x1000))) + ((pt + 0x1000) & PAGE_MASK);
+	uint64_t blk = dma_pa & ~0x1fffffULL;
+	((volatile uint64_t *)pt)[(blk >> 30) & 0x1ff] = pt2_pa | 3;
+	((volatile uint64_t *)(pt + 0x1000))[(blk >> 21) & 0x1ff] =
+	    blk | (1u << 10) | (3u << 8) | (1u << 6) | 1u;      /* AF, ISH, AP=01, attr0, block */
+	flush_dcache64((addr64_t)pt_pa, 0x1000, TRUE);
+	flush_dcache64((addr64_t)pt2_pa, 0x1000, TRUE);
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	vm_offset_t c = as + cbbase + cb * pagesz;
+	ud_smmu_cb = c;
+#define CBW(off, v) (*(volatile uint32_t *)(c + (off)) = (v))
+	CBW(0x00, 0);                                           /* SCTLR off while programming */
+	*(volatile uint32_t *)(as + pagesz + 0x800 + 4 * cb) = 1;       /* CBA2R: AArch64 */
+	*(volatile uint32_t *)(as + pagesz + 4 * cb) = (1u << 16) | (0xfu << 12) | (3u << 8) | (cb + 1);
+	CBW(0x10, 2);                                           /* TCR2: 40-bit PA */
+	CBW(0x20, (uint32_t)pt_pa);
+	CBW(0x24, (uint32_t)(pt_pa >> 32));
+	/*
+	 * Non-cacheable, non-shareable table walks: the tables are written
+	 * through an uncached mapping, and ABL may have left cache lines for
+	 * this RAM (a cacheable walk found no valid entry: translation fault
+	 * at the first TRB fetch while the descriptors read back right).
+	 */
+	CBW(0x30, 25 | (1u << 23));
+	CBW(0x38, 0x0000ff44);                                  /* MAIR0: attr0 Normal NC */
+	CBW(0x58, 0xffffffff);                                  /* clear FSR */
+	CBW(0x00, 1 | 2 | 4 | 0x20 | 0x40);                     /* M TRE AFE CFRE CFIE */
+#undef CBW
+	*(volatile uint32_t *)(as + 0x68) = 0;                  /* TLBIALLNSNH */
+	*(volatile uint32_t *)(as + 0x70) = 0;                  /* TLBGSYNC */
+	for (int i = 0; i < 1000 && (usb_rd(as, 0x74) & 1); i++) {
+		delay(1);
+	}
+	*(volatile uint32_t *)(as + 0xc00 + 4 * free_smr) = (uint32_t)cb;      /* translate via cb */
+	*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | 0x140;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	/* Self-test: read back our descriptors and ask the SMMU to translate (ATS1PR). */
+	printf("SWEET USB: SMMU pt L1[%llu] %llx L2[%llu] %llx tcr %x tcr2 %x mair0 %x ttbr0 %x:%x\n",
+	    (blk >> 30) & 0x1ff, ((volatile uint64_t *)pt)[(blk >> 30) & 0x1ff], (blk >> 21) & 0x1ff,
+	    ((volatile uint64_t *)(pt + 0x1000))[(blk >> 21) & 0x1ff], usb_rd(c, 0x30), usb_rd(c, 0x10),
+	    usb_rd(c, 0x38), usb_rd(c, 0x24), usb_rd(c, 0x20));
+	*(volatile uint32_t *)(c + 0x800) = (uint32_t)dma_pa + 0x1000;       /* ATS1PR lo */
+	*(volatile uint32_t *)(c + 0x804) = 0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (int i = 0; i < 1000 && (usb_rd(c, 0x8f0) & 1); i++) {
+		delay(1);
+	}
+	printf("SWEET USB: SMMU ATS1PR(0x%llx): atsr %x par %08x%08x fsr %x\n", dma_pa + 0x1000,
+	    usb_rd(c, 0x8f0), usb_rd(c, 0x54), usb_rd(c, 0x50), usb_rd(c, 0x58));
+	*(volatile uint32_t *)(c + 0x58) = 0xffffffff;
+	printf("SWEET USB: SMMU smr%d %x s2cr %x -> cb%d cbar %x sctlr %x ttbr0 0x%llx (identity 2 MB at 0x%llx)\n",
+	    free_smr, usb_rd(as, 0x800 + 4 * free_smr), usb_rd(as, 0xc00 + 4 * free_smr), cb,
+	    usb_rd(as, pagesz + 4 * cb), usb_rd(as, cbbase + cb * pagesz), pt_pa, blk);
+	return 0;
+}
+
+/*
+ * flame: the Synopsys femto HS PHY of the primary port (hsphy@88e2000, the
+ * DWC3 node's usb-phy; 88e3000 is the second, disabled controller's). ABL runs fastboot at
+ * SuperSpeed and leaves this PHY in an unknown power state; the device
+ * controller ran but no host ever saw a connection. Same register sequence
+ * as Linux qcom_snps_hsphy_init (phy-qcom-snps-femto-v2.c) minus the
+ * regulators and the GCC block reset.
+ */
+#define HSPHY_PA        0x088e2000
+#define HP_UTMI_CTRL0   0x3c
+#define HP_UTMI_CTRL5   0x50
+#define HP_COMMON0      0x54
+#define HP_COMMON1      0x58
+#define HP_COMMON2      0x5c
+#define HP_CTRL1        0x60
+#define HP_CTRL2        0x64
+#define HP_CFG0         0x94
+#define HP_REFCLK       0xa0
+
+static void
+hp_rmw(vm_offset_t p, uint32_t off, uint32_t mask, uint32_t val)
+{
+	uint32_t v = usb_rd(p, off);
+	*(volatile uint32_t *)(p + off) = (v & ~mask) | (val & mask);
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+ud_hsphy_dump(vm_offset_t p, const char *when)
+{
+	printf("SWEET USB: hsphy %s: utmi0 %x utmi5 %x common0 %x common1 %x common2 %x ctrl1 %x ctrl2 %x cfg0 %x refclk %x\n",
+	    when, usb_rd(p, HP_UTMI_CTRL0), usb_rd(p, HP_UTMI_CTRL5), usb_rd(p, HP_COMMON0),
+	    usb_rd(p, HP_COMMON1), usb_rd(p, HP_COMMON2), usb_rd(p, HP_CTRL1), usb_rd(p, HP_CTRL2),
+	    usb_rd(p, HP_CFG0), usb_rd(p, HP_REFCLK));
+}
+
+static void
+ud_hsphy_init(void)
+{
+	int doinit = 1;
+	PE_parse_boot_argn("sweethsphy", &doinit, sizeof(doinit));
+	vm_offset_t p = ml_io_map(HSPHY_PA, 0x1000);
+	if (!p) {
+		return;
+	}
+	ud_hsphy_dump(p, "as ABL left it");
+	if (!doinit) {
+		return;
+	}
+	hp_rmw(p, HP_CFG0, 1u << 1, 1u << 1);           /* UTMI_PHY_CMN_CTRL_OVERRIDE_EN */
+	hp_rmw(p, HP_UTMI_CTRL5, 1u << 1, 1u << 1);     /* POR */
+	hp_rmw(p, HP_COMMON0, 7u << 4, 0);              /* FSEL */
+	hp_rmw(p, HP_COMMON1, 1u << 5, 1u << 5);        /* PLLBTUNE */
+	hp_rmw(p, HP_REFCLK, 3u, 2u);                   /* REFCLK_SEL default */
+	hp_rmw(p, HP_COMMON1, 1u << 4, 1u << 4);        /* VBUSVLDEXTSEL0 */
+	hp_rmw(p, HP_CTRL1, 1u << 0, 1u << 0);          /* VBUSVLDEXT0 */
+	hp_rmw(p, HP_COMMON2, 1u << 0, 1u << 0);        /* VREGBYPASS */
+	hp_rmw(p, HP_CTRL2, (1u << 3) | (1u << 2), (1u << 3) | (1u << 2));     /* SUSPEND_N(_SEL) */
+	hp_rmw(p, HP_UTMI_CTRL0, 1u << 0, 1u << 0);     /* SLEEPM */
+	hp_rmw(p, HP_COMMON0, 1u << 2, 0);              /* SIDDQ off: power up */
+	delay(100);
+	hp_rmw(p, HP_UTMI_CTRL5, 1u << 1, 0);           /* POR release */
+	hp_rmw(p, HP_CTRL2, 1u << 3, 0);
+	hp_rmw(p, HP_CFG0, 1u << 1, 0);
+	hp_rmw(p, 0x70, 0xff, 0x43);                    /* DT qcom,param-override-seq: 0x43 @ X1 */
+	delay(1000);
+	ud_hsphy_dump(p, "after init");
+}
+
 static void
 sweet_usb_gadget_start(vm_offset_t dwc)
 {
 	thread_t thread;
 
 	ud.dwc = dwc;
-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		printf("SWEET USB: no DMA memory\n");
-		return;
+	/*
+	 * flame: DMA buffers at a fixed physical address below 4 GB (RAM XNU
+	 * does not manage; ABL's own USB buffers were at 0xfd34c000), mapped
+	 * write-combining, identity-mapped for the DWC3 in the apps SMMU
+	 * (ud_smmu_setup). Boot-arg sweetusbdma=0: kernel memory, no SMMU setup
+	 * (the Redmi path).
+	 */
+	uint64_t lowpa = 0;
+	PE_parse_boot_argn("sweetusbdma", &lowpa, sizeof(lowpa));
+	if (lowpa) {
+		ud.dma = ml_io_map_wcomb((vm_offset_t)lowpa, UD_SIZE);
+		if (!ud.dma) {
+			printf("SWEET USB: low DMA map failed\n");
+			return;
+		}
+		bzero((void *)ud.dma, UD_SIZE);
+		ud.dma_pa = lowpa;
+		ud_dma_uncached = true;
+	} else {
+		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			printf("SWEET USB: no DMA memory\n");
+			return;
+		}
+		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+		if (!pn) {
+			return;
+		}
+		ud.dma_pa = ptoa_64(pn);
 	}
-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
-	if (!pn) {
-		return;
-	}
-	ud.dma_pa = ptoa_64(pn);
 	ud_if_create();
+	if (ud_smmu_setup(ud.dma_pa) != 0) {
+		printf("SWEET USB: SMMU setup failed; not starting the device\n");
+		return;
+	}
 
 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
 	dwc_wr(DCTL, DCTL_CSFTRST);
@@ -883,18 +1206,21 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 		return;
 	}
 
+	printf("SWEET USB: step event buffer at 0x%llx\n", ud.dma_pa + UD_EVT);
 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
 	ud.evt_pos = 0;
 
+	printf("SWEET USB: step dcfg\n");
 	/* High speed, address 0 */
 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
 	dwc_wr(DCFG, dcfg | 0);
 	/* Events: disconnect, USB reset, connect done */
 	dwc_wr(DEVTEN, 0x7);
 
+	printf("SWEET USB: step ep0 commands\n");
 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
 	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
@@ -905,7 +1231,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 		return;
 	}
 	dwc_wr(DALEPENA, 0x3);
+	printf("SWEET USB: step start setup\n");
 	ud_start_setup();
+	printf("SWEET USB: step qscratch\n");
+	ud_hsphy_init();
 
 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
 	if (qs != 0) {
@@ -930,6 +1259,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 	int livelog = 1;
 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+	if (ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
 }

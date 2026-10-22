@@ -76,14 +76,19 @@ flame_wdt_start(void)
 	IOLog("FLAME WDT: petting every %d s\n", FLAME_WDT_PET_S);
 }
 
+extern "C" void sweet_log_mirror_start(void);
+extern "C" void sweet_poke_start(void);
+
 bool
 SweetPlatformExpert::start(IOService *provider)
 {
+	sweet_log_mirror_start();       /* crash rescue: bsd/dev/sweet_ufs.c */
 	IOLog("SWEET: starting device-tree platform expert\n");
 	if (!IODTPlatformExpert::start(provider)) {
 		return false;
 	}
 	flame_wdt_start();
+	sweet_poke_start();             /* register scripts: bsd/dev/sweet_poke.c */
 	registerService();
 	IOLog("SWEET: platform expert registered\n");
 	return true;

@@ -689,8 +689,80 @@ static uint64_t _Atomic sweet_log_total;
 static int sweet_log_chan;
 static uint32_t sweet_log_secs = SWEET_LOG_SECS;
 
-/* Called for all console output, any context: never blocks. */
+/*
+ * Uncached mirror of the ring for crash rescue (shim/ramlog.c): DRAM keeps
+ * its contents across the warm reset into fastboot, but the cached ring
+ * itself loses whatever was still dirty in the CPU caches. From
+ * sweet_log_mirror_start() on (once ml_io_map works), every byte also goes
+ * to a write-combining mirror at the top of RAM, above XNU's range:
+ *   +0      "SWEETMIR" | u64 total | u32 ring size
+ *   +0x1000 ring bytes (offset of byte n = n % ring size)
+ * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
+ */
+#define SWEET_MIRROR_PA         0x1fa000000ULL
+struct sweet_mirror_header {
+	char magic[8];
+	uint64_t total;
+	uint32_t size;
+};
+static volatile struct sweet_mirror_header *sweet_mirror_hdr;
+static volatile char *sweet_mirror_ring;
+
+static void
+sweet_log_put(const char *c, int size)
+{
+	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
+	for (int i = 0; i < size; i++) {
+		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+	}
+	if (sweet_mirror_ring) {
+		for (int i = 0; i < size; i++) {
+			sweet_mirror_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+		}
+		uint64_t end = at + (uint64_t)size;
+		if (end > sweet_mirror_hdr->total) {
+			sweet_mirror_hdr->total = end;
+		}
+	}
+}
+
+void sweet_log_mirror_start(void);
+
+void
+sweet_log_mirror_start(void)
+{
+	extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+	vm_offset_t m = ml_io_map_wcomb((vm_offset_t)SWEET_MIRROR_PA, 0x1000 + SWEET_LOG_SIZE);
+	if (!m) {
+		return;
+	}
+	volatile struct sweet_mirror_header *h = (volatile struct sweet_mirror_header *)m;
+	volatile char *r = (volatile char *)(m + 0x1000);
+	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+	for (uint64_t i = total > SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : 0; i < total; i++) {
+		r[i % SWEET_LOG_SIZE] = sweet_log_ring[i % SWEET_LOG_SIZE];
+	}
+	h->total = total;
+	h->size = SWEET_LOG_SIZE;
+	const char *magic = "SWEETMIR";
+	for (int i = 0; i < 8; i++) {
+		h->magic[i] = magic[i];
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	sweet_mirror_hdr = h;
+	sweet_mirror_ring = r;
+	printf("SWEET LOG: uncached mirror at 0x%llx for crash rescue\n", SWEET_MIRROR_PA);
+}
+
+/*
+ * Called for all console output, any context: never blocks. Each line in
+ * the ring (not on screen) starts with "[sss.mmm] ", seconds since the
+ * timer started (flame: 19.2 MHz). No boot-arg: this runs from the first
+ * console byte, before boot-args can be read.
+ * Concurrent writers can interleave mid-line, as on the console itself.
+ */
 void sweet_log_append(const char *c, int size);
+static bool sweet_log_sol = true;
 
 void
 sweet_log_append(const char *c, int size)
@@ -698,9 +770,25 @@ sweet_log_append(const char *c, int size)
 	if (size <= 0) {
 		return;
 	}
-	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
+	int start = 0;
 	for (int i = 0; i < size; i++) {
-		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+		if (sweet_log_sol) {
+			if (i > start) {
+				sweet_log_put(c + start, i - start);
+			}
+			char ts[24];
+			uint64_t ms = mach_absolute_time() / 19200;
+			int n = snprintf(ts, sizeof(ts), "[%4llu.%03llu] ", ms / 1000, ms % 1000);
+			sweet_log_put(ts, n);
+			start = i;
+			sweet_log_sol = false;
+		}
+		if (c[i] == '\n') {
+			sweet_log_sol = true;
+		}
+	}
+	if (size > start) {
+		sweet_log_put(c + start, size - start);
 	}
 }
 
