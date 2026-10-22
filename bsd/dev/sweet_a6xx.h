@@ -95,6 +95,7 @@ uint32_t a6_fence_read(const struct a6_gpu *g);
 /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */
 int a6_map(struct a6_gpu *g, uint64_t iova, uint64_t pa, uint64_t size);
 int a6_map_pages(struct a6_gpu *g, uint64_t iova, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+void a6_unmap(struct a6_gpu *g, uint64_t iova, uint64_t size);	/* clear 4K entries; then a6_tlb_flush */
 void a6_unmap_high(struct a6_gpu *g);	/* drop all mappings above 1 GB, reset the arena */
 void a6_tlb_flush(const struct a6_gpu *g);
 int a6_clear_fault(const struct a6_gpu *g);	/* 1 if an SMMU fault was cleared */

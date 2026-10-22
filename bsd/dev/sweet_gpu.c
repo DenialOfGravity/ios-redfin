@@ -398,11 +398,70 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 
 static uint64_t user_va_next = USER_VA_BASE;
 
+/* Freed ranges, sorted by address and merged: reused first fit, so page tables are reused too. */
+#define USER_VA_FREE_MAX 1024
+static struct { uint64_t va, size; } user_va_free[USER_VA_FREE_MAX];
+static uint32_t user_va_nfree;
+
+static uint64_t
+user_va_alloc(uint64_t size)
+{
+	for (uint32_t i = 0; i < user_va_nfree; i++) {
+		if (user_va_free[i].size >= size) {
+			uint64_t va = user_va_free[i].va;
+			user_va_free[i].va += size;
+			user_va_free[i].size -= size;
+			if (user_va_free[i].size == 0) {
+				memmove(&user_va_free[i], &user_va_free[i + 1], (user_va_nfree - i - 1) * sizeof(user_va_free[0]));
+				user_va_nfree--;
+			}
+			return va;
+		}
+	}
+	if (user_va_next + size > USER_VA_END) {
+		return 0;
+	}
+	uint64_t va = user_va_next;
+	user_va_next += size;
+	return va;
+}
+
+static void
+user_va_release(uint64_t va, uint64_t size)
+{
+	uint32_t i = 0;
+	while (i < user_va_nfree && user_va_free[i].va < va) {
+		i++;
+	}
+	if (i > 0 && user_va_free[i - 1].va + user_va_free[i - 1].size == va) {
+		user_va_free[i - 1].size += size;
+		if (i < user_va_nfree && va + size == user_va_free[i].va) {
+			user_va_free[i - 1].size += user_va_free[i].size;
+			memmove(&user_va_free[i], &user_va_free[i + 1], (user_va_nfree - i - 1) * sizeof(user_va_free[0]));
+			user_va_nfree--;
+		}
+		return;
+	}
+	if (i < user_va_nfree && va + size == user_va_free[i].va) {
+		user_va_free[i].va = va;
+		user_va_free[i].size += size;
+		return;
+	}
+	if (user_va_nfree == USER_VA_FREE_MAX) {
+		return;         /* leaks the range */
+	}
+	memmove(&user_va_free[i + 1], &user_va_free[i], (user_va_nfree - i) * sizeof(user_va_free[0]));
+	user_va_free[i].va = va;
+	user_va_free[i].size = size;
+	user_va_nfree++;
+}
+
 /*
- * Map pages at a fresh GPU VA (never reused yet: freed buffers leak their VA,
- * and the page-table arena is finite). The caller cleans the CPU caches
- * through a virtual mapping: physical cache operations panic for RAM outside
- * the physmap (kernel memory below 4 GB, "phystokv_range: illegal PA").
+ * Map pages at a free GPU VA (64 KB granules; freed ranges are reused, and
+ * with them the page tables, of which the arena has only ~250). The caller
+ * cleans the CPU caches through a virtual mapping: physical cache operations
+ * panic for RAM outside the physmap (kernel memory below 4 GB, "phystokv_range:
+ * illegal PA").
  */
 int
 sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size)
@@ -410,15 +469,18 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
 	if (!gpu_ready || npages == 0) {
 		return -1;
 	}
-	uint64_t size = (uint64_t)npages * page_size;
+	uint64_t size = ((uint64_t)npages * page_size + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
 	lck_mtx_lock(&sweet_gpu_lock);
-	uint64_t iova = user_va_next;
-	if (iova + size > USER_VA_END) {
+	uint64_t iova = user_va_alloc(size);
+	if (iova == 0) {
 		lck_mtx_unlock(&sweet_gpu_lock);
 		return -1;
 	}
-	user_va_next = (iova + size + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
 	int rc = a6_map_pages(&gpu, iova, pages, npages, page_size);
+	if (rc) {
+		a6_unmap(&gpu, iova, size);
+		user_va_release(iova, size);
+	}
 	a6_tlb_flush(&gpu);
 	lck_mtx_unlock(&sweet_gpu_lock);
 	if (rc) {
@@ -426,6 +488,23 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
 	}
 	*iova_out = iova;
 	return 0;
+}
+
+/* Undo sweet_gpu_map_user (submissions are synchronous: nothing in flight uses it). */
+void
+sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
+{
+	uint64_t size = (len + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
+	if (iova < USER_VA_BASE || size == 0) {
+		return;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	if (gpu_ready) {
+		a6_unmap(&gpu, iova, size);
+		a6_tlb_flush(&gpu);
+	}
+	user_va_release(iova, size);
+	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
 /* Run an IB (user GPU memory) and wait for it. 0, or -1 on a hang/fault (cleared, logged). */

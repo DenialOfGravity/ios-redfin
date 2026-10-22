@@ -838,6 +838,29 @@ int a6_map_pages(struct a6_gpu *g, uint64_t iova, const uint64_t *pages, uint32_
 	return map_4k(g, iova, npages << l.shift, list_pa, &l);
 }
 
+/* Clear the 4K entries for [iova, iova + size) (tables stay, for the next mapping there). Then a6_tlb_flush. */
+void a6_unmap(struct a6_gpu *g, uint64_t iova, uint64_t size)
+{
+	static const uint64_t zeros[512];
+	uint64_t l1 = a6_pool_pa(g, A6_OFF_GT_L1);
+	uint64_t end = iova + ((size + 0xfff) & ~0xfffull);
+	for (uint64_t va = iova & ~0xfffull; va < end;) {
+		uint64_t e = 0, l2, l3;
+		a6_read(l1 + 8 * ((va >> 30) & 0x1ff), &e, 8);
+		l2 = (e & 3) == 3 ? e & 0xfffffff000ull : 0;
+		e = 0;
+		if (l2)
+			a6_read(l2 + 8 * ((va >> 21) & 0x1ff), &e, 8);
+		l3 = (e & 3) == 3 ? e & 0xfffffff000ull : 0;
+		uint64_t next = (va | 0x1fffffull) + 1;
+		if (next > end)
+			next = end;
+		if (l3)
+			a6_write(l3 + 8 * ((va >> 12) & 0x1ff), zeros, (size_t)((next - va) >> 12) * 8);
+		va = next;
+	}
+}
+
 void a6_unmap_high(struct a6_gpu *g)
 {
 	static const uint64_t zeros[511];

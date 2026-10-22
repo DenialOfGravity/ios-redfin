@@ -16,7 +16,7 @@
  *   1 buffer alloc    [size] -> [handle, gpu_va, size]  zeroed, wired, cleaned; map it into the task
  *                     with IOConnectMapMemory64(type = handle): cacheable, so userland does the cache
  *                     maintenance (the GPU does not snoop)
- *   2 buffer free     [handle]                          (the GPU VA is not reused yet)
+ *   2 buffer free     [handle]                          (GPU VA and handle are reused)
  *   3 surface import  [IOSurface id] -> [handle, gpu_va, size]  the surface's pages, wired
  *   4 submit          [ib_gpu_va, dwords, timeout_ms] -> [fence]  runs the IB and waits for it
  *   5 cache flush     [handle, offset, length]  clean+invalidate through the kernel mapping: before
@@ -36,6 +36,7 @@
 extern "C" {
 bool sweet_gpu_ready(void);
 int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
 int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
 }
@@ -91,6 +92,8 @@ class SweetAcceleratorUserClient : public IOUserClient {
 	IOLock  *fLock;
 	OSArray *fMem;          /* index + 1 = handle; IOMemoryDescriptor, or kOSBooleanFalse once freed */
 	OSArray *fMaps;         /* same index: the kernel IOMemoryMap, for cache maintenance */
+	uint64_t *fVA;          /* same index: GPU VA and length (0 once freed) */
+	uint64_t *fLen;
 
 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
 
@@ -115,7 +118,9 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
 	fLock = IOLockAlloc();
 	fMem = OSArray::withCapacity(64);
 	fMaps = OSArray::withCapacity(64);
-	return fLock != NULL && fMem != NULL && fMaps != NULL;
+	fVA = IONew(uint64_t, SWEET_MTL_MAX_BUFFERS);
+	fLen = IONew(uint64_t, SWEET_MTL_MAX_BUFFERS);
+	return fLock != NULL && fMem != NULL && fMaps != NULL && fVA != NULL && fLen != NULL;
 }
 
 IOReturn
@@ -132,9 +137,18 @@ SweetAcceleratorUserClient::free(void)
 		for (unsigned i = 0; i < fMem->getCount(); i++) {
 			IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, fMem->getObject(i));
 			if (md != NULL) {
+				sweet_gpu_unmap_user(fVA[i], fLen[i]);
 				md->complete();
 			}
 		}
+	}
+	if (fVA != NULL) {
+		IODelete(fVA, uint64_t, SWEET_MTL_MAX_BUFFERS);
+		fVA = NULL;
+	}
+	if (fLen != NULL) {
+		IODelete(fLen, uint64_t, SWEET_MTL_MAX_BUFFERS);
+		fLen = NULL;
 	}
 	OSSafeReleaseNULL(fMem);
 	OSSafeReleaseNULL(fMaps);
@@ -155,8 +169,11 @@ SweetAcceleratorUserClient::addMemory(IOMemoryDescriptor *md, uint64_t *handle, 
 		return -1;
 	}
 	IOLockLock(fLock);
-	uint32_t n = 0;
-	bool ok = fMem->getCount() < SWEET_MTL_MAX_BUFFERS;
+	uint32_t n = 0, slot = 0;
+	while (slot < fMem->getCount() && fMem->getObject(slot) != kOSBooleanFalse) {
+		slot++;         /* a freed handle, else a new one */
+	}
+	bool ok = slot < SWEET_MTL_MAX_BUFFERS;
 	for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
 		IOByteCount seg = 0;
 		addr64_t pa = md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
@@ -174,10 +191,17 @@ SweetAcceleratorUserClient::addMemory(IOMemoryDescriptor *md, uint64_t *handle, 
 		md->complete();
 		return -1;
 	}
-	fMaps->setObject(km);
+	if (slot < fMem->getCount()) {
+		fMaps->replaceObject(slot, km);
+		fMem->replaceObject(slot, md);
+	} else {
+		fMaps->setObject(km);
+		fMem->setObject(md);
+	}
 	km->release();
-	fMem->setObject(md);
-	*handle = fMem->getCount();
+	fVA[slot] = *va;
+	fLen[slot] = len;
+	*handle = slot + 1;
 	IOLockUnlock(fLock);
 	return 0;
 }
@@ -254,6 +278,7 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 		IOMemoryDescriptor *md = in[0] >= 1 && in[0] <= fMem->getCount() ?
 		    OSDynamicCast(IOMemoryDescriptor, fMem->getObject((unsigned)in[0] - 1)) : NULL;
 		if (md != NULL) {
+			sweet_gpu_unmap_user(fVA[in[0] - 1], fLen[in[0] - 1]);
 			md->complete();
 			fMem->replaceObject((unsigned)in[0] - 1, kOSBooleanFalse);
 			fMaps->replaceObject((unsigned)in[0] - 1, kOSBooleanFalse);
