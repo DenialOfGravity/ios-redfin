@@ -182,9 +182,18 @@ fts_clocks(void)
 			return false;
 		}
 	}
-	/* Branch halt bits: wrap0 m_ahb, s_ahb, s4. */
+	/*
+	 * Branch halt bits: wrap0 m_ahb, s_ahb, s4. A branch under hardware
+	 * clock gating (bit 1) reads halted while idle; Linux skips the check
+	 * then (clk_branch_check_halt), so do the same.
+	 */
 	const uint32_t branches[] = {0x17004, 0x17008, 0x17604};
 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+		uint32_t cbcr = fts_rd(ft.gcc, branches[i]);
+		printf("SWEET FTS: GCC branch %#x = %#x\n", branches[i], cbcr);
+		if (cbcr & 2u) {
+			continue;
+		}
 		if (!fts_wait_clear(ft.gcc, branches[i], 1u << 31)) {
 			printf("SWEET FTS: GCC branch %#x halted (%#x)\n", branches[i],
 			    fts_rd(ft.gcc, branches[i]));

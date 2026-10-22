@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
 bsd/dev/sweet_keys.c			standard
 bsd/dev/sweet_touch.c			standard
 bsd/dev/sweet_fts.c			standard
+bsd/dev/sweet_cpufreq.c			standard
 bsd/dev/sweet_rpmh.c			standard
 bsd/dev/sweet_spmi.c			standard
 bsd/dev/sweet_usb.c			standard
