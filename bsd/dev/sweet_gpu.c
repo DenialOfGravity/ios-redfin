@@ -45,9 +45,11 @@ void sweet_gpu_init(void);
 bool sweet_gpu_ready(void);
 int sweet_gpu_surface_slot(uint64_t key);
 int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
-int sweet_gpu_present(int slot, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
-    uint32_t *out_dx, uint32_t *out_dw);
+int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+    uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dw);
 void sweet_gpu_panel_stride(uint32_t stride);
+int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
 
 /* Panel mapping for touch (SweetHID.cpp): 0 = the crop of iOS's frame, else x offset + width of the fit. */
 int sweet_display_fit_x, sweet_display_fit_w;
@@ -117,13 +119,17 @@ a6_wr(uint64_t pa, uint32_t v)
 	__asm__ volatile ("dsb osh" ::: "memory");
 }
 
-/* Pool (and other kernel RAM): through the physmap, cleaned to the point of coherency. MMIO: words. */
+/*
+ * Pool: through its kernel mapping, cleaned to the point of coherency (by VA:
+ * physical cache operations panic for RAM outside the physmap). Other managed
+ * RAM: through the physmap. MMIO: words.
+ */
 int
 a6_write(uint64_t pa, const void *buf, size_t len)
 {
 	if (in_pool(pa, len)) {
 		memcpy((void *)(pool_kva + (pa - gpu.pool_pa)), buf, len);
-		flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
+		flush_dcache64((addr64_t)(pool_kva + (pa - gpu.pool_pa)), (unsigned)len, FALSE);
 		return 0;
 	}
 	if (pmap_valid_address(pa)) {
@@ -142,7 +148,7 @@ int
 a6_read(uint64_t pa, void *buf, size_t len)
 {
 	if (in_pool(pa, len)) {
-		flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
+		flush_dcache64((addr64_t)(pool_kva + (pa - gpu.pool_pa)), (unsigned)len, FALSE);
 		memcpy(buf, (const void *)(pool_kva + (pa - gpu.pool_pa)), len);
 		return 0;
 	}
@@ -229,7 +235,7 @@ sweet_gpu_init(void)
 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
 	a6_init_state(&gpu, ptoa_64(pn));
 	pool_kva = va;
-	flush_dcache64((addr64_t)gpu.pool_pa, (unsigned)A6_POOL_SIZE, TRUE);
+	flush_dcache64((addr64_t)va, (unsigned)A6_POOL_SIZE, FALSE);
 	thread_t thread;
 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
@@ -324,18 +330,19 @@ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
 /*
  * Blit a mapped surface, scaled to fit and centred, into the panel memory
  * (rows of fb_pitch bytes). The CPU rendered it through the cache: clean
- * its pages to memory first. Waits for the GPU (a few ms).
+ * it to memory first, through its kernel mapping kva (0: no clean). Waits
+ * for the GPU (a few ms).
  */
 int
-sweet_gpu_present(int s, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
+sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
     uint32_t *out_dx, uint32_t *out_dw)
 {
 	if (!gpu_ready || s < 0 || s >= SLOTS || !slot[s].npages || (pitch & 63) || (fb_pitch & 63)) {
 		return -1;
 	}
 	uint64_t t0 = mach_absolute_time();
-	for (uint32_t i = 0; i < slot[s].npages; i++) {
-		clean_dcache64((addr64_t)slot[s].pages[i], slot[s].page_size, TRUE);
+	if (kva) {
+		clean_dcache64((addr64_t)kva, (unsigned)((uint64_t)pitch * h + offset), FALSE);
 	}
 	uint64_t t1 = mach_absolute_time();
 
@@ -380,6 +387,65 @@ sweet_gpu_present(int s, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch
 	}
 	*out_dx = b.dx;
 	*out_dw = b.dw;
+	return rc;
+}
+
+/* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
+
+#define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
+#define USER_VA_END     0x7f00000000ULL
+#define USER_VA_ALIGN   0x10000ULL
+
+static uint64_t user_va_next = USER_VA_BASE;
+
+/*
+ * Map pages at a fresh GPU VA (never reused yet: freed buffers leak their VA,
+ * and the page-table arena is finite). The caller cleans the CPU caches
+ * through a virtual mapping: physical cache operations panic for RAM outside
+ * the physmap (kernel memory below 4 GB, "phystokv_range: illegal PA").
+ */
+int
+sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size)
+{
+	if (!gpu_ready || npages == 0) {
+		return -1;
+	}
+	uint64_t size = (uint64_t)npages * page_size;
+	lck_mtx_lock(&sweet_gpu_lock);
+	uint64_t iova = user_va_next;
+	if (iova + size > USER_VA_END) {
+		lck_mtx_unlock(&sweet_gpu_lock);
+		return -1;
+	}
+	user_va_next = (iova + size + USER_VA_ALIGN - 1) & ~(USER_VA_ALIGN - 1);
+	int rc = a6_map_pages(&gpu, iova, pages, npages, page_size);
+	a6_tlb_flush(&gpu);
+	lck_mtx_unlock(&sweet_gpu_lock);
+	if (rc) {
+		return -1;
+	}
+	*iova_out = iova;
+	return 0;
+}
+
+/* Run an IB (user GPU memory) and wait for it. 0, or -1 on a hang/fault (cleared, logged). */
+int
+sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)
+{
+	if (!gpu_ready) {
+		return -1;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	int rc = a6_submit_ib(&gpu, ib_iova, dwords, timeout_ms ? timeout_ms : 1000);
+	if (rc) {
+		uint64_t far;
+		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
+		a6_log("user submit: ib %llx %u dwords: timeout or fault (smmu fsr %x far %llx fsynr0 %x)\n",
+		    ib_iova, dwords, fsr, far, syn);
+		(void)a6_clear_fault(&gpu);
+	}
+	*fence_out = gpu.fence;
+	lck_mtx_unlock(&sweet_gpu_lock);
 	return rc;
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */

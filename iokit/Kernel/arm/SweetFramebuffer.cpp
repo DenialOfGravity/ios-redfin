@@ -43,8 +43,8 @@ extern "C" {
 bool sweet_gpu_ready(void);
 int sweet_gpu_surface_slot(uint64_t key);
 int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
-int sweet_gpu_present(int slot, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
-    uint32_t *out_dx, uint32_t *out_dw);
+int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+    uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dw);
 void sweet_gpu_panel_stride(uint32_t stride);
 extern int sweet_display_fit_x, sweet_display_fit_w;
 }
@@ -441,7 +441,8 @@ AppleCLCD::presentGPU(const uint8_t *rec)
 		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
 	}
 	uint32_t dx = 0, dw = 0;
-	int rc = sweet_gpu_present(slot, s->offset, s->width, s->height, s->bytesPerRow, fRowBytes, &dx, &dw);
+	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
+	    fRowBytes, &dx, &dw);
 	s->release();
 	if (rc) {
 		return gpu_fallback(7, "GPU blit failed");
