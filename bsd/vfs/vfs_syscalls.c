@@ -14579,3 +14579,35 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
 
 	return error;
 }
+
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * Kernel-path wrappers for the SWEET file server (bsd/dev/sweet_files.c):
+ * installs tools into the running root over USB Ethernet.
+ */
+int sweet_vfs_mkdir(const char *path, int mode);
+int sweet_vfs_symlink(const char *target, const char *link);
+int sweet_vfs_unlink(const char *path);
+
+int
+sweet_vfs_mkdir(const char *path, int mode)
+{
+	struct vnode_attr va;
+	VATTR_INIT(&va);
+	VATTR_SET(&va, va_mode, (mode & ACCESSPERMS) & ~0);
+	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
+}
+
+int
+sweet_vfs_symlink(const char *target, const char *link)
+{
+	return symlinkat_internal(vfs_context_kernel(), CAST_USER_ADDR_T(target), AT_FDCWD,
+	           CAST_USER_ADDR_T(link), UIO_SYSSPACE);
+}
+
+int
+sweet_vfs_unlink(const char *path)
+{
+	return unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */

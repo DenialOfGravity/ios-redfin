@@ -508,6 +508,36 @@ ud_rx_arm(void)
 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
 }
 
+/* The first frames each way, for link debugging (boot-arg sweetusbframes=N, default 40). */
+static int ud_frame_log = -1;
+
+static void
+ud_log_frame(const char *dir, const uint8_t *f, uint32_t len)
+{
+	if (ud_frame_log < 0) {
+		ud_frame_log = 40;
+		PE_parse_boot_argn("sweetusbframes", &ud_frame_log, sizeof(ud_frame_log));
+	}
+	if (len < 14) {
+		return;
+	}
+	if (len >= 42 && f[12] == 0x08 && f[13] == 0x06) {
+		/* ARP: always, in full (opcode, sender MAC/IP, target MAC/IP) */
+		printf("SWEET ARP %s op %u sha %02x:%02x:%02x:%02x:%02x:%02x spa %u.%u.%u.%u tha %02x:%02x:%02x:%02x:%02x:%02x tpa %u.%u.%u.%u (eth dst %02x:..:%02x)\n",
+		    dir, f[21], f[22], f[23], f[24], f[25], f[26], f[27], f[28], f[29], f[30], f[31],
+		    f[32], f[33], f[34], f[35], f[36], f[37], f[38], f[39], f[40], f[41], f[0], f[5]);
+		return;
+	}
+	if (ud_frame_log <= 0) {
+		return;
+	}
+	ud_frame_log--;
+	printf("SWEET FRAME %s len %u dst %02x:%02x:%02x:%02x:%02x:%02x src %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	    dir, len, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
+	    len > 14 ? f[14] : 0, len > 15 ? f[15] : 0, len > 20 ? f[20] : 0, len > 21 ? f[21] : 0,
+	    len > 38 ? f[38] : 0, len > 39 ? f[39] : 0, len > 40 ? f[40] : 0, len > 41 ? f[41] : 0);
+}
+
 static void
 ud_rx_done(void)
 {
@@ -515,6 +545,7 @@ ud_rx_done(void)
 	ud_sync(UD_TRB_RX, 16);
 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
 	ud_sync(UD_RX, UD_FRAME_MAX);
+	ud_log_frame("rx", (const uint8_t *)(ud.dma + UD_RX), len);
 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
 		/*
 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
@@ -560,6 +591,24 @@ ud_tx_kick_locked(void)
 		}
 		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
 		mbuf_freem(m);
+		ud_log_frame("tx", (const uint8_t *)(ud.dma + UD_TX), (uint32_t)len);
+		/*
+		 * ARP replies go to the Ethernet broadcast address: macOS's ECM
+		 * driver shows the host as 02:00:5e:77:ee:01 (our iMACAddress) on
+		 * the wire, but en17's own lladdr is 02:00:00:00:00:00, and its
+		 * ARP drops replies unicast to ..:01, so 192.168.7.2 never
+		 * resolved (frames carrying IP are accepted either way).
+		 */
+		uint8_t *fr = (uint8_t *)(ud.dma + UD_TX);
+		if (len >= 42 && fr[12] == 0x08 && fr[13] == 0x06 && fr[20] == 0 && fr[21] == 2) {
+			memset(fr, 0xff, ETHER_ADDR_LEN);
+		}
+		/* Pad to the Ethernet minimum (60 bytes without FCS), as a MAC
+		 * would: macOS drops shorter frames, e.g. our 42-byte ARP replies,
+		 * so the Mac never resolved 192.168.7.2. */
+		while (len < 60) {
+			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+		}
 		/* A frame of a multiple of 512 bytes would need a zero-length
 		 * packet to end it; one pad byte does the same (IP ignores it). */
 		if ((len % 512) == 0) {
@@ -838,6 +887,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
  */
 extern void sweet_poke_run(const char *text, unsigned len);
+struct sync_args;
+extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
 
 static void
 ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
@@ -874,7 +925,17 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		cmd[got] = 0;
 		printf("SWEET CMD: %u bytes: %.60s\n", (unsigned)got, cmd);
+		if (strncmp(cmd, "sync", 4) == 0 || strncmp(cmd, "reboot", 6) == 0) {
+			/* Flush dirty file data (e.g. sweet_files.c writes) before a reset. */
+			int32_t rv = 0;
+			(void)sync(kernproc, NULL, &rv);
+			printf("SWEET CMD: synced\n");
+			if (cmd[0] == 's') {
+				continue;
+			}
+		}
 		if (strncmp(cmd, "reboot", 6) == 0) {
+			ud_sleep_ms(1000);      /* let HFS finish the journal writes */
 			printf("SWEET CMD: rebooting (PSCI SYSTEM_RESET)\n");
 			ud_sleep_ms(500);       /* let the log go out */
 			register uint64_t x0 __asm__("x0") = 0x84000009ULL;
@@ -1263,6 +1324,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 	}
 	if (ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
+	}
+	if (ud.ifp != NULL) {
+		extern void sweet_files_start(void);
+		sweet_files_start();    /* tcp 2223: bsd/dev/sweet_files.c */
 	}
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */
