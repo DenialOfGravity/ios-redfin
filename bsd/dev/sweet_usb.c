@@ -882,7 +882,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
 /*
  * Command server on 192.168.7.2:5141 (UDP): each datagram is poke script
  * text (bsd/dev/sweet_poke.c: r/w/m/p/s lines), run at once in this
- * thread, results in the console (and so in the live log); "panic" panics
+ * thread, results in the console (and so in the live log); "rtc" prints the
+ * PM8150 RTC ("SWEET RTC: N", for tools/flame-rtc.py); "panic" panics
  * (to test the panic path); "reboot" resets
  * the phone with PSCI (the shim already set the PMIC reason to
  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
@@ -934,6 +935,18 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
 			if (cmd[0] == 's') {
 				continue;
 			}
+		}
+		if (strncmp(cmd, "rtc", 3) == 0) {
+			extern int sweet_rtc_seconds(uint32_t *secs);   /* SweetPlatformExpert.cpp */
+			uint32_t rtc = 0;
+			struct timeval tv;
+			int rc = sweet_rtc_seconds(&rtc);
+			microtime(&tv);
+			printf("SWEET CMD: rtc %u%s, time of day %ld\n", rtc, rc ? " (read failed)" : "", (long)tv.tv_sec);
+			if (!rc) {
+				printf("SWEET RTC: %u\n", rtc);
+			}
+			continue;
 		}
 		if (strncmp(cmd, "panic", 5) == 0) {
 			/* Tests the panic path: backtraces must reach the persistent log. */
