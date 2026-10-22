@@ -17,6 +17,7 @@
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
@@ -299,15 +300,48 @@ static uint64_t recoveries;
 static struct { uint32_t lo, hi; } lost[LOST_RING];
 
 /*
- * Every 5 s: how long the GPU spent on the submits that landed (their CP_ALWAYS_ON stamps, 19.2 MHz), from the
- * submit path. Fences older than the stamp ring (A6_TS_SLOTS) are skipped.
+ * GPU time of the submits that landed (their CP_ALWAYS_ON stamps, 19.2 MHz), by the process that queued them
+ * (pid 0 = the kernel's presents), summed on every submit and logged every 5 s. Fences that fall out of the
+ * stamp ring (A6_TS_SLOTS) before they are summed only count as "missed".
  */
+#define GSTAT_OWNERS    6
 static uint32_t gstat_next = 1;
 static uint64_t gstat_abs;
+static int gstat_pid[A6_TS_SLOTS];
+static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1];     /* last: everyone else */
+static uint32_t gstat_n, gstat_missed;
+static uint64_t gstat_busy, gstat_longest;
+
+static void
+gpu_owner_locked(uint32_t fence, int pid)
+{
+	if (fence) {
+		gstat_pid[fence % A6_TS_SLOTS] = pid;
+	}
+}
 
 static void
 gpu_stats_locked(void)
 {
+	uint32_t done = a6_fence_read(&gpu);
+	if ((int32_t)(done - gstat_next) >= (int32_t)A6_TS_SLOTS) {
+		gstat_missed += done - gstat_next - A6_TS_SLOTS + 1;
+		gstat_next = done - A6_TS_SLOTS + 1;
+	}
+	for (; (int32_t)(done - gstat_next) >= 0; gstat_next++) {
+		uint64_t t = a6_submit_time(&gpu, gstat_next);
+		int pid = gstat_pid[gstat_next % A6_TS_SLOTS], o;
+		for (o = 0; o < GSTAT_OWNERS && gstat_own[o].n && gstat_own[o].pid != pid; o++) {
+		}
+		gstat_own[o].pid = o < GSTAT_OWNERS ? pid : -1;
+		gstat_own[o].n++;
+		gstat_own[o].busy += t;
+		gstat_n++;
+		gstat_busy += t;
+		if (t > gstat_longest) {
+			gstat_longest = t;
+		}
+	}
 	uint64_t now = mach_absolute_time(), ns;
 	if (gstat_abs == 0) {
 		gstat_abs = now;
@@ -316,22 +350,25 @@ gpu_stats_locked(void)
 	if (ns < 5000000000ULL) {
 		return;
 	}
-	uint32_t done = a6_fence_read(&gpu), n = 0;
-	if ((int32_t)(done - gstat_next) >= (int32_t)A6_TS_SLOTS) {
-		gstat_next = done - A6_TS_SLOTS + 1;
-	}
-	uint64_t busy = 0, longest = 0;
-	for (; (int32_t)(done - gstat_next) >= 0; gstat_next++, n++) {
-		uint64_t t = a6_submit_time(&gpu, gstat_next);
-		busy += t;
-		if (t > longest) {
-			longest = t;
+	if (gstat_n) {
+		char who[160] = "", name[24];
+		size_t w = 0;
+		for (int o = 0; o <= GSTAT_OWNERS && gstat_own[o].n && w < sizeof(who) - 40; o++) {
+			if (gstat_own[o].pid > 0) {
+				proc_name(gstat_own[o].pid, name, sizeof(name));
+			} else {
+				strlcpy(name, gstat_own[o].pid == 0 ? "present" : "others", sizeof(name));
+			}
+			w += snprintf(who + w, sizeof(who) - w, " %s %u/%llums", name, gstat_own[o].n,
+			    gstat_own[o].busy / 19200);
 		}
+		a6_log("5s: %u submits (%u missed), GPU busy %llu ms (%llu%%), longest %llu us, mean %llu us;%s\n",
+		    gstat_n, gstat_missed, gstat_busy / 19200, gstat_busy * 100 / 19200 / (ns / 1000000),
+		    gstat_longest * 10 / 192, gstat_busy * 10 / 192 / gstat_n, who);
 	}
-	if (n) {
-		a6_log("5s: %u submits, GPU busy %llu ms (%llu%%), longest %llu us, mean %llu us\n", n, busy / 19200,
-		    busy * 100 / 19200 / (ns / 1000000), longest * 10 / 192, busy * 10 / 192 / n);
-	}
+	gstat_n = gstat_missed = 0;
+	gstat_busy = gstat_longest = 0;
+	bzero(gstat_own, sizeof(gstat_own));
 	gstat_abs = now;
 }
 
@@ -625,6 +662,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
 		gpu_note_submit_locked();
 		present_fence[k] = a6_submit_ib_async(&gpu, a6_pool_va(PRESENT_IB(k)), n, 100);
+		gpu_owner_locked(present_fence[k], 0);
 		rc = present_fence[k] ? 0 : -1;
 		present_next++;
 	}
@@ -774,6 +812,7 @@ sweet_gpu_submit_user_async(uint64_t ib_iova, uint32_t dwords)
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
 	uint32_t fence = a6_submit_ib_async(&gpu, ib_iova, dwords, 1000);
+	gpu_owner_locked(fence, proc_selfpid());
 	lck_mtx_unlock(&sweet_gpu_lock);
 	return fence;
 }
@@ -809,6 +848,7 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
 	}
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
+	gpu_owner_locked(gpu.fence + 1, proc_selfpid());
 	int rc = a6_submit_ib(&gpu, ib_iova, dwords, timeout_ms ? timeout_ms : 1000);
 	if (rc) {
 		gpu_recover_locked("user submit");
@@ -997,6 +1037,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
 	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, 0);
+	gpu_owner_locked(fence, proc_selfpid());
 	lck_mtx_unlock(&sweet_gpu_lock);
 	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
 	return fence;

@@ -45,6 +45,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
 #define RH_VRM          4u
 #define RH_ARC          3u
+#define RH_BCM          5u
 #define RH_TIMEOUT_US   100000u
 
 static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
@@ -187,9 +188,9 @@ rh_lookup(const char *res, uint32_t *address)
 				continue;
 			}
 			uint32_t addr = rh_read(rh_db, e + 16);
-			if ((slave != RH_VRM && slave != RH_ARC) || (addr >> 16) != slave || (addr & 15u) ||
+			if ((slave != RH_VRM && slave != RH_ARC && slave != RH_BCM) || (addr >> 16) != slave || (addr & 3u) ||
 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
-				printf("SWEET RPMH: invalid VRM/ARC entry for %s\n", res);
+				printf("SWEET RPMH: invalid VRM/ARC/BCM entry for %s\n", res);
 				return EINVAL;
 			}
 			*address = addr;
@@ -334,7 +335,7 @@ rh_send(uint32_t address, unsigned mv)
 }
 
 /*
- * Any VRM or ARC resource, 1-4 commands (offset from the resource address,
+ * Any VRM, ARC or BCM resource, 1-4 commands (offset from the resource address,
  * value): for /dev/pmem's PMEM_RPMH (userland bring-up of the modem and
  * WLAN: ARC levels of cx/mss, WLAN rails). No policy: a debugging path.
  */
