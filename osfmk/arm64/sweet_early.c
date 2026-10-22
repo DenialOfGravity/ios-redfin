@@ -11,11 +11,11 @@
 #include <stdint.h>
 #include <kern/misc_protos.h>
 
-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
 #define EARLY_FB early_fb
-#define EARLY_WIDTH 1080u
-#define EARLY_HEIGHT 2400u
-#define EARLY_STRIDE (4320u / 4)
+#define EARLY_WIDTH ((unsigned int)SWEET_EARLY_FB_WIDTH)
+#define EARLY_HEIGHT ((unsigned int)SWEET_EARLY_FB_HEIGHT)
+#define EARLY_STRIDE ((unsigned int)SWEET_EARLY_FB_STRIDE / 4)
 #define EARLY_SCALE 2u
 #define EARLY_CELL_W (8u * EARLY_SCALE)
 #define EARLY_CELL_H (16u * EARLY_SCALE)

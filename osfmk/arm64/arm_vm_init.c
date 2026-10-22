@@ -1843,7 +1843,7 @@ sweet_early_map_final(void)
 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
 	assert(*slot == ARM_TTE_EMPTY);
-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+	*slot = (tt_entry_t)SWEET_EARLY_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
@@ -2190,7 +2190,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 #if defined(SWEET)
 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
-	sweet_early_relocate(SWEET_EARLY_FB_VA);
+	sweet_early_relocate(SWEET_EARLY_FB_VA + (SWEET_EARLY_FB_PA - SWEET_EARLY_FB_BLOCK_PA));
 #endif
 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
 

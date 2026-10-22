@@ -638,7 +638,11 @@ out:
 void
 sweet_touch_init(void)
 {
-	int enabled = 1;
+	/*
+	 * flame: the Redmi touch path (GENI I2C SE7, SM7150 GCC clock writes,
+	 * RPMh L11C at 3.2 V) is wrong hardware here; only with sweettouch=1.
+	 */
+	int enabled = 0;
 	thread_t thread;
 	if (st.started) {
 		return;
@@ -647,7 +651,7 @@ sweet_touch_init(void)
 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
 	if (!enabled) {
-		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+		printf("SWEET TOUCH: disabled (Redmi driver; sweettouch=1 forces it)\n");
 		return;
 	}
 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);

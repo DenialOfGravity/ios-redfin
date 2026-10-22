@@ -22,6 +22,60 @@ public:
 
 OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
 
+/*
+ * flame: the shim arms the APSS watchdog (qcom,wdt@17c10000, ~30 s bite)
+ * and sets the PON reason to bootloader, so a kernel that hangs or panics
+ * resets the phone into fastboot. Pet it while threads run. flamewdt=0
+ * turns it off; flamereboot=N stops petting after about N seconds, which
+ * bounds an unattended test run.
+ */
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+#define FLAME_WDT_PA    0x17c10000
+#define FLAME_WDT_RST   0x04
+#define FLAME_WDT_EN    0x08
+#define FLAME_WDT_PET_S 5
+
+static void
+flame_wdt_thread(void *arg)
+{
+	volatile uint32_t *wdt = (volatile uint32_t *)arg;
+	int reboot_s = 0;
+	PE_parse_boot_argn("flamereboot", &reboot_s, sizeof(reboot_s));
+	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += FLAME_WDT_PET_S) {
+		wdt[FLAME_WDT_RST / 4] = 1;
+		IOSleep(FLAME_WDT_PET_S * 1000);
+	}
+	IOLog("FLAME WDT: flamereboot=%d reached, no more pets: reset follows\n", reboot_s);
+	for (;;) {
+		IOSleep(1000000);
+	}
+}
+
+static void
+flame_wdt_start(void)
+{
+	int enabled = 1;
+	PE_parse_boot_argn("flamewdt", &enabled, sizeof(enabled));
+	volatile uint32_t *wdt = (volatile uint32_t *)ml_io_map(FLAME_WDT_PA, 0x1000);
+	if (wdt == NULL) {
+		IOLog("FLAME WDT: mapping failed\n");
+		return;
+	}
+	if (!(wdt[FLAME_WDT_EN / 4] & 1)) {
+		IOLog("FLAME WDT: not armed by the shim\n");
+		return;
+	}
+	wdt[FLAME_WDT_RST / 4] = 1;
+	if (!enabled) {
+		wdt[FLAME_WDT_EN / 4] = 0;
+		IOLog("FLAME WDT: disabled (flamewdt=0)\n");
+		return;
+	}
+	IOCreateThread(flame_wdt_thread, (void *)wdt);
+	IOLog("FLAME WDT: petting every %d s\n", FLAME_WDT_PET_S);
+}
+
 bool
 SweetPlatformExpert::start(IOService *provider)
 {
@@ -29,6 +83,7 @@ SweetPlatformExpert::start(IOService *provider)
 	if (!IODTPlatformExpert::start(provider)) {
 		return false;
 	}
+	flame_wdt_start();
 	registerService();
 	IOLog("SWEET: platform expert registered\n");
 	return true;

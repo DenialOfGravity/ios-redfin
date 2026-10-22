@@ -515,10 +515,10 @@ LEXT(start_first_cpu)
 
 #if defined(SWEET)
 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-	MOV64	x0, (0x9c000000 + 2368 * 4320)
+	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_HEIGHT - 32) * SWEET_EARLY_FB_STRIDE)
 	mov		w1, #-1
 	mov		x2, #32
-	mov		x4, #4320
+	mov		x4, #SWEET_EARLY_FB_STRIDE
 Lsweet_mark_row:
 	mov		x3, #64
 	mov		x5, x0
@@ -686,7 +686,7 @@ Lkernelcache_base_found:
 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
 	 */
-	MOV64	x10, 0x9c000000
+	MOV64	x10, SWEET_EARLY_FB_BLOCK_PA
 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 	orr		x11, x11, x10
 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
