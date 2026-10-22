@@ -110,13 +110,17 @@ SweetAccelerator::start(IOService *provider)
 	if (!IOService::start(provider)) {
 		return false;
 	}
-	setProperty("MetalPluginName", "SweetMetal");
-	setProperty("MetalPluginClassName", "SweetMTLDevice");
-	setProperty("IOGLBundleName", "SweetMetal");
+	/* sweetmtl=1: SweetMetal (host-made templates, phone/metal); sweetmtl=2: SweetMetal2 (metal2vulkan + Turnip, phone/metal2) */
+	uint32_t which = 1;
+	PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
+	const char *plugin = which == 2 ? "SweetMetal2" : "SweetMetal";
+	setProperty("MetalPluginName", plugin);
+	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
+	setProperty("IOGLBundleName", plugin);
 	setProperty("model", "Adreno 640");
 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
 	registerService();
-	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal)\n");
+	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
 	return true;
 }
 
