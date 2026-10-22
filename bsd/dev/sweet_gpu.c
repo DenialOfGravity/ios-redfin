@@ -298,6 +298,43 @@ static uint64_t progress_abs;
 static uint64_t recoveries;
 static struct { uint32_t lo, hi; } lost[LOST_RING];
 
+/*
+ * Every 5 s: how long the GPU spent on the submits that landed (their CP_ALWAYS_ON stamps, 19.2 MHz), from the
+ * submit path. Fences older than the stamp ring (A6_TS_SLOTS) are skipped.
+ */
+static uint32_t gstat_next = 1;
+static uint64_t gstat_abs;
+
+static void
+gpu_stats_locked(void)
+{
+	uint64_t now = mach_absolute_time(), ns;
+	if (gstat_abs == 0) {
+		gstat_abs = now;
+	}
+	absolutetime_to_nanoseconds(now - gstat_abs, &ns);
+	if (ns < 5000000000ULL) {
+		return;
+	}
+	uint32_t done = a6_fence_read(&gpu), n = 0;
+	if ((int32_t)(done - gstat_next) >= (int32_t)A6_TS_SLOTS) {
+		gstat_next = done - A6_TS_SLOTS + 1;
+	}
+	uint64_t busy = 0, longest = 0;
+	for (; (int32_t)(done - gstat_next) >= 0; gstat_next++, n++) {
+		uint64_t t = a6_submit_time(&gpu, gstat_next);
+		busy += t;
+		if (t > longest) {
+			longest = t;
+		}
+	}
+	if (n) {
+		a6_log("5s: %u submits, GPU busy %llu ms (%llu%%), longest %llu us, mean %llu us\n", n, busy / 19200,
+		    busy * 100 / 19200 / (ns / 1000000), longest * 10 / 192, busy * 10 / 192 / n);
+	}
+	gstat_abs = now;
+}
+
 static void
 gpu_note_submit_locked(void)
 {
@@ -306,6 +343,7 @@ gpu_note_submit_locked(void)
 		progress_fence = done;
 		progress_abs = mach_absolute_time();
 	}
+	gpu_stats_locked();
 }
 
 static bool

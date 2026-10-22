@@ -111,6 +111,10 @@ uint32_t a6_fence_read(const struct a6_gpu *g);
 void a6_fence_force(struct a6_gpu *g);
 /* CP_ALWAYS_ON_COUNTER (19.2 MHz) */
 uint64_t a6_timestamp(const struct a6_gpu *g);
+/* GPU ticks (19.2 MHz) a landed fence's submit took (a6_submit_ibs_async stamps its start and idle end) */
+#define A6_TS_OFF	0x1000ull	/* in the scratch page: 16-byte slots by fence */
+#define A6_TS_SLOTS	256u
+uint64_t a6_submit_time(const struct a6_gpu *g, uint32_t fence);
 
 /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */
 int a6_map(struct a6_gpu *g, uint64_t iova, uint64_t pa, uint64_t size);

@@ -743,19 +743,30 @@ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint3
 			     unsigned timeout_ms)
 {
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
-	uint32_t dw[4 + 4 * A6_SUBMIT_MAX + 5], n = 0;
+	/* GPU time of this submit: CP_ALWAYS_ON_COUNTER before the IBs and once they are idle (a6_submit_time) */
+	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
+	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5], n = 0;
 	if (nib == 0 || nib > A6_SUBMIT_MAX)
 		return 0;
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
 	dw[n++] = 0x18;				/* PC_CCU_INVALIDATE_DEPTH */
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
 	dw[n++] = 0x19;				/* PC_CCU_INVALIDATE_COLOR */
+	dw[n++] = a6_pkt7(0x3e, 3);		/* CP_REG_TO_MEM CP_ALWAYS_ON_COUNTER, 2 dwords -> ts */
+	dw[n++] = 0x980 | 2u << 18;
+	dw[n++] = (uint32_t)ts;
+	dw[n++] = (uint32_t)(ts >> 32);
 	for (unsigned i = 0; i < nib; i++) {
 		dw[n++] = a6_pkt7(A6_CP_INDIRECT_BUFFER, 3);
 		dw[n++] = (uint32_t)iova[i];
 		dw[n++] = (uint32_t)(iova[i] >> 32);
 		dw[n++] = dwords[i] & 0xfffff;
 	}
+	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
+	dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
+	dw[n++] = 0x980 | 2u << 18;
+	dw[n++] = (uint32_t)(ts + 8);
+	dw[n++] = (uint32_t)((ts + 8) >> 32);
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);
 	dw[n++] = 0x04;				/* CACHE_FLUSH_TS: the fence lands once the caches are clean */
 	dw[n++] = (uint32_t)fva;
@@ -788,6 +799,13 @@ void a6_fence_force(struct a6_gpu *g)
 {
 	uint32_t v = g->fence;
 	a6_write(a6_pool_pa(g, A6_OFF_SCRATCH), &v, 4);
+}
+
+uint64_t a6_submit_time(const struct a6_gpu *g, uint32_t fence)
+{
+	uint64_t t[2] = { 0, 0 };
+	a6_read(a6_pool_pa(g, A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * (fence % A6_TS_SLOTS), t, 16);
+	return t[1] > t[0] ? t[1] - t[0] : 0;
 }
 
 uint64_t a6_timestamp(const struct a6_gpu *g)
