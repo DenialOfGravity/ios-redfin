@@ -52,6 +52,7 @@ static void sweet_log_start(void);
 extern void sweet_sample_start(void);
 extern void sweet_keys_init(void);
 extern void sweet_touch_init(void);
+extern void sweet_fts_init(void);
 extern void sweet_usb_probe(void);
 
 #define REG_CAP         0x00
@@ -659,6 +660,7 @@ sweet_ufs_init(void)
 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 	sweet_keys_init();
 	sweet_touch_init();
+	sweet_fts_init();
 	sweet_usb_probe();
 	return 0;
 }

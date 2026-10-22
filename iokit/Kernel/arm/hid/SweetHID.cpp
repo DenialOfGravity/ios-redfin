@@ -356,6 +356,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
  * app-switcher gesture.
  */
 #define SWEET_TOUCH_EDGE_PX 48
+/* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
+#define SWEET_PANEL_W 1080
+#define SWEET_PANEL_H 2280
 class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
 public:
@@ -435,9 +438,9 @@ SweetHIDTouch::start(IOService *provider)
 	int native = 0;
 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
 	fLogicalW = native ? 1080 : 1125;
-	fLogicalH = native ? 2400 : 2436;
-	fOffX = (fLogicalW - 1080) / 2;
-	fOffY = (fLogicalH - 2400) / 2;
+	fLogicalH = native ? SWEET_PANEL_H : 2436;
+	fOffX = (fLogicalW - SWEET_PANEL_W) / 2;
+	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
 	/* The digitizer covers the main display (backboardd maps it 1:1). */
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
@@ -458,8 +461,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
 		return;
 	}
-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
+	x = x < 0 ? 0 : (x > SWEET_PANEL_W - 1 ? SWEET_PANEL_W - 1 : x);
+	y = y < 0 ? 0 : (y > SWEET_PANEL_H - 1 ? SWEET_PANEL_H - 1 : y);
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
@@ -472,8 +475,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 		return;
 	}
 	if (!was && down) {
-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
+		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > SWEET_PANEL_W - 1 - SWEET_TOUCH_EDGE_PX ||
+		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
 	}
 
 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

@@ -320,7 +320,7 @@ rh_send(uint32_t address, unsigned mv)
 		return EIO;
 	}
 	rh_poisoned = false;
-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
+	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
 	return 0;
 }
 
@@ -328,8 +328,12 @@ int
 sweet_rpmh_vreg_enable(const char *res, unsigned mv)
 {
 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
+	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges. */
+	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
+	    (!strcmp(res, "ldoa14") && mv >= 1800 && mv <= 1840) ||
+	    (!strcmp(res, "ldoa17") && mv >= 2856 && mv <= 3008));
+	if (!ok) {
+		printf("SWEET RPMH: %s %u mV is not an allowed touch rail\n", res ? res : "?", mv);
 		return EINVAL;
 	}
 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
