@@ -807,9 +807,9 @@ sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
 			gpool_used += size;
 			if (gpool_used > gpool_peak) {
 				gpool_peak = gpool_used;
-				if ((gpool_peak >> 24) != ((gpool_peak - size) >> 24)) {
-					a6_log("pool: peak %llu MB in use\n", gpool_peak >> 20);
-				}
+			}
+			if ((gpool_used >> 25) != ((gpool_used - size) >> 25)) {
+				a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
 			}
 			rc = 0;
 			break;
@@ -828,6 +828,9 @@ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
 	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
 	lck_mtx_lock(&sweet_gpool_lock);
 	gpool_used -= size;
+	if ((gpool_used >> 25) != ((gpool_used + size) >> 25)) {
+		a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
+	}
 	uint32_t i = 0;
 	while (i < gpool_nfree && gpool_free[i].pa < pa) {
 		i++;
