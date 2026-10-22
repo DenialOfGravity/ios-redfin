@@ -447,11 +447,8 @@ SweetHIDTouch::start(IOService *provider)
 	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
 	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
-	if (fCornerRadius > SWEET_PANEL_W / 2) {
-		fCornerRadius = SWEET_PANEL_W / 2;
-	}
-	if (fCornerRadius > SWEET_PANEL_H) {
-		fCornerRadius = SWEET_PANEL_H;
+	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
+		fCornerRadius = SWEET_DISPLAY_CORNER_MAX;
 	}
 	/* The digitizer covers the main display (backboardd maps it 1:1). */
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
@@ -485,26 +482,19 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 		fitW = SWEET_PANEL_W;
 		fitH = SWEET_PANEL_H;
 	}
-	uint32_t cornerRadius = fCornerRadius;
-	if (cornerRadius > (uint32_t)(fitW / 2)) {
-		cornerRadius = (uint32_t)(fitW / 2);
-	}
-	if (cornerRadius > (uint32_t)fitH) {
-		cornerRadius = (uint32_t)fitH;
-	}
 	if (!was && down && (x < fitX || x >= fitX + fitW || y < fitY || y >= fitY + fitH)) {
 		IOLockUnlock(fLock);
 		return;
 	}
-	if (!was && down && cornerRadius && y >= fitY && y < fitY + (int)cornerRadius) {
-		int localX = -1;
-		if (x >= fitX && x < fitX + (int)cornerRadius) {
-			localX = x - fitX;
-		} else if (x < fitX + fitW && x >= fitX + fitW - (int)cornerRadius) {
-			localX = fitX + fitW - 1 - x;
-		}
-		if (localX >= 0 &&
-		    !sweet_display_corner_point_visible((uint32_t)localX, (uint32_t)(y - fitY), cornerRadius)) {
+	uint32_t cornerRadius = fCornerRadius;
+	bool left = x < (int)cornerRadius;
+	bool right = x >= SWEET_PANEL_W - (int)cornerRadius;
+	bool top = y < (int)cornerRadius;
+	bool bottom = y >= SWEET_PANEL_H - (int)cornerRadius;
+	if (!was && down && cornerRadius && (left || right) && (top || bottom)) {
+		uint32_t localX = (uint32_t)(left ? x : SWEET_PANEL_W - 1 - x);
+		uint32_t localY = (uint32_t)(top ? y : SWEET_PANEL_H - 1 - y);
+		if (!sweet_display_corner_point_visible(localX, localY, cornerRadius)) {
 			IOLockUnlock(fLock);
 			return;
 		}

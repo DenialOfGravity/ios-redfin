@@ -123,6 +123,7 @@ struct a6_blit {
 	uint32_t dst_pitch;
 	uint32_t dx, dy, dw, dh;		/* destination rectangle */
 	bool filter;				/* bilinear */
+	bool blend;				/* source-over alpha blend */
 };
 #define A6_BLIT_MAX_DW	256
 uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);

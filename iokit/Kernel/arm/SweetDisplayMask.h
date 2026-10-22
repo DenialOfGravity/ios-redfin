@@ -8,7 +8,8 @@
 
 #include <stdint.h>
 
-#define SWEET_DISPLAY_CORNER_DEFAULT 64u
+#define SWEET_DISPLAY_CORNER_DEFAULT 176u
+#define SWEET_DISPLAY_CORNER_MAX     256u
 #define SWEET_DISPLAY_MASK_SAMPLES   4u
 
 static inline uint64_t

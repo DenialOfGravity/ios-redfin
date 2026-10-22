@@ -45,7 +45,8 @@ bool sweet_gpu_ready(void);
 int sweet_gpu_surface_slot(uint64_t key);
 int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
-	uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh);
+	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
+	uint32_t *out_dw, uint32_t *out_dh);
 void sweet_gpu_panel_stride(uint32_t stride);
 extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 }
@@ -141,7 +142,7 @@ public:
 	void swap(const uint8_t *rec);
 	void present(const uint8_t *rec);
 	bool presentGPU(const uint8_t *rec);
-	void maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+	void maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -198,6 +199,9 @@ AppleCLCD::start(IOService *provider)
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
 	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
+	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
+		fCornerRadius = SWEET_DISPLAY_CORNER_MAX;
+	}
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
 	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
@@ -376,13 +380,9 @@ gpu_fallback(uint32_t why, const char *what)
 	return false;
 }
 
-/*
- * Clip just the top corners of the rendered iOS image. The superellipse
- * coverage approximates Core Animation's continuous corner curve; the
- * output outside the content shape stays black.
- */
+/* CPU fallback only. The normal GPU path applies this matte before scanout. */
 void
-AppleCLCD::maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+AppleCLCD::maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
 	if (fCornerRadius == 0 || x >= fWidth || y >= fHeight || w < 2 || h == 0) {
 		return;
@@ -405,24 +405,24 @@ AppleCLCD::maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 	}
 
 	for (uint32_t cy = 0; cy < radius; cy++) {
-		volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
+		volatile uint32_t *top = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
+		volatile uint32_t *bottom = (volatile uint32_t *)(fPixels + (uint64_t)(y + h - 1 - cy) * fRowBytes);
 		for (uint32_t cx = 0; cx < radius; cx++) {
 			uint32_t coverage = sweet_display_corner_coverage(cx, cy, radius);
 			if (coverage == 16) {
 				continue;
 			}
-			uint32_t left = x + cx;
-			uint32_t right = x + w - 1 - cx;
-			volatile uint32_t *pixels[2] = { &row[left], &row[right] };
-			for (unsigned side = 0; side < (left == right ? 1u : 2u); side++) {
-				uint32_t pixel = *pixels[side];
+			volatile uint32_t *pixels[4] = { &top[x + cx], &top[x + w - 1 - cx],
+			    &bottom[x + cx], &bottom[x + w - 1 - cx] };
+			for (unsigned corner = 0; corner < 4; corner++) {
+				uint32_t pixel = *pixels[corner];
 				if (coverage == 0) {
-					*pixels[side] = 0;
+					*pixels[corner] = 0;
 				} else {
 					uint32_t b = ((pixel & 0x000000ff) * coverage + 8) / 16;
 					uint32_t g = ((pixel & 0x0000ff00) * coverage + 0x800) / 16 & 0x0000ff00;
 					uint32_t r = ((pixel & 0x00ff0000) * coverage + 0x80000) / 16 & 0x00ff0000;
-					*pixels[side] = (pixel & 0xff000000) | r | g | b;
+					*pixels[corner] = (pixel & 0xff000000) | r | g | b;
 				}
 			}
 		}
@@ -500,7 +500,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
 	}
 	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
-	    fRowBytes, &dx, &dy, &dw, &dh);
+	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
 	s->release();
 	if (rc) {
 		return gpu_fallback(7, "GPU blit failed");
@@ -509,7 +509,6 @@ AppleCLCD::presentGPU(const uint8_t *rec)
 	sweet_display_fit_y = (int)dy;
 	sweet_display_fit_w = (int)dw;
 	sweet_display_fit_h = (int)dh;
-	maskTopCorners(dx, dy, dw, dh);
 	return true;
 }
 
@@ -612,7 +611,7 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 		s->release();
 	}
-	maskTopCorners(0, 0, fWidth, fHeight);
+	maskCorners(0, 0, fWidth, fHeight);
 }
 
 bool

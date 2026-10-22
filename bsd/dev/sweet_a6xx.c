@@ -1056,7 +1056,8 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
 	EV(EV_CACHE_INVALIDATE);
 	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
 
-	REG(0x8c01, 0);			/* RB_A2D_PIXEL_CNTL */
+	/* Source-over, with straight source alpha; used by the display corner matte. */
+	REG(0x8c01, b->blend ? 0x3809c181 : 0);	/* RB_A2D_PIXEL_CNTL */
 	REG(0x8c00, 0x00f03000);	/* RB_A2D_BLT_CNTL: 8888 UNORM, mask f */
 	REG(0x8400, 0x00f03000);	/* GRAS_A2D_BLT_CNTL */
 	REG(0xacc0, 0xf180);		/* SP_A2D_OUTPUT_INFO */
