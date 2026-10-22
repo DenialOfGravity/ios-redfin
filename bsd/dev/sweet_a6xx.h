@@ -124,6 +124,8 @@ struct a6_blit {
 	uint32_t dx, dy, dw, dh;		/* destination rectangle */
 	bool filter;				/* bilinear */
 	bool blend;				/* source-over alpha blend */
+	bool clip;				/* write only inside the scissor: */
+	uint32_t cx0, cy0, cx1, cy1;		/* destination, inclusive */
 };
 #define A6_BLIT_MAX_DW	256
 uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);

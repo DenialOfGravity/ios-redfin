@@ -361,22 +361,46 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
 #define IB_OFF          A6_OFF_FREE     /* the present IB in the pool */
 #define PANEL_W         1080
 #define PANEL_H         2280
-#define DISPLAY_MASK_OFF        0x500000ULL
+#define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
 #define DISPLAY_MASK_SIDE       256u
 #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
 #define DISPLAY_MASK_PITCH      (DISPLAY_MASK_DIM * 4)
-#define DISPLAY_STAGE_OFF       0x600000ULL
+#define DISPLAY_STAGE_OFF       0x600000ULL     /* panel-sized; only the corner bands are used */
 
-static bool display_stage_ready;
 static uint32_t display_mask_radius;
 
 static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
 
+/* The four corner mattes: black, alpha = 1 - coverage of the image (SweetDisplayMask.h). */
+static void
+display_mask_build(uint32_t r, uint32_t ext)
+{
+	uint32_t *atlas = (uint32_t *)(pool_kva + DISPLAY_MASK_OFF);
+	uint8_t row[DISPLAY_MASK_SIDE];
+	uint32_t seg = 0;
+
+	for (uint32_t cy = 0; cy < ext; cy++) {
+		sweet_display_corner_row(r, ext, cy, &seg, row);
+		for (uint32_t corner = 0; corner < 4; corner++) {
+			/* Bit 0: right corner, bit 1: bottom; mirror the top-left one. */
+			uint32_t ty = (corner >> 1) * DISPLAY_MASK_SIDE + ((corner & 2) ? ext - 1 - cy : cy);
+			uint32_t *line = atlas + (size_t)ty * DISPLAY_MASK_DIM + (corner & 1) * DISPLAY_MASK_SIDE;
+			for (uint32_t cx = 0; cx < ext; cx++) {
+				line[(corner & 1) ? ext - 1 - cx : cx] = (uint32_t)(255 - row[cx]) << 24;
+			}
+		}
+	}
+	flush_dcache64((addr64_t)(uintptr_t)atlas, DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM, FALSE);
+}
+
 /*
- * Blit a mapped surface, scaled to fit and centred. With corner_radius, the
- * GPU composites a four-corner matte into a pool staging image and copies the
- * completed frame to scanout. The CPU rendered the source through its cache:
- * clean it through kva first (0: no clean). Waits for the GPU (a few ms).
+ * Blit a mapped surface, scaled to fit and centred, into the panel memory
+ * (rows of fb_pitch bytes). With corner_radius, the image gets continuous
+ * corners: the rows they cover go to a staging image in the pool first (same
+ * blit, scissored), get the mattes blended over, and only then reach the
+ * panel, which scans out continuously. The CPU rendered the source through
+ * its cache: clean it through kva first (0: no clean). Waits for the GPU (a
+ * few ms).
  */
 int
 sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
@@ -387,9 +411,6 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	    (pitch & 63) || (fb_pitch & 63) || fb_pitch < PANEL_W * 4 ||
 	    DISPLAY_STAGE_OFF + (uint64_t)fb_pitch * PANEL_H > A6_POOL_SIZE) {
 		return -1;
-	}
-	if (corner_radius > DISPLAY_MASK_SIDE) {
-		corner_radius = DISPLAY_MASK_SIDE;
 	}
 	uint64_t t0 = mach_absolute_time();
 	if (kva) {
@@ -411,64 +432,61 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	}
 	frame.dx = (PANEL_W - frame.dw) / 2;
 	frame.dy = (PANEL_H - frame.dh) / 2;
-	static uint32_t ib[6 * A6_BLIT_MAX_DW];
+	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
+	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
+		ext = 0;
+	}
+	static uint32_t ib[10 * A6_BLIT_MAX_DW];
 	lck_mtx_lock(&sweet_gpu_lock);
 	uint32_t n = 0;
-	if (corner_radius != 0) {
-		if (!display_stage_ready) {
-			vm_size_t stage_size = (vm_size_t)fb_pitch * PANEL_H;
-			bzero((void *)(pool_kva + DISPLAY_STAGE_OFF), stage_size);
-			flush_dcache64((addr64_t)(pool_kva + DISPLAY_STAGE_OFF), (unsigned)stage_size, FALSE);
-			display_stage_ready = true;
-		}
+	if (ext) {
 		if (display_mask_radius != corner_radius) {
-			uint32_t *atlas = (uint32_t *)(pool_kva + DISPLAY_MASK_OFF);
-			bzero(atlas, DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM);
-			for (uint32_t y = 0; y < corner_radius; y++) {
-				for (uint32_t x = 0; x < corner_radius; x++) {
-					uint32_t xs[4] = { x, corner_radius - 1 - x, x, corner_radius - 1 - x };
-					uint32_t ys[4] = { y, y, corner_radius - 1 - y, corner_radius - 1 - y };
-					for (uint32_t corner = 0; corner < 4; corner++) {
-						uint32_t tx = (corner & 1) * DISPLAY_MASK_SIDE + x;
-						uint32_t ty = (corner >> 1) * DISPLAY_MASK_SIDE + y;
-						/* Each tile is oriented so its destination's outer edge is local x/y = 0. */
-						uint32_t cx = xs[corner], cy = ys[corner];
-						uint32_t alpha = 255 - (sweet_display_corner_coverage(cx, cy, corner_radius) * 255 + 8) / 16;
-						atlas[(size_t)ty * DISPLAY_MASK_DIM + tx] = alpha << 24;
-					}
-				}
-			}
-			flush_dcache64((addr64_t)(pool_kva + DISPLAY_MASK_OFF),
-			    DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM, FALSE);
+			display_mask_build(corner_radius, ext);
 			display_mask_radius = corner_radius;
 		}
-
-		frame.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
-		uint32_t used = a6_blit_ib(&gpu, &frame, ib + n);
-		n += used;
+		uint32_t top = frame.dy, bottom = frame.dy + frame.dh - ext;
+		struct a6_blit b = frame;
+		b.clip = true;
+		b.cx0 = 0;
+		b.cx1 = PANEL_W - 1;
+		/* The rows between the corners straight to the panel ... */
+		b.cy0 = top + ext;
+		b.cy1 = bottom - 1;
+		n += a6_blit_ib(&gpu, &b, ib + n);
+		/* ... the corner rows to the stage ... */
+		b.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF;
+		b.cy0 = top;
+		b.cy1 = top + ext - 1;
+		n += a6_blit_ib(&gpu, &b, ib + n);
+		b.cy0 = bottom;
+		b.cy1 = bottom + ext - 1;
+		n += a6_blit_ib(&gpu, &b, ib + n);
+		/* ... darkened by the mattes ... */
 		for (uint32_t corner = 0; corner < 4; corner++) {
 			struct a6_blit matte = {
 				.src_iova = A6_GVA_POOL + DISPLAY_MASK_OFF,
 				.src_w = DISPLAY_MASK_DIM, .src_h = DISPLAY_MASK_DIM, .src_pitch = DISPLAY_MASK_PITCH,
 				.sx = (corner & 1) * DISPLAY_MASK_SIDE, .sy = (corner >> 1) * DISPLAY_MASK_SIDE,
-				.sw = corner_radius, .sh = corner_radius,
+				.sw = ext, .sh = ext,
 				.dst_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF, .dst_pitch = fb_pitch,
-				.dx = (corner & 1) ? PANEL_W - corner_radius : 0,
-				.dy = (corner & 2) ? PANEL_H - corner_radius : 0,
-				.dw = corner_radius, .dh = corner_radius, .filter = false, .blend = true,
+				.dx = (corner & 1) ? frame.dx + frame.dw - ext : frame.dx,
+				.dy = (corner & 2) ? bottom : top,
+				.dw = ext, .dh = ext, .blend = true,
 			};
-			used = a6_blit_ib(&gpu, &matte, ib + n);
-			n += used;
+			n += a6_blit_ib(&gpu, &matte, ib + n);
 		}
-		struct a6_blit output = {
-			.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
-			.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
-			.sw = PANEL_W, .sh = PANEL_H,
-			.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
-			.dw = PANEL_W, .dh = PANEL_H, .filter = false,
-		};
-		used = a6_blit_ib(&gpu, &output, ib + n);
-		n += used;
+		/* ... then copied to the panel. */
+		for (uint32_t band = 0; band < 2; band++) {
+			uint32_t y = band ? bottom : top;
+			struct a6_blit copy = {
+				.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
+				.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
+				.sx = frame.dx, .sy = y, .sw = frame.dw, .sh = ext,
+				.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
+				.dx = frame.dx, .dy = y, .dw = frame.dw, .dh = ext,
+			};
+			n += a6_blit_ib(&gpu, &copy, ib + n);
+		}
 	} else {
 		n = a6_blit_ib(&gpu, &frame, ib);
 	}

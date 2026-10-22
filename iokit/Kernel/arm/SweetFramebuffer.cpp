@@ -121,7 +121,9 @@ public:
 	uint32_t      fWidth, fHeight, fRowBytes;
 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
-	uint32_t      fCornerRadius;             /* output pixels; boot-arg sweetfb_corner_radius */
+	uint32_t      fCornerRadius;    /* panel pixels; boot-arg sweetfb_corner_radius */
+	uint32_t      fCornerExt;       /* rows/columns a corner covers */
+	uint8_t      *fCornerCov;       /* fCornerExt^2 coverage, top-left corner (CPU copy) */
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -142,7 +144,7 @@ public:
 	void swap(const uint8_t *rec);
 	void present(const uint8_t *rec);
 	bool presentGPU(const uint8_t *rec);
-	void maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -201,6 +203,19 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
 	if (fCornerRadius > SWEET_DISPLAY_CORNER_MAX) {
 		fCornerRadius = SWEET_DISPLAY_CORNER_MAX;
+	}
+	fCornerExt = fCornerRadius ? sweet_display_corner_extent(fCornerRadius) : 0;
+	if (2 * fCornerExt >= fWidth || 2 * fCornerExt >= fHeight) {
+		fCornerExt = 0;
+	}
+	fCornerCov = fCornerExt ? (uint8_t *)IOMalloc((vm_size_t)fCornerExt * fCornerExt) : NULL;
+	if (fCornerCov != NULL) {
+		uint32_t seg = 0;
+		for (uint32_t cy = 0; cy < fCornerExt; cy++) {
+			sweet_display_corner_row(fCornerRadius, fCornerExt, cy, &seg, fCornerCov + cy * fCornerExt);
+		}
+	} else {
+		fCornerExt = 0;
 	}
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
@@ -380,52 +395,38 @@ gpu_fallback(uint32_t why, const char *what)
 	return false;
 }
 
-/* CPU fallback only. The normal GPU path applies this matte before scanout. */
+/*
+ * One row of the CPU copy, n pixels to panel (x, y): rows in the corner bands
+ * are darkened on the way (the GPU path has its own mattes), so the panel
+ * never shows the corners unmasked.
+ */
 void
-AppleCLCD::maskCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
 {
-	if (fCornerRadius == 0 || x >= fWidth || y >= fHeight || w < 2 || h == 0) {
-		return;
-	}
-	if (w > fWidth - x) {
-		w = fWidth - x;
-	}
-	if (h > fHeight - y) {
-		h = fHeight - y;
-	}
-	uint32_t radius = fCornerRadius;
-	if (radius > w / 2) {
-		radius = w / 2;
-	}
-	if (radius > h) {
-		radius = h;
-	}
-	if (radius == 0) {
-		return;
-	}
+	uint32_t *dst = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes) + x;
+	uint32_t e = fCornerExt;
+	const uint8_t *cov = NULL;
 
-	for (uint32_t cy = 0; cy < radius; cy++) {
-		volatile uint32_t *top = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
-		volatile uint32_t *bottom = (volatile uint32_t *)(fPixels + (uint64_t)(y + h - 1 - cy) * fRowBytes);
-		for (uint32_t cx = 0; cx < radius; cx++) {
-			uint32_t coverage = sweet_display_corner_coverage(cx, cy, radius);
-			if (coverage == 16) {
-				continue;
-			}
-			volatile uint32_t *pixels[4] = { &top[x + cx], &top[x + w - 1 - cx],
-			    &bottom[x + cx], &bottom[x + w - 1 - cx] };
-			for (unsigned corner = 0; corner < 4; corner++) {
-				uint32_t pixel = *pixels[corner];
-				if (coverage == 0) {
-					*pixels[corner] = 0;
-				} else {
-					uint32_t b = ((pixel & 0x000000ff) * coverage + 8) / 16;
-					uint32_t g = ((pixel & 0x0000ff00) * coverage + 0x800) / 16 & 0x0000ff00;
-					uint32_t r = ((pixel & 0x00ff0000) * coverage + 0x80000) / 16 & 0x00ff0000;
-					*pixels[corner] = (pixel & 0xff000000) | r | g | b;
-				}
-			}
-		}
+	if (y < e) {
+		cov = fCornerCov + (size_t)y * e;
+	} else if (y >= fHeight - e) {
+		cov = fCornerCov + (size_t)(fHeight - 1 - y) * e;
+	}
+	if (cov == NULL) {
+		memcpy(dst, src, (size_t)n * 4);
+		return;
+	}
+	/* [x, l): left corner, [l, r): plain, [r, end): right corner. */
+	uint32_t end = x + n, l = e < end ? e : end, r = fWidth - e;
+	l = l < x ? x : l;
+	r = r < l ? l : (r > end ? end : r);
+	for (uint32_t px = x; px < l; px++) {
+		dst[px - x] = cov[px] == 255 ? src[px - x] : sweet_display_dim(src[px - x], cov[px]);
+	}
+	memcpy(&dst[l - x], &src[l - x], (size_t)(r - l) * 4);
+	for (uint32_t px = r; px < end; px++) {
+		uint32_t c = cov[fWidth - 1 - px];
+		dst[px - x] = c == 255 ? src[px - x] : sweet_display_dim(src[px - x], c);
 	}
 }
 
@@ -604,14 +605,13 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 		if (src != 0 && bpe == 4) {
 			for (int32_t y = 0; y < h; y++) {
-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
-				    (size_t)w * 4);
+				copyRow((uint32_t)dx, (uint32_t)(dy + y),
+				    (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+				    (uint32_t)w);
 			}
 		}
 		s->release();
 	}
-	maskCorners(0, 0, fWidth, fHeight);
 }
 
 bool

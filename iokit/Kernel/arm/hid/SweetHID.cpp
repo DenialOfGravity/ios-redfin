@@ -482,22 +482,17 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 		fitW = SWEET_PANEL_W;
 		fitH = SWEET_PANEL_H;
 	}
-	if (!was && down && (x < fitX || x >= fitX + fitW || y < fitY || y >= fitY + fitH)) {
+	/*
+	 * No contact starts in a masked corner of the image (SweetDisplayMask.h);
+	 * cx/cy: from the nearest image edge, -1 outside a corner (or in the bars).
+	 */
+	int ext = fCornerRadius ? (int)sweet_display_corner_extent(fCornerRadius) : 0;
+	int cx = x - fitX < ext ? x - fitX : (fitX + fitW - 1 - x < ext ? fitX + fitW - 1 - x : -1);
+	int cy = y - fitY < ext ? y - fitY : (fitY + fitH - 1 - y < ext ? fitY + fitH - 1 - y : -1);
+	if (!was && down && cx >= 0 && cy >= 0 &&
+	    !sweet_display_corner_point_visible((uint32_t)cx, (uint32_t)cy, fCornerRadius)) {
 		IOLockUnlock(fLock);
 		return;
-	}
-	uint32_t cornerRadius = fCornerRadius;
-	bool left = x < (int)cornerRadius;
-	bool right = x >= SWEET_PANEL_W - (int)cornerRadius;
-	bool top = y < (int)cornerRadius;
-	bool bottom = y >= SWEET_PANEL_H - (int)cornerRadius;
-	if (!was && down && cornerRadius && (left || right) && (top || bottom)) {
-		uint32_t localX = (uint32_t)(left ? x : SWEET_PANEL_W - 1 - x);
-		uint32_t localY = (uint32_t)(top ? y : SWEET_PANEL_H - 1 - y);
-		if (!sweet_display_corner_point_visible(localX, localY, cornerRadius)) {
-			IOLockUnlock(fLock);
-			return;
-		}
 	}
 	/*
 	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp):
