@@ -767,12 +767,14 @@ static void map_gpu_low(struct a6_gpu *g)
 
 static uint64_t pt_alloc(struct a6_gpu *g)
 {
-	uint64_t off = A6_OFF_PT_ARENA + 0x1000ull * g->pt_next;
-	if (off + 0x1000 > A6_OFF_SQE)
+	const uint32_t arena = (uint32_t)((A6_OFF_SQE - A6_OFF_PT_ARENA) / 0x1000);
+	uint64_t pa = g->pt_next < arena ? a6_pool_pa(g, A6_OFF_PT_ARENA + 0x1000ull * g->pt_next) :
+	    a6_pt_extra(g->pt_next - arena);
+	if (!pa)
 		return 0;
 	g->pt_next++;
-	zero_pa(a6_pool_pa(g, off), 0x1000);
-	return a6_pool_pa(g, off);
+	zero_pa(pa, 0x1000);
+	return pa;
 }
 
 static uint64_t pt_walk(struct a6_gpu *g, uint64_t table, unsigned idx)

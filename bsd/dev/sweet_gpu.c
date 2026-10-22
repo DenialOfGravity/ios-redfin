@@ -56,6 +56,10 @@ int sweet_display_fit_x, sweet_display_fit_w;
 
 static struct a6_gpu gpu;
 static vm_offset_t pool_kva;
+/* More GPU page tables than the pool's arena (~250 tables = 500 MB mapped): 2048 more (4 GB) */
+#define PT_EXTRA_SIZE   0x800000ULL
+static vm_offset_t pt_kva;
+static uint64_t pt_pa;
 static volatile bool gpu_ready;
 static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
 static LCK_MTX_DECLARE(sweet_gpu_lock, &sweet_gpu_grp);
@@ -91,7 +95,21 @@ gpu_io(uint64_t pa)
 static bool
 in_pool(uint64_t pa, size_t len)
 {
-	return pool_kva && pa >= gpu.pool_pa && pa + len <= gpu.pool_pa + A6_POOL_SIZE;
+	return (pool_kva && pa >= gpu.pool_pa && pa + len <= gpu.pool_pa + A6_POOL_SIZE) ||
+	       (pt_kva && pa >= pt_pa && pa + len <= pt_pa + PT_EXTRA_SIZE);
+}
+
+/* kernel VA of pool or page-table memory (in_pool) */
+static vm_offset_t
+pool_addr(uint64_t pa)
+{
+	return pa >= gpu.pool_pa && pa < gpu.pool_pa + A6_POOL_SIZE ? pool_kva + (pa - gpu.pool_pa) : pt_kva + (pa - pt_pa);
+}
+
+uint64_t
+a6_pt_extra(uint32_t n)
+{
+	return pt_kva && (n + 1) * 0x1000ULL <= PT_EXTRA_SIZE ? pt_pa + n * 0x1000ULL : 0;
 }
 
 uint32_t
@@ -128,8 +146,8 @@ int
 a6_write(uint64_t pa, const void *buf, size_t len)
 {
 	if (in_pool(pa, len)) {
-		memcpy((void *)(pool_kva + (pa - gpu.pool_pa)), buf, len);
-		flush_dcache64((addr64_t)(pool_kva + (pa - gpu.pool_pa)), (unsigned)len, FALSE);
+		memcpy((void *)pool_addr(pa), buf, len);
+		flush_dcache64((addr64_t)pool_addr(pa), (unsigned)len, FALSE);
 		return 0;
 	}
 	if (pmap_valid_address(pa)) {
@@ -148,8 +166,8 @@ int
 a6_read(uint64_t pa, void *buf, size_t len)
 {
 	if (in_pool(pa, len)) {
-		flush_dcache64((addr64_t)(pool_kva + (pa - gpu.pool_pa)), (unsigned)len, FALSE);
-		memcpy(buf, (const void *)(pool_kva + (pa - gpu.pool_pa)), len);
+		flush_dcache64((addr64_t)pool_addr(pa), (unsigned)len, FALSE);
+		memcpy(buf, (const void *)pool_addr(pa), len);
 		return 0;
 	}
 	uint32_t *w = buf;
@@ -235,6 +253,14 @@ sweet_gpu_init(void)
 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
 	a6_init_state(&gpu, ptoa_64(pn));
 	pool_kva = va;
+	vm_offset_t pva = 0;
+	if (kmem_alloc_contig(kernel_map, &pva, PT_EXTRA_SIZE, PAGE_MASK, 0, 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+		pt_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)pva));
+		pt_kva = pva;
+	} else {
+		a6_log("no contiguous memory for more page tables\n");
+	}
 	flush_dcache64((addr64_t)va, (unsigned)A6_POOL_SIZE, FALSE);
 	thread_t thread;
 	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {

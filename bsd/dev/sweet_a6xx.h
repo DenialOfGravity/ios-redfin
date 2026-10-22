@@ -72,6 +72,7 @@ void a6_delay_ms(unsigned ms);
 void a6_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void a6_smc(uint64_t x[8]);				/* x0..x7 in, x0..x3 out */
 const uint8_t *a6_firmware(const char *name, uint32_t *len);	/* NULL if missing */
+uint64_t a6_pt_extra(uint32_t n);	/* PA of the nth 4K page table beyond the pool's arena; 0 = none */
 
 /* ---- core ---- */
 static inline uint64_t a6_pool_pa(const struct a6_gpu *g, uint64_t off) { return g->pool_pa + off; }
