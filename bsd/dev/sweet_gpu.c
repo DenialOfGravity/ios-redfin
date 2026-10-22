@@ -227,10 +227,35 @@ a6_firmware(const char *name, uint32_t *len)
 
 /* ---- bring-up ---- */
 
+int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+
+/*
+ * DDR (BCM MC0) and the memory NoC (SH0) at their top levels: nothing else votes them for the GPU (mainline
+ * sm8150 has no GPU interconnect path either), and ABL's level left 8-thread CPU bandwidth at 13.7 GB/s
+ * (19.6 GB/s voted up) and the present blit 35% slower. BCM command: commit | valid | x (avg) | y (peak).
+ * Boot-arg sweetddr=0 leaves them alone.
+ */
+static void
+gpu_bus_vote(void)
+{
+	uint32_t on = 1;
+	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	static const char *const bcm[] = { "MC0", "SH0" };
+	for (unsigned i = 0; i < sizeof(bcm) / sizeof(bcm[0]); i++) {
+		uint32_t off = 0, val = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
+		int rc = sweet_rpmh_write(bcm[i], 1, &off, &val);
+		a6_log("bus vote %s top -> %d\n", bcm[i], rc);
+	}
+}
+
 static void
 gpu_thread(void *arg __unused, wait_result_t wr __unused)
 {
 	uint64_t t0 = mach_absolute_time(), ns;
+	gpu_bus_vote();
 	lck_mtx_lock(&sweet_gpu_lock);
 	int rc = a6_power_up(&gpu);
 	if (!rc) {
@@ -877,6 +902,18 @@ static const struct { uint64_t pa, size; } gpool_ranges[] = {
 static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
 static uint32_t gpool_nfree;
 static uint64_t gpool_used, gpool_peak;
+
+/* GPU pool bytes not in use (sweet_gpu_pool_alloc), for the per-client cap in SweetAccelerator */
+uint64_t sweet_gpu_pool_avail(void);
+uint64_t
+sweet_gpu_pool_avail(void)
+{
+	uint64_t total = 0;
+	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
+		total += gpool_ranges[i].size;
+	}
+	return total - gpool_used;
+}
 static bool gpool_ready;
 static LCK_MTX_DECLARE(sweet_gpool_lock, &sweet_gpu_grp);
 
