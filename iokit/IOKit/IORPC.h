@@ -224,6 +224,10 @@ struct IORPC {
 	IORPCMessageMach * reply;
 	uint32_t           sendSize;
 	uint32_t           replySize;
+#ifdef KERNEL
+	/* Set by newer iig (Xcode 16+) kernel stubs, read by their Dispatch. */
+	IORPCMessage     * kernelContent;
+#endif /* KERNEL */
 };
 typedef struct IORPC IORPC;
 
