@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
 extern void sweet_touch_init(void);
 extern void sweet_fts_init(void);
 extern void sweet_cpufreq_init(void);
+extern void sweet_pmem_init(void);
 extern void sweet_usb_probe(void);
 
 #define REG_CAP         0x00
@@ -659,6 +660,7 @@ sweet_ufs_init(void)
 	sweet_log_start();
 	sweet_sample_start();
 	sweet_cpufreq_init();
+	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 	sweet_keys_init();
 	sweet_touch_init();

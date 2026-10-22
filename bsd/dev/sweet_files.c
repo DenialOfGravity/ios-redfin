@@ -6,6 +6,8 @@
  *
  *   PUT <path> <mode-octal> <size>\n<size bytes>  -> "OK <size>\n"  (root:wheel)
  *   GET <path>\n                                  -> "OK <size>\n<bytes>"
+ *   READ <path> <offset> <len>\n                  -> "OK <len>\n<bytes>"  (decimal; for
+ *                                                    devices, e.g. /dev/pmem at a PA)
  *   MKDIR <path> <mode-octal>\n                   -> "OK\n"
  *   LINK <target> <path>\n                        -> "OK\n"  (symlink)
  *   RM <path>\n                                   -> "OK\n"
@@ -218,6 +220,45 @@ sf_get(socket_t so, const char *path)
 	return err;
 }
 
+/* Range read: works on character devices (vnode_size is 0 there). */
+static int
+sf_read(socket_t so, const char *path, uint64_t off, uint64_t len)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+	if (err) {
+		sf_reply(so, err, 0, false);
+		return err;
+	}
+	/* Read the first chunk before replying, so a bad offset gives ERR. */
+	int chunk = (int)MIN((uint64_t)SF_BUF, len), resid = 0;
+	err = vn_rdwr(UIO_READ, vp, sf_buf, chunk, (off_t)off, UIO_SYSSPACE, IO_UNIT,
+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	if (err || resid) {
+		vnode_close(vp, FREAD, ctx);
+		sf_reply(so, err ? err : EIO, 0, false);
+		return err ? err : EIO;
+	}
+	sf_reply(so, 0, len, true);
+	for (uint64_t done = 0;;) {
+		err = sf_send(so, sf_buf, (size_t)chunk);
+		done += (uint64_t)chunk;
+		if (err || done >= len) {
+			break;
+		}
+		chunk = (int)MIN((uint64_t)SF_BUF, len - done);
+		err = vn_rdwr(UIO_READ, vp, sf_buf, chunk, (off_t)(off + done), UIO_SYSSPACE, IO_UNIT,
+		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		if (err || resid) {
+			err = err ? err : EIO;
+			break;          /* short stream: the client sees a closed socket */
+		}
+	}
+	vnode_close(vp, FREAD, ctx);
+	return err;
+}
+
 static void
 sf_handle(socket_t so)
 {
@@ -248,6 +289,20 @@ sf_handle(socket_t so)
 	if (!strncmp(line, "GET ", 4)) {
 		err = sf_get(so, line + 4);
 		printf("SWEET FILES: GET %s -> %d\n", line + 4, err);
+		return;
+	}
+	if (!strncmp(line, "READ ", 5)) {
+		char *p = line + 5, *sp = strchr(p, ' ');
+		if (!sp || (size_t)(sp - p) >= sizeof(a)) {
+			sf_reply(so, EINVAL, 0, false);
+			return;
+		}
+		memcpy(a, p, (size_t)(sp - p));
+		a[sp - p] = 0;
+		unsigned long long off = strtoul(sp + 1, &p, 10);   /* 64-bit long */
+		n = sf_dec(p);
+		err = sf_read(so, a, off, n);
+		printf("SWEET FILES: READ %s %llu %llu -> %d\n", a, off, n, err);
 		return;
 	}
 	char *sp = strchr(line, ' ');
