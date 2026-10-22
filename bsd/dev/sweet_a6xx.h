@@ -96,9 +96,21 @@ int a6_ring(struct a6_gpu *g, const uint32_t *dw, uint32_t n, const char *what, 
 int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms);
 /* The same without waiting: returns the fence value (0 = no ring space within timeout_ms) */
 uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms);
+/*
+ * Up to A6_SUBMIT_MAX IBs as Linux's a6xx_submit wraps them: CCU depth/colour invalidate, the IBs, then
+ * the fence written by CACHE_FLUSH_TS (so everything the IBs wrote is in memory when it lands). No wait:
+ * returns the fence, or 0 when the ring has no room within timeout_ms (0 = look once).
+ */
+#define A6_SUBMIT_MAX	16
+uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned n,
+			     unsigned timeout_ms);
 /* Has the fence (from a6_submit_ib_async) landed? (wraparound-safe) */
 bool a6_fence_done(const struct a6_gpu *g, uint32_t fence);
 uint32_t a6_fence_read(const struct a6_gpu *g);
+/* After a6_recover: the fence memory to the last fence submitted (lost work counts as done) */
+void a6_fence_force(struct a6_gpu *g);
+/* CP_ALWAYS_ON_COUNTER (19.2 MHz) */
+uint64_t a6_timestamp(const struct a6_gpu *g);
 
 /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */
 int a6_map(struct a6_gpu *g, uint64_t iova, uint64_t pa, uint64_t size);

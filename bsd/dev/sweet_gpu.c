@@ -285,6 +285,68 @@ sweet_gpu_ready(void)
 	return gpu_ready;
 }
 
+/* ---- hangs and resets (all with sweet_gpu_lock held) ---- */
+
+/*
+ * A hang is no progress: the completed fence has not moved for a while although work is queued.
+ * progress_abs restarts whenever work is queued on an idle GPU.
+ */
+static uint32_t progress_fence;
+static uint64_t progress_abs;
+/* Resets so far, and the fences each lost: (lo, hi] (the last LOST_RING of them) */
+#define LOST_RING       8
+static uint64_t recoveries;
+static struct { uint32_t lo, hi; } lost[LOST_RING];
+
+static void
+gpu_note_submit_locked(void)
+{
+	uint32_t done = a6_fence_read(&gpu);
+	if (done == gpu.fence) {
+		progress_fence = done;
+		progress_abs = mach_absolute_time();
+	}
+}
+
+static bool
+gpu_hung_locked(uint32_t hang_ms)
+{
+	uint32_t done = a6_fence_read(&gpu);
+	uint64_t now = mach_absolute_time(), ns;
+	if (done != progress_fence || (int32_t)(gpu.fence - done) <= 0) {
+		progress_fence = done;
+		progress_abs = now;
+		return false;
+	}
+	absolutetime_to_nanoseconds(now - progress_abs, &ns);
+	return ns > hang_ms * 1000000ULL;
+}
+
+/* Soft reset + CP re-init; everything queued is lost, its fences complete at once (waiters return). */
+static void
+gpu_recover_locked(const char *why)
+{
+	uint64_t far;
+	uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn), done = a6_fence_read(&gpu);
+	a6_log("%s: GPU hang or fault (fence %u, done %u, smmu fsr %x far %llx fsynr0 %x): reset\n",
+	    why, gpu.fence, done, fsr, far, syn);
+	/* where the CP was: ring read pointer, IB1/IB2 (base + dwords left), SQE status */
+	a6_log("%s: rb rptr %x wptr %x, ib1 %08x%08x rem %x, ib2 %08x%08x rem %x, rbbm status %x, sqe stat %x\n", why,
+	    a6_rd(A6_GREG(0x806)), gpu.wptr, a6_rd(A6_GREG(0x929)), a6_rd(A6_GREG(0x928)), a6_rd(A6_GREG(0x92a)),
+	    a6_rd(A6_GREG(0x92c)), a6_rd(A6_GREG(0x92b)), a6_rd(A6_GREG(0x92d)), a6_rd(A6_GREG(0x210)),
+	    a6_rd(A6_GREG(0x908)));
+	lost[recoveries % LOST_RING].lo = done;
+	lost[recoveries % LOST_RING].hi = gpu.fence;
+	recoveries++;
+	if (a6_recover(&gpu)) {
+		a6_log("%s: GPU not recovered\n", why);
+		gpu_ready = false;
+	}
+	a6_fence_force(&gpu);
+	progress_fence = gpu.fence;
+	progress_abs = mach_absolute_time();
+}
+
 /* ---- the panel ---- */
 
 #define MDP             0x0ae00000ULL
@@ -491,16 +553,20 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		n = a6_blit_ib(&gpu, &frame, ib);
 	}
 	a6_write(a6_pool_pa(&gpu, IB_OFF), ib, 4ULL * n);
-	int rc = a6_submit_ib(&gpu, a6_pool_va(IB_OFF), n, 100);
-	if (rc) {
-		uint64_t far;
-		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
-		a6_log("present: GPU timeout (fence %u, memory %u, smmu fsr %x far %llx)\n",
-		    gpu.fence, a6_fence_read(&gpu), fsr, far);
-		if (a6_recover(&gpu)) {
-			a6_log("present: GPU not recovered; back to the CPU copy\n");
-			gpu_ready = false;
+	/*
+	 * Queued behind whatever the Metal clients submitted: wait for our own fence, and reset the GPU only
+	 * when it stops making progress (long but healthy client work must not count as a hang).
+	 */
+	gpu_note_submit_locked();
+	uint32_t fence = a6_submit_ib_async(&gpu, a6_pool_va(IB_OFF), n, 100);
+	int rc = fence ? 0 : -1;
+	while (fence && !a6_fence_done(&gpu, fence)) {
+		if (gpu_hung_locked(500)) {
+			gpu_recover_locked("present");
+			rc = -1;
+			break;
 		}
+		delay(20);
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 	uint64_t t2 = mach_absolute_time();
@@ -524,7 +590,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
 
 #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
-#define USER_VA_END     0x7f00000000ULL
+#define USER_VA_END     0x1000000000ULL /* v1 clients; v2 windows above (sweet_gpu_window_alloc) */
 #define USER_VA_ALIGN   0x10000ULL
 
 static uint64_t user_va_next = USER_VA_BASE;
@@ -646,6 +712,7 @@ sweet_gpu_submit_user_async(uint64_t ib_iova, uint32_t dwords)
 		return 0;
 	}
 	lck_mtx_lock(&sweet_gpu_lock);
+	gpu_note_submit_locked();
 	uint32_t fence = a6_submit_ib_async(&gpu, ib_iova, dwords, 1000);
 	lck_mtx_unlock(&sweet_gpu_lock);
 	return fence;
@@ -667,14 +734,7 @@ sweet_gpu_wait_fence(uint32_t fence, uint32_t timeout_ms)
 	lck_mtx_lock(&sweet_gpu_lock);
 	int rc = a6_fence_done(&gpu, fence) ? 0 : -1;
 	if (rc) {
-		uint64_t far;
-		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
-		a6_log("user fence %u: timeout or fault (fence now %u, smmu fsr %x far %llx fsynr0 %x)\n",
-		    fence, a6_fence_read(&gpu), fsr, far, syn);
-		if (a6_recover(&gpu)) {
-			a6_log("user fence: GPU not recovered\n");
-			gpu_ready = false;
-		}
+		gpu_recover_locked("user fence");
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 	return rc;
@@ -688,19 +748,266 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
 		return -1;
 	}
 	lck_mtx_lock(&sweet_gpu_lock);
+	gpu_note_submit_locked();
 	int rc = a6_submit_ib(&gpu, ib_iova, dwords, timeout_ms ? timeout_ms : 1000);
 	if (rc) {
-		uint64_t far;
-		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
-		a6_log("user submit: ib %llx %u dwords: timeout or fault (smmu fsr %x far %llx fsynr0 %x)\n",
-		    ib_iova, dwords, fsr, far, syn);
-		if (a6_recover(&gpu)) {
-			a6_log("user submit: GPU not recovered\n");
-			gpu_ready = false;
-		}
+		gpu_recover_locked("user submit");
 	}
 	*fence_out = gpu.fence;
 	lck_mtx_unlock(&sweet_gpu_lock);
 	return rc;
+}
+
+/*
+ * ---- v2 buffer memory: RAM that XNU does not manage ----
+ *
+ * SWEET has no PPL, so no __ARM_PTE_PHYSMAP__: the physmap maps all managed RAM with cacheable blocks,
+ * which pmap_set_cache_attributes cannot change per page. A write-combined view of a managed page is
+ * then a mismatched alias: writes got lost and reads came back stale (Turnip's command streams, phone
+ * test v2test). v2 buffers come from HLOS RAM below 4 GB that XNU never maps instead (the flame memory
+ * node is <0xc0000000 0x140000000>; XNU takes 4 GB up; the boot ramdisk at 0xc0000000 is dead once the
+ * shim has jumped; phone/wifi's radio uses 0xe0000000-0xe1000000). Units of 16 KB (a CPU page).
+ */
+#define GPOOL_UNIT      0x4000ULL
+#define GPOOL_FREE_MAX  4096
+static const struct { uint64_t pa, size; } gpool_ranges[] = {
+	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
+	{ 0xe1000000ULL, 0x1f000000ULL },       /* 496 MB */
+};
+static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
+static uint32_t gpool_nfree;
+static uint64_t gpool_used, gpool_peak;
+static bool gpool_ready;
+static LCK_MTX_DECLARE(sweet_gpool_lock, &sweet_gpu_grp);
+
+/* First fit: the physical address of `bytes` (rounded to 16 KB), zeroing is the caller's. 0 = ok. */
+int
+sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
+{
+	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
+	int rc = -1;
+	lck_mtx_lock(&sweet_gpool_lock);
+	if (!gpool_ready) {
+		for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
+			gpool_free[gpool_nfree].pa = gpool_ranges[i].pa;
+			gpool_free[gpool_nfree].size = gpool_ranges[i].size;
+			gpool_nfree++;
+		}
+		gpool_ready = true;
+	}
+	for (uint32_t i = 0; i < gpool_nfree; i++) {
+		if (gpool_free[i].size >= size) {
+			*pa = gpool_free[i].pa;
+			gpool_free[i].pa += size;
+			gpool_free[i].size -= size;
+			if (gpool_free[i].size == 0) {
+				memmove(&gpool_free[i], &gpool_free[i + 1], (gpool_nfree - i - 1) * sizeof(gpool_free[0]));
+				gpool_nfree--;
+			}
+			gpool_used += size;
+			if (gpool_used > gpool_peak) {
+				gpool_peak = gpool_used;
+				if ((gpool_peak >> 24) != ((gpool_peak - size) >> 24)) {
+					a6_log("pool: peak %llu MB in use\n", gpool_peak >> 20);
+				}
+			}
+			rc = 0;
+			break;
+		}
+	}
+	lck_mtx_unlock(&sweet_gpool_lock);
+	if (rc) {
+		a6_log("pool: no %llu bytes free (%llu MB in use)\n", size, gpool_used >> 20);
+	}
+	return rc;
+}
+
+void
+sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
+{
+	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
+	lck_mtx_lock(&sweet_gpool_lock);
+	gpool_used -= size;
+	uint32_t i = 0;
+	while (i < gpool_nfree && gpool_free[i].pa < pa) {
+		i++;
+	}
+	if (i > 0 && gpool_free[i - 1].pa + gpool_free[i - 1].size == pa) {
+		gpool_free[i - 1].size += size;
+		if (i < gpool_nfree && pa + size == gpool_free[i].pa) {
+			gpool_free[i - 1].size += gpool_free[i].size;
+			memmove(&gpool_free[i], &gpool_free[i + 1], (gpool_nfree - i - 1) * sizeof(gpool_free[0]));
+			gpool_nfree--;
+		}
+	} else if (i < gpool_nfree && pa + size == gpool_free[i].pa) {
+		gpool_free[i].pa = pa;
+		gpool_free[i].size += size;
+	} else if (gpool_nfree < GPOOL_FREE_MAX) {
+		memmove(&gpool_free[i + 1], &gpool_free[i], (gpool_nfree - i) * sizeof(gpool_free[0]));
+		gpool_free[i].pa = pa;
+		gpool_free[i].size = size;
+		gpool_nfree++;
+	} else {
+		a6_log("pool: free list full, %llu bytes at %llx leak\n", size, pa);
+	}
+	lck_mtx_unlock(&sweet_gpool_lock);
+}
+
+/*
+ * ---- v2 clients: Turnip's darwin backend (SweetAccelerator.cpp, NativeAdreno ABI) ----
+ *
+ * The client picks its GPU addresses (Turnip's own VMA heap), so each connection gets a window of
+ * the one GPU address space to itself: 4 GB windows from 64 GB up, above the v1 range.
+ */
+#define WIN_BASE        0x1000000000ULL
+#define WIN_SIZE        0x100000000ULL
+#define WIN_COUNT       64
+static uint64_t win_used;               /* bit n: window n taken */
+
+int
+sweet_gpu_window_alloc(uint64_t *base, uint64_t *size)
+{
+	lck_mtx_lock(&sweet_gpu_lock);
+	for (unsigned n = 0; n < WIN_COUNT; n++) {
+		if (!(win_used & (1ULL << n))) {
+			win_used |= 1ULL << n;
+			lck_mtx_unlock(&sweet_gpu_lock);
+			*base = WIN_BASE + n * WIN_SIZE;
+			*size = WIN_SIZE;
+			return 0;
+		}
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return -1;
+}
+
+void
+sweet_gpu_window_free(uint64_t base)
+{
+	if (base < WIN_BASE || base >= WIN_BASE + WIN_COUNT * WIN_SIZE) {
+		return;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	win_used &= ~(1ULL << ((base - WIN_BASE) / WIN_SIZE));
+	lck_mtx_unlock(&sweet_gpu_lock);
+}
+
+/* 4K pages at iova (inside the caller's window), then a TLB flush. */
+int
+sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages)
+{
+	if (!gpu_ready || npages == 0 || iova < WIN_BASE) {
+		return -1;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	int rc = a6_map_pages(&gpu, iova, pages, npages, 0x1000);
+	if (rc) {
+		a6_unmap(&gpu, iova, (uint64_t)npages << 12);
+	}
+	a6_tlb_flush(&gpu);
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return rc;
+}
+
+void
+sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
+{
+	if (iova < WIN_BASE || len == 0) {
+		return;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	if (gpu_ready) {
+		a6_unmap(&gpu, iova, len);
+		a6_tlb_flush(&gpu);
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+}
+
+/* Queue up to A6_SUBMIT_MAX IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
+uint32_t
+sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
+{
+	*busy = false;
+	if (!gpu_ready) {
+		return 0;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	gpu_note_submit_locked();
+	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, 0);
+	lck_mtx_unlock(&sweet_gpu_lock);
+	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
+	return fence;
+}
+
+bool
+sweet_gpu_fence_done(uint32_t fence)
+{
+	return !gpu_ready || a6_fence_done(&gpu, fence);
+}
+
+/*
+ * Wait up to timeout_ns (0: look once) for a fence: 0 done, 1 timeout. A GPU that makes no progress for
+ * a second is reset here (its queued work is lost; sweet_gpu_lost tells the clients).
+ */
+int
+sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+{
+	/* the hang check by time, not per call: Turnip's darwin backend waits in 1 ms slices */
+	static uint64_t last_check;
+	uint64_t t0 = mach_absolute_time(), ns = 0, check_abs;
+	nanoseconds_to_absolutetime(5000000, &check_abs);
+	for (;;) {
+		if (sweet_gpu_fence_done(fence)) {
+			return 0;
+		}
+		uint64_t now = mach_absolute_time();
+		if (now - last_check > check_abs) {
+			last_check = now;
+			lck_mtx_lock(&sweet_gpu_lock);
+			if (!a6_fence_done(&gpu, fence) && gpu_hung_locked(1000)) {
+				gpu_recover_locked("v2 fence wait");
+			}
+			lck_mtx_unlock(&sweet_gpu_lock);
+		}
+		absolutetime_to_nanoseconds(now - t0, &ns);
+		if (ns >= timeout_ns) {
+			return sweet_gpu_fence_done(fence) ? 0 : 1;
+		}
+		delay(20);
+	}
+}
+
+/*
+ * Did a reset since *epoch lose work of a client whose last fence is last_fence? Moves *epoch to now.
+ * (Fences are global and in submission order: the client lost work if its last one was in a lost range.)
+ */
+bool
+sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence)
+{
+	bool hit = false;
+	lck_mtx_lock(&sweet_gpu_lock);
+	if (recoveries - *epoch > LOST_RING) {
+		*epoch = recoveries - LOST_RING;
+	}
+	for (; *epoch < recoveries; (*epoch)++) {
+		uint32_t lo = lost[*epoch % LOST_RING].lo, hi = lost[*epoch % LOST_RING].hi;
+		if (last_fence && (int32_t)(last_fence - lo) > 0 && (int32_t)(hi - last_fence) >= 0) {
+			hit = true;
+		}
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return hit;
+}
+
+uint64_t
+sweet_gpu_recoveries(void)
+{
+	return recoveries;
+}
+
+uint64_t
+sweet_gpu_timestamp(void)
+{
+	return gpu_ready ? a6_timestamp(&gpu) : 0;
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */

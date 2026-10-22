@@ -739,15 +739,28 @@ uint32_t a6_fence_read(const struct a6_gpu *g)
 	return v;
 }
 
-uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
+uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned nib,
+			     unsigned timeout_ms)
 {
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
-	uint32_t dw[] = {
-		a6_pkt7(A6_CP_INDIRECT_BUFFER, 3), (uint32_t)iova, (uint32_t)(iova >> 32), dwords,
-		a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0),
-		a6_pkt7(A6_CP_MEM_WRITE, 3), (uint32_t)fva, (uint32_t)(fva >> 32), g->fence + 1,
-	};
-	uint32_t n = sizeof(dw) / 4;
+	uint32_t dw[4 + 4 * A6_SUBMIT_MAX + 5], n = 0;
+	if (nib == 0 || nib > A6_SUBMIT_MAX)
+		return 0;
+	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
+	dw[n++] = 0x18;				/* PC_CCU_INVALIDATE_DEPTH */
+	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
+	dw[n++] = 0x19;				/* PC_CCU_INVALIDATE_COLOR */
+	for (unsigned i = 0; i < nib; i++) {
+		dw[n++] = a6_pkt7(A6_CP_INDIRECT_BUFFER, 3);
+		dw[n++] = (uint32_t)iova[i];
+		dw[n++] = (uint32_t)(iova[i] >> 32);
+		dw[n++] = dwords[i] & 0xfffff;
+	}
+	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);
+	dw[n++] = 0x04;				/* CACHE_FLUSH_TS: the fence lands once the caches are clean */
+	dw[n++] = (uint32_t)fva;
+	dw[n++] = (uint32_t)(fva >> 32);
+	dw[n++] = g->fence + 1;
 	/* room in the ring: what the CP has not read yet stays intact */
 	for (unsigned i = 0; ; i++) {
 		uint32_t r = rd32(GREG(CP_RB_RPTR)), used = (g->wptr + A6_RING_DW - r) % A6_RING_DW;
@@ -764,6 +777,26 @@ uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, un
 	g->wptr = (w + n) % A6_RING_DW;
 	wr32(GREG(CP_RB_WPTR), g->wptr);
 	return ++g->fence;
+}
+
+uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
+{
+	return a6_submit_ibs_async(g, &iova, &dwords, 1, timeout_ms);
+}
+
+void a6_fence_force(struct a6_gpu *g)
+{
+	uint32_t v = g->fence;
+	a6_write(a6_pool_pa(g, A6_OFF_SCRATCH), &v, 4);
+}
+
+uint64_t a6_timestamp(const struct a6_gpu *g)
+{
+	(void)g;
+	uint32_t hi = rd32(GREG(0x0981)), lo = rd32(GREG(0x0980)), hi2 = rd32(GREG(0x0981));
+	if (hi2 != hi)
+		lo = rd32(GREG(0x0980));
+	return (uint64_t)hi2 << 32 | lo;
 }
 
 bool a6_fence_done(const struct a6_gpu *g, uint32_t fence)
