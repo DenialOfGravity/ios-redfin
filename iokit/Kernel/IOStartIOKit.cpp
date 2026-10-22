@@ -188,7 +188,16 @@ StartIOKitMatching(void)
 	}
 
 #if !NO_KEXTD
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	/*
+	 * SWEET: no IOKit daemon ever reports that it has launched (no kexts to manage), so this
+	 * hold kept the registry root busy forever: IOKit never quiesced, configd's InterfaceNamer
+	 * never said "quiet", and wifid (and SpringBoard behind it) waited for that at boot.
+	 */
+	if (false) {
+#else
 	if (OSKext::iokitDaemonAvailable()) {
+#endif
 		/* Add a busy count to keep the registry busy until the IOKit daemon has
 		 * completely finished launching. This is decremented when the IOKit daemon
 		 * messages the kernel after the in-kernel linker has been

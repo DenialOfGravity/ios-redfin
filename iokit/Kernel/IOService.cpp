@@ -1200,7 +1200,9 @@ IOService::iokitDaemonLaunched(void)
 	}
 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
 	startDeferredMatches();
+#if !defined(ARM64_BOARD_CONFIG_SWEET)                 /* SWEET takes no hold for it (IOStartIOKit.cpp) */
 	getServiceRoot()->adjustBusy(-1);
+#endif
 	IOService::publishUserResource(gIOResourceIOKitKey);
 #endif /* !NO_KEXTD */
 }

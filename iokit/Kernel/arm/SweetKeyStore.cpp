@@ -227,6 +227,49 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		args->scalarOutputCount = 0;
 		ret = sweet_aks_device_state(args);
 		break;
+	/*
+	 * (from HackiOS) kAKSWrapKey / kAKSUnwrapKey: securityd wraps each keychain item's key with
+	 * its protection class before storing it. No SEP, no secret: a mark, the class and the key
+	 * mixed with a fixed pattern, 8 bytes longer like AES key wrap. Without them no keychain item
+	 * (wifid's network passwords among them) could be stored.
+	 */
+	case kAKSWrapKey: {
+		uint8_t wrapped[8 + 64];
+		size_t len = args->structureInputSize;
+		if (args->structureInput == NULL || len == 0 || len > 64 || in_scalars < 2) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		memcpy(wrapped, "HKwr", 4);
+		wrapped[4] = (uint8_t)args->scalarInput[1];
+		wrapped[5] = wrapped[6] = wrapped[7] = 0;
+		memcpy(wrapped + 8, args->structureInput, len);
+		for (size_t i = 0; i < len; i++) {
+			wrapped[8 + i] ^= (uint8_t)(0x5a + 37 * i);
+		}
+		if (out_scalars >= 1) {
+			args->scalarOutput[0] = args->scalarInput[1];
+			args->scalarOutputCount = 1;
+		}
+		ret = sweet_aks_struct_out(args, wrapped, (uint32_t)(8 + len));
+		break;
+	}
+	case kAKSUnwrapKey: {
+		uint8_t key[64];
+		const uint8_t *w = (const uint8_t *)args->structureInput;
+		size_t len = args->structureInputSize;
+		if (w == NULL || len <= 8 || len > 8 + sizeof(key) || memcmp(w, "HKwr", 4) != 0) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		memcpy(key, w + 8, len - 8);
+		for (size_t i = 0; i < len - 8; i++) {
+			key[i] ^= (uint8_t)(0x5a + 37 * i);
+		}
+		args->scalarOutputCount = 0;
+		ret = sweet_aks_struct_out(args, key, (uint32_t)(len - 8));
+		break;
+	}
 	default:
 		ret = kIOReturnUnsupported;
 		break;

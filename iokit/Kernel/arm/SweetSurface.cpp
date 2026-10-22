@@ -288,6 +288,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
+	/*
+	 * (from HackiOS) 10-bit formats a wide-gamut iPhone asks for ('w30r', 'l10r', 'w30R' and
+	 * 'b3a8' with its separate alpha plane): neither these surfaces nor the software renderer
+	 * draw them, and the panel is 8-bit sRGB. Made as one-plane BGRA, which the client reads back.
+	 */
+	bool one_plane = false;
+	if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u || s->pixelFormat == 0x77333052u) {
+		s->pixelFormat = 0x42475241u;           /* BGRA */
+	} else if (s->pixelFormat == 0x62336138u) {
+		s->pixelFormat = 0x42475241u;
+		one_plane = true;
+	}
 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
@@ -301,7 +313,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	}
 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 
-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 	s->planeCount = 0;
 	if (planes != NULL) {
 		uint64_t next = s->offset;

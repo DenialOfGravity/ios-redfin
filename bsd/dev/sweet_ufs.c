@@ -55,6 +55,7 @@ extern void sweet_touch_init(void);
 extern void sweet_fts_init(void);
 extern void sweet_cpufreq_init(void);
 extern void sweet_pmem_init(void);
+extern void flame_wlan_init(void);
 extern void sweet_gpu_init(void);
 extern void sweet_usb_probe(void);
 
@@ -662,6 +663,7 @@ sweet_ufs_init(void)
 	sweet_sample_start();
 	sweet_cpufreq_init();
 	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
+	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c */
 	sweet_gpu_init();        /* Adreno 640 (sweetgpu=1): bsd/dev/sweet_gpu.c */
 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 	sweet_keys_init();
