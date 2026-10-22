@@ -98,6 +98,7 @@ class SweetAcceleratorUserClient : public IOUserClient {
 	OSArray *fMaps;         /* same index: the kernel IOMemoryMap, for cache maintenance */
 	uint64_t *fVA;          /* same index: GPU VA and length (0 once freed) */
 	uint64_t *fLen;
+	uint32_t fLastFence;    /* of this client's last submit: waited for before its memory is unmapped */
 
 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
 
@@ -137,6 +138,14 @@ SweetAcceleratorUserClient::clientClose(void)
 void
 SweetAcceleratorUserClient::free(void)
 {
+	/*
+	 * Submits are asynchronous: a client that exits (or crashes) may leave work queued. Unmapping its
+	 * memory under the GPU would fault, or hand the VAs and pages to someone else while the GPU still
+	 * writes them: wait for its last fence first.
+	 */
+	if (fLastFence != 0 && sweet_gpu_wait_fence(fLastFence, 2000)) {
+		IOLog("SWEET MTL: client freed with fence %u still pending\n", fLastFence);
+	}
 	if (fMem != NULL) {
 		for (unsigned i = 0; i < fMem->getCount(); i++) {
 			IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, fMem->getObject(i));
@@ -339,6 +348,9 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 			return kIOReturnBadArgument;
 		}
 		out[0] = sweet_gpu_submit_user_async(in[0], (uint32_t)in[1]);
+		if (out[0]) {
+			fLastFence = (uint32_t)out[0];
+		}
 		return out[0] ? kIOReturnSuccess : kIOReturnNotReady;
 	}
 	case 7:

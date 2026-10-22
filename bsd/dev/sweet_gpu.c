@@ -621,7 +621,7 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
 	return 0;
 }
 
-/* Undo sweet_gpu_map_user (submissions are synchronous: nothing in flight uses it). */
+/* Undo sweet_gpu_map_user. The caller makes sure no queued GPU work uses it (SweetAccelerator: the client's last fence). */
 void
 sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
 {
