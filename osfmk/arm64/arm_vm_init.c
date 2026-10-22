@@ -1829,7 +1829,8 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool 
 /*
  * The reserved low-globals/kernel region is excluded from VM allocation.
  * Use the otherwise empty 32MB block above low globals and below gVirtBase
- * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
+ * for a framebuffer alias that survives bootstrap TTBR0 teardown. Device-GRE
+ * like start.s: the 32MB block reaches into pil_slpi_region on flame.
  */
 #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
 
@@ -1845,7 +1846,7 @@ sweet_early_map_final(void)
 	assert(*slot == ARM_TTE_EMPTY);
 	*slot = (tt_entry_t)SWEET_EARLY_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED) |
 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
 	__asm__ volatile("dsb ishst" ::: "memory");
 }

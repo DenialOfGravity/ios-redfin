@@ -1,7 +1,8 @@
 /*
  * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
  * per-CPU state: panic() can reach this before a current thread exists.
- * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+ * start.s maps the splash framebuffer VA=PA as Device-GRE memory (aligned
+ * 32-bit stores only).
  * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
  * retain this console until the normal framebuffer serial console is ready.
  */
