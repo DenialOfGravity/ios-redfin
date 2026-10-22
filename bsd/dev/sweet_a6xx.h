@@ -61,6 +61,7 @@ struct a6_gpu {
 	uint32_t fence;			/* last fence value submitted */
 	uint32_t hfi_seq;
 	uint32_t pt_next;		/* next free table in the arena */
+	uint32_t perf_level;		/* GMU perf vote: 1 (257 MHz) .. 5 (585 MHz); 0 = 1 */
 };
 
 /* ---- environment ---- */

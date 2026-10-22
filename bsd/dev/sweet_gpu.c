@@ -252,6 +252,9 @@ sweet_gpu_init(void)
 	}
 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
 	a6_init_state(&gpu, ptoa_64(pn));
+	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */
+	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+	gpu.perf_level = lvl;
 	pool_kva = va;
 	vm_offset_t pva = 0;
 	if (kmem_alloc_contig(kernel_map, &pva, PT_EXTRA_SIZE, PAGE_MASK, 0, 0,
