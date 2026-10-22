@@ -44,6 +44,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 #define RH_DB_ENTRY     24u
 #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
 #define RH_VRM          4u
+#define RH_ARC          3u
 #define RH_TIMEOUT_US   100000u
 
 static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
@@ -186,9 +187,9 @@ rh_lookup(const char *res, uint32_t *address)
 				continue;
 			}
 			uint32_t addr = rh_read(rh_db, e + 16);
-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+			if ((slave != RH_VRM && slave != RH_ARC) || (addr >> 16) != slave || (addr & 15u) ||
 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
+				printf("SWEET RPMH: invalid VRM/ARC entry for %s\n", res);
 				return EINVAL;
 			}
 			*address = addr;
@@ -219,7 +220,7 @@ rh_free(unsigned t)
 }
 
 static int
-rh_send(uint32_t address, unsigned mv)
+rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32_t *values)
 {
 	int chosen = -1;
 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
@@ -266,11 +267,10 @@ rh_send(uint32_t address, unsigned mv)
 	}
 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
 	rh_poisoned = true;
-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
-	const uint32_t offsets[3] = {0, 8, 4};
-	const uint32_t values[3] = {mv, 7, 1};
-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
-	for (unsigned c = 0; c < 3; ++c) {
+	uint32_t mask = (1u << n) - 1u;
+	printf("SWEET RPMH: TCS%u ACTIVE %u commands at %#x (first %#x=%u) irq-enable=%#x\n", t, n, address,
+	    offsets[0], values[0], irq_en);
+	for (unsigned c = 0; c < n; ++c) {
 		uint32_t cmd = b + c * RH_CMD_STRIDE;
 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
@@ -278,18 +278,18 @@ rh_send(uint32_t address, unsigned mv)
 			return EIO;
 		}
 	}
-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
+	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
 		return EIO;
 	}
 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
+	uint32_t irq = 0, idle = 0, status[4] = {0, 0, 0, 0};
 	bool done = false, progress = false;
 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
 		idle = rh_read(rh_tcs, b + RH_STATUS);
 		bool complete = true;
-		for (unsigned c = 0; c < 3; ++c) {
+		for (unsigned c = 0; c < n; ++c) {
 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
 			complete &= status[c] != 0xffffffffu &&
 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
@@ -322,6 +322,46 @@ rh_send(uint32_t address, unsigned mv)
 	rh_poisoned = false;
 	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
 	return 0;
+}
+
+static int
+rh_send(uint32_t address, unsigned mv)
+{
+	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+	const uint32_t offsets[3] = {0, 8, 4};
+	const uint32_t values[3] = {mv, 7, 1};
+	return rh_send_cmds(address, 3, offsets, values);
+}
+
+/*
+ * Any VRM or ARC resource, 1-4 commands (offset from the resource address,
+ * value): for /dev/pmem's PMEM_RPMH (userland bring-up of the modem and
+ * WLAN: ARC levels of cx/mss, WLAN rails). No policy: a debugging path.
+ */
+int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+
+int
+sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
+{
+	if (!res || n == 0 || n > 4) {
+		return EINVAL;
+	}
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+		return EBUSY;
+	}
+	int error = EIO;
+	uint32_t address = 0;
+	if (!rh_poisoned) {
+		error = rh_map();
+		if (!error) {
+			error = rh_lookup(res, &address);
+		}
+		if (!error) {
+			error = rh_send_cmds(address, n, offsets, values);
+		}
+	}
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
 }
 
 int

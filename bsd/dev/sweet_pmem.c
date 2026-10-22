@@ -16,6 +16,8 @@
  *   ioctl PMEM_FREE    {pa}
  *   ioctl PMEM_SMC     x0..x7 in, x0..x3 out (SMCCC; e.g. SCM PAS calls)
  *   ioctl PMEM_LIST    allocation table, for tools that lost their state
+ *   ioctl PMEM_RPMH    one RPMh active vote: resource name, 1-4 (offset, value) commands
+ *                      (ARC levels, VRM rails; bsd/dev/sweet_rpmh.c)
  *
  * Userland side: work/userland/gpu/pmem.h (same structs and numbers).
  */
@@ -66,6 +68,14 @@ struct pmem_list {
 #define PMEM_FREE       _IOW('P', 2, uint64_t)
 #define PMEM_SMC        _IOWR('P', 3, struct pmem_smc)
 #define PMEM_LIST       _IOR('P', 4, struct pmem_list)
+struct pmem_rpmh {
+	char res[16];           /* cmd-db name, e.g. "mss.lvl", "ldoa1" */
+	uint32_t n;             /* 1..4 commands */
+	uint32_t offset[4];     /* from the resource address */
+	uint32_t value[4];
+};
+#define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
+extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
 
 #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
 #define PMEM_WIN        0x200000ULL
@@ -315,6 +325,14 @@ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unus
 			}
 		}
 		break;
+	}
+	case PMEM_RPMH: {
+		struct pmem_rpmh *r = (struct pmem_rpmh *)data;
+		r->res[sizeof(r->res) - 1] = 0;
+		lck_mtx_unlock(&sweet_pmem_lock);       /* waits up to 100 ms; not under our lock */
+		err = sweet_rpmh_write(r->res, r->n, r->offset, r->value);
+		printf("SWEET PMEM: rpmh %s %u cmds (%#x=%u ...) -> %d\n", r->res, r->n, r->offset[0], r->value[0], err);
+		return err;
 	}
 	default:
 		err = ENOTTY;
