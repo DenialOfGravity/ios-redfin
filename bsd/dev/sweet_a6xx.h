@@ -70,6 +70,7 @@ void a6_wr(uint64_t pa, uint32_t v);
 int a6_write(uint64_t pa, const void *buf, size_t len);	/* DRAM: any size; MMIO: words */
 int a6_read(uint64_t pa, void *buf, size_t len);
 void a6_delay_ms(unsigned ms);
+void a6_delay_us(unsigned us);
 void a6_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void a6_smc(uint64_t x[8]);				/* x0..x7 in, x0..x3 out */
 const uint8_t *a6_firmware(const char *name, uint32_t *len);	/* NULL if missing */
@@ -81,6 +82,7 @@ static inline uint64_t a6_pool_va(uint64_t off) { return A6_GVA_POOL + off; }
 
 void a6_init_state(struct a6_gpu *g, uint64_t pool_pa);
 int a6_power_up(struct a6_gpu *g);	/* everything up to a working CP with the zap shader; 0 = ok */
+int a6_recover(struct a6_gpu *g);	/* after a hang/fault: soft reset, CP re-init (mappings kept); 0 = ok */
 bool a6_cx_up(void);
 bool a6_gx_up(void);
 bool a6_cp_running(const struct a6_gpu *g);	/* GX on and the CP runs our SQE */

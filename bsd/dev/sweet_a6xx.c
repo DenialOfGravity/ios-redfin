@@ -715,14 +715,15 @@ int a6_ring(struct a6_gpu *g, const uint32_t *dw, uint32_t n, const char *what, 
 		a6_write(a6_pool_pa(g, A6_OFF_RING), dw + first, 4ull * (n - first));
 	g->wptr = (w + n) % A6_RING_DW;
 	wr32(GREG(CP_RB_WPTR), g->wptr);
+	/* poll: a few reads, then 20 us sleeps (1 ms ones made every submit take whole milliseconds) */
 	unsigned i;
-	for (i = 0; i < timeout_ms * 10; i++) {
+	for (i = 0; i < timeout_ms * 50 + 8; i++) {
 		if (rd32(GREG(CP_RB_RPTR)) == g->wptr && !(rd32(GREG(RBBM_STATUS)) & (1u << 23)))
 			break;
-		if ((i & 7) == 7)
-			a6_delay_ms(1);
+		if (i >= 8)
+			a6_delay_us(20);
 	}
-	bool ok = i < timeout_ms * 10;
+	bool ok = i < timeout_ms * 50 + 8;
 	if (what || !ok)
 		a6_log("ring %s: rptr %x wptr %x status %x int %x hwfault %x cp_status1 %x %s\n",
 		       what ? what : "", rd32(GREG(CP_RB_RPTR)), g->wptr, rd32(GREG(RBBM_STATUS)),
@@ -878,6 +879,17 @@ void a6_unmap_high(struct a6_gpu *g)
 
 /* ---- stage 4: GPU SMMU bank, hw_init, SQE, CP ---- */
 
+/* The zap shader is already in TrustZone after a GPU reset: tell TZ to resume it (Linux: SCM_GPU_ZAP_SHADER_RESUME) */
+static int zap_resume(void)
+{
+	uint64_t x[8] = { 0x42000000ull | (1u << 8) | 0x0a, 2, 0 /* resume */, PAS_GPU, 0, 0, 0, 0 };
+	a6_smc(x);
+	a6_log("zap: resume rc %lld\n", (long long)x[0]);
+	return x[0] ? -1 : 0;
+}
+
+static int gpu_cp_init(struct a6_gpu *g, bool resume);
+
 static int gpu_cp(struct a6_gpu *g)
 {
 	if (smmu_pick(&g->gpu_smr, &g->gpu_cb, g->gmu_cb + 1)) {
@@ -886,7 +898,26 @@ static int gpu_cp(struct a6_gpu *g)
 	}
 	map_gpu_low(g);
 	smmu_bank(g->gpu_smr, g->gpu_cb, a6_pool_pa(g, A6_OFF_GT_L1), GPU_SID, GPU_SID_MASK);
+	return gpu_cp_init(g, false);
+}
 
+/* After a hang or fault: soft reset of the GPU core, then the CP up again (page tables and SMMU banks kept). */
+int a6_recover(struct a6_gpu *g)
+{
+	(void)a6_clear_fault(g);
+	wr32(GREG(0x43), 1);			/* RBBM_SW_RESET_CMD */
+	(void)rd32(GREG(0x43));
+	a6_delay_us(100);
+	wr32(GREG(0x43), 0);
+	a6_delay_ms(1);
+	(void)a6_clear_fault(g);
+	int rc = gpu_cp_init(g, true);
+	a6_log("recover: soft reset + CP init -> %d\n", rc);
+	return rc;
+}
+
+static int gpu_cp_init(struct a6_gpu *g, bool resume)
+{
 	/* a6xx hw_init for the A640 (a6xx_gpu.c), minus clock gating, CP protection and interrupts */
 	wr32(GREG(0x3c45), 0);			/* GBIF_HALT */
 	(void)rd32(GREG(0x3c45));
@@ -933,7 +964,7 @@ static int gpu_cp(struct a6_gpu *g)
 	uint32_t me_init[] = { a6_pkt7(A6_CP_ME_INIT, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0 };
 	if (a6_ring(g, me_init, 9, "me_init", 1000))
 		return -1;
-	if (zap_load(g))
+	if (resume ? zap_resume() : zap_load(g))
 		return -1;
 	uint32_t secure[] = { a6_pkt7(A6_CP_SET_SECURE_MODE, 1), 0 };
 	return a6_ring(g, secure, 2, "secure mode off", 1000);

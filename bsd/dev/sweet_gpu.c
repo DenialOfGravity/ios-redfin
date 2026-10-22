@@ -184,6 +184,12 @@ a6_delay_ms(unsigned ms)
 }
 
 void
+a6_delay_us(unsigned us)
+{
+	delay((int)us);
+}
+
+void
 a6_log(const char *fmt, ...)
 {
 	va_list ap;
@@ -397,10 +403,12 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	if (rc) {
 		uint64_t far;
 		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
-		a6_log("present: GPU timeout (fence %u, memory %u, smmu fsr %x far %llx); back to the CPU copy\n",
+		a6_log("present: GPU timeout (fence %u, memory %u, smmu fsr %x far %llx)\n",
 		    gpu.fence, a6_fence_read(&gpu), fsr, far);
-		(void)a6_clear_fault(&gpu);
-		gpu_ready = false;
+		if (a6_recover(&gpu)) {
+			a6_log("present: GPU not recovered; back to the CPU copy\n");
+			gpu_ready = false;
+		}
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 	uint64_t t2 = mach_absolute_time();
@@ -550,7 +558,10 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
 		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
 		a6_log("user submit: ib %llx %u dwords: timeout or fault (smmu fsr %x far %llx fsynr0 %x)\n",
 		    ib_iova, dwords, fsr, far, syn);
-		(void)a6_clear_fault(&gpu);
+		if (a6_recover(&gpu)) {
+			a6_log("user submit: GPU not recovered\n");
+			gpu_ready = false;
+		}
 	}
 	*fence_out = gpu.fence;
 	lck_mtx_unlock(&sweet_gpu_lock);
