@@ -544,6 +544,48 @@ sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
 	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
+/* Queue an IB (user GPU memory) without waiting: its fence, or 0 if the GPU is not usable. */
+uint32_t
+sweet_gpu_submit_user_async(uint64_t ib_iova, uint32_t dwords)
+{
+	if (!gpu_ready) {
+		return 0;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	uint32_t fence = a6_submit_ib_async(&gpu, ib_iova, dwords, 1000);
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return fence;
+}
+
+/* Wait for a fence of sweet_gpu_submit_user_async: 0, or -1 after timeout_ms (the GPU is then recovered). */
+int
+sweet_gpu_wait_fence(uint32_t fence, uint32_t timeout_ms)
+{
+	for (unsigned i = 0; i < timeout_ms * 50; i++) {
+		if (!gpu_ready) {
+			return -1;
+		}
+		if (a6_fence_done(&gpu, fence)) {
+			return 0;
+		}
+		delay(20);
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	int rc = a6_fence_done(&gpu, fence) ? 0 : -1;
+	if (rc) {
+		uint64_t far;
+		uint32_t syn, fsr = a6_fault_status(&gpu, &far, &syn);
+		a6_log("user fence %u: timeout or fault (fence now %u, smmu fsr %x far %llx fsynr0 %x)\n",
+		    fence, a6_fence_read(&gpu), fsr, far, syn);
+		if (a6_recover(&gpu)) {
+			a6_log("user fence: GPU not recovered\n");
+			gpu_ready = false;
+		}
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return rc;
+}
+
 /* Run an IB (user GPU memory) and wait for it. 0, or -1 on a hang/fault (cleared, logged). */
 int
 sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)

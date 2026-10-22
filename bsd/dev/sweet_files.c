@@ -162,6 +162,10 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
 	vfs_context_t ctx = vfs_context_kernel();
 	vnode_t vp = NULLVP;
 	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
+	if (!err) {
+		/* O_TRUNC through vnode_open does not shorten an existing file here: a smaller file kept the old tail */
+		err = vnode_setsize(vp, 0, 0, ctx);
+	}
 	uint64_t off = 0;
 	while (off < size) {
 		size_t chunk = (size_t)MIN((uint64_t)SF_BUF, size - off);

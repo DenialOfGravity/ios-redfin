@@ -94,6 +94,10 @@ uint32_t a6_pkt4(uint32_t reg, uint32_t cnt);
 int a6_ring(struct a6_gpu *g, const uint32_t *dw, uint32_t n, const char *what, unsigned timeout_ms);
 /* IB at iova, then WFI + fence write; waits for the fence. 0 = ok. */
 int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms);
+/* The same without waiting: returns the fence value (0 = no ring space within timeout_ms) */
+uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms);
+/* Has the fence (from a6_submit_ib_async) landed? (wraparound-safe) */
+bool a6_fence_done(const struct a6_gpu *g, uint32_t fence);
 uint32_t a6_fence_read(const struct a6_gpu *g);
 
 /* 4K pages (AP=01, NC) at iova -> pa; tables from the arena. Then a6_tlb_flush. */

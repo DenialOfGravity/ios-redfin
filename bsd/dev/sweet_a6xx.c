@@ -739,6 +739,38 @@ uint32_t a6_fence_read(const struct a6_gpu *g)
 	return v;
 }
 
+uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
+{
+	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
+	uint32_t dw[] = {
+		a6_pkt7(A6_CP_INDIRECT_BUFFER, 3), (uint32_t)iova, (uint32_t)(iova >> 32), dwords,
+		a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0),
+		a6_pkt7(A6_CP_MEM_WRITE, 3), (uint32_t)fva, (uint32_t)(fva >> 32), g->fence + 1,
+	};
+	uint32_t n = sizeof(dw) / 4;
+	/* room in the ring: what the CP has not read yet stays intact */
+	for (unsigned i = 0; ; i++) {
+		uint32_t r = rd32(GREG(CP_RB_RPTR)), used = (g->wptr + A6_RING_DW - r) % A6_RING_DW;
+		if (used + n + 16 < A6_RING_DW)
+			break;
+		if (i >= timeout_ms * 50)
+			return 0;
+		a6_delay_us(20);
+	}
+	uint32_t w = g->wptr, first = n < A6_RING_DW - w ? n : A6_RING_DW - w;
+	a6_write(a6_pool_pa(g, A6_OFF_RING) + 4ull * w, dw, 4ull * first);
+	if (first < n)
+		a6_write(a6_pool_pa(g, A6_OFF_RING), dw + first, 4ull * (n - first));
+	g->wptr = (w + n) % A6_RING_DW;
+	wr32(GREG(CP_RB_WPTR), g->wptr);
+	return ++g->fence;
+}
+
+bool a6_fence_done(const struct a6_gpu *g, uint32_t fence)
+{
+	return (int32_t)(a6_fence_read(g) - fence) >= 0;
+}
+
 int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned timeout_ms)
 {
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);

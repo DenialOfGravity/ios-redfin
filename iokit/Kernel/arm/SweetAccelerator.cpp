@@ -19,6 +19,8 @@
  *   2 buffer free     [handle]                          (GPU VA and handle are reused)
  *   3 surface import  [IOSurface id] -> [handle, gpu_va, size]  the surface's pages, wired
  *   4 submit          [ib_gpu_va, dwords, timeout_ms] -> [fence]  runs the IB and waits for it
+ *   6 submit async    [ib_gpu_va, dwords] -> [fence]      queued, not waited for (fence 0: GPU not usable)
+ *   7 wait fence      [fence, timeout_ms]               0, or timeout (the GPU is recovered)
  *   5 cache flush     [handle, offset, length]  clean+invalidate through the kernel mapping: before
  *                     a submit for what the CPU wrote, after it for what the CPU will read
  *                     (sys_dcache_flush does nothing on iOS: Apple GPUs are coherent)
@@ -38,6 +40,8 @@ bool sweet_gpu_ready(void);
 int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
 int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
+uint32_t sweet_gpu_submit_user_async(uint64_t ib_iova, uint32_t dwords);
+int sweet_gpu_wait_fence(uint32_t fence, uint32_t timeout_ms);
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
 }
 
@@ -330,6 +334,18 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 		IOLockUnlock(fLock);
 		return ret;
 	}
+	case 6: {
+		if (nin < 2 || args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = sweet_gpu_submit_user_async(in[0], (uint32_t)in[1]);
+		return out[0] ? kIOReturnSuccess : kIOReturnNotReady;
+	}
+	case 7:
+		if (nin < 2) {
+			return kIOReturnBadArgument;
+		}
+		return sweet_gpu_wait_fence((uint32_t)in[0], (uint32_t)in[1]) ? kIOReturnTimeout : kIOReturnSuccess;
 	default:
 		return kIOReturnUnsupported;
 	}
