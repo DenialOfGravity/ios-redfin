@@ -87,6 +87,11 @@ const char * gIOKernelConfigTables =
     "     'IOProviderClass' = IOResources;"
     "     'IOMatchCategory' = SweetAccelerator;"
     "   },"
+    "   {"
+    "     'IOClass'         = AppleMobileFileIntegrity;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
+    "   },"
 #endif
     "   {"
     "     'IOClass'         = IOPanicPlatform;"
