@@ -294,7 +294,24 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	 * draw them, and the panel is 8-bit sRGB. Made as one-plane BGRA, which the client reads back.
 	 */
 	bool one_plane = false;
-	if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u || s->pixelFormat == 0x77333052u) {
+	/*
+	 * flame: only for WebKit's content process, which draws its tiles with CoreGraphics on the CPU and
+	 * reads the format back (its 'w30r' tiles stayed white otherwise). Clients that render the 10-bit
+	 * format they asked for (CA's software renderer in chronod, Metal in widget extensions such as
+	 * NewsToday2) write it into the BGRA surface: white widgets, garbled colours. Boot-arg
+	 * sweetsurf10=0 never remaps, =2 always does.
+	 */
+	static int remap10 = -1;
+	if (remap10 < 0) {
+		uint32_t v = 1;
+		PE_parse_boot_argn("sweetsurf10", &v, sizeof(v));
+		remap10 = (int)v;
+	}
+	char who[32] = "";
+	proc_selfname(who, sizeof(who));
+	bool remap = remap10 == 2 || (remap10 == 1 && strcmp(who, "com.apple.WebKit.WebContent") == 0);
+	if (!remap) {
+	} else if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u || s->pixelFormat == 0x77333052u) {
 		s->pixelFormat = 0x42475241u;           /* BGRA */
 	} else if (s->pixelFormat == 0x62336138u) {
 		s->pixelFormat = 0x42475241u;

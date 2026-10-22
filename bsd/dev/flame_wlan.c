@@ -58,6 +58,8 @@ static uint64_t fw_tx_dropped;
 static bool fw_opened, fw_ready, fw_link_up;
 static uint8_t fw_addr[6];
 static struct fw_link fw_link;          /* the network of the last FW_LINK up */
+static struct flame_wlan_bss fw_link_bss;       /* ... as a scan heard it (kept: a new list empties fw_bss a while) */
+static bool fw_link_bss_heard;
 #define FW_BSS_MAX      64
 static struct flame_wlan_bss fw_bss[FW_BSS_MAX];
 static unsigned fw_nbss;
@@ -205,11 +207,8 @@ flame_wlan_link_bss(struct flame_wlan_bss *bss)
 	bool have = fw_link_up && fw_link.ssid_len > 0;
 	if (have) {
 		bzero(bss, sizeof(*bss));
-		unsigned i;
-		for (i = 0; i < fw_nbss && memcmp(fw_bss[i].bssid, fw_link.bssid, 6) != 0; i++) {
-		}
-		if (i < fw_nbss) {
-			memcpy(bss, &fw_bss[i], sizeof(*bss));
+		if (fw_link_bss_heard) {
+			memcpy(bss, &fw_link_bss, sizeof(*bss));
 		} else {
 			memcpy(bss->bssid, fw_link.bssid, 6);
 			memcpy(bss->ssid, fw_link.ssid, sizeof(bss->ssid));
@@ -365,6 +364,10 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			t->age_ms = b->age_ms;
 			t->elements_length = b->elements_len > sizeof(t->elements) ? sizeof(t->elements) : b->elements_len;
 			memcpy(t->elements, b->elements, t->elements_length);
+			if (fw_link_up && memcmp(t->bssid, fw_link.bssid, 6) == 0) {
+				fw_link_bss = *t;
+				fw_link_bss_heard = true;
+			}
 		}
 		lck_mtx_unlock(&fw_lock);
 		break;
@@ -385,6 +388,14 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		fw_link_up = up;
 		if (up && h.len >= sizeof(fw_link)) {
 			memcpy(&fw_link, p, sizeof(fw_link));
+			fw_link_bss_heard = false;
+			for (unsigned i = 0; i < fw_nbss; i++) {
+				if (memcmp(fw_bss[i].bssid, fw_link.bssid, 6) == 0) {
+					fw_link_bss = fw_bss[i];
+					fw_link_bss_heard = true;
+					break;
+				}
+			}
 		}
 		lck_mtx_unlock(&fw_lock);
 		if (changed && flame_wlan_link_hook != NULL) {
