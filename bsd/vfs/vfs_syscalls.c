@@ -8581,6 +8581,77 @@ out1:
  * Helper function for doing clones. The caller is expected to provide an
  * iocounted source vnode and release it.
  */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * clonefile on a filesystem that cannot clone (SWEET's root is HFS+, iOS
+ * assumes APFS): create the target and copy the data instead. installd
+ * stages every app it installs with clonefile, so without this no app
+ * install worked ("Failed to clonefile ... Operation not supported").
+ * Regular files only; file flags are applied after the data (an immutable
+ * flag would refuse the writes).
+ */
+static int
+sweet_clonefile_copy(vnode_t fvp, vnode_t tdvp, vnode_t *tvpp, struct componentname *cnp,
+    struct vnode_attr *nva, vfs_context_t ctx)
+{
+	struct vnode_attr fva;
+	uint32_t flags = 0;
+	bool has_flags = VATTR_IS_ACTIVE(nva, va_flags);
+	int error;
+
+	VATTR_INIT(&fva);
+	VATTR_WANTED(&fva, va_data_size);
+	if ((error = vnode_getattr(fvp, &fva, ctx)) != 0) {
+		return error;
+	}
+	if (has_flags) {
+		flags = nva->va_flags;
+		VATTR_CLEAR_ACTIVE(nva, va_flags);
+	}
+	if ((error = VNOP_CREATE(tdvp, tvpp, cnp, nva, ctx)) != 0) {
+		return error;
+	}
+	const int chunk = 64 * 1024;
+	char *buf = kalloc_data(chunk, Z_WAITOK);
+	kauth_cred_t cred = vfs_context_ucred(ctx);
+	proc_t p = vfs_context_proc(ctx);
+	for (off_t off = 0; buf != NULL && off < (off_t)fva.va_data_size && !error;) {
+		int n = (int)MIN((off_t)chunk, (off_t)fva.va_data_size - off), resid = 0;
+		error = vn_rdwr(UIO_READ, fvp, buf, n, off, UIO_SYSSPACE, IO_NOCACHE, cred, &resid, p);
+		if (!error && resid) {
+			error = EIO;
+		}
+		if (!error) {
+			error = vn_rdwr(UIO_WRITE, *tvpp, buf, n, off, UIO_SYSSPACE, IO_UNIT, cred, &resid, p);
+			if (!error && resid) {
+				error = EIO;
+			}
+		}
+		off += n;
+	}
+	if (buf == NULL) {
+		error = ENOMEM;
+	}
+	kfree_data(buf, chunk);
+	if (!error && has_flags && flags) {
+		struct vnode_attr fla;
+		VATTR_INIT(&fla);
+		VATTR_SET(&fla, va_flags, flags);
+		(void)vnode_setattr(*tvpp, &fla, ctx);
+	}
+	if (has_flags) {
+		VATTR_SET(nva, va_flags, flags);
+		VATTR_SET_SUPPORTED(nva, va_flags);
+	}
+	if (error) {
+		printf("SWEET: clonefile copy fallback for \"%s\" failed: %d\n", cnp->cn_nameptr, error);
+		vnode_put(*tvpp);
+		*tvpp = NULLVP;
+	}
+	return error;
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */
+
 static int
 clonefile_internal(vnode_t fvp, boolean_t data_read_authorised, int dst_dirfd,
     user_addr_t dst, uint32_t flags, vfs_context_t ctx)
@@ -8731,6 +8802,11 @@ clonefile_internal(vnode_t fvp, boolean_t data_read_authorised, int dst_dirfd,
 #endif
 
 	error = VNOP_CLONEFILE(fvp, tdvp, &tvp, cnp, &nva, vnop_flags, ctx);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	if (error == ENOTSUP && v_type == VREG) {
+		error = sweet_clonefile_copy(fvp, tdvp, &tvp, cnp, &nva, ctx);
+	}
+#endif
 
 	if (!error && tvp) {
 		int     update_flags = 0;

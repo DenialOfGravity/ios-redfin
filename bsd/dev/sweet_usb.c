@@ -883,7 +883,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
  * Command server on 192.168.7.2:5141 (UDP): each datagram is poke script
  * text (bsd/dev/sweet_poke.c: r/w/m/p/s lines), run at once in this
  * thread, results in the console (and so in the live log); "rtc" prints the
- * PM8150 RTC ("SWEET RTC: N", for tools/flame-rtc.py); "panic" panics
+ * PM8150 RTC ("SWEET RTC: N", for tools/flame-rtc.py); "tap X Y" and
+ * "swipe X1 Y1 X2 Y2 MS" touch the screen (panel pixels); "panic" panics
  * (to test the panic path); "reboot" resets
  * the phone with PSCI (the shim already set the PMIC reason to
  * bootloader, so it lands in fastboot). tools/flame-cmd.py sends them.
@@ -891,6 +892,51 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
 extern void sweet_poke_run(const char *text, unsigned len);
 struct sync_args;
 extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
+
+/*
+ * Synthetic touches through the touchscreen's own path (SweetHID), in panel
+ * pixels (0..1079, 0..2279): "tap X Y", "swipe X1 Y1 X2 Y2 MS" (finger 9,
+ * so a real finger is not disturbed). For driving the UI from the Mac.
+ */
+extern void sweet_hid_touch(int finger, int down, int x, int y);
+
+static int
+ud_num(const char **p)
+{
+	int v = 0;
+	while (**p == ' ') {
+		(*p)++;
+	}
+	while (**p >= '0' && **p <= '9') {
+		v = v * 10 + (*(*p)++ - '0');
+	}
+	return v;
+}
+
+static void
+ud_touch_cmd(const char *cmd)
+{
+	const char *p = cmd + (cmd[0] == 't' ? 4 : 6);
+	int x1 = ud_num(&p), y1 = ud_num(&p);
+	if (cmd[0] == 't') {
+		sweet_hid_touch(9, 1, x1, y1);
+		ud_sleep_ms(80);
+		sweet_hid_touch(9, 0, x1, y1);
+		printf("SWEET CMD: tap %d %d\n", x1, y1);
+		return;
+	}
+	int x2 = ud_num(&p), y2 = ud_num(&p), ms = ud_num(&p);
+	int steps = ms > 0 ? ms / 10 : 20;
+	if (steps < 2) {
+		steps = 2;
+	}
+	for (int i = 0; i <= steps; i++) {
+		sweet_hid_touch(9, 1, x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps);
+		ud_sleep_ms(10);
+	}
+	sweet_hid_touch(9, 0, x2, y2);
+	printf("SWEET CMD: swipe %d,%d -> %d,%d in %d steps\n", x1, y1, x2, y2, steps);
+}
 
 static void
 ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
@@ -935,6 +981,10 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
 			if (cmd[0] == 's') {
 				continue;
 			}
+		}
+		if (strncmp(cmd, "tap ", 4) == 0 || strncmp(cmd, "swipe ", 6) == 0) {
+			ud_touch_cmd(cmd);
+			continue;
 		}
 		if (strncmp(cmd, "rtc", 3) == 0) {
 			extern int sweet_rtc_seconds(uint32_t *secs);   /* SweetPlatformExpert.cpp */
