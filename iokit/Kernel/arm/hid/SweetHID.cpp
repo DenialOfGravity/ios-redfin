@@ -356,6 +356,8 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
  * app-switcher gesture.
  */
 #define SWEET_TOUCH_EDGE_PX 48
+extern "C" int sweet_display_fit_x, sweet_display_fit_w;     /* bsd/dev/sweet_gpu.c */
+
 /* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
 #define SWEET_PANEL_W 1080
 #define SWEET_PANEL_H 2280
@@ -466,9 +468,20 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+	/*
+	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp):
+	 * the centre crop of the CPU copy, or the GPU's fit (sweet_display_fit_*).
+	 */
+	IOFixed nx, ny;
+	int fitX = sweet_display_fit_x, fitW = sweet_display_fit_w;
+	if (fitW > 0) {
+		int64_t fx = (((int64_t)(x - fitX) << 16) + fitW / 2) / fitW;
+		nx = (IOFixed)(fx < 0 ? 0 : (fx > 0xffff ? 0xffff : fx));
+		ny = (IOFixed)(((int64_t)y << 16) / SWEET_PANEL_H);
+	} else {
+		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+	}
 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
 	if (was == down && !moved) {
 		IOLockUnlock(fLock);

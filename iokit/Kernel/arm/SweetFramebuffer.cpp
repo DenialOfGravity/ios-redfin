@@ -38,6 +38,18 @@
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
 
+/* bsd/dev/sweet_gpu.c: the Adreno 640's 2D engine scales each frame onto the panel (boot-arg sweetgpu=1). */
+extern "C" {
+bool sweet_gpu_ready(void);
+int sweet_gpu_surface_slot(uint64_t key);
+int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
+int sweet_gpu_present(int slot, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
+    uint32_t *out_dx, uint32_t *out_dw);
+void sweet_gpu_panel_stride(uint32_t stride);
+extern int sweet_display_fit_x, sweet_display_fit_w;
+}
+#define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
+
 #if defined(SWEET)
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
@@ -118,6 +130,7 @@ public:
 	bool          fDirty;
 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
 	bool          fPowerOff;      /* RequestPowerChange(0) */
+	bool          fGPU;           /* panel switched to the GPU's stride; frames scaled to fit */
 	uint32_t      fFadeStep;      /* fade-out steps done while off */
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -125,6 +138,7 @@ public:
 	void removeClient(IOMobileFramebufferUserClient *client);
 	void swap(const uint8_t *rec);
 	void present(const uint8_t *rec);
+	bool presentGPU(const uint8_t *rec);
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -181,7 +195,11 @@ AppleCLCD::start(IOService *provider)
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
-	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
+	int gpu = 0;
+	PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
+	uint32_t mapRowBytes = gpu && fRowBytes < SWEET_FB_GPU_ROWBYTES ? SWEET_FB_GPU_ROWBYTES : fRowBytes;
+	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, mapRowBytes, SWEET_FB_FORMAT_BGRA);
 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
 	fWorkLoop = IOWorkLoop::workLoop();
 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
@@ -340,6 +358,99 @@ AppleCLCD::swap(const uint8_t *rec)
 	}
 }
 
+static uint32_t sweet_fb_gpu_why_logged;
+
+/* Why presentGPU fell back to the CPU copy, logged once per reason. */
+static bool
+gpu_fallback(uint32_t why, const char *what)
+{
+	if (!(sweet_fb_gpu_why_logged & (1u << why))) {
+		sweet_fb_gpu_why_logged |= 1u << why;
+		IOLog("SWEET FB: GPU present not used: %s\n", what);
+	}
+	return false;
+}
+
+/*
+ * One full-frame BGRA layer (what backboardd swaps): the GPU scales the whole
+ * iOS frame (1125x2436) to fit the panel (1053x2280 at x 13), instead of the
+ * CPU copying its centre (cropping the status bar and home indicator). The
+ * first time, the panel switches to the GPU's row stride and is cleared, so
+ * the bars stay black. False: use the CPU copy.
+ */
+bool
+AppleCLCD::presentGPU(const uint8_t *rec)
+{
+	uint32_t mask = get32(rec, 0x104), layer = 0;
+	if (mask == 0 || (mask & (mask - 1))) {
+		return gpu_fallback(0, "not exactly one layer");
+	}
+	while (!(mask & (1u << layer))) {
+		layer++;
+	}
+	if (layer >= SWEET_FB_LAYERS) {
+		return gpu_fallback(1, "layer out of range");
+	}
+	uint32_t id = get32(rec, 0x54 + 4 * layer);
+	SweetSurface *s = id ? sweet_surface_copy(id) : NULL;
+	if (s == NULL || s == fSurface || s->memory == NULL) {
+		OSSafeReleaseNULL(s);
+		return gpu_fallback(2, "no surface (or the panel's own)");
+	}
+	if (s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->elementWidth != 1 || s->elementHeight != 1 ||
+	    (s->bytesPerRow & 63) || s->width == 0 || s->height == 0 ||
+	    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+		s->release();
+		return gpu_fallback(3, "surface format/size/pitch");
+	}
+	uint64_t key = ((uint64_t)id << 48) ^ (uint64_t)(uintptr_t)s->memory;
+	int slot = sweet_gpu_surface_slot(key);
+	if (slot < 0) {
+		/* Wire the pages for the GPU (left wired: surfaces live as long as backboardd). */
+		if (s->memory->prepare() != kIOReturnSuccess) {
+			s->release();
+			return gpu_fallback(4, "prepare() failed");
+		}
+		static uint64_t pages[1024];
+		uint64_t len = s->memory->getLength();
+		uint32_t n = 0;
+		bool ok = len <= sizeof(pages) / sizeof(pages[0]) * PAGE_SIZE;
+		for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
+			IOByteCount seg = 0;
+			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+			ok = pa != 0 && (pa & PAGE_MASK) == 0;
+			pages[n++] = pa;
+		}
+		if (!ok) {
+			s->release();
+			return gpu_fallback(5, "surface pages not page-aligned physical memory");
+		}
+		slot = sweet_gpu_map_surface(key, pages, n, PAGE_SIZE);
+	}
+	if (slot < 0) {
+		s->release();
+		return gpu_fallback(6, "GPU mapping failed");
+	}
+	if (!fGPU) {
+		IOLockLock(fLock);
+		sweet_gpu_panel_stride(SWEET_FB_GPU_ROWBYTES);
+		fRowBytes = SWEET_FB_GPU_ROWBYTES;
+		bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
+		fGPU = true;
+		IOLockUnlock(fLock);
+		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
+	}
+	uint32_t dx = 0, dw = 0;
+	int rc = sweet_gpu_present(slot, s->offset, s->width, s->height, s->bytesPerRow, fRowBytes, &dx, &dw);
+	s->release();
+	if (rc) {
+		return gpu_fallback(7, "GPU blit failed");
+	}
+	sweet_display_fit_x = (int)dx;
+	sweet_display_fit_w = (int)dw;
+	return true;
+}
+
 void
 AppleCLCD::present(const uint8_t *rec)
 {
@@ -354,6 +465,13 @@ AppleCLCD::present(const uint8_t *rec)
 			 * writes the read-only-late cons_ops_index and panics. */
 			sweet_console_muted = 1;
 		}
+	}
+
+	if (sweet_gpu_ready() && presentGPU(rec)) {
+		return;
+	}
+	if (sweet_display_fit_w) {
+		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
 	}
 
 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {

@@ -61,7 +61,10 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
 MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
 MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
 MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+# The CPU, not just the architecture: with -arch arm64 Apple clang's default CPU is an Apple core,
+# and -march=armv8.2-a+crypto kept its features, so clang vectorized XORs into EOR3 (FEAT_SHA3),
+# an undefined instruction on the A76/A55 (panic in a6_blit_ib). Cortex-A55 = the ISA both clusters share.
+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a55+crypto
 
 
 #

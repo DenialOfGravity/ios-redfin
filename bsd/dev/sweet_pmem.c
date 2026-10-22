@@ -44,6 +44,7 @@ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern void _disable_preemption(void);
 extern void _enable_preemption(void);
 void sweet_pmem_init(void);
+void sweet_smc(uint64_t x[8]);
 
 struct pmem_alloc {
 	uint64_t size;          /* in: bytes (rounded up to pages) */
@@ -229,6 +230,16 @@ pm_smc(struct pmem_smc *s)
 	if (resumes) {
 		printf("SWEET PMEM: smc %llx resumed %u times -> %llx\n", fn, resumes, x[0]);
 	}
+}
+
+/* For bsd/dev/sweet_gpu.c (zap shader): x0..x7 in, x0..x3 out. */
+void
+sweet_smc(uint64_t x[8])
+{
+	struct pmem_smc s;
+	memcpy(s.x, x, sizeof(s.x));
+	pm_smc(&s);
+	memcpy(x, s.x, 4 * sizeof(uint64_t));
 }
 
 static int
