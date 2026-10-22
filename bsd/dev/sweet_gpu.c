@@ -46,13 +46,13 @@ bool sweet_gpu_ready(void);
 int sweet_gpu_surface_slot(uint64_t key);
 int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
-    uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dw);
+	uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh);
 void sweet_gpu_panel_stride(uint32_t stride);
 int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
 
-/* Panel mapping for touch (SweetHID.cpp): 0 = the crop of iOS's frame, else x offset + width of the fit. */
-int sweet_display_fit_x, sweet_display_fit_w;
+/* Panel mapping for touch (SweetHID.cpp): zero extents = CPU crop, otherwise the GPU's fitted rectangle. */
+int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 
 static struct a6_gpu gpu;
 static vm_offset_t pool_kva;
@@ -370,7 +370,7 @@ static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
  */
 int
 sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fb_pitch,
-    uint32_t *out_dx, uint32_t *out_dw)
+	uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh)
 {
 	if (!gpu_ready || s < 0 || s >= SLOTS || !slot[s].npages || (pitch & 63) || (fb_pitch & 63)) {
 		return -1;
@@ -423,7 +423,9 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		stat_clean_abs = stat_gpu_abs = 0;
 	}
 	*out_dx = b.dx;
+	*out_dy = b.dy;
 	*out_dw = b.dw;
+	*out_dh = b.dh;
 	return rc;
 }
 

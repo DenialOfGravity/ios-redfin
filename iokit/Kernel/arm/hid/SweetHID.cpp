@@ -28,6 +28,7 @@
 #include "IOHIDKeys.h"
 #include "IOHIDPrivateKeys.h"
 #include "IOHIDUsageTables.h"
+#include "../SweetDisplayMask.h"
 
 extern "C" uint64_t mach_absolute_time(void);
 
@@ -356,7 +357,7 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
  * app-switcher gesture.
  */
 #define SWEET_TOUCH_EDGE_PX 48
-extern "C" int sweet_display_fit_x, sweet_display_fit_w;     /* bsd/dev/sweet_gpu.c */
+extern "C" int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 
 /* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
 #define SWEET_PANEL_W 1080
@@ -373,6 +374,7 @@ protected:
 private:
 	IOLock *fLock;
 	int fLogicalW, fLogicalH, fOffX, fOffY;
+	uint32_t fCornerRadius;
 	bool fDown[SWEET_TOUCH_FINGERS];
 	bool fEdge[SWEET_TOUCH_FINGERS];
 	IOFixed fX[SWEET_TOUCH_FINGERS];
@@ -443,6 +445,14 @@ SweetHIDTouch::start(IOService *provider)
 	fLogicalH = native ? SWEET_PANEL_H : 2436;
 	fOffX = (fLogicalW - SWEET_PANEL_W) / 2;
 	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
+	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
+	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
+	if (fCornerRadius > SWEET_PANEL_W / 2) {
+		fCornerRadius = SWEET_PANEL_W / 2;
+	}
+	if (fCornerRadius > SWEET_PANEL_H) {
+		fCornerRadius = SWEET_PANEL_H;
+	}
 	/* The digitizer covers the main display (backboardd maps it 1:1). */
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
@@ -468,16 +478,47 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
+	int fitX = sweet_display_fit_x, fitY = sweet_display_fit_y;
+	int fitW = sweet_display_fit_w, fitH = sweet_display_fit_h;
+	if (fitW <= 0 || fitH <= 0) {
+		fitX = fitY = 0;
+		fitW = SWEET_PANEL_W;
+		fitH = SWEET_PANEL_H;
+	}
+	uint32_t cornerRadius = fCornerRadius;
+	if (cornerRadius > (uint32_t)(fitW / 2)) {
+		cornerRadius = (uint32_t)(fitW / 2);
+	}
+	if (cornerRadius > (uint32_t)fitH) {
+		cornerRadius = (uint32_t)fitH;
+	}
+	if (!was && down && (x < fitX || x >= fitX + fitW || y < fitY || y >= fitY + fitH)) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	if (!was && down && cornerRadius && y >= fitY && y < fitY + (int)cornerRadius) {
+		int localX = -1;
+		if (x >= fitX && x < fitX + (int)cornerRadius) {
+			localX = x - fitX;
+		} else if (x < fitX + fitW && x >= fitX + fitW - (int)cornerRadius) {
+			localX = fitX + fitW - 1 - x;
+		}
+		if (localX >= 0 &&
+		    !sweet_display_corner_point_visible((uint32_t)localX, (uint32_t)(y - fitY), cornerRadius)) {
+			IOLockUnlock(fLock);
+			return;
+		}
+	}
 	/*
 	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp):
 	 * the centre crop of the CPU copy, or the GPU's fit (sweet_display_fit_*).
 	 */
 	IOFixed nx, ny;
-	int fitX = sweet_display_fit_x, fitW = sweet_display_fit_w;
-	if (fitW > 0) {
-		int64_t fx = (((int64_t)(x - fitX) << 16) + fitW / 2) / fitW;
+	if (sweet_display_fit_w > 0 && sweet_display_fit_h > 0) {
+		int64_t fx = ((int64_t)(x - fitX) * 65536 + fitW / 2) / fitW;
 		nx = (IOFixed)(fx < 0 ? 0 : (fx > 0xffff ? 0xffff : fx));
-		ny = (IOFixed)(((int64_t)y << 16) / SWEET_PANEL_H);
+		int64_t fy = ((int64_t)(y - fitY) * 65536 + fitH / 2) / fitH;
+		ny = (IOFixed)(fy < 0 ? 0 : (fy > 0xffff ? 0xffff : fy));
 	} else {
 		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
 		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);

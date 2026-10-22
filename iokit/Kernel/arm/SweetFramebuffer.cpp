@@ -35,6 +35,7 @@
  * the first swap on (it still reaches the persistent log; panics draw).
  */
 #include "SweetSurface.h"
+#include "SweetDisplayMask.h"
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
 
@@ -44,9 +45,9 @@ bool sweet_gpu_ready(void);
 int sweet_gpu_surface_slot(uint64_t key);
 int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
-    uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dw);
+	uint32_t fb_pitch, uint32_t *out_dx, uint32_t *out_dy, uint32_t *out_dw, uint32_t *out_dh);
 void sweet_gpu_panel_stride(uint32_t stride);
-extern int sweet_display_fit_x, sweet_display_fit_w;
+extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 }
 #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
 
@@ -119,6 +120,7 @@ public:
 	uint32_t      fWidth, fHeight, fRowBytes;
 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+	uint32_t      fCornerRadius;             /* output pixels; boot-arg sweetfb_corner_radius */
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -139,6 +141,7 @@ public:
 	void swap(const uint8_t *rec);
 	void present(const uint8_t *rec);
 	bool presentGPU(const uint8_t *rec);
+	void maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -193,6 +196,8 @@ AppleCLCD::start(IOService *provider)
 	}
 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
+	PE_parse_boot_argn("sweetfb_corner_radius", &fCornerRadius, sizeof(fCornerRadius));
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
 	/* With the GPU (sweetgpu=1) the panel later switches to 4352-byte rows: map that much. */
@@ -372,6 +377,59 @@ gpu_fallback(uint32_t why, const char *what)
 }
 
 /*
+ * Clip just the top corners of the rendered iOS image. The superellipse
+ * coverage approximates Core Animation's continuous corner curve; the
+ * output outside the content shape stays black.
+ */
+void
+AppleCLCD::maskTopCorners(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	if (fCornerRadius == 0 || x >= fWidth || y >= fHeight || w < 2 || h == 0) {
+		return;
+	}
+	if (w > fWidth - x) {
+		w = fWidth - x;
+	}
+	if (h > fHeight - y) {
+		h = fHeight - y;
+	}
+	uint32_t radius = fCornerRadius;
+	if (radius > w / 2) {
+		radius = w / 2;
+	}
+	if (radius > h) {
+		radius = h;
+	}
+	if (radius == 0) {
+		return;
+	}
+
+	for (uint32_t cy = 0; cy < radius; cy++) {
+		volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)(y + cy) * fRowBytes);
+		for (uint32_t cx = 0; cx < radius; cx++) {
+			uint32_t coverage = sweet_display_corner_coverage(cx, cy, radius);
+			if (coverage == 16) {
+				continue;
+			}
+			uint32_t left = x + cx;
+			uint32_t right = x + w - 1 - cx;
+			volatile uint32_t *pixels[2] = { &row[left], &row[right] };
+			for (unsigned side = 0; side < (left == right ? 1u : 2u); side++) {
+				uint32_t pixel = *pixels[side];
+				if (coverage == 0) {
+					*pixels[side] = 0;
+				} else {
+					uint32_t b = ((pixel & 0x000000ff) * coverage + 8) / 16;
+					uint32_t g = ((pixel & 0x0000ff00) * coverage + 0x800) / 16 & 0x0000ff00;
+					uint32_t r = ((pixel & 0x00ff0000) * coverage + 0x80000) / 16 & 0x00ff0000;
+					*pixels[side] = (pixel & 0xff000000) | r | g | b;
+				}
+			}
+		}
+	}
+}
+
+/*
  * One full-frame BGRA layer (what backboardd swaps): the GPU scales the whole
  * iOS frame (1125x2436) to fit the panel (1053x2280 at x 13), instead of the
  * CPU copying its centre (cropping the status bar and home indicator). The
@@ -440,15 +498,18 @@ AppleCLCD::presentGPU(const uint8_t *rec)
 		IOLockUnlock(fLock);
 		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
 	}
-	uint32_t dx = 0, dw = 0;
+	uint32_t dx = 0, dy = 0, dw = 0, dh = 0;
 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
-	    fRowBytes, &dx, &dw);
+	    fRowBytes, &dx, &dy, &dw, &dh);
 	s->release();
 	if (rc) {
 		return gpu_fallback(7, "GPU blit failed");
 	}
 	sweet_display_fit_x = (int)dx;
+	sweet_display_fit_y = (int)dy;
 	sweet_display_fit_w = (int)dw;
+	sweet_display_fit_h = (int)dh;
+	maskTopCorners(dx, dy, dw, dh);
 	return true;
 }
 
@@ -473,6 +534,7 @@ AppleCLCD::present(const uint8_t *rec)
 	}
 	if (sweet_display_fit_w) {
 		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
+		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;
 	}
 
 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
@@ -550,6 +612,7 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 		s->release();
 	}
+	maskTopCorners(0, 0, fWidth, fHeight);
 }
 
 bool
