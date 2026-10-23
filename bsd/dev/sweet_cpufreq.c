@@ -26,9 +26,12 @@ void sweet_cpufreq_init(void);
 static const struct {
 	const char *name;
 	uint32_t pa;
+	unsigned ncores;
 } osm_clusters[] = {
-	{"pwrcl (A55 x6)", 0x18323000u},
-	{"perfcl (A76 x2)", 0x18325800u},
+	{"pwrcl (A55 x6)", 0x18323000u, 6},
+	{"perfcl (A76 x2)", 0x18325800u, 2},
+	/* redfin (lito) cpufreq-hw third domain: the 2.4 GHz prime core (live DT qcom,cpufreq-hw reg 2) */
+	{"prime (A76 x1)", 0x18327800u, 1},
 };
 
 static uint32_t
@@ -65,10 +68,12 @@ sweet_cpufreq_init(void)
 			n = i + 1;
 			if (len < sizeof(line) - 16) {
 				len += snprintf(line + len, sizeof(line) - len, " %u%s", khz / 1000,
-				    cores == 1 ? "*" : "");
+				    cores < osm_clusters[c].ncores ? "*" : "");
 			}
-			/* core count 1 = single-core boost entry: skip, as Linux does */
-			if (cores == 1 || (want > 1 && khz / 1000 > want)) {
+			/* fewer cores than the cluster has = boost entry: skip, as Linux's
+			 * cpufreq-hw does (on the 1-core prime cluster every entry is normal) */
+			bool boost = cores < osm_clusters[c].ncores;
+			if (boost || (want > 1 && khz / 1000 > want)) {
 				continue;
 			}
 			if (khz > best_khz) {

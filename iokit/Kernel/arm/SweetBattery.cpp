@@ -163,7 +163,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
 	int mode = measured ? 1 : 0;
 	if (mode != fLastMode) {
 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+		    measured ? "PM7250B / estimated SOC" : "static fallback",
 		    percent, mv, external, charging);
 		fLastMode = mode;
 	}

@@ -45,21 +45,24 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 
 #define GCC_PA                  0x00100000
 #define GCC_SIZE                0x00090000
-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on (same on lito) */
+/* DWC3 stream ID in the apps SMMU: redfin DT iommus = <&apps_smmu 0xe0 0x0> (flame/sunfish 0x140) */
+#define USB_SID                 0xe0u
 #define CBCR_CLK_OFF            (1u << 31)
 
 static const struct {
 	const char *name;
 	uint32_t    off;
 } usb_cbcr[] = {
-	/* flame (SM8150, gcc-sm8150.c); index 0 master and 3 cfg-noc-axi gate DWC3 reads */
+	/* redfin (SM7250, gcc-lito.c halt_reg); index 0 master and 3 cfg-noc-axi gate DWC3 reads.
+	 * (flame/SM8150: sleep 0xf014, utmi 0xf018, cfg-noc 0xf078, aggre 0xf07c, aux 0xf050, clkref 0x8c008) */
 	{ "master", 0x0f010 },
-	{ "sleep", 0x0f014 },
-	{ "utmi", 0x0f018 },
-	{ "cfg-noc-axi", 0x0f078 },
-	{ "aggre-axi", 0x0f07c },
-	{ "phy-aux", 0x0f050 },
-	{ "clkref", 0x8c008 },
+	{ "sleep", 0x0f018 },
+	{ "utmi", 0x0f01c },
+	{ "cfg-noc-axi", 0x0f07c },
+	{ "aggre-axi", 0x0f080 },
+	{ "phy-aux", 0x0f054 },
+	{ "clkref", 0x8c010 },
 };
 
 #define DWC3_PA                 0x0a600000
@@ -1136,8 +1139,8 @@ ud_smmu_setup(uint64_t dma_pa)
 		if (((c >> 16) & 3) == 0) {
 			used[(c & 0xff) / 64] |= 1ULL << ((c & 0xff) % 64);
 		}
-		if (((0x140 ^ (m & 0x7fff)) & ~((m >> 16) & 0x7fff) & 0x7fff) == 0) {
-			printf("SWEET USB: SMMU smr%u %x already matches 0x140 (s2cr %x)\n", i, m, c);
+		if (((USB_SID ^ (m & 0x7fff)) & ~((m >> 16) & 0x7fff) & 0x7fff) == 0) {
+			printf("SWEET USB: SMMU smr%u %x already matches %#x (s2cr %x)\n", i, m, USB_SID, c);
 			return -1;
 		}
 	}
@@ -1166,7 +1169,7 @@ ud_smmu_setup(uint64_t dma_pa)
 		*(volatile uint32_t *)(as + pagesz + 4 * cb) = 0x1f000;        /* CBAR as ABL's banks */
 		__asm__ volatile ("dsb sy" ::: "memory");
 		*(volatile uint32_t *)(as + 0xc00 + 4 * free_smr) = (uint32_t)cb;
-		*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | 0x140;
+		*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | USB_SID;
 		__asm__ volatile ("dsb sy" ::: "memory");
 		ud_smmu_cb = cbv;
 		printf("SWEET USB: SMMU smr%d %x s2cr %x -> cb%d cbar %x cba2r %x sctlr %x (translation off, as ABL)\n",
@@ -1225,7 +1228,7 @@ ud_smmu_setup(uint64_t dma_pa)
 		delay(1);
 	}
 	*(volatile uint32_t *)(as + 0xc00 + 4 * free_smr) = (uint32_t)cb;      /* translate via cb */
-	*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | 0x140;
+	*(volatile uint32_t *)(as + 0x800 + 4 * free_smr) = (1u << 31) | USB_SID;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	/* Self-test: read back our descriptors and ask the SMMU to translate (ATS1PR). */
 	printf("SWEET USB: SMMU pt L1[%llu] %llx L2[%llu] %llx tcr %x tcr2 %x mair0 %x ttbr0 %x:%x\n",
