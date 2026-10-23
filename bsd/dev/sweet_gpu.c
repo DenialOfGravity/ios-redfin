@@ -941,7 +941,7 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
 #define GPOOL_FREE_MAX  4096
 static const struct { uint64_t pa, size; } gpool_ranges[] = {
 	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
-	{ 0xe1000000ULL, 0x1f000000ULL },       /* 496 MB */
+	{ 0xe1400000ULL, 0x1ec00000ULL },       /* 492 MB; 0xe1000000-0xe1400000 is wland's rmtfs buffer (hyp-assigned to the modem) */
 };
 static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
 static uint32_t gpool_nfree;
