@@ -359,9 +359,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
 #define SWEET_TOUCH_EDGE_PX 48
 extern "C" int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 
-/* Touch reports panel pixels; flame's panel is 1080x2280 (SWEET.h). */
+/* Touch reports panel pixels; sunfish's panel is 1080x2340 (SWEET.h). */
 #define SWEET_PANEL_W 1080
-#define SWEET_PANEL_H 2280
+#define SWEET_PANEL_H 2340
 class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
 public:

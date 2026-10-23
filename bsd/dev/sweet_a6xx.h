@@ -48,7 +48,7 @@
 #define A6_RING_SIZE		0x8000u
 #define A6_RING_DW		(A6_RING_SIZE / 4)
 
-#define A6_FB_PA		0x9c400000ull
+#define A6_FB_PA		0x9c000000ull
 #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
 
 #define A6_GPU_ID		640

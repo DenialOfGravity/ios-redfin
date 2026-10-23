@@ -56,10 +56,10 @@
  * 4320-byte rows. The bootstrap console uses it before the ADT is parsed.
  * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
  */
-#define SWEET_EARLY_FB_PA         0x9c400000
+#define SWEET_EARLY_FB_PA         0x9c000000
 #define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
 #define SWEET_EARLY_FB_WIDTH      1080
-#define SWEET_EARLY_FB_HEIGHT     2280
+#define SWEET_EARLY_FB_HEIGHT     2340
 #define SWEET_EARLY_FB_STRIDE     4320
 
 #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt

@@ -546,7 +546,7 @@ present_wait_locked(uint32_t k, const char *why)
 	return 0;
 }
 #define PANEL_W         1080
-#define PANEL_H         2280
+#define PANEL_H         2340
 #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
 #define DISPLAY_MASK_SIDE       256u
 #define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
