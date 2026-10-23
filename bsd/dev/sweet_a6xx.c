@@ -90,9 +90,10 @@ static void zero_pa(uint64_t pa, uint64_t size)
 #define TCR2_VAL	((7u << 15) | 2u)
 
 #define GMU_SID		5
-#define GMU_SID_MASK	0x400
+/* A618 (0141): DT #iommu-cells = 1 → exact SIDs, mask 0 (the hypervisor drops SMRs with flame's masks) */
+#define GMU_SID_MASK	0
 #define GPU_SID		0
-#define GPU_SID_MASK	0x401
+#define GPU_SID_MASK	0
 
 #define GMEM_L1(g)	a6_pool_pa(g, 0x0000)
 #define GMEM_L2_0(g)	a6_pool_pa(g, 0x1000)
