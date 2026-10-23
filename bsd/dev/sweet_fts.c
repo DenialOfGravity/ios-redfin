@@ -572,7 +572,9 @@ out:
 void
 sweet_fts_init(void)
 {
-	int enabled = 1;
+	/* redfin: off unless asked. Its TLMM SOUTH address (0x03d00000) is the GPU
+	 * on lito, so a forgotten flametouch=0 must not mean writes there. */
+	int enabled = 0;
 	thread_t thread;
 	if (ft.started) {
 		return;

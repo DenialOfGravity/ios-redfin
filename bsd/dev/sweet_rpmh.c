@@ -18,6 +18,8 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 #define RH_TCS_PA       0x18220d00u
 #define RH_TCS_SIZE     0x3000u
 #define RH_DICT_PA      0x0c3f000cu
+#define RH_DB_LITO_PA   0x80860000u
+#define RH_DB_LITO_SIZE 0x20000u
 #define RH_DRV          2u
 #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
 #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
@@ -138,8 +140,15 @@ rh_map(void)
 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
 		    (uint64_t)pa + size > 0x100000000ULL) {
-			printf("SWEET RPMH: invalid cmd-db locator\n");
-			return EINVAL;
+			/*
+			 * redfin (lito): cmd-db is a fixed reserved-memory region
+			 * (lito.dtsi qcom,cmd-db reg <0x80860000 0x20000>), not an AOP
+			 * locator. Use it only if the locator is unusable; the magic and
+			 * version check below still has to pass.
+			 */
+			printf("SWEET RPMH: invalid cmd-db locator; trying lito cmd-db %#x\n", RH_DB_LITO_PA);
+			pa = RH_DB_LITO_PA;
+			size = RH_DB_LITO_SIZE;
 		}
 		rh_db = ml_io_map(pa, size);
 		if (!rh_db) {
@@ -369,10 +378,11 @@ int
 sweet_rpmh_vreg_enable(const char *res, unsigned mv)
 {
 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
-	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges. */
+	/* Redmi touch L11C; flame touch L14A (DVDD) and L17A (AVDD), DT ranges;
+	 * redfin touch AVDD L17A fixed at 3304 mV (lito-redfin-touch.dtsi). */
 	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
 	    (!strcmp(res, "ldoa14") && mv >= 1800 && mv <= 1840) ||
-	    (!strcmp(res, "ldoa17") && mv >= 2856 && mv <= 3008));
+	    (!strcmp(res, "ldoa17") && ((mv >= 2856 && mv <= 3008) || mv == 3304)));
 	if (!ok) {
 		printf("SWEET RPMH: %s %u mV is not an allowed touch rail\n", res ? res : "?", mv);
 		return EINVAL;
