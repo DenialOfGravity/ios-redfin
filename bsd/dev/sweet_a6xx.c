@@ -110,7 +110,11 @@ static void zero_pa(uint64_t pa, uint64_t size)
 #define CACHE_SIZE	0x3c000u
 #define VA_DUMMY	0x60000000u
 #define VA_LOG		A6_GMU_LOG_VA
+#if A6_GPU_ID == 618
+#define VA_HFI		0x60001000u	/* kgsl: first NONCACHED_KERNEL alloc after the dummy page */
+#else
 #define VA_HFI		0x60005000u
+#endif
 
 #define RSCC		(A6_GPU_BASE + 0x6a000ull + 0x23000)	/* GMU + 0x23000; sunfish 0x0508d000 (was hardcoded flame 0x02c6a000) */
 #define RSCC_REG(o)	(RSCC + 4ull * (o))

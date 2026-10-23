@@ -164,7 +164,11 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
 #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
 #define A6_FSR_FAULT		0xc00001feu
 #define A6_GMEM_LOG_OFF		0x91000ull
+#if A6_GPU_ID == 618
+#define A6_GMU_LOG_VA		0x60010000u	/* sunfish: kgsl order puts HFI at 0x60001000 */
+#else
 #define A6_GMU_LOG_VA		0x60001000u
+#endif
 #define A6_GMU_LOG_SIZE		0x4000u
 
 #endif
