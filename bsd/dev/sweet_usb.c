@@ -1340,7 +1340,9 @@ static const struct { uint16_t off; uint8_t val; } qusb2_v2_tbl[] = {
 static int
 ud_qusb2_init(void)
 {
-	int doinit = 1;
+	/* redfin: the primary HS PHY is the femto hsphy@88e3000 (ud_hsphy_init); there is no QUSB2 v2 and
+	 * 0x088e2000 is its eud register. Upstream sunfish 0151 stays off unless sweetqusb=1. */
+	int doinit = 0;
 	PE_parse_boot_argn("sweetqusb", &doinit, sizeof(doinit));
 	if (!doinit) {
 		return 0;
