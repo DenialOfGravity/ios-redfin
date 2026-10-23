@@ -56,8 +56,10 @@
  * 4320-byte rows. The bootstrap console uses it before the ADT is parsed.
  * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
  */
-#define SWEET_EARLY_FB_PA         0x9c000000
-#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
+/* redfin (Pixel 5, lito): cont_splash_region 0xa0000000 + 0x2300000, S6E3HC2 cmd-mode
+ * panel 1080x2340 (32MB-aligned, so the block PA is the buffer itself). */
+#define SWEET_EARLY_FB_PA         0xa0000000
+#define SWEET_EARLY_FB_BLOCK_PA   0xa0000000
 #define SWEET_EARLY_FB_WIDTH      1080
 #define SWEET_EARLY_FB_HEIGHT     2340
 #define SWEET_EARLY_FB_STRIDE     4320

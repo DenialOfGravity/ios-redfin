@@ -1255,7 +1255,9 @@ ud_smmu_setup(uint64_t dma_pa)
  * as Linux qcom_snps_hsphy_init (phy-qcom-snps-femto-v2.c) minus the
  * regulators and the GCC block reset.
  */
-#define HSPHY_PA        0x088e2000
+/* redfin (lito): the primary port's femto PHY is hsphy@88e3000; 0x088e2000 is the
+ * EUD enable register there, never written. */
+#define HSPHY_PA        0x088e3000
 #define HP_UTMI_CTRL0   0x3c
 #define HP_UTMI_CTRL5   0x50
 #define HP_COMMON0      0x54
@@ -1311,7 +1313,9 @@ ud_hsphy_init(void)
 	hp_rmw(p, HP_UTMI_CTRL5, 1u << 1, 0);           /* POR release */
 	hp_rmw(p, HP_CTRL2, 1u << 3, 0);
 	hp_rmw(p, HP_CFG0, 1u << 1, 0);
-	hp_rmw(p, 0x70, 0xff, 0x43);                    /* DT qcom,param-override-seq: 0x43 @ X1 */
+	/* redfin DT qcom,param-override-seq <0xC7 0x6C 0xCC 0x70> (lito-redfin-usb.dtsi) */
+	hp_rmw(p, 0x6c, 0xff, 0xc7);
+	hp_rmw(p, 0x70, 0xff, 0xcc);
 	delay(1000);
 	ud_hsphy_dump(p, "after init");
 }

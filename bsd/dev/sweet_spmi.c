@@ -5,6 +5,7 @@
  * Init is serialized by the single built-in SweetBattery personality.
  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
  * Also the PM8150 RTC (peripheral 0x60) for the time of day (SweetPlatformExpert.cpp).
+ * redfin: the battery blocks are on PM7250B (SID 2), the RTC stays on SID 0.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -89,9 +90,11 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
 {
 	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
 	unsigned peripheral = addr >> 8;
-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
+	/* redfin: battery blocks on PM7250B (SID 2), RTC on PM8150 (SID 0). */
+	bool batt = sid == 2 && (peripheral == 0x10 || peripheral == 0x11 ||
+	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+	bool rtc = sid == 0 && peripheral == 0x60;
+	if (!sp_ready || !out || addr > 0xffffu || !(batt || rtc)) {
 		return -1;
 	}
 	IOLockLock(sp_lock);

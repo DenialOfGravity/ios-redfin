@@ -12,6 +12,10 @@
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include <libkern/c++/OSCollectionIterator.h>
 #include <pexpert/pexpert.h>
+/* redfin: QG fuel gauge (0x4800) and charger (0x1000) are on PM7250B, SID 2
+ * (pm7250b.dtsi qcom,qgauge@4800); sunfish had them on PM6150 SID 0. */
+#define BATT_SID 2
+
 /* bsd/dev/sweet_spmi.c */
 extern "C" int sweet_spmi_init(void);
 extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
@@ -174,8 +178,8 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
 	uint16_t previous = 0;
 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
 		uint8_t lo, hi;
-		if (sweet_spmi_read(0, address, &lo) ||
-		    sweet_spmi_read(0, address + 1, &hi)) {
+		if (sweet_spmi_read(BATT_SID, address, &lo) ||
+		    sweet_spmi_read(BATT_SID, address + 1, &hi)) {
 			return false;
 		}
 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
@@ -214,14 +218,14 @@ SweetBattery::poll(void)
 	uint8_t type, present, usb, path, charger, error, temperature;
 	uint16_t rawVoltage;
 	bool valid = fReal &&
-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+	    !sweet_spmi_read(BATT_SID, 0x4804, &type) && type == 0x0d &&
+	    !sweet_spmi_read(BATT_SID, 0x4808, &present) && (present & 1u) &&
 	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
-	    !sweet_spmi_read(0, 0x1310, &usb) &&
-	    !sweet_spmi_read(0, 0x110b, &path) &&
-	    !sweet_spmi_read(0, 0x1006, &charger) &&
-	    !sweet_spmi_read(0, 0x1007, &error) &&
-	    !sweet_spmi_read(0, 0x100d, &temperature);
+	    !sweet_spmi_read(BATT_SID, 0x1310, &usb) &&
+	    !sweet_spmi_read(BATT_SID, 0x110b, &path) &&
+	    !sweet_spmi_read(BATT_SID, 0x1006, &charger) &&
+	    !sweet_spmi_read(BATT_SID, 0x1007, &error) &&
+	    !sweet_spmi_read(BATT_SID, 0x100d, &temperature);
 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
 	valid = valid && mv >= 2800 && mv <= 4600;
@@ -243,7 +247,7 @@ SweetBattery::poll(void)
 	int ma = 0;
 	uint8_t subtype;
 	uint16_t rawCurrent;
-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+	bool currentValid = !sweet_spmi_read(BATT_SID, 0x4805, &subtype) &&
 	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
 	    rawCurrent != 0x8000;
 	if (currentValid) {

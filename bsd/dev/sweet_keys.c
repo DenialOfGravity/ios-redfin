@@ -1,7 +1,8 @@
 /*
  * Minimal polled SWEET keys. Call once after the scheduler is running.
  * flame: power (KPDPWR) and volume down (RESIN) on the PM8150 PON block,
- * volume up: sunfish PM6150L GPIO2 (SID 4, 0xc100, active low; was Pixel 4 PM8150 GPIO6).
+ * volume up: redfin PM8150L GPIO5 (SID 4, 0xc400, active low; sunfish PM6150L GPIO2 0xc100,
+ * Pixel 4 PM8150 GPIO6). The shim sets its pull-up (shim.c redfin_pmic_gpios).
  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
  */
@@ -23,7 +24,7 @@ void sweet_keys_init(void);
 #define KEYS_CNFG_PA     0x0c40a000u
 #define KEYS_PON_RT      0x0810u
 #define KEYS_GPIO_SID    4u
-#define KEYS_GPIO_BASE   0xc100u
+#define KEYS_GPIO_BASE   0xc400u
 #define KEYS_GPIO_RT     (KEYS_GPIO_BASE + 0x10u)
 #define KEYS_NO_APID     0xffffu
 
