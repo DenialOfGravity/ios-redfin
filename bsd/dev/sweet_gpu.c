@@ -330,7 +330,7 @@ sweet_gpu_init(void)
 	}
 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
 	a6_init_state(&gpu, ptoa_64(pn));
-	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */
+	uint32_t lvl = 4;	/* boot-arg sweetgpufreq=1 (180) .. 5 (565); A618 also 6 (650), 7 (800), 8 (825) */
 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
 	gpu.perf_level = lvl;
 	pool_kva = va;
