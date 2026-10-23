@@ -119,7 +119,7 @@ SweetAccelerator::start(IOService *provider)
 	setProperty("MetalPluginName", plugin);
 	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
 	setProperty("IOGLBundleName", plugin);
-	setProperty("model", "Adreno 640");
+	setProperty("model", "Adreno 618");
 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
 	registerService();
 	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
@@ -413,7 +413,7 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 		if (args->scalarOutputCount < 3) {
 			return kIOReturnBadArgument;
 		}
-		out[0] = 640;
+		out[0] = 618;
 		out[1] = 0x06040001;
 		out[2] = sweet_gpu_ready();
 		return kIOReturnSuccess;
@@ -663,16 +663,17 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 	case NativeAdrenoMethodGetDeviceInfo: {
 		V2_OUT(NativeAdrenoAbiDeviceInfo);
 		/* what bsd/dev/sweet_a6xx.c's hw_init programs: GMEM 1 MB at 0x100000, UBWC 3 (hbb 15, lvl 2+3 swizzle) */
-		rp->chip_id = 0x06040001;
-		rp->gmem_bytes = 0x100000;
+		/* sunfish A618 (0145): chip id, 512 KB GMEM, highest bank bit 14, UBWC 2 (DT qcom,ubwc-mode) */
+		rp->chip_id = 0x06010800;
+		rp->gmem_bytes = 0x80000;
 		rp->gmem_base = 0x100000;
 		rp->uche_trap_base = 0x1fffffffff000ULL;
 		rp->va_start = fWinBase;
 		rp->va_size = fWinSize;
-		rp->highest_bank_bit = 15;
+		rp->highest_bank_bit = 14;
 		rp->ubwc_swizzle = 0x6;
 		rp->macrotile_mode = 0;
-		rp->ubwc_version = 3;
+		rp->ubwc_version = 2;
 		rp->flags = NativeAdrenoDeviceClientIova;
 		return kIOReturnSuccess;
 	}

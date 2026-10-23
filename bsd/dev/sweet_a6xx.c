@@ -1168,7 +1168,11 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
 		/* UCHE: write range max, trap base, write-through base (trap 0x1fffffffff000) */
 		{ 0x0e05, 0xffffffc0 }, { 0x0e06, 0x1ffff }, { 0x0e09, 0xfffff000 }, { 0x0e0a, 0x1ffff },
 		{ 0x0e07, 0xfffff000 }, { 0x0e08, 0x1ffff },
+#if A6_GPU_ID == 618
+		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x17ffff }, { 0x0e0e, 0 },	/* GMEM range: 512 KB */
+#else
 		{ 0x0e0b, 0x100000 }, { 0x0e0c, 0 }, { 0x0e0d, 0x1fffff }, { 0x0e0e, 0 },	/* GMEM range */
+#endif
 		{ 0x0e18, 0x804 }, { 0x0e17, 0x4 },	/* UCHE_FILTER_CNTL, CACHE_WAYS */
 		{ 0x08c2, 0x02000140 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },	/* ROQ, mem pool */
 		{ 0x098d, 1 }, { 0x0500, 1 },		/* CP_AHB_CNTL, RBBM_PERFCTR_CNTL */
@@ -1176,9 +1180,15 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
 		{ 0x0e19, (1u << 7) | 1 },		/* UCHE_CLIENT_PF */
 		{ 0x9e00, 0x00180000 },			/* PC_DBG_ECO_CNTL: prim_fifo_threshold */
 		{ 0x08d0, 0 },				/* CP_PERFCTR_CP_SEL[0]: always count */
+#if A6_GPU_ID == 618
+		/* a6xx_set_ubwc_config for A618 (0145): highest bank bit 14 (DT, hbb_lo 1), no AMSBC */
+		{ 0x8e08, 1u << 1 }, { 0xb604, 1u << 1 }, { 0xae02, 1u << 1 },
+		{ 0x0e01, 1u << 21 }, { 0x0534, 0 },
+#else
 		/* a6xx_set_ubwc_config: highest bank bit 15 (hbb_lo 2), AMSBC, UBWC 3 */
 		{ 0x8e08, (1u << 4) | (2u << 1) }, { 0xb604, 2u << 1 }, { 0xae02, 2u << 1 },
 		{ 0x0e01, 2u << 21 }, { 0x0534, 0 },
+#endif
 	};
 	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++)
 		wr32(GREG(init[i][0]), init[i][1]);
