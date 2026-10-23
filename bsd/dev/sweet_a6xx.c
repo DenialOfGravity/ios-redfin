@@ -112,7 +112,7 @@ static void zero_pa(uint64_t pa, uint64_t size)
 #define VA_LOG		A6_GMU_LOG_VA
 #define VA_HFI		0x60005000u
 
-#define RSCC		(0x02c6a000ull + 0x23000)
+#define RSCC		(A6_GPU_BASE + 0x6a000ull + 0x23000)	/* GMU + 0x23000; sunfish 0x0508d000 (was hardcoded flame 0x02c6a000) */
 #define RSCC_REG(o)	(RSCC + 4ull * (o))
 #define PDC		0x0b290000ull
 #define PDC_REG(o)	(PDC + 4ull * (o))
