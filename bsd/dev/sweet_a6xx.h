@@ -51,8 +51,8 @@
 #define A6_FB_PA		0x9c000000ull
 #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
 
-#define A6_GPU_ID		640
-#define A6_CHIP_ID		0x06040001ull
+#define A6_GPU_ID		618	/* sunfish (flame: 640) */
+#define A6_CHIP_ID		0x06010800ull	/* sunfish DT qcom,chipid */
 
 struct a6_gpu {
 	uint64_t pool_pa;
@@ -157,10 +157,10 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
 #define A6_CP_MEMCPY		0x75
 
 /* Register/state access for status and dumps */
-#define A6_GPU_BASE		0x02c00000ull
+#define A6_GPU_BASE		0x05000000ull	/* sunfish kgsl-3d0 (flame 0x02c00000) */
 #define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
-#define A6_GPUCC		0x02c90000ull
-#define A6_SMMU			0x02ca0000ull
+#define A6_GPUCC		0x05090000ull	/* gpucc-sdmmagpie */
+#define A6_SMMU			0x05040000ull	/* sunfish kgsl-iommu */
 #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
 #define A6_FSR_FAULT		0xc00001feu
 #define A6_GMEM_LOG_OFF		0x91000ull
