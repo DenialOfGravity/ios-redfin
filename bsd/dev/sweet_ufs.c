@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
 extern void sweet_touch_init(void);
 extern void sweet_fts_init(void);
 extern void sweet_sects_init(void);
+extern void sweet_haptic_init(void);
 extern void sweet_cpufreq_init(void);
 extern void sweet_pmem_init(void);
 extern void flame_wlan_init(void);
@@ -671,6 +672,7 @@ sweet_ufs_init(void)
 	sweet_touch_init();
 	sweet_fts_init();
 	sweet_sects_init();	/* redfin sec_ts (sectouch=1) */
+	sweet_haptic_init();	/* redfin DRV2624 (sweethaptic=1) */
 	sweet_usb_probe();
 	return 0;
 }

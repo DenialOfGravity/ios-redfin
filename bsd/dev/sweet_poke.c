@@ -135,7 +135,7 @@ poke_line(const char *s, const char *end, unsigned lineno)
 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
 	volatile uint32_t *r = NULL;
-	if (op != '@' && op != 's') {
+	if (op != '@' && op != 's' && op != 'v') {
 		if (!ha || (a & 3) || !(r = poke_reg(a))) {
 			printf("POKE: line %u: bad address\n", lineno);
 			return;
@@ -153,6 +153,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 	case 's':
 		poke_sleep_ms((unsigned)a);
 		break;
+	case 'v': {
+		/* redfin (0907): v MS [STRENGTH 1..127] buzzes the DRV2624 (bsd/dev/sweet_haptic.c, sweethaptic=1) */
+		extern int sweet_haptic_buzz(unsigned ms, unsigned strength);
+		printf("POKE: v %llu ms -> %d\n", a, sweet_haptic_buzz((unsigned)a, hb ? (unsigned)b : 127));
+		break;
+	}
 	case 'r': {
 		uint64_t n = hb ? b : 1;
 		for (uint64_t i = 0; i < n && i < 256; i += 4) {
