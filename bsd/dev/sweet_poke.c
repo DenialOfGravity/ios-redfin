@@ -167,9 +167,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		break;
 	}
 	case 'c': {
-		/* redfin (0919): c N powers camera sensor N up, reads its chip ID, powers it down (9: look) */
-		extern int sweet_cam_cmd(unsigned what);
-		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd((unsigned)a));
+		/*
+		 * redfin (0919): c N powers camera sensor N up, reads its chip ID, powers it down (9: look);
+		 * 0922: c 20 the CSID's test pattern, c 21 SENSOR MODE OPTIONS a sensor's frames (sweet_cam.c)
+		 */
+		extern int sweet_cam_cmd_args(unsigned what, uint64_t a, uint64_t b, uint64_t c);
+		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd_args((unsigned)a, b, c, d));
 		break;
 	}
 	case 'r': {
