@@ -112,6 +112,7 @@ bsd/dev/sweet_fts.c			standard
 bsd/dev/sweet_sects.c			standard
 bsd/dev/sweet_haptic.c			standard
 bsd/dev/sweet_torch.c			standard
+bsd/dev/sweet_cam.c			standard
 bsd/dev/sweet_audio.c			standard
 bsd/dev/sweet_adsp.c			standard
 bsd/dev/sweet_cpufreq.c			standard

@@ -56,6 +56,7 @@ extern void sweet_fts_init(void);
 extern void sweet_sects_init(void);
 extern void sweet_haptic_init(void);
 extern void sweet_torch_init(void);
+extern void sweet_cam_init(void);
 extern void sweet_audio_init(void);
 extern void redwood_adsp_init(void);
 extern void sweet_cpufreq_init(void);
@@ -677,6 +678,7 @@ sweet_ufs_init(void)
 	sweet_sects_init();	/* redfin sec_ts (sectouch=1) */
 	sweet_haptic_init();	/* redfin DRV2624 (sweethaptic=1) */
 	sweet_torch_init();	/* redfin flash LED (sweettorch=2): bsd/dev/sweet_torch.c */
+	sweet_cam_init();	/* redfin camera sensors (sweetcam=1/2): bsd/dev/sweet_cam.c */
 	sweet_audio_init();	/* /dev/redwood-audio, /dev/redwood-haptic: bsd/dev/sweet_audio.c */
 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
 	sweet_usb_probe();

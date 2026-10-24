@@ -358,7 +358,7 @@ hap_abort(void)
 
 /* One FIFO message: TX at most 8 bytes or RX at most 8 bytes (sweet_touch.c touch_msg_run). */
 static int
-hap_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+hap_msg_to(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
 {
 	if (hp.dead || nt > 8 || nr > 8 || (nt && nr) || (!nt && !nr)) {
 		return EIO;
@@ -371,7 +371,7 @@ hap_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
 	hap_wr(hp.se, SE_IRQ_CLR, 0xffffffffu);
 	hap_wr(hp.se, SE_TX_WM, nt ? 1u : 0u);
 	hap_wr(hp.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
-	hap_wr(hp.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)HAP_ADDR << 9) | (stretch ? 4u : 0u));
+	hap_wr(hp.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
 	int err = ETIMEDOUT;
 	for (unsigned i = 0; i < 20000; ++i) {
 		uint32_t irq = hp.irq_last = hap_rd(hp.se, SE_IRQ);
@@ -422,6 +422,12 @@ hap_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
 	}
 	hap_abort();
 	return err;
+}
+
+static int
+hap_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+{
+	return hap_msg_to(HAP_ADDR, tx, nt, rx, nr, stretch);
 }
 
 static int
@@ -617,6 +623,26 @@ hap_thread(void *arg __unused, wait_result_t wr __unused)
 out:
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/*
+ * 0919: another device on SE9 (the SLG51000 camera PMIC at 0x75, bsd/dev/sweet_cam.c): write nt bytes,
+ * then (with a repeated start) read nr bytes, under the motor's lock. Only once the bus is up.
+ */
+int sweet_se9_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
+int
+sweet_se9_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr)
+{
+	if (!hp.ready || hp.dead || addr == HAP_ADDR || nt == 0 || nt > 8 || nr > 8) {
+		return ENXIO;
+	}
+	lck_mtx_lock(&sweet_haptic_lock);
+	int err = hap_msg_to(addr, tx, nt, NULL, 0, nr != 0);
+	if (!err && nr) {
+		err = hap_msg_to(addr, NULL, 0, rx, nr, false);
+	}
+	lck_mtx_unlock(&sweet_haptic_lock);
+	return err;
 }
 
 /* The motor on at strength (1..127) for at least ms more, from the driver's thread; newest wins. */

@@ -166,6 +166,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		    sweet_torch_set((unsigned)a, hb ? (unsigned)b : 1000));
 		break;
 	}
+	case 'c': {
+		/* redfin (0919): c N powers camera sensor N up, reads its chip ID, powers it down (9: look) */
+		extern int sweet_cam_cmd(unsigned what);
+		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd((unsigned)a));
+		break;
+	}
 	case 'r': {
 		uint64_t n = hb ? b : 1;
 		for (uint64_t i = 0; i < n && i < 256; i += 4) {
