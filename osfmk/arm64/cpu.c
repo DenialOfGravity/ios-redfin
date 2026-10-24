@@ -568,7 +568,12 @@ cpu_idle(void)
 #endif /* MONOTONIC */
 
 	if (wfi) {
-#if !defined(APPLE_ARM64_ARCH_FAMILY)
+#if !defined(APPLE_ARM64_ARCH_FAMILY) && !defined(SWEET)
+		/*
+		 * (Not on SWEET: the caches stay coherent and powered while a core
+		 * waits; this cleaned and invalidated the whole D-cache by set/way
+		 * on every idle entry. HackiOS's generic boards skip it too.)
+		 */
 		platform_cache_idle_enter();
 #endif
 

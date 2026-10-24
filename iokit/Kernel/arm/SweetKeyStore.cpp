@@ -55,9 +55,12 @@ enum {
 
 /*
  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
+ * (MobileKeyBag MKBDeviceUnlockedSinceBoot), bit 1 "no passcode"; clear
+ * lock bits = unlocked. 0910 (after sailfish 0180): with only bit 2 and lock
+ * state 0, coreduetd asked thousands of times a minute; answer no passcode,
+ * lock state disabled (HackiOS MiniAppleKeyStore.cpp does the same).
  */
-#define SWEET_AKS_LOCK_STATE    0x4
+#define SWEET_AKS_LOCK_STATE    0x6
 
 class AppleKeyStore : public IOService {
 	OSDeclareDefaultStructors(AppleKeyStore);
@@ -150,7 +153,7 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
 		const char *key;
 		uint8_t value;
 	} fields[] = {
-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 3 }, { "sb", 0 }, { "sfa", 0 },
 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
 	};
 	uint8_t buf[128];
@@ -275,10 +278,13 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		break;
 	}
 
-	char name[32];
-	proc_selfname(name, sizeof(name));
-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+	static uint32_t logged[128];            /* a few lines per selector */
+	if (selector >= 128 || logged[selector]++ < 5) {
+		char name[32];
+		proc_selfname(name, sizeof(name));
+		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+	}
 	return ret;
 }
 #endif /* SWEET */
