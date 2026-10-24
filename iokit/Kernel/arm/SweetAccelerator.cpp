@@ -643,6 +643,14 @@ IOReturn
 SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize)
 {
 	static uint32_t logged;
+/* 0153: a v2 error back to a client (Turnip turns most into device lost): logged with the client, the first
+ * 20 per client, then every 1000th */
+#define v2_err_log(what, why) do { \
+		static uint32_t v2_errs_##__LINE__; \
+		uint32_t e_ = ++v2_errs_##__LINE__; \
+		if (e_ <= 20 || e_ % 1000 == 0) \
+			IOLog("SWEET MTL: v2 %s: %s %s (#%u)\n", fName, what, why, e_); \
+	} while (0)
 #define V2_IN(T)        if (in == NULL || inSize != sizeof(T)) return kIOReturnBadArgument; const T *rq = (const T *)in
 #define V2_OUT(T)       if (out == NULL || *outSize < sizeof(T)) return kIOReturnBadArgument; T *rp = (T *)out; \
 	                bzero(rp, sizeof(T)); *outSize = sizeof(T)
@@ -841,11 +849,13 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 			dw[i] = (uint32_t)(b->bytes / 4);
 		}
 		if (rq->wait_fence != 0 && sweet_gpu_wait_fence_ns((uint32_t)rq->wait_fence, rq->wait_timeout_ns)) {
+			v2_err_log("submit", "wait_fence timeout");
 			return kIOReturnTimeout;
 		}
 		bool busy = false;
 		uint32_t fence = sweet_gpu_submit_v2(iova, dw, rq->buffer_count, &busy);
 		if (fence == 0) {
+			v2_err_log("submit", busy ? "busy (ring full)" : "not ready (GPU down)");
 			return busy ? kIOReturnBusy : kIOReturnNotReady;
 		}
 		fLastFence = fence;
@@ -854,7 +864,13 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 	}
 	case NativeAdrenoMethodWaitFence: {
 		V2_IN(NativeAdrenoAbiWaitFence);
-		return sweet_gpu_wait_fence_ns((uint32_t)rq->fence, rq->timeout_ns) ? kIOReturnTimeout : kIOReturnSuccess;
+		if (sweet_gpu_wait_fence_ns((uint32_t)rq->fence, rq->timeout_ns)) {
+			if (rq->timeout_ns >= 1000000000ULL) {	/* Turnip waits in 100 ms slices: only long waits are news */
+				v2_err_log("wait fence", "timeout");
+			}
+			return kIOReturnTimeout;
+		}
+		return kIOReturnSuccess;
 	}
 	case NativeAdrenoMethodGetTimestamp: {
 		V2_OUT(NativeAdrenoAbiTimestamp);
@@ -865,6 +881,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 		V2_OUT(NativeAdrenoAbiStatus);
 		if (sweet_gpu_lost(&fEpoch, fLastFence)) {
 			fFaults++;
+			v2_err_log("status", "work lost in a GPU reset: device lost for this client");
 		}
 		rp->faults = fFaults;
 		return kIOReturnSuccess;

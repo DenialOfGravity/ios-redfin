@@ -1128,9 +1128,14 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	if (!gpu_ready) {
 		return 0;
 	}
+	/* 0153: a full ring waits here (sweetringwait ms, default 2000) instead of bouncing busy back to Turnip,
+	 * whose retry gives up after ~6 ms when the ring is full of other clients' work (device lost). */
+	static uint32_t ring_wait_ms;
+	if (!ring_wait_ms && !PE_parse_boot_argn("sweetringwait", &ring_wait_ms, sizeof(ring_wait_ms)))
+		ring_wait_ms = 2000;
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
-	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, 0);
+	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, ring_wait_ms);
 	gpu_owner_locked(fence, proc_selfpid());
 	lck_mtx_unlock(&sweet_gpu_lock);
 	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
