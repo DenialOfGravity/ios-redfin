@@ -507,7 +507,19 @@ AppleCLCD::start(IOService *provider)
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+	/*
+	 * 0925: a dictionary, as on an iPhone's AppleCLCD. VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService
+	 * takes CFDictionaryGetValue(property, "PlaneBaseAlignmentLinear"): on a number mediaserverd died
+	 * ("-[__NSCFNumber objectForKey:]: unrecognized selector") whenever Camera.app's preview started.
+	 */
+	OSDictionary *align = OSDictionary::withCapacity(1);
+	OSNumber *linear = OSNumber::withNumber(64ULL, 32);
+	if (align != NULL && linear != NULL) {
+		align->setObject("PlaneBaseAlignmentLinear", linear);
+		setProperty("DisplayPipePlaneBaseAlignment", align);
+	}
+	OSSafeReleaseNULL(linear);
+	OSSafeReleaseNULL(align);
 	if (blStart()) {
 		uint32_t blOn = 0;
 		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
