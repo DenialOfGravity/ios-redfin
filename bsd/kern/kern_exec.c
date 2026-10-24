@@ -445,6 +445,135 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
 	return error;
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/* Append the kernel string var to the environment being built (exec_extract_strings). */
+static int
+sweet_exec_add_env(struct image_params *imgp, const char *var, int ptr_size)
+{
+	int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
+	if (error) {
+		return error;
+	}
+	if (imgp->ip_argspace < ptr_size) {
+		return E2BIG;
+	}
+	imgp->ip_argspace -= ptr_size;
+	imgp->ip_envc++;
+	return 0;
+}
+
+/* Is there already an environment string starting with prefix? */
+static bool
+sweet_exec_has_env(struct image_params *imgp, const char *prefix)
+{
+	size_t n = strlen(prefix);
+	for (const char *e = imgp->ip_endargv; e < imgp->ip_strendp; e += strlen(e) + 1) {
+		if (strncmp(e, prefix, n) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * 0912 (after sailfish 0104/0163): boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...][;NAME:...]
+ * appends VAR=VAL to the environment of every executable whose file name is NAME, e.g.
+ * sweetenv=backboardd:CA_DISABLE_BACKDROP_CACHE=1 (CoreAnimation knobs without editing
+ * launchd plists on the phone).
+ *
+ * Boot-arg sweetui=1: UI processes (SpringBoard and apps under /Applications and the app
+ * containers) get DYLD_INSERT_LIBRARIES=SWEET_UI_DYLIB when that file exists and they have
+ * no DYLD_INSERT_LIBRARIES of their own (dyld takes the last one, and stops the process if
+ * an inserted library is missing). AMFI's dyld policy (0114) honours it except for
+ * restricted and FairPlay-encrypted (App Store) executables. The library maps UIKit's
+ * haptic feedback onto the vibration motor (phone/haptics, kern.sweet_haptic).
+ */
+#define SWEET_UI_DYLIB  "/var/local/lib/SweetHaptics.dylib"
+
+static int
+sweet_exec_env(struct image_params *imgp, int ptr_size)
+{
+	static char spec[256];
+	static int state;       /* 0 not parsed, 1 none, 2 set */
+	static int ui = -1;
+	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
+	for (const char *c = path; *c; c++) {
+		if (*c == '/') {
+			base = c + 1;
+		}
+	}
+	if (ui < 0) {
+		int v = 0;
+		(void)PE_parse_boot_argn("sweetui", &v, sizeof(v));
+		ui = v;
+	}
+	if (ui && (strncmp(path, "/Applications/", 14) == 0 ||
+	    strncmp(path, "/System/Library/CoreServices/SpringBoard.app/", 45) == 0 ||
+	    strncmp(path, "/private/var/containers/Bundle/Application/", 43) == 0 ||
+	    strncmp(path, "/var/containers/Bundle/Application/", 35) == 0) &&
+	    !sweet_exec_has_env(imgp, "DYLD_INSERT_LIBRARIES=")) {
+		vnode_t vp = NULLVP;
+		if (vnode_lookup(SWEET_UI_DYLIB, 0, &vp, vfs_context_kernel()) == 0) {
+			vnode_put(vp);
+			int error = sweet_exec_add_env(imgp, "DYLD_INSERT_LIBRARIES=" SWEET_UI_DYLIB, ptr_size);
+			if (error) {
+				return error;
+			}
+			static unsigned logged;
+			if (logged++ < 8) {
+				printf("SWEET ENV: %s += haptics\n", base);
+			}
+		}
+	}
+
+	if (state == 0) {
+		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
+	}
+	if (state != 2) {
+		return 0;
+	}
+	const char *entry = spec;
+	for (;;) {
+		size_t n = 0;
+		while (entry[n] && entry[n] != ':' && entry[n] != ';') {
+			n++;
+		}
+		if (entry[n] == ':' && strlen(base) == n && strncmp(base, entry, n) == 0) {
+			break;
+		}
+		while (*entry && *entry != ';') {
+			entry++;
+		}
+		if (*entry == '\0') {
+			return 0;
+		}
+		entry++;
+	}
+	const char *p = strchr(entry, ':') + 1;
+	while (*p && *p != ';') {
+		char var[128];
+		size_t len = 0;
+		while (p[len] && p[len] != ',' && p[len] != ';') {
+			len++;
+		}
+		if (len > 0 && len < sizeof(var)) {
+			memcpy(var, p, len);
+			var[len] = '\0';
+			int error = sweet_exec_add_env(imgp, var, ptr_size);
+			if (error) {
+				return error;
+			}
+			printf("SWEET ENV: %s += %s\n", base, var);
+		}
+		p += len;
+		if (*p == ',') {
+			p++;
+		}
+	}
+	return 0;
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */
+
 /*
  * dyld is now passed the executable path as a getenv-like variable
  * in the same fashion as the stack_guard and malloc_entropy keys.
@@ -5740,6 +5869,13 @@ exec_extract_strings(struct image_params *imgp)
 		imgp->ip_argspace -= new_ptr_size; /* to hold envv[] entry */
 		imgp->ip_envc++;
 	}
+
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	error = sweet_exec_env(imgp, new_ptr_size);
+	if (error) {
+		goto bad;
+	}
+#endif
 
 	/* Save space for envv[] NULL terminator */
 	if (imgp->ip_argspace < new_ptr_size) {

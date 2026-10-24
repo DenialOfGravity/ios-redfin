@@ -12,6 +12,12 @@
  * (strength 1..127, open-loop RTP level) is the kernel API; the poke/command line
  * "v MS [STRENGTH]" calls it (tools/flame-cmd.py 'v 200').
  *
+ * 0912: for iOS, sysctl kern.sweet_haptic (write-only, any user) queues one pulse for the
+ * driver's thread, which stays up after bring-up and plays requests in order, newest
+ * winning: value = ms | strength << 16 (ms 1..2000, strength 1..127; 0 = defaults). The
+ * caller never waits on I2C. SweetHaptics.dylib (phone/haptics) maps UIKit's feedback
+ * generators and AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) onto it.
+ *
  * Writes outside the SE and the motor: GCC branch votes and the SE9 RCG (XO), the two TLMM
  * pin configs, and three PM7250B GPIO1 registers (output high = motor enabled).
  */
@@ -19,6 +25,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/sysctl.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <kern/locks.h>
@@ -32,6 +39,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
 void sweet_haptic_init(void);
 int sweet_haptic_buzz(unsigned ms, unsigned strength);
+int sweet_haptic_request(unsigned ms, unsigned strength);
 
 #define HAP_SE_PA       0x0098c000u
 #define HAP_GCC_PA      0x00100000u
@@ -110,6 +118,9 @@ static struct {
 static LCK_GRP_DECLARE(sweet_haptic_grp, "sweet_haptic");
 static LCK_MTX_DECLARE(sweet_haptic_lock, &sweet_haptic_grp);
 static int hap_sleep_chan;
+static int hap_req_chan;
+static volatile uint32_t hap_req;       /* pending pulse: ms | strength << 16; 0 = none */
+static volatile uint32_t hap_reqs;
 
 static uint32_t
 hap_rd(vm_offset_t base, uint32_t off)
@@ -530,10 +541,59 @@ hap_thread(void *arg __unused, wait_result_t wr __unused)
 			(void)sweet_haptic_buzz(80, 127);
 		}
 	}
+	/* 0912: the request worker (kern.sweet_haptic). */
+	while (hp.ready && !hp.dead) {
+		uint64_t deadline;
+		clock_interval_to_deadline(60000, NSEC_PER_MSEC, &deadline);
+		(void)assert_wait_deadline(&hap_req_chan, THREAD_UNINT, deadline);
+		if (hap_req != 0) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+		} else {
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+		uint32_t req = __atomic_exchange_n(&hap_req, 0, __ATOMIC_ACQ_REL);
+		if (req) {
+			(void)sweet_haptic_buzz(req & 0xffffu, (req >> 16) & 0xffu);
+		}
+	}
 out:
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }
+
+/* Queue a pulse for the driver's thread (any context that may take a wakeup); newest wins. */
+int
+sweet_haptic_request(unsigned ms, unsigned strength)
+{
+	if (!hp.ready || hp.dead) {
+		return ENXIO;
+	}
+	if (ms == 0 || ms > 2000) {
+		ms = 60;
+	}
+	if (strength == 0 || strength > 127) {
+		strength = 127;
+	}
+	__atomic_store_n(&hap_req, ms | (strength << 16), __ATOMIC_RELEASE);
+	hap_reqs++;
+	thread_wakeup(&hap_req_chan);
+	return 0;
+}
+
+static int
+sysctl_sweet_haptic SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0;
+	int changed = 0;
+	int error = sysctl_io_number(req, (int)hap_reqs, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	return sweet_haptic_request((unsigned)value & 0xffffu, ((unsigned)value >> 16) & 0xffu);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_haptic, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_haptic, "I", "SWEET vibration: write ms | strength << 16");
 
 void
 sweet_haptic_init(void)
