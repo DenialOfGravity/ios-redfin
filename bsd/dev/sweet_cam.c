@@ -312,8 +312,21 @@ pgpio_set(unsigned n, bool high)
 	uint8_t vals[4] = { 0x01, (uint8_t)(high ? 0x80 : 0x00), 0x01, 0x80 };      /* VIN1, level, output, on */
 	for (unsigned i = set_vin ? 0 : 1; i < 4; i++) {
 		uint8_t v = vals[i], back = 0;
-		if (spmi(PGPIO_SID, base + regs[i], true, &v) || spmi(PGPIO_SID, base + regs[i], false, &back) ||
-		    (back & 0x87) != (vals[i] & 0x87)) {
+		bool ok = false;
+		/*
+		 * 0926: three tries. r18d: after a dozen quick sensor switches (mediaserverd restarting), gpio8's MODE_CTL
+		 * read back 0 once and the camera was given up for the rest of the boot.
+		 */
+		for (unsigned t = 0; t < 3 && !ok; t++) {
+			v = vals[i];
+			back = 0;
+			ok = !spmi(PGPIO_SID, base + regs[i], true, &v) && !spmi(PGPIO_SID, base + regs[i], false, &back) &&
+			    (back & 0x87) == (vals[i] & 0x87);
+			if (!ok) {
+				delay(200);
+			}
+		}
+		if (!ok) {
 			printf("SWEET CAM: PM8150L gpio%u reg %#x <- %#x reads %#x\n", n, regs[i], vals[i], back);
 			give_up("a PMIC GPIO write that did not read back");
 			return false;
@@ -2436,6 +2449,8 @@ places_reset(void)
 }
 
 /* one session: from the first read that wants frames to the close, the idle time, a fault or another sensor */
+static unsigned ios_start_failures;
+
 static void
 ios_session(void)
 {
@@ -2471,13 +2486,18 @@ ios_session(void)
 		ok = sensor_table("on");
 	}
 	if (!ok) {
-		printf("SWEET CAM: /dev/redwood-camera: the %s did not start\n", sensors[ios_sensor].name);
-		ios_broken = true;
+		/* 0926: a start that failed is tried again at the next read, up to three times in a row */
+		ios_start_failures++;
+		printf("SWEET CAM: /dev/redwood-camera: the %s did not start (%u in a row)%s\n", sensors[ios_sensor].name,
+		    ios_start_failures, ios_start_failures >= 3 ? ": no more tries" : "");
+		ios_broken = ios_start_failures >= 3;
 		stream_down(powered);
 		tab_free();
 		lck_mtx_unlock(&sweet_cam_lock);
+		sleep_ms(200);
 		return;
 	}
+	ios_start_failures = 0;
 	ios_now.lines = ios_next.lines = lines;
 	ios_now.gain = ios_next.gain = gain;
 	ios_now.frame_lines = ios_next.frame_lines = frame_lines;
