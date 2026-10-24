@@ -18,6 +18,12 @@
  * caller never waits on I2C. SweetHaptics.dylib (phone/haptics) maps UIKit's feedback
  * generators and AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) onto it.
  *
+ * 0914: the worker follows a level instead of playing fixed pulses: sweet_haptic_drive(strength,
+ * ms) keeps the motor on at that RTP level for at least ms more (a newer level replaces it at
+ * once), then stops it. /dev/redwood-haptic (bsd/dev/sweet_audio.c) drives it from the waveform
+ * iOS plays on its "Actuator" audio device, as on an iPhone X. At most HAP_MAX_ON_MS on without a
+ * break, then it rests as long.
+ *
  * Writes outside the SE and the motor: GCC branch votes and the SE9 RCG (XO), the two TLMM
  * pin configs, and three PM7250B GPIO1 registers (output high = motor enabled).
  */
@@ -40,6 +46,7 @@ extern void thread_deallocate(thread_t);
 void sweet_haptic_init(void);
 int sweet_haptic_buzz(unsigned ms, unsigned strength);
 int sweet_haptic_request(unsigned ms, unsigned strength);
+int sweet_haptic_drive(unsigned ms, unsigned strength);
 
 #define HAP_SE_PA       0x0098c000u
 #define HAP_GCC_PA      0x00100000u
@@ -119,8 +126,9 @@ static LCK_GRP_DECLARE(sweet_haptic_grp, "sweet_haptic");
 static LCK_MTX_DECLARE(sweet_haptic_lock, &sweet_haptic_grp);
 static int hap_sleep_chan;
 static int hap_req_chan;
-static volatile uint32_t hap_req;       /* pending pulse: ms | strength << 16; 0 = none */
+static volatile uint32_t hap_req;       /* pending: ms | strength << 16; 0 = none */
 static volatile uint32_t hap_reqs;
+#define HAP_MAX_ON_MS   1500u
 
 static uint32_t
 hap_rd(vm_offset_t base, uint32_t off)
@@ -541,19 +549,69 @@ hap_thread(void *arg __unused, wait_result_t wr __unused)
 			(void)sweet_haptic_buzz(80, 127);
 		}
 	}
-	/* 0912: the request worker (kern.sweet_haptic). */
-	while (hp.ready && !hp.dead) {
-		uint64_t deadline;
-		clock_interval_to_deadline(60000, NSEC_PER_MSEC, &deadline);
-		(void)assert_wait_deadline(&hap_req_chan, THREAD_UNINT, deadline);
-		if (hap_req != 0) {
-			clear_wait(current_thread(), THREAD_AWAKENED);
-		} else {
-			thread_block(THREAD_CONTINUE_NULL);
-		}
-		uint32_t req = __atomic_exchange_n(&hap_req, 0, __ATOMIC_ACQ_REL);
-		if (req) {
-			(void)sweet_haptic_buzz(req & 0xffffu, (req >> 16) & 0xffu);
+	/* 0912/0914: the worker: the motor on at the newest level until its time is up. */
+	{
+		bool on = false;
+		uint8_t level = 0;
+		uint64_t until = 0, on_since = 0, rest_until = 0;
+		unsigned drives = 0;
+		while (hp.ready && !hp.dead) {
+			uint64_t now = mach_absolute_time(), deadline;
+			if (on) {
+				deadline = until;
+			} else {
+				clock_interval_to_deadline(60000, NSEC_PER_MSEC, &deadline);
+			}
+			(void)assert_wait_deadline(&hap_req_chan, THREAD_UNINT, deadline);
+			if (hap_req != 0 || (on && now >= until)) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			now = mach_absolute_time();
+			uint32_t req = __atomic_exchange_n(&hap_req, 0, __ATOMIC_ACQ_REL);
+			if (req && now >= rest_until) {
+				unsigned ms = req & 0xffffu, strength = (req >> 16) & 0xffu;
+				uint64_t t;
+				clock_interval_to_deadline(ms, NSEC_PER_MSEC, &t);
+				int err = 0;
+				lck_mtx_lock(&sweet_haptic_lock);
+				if (!on) {
+					err |= drv_bits(DRV_MODE, 0x03, 0x00);
+					err |= drv_write(DRV_RTP, (uint8_t)strength);
+					err |= drv_bits(DRV_GO, 0x01, 0x01);
+					on = true;
+					on_since = now;
+					until = t;
+				} else {
+					if (strength != level) {
+						err |= drv_write(DRV_RTP, (uint8_t)strength);
+					}
+					until = t > until ? t : until;
+				}
+				lck_mtx_unlock(&sweet_haptic_lock);
+				level = (uint8_t)strength;
+				if (drives++ < 12 || err) {
+					printf("SWEET HAPTIC: drive %u ms level %u%s -> %d\n", ms, strength,
+					    on && now != on_since ? " (held)" : "", err);
+				}
+				if (err) {
+					hp.dead = true;
+				}
+			}
+			uint64_t max_on;
+			nanoseconds_to_absolutetime((uint64_t)HAP_MAX_ON_MS * NSEC_PER_MSEC, &max_on);
+			if (on && (now >= until || hp.dead || now - on_since >= max_on)) {
+				lck_mtx_lock(&sweet_haptic_lock);
+				(void)drv_bits(DRV_GO, 0x01, 0x00);
+				lck_mtx_unlock(&sweet_haptic_lock);
+				if (now - on_since >= max_on) {
+					rest_until = now + max_on;
+					printf("SWEET HAPTIC: on for %u ms: resting as long\n", HAP_MAX_ON_MS);
+				}
+				on = false;
+				level = 0;
+			}
 		}
 	}
 out:
@@ -561,7 +619,22 @@ out:
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
-/* Queue a pulse for the driver's thread (any context that may take a wakeup); newest wins. */
+/* The motor on at strength (1..127) for at least ms more, from the driver's thread; newest wins. */
+int
+sweet_haptic_drive(unsigned ms, unsigned strength)
+{
+	if (!hp.ready || hp.dead) {
+		return ENXIO;
+	}
+	ms = ms == 0 ? 1 : ms > 2000 ? 2000 : ms;
+	strength = strength == 0 ? 1 : strength > 127 ? 127 : strength;
+	__atomic_store_n(&hap_req, ms | (strength << 16), __ATOMIC_RELEASE);
+	hap_reqs++;
+	thread_wakeup(&hap_req_chan);
+	return 0;
+}
+
+/* A pulse (kern.sweet_haptic): 0 = defaults (60 ms, full strength). */
 int
 sweet_haptic_request(unsigned ms, unsigned strength)
 {
@@ -574,10 +647,7 @@ sweet_haptic_request(unsigned ms, unsigned strength)
 	if (strength == 0 || strength > 127) {
 		strength = 127;
 	}
-	__atomic_store_n(&hap_req, ms | (strength << 16), __ATOMIC_RELEASE);
-	hap_reqs++;
-	thread_wakeup(&hap_req_chan);
-	return 0;
+	return sweet_haptic_drive(ms, strength);
 }
 
 static int
