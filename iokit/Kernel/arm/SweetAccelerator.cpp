@@ -724,7 +724,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 				fPoolPeak = fPoolBytes;
 			}
 			fAllocs++;
-			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25)) {
+			if ((fPoolBytes >> 25) != ((fPoolBytes - len) >> 25) || fAllocs % 500 == 0) {
 				/* 0154: live pool buffers by size: <256K, <1M, <8M, 8M, >8M (count/MB) */
 				uint32_t n[5] = { 0 };
 				uint64_t mb[5] = { 0 };
