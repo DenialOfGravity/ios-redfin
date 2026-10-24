@@ -48,6 +48,8 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
 	uint32_t *out_dw, uint32_t *out_dh);
 void sweet_gpu_panel_stride(uint32_t stride);
+void sweet_gpu_flip_poll(void);         /* 0905: sweetfbflip=1 */
+void sweet_gpu_scanout_front(void);
 extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
 }
 #define SWEET_FB_GPU_ROWBYTES           4352    /* the 2D engine writes 64-byte multiples */
@@ -288,6 +290,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		fb->fNextVsync = now + fb->fVsyncAbs;
 	}
 	sender->wakeAtTime(fb->fNextVsync);
+	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
 	if ((count % 300) == 0) {
 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
 		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
@@ -601,6 +604,7 @@ AppleCLCD::present(const uint8_t *rec)
 	if (sweet_gpu_ready() && presentGPU(rec)) {
 		return;
 	}
+	sweet_gpu_scanout_front();	/* 0905: the CPU copy below draws into the first panel buffer */
 	if (sweet_display_fit_w) {
 		sweet_display_fit_w = 0;        /* touch back to the crop mapping */
 		sweet_display_fit_x = sweet_display_fit_y = sweet_display_fit_h = 0;

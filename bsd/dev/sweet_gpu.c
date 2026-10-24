@@ -529,6 +529,111 @@ sweet_gpu_panel_stride(uint32_t stride)
 	a6_log("panel stride %u\n", stride);
 }
 
+/*
+ * 0905: double-buffered GPU present (boot-arg sweetfbflip=1; ios-sailfish 0164 does this on the Pixel 1).
+ * The GPU blits each frame into the buffer the panel is not scanning (A6_FB_PA or A6_FB_PA + A6_FB_BUF_OFF);
+ * once that blit's fence has landed, VIG0 and VIG1 are pointed at it and CTL0 flushed: with ABL's
+ * autorefresh the next frame start latches both pipes at once, so the panel never shows a half-drawn frame
+ * (the single-buffer path blits into the buffer being scanned out). Until the flip has latched (CTL0's
+ * VIG flush bits read back clear, or two 60 Hz frames passed) nothing is written into the old buffer:
+ * the present reports "busy" and the framebuffer retries on its next tick.
+ */
+#define SSPP_SRC0_ADDR  0x14
+static int fb_flip = -1;                /* boot-arg sweetfbflip */
+static uint32_t scan_buf;               /* 0 = A6_FB_PA (ABL's), 1 = the second buffer */
+static uint32_t back_fence;             /* latest present queued into the back buffer, 0 = none */
+static uint64_t flip_abs;               /* when the last flip was flushed */
+static uint64_t stat_flips;
+static uint32_t stat_flip_late;         /* flips taken as latched by time, not by CTL0's flush bits */
+
+static bool
+fb_flip_on(void)
+{
+	if (fb_flip < 0) {
+		int on = 0;
+		PE_parse_boot_argn("sweetfbflip", &on, sizeof(on));
+		fb_flip = on && A6_FB_BUF_OFF != 0;
+		if (on) {
+			a6_log("present: double-buffered (%s)\n", fb_flip ? "on" : "no second buffer on this GPU");
+		}
+	}
+	return fb_flip > 0;
+}
+
+static bool
+flip_latched_locked(void)
+{
+	if (!flip_abs || !(a6_rd(CTL0_FLUSH) & 0x3)) {
+		return true;
+	}
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time() - flip_abs, &ns);
+	if (ns <= 34000000ULL) {
+		return false;
+	}
+	stat_flip_late++;
+	flip_abs = 0;
+	return true;
+}
+
+static void
+flip_to_locked(uint32_t buf)
+{
+	uint64_t from = A6_FB_PA + scan_buf * A6_FB_BUF_OFF, to = A6_FB_PA + buf * A6_FB_BUF_OFF;
+	for (uint32_t p = 0; p < 2; p++) {
+		uint32_t a = a6_rd(SSPP_VIG(p) + SSPP_SRC0_ADDR);
+		a6_wr(SSPP_VIG(p) + SSPP_SRC0_ADDR, (uint32_t)(a - (uint32_t)from + (uint32_t)to));
+	}
+	a6_wr(CTL0_FLUSH, 0x3);
+	flip_abs = mach_absolute_time();
+	scan_buf = buf;
+	if (stat_flips++ < 3) {
+		a6_log("present: flip %llu to 0x%llx (vig0 %x vig1 %x)\n", stat_flips, to,
+		    a6_rd(SSPP_VIG(0) + SSPP_SRC0_ADDR), a6_rd(SSPP_VIG(1) + SSPP_SRC0_ADDR));
+	}
+}
+
+/* The back buffer's latest blit has landed: show it. With sweet_gpu_lock. */
+static void
+flip_poll_locked(void)
+{
+	if (back_fence && a6_fence_done(&gpu, back_fence) && flip_latched_locked()) {
+		flip_to_locked(scan_buf ^ 1);
+		back_fence = 0;
+	}
+}
+
+/* From the framebuffer's vsync tick: a finished frame waiting in the back buffer goes on screen. */
+void sweet_gpu_flip_poll(void);
+void
+sweet_gpu_flip_poll(void)
+{
+	if (!gpu_ready || fb_flip <= 0 || !back_fence) {
+		return;
+	}
+	if (lck_mtx_try_lock(&sweet_gpu_lock)) {
+		flip_poll_locked();
+		lck_mtx_unlock(&sweet_gpu_lock);
+	}
+}
+
+/* Before the CPU draws into A6_FB_PA again (framebuffer fallback): scan that buffer out. */
+void sweet_gpu_scanout_front(void);
+void
+sweet_gpu_scanout_front(void)
+{
+	if (!gpu_ready || fb_flip <= 0 || (scan_buf == 0 && !back_fence)) {
+		return;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	back_fence = 0;
+	if (scan_buf != 0) {
+		flip_to_locked(0);
+		a6_log("present: back to the front buffer for the CPU path\n");
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+}
+
 /* ---- surfaces ---- */
 
 static int present_wait_locked(uint32_t k, const char *why);
@@ -690,6 +795,18 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	}
 	static uint32_t ib[10 * A6_BLIT_MAX_DW];
 	lck_mtx_lock(&sweet_gpu_lock);
+	uint64_t fb_gva = A6_GVA_FB;
+	if (fb_flip_on()) {
+		/* 0905: draw into the buffer that is not on screen, once the last flip has latched */
+		flip_poll_locked();
+		if (!flip_latched_locked()) {
+			stat_busy++;
+			lck_mtx_unlock(&sweet_gpu_lock);
+			return 1;
+		}
+		fb_gva += (scan_buf ^ 1) * A6_FB_BUF_OFF;
+		frame.dst_iova = fb_gva;
+	}
 	uint32_t n = 0;
 	if (ext) {
 		if (display_mask_radius != corner_radius) {
@@ -734,7 +851,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 				.src_iova = A6_GVA_POOL + DISPLAY_STAGE_OFF,
 				.src_w = PANEL_W, .src_h = PANEL_H, .src_pitch = fb_pitch,
 				.sx = frame.dx, .sy = y, .sw = frame.dw, .sh = ext,
-				.dst_iova = A6_GVA_FB, .dst_pitch = fb_pitch,
+				.dst_iova = fb_gva, .dst_pitch = fb_pitch,
 				.dx = frame.dx, .dy = y, .dw = frame.dw, .dh = ext,
 			};
 			n += a6_blit_ib(&gpu, &copy, ib + n);
@@ -774,6 +891,9 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		gpu_owner_locked(present_fence[k], 0);
 		rc = present_fence[k] ? 0 : -1;
 		present_next++;
+		if (fb_flip > 0 && present_fence[k]) {
+			back_fence = present_fence[k];	/* 0905: flipped to once it lands (flip_poll_locked) */
+		}
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 	uint64_t t2 = mach_absolute_time();
@@ -783,8 +903,8 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		uint64_t c, g;
 		absolutetime_to_nanoseconds(stat_clean_abs, &c);
 		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
-		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us, put off %u\n", stat_frames,
-		    c / 1000 / 300, g / 1000 / 300, stat_busy);
+		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us, put off %u, flips %llu (%u latched late)\n",
+		    stat_frames, c / 1000 / 300, g / 1000 / 300, stat_busy, stat_flips, stat_flip_late);
 		stat_clean_abs = stat_gpu_abs = 0;
 	}
 	*out_dx = frame.dx;
