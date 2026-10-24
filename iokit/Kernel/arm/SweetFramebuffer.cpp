@@ -147,6 +147,7 @@ public:
 	void swap(const uint8_t *rec);
 	void present(const uint8_t *rec);
 	bool presentGPU(const uint8_t *rec);
+	bool fPresentBusy;	/* 0158: the last present was put off (GPU busy): show fPending on the next tick */
 	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
 	static void presentLoop(void *arg);
 };
@@ -352,9 +353,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 	IOLockUnlock(fb->fLock);
 	if (rec != NULL) {
 		uint64_t t0 = mach_absolute_time();
+		fb->fPresentBusy = false;
 		fb->present(rec);
 		fb->fStatPresentAbs += mach_absolute_time() - t0;
-		fb->fStatPresents++;
+		if (fb->fPresentBusy) {
+			IOLockLock(fb->fLock);
+			fb->fDirty = true;	/* not shown: again on the next tick (fPending, maybe newer by then) */
+			IOLockUnlock(fb->fLock);
+		} else {
+			fb->fStatPresents++;
+		}
 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
 	}
 }
@@ -377,9 +385,16 @@ AppleCLCD::presentLoop(void *arg)
 		IOLockUnlock(fb->fLock);
 		if (go) {
 			uint64_t t0 = mach_absolute_time();
+			fb->fPresentBusy = false;
 			fb->present(fb->fPresentRec);
 			fb->fStatPresentAbs += mach_absolute_time() - t0;
-			fb->fStatPresents++;
+			if (fb->fPresentBusy) {
+				IOLockLock(fb->fLock);
+				fb->fDirty = true;
+				IOLockUnlock(fb->fLock);
+			} else {
+				fb->fStatPresents++;
+			}
 		}
 	}
 }
@@ -553,6 +568,10 @@ AppleCLCD::presentGPU(const uint8_t *rec)
 	int rc = sweet_gpu_present(slot, s->kernelAddress(), s->offset, s->width, s->height, s->bytesPerRow,
 	    fRowBytes, fCornerRadius, &dx, &dy, &dw, &dh);
 	s->release();
+	if (rc == 1) {
+		fPresentBusy = true;	/* 0158: the GPU still has the present before last: next tick */
+		return true;
+	}
 	if (rc) {
 		return gpu_fallback(7, "GPU blit failed");
 	}

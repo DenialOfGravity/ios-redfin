@@ -590,6 +590,7 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
 
 static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
 static uint32_t present_next;
+static uint32_t stat_busy;	/* 0158: presents put off a tick (slot still queued) */
 
 /* With sweet_gpu_lock: the present from IB slot k has landed (or the GPU was reset). 0, or -1 if reset. */
 static int
@@ -743,6 +744,24 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	 * CA paces on came late). Two IB slots: only the one two presents back must have landed.
 	 */
 	uint32_t k = present_next & 1;
+	/*
+	 * 0158: never block the vsync tick behind client render jobs. The present of this IB slot (two frames
+	 * back) still queued: 1, "busy" — the framebuffer keeps the frame and tries again on the next tick
+	 * (sweetpresentwait=1: the old blocking wait).
+	 */
+	static int block = -1;
+	if (block < 0 && !PE_parse_boot_argn("sweetpresentwait", &block, sizeof(block)))
+		block = 0;
+	if (!block && present_fence[k] && !a6_fence_done(&gpu, present_fence[k])) {
+		if (gpu_hung_locked(500)) {
+			gpu_recover_locked("present");
+			lck_mtx_unlock(&sweet_gpu_lock);
+			return -1;
+		}
+		stat_busy++;
+		lck_mtx_unlock(&sweet_gpu_lock);
+		return 1;
+	}
 	int rc = present_wait_locked(k, "present");
 	if (rc == 0) {
 		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
@@ -760,8 +779,8 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		uint64_t c, g;
 		absolutetime_to_nanoseconds(stat_clean_abs, &c);
 		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
-		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us\n", stat_frames,
-		    c / 1000 / 300, g / 1000 / 300);
+		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us, put off %u\n", stat_frames,
+		    c / 1000 / 300, g / 1000 / 300, stat_busy);
 		stat_clean_abs = stat_gpu_abs = 0;
 	}
 	*out_dx = frame.dx;
