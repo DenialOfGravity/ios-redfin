@@ -20,7 +20,8 @@
  * (READ_ONE_EVENT), which keeps every transfer inside one FIFO fill.
  *
  * Boot-args: sectouch=1 on (default off until it has run on a phone),
- * sectouchdelay=N start after N s, sectouchlog=1 log every event.
+ * sectouchdelay=N start after N s, sectouchlog=1 log every event,
+ * sectouchirq=0 poll instead of taking the attention interrupt.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -188,6 +189,52 @@ static bool
 st_irq_asserted(void)
 {
 	return !(st_rd(st.west, ST_GPIO_IO(ST_PIN_IRQ)) & 1u);
+}
+
+/*
+ * 0911: the attention line as an interrupt. TLMM GPIO 9 (level low) feeds the
+ * TLMM summary interrupt, GIC SPI 208 = INTID 240 (live DT pinctrl@f000000
+ * interrupts = <0 0xd0 4>). Per-pin INTR_CFG (+0x8): bit 0 enable, 1 polarity
+ * (0 = low), 3:2 detection (0 = level), 4 raw status, 7:5 target (3 = apps);
+ * INTR_STATUS (+0xc) bit 0, cleared by writing 0 (pinctrl-lito.c PINGROUP).
+ * The handler masks the pin and wakes the thread, which drains the events and
+ * unmasks it. If the line is seen low without an interrupt arriving (summary
+ * not delivered, e.g. routed elsewhere), or the summary storms for another
+ * pin, the driver goes back to 8 ms polling. sectouchirq=0 keeps polling.
+ */
+#define ST_IRQ_INTID            240u
+#define ST_INTR_CFG(n)          (ST_GPIO_CFG(n) + 0x8u)
+#define ST_INTR_STATUS(n)       (ST_GPIO_CFG(n) + 0xcu)
+#define ST_INTR_CFG_ON          ((3u << 5) | (1u << 4))        /* apps, raw status, level low; | 1 enables */
+extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
+extern void sweet_spi_mask(uint32_t intid, bool masked);
+static volatile bool st_irq_on;
+static volatile uint32_t st_irqs, st_irq_others;
+
+static void
+st_irq(__unused void *arg)
+{
+	if (st_rd(st.west, ST_INTR_STATUS(ST_PIN_IRQ)) & 1u) {
+		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON); /* masked until the thread has read */
+		st_wr(st.west, ST_INTR_STATUS(ST_PIN_IRQ), 0);
+		st_irqs++;
+		thread_wakeup(&st_sleep_chan);
+	} else if (++st_irq_others > 1000) {
+		sweet_spi_mask(ST_IRQ_INTID, true);     /* another pin holds the summary line */
+		st_irq_on = false;
+		thread_wakeup(&st_sleep_chan);
+	}
+}
+
+/* Unmask the attention interrupt and sleep until it fires or ms pass. */
+static void
+st_irq_wait(unsigned ms)
+{
+	uint64_t deadline;
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	(void)assert_wait_deadline(&st_sleep_chan, THREAD_UNINT, deadline);
+	st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON | 1u);  /* after assert_wait: no lost wakeup */
+	thread_block(THREAD_CONTINUE_NULL);
 }
 
 static bool
@@ -604,16 +651,25 @@ st_thread(void *arg, wait_result_t result)
 	if (!err) {
 		err = st_write(SEC_CMD_SENSE_ON, NULL, 0);
 	}
-	printf("SWEET SECTS: sense on err=%d; polling every 8 ms\n", err);
 	if (err) {
+		printf("SWEET SECTS: sense on err=%d\n", err);
 		goto out;
 	}
-	unsigned errors = 0, events = 0, ticks = 0;
+	int irq = 1;
+	(void)PE_parse_boot_argn("sectouchirq", &irq, sizeof(irq));
+	if (irq) {
+		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON);
+		st_wr(st.west, ST_INTR_STATUS(ST_PIN_IRQ), 0);
+		st_irq_on = sweet_spi_attach(ST_IRQ_INTID, false, st_irq, NULL);
+	}
+	printf("SWEET SECTS: sense on; %s\n", st_irq_on ? "interrupt (TLMM gpio9, INTID 240)" : "polling every 8 ms");
+	unsigned errors = 0, events = 0, ticks = 0, missed = 0;
+	uint32_t seen = 0;
 	while (!st.dead) {
 		uint8_t ev[8];
-		/* The IRQ line (level low) says events are queued; also read every
-		 * ~100 ms in case the line does not work as assumed. */
-		bool poll = (++ticks % 12u) == 0;
+		/* The IRQ line (level low) says events are queued; when polling also
+		 * read every ~100 ms in case the line does not work as assumed. */
+		bool poll = st_irq_on || (++ticks % 12u) == 0;
 		for (unsigned n = 0; n < 32 && (poll || st_irq_asserted()) && !st.dead; ++n) {
 			poll = false;
 			if (st_read(SEC_READ_ONE_EVENT, ev, sizeof(ev))) {
@@ -630,7 +686,29 @@ st_thread(void *arg, wait_result_t result)
 			}
 			st_handle(ev);
 		}
-		st_wait(8);
+		if (!st_irq_on) {
+			if (irq && st_irq_others > 1000 && st_irq_others < 2000) {
+				st_irq_others = 2000;
+				printf("SWEET SECTS: summary interrupt held by another pin (%u ours): polling\n", st_irqs);
+			}
+			st_wait(8);
+			continue;
+		}
+		seen = st_irqs;
+		st_irq_wait(500);
+		/* Timed out with the line low and no interrupt: it is not reaching us. */
+		if (st_irq_on && st_irqs == seen && st_irq_asserted() && ++missed >= 3) {
+			sweet_spi_mask(ST_IRQ_INTID, true);
+			st_irq_on = false;
+			printf("SWEET SECTS: attention low but no interrupt (%u taken): polling every 8 ms\n", st_irqs);
+		}
+		if (st_irqs != seen) {
+			missed = 0;
+		}
+	}
+	if (st_irq_on) {
+		sweet_spi_mask(ST_IRQ_INTID, true);
+		st_wr(st.west, ST_INTR_CFG(ST_PIN_IRQ), ST_INTR_CFG_ON);
 	}
 	st_release_all();
 out:

@@ -73,6 +73,82 @@ find_gicr_pe_base()
 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
 }
 
+#if defined(SWEET)
+/*
+ * Device interrupts (GIC SPIs, INTIDs 32..1019) for SWEET drivers, after
+ * HackiOS's gic_v3_spi_attach() (github.com/oosexgang/hackios-xnu-kernel,
+ * osfmk/arm64/gic_v3_irq.c, APSL 2.0): configured (edge/level), routed to
+ * the processor that attaches it, enabled; its handler runs in interrupt
+ * context (sleh_irq -> sweet_spi_dispatch) and must quiet the device
+ * before returning (the interrupt is ended after it).
+ */
+#define GICD_ISENABLER(n)       (0x0100 + 4 * (n))
+#define GICD_ICENABLER(n)       (0x0180 + 4 * (n))
+#define GICD_IPRIORITYR(n)      (0x0400 + (n))
+#define GICD_ICFGR(n)           (0x0C00 + 4 * (n))
+#define GICD_IROUTER(n)         (0x6000 + 8 * (n))
+#define SWEET_SPI_MAX           1020
+
+static struct {
+	void (*fn)(void *arg);
+	void *arg;
+} sweet_spi[SWEET_SPI_MAX];
+
+static void
+sweet_gicd_rwp(void)
+{
+	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+		;
+	}
+}
+
+bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
+void sweet_spi_mask(uint32_t intid, bool masked);
+bool sweet_spi_dispatch(uint32_t intid);
+
+bool
+sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg)
+{
+	if (intid < 32 || intid >= SWEET_SPI_MAX || fn == NULL || gicd_base == 0) {
+		return false;
+	}
+	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xFF00FFFFFFULL;   /* Aff3, Aff2.1.0 */
+	gicd_write32(GICD_ICENABLER(intid / 32), 1u << (intid % 32));
+	sweet_gicd_rwp();
+	sweet_spi[intid].arg = arg;
+	sweet_spi[intid].fn = fn;
+	__builtin_arm_dmb(DMB_ISH);
+	uint32_t cfg = gicd_read32(GICD_ICFGR(intid / 16)), bit = 2u << (2 * (intid % 16));
+	gicd_write32(GICD_ICFGR(intid / 16), edge ? (cfg | bit) : (cfg & ~bit));
+	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = 0xA0;
+	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = mpidr;
+	gicd_write32(GICD_ISENABLER(intid / 32), 1u << (intid % 32));
+	sweet_gicd_rwp();
+	kprintf("SWEET GIC: SPI intid %u (%s) attached, routed to MPIDR 0x%llx\n", intid, edge ? "edge" : "level", mpidr);
+	return true;
+}
+
+/* Masked: the line stays quiet at the GIC (a driver giving up on a storming interrupt). */
+void
+sweet_spi_mask(uint32_t intid, bool masked)
+{
+	if (intid >= 32 && intid < SWEET_SPI_MAX && gicd_base) {
+		gicd_write32(masked ? GICD_ICENABLER(intid / 32) : GICD_ISENABLER(intid / 32), 1u << (intid % 32));
+	}
+}
+
+/* From sleh_irq: false if nobody attached the INTID. */
+bool
+sweet_spi_dispatch(uint32_t intid)
+{
+	if (intid >= SWEET_SPI_MAX || sweet_spi[intid].fn == NULL) {
+		return false;
+	}
+	sweet_spi[intid].fn(sweet_spi[intid].arg);
+	return true;
+}
+#endif /* SWEET */
+
 void
 pe_init_fiq()
 {

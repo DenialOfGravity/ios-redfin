@@ -1847,6 +1847,10 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
 	__builtin_unreachable();
 }
 
+#if defined(SWEET)
+extern bool sweet_spi_dispatch(uint32_t intid);
+#endif
+
 void
 sleh_irq(arm_saved_state_t *state)
 {
@@ -1882,7 +1886,9 @@ sleh_irq(arm_saved_state_t *state)
 		cpu_signal_handler();
 	} else {
 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
-		if (cdp->interrupt_handler) {
+		if (sweet_spi_dispatch(intid)) {
+			/* a SWEET driver's device interrupt (pexpert/arm/pe_fiq.c) */
+		} else if (cdp->interrupt_handler) {
 			cdp->interrupt_handler(cdp->interrupt_target,
 			    cdp->interrupt_refCon,
 			    cdp->interrupt_nub,
