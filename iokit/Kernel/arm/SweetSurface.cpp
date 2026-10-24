@@ -328,6 +328,22 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 		return kIOReturnBadArgument;
 	}
+	/*
+	 * 0159: single-plane rows 64-byte aligned (boot-arg sweetsurfalign=N, 0 = as asked). Core Animation
+	 * asks 16/32-byte aligned rows (5088 for 1271 BGRA pixels, 96 for 96 A8 ones); Turnip makes linear
+	 * images only at 64-byte pitches, so the Metal bridge copied each such layer into an image of its own
+	 * every frame (6.6 ms of backboardd's ~12 ms frame). Creators read the rows back with
+	 * IOSurfaceGetBytesPerRow.
+	 */
+	static uint32_t row_align = 0xffffffffu;
+	if (row_align == 0xffffffffu) {
+		uint32_t v = 64;
+		PE_parse_boot_argn("sweetsurfalign", &v, sizeof(v));
+		row_align = (v & (v - 1)) == 0 ? v : 0;
+	}
+	if (row_align > 1 && (one_plane || props->getObject("IOSurfacePlaneInfo") == NULL)) {
+		s->bytesPerRow = (s->bytesPerRow + row_align - 1) & ~(row_align - 1);
+	}
 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 
 	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
