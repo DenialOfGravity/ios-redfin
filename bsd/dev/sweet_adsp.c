@@ -1448,53 +1448,57 @@ step_header(void)
 
 static bool image_written;
 
-static uint64_t
+static uint32_t
 segment_word(unsigned s, uint32_t at)
 {
-	uint64_t word = 0;
+	uint32_t word = 0;
 
-	for (unsigned b = 0; b < 8 && at + b < image.segment[s].file_size; b++) {
-		word |= (uint64_t)image.segment[s].file[at + b] << (8 * b);
+	for (unsigned b = 0; b < 4 && at + b < image.segment[s].file_size; b++) {
+		word |= (uint32_t)image.segment[s].file[at + b] << (8 * b);
 	}
 	return word;
 }
 
+/*
+ * redfin: in four-byte words (HackiOS wrote eight): lito's adsp image has segments that begin or end
+ * at a multiple of four only (e.g. 0x89bb5000, 0x94 bytes, then 0x89bb5094).
+ */
 static bool
 step_image(void)
 {
-	volatile uint64_t *dsp_memory;
+	volatile uint32_t *dsp_memory;
 	uint64_t written = 0, cleared = 0, wrong = 0;
 
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
+	announce("put the image's segments into the audio DSP's memory (0x89200000, 40 MB: memory of nobody's until TrustZone "
 	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
-	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
+	dsp_memory = (volatile uint32_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
 	for (unsigned s = 0; s < image.segments; s++) {
-		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
+		volatile uint32_t *to = dsp_memory + image.segment[s].at / 4;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		if ((image.segment[s].at | image.segment[s].memory_size) & 3) {
+			printf("adsp: %u: a segment that does not begin and end at a multiple of four bytes: not written\n", step);
 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 			return false;
 		}
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			to[i / 8] = segment_word(s, i);
+		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 4) {
+			to[i / 4] = segment_word(s, i);
 		}
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
 	}
 	settle();
 	for (unsigned s = 0; s < image.segments; s++) {
-		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
+		volatile uint32_t *from = dsp_memory + image.segment[s].at / 4;
 
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			wrong += from[i / 8] != segment_word(s, i);
+		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 4) {
+			wrong += from[i / 4] != segment_word(s, i);
 		}
 	}
-	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step,
+	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu words of four bytes differ\n", step,
 	    image.segments, written, cleared, wrong);
 	settle();
 	ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
