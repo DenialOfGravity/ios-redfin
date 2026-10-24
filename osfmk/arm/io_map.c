@@ -62,7 +62,11 @@
 
 extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
 
-#define IO_MAP_SIZE            (8ul << 20)
+/*
+ * SWEET (0920): 32 MiB, as on x86. The SWEET drivers map their blocks with ml_io_map() and never unmap;
+ * on redfin the 8 MiB ran out once a driver mapped ~600 KB more (KMA_NOFAIL: a panic, r16a-r16e).
+ */
+#define IO_MAP_SIZE            (32ul << 20)
 
 __startup_data static struct mach_vm_range io_range;
 static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
