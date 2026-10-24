@@ -332,6 +332,10 @@ sweet_gpu_init(void)
 	a6_init_state(&gpu, ptoa_64(pn));
 	uint32_t lvl = 4;	/* boot-arg sweetgpufreq=1 (180) .. 5 (565); A618 also 6 (650), 7 (800), 8 (825) */
 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
+	{
+		extern int a6_submit_wfi;
+		PE_parse_boot_argn("sweetwfi", &a6_submit_wfi, sizeof(a6_submit_wfi));
+	}
 	gpu.perf_level = lvl;
 	pool_kva = va;
 	vm_offset_t pva = 0;

@@ -14,6 +14,8 @@
 #endif
 #include "sweet_a6xx.h"
 
+int a6_submit_wfi;	/* 0157: CP_WAIT_FOR_IDLE after each client submit (boot-arg sweetwfi) */
+
 #define rd32		a6_rd
 #define wr32		a6_wr
 
@@ -925,7 +927,10 @@ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint3
 		dw[n++] = (uint32_t)(iova[i] >> 32);
 		dw[n++] = dwords[i] & 0xfffff;
 	}
-	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
+	/* 0157: no wait-for-idle between client submits (sweetwfi=1 brings it back): CACHE_FLUSH_TS below
+	 * lands only once the work before it is done, and the CP may start the next submit meanwhile */
+	if (a6_submit_wfi)
+		dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
 	dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
 	dw[n++] = 0x980 | 2u << 18;
 	dw[n++] = (uint32_t)(ts + 8);
