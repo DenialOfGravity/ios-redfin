@@ -455,11 +455,24 @@ gpu_note_submit_locked(void)
 static bool
 gpu_hung_locked(uint32_t hang_ms)
 {
+	/*
+	 * 0152: a hang is no progress at all, not just no fence: a long client IB (WebKit) keeps the CP moving
+	 * (ring rptr, IB1 base and dwords left, IB2 left change) with the fence still behind. Those count as
+	 * progress; and never less than sweetgpuhang ms (default 2000).
+	 */
+	static uint32_t sig[4];
+	static uint32_t min_ms;
+	if (!min_ms && !PE_parse_boot_argn("sweetgpuhang", &min_ms, sizeof(min_ms)))
+		min_ms = 2000;
+	if (hang_ms < min_ms)
+		hang_ms = min_ms;
+	uint32_t now_sig[4] = { a6_rd(A6_GREG(0x806)), a6_rd(A6_GREG(0x928)), a6_rd(A6_GREG(0x92a)), a6_rd(A6_GREG(0x92d)) };
 	uint32_t done = a6_fence_read(&gpu);
 	uint64_t now = mach_absolute_time(), ns;
-	if (done != progress_fence || (int32_t)(gpu.fence - done) <= 0) {
+	if (done != progress_fence || (int32_t)(gpu.fence - done) <= 0 || memcmp(sig, now_sig, sizeof(sig))) {
 		progress_fence = done;
 		progress_abs = now;
+		memcpy(sig, now_sig, sizeof(sig));
 		return false;
 	}
 	absolutetime_to_nanoseconds(now - progress_abs, &ns);

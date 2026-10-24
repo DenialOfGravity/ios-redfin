@@ -1159,6 +1159,25 @@ int a6_recover(struct a6_gpu *g)
 	(void)a6_clear_fault(g);
 	int rc = gpu_cp_init(g, true);
 	a6_log("recover: soft reset + CP init -> %d\n", rc);
+	if (rc == 0)
+		return 0;
+	/*
+	 * 0152: kgsl a6xx_halt_gbif before a reset: stop new GBIF transactions (GBIF_HALT, ack in GBIF_HALT_ACK),
+	 * then the RBBM side, so the reset does not land mid-transaction; then reset and CP init again (it
+	 * clears both halts).
+	 */
+	wr32(GREG(0x3c45), 0x3);		/* GBIF_HALT: client + arbiter */
+	(void)wait_bit(GREG(0x3c46), 0x3, 1, 100);
+	wr32(GREG(0x16), 1);			/* RBBM_GBIF_HALT */
+	(void)wait_bit(GREG(0x17), 1, 1, 100);	/* RBBM_GBIF_HALT_ACK */
+	wr32(GREG(0x43), 1);
+	(void)rd32(GREG(0x43));
+	a6_delay_us(100);
+	wr32(GREG(0x43), 0);
+	a6_delay_ms(10);
+	(void)a6_clear_fault(g);
+	rc = gpu_cp_init(g, true);
+	a6_log("recover: GBIF halt + soft reset + CP init -> %d\n", rc);
 	return rc;
 }
 
