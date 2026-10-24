@@ -246,8 +246,19 @@ hap_clocks(void)
 			return false;
 		}
 	}
+	/*
+	 * 0909: s_ahb (0x18008) is hardware clock gated (gcc-lito hwcg_reg 0x18008, HW_CTL bit 1 set): its
+	 * CLK_OFF reads 1 while idle (r9: 0x80000002), so only the other branches must report running.
+	 */
+	uint32_t sahb = hap_rd(hp.gcc, 0x18008);
+	if (sahb & 2u) {
+		printf("SWEET HAPTIC: s_ahb %#x is hardware gated: not checked\n", sahb);
+	}
 	static const uint32_t branches[] = { 0x18004, 0x18008, 0x23138, 0x23140, 0x1839c };
 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+		if (branches[i] == 0x18008 && (sahb & 2u)) {
+			continue;
+		}
 		if (!hap_wait_clear(hp.gcc, branches[i], 1u << 31)) {
 			printf("SWEET HAPTIC: GCC branch %#x halted (%#x)\n", branches[i], hap_rd(hp.gcc, branches[i]));
 			return false;
