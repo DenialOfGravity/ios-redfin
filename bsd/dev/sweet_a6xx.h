@@ -48,11 +48,34 @@
 #define A6_RING_SIZE		0x8000u
 #define A6_RING_DW		(A6_RING_SIZE / 4)
 
+/*
+ * Which Adreno this kernel drives: 640 (flame, SM8150), 618 (sunfish, SM7150, legacy GMU) or
+ * 620 (redfin, SM7250 lito: A650-family GMU and register spec, HFI v2, 512 KB GMEM).
+ */
+#ifndef A6_GPU_ID
+#define A6_GPU_ID		620	/* redfin (sunfish: 618, flame: 640) */
+#endif
+
+#if A6_GPU_ID == 620
+#define A6_FB_PA		0xa0000000ull	/* redfin cont_splash_region (0x2300000 long) */
+/*
+ * 0904: two panel buffers for the GPU present (sweetfbflip=1): the front one ABL scans out, the back
+ * one A6_FB_BUF_OFF above it, both inside the splash region. Mapped for the GPU: 10 x 2 MB.
+ */
+#define A6_FB_SIZE		0x1400000ull
+#define A6_FB_BUF_OFF		0xa00000ull
+#define A6_CHIP_ID		0x06020000ull	/* redfin live DT qcom,chipid */
+#elif A6_GPU_ID == 618
 #define A6_FB_PA		0x9c000000ull
 #define A6_FB_SIZE		0xa00000ull	/* mapped for the GPU: 5 x 2 MB */
-
-#define A6_GPU_ID		618	/* sunfish (flame: 640) */
+#define A6_FB_BUF_OFF		0ull		/* one panel buffer */
 #define A6_CHIP_ID		0x06010800ull	/* sunfish DT qcom,chipid */
+#else
+#define A6_FB_PA		0x9c400000ull
+#define A6_FB_SIZE		0xa00000ull
+#define A6_FB_BUF_OFF		0ull
+#define A6_CHIP_ID		0x06040001ull
+#endif
 
 struct a6_gpu {
 	uint64_t pool_pa;
@@ -157,10 +180,20 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
 #define A6_CP_MEMCPY		0x75
 
 /* Register/state access for status and dumps */
+#if A6_GPU_ID == 620
+#define A6_GPU_BASE		0x03d00000ull	/* redfin kgsl-3d0 */
+#define A6_GPUCC		0x03d90000ull	/* gpucc-lito */
+#define A6_SMMU			0x03da0000ull	/* redfin kgsl-smmu (CB5-7 belong to the hypervisor) */
+#elif A6_GPU_ID == 618
 #define A6_GPU_BASE		0x05000000ull	/* sunfish kgsl-3d0 (flame 0x02c00000) */
-#define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
 #define A6_GPUCC		0x05090000ull	/* gpucc-sdmmagpie */
 #define A6_SMMU			0x05040000ull	/* sunfish kgsl-iommu */
+#else
+#define A6_GPU_BASE		0x02c00000ull
+#define A6_GPUCC		0x02c90000ull
+#define A6_SMMU			0x02ca0000ull
+#endif
+#define A6_GREG(o)		(A6_GPU_BASE + 4ull * (o))
 #define A6_SMMU_CB(n)		(A6_SMMU + 0x8000 + 0x1000ull * (n))
 #define A6_FSR_FAULT		0xc00001feu
 #define A6_GMEM_LOG_OFF		0x91000ull

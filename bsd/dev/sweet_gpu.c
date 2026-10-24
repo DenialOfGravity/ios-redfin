@@ -45,7 +45,7 @@ extern int vprintf(const char *fmt, va_list ap);
 extern void sweet_smc(uint64_t x[8]);
 
 void sweet_gpu_init(void);
-#define GPU_TRAIL_PA	0xE2000000ull	/* sunfish: low RAM outside XNU (a6_log mirror) */
+#define GPU_TRAIL_PA	0xE2000000ull	/* sunfish/redfin: low RAM outside XNU (a6_log mirror; the GPU pool skips it) */
 #define GPU_TRAIL_SIZE	0x10000u
 bool sweet_gpu_ready(void);
 int sweet_gpu_surface_slot(uint64_t key);
@@ -330,7 +330,11 @@ sweet_gpu_init(void)
 	}
 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
 	a6_init_state(&gpu, ptoa_64(pn));
+#if A6_GPU_ID == 620
+	uint32_t lvl = 3;	/* redfin: sweetgpufreq=1 (275), 2 (400), 3 (500), 4 (625) */
+#else
 	uint32_t lvl = 4;	/* boot-arg sweetgpufreq=1 (180) .. 5 (565); A618 also 6 (650), 7 (800), 8 (825) */
+#endif
 	PE_parse_boot_argn("sweetgpufreq", &lvl, sizeof(lvl));
 	{
 		extern int a6_submit_wfi;
@@ -976,8 +980,19 @@ sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, ui
 #define GPOOL_UNIT      0x4000ULL
 #define GPOOL_FREE_MAX  4096
 static const struct { uint64_t pa, size; } gpool_ranges[] = {
+#if A6_GPU_ID == 620
+	/*
+	 * redfin (0904): the same HLOS RAM (live DT memory 0xc0000000 + 3 GB, XNU from 4 GB), minus
+	 * kregistry_mem 0xc8000000 + 64 KB (no-map in the DT), wland's rmtfs buffer 0xe1001000-0xe1281000
+	 * and the GPU log trail / GMU dump area at 0xe2000000 (GPU_TRAIL_PA, 0xe2010000).
+	 */
+	{ 0xc4000000ULL, 0x04000000ULL },       /* 64 MB, up to kregistry */
+	{ 0xc8400000ULL, 0x17c00000ULL },       /* 380 MB */
+	{ 0xe2400000ULL, 0x1dc00000ULL },       /* 476 MB */
+#else
 	{ 0xc4000000ULL, 0x1c000000ULL },       /* 448 MB (the first 64 MB left to ABL's ramdisk) */
 	{ 0xe1400000ULL, 0x1ec00000ULL },       /* 492 MB; 0xe1000000-0xe1400000 is wland's rmtfs buffer (hyp-assigned to the modem) */
+#endif
 };
 static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
 static uint32_t gpool_nfree;
