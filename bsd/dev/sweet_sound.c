@@ -54,7 +54,8 @@
  * sndgpio=1 (sweet_cs35l41.c: let the kernel drive the amplifiers' PMIC reset lines).
  * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000),
  * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20, sound=4 than 0), `a off` (the
- * amplifiers off and kept off), `a on` (allowed again).
+ * amplifiers off and kept off), `a on` (allowed again), `a mic SECS` (0955, bsd/dev/sweet_mic.c: record SECS
+ * seconds from the microphone, mic=1, and print the `files read /dev/pmem PA LEN` that fetches it).
  *
  * Log lines: "SWEET SOUND: ...". What is started is stopped before the DSP is shut down
  * (redwood_sound_dsp_down() from sweet_adsp.c's redwood_adsp_stop()).
@@ -100,6 +101,9 @@ extern bool sweet_amp_healthy(void);
 extern void sweet_amp_stop(void);
 extern bool sweet_amp_ready(void);
 extern void sweet_amp_status(void);
+/* bsd/dev/sweet_mic.c */
+extern int sweet_mic_cmd(uint32_t seconds);
+extern void sweet_mic_status(void);
 
 static void
 sleep_ms(uint32_t ms)
@@ -1328,6 +1332,7 @@ sweet_sound_cmd(const char *s, const char *end)
 		if (level >= 3) {
 			sweet_amp_status();
 		}
+		sweet_mic_status();
 		return 0;
 	}
 	if (is(w, len, "tone")) {
@@ -1360,12 +1365,15 @@ sweet_sound_cmd(const char *s, const char *end)
 		SAY("off: the amplifiers are stopped and kept off (`a on' allows them again)\n");
 		return 0;
 	}
+	if (is(w, len, "mic")) {
+		return sweet_mic_cmd(number(&s, end, 3));
+	}
 	if (is(w, len, "on")) {
 		amps_held_off = false;
 		SAY("on: the amplifiers may run again\n");
 		return 0;
 	}
-	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on)\n");
+	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on, mic SECS)\n");
 	return -1;
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */
