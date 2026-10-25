@@ -115,6 +115,8 @@ bsd/dev/sweet_torch.c			standard
 bsd/dev/sweet_cam.c			standard
 bsd/dev/sweet_audio.c			standard
 bsd/dev/sweet_sound.c			standard
+bsd/dev/sweet_cs35l41.c			standard
+bsd/dev/sweet_guard.c			standard
 bsd/dev/sweet_adsp.c			standard
 bsd/dev/sweet_cpufreq.c			standard
 bsd/dev/sweet_poke.c			standard

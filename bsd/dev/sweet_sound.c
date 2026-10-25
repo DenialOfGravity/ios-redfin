@@ -40,8 +40,16 @@
  *            sndsecs (default 3) seconds, then everything taken back
  *   sound=2  ... and the stream: a 1 kHz tone at -30 dBFS for one second into the DSP, the amplifiers
  *            OFF; the path then stays up feeding silence (poke `a tone MS` plays the tone again)
- * Boot-args: sndsecs=S (sound=1 hold), sndlpi=0 (leave the LPI pins alone: no clock at the amps).
- * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000).
+ *   sound=3  ... and the amplifiers (0953, bsd/dev/sweet_cs35l41.c): probed and configured, powered
+ *            down; HackiOS's speaker guard (bsd/dev/sweet_guard.c) armed at their level first; the tone
+ *            AUDIBLE for a second at sndbelow (default and loudest for sound=3: 20 dB under Android's
+ *            level); the amplifiers run only while something plays and stop after 2 s of silence
+ * Boot-args: sndsecs=S (sound=1 hold), sndlpi=0 (leave the LPI pins alone: no clock at the amps),
+ * sndbelow=E (eighths of a dB under Android's level, sound>=3), sndgpio=1 (sweet_cs35l41.c: let the
+ * kernel drive the amplifiers' PMIC reset lines).
+ * poke (bsd/dev/sweet_poke.c, letter a): `a status`, `a tone [MS]` (default 1000, at most 5000),
+ * `a gain DB` (the amplifiers DB dB under Android's level; sound=3 no louder than 20), `a off` (the
+ * amplifiers off and kept off), `a on` (allowed again).
  *
  * Log lines: "SWEET SOUND: ...". What is started is stopped before the DSP is shut down
  * (redwood_sound_dsp_down() from sweet_adsp.c's redwood_adsp_stop()).
@@ -75,6 +83,17 @@ static LCK_GRP_DECLARE(sound_lock_group, "sweet-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
 
 static uint32_t level, hold_secs = 3, use_lpi = 1;
+static uint32_t below = 160;            /* the amplifiers' level, eighths of a dB under Android's (sndbelow) */
+static uint32_t below_min = 160;        /* the loudest allowed: sound=3 20 dB under */
+
+/* bsd/dev/sweet_cs35l41.c */
+extern bool sweet_amp_prepare(void);
+extern bool sweet_amp_start(void);
+extern bool sweet_amp_volume(uint32_t below);
+extern bool sweet_amp_healthy(void);
+extern void sweet_amp_stop(void);
+extern bool sweet_amp_ready(void);
+extern void sweet_amp_status(void);
 
 static void
 sleep_ms(uint32_t ms)
@@ -790,6 +809,7 @@ static uint32_t tone_at;
 static volatile uint64_t tone_until_us;          /* the tone plays until then */
 static volatile bool stopping, feeder_runs;
 static uint64_t sent_periods, failed_sends, tone_periods, silent_periods;
+static uint32_t guard_periods;
 
 static void
 period_fill(unsigned period)
@@ -807,6 +827,11 @@ period_fill(unsigned period)
 		tone_periods++;
 	} else {
 		silent_periods++;
+	}
+	if (level >= 3) {
+		/* every period, silence too: its filter and its averages go on (sweet_guard.c) */
+		redwood_guard_process(samples, PERIOD_FRAMES);
+		guard_periods++;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");       /* (write-combining: out to memory before the DSP is told) */
 }
@@ -883,10 +908,115 @@ tone_for(uint32_t ms)
 	uint32_t done = written_done;
 
 	tone_until_us = now_us() + 1000ull * ms;
-	SAY("tone: 1 kHz at -30 dBFS for %u ms into the DSP (amplifiers off: nothing to hear)\n", ms);
+	SAY("tone: 1 kHz at -30 dBFS for %u ms into the DSP%s\n", ms, level >= 3 && sweet_amp_ready() ?
+	    " (AUDIBLE: the amplifiers follow)" : " (amplifiers off: nothing to hear)");
 	sleep_ms(ms + 200);
 	SAY("tone over: %u periods came back meanwhile (%u errors, %u underflows): the DSP took %u frames/s\n", written_done - done,
 	    write_errors, underflows, (written_done - done) * PERIOD_FRAMES * 1000 / (ms + 200));
+}
+
+/* ---- the amplifiers: on while something plays, off after 2 s of silence ------------------------------------------ */
+
+#define QUIET_BEFORE_OFF_US     2000000ull
+
+static volatile bool amps_on, amps_held_off, amps_given_up, watcher_runs;
+static volatile uint32_t below_wanted;          /* set by poke `a gain`; applied by the watcher */
+static uint32_t amp_starts;
+
+static const char *
+db(char *text, uint32_t eighths)
+{
+	snprintf(text, 16, "%u.%03u", eighths / 8, eighths % 8 * 125);
+	return text;
+}
+
+static void
+guard_say(const char *when)
+{
+	struct redwood_guard_report r;
+
+	redwood_guard_take_report(&r);
+	if (r.blocks == 0) {
+		return;
+	}
+	SAY("guard %s: %u blocks, peaks in %u out %u; held down by the 0.2 s/3 s/60 s averages in %u/%u/%u; %u frames "
+	    "limited; gain now %d/10 dB (least %d/10)\n", when, r.blocks, r.peak_in, r.peak_out, r.rms_blocks, r.fast_blocks,
+	    r.slow_blocks, r.limited_frames, redwood_guard_decibels(r.gain * r.gain >> 30),
+	    redwood_guard_decibels(r.least_gain * r.least_gain >> 30));
+}
+
+static void
+amps_off(const char *why)
+{
+	char t[16];
+
+	if (!amps_on) {
+		return;
+	}
+	(void)sweet_amp_volume(0xffffffffu);
+	sweet_amp_stop();
+	amps_on = false;
+	SAY("amplifiers OFF (%s); they were at %s dB under Android's level\n", why, db(t, below));
+	guard_say("while they were on");
+}
+
+/* sound >= 3, on the sound thread until the run ends */
+static void
+watch(void)
+{
+	uint64_t last_look = 0;
+	char t[16];
+
+	watcher_runs = true;
+	while (!stopping) {
+		uint64_t now = now_us(), until = tone_until_us;
+		bool wanted = now < until + QUIET_BEFORE_OFF_US && until != 0;
+
+		if (below_wanted != below) {
+			below = below_wanted;
+			redwood_guard_attenuation(below);
+			if (amps_on) {
+				(void)sweet_amp_volume(below);
+			}
+			SAY("amplifiers' level: %s dB under Android's\n", db(t, below));
+		}
+		if (wanted && !amps_on && !amps_held_off && !amps_given_up && sweet_amp_ready()) {
+			/* the guard is armed at the level they will play at before they are started */
+			redwood_guard_attenuation(below);
+			guard_say("(silence before)");
+			if (!sweet_amp_start()) {
+				SAY("THE AMPLIFIERS DID NOT START: given up\n");
+				amps_given_up = true;
+				sweet_amp_stop();
+			} else {
+				amps_on = true;
+				amp_starts++;
+				/* faded in from 30 dB further down, 6 dB a step */
+				for (uint32_t extra = 240; extra > 0; extra -= 48) {
+					(void)sweet_amp_volume(below + extra);
+					sleep_ms(8);
+				}
+				(void)sweet_amp_volume(below);
+				last_look = now_us();
+				SAY("amplifiers ON at %s dB under Android's level (start %u)\n", db(t, below), amp_starts);
+			}
+		} else if (amps_on && (!wanted || amps_held_off)) {
+			amps_off(amps_held_off ? "poke a off" : "2 s of silence");
+		} else if (amps_on && now - last_look >= 200000) {
+			last_look = now;
+			if (!sweet_amp_healthy()) {
+				amps_on = false;
+				amps_given_up = true;
+				SAY("an amplifier reported an error: given up for this boot\n");
+			} else if (guard_periods >= 250) {
+				guard_periods = 0;
+				guard_say("(5 s)");
+			}
+		}
+		sleep_ms(10);
+	}
+	amps_off("the run ends");
+	watcher_runs = false;
 }
 
 /* ---- the whole ------------------------------------------------------------------------------------------------ */
@@ -898,12 +1028,16 @@ take_down(void)
 {
 	stopping = true;
 	thread_wakeup(&feeder_wake);
-	for (unsigned ms = 0; ms < 2000 && feeder_runs; ms++) {
+	for (unsigned ms = 0; ms < 2000 && (feeder_runs || watcher_runs); ms++) {
 		sleep_ms(1);
 	}
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
+		if (amps_on) {
+			sweet_amp_stop();
+			amps_on = false;
+		}
 		stream_off();
 		afe_off();
 		pins_off();
@@ -918,14 +1052,22 @@ take_down(void)
 }
 
 static void
+watcher_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	watch();
+	thread_terminate(current_thread());
+}
+
+static void
 sound_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	bool ok = false;
 	thread_t feeder;
 
 	lck_mtx_lock(&sound_lock);
-	SAY("sound=%u: %s\n", level, level == 1 ? "votes, LPI pins, QUIN TDM clock/group/port only" :
-	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF");
+	SAY("sound=%u: %s\n", level, level == 1 ? "votes, LPI pins, QUIN TDM clock/group/port only" : level == 2 ?
+	    "the port and a stream with a -30 dBFS test tone, amplifiers OFF" :
+	    "the port, a stream, the guard and the amplifiers: the test tone AUDIBLE");
 	if (!vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO") || !vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC")) {
 		SAY("the LPASS votes were not granted\n");
 	}
@@ -956,8 +1098,32 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	thread_deallocate(feeder);
 	path_up = true;
+	if (level >= 3) {
+		char t[16];
+
+		/* the guard first, at the amplifiers' level; then the amplifiers, powered down (sweet_cs35l41.c) */
+		redwood_guard_configure(true, 0);
+		redwood_guard_attenuation(below);
+		below_wanted = below;
+		SAY("guard armed: high-pass 200 Hz, no gain, limits reckoned at %s dB under Android's level\n", db(t, below));
+		if (!sweet_amp_prepare()) {
+			SAY("no amplifier: the tone goes into the DSP unheard\n");
+		}
+	}
 	lck_mtx_unlock(&sound_lock);
 	SAY("PATH UP: QUIN_TDM_RX_0 0x9040, COPP %u, ASM session 1 running; poke `a tone MS` plays the test tone\n", copp);
+	if (level >= 3) {
+		thread_t watcher;
+
+		tone_until_us = now_us() + 300000ull + 1000000ull;      /* (the amplifiers come up meanwhile) */
+		if (kernel_thread_start(watcher_thread, NULL, &watcher) == KERN_SUCCESS) {
+			thread_deallocate(watcher);
+		}
+		sleep_ms(1500);
+		smmu_faults("after the tone");
+		SAY("sound=%u: LEVEL DONE (the path stays up; the amplifiers follow what plays)\n", level);
+		thread_terminate(current_thread());
+	}
 	tone_for(1000);
 	smmu_faults("after the tone");
 	SAY("sound=%u: LEVEL DONE (the path stays up feeding silence)\n", level);
@@ -977,11 +1143,13 @@ redwood_sound_dsp_up(void)
 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 2) {
-		SAY("sound=%u: this kernel knows levels 1-2; doing 2\n", level);
-		level = 2;
+	if (level > 3) {
+		SAY("sound=%u: this kernel knows levels 1-3; doing 3\n", level);
+		level = 3;
 	}
 	PE_parse_boot_argn("sndsecs", &hold_secs, sizeof(hold_secs));
+	PE_parse_boot_argn("sndbelow", &below, sizeof(below));
+	below = below < below_min ? below_min : below;
 	PE_parse_boot_argn("sndlpi", &use_lpi, sizeof(use_lpi));
 	running = true;
 	if (kernel_thread_start(sound_thread, NULL, &thread) != KERN_SUCCESS) {
@@ -1057,10 +1225,14 @@ sweet_sound_cmd(const char *s, const char *end)
 
 	if (len == 0 || is(w, len, "status")) {
 		SAY("status: sound=%u path %s, votes %d/%d, pins %s, port %s, stream %s; %llu periods sent, %u done (%u errors), "
-		    "%u underflows\n", level, path_up ? "UP" : "down", voted[LPASS_HW_MACRO_BLOCK], voted[LPASS_HW_DCODEC_BLOCK],
-		    pins_taken ? "taken" : "-", port_on ? "on" : "off", stream_runs ? "running" : "-", sent_periods, written_done,
-		    write_errors, underflows);
+		    "%u underflows; amplifiers %s%s%s, %u starts\n", level, path_up ? "UP" : "down", voted[LPASS_HW_MACRO_BLOCK],
+		    voted[LPASS_HW_DCODEC_BLOCK], pins_taken ? "taken" : "-", port_on ? "on" : "off", stream_runs ? "running" : "-",
+		    sent_periods, written_done, write_errors, underflows, amps_on ? "ON" : "off", amps_held_off ? " (held off)" : "",
+		    amps_given_up ? " (GIVEN UP)" : "", amp_starts);
 		smmu_faults("(status)");
+		if (level >= 3) {
+			sweet_amp_status();
+		}
 		return 0;
 	}
 	if (is(w, len, "tone")) {
@@ -1072,10 +1244,33 @@ sweet_sound_cmd(const char *s, const char *end)
 		}
 		ms = ms > 5000 ? 5000 : ms;
 		tone_until_us = now_us() + 1000ull * ms;
-		SAY("tone: 1 kHz -30 dBFS for %u ms (amplifiers off)\n", ms);
+		SAY("tone: 1 kHz -30 dBFS for %u ms%s\n", ms, level >= 3 && !amps_held_off && !amps_given_up && sweet_amp_ready() ?
+		    " (AUDIBLE)" : " (amplifiers off)");
 		return 0;
 	}
-	SAY("poke a: unknown command (status, tone [MS])\n");
+	if (is(w, len, "gain")) {
+		uint32_t dbs = number(&s, end, ~0u);
+		char t[16];
+
+		if (dbs == ~0u || level < 3) {
+			SAY("gain: `a gain DB' (DB dB under Android's level) needs sound>=3\n");
+			return -1;
+		}
+		below_wanted = dbs * 8 < below_min ? below_min : dbs * 8 > 816 ? 816 : dbs * 8;
+		SAY("gain: the amplifiers %s dB under Android's level from now on\n", db(t, below_wanted));
+		return 0;
+	}
+	if (is(w, len, "off")) {
+		amps_held_off = true;
+		SAY("off: the amplifiers are stopped and kept off (`a on' allows them again)\n");
+		return 0;
+	}
+	if (is(w, len, "on")) {
+		amps_held_off = false;
+		SAY("on: the amplifiers may run again\n");
+		return 0;
+	}
+	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on)\n");
 	return -1;
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */
