@@ -56,6 +56,8 @@
 #include <mach/vm_types.h>
 
 #include <kern/thread.h>
+#include <pexpert/pexpert.h>
+#include <sys/proc.h>
 
 struct kctl {
 	TAILQ_ENTRY(kctl)       next;           /* controller chain */
@@ -1418,6 +1420,43 @@ out:
 	return error;
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * redfin 0980, boot-arg sweetbtlog=1: what iOS's Bluetooth daemons look for. Every kernel-control name
+ * asked for with CTLIOCGINFO (BlueTool historically opened com.apple.uart.bluetooth this way), every
+ * failing open() of a /dev node named bt..., uart..., cu.... or containing "bluetooth"
+ * (bsd/vfs/vfs_syscalls.c), and the
+ * IOKit trace (IOUserClient.cpp sweet_iolog) extended to bluetoothd, BlueTool, wirelessproxd,
+ * bluetoothuserd and BTLEServer. "SWEET BTLOG:" lines, at most 300 of each kind per boot.
+ */
+int sweet_btlog_on(void);
+
+int
+sweet_btlog_on(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		int v = 0;
+		on = PE_parse_boot_argn("sweetbtlog", &v, sizeof(v)) && v;
+	}
+	return on;
+}
+
+static void
+sweet_btlog_kctl(const char *name, int found)
+{
+	static uint32_t lines;
+	if (!sweet_btlog_on() || lines >= 300) {
+		return;
+	}
+	lines++;
+	char pname[32];
+	proc_selfname(pname, sizeof(pname));
+	printf("SWEET BTLOG: kctl CTLIOCGINFO \"%.96s\" by %s[%d] -> %s\n", name, pname, proc_selfpid(),
+	    found ? "found" : "ENOENT");
+}
+#endif
+
 static int
 ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
     struct ifnet *ifp, struct proc *p)
@@ -1455,6 +1494,9 @@ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
 		lck_mtx_lock(&ctl_mtx);
 		kctl = ctl_find_by_name(ctl_info.ctl_name);
 		lck_mtx_unlock(&ctl_mtx);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+		sweet_btlog_kctl(ctl_info.ctl_name, kctl != 0);
+#endif
 		if (kctl == 0) {
 			error = ENOENT;
 			break;

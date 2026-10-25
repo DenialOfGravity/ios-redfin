@@ -5030,6 +5030,35 @@ open_dprotected_np(__unused proc_t p, struct open_dprotected_np_args *uap, int32
 	           uap->class, uap->dpflags, AT_FDCWD, AUTH_OPEN_NOAUTHFD, UIO_USERSPACE, retval);
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/* redfin 0980 (sweetbtlog=1, bsd/kern/kern_control.c): failing opens of Bluetooth-looking device nodes */
+extern int sweet_btlog_on(void);
+
+static void
+sweet_btlog_open(user_addr_t upath, int error)
+{
+	static uint32_t lines;
+	char p[96];
+	size_t len = 0;
+	if (!sweet_btlog_on() || lines >= 300 || copyinstr(upath, p, sizeof(p), &len) || strncmp(p, "/dev/", 5)) {
+		return;
+	}
+	const char *n = p + 5;
+	bool bt = !strncmp(n, "bt", 2) || !strncmp(n, "uart", 4) || !strncmp(n, "cu.", 3);
+	for (const char *q = n; !bt && *q; q++) {
+		bt = !strncmp(q, "bluetooth", 9);
+	}
+	if (!bt) {
+		return;
+	}
+	lines++;
+	char pname[32];
+	proc_selfname(pname, sizeof(pname));
+	printf("SWEET BTLOG: open %s by %s[%d] -> %s (%d)\n", p, pname, proc_selfpid(),
+	    error == ENOENT ? "ENOENT" : "error", error);
+}
+#endif
+
 static int
 openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
     int fd, enum uio_seg segflg, int *retval)
@@ -5060,6 +5089,11 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
 
 	kfree_type(typeof(*__open_data), __open_data);
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	if (error && segflg == UIO_USERSPACE) {
+		sweet_btlog_open(path, error);
+	}
+#endif
 	return error;
 }
 

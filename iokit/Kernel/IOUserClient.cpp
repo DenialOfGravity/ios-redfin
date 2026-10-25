@@ -2610,17 +2610,23 @@ static
 static char sweet_iolog_names[128];
 static int sweet_iolog_parsed;
 static uint32_t sweet_iolog_lines;
+/* redfin 0980: sweetbtlog=1 traces the Bluetooth daemons (instead of the default pair), up to 1000 lines */
+extern "C" int sweet_btlog_on(void);
+#define SWEET_BT_PROCS "bluetoothd,BlueTool,wirelessproxd,bluetoothuserd,BTLEServer"
 
 static bool
 sweet_iolog(char *name, size_t len)
 {
 	if (!sweet_iolog_parsed) {
 		if (!PE_parse_boot_argn("sweetiolog", sweet_iolog_names, sizeof(sweet_iolog_names))) {
-			strlcpy(sweet_iolog_names, "backboardd,SpringBoard", sizeof(sweet_iolog_names));
+			strlcpy(sweet_iolog_names, sweet_btlog_on() ? SWEET_BT_PROCS : "backboardd,SpringBoard",
+			    sizeof(sweet_iolog_names));
+		} else if (sweet_btlog_on()) {
+			strlcat(sweet_iolog_names, "," SWEET_BT_PROCS, sizeof(sweet_iolog_names));
 		}
 		sweet_iolog_parsed = 1;
 	}
-	if (sweet_iolog_lines >= 400) {
+	if (sweet_iolog_lines >= (sweet_btlog_on() ? 1000u : 400u)) {
 		return false;
 	}
 	proc_selfname(name, (int)len);
