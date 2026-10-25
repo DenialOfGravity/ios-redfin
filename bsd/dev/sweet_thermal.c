@@ -23,6 +23,7 @@
  *   w table [DOM]       print the frequency table(s)
  *   w gov 0|1 [MS]      DVFS governor off/on, tick MS (0963)
  *   w chg               charger/gauge registers now
+ *   w chg wr ADDR VAL   one allow-listed charger write (hex, sweetchg=1 only; 0967)
  *   w cap N             force thermal level N (0-3) for a test, "w cap auto" back to the sensors
  *   w gpu N             GPU level cap N (0 = none) through sweet_gpu_level_cap()
  *
@@ -365,6 +366,26 @@ pc_num(const char **p, const char *end, unsigned *out)
 	return true;
 }
 
+/* hex with or without 0x */
+static unsigned
+pc_hex(const char *w)
+{
+	unsigned v = 0;
+	if (w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
+		w += 2;
+	}
+	for (; *w; w++) {
+		unsigned c = (unsigned char)*w;
+		unsigned d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+		    c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+		if (d > 15) {
+			break;
+		}
+		v = v * 16 + d;
+	}
+	return v;
+}
+
 /* DOM: 0/1/2 or s(ilver)/g(old)/p(rime) */
 static bool
 pc_dom(const char **p, const char *end, unsigned *out)
@@ -445,6 +466,17 @@ sweet_power_cmd(const char *s, const char *end)
 		(void)pc_num(&s, end, &n);
 		printf("SWEET POWER: gpu level cap %u -> %d\n", n, sweet_gpu_level_cap(n));
 	} else if (pc_is(w, "chg")) {
+		char sub[8];
+		if (pc_word(&s, end, sub, sizeof(sub)) && pc_is(sub, "wr")) {
+			char a[12], v[8];
+			if (!pc_word(&s, end, a, sizeof(a)) || !pc_word(&s, end, v, sizeof(v))) {
+				printf("SWEET POWER: usage: w chg wr ADDR VAL (hex)\n");
+				return;
+			}
+			unsigned addr = pc_hex(a), val = pc_hex(v);
+			printf("SWEET POWER: w chg wr %04x %02x -> %d\n", addr, val, sweet_spmi_write(2, addr, (uint8_t)val));
+			return;
+		}
 		sweet_thermal_pmic_dump("now");
 	} else {
 		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
