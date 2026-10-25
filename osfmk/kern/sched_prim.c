@@ -5009,6 +5009,25 @@ choose_next_pset(
 	return nset;
 }
 
+#if defined(__arm64__)
+/*
+ * redfin (0961): idle time of one CPU (mach absolute time) for the SWEET busy %
+ * and DVFS governor (bsd/dev/sweet_cpufreq.c); 0 if the CPU does not exist.
+ */
+uint64_t sweet_cpu_idle_abs(int cpu);
+uint64_t
+sweet_cpu_idle_abs(int cpu)
+{
+	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || processor_array[cpu] == PROCESSOR_NULL) {
+		return 0;
+	}
+	struct recount_usage usage = { 0 };
+	uint64_t idle = 0;
+	recount_processor_usage(&processor_array[cpu]->pr_recount, &usage, &idle);
+	return idle;
+}
+#endif
+
 /*
  *	choose_processor:
  *

@@ -15,6 +15,14 @@
  * Once at boot (after 20 s, read only): the PM7250B charger / gauge registers
  * later patches act on ("SWEET BATTERY: boot ...").
  * Boot-arg sweettherm=0: off.
+ *
+ * 0961: the 5 s tick also prints the "SWEET CPUFREQ:" busy/readback line, and
+ * the command server's "w ..." lines land here (sweet_poke.c):
+ *   w stat              temperatures + CPU busy/frequency/LMh now
+ *   w freq DOM IDX      write a domain's perf state (DOM 0/s silver, 1/g gold, 2/p prime)
+ *   w table [DOM]       print the frequency table(s)
+ *   w gov 0|1           DVFS governor off/on (0963)
+ *   w chg               charger/gauge registers now
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -28,6 +36,10 @@
 #include "sweet_spmi.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern void sweet_cpufreq_log(void);
+extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
+extern void sweet_cpufreq_table_log(unsigned dom);
+void sweet_power_cmd(const char *s, const char *end);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
 void sweet_thermal_start(void);
@@ -221,6 +233,7 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
 	for (;;) {
 		ts_sample();
 		ts_log();
+		sweet_cpufreq_log();
 		if (!dumped && elapsed >= 20000) {
 			dumped = true;
 			sweet_thermal_pmic_dump("boot");
@@ -230,6 +243,102 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
 		(void)assert_wait_deadline(&ts_chan, THREAD_UNINT, deadline);
 		thread_block(THREAD_CONTINUE_NULL);
 		elapsed += ts_period_ms;
+	}
+}
+
+/* "w ..." command parsing */
+static bool
+pc_word(const char **p, const char *end, char *out, size_t len)
+{
+	const char *s = *p;
+	while (s < end && (*s == ' ' || *s == '\t')) {
+		s++;
+	}
+	size_t n = 0;
+	while (s < end && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r' && *s) {
+		if (n + 1 < len) {
+			out[n++] = *s;
+		}
+		s++;
+	}
+	out[n] = 0;
+	*p = s;
+	return n > 0;
+}
+
+static bool
+pc_num(const char **p, const char *end, unsigned *out)
+{
+	char w[16];
+	if (!pc_word(p, end, w, sizeof(w)) || w[0] < '0' || w[0] > '9') {
+		return false;
+	}
+	unsigned v = 0;
+	for (const char *c = w; *c >= '0' && *c <= '9'; c++) {
+		v = v * 10 + (unsigned)(*c - '0');
+	}
+	*out = v;
+	return true;
+}
+
+/* DOM: 0/1/2 or s(ilver)/g(old)/p(rime) */
+static bool
+pc_dom(const char **p, const char *end, unsigned *out)
+{
+	char w[16];
+	if (!pc_word(p, end, w, sizeof(w))) {
+		return false;
+	}
+	switch (w[0]) {
+	case '0': case 's': *out = 0; return true;
+	case '1': case 'g': *out = 1; return true;
+	case '2': case 'p': *out = 2; return true;
+	default: return false;
+	}
+}
+
+static bool
+pc_is(const char *w, const char *name)
+{
+	return strncmp(w, name, strlen(name) + 1) == 0;
+}
+
+void
+sweet_power_cmd(const char *s, const char *end)
+{
+	char w[16];
+	unsigned dom = 0, idx = 0;
+	if (!pc_word(&s, end, w, sizeof(w))) {
+		return;
+	}
+	if (pc_is(w, "stat") || pc_is(w, "temp")) {
+		if (ts_tm[0]) {
+			ts_sample();
+			ts_log();
+		}
+		sweet_cpufreq_log();
+	} else if (pc_is(w, "freq")) {
+		if (!pc_dom(&s, end, &dom) || !pc_num(&s, end, &idx)) {
+			printf("SWEET POWER: usage: w freq DOM(0-2|s|g|p) IDX\n");
+			return;
+		}
+		if (sweet_cpufreq_set(dom, idx, "w freq") < 0) {
+			printf("SWEET POWER: w freq %u %u refused (no such domain/index)\n", dom, idx);
+		}
+	} else if (pc_is(w, "table")) {
+		if (pc_dom(&s, end, &dom)) {
+			sweet_cpufreq_table_log(dom);
+		} else {
+			for (unsigned d = 0; d < 3; d++) {
+				sweet_cpufreq_table_log(d);
+			}
+		}
+	} else if (pc_is(w, "gov")) {
+		printf("SWEET POWER: no DVFS governor in this kernel\n");
+	} else if (pc_is(w, "chg")) {
+		sweet_thermal_pmic_dump("now");
+	} else {
+		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, chg)\n", w);
 	}
 }
 

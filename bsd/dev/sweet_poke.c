@@ -144,6 +144,18 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		return;
 	}
 	char op = *s++;
+	if (op == 'w') {
+		/* redfin (0961): "w WORD ..." = power/thermal commands (bsd/dev/sweet_thermal.c); "w ADDR VAL" stays a write */
+		const char *q = s;
+		while (q < end && (*q == ' ' || *q == '\t')) {
+			q++;
+		}
+		if (q < end && *q >= 'a' && *q <= 'z') {
+			extern void sweet_power_cmd(const char *s, const char *end);
+			sweet_power_cmd(q, end);
+			return;
+		}
+	}
 	if (op == 'a') {
 		/* redfin WS-A (0952): a status | a tone [MS] | ...: the speakers and the microphone (bsd/dev/sweet_sound.c) */
 		extern int sweet_sound_cmd(const char *s, const char *end);
