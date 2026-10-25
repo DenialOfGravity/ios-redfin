@@ -4,9 +4,11 @@
  * plug-in that gives iOS the iPhone X's built-in audio devices:
  *
  *   /dev/redwood-audio   the "Speaker" output: whole frames of 48 kHz 16-bit stereo, written by the
- *                        audio server's real-time thread, never waited on. No sink yet (the speaker
- *                        path is behind the ADSP): counted and dropped. ioctl _IOW('r', 1,
- *                        {below, muted}) is the volume iOS sets, kept for the sink.
+ *                        audio server's real-time thread, never waited on. 0954 (WS-A): handed to the
+ *                        sink a driver sets with redwood_audio_set_sink() (sound=4: bsd/dev/sweet_sound.c,
+ *                        the speakers through the ADSP); without one, counted and dropped as before.
+ *                        ioctl _IOW('r', 1, {below, muted}) is the volume iOS sets, read by the sink with
+ *                        redwood_audio_volume().
  *   /dev/redwood-haptic  the "Actuator" output: 48 kHz 16-bit mono, the waveforms iOS plays on an
  *                        iPhone X's Taptic Engine (UIKit feedback, CoreHaptics, system vibrations).
  *                        Each write's peak becomes a drive level for the DRV2624 (sweet_haptic_drive):
@@ -26,6 +28,8 @@
 #include <sys/uio.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <kern/locks.h>
+#include <sys/redwood_audio.h>
 
 void sweet_audio_init(void);
 extern int sweet_haptic_drive(unsigned ms, unsigned strength);
@@ -44,11 +48,39 @@ struct sweet_audio_volume {
 #define HAP_MIN_MS              14      /* the shortest drive: one tap */
 
 static struct {
-	uint64_t audio_frames, haptic_frames;
+	uint64_t audio_frames, haptic_frames, sunk_frames;
 	uint32_t audio_writes, haptic_writes, haptic_drives;
 	struct sweet_audio_volume volume;
 	uint32_t volume_set;
 } sa;
+
+/* 0954: the sink (a driver that plays the frames) and the lock that guards its replacement */
+static LCK_GRP_DECLARE(sa_lock_group, "sweet-audio");
+static LCK_MTX_DECLARE(sa_sink_lock, &sa_lock_group);
+static redwood_audio_sink_t sa_sink;
+static const char *sa_sink_name = "nothing";
+
+void
+redwood_audio_set_sink(const char *name, redwood_audio_sink_t sink)
+{
+	lck_mtx_lock(&sa_sink_lock);
+	sa_sink = sink;
+	sa_sink_name = sink != NULL ? name : "nothing";
+	lck_mtx_unlock(&sa_sink_lock);
+	printf("SWEET AUDIO: /dev/redwood-audio now goes to %s\n", sink != NULL ? name : "nothing (dropped)");
+}
+
+bool
+redwood_audio_volume(uint32_t *below, bool *muted, uint32_t *generation)
+{
+	if (sa.volume_set == 0) {
+		return false;
+	}
+	*below = sa.volume.below;
+	*muted = sa.volume.muted != 0;
+	*generation = sa.volume_set;
+	return true;
+}
 
 static int
 sa_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
@@ -105,13 +137,18 @@ sa_write(dev_t dev, struct uio *uio, __unused int ioflag)
 			sa_haptic(buf, (unsigned)n / 2);
 		} else {
 			sa.audio_frames += (unsigned)n / 4;
+			lck_mtx_lock(&sa_sink_lock);
+			if (sa_sink != NULL) {
+				sa.sunk_frames += sa_sink(buf, (uint32_t)n / 4);
+			}
+			lck_mtx_unlock(&sa_sink_lock);
 		}
 	}
 	uint32_t w = haptic ? ++sa.haptic_writes : ++sa.audio_writes;
 	if (w == 1 || (w & 0xfff) == 0) {
-		printf("SWEET AUDIO: %s: %u writes, %llu frames (%llu s)%s\n", haptic ? "actuator" : "speaker", w,
+		printf("SWEET AUDIO: %s: %u writes, %llu frames (%llu s)%s%s%s\n", haptic ? "actuator" : "speaker", w,
 		    haptic ? sa.haptic_frames : sa.audio_frames, (haptic ? sa.haptic_frames : sa.audio_frames) / AUDIO_RATE,
-		    haptic ? "" : ": no speaker yet, dropped");
+		    haptic ? "" : ", to ", haptic ? "" : sa_sink_name, haptic || sa_sink != NULL ? "" : " (dropped)");
 	}
 	return 0;
 }
@@ -123,6 +160,7 @@ sa_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_
 		return ENOTTY;
 	}
 	sa.volume = *(struct sweet_audio_volume *)data;
+	__asm__ volatile ("dmb ish" ::: "memory");      /* (the generation last: redwood_audio_volume() reads it) */
 	if (sa.volume_set++ < 8) {
 		printf("SWEET AUDIO: speaker volume %u.%u dB under the loudest%s\n", sa.volume.below / 8,
 		    sa.volume.below % 8 * 125 / 100, sa.volume.muted ? ", muted" : "");
