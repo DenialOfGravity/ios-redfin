@@ -147,6 +147,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 	uint64_t a = 0, b = 0, c = 0, d = 0;
 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
+	if (op == 'f') {
+		/* redfin (0950, WS-D): f N [A]: the audio DSP's FastRPC/QRTR (bsd/dev/sweet_adsp.c sweet_adsp_poke; f 9: help) */
+		extern int sweet_adsp_poke(unsigned what, uint64_t a, uint64_t b);
+		printf("POKE: f %llu -> %d\n", a, sweet_adsp_poke((unsigned)a, b, c));
+		return;
+	}
 	volatile uint32_t *r = NULL;
 	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c') {
 		if (!ha || (a & 3) || !(r = poke_reg(a))) {
