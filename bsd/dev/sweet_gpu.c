@@ -374,7 +374,7 @@ static uint64_t progress_abs;
 /* Resets so far, and the fences each lost: (lo, hi] (the last LOST_RING of them) */
 #define LOST_RING       8
 static uint64_t recoveries;
-static struct { uint32_t lo, hi; } lost[LOST_RING];
+static struct { uint32_t lo, hi; int culprit; } lost[LOST_RING];	/* 0941: culprit = pid of the job the GPU was on (-1 unknown) */
 
 /*
  * GPU time of the submits that landed (their CP_ALWAYS_ON stamps, 19.2 MHz), by the process that queued them
@@ -502,6 +502,10 @@ gpu_recover_locked(const char *why)
 	    a6_rd(A6_GREG(0x908)));
 	lost[recoveries % LOST_RING].lo = done;
 	lost[recoveries % LOST_RING].hi = gpu.fence;
+	/* 0941: whose job hung (the first not done); the fence-owner ring holds it while it is in flight */
+	lost[recoveries % LOST_RING].culprit = (int32_t)(gpu.fence - done) > 0 && (int32_t)(gpu.fence - done) <= (int32_t)A6_TS_SLOTS ?
+	    gstat_pid[(done + 1) % A6_TS_SLOTS] : -1;
+	a6_log("%s: the job of pid %d hung or faulted\n", why, lost[recoveries % LOST_RING].culprit);
 	recoveries++;
 	if (a6_recover(&gpu)) {
 		a6_log("%s: GPU not recovered\n", why);
@@ -1354,6 +1358,42 @@ sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence)
 		uint32_t lo = lost[*epoch % LOST_RING].lo, hi = lost[*epoch % LOST_RING].hi;
 		if (last_fence && (int32_t)(last_fence - lo) > 0 && (int32_t)(hi - last_fence) >= 0) {
 			hit = true;
+		}
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return hit;
+}
+
+/*
+ * 0941: sweet_gpu_lost for the render server (backboardd, SpringBoard). A reset caused by another process's job
+ * also throws away the frames the compositor had queued behind it; telling Turnip so loses its device for good
+ * (r18e: backboardd's screen froze with the camera running). The compositor redraws its next frame anyway, so a
+ * reset whose hung job was not its own is not reported to it (logged, *spared counts them). sweetgpuspare=0: as
+ * sweet_gpu_lost.
+ */
+bool
+sweet_gpu_lost_spare(uint64_t *epoch, uint32_t last_fence, int self_pid, uint32_t *spared)
+{
+	static int spare = -1;
+	if (spare < 0 && !PE_parse_boot_argn("sweetgpuspare", &spare, sizeof(spare))) {
+		spare = 1;
+	}
+	bool hit = false;
+	lck_mtx_lock(&sweet_gpu_lock);
+	if (recoveries - *epoch > LOST_RING) {
+		*epoch = recoveries - LOST_RING;
+	}
+	for (; *epoch < recoveries; (*epoch)++) {
+		uint32_t lo = lost[*epoch % LOST_RING].lo, hi = lost[*epoch % LOST_RING].hi;
+		int culprit = lost[*epoch % LOST_RING].culprit;
+		if (last_fence && (int32_t)(last_fence - lo) > 0 && (int32_t)(hi - last_fence) >= 0) {
+			if (spare && culprit >= 0 && culprit != self_pid) {
+				(*spared)++;
+				a6_log("reset by pid %d's job: pid %d's queued work (fence %u) lost, not reported to it\n", culprit,
+				    self_pid, last_fence);
+			} else {
+				hit = true;
+			}
 		}
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);

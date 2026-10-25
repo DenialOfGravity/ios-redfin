@@ -46,6 +46,7 @@
 
 extern "C" {
 void proc_selfname(char *buf, int size);
+int proc_selfpid(void);
 bool sweet_gpu_ready(void);
 int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
@@ -60,6 +61,7 @@ void sweet_gpu_unmap_at(uint64_t iova, uint64_t len);
 uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy);
 int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
 bool sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence);
+bool sweet_gpu_lost_spare(uint64_t *epoch, uint32_t last_fence, int self_pid, uint32_t *spared);
 uint64_t sweet_gpu_recoveries(void);
 uint64_t sweet_gpu_timestamp(void);
 int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
@@ -151,6 +153,8 @@ class SweetAcceleratorUserClient : public IOUserClient {
 	uint64_t fPoolBytes, fPoolPeak; /* GPU pool memory this client holds */
 	uint32_t fAllocs, fFrees, fImports, fImportFrees;	/* 0154: census for the holds line */
 	uint32_t fV2Errors;                     /* 0928: refused v2 calls (the first 40 logged) */
+	uint32_t fSpared, fImportRetries;       /* 0941: resets not reported (another's job), imports pinned on a retry */
+	int fPid;
 	char fName[32];
 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
 	bool fCapLogged;
@@ -205,6 +209,7 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
 		fEpoch = sweet_gpu_recoveries();
 		proc_selfname(fName, sizeof(fName));
 		fSystem = !strcmp(fName, "backboardd") || !strcmp(fName, "SpringBoard");
+		fPid = proc_selfpid();
 		fV2 = true;
 	}
 	return true;
@@ -825,19 +830,37 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 		    rq->bytes > (1ULL << NativeAdrenoAbiMaxBoBytesShift)) {
 			return kIOReturnBadArgument;
 		}
-		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionInOut, fTask);
-		if (md != NULL && md->prepare() != kIOReturnSuccess) {
-			md->release();  /* read-only pages: pinned for reading */
-			md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionOut, fTask);
-			if (md != NULL && md->prepare() != kIOReturnSuccess) {
-				md->release();
-				md = NULL;
+		/*
+		 * 0941: the render server's imports (CA's surfaces, the camera's pictures) are tried again, up to 4 times
+		 * 2-8 ms apart, before they are refused: a pin that fails while the pages are busy (being faulted in,
+		 * wired by another import) succeeds a moment later, and a refused import of backboardd's is a missing
+		 * layer. The prepare() results are logged with the refusal.
+		 */
+		IOMemoryDescriptor *md = NULL;
+		IOReturn pin_rw = kIOReturnSuccess, pin_ro = kIOReturnSuccess;
+		for (uint32_t attempt = 0; md == NULL && attempt < (fSystem ? 4u : 1u); attempt++) {
+			if (attempt) {
+				IOSleep(2u << attempt);
+			}
+			md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionInOut, fTask);
+			if (md != NULL && (pin_rw = md->prepare()) != kIOReturnSuccess) {
+				md->release();  /* read-only pages: pinned for reading */
+				md = IOMemoryDescriptor::withAddressRange(rq->address, rq->bytes, kIODirectionOut, fTask);
+				if (md != NULL && (pin_ro = md->prepare()) != kIOReturnSuccess) {
+					md->release();
+					md = NULL;
+				}
+			}
+			if (md != NULL && attempt) {
+				fImportRetries++;
+				IOLog("SWEET MTL: v2 %s: import of %llu KB pinned on try %u (%u so far)\n", fName, rq->bytes >> 10,
+				    attempt + 1, fImportRetries);
 			}
 		}
 		if (md == NULL) {
 			v2_err_log("import", "the pages could not be pinned");
-			IOLog("SWEET MTL: v2 %s: import of %llu KB at 0x%llx refused (live imports %u)\n", fName, rq->bytes >> 10,
-			    rq->address, fImports - fImportFrees);
+			IOLog("SWEET MTL: v2 %s: import of %llu KB at 0x%llx refused (live imports %u, pin 0x%x/0x%x)\n", fName,
+			    rq->bytes >> 10, rq->address, fImports - fImportFrees, pin_rw, pin_ro);
 			return kIOReturnBadArgument;
 		}
 		IOLockLock(fLock);
@@ -974,7 +997,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 	}
 	case NativeAdrenoMethodGetStatus: {
 		V2_OUT(NativeAdrenoAbiStatus);
-		if (sweet_gpu_lost(&fEpoch, fLastFence)) {
+		if (fSystem ? sweet_gpu_lost_spare(&fEpoch, fLastFence, fPid, &fSpared) : sweet_gpu_lost(&fEpoch, fLastFence)) {
 			fFaults++;
 			v2_err_log("status", "work lost in a GPU reset: device lost for this client");
 		}
