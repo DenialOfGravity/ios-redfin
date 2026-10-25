@@ -21,7 +21,7 @@
  *   w stat              temperatures + CPU busy/frequency/LMh now
  *   w freq DOM IDX      write a domain's perf state (DOM 0/s silver, 1/g gold, 2/p prime)
  *   w table [DOM]       print the frequency table(s)
- *   w gov 0|1           DVFS governor off/on (0963)
+ *   w gov 0|1 [MS]      DVFS governor off/on, tick MS (0963)
  *   w chg               charger/gauge registers now
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -39,6 +39,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void sweet_cpufreq_log(void);
 extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
 extern void sweet_cpufreq_table_log(unsigned dom);
+extern int sweet_cpufreq_gov(int on, unsigned period_ms);
+extern void sweet_cpufreq_manual(unsigned dom);
 void sweet_power_cmd(const char *s, const char *end);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
@@ -322,6 +324,7 @@ sweet_power_cmd(const char *s, const char *end)
 			printf("SWEET POWER: usage: w freq DOM(0-2|s|g|p) IDX\n");
 			return;
 		}
+		sweet_cpufreq_manual(dom);
 		if (sweet_cpufreq_set(dom, idx, "w freq") < 0) {
 			printf("SWEET POWER: w freq %u %u refused (no such domain/index)\n", dom, idx);
 		}
@@ -334,7 +337,15 @@ sweet_power_cmd(const char *s, const char *end)
 			}
 		}
 	} else if (pc_is(w, "gov")) {
-		printf("SWEET POWER: no DVFS governor in this kernel\n");
+		unsigned on = 0, ms = 0;
+		if (!pc_num(&s, end, &on)) {
+			printf("SWEET POWER: usage: w gov 0|1 [MS]\n");
+			return;
+		}
+		(void)pc_num(&s, end, &ms);
+		if (sweet_cpufreq_gov(on != 0, ms) < 0) {
+			printf("SWEET POWER: governor unavailable\n");
+		}
 	} else if (pc_is(w, "chg")) {
 		sweet_thermal_pmic_dump("now");
 	} else {
