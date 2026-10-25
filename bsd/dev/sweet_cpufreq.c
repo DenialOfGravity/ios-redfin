@@ -33,6 +33,9 @@
  * the perf-state register is written (no RPMh). "w gov 0" stops it (clocks stay
  * where they are), "w gov 1" starts it; "w freq" takes that domain out of the
  * governor until the next "w gov 1".
+ *
+ * 0964: sweet_cpufreq_cap() (from the thermal policy in sweet_thermal.c) puts a
+ * ceiling on a domain, in every mode.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -51,6 +54,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
 int sweet_cpufreq_gov(int on, unsigned period_ms);
 void sweet_cpufreq_manual(unsigned dom);
+int sweet_cpufreq_cap(unsigned dom, uint32_t max_khz);
 void sweet_cpufreq_init(void);
 void sweet_cpufreq_log(void);
 int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
@@ -91,6 +95,10 @@ struct cf_dom {
 	unsigned down, wish;    /* consecutive "lower" ticks, highest lower wish (position) */
 	bool manual;            /* "w freq" took it out of the governor */
 	unsigned changes;
+	/* 0964 thermal cap */
+	uint32_t cap_khz;       /* 0 = none */
+	bool capped;            /* not governed: req was lowered from pin */
+	unsigned pin;           /* the index before the cap */
 };
 
 static struct cf_dom cf[CF_NDOM] = {
@@ -213,11 +221,15 @@ cf_build_choices(struct cf_dom *d)
 	}
 }
 
-/* Highest position the governor may pick. */
+/* Highest position the governor may pick (0964: at or below the thermal cap). */
 static unsigned
 cf_ceiling(const struct cf_dom *d)
 {
-	return d->nch ? d->nch - 1 : 0;
+	unsigned c = d->nch ? d->nch - 1 : 0;
+	while (c > 0 && d->cap_khz && d->khz[d->ch[c]] > d->cap_khz) {
+		c--;
+	}
+	return c;
 }
 
 /* Position of the current request in ch[] (the nearest frequency at or below it). */
@@ -309,7 +321,7 @@ cf_gov_tick(struct cf_load *ld)
 		if (util >= 95) {
 			target *= 2;            /* saturated: the real demand is unknown, ramp fast */
 		}
-		unsigned want = d->floor_pos;
+		unsigned want = d->floor_pos < ceil ? d->floor_pos : ceil;
 		while (want < ceil && d->khz[d->ch[want]] < target) {
 			want++;
 		}
@@ -385,6 +397,39 @@ sweet_cpufreq_gov(int on, unsigned period_ms)
 	cf_gov_on = on ? 1 : 0;
 	thread_wakeup((event_t)&cf_gov_on);
 	printf("SWEET CPUFREQ: governor %s, %u ms\n", on ? "on" : "off", cf_gov_ms);
+	return 0;
+}
+
+/*
+ * 0964: thermal cap for one domain (max_khz 0 = none). The governor honours it on
+ * its next tick; otherwise (pinned, kept, "w freq") the request is lowered here
+ * and put back when the cap goes.
+ */
+int
+sweet_cpufreq_cap(unsigned dom, uint32_t max_khz)
+{
+	if (!cf_ready || dom >= CF_NDOM || !cf[dom].base || cf[dom].nch == 0) {
+		return -1;
+	}
+	struct cf_dom *d = &cf[dom];
+	d->cap_khz = max_khz;
+	if (cf_gov_on && !d->manual) {
+		d->capped = false;
+		return 0;
+	}
+	uint32_t cur = d->req < d->n ? d->khz[d->req] : 0;
+	if (max_khz && cur > max_khz) {
+		if (!d->capped) {
+			d->pin = d->req;
+			d->capped = true;
+		}
+		(void)sweet_cpufreq_set(dom, d->ch[cf_ceiling(d)], "thermal cap");
+	} else if (d->capped && (!max_khz || d->khz[d->pin] <= max_khz)) {
+		d->capped = false;
+		(void)sweet_cpufreq_set(dom, d->pin, "thermal cap released");
+	} else if (d->capped && d->khz[d->ch[cf_ceiling(d)]] > cur) {
+		(void)sweet_cpufreq_set(dom, d->ch[cf_ceiling(d)], "thermal cap eased");
+	}
 	return 0;
 }
 

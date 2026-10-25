@@ -23,6 +23,16 @@
  *   w table [DOM]       print the frequency table(s)
  *   w gov 0|1 [MS]      DVFS governor off/on, tick MS (0963)
  *   w chg               charger/gauge registers now
+ *   w cap N             force thermal level N (0-3) for a test, "w cap auto" back to the sensors
+ *   w gpu N             GPU level cap N (0 = none) through sweet_gpu_level_cap()
+ *
+ * 0964 thermal caps, sampled every 1 s (the log stays at 5 s); hot = the hottest
+ * of gold, prime, cpuss and camera (die sensors; the skin ADC needs PMIC writes):
+ *   level 1 > 75 C (back below 65): gold/prime <= 1.8 GHz
+ *   level 2 > 85 C (back below 75): gold/prime <= 1.2 GHz, silver <= 1.5 GHz, GPU level <= 2 (400 MHz)
+ *   level 3 > 100 C (back below 90): gold/prime lowest row, silver <= 1.0 GHz, GPU level 1
+ * Each change is logged once ("SWEET THERMAL: level A -> B ..."). Boot-arg sweettcap: bit 0 (1, default)
+ * CPU caps, bit 1 (2) GPU caps too (runtime GMU vote, off by default); 0 = log the levels only.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -31,6 +41,7 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+#include <kern/locks.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include "sweet_spmi.h"
@@ -41,6 +52,8 @@ extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
 extern void sweet_cpufreq_table_log(unsigned dom);
 extern int sweet_cpufreq_gov(int on, unsigned period_ms);
 extern void sweet_cpufreq_manual(unsigned dom);
+extern int sweet_cpufreq_cap(unsigned dom, uint32_t max_khz);
+extern int sweet_gpu_level_cap(unsigned max_lvl);
 void sweet_power_cmd(const char *s, const char *end);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
@@ -54,7 +67,12 @@ void sweet_thermal_start(void);
 #define TS_NONE         (-9999)
 
 static vm_offset_t ts_tm[2];
-static unsigned ts_period_ms = 5000;
+static unsigned ts_period_ms = 1000;    /* sample (0964 caps); log every 5th */
+static unsigned ts_tcap = 1;            /* sweettcap */
+static int ts_level;                    /* 0964 thermal level 0-3 */
+static int ts_forced = -1;              /* "w cap N" */
+static LCK_GRP_DECLARE(ts_grp, "sweet_thermal");
+static LCK_MTX_DECLARE(ts_lock, &ts_grp);       /* sampling + policy: thread vs "w" commands */
 
 /* Published values, deci-degC (TS_NONE = not read). */
 static int t_aoss = TS_NONE, t_silver = TS_NONE, t_gold = TS_NONE, t_prime = TS_NONE;
@@ -226,20 +244,84 @@ sweet_thermal_pmic_dump(const char *why)
 	}
 }
 
+/* 0964: caps per level. silver, gold, prime kHz (0 = none; 1 = lowest row); GPU level (0 = none). */
+static const struct {
+	uint32_t khz[3];
+	unsigned gpu;
+	int up, down;           /* enter above up, leave below down (deci-degC) */
+} ts_levels[4] = {
+	{ { 0, 0, 0 }, 0, 0, 0 },
+	{ { 0, 1800000, 1800000 }, 0, 750, 650 },
+	{ { 1500000, 1200000, 1200000 }, 2, 850, 750 },
+	{ { 1000000, 1, 1 }, 1, 1000, 900 },
+};
+
+static void
+ts_apply_level(int level, int hot)
+{
+	char b[12];
+	if (level == ts_level) {
+		return;
+	}
+	printf("SWEET THERMAL: level %d -> %d (hot %s C%s): silver %u gold %u prime %u MHz cap, gpu %u%s\n",
+	    ts_level, level, ts_fmt(b, sizeof(b), hot), ts_forced >= 0 ? ", forced" : "",
+	    ts_levels[level].khz[0] / 1000, ts_levels[level].khz[1] / 1000, ts_levels[level].khz[2] / 1000,
+	    ts_levels[level].gpu, (ts_tcap & 1) ? "" : " (sweettcap=0: not applied)");
+	ts_level = level;
+	if (ts_tcap & 1) {
+		for (unsigned d = 0; d < 3; d++) {
+			(void)sweet_cpufreq_cap(d, ts_levels[level].khz[d]);
+		}
+	}
+	if (ts_tcap & 2) {
+		int rc = sweet_gpu_level_cap(ts_levels[level].gpu);
+		if (rc) {
+			printf("SWEET THERMAL: gpu cap %u -> %d\n", ts_levels[level].gpu, rc);
+		}
+	}
+}
+
+static void
+ts_policy(void)
+{
+	int hot = ts_max2(ts_max2(t_gold, t_prime), ts_max2(t_cpuss, t_camera));
+	int level = ts_level;
+	if (ts_forced >= 0) {
+		level = ts_forced;
+	} else if (hot == TS_NONE) {
+		return;
+	} else {
+		while (level < 3 && hot > ts_levels[level + 1].up) {
+			level++;
+		}
+		while (level > 0 && hot < ts_levels[level].down) {
+			level--;
+		}
+	}
+	ts_apply_level(level, hot);
+}
+
 static void
 ts_thread(void *arg __unused, wait_result_t wr __unused)
 {
 	static int ts_chan;
-	unsigned elapsed = 0;
+	unsigned elapsed = 0, ticks = 0;
 	bool dumped = false;
 	for (;;) {
+		lck_mtx_lock(&ts_lock);
 		ts_sample();
+		ts_policy();
+		lck_mtx_unlock(&ts_lock);
+		if ((ticks++ % 5) != 0) {
+			goto next_tick;
+		}
 		ts_log();
 		sweet_cpufreq_log();
 		if (!dumped && elapsed >= 20000) {
 			dumped = true;
 			sweet_thermal_pmic_dump("boot");
 		}
+next_tick:;
 		uint64_t deadline;
 		clock_interval_to_deadline(ts_period_ms, NSEC_PER_MSEC, &deadline);
 		(void)assert_wait_deadline(&ts_chan, THREAD_UNINT, deadline);
@@ -346,10 +428,26 @@ sweet_power_cmd(const char *s, const char *end)
 		if (sweet_cpufreq_gov(on != 0, ms) < 0) {
 			printf("SWEET POWER: governor unavailable\n");
 		}
+	} else if (pc_is(w, "cap")) {
+		unsigned n = 0;
+		if (pc_num(&s, end, &n) && n <= 3) {
+			ts_forced = (int)n;
+		} else {
+			ts_forced = -1;
+		}
+		lck_mtx_lock(&ts_lock);
+		ts_sample();
+		ts_policy();
+		lck_mtx_unlock(&ts_lock);
+		printf("SWEET POWER: thermal level %d (%s)\n", ts_level, ts_forced >= 0 ? "forced" : "sensors");
+	} else if (pc_is(w, "gpu")) {
+		unsigned n = 0;
+		(void)pc_num(&s, end, &n);
+		printf("SWEET POWER: gpu level cap %u -> %d\n", n, sweet_gpu_level_cap(n));
 	} else if (pc_is(w, "chg")) {
 		sweet_thermal_pmic_dump("now");
 	} else {
-		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, chg)\n", w);
+		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
 	}
 }
 
@@ -358,6 +456,7 @@ sweet_thermal_start(void)
 {
 	uint32_t on = 1;
 	PE_parse_boot_argn("sweettherm", &on, sizeof(on));
+	PE_parse_boot_argn("sweettcap", &ts_tcap, sizeof(ts_tcap));
 	if (!on) {
 		printf("SWEET THERMAL: off (sweettherm=0)\n");
 		return;

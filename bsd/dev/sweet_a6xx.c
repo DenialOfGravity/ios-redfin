@@ -876,6 +876,25 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
 	return -1;
 }
 
+/* redfin (0964): runtime GPU level vote for the thermal cap (sweet_gpu_level_cap); HFI v2 GMUs only. */
+int a6_perf_vote(struct a6_gpu *g, uint32_t lvl);
+int a6_perf_vote(struct a6_gpu *g, uint32_t lvl)
+{
+#if A6_GPU_ID == 618
+	(void)g;
+	(void)lvl;
+	return -1;
+#else
+	static uint32_t msg[8];
+	if (lvl < 1 || (int)lvl >= NLVL)
+		return -1;
+	msg[1] = 1;
+	msg[2] = lvl;
+	msg[3] = 0;
+	return hfi_send(g, 30, msg, 4);
+#endif
+}
+
 static int gmu_hfi(struct a6_gpu *g)
 {
 	static uint32_t msg[256];

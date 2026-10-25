@@ -363,6 +363,27 @@ sweet_gpu_ready(void)
 	return gpu_ready;
 }
 
+/* redfin (0964): thermal cap on the GPU level (bsd/dev/sweet_thermal.c, sweettcap bit 2); 0 = back to the boot level. */
+int sweet_gpu_level_cap(unsigned max_lvl);
+int
+sweet_gpu_level_cap(unsigned max_lvl)
+{
+	extern int a6_perf_vote(struct a6_gpu *g, uint32_t lvl);
+	static uint32_t boot_lvl;
+	int rc = 0;
+	lck_mtx_lock(&sweet_gpu_lock);
+	if (!boot_lvl) {
+		boot_lvl = gpu.perf_level ? gpu.perf_level : 1;
+	}
+	uint32_t lvl = (max_lvl && max_lvl < boot_lvl) ? max_lvl : boot_lvl;
+	if (lvl != gpu.perf_level) {
+		gpu.perf_level = lvl;   /* also what a reset/recovery brings the GPU up at */
+		rc = gpu_ready ? a6_perf_vote(&gpu, lvl) : 0;
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+	return rc;
+}
+
 /* ---- hangs and resets (all with sweet_gpu_lock held) ---- */
 
 /*
