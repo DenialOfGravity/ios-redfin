@@ -131,6 +131,7 @@ bsd/dev/sweet_rpmh.c			standard
 bsd/dev/sweet_spmi.c			standard
 bsd/dev/sweet_charger.c			standard
 bsd/dev/sweet_usb.c			standard
+bsd/dev/sweet_geniuart.c		standard
 bsd/dev/redwood_sta.c		standard
 bsd/dev/redwood_net.c		standard
 bsd/dev/redwood_apple80211.c	standard

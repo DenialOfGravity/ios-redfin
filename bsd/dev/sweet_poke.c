@@ -184,7 +184,7 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		return;
 	}
 	volatile uint32_t *r = NULL;
-	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c') {
+	if (op != '@' && op != 's' && op != 'v' && op != 't' && op != 'c' && op != 'b') {
 		if (!ha || (a & 3) || !(r = poke_reg(a))) {
 			printf("POKE: line %u: bad address\n", lineno);
 			return;
@@ -222,6 +222,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		 */
 		extern int sweet_cam_cmd_args(unsigned what, uint64_t a, uint64_t b, uint64_t c);
 		printf("POKE: c %llu -> %d\n", a, sweet_cam_cmd_args((unsigned)a, b, c, d));
+		break;
+	}
+	case 'b': {
+		/* redfin (0981): b 0 /dev/btuart state; b 1 HCI Read_Local_Version, b 2 QCA EDL version (sweet_geniuart.c) */
+		extern int sweet_geniuart_cmd(unsigned what);
+		printf("POKE: b %llu -> %d\n", a, sweet_geniuart_cmd((unsigned)a));
 		break;
 	}
 	case 'r': {
