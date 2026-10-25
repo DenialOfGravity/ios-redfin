@@ -150,6 +150,7 @@ class SweetAcceleratorUserClient : public IOUserClient {
 	uint64_t fEpoch, fFaults;       /* GPU resets seen; those that lost this client's work */
 	uint64_t fPoolBytes, fPoolPeak; /* GPU pool memory this client holds */
 	uint32_t fAllocs, fFrees, fImports, fImportFrees;	/* 0154: census for the holds line */
+	uint32_t fV2Errors;                     /* 0928: refused v2 calls (the first 40 logged) */
 	char fName[32];
 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
 	bool fCapLogged;
@@ -409,6 +410,11 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 			r = w[1] == 0xffffffffu ? kIOReturnSuccess : v2Method(w[1], w + 2, isz - 8, o, &osz);
 		} else {
 			r = v2Method(selector, isz ? args->structureInput : NULL, isz, o, &osz);
+		}
+		/* 0928: every refused v2 call, the first 40 of each client (Turnip loses its device over most of them) */
+		if (r != kIOReturnSuccess && fV2Errors++ < 40) {
+			IOLog("SWEET MTL: v2 %s: method %u refused: 0x%x (#%u)\n", fName,
+			    isz >= 8 && w[0] == SWEET_V2_TUNNEL ? w[1] : selector, r, fV2Errors);
 		}
 		if (o != NULL) {
 			args->structureOutputSize = r == kIOReturnSuccess ? osz : 0;
@@ -829,6 +835,9 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 			}
 		}
 		if (md == NULL) {
+			v2_err_log("import", "the pages could not be pinned");
+			IOLog("SWEET MTL: v2 %s: import of %llu KB at 0x%llx refused (live imports %u)\n", fName, rq->bytes >> 10,
+			    rq->address, fImports - fImportFrees);
 			return kIOReturnBadArgument;
 		}
 		IOLockLock(fLock);
@@ -886,6 +895,10 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 			sweet_gpu_unmap_at(rq->iova, bo->bytes);
 		}
 		IOLockUnlock(fLock);
+		if (r != kIOReturnSuccess) {
+			/* 0928: Turnip takes any error here for a lost device (backboardd's screen stopped with the camera) */
+			IOLog("SWEET MTL: v2 %s: map of handle %llu at 0x%llx refused: 0x%x\n", fName, rq->handle, rq->iova, r);
+		}
 		return r;
 	}
 	case NativeAdrenoMethodBoFree: {
