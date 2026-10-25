@@ -903,13 +903,35 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	uint64_t t2 = mach_absolute_time();
 	stat_clean_abs += t1 - t0;
 	stat_gpu_abs += t2 - t1;
+	/*
+	 * 0942: the present line per window of 300 frames, readable on its own: how long the window took and the
+	 * presents a second in it, the mean cache clean and blit queueing per frame, and what happened in that window
+	 * only (presents put off because the previous blit was still queued, flips, flips taken as latched by time),
+	 * with the mode (single buffer / flip) and the GPU clock step. The totals since boot follow in brackets.
+	 */
+	static uint64_t win_abs;
+	static uint32_t win_busy, win_late;
+	static uint64_t win_flips;
+	if (win_abs == 0) {
+		win_abs = t0;
+	}
 	if ((++stat_frames % 300) == 0) {
-		uint64_t c, g;
+		uint64_t c, g, span;
 		absolutetime_to_nanoseconds(stat_clean_abs, &c);
 		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
-		a6_log("present: %llu frames, avg cache clean %llu us, GPU blit %llu us, put off %u, flips %llu (%u latched late)\n",
-		    stat_frames, c / 1000 / 300, g / 1000 / 300, stat_busy, stat_flips, stat_flip_late);
+		absolutetime_to_nanoseconds(t2 - win_abs, &span);
+		uint32_t freq = 0;
+		PE_parse_boot_argn("sweetgpufreq", &freq, sizeof(freq));
+		a6_log("present: 300 frames in %llu ms = %llu.%llu/s (%s, gpufreq %u); per frame clean %llu us, blit %llu us; "
+		    "put off %u, flips %llu, late %u [total %llu frames, put off %u, flips %llu, late %u]\n",
+		    span / 1000000, span ? 300000000000ULL / span : 0, span ? (3000000000000ULL / span) % 10 : 0,
+		    fb_flip > 0 ? "flip" : "single buffer", freq, c / 1000 / 300, g / 1000 / 300, stat_busy - win_busy,
+		    stat_flips - win_flips, stat_flip_late - win_late, stat_frames, stat_busy, stat_flips, stat_flip_late);
 		stat_clean_abs = stat_gpu_abs = 0;
+		win_abs = t2;
+		win_busy = stat_busy;
+		win_flips = stat_flips;
+		win_late = stat_flip_late;
 	}
 	*out_dx = frame.dx;
 	*out_dy = frame.dy;
