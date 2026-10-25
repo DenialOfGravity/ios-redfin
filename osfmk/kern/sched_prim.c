@@ -5078,6 +5078,8 @@ choose_processor(
 	/*
 	 * sunfish (0147): the ADT describes one SMP cluster, but CPUs 6-7 are the A76 big cores (6 x A55 + 2 x A76).
 	 * Foreground and UI threads (render server, apps) take an idle big core first. Boot-arg sweetbig=0: off.
+	 * redfin (0962): sweetbig=1 tries CPU7 (prime, 2.4 GHz) first, as before; sweetbig=2 tries CPU6 (gold) first
+	 * and uses the prime core only while CPU6 is busy (the prime core is the hottest and least efficient).
 	 */
 	{
 		static int sweet_big = -1;
@@ -5087,7 +5089,8 @@ choose_processor(
 			sweet_big = v;
 		}
 		if (sweet_big && thread->sched_pri >= BASEPRI_FOREGROUND) {
-			for (int i = 7; i >= 6; i--) {
+			for (int k = 0; k < 2; k++) {
+				int i = sweet_big == 2 ? 6 + k : 7 - k;
 				processor_t bp = processor_array[i];
 				if (bp != PROCESSOR_NULL && bp->processor_set == pset && bp->state == PROCESSOR_IDLE &&
 				    bp->is_recommended) {
