@@ -52,6 +52,7 @@ static void sweet_log_start(void);
 extern void sweet_sample_start(void);
 extern void sweet_keys_init(void);
 extern void sweet_touch_init(void);
+extern void sweet_motion_init(void);
 extern void sweet_fts_init(void);
 extern void sweet_sects_init(void);
 extern void sweet_haptic_init(void);
@@ -674,6 +675,7 @@ sweet_ufs_init(void)
 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 	sweet_keys_init();
 	sweet_touch_init();
+	sweet_motion_init();	/* redfin sensors: /dev/redwood-motion, poke m (bsd/dev/sweet_motion.c) */
 	sweet_fts_init();
 	sweet_sects_init();	/* redfin sec_ts (sectouch=1) */
 	sweet_haptic_init();	/* redfin DRV2624 (sweethaptic=1) */

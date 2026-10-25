@@ -144,6 +144,18 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		return;
 	}
 	char op = *s++;
+	if (op == 'm') {
+		/* redfin (0972): "m WORD ..." is the sensor command (bsd/dev/sweet_motion.c); "m ADDR MASK VAL" stays */
+		extern void sweet_motion_cmd(const char *s, const char *end);
+		const char *q = s;
+		while (q < end && (*q == ' ' || *q == '\t')) {
+			q++;
+		}
+		if (q < end && *q >= 'a' && *q <= 'z') {
+			sweet_motion_cmd(q, end);
+			return;
+		}
+	}
 	if (op == 'w') {
 		/* redfin (0961): "w WORD ..." = power/thermal commands (bsd/dev/sweet_thermal.c); "w ADDR VAL" stays a write */
 		const char *q = s;
