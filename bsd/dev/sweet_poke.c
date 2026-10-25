@@ -144,6 +144,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		return;
 	}
 	char op = *s++;
+	if (op == 'a') {
+		/* redfin WS-A (0952): a status | a tone [MS] | ...: the speakers and the microphone (bsd/dev/sweet_sound.c) */
+		extern int sweet_sound_cmd(const char *s, const char *end);
+		printf("POKE: a -> %d\n", sweet_sound_cmd(s, end));
+		return;
+	}
 	uint64_t a = 0, b = 0, c = 0, d = 0;
 	bool ha = poke_num(&s, end, &a), hb = poke_num(&s, end, &b);
 	bool hc = poke_num(&s, end, &c), hd = poke_num(&s, end, &d);
