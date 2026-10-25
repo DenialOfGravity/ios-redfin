@@ -660,6 +660,14 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
 		put32(p, 0x04, pl->height);
 		put32(p, 0x08, pl->bytesPerRow);
 		put32(p, 0x0c, pl->offset);
+		/*
+		 * 0927: IOSurface.framework (16.7) reads a plane's bytes per row at +0x10
+		 * (IOSurfaceGetBytesPerRowOfPlane: client + 0xe0 + 0x80 * plane, the lock result
+		 * being at + 0x68). Without it every plane had 0 bytes per row: the camera's
+		 * pictures were drawn all into their first row (green photographs, a black
+		 * preview) and VideoToolbox refused its transfers (-12902).
+		 */
+		put32(p, 0x10, pl->bytesPerRow);
 		put32(p, 0x14, pl->size);
 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
 		p[0x1a] = pl->elementWidth;
