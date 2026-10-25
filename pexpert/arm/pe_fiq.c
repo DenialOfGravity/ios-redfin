@@ -137,6 +137,20 @@ sweet_spi_mask(uint32_t intid, bool masked)
 	}
 }
 
+/* redfin (0965): the GIC CPU interface after a PSCI power collapse (its system registers are per core and lost). */
+void sweet_gic_cpu_resume(void);
+void
+sweet_gic_cpu_resume(void)
+{
+	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | ICC_SRE_SRE);
+	__builtin_arm_isb(ISB_SY);
+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
+	__builtin_arm_wsr64("ICC_CTLR_EL1", __builtin_arm_rsr64("ICC_CTLR_EL1") & ~ICC_CTLR_EOIMODE);
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+	__builtin_arm_isb(ISB_SY);
+}
+
 /* From sleh_irq: false if nobody attached the INTID. */
 bool
 sweet_spi_dispatch(uint32_t intid)

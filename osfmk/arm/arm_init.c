@@ -839,5 +839,12 @@ arm_init_idle_cpu(
 
 	fiq_context_init(FALSE);
 
+#if defined(SWEET)
+	{
+		/* redfin (0965): back from a PSCI power collapse (osfmk/arm64/cpu.c) */
+		extern void sweet_idle_resume(cpu_data_t *cdp);
+		sweet_idle_resume(cpu_data_ptr);
+	}
+#endif
 	cpu_idle_exit(TRUE);
 }

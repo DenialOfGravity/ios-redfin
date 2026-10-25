@@ -20,6 +20,7 @@
 
 extern "C" void sweet_secondary_entry(void);
 extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+extern "C" void sweet_idle_setup(void);
 
 class SweetCPU;
 static SweetCPU *sweet_cpus[MAX_CPUS];
@@ -175,6 +176,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
 	ml_set_max_cpus(topology->max_cpu_id + 1);
 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
 	    topology->num_cpus, topology->num_cpus);
+	sweet_idle_setup();     /* 0965: PSCI power collapse when sweetidle=1 (osfmk/arm64/cpu.c) */
 	thread_terminate(current_thread());
 }
 

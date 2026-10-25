@@ -276,7 +276,7 @@ sweet_cpufreq_log(void)
 	}
 	unsigned busy[CF_NCPU];
 	cf_busy(&ld, busy);
-	char line[300];
+	char line[440];
 	int len = snprintf(line, sizeof(line), "SWEET CPUFREQ: busy %u %u %u %u %u %u | %u | %u %%;",
 	    busy[0], busy[1], busy[2], busy[3], busy[4], busy[5], busy[6], busy[7]);
 	uint64_t now = mach_absolute_time();
@@ -298,6 +298,12 @@ sweet_cpufreq_log(void)
 	if (cf_gov_thread) {
 		len += snprintf(line + len, sizeof(line) - len, "; gov %s %u/%u/%u changes", cf_gov_on ? "on" : "off",
 		    cf[0].changes, cf[1].changes, cf[2].changes);
+	}
+	{
+		extern void sweet_idle_stats(char *buf, size_t len);   /* 0965, osfmk/arm64/cpu.c */
+		char idle[120];
+		sweet_idle_stats(idle, sizeof(idle));
+		len += snprintf(line + len, sizeof(line) - len, "; %s", idle);
 	}
 	printf("%s\n", line);
 }
