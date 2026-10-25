@@ -24,6 +24,7 @@
  *   w gov 0|1 [MS]      DVFS governor off/on, tick MS (0963)
  *   w chg               charger/gauge registers now
  *   w chg wr ADDR VAL   one allow-listed charger write (hex, sweetchg=1 only; 0967)
+ *   w chg apsd          rerun charger detection; w chg pol 0|1 charger policy off/on (0968)
  *   w cap N             force thermal level N (0-3) for a test, "w cap auto" back to the sensors
  *   w gpu N             GPU level cap N (0 = none) through sweet_gpu_level_cap()
  *
@@ -55,6 +56,9 @@ extern int sweet_cpufreq_gov(int on, unsigned period_ms);
 extern void sweet_cpufreq_manual(unsigned dom);
 extern int sweet_cpufreq_cap(unsigned dom, uint32_t max_khz);
 extern int sweet_gpu_level_cap(unsigned max_lvl);
+extern void sweet_charger_tick(void);
+extern void sweet_charger_dump(void);
+extern void sweet_charger_apsd(void);
 void sweet_power_cmd(const char *s, const char *end);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
@@ -74,6 +78,7 @@ static int ts_level;                    /* 0964 thermal level 0-3 */
 static int ts_forced = -1;              /* "w cap N" */
 static LCK_GRP_DECLARE(ts_grp, "sweet_thermal");
 static LCK_MTX_DECLARE(ts_lock, &ts_grp);       /* sampling + policy: thread vs "w" commands */
+static unsigned ts_chg = 1;             /* 0968 charger policy (sweetchgpol=0: off; writes need sweetchg=1) */
 
 /* Published values, deci-degC (TS_NONE = not read). */
 static int t_aoss = TS_NONE, t_silver = TS_NONE, t_gold = TS_NONE, t_prime = TS_NONE;
@@ -322,6 +327,9 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
 			dumped = true;
 			sweet_thermal_pmic_dump("boot");
 		}
+		if (dumped && ts_chg) {
+			sweet_charger_tick();   /* 0968, after the boot register dump */
+		}
 next_tick:;
 		uint64_t deadline;
 		clock_interval_to_deadline(ts_period_ms, NSEC_PER_MSEC, &deadline);
@@ -477,7 +485,18 @@ sweet_power_cmd(const char *s, const char *end)
 			printf("SWEET POWER: w chg wr %04x %02x -> %d\n", addr, val, sweet_spmi_write(2, addr, (uint8_t)val));
 			return;
 		}
-		sweet_thermal_pmic_dump("now");
+		if (pc_is(sub, "apsd")) {
+			sweet_charger_apsd();
+			return;
+		}
+		if (pc_is(sub, "pol")) {
+			unsigned n = 1;
+			(void)pc_num(&s, end, &n);
+			ts_chg = n;
+			printf("SWEET POWER: charger policy %s\n", n ? "on" : "off");
+			return;
+		}
+		sweet_charger_dump();
 	} else {
 		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
 	}
@@ -489,6 +508,7 @@ sweet_thermal_start(void)
 	uint32_t on = 1;
 	PE_parse_boot_argn("sweettherm", &on, sizeof(on));
 	PE_parse_boot_argn("sweettcap", &ts_tcap, sizeof(ts_tcap));
+	PE_parse_boot_argn("sweetchgpol", &ts_chg, sizeof(ts_chg));
 	if (!on) {
 		printf("SWEET THERMAL: off (sweettherm=0)\n");
 		return;
