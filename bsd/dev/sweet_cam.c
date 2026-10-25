@@ -2669,7 +2669,8 @@ struct redwood_camera_frame {
 	    margin, sensor, focus, reserved[5];
 };
 #define REDWOOD_CAMERA_NO_FOCUS         0xffffffffu
-enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3, REDWOOD_CAMERA_FOCUS = 4 };
+enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3, REDWOOD_CAMERA_FOCUS = 4,
+       REDWOOD_CAMERA_FLASH = 5 };
 /* 0929-0933 (the shared contract with phone/audio/redwood_camera.h): reserved[0] flags, [1]/[2] start of frame (mach
  * time, low/high 32 bits), [3] digital gain (unity | max << 16; 0 none), [4] the mode's frames a second x 1000 */
 #define REDWOOD_CAMERA_FLAG_FLASH_LIT           (1u << 0)
@@ -2723,6 +2724,36 @@ static volatile unsigned ios_switch_to;        /* 1 + ours */
 static uint32_t ios_switch_mode = ~0u;
 static unsigned ios_switch_class;      /* 0932: SENSOR's c */
 static struct { uint32_t pos; bool pending, park; } ios_focus;     /* 0929: FOCUS, done after the next frame's end */
+
+/*
+ * 0933: FLASH (a mA per channel, b frames, c 1 = a metering pre-flash at the torch's current). Asked for at the end of
+ * frame k, the LED is lit at the start of frame k + 1 -- the start of its read-out: the sensor's shutter rolls, and the
+ * first line of frame k + 2 begins its exposure after that -- and switched off at the end of frame k + 1 + b; frames
+ * k + 2 .. k + 1 + b carry FLASH_LIT if the light was still on (the module's safety timer, set to the frames' time,
+ * at most 100 ms for a flash, 500 ms for a pre-flash) when they ended. 0 mA: off now.
+ */
+extern int sweet_torch_flash(unsigned ma, unsigned *ms, bool pre);
+extern void sweet_torch_flash_off(void);
+#define FLASH_FRAMES_MAX        8u
+static struct { uint32_t ma, frames; bool pre, pending; } ios_flash_ask;
+enum { FL_IDLE, FL_ARMED, FL_LIT };
+static struct {
+	unsigned state;
+	uint32_t ma, frames;
+	bool pre;
+	uint64_t first, last;           /* the frames to be lit (sequence numbers) */
+	uint64_t until;                 /* mach time the safety timer ends it */
+	unsigned refused;
+} fl;
+
+static void
+flash_stop(void)
+{
+	if (fl.state == FL_LIT) {
+		sweet_torch_flash_off();
+	}
+	fl.state = FL_IDLE;
+}
 
 static uint64_t
 ios_ms(void)
@@ -2966,6 +2997,7 @@ ios_warm_switch(uint32_t mode_n)
 	unsigned old_n = ios_mode_n, phy = sensor_capture[ios_sensor].phy;
 	uint32_t frame_ms = (uint32_t)((uint64_t)ios_line_ns * ios_now.frame_lines / 1000000u) + 5;
 	uint64_t t0 = ios_ms();
+	flash_stop();           /* 0933 */
 	lck_mtx_lock(&ios_lock);
 	ios_streaming = false;
 	for (int i = 0; i < RING; i++) {
@@ -3144,11 +3176,36 @@ ios_session(void)
 			place[writing].focus = lens.up ? lens.pos : REDWOOD_CAMERA_NO_FOCUS;
 			place[writing].flags = 0;
 			place[writing].gen = ios_gen;
+			/* 0933: lit, the light on from before its first line's exposure to its end */
+			if (fl.state == FL_LIT && ios_frames_done >= fl.first && ios_frames_done <= fl.last &&
+			    place[writing].time <= fl.until) {
+				place[writing].flags |= REDWOOD_CAMERA_FLAG_FLASH_LIT;
+			}
 			uint64_t exposed;
 			nanoseconds_to_absolutetime((uint64_t)ios_now.lines * ios_line_ns, &exposed);
 			if (lens.up && lens.moving_until > place[writing].sof - MIN(exposed, place[writing].sof) &&
 			    lens.moving_from < place[writing].time) {
 				place[writing].flags |= REDWOOD_CAMERA_FLAG_LENS_MOVING;
+			}
+		}
+		/* 0933: the flash: off after the last lit frame's end; a new one armed at a frame's end */
+		bool flash_off = false, flash_on = false;
+		if (bus_st & WM0_DONE) {
+			if (fl.state == FL_LIT && ios_frames_done >= fl.last) {
+				flash_off = true;
+			}
+			if (ios_flash_ask.pending && ios_flash_ask.ma == 0) {
+				ios_flash_ask.pending = false;
+				flash_off = fl.state == FL_LIT;
+				fl.state = fl.state == FL_ARMED ? FL_IDLE : fl.state;
+			} else if (ios_flash_ask.pending && (fl.state == FL_IDLE || flash_off)) {
+				ios_flash_ask.pending = false;
+				fl.ma = ios_flash_ask.ma;
+				fl.frames = ios_flash_ask.frames;
+				fl.pre = ios_flash_ask.pre;
+				fl.first = ios_frames_done + 2;
+				fl.last = ios_frames_done + 1 + fl.frames;
+				flash_on = true;        /* lit at the next SOF (frame k + 1's) */
 			}
 		}
 		if (top & RDI0_SOF) {
@@ -3171,6 +3228,7 @@ ios_session(void)
 				wr(cap.ife, IFE_REG_UPDATE, 0x2);
 			}
 		}
+		uint64_t sof_now = place[writing].sof;
 		bool ask = (bus_st & WM0_DONE) && ios_ask.pending;
 		uint32_t al = ios_ask.lines, ag = ios_ask.gain, af = ios_ask.frame_lines, ad = ios_ask.dgain;
 		ios_ask.pending = ios_ask.pending && !ask;
@@ -3180,6 +3238,28 @@ ios_session(void)
 		bool fpark = ios_focus.park;
 		ios_focus.pending = ios_focus.pending && !focus;
 		lck_mtx_unlock(&ios_lock);
+		/* 0933: the flash's writes, outside the lock (each a few SPMI writes, read back) */
+		if (flash_off) {
+			flash_stop();
+		}
+		if (flash_on) {
+			fl.state = FL_ARMED;
+		}
+		if (fl.state == FL_ARMED && (top & RDI0_SOF)) {
+			uint64_t frame_ns = (uint64_t)ios_line_ns * ios_now.frame_lines, span;
+			unsigned ms = (unsigned)((frame_ns * (fl.frames + 1) + 16 * NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
+			int err = sweet_torch_flash(fl.ma, &ms, fl.pre);
+			if (err == 0) {
+				nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &span);
+				fl.until = sof_now + span;
+				fl.state = FL_LIT;
+			} else {
+				if (fl.refused++ < 10) {
+					printf("SWEET CAM: /dev/redwood-camera: no flash (%d)\n", err);
+				}
+				fl.state = FL_IDLE;
+			}
+		}
 		if (focus && lens.up) {
 			if (fpark) {
 				/* a step a frame back to infinity, the next step asked for again until it is there */
@@ -3223,6 +3303,7 @@ ios_session(void)
 			show_paths("streaming");
 		}
 	}
+	flash_stop();           /* 0933 */
 	lck_mtx_lock(&ios_lock);
 	ios_streaming = false;
 	for (int i = 0; i < RING; i++) {
@@ -3371,6 +3452,8 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_min = ios_mode->frame_length;
 	f.frame_lines_max = FRAME_LINES_MAX;
 	f.margin = ios_margin;                          /* 0931 */
+	f.reserved[1] = (uint32_t)place[b].sof;        /* 0933: the start of frame, mach time */
+	f.reserved[2] = (uint32_t)(place[b].sof >> 32);
 	f.reserved[3] = ios_dgain_max ? ios_dgain_max << 16 | GAIN_UNITY : 0;
 	f.reserved[4] = ios_mode->fps_milli;
 	f.sensor = ours_to_ios[ios_sensor];
@@ -3458,6 +3541,18 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		ios_switch_to = ios_to_ours[c.a] + 1;
 		lck_mtx_unlock(&ios_lock);
 		wakeup(&ios_open);
+		return 0;
+	case REDWOOD_CAMERA_FLASH:
+		/* 0933: a mA per channel (0 = off; the torch driver caps it), b frames (0 = 1), c = 1 metering pre-flash */
+		if (c.c > 1) {
+			return EINVAL;
+		}
+		lck_mtx_lock(&ios_lock);
+		ios_flash_ask.ma = c.a;
+		ios_flash_ask.frames = c.b == 0 ? 1 : c.b > FLASH_FRAMES_MAX ? FLASH_FRAMES_MAX : c.b;
+		ios_flash_ask.pre = c.c == 1;
+		ios_flash_ask.pending = true;
+		lck_mtx_unlock(&ios_lock);
 		return 0;
 	case REDWOOD_CAMERA_KEEP:
 		return ENOTSUP;
