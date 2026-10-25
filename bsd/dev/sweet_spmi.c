@@ -92,7 +92,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
 	unsigned peripheral = addr >> 8;
 	/* redfin: battery blocks on PM7250B (SID 2), RTC on PM8150 (SID 0). */
 	bool batt = sid == 2 && (peripheral == 0x10 || peripheral == 0x11 ||
-	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+	    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48 ||
+	    /* 0960: Type-C (0x15), SMB misc/watchdog (0x16), QG SDAM (0xb1): read only */
+	    peripheral == 0x15 || peripheral == 0x16 || peripheral == 0xb1);
 	bool rtc = sid == 0 && peripheral == 0x60;
 	if (!sp_ready || !out || addr > 0xffffu || !(batt || rtc)) {
 		return -1;

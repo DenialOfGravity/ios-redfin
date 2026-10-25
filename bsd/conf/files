@@ -120,6 +120,7 @@ bsd/dev/sweet_guard.c			standard
 bsd/dev/sweet_mic.c			standard
 bsd/dev/sweet_adsp.c			standard
 bsd/dev/sweet_cpufreq.c			standard
+bsd/dev/sweet_thermal.c			standard
 bsd/dev/sweet_poke.c			standard
 bsd/dev/sweet_files.c			standard
 bsd/dev/sweet_pmem.c			standard

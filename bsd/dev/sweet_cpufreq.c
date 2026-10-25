@@ -92,5 +92,7 @@ sweet_cpufreq_init(void)
 		printf("SWEET CPUFREQ: %s index %u -> %u (%u MHz), reads back %u\n",
 		    osm_clusters[c].name, cur, best, best_khz / 1000, osm_rd(base, OSM_DESIRED));
 	}
+	extern void sweet_thermal_start(void);
+	sweet_thermal_start();  /* 0960: TSENS sampling, bsd/dev/sweet_thermal.c */
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */
