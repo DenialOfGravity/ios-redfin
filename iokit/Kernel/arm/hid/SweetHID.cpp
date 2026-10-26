@@ -561,10 +561,15 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
 	}
 }
 
+extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
+
 void
 SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
 {
 	uint64_t now = stamp ? stamp : mach_absolute_time();
+	if (down) {
+		sweet_cpufreq_boost(0);         /* 0970: touch boost (w boost 1 / sweetgov) */
+	}
 	IOHIDEvent *collection;
 	bool any = false;
 

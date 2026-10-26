@@ -59,6 +59,7 @@ int sweet_gpu_cpu_target(uint64_t *pa);         /* 0946 (sweetfbx & 8) */
 void sweet_gpu_cpu_flip(void);
 void sweet_gpu_present_tag(uint64_t swap_abs);
 void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
+void sweet_cpufreq_boost(int why);              /* 0970: bsd/dev/sweet_cpufreq.c */
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
 uint32_t sweet_gpu_fence_submitted(void);       /* 0949: CPU present after the GPU has drawn the frame */
 int sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms);
@@ -928,6 +929,13 @@ AppleCLCD::swap(const uint8_t *rec)
 		if (t <= 5000) {
 			fStBucket[t <= 111 ? 0 : t <= 180 ? 1 : t <= 260 ? 2 : t <= 350 ? 3 : 4]++;
 		}
+	}
+	static uint64_t flowing;
+	if (flowing == 0) {
+		nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &flowing);
+	}
+	if (fStLastSwap != 0 && now - fStLastSwap < flowing) {
+		sweet_cpufreq_boost(1);         /* 0970: frames flowing (< 50 ms apart): animation boost */
 	}
 	fStLastSwap = now;
 	fStSwaps++;
@@ -2015,6 +2023,7 @@ AppleCLCD::presentCPU(const uint8_t *rec)
 		}
 		fCpuXKey = key;
 	}
+	sweet_cpufreq_boost(2);         /* 0970: the copy on a boosted core (the gold idles at 650-900 MHz) */
 	uint64_t pa = 0;
 	if (sweet_gpu_cpu_target(&pa) == 1) {
 		fPresentBusy = true;    /* the last flip has not latched: again soon */

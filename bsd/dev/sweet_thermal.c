@@ -457,6 +457,15 @@ sweet_power_cmd(const char *s, const char *end)
 		if (sweet_cpufreq_gov(on != 0, ms) < 0) {
 			printf("SWEET POWER: governor unavailable\n");
 		}
+	} else if (pc_is(w, "boost")) {
+		/* 0970: w boost 0|1: the big-core policy and the touch/animation boost */
+		extern void sweet_cpufreq_boost_set(int on);
+		unsigned on = 0;
+		if (!pc_num(&s, end, &on)) {
+			printf("SWEET POWER: usage: w boost 0|1\n");
+			return;
+		}
+		sweet_cpufreq_boost_set(on != 0);
 	} else if (pc_is(w, "cap")) {
 		unsigned n = 0;
 		if (pc_num(&s, end, &n) && n <= 3) {
@@ -498,7 +507,7 @@ sweet_power_cmd(const char *s, const char *end)
 		}
 		sweet_charger_dump();
 	} else {
-		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, cap, gpu, chg)\n", w);
+		printf("SWEET POWER: unknown \"w %s\" (stat, freq, table, gov, boost, cap, gpu, chg)\n", w);
 	}
 }
 
