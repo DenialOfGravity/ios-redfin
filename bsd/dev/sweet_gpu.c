@@ -549,6 +549,7 @@ static uint32_t back_fence;             /* latest present queued into the back b
 static uint64_t flip_abs;               /* when the last flip was flushed */
 static uint64_t stat_flips;
 static uint32_t stat_flip_late;         /* flips taken as latched by time, not by CTL0's flush bits */
+static int mdp_owned;                   /* 0948: the poke p mdp test/scale owns VIG0/VIG1 (sweet_gpu_mdp_own) */
 
 static bool
 fb_flip_on(void)
@@ -583,6 +584,9 @@ flip_latched_locked(void)
 static void
 flip_to_locked(uint32_t buf)
 {
+	if (mdp_owned) {
+		return;         /* 0948: the pipes show a test pattern; p mdp restore puts this buffer back */
+	}
 	uint64_t from = A6_FB_PA + scan_buf * A6_FB_BUF_OFF, to = A6_FB_PA + buf * A6_FB_BUF_OFF;
 	for (uint32_t p = 0; p < 2; p++) {
 		uint32_t a = a6_rd(SSPP_VIG(p) + SSPP_SRC0_ADDR);
@@ -697,6 +701,19 @@ sweet_mdp_wr(uint32_t off, uint32_t v)
 	if (off < MDP_WINDOW && !(off & 3)) {
 		a6_wr(MDP + off, v);
 	}
+}
+
+/*
+ * 0948: the poke p mdp test/scale (SweetFramebuffer.cpp) takes VIG0/VIG1 over: no flip touches them until it gives
+ * them back. Under sweet_gpu_lock, so a flip in progress finishes first.
+ */
+void sweet_gpu_mdp_own(int on);
+void
+sweet_gpu_mdp_own(int on)
+{
+	lck_mtx_lock(&sweet_gpu_lock);
+	mdp_owned = on;
+	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
 /* ---- surfaces ---- */
