@@ -497,7 +497,9 @@ class AppleARMBacklight : public IOService {
 
 public:
 	AppleCLCD *fFB;
+	bool fNitsDone;
 	void publish(uint32_t level);
+	void publishNits(uint32_t level);
 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 };
 
@@ -518,6 +520,50 @@ AppleARMBacklight::publish(uint32_t level)
 	}
 	OSSafeReleaseNULL(b);
 	OSSafeReleaseNULL(p);
+	publishNits(level);
+}
+
+/*
+ * redfin 0973: the panel's luminance in nits, under the names CoreBrightness's strings have (without them it
+ * clamps its target to 1 nit and never updates the backlight: "systemShallUpdateBacklight=false"). The S6E3HC2
+ * at its 500 nits <-> level 1023 (SWEET_BL_MAX_NITS), 2 nits the floor. Integer nits; boot-arg sweetnits=0: none.
+ */
+#define SWEET_BL_MIN_NITS       2u
+void
+AppleARMBacklight::publishNits(uint32_t level)
+{
+	static int on = -1;
+	if (on < 0) {
+		uint32_t v = 1;
+		PE_parse_boot_argn("sweetnits", &v, sizeof(v));
+		on = v != 0;
+	}
+	if (!on) {
+		return;
+	}
+	uint32_t nits = level * SWEET_BL_MAX_NITS / SWEET_BL_MAX;
+	nits = nits < SWEET_BL_MIN_NITS ? SWEET_BL_MIN_NITS : nits;
+	if (!fNitsDone) {
+		static const struct {
+			const char *key;
+			uint32_t value;
+		} fixed[] = {
+			{ "MinNits", SWEET_BL_MIN_NITS }, { "MaxNits", SWEET_BL_MAX_NITS }, { "MaxNitsPanel", SWEET_BL_MAX_NITS },
+			{ "HardwareAccessibleMinNits", SWEET_BL_MIN_NITS }, { "HardwareAccessibleMaxNits", SWEET_BL_MAX_NITS },
+			{ "user-accessible-max-nits", SWEET_BL_MAX_NITS }, { "digital-dimming-min-nits", SWEET_BL_MIN_NITS },
+			{ "brightness-nits-cap", SWEET_BL_MAX_NITS },
+			{ "DisplayPanelLuminanceMin", SWEET_BL_MIN_NITS }, { "DisplayPanelLuminanceMid", SWEET_BL_MAX_NITS / 2 },
+			{ "DisplayPanelLuminanceMax", SWEET_BL_MAX_NITS },
+			{ "DisplayProductLuminanceMin", SWEET_BL_MIN_NITS }, { "DisplayProductLuminanceMid", SWEET_BL_MAX_NITS / 2 },
+			{ "DisplayProductLuminanceMax", SWEET_BL_MAX_NITS },
+		};
+		for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+			setProperty(fixed[i].key, (unsigned long long)fixed[i].value, 32);
+		}
+		fNitsDone = true;
+		IOLog("SWEET BL: 0973 nits published: %u..%u nits (sweetnits=0: off)\n", SWEET_BL_MIN_NITS, SWEET_BL_MAX_NITS);
+	}
+	setProperty("brightness-nits", (unsigned long long)nits, 32);
 }
 
 IOReturn
