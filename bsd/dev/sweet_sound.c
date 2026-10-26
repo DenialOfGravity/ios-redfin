@@ -101,6 +101,7 @@ extern bool sweet_amp_healthy(void);
 extern void sweet_amp_stop(void);
 extern bool sweet_amp_ready(void);
 extern void sweet_amp_status(void);
+extern void sweet_amp_reprobe(void);
 /* bsd/dev/sweet_mic.c */
 extern int sweet_mic_cmd(uint32_t seconds);
 extern void sweet_mic_status(void);
@@ -1383,6 +1384,14 @@ sweet_sound_cmd(const char *s, const char *end)
 		SAY("off: the amplifiers are stopped and kept off (`a on' allows them again)\n");
 		return 0;
 	}
+	if (is(w, len, "probe")) {
+		if (level < 3 || !path_up) {
+			SAY("probe: the amplifiers are not in use (sound=%u, path %s)\n", level, path_up ? "up" : "down");
+			return -1;
+		}
+		sweet_amp_reprobe();    /* (the amplifiers that did not answer: reset, DEVID, configure; they join at the next ON) */
+		return 0;
+	}
 	if (is(w, len, "mic")) {
 		return sweet_mic_cmd(number(&s, end, 3));
 	}
@@ -1391,7 +1400,7 @@ sweet_sound_cmd(const char *s, const char *end)
 		SAY("on: the amplifiers may run again\n");
 		return 0;
 	}
-	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on, mic SECS)\n");
+	SAY("poke a: unknown command (status, tone [MS], gain DB, off, on, probe, mic SECS)\n");
 	return -1;
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -1,8 +1,8 @@
 /*
  * redfin (Pixel 5): the two Cirrus Logic CS35L41 speaker amplifiers. Patch 0953 (WS-A).
  *
- * Where they are (live DT i2c@98c000, lito-redbull-audio.dtsi): I2C 0x40 (cs35l41_l, bottom speaker,
- * "cirrus,left-channel-amp", ASP RX slot 0) and 0x41 (cs35l41_r, earpiece-top, prefix "R", slot 1) on
+ * Where they are (live DT i2c@98c000, lito-redbull-audio.dtsi): I2C 0x40 (cs35l41_l, "cirrus,left-channel-amp",
+ * ASP RX slot 0; heard as the TOP/earpiece speaker, r29b) and 0x41 (cs35l41_r, prefix "R", slot 1; heard as the BOTTOM one) on
  * QUPv3 SE9, the DRV2624's bus: every transfer goes through bsd/dev/sweet_haptic.c's
  * sweet_se9_xfer(), under its lock (so sweethaptic=1 must have brought the bus up). Reset lines:
  * PM8150L GPIO11 (0x40, SID 4 peripheral 0xca) and PM7250B GPIO11 (0x41, SID 2 peripheral 0xca): the 0x41
@@ -47,6 +47,7 @@ bool sweet_amp_healthy(void);
 void sweet_amp_stop(void);
 bool sweet_amp_ready(void);
 void sweet_amp_status(void);
+void sweet_amp_reprobe(void);
 int sweet_audio_pmic_gpio(unsigned sid, unsigned peripheral, int high);
 
 #define SAY(...)                printf("SWEET AMP: " __VA_ARGS__)
@@ -273,10 +274,18 @@ static struct amp {
 	unsigned slot, reset_gpio;              /* reset_gpio: index into allowed[] */
 	bool present, prepared, on;
 	uint32_t revid, otpid, pwr2;
+	unsigned reprobes;                      /* 0958: lazy re-probes made (limit CS_REPROBE_MAX per boot) */
+	uint64_t last_try_us;                   /* 0958: when the last one began (0: none yet) */
 } amps[2] = {
-	{ AMP_L, "0x40 (left, bottom)", 0, 0, false, false, false, 0, 0, 0 },
-	{ AMP_R, "0x41 (right, top)", 1, 1, false, false, false, 0, 0, 0 },
+	/* (position labels as heard on the phone, r29b: 0x41 is the bottom speaker, 0x40 the top/earpiece one; routing unchanged) */
+	{ AMP_L, "0x40 (top)", 0, 0, false, false, false, 0, 0, 0, 0, 0 },
+	{ AMP_R, "0x41 (bottom)", 1, 1, false, false, false, 0, 0, 0, 0, 0 },
 };
+static unsigned se9_waited_ms;                  /* 0958: how long sweet_amp_prepare() waited for SE9 */
+static LCK_MTX_DECLARE(reprobe_lock, &amp_lock_group);
+#define CS_REPROBE_MAX          20u             /* per boot, per amplifier */
+#define CS_REPROBE_GAP_US       10000000ull     /* at least 10 s between two tries of one amplifier */
+#define CS_REPROBE_OTP_MS       30u             /* (boot probe: 100) so the ON path stays short */
 static uint32_t below_now = CS_VOL_MAX_BELOW + 1;
 static bool gave_up, warned_temp;
 
@@ -428,7 +437,7 @@ cs_otp(struct amp *a)
 }
 
 static bool
-probe(struct amp *a)
+probe(struct amp *a, unsigned otp_ms, const char *tag)
 {
 	uint32_t devid = 0, st = 0;
 	int err;
@@ -436,20 +445,20 @@ probe(struct amp *a)
 
 	err = cs_read(a, CS_DEVID, &devid);
 	if (err) {
-		SAY("%s: NO ANSWER on SE9 (%d%s)\n", a->name, err, err == ENXIO ? ": NACK, or the SE9 bus is not up (sweethaptic=1)" : "");
+		SAY("%s: %sNO ANSWER on SE9 (%d%s)\n", a->name, tag, err, err == ENXIO ? ": NACK, or the SE9 bus is not up (sweethaptic=1)" : "");
 		return false;
 	}
 	(void)cs_read(a, CS_REVID, &a->revid);
-	for (ms = 0; ms < 100; ms++) {
+	for (ms = 0; ms < otp_ms; ms++) {
 		if (cs_read(a, CS_IRQ1_STATUS4, &st) == 0 && (st & CS_OTP_BOOT_DONE)) {
 			break;
 		}
 		sleep_ms(1);
 	}
 	(void)cs_read(a, CS_IRQ1_STATUS3, &st);
-	SAY("%s: DEVID %#x REVID %#x, OTP boot %s%s\n", a->name, devid, a->revid, ms < 100 ? "done" : "NOT DONE",
+	SAY("%s: %sDEVID %#x REVID %#x, OTP boot %s%s\n", a->name, tag, devid, a->revid, ms < otp_ms ? "done" : "NOT DONE",
 	    (st & CS_OTP_BOOT_ERR) ? ", OTP BOOT ERROR" : "");
-	if ((devid != CS_CHIP_ID && devid != CS_CHIP_ID_R) || ms >= 100 || (st & CS_OTP_BOOT_ERR)) {
+	if ((devid != CS_CHIP_ID && devid != CS_CHIP_ID_R) || ms >= otp_ms || (st & CS_OTP_BOOT_ERR)) {
 		return false;
 	}
 	a->present = true;
@@ -490,6 +499,75 @@ configure(struct amp *a)
 	    "SCLK 6.144 MHz, gain 17, muted", pwr2);
 	a->prepared = !err;
 	return !err;
+}
+
+/* 0958: what "the SE9 bus is up" rests on: a DEVID read of each amplifier (sweet_se9_xfer: 0 = answered, ENXIO = bus down or NACK). */
+static void
+se9_look(const char *why)
+{
+	uint32_t id = 0;
+	int e0 = cs_read(&amps[0], CS_DEVID, &id), e1 = cs_read(&amps[1], CS_DEVID, &id);
+
+	SAY("SE9 state (%s): DEVID read of %s -> %d, of %s -> %d, waited %u ms at boot: %s\n", why, amps[0].name, e0, amps[1].name, e1,
+	    se9_waited_ms, e0 && e1 ? "neither answers (bus not up, or both NACK)" : e0 || e1 ?
+	    "the bus is up; the other one NACKs (reset, power or address)" : "both answer");
+}
+
+static uint64_t
+now_us(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
+
+/*
+ * 0958: an amplifier that did not answer at boot is probed again: its own reset pulse (as sweet_amp_prepare(): low, 3 ms, high,
+ * 3 ms, only with sndgpio=1; the other amplifier is left alone), the DEVID read, and if it answers the same configure() as at
+ * boot, so it joins the next start. Lazy: from sweet_amp_start() (the watcher thread, never the audio feeder), at most once per
+ * 10 s per amplifier, 20 times per boot; `force' (poke a probe) skips the 10 s. One log line per attempt. Cost of a failed try
+ * ~7 ms; a successful one adds the OTP wait (<= 30 ms) and configure().
+ */
+static void
+reprobe_one(struct amp *a, bool force)
+{
+	char tag[24];
+	uint64_t now = now_us();
+
+	if (a->prepared || a->on || (!force && (a->reprobes >= CS_REPROBE_MAX ||
+	    (a->last_try_us != 0 && now - a->last_try_us < CS_REPROBE_GAP_US)))) {
+		return;
+	}
+	a->last_try_us = now;
+	a->reprobes++;
+	snprintf(tag, sizeof(tag), "re-probe %u: ", a->reprobes);
+	if (pmic_writes) {
+		(void)sweet_audio_pmic_gpio(allowed[a->reset_gpio].sid, allowed[a->reset_gpio].peripheral, 0);
+		sleep_ms(3);
+		(void)sweet_audio_pmic_gpio(allowed[a->reset_gpio].sid, allowed[a->reset_gpio].peripheral, 1);
+		sleep_ms(3);
+	}
+	a->present = false;
+	if (probe(a, CS_REPROBE_OTP_MS, tag)) {
+		(void)configure(a);
+	}
+}
+
+void
+sweet_amp_reprobe(void)
+{
+	/* (poke a probe) */
+	if (!lck_mtx_try_lock(&reprobe_lock)) {
+		SAY("re-probe: one is running already\n");
+		return;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		if (!amps[i].prepared) {
+			reprobe_one(&amps[i], true);
+		}
+	}
+	lck_mtx_unlock(&reprobe_lock);
 }
 
 bool
@@ -536,13 +614,15 @@ sweet_amp_prepare(void)
 			}
 			sleep_ms(100);
 		}
+		se9_waited_ms = waited;
 		SAY("SE9: %s after %u ms\n", waited < 15000 ? "an amplifier answers" : "NO AMPLIFIER ANSWERS (or the bus never came up)",
 		    waited);
 	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amp *a = &amps[i];
 
-		if (!probe(a)) {
+		if (!probe(a, 100, "")) {
+			se9_look("boot probe failed");
 			gpio_look(a->reset_gpio);
 			if (!pmic_writes) {
 				SAY("%s: if its reset line above is low or an input, sndgpio=1 lets this kernel drive it high\n", a->name);
@@ -579,6 +659,13 @@ sweet_amp_start(void)
 
 	if (gave_up) {
 		return false;
+	}
+	/* 0958: an amplifier missing since boot gets another try now (rate-limited inside; skipped if poke a probe is at it) */
+	if (lck_mtx_try_lock(&reprobe_lock)) {
+		for (unsigned i = 0; i < 2; i++) {
+			reprobe_one(&amps[i], false);
+		}
+		lck_mtx_unlock(&reprobe_lock);
 	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amp *a = &amps[i];
@@ -672,7 +759,7 @@ sweet_amp_status(void)
 		uint32_t s1 = 0, p1 = 0, p2 = 0, vol = 0;
 
 		if (!a->present) {
-			SAY("%s: not present\n", a->name);
+			SAY("%s: not present (re-probes %u of %u)\n", a->name, a->reprobes, CS_REPROBE_MAX);
 			continue;
 		}
 		(void)cs_read(a, CS_IRQ1_STATUS1, &s1);
