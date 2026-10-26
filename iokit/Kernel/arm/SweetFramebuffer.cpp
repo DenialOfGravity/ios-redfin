@@ -1437,6 +1437,8 @@ AppleCLCD::presentCPU(const uint8_t *rec)
 	}
 	dw = dw > pw ? pw : dw ? dw : 1;
 	dh = dh > ph ? ph : dh ? dh : 1;
+	dh = ph - dh <= 2 ? ph : dh;    /* 0947: as the GPU fit, the whole panel within 2 px */
+	dw = pw - dw <= 2 ? pw : dw;
 	uint32_t dx = (pw - dw) / 2, dy = (ph - dh) / 2;
 	uint64_t key = (uint64_t)w << 32 | (uint64_t)dw << 16 | dx;
 	if (key != fCpuXKey) {
@@ -1717,10 +1719,41 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 	}
 
+	/*
+	 * 0947: once frames are fitted (GPU blit or CPU present), a swap that sets no layer (the others keep theirs)
+	 * or only the panel's own surface changes nothing: it used to fall through to the crop copy below, which flips
+	 * back to the first buffer and draws the cropped frame over the fitted ones: the tearing/flicker seen with
+	 * the CPU present, and with the GPU path whenever it fell back.
+	 */
+	if (fGPU || fCpuXKey) {
+		bool keep = mask == 0;
+		if (!keep && !(mask & (mask - 1))) {
+			uint32_t l = (uint32_t)__builtin_ctz(mask);
+			uint32_t id = l < SWEET_FB_LAYERS ? get32(rec, 0x54 + 4 * l) : 0;
+			keep = id == 0 || (fSurface != NULL && id == fSurface->id);
+		}
+		if (keep) {
+			static uint32_t logs;
+			if (logs < 4) {
+				logs++;
+				IOLog("SWEET FB: swap %u (layers %#x) kept the fitted frame on screen\n", get32(rec, 0x50), mask);
+			}
+			return;
+		}
+	}
 	if ((sweet_fbx & SWEET_FBX_CPUPRESENT) && presentCPU(rec)) {
 		return;         /* 0946 */
 	}
 	if (sweet_gpu_ready() && presentGPU(rec)) {
+		return;
+	}
+	if (fGPU || fCpuXKey) {
+		/* 0947: frames are fitted: a frame neither fit path takes is not cropped over them (see above) */
+		static uint32_t logs;
+		if (logs < 4) {
+			logs++;
+			IOLog("SWEET FB: swap %u (layers %#x) not fitted: the last frame stays\n", get32(rec, 0x50), mask);
+		}
 		return;
 	}
 	sweet_gpu_scanout_front();	/* 0905: the CPU copy below draws into the first panel buffer */

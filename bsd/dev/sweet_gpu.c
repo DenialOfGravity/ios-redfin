@@ -932,6 +932,10 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		frame.dw = PANEL_W;
 		frame.dh = (uint32_t)(((uint64_t)h * PANEL_W + w / 2) / w);
 	}
+	/* 0947: within 2 px of the panel: all of it (1125x2436 gave 1080x2339, and row 2339 was never written:
+	 * it flickered between the two flip buffers' old contents) */
+	frame.dh = PANEL_H - frame.dh <= 2 ? PANEL_H : frame.dh;
+	frame.dw = PANEL_W - frame.dw <= 2 ? PANEL_W : frame.dw;
 	frame.dx = (PANEL_W - frame.dw) / 2;
 	frame.dy = (PANEL_H - frame.dh) / 2;
 	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
