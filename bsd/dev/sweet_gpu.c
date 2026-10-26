@@ -638,6 +638,31 @@ sweet_gpu_scanout_front(void)
 	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
+/*
+ * 0943: display engine registers for the framebuffer (SweetFramebuffer.cpp: p fc, p hz, the tear-check
+ * phase). Only inside the MDP's 2 MB device window, which the panel code above already maps (gpu_io);
+ * nothing past it is ever read. INTF1 and its tear check run since ABL (autorefresh), so they are clocked.
+ */
+#define MDP_WINDOW      0x200000u
+uint32_t sweet_mdp_rd(uint32_t off);
+void sweet_mdp_wr(uint32_t off, uint32_t v);
+uint32_t
+sweet_mdp_rd(uint32_t off)
+{
+	if (off >= MDP_WINDOW || (off & 3)) {
+		return 0;
+	}
+	return a6_rd(MDP + off);
+}
+
+void
+sweet_mdp_wr(uint32_t off, uint32_t v)
+{
+	if (off < MDP_WINDOW && !(off & 3)) {
+		a6_wr(MDP + off, v);
+	}
+}
+
 /* ---- surfaces ---- */
 
 static int present_wait_locked(uint32_t k, const char *why);
@@ -720,6 +745,56 @@ present_wait_locked(uint32_t k, const char *why)
 	}
 	return 0;
 }
+
+/*
+ * 0943: when each present's blit landed, for the framebuffer's 5 s line (fence us = queued -> fence seen
+ * signalled, as finely as it is polled: every present, every vsync tick and every 1 ms of the present thread
+ * while a blit is out).
+ */
+static uint64_t present_queued_abs[2];  /* 0 = landed (or never queued) */
+static uint64_t present_land_abs, present_land_n;
+
+static void
+present_landed_locked(uint64_t now)
+{
+	for (uint32_t k = 0; k < 2; k++) {
+		if (present_queued_abs[k] && (!present_fence[k] || a6_fence_done(&gpu, present_fence[k]))) {
+			present_land_abs += now - present_queued_abs[k];
+			present_land_n++;
+			present_queued_abs[k] = 0;
+		}
+	}
+}
+
+/* True while a present's blit is still out. Never blocks. */
+bool sweet_gpu_present_poll(void);
+bool
+sweet_gpu_present_poll(void)
+{
+	if (!gpu_ready || !(present_queued_abs[0] | present_queued_abs[1])) {
+		return false;
+	}
+	if (lck_mtx_try_lock(&sweet_gpu_lock)) {
+		present_landed_locked(mach_absolute_time());
+		lck_mtx_unlock(&sweet_gpu_lock);
+	}
+	return (present_queued_abs[0] | present_queued_abs[1]) != 0;
+}
+
+/* Sum (absolute time) and count of blit->fence latencies since the last call (0 when the GPU lock is busy). */
+void sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n);
+void
+sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n)
+{
+	*sum_abs = *n = 0;
+	if (!gpu_ready || !lck_mtx_try_lock(&sweet_gpu_lock)) {
+		return;
+	}
+	*sum_abs = present_land_abs;
+	*n = present_land_n;
+	present_land_abs = present_land_n = 0;
+	lck_mtx_unlock(&sweet_gpu_lock);
+}
 #define PANEL_W         1080
 #define PANEL_H         2340
 #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
@@ -799,6 +874,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	}
 	static uint32_t ib[10 * A6_BLIT_MAX_DW];
 	lck_mtx_lock(&sweet_gpu_lock);
+	present_landed_locked(mach_absolute_time());	/* 0943 */
 	uint64_t fb_gva = A6_GVA_FB;
 	if (fb_flip_on()) {
 		/* 0905: draw into the buffer that is not on screen, once the last flip has latched */
@@ -893,6 +969,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 		gpu_note_submit_locked();
 		present_fence[k] = a6_submit_ib_async(&gpu, a6_pool_va(PRESENT_IB(k)), n, 100);
 		gpu_owner_locked(present_fence[k], 0);
+		present_queued_abs[k] = present_fence[k] ? mach_absolute_time() : 0;	/* 0943 */
 		rc = present_fence[k] ? 0 : -1;
 		present_next++;
 		if (fb_flip > 0 && present_fence[k]) {

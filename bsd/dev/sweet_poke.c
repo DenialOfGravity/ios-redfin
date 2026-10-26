@@ -8,6 +8,7 @@
  *   w ADDR VAL             write
  *   m ADDR MASK VAL        read-modify-write: (old & ~MASK) | (VAL & MASK)
  *   p ADDR MASK VAL MS     poll until (read & MASK) == VAL, at most MS ms
+ *   p fc | p hz 60|90 [tc] the panel's frame rate (0943, SweetFramebuffer.cpp)
  *   s MS                   sleep
  *   # ...                  comment
  *
@@ -126,6 +127,18 @@ poke_line(const char *s, const char *end, unsigned lineno)
 {
 	while (s < end && (*s == ' ' || *s == '\t')) {
 		s++;
+	}
+	if (end - s > 2 && s[0] == 'p' && (s[1] == ' ' || s[1] == '\t')) {
+		/* redfin (0943): "p WORD ..." = display commands (SweetFramebuffer.cpp: p fc, p hz 60|90 [tc]); "p ADDR ..." stays a poll */
+		const char *q = s + 1;
+		while (q < end && (*q == ' ' || *q == '\t')) {
+			q++;
+		}
+		if (q < end && *q >= 'a' && *q <= 'z') {
+			extern void sweet_fb_cmd(const char *s, const char *end);
+			sweet_fb_cmd(q, end);
+			return;
+		}
 	}
 	if (s >= end || *s == '#' || *s == '\n') {
 		return;
