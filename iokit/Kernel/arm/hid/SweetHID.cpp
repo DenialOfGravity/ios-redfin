@@ -366,7 +366,7 @@ class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
 public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-	void touch(int finger, bool down, int x, int y);
+	void touch(int finger, bool down, int x, int y, uint64_t stamp = 0);
 protected:
 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
@@ -460,10 +460,111 @@ SweetHIDTouch::start(IOService *provider)
 	return true;
 }
 
-void
-SweetHIDTouch::touch(int finger, bool down, int x, int y)
+/*
+ * 0945: what iOS sees, per source: real fingers, and finger 9 (tap / swipe
+ * from the command channel). Intervals between the HID timestamps of one
+ * contact's consecutive moves, stalls (> 20 ms while moving >= 8 px), and the
+ * time dispatchEvent takes. One line every 5 s, or when the source lifts its
+ * last finger after >= 10 moves (one scroll or one swipe).
+ */
+extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+extern "C" void nanoseconds_to_absolutetime(uint64_t nanoseconds, uint64_t *result);
+#define SWEET_TS_N 1024u
+static struct {
+	uint64_t start, disp_sum;
+	uint32_t n, moves, gaps, disp_max, disp_n;
+	uint32_t dt[SWEET_TS_N];
+} gTouchStat[2];
+static uint64_t gTouchLastT[SWEET_TOUCH_FINGERS];
+static int gTouchLastX[SWEET_TOUCH_FINGERS], gTouchLastY[SWEET_TOUCH_FINGERS];
+
+static uint32_t
+sweetTouchUs(uint64_t abs)
 {
-	uint64_t now = mach_absolute_time();
+	uint64_t ns;
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / 1000u > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / 1000u);
+}
+
+static void
+sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool down, bool moved,
+    uint64_t stamp, int x, int y, uint32_t dispUs)
+{
+	int src = finger == 9 ? 1 : 0;
+	uint32_t v[5] = {0}, n, moves, gaps, dmax, davg;
+	bool report = false;
+	uint64_t now = mach_absolute_time(), win;
+
+	nanoseconds_to_absolutetime(5000000000ull, &win);
+	IOLockLock(lock);
+	auto &st = gTouchStat[src];
+	if (!st.start && down) {
+		st.start = now;
+	}
+	st.disp_sum += dispUs;
+	st.disp_n++;
+	st.disp_max = dispUs > st.disp_max ? dispUs : st.disp_max;
+	if (was && down && moved) {
+		st.moves++;
+		if (gTouchLastT[finger] && stamp >= gTouchLastT[finger]) {
+			uint32_t dt = sweetTouchUs(stamp - gTouchLastT[finger]);
+			int d = (x > gTouchLastX[finger] ? x - gTouchLastX[finger] : gTouchLastX[finger] - x) +
+			    (y > gTouchLastY[finger] ? y - gTouchLastY[finger] : gTouchLastY[finger] - y);
+			if (st.n < SWEET_TS_N) {
+				st.dt[st.n++] = dt;
+			}
+			if (dt > 20000u && d >= 8) {
+				st.gaps++;
+			}
+		}
+	}
+	gTouchLastT[finger] = down ? stamp : 0;
+	gTouchLastX[finger] = x;
+	gTouchLastY[finger] = y;
+	bool lifted = was && !down;
+	for (int i = 0; lifted && i < SWEET_TOUCH_FINGERS; i++) {
+		if (fingersDown[i] && (i == 9) == (src == 1)) {
+			lifted = false;
+		}
+	}
+	if (st.start && (now - st.start >= win || (lifted && st.n >= 10))) {
+		for (uint32_t i = 1; i < st.n; ++i) {   /* insertion sort, n <= 1024 */
+			uint32_t t = st.dt[i], j = i;
+			while (j > 0 && st.dt[j - 1] > t) {
+				st.dt[j] = st.dt[j - 1];
+				--j;
+			}
+			st.dt[j] = t;
+		}
+		if (st.n) {
+			v[0] = st.dt[(st.n - 1) * 5 / 100];
+			v[1] = st.dt[(st.n - 1) * 50 / 100];
+			v[2] = st.dt[(st.n - 1) * 95 / 100];
+			v[3] = st.dt[st.n - 1];
+		}
+		report = true;
+	}
+	n = st.n;
+	moves = st.moves;
+	gaps = st.gaps;
+	dmax = st.disp_max;
+	davg = st.disp_n ? (uint32_t)(st.disp_sum / st.disp_n) : 0;
+	if (report || (lifted && st.n < 10)) {
+		bzero(&st, sizeof(st));
+	}
+	IOLockUnlock(lock);
+	if (report) {
+		IOLog("SWEET HID: %s: moves %u (dt %u) dt p5/p50/p95/max %u.%u/%u.%u/%u.%u/%u.%u ms"
+		    " | gaps>20ms %u | dispatch avg/max %u/%u us\n", src ? "swipe" : "real", moves, n,
+		    v[0] / 1000, v[0] % 1000 / 100, v[1] / 1000, v[1] % 1000 / 100,
+		    v[2] / 1000, v[2] % 1000 / 100, v[3] / 1000, v[3] % 1000 / 100, gaps, davg, dmax);
+	}
+}
+
+void
+SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+{
+	uint64_t now = stamp ? stamp : mach_absolute_time();
 	IOHIDEvent *collection;
 	bool any = false;
 
@@ -576,8 +677,11 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
 		    fEdge[finger] ? " edge" : "");
 	}
+	uint64_t t1 = mach_absolute_time();
 	dispatchEvent(collection);
+	uint32_t dispUs = sweetTouchUs(mach_absolute_time() - t1);
 	collection->release();
+	sweetTouchStat(fLock, fDown, finger, was, down, moved, now, x, y, dispUs);
 }
 
 /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
@@ -591,6 +695,15 @@ sweet_hid_key(int key, int down)
 
 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
 		gSweetButtons->key(usages[key], down != 0);
+	}
+}
+
+/* 0945: with the sample's own time (mach absolute) as the HID timestamp. */
+extern "C" void
+sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp)
+{
+	if (gSweetTouch) {
+		gSweetTouch->touch(finger, down != 0, x, y, stamp);
 	}
 }
 
