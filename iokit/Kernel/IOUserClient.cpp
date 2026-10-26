@@ -2660,6 +2660,27 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char 
 }
 #endif
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/* redfin 0982: every property read from the sweetbtnub stand-in nubs (iokit/Kernel/arm/SweetBTNub.cpp) */
+extern "C" bool SweetBTNubIs(const void *entry);
+static uint32_t sweet_btnub_reads;
+
+static void
+sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
+{
+	if (!SweetBTNubIs(entry) || sweet_btnub_reads >= 500) {
+		return;
+	}
+	sweet_btnub_reads++;
+	char pname[32];
+	proc_selfname(pname, (int)sizeof(pname));
+	OSObject *v = key ? entry->copyProperty(key) : NULL;
+	IOLog("SWEET BTNUB: %s reads %s.%s (%s) -> %s\n", pname, entry->getName(), key ? key : "*", how,
+	    key ? (v ? "found" : "MISSING") : "all");
+	OSSafeReleaseNULL(v);
+}
+#endif
+
 kern_return_t
 internal_io_service_get_matching_services(
 	mach_port_t main_port,
@@ -3656,6 +3677,9 @@ is_io_registry_entry_get_property_bytes(
 	IOReturn            ret = kIOReturnSuccess;
 
 	CHECK( IORegistryEntry, registry_entry, entry );
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	sweet_btnub_read(entry, property_name, "bytes");
+#endif
 
 #if CONFIG_MACF
 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
@@ -3724,6 +3748,9 @@ is_io_registry_entry_get_property(
 	OSObject *          obj;
 
 	CHECK( IORegistryEntry, registry_entry, entry );
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	sweet_btnub_read(entry, property_name, "get");
+#endif
 
 #if CONFIG_MACF
 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
@@ -3771,6 +3798,9 @@ is_io_registry_entry_get_property_recursively(
 	OSObject *          obj;
 
 	CHECK( IORegistryEntry, registry_entry, entry );
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	sweet_btnub_read(entry, property_name, "recursive");
+#endif
 
 #if CONFIG_MACF
 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
@@ -3864,6 +3894,9 @@ is_io_registry_entry_get_properties_bin_buf(
 	void                 * editRef = NULL;
 
 	CHECK(IORegistryEntry, registry_entry, entry);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	sweet_btnub_read(entry, NULL, "all");
+#endif
 
 #if CONFIG_MACF
 	GetPropertiesEditorRef ref;
@@ -3961,6 +3994,9 @@ is_io_registry_entry_get_property_bin_buf(
 	const OSSymbol *    sym;
 
 	CHECK( IORegistryEntry, registry_entry, entry );
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	sweet_btnub_read(entry, property_name, "bin");
+#endif
 
 #if CONFIG_MACF
 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {

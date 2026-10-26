@@ -878,9 +878,12 @@ sweet_geniuart_cmd(unsigned what)
 	return e ? e : (int)total;
 }
 
+extern void SweetBTNubStart(void);
+
 void
 sweet_geniuart_init(void)
 {
+	SweetBTNubStart();      /* 0982: stand-in "bluetooth" / "marconi-bt" nubs (sweetbtnub=1|2|3) */
 	uint32_t on = 0;
 	PE_parse_boot_argn("btuart", &on, sizeof(on));
 	if (!on) {
