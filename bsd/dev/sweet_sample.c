@@ -78,6 +78,59 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 }
 
+/*
+ * 0991: the task of a process by pid (pid >= 0) or by name (the first match), with a task reference, for the
+ * profiler (osfmk/arm64/sweet_prof.c).
+ */
+task_t sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len);
+
+struct sweet_prof_find {
+	const char *name;
+	size_t      len;
+	int         pid;
+};
+
+static int
+sweet_prof_find_proc(proc_t p, void *arg)
+{
+	struct sweet_prof_find *f = arg;
+	char name[32];
+	if (f->pid >= 0) {
+		return PROC_RETURNED;
+	}
+	proc_name(proc_pid(p), name, sizeof(name));
+	if (strlen(name) == f->len && strncmp(name, f->name, f->len) == 0) {
+		f->pid = proc_pid(p);
+		return PROC_RETURNED_DONE;
+	}
+	return PROC_RETURNED;
+}
+
+task_t
+sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len)
+{
+	if (pid < 0) {
+		struct sweet_prof_find f = { .name = name, .len = len, .pid = -1 };
+		proc_iterate(PROC_ALLPROCLIST, sweet_prof_find_proc, &f, NULL, NULL);
+		pid = f.pid;
+	}
+	if (pid < 0) {
+		return TASK_NULL;
+	}
+	proc_t p = proc_find(pid);
+	if (p == PROC_NULL) {
+		return TASK_NULL;
+	}
+	task_t task = proc_task(p);
+	if (task != TASK_NULL) {
+		task_reference(task);
+		*pid_out = pid;
+		proc_name(pid, name_out, (int)name_len);
+	}
+	proc_rele(p);
+	return task;
+}
+
 void
 sweet_sample_start(void)
 {

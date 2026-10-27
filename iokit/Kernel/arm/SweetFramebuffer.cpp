@@ -2929,9 +2929,46 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
  *                          CP waits for the latch (2; boot-arg sweetscangate)
  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
  */
+extern "C" void sweet_gpu_stats_flush(void);     /* 0991 */
+extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
+
 void
 AppleCLCD::fbCmd(const char *s, const char *end)
 {
+	if (end - s >= 4 && !strncmp(s, "disp", 4)) {
+		/* 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh) */
+		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
+		return;
+	}
+	if (end - s >= 5 && !strncmp(s, "phase", 5)) {
+		/*
+		 * 0991: p phase NAME: the FB, SCANOUT and GPU stats lines of the phase that ends now (when it had frames),
+		 * their windows restart, then "SWEET PHASE: NAME" (and a profiler mark). Every stats line between two
+		 * PHASE lines covers only that phase (tools-claude/fps-parse.py).
+		 */
+		const char *q = s + 5;
+		while (q < end && *q == ' ') {
+			q++;
+		}
+		uint64_t now = mach_absolute_time();
+		IOLockLock(fLock);
+		fStWin = 1;
+		IOLockUnlock(fLock);
+		statLine(now);
+		IOLockLock(fLock);
+		if (sweet_scan.on) {
+			sweet_scan.stWin = 1;
+			sweet_scan_stats_locked(now);
+		}
+		sweet_scan.stWin = now;
+		IOLockUnlock(fLock);
+		sweet_gpu_stats_flush();
+		IOLog("SWEET PHASE: %.*s\n", (int)(end - q > 60 ? 60 : end - q), q);
+		char mk[72];
+		snprintf(mk, sizeof(mk), "prof mark %.*s", (int)(end - q > 56 ? 56 : end - q), q);
+		sweet_prof_cmd(mk, mk + strlen(mk));
+		return;
+	}
 	if (end - s >= 8 && !strncmp(s, "swapdone", 8)) {
 		/* 0987: p swapdone [MASK | trace]: 1 swap-complete tick, 2 trace (trace = re-arm with 2 set); no argument: state */
 		const char *q = s + 8;

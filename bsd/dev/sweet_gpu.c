@@ -407,6 +407,7 @@ static struct { uint32_t lo, hi; int culprit; } lost[LOST_RING];	/* 0941: culpri
 #define GSTAT_OWNERS    6
 static uint32_t gstat_next = 1;
 static uint64_t gstat_abs;
+static bool gstat_force;     /* 0991: p phase: the line now, whatever the window */
 static int gstat_pid[A6_TS_SLOTS];
 static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1];     /* last: everyone else */
 static uint32_t gstat_n, gstat_missed;
@@ -447,8 +448,12 @@ gpu_stats_locked(void)
 		gstat_abs = now;
 	}
 	absolutetime_to_nanoseconds(now - gstat_abs, &ns);
-	if (ns < 5000000000ULL) {
+	if (ns < 5000000000ULL && !gstat_force) {
 		return;
+	}
+	gstat_force = false;
+	if (ns < 1000000) {
+		ns = 1000000;
 	}
 	if (gstat_n) {
 		char who[160] = "", name[24];
@@ -470,6 +475,21 @@ gpu_stats_locked(void)
 	gstat_busy = gstat_longest = 0;
 	bzero(gstat_own, sizeof(gstat_own));
 	gstat_abs = now;
+}
+
+/* 0991: p phase (SweetFramebuffer.cpp): the GPU stats line for the phase that ends; the window restarts now */
+void sweet_gpu_stats_flush(void);
+void
+sweet_gpu_stats_flush(void)
+{
+	if (!gpu_ready) {
+		return;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	gstat_force = true;
+	gpu_stats_locked();
+	gstat_force = false;
+	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
 static void

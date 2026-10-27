@@ -134,6 +134,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 		while (q < end && (*q == ' ' || *q == '\t')) {
 			q++;
 		}
+		if (end - q >= 4 && !strncmp(q, "prof", 4) && (end - q == 4 || q[4] == ' ')) {
+			/* 0991: p prof ... = the sampling profiler (osfmk/arm64/sweet_prof.c) */
+			extern void sweet_prof_cmd(const char *s, const char *end);
+			sweet_prof_cmd(q, end);
+			return;
+		}
 		if (q < end && *q >= 'a' && *q <= 'z') {
 			extern void sweet_fb_cmd(const char *s, const char *end);
 			sweet_fb_cmd(q, end);
