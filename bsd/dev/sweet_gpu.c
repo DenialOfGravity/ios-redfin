@@ -1522,7 +1522,35 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
 	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
-void sweet_scan_submit_gate(void);     /* 0985: SweetFramebuffer.cpp */
+uint32_t sweet_scan_submit_gate(void);         /* 0985: SweetFramebuffer.cpp; 0989: a GPU-side wait's reference */
+
+/*
+ * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
+ * for (p scanout gate 2); and each process's last fence (the swapper's frame is done at its own last submit, not at
+ * the latest of anyone's: r39's fence waits included other clients' work queued after it).
+ */
+void sweet_gpu_scan_word(uint32_t v);
+void
+sweet_gpu_scan_word(uint32_t v)
+{
+	if (gpu_ready) {
+		a6_write(a6_pool_pa(&gpu, A6_OFF_SCRATCH + A6_SCAN_WORD_OFF), &v, 4);
+	}
+}
+
+static struct { int pid; uint32_t fence; } pid_fence[8];
+uint32_t sweet_gpu_fence_of(int pid);
+uint32_t
+sweet_gpu_fence_of(int pid)
+{
+	for (unsigned i = 0; i < 8; i++) {
+		if (pid_fence[i].pid == pid) {
+			return pid_fence[i].fence;
+		}
+	}
+	return 0;
+}
+
 /* Queue up to A6_SUBMIT_MAX IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
 uint32_t
 sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
@@ -1536,11 +1564,28 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	static uint32_t ring_wait_ms;
 	if (!ring_wait_ms && !PE_parse_boot_argn("sweetringwait", &ring_wait_ms, sizeof(ring_wait_ms)))
 		ring_wait_ms = 2000;
-	sweet_scan_submit_gate();       /* 0985: CA's next frame waits for its last one on screen (direct scanout) */
+	/* 0985: CA's next frame waits for its last one on screen (direct scanout): here (gate 1) or in the CP (0989, gate 2) */
+	uint32_t wait_ref = sweet_scan_submit_gate();
+	int pid = proc_selfpid();
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
-	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, ring_wait_ms);
-	gpu_owner_locked(fence, proc_selfpid());
+	uint32_t fence = a6_submit_ibs_async_wait(&gpu, iova, dwords, n, ring_wait_ms,
+	    wait_ref ? a6_pool_va(A6_OFF_SCRATCH + A6_SCAN_WORD_OFF) : 0, wait_ref);
+	gpu_owner_locked(fence, pid);
+	if (fence != 0) {
+		unsigned slot = 0;      /* 0989: this pid's entry, else the oldest */
+		for (unsigned i = 0; i < 8; i++) {
+			if (pid_fence[i].pid == pid) {
+				slot = i;
+				break;
+			}
+			if ((int32_t)(pid_fence[i].fence - pid_fence[slot].fence) < 0) {
+				slot = i;
+			}
+		}
+		pid_fence[slot].pid = pid;
+		pid_fence[slot].fence = fence;
+	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
 	return fence;

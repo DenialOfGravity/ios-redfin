@@ -1217,12 +1217,31 @@ uint32_t a6_fence_read(const struct a6_gpu *g)
 uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned nib,
 			     unsigned timeout_ms)
 {
+	return a6_submit_ibs_async_wait(g, iova, dwords, nib, timeout_ms, 0, 0);
+}
+
+/*
+ * 0989: the same, with the CP first waiting until the word at GPU address wait_va is >= wait_ref (CP_WAIT_REG_MEM,
+ * memory poll, WRITE_GE; wait_va 0: no wait). Whoever arms it must make sure the word gets there (sweet_gpu_scan_word).
+ */
+uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned nib,
+				  unsigned timeout_ms, uint64_t wait_va, uint32_t wait_ref)
+{
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
 	/* GPU time of this submit: CP_ALWAYS_ON_COUNTER before the IBs and once they are idle (a6_submit_time) */
 	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
-	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5 + 2], n = 0;	/* 0988: + the longer end stamp */
+	uint32_t dw[7 + 4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5 + 2], n = 0;	/* 0988: + the longer end stamp; 0989: + the wait */
 	if (nib == 0 || nib > A6_SUBMIT_MAX)
 		return 0;
+	if (wait_va != 0) {
+		dw[n++] = a6_pkt7(0x3c, 6);		/* CP_WAIT_REG_MEM */
+		dw[n++] = 5u | 1u << 4;			/* FUNCTION WRITE_GE, POLL memory */
+		dw[n++] = (uint32_t)wait_va;
+		dw[n++] = (uint32_t)(wait_va >> 32);
+		dw[n++] = wait_ref;
+		dw[n++] = 0xffffffffu;			/* MASK */
+		dw[n++] = 16;				/* DELAY_LOOP_CYCLES */
+	}
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
 	dw[n++] = 0x18;				/* PC_CCU_INVALIDATE_DEPTH */
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
