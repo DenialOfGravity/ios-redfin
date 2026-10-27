@@ -1999,10 +1999,14 @@ static struct {
 	uint32_t      seed[SWEET_SCAN_SLOTS];
 	uint32_t      slotRun;          /* 0979: slot frames in a row (direct only from 3: no switching every frame) */
 	uint32_t      chain[8], chainNext;      /* 0979: the last slot frames' surfaces: CA's chain depth */
+	uint64_t      chainSeq[8];              /* 0983: ... and their frame numbers */
+	uint32_t      depth;                    /* 0983: frames since this frame's surface was last shown */
+	uint32_t      stDepthMax, stDepthMin;
 	/* 5 s statistics (fLock) */
 	uint64_t      stWin, stFenceAbs, stLatchAbs, stLatchMax;
 	uint32_t      stFrames, stFlips, stLatched, stDropped, stNonslot, stLate, stBp, stBpTimeout, stWait, stWaitTimeout;
 	uint32_t      stEnter, stLeave, stClean, stLatchN, stLatchFc, stHold;
+	uint32_t      lastSwap, stWaitNewest;   /* 0983: the newest slot swap's id; SwapWaits on it (not waited) */
 } sweet_scan;
 
 static bool
@@ -2028,6 +2032,7 @@ sweet_scan_hold(SweetSurface *s)
 {
 	s->retain();
 	OSIncrementAtomic(&s->displayUse);
+	sweet_surface_publish_use(s);   /* 0983: in use for CA's swap chain */
 }
 
 static void
@@ -2035,6 +2040,7 @@ sweet_scan_drop(SweetSurface **sp)
 {
 	if (*sp != NULL) {
 		OSDecrementAtomic(&(*sp)->displayUse);
+		sweet_surface_publish_use(*sp);
 		(*sp)->release();
 		*sp = NULL;
 	}
@@ -2143,8 +2149,28 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	 * leave 69 in 5 s). Direct only after 3 slot frames in a row; until then the normal path.
 	 */
 	sweet_scan.slotRun++;
+	/*
+	 * 0983: CA's chain depth = how many frames ago this frame's surface was last swapped (round robin). 0979 counted
+	 * distinct surfaces in the last 8 frames, which after a backboardd restart (new ids next to old ones) overcounts.
+	 * Unknown (first use of a surface): 2, the safe value.
+	 */
+	uint32_t d = 0;
+	for (uint32_t i = 1; i <= 8 && d == 0; i++) {
+		uint32_t k = (sweet_scan.chainNext + 8 - i) % 8;
+		if (sweet_scan.chain[k] == s->id && sweet_scan.chainSeq[k] != 0) {
+			d = (uint32_t)(sweet_scan.seq + 1 - sweet_scan.chainSeq[k]);
+		}
+	}
+	sweet_scan.depth = d >= 2 ? d : 2;
 	sweet_scan.chain[sweet_scan.chainNext] = s->id;
+	sweet_scan.chainSeq[sweet_scan.chainNext] = sweet_scan.seq + 1;
 	sweet_scan.chainNext = (sweet_scan.chainNext + 1) % 8;
+	if (sweet_scan.depth > sweet_scan.stDepthMax) {
+		sweet_scan.stDepthMax = sweet_scan.depth;
+	}
+	if (sweet_scan.stDepthMin == 0 || sweet_scan.depth < sweet_scan.stDepthMin) {
+		sweet_scan.stDepthMin = sweet_scan.depth;
+	}
 	if (!sweet_scan.geom && (sweet_scan.slotRun < 3 || sweet_scan.entering)) {
 		sweet_scan.stHold++;
 		IOLockUnlock(fb->fLock);
@@ -2161,6 +2187,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	sweet_scan.next = s;
 	sweet_scan.nextFence = fence;
 	sweet_scan.nextSwap = get32(rec, 0x50);
+	sweet_scan.lastSwap = sweet_scan.nextSwap;
 	sweet_scan.nextSeq = seq;
 	sweet_scan.nextAbs = now;
 	sweet_scan.stFrames++;
@@ -2170,17 +2197,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	 * seq + 1 into the surface of frame seq + 1 - N, which must be off screen: return once frame seq + 2 - N (or a
 	 * later one) is on screen. N = 2 (r36a): this frame itself; N = 3: the one before.
 	 */
-	uint32_t depth = 0;
-	for (uint32_t i = 0; i < 8; i++) {
-		bool seen = sweet_scan.chain[i] == 0;
-		for (uint32_t j = 0; j < i && !seen; j++) {
-			seen = sweet_scan.chain[j] == sweet_scan.chain[i];
-		}
-		depth += !seen;
-	}
-	if (depth < 2) {
-		depth = 2;
-	}
+	uint32_t depth = sweet_scan.depth;
 	uint64_t need = seq + 2 > depth ? seq + 2 - depth : 0;
 	if (sweet_scan.shownSeq < need && sweet_scan.geom) {
 		uint64_t dl;
@@ -2204,12 +2221,24 @@ sweet_scan_wait(AppleCLCD *fb, uint32_t id)
 	if (!sweet_scan.on) {
 		return;
 	}
+	/*
+	 * 0983: r37a: CA calls SwapWait twice per frame, for the previous swap and for the one it just ended (scalars
+	 * id, 0x80000000, ...). 0979 waited until a swap was *retired* (a later one on screen): for the newest swap that
+	 * needs the next frame, which CA only makes after this returns: 50 ms timeout on every frame (10 fps). Now:
+	 * until the swap is on screen (latched), and the newest one never waits (as upstream HakiOS: "a swap is on the
+	 * screen as soon as it is made"). Reuse of a surface on screen is kept away by SwapEnd's back pressure and the
+	 * use counts, not here.
+	 */
 	uint64_t dl;
-	clock_interval_to_deadline(50, kMillisecondScale, &dl);
+	clock_interval_to_deadline(20, kMillisecondScale, &dl);
 	IOLockLock(fb->fLock);
 	sweet_scan.stWait++;
-	/* 0979: until the swap is retired (a later one on screen: its surface is free); the normal path: at once */
-	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) <= 0) {
+	if (id == sweet_scan.nextSwap || id == sweet_scan.flipSwap || (int32_t)(id - sweet_scan.lastSwap) >= 0) {
+		sweet_scan.stWaitNewest++;
+		IOLockUnlock(fb->fLock);
+		return;
+	}
+	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) < 0) {
 		if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
 			sweet_scan.stWaitTimeout++;
 			break;
@@ -2349,17 +2378,20 @@ sweet_scan_stats_locked(uint64_t now)
 	absolutetime_to_nanoseconds(sweet_scan.stLatchAbs, &lat);
 	absolutetime_to_nanoseconds(sweet_scan.stLatchMax, &lmax);
 	IOLog("SWEET SCANOUT: 5s: frames %u flips %u latched %u dropped %u nonslot %u late %u | fence %llu us swap->latch %llu "
-	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u | clean %u enter %u leave %u held %u latch-fc %u | %s\n",
+	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u newest %u | chain %u-%u | clean %u enter %u leave %u held %u "
+	    "latch-fc %u | %s\n",
 	    sweet_scan.stFrames, sweet_scan.stFlips, sweet_scan.stLatched, sweet_scan.stDropped, sweet_scan.stNonslot,
 	    sweet_scan.stLate, sweet_scan.stFlips ? fw / 1000 / sweet_scan.stFlips : 0,
 	    sweet_scan.stLatchN ? lat / 1000 / sweet_scan.stLatchN : 0, lmax / 1000, sweet_scan.stBp, sweet_scan.stBpTimeout,
-	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
+	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stWaitNewest, sweet_scan.stDepthMin, sweet_scan.stDepthMax,
+	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
 	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
 	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
 	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
 	sweet_scan.stClean = sweet_scan.stEnter = sweet_scan.stLeave = sweet_scan.stLatchN = 0;
 	sweet_scan.stHold = sweet_scan.stLatchFc = 0;
+	sweet_scan.stWaitNewest = sweet_scan.stDepthMin = sweet_scan.stDepthMax = 0;
 }
 
 static void

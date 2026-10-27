@@ -43,6 +43,7 @@ public:
 	uint64_t                  scanPA;       /* 0975: the slot's physical address (contiguous, below 4 GB) */
 	volatile SInt32           displayUse;   /* 0976: frames of it the display holds (queued, flipping, shown) */
 	volatile SInt32           clientUse;    /* 0976: IOSurfaceIncrementUseCount - Decrement from userland */
+	volatile SInt32           clientUse1;   /* 0983: ... category 1 */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -64,6 +65,12 @@ uint32_t sweet_surface_scan_mode(void);
 SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
 /* 0979: the slots' memory made at boot (AppleCLCD::start, before userland fragments RAM); a slot's memory (retained) */
 void sweet_surface_scan_reserve(void);
+/*
+ * 0983: a scanout-slot surface's use counts into its shared state page (+0x18: category 0 low, 1 high), as
+ * IOSurfaceIsInUse reads them: category 0 = userland's + the frames the display holds. CA's swap chain then sees
+ * the surface on screen as in use, as on an iPhone (IOMFB keeps a use count on what it scans out).
+ */
+void sweet_surface_publish_use(SweetSurface *s);
 IOMemoryDescriptor *sweet_surface_scan_md(uint32_t slot, uint64_t *pa);
 
 /*

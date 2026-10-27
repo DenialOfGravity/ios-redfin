@@ -1169,7 +1169,8 @@ sweet_surface_client_use(void *id, void *category, int delta)
 	if (s == NULL) {
 		return;
 	}
-	SInt32 v = OSAddAtomic(delta, &s->clientUse) + delta;
+	SInt32 v = OSAddAtomic(delta, (uintptr_t)category == 1 ? &s->clientUse1 : &s->clientUse) + delta;
+	sweet_surface_publish_use(s);   /* 0983 */
 	if (logs < 16 && (s->scanSlot != 0 || strcmp(name, "backboardd") == 0)) {
 		logs++;     /* 0979: the display's surfaces only (SpringBoard's layer surfaces filled the 16 lines) */
 		IOLog("SWEET SURF: %s use count %s surface %u (%s %u) category %#llx -> %d\n", name, delta > 0 ? "+1" : "-1",
@@ -1177,6 +1178,18 @@ sweet_surface_client_use(void *id, void *category, int delta)
 		    (uint64_t)(uintptr_t)category, (int)v);
 	}
 	s->release();
+}
+
+#define SWEET_SURFACE_STATE_USE         0x18    /* 0983: u64 use counts, category 1 << 32 | category 0 */
+void
+sweet_surface_publish_use(SweetSurface *s)
+{
+	if (s == NULL || s->state == NULL || s->scanSlot == 0) {
+		return;         /* only the display's own surfaces: the others stay as before (never in use) */
+	}
+	int32_t c0 = s->clientUse + s->displayUse, c1 = s->clientUse1;
+	uint64_t v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | (uint32_t)(c0 < 0 ? 0 : c0);
+	*(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) = v;
 }
 
 IOReturn
