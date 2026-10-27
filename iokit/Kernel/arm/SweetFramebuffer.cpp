@@ -2089,6 +2089,11 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
  */
 static struct {
 	volatile bool on;               /* frames go direct (p scanout / boot-arg) */
+	bool          noGate;           /* 0985: p scanout gate 0: back pressure in SwapEnd as 0979/0983 */
+	int           gatePid;          /* 0985: who swapped (backboardd): its GPU submits wait for gateSeq on screen */
+	volatile uint64_t gateSeq;
+	uint64_t      stGateAbs;
+	uint32_t      stGate, stGateWait, stGateTimeout;
 	bool          geom;             /* the pipes are in the scaled direct geometry (fLock) */
 	bool          entering;
 	bool          thread;
@@ -2300,6 +2305,20 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	 */
 	uint32_t depth = sweet_scan.depth;
 	uint64_t need = seq + 2 > depth ? seq + 2 - depth : 0;
+	if (!sweet_scan.noGate) {
+		/*
+		 * 0985: double buffering without holding CA. SwapEnd K always came before K was on screen (its fence lands
+		 * ~5-12 ms later, the latch at the next frame start), so 0983's "SwapEnd K returns once K is on screen" waited
+		 * on every frame (bp = frames) and CA could not even start building K+1 meanwhile. CA's frame K+1 can only
+		 * write the other surface (K-1's) from the GPU, and its GPU work enters the ring through sweet_gpu_submit_v2:
+		 * there the swapper's submits wait (sweet_scan_submit_gate) until frame K is on screen, i.e. until K-1's
+		 * surface is no longer scanned. CA's CPU work for K+1 overlaps K's fence and latch.
+		 */
+		sweet_scan.gatePid = proc_selfpid();
+		sweet_scan.gateSeq = seq;
+		IOLockUnlock(fb->fLock);
+		return true;
+	}
 	if (sweet_scan.shownSeq < need && sweet_scan.geom) {
 		uint64_t dl;
 		clock_interval_to_deadline(50, kMillisecondScale, &dl);
@@ -2313,6 +2332,36 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	}
 	IOLockUnlock(fb->fLock);
 	return true;
+}
+
+/*
+ * 0985: from sweet_gpu_submit_v2, before the IBs go into the ring (without the GPU lock): the swapper's GPU work after
+ * SwapEnd K waits until frame K is on screen (30 ms at most). K's own work is in the ring before its SwapEnd (0949),
+ * so this cannot hold up K's fence.
+ */
+extern "C" void sweet_scan_submit_gate(void);
+void
+sweet_scan_submit_gate(void)
+{
+	AppleCLCD *fb = sweet_fb_instance;
+	if (!sweet_scan.on || !sweet_scan.geom || sweet_scan.noGate || fb == NULL || proc_selfpid() != sweet_scan.gatePid) {
+		return;
+	}
+	IOLockLock(fb->fLock);
+	sweet_scan.stGate++;
+	if (sweet_scan.shownSeq < sweet_scan.gateSeq && sweet_scan.geom) {
+		uint64_t dl, t0 = mach_absolute_time();
+		clock_interval_to_deadline(30, kMillisecondScale, &dl);
+		sweet_scan.stGateWait++;
+		while (sweet_scan.on && sweet_scan.geom && !sweet_scan.noGate && sweet_scan.shownSeq < sweet_scan.gateSeq) {
+			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
+				sweet_scan.stGateTimeout++;
+				break;
+			}
+		}
+		sweet_scan.stGateAbs += mach_absolute_time() - t0;
+	}
+	IOLockUnlock(fb->fLock);
 }
 
 /* SwapWait(id): until swap id (or a later one) is on screen, 50 ms at most. */
@@ -2487,7 +2536,15 @@ sweet_scan_stats_locked(uint64_t now)
 	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stWaitNewest, sweet_scan.stDepthMin, sweet_scan.stDepthMax,
 	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
-	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
+	{
+		uint64_t gw = 0;    /* 0985 */
+		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+		IOLog("SWEET SCANOUT: 5s gate: submits %u waited %u (avg %llu us) timeout %u%s\n", sweet_scan.stGate,
+		    sweet_scan.stGateWait, sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0, sweet_scan.stGateTimeout,
+		    sweet_scan.noGate ? " (off: SwapEnd back pressure)" : "");
+		sweet_scan.stGateAbs = 0;
+		sweet_scan.stGate = sweet_scan.stGateWait = sweet_scan.stGateTimeout = 0;
+	}	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
 	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
 	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
 	sweet_scan.stClean = sweet_scan.stEnter = sweet_scan.stLeave = sweet_scan.stLatchN = 0;
@@ -2684,7 +2741,18 @@ AppleCLCD::fbCmd(const char *s, const char *end)
 		while (q < end && *q == ' ') {
 			q++;
 		}
-		if (q < end && (*q == '0' || *q == '1')) {
+		if (end - q >= 4 && !strncmp(q, "gate", 4)) {
+			/* 0985: p scanout gate 0|1 */
+			const char *v = q + 4;
+			while (v < end && *v == ' ') {
+				v++;
+			}
+			IOLockLock(fLock);
+			sweet_scan.noGate = v < end && *v == '0';
+			IOLockWakeup(fLock, &sweet_scan.shownSeq, false);
+			IOLockUnlock(fLock);
+			IOLog("SWEET SCANOUT: gate %s\n", sweet_scan.noGate ? "off (SwapEnd back pressure)" : "on (GPU submits wait)");
+		} else if (q < end && (*q == '0' || *q == '1')) {
 			sweet_scan_set(this, *q == '1', "p scanout");
 		} else {
 			sweet_scan_set(this, sweet_scan.on, "p scanout (state)");

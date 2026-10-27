@@ -1520,6 +1520,7 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
 	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
+void sweet_scan_submit_gate(void);     /* 0985: SweetFramebuffer.cpp */
 /* Queue up to A6_SUBMIT_MAX IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
 uint32_t
 sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
@@ -1533,6 +1534,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	static uint32_t ring_wait_ms;
 	if (!ring_wait_ms && !PE_parse_boot_argn("sweetringwait", &ring_wait_ms, sizeof(ring_wait_ms)))
 		ring_wait_ms = 2000;
+	sweet_scan_submit_gate();       /* 0985: CA's next frame waits for its last one on screen (direct scanout) */
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
 	uint32_t fence = a6_submit_ibs_async(&gpu, iova, dwords, n, ring_wait_ms);
