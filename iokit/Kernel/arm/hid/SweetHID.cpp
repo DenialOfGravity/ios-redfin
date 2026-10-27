@@ -31,6 +31,7 @@
 #include "IOHIDPrivateKeys.h"
 #include "IOHIDUsageTables.h"
 #include "../SweetDisplayMask.h"
+#include "../SweetTrace.h"   /* 0994 */
 
 extern "C" uint64_t mach_absolute_time(void);
 
@@ -709,6 +710,7 @@ sweet_hid_key(int key, int down)
 extern "C" void
 sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp)
 {
+	SWEET_TRACE(SWT_TOUCH, finger, down, x, y);     /* 0994 */
 	if (gSweetTouch) {
 		gSweetTouch->touch(finger, down != 0, x, y, stamp);
 	}
@@ -717,6 +719,7 @@ sweet_hid_touch_at(int finger, int down, int x, int y, uint64_t stamp)
 extern "C" void
 sweet_hid_touch(int finger, int down, int x, int y)
 {
+	SWEET_TRACE(SWT_TOUCH, finger, down, x, y);     /* 0994 */
 	if (gSweetTouch) {
 		gSweetTouch->touch(finger, down != 0, x, y);
 	}

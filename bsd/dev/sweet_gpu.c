@@ -32,6 +32,7 @@
 #include <mach/mach_time.h>
 #include "sweet_a6xx.h"
 #include "../../iokit/Kernel/arm/SweetDisplayMask.h"
+#include "../../iokit/Kernel/arm/SweetTrace.h"  /* 0994 */
 
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern boolean_t pmap_valid_address(uint64_t pa);
@@ -432,6 +433,11 @@ gpu_stats_locked(void)
 	for (; (int32_t)(done - gstat_next) >= 0; gstat_next++) {
 		uint64_t t = a6_submit_time(&gpu, gstat_next);
 		int pid = gstat_pid[gstat_next % A6_TS_SLOTS], o;
+		if (SWEET_TRACE_ON()) {        /* 0994: the fence's raw stamps (start, end) */
+			uint64_t st[2] = { 0, 0 };
+			a6_read(a6_pool_pa(&gpu, A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * (gstat_next % A6_TS_SLOTS), st, 16);
+			SWEET_TRACE(SWT_GPU_DONE, gstat_next, st[0], st[1], pid);
+		}
 		for (o = 0; o < GSTAT_OWNERS && gstat_own[o].n && gstat_own[o].pid != pid; o++) {
 		}
 		gstat_own[o].pid = o < GSTAT_OWNERS ? pid : -1;
@@ -1585,10 +1591,24 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	if (!ring_wait_ms && !PE_parse_boot_argn("sweetringwait", &ring_wait_ms, sizeof(ring_wait_ms)))
 		ring_wait_ms = 2000;
 	/* 0985: CA's next frame waits for its last one on screen (direct scanout): here (gate 1) or in the CP (0989, gate 2) */
-	uint32_t wait_ref = sweet_scan_submit_gate();
 	int pid = proc_selfpid();
+	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
+	uint32_t wait_ref = sweet_scan_submit_gate();
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
+	uint64_t gpu_ticks = 0;
+	if (SWEET_TRACE_ON()) {        /* 0994: the GPU clock against mach time, every 50 ms at most */
+		static uint64_t cal_abs, cal_every;
+		if (cal_every == 0) {
+			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &cal_every);
+		}
+		uint64_t t0 = mach_absolute_time();
+		if (t0 - cal_abs > cal_every) {
+			cal_abs = t0;
+			gpu_ticks = a6_timestamp(&gpu);         /* CP_ALWAYS_ON_COUNTER, as Turnip's GetTimestamp */
+			SWEET_TRACE(SWT_GPU_CAL, gpu_ticks, t0, mach_absolute_time(), 0);
+		}
+	}
 	uint32_t fence = a6_submit_ibs_async_wait(&gpu, iova, dwords, n, ring_wait_ms,
 	    wait_ref ? a6_pool_va(A6_OFF_SCRATCH + A6_SCAN_WORD_OFF) : 0, wait_ref);
 	gpu_owner_locked(fence, pid);
@@ -1608,6 +1628,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
+	SWEET_TRACE_END(SWT_GPU_SUBMIT, fence, wait_ref, pid, gpu_ticks);    /* 0994 */
 	return fence;
 }
 
@@ -1628,8 +1649,13 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
 	static uint64_t last_check;
 	uint64_t t0 = mach_absolute_time(), ns = 0, check_abs;
 	nanoseconds_to_absolutetime(5000000, &check_abs);
+	if (sweet_gpu_fence_done(fence)) {
+		return 0;      /* 0994: already done: not traced */
+	}
+	SWEET_TRACE_START(SWT_GPU_WAIT, fence, timeout_ns, 0, 0);     /* 0994 */
 	for (;;) {
 		if (sweet_gpu_fence_done(fence)) {
+			SWEET_TRACE_END(SWT_GPU_WAIT, fence, 0, gpu_ready ? a6_fence_read(&gpu) : 0, 0);
 			return 0;
 		}
 		uint64_t now = mach_absolute_time();
@@ -1643,7 +1669,9 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
 		}
 		absolutetime_to_nanoseconds(now - t0, &ns);
 		if (ns >= timeout_ns) {
-			return sweet_gpu_fence_done(fence) ? 0 : 1;
+			int r = sweet_gpu_fence_done(fence) ? 0 : 1;
+			SWEET_TRACE_END(SWT_GPU_WAIT, fence, r, gpu_ready ? a6_fence_read(&gpu) : 0, 0);     /* 0994 */
+			return r;
 		}
 		delay(20);
 	}

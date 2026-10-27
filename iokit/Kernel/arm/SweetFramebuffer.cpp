@@ -36,6 +36,7 @@
  */
 #include "SweetSurface.h"
 #include "SweetDisplayMask.h"
+#include "SweetTrace.h"     /* 0994 */
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
 
@@ -363,6 +364,7 @@ public:
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
 
 /* 0976: the direct scanout (below) */
+static uint32_t get32(const uint8_t *p, uint32_t off);      /* 0994: the trace reads swap ids before its definition */
 static bool sweet_scan_live(void);
 static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence);
 static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
@@ -376,6 +378,7 @@ class IOMobileFramebufferUserClient : public IOUserClient {
 public:
 	AppleCLCD          *fFB;
 	task_t              fTask;
+	int                 fPid;           /* 0994: for the trace */
 	mach_port_t         fPort;
 	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
 	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
@@ -905,6 +908,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 			send = false;
 		}
 	}
+	SWEET_TRACE(SWT_VSYNC, count, send, mode, fb->fPowerOff ? 0 : sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT));     /* 0994 */
 	if (send) {
 		fb->sendVsync(count, now);
 	}
@@ -945,7 +949,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		uint64_t t0 = mach_absolute_time();
 		fb->fPresentBusy = false;
 		fb->fPresentingAbs = recAbs;	/* 0946 */
+		SWEET_TRACE_START(SWT_PRESENT, get32(rec, 0x50), 0, 0, 0);       /* 0994 */
 		fb->present(rec);
+		SWEET_TRACE_END(SWT_PRESENT, get32(rec, 0x50), fb->fPresentBusy, 0, 0);
 		fb->fStatPresentAbs += mach_absolute_time() - t0;
 		if (fb->fPresentBusy) {
 			IOLockLock(fb->fLock);
@@ -974,6 +980,14 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
 	fPaceSwapped = false;
 	fPaceLastAbs = now;     /* 0983 */
 	sweet_swaptrace('V', (uint32_t)count);  /* 0987 */
+	if (SWEET_TRACE_ON()) {        /* 0994 */
+		uint32_t on = 0;
+		for (unsigned int i = 0; i < fClients->getCount(); i++) {
+			IOMobileFramebufferUserClient *c = (IOMobileFramebufferUserClient *)fClients->getObject(i);
+			on += c->fFunc[SWEET_FB_NOTIFY_VSYNC] != 0 && c->fPort != MACH_PORT_NULL;
+		}
+		SWEET_TRACE(SWT_VSYNC_SEND, count, on, now, period);
+	}
 	for (unsigned int i = 0; i < fClients->getCount(); i++) {
 		IOMobileFramebufferUserClient *client =
 		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
@@ -989,6 +1003,7 @@ void
 AppleCLCD::swapDone(uint64_t now, uint32_t where)
 {
 	sweet_swaptrace('D', where);
+	SWEET_TRACE(SWT_SWAPDONE, where, 0, 0, 0);     /* 0994 */
 	if (!(sweet_swapdone & SWEET_SWAPDONE_TICK)) {
 		return;
 	}
@@ -1112,7 +1127,9 @@ AppleCLCD::presentLoop(void *arg)
 			uint64_t t0 = mach_absolute_time();
 			fb->fPresentBusy = false;
 			fb->fPresentingAbs = fb->fPresentRecAbs;	/* 0946 */
+			SWEET_TRACE_START(SWT_PRESENT, get32(fb->fPresentRec, 0x50), 0, 0, 0);       /* 0994 */
 			fb->present(fb->fPresentRec);
+			SWEET_TRACE_END(SWT_PRESENT, get32(fb->fPresentRec, 0x50), fb->fPresentBusy, 0, 0);
 			fb->fStatPresentAbs += mach_absolute_time() - t0;
 			bool shown = !fb->fPresentBusy, pop = shown;
 			IOLockLock(fb->fLock);
@@ -1157,7 +1174,9 @@ AppleCLCD::presentLoop(void *arg)
 			uint64_t t0 = mach_absolute_time();
 			fb->fPresentBusy = false;
 			fb->fPresentingAbs = fb->fPresentRecAbs;	/* 0946 */
+			SWEET_TRACE_START(SWT_PRESENT, get32(fb->fPresentRec, 0x50), 0, 0, 0);       /* 0994 */
 			fb->present(fb->fPresentRec);
+			SWEET_TRACE_END(SWT_PRESENT, get32(fb->fPresentRec, 0x50), fb->fPresentBusy, 0, 0);
 			fb->fStatPresentAbs += mach_absolute_time() - t0;
 			if (fb->fPresentBusy) {
 				IOLockLock(fb->fLock);
@@ -1218,6 +1237,7 @@ AppleCLCD::swap(const uint8_t *rec)
 {
 	uint64_t now = mach_absolute_time();
 	uint32_t fence = sweet_gpu_fence_submitted();   /* 0949: CA's rendering of this frame is at or before it */
+	SWEET_TRACE_START(SWT_SWAP, get32(rec, 0x50), fence, get32(rec, 0x104), 0);      /* 0994 */
 	IOLockLock(fLock);
 	fSwapFence[fSwapFenceNext].abs = now;
 	fSwapFence[fSwapFenceNext].fence = fence;
@@ -1273,18 +1293,21 @@ AppleCLCD::swap(const uint8_t *rec)
 		/* 0989: the swapper's own last submit (its frame), not the latest of any client's */
 		uint32_t own = sweet_gpu_fence_of(proc_selfpid());
 		if (sweet_scan_swap(this, rec, now, own != 0 && (int32_t)(fence - own) >= 0 ? own : fence)) {
+			SWEET_TRACE_END(SWT_SWAP, get32(rec, 0x50), 1, 0, 0);    /* 0994 */
 			return;
 		}
 		IOLockLock(fLock);
 	}
 	if (fSwapQ && queueSwap(rec, now)) {
 		IOLockUnlock(fLock);
+		SWEET_TRACE_END(SWT_SWAP, get32(rec, 0x50), 2, 0, 0);    /* 0994 */
 		return;
 	}
 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
 	fPendingAbs = now;
 	fDirty = true;
 	IOLockUnlock(fLock);
+	SWEET_TRACE_END(SWT_SWAP, get32(rec, 0x50), 0, 0, 0);    /* 0994 */
 	if ((++sweet_fb_swap_count % 1000) == 0) {
 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
 	}
@@ -1305,6 +1328,7 @@ void
 AppleCLCD::statShown(uint64_t swapAbs)
 {
 	uint64_t now = mach_absolute_time();
+	SWEET_TRACE(SWT_SHOWN, swapAbs, 0, 0, 0);       /* 0994 */
 	IOLockLock(fLock);
 	fStShown++;
 	if (swapAbs != 0 && now > swapAbs) {
@@ -2425,6 +2449,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 			    get32(rec, 0x50), mask, s != NULL ? s->id : 0, s != NULL ? s->scanSlot : 0);
 		}
 		OSSafeReleaseNULL(s);
+		SWEET_TRACE(SWT_SCAN_SWAP, get32(rec, 0x50), 0, 4, 0);  /* 0994 */
 		IOLockLock(fb->fLock);
 		sweet_scan.stNonslot++;
 		sweet_scan.slotRun = 0;
@@ -2470,6 +2495,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	}
 	if (!sweet_scan.geom && (sweet_scan.slotRun < 3 || sweet_scan.entering)) {
 		sweet_scan.stHold++;
+		SWEET_TRACE(SWT_SCAN_SWAP, get32(rec, 0x50), sweet_scan.seq, 3, sweet_scan.depth);       /* 0994 */
 		IOLockUnlock(fb->fLock);
 		s->release();
 		return false;
@@ -2490,12 +2516,14 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 		sweet_scan.gateSeq = sweet_scan.later[i].seq;
 		sweet_scan.stQueued++;
 		sweet_scan.stFrames++;
+		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.later[i].swap, sweet_scan.later[i].seq, 1, sweet_scan.depth);    /* 0994 */
 		IOLockWakeup(fb->fLock, &sweet_scan, false);
 		IOLockUnlock(fb->fLock);
 		return true;
 	}
 	if (sweet_scan.next != NULL) {
 		sweet_scan.stDropped++;         /* a newer frame before the last one was flipped */
+		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.nextSwap, sweet_scan.nextSeq, 2, 0);    /* 0994: this one is replaced */
 		if (sweet_scan.gate == 2) {
 			sweet_scan.stOverflow++;        /* 0991: never shown: its CP waiters go on */
 			sweet_scan_word_locked((uint32_t)sweet_scan.nextSeq);
@@ -2519,6 +2547,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	sweet_scan.nextSeq = seq;
 	sweet_scan.nextAbs = now;
 	sweet_scan.stFrames++;
+	SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.nextSwap, seq, 0, sweet_scan.depth);    /* 0994 */
 	IOLockWakeup(fb->fLock, &sweet_scan, false);
 	/*
 	 * Back pressure (0979: by CA's chain depth N, the different surfaces of the last 8 slot frames). CA draws frame
@@ -2545,12 +2574,14 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 		uint64_t dl;
 		clock_interval_to_deadline(50, kMillisecondScale, &dl);
 		sweet_scan.stBp++;
+		SWEET_TRACE_START(SWT_SCAN_BP, need, sweet_scan.shownSeq, 0, 0);       /* 0994 */
 		while (sweet_scan.on && sweet_scan.geom && sweet_scan.shownSeq < need) {
 			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
 				sweet_scan.stBpTimeout++;
 				break;
 			}
 		}
+		SWEET_TRACE_END(SWT_SCAN_BP, need, sweet_scan.shownSeq, 0, 0);
 	}
 	IOLockUnlock(fb->fLock);
 	return true;
@@ -2571,6 +2602,7 @@ sweet_scan_submit_gate(void)
 	}
 	IOLockLock(fb->fLock);
 	sweet_scan.stGate++;
+	SWEET_TRACE(SWT_GPU_GATE, sweet_scan.gate, sweet_scan.gateSeq, sweet_scan.shownSeq, sweet_scan.word);      /* 0994 */
 	if (sweet_scan.gate == 2 && sweet_scan.geom) {
 		/* 0989: the CP waits instead of this thread: until the word reaches gateSeq (released after 50 ms) */
 		uint32_t ref = (uint32_t)sweet_scan.gateSeq;
@@ -2593,6 +2625,7 @@ sweet_scan_submit_gate(void)
 		uint64_t dl, t0 = mach_absolute_time();
 		clock_interval_to_deadline(50, kMillisecondScale, &dl);    /* 0989: 30 -> 50 ms */
 		sweet_scan.stGateWait++;
+		SWEET_TRACE_START(SWT_GPU_GATE, proc_selfpid(), sweet_scan.gateSeq, sweet_scan.shownSeq, 0);   /* 0994 */
 		while (sweet_scan.on && sweet_scan.geom && sweet_scan.gate == 1 && sweet_scan.shownSeq < sweet_scan.gateSeq) {
 			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
 				sweet_scan.stGateTimeout++;
@@ -2600,6 +2633,7 @@ sweet_scan_submit_gate(void)
 			}
 		}
 		sweet_scan.stGateAbs += mach_absolute_time() - t0;
+		SWEET_TRACE_END(SWT_GPU_GATE, proc_selfpid(), sweet_scan.gateSeq, sweet_scan.shownSeq, 0);
 	}
 	IOLockUnlock(fb->fLock);
 	return 0;
@@ -2688,6 +2722,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 			return true;
 		}
 		sweet_scan.stLatchFc += !bits;
+		SWEET_TRACE(SWT_SCAN_LATCH, sweet_scan.flipSwap, sweet_scan.flipSeq, now - sweet_scan.flipSwapAbs, frames);  /* 0994 */
 		fb->swapDone(now, 3);   /* 0987: the flipped frame is on screen */
 		sweet_scan_drop(&sweet_scan.shown);
 		sweet_scan.shown = sweet_scan.flipping;
@@ -2775,6 +2810,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 		sweet_scan.stLatched++;
 		sweet_scan.stLatchN++;
 		sweet_scan.stLatchAbs += mach_absolute_time() - sAbs;
+		SWEET_TRACE(SWT_SCAN_LATCH, sSwap, sSeq, mach_absolute_time() - sAbs, 0);    /* 0994: pipes switched to it */
 		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
 		return sweet_scan.next != NULL;
 	}
@@ -2782,6 +2818,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 	sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
 	sweet_scan.flipFrame = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
 	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
+	SWEET_TRACE(SWT_SCAN_FLIP, sSwap, sSeq, now - sAbs, sweet_scan.flipFrame);    /* 0994 */
 	sweet_scan.flipping = s;
 	sweet_scan.flipSeq = sSeq;
 	sweet_scan.flipSwap = sSwap;
@@ -3809,6 +3846,7 @@ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID,
 		return false;
 	}
 	fTask = owningTask;
+	fPid = proc_selfpid();  /* 0994 */
 	return true;
 }
 
@@ -3866,8 +3904,9 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
 	}
 	bzero(ref, sizeof(ref));
 	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
-	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+	IOReturn r = sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
 	    kIOUserNotifyOptionCanDrop);
+	SWEET_TRACE(SWT_NOTIFY, type, fPid, r, count > 0 ? values[0] : 0);      /* 0994: r != 0: dropped */
 }
 
 static uint64_t sweet_fb_logged[2];     /* selectors already logged (< 128; 0943: each once) */
@@ -3881,6 +3920,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	uint64_t out[2] = { 0, 0 };
 	uint32_t outCount = 0;
 	bool structDone = false;        /* 0943: structureOutput filled in, not to be zeroed */
+	uint32_t traceSwap = 0;         /* 0994 */
+	SWEET_TRACE_START(SWT_IOMFB_SEL, selector, args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
+	    args->scalarInputCount > 1 ? args->scalarInput[1] : 0, args->structureInputSize);
 
 	switch (selector) {
 	case kSweetFBGetLayerDefaultSurface:
@@ -3903,6 +3945,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		memcpy(rec, args->structureInput, sizeof(rec));
 		sweet_swaptrace('E', get32(rec, 0x50));  /* 0987 */
+		traceSwap = get32(rec, 0x50);   /* 0994 */
 		fFB->swap(rec);
 		break;
 	}
@@ -3997,6 +4040,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	if (!structDone && args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
 		bzero(args->structureOutput, args->structureOutputSize);
 	}
+	SWEET_TRACE_END(SWT_IOMFB_SEL, selector, ret, out[0], traceSwap);      /* 0994 */
 	if (selector >= 128 || !(sweet_fb_logged[selector / 64] & (1ULL << (selector % 64)))) {
 		if (selector < 128) {
 			sweet_fb_logged[selector / 64] |= 1ULL << (selector % 64);

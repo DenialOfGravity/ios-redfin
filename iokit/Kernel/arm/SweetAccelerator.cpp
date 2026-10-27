@@ -43,6 +43,7 @@
 #include <pexpert/pexpert.h>
 #include "SweetSurface.h"
 #include "SweetGPUABI.h"
+#include "SweetTrace.h"     /* 0994 */
 
 extern "C" {
 void proc_selfname(char *buf, int size);
@@ -412,11 +413,14 @@ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 		void *o = args->structureOutputDescriptor == NULL ? args->structureOutput : NULL;
 		uint32_t osz = o != NULL ? args->structureOutputSize : 0;
 		IOReturn r;
+		uint32_t m = isz >= 8 && w[0] == SWEET_V2_TUNNEL ? w[1] : selector;      /* 0994 */
+		SWEET_TRACE_START(SWT_ACCEL_SEL, m, fPid, 0, 0);
 		if (isz >= 8 && w[0] == SWEET_V2_TUNNEL) {
 			r = w[1] == 0xffffffffu ? kIOReturnSuccess : v2Method(w[1], w + 2, isz - 8, o, &osz);
 		} else {
 			r = v2Method(selector, isz ? args->structureInput : NULL, isz, o, &osz);
 		}
+		SWEET_TRACE_END(SWT_ACCEL_SEL, m, r, fLastFence, 0);
 		/* 0928: every refused v2 call, the first 40 of each client (Turnip loses its device over most of them) */
 		if (r != kIOReturnSuccess && fV2Errors++ < 40) {
 			IOLog("SWEET MTL: v2 %s: method %u refused: 0x%x (#%u)\n", fName,
