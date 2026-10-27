@@ -48,6 +48,7 @@ extern "C" {
 void proc_selfname(char *buf, int size);
 int proc_selfpid(void);
 bool sweet_gpu_ready(void);
+void sweet_swaptrace(char ev, uint32_t arg);    /* 0987 */
 int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 void sweet_gpu_unmap_user(uint64_t iova, uint64_t len);
 int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
@@ -978,6 +979,9 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 		}
 		fLastFence = fence;
 		rp->fence = fence;
+		if (fSystem && fName[0] == 'b') {
+			sweet_swaptrace('S', fence);    /* 0987: SweetFramebuffer.cpp (p swapdone trace) */
+		}
 		return kIOReturnSuccess;
 	}
 	case NativeAdrenoMethodWaitFence: {

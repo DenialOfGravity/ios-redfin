@@ -140,6 +140,55 @@ static uint32_t sweet_pace;
  */
 static uint32_t sweet_pace_min = 8000;
 
+/*
+ * 0987: boot-arg sweetswapdone=MASK, poke p swapdone [MASK | trace]. backboardd only ever turns on notification
+ * type 5 (klogs: "notifications type 5 on/off", no other type; ios-sweet NOTES: 0 hotplug, 1 power, 3 frame info,
+ * 4 CRC, 5 vsync) and learns that a swap is done from SwapWait (sel 6 [id, 0x80000000, 0], twice per frame: the
+ * swap before, then the one just ended). So a swap-complete event can only reach CA as a type-5 tick:
+ *   0x1  swap-complete tick: a vsync notification once a frame's present is done (GPU blit fence landed, CPU copy
+ *        done, direct scanout latched), at least sweetpace_min after the last notification, while CA has them on
+ *   0x2  trace: the next 256 events (SwapBegin/End/Wait, the swapper's GPU submits, ticks, swap-done) with thread
+ *        ids and times, printed as SWEET SWAPTRACE lines once full; p swapdone trace arms it again
+ */
+static uint32_t sweet_swapdone;
+#define SWEET_SWAPDONE_TICK     0x1
+#define SWEET_SWAPDONE_TRACE    0x2
+#define SWEET_ST_N              256
+extern "C" uint64_t thread_tid(thread_t thread);
+extern "C" thread_t current_thread(void);
+extern "C" void sweet_swaptrace(char ev, uint32_t arg);
+static struct { uint64_t abs, tid; uint32_t arg; char ev; } sweet_st[SWEET_ST_N];
+static volatile SInt32 sweet_st_n;
+static uint32_t sweet_swapdone_ticks, sweet_swapdone_events, sweet_swapdone_close;
+
+/* 0987: one trace event (any thread, no lock); the one that fills the buffer prints it */
+void
+sweet_swaptrace(char ev, uint32_t arg)
+{
+	if (!(sweet_swapdone & SWEET_SWAPDONE_TRACE) || sweet_st_n >= SWEET_ST_N) {
+		return;
+	}
+	SInt32 i = OSIncrementAtomic(&sweet_st_n);
+	if (i >= SWEET_ST_N) {
+		return;
+	}
+	sweet_st[i].abs = mach_absolute_time();
+	sweet_st[i].tid = thread_tid(current_thread());
+	sweet_st[i].arg = arg;
+	sweet_st[i].ev = ev;
+	if (i != SWEET_ST_N - 1) {
+		return;
+	}
+	IOSleep(2);     /* the last writers finish their entries */
+	IOLog("SWEET SWAPTRACE: %u events: B SwapBegin id, E SwapEnd id, W/w SwapWait id in/out, S GPU submit fence, "
+	    "V tick, D swap done (1 blit, 2 CPU, 3 scanout)\n", SWEET_ST_N);
+	for (uint32_t k = 0; k < SWEET_ST_N; k++) {
+		uint64_t ns;
+		absolutetime_to_nanoseconds(sweet_st[k].abs - sweet_st[0].abs, &ns);
+		IOLog("SWEET SWAPTRACE: %llu us tid %llu %c %u\n", ns / 1000, sweet_st[k].tid, sweet_st[k].ev, sweet_st[k].arg);
+	}
+}
+
 /* INTF1 (DSI0) and its tear check, offsets from the MDP (as shim/sde.c): the TE frame counter is INT_COUNT >> 16 */
 #define SWEET_INTF1             0x6b800u
 #define INTF_FRAME_COUNT        0x0ac
@@ -274,6 +323,7 @@ public:
 	uint64_t      fPaceAheadAbs;          /* at-swap ticks: sum of (next tick - delivery) */
 	bool          vsyncOn(void);
 	void          sendVsync(uint64_t count, uint64_t now);
+	void          swapDone(uint64_t now, uint32_t where);     /* 0987 (fLock) */
 	/* 0983 (fLock) */
 	IOTimerEventSource *fPaceTimer;       /* mode 3: the notification at last + MIN */
 	bool          fPaceArmed;
@@ -709,6 +759,10 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("sweetfbx", &sweet_fbx, sizeof(sweet_fbx));
 	PE_parse_boot_argn("sweetpace", &sweet_pace, sizeof(sweet_pace));      /* 0977 */
 	PE_parse_boot_argn("sweetpace_min", &sweet_pace_min, sizeof(sweet_pace_min));      /* 0983 */
+	PE_parse_boot_argn("sweetswapdone", &sweet_swapdone, sizeof(sweet_swapdone));      /* 0987 */
+	if (sweet_swapdone) {
+		IOLog("SWEET FB: swapdone %#x (0987: 1 tick at swap done, 2 trace)\n", sweet_swapdone);
+	}
 	fPaceTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::paceFired);
 	if (fPaceTimer != NULL && fWorkLoop->addEventSource(fPaceTimer) != kIOReturnSuccess) {
 		fPaceTimer->release();
@@ -915,11 +969,35 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
 
 	fPaceSwapped = false;
 	fPaceLastAbs = now;     /* 0983 */
+	sweet_swaptrace('V', (uint32_t)count);  /* 0987 */
 	for (unsigned int i = 0; i < fClients->getCount(); i++) {
 		IOMobileFramebufferUserClient *client =
 		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
 	}
+}
+
+/*
+ * 0987: with the fLock. A frame's present is done (where: 1 GPU blit fence landed, 2 CPU copy done, 3 direct scanout
+ * latched): with sweetswapdone & 1, the swap-complete tick (type 5, the only notification CA takes).
+ */
+void
+AppleCLCD::swapDone(uint64_t now, uint32_t where)
+{
+	sweet_swaptrace('D', where);
+	if (!(sweet_swapdone & SWEET_SWAPDONE_TICK)) {
+		return;
+	}
+	sweet_swapdone_events++;
+	if (fPowerOff || !vsyncOn()) {
+		return;
+	}
+	if (fPaceLastAbs != 0 && now - fPaceLastAbs < paceMinAbs()) {
+		sweet_swapdone_close++;         /* a tick went out less than MIN ago: CA has one already */
+		return;
+	}
+	sweet_swapdone_ticks++;
+	sendVsync(fVsyncCount, now);
 }
 
 /* 0977: with the fLock. Does any client take vsync notifications now (CA turns them on while it animates)? */
@@ -980,6 +1058,7 @@ AppleCLCD::presentLoop(void *arg)
 {
 	AppleCLCD *fb = (AppleCLCD *)arg;
 	bool bound = false;
+	bool blitOut = false;   /* 0987: a present blit was out at the last look */
 	for (;;) {
 		/*
 		 * 0946: while the CPU presents (sweetfbx & 8), this thread runs on a big core only: CPU6 (A76 gold; the
@@ -1004,6 +1083,10 @@ AppleCLCD::presentLoop(void *arg)
 				break;
 			}
 			bool out = sweet_gpu_present_poll();
+			if (blitOut && !out) {
+				fb->swapDone(mach_absolute_time(), 1);  /* 0987: the present blit's fence landed */
+			}
+			blitOut = out;
 			if (fb->fSwapQ && out) {
 				sweet_gpu_flip_poll();	/* 0944: a landed frame flips at once, latched by the next TE */
 			}
@@ -1046,6 +1129,11 @@ AppleCLCD::presentLoop(void *arg)
 			if (shown) {
 				fb->fStatPresents++;
 				fb->statShown(fb->fPresentRecAbs);
+				if (sweet_fbx & SWEET_FBX_CPUPRESENT) {
+					IOLockLock(fb->fLock);
+					fb->swapDone(mach_absolute_time(), 2);  /* 0987: the CPU copy is done */
+					IOLockUnlock(fb->fLock);
+				}
 			}
 			continue;
 		}
@@ -1075,6 +1163,11 @@ AppleCLCD::presentLoop(void *arg)
 			} else {
 				fb->fStatPresents++;
 				fb->statShown(fb->fPresentRecAbs);
+				if (sweet_fbx & SWEET_FBX_CPUPRESENT) {
+					IOLockLock(fb->fLock);
+					fb->swapDone(mach_absolute_time(), 2);  /* 0987: the CPU copy is done */
+					IOLockUnlock(fb->fLock);
+				}
 			}
 		}
 	}
@@ -2450,6 +2543,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 			return true;
 		}
 		sweet_scan.stLatchFc += !bits;
+		fb->swapDone(now, 3);   /* 0987: the flipped frame is on screen */
 		sweet_scan_drop(&sweet_scan.shown);
 		sweet_scan.shown = sweet_scan.flipping;
 		sweet_scan.flipping = NULL;
@@ -2671,6 +2765,33 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
 void
 AppleCLCD::fbCmd(const char *s, const char *end)
 {
+	if (end - s >= 8 && !strncmp(s, "swapdone", 8)) {
+		/* 0987: p swapdone [MASK | trace]: 1 swap-complete tick, 2 trace (trace = re-arm with 2 set); no argument: state */
+		const char *q = s + 8;
+		while (q < end && *q == ' ') {
+			q++;
+		}
+		IOLockLock(fLock);
+		if (end - q >= 5 && !strncmp(q, "trace", 5)) {
+			sweet_swapdone |= SWEET_SWAPDONE_TRACE;
+			sweet_st_n = 0;
+		} else if (q < end && *q >= '0' && *q <= '9') {
+			uint32_t v = 0;
+			while (q < end && *q >= '0' && *q <= '9') {
+				v = v * 10 + (uint32_t)(*q++ - '0');
+			}
+			if ((v & SWEET_SWAPDONE_TRACE) && !(sweet_swapdone & SWEET_SWAPDONE_TRACE)) {
+				sweet_st_n = 0;
+			}
+			sweet_swapdone = v;
+		}
+		uint32_t ev = sweet_swapdone_events, tk = sweet_swapdone_ticks, cl = sweet_swapdone_close;
+		sweet_swapdone_events = sweet_swapdone_ticks = sweet_swapdone_close = 0;
+		IOLockUnlock(fLock);
+		IOLog("SWEET FB: swapdone now %#x (1 tick at swap done, 2 trace %d/%u); since last: swap done %u, ticks %u, "
+		    "within MIN %u\n", sweet_swapdone, (int)sweet_st_n, SWEET_ST_N, ev, tk, cl);
+		return;
+	}
 	if (end - s >= 2 && s[0] == 'f' && s[1] == 'c') {
 		uint32_t a0 = sweet_mdp_rd(SWEET_INTF1 + INTF_TEAR_INT_COUNT), f0 = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
 		uint64_t t0 = mach_absolute_time();
@@ -3564,6 +3685,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		out[0] = ++fFB->fSwapID;
 		IOLockUnlock(fFB->fLock);
 		outCount = 1;
+		sweet_swaptrace('B', (uint32_t)out[0]);  /* 0987 */
 		break;
 	case kSweetFBSwapEnd: {
 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
@@ -3573,6 +3695,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			break;
 		}
 		memcpy(rec, args->structureInput, sizeof(rec));
+		sweet_swaptrace('E', get32(rec, 0x50));  /* 0987 */
 		fFB->swap(rec);
 		break;
 	}
@@ -3638,6 +3761,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		break;
 	case kSweetFBSwapWait:
+		sweet_swaptrace('W', args->scalarInputCount >= 1 ? (uint32_t)args->scalarInput[0] : 0);  /* 0987 */
 		/* 0976: with the direct scanout, until that swap is on screen (50 ms at most) */
 		if (sweet_scan_live() && args->scalarInputCount >= 1) {
 			static uint32_t logs;
@@ -3651,6 +3775,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 				sweet_scan_wait(fFB, id);
 			}
 		}
+		sweet_swaptrace('w', args->scalarInputCount >= 1 ? (uint32_t)args->scalarInput[0] : 0);  /* 0987 */
 		break;
 	default:
 		break;
