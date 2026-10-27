@@ -1242,6 +1242,8 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
  *                       the current geometry, no scaler; put back after SECS (default 10, 0 = at p mdp restore)
  *   p mdp scale [SECS]  a 1125x2436 pattern (4608-byte rows, like CA's surfaces) through both scalers to 2 x 540x2340:
  *                       overlapping source crops (0 and 562, 563 wide), the right pipe's initial phase 0.5
+ *   p mdp ca [SLOT [SECS]] 0975: the CA surface in scanout slot SLOT (default 0; boot-arg sweetscanout) scaled the
+ *                       same way, as a still frame
  *   p mdp restore       every pipe register written goes back, one CTL0 flush, presents resume
  *
  * Registers only inside the MDP's 2 MB window (sweet_mdp_rd/wr); the SMMU through its own 4 KB pages. While a test
@@ -1649,19 +1651,16 @@ sweet_mdp_test(void)
  * mode needs no coefficient tables (as upstream DPU: _dpu_plane_setup_scaler3, dpu_hw_setup_scaler3).
  */
 static bool
-sweet_mdp_scale(void)
+sweet_mdp_scale_regs(uint32_t pa, uint32_t stride, bool quiet)
 {
 	const uint32_t sw = SWEET_FB_LOGICAL_W, sh = SWEET_FB_LOGICAL_H;
 	uint32_t ver = sweet_mdp_rd(MDP_VIG(0) + QS_VERSION), ver1 = sweet_mdp_rd(MDP_VIG(1) + QS_VERSION);
 	uint32_t dw0 = sweet_mdp.old[0][MR_OUT_SIZE] & 0xffff, dw1 = sweet_mdp.old[1][MR_OUT_SIZE] & 0xffff;
 	uint32_t dh = sweet_mdp.old[0][MR_OUT_SIZE] >> 16, W = dw0 + dw1;
-	if (ver < 0x2000 || ver != ver1 || dh == 0 || W == 0 || dh != sweet_mdp.old[1][MR_OUT_SIZE] >> 16) {
-		IOLog("SWEET MDP: scale: scaler version %x/%x or outputs %x/%x not handled\n", ver, ver1,
-		    sweet_mdp.old[0][MR_OUT_SIZE], sweet_mdp.old[1][MR_OUT_SIZE]);
-		return false;
-	}
-	if (!sweet_mdp_pattern(sw, sh, SWEET_MDP_SURF_STRIDE, sw / 2 + 1)) {
-		IOLog("SWEET MDP: scale: no pattern\n");
+	if (ver < 0x2000 || ver != ver1 || dh == 0 || W == 0 || dh != sweet_mdp.old[1][MR_OUT_SIZE] >> 16 ||
+	    stride < sw * 4 || stride > 0xffff) {
+		IOLog("SWEET MDP: scale: scaler version %x/%x, outputs %x/%x or stride %u not handled\n", ver, ver1,
+		    sweet_mdp.old[0][MR_OUT_SIZE], sweet_mdp.old[1][MR_OUT_SIZE], stride);
 		return false;
 	}
 	uint64_t step_x = ((1ULL << 21) * sw + W / 2) / W, step_y = ((1ULL << 21) * sh + dh / 2) / dh;
@@ -1678,8 +1677,8 @@ sweet_mdp_scale(void)
 		if (sweet_mdp_rd(b + SSPP_FORMAT) & (1u << 8)) {
 			op |= 1u << 10 | 1u << 29;                      /* alpha through the scaler, bilinear */
 		}
-		sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)SWEET_MDP_TEST_PA);
-		sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | SWEET_MDP_SURF_STRIDE);
+		sweet_mdp_wr(b + SSPP_SRC0, pa);
+		sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | stride);
 		sweet_mdp_wr(b + SSPP_SRC_IMG, sh << 16 | sw);
 		sweet_mdp_wr(b + SSPP_SRC_XY, sx);
 		sweet_mdp_wr(b + SSPP_SRC_SIZE, src);
@@ -1701,12 +1700,55 @@ sweet_mdp_scale(void)
 		sweet_mdp_wr(b + QS_SRC_SIZE_UV, src);
 		sweet_mdp_wr(b + QS_DST_SIZE, dh << 16 | dw);
 		sweet_mdp_wr(b + QS_OP_MODE, op);
-		IOLog("SWEET MDP: scale: vig%u source x %u w %u phase %#x -> %ux%u, step %#llx/%#llx op %#x\n", p, sx, cw,
-		    phase, dw, dh, step_x, step_y, op);
+		if (!quiet) {
+			IOLog("SWEET MDP: scale: vig%u source x %u w %u phase %#x -> %ux%u, step %#llx/%#llx op %#x\n", p, sx, cw,
+			    phase, dw, dh, step_x, step_y, op);
+		}
+	}
+	return true;
+}
+
+static bool
+sweet_mdp_scale(void)
+{
+	if (!sweet_mdp_pattern(SWEET_FB_LOGICAL_W, SWEET_FB_LOGICAL_H, SWEET_MDP_SURF_STRIDE, SWEET_FB_LOGICAL_W / 2 + 1)) {
+		IOLog("SWEET MDP: scale: no pattern\n");
+		return false;
+	}
+	if (!sweet_mdp_scale_regs((uint32_t)SWEET_MDP_TEST_PA, SWEET_MDP_SURF_STRIDE, false)) {
+		return false;
 	}
 	sweet_mdp_flush("scale");
 	sweet_mdp_pipes("scale");
 	return true;
+}
+
+/* 0975 (step d): one of CA's surfaces in a scanout slot, scaled, as it is now (a still frame). */
+static bool
+sweet_mdp_ca(uint32_t slot)
+{
+	uint64_t pa = 0;
+	SweetSurface *s = sweet_surface_scan_copy(slot, &pa);
+	if (s == NULL) {
+		IOLog("SWEET MDP: ca: no surface in scanout slot %u (PA %#llx; boot-arg sweetscanout=1|2)\n", slot, pa);
+		return false;
+	}
+	uint32_t id = s->id, bpr = s->bytesPerRow, seed = s->state != NULL ?
+	    *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+		uintptr_t va = s->kernelAddress();
+		if (va != 0) {
+			flush_dcache64((addr64_t)va, (unsigned)((uint64_t)bpr * s->height), FALSE);
+		}
+	}
+	s->release();
+	bool ok = sweet_mdp_scale_regs((uint32_t)pa, bpr, false);
+	if (ok) {
+		sweet_mdp_flush("ca");
+		sweet_mdp_pipes("ca");
+		IOLog("SWEET MDP: ca: slot %u = surface %u (PA %#llx, %u-byte rows, seed %u) on screen\n", slot, id, pa, bpr, seed);
+	}
+	return ok;
 }
 
 void
@@ -1724,15 +1766,21 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
 	while (q < end && *q == ' ') {
 		q++;
 	}
-	uint32_t secs = 10;
-	if (q < end && *q >= '0' && *q <= '9') {
-		secs = 0;
+	uint32_t num[2] = { 0, 0 }, nums = 0;
+	while (nums < 2 && q < end && *q >= '0' && *q <= '9') {
 		while (q < end && *q >= '0' && *q <= '9') {
-			secs = secs * 10 + (uint32_t)(*q++ - '0');
+			num[nums] = num[nums] * 10 + (uint32_t)(*q++ - '0');
 		}
-		if (secs > 600) {
-			secs = 600;
+		nums++;
+		while (q < end && *q == ' ') {
+			q++;
 		}
+	}
+	bool ca = wl == 2 && !strncmp(w, "ca", 2);
+	uint32_t slot = ca && nums >= 1 ? num[0] : 0;           /* 0975: p mdp ca [SLOT [SECS]] */
+	uint32_t secs = ca ? (nums >= 2 ? num[1] : 10) : (nums >= 1 ? num[0] : 10);
+	if (secs > 600) {
+		secs = 600;
 	}
 	if (sweet_mdp.lock == NULL) {
 		IOLock *l = IOLockAlloc();
@@ -1748,29 +1796,38 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
 		sweet_mdp_dump();
 	} else if (wl == 4 && !strncmp(w, "smmu", 4)) {
 		sweet_mdp_smmu(end - q >= 4 && !strncmp(q, "walk", 4));
-	} else if ((wl == 4 && !strncmp(w, "test", 4)) || (wl == 5 && !strncmp(w, "scale", 5))) {
+	} else if ((wl == 4 && !strncmp(w, "test", 4)) || (wl == 5 && !strncmp(w, "scale", 5)) || ca) {
 		bool scale = wl == 5;
+		const char *what = ca ? "ca" : scale ? "scale" : "test";
+		uint64_t slot0 = 0;
+		SweetSurface *held = ca ? NULL : sweet_surface_scan_copy(0, &slot0);
+		if (held != NULL) {
+			/* 0975: the test pattern would draw over CA's surface in scanout slot 0 (same memory) */
+			IOLog("SWEET MDP: %s: scanout slot 0 (%#llx) holds surface %u: use p mdp ca\n", what, slot0, held->id);
+			held->release();
+			IOLockUnlock(sweet_mdp.lock);
+			return;
+		}
 		if (sweet_mdp.timer == NULL) {
 			sweet_mdp.timer = IOTimerEventSource::timerEventSource(this, sweet_mdp_timer_fired);
 			if (sweet_mdp.timer != NULL && fWorkLoop->addEventSource(sweet_mdp.timer) != kIOReturnSuccess) {
 				OSSafeReleaseNULL(sweet_mdp.timer);
 			}
 		}
-		if (sweet_mdp_take(this, scale ? "scale" : "test")) {
-			if (!(scale ? sweet_mdp_scale() : sweet_mdp_test())) {
+		if (sweet_mdp_take(this, what)) {
+			if (!(ca ? sweet_mdp_ca(slot) : scale ? sweet_mdp_scale() : sweet_mdp_test())) {
 				sweet_mdp_restore_locked(this, "failed");
 			} else if (secs != 0 && sweet_mdp.timer != NULL) {
 				sweet_mdp.timer->setTimeoutMS(secs * 1000);
-				IOLog("SWEET MDP: %s on screen for %u s (p mdp restore puts it back sooner)\n",
-				    scale ? "scale" : "test", secs);
+				IOLog("SWEET MDP: %s on screen for %u s (p mdp restore puts it back sooner)\n", what, secs);
 			} else {
-				IOLog("SWEET MDP: %s on screen until p mdp restore\n", scale ? "scale" : "test");
+				IOLog("SWEET MDP: %s on screen until p mdp restore\n", what);
 			}
 		}
 	} else if (wl == 7 && !strncmp(w, "restore", 7)) {
 		sweet_mdp_restore_locked(this, "poke");
 	} else {
-		IOLog("SWEET MDP: p mdp dump | smmu [walk] | test [SECS] | scale [SECS] | restore\n");
+		IOLog("SWEET MDP: p mdp dump | smmu [walk] | test [SECS] | scale [SECS] | ca [SLOT [SECS]] | restore\n");
 	}
 	IOLockUnlock(sweet_mdp.lock);
 }

@@ -39,6 +39,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
 #include <sys/proc.h>
+#include <pexpert/pexpert.h>
 
 enum {
 	kSweetSurfaceCreate             = 0,
@@ -78,10 +79,166 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
 
 OSDefineMetaClassAndStructors(SweetSurface, OSObject);
 
+/*
+ * 0975: scanout slots (boot-arg sweetscanout=1 or 2; docs/redfin/scanout-plan.md step d). backboardd's
+ * framebuffer-sized surfaces (1125x2436 'BGRA', one plane, offset 0) get physically contiguous memory below 4 GB,
+ * which the display engine reads directly: its apps-SMMU bank (SMR3 0xb40/0x402 -> bank 2) has translation off
+ * (r35a, p mdp smmu). Slot 0 is the splash carve-out at 0xa1400000 (where p mdp test/scale drew), slots 1-6 come from
+ * RAM, each allocated on first use and kept for the next surface. Every other create, and every create once the
+ * slots are taken, gets ordinary memory as before.
+ */
+#define SWEET_SCAN_CARVE_PA     0xa1400000ULL
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+static struct {
+	IOMemoryDescriptor *md;
+	uint64_t            pa;
+	SweetSurface       *owner;          /* not retained: SweetSurface::free gives the slot back */
+} sweet_scan_slot[SWEET_SCAN_SLOTS];
+static IOLock *sweet_scan_lock;
+static int sweet_scan_boot = -1;
+static bool sweet_scan_ram_failed;
+
+uint32_t
+sweet_surface_scan_mode(void)
+{
+	if (sweet_scan_boot < 0) {
+		int m = 0;
+		PE_parse_boot_argn("sweetscanout", &m, sizeof(m));
+		sweet_scan_boot = m < 0 ? 0 : m;
+	}
+	return (uint32_t)sweet_scan_boot;
+}
+
+static void
+sweet_scan_release(SweetSurface *s)
+{
+	uint32_t n = s->scanSlot - 1;
+	if (sweet_scan_lock != NULL && n < SWEET_SCAN_SLOTS) {
+		IOLockLock(sweet_scan_lock);
+		if (sweet_scan_slot[n].owner == s) {
+			sweet_scan_slot[n].owner = NULL;
+		}
+		IOLockUnlock(sweet_scan_lock);
+	}
+	s->scanSlot = 0;
+}
+
+/* The slot's memory, made on first use: the carve-out (slot 0) or contiguous RAM below 4 GB (32-bit SRC0_ADDR). */
+static bool
+sweet_scan_make_locked(uint32_t n)
+{
+	if (n == 0) {
+		sweet_scan_slot[0].md = IOMemoryDescriptor::withPhysicalAddress(SWEET_SCAN_CARVE_PA, SWEET_SCAN_SLOT_LEN,
+		    kIODirectionInOut);
+		sweet_scan_slot[0].pa = SWEET_SCAN_CARVE_PA;
+		return sweet_scan_slot[0].md != NULL;
+	}
+	if (sweet_scan_ram_failed) {
+		return false;
+	}
+	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared, SWEET_SCAN_SLOT_LEN,
+	    0x00000000ffffc000ULL);
+	uint64_t pa = b != NULL ? (uint64_t)b->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+	if (b == NULL || pa == 0 || pa + SWEET_SCAN_SLOT_LEN > (1ULL << 32)) {
+		IOLog("SWEET SURF: scanout slot %u: no contiguous %#llx bytes below 4 GB (%#llx): RAM slots off\n", n,
+		    SWEET_SCAN_SLOT_LEN, pa);
+		OSSafeReleaseNULL(b);
+		sweet_scan_ram_failed = true;
+		return false;
+	}
+	sweet_scan_slot[n].md = b;
+	sweet_scan_slot[n].pa = pa;
+	return true;
+}
+
+/* create(): a framebuffer-sized backboardd surface goes into a free slot (zeroed), or false. */
+static bool
+sweet_scan_claim(SweetSurface *s)
+{
+	char name[32];
+	if (sweet_surface_scan_mode() == 0 || s->width != 1125 || s->height != 2436 || s->pixelFormat != 0x42475241 ||
+	    s->planeCount > 1 || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->offset != 0 ||
+	    (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > SWEET_SCAN_SLOT_LEN) {
+		return false;
+	}
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, "backboardd") != 0) {
+		return false;
+	}
+	if (sweet_scan_lock == NULL) {
+		IOLock *lock = IOLockAlloc();
+		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&sweet_scan_lock)) {
+			IOLockFree(lock);
+		}
+		if (sweet_scan_lock == NULL) {
+			return false;
+		}
+	}
+	IOLockLock(sweet_scan_lock);
+	uint32_t n;
+	for (n = 0; n < SWEET_SCAN_SLOTS; n++) {
+		if (sweet_scan_slot[n].owner == NULL && (sweet_scan_slot[n].md != NULL || sweet_scan_make_locked(n))) {
+			break;
+		}
+	}
+	if (n == SWEET_SCAN_SLOTS) {
+		IOLockUnlock(sweet_scan_lock);
+		IOLog("SWEET SURF: scanout slots full: surface %ux%u in ordinary memory\n", s->width, s->height);
+		return false;
+	}
+	sweet_scan_slot[n].owner = s;
+	sweet_scan_slot[n].md->retain();
+	s->memory = sweet_scan_slot[n].md;
+	s->scanSlot = n + 1;
+	s->scanPA = sweet_scan_slot[n].pa;
+	IOLockUnlock(sweet_scan_lock);
+	IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+	if (b != NULL) {
+		s->mapCache = kIOMapDefaultCache;       /* as every surface; the scanout cleans CPU-written frames */
+		bzero(b->getBytesNoCopy(), (size_t)SWEET_SCAN_SLOT_LEN);
+		flush_dcache64((addr64_t)(uintptr_t)b->getBytesNoCopy(), (unsigned)SWEET_SCAN_SLOT_LEN, FALSE);
+	} else {
+		s->mapCache = kIOMapWriteCombineCache;  /* as the panel's own surface */
+		uintptr_t va = s->kernelAddress();
+		if (va != 0) {
+			bzero((void *)va, (size_t)SWEET_SCAN_SLOT_LEN);
+			__asm__ volatile ("dsb sy" ::: "memory");
+		}
+	}
+	IOLog("SWEET SURF: scanout slot %u (%s, PA %#llx) for a %ux%u surface, %u-byte rows\n", n, b != NULL ? "RAM" : "carve-out",
+	    s->scanPA, s->width, s->height, s->bytesPerRow);
+	return true;
+}
+
+SweetSurface *
+sweet_surface_scan_copy(uint32_t slot, uint64_t *pa)
+{
+	uint32_t id = 0;
+	*pa = 0;
+	if (slot >= SWEET_SCAN_SLOTS || sweet_scan_lock == NULL) {
+		return NULL;
+	}
+	IOLockLock(sweet_scan_lock);
+	if (sweet_scan_slot[slot].owner != NULL) {
+		id = sweet_scan_slot[slot].owner->id;
+	}
+	*pa = sweet_scan_slot[slot].pa;
+	IOLockUnlock(sweet_scan_lock);
+	SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
+	if (s != NULL && s->scanSlot != slot + 1) {
+		s->release();
+		s = NULL;
+	}
+	return s;
+}
+
 void
 SweetSurface::free()
 {
-	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+	if (scanSlot != 0) {
+		sweet_scan_release(this);       /* 0975: the slot's memory stays allocated for the next surface */
+	} else if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
 	}
 	OSSafeReleaseNULL(kernelMap);
@@ -806,7 +963,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 	}
 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
 	ret = sweet_surface_layout(s, props);
-	if (ret == kIOReturnSuccess) {
+	if (ret == kIOReturnSuccess && sweet_scan_claim(s)) {
+		if (!sweet_surface_publish(s)) {        /* 0975: in a scanout slot */
+			ret = kIOReturnNoResources;
+		}
+	} else if (ret == kIOReturnSuccess) {
 		IOBufferMemoryDescriptor *mem = NULL;
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {

@@ -39,6 +39,10 @@ public:
 	IOOptionBits              mapCache;     /* cache mode for user mappings */
 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+	uint32_t                  scanSlot;     /* 0975: 1 + its scanout slot (sweetscanout), 0 = ordinary memory */
+	uint64_t                  scanPA;       /* 0975: the slot's physical address (contiguous, below 4 GB) */
+	volatile SInt32           displayUse;   /* 0976: frames of it the display holds (queued, flipping, shown) */
+	volatile SInt32           clientUse;    /* 0976: IOSurfaceIncrementUseCount - Decrement from userland */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -49,6 +53,15 @@ public:
 
 /* Retained surface for an id, or NULL. */
 SweetSurface *sweet_surface_copy(uint32_t id);
+
+/*
+ * 0975: scanout slots (boot-arg sweetscanout, SweetSurface.cpp). The surface in slot n, retained, and the slot's
+ * address (also when it is free: slots are never given back), or NULL.
+ */
+#define SWEET_SCAN_SLOTS                7
+#define SWEET_SCAN_SLOT_LEN             0xab8000ULL     /* 4608 x 2436, 16 KB pages */
+uint32_t sweet_surface_scan_mode(void);
+SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
 
 /*
  * Publish physical memory (the panel framebuffer) as a surface. Returns a
