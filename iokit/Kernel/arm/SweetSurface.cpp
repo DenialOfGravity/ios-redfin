@@ -692,6 +692,8 @@ public:
 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
 
 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
+	IOReturn trapIncUse(void *id, void *category, void *, void *, void *, void *);    /* 0976 */
+	IOReturn trapDecUse(void *id, void *category, void *, void *, void *, void *);
 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
@@ -1075,6 +1077,43 @@ IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category
 	return kIOReturnSuccess;
 }
 
+/* 0976: with scanout slots (sweetscanout), userland's use counts are kept in clientUse (and the first logged). */
+static void
+sweet_surface_client_use(void *id, void *category, int delta)
+{
+	static uint32_t logs;
+	if (sweet_surface_scan_mode() == 0) {
+		return;
+	}
+	SweetSurface *s = sweet_surface_copy((uint32_t)(uintptr_t)id);
+	if (s == NULL) {
+		return;
+	}
+	SInt32 v = OSAddAtomic(delta, &s->clientUse) + delta;
+	if (logs < 16) {
+		char name[32];
+		logs++;
+		proc_selfname(name, sizeof(name));
+		IOLog("SWEET SURF: %s use count %s surface %u (slot %u) category %#llx -> %d\n", name, delta > 0 ? "+1" : "-1",
+		    s->id, s->scanSlot, (uint64_t)(uintptr_t)category, (int)v);
+	}
+	s->release();
+}
+
+IOReturn
+IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, void *, void *)
+{
+	sweet_surface_client_use(id, category, 1);
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOSurfaceRootUserClient::trapDecUse(void *id, void *category, void *, void *, void *, void *)
+{
+	sweet_surface_client_use(id, category, -1);
+	return kIOReturnSuccess;
+}
+
 static IOReturn
 sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
 {
@@ -1145,8 +1184,8 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
 }
 
 static IOExternalTrap sweet_surface_traps[] = {
-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncUse },
+	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecUse },
 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
