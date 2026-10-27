@@ -250,7 +250,7 @@ prof_tick(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
 		}
 	}
 	prof_sample_here();
-	if (now >= prof.end_abs) {
+	if (now >= prof.end_abs || prof.dropped != 0) {      /* 0993: a full buffer ends the run */
 		prof.state = PROF_STOPPING;
 		thread_wakeup((event_t)&prof.state);
 		return;
@@ -518,10 +518,18 @@ sweet_prof_cmd(const char *s, const char *end)
 			const char *t = nm;
 			pid = (int)prof_num(&t, q, 0);
 		}
-		uint32_t hz = PMIN(PMAX(prof_num(&q, end, 1000), 10u), 4000u);
-		uint32_t secs = PMIN(PMAX(prof_num(&q, end, 10), 1u), 120u);
-		uint32_t depth = PMIN(prof_num(&q, end, 24), (uint32_t)PROF_DEPTH_MAX);
-		uint32_t whz = PMIN(prof_num(&q, end, 0), 200u);
+		/*
+		 * 0993: one prof_num per argument, then the clamps (PMIN/PMAX evaluate their arguments twice: 0992 read
+		 * "1000 120 24 0" as 0 Hz 10 s, a timer with interval 0)
+		 */
+		uint32_t hz = prof_num(&q, end, 1000);
+		uint32_t secs = prof_num(&q, end, 10);
+		uint32_t depth = prof_num(&q, end, 24);
+		uint32_t whz = prof_num(&q, end, 0);
+		hz = PMIN(PMAX(hz, 10u), 4000u);
+		secs = PMIN(PMAX(secs, 1u), 120u);
+		depth = PMIN(depth, (uint32_t)PROF_DEPTH_MAX);
+		whz = PMIN(whz, 200u);
 		if (nl == 0) {
 			printf("SWEET PROF: usage p prof start NAME|PID [HZ [SECS [DEPTH [WAITHZ]]]]\n");
 			return;
@@ -562,6 +570,9 @@ sweet_prof_cmd(const char *s, const char *end)
 		prof.xbusy = prof.xfail = prof.marks = prof.overruns = 0;
 		prof.text_size = 0;
 		nanoseconds_to_absolutetime(1000000000ull / hz, &prof.interval);
+		if (prof.interval == 0) {
+			prof.interval = 1;
+		}
 		uint64_t len;
 		nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &len);
 		prof.nthreads = 0;
