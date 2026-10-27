@@ -339,6 +339,8 @@ sweet_gpu_init(void)
 	{
 		extern int a6_submit_wfi;
 		PE_parse_boot_argn("sweetwfi", &a6_submit_wfi, sizeof(a6_submit_wfi));
+		extern int a6_submit_rbts;	/* 0988 */
+		PE_parse_boot_argn("sweetgputs", &a6_submit_rbts, sizeof(a6_submit_rbts));
 	}
 	gpu.perf_level = lvl;
 	pool_kva = va;

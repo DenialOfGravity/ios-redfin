@@ -16,6 +16,13 @@
 #include "sweet_a6xx.h"
 
 int a6_submit_wfi;	/* 0157: CP_WAIT_FOR_IDLE after each client submit (boot-arg sweetwfi) */
+/*
+ * 0988: boot-arg sweetgputs=1: a submit's end stamp is written by CP_EVENT_WRITE RB_DONE_TS | TIMESTAMP (the
+ * ALWAYS_ON counter once the rendering before it is done, as Turnip's A6XX timestamps) instead of CP_REG_TO_MEM,
+ * and its start is max(its CP stamp, the previous submit's end). Without the 0157 WFI both CP stamps are taken when
+ * the CP gets there, not when the GPU is done: the 5 s "GPU busy" sums measure the CP's progress, not the GPU's.
+ */
+int a6_submit_rbts;
 
 #define rd32		a6_rd
 #define wr32		a6_wr
@@ -1213,7 +1220,7 @@ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint3
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
 	/* GPU time of this submit: CP_ALWAYS_ON_COUNTER before the IBs and once they are idle (a6_submit_time) */
 	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
-	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5], n = 0;
+	uint32_t dw[4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5 + 2], n = 0;	/* 0988: + the longer end stamp */
 	if (nib == 0 || nib > A6_SUBMIT_MAX)
 		return 0;
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 1);
@@ -1234,10 +1241,18 @@ uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint3
 	 * lands only once the work before it is done, and the CP may start the next submit meanwhile */
 	if (a6_submit_wfi)
 		dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
-	dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
-	dw[n++] = 0x980 | 2u << 18;
-	dw[n++] = (uint32_t)(ts + 8);
-	dw[n++] = (uint32_t)((ts + 8) >> 32);
+	if (a6_submit_rbts) {
+		dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);	/* 0988: RB_DONE_TS with the timestamp -> ts + 8 */
+		dw[n++] = 0x16 | 1u << 30;
+		dw[n++] = (uint32_t)(ts + 8);
+		dw[n++] = (uint32_t)((ts + 8) >> 32);
+		dw[n++] = 0;
+	} else {
+		dw[n++] = a6_pkt7(0x3e, 3);		/* ... -> ts + 8 */
+		dw[n++] = 0x980 | 2u << 18;
+		dw[n++] = (uint32_t)(ts + 8);
+		dw[n++] = (uint32_t)((ts + 8) >> 32);
+	}
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);
 	dw[n++] = 0x04;				/* CACHE_FLUSH_TS: the fence lands once the caches are clean */
 	dw[n++] = (uint32_t)fva;
@@ -1276,6 +1291,14 @@ uint64_t a6_submit_time(const struct a6_gpu *g, uint32_t fence)
 {
 	uint64_t t[2] = { 0, 0 };
 	a6_read(a6_pool_pa(g, A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * (fence % A6_TS_SLOTS), t, 16);
+	if (a6_submit_rbts) {
+		/* 0988: the GPU was on the submit before until its end */
+		uint64_t p[2] = { 0, 0 };
+		a6_read(a6_pool_pa(g, A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((fence - 1) % A6_TS_SLOTS), p, 16);
+		if (p[1] > t[0] && p[1] < t[1]) {
+			t[0] = p[1];
+		}
+	}
 	return t[1] > t[0] ? t[1] - t[0] : 0;
 }
 
