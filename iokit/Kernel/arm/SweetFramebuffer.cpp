@@ -278,6 +278,7 @@ public:
 	struct { const void *s; uint32_t id, seed; } fSeen[8];  /* 0943: surfaces' seeds at their last present */
 	uint32_t      fSeenNext;
 	void          publishModes(void);
+	void          publishSourceLimits(void);     /* 0990 */
 	bool          setHz(uint32_t hz, bool tc);
 	bool          dsiSend(const uint8_t *pkt, uint32_t size);
 	bool          cpuWrote(SweetSurface *s);
@@ -809,6 +810,7 @@ AppleCLCD::start(IOService *provider)
 	}
 	OSSafeReleaseNULL(linear);
 	OSSafeReleaseNULL(align);
+	publishSourceLimits();          /* 0990: sweetiomfbprops=1 */
 	if (blStart()) {
 		uint32_t blOn = 0;
 		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
@@ -1433,6 +1435,38 @@ sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
 		d->setObject(key, n);
 		n->release();
 	}
+}
+
+/*
+ * 0990 (boot-arg sweetiomfbprops=1): the display pipe's source limits. QuartzCore os_logs "kIOMFB... missing!" when
+ * the framebuffer service lacks them; the key strings (imgdump grep in QuartzCore and IOMobileFramebuffer, r39):
+ * IOMFBMaxSrcPixels = { MaxSrcBufferWidth, MaxSrcBufferHeight, MaxSrcRectWidth, MaxSrcRectTotal } (read by CA's
+ * maximumSourceRectPixels / maximumSourceRectWidth) and IOMFBMaxCompressedSizeInBytes. Values: buffers up to 16384,
+ * a 4096-wide source rectangle, two 1125x2436 frames of source pixels in all, one uncompressed frame's bytes.
+ */
+void
+AppleCLCD::publishSourceLimits(void)
+{
+	uint32_t on = 0;
+	PE_parse_boot_argn("sweetiomfbprops", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	OSDictionary *px = OSDictionary::withCapacity(4);
+	if (px != NULL) {
+		sweet_fb_set_number(px, "MaxSrcBufferWidth", 16384);
+		sweet_fb_set_number(px, "MaxSrcBufferHeight", 16384);
+		sweet_fb_set_number(px, "MaxSrcRectWidth", 4096);
+		sweet_fb_set_number(px, "MaxSrcRectTotal", 2ULL * SWEET_FB_LOGICAL_W * SWEET_FB_LOGICAL_H);
+		setProperty("IOMFBMaxSrcPixels", px);
+		px->release();
+	}
+	OSNumber *n = OSNumber::withNumber(4ULL * SWEET_FB_LOGICAL_W * SWEET_FB_LOGICAL_H, 32);
+	if (n != NULL) {
+		setProperty("IOMFBMaxCompressedSizeInBytes", n);
+		n->release();
+	}
+	IOLog("SWEET FB: source limits published (IOMFBMaxSrcPixels, IOMFBMaxCompressedSizeInBytes)\n");
 }
 
 /*
