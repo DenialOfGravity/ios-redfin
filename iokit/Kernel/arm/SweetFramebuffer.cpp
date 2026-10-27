@@ -744,6 +744,7 @@ AppleCLCD::start(IOService *provider)
 		publishModes();
 	}
 	sweet_fb_instance = this;
+	sweet_surface_scan_reserve();   /* 0979: the scanout slots' memory before userland (sweetscanout) */
 	if (sweet_surface_scan_mode() == 1) {
 		sweet_scan_set(this, true, "boot-arg sweetscanout=1");  /* 0976 */
 	}
@@ -1582,7 +1583,7 @@ sweet_mdp_smmu(bool walk)
 /* A w x h pattern at SWEET_MDP_TEST_PA: white border, red block top left, colour bars above, a 64 px grid below,
  * a red 2 px line left and right of column seam (where the two pipes meet). Through a write-combined mapping. */
 static bool
-sweet_mdp_pattern(uint32_t w, uint32_t h, uint32_t stride, uint32_t seam)
+sweet_mdp_pattern(uint32_t w, uint32_t h, uint32_t stride, uint32_t seam, IOMemoryDescriptor *into = NULL)
 {
 	static const uint32_t bars[8] = {
 		0xffffffff, 0xffffff00, 0xff00ffff, 0xff00ff00, 0xffff00ff, 0xffff0000, 0xff0000ff, 0xff000000,
@@ -1591,13 +1592,25 @@ sweet_mdp_pattern(uint32_t w, uint32_t h, uint32_t stride, uint32_t seam)
 	if (w == 0 || h == 0 || stride < w * 4 || len > SWEET_MDP_TEST_LEN) {
 		return false;
 	}
-	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_MDP_TEST_PA, len, kIODirectionInOut);
-	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
-	OSSafeReleaseNULL(md);
-	if (map == NULL) {
+	/* 0979: or into a scanout slot's memory (RAM: through the cached kernel mapping, cleaned after) */
+	IOBufferMemoryDescriptor *ram = OSDynamicCast(IOBufferMemoryDescriptor, into);
+	IOMemoryMap *map = NULL;
+	if (ram == NULL) {
+		IOMemoryDescriptor *md = into;
+		if (md != NULL) {
+			md->retain();
+		} else {
+			md = IOMemoryDescriptor::withPhysicalAddress(SWEET_MDP_TEST_PA, len, kIODirectionInOut);
+		}
+		map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+		OSSafeReleaseNULL(md);
+		if (map == NULL) {
+			return false;
+		}
+	} else if (ram->getLength() < len) {
 		return false;
 	}
-	uint8_t *base = (uint8_t *)map->getVirtualAddress();
+	uint8_t *base = ram != NULL ? (uint8_t *)ram->getBytesNoCopy() : (uint8_t *)map->getVirtualAddress();
 	for (uint32_t y = 0; y < h; y++) {
 		uint32_t *row = (uint32_t *)(base + (uint64_t)y * stride);
 		for (uint32_t x = 0; x < w; x++) {
@@ -1616,8 +1629,11 @@ sweet_mdp_pattern(uint32_t w, uint32_t h, uint32_t stride, uint32_t seam)
 			row[x] = c;
 		}
 	}
+	if (ram != NULL) {
+		flush_dcache64((addr64_t)(uintptr_t)base, (unsigned)len, FALSE);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	map->release();
+	OSSafeReleaseNULL(map);
 	return true;
 }
 
@@ -1835,8 +1851,20 @@ sweet_mdp_ca(uint32_t slot)
 	uint64_t pa = 0;
 	SweetSurface *s = sweet_surface_scan_copy(slot, &pa);
 	if (s == NULL) {
-		IOLog("SWEET MDP: ca: no surface in scanout slot %u (PA %#llx; boot-arg sweetscanout=1|2)\n", slot, pa);
-		return false;
+		/* 0979: an empty slot shows the test pattern from its own memory (does the MDP read this RAM?) */
+		IOMemoryDescriptor *md = sweet_surface_scan_md(slot, &pa);
+		bool ok = md != NULL && sweet_mdp_pattern(SWEET_FB_LOGICAL_W, SWEET_FB_LOGICAL_H, SWEET_MDP_SURF_STRIDE,
+		    SWEET_FB_LOGICAL_W / 2 + 1, md) && sweet_mdp_scale_regs((uint32_t)pa, SWEET_MDP_SURF_STRIDE, false);
+		OSSafeReleaseNULL(md);
+		if (!ok) {
+			IOLog("SWEET MDP: ca: no surface and no memory in scanout slot %u (PA %#llx; boot-arg sweetscanout=1|2)\n",
+			    slot, pa);
+			return false;
+		}
+		sweet_mdp_flush("ca");
+		sweet_mdp_pipes("ca");
+		IOLog("SWEET MDP: ca: slot %u is empty: the test pattern from its memory (PA %#llx) on screen\n", slot, pa);
+		return true;
 	}
 	uint32_t id = s->id, bpr = s->bytesPerRow, seed = s->state != NULL ?
 	    *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
@@ -1969,10 +1997,12 @@ static struct {
 	uint64_t      nextSeq, flipSeq, shownSeq, seq;
 	uint64_t      nextAbs, flipSwapAbs, flipAbs;
 	uint32_t      seed[SWEET_SCAN_SLOTS];
+	uint32_t      slotRun;          /* 0979: slot frames in a row (direct only from 3: no switching every frame) */
+	uint32_t      chain[8], chainNext;      /* 0979: the last slot frames' surfaces: CA's chain depth */
 	/* 5 s statistics (fLock) */
 	uint64_t      stWin, stFenceAbs, stLatchAbs, stLatchMax;
 	uint32_t      stFrames, stFlips, stLatched, stDropped, stNonslot, stLate, stBp, stBpTimeout, stWait, stWaitTimeout;
-	uint32_t      stEnter, stLeave, stClean, stLatchN;
+	uint32_t      stEnter, stLeave, stClean, stLatchN, stLatchFc, stHold;
 } sweet_scan;
 
 static bool
@@ -2094,6 +2124,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 		OSSafeReleaseNULL(s);
 		IOLockLock(fb->fLock);
 		sweet_scan.stNonslot++;
+		sweet_scan.slotRun = 0;
 		bool geom = sweet_scan.geom;
 		IOLockUnlock(fb->fLock);
 		if (geom) {
@@ -2103,6 +2134,19 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	}
 	IOLockLock(fb->fLock);
 	if (!sweet_scan.on) {
+		IOLockUnlock(fb->fLock);
+		s->release();
+		return false;
+	}
+	/*
+	 * 0979: r36a's chain had one surface in a slot and one not: the pipes switched geometry on every frame (enter 70,
+	 * leave 69 in 5 s). Direct only after 3 slot frames in a row; until then the normal path.
+	 */
+	sweet_scan.slotRun++;
+	sweet_scan.chain[sweet_scan.chainNext] = s->id;
+	sweet_scan.chainNext = (sweet_scan.chainNext + 1) % 8;
+	if (!sweet_scan.geom && (sweet_scan.slotRun < 3 || sweet_scan.entering)) {
+		sweet_scan.stHold++;
 		IOLockUnlock(fb->fLock);
 		s->release();
 		return false;
@@ -2121,12 +2165,28 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
 	sweet_scan.nextAbs = now;
 	sweet_scan.stFrames++;
 	IOLockWakeup(fb->fLock, &sweet_scan, false);
-	/* back pressure: return once frame seq - 1 (or later) is on screen */
-	if (sweet_scan.shownSeq + 1 < seq && sweet_scan.geom) {
+	/*
+	 * Back pressure (0979: by CA's chain depth N, the different surfaces of the last 8 slot frames). CA draws frame
+	 * seq + 1 into the surface of frame seq + 1 - N, which must be off screen: return once frame seq + 2 - N (or a
+	 * later one) is on screen. N = 2 (r36a): this frame itself; N = 3: the one before.
+	 */
+	uint32_t depth = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		bool seen = sweet_scan.chain[i] == 0;
+		for (uint32_t j = 0; j < i && !seen; j++) {
+			seen = sweet_scan.chain[j] == sweet_scan.chain[i];
+		}
+		depth += !seen;
+	}
+	if (depth < 2) {
+		depth = 2;
+	}
+	uint64_t need = seq + 2 > depth ? seq + 2 - depth : 0;
+	if (sweet_scan.shownSeq < need && sweet_scan.geom) {
 		uint64_t dl;
 		clock_interval_to_deadline(50, kMillisecondScale, &dl);
 		sweet_scan.stBp++;
-		while (sweet_scan.on && sweet_scan.geom && sweet_scan.shownSeq + 1 < seq) {
+		while (sweet_scan.on && sweet_scan.geom && sweet_scan.shownSeq < need) {
 			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
 				sweet_scan.stBpTimeout++;
 				break;
@@ -2148,7 +2208,8 @@ sweet_scan_wait(AppleCLCD *fb, uint32_t id)
 	clock_interval_to_deadline(50, kMillisecondScale, &dl);
 	IOLockLock(fb->fLock);
 	sweet_scan.stWait++;
-	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) < 0) {
+	/* 0979: until the swap is retired (a later one on screen: its surface is free); the normal path: at once */
+	while (sweet_scan.on && sweet_scan.geom && (int32_t)(sweet_scan.shownSwap - id) <= 0) {
 		if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
 			sweet_scan.stWaitTimeout++;
 			break;
@@ -2162,10 +2223,16 @@ static bool
 sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 {
 	if (sweet_scan.flipping != NULL) {
+		/*
+		 * 0979: on screen once INTF1's frame counter (0x6b8ac, the one that works; the tear-check TE counter reads 0)
+		 * has moved past the flush and the VIG flush bits are clear; or after 2 frames whatever the bits say.
+		 */
 		uint32_t frames = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT) - sweet_scan.flipFrame;
-		if ((sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) & MDP_FLUSH_VIG01) != 0 && frames < 2) {
+		bool bits = (sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) & MDP_FLUSH_VIG01) == 0;
+		if (!(frames >= 2 || (frames >= 1 && bits))) {
 			return true;
 		}
+		sweet_scan.stLatchFc += !bits;
 		sweet_scan_drop(&sweet_scan.shown);
 		sweet_scan.shown = sweet_scan.flipping;
 		sweet_scan.flipping = NULL;
@@ -2210,6 +2277,8 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 		}
 	}
 	sweet_scan.next = NULL;
+	uint64_t sSeq = sweet_scan.nextSeq, sAbs = sweet_scan.nextAbs;    /* 0979: a newer frame may come while entering */
+	uint32_t sSwap = sweet_scan.nextSwap;
 	if (!sweet_scan.geom) {
 		/* the first direct frame: switch the pipes (they show s once it returns) */
 		sweet_scan.entering = true;
@@ -2236,9 +2305,12 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 		}
 		sweet_scan_drop(&sweet_scan.shown);
 		sweet_scan.shown = s;
-		sweet_scan.shownSeq = sweet_scan.nextSeq;
-		sweet_scan.shownSwap = sweet_scan.nextSwap;
+		sweet_scan.shownSeq = sSeq;
+		sweet_scan.shownSwap = sSwap;
 		sweet_scan.stFlips++;
+		sweet_scan.stLatched++;
+		sweet_scan.stLatchN++;
+		sweet_scan.stLatchAbs += mach_absolute_time() - sAbs;
 		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
 		return sweet_scan.next != NULL;
 	}
@@ -2247,9 +2319,9 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 	sweet_scan.flipFrame = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
 	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
 	sweet_scan.flipping = s;
-	sweet_scan.flipSeq = sweet_scan.nextSeq;
-	sweet_scan.flipSwap = sweet_scan.nextSwap;
-	sweet_scan.flipSwapAbs = sweet_scan.nextAbs;
+	sweet_scan.flipSeq = sSeq;
+	sweet_scan.flipSwap = sSwap;
+	sweet_scan.flipSwapAbs = sAbs;
 	sweet_scan.flipAbs = now;
 	sweet_scan.stFlips++;
 	return true;
@@ -2277,16 +2349,17 @@ sweet_scan_stats_locked(uint64_t now)
 	absolutetime_to_nanoseconds(sweet_scan.stLatchAbs, &lat);
 	absolutetime_to_nanoseconds(sweet_scan.stLatchMax, &lmax);
 	IOLog("SWEET SCANOUT: 5s: frames %u flips %u latched %u dropped %u nonslot %u late %u | fence %llu us swap->latch %llu "
-	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u | clean %u enter %u leave %u | %s\n",
+	    "us max %llu us | bp %u timeout %u | swapwait %u timeout %u | clean %u enter %u leave %u held %u latch-fc %u | %s\n",
 	    sweet_scan.stFrames, sweet_scan.stFlips, sweet_scan.stLatched, sweet_scan.stDropped, sweet_scan.stNonslot,
 	    sweet_scan.stLate, sweet_scan.stFlips ? fw / 1000 / sweet_scan.stFlips : 0,
 	    sweet_scan.stLatchN ? lat / 1000 / sweet_scan.stLatchN : 0, lmax / 1000, sweet_scan.stBp, sweet_scan.stBpTimeout,
 	    sweet_scan.stWait, sweet_scan.stWaitTimeout, sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
-	    sweet_scan.geom ? "direct" : "panel buffer");
+	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
 	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
 	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
 	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
 	sweet_scan.stClean = sweet_scan.stEnter = sweet_scan.stLeave = sweet_scan.stLatchN = 0;
+	sweet_scan.stHold = sweet_scan.stLatchFc = 0;
 }
 
 static void

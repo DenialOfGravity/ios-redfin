@@ -123,57 +123,119 @@ sweet_scan_release(SweetSurface *s)
 	s->scanSlot = 0;
 }
 
-/* The slot's memory, made on first use: the carve-out (slot 0) or contiguous RAM below 4 GB (32-bit SRC0_ADDR). */
+/*
+ * The slot's memory, made on first use: the carve-out (slot 0) or, 0979, the GPU pool: HLOS RAM below 4 GB that XNU
+ * does not manage (0xc4000000.., sweet_gpu.c gpool_ranges). r36a asked XNU for contiguous RAM below 4 GB and got
+ * none: on redfin XNU's RAM starts at 4 GB (mkadt.py --highmem), and SRC0_ADDR is 32 bits with the MDP's SMMU bank
+ * not translating. Pool memory is unmanaged like the carve-out: mapped write-combined, no cache maintenance.
+ */
+extern "C" int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
 static bool
 sweet_scan_make_locked(uint32_t n)
 {
-	if (n == 0) {
-		sweet_scan_slot[0].md = IOMemoryDescriptor::withPhysicalAddress(SWEET_SCAN_CARVE_PA, SWEET_SCAN_SLOT_LEN,
-		    kIODirectionInOut);
-		sweet_scan_slot[0].pa = SWEET_SCAN_CARVE_PA;
-		return sweet_scan_slot[0].md != NULL;
+	uint64_t pa = SWEET_SCAN_CARVE_PA;
+	if (n != 0) {
+		if (sweet_scan_ram_failed) {
+			return false;
+		}
+		pa = 0;
+		if (sweet_gpu_pool_alloc(SWEET_SCAN_SLOT_LEN, &pa) != 0 || pa == 0 || pa + SWEET_SCAN_SLOT_LEN > (1ULL << 32)) {
+			IOLog("SWEET SURF: scanout slot %u: no %#llx bytes in the GPU pool below 4 GB (%#llx): no more RAM slots\n", n,
+			    SWEET_SCAN_SLOT_LEN, pa);
+			sweet_scan_ram_failed = true;   /* (a pool block above 4 GB would leak: the ranges are all below) */
+			return false;
+		}
 	}
-	if (sweet_scan_ram_failed) {
-		return false;
-	}
-	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared, SWEET_SCAN_SLOT_LEN,
-	    0x00000000ffffc000ULL);
-	uint64_t pa = b != NULL ? (uint64_t)b->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
-	if (b == NULL || pa == 0 || pa + SWEET_SCAN_SLOT_LEN > (1ULL << 32)) {
-		IOLog("SWEET SURF: scanout slot %u: no contiguous %#llx bytes below 4 GB (%#llx): RAM slots off\n", n,
-		    SWEET_SCAN_SLOT_LEN, pa);
-		OSSafeReleaseNULL(b);
-		sweet_scan_ram_failed = true;
-		return false;
-	}
-	sweet_scan_slot[n].md = b;
+	sweet_scan_slot[n].md = IOMemoryDescriptor::withPhysicalAddress(pa, SWEET_SCAN_SLOT_LEN, kIODirectionInOut);
 	sweet_scan_slot[n].pa = pa;
-	return true;
+	return sweet_scan_slot[n].md != NULL;
 }
 
-/* create(): a framebuffer-sized backboardd surface goes into a free slot (zeroed), or false. */
 static bool
-sweet_scan_claim(SweetSurface *s)
+sweet_scan_lock_ready(void)
 {
-	char name[32];
-	if (sweet_surface_scan_mode() == 0 || s->width != 1125 || s->height != 2436 || s->pixelFormat != 0x42475241 ||
-	    s->planeCount > 1 || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->offset != 0 ||
-	    (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > SWEET_SCAN_SLOT_LEN) {
-		return false;
-	}
-	proc_selfname(name, sizeof(name));
-	if (strcmp(name, "backboardd") != 0) {
-		return false;
-	}
 	if (sweet_scan_lock == NULL) {
 		IOLock *lock = IOLockAlloc();
 		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&sweet_scan_lock)) {
 			IOLockFree(lock);
 		}
-		if (sweet_scan_lock == NULL) {
-			return false;
+	}
+	return sweet_scan_lock != NULL;
+}
+
+/*
+ * 0979: the slots' memory at boot. r36a: the first RAM slot, asked for when backboardd created its second surface
+ * (68 s), found no contiguous 11 MB below 4 GB any more, so CA's 2-surface chain had one surface in a slot and one not.
+ * AppleCLCD::start runs before userland: slot 0 (carve-out) and RAM slots 1..sweetscanslots (default 6) now.
+ */
+void
+sweet_surface_scan_reserve(void)
+{
+	uint32_t want = SWEET_SCAN_SLOTS - 1, got = 0;
+	if (sweet_surface_scan_mode() == 0 || !sweet_scan_lock_ready()) {
+		return;
+	}
+	PE_parse_boot_argn("sweetscanslots", &want, sizeof(want));
+	if (want > SWEET_SCAN_SLOTS - 1) {
+		want = SWEET_SCAN_SLOTS - 1;
+	}
+	IOLockLock(sweet_scan_lock);
+	for (uint32_t n = 0; n <= want; n++) {
+		if (sweet_scan_slot[n].md == NULL && !sweet_scan_make_locked(n)) {
+			break;
 		}
+		IOMemoryMap *map = n != 0 ? sweet_scan_slot[n].md->map(kIOMapWriteCombineCache) : NULL;
+		if (map != NULL) {
+			bzero((void *)map->getVirtualAddress(), (size_t)SWEET_SCAN_SLOT_LEN);     /* black, not old pool data */
+			__asm__ volatile ("dsb sy" ::: "memory");
+			map->release();
+		}
+		IOLog("SWEET SURF: scanout slot %u reserved: %s PA %#llx\n", n, n == 0 ? "carve-out" : "GPU-pool RAM",
+		    sweet_scan_slot[n].pa);
+		got++;
+	}
+	IOLockUnlock(sweet_scan_lock);
+	IOLog("SWEET SURF: scanout: %u slots at boot (asked 1 + %u)\n", got, want);
+}
+
+IOMemoryDescriptor *
+sweet_surface_scan_md(uint32_t slot, uint64_t *pa)
+{
+	IOMemoryDescriptor *md = NULL;
+	*pa = 0;
+	if (slot < SWEET_SCAN_SLOTS && sweet_scan_lock_ready()) {
+		IOLockLock(sweet_scan_lock);
+		md = sweet_scan_slot[slot].md;
+		*pa = sweet_scan_slot[slot].pa;
+		if (md != NULL) {
+			md->retain();
+		}
+		IOLockUnlock(sweet_scan_lock);
+	}
+	return md;
+}
+
+/* create(): a framebuffer-sized backboardd surface goes into a free slot (zeroed): NULL, or why not. */
+static const char *
+sweet_scan_claim(SweetSurface *s)
+{
+	char name[32];
+	if (sweet_surface_scan_mode() == 0) {
+		return "scanout off (boot-arg sweetscanout)";
+	}
+	if (s->pixelFormat != 0x42475241 || s->planeCount > 1 || s->bytesPerElement != 4 || s->elementWidth != 1 ||
+	    s->elementHeight != 1) {
+		return "not one-plane BGRA";
+	}
+	if (s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > SWEET_SCAN_SLOT_LEN) {
+		return "offset, rows or size";
+	}
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, "backboardd") != 0) {
+		return "not backboardd's";
+	}
+	if (!sweet_scan_lock_ready()) {
+		return "no lock";
 	}
 	IOLockLock(sweet_scan_lock);
 	uint32_t n;
@@ -184,8 +246,7 @@ sweet_scan_claim(SweetSurface *s)
 	}
 	if (n == SWEET_SCAN_SLOTS) {
 		IOLockUnlock(sweet_scan_lock);
-		IOLog("SWEET SURF: scanout slots full: surface %ux%u in ordinary memory\n", s->width, s->height);
-		return false;
+		return "slots full (or no memory for another)";
 	}
 	sweet_scan_slot[n].owner = s;
 	sweet_scan_slot[n].md->retain();
@@ -206,9 +267,9 @@ sweet_scan_claim(SweetSurface *s)
 			__asm__ volatile ("dsb sy" ::: "memory");
 		}
 	}
-	IOLog("SWEET SURF: scanout slot %u (%s, PA %#llx) for a %ux%u surface, %u-byte rows\n", n, b != NULL ? "RAM" : "carve-out",
+	IOLog("SWEET SURF: scanout slot %u (%s, PA %#llx) for a %ux%u surface, %u-byte rows\n", n, n != 0 ? "pool RAM" : "carve-out",
 	    s->scanPA, s->width, s->height, s->bytesPerRow);
-	return true;
+	return NULL;
 }
 
 SweetSurface *
@@ -965,7 +1026,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 	}
 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
 	ret = sweet_surface_layout(s, props);
-	if (ret == kIOReturnSuccess && sweet_scan_claim(s)) {
+	const char *notSlot = "-";
+	bool panelSized = ret == kIOReturnSuccess && s->width == 1125 && s->height == 2436;
+	if (panelSized) {
+		notSlot = sweet_scan_claim(s);
+	}
+	if (panelSized && notSlot == NULL) {
 		if (!sweet_surface_publish(s)) {        /* 0975: in a scanout slot */
 			ret = kIOReturnNoResources;
 		}
@@ -986,6 +1052,18 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 			if (!sweet_surface_publish(s)) {
 				ret = kIOReturnNoResources;
 			}
+		}
+	}
+	if (panelSized && sweet_surface_scan_mode() != 0) {
+		/* 0979: one line per panel-sized surface: in which slot, or why not */
+		char who[32];
+		proc_selfname(who, sizeof(who));
+		if (s->scanSlot != 0) {
+			IOLog("SWEET SURF: %s surface %u (fmt %#x bpr %u): scanout slot %u\n", who, s->id, s->pixelFormat,
+			    s->bytesPerRow, s->scanSlot - 1);
+		} else {
+			IOLog("SWEET SURF: %s surface %u (fmt %#x bpr %u): no slot: %s\n", who, s->id, s->pixelFormat, s->bytesPerRow,
+			    notSlot);
 		}
 	}
 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
@@ -1085,17 +1163,18 @@ sweet_surface_client_use(void *id, void *category, int delta)
 	if (sweet_surface_scan_mode() == 0) {
 		return;
 	}
+	char name[32];
+	proc_selfname(name, sizeof(name));
 	SweetSurface *s = sweet_surface_copy((uint32_t)(uintptr_t)id);
 	if (s == NULL) {
 		return;
 	}
 	SInt32 v = OSAddAtomic(delta, &s->clientUse) + delta;
-	if (logs < 16) {
-		char name[32];
-		logs++;
-		proc_selfname(name, sizeof(name));
-		IOLog("SWEET SURF: %s use count %s surface %u (slot %u) category %#llx -> %d\n", name, delta > 0 ? "+1" : "-1",
-		    s->id, s->scanSlot, (uint64_t)(uintptr_t)category, (int)v);
+	if (logs < 16 && (s->scanSlot != 0 || strcmp(name, "backboardd") == 0)) {
+		logs++;     /* 0979: the display's surfaces only (SpringBoard's layer surfaces filled the 16 lines) */
+		IOLog("SWEET SURF: %s use count %s surface %u (%s %u) category %#llx -> %d\n", name, delta > 0 ? "+1" : "-1",
+		    s->id, s->scanSlot != 0 ? "slot" : "no slot", s->scanSlot != 0 ? s->scanSlot - 1 : 0,
+		    (uint64_t)(uintptr_t)category, (int)v);
 	}
 	s->release();
 }

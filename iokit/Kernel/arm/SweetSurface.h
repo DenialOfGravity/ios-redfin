@@ -62,6 +62,9 @@ SweetSurface *sweet_surface_copy(uint32_t id);
 #define SWEET_SCAN_SLOT_LEN             0xab8000ULL     /* 4608 x 2436, 16 KB pages */
 uint32_t sweet_surface_scan_mode(void);
 SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
+/* 0979: the slots' memory made at boot (AppleCLCD::start, before userland fragments RAM); a slot's memory (retained) */
+void sweet_surface_scan_reserve(void);
+IOMemoryDescriptor *sweet_surface_scan_md(uint32_t slot, uint64_t *pa);
 
 /*
  * Publish physical memory (the panel framebuffer) as a surface. Returns a
