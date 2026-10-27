@@ -60,6 +60,8 @@ void sweet_gpu_cpu_flip(void);
 void sweet_gpu_present_tag(uint64_t swap_abs);
 void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
+uint32_t sweet_gpu_fence_submitted(void);       /* 0949: CPU present after the GPU has drawn the frame */
+int sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms);
 struct processor;                               /* 0946: the present thread on a big core (osfmk/kern/sched_prim.h) */
 struct processor *thread_bind(struct processor *processor);
 struct processor *cpu_to_processor(int cpu);
@@ -206,6 +208,10 @@ public:
 	void          mdpCmd(const char *s, const char *end);    /* 0948: p mdp ... */
 	/* 0946 */
 	uint64_t      fPresentingAbs;         /* SwapEnd of the frame being presented */
+	struct { uint64_t abs; uint32_t fence; } fSwapFence[4];      /* 0949: GPU fence submitted at each SwapEnd */
+	uint32_t      fSwapFenceNext;
+	uint64_t      fStWaitAbs;             /* 0949: CPU present waits for the GPU (fLock) */
+	uint32_t      fStWaitN, fStWaitLate;
 	uint64_t      fStVisAbs, fStCpuAbs;   /* SwapEnd -> panel-visible, CPU copy time (fLock) */
 	uint32_t      fStVisN, fStCpuN;
 	uintptr_t     fCpuDst;                /* copyRow's target while the CPU presents (0: fPixels) */
@@ -909,7 +915,11 @@ void
 AppleCLCD::swap(const uint8_t *rec)
 {
 	uint64_t now = mach_absolute_time();
+	uint32_t fence = sweet_gpu_fence_submitted();   /* 0949: CA's rendering of this frame is at or before it */
 	IOLockLock(fLock);
+	fSwapFence[fSwapFenceNext].abs = now;
+	fSwapFence[fSwapFenceNext].fence = fence;
+	fSwapFenceNext = (fSwapFenceNext + 1) % 4;
 	/* 0943: swap->swap interval (ms buckets, pauses over 500 ms not counted), and frames never shown */
 	if (fStLastSwap != 0) {
 		uint64_t ns;
@@ -1004,6 +1014,10 @@ AppleCLCD::statLine(uint64_t now)
 	absolutetime_to_nanoseconds(fStVisAbs, &cvis);
 	fStCpuAbs = fStVisAbs = 0;
 	fStCpuN = fStVisN = 0;
+	uint64_t gw = 0, gwN = fStWaitN, gwLate = fStWaitLate;  /* 0949 */
+	absolutetime_to_nanoseconds(fStWaitAbs, &gw);
+	fStWaitAbs = 0;
+	fStWaitN = fStWaitLate = 0;
 	absolutetime_to_nanoseconds(fStBlitqAbs, &blitq);
 	blitq = fStBlitqN ? blitq / 1000 / fStBlitqN : 0;
 	fStWin = now;
@@ -1020,12 +1034,13 @@ AppleCLCD::statLine(uint64_t now)
 	absolutetime_to_nanoseconds(vis, &vis);
 	vis = visN + cvisN ? (vis + cvis) / 1000 / (visN + cvisN) : 0;
 	cpu = cpuN ? cpu / 1000 / cpuN : 0;
+	gw = gwN ? gw / 1000 / gwN : 0;
 	if (swaps == 0 && shown == 0) {
 		return;
 	}
 	IOLog("SWEET FB: 5s: swaps %u shown %u dropped %u | le11 %u le18 %u le26 %u le35 %u gt35 %u | "
-	    "p50 %u.%u p95 %u.%u ms | blitq %llu us fence %llu us | hz %u | vis %llu us cpu %llu us\n", swaps, shown, dropped,
-	    b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz, vis, cpu);
+	    "p50 %u.%u p95 %u.%u ms | blitq %llu us fence %llu us | hz %u | vis %llu us cpu %llu us gpuwait %llu us late %llu\n", swaps, shown,
+	    dropped, b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz, vis, cpu, gw, gwLate);
 }
 
 /* sweetfbx & 2: has the CPU locked the surface for writing (IOSurface seed bumped) since its last present? */
@@ -2011,7 +2026,30 @@ AppleCLCD::presentCPU(const uint8_t *rec)
 		s->release();
 		return false;
 	}
+	/*
+	 * 0949: the frame is read only once the GPU has drawn it. Copied at SwapEnd it was still being rendered
+	 * (cleared, then filled bin by bin): black regions with a stepped edge where the GPU had got to. The fence
+	 * submitted at this frame's SwapEnd (unknown: the latest), at most 50 ms.
+	 */
+	uint32_t fence = 0;
+	IOLockLock(fLock);
+	for (uint32_t i = 0; i < 4; i++) {
+		if (fSwapFence[i].abs == fPresentingAbs && fPresentingAbs != 0) {
+			fence = fSwapFence[i].fence;
+		}
+	}
+	IOLockUnlock(fLock);
+	if (fence == 0) {
+		fence = sweet_gpu_fence_submitted();
+	}
+	uint64_t w0 = mach_absolute_time();
+	bool late = sweet_gpu_fence_wait_soft(fence, 50) != 0;
 	uint64_t t0 = mach_absolute_time();
+	IOLockLock(fLock);
+	fStWaitAbs += t0 - w0;
+	fStWaitN++;
+	fStWaitLate += late;
+	IOLockUnlock(fLock);
 	const uint8_t *base = (const uint8_t *)src + s->offset;
 	flush_dcache64((addr64_t)(uintptr_t)base, (unsigned)((uint64_t)pitch * h), FALSE);
 	fCpuDst = dst;

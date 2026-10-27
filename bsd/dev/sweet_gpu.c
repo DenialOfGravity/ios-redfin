@@ -855,6 +855,36 @@ sweet_gpu_present_landed(uint64_t *sum_abs, uint64_t *n)
 	present_land_abs = present_land_n = 0;
 	lck_mtx_unlock(&sweet_gpu_lock);
 }
+/*
+ * 0949: CPU present after the GPU. SwapEnd comes once CA has *queued* the frame's rendering, not when the GPU has
+ * drawn it: the GPU blit sits behind that work on the ring by itself, a CPU copy does not. The last fence
+ * submitted (at SwapEnd), and a wait for it that sleeps in 100 us steps.
+ */
+uint32_t sweet_gpu_fence_submitted(void);
+uint32_t
+sweet_gpu_fence_submitted(void)
+{
+	return gpu_ready ? gpu.fence : 0;
+}
+
+int sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms);
+int
+sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms)
+{
+	if (!gpu_ready || fence == 0) {
+		return 0;
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	while (!a6_fence_done(&gpu, fence)) {
+		if (!gpu_ready || mach_absolute_time() > deadline) {
+			return -1;
+		}
+		delay(100);
+	}
+	return 0;
+}
+
 /* 0946: the next present's SwapEnd time (from the framebuffer, before sweet_gpu_present). */
 void sweet_gpu_present_tag(uint64_t swap_abs);
 void
