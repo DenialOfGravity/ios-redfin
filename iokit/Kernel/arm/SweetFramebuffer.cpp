@@ -237,6 +237,9 @@ public:
 	bool          fFcCal, fFcDead;
 	bool          presentCPU(const uint8_t *rec);
 	uintptr_t     cpuBuffer(uint64_t pa);
+	uintptr_t     cpuSource(SweetSurface *s);       /* 0978 */
+	struct { IOMemoryDescriptor *md; IOMemoryMap *map; } fCpuSrc[4];
+	uint32_t      fCpuSrcNext;
 	void          phaseFrameCount(uint64_t now);
 	/* 0944 (sweetfbx & 4): frames queued at SwapEnd for the present thread, ticks phased to the TE (fLock) */
 	bool          fSwapQ;
@@ -2588,6 +2591,40 @@ AppleCLCD::phaseTick(uint64_t now)
  * frame start, no tearing); else into the scanned one. Not exactly one full-frame BGRA layer: the GPU / old CPU
  * path as before.
  */
+/*
+ * 0978: the source frame through a cacheable kernel mapping. SweetSurface::kernelAddress() maps a surface that is
+ * not a kernel buffer (CA's, every other one on r36a) write-combined, i.e. uncached: the scaled copy read it at
+ * 41 ms a frame against 4.3 ms for the cacheable one. Kept for the last 4 surfaces' memory (the map holds it);
+ * the copy cleans+invalidates the lines first, as before.
+ */
+uintptr_t
+AppleCLCD::cpuSource(SweetSurface *s)
+{
+	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+		return s->kernelAddress();      /* already a cacheable kernel buffer */
+	}
+	for (uint32_t i = 0; i < 4; i++) {
+		if (fCpuSrc[i].md == s->memory && fCpuSrc[i].map != NULL) {
+			return (uintptr_t)fCpuSrc[i].map->getVirtualAddress();
+		}
+	}
+	IOMemoryMap *map = s->memory->map(kIOMapCopybackCache);
+	if (map == NULL) {
+		return s->kernelAddress();
+	}
+	uint32_t k = fCpuSrcNext;
+	fCpuSrcNext = (k + 1) % 4;
+	OSSafeReleaseNULL(fCpuSrc[k].map);
+	fCpuSrc[k].md = s->memory;
+	fCpuSrc[k].map = map;
+	static uint32_t logs;
+	if (logs < 4) {
+		logs++;
+		IOLog("SWEET FB: CPU present: surface %u mapped cacheable for the copy\n", s->id);
+	}
+	return (uintptr_t)map->getVirtualAddress();
+}
+
 uintptr_t
 AppleCLCD::cpuBuffer(uint64_t pa)
 {
@@ -2638,7 +2675,7 @@ AppleCLCD::presentCPU(const uint8_t *rec)
 		    s->width == 0 || s->height == 0 || s->bytesPerRow < s->width * 4 ||
 		    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
 			why = 3;
-		} else if ((src = s->kernelAddress()) == 0) {
+		} else if ((src = cpuSource(s)) == 0) {
 			why = 4;
 		}
 	}
