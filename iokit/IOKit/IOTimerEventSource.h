@@ -94,6 +94,7 @@ enum{
 enum{
 	kIOTimeOptionsWithLeeway = 0x00000020,
 	kIOTimeOptionsContinuous = 0x00000100,
+	kIOTimeOptionsSweetCritical = 0x00010000,       /* redfin 0995: no timer coalescing slop (SYS_CRITICAL) */
 };
 
 /*!

@@ -5,7 +5,8 @@
  * and a branch while no trace runs (the arguments are evaluated inside the branch). No boot-arg.
  *
  * Code  Name          Args (a1, a2, a3, a4)
- * 0x01  VSYNC         vsync timer tick: count, sent (1) or held (0), sweetpace mode, INTF1 frame counter
+ * 0x01  VSYNC         vsync timer tick: count, sent (1) or held (0), sweetpace mode | sweetvsync << 8 (0995),
+ *                     INTF1 frame counter
  * 0x02  VSYNC_SEND    vsync (type 5) notification out: count, clients that take it, timestamp sent, period
  * 0x03  NOTIFY        IOMFB async notification: type, client pid, IOReturn of the send (non-zero: dropped), 0
  * 0x04  IOMFB_SEL     IOMFB externalMethod, START: selector, scalar[0], scalar[1], structIn size;

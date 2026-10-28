@@ -559,6 +559,10 @@ IOTimerEventSource::wakeAtTime(uint32_t options, AbsoluteTime inAbstime, Absolut
 		if (kIOTimeOptionsContinuous & options) {
 			tcoptions |= THREAD_CALL_CONTINUOUS;
 		}
+		if (kIOTimeOptionsSweetCritical & options) {
+			/* redfin 0995: a kernel thread's timer otherwise gets min(delay >> 3, 1 ms) of coalescing slop */
+			tcoptions |= THREAD_CALL_DELAY_SYS_CRITICAL;
+		}
 
 		if (reserved) {
 			if (kPassive & flags) {
