@@ -130,6 +130,17 @@ uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const 
 #define A6_SCAN_WORD_OFF	0x3000ull	/* 0989: in the scratch page: the direct scanout's latched frame */
 uint32_t a6_submit_ibs_async(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned n,
 			     unsigned timeout_ms);
+/*
+ * 0999: the GPU interrupt (kgsl_3d0_irq). a6_irq_mask nonzero: RBBM_INT_0_MASK gets it at each CP init (and
+ * a6_irq_enable now); a6_submit_irq: the fence's CACHE_FLUSH_TS raises CP_CACHE_FLUSH_TS (CP_EVENT_WRITE IRQ bit).
+ * a6_irq_ack: RBBM_INT_0_STATUS, cleared (the line is level: before the handler returns).
+ */
+#define A6_INT_CP_RB_DONE_TS		0x00020000u	/* a6xx.xml A6XX_RBBM_INT_0_MASK */
+#define A6_INT_CP_CACHE_FLUSH_TS	0x00100000u
+extern uint32_t a6_irq_mask;
+extern int a6_submit_irq;
+void a6_irq_enable(uint32_t mask);
+uint32_t a6_irq_ack(void);
 /* Has the fence (from a6_submit_ib_async) landed? (wraparound-safe) */
 bool a6_fence_done(const struct a6_gpu *g, uint32_t fence);
 uint32_t a6_fence_read(const struct a6_gpu *g);

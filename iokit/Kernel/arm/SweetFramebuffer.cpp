@@ -3208,6 +3208,21 @@ sweet_scan_thread(void *arg)
 	}
 }
 
+/*
+ * 0999: from the GPU interrupt (sweet_gpu.c, sweetgpuirq=1 / p gpuirq 1): a fence landed; the scanout thread, asleep
+ * for 1 ms between looks at its next frame's fence, looks now (GPU done -> flip ~0.6 ms on average without it).
+ * Interrupt context: only the wakeup (IOLockWakeup does not take the lock).
+ */
+extern "C" void sweet_scan_gpu_kick(void);
+void
+sweet_scan_gpu_kick(void)
+{
+	AppleCLCD *fb = sweet_fb_instance;
+	if (fb != NULL && sweet_scan.thread && sweet_scan.on && sweet_scan.next != NULL) {
+		IOLockWakeup(fb->fLock, &sweet_scan, false);
+	}
+}
+
 /* p scanout 0|1 and the boot-arg: frames direct or the normal way. */
 static void
 sweet_scan_set(AppleCLCD *fb, bool on, const char *why)

@@ -23,6 +23,9 @@ int a6_submit_wfi;	/* 0157: CP_WAIT_FOR_IDLE after each client submit (boot-arg 
  * the CP gets there, not when the GPU is done: the 5 s "GPU busy" sums measure the CP's progress, not the GPU's.
  */
 int a6_submit_rbts;
+/* 0999: the GPU interrupt for fence waits (sweet_gpu.c: boot-arg sweetgpuirq, p gpuirq); 0: none, as before */
+uint32_t a6_irq_mask;
+int a6_submit_irq;
 
 #define rd32		a6_rd
 #define wr32		a6_wr
@@ -176,6 +179,8 @@ static void zero_pa(uint64_t pa, uint64_t size)
 
 #define RBBM_STATUS		0x210
 #define RBBM_INT_STATUS		0x201
+#define RBBM_INT_CLEAR_CMD	0x037	/* 0999 */
+#define RBBM_INT_0_MASK		0x038	/* 0999 */
 #define CP_RB_BASE		0x800
 #define CP_RB_CNTL		0x802
 #define CP_RB_RPTR		0x806
@@ -1273,7 +1278,8 @@ uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const 
 		dw[n++] = (uint32_t)((ts + 8) >> 32);
 	}
 	dw[n++] = a6_pkt7(A6_CP_EVENT_WRITE, 4);
-	dw[n++] = 0x04;				/* CACHE_FLUSH_TS: the fence lands once the caches are clean */
+	/* CACHE_FLUSH_TS: the fence lands once the caches are clean; 0999: and raises CP_CACHE_FLUSH_TS (bit 31 IRQ) */
+	dw[n++] = 0x04 | (a6_submit_irq ? 1u << 31 : 0);
 	dw[n++] = (uint32_t)fva;
 	dw[n++] = (uint32_t)(fva >> 32);
 	dw[n++] = g->fence + 1;
@@ -1328,6 +1334,22 @@ uint64_t a6_timestamp(const struct a6_gpu *g)
 	if (hi2 != hi)
 		lo = rd32(GREG(0x0980));
 	return (uint64_t)hi2 << 32 | lo;
+}
+
+/* 0999: unmask these RBBM interrupts (0: all masked), stale status cleared first */
+void a6_irq_enable(uint32_t mask)
+{
+	wr32(GREG(RBBM_INT_CLEAR_CMD), 0xffffffffu);
+	wr32(GREG(RBBM_INT_0_MASK), mask);
+}
+
+/* 0999: from the interrupt handler: the RBBM status bits, cleared before the line is ended */
+uint32_t a6_irq_ack(void)
+{
+	uint32_t st = rd32(GREG(RBBM_INT_STATUS));
+	if (st)
+		wr32(GREG(RBBM_INT_CLEAR_CMD), st);
+	return st;
 }
 
 bool a6_fence_done(const struct a6_gpu *g, uint32_t fence)
@@ -1604,6 +1626,8 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
 	};
 	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++)
 		wr32(GREG(init[i][0]), init[i][1]);
+	if (a6_irq_mask)
+		a6_irq_enable(a6_irq_mask);	/* 0999: a soft reset cleared it */
 
 	uint32_t len;
 #if A6_GPU_ID == 620

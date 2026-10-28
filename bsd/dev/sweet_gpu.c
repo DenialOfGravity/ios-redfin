@@ -68,6 +68,7 @@ static vm_offset_t pool_kva;
 static vm_offset_t pt_kva;
 static uint64_t pt_pa;
 static volatile bool gpu_ready;
+static int gpu_irq_chan;                /* 0999: fence waiters asleep until the GPU interrupt */
 static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
 static LCK_MTX_DECLARE(sweet_gpu_lock, &sweet_gpu_grp);
 
@@ -285,6 +286,112 @@ gpu_bus_vote(void)
 	}
 }
 
+/*
+ * ---- 0999: fence waits on the GPU interrupt (boot-arg sweetgpuirq=1, or p gpuirq 1; default off) ----
+ *
+ * Without it a fence wait (sweet_gpu_wait_fence_ns: Turnip's vkWaitForFences under the bridge's
+ * metal2vulkan-queue-wait thread, in 1 ms IOKit calls) sleep-polls the fence word every 20 us (delay(20):
+ * ~40 us a turn, ~25 wakeups per 1 ms call, ~95 ms of CPU a second in a Settings fling), and the direct
+ * scanout thread looks for its frame's fence once a millisecond (GPU done -> flip 0.6 ms on average).
+ * With it each submit's CACHE_FLUSH_TS also raises CP_CACHE_FLUSH_TS (CP_EVENT_WRITE IRQ bit, as Linux's
+ * a6xx_submit), RBBM_INT_0_MASK lets only that through, and kgsl_3d0_irq (redfin DT: GIC SPI 300, level =
+ * INTID 332, boot-arg sweetgpuirqid) wakes the fence waiters and the scanout thread. The waiters still look
+ * every sweetgpuirqslice us (default 5000, the hang check's period) for the hang check and a lost interrupt; if fences keep landing
+ * with no interrupt at all it goes back to polling by itself. After UniXNU cd1b9757 (whose kernel already
+ * idles until the GPU interrupt inside a wait).
+ */
+extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
+extern void sweet_spi_mask(uint32_t intid, bool masked);
+extern void sweet_scan_gpu_kick(void);          /* SweetFramebuffer.cpp: the scanout thread looks now */
+static uint32_t gpu_irq_want, gpu_irq_intid = 332, gpu_irq_slice_us = 5000;
+static volatile bool gpu_irq_on;                /* the waiters sleep until the interrupt (else delay(20)) */
+static bool gpu_irq_attached;
+static uint64_t gpu_irq_slice_abs;
+static volatile uint64_t gpu_irqs, gpu_irq_empty, gpu_irq_sleeps, gpu_irq_late, gpu_irq_polls;
+static volatile uint32_t gpu_irq_empty_run;
+
+static void
+gpu_irq_boot_args(void)
+{
+	PE_parse_boot_argn("sweetgpuirq", &gpu_irq_want, sizeof(gpu_irq_want));
+	PE_parse_boot_argn("sweetgpuirqid", &gpu_irq_intid, sizeof(gpu_irq_intid));
+	PE_parse_boot_argn("sweetgpuirqslice", &gpu_irq_slice_us, sizeof(gpu_irq_slice_us));
+	if (gpu_irq_slice_us < 100 || gpu_irq_slice_us > 100000) {
+		gpu_irq_slice_us = 5000;
+	}
+	nanoseconds_to_absolutetime((uint64_t)gpu_irq_slice_us * NSEC_PER_USEC, &gpu_irq_slice_abs);
+}
+
+/* Interrupt context (sleh_irq -> sweet_spi_dispatch): ack the RBBM status (level line), wake the waiters. */
+static void
+gpu_irq(__unused void *arg)
+{
+	uint32_t st = a6_irq_ack();
+	if (st == 0) {
+		gpu_irq_empty++;
+		if (++gpu_irq_empty_run > 100000) {
+			sweet_spi_mask(gpu_irq_intid, true);    /* nothing to clear and it keeps coming: give up */
+			gpu_irq_on = false;
+			thread_wakeup((event_t)&gpu_irq_chan);
+		}
+		return;
+	}
+	gpu_irq_empty_run = 0;
+	gpu_irqs++;
+	SWEET_TRACE(SWT_GPU_IRQ, st, a6_fence_read(&gpu), 0, 0);
+	thread_wakeup((event_t)&gpu_irq_chan);
+	sweet_scan_gpu_kick();
+}
+
+static int
+gpu_irq_set(bool on, const char *why)
+{
+	if (!gpu_ready) {
+		a6_log("gpu irq: GPU not ready (%s)\n", why);
+		return -1;
+	}
+	if (on && !gpu_irq_attached) {
+		if (gpu_irq_slice_abs == 0) {
+			nanoseconds_to_absolutetime((uint64_t)gpu_irq_slice_us * NSEC_PER_USEC, &gpu_irq_slice_abs);
+		}
+		gpu_irq_attached = sweet_spi_attach(gpu_irq_intid, false, gpu_irq, NULL);
+		if (!gpu_irq_attached) {
+			a6_log("gpu irq: INTID %u not attached: fence waits poll\n", gpu_irq_intid);
+			return -1;
+		}
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	a6_irq_mask = on ? A6_INT_CP_CACHE_FLUSH_TS : 0;
+	a6_irq_enable(a6_irq_mask);
+	a6_submit_irq = on;
+	gpu_irq_empty_run = 0;
+	gpu_irq_on = on;
+	lck_mtx_unlock(&sweet_gpu_lock);
+	if (gpu_irq_attached) {
+		sweet_spi_mask(gpu_irq_intid, !on);
+	}
+	thread_wakeup((event_t)&gpu_irq_chan);  /* sleepers go back to polling (off) */
+	a6_log("gpu irq %s (%s): INTID %u, look every %u us\n", on ? "on" : "off", why, gpu_irq_intid, gpu_irq_slice_us);
+	return 0;
+}
+
+/* p gpuirq [0|1]: switch (1 attaches kgsl_3d0_irq the first time), and the counters */
+void sweet_gpu_irq_cmd(const char *s, const char *end);
+void
+sweet_gpu_irq_cmd(const char *s, const char *end)
+{
+	while (s < end && (*s == ' ' || *s == '\t')) {
+		s++;
+	}
+	if (s < end && (*s == '0' || *s == '1')) {
+		(void)gpu_irq_set(*s == '1', "p gpuirq");
+	}
+	printf("SWEET GPU IRQ: %s, INTID %u%s, slice %u us; irqs %llu (empty %llu); sleeps %llu, late %llu "
+	    "(fence done at a slice end: a lost interrupt), poll turns %llu\n", gpu_irq_on ? "on" : "off",
+	    gpu_irq_intid, gpu_irq_attached ? " attached" : "", gpu_irq_slice_us, gpu_irqs, gpu_irq_empty,
+	    gpu_irq_sleeps, gpu_irq_late, gpu_irq_polls);
+}
+
 static void
 gpu_thread(void *arg __unused, wait_result_t wr __unused)
 {
@@ -311,6 +418,9 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	a6_log("bring-up %s in %llu ms (pool 0x%llx)\n", rc ? "FAILED" : "done, GPU ready", ns / 1000000,
 	    gpu.pool_pa);
+	if (!rc && gpu_irq_want) {
+		(void)gpu_irq_set(true, "boot-arg sweetgpuirq");      /* 0999 */
+	}
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }
@@ -343,6 +453,7 @@ sweet_gpu_init(void)
 		extern int a6_submit_rbts;	/* 0988 */
 		PE_parse_boot_argn("sweetgputs", &a6_submit_rbts, sizeof(a6_submit_rbts));
 	}
+	gpu_irq_boot_args();    /* 0999 */
 	gpu.perf_level = lvl;
 	pool_kva = va;
 	vm_offset_t pva = 0;
@@ -563,6 +674,7 @@ gpu_recover_locked(const char *why)
 	a6_fence_force(&gpu);
 	progress_fence = gpu.fence;
 	progress_abs = mach_absolute_time();
+	thread_wakeup((event_t)&gpu_irq_chan);  /* 0999: interrupt waiters see the forced fence now */
 }
 
 /* ---- the panel ---- */
@@ -1673,6 +1785,29 @@ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
 			SWEET_TRACE_END(SWT_GPU_WAIT, fence, r, gpu_ready ? a6_fence_read(&gpu) : 0, 0);     /* 0994 */
 			return r;
 		}
+		if (gpu_irq_on) {
+			/* 0999: asleep until the GPU interrupt, the timeout, or the next look (hang check, lost interrupt) */
+			uint64_t left_abs, left_ns = timeout_ns - ns, dl = now + gpu_irq_slice_abs;
+			nanoseconds_to_absolutetime(left_ns < NSEC_PER_SEC ? left_ns : NSEC_PER_SEC, &left_abs);
+			if (now + left_abs < dl) {
+				dl = now + left_abs;
+			}
+			(void)assert_wait_deadline((event_t)&gpu_irq_chan, THREAD_UNINT, dl);
+			if (sweet_gpu_fence_done(fence) || !gpu_irq_on) {
+				clear_wait(current_thread(), THREAD_AWAKENED);  /* landed before the wait was armed */
+				continue;
+			}
+			gpu_irq_sleeps++;
+			if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && sweet_gpu_fence_done(fence)) {
+				gpu_irq_late++;
+				if (gpu_irqs == 0 && gpu_irq_late >= 64) {
+					a6_log("gpu irq: 64 fences landed and no interrupt came: back to polling\n");
+					(void)gpu_irq_set(false, "no interrupts");
+				}
+			}
+			continue;
+		}
+		gpu_irq_polls++;
 		delay(20);
 	}
 }

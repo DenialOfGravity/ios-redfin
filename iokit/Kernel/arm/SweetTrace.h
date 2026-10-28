@@ -26,12 +26,14 @@
  *                     a GPU_CAL went out with this submit)
  * 0x11  GPU_DONE      a fence's stamps (read at the next submit): fence, start ticks, end ticks, pid
  *                     (19.2 MHz CP_ALWAYS_ON; with sweetgputs=1 the end is RB_DONE_TS)
- * 0x12  GPU_WAIT      sweet_gpu_wait_fence_ns (Turnip's waits, a spin in 20 us steps) when the fence was not done
+ * 0x12  GPU_WAIT      sweet_gpu_wait_fence_ns (Turnip's waits, a sleep-poll in 20 us steps, or 0999 asleep until the
+ *                     GPU interrupt) when the fence was not done
  *                     yet, START: fence, timeout (ns); END: fence, 0 done / 1 timeout, last done fence
  * 0x13  GPU_CAL       ALWAYS_ON ticks, mach_absolute_time before, after (once per submit, at most every 50 ms)
  * 0x14  GPU_GATE      sweet_scan_submit_gate for the swapper: gate, gate seq, shown seq, CP word; START/END around a
  *                     gate-1 CPU wait: pid, gate seq, shown seq
  * 0x15  ACCEL_SEL     SweetAccelerator v2 method START: method, pid; END: method, IOReturn, fence (submit)
+ * 0x16  GPU_IRQ       0999 (sweetgpuirq=1 / p gpuirq 1): the GPU interrupt: RBBM_INT_0_STATUS, last done fence, 0, 0
  * 0x20  TOUCH         digitizer report: finger, down, x, y (FTS: the GPIO is polled every 8 ms, no IRQ)
  */
 #ifndef SWEET_TRACE_H
@@ -57,6 +59,7 @@
 #define SWT_GPU_CAL             0x13
 #define SWT_GPU_GATE            0x14
 #define SWT_ACCEL_SEL           0x15
+#define SWT_GPU_IRQ             0x16    /* 0999 */
 #define SWT_TOUCH               0x20
 
 #define SWEET_TRACE_ID(code)    KDBG_CODE(DBG_DRIVERS, SWEET_TRACE_SUBCLASS, code)

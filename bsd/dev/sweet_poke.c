@@ -150,6 +150,12 @@ poke_line(const char *s, const char *end, unsigned lineno)
 			sweet_files_cmd(q, end);
 			return;
 		}
+		if (end - q >= 6 && !strncmp(q, "gpuirq", 6) && (end - q == 6 || q[6] == ' ' || q[6] == '\n')) {
+			/* 0999: p gpuirq [0|1] = fence waits on the GPU interrupt (bsd/dev/sweet_gpu.c) */
+			extern void sweet_gpu_irq_cmd(const char *s, const char *end);
+			sweet_gpu_irq_cmd(q + 6, end);
+			return;
+		}
 		if (q < end && *q >= 'a' && *q <= 'z') {
 			extern void sweet_fb_cmd(const char *s, const char *end);
 			sweet_fb_cmd(q, end);
