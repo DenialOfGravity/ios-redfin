@@ -73,6 +73,7 @@
 #include	"BTreesInternal.h"
 #include	"hfs_cnode.h"
 #include	"hfs_dbg.h"
+#include <pexpert/pexpert.h>	/* SWEET: sweethfsapfs boot-arg */
 
 #if HFS_CONFIG_KEY_ROLL
 #include	"hfs_key_roll.h"
@@ -1651,6 +1652,74 @@ out_unlock:
 }
 
 /*
+ * SWEET (redfin): the root is HFS+, but iOS 16 userland expects APFS. APFS fsctls (ioctl group 'J', APFSIOC_*)
+ * reach hfs_vnop_ioctl and fail with ENOTTY ("Inappropriate ioctl for device"). Most callers take ENOTTY as "not
+ * APFS" (launchd 'J' 106, keybagd 'J' 96 and apfs_iosd 'J' 61/62 ask about / early on; answering them anything
+ * else stops the boot), but FileProvider's FPFS layer (fpfs_* in FileProvider.framework, used by Files > On My
+ * iPhone) needs answers: LocalStorageFileProvider dropped every item ("can't obtain VFSItem ... [25]") because
+ * fpfs_fget_parent_syncroot ('J' 74, u64 out) failed, and 'J' 71 (u64 out) only tolerates EPERM/ENOTSUP.
+ *
+ * For the FileProvider processes (sweet_hfs_apfs_procs, matched on the first MAXCOMLEN chars as p_comm is cut
+ * there) an APFS command that only reads a small value (_IOR, <= 64 bytes) succeeds with zeros: "no sync root",
+ * "no flags", the same as when the caller gets ENOTSUP and keeps its zeroed default. Commands that would change
+ * state (_IOW, _IOWR, _IO) get ENOTSUP. Everything else keeps ENOTTY.
+ * Boot-arg sweethfsapfs: 1 (default) as above; 0 always ENOTTY.
+ * Each distinct (command, answer) is logged once with the caller, to find the next one worth emulating.
+ */
+static int sweet_hfs_apfs_compat = -1;
+static void * volatile sweet_hfs_unknown_seen[64];
+static const char *const sweet_hfs_apfs_procs[] = {
+	"fileproviderd", "LocalStorageFileProvider", "Files",
+};
+
+static int
+sweet_hfs_unknown_ioctl(vnode_t vp, u_long cmd, caddr_t data, vfs_context_t ctx)
+{
+	if (sweet_hfs_apfs_compat < 0) {
+		int mode = 1;
+		PE_parse_boot_argn("sweethfsapfs", &mode, sizeof(mode));
+		sweet_hfs_apfs_compat = mode;
+	}
+	char name[2 * MAXCOMLEN + 1];
+	proc_name(proc_pid(vfs_context_proc(ctx)), name, sizeof(name));
+	int error = ENOTTY;
+	const char *how = "ENOTTY";
+	if (IOCGROUP(cmd) == 'J' && sweet_hfs_apfs_compat == 1) {
+		int fp = 0;
+		for (int i = 0; i < (int)(sizeof(sweet_hfs_apfs_procs) / sizeof(sweet_hfs_apfs_procs[0])); i++) {
+			if (strncmp(name, sweet_hfs_apfs_procs[i], MAXCOMLEN) == 0) {
+				fp = 1;
+			}
+		}
+		if (fp) {
+			u_long len = IOCPARM_LEN(cmd);
+			if ((cmd & IOC_DIRMASK) == IOC_OUT && len > 0 && len <= 64 && data != NULL) {
+				bzero(data, len);
+				error = 0;
+				how = "0, zeroed";
+			} else {
+				error = ENOTSUP;
+				how = "ENOTSUP";
+			}
+		}
+	}
+	/* log each (command, answer) once */
+	u_long key = cmd ^ ((u_long)(error == 0 ? 1 : error == ENOTSUP ? 2 : 0) << 62);
+	for (int i = 0; i < (int)(sizeof(sweet_hfs_unknown_seen) / sizeof(sweet_hfs_unknown_seen[0])); i++) {
+		void *seen = sweet_hfs_unknown_seen[i];
+		if ((u_long)seen == key) {
+			break;
+		}
+		if (seen == NULL && OSCompareAndSwapPtr(NULL, (void *)key, &sweet_hfs_unknown_seen[i])) {
+			printf("SWEET HFS: unknown ioctl 0x%lx ('%c' %lu, %lu bytes) on %s from %s -> %s\n", cmd,
+			    (int)IOCGROUP(cmd), cmd & 0xff, (u_long)IOCPARM_LEN(cmd), vnode_isdir(vp) ? "dir" : "file", name, how);
+			break;
+		}
+	}
+	return error;
+}
+
+/*
  * Control filesystem operating characteristics.
  */
 int
@@ -3073,7 +3142,7 @@ fail_change_next_allocation:
 		return hfs_cas_bsdflags(hfsmp, vp, ap);
 
 	default:
-		return (ENOTTY);
+		return sweet_hfs_unknown_ioctl(vp, ap->a_command, ap->a_data, context);
 	}
 
 	return 0;
