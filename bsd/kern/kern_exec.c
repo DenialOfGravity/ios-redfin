@@ -487,8 +487,16 @@ sweet_exec_has_env(struct image_params *imgp, const char *prefix)
  * an inserted library is missing). AMFI's dyld policy (0114) honours it except for
  * restricted and FairPlay-encrypted (App Store) executables. The library maps UIKit's
  * haptic feedback onto the vibration motor (phone/haptics, kern.sweet_haptic).
+ *
+ * 0999 (ws-u-fps): boot-arg sweetfbx & 0x100 (the cmdline has no room for a new name) inserts
+ * SWEET_FPS_DYLIB into the same UI processes (with SweetHaptics too when sweetui=1: dyld takes a
+ * colon-separated list) and adds SWEET_FPS=2 unless the environment has SWEET_FPS: UIKit's 60 fps
+ * display-link requests (settle animations, scroll deceleration) become 90, i.e. frame interval 1 on
+ * the 90 Hz heartbeat instead of 2 (phone/fps/SweetFPS.m; /var/local/sweetfps overrides the mode).
  */
 #define SWEET_UI_DYLIB  "/var/local/lib/SweetHaptics.dylib"
+#define SWEET_FPS_DYLIB "/var/local/lib/SweetFPS.dylib"
+#define SWEET_FBX_FPS   0x100
 
 static int
 sweet_exec_env(struct image_params *imgp, int ptr_size)
@@ -502,26 +510,50 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
 			base = c + 1;
 		}
 	}
+	static int fps = -1;
 	if (ui < 0) {
 		int v = 0;
 		(void)PE_parse_boot_argn("sweetui", &v, sizeof(v));
 		ui = v;
 	}
-	if (ui && (strncmp(path, "/Applications/", 14) == 0 ||
+	if (fps < 0) {
+		uint32_t fbx = 0;
+		(void)PE_parse_boot_argn("sweetfbx", &fbx, sizeof(fbx));
+		fps = (fbx & SWEET_FBX_FPS) != 0;       /* 0999 */
+	}
+	if ((ui || fps) && (strncmp(path, "/Applications/", 14) == 0 ||
 	    strncmp(path, "/System/Library/CoreServices/SpringBoard.app/", 45) == 0 ||
 	    strncmp(path, "/private/var/containers/Bundle/Application/", 43) == 0 ||
 	    strncmp(path, "/var/containers/Bundle/Application/", 35) == 0) &&
 	    !sweet_exec_has_env(imgp, "DYLD_INSERT_LIBRARIES=")) {
+		char buf[128];
+		bool haptics = false, fpsLib = false;
 		vnode_t vp = NULLVP;
-		if (vnode_lookup(SWEET_UI_DYLIB, 0, &vp, vfs_context_kernel()) == 0) {
+		if (ui && vnode_lookup(SWEET_UI_DYLIB, 0, &vp, vfs_context_kernel()) == 0) {
 			vnode_put(vp);
-			int error = sweet_exec_add_env(imgp, "DYLD_INSERT_LIBRARIES=" SWEET_UI_DYLIB, ptr_size);
+			haptics = true;
+		}
+		vp = NULLVP;
+		if (fps && vnode_lookup(SWEET_FPS_DYLIB, 0, &vp, vfs_context_kernel()) == 0) {
+			vnode_put(vp);
+			fpsLib = true;      /* 0999 */
+		}
+		if (haptics || fpsLib) {
+			snprintf(buf, sizeof(buf), "DYLD_INSERT_LIBRARIES=%s%s%s", haptics ? SWEET_UI_DYLIB : "",
+			    haptics && fpsLib ? ":" : "", fpsLib ? SWEET_FPS_DYLIB : "");
+			int error = sweet_exec_add_env(imgp, buf, ptr_size);
 			if (error) {
 				return error;
 			}
+			if (fpsLib && !sweet_exec_has_env(imgp, "SWEET_FPS=")) {
+				error = sweet_exec_add_env(imgp, "SWEET_FPS=2", ptr_size);
+				if (error) {
+					return error;
+				}
+			}
 			static unsigned logged;
 			if (logged++ < 8) {
-				printf("SWEET ENV: %s += haptics\n", base);
+				printf("SWEET ENV: %s +=%s%s\n", base, haptics ? " haptics" : "", fpsLib ? " fps (0999)" : "");
 			}
 		}
 	}
