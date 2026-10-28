@@ -140,6 +140,16 @@ poke_line(const char *s, const char *end, unsigned lineno)
 			sweet_prof_cmd(q, end);
 			return;
 		}
+		if (end - q >= 2 && q[0] == 'f' && q[1] == 's' && (end - q == 2 || q[2] == ' ' || q[2] == '\n')) {
+			/* 0997: p fs [reset] = the file server's state (bsd/dev/sweet_files.c) */
+			extern void sweet_files_cmd(const char *s, const char *end);
+			q += 2;
+			while (q < end && (*q == ' ' || *q == '\t')) {
+				q++;
+			}
+			sweet_files_cmd(q, end);
+			return;
+		}
 		if (q < end && *q >= 'a' && *q <= 'z') {
 			extern void sweet_fb_cmd(const char *s, const char *end);
 			sweet_fb_cmd(q, end);
