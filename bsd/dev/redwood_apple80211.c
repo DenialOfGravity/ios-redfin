@@ -35,6 +35,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
 #include <sys/kernel.h>
@@ -202,6 +203,25 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+/*
+ * 0193: the country code iOS sets (COUNTRY_CODE, 51) is kept and given back, never sent to the firmware;
+ * set 383 is taken and dropped. sweetwifiacc=0 refuses both again, as before.
+ * apple80211_country_code_data (apple80211_var.h): { u32 version; u8 cc[3]; }, padded to 8.
+ */
+static int wifi_accept = -1;
+static char country[3] = "XX";
+
+static bool
+accepting(void)
+{
+	if (wifi_accept < 0) {
+		int on = 1;
+
+		PE_parse_boot_argn("sweetwifiacc", &on, sizeof(on));
+		wifi_accept = on != 0;
+	}
+	return wifi_accept != 0;
+}
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -381,6 +401,20 @@ get(struct apple80211req *request)
 		request->req_val = (int32_t)join_result;
 		lck_mtx_unlock(&apple80211_lock);
 		return 0;
+	case 51: {                              /* 0193: the country code last set ("XX" until then) */
+		struct {
+			uint32_t version;
+			uint8_t cc[4];
+		} answer = { .version = 1 };
+
+		if (!accepting()) {
+			break;
+		}
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(answer.cc, country, sizeof(country));
+		lck_mtx_unlock(&apple80211_lock);
+		return give(request, &answer, sizeof(answer));
+	}
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
 		struct redwood_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
 		unsigned index;
@@ -614,7 +648,36 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 			}
 			printf("\n");
 		}
-		return EOPNOTSUPP;
+		return accepting() ? 0 : EOPNOTSUPP;      /* 0193: taken, nothing done */
+	}
+	case 51: {                              /* 0193: the country code: kept, not sent to the firmware */
+		static bool shown;
+		struct {
+			uint32_t version;
+			uint8_t cc[4];
+		} asked = { 0 };
+		unsigned length = request->req_len < sizeof(asked) ? request->req_len : sizeof(asked);
+		int error;
+
+		if (!accepting()) {
+			return EOPNOTSUPP;
+		}
+		if (length < 6 || (error = copyin(request->req_data, &asked, length)) != 0) {
+			return length < 6 ? EINVAL : error;
+		}
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(country, asked.cc, sizeof(country));
+		country[2] = 0;
+		lck_mtx_unlock(&apple80211_lock);
+		if (!shown) {
+			const uint8_t *raw = (const uint8_t *)&asked;
+
+			shown = true;
+			printf("SWEET WIFI: country code set to %.2s (%u bytes: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
+			    (const char *)asked.cc, request->req_len, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+		}
+		snprintf(said, said_size, " (country %.2s)", (const char *)asked.cc);
+		return 0;
 	}
 	default:
 		return EOPNOTSUPP;
