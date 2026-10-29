@@ -432,6 +432,12 @@ static const struct {
 	{ PRIV_NET_RESTRICTED_ROUTE_NC_READ, "com.apple.private.network.route-nc-read" },
 	{ PRIV_NET_VALIDATED_RESOLVER, "com.apple.private.network.validated-resolver" },
 	{ PRIV_GLOBAL_PROC_INFO, "com.apple.private.kernel.global-proc-info" },
+	/* 1016: Skywalk nexus privileges. bluetoothd registers a user-pipe nexus for A2DP audio
+	   (AudioSkywalkPipe); denied, os_channel_create_extended returned NULL and bluetoothd crashed
+	   in os_channel_get_fd(NULL) the moment headphones started streaming. */
+	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
+	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
+	{ PRIV_SKYWALK_LOW_LATENCY_CHANNEL, "com.apple.private.skywalk.low-latency-channel" },
 };
 
 static bool
