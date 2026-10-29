@@ -30,6 +30,7 @@
 #include <pexpert/device_tree.h>
 #include <libkern/libkern.h>
 #include <mach/mach_time.h>
+#include <sys/sysctl.h>
 #include "sweet_a6xx.h"
 #include "../../iokit/Kernel/arm/SweetDisplayMask.h"
 #include "../../iokit/Kernel/arm/SweetTrace.h"  /* 0994 */
@@ -1295,6 +1296,37 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
 	*out_dh = frame.dh;
 	return rc;
 }
+
+/*
+ * 1035: kern.sweet_fb_early_retire MASK (SweetFramebuffer.cpp, the 0944 swap queue + GPU present; default 0 = as
+ * before). A swap counts as retired once its present blit is accepted onto the ring (present() queued it), not when
+ * the blit's fence lands or the flip latches:
+ *   1  swap-complete tick (type-5 notification, as sweetswapdone 1) at acceptance, without needing sweetswapdone;
+ *      no tick at the fence; at least sweetpace_min after the last notification
+ *   2  re-kick: a queued frame that was put off (flip not latched, IB slot busy) is tried again at each vsync tick
+ *      and as soon as the previous blit's fence is seen, instead of 1 ms later
+ *   4  SwapWait polls (scalar 1 bit 31, CA's can_update_) answer kIOReturnBusy while that swap still waits in the
+ *      queue or is being presented, 0 once its blit is on the ring (100 ms cap); today they answer 0 at once
+ */
+int sweet_fb_early_retire;
+static int
+sysctl_sweet_fb_early_retire SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_fb_early_retire, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 7) {
+		return EINVAL;
+	}
+	sweet_fb_early_retire = value;
+	printf("SWEET FB: early retire %d (1 tick at ring, 2 rekick, 4 honest SwapWait poll)\n", value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_early_retire, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_fb_early_retire, "I", "SWEET FB: early swap retire mask (1 tick, 2 rekick, 4 SwapWait poll)");
 
 /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
 
