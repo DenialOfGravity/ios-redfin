@@ -50,6 +50,7 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void sweet_cpufreq_log(void);
+extern void sweet_ui_bigcore_log(void);         /* 1041: osfmk/kern/sched_prim.c */
 extern int sweet_cpufreq_set(unsigned dom, unsigned idx, const char *why);
 extern void sweet_cpufreq_table_log(unsigned dom);
 extern int sweet_cpufreq_gov(int on, unsigned period_ms);
@@ -323,6 +324,7 @@ ts_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		ts_log();
 		sweet_cpufreq_log();
+		sweet_ui_bigcore_log();         /* 1041 */
 		if (!dumped && elapsed >= 20000) {
 			dumped = true;
 			sweet_thermal_pmic_dump("boot");

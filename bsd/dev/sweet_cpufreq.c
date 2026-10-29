@@ -202,6 +202,33 @@ sysctl_sweet_gov_framehold SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_gov_framehold, "I", "SWEET GOV: % of each domain's top held 300 ms after a SwapEnd (0 off)");
 
+/*
+ * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; default 0 = as before): 1 threads named
+ * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
+ * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
+ * normal choice (never waits). Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
+ */
+extern int sweet_ui_bigcore;
+static int
+sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_ui_bigcore, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 3) {
+		return EINVAL;
+	}
+	sweet_ui_bigcore = value;
+	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower)\n",
+	    value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off)");
+
 /* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
 static unsigned
 cf_hold_pos(const struct cf_dom *d, int pct)

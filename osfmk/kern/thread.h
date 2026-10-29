@@ -471,6 +471,9 @@ struct thread {
 #define TH_SFLAG_PROMOTE_REASON_MASK    (TH_SFLAG_RW_PROMOTED | TH_SFLAG_WAITQ_PROMOTED | TH_SFLAG_EXEC_PROMOTED | TH_SFLAG_FLOOR_PROMOTED)
 
 #define TH_SFLAG_RT_DISALLOWED         0x100000         /* thread wants RT but may not have joined a work interval that allows it */
+#define TH_SFLAG_SWEET_UI_RS           0x20000000       /* redfin 1041: named com.apple.coreanimation.render-server* */
+#define TH_SFLAG_SWEET_UI_DISPLAY      0x40000000       /* redfin 1041: named com.apple.coreanimation.display* */
+#define TH_SFLAG_SWEET_UI_MASK         (TH_SFLAG_SWEET_UI_RS | TH_SFLAG_SWEET_UI_DISPLAY)
 #define TH_SFLAG_DEMOTED_MASK      (TH_SFLAG_THROTTLED | TH_SFLAG_FAILSAFE | TH_SFLAG_RT_DISALLOWED)     /* saved_mode contains previous sched_mode */
 
 	int16_t                 sched_pri;              /* scheduled (current) priority */

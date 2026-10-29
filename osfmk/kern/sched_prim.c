@@ -3564,6 +3564,12 @@ thread_dispatch(
 #endif /* defined(CONFIG_SCHED_MULTIQ) */
 			}
 
+#if defined(__arm64__)
+			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
+				extern void sweet_ui_account(thread_t thread, processor_t processor);
+				sweet_ui_account(thread, processor);    /* 1041 */
+			}
+#endif
 			thread->computation_metered += (processor->last_dispatch - thread->computation_epoch);
 
 			if (!(thread->state & TH_WAIT)) {
@@ -5015,6 +5021,87 @@ choose_next_pset(
  * and DVFS governor (bsd/dev/sweet_cpufreq.c); 0 if the CPU does not exist.
  */
 uint64_t sweet_cpu_idle_abs(int cpu);
+
+/*
+ * redfin 1041: kern.sweet_ui_bigcore MASK (bsd/dev/sweet_cpufreq.c; default 0 = as before). Trace of a Settings scroll
+ * (2026-10-29): backboardd's com.apple.coreanimation.display.primary (CA prepare, ~10 ms of CPU per frame on an A76)
+ * ran 8 of 174 frames on an A55 at ~19.7 ms and cost 44 "display thread busy" ticks: 0962 only takes an IDLE big core.
+ * Threads are tagged when named (bsd_setthreadname): com.apple.coreanimation.display* (class 1) and
+ * com.apple.coreanimation.render-server* (class 2). For a tagged thread whose class bit is set in the mask,
+ * choose_processor() takes, in sweetbig's order (CPU6 first with sweetbig=2): an idle big core; else the big core
+ * running the lowest priority below this thread's (it is preempted at once: IPI); else the normal choice. That last
+ * step is the no-starvation fallback, at 0 ms: on this one-cluster clutch scheduler a runnable unbound thread waits in
+ * the shared run queue (no per-CPU queue to wait on without binding it, and binding a queued thread desynchronises the
+ * clutch bucket run counts), so it never waits for a big core that runs equal or higher priority work.
+ * Stats always (cheap): runs and on-CPU ms of tagged threads on big (CPU6/7) and little cores, counted when they go off
+ * core; line every 5 s while tagged threads run: SWEET UI: bigcore 5s: ... (sweet_thermal.c's 5 s tick).
+ */
+int sweet_ui_bigcore;
+static uint32_t sweet_ui_tagged;
+static uint32_t sweet_ui_st_idle, sweet_ui_st_preempt, sweet_ui_st_fallback;
+static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display, render-server][big, little] */
+
+void sweet_ui_thread_named(void *uth, const char *name);
+void
+sweet_ui_thread_named(void *uth, const char *name)
+{
+	thread_t th = get_machthread((struct uthread *)uth);
+	uint32_t f = 0;
+	if (name == NULL || th == THREAD_NULL) {
+		return;
+	}
+	if (strncmp(name, "com.apple.coreanimation.display", 31) == 0) {
+		f = TH_SFLAG_SWEET_UI_DISPLAY;
+	} else if (strncmp(name, "com.apple.coreanimation.render-server", 37) == 0) {
+		f = TH_SFLAG_SWEET_UI_RS;
+	}
+	if (f == 0 && !(th->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
+		return;
+	}
+	spl_t s = splsched();
+	thread_lock(th);
+	th->sched_flags = (th->sched_flags & ~TH_SFLAG_SWEET_UI_MASK) | f;
+	thread_unlock(th);
+	splx(s);
+	if (f != 0 && os_atomic_inc(&sweet_ui_tagged, relaxed) <= 16) {
+		printf("SWEET UI: tagged thread %llu %s (1041 class %d, kern.sweet_ui_bigcore %d)\n", thread_tid(th), name,
+		    f == TH_SFLAG_SWEET_UI_DISPLAY ? 1 : 2, sweet_ui_bigcore);
+	}
+}
+
+/* thread_dispatch, the tagged thread going off core (thread locked): one run of processor->last_dispatch - epoch */
+void sweet_ui_account(thread_t thread, processor_t processor);
+void
+sweet_ui_account(thread_t thread, processor_t processor)
+{
+	int c = (thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 0 : 1, b = processor->cpu_id >= 6 ? 0 : 1;
+	uint64_t ran = processor->last_dispatch > thread->computation_epoch ? processor->last_dispatch - thread->computation_epoch : 0;
+	os_atomic_inc(&sweet_ui_runs[c][b], relaxed);
+	os_atomic_add(&sweet_ui_abs[c][b], ran, relaxed);
+}
+
+void sweet_ui_bigcore_log(void);
+void
+sweet_ui_bigcore_log(void)
+{
+	uint64_t r[2][2], ms[2][2];
+	for (int c = 0; c < 2; c++) {
+		for (int b = 0; b < 2; b++) {
+			r[c][b] = os_atomic_xchg(&sweet_ui_runs[c][b], 0, relaxed);
+			absolutetime_to_nanoseconds(os_atomic_xchg(&sweet_ui_abs[c][b], 0, relaxed), &ms[c][b]);
+			ms[c][b] /= NSEC_PER_MSEC;
+		}
+	}
+	uint32_t pi = sweet_ui_st_idle, pp = sweet_ui_st_preempt, pf = sweet_ui_st_fallback;
+	sweet_ui_st_idle = sweet_ui_st_preempt = sweet_ui_st_fallback = 0;
+	if (r[0][0] + r[0][1] + r[1][0] + r[1][1] == 0) {
+		return;
+	}
+	printf("SWEET UI: bigcore 5s: runs big/little, ms: display %llu/%llu, %llu/%llu | render-server %llu/%llu, %llu/%llu | "
+	    "placed idle %u preempt %u fallback %u | mode %d tagged %u\n", r[0][0], r[0][1], ms[0][0], ms[0][1], r[1][0], r[1][1],
+	    ms[1][0], ms[1][1], pi, pp, pf, sweet_ui_bigcore, sweet_ui_tagged);
+}
+
 uint64_t
 sweet_cpu_idle_abs(int cpu)
 {
@@ -5097,6 +5184,37 @@ choose_processor(
 					processor = bp;
 					break;
 				}
+			}
+		}
+		/* 1041: kern.sweet_ui_bigcore: a tagged CA thread takes an idle big core, else preempts the lower-priority one */
+		int ui = ((thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((thread->sched_flags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
+		if (__improbable(ui & sweet_ui_bigcore)) {
+			processor_t idle = PROCESSOR_NULL, low = PROCESSOR_NULL;
+			for (int k = 0; k < 2; k++) {
+				int i = sweet_big == 2 ? 6 + k : 7 - k;
+				processor_t bp = processor_array[i];
+				if (bp == PROCESSOR_NULL || bp->processor_set != pset || !bp->is_recommended) {
+					continue;
+				}
+				if (bp->state == PROCESSOR_IDLE) {
+					if (idle == PROCESSOR_NULL) {
+						idle = bp;
+					}
+				} else if (bp->state == PROCESSOR_RUNNING && bp->current_pri < thread->sched_pri &&
+				    !bit_test(pset->pending_AST_URGENT_cpu_mask, bp->cpu_id) &&
+				    (low == PROCESSOR_NULL || bp->current_pri < low->current_pri)) {
+					low = bp;
+				}
+			}
+			if (idle != PROCESSOR_NULL) {
+				processor = idle;       /* an idle hint is taken as is below (RT: if a fast-track candidate) */
+				sweet_ui_st_idle++;
+			} else if (low != PROCESSOR_NULL && (thread->sched_pri < BASEPRI_RTQUEUES ||
+			    processor_is_fast_track_candidate_for_realtime_thread(pset, low))) {
+				sweet_ui_st_preempt++;
+				return low;             /* pset locked; processor_setrun / realtime_setrun preempt it */
+			} else {
+				sweet_ui_st_fallback++;
 			}
 		}
 	}

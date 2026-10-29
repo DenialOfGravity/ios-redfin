@@ -938,6 +938,9 @@ bsd_getthreadname(void *uth, char *buffer)
  * This is known to race with regards to the contents of the thread name; concurrent
  * callers may result in a garbled name.
  */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+extern void sweet_ui_thread_named(void *uth, const char *name);    /* osfmk/kern/sched_prim.c (1041) */
+#endif
 void
 bsd_setthreadname(void *uth, const char *name)
 {
@@ -959,6 +962,9 @@ bsd_setthreadname(void *uth, const char *name)
 
 	strncpy(ut->pth_name, name, MAXTHREADNAMESIZE - 1);
 	kernel_debug_string_simple(TRACE_STRING_THREADNAME, ut->pth_name);
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	sweet_ui_thread_named(ut, ut->pth_name);        /* redfin 1041: CA display / render-server threads tagged */
+#endif
 }
 
 void
