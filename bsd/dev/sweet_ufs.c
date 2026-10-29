@@ -919,8 +919,13 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
  *   +0      "SWEETMIR" | u64 total | u32 ring size
  *   +0x1000 ring bytes (offset of byte n = n % ring size)
  * The next shim boot copies its tail to UFS (tools/flame-log-pull.sh rescue).
+ *
+ * redfin (1033): XNU now takes 0x100000000-0x27ec00000 (all of the 6 GiB bank
+ * above 4 GiB, mkadt.py HIGH_MEM_SIZE), so the sunfish address 0x1fa000000 is
+ * XNU-managed RAM: the mirror moves to 0x27f200000 (pram 0x27f000000, shim
+ * mailbox 0x27f800000; 0x27fc00000-0x280000000 is left untouched).
  */
-#define SWEET_MIRROR_PA         0x1fa000000ULL
+#define SWEET_MIRROR_PA         0x27f200000ULL
 struct sweet_mirror_header {
 	char magic[8];
 	uint64_t total;

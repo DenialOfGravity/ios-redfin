@@ -570,7 +570,9 @@ sysctl_hw_generic(__unused struct sysctl_oid *oidp, void *arg1,
 #endif
 	case HW_USERMEM:
 	{
-		int usermem = (int)(mem_size - vm_page_wire_count * page_size);
+		/* 1033: mem_size is 6 GiB on redfin; clamp instead of wrapping negative */
+		uint64_t um = mem_size - (uint64_t)vm_page_wire_count * page_size;
+		int usermem = (int)MIN(um, (uint64_t)(INT32_MAX & ~PAGE_MASK));
 
 		return SYSCTL_RETURN(req, usermem);
 	}
@@ -1000,7 +1002,18 @@ SYSCTL_PROC(_hw, HW_MACHINE, machine, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MASK
 SYSCTL_PROC(_hw, HW_MODEL, model, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_MODEL, sysctl_hw_generic, "A", "");
 SYSCTL_PROC(_hw, HW_TARGET, target, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_TARGET, sysctl_hw_generic, "A", "");
 SYSCTL_PROC(_hw, HW_PRODUCT, product, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_PRODUCT, sysctl_hw_generic, "A", "");
-SYSCTL_COMPAT_UINT(_hw, HW_PHYSMEM, physmem, CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, &mem_size, 0, "");
+/*
+ * 1033: hw.physmem is a 32-bit int, but it pointed at the 64-bit mem_size and read its low half: on redfin
+ * (0xf8c00000, then 6 GiB) it came out negative or wrapped. Clamp to INT32_MAX like other BSDs; the real size
+ * is hw.memsize (64-bit).
+ */
+static int
+sysctl_hw_physmem32(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int physmem = (int)MIN((uint64_t)mem_size, (uint64_t)(INT32_MAX & ~PAGE_MASK));
+	return SYSCTL_OUT(req, &physmem, sizeof(physmem));
+}
+SYSCTL_PROC(_hw, HW_PHYSMEM, physmem, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, 0, sysctl_hw_physmem32, "I", "");
 SYSCTL_PROC(_hw, HW_USERMEM, usermem, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_USERMEM, sysctl_hw_generic, "I", "");
 SYSCTL_PROC(_hw, HW_EPOCH, epoch, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_EPOCH, sysctl_hw_generic, "I", "");
 SYSCTL_PROC(_hw, HW_VECTORUNIT, vectorunit, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_VECTORUNIT, sysctl_hw_generic, "I", "");
