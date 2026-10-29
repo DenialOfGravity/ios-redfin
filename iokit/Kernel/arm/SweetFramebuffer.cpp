@@ -63,6 +63,7 @@ void sweet_gpu_cpu_flip(void);
 void sweet_gpu_present_tag(uint64_t swap_abs);
 void sweet_gpu_present_visible(uint64_t *sum_abs, uint64_t *n);
 void sweet_cpufreq_boost(int why);              /* 0970: bsd/dev/sweet_cpufreq.c */
+void sweet_cpufreq_frame(void);                 /* 1037: kern.sweet_gov_framehold */
 extern int sweet_fb_early_retire;               /* 1035: bsd/dev/sweet_gpu.c, kern.sweet_fb_early_retire */
 void flush_dcache64(addr64_t addr, unsigned count, int phys);
 uint32_t sweet_gpu_fence_submitted(void);       /* 0949: CPU present after the GPU has drawn the frame */
@@ -1423,6 +1424,7 @@ AppleCLCD::swap(const uint8_t *rec)
 	if (fStLastSwap != 0 && now - fStLastSwap < flowing) {
 		sweet_cpufreq_boost(1);         /* 0970: frames flowing (< 50 ms apart): animation boost */
 	}
+	sweet_cpufreq_frame();          /* 1037: frames flow: hold every cluster >= kern.sweet_gov_framehold % (0 = off) */
 	fStLastSwap = now;
 	fStSwaps++;
 	fStDropped += fDirty;

@@ -47,6 +47,7 @@
 #include <mach/mach_time.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+#include <sys/sysctl.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern uint64_t sweet_cpu_idle_abs(int cpu);    /* osfmk/kern/sched_prim.c (0961) */
@@ -152,6 +153,68 @@ sweet_cpufreq_boost(int why)
 		cf_boosts++;
 		thread_wakeup((event_t)&cf_gov_chan);   /* the governor acts now, not at its next tick */
 	}
+}
+
+/*
+ * 1037: kern.sweet_gov_framehold PCT (0..100, default 0 = off): after each SwapEnd (SweetFramebuffer swap()) the
+ * governor keeps every domain at >= PCT % of its top frequency (the lowest choosable row at or above) for 300 ms,
+ * on both the 0963 rule and 0970's gold/prime policy; 0964's caps stay the ceiling. UniXNU sheng-cpufreq=4 holds
+ * >= 60 %. Counted in the SWEET GOV 5s line as "hold N" (ticks with the hold raising a domain).
+ */
+static int cf_framehold;
+static volatile uint64_t cf_frame_until;
+static uint32_t cf_hold_ticks;
+
+void sweet_cpufreq_frame(void);
+void
+sweet_cpufreq_frame(void)
+{
+	if (cf_framehold <= 0 || !cf_ready) {
+		return;
+	}
+	uint64_t now = mach_absolute_time(), d;
+	nanoseconds_to_absolutetime(300 * NSEC_PER_MSEC, &d);
+	bool was = now < cf_frame_until;
+	cf_frame_until = now + d;
+	if (!was) {
+		thread_wakeup((event_t)&cf_gov_chan);   /* up now, not at the next 30 ms tick */
+	}
+}
+
+static int
+sysctl_sweet_gov_framehold SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, cf_framehold, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 100) {
+		return EINVAL;
+	}
+	cf_framehold = value;
+	cf_frame_until = 0;
+	printf("SWEET GOV: frame hold %d %% of top for 300 ms after each SwapEnd%s\n", value,
+	    cf_gov_on ? "" : " (the governor is off: flamecpufreq=2 / w gov 1)");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_gov_framehold, "I", "SWEET GOV: % of each domain's top held 300 ms after a SwapEnd (0 off)");
+
+/* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
+static unsigned
+cf_hold_pos(const struct cf_dom *d, int pct)
+{
+	if (pct <= 0 || d->nch == 0) {
+		return 0;
+	}
+	uint64_t want = (uint64_t)d->khz[d->ch[d->nch - 1]] * (unsigned)pct / 100;
+	unsigned p = 0;
+	while (p + 1 < d->nch && d->khz[d->ch[p]] < want) {
+		p++;
+	}
+	return p;
 }
 
 static LCK_GRP_DECLARE(cf_grp, "sweet_cpufreq");
@@ -394,9 +457,10 @@ cf_gov_log(uint64_t now)
 	if (now - cf_log_t < win) {
 		return;
 	}
-	if (cf_boost_on && cf_boost_seen) {
+	if ((cf_boost_on || cf_framehold > 0) && cf_boost_seen) {
 		char line[400];
-		int len = snprintf(line, sizeof(line), "SWEET GOV: 5s: boosts %u capped %u |", cf_boosts, cf_caphits);
+		int len = snprintf(line, sizeof(line), "SWEET GOV: 5s: boosts %u capped %u hold %u |", cf_boosts, cf_caphits,
+		    cf_hold_ticks);     /* 1037: hold */
 		for (unsigned i = 1; i < CF_NDOM; ++i) {
 			len += snprintf(line + len, sizeof(line) - len, " %s", cf[i].name);
 			for (unsigned r = 0; r < cf[i].n && len < (int)sizeof(line) - 16; ++r) {
@@ -412,6 +476,7 @@ cf_gov_log(uint64_t now)
 		bzero(cf[i].at_ms, sizeof(cf[i].at_ms));
 	}
 	cf_boosts = cf_caphits = 0;
+	cf_hold_ticks = 0;
 	cf_boost_seen = false;
 	cf_log_t = now;
 }
@@ -428,6 +493,8 @@ cf_gov_tick(struct cf_load *ld)
 	cf_busy(ld, busy);
 	bool boost = cf_boost_on && now < cf_boost_until;
 	cf_boost_seen |= boost;
+	int hold = cf_framehold > 0 && now < cf_frame_until ? cf_framehold : 0;      /* 1037 */
+	cf_boost_seen |= hold != 0;
 	for (unsigned i = 0; i < CF_NDOM; ++i) {
 		struct cf_dom *d = &cf[i];
 		if (!d->base || d->nch == 0 || d->manual) {
@@ -444,6 +511,14 @@ cf_gov_tick(struct cf_load *ld)
 		if (cf_boost_on && i > 0) {
 			/* 0970 */
 			unsigned bw = cf_big_want(d, util, cur, ceil, now, boost);
+			unsigned hp = cf_hold_pos(d, hold);     /* 1037 */
+			if (hp > bw) {
+				bw = hp > ceil ? ceil : hp;
+				cf_hold_ticks++;
+				if (bw > cur) {
+					d->last_up = now;
+				}
+			}
 			if (d->ch[bw] != d->req) {
 				(void)sweet_cpufreq_set(i, d->ch[bw], NULL);
 				d->changes++;
@@ -460,6 +535,14 @@ cf_gov_tick(struct cf_load *ld)
 		}
 		if (want > ceil) {
 			want = ceil;
+		}
+		if (hold) {
+			unsigned hp = cf_hold_pos(d, hold);     /* 1037 */
+			hp = hp > ceil ? ceil : hp;
+			if (hp > want) {
+				want = hp;
+				cf_hold_ticks++;
+			}
 		}
 		if (cur > ceil) {
 			d->down = 0;            /* above the ceiling (a new cap): down now */
