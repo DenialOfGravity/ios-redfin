@@ -136,9 +136,11 @@ static uint64_t cf_log_t;
 static bool cf_boost_seen;
 
 void sweet_cpufreq_boost(int why);
+extern void sweet_gpu_dcvs_boost(int why);     /* 1036: bsd/dev/sweet_gpu.c (kern.sweet_gpu_dcvs) */
 void
-sweet_cpufreq_boost(int why __unused)
+sweet_cpufreq_boost(int why)
 {
+	sweet_gpu_dcvs_boost(why);      /* 1036: the GPU governor takes the same touch / frames-flowing hints */
 	if (!cf_boost_on || !cf_ready || cf_boost_khz == 0) {
 		return;
 	}

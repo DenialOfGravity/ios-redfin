@@ -110,6 +110,13 @@ bool a6_cx_up(void);
 bool a6_gx_up(void);
 bool a6_cp_running(const struct a6_gpu *g);	/* GX on and the CP runs our SQE */
 
+/* 1036: GPU DCVS helpers */
+int a6_perf_vote_fast(struct a6_gpu *g, uint32_t lvl);	/* HFI perf vote, ack polled every 20 us; 0 = ok */
+uint32_t a6_level_khz(uint32_t lvl);			/* 0 past the table */
+uint32_t a6_nlevels(void);				/* highest level number */
+void a6_busy_counter_enable(void);			/* GMU POWER_COUNTER XOCLK_0 = GPU busy (Linux a6xx) */
+uint64_t a6_busy_counter(void);				/* 19.2 MHz ticks the GPU was busy */
+
 uint32_t a6_pkt7(uint32_t op, uint32_t cnt);
 uint32_t a6_pkt4(uint32_t reg, uint32_t cnt);
 

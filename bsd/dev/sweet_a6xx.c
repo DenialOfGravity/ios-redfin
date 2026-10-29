@@ -844,7 +844,14 @@ static int arc_votes(uint32_t *votes, const uint32_t *lvl, int n, const char *pr
 	return 0;
 }
 
+static int hfi_send_us(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dwords, unsigned poll_us);
 static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dwords)
+{
+	return hfi_send_us(g, id, msg, dwords, 1000);
+}
+
+/* 1036: poll_us = how often the ack is looked for (1000: as before; the DCVS votes look every 20 us, 1 s at most) */
+static int hfi_send_us(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dwords, unsigned poll_us)
 {
 	uint32_t seq = ++g->hfi_seq;
 	msg[0] = (seq << 20) | (dwords << 8) | id;
@@ -863,7 +870,9 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
 	wr32(h + 44, w);
 	wr32(GMU_REG(GMU_H2G_SET), 1);
 
-	for (int t = 0; t < 1000; t++) {
+	if (poll_us == 0 || poll_us > 1000)
+		poll_us = 1000;
+	for (unsigned t = 0; t < 1000000u / poll_us; t++) {
 		if (rd32(GMU_REG(GMU_G2H_INFO)) & 1) {
 			wr32(GMU_REG(GMU_G2H_CLR), 1);
 			uint64_t rh = QHDR(g, HFI_Q_RESP);
@@ -882,7 +891,10 @@ static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, uint32_t dword
 					return (int)buf[2];
 			}
 		}
-		a6_delay_ms(1);
+		if (poll_us >= 1000)
+			a6_delay_ms(1);
+		else
+			a6_delay_us(poll_us);
 	}
 	a6_log("hfi: msg %u seq %u: no ack (info %x)\n", id, seq, rd32(GMU_REG(GMU_G2H_INFO)));
 	return -1;
@@ -905,6 +917,62 @@ int a6_perf_vote(struct a6_gpu *g, uint32_t lvl)
 	msg[3] = 0;
 	return hfi_send(g, 30, msg, 4);
 #endif
+}
+
+/*
+ * 1036: GPU DCVS (sweet_gpu.c, kern.sweet_gpu_dcvs). The same vote with a 20 us ack poll; the level table; and the GMU's
+ * busy counter as Linux a6xx_hw_init sets it up (GPU_GMU_AO_GPU_CX_BUSY_MASK 0xff000000, POWER_COUNTER_SELECT_0
+ * countable 0x20 on XOCLK_0, POWER_COUNTER_ENABLE) and a6xx_gpu_busy reads it (XOCLK_0, 19.2 MHz ticks while busy).
+ */
+int a6_perf_vote_fast(struct a6_gpu *g, uint32_t lvl)
+{
+#if A6_GPU_ID == 618
+	(void)g;
+	(void)lvl;
+	return -1;
+#else
+	static uint32_t msg[8];
+	if (lvl < 1 || (int)lvl >= NLVL)
+		return -1;
+	msg[1] = 1;
+	msg[2] = lvl;
+	msg[3] = 0;
+	return hfi_send_us(g, 30, msg, 4, 20);
+#endif
+}
+
+uint32_t a6_level_khz(uint32_t lvl)
+{
+	return (int)lvl < NLVL ? gpu_khz[lvl] : 0;
+}
+
+uint32_t a6_nlevels(void)
+{
+	return (uint32_t)NLVL - 1;	/* levels 1..n */
+}
+
+#define GMU_AO_CX_BUSY_MASK	0x23b0e
+#define GMU_PWR_CNT_ENABLE	0x1f840
+#define GMU_PWR_CNT_SEL0	0x1f841
+#define GMU_PWR_CNT_XO0_L	0x1f844
+#define GMU_PWR_CNT_XO0_H	0x1f845
+
+void a6_busy_counter_enable(void)
+{
+	wr32(GMU_REG(GMU_AO_CX_BUSY_MASK), 0xff000000u);
+	wr32(GMU_REG(GMU_PWR_CNT_SEL0), (rd32(GMU_REG(GMU_PWR_CNT_SEL0)) & ~0xffu) | 0x20u);
+	wr32(GMU_REG(GMU_PWR_CNT_ENABLE), 1);
+	a6_log("dcvs: GMU busy counter on (sel0 %x enable %x mask %x)\n", rd32(GMU_REG(GMU_PWR_CNT_SEL0)),
+	    rd32(GMU_REG(GMU_PWR_CNT_ENABLE)), rd32(GMU_REG(GMU_AO_CX_BUSY_MASK)));
+}
+
+uint64_t a6_busy_counter(void)
+{
+	uint32_t hi = rd32(GMU_REG(GMU_PWR_CNT_XO0_H)), lo = rd32(GMU_REG(GMU_PWR_CNT_XO0_L));
+	uint32_t hi2 = rd32(GMU_REG(GMU_PWR_CNT_XO0_H));
+	if (hi2 != hi)
+		lo = rd32(GMU_REG(GMU_PWR_CNT_XO0_L));
+	return (uint64_t)hi2 << 32 | lo;
 }
 
 static int gmu_hfi(struct a6_gpu *g)
