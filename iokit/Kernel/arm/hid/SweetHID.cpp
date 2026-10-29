@@ -565,11 +565,18 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
 }
 
 extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
+/* 1044: the newest two touch event times (IRQ time with sectouchx 0x1), for SweetFramebuffer's touch -> latch */
+extern "C" volatile uint64_t sweet_hid_touch_abs[2];
+volatile uint64_t sweet_hid_touch_abs[2];
 
 void
 SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
 {
 	uint64_t now = stamp ? stamp : mach_absolute_time();
+	if (now != sweet_hid_touch_abs[0]) {
+		sweet_hid_touch_abs[1] = sweet_hid_touch_abs[0];        /* 1044 */
+		sweet_hid_touch_abs[0] = now;
+	}
 	if (down) {
 		sweet_cpufreq_boost(0);         /* 0970: touch boost (w boost 1 / sweetgov) */
 	}
