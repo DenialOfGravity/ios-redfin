@@ -304,7 +304,15 @@ gpu_bus_vote(void)
 extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
 extern void sweet_spi_mask(uint32_t intid, bool masked);
 extern void sweet_scan_gpu_kick(void);          /* SweetFramebuffer.cpp: the scanout thread looks now */
+/*
+ * 1040: on by default on redfin (validated on r64u with p gpuirq 1: backboardd wakeups ~5000/s -> ~200/s, 23k IRQs,
+ * 113 late, no fallback, no fps loss); boot-arg sweetgpuirq=0 keeps the old polling, p gpuirq 0|1 switches live.
+ */
+#if A6_GPU_ID == 620
+static uint32_t gpu_irq_want = 1, gpu_irq_intid = 332, gpu_irq_slice_us = 5000;
+#else
 static uint32_t gpu_irq_want, gpu_irq_intid = 332, gpu_irq_slice_us = 5000;
+#endif
 static volatile bool gpu_irq_on;                /* the waiters sleep until the interrupt (else delay(20)) */
 static bool gpu_irq_attached;
 static uint64_t gpu_irq_slice_abs;
@@ -420,7 +428,12 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
 	a6_log("bring-up %s in %llu ms (pool 0x%llx)\n", rc ? "FAILED" : "done, GPU ready", ns / 1000000,
 	    gpu.pool_pa);
 	if (!rc && gpu_irq_want) {
-		(void)gpu_irq_set(true, "boot-arg sweetgpuirq");      /* 0999 */
+		/* 0999; 1040: the default (klog "gpu irq on (default (1040); sweetgpuirq=0 for polling)") */
+		uint32_t given = 0;
+		(void)gpu_irq_set(true, PE_parse_boot_argn("sweetgpuirq", &given, sizeof(given)) ? "boot-arg sweetgpuirq" :
+		    "default (1040); sweetgpuirq=0 for polling");
+	} else if (!rc) {
+		a6_log("gpu irq off (boot-arg sweetgpuirq=0): fence waits poll; p gpuirq 1 turns it on\n");
 	}
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
