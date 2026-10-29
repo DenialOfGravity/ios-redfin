@@ -1721,6 +1721,34 @@ sysctl_sweet_fb_early_retire SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_early_retire, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_fb_early_retire, "I", "SWEET FB: early swap retire mask (1 tick, 2 rekick, 4 SwapWait poll)");
 
+/*
+ * 1042: kern.sweet_vsync_lock 0|1 (default 0 = as before): 0995's vsync options as a runtime switch (the cmdline is full):
+ * 1 = sweetvsync 7 + sweetfb_refresh 1 (SweetFramebuffer.cpp sweet_vlock): ticks without slop on the panel's measured
+ * period (INTF1 frame counter), IOMFBDisplayRefresh published from it. 0 = the values from before.
+ */
+extern int sweet_fb_vsync_lock(int on);         /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+static int sweet_vsync_lock;
+static int
+sysctl_sweet_vsync_lock SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_vsync_lock, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	error = sweet_fb_vsync_lock(value);
+	if (error == 0) {
+		sweet_vsync_lock = value;
+	}
+	return error;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_vsync_lock, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_vsync_lock, "I", "SWEET FB: vsync ticks + IOMFBDisplayRefresh on the measured panel period (0995 mask 7)");
+
 /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
 
 #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */

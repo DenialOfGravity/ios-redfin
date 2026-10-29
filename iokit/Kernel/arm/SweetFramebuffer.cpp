@@ -198,6 +198,20 @@ static uint32_t sweet_vsync, sweet_vsync_lead = 500, sweet_fb_refresh;
  */
 static uint32_t sweet_fb_vrr, sweet_fb_vrr_step_ns;
 static uint32_t sweet_vsync_cal_ok, sweet_vsync_cal_late, sweet_vsync_cal_lost;
+/*
+ * 1042 (kern.sweet_vsync_lock, bsd/dev/sweet_gpu.c; default 0 = as before): a runtime switch over 0995 for a full cmdline.
+ * 1 = sweetvsync 7 (ticks without timer slop, calibration keeps its tick, notifications carry the measured period) and
+ * sweetfb_refresh 1 (IOMFBDisplayRefresh = the measured INTF1 frame-counter period, republished when it moves > 0.01 %;
+ * published at once). The ticks themselves already follow the panel's edges with sweetfbx 0x4 (0944/0946 phase on the
+ * INTF1 frame counter); 0 restores the values from before (and removes IOMFBDisplayRefresh if 1042 published it).
+ * CA reads IOMFBDisplayRefresh when it opens the display and only when backboardd has no CA_HEARTBEAT_RATE: restart
+ * backboardd without CA_HEARTBEAT_RATE=90 for the heartbeat to take the panel's 89.7 Hz.
+ * Line every 5 s while on: SWEET FB: vsync lock 5s: period .. | ticks .. | cal ok/late/lost | drift corrected ...
+ */
+static uint32_t sweet_vlock, sweet_vlock_old_vsync, sweet_vlock_old_refresh;
+static bool sweet_vlock_published;
+static uint32_t sweet_vlock_ticks, sweet_vlock_ok, sweet_vlock_late, sweet_vlock_lost, sweet_vlock_driftN;
+static uint64_t sweet_vlock_drift_abs, sweet_vlock_drift_max;
 #define SWEET_VSYNC_CRIT        0x1
 #define SWEET_VSYNC_CAL         0x2
 #define SWEET_VSYNC_PERIOD      0x4
@@ -355,6 +369,8 @@ public:
 	uint64_t      fRefreshNs;             /* 0995: the period published as IOMFBDisplayRefresh */
 	void          publishRefresh(uint64_t ns);
 	void          vsyncCmd(const char *s, const char *end);
+	int           vsyncLock(int on);             /* 1042 */
+	void          vsyncLockLine(void);
 	bool          presentCPU(const uint8_t *rec);
 	uintptr_t     cpuBuffer(uint64_t pa);
 	uintptr_t     cpuSource(SweetSurface *s);       /* 0978 */
@@ -1014,6 +1030,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 	    fb->fPowerOff ? 0 : sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT));
 	if (send) {
 		fb->sendVsync(count, now);
+		sweet_vlock_ticks++;    /* 1042 */
 	}
 	if (fb->fPowerOff) {
 		/* Fade out: halve every channel each vsync, then black, then idle. */
@@ -1568,6 +1585,11 @@ AppleCLCD::statLine(uint64_t now)
 	sweet_er_acc = sweet_er_busy = sweet_er_done = sweet_er_stale = sweet_er_kick = 0;
 	fStWin = now;
 	fStSwaps = fStShown = fStDropped = fStBlitqN = fStHistN = 0;
+	if (sweet_vlock) {
+		IOLockUnlock(fLock);
+		vsyncLockLine();        /* 1042 */
+		IOLockLock(fLock);
+	}
 	fStBlitqAbs = 0;
 	bzero(fStBucket, sizeof(fStBucket));
 	bzero(fStHist, sizeof(fStHist));
@@ -1845,6 +1867,75 @@ AppleCLCD::vsyncCmd(const char *q, const char *end)
 	IOLog("SWEET FB: vsync now %#x lead %u us (1 no timer slop, 2 calibration keeps its tick, 4 measured period); "
 	    "calibrations since last: ok %u late %u lost %u, margin %u us; panel period %llu ns; refresh published %llu ns\n",
 	    sweet_vsync, sweet_vsync_lead, ok, late, lost, fFcEarlyUs, pns, fRefreshNs);
+}
+
+/* 1042: kern.sweet_vsync_lock 0|1 (see sweet_vlock). From the sysctl handler (no locks held). */
+int
+AppleCLCD::vsyncLock(int on)
+{
+	uint64_t ns = 0;
+	IOLockLock(fLock);
+	if (on && !sweet_vlock) {
+		sweet_vlock_old_vsync = sweet_vsync;
+		sweet_vlock_old_refresh = sweet_fb_refresh;
+		sweet_vlock_published = fRefreshNs == 0;
+		sweet_vsync |= SWEET_VSYNC_CRIT | SWEET_VSYNC_CAL | SWEET_VSYNC_PERIOD;
+		sweet_fb_refresh = 1;
+		fFcEarlyUs = 300;
+		sweet_vlock_ticks = sweet_vlock_ok = sweet_vlock_late = sweet_vlock_lost = sweet_vlock_driftN = 0;
+		sweet_vlock_drift_abs = sweet_vlock_drift_max = 0;
+		absolutetime_to_nanoseconds(fFcPeriod, &ns);
+	} else if (!on && sweet_vlock) {
+		sweet_vsync = sweet_vlock_old_vsync;
+		sweet_fb_refresh = sweet_vlock_old_refresh;
+		fFcEarlyUs = 300;
+	}
+	bool was = sweet_vlock != 0;
+	sweet_vlock = on ? 1 : 0;
+	IOLockUnlock(fLock);
+	if (on && !was) {
+		publishRefresh(ns != 0 ? ns : (fHz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL));
+	} else if (!on && was && sweet_vlock_published && sweet_fb_refresh == 0) {
+		removeProperty("IOMFBDisplayRefresh");
+		fRefreshNs = 0;
+	}
+	IOLog("SWEET FB: vsync lock %d (1042: sweetvsync %#x, refresh %u, panel period %llu ns; CA takes IOMFBDisplayRefresh "
+	    "at backboardd start, without CA_HEARTBEAT_RATE)\n", sweet_vlock, sweet_vsync, sweet_fb_refresh, ns);
+	return 0;
+}
+
+/* 1042: from statLine, every 5 s while the lock is on */
+void
+AppleCLCD::vsyncLockLine(void)
+{
+	if (!sweet_vlock) {
+		return;
+	}
+	IOLockLock(fLock);
+	uint64_t pns = 0, dsum = 0, dmax = 0;
+	absolutetime_to_nanoseconds(fFcPeriod, &pns);
+	absolutetime_to_nanoseconds(sweet_vlock_drift_abs, &dsum);
+	absolutetime_to_nanoseconds(sweet_vlock_drift_max, &dmax);
+	uint32_t ticks = sweet_vlock_ticks, ok = sweet_vlock_ok, late = sweet_vlock_late, lost = sweet_vlock_lost;
+	uint32_t dn = sweet_vlock_driftN;
+	sweet_vlock_ticks = sweet_vlock_ok = sweet_vlock_late = sweet_vlock_lost = sweet_vlock_driftN = 0;
+	sweet_vlock_drift_abs = sweet_vlock_drift_max = 0;
+	uint64_t rns = fRefreshNs;
+	IOLockUnlock(fLock);
+	IOLog("SWEET FB: vsync lock 5s: period %llu ns (%llu.%03llu Hz) published %llu ns | ticks %u | cal ok %u late %u lost %u | "
+	    "drift corrected %u x avg %llu us max %llu us | dead %d\n", pns, pns ? 1000000000000ULL / pns / 1000 : 0,
+	    pns ? 1000000000000ULL / pns % 1000 : 0, rns, ticks, ok, late, lost, dn, dn ? dsum / 1000 / dn : 0, dmax / 1000,
+	    fFcDead ? 1 : 0);
+}
+
+extern "C" int sweet_fb_vsync_lock(int on);
+int
+sweet_fb_vsync_lock(int on)
+{
+	if (sweet_fb_instance == NULL) {
+		return 19;      /* ENODEV (no errno.h in this file) */
+	}
+	return sweet_fb_instance->vsyncLock(on);
 }
 
 /*
@@ -3947,6 +4038,7 @@ AppleCLCD::phaseFrameCount(uint64_t now)
 			fFcTicks = 24;          /* calibrate again in 8 ticks, with a larger margin */
 			fFcEarlyUs = fFcEarlyUs + 250 > 2000 ? 2000 : fFcEarlyUs + 250;
 			sweet_vsync_cal_late++;
+			sweet_vlock_late++;     /* 1042 */
 		}
 	}
 	if (fFcEdge == 0 || fFcCal) {
@@ -3969,11 +4061,22 @@ AppleCLCD::phaseFrameCount(uint64_t now)
 		fFcMiss = 0;
 		if (fFcEdge != 0 && t - now > period / 2) {
 			sweet_vsync_cal_lost++;         /* 0995: polled past an edge that had gone by: that edge got no tick */
+			sweet_vlock_lost++;
 		} else if (cal) {
 			sweet_vsync_cal_ok++;
+			sweet_vlock_ok++;
 			fFcEarlyUs = fFcEarlyUs >= 350 ? fFcEarlyUs - 50 : 300;
 		}
 		uint32_t frames = f - fFcFrame;
+		if (fFcEdge != 0 && frames >= 1 && frames < 4096) {
+			/* 1042: how far the edge found is from the one predicted with the old period (the phase corrected) */
+			uint64_t pred = fFcEdge + (uint64_t)frames * period, d = t > pred ? t - pred : pred - t;
+			sweet_vlock_drift_abs += d;
+			sweet_vlock_driftN++;
+			if (d > sweet_vlock_drift_max) {
+				sweet_vlock_drift_max = d;
+			}
+		}
 		if (fFcEdge != 0 && frames >= 1 && frames < 4096) {
 			uint64_t p = (t - fFcEdge) / frames;
 			if (p > fVsyncAbs * 3 / 4 && p < fVsyncAbs * 5 / 4) {
