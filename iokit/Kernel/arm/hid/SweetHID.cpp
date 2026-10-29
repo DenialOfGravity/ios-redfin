@@ -1364,6 +1364,15 @@ SweetHIDSensor::post(const struct sweet_motion_sample *s, IOHIDEvent **built)
 		if (event) {
 			event->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage,
 			    (SInt32)(gSweetKnobs.orientbase + o));
+			/* 1031: CoreMotion (sensorTimeFromHidChildEvent) wants child 0 = vendor event
+			 * {0xff15, 2} with an 8-byte sensor time; without it every sample is "stale". */
+			uint64_t st = ts;
+			IOHIDEvent *child = IOHIDEvent::vendorDefinedEvent(ts, 0xff15, 2, 0, (UInt8 *)&st,
+			    (UInt32)sizeof(st));
+			if (child) {
+				event->appendChild(child);      /* the children array retains it */
+				child->release();
+			}
 		}
 		snprintf(line, sizeof(line), "UIDeviceOrientation %lld (usage %lld)", o, gSweetKnobs.orientbase + o);
 		break;
