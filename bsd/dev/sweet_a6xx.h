@@ -132,6 +132,8 @@ uint32_t a6_submit_ib_async(struct a6_gpu *g, uint64_t iova, uint32_t dwords, un
  * returns the fence, or 0 when the ring has no room within timeout_ms (0 = look once).
  */
 #define A6_SUBMIT_MAX	16
+#define A6_SUBMIT_MAX_HW	128	/* 1038: kern.sweet_gpu_ibmax up to this (ring: 27 + 4 x 128 = 539 of 8192 dwords) */
+extern unsigned a6_submit_max;		/* 1038: IBs one submit may carry (default A6_SUBMIT_MAX) */
 uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const uint32_t *dwords, unsigned n,
 	unsigned timeout_ms, uint64_t wait_va, uint32_t wait_ref);	/* 0989 */
 #define A6_SCAN_WORD_OFF	0x3000ull	/* 0989: in the scratch page: the direct scanout's latched frame */

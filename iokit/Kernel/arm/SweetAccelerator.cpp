@@ -44,6 +44,7 @@
 #include "SweetSurface.h"
 #include "SweetGPUABI.h"
 #include "SweetTrace.h"     /* 0994 */
+#define SWEET_V2_IB_HW  128     /* 1038: = A6_SUBMIT_MAX_HW (bsd/dev/sweet_a6xx.h) */
 
 extern "C" {
 void proc_selfname(char *buf, int size);
@@ -61,6 +62,7 @@ void sweet_gpu_window_free(uint64_t base);
 int sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages);
 void sweet_gpu_unmap_at(uint64_t iova, uint64_t len);
 uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy);
+unsigned sweet_gpu_ibmax(void);         /* 1038: kern.sweet_gpu_ibmax */
 int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
 bool sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence);
 bool sweet_gpu_lost_spare(uint64_t *epoch, uint32_t last_fence, int self_pid, uint32_t *spared);
@@ -955,15 +957,29 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 	case NativeAdrenoMethodBoCpuUnmap:
 		return kIOReturnSuccess;        /* the mapping is the client's (IOConnectUnmapMemory64) */
 	case NativeAdrenoMethodSubmit: {
-		V2_IN(NativeAdrenoAbiSubmit);
-		V2_OUT(NativeAdrenoAbiSubmitReply);
-		if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || rq->reserved) {
+		/*
+		 * 1038: up to kern.sweet_gpu_ibmax buffers (default 16 = NativeAdrenoAbiMaxBuffers): past 16 the extra
+		 * NativeAdrenoAbiSubmitBuffer entries follow the fixed array, the record grows by 24 bytes per entry.
+		 */
+		if (in == NULL || inSize < sizeof(NativeAdrenoAbiSubmit)) {
 			return kIOReturnBadArgument;
 		}
-		uint64_t iova[NativeAdrenoAbiMaxBuffers];
-		uint32_t dw[NativeAdrenoAbiMaxBuffers];
-		for (uint32_t i = 0; i < rq->buffer_count; i++) {
-			const NativeAdrenoAbiSubmitBuffer *b = &rq->buffers[i];
+		const NativeAdrenoAbiSubmit *rq = (const NativeAdrenoAbiSubmit *)in;
+		uint32_t nmax = sweet_gpu_ibmax();
+		if (nmax > SWEET_V2_IB_HW) {
+			nmax = SWEET_V2_IB_HW;
+		}
+		uint32_t nbuf = rq->buffer_count;
+		uint32_t extra = nbuf > NativeAdrenoAbiMaxBuffers ? nbuf - NativeAdrenoAbiMaxBuffers : 0;
+		if (nbuf == 0 || nbuf > nmax || nbuf > SWEET_V2_IB_HW || rq->reserved ||
+		    inSize != sizeof(NativeAdrenoAbiSubmit) + extra * sizeof(NativeAdrenoAbiSubmitBuffer)) {
+			return kIOReturnBadArgument;
+		}
+		V2_OUT(NativeAdrenoAbiSubmitReply);
+		uint64_t iova[SWEET_V2_IB_HW];
+		uint32_t dw[SWEET_V2_IB_HW];
+		for (uint32_t i = 0; i < nbuf; i++) {
+			const NativeAdrenoAbiSubmitBuffer *b = &rq->buffers[0] + i;    /* 1038: past [15] = the appended ones */
 			if ((b->bytes & 3) || b->bytes == 0 || b->bytes / 4 > 0xfffff || b->iova < fWinBase ||
 			    b->iova + b->bytes > fWinBase + fWinSize) {
 				return kIOReturnBadArgument;
@@ -976,7 +992,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 			return kIOReturnTimeout;
 		}
 		bool busy = false;
-		uint32_t fence = sweet_gpu_submit_v2(iova, dw, rq->buffer_count, &busy);
+		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, &busy);
 		if (fence == 0) {
 			v2_err_log("submit", busy ? "busy (ring full)" : "not ready (GPU down)");
 			return busy ? kIOReturnBusy : kIOReturnNotReady;

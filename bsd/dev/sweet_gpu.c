@@ -2010,7 +2010,42 @@ sweet_gpu_fence_of(int pid)
 	return 0;
 }
 
-/* Queue up to A6_SUBMIT_MAX IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
+/*
+ * 1038: kern.sweet_gpu_ibmax N (1..128, default 16 = A6_SUBMIT_MAX as before): IBs one v2 submit may carry. The v2
+ * record stays NativeAdrenoAbiSubmit; a client sending more than 16 appends the extra NativeAdrenoAbiSubmitBuffer
+ * entries right after the fixed array (structure input = sizeof + (count - 16) x 24 bytes; SweetAccelerator.cpp).
+ * Ring room: one submit is 27 + 4 x N dwords (539 at 128) of the 8192-dword ring; a6_submit_ibs_async_wait waits for
+ * used + n + 16 < 8192 as before. Each IB is one CP_INDIRECT_BUFFER (IB1) in the ring, so N has no CP limit.
+ */
+static int
+sysctl_sweet_gpu_ibmax SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, (int)a6_submit_max, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 1 || value > A6_SUBMIT_MAX_HW) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);  /* not while a submit builds its packet */
+	a6_submit_max = (unsigned)value;
+	lck_mtx_unlock(&sweet_gpu_lock);
+	printf("SWEET GPU: ibmax %d IBs per v2 submit\n", value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_ibmax, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_gpu_ibmax, "I", "SWEET GPU: IBs per v2 submit (1..128, default 16)");
+
+unsigned sweet_gpu_ibmax(void);
+unsigned
+sweet_gpu_ibmax(void)
+{
+	return a6_submit_max;
+}
+
+/* Queue up to kern.sweet_gpu_ibmax IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
 uint32_t
 sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
 {
@@ -2060,7 +2095,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 		pid_fence[slot].fence = fence;
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
-	*busy = fence == 0 && n > 0 && n <= A6_SUBMIT_MAX;
+	*busy = fence == 0 && n > 0 && n <= a6_submit_max;     /* 1038 */
 	SWEET_TRACE_END(SWT_GPU_SUBMIT, fence, wait_ref, pid, gpu_ticks);    /* 0994 */
 	return fence;
 }

@@ -26,6 +26,7 @@ int a6_submit_rbts;
 /* 0999: the GPU interrupt for fence waits (sweet_gpu.c: boot-arg sweetgpuirq, p gpuirq); 0: none, as before */
 uint32_t a6_irq_mask;
 int a6_submit_irq;
+unsigned a6_submit_max = A6_SUBMIT_MAX;	/* 1038 */
 
 #define rd32		a6_rd
 #define wr32		a6_wr
@@ -1303,8 +1304,10 @@ uint32_t a6_submit_ibs_async_wait(struct a6_gpu *g, const uint64_t *iova, const 
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
 	/* GPU time of this submit: CP_ALWAYS_ON_COUNTER before the IBs and once they are idle (a6_submit_time) */
 	uint64_t ts = a6_pool_va(A6_OFF_SCRATCH + A6_TS_OFF) + 16ull * ((g->fence + 1) % A6_TS_SLOTS);
-	uint32_t dw[7 + 4 + 4 + 4 * A6_SUBMIT_MAX + 5 + 5 + 2], n = 0;	/* 0988: + the longer end stamp; 0989: + the wait */
-	if (nib == 0 || nib > A6_SUBMIT_MAX)
+	/* 0988: + the longer end stamp; 0989: + the wait; 1038: up to A6_SUBMIT_MAX_HW IBs, static (callers hold the GPU lock) */
+	static uint32_t dw[7 + 4 + 4 + 4 * A6_SUBMIT_MAX_HW + 5 + 5 + 2];
+	uint32_t n = 0;
+	if (nib == 0 || nib > a6_submit_max || nib > A6_SUBMIT_MAX_HW)
 		return 0;
 	if (wait_va != 0) {
 		dw[n++] = a6_pkt7(0x3c, 6);		/* CP_WAIT_REG_MEM */
