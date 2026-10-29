@@ -814,6 +814,8 @@ static struct { int pid; uint32_t n; uint64_t busy; } gstat_own[GSTAT_OWNERS + 1
 static uint32_t gstat_n, gstat_missed;
 static uint64_t gstat_busy, gstat_longest;
 
+static void tlb_stats_locked(bool flush);       /* 1039 */
+
 static void
 gpu_owner_locked(uint32_t fence, int pid)
 {
@@ -878,6 +880,7 @@ gpu_stats_locked(void)
 		    gstat_n, gstat_missed, gstat_busy / 19200, gstat_busy * 100 / 19200 / (ns / 1000000),
 		    gstat_longest * 10 / 192, gstat_busy * 10 / 192 / gstat_n, who);
 	}
+	tlb_stats_locked(true);         /* 1039 */
 	gstat_n = gstat_missed = 0;
 	gstat_busy = gstat_longest = 0;
 	bzero(gstat_own, sizeof(gstat_own));
@@ -966,6 +969,94 @@ gpu_recover_locked(const char *why)
 	progress_abs = mach_absolute_time();
 	thread_wakeup((event_t)&gpu_irq_chan);  /* 0999: interrupt waiters see the forced fence now */
 }
+
+/*
+ * ---- 1039: kern.sweet_gpu_tlb (default 0 = a full context-bank flush, TLBIALL + TLBSYNC, after every map/unmap) ----
+ *   1  unmaps of <= 512 4K pages: one TLBIVA per page on the GPU context bank (MMU-500 CB + 0x600, 64-bit store,
+ *      AArch64 format VA[55:12], ASID 0 = the bank's TTBR0 ASID; our PTEs are global, nG clear, which TLBIVA matches
+ *      too), then TLBSYNC and TLBSTATUS polled; maps whose 4K entries were all invalid before: no invalidate (the
+ *      SMMU caches no invalid entries; page tables only gain entries; new tables hang off invalid slots). A map that
+ *      replaced a valid entry (surface slot reuse, a BO mapped over another) or failed: the full flush as before.
+ *   2  only the unmap part, 3 only the map part (to isolate a fault)
+ * Risk: MMU-500's next-page prefetcher (CB ACTLR.CPRE; Linux turns it off for errata) could keep a prefetched entry
+ * TLBIVA misses: ACTLR is logged when the mode is set. Line SWEET GPU: tlb 5s: full F | va V pages in U unmaps |
+ * map skipped S (only while nonzero).
+ */
+static int tlb_mode;
+static uint32_t tlb_full, tlb_va, tlb_unmaps, tlb_skip;
+
+static void
+tlb_after_map_locked(int rc)
+{
+	if (rc == 0 && (tlb_mode == 1 || tlb_mode == 3) && !a6_map_replaced) {
+		tlb_skip++;
+		return;
+	}
+	a6_tlb_flush(&gpu);
+	tlb_full++;
+}
+
+static void
+tlb_after_unmap_locked(uint64_t iova, uint64_t size)
+{
+	uint64_t n = (size + 0xfff) >> 12;
+	if ((tlb_mode == 1 || tlb_mode == 2) && n != 0 && n <= 512) {
+		uint64_t cb = A6_SMMU_CB(gpu.gpu_cb);
+		volatile uint64_t *tlbiva = (volatile uint64_t *)(uintptr_t)gpu_io(cb + 0x600);
+		__asm__ volatile ("dsb osh" ::: "memory");      /* the cleared PTEs before the invalidates */
+		for (uint64_t i = 0; i < n; i++) {
+			*tlbiva = ((iova & ~0xfffULL) + (i << 12)) >> 12;
+		}
+		a6_wr(cb + 0x7f0, 0);                           /* TLBSYNC */
+		for (unsigned i = 0; i < 1000 && (a6_rd(cb + 0x7f4) & 1); i++) {
+			delay(10);
+		}
+		tlb_va += (uint32_t)n;
+		tlb_unmaps++;
+		return;
+	}
+	a6_tlb_flush(&gpu);
+	tlb_full++;
+}
+
+static void
+tlb_stats_locked(bool flush)
+{
+	if (flush && (tlb_mode || tlb_va || tlb_skip)) {
+		a6_log("tlb 5s: full %u | va %u pages in %u unmaps | map skipped %u | mode %d\n", tlb_full, tlb_va,
+		    tlb_unmaps, tlb_skip, tlb_mode);
+	}
+	if (flush) {
+		tlb_full = tlb_va = tlb_unmaps = tlb_skip = 0;
+	}
+}
+
+static int
+sysctl_sweet_gpu_tlb SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, tlb_mode, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 3) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&sweet_gpu_lock);
+	tlb_mode = value;
+	a6_map_check = value == 1 || value == 3;
+	uint32_t actlr = gpu_ready && value ? a6_rd(A6_SMMU_CB(gpu.gpu_cb) + 0x4) : 0;
+	if (gpu_ready) {
+		a6_tlb_flush(&gpu);     /* start from a clean TLB either way */
+	}
+	lck_mtx_unlock(&sweet_gpu_lock);
+	printf("SWEET GPU: tlb %d (1 per-page unmap + no flush on fresh maps, 2 unmap only, 3 map only); cb%d actlr %x%s\n",
+	    value, gpu.gpu_cb, actlr, (actlr & 2) ? " (CPRE prefetch on)" : "");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_tlb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_gpu_tlb, "I", "SWEET GPU: TLB maintenance (0 full flush, 1 per-page/skip, 2 unmap, 3 map)");
 
 /* ---- the panel ---- */
 
@@ -1212,7 +1303,7 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
 	(void)present_wait_locked(0, "surface remap");
 	(void)present_wait_locked(1, "surface remap");
 	int rc = a6_map_pages(&gpu, SLOT_IOVA(s), pages, npages, page_size);
-	a6_tlb_flush(&gpu);
+	tlb_after_map_locked(rc);       /* 1039 (a slot reuse replaced valid entries: full flush) */
 	lck_mtx_unlock(&sweet_gpu_lock);
 	if (rc) {
 		slot[s].npages = 0;
@@ -1708,7 +1799,7 @@ sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, u
 		a6_unmap(&gpu, iova, size);
 		user_va_release(iova, size);
 	}
-	a6_tlb_flush(&gpu);
+	tlb_after_map_locked(rc);       /* 1039 */
 	lck_mtx_unlock(&sweet_gpu_lock);
 	if (rc) {
 		return -1;
@@ -1728,7 +1819,7 @@ sweet_gpu_unmap_user(uint64_t iova, uint64_t len)
 	lck_mtx_lock(&sweet_gpu_lock);
 	if (gpu_ready) {
 		a6_unmap(&gpu, iova, size);
-		a6_tlb_flush(&gpu);
+		tlb_after_unmap_locked(iova, size);     /* 1039 */
 	}
 	user_va_release(iova, size);
 	lck_mtx_unlock(&sweet_gpu_lock);
@@ -1962,7 +2053,7 @@ sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages)
 	if (rc) {
 		a6_unmap(&gpu, iova, (uint64_t)npages << 12);
 	}
-	a6_tlb_flush(&gpu);
+	tlb_after_map_locked(rc);       /* 1039 */
 	lck_mtx_unlock(&sweet_gpu_lock);
 	return rc;
 }
@@ -1976,7 +2067,7 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
 	lck_mtx_lock(&sweet_gpu_lock);
 	if (gpu_ready) {
 		a6_unmap(&gpu, iova, len);
-		a6_tlb_flush(&gpu);
+		tlb_after_unmap_locked(iova, len);      /* 1039 */
 	}
 	lck_mtx_unlock(&sweet_gpu_lock);
 }

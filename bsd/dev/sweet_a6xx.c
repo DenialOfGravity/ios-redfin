@@ -1480,12 +1480,16 @@ static uint64_t pt_walk(struct a6_gpu *g, uint64_t table, unsigned idx)
 	return t;
 }
 
+int a6_map_check;	/* 1039 */
+int a6_map_replaced;
+
 /* 4K entries for [iova, iova + n * 4K) taking the physical address of each 4K page from pa_of. */
 static int map_4k(struct a6_gpu *g, uint64_t iova, uint32_t n4k, uint64_t (*pa_of)(const void *, uint32_t),
 		  const void *arg)
 {
-	static uint64_t pte[512];
+	static uint64_t pte[512], old[512];
 	uint64_t l1 = a6_pool_pa(g, A6_OFF_GT_L1);
+	a6_map_replaced = 0;
 	for (uint32_t i = 0; i < n4k;) {
 		uint64_t va = iova + 0x1000ull * i;
 		uint64_t l2 = pt_walk(g, l1, (va >> 30) & 0x1ff);
@@ -1497,6 +1501,15 @@ static int map_4k(struct a6_gpu *g, uint64_t iova, uint32_t n4k, uint64_t (*pa_o
 		unsigned first = (va >> 12) & 0x1ff, k = 0;
 		while (first + k < 512 && i < n4k)
 			pte[k++] = pa_of(arg, i++) | (1u << 10) | (3u << 8) | (1u << 6) | 3u;
+		if (a6_map_check && !a6_map_replaced) {
+			/* 1039: an entry valid before may be in the SMMU's TLB: the caller must invalidate */
+			a6_read(l3 + 8ull * first, old, 8ull * k);
+			for (unsigned j = 0; j < k; j++)
+				if (old[j] & 1) {
+					a6_map_replaced = 1;
+					break;
+				}
+		}
 		a6_write(l3 + 8ull * first, pte, 8ull * k);
 	}
 	return 0;

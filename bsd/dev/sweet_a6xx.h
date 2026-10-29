@@ -168,6 +168,9 @@ int a6_map_pages(struct a6_gpu *g, uint64_t iova, const uint64_t *pages, uint32_
 void a6_unmap(struct a6_gpu *g, uint64_t iova, uint64_t size);	/* clear 4K entries; then a6_tlb_flush */
 void a6_unmap_high(struct a6_gpu *g);	/* drop all mappings above 1 GB, reset the arena */
 void a6_tlb_flush(const struct a6_gpu *g);
+/* 1039: with a6_map_check set, a6_map/a6_map_pages note whether any 4K entry they wrote was valid before */
+extern int a6_map_check;
+extern int a6_map_replaced;
 int a6_clear_fault(const struct a6_gpu *g);	/* 1 if an SMMU fault was cleared */
 uint32_t a6_fault_status(const struct a6_gpu *g, uint64_t *far, uint32_t *fsynr0);
 
