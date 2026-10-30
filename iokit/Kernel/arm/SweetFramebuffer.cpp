@@ -440,6 +440,8 @@ static IOReturn sweet_scan_poll(AppleCLCD *fb, uint32_t id);    /* 0996 */
 static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
 
 static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
+static volatile bool sweet_scan_auto_armed;     /* 1046: sweetscanout=2 (default): direct on at the first slot swap */
+static void sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec);
 
 class IOMobileFramebufferUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
@@ -935,7 +937,11 @@ AppleCLCD::start(IOService *provider)
 	sweet_surface_scan_reserve();   /* 0979: the scanout slots' memory before userland (sweetscanout) */
 	if (sweet_surface_scan_mode() == 1) {
 		sweet_scan_set(this, true, "boot-arg sweetscanout=1");  /* 0976 */
+	} else if (sweet_surface_scan_mode() == 2) {
+		sweet_scan_auto_armed = true;   /* 1046: on at the first slot surface's swap (AppleCLCD::swap) */
 	}
+	IOLog("SWEET SCANOUT: sweetscanout=%u (1046: 0 off, 1 on at start, 2 = default: on at the first slot swap, "
+	    "3 slots only)%s\n", sweet_surface_scan_mode(), sweet_scan_auto_armed ? ": auto armed" : "");
 	IOLog("SWEET FB: sweetfbx %#x, panel %u Hz\n", sweet_fbx, fHz);
 	registerService();
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
@@ -1421,6 +1427,9 @@ AppleCLCD::swap(const uint8_t *rec)
 	uint64_t now = mach_absolute_time();
 	uint32_t fence = sweet_gpu_fence_submitted();   /* 0949: CA's rendering of this frame is at or before it */
 	SWEET_TRACE_START(SWT_SWAP, get32(rec, 0x50), fence, get32(rec, 0x104), 0);      /* 0994 */
+	if (__improbable(sweet_scan_auto_armed)) {
+		sweet_scan_auto(this, rec);     /* 1046: before this frame's sweet_scan_live() check, so it already counts */
+	}
 	IOLockLock(fLock);
 	fSwapFence[fSwapFenceNext].abs = now;
 	fSwapFence[fSwapFenceNext].fence = fence;
@@ -2620,7 +2629,8 @@ AppleCLCD::mdpCmd(const char *s, const char *end)
 
 /*
  * ---- 0976: direct scanout (step e of docs/redfin/scanout-plan.md): boot-arg sweetscanout=1 (on) or 2 (slots
- * only, off until p scanout 1); p scanout 0|1 switches live. Inert with sweetscanout=0 (the default). ----
+ * only, off until p scanout 1); p scanout 0|1 switches live. Inert with sweetscanout=0. 1046: 2 is the default and
+ * turns direct on at the first slot swap (sweet_scan_auto); 3 = slots only (the old 2). ----
  *
  * A SwapEnd whose single layer is a CA surface in a scanout slot (0975) is not copied: it waits for the GPU fence
  * submitted at its SwapEnd (0949: SwapEnd comes when CA has queued the rendering, not when the GPU has drawn it),
@@ -3500,6 +3510,39 @@ sweet_scan_gpu_kick(void)
 	}
 }
 
+/*
+ * 1046: sweetscanout=2 (the default): direct scanout turns itself on, once, at the first SwapEnd whose single layer is
+ * a scanout-slot surface of the panel's logical size, with the display on: the same sweet_scan_set as p scanout 1,
+ * from backboardd's SwapEnd thread (AppleCLCD::start has made the slots, the MDP is ABL's set-up, CA's chain is in the
+ * slots). Afterwards nothing differs from the live poke: display off leaves the direct geometry (0989) with
+ * sweet_scan.on kept, and the next slot frames (3 in a row, 0979) enter it again. p scanout 0|1 before that disarms it.
+ */
+static void
+sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec)
+{
+	uint32_t mask = get32(rec, 0x104);
+	if (mask == 0 || (mask & (mask - 1)) || fb->fPowerOff) {
+		return;
+	}
+	uint32_t l = (uint32_t)__builtin_ctz(mask);
+	uint32_t id = l < SWEET_FB_LAYERS ? get32(rec, 0x54 + 4 * l) : 0;
+	SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
+	if (s == NULL) {
+		return;
+	}
+	bool slot = s->scanSlot != 0 && s->width == SWEET_FB_LOGICAL_W && s->height == SWEET_FB_LOGICAL_H;
+	uint32_t sid = s->id, n = s->scanSlot;
+	s->release();
+	if (!slot || !OSCompareAndSwap8(1, 0, (volatile UInt8 *)&sweet_scan_auto_armed)) {
+		return;
+	}
+	char name[32];
+	proc_selfname(name, sizeof(name));
+	IOLog("SWEET SCANOUT: auto on (1046 default sweetscanout=2): swap %u from %s, surface %u in slot %u\n",
+	    get32(rec, 0x50), name, sid, n - 1);
+	sweet_scan_set(fb, true, "auto (1046: sweetscanout=2, first slot swap)");
+}
+
 /* p scanout 0|1 and the boot-arg: frames direct or the normal way. */
 static void
 sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
@@ -3547,7 +3590,7 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
  *                   with the tear-check configuration
  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
  *   p mdp ...       0948: display-engine dump and scanout tests (above)
- *   p scanout 0|1   0976: the direct scanout off / on (needs boot-arg sweetscanout=1|2); no argument: the state
+ *   p scanout 0|1   0976: the direct scanout off / on (needs sweetscanout 1|2|3; 1046: 2 by default); no argument: the state
  *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
  *                          CP waits for the latch (2; boot-arg sweetscangate)
  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
@@ -3784,6 +3827,10 @@ AppleCLCD::fbCmd(const char *s, const char *end)
 			    sweet_scan.tribuf ? "busy until latched" : "done at once for the newest",
 			    sweet_scan.tribuf ? "K-1 on screen at chain 3" : "K on screen");
 		} else if (q < end && (*q == '0' || *q == '1')) {
+			if (sweet_scan_auto_armed) {
+				sweet_scan_auto_armed = false;  /* 1046: the poke decides from now on */
+				IOLog("SWEET SCANOUT: auto disarmed (p scanout %c)\n", *q);
+			}
 			sweet_scan_set(this, *q == '1', "p scanout");
 		} else {
 			sweet_scan_set(this, sweet_scan.on, "p scanout (state)");

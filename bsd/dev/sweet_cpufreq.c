@@ -203,7 +203,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTL
     0, 0, sysctl_sweet_gov_framehold, "I", "SWEET GOV: % of each domain's top held 300 ms after a SwapEnd (0 off)");
 
 /*
- * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; default 0 = as before): 1 threads named
+ * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; 1046: default 1, was 0): 1 threads named
  * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
  * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
  * normal choice (never waits). Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).

@@ -5023,7 +5023,7 @@ choose_next_pset(
 uint64_t sweet_cpu_idle_abs(int cpu);
 
 /*
- * redfin 1041: kern.sweet_ui_bigcore MASK (bsd/dev/sweet_cpufreq.c; default 0 = as before). Trace of a Settings scroll
+ * redfin 1041: kern.sweet_ui_bigcore MASK (bsd/dev/sweet_cpufreq.c; 1046: default 1, was 0). Trace of a Settings scroll
  * (2026-10-29): backboardd's com.apple.coreanimation.display.primary (CA prepare, ~10 ms of CPU per frame on an A76)
  * ran 8 of 174 frames on an A55 at ~19.7 ms and cost 44 "display thread busy" ticks: 0962 only takes an IDLE big core.
  * Threads are tagged when named (bsd_setthreadname): com.apple.coreanimation.display* (class 1) and
@@ -5036,7 +5036,7 @@ uint64_t sweet_cpu_idle_abs(int cpu);
  * Stats always (cheap): runs and on-CPU ms of tagged threads on big (CPU6/7) and little cores, counted when they go off
  * core; line every 5 s while tagged threads run: SWEET UI: bigcore 5s: ... (sweet_thermal.c's 5 s tick).
  */
-int sweet_ui_bigcore;
+int sweet_ui_bigcore = 1;      /* 1046: default 1 (CA display threads; was 0); sysctl kern.sweet_ui_bigcore changes it live */
 static uint32_t sweet_ui_tagged;
 static uint32_t sweet_ui_st_idle, sweet_ui_st_preempt, sweet_ui_st_fallback;
 static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display, render-server][big, little] */

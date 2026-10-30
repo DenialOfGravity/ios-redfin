@@ -102,7 +102,12 @@ uint32_t
 sweet_surface_scan_mode(void)
 {
 	if (sweet_scan_boot < 0) {
-		int m = 0;
+		/*
+		 * 1046: absent = 2 (was 0). 0 off (blit, no slots); 1 slots + direct on at AppleCLCD::start; 2 slots + direct
+		 * on by itself at the first swap of a scanout-slot surface (AppleCLCD::swap, sweet_scan_auto); 3 slots only
+		 * (direct off until p scanout 1: what 2 was before 1046).
+		 */
+		int m = 2;
 		PE_parse_boot_argn("sweetscanout", &m, sizeof(m));
 		sweet_scan_boot = m < 0 ? 0 : m;
 	}
