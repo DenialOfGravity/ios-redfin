@@ -29,6 +29,9 @@ int radio_heard(unsigned i, struct radio_bss *out);	/* 0, or -1 past the last */
 int radio_scanning(void);	/* a scan runs or is due */
 int radio_joined(void);
 int radio_link_rssi(int *rssi, uint32_t *age_ms);	/* joined network's last heard RSSI; -1 when not joined */
+unsigned radio_link_rate(void);	/* joined link's rate, Mbit/s (0: not joined) */
+/* wland's settings (wland.c): env WLAND_<KEY> (upper case), else a "key=N" line in /var/local/wland.conf, else def */
+int wland_setting(const char *key, int def);
 unsigned radio_ssid(uint8_t ssid[32], uint8_t bssid[6]);	/* of the network joined or being joined; 0 when idle */
 int radio_tx_ether(const uint8_t *frame, uint32_t len);	/* an Ethernet frame out; 0 = queued */
 extern void (*radio_rx_hook)(const uint8_t *frame, uint32_t len);	/* Ethernet frames in */
