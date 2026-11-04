@@ -84,6 +84,7 @@
 #define VOTE_FSM_ENA	(1u << 20)
 #define UPDATE_BYPASS	(1u << 23)
 #define LOCK_DET	(1u << 31)
+#define PCAL_DONE	(1u << 27)	/* Lucid: calibration done (LUCID_PCAL_DONE); stays set after alpha_pll_lucid_disable */
 #define PLL_RUN		1u
 #define PLL_OUT_MASK	7u
 /* video_cc_iris_clk_src: cmd_rcgr 0x7f0, hid_width 5, no MND, PLL0 main = sel 1 (videocc-lito.c, as sdmmagpie) */
@@ -660,7 +661,9 @@ static int pll_on(uint32_t l)
 		printf("venus: STOP: pll0 running at L %#x, not %#x (MODE %#x)\n", vrd(PLL_L), l, m);
 		return -1;
 	}
-	if (m & ~(RESET_N | UPDATE_BYPASS | LOCK_DET)) {	/* reset state 0 or our own 'off' state (as camclk) */
+	/* reset state 0 or our own 'off' state: redfin rn4x, a second power on after power off read MODE 0x08800004
+	 * (PCAL_DONE | UPDATE_BYPASS | RESET_N) with OPMODE STANDBY, i.e. Lucid's disabled state */
+	if ((m & ~(RESET_N | UPDATE_BYPASS | LOCK_DET | PCAL_DONE)) || (vrd(PLL_OPMODE) & PLL_RUN)) {
 		printf("venus: STOP: pll0 MODE %#x not reset/standby\n", m);
 		return -1;
 	}
@@ -796,8 +799,13 @@ int power_on(void)
 		return power_off(), 1;
 	int axi_late = gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 0);	/* may need the video GDSCs to report on */
 
-	/* videocc-lito.c video_multipipe_fixup: either efuse bit -> L 0x14 (384 MHz; /2 = 192 MHz) */
-	uint32_t l = (rd32(EFUSE_VIDEO) & (EFUSE_NO_MPIPE | EFUSE_NO_FMAX)) ? 0x14 : 0x19;
+	/* videocc-lito.c video_multipipe_fixup writes L 0x14 into the config for either efuse bit, but the RCG then sets
+	 * the PLL's rate itself (CLK_SET_RATE_PARENT): with VP fmax off the table still starts at 240 MHz = PLL 480 / 2,
+	 * only multipipe-disabled parts are capped at 200 MHz. So: L 0x19 (480 -> 240 MHz) unless multipipe is disabled,
+	 * then L 0x14 (384 -> 192 MHz, under the 200 cap). rn4x (L 0x14 for either bit) locked at 384 MHz. */
+	uint32_t l = (rd32(EFUSE_VIDEO) & EFUSE_NO_MPIPE) ? 0x14 : 0x19;
+	if (getenv("VENUSCTL_PLL_L"))
+		l = (uint32_t)strtoul(getenv("VENUSCTL_PLL_L"), NULL, 0) == 0x14 ? 0x14 : 0x19;	/* 0x14 or 0x19 only */
 	if (l != 0x19)
 		printf("venus: efuse %#010x: multipipe or VP fmax disabled, PLL L %#x\n", rd32(EFUSE_VIDEO), l);
 	if (pll_on(l) || rcg_set(1, 3, "iris rcg PLL0 main /2"))	/* F(240 MHz, PLL0_OUT_MAIN, 2): field 2*2-1 */
