@@ -500,6 +500,24 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
 }
 
+/*
+ * redfin 1048: kern.sweet_surfkeep (bsd/dev/sweet_gpu.c) / boot-arg sweetsurfkeep, default 0. 0xffffffff = not read yet.
+ */
+extern "C" uint32_t sweet_surfkeep;
+uint32_t sweet_surfkeep = 0xffffffffu;
+static uint32_t sweet_surface_keep_logged;
+extern "C" uint32_t sweet_surface_keep_row(void);
+uint32_t
+sweet_surface_keep_row(void)
+{
+	if (sweet_surfkeep == 0xffffffffu) {
+		uint32_t v = 1;	/* default on since 2026-11-05 (sweetsurfkeep=0 = old rounding) */
+		PE_parse_boot_argn("sweetsurfkeep", &v, sizeof(v));
+		sweet_surfkeep = v ? 1 : 0;
+	}
+	return sweet_surfkeep;
+}
+
 /* Geometry from the creation properties (IOSurface.h keys). */
 static IOReturn
 sweet_surface_layout(SweetSurface *s, OSDictionary *props)
@@ -578,9 +596,26 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 		planar_align = v ? row_align : 0;
 	}
 	OSArray *plane_info = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
-	if (row_align > 1 && (one_plane || plane_info == NULL || (plane_info->getCount() == 1 && planar_align > 1))) {
+	/*
+	 * redfin 1048 (Yofuness 0251, kern.sweet_surfkeep / boot-arg sweetsurfkeep, default 0 = as before): a surface made
+	 * from a recorded key set (at most 9 keys: QuartzCore's iosurface_keys_allow_list) with an explicit row keeps that
+	 * row, its planes' rows too. CA's archive decoder copies a recorded blob written at the client's (32-byte) row and
+	 * never reads the row back, so 0159's 64-byte rounding shears it: glyph stripes (Control Center). New surfaces
+	 * only. Line SWEET SURF: 1048 ... for the first 32 such surfaces whose row 0159 would round (also with 0).
+	 */
+	bool recorded = props->getCount() <= 9 && props->getObject("IOSurfaceBytesPerRow") != NULL;
+	bool keep_row = recorded && sweet_surface_keep_row() != 0;
+	if (recorded && row_align > 1 && (s->bytesPerRow & (row_align - 1)) != 0) {
+		if (sweet_surface_keep_logged < 32) {
+			sweet_surface_keep_logged++;
+			IOLog("SWEET SURF: 1048 %u keys %ux%u fmt 0x%x row %u %s (%s)\n", props->getCount(), s->width, s->height,
+			    s->pixelFormat, s->bytesPerRow, keep_row ? "kept" : "rounded", who);
+		}
+	}
+	if (!keep_row && row_align > 1 && (one_plane || plane_info == NULL || (plane_info->getCount() == 1 && planar_align > 1))) {
 		s->bytesPerRow = (s->bytesPerRow + row_align - 1) & ~(row_align - 1);
 	}
+	uint32_t plane_align = keep_row ? 0 : planar_align;      /* 1048 */
 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 
 	OSArray *planes = one_plane ? NULL : plane_info;
@@ -612,9 +647,9 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
-			if (planar_align > 1 && (p->bytesPerRow & (planar_align - 1)) != 0) {
+			if (plane_align > 1 && (p->bytesPerRow & (plane_align - 1)) != 0) {
 				uint32_t was_row = p->bytesPerRow;
-				uint64_t row = ((uint64_t)p->bytesPerRow + planar_align - 1) & ~(uint64_t)(planar_align - 1);
+				uint64_t row = ((uint64_t)p->bytesPerRow + plane_align - 1) & ~(uint64_t)(plane_align - 1);
 				uint64_t size = row * sweet_div_up(p->height, p->elementHeight);
 				if (row > 0xffffffffull || size > 0xffffffffull) {
 					return kIOReturnBadArgument;
@@ -633,7 +668,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 			if (moved && (uint64_t)p->offset < prev_end) {
 				/* the plane before grew into this one: after it, page-aligned if the creator's was */
 				uint64_t at = (p->offset & PAGE_MASK) == 0 ? round_page(prev_end) :
-				    ((prev_end + planar_align - 1) & ~(uint64_t)(planar_align - 1));
+				    ((prev_end + plane_align - 1) & ~(uint64_t)(plane_align - 1));
 				if (at + p->size > 0xffffffffull) {
 					return kIOReturnBadArgument;
 				}

@@ -1297,6 +1297,32 @@ sweet_gpu_mdp_own(int on)
 
 /* ---- surfaces ---- */
 
+/*
+ * redfin 1048: kern.sweet_surfkeep 0|1 (default 0 = as before; boot-arg sweetsurfkeep=1): surfaces from a recorded key
+ * set (<= 9 keys, explicit IOSurfaceBytesPerRow) keep their row, no 0159/0940 rounding (iokit/Kernel/arm/SweetSurface.cpp,
+ * sweet_surface_layout). Takes effect for surfaces created after the change.
+ */
+extern uint32_t sweet_surfkeep;
+extern uint32_t sweet_surface_keep_row(void);
+static int
+sysctl_sweet_surfkeep SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, (int)sweet_surface_keep_row(), sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	sweet_surfkeep = (uint32_t)value;
+	printf("SWEET SURF: surfkeep %d (1048: recorded key sets keep their row; new surfaces)\n", value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_surfkeep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_surfkeep, "I", "SWEET SURF: recorded key-set surfaces keep their explicit row (1048)");
+
 static int present_wait_locked(uint32_t k, const char *why);
 
 #define SLOTS           4
