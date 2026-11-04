@@ -74,7 +74,16 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
 static inline bool
 pa_valid(pmap_paddr_t pa)
 {
-	return (pa >= vm_first_phys) && (pa < vm_last_phys);
+	if (__probable((pa >= vm_first_phys) && (pa < vm_last_phys))) {
+		return true;
+	}
+	/* HakiOS (patch 1512): the boot loader's extra RAM beside the window (arm/pmap/pmap.h) is kernel-managed too */
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if ((pa >= hakios_extra_ram[i].pa) && (pa < hakios_extra_ram[i].end)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -97,7 +106,31 @@ pa_valid(pmap_paddr_t pa)
 static inline unsigned int
 pa_index(pmap_paddr_t pa)
 {
+	if (__probable((pa >= vm_first_phys) && (pa < vm_last_phys))) {
+		return (unsigned int)atop(pa - vm_first_phys);
+	}
+	/* HakiOS (patch 1512): an extra range's pages come after the window's, in the order of the ranges */
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if ((pa >= hakios_extra_ram[i].pa) && (pa < hakios_extra_ram[i].end)) {
+			return hakios_extra_ram[i].pai + (unsigned int)atop(pa - hakios_extra_ram[i].pa);
+		}
+	}
 	return (unsigned int)atop(pa - vm_first_phys);
+}
+
+/**
+ * The physical address of a physical address index (the reverse of pa_index()).
+ */
+static inline pmap_paddr_t
+pai_to_pa(unsigned int pai)
+{
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if ((pai >= hakios_extra_ram[i].pai) &&
+		    (pai - hakios_extra_ram[i].pai < atop(hakios_extra_ram[i].end - hakios_extra_ram[i].pa))) {
+			return hakios_extra_ram[i].pa + ptoa((pmap_paddr_t)(pai - hakios_extra_ram[i].pai));
+		}
+	}
+	return vm_first_phys + ptoa((pmap_paddr_t)pai);
 }
 
 /* See the definition of pv_head_table for more information. */

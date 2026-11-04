@@ -48,6 +48,26 @@
 #include <arm/misc_protos.h>
 
 /*
+ * HakiOS (patch 1512): the boot loader's extra RAM beside the window (arm/pmap/pmap.h) is in the physical aperture too,
+ * and is RAM: not a page to map through a copy window, nor (cache_sync_page) a reason to clean the whole data cache.
+ */
+static inline bool
+hakios_isphysmem(pmap_paddr_t pa)
+{
+	if (((vm_address_t)pa - gPhysBase) < gPhysSize) {
+		return true;
+	}
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if ((pa >= hakios_extra_ram[i].pa) && (pa < hakios_extra_ram[i].end)) {
+			return true;
+		}
+	}
+	return false;
+}
+#undef isphysmem
+#define isphysmem(a) hakios_isphysmem((pmap_paddr_t)(a))
+
+/*
  * dcache_incoherent_io_flush64() dcache_incoherent_io_store64() result info
  */
 #define LWOpDone 1

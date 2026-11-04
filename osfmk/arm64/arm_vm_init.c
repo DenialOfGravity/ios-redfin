@@ -364,7 +364,134 @@ typedef struct {
 
 #define PTOV_TABLE_SIZE 8
 SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
+/*
+ * redfin (1054): the extra RAM's aperture entries, in a table of their own (HakiOS 1512 grew ptov_table instead), so
+ * that with xram=0 ptov_table, ARM64_PHYSMAP_ALIGNMENT_PADDING and the physmap sizing are exactly as before.
+ * Looked up only when hakios_extra_ram_count != 0.
+ */
+SECURITY_READ_ONLY_LATE(static ptov_table_entry)        sweet_xram_ptov[HAKIOS_EXTRA_RAM_MAX];
 SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+
+/*
+ * HakiOS (patch 1512): the boot loader's extra RAM beside the window (arm/pmap/pmap.h). Read once in arm_vm_init(),
+ * before anything is sized from the memory there is. redfin (1054): from the table below, boot-arg xram=N (default 0).
+ */
+SECURITY_READ_ONLY_LATE(hakios_extra_ram_t) hakios_extra_ram[HAKIOS_EXTRA_RAM_MAX];
+SECURITY_READ_ONLY_LATE(unsigned int) hakios_extra_ram_count = 0;
+SECURITY_READ_ONLY_LATE(unsigned int) hakios_extra_ram_pages = 0;
+SECURITY_READ_ONLY_LATE(static unsigned int) hakios_extra_ram_refused = 0;
+
+/*
+ * redfin (1054): the free RAM of the low bank, which XNU's window (0x100000000 + 6 GiB - 20 MiB, mkadt.py --highmem,
+ * 1033) leaves out. Live DT (TWRP recon 2026-10-23) memory <0x80000000 0x3bb00000>: /proc/iomem's "System RAM"
+ * pieces between the no-map carve-outs, 16 KB aligned, without the 1 MB and 428 KB slivers next to hyp/aop/smem.
+ * Kept out: hyp, xbl_aop, cmd-db, uefi log, sec_apps, smem, removed_region, qtee_apps (TZ/hyp), pil_camera,
+ * pil_adsp, pil_wlan_fw, ipa, pil_gpu (zap), reserved_pil_mem, modem_wlan (MPSS + rmtfs), cdsp_sec, cont_splash
+ * (ABL's autorefresh scans it out), dfps_data, debug_info, ramoops, alt_ramoops, ramoops_meta, ramdumplog.
+ * The loader's payload, ABL's DTB and the shim itself sit in 0xa2400000-0xb7e00000 but are dead once XNU runs
+ * (everything is copied into the window, shim/loader.c).
+ *   xram=1  System RAM only                                                         459.7 MB
+ *   xram=2  plus pil_npu + pil_video + pil_cdsp (firmware we never load; +40 MB)    499.7 MB
+ * Default 0: no extra RAM, as before.
+ * With boot-arg sweetvenus non-zero (the video track, 1057: Venus queues at 0xa2600000, buffer window 0xa2a00000 +
+ * 160 MB, firmware in pil_video) the ranges marked venus are left out: 0xa2600000-0xaca00000 and pil_video
+ * (xram=1 295.7 MB, xram=2 330.7 MB). xram=3 / xram=4 = xram=1 / xram=2 with the Venus ranges left out too, for a
+ * cmdline with no room for sweetvenus= (Venus then switched on live with kern.sweet_venus).
+ */
+static const struct { uint64_t pa, end; unsigned int tier; bool venus; } sweet_xram_ranges[] = {
+	{ 0x084400000ULL, 0x086000000ULL, 1, false },   /* 28 MB, between qtee_apps and pil_camera */
+	{ 0x086500000ULL, 0x086a00000ULL, 2, false },   /* 5 MB, pil_npu */
+	{ 0x086a00000ULL, 0x086f00000ULL, 2, true },    /* 5 MB, pil_video (Venus firmware with sweetvenus) */
+	{ 0x086f00000ULL, 0x087400000ULL, 1, false },   /* 5 MB, between pil_video and pil_cdsp */
+	{ 0x087400000ULL, 0x089200000ULL, 2, false },   /* 30 MB, pil_cdsp */
+	{ 0x09d800000ULL, 0x09f400000ULL, 1, false },   /* 28 MB, between modem_wlan and cdsp_sec */
+	{ 0x0a2400000ULL, 0x0a2600000ULL, 1, false },   /* 2 MB, after dfps_data */
+	{ 0x0a2600000ULL, 0x0aca00000ULL, 1, true },    /* 164 MB, Venus queues + buffer window with sweetvenus */
+	{ 0x0aca00000ULL, 0x0b7e00000ULL, 1, false },   /* 180 MB, up to debug_info */
+	{ 0x0b8654000ULL, 0x0bbb00000ULL, 1, false },   /* 52.7 MB, between ramdumplog and the end of the bank */
+};
+SECURITY_READ_ONLY_LATE(static uint32_t) sweet_xram_tier = 0;
+SECURITY_READ_ONLY_LATE(static uint32_t) sweet_xram_venus = 0;
+
+static void
+hakios_extra_ram_init(void)
+{
+	unsigned int first_pai = (unsigned int)atop(mem_size);
+	uint32_t tier = 0;
+
+	if (!PE_parse_boot_argn("xram", &tier, sizeof(tier)) || tier == 0) {
+		return;
+	}
+	sweet_xram_tier = tier;
+	if (!PE_parse_boot_argn("sweetvenus", &sweet_xram_venus, sizeof(sweet_xram_venus))) {
+		sweet_xram_venus = 0;
+	}
+	if (tier >= 3) {                /* 3 = 1, 4 = 2, both without the Venus ranges */
+		tier -= 2;
+		if (sweet_xram_venus == 0) {
+			sweet_xram_venus = 0x100;       /* (kept out because of xram=3/4, not the boot-arg) */
+		}
+	}
+	/* only on the redfin map: the window above 4 GiB (otherwise these ranges could be the window's or no RAM at all) */
+	if (gPhysBase != 0x100000000ULL) {
+		hakios_extra_ram_refused = (unsigned int)-1;
+		return;
+	}
+	for (unsigned int i = 0; i < sizeof(sweet_xram_ranges) / sizeof(sweet_xram_ranges[0]) &&
+	    hakios_extra_ram_count < HAKIOS_EXTRA_RAM_MAX; i++) {
+		if (sweet_xram_ranges[i].tier > tier || (sweet_xram_ranges[i].venus && sweet_xram_venus != 0)) {
+			continue;
+		}
+		pmap_paddr_t pa = round_page(sweet_xram_ranges[i].pa), end = trunc_page(sweet_xram_ranges[i].end);
+		bool ok = end > pa;
+
+		/* never the window, nor another range */
+		if (ok && pa < gPhysBase + real_phys_size && end > gPhysBase) {
+			ok = false;
+		}
+		for (unsigned int j = 0; ok && j < hakios_extra_ram_count; j++) {
+			ok = !(pa < hakios_extra_ram[j].end && end > hakios_extra_ram[j].pa);
+		}
+		if (!ok) {
+			hakios_extra_ram_refused++;     /* (said in arm_vm_prot_finalize(): too early for printf here) */
+			continue;
+		}
+		/* a range that starts where the last one ended joins it (one ptov entry) */
+		if (hakios_extra_ram_count != 0 && hakios_extra_ram[hakios_extra_ram_count - 1].end == pa) {
+			hakios_extra_ram[hakios_extra_ram_count - 1].end = end;
+		} else {
+			hakios_extra_ram[hakios_extra_ram_count].pa = pa;
+			hakios_extra_ram[hakios_extra_ram_count].end = end;
+			hakios_extra_ram[hakios_extra_ram_count].pai = first_pai + hakios_extra_ram_pages;
+			hakios_extra_ram_count++;
+		}
+		hakios_extra_ram_pages += (unsigned int)atop(end - pa);
+	}
+}
+
+/* [pa, pa + len) is all in one of the extra ranges */
+static bool
+hakios_extra_ram_covers(pmap_paddr_t pa, pmap_paddr_t len)
+{
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if (pa >= hakios_extra_ram[i].pa && pa + len <= hakios_extra_ram[i].end) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* [pa, pa + len) meets one of the extra ranges */
+static bool
+hakios_extra_ram_meets(pmap_paddr_t pa, pmap_paddr_t len)
+{
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if (pa < hakios_extra_ram[i].end && pa + len > hakios_extra_ram[i].pa) {
+			return true;
+		}
+	}
+	return false;
+}
 
 
 vm_map_address_t
@@ -374,6 +501,11 @@ phystokv(pmap_paddr_t pa)
 	for (size_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
 		if ((pa >= ptov_table[i].pa) && (pa < (ptov_table[i].pa + ptov_table[i].len))) {
 			return pa - ptov_table[i].pa + ptov_table[i].va;
+		}
+	}
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {      /* (1054; none with xram=0) */
+		if ((pa >= sweet_xram_ptov[i].pa) && (pa < (sweet_xram_ptov[i].pa + sweet_xram_ptov[i].len))) {
+			return pa - sweet_xram_ptov[i].pa + sweet_xram_ptov[i].va;
 		}
 	}
 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
@@ -397,6 +529,15 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
 			return pa - ptov_table[i].pa + ptov_table[i].va;
 		}
 	}
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {      /* (1054; none with xram=0) */
+		if ((pa >= sweet_xram_ptov[i].pa) && (pa < (sweet_xram_ptov[i].pa + sweet_xram_ptov[i].len))) {
+			len = sweet_xram_ptov[i].len - (pa - sweet_xram_ptov[i].pa);
+			if (*max_len > len) {
+				*max_len = len;
+			}
+			return pa - sweet_xram_ptov[i].pa + sweet_xram_ptov[i].va;
+		}
+	}
 	len = PAGE_SIZE - (pa & PAGE_MASK);
 	if (*max_len > len) {
 		*max_len = len;
@@ -414,6 +555,11 @@ ml_static_vtop(vm_offset_t va)
 	for (size_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
 		if ((va >= ptov_table[i].va) && (va < (ptov_table[i].va + ptov_table[i].len))) {
 			return va - ptov_table[i].va + ptov_table[i].pa;
+		}
+	}
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {      /* (1054; none with xram=0) */
+		if ((va >= sweet_xram_ptov[i].va) && (va < (sweet_xram_ptov[i].va + sweet_xram_ptov[i].len))) {
+			return va - sweet_xram_ptov[i].va + sweet_xram_ptov[i].pa;
 		}
 	}
 	if (__improbable((va < gVirtBase) || (((vm_address_t)(va) - gVirtBase) >= gPhysSize))) {
@@ -996,7 +1142,9 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
 		va &= ~ARM_TT_L2_OFFMASK;
 		pa = va - gVirtBase + gPhysBase - pa_offset;
 
-		if (pa >= real_avail_end) {
+		/* (HakiOS, patch 1512: an extra range may be anywhere, below the window too) */
+		bool extra = hakios_extra_ram_meets(pa, ARM_TT_L2_SIZE);
+		if (pa >= real_avail_end && !extra) {
 			return;
 		}
 
@@ -1023,10 +1171,10 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
 		}
 
 		vm_offset_t len = _end - va;
-		if ((pa + len) > real_avail_end) {
+		if (!extra && (pa + len) > real_avail_end) {
 			_end -= (pa + len - real_avail_end);
 		}
-		assert((start - gVirtBase + gPhysBase - pa_offset) >= gPhysBase);
+		assert(extra || (start - gVirtBase + gPhysBase - pa_offset) >= gPhysBase);
 
 		/* Round up to the nearest PAGE_SIZE boundary when creating mappings:
 		 * PAGE_SIZE may be a multiple of ARM_PGBYTES, and we don't want to leave
@@ -1117,7 +1265,7 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
 
 			tte2 = arm_kva_to_tte(align_start);
 
-			if ((pa >= gPhysBase) && (pa < real_avail_end)) {
+			if (((pa >= gPhysBase) && (pa < real_avail_end)) || hakios_extra_ram_covers(pa, ARM_TT_L2_SIZE)) {
 				tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
 				    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX
 				    | ARM_TTE_BLOCK_AP(pte_prot_APX) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)
@@ -1603,6 +1751,33 @@ arm_vm_physmap_init(boot_args *args)
 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
 	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
 
+	/*
+	 * HakiOS (patch 1512) / redfin (1054): the extra RAM, each range after the last in the aperture, block offset kept
+	 * as arm_vm_physmap_slide() keeps it, entries in sweet_xram_ptov. Its "orig_va" (pa - gPhysBase + gVirtBase) is
+	 * no address for a range below the window: it only turns back into the physical address. Nothing with xram=0.
+	 */
+	if (hakios_extra_ram_count != 0) {
+		vm_map_address_t next_va = temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len;
+		for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+			pmap_paddr_t pa = hakios_extra_ram[i].pa;
+			vm_size_t len = hakios_extra_ram[i].end - pa;
+			vm_map_address_t va = next_va;
+			vm_map_address_t orig_offset = pa & ARM_TT_TWIG_OFFMASK, new_offset = va & ARM_TT_TWIG_OFFMASK;
+			if (new_offset < orig_offset) {
+				va += orig_offset - new_offset;
+			} else if (new_offset > orig_offset) {
+				va = ROUND_TWIG(va) + orig_offset;
+			}
+			vm_map_address_t orig_va = pa - gPhysBase + gVirtBase;
+			arm_vm_page_granular_prot(va, len, va - orig_va, 1, AP_RWNA, 1, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT);
+			sweet_xram_ptov[i].pa = pa;
+			sweet_xram_ptov[i].va = va;
+			sweet_xram_ptov[i].len = len;
+			next_va = va + len;
+		}
+		assert(next_va <= physmap_end);
+	}
+
 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
 
 	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
@@ -1651,6 +1826,39 @@ arm_vm_prot_finalize(boot_args * args __unused)
 	cpu_stack_alloc(&BootCpuData);
 	arm64_replace_bootstack(&BootCpuData);
 	ml_static_mfree(phystokv(segBOOTDATAB - gVirtBase + gPhysBase), segSizeBOOTDATA);
+
+	/*
+	 * HakiOS (patch 1512): the boot loader's extra RAM to the VM, its pages made as vm_page_create() makes those of
+	 * ml_static_mfree(), now that the zone they come from is up. (Before bsd_init() and vm_pageout(), so that jetsam's
+	 * and the pageout daemon's levels count it.)
+	 */
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		vm_page_create((ppnum_t)atop(hakios_extra_ram[i].pa), (ppnum_t)atop(hakios_extra_ram[i].end));
+		/*
+		 * vm_page_bootstrap() counted every page of max_mem that was not free then as wired, these with them: they are
+		 * not (seen on the phone, 3 November: "wired" 1.1 GB up with them). As ml_static_mfree() says of its pages.
+		 */
+		vm_page_lockspin_queues();
+		vm_page_wire_count -= (unsigned int)atop(hakios_extra_ram[i].end - hakios_extra_ram[i].pa);
+		vm_page_wire_count_initial -= (unsigned int)atop(hakios_extra_ram[i].end - hakios_extra_ram[i].pa);
+		vm_page_unlock_queues();
+		printf("SWEET XRAM: 0x%llx..0x%llx (%llu MB) given to the VM\n", (unsigned long long)hakios_extra_ram[i].pa,
+		    (unsigned long long)hakios_extra_ram[i].end - 1,
+		    (unsigned long long)(hakios_extra_ram[i].end - hakios_extra_ram[i].pa) >> 20);
+	}
+	if (hakios_extra_ram_refused == (unsigned int)-1) {
+		printf("SWEET XRAM: refused, the window is at 0x%llx, not the redfin map's 0x100000000\n", (unsigned long long)gPhysBase);
+	} else if (hakios_extra_ram_refused != 0) {
+		printf("SWEET XRAM: %u ranges refused (the window's, or each other's)\n", hakios_extra_ram_refused);
+	}
+	if (hakios_extra_ram_count != 0) {
+		printf("SWEET XRAM: xram=%u %s: %u pages (%llu MB) in %u ranges beside the window 0x%llx + 0x%llx; max_mem 0x%llx\n",
+		    sweet_xram_tier, sweet_xram_venus == 0 ? "no venus" : sweet_xram_venus == 0x100 ?
+		    "venus by xram (0xa2600000-0xaca00000 + pil_video kept out)" :
+		    "venus by sweetvenus (0xa2600000-0xaca00000 + pil_video kept out)",
+		    hakios_extra_ram_pages, (unsigned long long)ptoa((uint64_t)hakios_extra_ram_pages) >> 20, hakios_extra_ram_count,
+		    (unsigned long long)gPhysBase, (unsigned long long)mem_size, (unsigned long long)max_mem);
+	}
 
 #if __ARM_KERNEL_PROTECT__
 	arm_vm_populate_kernel_el0_mappings();
@@ -1893,13 +2101,21 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 		max_mem_actual = memory_size;
 	} else {
 		max_mem_actual = mem_actual;
+		/* HakiOS (patch 1512): the boot loader's extra RAM beside the window (none with maxmem=) */
+		hakios_extra_ram_init();
+		mem_actual += ptoa((uint64_t)hakios_extra_ram_pages);
+		max_mem_actual += ptoa((uint64_t)hakios_extra_ram_pages);
 	}
 	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 2)) {
 		panic("Unsupported memory configuration %lx", mem_size);
 	}
 
 #if defined(ARM_LARGE_MEMORY)
-	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
+	/* (1054: the extra RAM, after the window in the aperture, plus a twig per range for alignment; 0 with xram=0) */
+	const uint64_t sweet_xram_va = hakios_extra_ram_count == 0 ? 0 :
+	    ptoa((uint64_t)hakios_extra_ram_pages) + (uint64_t)hakios_extra_ram_count * ARM_TT_TWIG_SIZE;
+	unsigned long physmap_l1_entries = ((real_phys_size + sweet_xram_va + ARM64_PHYSMAP_SLIDE_RANGE +
+	    ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
 	physmap_base = VM_MIN_KERNEL_ADDRESS - (physmap_l1_entries << ARM_TT_L1_SHIFT);
 #else
 	physmap_base = phystokv(args->topOfKernelData);
@@ -1924,9 +2140,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 	/* For large memory systems with no PPL such as virtual machines */
 	static_memory_end = phystokv(args->topOfKernelData);
 	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+	physmap_end += sweet_xram_va;        /* (1054: the extra RAM is in the aperture too; 0 with xram=0) */
 #else
 	static_memory_end = physmap_base + mem_size + ARM64_PHYSMAP_ALIGNMENT_PADDING; // worst possible case for block alignment
 	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+	/* (HakiOS, patch 1512: the extra RAM is in the aperture too) */
+	static_memory_end += ptoa((vm_map_address_t)hakios_extra_ram_pages);
+	physmap_end += ptoa((vm_map_address_t)hakios_extra_ram_pages);
 #endif // ARM_LARGE_MEMORY
 #endif
 
@@ -2252,6 +2472,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	sane_size = mem_size - (avail_start - gPhysBase);
 	max_mem = mem_size;
+	/* (HakiOS, patch 1512: the extra RAM counts as the VM's: it is given to it in arm_vm_prot_finalize()) */
+	sane_size += ptoa((uint64_t)hakios_extra_ram_pages);
+	max_mem += ptoa((uint64_t)hakios_extra_ram_pages);
 	vm_kernel_slid_base = segLOWESTTEXT;
 	// vm_kernel_slide is set by arm_init()->arm_slide_rebase_and_sign_image()
 	vm_kernel_stext = segTEXTB;

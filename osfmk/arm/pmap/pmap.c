@@ -1467,7 +1467,7 @@ pmap_set_xprr_perm(
 {
 	pvh_assert_locked(pai);
 
-	const vm_offset_t kva = phystokv(vm_first_phys + (pmap_paddr_t)ptoa(pai));
+	const vm_offset_t kva = phystokv(pai_to_pa(pai));
 	pt_entry_t * const ptep = pmap_pte(kernel_pmap, kva);
 
 	pmap_set_pte_xprr_perm(ptep, expected_perm, new_perm);
@@ -2685,7 +2685,8 @@ pmap_init(
 	 *	structures for pages we allocate to be page tables in
 	 *	pmap_expand().
 	 */
-	_vm_object_allocate(mem_size, pmap_object);
+	/* (HakiOS, patch 1512: page-table pages are kept at ptoa(pa_index(pa)), the extra RAM's after the window's) */
+	_vm_object_allocate(mem_size + ptoa((vm_object_size_t)hakios_extra_ram_pages), pmap_object);
 	pmap_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
 
 	/*
@@ -3927,7 +3928,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t 
 {
 #if __ARM_PTE_PHYSMAP__
 	pvh_assert_locked(pai);
-	vm_offset_t kva = phystokv(vm_first_phys + (pmap_paddr_t)ptoa(pai));
+	vm_offset_t kva = phystokv(pai_to_pa(pai));
 	pt_entry_t *pte_p = pmap_pte(kernel_pmap, kva);
 
 	pt_entry_t tmplate = *pte_p;
@@ -7441,6 +7442,12 @@ pmap_disconnect(
 boolean_t
 pmap_has_managed_page(ppnum_t first, ppnum_t last)
 {
+	/* HakiOS (patch 1512): the boot loader's extra RAM, below or above the window, is managed too */
+	for (unsigned int i = 0; i < hakios_extra_ram_count; i++) {
+		if ((ptoa(first) < hakios_extra_ram[i].end) && (ptoa(last) >= hakios_extra_ram[i].pa)) {
+			return TRUE;
+		}
+	}
 	if (ptoa(first) >= vm_last_phys) {
 		return FALSE;
 	}

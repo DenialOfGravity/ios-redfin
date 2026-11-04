@@ -527,6 +527,24 @@ extern pmap_paddr_t kvtophys_nofail(vm_offset_t va);
 extern vm_map_address_t phystokv(pmap_paddr_t pa);
 extern vm_map_address_t phystokv_range(pmap_paddr_t pa, vm_size_t *max_len);
 
+/*
+ * HakiOS (patch 1512): RAM the boot loader gives the kernel beside its window [gPhysBase, gPhysBase + memSize), in the
+ * device tree's /chosen "hakios-extra-ram" (pairs of 64-bit base and size). A phone whose RAM is in two banks (the
+ * Galaxy S9: 2 GB from 0x80000000 with the firmware's and the drivers' ranges in it, 2 GB from 0x880000000) has only
+ * one of them as the window; the free pieces of the other come here. arm_vm_init() reads them, maps them in the
+ * physical aperture (phystokv), and gives each page an index after the window's in the pmap's tables (pa_index); the
+ * pages go to the VM in arm_vm_prot_finalize(), as vm_page_create() pages (ml_static_mfree's way).
+ */
+#define HAKIOS_EXTRA_RAM_MAX 12
+typedef struct {
+	pmap_paddr_t pa;        /* the first byte, PAGE_SIZE aligned */
+	pmap_paddr_t end;       /* past the last byte, PAGE_SIZE aligned */
+	unsigned int pai;       /* the pmap's index (pa_index) of its first page */
+} hakios_extra_ram_t;
+extern hakios_extra_ram_t hakios_extra_ram[HAKIOS_EXTRA_RAM_MAX];
+extern unsigned int hakios_extra_ram_count;     /* ranges in use */
+extern unsigned int hakios_extra_ram_pages;     /* PAGE_SIZE pages in them all */
+
 extern vm_map_address_t pmap_map(vm_map_address_t va, vm_offset_t sa, vm_offset_t ea, vm_prot_t prot, unsigned int flags);
 extern vm_map_address_t pmap_map_high_window_bd( vm_offset_t pa, vm_size_t len, vm_prot_t prot);
 extern kern_return_t pmap_map_block(pmap_t pmap, addr64_t va, ppnum_t pa, uint32_t size, vm_prot_t prot, int attr, unsigned int flags);
