@@ -1,4 +1,4 @@
-From 67e8219515fcb754818ea10f9e86f8cf9203e3c9 Mon Sep 17 00:00:00 2001
+From 70105b9cb602680485282783f923579bcfcbf53a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 4 Nov 2026 20:48:07 +0000
 Subject: [PATCH] 1054 redfin: low-bank RAM to the VM behind boot-arg xram
@@ -13,7 +13,8 @@ pil_cdsp, 499.7 MB. With sweetvenus != 0 (1057) 0xa2600000-0xaca00000 and
 pil_video stay out (295.7 / 330.7 MB). Default 0 = as before: ptov_table,
 the physmap padding and sizing are unchanged; the extra aperture entries
 live in their own table, and every new path loops over zero ranges.
-Only when the window is at 0x100000000.
+xram=3 / xram=4 = 1 / 2 with the Venus ranges out (no room for sweetvenus=
+on the rk5a cmdline). Only when the window is at 0x100000000.
 
 Mechanism from Scion-Project/hackios-xnu-kernel PR 179 (patch 1512,
 credited): pmap indices after the window's, aperture entries, vm_page_create()
@@ -27,8 +28,8 @@ Klog: "SWEET XRAM: 0x..-0x.. (N MB) given to the VM" per range and
  osfmk/arm/pmap/pmap.h      |  18 +++
  osfmk/arm/pmap/pmap_data.c |   9 +-
  osfmk/arm/pmap/pmap_data.h |  35 +++++-
- osfmk/arm64/arm_vm_init.c  | 224 ++++++++++++++++++++++++++++++++++++-
- 6 files changed, 306 insertions(+), 13 deletions(-)
+ osfmk/arm64/arm_vm_init.c  | 233 ++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 315 insertions(+), 13 deletions(-)
 
 diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
 index b5b3ba9..fd335b6 100644
@@ -234,10 +235,10 @@ index 2883f63..7218e6f 100644
  extern pv_entry_t **pv_head_table;
  
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index cd7cc4c..f42f622 100644
+index cd7cc4c..1db05ee 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -364,8 +364,128 @@ typedef struct {
+@@ -364,8 +364,135 @@ typedef struct {
  
  #define PTOV_TABLE_SIZE 8
  SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
@@ -272,7 +273,8 @@ index cd7cc4c..f42f622 100644
 + * Default 0: no extra RAM, as before.
 + * With boot-arg sweetvenus non-zero (the video track, 1057: Venus queues at 0xa2600000, buffer window 0xa2a00000 +
 + * 160 MB, firmware in pil_video) the ranges marked venus are left out: 0xa2600000-0xaca00000 and pil_video
-+ * (xram=1 295.7 MB, xram=2 330.7 MB).
++ * (xram=1 295.7 MB, xram=2 330.7 MB). xram=3 / xram=4 = xram=1 / xram=2 with the Venus ranges left out too, for a
++ * cmdline with no room for sweetvenus= (Venus then switched on live with kern.sweet_venus).
 + */
 +static const struct { uint64_t pa, end; unsigned int tier; bool venus; } sweet_xram_ranges[] = {
 +	{ 0x084400000ULL, 0x086000000ULL, 1, false },   /* 28 MB, between qtee_apps and pil_camera */
@@ -301,6 +303,12 @@ index cd7cc4c..f42f622 100644
 +	sweet_xram_tier = tier;
 +	if (!PE_parse_boot_argn("sweetvenus", &sweet_xram_venus, sizeof(sweet_xram_venus))) {
 +		sweet_xram_venus = 0;
++	}
++	if (tier >= 3) {                /* 3 = 1, 4 = 2, both without the Venus ranges */
++		tier -= 2;
++		if (sweet_xram_venus == 0) {
++			sweet_xram_venus = 0x100;       /* (kept out because of xram=3/4, not the boot-arg) */
++		}
 +	}
 +	/* only on the redfin map: the window above 4 GiB (otherwise these ranges could be the window's or no RAM at all) */
 +	if (gPhysBase != 0x100000000ULL) {
@@ -366,7 +374,7 @@ index cd7cc4c..f42f622 100644
  
  vm_map_address_t
  phystokv(pmap_paddr_t pa)
-@@ -376,6 +496,11 @@ phystokv(pmap_paddr_t pa)
+@@ -376,6 +503,11 @@ phystokv(pmap_paddr_t pa)
  			return pa - ptov_table[i].pa + ptov_table[i].va;
  		}
  	}
@@ -378,7 +386,7 @@ index cd7cc4c..f42f622 100644
  	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
  		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
  		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
-@@ -397,6 +522,15 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
+@@ -397,6 +529,15 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
  			return pa - ptov_table[i].pa + ptov_table[i].va;
  		}
  	}
@@ -394,7 +402,7 @@ index cd7cc4c..f42f622 100644
  	len = PAGE_SIZE - (pa & PAGE_MASK);
  	if (*max_len > len) {
  		*max_len = len;
-@@ -416,6 +550,11 @@ ml_static_vtop(vm_offset_t va)
+@@ -416,6 +557,11 @@ ml_static_vtop(vm_offset_t va)
  			return va - ptov_table[i].va + ptov_table[i].pa;
  		}
  	}
@@ -406,7 +414,7 @@ index cd7cc4c..f42f622 100644
  	if (__improbable((va < gVirtBase) || (((vm_address_t)(va) - gVirtBase) >= gPhysSize))) {
  		panic("%s: illegal VA: %p; virt base 0x%llx, size 0x%llx", __func__,
  		    (void*)va, (unsigned long long)gVirtBase, (unsigned long long)gPhysSize);
-@@ -996,7 +1135,9 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+@@ -996,7 +1142,9 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
  		va &= ~ARM_TT_L2_OFFMASK;
  		pa = va - gVirtBase + gPhysBase - pa_offset;
  
@@ -417,7 +425,7 @@ index cd7cc4c..f42f622 100644
  			return;
  		}
  
-@@ -1023,10 +1164,10 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+@@ -1023,10 +1171,10 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
  		}
  
  		vm_offset_t len = _end - va;
@@ -430,7 +438,7 @@ index cd7cc4c..f42f622 100644
  
  		/* Round up to the nearest PAGE_SIZE boundary when creating mappings:
  		 * PAGE_SIZE may be a multiple of ARM_PGBYTES, and we don't want to leave
-@@ -1117,7 +1258,7 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
+@@ -1117,7 +1265,7 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
  
  			tte2 = arm_kva_to_tte(align_start);
  
@@ -439,7 +447,7 @@ index cd7cc4c..f42f622 100644
  				tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
  				    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX
  				    | ARM_TTE_BLOCK_AP(pte_prot_APX) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)
-@@ -1603,6 +1744,33 @@ arm_vm_physmap_init(boot_args *args)
+@@ -1603,6 +1751,33 @@ arm_vm_physmap_init(boot_args *args)
  	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
  	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
  
@@ -473,7 +481,7 @@ index cd7cc4c..f42f622 100644
  	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
  
  	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
-@@ -1652,6 +1820,37 @@ arm_vm_prot_finalize(boot_args * args __unused)
+@@ -1652,6 +1827,39 @@ arm_vm_prot_finalize(boot_args * args __unused)
  	arm64_replace_bootstack(&BootCpuData);
  	ml_static_mfree(phystokv(segBOOTDATAB - gVirtBase + gPhysBase), segSizeBOOTDATA);
  
@@ -503,7 +511,9 @@ index cd7cc4c..f42f622 100644
 +	}
 +	if (hakios_extra_ram_count != 0) {
 +		printf("SWEET XRAM: xram=%u %s: %u pages (%llu MB) in %u ranges beside the window 0x%llx + 0x%llx; max_mem 0x%llx\n",
-+		    sweet_xram_tier, sweet_xram_venus ? "venus (0xa2600000-0xaca00000 + pil_video kept out)" : "no venus",
++		    sweet_xram_tier, sweet_xram_venus == 0 ? "no venus" : sweet_xram_venus == 0x100 ?
++		    "venus by xram (0xa2600000-0xaca00000 + pil_video kept out)" :
++		    "venus by sweetvenus (0xa2600000-0xaca00000 + pil_video kept out)",
 +		    hakios_extra_ram_pages, (unsigned long long)ptoa((uint64_t)hakios_extra_ram_pages) >> 20, hakios_extra_ram_count,
 +		    (unsigned long long)gPhysBase, (unsigned long long)mem_size, (unsigned long long)max_mem);
 +	}
@@ -511,7 +521,7 @@ index cd7cc4c..f42f622 100644
  #if __ARM_KERNEL_PROTECT__
  	arm_vm_populate_kernel_el0_mappings();
  #endif /* __ARM_KERNEL_PROTECT__ */
-@@ -1893,13 +2092,21 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1893,13 +2101,21 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  		max_mem_actual = memory_size;
  	} else {
  		max_mem_actual = mem_actual;
@@ -534,7 +544,7 @@ index cd7cc4c..f42f622 100644
  	physmap_base = VM_MIN_KERNEL_ADDRESS - (physmap_l1_entries << ARM_TT_L1_SHIFT);
  #else
  	physmap_base = phystokv(args->topOfKernelData);
-@@ -1924,9 +2131,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1924,9 +2140,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	/* For large memory systems with no PPL such as virtual machines */
  	static_memory_end = phystokv(args->topOfKernelData);
  	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
@@ -548,7 +558,7 @@ index cd7cc4c..f42f622 100644
  #endif // ARM_LARGE_MEMORY
  #endif
  
-@@ -2252,6 +2463,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2252,6 +2472,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  	sane_size = mem_size - (avail_start - gPhysBase);
  	max_mem = mem_size;
