@@ -1799,6 +1799,35 @@ sysctl_sweet_vsync_lock SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, sweet_vsync_lock, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_vsync_lock, "I", "SWEET FB: vsync ticks + IOMFBDisplayRefresh on the measured panel period (0995 mask 7)");
 
+/*
+ * redfin 1049: kern.sweet_vsyncphase US (0 = off, default; boot-arg sweetvsyncphase): vsync ticks US us before CA's
+ * display-link grid (Yofuness 0274/0275, sunfish 5000), kern.sweet_vsyncphase_grid 0 auto | Hz (<= 1000) | ns: the grid
+ * (iokit/Kernel/arm/SweetFramebuffer.cpp, vsyncPhaseNext). Live from the next tick.
+ */
+extern uint32_t sweet_vsyncphase, sweet_vsyncphase_grid;
+static int
+sysctl_sweet_vsyncphase SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg2)
+	uint32_t *var = (uint32_t *)arg1;
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, (int)*var, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 100000000) {
+		return EINVAL;
+	}
+	*var = (uint32_t)value;
+	printf("SWEET FB: %s %d (1049: vsync phase %u us, grid %u: 0 auto, <= 1000 Hz, else ns)\n", oidp->oid_name, value,
+	    sweet_vsyncphase, sweet_vsyncphase_grid);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    &sweet_vsyncphase, 0, sysctl_sweet_vsyncphase, "I", "SWEET FB: vsync ticks US before CA's display-link grid (0 off)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase_grid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    &sweet_vsyncphase_grid, 0, sysctl_sweet_vsyncphase, "I", "SWEET FB: 1049 grid: 0 auto, <= 1000 Hz, else ns");
+
 /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
 
 #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */

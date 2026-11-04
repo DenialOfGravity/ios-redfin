@@ -212,6 +212,22 @@ static uint32_t sweet_vlock, sweet_vlock_old_vsync, sweet_vlock_old_refresh;
 static bool sweet_vlock_published;
 static uint32_t sweet_vlock_ticks, sweet_vlock_ok, sweet_vlock_late, sweet_vlock_lost, sweet_vlock_driftN;
 static uint64_t sweet_vlock_drift_abs, sweet_vlock_drift_max;
+/*
+ * redfin 1049 (Yofuness 0274/0275): kern.sweet_vsyncphase US / boot-arg sweetvsyncphase=US (default 0 = off, as before).
+ * Apps' CADisplayLinks fire on a fixed grid of CA's heartbeat period from mach time 0 (no frame-info presentation time);
+ * with ticks free on the panel's edges that grid lands anywhere in the frame, and where it falls just before backboardd's
+ * render gate edge commits miss it (on sunfish ~30 % of frames skipped at 12.5-14.8 ms after the tick). On: each tick
+ * goes US us before a grid point (k * grid - US), so the display link fires US us after the tick; 0944/0946's panel-edge
+ * phasing (sweetfbx 0x4) is left out while on (it comes back at the next tick after 0), and the notifications carry
+ * the grid period. Sunfish runs 5000. Grid: kern.sweet_vsyncphase_grid / boot-arg sweetvsyncphasegrid, 0 (default) =
+ * IOMFBDisplayRefresh's period when published (0995/1042, CA takes it without CA_HEARTBEAT_RATE), else 1 s / panel Hz
+ * (CA_HEARTBEAT_RATE=90); 1..1000 = that rate in Hz, > 1000 = that period in ns. Both live (bsd/dev/sweet_gpu.c).
+ * Line every 5 s while on: SWEET FB: vsync phase 5s: ... ticks .. | wake late avg/max.
+ */
+extern "C" uint32_t sweet_vsyncphase, sweet_vsyncphase_grid;
+uint32_t sweet_vsyncphase = 5000, sweet_vsyncphase_grid;	/* default 5000 since 2026-11-05 (sweetvsyncphase=0 = off) */
+static uint32_t sweet_vphase_ticks;
+static uint64_t sweet_vphase_late_abs, sweet_vphase_late_max;
 #define SWEET_VSYNC_CRIT        0x1
 #define SWEET_VSYNC_CAL         0x2
 #define SWEET_VSYNC_PERIOD      0x4
@@ -371,6 +387,9 @@ public:
 	void          vsyncCmd(const char *s, const char *end);
 	int           vsyncLock(int on);             /* 1042 */
 	void          vsyncLockLine(void);
+	uint64_t      fPhasePeriodAbs;              /* 1049: the grid period of the last phased tick */
+	uint64_t      vsyncPhaseNext(uint64_t now);
+	void          vsyncPhaseLine(void);
 	bool          presentCPU(const uint8_t *rec);
 	uintptr_t     cpuBuffer(uint64_t pa);
 	uintptr_t     cpuSource(SweetSurface *s);       /* 0978 */
@@ -839,6 +858,12 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("sweetswapdone", &sweet_swapdone, sizeof(sweet_swapdone));      /* 0987 */
 	PE_parse_boot_argn("sweetvsync", &sweet_vsync, sizeof(sweet_vsync));      /* 0995 */
 	PE_parse_boot_argn("sweetvsync_lead", &sweet_vsync_lead, sizeof(sweet_vsync_lead));
+	PE_parse_boot_argn("sweetvsyncphase", &sweet_vsyncphase, sizeof(sweet_vsyncphase));             /* 1049 */
+	PE_parse_boot_argn("sweetvsyncphasegrid", &sweet_vsyncphase_grid, sizeof(sweet_vsyncphase_grid));
+	if (sweet_vsyncphase || sweet_vsyncphase_grid) {
+		IOLog("SWEET FB: vsync phase %u us, grid %u (1049: ticks US before CA's display-link grid; grid 0 auto, "
+		    "<= 1000 Hz, else ns)\n", sweet_vsyncphase, sweet_vsyncphase_grid);
+	}
 	PE_parse_boot_argn("sweetfb_refresh", &sweet_fb_refresh, sizeof(sweet_fb_refresh));
 	if (sweet_fbx & SWEET_FBX_VSYNC) {
 		sweet_vsync |= SWEET_VSYNC_CRIT | SWEET_VSYNC_CAL;     /* 0995: sweetfbx 0x10 (the cmdline is nearly full) */
@@ -974,12 +999,26 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		nanoseconds_to_absolutetime(fb->fHz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL, &fb->fVsyncAbs);
 		fb->fNextVsync = now;
 	}
+	if (sweet_vsyncphase != 0 && fb->fPhasePeriodAbs != 0) {
+		/* 1049: how late this tick woke after its grid deadline */
+		uint64_t late = now > fb->fNextVsync ? now - fb->fNextVsync : 0;
+		sweet_vphase_ticks++;
+		sweet_vphase_late_abs += late;
+		if (late > sweet_vphase_late_max) {
+			sweet_vphase_late_max = late;
+		}
+	}
 	fb->fNextVsync += fb->fVsyncAbs;
 	if (fb->fNextVsync <= now) {
 		fb->fNextVsync = now + fb->fVsyncAbs;
 	}
-	if (sweet_fbx & SWEET_FBX_SWAPQ) {
+	if (sweet_vsyncphase != 0) {
+		fb->fNextVsync = fb->vsyncPhaseNext(now);	/* 1049: US before CA's grid, not on the panel's edges */
+	} else if (sweet_fbx & SWEET_FBX_SWAPQ) {
+		fb->fPhasePeriodAbs = 0;
 		fb->phaseTick(now);	/* 0944: the next tick just after a TE */
+	} else {
+		fb->fPhasePeriodAbs = 0;
 	}
 	if (sweet_vsync & SWEET_VSYNC_CRIT) {
 		sender->wakeAtTime(kIOTimeOptionsSweetCritical, fb->fNextVsync, 0);    /* 0995: no coalescing slop */
@@ -1097,6 +1136,9 @@ void
 AppleCLCD::sendVsync(uint64_t count, uint64_t now)
 {
 	uint64_t period = (sweet_vsync & SWEET_VSYNC_PERIOD) && fFcPeriod != 0 ? fFcPeriod : fVsyncAbs;     /* 0995 */
+	if (sweet_vsyncphase != 0 && fPhasePeriodAbs != 0) {
+		period = fPhasePeriodAbs;       /* 1049: the grid the ticks are on */
+	}
 	uint64_t values[6] = {
 		(uint32_t)count, (uint32_t)(count >> 32),
 		(uint32_t)now, (uint32_t)(now >> 32),
@@ -1599,6 +1641,11 @@ AppleCLCD::statLine(uint64_t now)
 		vsyncLockLine();        /* 1042 */
 		IOLockLock(fLock);
 	}
+	if (sweet_vsyncphase) {
+		IOLockUnlock(fLock);
+		vsyncPhaseLine();       /* 1049 */
+		IOLockLock(fLock);
+	}
 	fStBlitqAbs = 0;
 	bzero(fStBucket, sizeof(fStBucket));
 	bzero(fStHist, sizeof(fStHist));
@@ -1935,6 +1982,63 @@ AppleCLCD::vsyncLockLine(void)
 	    "drift corrected %u x avg %llu us max %llu us | dead %d\n", pns, pns ? 1000000000000ULL / pns / 1000 : 0,
 	    pns ? 1000000000000ULL / pns % 1000 : 0, rns, ticks, ok, late, lost, dn, dn ? dsum / 1000 / dn : 0, dmax / 1000,
 	    fFcDead ? 1 : 0);
+}
+
+/*
+ * 1049: the first point of CA's display-link grid minus sweet_vsyncphase us that is at least half a grid period after
+ * NOW (a late wake skips no grid point and two ticks never come closer than half a period). Exact in ns: the grid
+ * period is num / den ns (1 s / 90 is not a whole number of ns, nor of 19.2 MHz ticks).
+ */
+uint64_t
+AppleCLCD::vsyncPhaseNext(uint64_t now)
+{
+	uint32_t g = sweet_vsyncphase_grid;
+	uint64_t num, den, t, pns, at;
+	if (g > 1000) {
+		num = g;
+		den = 1;
+	} else if (g > 0) {
+		num = NSEC_PER_SEC;
+		den = g;
+	} else if (fRefreshNs != 0) {
+		num = fRefreshNs;
+		den = 1;
+	} else {
+		num = NSEC_PER_SEC;
+		den = fHz == 90 ? 90 : 60;
+	}
+	uint64_t per = num / den;
+	if (per < 1000000 || per > 100000000) {         /* outside 10..1000 Hz: the nominal panel rate */
+		num = NSEC_PER_SEC;
+		den = fHz == 90 ? 90 : 60;
+		per = num / den;
+	}
+	pns = ((uint64_t)sweet_vsyncphase * 1000) % per;
+	absolutetime_to_nanoseconds(now, &t);
+	t += per / 2;
+	uint64_t k = ((t + pns) * den + num - 1) / num;
+	nanoseconds_to_absolutetime(k * num / den - pns, &at);
+	nanoseconds_to_absolutetime(per, &fPhasePeriodAbs);
+	if (at <= now) {
+		at = now + fPhasePeriodAbs;
+	}
+	return at;
+}
+
+/* 1049: from statLine, every 5 s while sweet_vsyncphase is on */
+void
+AppleCLCD::vsyncPhaseLine(void)
+{
+	uint64_t pns = 0, lsum = 0, lmax = 0;
+	absolutetime_to_nanoseconds(fPhasePeriodAbs, &pns);
+	absolutetime_to_nanoseconds(sweet_vphase_late_abs, &lsum);
+	absolutetime_to_nanoseconds(sweet_vphase_late_max, &lmax);
+	uint32_t n = sweet_vphase_ticks;
+	sweet_vphase_ticks = 0;
+	sweet_vphase_late_abs = sweet_vphase_late_max = 0;
+	IOLog("SWEET FB: vsync phase 5s: %u us before a %llu ns grid (grid %u, refresh %llu ns, panel %u Hz) | ticks %u | "
+	    "wake late avg %llu us max %llu us\n", sweet_vsyncphase, pns, sweet_vsyncphase_grid, fRefreshNs, fHz, n,
+	    n ? lsum / 1000 / n : 0, lmax / 1000);
 }
 
 extern "C" int sweet_fb_vsync_lock(int on);
