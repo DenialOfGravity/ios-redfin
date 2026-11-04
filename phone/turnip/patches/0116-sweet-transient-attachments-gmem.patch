@@ -59,7 +59,7 @@ index 5e62b07..154cb22 100644
      * the autotuner (which keeps fetching passes in GMEM). On redfin (A620, 22 bins of 576x224 for CA's 1125x2436
      * BGRA frame) a full-screen CA pass took 4.8 ms in sysmem against 5.6 ms in GMEM (r33a, TU_DEBUG=sysmem). 0 = off. */
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index 9cb7703..ff40abf 100644
+index 9cb7703..4811c6a 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -269,6 +269,19 @@ darwin_free_iova(struct tu_device *dev, uint64_t iova, uint64_t size)
@@ -70,7 +70,7 @@ index 9cb7703..ff40abf 100644
 + * memory (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, darwin_sparse_vma_init) and lets a pass whose transient attachment has no memory
 + * yet render in GMEM even with TU_DEBUG=sysmem (use_sysmem_rendering): Metal's memoryless textures (CA's scratch colour 1) then take
 + * no memory, where today each is a new 32-112 MiB image allocation wired page by page. Unset or 0: as before (no lazy type). */
-+int
++static int
 +sweet_tu_transient(void)
 +{
 +   static int mode = -1;
