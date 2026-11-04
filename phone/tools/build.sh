@@ -37,3 +37,5 @@ build a2s a2s.c
 build sweetmon sweetmon.c lz4/lz4.c -DSWEETMON_VERSION="\"$(git rev-parse --short HEAD 2>/dev/null || date +%F)\""
 build imgdump imgdump.c -lobjc
 ls -l out
+# Venus hardware video (redfin track V, off unless /var/local/venus.on): its own build, copies into the userland output
+sh ../video/build.sh || echo "WARN phone/video build failed"

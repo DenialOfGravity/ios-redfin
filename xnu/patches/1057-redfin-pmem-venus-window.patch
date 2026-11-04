@@ -1,0 +1,221 @@
+From 393bb50664348a19e9db3aae38892e1dfa4547a4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 22:47:25 +0000
+Subject: [PATCH] 1057 redfin: /dev/pmem maps the Venus buffer window in one
+ piece, sweetvenus (default 0 = off)
+
+Track V (hardware video decode), kernel side of the port of Yofuness/ios-flame's
+Venus stack (their 0277 write-combined + 0278 cached window, sunfish). Venus
+decodes into a buffer window of free low-bank RAM below 4 GB; venusd copies each
+decoded frame (3.1 MB at 1080p NV12) out through /dev/pmem, which maps such RAM
+as 2 MB device windows with 32-bit accesses (~14 MB/s on sunfish).
+
+Window 0xa2a00000 + 160 MB (queue block below at 0xa2600000, on device windows
+as before). Boot-arg sweetvenus and RW sysctl kern.sweet_venus: 0 (default) =
+unchanged behaviour, 1 = one write-combined mapping, 2 = one cacheable mapping
+with DC CIVAC before reads and after writes. A sysctl change drops the old
+mapping and any device window over the range, so the memory types never alias.
+
+Guard (any mode): pmem reads/writes in 0xa2600000-0xaca00000 are refused (EPERM,
+logged once) when the RAM there is XNU's (pmap_valid_address), e.g. given to the
+VM by an extra-RAM option (1054 xram=1 covers 0xa2400000-0xb7e00000): Venus
+must not DMA into VM pages. A no-op today.
+
+Klog: "SWEET PMEM: /dev/pmem ready (major N), Venus window device (sweetvenus=0)
+| write-combined | cached+maintenance"; "SWEET PMEM: Venus window ... mapped ...".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC13WDmBSsHUCcqWn9b
+---
+ bsd/dev/sweet_pmem.c | 120 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 119 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index d405964..693a064 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -19,6 +19,20 @@
+  *   ioctl PMEM_RPMH    one RPMh active vote: resource name, 1-4 (offset, value) commands
+  *                      (ARC levels, VRM rails; bsd/dev/sweet_rpmh.c)
+  *
++ * 1057 (redfin track V, Venus video decode; Yofuness/ios-flame 0277 + 0278 for
++ * sunfish): the Venus buffer window 0xa2a00000 + 160 MB (free low-bank RAM
++ * below 4 GB, outside XNU's window at 0x100000000) is read and written through
++ * ONE mapping with any offset and length, instead of 2 MB device windows with
++ * 32-bit accesses (~14 MB/s: a 1080p NV12 frame is 3.1 MB). Boot-arg and RW
++ * sysctl kern.sweet_venus: 0 (default) = as before (device windows), 1 =
++ * write-combined (uncached: no maintenance), 2 = cacheable with DC CIVAC around
++ * each read and write. A change takes effect at the next access (the mapping
++ * and device windows over the range are dropped). The queue block below
++ * (0xa2600000-0xa2901000) stays on device windows: firmware and host poll it.
++ * Guard, any mode: reads/writes into 0xa2600000-0xaca00000 are refused (EPERM,
++ * logged once) when that RAM is XNU's (pmap_valid_address: e.g. given to the
++ * VM by an extra-RAM option such as 1054's xram=1): Venus must not DMA there.
++ *
+  * Userland side: work/userland/gpu/pmem.h (same structs and numbers).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -29,6 +43,7 @@
+ #include <sys/ioccom.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
++#include <sys/sysctl.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+@@ -79,6 +94,9 @@ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets
+ 
+ #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+ #define PMEM_WIN        0x200000ULL
++#define PM_VQ_PA        0xa2600000ULL   /* 1057: Venus queue block (venusd's default --phys), device windows */
++#define PM_VEN_PA       0xa2a00000ULL   /* 1057: Venus buffer window, 2 MB aligned past the queue block's windows */
++#define PM_VEN_LEN      0x0a000000ULL   /* 160 MB, to 0xaca00000 */
+ 
+ static struct {
+ 	vm_offset_t va;
+@@ -90,6 +108,10 @@ static struct {
+ } pm_map[PMEM_MAPS];
+ static unsigned pm_map_next;
+ static uint32_t pm_bounce[PAGE_SIZE / 4];
++static int pm_venus;                    /* 1057: kern.sweet_venus / boot-arg sweetvenus: 0 device, 1 WC, 2 cached */
++static int pm_ven_mapped;               /* the mode pm_ven_va was mapped with (0: none) */
++static vm_offset_t pm_ven_va;
++static bool pm_ven_guard_said;
+ 
+ static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
+ static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
+@@ -109,6 +131,9 @@ pm_io(uint64_t pa)
+ 			return (volatile uint32_t *)(pm_map[i].va + (pa - win));
+ 		}
+ 	}
++	if (pm_venus && pa >= PM_VEN_PA && pa < PM_VEN_PA + PM_VEN_LEN) {
++		return NULL;    /* 1057: never a device alias of the Venus window while it has its own mapping */
++	}
+ 	unsigned i = pm_map_next++ % PMEM_MAPS;
+ 	if (pm_map[i].va) {
+ 		ml_io_unmap(pm_map[i].va, PMEM_WIN);
+@@ -118,6 +143,41 @@ pm_io(uint64_t pa)
+ 	return pm_map[i].va ? (volatile uint32_t *)(pm_map[i].va + (pa - win)) : NULL;
+ }
+ 
++/*
++ * 1057: the Venus window's single mapping in the current mode (caller holds
++ * sweet_pmem_lock). A mode change drops the old mapping and every device
++ * window over the range first: no two mappings of one page with different
++ * memory types.
++ */
++static vm_offset_t
++pm_ven_map(void)
++{
++	if (pm_ven_va && pm_ven_mapped == pm_venus) {
++		return pm_ven_va;
++	}
++	if (pm_ven_va) {
++		ml_io_unmap(pm_ven_va, PM_VEN_LEN);
++		pm_ven_va = 0;
++		pm_ven_mapped = 0;
++	}
++	for (unsigned i = 0; i < PMEM_MAPS; i++) {
++		if (pm_map[i].va && pm_map[i].win + PMEM_WIN > PM_VEN_PA && pm_map[i].win < PM_VEN_PA + PM_VEN_LEN) {
++			ml_io_unmap(pm_map[i].va, PMEM_WIN);
++			pm_map[i].va = 0;
++		}
++	}
++	if (!pm_venus) {
++		return 0;
++	}
++	pm_ven_va = ml_io_map_unmappable((vm_offset_t)PM_VEN_PA, PM_VEN_LEN, pm_venus == 2 ? VM_WIMG_DEFAULT : VM_WIMG_WCOMB);
++	if (pm_ven_va) {
++		pm_ven_mapped = pm_venus;
++		printf("SWEET PMEM: Venus window 0x%llx+%llu MB mapped %s\n", PM_VEN_PA, PM_VEN_LEN >> 20,
++		    pm_venus == 2 ? "cacheable (DC CIVAC around accesses)" : "write-combined");
++	}
++	return pm_ven_va;
++}
++
+ static int
+ pm_rw(struct uio *uio, bool write)
+ {
+@@ -127,6 +187,36 @@ pm_rw(struct uio *uio, bool write)
+ 		uint64_t pa = (uint64_t)uio_offset(uio);
+ 		uint64_t off = pa & PAGE_MASK;
+ 		unsigned n = (unsigned)MIN((user_ssize_t)(PAGE_SIZE - off), uio_resid(uio));
++		if (pa >= PM_VQ_PA && pa < PM_VEN_PA + PM_VEN_LEN && pmap_valid_address(pa)) {
++			if (!pm_ven_guard_said) {
++				pm_ven_guard_said = true;
++				printf("SWEET PMEM: refused 0x%llx: the Venus range 0x%llx-0x%llx is XNU's RAM here (extra RAM"
++				    " given to the VM?): no Venus buffers there\n", pa, PM_VQ_PA, PM_VEN_PA + PM_VEN_LEN);
++			}
++			err = EPERM;
++			break;
++		}
++		if (pm_venus && pa >= PM_VEN_PA && pa + n <= PM_VEN_PA + PM_VEN_LEN) {
++			vm_offset_t base = pm_ven_map();
++			if (!base) {
++				err = ENOMEM;
++				break;
++			}
++			caddr_t va = (caddr_t)(base + (pa - PM_VEN_PA));
++			if (pm_venus == 2) {
++				if (!write) {
++					flush_dcache((vm_offset_t)va, n, FALSE);        /* DC CIVAC: drop lines older than the DMA */
++				}
++				err = uiomove(va, (int)n, uio);
++				if (write) {
++					flush_dcache((vm_offset_t)va, n, FALSE);        /* to the point of coherency for Venus */
++				}
++			} else {
++				err = uiomove(va, (int)n, uio);
++				__asm__ volatile ("dsb osh" ::: "memory");
++			}
++			continue;
++		}
+ 		if (pmap_valid_address(pa)) {
+ 			caddr_t va = (caddr_t)phystokv(pa);
+ 			flush_dcache64((addr64_t)pa, n, TRUE);
+@@ -358,6 +448,30 @@ static const struct cdevsw sweet_pmem_cdevsw = {
+ 	.d_type       = 0,
+ };
+ 
++/* 1057: kern.sweet_venus, 0 device windows (default), 1 write-combined, 2 cached + DC CIVAC */
++static int
++sysctl_sweet_venus SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, pm_venus, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 2) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_pmem_lock);
++	pm_venus = value;
++	(void)pm_ven_map();     /* drops the old mapping/device aliases; maps the new mode */
++	lck_mtx_unlock(&sweet_pmem_lock);
++	printf("SWEET PMEM: kern.sweet_venus %d (Venus window %s)\n", value,
++	    value == 2 ? "cached" : value == 1 ? "write-combined" : "device windows");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_venus, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_venus, "I", "SWEET /dev/pmem Venus buffer window: 0 device, 1 write-combined, 2 cached");
++
+ void
+ sweet_pmem_init(void)
+ {
+@@ -372,6 +486,10 @@ sweet_pmem_init(void)
+ 		return;
+ 	}
+ 	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "pmem");
+-	printf("SWEET PMEM: /dev/pmem ready (major %d)\n", major);
++	if (PE_parse_boot_argn("sweetvenus", &pm_venus, sizeof(pm_venus)) && (pm_venus < 0 || pm_venus > 2)) {
++		pm_venus = 0;   /* 1057 */
++	}
++	printf("SWEET PMEM: /dev/pmem ready (major %d), Venus window %s\n", major,
++	    pm_venus == 2 ? "cached+maintenance" : pm_venus ? "write-combined" : "device (sweetvenus=0)");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0
+

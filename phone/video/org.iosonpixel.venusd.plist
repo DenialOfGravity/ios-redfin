@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- org.iosonpixel.venusd (redfin track V; Yofuness/ios-flame tools/venusd.plist): /System/Library/LaunchDaemons/
+     org.iosonpixel.venusd.plist in the launchd.plist cache. Not installed by default. Off unless /var/local/venus.on
+     exists: venusd exits 0 at start without it (not restarted), and KeepAlive's PathState starts it when the file
+     appears (if this launchd honours PathState; otherwise at the next boot). Restarted after a crash or kill. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.iosonpixel.venusd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/venusd</string>
+		<string>--log</string>
+		<string>/var/local/venusd.log</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>PathState</key>
+		<dict>
+			<key>/var/local/venus.on</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<!-- Interactive: with launchd's default class venusd's 1 ms waits stretched ~14x (timer coalescing) on sunfish -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
