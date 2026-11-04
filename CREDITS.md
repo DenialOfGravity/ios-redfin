@@ -24,6 +24,12 @@ what you need to fetch yourself.
   were written from the redbull kernel's `sound/soc/codecs/cs35l41*.c`, `rt5514.c`, `rl6231.c` and
   `techpack/audio` (GPL-2.0; LineageOS android_kernel_google_redbull) and the phone's device tree.
 
+- **ios-flame, sunfish branch** (Yofuness, <https://github.com/Yofuness/ios-flame>, MIT, same licence as this
+  repository): `phone/video/` (venusctl, venusd, venusc, venus_core/h264/hevc, the VideoToolbox plug-in vtvenus,
+  vtdecode, smmu.c, pmem.c) is their Venus video stack at 598ba5b (phone/wifi/venus*, phone/video/vtvenus.c,
+  phone/tools/vtdecode.m), with the SM7250 (lito) numbers in `venus_core.c`'s header. Patch 1057 is their xnu
+  0277/0278 (Venus window write-combined / cached) rewritten for this kernel and memory map.
+
 - **ios-sweet** (dipa-studio, <https://github.com/dipa-studio/ios-sweet>, MIT): the XNU port to the Redmi
   Note 10 Pro this is forked from. Patches 0001-0081, the shim and most of `tools/` started there.
 - **XNU** (Apple, APSL 2.0): xnu-8796.141.3.
