@@ -42,6 +42,7 @@ struct flame_wlan_bss {
 void (*flame_wlan_ready_hook)(void);
 void (*flame_wlan_rx_hook)(const uint8_t *frame, size_t length);
 void (*flame_wlan_link_hook)(bool up);
+extern void redwood_apple80211_signal(int rssi, unsigned tx_rate);       /* redfin 1051 */
 
 static LCK_GRP_DECLARE(fw_grp, "flame-wlan");
 static LCK_MTX_DECLARE(fw_lock, &fw_grp);
@@ -400,6 +401,22 @@ fw_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		lck_mtx_unlock(&fw_lock);
 		if (changed && flame_wlan_link_hook != NULL) {
 			flame_wlan_link_hook(up);
+		}
+		break;
+	}
+	case FW_RSSI: {                         /* redfin 1051: the joined network's signal */
+		struct fw_rssi q;
+		bool ours;
+
+		if (h.len < sizeof(q)) {
+			return EINVAL;
+		}
+		memcpy(&q, p, sizeof(q));
+		lck_mtx_lock(&fw_lock);
+		ours = fw_link_up && memcmp(q.bssid, fw_link.bssid, 6) == 0;
+		lck_mtx_unlock(&fw_lock);
+		if (ours) {
+			redwood_apple80211_signal(q.rssi, q.tx_rate != 0 ? q.tx_rate : 54);
 		}
 		break;
 	}

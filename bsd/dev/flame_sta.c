@@ -40,6 +40,8 @@ extern bool flame_wlan_link_bss(struct flame_wlan_bss *bss);
 
 static struct redwood_sta_bss sta_joined_bss;
 static int sta_last_error;
+static volatile bool sta_joining;       /* redfin 1051: a join of wifid's is running (its JOIN_DONE tells wifid) */
+extern int redwood_apple80211_sig(void);
 
 static const uint16_t sta_freqs[] = {
 	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
@@ -95,11 +97,13 @@ sta_join(const struct redwood_sta_join *what)
 	for (int i = 0; i < 6; i++) {
 		any |= what->bssid[i] != 0;
 	}
+	sta_joining = (redwood_apple80211_sig() & 0x10) != 0;  /* (only with 0x10: as before 1051 otherwise) */
 	if (what->security == REDWOOD_STA_WPA2_PSK && what->passphrase_length == 0) {
 		error = flame_wlan_join_pmk(what->ssid, what->ssid_length, any ? what->bssid : NULL, what->pmk);
 	} else error = flame_wlan_join(what->ssid, what->ssid_length, any ? what->bssid : NULL,
 	    what->security == REDWOOD_STA_WPA2_PSK ? what->passphrase : NULL,
 	    what->security == REDWOOD_STA_WPA2_PSK ? what->passphrase_length : 0);
+	sta_joining = false;
 	sta_last_error = error;
 	bzero(&sta_joined_bss, sizeof(sta_joined_bss));
 	if (error == 0) {
@@ -195,6 +199,15 @@ static void
 sta_link_changed(bool up)
 {
 	redwood_net_link_state(up);
+	if (up && !sta_joining && (redwood_apple80211_sig() & 0x10)) {
+		/*
+		 * redfin 1051 bit 0x10: a link wland made by itself (wlan.conf at boot, or its own rejoin) is told to
+		 * wifid as a join's: SSID/BSSID/LINK changed, so wifid takes the network as joined (HakiOS's station
+		 * boundary does the same for its standing boot join).
+		 */
+		printf("SWEET WIFI 1051: link up without a join of wifid's: told to wifid\n");
+		redwood_apple80211_event(REDWOOD_STA_LINK, 1);
+	}
 	if (!up && sta_last_error == 0) {
 		redwood_sta_lost(ECONNRESET);
 	}
