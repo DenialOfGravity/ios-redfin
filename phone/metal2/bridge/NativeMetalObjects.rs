@@ -850,6 +850,25 @@ pub extern "C" fn nmb_sweet_shadow_counts(out: *mut u64) -> bool {
     true
 }
 
+/// SweetMetal2 (bridge 0164, `SWEET_SPARE_IMAGES`): spare image blocks since the process started, into the caller's six words:
+/// kept, taken for a new image (a vkAllocateMemory saved), freed; then the bytes of each.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_spare_counts(out: *mut u64) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let counts = metal2vulkan_runtime::sweet_counts::spare_snapshot();
+    // SAFETY: the caller passes six writable words.
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, counts.len()) };
+    true
+}
+
+/// SweetMetal2 (bridge 0164): free every spare image block of the device (memory pressure): how many went.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_release_kept_memory(device: *const NmbDevice) -> usize {
+    guard(0, || Ok(get(device)?.0.release_kept_memory()))
+}
+
 /// SweetMetal2: whether the runtime times its render encoders' steps (bridge patch 0106, env `SWEET_DRAWSTAT=1`).
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_sweet_drawstat_on() -> bool {

@@ -104,6 +104,10 @@ bool nmb_texture_set_converted_generation(const NmbTexture *, uint64_t generatio
 bool nmb_texture_set_bytes_generation(const NmbTexture *, uint64_t generation);
 /* SweetMetal2: shadow copy counts since start (patch 0104): copies, texel bytes, repacked, YCbCr copies skipped, layouts refused. */
 bool nmb_sweet_shadow_counts(uint64_t out[5]);
+/* SweetMetal2 (bridge 0164, SWEET_SPARE_IMAGES): spare image blocks kept, taken, freed, then their bytes; and free them all now
+   (memory pressure): how many went. */
+bool nmb_sweet_spare_counts(uint64_t out[6]);
+size_t nmb_device_release_kept_memory(const NmbDevice *);
 /* SweetMetal2: render encoder step times (patch 0106, env SWEET_DRAWSTAT=1): (ns, count) pairs since start into out[2*capacity];
    returns the steps written. nmb_sweet_drawstat_name: step index's name (static), or NULL. */
 bool nmb_sweet_drawstat_on(void);

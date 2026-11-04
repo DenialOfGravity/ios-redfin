@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <math.h>
+#include <cmath>   // m1: std::isfinite (SWEET_CULL=3)
 #include <unistd.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -89,6 +90,43 @@ static int deadfillMode() {
  const int64_t live=gLiveDeadfill.load(std::memory_order_relaxed);
  return live>=0?(int)live:env;
 }
+// m1: SWEET_CULL=3 (env, read once; unset or any other value: off = as before): cover cull, after Yofuness ios-flame's sweet cull 3
+// (8ead22c, their default with SWEET_DEADFILL=3; MIT), on our SWEET_DEADFILL tracking (any mode 1|2, so with today's permanent 1).
+// A pass SWEET_DEADFILL tracks (backboardd, colour 0 an 8-bit IOSurface, no depth/stencil/visibility, every attached colour the size
+// of colour 0) is held whole until endEncoding (the deadfill stash, from its creation on). Cover draws: CA's opaque textured quad
+// (draw.PBGRAXm_TimgA2Xhfn_Isrc: the wallpaper) and its blurred backdrop (..._IsrcCcl): one 6-vertex rectangle through
+// fixed_vert_lph_spc (position at buffer 1, w 1, one z, viewport the target), blending off and full masks on every colour it
+// writes (writes colour 0), its fragment's constants saying it reads no destination (fixed_frag_lph_cph, fc_dest_count 0,
+// fc_destination_function 0, fc_blend_function 0x36, fc_framebuffer_sample 0; label not Bvcm/Bdso), no depth/stencil state,
+// single-sample, no alpha-to-coverage, cull none, fill mode fill. Its cover: the scissor within its pixel rectangle (CA's transform,
+// rounded inward). An earlier draw goes when its pixels (its vertices' box through CA's transform, rounded outward, within its
+// scissor; known only for fixed_vert_lph_spc triangles of one z) lie inside a later cover, it writes no target the cover does not
+// overwrite, and no surviving draw in between that may read the destination (any pipeline but the no-destination one above) and
+// writes a target the cover leaves touches its pixels. A fence in the pass turns the cull off for it. The deadfill drops and
+// mode 2's clear work as before inside the held pass. "DF 5s" adds "c3 <draws> <Mpx> held <passes> nocull <passes>".
+static int cullMode() {static const int mode=[]{const char *e=getenv("SWEET_CULL");return e && *e?atoi(e):0;}();return mode;}
+static bool cull3On() {return cullMode()==3;}
+static std::atomic<uint64_t> gC3Draws{0},gC3Px{0},gC3Passes{0},gC3NoCull{0};
+// m1 cull 3: one draw of a held pass: its stash index, its pixels (h*, known if hok), its clip (c*: the scissor within the target; for a
+// cover, within its pixel rectangle), the targets it may change (writes) and a cover overwrites (over), whether it may read the destination
+struct C3Draw {uint32_t idx;bool hok,cover,reads;uint8_t writes,over;long hx0,hy0,hx1,hy1,cx0,cy0,cx1,cy1;};
+// m1 cull 3: is "name:type:hex" among a function's constants (the journal's text)?
+static bool c3ConstIs(const std::string &t,const std::string &kv) {
+ const size_t p=t.find(kv);return p!=std::string::npos && (p==0 || t[p-1]==' ') && (p+kv.size()==t.size() || t[p+kv.size()]==' ');
+}
+// m1 cull 3: a rectangle through CA's transform (column-major 4x4: an axis-aligned 2D map with w 1 and z in the clip range) to pixels of a
+// tw x th target (viewport the target)
+static bool c3PixelRect(const float *m,float x0,float y0,float x1,float y1,float z,unsigned long tw,unsigned long th,double *r) {
+ for(int i=0;i<16;i++)if(!std::isfinite(m[i]))return false;
+ if(m[0]==0 || m[5]==0 || m[1]!=0 || m[2]!=0 || m[3]!=0 || m[4]!=0 || m[6]!=0 || m[7]!=0 || m[8]!=0 || m[9]!=0 || m[11]!=0 || m[15]!=1)return false;
+ const double cz=(double)m[10]*z+m[14];if(!(cz>=0 && cz<=1))return false;
+ const double ax=((double)m[0]*x0+m[12]+1)*0.5*tw,bx=((double)m[0]*x1+m[12]+1)*0.5*tw,ay=(1-((double)m[5]*y0+m[13]))*0.5*th,by=(1-((double)m[5]*y1+m[13]))*0.5*th;
+ r[0]=std::min(ax,bx);r[1]=std::min(ay,by);r[2]=std::max(ax,bx);r[3]=std::max(ay,by);
+ for(int i=0;i<4;i++)if(!(fabs(r[i])<1e6))return false;
+ return true;
+}
+// m1 cull 3: the first pixel whose centre is at or past v (margin 1/256 pixel; + moves it right)
+static long c3Pix(double v,double margin) {return (long)ceil(v-0.5+margin/256);}
 // g9 SWEET_LUMA_BOOST=0 (env or /var/local/mtl2-live; unset = CA unchanged): Core Animation's luma boost pass (one full-screen
 // luma_boost_lph draw a frame) off. QuartzCore 16.7 reads CA_DISABLE_LUMA_BOOST from the environment once, before the plugin's
 // setenv; it is debug option 91 of its table (CA_COLOR_FLUSH = 0 .. CA_PRINT_FILM_GRAIN = 152) and the render path tests that byte
@@ -121,6 +159,7 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
 static void noteShadowCopies();   // WS-U: backboardd's 5 s "J copies" line (defined by the telemetry table)
+static void watchSparePressure();   // m1 (bridge 0164): SWEET_SPARE_IMAGES memory-pressure source
 // u-f (r36): SWEET_SHADOW_SEED=1, surface-seed shadow copy skip (bridge patch 0107; see bumpWrittenSeeds).
 static bool shadowSeedOn() {
  static int on=-1;
@@ -1264,6 +1303,9 @@ static std::string quartzCoreCallers();
  // ovd (SWEET_DRAWBOX): colour attachment 0's blend and mask, the label's tail, attribute 0 (format, offset, buffer, stride)
  char dbLabel[48];uint8_t dbBlend,dbMask,dbSrc,dbDst,dbSrcA,dbDstA;uint32_t dbFmt,dbOff,dbBuf,dbStride,dbCFmt,dbCOff;   // + the first 4-wide colour-like attribute after 0 (half4/float4/uchar4n)
  uint8_t dfMasks[8],dfSamples;bool dfA2C;   // g10: every colour's write mask (0 where no format), raster sample count, alpha to coverage
+ // m1 (SWEET_CULL=3): colours written with blending off and a full mask (c3Opaque), colours written at all (c3Written), the fragment reads
+ // no destination (c3NoDest), the vertex function is CA's fixed_vert_lph_spc (c3Fixed), a cover's label (c3Cover: Isrc or IsrcCcl)
+ uint8_t c3Opaque,c3Written;bool c3NoDest,c3Fixed,c3Cover;
 }
 @property(nonatomic) NmbRenderPipeline *handle;
 @end
@@ -1455,6 +1497,32 @@ static EncChunk *encChunk() {   // gEqLock held
  if(gEqFree.empty())return new EncChunk();
  EncChunk *k=gEqFree.back();gEqFree.pop_back();return k;
 }
+// m1 (after UniXNU AdrenoMetal 241f355, rponeawa): SWEET_ENCPRIO=1 (with SWEET_ENCTHREAD=1|3; default off = the fixed
+// SWEET_ENCTHREAD_PRI below) runs the encoding thread at the scheduling policy and priority of the first Core Animation thread
+// (pthread name "com.apple.coreanimation*") that makes a command buffer, read when the worker takes its first work after that: the
+// work it replays is that thread's frame work. A timeshare reference leaves the worker as it is. Logged once ("ENCPRIO").
+static std::atomic<pthread_t> gEncReference{nullptr};
+static bool encPrioOn() {static const bool on=[]{const char *e=getenv("SWEET_ENCPRIO");return e && *e && atoi(e)!=0;}();return on;}
+static void encNoteReference() {   // a command buffer's creation
+ if(!encPrioOn() || gEncReference.load(std::memory_order_relaxed))return;
+ char name[64]={};pthread_getname_np(pthread_self(),name,sizeof name);
+ if(strncmp(name,"com.apple.coreanimation",23))return;
+ pthread_t none=nullptr;gEncReference.compare_exchange_strong(none,pthread_self(),std::memory_order_acq_rel);
+}
+static void encAdoptReference() {   // the worker, before each piece of work, until it adopted
+ static bool adopted=false;
+ if(adopted || !encPrioOn())return;
+ const pthread_t reference=gEncReference.load(std::memory_order_acquire);
+ if(!reference)return;
+ adopted=true;
+ int policy=SCHED_OTHER;sched_param param{};
+ const int g=pthread_getschedparam(reference,&policy,&param);
+ int r=-1;
+ if(!g && policy!=SCHED_OTHER)r=pthread_setschedparam(pthread_self(),policy,&param);
+ char line[160];snprintf(line,sizeof line,"native-metal: ENCPRIO: CA reference policy %d priority %d (get %d) -> worker set %d%s",policy,
+  param.sched_priority,g,r,!g && policy==SCHED_OTHER?" (timeshare reference: unchanged)":"");
+ sm2_logs(line);
+}
 static void *encWorkerMain(void *) {
  pthread_setname_np("sweet.encthread");
  // CA's display thread runs at a fixed priority 54 (RR): the work it hands over keeps that (SWEET_ENCTHREAD_PRI=N, 0: QoS only)
@@ -1481,6 +1549,7 @@ static void *encWorkerMain(void *) {
    gEqWakeTick=mach_absolute_time();   // g4 telemetry
    continue;
   }
+  encAdoptReference();   // m1 (SWEET_ENCPRIO)
   const uint64_t t0=mach_absolute_time();
   @autoreleasepool {for(const EncCmd &c:k->cmds)encReplay(c,k->bytes.data());}
   gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
@@ -1519,6 +1588,7 @@ static void *encBatchWorkerMain(void *) {
    }
    k=gEqBatches.front();gEqBatches.pop_front();
   }
+  encAdoptReference();   // m1 (SWEET_ENCPRIO)
   const uint64_t t0=mach_absolute_time();
   @autoreleasepool {for(const EncCmd &c:k->cmds)encReplay(c,k->bytes.data());}
   gEtReplayTicks.fetch_add(mach_absolute_time()-t0,std::memory_order_relaxed);
@@ -1687,6 +1757,10 @@ static void fnReport() {
  bool dfTrack,dfCapturing,dfPending,dfDirect,dfHeldPx;int8_t dfMode;int32_t dfHeld;uint32_t dfHeldD;float dfHeldCol[4];
  uint8_t dfAttached,dfWhy;__unsafe_unretained id dfHeldPipe;   // g10: the pass's colours 1..7 attached (bit i); why the held fill may not clear (bits); its pipeline
  std::vector<EncCmd> dfList;std::vector<uint8_t> dfBytes;NmbRenderPassDescriptor *dfPass;uint64_t dfPx,dfHeldBind;
+ // m1 (SWEET_CULL=3): the whole pass held (dfPassHold) until endEncoding (dfFinal: the release that replays it); mode 2's creation
+ // decided at the first surviving draw (dfPendingDecided, its clear in dfPendingClear) but made at the end; a fence seen (c3NoCull);
+ // every attached colour the size of colour 0 (c3Pass), which colours are attached (c3Att); the pass's draws
+ bool dfPassHold,dfFinal,dfPendingDecided,dfPendingClear,c3NoCull,c3Pass;uint8_t c3Att;std::vector<C3Draw> c3Draws;
  bool encDeferred,encEnded;   // u-encthread: recorded for the worker (then `handle` is the worker's alone); endEncoding recorded
 }
 @property(nonatomic) NmbEncoder *handle;
@@ -1756,6 +1830,12 @@ static void waitForResource(id resource) {
 - (void)dfRelease:(bool)drop clear:(bool)clear {
  if(!dfCapturing)return;
  if(dfHeld>=0 && drop)dfList[(size_t)dfHeld].op=EO_COUNT;
+ if(dfPassHold && !dfFinal) {   // m1 (SWEET_CULL=3): the pass stays held; mode 2's creation is decided here, made at the end
+  if(dfPending && !dfPendingDecided){dfPendingDecided=true;dfPendingClear=clear;}
+  dfHeld=-1;
+  return;
+ }
+ if(dfPassHold && dfPendingDecided)clear=dfPendingClear;   // m1: the decision of the first surviving draw
  dfCapturing=false;gDfCapturing.fetch_sub(1);
  [self dfCreate:clear];
  if(dfDirect)encDeferred=false;
@@ -1767,10 +1847,39 @@ static void waitForResource(id resource) {
  }
  dfHeld=-1;dfDirect=false;
 }
+// m1 (SWEET_CULL=3): at the held pass's end, every draw a later cover hides goes (marked as the deadfill's drops are)
+- (void)c3Resolve {
+ if(!dfPassHold)return;
+ gC3Passes.fetch_add(1,std::memory_order_relaxed);
+ if(c3NoCull || !c3Pass){gC3NoCull.fetch_add(1,std::memory_order_relaxed);return;}
+ const long n=(long)c3Draws.size();
+ std::vector<char> dead((size_t)n,0);
+ for(long i=0;i<n;i++){const uint32_t at=c3Draws[(size_t)i].idx;dead[(size_t)i]=at>=dfList.size() || dfList[at].op==EO_COUNT;}
+ for(long d=n-1;d>=0;d--) {
+  const C3Draw &o=c3Draws[(size_t)d];
+  if(dead[(size_t)d] || !o.cover)continue;
+  for(long e=d-1;e>=0;e--) {
+   const C3Draw &f=c3Draws[(size_t)e];
+   if(dead[(size_t)e] || !f.hok || (f.writes&~o.over) || f.hx0<o.cx0 || f.hy0<o.cy0 || f.hx1>o.cx1 || f.hy1>o.cy1)continue;
+   bool safe=true;
+   for(long m=e+1;m<d && safe;m++) {   // a surviving reader that writes a target the cover leaves, on f's pixels, keeps f
+    const C3Draw &q=c3Draws[(size_t)m];
+    if(dead[(size_t)m] || !q.reads || !(q.writes&~o.over))continue;
+    const long a0=q.hok?q.hx0:q.cx0,b0=q.hok?q.hy0:q.cy0,a1=q.hok?q.hx1:q.cx1,b1=q.hok?q.hy1:q.cy1;
+    if(a0<f.hx1 && f.hx0<a1 && b0<f.hy1 && f.hy0<b1)safe=false;
+   }
+   if(!safe)continue;
+   dead[(size_t)e]=1;dfList[f.idx].op=EO_COUNT;
+   gC3Draws.fetch_add(1,std::memory_order_relaxed);gC3Px.fetch_add((uint64_t)((f.hx1-f.hx0)*(f.hy1-f.hy0)),std::memory_order_relaxed);
+  }
+ }
+}
 - (void)endEncoding {
  if(dfCapturing) {   // g9: a fill still held at the end is the pass's last draw: it goes out (mode 2: a pass of only fills clears)
-  const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;
-  if(dfPending && dfHeld>=0 && !dfHeldPx)gDfNoClear.fetch_add(1);
+  const bool open=dfPending && !dfPendingDecided;   // m1: a held pass's creation may be decided already
+  const bool clearIt=open && dfHeld>=0 && dfHeldPx;
+  if(open && dfHeld>=0 && !dfHeldPx)gDfNoClear.fetch_add(1);
+  if(dfPassHold){[self c3Resolve];dfFinal=true;}   // m1 (SWEET_CULL=3): cull, then the release below replays the pass
   if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (pass end)",dbFrame,dbPass,dfHeldD);sm2_logs(l);}}
   [self dfRelease:clearIt clear:clearIt];
  }
@@ -1854,6 +1963,7 @@ static void waitForResource(id resource) {
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {ENC_SCOPE(EC_BIND,"fence");
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
+ if(dfPassHold)c3NoCull=true;   // m1 (SWEET_CULL=3): fences order work against draws: the pass stays as drawn
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_FENCE;c.target=(__bridge void *)self;c.a=(__bridge_retained void *)fence;c.flags=ECF_RETAIN_A;c.u[0]=stages;c.u[1]=update;
@@ -2073,6 +2183,61 @@ static void waitForResource(id resource) {
  dfClearOK=clr;dfWhyLast=why;
  return true;
 }
+// m1 (SWEET_CULL=3): note the draw about to be stashed in a held pass (C3Draw): its targets, whether it may read the destination, its
+// clip, its pixels where known (CA's fixed vertex function, one instance, filled triangles of at most 64 vertices or a 4-vertex strip, w 1,
+// one z, viewport the target), and whether it is a cover (see SWEET_CULL)
+- (void)c3Note:(uint32_t)prim start:(uint32_t)start count:(uint32_t)count inst:(uint32_t)inst index:(id<MTLBuffer>)ib type:(uint32_t)itype
+        offset:(NSUInteger)ioff base:(int32_t)base {
+ C3Draw e={};e.idx=(uint32_t)dfList.size();e.writes=0xff;e.reads=true;
+ NBRenderPipeline *p=dbPipe;
+ if(p){e.writes=p->c3Written&c3Att;e.over=p->c3Opaque&c3Att;e.reads=!p->c3NoDest;}
+ long c[4]={0,0,(long)dbW,(long)dbH};
+ if(dbHaveSc){c[0]=std::max(c[0],(long)dbSc[0]);c[1]=std::max(c[1],(long)dbSc[1]);c[2]=std::min(c[2],(long)(dbSc[0]+dbSc[2]));c[3]=std::min(c[3],(long)(dbSc[1]+dbSc[3]));}
+ e.cx0=c[0];e.cy0=c[1];e.cx1=c[2];e.cy1=c[3];
+ c3Draws.push_back(e);
+ C3Draw &r=c3Draws.back();
+ if(!p || dfDss || inst!=1 || p->dfSamples>1 || !p->c3Fixed || rasterFill!=MTLTriangleFillModeFill)return;
+ if(!(prim==MTLPrimitiveTypeTriangle?count>=3 && count<=64 && count%3==0:prim==MTLPrimitiveTypeTriangleStrip && count==4))return;
+ if((p->dbFmt!=MTLVertexFormatFloat4 && p->dbFmt!=MTLVertexFormatFloat2) || p->dbBuf>=8 || !dbW || !dbH)return;
+ if(dbHaveVp && (dbVp[0]!=0 || dbVp[1]!=0 || dbVp[2]!=dbW || dbVp[3]!=dbH))return;
+ const uint8_t *src=nullptr;size_t len=0;
+ if(!dbVbytes[p->dbBuf].empty()){src=dbVbytes[p->dbBuf].data();len=dbVbytes[p->dbBuf].size();}
+ else if(id vb=dbVb[p->dbBuf]){if(![vb isKindOfClass:[NBBuffer class]])return;const uint8_t *cc=(const uint8_t *)[(id<MTLBuffer>)vb contents];
+  const NSUInteger l=[(id<MTLBuffer>)vb length];if(cc && dbVbOff[p->dbBuf]<l){src=cc+dbVbOff[p->dbBuf];len=l-dbVbOff[p->dbBuf];}}
+ if(!src)return;
+ const uint8_t *ix=nullptr;size_t ilen=0;
+ if(ib){if(![(id)ib isKindOfClass:[NBBuffer class]])return;const uint8_t *cc=(const uint8_t *)[(id<MTLBuffer>)ib contents];const NSUInteger l=[(id<MTLBuffer>)ib length];
+  if(!cc || ioff>=l)return;ix=cc+ioff;ilen=l-ioff;}
+ const unsigned comps=p->dbFmt==MTLVertexFormatFloat4?4:2,stride=p->dbStride?p->dbStride:comps*4;
+ float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f,z0=0;float vx[6]={},vy[6]={};
+ for(uint32_t k=0;k<count;k++) {
+  int64_t v;
+  if(ib){if(itype==MTLIndexTypeUInt16){if((k+1)*2>ilen)return;uint16_t t;memcpy(&t,ix+k*2,2);v=t;}else{if((k+1)*4>ilen)return;uint32_t t;memcpy(&t,ix+k*4,4);v=t;}v+=base;}
+  else v=(int64_t)start+k;
+  if(v<0)return;
+  const size_t o=(size_t)v*stride+p->dbOff;if(o+comps*4>len)return;
+  float q[4]={0,0,0,1};memcpy(q,src+o,comps*4);
+  if(q[3]!=1 || !std::isfinite(q[0]) || !std::isfinite(q[1]))return;
+  if(k==0)z0=q[2];else if(q[2]!=z0)return;   // NaN z: refused
+  if(k<6){vx[k]=q[0];vy[k]=q[1];}
+  x0=std::min(x0,q[0]);x1=std::max(x1,q[0]);y0=std::min(y0,q[1]);y1=std::max(y1,q[1]);
+ }
+ const float *m=[self dfTransform];double px[4];
+ if(!m || !c3PixelRect(m,x0,y0,x1,y1,z0,dbW,dbH,px))return;
+ r.hx0=std::max(c[0],c3Pix(px[0],-1));r.hy0=std::max(c[1],c3Pix(px[1],-1));r.hx1=std::min(c[2],c3Pix(px[2],1));r.hy1=std::min(c[3],c3Pix(px[3],1));
+ r.hok=r.hx0<r.hx1 && r.hy0<r.hy1;
+ // a cover: CA's opaque textured quad, exactly one rectangle (two triangles of its corners sharing a diagonal), every pixel written once
+ if(!p->c3Cover || prim!=MTLPrimitiveTypeTriangle || count!=6 || p->dbBuf!=1 || !(p->c3Opaque&1) || (p->c3Written&~p->c3Opaque) || !p->c3NoDest)return;
+ if(p->dfA2C || rasterCull!=MTLCullModeNone || !(x0<x1 && y0<y1))return;
+ unsigned id[6];
+ for(unsigned k=0;k<6;k++){if(!(vx[k]==x0 || vx[k]==x1) || !(vy[k]==y0 || vy[k]==y1))return;id[k]=(vx[k]==x1?1u:0u)|(vy[k]==y1?2u:0u);}
+ if(id[0]==id[1] || id[0]==id[2] || id[1]==id[2] || id[3]==id[4] || id[3]==id[5] || id[4]==id[5])return;
+ const unsigned ma=(1u<<id[0])|(1u<<id[1])|(1u<<id[2]),mb=(1u<<id[3])|(1u<<id[4])|(1u<<id[5]),sh=ma&mb;
+ if((ma|mb)!=15 || __builtin_popcount(sh)!=2 || ((unsigned)__builtin_ctz(sh)^(unsigned)(31-__builtin_clz(sh)))!=3)return;
+ const long k0=std::max(c[0],c3Pix(px[0],1)),k1=std::max(c[1],c3Pix(px[1],1)),k2=std::min(c[2],c3Pix(px[2],-1)),k3=std::min(c[3],c3Pix(px[3],-1));
+ if(k0>=k2 || k1>=k3)return;
+ r.cover=true;r.cx0=k0;r.cy0=k1;r.cx1=k2;r.cy1=k3;
+}
 // g10: the vertex transform: the first vertex-stage binding other than the position's with 16 floats (bytes, else a buffer at its offset)
 - (const float *)dfTransform {
  const uint32_t buf=dbPipe?dbPipe->dbBuf:99;
@@ -2127,8 +2292,9 @@ static void waitForResource(id resource) {
   return;
  }
  if(!dfCapturing)return;
- const bool clearIt=dfPending && dfHeld>=0 && dfHeldPx;   // mode 2: the first surviving draw of the pass is a fill (g10: covering the target): a clear instead
- if(dfPending && dfHeld>=0 && !dfHeldPx){gDfNoClear.fetch_add(1);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF no clear (why 0x%x: 1 function 2 other colour written 4 no transform 8 not the target)",dbFrame,dbPass,dfHeldD,dfWhy);sm2_logs(l);}}
+ const bool open=dfPending && !dfPendingDecided;   // m1: a held pass's creation may be decided already
+ const bool clearIt=open && dfHeld>=0 && dfHeldPx;   // mode 2: the first surviving draw of the pass is a fill (g10: covering the target): a clear instead
+ if(open && dfHeld>=0 && !dfHeldPx){gDfNoClear.fetch_add(1);if(dbFrame){char l[120];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF no clear (why 0x%x: 1 function 2 other colour written 4 no transform 8 not the target)",dbFrame,dbPass,dfHeldD,dfWhy);sm2_logs(l);}}
  if(clearIt){gDfCleared.fetch_add(1);gDfPx.fetch_add(dfPx);if(dbFrame){char l[160];snprintf(l,sizeof l,"native-metal: DB f%u p%u d%u DF cleared (load->clear %.3f,%.3f,%.3f,%.3f)",dbFrame,dbPass,dfHeldD,
   dfHeldCol[0],dfHeldCol[1],dfHeldCol[2],dfHeldCol[3]);sm2_logs(l);}}
  [self dfRelease:clearIt clear:clearIt];
@@ -2270,6 +2436,7 @@ static void waitForResource(id resource) {
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,s);
  if(dbFrame)[self dbDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // ovd
  if(dfTrack)[self dfDraw:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // g9
+ if(dfPassHold && dfCapturing)[self c3Note:(uint32_t)t start:(uint32_t)s count:(uint32_t)n inst:(uint32_t)i index:nil type:0 offset:0 base:0];   // m1
  if(encDeferred) {
   ET_REC;ENC_LIVE();
   EncCmd c={};c.op=EO_DRAW;c.target=(__bridge void *)self;c.u[0]=(uint64_t)t;c.u[1]=(uint32_t)s;c.u[2]=(uint32_t)n;c.u[3]=(uint32_t)i;c.u[4]=(uint32_t)b;
@@ -2293,6 +2460,7 @@ static void waitForResource(id resource) {
  if(fnStatOn())fnNote((__bridge const void *)self,encPipeline,(uint32_t)n,(uint32_t)i,0);
  if(dbFrame)[self dbDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // ovd
  if(dfTrack)[self dfDraw:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // g9
+ if(dfPassHold && dfCapturing)[self c3Note:(uint32_t)t start:0 count:(uint32_t)n inst:(uint32_t)i index:b type:(uint32_t)k offset:o base:(int32_t)v];   // m1
  if(encDeferred) {
   ET_REC;
   EncCmd c={};c.op=EO_DRAW_INDEXED;c.target=(__bridge void *)self;c.a=(__bridge void *)b;c.u[0]=(uint64_t)t;c.u[1]=(uint64_t)(uint32_t)n<<32|(uint32_t)i;
@@ -2556,7 +2724,7 @@ static void noteDeviceLost(const char *why) {
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();encDeferred=encThreadOn();}
+ if(self){createdUs=nowUs();if(timelineOn())tlCreated=tlNow();encDeferred=encThreadOn();if(encDeferred)encNoteReference();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -2690,6 +2858,10 @@ static void noteDeviceLost(const char *why) {
    // (colour 1) is written only by its "S1" pipelines (r51); the fill pipeline is exactly draw.PBGRAXm_A2Xhf, never one of them.
    re->dfAttached=0;
    for(unsigned i=1;i<8;i++)if(id<MTLTexture> c=d.colorAttachments[i].texture)if(c.storageMode!=MTLStorageModeMemoryless)re->dfAttached|=(uint8_t)(1u<<i);
+   if(cull3On()) {   // m1 (SWEET_CULL=3): the pass held whole; cull only where every attached colour is colour 0's size
+    re->dfPassHold=true;re->c3Pass=true;re->c3Att=0;
+    for(unsigned i=0;i<8;i++)if(id<MTLTexture> c=d.colorAttachments[i].texture){re->c3Att|=(uint8_t)(1u<<i);if(c.width!=t.width || c.height!=t.height)re->c3Pass=false;}
+   }
    const MTLLoadAction load=d.colorAttachments[0].loadAction;
    if((mode&3)>=2 && (load==MTLLoadActionLoad || load==MTLLoadActionDontCare) && !self.committed) {
     if(!tlFirstEncoder && tlCreated)tlFirstEncoder=tlNow();
@@ -2701,8 +2873,10 @@ static void noteDeviceLost(const char *why) {
    }
   }
  }
- if(encDeferred)return [self deferredEncoder:re op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"];
- return [self encoder:re handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ id made=encDeferred?[self deferredEncoder:re op:EO_RENDER_NEW pass:&pass what:@"renderCommandEncoder"]:
+  [self encoder:re handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if(made && re->dfPassHold)[re dfCapture];   // m1 (SWEET_CULL=3): held from its creation on
+ return made;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addScheduledHandler");if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {ENC_SCOPE(EC_CB,"addCompletedHandler");if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
@@ -2828,7 +3002,7 @@ static void noteDeviceLost(const char *why) {
  dispatch_group_enter(_schedulingHandlers);
  if(encDeferred) {   // u-encthread: the rest (in flight, surface cleans, handlers, the bridge's commit) is the worker's, in order
   ET_REC;
-  if(NBEncoder *open=encOpen)if(!open->encEnded && open->dfCapturing)[open dfRelease:false clear:false];   // g9: its creation recorded first
+  if(NBEncoder *open=encOpen)if(!open->encEnded && open->dfCapturing){open->dfFinal=true;[open dfRelease:false clear:false];}   // g9: its creation recorded first (m1: a held pass too)
   if(NBEncoder *open=encOpen)if(!open->encEnded){open->encEnded=true;EncCmd d={};d.op=EO_DISCARD;d.target=(__bridge void *)open;encPush(d);}
   encOpen=nil;
   encCommitTick=mach_absolute_time();
@@ -3917,6 +4091,20 @@ static void ycbcrRefresh(NBTexture *texture,id commandBuffer) {
   state->dbFmt=0;state->dbCFmt=0;
   for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *c=d.colorAttachments[i];state->dfMasks[i]=c.pixelFormat==MTLPixelFormatInvalid?0:(uint8_t)c.writeMask;}
   state->dfSamples=(uint8_t)std::min<NSUInteger>(d.rasterSampleCount,255);state->dfA2C=d.alphaToCoverageEnabled;   // g10
+  if(cull3On()) {   // m1 (SWEET_CULL=3)
+   uint8_t o=0,w=0;
+   for(unsigned i=0;i<8;i++){MTLRenderPipelineColorAttachmentDescriptor *c=d.colorAttachments[i];if(c.pixelFormat==MTLPixelFormatInvalid)continue;
+    if(c.writeMask!=MTLColorWriteMaskNone)w|=(uint8_t)(1u<<i);if(!c.blendingEnabled && c.writeMask==MTLColorWriteMaskAll)o|=(uint8_t)(1u<<i);}
+   state->c3Opaque=o;state->c3Written=w;
+   state->c3Fixed=d.vertexFunction.name && !strncmp(d.vertexFunction.name.UTF8String,"fixed_vert_lph_spc",18);
+   state->c3Cover=!strcmp(state->dbLabel,"draw.PBGRAXm_TimgA2Xhfn_Isrc") || !strcmp(state->dbLabel,"draw.PBGRAXm_TimgA2Xhfn_IsrcCcl");
+   // journal census (Yofuness rtj/rtj2, 254 labels): every label reading the destination has a non-zero dest count or another blend function
+   if([(id)d.fragmentFunction isKindOfClass:[NBFunction class]] && [((NBFunction *)d.fragmentFunction).name isEqualToString:@"fixed_frag_lph_cph"]) {
+    const std::string fc=((NBFunction *)d.fragmentFunction).constantsText;
+    state->c3NoDest=c3ConstIs(fc,"fc_dest_count:49:00") && c3ConstIs(fc,"fc_destination_function:49:00") && c3ConstIs(fc,"fc_blend_function:49:36") &&
+     c3ConstIs(fc,"fc_framebuffer_sample:53:00") && d.label && ![d.label containsString:@"Bvcm"] && ![d.label containsString:@"Bdso"];
+   }
+  }
   if(MTLVertexDescriptor *v=d.vertexDescriptor){MTLVertexAttributeDescriptor *at=v.attributes[0];
    if(at.format!=MTLVertexFormatInvalid && at.bufferIndex<31){state->dbFmt=(uint32_t)at.format;state->dbOff=(uint32_t)at.offset;state->dbBuf=(uint32_t)at.bufferIndex;state->dbStride=(uint32_t)v.layouts[at.bufferIndex].stride;
     for(unsigned k=1;k<31;k++){MTLVertexAttributeDescriptor *c=v.attributes[k];
@@ -4041,6 +4229,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+ watchSparePressure();   // m1 (bridge 0164)
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  prewarmStart(cache);
  nilencInstall();   // G5
@@ -4219,6 +4408,35 @@ static void noteShadowCopies() {
      (unsigned long long)(c[0]-last[0]),(unsigned long long)(c[1]-last[1]),(unsigned long long)(c[3]-last[3]),(unsigned long long)(c[4]-last[4]),
      (unsigned long long)(c[2]-last[2])].UTF8String);
  memcpy(last,c,sizeof last);
+ // m1 (bridge 0164, SWEET_SPARE_IMAGES=1): spare image blocks in the same 5 s: kept, taken (a vkAllocateMemory + page wiring saved),
+ // freed (aged SWEET_SPARE_MS, over SWEET_SPARE_MB, or memory pressure), and the MiB held now. "SP 5s: ..." only while the knob is on.
+ static const bool spareOn=[]{const char *e=getenv("SWEET_SPARE_IMAGES");return e && *e && atoi(e)!=0;}();
+ uint64_t sp[6]={};
+ if(spareOn && nmb_sweet_spare_counts(sp)) {
+  static uint64_t lastSp[6]={};
+  const uint64_t heldMiB=(sp[3]-std::min(sp[3],sp[4]+sp[5]))>>20;
+  if(due)sm2_logs([NSString stringWithFormat:@"native-metal: SP 5s: spare image blocks kept %llu taken %llu (%llu MiB) freed %llu, held %llu MiB",
+      (unsigned long long)(sp[0]-lastSp[0]),(unsigned long long)(sp[1]-lastSp[1]),(unsigned long long)((sp[4]-lastSp[4])>>20),
+      (unsigned long long)(sp[2]-lastSp[2]),(unsigned long long)heldMiB].UTF8String);
+  memcpy(lastSp,sp,sizeof lastSp);
+ }
+}
+// m1 (bridge 0164, SWEET_SPARE_IMAGES=1): the runtime's spare image blocks go back on the system's memory-pressure signal (warn or
+// critical), as Metal's resource cache gives memory back. Off (no source) unless the knob is set.
+static void watchSparePressure() {
+ static const bool on=[]{const char *e=getenv("SWEET_SPARE_IMAGES");return e && *e && atoi(e)!=0;}();
+ if(!on)return;
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
+   DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+  if(!source)return;
+  dispatch_source_set_event_handler(source,^{
+   const size_t n=gDevice?nmb_device_release_kept_memory(gDevice):0;
+   char line[96];snprintf(line,sizeof line,"native-metal: SP memory pressure: %zu spare image blocks freed",n);sm2_logs(line);
+  });
+  dispatch_activate(source);
+ });
 }
 // u-t: the frame timeline's 5 s line (see TLRecord). Medians and 95th percentiles in ms over the frames (CA's framebuffer command
 // buffers) completed in the window:
@@ -4337,9 +4555,15 @@ static void timelineReport(std::vector<TLRecord> records,uint64_t spanNs) {
   {   // g9: SWEET_DEADFILL in the window
    static uint64_t lastDf[6];const uint64_t df[6]={gDfDeferred.load(),gDfDropped.load(),gDfCleared.load(),gDfPx.load(),gDfHeldPasses.load(),gDfNoClear.load()};
    if(deadfillMode() || memcmp(df,lastDf,sizeof df)) {
-    char dl[240];snprintf(dl,sizeof dl,"native-metal: DF 5s: deferred %llu dropped %llu cleared %llu px_saved %llu held_passes %llu no_clear %llu (mode %d)",
+    char dl[320];int dn=snprintf(dl,sizeof dl,"native-metal: DF 5s: deferred %llu dropped %llu cleared %llu px_saved %llu held_passes %llu no_clear %llu (mode %d)",
      (unsigned long long)(df[0]-lastDf[0]),(unsigned long long)(df[1]-lastDf[1]),(unsigned long long)(df[2]-lastDf[2]),(unsigned long long)(df[3]-lastDf[3]),
      (unsigned long long)(df[4]-lastDf[4]),(unsigned long long)(df[5]-lastDf[5]),deadfillMode());
+    if(cull3On() && dn>0 && dn<(int)sizeof dl) {   // m1 (SWEET_CULL=3): draws culled under a cover, their Mpx, passes held, passes not culled (fence/sizes)
+     static uint64_t lastC3[4];const uint64_t c3[4]={gC3Draws.load(),gC3Px.load(),gC3Passes.load(),gC3NoCull.load()};
+     snprintf(dl+dn,sizeof dl-dn," c3 %llu %.1f held %llu nocull %llu",(unsigned long long)(c3[0]-lastC3[0]),(c3[1]-lastC3[1])/1e6,
+      (unsigned long long)(c3[2]-lastC3[2]),(unsigned long long)(c3[3]-lastC3[3]));
+     memcpy(lastC3,c3,sizeof lastC3);
+    }
     sm2_logs(dl);
    }
    memcpy(lastDf,df,sizeof df);

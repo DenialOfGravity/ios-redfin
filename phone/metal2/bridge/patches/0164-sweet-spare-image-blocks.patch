@@ -1,0 +1,312 @@
+ios-redfin bridge patch 0164: spare image blocks, after UniXNU AdrenoMetal bridge patches 0021 (e0997b0, rpone), 0027 (59aabad) and
+0030 (0f17e74, bluseliu50), BSD-2-Clause-Patent. Taken: spare dedicated image blocks, smallest fit with <= 1/4 left over, 10 s age,
+spares freed when a block of their type cannot be made and on memory pressure (Device::release_kept_memory), 0027's byte bound
+(256 MiB, knob). Not taken: 0021's room keeper thread, 0027's deferred-release thread and stage traces, 0030's room keeper use of spares.
+Knobs (read once): SWEET_SPARE_IMAGES=1 (default off = as before), SWEET_SPARE_MS (10000), SWEET_SPARE_MB (256; 0030 = unbounded: large).
+
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index d96f7cba..0aacf11d 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -639,6 +639,13 @@ impl Device {
+         &self.0
+     }
+ 
++    /// sweet 0164: free every spare image block (`SWEET_SPARE_IMAGES`), as Metal's resource cache
++    /// gives memory back when the system reports memory pressure: how many went.
++    pub fn release_kept_memory(&self) -> usize {
++        let shared = self.shared();
++        lock(&shared.memory).release_spare(shared.vk(), None)
++    }
++
+     /// Keep room in the memory pools the runtime's encodings and commits place their own
+     /// resources in (`memory::keep_room`): called by the creation calls that may wait (a queue's,
+     /// a pipeline state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 38dfa34b..f12186bb 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -47,6 +47,55 @@ use std::ptr::NonNull;
+ #[cfg(unix)]
+ use std::sync::Arc;
+ use std::sync::Mutex;
++use std::time::{Duration, Instant};
++
++/// sweet 0164 (after UniXNU AdrenoMetal bridge 0021 e0997b0, 0027 59aabad, 0030 0f17e74): spare
++/// image blocks. Env `SWEET_SPARE_IMAGES=1` (read once; unset or 0: as before, every dedicated
++/// block freed with its image): a dedicated block of images (larger than half a [`BLOCK_BYTES`]
++/// block: every framebuffer-sized texture, CA's memoryless attachments where the device has no
++/// lazily allocated memory) whose image went stays spare for the next dedicated image of its
++/// pool that it holds with at most a quarter left over ([`Memory::take_spare`]). Each new block
++/// was a `vkAllocateMemory` Turnip's darwin KMD wires page by page (13-14 us a page in UniXNU's
++/// untagged-102cb4a069: 37 ms for a 1125x2436 BGRA surface) and its free unwired it again.
++/// Bounded: a spare goes after `SWEET_SPARE_MS` (default 10000) unused, at a placement or free
++/// after that; the oldest go when the spares would pass `SWEET_SPARE_MB` (default 256, UniXNU
++/// 0027's bound; 0030 has none: a large value); all of a type go when a block of it fails to be
++/// made; all go on `Device::release_kept_memory` (the frontend's memory-pressure source). Not
++/// ported: 0021's room keeper thread and 0027's deferred release thread.
++pub(crate) mod spare_knobs {
++    use std::sync::OnceLock;
++    use std::time::Duration;
++    fn num(name: &str, default: u64) -> u64 {
++        std::env::var(name)
++            .ok()
++            .and_then(|v| v.trim().parse().ok())
++            .unwrap_or(default)
++    }
++    /// `SWEET_SPARE_IMAGES` set and not 0.
++    pub(crate) fn on() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| num("SWEET_SPARE_IMAGES", 0) != 0)
++    }
++    /// How long a spare stays unused before it is freed.
++    pub(crate) fn spare_for() -> Duration {
++        static MS: OnceLock<u64> = OnceLock::new();
++        Duration::from_millis(*MS.get_or_init(|| num("SWEET_SPARE_MS", 10_000)))
++    }
++    /// The bytes all spares of the device may hold.
++    pub(crate) fn spare_bytes() -> u64 {
++        static BYTES: OnceLock<u64> = OnceLock::new();
++        *BYTES.get_or_init(|| num("SWEET_SPARE_MB", 256).saturating_mul(1 << 20))
++    }
++}
++
++/// sweet 0164: a dedicated block of images whose image went, kept for the next dedicated image of
++/// its pool ([`spare_knobs`]).
++#[derive(Debug)]
++struct Spare {
++    pool: (Holds, u32),
++    block: Block,
++    since: Instant,
++}
+ 
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`. SweetMetal2: 8 MB, not 64: the A640's
+ /// kernel backs every block with RAM at once, and each process paid 64 MB per memory class it touched.
+@@ -336,6 +385,14 @@ impl<T> Pool<T> {
+             .any(|block| !block.dedicated && block.ranges.longest(self.align) >= size)
+     }
+ 
++    /// sweet 0164: whether block `index` is a dedicated one.
++    fn is_dedicated(&self, index: usize) -> bool {
++        self.blocks
++            .get(index)
++            .and_then(Option::as_ref)
++            .is_some_and(|block| block.dedicated)
++    }
++
+     /// The payload of block `index`.
+     pub(super) fn payload(&self, index: usize) -> Option<&T> {
+         self.blocks.get(index)?.as_ref().map(|block| &block.payload)
+@@ -451,6 +508,12 @@ struct BlockAddresses {
+ }
+ 
+ impl Block {
++    /// sweet 0164: whether it is the runtime's own memory, imported from nothing and with no
++    /// buffer of addresses: what a spare may be.
++    fn plain(&self) -> bool {
++        !self.imported && self.addresses.is_none()
++    }
++
+     /// Free the block's memory, its buffer of addresses first.
+     ///
+     /// # Safety
+@@ -670,6 +733,8 @@ pub(super) struct Memory {
+     families: Vec<u32>,
+     /// The bytes of the blocks allocated so far ([`Memory::allocated`]).
+     allocated: u64,
++    /// sweet 0164: the dedicated blocks of images kept for the next dedicated image of their pool.
++    spare: Vec<Spare>,
+ }
+ 
+ impl Memory {
+@@ -697,6 +762,7 @@ impl Memory {
+             unified,
+             families,
+             allocated: 0,
++            spare: Vec::new(),
+         }
+     }
+ 
+@@ -712,6 +778,7 @@ impl Memory {
+         for pool in &self.pools {
+             pool.count_into(&mut census, |block| block.imported);
+         }
++        census.empty += self.spare.len() as u64; // sweet 0164
+         census
+     }
+ 
+@@ -955,12 +1022,101 @@ impl Memory {
+         offset: u64,
+         size: u64,
+     ) {
+-        if let Some(block) = self.pool(holds, type_index).release(block, offset, size) {
++        let dedicated = self.pool(holds, type_index).is_dedicated(block);
++        let freed = self.pool(holds, type_index).release(block, offset, size);
++        if spare_knobs::on() {
++            let now = Instant::now();
++            self.age_spare(device, now);
++            if let Some(block) = freed {
++                // sweet 0164: a dedicated block of an image stays spare.
++                if dedicated && holds == Holds::Images && block.plain() {
++                    self.keep_spare(device, (holds, type_index), block, now);
++                } else {
++                    // SAFETY: no resource is placed in the block any more.
++                    unsafe { block.release(device) };
++                }
++            }
++            return;
++        }
++        if let Some(block) = freed {
+             // SAFETY: no resource is placed in the block any more.
+             unsafe { block.release(device) };
+         }
+     }
+ 
++    /// sweet 0164: keep `block` (empty, unread) spare for `pool`, the oldest spares freed first
++    /// where the spares would pass `SWEET_SPARE_MB`; one larger than that is freed at once.
++    fn keep_spare(&mut self, device: &ash::Device, pool: (Holds, u32), block: Block, now: Instant) {
++        let cap = spare_knobs::spare_bytes();
++        if block.size > cap {
++            crate::sweet_counts::spare_event(crate::sweet_counts::SPARE_FREED, block.size);
++            // SAFETY: the caller's: nothing is placed in the block, and no command reads it.
++            unsafe { block.release(device) };
++            return;
++        }
++        while self.spare.iter().map(|spare| spare.block.size).sum::<u64>() + block.size > cap {
++            let Some((index, _)) = (self.spare.iter().enumerate()).min_by_key(|(_, spare)| spare.since)
++            else {
++                break;
++            };
++            let old = self.spare.swap_remove(index);
++            crate::sweet_counts::spare_event(crate::sweet_counts::SPARE_FREED, old.block.size);
++            // SAFETY: nothing is placed in a spare block, and no command reads it.
++            unsafe { old.block.release(device) };
++        }
++        crate::sweet_counts::spare_event(crate::sweet_counts::SPARE_KEPT, block.size);
++        self.spare.push(Spare {
++            pool,
++            block,
++            since: now,
++        });
++    }
++
++    /// sweet 0164: free the spare blocks unused for `SWEET_SPARE_MS` at `now`.
++    fn age_spare(&mut self, device: &ash::Device, now: Instant) {
++        let spare_for: Duration = spare_knobs::spare_for();
++        let stale: Vec<Spare> = (self.spare)
++            .extract_if(.., |spare| now.saturating_duration_since(spare.since) >= spare_for)
++            .collect();
++        for spare in stale {
++            crate::sweet_counts::spare_event(crate::sweet_counts::SPARE_FREED, spare.block.size);
++            // SAFETY: nothing is placed in a spare block, and no command reads it.
++            unsafe { spare.block.release(device) };
++        }
++    }
++
++    /// sweet 0164: the smallest spare block of `pool` that holds `size` bytes with at most a
++    /// quarter of it left over, taken out for a dedicated image ([`place`]); the stale spares go
++    /// first.
++    fn take_spare(&mut self, device: &ash::Device, pool: (Holds, u32), size: u64) -> Option<Block> {
++        self.age_spare(device, Instant::now());
++        let (index, _) = (self.spare.iter().enumerate())
++            .filter(|(_, spare)| {
++                spare.pool == pool
++                    && spare.block.size >= size
++                    && spare.block.size - size <= spare.block.size / 4
++            })
++            .min_by_key(|(_, spare)| spare.block.size)?;
++        let block = self.spare.swap_remove(index).block;
++        crate::sweet_counts::spare_event(crate::sweet_counts::SPARE_TAKEN, block.size);
++        Some(block)
++    }
++
++    /// sweet 0164: free the spare blocks of memory type `type_index` (`None`: every one), as a
++    /// block of it fails to be made or the system reports memory pressure: how many went.
++    pub(super) fn release_spare(&mut self, device: &ash::Device, type_index: Option<u32>) -> usize {
++        let blocks: Vec<Spare> = (self.spare)
++            .extract_if(.., |spare| type_index.is_none_or(|t| spare.pool.1 == t))
++            .collect();
++        let count = blocks.len();
++        for spare in blocks {
++            crate::sweet_counts::spare_event(crate::sweet_counts::SPARE_FREED, spare.block.size);
++            // SAFETY: nothing is placed in a spare block, and no command reads it.
++            unsafe { spare.block.release(device) };
++        }
++        count
++    }
++
+     /// Import the caller's host memory, `size` bytes at `pointer` (both multiples of the device's
+     /// import alignment), as a dedicated block of the best memory type of `class` among
+     /// `allowed` (the types both the pointer and the resource take): its placement at offset 0,
+@@ -1105,6 +1261,11 @@ impl Memory {
+ 
+     /// Free every block: the device is being destroyed and no resource is left.
+     pub(super) fn destroy(&mut self, device: &ash::Device) {
++        // sweet 0164: the spares too
++        for spare in self.spare.drain(..) {
++            // SAFETY: no resource is left, and the device is idle.
++            unsafe { spare.block.release(device) };
++        }
+         for pool in &mut self.pools {
+             for block in pool.drain() {
+                 // SAFETY: no resource is left, and the device is idle.
+@@ -1386,7 +1547,31 @@ fn place(
+                 return Ok(placement);
+             }
+         }
+-        match maker.make(device, type_index, block_size, addressed) {
++        // sweet 0164: a dedicated image takes a spare block of its pool where one fits; one placed
++        // apart takes memory no submission has used ([`Fit`]).
++        if spare_knobs::on()
++            && dedicated
++            && fit == Fit::Pooled
++            && holds == Holds::Images
++            && addressed.is_none()
++        {
++            let mut memory = lock(memory);
++            if let Some(block) = memory.take_spare(device, pool, size) {
++                let bytes = block.size;
++                let index = memory.pool(pool.0, pool.1).add(bytes, true, block, size);
++                return Ok(memory.placement(pool, index, 0, size, false));
++            }
++        }
++        let made = match maker.make(device, type_index, block_size, addressed) {
++            // sweet 0164: the type's spares go before a block of it fails to be made.
++            Err(Error::OutOfMemory(_))
++                if spare_knobs::on() && lock(memory).release_spare(device, Some(type_index)) > 0 =>
++            {
++                maker.make(device, type_index, block_size, addressed)
++            }
++            made => made,
++        };
++        match made {
+             Ok(block) => {
+                 let mut memory = lock(memory);
+                 let index = memory.add_block(pool, block, block_size, dedicated, size);
+diff --git a/crates/metal2vulkan-runtime/src/sweet_counts.rs b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+index bd87c5aa..e58ac253 100644
+--- a/crates/metal2vulkan-runtime/src/sweet_counts.rs
++++ b/crates/metal2vulkan-runtime/src/sweet_counts.rs
+@@ -53,3 +53,22 @@ pub(crate) fn repack_enabled() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var("SWEET_SHADOW_REPACK").map_or(true, |v| v.trim() != "0"))
+ }
++
++/// sweet 0164 (`SWEET_SPARE_IMAGES`, `memory.rs`): spare image blocks kept, taken for a new image
++/// (a `vkAllocateMemory` saved), and freed; then the bytes of each.
++pub(crate) const SPARE_KEPT: usize = 0;
++pub(crate) const SPARE_TAKEN: usize = 1;
++pub(crate) const SPARE_FREED: usize = 2;
++static SPARE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++
++/// sweet 0164: a spare block of `bytes` kept, taken or freed (`what`).
++pub(crate) fn spare_event(what: usize, bytes: u64) {
++    SPARE[what].fetch_add(1, Ordering::Relaxed);
++    SPARE[3 + what].fetch_add(bytes, Ordering::Relaxed);
++}
++
++/// sweet 0164: since the process started: spare blocks kept, taken, freed, and their bytes (in
++/// that order). Held now: kept bytes - taken bytes - freed bytes.
++pub fn spare_snapshot() -> [u64; 6] {
++    std::array::from_fn(|i| SPARE[i].load(Ordering::Relaxed))
++}

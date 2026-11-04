@@ -1,0 +1,200 @@
+ios-redfin Turnip patch 0116: after UniXNU/UniXNU 2d0d39f + 6c295f4 (patches/mesa/turnip-transient-attachments-in-gmem.patch, bluseliu50),
+re-done on Mesa 85fda3b + UniXNU e95b37d patches + ours 0100-0115 (their version sits on five later UniXNU mesa patches; their
+darwin_sparse_vma_init/lazy BO from their newer darwin KMD). Knob SWEET_TU_TRANSIENT=1 (unset/0: no lazy memory type, TU_DEBUG=sysmem
+returns early as before). a6xx and a7xx alike (no chip-specific path). 93ad2ce not taken: it fixes their gmem-mutable-swap patch.
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 5e62b07..154cb22 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1445,7 +1445,13 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+                      tu_autotune::rp_ctx_t *rp_ctx,
+                      tu_autotune::rp_key_opt rp_key)
+ {
+-   if (TU_DEBUG(SYSMEM)) {
++   /* sweet 0116 (after UniXNU 2d0d39f, turnip-transient-attachments-in-gmem): SWEET_TU_TRANSIENT=1 (with the darwin KMD's lazily
++    * allocated memory) lets TU_DEBUG=sysmem keep a pass in GMEM when an attachment in lazily allocated memory has none yet (Metal's
++    * memoryless textures, CA's scratch colour 1): in sysmem the pass would back it for good (tu_allocate_transient_attachments).
++    * Other passes keep sysmem. Unset or 0: TU_DEBUG=sysmem returns here as before. */
++   static const int sweet_transient = (int) debug_get_num_option("SWEET_TU_TRANSIENT", 0);
++   const bool sweet_forced_sysmem = TU_DEBUG(SYSMEM);
++   if (sweet_forced_sysmem && !sweet_transient) {
+       cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
+       return true;
+    }
+@@ -1501,7 +1507,7 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
+-   if (TU_DEBUG(GMEM)) {
++   if (TU_DEBUG(GMEM) && !sweet_forced_sysmem) {
+       cmd->state.rp.gmem_disable_reason = "TU_DEBUG(GMEM)";
+       return false;
+    }
+@@ -1512,6 +1518,26 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
++   /* sweet 0116: an attachment in lazily allocated memory that has none yet lives in tile memory alone in GMEM rendering; the
++    * autotuner's (or TU_DEBUG=sysmem's) choice of SYSMEM would make its memory for good (a 1125x2436 RGBA16F scratch is ~21 MiB). */
++   if (sweet_transient) {
++      for (unsigned i = 0; i < cmd->state.pass->attachment_count; i++) {
++         const struct tu_image_view *iview = cmd->state.attachments[i];
++         if (iview && !(iview->image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) && iview->image->mem &&
++             iview->image->mem->lazy && !iview->image->mem->bo) {
++            static uint64_t sweet_transient_gmem;
++            const uint64_t n = p_atomic_inc_return(&sweet_transient_gmem);
++            if (!(n & (n - 1)) && n >= 1024)   /* 1024, 2048, 4096 ... */
++               mesa_logi("SWEET TRANSIENT: %llu passes kept in GMEM for an unbacked transient attachment", (unsigned long long) n);
++            return false;
++         }
++      }
++      if (sweet_forced_sysmem) {
++         cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
++         return true;
++      }
++   }
++
+    /* sweet 0108: SWEET_TU_SYSMEM_MIN_PIXELS=N: passes whose render area has N pixels or more draw in sysmem, ahead of
+     * the autotuner (which keeps fetching passes in GMEM). On redfin (A620, 22 bins of 576x224 for CA's 1125x2436
+     * BGRA frame) a full-screen CA pass took 4.8 ms in sysmem against 5.6 ms in GMEM (r33a, TU_DEBUG=sysmem). 0 = off. */
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 9cb7703..ff40abf 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -269,6 +269,19 @@ darwin_free_iova(struct tu_device *dev, uint64_t iova, uint64_t size)
+    mtx_unlock(&dev->vma_mutex);
+ }
+ 
++/* sweet 0116 (after UniXNU 2d0d39f/6c295f4, turnip-transient-attachments-in-gmem): SWEET_TU_TRANSIENT=1 offers lazily allocated
++ * memory (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, darwin_sparse_vma_init) and lets a pass whose transient attachment has no memory
++ * yet render in GMEM even with TU_DEBUG=sysmem (use_sysmem_rendering): Metal's memoryless textures (CA's scratch colour 1) then take
++ * no memory, where today each is a new 32-112 MiB image allocation wired page by page. Unset or 0: as before (no lazy type). */
++int
++sweet_tu_transient(void)
++{
++   static int mode = -1;
++   if (mode < 0)
++      mode = (int) debug_get_num_option("SWEET_TU_TRANSIENT", 0);
++   return mode;
++}
++
+ /* Called under retire->lock. All fence polls are nonblocking. Failed/uncertain
+  * releases retain the record and the IOVA; a busy BO is retried by a later sweep. */
+ static VkResult
+@@ -332,12 +345,13 @@ darwin_collect_retired(struct tu_device *dev)
+ 
+ static VkResult
+ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+-                   uint64_t size, kern_return_t map_error)
++                   uint64_t size, kern_return_t map_error, bool own_iova = true)
+ {
+    NativeAdrenoAbiBoFree release = {.handle = handle};
+    kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (cleanup == KERN_SUCCESS) {
+-      darwin_free_iova(dev, iova, size);
++      if (own_iova)   /* sweet 0116: a lazy BO's range is its sparse VMA's, which frees it */
++         darwin_free_iova(dev, iova, size);
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoMap failed: 0x%x", map_error);
+    }
+    /* A failed map may have modified tables. Unknown cleanup never authorizes
+@@ -360,15 +374,21 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+                const char *name)
+ {
+    MESA_TRACE_FUNC();
+-   if (lazy_vma)
++   if (lazy_vma && !sweet_tu_transient())
+       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+ 
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
+       return collected;
+ 
++   /* sweet 0116: a lazy BO lies at its sparse VMA's range (darwin_sparse_vma_init) and owns it from here, handing it back with
++    * itself after its last submission (darwin_bo_finish's retire record frees bo->iova, bo->size: the VMA's). */
+    uint64_t iova;
+-   VkResult result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
++   VkResult result = VK_SUCCESS;
++   if (lazy_vma)
++      iova = lazy_vma->msm.iova;
++   else
++      result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -376,7 +396,8 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+    NativeAdrenoAbiBoAllocReply reply = {};
+    kern_return_t kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS) {
+-      darwin_free_iova(dev, iova, size);
++      if (!lazy_vma)
++         darwin_free_iova(dev, iova, size);
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+    }
+ 
+@@ -390,7 +411,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+    NativeAdrenoAbiBoMapReply mapped = {};
+    kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+    if (kr != KERN_SUCCESS) {
+-      return darwin_map_failure(dev, reply.handle, iova, size, kr);
++      return darwin_map_failure(dev, reply.handle, iova, size, kr, !lazy_vma);
+    }
+ 
+    uint32_t gem_handle = (uint32_t)reply.handle;
+@@ -410,6 +431,16 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       .unique_id = reply.handle,
+    };
+    bo->darwin_handle = reply.handle;
++   if (lazy_vma) {   /* sweet 0116 */
++      lazy_vma->msm.backs_lazy_bo = true;   /* the range now goes back with the BO */
++      bo->lazy = true;
++      static uint64_t sweet_lazy_n, sweet_lazy_kib;
++      const uint64_t n = p_atomic_inc_return(&sweet_lazy_n);
++      const uint64_t kib = p_atomic_add_return(&sweet_lazy_kib, size >> 10);
++      if (!(n & (n - 1)))   /* 1, 2, 4, 8 ...: passes that could not keep a transient attachment in tile memory */
++         mesa_logi("SWEET TRANSIENT: lazy memory backed %llu times, %llu MiB in all (this one %llu KiB)",
++                   (unsigned long long) n, (unsigned long long) (kib >> 10), (unsigned long long) (size >> 10));
++   }
+ 
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
+@@ -1082,12 +1113,29 @@ darwin_sparse_vma_init(struct tu_device *dev, struct vk_object_base *base,
+                        struct tu_sparse_vma *out_vma, uint64_t *out_iova,
+                        enum tu_sparse_vma_flags flags, uint64_t size, uint64_t client_iova)
+ {
+-   return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
++   /* sweet 0116 (SWEET_TU_TRANSIENT): lazily allocated memory as the msm backend gives it with a settable GPU address
++    * (msm_sparse_vma_init): a GPU range alone until a pass needs its bytes (tu_allocate_transient_attachments: a sysmem pass, a load
++    * or store, LRZ), when darwin_bo_init makes a BO at that range. No sparse residency (no null mapping). */
++   if (!sweet_tu_transient() || (flags & TU_SPARSE_VMA_MAP_ZERO))
++      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
++   out_vma->flags = flags;
++   out_vma->msm.size = size;
++   out_vma->msm.backs_lazy_bo = false;
++   VkResult result = darwin_allocate_iova(dev, size, client_iova,
++                                          (flags & TU_SPARSE_VMA_REPLAYABLE) ? TU_BO_ALLOC_REPLAYABLE : TU_BO_ALLOC_NO_FLAGS,
++                                          &out_vma->msm.iova);
++   if (result != VK_SUCCESS)
++      return result;
++   *out_iova = out_vma->msm.iova;
++   return VK_SUCCESS;
+ }
+ 
+ static void
+ darwin_sparse_vma_finish(struct tu_device *dev, struct tu_sparse_vma *vma)
+ {
++   /* sweet 0116: a range a BO backs goes back with that BO (its retire record) */
++   if (sweet_tu_transient() && !vma->msm.backs_lazy_bo && vma->msm.iova)
++      darwin_free_iova(dev, vma->msm.iova, vma->msm.size);
+ }
+ 
+ static const struct tu_knl darwin_knl_funcs = {
+@@ -1163,7 +1211,7 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    device->has_set_iova = !!(info->flags & NativeAdrenoDeviceClientIova);
+    device->va_start = info->va_start;
+    device->va_size = info->va_size;
+-   device->has_lazy_bos = false;
++   device->has_lazy_bos = sweet_tu_transient() != 0;   /* sweet 0116 (darwin_sparse_vma_init); unset/0 as before */
+    device->has_sparse = false;
+    device->has_sparse_prr = false;
+    device->has_raytracing = false;
