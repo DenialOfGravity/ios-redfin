@@ -41,6 +41,7 @@
 #include "radio.h"
 #include "ipnet.h"
 #include "bridge.h"
+#include "cell.h"
 
 static void set_stage(const char *stage);	/* wland auto: progress in /var/local/wland.boot (no-op otherwise) */
 
@@ -596,6 +597,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			wlfw_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port == CELL_PORT) {
+			cell_handle(h, d, n);
+			return;
+		}
 		if (h->dst_port == PDMAPPER_PORT) {
 			pdmapper_handle(h, d, n);
 			return;
@@ -616,6 +621,11 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		printf("qrtr:   server service %#x instance %#x at %u:%x\n", w[1], w[2], w[3], w[4]);
 		if (w[1] == WLFW_SERVICE)
 			wlfw_new_server(w[3], w[4]);
+		cell_server(w[1], w[2], w[3], w[4]);
+	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
+		cell_server_gone(w[3], w[4]);
+	} else if (w[0] == QRTR_TYPE_BYE) {
+		cell_server_gone(h->src_node, 0xffffffffu);
 	}
 }
 
@@ -708,6 +718,7 @@ static void net_idle(void)
 	ipnet_poll();
 	bridge_poll();
 	join_poll();
+	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
 }
 
 static int net(unsigned secs)
@@ -1065,7 +1076,7 @@ static int auto_up(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: wland smem | smp2p | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
+		fprintf(stderr, "usage: wland smem | smp2p | cell | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);	/* a stalled bus access must not swallow the output */
@@ -1087,6 +1098,8 @@ int main(int argc, char **argv)
 		printf("%s = %d (%#x)\n", argv[2], v, v);
 		return 0;
 	}
+	if (!strcmp(argv[1], "cell"))
+		return cell_print();	/* the last read-only modem status line (cell.c; needs /var/local/cell.on) */
 	pm_init();
 	if (smem_init())
 		return 1;
