@@ -487,7 +487,8 @@ static void probe_smmu(void)
 {
 	uint64_t s = 0x15000000ull;	/* apps SMMU (smmu.c), register reads only */
 	uint32_t id0 = rd32(s + 0x20), nsmr = id0 & 0xff, valid = 0, hits = 0;
-	printf("smmu: sCR0 %08x ID0 %08x: %u SMRs\n", rd32(s), id0, nsmr);
+	printf("smmu: sCR0 %08x (USFCFG %u: a stream with no SMR is %s) ID0 %08x: %u SMRs\n", rd32(s), (rd32(s) >> 10) & 1,
+	       (rd32(s) >> 10) & 1 ? "FAULTED (global fault)" : "bypassed", id0, nsmr);
 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
 		uint32_t smr = rd32(s + 0x800 + 4 * i);
 		if (!(smr >> 31))
@@ -529,7 +530,8 @@ static void probe_vcc(void)
 {
 	uint32_t ef = rd32(EFUSE_VIDEO);
 	printf("efuse %#x = %#010x: multipipe %s, VP fmax %s\n", EFUSE_VIDEO, ef,
-	       (ef & EFUSE_NO_MPIPE) ? "disabled (L 0x14)" : "ok", (ef & EFUSE_NO_FMAX) ? "disabled (L 0x14)" : "ok");
+	       (ef & EFUSE_NO_MPIPE) ? "disabled (power on uses L 0x14 = 192 MHz)" : "ok",
+	       (ef & EFUSE_NO_FMAX) ? "disabled (365 MHz cap; we run 240)" : "ok");
 	static const struct { const char *n; uint32_t off; } r[] = {
 		{ "MODE", 0x00 }, { "L", 0x04 }, { "CAL_L", 0x08 }, { "USER_CTL", 0x0c }, { "USER_CTL_U", 0x10 },
 		{ "USER_CTL_U1", 0x14 }, { "CONFIG_CTL", 0x18 }, { "CONFIG_CTL_U", 0x1c }, { "CONFIG_CTL_U1", 0x20 },
@@ -810,6 +812,9 @@ int power_on(void)
 		printf("venus: efuse %#010x: multipipe or VP fmax disabled, PLL L %#x\n", rd32(EFUSE_VIDEO), l);
 	if (pll_on(l) || rcg_set(1, 3, "iris rcg PLL0 main /2"))	/* F(240 MHz, PLL0_OUT_MAIN, 2): field 2*2-1 */
 		return power_off(), 1;
+	printf("venus: pll0 L %#x wanted, reads L %#x MODE %#010x OPMODE %#x: %.1f MHz, iris %.1f MHz\n", l,
+	       vrd(PLL_L) & 0xffff, vrd(PLL_MODE), vrd(PLL_OPMODE), 19.2 * (vrd(PLL_L) & 0xffff),
+	       19.2 * (vrd(PLL_L) & 0xffff) / 2);
 	if (gdsc_on(GDSC_MVSC, "mvsc") || gdsc_on(GDSC_MVS0, "mvs0") || (cvp && gdsc_on(GDSC_MVS1, "mvs1")))
 		return power_off(), 1;
 	if (axi_late && gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 1))
@@ -1380,6 +1385,9 @@ static int q_write(const uint32_t *w)
 		return -1;
 	}
 	wr32(qhdr(0) + QH_TX_REQ, 0);
+	if (pm_stepping())
+		pm_step("HFI cmd %#x size %u: %08x %08x %08x %08x %08x %08x", w[1], w[0], n > 2 ? w[2] : 0, n > 3 ? w[3] : 0,
+			n > 4 ? w[4] : 0, n > 5 ? w[5] : 0, n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
 	uint32_t first = n < QWORDS - wi ? n : QWORDS - wi;
 	pm_wr(qstart(0) + 4ull * wi, w, 4 * first);
 	if (first < n)
@@ -1429,6 +1437,10 @@ static int q_read(unsigned i)
 	}
 	wr32(qhdr(i) + QH_RX_REQ, nr != wi ? 0 : want_rx);
 	wr32(qhdr(i) + QH_READ, nr);
+	if (pm_stepping() && got > 0)
+		pm_step("HFI %s pkt %#x size %u: %08x %08x %08x %08x %08x %08x", i == 1 ? "msg" : "dbg", pkt[1], pkt[0],
+			got > 2 ? pkt[2] : 0, got > 3 ? pkt[3] : 0, got > 4 ? pkt[4] : 0, got > 5 ? pkt[5] : 0,
+			got > 6 ? pkt[6] : 0, got > 7 ? pkt[7] : 0);
 	return got;
 }
 
@@ -1465,6 +1477,26 @@ static int lastmsg_n;
 static int (*on_pkt)(int n);	/* stage 3 decode: sees every msgq packet before the want check */
 static int fw_dead;		/* stage 3: a sys error came: no more session commands */
 
+/* redfin --step: every 500 ms while waiting, the core's status words and the SMMU's global fault registers (reads
+ * only: CTRL_STATUS, CPU_STATUS, INTR_STATUS through core_ok's gate; sGFSR/sGFSYNR0-2/sGFAR) to the step log */
+static void step_status(int force_now)
+{
+	static double last;
+	double t = mono_ms();
+	if (!force_now && t - last < 500)
+		return;
+	last = t;
+	if (!core_ok()) {
+		pm_step("status: a video clock or GDSC reads off");
+		return;
+	}
+	uint64_t s = 0x15000000ull;
+	pm_step("status: CTRL_STATUS %#010x CPU_STATUS %#010x INTR_STATUS %#010x | smmu sGFSR %#010x sGFSYNR0 %#010x"
+		" sGFSYNR1 %#010x sGFSYNR2 %#010x sGFAR %#010x%08x", rd32(CTRL_STATUS), rd32(WRAP_CPU_STATUS),
+		rd32(WRAP_INTR_STATUS), rd32(s + 0x48), rd32(s + 0x50), rd32(s + 0x54), rd32(s + 0x58), rd32(s + 0x44),
+		rd32(s + 0x40));
+}
+
 /* drain the debug queue, then the message queue until a packet of type want (0 = just drain); 0 = got it */
 static int wait_msg(uint32_t want, unsigned ms)
 {
@@ -1492,6 +1524,8 @@ static int wait_msg(uint32_t want, unsigned ms)
 		}
 		if (n < 0)
 			return -1;
+		if (pm_stepping())
+			step_status(0);
 		if (wait_over(t0, t, ms))
 			break;
 		delay_ms(1);
@@ -1869,6 +1903,7 @@ static uint32_t balloc(uint32_t size, const char *what)
 		if (pm_wr(a + o, zeros, size - o < sizeof(zeros) ? size - o : sizeof(zeros)))
 			return 0;
 	dc.top = a + size;
+	pm_step("balloc %s %#llx size %#x", what, (unsigned long long)a, size);
 	return (uint32_t)a;
 }
 
@@ -2362,6 +2397,21 @@ int vdec_prepare(uint32_t debug, uint64_t bufphys, uint64_t mb, int want, const 
 	return 0;
 }
 
+/* redfin --stop-at STAGE (venusctl decode): vdec_start returns 3 right after STAGE, decode() then only watches the
+ * queues for 2 s and closes. Stages in order: sessinit props workmode intl alloc load start ftb (--dry = ftb). */
+const char *vc_stop_at;
+
+static int stop_here(const char *stage)
+{
+	pm_step("stage %s done", stage);
+	printf("venus: stage %s done\n", stage);
+	if (vc_stop_at && !strcmp(vc_stop_at, stage)) {
+		printf("venus: --stop-at %s: no further steps\n", stage);
+		return 1;
+	}
+	return 0;
+}
+
 /* start: session init, the downstream decoder sequence, buffers, START, FTBs (see vdec_start in venus_core.h) */
 int vdec_start(uint32_t min_in)
 {
@@ -2379,6 +2429,8 @@ int vdec_start(uint32_t min_in)
 	if (pkt[3])
 		return 1;
 	on_pkt = dec_pkt;
+	if (stop_here("sessinit"))
+		return 3;
 	uint32_t W = (uint32_t)dc.w, H = (uint32_t)dc.h, ob = dc.split ? B_OUTPUT2 : B_OUTPUT;
 	/* properties in the client's order (msm_vdec.c line of each) */
 	if (set_prop(P_FRAME_SIZE, B_INPUT, W, H, 3, "input frame size") ||	/* s_fmt OUTPUT, msm_vdec.c:735-742 */
@@ -2389,6 +2441,8 @@ int vdec_start(uint32_t min_in)
 	    set_prop(P_FMT_SEL, ob, CF_NV12, 0, 2, "output format NV12") ||	/* s_fmt CAPTURE, msm_vdec.c:631 */
 	    get_bufreq())
 		return 2;
+	if (stop_here("props"))
+		return 3;
 	uint32_t *ri = req_of(B_INPUT);
 	int nin = ri && (int)ri[5] > 4 ? (int)ri[5] : 4;	/* input_min_count 4 (msm_vdec.c:514) */
 	if (nin > 8)
@@ -2401,6 +2455,8 @@ int vdec_start(uint32_t min_in)
 		     "work route") ||
 	    get_bufreq())	/* start_streaming: msm_comm_try_get_bufreqs again (scratch depends on the work mode) */
 		return 2;
+	if (stop_here("workmode"))
+		return 3;
 	/* internal buffers: scratch, scratch_1, scratch_2, persist, persist_1, count_actual each
 	 * (msm_comm_set_scratch_buffers 5150, msm_comm_set_persist_buffers 5230, allocate_and_set_internal_bufs 3883) */
 	static const uint32_t itypes[] = { 6, 7, 8, 4, 5 };
@@ -2421,6 +2477,8 @@ int vdec_start(uint32_t min_in)
 	}
 	if (wait_msg(0, 20) || dc.err)
 		return 2;
+	if (stop_here("intl"))
+		return 3;
 	ri = req_of(B_INPUT);
 	uint32_t isz = ri && ri[1] ? ri[1] : 0x100000;
 	if (min_in > isz)	/* venusctl: its longest access unit; venusd: VENUSD_IN_KB */
@@ -2436,14 +2494,24 @@ int vdec_start(uint32_t min_in)
 		return 2;
 	printf("venus: buffers %#llx-%#llx (%llu KB of the window)\n", (unsigned long long)dc.base,
 	       (unsigned long long)dc.top, (unsigned long long)((dc.top - dc.base) >> 10));
+	if (stop_here("alloc"))
+		return 3;
 	/* msm_vidc_load_resources (msm_vidc_common.c:3419), msm_vidc_start (3452) -> START_DONE */
-	if (sess_cmd(S_LOAD_RES) || wait_msg(M_LOAD_DONE, 1000) || sess_cmd(S_START))
+	if (sess_cmd(S_LOAD_RES) || wait_msg(M_LOAD_DONE, 1000))
+		return 2;
+	if (stop_here("load"))
+		return 3;
+	if (sess_cmd(S_START))
 		return 2;
 	dc.started = 1;
 	if (wait_msg(M_START_DONE, 1000))
 		return 2;
 	printf("venus: START_DONE error %#x\n", pkt[0] >= 16 ? pkt[3] : 0);
+	if (stop_here("start"))
+		return 3;
 	ftb_all();
+	if (stop_here("ftb"))
+		return 3;
 	return 0;
 }
 
@@ -2578,6 +2646,15 @@ int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t 
 	int rc = 1, st = vdec_start(maxau);
 	if (st == 1)
 		return 1;
+	if (st == 3) {	/* --stop-at: watch the queues (and with --step the status lines) for 2 s, then close */
+		double td = now_s();
+		while (now_s() - td < 2 && !dc.err)
+			if (wait_msg(0, 5))
+				break;
+		step_status(1);
+		rc = dc.err ? 1 : 0;
+		goto close;
+	}
 	if (st)
 		goto close;
 
@@ -2611,6 +2688,7 @@ int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t 
 			break;
 		}
 	}
+	step_status(1);
 	printf("venus: decoded %d of %d frames%s%s in %.2f s\n", dc.frames, want, dc.eos ? ", EOS" : "",
 	       dc.err ? ", session error" : "", now_s() - t0);
 	if (dc.frames > 0)	/* v4a0: copy cost vs the decode itself (first to last frame) */

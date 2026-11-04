@@ -20,6 +20,7 @@ extern int vc_quiet;		/* 1: no per-buffer lines (ETB/FTB commands, EBD/FBD packe
  * instead of exit(1); it must not return (venusd longjmps out). NULL (venusctl): exit(1) */
 extern void (*vc_stop_hook)(const char *what);
 extern int vc_fake_off;		/* vdstop test: the next N clock checks read off (venusd VENUSD_TEST_CLKOFF) */
+extern const char *vc_stop_at;	/* redfin: venusctl decode --stop-at STAGE (--dry = ftb) */
 extern int vc_frame_tag;	/* vdstop: 1: firmware debug lines during a session as "[frame N] fw [...]" */
 int vc_core_ok(void);		/* the core gate's check: AHB, AXI, GDSCs, branches on (no STOP) */
 

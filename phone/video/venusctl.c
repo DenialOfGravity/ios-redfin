@@ -43,6 +43,12 @@
  * our exact SMR and S2CR; it counts as done once the SMR reads invalid, other differences are warnings (v2c;
  * VENUSCTL_STRICT_RELEASE=1: any difference fails). init/ping re-check the mnoc_sf_0_tbu vote before CTRL_INIT and each doorbell.
  *   -v                      print every register write (address, old, new, read-back)
+ *   --step [--step-file F]  redfin: every /dev/pmem write, SMC and RPMh vote, every HFI command and packet, buffer
+ *                           allocations, decode stages, and (while waiting) core + SMMU global fault status every
+ *                           500 ms, to F (default /var/local/venus-step.log), fsynced BEFORE each action: after a
+ *                           reset the last line is the last thing done
+ *   decode ... --stop-at STAGE  redfin: stop after STAGE (sessinit props workmode intl alloc load start ftb), watch the
+ *                           queues 2 s, close; --dry = --stop-at ftb (buffers set, START, FTBs, no input queued)
  * redfin (Pixel 5, SM7250 lito; track V): ported from Yofuness/ios-flame 598ba5b, SoC numbers in venus_core.c's header.
  * Read the SoC names above as lito's: SIDs 0x1380/0x13a0/0x13c0/0x13e0 + 0x1360, firmware at 0x86a00000, video_pll0
  * Lucid, queues/buffers in 0xa2600000-0xb7e00000 (init needs --phys: this kernel has no PMEM_ALLOC32; use 0xa2600000,
@@ -112,6 +118,7 @@ int main(int argc, char **argv)
 	const char *fw = NULL, *cmd = NULL, *arg = NULL, *arg2 = NULL, *arg3 = NULL;
 	int no_shutdown = 0, keep = 0, frames = 5, hevc = -1;	/* 4e: -1 = from the stream */
 	uint64_t phys = 0, bufphys = 0;
+	const char *steplog = NULL;	/* redfin: --step [--step-file F] */
 	uint32_t debug = 0x18;	/* HFI_DEBUG_MSG_ERROR | FATAL (guess: msm_vidc_debug.c's default is not in our source copy) */
 	setvbuf(stdout, NULL, _IOLBF, 0);	/* a hang shows the last line */
 	ts_start();
@@ -134,6 +141,14 @@ int main(int argc, char **argv)
 			frames = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--bufphys") && i + 1 < argc)
 			bufphys = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--step"))
+			steplog = steplog ? steplog : "/var/local/venus-step.log";
+		else if (!strcmp(argv[i], "--step-file") && i + 1 < argc)
+			steplog = argv[++i];
+		else if (!strcmp(argv[i], "--stop-at") && i + 1 < argc)
+			vc_stop_at = argv[++i];
+		else if (!strcmp(argv[i], "--dry"))
+			vc_stop_at = "ftb";
 		else if (!strcmp(argv[i], "--hevc"))
 			hevc = 1;
 		else if (!strcmp(argv[i], "--h264"))
@@ -158,6 +173,16 @@ int main(int argc, char **argv)
 		fw = stat("/vendor/firmware/venus.mdt", &st) == 0 ? "/vendor/firmware" : "/var/local/fw/venus";
 	}
 	pm_init();
+	if (steplog) {
+		if (pm_step_open(steplog))
+			return 1;
+		char cl[400];
+		size_t o = 0;
+		for (int i = 0; i < argc && o < sizeof(cl) - 1; i++)
+			o += (size_t)snprintf(cl + o, sizeof(cl) - o, "%s%s", i ? " " : "", argv[i]);
+		pm_step("venusctl: %s", cl);
+		printf("venus: step log %s (fsync per line)\n", steplog);
+	}
 	stale_drop(STATE);
 	stale_drop(AHB_STATE);
 	if (arg2 && strcmp(cmd, "memtest") && strcmp(cmd, "decode"))
@@ -188,7 +213,8 @@ usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
 		"       | session [--debug MASK] | decode IN.h264|IN.h265 OUT.yuv [--frames N] [--bufphys ADDR] [--debug MASK]\n"
-		"         [--hevc|--h264]\n"
+		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"
+		"       any command: [--step] [--step-file FILE]  (default /var/local/venus-step.log)\n"
 		"       | shutdown\n"
 		"       | memtest ADDR SIZE write|check\n");
 	return 2;

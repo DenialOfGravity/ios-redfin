@@ -53,6 +53,10 @@ void pm_smc(uint64_t x[8]);		/* x0..x7 in, x0..x3 out */
 int pm_list(struct pmem_list *l);
 int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *val);	/* errno or 0 */
 void delay_ms(unsigned ms);
+/* redfin track V: venusctl --step FILE: writes/SMCs/votes logged and fsynced before they happen */
+int pm_step_open(const char *path);
+int pm_stepping(void);
+void pm_step(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int wait_bit(uint64_t pa, uint32_t mask, int set, unsigned ms);	/* 0 = ok */
 /* video lat2: waits end on a CLOCK_MONOTONIC deadline, not after ms passes of delay_ms(1) (a throttled process's
  * 1 ms sleep lasted ~14 ms, lat1: a "1000 ms" wait ran ~14 s). PMEM_PASS_WAITS=1: count passes as ms, as before */

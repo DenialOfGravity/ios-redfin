@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,67 @@
 #include "pmem.h"
 
 static int pm_fd = -1;
+
+/* redfin track V (venusctl --step): every write, SMC and RPMh vote logged to a file and fsynced BEFORE it is done, so
+ * the last line survives a reset. Repeated wr32 of the same value to the same address (queue polling) is logged once. */
+static int step_fd = -1;
+static double step_t0;
+static struct { uint64_t pa; uint32_t v; } step_last[16];
+
+int pm_step_open(const char *path)
+{
+	step_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (step_fd < 0) {
+		fprintf(stderr, "step log %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	step_t0 = mono_ms();
+	pm_step("---- step log open (pid %d)", getpid());
+	return 0;
+}
+
+int pm_stepping(void)
+{
+	return step_fd >= 0;
+}
+
+void pm_step(const char *fmt, ...)
+{
+	if (step_fd < 0)
+		return;
+	char line[512];
+	int n = snprintf(line, sizeof(line), "[%9.3f] ", (mono_ms() - step_t0) / 1e3);
+	va_list ap;
+	va_start(ap, fmt);
+	n += vsnprintf(line + n, sizeof(line) - (size_t)n - 1, fmt, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 2)
+		n = (int)sizeof(line) - 2;
+	line[n++] = '\n';
+	if (write(step_fd, line, (size_t)n) < 0) {
+		/* nothing to do */
+	}
+	fsync(step_fd);
+}
+
+static void step_wr(uint64_t pa, const void *buf, size_t len)
+{
+	if (step_fd < 0)
+		return;
+	if (len == 4) {
+		uint32_t v;
+		memcpy(&v, buf, 4);
+		unsigned slot = (unsigned)((pa >> 2) % 16);
+		if (step_last[slot].pa == pa && step_last[slot].v == v)
+			return;
+		step_last[slot].pa = pa, step_last[slot].v = v;
+		pm_step("wr32 %#llx = %#010x", (unsigned long long)pa, v);
+		return;
+	}
+	uint32_t w0 = 0;
+	memcpy(&w0, buf, len < 4 ? len : 4);
+	pm_step("pwrite %#llx len %#zx (first word %#010x)", (unsigned long long)pa, len, w0);
+}
 unsigned long long pm_calls[2], pm_bytes[2];	/* wifi batch: pread/pwrite calls and bytes ([0] read, [1] write) */
 
 void pm_init(void)
@@ -36,6 +98,7 @@ int pm_rd(uint64_t pa, void *buf, size_t len)
 
 int pm_wr(uint64_t pa, const void *buf, size_t len)
 {
+	step_wr(pa, buf, len);
 	ssize_t n = pwrite(pm_fd, buf, len, (off_t)pa);
 	pm_calls[1]++, pm_bytes[1] += len;
 	if (n != (ssize_t)len) {
@@ -92,12 +155,16 @@ void pm_smc(uint64_t x[8])
 {
 	struct pmem_smc s;
 	memcpy(s.x, x, sizeof(s.x));
+	pm_step("smc x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx", (unsigned long long)x[0], (unsigned long long)x[1],
+		(unsigned long long)x[2], (unsigned long long)x[3], (unsigned long long)x[4]);
 	if (ioctl(pm_fd, PMEM_SMC, &s) < 0) {
 		fprintf(stderr, "pmem: smc: %s\n", strerror(errno));
 		x[0] = (uint64_t)-1;
 		return;
 	}
 	memcpy(x, s.x, 4 * sizeof(uint64_t));
+	pm_step("smc -> %#llx %#llx %#llx %#llx", (unsigned long long)x[0], (unsigned long long)x[1],
+		(unsigned long long)x[2], (unsigned long long)x[3]);
 }
 
 int pm_list(struct pmem_list *l)
@@ -154,6 +221,7 @@ int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *va
 	memset(&r, 0, sizeof(r));
 	snprintf(r.res, sizeof(r.res), "%s", res);
 	r.n = n;
+	pm_step("rpmh %s n %u: off %#x val %#x", res, n, n ? off[0] : 0, n ? val[0] : 0);
 	for (unsigned i = 0; i < n && i < 4; i++) {
 		r.offset[i] = off[i];
 		r.value[i] = val[i];
