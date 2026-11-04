@@ -57,8 +57,10 @@ for p in modemst1 modemst2 fsg fsc; do put "$BK/$p.img" "$V/fw/rmtfs/$p.img" 600
 echo "  /var/local: $(sudo find "$V" -type f | wc -l) files"
 
 echo "== launchd job org.iosonpixel.wland"
-sudo python3 -I - "$M/System/Library/xpc/launchd.plist" <<'PY'
-import plistlib, sys
+# WLAND_JOB_INTERACTIVE=1: the job as ProcessType/POSIXSpawnType Interactive (Yofuness/ios-flame 9730bab, B57: the
+# default class let timer coalescing stretch wland's 1 ms naps ~10x, 0.5 MB/s Wi-Fi). Default 0: the job as before.
+sudo WLAND_JOB_INTERACTIVE="${WLAND_JOB_INTERACTIVE:-0}" python3 -I - "$M/System/Library/xpc/launchd.plist" <<'PY'
+import os, plistlib, sys
 path = sys.argv[1]
 p = plistlib.load(open(path, 'rb'))
 p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.wland.plist'] = {
@@ -67,6 +69,10 @@ p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.wland.plist'] =
     'RunAtLoad': True, 'UserName': 'root',
     'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
 }
+if os.environ.get('WLAND_JOB_INTERACTIVE') == '1':
+    job = p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.wland.plist']
+    job['ProcessType'] = job['POSIXSpawnType'] = 'Interactive'
+    print('  wland job: Interactive')
 plistlib.dump(p, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
 print('  launchd jobs:', len(p['LaunchDaemons']))
 PY

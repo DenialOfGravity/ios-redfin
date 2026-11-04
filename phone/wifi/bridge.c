@@ -323,7 +323,7 @@ void bridge_poll(void)
 			bridge_status(FW_JOIN_DONE, r == -1 ? ETIMEDOUT : r);
 		}
 	}
-	/* the joined network's signal for the status bar (kernel 1014): every 2 s when it moved 2 dB, else every 10 s */
+	/* the joined network's signal for the status bar (kernel 1051, or 1014): every 2 s when it moved 2 dB, else every 10 s */
 	if (!rssi_off && now >= rssi_next) {
 		int rssi;
 		uint32_t age;
@@ -332,6 +332,7 @@ void bridge_poll(void)
 			struct fw_rssi q;
 			memset(&q, 0, sizeof(q));
 			q.rssi = (int16_t)rssi;
+			q.tx_rate = (uint16_t)radio_link_rate();
 			radio_ssid((uint8_t[32]){ 0 }, q.bssid);
 			q.age_s = (uint16_t)(age / 1000 > 0xffffu ? 0xffffu : age / 1000);
 			int e = bridge_send(FW_RSSI, &q, sizeof(q));

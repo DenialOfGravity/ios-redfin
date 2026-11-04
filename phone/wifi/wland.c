@@ -30,6 +30,7 @@
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include "pmem.h"
 #include "ipcc.h"
 #include "smem.h"
@@ -619,6 +620,54 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 }
 
+/*
+ * wland's settings (redfin 2026-11-04): env WLAND_<KEY> (upper case), else a "key=N" line in /var/local/wland.conf
+ * (no credentials there: those are wlan.conf's), else DEF. Read when asked (a restarted wland reads them again).
+ */
+#define WLAND_CONF	"/var/local/wland.conf"
+int wland_setting(const char *key, int def)
+{
+	char name[64], line[128];
+	size_t kl = strlen(key);
+	int v = def;
+	snprintf(name, sizeof(name), "WLAND_");
+	for (size_t i = 0; i < kl && 6 + i < sizeof(name) - 1; i++) {
+		name[6 + i] = (char)(key[i] >= 'a' && key[i] <= 'z' ? key[i] - 32 : key[i]);
+		name[7 + i] = 0;
+	}
+	const char *e = getenv(name);
+	if (e)
+		return atoi(e);
+	FILE *f = fopen(WLAND_CONF, "r");
+	if (!f)
+		return def;
+	while (fgets(line, sizeof(line), f))
+		if (!strncmp(line, key, kl) && line[kl] == '=')
+			v = atoi(line + kl + 1);
+	fclose(f);
+	return v;
+}
+
+/*
+ * Yofuness/ios-flame 9730bab (B57: 0.5 MB/s Wi-Fi): launchd's default process class let timer coalescing stretch
+ * wland's 1 ms naps ~10x; the job as ProcessType Interactive fixed it (tools/redfin-install-wifi-wsl.sh,
+ * WLAND_JOB_INTERACTIVE=1). Without a new job: "role=1" in wland.conf asks for the foreground role and latency
+ * QoS tier 1 here (setpriority PRIO_DARWIN_ROLE); 0 (default) leaves the job's class as it is.
+ */
+#ifndef PRIO_DARWIN_ROLE
+#define PRIO_DARWIN_ROLE		6
+#endif
+#ifndef PRIO_DARWIN_ROLE_UI_FOCAL
+#define PRIO_DARWIN_ROLE_UI_FOCAL	0x1
+#endif
+static void role_setting(void)
+{
+	if (wland_setting("role", 0) != 1)
+		return;
+	int r = setpriority(PRIO_DARWIN_ROLE, 0, PRIO_DARWIN_ROLE_UI_FOCAL);
+	printf("net: role=1: foreground role -> %s\n", r ? strerror(errno) : "ok");
+}
+
 /* the network to join: "ssid=NAME" and "psk=PASSPHRASE" lines (on the phone only, never in a repo) */
 #define WLAN_CONF	"/var/local/wlan.conf"
 static char conf_ssid[33], conf_psk[65];
@@ -724,6 +773,7 @@ static int net(unsigned secs)
 	if (pdmapper_init() || tftp_init())
 		printf("net: no pd-mapper/tftp\n");
 	read_conf();
+	role_setting();
 	uint64_t end = link_ms() + (uint64_t)secs * 1000, stats = link_ms() + 30000;
 	while (!secs || link_ms() < end) {
 		link_poll(100);
