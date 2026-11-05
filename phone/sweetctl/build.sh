@@ -2,6 +2,7 @@
 # ws-n-ctl: SweetControl.app (settings menu) and its setuid helper sweetctl, into phone/sweetctl/out.
 # Called by phone/tools/build.sh (the local builder's component list and CI both run that); copies into the userland
 # output like phone/video does. Install (phone agent `files put`, then on the phone):
+#   (every file: put to NAME.new, then mv over: in-place overwrites keep a stale kernel code signature)
 #   out/sweetctl            -> /var/local/bin/sweetctl, then: toybox chown root:wheel /var/local/bin/sweetctl && chmod 4755 /var/local/bin/sweetctl
 #   out/SweetControl.app/*  -> /Applications/SweetControl.app/ (root:wheel, binary 755), then: lsreg /Applications/SweetControl.app; respring
 #   (optional) app/Knobs.json -> /var/local/sweetctl/knobs.json to edit the menu on the phone without a rebuild
