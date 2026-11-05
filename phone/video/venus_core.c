@@ -1344,6 +1344,20 @@ int map_sid(uint32_t sid)
 	return rc ? 1 : 0;
 }
 
+/* redfin: `venusctl smmu`: the snapshot, the window bank's fault record (from STATE) and, with the power on, the
+ * core status: reads only, safe to run in a loop while the firmware runs */
+int smmu_cmd(void)
+{
+	struct vstate v;
+	state_load(&v);	/* sets win_cbp when a window bank is recorded */
+	smmu_snapshot("now");
+	win_faults("now");
+	if (core_ok())
+		printf("venus: now: CTRL_STATUS %#010x CPU_STATUS %#010x INTR_STATUS %#010x\n", rd32(CTRL_STATUS),
+		       rd32(WRAP_CPU_STATUS), rd32(WRAP_INTR_STATUS));
+	return 0;
+}
+
 int boot(const char *fw, int keep)
 {
 	struct vstate v;

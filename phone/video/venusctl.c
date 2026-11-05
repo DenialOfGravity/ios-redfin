@@ -221,10 +221,8 @@ int main(int argc, char **argv)
 		return shutdown_cmd();
 	if (!strcmp(cmd, "map-sid") && arg)
 		return map_sid((uint32_t)strtoul(arg, NULL, 0));
-	if (!strcmp(cmd, "smmu") && !arg) {
-		smmu_snapshot("now");
-		return 0;
-	}
+	if (!strcmp(cmd, "smmu") && !arg)
+		return smmu_cmd();
 usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
