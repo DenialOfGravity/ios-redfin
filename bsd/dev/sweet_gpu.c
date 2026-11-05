@@ -1828,6 +1828,13 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
 SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase_grid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     &sweet_vsyncphase_grid, 0, sysctl_sweet_vsyncphase, "I", "SWEET FB: 1049 grid: 0 auto, <= 1000 Hz, else ns");
 
+/* redfin 1060: read-only frame counter for the FPS overlay (iokit/Kernel/arm/SweetFramebuffer.cpp) */
+extern uint64_t sweet_fb_frames;
+extern uint32_t sweet_fb_hz;
+SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
+    "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
+SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
+
 /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
 
 #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
