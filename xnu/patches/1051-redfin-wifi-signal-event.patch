@@ -160,7 +160,7 @@ index 0f7ad6a..37f7586 100644
 + * kern.sweet_wifi_live_rssi (read only): the last signal wland reported, 0 when none. "SWEET WIFI 1051" lines.
 + */
 +#define NOISE_FLOOR     (-95)
-+static int wifi_sig;
++static int wifi_sig = 3;	/* default 3 since 2026-11-05 (sweetwifisig=0 = as before) */
 +static bool wifi_sig_read;
 +static int wifi_live_rssi;                      /* the joined network's last signal from wland (0: none since the link came) */
 +SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_sig, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_sig, 0, "redfin 1051: Wi-Fi signal for wifid (bits)");

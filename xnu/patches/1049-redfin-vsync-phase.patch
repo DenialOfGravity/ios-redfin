@@ -70,7 +70,7 @@ index 2c96689..be871c2 100644
 + * Line every 5 s while on: SWEET FB: vsync phase 5s: ... ticks .. | wake late avg/max.
 + */
 +extern "C" uint32_t sweet_vsyncphase, sweet_vsyncphase_grid;
-+uint32_t sweet_vsyncphase, sweet_vsyncphase_grid;
++uint32_t sweet_vsyncphase = 5000, sweet_vsyncphase_grid;	/* default 5000 since 2026-11-05 (sweetvsyncphase=0 = off) */
 +static uint32_t sweet_vphase_ticks;
 +static uint64_t sweet_vphase_late_abs, sweet_vphase_late_max;
  #define SWEET_VSYNC_CRIT        0x1

@@ -65,7 +65,7 @@ index 8642b78..4c09184 100644
 +sweet_surface_keep_row(void)
 +{
 +	if (sweet_surfkeep == 0xffffffffu) {
-+		uint32_t v = 0;
++		uint32_t v = 1;	/* default on since 2026-11-05 (sweetsurfkeep=0 = old rounding) */
 +		PE_parse_boot_argn("sweetsurfkeep", &v, sizeof(v));
 +		sweet_surfkeep = v ? 1 : 0;
 +	}

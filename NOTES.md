@@ -411,3 +411,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   could write past f_sim once a reply had many apps); the client starts only 15 s after wland's WLFW bring-up ended
   (cell_allow; 3 min fallback), never sends from the receive path (200 ms gap), drops a step after 3 unanswered tries,
   pauses 5 min after 2 unanswered in a round; Get Slots Status and DMS hw revision only with `slots=1` / `hw=1` in cell.on.
+- 2026-11-05 defaults flipped: 1048 sweet_surfkeep 1 (set before SpringBoard draws, so CC/lock-screen glyphs are clean at boot), 1049 sweet_vsyncphase 5000, 1051 sweet_wifi_sig 3. Boot-args sweetsurfkeep=0 / sweetvsyncphase=0 / sweetwifisig=0 give the old behaviour.
