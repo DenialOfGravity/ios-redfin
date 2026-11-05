@@ -8,6 +8,7 @@
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/fake_gpu.hpp"
 #include "test.hpp"
+#include "transport_hook.hpp"
 
 using namespace hakios::metal;
 
@@ -16,7 +17,7 @@ struct Rig {
     explicit Rig(bool async = false, uint32_t delayUs = 0, bool recovers = true) {
         auto f = std::make_unique<FakeGpu>(async, delayUs, recovers);
         fake = f.get();
-        gpu = std::make_unique<Gpu>(std::move(f));
+        gpu = std::make_unique<Gpu>(HMETAL_TRANSPORT_OF(f));
         std::string why;
         queue = CommandQueue::make(*gpu, &why);
     }
@@ -46,12 +47,20 @@ TEST(gpu_params) {
     CHECK_EQ(r.gpu->param(kParamChipId, &v), 0);
     const uint32_t chipId = r.fake->chip().chipId == a6xx::kChipA635.chipId ? 0x06030500u : 0x06020000u;   // (redfin) as which chip
     CHECK_EQ(uint32_t(v), chipId);                          // GPU_CHIP_ID (dt qcom,chipid) ...
+#ifndef HMETAL_TEST_TRANSPORT
     CHECK_EQ(v >> 32, FakeGpu::kSpeedBin);                  // ... "with the speed bin above it"
+#else
+    CHECK_EQ(v >> 32, 0ull);                                // (redfin) our kernel's ABI v1 has no speed bin
+#endif
     CHECK_EQ(r.gpu->chipId(), chipId);
     CHECK_EQ(r.gpu->param(kParamGmemSize, &v), 0);
     CHECK_EQ(v, 512ull * 1024);
     CHECK_EQ(r.gpu->param(kParamMaxFreq, &v), 0);
+#ifndef HMETAL_TEST_TRANSPORT
     CHECK_EQ(v, 550000000ull);                              // core_khz * 1000, the default clock
+#else
+    CHECK_EQ(v, 625000000ull);                              // (redfin) the transport's: redfin's top level (xnu 0904)
+#endif
     CHECK_EQ(r.gpu->param(kParamFaults, &v), 0);
     CHECK_EQ(v, 0ull);
     CHECK_EQ(r.gpu->param(kParamPriorities, &v), 0);

@@ -390,7 +390,11 @@ int main(int argc, char** argv) {
         }
     }
     std::string why;
+#ifdef HAKIOS_METAL_NATIVE_ADRENO
+    auto transport = openNativeAdrenoGpu(&why);   // (redfin) our kernel's IOAcceleratorES
+#else
     auto transport = openKernelGpu(&why);
+#endif
     if (transport == nullptr) {
         std::printf("probe: no GPU: %s\n", why.c_str());
         return 100;

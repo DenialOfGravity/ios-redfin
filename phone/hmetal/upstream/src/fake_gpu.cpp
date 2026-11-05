@@ -265,6 +265,18 @@ std::vector<uint8_t> FakeGpu::memory(uint64_t iova, uint64_t length) {
     return p ? std::vector<uint8_t>(p, p + length) : std::vector<uint8_t>{};
 }
 
+bool FakeGpu::placeAt(uint32_t handle, uint64_t iova) {
+    std::lock_guard<std::mutex> g(lock_);
+    auto it = buffers_.find(handle);
+    if (it == buffers_.end()) return false;
+    const uint64_t n = it->second.bytes.size();
+    for (const auto& [h, b] : buffers_) {
+        if (h != handle && iova < b.iova + b.bytes.size() && b.iova < iova + n) return false;
+    }
+    it->second.iova = iova;
+    return true;
+}
+
 uint8_t* FakeGpu::at(uint64_t iova, uint64_t length) {
     for (auto& [handle, b] : buffers_) {
         if (iova >= b.iova && length <= b.bytes.size() && iova - b.iova <= b.bytes.size() - length) {

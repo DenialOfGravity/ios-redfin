@@ -170,6 +170,10 @@ public:
     // LRZ feedback, early preamble, magic registers, the sysmem CCU layout, gen1's WFM before an indirect draw)
     FakeGpu(const a6xx::ChipInfo& chip, bool async = false, uint32_t delayUs = 0, bool recovers = true);
     static const a6xx::ChipInfo*& defaultChip();
+    // (redfin) move buffer HANDLE to GPU address IOVA, as a client that chooses its own addresses (our kernel's
+    // NativeAdreno BoMap) would have it: the in-process NativeAdreno service of phone/hmetal/redfin/tests. False when
+    // there is no such buffer or the range overlaps another's.
+    bool placeAt(uint32_t handle, uint64_t iova);
     const a6xx::ChipInfo& chip() const { return *chip_; }
     ~FakeGpu() override;
 

@@ -116,6 +116,9 @@ public:
 // HakiosGPU's user client (Darwin only: src/iokit_transport.cpp). nullptr when there is no such service: no gpu=1,
 // no firmware, QEMU, or not the phone.
 std::unique_ptr<Transport> openKernelGpu(std::string* why);
+// (redfin) our kernel's GPU user client (IOAcceleratorES, NativeAdreno ABI v1): phone/hmetal/redfin. The redfin build
+// (phone/hmetal/build.sh, -DHAKIOS_METAL_NATIVE_ADRENO) opens it where upstream opens HakiosGPU.
+std::unique_ptr<Transport> openNativeAdrenoGpu(std::string* why);
 
 // --- the GPU --------------------------------------------------------------------------------------------------------
 

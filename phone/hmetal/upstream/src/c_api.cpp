@@ -228,7 +228,12 @@ hakios_metal_device* hakios_metal_open(void) {
 #ifdef __APPLE__
 #if TARGET_OS_IPHONE || defined(HAKIOS_METAL_IOKIT)
     std::string why;
+#ifdef HAKIOS_METAL_NATIVE_ADRENO
+    // (redfin) our kernel's GPU (IOAcceleratorES, NativeAdreno ABI): phone/hmetal/redfin/native_adreno_transport.cpp
+    std::unique_ptr<Transport> t = openNativeAdrenoGpu(&why);
+#else
     std::unique_ptr<Transport> t = openKernelGpu(&why);
+#endif
     if (t == nullptr) {
         failed(why);
         return nullptr;

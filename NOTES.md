@@ -423,3 +423,9 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   (0x06020000/0x060200xx); gen4-only writes gated (SP_CS_CNTL_0/1, HLSQ_CS_CTRL_REG1, LRZ feedback, EARLYPREAMBLE), RB_CCU_CNTL
   0x08000000 sysmem / 0x3e400000 GMEM on A620, WFM before indirect draws (gen1 quirk); ir3 and fdl use the device's chip.
   Fake GPU runs as either (`make test` = both, CHIP=a620 one; tests/main --chip).
+- hmetal (ws-hm-a620, H1): redfin/native_adreno_transport.cpp = hakios-metal's Transport on our NativeAdreno ABI v1
+  (IOAcceleratorES type 0x4147, NTNL tunnel, client IOVAs from a first-fit allocator in DeviceInfo va_start/va_size, BoMap
+  rw/wb0/share2, WC CPU maps by BoCpuMap token; 0x7e IOSurface and 0x7d userptr = BoImport; unknown msm requests ENOSYS).
+  Imported BOs: dc civac before each submit naming them and after the fence for written ones (kernel does no maintenance).
+  openNativeAdrenoGpu() under -DHAKIOS_METAL_NATIVE_ADRENO (c_api, probe). Host: redfin/tests shim + fake v2 client;
+  phone/hmetal/build.sh (iOS lib + probe, host tests first), README.md (H2 steps, not run).

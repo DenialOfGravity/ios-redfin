@@ -37,6 +37,7 @@
 #include "fixtures/tri_flat_fs_air.hpp"
 #include "fixtures/tri_flat_vs_air.hpp"
 #include "test.hpp"
+#include "transport_hook.hpp"
 
 using namespace hakios::metal;
 namespace kernels = hakios::metal::kernels;
@@ -46,7 +47,7 @@ struct Rig {
     Rig() {
         auto f = std::make_unique<FakeGpu>();
         fake = f.get();
-        gpu = std::make_unique<Gpu>(std::move(f));
+        gpu = std::make_unique<Gpu>(HMETAL_TRANSPORT_OF(f));
         std::string why;
         queue = CommandQueue::make(*gpu, &why);
     }
