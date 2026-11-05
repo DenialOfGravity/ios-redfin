@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: [PATCH] 1060 redfin: read-only frame counter kern.sweet_fb_frames (+
+ kern.sweet_fb_hz) for the FPS overlay
+
+---
+ bsd/dev/sweet_gpu.c                   |  7 +++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 10 ++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index cd0475b..91fa056 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1828,6 +1828,13 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase_grid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     &sweet_vsyncphase_grid, 0, sysctl_sweet_vsyncphase, "I", "SWEET FB: 1049 grid: 0 auto, <= 1000 Hz, else ns");
+ 
++/* redfin 1060: read-only frame counter for the FPS overlay (iokit/Kernel/arm/SweetFramebuffer.cpp) */
++extern uint64_t sweet_fb_frames;
++extern uint32_t sweet_fb_hz;
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
++    "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
++
+ /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
+ 
+ #define USER_VA_BASE    0x200000000ULL  /* above the surface slots */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fd2f2f9..aa50ea6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -226,6 +226,11 @@ static uint64_t sweet_vlock_drift_abs, sweet_vlock_drift_max;
+  */
+ extern "C" uint32_t sweet_vsyncphase, sweet_vsyncphase_grid;
+ uint32_t sweet_vsyncphase = 5000, sweet_vsyncphase_grid;	/* default 5000 since 2026-11-05 (sweetvsyncphase=0 = off) */
++/* 1060: RD kern.sweet_fb_frames (frames that reached the panel: statShown + 1044 scanout latches), kern.sweet_fb_hz */
++extern "C" uint64_t sweet_fb_frames;
++extern "C" uint32_t sweet_fb_hz;
++uint64_t sweet_fb_frames;
++uint32_t sweet_fb_hz = 60;
+ static uint32_t sweet_vphase_ticks;
+ static uint64_t sweet_vphase_late_abs, sweet_vphase_late_max;
+ #define SWEET_VSYNC_CRIT        0x1
+@@ -898,6 +903,7 @@ AppleCLCD::start(IOService *provider)
+ 		    sweet_pace, sweet_pace_min, fPaceTimer ? "" : " (no pace timer)");
+ 	}
+ 	fHz = hz == 90 ? 90 : 60;
++	sweet_fb_hz = fHz;     /* 1060 */
+ 	fDsiLock = IOLockAlloc();
+ 	fVsync->setTimeoutUS(fHz == 90 ? 11111 : SWEET_FB_VSYNC_US);
+ 	/*
+@@ -949,6 +955,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (fHz == 90 && !setHz(90, false)) {
+ 		IOLog("SWEET FB: sweetfb_hz=90: the panel did not take DCS 0x53 0x38: 60 Hz\n");
+ 		fHz = 60;
++		sweet_fb_hz = 60;      /* 1060 */
+ 		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	}
+ 	if (sweet_fbx & SWEET_FBX_MODES) {
+@@ -1566,6 +1573,7 @@ AppleCLCD::statShown(uint64_t swapAbs)
+ 	SWEET_TRACE(SWT_SHOWN, swapAbs, 0, 0, 0);       /* 0994 */
+ 	IOLockLock(fLock);
+ 	fStShown++;
++	OSAddAtomic64(1, &sweet_fb_frames);    /* 1060 */
+ 	if (swapAbs != 0 && now > swapAbs) {
+ 		fStBlitqAbs += now - swapAbs;
+ 		fStBlitqN++;
+@@ -2079,6 +2087,7 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
+ 	uint64_t period;
+ 	nanoseconds_to_absolutetime(hz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL, &period);
+ 	fHz = hz;
++	sweet_fb_hz = hz;      /* 1060 */
+ 	if (fVsyncAbs != 0) {
+ 		fVsyncAbs = period;     /* from the next tick on */
+ 	}
+@@ -3406,6 +3415,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		sweet_scan.shownSwap = sweet_scan.flipSwap;
+ 		uint64_t l = now - sweet_scan.flipSwapAbs;
+ 		sweet_scan_frame_latched(fb, now, sweet_scan.flipSwapAbs);    /* 1044 */
++		OSAddAtomic64(1, &sweet_fb_frames);    /* 1060 */
+ 		sweet_scan.stLatched++;
+ 		sweet_scan.stLatchN++;
+ 		sweet_scan.stLatchAbs += l;
