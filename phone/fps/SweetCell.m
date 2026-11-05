@@ -655,18 +655,39 @@ static void
 sc_reattach(void)
 {
 	for (id item in sc_items.allObjects) {
-		Ivar sv = class_getInstanceVariable(object_getClass(item), "_signalView");
-		Ivar nv = class_getInstanceVariable(object_getClass(item), "_serviceNameView");
-		UIView *sig = sv ? object_getIvar(item, sv) : nil, *name = nv ? object_getIvar(item, nv) : nil;
-		if (sig == nil || sig.superview != nil || name == nil || name.superview == nil || sig.frame.size.width <= 0) {
-			continue;
+		@try {
+			Ivar sv = class_getInstanceVariable(object_getClass(item), "_signalView");
+			UIView *sig = sv ? object_getIvar(item, sv) : nil;
+			if (sig == nil || sig.superview != nil || sig.frame.size.width <= 0) {
+				continue;
+			}
+			id sb = [item valueForKey:@"statusBar"];
+			NSDictionary *regs = [sb valueForKey:@"regions"];
+			for (id rk in regs) {
+				id rg = regs[rk];
+				BOOL mine = NO;
+				UIView *host = nil;
+				for (id di in [rg valueForKey:@"enabledDisplayItems"]) {
+					UIView *v = [di valueForKey:@"view"];
+					if (v == sig) {
+						mine = YES;
+					} else if (v.superview != nil && host == nil) {
+						host = v.superview;
+					}
+				}
+				if (mine && host != nil) {
+					[host addSubview:sig];
+					sig.hidden = NO;
+					sig.alpha = 1;
+					sig.layer.opacity = 1;
+					sc_ui_log([NSString stringWithFormat:@"reattached signal view %p into %s of region %@ (frame %.1f %.1f %.1f %.1f)",
+					    sig, object_getClassName(host), rk, sig.frame.origin.x, sig.frame.origin.y, sig.frame.size.width,
+					    sig.frame.size.height]);
+				}
+			}
+		} @catch (NSException *e) {
+			sc_ui_log([NSString stringWithFormat:@"reattach: %@", e.reason]);
 		}
-		[name.superview addSubview:sig];
-		sig.hidden = NO;
-		sig.alpha = 1;
-		sc_ui_log([NSString stringWithFormat:@"reattached signal view %p to %s (frame %.1f %.1f %.1f %.1f, name at %.1f %.1f)",
-		    sig, object_getClassName(name.superview), sig.frame.origin.x, sig.frame.origin.y, sig.frame.size.width,
-		    sig.frame.size.height, name.frame.origin.x, name.frame.origin.y]);
 	}
 }
 
