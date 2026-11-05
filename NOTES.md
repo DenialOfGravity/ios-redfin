@@ -429,3 +429,9 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   0x49 every 30 s; Get Profile Settings 0x2b once per listed profile (again on a cell.on/list/server change). Status line
   gets `| wds=disconnected bearer=... profiles=N default=K apn='...' pdp=ipv4v6`; each profile logged once as `cell: wds
   profile N apn=... pdp=... auth=... name=... roaming=...`. Username/password TLVs never read. No WDS write of any kind.
+- cell (ws-n-wds, data design X1, one data call): only with BOTH `datatest=1` and `wds=1` in cell.on (optional `apn=<1-63 of
+  A-Za-z0-9.->`, `ipfam=4|6`), once per wland run (once more per cell.on change) when WDS is up, NAS reg=registered ps=1 and the
+  SIM app ready: WRITE WDS Start Network 0x20 (0x14 APN, else 0x31 = X0's default profile; 0x19 family; no auth TLVs), Get
+  Current Settings 0x2d (mask 0xa314), WRITE Stop Network 0x21 (handle) 20 s later. Logs `cell: WRITE wds start network ...`,
+  `cell: wds settings ip=... gw=... dns1=... mtu=... fam=...`; status gets ` x1=idle|started|settings-ok|stopped|err0xE(end
+  N/T:R)|...`. Never repeated; no IPA, no data path.

@@ -10,9 +10,14 @@
  *        Get Profile Settings 0x2b once per listed profile (again when cell.on, the list or the WDS server changes).
  *        Appends "| wds=... bearer=... profiles=N default=K apn='...' pdp=..." to the status line and logs each
  *        profile once ("cell: wds profile N ..."). Username/password TLVs (0x1b/0x1c) are never read.
- * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 (writes; see maybe_write and the PIN
- * section). Message ids and TLV layouts: libqmi data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
- * No Network Register, no SMS/data/voice, no WDS Start Network or any other WDS write, never a PUK.
+ *   X1   (only with BOTH datatest=1 and wds=1; data design step X1, one data call) see the X1 section: once per wland
+ *        process (once more per cell.on change) WDS Start Network 0x20, Get Current Settings 0x2d, 20 s later Stop
+ *        Network 0x21. Optional words apn=<1-63 of [A-Za-z0-9.-]> (else the default 3GPP profile is used) and
+ *        ipfam=4|6 (default 4). Appends " x1=..." to the status line.
+ * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 datatest=1 (writes; see maybe_write, the
+ * PIN section and the X1 section), apn=... ipfam=4|6 (X1 parameters). Message ids and TLV layouts: libqmi
+ * data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
+ * No Network Register, no SMS/voice, no WDS write except X1's Start/Stop Network, never a PUK.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 #include "cell.h"
 #include "link.h"
 #include "qmi.h"
@@ -33,8 +39,10 @@ static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
-enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64 };
+enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64, OPT_DATATEST = 128 };
 static int p1_known, p1_present, p1_active, cur_mode = -1;
+/* X1 preconditions from the last whole round (-1 = not answered this round) */
+static int nas_reg = -1, nas_ps = -1, x1_sim = -1;
 static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 	{ SVC_DMS, 0x22, 1, 0 }, { SVC_DMS, 0x23, 1, 0 }, { SVC_DMS, 0x25, 1, 0 }, { SVC_DMS, 0x2c, 1, OPT_HW },
 	{ SVC_DMS, 0x2d, 0, 0 },
@@ -246,6 +254,7 @@ static void on_uim(const struct qmi_msg *m, unsigned e)
 			o = q + 7;
 		}
 	}
+	x1_sim = papp.known && papp.state == 7;		/* the SIM/USIM application is ready */
 	const uint8_t *hs = qmi_get(m, 0x11, &l);	/* "Hot Swap": count, then a flag per card */
 	if (hs && l >= 2 && n < (int)sizeof(f_sim) - 1)
 		AP(f_sim, n, " hotswap=%u", hs[1]);
@@ -309,6 +318,8 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 			snprintf(f_reg, sizeof(f_reg), "reg=err%#x", e);
 			return;
 		}
+		nas_reg = p[0];		/* 1 = registered */
+		nas_ps = p[2];		/* PS attach state: 0 unknown, 1 attached, 2 detached */
 		int n = snprintf(f_reg, sizeof(f_reg), "reg=%s cs=%u ps=%u radio=", NM(reg_state, p[0]), p[1], p[2]);
 		uint8_t nr = p[4];
 		if (!nr)
@@ -578,14 +589,26 @@ static void wds_field(char *dst, size_t dsz)
 		 w_bearer, w_list, w_def, apn, pdp);
 }
 
+/* X1 state (see the X1 section); declared here for the status line */
+enum { X1_IDLE, X1_START, X1_UP, X1_SET, X1_WAIT, X1_STOP, X1_DONE };
+static int x1_state, x1_armed, x1_fam = 4, x1_late;
+static uint16_t x1_id, x1_txn;			/* x1_id: the X1 request in flight (0 none) */
+static uint32_t x1_handle;
+static uint64_t x1_sent, x1_next, x1_stop_at;
+static char x1_apn[64], x1_res[64] = "idle";
+
 static void publish(void)
 {
-	char line[1536], wds[256] = "";
+	char line[1536], wds[352] = "";
 	if (!strstr(f_reg, "reg=registered"))
 		bars = 0;
 	if (opts & OPT_WDS) {
 		wds[0] = ' ', wds[1] = '|', wds[2] = ' ';
 		wds_field(wds + 3, sizeof(wds) - 3);
+		if (opts & OPT_DATATEST) {
+			size_t k = strlen(wds);
+			snprintf(wds + k, sizeof(wds) - k, " x1=%s", x1_res);
+		}
 	}
 	snprintf(line, sizeof(line), "%s %s %s | %s %s | %s bars=%d | model=%s hw=%s rev=%s imei=%s%s", f_sim, f_slots, f_mode, f_reg, f_svc, f_sig,
 		 bars, model, hwrev, rev, imei, wds);
@@ -660,9 +683,38 @@ void cell_allow(void)
 	}
 }
 
+/* X1 parameters as read_opts last parsed them */
+static char rd_apn[64];
+static int rd_fam = 4, rd_apn_bad;
+
+/* "apn=<1-63 of [A-Za-z0-9.-]>" as a word of b (start or after a blank); anything else is ignored */
+static void read_apn(const char *b)
+{
+	rd_apn[0] = 0;
+	rd_apn_bad = 0;
+	for (const char *s = b; (s = strstr(s, "apn=")); s += 4) {
+		if (s != b && s[-1] != ' ' && s[-1] != '\t' && s[-1] != '\n')
+			continue;
+		const char *v = s + 4;
+		size_t n = 0;
+		while (v[n] && v[n] != ' ' && v[n] != '\t' && v[n] != '\n' && v[n] != '\r')
+			n++;
+		int ok = n >= 1 && n <= 63;
+		for (size_t i = 0; ok && i < n; i++)
+			ok = (v[i] >= 'A' && v[i] <= 'Z') || (v[i] >= 'a' && v[i] <= 'z') || (v[i] >= '0' && v[i] <= '9') ||
+			     v[i] == '.' || v[i] == '-';
+		if (ok) {
+			memcpy(rd_apn, v, n);
+			rd_apn[n] = 0;
+		} else
+			rd_apn_bad = 1;
+		return;
+	}
+}
+
 static int read_opts(void)
 {
-	char b[128] = "";
+	char b[256] = "";
 	FILE *f = fopen(CELL_ON, "r");
 	if (!f)
 		return -1;
@@ -670,6 +722,10 @@ static int read_opts(void)
 	fclose(f);
 	b[k] = 0;
 	int o = 0;
+	read_apn(b);
+	rd_fam = strstr(b, "ipfam=6") ? 6 : 4;
+	if (strstr(b, "datatest=1"))
+		o |= OPT_DATATEST;
 	if (strstr(b, "slots=1"))
 		o |= OPT_SLOTS;
 	if (strstr(b, "hw=1"))
@@ -964,7 +1020,7 @@ static void pin_poll(void)
 		pin_reply("err=timeout retries=%u\n", papp.retries);
 		next_round = now + 2000;
 	}
-	if (pin_queued && step < 0 && !wr_id && !pin_txn) {
+	if (pin_queued && step < 0 && !wr_id && !pin_txn && !x1_id) {
 		if (srv[SVC_UIM].up)
 			pin_send();
 		else {
@@ -1027,6 +1083,266 @@ static void pin_answer(const struct qmi_msg *m)
 	next_round = link_ms() + 2000;	/* re-read: expect usim:ready */
 }
 
+/*
+ * X1 (data design step X1; only with BOTH datatest=1 and wds=1 in cell.on): one data call, no IPA, no data path.
+ * Preconditions, all from the last whole round: WDS server up, NAS Get Serving System registered with PS attached
+ * (ps=1), the SIM/USIM application ready, and (without apn=) Get Default Profile Number answered. Until then nothing
+ * new is logged. Then once per wland process (one more time per cell.on change), between rounds, one at a time:
+ *   WRITE WDS Start Network 0x20: 0x14 APN string (apn= given), else 0x31 Profile Index 3GPP u8 = X0's default
+ *         profile (when known); 0x19 IP Family Preference u8 4/6. No auth/username/password TLVs. Out: 0x01 Packet
+ *         Data Handle u32; on failure (CallFailed 0x0e) 0x10 Call End Reason u16, 0x11 Verbose Call End Reason
+ *         {type u16, reason i16}, 0xe0 Extended Error Code u16. Waited for up to 120 s; a late handle is still stopped.
+ *   WDS Get Current Settings 0x2d (a read): 0x10 Requested Settings u32 = PDP type 1<<2 | DNS 1<<4 | IP address 1<<8 |
+ *         gateway 1<<9 | MTU 1<<13 | IP family 1<<15 (0xa314). Out: 0x11 PDP type u8, 0x15/0x16 IPv4 DNS u32, 0x1e IPv4
+ *         address u32, 0x20 gateway u32, 0x21 subnet mask u32 (IPv4 u32s little-endian, first octet in the top byte),
+ *         0x25/0x26 IPv6 address/gateway {16 bytes network order, prefix u8}, 0x27/0x28 IPv6 DNS 16 bytes, 0x29 MTU
+ *         u32, 0x2b IP family u8.
+ *   20 s after the start answer: WRITE WDS Stop Network 0x21: 0x01 Packet Data Handle u32.
+ * Nothing is ever repeated: no answer, an error, the WDS server going away (modem restart) or wland exiting ends it.
+ * A started call is still stopped if cell.on goes away in between. While an X1 request is out, no round, write or
+ * PIN verify is sent. Status: x1=idle|started|settings-ok|stopped|err0xE(end N/T:R)|start-noanswer|stop-err0xE|
+ * stop-noanswer|lost.
+ */
+#define X1_START_MS	120000
+#define X1_REPLY_MS	10000
+#define X1_HOLD_MS	20000
+#define X1_MASK		0xa314u
+
+static int x1_ready(void)
+{
+	return enabled && (opts & OPT_DATATEST) && (opts & OPT_WDS) && srv[SVC_WDS].up && nas_reg == 1 && nas_ps == 1 &&
+	       x1_sim == 1 && (x1_apn[0] || wds_default >= 0 || !strncmp(w_def, "err", 3));
+}
+
+static int x1_send(uint16_t id)
+{
+	struct qmi_buf *q = malloc(sizeof(*q));
+	if (!q)
+		return -1;
+	x1_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(q, QMI_REQUEST, x1_txn, id);
+	if (id == 0x20) {
+		if (x1_apn[0])
+			qmi_tlv(q, 0x14, x1_apn, (uint16_t)strlen(x1_apn));
+		qmi_tlv_u8(q, 0x19, (uint8_t)x1_fam);
+		if (!x1_apn[0] && wds_default >= 0)
+			qmi_tlv_u8(q, 0x31, (uint8_t)wds_default);
+	} else if (id == 0x2d)
+		qmi_tlv_u32(q, 0x10, X1_MASK);
+	else
+		qmi_tlv_u32(q, 0x01, x1_handle);
+	size_t len = qmi_finish(q);
+	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[SVC_WDS].node, srv[SVC_WDS].port, q->b, (uint32_t)len);
+	free(q);
+	x1_id = id;
+	x1_late = 0;
+	x1_sent = link_ms();
+	return 0;
+}
+
+static void x1_ip4(char *d, size_t n, const struct qmi_msg *m, uint8_t t)
+{
+	uint32_t v;
+	if (qmi_get_u32(m, t, &v))
+		snprintf(d, n, "-");
+	else
+		snprintf(d, n, "%u.%u.%u.%u", v >> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255);
+}
+
+/* IPv6 TLV: 16 bytes in network order, then (with_prefix) a prefix length u8 */
+static int x1_ip6(char *d, size_t n, const struct qmi_msg *m, uint8_t t, int with_prefix)
+{
+	uint16_t l;
+	const uint8_t *p = qmi_get(m, t, &l);
+	char s[INET6_ADDRSTRLEN];
+	if (!p || l < 16 + with_prefix) {
+		snprintf(d, n, "-");
+		return 0;
+	}
+	if (!inet_ntop(AF_INET6, p, s, sizeof(s)))
+		snprintf(s, sizeof(s), "?");
+	if (with_prefix)
+		snprintf(d, n, "%s/%u", s, p[16]);
+	else
+		snprintf(d, n, "%s", s);
+	return 1;
+}
+
+static void x1_settings(const struct qmi_msg *m)
+{
+	char ip[24], gw[16], d1[16], d2[16], mtu[12] = "-", fam[8] = "-", pdp[12] = "-", v6[256] = "";
+	uint32_t v;
+	uint8_t b;
+	x1_ip4(ip, sizeof(ip), m, 0x1e);
+	x1_ip4(gw, sizeof(gw), m, 0x20);
+	x1_ip4(d1, sizeof(d1), m, 0x15);
+	x1_ip4(d2, sizeof(d2), m, 0x16);
+	if (ip[0] != '-' && !qmi_get_u32(m, 0x21, &v)) {
+		size_t k = strlen(ip);
+		snprintf(ip + k, sizeof(ip) - k, "/%d", __builtin_popcount(v));
+	}
+	if (!qmi_get_u32(m, 0x29, &v))
+		snprintf(mtu, sizeof(mtu), "%u", v);
+	if (!qmi_get_u8(m, 0x2b, &b))
+		snprintf(fam, sizeof(fam), "%u", b);
+	if (!qmi_get_u8(m, 0x11, &b))
+		snprintf(pdp, sizeof(pdp), "%s", NM(wds_pdp, b));
+	char a6[64], g6[64], s1[48], s2[48];
+	int any = x1_ip6(a6, sizeof(a6), m, 0x25, 1);
+	any |= x1_ip6(g6, sizeof(g6), m, 0x26, 1);
+	any |= x1_ip6(s1, sizeof(s1), m, 0x27, 0);
+	any |= x1_ip6(s2, sizeof(s2), m, 0x28, 0);
+	if (any)
+		snprintf(v6, sizeof(v6), " ip6=%s gw6=%s dns6a=%s dns6b=%s", a6, g6, s1, s2);
+	printf("[%6llu] cell: wds settings ip=%s gw=%s dns1=%s dns2=%s mtu=%s fam=%s pdp=%s%s\n", (unsigned long long)link_ms(),
+	       ip, gw, d1, d2, mtu, fam, pdp, v6);
+}
+
+/* the answer to the X1 request in flight (or a late Start Network answer) */
+static void x1_answer(const struct qmi_msg *m)
+{
+	uint64_t now = link_ms();
+	unsigned e = qerr(m);
+	int late = x1_late && !x1_id;
+	x1_id = 0;
+	x1_txn = 0;
+	x1_late = 0;
+	x1_next = now + SEND_GAP_MS;
+	if (m->id == 0x20) {
+		uint32_t h;
+		if (!e && !qmi_get_u32(m, 1, &h)) {
+			x1_handle = h;
+			x1_state = X1_UP;
+			x1_stop_at = now + X1_HOLD_MS;
+			snprintf(x1_res, sizeof(x1_res), "started");
+			printf("[%6llu] cell: WRITE wds start network -> ok handle=%#x%s; stop in %d s\n", (unsigned long long)now, h,
+			       late ? " (late answer)" : "", X1_HOLD_MS / 1000);
+			return;
+		}
+		char end[8] = "?", vt[8] = "?", vr[8] = "?", ext[16] = "";
+		uint16_t l, u;
+		int16_t r;
+		const uint8_t *p;
+		if ((p = qmi_get(m, 0x10, &l)) && l >= 2) {
+			memcpy(&u, p, 2);
+			snprintf(end, sizeof(end), "%u", u);
+		}
+		if ((p = qmi_get(m, 0x11, &l)) && l >= 4) {
+			memcpy(&u, p, 2);
+			memcpy(&r, p + 2, 2);
+			snprintf(vt, sizeof(vt), "%u", u);
+			snprintf(vr, sizeof(vr), "%d", r);
+		}
+		if ((p = qmi_get(m, 0xe0, &l)) && l >= 2) {
+			memcpy(&u, p, 2);
+			snprintf(ext, sizeof(ext), " ext=%u", u);
+		}
+		x1_state = X1_DONE;
+		if (!e) {		/* success with no handle: nothing to stop */
+			snprintf(x1_res, sizeof(x1_res), "err-nohandle");
+			printf("[%6llu] cell: WRITE wds start network -> ok but no packet data handle\n", (unsigned long long)now);
+			return;
+		}
+		snprintf(x1_res, sizeof(x1_res), "err%#x(end %s/%s:%s)", e, end, vt, vr);
+		printf("[%6llu] cell: WRITE wds start network -> refused err %#x call-end=%s verbose=%s:%s%s%s\n",
+		       (unsigned long long)now, e, end, vt, vr, ext, late ? " (late answer)" : "");
+	} else if (m->id == 0x2d) {
+		x1_state = X1_WAIT;
+		if (e)
+			printf("[%6llu] cell: wds settings err%#x\n", (unsigned long long)now, e);
+		else {
+			x1_settings(m);
+			snprintf(x1_res, sizeof(x1_res), "settings-ok");
+		}
+	} else if (m->id == 0x21) {
+		x1_state = X1_DONE;
+		if (e)
+			snprintf(x1_res, sizeof(x1_res), "stop-err%#x", e);
+		else
+			snprintf(x1_res, sizeof(x1_res), "stopped");
+		printf("[%6llu] cell: WRITE wds stop network handle=%#x -> %s (err %#x)\n", (unsigned long long)now, x1_handle,
+		       e ? "refused" : "ok", e);
+	}
+}
+
+/* 1 = this message is X1's */
+static int x1_mine(const struct qmi_msg *m)
+{
+	return x1_txn && m->txn == x1_txn && (x1_id ? m->id == x1_id : x1_late && m->id == 0x20);
+}
+
+/* the WDS server went away (modem restart): the call is gone with it, nothing more is sent */
+static void x1_lost(void)
+{
+	if (!x1_id && !x1_late && (x1_state == X1_IDLE || x1_state == X1_DONE))
+		return;
+	printf("[%6llu] cell: x1: wds server gone with the call in progress: nothing more sent\n", (unsigned long long)link_ms());
+	x1_id = 0;
+	x1_txn = 0;
+	x1_late = 0;
+	x1_state = X1_DONE;
+	snprintf(x1_res, sizeof(x1_res), "lost");
+}
+
+/* from cell_poll; 1 = an X1 request is in flight or was just sent (nothing else goes out) */
+static int x1_poll(uint64_t now)
+{
+	if (x1_id) {
+		if (now - x1_sent <= (x1_id == 0x20 ? X1_START_MS : X1_REPLY_MS))
+			return 1;
+		printf("[%6llu] cell: x1: wds %#x unanswered in %d s (not repeated)\n", (unsigned long long)now, x1_id,
+		       (x1_id == 0x20 ? X1_START_MS : X1_REPLY_MS) / 1000);
+		if (x1_id == 0x20) {
+			x1_state = X1_DONE;
+			x1_late = 1;	/* x1_txn kept: a late handle is still stopped */
+			snprintf(x1_res, sizeof(x1_res), "start-noanswer");
+		} else if (x1_id == 0x2d) {
+			x1_state = X1_WAIT;
+			x1_txn = 0;
+		} else {
+			x1_state = X1_DONE;
+			x1_txn = 0;
+			snprintf(x1_res, sizeof(x1_res), "stop-noanswer");
+		}
+		x1_id = 0;
+		x1_next = now + SEND_GAP_MS;
+		return 0;
+	}
+	if (step >= 0 || wr_id || pin_txn || pin_queued || now < x1_next || !srv[SVC_WDS].up)
+		return 0;
+	if (x1_state == X1_UP) {
+		x1_state = X1_SET;
+		if (!x1_send(0x2d))
+			return 1;
+		x1_state = X1_WAIT;
+		return 0;
+	}
+	if (x1_state == X1_WAIT && now >= x1_stop_at) {
+		printf("[%6llu] cell: WRITE wds stop network handle=%#x\n", (unsigned long long)now, x1_handle);
+		x1_state = X1_STOP;
+		if (!x1_send(0x21))
+			return 1;
+		x1_state = X1_WAIT;	/* out of memory: tried again in 1 s (nothing reached the modem) */
+		x1_next = now + 1000;
+		return 0;
+	}
+	if ((x1_state == X1_IDLE || x1_state == X1_DONE) && x1_armed && x1_ready()) {
+		x1_armed = 0;
+		char prof[16] = "";
+		if (!x1_apn[0] && wds_default >= 0)
+			snprintf(prof, sizeof(prof), " profile=%d", wds_default);
+		printf("[%6llu] cell: WRITE wds start network apn='%s'%s fam=%d\n", (unsigned long long)now, x1_apn, prof, x1_fam);
+		x1_state = X1_START;
+		if (!x1_send(0x20))
+			return 1;
+		x1_state = X1_DONE;
+		snprintf(x1_res, sizeof(x1_res), "err-nomem");
+	}
+	return 0;
+}
+
 void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
 {
 	for (int i = 0; i < NSVC; i++)
@@ -1046,6 +1362,8 @@ void cell_server_gone(uint32_t node, uint32_t port)
 	for (int i = 0; i < NSVC; i++)
 		if (srv[i].up && srv[i].node == node && (port == 0xffffffffu || srv[i].port == port)) {
 			srv[i].up = 0;
+			if (i == SVC_WDS)
+				x1_lost();
 			if (enabled && (i != SVC_WDS || (opts & OPT_WDS)))
 				printf("cell: %s server gone\n", svc_name[i]);
 		}
@@ -1056,6 +1374,10 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	struct qmi_msg m;
 	if (qmi_parse(d, n, &m) || m.type != QMI_RESPONSE)
 		return;			/* indications: none registered for */
+	if (x1_mine(&m)) {
+		x1_answer(&m);
+		return;
+	}
 	if (pin_txn && m.txn == pin_txn && m.id == 0x26) {
 		pin_answer(&m);
 		return;
@@ -1104,9 +1426,17 @@ void cell_poll(void)
 	if (now >= next_check) {
 		next_check = now + 10000;
 		int o = read_opts(), on = o >= 0;
-		if (on != enabled || (on && o != opts)) {
+		if (on != enabled || (on && (o != opts || strcmp(rd_apn, x1_apn) || rd_fam != x1_fam))) {
 			enabled = on;
 			opts = on ? o : 0;
+			snprintf(x1_apn, sizeof(x1_apn), "%s", on ? rd_apn : "");
+			x1_fam = rd_fam;
+			x1_armed = on;		/* X1: one (more) attempt per cell.on change */
+			nas_reg = nas_ps = x1_sim = -1;	/* X1 waits for a whole new round */
+			if (on && (opts & OPT_DATATEST))
+				printf("[%6llu] cell: x1 armed: datatest=1%s apn='%s'%s ipfam=%d\n", (unsigned long long)now,
+				       opts & OPT_WDS ? " wds=1" : " (needs wds=1 too)", x1_apn, rd_apn_bad ? " (apn= ignored: 1-63 of A-Za-z0-9.-)" : "",
+				       x1_fam);
 			memset(fails, 0, sizeof(fails));
 			sw_tries = mode_tries = 0;
 			timeouts = 0;
@@ -1125,6 +1455,8 @@ void cell_poll(void)
 		}
 	}
 	pin_poll();
+	if (allowed && now >= allow_ms && x1_poll(now))
+		return;			/* an X1 request is out (also after cell.on went: a started call is still stopped) */
 	if (!enabled || !allowed || now < allow_ms)
 		return;
 	if (wr_id) {
@@ -1173,6 +1505,7 @@ void cell_poll(void)
 	snprintf(f_reg, sizeof(f_reg), "reg=?");
 	snprintf(f_svc, sizeof(f_svc), "svc=?");
 	snprintf(f_sig, sizeof(f_sig), "sig=?");
+	nas_reg = nas_ps = x1_sim = -1;
 	if (!(opts & OPT_HW) && !done_once[3])
 		snprintf(hwrev, sizeof(hwrev), "off");
 	timeouts = 0;
