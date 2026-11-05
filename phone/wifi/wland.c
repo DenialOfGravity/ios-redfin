@@ -44,6 +44,7 @@
 #include "ipnet.h"
 #include "bridge.h"
 #include "cell.h"
+#include "ipaqmi.h"
 
 static void set_stage(const char *stage);	/* wland auto: progress in /var/local/wland.boot (no-op otherwise) */
 
@@ -731,6 +732,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			pdmapper_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port == IPAQMI_PORT || h->dst_port == IPAQMI_CLIENT_PORT) {
+			ipaqmi_handle(h, d, n);	/* only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
+			return;
+		}
 		if (h->dst_port == TFTP_PORT || (h->dst_port >= TFTP_XFER_PORT0 && h->dst_port < TFTP_XFER_PORT0 + TFTP_XFERS)) {
 			tftp_handle(h, d, n);
 			return;
@@ -748,10 +753,13 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		if (w[1] == WLFW_SERVICE)
 			wlfw_new_server(w[3], w[4]);
 		cell_server(w[1], w[2], w[3], w[4]);
+		ipaqmi_server(w[1], w[2], w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
 		cell_server_gone(w[3], w[4]);
+		ipaqmi_server_gone(w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_BYE) {
 		cell_server_gone(h->src_node, 0xffffffffu);
+		ipaqmi_server_gone(h->src_node, 0xffffffffu);
 	}
 }
 
@@ -893,6 +901,7 @@ static void net_idle(void)
 	bridge_poll();
 	join_poll();
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
+	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 }
 
 static int net(unsigned secs)
@@ -908,6 +917,7 @@ static int net(unsigned secs)
 		printf("net: no rmtfs\n");
 	if (pdmapper_init() || tftp_init())
 		printf("net: no pd-mapper/tftp\n");
+	ipaqmi_init();	/* announces 0x31/1 only with ipaqmi=1/2 in cell.on; default: nothing */
 	read_conf();
 	role_setting();
 	uint64_t end = link_ms() + (uint64_t)secs * 1000, stats = link_ms() + 30000;
@@ -932,6 +942,7 @@ static int net(unsigned secs)
 			}
 		}
 		cell_allow();	/* the cell client (cell.on only) waits for this, + 15 s: never during WLFW/radio start */
+		ipaqmi_allow();	/* ipaqmi=2's one INIT_DRIVER too */
 	}
 	radio_summary();
 	radio_stats();
@@ -1252,7 +1263,7 @@ static int auto_up(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: wland smem | smp2p | cell | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
+		fprintf(stderr, "usage: wland smem | smp2p | cell | ipa show|init-driver | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);	/* a stalled bus access must not swallow the output */
@@ -1276,6 +1287,8 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(argv[1], "cell"))
 		return cell_print();	/* the last read-only modem status line (cell.c; needs /var/local/cell.on) */
+	if (!strcmp(argv[1], "ipa") && argc > 2 && (!strcmp(argv[2], "show") || !strcmp(argv[2], "init-driver")))
+		return ipaqmi_cmd(argc, argv);	/* INIT_DRIVER bytes / one INIT_DRIVER via the running wland (ipaqmi.c) */
 	pm_init();
 	if (smem_init())
 		return 1;
