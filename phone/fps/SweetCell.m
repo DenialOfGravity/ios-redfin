@@ -493,13 +493,82 @@ sc_poll(void)
 	});
 }
 
+/* ---- step 3: the condensed status bar item (home / lock screen; Control Center's expanded item shows the bars) ----
+ * -[_UIStatusBarCellularCondensedItem canEnableDisplayItem:fromData:] decides per display item (signal strength, name,
+ * type, ...). With sweetcell.on, every process logs its decisions when they change (SpringBoard: /var/tmp/sweetcell.log;
+ * apps: NSLog), with the cellular entry. /var/local/sweetcell.forcebars (stat only, so it works in app sandboxes too):
+ * the signal strength / name items are enabled whenever a cellular entry exists. */
+static IMP sc_orig_canenable;
+static int sc_forcebars;
+
+static void
+sc_ui_log(NSString *what)
+{
+	if (strcmp(getprogname(), "SpringBoard") == 0) {
+		sc_write(what);
+	} else {
+		NSLog(@"SweetCell: %s %@", getprogname(), what);
+	}
+}
+
+static void
+sc_install_ui(void)
+{
+	Class c = objc_getClass("_UIStatusBarCellularCondensedItem");
+	SEL sel = sel_registerName("canEnableDisplayItem:fromData:");
+	Method m = c ? class_getInstanceMethod(c, sel) : NULL;
+	if (m == NULL) {
+		sc_ui_log(@"no _UIStatusBarCellularCondensedItem canEnableDisplayItem:fromData:");
+		return;
+	}
+	static NSMutableDictionary *seen;
+	seen = [NSMutableDictionary dictionary];
+	sc_orig_canenable = method_setImplementation(m, imp_implementationWithBlock(^BOOL(id me, id ident, id data) {
+		BOOL r = ((BOOL (*)(id, SEL, id, id))sc_orig_canenable)(me, sel, ident, data);
+		id entry = nil;
+		SEL ce = sel_registerName("cellularEntry");
+		if (data != nil && [data respondsToSelector:ce]) {
+			entry = ((id (*)(id, SEL))objc_msgSend)(data, ce);
+		}
+		NSString *key = [ident description] ?: @"?";
+		BOOL forced = NO;
+		if (!r && sc_forcebars && entry != nil &&
+		    ([key rangeOfString:@"ignalStrength"].location != NSNotFound || [key rangeOfString:@"ame"].location != NSNotFound) &&
+		    [key rangeOfString:@"dual"].location == NSNotFound && [key rangeOfString:@"Dual"].location == NSNotFound &&
+		    [key rangeOfString:@"sos"].location == NSNotFound) {
+			r = YES;
+			forced = YES;
+		}
+		@synchronized(seen) {
+			NSNumber *was = seen[key];
+			if (was == nil || was.boolValue != r) {
+				seen[key] = @(r);
+				sc_ui_log([NSString stringWithFormat:@"condensed %@ -> %d%s entry %@", key, r, forced ? " (forced)" : "",
+				    entry ? [entry description] : @"(none in data)"]);
+			}
+		}
+		return r;
+	}));
+	sc_ui_log([NSString stringWithFormat:@"condensed item hook on (forcebars %d)", sc_forcebars]);
+}
+
 __attribute__((constructor)) static void
 sc_init(void)
 {
 	struct stat st;
-	if (stat(SC_FLAG, &st) != 0 || strcmp(getprogname(), "SpringBoard") != 0) {
+	if (stat(SC_FLAG, &st) != 0) {
 		return;
 	}
+	struct stat fb;
+	sc_forcebars = stat("/var/local/sweetcell.forcebars", &fb) == 0;
+	off_t flagsize = st.st_size;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		sc_install_ui();
+	});
+	if (strcmp(getprogname(), "SpringBoard") != 0) {
+		return;
+	}
+	st.st_size = flagsize;
 	sc_mode = st.st_size == 0 ? 1 : st.st_size >= 100 && st.st_size <= 109 ? (int)(st.st_size - 100) : 0;
 	sc_lock = [NSObject new];
 	sc_read_conf();
