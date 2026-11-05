@@ -21,20 +21,46 @@ static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b };
 static const char *svc_name[NSVC] = { "dms", "nas", "uim" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
-static const struct { int svc; uint16_t id; int once; } steps[] = {
-	{ SVC_DMS, 0x22, 1 }, { SVC_DMS, 0x23, 1 }, { SVC_DMS, 0x25, 1 }, { SVC_DMS, 0x2c, 1 }, { SVC_DMS, 0x2d, 0 },
-	{ SVC_UIM, 0x47, 0 }, { SVC_UIM, 0x2f, 0 },
-	{ SVC_NAS, 0x24, 0 }, { SVC_NAS, 0x4d, 0 }, { SVC_NAS, 0x4f, 0 },
+/* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
+enum { OPT_SLOTS = 1, OPT_HW = 2 };
+static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
+	{ SVC_DMS, 0x22, 1, 0 }, { SVC_DMS, 0x23, 1, 0 }, { SVC_DMS, 0x25, 1, 0 }, { SVC_DMS, 0x2c, 1, OPT_HW },
+	{ SVC_DMS, 0x2d, 0, 0 },
+	{ SVC_UIM, 0x47, 0, OPT_SLOTS }, { SVC_UIM, 0x2f, 0, 0 },
+	{ SVC_NAS, 0x24, 0, 0 }, { SVC_NAS, 0x4d, 0, 0 }, { SVC_NAS, 0x4f, 0, 0 },
 };
 #define NSTEPS (int)(sizeof(steps) / sizeof(steps[0]))
 
-static int enabled, step = -1, done_once[NSTEPS];
+static int enabled, opts, allowed, step = -1, done_once[NSTEPS], fails[NSTEPS], timeouts;
+static uint64_t allow_ms, first_poll, next_send;
 static uint16_t txn = 1, want_txn;
 static uint64_t sent_ms, next_round, next_check, last_log;
 static char model[48] = "?", hwrev[48] = "?", rev[128] = "?", imei[24] = "?";
 static char f_mode[32], f_sim[256], f_slots[192], f_reg[160], f_svc[96], f_sig[96];
 static char last_line[1280];
 static int bars;
+
+
+/*
+ * Append to a fixed field, never past its end. (cfc3df9 used `n += snprintf(buf + n, sizeof(buf) - n, ...)`
+ * inside the per-application loop with no check: once n passed the field's size the size argument wrapped
+ * to ~2^64 and the next write ran over the globals after it -- the suspect for the 2026-11-05 wedge.)
+ */
+#include <stdarg.h>
+static int ap_(char *buf, size_t size, int n, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static int ap_(char *buf, size_t size, int n, const char *fmt, ...)
+{
+	if (n < 0 || (size_t)n >= size - 1)
+		return n < 0 ? 0 : (int)(size - 1);
+	va_list va;
+	va_start(va, fmt);
+	int k = vsnprintf(buf + n, size - (size_t)n, fmt, va);
+	va_end(va);
+	if (k < 0)
+		return n;
+	return (size_t)n + (size_t)k >= size ? (int)(size - 1) : n + k;
+}
+#define AP(buf, n, ...) ((n) = ap_((buf), sizeof(buf), (n), __VA_ARGS__))
 
 #define ROUND_MS	30000
 #define REPLY_MS	5000
@@ -150,36 +176,36 @@ static void on_uim(const struct qmi_msg *m, unsigned e)
 	uint32_t o = 8, ncards = p[o++];
 	int n = snprintf(f_sim, sizeof(f_sim), "sim=");
 	if (!ncards)
-		n += snprintf(f_sim + n, sizeof(f_sim) - n, "no-cards");
+		AP(f_sim, n, "no-cards");
 	for (uint32_t c = 0; c < ncards && n < (int)sizeof(f_sim) - 1; c++) {
 		if (o + 6 > l) {
-			n += snprintf(f_sim + n, sizeof(f_sim) - n, "%sshort", c ? ";" : "");
+			AP(f_sim, n, "%sshort", c ? ";" : "");
 			break;
 		}
 		uint8_t cs = p[o], err = p[o + 4], napps = p[o + 5];
 		o += 6;
-		n += snprintf(f_sim + n, sizeof(f_sim) - n, "%sL%u:%s", c ? ";" : "", c + 1, NM(card_state, cs));
+		AP(f_sim, n, "%sL%u:%s", c ? ";" : "", c + 1, NM(card_state, cs));
 		if (cs == 2)
-			n += snprintf(f_sim + n, sizeof(f_sim) - n, "(%s,%u)", NM(card_err, err), err);
+			AP(f_sim, n, "(%s,%u)", NM(card_err, err), err);
 		if (cs == 1 && !napps)
-			n += snprintf(f_sim + n, sizeof(f_sim) - n, " apps=0");
+			AP(f_sim, n, " apps=0");
 		for (uint8_t a = 0; a < napps; a++) {
 			if (o + 7 > l) {
-				n += snprintf(f_sim + n, sizeof(f_sim) - n, " short");
+				AP(f_sim, n, " short");
 				o = l;
 				break;
 			}
 			uint8_t type = p[o], st = p[o + 1], aidl = p[o + 6];
 			uint32_t q = o + 7 + aidl;	/* upin_replaces_pin1, pin1_state, pin1_retries, puk1_retries, ... */
-			n += snprintf(f_sim + n, sizeof(f_sim) - n, " %s:%s", NM(app_type, type), NM(app_state, st));
+			AP(f_sim, n, " %s:%s", NM(app_type, type), NM(app_state, st));
 			if (q + 4 <= l)
-				n += snprintf(f_sim + n, sizeof(f_sim) - n, "/pin1=%s(%u)", NM(pin_state, p[q + 1]), p[q + 2]);
+				AP(f_sim, n, "/pin1=%s(%u)", NM(pin_state, p[q + 1]), p[q + 2]);
 			o = q + 7;
 		}
 	}
 	const uint8_t *hs = qmi_get(m, 0x11, &l);	/* "Hot Swap": count, then a flag per card */
 	if (hs && l >= 2 && n < (int)sizeof(f_sim) - 1)
-		snprintf(f_sim + n, sizeof(f_sim) - n, " hotswap=%u", hs[1]);
+		AP(f_sim, n, " hotswap=%u", hs[1]);
 }
 
 /*
@@ -216,12 +242,12 @@ static void on_slots(const struct qmi_msg *m, unsigned e)
 				euicc = x[xo + 6 + atrl];
 			xo += 6 + atrl + 1;
 		}
-		n += snprintf(f_slots + n, sizeof(f_slots) - n, "%sP%u:%s%s,%s,L%u", i ? "|" : "", i + 1,
+		AP(f_slots, n, "%sP%u:%s%s,%s,L%u", i ? "|" : "", i + 1,
 			      euicc == 1 ? "euicc," : "", NM(cardst, card), act == 1 ? "active" : "inactive", logical);
 		if (apps >= 0)
-			n += snprintf(f_slots + n, sizeof(f_slots) - n, ",%s,apps%d", NM(proto, pr), apps);
+			AP(f_slots, n, ",%s,apps%d", NM(proto, pr), apps);
 		if (il)
-			n += snprintf(f_slots + n, sizeof(f_slots) - n, ",iccid(%u)", il);
+			AP(f_slots, n, ",iccid(%u)", il);
 	}
 }
 
@@ -237,12 +263,12 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 		int n = snprintf(f_reg, sizeof(f_reg), "reg=%s cs=%u ps=%u radio=", NM(reg_state, p[0]), p[1], p[2]);
 		uint8_t nr = p[4];
 		if (!nr)
-			n += snprintf(f_reg + n, sizeof(f_reg) - n, "-");
+			AP(f_reg, n, "-");
 		for (uint8_t i = 0; i < nr && 5u + i < l; i++)
-			n += snprintf(f_reg + n, sizeof(f_reg) - n, "%s%s", i ? "+" : "", radio_name((int8_t)p[5 + i]));
+			AP(f_reg, n, "%s%s", i ? "+" : "", radio_name((int8_t)p[5 + i]));
 		const uint8_t *r = qmi_get(m, 0x10, &l);
 		if (r && l)
-			n += snprintf(f_reg + n, sizeof(f_reg) - n, " roam=%s", r[0] == 0 ? "on" : r[0] == 1 ? "off" : "?");
+			AP(f_reg, n, " roam=%s", r[0] == 0 ? "on" : r[0] == 1 ? "off" : "?");
 		const uint8_t *pl = qmi_get(m, 0x12, &l);	/* network (not subscriber) identity: MCC/MNC + name */
 		if (pl && l >= 5) {
 			uint16_t mcc, mnc;
@@ -251,7 +277,7 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 			memcpy(&mnc, pl + 2, 2);
 			uint16_t dl = pl[4] < l - 5 ? pl[4] : (uint16_t)(l - 5);
 			clean(name, sizeof(name), pl + 5, dl);
-			snprintf(f_reg + n, sizeof(f_reg) - n, " plmn=%03u-%02u '%s'", mcc, mnc, name);
+			AP(f_reg, n, " plmn=%03u-%02u '%s'", mcc, mnc, name);
 		}
 	} else if (id == 0x4d) {
 		static const struct { uint8_t t; const char *n; } ts[] = { { 0x12, "gsm" }, { 0x13, "wcdma" }, { 0x14, "lte" }, { 0x4a, "nr5g" } };
@@ -264,10 +290,10 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 		for (unsigned i = 0; i < sizeof(ts) / sizeof(ts[0]); i++) {
 			const uint8_t *p = qmi_get(m, ts[i].t, &l);
 			if (p && l)
-				n += snprintf(f_svc + n, sizeof(f_svc) - n, "%s%s:%s", any++ ? "," : "", ts[i].n, NM(srv_status, p[0]));
+				AP(f_svc, n, "%s%s:%s", any++ ? "," : "", ts[i].n, NM(srv_status, p[0]));
 		}
 		if (!any)
-			snprintf(f_svc + n, sizeof(f_svc) - n, "-");
+			AP(f_svc, n, "-");
 	} else if (id == 0x4f) {
 		bars = 0;
 		if (e) {
@@ -281,7 +307,7 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 			int16_t rsrp, snr;
 			memcpy(&rsrp, p + 2, 2);
 			memcpy(&snr, p + 4, 2);
-			n += snprintf(f_sig + n, sizeof(f_sig) - n, "lte rssi=%d rsrq=%d rsrp=%d snr=%d.%d", (int8_t)p[0], (int8_t)p[1], rsrp,
+			AP(f_sig, n, "lte rssi=%d rsrq=%d rsrp=%d snr=%d.%d", (int8_t)p[0], (int8_t)p[1], rsrp,
 				      snr / 10, abs(snr % 10));
 			bars = rsrp >= -95 ? 4 : rsrp >= -105 ? 3 : rsrp >= -115 ? 2 : rsrp >= -125 ? 1 : 0;
 			any = 1;
@@ -290,19 +316,19 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 			int16_t rsrp, snr;
 			memcpy(&rsrp, p, 2);
 			memcpy(&snr, p + 2, 2);
-			n += snprintf(f_sig + n, sizeof(f_sig) - n, "%snr5g rsrp=%d snr=%d", any ? " " : "", rsrp, snr);
+			AP(f_sig, n, "%snr5g rsrp=%d snr=%d", any ? " " : "", rsrp, snr);
 			any = 1;
 		}
 		if ((p = qmi_get(m, 0x13, &l)) && l >= 1) {
-			n += snprintf(f_sig + n, sizeof(f_sig) - n, "%swcdma rssi=%d", any ? " " : "", (int8_t)p[0]);
+			AP(f_sig, n, "%swcdma rssi=%d", any ? " " : "", (int8_t)p[0]);
 			any = 1;
 		}
 		if ((p = qmi_get(m, 0x12, &l)) && l >= 1) {
-			n += snprintf(f_sig + n, sizeof(f_sig) - n, "%sgsm rssi=%d", any ? " " : "", (int8_t)p[0]);
+			AP(f_sig, n, "%sgsm rssi=%d", any ? " " : "", (int8_t)p[0]);
 			any = 1;
 		}
 		if (!any)
-			snprintf(f_sig + n, sizeof(f_sig) - n, "none");
+			AP(f_sig, n, "none");
 	}
 }
 
@@ -327,17 +353,37 @@ static void publish(void)
 	}
 }
 
+#define MAX_FAILS	3		/* a step left unanswered 3 times running is dropped until cell.on changes */
+#define MAX_TIMEOUTS	2		/* 2 unanswered requests in one round: stop the round, pause 5 min */
+#define SEND_GAP_MS	200		/* never two requests closer than this; never sent from the receive path */
+#define ALLOW_AFTER_MS	15000		/* first round 15 s after Wi-Fi's WLFW bring-up ended (cell_allow) */
+#define ALLOW_LATEST_MS	180000		/* or 3 min after wland's link came up, if WLFW never shows */
+
+static void end_round(uint64_t pause)
+{
+	step = -1;
+	publish();
+	next_round = link_ms() + pause;
+}
+
+/* the next request of the round, or the end of it; called only from cell_poll */
 static void send_step(void)
 {
-	for (; step < NSTEPS; step++) {
+	for (; step >= 0 && step < NSTEPS; step++) {
 		if (steps[step].once && done_once[step])
+			continue;
+		if (steps[step].opt && !(opts & steps[step].opt))
+			continue;
+		if (fails[step] >= MAX_FAILS)
 			continue;
 		int s = steps[step].svc;
 		if (!srv[s].up)
 			continue;
 		struct qmi_buf *q = malloc(sizeof(*q));
-		if (!q)
+		if (!q) {
+			end_round(ROUND_MS);
 			return;
+		}
 		want_txn = txn++;
 		if (!txn)
 			txn = 1;
@@ -348,9 +394,33 @@ static void send_step(void)
 		sent_ms = link_ms();
 		return;
 	}
-	step = -1;
-	publish();
-	next_round = link_ms() + ROUND_MS;
+	end_round(ROUND_MS);
+}
+
+/* wland: Wi-Fi's WLFW bring-up is over (ok or not): cell may start 15 s later */
+void cell_allow(void)
+{
+	if (!allowed) {
+		allowed = 1;
+		allow_ms = link_ms() + ALLOW_AFTER_MS;
+	}
+}
+
+static int read_opts(void)
+{
+	char b[128] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	if (!f)
+		return -1;
+	size_t k = fread(b, 1, sizeof(b) - 1, f);
+	fclose(f);
+	b[k] = 0;
+	int o = 0;
+	if (strstr(b, "slots=1"))
+		o |= OPT_SLOTS;
+	if (strstr(b, "hw=1"))
+		o |= OPT_HW;
+	return o;
 }
 
 void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
@@ -380,44 +450,80 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	struct qmi_msg m;
 	if (qmi_parse(d, n, &m) || m.type != QMI_RESPONSE)
 		return;			/* indications: none registered for */
-	if (step < 0 || m.txn != want_txn || m.id != steps[step].id)
-		return;			/* late answer to a timed-out request */
+	if (!enabled || step < 0 || step >= NSTEPS || m.txn != want_txn || m.id != steps[step].id)
+		return;			/* off, or a late answer to a timed-out request */
 	unsigned e = qerr(&m);
 	switch (steps[step].svc) {
 	case SVC_DMS: on_dms(m.id, &m, e); break;
 	case SVC_UIM: if (m.id == 0x47) on_slots(&m, e); else on_uim(&m, e); break;
 	case SVC_NAS: on_nas(m.id, &m, e); break;
 	}
+	fails[step] = 0;	/* answered (an error answer, e.g. no signal without service, is normal) */
 	if (!e)
 		done_once[step] = 1;
 	step++;
-	send_step();
+	next_send = link_ms() + SEND_GAP_MS;	/* cell_poll sends the next one */
 }
 
+/*
+ * From wland's idle loop (every link_poll round). Bounded work per call: at most one file check (every 10 s)
+ * and one request sent. Nothing before cell_allow() + 15 s (Wi-Fi bring-up and rmtfs come first), nothing
+ * at all without /var/local/cell.on.
+ */
 void cell_poll(void)
 {
 	uint64_t now = link_ms();
+	if (!first_poll)
+		first_poll = now ? now : 1;
+	if (!allowed && now - first_poll > ALLOW_LATEST_MS) {
+		allowed = 1;
+		allow_ms = now;
+	}
 	if (now >= next_check) {
 		next_check = now + 10000;
-		int on = !access(CELL_ON, F_OK);
-		if (on != enabled) {
+		int o = read_opts(), on = o >= 0;
+		if (on != enabled || (on && o != opts)) {
 			enabled = on;
-			printf("[%6llu] cell: %s (%s); servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off", CELL_ON,
-			       srv[SVC_DMS].up ? "up" : "-", srv[SVC_NAS].up ? "up" : "-", srv[SVC_UIM].up ? "up" : "-");
+			opts = on ? o : 0;
+			memset(fails, 0, sizeof(fails));
+			timeouts = 0;
+			printf("[%6llu] cell: %s (%s%s%s)%s; servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off",
+			       CELL_ON, opts & OPT_SLOTS ? " slots=1" : "", opts & OPT_HW ? " hw=1" : "",
+			       allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-", srv[SVC_NAS].up ? "up" : "-",
+			       srv[SVC_UIM].up ? "up" : "-");
 			step = -1;
 			next_round = now + 1000;
 			if (!on)
 				unlink(CELL_STATUS);
 		}
 	}
-	if (!enabled)
+	if (!enabled || !allowed || now < allow_ms)
 		return;
 	if (step >= 0) {
-		if (now - sent_ms > REPLY_MS) {
-			const char *what = svc_name[steps[step].svc];
-			printf("[%6llu] cell: no answer from %s to %#x in 5 s\n", (unsigned long long)now, what, steps[step].id);
-			step++;
+		if (step >= NSTEPS) {
+			end_round(ROUND_MS);
+			return;
+		}
+		if (next_send) {			/* the last one was answered: the next after the gap */
+			if (now < next_send)
+				return;
+			next_send = 0;
 			send_step();
+			return;
+		}
+		if (now - sent_ms > REPLY_MS) {
+			printf("[%6llu] cell: no answer from %s to %#x in 5 s\n", (unsigned long long)now, svc_name[steps[step].svc],
+			       steps[step].id);
+			if (++fails[step] == MAX_FAILS)
+				printf("[%6llu] cell: %#x dropped until cell.on changes\n", (unsigned long long)now, steps[step].id);
+			if (++timeouts >= MAX_TIMEOUTS) {
+				printf("[%6llu] cell: %d requests unanswered: pausing 5 min\n", (unsigned long long)now, timeouts);
+				timeouts = 0;
+				end_round(300000);
+				return;
+			}
+			step++;
+			next_send = now + SEND_GAP_MS;
 		}
 		return;
 	}
@@ -425,11 +531,15 @@ void cell_poll(void)
 		return;
 	snprintf(f_mode, sizeof(f_mode), "mode=?");
 	snprintf(f_sim, sizeof(f_sim), "sim=?");
-	snprintf(f_slots, sizeof(f_slots), "slots=?");
+	snprintf(f_slots, sizeof(f_slots), "%s", opts & OPT_SLOTS ? "slots=?" : "slots=off");
 	snprintf(f_reg, sizeof(f_reg), "reg=?");
 	snprintf(f_svc, sizeof(f_svc), "svc=?");
 	snprintf(f_sig, sizeof(f_sig), "sig=?");
+	if (!(opts & OPT_HW) && !done_once[3])
+		snprintf(hwrev, sizeof(hwrev), "off");
+	timeouts = 0;
 	step = 0;
+	next_send = 0;
 	send_step();
 }
 

@@ -806,6 +806,7 @@ static int net(unsigned secs)
 					printf("net: no utun: joining without IP\n");
 			}
 		}
+		cell_allow();	/* the cell client (cell.on only) waits for this, + 15 s: never during WLFW/radio start */
 	}
 	radio_summary();
 	radio_stats();

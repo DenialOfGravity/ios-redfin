@@ -407,3 +407,7 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - cell (ws-n-tel, step 1b): UIM Get Slots Status 0x47 per physical slot (`slots=P1:...|P2:euicc,...`, active slot, protocol,
   apps; ICCID length only); card status walks every logical card and app (`sim=L1:present usim:ready/pin1=...`, `apps=0`
   = eUICC with no enabled profile, the 2026-11-05 phone result); DMS hardware revision 0x2c (`hw=`, model is "0" on redfin).
+- cell (ws-n-tel, step 1c, after cfc3df9 wedged boots with a SIM in): every field append clamped (cfc3df9's per-app loop
+  could write past f_sim once a reply had many apps); the client starts only 15 s after wland's WLFW bring-up ended
+  (cell_allow; 3 min fallback), never sends from the receive path (200 ms gap), drops a step after 3 unanswered tries,
+  pauses 5 min after 2 unanswered in a round; Get Slots Status and DMS hw revision only with `slots=1` / `hw=1` in cell.on.
