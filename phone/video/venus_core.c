@@ -1195,12 +1195,24 @@ static void win_faults(const char *when)	/* redfin: the window bank's fault reco
 {
 	if (!win_cbp)
 		return;
+	/* FSR bits 10:9 are FORMAT (0x400 = AArch64 record), not a fault; only 0xc00001fe are fault bits. FAR/FSYNR0
+	 * mean something only while a fault bit is set (otherwise: reset leftovers, never cleared). FAR = 0x60 low,
+	 * 0x64 high; FSYNR0 = 0x68 (bits 7:0 PLVL/WNR/etc., 23:16 ... see smmu_faults); CBFRSYNRA (GR1 0x400 + 4 n)
+	 * holds the faulting stream ID. */
 	uint32_t fsr = rd32(win_cbp + 0x58);
-	printf("venus: %s: window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x%s\n", when, fsr, rd32(win_cbp + 0x64),
-	       rd32(win_cbp + 0x60), rd32(win_cbp + 0x68), (fsr & 0xc00001feu) ? " (FAULT: a stream used an address"
-	       " outside the window)" : "");
-	pm_step("window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x (%s)", fsr, rd32(win_cbp + 0x64), rd32(win_cbp + 0x60),
-		rd32(win_cbp + 0x68), when);
+	if (!(fsr & 0xc00001feu)) {
+		printf("venus: %s: window bank: no fault (FSR %#010x)\n", when, fsr);
+		pm_step("window bank: no fault (FSR %#010x) (%s)", fsr, when);
+		return;
+	}
+	uint64_t gr1 = 0x15000000ull + ((rd32(0x15000024ull) >> 31) ? 0x10000 : 0x1000);
+	uint32_t cb = (uint32_t)((win_cbp - 0x15000000ull) / ((rd32(0x15000024ull) >> 31) ? 0x10000 : 0x1000)) -
+		      (1u << (((rd32(0x15000024ull) >> 28) & 7) + 1));
+	uint32_t frsynra = rd32(gr1 + 0x400 + 4 * cb);
+	printf("venus: %s: window bank FAULT FSR %#010x FAR %#010x%08x FSYNR0 %#010x CBFRSYNRA %#010x (stream %#x)\n",
+	       when, fsr, rd32(win_cbp + 0x64), rd32(win_cbp + 0x60), rd32(win_cbp + 0x68), frsynra, frsynra & 0xffff);
+	pm_step("window bank FAULT FSR %#010x FAR %#010x%08x FSYNR0 %#010x CBFRSYNRA %#010x (%s)", fsr, rd32(win_cbp + 0x64),
+		rd32(win_cbp + 0x60), rd32(win_cbp + 0x68), frsynra, when);
 }
 
 static void core_status(const char *when)
@@ -1217,6 +1229,119 @@ static int boot_fail(struct vstate *v)
 	printf("venus: boot failed, undoing\n");
 	teardown(v);
 	return 1;
+}
+
+/* redfin rn4x: read-only SMMU picture for the Venus range: every valid SMR that matches any SID 0x1300-0x13ff (with its
+ * S2CR, bank SCTLR/CBAR and FSR fault bits), the number of valid SMRs, and the global fault registers. Called around
+ * auth_and_reset and memory protect to see whether TZ/the hypervisor adds or changes SMRs for the video streams. */
+void smmu_snapshot(const char *when)
+{
+	uint64_t s = 0x15000000ull;
+	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24), nsmr = id0 & 0xff, valid = 0;
+	uint32_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i);
+		if (!(smr >> 31))
+			continue;
+		valid++;
+		uint32_t first = 0, cnt = 0;
+		for (uint32_t sid = 0x1300; sid <= 0x13ff; sid++)
+			if (sid_match(smr, sid))
+				first = cnt++ ? first : sid;
+		if (!cnt)
+			continue;
+		uint32_t s2cr = rd32(s + 0xc00 + 4 * i), cb = s2cr & 0xff;
+		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
+		printf("venus: smmu %s: SMR%u %08x (%u SIDs from %#x) S2CR %08x type %u CB%u SCTLR %08x CBAR %08x FSR %08x\n",
+		       when, i, smr, cnt, first, s2cr, (s2cr >> 16) & 3, cb, rd32(cbp), rd32(s + psize + 4 * cb), rd32(cbp + 0x58));
+		pm_step("smmu %s: SMR%u %08x (%u SIDs from %#x) S2CR %08x CB%u SCTLR %08x CBAR %08x FSR %08x", when, i, smr, cnt,
+			first, s2cr, cb, rd32(cbp), rd32(s + psize + 4 * cb), rd32(cbp + 0x58));
+	}
+	printf("venus: smmu %s: %u valid SMRs, sCR0 %08x sGFSR %08x sGFSYNR0 %08x sGFSYNR1 %08x sGFSYNR2 %08x\n", when, valid,
+	       rd32(s), rd32(s + 0x48), rd32(s + 0x50), rd32(s + 0x54), rd32(s + 0x58));
+	pm_step("smmu %s: %u valid SMRs, sCR0 %08x sGFSR %08x sGFSYNR0 %08x sGFSYNR1 %08x sGFSYNR2 %08x", when, valid,
+		rd32(s), rd32(s + 0x48), rd32(s + 0x50), rd32(s + 0x54), rd32(s + 0x58));
+}
+
+/*
+ * redfin rn4x: SMMU setup for the Venus SIDs, by VENUSCTL_SMMU:
+ *   window   (default) all of them through one translating bank mapping only FIXED_LO-FIXED_HI (smmu_window)
+ *   identity translation-off banks, one per SID (sunfish's way; 4 SIDs passed boot/init/session on rn4x)
+ *   hybrid   identity for the 0x1380 group, the window bank for 0x1360 only
+ * Appends to v (STATE saved). 0 = ok.
+ */
+static int map_sids(struct vstate *v, const uint16_t *sids, unsigned n, const char *mode)
+{
+	if (!strcmp(mode, "identity") || !strcmp(mode, "hybrid")) {
+		for (unsigned k = 0; k < n; k++) {
+			if (!strcmp(mode, "hybrid") && sids[k] == 0x1360)
+				continue;
+			smmu_last.slot = -1;
+			int bad = smmu_identity("venus", sids[k], 0);
+			if (smmu_last.slot >= 0) {
+				v->sid[v->nsmr] = sids[k];
+				v->smr[v->nsmr++] = smmu_last;
+				state_save(v);
+				printf("venus: SID %#x: SMR%d + CB%d added (identity)\n", sids[k], smmu_last.slot, smmu_last.cb);
+			}
+			if (bad)
+				return -1;
+		}
+		if (!strcmp(mode, "identity"))
+			return 0;
+	}
+	uint16_t w[8];
+	unsigned nw = 0;
+	for (unsigned k = 0; k < n && nw < 8; k++)
+		if (strcmp(mode, "hybrid") || sids[k] == 0x1360)
+			w[nw++] = sids[k];
+	if (!nw)
+		return 0;
+	if (strcmp(mode, "window") && strcmp(mode, "hybrid")) {
+		printf("venus: refused: VENUSCTL_SMMU=%s (window, identity or hybrid)\n", mode);
+		return -1;
+	}
+	struct smmu_saved sv[8];
+	int wcb = smmu_window("venus", w, nw, FIXED_LO, FIXED_HI - FIXED_LO, SMMU_TBL, sv);
+	if (wcb < 0)
+		return -1;
+	for (unsigned k = 0; k < nw; k++) {
+		v->sid[v->nsmr] = w[k];
+		v->smr[v->nsmr++] = sv[k];
+	}
+	win_cbp = sv[0].cbp;
+	state_save(v);
+	printf("venus: %u SID(s) through window bank CB%d (%#llx-%#llx, IOVA = PA)\n", nw, wcb,
+	       (unsigned long long)FIXED_LO, (unsigned long long)FIXED_HI);
+	return 0;
+}
+
+/* redfin rn4x: `venusctl map-sid SID` after boot --keep (and init): one more SID now, recorded in STATE (shutdown
+ * releases it); mode as VENUSCTL_SMMU (window default). Tests whether 0x1360's SMR kills the phone only when it is
+ * there at auth_and_reset. */
+int map_sid(uint32_t sid)
+{
+	struct vstate v;
+	if (state_load(&v)) {
+		printf("venus: refused: no %s (boot --keep first)\n", STATE);
+		return 1;
+	}
+	for (int i = 0; i < v.nsmr; i++)
+		if (v.sid[i] == sid) {
+			printf("venus: refused: SID %#x already mapped (SMR%d)\n", sid, v.smr[i].slot);
+			return 1;
+		}
+	if (v.nsmr >= 8) {
+		printf("venus: refused: 8 SMRs recorded already\n");
+		return 1;
+	}
+	smmu_snapshot("before map-sid");
+	uint16_t one = (uint16_t)sid;
+	const char *mode = getenv("VENUSCTL_SMMU") ? getenv("VENUSCTL_SMMU") : "window";
+	int rc = map_sids(&v, &one, 1, !strcmp(mode, "hybrid") ? "window" : mode);
+	smmu_snapshot("after map-sid");
+	core_status("after map-sid");
+	return rc ? 1 : 0;
 }
 
 int boot(const char *fw, int keep)
@@ -1275,34 +1400,11 @@ int boot(const char *fw, int keep)
 				return 1;
 			}
 	}
-	const char *smode = getenv("VENUSCTL_SMMU");
-	if (!smode || strcmp(smode, "identity")) {	/* redfin default: the window bank (see SMMU_TBL) */
-		struct smmu_saved sv[8];
-		int wcb = smmu_window("venus", venus_sids, nsid, FIXED_LO, FIXED_HI - FIXED_LO, SMMU_TBL, sv);
-		if (wcb < 0)
-			return boot_fail(&v);
-		for (unsigned k = 0; k < nsid; k++) {
-			v.sid[v.nsmr] = venus_sids[k];
-			v.smr[v.nsmr++] = sv[k];
-		}
-		win_cbp = sv[0].cbp;
-		state_save(&v);
-		printf("venus: %u SIDs through window bank CB%d (%#llx-%#llx, IOVA = PA)\n", nsid, wcb,
-		       (unsigned long long)FIXED_LO, (unsigned long long)FIXED_HI);
-	}
-	for (unsigned k = 0; smode && !strcmp(smode, "identity") && k < nsid; k++) {
-		smmu_last.slot = -1;	/* a failed call leaves smmu_last alone: don't record the previous SID twice */
-		int bad = smmu_identity("venus", venus_sids[k], 0);
-		if (smmu_last.slot >= 0) {
-			v.sid[v.nsmr] = venus_sids[k];
-			v.smr[v.nsmr++] = smmu_last;
-			state_save(&v);
-			printf("venus: SID %#x: SMR%d + CB%d added\n", venus_sids[k], smmu_last.slot, smmu_last.cb);
-		}
-		if (bad)
-			return boot_fail(&v);
-	}
-
+	const char *smode = getenv("VENUSCTL_SMMU") ? getenv("VENUSCTL_SMMU") : "window";
+	smmu_snapshot("before boot");
+	if (map_sids(&v, venus_sids, nsid, smode))
+		return boot_fail(&v);
+	smmu_snapshot("SIDs mapped");
 	/* clock_config_on_enable_vpu5 (venus_hfi.c:4703-4707), part of downstream __venus_power_on before the PIL load */
 	if (!getenv("VENUSCTL_NO_CLKCFG")) {
 		wr(WRAP_CPU_CGCDIS, 0, "CPU_CGC_DIS");
@@ -1367,6 +1469,7 @@ int boot(const char *fw, int keep)
 	}
 	if (pas(5, "auth_and_reset"))
 		return boot_fail(&v);
+	smmu_snapshot("after auth");
 	if (!getenv("VENUSCTL_NO_MEMPROT")) {
 		uint64_t x[8] = { SCM_MP_VIDEO_VAR, 4, 0, CP_SIZE, CP_NP_START, CP_NP_SIZE, 0, 0 };
 		printf("venus: mem protect video var (0, %#x, %#x, %#x)...\n", CP_SIZE, CP_NP_START, CP_NP_SIZE);
@@ -1375,6 +1478,7 @@ int boot(const char *fw, int keep)
 		if (x[0])
 			return boot_fail(&v);
 	}
+	smmu_snapshot("after mem protect");
 	core_status("after auth");
 	if (keep) {
 		printf("venus: boot ok, kept (state %s): next venusctl init, or venusctl shutdown\n", STATE);

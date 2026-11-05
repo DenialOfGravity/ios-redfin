@@ -390,14 +390,23 @@ int smmu_window(const char *name, const uint16_t *sids, unsigned n, uint64_t bas
 		return cb;
 	}
 	static const uint64_t zero[512];
-	uint64_t l1 = tbl, l2 = tbl + 0x1000, d;
-	pm_wr(l1, zero, sizeof(zero));
-	pm_wr(l2, zero, sizeof(zero));
-	d = l2 | 3;
-	pm_wr(l1 + 8 * ((base >> 30) & 0x1ff), &d, 8);
-	for (uint64_t o = 0; o < len; o += 0x200000) {
-		d = (base + o) | (R_PAGE & ~2ull);	/* block: attr 0, AP 01, SH 2, AF, nG */
-		pm_wr(l2 + 8 * (((base + o) >> 21) & 0x1ff), &d, 8);
+	uint64_t l1 = tbl, l2 = tbl + 0x1000, d, c1 = 0, cb0 = 0, cbe = 0;
+	/* a second window bank (venusctl map-sid) shares the tables: rewrite them only if they aren't already ours, so a
+	 * live bank never walks half-written tables */
+	pm_rd(l1 + 8 * ((base >> 30) & 0x1ff), &c1, 8);
+	pm_rd(l2 + 8 * ((base >> 21) & 0x1ff), &cb0, 8);
+	pm_rd(l2 + 8 * (((base + len - 1) >> 21) & 0x1ff), &cbe, 8);
+	if (c1 == (l2 | 3) && cb0 == (base | (R_PAGE & ~2ull)) && cbe == ((base + len - 0x200000) | (R_PAGE & ~2ull))) {
+		printf("smmu: %s: tables at %llx already map the window: shared\n", name, (unsigned long long)tbl);
+	} else {
+		pm_wr(l1, zero, sizeof(zero));
+		pm_wr(l2, zero, sizeof(zero));
+		d = l2 | 3;
+		pm_wr(l1 + 8 * ((base >> 30) & 0x1ff), &d, 8);
+		for (uint64_t o = 0; o < len; o += 0x200000) {
+			d = (base + o) | (R_PAGE & ~2ull);	/* block: attr 0, AP 01, SH 2, AF, nG */
+			pm_wr(l2 + 8 * (((base + o) >> 21) & 0x1ff), &d, 8);
+		}
 	}
 	uint64_t asid = (uint64_t)cb << 48;
 	wr32(cbp, 0);
