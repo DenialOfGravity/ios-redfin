@@ -165,6 +165,12 @@ public:
     // has returned; otherwise at once, inside the submit call. RECOVERS: the kernel resets the GPU after a hang
     // (gpu_recover=1); false is the kernel without it, where the first hang ends every later wait at once.
     explicit FakeGpu(bool async = false, uint32_t delayUs = 0, bool recovers = true);
+    // (redfin) the chip the fake is: defaultChip() unless given (tests/main.cpp sets it from --chip / HMETAL_CHIP), and
+    // what it reports (GET_PARAM CHIP_ID, GMEM_SIZE) and holds a stream to (instruction cache, gen4-only registers,
+    // LRZ feedback, early preamble, magic registers, the sysmem CCU layout, gen1's WFM before an indirect draw)
+    FakeGpu(const a6xx::ChipInfo& chip, bool async = false, uint32_t delayUs = 0, bool recovers = true);
+    static const a6xx::ChipInfo*& defaultChip();
+    const a6xx::ChipInfo& chip() const { return *chip_; }
     ~FakeGpu() override;
 
     int call(uint32_t request, void* data, size_t size) override;
@@ -188,6 +194,7 @@ public:
 
     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
     static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
+                                                         // (redfin: the A635's; the fake reports chip().chipId)
     static constexpr uint64_t kSpeedBin = 0x75;          // the phone's fuse value above the chip id, as the probe read it
                                                          // (0x7506030500 on 28 October); Mesa's named row for this part
     static constexpr uint64_t kGmemBytes = 512 * 1024;
@@ -256,6 +263,7 @@ private:
     bool checkIboDescriptors(uint64_t table, uint32_t nibo);
     bool checkSampler(const uint32_t* d, uint32_t i);
     uint32_t reg(uint32_t r) const;
+    bool magicOk(uint32_t r, uint32_t v);
     uint64_t reg64(uint32_t r) const;
     void fault(const std::string& why);
     void hung();
@@ -295,7 +303,9 @@ private:
     std::set<uint64_t> ubwcWritten_;   // the UBWC images a copy has written (their data addresses)
     uint32_t binQueued_ = 0;   // tiles' streams handed over (CP_SET_BIN_DATA5*) and not yet let go by RM6_BIN_END_OF_DRAWS
     bool binning_ = false;   // between RM6_BIN_VISIBILITY and the first tile: the draws only bin
-    std::vector<uint8_t> gmem_ = std::vector<uint8_t>(a6xx::kGmemBytes);
+    const a6xx::ChipInfo* chip_ = defaultChip();
+    bool lastWasWfm_ = false;   // (redfin) the last packet was CP_WAIT_FOR_ME: gen1's indirect draw wants one before it
+    std::vector<uint8_t> gmem_ = std::vector<uint8_t>(chip_->gmemBytes);
     bool tileState(uint32_t* binW, uint32_t* binH, uint32_t win[4]);
     bool eventBlit();
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it

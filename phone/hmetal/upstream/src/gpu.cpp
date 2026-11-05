@@ -1,5 +1,7 @@
 #include "hakios-metal/gpu.hpp"
 
+#include "hakios-metal/a6xx.hpp"
+
 #include <cerrno>
 #include <cstring>
 
@@ -18,6 +20,19 @@ MsmTimespec deadline(Transport& t, int64_t ns) {
     return MsmTimespec{at / 1000000000, at % 1000000000};
 }
 }  // namespace
+
+// (redfin) the chip this process drives, one GPU per process: the A635 until a Gpu names another
+namespace a6xx {
+namespace {
+std::atomic<const ChipInfo*> gChip{&kChipA635};
+}
+const ChipInfo& chip() { return *gChip.load(std::memory_order_relaxed); }
+void selectChip(const ChipInfo& c) { gChip.store(&c, std::memory_order_relaxed); }
+}  // namespace a6xx
+
+Gpu::Gpu(std::unique_ptr<Transport> transport) : t_(std::move(transport)) {
+    if (const a6xx::ChipInfo* c = a6xx::chipFor(chipId())) a6xx::selectChip(*c);
+}
 
 int Gpu::param(uint32_t which, uint64_t* value) {
     MsmParam p{};

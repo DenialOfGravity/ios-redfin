@@ -153,7 +153,8 @@ struct BoUse {
 
 class Gpu {
 public:
-    explicit Gpu(std::unique_ptr<Transport> transport) : t_(std::move(transport)) {}
+    // (redfin) asks the transport for the chip id and selects that chip's row (a6xx::selectChip) when there is one
+    explicit Gpu(std::unique_ptr<Transport> transport);
 
     // what the driver says about the GPU (kParam...): 0 and *value, or an errno
     int param(uint32_t which, uint64_t* value);

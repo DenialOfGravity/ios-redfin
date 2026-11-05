@@ -167,10 +167,18 @@ bool allZero(const uint32_t* d, uint32_t n) {
 }
 }  // namespace
 
-FakeGpu::FakeGpu(bool async, uint32_t delayUs, bool recovers) : async_(async), recovers_(recovers), delayUs_(delayUs) {
+FakeGpu::FakeGpu(bool async, uint32_t delayUs, bool recovers) : FakeGpu(*defaultChip(), async, delayUs, recovers) {}
+
+FakeGpu::FakeGpu(const a6xx::ChipInfo& chip, bool async, uint32_t delayUs, bool recovers)
+    : chip_(&chip), gmem_(chip.gmemBytes), async_(async), recovers_(recovers), delayUs_(delayUs) {
     if (async_) {
         thread_ = std::thread([this] { worker(); });
     }
+}
+
+const a6xx::ChipInfo*& FakeGpu::defaultChip() {
+    static const a6xx::ChipInfo* c = &a6xx::kChipA635;
+    return c;
 }
 
 FakeGpu::~FakeGpu() {
@@ -271,6 +279,40 @@ void FakeGpu::fault(const std::string& why) {
     stats_.lastFault = why;
 }
 
+// (redfin) a magic register written with another chip's value: the blob's numbers are per chip (freedreno_devices.py
+// magic_regs), and RB_CCU_CNTL in sysmem shape must put the colour cache after this chip's depth caches
+bool FakeGpu::magicOk(uint32_t r, uint32_t v) {
+    using namespace a6xx;
+    const ChipInfo& c = *chip_;
+    switch (r) {
+    case REG_A6XX_RB_DBG_ECO_CNTL: case REG_A6XX_SP_DBG_ECO_CNTL: case REG_A6XX_TPL1_DBG_ECO_CNTL: case REG_A6XX_VPC_DBG_ECO_CNTL:
+    case REG_A6XX_GRAS_DBG_ECO_CNTL: case REG_A6XX_HLSQ_DBG_ECO_CNTL: case REG_A6XX_SP_CHICKEN_BITS: case REG_A6XX_UCHE_UNKNOWN_0E12:
+    case REG_A6XX_UCHE_CLIENT_PF: case REG_A6XX_RB_UNKNOWN_8E01: case REG_A6XX_PC_MODE_CNTL: {
+        const uint32_t want = a6xx::staticValue(a6xx::RegWrite{r, 0}, c);
+        if (v != want) {
+            fault(text("magic register %#llx written %#llx: ", r, v) + c.name + text("'s value is %#llx", want));
+            return false;
+        }
+        break;
+    }
+    default: break;
+    }
+    if ((r == REG_A6XX_PC_POWER_CNTL || r == REG_A6XX_VFD_POWER_CNTL) && v != c.magic.pcPowerCntl) {
+        fault(text("register %#llx (PC/VFD_POWER_CNTL) written %#llx: ", r, v) + c.name + text("'s is %#llx", c.magic.pcPowerCntl));
+        return false;
+    }
+    if (r == REG_A6XX_RB_CCU_CNTL && fieldOf(v, A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE__MASK, A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE__SHIFT) == CCU_CACHE_SIZE_FULL) {
+        const uint32_t at = fieldOf(v, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
+                            fieldOf(v, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT) << 21;
+        if (at != 0 && at != c.numCcu * c.sysmemPerCcuDepthCacheSize) {
+            fault(text("RB_CCU_CNTL %#llx: the sysmem colour cache at %#llx, ", v, at) + c.name +
+                  text("'s depth caches end at %#llx", c.numCcu * c.sysmemPerCcuDepthCacheSize));
+            return false;
+        }
+    }
+    return true;
+}
+
 uint32_t FakeGpu::reg(uint32_t r) const {
     auto it = regs_.find(r);
     return it == regs_.end() ? 0 : it->second;
@@ -361,8 +403,8 @@ bool FakeGpu::loadState(uint32_t opcode, const uint32_t* p, uint32_t count) {
         return false;
     }
     uint32_t unitBytes = texBlock ? (type == ST6_SHADER ? 16 : 64) : type == ST6_SHADER ? 128 : type == ST6_CONSTANTS ? 16 : type == ST6_UBO ? 8 : 64;
-    if (!texBlock && type == ST6_SHADER && units > kInstrCacheSize) {
-        fault(text("a program preload of %llu units: 128 hangs this GPU, the instruction cache holds %llu", units, kInstrCacheSize));
+    if (!texBlock && type == ST6_SHADER && units > chip_->instrCacheSize) {
+        fault(text("a program preload of %llu units: %llu hangs this GPU, the instruction cache holds %llu", units, chip_->instrCacheSize + 1, chip_->instrCacheSize));
         return false;
     }
     uint64_t from = 0;
@@ -667,11 +709,24 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
         return false;
     }
-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+    // (redfin) the SP's / HLSQ's copies exist on gen4 alone (has_lpac): on another chip a write of one is a write to
+    // whatever that offset is there, and refused
+    if (!chip_->hasLpac) {
+        for (uint32_t r : {REG_A6XX_SP_CS_CNTL_0, REG_A6XX_SP_CS_CNTL_1, REG_A6XX_HLSQ_CS_CTRL_REG1}) {
+            if (regs_.count(r) != 0) {
+                fault(text("register %#llx (SP_CS_CNTL_0/1, HLSQ_CS_CTRL_REG1: gen4's has_lpac copies) written on a chip without them", r));
+                return false;
+            }
+        }
+    } else if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
         return false;
     }
-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+    if ((ctrl0 & A6XX_SP_CS_CTRL_REG0_EARLYPREAMBLE) != 0 && !chip_->hasEarlyPreamble) {
+        fault("SP_CS_CTRL_REG0.EARLYPREAMBLE on a chip without early preamble");
+        return false;
+    }
+    if (chip_->hasLpac && reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
         return false;
     }
@@ -1291,6 +1346,19 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     }
     uint32_t binW = 0, binH = 0, tileWin[4] = {};
     if (inTile_ && !tileState(&binW, &binH, tileWin)) {
+        return false;
+    }
+    // (redfin) the LRZ feedback mask only on a chip with lrz feedback; early preamble only on a chip with it
+    for (uint32_t r : {REG_A6XX_GRAS_BIN_CONTROL, REG_A6XX_RB_BIN_CONTROL}) {
+        if (!chip_->hasLrzFeedback && (reg(r) & A6XX_GRAS_BIN_CONTROL_LRZ_FEEDBACK_ZMODE_MASK__MASK) != 0) {
+            fault(std::string(r == REG_A6XX_GRAS_BIN_CONTROL ? "GRAS_BIN_CONTROL" : "RB_BIN_CONTROL") +
+                  text(" %#llx: an LRZ feedback mask on a chip without lrz feedback", reg(r)));
+            return false;
+        }
+    }
+    if (!chip_->hasEarlyPreamble && ((reg(REG_A6XX_SP_VS_CTRL_REG0) & A6XX_SP_VS_CTRL_REG0_EARLYPREAMBLE) != 0 ||
+                                     (reg(REG_A6XX_SP_FS_CTRL_REG0) & A6XX_SP_FS_CTRL_REG0_EARLYPREAMBLE) != 0)) {
+        fault("SP_VS/FS_CTRL_REG0.EARLYPREAMBLE on a chip without early preamble");
         return false;
     }
     for (uint32_t r : {REG_A6XX_GRAS_BIN_CONTROL, REG_A6XX_RB_BIN_CONTROL}) {
@@ -1935,6 +2003,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             for (uint32_t j = 0; j < h.count; j++) {
                 regs_[h.reg + j] = p[j];   // kept as written; a dispatch or a draw is checked against them
                 written_.insert(h.reg + j);
+                if (!magicOk(h.reg + j, p[j])) return false;
                 if (h.reg + j == REG_A6XX_RB_CCU_CNTL) {
                     // "isn't pipelined" (tu_cmd_buffer.cc:373-377): both witnesses write it right after a CP_WAIT_FOR_IDLE
                     ccuCntlWritten_ = true;
@@ -2099,6 +2168,11 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 break;
             }
             case CP_DRAW_INDIRECT_MULTI: {
+                // (redfin) gen1 (indirect_draw_wfm_quirk): turnip puts a CP_WAIT_FOR_ME right before it
+                if (chip_->indirectDrawWfmQuirk && !lastWasWfm_) {
+                    fault("CP_DRAW_INDIRECT_MULTI without a CP_WAIT_FOR_ME right before it, on a chip with indirect_draw_wfm_quirk");
+                    return false;
+                }
                 // one draw (DRAW_COUNT 1), its words read from memory as the packet runs (tu_CmdDrawIndirect's layout:
                 // Vulkan's draw commands, Metal's indirect arguments): the CP sets VFD_INDEX_OFFSET and
                 // VFD_INSTANCE_START_OFFSET from them and the draw goes on as CP_DRAW_INDX_OFFSET's would, checked the same
@@ -2348,6 +2422,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             }
         }
         lastWasWfi_ = h.kind == pm4::Header::kCommand && h.opcode == pm4::kWaitForIdle;
+        lastWasWfm_ = h.kind == pm4::Header::kCommand && h.opcode == pm4::kWaitForMe;
         i += 1 + h.count;
     }
     return true;
@@ -2437,8 +2512,8 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         // the kernel's table (bsd/dev/hakios.adreno.c, hakios_gpu_parameter), number for number
         switch (p->param) {
         case kParamGpuId: p->value = 0; return 0;                   // "none, the chip ID says it"
-        case kParamGmemSize: p->value = kGmemBytes; return 0;
-        case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
+        case kParamGmemSize: p->value = chip_->gmemBytes; return 0;
+        case kParamChipId: p->value = chip_->chipId | kSpeedBin << 32; return 0;
         case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
         case kParamTimestamp: p->value = uint64_t(nowNs()); return 0;
         case kParamGmemBase: p->value = 0; return 0;

@@ -416,3 +416,10 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Slot 0x46 (logical 1 -> physical 1, once per cell.on change, only if P1 holds a card and is inactive; rmtfs images
   copied to *.pre-slot first) and `online=1` / `online=0` DMS Set Operating Mode 0x2e online / low power (2 tries, only
   if the mode differs; *.pre-online copies first). An offline (3) modem refuses (0x35); no reset is ever sent.
+- hmetal (ws-hm-a620): phone/hmetal/upstream = oosexgang/hakios-xnu-kernel hakios-metal/ at 2631f5d (MIT, LICENSE+NOTICE kept;
+  no Apple-derived file in it, none excluded). Host build: Mesa fixture rules only with a Mesa build or MESA=1.
+- hmetal (ws-hm-a620, H0): per-chip table a6xx::ChipInfo (A635 row = upstream's constants, A620 row = Mesa FD620 gen1: 1 CCU,
+  instr cache 64, 128*16 fibers, magic regs as xnu 0904), chosen from the reported chip id when a Gpu is made
+  (0x06020000/0x060200xx); gen4-only writes gated (SP_CS_CNTL_0/1, HLSQ_CS_CTRL_REG1, LRZ feedback, EARLYPREAMBLE), RB_CCU_CNTL
+  0x08000000 sysmem / 0x3e400000 GMEM on A620, WFM before indirect draws (gen1 quirk); ir3 and fdl use the device's chip.
+  Fake GPU runs as either (`make test` = both, CHIP=a620 one; tests/main --chip).

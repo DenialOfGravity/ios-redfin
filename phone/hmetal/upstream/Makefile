@@ -31,8 +31,12 @@ HOSTOUT   = out/host$(if $(SAN),-$(SAN))
 # $(HAKIOS)/xnu-deps/build/mesa at parse time, which an unset HAKIOS would turn into a silent empty set
 # (in the kernel's tree, hakios-metal/: that tree; beside it, HAKIOS= or the workspace of old)
 HAKIOS    ?= $(if $(wildcard ../xnu/apply.sh),..,../workspace)
+# (redfin: both fragments only where a Mesa build is there, or MESA= asks: their fixture rules would otherwise send a
+# plain `make test` after ir3_compiler whenever a checkout leaves a fixture older than its .ll)
+ifneq ($(strip $(MESA))$(wildcard $(abspath $(HAKIOS))/xnu-deps/build/mesa-host/build/build.ninja),)
 -include tools/kernels.mk
 -include tools/compiler.mk
+endif
 ifneq ($(strip $(MESA)),)
 override CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_MESA_CXXFLAGS)
 HOSTLIBS  += $(HAKIOS_METAL_MESA_LIBS)
@@ -72,8 +76,11 @@ $(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
 sweep: $(HOSTOUT)/sweep
 
 # (with the compiler in, compiler_test compiles every tools/kernels/*.ll against its fixture: their bitcode must be there)
+# (redfin) CHIP=a620 or CHIP=a635 runs the suite as that chip (default: both, one after the other)
+CHIP      ?= a635 a620
 test: $(HOSTOUT)/tests $(if $(strip $(MESA)),$(KERNEL_BC))
-	$(HOSTOUT)/tests
+	@for c in $(CHIP); do echo "== $$c"; $(HOSTOUT)/tests --chip $$c > $(HOSTOUT)/test-$$c.log 2>&1; r=$$?; \
+		grep -E "^chip:|FAIL|tests, " $(HOSTOUT)/test-$$c.log; [ $$r -eq 0 ] || exit $$r; done
 
 tsan:
 	$(MAKE) test SAN=thread
@@ -121,8 +128,11 @@ out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard
 
 
 # a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll)
+# (redfin: with the Mesa fragments only, as above: another llvm-as writes other bytes, and a checkout's mtimes are no reason to)
+ifneq ($(strip $(MESA))$(wildcard $(abspath $(HAKIOS))/xnu-deps/build/mesa-host/build/build.ninja),)
 tests/fixtures/%_bc.hpp: out/host/kernels/%.bc tools/bc-header.py
 	python3 -I tools/bc-header.py $< $* > $@
+endif
 
 clean:
 	rm -rf out

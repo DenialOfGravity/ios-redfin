@@ -214,8 +214,9 @@ const char* hakios_metal_error(void) { return lastError.c_str(); }
 
 // Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
 // word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
-bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
-static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
+// (redfin) every chip a6xx.hpp has a row for (the A635, the A620)
+bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || a6xx::chipFor(chip) != nullptr; }
+[[maybe_unused]] static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
 
 static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
     auto* d = new hakios_metal_device;
@@ -235,8 +236,8 @@ hakios_metal_device* hakios_metal_open(void) {
     hakios_metal_device* d = deviceOn(std::move(t));
     if (!chipKnown(d->gpu->chipId())) {
         char text[160];
-        snprintf(text, sizeof(text), "the GPU's chip ID is %#x: the tables of this driver are the Adreno's of chip ID %#x (a6xx.hpp), another's would hang it",
-                 d->gpu->chipId(), a6xx::kChipId);
+        snprintf(text, sizeof(text), "the GPU's chip ID is %#x: this driver has tables for chip IDs %#x and %#x (a6xx.hpp), another's would hang it",
+                 d->gpu->chipId(), a6xx::kChipA635.chipId, a6xx::kChipA620.chipId);
         failed(text);
         delete d;
         return nullptr;

@@ -903,3 +903,72 @@ TEST(a6xx_first_draw_fs_input_output_and_raster_words) {
     CHECK_EQ(CP_DRAW_INDX_OFFSET_2_NUM_INDICES(3), 3u);
     CHECK_EQ(CP_DRAW_INDX_OFFSET_0_GS_ENABLE, 0x10000u);
 }
+
+// --- (redfin) the per-chip table: the A620 row against Mesa's FD620 entry, worked out by hand ---------------------------
+TEST(a620_chip_row_is_mesas_fd620) {
+    const ChipInfo& c = kChipA620;
+    CHECK_EQ(c.chipId, 0x06020000u);
+    CHECK(chipFor(0x06020000) == &kChipA620);   // our kernel's (xnu/patches/0904)
+    CHECK(chipFor(0x060200ff) == &kChipA620);   // Mesa's wildcard
+    CHECK(chipFor(0x06030500) == &kChipA635);
+    CHECK(chipFor(0x06010800) == nullptr);      // the A618: no row
+    CHECK_EQ(c.gen, 1u);
+    CHECK(!c.hasLpac && !c.hasLrzFeedback && !c.hasEarlyPreamble && !c.hasTexFilterCubic);
+    CHECK(c.hasCpRegWrite && c.hasGmemFastClear && c.supportsDoubleThreadsize && c.hasFsTexPrefetch);
+    CHECK(c.indirectDrawWfmQuirk && c.depthBoundsRequireDepthTestQuirk);
+    CHECK_EQ(c.numCcu, 1u);
+    CHECK_EQ(c.fibersPerSp, 2048u);
+    CHECK_EQ(c.instrCacheSize, 64u);
+    CHECK_EQ(c.regSizeVec4, 96u);
+    CHECK_EQ(c.gmemBytes, 512u * 1024);
+    CHECK_EQ(c.tileAlignW, 32u);
+    CHECK_EQ(c.tileAlignH, 16u);
+    CHECK_EQ(c.numVscPipes, 32u);
+    CHECK_EQ(c.csSharedMemSize, 32u * 1024);
+    CHECK_EQ(c.waveGranularity, 2u);
+    // magic_regs, FD620
+    CHECK_EQ(c.magic.pcPowerCntl, 0u);
+    CHECK_EQ(c.magic.tpl1DbgEcoCntl, 0x01008000u);
+    CHECK_EQ(c.magic.grasDbgEcoCntl, 0u);
+    CHECK_EQ(c.magic.spChickenBits, 0x400u);
+    CHECK_EQ(c.magic.ucheClientPf, 0x4u);
+    CHECK_EQ(c.magic.pcModeCntl, 0x1fu);
+    CHECK_EQ(c.magic.spDbgEcoCntl, 0x01000000u);
+    CHECK_EQ(c.magic.rbDbgEcoCntl, 0x04100000u);
+    CHECK_EQ(c.magic.rbDbgEcoCntlBlit, 0x04100000u);
+    CHECK_EQ(c.magic.hlsqDbgEcoCntl, 0u);
+    CHECK_EQ(c.magic.rbUnknown8E01, 0u);
+    CHECK_EQ(c.magic.vpcDbgEcoCntl, 0x02000000u);
+    CHECK_EQ(c.magic.ucheUnknown0E12, 1u);
+    // RB_CCU_CNTL: sysmem colour after 1 x 64K of depth = 0x10000 >> 12 = 0x10 << 23 = 0x08000000 (what the kernel's
+    // own blit writes); GMEM colour at 512K - 64K / 4 = 0x7c000: 0x7c000 >> 12 = 0x7c << 23 = 0x3e000000, QUARTER 2 << 21
+    CHECK_EQ(rbCcuCntlSysmem(c), 0x08000000u);
+    CHECK_EQ(gmemCcuColorOffset(c), 0x7c000u);
+    CHECK_EQ(rbCcuCntlGmem(c), 0x3e400000u);
+    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(c.instrCacheSize), 64u << 22);
+    // the static table as this chip writes it: the magic entries take its values, the rest are the table's
+    for (const RegWrite& w : kStaticState) {
+        const uint32_t v = staticValue(w, c);
+        if (w.reg == REG_A6XX_TPL1_DBG_ECO_CNTL) CHECK_EQ(v, 0x01008000u);
+        else if (w.reg == REG_A6XX_SP_CHICKEN_BITS) CHECK_EQ(v, 0x400u);
+        else if (w.reg == REG_A6XX_UCHE_CLIENT_PF) CHECK_EQ(v, 0x4u);
+        else if (w.reg == REG_A6XX_SP_DBG_ECO_CNTL) CHECK_EQ(v, 0x01000000u);
+        else CHECK_EQ(v, w.value);
+    }
+}
+
+// the A635 row is the A635 constants above, field for field (nothing of the old behaviour moved)
+TEST(a635_chip_row_is_the_a635_constants) {
+    const ChipInfo& c = kChipA635;
+    CHECK_EQ(c.chipId, kChipId);
+    CHECK(c.hasLpac && c.hasLrzFeedback && !c.hasEarlyPreamble && c.hasTexFilterCubic);
+    CHECK(!c.indirectDrawWfmQuirk);
+    CHECK_EQ(c.instrCacheSize, kInstrCacheSize);
+    CHECK_EQ(c.fibersPerSp, kFibersPerSp);
+    CHECK_EQ(c.numSpCores, kNumSpCores);
+    CHECK_EQ(c.numCcu, kNumCcu);
+    CHECK_EQ(c.gmemBytes, kGmemBytes);
+    CHECK_EQ(rbCcuCntlSysmem(c), 0x10000000u);
+    CHECK_EQ(rbCcuCntlGmem(c), 0x3c400000u);
+    for (const RegWrite& w : kStaticState) CHECK_EQ(staticValue(w, c), w.value);
+}

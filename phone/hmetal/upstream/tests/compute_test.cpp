@@ -162,8 +162,11 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     auto at = [&](uint32_t reg) { size_t i = e.findReg(reg); return i == size_t(-1) ? 0xdeadbeefu : e.stream.words()[i]; };
     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 1), uint32_t(scratch->gpuAddress()));
-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * 4096u) >> 12);
-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
+    // (redfin) the chip's fibers an SP: 4096 on the A635, 2048 on the A620
+    const uint32_t fibers = a6xx::chip().fibersPerSp;
+    CHECK(fibers == (a6xx::chip().chipId == a6xx::kChipA635.chipId ? 4096u : 2048u));
+    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * fibers) >> 12);
+    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * fibers) >> 11);
     // through a command buffer the queue's own is bound, and the fake takes the dispatch
     auto cb = r.queue->commandBuffer();
     CHECK(cb->dispatch(k, kGroups16, nullptr, {Binding{out.get(), 0}}));
@@ -180,7 +183,13 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
     CHECK(big.ok);
     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
-    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
+    if (a6xx::chip().hasLpac) {
+        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
+    } else {
+        // (redfin) gen1: no HLSQ copy, no SP_CS_CNTL_0/1
+        CHECK_EQ(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1), size_t(-1));
+        CHECK_EQ(big.findReg(REG_A6XX_SP_CS_CNTL_0), size_t(-1));
+    }
     tg.sharedBytes = 32 * 1024 + 1;
     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
     CHECK(!over.ok);
@@ -404,13 +413,15 @@ TEST(the_fake_refuses_a_program_preload_of_128_units) {
     Rig r;
     Raw raw(r);
     using namespace a6xx;
-    uint32_t w0 = loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_CS_SHADER, 128);
+    // (redfin) one unit past the chip's cache: 128 on the A635 (127), 65 on the A620 (64)
+    const uint32_t over = chip().instrCacheSize + 1;
+    uint32_t w0 = loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_CS_SHADER, over);
     pm4::Stream s;
     uint32_t words[3] = {w0, uint32_t(raw.bo->gpuAddress()), uint32_t(raw.bo->gpuAddress() >> 32)};
     s.packet(CP_LOAD_STATE6_FRAG, words, 3);
     CHECK_EQ(raw.submit(s.words()), ETIMEDOUT);
     CHECK_EQ(r.fake->stats().faults, 1u);
-    CHECK(r.fake->stats().lastFault.find("128 hangs this GPU") != std::string::npos);
+    CHECK(r.fake->stats().lastFault.find(std::to_string(over) + " hangs this GPU") != std::string::npos);
 }
 
 TEST(the_fake_refuses_exec_cs_without_a_program) {
@@ -518,6 +529,24 @@ TEST(an_event_with_the_timestamp_bit_writes_a_timestamp_not_the_value) {
 
 TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
     Rig r;
+    if (!a6xx::chip().hasLpac) {
+        // (redfin) gen1 has no second copy: the fake refuses any write of SP_CS_CNTL_0 there instead
+        auto out = buffer(r, 4096, 0);
+        Encoded e(r, kernels::fill_id, kGroups16, nullptr, {Binding{out.get(), 0}});
+        CHECK(e.ok);
+        CHECK_EQ(e.findReg(a6xx::REG_A6XX_SP_CS_CNTL_0), size_t(-1));
+        std::vector<uint32_t> words = e.stream.words();
+        const size_t exec = e.find(a6xx::CP_EXEC_CS);
+        CHECK(exec != size_t(-1));
+        uint32_t v = 0x00fcfc00;
+        pm4::Stream ins;
+        ins.registers(a6xx::REG_A6XX_SP_CS_CNTL_0, &v, 1);
+        words.insert(words.begin() + long(exec), ins.words().begin(), ins.words().end());
+        Raw raw(r);
+        CHECK_EQ(raw.submit(words), ETIMEDOUT);
+        CHECK(r.fake->stats().lastFault.find("has_lpac copies) written on a chip without them") != std::string::npos);
+        return;
+    }
     auto out = buffer(r, 4096, 0);
     Encoded e(r, kernels::fill_id, kGroups16, nullptr, {Binding{out.get(), 0}});
     CHECK(e.ok);
@@ -1187,10 +1216,13 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
     {
         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
         CHECK(e.ok);
-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
+        // (redfin) 96 units: within the A635's cache of 127, past the A620's of 64: there it gets the workaround too
+        const bool fits = kernels::chain160_air.instrlen <= a6xx::chip().instrCacheSize;
+        CHECK(fits == (a6xx::chip().chipId == a6xx::kChipA635.chipId));
+        CHECK((e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1)) == fits);
         size_t before = 0, after = 0;
         labels(e, &before, &after);
-        CHECK_EQ(before + after, size_t(0));
+        CHECK_EQ(before + after, fits ? size_t(0) : size_t(2));
         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
         compute::Options cut;
         cut.preloadCap = 64;

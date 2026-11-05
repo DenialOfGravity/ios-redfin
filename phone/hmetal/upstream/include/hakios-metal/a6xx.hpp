@@ -1420,6 +1420,103 @@ inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-hea
 inline constexpr uint32_t kBorderColorBytes = 256 * 128;          // not-in-headers: fd6_texture.h FD6_MAX_BORDER_COLORS * FD6_BORDER_COLOR_SIZE
 inline constexpr uint32_t kBorderColorAlign = 128;                // not-in-headers: a6xx.xml SP_TP_BORDER_COLOR_BASE_ADDR align="128"
 
+// --- per chip (redfin) ---------------------------------------------------------------------------------------------------
+// The constants above are the A635's row (hakios' phone). What the emitters branch on lives in ChipInfo, one row per
+// chip this driver knows, picked by the chip id the kernel reports (Gpu's constructor: selectChip). The emitters read
+// chip(), never the A635 constants; the tests read both. The A620 row is Mesa's freedreno_devices.py GPUId(620) =
+// a6xx_base + a6xx_gen1 with the FD620 entry's own values and magic_regs (the same values our kernel's present blit
+// writes, xnu/patches/0904), GMEM from Linux's a6xx catalog (adreno_620: SZ_512K). Layout in the spirit of
+// JosephMontfort/hakios-metal's chip.hpp (MIT), written here for a6xx gen1 / gen4.
+struct ChipMagic {
+    uint32_t pcPowerCntl, tpl1DbgEcoCntl, grasDbgEcoCntl, spChickenBits, ucheClientPf, pcModeCntl, spDbgEcoCntl,
+        rbDbgEcoCntl, rbDbgEcoCntlBlit, hlsqDbgEcoCntl, rbUnknown8E01, vpcDbgEcoCntl, ucheUnknown0E12;
+};
+struct ChipInfo {
+    const char* name;
+    uint32_t chipId;              // as the kernel reports it (GET_PARAM CHIP_ID low word / NativeAdreno DeviceInfo.chip_id)
+    uint32_t chipIdMask;          // which bits of a reported id must equal chipId (A620: the patch byte is Mesa's wildcard)
+    uint32_t gen;                 // Mesa's a6xx_genN
+    bool hasLpac;                 // gen4: SP_CS_CNTL_0/1 and HLSQ_CS_CTRL_REG1 exist (the SP's / HLSQ's copies)
+    bool hasLrzFeedback;          // GRAS/RB_BIN_CONTROL.LRZ_FEEDBACK_ZMODE_MASK may be non-zero
+    bool hasEarlyPreamble;        // SP_xS_CTRL_REG0.EARLYPREAMBLE, and turnip's SP_FS_CTRL_REG0 reset at batch start
+    bool hasCpRegWrite;           // CP_REG_WRITE(TRACK_RENDER_CNTL) for RB_RENDER_CNTL (Mesa); here: informational
+    bool hasGmemFastClear;
+    bool concurrentResolve;
+    bool hasTexFilterCubic;       // the TP's cubic filter (A6XX_TEX_CUBIC, "a650 only" in the XML)
+    bool supportsDoubleThreadsize;
+    bool hasFsTexPrefetch;
+    bool indirectDrawWfmQuirk;    // gen1: CP_WAIT_FOR_ME before an indirect draw (turnip draw_wfm)
+    bool depthBoundsRequireDepthTestQuirk;   // gen1 (nothing here enables depth bounds: Metal has none)
+    uint32_t numCcu;
+    uint32_t numSpCores;
+    uint32_t fibersPerSp;
+    uint32_t csSharedMemSize;
+    uint32_t waveGranularity;
+    uint32_t instrCacheSize;      // the CP_LOAD_STATE6 program preload cap, in instruction groups
+    uint32_t regSizeVec4;
+    uint32_t sysmemPerCcuDepthCacheSize, sysmemPerCcuColorCacheSize;
+    uint32_t gmemBytes;
+    uint32_t gmemCcuColorCacheFraction;   // QUARTER = 4
+    uint32_t tileAlignW, tileAlignH, gmemAlignW, gmemAlignH, tileMaxW, tileMaxH;
+    uint32_t numVscPipes;
+    uint32_t highestBankBit;      // Mesa's default; the kernel's GET_PARAM HIGHEST_BANK_BIT is what UBWC uses
+    ChipMagic magic;
+};
+
+inline constexpr ChipInfo kChipA635{
+    "a635 (Adreno 7c+ Gen 3)", kChipId, 0xffffffffu, 4,
+    kHasLpac, /*hasLrzFeedback*/ true, kHasEarlyPreamble, /*hasCpRegWrite*/ false, kHasGmemFastClear, kConcurrentResolve,
+    /*hasTexFilterCubic*/ true, kSupportsDoubleThreadsize, /*hasFsTexPrefetch*/ true,
+    /*indirectDrawWfmQuirk*/ false, /*depthBoundsRequireDepthTestQuirk*/ false,
+    kNumCcu, kNumSpCores, kFibersPerSp, kCsSharedMemSize, kWaveGranularity, kInstrCacheSize, /*regSizeVec4*/ 64,
+    kSysmemPerCcuDepthCacheSize, kSysmemPerCcuColorCacheSize, kGmemBytes, kGmemCcuColorCacheFraction,
+    kTileAlignW, kTileAlignH, kGmemAlignW, kGmemAlignH, kTileMaxW, kTileMaxH, /*numVscPipes*/ 32, /*hbb*/ 15,
+    {kMagicPcPowerCntl, kMagicTpl1DbgEcoCntl, kMagicGrasDbgEcoCntl, kMagicSpChickenBits, kMagicUcheClientPf, kMagicPcModeCntl,
+     kMagicSpDbgEcoCntl, kMagicRbDbgEcoCntl, kMagicRbDbgEcoCntl, kMagicHlsqDbgEcoCntl, kMagicRbUnknown8E01, kMagicVpcDbgEcoCntl,
+     kMagicUcheUnknown0E12},
+};
+
+// Adreno 620 (SM7250, redfin). freedreno_devices.py GPUId(620): [a6xx_base, a6xx_gen1], num_ccu 1, tile_align 32x16,
+// num_vsc_pipes 32, cs_shared_mem_size 32K, wave_granularity 2, fibers_per_sp 128 * 16; gen1: reg_size_vec4 96,
+// instr_cache_size 64, indirect_draw_wfm_quirk, depth_bounds_require_depth_test_quirk; base: has_cp_reg_write,
+// has_gmem_fast_clear, 64K depth/colour cache per CCU, QUARTER, double threadsize, fs tex prefetch. No lpac, no lrz
+// feedback, no early preamble, no cubic filter. Mesa's id is 0x060200ff (patch byte wildcard); the kernel reports
+// 0x06020000 (xnu/patches/0904, DT qcom,chipid), lito's DT says 0x06020001: any patch byte matches.
+inline constexpr ChipInfo kChipA620{
+    "a620 (Adreno 620)", 0x06020000, 0xffffff00u, 1,
+    /*hasLpac*/ false, /*hasLrzFeedback*/ false, /*hasEarlyPreamble*/ false, /*hasCpRegWrite*/ true, /*hasGmemFastClear*/ true,
+    /*concurrentResolve*/ false, /*hasTexFilterCubic*/ false, /*supportsDoubleThreadsize*/ true, /*hasFsTexPrefetch*/ true,
+    /*indirectDrawWfmQuirk*/ true, /*depthBoundsRequireDepthTestQuirk*/ true,
+    /*numCcu*/ 1, /*numSpCores*/ 1, /*fibersPerSp*/ 128 * 16, /*csSharedMemSize*/ 32 * 1024, /*waveGranularity*/ 2,
+    /*instrCacheSize*/ 64, /*regSizeVec4*/ 96, 0x10000, 0x10000, /*gmemBytes*/ 512 * 1024, /*QUARTER*/ 4,
+    32, 16, 16, 4, 1024, 1008, /*numVscPipes*/ 32, /*hbb (Mesa default)*/ 15,
+    {/*PC_POWER_CNTL*/ 0, /*TPL1_DBG_ECO_CNTL*/ 0x01008000, /*GRAS_DBG_ECO_CNTL*/ 0, /*SP_CHICKEN_BITS*/ 0x00000400,
+     /*UCHE_CLIENT_PF*/ 0x00000004, /*PC_MODE_CNTL*/ 0x1f, /*SP_DBG_ECO_CNTL*/ 0x01000000, /*RB_DBG_ECO_CNTL*/ 0x04100000,
+     /*RB_DBG_ECO_CNTL_blit*/ 0x04100000, /*HLSQ_DBG_ECO_CNTL*/ 0, /*RB_UNKNOWN_8E01*/ 0, /*VPC_DBG_ECO_CNTL*/ 0x02000000,
+     /*UCHE_UNKNOWN_0E12*/ 0x00000001},
+};
+
+inline constexpr const ChipInfo* kChips[] = {&kChipA635, &kChipA620};
+
+// the row for a reported chip id; nullptr for a chip this driver has no table for (0: none, see chipKnown in c_api.cpp)
+constexpr const ChipInfo* chipFor(uint32_t id) {
+    for (const ChipInfo* c : kChips) {
+        if ((id & c->chipIdMask) == c->chipId) return c;
+    }
+    return nullptr;
+}
+static_assert(chipFor(0x06030500) == &kChipA635 && chipFor(0x06020000) == &kChipA620 && chipFor(0x060200ff) == &kChipA620 &&
+                  chipFor(0x06020001) == &kChipA620 && chipFor(0x06030501) == nullptr && chipFor(0x06040001) == nullptr,
+              "chip ids: the kernel's, Mesa's wildcard, lito's DT; the A618 and other A635 revisions refused");
+
+// The chip this process drives: the A635 until a Gpu says otherwise (one GPU per process). gpu.cpp holds it.
+const ChipInfo& chip();
+void selectChip(const ChipInfo& c);
+// the per-generation GMEM layout values (tu6_emit_ccu_cntl): where the colour cache starts in GMEM for tiled rendering
+constexpr uint32_t gmemCcuColorOffset(const ChipInfo& c) {
+    return c.gmemBytes - c.numCcu * c.sysmemPerCcuColorCacheSize / c.gmemCcuColorCacheFraction;
+}
+
 // the registers, in the order of their first write
 inline constexpr uint32_t REG_A6XX_RB_DBG_ECO_CNTL = 0x8e04;                           // a6xx.xml.h:6711
 inline constexpr uint32_t REG_A6XX_SP_DBG_ECO_CNTL = 0xae00;                           // a6xx.xml.h:9559
@@ -1652,6 +1749,18 @@ constexpr uint32_t rbCcuCntlSysmem(uint32_t colorOffset = kNumCcu * kSysmemPerCc
            A6XX_RB_CCU_CNTL_COLOR_OFFSET(colorOffset & 0x1fffff);
 }
 
+// ...for chip C: the colour cache after C's depth caches (num_ccu * sysmem_per_ccu_depth_cache_size): 0x10000000 on the
+// A635 (2 CCUs), 0x08000000 on the A620 (1 CCU, what our kernel's blit writes too)
+constexpr uint32_t rbCcuCntlSysmem(const ChipInfo& c) {
+    const uint32_t colorOffset = c.numCcu * c.sysmemPerCcuDepthCacheSize;
+    return (c.hasGmemFastClear ? 0u : A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) |
+           (c.concurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u) | A6XX_RB_CCU_CNTL_DEPTH_OFFSET_HI(0) |
+           A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(colorOffset >> 21) | A6XX_RB_CCU_CNTL_DEPTH_CACHE_SIZE(CCU_CACHE_SIZE_FULL) |
+           A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0) | A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_FULL) |
+           A6XX_RB_CCU_CNTL_COLOR_OFFSET(colorOffset & 0x1fffff);
+}
+static_assert(rbCcuCntlSysmem(kChipA635) == rbCcuCntlSysmem() && rbCcuCntlSysmem(kChipA620) == 0x08000000u, "sysmem CCU per chip");
+
 // fd6_emit_static_regs, A6XX, this chip: up to CP_SET_DRAW_STATE
 inline constexpr RegWrite kStaticState[] = {
     {REG_A6XX_RB_DBG_ECO_CNTL, kMagicRbDbgEcoCntl},
@@ -1723,6 +1832,31 @@ inline constexpr RegWrite kStaticStateTail[] = {
     {REG_A6XX_PC_DGEN_SU_CONSERVATIVE_RAS_CNTL, 0},
     {REG_A6XX_RB_ALPHA_CONTROL, 0},
 };
+
+// A static-table entry as chip C writes it: the magic registers take C's values, every other entry its own
+constexpr uint32_t staticValue(const RegWrite& w, const ChipInfo& c) {
+    switch (w.reg) {
+    case REG_A6XX_RB_DBG_ECO_CNTL: return c.magic.rbDbgEcoCntl;
+    case REG_A6XX_SP_DBG_ECO_CNTL: return c.magic.spDbgEcoCntl;
+    case REG_A6XX_TPL1_DBG_ECO_CNTL: return c.magic.tpl1DbgEcoCntl;
+    case REG_A6XX_VPC_DBG_ECO_CNTL: return c.magic.vpcDbgEcoCntl;
+    case REG_A6XX_GRAS_DBG_ECO_CNTL: return c.magic.grasDbgEcoCntl;
+    case REG_A6XX_HLSQ_DBG_ECO_CNTL: return c.magic.hlsqDbgEcoCntl;
+    case REG_A6XX_SP_CHICKEN_BITS: return c.magic.spChickenBits;
+    case REG_A6XX_UCHE_UNKNOWN_0E12: return c.magic.ucheUnknown0E12;
+    case REG_A6XX_UCHE_CLIENT_PF: return c.magic.ucheClientPf;
+    case REG_A6XX_RB_UNKNOWN_8E01: return c.magic.rbUnknown8E01;
+    case REG_A6XX_PC_MODE_CNTL: return c.magic.pcModeCntl;
+    default: return w.value;
+    }
+}
+constexpr bool staticTableIsTheA635s() {
+    for (const RegWrite& w : kStaticState) {
+        if (staticValue(w, kChipA635) != w.value) return false;
+    }
+    return true;
+}
+static_assert(staticTableIsTheA635s(), "kStaticState is the A635's row: staticValue(w, kChipA635) changes nothing");
 
 // CP_SET_DRAW_STATE, 3 words per group: Gallium's batch start sends one group with DISABLE_ALL_GROUPS and no address,
 // to drop any state group a previous owner of the GPU left pending
@@ -3975,7 +4109,9 @@ constexpr uint32_t regVfdDestCntlInstr(uint32_t i) { return REG_A6XX_VFD_DEST_CN
 // by 2^23 (exact: a float has 24 significant bits). A finite value round-trips exactly (tests/a6xx_test.cpp holds it
 // to memcpy); NaN gives the quiet NaN, an infinity 0x7f800000 with its sign.
 constexpr uint32_t fui(float f) {
-    uint32_t sign = __builtin_signbit(f) ? 0x80000000u : 0u;
+    // (redfin) the sign without __builtin_signbit, which clang before 19 does not fold in a constant expression (the
+    // same fix as hakios-picasso's 0006): below zero, or a zero whose reciprocal is -inf; a NaN's sign is never read
+    uint32_t sign = (f < 0.0f || (f == 0.0f && 1.0f / f < 0.0f)) ? 0x80000000u : 0u;
     if (f != f) {
         return 0x7fc00000u;
     }
@@ -4092,6 +4228,13 @@ constexpr uint32_t rbCcuCntlGmem() {
            A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER) | A6XX_RB_CCU_CNTL_COLOR_OFFSET(kGmemCcuColorOffset & 0x1fffff);
 }
 static_assert(rbCcuCntlGmem() == 0x3c400000, "the GMEM CCU layout turnip computes for this chip");
+constexpr uint32_t rbCcuCntlGmem(const ChipInfo& c) {
+    const uint32_t at = gmemCcuColorOffset(c);
+    return (c.hasGmemFastClear ? 0u : A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) | A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(at >> 21) |
+           A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER) | A6XX_RB_CCU_CNTL_COLOR_OFFSET(at & 0x1fffff);
+}
+static_assert(rbCcuCntlGmem(kChipA635) == 0x3c400000 && gmemCcuColorOffset(kChipA635) == kGmemCcuColorOffset, "A635 GMEM CCU");
+static_assert(gmemCcuColorOffset(kChipA620) == 0x7c000 && rbCcuCntlGmem(kChipA620) == 0x3e400000, "A620 GMEM CCU: 512K - 1 x 64K / 4");
 
 // hardware binning (fd6_gmem.cc emit_binning_pass, update_vsc_pipe, fd6_emit_tile_prep): the binning pass runs every draw's
 // vertex stage once over the whole window and the VSC writes, for each pipe of bins, which draws and primitives reach

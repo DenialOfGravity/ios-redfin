@@ -660,7 +660,8 @@ TEST(render_encodes_the_first_triangles_registers) {
     {
         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
         CHECK(ccu != size_t(-1));
-        CHECK_EQ(w[ccu], 0x10000000u);
+        CHECK_EQ(w[ccu], a6xx::rbCcuCntlSysmem(a6xx::chip()));   // (redfin) 0x10000000 on the A635, 0x08000000 on the A620
+        CHECK_EQ(w[ccu], a6xx::chip().numCcu == 2 ? 0x10000000u : 0x08000000u);
         pm4::Header before = pm4::decode(w[ccu - 2]);
         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
     }
@@ -964,7 +965,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), a6xx::rbCcuCntlSysmem(a6xx::chip()));   // ccuCntl is its own group
         CHECK(e.stream.size() < whole.stream.size());
     }
     {
@@ -974,7 +975,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
     }
     {
         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), a6xx::rbCcuCntlSysmem(a6xx::chip()) | 4u);   // 0x10000004 / 0x08000004
     }
     {
         Encoded e = with([](render::Options& o) { o.passBegin = false; });
@@ -987,8 +988,10 @@ TEST(render_options_switch_each_group_and_each_alternative) {
     }
     {
         Encoded e = with([](render::Options& o) { o.binControlLrzFeedback = true; });
-        CHECK_EQ(e.reg(REG_A6XX_GRAS_BIN_CONTROL), 0x03c00000u);
-        CHECK_EQ(e.reg(REG_A6XX_RB_BIN_CONTROL), 0x03c00000u);
+        // (redfin) the switch is honoured only on a chip with lrz feedback: the A620 keeps fd6's 0x00c00000
+        const uint32_t want = a6xx::chip().hasLrzFeedback ? 0x03c00000u : 0x00c00000u;
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_BIN_CONTROL), want);
+        CHECK_EQ(e.reg(REG_A6XX_RB_BIN_CONTROL), want);
     }
     {
         Encoded e = with([](render::Options& o) { o.marker = false; });
@@ -1851,7 +1854,9 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
         Twin w;
         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
-        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
+        char text[96];
+        snprintf(text, sizeof(text), "RB_CCU_CNTL (%#x) was not written in this submission right after a CP_WAIT_FOR_IDLE", a6xx::rbCcuCntlSysmem(a6xx::chip()));
+        CHECK(has(w.fault(), text));
     }
     {
         Twin w;
@@ -2147,8 +2152,10 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
     auto scratch = r.queue->privateMemory(64, false, &pm, &why);
     CHECK(scratch != nullptr);
     CHECK_EQ(pm.perFiber, 512u);
-    CHECK_EQ(pm.perSp, 512u * 4096u);
-    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
+    // (redfin) per chip: 2 SPs of 4096 fibers (A635), 1 of 2048 (A620)
+    const uint32_t fibers = a6xx::chip().fibersPerSp, sps = a6xx::chip().numSpCores;
+    CHECK_EQ(pm.perSp, 512u * fibers);
+    CHECK_EQ(scratch->length(), uint64_t(sps) * 512u * fibers);
     Bindings fsb;
     fsb.privateMemory = pm;
     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
@@ -2156,8 +2163,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
     if (!e.ok) std::printf("       %s\n", e.error.c_str());
     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 3), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 4), uint32_t(scratch->gpuAddress()));
-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * 4096u) >> 12);
-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
+    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * fibers) >> 12);
+    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * fibers) >> 11);
     CHECK_EQ(e.reg(REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET + 4), 0u);
     CHECK_EQ(e.reg(REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET), 0u);
     auto cb = drawOnce(r, p, pass, wholeDraw(3));
@@ -4648,13 +4655,15 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
-            w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
+            // (redfin) capped at the chip's cache: 127 on the A635, 64 on the A620; the twin asks one more
+            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, a6xx::chip().instrCacheSize);
+            w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(a6xx::chip().instrCacheSize + 1);
             found = true;
         }
     }
     CHECK(found);
-    CHECK(has(faultOf(r, w), "a program preload of 128 units: 128 hangs this GPU"));
+    const std::string over = std::to_string(a6xx::chip().instrCacheSize + 1);
+    CHECK(has(faultOf(r, w), ("a program preload of " + over + " units: " + over + " hangs this GPU").c_str()));
 }
 
 // Occlusion queries (-setVisibilityResultMode:offset:): around the draw the running sample count is copied out twice
@@ -5462,7 +5471,9 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
+        // (redfin) the A620's colour cache starts at 0x7c000 (one CCU), the A635's at 0x78000: the second share is 0x4000 larger
+        const uint32_t room1 = a6xx::chip().numCcu == 2 ? 0x3c000u : 0x40000u;
+        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == room1);
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));

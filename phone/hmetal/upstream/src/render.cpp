@@ -1154,7 +1154,7 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
         event(stream, CACHE_INVALIDATE);
         reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD, hlsqInvalidateCmdAll());
         stream.waitForIdle();
-        for (const RegWrite& w : kStaticState) reg(stream, w.reg, w.value);
+        for (const RegWrite& w : kStaticState) reg(stream, w.reg, staticValue(w, chip()));   // (redfin) the chip's magic values
         {
             uint32_t w[3] = {setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE_ALL_GROUPS, 0), 0, 0};
             stream.packet(CP_SET_DRAW_STATE, w, 3);
@@ -1170,7 +1170,7 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
     // wrote at boot (hakios.adreno.c:2904) and Mesa never sets for this chip -- the switch is the bisect's
     if (o.ccuCntl) {
         stream.waitForIdle();
-        reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem() | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
+        reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem(chip()) | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
     }
     // fd6's LRZ_FLUSH at the start of a sysmem pass (fd6_gmem.cc:2001); turnip has none here. Under lrzOff with the LRZ
     // registers below, since it is the LRZ it flushes
@@ -1192,8 +1192,10 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
         reg(stream, REG_A6XX_RB_WINDOW_OFFSET2, regXY(0, 0));
         reg(stream, REG_A6XX_SP_WINDOW_OFFSET, regXY(0, 0));
         reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(0, 0));
-        reg(stream, REG_A6XX_GRAS_BIN_CONTROL, binControlSysmem(o.binControlLrzFeedback));
-        reg(stream, REG_A6XX_RB_BIN_CONTROL, binControlSysmem(o.binControlLrzFeedback));
+        // (redfin) the LRZ feedback mask only where the chip has lrz feedback: NONE on an A620
+        const bool lrzFeedback = o.binControlLrzFeedback && chip().hasLrzFeedback;
+        reg(stream, REG_A6XX_GRAS_BIN_CONTROL, binControlSysmem(lrzFeedback));
+        reg(stream, REG_A6XX_RB_BIN_CONTROL, binControlSysmem(lrzFeedback));
         reg(stream, REG_A6XX_RB_BIN_CONTROL2, 0);
     }
     if (o.marker) {
@@ -1740,7 +1742,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
              {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
               uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
-        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, chip().instrCacheSize), address);
         if (s.k.numImmediates != 0) {
             std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
             imm.resize((imm.size() + 3) & ~size_t(3), 0);
@@ -1767,7 +1769,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         }
     };
     if (o.programVs) {
-        programOf(vs, vsBindings, vsRanges, vsUbos, vsProgram, spVsCtrlReg0(uint32_t(vs.k.maxReg + 1), uint32_t(vs.k.maxHalfReg + 1), vs.k.branchstackHw, vs.k.mergedRegs, vs.k.earlyPreamble),
+        programOf(vs, vsBindings, vsRanges, vsUbos, vsProgram, spVsCtrlReg0(uint32_t(vs.k.maxReg + 1), uint32_t(vs.k.maxHalfReg + 1), vs.k.branchstackHw, vs.k.mergedRegs, vs.k.earlyPreamble && chip().hasEarlyPreamble),
                   REG_A6XX_SP_VS_CTRL_REG0, REG_A6XX_SP_VS_INSTRLEN, REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET, REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET);
     }
     // 10a. the VS's driver params, every draw since they are the draw's own (tu6_emit_vs_params, tu_cmd_buffer.cc:
@@ -1782,7 +1784,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (o.programFs) {
         programOf(fs, fsBindings, fsRanges, fsUbos, fsProgram,
                   spFsCtrlReg0(uint32_t(fs.k.maxReg + 1), uint32_t(fs.k.maxHalfReg + 1), fs.k.branchstackHw, fsThreads, fs.totalIn != 0, fs.needFullQuad != 0,
-                               fs.needPixlod != 0, fs.k.earlyPreamble, fs.k.mergedRegs),
+                               fs.needPixlod != 0, fs.k.earlyPreamble && chip().hasEarlyPreamble, fs.k.mergedRegs),
                   REG_A6XX_SP_FS_CTRL_REG0, REG_A6XX_SP_FS_INSTRLEN, REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET, REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET);
     }
     // 10b. the FS's textures and samplers, Gallium's FS_TEX group in its order (fd6_texture.cc:593-687): the samplers into
@@ -2082,10 +2084,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
                                  CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(draw.indexType == 0 ? INDEX4_SIZE_16_BIT : INDEX4_SIZE_32_BIT),
                              drawIndirectMulti1(INDIRECT_OP_INDEXED, dstOff), 1, uint32_t(base), uint32_t(base >> 32), uint32_t(maxIndices),
                              uint32_t(args), uint32_t(args >> 32), 20};
+            if (chip().indirectDrawWfmQuirk) stream.waitForMe();   // (redfin) gen1's indirect_draw_wfm_quirk (turnip draw_wfm)
             stream.packet(CP_DRAW_INDIRECT_MULTI, w, 9);
         } else {
             uint32_t w[6] = {drawIndxOffset0(prim, DI_SRC_SEL_AUTO_INDEX, o.visCullUse ? USE_VISIBILITY : IGNORE_VISIBILITY),
                              drawIndirectMulti1(INDIRECT_OP_NORMAL, dstOff), 1, uint32_t(args), uint32_t(args >> 32), 16};
+            if (chip().indirectDrawWfmQuirk) stream.waitForMe();
             stream.packet(CP_DRAW_INDIRECT_MULTI, w, 6);
         }
     } else if (draw.indexBuffer != nullptr) {
@@ -2184,8 +2188,8 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         // loaded, but both must lie inside the texture's buffer.
         const uint64_t base = t.levelAddress(a.level) + (a.slice != 0 ? uint64_t(a.slice) * t.sliceBytes() : 0);
         const uint64_t start = base - t.buffer()->gpuAddress();
-        if (L.pitch < uint64_t(alignUp(W, kGmemAlignW)) * f.bytesPerPixel || L.pitch % 64 != 0 ||
-            start + uint64_t(alignUp(H, kGmemAlignH)) * L.pitch > t.buffer()->length()) {
+        if (L.pitch < uint64_t(alignUp(W, chip().gmemAlignW)) * f.bytesPerPixel || L.pitch % 64 != 0 ||
+            start + uint64_t(alignUp(H, chip().gmemAlignH)) * L.pitch > t.buffer()->length()) {
             return refuse(why, which + ": rows without room for the event blit's granules past the edge");
         }
         bytes += f.bytesPerPixel;
@@ -2198,9 +2202,9 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture == nullptr) continue;
         p.bpp[i] = a.texture->info().bytesPerPixel;
-        p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
+        p.base[i] = uint32_t(uint64_t(gmemCcuColorOffset(chip())) * before / bytes) & ~0x3fffu;
         before += p.bpp[i];
-        p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        p.room[i] = (uint32_t(uint64_t(gmemCcuColorOffset(chip())) * before / bytes) & ~0x3fffu) - p.base[i];
     }
     const uint32_t whole[4] = {0, 0, W - 1, H - 1};
     if (!gmemTiles(&p, whole)) return refuse(why, "a bin too wide for GMEM");
@@ -2210,25 +2214,25 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
 
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     GmemPlan p = *plan;
-    p.x0 = area[0] & ~(kTileAlignW - 1);
-    p.y0 = area[1] & ~(kTileAlignH - 1);
+    p.x0 = area[0] & ~(chip().tileAlignW - 1);
+    p.y0 = area[1] & ~(chip().tileAlignH - 1);
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
     // The bin width is fixed once a plan has one: a framebuffer fetch's descriptor holds it as its pitch (encodeInPass,
     // written before the area was known), and a tile laid out narrower read through it as sheared rows (the screen in
     // stripes over two tile columns). Only the grid's corner, the columns, the rows and the bin height follow the area.
     if (p.binW == 0) {
-        p.cols = divUp(alignUp(w, kTileAlignW), kTileMaxW);
-        p.binW = alignUp(divUp(w, p.cols), kTileAlignW);
+        p.cols = divUp(alignUp(w, chip().tileAlignW), chip().tileMaxW);
+        p.binW = alignUp(divUp(w, p.cols), chip().tileAlignW);
     } else {
         p.cols = divUp(w, p.binW);
     }
-    uint32_t fit = kTileMaxH;
+    uint32_t fit = chip().tileMaxH;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
-        if (p.bpp[i] != 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / kTileAlignH * kTileAlignH);
+        if (p.bpp[i] != 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / chip().tileAlignH * chip().tileAlignH);
     }
-    if (fit < kTileAlignH) return false;
+    if (fit < chip().tileAlignH) return false;
     p.rows = divUp(h, fit);
-    p.binH = alignUp(divUp(h, p.rows), kTileAlignH);
+    p.binH = alignUp(divUp(h, p.rows), chip().tileAlignH);
     for (uint32_t k = 0; k < 4; k++) p.area[k] = area[k];
     *plan = p;
     return true;
@@ -2328,12 +2332,12 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     const auto [W, H] = windowOf(pass);
     // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
     stream.waitForIdle();
-    reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
+    reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem(chip()));
     // the event blit's state common to every load and store (event_blit_setup): over the render area in granules
     // (tu6_emit_blit_scissor with align), single-sampled
-    const uint32_t bx1 = std::min(alignUp(plan.area[2] + 1, kGmemAlignW), alignUp(W, kGmemAlignW)) - 1;
-    const uint32_t by1 = std::min(alignUp(plan.area[3] + 1, kGmemAlignH), alignUp(H, kGmemAlignH)) - 1;
-    regs(stream, REG_A6XX_RB_BLIT_SCISSOR_TL, {regXY(plan.area[0] & ~(kGmemAlignW - 1), plan.area[1] & ~(kGmemAlignH - 1)), regXY(bx1, by1)});
+    const uint32_t bx1 = std::min(alignUp(plan.area[2] + 1, chip().gmemAlignW), alignUp(W, chip().gmemAlignW)) - 1;
+    const uint32_t by1 = std::min(alignUp(plan.area[3] + 1, chip().gmemAlignH), alignUp(H, chip().gmemAlignH)) - 1;
+    regs(stream, REG_A6XX_RB_BLIT_SCISSOR_TL, {regXY(plan.area[0] & ~(chip().gmemAlignW - 1), plan.area[1] & ~(chip().gmemAlignH - 1)), regXY(bx1, by1)});
     reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
     reg(stream, REG_A6XX_RB_UNKNOWN_88D0, 0);
     // one attachment's load or store (event_blit_run): its memory as the destination, its bin where RB_MRT's BASE_GMEM
@@ -2350,7 +2354,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         reg(stream, REG_A6XX_RB_BLIT_INFO, rbBlitInfo(type, false));
         event(stream, BLIT);
     };
-    const uint32_t bin = binControlGmem(o.binControlLrzFeedback, plan.binW, plan.binH);
+    const bool lrzFeedback = o.binControlLrzFeedback && chip().hasLrzFeedback;   // (redfin) NONE without lrz feedback
+    const uint32_t bin = binControlGmem(lrzFeedback, plan.binW, plan.binH);
     // The pipes: as fd's gmem layout groups bins (freedreno_gmem.c: tpp_y up by 2 until the rows fit the pipes, then
     // tpp_x up by 1), and each tile's place in its pipe the order the tiles are drawn in
     uint32_t tppX = 1, tppY = 1;
@@ -2370,8 +2375,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         command1(stream, CP_SET_MODE, 1);
         stream.waitForIdle();
         reg(stream, REG_A6XX_VFD_MODE_CNTL, A6XX_VFD_MODE_CNTL_RENDER_MODE(BINNING_PASS));
-        const uint32_t binning = binControl(BINNING_PASS, BUFFERS_IN_GMEM, o.binControlLrzFeedback ? LRZ_FEEDBACK_EARLY_LRZ_LATE_Z : LRZ_FEEDBACK_NONE,
-                                            plan.binW, plan.binH) | (o.binControlLrzFeedback ? 0u : A6XX_GRAS_BIN_CONTROL_FORCE_LRZ_WRITE_DIS);
+        const uint32_t binning = binControl(BINNING_PASS, BUFFERS_IN_GMEM, lrzFeedback ? LRZ_FEEDBACK_EARLY_LRZ_LATE_Z : LRZ_FEEDBACK_NONE,
+                                            plan.binW, plan.binH) | (lrzFeedback ? 0u : A6XX_GRAS_BIN_CONTROL_FORCE_LRZ_WRITE_DIS);
         reg(stream, REG_A6XX_GRAS_BIN_CONTROL, binning);
         reg(stream, REG_A6XX_RB_BIN_CONTROL, binning);
         reg(stream, REG_A6XX_RB_BIN_CONTROL2, A6XX_RB_BIN_CONTROL2_BINW(plan.binW) | A6XX_RB_BIN_CONTROL2_BINH(plan.binH));
@@ -2390,8 +2395,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         }
         regs(stream, REG_A6XX_VSC_PRIM_STRM_ADDRESS, {uint32_t(primStrm), uint32_t(primStrm >> 32), kVscPrimPitch, kVscPrimPitch - 64});
         regs(stream, REG_A6XX_VSC_DRAW_STRM_ADDRESS, {uint32_t(drawStrm), uint32_t(drawStrm >> 32), kVscDrawPitch, kVscDrawPitch - 64});
-        reg(stream, REG_A6XX_PC_POWER_CNTL, kMagicPcPowerCntl);
-        reg(stream, REG_A6XX_VFD_POWER_CNTL, kMagicPcPowerCntl);
+        reg(stream, REG_A6XX_PC_POWER_CNTL, chip().magic.pcPowerCntl);
+        reg(stream, REG_A6XX_VFD_POWER_CNTL, chip().magic.pcPowerCntl);
         event(stream, UNK_2C);
         reg(stream, REG_A6XX_RB_WINDOW_OFFSET, regXY(0, 0));
         reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(0, 0));
@@ -2515,7 +2520,7 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     eventTimestamp(stream, PC_CCU_RESOLVE_TS, table + kTableBlitFlushAt, kBlitFlushValue, false);
     waitForWord(stream, table + kTableBlitFlushAt, kBlitFlushValue);
     stream.waitForIdle();
-    reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem() | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
+    reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem(chip()) | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
     crumb(0x999);
 }
 
@@ -3279,7 +3284,7 @@ void CommandBuffer::closePass() {
         // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
         // rows past the bottom may be another layer's or level's)
         (void)W;
-        const bool inside = render::alignUp(plan.area[3] + 1, a6xx::kGmemAlignH) <= H;
+        const bool inside = render::alignUp(plan.area[3] + 1, a6xx::chip().gmemAlignH) <= H;
         uint32_t load = 0, store = 0;
         for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
             const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;

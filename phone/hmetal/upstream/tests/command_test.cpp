@@ -44,9 +44,10 @@ TEST(gpu_params) {
     CHECK_EQ(r.gpu->param(kParamGpuId, &v), 0);
     CHECK_EQ(v, 0ull);                                      // "GPU_ID: none, the chip ID says it"
     CHECK_EQ(r.gpu->param(kParamChipId, &v), 0);
-    CHECK_EQ(uint32_t(v), 0x06030500u);                     // GPU_CHIP_ID (dt qcom,chipid) ...
+    const uint32_t chipId = r.fake->chip().chipId == a6xx::kChipA635.chipId ? 0x06030500u : 0x06020000u;   // (redfin) as which chip
+    CHECK_EQ(uint32_t(v), chipId);                          // GPU_CHIP_ID (dt qcom,chipid) ...
     CHECK_EQ(v >> 32, FakeGpu::kSpeedBin);                  // ... "with the speed bin above it"
-    CHECK_EQ(r.gpu->chipId(), 0x06030500u);
+    CHECK_EQ(r.gpu->chipId(), chipId);
     CHECK_EQ(r.gpu->param(kParamGmemSize, &v), 0);
     CHECK_EQ(v, 512ull * 1024);
     CHECK_EQ(r.gpu->param(kParamMaxFreq, &v), 0);

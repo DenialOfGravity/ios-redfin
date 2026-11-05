@@ -7,6 +7,7 @@
 
 #include "hakios-metal/hakios_metal.h"
 #include "test.hpp"
+#include "hakios-metal/a6xx.hpp"
 
 namespace {
 void counted(hakios_metal_cb* cb, void* context) {
@@ -19,7 +20,8 @@ void counted(hakios_metal_cb* cb, void* context) {
 TEST(c_api_copy_and_callbacks) {
     hakios_metal_device* d = hakios_metal_open_fake();
     CHECK(d != nullptr);
-    CHECK_EQ(hakios_metal_gpu_id(d), 0x06030500ull);
+    CHECK_EQ(hakios_metal_gpu_id(d), uint64_t(hakios::metal::a6xx::chip().chipId));   // (redfin) 0x06030500, or 0x06020000 as the A620
+    CHECK(hakios::metal::a6xx::chip().chipId == 0x06030500u || hakios::metal::a6xx::chip().chipId == 0x06020000u);
     hakios_metal_buffer* a = hakios_metal_buffer_new(d, 4096);
     hakios_metal_buffer* b = hakios_metal_buffer_new(d, 4096);
     CHECK_EQ(hakios_metal_buffer_length(a), 4096ull);
@@ -59,6 +61,9 @@ TEST(c_api_copy_and_callbacks) {
     hakios_metal_close(d);
     CHECK(hakios_metal_open() == nullptr);      // no kernel GPU on this machine
     CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
+    CHECK(hakios_metal_chip_known(0x06020000));  // (redfin) the Pixel 5's A620, as our kernel reports it
+    CHECK(hakios_metal_chip_known(0x060200ff));  // ...and as Mesa's table names it
+    CHECK(!hakios_metal_chip_known(0x06010800)); // the A618 has no row
     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
     CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
     CHECK(strlen(hakios_metal_error()) > 0);

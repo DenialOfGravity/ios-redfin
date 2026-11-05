@@ -737,7 +737,7 @@ int main(int argc, char** argv) {
                     }
                     report(cb->status() == CommandBuffer::kCompleted && right == words && shortTwin < words / 16,
                            std::string("dispatch of ") + ch.name + " (" + std::to_string(ch.k->instrlen) + " units, " +
-                               std::to_string(std::min(ch.k->instrlen, a6xx::kInstrCacheSize)) + " preloaded), 16 groups of 64: " +
+                               std::to_string(std::min(ch.k->instrlen, a6xx::chip().instrCacheSize)) + " preloaded), 16 groups of 64: " +
                                std::to_string(right) + " of " + std::to_string(words) + " words the " + std::to_string(ch.steps) +
                                "-step chain, " + std::to_string(shortTwin) + " the one a step short" + where + status(*cb, gpu));
                 }

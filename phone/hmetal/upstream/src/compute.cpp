@@ -427,18 +427,20 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
         stream.registers(REG_A6XX_SP_CS_CONFIG, v, 2);
     }
     reg(stream, REG_A6XX_SP_CS_CTRL_REG0,
-        spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw, threadsize, k.mergedRegs, k.earlyPreamble));
+        spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw, threadsize, k.mergedRegs, k.earlyPreamble && chip().hasEarlyPreamble));
     // the shared memory and constant split, in both the SP's and (gen4's) the HLSQ's copy, the same value: Gallium gives
     // the HLSQ the real size where computerator writes 1, and the one that is right when they disagree is not measured
     uint32_t ctrl1 = spCsCtrlReg1(shared, k.constlen);
     reg(stream, REG_A6XX_SP_CS_CTRL_REG1, ctrl1);
-    if (o.hlsqCopies) {
+    // (redfin) the copies exist on gen4 alone (has_lpac): an A620 has no such registers
+    const bool lpac = chip().hasLpac;
+    if (o.hlsqCopies && lpac) {
         reg(stream, REG_A6XX_HLSQ_CS_CTRL_REG1, ctrl1);
     }
     {
         uint32_t v[2] = {csCntl0(k.workGroupIdRegid, k.localIdRegid), csCntl1(threadsize)};
         stream.registers(REG_A6XX_HLSQ_CS_CNTL_0, v, 2);   // HLSQ_CS_CNTL_0, HLSQ_CS_CNTL_1
-        if (o.hlsqCopies) {
+        if (o.hlsqCopies && lpac) {
             stream.registers(REG_A6XX_SP_CS_CNTL_0, v, 2); // SP_CS_CNTL_0, SP_CS_CNTL_1 (has_lpac)
         }
     }
@@ -457,7 +459,7 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
         stream.registers(REG_A6XX_SP_CS_PVT_MEM_PARAM, v, 4);
         reg(stream, REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, 0);
     }
-    loadIndirect(stream, ST6_SHADER, 0, std::min({k.instrlen, kInstrCacheSize, o.preloadCap != 0 ? o.preloadCap : kInstrCacheSize}), program);
+    loadIndirect(stream, ST6_SHADER, 0, std::min({k.instrlen, chip().instrCacheSize, o.preloadCap != 0 ? o.preloadCap : chip().instrCacheSize}), program);
     if (immUnits != 0) {
         loadDirect(stream, ST6_CONSTANTS, k.immediatesOffsetVec4, immUnits, imm.data(), uint32_t(imm.size()));
     }
@@ -535,7 +537,7 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     // with SP_FS_INSTRLEN left as it was, a 134-unit chain finished with every word wrong and a 492-unit one hung. So the
     // FS length is set to the kernel's and a LABEL event rolls the context before the dispatch, and another after it, so
     // that the write and CP_EXEC_CS cannot race.
-    const bool instrlenWorkaround = k.instrlen > kInstrCacheSize || (o.preloadCap != 0 && k.instrlen > o.preloadCap);
+    const bool instrlenWorkaround = k.instrlen > chip().instrCacheSize || (o.preloadCap != 0 && k.instrlen > o.preloadCap);
     if (instrlenWorkaround) {
         reg(stream, REG_A6XX_SP_FS_INSTRLEN, k.instrlen);
         event(stream, LABEL);
