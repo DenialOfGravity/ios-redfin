@@ -22,7 +22,8 @@ extern void (*vc_stop_hook)(const char *what);
 extern int vc_fake_off;		/* vdstop test: the next N clock checks read off (venusd VENUSD_TEST_CLKOFF) */
 int map_sid(uint32_t sid);		/* redfin: venusctl map-sid SID (after boot --keep) */
 void smmu_snapshot(const char *when);
-int smmu_cmd(void);	/* redfin: venusctl smmu */	/* redfin: read-only SMMU picture of the 0x13xx streams */
+int smmu_cmd(void);
+int watch(unsigned secs, int sysinit, uint32_t debug);	/* redfin: venusctl watch */	/* redfin: venusctl smmu */	/* redfin: read-only SMMU picture of the 0x13xx streams */
 extern const char *vc_stop_at;	/* redfin: venusctl decode --stop-at STAGE (--dry = ftb) */
 extern int vc_frame_tag;	/* vdstop: 1: firmware debug lines during a session as "[frame N] fw [...]" */
 int vc_core_ok(void);		/* the core gate's check: AHB, AXI, GDSCs, branches on (no STOP) */

@@ -55,6 +55,10 @@
  *                           the 0x1380 group, the window bank for 0x1360 only. boot prints an SMMU snapshot (SMRs
  *                           matching 0x1300-0x13ff, sGFSR) before, after mapping, after auth and after mem protect.
  *   venusctl smmu           that snapshot alone (read-only)
+ *   venusctl watch SECS [--sysinit] [--debug MASK]  after init: CTRL/CPU/INTR status (watchdog bit), video NoC error
+ *                           logger, SMMU global faults, GDSC/PLL, firmware queues, every 200 ms (with --step: console
+ *                           + fsynced file); --sysinit first sends SYS_INIT + debug config + image version
+ * power on (redfin): enables video_cc_xo (0x980) if it reads off (critical clock under Linux; VENUSCTL_XO=0: report)
  *   venusctl map-sid SID    after boot --keep: map one more SID now (VENUSCTL_SMMU mode, hybrid = window), recorded in
  *                           STATE; e.g. boot with VENUSCTL_NSID=4, init, then map-sid 0x1360
  *   decode ... --stop-at STAGE  redfin: stop after STAGE (sessinit props workmode intl alloc load start ftb), watch the
@@ -126,6 +130,7 @@ static void ts_start(void)
 int main(int argc, char **argv)
 {
 	const char *fw = NULL, *cmd = NULL, *arg = NULL, *arg2 = NULL, *arg3 = NULL;
+	int sysinit = 0;	/* redfin: watch --sysinit */
 	int no_shutdown = 0, keep = 0, frames = 5, hevc = -1;	/* 4e: -1 = from the stream */
 	uint64_t phys = 0, bufphys = 0;
 	const char *steplog = NULL;	/* redfin: --step [--step-file F] */
@@ -157,6 +162,8 @@ int main(int argc, char **argv)
 			steplog = argv[++i];
 		else if (!strcmp(argv[i], "--stop-at") && i + 1 < argc)
 			vc_stop_at = argv[++i];
+		else if (!strcmp(argv[i], "--sysinit"))
+			sysinit = 1;
 		else if (!strcmp(argv[i], "--dry"))
 			vc_stop_at = "ftb";
 		else if (!strcmp(argv[i], "--hevc"))
@@ -219,6 +226,8 @@ int main(int argc, char **argv)
 		return session(debug);
 	if (!strcmp(cmd, "shutdown") && !arg)
 		return shutdown_cmd();
+	if (!strcmp(cmd, "watch") && arg)
+		return watch((unsigned)atoi(arg), sysinit, debug);
 	if (!strcmp(cmd, "map-sid") && arg)
 		return map_sid((uint32_t)strtoul(arg, NULL, 0));
 	if (!strcmp(cmd, "smmu") && !arg)
@@ -230,6 +239,7 @@ usage:
 		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"
 		"       any command: [--step] [--step-file FILE]  (default /var/local/venus-step.log)\n"
 		"       | shutdown | smmu (read-only: SMRs for 0x1300-0x13ff, global faults) | map-sid SID (after boot --keep)\n"
+		"       | watch SECONDS [--sysinit] [--debug MASK] (after init: firmware/NoC/SMMU state every 200 ms)\n"
 		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
 		"       | memtest ADDR SIZE write|check\n");
 	return 2;
