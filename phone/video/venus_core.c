@@ -365,6 +365,8 @@ static int allowed(uint32_t pa)
 		return 1;
 	if ((pa >= PLL0 && pa <= PLL_FRAC) || pa == IRIS_RCG || pa == IRIS_CFG)
 		return 1;
+	if (pa == VIDEO_CC_XO)	/* redfin: power on enables it if off (Linux keeps it on, CLK_IS_CRITICAL) */
+		return 1;
 	if (pa == GDSC_MVSC || pa == GDSC_MVS0 || pa == GDSC_MVS1)
 		return 1;
 	for (unsigned i = 0; i < NBR; i++)
@@ -821,6 +823,16 @@ int power_on(void)
 	printf("venus: pll0 L %#x wanted, reads L %#x MODE %#010x OPMODE %#x: %.1f MHz, iris %.1f MHz\n", l,
 	       vrd(PLL_L) & 0xffff, vrd(PLL_MODE), vrd(PLL_OPMODE), 19.2 * (vrd(PLL_L) & 0xffff),
 	       19.2 * (vrd(PLL_L) & 0xffff) / 2);
+	/* redfin: video_cc_xo_clk is CLK_IS_CRITICAL in videocc-lito.c (always on under Linux) and the venus PIL node's
+	 * proxy clock "xo": the firmware's timers run from it. Nothing in XNU turns it on; enable it if it reads off
+	 * (left on afterwards, as Linux does). VENUSCTL_XO=0: only report it. */
+	{
+		uint32_t xo = vrd(VIDEO_CC_XO);
+		printf("venus: video_cc_xo %#x = %#010x (%s)\n", VIDEO_CC_XO, xo, onoff(xo));
+		if ((xo & CLK_OFF) && (!getenv("VENUSCTL_XO") || atoi(getenv("VENUSCTL_XO"))) &&
+		    branch_on(VIDEO_CC_XO, "video_cc_xo"))
+			return power_off(), 1;
+	}
 	if (gdsc_on(GDSC_MVSC, "mvsc") || gdsc_on(GDSC_MVS0, "mvs0") || (cvp && gdsc_on(GDSC_MVS1, "mvs1")))
 		return power_off(), 1;
 	if (axi_late && gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 1))
@@ -1857,6 +1869,72 @@ static int sys_up(struct vstate *vp, uint32_t debug, const char *what)
 		printf("venus: property info without an image version (size %u, property %#x)\n", pkt[0], pkt[3]);
 	}
 	*vp = v;
+	return 0;
+}
+
+/*
+ * redfin rn4x: `venusctl watch SECONDS [--sysinit] [--debug MASK]`: after init, read-only watch of the firmware until
+ * it dies or SECONDS pass, every 200 ms: CTRL_STATUS (init/idle/pc_ready/error), WRAPPER_CPU_STATUS (WFI),
+ * WRAPPER_INTR_STATUS (0x10 = watchdog A2HWD, 0x4 = A2H), the video NoC error logger (ERRVLD + ERRLOG0-3), the
+ * SMMU's global fault registers (USF stream in sGFSYNR1), GDSC/clock/PLL state, and the firmware's debug/msg queues
+ * (drained and printed). A line when anything changes, else every 2 s; with --step each line is also on /dev/console
+ * and fsynced, so the last state before a reset survives. --sysinit first sends SYS_INIT + debug config + image
+ * version (Linux's core_init does this right after the boot handshake; our init leaves the firmware before
+ * SYS_INIT). Never writes a core register except the doorbell for --sysinit's commands.
+ */
+#define NOC_ERR		(CORE + 0x4000 + 0x500)	/* VCODEC_CORE0_VIDEO_NOC_BASE_OFFS + ERR_SWID_LOW (hfi_io_common.h) */
+int watch(unsigned secs, int sysinit, uint32_t debug)
+{
+	struct vstate v;
+	if (state_load(&v) || !v.init || !v.q) {
+		printf("venus: refused: no initialised firmware (venusctl boot --keep, then init)\n");
+		return 1;
+	}
+	qb = v.q;
+	if (sysinit && sys_up(&v, debug, "watch"))
+		return 1;
+	uint64_t s = 0x15000000ull;
+	uint32_t last[16] = { 0 };
+	double t0 = mono_ms(), tl = -1e9;
+	unsigned n = 0;
+	for (;;) {
+		double t = mono_ms();
+		if (t - t0 > secs * 1e3)
+			break;
+		uint32_t cur[16] = { 0 };
+		int on = core_ok();
+		cur[0] = on;
+		cur[1] = vrd(GDSC_MVSC), cur[2] = vrd(GDSC_MVS0), cur[3] = vrd(PLL_MODE), cur[4] = rd32(GCC_VIDEO_AXI);
+		cur[5] = rd32(s + 0x48), cur[6] = rd32(s + 0x50), cur[7] = rd32(s + 0x54), cur[8] = rd32(s + 0x58);
+		if (on) {
+			cur[9] = rd32(CTRL_STATUS), cur[10] = rd32(WRAP_CPU_STATUS), cur[11] = rd32(WRAP_INTR_STATUS);
+			cur[12] = rd32(NOC_ERR + 0x10);	/* ERRVLD */
+			if (cur[12] & 1) {
+				cur[13] = rd32(NOC_ERR + 0x20), cur[14] = rd32(NOC_ERR + 0x28), cur[15] = rd32(NOC_ERR + 0x30);
+			}
+		}
+		int changed = memcmp(cur, last, sizeof(cur)) != 0;
+		if (changed || t - tl >= 2000) {
+			tl = t;
+			char line[400];
+			snprintf(line, sizeof(line), "watch %.1f s: %s CTRL_STATUS %#010x (init %u idle %u pc_ready %u err %#x)"
+				 " CPU_STATUS %#x INTR_STATUS %#x%s | NoC ERRVLD %#x LOG0 %#x LOG1 %#x LOG2 %#x | sGFSR %#x"
+				 " sGFSYNR0 %#x SYNR1 %#x SYNR2 %#x | gdsc mvsc %#x mvs0 %#x pll %#x axi %#x%s",
+				 (t - t0) / 1e3, on ? "on" : "CLOCK/GDSC OFF", cur[9], cur[9] & 1, (cur[9] >> 30) & 1,
+				 (cur[9] >> 8) & 1, cur[9] & 0xfe, cur[10], cur[11], (cur[11] & 0x10) ? " (WATCHDOG)" : "",
+				 cur[12], cur[13], cur[14], cur[15], cur[5], cur[6], cur[7], cur[8], cur[1], cur[2], cur[3], cur[4],
+				 changed ? "" : " (same)");
+			printf("venus: %s\n", line);
+			pm_step("%s", line);
+			memcpy(last, cur, sizeof(cur));
+		}
+		if (on && wait_msg(0, 0))	/* drain + print firmware debug/messages (q_read only touches queue memory) */
+			printf("venus: watch: queue read failed\n");
+		if (on && n++ % 25 == 0)
+			win_faults("watch");
+		delay_ms(200);
+	}
+	printf("venus: watch: %u s done, phone alive\n", secs);
 	return 0;
 }
 
