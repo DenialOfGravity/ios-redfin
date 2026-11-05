@@ -451,6 +451,7 @@ sc_install(void)
 static void sc_dump_view(id v);
 static id sc_sigview_get(void);
 static void sc_dump_all(void);
+static void sc_reattach(void);
 
 static void
 sc_poll(void)
@@ -495,6 +496,9 @@ sc_poll(void)
 	struct stat dv;
 	if (++polls % 4 == 0 && stat("/var/local/sweetcell.dumpview", &dv) == 0) {
 		sc_dump_all();
+	}
+	if (stat("/var/local/sweetcell.reattach", &dv) == 0) {
+		sc_reattach();
 	}
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		@try {
@@ -612,6 +616,29 @@ sc_dump_all(void)
 	}
 }
 
+/* sweetcell.reattach: the condensed items seen by the hook whose signal view is enabled but has no superview get it
+ * added back next to their service name view (same region container, the frame the status bar computed). */
+static NSHashTable *sc_items;
+
+static void
+sc_reattach(void)
+{
+	for (id item in sc_items.allObjects) {
+		Ivar sv = class_getInstanceVariable(object_getClass(item), "_signalView");
+		Ivar nv = class_getInstanceVariable(object_getClass(item), "_serviceNameView");
+		UIView *sig = sv ? object_getIvar(item, sv) : nil, *name = nv ? object_getIvar(item, nv) : nil;
+		if (sig == nil || sig.superview != nil || name == nil || name.superview == nil || sig.frame.size.width <= 0) {
+			continue;
+		}
+		[name.superview addSubview:sig];
+		sig.hidden = NO;
+		sig.alpha = 1;
+		sc_ui_log([NSString stringWithFormat:@"reattached signal view %p to %s (frame %.1f %.1f %.1f %.1f, name at %.1f %.1f)",
+		    sig, object_getClassName(name.superview), sig.frame.origin.x, sig.frame.origin.y, sig.frame.size.width,
+		    sig.frame.size.height, name.frame.origin.x, name.frame.origin.y]);
+	}
+}
+
 static void
 sc_install_ui(void)
 {
@@ -649,6 +676,12 @@ sc_install_ui(void)
 			}
 		}
 		/* remember the signal view: sc_poll dumps it every 20 s while /var/local/sweetcell.dumpview exists */
+		@synchronized(seen) {
+			if (sc_items == nil) {
+				sc_items = [NSHashTable weakObjectsHashTable];
+			}
+			[sc_items addObject:me];
+		}
 		if ([key rangeOfString:@".signalStrengthDisplayIdentifier"].location != NSNotFound) {
 			id v = [ident respondsToSelector:sel_registerName("view")] ? [ident valueForKey:@"view"] : nil;
 			if (v != nil) {
@@ -690,6 +723,23 @@ sc_init(void)
 	sc_write([NSString stringWithFormat:@"on, mode %d%s", sc_mode, disc ? ", discovery in 12 s" : ""]);
 	if (sc_mode & 1) {
 		sc_install();	/* before SpringBoard's telephony objects ask (constructor time) */
+		/* the first answer is already the modem's state: a status bar that starts at "Searching" and then
+		 * switches drops the condensed signal view from its region (seen 2026-11-05, see sc_reattach) */
+		char line[1024] = "";
+		FILE *f = fopen(SC_STATUS, "r");
+		if (f != NULL) {
+			if (fgets(line, sizeof(line), f) == NULL) {
+				line[0] = 0;
+			}
+			fclose(f);
+		}
+		if (line[0]) {
+			id info = sc_build(line);
+			@synchronized(sc_lock) {
+				sc_info = info;
+			}
+			sc_write(@"early info set from cell.status");
+		}
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 			sc_poll();
 		});
