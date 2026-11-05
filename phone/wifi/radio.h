@@ -2,8 +2,15 @@
 #define RADIO_H
 #include <stdint.h>
 
+/* apps SMMU (SMMUv2, 0x15000000): also used by ipa.c for the IPA streams */
+#define SMMU_PA		0x15000000ull
+#define SMMU_SIZE	0x00100000u
+/* does a valid-or-not SMR value (id 14:0, mask 30:16) match stream SID with extra mask bits MASK */
+int smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask);
+
 /* The WLAN DMA stream (apps SMMU 0x640/0x1) through a translation-off bank; before the modem boots. 0 = ok. */
 int smmu_wlan_identity(void);
+int smmu_stream_identity(uint32_t sid, uint32_t smask, const char *label);
 int radio_start(void);		/* after WLFW mission mode: copy engines, HTC, then WMI/HTT/scan from radio_poll */
 void radio_poll(void);		/* called from the link's idle loop */
 void radio_summary(void);	/* the networks heard so far */

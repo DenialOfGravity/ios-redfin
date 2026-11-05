@@ -13,6 +13,7 @@
  *   wland qmp MSG           message to the AOP over QMP (opens the link if needed)
  *   wland shutdown          PAS shutdown of the modem
  *   wland boot              power votes + PAS boot of the modem + wait for ready
+ *   wland ipahw regs|smmu|hwinit|meminit   IPA v4.7 AP-side setup (ipa.c; cellular data)
  *   wland pas-load ID DIR NAME PA SIZE  TrustZone PAS load of DIR/NAME.mdt into a carve-out (other peripherals)
  *   wland smmu              the WLAN DMA stream through a translation-off SMMU bank (radio.c)
  *   wland up [SECS]         all of it from a fresh boot, then the radio: copy engines, WMI, passive scans
@@ -44,6 +45,7 @@
 #include "ipnet.h"
 #include "bridge.h"
 #include "cell.h"
+#include "ipa.h"
 
 static void set_stage(const char *stage);	/* wland auto: progress in /var/local/wland.boot (no-op otherwise) */
 
@@ -1345,6 +1347,8 @@ int main(int argc, char **argv)
 		int rc = pm_rpmh(argv[2], 1, off, val);
 		printf("bcm %s x %#x y %#x (%#x) -> %d\n", argv[2], x, y, val[0], rc);
 		return rc ? 1 : 0;
+	} else if (!strcmp(c, "ipahw")) {
+		return ipa_main(argc - 1, argv + 1);
 	} else if (!strcmp(c, "pas-load") && argc > 6) {
 		return pas_load((uint32_t)strtoul(argv[2], NULL, 0), argv[3], argv[4], strtoull(argv[5], NULL, 0),
 				strtoull(argv[6], NULL, 0)) ? 1 : 0;

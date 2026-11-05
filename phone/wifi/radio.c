@@ -67,8 +67,7 @@ static void mem_wr(uint64_t pa, const void *buf, uint32_t len)
 
 /* ---------------------------------------------------------------- apps SMMU */
 
-#define SMMU_PA		0x15000000ull
-#define SMMU_SIZE	0x00100000u
+/* SMMU_PA, SMMU_SIZE: radio.h (shared with ipa.c) */
 #define WLAN_SID	0xc0	/* redfin lito icnss iommus <&apps_smmu 0xC0 0x1> (sunfish 0x240, flame 0x640) */
 #define WLAN_SID_MASK	0x1
 #define CB_CBAR		0x0001f000u	/* S1 translation, S2 bypass, as ABL's banks */
@@ -83,8 +82,15 @@ static int sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
 	return ((id ^ sid) & ~(m | mask) & 0x7fff) == 0;
 }
 
-int smmu_wlan_identity(void)
+int smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
 {
+	return sid_match(smr, sid, mask);
+}
+
+/* the same translation-off bank setup for any stream (ipa.c: IPA 0x520/0x522); 0 = matched as written */
+int smmu_stream_identity(uint32_t sid, uint32_t smask, const char *label)
+{
+	int ok;
 	uint64_t s = SMMU_PA;
 	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
 	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
@@ -103,13 +109,13 @@ int smmu_wlan_identity(void)
 		}
 		if (((s2cr >> 16) & 3) == 0)
 			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
-		if (sid_match(smr, WLAN_SID, WLAN_SID_MASK)) {
+		if (sid_match(smr, sid, smask)) {
 			uint32_t c = s2cr & 0xff;
 			uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
 			printf("smmu: SMR%u %08x already matches %#x: S2CR %08x, CB%u SCTLR %08x CBAR %08x\n", i, smr,
-			       WLAN_SID, s2cr, c, rd32(cbp), rd32(s + psize + 4 * c));
-			smmu_done = ((s2cr >> 16) & 3) == 0 && !(rd32(cbp) & 1);
-			return smmu_done ? 0 : -1;
+			       sid, s2cr, c, rd32(cbp), rd32(s + psize + 4 * c));
+			ok = ((s2cr >> 16) & 3) == 0 && !(rd32(cbp) & 1);
+			return ok ? 0 : -1;
 		}
 	}
 	/* lowest free bank that nothing points at and nobody set up (the top ones may be secure) */
@@ -136,15 +142,21 @@ int smmu_wlan_identity(void)
 	wr32(gr1 + 4 * cb, CB_CBAR);
 	wr32(cbp, CB_SCTLR);				/* SCTLR last */
 	wr32(s + 0xc00 + 4 * slot, (uint32_t)cb);	/* S2CR: translate (type 0) through this bank */
-	wr32(s + 0x800 + 4 * slot, (1u << 31) | (WLAN_SID_MASK << 16) | WLAN_SID);	/* SMR valid last */
+	wr32(s + 0x800 + 4 * slot, (1u << 31) | (smask << 16) | sid);	/* SMR valid last */
 	wr32(s + 0x70, 0);				/* sTLBGSYNC */
 	for (int i = 0; i < 1000 && (rd32(s + 0x74) & 1); i++)
 		delay_ms(1);
 	uint32_t smr = rd32(s + 0x800 + 4 * slot), s2cr = rd32(s + 0xc00 + 4 * slot);
-	smmu_done = (smr >> 31) && sid_match(smr, WLAN_SID, WLAN_SID_MASK) && ((s2cr >> 16) & 3) == 0 &&
+	ok = (smr >> 31) && sid_match(smr, sid, smask) && ((s2cr >> 16) & 3) == 0 &&
 		    (s2cr & 0xff) == (uint32_t)cb;
-	printf("smmu: WLAN %#x/%#x -> CB%d via SMR%d: SMR %08x S2CR %08x SCTLR %08x CBAR %08x -> %s\n", WLAN_SID,
-	       WLAN_SID_MASK, cb, slot, smr, s2cr, rd32(cbp), rd32(gr1 + 4 * cb), smmu_done ? "ok" : "NOT as written");
+	printf("smmu: %s %#x/%#x -> CB%d via SMR%d: SMR %08x S2CR %08x SCTLR %08x CBAR %08x -> %s\n", label, sid,
+	       smask, cb, slot, smr, s2cr, rd32(cbp), rd32(gr1 + 4 * cb), ok ? "ok" : "NOT as written");
+	return ok ? 0 : -1;
+}
+
+int smmu_wlan_identity(void)
+{
+	smmu_done = smmu_stream_identity(WLAN_SID, WLAN_SID_MASK, "WLAN") == 0;
 	return smmu_done ? 0 : -1;
 }
 
