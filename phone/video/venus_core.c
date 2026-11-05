@@ -1886,12 +1886,12 @@ static int sys_up(struct vstate *vp, uint32_t debug, const char *what)
 int watch(unsigned secs, int sysinit, uint32_t debug)
 {
 	struct vstate v;
-	if (state_load(&v) || !v.init || !v.q) {
-		printf("venus: refused: no initialised firmware (venusctl boot --keep, then init)\n");
-		return 1;
-	}
-	qb = v.q;
-	if (sysinit && sys_up(&v, debug, "watch"))
+	int fwq = state_load(&v) == 0 && v.init && v.q;	/* queues to drain; without them: power-only watch */
+	if (!fwq)
+		printf("venus: watch: no initialised firmware in %s: power/bus state only (no queues)\n", STATE);
+	else
+		qb = v.q;
+	if (sysinit && (!fwq || sys_up(&v, debug, "watch")))
 		return 1;
 	uint64_t s = 0x15000000ull;
 	uint32_t last[16] = { 0 };
@@ -1903,9 +1903,11 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 			break;
 		uint32_t cur[16] = { 0 };
 		int on = core_ok();
-		cur[0] = on;
+		cur[0] = (uint32_t)on;
 		cur[1] = vrd(GDSC_MVSC), cur[2] = vrd(GDSC_MVS0), cur[3] = vrd(PLL_MODE), cur[4] = rd32(GCC_VIDEO_AXI);
 		cur[5] = rd32(s + 0x48), cur[6] = rd32(s + 0x50), cur[7] = rd32(s + 0x54), cur[8] = rd32(s + 0x58);
+		uint32_t tbu = rd32(GCC_TBU_SF_VOTE), tbs0 = rd32(TBU_SF_STATUS), tbs1 = rd32(TBU_SF_STATUS + 4);
+		cur[0] |= (tbu & PWR_ON) ? 2 : 0;	/* mnoc_sf_0_tbu powered (someone else's vote; ours is collapse) */
 		if (on) {
 			cur[9] = rd32(CTRL_STATUS), cur[10] = rd32(WRAP_CPU_STATUS), cur[11] = rd32(WRAP_INTR_STATUS);
 			cur[12] = rd32(NOC_ERR + 0x10);	/* ERRVLD */
@@ -1919,16 +1921,17 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 			char line[400];
 			snprintf(line, sizeof(line), "watch %.1f s: %s CTRL_STATUS %#010x (init %u idle %u pc_ready %u err %#x)"
 				 " CPU_STATUS %#x INTR_STATUS %#x%s | NoC ERRVLD %#x LOG0 %#x LOG1 %#x LOG2 %#x | sGFSR %#x"
-				 " sGFSYNR0 %#x SYNR1 %#x SYNR2 %#x | gdsc mvsc %#x mvs0 %#x pll %#x axi %#x%s",
+				 " sGFSYNR0 %#x SYNR1 %#x SYNR2 %#x | gdsc mvsc %#x mvs0 %#x pll %#x axi %#x | tbu_sf0 vote %#x"
+				 " status %#x %#x%s",
 				 (t - t0) / 1e3, on ? "on" : "CLOCK/GDSC OFF", cur[9], cur[9] & 1, (cur[9] >> 30) & 1,
 				 (cur[9] >> 8) & 1, cur[9] & 0xfe, cur[10], cur[11], (cur[11] & 0x10) ? " (WATCHDOG)" : "",
 				 cur[12], cur[13], cur[14], cur[15], cur[5], cur[6], cur[7], cur[8], cur[1], cur[2], cur[3], cur[4],
-				 changed ? "" : " (same)");
+				 tbu, tbs0, tbs1, changed ? "" : " (same)");
 			printf("venus: %s\n", line);
 			pm_step("%s", line);
 			memcpy(last, cur, sizeof(cur));
 		}
-		if (on && wait_msg(0, 0))	/* drain + print firmware debug/messages (q_read only touches queue memory) */
+		if (on && fwq && wait_msg(0, 0))	/* drain + print firmware debug/messages (q_read only touches queue memory) */
 			printf("venus: watch: queue read failed\n");
 		if (on && n++ % 25 == 0)
 			win_faults("watch");
