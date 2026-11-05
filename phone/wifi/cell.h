@@ -5,7 +5,8 @@
  * (wland boots MPSS and is the only QRTR endpoint on the apps side for the modem). Off unless /var/local/cell.on
  * exists (checked every 10 s, so it can be switched on and off without restarting wland); its content may hold
  * "slots=1" (UIM Get Slots Status) and "hw=1" (DMS hardware revision), both off otherwise. "pin=1" opens CELL_SOCK for
- * the SIM PIN UI (SweetPIN): one UIM Verify PIN per user entry (cell.c, PIN section). Starts only 15 s after
+ * the SIM PIN UI (SweetPIN): one UIM Verify PIN per user entry (cell.c, PIN section). "wds=1" adds read-only WDS
+ * queries (packet service status, bearer, 3GPP profiles; cell.c header). Starts only 15 s after
  * Wi-Fi's WLFW bring-up ended (cell_allow), or 3 min after the link came up if WLFW never shows. Never registers,
  * never changes the operating mode, no SMS, no data. Results: one line in wland.log ("cell: ...") and in
  * /var/local/cell.status (`wland cell` prints it).

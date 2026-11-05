@@ -424,3 +424,8 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   getSIMStatus/getRemainingPINAttemptCount/unlockPIN/promptForSIMUnlock answered from wland (block signatures checked at
   run time); SpringBoard opens SIMSetupUIService's unlock remote alert (iOS 16 has no SBSIMLockManager; VC name found in
   the app binary or /var/local/sweetpin.vc), else a UIKit SIM PIN alert. Discovery -> /var/tmp/sweetpin.log.
+- cell (ws-n-wds, data design X0, read-only): `wds=1` in cell.on adds the WDS server (0x01) to cell.c's rounds: Get Packet
+  Service Status 0x22, Get Current Data Bearer Technology 0x44, Get Profile List 0x2a (3GPP), Get Default Profile Number
+  0x49 every 30 s; Get Profile Settings 0x2b once per listed profile (again on a cell.on/list/server change). Status line
+  gets `| wds=disconnected bearer=... profiles=N default=K apn='...' pdp=ipv4v6`; each profile logged once as `cell: wds
+  profile N apn=... pdp=... auth=... name=... roaming=...`. Username/password TLVs never read. No WDS write of any kind.

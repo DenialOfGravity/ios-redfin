@@ -1,13 +1,18 @@
 /*
- * cell: read-only QMI client for the modem's UIM (0x0b), NAS (0x03) and DMS (0x02) services, on wland's
- * QRTR link (see cell.h). One request in flight, a round every 30 s while /var/local/cell.on exists:
+ * cell: read-only QMI client for the modem's UIM (0x0b), NAS (0x03), DMS (0x02) and (wds=1) WDS (0x01) services,
+ * on wland's QRTR link (see cell.h). One request in flight, a round every 30 s while /var/local/cell.on exists:
  *   DMS  Get Model 0x22, Get Revision 0x23, Get IDs 0x25, Get Hardware Revision 0x2c (once; IMEI only counted),
  *        Get Operating Mode 0x2d
  *   UIM  Get Slots Status 0x47 (physical tray / eUICC; ICCID only counted), Get Card Status 0x2f (logical)
  *   NAS  Get Serving System 0x24, Get System Info 0x4d, Get Signal Info 0x4f
- * Message ids and TLV layouts: libqmi data/qmi-service-{uim,nas,dms}.json (as HakiOS vayu_cell_qmi.h).
- * Writes only with their word in cell.on (slotswitch=1, online=1/0, pin=1; see maybe_write and the PIN section).
- * No Network Register, no SMS/data/voice, never a PUK.
+ *   WDS  (only with wds=1; data design step X0, read-only) Get Packet Service Status 0x22, Get Current Data Bearer
+ *        Technology 0x44, Get Profile List 0x2a (3GPP), Get Default Profile Number 0x49 (3GPP, embedded) every round;
+ *        Get Profile Settings 0x2b once per listed profile (again when cell.on, the list or the WDS server changes).
+ *        Appends "| wds=... bearer=... profiles=N default=K apn='...' pdp=..." to the status line and logs each
+ *        profile once ("cell: wds profile N ..."). Username/password TLVs (0x1b/0x1c) are never read.
+ * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 (writes; see maybe_write and the PIN
+ * section). Message ids and TLV layouts: libqmi data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
+ * No Network Register, no SMS/data/voice, no WDS Start Network or any other WDS write, never a PUK.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,19 +27,22 @@
 #include "link.h"
 #include "qmi.h"
 
-enum { SVC_DMS, SVC_NAS, SVC_UIM, NSVC };
-static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b };
-static const char *svc_name[NSVC] = { "dms", "nas", "uim" };
+enum { SVC_DMS, SVC_NAS, SVC_UIM, SVC_WDS, NSVC };
+static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b, 0x01 };
+static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
-enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32 };
+enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64 };
 static int p1_known, p1_present, p1_active, cur_mode = -1;
 static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 	{ SVC_DMS, 0x22, 1, 0 }, { SVC_DMS, 0x23, 1, 0 }, { SVC_DMS, 0x25, 1, 0 }, { SVC_DMS, 0x2c, 1, OPT_HW },
 	{ SVC_DMS, 0x2d, 0, 0 },
 	{ SVC_UIM, 0x47, 0, OPT_SLOTS }, { SVC_UIM, 0x2f, 0, 0 },
 	{ SVC_NAS, 0x24, 0, 0 }, { SVC_NAS, 0x4d, 0, 0 }, { SVC_NAS, 0x4f, 0, 0 },
+	/* appended, so the indexes above (done_once[3] = DMS 0x2c) stay */
+	{ SVC_WDS, 0x22, 0, OPT_WDS }, { SVC_WDS, 0x44, 0, OPT_WDS }, { SVC_WDS, 0x2a, 0, OPT_WDS },
+	{ SVC_WDS, 0x49, 0, OPT_WDS }, { SVC_WDS, 0x2b, 0, OPT_WDS },	/* 0x2b: one request per profile, see wds_more */
 };
 #define NSTEPS (int)(sizeof(steps) / sizeof(steps[0]))
 
@@ -44,7 +52,7 @@ static uint16_t txn = 1, want_txn;
 static uint64_t sent_ms, next_round, next_check, last_log;
 static char model[48] = "?", hwrev[48] = "?", rev[128] = "?", imei[24] = "?";
 static char f_mode[32], f_sim[256], f_slots[192], f_reg[160], f_svc[96], f_sig[96];
-static char last_line[1280];
+static char last_line[1536];
 static int bars;
 
 
@@ -373,13 +381,214 @@ static void on_nas(uint16_t id, const struct qmi_msg *m, unsigned e)
 	}
 }
 
+/*
+ * WDS (wds=1 only; data design X0): read-only. Layouts from libqmi data/qmi-service-wds.json:
+ *   0x22 Get Packet Service Status: out 0x01 u8 (0 unknown, 1 disconnected, 2 connected, 3 suspended, 4 authenticating)
+ *   0x44 Get Current Data Bearer Technology: out 0x01 Current / 0x10 Last {network type u8 (1 3gpp2, 2 3gpp),
+ *        rat mask u32, so mask u32}; out of a call the modem answers an error (expected) and may still give Last
+ *   0x2a Get Profile List: in 0x10 profile type u8 (0 = 3GPP); out 0x01 [u8] {type u8, index u8, name[u8]}
+ *   0x49 Get Default Profile Number: in 0x01 {type u8 0 = 3GPP, family u8 0 = embedded}; out 0x01 index u8
+ *   0x2b Get Profile Settings: in 0x01 {type u8, index u8}; out 0x10 name, 0x11 PDP type u8, 0x14 APN (strings
+ *        fill their TLV), 0x1d auth u8 (bit 0 PAP, bit 1 CHAP), 0x3e roaming disallowed u8. Never read: 0x1b
+ *        username, 0x1c password.
+ */
+#define WDS_MAXPROF	16
+static struct {
+	uint8_t index, have;		/* have: 1 = settings read without an error */
+	uint8_t pdp, auth, roam_dis;	/* 0xff = TLV absent */
+	char apn[64], name[40];
+} wprof[WDS_MAXPROF];
+static int wds_nprof = -1, wds_next, wds_default = -1;
+static char w_ps[40] = "?", w_bearer[64] = "?", w_list[24] = "?", w_def[24] = "?";
+
+static const char *const wds_conn[] = { "unknown", "disconnected", "connected", "suspended", "authenticating" };
+static const char *const wds_pdp[] = { "ipv4", "ppp", "ipv6", "ipv4v6", "non-ip" };
+
+/* forget the profile table (cell.on changed, or the WDS server came back): settings are read again */
+static void wds_reset(void)
+{
+	memset(wprof, 0, sizeof(wprof));
+	wds_nprof = -1;
+	wds_next = 0;
+	wds_default = -1;
+	snprintf(w_ps, sizeof(w_ps), "?");
+	snprintf(w_bearer, sizeof(w_bearer), "?");
+	snprintf(w_list, sizeof(w_list), "?");
+	snprintf(w_def, sizeof(w_def), "?");
+}
+
+/* one bearer TLV {network type, rat mask, so mask} as a short name */
+static void wds_bearer_name(char *dst, size_t dsz, const uint8_t *p, uint16_t l)
+{
+	if (!p || l < 9) {
+		snprintf(dst, dsz, "?");
+		return;
+	}
+	uint32_t rat;
+	memcpy(&rat, p + 1, 4);
+	if (p[0] == 1) {
+		snprintf(dst, dsz, "3gpp2:%#x", rat);
+		return;
+	}
+	if (p[0] != 2) {
+		snprintf(dst, dsz, "unknown");
+		return;
+	}
+	static const struct { uint32_t bit; const char *n; } r[] = {
+		{ 1u << 10, "nr5g" }, { 1u << 5, "lte" }, { 1u << 7, "dc-hsdpa+" }, { 1u << 6, "hsdpa+" }, { 1u << 3, "hsupa" },
+		{ 1u << 2, "hsdpa" }, { 1u << 0, "wcdma" }, { 1u << 9, "td-scdma" }, { 1u << 4, "edge" }, { 1u << 1, "gprs" },
+		{ 1u << 15, "null-bearer" },
+	};
+	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
+		if (rat & r[i].bit) {
+			snprintf(dst, dsz, "%s", r[i].n);
+			return;
+		}
+	if (rat)
+		snprintf(dst, dsz, "3gpp:%#x", rat);
+	else
+		snprintf(dst, dsz, "none");
+}
+
+static void wds_log_profile(int i, unsigned e)
+{
+	if (e) {
+		printf("[%6llu] cell: wds profile %u err%#x\n", (unsigned long long)link_ms(), wprof[i].index, e);
+		return;
+	}
+	static const char *const auth[] = { "none", "pap", "chap", "pap+chap" };
+	printf("[%6llu] cell: wds profile %u apn='%s' pdp=%s auth=%s name='%s' roaming=%s%s\n", (unsigned long long)link_ms(),
+	       wprof[i].index, wprof[i].apn, wprof[i].pdp == 0xff ? "?" : NM(wds_pdp, wprof[i].pdp),
+	       wprof[i].auth == 0xff ? "?" : NM(auth, wprof[i].auth & 3), wprof[i].name,
+	       wprof[i].roam_dis == 0xff ? "?" : wprof[i].roam_dis ? "disallowed" : "allowed",
+	       (int)wprof[i].index == wds_default ? " (default)" : "");
+}
+
+/* 1 = this round's 0x2b step still has a profile to read */
+static int wds_more(void)
+{
+	return wds_nprof > 0 && wds_next < wds_nprof;
+}
+
+/* the request TLVs of a WDS step (none for 0x22/0x44) */
+static void wds_tlvs(struct qmi_buf *q, uint16_t id)
+{
+	if (id == 0x2a)
+		qmi_tlv_u8(q, 0x10, 0);			/* 3GPP */
+	else if (id == 0x49) {
+		uint8_t t[2] = { 0, 0 };		/* 3GPP, embedded */
+		qmi_tlv(q, 1, t, 2);
+	} else if (id == 0x2b) {
+		uint8_t t[2] = { 0, wds_more() ? wprof[wds_next].index : 0 };
+		qmi_tlv(q, 1, t, 2);
+	}
+}
+
+/* an answer to a WDS step; returns 1 if the same step is to be sent again (more profiles) */
+static int on_wds(uint16_t id, const struct qmi_msg *m, unsigned e)
+{
+	uint16_t l;
+	const uint8_t *p;
+	if (id == 0x22) {
+		uint8_t v;
+		if (e || qmi_get_u8(m, 1, &v))
+			snprintf(w_ps, sizeof(w_ps), "err%#x", e);
+		else
+			snprintf(w_ps, sizeof(w_ps), "%s", NM(wds_conn, v));
+	} else if (id == 0x44) {
+		char cur[24], last[24];
+		p = qmi_get(m, 0x10, &l);
+		wds_bearer_name(last, sizeof(last), p, p ? l : 0);
+		if (!e) {
+			p = qmi_get(m, 1, &l);
+			wds_bearer_name(cur, sizeof(cur), p, p ? l : 0);
+			snprintf(w_bearer, sizeof(w_bearer), "%s", cur);
+		} else if (strcmp(last, "?"))
+			snprintf(w_bearer, sizeof(w_bearer), "none(err%#x,last=%s)", e, last);
+		else
+			snprintf(w_bearer, sizeof(w_bearer), "none(err%#x)", e);
+	} else if (id == 0x2a) {
+		p = qmi_get(m, 1, &l);
+		if (e || !p || l < 1) {
+			snprintf(w_list, sizeof(w_list), "err%#x", e);
+			return 0;		/* the table read before (if any) is kept */
+		}
+		uint8_t idx[WDS_MAXPROF];
+		int n = 0;
+		for (uint32_t o = 1, i = 0; i < p[0] && o + 3 <= l && n < WDS_MAXPROF; i++) {
+			idx[n++] = p[o + 1];	/* type (o), index (o + 1), name length (o + 2), name */
+			o += 3u + p[o + 2];
+		}
+		int same = n == wds_nprof;
+		for (int i = 0; same && i < n; i++)
+			same = wprof[i].index == idx[i];
+		if (!same) {			/* first list, or the modem's list changed: read every profile again */
+			memset(wprof, 0, sizeof(wprof));
+			for (int i = 0; i < n; i++)
+				wprof[i].index = idx[i];
+			wds_nprof = n;
+			wds_next = 0;
+			printf("[%6llu] cell: wds %d 3gpp profile%s listed%s\n", (unsigned long long)link_ms(), n, n == 1 ? "" : "s",
+			       p[0] > n ? " (more not kept)" : "");
+		}
+		snprintf(w_list, sizeof(w_list), "%d", n);
+	} else if (id == 0x49) {
+		uint8_t v;
+		if (e || qmi_get_u8(m, 1, &v)) {
+			snprintf(w_def, sizeof(w_def), "err%#x", e);
+			wds_default = -1;
+		} else {
+			snprintf(w_def, sizeof(w_def), "%u", v);
+			wds_default = v;
+		}
+	} else if (id == 0x2b) {
+		if (!wds_more())
+			return 0;
+		int i = wds_next++;
+		wprof[i].have = !e;
+		wprof[i].pdp = wprof[i].auth = wprof[i].roam_dis = 0xff;
+		if (!e) {
+			if ((p = qmi_get(m, 0x14, &l)))
+				clean(wprof[i].apn, sizeof(wprof[i].apn), p, l);	/* clamped to 63 chars */
+			if ((p = qmi_get(m, 0x10, &l)))
+				clean(wprof[i].name, sizeof(wprof[i].name), p, l);
+			if ((p = qmi_get(m, 0x11, &l)) && l >= 1)
+				wprof[i].pdp = p[0];
+			if ((p = qmi_get(m, 0x1d, &l)) && l >= 1)
+				wprof[i].auth = p[0];
+			if ((p = qmi_get(m, 0x3e, &l)) && l >= 1)
+				wprof[i].roam_dis = p[0];
+		}
+		wds_log_profile(i, e);
+		return wds_more();
+	}
+	return 0;
+}
+
+/* the status line's WDS part: "wds=... bearer=... profiles=N default=K apn='...' pdp=..." */
+static void wds_field(char *dst, size_t dsz)
+{
+	const char *apn = "?", *pdp = "?";
+	for (int i = 0; i < wds_nprof && i < WDS_MAXPROF; i++)
+		if ((int)wprof[i].index == wds_default && wprof[i].have) {
+			apn = wprof[i].apn;
+			pdp = wprof[i].pdp == 0xff ? "?" : NM(wds_pdp, wprof[i].pdp);
+		}
+	snprintf(dst, dsz, "wds=%s bearer=%s profiles=%s default=%s apn='%s' pdp=%s", srv[SVC_WDS].up ? w_ps : "no-server",
+		 w_bearer, w_list, w_def, apn, pdp);
+}
+
 static void publish(void)
 {
-	char line[1280];
+	char line[1536], wds[256] = "";
 	if (!strstr(f_reg, "reg=registered"))
 		bars = 0;
-	snprintf(line, sizeof(line), "%s %s %s | %s %s | %s bars=%d | model=%s hw=%s rev=%s imei=%s", f_sim, f_slots, f_mode, f_reg, f_svc, f_sig,
-		 bars, model, hwrev, rev, imei);
+	if (opts & OPT_WDS) {
+		wds[0] = ' ', wds[1] = '|', wds[2] = ' ';
+		wds_field(wds + 3, sizeof(wds) - 3);
+	}
+	snprintf(line, sizeof(line), "%s %s %s | %s %s | %s bars=%d | model=%s hw=%s rev=%s imei=%s%s", f_sim, f_slots, f_mode, f_reg, f_svc, f_sig,
+		 bars, model, hwrev, rev, imei, wds);
 	uint64_t now = link_ms();
 	if (strcmp(line, last_line) || now - last_log > 600000) {
 		printf("[%6llu] cell: %s\n", (unsigned long long)now, line);
@@ -420,6 +629,8 @@ static void send_step(void)
 		int s = steps[step].svc;
 		if (!srv[s].up)
 			continue;
+		if (s == SVC_WDS && steps[step].id == 0x2b && !wds_more())
+			continue;		/* every listed profile read already (or no list yet) */
 		struct qmi_buf *q = malloc(sizeof(*q));
 		if (!q) {
 			end_round(ROUND_MS);
@@ -429,6 +640,8 @@ static void send_step(void)
 		if (!txn)
 			txn = 1;
 		qmi_start(q, QMI_REQUEST, want_txn, steps[step].id);
+		if (s == SVC_WDS)
+			wds_tlvs(q, steps[step].id);
 		size_t len = qmi_finish(q);
 		qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[s].node, srv[s].port, q->b, (uint32_t)len);
 		free(q);
@@ -465,6 +678,8 @@ static int read_opts(void)
 		o |= OPT_SWITCH | OPT_SLOTS;	/* the switch needs the slot status */
 	if (strstr(b, "pin=1"))
 		o |= OPT_PIN;
+	if (strstr(b, "wds=1"))
+		o |= OPT_WDS;
 	if (strstr(b, "online=1"))
 		o |= OPT_ONLINE;
 	else if (strstr(b, "online=0"))
@@ -819,7 +1034,9 @@ void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t po
 			srv[i].node = node;
 			srv[i].port = port;
 			srv[i].up = 1;
-			if (!access(CELL_ON, F_OK))
+			if (i == SVC_WDS)
+				wds_reset();	/* a new modem session: its profiles are read again */
+			if (!access(CELL_ON, F_OK) && (i != SVC_WDS || (opts & OPT_WDS)))
 				printf("cell: %s server (instance %#x) at %u:%x\n", svc_name[i], instance, node, port);
 		}
 }
@@ -829,7 +1046,7 @@ void cell_server_gone(uint32_t node, uint32_t port)
 	for (int i = 0; i < NSVC; i++)
 		if (srv[i].up && srv[i].node == node && (port == 0xffffffffu || srv[i].port == port)) {
 			srv[i].up = 0;
-			if (enabled)
+			if (enabled && (i != SVC_WDS || (opts & OPT_WDS)))
 				printf("cell: %s server gone\n", svc_name[i]);
 		}
 }
@@ -855,15 +1072,18 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (!enabled || step < 0 || step >= NSTEPS || m.txn != want_txn || m.id != steps[step].id)
 		return;			/* off, or a late answer to a timed-out request */
 	unsigned e = qerr(&m);
+	int again = 0;
 	switch (steps[step].svc) {
 	case SVC_DMS: on_dms(m.id, &m, e); break;
 	case SVC_UIM: if (m.id == 0x47) on_slots(&m, e); else on_uim(&m, e); break;
 	case SVC_NAS: on_nas(m.id, &m, e); break;
+	case SVC_WDS: again = on_wds(m.id, &m, e); break;
 	}
 	fails[step] = 0;	/* answered (an error answer, e.g. no signal without service, is normal) */
 	if (!e)
 		done_once[step] = 1;
-	step++;
+	if (!again)		/* WDS 0x2b: the next profile goes out as the same step, after the same gap */
+		step++;
 	next_send = link_ms() + SEND_GAP_MS;	/* cell_poll sends the next one */
 }
 
@@ -890,11 +1110,13 @@ void cell_poll(void)
 			memset(fails, 0, sizeof(fails));
 			sw_tries = mode_tries = 0;
 			timeouts = 0;
-			printf("[%6llu] cell: %s (%s%s%s%s%s%s)%s; servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off",
+			wds_reset();
+			printf("[%6llu] cell: %s (%s%s%s%s%s%s%s)%s; servers dms %s nas %s uim %s%s%s\n", (unsigned long long)now, on ? "on" : "off",
 			       CELL_ON, opts & OPT_SLOTS ? " slots=1" : "", opts & OPT_HW ? " hw=1" : "",
 			       opts & OPT_SWITCH ? " slotswitch=1" : "", opts & OPT_PIN ? " pin=1" : "", opts & OPT_ONLINE ? " online=1" : opts & OPT_LPM ? " online=0" : "",
-			       allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-", srv[SVC_NAS].up ? "up" : "-",
-			       srv[SVC_UIM].up ? "up" : "-");
+			       opts & OPT_WDS ? " wds=1" : "", allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-",
+			       srv[SVC_NAS].up ? "up" : "-", srv[SVC_UIM].up ? "up" : "-", opts & OPT_WDS ? " wds " : "",
+			       opts & OPT_WDS ? (srv[SVC_WDS].up ? "up" : "-") : "");
 			step = -1;
 			next_round = now + 1000;
 			if (!on)
@@ -961,7 +1183,7 @@ void cell_poll(void)
 
 int cell_print(void)
 {
-	char line[1400];
+	char line[1700];
 	FILE *f = fopen(CELL_STATUS, "r");
 	if (!f) {
 		printf("cell: no %s (%s %s; wland running?)\n", CELL_STATUS, CELL_ON, access(CELL_ON, F_OK) ? "absent" : "present");
