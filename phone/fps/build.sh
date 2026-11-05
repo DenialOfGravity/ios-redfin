@@ -15,7 +15,7 @@ mkdir -p out
 ../../work/userland/bin/ios-cc -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc -dynamiclib \
 	-install_name /var/local/lib/SweetFPS.dylib \
 	-framework Foundation -framework QuartzCore -framework UIKit \
-	-o out/SweetFPS.dylib SweetFPS.m SweetSB.m SweetPIN.m SweetHUD.m
+	-o out/SweetFPS.dylib SweetFPS.m SweetSB.m SweetPIN.m SweetHUD.m SweetCell.m
 codesign -f -s - out/SweetFPS.dylib
 ls -la out/SweetFPS.dylib
 # The PC's local userland builder has a fixed component list (it runs phone/haptics/build.sh, which calls this):
