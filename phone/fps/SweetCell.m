@@ -691,6 +691,41 @@ sc_reattach(void)
 	}
 }
 
+/* /var/local/sweetcell.discover2 (stat; any process): how CoreTelephonyClient reaches CommCenter. 6 s after start,
+ * /var/tmp/sweetcell-<process>.log gets CoreTelephonyClientMux (ivars, methods), CoreTelephonyClient's proxy /
+ * connection methods, and every CTXPC* / *ServiceInterface protocol with its methods. */
+static void
+sc_discover2(void)
+{
+	NSMutableString *s = [NSMutableString string];
+	static const char *const ck[] = { "roxy", "onnection", "Mux", "mux", "xpc", "XPC", NULL };
+	Class ct = objc_getClass("CoreTelephonyClient"), mux = objc_getClass("CoreTelephonyClientMux");
+	if (ct != Nil) {
+		sc_class(ct, s, ck);
+	}
+	if (mux != Nil) {
+		sc_class(mux, s, NULL);
+	}
+	unsigned np = 0;
+	Protocol *__unsafe_unretained *pl = objc_copyProtocolList(&np);
+	for (unsigned i = 0; i < np; i++) {
+		const char *pn = protocol_getName(pl[i]);
+		if (strncmp(pn, "CTXPC", 5) == 0 || strstr(pn, "ServiceInterface") || strstr(pn, "CoreTelephonyServer")) {
+			sc_protocol(pl[i], s);
+		}
+	}
+	free(pl);
+	char path[256];
+	snprintf(path, sizeof(path), "/var/tmp/sweetcell-%s.log", getprogname());
+	FILE *f = fopen(path, "a");
+	if (f != NULL) {
+		fprintf(f, "%s[%d] discover2:%s\n", getprogname(), getpid(), s.UTF8String);
+		fclose(f);
+	} else {
+		NSLog(@"SweetCell discover2 (no %s): %@", path, s);
+	}
+}
+
 static void
 sc_install_ui(void)
 {
@@ -764,6 +799,11 @@ sc_init(void)
 	dispatch_async(dispatch_get_main_queue(), ^{
 		sc_install_ui();
 	});
+	if (stat("/var/local/sweetcell.discover2", &fb) == 0) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			sc_discover2();
+		});
+	}
 	if (strcmp(getprogname(), "SpringBoard") != 0) {
 		return;
 	}
