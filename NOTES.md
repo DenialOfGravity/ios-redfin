@@ -416,3 +416,11 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Slot 0x46 (logical 1 -> physical 1, once per cell.on change, only if P1 holds a card and is inactive; rmtfs images
   copied to *.pre-slot first) and `online=1` / `online=0` DMS Set Operating Mode 0x2e online / low power (2 tries, only
   if the mode differs; *.pre-online copies first). An offline (3) modem refuses (0x35); no reset is ever sent.
+- SIM PIN (ws-n-pin, userland: wland + SweetFPS.dylib's SweetPIN.m): `pin=1` in cell.on opens /var/run/wland-cell.sock
+  (root:mobile 0660, peers uid 0/501): "S" = PIN1 status of the card's sim/usim app, "V"+digits = one UIM Verify PIN 0x26
+  (session 0 if it is the GW primary provisioning app, else non-prov slot N + AID); never repeated, refused with <=1 try
+  left, no PUK; log "cell: verify pin -> ok/err, retries left N", the PIN only in a zeroed buffer. SweetPIN (flag
+  /var/local/sweetpin.on, size 100+mode: 0 native then fallback, 1 fallback, 2 discovery, 3 native): CoreTelephonyClient
+  getSIMStatus/getRemainingPINAttemptCount/unlockPIN/promptForSIMUnlock answered from wland (block signatures checked at
+  run time); SpringBoard opens SIMSetupUIService's unlock remote alert (iOS 16 has no SBSIMLockManager; VC name found in
+  the app binary or /var/local/sweetpin.vc), else a UIKit SIM PIN alert. Discovery -> /var/tmp/sweetpin.log.
