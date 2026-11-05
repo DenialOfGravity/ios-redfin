@@ -971,7 +971,7 @@ enum { KS_ABOUT, KS_EDIT, KS_EXTRA, KS_N };
 /* ---------- app ---------- */
 
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
-@property (strong) UIWindow *window;
+@property (strong, nonatomic) UIWindow *window;
 @end
 
 @implementation AppDelegate
