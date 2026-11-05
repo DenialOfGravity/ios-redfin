@@ -404,3 +404,6 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   port 0x30): DMS model/revision/IDs (IMEI only counted)/operating mode, UIM card status, NAS serving system/system
   info/signal info every 30 s; one `cell:` line in wland.log + /var/local/cell.status (`wland cell`). Off unless
   /var/local/cell.on exists (checked every 10 s, no restart). Never registers, sets a mode, or touches SMS/data/voice.
+- cell (ws-n-tel, step 1b): UIM Get Slots Status 0x47 per physical slot (`slots=P1:...|P2:euicc,...`, active slot, protocol,
+  apps; ICCID length only); card status walks every logical card and app (`sim=L1:present usim:ready/pin1=...`, `apps=0`
+  = eUICC with no enabled profile, the 2026-11-05 phone result); DMS hardware revision 0x2c (`hw=`, model is "0" on redfin).
