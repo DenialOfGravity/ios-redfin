@@ -315,6 +315,138 @@ int smmu_translate(const char *name, const uint16_t *sids, unsigned n, uint64_t 
 	return 0;
 }
 
+/*
+ * redfin track V: SIDS (one exact SMR each, mask 0) through ONE new translating bank in which only [base, base+len)
+ * is mapped, IOVA = PA, as 2 MB level-2 blocks (base and len 2 MB aligned, inside one 1 GB slot below 4 GB). Every
+ * other address the streams use takes a translation fault in this bank: terminated, the abort returned to the master
+ * (CFRE), no interrupt (CFIE 0), no stall (CFCFG 0), recorded in the bank's FSR/FAR/FSYNR0. That is what the Linux
+ * driver's venus_ns bank does (only mapped buffers translate). A translation-off bank instead sends any stray address
+ * straight to physical memory: on redfin, identity for SID 0x1360 reset the phone once the firmware ran (rn4x).
+ * The two table pages are at TBL (caller's memory below 4 GB, written through /dev/pmem device windows: nothing cached
+ * on the CPU side). Walk/attribute values are the SM7150 reference's (smmu_translate's R_*: proven for audio), the
+ * leaf is a block (bits 1:0 = 01). saved[k]: what smmu_release puts back for SID k (bank registers in every entry).
+ * Returns the bank, or -1 with nothing routed.
+ */
+int smmu_window(const char *name, const uint16_t *sids, unsigned n, uint64_t base, uint64_t len, uint64_t tbl,
+		struct smmu_saved *saved)
+{
+	uint64_t s = SMMU_PA;
+	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
+	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	uint32_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
+	uint64_t used[4] = { 0 };
+	int cb = -1, slot[16];
+	if (n > 16 || !len || ((base | len) & 0x1fffff) || base + len > (1ull << 32) || ((base ^ (base + len - 1)) >> 30) ||
+	    (tbl & 0xfff)) {
+		printf("smmu: %s: bad window %llx+%llx (2 MB aligned, one 1 GB slot, below 4 GB) or tables %llx\n", name,
+		       (unsigned long long)base, (unsigned long long)len, (unsigned long long)tbl);
+		return -1;
+	}
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
+		if ((smr >> 31) && ((s2cr >> 16) & 3) == 0)
+			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
+		for (unsigned k = 0; k < n && (smr >> 31); k++)
+			if (sid_match(smr, sids[k], 0)) {
+				printf("smmu: %s: SMR%u %08x already matches %#x: refused\n", name, i, smr, sids[k]);
+				return -1;
+			}
+	}
+	for (uint32_t c = 0; c < ncb && c < 256; c++) {	/* free as in smmu_identity; a released bank keeps its CBAR */
+		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
+		uint32_t cbar = rd32(s + psize + 4 * c);
+		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) &&
+		    (cbar == 0 || cbar == CB_CBAR || cbar == R_CBAR)) {
+			cb = (int)c;
+			break;
+		}
+	}
+	for (unsigned k = 0; k < n; k++) {
+		slot[k] = -1;
+		for (uint32_t i = 0; i < nsmr && i < 128 && slot[k] < 0; i++) {
+			int taken = 0;
+			for (unsigned j = 0; j < k; j++)
+				taken |= slot[j] == (int)i;
+			if (!(rd32(s + 0x800 + 4 * i) >> 31) && !taken)
+				slot[k] = (int)i;
+		}
+		if (slot[k] < 0) {
+			printf("smmu: %s: no free SMR for %#x\n", name, sids[k]);
+			return -1;
+		}
+	}
+	if (cb < 0 || (uint64_t)(npage + cb + 1) * psize > SMMU_SIZE) {
+		printf("smmu: %s: no free bank\n", name);
+		return -1;
+	}
+	uint64_t gr1 = s + psize, cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
+	for (unsigned k = 0; k < n; k++)
+		saved[k] = (struct smmu_saved){ .slot = slot[k], .cb = cb, .cbp = cbp, .gr1 = gr1,
+			.smr = rd32(s + 0x800 + 4 * slot[k]), .s2cr = rd32(s + 0xc00 + 4 * slot[k]), .cbar = rd32(gr1 + 4 * cb),
+			.cba2r = rd32(gr1 + 0x800 + 4 * cb), .sctlr = rd32(cbp) };
+	if (smmu_dry) {
+		printf("smmu: %s: would map %llx+%llx (IOVA = PA, 2 MB blocks) through CB%d, tables %llx (dry run)\n", name,
+		       (unsigned long long)base, (unsigned long long)len, cb, (unsigned long long)tbl);
+		return cb;
+	}
+	static const uint64_t zero[512];
+	uint64_t l1 = tbl, l2 = tbl + 0x1000, d;
+	pm_wr(l1, zero, sizeof(zero));
+	pm_wr(l2, zero, sizeof(zero));
+	d = l2 | 3;
+	pm_wr(l1 + 8 * ((base >> 30) & 0x1ff), &d, 8);
+	for (uint64_t o = 0; o < len; o += 0x200000) {
+		d = (base + o) | (R_PAGE & ~2ull);	/* block: attr 0, AP 01, SH 2, AF, nG */
+		pm_wr(l2 + 8 * (((base + o) >> 21) & 0x1ff), &d, 8);
+	}
+	uint64_t asid = (uint64_t)cb << 48;
+	wr32(cbp, 0);
+	wr32(cbp + 0x58, 0xffffffff);			/* FSR: clear */
+	wr64(cbp + 0x20, l1 | asid);			/* TTBR0 */
+	wr64(cbp + 0x28, 0);				/* TTBR1 */
+	wr32(cbp + 0x30, R_TCR);
+	wr32(cbp + 0x10, R_TCR2);
+	wr32(cbp + 0x38, R_MAIR0);
+	wr32(cbp + 0x3c, 0);
+	wr32(gr1 + 0x800 + 4 * cb, CB_CBA2R);
+	wr32(gr1 + 4 * cb, R_CBAR);
+	wr32(cbp + 0x610, (uint32_t)cb);		/* TLBIASID */
+	wr32(cbp + 0x618, 0);				/* TLBIALL */
+	wr32(cbp + 0x7f0, 0);				/* TLBSYNC */
+	double t0 = mono_ms();
+	for (unsigned i = 0; (rd32(cbp + 0x7f4) & 1) && !wait_over(t0, i, 1000); i++)
+		delay_ms(1);
+	wr32(cbp, R_SCTLR);				/* SCTLR last: M | TRE | AFE | CFRE | HUPCF | ASIDPNE, no CFIE */
+	uint64_t r1 = 0, rb = 0, re = 0;
+	pm_rd(l1 + 8 * ((base >> 30) & 0x1ff), &r1, 8);
+	pm_rd(l2 + 8 * ((base >> 21) & 0x1ff), &rb, 8);
+	pm_rd(l2 + 8 * (((base + len - 1) >> 21) & 0x1ff), &re, 8);
+	uint64_t ttbr = ((uint64_t)rd32(cbp + 0x24) << 32) | rd32(cbp + 0x20);
+	int ok = r1 == (l2 | 3) && rb == (base | (R_PAGE & ~2ull)) &&
+		 re == ((base + len - 0x200000) | (R_PAGE & ~2ull)) && ttbr == (l1 | asid) && rd32(cbp + 0x30) == R_TCR &&
+		 (rd32(cbp) & ~0x1000u) == (R_SCTLR & ~0x1000u) && rd32(gr1 + 4 * cb) == R_CBAR;
+	printf("smmu: %s: CB%d window %llx-%llx (IOVA = PA), tables %llx: TTBR0 %llx TCR %08x SCTLR %08x CBAR %08x -> %s\n",
+	       name, cb, (unsigned long long)base, (unsigned long long)(base + len), (unsigned long long)tbl,
+	       (unsigned long long)ttbr, rd32(cbp + 0x30), rd32(cbp), rd32(gr1 + 4 * cb), ok ? "ok" : "NOT as written");
+	if (!ok) {
+		wr32(cbp, saved[0].sctlr);
+		printf("smmu: %s: not routing any SID to CB%d\n", name, cb);
+		return -1;
+	}
+	for (unsigned k = 0; k < n; k++) {
+		wr32(s + 0xc00 + 4 * slot[k], (uint32_t)cb);	/* S2CR: translate through the window bank */
+		wr32(s + 0x800 + 4 * slot[k], 0x80000000u | sids[k]);	/* SMR valid last */
+	}
+	wr32(s + 0x70, 0);				/* sTLBGSYNC */
+	t0 = mono_ms();
+	for (unsigned i = 0; (rd32(s + 0x74) & 1) && !wait_over(t0, i, 1000); i++)
+		delay_ms(1);
+	for (unsigned k = 0; k < n; k++)
+		printf("smmu: %s %#x -> CB%d via SMR%d: SMR %08x S2CR %08x\n", name, sids[k], cb, slot[k],
+		       rd32(s + 0x800 + 4 * slot[k]), rd32(s + 0xc00 + 4 * slot[k]));
+	return cb;
+}
+
 void smmu_faults(const char *name, uint32_t sid)
 {
 	uint64_t s = SMMU_PA;

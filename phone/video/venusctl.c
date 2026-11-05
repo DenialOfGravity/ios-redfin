@@ -46,7 +46,12 @@
  *   --step [--step-file F]  redfin: every /dev/pmem write, SMC and RPMh vote, every HFI command and packet, buffer
  *                           allocations, decode stages, and (while waiting) core + SMMU global fault status every
  *                           500 ms, to F (default /var/local/venus-step.log), fsynced BEFORE each action: after a
- *                           reset the last line is the last thing done
+ *                           reset the last line is the last thing done. The file is a fixed 4 MB, lines written in
+ *                           place (F_FULLFSYNC each); read it with tr -d '\000'. Lines also go to /dev/console.
+ * SMMU (redfin, rn4x): by default the 5 venus_ns SIDs go through ONE translating bank mapping only 0xa2600000-
+ *                           0xaca00000 (IOVA = PA), tables at 0xa29fe000; any other address faults in that bank (FSR/
+ *                           FAR printed at timeouts and in --step status). VENUSCTL_SMMU=identity: the old
+ *                           translation-off banks (identity for 0x1360 reset the phone).
  *   decode ... --stop-at STAGE  redfin: stop after STAGE (sessinit props workmode intl alloc load start ftb), watch the
  *                           queues 2 s, close; --dry = --stop-at ftb (buffers set, START, FTBs, no input queued)
  * redfin (Pixel 5, SM7250 lito; track V): ported from Yofuness/ios-flame 598ba5b, SoC numbers in venus_core.c's header.

@@ -151,7 +151,13 @@ static const uint16_t venus_sids[] = { 0x1380, 0x13a0, 0x13c0, 0x13e0, 0x1360 };
 #define SFR_OFF		0x2fe000u
 #define SFR_SIZE	0x1000u
 #define FIXED_LO	0xa2600000ull	/* redfin: free low-bank RAM 0xa2400000-0xb7e00000 (xnu 1054 notes; memtest first) */
-#define FIXED_HI	0xb7e00000ull	/* debug_info@b7e01000 above */
+#define FIXED_HI	0xaca00000ull	/* redfin: end of xnu 1057's Venus window (xram=3/4 keep 0xa2600000-0xaca00000 out of
+				 * the VM; the RAM above may be the VM's) */
+/* redfin (rn4x): the Venus streams go through ONE translating bank mapping only FIXED_LO-FIXED_HI, IOVA = PA
+ * (smmu_window), as Linux's venus_ns bank; its two table pages sit in the unused gap between the queue block
+ * (0xa2600000 + 0x301000) and the buffer window (0xa2a00000). VENUSCTL_SMMU=identity: the old translation-off banks. */
+#define SMMU_TBL	0xa29fe000ull
+static uint64_t win_cbp;	/* the window bank (from boot or STATE), for fault reports */
 #define POOL_END	0xe0000000ull	/* venus_ns IOVA pool 0x25800000-0xe0000000 (notes 8.4) */
 
 #define PAS_VENUS	9
@@ -1067,9 +1073,10 @@ static int state_load(struct vstate *v)
 			continue;
 		}
 		unsigned sid;
-		if (v->nsmr < 8 && sscanf(line, "smr %d %d %llx %llx %x %x %x %x %x %x", &m.slot, &m.cb, &a, &b, &m.smr,
+		if (v->nsmr < 8 && !strncmp(line, "smr ", 4) && sscanf(line, "smr %d %d %llx %llx %x %x %x %x %x %x", &m.slot, &m.cb, &a, &b, &m.smr,
 					  &m.s2cr, &m.cbar, &m.cba2r, &m.sctlr, &sid) == 10) {
 			m.cbp = a;
+			win_cbp = a;
 			m.gr1 = b;
 			v->sid[v->nsmr] = sid;
 			v->smr[v->nsmr++] = m;
@@ -1172,6 +1179,11 @@ static int tbu_ok(const char *when)
  * the venus_ns pool [0x25800000, 0xe0000000). 0 = ok. */
 static int range_ok(uint64_t a, uint64_t len, const char *what)
 {
+	if (a < SMMU_TBL + 0x2000 && a + len > SMMU_TBL) {
+		printf("venus: refused: %s %#llx+%#llx overlaps the SMMU tables at %#llx\n", what, (unsigned long long)a,
+		       (unsigned long long)len, SMMU_TBL);
+		return -1;
+	}
 	if (!(a & 0xfffff) && len && a >= CP_SIZE && a + len <= POOL_END && a >= FIXED_LO && a + len <= FIXED_HI)
 		return 0;
 	printf("venus: refused: %s %#llx+%#llx: needs 1 MB alignment, inside %#llx-%#llx (and %#x-%#llx)\n", what,
@@ -1179,8 +1191,21 @@ static int range_ok(uint64_t a, uint64_t len, const char *what)
 	return -1;
 }
 
+static void win_faults(const char *when)	/* redfin: the window bank's fault record (reads only) */
+{
+	if (!win_cbp)
+		return;
+	uint32_t fsr = rd32(win_cbp + 0x58);
+	printf("venus: %s: window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x%s\n", when, fsr, rd32(win_cbp + 0x64),
+	       rd32(win_cbp + 0x60), rd32(win_cbp + 0x68), (fsr & 0xc00001feu) ? " (FAULT: a stream used an address"
+	       " outside the window)" : "");
+	pm_step("window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x (%s)", fsr, rd32(win_cbp + 0x64), rd32(win_cbp + 0x60),
+		rd32(win_cbp + 0x68), when);
+}
+
 static void core_status(const char *when)
 {
+	win_faults(when);
 	uint32_t st = crd(CTRL_STATUS);
 	printf("venus: %s: CTRL_STATUS %#010x (init %u error %#x pc_ready %u) VERSION_INFO %#010x HW_VERSION %#010x"
 	       " CPU_STATUS %#010x INTR_STATUS %#010x\n", when, st, st & ST_INIT, st & ST_ERROR, (st >> 8) & 1,
@@ -1250,7 +1275,22 @@ int boot(const char *fw, int keep)
 				return 1;
 			}
 	}
-	for (unsigned k = 0; k < nsid; k++) {
+	const char *smode = getenv("VENUSCTL_SMMU");
+	if (!smode || strcmp(smode, "identity")) {	/* redfin default: the window bank (see SMMU_TBL) */
+		struct smmu_saved sv[8];
+		int wcb = smmu_window("venus", venus_sids, nsid, FIXED_LO, FIXED_HI - FIXED_LO, SMMU_TBL, sv);
+		if (wcb < 0)
+			return boot_fail(&v);
+		for (unsigned k = 0; k < nsid; k++) {
+			v.sid[v.nsmr] = venus_sids[k];
+			v.smr[v.nsmr++] = sv[k];
+		}
+		win_cbp = sv[0].cbp;
+		state_save(&v);
+		printf("venus: %u SIDs through window bank CB%d (%#llx-%#llx, IOVA = PA)\n", nsid, wcb,
+		       (unsigned long long)FIXED_LO, (unsigned long long)FIXED_HI);
+	}
+	for (unsigned k = 0; smode && !strcmp(smode, "identity") && k < nsid; k++) {
 		smmu_last.slot = -1;	/* a failed call leaves smmu_last alone: don't record the previous SID twice */
 		int bad = smmu_identity("venus", venus_sids[k], 0);
 		if (smmu_last.slot >= 0) {
@@ -1495,6 +1535,9 @@ static void step_status(int force_now)
 		" sGFSYNR1 %#010x sGFSYNR2 %#010x sGFAR %#010x%08x", rd32(CTRL_STATUS), rd32(WRAP_CPU_STATUS),
 		rd32(WRAP_INTR_STATUS), rd32(s + 0x48), rd32(s + 0x50), rd32(s + 0x54), rd32(s + 0x58), rd32(s + 0x44),
 		rd32(s + 0x40));
+	if (win_cbp)
+		pm_step("status: window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x", rd32(win_cbp + 0x58),
+			rd32(win_cbp + 0x64), rd32(win_cbp + 0x60), rd32(win_cbp + 0x68));
 }
 
 /* drain the debug queue, then the message queue until a packet of type want (0 = just drain); 0 = got it */
