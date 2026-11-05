@@ -639,7 +639,7 @@ static void cli_poll(uint64_t now)
 		return;
 	}
 	if (c_waiting) {
-		if (now - pend_ms > REPLY_MS + 1000)
+		if (now > pend_ms && now - pend_ms > REPLY_MS + 1000)
 			cli_done("ipaqmi: no answer\n");
 		return;
 	}
@@ -674,7 +674,7 @@ void ipaqmi_poll(void)
 	if (!level)
 		return;
 	cli_poll(now);
-	if (pend_txn && now - pend_ms > REPLY_MS) {
+	if (pend_txn && now > pend_ms && now - pend_ms > REPLY_MS) {
 		printf("[%6llu] ipaqmi: INIT_DRIVER txn %u unanswered in %d s (not resent; a late answer is still logged)\n", TS(),
 		       pend_txn, REPLY_MS / 1000);
 		pend_txn = 0;

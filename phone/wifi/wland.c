@@ -13,6 +13,7 @@
  *   wland qmp MSG           message to the AOP over QMP (opens the link if needed)
  *   wland shutdown          PAS shutdown of the modem
  *   wland boot              power votes + PAS boot of the modem + wait for ready
+ *   wland smp2p-ipa VALUE   our outbound SMP2P entry "ipa" (IPA clock answer to the modem: 3 = valid + on)
  *   wland ipahw regs|smmu|hwinit|meminit   IPA v4.7 AP-side setup (ipa.c; cellular data)
  *   wland pas-load ID DIR NAME PA SIZE  TrustZone PAS load of DIR/NAME.mdt into a carve-out (other peripherals)
  *   wland smmu              the WLAN DMA stream through a translation-off SMMU bank (radio.c)
@@ -268,6 +269,50 @@ static int smp2p_create(void)
 		wr32(pa + 4, 1 | (1u << 8));		/* version 1 last, features: SSR ack */
 	}
 	smp2p_out_pa = pa;
+	kick(IPC_MODEM_SMP2P);
+	return 0;
+}
+
+/*
+ * wland smp2p-ipa VALUE: our outbound entry "ipa" (Linux ipa_smp2p.c: the AP's answer to the modem's IPA clock
+ * query; bit 0 = answer valid, bit 1 = IPA clock enabled), added after "master-kernel" if missing, set to VALUE,
+ * doorbell rung. Only after the IPA is clocked, loaded and set up (cellular data design, step 4 D1).
+ */
+static int smp2p_ipa(uint32_t val)
+{
+	uint64_t pa;
+	uint32_t sz;
+	if (smem_get(SMEM_HOST_MODEM, SMP2P_OUT, &pa, &sz) || rd32(pa) != 0x504d5324) {
+		fprintf(stderr, "smp2p-ipa: no outbound item %u\n", SMP2P_OUT);
+		return -1;
+	}
+	uint32_t w = rd32(pa + 12), total = w & 0xffff, valid = w >> 16;
+	int idx = -1;
+	for (uint32_t i = 0; i < valid && i < 16; i++) {
+		char nm[17];
+		for (int k = 0; k < 16; k++)
+			nm[k] = (char)(rd32(pa + 20 + 20ull * i + (k & ~3)) >> (8 * (k & 3)));
+		nm[16] = 0;
+		if (!strcmp(nm, "ipa"))
+			idx = (int)i;
+	}
+	if (idx < 0) {
+		if (valid >= total || valid >= 16) {
+			fprintf(stderr, "smp2p-ipa: no free entry (%u/%u)\n", valid, total);
+			return -1;
+		}
+		idx = (int)valid;
+		wr_name(pa + 20 + 20ull * idx, "ipa");
+		wr32(pa + 20 + 20ull * idx + 16, 0);
+		__asm__ volatile("dsb sy" ::: "memory");
+		wr32(pa + 12, total | ((valid + 1) << 16));	/* the new entry becomes valid */
+		kick(IPC_MODEM_SMP2P);
+		printf("smp2p-ipa: entry %d \"ipa\" added (%u/%u valid)\n", idx, valid + 1, total);
+	}
+	uint64_t va = pa + 20 + 20ull * idx + 16;
+	printf("smp2p-ipa: value %#x -> %#x\n", rd32(va), val);
+	wr32(va, val);
+	__asm__ volatile("dsb sy" ::: "memory");
 	kick(IPC_MODEM_SMP2P);
 	return 0;
 }
@@ -1360,6 +1405,8 @@ int main(int argc, char **argv)
 		int rc = pm_rpmh(argv[2], 1, off, val);
 		printf("bcm %s x %#x y %#x (%#x) -> %d\n", argv[2], x, y, val[0], rc);
 		return rc ? 1 : 0;
+	} else if (!strcmp(c, "smp2p-ipa") && argc > 2) {
+		return smp2p_ipa((uint32_t)strtoul(argv[2], NULL, 0)) ? 1 : 0;
 	} else if (!strcmp(c, "ipahw")) {
 		return ipa_main(argc - 1, argv + 1);
 	} else if (!strcmp(c, "pas-load") && argc > 6) {
