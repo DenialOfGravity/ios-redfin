@@ -26,6 +26,8 @@ build() {	# NAME SOURCE [FLAGS...]
 		codesign -f -s - "out/$name"
 	fi
 }
+# SweetControl.app + sweetctl (ws-n-ctl): first, so a failing tool below (set -e) cannot skip it
+sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
 for c in membw pstack psx sweettrace; do build $c $c.c; done
 for m in autolock expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
@@ -39,5 +41,3 @@ build imgdump imgdump.c -lobjc
 ls -l out
 # Venus hardware video (redfin track V, off unless /var/local/venus.on): its own build, copies into the userland output
 sh ../video/build.sh || echo "WARN phone/video build failed"
-# SweetControl.app + sweetctl (ws-n-ctl): same pattern
-sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
