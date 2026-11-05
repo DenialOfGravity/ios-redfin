@@ -36,11 +36,14 @@
  * The modem identifiers in cell.status are already redacted by wland (iccid/imei lengths only).
  */
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SC_FLAG "/var/local/sweetcell.on"
@@ -445,6 +448,9 @@ sc_install(void)
 	sc_write([NSString stringWithFormat:@"feed hooks installed (hooks 0x%x)", sc_cf.hooks]);
 }
 
+static void sc_dump_view(id v);
+static id sc_sigview_get(void);
+
 static void
 sc_poll(void)
 {
@@ -484,6 +490,11 @@ sc_poll(void)
 			sc_last[0] = 0;	/* try again next poll */
 		}
 	}
+	static unsigned polls;
+	struct stat dv;
+	if (++polls % 4 == 0 && stat("/var/local/sweetcell.dumpview", &dv) == 0 && sc_sigview_get() != nil) {
+		sc_dump_view(sc_sigview_get());
+	}
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		@try {
 			sc_poll();
@@ -499,6 +510,7 @@ sc_poll(void)
  * apps: NSLog), with the cellular entry. /var/local/sweetcell.forcebars (stat only, so it works in app sandboxes too):
  * the signal strength / name items are enabled whenever a cellular entry exists. */
 static IMP sc_orig_canenable;
+static __weak id sc_sigview;
 static int sc_forcebars;
 
 static void
@@ -509,6 +521,33 @@ sc_ui_log(NSString *what)
 	} else {
 		NSLog(@"SweetCell: %s %@", getprogname(), what);
 	}
+}
+
+/* the signal view's live state: KVC keys, the cycle animation, its layer and sublayers (opacity, colour, animations) */
+static void
+sc_dump_view(id v)
+{
+	NSMutableString *o = [NSMutableString stringWithFormat:@"signal view %s", object_getClassName(v)];
+	for (NSString *k in @[ @"numberOfBars", @"numberOfActiveBars", @"signalMode", @"activeColor", @"inactiveColor",
+	    @"needsCycleAnimationUpdate", @"cycleAnimation", @"alpha", @"hidden", @"iconSize" ]) {
+		@try {
+			[o appendFormat:@"\n    %@ = %@", k, [v valueForKey:k]];
+		} @catch (NSException *e) {
+			[o appendFormat:@"\n    %@ (no key)", k];
+		}
+	}
+	CALayer *l = [v layer];
+	[o appendFormat:@"\n    layer %@ opacity %.2f hidden %d anims %@", l, l.opacity, l.hidden, l.animationKeys];
+	int i = 0;
+	for (CALayer *sl in l.sublayers) {
+		CGColorRef bg = sl.backgroundColor;
+		const CGFloat *c = bg ? CGColorGetComponents(bg) : NULL;
+		size_t nc = bg ? CGColorGetNumberOfComponents(bg) : 0;
+		[o appendFormat:@"\n    sub%d %s frame (%.1f %.1f %.1f %.1f) opacity %.2f hidden %d bg %zu:%.2f/%.2f anims %@", i++,
+		    object_getClassName(sl), sl.frame.origin.x, sl.frame.origin.y, sl.frame.size.width, sl.frame.size.height,
+		    sl.opacity, sl.hidden, nc, nc ? c[0] : -1.0, nc ? c[nc - 1] : -1.0, sl.animationKeys];
+	}
+	sc_ui_log(o);
 }
 
 static void
@@ -547,9 +586,22 @@ sc_install_ui(void)
 				    entry ? [entry description] : @"(none in data)"]);
 			}
 		}
+		/* remember the signal view: sc_poll dumps it every 20 s while /var/local/sweetcell.dumpview exists */
+		if ([key rangeOfString:@".signalStrengthDisplayIdentifier"].location != NSNotFound) {
+			id v = [ident respondsToSelector:sel_registerName("view")] ? [ident valueForKey:@"view"] : nil;
+			if (v != nil) {
+				sc_sigview = v;
+			}
+		}
 		return r;
 	}));
 	sc_ui_log([NSString stringWithFormat:@"condensed item hook on (forcebars %d)", sc_forcebars]);
+}
+
+static id
+sc_sigview_get(void)
+{
+	return sc_sigview;
 }
 
 __attribute__((constructor)) static void
