@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include "cell.h"
 #include "link.h"
 #include "qmi.h"
@@ -22,7 +24,8 @@ static const char *svc_name[NSVC] = { "dms", "nas", "uim" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
-enum { OPT_SLOTS = 1, OPT_HW = 2 };
+enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16 };
+static int p1_known, p1_present, p1_active, cur_mode = -1;
 static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 	{ SVC_DMS, 0x22, 1, 0 }, { SVC_DMS, 0x23, 1, 0 }, { SVC_DMS, 0x25, 1, 0 }, { SVC_DMS, 0x2c, 1, OPT_HW },
 	{ SVC_DMS, 0x2d, 0, 0 },
@@ -151,8 +154,10 @@ static void on_dms(uint16_t id, const struct qmi_msg *m, unsigned e)
 		uint8_t v;
 		if (e || qmi_get_u8(m, 1, &v))
 			snprintf(f_mode, sizeof(f_mode), "mode=err%#x", e);
-		else
+		else {
 			snprintf(f_mode, sizeof(f_mode), "mode=%s(%u)", NM(opmode, v), v);
+			cur_mode = v;
+		}
 	}
 }
 
@@ -225,6 +230,7 @@ static void on_slots(const struct qmi_msg *m, unsigned e)
 	static const char *const cardst[] = { "unknown", "absent", "present" };
 	static const char *const proto[] = { "?", "icc", "uicc" };
 	int n = snprintf(f_slots, sizeof(f_slots), "slots=");
+	p1_known = 0;
 	uint32_t o = 1, xo = 1, nx = x && l2 ? x[0] : 0;
 	for (uint32_t i = 0; i < p[0] && o + 10 <= l && n < (int)sizeof(f_slots) - 1; i++) {
 		uint32_t card, act;
@@ -241,6 +247,11 @@ static void on_slots(const struct qmi_msg *m, unsigned e)
 			if (xo + 6 + atrl + 1 <= l2)
 				euicc = x[xo + 6 + atrl];
 			xo += 6 + atrl + 1;
+		}
+		if (i == 0) {
+			p1_known = 1;
+			p1_present = card == 2 && euicc != 1;
+			p1_active = act == 1;
 		}
 		AP(f_slots, n, "%sP%u:%s%s,%s,L%u", i ? "|" : "", i + 1,
 			      euicc == 1 ? "euicc," : "", NM(cardst, card), act == 1 ? "active" : "inactive", logical);
@@ -420,7 +431,110 @@ static int read_opts(void)
 		o |= OPT_SLOTS;
 	if (strstr(b, "hw=1"))
 		o |= OPT_HW;
+	if (strstr(b, "slotswitch=1"))
+		o |= OPT_SWITCH | OPT_SLOTS;	/* the switch needs the slot status */
+	if (strstr(b, "online=1"))
+		o |= OPT_ONLINE;
+	else if (strstr(b, "online=0"))
+		o |= OPT_LPM;
 	return o;
+}
+
+/*
+ * The two writes (track T step 2), each only with its own word in cell.on, never by themselves:
+ *   slotswitch=1  UIM Switch Slot 0x46 (TLV 1 logical slot u8 = 1, TLV 2 physical slot u32 = 1): once per cell.on
+ *                 change, only when Get Slots Status said P1 holds a card and is inactive. The modem keeps the
+ *                 mapping in its EFS (served by wland's rmtfs), so the rmtfs images are copied to *.pre-slot first
+ *                 and nothing is sent if that copy fails.
+ *   online=1      DMS Set Operating Mode 0x2e (TLV 1 u8: 0 online); online=0 sends 1 (low power). At most 2 tries
+ *                 per cell.on change, only when Get Operating Mode reads something else; *.pre-online copies first.
+ *                 An offline (3) modem refuses both (QMI: offline only goes to reset); no reset is ever sent.
+ * One write at a time, in place of a round's first request, then the round 5 s later re-reads everything.
+ */
+static int wr_txn, wr_svc, sw_tries, mode_tries;
+static uint16_t wr_id;
+static uint64_t wr_sent;
+
+static int backup_rmtfs(const char *suffix)
+{
+	static const char *const f[] = { "modemst1.img", "modemst2.img", "fsg.img", "fsc.img" };
+	static char buf[65536];
+	int copied = 0;
+	for (unsigned i = 0; i < 4; i++) {
+		char src[128], dst[160];
+		snprintf(src, sizeof(src), "/var/local/fw/rmtfs/%s", f[i]);
+		snprintf(dst, sizeof(dst), "%s.%s", src, suffix);
+		if (!access(dst, F_OK))
+			continue;			/* the first backup is the one kept */
+		int a = open(src, O_RDONLY), b = a < 0 ? -1 : open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		ssize_t k = 0;
+		while (b >= 0 && (k = read(a, buf, sizeof(buf))) > 0)
+			if (write(b, buf, (size_t)k) != k) {
+				k = -1;
+				break;
+			}
+		int bad = a < 0 || b < 0 || k < 0 || fsync(b);
+		if (a >= 0)
+			close(a);
+		if (b >= 0)
+			close(b);
+		copied++;
+		if (bad) {
+			printf("[%6llu] cell: backup %s failed (%s): write not sent\n", (unsigned long long)link_ms(), dst, strerror(errno));
+			unlink(dst);
+			return -1;
+		}
+	}
+	if (copied)
+		printf("[%6llu] cell: rmtfs images backed up as *.%s\n", (unsigned long long)link_ms(), suffix);
+	return 0;
+}
+
+static int send_write(int svc, uint16_t id, const void *t1, uint16_t l1, const void *t2, uint16_t l2)
+{
+	struct qmi_buf *q = malloc(sizeof(*q));
+	if (!q)
+		return -1;
+	wr_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(q, QMI_REQUEST, (uint16_t)wr_txn, id);
+	qmi_tlv(q, 1, t1, l1);
+	if (t2)
+		qmi_tlv(q, 2, t2, l2);
+	size_t len = qmi_finish(q);
+	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[svc].node, srv[svc].port, q->b, (uint32_t)len);
+	free(q);
+	wr_id = id;
+	wr_svc = svc;
+	wr_sent = link_ms();
+	return 0;
+}
+
+/* at the start of a round: one write if one is asked for and due; 1 = sent (the round waits) */
+static int maybe_write(void)
+{
+	uint64_t now = link_ms();
+	if ((opts & OPT_SWITCH) && !sw_tries && p1_known && p1_present && !p1_active && srv[SVC_UIM].up) {
+		sw_tries = 1;
+		if (backup_rmtfs("pre-slot"))
+			return 0;
+		uint8_t logical = 1;
+		uint32_t physical = 1;
+		printf("[%6llu] cell: WRITE uim switch slot: logical 1 -> physical 1\n", (unsigned long long)now);
+		return !send_write(SVC_UIM, 0x46, &logical, 1, &physical, 4);
+	}
+	int want = opts & OPT_ONLINE ? 0 : opts & OPT_LPM ? 1 : -1;
+	if (want >= 0 && cur_mode >= 0 && cur_mode != want && mode_tries < 2 && srv[SVC_DMS].up) {
+		mode_tries++;
+		if (backup_rmtfs("pre-online"))
+			return 0;
+		uint8_t m = (uint8_t)want;
+		printf("[%6llu] cell: WRITE dms set operating mode %s (now %d, try %d/2)\n", (unsigned long long)now,
+		       want ? "low-power" : "online", cur_mode, mode_tries);
+		return !send_write(SVC_DMS, 0x2e, &m, 1, NULL, 0);
+	}
+	return 0;
 }
 
 void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
@@ -450,6 +564,15 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	struct qmi_msg m;
 	if (qmi_parse(d, n, &m) || m.type != QMI_RESPONSE)
 		return;			/* indications: none registered for */
+	if (wr_id && m.txn == wr_txn && m.id == wr_id) {
+		unsigned we = qerr(&m);
+		printf("[%6llu] cell: WRITE %s %#x -> %s (err %#x)%s\n", (unsigned long long)link_ms(), svc_name[wr_svc], wr_id,
+		       we ? "refused" : "ok", we, we == 0x35 ? " invalid transition: an offline modem only takes a reset" : "");
+		wr_id = 0;
+		cur_mode = -1;
+		next_round = link_ms() + 5000;	/* re-read slots, card, mode, registration */
+		return;
+	}
 	if (!enabled || step < 0 || step >= NSTEPS || m.txn != want_txn || m.id != steps[step].id)
 		return;			/* off, or a late answer to a timed-out request */
 	unsigned e = qerr(&m);
@@ -486,9 +609,11 @@ void cell_poll(void)
 			enabled = on;
 			opts = on ? o : 0;
 			memset(fails, 0, sizeof(fails));
+			sw_tries = mode_tries = 0;
 			timeouts = 0;
-			printf("[%6llu] cell: %s (%s%s%s)%s; servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off",
+			printf("[%6llu] cell: %s (%s%s%s%s%s)%s; servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off",
 			       CELL_ON, opts & OPT_SLOTS ? " slots=1" : "", opts & OPT_HW ? " hw=1" : "",
+			       opts & OPT_SWITCH ? " slotswitch=1" : "", opts & OPT_ONLINE ? " online=1" : opts & OPT_LPM ? " online=0" : "",
 			       allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-", srv[SVC_NAS].up ? "up" : "-",
 			       srv[SVC_UIM].up ? "up" : "-");
 			step = -1;
@@ -499,6 +624,14 @@ void cell_poll(void)
 	}
 	if (!enabled || !allowed || now < allow_ms)
 		return;
+	if (wr_id) {
+		if (now - wr_sent > REPLY_MS) {
+			printf("[%6llu] cell: WRITE %#x unanswered in 5 s (not repeated)\n", (unsigned long long)now, wr_id);
+			wr_id = 0;
+			next_round = now + 5000;
+		}
+		return;
+	}
 	if (step >= 0) {
 		if (step >= NSTEPS) {
 			end_round(ROUND_MS);
@@ -528,6 +661,8 @@ void cell_poll(void)
 		return;
 	}
 	if (now < next_round || !(srv[SVC_DMS].up || srv[SVC_NAS].up || srv[SVC_UIM].up))
+		return;
+	if (maybe_write())
 		return;
 	snprintf(f_mode, sizeof(f_mode), "mode=?");
 	snprintf(f_sim, sizeof(f_sim), "sim=?");
