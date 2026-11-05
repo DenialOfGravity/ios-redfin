@@ -6,7 +6,8 @@
  *   UIM  Get Slots Status 0x47 (physical tray / eUICC; ICCID only counted), Get Card Status 0x2f (logical)
  *   NAS  Get Serving System 0x24, Get System Info 0x4d, Get Signal Info 0x4f
  * Message ids and TLV layouts: libqmi data/qmi-service-{uim,nas,dms}.json (as HakiOS vayu_cell_qmi.h).
- * Nothing here writes to the modem: no Set Operating Mode, no Network Register, no PIN, no WMS/WDS/VOICE.
+ * Writes only with their word in cell.on (slotswitch=1, online=1/0, pin=1; see maybe_write and the PIN section).
+ * No Network Register, no SMS/data/voice, never a PUK.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include "cell.h"
 #include "link.h"
 #include "qmi.h"
@@ -24,7 +28,7 @@ static const char *svc_name[NSVC] = { "dms", "nas", "uim" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
-enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16 };
+enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32 };
 static int p1_known, p1_present, p1_active, cur_mode = -1;
 static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 	{ SVC_DMS, 0x22, 1, 0 }, { SVC_DMS, 0x23, 1, 0 }, { SVC_DMS, 0x25, 1, 0 }, { SVC_DMS, 0x2c, 1, OPT_HW },
@@ -170,14 +174,26 @@ static void on_dms(uint16_t id, const struct qmi_msg *m, unsigned e)
  * says which). A present card with no applications is an eUICC with no enabled profile (or a card still
  * being read). Every card and every application is printed now (the first version stopped at card 1).
  */
+/* the application whose PIN1 the SIM PIN UI unlocks (filled from Get Card Status; see the PIN section) */
+static struct {
+	int known;			/* 1 = this round's card status had a usable application */
+	uint8_t slot;			/* logical card 1.. */
+	uint8_t state, pin1, retries, puk_retries;
+	uint8_t aid_len, aid[32];
+	int prov;			/* it is the primary GW provisioning application (session type 0 works) */
+} papp;
+
 static void on_uim(const struct qmi_msg *m, unsigned e)
 {
 	uint16_t l;
 	const uint8_t *p = qmi_get(m, 0x10, &l);
+	papp.known = 0;
 	if (e || !p || l < 9) {
 		snprintf(f_sim, sizeof(f_sim), "sim=err%#x", e);
 		return;
 	}
+	uint16_t gw_primary;		/* Index GW Primary: slot << 8 | application, 0xffff = none */
+	memcpy(&gw_primary, p, 2);
 	uint32_t o = 8, ncards = p[o++];
 	int n = snprintf(f_sim, sizeof(f_sim), "sim=");
 	if (!ncards)
@@ -203,8 +219,22 @@ static void on_uim(const struct qmi_msg *m, unsigned e)
 			uint8_t type = p[o], st = p[o + 1], aidl = p[o + 6];
 			uint32_t q = o + 7 + aidl;	/* upin_replaces_pin1, pin1_state, pin1_retries, puk1_retries, ... */
 			AP(f_sim, n, " %s:%s", NM(app_type, type), NM(app_state, st));
-			if (q + 4 <= l)
+			if (q + 4 <= l) {
 				AP(f_sim, n, "/pin1=%s(%u)", NM(pin_state, p[q + 1]), p[q + 2]);
+				int prov = gw_primary != 0xffff && (gw_primary >> 8) == c && (gw_primary & 0xff) == a;
+				/* sim/usim only; the provisioning application wins over an earlier one */
+				if ((type == 1 || type == 2) && (!papp.known || (prov && !papp.prov)) && aidl <= sizeof(papp.aid)) {
+					papp.known = 1;
+					papp.slot = (uint8_t)(c + 1);
+					papp.state = st;
+					papp.pin1 = p[q + 1];
+					papp.retries = p[q + 2];
+					papp.puk_retries = p[q + 3];
+					papp.aid_len = aidl;
+					memcpy(papp.aid, p + o + 7, aidl);
+					papp.prov = prov;
+				}
+			}
 			o = q + 7;
 		}
 	}
@@ -433,6 +463,8 @@ static int read_opts(void)
 		o |= OPT_HW;
 	if (strstr(b, "slotswitch=1"))
 		o |= OPT_SWITCH | OPT_SLOTS;	/* the switch needs the slot status */
+	if (strstr(b, "pin=1"))
+		o |= OPT_PIN;
 	if (strstr(b, "online=1"))
 		o |= OPT_ONLINE;
 	else if (strstr(b, "online=0"))
@@ -537,6 +569,249 @@ static int maybe_write(void)
 	return 0;
 }
 
+/*
+ * SIM PIN (ws-n-pin; only with "pin=1" in cell.on): SpringBoard's SIM PIN UI (SweetPIN in SweetFPS.dylib) talks to
+ * wland over a unix socket, CELL_SOCK (root:mobile 0660; peers other than uid 0 and 501 are dropped). One client at
+ * a time, one request per connection, all non-blocking from cell_poll:
+ *   "S\n"            -> "pin app=<state> pin1=<state> retries=N puk=N slot=N on=0|1\n" (or "pin app=none ...")
+ *   'V' len digits   -> after UIM Verify PIN 0x26 answers: "ok retries=N\n" / "err=0xE retries=N\n",
+ *                       or at once "refused <why> retries=N\n"
+ * The PIN: 4-8 ASCII digits, held only in pin_buf until the request is built (never logged, never in a file),
+ * then pin_buf and the QMI buffer are zeroed. One Verify per user entry, never repeated (a timeout is reported, not
+ * retried); refused when the application is not waiting for PIN1, when PIN1 has 1 try left or fewer (a wrong PIN
+ * would block the card), or when the retry count is unknown. No PUK path at all. Session: primary GW provisioning
+ * (type 0, no AID) when the card status names this application as the provisioning one, else non-provisioning
+ * slot N (4/5) with its AID. After any answer the next round (2 s) re-reads the card status.
+ */
+#define PIN_REPLY_MS	8000
+#define PIN_REQ_MS	2000
+static int pin_lfd = -1, pin_cfd = -1, pin_txn, pin_queued;
+static uint64_t pin_cdead, pin_sent;
+static uint8_t pin_req[16], pin_buf[9];
+static unsigned pin_reqn, pin_len;
+
+static void pin_zero(void *p, size_t n)
+{
+	volatile uint8_t *v = p;
+	while (n--)
+		*v++ = 0;
+}
+
+static void pin_reply(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void pin_reply(const char *fmt, ...)
+{
+	char b[160];
+	va_list va;
+	va_start(va, fmt);
+	int k = vsnprintf(b, sizeof(b), fmt, va);
+	va_end(va);
+	if (pin_cfd >= 0) {
+		if (k > 0 && write(pin_cfd, b, (size_t)k < sizeof(b) ? (size_t)k : sizeof(b) - 1) < 0)
+			(void)0;
+		close(pin_cfd);
+		pin_cfd = -1;
+	}
+	pin_zero(pin_req, sizeof(pin_req));
+	pin_reqn = 0;
+}
+
+static void pin_listen(int on)
+{
+	if (!on) {
+		if (pin_lfd >= 0) {
+			close(pin_lfd);
+			pin_lfd = -1;
+			unlink(CELL_SOCK);
+		}
+		if (pin_cfd >= 0)
+			pin_reply("refused off\n");
+		pin_zero(pin_buf, sizeof(pin_buf));
+		pin_queued = 0;
+		return;
+	}
+	if (pin_lfd >= 0)
+		return;
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	snprintf(a.sun_path, sizeof(a.sun_path), "%s", CELL_SOCK);
+	unlink(CELL_SOCK);
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	mode_t um = umask(0177);
+	int bad = fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof(a)) || listen(fd, 2);
+	umask(um);
+	if (!bad && (chown(CELL_SOCK, 0, 501) || chmod(CELL_SOCK, 0660)))
+		bad = 1;
+	if (bad) {
+		printf("[%6llu] cell: pin socket %s: %s\n", (unsigned long long)link_ms(), CELL_SOCK, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		unlink(CELL_SOCK);
+		return;
+	}
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	pin_lfd = fd;
+	printf("[%6llu] cell: pin socket %s ready\n", (unsigned long long)link_ms(), CELL_SOCK);
+}
+
+static void pin_send(void)
+{
+	struct qmi_buf *q = malloc(sizeof(*q));
+	if (!q) {
+		pin_zero(pin_buf, sizeof(pin_buf));
+		pin_reply("refused nomem retries=%u\n", papp.retries);
+		return;
+	}
+	uint8_t sess[2 + sizeof(papp.aid)], info[2 + sizeof(pin_buf)];
+	uint16_t sl = 2;
+	if (papp.prov || papp.slot < 1 || papp.slot > 2) {
+		sess[0] = 0;		/* primary GW provisioning, no AID */
+		sess[1] = 0;
+	} else {
+		sess[0] = (uint8_t)(3 + papp.slot);	/* non-provisioning slot 1/2 */
+		sess[1] = papp.aid_len;
+		memcpy(sess + 2, papp.aid, papp.aid_len);
+		sl = (uint16_t)(2 + papp.aid_len);
+	}
+	info[0] = 1;			/* PIN1 */
+	info[1] = (uint8_t)pin_len;
+	memcpy(info + 2, pin_buf, pin_len);
+	pin_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(q, QMI_REQUEST, (uint16_t)pin_txn, 0x26);
+	qmi_tlv(q, 1, sess, sl);
+	qmi_tlv(q, 2, info, (uint16_t)(2 + pin_len));
+	size_t len = qmi_finish(q);
+	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[SVC_UIM].node, srv[SVC_UIM].port, q->b, (uint32_t)len);
+	pin_zero(q, sizeof(*q));
+	free(q);
+	pin_zero(info, sizeof(info));
+	pin_zero(pin_buf, sizeof(pin_buf));
+	pin_len = 0;
+	pin_queued = 0;
+	pin_sent = link_ms();
+	printf("[%6llu] cell: verify pin sent (slot %u, session %u, retries %u)\n", (unsigned long long)pin_sent, papp.slot,
+	       sess[0], papp.retries);
+}
+
+/* a whole request is in pin_req: answer a status query, or check and queue a verify */
+static void pin_request(void)
+{
+	const char *const *as = app_state, *const *ps = pin_state;
+	if (pin_req[0] == 'S') {
+		if (!papp.known)
+			pin_reply("pin app=none on=%d\n", !!(opts & OPT_PIN));
+		else
+			pin_reply("pin app=%s pin1=%s retries=%u puk=%u slot=%u on=%d\n", nm(as, 8, papp.state), nm(ps, 6, papp.pin1),
+				  papp.retries, papp.puk_retries, papp.slot, !!(opts & OPT_PIN));
+		return;
+	}
+	unsigned n = pin_req[1];
+	int digits = n >= 4 && n <= 8;
+	for (unsigned i = 0; digits && i < n; i++)
+		digits = pin_req[2 + i] >= '0' && pin_req[2 + i] <= '9';
+	const char *why = NULL;
+	if (!digits)
+		why = "format";		/* 4-8 digits */
+	else if (!(opts & OPT_PIN))
+		why = "off";
+	else if (!srv[SVC_UIM].up)
+		why = "uim-down";
+	else if (!papp.known)
+		why = "unknown";
+	else if (papp.pin1 != 1 && papp.state != 2)
+		why = "not-required";	/* only enabled-unverified / pin1-required; never PUK */
+	else if (papp.retries <= 1)
+		why = "last-try";	/* a wrong PIN would block the card: the user decides elsewhere */
+	else if (pin_queued || pin_txn)
+		why = "busy";
+	if (why) {
+		printf("[%6llu] cell: verify pin refused (%s), retries left %u\n", (unsigned long long)link_ms(), why,
+		       papp.known ? papp.retries : 0);
+		pin_reply("refused %s retries=%u\n", why, papp.known ? papp.retries : 0);
+		return;
+	}
+	memcpy(pin_buf, pin_req + 2, n);
+	pin_len = n;
+	pin_zero(pin_req, sizeof(pin_req));
+	pin_reqn = 0;
+	pin_queued = 1;			/* sent by pin_poll between rounds; the client stays connected for the answer */
+}
+
+static void pin_poll(void)
+{
+	uint64_t now = link_ms();
+	if (pin_lfd < 0)
+		return;
+	if (pin_txn && now - pin_sent > PIN_REPLY_MS) {
+		printf("[%6llu] cell: verify pin -> no answer in %d s (not repeated)\n", (unsigned long long)now, PIN_REPLY_MS / 1000);
+		pin_txn = 0;
+		pin_reply("err=timeout retries=%u\n", papp.retries);
+		next_round = now + 2000;
+	}
+	if (pin_queued && step < 0 && !wr_id && !pin_txn) {
+		if (srv[SVC_UIM].up)
+			pin_send();
+		else {
+			pin_zero(pin_buf, sizeof(pin_buf));
+			pin_queued = 0;
+			pin_reply("refused uim-down retries=%u\n", papp.retries);
+		}
+	}
+	if (pin_cfd < 0) {
+		int fd = accept(pin_lfd, NULL, NULL);
+		if (fd < 0)
+			return;
+		uid_t uid = (uid_t)-1;
+		gid_t gid = (gid_t)-1;
+		if (getpeereid(fd, &uid, &gid) || (uid != 0 && uid != 501)) {
+			close(fd);
+			return;
+		}
+		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+		pin_cfd = fd;
+		pin_cdead = now + PIN_REQ_MS;
+		pin_reqn = 0;
+		return;
+	}
+	if (pin_queued || pin_txn)
+		return;			/* waiting for the modem's answer */
+	ssize_t k = read(pin_cfd, pin_req + pin_reqn, sizeof(pin_req) - pin_reqn);
+	if (k > 0)
+		pin_reqn += (unsigned)k;
+	int whole = pin_reqn >= 1 && (pin_req[0] == 'S' || (pin_req[0] == 'V' && pin_reqn >= 2 && pin_reqn >= 2u + pin_req[1]));
+	if (whole && pin_req[0] == 'V' && pin_req[1] > 8)
+		whole = 0, k = 0;	/* too long: dropped below */
+	if (whole) {
+		pin_request();
+		return;
+	}
+	if (k == 0 || (k < 0 && errno != EAGAIN) || now > pin_cdead || pin_reqn >= sizeof(pin_req)) {
+		pin_reply("refused request\n");
+	}
+}
+
+/* UIM 0x26's answer */
+static void pin_answer(const struct qmi_msg *m)
+{
+	unsigned e = qerr(m);
+	uint16_t l;
+	const uint8_t *r = qmi_get(m, 0x10, &l);	/* Retries Remaining (on failure): verify, unblock */
+	int left = r && l >= 1 ? r[0] : e ? -1 : (int)papp.retries;
+	pin_txn = 0;
+	if (left >= 0)
+		papp.retries = (uint8_t)left;
+	if (!e) {
+		printf("[%6llu] cell: verify pin -> ok, retries left %d\n", (unsigned long long)link_ms(), left);
+		pin_reply("ok retries=%d\n", left);
+	} else {
+		printf("[%6llu] cell: verify pin -> err %#x, retries left %d\n", (unsigned long long)link_ms(), e, left);
+		pin_reply("err=%#x retries=%d\n", e, left);
+	}
+	papp.known = 0;			/* only a fresh card status may allow another try */
+	next_round = link_ms() + 2000;	/* re-read: expect usim:ready */
+}
+
 void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
 {
 	for (int i = 0; i < NSVC; i++)
@@ -564,6 +839,10 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	struct qmi_msg m;
 	if (qmi_parse(d, n, &m) || m.type != QMI_RESPONSE)
 		return;			/* indications: none registered for */
+	if (pin_txn && m.txn == pin_txn && m.id == 0x26) {
+		pin_answer(&m);
+		return;
+	}
 	if (wr_id && m.txn == wr_txn && m.id == wr_id) {
 		unsigned we = qerr(&m);
 		printf("[%6llu] cell: WRITE %s %#x -> %s (err %#x)%s\n", (unsigned long long)link_ms(), svc_name[wr_svc], wr_id,
@@ -611,17 +890,19 @@ void cell_poll(void)
 			memset(fails, 0, sizeof(fails));
 			sw_tries = mode_tries = 0;
 			timeouts = 0;
-			printf("[%6llu] cell: %s (%s%s%s%s%s)%s; servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off",
+			printf("[%6llu] cell: %s (%s%s%s%s%s%s)%s; servers dms %s nas %s uim %s\n", (unsigned long long)now, on ? "on" : "off",
 			       CELL_ON, opts & OPT_SLOTS ? " slots=1" : "", opts & OPT_HW ? " hw=1" : "",
-			       opts & OPT_SWITCH ? " slotswitch=1" : "", opts & OPT_ONLINE ? " online=1" : opts & OPT_LPM ? " online=0" : "",
+			       opts & OPT_SWITCH ? " slotswitch=1" : "", opts & OPT_PIN ? " pin=1" : "", opts & OPT_ONLINE ? " online=1" : opts & OPT_LPM ? " online=0" : "",
 			       allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-", srv[SVC_NAS].up ? "up" : "-",
 			       srv[SVC_UIM].up ? "up" : "-");
 			step = -1;
 			next_round = now + 1000;
 			if (!on)
 				unlink(CELL_STATUS);
+			pin_listen(on && (opts & OPT_PIN));
 		}
 	}
+	pin_poll();
 	if (!enabled || !allowed || now < allow_ms)
 		return;
 	if (wr_id) {
