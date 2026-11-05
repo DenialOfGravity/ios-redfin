@@ -39,3 +39,5 @@ build imgdump imgdump.c -lobjc
 ls -l out
 # Venus hardware video (redfin track V, off unless /var/local/venus.on): its own build, copies into the userland output
 sh ../video/build.sh || echo "WARN phone/video build failed"
+# SweetControl.app + sweetctl (ws-n-ctl): same pattern
+sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
