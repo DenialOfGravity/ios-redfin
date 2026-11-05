@@ -437,6 +437,7 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   N/T:R)|...`. Never repeated; no IPA, no data path.
 - cell (ws-n-wds, safety switches): `nolte=1` / `csonly=1` in cell.on: once per wland run (once more per cell.on change), as
 - cell.c `domain=N` (ws-n-wds): NAS 0x33 TLV 0x18 Service Domain Preference = N instead of csonly's 0 (3 PS attach, 4 PS detach); 2026-11-05: csonly=1 alone did not stop the ps_rm ERR-FATAL (modem still attached PS on GSM and crashed 13 s after registering).
+- wland `pas-load ID DIR NAME PA SIZE` (ws-n-wds): generic TrustZone PAS load (init image, mem setup if relocatable, segments, auth+reset) into a carve-out; for the IPA firmware: `wland pas-load 15 /var/local/fw/ipa ipa_fws 0x8bc00000 0x10000` after the IP0 vote (X2).
   soon as NAS is up and before the online write or any PIN verify (both held until it is answered, max 10 s): WRITE NAS Set
   System Selection Preference 0x33 with 0x11 mode u16 = 0x000c GSM|UMTS (nolte), 0x18 service domain u32 = 0 CS only
   (csonly), 0x17 change duration u8 = 0 power cycle; one message for both. Then Get 0x34 once: `cell: nas sys-sel mode=0x0c

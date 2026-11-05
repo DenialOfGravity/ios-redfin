@@ -13,6 +13,7 @@
  *   wland qmp MSG           message to the AOP over QMP (opens the link if needed)
  *   wland shutdown          PAS shutdown of the modem
  *   wland boot              power votes + PAS boot of the modem + wait for ready
+ *   wland pas-load ID DIR NAME PA SIZE  TrustZone PAS load of DIR/NAME.mdt into a carve-out (other peripherals)
  *   wland smmu              the WLAN DMA stream through a translation-off SMMU bank (radio.c)
  *   wland up [SECS]         all of it from a fresh boot, then the radio: copy engines, WMI, passive scans
  *   wland auto              the boot job (launchd org.iosonpixel.wland): `up 0` once per phone boot in a child that
@@ -419,6 +420,7 @@ static int qmp_send(const char *msg)
 }
 
 /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
+static int pas_load(uint32_t pas, const char *dir, const char *name, uint64_t rpa, uint64_t rsize);
 
 #define PAS_MODEM	4
 #define MPSS_PA		0x8c000000ull	/* redfin modem_wlan_mem (lito-redbull-memory.dtsi; sunfish 0x8b000000) */
@@ -453,6 +455,129 @@ static uint8_t *slurp(const char *path, size_t *len)
 }
 
 struct phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; };
+
+/*
+ * wland pas-load ID DIR NAME PA SIZE: a generic TrustZone PAS load of DIR/NAME.mdt + NAME.bNN into the carve-out
+ * PA..PA+SIZE (Linux qcom_mdt_load + qcom_scm_pas_auth_and_reset), for peripherals other than the modem. Nothing
+ * else is touched: no votes, no SMP2P, no QMP (the caller makes the votes the peripheral needs first). Relocatable
+ * images (phdr flag bit 27) get PAS mem setup and are placed at PA + (paddr - lowest relocatable paddr); fixed
+ * ones must lie inside PA..PA+SIZE. Used for the IPA firmware (ipa_fws, PAS id 15, pil_ipa_fw_mem 0x8bc00000/0x10000,
+ * redbull lito.dtsi) in the cellular data bring-up (X2).
+ */
+static int pas_load(uint32_t pas, const char *dir, const char *name, uint64_t rpa, uint64_t rsize)
+{
+	char path[256];
+	size_t mlen;
+	snprintf(path, sizeof(path), "%s/%s.mdt", dir, name);
+	uint8_t *mdt = slurp(path, &mlen);
+	if (!mdt || mlen < 0x34) {
+		fprintf(stderr, "pas-load: no %s\n", path);
+		return -1;
+	}
+	uint32_t phoff, phnum = 0;
+	memcpy(&phoff, mdt + 0x1c, 4);
+	memcpy(&phnum, mdt + 0x2c, 2);
+	if (mdt[4] != 1 || phnum == 0 || phnum > 64 || phoff + 32ull * phnum > mlen) {
+		fprintf(stderr, "pas-load: %s is not a 32-bit ELF with program headers\n", path);
+		return -1;
+	}
+	struct phdr *ph = (struct phdr *)(mdt + phoff);
+	int hash = -1, reloc = 0;
+	uint64_t lo = ~0ull;
+	for (uint32_t i = 0; i < phnum; i++) {
+		if (((ph[i].flags >> 24) & 7) == 2)
+			hash = (int)i;
+		if (ph[i].type == 1 && ph[i].memsz && (ph[i].flags & (1u << 27))) {
+			reloc = 1;
+			if (ph[i].paddr < lo)
+				lo = ph[i].paddr;
+		}
+	}
+	if (hash < 0) {
+		fprintf(stderr, "pas-load: no hash segment\n");
+		return -1;
+	}
+	size_t ehsz = phoff + 32ull * phnum, meta_len = ehsz + ph[hash].filesz;
+	uint8_t *meta = malloc(meta_len);
+	if (!meta)
+		return -1;
+	memcpy(meta, mdt, ehsz);
+	if (ph[hash].offset + ph[hash].filesz <= mlen) {
+		memcpy(meta + ehsz, mdt + ph[hash].offset, ph[hash].filesz);
+	} else {
+		size_t hl;
+		snprintf(path, sizeof(path), "%s/%s.b%02d", dir, name, hash);
+		uint8_t *h = slurp(path, &hl);
+		if (!h || hl < ph[hash].filesz) {
+			fprintf(stderr, "pas-load: hash segment %s missing\n", path);
+			return -1;
+		}
+		memcpy(meta + ehsz, h, ph[hash].filesz);
+		free(h);
+	}
+	/* check every segment fits before TrustZone is told anything */
+	for (uint32_t i = 0; i < phnum; i++) {
+		if (ph[i].type != 1 || (int)i == hash || !ph[i].memsz)
+			continue;
+		uint64_t pa = (ph[i].flags & (1u << 27)) ? rpa + (ph[i].paddr - lo) : ph[i].paddr;
+		if (pa < rpa || pa + ph[i].memsz > rpa + rsize) {
+			fprintf(stderr, "pas-load: segment %u at %llx+%x outside %llx+%llx\n", i, (unsigned long long)pa,
+				ph[i].memsz, (unsigned long long)rpa, (unsigned long long)rsize);
+			return -1;
+		}
+	}
+	uint64_t meta_pa = pm_alloc(meta_len, 0x1000);
+	if (!meta_pa)
+		return -1;
+	pm_wr(meta_pa, meta, meta_len);
+	uint64_t r1 = 0;
+	int64_t rc = scm(1, 2 | (2u << 6), pas, meta_pa, 0, &r1);
+	printf("pas-load %u: init image (%zu bytes metadata) -> %lld/%llx\n", pas, meta_len, (long long)rc,
+	       (unsigned long long)r1);
+	if (rc || r1)
+		return -1;
+	if (reloc) {
+		rc = scm(2, 3, pas, rpa, rsize, &r1);
+		printf("pas-load %u: mem setup %llx+%llx -> %lld/%llx\n", pas, (unsigned long long)rpa,
+		       (unsigned long long)rsize, (long long)rc, (unsigned long long)r1);
+		if (rc || r1)
+			return -1;
+	}
+	uint64_t total = 0;
+	static uint8_t zeros[0x1000];
+	for (uint32_t i = 0; i < phnum; i++) {
+		if (ph[i].type != 1 || (int)i == hash || !ph[i].memsz)
+			continue;
+		uint64_t pa = (ph[i].flags & (1u << 27)) ? rpa + (ph[i].paddr - lo) : ph[i].paddr;
+		if (ph[i].filesz) {
+			size_t sl;
+			snprintf(path, sizeof(path), "%s/%s.b%02u", dir, name, i);
+			uint8_t *seg = slurp(path, &sl);
+			if (!seg || sl < ph[i].filesz) {
+				fprintf(stderr, "pas-load: %s missing or short\n", path);
+				return -1;
+			}
+			uint8_t *pad = calloc(1, (ph[i].filesz + 3) & ~3u);
+			memcpy(pad, seg, ph[i].filesz);
+			pm_wr(pa, pad, (ph[i].filesz + 3) & ~3u);
+			free(pad);
+			free(seg);
+			total += ph[i].filesz;
+		}
+		for (uint64_t o = (ph[i].filesz + 3) & ~3ull; o < ph[i].memsz; o += sizeof(zeros)) {
+			uint64_t n = ph[i].memsz - o < sizeof(zeros) ? ph[i].memsz - o : sizeof(zeros);
+			pm_wr(pa + o, zeros, (n + 3) & ~3ull);
+		}
+		printf("pas-load %u: segment %u -> %llx (%x/%x bytes)\n", pas, i, (unsigned long long)pa, ph[i].filesz,
+		       ph[i].memsz);
+	}
+	rc = scm(5, 1, pas, 0, 0, &r1);
+	printf("pas-load %u: %llu bytes loaded; auth and reset -> %lld/%llx\n", pas, (unsigned long long)total,
+	       (long long)rc, (unsigned long long)r1);
+	free(meta);
+	free(mdt);
+	return rc || r1 ? -1 : 0;
+}
 
 static int boot_modem(void)
 {
@@ -1220,6 +1345,9 @@ int main(int argc, char **argv)
 		int rc = pm_rpmh(argv[2], 1, off, val);
 		printf("bcm %s x %#x y %#x (%#x) -> %d\n", argv[2], x, y, val[0], rc);
 		return rc ? 1 : 0;
+	} else if (!strcmp(c, "pas-load") && argc > 6) {
+		return pas_load((uint32_t)strtoul(argv[2], NULL, 0), argv[3], argv[4], strtoull(argv[5], NULL, 0),
+				strtoull(argv[6], NULL, 0)) ? 1 : 0;
 	} else if (!strcmp(c, "vote") && argc > 3) {
 		return vote(argv[2], (uint32_t)strtoul(argv[3], NULL, 0)) ? 1 : 0;
 	} else {
