@@ -573,6 +573,14 @@ sc_dump_all(void)
 			[wins addObjectsFromArray:((UIWindowScene *)sc).windows];
 		}
 	}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	for (UIWindow *w in [UIApplication sharedApplication].windows) {
+		if (![wins containsObject:w]) {
+			[wins addObject:w];
+		}
+	}
+#pragma clang diagnostic pop
 	for (UIWindow *w in wins) {
 		sc_walk(w, found);
 	}
