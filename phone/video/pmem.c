@@ -12,19 +12,66 @@ static int pm_fd = -1;
 
 /* redfin track V (venusctl --step): every write, SMC and RPMh vote logged to a file and fsynced BEFORE it is done, so
  * the last line survives a reset. Repeated wr32 of the same value to the same address (queue polling) is logged once. */
-static int step_fd = -1;
+static int step_fd = -1, step_con = -1;
+static off_t step_off;
 static double step_t0;
 static struct { uint64_t pa; uint32_t v; } step_last[16];
+#define STEP_SIZE	(4 << 20)
+#ifndef F_FULLFSYNC
+#define F_FULLFSYNC	51	/* Darwin */
+#endif
 
+static void step_sync(void)
+{
+	if (fcntl(step_fd, F_FULLFSYNC) < 0)
+		fsync(step_fd);
+}
+
+/*
+ * rn4x: plain appends + fsync lost every line of the run that reset the phone (the file's new length is metadata, and
+ * fsync on Darwin does not flush the drive). So the file is a fixed 4 MB of zeros, written once (F_FULLFSYNC), and
+ * lines go in place with pwrite at the first zero byte + F_FULLFSYNC: no length or extent change per line. Read it
+ * with `tr -d '\000' < FILE`. Every line also goes to /dev/console (the kernel log; VENUSCTL_STEP_CONSOLE=0: not).
+ */
 int pm_step_open(const char *path)
 {
-	step_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	step_fd = open(path, O_RDWR | O_CREAT, 0644);
 	if (step_fd < 0) {
 		fprintf(stderr, "step log %s: %s\n", path, strerror(errno));
 		return -1;
 	}
+	static char buf[1 << 16];
+	off_t size = lseek(step_fd, 0, SEEK_END), o;
+	if (size < STEP_SIZE) {	/* new or short: fill to STEP_SIZE with zeros once */
+		memset(buf, 0, sizeof(buf));
+		for (o = size; o < STEP_SIZE; o += (off_t)sizeof(buf))
+			if (pwrite(step_fd, buf, sizeof(buf), o) < 0)
+				break;
+		step_sync();
+	}
+	step_off = -1;	/* the first zero byte: where the last run stopped */
+	for (o = 0; o < STEP_SIZE && step_off < 0; o += (off_t)sizeof(buf)) {
+		ssize_t n = pread(step_fd, buf, sizeof(buf), o);
+		if (n <= 0)
+			break;
+		for (ssize_t i = 0; i < n; i++)
+			if (!buf[i]) {
+				step_off = o + i;
+				break;
+			}
+	}
+	if (step_off < 0 || step_off > STEP_SIZE - 65536) {	/* full: start over */
+		memset(buf, 0, sizeof(buf));
+		for (o = 0; o < STEP_SIZE; o += (off_t)sizeof(buf))
+			if (pwrite(step_fd, buf, sizeof(buf), o) < 0)
+				break;
+		step_sync();
+		step_off = 0;
+	}
+	if (!getenv("VENUSCTL_STEP_CONSOLE") || atoi(getenv("VENUSCTL_STEP_CONSOLE")))
+		step_con = open("/dev/console", O_WRONLY | O_NOCTTY);
 	step_t0 = mono_ms();
-	pm_step("---- step log open (pid %d)", getpid());
+	pm_step("---- step log open (pid %d, offset %lld)", getpid(), (long long)step_off);
 	return 0;
 }
 
@@ -46,10 +93,15 @@ void pm_step(const char *fmt, ...)
 	if (n > (int)sizeof(line) - 2)
 		n = (int)sizeof(line) - 2;
 	line[n++] = '\n';
-	if (write(step_fd, line, (size_t)n) < 0) {
-		/* nothing to do */
+	if (step_con >= 0) {
+		static const char tag[] = "venus step: ";
+		if (write(step_con, tag, sizeof(tag) - 1) < 0 || write(step_con, line, (size_t)n) < 0) {
+			/* the console is a mirror only */
+		}
 	}
-	fsync(step_fd);
+	if (step_off + n < STEP_SIZE && pwrite(step_fd, line, (size_t)n, step_off) == n)
+		step_off += n;
+	step_sync();
 }
 
 static void step_wr(uint64_t pa, const void *buf, size_t len)

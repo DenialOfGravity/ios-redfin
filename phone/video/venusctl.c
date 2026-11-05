@@ -46,7 +46,17 @@
  *   --step [--step-file F]  redfin: every /dev/pmem write, SMC and RPMh vote, every HFI command and packet, buffer
  *                           allocations, decode stages, and (while waiting) core + SMMU global fault status every
  *                           500 ms, to F (default /var/local/venus-step.log), fsynced BEFORE each action: after a
- *                           reset the last line is the last thing done
+ *                           reset the last line is the last thing done. The file is a fixed 4 MB, lines written in
+ *                           place (F_FULLFSYNC each); read it with tr -d '\000'. Lines also go to /dev/console.
+ * SMMU (redfin, rn4x): by default the 5 venus_ns SIDs go through ONE translating bank mapping only 0xa2600000-
+ *                           0xaca00000 (IOVA = PA), tables at 0xa29fe000; any other address faults in that bank (FSR/
+ *                           FAR printed at timeouts and in --step status). VENUSCTL_SMMU=identity: the old
+ *                           translation-off banks (identity for 0x1360 reset the phone); =hybrid: identity for
+ *                           the 0x1380 group, the window bank for 0x1360 only. boot prints an SMMU snapshot (SMRs
+ *                           matching 0x1300-0x13ff, sGFSR) before, after mapping, after auth and after mem protect.
+ *   venusctl smmu           that snapshot alone (read-only)
+ *   venusctl map-sid SID    after boot --keep: map one more SID now (VENUSCTL_SMMU mode, hybrid = window), recorded in
+ *                           STATE; e.g. boot with VENUSCTL_NSID=4, init, then map-sid 0x1360
  *   decode ... --stop-at STAGE  redfin: stop after STAGE (sessinit props workmode intl alloc load start ftb), watch the
  *                           queues 2 s, close; --dry = --stop-at ftb (buffers set, START, FTBs, no input queued)
  * redfin (Pixel 5, SM7250 lito; track V): ported from Yofuness/ios-flame 598ba5b, SoC numbers in venus_core.c's header.
@@ -209,13 +219,18 @@ int main(int argc, char **argv)
 		return session(debug);
 	if (!strcmp(cmd, "shutdown") && !arg)
 		return shutdown_cmd();
+	if (!strcmp(cmd, "map-sid") && arg)
+		return map_sid((uint32_t)strtoul(arg, NULL, 0));
+	if (!strcmp(cmd, "smmu") && !arg)
+		return smmu_cmd();
 usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
 		"       | session [--debug MASK] | decode IN.h264|IN.h265 OUT.yuv [--frames N] [--bufphys ADDR] [--debug MASK]\n"
 		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"
 		"       any command: [--step] [--step-file FILE]  (default /var/local/venus-step.log)\n"
-		"       | shutdown\n"
+		"       | shutdown | smmu (read-only: SMRs for 0x1300-0x13ff, global faults) | map-sid SID (after boot --keep)\n"
+		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
 		"       | memtest ADDR SIZE write|check\n");
 	return 2;
 }
