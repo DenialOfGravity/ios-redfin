@@ -452,6 +452,7 @@ static void sc_dump_view(id v);
 static id sc_sigview_get(void);
 static void sc_dump_all(void);
 static void sc_reattach(void);
+static NSHashTable *sc_items;
 
 static void
 sc_poll(void)
@@ -590,6 +591,37 @@ sc_dump_all(void)
 	}
 	sc_ui_log([NSString stringWithFormat:@"%lu windows, %lu cellular signal views", (unsigned long)wins.count,
 	    (unsigned long)found.count]);
+	/* the status bars of the condensed items seen: every region, its frame and its display items */
+	NSMutableSet *bars = [NSMutableSet set];
+	for (id item in sc_items.allObjects) {
+		@try {
+			id sb = [item valueForKey:@"statusBar"];
+			if (sb != nil && ![bars containsObject:sb]) {
+				[bars addObject:sb];
+				NSMutableString *o = [NSMutableString stringWithFormat:@"  status bar %p %s frame %@ window %s", sb,
+				    object_getClassName(sb), NSStringFromCGRect([sb frame]), object_getClassName([sb window])];
+				NSDictionary *regs = [sb valueForKey:@"regions"];
+				for (id rk in regs) {
+					id rg = regs[rk];
+					[o appendFormat:@"\n    region %@ (%s)", rk, object_getClassName(rg)];
+					for (NSString *k in @[ @"enabled", @"frame", @"layoutView", @"displayItems", @"enabledDisplayItems" ]) {
+						@try {
+							id val = [rg valueForKey:k];
+							NSString *d = [val description];
+							if (d.length > 1500) {
+								d = [d substringToIndex:1500];
+							}
+							[o appendFormat:@"\n      %@: %@", k, d];
+						} @catch (NSException *e) {
+						}
+					}
+				}
+				sc_ui_log(o);
+			}
+		} @catch (NSException *e) {
+			sc_ui_log([NSString stringWithFormat:@"status bar dump: %@", e.reason]);
+		}
+	}
 	UIView *rem = sc_sigview_get();
 	if (rem != nil && ![found containsObject:rem]) {
 		NSMutableString *ch = [NSMutableString string];
@@ -618,7 +650,6 @@ sc_dump_all(void)
 
 /* sweetcell.reattach: the condensed items seen by the hook whose signal view is enabled but has no superview get it
  * added back next to their service name view (same region container, the frame the status bar computed). */
-static NSHashTable *sc_items;
 
 static void
 sc_reattach(void)
