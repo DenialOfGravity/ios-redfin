@@ -14,10 +14,17 @@
  *        process (once more per cell.on change) WDS Start Network 0x20, Get Current Settings 0x2d, 20 s later Stop
  *        Network 0x21. Optional words apn=<1-63 of [A-Za-z0-9.-]> (else the default 3GPP profile is used) and
  *        ipfam=4|6 (default 4). Appends " x1=..." to the status line.
- * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 datatest=1 (writes; see maybe_write, the
- * PIN section and the X1 section), apn=... ipfam=4|6 (X1 parameters). Message ids and TLV layouts: libqmi
- * data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
- * No Network Register, no SMS/voice, no WDS write except X1's Start/Stop Network, never a PUK.
+ *   SS   (only with nolte=1 and/or csonly=1; safety switches, see the SS section) once per wland process (once more per
+ *        cell.on change), as soon as the NAS server is up and before the online write and any PIN verify: WRITE NAS Set
+ *        System Selection Preference 0x33 (nolte=1: mode GSM|UMTS; csonly=1: service domain CS only; both: one message;
+ *        always change duration = power cycle), then NAS Get System Selection Preference 0x34 once. Keeps the modem
+ *        off LTE/NR and packet-data bring-up (no IPA driver yet: the modem dies with ERR-FATAL ps_rm 0xd1 registering
+ *        LTE). Appends " sysel=<mode>/<domain>" to the status line.
+ * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 datatest=1 nolte=1 csonly=1 (writes; see
+ * maybe_write, the PIN section, the X1 section and the SS section), apn=... ipfam=4|6 (X1 parameters). Message ids and
+ * TLV layouts: libqmi data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
+ * No Network Register, no SMS/voice, no NAS write except SS's system selection, no WDS write except X1's Start/Stop
+ * Network, never a PUK.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +46,9 @@ static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
-enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64, OPT_DATATEST = 128 };
+enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64, OPT_DATATEST = 128,
+       OPT_NOLTE = 256, OPT_CSONLY = 512 };
+#define OPT_SS		(OPT_NOLTE | OPT_CSONLY)
 static int p1_known, p1_present, p1_active, cur_mode = -1;
 /* X1 preconditions from the last whole round (-1 = not answered this round) */
 static int nas_reg = -1, nas_ps = -1, x1_sim = -1;
@@ -597,9 +606,18 @@ static uint32_t x1_handle;
 static uint64_t x1_sent, x1_next, x1_stop_at;
 static char x1_apn[64], x1_res[64] = "idle";
 
+/* SS state (see the SS section); declared here for publish, maybe_write, pin_poll and x1_poll */
+enum { SS_IDLE, SS_GET, SS_DONE };
+static int ss_state, ss_armed, ss_hold, ss_waitlog;	/* ss_hold: online write and PIN verify wait for 0x33's answer */
+static uint16_t ss_id, ss_txn;			/* ss_id: the SS request in flight (0 none) */
+static uint64_t ss_sent, ss_next;
+static char ss_res[64] = "?";
+
 static void publish(void)
 {
-	char line[1536], wds[352] = "";
+	char line[1536], wds[352] = "", ss[80] = "";
+	if (opts & OPT_SS)
+		snprintf(ss, sizeof(ss), " sysel=%s", ss_res);
 	if (!strstr(f_reg, "reg=registered"))
 		bars = 0;
 	if (opts & OPT_WDS) {
@@ -610,8 +628,8 @@ static void publish(void)
 			snprintf(wds + k, sizeof(wds) - k, " x1=%s", x1_res);
 		}
 	}
-	snprintf(line, sizeof(line), "%s %s %s | %s %s | %s bars=%d | model=%s hw=%s rev=%s imei=%s%s", f_sim, f_slots, f_mode, f_reg, f_svc, f_sig,
-		 bars, model, hwrev, rev, imei, wds);
+	snprintf(line, sizeof(line), "%s %s %s | %s %s | %s bars=%d | model=%s hw=%s rev=%s imei=%s%s%s", f_sim, f_slots, f_mode, f_reg,
+		 f_svc, f_sig, bars, model, hwrev, rev, imei, wds, ss);
 	uint64_t now = link_ms();
 	if (strcmp(line, last_line) || now - last_log > 600000) {
 		printf("[%6llu] cell: %s\n", (unsigned long long)now, line);
@@ -736,6 +754,10 @@ static int read_opts(void)
 		o |= OPT_PIN;
 	if (strstr(b, "wds=1"))
 		o |= OPT_WDS;
+	if (strstr(b, "nolte=1"))
+		o |= OPT_NOLTE;
+	if (strstr(b, "csonly=1"))
+		o |= OPT_CSONLY;
 	if (strstr(b, "online=1"))
 		o |= OPT_ONLINE;
 	else if (strstr(b, "online=0"))
@@ -828,7 +850,8 @@ static int maybe_write(void)
 		return !send_write(SVC_UIM, 0x46, &logical, 1, &physical, 4);
 	}
 	int want = opts & OPT_ONLINE ? 0 : opts & OPT_LPM ? 1 : -1;
-	if (want >= 0 && cur_mode >= 0 && cur_mode != want && mode_tries < 2 && srv[SVC_DMS].up) {
+	/* ss_hold: nolte=1/csonly=1's system selection goes first (SS section) */
+	if (want >= 0 && cur_mode >= 0 && cur_mode != want && mode_tries < 2 && srv[SVC_DMS].up && !ss_hold && !ss_id) {
 		mode_tries++;
 		if (backup_rmtfs("pre-online"))
 			return 0;
@@ -1020,7 +1043,7 @@ static void pin_poll(void)
 		pin_reply("err=timeout retries=%u\n", papp.retries);
 		next_round = now + 2000;
 	}
-	if (pin_queued && step < 0 && !wr_id && !pin_txn && !x1_id) {
+	if (pin_queued && step < 0 && !wr_id && !pin_txn && !x1_id && !ss_id && !ss_hold) {
 		if (srv[SVC_UIM].up)
 			pin_send();
 		else {
@@ -1081,6 +1104,215 @@ static void pin_answer(const struct qmi_msg *m)
 	}
 	papp.known = 0;			/* only a fresh card status may allow another try */
 	next_round = link_ms() + 2000;	/* re-read: expect usim:ready */
+}
+
+/*
+ * SS: system selection safety switches (nolte=1 / csonly=1 in cell.on). Without the IPA driver the modem dies
+ * (ERR-FATAL "EX:kernel:0x0:ps_rm:0xd1") ~45 s after SIM unlock while registering LTE, i.e. bringing up packet data.
+ * Once per wland process (once more per cell.on change), as soon as the NAS server is up, between rounds, whatever the
+ * operating mode (an online modem re-selects):
+ *   WRITE NAS Set System Selection Preference 0x33 (libqmi data/qmi-service-nas.json), one message:
+ *     0x11 Mode Preference u16 (QmiNasRatModePreference) = GSM 1<<2 | UMTS 1<<3 = 0x000c  (nolte=1; no CDMA 1<<0/1<<1,
+ *          LTE 1<<4, TD-SCDMA 1<<5, 5GNR 1<<6)
+ *     0x17 Change Duration u8 (QmiNasChangeDuration) = 0 power cycle (nothing kept in the modem's NV)
+ *     0x18 Service Domain Preference u32 (QmiNasServiceDomainPreference) = 0 CS only  (csonly=1)
+ *   then NAS Get System Selection Preference 0x34 (a read) once: 0x11 Mode Preference u16, 0x18 Service Domain
+ *     Preference u32, 0x22 Disabled Modes u16 -> "cell: nas sys-sel mode=0x.. domain=... (wanted ...)".
+ * From the cell.on change until 0x33 is answered (ok or an error) or 10 s after it went out, the DMS online write and
+ * the SIM PIN verify are held (also while the NAS server is not up yet). Nothing is repeated: no answer, an error or
+ * the NAS server going away ends it. Status: " sysel=<mode>/<domain>" from the read-back (pending|set-noanswer|lost|
+ * get-err0xE|...; "seterr0xE:" in front when 0x33 was refused).
+ */
+#define SS_REPLY_MS	10000
+#define SS_MODE		0x000cu		/* GSM | UMTS */
+
+static void ss_modes(char *d, size_t n, uint16_t v)
+{
+	static const char *const b[] = { "cdma1x", "evdo", "gsm", "umts", "lte", "td-scdma", "nr5g" };
+	int k = 0;
+	d[0] = 0;
+	for (unsigned i = 0; i < 16 && k >= 0 && (size_t)k < n - 1; i++)
+		if (v & (1u << i))
+			k += snprintf(d + k, n - (size_t)k, "%s%s", k ? "+" : "", i < 7 ? b[i] : "?");
+	if (!d[0])
+		snprintf(d, n, "none");
+}
+
+static const char *ss_domain(uint32_t v)
+{
+	static const char *const d[] = { "cs", "ps", "cs+ps", "ps-attach", "ps-detach" };
+	return v < 5 ? d[v] : "?";
+}
+
+static int ss_send(uint16_t id)
+{
+	struct qmi_buf *q = malloc(sizeof(*q));
+	if (!q)
+		return -1;
+	ss_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(q, QMI_REQUEST, ss_txn, id);
+	if (id == 0x33) {
+		if (opts & OPT_NOLTE) {
+			uint16_t mode = SS_MODE;
+			qmi_tlv(q, 0x11, &mode, 2);
+		}
+		qmi_tlv_u8(q, 0x17, 0);			/* power cycle */
+		if (opts & OPT_CSONLY)
+			qmi_tlv_u32(q, 0x18, 0);	/* CS only */
+	}
+	size_t len = qmi_finish(q);
+	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[SVC_NAS].node, srv[SVC_NAS].port, q->b, (uint32_t)len);
+	free(q);
+	ss_id = id;
+	ss_sent = link_ms();
+	return 0;
+}
+
+static void ss_wanted(char *d, size_t n)
+{
+	snprintf(d, n, "mode=%s domain=%s", opts & OPT_NOLTE ? "0x000c(gsm+umts)" : "any", opts & OPT_CSONLY ? "cs" : "any");
+}
+
+static void ss_answer(const struct qmi_msg *m)
+{
+	uint64_t now = link_ms();
+	unsigned e = qerr(m);
+	ss_id = 0;
+	ss_txn = 0;
+	ss_next = now + SEND_GAP_MS;
+	if (m->id == 0x33) {
+		ss_hold = 0;
+		ss_state = SS_GET;
+		if (e)
+			snprintf(ss_res, sizeof(ss_res), "seterr%#x:", e);
+		else
+			ss_res[0] = 0;
+		printf("[%6llu] cell: WRITE nas set system selection -> %s (err %#x) after %llu ms: online write and pin verify "
+		       "released\n", (unsigned long long)now, e ? "refused" : "ok", e, (unsigned long long)(now - ss_sent));
+		return;
+	}
+	ss_state = SS_DONE;
+	size_t k = strlen(ss_res);
+	char want[64];
+	ss_wanted(want, sizeof(want));
+	uint16_t l, mode = 0, dis = 0;
+	uint32_t dom = 0;
+	const uint8_t *p;
+	int have_mode = 0, have_dom = 0, have_dis = 0;
+	if (!e && (p = qmi_get(m, 0x11, &l)) && l >= 2) {
+		memcpy(&mode, p, 2);
+		have_mode = 1;
+	}
+	if (!e && !qmi_get_u32(m, 0x18, &dom))
+		have_dom = 1;
+	if (!e && (p = qmi_get(m, 0x22, &l)) && l >= 2) {
+		memcpy(&dis, p, 2);
+		have_dis = 1;
+	}
+	if (e) {
+		snprintf(ss_res + k, sizeof(ss_res) - k, "get-err%#x", e);
+		printf("[%6llu] cell: nas sys-sel get err %#x (wanted %s)\n", (unsigned long long)now, e, want);
+		return;
+	}
+	char mn[64] = "?", dn[24] = "?";
+	if (have_mode)
+		ss_modes(mn, sizeof(mn), mode);
+	if (have_dom)
+		snprintf(dn, sizeof(dn), "%s", ss_domain(dom));
+	snprintf(ss_res + k, sizeof(ss_res) - k, "%s/%s", mn, dn);
+	char dm[64] = "";
+	if (have_dis) {
+		char x[48];
+		ss_modes(x, sizeof(x), dis);
+		snprintf(dm, sizeof(dm), " disabled=0x%02x(%s)", dis, x);
+	}
+	int bad = ((opts & OPT_NOLTE) && (!have_mode || mode != SS_MODE)) || ((opts & OPT_CSONLY) && (!have_dom || dom != 0));
+	char ms[16] = "-", ds[16] = "-";
+	if (have_mode)
+		snprintf(ms, sizeof(ms), "0x%02x", mode);
+	if (have_dom)
+		snprintf(ds, sizeof(ds), "%u", dom);
+	printf("[%6llu] cell: nas sys-sel mode=%s(%s) domain=%s(%s)%s (wanted %s)%s\n", (unsigned long long)now, ms, mn, dn, ds,
+	       dm, want, bad ? " MISMATCH" : "");
+}
+
+/* 1 = this message is SS's */
+static int ss_mine(const struct qmi_msg *m)
+{
+	return ss_id && m->txn == ss_txn && m->id == ss_id;
+}
+
+/* the NAS server went away (modem restart): nothing more is sent, the hold ends */
+static void ss_lost(void)
+{
+	if (!ss_id)
+		return;
+	printf("[%6llu] cell: sys-sel: nas server gone with %#x unanswered: nothing more sent%s\n", (unsigned long long)link_ms(),
+	       ss_id, ss_hold ? "; online write and pin verify released" : "");
+	ss_id = 0;
+	ss_txn = 0;
+	ss_hold = 0;
+	ss_state = SS_DONE;
+	snprintf(ss_res, sizeof(ss_res), "lost");
+}
+
+/* from cell_poll; 1 = an SS request is in flight or was just sent (nothing else goes out) */
+static int ss_poll(uint64_t now)
+{
+	if (ss_id) {
+		if (now - ss_sent <= SS_REPLY_MS)
+			return 1;
+		printf("[%6llu] cell: %snas %#x unanswered in %d s (not repeated)%s\n", (unsigned long long)now,
+		       ss_id == 0x33 ? "WRITE " : "", ss_id, SS_REPLY_MS / 1000,
+		       ss_id == 0x33 ? ": online write and pin verify released" : "");
+		if (ss_id == 0x33) {
+			ss_hold = 0;
+			ss_state = SS_GET;		/* still read back what the modem has */
+			snprintf(ss_res, sizeof(ss_res), "set-noanswer:");
+		} else {
+			ss_state = SS_DONE;
+			size_t k = strlen(ss_res);
+			snprintf(ss_res + k, sizeof(ss_res) - k, "get-noanswer");
+		}
+		ss_id = 0;
+		ss_txn = 0;
+		ss_next = now + SEND_GAP_MS;
+		return 0;
+	}
+	if (step >= 0 || wr_id || pin_txn || x1_id || now < ss_next)
+		return 0;
+	if (ss_armed && !srv[SVC_NAS].up) {
+		if (!ss_waitlog) {
+			ss_waitlog = 1;
+			printf("[%6llu] cell: sys-sel waiting for the nas server (online write and pin verify held)\n",
+			       (unsigned long long)now);
+		}
+		return 0;
+	}
+	if (ss_armed) {
+		ss_armed = 0;
+		char want[64];
+		ss_wanted(want, sizeof(want));
+		printf("[%6llu] cell: WRITE nas set system selection %s duration=power-cycle (mode now %d; online write and pin "
+		       "verify held until answered, max %d s)\n", (unsigned long long)now, want, cur_mode, SS_REPLY_MS / 1000);
+		snprintf(ss_res, sizeof(ss_res), "pending");
+		if (!ss_send(0x33))
+			return 1;
+		ss_hold = 0;
+		ss_state = SS_DONE;
+		snprintf(ss_res, sizeof(ss_res), "err-nomem");
+		printf("[%6llu] cell: WRITE nas set system selection not sent (no memory): online write and pin verify released\n",
+		       (unsigned long long)now);
+		return 0;
+	}
+	if (ss_state == SS_GET && srv[SVC_NAS].up) {
+		if (!ss_send(0x34))
+			return 1;
+		ss_state = SS_DONE;
+	}
+	return 0;
 }
 
 /*
@@ -1310,7 +1542,7 @@ static int x1_poll(uint64_t now)
 		x1_next = now + SEND_GAP_MS;
 		return 0;
 	}
-	if (step >= 0 || wr_id || pin_txn || pin_queued || now < x1_next || !srv[SVC_WDS].up)
+	if (step >= 0 || wr_id || pin_txn || pin_queued || ss_id || ss_hold || now < x1_next || !srv[SVC_WDS].up)
 		return 0;
 	if (x1_state == X1_UP) {
 		x1_state = X1_SET;
@@ -1364,6 +1596,8 @@ void cell_server_gone(uint32_t node, uint32_t port)
 			srv[i].up = 0;
 			if (i == SVC_WDS)
 				x1_lost();
+			if (i == SVC_NAS)
+				ss_lost();
 			if (enabled && (i != SVC_WDS || (opts & OPT_WDS)))
 				printf("cell: %s server gone\n", svc_name[i]);
 		}
@@ -1376,6 +1610,10 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		return;			/* indications: none registered for */
 	if (x1_mine(&m)) {
 		x1_answer(&m);
+		return;
+	}
+	if (ss_mine(&m)) {
+		ss_answer(&m);
 		return;
 	}
 	if (pin_txn && m.txn == pin_txn && m.id == 0x26) {
@@ -1437,14 +1675,26 @@ void cell_poll(void)
 				printf("[%6llu] cell: x1 armed: datatest=1%s apn='%s'%s ipfam=%d\n", (unsigned long long)now,
 				       opts & OPT_WDS ? " wds=1" : " (needs wds=1 too)", x1_apn, rd_apn_bad ? " (apn= ignored: 1-63 of A-Za-z0-9.-)" : "",
 				       x1_fam);
+			ss_armed = on && (opts & OPT_SS);	/* SS: one (more) system selection per cell.on change */
+			ss_hold = ss_armed;		/* the online write and a PIN verify wait for it */
+			ss_waitlog = 0;
+			if (!on && ss_id) {		/* off: ss_poll no longer runs; an answer is not waited for */
+				printf("[%6llu] cell: sys-sel: cell.on gone with %#x unanswered\n", (unsigned long long)now, ss_id);
+				ss_id = 0;
+				ss_txn = 0;
+			}
+			if (!ss_id) {
+				ss_state = SS_IDLE;
+				snprintf(ss_res, sizeof(ss_res), "%s", ss_armed ? "pending" : "off");
+			}
 			memset(fails, 0, sizeof(fails));
 			sw_tries = mode_tries = 0;
 			timeouts = 0;
 			wds_reset();
-			printf("[%6llu] cell: %s (%s%s%s%s%s%s%s)%s; servers dms %s nas %s uim %s%s%s\n", (unsigned long long)now, on ? "on" : "off",
+			printf("[%6llu] cell: %s (%s%s%s%s%s%s%s%s%s)%s; servers dms %s nas %s uim %s%s%s\n", (unsigned long long)now, on ? "on" : "off",
 			       CELL_ON, opts & OPT_SLOTS ? " slots=1" : "", opts & OPT_HW ? " hw=1" : "",
 			       opts & OPT_SWITCH ? " slotswitch=1" : "", opts & OPT_PIN ? " pin=1" : "", opts & OPT_ONLINE ? " online=1" : opts & OPT_LPM ? " online=0" : "",
-			       opts & OPT_WDS ? " wds=1" : "", allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-",
+			       opts & OPT_WDS ? " wds=1" : "", opts & OPT_NOLTE ? " nolte=1" : "", opts & OPT_CSONLY ? " csonly=1" : "", allowed ? "" : ", waiting for the Wi-Fi bring-up", srv[SVC_DMS].up ? "up" : "-",
 			       srv[SVC_NAS].up ? "up" : "-", srv[SVC_UIM].up ? "up" : "-", opts & OPT_WDS ? " wds " : "",
 			       opts & OPT_WDS ? (srv[SVC_WDS].up ? "up" : "-") : "");
 			step = -1;
@@ -1467,6 +1717,8 @@ void cell_poll(void)
 		}
 		return;
 	}
+	if (ss_poll(now))
+		return;			/* nolte=1/csonly=1's system selection is out (or just went out) */
 	if (step >= 0) {
 		if (step >= NSTEPS) {
 			end_round(ROUND_MS);
