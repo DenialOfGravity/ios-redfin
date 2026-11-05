@@ -416,3 +416,5 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Slot 0x46 (logical 1 -> physical 1, once per cell.on change, only if P1 holds a card and is inactive; rmtfs images
   copied to *.pre-slot first) and `online=1` / `online=0` DMS Set Operating Mode 0x2e online / low power (2 tries, only
   if the mode differs; *.pre-online copies first). An offline (3) modem refuses (0x35); no reset is ever sent.
+- cell (ws-n-tel): Get Operating Mode's Offline Reason (0x10) and Hardware Restricted Mode (0x11) shown in `mode=`; write
+  result labels fixed per libqmi qmi-errors.h (0x34 DEVICE_NOT_READY, 0x3c INVALID_TRANSITION; 0x35 is NETWORK_NOT_READY).

@@ -39,7 +39,7 @@ static uint64_t allow_ms, first_poll, next_send;
 static uint16_t txn = 1, want_txn;
 static uint64_t sent_ms, next_round, next_check, last_log;
 static char model[48] = "?", hwrev[48] = "?", rev[128] = "?", imei[24] = "?";
-static char f_mode[32], f_sim[256], f_slots[192], f_reg[160], f_svc[96], f_sig[96];
+static char f_mode[96], f_sim[256], f_slots[192], f_reg[160], f_svc[96], f_sig[96];
 static char last_line[1280];
 static int bars;
 
@@ -155,8 +155,16 @@ static void on_dms(uint16_t id, const struct qmi_msg *m, unsigned e)
 		if (e || qmi_get_u8(m, 1, &v))
 			snprintf(f_mode, sizeof(f_mode), "mode=err%#x", e);
 		else {
-			snprintf(f_mode, sizeof(f_mode), "mode=%s(%u)", NM(opmode, v), v);
+			int n = snprintf(f_mode, sizeof(f_mode), "mode=%s(%u)", NM(opmode, v), v);
 			cur_mode = v;
+			/* libqmi "Offline Reason" 0x10 (u16, only when offline): 1 host image, 2 PRI image misconfiguration,
+			   4 PRI version incompatible, 8 memory full; "Hardware Restricted Mode" 0x11 (u8 bool) */
+			uint16_t ol;
+			const uint8_t *r = qmi_get(m, 0x10, &ol);
+			if (r && ol >= 2)
+				AP(f_mode, n, " offline-reason=%#x", r[0] | r[1] << 8);
+			if ((r = qmi_get(m, 0x11, &ol)) && ol >= 1)
+				AP(f_mode, n, " hw-restricted=%u", r[0]);
 		}
 	}
 }
@@ -448,7 +456,7 @@ static int read_opts(void)
  *                 and nothing is sent if that copy fails.
  *   online=1      DMS Set Operating Mode 0x2e (TLV 1 u8: 0 online); online=0 sends 1 (low power). At most 2 tries
  *                 per cell.on change, only when Get Operating Mode reads something else; *.pre-online copies first.
- *                 An offline (3) modem refuses both (QMI: offline only goes to reset); no reset is ever sent.
+ *                 redfin 2026-11-05: the modem boots offline(3) and refuses online with 0x34 DEVICE_NOT_READY; no reset is ever sent.
  * One write at a time, in place of a round's first request, then the round 5 s later re-reads everything.
  */
 static int wr_txn, wr_svc, sw_tries, mode_tries;
@@ -567,7 +575,7 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (wr_id && m.txn == wr_txn && m.id == wr_id) {
 		unsigned we = qerr(&m);
 		printf("[%6llu] cell: WRITE %s %#x -> %s (err %#x)%s\n", (unsigned long long)link_ms(), svc_name[wr_svc], wr_id,
-		       we ? "refused" : "ok", we, we == 0x35 ? " invalid transition: an offline modem only takes a reset" : "");
+		       we ? "refused" : "ok", we, we == 0x3c ? " (invalid transition)" : we == 0x34 ? " (device not ready)" : "");
 		wr_id = 0;
 		cur_mode = -1;
 		next_round = link_ms() + 5000;	/* re-read slots, card, mode, registration */
