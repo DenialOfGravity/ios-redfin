@@ -586,6 +586,15 @@ sc_dump_all(void)
 	}
 	sc_ui_log([NSString stringWithFormat:@"%lu windows, %lu cellular signal views", (unsigned long)wins.count,
 	    (unsigned long)found.count]);
+	UIView *rem = sc_sigview_get();
+	if (rem != nil && ![found containsObject:rem]) {
+		NSMutableString *ch = [NSMutableString string];
+		for (UIView *a = rem; a != nil; a = a.superview) {
+			[ch appendFormat:@" < %s h%d a%.2f (%.0f %.0f %.0f %.0f)", object_getClassName(a), a.hidden, a.alpha,
+			    a.frame.origin.x, a.frame.origin.y, a.frame.size.width, a.frame.size.height];
+		}
+		sc_ui_log([NSString stringWithFormat:@"  remembered signal view not in a window: window %@, chain%@", rem.window, ch]);
+	}
 	for (UIView *v in found) {
 		CGRect r = [v convertRect:v.bounds toView:nil];
 		NSMutableString *chain = [NSMutableString string];
