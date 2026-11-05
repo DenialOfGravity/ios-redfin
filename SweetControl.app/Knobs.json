@@ -1,0 +1,108 @@
+{
+ "_doc": "SweetControl knob catalog. Copy to /var/local/sweetctl/knobs.json on the phone and edit it there to add or change knobs without a rebuild (the app prefers that file). kind: sysctl | kv (KEY=VALUE file) | words (whitespace-separated file, one word per knob) | size (file whose size = base + scale*value) | flag (file exists or not) | hud (bits of the overlay state) | info (read-only sysctl). type: bool | int | enum | bits. effect: live | respring | render (restart backboardd) | userspace (userspace reboot) | reboot | daemon:NAME. 'unset' true lets a kv/size/words knob be removed so the program's own default applies.",
+ "sections": [
+  {"title": "FPS overlay", "footer": "Drawn by SweetFPS.dylib. Changes show at once. FPS 'fb' = frames that reached the panel (kernel 1060); 'dl' = an estimate from a display link on older kernels.", "knobs": [
+   {"id": "hud.on", "title": "Show overlay", "kind": "hud", "shift": 0, "width": 1, "type": "bool", "default": 0},
+   {"id": "hud.where", "title": "Draw in", "kind": "hud", "shift": 1, "width": 2, "type": "enum", "default": 0,
+    "options": [{"v": 0, "t": "SpringBoard (over everything)"}, {"v": 1, "t": "Each app"}, {"v": 2, "t": "Both"}]},
+   {"id": "hud.pos", "title": "Position", "kind": "hud", "shift": 3, "width": 3, "type": "enum", "default": 2,
+    "options": [{"v": 0, "t": "Top left"}, {"v": 1, "t": "Top centre"}, {"v": 2, "t": "Top right"}, {"v": 3, "t": "Bottom left"}, {"v": 4, "t": "Bottom centre"}, {"v": 5, "t": "Bottom right"}]},
+   {"id": "hud.fields", "title": "Fields", "kind": "hud", "shift": 8, "width": 8, "type": "bits", "default": 13,
+    "bits": [{"b": 1, "t": "FPS"}, {"b": 2, "t": "GPU MHz"}, {"b": 4, "t": "Hottest temperature"}, {"b": 8, "t": "CPU load"}, {"b": 16, "t": "Free RAM"}, {"b": 32, "t": "Wi-Fi signal"}, {"b": 64, "t": "FPS source tag (fb/dl)"}]},
+   {"id": "hud.interval", "title": "Update every (x100 ms)", "kind": "hud", "shift": 16, "width": 5, "type": "int", "min": 1, "max": 31, "step": 1, "default": 5},
+   {"id": "hud.font", "title": "Font size (8 + N pt)", "kind": "hud", "shift": 21, "width": 4, "type": "int", "min": 1, "max": 15, "step": 1, "default": 3},
+   {"id": "hud.alpha", "title": "Background (tenths)", "kind": "hud", "shift": 25, "width": 4, "type": "int", "min": 1, "max": 10, "step": 1, "default": 6},
+   {"id": "hud.colour", "title": "Colour FPS (green/yellow/red)", "kind": "hud", "shift": 29, "width": 1, "type": "bool", "default": 1}
+  ]},
+  {"title": "Display and frame pacing (kernel)", "footer": "Live sysctls. They reset at a full reboot unless pinned ('Apply at boot' on the knob's page).", "knobs": [
+   {"id": "surfkeep", "title": "Surface keep-row (1048)", "kind": "sysctl", "name": "kern.sweet_surfkeep", "type": "bool", "default": 1, "effect": "live", "desc": "Recorded key-set surfaces keep their explicit row. Fixes the Control Center glyph stripes."},
+   {"id": "vsyncphase", "title": "Vsync phase, µs (1049)", "kind": "sysctl", "name": "kern.sweet_vsyncphase", "type": "int", "min": 0, "max": 11000, "step": 250, "default": 5000, "effect": "live", "desc": "Vsync ticks this many µs before CA's display-link grid. 0 = off. 5000 gave +3 % fps, +8 % in CC."},
+   {"id": "vsyncgrid", "title": "Vsync phase grid", "kind": "sysctl", "name": "kern.sweet_vsyncphase_grid", "type": "int", "min": 0, "max": 100000000, "step": 1, "default": 0, "effect": "live", "desc": "0 auto; up to 1000 = Hz; larger = ns."},
+   {"id": "vsynclock", "title": "Vsync lock to measured panel period", "kind": "sysctl", "name": "kern.sweet_vsync_lock", "type": "int", "min": 0, "max": 7, "step": 1, "effect": "live", "desc": "Vsync ticks + IOMFBDisplayRefresh on the measured panel period (0995 mask 7)."},
+   {"id": "earlyretire", "title": "Early swap retire", "kind": "sysctl", "name": "kern.sweet_fb_early_retire", "type": "bits", "effect": "live", "bits": [{"b": 1, "t": "1 tick"}, {"b": 2, "t": "Rekick"}, {"b": 4, "t": "SwapWait poll"}]},
+   {"id": "bigcore", "title": "CA threads on big cores (1041)", "kind": "sysctl", "name": "kern.sweet_ui_bigcore", "type": "bits", "effect": "live", "bits": [{"b": 1, "t": "Display thread"}, {"b": 2, "t": "Render server"}]},
+   {"id": "framehold", "title": "Governor frame hold, % (1037)", "kind": "sysctl", "name": "kern.sweet_gov_framehold", "type": "int", "min": 0, "max": 100, "step": 5, "effect": "live", "desc": "% of each CPU domain's top frequency held for 300 ms after a SwapEnd. 0 = off."}
+  ]},
+  {"title": "GPU (kernel)", "knobs": [
+   {"id": "dcvs", "title": "GPU DCVS", "kind": "sysctl", "name": "kern.sweet_gpu_dcvs", "type": "bits", "effect": "live", "desc": "0 = fixed level.", "bits": [{"b": 1, "t": "DCVS on"}, {"b": 2, "t": "No touch boost"}, {"b": 4, "t": "No SwapEnd boost"}]},
+   {"id": "dcvsfloor", "title": "DCVS floor, MHz", "kind": "sysctl", "name": "kern.sweet_gpu_dcvs_floor", "type": "int", "min": 0, "max": 750, "step": 25, "effect": "live", "desc": "Lowest GPU level at or above this."},
+   {"id": "dcvsboost", "title": "DCVS boost, ms", "kind": "sysctl", "name": "kern.sweet_gpu_dcvs_boost_ms", "type": "int", "min": 0, "max": 2000, "step": 25, "effect": "live", "desc": "Time at the top level after a touch or SwapEnd. 0 = none."},
+   {"id": "ibmax", "title": "IBs per submit", "kind": "sysctl", "name": "kern.sweet_gpu_ibmax", "type": "int", "min": 1, "max": 128, "step": 1, "default": 16, "effect": "live"},
+   {"id": "tlb", "title": "GPU TLB maintenance", "kind": "sysctl", "name": "kern.sweet_gpu_tlb", "type": "enum", "effect": "live", "options": [{"v": 0, "t": "Full flush"}, {"v": 1, "t": "Per page / skip"}, {"v": 2, "t": "Unmap"}, {"v": 3, "t": "Map"}]}
+  ]},
+  {"title": "Wi-Fi, USB, storage, video (kernel)", "knobs": [
+   {"id": "wifisig", "title": "Wi-Fi signal to wifid (1051)", "kind": "sysctl", "name": "kern.sweet_wifi_sig", "type": "bits", "default": 3, "effect": "live", "bits": [{"b": 1, "t": "Post event 39 on each RSSI"}, {"b": 2, "t": "RSSI uses the live signal"}, {"b": 4, "t": "Noise/SNR in scan results"}, {"b": 16, "t": "Report wland-made joins to wifid"}]},
+   {"id": "usbpoll", "title": "USB poll while busy, µs", "kind": "sysctl", "name": "kern.sweet_usb_poll_us", "type": "int", "min": 0, "max": 10000, "step": 50, "effect": "live", "desc": "0 = 1 ms / 10 ms."},
+   {"id": "usbtx", "title": "USB frames per bulk IN", "kind": "sysctl", "name": "kern.sweet_usb_txbatch", "type": "int", "min": 0, "max": 16, "step": 1, "effect": "live"},
+   {"id": "usbrecover", "title": "USB recover (1045)", "kind": "sysctl", "name": "kern.sweet_usb_recover", "type": "bool", "effect": "live", "desc": "Reset endpoints on bus reset/reconfig, plus the stuck watchdog."},
+   {"id": "ufsguard", "title": "UFS write guard (1032)", "kind": "sysctl", "name": "kern.sweet_ufs_guard", "type": "enum", "effect": "live", "options": [{"v": 0, "t": "Off"}, {"v": 1, "t": "Log"}, {"v": 2, "t": "Enforce"}]},
+   {"id": "venus", "title": "Venus /dev/pmem window (1057)", "kind": "sysctl", "name": "kern.sweet_venus", "type": "enum", "effect": "live", "options": [{"v": 0, "t": "Device"}, {"v": 1, "t": "Write-combined"}, {"v": 2, "t": "Cached"}]}
+  ]},
+  {"title": "Metal, live (mtl2-live)", "footer": "Read by the Metal bundle once a second. 'Unset' falls back to mtl2-env / the built-in default.", "knobs": [
+   {"id": "deadfill", "title": "Dead fill drop", "kind": "kv", "file": "/var/local/mtl2-live", "key": "SWEET_DEADFILL", "type": "enum", "unset": true, "effect": "live", "options": [{"v": 0, "t": "Off"}, {"v": 1, "t": "1: drops only (your pick)"}, {"v": 2, "t": "2: hold + clear"}]},
+   {"id": "luma", "title": "CA luma boost pass", "kind": "kv", "file": "/var/local/mtl2-live", "key": "SWEET_LUMA_BOOST", "type": "enum", "unset": true, "effect": "live", "options": [{"v": 0, "t": "Off (faster)"}, {"v": 1, "t": "On"}]},
+   {"id": "cpufast", "title": "Frontend CPU savings", "kind": "kv", "file": "/var/local/mtl2-live", "key": "SWEET_CPUFAST", "type": "bits", "unset": true, "effect": "live", "bits": [{"b": 1, "t": "Cached device answers"}, {"b": 2, "t": "Skip repeated viewport/scissor"}]},
+   {"id": "encstat", "title": "Encode-time stats (klog)", "kind": "kv", "file": "/var/local/mtl2-live", "key": "SWEET_ENCSTAT", "type": "bool", "unset": true, "effect": "live"},
+   {"id": "fnstat", "title": "Function stats (klog)", "kind": "kv", "file": "/var/local/mtl2-live", "key": "SWEET_FNSTAT", "type": "bool", "unset": true, "effect": "live"},
+   {"id": "encslow", "title": "Log encodes slower than, ms", "kind": "kv", "file": "/var/local/mtl2-live", "key": "SWEET_ENC_SLOW_MS", "type": "int", "min": 0, "max": 100, "step": 1, "unset": true, "effect": "live"}
+  ]},
+  {"title": "Metal, at start (mtl2-env)", "footer": "Read when backboardd starts: needs 'Restart render server'.", "knobs": [
+   {"id": "shadowcache", "title": "Shadow cache (n1)", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_SHADOW_CACHE", "type": "bool", "unset": true, "effect": "render", "desc": "Part of the n1 set: +12 % fps."},
+   {"id": "cull", "title": "Cull mode (n1)", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_CULL", "type": "int", "min": 0, "max": 3, "step": 1, "unset": true, "effect": "render"},
+   {"id": "spare", "title": "Spare images (n1)", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_SPARE_IMAGES", "type": "bool", "unset": true, "effect": "render"},
+   {"id": "tutransient", "title": "Turnip transient attachments", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_TU_TRANSIENT", "type": "bool", "unset": true, "effect": "render", "desc": "Known to break Control Center and the lock screen. Leave off."},
+   {"id": "timeline", "title": "Timeline accounting", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_TIMELINE", "type": "bool", "unset": true, "effect": "render"},
+   {"id": "prewarm", "title": "Pipeline prewarm", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_PREWARM", "type": "enum", "unset": true, "effect": "render", "options": [{"v": 0, "t": "Off"}, {"v": 1, "t": "At device creation"}, {"v": 2, "t": "Idle priming"}]},
+   {"id": "mesacache", "title": "Mesa shader cache", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_MESA_CACHE", "type": "bool", "unset": true, "effect": "render"},
+   {"id": "encthread", "title": "Encode thread", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_ENCTHREAD", "type": "bool", "unset": true, "effect": "render"},
+   {"id": "renderpri", "title": "Render thread fixed priority", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_RENDER_PRI", "type": "int", "min": 0, "max": 97, "step": 1, "unset": true, "effect": "render", "desc": "SCHED_RR priority. Unset = off."},
+   {"id": "rtrot", "title": "Keep Metal's rotation answer", "kind": "kv", "file": "/var/local/mtl2-env", "key": "SWEET_RT_ROTATION", "type": "bool", "unset": true, "effect": "render"}
+  ]},
+  {"title": "Frame rate requests (SweetFPS)", "footer": "File /var/local/sweetfps 'MODE TARGET'. Read when a process starts: respring (apps on relaunch).", "knobs": [
+   {"id": "fpsmode", "title": "Mode", "kind": "words", "file": "/var/local/sweetfps", "index": 0, "type": "bits", "unset": true, "effect": "respring", "bits": [{"b": 1, "t": "Log requests"}, {"b": 2, "t": "Rewrite low requests to target"}, {"b": 4, "t": "Also log to /var/tmp/sweetfps.log"}, {"b": 8, "t": "Rewrite to default instead"}]},
+   {"id": "fpstarget", "title": "Target fps", "kind": "words", "file": "/var/local/sweetfps", "index": 1, "type": "int", "min": 30, "max": 120, "step": 1, "default": 90, "effect": "respring"}
+  ]},
+  {"title": "Status bar (SweetSB)", "footer": "Size flags: read when the status bar is built. Respring.", "knobs": [
+   {"id": "sbx", "title": "Clock shift right, pt", "kind": "size", "file": "/var/local/sweetsb.x", "base": 100, "scale": 1, "type": "int", "min": -40, "max": 60, "step": 1, "unset": true, "effect": "respring"},
+   {"id": "sbxm", "title": "Clock shift method", "kind": "size", "file": "/var/local/sweetsb.xm", "base": 100, "scale": 1, "type": "enum", "unset": true, "effect": "respring", "options": [{"v": 1, "t": "1: move item centres (hides the clock)"}, {"v": 2, "t": "2: move the layout guide"}]},
+   {"id": "sby", "title": "Both sides down, pt", "kind": "size", "file": "/var/local/sweetsb.y", "base": 100, "scale": 2, "type": "int", "min": -10, "max": 20, "step": 0.5, "unset": true, "effect": "respring"},
+   {"id": "sbr", "title": "Right side inward, pt", "kind": "size", "file": "/var/local/sweetsb.r", "base": 100, "scale": 2, "type": "int", "min": -10, "max": 30, "step": 0.5, "unset": true, "effect": "respring"}
+  ]},
+  {"title": "Radio (wland)", "footer": "wland can't restart in place: these apply at the next boot.", "knobs": [
+   {"id": "wlht", "title": "Wi-Fi HT (802.11n)", "kind": "kv", "file": "/var/local/wland.conf", "key": "ht", "type": "bool", "unset": true, "effect": "reboot"},
+   {"id": "wlrole", "title": "Foreground role", "kind": "kv", "file": "/var/local/wland.conf", "key": "role", "type": "bool", "unset": true, "effect": "reboot"},
+   {"id": "cellon", "title": "Modem client (cell.on)", "kind": "flag", "file": "/var/local/cell.on", "type": "bool", "effect": "live", "desc": "Read-only modem client. Polled every 30 s."}
+  ]},
+  {"title": "Hardware", "knobs": [
+   {"id": "torch", "title": "Torch level", "kind": "sysctl", "name": "kern.sweet_torch", "type": "int", "min": 0, "max": 1000, "step": 50, "effect": "live", "nopin": true},
+   {"id": "haptic", "title": "Test vibration (ms)", "kind": "sysctl", "name": "kern.sweet_haptic", "type": "int", "min": 0, "max": 2000, "step": 20, "effect": "live", "nopin": true, "noread": true, "desc": "Writes ms | strength << 16 (strength 0 = default)."}
+  ]},
+  {"title": "Status (read-only)", "knobs": [
+   {"id": "i.fps", "title": "Panel frames", "kind": "info", "name": "kern.sweet_fb_frames"},
+   {"id": "i.hz", "title": "Panel Hz", "kind": "info", "name": "kern.sweet_fb_hz"},
+   {"id": "i.gpu", "title": "GPU MHz", "kind": "info", "name": "kern.sweet_gpu_mhz"},
+   {"id": "i.tmax", "title": "Hottest, °C", "kind": "info", "name": "kern.sweet_temp_max", "div": 10},
+   {"id": "i.tprime", "title": "CPU7 prime, °C", "kind": "info", "name": "kern.sweet_temp_prime", "div": 10},
+   {"id": "i.tgold", "title": "CPU6 gold, °C", "kind": "info", "name": "kern.sweet_temp_gold", "div": 10},
+   {"id": "i.tsilver", "title": "A55 hottest, °C", "kind": "info", "name": "kern.sweet_temp_silver", "div": 10},
+   {"id": "i.tgpu", "title": "GPU, °C", "kind": "info", "name": "kern.sweet_temp_gpu", "div": 10},
+   {"id": "i.tddr", "title": "DDR, °C", "kind": "info", "name": "kern.sweet_temp_ddr", "div": 10},
+   {"id": "i.rssi", "title": "Wi-Fi dBm", "kind": "info", "name": "kern.sweet_wifi_live_rssi"},
+   {"id": "i.ufsh", "title": "UFS guard hits", "kind": "info", "name": "kern.sweet_ufs_guard_hits"},
+   {"id": "i.usbr", "title": "USB resets / stuck", "kind": "info", "name": "kern.sweet_usb_resets"},
+   {"id": "i.mem", "title": "RAM (MB)", "kind": "info", "name": "hw.memsize", "div": 1048576},
+   {"id": "i.os", "title": "Kernel", "kind": "info", "name": "kern.version"}
+  ]}
+ ],
+ "actions": [
+  {"id": "respring", "title": "Respring", "cmd": ["respring"], "desc": "Restart SpringBoard"},
+  {"id": "render", "title": "Restart render server", "cmd": ["render"], "desc": "backboardd: Metal env, CA env. SpringBoard and apps restart too."},
+  {"id": "d.sensd", "title": "Restart sensd", "cmd": ["kill", "sensd"]},
+  {"id": "d.btd", "title": "Restart btd", "cmd": ["kill", "btd"]},
+  {"id": "d.fastrpcd", "title": "Restart fastrpcd", "cmd": ["kill", "fastrpcd"]},
+  {"id": "d.sweetmon", "title": "Restart sweetmon", "cmd": ["kill", "sweetmon"]},
+  {"id": "bootapply", "title": "Apply pinned values now", "cmd": ["boot-apply"]},
+  {"id": "userspace", "title": "Userspace reboot", "cmd": ["userspace-reboot"], "confirm": "All of userland restarts on the same kernel. Live sysctls stay. Experimental on this port.", "danger": true},
+  {"id": "reboot", "title": "Full reboot", "cmd": ["reboot"], "confirm": "The phone reboots out of the RAM-booted image. You'll need to fastboot boot it again.", "danger": true}
+ ]
+}
