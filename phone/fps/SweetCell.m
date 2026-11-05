@@ -450,6 +450,7 @@ sc_install(void)
 
 static void sc_dump_view(id v);
 static id sc_sigview_get(void);
+static void sc_dump_all(void);
 
 static void
 sc_poll(void)
@@ -492,8 +493,8 @@ sc_poll(void)
 	}
 	static unsigned polls;
 	struct stat dv;
-	if (++polls % 4 == 0 && stat("/var/local/sweetcell.dumpview", &dv) == 0 && sc_sigview_get() != nil) {
-		sc_dump_view(sc_sigview_get());
+	if (++polls % 4 == 0 && stat("/var/local/sweetcell.dumpview", &dv) == 0) {
+		sc_dump_all();
 	}
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		@try {
@@ -548,6 +549,50 @@ sc_dump_view(id v)
 		    sl.opacity, sl.hidden, nc, nc ? c[0] : -1.0, nc ? c[nc - 1] : -1.0, sl.animationKeys];
 	}
 	sc_ui_log(o);
+}
+
+/* every _UIStatusBarCellularSignalView in every window: window-space frame, and why it might not show */
+static void
+sc_walk(UIView *v, NSMutableArray *found)
+{
+	if ([NSStringFromClass([v class]) isEqualToString:@"_UIStatusBarCellularSignalView"]) {
+		[found addObject:v];
+	}
+	for (UIView *c in v.subviews) {
+		sc_walk(c, found);
+	}
+}
+
+static void
+sc_dump_all(void)
+{
+	NSMutableArray *found = [NSMutableArray array];
+	NSMutableArray *wins = [NSMutableArray array];
+	for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+		if ([sc isKindOfClass:[UIWindowScene class]]) {
+			[wins addObjectsFromArray:((UIWindowScene *)sc).windows];
+		}
+	}
+	for (UIWindow *w in wins) {
+		sc_walk(w, found);
+	}
+	sc_ui_log([NSString stringWithFormat:@"%lu windows, %lu cellular signal views", (unsigned long)wins.count,
+	    (unsigned long)found.count]);
+	for (UIView *v in found) {
+		CGRect r = [v convertRect:v.bounds toView:nil];
+		NSMutableString *chain = [NSMutableString string];
+		for (UIView *a = v; a != nil; a = a.superview) {
+			if (a.hidden || a.alpha < 0.99 || a.layer.opacity < 0.99 || a.layer.mask != nil || a.clipsToBounds) {
+				[chain appendFormat:@" [%s h%d a%.2f op%.2f mask%d clip%d (%.0f %.0f %.0f %.0f)]", object_getClassName(a),
+				    a.hidden, a.alpha, a.layer.opacity, a.layer.mask != nil, a.clipsToBounds, a.frame.origin.x,
+				    a.frame.origin.y, a.frame.size.width, a.frame.size.height];
+			}
+		}
+		sc_ui_log([NSString stringWithFormat:@"  view %p in window %s (level %.0f, hidden %d): (%.1f %.1f %.1f %.1f) superview %s; %@",
+		    v, object_getClassName(v.window), v.window.windowLevel, v.window.hidden, r.origin.x, r.origin.y, r.size.width,
+		    r.size.height, object_getClassName(v.superview), chain.length ? chain : @"no hidden/alpha/clip ancestors"]);
+		sc_dump_view(v);
+	}
 }
 
 static void
