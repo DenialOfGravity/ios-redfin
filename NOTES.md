@@ -436,6 +436,7 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   `cell: wds settings ip=... gw=... dns1=... mtu=... fam=...`; status gets ` x1=idle|started|settings-ok|stopped|err0xE(end
   N/T:R)|...`. Never repeated; no IPA, no data path.
 - cell (ws-n-wds, safety switches): `nolte=1` / `csonly=1` in cell.on: once per wland run (once more per cell.on change), as
+- cell.c `domain=N` (ws-n-wds): NAS 0x33 TLV 0x18 Service Domain Preference = N instead of csonly's 0 (3 PS attach, 4 PS detach); 2026-11-05: csonly=1 alone did not stop the ps_rm ERR-FATAL (modem still attached PS on GSM and crashed 13 s after registering).
   soon as NAS is up and before the online write or any PIN verify (both held until it is answered, max 10 s): WRITE NAS Set
   System Selection Preference 0x33 with 0x11 mode u16 = 0x000c GSM|UMTS (nolte), 0x18 service domain u32 = 0 CS only
   (csonly), 0x17 change duration u8 = 0 power cycle; one message for both. Then Get 0x34 once: `cell: nas sys-sel mode=0x0c

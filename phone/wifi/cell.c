@@ -20,7 +20,7 @@
  *        always change duration = power cycle), then NAS Get System Selection Preference 0x34 once. Keeps the modem
  *        off LTE/NR and packet-data bring-up (no IPA driver yet: the modem dies with ERR-FATAL ps_rm 0xd1 registering
  *        LTE). Appends " sysel=<mode>/<domain>" to the status line.
- * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 datatest=1 nolte=1 csonly=1 (writes; see
+ * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 datatest=1 nolte=1 csonly=1 domain=N (writes; see
  * maybe_write, the PIN section, the X1 section and the SS section), apn=... ipfam=4|6 (X1 parameters). Message ids and
  * TLV layouts: libqmi data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
  * No Network Register, no SMS/voice, no NAS write except SS's system selection, no WDS write except X1's Start/Stop
@@ -63,6 +63,7 @@ static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 };
 #define NSTEPS (int)(sizeof(steps) / sizeof(steps[0]))
 
+static unsigned ss_dom;	/* domain=N (default 0 = CS only) */
 static int enabled, opts, allowed, step = -1, done_once[NSTEPS], fails[NSTEPS], timeouts;
 static uint64_t allow_ms, first_poll, next_send;
 static uint16_t txn = 1, want_txn;
@@ -758,6 +759,14 @@ static int read_opts(void)
 		o |= OPT_NOLTE;
 	if (strstr(b, "csonly=1"))
 		o |= OPT_CSONLY;
+	ss_dom = 0;
+	const char *dw = strstr(b, "domain=");
+	if (dw && dw[7] >= '0' && dw[7] <= '4') {
+		/* domain=N: Service Domain Preference value instead of csonly's 0 (0 CS only, 1 PS only, 2 CS+PS,
+		 * 3 PS attach, 4 PS detach; QmiNasServiceDomainPreference). Implies csonly=1's write. */
+		ss_dom = (unsigned)(dw[7] - '0');
+		o |= OPT_CSONLY;
+	}
 	if (strstr(b, "online=1"))
 		o |= OPT_ONLINE;
 	else if (strstr(b, "online=0"))
@@ -1160,7 +1169,7 @@ static int ss_send(uint16_t id)
 		}
 		qmi_tlv_u8(q, 0x17, 0);			/* power cycle */
 		if (opts & OPT_CSONLY)
-			qmi_tlv_u32(q, 0x18, 0);	/* CS only */
+			qmi_tlv_u32(q, 0x18, ss_dom);	/* 0 CS only (csonly=1) or domain=N */
 	}
 	size_t len = qmi_finish(q);
 	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[SVC_NAS].node, srv[SVC_NAS].port, q->b, (uint32_t)len);
@@ -1172,7 +1181,7 @@ static int ss_send(uint16_t id)
 
 static void ss_wanted(char *d, size_t n)
 {
-	snprintf(d, n, "mode=%s domain=%s", opts & OPT_NOLTE ? "0x000c(gsm+umts)" : "any", opts & OPT_CSONLY ? "cs" : "any");
+	snprintf(d, n, "mode=%s domain=%s", opts & OPT_NOLTE ? "0x000c(gsm+umts)" : "any", opts & OPT_CSONLY ? (ss_dom == 0 ? "cs" : ss_dom == 1 ? "ps" : ss_dom == 2 ? "cs+ps" : ss_dom == 3 ? "ps-attach" : "ps-detach") : "any");
 }
 
 static void ss_answer(const struct qmi_msg *m)
@@ -1228,7 +1237,7 @@ static void ss_answer(const struct qmi_msg *m)
 		ss_modes(x, sizeof(x), dis);
 		snprintf(dm, sizeof(dm), " disabled=0x%02x(%s)", dis, x);
 	}
-	int bad = ((opts & OPT_NOLTE) && (!have_mode || mode != SS_MODE)) || ((opts & OPT_CSONLY) && (!have_dom || dom != 0));
+	int bad = ((opts & OPT_NOLTE) && (!have_mode || mode != SS_MODE)) || ((opts & OPT_CSONLY) && ss_dom <= 2 && (!have_dom || dom != ss_dom));
 	char ms[16] = "-", ds[16] = "-";
 	if (have_mode)
 		snprintf(ms, sizeof(ms), "0x%02x", mode);
