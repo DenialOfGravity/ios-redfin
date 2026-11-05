@@ -189,6 +189,7 @@ ct_protocols(void)
 			[args appendFormat:@" %s=%llu", t, v];
 		}
 	}
+	ct_write([NSString stringWithFormat:@"ct %s%@", sel, args]);
 	BOOL known = NO;
 	for (NSUInteger i = 2; i < ms.numberOfArguments; i++) {
 		const char *t = [ms getArgumentTypeAtIndex:i];
@@ -202,6 +203,7 @@ ct_protocols(void)
 			continue;
 		}
 		NSInvocation *bi = [NSInvocation invocationWithMethodSignature:bs];
+		[bi retainArguments];	/* the answers are autoreleased/local: the invocation must own them */
 		bi.target = blk;
 		for (NSUInteger a = 1; a < bs.numberOfArguments; a++) {
 			if (ct_answer(sel, bi, a, [bs getArgumentTypeAtIndex:a])) {
@@ -216,7 +218,9 @@ ct_protocols(void)
 			[inv setReturnValue:zero];
 		}
 	}
-	ct_write([NSString stringWithFormat:@"ct %s%@%s", sel, args, known ? " -> answered" : ""]);
+	if (known) {
+		ct_write([NSString stringWithFormat:@"   %s answered", sel]);
+	}
 }
 
 - (BOOL)respondsToSelector:(SEL)sel
