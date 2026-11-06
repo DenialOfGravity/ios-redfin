@@ -1,6 +1,6 @@
 #!/bin/bash
 # Local builds: the same steps as .github/workflows/{shim,userland,metal2,xnu}.yml, on Linux.
-#   build.sh TARGET [REF]       TARGET shim | userland | metal2 | xnu;  REF branch or commit (default redfin-qol)
+#   build.sh TARGET [REF]       TARGET shim | userland | metal2 | hmetal | xnu;  REF branch or commit (default redfin-qol)
 # Source: REF of DenialOfGravity/ios-flame-redfin, fetched fresh each run into $WORK/TARGET/repo (the build trees
 # beside it are kept, so rebuilds are incremental). Result: $P/builds/TARGET/<REF>-<sha>/ (+ BUILD.txt, build.log).
 # Env: XNU_CLEAN=1 (xnu: ignore the incremental tree), XNU_KEEP_GOING=0 (stop at the first error), JOBS=N.
@@ -166,6 +166,15 @@ build_metal2() {
 		codesign -f -s - phone/turnip/out/v2test || true
 	(cd phone/metal2/out && tar cf - --exclude='*.dSYM' .) | tar xf - -C "$OUT"; mkdir -p "$OUT/turnip"	# dSYM (190 MB) stays in WSL; cp -R phone/turnip/out/. "$OUT/turnip/" 2>/dev/null
 	[ -d "$OUT/SweetMetal2.bundle" ]
+}
+
+# ---- hmetal (hakios-metal on NativeAdreno: phone/hmetal/build.sh; no CI workflow) ----
+build_hmetal() {
+	ios_env
+	cd "$R"
+	sh phone/hmetal/build.sh || return 1
+	cp phone/hmetal/out/libhakios-metal.a phone/hmetal/out/hakios-metal-probe phone/hmetal/out/SHA256SUMS phone/hmetal/out/hmetal-host-tests.txt "$OUT/"
+	[ -f "$OUT/hakios-metal-probe" ]
 }
 
 # ---- xnu (xnu.yml) ----
