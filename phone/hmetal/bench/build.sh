@@ -48,7 +48,17 @@ strip -x "$B/HakiosMetal" 2>/dev/null || true
 cp Info.plist "$B/Info.plist"
 codesign -f -s - "$B" 2>/dev/null || codesign -f -s - "$B/HakiosMetal" 2>/dev/null || true
 nm -u "$B/HakiosMetal" 2>/dev/null | grep -c . | sed 's/^/HakiosMetal: undefined symbols: /' || true
+# 4. (H3) the SweetMetal2 stand-in for the window-server test (bench/m2shim.m): -> /System/Library/Extensions/SweetMetal2.bundle
+#    for the test only, the real bundle kept at /var/local/SweetMetal2.bundle.pre-hmca
+S=$O/SweetMetal2-shim.bundle
+rm -rf "$S" && mkdir -p "$S"
+"$CC" -x objective-c -fno-objc-arc -O2 -g -Wall -Wno-deprecated-declarations -bundle -o "$S/SweetMetal2" m2shim.m \
+	-lobjc -framework Foundation -framework Metal 2>&1 | grep -v "was built for newer 'iOS' version" || true
+[ -f "$S/SweetMetal2" ]
+strip -x "$S/SweetMetal2" 2>/dev/null || true
+cp m2shim.plist "$S/Info.plist"
+codesign -f -s - "$S" 2>/dev/null || codesign -f -s - "$S/SweetMetal2" 2>/dev/null || true
 rm -rf "$O/obj"
-(cd "$O" && { sha256sum hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal 2>/dev/null ||
-	shasum -a 256 hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal; }) > "$O/SHA256SUMS"
-ls -la "$O" "$B"
+(cd "$O" && { sha256sum hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2 2>/dev/null ||
+	shasum -a 256 hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2; }) > "$O/SHA256SUMS"
+ls -la "$O" "$B" "$S"
