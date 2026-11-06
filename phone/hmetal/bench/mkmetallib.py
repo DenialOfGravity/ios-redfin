@@ -4,12 +4,14 @@
 TYPE: vertex | fragment | kernel. FILE.bc: llvm-as output of a hand-written AIR .ll (hakios-metal tools/kernels style).
 The layout is the one metal2vulkan's container parser and its corpus writer use (crates/metal2vulkan-air/src/container/
 mtlb.rs, corpus-harvest.rs metallib()) and hakios-metal's MetalLibrary reads (src/metallib.cpp):
-  0x00 'MTLB'; u16 platform 0x8001; u16 u16 container version; u8 file type (0 executable); u8 os; u16 u16 os version;
+  0x00 'MTLB'; u16 platform (0x0001; 0x8001 is a macOS file's); u16 u16 container version (2.7); u8 file type (0 executable); u8 os; u16 u16 os version;
   0x10 u64 file size; then (offset, size) u64 pairs: function list entries, public metadata, private metadata, bitcode.
   0x58 u32 function count, entries (u32 size counting itself, tags NAME TYPE HASH MDSZ OFFT VERS, ENDT), the header
   extension (ENDT alone), per function an empty public and private metadata record (u32 4 + ENDT), the bitcode, each
   module in LLVM's 0x0B17C0DE wrapper (offset 0x14, cputype -1) as Apple's toolchain stores AIR.
-Ours, MIT. Env MTLB_OS=0x82 (iOS), MTLB_OS_VERSION=16.0, MTLB_VERSION=2.6 change the header's values.
+The header's values are what iOS 16.7's own libraries carry (their first 16 bytes, read on the phone: 01 00 02 00 07 00
+00 82 10 00 07 00; Metal refuses 0x8001 / 2.6 with "This library format is not supported on this platform").
+Ours, MIT. Env MTLB_PLATFORM=0x0001, MTLB_OS=0x82 (iOS), MTLB_OS_VERSION=16.0, MTLB_VERSION=2.7 change them.
 """
 import hashlib
 import os
@@ -43,7 +45,8 @@ def build(functions):
         return int(a), int(b)
     os_byte = int(os.environ.get('MTLB_OS', '0x82'), 0)
     osv = ver('MTLB_OS_VERSION', '16.0')
-    cv = ver('MTLB_VERSION', '2.6')
+    cv = ver('MTLB_VERSION', '2.7')
+    platform = int(os.environ.get('MTLB_PLATFORM', '0x0001'), 0)
     empty = struct.pack('<I', 4) + b'ENDT'
     public = private = bitcode = b''
     entries = []
@@ -63,7 +66,7 @@ def build(functions):
     prv_off = pub_off + len(public)
     bc_off = prv_off + len(private)
     total = bc_off + len(bitcode)
-    head = b'MTLB' + struct.pack('<HHHBBHH', 0x8001, cv[0], cv[1], 0, os_byte, osv[0], osv[1])
+    head = b'MTLB' + struct.pack('<HHHBBHH', platform, cv[0], cv[1], 0, os_byte, osv[0], osv[1])
     head += struct.pack('<9Q', total, list_off, elen, pub_off, len(public), prv_off, len(private), bc_off, len(bitcode))
     out = head + struct.pack('<I', len(functions)) + b''.join(entries) + b'ENDT' + public + private + bitcode
     assert len(head) == 0x58 and len(out) == total
