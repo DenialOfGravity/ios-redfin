@@ -42,6 +42,7 @@
 #include "cell.h"
 #include "link.h"
 #include "qmi.h"
+#include "ipagsi.h"
 
 enum { SVC_DMS, SVC_NAS, SVC_UIM, SVC_WDS, SVC_DPM, SVC_WDA, NSVC };
 static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b, 0x01, 0x2f, 0x1a };
@@ -50,7 +51,7 @@ static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
 enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64, OPT_DATATEST = 128,
-       OPT_NOLTE = 256, OPT_CSONLY = 512 };
+       OPT_NOLTE = 256, OPT_CSONLY = 512, OPT_X1HOLD = 1024, OPT_IPADATA = 2048, OPT_IPACMD0 = 4096 };
 #define OPT_SS		(OPT_NOLTE | OPT_CSONLY)
 static int p1_known, p1_present, p1_active, cur_mode = -1;
 /* X1 preconditions from the last whole round (-1 = not answered this round) */
@@ -633,6 +634,10 @@ static void publish(void)
 		if (opts & OPT_DATATEST) {
 			size_t k = strlen(wds);
 			snprintf(wds + k, sizeof(wds) - k, " x1=%s", x1_res);
+			if (opts & OPT_IPADATA) {
+				k = strlen(wds);
+				snprintf(wds + k, sizeof(wds) - k, " ipadata=%s", ipagsi_state());
+			}
 		}
 	}
 	snprintf(line, sizeof(line), "%s %s %s | %s %s | %s bars=%d | model=%s hw=%s rev=%s imei=%s%s%s", f_sim, f_slots, f_mode, f_reg,
@@ -765,6 +770,12 @@ static int read_opts(void)
 		o |= OPT_NOLTE;
 	if (strstr(b, "csonly=1"))
 		o |= OPT_CSONLY;
+	if (strstr(b, "x1hold=1"))
+		o |= OPT_X1HOLD;	/* X1 keeps the call up while ipagsi runs (no 20 s stop) */
+	if (strstr(b, "ipadata=1"))
+		o |= OPT_IPADATA;	/* hand the call's settings to ipagsi.c */
+	if (strstr(b, "ipacmd=0"))
+		o |= OPT_IPACMD0;	/* ipagsi without the table init commands */
 	ss_dom = 0;
 	const char *dw = strstr(b, "domain=");
 	if (dw && dw[7] >= '0' && dw[7] <= '4') {
@@ -1524,6 +1535,36 @@ static int x1_ip6(char *d, size_t n, const struct qmi_msg *m, uint8_t t, int wit
 	return 1;
 }
 
+static int x1_holdlog;	/* "call kept up" logged once */
+
+/* ipadata=1: hand the call's IPv4 settings (Get Current Settings) to ipagsi.c; needs the data port (ipa_ok) */
+static void x1_ipagsi(const struct qmi_msg *m, uint64_t now)
+{
+	struct ipagsi_call c;
+	uint32_t v;
+	if (!(opts & OPT_IPADATA))
+		return;
+	if (!ipa_ok) {
+		printf("[%6llu] cell: x1: ipadata=1 but no IPA INIT_DRIVER accepted in this run: ipagsi not started\n",
+		       (unsigned long long)now);
+		return;
+	}
+	memset(&c, 0, sizeof(c));
+	if (!qmi_get_u32(m, 0x1e, &v))
+		c.ip = htonl(v);
+	if (!qmi_get_u32(m, 0x20, &v))
+		c.gw = htonl(v);
+	if (!qmi_get_u32(m, 0x21, &v))
+		c.mask = htonl(v);
+	if (!qmi_get_u32(m, 0x15, &v))
+		c.dns1 = htonl(v);
+	if (!qmi_get_u32(m, 0x16, &v))
+		c.dns2 = htonl(v);
+	if (!qmi_get_u32(m, 0x29, &v))
+		c.mtu = v;
+	ipagsi_start(&c, !(opts & OPT_IPACMD0));
+}
+
 static void x1_settings(const struct qmi_msg *m)
 {
 	char ip[24], gw[16], d1[16], d2[16], mtu[12] = "-", fam[8] = "-", pdp[12] = "-", v6[256] = "";
@@ -1615,9 +1656,11 @@ static void x1_answer(const struct qmi_msg *m)
 		else {
 			x1_settings(m);
 			snprintf(x1_res, sizeof(x1_res), "settings-ok");
+			x1_ipagsi(m, now);
 		}
 	} else if (m->id == 0x21) {
 		x1_state = X1_DONE;
+		ipagsi_stop("x1: call stopped");
 		if (e)
 			snprintf(x1_res, sizeof(x1_res), "stop-err%#x", e);
 		else
@@ -1644,6 +1687,7 @@ static void x1_lost(void)
 	x1_late = 0;
 	x1_state = X1_DONE;
 	snprintf(x1_res, sizeof(x1_res), "lost");
+	ipagsi_stop("x1: wds server gone");
 }
 
 /* from cell_poll; 1 = an X1 request is in flight or was just sent (nothing else goes out) */
@@ -1692,7 +1736,16 @@ static int x1_poll(uint64_t now)
 		x1_state = X1_WAIT;
 		return 0;
 	}
+	if (x1_state == X1_WAIT && now >= x1_stop_at && enabled && (opts & OPT_X1HOLD) && ipagsi_running()) {
+		if (!x1_holdlog)
+			printf("[%6llu] cell: x1: x1hold=1 and ipadata %s: call kept up (re-checked every 10 s)\n",
+			       (unsigned long long)now, ipagsi_state());
+		x1_holdlog = 1;
+		x1_stop_at = now + 10000;
+		return 0;
+	}
 	if (x1_state == X1_WAIT && now >= x1_stop_at) {
+		ipagsi_stop("x1: stopping the call");
 		printf("[%6llu] cell: WRITE wds stop network handle=%#x\n", (unsigned long long)now, x1_handle);
 		x1_state = X1_STOP;
 		if (!x1_send(0x21))
@@ -1871,6 +1924,9 @@ void cell_poll(void)
 			snprintf(x1_apn, sizeof(x1_apn), "%s", on ? rd_apn : "");
 			x1_fam = rd_fam;
 			x1_armed = on;		/* X1: one (more) attempt per cell.on change */
+			x1_holdlog = 0;
+			if (!on || !(opts & OPT_IPADATA))
+				ipagsi_stop(on ? "ipadata=1 gone from cell.on" : "cell.on gone");
 			nas_reg = nas_ps = x1_sim = -1;	/* X1 waits for a whole new round */
 			if (on && (opts & OPT_DATATEST))
 				printf("[%6llu] cell: x1 armed: datatest=1%s apn='%s'%s ipfam=%d\n", (unsigned long long)now,

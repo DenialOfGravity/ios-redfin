@@ -52,11 +52,12 @@ static uint16_t csum(const void *p, uint32_t len, uint32_t sum)
 	return (uint16_t)~sum;
 }
 
-static int tun_open(void)
+/* a new utunN (the kernel picks the unit), non-blocking; its name in name[n]. fd, or -1 (logged) */
+int ipnet_utun_open(char *name, size_t n)
 {
 	struct ctl_info ci;
 	struct sockaddr_ctl sc;
-	socklen_t nl = sizeof(tun_name);
+	socklen_t nl = (socklen_t)n;
 	int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
 	if (fd < 0) {
 		LOG("utun: socket: %s", strerror(errno));
@@ -65,6 +66,8 @@ static int tun_open(void)
 	memset(&ci, 0, sizeof(ci));
 	snprintf(ci.ctl_name, sizeof(ci.ctl_name), "com.apple.net.utun_control");
 	memset(&sc, 0, sizeof(sc));
+	if (n)
+		name[0] = 0;
 	if (ioctl(fd, CTLIOCGINFO, &ci) < 0)
 		goto fail;
 	sc.sc_len = sizeof(sc);
@@ -73,16 +76,78 @@ static int tun_open(void)
 	sc.sc_id = ci.ctl_id;
 	sc.sc_unit = 0;					/* the next free utunN */
 	if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) < 0 ||
-	    getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, tun_name, &nl) < 0)
+	    getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, name, &nl) < 0)
 		goto fail;
+	if (!n || !name[0]) {
+		errno = EINVAL;
+		goto fail;
+	}
 	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-	tun = fd;
-	LOG("utun: %s", tun_name);
-	return 0;
+	LOG("utun: %s", name);
+	return fd;
 fail:
 	LOG("utun: %s", strerror(errno));
 	close(fd);
 	return -1;
+}
+
+/* point to point IPv4 address ip -> peer (network order, mask /32), MTU (0 = leave), IFF_UP. 0, or -1 (logged) */
+int ipnet_utun_set(const char *name, uint32_t ip, uint32_t peer, unsigned mtu)
+{
+	struct ifaliasreq ifra;
+	struct ifreq ifr;
+	struct sockaddr_in *a;
+	int rc = -1, s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) {
+		LOG("%s: socket: %s", name, strerror(errno));
+		return -1;
+	}
+	memset(&ifra, 0, sizeof(ifra));
+	snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "%s", name);
+	a = (struct sockaddr_in *)&ifra.ifra_addr;
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = ip;
+	a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = peer;
+	a = (struct sockaddr_in *)&ifra.ifra_mask;
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = 0xffffffff;
+	if (ioctl(s, SIOCAIFADDR, &ifra) < 0) {
+		LOG("%s: SIOCAIFADDR: %s", name, strerror(errno));
+		goto out;
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name);
+	if (mtu) {
+		ifr.ifr_mtu = (int)mtu;
+		if (ioctl(s, SIOCSIFMTU, &ifr) < 0) {
+			LOG("%s: SIOCSIFMTU %u: %s", name, mtu, strerror(errno));
+			goto out;
+		}
+	}
+	if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0) {
+		LOG("%s: SIOCGIFFLAGS: %s", name, strerror(errno));
+		goto out;
+	}
+	ifr.ifr_flags |= IFF_UP;
+	if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
+		LOG("%s: SIOCSIFFLAGS: %s", name, strerror(errno));
+		goto out;
+	}
+	rc = 0;
+out:
+	close(s);
+	return rc;
+}
+
+static int tun_open(void)
+{
+	tun = ipnet_utun_open(tun_name, sizeof(tun_name));
+	return tun < 0 ? -1 : 0;
 }
 
 /* the lease on the utun (point to point to the router) and to configd */
