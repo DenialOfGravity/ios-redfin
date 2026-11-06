@@ -434,3 +434,5 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   (A/B), pvt_fill encoded with the chosen options, first wrong pixel/sample printed for tex_copy and the address-mode lines.
 - hmetal (ws-hm-fix, F2): private-memory experiments for the A620 compute hang (compute::Options pvtForcePerFiber /
   pvtFiberScale / pvtBufferScale, CommandQueue::privateMemoryScaled; defaults = Mesa's sizing), probe --pvt-only runs the variants.
+- hmetal (ws-hm-fix, F3): A620 wave-layout private memory sized for 2x fibersPerSp (ChipInfo::pvtPerWaveFiberScale; registers
+  and buffer): F2 on the phone hung at Mesa's sizing, ran with 4x buffer / 2x fibers / per-fiber layout. A635 unchanged.

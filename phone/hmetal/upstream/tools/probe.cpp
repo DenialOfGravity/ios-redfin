@@ -909,7 +909,7 @@ int main(int argc, char** argv) {
         compute::Options c = chosen;
         c.pvtFiberScale = 2;
         pvtFill(c, " [per-wave, 2x fibers an SP]");
-        pvtFill(chosen, " [as compiled: per-wave, Mesa's sizing]");
+        pvtFill(chosen, " [as compiled: per-wave, the chip's sizing (A620: 2x fibers)]");
         std::printf("probe: %d failure%s (--pvt-only)\n", failures, failures == 1 ? "" : "s");
         return failures == 0 ? 0 : 1;
     }

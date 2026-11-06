@@ -15,7 +15,7 @@ hakios' Metal driver core (C++; writes Adreno PM4 itself, Mesa only for ir3), po
 A620 (Mesa FD620 = a6xx_base + a6xx_gen1). The row is picked when a `Gpu` is made, from the chip id the transport
 reports (our kernel: 0x06020000, xnu/patches/0904). On the A620: no SP_CS_CNTL_0/1 or HLSQ_CS_CTRL_REG1 (gen4 only), no LRZ
 feedback mask, no early preamble, a 64-group program preload cap, RB_CCU_CNTL 0x08000000 (sysmem) / 0x3e400000 (GMEM),
-FD620's magic registers, PC/VFD_POWER_CNTL 0, 2048 fibers on 1 SP for private memory, CP_WAIT_FOR_ME before
+FD620's magic registers, PC/VFD_POWER_CNTL 0, 2048 fibers on 1 SP for private memory (4096 for the wave layout: probe F2), CP_WAIT_FOR_ME before
 indirect draws. Open: the cubic sampler filter is not refused on the A620 yet (A620 has no `has_tex_filter_cubic`), and
 RB_RENDER_CNTL is a plain register write (Mesa uses CP_REG_WRITE where `has_cp_reg_write`).
 

@@ -1451,6 +1451,11 @@ struct ChipInfo {
     // the indirect loads (constants, descriptors) read UCHE lines the dispatch's later invalidate had not yet dropped:
     // probe H2 read a reused constant buffer one dispatch late. Gallium/turnip both flush before emitting state.
     bool invalidateBeforeState;
+    // (redfin) the wave layout's (PERWAVEMEMLAYOUT) private memory sized for this many times fibersPerSp an SP, the
+    // registers too (TOTALPVTMEMSIZE, the stack offset). A620: 2. Probe F2 on the phone: a per-wave compute kernel at
+    // Mesa's sizing (512 B x 2048 fibers x 1 SP) hung the GPU; the same with 4x the buffer behind Mesa's registers, or
+    // with 2x fibers in the registers and buffer, or the per-fiber layout at Mesa's sizing, all ran every word right.
+    uint32_t pvtPerWaveFiberScale;
     uint32_t numCcu;
     uint32_t numSpCores;
     uint32_t fibersPerSp;
@@ -1471,7 +1476,7 @@ inline constexpr ChipInfo kChipA635{
     "a635 (Adreno 7c+ Gen 3)", kChipId, 0xffffffffu, 4,
     kHasLpac, /*hasLrzFeedback*/ true, kHasEarlyPreamble, /*hasCpRegWrite*/ false, kHasGmemFastClear, kConcurrentResolve,
     /*hasTexFilterCubic*/ true, kSupportsDoubleThreadsize, /*hasFsTexPrefetch*/ true,
-    /*indirectDrawWfmQuirk*/ false, /*depthBoundsRequireDepthTestQuirk*/ false, /*invalidateBeforeState*/ false,
+    /*indirectDrawWfmQuirk*/ false, /*depthBoundsRequireDepthTestQuirk*/ false, /*invalidateBeforeState*/ false, /*pvtPerWaveFiberScale*/ 1,
     kNumCcu, kNumSpCores, kFibersPerSp, kCsSharedMemSize, kWaveGranularity, kInstrCacheSize, /*regSizeVec4*/ 64,
     kSysmemPerCcuDepthCacheSize, kSysmemPerCcuColorCacheSize, kGmemBytes, kGmemCcuColorCacheFraction,
     kTileAlignW, kTileAlignH, kGmemAlignW, kGmemAlignH, kTileMaxW, kTileMaxH, /*numVscPipes*/ 32, /*hbb*/ 15,
@@ -1490,7 +1495,7 @@ inline constexpr ChipInfo kChipA620{
     "a620 (Adreno 620)", 0x06020000, 0xffffff00u, 1,
     /*hasLpac*/ false, /*hasLrzFeedback*/ false, /*hasEarlyPreamble*/ false, /*hasCpRegWrite*/ true, /*hasGmemFastClear*/ true,
     /*concurrentResolve*/ false, /*hasTexFilterCubic*/ false, /*supportsDoubleThreadsize*/ true, /*hasFsTexPrefetch*/ true,
-    /*indirectDrawWfmQuirk*/ true, /*depthBoundsRequireDepthTestQuirk*/ true, /*invalidateBeforeState*/ true,
+    /*indirectDrawWfmQuirk*/ true, /*depthBoundsRequireDepthTestQuirk*/ true, /*invalidateBeforeState*/ true, /*pvtPerWaveFiberScale*/ 2,
     /*numCcu*/ 1, /*numSpCores*/ 1, /*fibersPerSp*/ 128 * 16, /*csSharedMemSize*/ 32 * 1024, /*waveGranularity*/ 2,
     /*instrCacheSize*/ 64, /*regSizeVec4*/ 96, 0x10000, 0x10000, /*gmemBytes*/ 512 * 1024, /*QUARTER*/ 4,
     32, 16, 16, 4, 1024, 1008, /*numVscPipes*/ 32, /*hbb (Mesa default)*/ 15,

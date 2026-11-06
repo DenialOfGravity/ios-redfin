@@ -219,6 +219,13 @@ TEST(the_private_memory_experiments_bind_what_they_say) {
     Encoded e(r, k, kGroups16, nullptr, b, o);
     CHECK(e.ok);
     CHECK_EQ(e.stream.words()[e.findReg(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3)] & A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT, 0u);
+    // the wave layout at the chip's sizing: Mesa's on the A635, twice the fibers on the A620 (probe F2); per fiber Mesa's
+    PrivateMemory w;
+    auto wave = r.queue->privateMemory(512, true, &w, &why);
+    CHECK(wave != nullptr && w.perWave);
+    CHECK_EQ(w.perSp, 512u * chip().fibersPerSp * (chip().chipId == kChipA635.chipId ? 1u : 2u));
+    CHECK_EQ(wave->length(), uint64_t(w.perSp) * chip().numSpCores);
+    CHECK_EQ(pm.perSp, 512u * chip().fibersPerSp);
     PrivateMemory s2;
     auto scaled = r.queue->privateMemoryScaled(512, true, 2, 3, &s2, &why);
     CHECK(scaled != nullptr);
