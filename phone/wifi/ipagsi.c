@@ -932,8 +932,11 @@ static int utun_up(void)
 		ctx.utun_fd = -1;
 		return -1;
 	}
-	LOG("utun %s up: ip %s gw %s mask %s mtu %u", ctx.utun_name, inet_ntoa(*(struct in_addr *) &ctx.call.ip),
-	    inet_ntoa(*(struct in_addr *) &ctx.call.gw), inet_ntoa(*(struct in_addr *) &ctx.call.mask), mtu);
+	char a_ip[16], a_gw[16], a_mask[16];	/* inet_ntoa() shares one buffer: three in one LOG printed the last */
+	inet_ntop(AF_INET, &ctx.call.ip, a_ip, sizeof(a_ip));
+	inet_ntop(AF_INET, &ctx.call.gw, a_gw, sizeof(a_gw));
+	inet_ntop(AF_INET, &ctx.call.mask, a_mask, sizeof(a_mask));
+	LOG("utun %s up: ip %s gw %s mask %s mtu %u", ctx.utun_name, a_ip, a_gw, a_mask, mtu);
 	return 0;
 }
 
