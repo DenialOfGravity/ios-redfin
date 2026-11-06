@@ -28,6 +28,7 @@
 #include "../tests/fixtures/end_only.hpp"
 #include "../tests/fixtures/fill_id.hpp"
 #include "../tests/fixtures/fill_id_air.hpp"
+#include "../tests/fixtures/a620/fill_id_air.hpp"
 #include "../tests/fixtures/chain160_air.hpp"
 #include "../tests/fixtures/chain220_air.hpp"
 #include "../tests/fixtures/long_chain_air.hpp"
@@ -780,7 +781,8 @@ int main(int argc, char** argv) {
             report(false, "compile fill_id.ll on the phone: " + why2);
         } else {
             const Kernel& a = compiled->kernel;
-            const Kernel& b = kernels::fill_id_air;
+            // (redfin) the host compiler's words for this chip (tests/fixtures/a620/ on the A620)
+            const Kernel& b = a6xx::chip().chipId == a6xx::kChipA620.chipId ? kernels::a620::fill_id_air : kernels::fill_id_air;
             bool sameWords = a.numWords == b.numWords && memcmp(a.words, b.words, 4 * a.numWords) == 0;
             bool sameLayout = a.instrlen == b.instrlen && a.constlen == b.constlen && a.maxReg == b.maxReg &&
                               a.localIdRegid == b.localIdRegid && a.workGroupIdRegid == b.workGroupIdRegid &&

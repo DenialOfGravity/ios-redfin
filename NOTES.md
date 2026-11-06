@@ -429,4 +429,9 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Imported BOs: dc civac before each submit naming them and after the fence for written ones (kernel does no maintenance).
   openNativeAdrenoGpu() under -DHAKIOS_METAL_NATIVE_ADRENO (c_api, probe). Host: redfin/tests shim + fake v2 client;
   phone/hmetal/build.sh (iOS lib + probe, host tests first), README.md (H2 steps, not run).
+- hmetal MESA=1 (ws-hm-mesa): phone/hmetal/mesa = hakios-xnu-kernel 2631f5d tools/mesa (AIR front end air/, its Mesa 25.0.7
+  patches, hakios-drm; MIT) + build-mesa.sh (host + iOS arm64 static Mesa libs, localbuild `build hmesa`) + gen-fixtures.sh
+  (A620 compiler fixtures, A635 re-check); phone/hmetal/build.sh MESA=1 links the compiler (localbuild `build hmetal-mesa`).
+- hmetal (ws-hm-mesa): tests/fixtures/a620/*_air.hpp (59, host ir3_compiler --chip-id 0x06020000, ns kernels::a620); compiler_test
+  FIX() and probe stage 6 pick the running chip's fixture (A635 fixtures re-made by our Mesa: 59/59 bit-identical to hakios').
 - hmbench (ws-hm-bench): phone/hmetal/bench: one Metal workload (W1-W4) on SweetMetal2 or hakios-metal (HakiosMetalCA.m fetched at 2631f5d + 3 edits, over libhakios-metal.a), own MTLB writer for hakios' AIR kernels; built by phone/hmetal/build.sh step 4.

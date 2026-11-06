@@ -5,6 +5,7 @@
 #                         by bench/mkmetallib.py (llvm-as of the .ll; no Apple tool, no Apple metallib) -> /var/local/hmetal/
 #   HakiosMetal.bundle    hakios' render-capable plug-in (HakiosMetalCA.m, fetched at the pinned commit, never committed;
 #                         bench/plugin.py's three edits) over out/libhakios-metal.a -> /var/local/hmetal/HakiosMetal.bundle
+# HMB_LIBS: Mesa's archives when the library is built with MESA=1 (phone/hmetal/build.sh passes its LIBS).
 # Needs: $CC (ios-cc), llvm-as (LLVM 15+: opaque pointers), python3, curl (or HMB_CA_SRC=FILE).
 set -e
 cd "$(dirname "$0")"
@@ -40,7 +41,7 @@ B=$O/HakiosMetal.bundle
 rm -rf "$B" && mkdir -p "$B"
 U=""; for s in open first_problem status formats variant_hook; do U="$U -Wl,-U,_native_bridge_metal_$s"; done
 "$CC" -x objective-c -fno-objc-arc -O2 -g -w -bundle -I$UP/include -o "$B/HakiosMetal" "$O/obj/HakiosMetalCA.m" \
-	-x none ../out/libhakios-metal.a -lc++ -lobjc $U -framework Foundation -framework IOKit -framework IOSurface \
+	-x none ../out/libhakios-metal.a ${HMB_LIBS:-} -lc++ -lobjc $U -framework Foundation -framework IOKit -framework IOSurface \
 	-framework Metal -framework CoreFoundation 2>&1 | grep -v "was built for newer 'iOS' version" || true
 [ -f "$B/HakiosMetal" ]
 strip -x "$B/HakiosMetal" 2>/dev/null || true
