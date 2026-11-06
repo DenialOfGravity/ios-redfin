@@ -26,6 +26,16 @@ are `gcc -fsyntax-only` on Linux, which validates the C but not the register val
 ios-cc ... -DIPAGSI_PHASE=2 ipagsi.c ...      # phase 2
 ```
 
+**Phase 0 (`ipaphase=0` in cell.on, run time, any build).** The ws-n-ipa-plumb test merged in
+(2026-11-06): no GSI or IPA access at all; ipagsi only opens and configures the utun and counts and
+drops what the stack sends to it (`phase 0 utunN: tx ... pkts` every 10 s). Proven on the phone at
+ws-n-ipa-plumb a5f1e36 (r5au1). Use it as the fallback when a phase 1/2 build misbehaves.
+
+Two cell.c changes came in with it: ipagsi is only started when this boot's `ipa=1` bring-up had
+INIT_DRIVER accepted (`ipa_ok`), and with `ipadata=1` the `x1hold=1` hold lasts only while
+ipagsi is running, so a failed setup releases the call as described below (`x1hold=1` without
+`ipadata=1` still holds the call by itself).
+
 **Phase 1 (default, the one to run first).** GSI only. Check GSI (`GSI_STATUS`, `HW_PARAM_2`, the
 current state of channels 0-7 and event rings 0-3), allocate + program + start event rings 2 and 3
 and channels 2 (AP_MODEM_TX) and 7 (AP_MODEM_RX), allocate event ring 0 / channel 5 only when

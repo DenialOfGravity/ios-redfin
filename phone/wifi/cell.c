@@ -1597,7 +1597,10 @@ static void x1_settings(const struct qmi_msg *m)
 	if (opts & OPT_IPADATA) {
 		struct ipagsi_call c;
 
-		if (x1_call_settings(m, &c))
+		if (!ipa_ok)	/* GSI/IPA access needs this boot's IPA bring-up (IP0, firmware, SMMU, INIT_DRIVER) */
+			printf("[%6llu] cell: ipadata: no IPA INIT_DRIVER accepted in this run (ipa=1): not starting\n",
+			       (unsigned long long)link_ms());
+		else if (x1_call_settings(m, &c))
 			ipagsi_start(&c, !!(opts & OPT_IPACMD));
 	}
 }
@@ -1695,11 +1698,14 @@ static void x1_lost(void)
 	snprintf(x1_res, sizeof(x1_res), "lost");
 }
 
-/* is the call still needed?  ipagsi keeps it while its data path runs (ipagsi_stop() clears that,
- * and cell.on losing ipadata=1 calls it), and x1hold=1 asks for it until cell.on goes away */
+/* is the call still needed?  x1hold=1 asks for it; with ipadata=1 only while the data path runs
+ * (a failed or stopped setup releases the call, as README.ipagsi.md says); without ipadata=1,
+ * x1hold=1 alone keeps it until cell.on changes */
 static int x1_held(void)
 {
-	return (opts & OPT_X1HOLD) || ipagsi_running();
+	if (!(opts & OPT_X1HOLD))
+		return 0;
+	return !(opts & OPT_IPADATA) || ipagsi_running();
 }
 
 /* from cell_poll; 1 = an X1 request is in flight or was just sent (nothing else goes out) */

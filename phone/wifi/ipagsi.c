@@ -34,6 +34,7 @@
 #include "link.h"
 #include "ipagsi.h"
 #include "ipnet.h"
+#include "cell.h"
 
 #ifndef IPAGSI_PHASE
 #define IPAGSI_PHASE	1	/* 1 = GSI only + IPA dump, 2 = also program the IPA endpoints.
@@ -944,6 +945,52 @@ static int utun_up(void)
  */
 
 static int ever_ran;		/* setup has run once, successfully or not */
+static int phase0;		/* ipaphase=0 in cell.on: utun-only plumbing mode, no GSI/IPA access at all */
+static unsigned long long p0_bytes;
+static unsigned p0_v4, p0_v6, p0_bad;
+
+/* ipaphase=0 in cell.on picks the utun-only mode at run time (the ws-n-ipa-plumb test, 2026-11-06);
+ * anything else runs the compiled IPAGSI_PHASE */
+static int read_phase0(void)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	return strstr(b, "ipaphase=0") != NULL;
+}
+
+/* phase 0: drain the utun so the stack doesn't queue up; count and drop */
+static void p0_drain(void)
+{
+	static uint8_t pkt[2048];
+	for (int i = 0; i < 64 && ctx.utun_fd >= 0; i++) {
+		ssize_t n = read(ctx.utun_fd, pkt, sizeof(pkt));
+		uint32_t af;
+		if (n < 0) {
+			if (errno != EAGAIN && errno != EWOULDBLOCK)
+				ctx.tx_err++;
+			return;
+		}
+		if (n <= 4)
+			return;
+		memcpy(&af, pkt, 4);
+		af = ntohl(af);
+		if (af == AF_INET)
+			p0_v4++;
+		else if (af == AF_INET6)
+			p0_v6++;
+		else {
+			p0_bad++;
+			continue;
+		}
+		ctx.tx_pkts++;
+		p0_bytes += (unsigned long long)(n - 4);
+	}
+}
 static int setup_step;		/* the setup-N we are in (0 before setup-1) */
 static char stbuf[16];		/* the state string that carries the step number */
 
@@ -981,6 +1028,21 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	ctx.rx_st = ctx.tx_st = qmap_zero;
 	ctx.rx_pkts = ctx.tx_pkts = ctx.rx_err = ctx.tx_err = ctx.tx_other = 0;
 	ctx.stat_ms = link_ms();
+	phase0 = read_phase0();
+	p0_bytes = 0;
+	p0_v4 = p0_v6 = p0_bad = 0;
+	if (phase0) {
+		LOG("ipaphase=0: utun only, no GSI/IPA access (plumbing mode)");
+		set_state("setup-4");
+		if (utun_up()) {
+			fail_state();
+			return;
+		}
+		set_state("up");
+		ctx.active = 1;
+		LOG("up (phase 0, packets sent to %s are counted and dropped)", ctx.utun_name);
+		return;
+	}
 	set_state("setup-1");
 
 	if (gsi_check()) {
@@ -1070,6 +1132,15 @@ void ipagsi_poll(void)
 {
 	if (!ctx.active)
 		return;
+	if (phase0) {
+		p0_drain();
+		if (link_ms() - ctx.stat_ms >= 10000) {
+			ctx.stat_ms = link_ms();
+			LOG("phase 0 %s: tx %u pkts %llu B (v4 %u v6 %u bad-af %u) read-err %u", ctx.utun_name, ctx.tx_pkts,
+			    p0_bytes, p0_v4, p0_v6, p0_bad, ctx.tx_err);
+		}
+		return;
+	}
 	rx_drain();
 	tx_drain();
 	tx_pump();
