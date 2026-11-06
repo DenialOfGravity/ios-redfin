@@ -32,6 +32,7 @@
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
+#include <objc/runtime.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,6 +198,28 @@ int main(int argc, char **argv)
 		double tDev = now_us() - t0;
 		if (!dev) { say("hmbench: -initWithAcceleratorPort: gave nil (see the plug-in's log)\n"); return 1; }
 		say("hmbench: device \"%s\" (%s) in %.1f ms\n", dev.name.UTF8String, object_getClassName(dev), tDev / 1000);
+		/* What MTLAddDevice does next for a plug-in's device: -[_MTLDevice initLimits] fills the base class's limits table
+		 * (supportsFamily: and friends read it; unfilled it is a NULL read). A device that is not an _MTLDevice of the
+		 * system's (SweetMetal2 hands out the frontend's own NativeBridgeMetalDevice) gets nothing here. */
+		{
+			Class base = NSClassFromString(@"_MTLDevice");
+			SEL il = sel_registerName("initLimits");
+			if (base && [(id)dev isKindOfClass:base] && [(id)dev respondsToSelector:il]) {
+				((void (*)(id, SEL))objc_msgSend)((id)dev, il);
+				say("hmbench: -[_MTLDevice initLimits] sent (what MTLAddDevice does)\n");
+			} else if (base && [(id)dev isKindOfClass:base]) {
+				unsigned n = 0;
+				Method *m = class_copyMethodList(base, &n);
+				say("hmbench: _MTLDevice has no -initLimits; its init/limit methods:");
+				for (unsigned i = 0; i < n; i++) {
+					const char *nm = sel_getName(method_getName(m[i]));
+					if (strcasestr(nm, "limit") || !strncmp(nm, "init", 4))
+						say(" %s", nm);
+				}
+				say("\n");
+				free(m);
+			}
+		}
 
 		id<MTLCommandQueue> q = [dev newCommandQueue];
 		if (!q) { say("hmbench: no command queue\n"); return 1; }
