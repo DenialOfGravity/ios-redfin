@@ -412,6 +412,16 @@ static int ch_start(int ch)
 		    rd32(GSI_CH_C_CNTXT_3(ch)), rd32(GSI_CH_C_QOS(ch)), rd32(GSI_CH_C_SCRATCH_0(ch)),
 		    rd32(GSI_CH_C_SCRATCH_1(ch)), rd32(GSI_CH_C_SCRATCH_2(ch)), rd32(GSI_CH_C_SCRATCH_3(ch)),
 		    rd32(GSI_BASE + 0x12200));
+		LOG("ch %d gsi irq: type %08x src_ch %08x src_ev %08x glob %08x gsi %08x scratch0 %08x status %08x",
+		    ch, rd32(GSI_BASE + 0x12080), rd32(GSI_BASE + 0x12090), rd32(GSI_BASE + 0x12094),
+		    rd32(GSI_BASE + 0x12100), rd32(GSI_BASE + 0x12118), rd32(GSI_BASE + 0x12400),
+		    rd32(GSI_STATUS));
+		/* keep watching for 2 s: does START complete late, or never? */
+		for (int i = 1; i <= 4; i++) {
+			delay_ms(500);
+			LOG("ch %d +%d ms: state %s (%x), error log %08x", ch, i * 500,
+			    ch_state_name(ch_state(ch)), ch_state(ch), rd32(GSI_BASE + 0x12200));
+		}
 		return -1;
 	}
 	st = ch_state(ch);
@@ -419,6 +429,7 @@ static int ch_start(int ch)
 		LOG("ch %d after start: state %s (%x)", ch, ch_state_name(st), st);
 		return -1;
 	}
+	LOG("ch %d started (state %s)", ch, ch_state_name(st));
 	return 0;
 }
 
@@ -971,6 +982,36 @@ static int read_phase0(void)
 	return strstr(b, "ipaphase=0") != NULL;
 }
 
+/* gsistart=<mode> in cell.on (phase 1 only) splits the GSI experiment, because START of channel 7
+ * has stalled and the modem has asserted in every run so far:
+ *   alloc   - allocate, never START (does the modem object to the allocation alone?)
+ *   tx      - START channel 2 only        rx - START channel 7 only
+ *   rxfirst - START 7 then 2              (absent: 2 then 7, the old behaviour)
+ * Any mode but the default stops after the starts and parks in state "up" without touching the
+ * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
+enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST };
+static int gsitest;
+
+static int read_gsistart(void)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	if (strstr(b, "gsistart=alloc"))
+		return GS_ALLOC;
+	if (strstr(b, "gsistart=rxfirst"))
+		return GS_RXFIRST;
+	if (strstr(b, "gsistart=tx"))
+		return GS_TX;
+	if (strstr(b, "gsistart=rx"))
+		return GS_RX;
+	return GS_BOTH;
+}
+
 /* phase 0: drain the utun so the stack doesn't queue up; count and drop */
 static void p0_drain(void)
 {
@@ -1037,6 +1078,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	ctx.rx_pkts = ctx.tx_pkts = ctx.rx_err = ctx.tx_err = ctx.tx_other = 0;
 	ctx.stat_ms = link_ms();
 	phase0 = read_phase0();
+	gsitest = GS_BOTH;
 	p0_bytes = 0;
 	p0_v4 = p0_v6 = p0_bad = 0;
 	if (phase0) {
@@ -1093,6 +1135,27 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	 * still pointed at the modem's channels, so no packets move */
 	set_state("setup-5");
 	ipagsi_dump_ipa();
+	gsitest = read_gsistart();
+	if (gsitest != GS_BOTH) {
+		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst" };
+
+		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
+		if (gsitest == GS_RXFIRST) {
+			if (ch_start(CH_MDM_RX) || ch_start(CH_MDM_TX))
+				goto failed;
+		} else if (gsitest == GS_TX) {
+			if (ch_start(CH_MDM_TX))
+				goto failed;
+		} else if (gsitest == GS_RX) {
+			if (ch_start(CH_MDM_RX))
+				goto failed;
+		}
+		LOG("gsi test: ch 2 %s, ch 7 %s; parked (no ring traffic)",
+		    ch_state_name(ch_state(CH_MDM_TX)), ch_state_name(ch_state(CH_MDM_RX)));
+		set_state("up");
+		ctx.active = 1;
+		return;
+	}
 	if (ch_start(CH_MDM_TX) || ch_start(CH_MDM_RX))
 		goto failed;
 #endif
@@ -1140,6 +1203,8 @@ const char *ipagsi_state(void)
 void ipagsi_poll(void)
 {
 	if (!ctx.active)
+		return;
+	if (gsitest)
 		return;
 	if (phase0) {
 		p0_drain();
