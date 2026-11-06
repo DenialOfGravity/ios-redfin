@@ -54,3 +54,21 @@ Not covered here: `MESA=1` (the in-process ir3 compiler; needs a Mesa host build
 5. If a stage hangs: the kernel's hang recovery applies to every v2 client (Turnip included), so run it when a GPU reset
    is acceptable. `--bisect` (stage 11) switches dispatch parts off one at a time. Do not use `--recover` (it hangs the
    GPU on purpose).
+
+## hmbench: the two Metal implementations side by side (bench/)
+
+`hmbench --device m2v|hm` runs the same Metal-API workload (W1 empty command buffer, W2 clear pass, W3 40 textured
+alpha-blended quads, W4 200 small draws; BGRA8 1080x2340 IOSurface target) on SweetMetal2.bundle (metal2vulkan +
+Turnip, loaded read-only from /System) or on hakios-metal (`/var/local/hmetal/HakiosMetal.bundle`), making the device
+as Metal.framework does (NSBundle + `-initWithAcceleratorPort:` on the IOAcceleratorES port). One device per process.
+Logs `/var/local/hmetal/bench-<dev>.log`, lines `RESULT dev wl draws enc_us us/draw commit_us done_ms gpu_ms fps1 fps3 checksum`.
+
+- Shaders: hakios-metal's own AIR (`upstream/tools/kernels/tri_attr_vs, tri_tex_fs, tri_color_fs`), `llvm-as` +
+  `bench/mkmetallib.py` (our MTLB writer). No Apple metallib.
+- The hakios plug-in is upstream's render-capable one, `userland/src/HakiosMetalCA.m`, fetched by `bench/build.sh` at
+  2631f5d (sha256 pinned) and never committed: its origin (vcvkk/darwin-redwood) has a licence hakios lists as "to
+  verify". `bench/plugin.py` makes three edits (cache under /var/local/hmetal, device for `HAKIOS_METAL_ALL` processes).
+  The generic MIT plug-in (`HakiosMetal.m`) cannot render (stand-in pipeline states, no render encoder).
+- Pipelines on the hakios side need its compiler (`MESA=1`) or its compiled-stage cache (`HAKIOS_METAL_CACHE`,
+  `/var/local/hmetal/cache`); without either, W3/W4 report "no pipeline" and W1/W2 still run.
+- SweetMetal2 serves only listed processes: `/var/local/mtl2-clients` has `hmbench` (KNOWN-GOOD.txt).

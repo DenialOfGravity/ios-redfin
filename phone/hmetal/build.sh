@@ -3,6 +3,7 @@
 #   libhakios-metal.a      the core (phone/hmetal/upstream) + the NativeAdreno transport (phone/hmetal/redfin)
 #   hakios-metal-probe     upstream's on-phone probe (tools/probe.cpp) on that transport, signed ad hoc
 #   hmetal-host-tests.txt  the host tests' summary (both chips), run first: a red host suite stops the build
+#   bench/                 hmbench, hmbench.metallib, HakiosMetal.bundle (bench/build.sh; README.md "hmbench")
 #
 #   phone/hmetal/build.sh              (WSL local build: tools-claude/localbuild sets up ios-cc; or on a Mac)
 #   HMETAL_HOST_TESTS=0 phone/hmetal/build.sh   skip the host tests
@@ -48,5 +49,7 @@ AR=${AR:-$(command -v llvm-ar || echo ar)}
 [ -f "$OUT/hakios-metal-probe" ] || exit 1
 strip -x "$OUT/hakios-metal-probe" 2>/dev/null || true
 codesign -f -s - "$OUT/hakios-metal-probe" 2>/dev/null || true
+# 4. the benchmark (bench/build.sh: hmbench, its metallib, hakios' render plug-in as HakiosMetal.bundle); HMETAL_BENCH=0 skips
+[ "${HMETAL_BENCH:-1}" = 0 ] || sh bench/build.sh
 (cd "$OUT" && shasum -a 256 libhakios-metal.a hakios-metal-probe 2>/dev/null || sha256sum libhakios-metal.a hakios-metal-probe) > "$OUT/SHA256SUMS"
 ls -la "$OUT"

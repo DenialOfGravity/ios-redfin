@@ -429,3 +429,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Imported BOs: dc civac before each submit naming them and after the fence for written ones (kernel does no maintenance).
   openNativeAdrenoGpu() under -DHAKIOS_METAL_NATIVE_ADRENO (c_api, probe). Host: redfin/tests shim + fake v2 client;
   phone/hmetal/build.sh (iOS lib + probe, host tests first), README.md (H2 steps, not run).
+- hmbench (ws-hm-bench): phone/hmetal/bench: one Metal workload (W1-W4) on SweetMetal2 or hakios-metal (HakiosMetalCA.m fetched at 2631f5d + 3 edits, over libhakios-metal.a), own MTLB writer for hakios' AIR kernels; built by phone/hmetal/build.sh step 4.
