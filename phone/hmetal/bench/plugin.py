@@ -13,6 +13,12 @@ Edits, each by exact text, refused if the line is not found once:
   - the device for any process whose environment has HAKIOS_METAL_ALL (was: backboardd alone, or boot-arg metal_all=1)
   - (H3) every hm_print line also appended to the file $HAKIOS_METAL_LOG names (bench/m2shim.m sets it in backboardd:
     a launchd job's stderr here is not a log anybody reads)
+  - (H3 fix 1) CoreAnimation's uber shaders (fixed_*) compiled from the function itself, with the constants QuartzCore
+    specialised it by, when QuartzCore has a default.metallib (iOS 16.7 here; hakios' iPhone X 16.5 image had none, so
+    the plug-in picks a pre-specialised variant out of default.pipelinelib by label). On 16.7 the label pick gave
+    stand-ins for run-time pipelines the library does not name ("... is not in the library: ... stands in for it") and
+    a refused draw ("fixed_vert_lph_spc reads 64 bytes at 0 of constant buffer 3; 16 are bound").
+    HAKIOS_METAL_CA_VARIANTS=1 in the process's environment restores the label pick.
 """
 import sys
 
@@ -30,6 +36,20 @@ EDITS = [
      '\t\t\tif (log_fd == -2) { const char *p = getenv("HAKIOS_METAL_LOG"); log_fd = p ? open(p, O_WRONLY | O_APPEND | O_CREAT, 0666) : -1; }\n'
      '\t\t\tif (log_fd >= 0) (void)!write(log_fd, line, strlen(line));\n'
      '\t\t}\n'),
+    ('\tif (name == nil || ![name hasPrefix:@"fixed_"]) {\n\t\treturn own;\n\t}\n\thm_ca_load();\n',
+     '\tif (name == nil || ![name hasPrefix:@"fixed_"]) {\n\t\treturn own;\n\t}\n'
+     '\t{   /* (redfin H3 fix 1) QuartzCore with a default.metallib: the function as it is, its constants applied by the caller */\n'
+     '\t\tstatic int use_own = -1;\n'
+     '\t\tif (use_own < 0) {\n'
+     '\t\t\tconst char *e = getenv("HAKIOS_METAL_CA_VARIANTS");\n'
+     '\t\t\tuse_own = !(e != NULL && e[0] == \'1\') && access("/System/Library/Frameworks/QuartzCore.framework/default.metallib", R_OK) == 0;\n'
+     '\t\t\thm_print("CoreAnimation\'s uber shaders: %s\\n", use_own ? "compiled from the functions QuartzCore specialised (its default.metallib; HAKIOS_METAL_CA_VARIANTS=1: the label pick)" : "the variant its label names (default.pipelinelib)");\n'
+     '\t\t}\n'
+     '\t\tif (use_own && own != nil) {\n'
+     '\t\t\treturn own;\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\thm_ca_load();\n'),
 ]
 
 
