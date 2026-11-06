@@ -17,30 +17,54 @@
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/gpu.hpp"
 #include "fixtures/argbuf_res_air.hpp"
+#include "fixtures/a620/argbuf_res_air.hpp"
 #include "hakios-metal/hakios_metal.h"
 #include "fixtures/fill_id_air.hpp"
+#include "fixtures/a620/fill_id_air.hpp"
 #include "fixtures/tex_copy_air.hpp"
+#include "fixtures/a620/tex_copy_air.hpp"
 #include "fixtures/tex_fill_air.hpp"
+#include "fixtures/a620/tex_fill_air.hpp"
 #include "fixtures/tex_size_h_air.hpp"
+#include "fixtures/a620/tex_size_h_air.hpp"
 #include "fixtures/tg_arg_air.hpp"
+#include "fixtures/a620/tg_arg_air.hpp"
 #include "fixtures/ptr_phi_air.hpp"
+#include "fixtures/a620/ptr_phi_air.hpp"
 #include "fixtures/tex_sample_gid_air.hpp"
+#include "fixtures/a620/tex_sample_gid_air.hpp"
 #include "fixtures/tex_fill_h_air.hpp"
+#include "fixtures/a620/tex_fill_h_air.hpp"
 #include "fixtures/tri_dbuf_fs_bc.hpp"
 #include "fixtures/tri_dwrite_fs_bc.hpp"
 #include "fixtures/tri_color_fs_air.hpp"
+#include "fixtures/a620/tri_color_fs_air.hpp"
 #include "fixtures/tri_color_vs_air.hpp"
+#include "fixtures/a620/tri_color_vs_air.hpp"
 #include "fixtures/tri_flat_fs_air.hpp"
+#include "fixtures/a620/tri_flat_fs_air.hpp"
 #include "fixtures/tri_cflat_fs_air.hpp"
+#include "fixtures/a620/tri_cflat_fs_air.hpp"
 #include "fixtures/tri_tex_fs_air.hpp"
+#include "fixtures/a620/tri_tex_fs_air.hpp"
 #include "fixtures/tri_null_fs_air.hpp"
+#include "fixtures/a620/tri_null_fs_air.hpp"
 #include "fixtures/tri_mrt_fs_air.hpp"
+#include "fixtures/a620/tri_mrt_fs_air.hpp"
 #include "fixtures/tri_fb_fs_air.hpp"
+#include "fixtures/a620/tri_fb_fs_air.hpp"
 #include "fixtures/tri_upos_vs_air.hpp"
+#include "fixtures/a620/tri_upos_vs_air.hpp"
 #include "fixtures/tri_dpos_vs_air.hpp"
+#include "fixtures/a620/tri_dpos_vs_air.hpp"
 #include "fixtures/tri_flat_vs_air.hpp"
+#include "fixtures/a620/tri_flat_vs_air.hpp"
 #include "hakios-metal/a6xx.hpp"
 #include "test.hpp"
+
+// (redfin) the compiler fixtures of the chip the suite runs as: ir3 compiles otherwise for the A620 (tests/fixtures/a620/,
+// phone/hmetal/mesa/gen-fixtures.sh) than for the A635 (tests/fixtures/, hakios' own)
+#define FIX(n) (::hakios::metal::a6xx::chip().chipId == ::hakios::metal::a6xx::kChipA620.chipId ? ::hakios::metal::kernels::a620::n : ::hakios::metal::kernels::n)
 
 using namespace hakios::metal;
 
@@ -167,7 +191,7 @@ TEST(compiler_without_mesa_refuses_by_name_and_with_it_matches_the_fixture) {
         std::printf("       (no compiler in this build: the fixture comparison did not run)\n");
         return;
     }
-    compareWithFixture("fill_id", kernels::fill_id_air, "fill_id", "stib");
+    compareWithFixture("fill_id", FIX(fill_id_air), "fill_id", "stib");
     // and a module that is not a kernel is refused by name, not compiled into something else
     uint8_t garbage[16] = {'B', 'C', 0xc0, 0xde, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     CHECK(compileAir(garbage, sizeof garbage, &why) == nullptr);
@@ -182,7 +206,7 @@ TEST(a_size_query_after_a_sample_leaves_the_texture_its_class) {
         std::printf("       (no compiler in this build: the query typing did not run)\n");
         return;
     }
-    auto k = compareWithFixture("tex_size_h", kernels::tex_size_h_air, "tex_size_h", "getsize");
+    auto k = compareWithFixture("tex_size_h", FIX(tex_size_h_air), "tex_size_h", "getsize");
     if (k) {
         CHECK_EQ(k->kernel.textures[0].element, uint8_t(kElemFloat));
         CHECK_EQ(k->kernel.textures[0].kind, uint8_t(kTexSampled));
@@ -196,14 +220,14 @@ TEST(a_threadgroup_argument_starts_past_the_static_arrays) {
         std::printf("       (no compiler in this build: the threadgroup layout did not run)\n");
         return;
     }
-    auto k = compareWithFixture("tg_arg", kernels::tg_arg_air, "tg_arg", "l[r1.z+256]");
+    auto k = compareWithFixture("tg_arg", FIX(tg_arg_air), "tg_arg", "l[r1.z+256]");
     if (k) {
         CHECK(k->hasThreadgroupArg);
         CHECK_EQ(k->threadgroupArgBase, 256u);
         CHECK_EQ(k->kernel.sharedSize, 256u);
     }
     // the twin: a kernel with no threadgroup argument says so, and keeps its base at 0
-    auto fill = compareWithFixture("tex_fill", kernels::tex_fill_air, "tex_fill", "stib");
+    auto fill = compareWithFixture("tex_fill", FIX(tex_fill_air), "tex_fill", "stib");
     if (fill) CHECK(!fill->hasThreadgroupArg);
 }
 
@@ -215,7 +239,7 @@ TEST(a_pointer_phi_into_one_buffer_compiles) {
         std::printf("       (no compiler in this build: the pointer phis did not run)\n");
         return;
     }
-    auto k = compareWithFixture("ptr_phi", kernels::ptr_phi_air, "ptr_phi", "ldib");
+    auto k = compareWithFixture("ptr_phi", FIX(ptr_phi_air), "ptr_phi", "ldib");
     if (k) CHECK_EQ(k->kernel.numSsbos, 2u);
 }
 
@@ -227,7 +251,7 @@ TEST(compiler_matches_the_texture_fixtures) {
         std::printf("       (no compiler in this build: the texture fixture comparison did not run)\n");
         return;
     }
-    auto fill = compareWithFixture("tex_fill", kernels::tex_fill_air, "tex_fill", "stib.b.typed.2d.u32.4");
+    auto fill = compareWithFixture("tex_fill", FIX(tex_fill_air), "tex_fill", "stib.b.typed.2d.u32.4");
     if (fill) {
         // the image is the one resource with a texture kind; c is a constant buffer
         unsigned images = 0, textures = 0, samplers = 0;
@@ -240,7 +264,7 @@ TEST(compiler_matches_the_texture_fixtures) {
         CHECK_EQ(textures, 0u);
         CHECK_EQ(samplers, 0u);
     }
-    auto copy = compareWithFixture("tex_copy", kernels::tex_copy_air, "tex_copy", "isaml");
+    auto copy = compareWithFixture("tex_copy", FIX(tex_copy_air), "tex_copy", "isaml");
     if (copy) {
         bool inAt1 = false, outAt0 = false;
         for (const Resource& r : copy->resources) {
@@ -251,7 +275,7 @@ TEST(compiler_matches_the_texture_fixtures) {
         CHECK(outAt0);
         CHECK(copy->listing.find("t#1") != std::string::npos);
     }
-    auto sample = compareWithFixture("tex_sample_gid", kernels::tex_sample_gid_air, "tex_sample_gid", "saml");
+    auto sample = compareWithFixture("tex_sample_gid", FIX(tex_sample_gid_air), "tex_sample_gid", "saml");
     if (sample) {
         bool samplerAt0 = false;
         for (const Resource& r : sample->resources) samplerAt0 = samplerAt0 || (r.kind == Resource::kSampler && r.index == 0);
@@ -259,7 +283,7 @@ TEST(compiler_matches_the_texture_fixtures) {
         CHECK(sample->listing.find("s#0, t#0") != std::string::npos);
     }
     // the half image: the store typed by its VALUE (f16), the slot's class float as declared, 16-bit values
-    auto half = compareWithFixture("tex_fill_h", kernels::tex_fill_h_air, "tex_fill_h", "stib.b.typed.2d.f16.4");
+    auto half = compareWithFixture("tex_fill_h", FIX(tex_fill_h_air), "tex_fill_h", "stib.b.typed.2d.f16.4");
     if (half) {
         CHECK_EQ(half->kernel.textures[0].element, uint8_t(kElemFloat));
         CHECK_EQ(half->kernel.textures[0].bits, 16u);
@@ -572,12 +596,12 @@ TEST(compiler_matches_the_stage_fixtures) {
         std::printf("       (no compiler in this build: the stage fixture comparison did not run)\n");
         return;
     }
-    auto flatVs = compareStageWithFixture("tri_flat_vs", kernels::tri_flat_vs_air, "tri_flat_vs", "sel.b32");
-    auto flatFs = compareStageWithFixture("tri_flat_fs", kernels::tri_flat_fs_air, "tri_flat_fs", "mov.u32u32 r0.x, 0x3e008081");
-    auto colorVs = compareStageWithFixture("tri_color_vs", kernels::tri_color_vs_air, "tri_color_vs", "sel.b32");
-    auto colorFs = compareStageWithFixture("tri_color_fs", kernels::tri_color_fs_air, "tri_color_fs", "bary.f");
+    auto flatVs = compareStageWithFixture("tri_flat_vs", FIX(tri_flat_vs_air), "tri_flat_vs", "sel.b32");
+    auto flatFs = compareStageWithFixture("tri_flat_fs", FIX(tri_flat_fs_air), "tri_flat_fs", "mov.u32u32 r0.x, 0x3e008081");
+    auto colorVs = compareStageWithFixture("tri_color_vs", FIX(tri_color_vs_air), "tri_color_vs", "sel.b32");
+    auto colorFs = compareStageWithFixture("tri_color_fs", FIX(tri_color_fs_air), "tri_color_fs", "bary.f");
     // the constant-buffer fragment stage: its pushed range compiled here as the fixture writer wrote it (block 0, 16 dwords at c0)
-    auto cflatFs = compareStageWithFixture("tri_cflat_fs", kernels::tri_cflat_fs_air, "tri_cflat_fs", "mov.u32u32 r0.x, c0.x");
+    auto cflatFs = compareStageWithFixture("tri_cflat_fs", FIX(tri_cflat_fs_air), "tri_cflat_fs", "mov.u32u32 r0.x, c0.x");
     if (cflatFs) {
         CHECK_EQ(cflatFs->stage.k.numUboRanges, 1u);
         CHECK_EQ(cflatFs->stage.k.uboRanges[0].block, 0u);
@@ -612,18 +636,18 @@ TEST(compiler_matches_the_stage_fixtures) {
         }
     }
     // vertex pulling from a device buffer: an ldib through IBO 0 of the 3D table
-    auto dposVs = compareStageWithFixture("tri_dpos_vs", kernels::tri_dpos_vs_air, "tri_dpos_vs", "ldib");
+    auto dposVs = compareStageWithFixture("tri_dpos_vs", FIX(tri_dpos_vs_air), "tri_dpos_vs", "ldib");
     if (dposVs) {
         CHECK_EQ(dposVs->stage.k.numSsbos, 1u);
         CHECK_EQ(dposVs->stage.k.numIbos, 1u);
     }
     // vertex pulling from a constant buffer: an ldc through UBO 0, nothing pushed
-    auto uposVs = compareStageWithFixture("tri_upos_vs", kernels::tri_upos_vs_air, "tri_upos_vs", "ldc");
+    auto uposVs = compareStageWithFixture("tri_upos_vs", FIX(tri_upos_vs_air), "tri_upos_vs", "ldc");
     if (uposVs) {
         CHECK_EQ(uposVs->stage.k.numUbos, 1u);
         CHECK_EQ(uposVs->stage.k.numUboRanges, 0u);
     }
-    auto texFs = compareStageWithFixture("tri_tex_fs", kernels::tri_tex_fs_air, "tri_tex_fs", "bary.f");
+    auto texFs = compareStageWithFixture("tri_tex_fs", FIX(tri_tex_fs_air), "tri_tex_fs", "bary.f");
     if (texFs) {
         CHECK_EQ(texFs->stage.k.numTextureSlots, 1u);
         CHECK_EQ(texFs->stage.k.samplerMask, 1u);
@@ -634,14 +658,14 @@ TEST(compiler_matches_the_stage_fixtures) {
         CHECK_EQ(texFs->stage.colorRegid[0], 0x02u);   // the colour output IS the prefetch's destination
     }
     // the null texture's slot: the 2D sample a prefetch, the 3D one a sam.3d, both through slot 0, which is marked
-    auto nullFs = compareStageWithFixture("tri_null_fs", kernels::tri_null_fs_air, "tri_null_fs", "sam.3d");
+    auto nullFs = compareStageWithFixture("tri_null_fs", FIX(tri_null_fs_air), "tri_null_fs", "sam.3d");
     if (nullFs) {
         CHECK_EQ(nullFs->stage.k.numTextureSlots, 1u);
         CHECK_EQ(uint32_t(nullFs->stage.k.textures[0].isNull), 1u);
         CHECK_EQ(nullFs->stage.numSamplerPrefetch, 1u);
     }
     // two colour targets: [[color(0)]] in r0, [[color(1)]] in r1, and the pipeline links (MRT is the draw's to serve now)
-    auto mrtFs = compareStageWithFixture("tri_mrt_fs", kernels::tri_mrt_fs_air, "tri_mrt_fs", "mov.u32u32 r1.w, 0x3f400000");
+    auto mrtFs = compareStageWithFixture("tri_mrt_fs", FIX(tri_mrt_fs_air), "tri_mrt_fs", "mov.u32u32 r1.w, 0x3f400000");
     if (mrtFs) {
         CHECK_EQ(mrtFs->stage.numColorOutputs, 2u);
         CHECK_EQ(mrtFs->stage.colorRegid[1], 0x04u);
@@ -655,7 +679,7 @@ TEST(compiler_matches_the_stage_fixtures) {
     }
     // a framebuffer fetch: lowerFbRead's texel fetch (isaml) of slot 0, marked as colour attachment 0's, the layer and
     // the sample folded to 0, so no VARYING_SLOT_LAYER input and no sample id are left for the draw to refuse
-    auto fbFs = compareStageWithFixture("tri_fb_fs", kernels::tri_fb_fs_air, "tri_fb_fs", "isaml (f32)(xyz)");
+    auto fbFs = compareStageWithFixture("tri_fb_fs", FIX(tri_fb_fs_air), "tri_fb_fs", "isaml (f32)(xyz)");
     if (fbFs) {
         CHECK_EQ(uint32_t(fbFs->stage.fbRead), 1u);
         CHECK_EQ(uint32_t(fbFs->stage.k.textures[0].fbTarget), 1u);
@@ -1266,7 +1290,7 @@ TEST(argument_buffer_members_are_bound_from_the_words_in_their_set) {
         std::printf("       (no compiler in this build: argument buffers did not run)\n");
         return;
     }
-    auto k = compareWithFixture("argbuf_res", kernels::argbuf_res_air, "argbuf_res", "isam");
+    auto k = compareWithFixture("argbuf_res", FIX(argbuf_res_air), "argbuf_res", "isam");
     if (!k) return;
     Gpu gpu(std::make_unique<FakeGpu>());
     std::string why;
