@@ -170,7 +170,7 @@ int main(int argc, char **argv)
 		say("hmbench: device %s (%s, class %s), %d frames after %d warm-up, target BGRA8 %dx%d IOSurface\n", which,
 		    bundlePath, className, frames, warm, W, H);
 
-		io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
+		io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("IOAcceleratorES"));
 		if (!svc) { say("hmbench: no IOAcceleratorES service\n"); return 1; }
 		CFTypeRef pn = IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginName"), kCFAllocatorDefault, 0);
 		CFTypeRef pc = IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginClassName"), kCFAllocatorDefault, 0);
