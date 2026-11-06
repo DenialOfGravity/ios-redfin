@@ -6,12 +6,12 @@
  * nothing in SweetMetal2 reads a choice of driver at load. So for the test the bundle's executable is this file, and
  * the real SweetMetal2 bundle is kept, unchanged, at /var/local/SweetMetal2.bundle.pre-hmca:
  *
- *   - backboardd, while /var/local/hmetal/bbd-hm exists: /var/local/hmetal/HakiosMetal.bundle's HakiosMetalDevice
- *     (hakios' CoreAnimation plug-in, bench/plugin.py's edits), its lines also into /var/local/hmetal/bbd-hm.log;
+ *   - backboardd, while /var/local/hmetal/ca/bbd-hm exists: /var/local/hmetal/ca/HakiosMetal.bundle's HakiosMetalDevice
+ *     (hakios' CoreAnimation plug-in, bench/plugin.py's edits), its lines also into /var/local/hmetal/ca/bbd-hm.log;
  *   - every other case (every other process; backboardd without the flag; hakios-metal giving no device; the flag
  *     tripped): the real SweetMetal2 (dlopen of its Mach-O, its own SweetMTL2Device by symbol), as before.
  *
- * Trip: each backboardd start on hakios-metal appends its time to /var/local/hmetal/bbd-hm.starts; the third start within
+ * Trip: each backboardd start on hakios-metal appends its time to /var/local/hmetal/ca/bbd-hm.starts; the third start within
  * 120 s renames the flag to bbd-hm.tripped and takes SweetMetal2, so a window server that keeps dying on hakios-metal
  * comes back on SweetMetal2 by itself. Switching: touch / rm the flag, then psx -k backboardd.
  * Manual reference counting, as the plug-ins.
@@ -27,10 +27,10 @@
 #include <unistd.h>
 
 #define M2_REAL   "/var/local/SweetMetal2.bundle.pre-hmca/SweetMetal2"
-#define HM_BUNDLE "/var/local/hmetal/HakiosMetal.bundle"
-#define HM_FLAG   "/var/local/hmetal/bbd-hm"
-#define HM_STARTS "/var/local/hmetal/bbd-hm.starts"
-#define SHIM_LOG  "/var/local/hmetal/shim.log"
+#define HM_BUNDLE "/var/local/hmetal/ca/HakiosMetal.bundle"
+#define HM_FLAG   "/var/local/hmetal/ca/bbd-hm"
+#define HM_STARTS "/var/local/hmetal/ca/bbd-hm.starts"
+#define SHIM_LOG  "/var/local/hmetal/ca/shim.log"
 
 static void
 shim_log(const char *fmt, ...)
@@ -87,7 +87,7 @@ shim_tripped(void)
 
 	/* (self not released: before -init, _MTLDevice's -dealloc reads what -init never set; both plug-ins do the same) */
 	if (strcmp(getprogname(), "backboardd") == 0 && access(HM_FLAG, F_OK) == 0 && !shim_tripped()) {
-		setenv("HAKIOS_METAL_LOG", "/var/local/hmetal/bbd-hm.log", 1);
+		setenv("HAKIOS_METAL_LOG", "/var/local/hmetal/ca/bbd-hm.log", 1);
 		NSBundle *b = [NSBundle bundleWithPath:@HM_BUNDLE];
 		NSError *e = nil;
 		if (b != nil && [b loadAndReturnError:&e]) {
