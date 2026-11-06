@@ -397,6 +397,54 @@ static int ch_alloc_program(int ch, int ev, uint32_t cnt, int toward_ipa, int co
 	return 0;
 }
 
+/* release what ch_alloc_program()/ev_alloc_program() took, the way mainline's
+ * gsi_channel_teardown_one() does: channel DE_ALLOC straight from ALLOCATED, event ring RESET
+ * then DE_ALLOC.  Anything not in ALLOCATED is left alone (and logged). */
+static void ch_release(int ch)
+{
+	unsigned st = ch_state(ch);
+
+	if (st == CH_ST_NOT_ALLOC)
+		return;
+	if (st != CH_ST_ALLOCATED) {
+		LOG("ch %d release: state %s (%x), not releasing", ch, ch_state_name(st), st);
+		return;
+	}
+	wr32(GSI_CH_CMD, CH_CMD_DE_ALLOC << 24 | (unsigned) ch);
+	if (wait_state(GSI_CH_C_CNTXT_0(ch), CH_STATE_SHIFT, st, 100, "ch dealloc"))
+		return;
+	LOG("ch %d released (state %s)", ch, ch_state_name(ch_state(ch)));
+}
+
+static void ev_release(int ev)
+{
+	unsigned st = ev_state(ev);
+
+	if (st == EV_ST_NOT_ALLOC)
+		return;
+	if (st != EV_ST_ALLOCATED) {
+		LOG("evt ring %d release: state %x, not releasing", ev, st);
+		return;
+	}
+	delay_ms(2);
+	wr32(GSI_EV_CH_CMD, EV_CMD_RESET << 24 | (unsigned) ev);
+	delay_ms(2);
+	wr32(GSI_EV_CH_CMD, EV_CMD_DE_ALLOC << 24 | (unsigned) ev);
+	if (wait_state(GSI_EV_CH_E_CNTXT_0(ev), EV_STATE_SHIFT, EV_ST_ALLOCATED, 100, "evt dealloc"))
+		return;
+	LOG("evt ring %d released (state %x)", ev, ev_state(ev));
+}
+
+static void gsi_release_all(void)
+{
+	ch_release(CH_MDM_RX);
+	ch_release(CH_MDM_TX);
+	for (int ev = 0; ev < 4; ev++)
+		ev_release(ev);
+	LOG("released: ch 2 %s, ch 7 %s, evt 0 %x 1 %x 2 %x 3 %x", ch_state_name(ch_state(CH_MDM_TX)),
+	    ch_state_name(ch_state(CH_MDM_RX)), ev_state(0), ev_state(1), ev_state(2), ev_state(3));
+}
+
 static int ch_start(int ch)
 {
 	uint32_t st = ch_state(ch);
@@ -991,10 +1039,20 @@ static int read_phase0(void)
  * these split the allocation (nothing is ever STARTed in them):
  *   none    - read-only GSI/IPA access, allocate nothing (control)
  *   evonly  - event rings 2 and 3 only         ch2 / ch7 - one event ring + one channel only
+ * 2026-11-06 b64b047: none, evonly, ch2, ch7 ran clean, alloc (ch2+ch7, ev2+ev3) crashed the modem 9 s
+ * after setup again, so the PAIR is the trigger.  These probe the pair (still no START):
+ *   rev      - allocate in reverse order (ev3, ch7, then ev2, ch2)
+ *   onering  - both channels on event ring 2 (event ring 3 never allocated)
+ *   free     - allocate both, then release everything at once (DE_ALLOC)
+ *   freelate - allocate both, release everything from ipagsi_poll 6 s later (before the ~9 s assert)
+ *   evother  - ch2 on event ring 0, ch7 on event ring 1 (not the 2/3 of mainline's v4.7 table)
+ *   drop2 / drop7 - allocate both, then release only that channel and its event ring at once
  * Any mode but the default stops after the starts and parks in state "up" without touching the
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
-enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7 };
+enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
+       GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7 };
 static int gsitest;
+static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
 static int read_gsistart(void)
 {
@@ -1009,6 +1067,20 @@ static int read_gsistart(void)
 		return GS_ALLOC;
 	if (strstr(b, "gsistart=none"))
 		return GS_NONE;
+	if (strstr(b, "gsistart=evother"))
+		return GS_EVOTHER;
+	if (strstr(b, "gsistart=drop2"))
+		return GS_DROP2;
+	if (strstr(b, "gsistart=drop7"))
+		return GS_DROP7;
+	if (strstr(b, "gsistart=freelate"))
+		return GS_FREELATE;
+	if (strstr(b, "gsistart=free"))
+		return GS_FREE;
+	if (strstr(b, "gsistart=rev"))
+		return GS_REV;
+	if (strstr(b, "gsistart=onering"))
+		return GS_ONERING;
 	if (strstr(b, "gsistart=evonly"))
 		return GS_EVONLY;
 	if (strstr(b, "gsistart=ch2"))
@@ -1091,6 +1163,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	ctx.stat_ms = link_ms();
 	phase0 = read_phase0();
 	gsitest = GS_BOTH;
+	free_at = 0;
 	p0_bytes = 0;
 	p0_v4 = p0_v6 = p0_bad = 0;
 	if (phase0) {
@@ -1117,25 +1190,32 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 #endif
 	{
 		int ev_tx = gsitest != GS_NONE && gsitest != GS_CH7;
-		int ev_rx = gsitest != GS_NONE && gsitest != GS_CH2;
+		int ev_rx = gsitest != GS_NONE && gsitest != GS_CH2 && gsitest != GS_ONERING;
 		int ch_tx = gsitest != GS_NONE && gsitest != GS_EVONLY && gsitest != GS_CH7;
 		int ch_rx = gsitest != GS_NONE && gsitest != GS_EVONLY && gsitest != GS_CH2;
+		int rev = gsitest == GS_REV;
+		int tx_ev = gsitest == GS_EVOTHER ? 0 : EV_TX;
+		int rx_ev = gsitest == GS_ONERING ? EV_TX : gsitest == GS_EVOTHER ? 1 : EV_RX;
 
 		set_state("setup-2");
 		if (tables && gsitest == GS_BOTH && ev_alloc_program(EV_CMD, EV_CNT))
 			goto failed;
-		if (ev_tx && ev_alloc_program(EV_TX, EV_CNT))
+		if (rev && ev_rx && ev_alloc_program(rx_ev, EV_CNT))
 			goto failed;
-		if (ev_rx && ev_alloc_program(EV_RX, EV_CNT))
+		if (ev_tx && ev_alloc_program(tx_ev, EV_CNT))
+			goto failed;
+		if (!rev && ev_rx && ev_alloc_program(rx_ev, EV_CNT))
 			goto failed;
 
 		set_state("setup-3");
 		if (tables && gsitest == GS_BOTH &&
 		    ch_alloc_program(CH_CMDTX, EV_CMD, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
 			goto failed;
-		if (ch_tx && ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, TLV_MDM_TX))
+		if (rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
 			goto failed;
-		if (ch_rx && ch_alloc_program(CH_MDM_RX, EV_RX, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
+		if (ch_tx && ch_alloc_program(CH_MDM_TX, tx_ev, TX_TRE_CNT, 1, 0, TLV_MDM_TX))
+			goto failed;
+		if (!rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
 			goto failed;
 	}
 
@@ -1161,7 +1241,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	gsitest = read_gsistart();
 	if (gsitest != GS_BOTH) {
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
-						  "ch2", "ch7" };
+						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
+						  "drop7" };
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
@@ -1173,6 +1254,17 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		} else if (gsitest == GS_RX) {
 			if (ch_start(CH_MDM_RX))
 				goto failed;
+		}
+		if (gsitest == GS_FREE)
+			gsi_release_all();
+		else if (gsitest == GS_FREELATE)
+			free_at = link_ms() + 6000;
+		else if (gsitest == GS_DROP2) {
+			ch_release(CH_MDM_TX);
+			ev_release(EV_TX);
+		} else if (gsitest == GS_DROP7) {
+			ch_release(CH_MDM_RX);
+			ev_release(EV_RX);
 		}
 		LOG("gsi test: ch 2 %s, ch 7 %s; parked (no ring traffic)",
 		    ch_state_name(ch_state(CH_MDM_TX)), ch_state_name(ch_state(CH_MDM_RX)));
@@ -1228,8 +1320,13 @@ void ipagsi_poll(void)
 {
 	if (!ctx.active)
 		return;
-	if (gsitest)
+	if (gsitest) {
+		if (free_at && link_ms() >= free_at) {
+			free_at = 0;
+			gsi_release_all();
+		}
 		return;
+	}
 	if (phase0) {
 		p0_drain();
 		if (link_ms() - ctx.stat_ms >= 10000) {
