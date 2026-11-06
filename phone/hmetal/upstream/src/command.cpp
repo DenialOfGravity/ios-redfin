@@ -581,6 +581,22 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
     return private_[l].back();
 }
 
+std::shared_ptr<Buffer> CommandQueue::privateMemoryScaled(uint32_t bytes, bool perWave, uint32_t fiberScale, uint32_t bufferScale, PrivateMemory* out,
+                                                          std::string* why) {
+    std::lock_guard<std::mutex> g(lock_);
+    uint32_t perFiber = 512;
+    while (perFiber < bytes) perFiber *= 2;
+    const uint64_t perSp = (uint64_t(perFiber) * fibersPerSp() * std::max(fiberScale, 1u) + 4095) & ~uint64_t(4095);
+    std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores() * std::max(bufferScale, 1u), why);
+    if (b == nullptr) return nullptr;
+    privateScaled_.push_back(b);
+    out->address = b->gpuAddress();
+    out->perFiber = perFiber;
+    out->perSp = uint32_t(perSp);
+    out->perWave = perWave;
+    return b;
+}
+
 size_t CommandQueue::idleCommandBuffers() {
     std::lock_guard<std::mutex> g(lock_);
     return idle_.size();

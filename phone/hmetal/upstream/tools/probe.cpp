@@ -374,7 +374,7 @@ static const char* dimName(uint8_t dim) {
 }
 
 int main(int argc, char** argv) {
-    bool recover = false, bisect = false, binTrace = false;
+    bool recover = false, bisect = false, binTrace = false, pvtOnly = false;
     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
     for (int i = 1; i < argc; i++) {
@@ -386,6 +386,8 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
         // (redfin) --no-invfirst: no CACHE_INVALIDATE + WFI before a dispatch's state loads (the A635's stream; the A/B)
         if (strcmp(argv[i], "--no-invfirst") == 0) chosen.invalidateFirst = false;
+        // (redfin) --pvt-only: stage 6z's private-memory variants alone, then exit
+        if (strcmp(argv[i], "--pvt-only") == 0) pvtOnly = true;
         if (strcmp(argv[i], "--metallib") == 0 && i + 2 < argc) {
             metallibs.emplace_back(argv[i + 1], argv[i + 2]);
             i += 2;
@@ -873,7 +875,8 @@ int main(int argc, char** argv) {
 
     // 6z. private memory in a dispatch: pvt_fill keeps a[128] a fiber (512 bytes, stp/ldp), each thread's own values,
     // and writes a[gid & 127]; 4096 threads, every word 3 (gid & 127) + (gid >> 7) + 1, and the canary past the grid
-    {
+    // (redfin) as a lambda of the options and a label suffix, for --pvt-only's variants (the A620 compute hang)
+    auto pvtFill = [&](const compute::Options& po, const std::string& variant) {
         auto out = newBuffer(gpu, 4 * 4096 + 256, &why);
         if (out == nullptr) {
             report(false, "private memory in a dispatch: the buffer: " + why);
@@ -882,7 +885,7 @@ int main(int argc, char** argv) {
             for (uint32_t i = 0; i < 4096 + 64; i++) w[i] = 0xa5a5a5a5u;
             const uint32_t groups[3] = {64, 1, 1}, local[3] = {64, 1, 1};
             auto cb = queue->commandBuffer();
-            if (cb->dispatch(kernels::pvt_fill_air, groups, local, {Binding{out.get(), 0}}, nullptr, chosen)) {
+            if (cb->dispatch(kernels::pvt_fill_air, groups, local, {Binding{out.get(), 0}}, nullptr, po)) {
                 cb->commit();
                 cb->waitUntilCompleted();
             }
@@ -890,10 +893,27 @@ int main(int argc, char** argv) {
             for (uint32_t g = 0; g < 4096; g++) right += w[g] == 3 * (g & 127) + (g >> 7) + 1;
             for (uint32_t g = 4096; g < 4096 + 64; g++) tail += w[g] == 0xa5a5a5a5u;
             report(cb->status() == CommandBuffer::kCompleted && right == 4096 && tail == 64,
-                   "private memory in a dispatch, a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
+                   "private memory in a dispatch" + variant + ", a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
                        std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
         }
+    };
+    if (pvtOnly) {
+        // (redfin) the variants, least changed first: Mesa's sizing per fiber (the FS draw of 9x that passes is
+        // per-fiber), per wave with twice the fibers, per wave with the registers as Mesa and 4x the bytes behind them
+        compute::Options a = chosen;
+        a.pvtForcePerFiber = true;
+        pvtFill(a, " [per-fiber layout]");
+        compute::Options b = chosen;
+        b.pvtBufferScale = 4;
+        pvtFill(b, " [per-wave, Mesa's registers, 4x the buffer]");
+        compute::Options c = chosen;
+        c.pvtFiberScale = 2;
+        pvtFill(c, " [per-wave, 2x fibers an SP]");
+        pvtFill(chosen, " [as compiled: per-wave, Mesa's sizing]");
+        std::printf("probe: %d failure%s (--pvt-only)\n", failures, failures == 1 ? "" : "s");
+        return failures == 0 ? 0 : 1;
     }
+    pvtFill(chosen, "");
 
     // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
     // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each

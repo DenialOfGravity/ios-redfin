@@ -197,6 +197,46 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     CHECK(over.error.find("32769 bytes of threadgroup memory: a group has 32768") != std::string::npos);
 }
 
+// (redfin) the probe's private-memory experiments: a wave-layout kernel bound to per-fiber memory under
+// pvtForcePerFiber (refused without it), and privateMemoryScaled's sizes; both dispatch on the fake
+TEST(the_private_memory_experiments_bind_what_they_say) {
+    using namespace a6xx;
+    Rig r;
+    auto out = buffer(r, 4096, 0);
+    Kernel k = kernels::fill_id;
+    k.pvtmemSize = 512;
+    k.pvtmemPerWave = true;
+    PrivateMemory pm;
+    std::string why;
+    auto fiber = r.queue->privateMemory(512, false, &pm, &why);
+    CHECK(fiber != nullptr);
+    Bindings b{{Binding{out.get(), 0}}, {}, {}, {}};
+    b.privateMemory = pm;
+    Encoded refused(r, k, kGroups16, nullptr, b);
+    CHECK(!refused.ok);
+    compute::Options o;
+    o.pvtForcePerFiber = true;
+    Encoded e(r, k, kGroups16, nullptr, b, o);
+    CHECK(e.ok);
+    CHECK_EQ(e.stream.words()[e.findReg(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3)] & A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT, 0u);
+    PrivateMemory s2;
+    auto scaled = r.queue->privateMemoryScaled(512, true, 2, 3, &s2, &why);
+    CHECK(scaled != nullptr);
+    CHECK_EQ(s2.perSp, 512u * chip().fibersPerSp * 2);
+    CHECK_EQ(scaled->length(), uint64_t(s2.perSp) * chip().numSpCores * 3);
+    for (int v = 0; v < 3; v++) {
+        compute::Options d;
+        d.pvtForcePerFiber = v == 0;
+        d.pvtFiberScale = v == 1 ? 2 : 1;
+        d.pvtBufferScale = v == 2 ? 4 : 1;
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->dispatch(k, kGroups16, nullptr, Bindings{{Binding{out.get(), 0}}, {}, {}, {}}, nullptr, d));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+    }
+}
+
 // dispatchThreadgroupsWithIndirectBuffer:: the counts are read from memory when the GPU runs the dispatch. The twin
 // that shows it: they are changed after the dispatch is recorded and before it is committed, and the dispatch runs the
 // new ones. The driver params' first vec4 is then loaded from the table's copy (the last load into vec4 0 is the
