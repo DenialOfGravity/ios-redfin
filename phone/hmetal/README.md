@@ -77,3 +77,9 @@ Logs `/var/local/hmetal/bench-<dev>.log`, lines `RESULT dev wl draws enc_us us/d
 - Pipelines on the hakios side need its compiler (`MESA=1`) or its compiled-stage cache (`HAKIOS_METAL_CACHE`,
   `/var/local/hmetal/cache`); without either, W3/W4 report "no pipeline" and W1/W2 still run.
 - SweetMetal2 serves only listed processes: `/var/local/mtl2-clients` has `hmbench` (KNOWN-GOOD.txt).
+- The hakios device needs what Metal's MTLAddDevice does after `-initWithAcceleratorPort:` (MTLAddDevice itself asserts
+  on Metal's device array): hmbench sends `initLimits`, `initGPUFamilySupport`, `initFeatureQueries` (`--register`);
+  SweetMetal2's device needs none (and must get none). The metallib header must be iOS's (platform 1, 2.7, os 0x82).
+- Install a changed Mach-O under a new name and `mv` it into place: overwriting in place kept the old file's code
+  signature attached to the vnode ("code signature does not cover entire file").
+- First numbers and the frame comparison: project folder logs/hmetal/bench-summary-2026-11-06.md.

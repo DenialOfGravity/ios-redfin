@@ -443,3 +443,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   FIX() and probe stage 6 pick the running chip's fixture (A635 fixtures re-made by our Mesa: 59/59 bit-identical to hakios').
 - hmetal (ws-hm-mesa): probe 7d/9f compare the phone's compile with this chip's host fixtures (a620/ on the A620; 7d's 4 FAILs were A635 words).
 - hmbench (ws-hm-bench): phone/hmetal/bench: one Metal workload (W1-W4) on SweetMetal2 or hakios-metal (HakiosMetalCA.m fetched at 2631f5d + 3 edits, over libhakios-metal.a), own MTLB writer for hakios' AIR kernels; built by phone/hmetal/build.sh step 4.
+- hmbench: MTLAddDevice setup selectors for the hakios device, iOS metallib header (1, 2.7, 0x82); first results 2026-11-06 (both devices W1-W4, frames equal within 1 LSB).
