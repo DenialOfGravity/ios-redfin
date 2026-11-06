@@ -78,6 +78,17 @@ static int cmp_d(const void *a, const void *b)
 	return x < y ? -1 : x > y;
 }
 
+/* (ws-hm-perf) the processor this thread is on: TPIDR_EL0's low bits on our kernel (set_thread_registers, cswitch.s;
+ * the hakios plug-in's metal_fps reads the same). CPU6/7 are redfin's big cores (A77), 0-5 the little ones (A55). */
+static unsigned cpu_now(void)
+{
+	uint64_t t = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+	__asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(t));
+#endif
+	return (unsigned)(t & 0xfff);
+}
+
 struct stat5 { double mean, p50, p90, min, max; };
 static struct stat5 stats(double *v, int n)
 {
@@ -372,11 +383,18 @@ int main(int argc, char **argv)
 			id<MTLBuffer> vb = wl == 2 ? vb3 : vb4;
 			double *enc = calloc(frames, sizeof(double)), *com = calloc(frames, sizeof(double)),
 			       *done = calloc(frames, sizeof(double)), *gpu = calloc(frames, sizeof(double));
+			/* (ws-hm-perf) each 1-in-flight frame's encode and commit by the core it ran on, start to end on one kind:
+			 * big (CPU6/7), little (0-5), or mixed (moved between the kinds; left out of both) */
+			double *encBig = calloc(frames, sizeof(double)), *encLit = calloc(frames, sizeof(double));
+			double *comBig = calloc(frames, sizeof(double)), *comLit = calloc(frames, sizeof(double));
+			__block int nEncBig = 0, nEncLit = 0, nComBig = 0, nComLit = 0;
+			__block unsigned cpuA = 0, cpuB = 0, cpuC = 0;
 			__block int ngpu = 0;
 			__block int errors = 0;
 			__block NSString *firstErr = nil;
 			/* one frame: returns the command buffer, committed; tEnc, tCommit filled */
 			id<MTLCommandBuffer> (^frame)(double *, double *) = ^id<MTLCommandBuffer>(double *tEnc, double *tCommit) {
+				cpuA = cpu_now();
 				double a = now_us();
 				id<MTLCommandBuffer> cb = [q commandBuffer];
 				if (wl >= 1) {
@@ -394,8 +412,10 @@ int main(int argc, char **argv)
 					[e endEncoding];
 				}
 				double b = now_us();
+				cpuB = cpu_now();
 				[cb commit];
 				double c = now_us();
+				cpuC = cpu_now();
 				if (tEnc) *tEnc = b - a;
 				if (tCommit) *tCommit = c - b;
 				return cb;
@@ -420,6 +440,14 @@ int main(int argc, char **argv)
 				dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
 				enc[i] = te;
 				com[i] = tc;
+				if ((cpuA >= 6) == (cpuB >= 6)) {
+					if (cpuA >= 6) encBig[nEncBig++] = te;
+					else encLit[nEncLit++] = te;
+				}
+				if ((cpuB >= 6) == (cpuC >= 6)) {
+					if (cpuB >= 6) comBig[nComBig++] = tc;
+					else comLit[nComLit++] = tc;
+				}
 				done[i] = ((fin > 0 ? fin : now_us()) - c) / 1000.0;
 				CFTimeInterval g0 = cb.GPUStartTime, g1 = cb.GPUEndTime;
 				if (g0 > 0 && g1 > g0)
@@ -503,9 +531,20 @@ int main(int argc, char **argv)
 				snprintf(gs, sizeof(gs), "%.3f/%.3f", sg.mean, sg.p50);
 			say("RESULT  %s  %s  %d  %.1f/%.1f/%.1f  %.2f  %.1f  %.3f/%.3f/%.3f  %s  %.1f  %.1f  %s\n", which, names[wl], draws,
 			    se.mean, se.p50, se.p90, draws ? se.mean / draws : 0.0, sc.mean, sd5.mean, sd5.p50, sd5.p90, gs, fps1, fps3, sum);
+			{
+				struct stat5 eb = stats(encBig, nEncBig), el = stats(encLit, nEncLit), cbg = stats(comBig, nComBig), cl = stats(comLit, nComLit);
+				say("CORES  %s  %s  %d  encode big %d frames %.1f/%.1f us (%.2f/draw), little %d frames %.1f/%.1f us (%.2f/draw);  "
+				    "commit big %d %.1f/%.1f us, little %d %.1f/%.1f us  (mean/p50)\n", which, names[wl], draws,
+				    nEncBig, eb.mean, eb.p50, draws ? eb.p50 / draws : 0.0, nEncLit, el.mean, el.p50, draws ? el.p50 / draws : 0.0,
+				    nComBig, cbg.mean, cbg.p50, nComLit, cl.mean, cl.p50);
+			}
 			if (errors || bad)
 				say("hmbench: %s: %d of %d measured frames and %d warm-up frames ended in error (first: %s)\n", names[wl], errors,
 				    frames, bad, firstErr ? firstErr.UTF8String : "-");
+			free(encBig);
+			free(encLit);
+			free(comBig);
+			free(comLit);
 			free(enc);
 			free(com);
 			free(done);

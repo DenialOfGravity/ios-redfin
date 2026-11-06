@@ -448,3 +448,7 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - hmperf: transport cleans an IOSurface before a submit only when its seed changed since the last clean/invalidate (metal2 flushSurfaces' rule; HM_FLUSH=all = old); post-fence invalidate runs outside the transport lock.
 - hmperf: unorm8 clear colour = round(double(float) * 255) (0.3 -> 77, as m2v/Turnip on the A620); HM_CLEAR_ROUND=even = old float lroundeven.
 - hmperf: GPU start/end from CP_ALWAYS_ON_COUNTER stamps around each submission (hakios_metal_cb_gpu_times; HM_GPU_STAMPS=0 off); plug-in GPUStartTime/EndTime use them; plug-in boot-arg switches read from env HAKIOS_METAL_ARGS; plug-in not stripped (HMB_STRIP=1).
+- hmperf: GPU stamps read at finish and their slab piece let go (a held piece kept slabs out of the pool: a new 256 KB BO every buffer).
+- hmperf: a pass whose like had the same draws the last 4 times is decided as it opens and recorded one way (HM_DUAL=upstream: both ways); draw()'s four streams reused per command buffer (HM_SCRATCH=0: new).
+- hmperf: faultsAtCommit from the waiter's last GET_PARAM FAULTS, not a kernel call per commit (HM_FAULTS_AT_COMMIT=1: as before); empty command buffers complete in order without a submission (HM_EMPTY_SUBMIT=1: sent).
+- hmbench: CORES line: 1-in-flight encode/commit split by the core they ran on (TPIDR_EL0: CPU6/7 big, 0-5 little).

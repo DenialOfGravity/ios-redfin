@@ -5653,6 +5653,30 @@ TEST(a_pass_whose_like_was_light_is_recorded_for_sysmem_alone) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// (redfin ws-hm-perf) A pass whose like had the same draws the last 4 times is decided by that as it opens and recorded
+// one way: 5 draws under a bar of 8 (above half of it, so recorded both ways at first) sysmem alone from the 5th time on,
+// saying why; 10 draws GMEM alone, the picture the same. HM_DUAL=upstream: both ways every time.
+TEST(a_pass_whose_like_was_steady_is_recorded_one_way) {
+    if (getenv("HM_DUAL") != nullptr) return;
+    for (const auto& [draws, want] : {std::pair<int, uint32_t>{5, 0}, {10, 1}}) {
+        Rig r;
+        auto t = target(r);
+        RenderPass a;
+        a.color0 = t.get();
+        for (int round = 0; round < 6; round++) {
+            auto cb = r.queue->commandBuffer();
+            cb->setGmemMinDraws(8);
+            for (int i = 0; i < draws; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(6), Bindings{}, Bindings{}));
+            CHECK_EQ(cb->gmemRefusal().find("the last 4 times") != std::string::npos, round >= 4 && want == 0);
+            cb->commit();
+            cb->waitUntilCompleted();
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            CHECK_EQ(cb->counts().gmemPasses, want);
+        }
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
+}
+
 // A DontCare attachment is not loaded when the granules past its edge stay in its rows: 100 x 36 (the right edge in the
 // rows' padding, 36 rows a multiple of 4) -- stored, not loaded; 100 x 37 (a granule row past the last) -- loaded too
 TEST(a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row) {

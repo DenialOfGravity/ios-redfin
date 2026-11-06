@@ -337,7 +337,10 @@ private:
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
-    Piece gpuStamps_;                                   // (redfin) the two counter stamps, when gpuStamps_.buffer
+    Piece gpuStamps_;                                   // (redfin) the two counter stamps, when gpuStamps_.buffer (until finish)
+    uint64_t gpuTicks_[2] = {0, 0};                     // ...as finish read them
+    bool unsubmitted_ = false;                          // (redfin) empty: completed in order without the GPU
+    pm4::Stream scratch_[4];                            // (redfin) draw()'s head, body, headSys, bodySys, reused
 };
 
 class CommandQueue {
@@ -403,6 +406,8 @@ public:
     // only now and then (CoreAnimation's: light frames between the heavy ones of an animation) counts as heavy
     uint32_t peakDraws(uint64_t kind, uint32_t ordinal);
     void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws);
+    // (redfin) whether the pass at that place has had the same number of draws the last 4 times, and *DRAWS that number
+    bool stableDraws(uint64_t kind, uint32_t ordinal, uint32_t* draws);
 
 
 private:
@@ -417,6 +422,8 @@ private:
     int64_t calibNs_ = 0;
     uint64_t calibTicks_ = 0;
     bool calibrated_ = false;
+    std::atomic<uint64_t> faultsSeen_{0};   // (redfin) GET_PARAM FAULTS as the waiter read it last
+    std::atomic<bool> faultsKnown_{false};
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
 
     Gpu& gpu_;
@@ -439,7 +446,7 @@ private:
     struct Tune { double us[2] = {0, 0}; uint32_t runs[2] = {0, 0}; uint32_t passes = 0; };
     std::unordered_map<uint64_t, Tune> tune_;   // (under lock_) preferGmem's, by target
     std::unordered_map<uint64_t, uint32_t> lastDraws_;   // (under lock_) noteDraws', by kind and ordinal
-    struct Peak { uint32_t draws = 0, below = 0; };
+    struct Peak { uint32_t draws = 0, below = 0, last = ~0u, same = 0; };   // (redfin: last, same -- stableDraws')
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
     std::condition_variable changed_;
     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
