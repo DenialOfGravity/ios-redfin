@@ -41,7 +41,7 @@
 #   build-env                  what the build host has (cores, memory, disk, toolchain, SDKs)
 #   build-apt                  sudo apt-get install the fixed package list below (the only step that uses sudo)
 #   build-setup STEP           background: lb.sh setup STEP  (toolchain into ~/redfin-build/toolchain)
-#   build TARGET [REF]         background: lb.sh build TARGET REF  (TARGET shim|userland|metal2|hmetal|xnu, REF a branch
+#   build TARGET [REF]         background: lb.sh build TARGET REF  (TARGET shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu, REF a branch
 #                              or commit of DenialOfGravity/ios-flame-redfin, default redfin-qol)
 #   build-jobs                 running local builds;   build-kill  stops them all
 #   build-diag                 run localbuild/diag.sh (a throwaway inspection script Claude writes; foreground)
@@ -243,7 +243,7 @@ run() {	# one request line
 		lb_bg setup "$rest";;
 	build)
 		read -r tgt ref <<<"$rest"
-		[[ $tgt =~ ^(shim|userland|metal2|hmetal|xnu)$ ]] || { echo "TARGET: shim userland metal2 hmetal xnu"; return 1; }
+		[[ $tgt =~ ^(shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu)$ ]] || { echo "TARGET: shim userland metal2 hmetal hmesa hmetal-mesa xnu"; return 1; }
 		[[ ${ref:-x} =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; return 1; }
 		lb_bg build "$tgt" ${ref:-redfin-qol};;
 	build-jobs) pgrep -af "localbuild/lb.sh" || echo "no local builds running";;

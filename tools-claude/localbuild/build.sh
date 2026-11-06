@@ -177,6 +177,32 @@ build_hmetal() {
 	[ -f "$OUT/hakios-metal-probe" ]
 }
 
+# ---- hmesa (Mesa 25.0.7 + hakios' AIR front end for hakios-metal MESA=1: phone/hmetal/mesa/build-mesa.sh) ----
+# host build (host tests, fixtures' ir3_compiler) and iOS arm64 static libs, kept in $WORK/hmesa/mesa (incremental);
+# $WORK/hmesa/mesa/hmesa.env names them for `build hmetal-mesa`. Out: MANIFEST.txt, hmesa.env, fixtures/ (A620 compiler
+# fixtures + the A635 ones re-made, a635-diff.txt)
+HMESA_W=$WORK/hmesa/mesa
+build_hmesa() {
+	cd "$R"
+	local V=$WORK/metal2-venv
+	[ -x "$V/bin/meson" ] || { python3 -m venv "$V" && "$V/bin/pip" install -q meson mako pyyaml packaging; } || return 1
+	local t; t=$(dl https://archive.mesa3d.org/mesa-25.0.7.tar.xz) || return 1
+	# host first, without the iOS wrappers on PATH (their ar/nm/strip are for Mach-O)
+	PATH="$V/bin:$PATH" PARTS=host bash phone/hmetal/mesa/build-mesa.sh "$HMESA_W" "$t" || return 1
+	( set -a; . "$HMESA_W/hmesa.env"; set +a; bash phone/hmetal/mesa/gen-fixtures.sh "$OUT/fixtures" ) || return 1
+	ios_env
+	PATH="$V/bin:$PATH" PARTS=ios bash phone/hmetal/mesa/build-mesa.sh "$HMESA_W" "$t" || return 1
+	cp "$HMESA_W/MANIFEST.txt" "$HMESA_W/hmesa.env" "$OUT/"
+	grep -c "^ios " "$OUT/MANIFEST.txt"
+}
+# ---- hmetal-mesa (phone/hmetal/build.sh with MESA=1 against the hmesa build) ----
+build_hmetal-mesa() {
+	[ -f "$HMESA_W/hmesa.env" ] || { say "no $HMESA_W/hmesa.env: build hmesa first"; return 1; }
+	set -a; . "$HMESA_W/hmesa.env"; set +a
+	export MESA=1
+	build_hmetal && cp phone/hmetal/out/MESA.txt "$OUT/"
+}
+
 # ---- xnu (xnu.yml) ----
 build_xnu() { bash "$HERE/xnu.sh" "$R" "$OUT"; }
 
