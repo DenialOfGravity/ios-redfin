@@ -34,7 +34,12 @@ skipping, so it is correct but slower on large surfaces.
                                                   # and render suites through the transport -> fake service -> FakeGpu
                                                   # (139 x 2; 6 surface cases skipped, see the Makefile)
 
-Not covered here: `MESA=1` (the in-process ir3 compiler; needs a Mesa host build with hakios' AIR front end) and
+MESA=1 (in-process compiler): localbuild `build hmesa REF` (phone/hmetal/mesa/build-mesa.sh: Mesa 25.0.7 + hakios' AIR
+front end, host + iOS arm64 static libs, A620 fixtures via gen-fixtures.sh) then `build hmetal-mesa REF`.
+tests/fixtures/a620/*_air.hpp = the host ir3_compiler's output for chip 0x06020000 (namespace kernels::a620); compiler_test
+and probe stage 6 compare with them on the A620, with tests/fixtures/ (hakios', re-made bit-identical) on the A635.
+
+Formerly not covered here: `MESA=1` (the in-process ir3 compiler; needs a Mesa host build with hakios' AIR front end) and
 `tools/check-a6xx.py` (needs Mesa's generated a6xx.xml.h).
 
 ## H2: first run on the phone (not done yet; steps only)

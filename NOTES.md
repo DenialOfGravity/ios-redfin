@@ -436,3 +436,9 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   pvtFiberScale / pvtBufferScale, CommandQueue::privateMemoryScaled; defaults = Mesa's sizing), probe --pvt-only runs the variants.
 - hmetal (ws-hm-fix, F3): A620 wave-layout private memory sized for 2x fibersPerSp (ChipInfo::pvtPerWaveFiberScale; registers
   and buffer): F2 on the phone hung at Mesa's sizing, ran with 4x buffer / 2x fibers / per-fiber layout. A635 unchanged.
+- hmetal MESA=1 (ws-hm-mesa): phone/hmetal/mesa = hakios-xnu-kernel 2631f5d tools/mesa (AIR front end air/, its Mesa 25.0.7
+  patches, hakios-drm; MIT) + build-mesa.sh (host + iOS arm64 static Mesa libs, localbuild `build hmesa`) + gen-fixtures.sh
+  (A620 compiler fixtures, A635 re-check); phone/hmetal/build.sh MESA=1 links the compiler (localbuild `build hmetal-mesa`).
+- hmetal (ws-hm-mesa): tests/fixtures/a620/*_air.hpp (59, host ir3_compiler --chip-id 0x06020000, ns kernels::a620); compiler_test
+  FIX() and probe stage 6 pick the running chip's fixture (A635 fixtures re-made by our Mesa: 59/59 bit-identical to hakios').
+- hmetal (ws-hm-mesa): probe 7d/9f compare the phone's compile with this chip's host fixtures (a620/ on the A620; 7d's 4 FAILs were A635 words).

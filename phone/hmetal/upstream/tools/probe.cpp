@@ -28,6 +28,7 @@
 #include "../tests/fixtures/end_only.hpp"
 #include "../tests/fixtures/fill_id.hpp"
 #include "../tests/fixtures/fill_id_air.hpp"
+#include "../tests/fixtures/a620/fill_id_air.hpp"
 #include "../tests/fixtures/chain160_air.hpp"
 #include "../tests/fixtures/chain220_air.hpp"
 #include "../tests/fixtures/long_chain_air.hpp"
@@ -43,10 +44,13 @@
 #include "../tests/fixtures/dual_fs_bc.hpp"
 #include "../tests/fixtures/tri_pos_vs_bc.hpp"
 #include "../tests/fixtures/tex_copy_air.hpp"
+#include "../tests/fixtures/a620/tex_copy_air.hpp"
 #include "../tests/fixtures/tex_copy_bc.hpp"
 #include "../tests/fixtures/tex_fill_air.hpp"
+#include "../tests/fixtures/a620/tex_fill_air.hpp"
 #include "../tests/fixtures/tex_fill_bc.hpp"
 #include "../tests/fixtures/tex_fill_h_air.hpp"
+#include "../tests/fixtures/a620/tex_fill_h_air.hpp"
 #include "../tests/fixtures/tex_fill_h_bc.hpp"
 #include "../tests/fixtures/tex_fill_arr_air.hpp"
 #include "../tests/fixtures/tex_fill_3d_air.hpp"
@@ -56,13 +60,17 @@
 #include "../tests/fixtures/tex_sample_wide_air.hpp"
 #include "../tests/fixtures/argbuf_res_bc.hpp"
 #include "../tests/fixtures/tex_sample_gid_air.hpp"
+#include "../tests/fixtures/a620/tex_sample_gid_air.hpp"
 #include "../tests/fixtures/tex_sample_gid_bc.hpp"
 #include "../tests/fixtures/tex_col16_bc.hpp"
 #include "../tests/fixtures/tri_color_fs_air.hpp"
+#include "../tests/fixtures/a620/tri_color_fs_air.hpp"
 #include "../tests/fixtures/tri_color_fs_bc.hpp"
 #include "../tests/fixtures/tri_color_vs_air.hpp"
+#include "../tests/fixtures/a620/tri_color_vs_air.hpp"
 #include "../tests/fixtures/tri_color_vs_bc.hpp"
 #include "../tests/fixtures/tri_flat_fs_air.hpp"
+#include "../tests/fixtures/a620/tri_flat_fs_air.hpp"
 #include "../tests/fixtures/tri_cflat_fs_air.hpp"
 #include "../tests/fixtures/tri_attr_vs_air.hpp"
 #include "../tests/fixtures/tri_tex_fs_air.hpp"
@@ -99,6 +107,7 @@
 #include "../tests/fixtures/tri_ctex_fs_bc.hpp"
 #include "../tests/fixtures/tri_flat_fs_bc.hpp"
 #include "../tests/fixtures/tri_flat_vs_air.hpp"
+#include "../tests/fixtures/a620/tri_flat_vs_air.hpp"
 #include "../tests/fixtures/tri_flat_vs_bc.hpp"
 
 using namespace hakios::metal;
@@ -784,7 +793,8 @@ int main(int argc, char** argv) {
             report(false, "compile fill_id.ll on the phone: " + why2);
         } else {
             const Kernel& a = compiled->kernel;
-            const Kernel& b = kernels::fill_id_air;
+            // (redfin) the host compiler's words for this chip (tests/fixtures/a620/ on the A620)
+            const Kernel& b = a6xx::chip().chipId == a6xx::kChipA620.chipId ? kernels::a620::fill_id_air : kernels::fill_id_air;
             bool sameWords = a.numWords == b.numWords && memcmp(a.words, b.words, 4 * a.numWords) == 0;
             bool sameLayout = a.instrlen == b.instrlen && a.constlen == b.constlen && a.maxReg == b.maxReg &&
                               a.localIdRegid == b.localIdRegid && a.workGroupIdRegid == b.workGroupIdRegid &&
@@ -1781,10 +1791,13 @@ int main(int argc, char** argv) {
                 };
                 // tex_fill_h last: its store is typed f16 only by the front end as fixed on 29 October, so this line is also
                 // the proof that the phone's compiler carries that front end (and not the one that typed every write as uint)
-                const Pair pairs[] = {{kernels::tex_fill_bc, kernels::tex_fill_bc_size, &kernels::tex_fill_air, "tex_fill.ll"},
-                                      {kernels::tex_copy_bc, kernels::tex_copy_bc_size, &kernels::tex_copy_air, "tex_copy.ll"},
-                                      {kernels::tex_sample_gid_bc, kernels::tex_sample_gid_bc_size, &kernels::tex_sample_gid_air, "tex_sample_gid.ll"},
-                                      {kernels::tex_fill_h_bc, kernels::tex_fill_h_bc_size, &kernels::tex_fill_h_air, "tex_fill_h.ll"}};
+                // (redfin) against the host compiler's words for this chip (tests/fixtures/a620/ on the A620)
+                const bool a620 = a6xx::chip().chipId == a6xx::kChipA620.chipId;
+                const Kernel* texFillFix = a620 ? &kernels::a620::tex_fill_air : &kernels::tex_fill_air;
+                const Pair pairs[] = {{kernels::tex_fill_bc, kernels::tex_fill_bc_size, texFillFix, "tex_fill.ll"},
+                                      {kernels::tex_copy_bc, kernels::tex_copy_bc_size, a620 ? &kernels::a620::tex_copy_air : &kernels::tex_copy_air, "tex_copy.ll"},
+                                      {kernels::tex_sample_gid_bc, kernels::tex_sample_gid_bc_size, a620 ? &kernels::a620::tex_sample_gid_air : &kernels::tex_sample_gid_air, "tex_sample_gid.ll"},
+                                      {kernels::tex_fill_h_bc, kernels::tex_fill_h_bc_size, a620 ? &kernels::a620::tex_fill_h_air : &kernels::tex_fill_h_air, "tex_fill_h.ll"}};
                 for (const Pair& p : pairs) {
                     std::string whyCompile;
                     auto compiled = compileAir(p.bc, p.size, &whyCompile);
@@ -1795,7 +1808,7 @@ int main(int argc, char** argv) {
                     bool same = false;
                     std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
                     report(same, std::string("compile ") + p.name + " on the phone: " + text);
-                    if (same && p.fixture == &kernels::tex_fill_air) {
+                    if (same && p.fixture == texFillFix) {
                         texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
                                 "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
                     }
@@ -6207,10 +6220,11 @@ int main(int argc, char** argv) {
                 const Stage* fixture;
                 const char* name;
             };
-            const StagePair pairs[] = {{kernels::tri_flat_vs_bc, kernels::tri_flat_vs_bc_size, &kernels::tri_flat_vs_air, "tri_flat_vs.ll"},
-                                       {kernels::tri_flat_fs_bc, kernels::tri_flat_fs_bc_size, &kernels::tri_flat_fs_air, "tri_flat_fs.ll"},
-                                       {kernels::tri_color_vs_bc, kernels::tri_color_vs_bc_size, &kernels::tri_color_vs_air, "tri_color_vs.ll"},
-                                       {kernels::tri_color_fs_bc, kernels::tri_color_fs_bc_size, &kernels::tri_color_fs_air, "tri_color_fs.ll"}};
+            const bool a620s = a6xx::chip().chipId == a6xx::kChipA620.chipId;   // (redfin) this chip's host fixtures
+            const StagePair pairs[] = {{kernels::tri_flat_vs_bc, kernels::tri_flat_vs_bc_size, a620s ? &kernels::a620::tri_flat_vs_air : &kernels::tri_flat_vs_air, "tri_flat_vs.ll"},
+                                       {kernels::tri_flat_fs_bc, kernels::tri_flat_fs_bc_size, a620s ? &kernels::a620::tri_flat_fs_air : &kernels::tri_flat_fs_air, "tri_flat_fs.ll"},
+                                       {kernels::tri_color_vs_bc, kernels::tri_color_vs_bc_size, a620s ? &kernels::a620::tri_color_vs_air : &kernels::tri_color_vs_air, "tri_color_vs.ll"},
+                                       {kernels::tri_color_fs_bc, kernels::tri_color_fs_bc_size, a620s ? &kernels::a620::tri_color_fs_air : &kernels::tri_color_fs_air, "tri_color_fs.ll"}};
             std::shared_ptr<CompiledStage> compiled[4];
             for (int i = 0; i < 4; i++) {
                 std::string whyCompile;
