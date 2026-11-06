@@ -25,6 +25,8 @@
 #include <IOSurface/IOSurfaceRef.h>   // (on Linux: tests/shim's)
 
 #include <cerrno>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -33,6 +35,7 @@
 #include <vector>
 
 #include "NativeAdrenoABI.h"
+#include "hakios-metal/prof.hpp"
 
 namespace hakios::metal {
 
@@ -54,6 +57,18 @@ void dcacheFlush(const void* p, size_t n, bool before) {
     for (; a < end; a += 64) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
     __asm__ volatile("dsb sy" ::: "memory");
 #endif
+}
+
+// HM_FLUSH=all: every imported BO a submission names is cleaned before it, every time (the transport before ws-hm-perf).
+// Default: an IOSurface's pages are cleaned only when its seed (moved on by every write unlock: the CPU wrote it) differs
+// from the seed at this client's last clean or invalidate of them, as phone/metal2's flushSurfaces. Userptr imports have
+// no seed: always cleaned.
+bool flushAll() {
+    static const bool all = [] {
+        const char* e = getenv("HM_FLUSH");
+        return e != nullptr && strcmp(e, "all") == 0;
+    }();
+    return all;
 }
 
 int errnoOf(kern_return_t r, uint32_t method) {
@@ -120,7 +135,7 @@ public:
             if (i->info == kInfoGetOffset) { i->value = 0; return 0; }
             return EINVAL;
         }
-        case kGemClose: return size == sizeof(DrmGemClose) ? closeBo(static_cast<DrmGemClose*>(data)->handle) : EINVAL;
+        case kGemClose: return size == sizeof(DrmGemClose) ? closeBo(static_cast<DrmGemClose*>(data)->handle, &g) : EINVAL;
         case kGemCpuPrep: {
             if (size != sizeof(MsmGemCpuPrep)) return EINVAL;
             auto* p = static_cast<MsmGemCpuPrep*>(data);
@@ -217,6 +232,8 @@ private:
         IOSurfaceRef surface = nullptr;
         uint32_t lastFence = 0;  // the fence of the last submission that named it
         uint32_t writeFence = 0; // ...that named it as written (imported: invalidate once this passed)
+        uint32_t cleanSeed = 0;  // a surface's: its seed at the last clean/invalidate here (seedKnown)
+        bool seedKnown = false;
     };
 
     kern_return_t method(uint32_t m, const void* in, size_t inSize, void* out, size_t outSize) {
@@ -354,7 +371,10 @@ private:
         bo.token = 0;
     }
 
-    int closeBo(uint32_t handle) {
+    int closeBo(uint32_t handle, std::unique_lock<std::mutex>* g = nullptr) {
+        // (an imported buffer's pages stay the caller's while a fence's flush outside the lock may still touch them:
+        // wait for that before the import goes)
+        if (g != nullptr) flushed_.wait(*g, [this] { return flushing_ == 0; });
         auto b = bos_.find(handle);
         if (b == bos_.end()) return ENOENT;
         Bo bo = b->second;
@@ -381,9 +401,25 @@ private:
         }
         const Bo& ib = *named[cmd->submit_idx];
         if (uint64_t(cmd->submit_offset) + cmd->size > ib.bytes) return EINVAL;
-        // imported pages the GPU reads (or overwrites in part): what the CPU wrote goes to memory first
-        for (Bo* b : named) {
-            if (b->imported) dcacheFlush(b->importBase, b->bytes, true);
+        // imported pages the GPU reads (or overwrites in part): what the CPU wrote goes to memory first -- unless the
+        // surface's seed says the CPU has not written it since this client last cleaned or invalidated it
+        {
+            prof::Scope t(prof::kFlushBefore);
+            const bool all = flushAll();
+            for (Bo* b : named) {
+                if (!b->imported) continue;
+                if (b->surface != nullptr && !all) {
+                    const uint32_t seed = IOSurfaceGetSeed(b->surface);   // before the flush: a write after it moves it on
+                    if (b->seedKnown && b->cleanSeed == seed) {
+                        prof::bytes(true, 0, true);
+                        continue;
+                    }
+                    b->cleanSeed = seed;
+                    b->seedKnown = true;
+                }
+                dcacheFlush(b->importBase, b->bytes, true);
+                prof::bytes(true, b->bytes, false);
+            }
         }
         NativeAdrenoAbiSubmit q{};
         q.buffer_count = 1;
@@ -392,7 +428,12 @@ private:
         q.buffers[0].iova = ib.iova + cmd->submit_offset;
         q.buffers[0].bytes = cmd->size;
         NativeAdrenoAbiSubmitReply r{};
-        if (kern_return_t k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r))) return errnoOf(k, NativeAdrenoMethodSubmit);
+        kern_return_t k;
+        {
+            prof::Scope t(prof::kIoSubmit);
+            k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+        }
+        if (k != KERN_SUCCESS) return errnoOf(k, NativeAdrenoMethodSubmit);
         const uint32_t fence = uint32_t(r.fence);
         for (uint32_t i = 0; i < s.nr_bos; i++) {
             named[i]->lastFence = fence;
@@ -410,15 +451,39 @@ private:
         NativeAdrenoAbiWaitFence w{fence, uint64_t(left > 0 ? left : 0)};
         // the wait without our lock: the core's completion thread waits while its commit thread submits
         g.unlock();
-        const int e = errnoOf(method(NativeAdrenoMethodWaitFence, &w, sizeof(w), nullptr, 0), NativeAdrenoMethodWaitFence);
+        int e;
+        {
+            prof::Scope t(prof::kWaitIo);
+            e = errnoOf(method(NativeAdrenoMethodWaitFence, &w, sizeof(w), nullptr, 0), NativeAdrenoMethodWaitFence);
+        }
         g.lock();
         if (e != 0) return e;
         if (fence > passedFence_) passedFence_ = fence;
+        // the ranges are taken under the lock and flushed without it: a submission on the caller's thread does not
+        // wait for megabytes of dc civac here. The BO is held meanwhile (flushing_: closeBo waits for it).
+        std::vector<std::pair<void*, uint64_t>> ranges;
         for (auto& [h, b] : bos_) {
             if (b.imported && b.writeFence != 0 && b.writeFence <= passedFence_) {
-                dcacheFlush(b.importBase, b.bytes, false);
+                ranges.emplace_back(b.importBase, b.bytes);
                 b.writeFence = 0;
+                // (the invalidate also cleans: the CPU holds nothing dirty of it after, whatever the seed is then)
+                if (b.surface != nullptr) {
+                    b.cleanSeed = IOSurfaceGetSeed(b.surface);
+                    b.seedKnown = true;
+                }
             }
+        }
+        if (!ranges.empty()) {
+            prof::Scope t(prof::kFlushAfter);
+            flushing_++;
+            g.unlock();
+            for (const auto& [p, n] : ranges) {
+                dcacheFlush(p, n, false);
+                prof::bytes(false, n, false);
+            }
+            g.lock();
+            flushing_--;
+            flushed_.notify_all();
         }
         return 0;
     }
@@ -456,6 +521,8 @@ private:
     io_connect_t c_;
     mach_timebase_info_data_t timebase_{};
     std::mutex lock_;
+    std::condition_variable flushed_;   // flushing_ back to 0
+    unsigned flushing_ = 0;             // fence flushes running outside lock_
     NativeAdrenoAbiParams params_{};
     NativeAdrenoAbiDeviceInfo info_{};
     std::map<uint64_t, uint64_t> free_;   // GPU address -> bytes free there

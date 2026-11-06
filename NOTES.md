@@ -444,3 +444,7 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - hmetal (ws-hm-mesa): probe 7d/9f compare the phone's compile with this chip's host fixtures (a620/ on the A620; 7d's 4 FAILs were A635 words).
 - hmbench (ws-hm-bench): phone/hmetal/bench: one Metal workload (W1-W4) on SweetMetal2 or hakios-metal (HakiosMetalCA.m fetched at 2631f5d + 3 edits, over libhakios-metal.a), own MTLB writer for hakios' AIR kernels; built by phone/hmetal/build.sh step 4.
 - hmbench: MTLAddDevice setup selectors for the hakios device, iOS metallib header (1, 2.7, 0x82); first results 2026-11-06 (both devices W1-W4, frames equal within 1 LSB).
+- hmperf (ws-hm-perf): HM_PROF=N per-phase timers (submit, closePass, commandBo, faults, ioSubmit, flushBefore/After, waitIo, finish) every N buffers (upstream/include/hakios-metal/prof.hpp).
+- hmperf: transport cleans an IOSurface before a submit only when its seed changed since the last clean/invalidate (metal2 flushSurfaces' rule; HM_FLUSH=all = old); post-fence invalidate runs outside the transport lock.
+- hmperf: unorm8 clear colour = round(double(float) * 255) (0.3 -> 77, as m2v/Turnip on the A620); HM_CLEAR_ROUND=even = old float lroundeven.
+- hmperf: GPU start/end from CP_ALWAYS_ON_COUNTER stamps around each submission (hakios_metal_cb_gpu_times; HM_GPU_STAMPS=0 off); plug-in GPUStartTime/EndTime use them; plug-in boot-arg switches read from env HAKIOS_METAL_ARGS; plug-in not stripped (HMB_STRIP=1).

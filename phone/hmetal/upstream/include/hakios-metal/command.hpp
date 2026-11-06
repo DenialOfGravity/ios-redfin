@@ -73,6 +73,12 @@ public:
     void waitUntilCompleted();
     // how long the GPU had it: from commit to the fence, in nanoseconds (Metal's GPUStartTime..GPUEndTime, roughly)
     int64_t gpuNanoseconds() const { return completedAt_ - committedAt_; }
+    // (redfin) the GPU's own start and end of it, from CP_ALWAYS_ON_COUNTER stamps the submission writes before its first
+    // packet and after its final wait for idle (HM_GPU_STAMPS=0: none), as nanoseconds of the transport's nowNs clock
+    // (the counter's 19.2 MHz put on that clock by the queue's calibration against GET_PARAM TIMESTAMP). False when the
+    // buffer has not completed, carried no stamps, or the stamps are not in order; committedNs is nowNs at the commit.
+    bool gpuTimes(int64_t* startNs, int64_t* endNs) const;
+    int64_t committedNs() const { return committedAt_; }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -331,6 +337,7 @@ private:
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
+    Piece gpuStamps_;                                   // (redfin) the two counter stamps, when gpuStamps_.buffer
 };
 
 class CommandQueue {
@@ -403,6 +410,13 @@ private:
     CommandQueue(Gpu& gpu, uint32_t id) : gpu_(gpu), id_(id) {}
     void submit(std::shared_ptr<CommandBuffer> cb);
     void waiter();
+    // (redfin) the always-on counter (19.2 MHz ticks) against nowNs: a pair read together, again at most every 0.5 s
+    void calibrate();
+    bool ticksToNs(uint64_t ticks, int64_t* ns);
+    std::mutex calibLock_;
+    int64_t calibNs_ = 0;
+    uint64_t calibTicks_ = 0;
+    bool calibrated_ = false;
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
 
     Gpu& gpu_;

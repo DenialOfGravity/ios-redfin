@@ -7,6 +7,7 @@
 // (hakios-metal-probe stage 9).
 //
 // SPDX-License-Identifier: MIT
+#include <cstdlib>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -2525,7 +2526,10 @@ TEST(a_clear_packs_the_colour_as_each_format_holds_it) {
     const Case cases[] = {
         {PixelFormat::kRGBA8Unorm, {0.25, 0.5, 0.75, 1.0}, 4, {64, 128, 191, 255}},
         {PixelFormat::kBGRA8Unorm, {0.25, 0.5, 0.75, 1.0}, 4, {191, 128, 64, 255}},
-        {PixelFormat::kRGBA8Unorm, {-1.0, 2.0, 0.5 / 255.0, 1.5 / 255.0}, 4, {0, 255, 0, 2}},   // clamped; 0.5 and 1.5 to even
+        // clamped; 0.5/255 and 1.5/255 as floats are 0.50000003 and 1.50000003 units: to nearest, 1 and 2 (redfin: the
+        // A620's answer through Turnip; with HM_CLEAR_ROUND=even the float product 0.5 / 1.5 went to even, 0 and 2)
+        {PixelFormat::kRGBA8Unorm, {-1.0, 2.0, 0.5 / 255.0, 1.5 / 255.0}, 4, {0, 255, uint8_t(getenv("HM_CLEAR_ROUND") ? 0 : 1), 2}},
+        {PixelFormat::kBGRA8Unorm, {0.3, 0.3, 0.3, 1.0}, 4, {uint8_t(getenv("HM_CLEAR_ROUND") ? 76 : 77), uint8_t(getenv("HM_CLEAR_ROUND") ? 76 : 77), uint8_t(getenv("HM_CLEAR_ROUND") ? 76 : 77), 255}},   // hmbench W2's colour: m2v 77
         // linear 0.5 is sRGB 0.7354 -> 187.5 -> 188; alpha stays linear: 0.5 -> 128
         {PixelFormat::kRGBA8UnormSrgb, {0.5, 0.5, 0.5, 0.5}, 4, {188, 188, 188, 128}},
         {PixelFormat::kBGRA8UnormSrgb, {1.0, 0.0, 0.002, 1.0}, 4, {7, 0, 255, 255}},   // 0.002 * 12.92 * 255 = 6.6 -> 7, then swapped

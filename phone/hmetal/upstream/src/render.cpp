@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <initializer_list>
 #include <tuple>
 
@@ -468,10 +469,21 @@ float linearToSrgb(float c) {
     return 1.0f;
 }
 
-// tu_pack_float32_for_unorm(v, 8): _mesa_lroundevenf(CLAMP(v, 0, 1) * 255)
+// (redfin ws-hm-perf) The float clear value times 255 in double, rounded to nearest: what the A620 writes for the same
+// float when Turnip clears (SweetMetal2, TU_DEBUG=sysmem: 0.3 -> 77). The old packing (HM_CLEAR_ROUND=even) was
+// tu_pack_float32_for_unorm(v, 8) = _mesa_lroundevenf(CLAMP(v, 0, 1) * 255) in float, where 0.3f * 255.0f rounds to
+// exactly 76.5f and then to the even 76; the exact product 76.500003 is above the half.
+bool clearRoundEven() {
+    static const bool even = [] {
+        const char* e = getenv("HM_CLEAR_ROUND");
+        return e != nullptr && strcmp(e, "even") == 0;
+    }();
+    return even;
+}
 uint32_t unorm8Of(float v) {
     float c = v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;
-    return uint32_t(std::nearbyint(c * 255.0f));
+    if (clearRoundEven()) return uint32_t(std::nearbyint(c * 255.0f));
+    return uint32_t(std::floor(double(c) * 255.0 + 0.5));
 }
 
 // What a Clear writes: the 2D engine's intermediate format and RB_2D_SRC_SOLID_C0..3, the clear colour packed per

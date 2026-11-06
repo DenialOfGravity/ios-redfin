@@ -44,7 +44,8 @@ U=""; for s in open first_problem status formats variant_hook; do U="$U -Wl,-U,_
 	-x none ../out/libhakios-metal.a ${HMB_LIBS:-} -lc++ -lobjc $U -framework Foundation -framework IOKit -framework IOSurface \
 	-framework Metal -framework CoreFoundation 2>&1 | grep -v "was built for newer 'iOS' version" || true
 [ -f "$B/HakiosMetal" ]
-strip -x "$B/HakiosMetal" 2>/dev/null || true
+# (not stripped unless HMB_STRIP=1: metal_fps=sample names functions by dladdr, which needs the local symbols)
+[ "${HMB_STRIP:-0}" != 1 ] || strip -x "$B/HakiosMetal" 2>/dev/null || true
 cp Info.plist "$B/Info.plist"
 codesign -f -s - "$B" 2>/dev/null || codesign -f -s - "$B/HakiosMetal" 2>/dev/null || true
 nm -u "$B/HakiosMetal" 2>/dev/null | grep -c . | sed 's/^/HakiosMetal: undefined symbols: /' || true

@@ -18,6 +18,8 @@ using namespace hakios::metal;
 struct FakeIOSurface {
     fakena::Surface s;
     int refs = 0;
+    uint32_t seed = 0;       // setSurfaceSeed's
+    bool fixedSeed = false;  // else IOSurfaceGetSeed answers a new value every call (a CPU writer the test does not say)
 };
 
 namespace fakena {
@@ -323,6 +325,14 @@ uint8_t* addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBy
     return b;
 }
 
+void setSurfaceSeed(uint32_t id, uint32_t seed) {
+    std::lock_guard<std::recursive_mutex> g(gLock);
+    auto it = gSurfaces.find(id);
+    if (it == gSurfaces.end()) return;
+    it->second->seed = seed;
+    it->second->fixedSeed = true;
+}
+
 void removeSurfaces() {
     std::lock_guard<std::recursive_mutex> g(gLock);
     for (auto& [id, s] : gSurfaces) delete s->s.storage;
@@ -433,6 +443,10 @@ uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef s) { return s->s.pixelFormat; }
 size_t IOSurfaceGetPlaneCount(IOSurfaceRef) { return 0; }   // IOSurface's answer for a surface without planes
 void* IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s, size_t) { return s->s.base; }
 size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef s, size_t) { return s->s.rowBytes; }
+uint32_t IOSurfaceGetSeed(IOSurfaceRef s) {
+    std::lock_guard<std::recursive_mutex> g(fakena::gLock);
+    return s->fixedSeed ? s->seed : ++s->seed;
+}
 
 // --- upstream's tests through the transport ---------------------------------------------------------------------------
 

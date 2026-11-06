@@ -41,6 +41,8 @@ struct Surface {
 };
 uint8_t* addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBytes, uint32_t pixelFormat);
 void removeSurfaces();
+// IOSurfaceGetSeed's answer for ID from now on (a surface no CPU writes keeps one seed; a lock/unlock moves it on)
+void setSurfaceSeed(uint32_t id, uint32_t seed);
 int surfaceRefs(uint32_t id);   // references the transport holds (lookups not yet released)
 
 // What the GPU's copy of an import holds now (its FakeGpu buffer), for a test to tell a clean from none

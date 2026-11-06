@@ -546,6 +546,9 @@ enum hakios_metal_status hakios_metal_cb_status(hakios_metal_cb *cb);
 const char *hakios_metal_cb_error(hakios_metal_cb *cb);
 /* how long the GPU had it, in nanoseconds (commit to fence), once completed */
 int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb *cb);
+/* (redfin) the GPU's own start and end of a completed buffer (CP_ALWAYS_ON_COUNTER stamps), as nanoseconds after its
+ * commit (*start_ns may be negative by the calibration's error): 0, or -1 when there are none (not completed, HM_GPU_STAMPS=0) */
+int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *end_ns);
 
 #ifdef __cplusplus
 }

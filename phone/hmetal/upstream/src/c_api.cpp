@@ -1647,5 +1647,13 @@ int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb* cb) {
     syncOne(cb);
     return cb->cb->gpuNanoseconds();
 }
+int hakios_metal_cb_gpu_times(hakios_metal_cb* cb, int64_t* start_ns, int64_t* end_ns) {
+    syncOne(cb);
+    int64_t s = 0, e = 0;
+    if (!cb->cb->gpuTimes(&s, &e)) return -1;
+    *start_ns = s - cb->cb->committedNs();
+    *end_ns = e - cb->cb->committedNs();
+    return 0;
+}
 
 }  // extern "C"
