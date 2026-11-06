@@ -25,5 +25,6 @@ void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);
 void cell_poll(void);
 void cell_allow(void);		/* Wi-Fi WLFW bring-up over: cell may start 15 s later */			/* from wland's idle loop */
 int cell_print(void);
-void cell_ipa_hold(int on, const char *why);	/* wland.c ipa=1: hold/release the online write, PIN verify and X1 */			/* `wland cell` */
+void cell_ipa_hold(int on, const char *why);
+void cell_ipa_ready(uint32_t ctrl_ep, uint32_t default_ep);	/* ipa=1's INIT_DRIVER accepted: X1 opens the data port */	/* wland.c ipa=1: hold/release the online write, PIN verify and X1 */			/* `wland cell` */
 #endif

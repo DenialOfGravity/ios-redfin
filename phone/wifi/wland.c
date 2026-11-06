@@ -1382,6 +1382,8 @@ static void ipa_step(uint64_t now)
 		printf("ipa: auto step 8 INIT_DRIVER answer: %s ctrl_ep %d default_ep %d (%llu ms)\n",
 		       r > 0 ? "ACCEPTED" : r < 0 ? "REFUSED/unanswered/server gone" : "none", (int)ctrl, (int)def,
 		       (unsigned long long)(now - ia_since));
+		if (r > 0)
+			cell_ipa_ready(ctrl, def);	/* datatest=1's X1 opens the data port (DPM/WDA/bind) first */
 		ipa_end(r > 0, r > 0 ? "INIT_DRIVER accepted" : "INIT_DRIVER not accepted (see the ipaqmi lines)");
 		return;
 	}

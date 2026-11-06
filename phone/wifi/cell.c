@@ -13,7 +13,8 @@
  *   X1   (only with BOTH datatest=1 and wds=1; data design step X1, one data call) see the X1 section: once per wland
  *        process (once more per cell.on change) WDS Start Network 0x20, Get Current Settings 0x2d, 20 s later Stop
  *        Network 0x21. Optional words apn=<1-63 of [A-Za-z0-9.-]> (else the default 3GPP profile is used) and
- *        ipfam=4|6 (default 4). Appends " x1=..." to the status line.
+ *        ipfam=4|6 (default 4). Appends " x1=..." to the status line. When wland's ipa=1 bring-up had INIT_DRIVER
+ *        accepted, the data port goes first: DPM Open Port, WDA Set Data Format, WDS Bind Mux Data Port (X1 section).
  *   SS   (only with nolte=1 and/or csonly=1; safety switches, see the SS section) once per wland process (once more per
  *        cell.on change), as soon as the NAS server is up and before the online write and any PIN verify: WRITE NAS Set
  *        System Selection Preference 0x33 (nolte=1: mode GSM|UMTS; csonly=1: service domain CS only; both: one message;
@@ -42,9 +43,9 @@
 #include "link.h"
 #include "qmi.h"
 
-enum { SVC_DMS, SVC_NAS, SVC_UIM, SVC_WDS, NSVC };
-static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b, 0x01 };
-static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds" };
+enum { SVC_DMS, SVC_NAS, SVC_UIM, SVC_WDS, SVC_DPM, SVC_WDA, NSVC };
+static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b, 0x01, 0x2f, 0x1a };
+static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds", "dpm", "wda" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
@@ -602,8 +603,8 @@ static void wds_field(char *dst, size_t dsz)
 }
 
 /* X1 state (see the X1 section); declared here for the status line */
-enum { X1_IDLE, X1_START, X1_UP, X1_SET, X1_WAIT, X1_STOP, X1_DONE };
-static int x1_state, x1_armed, x1_fam = 4, x1_late;
+enum { X1_IDLE, X1_START, X1_UP, X1_SET, X1_WAIT, X1_STOP, X1_DONE, X1_DPM, X1_WDA, X1_BIND, X1_GO };
+static int x1_state, x1_armed, x1_fam = 4, x1_late, x1_svc = SVC_WDS;
 static uint16_t x1_id, x1_txn;			/* x1_id: the X1 request in flight (0 none) */
 static uint32_t x1_handle;
 static uint64_t x1_sent, x1_next, x1_stop_at;
@@ -613,6 +614,8 @@ static char x1_apn[64], x1_res[64] = "idle";
 enum { SS_IDLE, SS_GET, SS_DONE };
 static int ss_state, ss_armed, ss_hold, ss_waitlog;	/* ss_hold: online write and PIN verify wait for 0x33's answer */
 static int ipa_hold;	/* wland's ipa=1 IPA bring-up is pending or running: online write, PIN verify and X1 wait (cell_ipa_hold) */
+static int ipa_ok;	/* it ended with INIT_DRIVER accepted (cell_ipa_ready): X1 opens the data port first */
+static uint32_t ipa_mctrl = 0xffffffffu, ipa_mdef = 0xffffffffu;	/* the modem's ctrl/default endpoints from that answer */
 static uint16_t ss_id, ss_txn;			/* ss_id: the SS request in flight (0 none) */
 static uint64_t ss_sent, ss_next;
 static char ss_res[64] = "?";
@@ -1346,7 +1349,30 @@ static int ss_poll(uint64_t now)
  * A started call is still stopped if cell.on goes away in between. While an X1 request is out, no round, write or
  * PIN verify is sent. Status: x1=idle|started|settings-ok|stopped|err0xE(end N/T:R)|start-noanswer|stop-err0xE|
  * stop-noanswer|lost.
+ *
+ * Data port (only when wland's ipa=1 bring-up had INIT_DRIVER accepted in this run, cell_ipa_ready; ModemManager's
+ * order for net_driver "ipa", design section E; libqmi data/qmi-service-{dpm,wda,wds}.json): before Start Network, once
+ * per arm, one at a time, each a logged WRITE whose answer (and error) is logged; the first error, missing server or
+ * missing answer (10 s) ends X1 there (no Start Network):
+ *   WRITE DPM 0x2f Open Port 0x0020: 0x11 Hardware Data Ports, u8 count 1, {endpoint type u32 4 EMBEDDED, interface
+ *         u32 1, rx endpoint u32 DP_RX_EP, tx endpoint u32 DP_TX_EP}. The numbers are the AP's IPA endpoints as the
+ *         modem sees them: its RX is our TX (AP_MODEM_TX ep 2, mainline ipa_data-v4.7.c; Linux sysfs
+ *         modem/tx_endpoint_id), its TX our RX (AP_MODEM_RX ep 16, = INIT_DRIVER's ctrl_comm_dest_end_pt). ModemManager
+ *         (port-qmi "open dpm port automatically in case of IPA net driver") swaps them the same way:
+ *         rx_endpoint_number = tx_endpoint_id, tx_endpoint_number = rx_endpoint_id. The modem's INIT_DRIVER answer
+ *         (ctrl_ep/default_ep 14 on 2026-11-06) names ITS endpoint (MODEM_AP_RX ep 14), not ours: logged, not used.
+ *   WRITE WDA 0x1a Set Data Format 0x0020: 0x11 link layer u32 2 raw IP, 0x12/0x13 UL/DL aggregation u32 5 QMAP, 0x15 DL
+ *         max datagrams u32 16, 0x16 DL max size u32 0x3800, 0x17 endpoint {type u32 4, interface u32 1}. The answer's
+ *         0x11-0x18, 0x1a, 0x1b are logged.
+ *   WRITE WDS Bind Mux Data Port 0x00A2 (the same WDS client, CELL_PORT): 0x10 endpoint {u32 4, u32 1}, 0x11 mux id
+ *         u8 1, 0x13 client type u32 1 (tethered).
+ * Status: x1=dpm-err0xE|dpm-noanswer|dpm-noserver|wda-...|bind-...|bound (then Start Network's values).
  */
+#define DP_EP_TYPE	4	/* QMI_DATA_ENDPOINT_TYPE_EMBEDDED */
+#define DP_IFACE	1
+#define DP_RX_EP	2	/* the modem receives on our TX endpoint (AP_MODEM_TX) */
+#define DP_TX_EP	16	/* the modem sends on our RX endpoint (AP_MODEM_RX) */
+#define DP_MUX		1
 #define X1_START_MS	120000
 #define X1_REPLY_MS	10000
 #define X1_HOLD_MS	20000
@@ -1358,7 +1384,36 @@ static int x1_ready(void)
 	       x1_sim == 1 && (x1_apn[0] || wds_default >= 0 || !strncmp(w_def, "err", 3));
 }
 
-static int x1_send(uint16_t id)
+static const char *dp_name(int svc, uint16_t id)
+{
+	return svc == SVC_DPM ? "dpm" : svc == SVC_WDA ? "wda" : id == 0xa2 ? "bind" : "wds";
+}
+
+/* the data port requests (DPM 0x20, WDA 0x20, WDS 0xa2) into q */
+static void dp_tlvs(struct qmi_buf *q, int svc)
+{
+	uint32_t ep[2] = { DP_EP_TYPE, DP_IFACE };	/* (little-endian host, as every TLV here) */
+	if (svc == SVC_DPM) {
+		uint8_t p[1 + 16];
+		uint32_t v[4] = { DP_EP_TYPE, DP_IFACE, DP_RX_EP, DP_TX_EP };
+		p[0] = 1;
+		memcpy(p + 1, v, 16);
+		qmi_tlv(q, 0x11, p, sizeof(p));
+	} else if (svc == SVC_WDA) {
+		qmi_tlv_u32(q, 0x11, 2);	/* raw IP */
+		qmi_tlv_u32(q, 0x12, 5);	/* QMAP */
+		qmi_tlv_u32(q, 0x13, 5);
+		qmi_tlv_u32(q, 0x15, 16);
+		qmi_tlv_u32(q, 0x16, 0x3800);
+		qmi_tlv(q, 0x17, ep, 8);
+	} else {
+		qmi_tlv(q, 0x10, ep, 8);
+		qmi_tlv_u8(q, 0x11, DP_MUX);
+		qmi_tlv_u32(q, 0x13, 1);	/* tethered */
+	}
+}
+
+static int x1_send_svc(int svc, uint16_t id)
 {
 	struct qmi_buf *q = malloc(sizeof(*q));
 	if (!q)
@@ -1367,7 +1422,9 @@ static int x1_send(uint16_t id)
 	if (!txn)
 		txn = 1;
 	qmi_start(q, QMI_REQUEST, x1_txn, id);
-	if (id == 0x20) {
+	if (svc != SVC_WDS || id == 0xa2) {
+		dp_tlvs(q, svc);
+	} else if (id == 0x20) {
 		if (x1_apn[0])
 			qmi_tlv(q, 0x14, x1_apn, (uint16_t)strlen(x1_apn));
 		qmi_tlv_u8(q, 0x19, (uint8_t)x1_fam);
@@ -1378,12 +1435,65 @@ static int x1_send(uint16_t id)
 	else
 		qmi_tlv_u32(q, 0x01, x1_handle);
 	size_t len = qmi_finish(q);
-	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[SVC_WDS].node, srv[SVC_WDS].port, q->b, (uint32_t)len);
+	if (svc != SVC_WDS || id == 0xa2) {
+		printf("[%6llu] cell: > %s %zu bytes:", (unsigned long long)link_ms(), dp_name(svc, id), len);
+		for (size_t i = 0; i < len; i++)
+			printf(" %02x", q->b[i]);
+		printf("\n");
+	}
+	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[svc].node, srv[svc].port, q->b, (uint32_t)len);
 	free(q);
+	x1_svc = svc;
 	x1_id = id;
 	x1_late = 0;
 	x1_sent = link_ms();
 	return 0;
+}
+
+static int x1_send(uint16_t id)
+{
+	return x1_send_svc(SVC_WDS, id);
+}
+
+static int x1_dp(void)
+{
+	return x1_svc != SVC_WDS || x1_id == 0xa2;
+}
+
+/* a data port answer: on to the next request, or X1 ends here */
+static void dp_answer(const struct qmi_msg *m, int svc, uint16_t id)
+{
+	uint64_t now = link_ms();
+	unsigned e = qerr(m);
+	const char *n = dp_name(svc, id);
+	if (svc == SVC_WDA && !e) {
+		static const uint8_t t[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b };
+		char d[256];
+		int k = 0;
+		for (unsigned i = 0; i < sizeof(t); i++) {
+			uint32_t v;
+			uint8_t b;
+			if (!qmi_get_u32(m, t[i], &v))
+				AP(d, k, " %#x=%u", t[i], v);
+			else if (!qmi_get_u8(m, t[i], &b))
+				AP(d, k, " %#x=%u", t[i], b);
+		}
+		if (!k)
+			d[0] = 0;
+		printf("[%6llu] cell: wda data format now:%s (0x11 link 2=raw-ip, 0x12/0x13 aggregation 5=qmap)\n",
+		       (unsigned long long)now, k ? d : " (no TLVs)");
+	}
+	printf("[%6llu] cell: WRITE %s -> %s (err %#x) after %llu ms\n", (unsigned long long)now, n, e ? "refused" : "ok", e,
+	       (unsigned long long)(now - x1_sent));
+	if (e) {
+		x1_state = X1_DONE;
+		snprintf(x1_res, sizeof(x1_res), "%s-err%#x", n, e);
+		printf("[%6llu] cell: x1: data port chain stopped at %s: no start network\n", (unsigned long long)now, n);
+		return;
+	}
+	x1_state = svc == SVC_DPM ? X1_WDA : svc == SVC_WDA ? X1_BIND : X1_GO;
+	if (x1_state == X1_GO)
+		snprintf(x1_res, sizeof(x1_res), "bound");
 }
 
 static void x1_ip4(char *d, size_t n, const struct qmi_msg *m, uint8_t t)
@@ -1450,10 +1560,16 @@ static void x1_answer(const struct qmi_msg *m)
 	uint64_t now = link_ms();
 	unsigned e = qerr(m);
 	int late = x1_late && !x1_id;
+	int dp = x1_id && x1_dp();
+	uint16_t id = x1_id;
 	x1_id = 0;
 	x1_txn = 0;
 	x1_late = 0;
 	x1_next = now + SEND_GAP_MS;
+	if (dp) {
+		dp_answer(m, x1_svc, id);
+		return;
+	}
 	if (m->id == 0x20) {
 		uint32_t h;
 		if (!e && !qmi_get_u32(m, 1, &h)) {
@@ -1514,7 +1630,7 @@ static void x1_answer(const struct qmi_msg *m)
 /* 1 = this message is X1's */
 static int x1_mine(const struct qmi_msg *m)
 {
-	return x1_txn && m->txn == x1_txn && (x1_id ? m->id == x1_id : x1_late && m->id == 0x20);
+	return x1_txn && m->txn == x1_txn && (x1_id ? m->id == x1_id : x1_late && x1_svc == SVC_WDS && m->id == 0x20);
 }
 
 /* the WDS server went away (modem restart): the call is gone with it, nothing more is sent */
@@ -1533,6 +1649,19 @@ static void x1_lost(void)
 /* from cell_poll; 1 = an X1 request is in flight or was just sent (nothing else goes out) */
 static int x1_poll(uint64_t now)
 {
+	if (x1_id && x1_dp()) {
+		if (now - x1_sent <= X1_REPLY_MS)
+			return 1;
+		const char *n = dp_name(x1_svc, x1_id);
+		printf("[%6llu] cell: WRITE %s unanswered in %d s (not repeated): no start network\n", (unsigned long long)now, n,
+		       X1_REPLY_MS / 1000);
+		snprintf(x1_res, sizeof(x1_res), "%s-noanswer", n);
+		x1_state = X1_DONE;
+		x1_id = 0;
+		x1_txn = 0;
+		x1_next = now + SEND_GAP_MS;
+		return 0;
+	}
 	if (x1_id) {
 		if (now - x1_sent <= (x1_id == 0x20 ? X1_START_MS : X1_REPLY_MS))
 			return 1;
@@ -1572,8 +1701,49 @@ static int x1_poll(uint64_t now)
 		x1_next = now + 1000;
 		return 0;
 	}
-	if ((x1_state == X1_IDLE || x1_state == X1_DONE) && x1_armed && x1_ready()) {
+	if (x1_state == X1_DPM || x1_state == X1_WDA || x1_state == X1_BIND) {
+		int svc = x1_state == X1_DPM ? SVC_DPM : x1_state == X1_WDA ? SVC_WDA : SVC_WDS;
+		uint16_t id = x1_state == X1_BIND ? 0xa2 : 0x20;
+		const char *n = dp_name(svc, id);
+		if (!srv[svc].up) {
+			printf("[%6llu] cell: x1: no %s server known: data port chain stopped, no start network\n",
+			       (unsigned long long)now, svc_name[svc]);
+			snprintf(x1_res, sizeof(x1_res), "%s-noserver", n);
+			x1_state = X1_DONE;
+			return 0;
+		}
+		if (svc == SVC_DPM)
+			printf("[%6llu] cell: WRITE dpm open port: hw data port ep-type %d (embedded) iface %d rx-ep %d (our TX, "
+			       "AP_MODEM_TX) tx-ep %d (our RX, AP_MODEM_RX); the modem's INIT_DRIVER ctrl_ep %d default_ep %d are its own "
+			       "endpoints: not used\n", (unsigned long long)now, DP_EP_TYPE, DP_IFACE, DP_RX_EP, DP_TX_EP, (int)ipa_mctrl,
+			       (int)ipa_mdef);
+		else if (svc == SVC_WDA)
+			printf("[%6llu] cell: WRITE wda set data format: raw-ip, qmap up/down, dl max 16 datagrams / %#x bytes, "
+			       "endpoint {%d, %d}\n", (unsigned long long)now, 0x3800, DP_EP_TYPE, DP_IFACE);
+		else
+			printf("[%6llu] cell: WRITE wds bind mux data port: endpoint {%d, %d} mux %d client-type 1 (tethered)\n",
+			       (unsigned long long)now, DP_EP_TYPE, DP_IFACE, DP_MUX);
+		if (!x1_send_svc(svc, id))
+			return 1;
+		x1_state = X1_DONE;
+		snprintf(x1_res, sizeof(x1_res), "%s-nomem", n);
+		return 0;
+	}
+	int go = x1_state == X1_GO;
+	if (!go && (x1_state == X1_IDLE || x1_state == X1_DONE) && x1_armed && x1_ready()) {
 		x1_armed = 0;
+		if (ipa_ok) {
+			printf("[%6llu] cell: x1: IPA INIT_DRIVER accepted: data port first (dpm, wda, bind), then start network\n",
+			       (unsigned long long)now);
+			x1_state = X1_DPM;
+			snprintf(x1_res, sizeof(x1_res), "dataport");
+			return 0;
+		}
+		printf("[%6llu] cell: x1: no IPA INIT_DRIVER accepted in this run (ipa=1): start network without a data port\n",
+		       (unsigned long long)now);
+		go = 1;
+	}
+	if (go) {
 		char prof[16] = "";
 		if (!x1_apn[0] && wds_default >= 0)
 			snprintf(prof, sizeof(prof), " profile=%d", wds_default);
@@ -1588,6 +1758,15 @@ static int x1_poll(uint64_t now)
 }
 
 /* wland.c ipa=1: hold (1) the online write, the PIN verify and X1 until the IPA bring-up ended (0), like ss_hold */
+void cell_ipa_ready(uint32_t ctrl_ep, uint32_t default_ep)
+{
+	ipa_ok = 1;
+	ipa_mctrl = ctrl_ep;
+	ipa_mdef = default_ep;
+	printf("[%6llu] cell: IPA INIT_DRIVER accepted (modem ctrl_ep %d default_ep %d): x1 opens the data port first\n",
+	       (unsigned long long)link_ms(), (int)ctrl_ep, (int)default_ep);
+}
+
 void cell_ipa_hold(int on, const char *why)
 {
 	if (on == ipa_hold)
@@ -1606,7 +1785,7 @@ void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t po
 			srv[i].up = 1;
 			if (i == SVC_WDS)
 				wds_reset();	/* a new modem session: its profiles are read again */
-			if (!access(CELL_ON, F_OK) && (i != SVC_WDS || (opts & OPT_WDS)))
+			if (!access(CELL_ON, F_OK) && (i < SVC_WDS || (i == SVC_WDS && (opts & OPT_WDS)) || (i > SVC_WDS && (opts & OPT_DATATEST))))
 				printf("cell: %s server (instance %#x) at %u:%x\n", svc_name[i], instance, node, port);
 		}
 }
@@ -1616,11 +1795,11 @@ void cell_server_gone(uint32_t node, uint32_t port)
 	for (int i = 0; i < NSVC; i++)
 		if (srv[i].up && srv[i].node == node && (port == 0xffffffffu || srv[i].port == port)) {
 			srv[i].up = 0;
-			if (i == SVC_WDS)
+			if (i == SVC_WDS || (x1_id && x1_svc == i))
 				x1_lost();
 			if (i == SVC_NAS)
 				ss_lost();
-			if (enabled && (i != SVC_WDS || (opts & OPT_WDS)))
+			if (enabled && (i < SVC_WDS || (i == SVC_WDS && (opts & OPT_WDS)) || (i > SVC_WDS && (opts & OPT_DATATEST))))
 				printf("cell: %s server gone\n", svc_name[i]);
 		}
 }
