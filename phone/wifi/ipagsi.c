@@ -987,9 +987,13 @@ static int read_phase0(void)
  *   alloc   - allocate, never START (does the modem object to the allocation alone?)
  *   tx      - START channel 2 only        rx - START channel 7 only
  *   rxfirst - START 7 then 2              (absent: 2 then 7, the old behaviour)
+ * The 2026-11-06 gsistart=alloc run showed the modem asserts ~12 s after the ALLOCATEs alone, so
+ * these split the allocation (nothing is ever STARTed in them):
+ *   none    - read-only GSI/IPA access, allocate nothing (control)
+ *   evonly  - event rings 2 and 3 only         ch2 / ch7 - one event ring + one channel only
  * Any mode but the default stops after the starts and parks in state "up" without touching the
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
-enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST };
+enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7 };
 static int gsitest;
 
 static int read_gsistart(void)
@@ -1003,6 +1007,14 @@ static int read_gsistart(void)
 	}
 	if (strstr(b, "gsistart=alloc"))
 		return GS_ALLOC;
+	if (strstr(b, "gsistart=none"))
+		return GS_NONE;
+	if (strstr(b, "gsistart=evonly"))
+		return GS_EVONLY;
+	if (strstr(b, "gsistart=ch2"))
+		return GS_CH2;
+	if (strstr(b, "gsistart=ch7"))
+		return GS_CH7;
 	if (strstr(b, "gsistart=rxfirst"))
 		return GS_RXFIRST;
 	if (strstr(b, "gsistart=tx"))
@@ -1100,21 +1112,32 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		return;
 	}
 	wr32(GSI_BASE + 0x12200, 0);	/* ERROR_LOG: mainline zeroes it in gsi_setup(); it powers up stale */
-	set_state("setup-2");
-	if (tables && ev_alloc_program(EV_CMD, EV_CNT))
-		goto failed;
-	if (ev_alloc_program(EV_TX, EV_CNT))
-		goto failed;
-	if (ev_alloc_program(EV_RX, EV_CNT))
-		goto failed;
+#if IPAGSI_PHASE < 2
+	gsitest = read_gsistart();
+#endif
+	{
+		int ev_tx = gsitest != GS_NONE && gsitest != GS_CH7;
+		int ev_rx = gsitest != GS_NONE && gsitest != GS_CH2;
+		int ch_tx = gsitest != GS_NONE && gsitest != GS_EVONLY && gsitest != GS_CH7;
+		int ch_rx = gsitest != GS_NONE && gsitest != GS_EVONLY && gsitest != GS_CH2;
 
-	set_state("setup-3");
-	if (tables && ch_alloc_program(CH_CMDTX, EV_CMD, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
-		goto failed;
-	if (ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, TLV_MDM_TX))
-		goto failed;
-	if (ch_alloc_program(CH_MDM_RX, EV_RX, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
-		goto failed;
+		set_state("setup-2");
+		if (tables && gsitest == GS_BOTH && ev_alloc_program(EV_CMD, EV_CNT))
+			goto failed;
+		if (ev_tx && ev_alloc_program(EV_TX, EV_CNT))
+			goto failed;
+		if (ev_rx && ev_alloc_program(EV_RX, EV_CNT))
+			goto failed;
+
+		set_state("setup-3");
+		if (tables && gsitest == GS_BOTH &&
+		    ch_alloc_program(CH_CMDTX, EV_CMD, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
+			goto failed;
+		if (ch_tx && ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, TLV_MDM_TX))
+			goto failed;
+		if (ch_rx && ch_alloc_program(CH_MDM_RX, EV_RX, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
+			goto failed;
+	}
 
 	set_state("setup-4");
 	if (utun_up())
@@ -1137,7 +1160,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	ipagsi_dump_ipa();
 	gsitest = read_gsistart();
 	if (gsitest != GS_BOTH) {
-		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst" };
+		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
+						  "ch2", "ch7" };
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
