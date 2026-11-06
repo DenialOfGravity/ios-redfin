@@ -434,3 +434,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   (A620 compiler fixtures, A635 re-check); phone/hmetal/build.sh MESA=1 links the compiler (localbuild `build hmetal-mesa`).
 - hmetal (ws-hm-mesa): tests/fixtures/a620/*_air.hpp (59, host ir3_compiler --chip-id 0x06020000, ns kernels::a620); compiler_test
   FIX() and probe stage 6 pick the running chip's fixture (A635 fixtures re-made by our Mesa: 59/59 bit-identical to hakios').
+- hmetal (ws-hm-mesa): probe 7d/9f compare the phone's compile with this chip's host fixtures (a620/ on the A620; 7d's 4 FAILs were A635 words).
