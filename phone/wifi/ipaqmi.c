@@ -11,6 +11,9 @@
  *   ipasmem=N  (optional, hex or decimal) the IPA's SHARED_MEM_BADDR in bytes (downstream smem_restricted_bytes,
  *              mainline ipa->mem_offset), added to every offset in INIT_DRIVER. Default 0. It is a register value
  *              (IPA_SHARED_MEM_SIZE), only readable with IP0 voted (X2): read it there and put it here.
+ *   ipa=1      (wland.c, IPA auto) the IPA bring-up sends the one INIT_DRIVER itself, after the IPA is clocked,
+ *              loaded and set up and SMP2P "ipa" = 3 is out (ipaqmi_ipa_on / ipaqmi_ipa_send): ipaqmi is switched on
+ *              (as ipaqmi=1, whatever cell.on says, for the rest of this wland run) and ipaqmi=2's own send is not made.
  * No word, or ipaqmi=0: nothing is announced (a server announced earlier is withdrawn with DEL_SERVER), the socket is
  * closed, nothing is answered.
  *
@@ -131,6 +134,10 @@ static uint16_t txn = 1, pend_txn;
 static uint64_t pend_ms;
 static int lfd = -1, cfd = -1, c_waiting;	/* IPAQMI_SOCK listener / the one CLI client */
 static uint64_t c_dead;
+static int ipa_word, forced, ipa2_logged;	/* ipa=1 in cell.on; ipaqmi_ipa_on was called (level >= 1 from then on) */
+static uint16_t ipa_txn;			/* the IPA bring-up's INIT_DRIVER */
+static int ipa_res;				/* 0 none/pending, 1 accepted, -1 refused, unanswered or server gone */
+static uint32_t ipa_ctrl, ipa_def;
 
 #define TS() ((unsigned long long)link_ms())
 
@@ -482,6 +489,12 @@ static void on_client(const struct qmi_msg *m)
 	uint32_t ctrl = 0, def = 0;
 	uint8_t pend = 0;
 	int hc = !qmi_get_u32(m, 0x10, &ctrl), hd = !qmi_get_u32(m, 0x11, &def), hp = !qmi_get_u8(m, 0x12, &pend);
+	if (ipa_txn && m->txn == ipa_txn) {
+		ipa_res = res == 0 ? 1 : -1;
+		ipa_ctrl = hc ? ctrl : 0xffffffffu;
+		ipa_def = hd ? def : 0xffffffffu;
+		ipa_txn = 0;
+	}
 	pend_txn = 0;
 	drv_ok = res == 0;
 	snprintf(out, sizeof(out), "ipaqmi: INIT_DRIVER -> %s result %u error %#x ctrl_ep %s%u default_ep %s%u init_pending %s%u (%llu ms)\n",
@@ -534,6 +547,10 @@ void ipaqmi_server_gone(uint32_t node, uint32_t port)
 		if (level)
 			printf("[%6llu] ipaqmi: modem ipa server gone%s\n", TS(), pend_txn ? " (INIT_DRIVER unanswered)" : "");
 		pend_txn = 0;
+		if (ipa_txn) {
+			ipa_txn = 0;
+			ipa_res = -1;
+		}
 		if (c_waiting)
 			cli_done("ipaqmi: the modem's ipa server went away\n");
 		session_reset();	/* its IPA driver restarted or the modem went: a new handshake (mainline ipa_server_bye) */
@@ -565,6 +582,7 @@ static void read_words(int *lv, uint32_t *base)
 	char b[512] = "";
 	*lv = 0;
 	*base = 0;
+	ipa_word = 0;
 	FILE *f = fopen(CELL_ON, "r");
 	if (!f)
 		return;
@@ -573,6 +591,7 @@ static void read_words(int *lv, uint32_t *base)
 	b[k] = 0;
 	long v = word(b, "ipaqmi=");
 	*lv = v == 1 || v == 2 ? (int)v : 0;
+	ipa_word = word(b, "ipa=") == 1;
 	v = word(b, "ipasmem=");
 	*base = v > 0 && v < 0x10000 ? (uint32_t)v : 0;	/* IPA shared memory is 12 KB + base: anything bigger is a typo */
 }
@@ -582,6 +601,8 @@ static void check_words(void)
 	int lv;
 	uint32_t base;
 	read_words(&lv, &base);
+	if (forced && !lv)
+		lv = 1;			/* the IPA bring-up switched ipaqmi on: kept on (the modem was told about the IPA) */
 	if (lv == level && base == smem_base)
 		return;
 	int was = level;
@@ -678,13 +699,54 @@ void ipaqmi_poll(void)
 		printf("[%6llu] ipaqmi: INIT_DRIVER txn %u unanswered in %d s (not resent; a late answer is still logged)\n", TS(),
 		       pend_txn, REPLY_MS / 1000);
 		pend_txn = 0;
+		if (ipa_txn) {
+			ipa_txn = 0;
+			ipa_res = -1;
+		}
 		if (c_waiting)
 			cli_done("ipaqmi: INIT_DRIVER unanswered in 30 s\n");
+	}
+	if (level == 2 && ipa_word && !auto_sent) {
+		if (!ipa2_logged)
+			printf("[%6llu] ipaqmi: ipaqmi=2 with ipa=1: the IPA bring-up sends INIT_DRIVER (not ipaqmi=2)\n", TS());
+		ipa2_logged = 1;
+		return;
 	}
 	if (level == 2 && !auto_sent && m_up && allowed && now >= allow_ms && !pend_txn) {
 		auto_sent = 1;		/* once per wland process, whatever happens */
 		send_init_driver("ipaqmi=2");
 	}
+}
+
+/* ---- the IPA bring-up (wland.c ipa=1) -------------------------------------------------------------------------- */
+
+int ipaqmi_ipa_on(void)
+{
+	if (!forced)
+		printf("[%6llu] ipaqmi: switched on by the IPA bring-up (ipa=1)\n", TS());
+	forced = 1;
+	check_words();
+	return m_up;
+}
+
+int ipaqmi_ipa_send(void)
+{
+	if (!level || ipa_txn || ipa_res)
+		return -1;
+	auto_sent = 1;		/* ipaqmi=2's own send is not made after this one either */
+	if (send_init_driver("ipa=1"))
+		return -1;
+	ipa_txn = pend_txn;
+	return 0;
+}
+
+int ipaqmi_ipa_result(uint32_t *ctrl_ep, uint32_t *default_ep)
+{
+	if (ctrl_ep)
+		*ctrl_ep = ipa_ctrl;
+	if (default_ep)
+		*default_ep = ipa_def;
+	return ipa_res;
 }
 
 /* ---- `wland ipa ...` ---------------------------------------------------------------------------------------- */

@@ -23,7 +23,14 @@ void ipaqmi_server(uint32_t service, uint32_t verinst, uint32_t node, uint32_t p
 void ipaqmi_server_gone(uint32_t node, uint32_t port);					/* DEL_SERVER / BYE (port ~0) */
 void ipaqmi_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);		/* dst IPAQMI_PORT / _CLIENT_PORT */
 void ipaqmi_poll(void);			/* from wland's idle loop */
-int ipaqmi_cmd(int argc, char **argv);	/* `wland ipa ...` (argv[1] == "ipa") */
+int ipaqmi_cmd(int argc, char **argv);
+
+/* wland.c ipa=1 (IPA auto): _on switches ipaqmi on (as ipaqmi=1, for the rest of this run) and returns 1 when the
+ * modem's 0x31/2 is known; _send sends the one INIT_DRIVER (0 = sent; at most once); _result: 0 pending (or not
+ * sent), 1 accepted, -1 refused / unanswered in 30 s / server gone; the modem's ctrl/default endpoints (~0 absent). */
+int ipaqmi_ipa_on(void);
+int ipaqmi_ipa_send(void);
+int ipaqmi_ipa_result(uint32_t *ctrl_ep, uint32_t *default_ep);	/* `wland ipa ...` (argv[1] == "ipa") */
 
 /* INIT_DRIVER (0x21) request, header included, into b (>= 7 + 162 bytes). smem = SHARED_MEM_BADDR bytes (0 by
  * default), ssr = include TLV 0x18 is_ssr_bootup = 1 (never on a cold boot). Returns the size, 0 if cap is short. */

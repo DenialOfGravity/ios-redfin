@@ -23,6 +23,7 @@
  *                           /var/local/wland.log (last boot's: .prev), progress in /var/local/wland.boot;
  *                           off with /var/local/wland.off or sweetwifi=0
  * While joined, SIGUSR1 drops the link (tests the rejoin).
+ * ipa=1 in /var/local/cell.on: the running wland brings the IPA up once per boot before the SIM is unlocked (IPA auto).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,8 @@
 #include "ipaqmi.h"
 
 static void set_stage(const char *stage);	/* wland auto: progress in /var/local/wland.boot (no-op otherwise) */
+static void ipa_auto_poll(void);		/* ipa=1 in cell.on: the IPA bring-up (IPA auto, below) */
+static void ipa_auto_allow(void);
 
 /* cmd-db aux levels (as in the GPU's arc votes) */
 /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
@@ -137,6 +140,17 @@ static int vote(const char *res, uint32_t level_index)
  * Without them the WLAN firmware takes an exception once calibration starts (after the cal report).
  */
 static int qmp_send(const char *msg);
+
+/* a BCM (bus) vote: x = average, y = peak, in the BCM's own units (0x3fff = its top level); commit + valid */
+static int bcm_vote(const char *res, uint32_t x, uint32_t y)
+{
+	x &= 0x3fff;
+	y &= 0x3fff;
+	uint32_t off[1] = { 0 }, val[1] = { 1u << 30 | 1u << 29 | x << 14 | y };
+	int rc = pm_rpmh(res, 1, off, val);
+	printf("bcm %s x %#x y %#x (%#x) -> %d\n", res, x, y, val[0], rc);
+	return rc;
+}
 
 static int wlan_power(void)
 {
@@ -947,6 +961,7 @@ static void net_idle(void)
 	ipnet_poll();
 	bridge_poll();
 	join_poll();
+	ipa_auto_poll();	/* before cell_poll: its holds are in place before cell's first PIN verify could go */
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
 	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 }
@@ -990,6 +1005,7 @@ static int net(unsigned secs)
 		}
 		cell_allow();	/* the cell client (cell.on only) waits for this, + 15 s: never during WLFW/radio start */
 		ipaqmi_allow();	/* ipaqmi=2's one INIT_DRIVER too */
+		ipa_auto_allow();	/* and ipa=1's IPA bring-up */
 	}
 	radio_summary();
 	radio_stats();
@@ -1197,6 +1213,238 @@ static void stage_init(void)
 	auto_boot_us = (int)bt.tv_usec;
 }
 
+/*
+ * IPA auto (ipa=1 in /var/local/cell.on; cellular data steps B-D2 in one go, as proven by hand on 2026-11-06): once
+ * per phone boot, inside the running wland, 15 s after the Wi-Fi bring-up (the moment cell/ipaqmi start; or 3 min
+ * after the link came up) and before the SIM is unlocked:
+ *   1 IP0 vote (= `wland bcm IP0 0 0x3fff`)      2 pas_load(15, /var/local/fw/ipa, ipa_fws, 0x8bc00000, 0x10000)
+ *   3 ipa_smmu: streams 0x520/0x522              4 ipa_meminit
+ *   5 SMP2P "ipa" = 3 (without it the modem stalls in INIT_DRIVER: "Task starvation: ipa_ctl", then crashes)
+ *   6 ipaqmi on (as ipaqmi=1), wait for the modem's 0x31/2 (60 s)    7 INIT_DRIVER (as ipaqmi=2, once)
+ *   8 its answer (ipaqmi gives up after 30 s).
+ * (`ipahw hwinit` is not a step: the reset values already match.) From the moment ipa=1 is seen until the sequence
+ * ended, cell.c holds the DMS online write, the SIM PIN verify and X1 (cell_ipa_hold; without the IPA the modem dies
+ * in ps_rm once the unlocked SIM registers LTE). Every step logs "ipa: auto step N ..."; the first failure ends it,
+ * releases the holds, and nothing is ever retried: IPA_MARK holds this boot's id from step 1 on, so neither a
+ * cell.on change nor a restarted wland runs it (or pas_load) again in this boot. Steps 1-5 block the link loop for
+ * their duration (pas_load: the firmware copy and two SMCs); one step per idle call, 200 ms apart.
+ */
+#define IPA_MARK	"/var/local/wland.ipa"
+#define IPA_FW_DIR	"/var/local/fw/ipa"
+#define IPA_PAS		15
+#define IPA_FW_PA	0x8bc00000ull	/* pil_ipa_fw_mem (redbull lito.dtsi) */
+#define IPA_FW_SIZE	0x10000ull
+#define IA_GAP_MS	200
+#define IA_SERVER_MS	60000
+#define IA_ANSWER_MS	40000		/* ipaqmi's own 30 s, plus margin */
+enum { IA_OFF, IA_WAIT, IA_RUN, IA_END };
+static int ia_state, ia_step, ia_allowed, ia_waitlog;
+static uint64_t ia_first, ia_check, ia_allow_ms, ia_next, ia_since, ia_t0;
+static char ia_uuid[40] = "-", ia_bt[32] = "-";
+
+static void ipa_auto_allow(void)
+{
+	if (!ia_allowed) {
+		ia_allowed = 1;
+		ia_allow_ms = link_ms() + 15000;
+	}
+}
+
+/* ipa=1 as a word of cell.on (start, or after a blank) */
+static int ipa_word(void)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	if (!f)
+		return 0;
+	size_t k = fread(b, 1, sizeof(b) - 1, f);
+	fclose(f);
+	b[k] = 0;
+	for (const char *s = b; (s = strstr(s, "ipa=")); s += 4)
+		if (s == b || s[-1] == ' ' || s[-1] == '\t' || s[-1] == '\n' || s[-1] == '\r')
+			return s[4] == '1' && (!s[5] || s[5] == ' ' || s[5] == '\t' || s[5] == '\n' || s[5] == '\r');
+	return 0;
+}
+
+/* this boot's id: kern.bootsessionuuid ("-" if none) and kern.boottime */
+static void ipa_boot_id(void)
+{
+	struct timeval bt;
+	boot_id(&bt);
+	snprintf(ia_uuid, sizeof(ia_uuid), "%s", auto_uuid);
+	snprintf(ia_bt, sizeof(ia_bt), "%ld.%06d", (long)bt.tv_sec, (int)bt.tv_usec);
+}
+
+/* 1 = IPA_MARK ("UUID BOOTTIME what...") is from this boot: by uuid when both have one, else by boottime */
+static int ipa_mark_this_boot(char *what, size_t wsz)
+{
+	char line[192] = "", uu[40] = "", bt[32] = "";
+	int at = 0;
+	FILE *f = fopen(IPA_MARK, "r");
+	if (!f)
+		return 0;
+	if (!fgets(line, sizeof(line), f))
+		line[0] = 0;
+	fclose(f);
+	line[strcspn(line, "\r\n")] = 0;
+	if (sscanf(line, "%39s %31s %n", uu, bt, &at) < 2)
+		return 0;
+	snprintf(what, wsz, "%s", at > 0 ? line + at : "");
+	if (strcmp(uu, "-") && strcmp(ia_uuid, "-"))
+		return !strcmp(uu, ia_uuid);
+	return !strcmp(bt, ia_bt);
+}
+
+static int ipa_mark(const char *what)
+{
+	FILE *f = fopen(IPA_MARK ".new", "w");
+	if (!f)
+		return -1;
+	int bad = fprintf(f, "%s %s %s\n", ia_uuid, ia_bt, what) < 0;
+	bad |= fclose(f) != 0;
+	return bad || rename(IPA_MARK ".new", IPA_MARK) ? -1 : 0;
+}
+
+static void ipa_end(int ok, const char *why)
+{
+	uint64_t now = link_ms();
+	char m[96];
+	snprintf(m, sizeof(m), "%s step %d", ok ? "ok" : "failed", ia_step);
+	if (ipa_mark(m))
+		printf("ipa: auto: could not update %s (it still says started: no second run in this boot either way)\n", IPA_MARK);
+	printf("ipa: auto %s at step %d after %llu ms: %s; nothing is retried in this boot\n", ok ? "DONE" : "FAILED", ia_step,
+	       (unsigned long long)(now - ia_t0), why);
+	ia_state = IA_END;
+	cell_ipa_hold(0, ok ? "IPA bring-up done" : "IPA bring-up failed");
+}
+
+/* one step; on success the next one IA_GAP_MS later */
+static void ipa_step(uint64_t now)
+{
+	uint64_t t = now;
+	int rc = 0;
+	uint32_t ctrl = 0, def = 0;
+	switch (ia_step) {
+	case 1:
+		printf("ipa: auto step 1 IP0 vote (bcm IP0 x 0 y 0x3fff)\n");
+		rc = bcm_vote("IP0", 0, 0x3fff);
+		break;
+	case 2:
+		printf("ipa: auto step 2 pas-load %d %s/ipa_fws %#llx+%#llx\n", IPA_PAS, IPA_FW_DIR, (unsigned long long)IPA_FW_PA,
+		       (unsigned long long)IPA_FW_SIZE);
+		rc = pas_load(IPA_PAS, IPA_FW_DIR, "ipa_fws", IPA_FW_PA, IPA_FW_SIZE);
+		break;
+	case 3:
+		printf("ipa: auto step 3 smmu streams 0x520/0x522\n");
+		rc = ipa_smmu();
+		break;
+	case 4:
+		printf("ipa: auto step 4 meminit\n");
+		rc = ipa_meminit();
+		break;
+	case 5:
+		printf("ipa: auto step 5 smp2p ipa = 3\n");
+		rc = smp2p_ipa(3);
+		break;
+	case 6:
+		if (!ia_since) {
+			ia_since = now;
+			printf("ipa: auto step 6 ipaqmi on (as ipaqmi=1), the modem's 0x31/2 (max %d s)\n", IA_SERVER_MS / 1000);
+		}
+		if (!ipaqmi_ipa_on()) {
+			if (now - ia_since > IA_SERVER_MS) {
+				ipa_end(0, "step 6: the modem's ipa server 0x31/2 never showed");
+				return;
+			}
+			if (!ia_waitlog)
+				printf("ipa: auto step 6 waiting for the modem's 0x31/2\n");
+			ia_waitlog = 1;
+			ia_next = now + 500;
+			return;
+		}
+		printf("ipa: auto step 6 ok: modem ipa server known (%llu ms)\n", (unsigned long long)(now - ia_since));
+		ia_step++;
+		ia_since = 0;
+		ia_next = now + 2000;	/* the modem registers with our 0x31/1 first (it did at once on 2026-11-06) */
+		return;
+	case 7:
+		printf("ipa: auto step 7 INIT_DRIVER (as ipaqmi=2, once)\n");
+		rc = ipaqmi_ipa_send();
+		if (!rc)
+			ia_since = now;
+		break;
+	case 8: {
+		int r = ipaqmi_ipa_result(&ctrl, &def);
+		if (!r && now - ia_since <= IA_ANSWER_MS) {
+			ia_next = now + 200;
+			return;
+		}
+		printf("ipa: auto step 8 INIT_DRIVER answer: %s ctrl_ep %d default_ep %d (%llu ms)\n",
+		       r > 0 ? "ACCEPTED" : r < 0 ? "REFUSED/unanswered/server gone" : "none", (int)ctrl, (int)def,
+		       (unsigned long long)(now - ia_since));
+		ipa_end(r > 0, r > 0 ? "INIT_DRIVER accepted" : "INIT_DRIVER not accepted (see the ipaqmi lines)");
+		return;
+	}
+	}
+	uint64_t done = link_ms();
+	if (rc) {
+		char why[64];
+		snprintf(why, sizeof(why), "step %d returned %d", ia_step, rc);
+		printf("ipa: auto step %d FAILED (%llu ms)\n", ia_step, (unsigned long long)(done - t));
+		ipa_end(0, why);
+		return;
+	}
+	printf("ipa: auto step %d ok (%llu ms)\n", ia_step, (unsigned long long)(done - t));
+	ia_step++;
+	ia_next = done + IA_GAP_MS;
+}
+
+static void ipa_auto_poll(void)
+{
+	if (ia_state == IA_END)
+		return;
+	uint64_t now = link_ms();
+	if (!ia_first)
+		ia_first = now ? now : 1;
+	if (!ia_allowed && now - ia_first > 180000) {
+		ia_allowed = 1;
+		ia_allow_ms = now;
+	}
+	if (ia_state != IA_RUN && now >= ia_check) {
+		ia_check = now + 10000;
+		int on = ipa_word();
+		if (on && ia_state == IA_OFF) {
+			char what[96];
+			ipa_boot_id();
+			if (ipa_mark_this_boot(what, sizeof(what))) {
+				printf("ipa: auto: ipa=1, but %s says it already ran in this boot (%s): not again\n", IPA_MARK, what);
+				ia_state = IA_END;
+				return;
+			}
+			ia_state = IA_WAIT;
+			cell_ipa_hold(1, "ipa=1");
+			printf("ipa: auto: ipa=1: IPA bring-up %s\n", ia_allowed ? "in 15 s or less" : "15 s after the Wi-Fi bring-up");
+		} else if (!on && ia_state == IA_WAIT) {
+			ia_state = IA_OFF;
+			cell_ipa_hold(0, "ipa=1 gone before the IPA bring-up began");
+		}
+	}
+	if (ia_state == IA_WAIT && ia_allowed && now >= ia_allow_ms) {
+		ia_t0 = now;
+		ia_step = 0;
+		if (ipa_mark("started")) {
+			ipa_end(0, "could not write " IPA_MARK " (the once-per-boot guard): nothing done");
+			return;
+		}
+		printf("ipa: auto: starting (boot %s %s, %s)\n", ia_uuid, ia_bt, IPA_MARK);
+		ia_state = IA_RUN;
+		ia_step = 1;
+		ia_next = now;
+	}
+	if (ia_state == IA_RUN && now >= ia_next)
+		ipa_step(now);
+}
+
 /* the supervisor passes SIGUSR1 (drop the link, the rejoin test) on to the bring-up child */
 static volatile pid_t auto_child;
 static void forward_usr1(int sig)
@@ -1399,12 +1647,8 @@ int main(int argc, char **argv)
 		stage_init();
 		return boot_modem() ? 1 : 0;
 	} else if (!strcmp(c, "bcm") && argc > 3) {
-		/* a BCM (bus) vote: x = average, y = peak, in the BCM's own units (0x3fff = its top level); commit + valid */
-		uint32_t x = (uint32_t)strtoul(argv[2 + 1], NULL, 0) & 0x3fff, y = argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 0) & 0x3fff : x;
-		uint32_t off[1] = { 0 }, val[1] = { 1u << 30 | 1u << 29 | x << 14 | y };
-		int rc = pm_rpmh(argv[2], 1, off, val);
-		printf("bcm %s x %#x y %#x (%#x) -> %d\n", argv[2], x, y, val[0], rc);
-		return rc ? 1 : 0;
+		uint32_t x = (uint32_t)strtoul(argv[3], NULL, 0), y = argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 0) : x;
+		return bcm_vote(argv[2], x, y) ? 1 : 0;
 	} else if (!strcmp(c, "smp2p-ipa") && argc > 2) {
 		return smp2p_ipa((uint32_t)strtoul(argv[2], NULL, 0)) ? 1 : 0;
 	} else if (!strcmp(c, "ipahw")) {

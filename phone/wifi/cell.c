@@ -20,6 +20,8 @@
  *        always change duration = power cycle), then NAS Get System Selection Preference 0x34 once. Keeps the modem
  *        off LTE/NR and packet-data bring-up (no IPA driver yet: the modem dies with ERR-FATAL ps_rm 0xd1 registering
  *        LTE). Appends " sysel=<mode>/<domain>" to the status line.
+ *   IPA  (ipa=1, wland.c IPA auto) while wland's IPA bring-up is pending or running, the DMS online write, the SIM PIN
+ *        verify and X1 are held (cell_ipa_hold), as SS holds them; released when it ended, ok or not.
  * cell.on words: slots=1 hw=1 wds=1 (reads), slotswitch=1 online=1/0 pin=1 datatest=1 nolte=1 csonly=1 domain=N (writes; see
  * maybe_write, the PIN section, the X1 section and the SS section), apn=... ipfam=4|6 (X1 parameters). Message ids and
  * TLV layouts: libqmi data/qmi-service-{uim,nas,dms,wds}.json (as HakiOS vayu_cell_qmi.h).
@@ -610,6 +612,7 @@ static char x1_apn[64], x1_res[64] = "idle";
 /* SS state (see the SS section); declared here for publish, maybe_write, pin_poll and x1_poll */
 enum { SS_IDLE, SS_GET, SS_DONE };
 static int ss_state, ss_armed, ss_hold, ss_waitlog;	/* ss_hold: online write and PIN verify wait for 0x33's answer */
+static int ipa_hold;	/* wland's ipa=1 IPA bring-up is pending or running: online write, PIN verify and X1 wait (cell_ipa_hold) */
 static uint16_t ss_id, ss_txn;			/* ss_id: the SS request in flight (0 none) */
 static uint64_t ss_sent, ss_next;
 static char ss_res[64] = "?";
@@ -860,7 +863,7 @@ static int maybe_write(void)
 	}
 	int want = opts & OPT_ONLINE ? 0 : opts & OPT_LPM ? 1 : -1;
 	/* ss_hold: nolte=1/csonly=1's system selection goes first (SS section) */
-	if (want >= 0 && cur_mode >= 0 && cur_mode != want && mode_tries < 2 && srv[SVC_DMS].up && !ss_hold && !ss_id) {
+	if (want >= 0 && cur_mode >= 0 && cur_mode != want && mode_tries < 2 && srv[SVC_DMS].up && !ss_hold && !ss_id && !ipa_hold) {
 		mode_tries++;
 		if (backup_rmtfs("pre-online"))
 			return 0;
@@ -1052,7 +1055,7 @@ static void pin_poll(void)
 		pin_reply("err=timeout retries=%u\n", papp.retries);
 		next_round = now + 2000;
 	}
-	if (pin_queued && step < 0 && !wr_id && !pin_txn && !x1_id && !ss_id && !ss_hold) {
+	if (pin_queued && step < 0 && !wr_id && !pin_txn && !x1_id && !ss_id && !ss_hold && !ipa_hold) {
 		if (srv[SVC_UIM].up)
 			pin_send();
 		else {
@@ -1551,7 +1554,7 @@ static int x1_poll(uint64_t now)
 		x1_next = now + SEND_GAP_MS;
 		return 0;
 	}
-	if (step >= 0 || wr_id || pin_txn || pin_queued || ss_id || ss_hold || now < x1_next || !srv[SVC_WDS].up)
+	if (step >= 0 || wr_id || pin_txn || pin_queued || ss_id || ss_hold || ipa_hold || now < x1_next || !srv[SVC_WDS].up)
 		return 0;
 	if (x1_state == X1_UP) {
 		x1_state = X1_SET;
@@ -1582,6 +1585,16 @@ static int x1_poll(uint64_t now)
 		snprintf(x1_res, sizeof(x1_res), "err-nomem");
 	}
 	return 0;
+}
+
+/* wland.c ipa=1: hold (1) the online write, the PIN verify and X1 until the IPA bring-up ended (0), like ss_hold */
+void cell_ipa_hold(int on, const char *why)
+{
+	if (on == ipa_hold)
+		return;
+	ipa_hold = on;
+	printf("[%6llu] cell: online write, pin verify and x1 %s (%s)\n", (unsigned long long)link_ms(),
+	       on ? "held for the IPA bring-up" : "released", why);
 }
 
 void cell_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)

@@ -24,5 +24,6 @@ void cell_server_gone(uint32_t node, uint32_t port);					/* DEL_SERVER / BYE */
 void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);
 void cell_poll(void);
 void cell_allow(void);		/* Wi-Fi WLFW bring-up over: cell may start 15 s later */			/* from wland's idle loop */
-int cell_print(void);			/* `wland cell` */
+int cell_print(void);
+void cell_ipa_hold(int on, const char *why);	/* wland.c ipa=1: hold/release the online write, PIN verify and X1 */			/* `wland cell` */
 #endif

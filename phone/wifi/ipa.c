@@ -11,6 +11,9 @@
  *   wland ipahw meminit [--dry-run]   local memory: zero above the uC area, canaries of downstream ipa_4_7_mem_part,
  *                                   LOCAL_PKT_PROC_CNTXT base
  *
+ * ipa_smmu / ipa_meminit are also called in-process by wland's ipa=1 bring-up (wland.c, "IPA auto"). hwinit is not
+ * part of it: the reset values already match what it would write (2026-11-06).
+ *
  * Gate: nothing is written (or read beyond the gate) unless IPA_COMP_HW_VERSION reads 0x40070000, which also shows
  * the IP0 clock vote is in place (an unclocked IPA would not answer). No GSI channels, SMP2P, QMI or SMEM here.
  * Register offsets are from the IPA register base 0x1e40000 (ipa-base 0x1e00000 + 0x40000, downstream
@@ -106,7 +109,7 @@ static int regs(void)
 	return 0;
 }
 
-static int smmu(void)
+int ipa_smmu(void)
 {
 	if (gate())
 		return 1;
@@ -146,7 +149,7 @@ static int hwinit(int route)
 	return 0;
 }
 
-static int meminit(void)
+int ipa_meminit(void)
 {
 	if (gate())
 		return 1;
@@ -194,11 +197,11 @@ int ipa_main(int argc, char **argv)
 	if (!strcmp(argv[1], "regs"))
 		return regs();
 	if (!strcmp(argv[1], "smmu"))
-		return smmu();
+		return ipa_smmu();
 	if (!strcmp(argv[1], "hwinit"))
 		return hwinit(route);
 	if (!strcmp(argv[1], "meminit"))
-		return meminit();
+		return ipa_meminit();
 	fprintf(stderr, "wland ipa: unknown subcommand %s\n", argv[1]);
 	return 2;
 }
