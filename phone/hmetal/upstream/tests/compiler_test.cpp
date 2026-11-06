@@ -220,7 +220,7 @@ TEST(a_threadgroup_argument_starts_past_the_static_arrays) {
         std::printf("       (no compiler in this build: the threadgroup layout did not run)\n");
         return;
     }
-    auto k = compareWithFixture("tg_arg", FIX(tg_arg_air), "tg_arg", "l[r1.z+256]");
+    auto k = compareWithFixture("tg_arg", FIX(tg_arg_air), "tg_arg", "+256], ")  /* (redfin) the offset, not the register: the A620 allocates r2.x */;
     if (k) {
         CHECK(k->hasThreadgroupArg);
         CHECK_EQ(k->threadgroupArgBase, 256u);
