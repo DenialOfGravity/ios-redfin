@@ -1051,10 +1051,15 @@ static int read_phase0(void)
  * distinct rings IN USE, or just FOUR contexts allocated.  Told apart by:
  *   onering3 - ev2 + ev3 allocated, ch2 AND ch7 both on ev2 (ev3 unused): four allocations, one mapping
  *   swap     - ch2 on ev3, ch7 on ev2 (both rings in use, mapping swapped vs. mainline's table)
+ * 5e71b26: onering3 clean, swap crashed (+8.8 s): the trigger is two channels reporting to two DIFFERENT
+ * event rings; two channels on ONE ring were clean in every run (onering, onering3).  So:
+ *   onestart - ev2 only, ch2[2] and ch7[2], then START ch2 and ch7 (tx first), park with no ring traffic.
+ *              Does a shared event ring also let both channels START?  (Mainline uses one ring per
+ *              channel; a shared ring needs the chid field of the event to demultiplex.)
  * Any mode but the default stops after the starts and parks in state "up" without touching the
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
-       GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP };
+       GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART };
 static int gsitest;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1071,6 +1076,8 @@ static int read_gsistart(void)
 		return GS_ALLOC;
 	if (strstr(b, "gsistart=none"))
 		return GS_NONE;
+	if (strstr(b, "gsistart=onestart"))
+		return GS_ONESTART;
 	if (strstr(b, "gsistart=onering3"))
 		return GS_ONERING3;
 	if (strstr(b, "gsistart=swap"))
@@ -1198,14 +1205,16 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 #endif
 	{
 		int ev_tx = gsitest != GS_NONE && gsitest != GS_CH7;
-		int ev_rx = gsitest != GS_NONE && gsitest != GS_CH2 && gsitest != GS_ONERING;	/* onering3 keeps ring 3 */
+		int ev_rx = gsitest != GS_NONE && gsitest != GS_CH2 && gsitest != GS_ONERING &&
+			     gsitest != GS_ONESTART;	/* onering3 keeps ring 3 */
 		int ch_tx = gsitest != GS_NONE && gsitest != GS_EVONLY && gsitest != GS_CH7;
 		int ch_rx = gsitest != GS_NONE && gsitest != GS_EVONLY && gsitest != GS_CH2;
 		int rev = gsitest == GS_REV;
 		int tx_ring = gsitest == GS_EVOTHER ? 0 : EV_TX;	/* event ring ids that get allocated */
 		int rx_ring = gsitest == GS_EVOTHER ? 1 : EV_RX;
 		int tx_ev = gsitest == GS_SWAP ? rx_ring : tx_ring;	/* the ring each channel reports to */
-		int rx_ev = (gsitest == GS_ONERING || gsitest == GS_ONERING3 || gsitest == GS_SWAP) ?
+		int rx_ev = (gsitest == GS_ONERING || gsitest == GS_ONERING3 || gsitest == GS_SWAP ||
+		     gsitest == GS_ONESTART) ?
 			    tx_ring : rx_ring;
 
 		set_state("setup-2");
@@ -1253,7 +1262,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	if (gsitest != GS_BOTH) {
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
-						  "drop7", "onering3", "swap" };
+						  "drop7", "onering3", "swap", "onestart" };
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
@@ -1264,6 +1273,9 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 				goto failed;
 		} else if (gsitest == GS_RX) {
 			if (ch_start(CH_MDM_RX))
+				goto failed;
+		} else if (gsitest == GS_ONESTART) {
+			if (ch_start(CH_MDM_TX) || ch_start(CH_MDM_RX))
 				goto failed;
 		}
 		if (gsitest == GS_FREE)
