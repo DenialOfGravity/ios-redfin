@@ -174,6 +174,7 @@ build_hmetal() {
 	cd "$R"
 	sh phone/hmetal/build.sh || return 1
 	cp phone/hmetal/out/libhakios-metal.a phone/hmetal/out/hakios-metal-probe phone/hmetal/out/SHA256SUMS phone/hmetal/out/hmetal-host-tests.txt "$OUT/"
+	[ -d phone/hmetal/out/bench ] && cp -R phone/hmetal/out/bench "$OUT/" || true	# hmbench (ws-hm-bench): hmbench, metallib, HakiosMetal.bundle
 	[ -f "$OUT/hakios-metal-probe" ]
 }
 
