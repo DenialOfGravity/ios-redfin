@@ -30,6 +30,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -133,7 +134,7 @@ int main(int argc, char **argv)
 {
 	@autoreleasepool {
 		const char *which = NULL, *only = NULL, *dump = NULL, *logpath = NULL;
-		const char *libpath = "/var/local/hmetal/hmbench.metallib";
+		const char *libpath = "/var/local/hmetal/hmbench.metallib", *reg = "add";
 		int frames = 300, warm = 30;
 		for (int i = 1; i < argc; i++) {
 			if (!strcmp(argv[i], "--device") && i + 1 < argc) which = argv[++i];
@@ -143,6 +144,7 @@ int main(int argc, char **argv)
 			else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
 			else if (!strcmp(argv[i], "--log") && i + 1 < argc) logpath = argv[++i];
 			else if (!strcmp(argv[i], "--lib") && i + 1 < argc) libpath = argv[++i];
+			else if (!strcmp(argv[i], "--register") && i + 1 < argc) reg = argv[++i];
 			else { fprintf(stderr, "usage: hmbench --device m2v|hm [--frames N] [--warm N] [--only W1,..] [--dump DIR] [--log FILE] [--lib F]\n"); return 2; }
 		}
 		if (!which || (strcmp(which, "m2v") && strcmp(which, "hm"))) {
@@ -198,26 +200,35 @@ int main(int argc, char **argv)
 		double tDev = now_us() - t0;
 		if (!dev) { say("hmbench: -initWithAcceleratorPort: gave nil (see the plug-in's log)\n"); return 1; }
 		say("hmbench: device \"%s\" (%s) in %.1f ms\n", dev.name.UTF8String, object_getClassName(dev), tDev / 1000);
-		/* What MTLAddDevice does next for a plug-in's device: -[_MTLDevice initLimits] fills the base class's limits table
-		 * (supportsFamily: and friends read it; unfilled it is a NULL read). A device that is not an _MTLDevice of the
-		 * system's (SweetMetal2 hands out the frontend's own NativeBridgeMetalDevice) gets nothing here. */
+		/* What Metal.framework does next with a plug-in's device (MTLRegisterDevices -> MTLAddDevice): it checks the class
+		 * and fills the base class's limits (supportsFamily: and friends read them; unfilled, a NULL read). Only for a
+		 * device that is an _MTLDevice of the system's: SweetMetal2 hands out the frontend's own object and needs none.
+		 * --register add (default: MTLAddDevice when the runtime has it, else -initLimits) | limits | none */
 		{
 			Class base = NSClassFromString(@"_MTLDevice");
-			SEL il = sel_registerName("initLimits");
-			if (base && [(id)dev isKindOfClass:base] && [(id)dev respondsToSelector:il]) {
-				((void (*)(id, SEL))objc_msgSend)((id)dev, il);
-				say("hmbench: -[_MTLDevice initLimits] sent (what MTLAddDevice does)\n");
-			} else if (base && [(id)dev isKindOfClass:base]) {
+			if (base && [(id)dev isKindOfClass:base]) {
 				unsigned n = 0;
 				Method *m = class_copyMethodList(base, &n);
-				say("hmbench: _MTLDevice has no -initLimits; its init/limit methods:");
+				say("hmbench: _MTLDevice's init/limit/family/feature methods:");
 				for (unsigned i = 0; i < n; i++) {
 					const char *nm = sel_getName(method_getName(m[i]));
-					if (strcasestr(nm, "limit") || !strncmp(nm, "init", 4))
+					if (strcasestr(nm, "limit") || strcasestr(nm, "famil") || strcasestr(nm, "feature") || !strncmp(nm, "init", 4) ||
+					    !strncmp(nm, "_init", 5) || strcasestr(nm, "setup"))
 						say(" %s", nm);
 				}
 				say("\n");
 				free(m);
+				void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
+				SEL il = sel_registerName("initLimits");
+				if (!strcmp(reg, "none")) {
+					say("hmbench: --register none\n");
+				} else if (add && strcmp(reg, "limits")) {
+					add((id)dev);
+					say("hmbench: MTLAddDevice(device) (%p)\n", (void *)add);
+				} else if ([(id)dev respondsToSelector:il]) {
+					((void (*)(id, SEL))objc_msgSend)((id)dev, il);
+					say("hmbench: -[_MTLDevice initLimits] sent (MTLAddDevice: %s)\n", add ? "there, not used" : "not exported");
+				}
 			}
 		}
 
