@@ -2,9 +2,10 @@
 #define IPAGSI_H
 /*
  * ipagsi.c: the AP side of the IPA v4.7 data path (redfin / lito), polled from wland's idle loop over /dev/pmem:
- * GSI channels 5 (AP_COMMAND_TX, endpoint 7), 2 (AP_MODEM_TX, endpoint 2) and 7 (AP_MODEM_RX, endpoint 16), the
- * IPA table/header init by immediate commands on channel 5, QMAP framing, and a utun carrying the IP packets.
- * Only with ipadata=1 in cell.on, started by cell.c once X1's Start Network + Get Current Settings succeeded.
+ * GSI channels 5 (AP_COMMAND_TX, endpoint 7), 2 (AP_MODEM_TX, endpoint 2) and 7 (AP_MODEM_RX, endpoint 16),
+ * QMAP framing, and a utun carrying the IP packets.  The IPA table/header init by immediate commands on
+ * channel 5 is the part still missing (see README.ipagsi.md).  Only with ipadata=1 in cell.on, started by
+ * cell.c once X1's Start Network + Get Current Settings succeeded.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -16,10 +17,12 @@ struct ipagsi_call {
 	unsigned mtu;		/* 0: not given (1500 used) */
 };
 
-void ipagsi_start(const struct ipagsi_call *c, int tables);	/* tables: 0 = no channel 5 / table init (ipacmd=0) */
+void ipagsi_start(const struct ipagsi_call *c, int tables);	/* tables: 0 = no channel 5 / table init (ipacmd=0).
+							   One attempt per wland run: after it has run (up, failed
+							   or stopped) a second start is refused with a log. */
 void ipagsi_stop(const char *why);	/* polling and the utun end; the GSI/IPA are left as they are (no reset) */
-int ipagsi_running(void);		/* started and not failed/stopped: X1 holds the call (x1hold=1) */
-const char *ipagsi_state(void);		/* for cell.status: off|setup-N|up|failed-N|stopped */
+int ipagsi_running(void);		/* setup reached "up": X1 holds the call while it runs (x1hold=1) */
+const char *ipagsi_state(void);		/* for cell.status: off | setup-1..setup-8 | up | failed-N | stopped */
 void ipagsi_poll(void);			/* wland.c net_idle */
 
 /*

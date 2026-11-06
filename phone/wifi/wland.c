@@ -49,6 +49,7 @@
 #include "cell.h"
 #include "ipa.h"
 #include "ipaqmi.h"
+#include "ipagsi.h"
 
 static void set_stage(const char *stage);	/* wland auto: progress in /var/local/wland.boot (no-op otherwise) */
 static void ipa_auto_poll(void);		/* ipa=1 in cell.on: the IPA bring-up (IPA auto, below) */
@@ -964,6 +965,7 @@ static void net_idle(void)
 	ipa_auto_poll();	/* before cell_poll: its holds are in place before cell's first PIN verify could go */
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
 	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
+	ipagsi_poll();	/* the IPA/GSI data path and its utun, only after cell.c started it (ipagsi.c) */
 }
 
 static int net(unsigned secs)
