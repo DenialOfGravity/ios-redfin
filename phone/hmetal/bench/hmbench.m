@@ -134,7 +134,7 @@ int main(int argc, char **argv)
 {
 	@autoreleasepool {
 		const char *which = NULL, *only = NULL, *dump = NULL, *logpath = NULL;
-		const char *libpath = "/var/local/hmetal/hmbench.metallib", *reg = "add";
+		const char *libpath = "/var/local/hmetal/hmbench.metallib", *reg = NULL;
 		int frames = 300, warm = 30;
 		for (int i = 1; i < argc; i++) {
 			if (!strcmp(argv[i], "--device") && i + 1 < argc) which = argv[++i];
@@ -203,7 +203,7 @@ int main(int argc, char **argv)
 		/* What Metal.framework does next with a plug-in's device (MTLRegisterDevices -> MTLAddDevice): it checks the class
 		 * and fills the base class's limits (supportsFamily: and friends read them; unfilled, a NULL read). Only for a
 		 * device that is an _MTLDevice of the system's: SweetMetal2 hands out the frontend's own object and needs none.
-		 * --register add (default: MTLAddDevice when the runtime has it, else -initLimits) | limits | none */
+		 * --register SEL,SEL.. | none (default: hm initLimits,initGPUFamilySupport,initFeatureQueries; m2v none) */
 		{
 			Class base = NSClassFromString(@"_MTLDevice");
 			if (base && [(id)dev isKindOfClass:base]) {
@@ -218,16 +218,21 @@ int main(int argc, char **argv)
 				}
 				say("\n");
 				free(m);
-				void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
-				SEL il = sel_registerName("initLimits");
-				if (!strcmp(reg, "none")) {
-					say("hmbench: --register none\n");
-				} else if (add && strcmp(reg, "limits")) {
-					add((id)dev);
-					say("hmbench: MTLAddDevice(device) (%p)\n", (void *)add);
-				} else if ([(id)dev respondsToSelector:il]) {
-					((void (*)(id, SEL))objc_msgSend)((id)dev, il);
-					say("hmbench: -[_MTLDevice initLimits] sent (MTLAddDevice: %s)\n", add ? "there, not used" : "not exported");
+				/* MTLAddDevice itself asserts on Metal's device array, which only MTLCopyAllDevices makes (and that would
+				 * open the system's SweetMetal2 device in this process too): its setup messages are sent instead */
+				if (!reg)
+					reg = strcmp(which, "hm") ? "none" : "initLimits,initGPUFamilySupport,initFeatureQueries";
+				char list[256];
+				snprintf(list, sizeof(list), "%s", reg);
+				for (char *save = NULL, *nm = strtok_r(list, ",", &save); nm; nm = strtok_r(NULL, ",", &save)) {
+					if (!strcmp(nm, "none"))
+						break;
+					SEL sel = sel_registerName(nm);
+					if ([(id)dev respondsToSelector:sel]) {
+						((void (*)(id, SEL))objc_msgSend)((id)dev, sel);
+						say("hmbench: -[_MTLDevice %s] sent (MTLAddDevice's setup)\n", nm);
+					} else
+						say("hmbench: the device does not answer -%s\n", nm);
 				}
 			}
 		}
