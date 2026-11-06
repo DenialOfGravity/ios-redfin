@@ -42,7 +42,8 @@ AR=${AR:-$(command -v llvm-ar || echo ar)}
 "$AR" --format=darwin rcs "$OUT/libhakios-metal.a" "$OUT"/obj/*.o 2>/dev/null || "$AR" rcs "$OUT/libhakios-metal.a" "$OUT"/obj/*.o
 
 # 3. the probe (upstream tools/probe.cpp: its fixtures are this tree's own kernels, nothing of Apple's)
-"$CC" $CXXFLAGS -o "$OUT/hakios-metal-probe" "$UP/tools/probe.cpp" -x none "$OUT/libhakios-metal.a" -lc++ \
+# (-Wno-missing-field-initializers: upstream probe.cpp leaves Bindings::samplers to its default; clang 21 -Werror refuses)
+"$CC" $CXXFLAGS -Wno-missing-field-initializers -o "$OUT/hakios-metal-probe" "$UP/tools/probe.cpp" -x none "$OUT/libhakios-metal.a" -lc++ \
 	-framework IOKit -framework CoreFoundation -framework IOSurface 2>&1 | grep -v "was built for newer 'iOS' version" || true
 [ -f "$OUT/hakios-metal-probe" ] || exit 1
 strip -x "$OUT/hakios-metal-probe" 2>/dev/null || true
