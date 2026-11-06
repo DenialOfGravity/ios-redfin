@@ -105,10 +105,9 @@
 #define CH_SCR_THRESH_SHIFT	16
 
 /* CH_C_CNTXT_0 CHSTATE (GSI_CHANNEL_STATE_*), and EV_CH_E_CNTXT_0 23:20 (GSI_EVT_RING_STATE_*) */
-enum { CH_ST_DISABLED = 0, CH_ST_ALLOCATED = 1, CH_ST_ENABLED = 2, CH_ST_STARTED = 3,
-       CH_ST_STOPPED = 4, CH_ST_DB_STOPPED = 5, CH_ST_NOT_ALLOC = 0xa, CH_ST_ERROR = 0xb,
-       CH_ST_DEALLOC_PENDING = 0xe };
-enum { EV_ST_NOT_ALLOC = 0, EV_ST_ALLOCATED = 1, EV_ST_DEALLOC_PENDING = 0xe };
+enum { CH_ST_NOT_ALLOC = 0, CH_ST_ALLOCATED = 1, CH_ST_STARTED = 2, CH_ST_STOPPED = 3,
+       CH_ST_STOP_IN_PROC = 4, CH_ST_FLOW_CTRL = 5, CH_ST_ERROR = 0xf };	/* mainline gsi.h */
+enum { EV_ST_NOT_ALLOC = 0, EV_ST_ALLOCATED = 1, EV_ST_ERROR = 0xf };	/* mainline gsi.h */
 
 /* CH_CMD / EV_CH_CMD opcodes (reg value = opcode << 24 | id) */
 enum { CH_CMD_ALLOCATE = 0x0, CH_CMD_START = 0x1, CH_CMD_STOP = 0x2, CH_CMD_RESET = 0x9,
@@ -238,15 +237,13 @@ static unsigned ev_state(int ev)
 static const char *ch_state_name(unsigned s)
 {
 	switch (s) {
-	case CH_ST_DISABLED: return "disabled";
+	case CH_ST_NOT_ALLOC: return "not-alloc";
 	case CH_ST_ALLOCATED: return "allocated";
-	case CH_ST_ENABLED: return "enabled";
 	case CH_ST_STARTED: return "started";
 	case CH_ST_STOPPED: return "stopped";
-	case CH_ST_DB_STOPPED: return "db-stopped";
-	case CH_ST_NOT_ALLOC: return "not-alloc";
+	case CH_ST_STOP_IN_PROC: return "stop-in-proc";
+	case CH_ST_FLOW_CTRL: return "flow-controlled";
 	case CH_ST_ERROR: return "error";
-	case CH_ST_DEALLOC_PENDING: return "dealloc-pending";
 	default: return "?";
 	}
 }
