@@ -79,8 +79,8 @@
 #define GSI_EV_DB(ev)		(GSI_BASE + 0x11100 + (ev) * 8)
 
 /* CH_C_CNTXT_0 fields */
-#define CH_CHTYPE_MASK		0x7u		/* CHTYPE_PROTOCOL 2:0 (+ bit 13 MSB, unused at 1) */
-#define CH_CHTYPE_GPI		1u		/* GSI_CHANNEL_TYPE_GPI */
+#define CH_CHTYPE_MASK		0x7u		/* CHTYPE_PROTOCOL 2:0 (+ bit 13 MSB, 0 for values < 8) */
+#define CH_CHTYPE_GPI		2u		/* GSI_CHANNEL_TYPE_GPI = 0x2 (gsi_reg.h; 0 MHI, 1 XHCI, 3 XDCI) */
 #define CH_DIR			(1u << 3)	/* set for a channel going toward the IPA */
 #define CH_EE_SHIFT		4
 #define CH_ID_SHIFT		8
@@ -114,9 +114,9 @@ enum { CH_CMD_ALLOCATE = 0x0, CH_CMD_START = 0x1, CH_CMD_STOP = 0x2, CH_CMD_RESE
        CH_CMD_DE_ALLOC = 0xa, CH_CMD_DB_STOP = 0xb };
 enum { EV_CMD_ALLOCATE = 0x0, EV_CMD_RESET = 0x9, EV_CMD_DE_ALLOC = 0xa };
 
-/* EV_CH_E_CNTXT_0 fields: EV_CHTYPE 3:0 (GPI = 1), EV_EE 7:4 (0), EV_EVCHID 15:8 (0),
+/* EV_CH_E_CNTXT_0 fields: EV_CHTYPE 3:0 (GPI = 2), EV_EE 7:4 (0), EV_EVCHID 15:8 (0),
  * EV_INTYPE bit 16 (set), EV_CHSTATE 23:20, EV_ELEMENT_SIZE 31:24 */
-#define EV_CHTYPE_GPI		1u
+#define EV_CHTYPE_GPI		2u		/* same enum: GSI_CHANNEL_TYPE_GPI = 0x2 */
 #define EV_INTYPE		(1u << 16)
 #define EV_ELEM_SHIFT		24
 #define EV_STATE_SHIFT		20
@@ -1057,6 +1057,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		fail_state();
 		return;
 	}
+	wr32(GSI_BASE + 0x12200, 0);	/* ERROR_LOG: mainline zeroes it in gsi_setup(); it powers up stale */
 	set_state("setup-2");
 	if (tables && ev_alloc_program(EV_CMD, EV_CNT))
 		goto failed;
