@@ -43,6 +43,11 @@
 #define H 2340
 #define TEX 256
 
+/* what Metal.framework sends a plug-in's device class (MTLRegisterDevices) */
+@interface NSObject (HMBenchPlugin)
+- (id)initWithAcceleratorPort:(io_service_t)port;
+@end
+
 static FILE *gLog;
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void say(const char *fmt, ...)
@@ -186,8 +191,9 @@ int main(int argc, char **argv)
 		}
 		Class cls = NSClassFromString(@(className));
 		if (!cls) { say("hmbench: no class %s in the bundle\n", className); return 1; }
-		id (*initPort)(id, SEL, io_service_t) = (id (*)(id, SEL, io_service_t))objc_msgSend;
-		id<MTLDevice> dev = initPort([cls alloc], sel_registerName("initWithAcceleratorPort:"), svc);
+		/* an init-family call, so that ARC hands the receiver over as the plug-ins expect (SweetMTL2Device returns
+		 * another object and lets go of self: a plain objc_msgSend here released it a second time) */
+		id<MTLDevice> dev = [[cls alloc] initWithAcceleratorPort:svc];
 		double tDev = now_us() - t0;
 		if (!dev) { say("hmbench: -initWithAcceleratorPort: gave nil (see the plug-in's log)\n"); return 1; }
 		say("hmbench: device \"%s\" (%s) in %.1f ms\n", dev.name.UTF8String, object_getClassName(dev), tDev / 1000);
