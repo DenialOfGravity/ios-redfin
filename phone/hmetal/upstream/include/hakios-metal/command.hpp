@@ -354,6 +354,11 @@ public:
     // kept as long as the queue: a draw recorded against it may still be in flight. The buffer and *OUT its layout;
     // nullptr with *why.
     std::shared_ptr<Buffer> privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why);
+    // (redfin) the probe's private-memory experiments (compute::Options pvtFiberScale / pvtBufferScale): a buffer of
+    // its own, not the queue's shared one, sized as if an SP had FIBERSCALE times the chip's fibers (TOTALPVTMEMSIZE
+    // and the stride follow) and BUFFERSCALE times that again in bytes behind it (the registers do not follow)
+    std::shared_ptr<Buffer> privateMemoryScaled(uint32_t bytes, bool perWave, uint32_t fiberScale, uint32_t bufferScale, PrivateMemory* out,
+                                                std::string* why);
     // GMEM or sysmem for a pass into the target at KEY (its memory's address), by what the GPU spent on such passes:
     // each mode's time kept as a running average from the passes' own counter stamps (tuned), the cheaper one taken,
     // the other tried again now and then, sysmem tried first and GMEM next -- turnip's autotune, by time instead of samples.
@@ -414,6 +419,7 @@ private:
     std::atomic<bool> vscOverflowed_{false};
     std::vector<std::shared_ptr<Buffer>> private_[2];   // (under lock_) privateMemory's, by layout, the last the current one
     uint32_t privatePerFiber_[2] = {0, 0};
+    std::vector<std::shared_ptr<Buffer>> privateScaled_;   // (under lock_) privateMemoryScaled's, kept with the queue
     uint32_t id_;
     std::mutex lock_;
     struct Tune { double us[2] = {0, 0}; uint32_t runs[2] = {0, 0}; uint32_t passes = 0; };

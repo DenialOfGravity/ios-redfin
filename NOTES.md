@@ -429,9 +429,17 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Imported BOs: dc civac before each submit naming them and after the fence for written ones (kernel does no maintenance).
   openNativeAdrenoGpu() under -DHAKIOS_METAL_NATIVE_ADRENO (c_api, probe). Host: redfin/tests shim + fake v2 client;
   phone/hmetal/build.sh (iOS lib + probe, host tests first), README.md (H2 steps, not run).
+- hmetal (ws-hm-fix, F1): A620 dispatches start with CACHE_INVALIDATE + WFI before any CP_LOAD_STATE6 (ChipInfo::invalidateBeforeState,
+  compute::Options::invalidateFirst; A635 stream unchanged): H2 read a reused constant buffer one dispatch late. Probe: --no-invfirst
+  (A/B), pvt_fill encoded with the chosen options, first wrong pixel/sample printed for tex_copy and the address-mode lines.
+- hmetal (ws-hm-fix, F2): private-memory experiments for the A620 compute hang (compute::Options pvtForcePerFiber /
+  pvtFiberScale / pvtBufferScale, CommandQueue::privateMemoryScaled; defaults = Mesa's sizing), probe --pvt-only runs the variants.
+- hmetal (ws-hm-fix, F3): A620 wave-layout private memory sized for 2x fibersPerSp (ChipInfo::pvtPerWaveFiberScale; registers
+  and buffer): F2 on the phone hung at Mesa's sizing, ran with 4x buffer / 2x fibers / per-fiber layout. A635 unchanged.
 - hmetal MESA=1 (ws-hm-mesa): phone/hmetal/mesa = hakios-xnu-kernel 2631f5d tools/mesa (AIR front end air/, its Mesa 25.0.7
   patches, hakios-drm; MIT) + build-mesa.sh (host + iOS arm64 static Mesa libs, localbuild `build hmesa`) + gen-fixtures.sh
   (A620 compiler fixtures, A635 re-check); phone/hmetal/build.sh MESA=1 links the compiler (localbuild `build hmetal-mesa`).
 - hmetal (ws-hm-mesa): tests/fixtures/a620/*_air.hpp (59, host ir3_compiler --chip-id 0x06020000, ns kernels::a620); compiler_test
   FIX() and probe stage 6 pick the running chip's fixture (A635 fixtures re-made by our Mesa: 59/59 bit-identical to hakios').
+- hmetal (ws-hm-mesa): probe 7d/9f compare the phone's compile with this chip's host fixtures (a620/ on the A620; 7d's 4 FAILs were A635 words).
 - hmbench (ws-hm-bench): phone/hmetal/bench: one Metal workload (W1-W4) on SweetMetal2 or hakios-metal (HakiosMetalCA.m fetched at 2631f5d + 3 edits, over libhakios-metal.a), own MTLB writer for hakios' AIR kernels; built by phone/hmetal/build.sh step 4.

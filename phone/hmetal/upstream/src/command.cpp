@@ -559,6 +559,8 @@ namespace {
 // (redfin) the chip's SP cores and fibers an SP (freedreno_devices.py: the A635 2 x 128 * 2 * 16, the A620 1 x 128 * 16)
 uint32_t spCores() { return a6xx::chip().numSpCores; }
 uint32_t fibersPerSp() { return a6xx::chip().fibersPerSp; }
+// (redfin) the wave layout's extra (ChipInfo::pvtPerWaveFiberScale: 2 on the A620)
+uint32_t waveScale() { return std::max(a6xx::chip().pvtPerWaveFiberScale, 1u); }
 }  // namespace
 
 std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
@@ -567,7 +569,7 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
     if (privatePerFiber_[l] < bytes) {
         uint32_t perFiber = 512;
         while (perFiber < bytes) perFiber *= 2;
-        const uint64_t perSp = (uint64_t(perFiber) * fibersPerSp() + 4095) & ~uint64_t(4095);
+        const uint64_t perSp = (uint64_t(perFiber) * fibersPerSp() * (perWave ? waveScale() : 1u) + 4095) & ~uint64_t(4095);
         std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores(), why);
         if (b == nullptr) return nullptr;
         private_[l].push_back(std::move(b));
@@ -576,9 +578,25 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
     const uint32_t perFiber = privatePerFiber_[l];
     out->address = private_[l].back()->gpuAddress();
     out->perFiber = perFiber;
-    out->perSp = uint32_t((uint64_t(perFiber) * fibersPerSp() + 4095) & ~uint64_t(4095));
+    out->perSp = uint32_t((uint64_t(perFiber) * fibersPerSp() * (perWave ? waveScale() : 1u) + 4095) & ~uint64_t(4095));
     out->perWave = perWave;
     return private_[l].back();
+}
+
+std::shared_ptr<Buffer> CommandQueue::privateMemoryScaled(uint32_t bytes, bool perWave, uint32_t fiberScale, uint32_t bufferScale, PrivateMemory* out,
+                                                          std::string* why) {
+    std::lock_guard<std::mutex> g(lock_);
+    uint32_t perFiber = 512;
+    while (perFiber < bytes) perFiber *= 2;
+    const uint64_t perSp = (uint64_t(perFiber) * fibersPerSp() * std::max(fiberScale, 1u) + 4095) & ~uint64_t(4095);
+    std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores() * std::max(bufferScale, 1u), why);
+    if (b == nullptr) return nullptr;
+    privateScaled_.push_back(b);
+    out->address = b->gpuAddress();
+    out->perFiber = perFiber;
+    out->perSp = uint32_t(perSp);
+    out->perWave = perWave;
+    return b;
 }
 
 size_t CommandQueue::idleCommandBuffers() {

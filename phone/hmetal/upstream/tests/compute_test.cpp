@@ -197,6 +197,53 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     CHECK(over.error.find("32769 bytes of threadgroup memory: a group has 32768") != std::string::npos);
 }
 
+// (redfin) the probe's private-memory experiments: a wave-layout kernel bound to per-fiber memory under
+// pvtForcePerFiber (refused without it), and privateMemoryScaled's sizes; both dispatch on the fake
+TEST(the_private_memory_experiments_bind_what_they_say) {
+    using namespace a6xx;
+    Rig r;
+    auto out = buffer(r, 4096, 0);
+    Kernel k = kernels::fill_id;
+    k.pvtmemSize = 512;
+    k.pvtmemPerWave = true;
+    PrivateMemory pm;
+    std::string why;
+    auto fiber = r.queue->privateMemory(512, false, &pm, &why);
+    CHECK(fiber != nullptr);
+    Bindings b{{Binding{out.get(), 0}}, {}, {}, {}};
+    b.privateMemory = pm;
+    Encoded refused(r, k, kGroups16, nullptr, b);
+    CHECK(!refused.ok);
+    compute::Options o;
+    o.pvtForcePerFiber = true;
+    Encoded e(r, k, kGroups16, nullptr, b, o);
+    CHECK(e.ok);
+    CHECK_EQ(e.stream.words()[e.findReg(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3)] & A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT, 0u);
+    // the wave layout at the chip's sizing: Mesa's on the A635, twice the fibers on the A620 (probe F2); per fiber Mesa's
+    PrivateMemory w;
+    auto wave = r.queue->privateMemory(512, true, &w, &why);
+    CHECK(wave != nullptr && w.perWave);
+    CHECK_EQ(w.perSp, 512u * chip().fibersPerSp * (chip().chipId == kChipA635.chipId ? 1u : 2u));
+    CHECK_EQ(wave->length(), uint64_t(w.perSp) * chip().numSpCores);
+    CHECK_EQ(pm.perSp, 512u * chip().fibersPerSp);
+    PrivateMemory s2;
+    auto scaled = r.queue->privateMemoryScaled(512, true, 2, 3, &s2, &why);
+    CHECK(scaled != nullptr);
+    CHECK_EQ(s2.perSp, 512u * chip().fibersPerSp * 2);
+    CHECK_EQ(scaled->length(), uint64_t(s2.perSp) * chip().numSpCores * 3);
+    for (int v = 0; v < 3; v++) {
+        compute::Options d;
+        d.pvtForcePerFiber = v == 0;
+        d.pvtFiberScale = v == 1 ? 2 : 1;
+        d.pvtBufferScale = v == 2 ? 4 : 1;
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->dispatch(k, kGroups16, nullptr, Bindings{{Binding{out.get(), 0}}, {}, {}, {}}, nullptr, d));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+    }
+}
+
 // dispatchThreadgroupsWithIndirectBuffer:: the counts are read from memory when the GPU runs the dispatch. The twin
 // that shows it: they are changed after the dispatch is recorded and before it is committed, and the dispatch runs the
 // new ones. The driver params' first vec4 is then loaded from the table's copy (the last load into vec4 0 is the
@@ -526,6 +573,42 @@ TEST(an_event_with_the_timestamp_bit_writes_a_timestamp_not_the_value) {
     cb2->waitUntilCompleted();
     CHECK(cb2->status() == CommandBuffer::kCompleted);
     CHECK_EQ(r2.fake->stats().faults, 0u);
+}
+
+// (redfin) the A620 invalidates the caches (and waits) before the first state load of a dispatch, the A635 keeps its
+// stream (the one invalidate after the loads); Options::invalidateFirst off gives the A635's stream on either chip
+TEST(a_dispatch_invalidates_before_its_state_loads_where_the_chip_wants_it) {
+    Rig r;
+    auto out = buffer(r, 4096, 0);
+    auto firstInvalidate = [](const Encoded& e) {
+        const auto& w = e.stream.words();
+        for (size_t i = 0; i < w.size();) {
+            pm4::Header h = pm4::decode(w[i]);
+            if (h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_EVENT_WRITE && h.count >= 1 &&
+                (w[i + 1] & a6xx::CP_EVENT_WRITE_0_EVENT__MASK) == a6xx::CACHE_INVALIDATE)
+                return i;
+            i += 1 + h.count;
+        }
+        return size_t(-1);
+    };
+    Encoded e(r, kernels::fill_id, kGroups16, nullptr, {Binding{out.get(), 0}});
+    CHECK(e.ok);
+    const size_t inv = firstInvalidate(e), load = e.find(a6xx::CP_LOAD_STATE6_FRAG);
+    CHECK(inv != size_t(-1) && load != size_t(-1));
+    CHECK((inv < load) == a6xx::chip().invalidateBeforeState);
+    CHECK(a6xx::chip().invalidateBeforeState == (a6xx::chip().chipId != a6xx::kChipA635.chipId));
+    compute::Options o;
+    o.invalidateFirst = false;
+    Encoded off(r, kernels::fill_id, kGroups16, nullptr, Bindings{{Binding{out.get(), 0}}, {}, {}, {}}, o);
+    CHECK(off.ok);
+    CHECK(firstInvalidate(off) > off.find(a6xx::CP_LOAD_STATE6_FRAG));
+    // and the dispatch still runs on the fake
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->dispatch(kernels::fill_id, kGroups16, nullptr, std::vector<Binding>{Binding{out.get(), 0}}));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
 TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {

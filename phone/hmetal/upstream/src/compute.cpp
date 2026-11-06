@@ -134,7 +134,7 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     // private memory: the queue's (CommandBuffer::dispatch binds it), as large as the kernel's fibers want and in the
     // layout it was compiled for -- a smaller one would have one fiber's spills land in the next one's
     const PrivateMemory& pm = bindings.privateMemory;
-    if (k.pvtmemSize != 0 && (pm.address == 0 || pm.perFiber < k.pvtmemSize || pm.perWave != k.pvtmemPerWave || pm.address % 32 != 0)) {
+    if (k.pvtmemSize != 0 && (pm.address == 0 || pm.perFiber < k.pvtmemSize || pm.perWave != (k.pvtmemPerWave && !o.pvtForcePerFiber) || pm.address % 32 != 0)) {
         return refuse(why, std::string(k.name) + " wants " + n(k.pvtmemSize) + " bytes of private memory a fiber" + (k.pvtmemPerWave ? " laid out a wave" : "") +
                                ": the private memory bound has " + n(pm.perFiber) + (pm.perWave ? " laid out a wave" : "") + " at " + n(pm.address));
     }
@@ -401,6 +401,12 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     }
 
     // --- nothing is refused from here on: the stream, in computerator's order ---
+    if (o.invalidateFirst && chip().invalidateBeforeState) {
+        // (redfin) the A620: what the CPU, a blit or an earlier dispatch wrote is what the loads below read
+        // (tu_emit_cache_flush / fd6_barrier_flush run before a dispatch's state, not after it)
+        event(stream, CACHE_INVALIDATE);
+        stream.waitForIdle();
+    }
     if (o.prelude) {
         reg(stream, REG_A6XX_SP_MODE_CONTROL, A6XX_SP_MODE_CONTROL_CONSTANT_DEMOTION_ENABLE | A6XX_SP_MODE_CONTROL_ISAMMODE(ISAMMODE_GL));
         reg(stream, REG_A6XX_SP_PERFCTR_ENABLE, A6XX_SP_PERFCTR_ENABLE_CS);
@@ -631,7 +637,10 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
     std::shared_ptr<Buffer> scratch;
     if (k.pvtmemSize != 0) {
         withScratch = bindings;
-        scratch = queue_.privateMemory(k.pvtmemSize, k.pvtmemPerWave, &withScratch.privateMemory, &why);
+        const bool perWave = k.pvtmemPerWave && !options.pvtForcePerFiber;
+        scratch = options.pvtFiberScale > 1 || options.pvtBufferScale > 1
+                      ? queue_.privateMemoryScaled(k.pvtmemSize, perWave, options.pvtFiberScale, options.pvtBufferScale, &withScratch.privateMemory, &why)
+                      : queue_.privateMemory(k.pvtmemSize, perWave, &withScratch.privateMemory, &why);
         if (scratch == nullptr) {
             return fail(std::string("no private memory: ") + why);
         }

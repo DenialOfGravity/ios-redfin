@@ -44,10 +44,13 @@
 #include "../tests/fixtures/dual_fs_bc.hpp"
 #include "../tests/fixtures/tri_pos_vs_bc.hpp"
 #include "../tests/fixtures/tex_copy_air.hpp"
+#include "../tests/fixtures/a620/tex_copy_air.hpp"
 #include "../tests/fixtures/tex_copy_bc.hpp"
 #include "../tests/fixtures/tex_fill_air.hpp"
+#include "../tests/fixtures/a620/tex_fill_air.hpp"
 #include "../tests/fixtures/tex_fill_bc.hpp"
 #include "../tests/fixtures/tex_fill_h_air.hpp"
+#include "../tests/fixtures/a620/tex_fill_h_air.hpp"
 #include "../tests/fixtures/tex_fill_h_bc.hpp"
 #include "../tests/fixtures/tex_fill_arr_air.hpp"
 #include "../tests/fixtures/tex_fill_3d_air.hpp"
@@ -57,13 +60,17 @@
 #include "../tests/fixtures/tex_sample_wide_air.hpp"
 #include "../tests/fixtures/argbuf_res_bc.hpp"
 #include "../tests/fixtures/tex_sample_gid_air.hpp"
+#include "../tests/fixtures/a620/tex_sample_gid_air.hpp"
 #include "../tests/fixtures/tex_sample_gid_bc.hpp"
 #include "../tests/fixtures/tex_col16_bc.hpp"
 #include "../tests/fixtures/tri_color_fs_air.hpp"
+#include "../tests/fixtures/a620/tri_color_fs_air.hpp"
 #include "../tests/fixtures/tri_color_fs_bc.hpp"
 #include "../tests/fixtures/tri_color_vs_air.hpp"
+#include "../tests/fixtures/a620/tri_color_vs_air.hpp"
 #include "../tests/fixtures/tri_color_vs_bc.hpp"
 #include "../tests/fixtures/tri_flat_fs_air.hpp"
+#include "../tests/fixtures/a620/tri_flat_fs_air.hpp"
 #include "../tests/fixtures/tri_cflat_fs_air.hpp"
 #include "../tests/fixtures/tri_attr_vs_air.hpp"
 #include "../tests/fixtures/tri_tex_fs_air.hpp"
@@ -100,6 +107,7 @@
 #include "../tests/fixtures/tri_ctex_fs_bc.hpp"
 #include "../tests/fixtures/tri_flat_fs_bc.hpp"
 #include "../tests/fixtures/tri_flat_vs_air.hpp"
+#include "../tests/fixtures/a620/tri_flat_vs_air.hpp"
 #include "../tests/fixtures/tri_flat_vs_bc.hpp"
 
 using namespace hakios::metal;
@@ -375,7 +383,7 @@ static const char* dimName(uint8_t dim) {
 }
 
 int main(int argc, char** argv) {
-    bool recover = false, bisect = false, binTrace = false;
+    bool recover = false, bisect = false, binTrace = false, pvtOnly = false;
     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
     for (int i = 1; i < argc; i++) {
@@ -385,6 +393,10 @@ int main(int argc, char** argv) {
         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
+        // (redfin) --no-invfirst: no CACHE_INVALIDATE + WFI before a dispatch's state loads (the A635's stream; the A/B)
+        if (strcmp(argv[i], "--no-invfirst") == 0) chosen.invalidateFirst = false;
+        // (redfin) --pvt-only: stage 6z's private-memory variants alone, then exit
+        if (strcmp(argv[i], "--pvt-only") == 0) pvtOnly = true;
         if (strcmp(argv[i], "--metallib") == 0 && i + 2 < argc) {
             metallibs.emplace_back(argv[i + 1], argv[i + 2]);
             i += 2;
@@ -873,7 +885,8 @@ int main(int argc, char** argv) {
 
     // 6z. private memory in a dispatch: pvt_fill keeps a[128] a fiber (512 bytes, stp/ldp), each thread's own values,
     // and writes a[gid & 127]; 4096 threads, every word 3 (gid & 127) + (gid >> 7) + 1, and the canary past the grid
-    {
+    // (redfin) as a lambda of the options and a label suffix, for --pvt-only's variants (the A620 compute hang)
+    auto pvtFill = [&](const compute::Options& po, const std::string& variant) {
         auto out = newBuffer(gpu, 4 * 4096 + 256, &why);
         if (out == nullptr) {
             report(false, "private memory in a dispatch: the buffer: " + why);
@@ -882,7 +895,7 @@ int main(int argc, char** argv) {
             for (uint32_t i = 0; i < 4096 + 64; i++) w[i] = 0xa5a5a5a5u;
             const uint32_t groups[3] = {64, 1, 1}, local[3] = {64, 1, 1};
             auto cb = queue->commandBuffer();
-            if (cb->dispatch(kernels::pvt_fill_air, groups, local, {Binding{out.get(), 0}})) {
+            if (cb->dispatch(kernels::pvt_fill_air, groups, local, {Binding{out.get(), 0}}, nullptr, po)) {
                 cb->commit();
                 cb->waitUntilCompleted();
             }
@@ -890,10 +903,27 @@ int main(int argc, char** argv) {
             for (uint32_t g = 0; g < 4096; g++) right += w[g] == 3 * (g & 127) + (g >> 7) + 1;
             for (uint32_t g = 4096; g < 4096 + 64; g++) tail += w[g] == 0xa5a5a5a5u;
             report(cb->status() == CommandBuffer::kCompleted && right == 4096 && tail == 64,
-                   "private memory in a dispatch, a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
+                   "private memory in a dispatch" + variant + ", a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
                        std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
         }
+    };
+    if (pvtOnly) {
+        // (redfin) the variants, least changed first: Mesa's sizing per fiber (the FS draw of 9x that passes is
+        // per-fiber), per wave with twice the fibers, per wave with the registers as Mesa and 4x the bytes behind them
+        compute::Options a = chosen;
+        a.pvtForcePerFiber = true;
+        pvtFill(a, " [per-fiber layout]");
+        compute::Options b = chosen;
+        b.pvtBufferScale = 4;
+        pvtFill(b, " [per-wave, Mesa's registers, 4x the buffer]");
+        compute::Options c = chosen;
+        c.pvtFiberScale = 2;
+        pvtFill(c, " [per-wave, 2x fibers an SP]");
+        pvtFill(chosen, " [as compiled: per-wave, the chip's sizing (A620: 2x fibers)]");
+        std::printf("probe: %d failure%s (--pvt-only)\n", failures, failures == 1 ? "" : "s");
+        return failures == 0 ? 0 : 1;
     }
+    pvtFill(chosen, "");
 
     // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
     // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
@@ -1626,6 +1656,7 @@ int main(int argc, char** argv) {
                     const uint32_t groups[3] = {2, 1, 1};
                     auto cb = runTex(kernels::tex_copy_air, groups, local88, b);
                     uint32_t right = 0;
+                    std::string firstBad;   // (redfin) the first wrong pixel, got and wanted
                     for (uint32_t y = 0; y < H; y++)
                         for (uint32_t x = 0; x < W; x++) {
                             uint32_t v[4];
@@ -1633,8 +1664,14 @@ int main(int argc, char** argv) {
                             bool ok = true;
                             for (uint32_t l = 0; l < 4; l++) ok = ok && v[l] == (l < f.channels ? chan(x, y, l) : l == 3 ? 1u : 0u);
                             right += ok;
+                            if (!ok && firstBad.empty()) {
+                                char t[160];
+                                snprintf(t, sizeof t, " (first wrong at %u,%u: got %x %x %x %x wanted %x %x %x %x)", x, y, v[0], v[1], v[2], v[3],
+                                         chan(x, y, 0), f.channels > 1 ? chan(x, y, 1) : 0u, f.channels > 2 ? chan(x, y, 2) : 0u, f.channels > 3 ? chan(x, y, 3) : 1u);
+                                firstBad = t;
+                            }
                         }
-                    report(completed(*cb) && right == W * H, label + ": " + std::to_string(right) + " of 128 pixels each lane as written (absent ones 0, alpha 1)" + status(*cb, gpu));
+                    report(completed(*cb) && right == W * H, label + ": " + std::to_string(right) + " of 128 pixels each lane as written (absent ones 0, alpha 1)" + firstBad + status(*cb, gpu));
                 }
             }
 
@@ -1698,6 +1735,7 @@ int main(int argc, char** argv) {
                         auto cb = runTex(kernels::tex_sample_wide_air, groups, local, b);
                         const float* got = static_cast<const float*>(out->contents());
                         uint32_t right = 0, apart = 0;
+                        std::string firstBad;   // (redfin) the first wrong sample, got and wanted
                         for (uint32_t gy = 0; gy < GH; gy++)
                             for (uint32_t gx = 0; gx < GW; gx++) {
                                 const int ix = int(std::floor(((gx + 0.5) / GW * 3 - 1) * TW)), iy = int(std::floor(((gy + 0.5) / GH * 3 - 1) * TH));
@@ -1724,11 +1762,17 @@ int main(int argc, char** argv) {
                                 }
                                 right += ok;
                                 apart += ok && differs;
+                                if (!ok && firstBad.empty()) {
+                                    char t[200];
+                                    snprintf(t, sizeof t, " (first wrong at %u,%u: got %g %g %g %g wanted %g %g %g %g)", gx, gy, g[0], g[1], g[2], g[3], want[0], want[1],
+                                             want[2], want[3]);
+                                    firstBad = t;
+                                }
                             }
                         report(completed(*cb) && right == GW * GH && apart >= 40,
                                std::string("address mode ") + c.name + " over a 5x3 texture sampled on [-1, 2]: " + std::to_string(right) + " of " +
                                    std::to_string(GW * GH) + " samples its own rule, " + std::to_string(apart) + " of them where the nearest other rule differs" +
-                                   status(*cb, gpu));
+                                   firstBad + status(*cb, gpu));
                     }
                 }
             }
@@ -1747,10 +1791,13 @@ int main(int argc, char** argv) {
                 };
                 // tex_fill_h last: its store is typed f16 only by the front end as fixed on 29 October, so this line is also
                 // the proof that the phone's compiler carries that front end (and not the one that typed every write as uint)
-                const Pair pairs[] = {{kernels::tex_fill_bc, kernels::tex_fill_bc_size, &kernels::tex_fill_air, "tex_fill.ll"},
-                                      {kernels::tex_copy_bc, kernels::tex_copy_bc_size, &kernels::tex_copy_air, "tex_copy.ll"},
-                                      {kernels::tex_sample_gid_bc, kernels::tex_sample_gid_bc_size, &kernels::tex_sample_gid_air, "tex_sample_gid.ll"},
-                                      {kernels::tex_fill_h_bc, kernels::tex_fill_h_bc_size, &kernels::tex_fill_h_air, "tex_fill_h.ll"}};
+                // (redfin) against the host compiler's words for this chip (tests/fixtures/a620/ on the A620)
+                const bool a620 = a6xx::chip().chipId == a6xx::kChipA620.chipId;
+                const Kernel* texFillFix = a620 ? &kernels::a620::tex_fill_air : &kernels::tex_fill_air;
+                const Pair pairs[] = {{kernels::tex_fill_bc, kernels::tex_fill_bc_size, texFillFix, "tex_fill.ll"},
+                                      {kernels::tex_copy_bc, kernels::tex_copy_bc_size, a620 ? &kernels::a620::tex_copy_air : &kernels::tex_copy_air, "tex_copy.ll"},
+                                      {kernels::tex_sample_gid_bc, kernels::tex_sample_gid_bc_size, a620 ? &kernels::a620::tex_sample_gid_air : &kernels::tex_sample_gid_air, "tex_sample_gid.ll"},
+                                      {kernels::tex_fill_h_bc, kernels::tex_fill_h_bc_size, a620 ? &kernels::a620::tex_fill_h_air : &kernels::tex_fill_h_air, "tex_fill_h.ll"}};
                 for (const Pair& p : pairs) {
                     std::string whyCompile;
                     auto compiled = compileAir(p.bc, p.size, &whyCompile);
@@ -1761,7 +1808,7 @@ int main(int argc, char** argv) {
                     bool same = false;
                     std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
                     report(same, std::string("compile ") + p.name + " on the phone: " + text);
-                    if (same && p.fixture == &kernels::tex_fill_air) {
+                    if (same && p.fixture == texFillFix) {
                         texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
                                 "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
                     }
@@ -6173,10 +6220,11 @@ int main(int argc, char** argv) {
                 const Stage* fixture;
                 const char* name;
             };
-            const StagePair pairs[] = {{kernels::tri_flat_vs_bc, kernels::tri_flat_vs_bc_size, &kernels::tri_flat_vs_air, "tri_flat_vs.ll"},
-                                       {kernels::tri_flat_fs_bc, kernels::tri_flat_fs_bc_size, &kernels::tri_flat_fs_air, "tri_flat_fs.ll"},
-                                       {kernels::tri_color_vs_bc, kernels::tri_color_vs_bc_size, &kernels::tri_color_vs_air, "tri_color_vs.ll"},
-                                       {kernels::tri_color_fs_bc, kernels::tri_color_fs_bc_size, &kernels::tri_color_fs_air, "tri_color_fs.ll"}};
+            const bool a620s = a6xx::chip().chipId == a6xx::kChipA620.chipId;   // (redfin) this chip's host fixtures
+            const StagePair pairs[] = {{kernels::tri_flat_vs_bc, kernels::tri_flat_vs_bc_size, a620s ? &kernels::a620::tri_flat_vs_air : &kernels::tri_flat_vs_air, "tri_flat_vs.ll"},
+                                       {kernels::tri_flat_fs_bc, kernels::tri_flat_fs_bc_size, a620s ? &kernels::a620::tri_flat_fs_air : &kernels::tri_flat_fs_air, "tri_flat_fs.ll"},
+                                       {kernels::tri_color_vs_bc, kernels::tri_color_vs_bc_size, a620s ? &kernels::a620::tri_color_vs_air : &kernels::tri_color_vs_air, "tri_color_vs.ll"},
+                                       {kernels::tri_color_fs_bc, kernels::tri_color_fs_bc_size, a620s ? &kernels::a620::tri_color_fs_air : &kernels::tri_color_fs_air, "tri_color_fs.ll"}};
             std::shared_ptr<CompiledStage> compiled[4];
             for (int i = 0; i < 4; i++) {
                 std::string whyCompile;
