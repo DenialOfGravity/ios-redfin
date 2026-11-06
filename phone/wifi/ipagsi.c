@@ -303,8 +303,16 @@ static int ev_alloc_program(int ev, uint32_t cnt)
 	if (ring_clear(r))
 		return -1;
 
-	/* the order mainline uses: program the context, then ALLOCATE, then ring the doorbell
-	 * with the address of the last element (nothing consumed yet) */
+	wr32(GSI_EV_CH_CMD, EV_CMD_ALLOCATE << 24 | (unsigned) ev);
+	if (wait_state(off, EV_STATE_SHIFT, EV_ST_NOT_ALLOC, 100, "evt allocate"))
+		return -1;
+	st = ev_state(ev);
+	if (st != EV_ST_ALLOCATED) {
+		LOG("evt ring %d after allocate: state %x", ev, st);
+		return -1;
+	}
+	/* mainline order (gsi_channel_setup_one): ALLOCATE first, then program the context and
+	 * ring the doorbell.  Context written while the ring is NOT_ALLOCATED does not stick. */
 	wr32(off + 0x00, EV_CHTYPE_GPI | EV_INTYPE | (RING_ELEM << EV_ELEM_SHIFT));
 	wr32(off + 0x04, cnt * RING_ELEM & 0xffff);
 	wr32(off + 0x08, (uint32_t) r->pa);
@@ -316,14 +324,6 @@ static int ev_alloc_program(int ev, uint32_t cnt)
 	wr32(off + 0x30, 0);			/* read pointer update (not used) */
 	wr32(off + 0x34, 0);
 
-	wr32(GSI_EV_CH_CMD, EV_CMD_ALLOCATE << 24 | (unsigned) ev);
-	if (wait_state(off, EV_STATE_SHIFT, EV_ST_NOT_ALLOC, 100, "evt allocate"))
-		return -1;
-	st = ev_state(ev);
-	if (st != EV_ST_ALLOCATED) {
-		LOG("evt ring %d after allocate: state %x", ev, st);
-		return -1;
-	}
 	wr32(GSI_EV_DB(ev), (uint32_t) (r->pa + (uint64_t) (cnt - 1) * RING_ELEM));
 	LOG("evt ring %d pa %llx cnt %u ok", ev, (unsigned long long) r->pa, cnt);
 	return 0;
@@ -351,6 +351,16 @@ static int ch_alloc_program(int ch, int ev, uint32_t cnt, int toward_ipa, int co
 	if (ring_clear(r))
 		return -1;
 
+	wr32(GSI_CH_CMD, CH_CMD_ALLOCATE << 24 | (unsigned) ch);
+	if (wait_state(off, CH_STATE_SHIFT, CH_ST_NOT_ALLOC, 100, "ch allocate"))
+		return -1;
+	st = ch_state(ch);
+	if (st != CH_ST_ALLOCATED) {
+		LOG("ch %d after allocate: state %s (%x)", ch, ch_state_name(st), st);
+		return -1;
+	}
+	/* mainline order: ALLOCATE, then gsi_channel_program() (context written before ALLOCATE
+	 * is lost, which left START with an empty ring) */
 	/* CH_C_CNTXT_0: the CH_EE and CHID fields are left 0 as mainline leaves them (the
 	 * ALLOCATE command fills them in for our EE); ERINDEX says which event ring reports. */
 	wr32(off + 0x00, CH_CHTYPE_GPI | (toward_ipa ? CH_DIR : 0) |
@@ -382,14 +392,6 @@ static int ch_alloc_program(int ch, int ev, uint32_t cnt, int toward_ipa, int co
 		wr32(GSI_CH_C_SCRATCH_3(ch), keep | (2u * RING_ELEM) << CH_SCR_THRESH_SHIFT);
 	}
 
-	wr32(GSI_CH_CMD, CH_CMD_ALLOCATE << 24 | (unsigned) ch);
-	if (wait_state(off, CH_STATE_SHIFT, CH_ST_NOT_ALLOC, 100, "ch allocate"))
-		return -1;
-	st = ch_state(ch);
-	if (st != CH_ST_ALLOCATED) {
-		LOG("ch %d after allocate: state %s (%x)", ch, ch_state_name(st), st);
-		return -1;
-	}
 	LOG("ch %d pa %llx cnt %u evt %d %s ok", ch, (unsigned long long) r->pa, cnt, ev,
 	    toward_ipa ? "tx" : "rx");
 	return 0;
@@ -404,8 +406,14 @@ static int ch_start(int ch)
 		return -1;
 	}
 	wr32(GSI_CH_CMD, CH_CMD_START << 24 | (unsigned) ch);
-	if (wait_state(GSI_CH_C_CNTXT_0(ch), CH_STATE_SHIFT, st, 100, "ch start"))
+	if (wait_state(GSI_CH_C_CNTXT_0(ch), CH_STATE_SHIFT, st, 100, "ch start")) {
+		LOG("ch %d ctx %08x %08x %08x %08x qos %08x scr %08x %08x %08x %08x err %08x", ch,
+		    rd32(GSI_CH_C_CNTXT_0(ch)), rd32(GSI_CH_C_CNTXT_1(ch)), rd32(GSI_CH_C_CNTXT_2(ch)),
+		    rd32(GSI_CH_C_CNTXT_3(ch)), rd32(GSI_CH_C_QOS(ch)), rd32(GSI_CH_C_SCRATCH_0(ch)),
+		    rd32(GSI_CH_C_SCRATCH_1(ch)), rd32(GSI_CH_C_SCRATCH_2(ch)), rd32(GSI_CH_C_SCRATCH_3(ch)),
+		    rd32(GSI_BASE + 0x12200));
 		return -1;
+	}
 	st = ch_state(ch);
 	if (st != CH_ST_STARTED) {
 		LOG("ch %d after start: state %s (%x)", ch, ch_state_name(st), st);
