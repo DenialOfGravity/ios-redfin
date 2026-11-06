@@ -384,6 +384,8 @@ int main(int argc, char** argv) {
         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
+        // (redfin) --no-invfirst: no CACHE_INVALIDATE + WFI before a dispatch's state loads (the A635's stream; the A/B)
+        if (strcmp(argv[i], "--no-invfirst") == 0) chosen.invalidateFirst = false;
         if (strcmp(argv[i], "--metallib") == 0 && i + 2 < argc) {
             metallibs.emplace_back(argv[i + 1], argv[i + 2]);
             i += 2;
@@ -880,7 +882,7 @@ int main(int argc, char** argv) {
             for (uint32_t i = 0; i < 4096 + 64; i++) w[i] = 0xa5a5a5a5u;
             const uint32_t groups[3] = {64, 1, 1}, local[3] = {64, 1, 1};
             auto cb = queue->commandBuffer();
-            if (cb->dispatch(kernels::pvt_fill_air, groups, local, {Binding{out.get(), 0}})) {
+            if (cb->dispatch(kernels::pvt_fill_air, groups, local, {Binding{out.get(), 0}}, nullptr, chosen)) {
                 cb->commit();
                 cb->waitUntilCompleted();
             }
@@ -1624,6 +1626,7 @@ int main(int argc, char** argv) {
                     const uint32_t groups[3] = {2, 1, 1};
                     auto cb = runTex(kernels::tex_copy_air, groups, local88, b);
                     uint32_t right = 0;
+                    std::string firstBad;   // (redfin) the first wrong pixel, got and wanted
                     for (uint32_t y = 0; y < H; y++)
                         for (uint32_t x = 0; x < W; x++) {
                             uint32_t v[4];
@@ -1631,8 +1634,14 @@ int main(int argc, char** argv) {
                             bool ok = true;
                             for (uint32_t l = 0; l < 4; l++) ok = ok && v[l] == (l < f.channels ? chan(x, y, l) : l == 3 ? 1u : 0u);
                             right += ok;
+                            if (!ok && firstBad.empty()) {
+                                char t[160];
+                                snprintf(t, sizeof t, " (first wrong at %u,%u: got %x %x %x %x wanted %x %x %x %x)", x, y, v[0], v[1], v[2], v[3],
+                                         chan(x, y, 0), f.channels > 1 ? chan(x, y, 1) : 0u, f.channels > 2 ? chan(x, y, 2) : 0u, f.channels > 3 ? chan(x, y, 3) : 1u);
+                                firstBad = t;
+                            }
                         }
-                    report(completed(*cb) && right == W * H, label + ": " + std::to_string(right) + " of 128 pixels each lane as written (absent ones 0, alpha 1)" + status(*cb, gpu));
+                    report(completed(*cb) && right == W * H, label + ": " + std::to_string(right) + " of 128 pixels each lane as written (absent ones 0, alpha 1)" + firstBad + status(*cb, gpu));
                 }
             }
 
@@ -1696,6 +1705,7 @@ int main(int argc, char** argv) {
                         auto cb = runTex(kernels::tex_sample_wide_air, groups, local, b);
                         const float* got = static_cast<const float*>(out->contents());
                         uint32_t right = 0, apart = 0;
+                        std::string firstBad;   // (redfin) the first wrong sample, got and wanted
                         for (uint32_t gy = 0; gy < GH; gy++)
                             for (uint32_t gx = 0; gx < GW; gx++) {
                                 const int ix = int(std::floor(((gx + 0.5) / GW * 3 - 1) * TW)), iy = int(std::floor(((gy + 0.5) / GH * 3 - 1) * TH));
@@ -1722,11 +1732,17 @@ int main(int argc, char** argv) {
                                 }
                                 right += ok;
                                 apart += ok && differs;
+                                if (!ok && firstBad.empty()) {
+                                    char t[200];
+                                    snprintf(t, sizeof t, " (first wrong at %u,%u: got %g %g %g %g wanted %g %g %g %g)", gx, gy, g[0], g[1], g[2], g[3], want[0], want[1],
+                                             want[2], want[3]);
+                                    firstBad = t;
+                                }
                             }
                         report(completed(*cb) && right == GW * GH && apart >= 40,
                                std::string("address mode ") + c.name + " over a 5x3 texture sampled on [-1, 2]: " + std::to_string(right) + " of " +
                                    std::to_string(GW * GH) + " samples its own rule, " + std::to_string(apart) + " of them where the nearest other rule differs" +
-                                   status(*cb, gpu));
+                                   firstBad + status(*cb, gpu));
                     }
                 }
             }

@@ -528,6 +528,42 @@ TEST(an_event_with_the_timestamp_bit_writes_a_timestamp_not_the_value) {
     CHECK_EQ(r2.fake->stats().faults, 0u);
 }
 
+// (redfin) the A620 invalidates the caches (and waits) before the first state load of a dispatch, the A635 keeps its
+// stream (the one invalidate after the loads); Options::invalidateFirst off gives the A635's stream on either chip
+TEST(a_dispatch_invalidates_before_its_state_loads_where_the_chip_wants_it) {
+    Rig r;
+    auto out = buffer(r, 4096, 0);
+    auto firstInvalidate = [](const Encoded& e) {
+        const auto& w = e.stream.words();
+        for (size_t i = 0; i < w.size();) {
+            pm4::Header h = pm4::decode(w[i]);
+            if (h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_EVENT_WRITE && h.count >= 1 &&
+                (w[i + 1] & a6xx::CP_EVENT_WRITE_0_EVENT__MASK) == a6xx::CACHE_INVALIDATE)
+                return i;
+            i += 1 + h.count;
+        }
+        return size_t(-1);
+    };
+    Encoded e(r, kernels::fill_id, kGroups16, nullptr, {Binding{out.get(), 0}});
+    CHECK(e.ok);
+    const size_t inv = firstInvalidate(e), load = e.find(a6xx::CP_LOAD_STATE6_FRAG);
+    CHECK(inv != size_t(-1) && load != size_t(-1));
+    CHECK((inv < load) == a6xx::chip().invalidateBeforeState);
+    CHECK(a6xx::chip().invalidateBeforeState == (a6xx::chip().chipId != a6xx::kChipA635.chipId));
+    compute::Options o;
+    o.invalidateFirst = false;
+    Encoded off(r, kernels::fill_id, kGroups16, nullptr, Bindings{{Binding{out.get(), 0}}, {}, {}, {}}, o);
+    CHECK(off.ok);
+    CHECK(firstInvalidate(off) > off.find(a6xx::CP_LOAD_STATE6_FRAG));
+    // and the dispatch still runs on the fake
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->dispatch(kernels::fill_id, kGroups16, nullptr, std::vector<Binding>{Binding{out.get(), 0}}));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
     Rig r;
     if (!a6xx::chip().hasLpac) {

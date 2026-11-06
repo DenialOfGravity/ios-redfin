@@ -109,6 +109,9 @@ struct Options {
     bool hlsqCopies = true;     // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
     bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
     bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
+    // (redfin) CACHE_INVALIDATE + WFI before any state load, where the chip wants it (ChipInfo::invalidateBeforeState,
+    // the A620); off: the stream is the A635's on every chip (the probe's A/B of it)
+    bool invalidateFirst = true;
     bool marker = true;         // CP_SET_MARKER RM6_COMPUTE
     bool tail = true;           // the end: RB_DONE_TS, a wait for it, CACHE_FLUSH_TS, a wait for it
     bool tailRbDone = true;     // ... the RB_DONE_TS half of it

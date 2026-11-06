@@ -401,6 +401,12 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     }
 
     // --- nothing is refused from here on: the stream, in computerator's order ---
+    if (o.invalidateFirst && chip().invalidateBeforeState) {
+        // (redfin) the A620: what the CPU, a blit or an earlier dispatch wrote is what the loads below read
+        // (tu_emit_cache_flush / fd6_barrier_flush run before a dispatch's state, not after it)
+        event(stream, CACHE_INVALIDATE);
+        stream.waitForIdle();
+    }
     if (o.prelude) {
         reg(stream, REG_A6XX_SP_MODE_CONTROL, A6XX_SP_MODE_CONTROL_CONSTANT_DEMOTION_ENABLE | A6XX_SP_MODE_CONTROL_ISAMMODE(ISAMMODE_GL));
         reg(stream, REG_A6XX_SP_PERFCTR_ENABLE, A6XX_SP_PERFCTR_ENABLE_CS);

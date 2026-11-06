@@ -429,3 +429,6 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Imported BOs: dc civac before each submit naming them and after the fence for written ones (kernel does no maintenance).
   openNativeAdrenoGpu() under -DHAKIOS_METAL_NATIVE_ADRENO (c_api, probe). Host: redfin/tests shim + fake v2 client;
   phone/hmetal/build.sh (iOS lib + probe, host tests first), README.md (H2 steps, not run).
+- hmetal (ws-hm-fix, F1): A620 dispatches start with CACHE_INVALIDATE + WFI before any CP_LOAD_STATE6 (ChipInfo::invalidateBeforeState,
+  compute::Options::invalidateFirst; A635 stream unchanged): H2 read a reused constant buffer one dispatch late. Probe: --no-invfirst
+  (A/B), pvt_fill encoded with the chosen options, first wrong pixel/sample printed for tex_copy and the address-mode lines.

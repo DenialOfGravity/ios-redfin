@@ -1447,6 +1447,10 @@ struct ChipInfo {
     bool hasFsTexPrefetch;
     bool indirectDrawWfmQuirk;    // gen1: CP_WAIT_FOR_ME before an indirect draw (turnip draw_wfm)
     bool depthBoundsRequireDepthTestQuirk;   // gen1 (nothing here enables depth bounds: Metal has none)
+    // (redfin) CACHE_INVALIDATE + WFI at the very start of a dispatch, before its CP_LOAD_STATE6 loads. On the A620
+    // the indirect loads (constants, descriptors) read UCHE lines the dispatch's later invalidate had not yet dropped:
+    // probe H2 read a reused constant buffer one dispatch late. Gallium/turnip both flush before emitting state.
+    bool invalidateBeforeState;
     uint32_t numCcu;
     uint32_t numSpCores;
     uint32_t fibersPerSp;
@@ -1467,7 +1471,7 @@ inline constexpr ChipInfo kChipA635{
     "a635 (Adreno 7c+ Gen 3)", kChipId, 0xffffffffu, 4,
     kHasLpac, /*hasLrzFeedback*/ true, kHasEarlyPreamble, /*hasCpRegWrite*/ false, kHasGmemFastClear, kConcurrentResolve,
     /*hasTexFilterCubic*/ true, kSupportsDoubleThreadsize, /*hasFsTexPrefetch*/ true,
-    /*indirectDrawWfmQuirk*/ false, /*depthBoundsRequireDepthTestQuirk*/ false,
+    /*indirectDrawWfmQuirk*/ false, /*depthBoundsRequireDepthTestQuirk*/ false, /*invalidateBeforeState*/ false,
     kNumCcu, kNumSpCores, kFibersPerSp, kCsSharedMemSize, kWaveGranularity, kInstrCacheSize, /*regSizeVec4*/ 64,
     kSysmemPerCcuDepthCacheSize, kSysmemPerCcuColorCacheSize, kGmemBytes, kGmemCcuColorCacheFraction,
     kTileAlignW, kTileAlignH, kGmemAlignW, kGmemAlignH, kTileMaxW, kTileMaxH, /*numVscPipes*/ 32, /*hbb*/ 15,
@@ -1486,7 +1490,7 @@ inline constexpr ChipInfo kChipA620{
     "a620 (Adreno 620)", 0x06020000, 0xffffff00u, 1,
     /*hasLpac*/ false, /*hasLrzFeedback*/ false, /*hasEarlyPreamble*/ false, /*hasCpRegWrite*/ true, /*hasGmemFastClear*/ true,
     /*concurrentResolve*/ false, /*hasTexFilterCubic*/ false, /*supportsDoubleThreadsize*/ true, /*hasFsTexPrefetch*/ true,
-    /*indirectDrawWfmQuirk*/ true, /*depthBoundsRequireDepthTestQuirk*/ true,
+    /*indirectDrawWfmQuirk*/ true, /*depthBoundsRequireDepthTestQuirk*/ true, /*invalidateBeforeState*/ true,
     /*numCcu*/ 1, /*numSpCores*/ 1, /*fibersPerSp*/ 128 * 16, /*csSharedMemSize*/ 32 * 1024, /*waveGranularity*/ 2,
     /*instrCacheSize*/ 64, /*regSizeVec4*/ 96, 0x10000, 0x10000, /*gmemBytes*/ 512 * 1024, /*QUARTER*/ 4,
     32, 16, 16, 4, 1024, 1008, /*numVscPipes*/ 32, /*hbb (Mesa default)*/ 15,
