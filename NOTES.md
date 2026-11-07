@@ -485,3 +485,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi 64a1491 onering long (2026-11-07 r5au1): ev2 + ch2/ch7 allocated, clean 270 s. Phone left in ipaphase=0.
 - 2026-11-07 03:46 ipagsi.c (agent): eedump=1 as a separate cell.on word (any gsistart mode): logs modem EE1 states on change + ring base words.
 - ipagsi 9a9576e eedump=1 (2026-11-07 r5au1): none clean (modem EE1 ch3-7 start/stop at +45/+55 s), c2start clean (EE1 idle), ch3 CLEAN 180+ s (EE1 idle; ch3 crashed twice before with the same alloc path). Modem rings at 0x9ba5/0x9d5c, ours 0x106e/0x1070. Phone left in ipaphase=0.
+- ipagsi rate runs 9a9576e (2026-11-07 r5au1): ch3 x3 -> modem cycled 2/3, both crashed right after its EE1 ch7 start; c2start x3 -> modem cycled 3/3 (EE1 ch4-7 started, stayed), no crash. No AP-side event before the modem cycles. Phone left in ipaphase=0.
