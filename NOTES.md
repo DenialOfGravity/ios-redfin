@@ -472,3 +472,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 00:31 ipagsi.c: gsistart=late (45 s delay then onestart shape) and tlvmin (onestart with tlv 2/2); crashes cluster at ~157-158 s uptime
 - ipagsi ed88147 late run (2026-11-07 r5au1): channels allocated on ev2 after 45 s but not STARTed: gsistart re-read at setup-5 undoes the late/tlvmin -> onestart mapping, nm[] lacks tlvmin/late (prints (null), OOB). No crash. tlvmin not run. Phone left in ipaphase=0.
 - 2026-11-07 00:58 ipagsi.c: fix late/tlvmin (no gsistart re-read at setup-5, nm[] extended)
+- ipagsi 5d54ae9 late (2026-11-07 r5au1): ch2+ch7 STARTed on ev2 at 205 s (45 s after the call) -> modem assert ipa_hal.c:7354 at 293 s (+88 s, 106->107 took 3.7 s). Late START delays but does not prevent the crash. tlvmin not run. Phone left in ipaphase=0.
