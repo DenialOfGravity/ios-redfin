@@ -481,3 +481,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 02:54 ipagsi.c (agent): gsistart=ev4hi (event rings 4-7, no channels) and ev01 (rings 0,1): count vs. ring-id collision.
 - ipagsi e59808d ev4hi (2026-11-07 r5au1): event rings 4-7, no channels -> modem assert +8.9 s. A count, not the ring ids. ev01 not run. Phone left in ipaphase=0.
 - 2026-11-07 03:19 ipagsi.c (agent): gsistart=eedump (ch3 shape + read-only dump of the modem EE1 GSI channel/ring states every 250 ms for 15 s).
+- ipagsi 64a1491 eedump (2026-11-07 r5au1): EE1 readable. Modem EE1 ch 7 stopped->started at ~163.9 s next to smp2p 106 (163.83), assert 164.45 (+8.2 s); EE1 err 0 throughout.
