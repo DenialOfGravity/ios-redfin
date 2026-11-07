@@ -503,3 +503,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi 8e237eb p2low (2026-11-07 r5au1): FASTRPC_ALLOC busy while fastrpcd runs (used /var/local/fastrpcd.off for one boot, removed after); 1 MiB at PA 0xceb30000, TX still 3 posted / 0 completed, RP at base. Not the >4 GiB address. Phone left in ipaphase=0.
 - 2026-11-07 09:47 ipagsi.c (agent): p2_diag also dumps IPA and GSI global registers after the first post (read-only).
 - ipagsi e165905 p2 regs (2026-11-07 r5au1): IPA/GSI global register dump logged for the agent; TX still 3 posted / 0 completed. Phone left in ipaphase=0.
+- 2026-11-07 10:10 ipagsi.c (agent): p2_diag also dumps the modem EE1 channel/event-ring contexts 0-7 and our ch2/ev2 (read-only).

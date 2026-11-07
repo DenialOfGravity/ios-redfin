@@ -1416,6 +1416,18 @@ static void p2_diag(const char *why)
 		dumped++;	/* after the first post, and once more later (compare: IPA state registers change?) */
 		p2_regdump("p2 ipa", IPA_BASE, 0, 0x240);
 		p2_regdump("p2 gsi", GSI_BASE, 0, 0x200);
+		if (dumped == 1) {	/* full channel/event contexts: modem's EE1 (working) next to ours (EE0) */
+			char nm[24];
+
+			for (int i = 0; i < 8; i++) {
+				snprintf(nm, sizeof(nm), "p2 e1ch%d", i);
+				p2_regdump(nm, GSI_CH_C_CNTXT_0(i) + 0x4000, 0, 0x80);
+				snprintf(nm, sizeof(nm), "p2 e1ev%d", i);
+				p2_regdump(nm, GSI_EV_CH_E_CNTXT_0(i) + 0x4000, 0, 0x80);
+			}
+			p2_regdump("p2 e0ch2", GSI_CH_C_CNTXT_0(CH_MDM_TX), 0, 0x80);
+			p2_regdump("p2 e0ev2", GSI_EV_CH_E_CNTXT_0(EV_TX), 0, 0x80);
+		}
 	}
 
 	LOG("p2 diag (%s): ch2 state %s wp %u (db addr %llx) ctx %08x %08x %08x %08x", why, ch_state_name(ch_state(CH_MDM_TX)),
