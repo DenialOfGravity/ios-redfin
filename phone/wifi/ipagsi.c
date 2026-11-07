@@ -1677,6 +1677,7 @@ static int p2_cmd_setup(void)
 	p2_cmd_n = 0;
 	p2_stage = 2;
 	set_state("up");
+	ctx.active = 1;		/* ipagsi_poll() returns early without it: p2_cmd_poll() would never run */
 	return 0;
 }
 

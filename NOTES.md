@@ -514,3 +514,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi a76dcaf debug dump (2026-11-07 r5au1): GSI debug / IPA tail reads ok (13 lines), TX still 0 completed. Phone left in ipaphase=0.
 - 2026-11-07 14:45 ipagsi.c (agent): p2cmd=1 word: ev2 + command channel 5 (ep7), one IP_PACKET_INIT immediate command, logs ch5 progress for 24 s.
 - ipagsi 478221e p2cmd (2026-11-07 r5au1): ch5 started, 1 command posted, but p2cmd poll never ran (ctx.active not set on the p2cmd return path). Phone left in ipaphase=0.
+- 2026-11-07 15:10 ipagsi.c (agent): p2cmd sets ctx.active (poll runs).
