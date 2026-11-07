@@ -1318,12 +1318,13 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	 * still pointed at the modem's channels, so no packets move */
 	set_state("setup-5");
 	ipagsi_dump_ipa();
-	gsitest = read_gsistart();
+	/* gsitest was read (and late/tlvmin mapped to onestart) at setup-1: do not re-read it here */
 	if (gsitest != GS_BOTH) {
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34" };
+						  "c7start", "ids34", "tlvmin", "late" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_LATE + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {

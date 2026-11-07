@@ -471,3 +471,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 00:11 ipagsi.c: gsistart=ids34 probe (channels 3+4 on ev2, both STARTed); release covers ch 3/4
 - 2026-11-07 00:31 ipagsi.c: gsistart=late (45 s delay then onestart shape) and tlvmin (onestart with tlv 2/2); crashes cluster at ~157-158 s uptime
 - ipagsi ed88147 late run (2026-11-07 r5au1): channels allocated on ev2 after 45 s but not STARTed: gsistart re-read at setup-5 undoes the late/tlvmin -> onestart mapping, nm[] lacks tlvmin/late (prints (null), OOB). No crash. tlvmin not run. Phone left in ipaphase=0.
+- 2026-11-07 00:58 ipagsi.c: fix late/tlvmin (no gsistart re-read at setup-5, nm[] extended)
