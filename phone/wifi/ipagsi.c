@@ -1672,18 +1672,29 @@ static void p2_irq_setup(void)
 	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
 		n += snprintf(line + n, sizeof(line) - n, " %s %08x", r[i].n, rd32(GSI_BASE + r[i].off));
 	LOG("p2irq: before:%s", line);
-	wr32(GSI_BASE + 0x12180, 1);		/* INTSET: IRQ (not MSI) */
-	wr32(GSI_BASE + 0x12088, 0);		/* TYPE_IRQ_MSK: all types off */
-	wr32(GSI_BASE + 0x12098, 0);		/* SRC_CH_IRQ_MSK */
-	wr32(GSI_BASE + 0x1209c, 0);		/* SRC_EV_CH_IRQ_MSK */
-	wr32(GSI_BASE + 0x12108, 0);		/* GLOB_IRQ_EN */
-	wr32(GSI_BASE + 0x120b8, 0);		/* SRC_IEOB_IRQ_MSK */
-	wr32(GSI_BASE + 0x12120, 0);		/* GSI_IRQ_EN */
-	/* gsi_irq_enable() */
-	wr32(GSI_BASE + 0x12108, 1);		/* GLOB_IRQ_EN: ERROR_INT */
-	wr32(GSI_BASE + 0x12088, 1u << 2);	/* TYPE_IRQ_MSK: GLOB_EE */
-	wr32(GSI_BASE + 0x12120, 0xe);		/* GSI_IRQ_EN: BUS_ERROR | CMD_FIFO_OVRFLOW | MCS_STACK_OVRFLOW */
-	wr32(GSI_BASE + 0x12088, 1u << 2 | 1u << 6);	/* + GENERAL */
+	/* p2irqm=<mask> selects which groups are written (default 0x1f = all, as before):
+	 * bit0 INTSET=1, bit1 clear TYPE/SRC_CH/SRC_EV/IEOB masks, bit2 GLOB_IRQ_EN=1, bit3 TYPE_IRQ_MSK=GLOB_EE|GENERAL, bit4 GSI_IRQ_EN=0xe */
+	uint32_t m = (uint32_t) cell_word_int("p2irqm=", 0x1f);
+
+	LOG("p2irq: groups %02x", m);
+	if (m & 1)
+		wr32(GSI_BASE + 0x12180, 1);		/* INTSET: IRQ (not MSI) */
+	if (m & 2) {
+		wr32(GSI_BASE + 0x12088, 0);		/* TYPE_IRQ_MSK: all types off */
+		wr32(GSI_BASE + 0x12098, 0);		/* SRC_CH_IRQ_MSK */
+		wr32(GSI_BASE + 0x1209c, 0);		/* SRC_EV_CH_IRQ_MSK */
+		wr32(GSI_BASE + 0x120b8, 0);		/* SRC_IEOB_IRQ_MSK */
+	}
+	if (m & 4) {
+		wr32(GSI_BASE + 0x12108, 0);		/* GLOB_IRQ_EN */
+		wr32(GSI_BASE + 0x12108, 1);		/* GLOB_IRQ_EN: ERROR_INT */
+	}
+	if (m & 16) {
+		wr32(GSI_BASE + 0x12120, 0);		/* GSI_IRQ_EN */
+		wr32(GSI_BASE + 0x12120, 0xe);		/* BUS_ERROR | CMD_FIFO_OVRFLOW | MCS_STACK_OVRFLOW */
+	}
+	if (m & 8)
+		wr32(GSI_BASE + 0x12088, 1u << 2 | 1u << 6);	/* TYPE_IRQ_MSK: GLOB_EE + GENERAL */
 	n = 0;
 	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
 		n += snprintf(line + n, sizeof(line) - n, " %s %08x", r[i].n, rd32(GSI_BASE + r[i].off));

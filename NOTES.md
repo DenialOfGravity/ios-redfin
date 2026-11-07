@@ -524,3 +524,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 9735086 (no code): p2irq boots x3 -> modem ch4-7 start blips <1 s, no join; p2irq off -> start holds at +2.5 s, join + up, TX stalls (completed 0). wds=connected in all. p2irq is what stops the modem's channels.
 - 2026-11-07 ipagsi p2irq=2 (agent): irq setup at the join, after the modem's start cycle
 - 2026-11-07 697cdb8 p2irq=2: modem start holds, join + up, but ch2 RP stays at base (TX completed 0); irq setup after alloc does not service ch2
+- 2026-11-07 ipagsi p2irqm=<mask> (agent): bisect of the p2irq writes (decimal values: cell_word_int uses atoi)
