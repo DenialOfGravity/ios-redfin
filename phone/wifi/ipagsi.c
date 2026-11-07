@@ -168,6 +168,8 @@ struct gsi_tre {
 #define CH_CMDTX	5	/* AP_COMMAND_TX, endpoint 7 */
 #define CH_MDM_TX	2	/* AP_MODEM_TX, endpoint 2 */
 #define CH_MDM_RX	7	/* AP_MODEM_RX, endpoint 16 */
+#define CH_ALT_TX	3	/* gsistart=ids34 only: stand-ins for ch 2 / 7 */
+#define CH_ALT_RX	4
 #define EV_CMD		0
 #define EV_TX		2
 #define EV_RX		3
@@ -437,6 +439,8 @@ static void ev_release(int ev)
 
 static void gsi_release_all(void)
 {
+	ch_release(CH_ALT_RX);
+	ch_release(CH_ALT_TX);
 	ch_release(CH_MDM_RX);
 	ch_release(CH_MDM_TX);
 	for (int ev = 0; ev < 4; ev++)
@@ -1056,6 +1060,12 @@ static int read_phase0(void)
  *   onestart - ev2 only, ch2[2] and ch7[2], then START ch2 and ch7 (tx first), park with no ring traffic.
  *   45d6f8c: onestart: both STARTs reach "started" on the shared ring (the old ch 7 stall is gone), but the
  *   modem asserts 9.3 s after up.  So START upsets it too.  Which one?  (shared ring, nothing else changed)
+ * ead4c88: c2start, c7start clean; onetx crashed (+8.9 s).  Matrix: one channel (alloc or START) clean; two
+ * channels crash with two rings, or with one ring once one is STARTed; two channels on one ring, not started, clean.
+ * Our channel ids 2 and 7 are the SAME ids the modem EE uses for its own channels in mainline's ipa_data-v4.7.c
+ * (modem ch 0, 2, 7), and the crash needs both of them live.  Test whether the ids matter:
+ *   ids34    - ev2 only, channels 3 (tx) and 4 (rx) on it instead of 2 and 7, START both (the `onestart` shape).
+ *              Clean here while `onestart` crashed => the modem objects to AP channels 2+7 specifically.
  *   onetx    - ev2, ch2[2], ch7[2] allocated, START ch2 only
  *   onerx    - same allocation, START ch7 only
  *   c2start  - ev2 + ch2 only (ch7 never allocated), START ch2
@@ -1066,7 +1076,7 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34 };
 static int gsitest;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1083,6 +1093,8 @@ static int read_gsistart(void)
 		return GS_ALLOC;
 	if (strstr(b, "gsistart=none"))
 		return GS_NONE;
+	if (strstr(b, "gsistart=ids34"))
+		return GS_IDS34;
 	if (strstr(b, "gsistart=onetx"))
 		return GS_ONETX;
 	if (strstr(b, "gsistart=onerx"))
@@ -1220,7 +1232,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 #endif
 	{
 		int gm = gsitest == GS_C2START ? GS_CH2 : gsitest == GS_C7START ? GS_CH7 :
-			 (gsitest == GS_ONETX || gsitest == GS_ONERX) ? GS_ONESTART : gsitest;
+			 (gsitest == GS_ONETX || gsitest == GS_ONERX) ? GS_ONESTART :
+			 gsitest == GS_IDS34 ? GS_NONE : gsitest;
 		int ev_tx = gm != GS_NONE && gm != GS_CH7;
 		int ev_rx = gm != GS_NONE && gm != GS_CH2 && gm != GS_ONERING &&
 			     gm != GS_ONESTART;	/* onering3 keeps ring 3 */
@@ -1256,6 +1269,16 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 			goto failed;
 	}
 
+	if (gsitest == GS_IDS34) {
+		set_state("setup-2");
+		if (ev_alloc_program(EV_TX, EV_CNT))
+			goto failed;
+		set_state("setup-3");
+		if (ch_alloc_program(CH_ALT_TX, EV_TX, TX_TRE_CNT, 1, 0, TLV_MDM_TX) ||
+		    ch_alloc_program(CH_ALT_RX, EV_TX, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
+			goto failed;
+	}
+
 	set_state("setup-4");
 	if (utun_up())
 		goto failed;
@@ -1280,7 +1303,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start" };
+						  "c7start", "ids34" };
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
@@ -1294,6 +1317,9 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 				goto failed;
 		} else if (gsitest == GS_ONESTART) {
 			if (ch_start(CH_MDM_TX) || ch_start(CH_MDM_RX))
+				goto failed;
+		} else if (gsitest == GS_IDS34) {
+			if (ch_start(CH_ALT_TX) || ch_start(CH_ALT_RX))
 				goto failed;
 		} else if (gsitest == GS_ONETX || gsitest == GS_C2START) {
 			if (ch_start(CH_MDM_TX))
