@@ -184,6 +184,7 @@ struct gsi_tre {
  * belongs to comes from the channel -> endpoint binding, not from the TRE. */
 #define TLV_CMDTX	20
 #define TLV_MDM_TX	16
+static uint32_t tlv_tx = TLV_MDM_TX, tlv_rx = 9;	/* gsistart=tlvmin overrides */
 #define TLV_MDM_RX	9
 
 #define RX_BUFS		32	/* pre-posted RX buffers */
@@ -1076,7 +1077,7 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34 };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE };
 static int gsitest;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1093,6 +1094,10 @@ static int read_gsistart(void)
 		return GS_ALLOC;
 	if (strstr(b, "gsistart=none"))
 		return GS_NONE;
+	if (strstr(b, "gsistart=tlvmin"))
+		return GS_TLVMIN;
+	if (strstr(b, "gsistart=late"))
+		return GS_LATE;
 	if (strstr(b, "gsistart=ids34"))
 		return GS_IDS34;
 	if (strstr(b, "gsistart=onetx"))
@@ -1229,6 +1234,21 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	wr32(GSI_BASE + 0x12200, 0);	/* ERROR_LOG: mainline zeroes it in gsi_setup(); it powers up stale */
 #if IPAGSI_PHASE < 2
 	gsitest = read_gsistart();
+	tlv_tx = TLV_MDM_TX;
+	tlv_rx = TLV_MDM_RX;
+	if (gsitest == GS_TLVMIN) {
+		/* onestart shape, but minimal TLV FIFO sizes: tests a shared-TLV-memory budget */
+		tlv_tx = tlv_rx = 2;
+		gsitest = GS_ONESTART;
+		LOG("gsistart=tlvmin: onestart with tlv_count 2/2");
+	} else if (gsitest == GS_LATE) {
+		/* onestart shape, but only after 45 s: every crash so far lands at ~157-158 s of uptime,
+		 * whatever time we came up at, i.e. the modem's own IPA init */
+		gsitest = GS_ONESTART;
+		LOG("gsistart=late: waiting 45 s before touching GSI channels");
+		for (int i = 0; i < 45; i++)
+			delay_ms(1000);
+	}
 #endif
 	{
 		int gm = gsitest == GS_C2START ? GS_CH2 : gsitest == GS_C7START ? GS_CH7 :
@@ -1261,11 +1281,11 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		if (tables && gm == GS_BOTH &&
 		    ch_alloc_program(CH_CMDTX, EV_CMD, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
 			goto failed;
-		if (rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
+		if (rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, tlv_rx))
 			goto failed;
-		if (ch_tx && ch_alloc_program(CH_MDM_TX, tx_ev, TX_TRE_CNT, 1, 0, TLV_MDM_TX))
+		if (ch_tx && ch_alloc_program(CH_MDM_TX, tx_ev, TX_TRE_CNT, 1, 0, tlv_tx))
 			goto failed;
-		if (!rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
+		if (!rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, tlv_rx))
 			goto failed;
 	}
 
