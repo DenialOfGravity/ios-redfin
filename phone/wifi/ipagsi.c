@@ -1665,8 +1665,9 @@ static void p2_irq_setup(void)
 		{ "INTSET", 0x12180 }, { "TYPE_IRQ_MSK", 0x12088 }, { "SRC_CH_IRQ_MSK", 0x12098 },
 		{ "SRC_EV_CH_IRQ_MSK", 0x1209c }, { "GLOB_IRQ_EN", 0x12108 }, { "SRC_IEOB_IRQ_MSK", 0x120b8 },
 		{ "GSI_IRQ_EN", 0x12120 }, { "GLOB_IRQ_STTS", 0x12100 }, { "GSI_IRQ_STTS", 0x12118 },
+		{ "TYPE_IRQ", 0x12080 }, { "SRC_CH_IRQ", 0x12090 }, { "SRC_EV_CH_IRQ", 0x12094 }, { "SRC_IEOB_IRQ", 0x120b0 },
 	};
-	char line[200];
+	char line[420];
 	int n = 0;
 
 	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
@@ -1677,6 +1678,22 @@ static void p2_irq_setup(void)
 	uint32_t m = (uint32_t) cell_word_int("p2irqm=", 0x1f);
 
 	LOG("p2irq: groups %02x", m);
+	if (cell_word_int("p2ack=", 0)) {
+		/* acknowledge whatever is pending for EE0 (a polled client never ran an irq handler: the GSI may be
+		 * waiting for these to be cleared before it services our channels).  Status regs read, CLR regs written. */
+		uint32_t ch = rd32(GSI_BASE + 0x12090), evc = rd32(GSI_BASE + 0x12094), ieob = rd32(GSI_BASE + 0x120b0);
+		uint32_t glob = rd32(GSI_BASE + 0x12100), gen = rd32(GSI_BASE + 0x12118);
+
+		LOG("p2ack: pending ch %08x ev %08x ieob %08x glob %08x gsi %08x", ch, evc, ieob, glob, gen);
+		wr32(GSI_BASE + 0x120a0, ch);		/* SRC_CH_IRQ_CLR */
+		wr32(GSI_BASE + 0x120a4, evc);		/* SRC_EV_CH_IRQ_CLR */
+		wr32(GSI_BASE + 0x120c0, ieob);		/* SRC_IEOB_IRQ_CLR */
+		wr32(GSI_BASE + 0x12110, glob);		/* GLOB_IRQ_CLR */
+		wr32(GSI_BASE + 0x12128, gen);		/* GSI_IRQ_CLR */
+		LOG("p2ack: after ch %08x ev %08x ieob %08x glob %08x gsi %08x type %08x", rd32(GSI_BASE + 0x12090),
+		    rd32(GSI_BASE + 0x12094), rd32(GSI_BASE + 0x120b0), rd32(GSI_BASE + 0x12100), rd32(GSI_BASE + 0x12118),
+		    rd32(GSI_BASE + 0x12080));
+	}
 	if (m & 1)
 		wr32(GSI_BASE + 0x12180, 1);		/* INTSET: IRQ (not MSI) */
 	if (m & 2) {
