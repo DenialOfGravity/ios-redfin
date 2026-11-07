@@ -526,3 +526,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 697cdb8 p2irq=2: modem start holds, join + up, but ch2 RP stays at base (TX completed 0); irq setup after alloc does not service ch2
 - 2026-11-07 ipagsi p2irqm=<mask> (agent): bisect of the p2irq writes (decimal values: cell_word_int uses atoi)
 - 2026-11-07 4c1b306 p2irqm: m=1 and m=28 (no common write) both give TX 3/3 + modem blips; m=0 run lost to a low-battery drop to fastboot
+- 2026-11-07 4c1b306 p2irqm bisect: TX ok with m=1 (INTSET) / m=2 / m=8 (any TYPE_IRQ_MSK change), stalls with m=0/4/16; modem start blips whenever TX is serviced, holds with m=4
