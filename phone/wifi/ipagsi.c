@@ -1426,6 +1426,10 @@ static void p2_diag(const char *why)
 				snprintf(nm, sizeof(nm), "p2 e1ev%d", i);
 				p2_regdump(nm, GSI_EV_CH_E_CNTXT_0(i) + 0x4000, 0, 0x80);
 			}
+			/* wider look (non-zero lines only): GSI debug block, rest of the IPA global block, ep2's block tail */
+			p2_regdump("p2 gdbg", GSI_BASE, 0x5000, 0x5800);
+			p2_regdump("p2 ipa2", IPA_BASE, 0x240, 0x800);
+			p2_regdump("p2 ipaep2", IPA_BASE, 0x8e0, 0x960);
 			p2_regdump("p2 e0ch2", GSI_CH_C_CNTXT_0(CH_MDM_TX), 0, 0x80);
 			p2_regdump("p2 e0ev2", GSI_EV_CH_E_CNTXT_0(EV_TX), 0, 0x80);
 		}
