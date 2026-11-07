@@ -516,3 +516,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi 478221e p2cmd (2026-11-07 r5au1): ch5 started, 1 command posted, but p2cmd poll never ran (ctx.active not set on the p2cmd return path). Phone left in ipaphase=0.
 - 2026-11-07 15:10 ipagsi.c (agent): p2cmd sets ctx.active (poll runs).
 - ipagsi 58f8d0a p2cmd (2026-11-07 r5au1): 3 immediate commands on ch5, RP at base, 0 events: command channel stalls like ch2. Phone left in ipaphase=0.
+- 2026-11-07 15:25 ipagsi.c (agent): p2irq=1 word: EE0 GSI interrupt setup as mainline gsi_irq_setup/enable (logs before/after).

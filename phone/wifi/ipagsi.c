@@ -1341,6 +1341,7 @@ static int p2_stage;			/* 0 off, 1 waiting for the modem, 2 running */
 static int p2_tx_only, p2_ep_before;
 static int p2_cmd;			/* p2cmd=1: command channel test (below) */
 static int p2_cmd_setup(void);
+static void p2_irq_setup(void);
 static unsigned p2_join_s;		/* 0 = wait forever (default) */
 static uint64_t p2_t0, p2_seen, p2_stat;
 static unsigned p2_txev, p2_rxev, p2_unk;
@@ -1529,6 +1530,8 @@ static int p2_setup(void)
 	}
 	if (cell_word_int("p2low=", 0) && lo_init())
 		return -1;
+	if (cell_word_int("p2irq=", 0))
+		p2_irq_setup();
 	p2_cmd = cell_word_int("p2cmd=", 0);
 	if (p2_cmd)
 		return p2_cmd_setup();
@@ -1650,6 +1653,39 @@ static void p2_cmd_post(void)
 	ch_doorbell(CH_CMDTX);
 	LOG("p2cmd: posted command %u (IP_PACKET_INIT dest ep2), buf %llx, wp %u", r->wp, (unsigned long long) p2_cmd_buf,
 	    r->wp);
+}
+
+/* p2irq=1: what mainline's gsi_irq_setup() + gsi_irq_enable() write for the AP EE before any channel exists
+ * (we have never written any of it: GSI_CFG etc. are the firmware's).  EE0 registers only.  Polled: no handler. */
+static void p2_irq_setup(void)
+{
+	static const struct { const char *n; uint32_t off; } r[] = {
+		{ "INTSET", 0x12180 }, { "TYPE_IRQ_MSK", 0x12088 }, { "SRC_CH_IRQ_MSK", 0x12098 },
+		{ "SRC_EV_CH_IRQ_MSK", 0x1209c }, { "GLOB_IRQ_EN", 0x12108 }, { "SRC_IEOB_IRQ_MSK", 0x120b8 },
+		{ "GSI_IRQ_EN", 0x12120 }, { "GLOB_IRQ_STTS", 0x12100 }, { "GSI_IRQ_STTS", 0x12118 },
+	};
+	char line[200];
+	int n = 0;
+
+	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
+		n += snprintf(line + n, sizeof(line) - n, " %s %08x", r[i].n, rd32(GSI_BASE + r[i].off));
+	LOG("p2irq: before:%s", line);
+	wr32(GSI_BASE + 0x12180, 1);		/* INTSET: IRQ (not MSI) */
+	wr32(GSI_BASE + 0x12088, 0);		/* TYPE_IRQ_MSK: all types off */
+	wr32(GSI_BASE + 0x12098, 0);		/* SRC_CH_IRQ_MSK */
+	wr32(GSI_BASE + 0x1209c, 0);		/* SRC_EV_CH_IRQ_MSK */
+	wr32(GSI_BASE + 0x12108, 0);		/* GLOB_IRQ_EN */
+	wr32(GSI_BASE + 0x120b8, 0);		/* SRC_IEOB_IRQ_MSK */
+	wr32(GSI_BASE + 0x12120, 0);		/* GSI_IRQ_EN */
+	/* gsi_irq_enable() */
+	wr32(GSI_BASE + 0x12108, 1);		/* GLOB_IRQ_EN: ERROR_INT */
+	wr32(GSI_BASE + 0x12088, 1u << 2);	/* TYPE_IRQ_MSK: GLOB_EE */
+	wr32(GSI_BASE + 0x12120, 0xe);		/* GSI_IRQ_EN: BUS_ERROR | CMD_FIFO_OVRFLOW | MCS_STACK_OVRFLOW */
+	wr32(GSI_BASE + 0x12088, 1u << 2 | 1u << 6);	/* + GENERAL */
+	n = 0;
+	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
+		n += snprintf(line + n, sizeof(line) - n, " %s %08x", r[i].n, rd32(GSI_BASE + r[i].off));
+	LOG("p2irq: after: %s", line);
 }
 
 static int p2_cmd_setup(void)
