@@ -1532,7 +1532,7 @@ static int p2_setup(void)
 	}
 	if (cell_word_int("p2low=", 0) && lo_init())
 		return -1;
-	if (cell_word_int("p2irq=", 0))
+	if (cell_word_int("p2irq=", 0) == 1)	/* p2irq=2: later, at the join (after the modem's start cycle) */
 		p2_irq_setup();
 	p2_cmd = cell_word_int("p2cmd=", 0);
 	if (p2_cmd)
@@ -1773,6 +1773,8 @@ static void p2_poll(void)
 			return;
 		}
 		LOG("p2: join (%s)", go == 1 ? "cycle" : "timeout");
+		if (cell_word_int("p2irq=", 0) == 2)
+			p2_irq_setup();
 		if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx))
 			goto failed;
 		if (p2_prog && !p2_ep_before)
