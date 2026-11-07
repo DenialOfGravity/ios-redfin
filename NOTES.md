@@ -495,3 +495,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi 8730ee9 p2late (2026-11-07 r5au1): tx-only and full late join both stable (no crash, 220 s); 3 UDP to gw posted on ch2, 0 completed, 0 RX events (endpoints read-only). Phone left in ipaphase=0.
 - 2026-11-07 07:45 ipagsi.c (agent): p2late diagnostics (IPA endpoint read-back at start, 'p2 diag' GSI channel/ring context, TRE and buffer after first posts and while stalled).
 - ipagsi 3051133 p2late p2tx=1 diag (2026-11-07 r5au1): 3 posted, 0 completed, ev2 rp 0; stable 335 s; diag lines saved for the agent. Phone left in ipaphase=0.
+- 2026-11-07 08:23 ipagsi.c (agent): ep_program() for p2late (ep2 before ch2 START, ep16 at the join; words p2prog=0, p2status=0, p2ep=before|after); shorter diag lines.

@@ -1330,18 +1330,22 @@ static void p2_diag(const char *why)
 	uint8_t b[16] = { 0 };
 	uint64_t cb = GSI_CH_C_CNTXT_0(CH_MDM_TX), eb = GSI_EV_CH_E_CNTXT_0(EV_TX);
 
-	LOG("p2 diag (%s): ch2 state %s wp %u (db addr %llx) ctx %08x %08x %08x %08x | +10 %08x +14 %08x +18 %08x +1c %08x"
-	    " +20 %08x +24 %08x qos %08x scr %08x %08x %08x %08x", why, ch_state_name(ch_state(CH_MDM_TX)), ctx.ch[CH_MDM_TX].wp,
-	    (unsigned long long) (ctx.ch[CH_MDM_TX].pa + (uint64_t) (ctx.ch[CH_MDM_TX].wp % ctx.ch[CH_MDM_TX].cnt) * RING_ELEM),
-	    rd32(cb), rd32(cb + 4), rd32(cb + 8), rd32(cb + 12), rd32(cb + 0x10), rd32(cb + 0x14), rd32(cb + 0x18),
-	    rd32(cb + 0x1c), rd32(cb + 0x20), rd32(cb + 0x24), rd32(GSI_CH_C_QOS(CH_MDM_TX)),
+	LOG("p2 diag (%s): ch2 state %s wp %u (db addr %llx) ctx %08x %08x %08x %08x", why, ch_state_name(ch_state(CH_MDM_TX)),
+	    ctx.ch[CH_MDM_TX].wp, (unsigned long long) (ctx.ch[CH_MDM_TX].pa +
+	    (uint64_t) (ctx.ch[CH_MDM_TX].wp % ctx.ch[CH_MDM_TX].cnt) * RING_ELEM), rd32(cb), rd32(cb + 4), rd32(cb + 8),
+	    rd32(cb + 12));
+	LOG("p2 diag (%s): ch2 rp/wp words +10 %08x +14 %08x +18 %08x +1c %08x +20 %08x +24 %08x", why, rd32(cb + 0x10),
+	    rd32(cb + 0x14), rd32(cb + 0x18), rd32(cb + 0x1c), rd32(cb + 0x20), rd32(cb + 0x24));
+	LOG("p2 diag (%s): ch2 qos %08x scratch %08x %08x %08x %08x", why, rd32(GSI_CH_C_QOS(CH_MDM_TX)),
 	    rd32(GSI_CH_C_SCRATCH_0(CH_MDM_TX)), rd32(GSI_CH_C_SCRATCH_1(CH_MDM_TX)), rd32(GSI_CH_C_SCRATCH_2(CH_MDM_TX)),
 	    rd32(GSI_CH_C_SCRATCH_3(CH_MDM_TX)));
-	LOG("p2 diag (%s): ev2 state %x rp %u ctx %08x %08x %08x %08x +10 %08x +14 %08x +18 %08x +1c %08x +20 %08x +24 %08x"
-	    " +28 %08x +2c %08x +30 %08x err %08x gsi-irq %08x %08x %08x", why, ev_state(EV_TX), ctx.ev[EV_TX].rp, rd32(eb),
-	    rd32(eb + 4), rd32(eb + 8), rd32(eb + 12), rd32(eb + 0x10), rd32(eb + 0x14), rd32(eb + 0x18), rd32(eb + 0x1c),
-	    rd32(eb + 0x20), rd32(eb + 0x24), rd32(eb + 0x28), rd32(eb + 0x2c), rd32(eb + 0x30), rd32(GSI_BASE + 0x12200),
-	    rd32(GSI_BASE + 0x12080), rd32(GSI_BASE + 0x12090), rd32(GSI_BASE + 0x12094));
+	LOG("p2 diag (%s): ev2 state %x rp %u ctx %08x %08x %08x %08x", why, ev_state(EV_TX), ctx.ev[EV_TX].rp, rd32(eb),
+	    rd32(eb + 4), rd32(eb + 8), rd32(eb + 12));
+	LOG("p2 diag (%s): ev2 +10 %08x +14 %08x +18 %08x +1c %08x +20 %08x +24 %08x", why, rd32(eb + 0x10), rd32(eb + 0x14),
+	    rd32(eb + 0x18), rd32(eb + 0x1c), rd32(eb + 0x20), rd32(eb + 0x24));
+	LOG("p2 diag (%s): ev2 +28 %08x +2c %08x +30 %08x err %08x gsi-irq %08x %08x %08x", why, rd32(eb + 0x28), rd32(eb + 0x2c),
+	    rd32(eb + 0x30), rd32(GSI_BASE + 0x12200), rd32(GSI_BASE + 0x12080), rd32(GSI_BASE + 0x12090),
+	    rd32(GSI_BASE + 0x12094));
 	if (!pm_rd(ctx.ch[CH_MDM_TX].pa, &t, sizeof(t)))
 		LOG("p2 diag (%s): TRE[0] addr %llx len %u flags %08x", why, (unsigned long long) t.addr, t.len, t.flags);
 	if (tx_buf_pa[0] && !pm_rd(tx_buf_pa[0], b, sizeof(b)))
@@ -1350,11 +1354,68 @@ static void p2_diag(const char *why)
 	ipagsi_dump_ipa();
 }
 
+/* Program one AP endpoint the way mainline's ipa_endpoint_program() does for ipa_data-v4.7.c, with checksum
+ * offload OFF (our frames carry the 4-byte QMAP header only, as the WDA data format asked for).  The first
+ * p2late runs showed ep2/ep16/ep7 at their reset values: the modem does NOT program the AP's endpoints, so
+ * nothing moved.  ep2 = AP_MODEM_TX (toward the IPA, QMAP, status to endpoint 14 = MODEM_AP_RX, 2-pass seq),
+ * ep16 = AP_MODEM_RX (QMAP header filled in by the IPA, generic aggregation 6 KB / 500 us / close on EOF).
+ * p2prog=0 skips it; p2status=0 leaves out the status messages of ep2. */
+#define EP_MODEM_AP_RX	14
+static void ep_program(int ep, int status)
+{
+	uint32_t cfg = 0, nat = 0, hdr, ext, mmask = 0, mode = 0, aggr = 0, deaggr = 0, rsrc = 0, seq = 0, st = 0;
+	uint32_t rb_hdr, rb_ext, rb_aggr, rb_seq, rb_st, rb_mask;
+
+	if (ep == EP_MDM_TX) {
+		hdr = 4 | 1u << 6;		/* HDR_LEN 4, OFST_METADATA_VALID (offset 0) */
+		ext = 1;			/* HDR_ENDIANNESS: big endian */
+		seq = EP_SEQ_2_PASS_SKIP_LAST_UC;
+		if (status)
+			st = EP_STATUS_EN | EP_MODEM_AP_RX << EP_STATUS_ENDP_SHIFT;
+	} else {
+		hdr = 4 | 1u << 6 | 1u << 7 | 1u << 19 | 2u << 20;	/* len 4, metadata valid at offset 1 (mux id), pkt size valid at offset 2 */
+		ext = 1 | 1u << 1 | 1u << 3;	/* big endian, TOTAL_LEN_OR_PAD_VALID, PAYLOAD_LEN_INC_PADDING (pad align 0) */
+		mmask = 0xff000000u;		/* cpu_to_be32(0xff) */
+		aggr = 1 | 4u << EP_AGGR_TYPE_SHIFT | 6u << EP_AGGR_BYTE_SHIFT | 5u << EP_AGGR_TIME_SHIFT | EP_AGGR_SW_EOF;
+	}
+	wr32(IPA_ENDP_CFG(ep), cfg);
+	if (ep == EP_MDM_TX)
+		wr32(IPA_ENDP_NAT(ep), nat);
+	wr32(IPA_ENDP_HDR(ep), hdr);
+	wr32(IPA_ENDP_HDR_EXT(ep), ext);
+	if (ep != EP_MDM_TX)
+		wr32(IPA_ENDP_HDR_MASK(ep), mmask);
+	if (ep == EP_MDM_TX) {
+		wr32(IPA_ENDP_MODE(ep), mode);
+		wr32(IPA_ENDP_DEAGGR(ep), deaggr);
+		wr32(IPA_ENDP_SEQ(ep), seq);
+	}
+	wr32(IPA_ENDP_AGGR(ep), aggr);
+	if (ep != EP_MDM_TX)
+		wr32(IPA_ENDP_HOL_EN(ep), 0);
+	wr32(IPA_ENDP_RSRC_GRP(ep), rsrc);
+	wr32(IPA_ENDP_STATUS(ep), st);
+	rb_hdr = rd32(IPA_ENDP_HDR(ep));
+	rb_ext = rd32(IPA_ENDP_HDR_EXT(ep));
+	rb_mask = rd32(IPA_ENDP_HDR_MASK(ep));
+	rb_aggr = rd32(IPA_ENDP_AGGR(ep));
+	rb_seq = rd32(IPA_ENDP_SEQ(ep));
+	rb_st = rd32(IPA_ENDP_STATUS(ep));
+	LOG("p2: ep%d programmed: hdr %08x/%08x ext %08x/%08x mask %08x/%08x aggr %08x/%08x seq %08x/%08x status %08x/%08x"
+	    " (wrote/read back)%s", ep, hdr, rb_hdr, ext, rb_ext, mmask, rb_mask, aggr, rb_aggr, seq, rb_seq, st, rb_st,
+	    (rb_hdr != hdr || rb_ext != ext || rb_aggr != aggr || (ep == EP_MDM_TX && rb_seq != seq) || rb_st != st) ?
+	    "  <- READBACK DIFFERS" : "");
+}
+
+static int p2_prog = 1, p2_status = 1;
+
 static int p2_setup(void)
 {
 	p2_tx_only = cell_word_int("p2tx=", 0);
 	p2_join_s = (unsigned) cell_word_int("p2join=", 0);
 	p2_ep_before = cell_word_has("p2ep=before");
+	p2_prog = cell_word_int("p2prog=", 1);
+	p2_status = cell_word_int("p2status=", 1);
 	if (read_eedump_flag()) {
 		dump_n = -1;	/* until reboot; logs only on change */
 		dump_at = link_ms();
@@ -1363,6 +1424,11 @@ static int p2_setup(void)
 	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
 		return -1;
 	set_state("setup-3");
+	if (p2_prog) {
+		ep_program(EP_MDM_TX, p2_status);	/* before the channel is started, as mainline */
+		if (p2_ep_before && !p2_tx_only)
+			ep_program(EP_MDM_RX, 0);
+	}
 	if (ch_start(CH_MDM_TX))
 		return -1;
 	LOG("p2: tx ch up (ev2 + ch2 started: 3 units); tx_only %d join timeout %u s endpoints %s", p2_tx_only,
@@ -1436,7 +1502,11 @@ static void p2_poll(void)
 			return;
 		}
 		LOG("p2: join (%s)", go == 1 ? "cycle" : "timeout");
-		if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx) || ch_start(CH_MDM_RX))
+		if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx))
+			goto failed;
+		if (p2_prog && !p2_ep_before)
+			ep_program(EP_MDM_RX, 0);	/* before the RX channel is started */
+		if (ch_start(CH_MDM_RX))
 			goto failed;
 		if (!p2_ep_before)
 			ipagsi_endpoints();
