@@ -1389,11 +1389,34 @@ static int cell_word_has(const char *w)
 }
 
 /* TX posted but not completed: what do the GSI channel/event ring and the first TRE + buffer look like? */
+/* one-shot dump of the IPA global block and the GSI global block (non-zero lines only) */
+static void p2_regdump(const char *what, uint64_t base, uint32_t from, uint32_t to)
+{
+	for (uint32_t o = from; o < to; o += 32) {
+		uint32_t w[8], any = 0;
+
+		for (int i = 0; i < 8; i++) {
+			w[i] = rd32(base + o + 4 * i);
+			any |= w[i];
+		}
+		if (any)
+			LOG("%s +%03x: %08x %08x %08x %08x %08x %08x %08x %08x", what, o, w[0], w[1], w[2], w[3], w[4], w[5],
+			    w[6], w[7]);
+	}
+}
+
 static void p2_diag(const char *why)
 {
 	struct gsi_tre t;
 	uint8_t b[16] = { 0 };
 	uint64_t cb = GSI_CH_C_CNTXT_0(CH_MDM_TX), eb = GSI_EV_CH_E_CNTXT_0(EV_TX);
+	static int dumped;
+
+	if (dumped < 2 && ctx.ch[CH_MDM_TX].wp) {
+		dumped++;	/* after the first post, and once more later (compare: IPA state registers change?) */
+		p2_regdump("p2 ipa", IPA_BASE, 0, 0x240);
+		p2_regdump("p2 gsi", GSI_BASE, 0, 0x200);
+	}
 
 	LOG("p2 diag (%s): ch2 state %s wp %u (db addr %llx) ctx %08x %08x %08x %08x", why, ch_state_name(ch_state(CH_MDM_TX)),
 	    ctx.ch[CH_MDM_TX].wp, (unsigned long long) (ctx.ch[CH_MDM_TX].pa +
