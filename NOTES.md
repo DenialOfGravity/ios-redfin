@@ -523,3 +523,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi 9735086 full p2late+p2irq rerun (2026-11-07 r5au1): with p2irq the modem's EE1 ch4-7 start only blips (<1 s, repeatedly), never holds -> no RX join. Without p2irq it held in every run. Phone left in ipaphase=0.
 - 2026-11-07 9735086 (no code): p2irq boots x3 -> modem ch4-7 start blips <1 s, no join; p2irq off -> start holds at +2.5 s, join + up, TX stalls (completed 0). wds=connected in all. p2irq is what stops the modem's channels.
 - 2026-11-07 ipagsi p2irq=2 (agent): irq setup at the join, after the modem's start cycle
+- 2026-11-07 697cdb8 p2irq=2: modem start holds, join + up, but ch2 RP stays at base (TX completed 0); irq setup after alloc does not service ch2
