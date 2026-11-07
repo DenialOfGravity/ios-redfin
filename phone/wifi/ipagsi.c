@@ -311,6 +311,55 @@ static int wait_state(uint64_t reg, unsigned shift, unsigned from, unsigned ms, 
 		delay_ms(1);
 	}
 }
+/* ------------------------------------------------------------------ low (< 4 GiB) memory (p2low=1)
+ * Experiment: /dev/pmem gives managed DRAM above 4 GiB only.  /dev/redwood-fastrpc FASTRPC_ALLOC returns
+ * RAM < 4 GiB (GPU pool, zeroed); pmem reads/writes reach it with 32-bit aligned offsets/lengths only.
+ * One block is taken and bump-allocated; ring/TX buffer allocations use it while lo_on is set. */
+#include <fcntl.h>
+#include <sys/ioctl.h>
+struct lo_alloc { uint64_t size, pa; };
+#ifndef FASTRPC_ALLOC
+#define FASTRPC_ALLOC _IOWR('f', 2, struct lo_alloc)
+#endif
+#define LO_SIZE (1024 * 1024)
+static int lo_on, lo_fd = -1;
+static uint64_t lo_base, lo_next, lo_end;
+
+static int lo_init(void)
+{
+	struct lo_alloc a = { .size = LO_SIZE };
+
+	lo_fd = open("/dev/redwood-fastrpc", O_RDWR);
+	if (lo_fd < 0) {
+		LOG("p2low: open /dev/redwood-fastrpc: %s", strerror(errno));
+		return -1;
+	}
+	if (ioctl(lo_fd, FASTRPC_ALLOC, &a) < 0) {
+		LOG("p2low: FASTRPC_ALLOC %u: %s", (unsigned) LO_SIZE, strerror(errno));
+		return -1;
+	}
+	lo_base = lo_next = a.pa;
+	lo_end = a.pa + LO_SIZE;
+	lo_on = 1;
+	LOG("p2low: got %u KiB at PA 0x%llx", LO_SIZE / 1024, (unsigned long long) a.pa);
+	return 0;
+}
+
+static uint64_t ring_mem(uint64_t size, uint64_t align)
+{
+	uint64_t at;
+
+	if (!lo_on)
+		return pm_alloc(size, align);
+	at = (lo_next + align - 1) & ~(align - 1);
+	if (at + size > lo_end) {
+		LOG("p2low: out of low memory (%llu bytes)", (unsigned long long) size);
+		return 0;
+	}
+	lo_next = at + size;
+	return at;
+}
+
 /* ------------------------------------------------------------------ GSI bring-up */
 
 /* clear a freshly allocated ring (the event rings must start empty for ev_read()) */
@@ -337,7 +386,7 @@ static int ev_alloc_program(int ev, uint32_t cnt)
 		LOG("evt ring %d not free: state %s (%x)", ev, ch_state_name(st), st);
 		return -1;
 	}
-	r->pa = pm_alloc((uint64_t) cnt * RING_ELEM, 4096);
+	r->pa = ring_mem((uint64_t) cnt * RING_ELEM, 4096);
 	if (!r->pa) {
 		LOG("evt ring %d pm_alloc failed", ev);
 		return -1;
@@ -385,7 +434,7 @@ static int ch_alloc_program(int ch, int ev, uint32_t cnt, int toward_ipa, int co
 		LOG("ch %d not free: state %s (%x)", ch, ch_state_name(st), st);
 		return -1;
 	}
-	r->pa = pm_alloc((uint64_t) cnt * RING_ELEM, 4096);
+	r->pa = ring_mem((uint64_t) cnt * RING_ELEM, 4096);
 	if (!r->pa) {
 		LOG("ch %d pm_alloc failed", ch);
 		return -1;
@@ -987,13 +1036,13 @@ static int tx_send(const uint8_t *ip, size_t len)
 		return -1;
 	}
 	if (!tx_buf_pa[idx]) {
-		tx_buf_pa[idx] = pm_alloc(TX_CAP, 4096);
+		tx_buf_pa[idx] = ring_mem(TX_CAP, 4096);
 		if (!tx_buf_pa[idx]) {
 			LOG("tx buffer pm_alloc failed");
 			return -1;
 		}
 	}
-	if (pm_wr(tx_buf_pa[idx], tx_frame, n)) {
+	if (pm_wr(tx_buf_pa[idx], tx_frame, lo_on ? (n + 3) & ~(size_t) 3 : n)) {
 		LOG("tx buffer write failed: %s", strerror(errno));
 		return -1;
 	}
@@ -1436,6 +1485,8 @@ static int p2_setup(void)
 		dump_n = -1;	/* until reboot; logs only on change */
 		dump_at = link_ms();
 	}
+	if (cell_word_int("p2low=", 0) && lo_init())
+		return -1;
 	set_state("setup-2");
 	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
 		return -1;
