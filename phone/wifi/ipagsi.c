@@ -1119,11 +1119,12 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI, GS_EEDUMP, GS_C2JOIN };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI, GS_EEDUMP, GS_C2JOIN, GS_C2JOINT };
 static int gsitest;
 static uint64_t dump_at;		/* gsistart=eedump: next EE1 register dump */
 static int dump_n;
 static int join_pending;		/* gsistart=c2join: 2nd channel (ch 7 rx) still to be added */
+static uint64_t join_force;		/* gsistart=c2joint: join at this time even if the modem never cycled (0 = off) */
 static uint64_t join_seen;		/* when EE1 ch 7 was first seen started */
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1174,6 +1175,8 @@ static int read_gsistart(void)
 		return GS_ONETX;
 	if (strstr(b, "gsistart=onerx"))
 		return GS_ONERX;
+	if (strstr(b, "gsistart=c2joint"))
+		return GS_C2JOINT;
 	if (strstr(b, "gsistart=c2join"))
 		return GS_C2JOIN;
 	if (strstr(b, "gsistart=c2start"))
@@ -1320,6 +1323,13 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		tlv_tx = 30;
 		gsitest = GS_C2START;
 		LOG("gsistart=tlvbig: c2start with tlv_count 30");
+	} else if (gsitest == GS_C2JOINT) {
+		/* c2join, but if the modem has not cycled 120 s after we are up, add ch 7 rx anyway: tests a LATER
+		 * modem cycle against the 5-unit state (the risk c2join cannot cover). */
+		gsitest = GS_C2START;
+		join_pending = 1;
+		join_force = link_ms() + 120000;
+		LOG("gsistart=c2joint: c2start now, ch 7 rx added after the modem's ch 7 started for 5 s OR after 120 s");
 	} else if (gsitest == GS_C2JOIN) {
 		/* c2start shape (survives the modem's ch4-7 start), then, once the modem has been seen with its
 		 * ch 7 started for 5 s, add the RX channel on the same ring and start it (5 units, but after the
@@ -1437,8 +1447,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi", "eedump", "c2join" };
-	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_C2JOIN + 1, "nm[] out of sync with enum");
+						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi", "eedump", "c2join", "c2joint" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_C2JOINT + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_EEDUMP || read_eedump_flag()) {
@@ -1540,13 +1550,19 @@ void ipagsi_poll(void)
 			ee_dump();
 		}
 		if (join_pending) {
-			if ((rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf) != 2) {
+			int go = 0;
+			if ((rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf) != 2)
 				join_seen = 0;
-			} else if (!join_seen) {
+			else if (!join_seen)
 				join_seen = link_ms();
-			} else if (link_ms() >= join_seen + 5000) {
+			else if (link_ms() >= join_seen + 5000)
+				go = 1;
+			if (join_force && link_ms() >= join_force)
+				go = 2;
+			if (go) {
 				join_pending = 0;
-				LOG("c2join: modem ch 7 started for 5 s, adding ch 7 rx + start");
+				LOG("c2join: %s, adding ch 7 rx + start", go == 1 ? "modem ch 7 started for 5 s" :
+				    "timeout, modem has not cycled (or not finished)");
 				if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx) || ch_start(CH_MDM_RX))
 					LOG("c2join: ch 7 add/start FAILED");
 				else
