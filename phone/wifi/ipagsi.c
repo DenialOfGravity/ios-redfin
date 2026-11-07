@@ -237,6 +237,27 @@ static unsigned ev_state(int ev)
 	return rd32(GSI_EV_CH_E_CNTXT_0(ev)) >> EV_STATE_SHIFT & 0xf;
 }
 
+/* gsistart=eedump: READ-ONLY look at the modem's GSI EE (EE1 = our EE0 register block + 0x4000) next to ours:
+ * channel and event ring states 0-7 as hex digits (0 not-alloc, 1 allocated, 2 started, 3 stopped, f error),
+ * GSI status, error log.  Reading another EE's block could in principle be refused by the XPU (bus error);
+ * the run is opt-in for that reason. */
+static void ee_dump(void)
+{
+	static const char hx[] = "0123456789abcdef";
+	char c1[9], e1[9], c0[9], e0[9];
+
+	for (int i = 0; i < 8; i++) {
+		c1[i] = hx[rd32(GSI_CH_C_CNTXT_0(i) + 0x4000) >> CH_STATE_SHIFT & 0xf];
+		e1[i] = hx[rd32(GSI_EV_CH_E_CNTXT_0(i) + 0x4000) >> EV_STATE_SHIFT & 0xf];
+		c0[i] = hx[ch_state(i)];
+		e0[i] = hx[ev_state(i)];
+	}
+	c1[8] = e1[8] = c0[8] = e0[8] = 0;
+	LOG("eedump EE1 ch[%s] ev[%s] status %08x err %08x hw2 %08x | EE0 ch[%s] ev[%s] err %08x", c1, e1,
+	    rd32(GSI_BASE + 0x4000 + 0x12000), rd32(GSI_BASE + 0x4000 + 0x12200),
+	    rd32(GSI_BASE + 0x4000 + 0x12040), c0, e0, rd32(GSI_BASE + 0x12200));
+}
+
 static const char *ch_state_name(unsigned s)
 {
 	switch (s) {
@@ -1077,8 +1098,10 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI, GS_EEDUMP };
 static int gsitest;
+static uint64_t dump_at;		/* gsistart=eedump: next EE1 register dump */
+static int dump_n;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
 static int read_gsistart(void)
@@ -1096,6 +1119,8 @@ static int read_gsistart(void)
 		return GS_NONE;
 	if (strstr(b, "gsistart=tlvmin"))
 		return GS_TLVMIN;
+	if (strstr(b, "gsistart=eedump"))
+		return GS_EEDUMP;
 	if (strstr(b, "gsistart=ev4hi"))
 		return GS_EV4HI;
 	if (strstr(b, "gsistart=ev01"))
@@ -1221,6 +1246,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	phase0 = read_phase0();
 	gsitest = GS_BOTH;
 	free_at = 0;
+	dump_n = 0;
 	p0_bytes = 0;
 	p0_v4 = p0_v6 = p0_bad = 0;
 	if (phase0) {
@@ -1270,7 +1296,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		int gm = gsitest == GS_C2START ? GS_CH2 : gsitest == GS_C7START ? GS_CH7 :
 			 (gsitest == GS_ONETX || gsitest == GS_ONERX) ? GS_ONESTART :
 			 (gsitest == GS_IDS34 || gsitest == GS_EV4 || gsitest == GS_CH3 || gsitest == GS_EV01 ||
-			  gsitest == GS_EV4HI) ? GS_NONE : gsitest;
+			  gsitest == GS_EV4HI || gsitest == GS_EEDUMP) ? GS_NONE : gsitest;
 		int ev_tx = gm != GS_NONE && gm != GS_CH7;
 		int ev_rx = gm != GS_NONE && gm != GS_CH2 && gm != GS_ONERING &&
 			     gm != GS_ONESTART;	/* onering3 keeps ring 3 */
@@ -1323,7 +1349,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		for (int e = gsitest == GS_EV01 ? 0 : 4; e < (gsitest == GS_EV01 ? 2 : 8); e++)
 			if (ev_alloc_program(e, EV_CNT))
 				goto failed;
-	} else if (gsitest == GS_CH3) {
+	} else if (gsitest == GS_CH3 || gsitest == GS_EEDUMP) {
 		set_state("setup-2");
 		if (ev_alloc_program(EV_TX, EV_CNT))
 			goto failed;
@@ -1367,10 +1393,14 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi" };
-	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_EV4HI + 1, "nm[] out of sync with enum");
+						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi", "eedump" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_EEDUMP + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
+		if (gsitest == GS_EEDUMP) {
+			dump_n = 60;
+			dump_at = link_ms();
+		}
 		if (gsitest == GS_RXFIRST) {
 			if (ch_start(CH_MDM_RX) || ch_start(CH_MDM_TX))
 				goto failed;
@@ -1459,6 +1489,11 @@ void ipagsi_poll(void)
 	if (!ctx.active)
 		return;
 	if (gsitest) {
+		if (dump_n && link_ms() >= dump_at) {
+			dump_n--;
+			dump_at = link_ms() + 250;
+			ee_dump();
+		}
 		if (free_at && link_ms() >= free_at) {
 			free_at = 0;
 			gsi_release_all();
