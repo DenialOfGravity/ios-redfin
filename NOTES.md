@@ -528,3 +528,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 4c1b306 p2irqm: m=1 and m=28 (no common write) both give TX 3/3 + modem blips; m=0 run lost to a low-battery drop to fastboot
 - 2026-11-07 4c1b306 p2irqm bisect: TX ok with m=1 (INTSET) / m=2 / m=8 (any TYPE_IRQ_MSK change), stalls with m=0/4/16; modem start blips whenever TX is serviced, holds with m=4
 - 2026-11-07 ipagsi p2ack=1 (agent): log + clear pending EE0 irq status in p2_irq_setup
+- 2026-11-07 7b0397e p2ack: at the join ch2/ev2 control irqs pending (bit 2) and cleared, but TX still completed 0; modem start held
