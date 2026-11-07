@@ -498,3 +498,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 08:23 ipagsi.c (agent): ep_program() for p2late (ep2 before ch2 START, ep16 at the join; words p2prog=0, p2status=0, p2ep=before|after); shorter diag lines.
 - ipagsi a1c8338 p2late+ep_program (2026-11-07 r5au1): ep2/ep16 writes read back equal, no crash; TX still 3 posted / 0 completed (RP at base), rx 0; full run waited 624 s for the modem cycle. Phone left in ipaphase=0.
 - 2026-11-07 09:05 ipagsi.c (agent): p2qos=<n|0xHEX> word overrides ch2 QOS before START (p2late).
+- ipagsi f6242d7 p2qos=0 / 0x100 (2026-11-07 r5au1): QOS read back as set, TX still 3 posted / 0 completed. Below-4-GiB option: /dev/redwood-fastrpc FASTRPC_ALLOC (GPU pool, 32-bit aligned access, one opener). Phone left in ipaphase=0.
