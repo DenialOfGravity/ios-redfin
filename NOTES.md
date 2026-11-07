@@ -502,3 +502,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 09:24 ipagsi.c (agent): p2low=1 word: event ring, ch2 ring and TX buffers in one 1 MiB FASTRPC_ALLOC block (< 4 GiB, GPU pool) from /dev/redwood-fastrpc; RX not converted (use with p2tx=1).
 - ipagsi 8e237eb p2low (2026-11-07 r5au1): FASTRPC_ALLOC busy while fastrpcd runs (used /var/local/fastrpcd.off for one boot, removed after); 1 MiB at PA 0xceb30000, TX still 3 posted / 0 completed, RP at base. Not the >4 GiB address. Phone left in ipaphase=0.
 - 2026-11-07 09:47 ipagsi.c (agent): p2_diag also dumps IPA and GSI global registers after the first post (read-only).
+- ipagsi e165905 p2 regs (2026-11-07 r5au1): IPA/GSI global register dump logged for the agent; TX still 3 posted / 0 completed. Phone left in ipaphase=0.
