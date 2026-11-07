@@ -511,3 +511,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 13:54 ipagsi.c (agent): fix: transfer TRE type field set to XFER (was 0).
 - ipagsi bfc74f6 TRE XFER (2026-11-07 r5au1): TRE flags 00020200, TX still 0 completed (RP at base). One boot: wland auto gave up again (2nd today), reboot fine. Phone left in ipaphase=0.
 - 2026-11-07 14:18 ipagsi.c (agent): p2 dump adds GSI debug block, rest of IPA global block and ep2 block tail (read-only).
+- ipagsi a76dcaf debug dump (2026-11-07 r5au1): GSI debug / IPA tail reads ok (13 lines), TX still 0 completed. Phone left in ipaphase=0.
