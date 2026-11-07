@@ -489,3 +489,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 05:24 ipagsi.c (agent): gsistart=c2join (c2start, then add + start ch 7 rx on ev2 once the modem's EE1 ch 7 has been started for 5 s).
 - ipagsi 0196fb7 c2join x3 (2026-11-07 r5au1): r1 modem cycled +93 s, join (ch7 rx alloc+start on ev2, ch2+ch7 started) survived 224 s; r2/r3 no modem cycle in 402 s (no join). Scan map: 7/10 modem events inside a Wi-Fi scan. Phone left in ipaphase=0.
 - 2026-11-07 06:10 ipagsi.c (agent): gsistart=c2joint (c2join, but joins ch 7 rx 120 s after up even if the modem has not cycled).
+- ipagsi fd390dc c2joint (2026-11-07 r5au1): r1/r2 modem cycled at +8 s, late join (ch2+ch7 started on ev2) clean 605 s / 489 s; timeout join not exercised; r3 not run. Phone left in ipaphase=0.
