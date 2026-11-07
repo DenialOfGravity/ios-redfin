@@ -1339,6 +1339,8 @@ static void fail_state(void)
  * One reader for ring 2 tells TX and RX events apart by the channel id.  No channel 5, no tables. */
 static int p2_stage;			/* 0 off, 1 waiting for the modem, 2 running */
 static int p2_tx_only, p2_ep_before;
+static int p2_cmd;			/* p2cmd=1: command channel test (below) */
+static int p2_cmd_setup(void);
 static unsigned p2_join_s;		/* 0 = wait forever (default) */
 static uint64_t p2_t0, p2_seen, p2_stat;
 static unsigned p2_txev, p2_rxev, p2_unk;
@@ -1527,6 +1529,9 @@ static int p2_setup(void)
 	}
 	if (cell_word_int("p2low=", 0) && lo_init())
 		return -1;
+	p2_cmd = cell_word_int("p2cmd=", 0);
+	if (p2_cmd)
+		return p2_cmd_setup();
 	set_state("setup-2");
 	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
 		return -1;
@@ -1608,8 +1613,101 @@ static void p2_drain(void)
 	}
 }
 
+/* p2cmd=1: command-channel test.  ev2 + ch5 (AP_COMMAND_TX, ep7) only (3 units, as safe as p2tx), one immediate
+ * command (IP_PACKET_INIT, dest ep2: harmless, only affects the next data packet on ch5) and a look at whether
+ * ch5's RP moves / an event arrives.  If ch5 completes, the GSI->IPA TX path works and ch2's stall is specific to
+ * that pipe (routing/pipe config); if ch5 stalls too, the GSI or IPA core is not processing our channels at all. */
+static uint64_t p2_cmd_buf, p2_cmd_t;
+static unsigned p2_cmd_n;
+
+static void p2_cmd_dump(const char *why)
+{
+	uint64_t cb = GSI_CH_C_CNTXT_0(CH_CMDTX), eb = GSI_EV_CH_E_CNTXT_0(EV_TX);
+
+	LOG("p2cmd (%s): ch5 state %s ctx %08x %08x %08x %08x rp %08x/%08x wp %08x/%08x qos %08x", why,
+	    ch_state_name(ch_state(CH_CMDTX)), rd32(cb), rd32(cb + 4), rd32(cb + 8), rd32(cb + 12), rd32(cb + 0x10),
+	    rd32(cb + 0x14), rd32(cb + 0x18), rd32(cb + 0x1c), rd32(GSI_CH_C_QOS(CH_CMDTX)));
+	LOG("p2cmd (%s): ch5 scratch %08x %08x %08x %08x | ev2 state %x rp %08x wp %08x err %08x", why,
+	    rd32(GSI_CH_C_SCRATCH_0(CH_CMDTX)), rd32(GSI_CH_C_SCRATCH_1(CH_CMDTX)), rd32(GSI_CH_C_SCRATCH_2(CH_CMDTX)),
+	    rd32(GSI_CH_C_SCRATCH_3(CH_CMDTX)), ev_state(EV_TX), rd32(eb + 0x18), rd32(eb + 0x20), rd32(GSI_BASE + 0x12200));
+}
+
+static void p2_cmd_post(void)
+{
+	struct gsi_ring *r = &ctx.ch[CH_CMDTX];
+	struct gsi_tre tre;
+	uint32_t idx = r->wp % r->cnt;
+
+	tre.addr = p2_cmd_buf;
+	tre.len = 0x10;			/* IPA_CMD_IP_PACKET_INIT */
+	tre.resv = 0;
+	tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+	if (pm_wr(r->pa + (uint64_t) idx * RING_ELEM, &tre, sizeof(tre))) {
+		LOG("p2cmd: tre write failed: %s", strerror(errno));
+		return;
+	}
+	r->wp++;
+	ch_doorbell(CH_CMDTX);
+	LOG("p2cmd: posted command %u (IP_PACKET_INIT dest ep2), buf %llx, wp %u", r->wp, (unsigned long long) p2_cmd_buf,
+	    r->wp);
+}
+
+static int p2_cmd_setup(void)
+{
+	uint8_t pl[8] = { EP_MDM_TX, 0, 0, 0, 0, 0, 0, 0 };
+
+	set_state("setup-2");
+	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_CMDTX, EV_TX, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
+		return -1;
+	/* mainline ep7 (AP_COMMAND_TX): DMA mode to AP_LAN_RX (ep 9), seq type DMA, resource group 0 */
+	wr32(IPA_ENDP_MODE(EP_CMDTX), 3 | 9u << 4);
+	wr32(IPA_ENDP_SEQ(EP_CMDTX), 0);
+	LOG("p2cmd: ep7 mode %08x seq %08x", rd32(IPA_ENDP_MODE(EP_CMDTX)), rd32(IPA_ENDP_SEQ(EP_CMDTX)));
+	if (ch_start(CH_CMDTX))
+		return -1;
+	p2_cmd_buf = ring_mem(64, 64);
+	if (!p2_cmd_buf || pm_wr(p2_cmd_buf, pl, sizeof(pl))) {
+		LOG("p2cmd: payload buffer failed");
+		return -1;
+	}
+	LOG("p2cmd: ev2 + ch5 started (3 units)");
+	p2_cmd_dump("before");
+	p2_cmd_post();
+	p2_cmd_t = link_ms();
+	p2_cmd_n = 0;
+	p2_stage = 2;
+	set_state("up");
+	return 0;
+}
+
+static void p2_cmd_poll(void)
+{
+	struct gsi_evt e;
+	int n;
+
+	while ((n = ev_read(EV_TX, &e)) == 1) {
+		uint32_t w[4];
+
+		memcpy(w, &e, sizeof(w));
+
+		LOG("p2cmd: EVENT %08x %08x %08x %08x (code %02x type %02x chid %u)", w[0], w[1], w[2], w[3], e.code, e.type,
+		    e.chid);
+	}
+	if (p2_cmd_n < 12 && link_ms() >= p2_cmd_t + 2000u) {
+		p2_cmd_t = link_ms();
+		p2_cmd_n++;
+		p2_cmd_dump("poll");
+		if (p2_cmd_n == 3 || p2_cmd_n == 7)
+			p2_cmd_post();		/* ring again: a missed first doorbell would show here */
+	}
+}
+
 static void p2_poll(void)
 {
+	if (p2_cmd) {
+		p2_cmd_poll();
+		return;
+	}
 	if (dump_n && link_ms() >= dump_at) {
 		if (dump_n > 0)
 			dump_n--;
