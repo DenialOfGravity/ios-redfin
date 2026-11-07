@@ -1310,6 +1310,22 @@ static int cell_word_int(const char *key, int def)
 	return atoi(at + strlen(key));
 }
 
+/* key=<number> (decimal, or 0x hex) from cell.on; def when absent */
+static long cell_word_num(const char *key, long def)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	char *at;
+
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	at = strstr(b, key);
+	return at ? strtol(at + strlen(key), NULL, 0) : def;
+}
+
 static int cell_word_has(const char *w)
 {
 	char b[512] = "";
@@ -1423,6 +1439,14 @@ static int p2_setup(void)
 	set_state("setup-2");
 	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
 		return -1;
+	{
+		long q = cell_word_num("p2qos=", -1);	/* experiment: override ch 2's QOS register (prefetch mode etc.) */
+
+		if (q >= 0) {
+			LOG("p2: ch2 QOS %08x -> %08lx (p2qos=)", rd32(GSI_CH_C_QOS(CH_MDM_TX)), q);
+			wr32(GSI_CH_C_QOS(CH_MDM_TX), (uint32_t) q);
+		}
+	}
 	set_state("setup-3");
 	if (p2_prog) {
 		ep_program(EP_MDM_TX, p2_status);	/* before the channel is started, as mainline */
