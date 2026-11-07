@@ -483,3 +483,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 03:19 ipagsi.c (agent): gsistart=eedump (ch3 shape + read-only dump of the modem EE1 GSI channel/ring states every 250 ms for 15 s).
 - ipagsi 64a1491 eedump (2026-11-07 r5au1): EE1 readable. Modem EE1 ch 7 stopped->started at ~163.9 s next to smp2p 106 (163.83), assert 164.45 (+8.2 s); EE1 err 0 throughout.
 - ipagsi 64a1491 onering long (2026-11-07 r5au1): ev2 + ch2/ch7 allocated, clean 270 s. Phone left in ipaphase=0.
+- 2026-11-07 03:46 ipagsi.c (agent): eedump=1 as a separate cell.on word (any gsistart mode): logs modem EE1 states on change + ring base words.

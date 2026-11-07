@@ -244,7 +244,9 @@ static unsigned ev_state(int ev)
 static void ee_dump(void)
 {
 	static const char hx[] = "0123456789abcdef";
-	char c1[9], e1[9], c0[9], e0[9];
+	static char prev[64];
+	static unsigned beat;
+	char c1[9], e1[9], c0[9], e0[9], sig[64];
 
 	for (int i = 0; i < 8; i++) {
 		c1[i] = hx[rd32(GSI_CH_C_CNTXT_0(i) + 0x4000) >> CH_STATE_SHIFT & 0xf];
@@ -253,9 +255,28 @@ static void ee_dump(void)
 		e0[i] = hx[ev_state(i)];
 	}
 	c1[8] = e1[8] = c0[8] = e0[8] = 0;
-	LOG("eedump EE1 ch[%s] ev[%s] status %08x err %08x hw2 %08x | EE0 ch[%s] ev[%s] err %08x", c1, e1,
-	    rd32(GSI_BASE + 0x4000 + 0x12000), rd32(GSI_BASE + 0x4000 + 0x12200),
-	    rd32(GSI_BASE + 0x4000 + 0x12040), c0, e0, rd32(GSI_BASE + 0x12200));
+	snprintf(sig, sizeof(sig), "%s %s %s %s %08x", c1, e1, c0, e0, rd32(GSI_BASE + 0x4000 + 0x12200));
+	/* log only when something changed (plus a heartbeat every ~10 s): the dump may run for minutes */
+	if (!strcmp(sig, prev) && ++beat < 40)
+		return;
+	beat = 0;
+	LOG("eedump EE1 ch[%s] ev[%s] status %08x err %08x | EE0 ch[%s] ev[%s] err %08x%s", c1, e1,
+	    rd32(GSI_BASE + 0x4000 + 0x12000), rd32(GSI_BASE + 0x4000 + 0x12200), c0, e0, rd32(GSI_BASE + 0x12200),
+	    prev[0] && strcmp(sig, prev) ? "  <- CHANGED" : "");
+	if (strcmp(sig, prev)) {
+		/* modem EE context words (flags, ring length, ring base lo/hi) of every channel / event ring that exists */
+		for (int i = 0; i < 8; i++) {
+			if (c1[i] != '0')
+				LOG("  EE1 ch %d: %08x %08x %08x %08x", i, rd32(GSI_CH_C_CNTXT_0(i) + 0x4000),
+				    rd32(GSI_CH_C_CNTXT_1(i) + 0x4000), rd32(GSI_CH_C_CNTXT_2(i) + 0x4000),
+				    rd32(GSI_CH_C_CNTXT_3(i) + 0x4000));
+			if (e1[i] != '0')
+				LOG("  EE1 evt %d: %08x %08x %08x %08x", i, rd32(GSI_EV_CH_E_CNTXT_0(i) + 0x4000),
+				    rd32(GSI_EV_CH_E_CNTXT_1(i) + 0x4000), rd32(GSI_EV_CH_E_CNTXT_2(i) + 0x4000),
+				    rd32(GSI_EV_CH_E_CNTXT_3(i) + 0x4000));
+		}
+	}
+	snprintf(prev, sizeof(prev), "%s", sig);
 }
 
 static const char *ch_state_name(unsigned s)
@@ -1104,6 +1125,18 @@ static uint64_t dump_at;		/* gsistart=eedump: next EE1 register dump */
 static int dump_n;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
+static int read_eedump_flag(void)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	return strstr(b, "eedump=1") != NULL;
+}
+
 static int read_gsistart(void)
 {
 	char b[512] = "";
@@ -1397,8 +1430,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_EEDUMP + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
-		if (gsitest == GS_EEDUMP) {
-			dump_n = 60;
+		if (gsitest == GS_EEDUMP || read_eedump_flag()) {
+			dump_n = -1;	/* until reboot; logs only on change */
 			dump_at = link_ms();
 		}
 		if (gsitest == GS_RXFIRST) {
@@ -1490,7 +1523,8 @@ void ipagsi_poll(void)
 		return;
 	if (gsitest) {
 		if (dump_n && link_ms() >= dump_at) {
-			dump_n--;
+			if (dump_n > 0)
+				dump_n--;
 			dump_at = link_ms() + 250;
 			ee_dump();
 		}
