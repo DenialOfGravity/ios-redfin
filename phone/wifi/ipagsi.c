@@ -1077,7 +1077,7 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3 };
 static int gsitest;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1096,6 +1096,10 @@ static int read_gsistart(void)
 		return GS_NONE;
 	if (strstr(b, "gsistart=tlvmin"))
 		return GS_TLVMIN;
+	if (strstr(b, "gsistart=ev4"))
+		return GS_EV4;
+	if (strstr(b, "gsistart=ch3"))
+		return GS_CH3;
 	if (strstr(b, "gsistart=tlvbig"))
 		return GS_TLVBIG;
 	if (strstr(b, "gsistart=late"))
@@ -1261,7 +1265,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	{
 		int gm = gsitest == GS_C2START ? GS_CH2 : gsitest == GS_C7START ? GS_CH7 :
 			 (gsitest == GS_ONETX || gsitest == GS_ONERX) ? GS_ONESTART :
-			 gsitest == GS_IDS34 ? GS_NONE : gsitest;
+			 (gsitest == GS_IDS34 || gsitest == GS_EV4 || gsitest == GS_CH3) ? GS_NONE : gsitest;
 		int ev_tx = gm != GS_NONE && gm != GS_CH7;
 		int ev_rx = gm != GS_NONE && gm != GS_CH2 && gm != GS_ONERING &&
 			     gm != GS_ONESTART;	/* onering3 keeps ring 3 */
@@ -1297,6 +1301,25 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 			goto failed;
 	}
 
+	/* Resource-count model fitted to every result so far: units = event rings + channels + STARTed channels;
+	 * <= 3 units clean, >= 4 crash (r1c1s0=2, r1c1s1=3, r1c2s0=3, r2c0=2 clean; r2c2s0=4, r1c2s1=4 crash).
+	 *   ev4: four event rings (0-3), NO channels (4 units): crash => the count of rings alone counts, no channel needed.
+	 *   ch3: ev2 plus channels 2, 3, 7 on it, none started (4 units): crash => a third channel is enough. */
+	if (gsitest == GS_EV4) {
+		set_state("setup-2");
+		for (int e = 0; e < 4; e++)
+			if (ev_alloc_program(e, EV_CNT))
+				goto failed;
+	} else if (gsitest == GS_CH3) {
+		set_state("setup-2");
+		if (ev_alloc_program(EV_TX, EV_CNT))
+			goto failed;
+		set_state("setup-3");
+		if (ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, TLV_MDM_TX) ||
+		    ch_alloc_program(CH_ALT_TX, EV_TX, TX_TRE_CNT, 1, 0, TLV_MDM_TX) ||
+		    ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, TLV_MDM_RX))
+			goto failed;
+	}
 	if (gsitest == GS_IDS34) {
 		set_state("setup-2");
 		if (ev_alloc_program(EV_TX, EV_CNT))
@@ -1331,8 +1354,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34", "tlvmin", "late", "tlvbig" };
-	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_TLVBIG + 1, "nm[] out of sync with enum");
+						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_CH3 + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
