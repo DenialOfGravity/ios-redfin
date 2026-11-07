@@ -500,3 +500,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 09:05 ipagsi.c (agent): p2qos=<n|0xHEX> word overrides ch2 QOS before START (p2late).
 - ipagsi f6242d7 p2qos=0 / 0x100 (2026-11-07 r5au1): QOS read back as set, TX still 3 posted / 0 completed. Below-4-GiB option: /dev/redwood-fastrpc FASTRPC_ALLOC (GPU pool, 32-bit aligned access, one opener). Phone left in ipaphase=0.
 - 2026-11-07 09:24 ipagsi.c (agent): p2low=1 word: event ring, ch2 ring and TX buffers in one 1 MiB FASTRPC_ALLOC block (< 4 GiB, GPU pool) from /dev/redwood-fastrpc; RX not converted (use with p2tx=1).
+- ipagsi 8e237eb p2low (2026-11-07 r5au1): FASTRPC_ALLOC busy while fastrpcd runs (used /var/local/fastrpcd.off for one boot, removed after); 1 MiB at PA 0xceb30000, TX still 3 posted / 0 completed, RP at base. Not the >4 GiB address. Phone left in ipaphase=0.
