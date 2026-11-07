@@ -531,3 +531,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 7b0397e p2ack: at the join ch2/ev2 control irqs pending (bit 2) and cleared, but TX still completed 0; modem start held
 - 2026-11-08 7b0397e p2irq=2+p2ack (groups 1f) at the join: irq regs end as in serviced runs, nothing pending, modem holds, TX still 0 -> order (setup before ch2/ev2 alloc) matters; p2irqm=2 runs: modem never cycled (2 boots)
 - 2026-11-08 ipagsi p2irq=3 (agent): at the join irq setup, then stop/reset/release + re-create ch2/ev2
+- 2026-11-08 9d7b59e p2irq=3: untested, the modem did not start its channels in 2 boots (4 in a row incl. p2irqm=2), 630 s max
