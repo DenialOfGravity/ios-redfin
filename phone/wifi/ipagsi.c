@@ -208,7 +208,7 @@ static struct {
 	struct ipagsi_call call;
 	int tables;
 
-	struct gsi_ring ev[4];		/* event rings, by id (0, 2, 3) */
+	struct gsi_ring ev[8];		/* event rings, by id (0, 2, 3; 4-7 for the ev4hi probe) */
 	struct gsi_ring ch[8];		/* channels, by id (2, 5, 7) */
 
 	uint64_t rx_buf_pa[RX_BUFS];
@@ -444,7 +444,7 @@ static void gsi_release_all(void)
 	ch_release(CH_ALT_TX);
 	ch_release(CH_MDM_RX);
 	ch_release(CH_MDM_TX);
-	for (int ev = 0; ev < 4; ev++)
+	for (int ev = 0; ev < 8; ev++)
 		ev_release(ev);
 	LOG("released: ch 2 %s, ch 7 %s, evt 0 %x 1 %x 2 %x 3 %x", ch_state_name(ch_state(CH_MDM_TX)),
 	    ch_state_name(ch_state(CH_MDM_RX)), ev_state(0), ev_state(1), ev_state(2), ev_state(3));
@@ -1077,7 +1077,7 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3 };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI };
 static int gsitest;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1096,6 +1096,10 @@ static int read_gsistart(void)
 		return GS_NONE;
 	if (strstr(b, "gsistart=tlvmin"))
 		return GS_TLVMIN;
+	if (strstr(b, "gsistart=ev4hi"))
+		return GS_EV4HI;
+	if (strstr(b, "gsistart=ev01"))
+		return GS_EV01;
 	if (strstr(b, "gsistart=ev4"))
 		return GS_EV4;
 	if (strstr(b, "gsistart=ch3"))
@@ -1265,7 +1269,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	{
 		int gm = gsitest == GS_C2START ? GS_CH2 : gsitest == GS_C7START ? GS_CH7 :
 			 (gsitest == GS_ONETX || gsitest == GS_ONERX) ? GS_ONESTART :
-			 (gsitest == GS_IDS34 || gsitest == GS_EV4 || gsitest == GS_CH3) ? GS_NONE : gsitest;
+			 (gsitest == GS_IDS34 || gsitest == GS_EV4 || gsitest == GS_CH3 || gsitest == GS_EV01 ||
+			  gsitest == GS_EV4HI) ? GS_NONE : gsitest;
 		int ev_tx = gm != GS_NONE && gm != GS_CH7;
 		int ev_rx = gm != GS_NONE && gm != GS_CH2 && gm != GS_ONERING &&
 			     gm != GS_ONESTART;	/* onering3 keeps ring 3 */
@@ -1308,6 +1313,14 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 	if (gsitest == GS_EV4) {
 		set_state("setup-2");
 		for (int e = 0; e < 4; e++)
+			if (ev_alloc_program(e, EV_CNT))
+				goto failed;
+	} else if (gsitest == GS_EV01 || gsitest == GS_EV4HI) {
+		/* ring ids vs ring count: ev01 = two rings with low ids (0,1); ev4hi = four rings with HIGH ids (4-7).
+		 * ev (2,3) was clean for 150+ s, ev (0-3) crashed. ev4hi clean => it is the low ring ids (the modem
+		 * uses ring 0 or 1 of the shared pool), not the count; ev01 crash points at the same. */
+		set_state("setup-2");
+		for (int e = gsitest == GS_EV01 ? 0 : 4; e < (gsitest == GS_EV01 ? 2 : 8); e++)
 			if (ev_alloc_program(e, EV_CNT))
 				goto failed;
 	} else if (gsitest == GS_CH3) {
@@ -1354,8 +1367,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3" };
-	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_CH3 + 1, "nm[] out of sync with enum");
+						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_EV4HI + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
