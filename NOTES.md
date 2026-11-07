@@ -509,3 +509,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 11:06 ipagsi.c (agent): p2evmod=<n> (ev ring CNTXT_8) and p2scr0..3=<n> (ch2 scratch) run-time words for p2late.
 - ipagsi 8c727f0 tests A/B/C (2026-11-07 r5au1): scratch 0 / evmod 0x00030020 / both + qos 0x402 read back as set, TX still 0 completed (RP at base). No reboots. Phone left in ipaphase=0.
 - 2026-11-07 13:54 ipagsi.c (agent): fix: transfer TRE type field set to XFER (was 0).
+- ipagsi bfc74f6 TRE XFER (2026-11-07 r5au1): TRE flags 00020200, TX still 0 completed (RP at base). One boot: wland auto gave up again (2nd today), reboot fine. Phone left in ipaphase=0.
