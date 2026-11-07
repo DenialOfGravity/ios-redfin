@@ -476,3 +476,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 01:23 ipagsi.c: gsistart=tlvbig (c2start with tlv 30). late(fixed) crashed at +88 s: modem's own schedule
 - ipagsi tlv probes (2026-11-07 r5au1): tlvmin (5d54ae9, ch2+ch7 tlv 2/2 STARTed) modem assert +9.1 s; tlvbig (2a18c75, ch2 alone tlv 30 STARTed) clean 235 s. Not the TLV budget. Phone left in ipaphase=0.
 - 2026-11-07 01:50 ipagsi.c (agent): gsistart=ev4 (event rings 0-3, no channels) and ch3 (ev2 + ch 2/3/7, none started): test the resource-count model.
+- ipagsi 72f72f1 ev4 (2026-11-07 r5au1): event rings 0-3, no channels -> modem assert ipa_hal.c:7354 at +93 s (106->107 3.6 s). Event rings alone count. ch3 not run. Phone left in ipaphase=0.
