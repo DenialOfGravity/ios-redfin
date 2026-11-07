@@ -467,4 +467,5 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi probe 45d6f8c onestart (2026-11-07 r5au1): ev2 shared, ch2+ch7 both START to 'started', then modem assert ipa_hal.c:7354 at +9.3 s. Allocation on one ring is clean, START of both on it is not. Phone left in ipaphase=0.
 - ipagsi: 45d6f8c onestart: both channels START ok on one shared ring, modem still asserts +9.3 s. New probes (shared ring): gsistart=onetx|onerx|c2start|c7start (START one channel). Syntax-checked phases 1+2; untested on the phone.
 - ipagsi probes ead4c88 (2026-11-07 r5au1): c2start clean 96 s, c7start clean 96 s, onetx (ch2+ch7 on ev2, ch2 STARTed) modem assert +8.9 s. A started channel crashes the modem only with the other channel allocated. One boot had wland auto give up (up returned 1 x5 at stage start, before ipagsi); next boot fine. Phone left in ipaphase=0.
+- ipagsi probe a45ac02 ids34 (2026-11-07 r5au1): ch3+ch4 on ev2, both STARTed -> modem assert +8.2 s. Not the channel ids. Phone left in ipaphase=0.
 - 2026-11-07 00:11 ipagsi.c: gsistart=ids34 probe (channels 3+4 on ev2, both STARTed); release covers ch 3/4
