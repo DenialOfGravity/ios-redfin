@@ -1344,6 +1344,7 @@ static int p2_tx_only, p2_ep_before;
 static int p2_cmd;			/* p2cmd=1: command channel test (below) */
 static int p2_cmd_setup(void);
 static void p2_irq_setup(void);
+static int p2_tx_recreate(void);
 static unsigned p2_join_s;		/* 0 = wait forever (default) */
 static uint64_t p2_t0, p2_seen, p2_stat;
 static unsigned p2_txev, p2_rxev, p2_unk;
@@ -1718,6 +1719,45 @@ static void p2_irq_setup(void)
 	LOG("p2irq: after: %s", line);
 }
 
+/* p2irq=3: at the join, do the irq setup, then tear ch2 + ev2 down (STOP, RESET, DE_ALLOC) and set them up again, so
+ * the GSI sees the irq config when the channel is allocated/started (p2irq=1 does that at setup and ch2 is serviced,
+ * but then the modem's start blips; p2irq=2 holds the modem start but ch2 is not serviced).  3 units before and after. */
+static int p2_tx_recreate(void)
+{
+	uint64_t t0;
+
+	p2_irq_setup();
+	LOG("p2: recreate ch2/ev2: ch2 %s ev2 %x", ch_state_name(ch_state(CH_MDM_TX)), ev_state(EV_TX));
+	wr32(GSI_CH_CMD, CH_CMD_STOP << 24 | CH_MDM_TX);
+	for (t0 = link_ms(); ch_state(CH_MDM_TX) != CH_ST_STOPPED && link_ms() - t0 < 300;)
+		delay_ms(1);
+	if (ch_state(CH_MDM_TX) != CH_ST_STOPPED) {
+		LOG("p2: recreate: ch2 stop failed, state %s", ch_state_name(ch_state(CH_MDM_TX)));
+		return -1;
+	}
+	wr32(GSI_CH_CMD, CH_CMD_RESET << 24 | CH_MDM_TX);
+	for (t0 = link_ms(); ch_state(CH_MDM_TX) != CH_ST_ALLOCATED && link_ms() - t0 < 300;)
+		delay_ms(1);
+	if (ch_state(CH_MDM_TX) != CH_ST_ALLOCATED) {
+		LOG("p2: recreate: ch2 reset failed, state %s", ch_state_name(ch_state(CH_MDM_TX)));
+		return -1;
+	}
+	ch_release(CH_MDM_TX);
+	ev_release(EV_TX);
+	if (ch_state(CH_MDM_TX) != CH_ST_NOT_ALLOC || ev_state(EV_TX) != EV_ST_NOT_ALLOC) {
+		LOG("p2: recreate: release incomplete (ch2 %s, ev2 %x)", ch_state_name(ch_state(CH_MDM_TX)), ev_state(EV_TX));
+		return -1;
+	}
+	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
+		return -1;
+	if (p2_prog)
+		ep_program(EP_MDM_TX, p2_status);
+	if (ch_start(CH_MDM_TX))
+		return -1;
+	LOG("p2: recreate done: ch2 %s ev2 %x", ch_state_name(ch_state(CH_MDM_TX)), ev_state(EV_TX));
+	return 0;
+}
+
 static int p2_cmd_setup(void)
 {
 	uint8_t pl[8] = { EP_MDM_TX, 0, 0, 0, 0, 0, 0, 0 };
@@ -1803,6 +1843,8 @@ static void p2_poll(void)
 		LOG("p2: join (%s)", go == 1 ? "cycle" : "timeout");
 		if (cell_word_int("p2irq=", 0) == 2)
 			p2_irq_setup();
+		else if (cell_word_int("p2irq=", 0) == 3 && p2_tx_recreate())
+			goto failed;
 		if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx))
 			goto failed;
 		if (p2_prog && !p2_ep_before)
