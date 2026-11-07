@@ -519,3 +519,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 15:25 ipagsi.c (agent): p2irq=1 word: EE0 GSI interrupt setup as mainline gsi_irq_setup/enable (logs before/after).
 - ipagsi 9913389 p2irq (2026-11-07 r5au1): with mainline's GSI irq setup, ch2 RP MOVES (3 TREs fetched) and 3 events arrive on ev2 - but decoded as zeros. Fix (Claude, software): ev_read() zeroed the caller's event before returning; now clears the ring slot from a local zero element.
 - ipagsi 9735086 p2tx+p2irq (2026-11-07 r5au1): TX WORKS - 3 UDP to the gateway, tx posted 3 completed 3 (ev 3). Missing piece was the EE0 GSI irq setup (p2irq) plus the ev_read fix.
+- ipagsi 9735086 full p2late+p2irq (2026-11-07 r5au1): modem only blipped (0.8 s) at +2.6 s, no sustained cycle in 12 min -> RX never joined. Phone left in ipaphase=0.
