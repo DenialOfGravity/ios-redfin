@@ -505,3 +505,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi e165905 p2 regs (2026-11-07 r5au1): IPA/GSI global register dump logged for the agent; TX still 3 posted / 0 completed. Phone left in ipaphase=0.
 - 2026-11-07 10:10 ipagsi.c (agent): p2_diag also dumps the modem EE1 channel/event-ring contexts 0-7 and our ch2/ev2 (read-only).
 - ipagsi 0faa68a p2 EE1 ctx (2026-11-07 r5au1): EE1/EE0 context dump logged for the agent; TX still 3 posted / 0 completed. Phone left in ipaphase=0.
+- ipagsi 0faa68a p2qos 0x402/0x802 (2026-11-07 r5au1): WRR 2 read back, TX still 0 completed. 0x20802 run interrupted: phone rebooted into recovery, battery 3514 mV; paused for charging.
