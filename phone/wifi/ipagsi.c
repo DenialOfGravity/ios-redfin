@@ -158,8 +158,9 @@ struct gsi_tre {
 #define TRE_IEOT	(1u << 9)
 #define TRE_BEI		(1u << 10)
 /* flags 23:16 is the entry type (enum gsi_tre_type), not a per-endpoint TLV number: a plain
- * transfer is GSI_RE_XFER = 0, an immediate command is GSI_RE_IMMD_CMD = 3 */
-#define TRE_XFER	0u
+ * transfer is GSI_RE_XFER = 2 (gsi_trans.c: GSI_RE_XFER = 0x2; an earlier version of this file said 0 and
+ * so posted type-0 TREs the GSI never consumed), an immediate command is GSI_RE_IMMD_CMD = 3 */
+#define TRE_XFER	(2u << 16)
 #define TRE_IMMD_CMD	(3u << 16)
 
 #define RING_ELEM	16
