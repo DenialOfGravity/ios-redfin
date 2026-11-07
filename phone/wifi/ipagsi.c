@@ -1533,6 +1533,25 @@ static int p2_setup(void)
 			wr32(GSI_CH_C_QOS(CH_MDM_TX), (uint32_t) q);
 		}
 	}
+	{
+		/* experiments (all before ch_start): modem-like event ring moderation / channel scratch words */
+		long v = cell_word_num("p2evmod=", -1);
+
+		if (v >= 0) {
+			LOG("p2: ev2 CNTXT_8 %08x -> %08lx (p2evmod=)", rd32(GSI_EV_CH_E_CNTXT_8(EV_TX)), v);
+			wr32(GSI_EV_CH_E_CNTXT_8(EV_TX), (uint32_t) v);
+		}
+		for (int i = 0; i < 4; i++) {
+			char w[16];
+
+			snprintf(w, sizeof(w), "p2scr%d=", i);
+			v = cell_word_num(w, -1);
+			if (v >= 0) {
+				LOG("p2: ch2 SCRATCH_%d %08x -> %08lx (%s)", i, rd32(GSI_CH_C_SCRATCH_0(CH_MDM_TX) + 4 * i), v, w);
+				wr32(GSI_CH_C_SCRATCH_0(CH_MDM_TX) + 4 * i, (uint32_t) v);
+			}
+		}
+	}
 	set_state("setup-3");
 	if (p2_prog) {
 		ep_program(EP_MDM_TX, p2_status);	/* before the channel is started, as mainline */
