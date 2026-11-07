@@ -1077,7 +1077,7 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG };
 static int gsitest;
 static uint64_t free_at;		/* gsistart=freelate: when ipagsi_poll releases the rings */
 
@@ -1096,6 +1096,8 @@ static int read_gsistart(void)
 		return GS_NONE;
 	if (strstr(b, "gsistart=tlvmin"))
 		return GS_TLVMIN;
+	if (strstr(b, "gsistart=tlvbig"))
+		return GS_TLVBIG;
 	if (strstr(b, "gsistart=late"))
 		return GS_LATE;
 	if (strstr(b, "gsistart=ids34"))
@@ -1241,6 +1243,12 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		tlv_tx = tlv_rx = 2;
 		gsitest = GS_ONESTART;
 		LOG("gsistart=tlvmin: onestart with tlv_count 2/2");
+	} else if (gsitest == GS_TLVBIG) {
+		/* the other side of tlvmin: ONE channel (c2start shape) with a big TLV FIFO (30 vs mainline 16).
+		 * Crash => the modem objects to the TLV FIFO budget used, not to having two channels. */
+		tlv_tx = 30;
+		gsitest = GS_C2START;
+		LOG("gsistart=tlvbig: c2start with tlv_count 30");
 	} else if (gsitest == GS_LATE) {
 		/* onestart shape, but only after 45 s: every crash so far lands at ~157-158 s of uptime,
 		 * whatever time we came up at, i.e. the modem's own IPA init */
@@ -1323,8 +1331,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34", "tlvmin", "late" };
-	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_LATE + 1, "nm[] out of sync with enum");
+						  "c7start", "ids34", "tlvmin", "late", "tlvbig" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_TLVBIG + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_RXFIRST) {
