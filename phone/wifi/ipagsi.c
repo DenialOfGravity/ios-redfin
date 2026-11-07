@@ -699,7 +699,7 @@ static void ep_show(int ep)
 		LOG("  ep%d %-9s %08x", ep, r[i].name, rd32(base + r[i].off));
 }
 
-#if IPAGSI_PHASE >= 2
+#if 1	/* was IPAGSI_PHASE >= 2: gsistart=p2late uses it in the default build too */
 /* Endpoints are programmed by the modem during IPA QMI INIT_DEVICE / INIT_MODEM_DRIVER (that is
  * how the DPM port {embedded 4, iface 1, rx-ep 2, tx-ep 16} reached them), and mainline's
  * ipa_data-v4.7.c gives the values we would use.  Nothing here is rewritten unless its knob is
@@ -797,7 +797,7 @@ static int ipagsi_endpoints(void)
  * channel 5 with immediate commands (that is what ipacmd=1 would be for).  Not implemented - the
  * modem's own INIT_MODEM_DRIVER setup already left those tables in place, so this only logs, and
  * channel 5 and event ring 0 stay allocated but unused.  See open item 4 in README.ipagsi.md. */
-static void ipagsi_tables(void)
+static void __attribute__((unused)) ipagsi_tables(void)
 {
 	if (!ctx.tables)
 		return;
@@ -904,6 +904,37 @@ static int rx_prepost(void)
 	return 0;
 }
 
+/* one completion event of channel 7 (own ring in the old layout, the shared ring 2 in gsistart=p2late):
+ * hand the frame to the utun and re-post the buffer.  Returns 1 if the buffer could not be re-posted. */
+static unsigned long long rx_bytes;
+static int rx_event(const struct gsi_evt *e)
+{
+	if (e->type != EVT_CBCM) {
+		LOG("rx evt: type %02x code %02x ch %u len %u", e->type, e->code, e->chid, e->len);
+		ctx.rx_err++;
+		return 0;
+	}
+	if (e->code != EVT_CODE_DATA && e->code != EVT_CODE_THROW)
+		LOG("rx evt: unexpected code %02x len %u", e->code, e->len);
+	unsigned idx = ctx.rx_done % RX_BUFS;
+
+	ctx.rx_done++;
+	if (e->len > RX_BUF_SZ) {
+		LOG("rx len %u over buffer", e->len);
+		ctx.rx_err++;
+	} else if (e->len) {
+		rx_bytes += e->len;
+		if (pm_rd(ctx.rx_buf_pa[idx], bounce, e->len))
+			LOG("rx buffer read failed: %s", strerror(errno));
+		else
+			qmap_deagg(bounce, e->len, rx_to_utun, NULL, &ctx.rx_st);
+	}
+	if (rx_post_one(idx))
+		return 1;
+	ch_doorbell(CH_MDM_RX);
+	return 0;
+}
+
 /* take everything the modem has finished on channel 7 and hand it to the utun.  Completions
  * come back in the order the TREs were written, so the next buffer is just the next index. */
 static void rx_drain(void)
@@ -920,28 +951,8 @@ static void rx_drain(void)
 			break;
 		}
 		seen++;
-		if (e.type != EVT_CBCM) {
-			LOG("rx evt: type %02x code %02x ch %u len %u", e.type, e.code, e.chid, e.len);
-			ctx.rx_err++;
-			continue;
-		}
-		if (e.code != EVT_CODE_DATA && e.code != EVT_CODE_THROW)
-			LOG("rx evt: unexpected code %02x len %u", e.code, e.len);
-		unsigned idx = ctx.rx_done % RX_BUFS;
-
-		ctx.rx_done++;
-		if (e.len > RX_BUF_SZ) {
-			LOG("rx len %u over buffer", e.len);
-			ctx.rx_err++;
-		} else if (e.len) {
-			if (pm_rd(ctx.rx_buf_pa[idx], bounce, e.len))
-				LOG("rx buffer read failed: %s", strerror(errno));
-			else
-				qmap_deagg(bounce, e.len, rx_to_utun, NULL, &ctx.rx_st);
-		}
-		if (rx_post_one(idx))
+		if (rx_event(&e))
 			break;
-		ch_doorbell(CH_MDM_RX);
 	}
 	if (seen > 12)
 		LOG("rx drain looped %d events", seen);
@@ -1119,7 +1130,7 @@ static int read_phase0(void)
  * rings (ipagsi_poll returns early), so the call stays held and the modem can be observed. */
 enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, GS_CH7,
        GS_REV, GS_ONERING, GS_FREE, GS_FREELATE, GS_EVOTHER, GS_DROP2, GS_DROP7, GS_ONERING3, GS_SWAP, GS_ONESTART,
-       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI, GS_EEDUMP, GS_C2JOIN, GS_C2JOINT };
+       GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI, GS_EEDUMP, GS_C2JOIN, GS_C2JOINT, GS_P2LATE };
 static int gsitest;
 static uint64_t dump_at;		/* gsistart=eedump: next EE1 register dump */
 static int dump_n;
@@ -1175,6 +1186,8 @@ static int read_gsistart(void)
 		return GS_ONETX;
 	if (strstr(b, "gsistart=onerx"))
 		return GS_ONERX;
+	if (strstr(b, "gsistart=p2late"))
+		return GS_P2LATE;
 	if (strstr(b, "gsistart=c2joint"))
 		return GS_C2JOINT;
 	if (strstr(b, "gsistart=c2join"))
@@ -1264,6 +1277,193 @@ static void fail_state(void)
 	set_state(stbuf);
 }
 
+/* ------------------------------------------------------------------ gsistart=p2late
+ * A real data path that respects the modem's limit (BRIEF-ipagsi-phase2-latejoin-2026-11-07.md):
+ *  1. event ring 2 (128 entries, shared) + TX channel 2, started: 3 units, the c2start shape
+ *  2. wait until the modem has finished its own channel 4-7 start (EE1 ch 7 started for 5 s), or p2join=<s>
+ *     (default 0 = forever: a join before the modem's cycle crashes it at that cycle, c2joint-r3)
+ *  3. join: RX channel 7 on ring 2, started; endpoints checked (read only, see ipagsi_endpoints); RX buffers
+ *     posted; utun opened; TX from the utun
+ * Words in cell.on: p2tx=1 (TX channel only, never join: first proof that the modem takes a packet),
+ * p2join=<s>, p2ep=before|after (when ipagsi_endpoints() runs, default after the join).
+ * One reader for ring 2 tells TX and RX events apart by the channel id.  No channel 5, no tables. */
+static int p2_stage;			/* 0 off, 1 waiting for the modem, 2 running */
+static int p2_tx_only, p2_ep_before;
+static unsigned p2_join_s;		/* 0 = wait forever (default) */
+static uint64_t p2_t0, p2_seen, p2_stat;
+static unsigned p2_txev, p2_rxev, p2_unk;
+
+static int cell_word_int(const char *key, int def)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	char *at;
+
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	at = strstr(b, key);
+	if (!at)
+		return def;
+	return atoi(at + strlen(key));
+}
+
+static int cell_word_has(const char *w)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	return strstr(b, w) != NULL;
+}
+
+static int p2_setup(void)
+{
+	p2_tx_only = cell_word_int("p2tx=", 0);
+	p2_join_s = (unsigned) cell_word_int("p2join=", 0);
+	p2_ep_before = cell_word_has("p2ep=before");
+	if (read_eedump_flag()) {
+		dump_n = -1;	/* until reboot; logs only on change */
+		dump_at = link_ms();
+	}
+	set_state("setup-2");
+	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
+		return -1;
+	set_state("setup-3");
+	if (ch_start(CH_MDM_TX))
+		return -1;
+	LOG("p2: tx ch up (ev2 + ch2 started: 3 units); tx_only %d join timeout %u s endpoints %s", p2_tx_only,
+	    p2_join_s, p2_ep_before ? "before" : "after");
+	if (p2_ep_before)
+		ipagsi_endpoints();
+	p2_t0 = link_ms();
+	p2_seen = 0;
+	p2_stat = link_ms();
+	if (p2_tx_only) {
+		if (utun_up())
+			return -1;
+		p2_stage = 2;
+		set_state("up");
+		LOG("p2: tx-only running, utun %s", ctx.utun_name);
+	} else {
+		p2_stage = 1;
+		set_state("p2-wait");
+		LOG("p2: waiting for modem");
+	}
+	ctx.active = 1;
+	return 0;
+}
+
+static void p2_drain(void)
+{
+	struct gsi_evt e;
+
+	while (ev_read(EV_TX, &e) == 1) {
+		if (e.chid == CH_MDM_TX) {
+			if (e.type != EVT_CBCM)
+				LOG("p2 tx evt: type %02x code %02x len %u", e.type, e.code, e.len);
+			tx_done++;
+			p2_txev++;
+		} else if (e.chid == CH_MDM_RX) {
+			p2_rxev++;
+			if (rx_event(&e))
+				break;
+		} else {
+			if (p2_unk++ < 8)
+				LOG("p2: event for unknown ch %u type %02x code %02x len %u", e.chid, e.type, e.code, e.len);
+		}
+	}
+}
+
+static void p2_poll(void)
+{
+	if (dump_n && link_ms() >= dump_at) {
+		if (dump_n > 0)
+			dump_n--;
+		dump_at = link_ms() + 250;
+		ee_dump();
+	}
+	if (p2_stage == 1) {
+		int go = 0;
+
+		if ((rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf) != 2)
+			p2_seen = 0;
+		else if (!p2_seen)
+			p2_seen = link_ms();
+		else if (link_ms() >= p2_seen + 5000)
+			go = 1;
+		if (!go && p2_join_s && link_ms() >= p2_t0 + (uint64_t) p2_join_s * 1000)
+			go = 2;
+		if (!go) {
+			if (link_ms() - p2_stat >= 30000) {
+				p2_stat = link_ms();
+				LOG("p2: waiting for modem: %llu s, EE1 ch 7 state %u", (unsigned long long) (link_ms() - p2_t0) / 1000,
+				    (unsigned) (rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf));
+			}
+			return;
+		}
+		LOG("p2: join (%s)", go == 1 ? "cycle" : "timeout");
+		if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx) || ch_start(CH_MDM_RX))
+			goto failed;
+		if (!p2_ep_before)
+			ipagsi_endpoints();
+		LOG("p2: endpoints done");
+		if (rx_prepost())
+			goto failed;
+		LOG("p2: rx posted %u", RX_BUFS);
+		if (utun_up())
+			goto failed;
+		p2_stage = 2;
+		set_state("up");
+		LOG("up (p2late, join %s)", go == 1 ? "cycle" : "timeout");
+		return;
+	failed:
+		LOG("p2: join FAILED");
+		p2_stage = 0;
+		ctx.active = 0;
+		fail_state();
+		return;
+	}
+	if (p2_stage != 2)
+		return;
+	p2_drain();
+	tx_pump();
+	if (link_ms() - p2_stat >= 10000) {
+		p2_stat = link_ms();
+		LOG("p2: tx posted %u completed %u (ev %u) | rx events %u bytes %llu pkts %u frames %u | unknown %u"
+		    " | errors rx %u tx %u bad %u other-af %u", tx_wp, tx_done, p2_txev, p2_rxev, rx_bytes, ctx.rx_pkts,
+		    ctx.rx_st.pkts, p2_unk, ctx.rx_err, ctx.tx_err, ctx.tx_st.bad, ctx.tx_other);
+	}
+}
+
+/* The modem starts its own GSI channels 4-7 at an unpredictable time (+3..+113 s after us, sometimes not
+ * within 400 s) and asserts if the AP holds >= 4 GSI contexts at that moment (c2start/ch3/c2join runs).  The
+ * normal path therefore WAITS (state wait-modem, call held) until EE1 ch 7 has been 'started' for 5 s, or
+ * DEFER_TIMEOUT_MS after we were asked, and only then runs the whole GSI setup (ipagsi_setup_rest).
+ * cell.on word nodefer=1 sets up at once (old behaviour). */
+#define DEFER_TIMEOUT_MS	0	/* 0 = wait for the modem forever: c2joint-r3 showed a timeout join (5 units) crashes at the modem's later cycle */
+static int defer_pending, defer_go;
+static uint64_t defer_t0, defer_seen;
+static void ipagsi_setup_rest(void);
+
+static int read_nodefer_flag(void)
+{
+	char b[512] = "";
+	FILE *f = fopen(CELL_ON, "r");
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	return strstr(b, "nodefer=1") != NULL;
+}
+
 void ipagsi_start(const struct ipagsi_call *c, int tables)
 {
 	if (ctx.active) {
@@ -1308,6 +1508,27 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		return;
 	}
 	wr32(GSI_BASE + 0x12200, 0);	/* ERROR_LOG: mainline zeroes it in gsi_setup(); it powers up stale */
+	{
+#if IPAGSI_PHASE < 2
+		int plain = read_gsistart() == GS_BOTH;
+#else
+		int plain = 1;
+#endif
+		if (plain && !defer_go && !read_nodefer_flag()) {
+			defer_pending = 1;
+			defer_t0 = link_ms();
+			defer_seen = 0;
+			set_state("wait-modem");
+			ctx.active = 1;
+			LOG("waiting for the modem's own GSI start-up (EE1 ch 7 started for 5 s) before any GSI setup");
+			return;
+		}
+	}
+	ipagsi_setup_rest();
+}
+
+static void ipagsi_setup_rest(void)
+{
 #if IPAGSI_PHASE < 2
 	gsitest = read_gsistart();
 	tlv_tx = TLV_MDM_TX;
@@ -1345,6 +1566,12 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		for (int i = 0; i < 45; i++)
 			delay_ms(1000);
 	}
+	if (gsitest == GS_P2LATE) {
+		LOG("gsistart=p2late: shared-ring staged data path");
+		if (p2_setup())
+			goto failed;
+		return;
+	}
 #endif
 	{
 		int gm = gsitest == GS_C2START ? GS_CH2 : gsitest == GS_C7START ? GS_CH7 :
@@ -1365,7 +1592,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 			    tx_ring : rx_ring;
 
 		set_state("setup-2");
-		if (tables && gm == GS_BOTH && ev_alloc_program(EV_CMD, EV_CNT))
+		if (ctx.tables && gm == GS_BOTH && ev_alloc_program(EV_CMD, EV_CNT))
 			goto failed;
 		if (rev && ev_rx && ev_alloc_program(rx_ring, EV_CNT))
 			goto failed;
@@ -1375,7 +1602,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 			goto failed;
 
 		set_state("setup-3");
-		if (tables && gm == GS_BOTH &&
+		if (ctx.tables && gm == GS_BOTH &&
 		    ch_alloc_program(CH_CMDTX, EV_CMD, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
 			goto failed;
 		if (rev && ch_rx && ch_alloc_program(CH_MDM_RX, rx_ev, RX_TRE_CNT, 0, 0, tlv_rx))
@@ -1447,8 +1674,8 @@ void ipagsi_start(const struct ipagsi_call *c, int tables)
 		static const char *const nm[] = { "both", "alloc", "tx", "rx", "rxfirst", "none", "evonly",
 						  "ch2", "ch7", "rev", "onering", "free", "freelate", "evother", "drop2",
 						  "drop7", "onering3", "swap", "onestart", "onetx", "onerx", "c2start",
-						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi", "eedump", "c2join", "c2joint" };
-	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_C2JOINT + 1, "nm[] out of sync with enum");
+						  "c7start", "ids34", "tlvmin", "late", "tlvbig", "ev4", "ch3", "ev01", "ev4hi", "eedump", "c2join", "c2joint", "p2late" };
+	_Static_assert(sizeof(nm) / sizeof(nm[0]) == GS_P2LATE + 1, "nm[] out of sync with enum");
 
 		LOG("gsistart=%s: GSI test mode", nm[gsitest]);
 		if (gsitest == GS_EEDUMP || read_eedump_flag()) {
@@ -1542,6 +1769,38 @@ void ipagsi_poll(void)
 {
 	if (!ctx.active)
 		return;
+	if (gsitest == GS_P2LATE) {
+		p2_poll();
+		return;
+	}
+	if (defer_pending) {
+		int go = 0;
+		uint32_t st = rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf;
+
+		if (st != 2)
+			defer_seen = 0;
+		else if (!defer_seen)
+			defer_seen = link_ms();
+		else if (link_ms() >= defer_seen + 5000)
+			go = 1;
+		if (!go && DEFER_TIMEOUT_MS && link_ms() >= defer_t0 + DEFER_TIMEOUT_MS)
+			go = 2;
+		if (!go) {
+			static uint64_t last;
+			if (link_ms() - last >= 30000) {
+				last = link_ms();
+				LOG("wait-modem: %llu s, EE1 ch 7 state %u", (unsigned long long) (link_ms() - defer_t0) / 1000, st);
+			}
+			return;
+		}
+		LOG("wait-modem over: %s (EE1 ch 7 state %u); GSI setup now", go == 1 ?
+		    "modem ch 7 started for 5 s" : "timeout, no modem start-up seen", st);
+		defer_pending = 0;
+		defer_go = 1;
+		ctx.active = 0;
+		ipagsi_setup_rest();
+		return;
+	}
 	if (gsitest) {
 		if (dump_n && link_ms() >= dump_at) {
 			if (dump_n > 0)

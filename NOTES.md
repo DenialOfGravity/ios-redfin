@@ -491,3 +491,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 06:10 ipagsi.c (agent): gsistart=c2joint (c2join, but joins ch 7 rx 120 s after up even if the modem has not cycled).
 - ipagsi fd390dc c2joint (2026-11-07 r5au1): r1/r2 modem cycled at +8 s, late join (ch2+ch7 started on ev2) clean 605 s / 489 s; timeout join not exercised; r3 not run. Phone left in ipaphase=0.
 - ipagsi fd390dc c2joint r3 (2026-11-07 r5au1): timeout join at +120 s before any modem cycle -> modem assert 145 s later (smp2p 106 422.9, 107 426.6). Join only after the modem's ch4-7 sequence. Phone left in ipaphase=0.
+- 2026-11-07 07:21 ipagsi.c (agent): gsistart=p2late (phase-2 data path in the default build: ev2 shared + ch2 TX, wait for the modem's ch4-7 start (no timeout by default), join ch7 RX, endpoints (read-only), RX buffers, utun; p2tx=1 / p2join= / p2ep= words; chid demux); deferred plain path waits forever.
