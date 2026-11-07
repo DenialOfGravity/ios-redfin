@@ -642,8 +642,10 @@ static int ev_read(int ev, struct gsi_evt *e)
 	}
 	if (evt_is_free(e))
 		return 0;
-	memset(e, 0, sizeof(*e));
-	if (pm_wr(at, e, sizeof(*e))) {
+	/* clear the ring slot from a separate zero element: zeroing *e here wiped the event before the caller saw it */
+	struct gsi_evt z;
+	memset(&z, 0, sizeof(z));
+	if (pm_wr(at, &z, sizeof(z))) {
 		LOG("evt ring %d clear failed: %s", ev, strerror(errno));
 		return -1;
 	}

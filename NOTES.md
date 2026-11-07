@@ -517,3 +517,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-07 15:10 ipagsi.c (agent): p2cmd sets ctx.active (poll runs).
 - ipagsi 58f8d0a p2cmd (2026-11-07 r5au1): 3 immediate commands on ch5, RP at base, 0 events: command channel stalls like ch2. Phone left in ipaphase=0.
 - 2026-11-07 15:25 ipagsi.c (agent): p2irq=1 word: EE0 GSI interrupt setup as mainline gsi_irq_setup/enable (logs before/after).
+- ipagsi 9913389 p2irq (2026-11-07 r5au1): with mainline's GSI irq setup, ch2 RP MOVES (3 TREs fetched) and 3 events arrive on ev2 - but decoded as zeros. Fix (Claude, software): ev_read() zeroed the caller's event before returning; now clears the ring slot from a local zero element.
