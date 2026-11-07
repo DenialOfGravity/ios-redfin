@@ -479,3 +479,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - ipagsi 72f72f1 ev4 (2026-11-07 r5au1): event rings 0-3, no channels -> modem assert ipa_hal.c:7354 at +93 s (106->107 3.6 s). Event rings alone count. ch3 not run. Phone left in ipaphase=0.
 - ipagsi long-watch on 72f72f1 (2026-11-07 r5au1): none, evonly, c2start clean 260+ s; ch3 (ev2 + ch2/3/7 allocated, none started) modem assert +4.4 s (106 at +0.8 s, 106->107 3.6 s). Phone left in ipaphase=0.
 - 2026-11-07 02:54 ipagsi.c (agent): gsistart=ev4hi (event rings 4-7, no channels) and ev01 (rings 0,1): count vs. ring-id collision.
+- ipagsi e59808d ev4hi (2026-11-07 r5au1): event rings 4-7, no channels -> modem assert +8.9 s. A count, not the ring ids. ev01 not run. Phone left in ipaphase=0.
