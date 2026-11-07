@@ -1323,6 +1323,33 @@ static int cell_word_has(const char *w)
 	return strstr(b, w) != NULL;
 }
 
+/* TX posted but not completed: what do the GSI channel/event ring and the first TRE + buffer look like? */
+static void p2_diag(const char *why)
+{
+	struct gsi_tre t;
+	uint8_t b[16] = { 0 };
+	uint64_t cb = GSI_CH_C_CNTXT_0(CH_MDM_TX), eb = GSI_EV_CH_E_CNTXT_0(EV_TX);
+
+	LOG("p2 diag (%s): ch2 state %s wp %u (db addr %llx) ctx %08x %08x %08x %08x | +10 %08x +14 %08x +18 %08x +1c %08x"
+	    " +20 %08x +24 %08x qos %08x scr %08x %08x %08x %08x", why, ch_state_name(ch_state(CH_MDM_TX)), ctx.ch[CH_MDM_TX].wp,
+	    (unsigned long long) (ctx.ch[CH_MDM_TX].pa + (uint64_t) (ctx.ch[CH_MDM_TX].wp % ctx.ch[CH_MDM_TX].cnt) * RING_ELEM),
+	    rd32(cb), rd32(cb + 4), rd32(cb + 8), rd32(cb + 12), rd32(cb + 0x10), rd32(cb + 0x14), rd32(cb + 0x18),
+	    rd32(cb + 0x1c), rd32(cb + 0x20), rd32(cb + 0x24), rd32(GSI_CH_C_QOS(CH_MDM_TX)),
+	    rd32(GSI_CH_C_SCRATCH_0(CH_MDM_TX)), rd32(GSI_CH_C_SCRATCH_1(CH_MDM_TX)), rd32(GSI_CH_C_SCRATCH_2(CH_MDM_TX)),
+	    rd32(GSI_CH_C_SCRATCH_3(CH_MDM_TX)));
+	LOG("p2 diag (%s): ev2 state %x rp %u ctx %08x %08x %08x %08x +10 %08x +14 %08x +18 %08x +1c %08x +20 %08x +24 %08x"
+	    " +28 %08x +2c %08x +30 %08x err %08x gsi-irq %08x %08x %08x", why, ev_state(EV_TX), ctx.ev[EV_TX].rp, rd32(eb),
+	    rd32(eb + 4), rd32(eb + 8), rd32(eb + 12), rd32(eb + 0x10), rd32(eb + 0x14), rd32(eb + 0x18), rd32(eb + 0x1c),
+	    rd32(eb + 0x20), rd32(eb + 0x24), rd32(eb + 0x28), rd32(eb + 0x2c), rd32(eb + 0x30), rd32(GSI_BASE + 0x12200),
+	    rd32(GSI_BASE + 0x12080), rd32(GSI_BASE + 0x12090), rd32(GSI_BASE + 0x12094));
+	if (!pm_rd(ctx.ch[CH_MDM_TX].pa, &t, sizeof(t)))
+		LOG("p2 diag (%s): TRE[0] addr %llx len %u flags %08x", why, (unsigned long long) t.addr, t.len, t.flags);
+	if (tx_buf_pa[0] && !pm_rd(tx_buf_pa[0], b, sizeof(b)))
+		LOG("p2 diag (%s): buf0 %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", why, b[0], b[1], b[2],
+		    b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+	ipagsi_dump_ipa();
+}
+
 static int p2_setup(void)
 {
 	p2_tx_only = cell_word_int("p2tx=", 0);
@@ -1340,8 +1367,8 @@ static int p2_setup(void)
 		return -1;
 	LOG("p2: tx ch up (ev2 + ch2 started: 3 units); tx_only %d join timeout %u s endpoints %s", p2_tx_only,
 	    p2_join_s, p2_ep_before ? "before" : "after");
-	if (p2_ep_before)
-		ipagsi_endpoints();
+	if (p2_ep_before || p2_tx_only)
+		ipagsi_endpoints();	/* read only */
 	p2_t0 = link_ms();
 	p2_seen = 0;
 	p2_stat = link_ms();
@@ -1434,6 +1461,19 @@ static void p2_poll(void)
 		return;
 	p2_drain();
 	tx_pump();
+	{
+		static unsigned seen_wp, diag_n;
+		static uint64_t diag_at;
+
+		if (tx_wp != seen_wp && tx_wp <= 3) {	/* the first three posts */
+			seen_wp = tx_wp;
+			p2_diag("after post");
+		} else if (tx_wp > tx_done && diag_n < 4 && link_ms() >= diag_at + 20000) {
+			diag_at = link_ms();
+			diag_n++;
+			p2_diag("stalled");
+		}
+	}
 	if (link_ms() - p2_stat >= 10000) {
 		p2_stat = link_ms();
 		LOG("p2: tx posted %u completed %u (ev %u) | rx events %u bytes %llu pkts %u frames %u | unknown %u"
