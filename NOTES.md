@@ -548,3 +548,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 d405efa p2rec=70 x2: void (no modem start); recreate fails with unserviced TREs on ch2 (stop-in-proc)
 - 2026-11-08 d405efa p2rec=240 valid: modem start holds through irq config written after it; ch2 STOP hangs (stop-in-proc) even empty
 - 2026-11-08 ipagsi (agent): p2_tx_recreate re-issues STOP up to 40x (stop-in-proc retry)
+- 2026-11-08 26a961a STOP retry: valid boot -> 40x STOP, still stop-in-proc, then modem crash ipa_hal.c:6885 (IRQ from top level IPA GSI)
