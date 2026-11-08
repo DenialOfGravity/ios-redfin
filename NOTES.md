@@ -540,3 +540,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 3b55fc3 gsistart=none control: no EE1 change in 308 s after the call -> missing modem start is not caused by us
 - 2026-11-08 3b55fc3 gsistart=none controls x3 (03:07, 04:16, 08:29 CET): no modem ch4-7 start; 10 boots in a row; full power-off next
 - 2026-11-08 3b55fc3 call restart control: stop/start ok via cell.on toggle; eedump stops with ipagsi, EE1 not observable
+- 2026-11-08 ipagsi (agent): eedump kept after call stop; p2irqm bit5 inter-EE masks; p2qos also on ch5 in p2cmd

@@ -1185,7 +1185,7 @@ enum { GS_BOTH, GS_ALLOC, GS_TX, GS_RX, GS_RXFIRST, GS_NONE, GS_EVONLY, GS_CH2, 
        GS_ONETX, GS_ONERX, GS_C2START, GS_C7START, GS_IDS34, GS_TLVMIN, GS_LATE, GS_TLVBIG, GS_EV4, GS_CH3, GS_EV01, GS_EV4HI, GS_EEDUMP, GS_C2JOIN, GS_C2JOINT, GS_P2LATE };
 static int gsitest;
 static uint64_t dump_at;		/* gsistart=eedump: next EE1 register dump */
-static int dump_n;
+static int dump_n, dump_keep;
 static int join_pending;		/* gsistart=c2join: 2nd channel (ch 7 rx) still to be added */
 static uint64_t join_force;		/* gsistart=c2joint: join at this time even if the modem never cycled (0 = off) */
 static uint64_t join_seen;		/* when EE1 ch 7 was first seen started */
@@ -1681,15 +1681,16 @@ static void p2_irq_setup(void)
 		{ "SRC_EV_CH_IRQ_MSK", 0x1209c }, { "GLOB_IRQ_EN", 0x12108 }, { "SRC_IEOB_IRQ_MSK", 0x120b8 },
 		{ "GSI_IRQ_EN", 0x12120 }, { "GLOB_IRQ_STTS", 0x12100 }, { "GSI_IRQ_STTS", 0x12118 },
 		{ "TYPE_IRQ", 0x12080 }, { "SRC_CH_IRQ", 0x12090 }, { "SRC_EV_CH_IRQ", 0x12094 }, { "SRC_IEOB_IRQ", 0x120b0 },
+		{ "IEE_CH_MSK", 0xc020 }, { "IEE_EV_MSK", 0xc024 },
 	};
-	char line[420];
+	char line[520];
 	int n = 0;
 
 	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
 		n += snprintf(line + n, sizeof(line) - n, " %s %08x", r[i].n, rd32(GSI_BASE + r[i].off));
 	LOG("p2irq: before:%s", line);
 	/* p2irqm=<mask> selects which groups are written (default 0x1f = all, as before):
-	 * bit0 INTSET=1, bit1 clear TYPE/SRC_CH/SRC_EV/IEOB masks, bit2 GLOB_IRQ_EN=1, bit3 TYPE_IRQ_MSK=GLOB_EE|GENERAL, bit4 GSI_IRQ_EN=0xe */
+	 * bit0 INTSET=1, bit1 clear TYPE/SRC_CH/SRC_EV/IEOB masks, bit2 GLOB_IRQ_EN=1, bit3 TYPE_IRQ_MSK=GLOB_EE|GENERAL, bit4 GSI_IRQ_EN=0xe, bit5 inter-EE masks=0 (default off: 0x1f) */
 	uint32_t m = (uint32_t) cell_word_int("p2irqm=", 0x1f);
 
 	LOG("p2irq: groups %02x", m);
@@ -1727,6 +1728,11 @@ static void p2_irq_setup(void)
 	}
 	if (m & 8)
 		wr32(GSI_BASE + 0x12088, 1u << 2 | 1u << 6);	/* TYPE_IRQ_MSK: GLOB_EE + GENERAL */
+	if (m & 32) {
+		/* p2irqm bit5: inter-EE source masks (the other EEs' channel/event irqs towards EE0), as HakiOS gsi_interrupts_off() */
+		wr32(GSI_BASE + 0xc020, 0);		/* INTER_EE_SRC_CH_IRQ_MSK (EE0) */
+		wr32(GSI_BASE + 0xc024, 0);		/* INTER_EE_SRC_EV_CH_IRQ_MSK (EE0) */
+	}
 	n = 0;
 	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++)
 		n += snprintf(line + n, sizeof(line) - n, " %s %08x", r[i].n, rd32(GSI_BASE + r[i].off));
@@ -1780,6 +1786,14 @@ static int p2_cmd_setup(void)
 	set_state("setup-2");
 	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_CMDTX, EV_TX, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
 		return -1;
+	{
+		long q = cell_word_num("p2qos=", -1);	/* p2qos= also applies to ch5 here (mainline gives it WRR 7 and prefetch mode 0) */
+
+		if (q >= 0) {
+			LOG("p2cmd: ch5 QOS %08x -> %08lx (p2qos=)", rd32(GSI_CH_C_QOS(CH_CMDTX)), q);
+			wr32(GSI_CH_C_QOS(CH_CMDTX), (uint32_t) q);
+		}
+	}
 	/* mainline ep7 (AP_COMMAND_TX): DMA mode to AP_LAN_RX (ep 9), seq type DMA, resource group 0 */
 	wr32(IPA_ENDP_MODE(EP_CMDTX), 3 | 9u << 4);
 	wr32(IPA_ENDP_SEQ(EP_CMDTX), 0);
@@ -2230,6 +2244,7 @@ void ipagsi_stop(const char *why)
 		return;
 	LOG("stopping (%s)", why);
 	ctx.active = 0;
+	dump_keep = dump_n != 0;	/* eedump=1: keep logging EE1/EE0 channel states (read only) after a call stop */
 	if (ctx.utun_fd >= 0) {
 		close(ctx.utun_fd);
 		ctx.utun_fd = -1;
@@ -2249,8 +2264,13 @@ const char *ipagsi_state(void)
 
 void ipagsi_poll(void)
 {
-	if (!ctx.active)
+	if (!ctx.active) {
+		if (dump_keep && link_ms() >= dump_at) {
+			dump_at = link_ms() + 250;
+			ee_dump();
+		}
 		return;
+	}
 	if (gsitest == GS_P2LATE) {
 		p2_poll();
 		return;
