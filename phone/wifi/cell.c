@@ -69,6 +69,7 @@ static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 #define NSTEPS (int)(sizeof(steps) / sizeof(steps[0]))
 
 static unsigned ss_dom;	/* domain=N (default 0 = CS only) */
+static int dp_mux = 1, dp_iface = 1;	/* dpmux= / dpiface= in cell.on (Claude 2026-11-08), default 1 */
 static int enabled, opts, allowed, step = -1, done_once[NSTEPS], fails[NSTEPS], timeouts;
 static uint64_t allow_ms, first_poll, next_send;
 static uint16_t txn = 1, want_txn;
@@ -745,7 +746,7 @@ static void read_apn(const char *b)
 
 static int read_opts(void)
 {
-	char b[256] = "";
+	char b[512] = "";
 	FILE *f = fopen(CELL_ON, "r");
 	if (!f)
 		return -1;
@@ -754,6 +755,15 @@ static int read_opts(void)
 	b[k] = 0;
 	int o = 0;
 	read_apn(b);
+	{
+		const char *w;
+		dp_mux = (w = strstr(b, "dpmux=")) ? atoi(w + 6) : 1;
+		dp_iface = (w = strstr(b, "dpiface=")) ? atoi(w + 8) : 1;
+		if (dp_mux < 1 || dp_mux > 254)
+			dp_mux = 1;
+		if (dp_iface < 0)
+			dp_iface = 1;
+	}
 	rd_fam = strstr(b, "ipfam=6") ? 6 : 4;
 	if (strstr(b, "datatest=1"))
 		o |= OPT_DATATEST;
@@ -1383,10 +1393,10 @@ static int ss_poll(uint64_t now)
  * Status: x1=dpm-err0xE|dpm-noanswer|dpm-noserver|wda-...|bind-...|bound (then Start Network's values).
  */
 #define DP_EP_TYPE	4	/* QMI_DATA_ENDPOINT_TYPE_EMBEDDED */
-#define DP_IFACE	1
+#define DP_IFACE	dp_iface	/* cell.on dpiface=, default 1 */
 #define DP_RX_EP	2	/* the modem receives on our TX endpoint (AP_MODEM_TX) */
 #define DP_TX_EP	16	/* the modem sends on our RX endpoint (AP_MODEM_RX) */
-#define DP_MUX		1
+#define DP_MUX		dp_mux	/* cell.on dpmux=, default 1 (QMAP mux id of the bind; ipagsi frames with the same) */
 #define X1_START_MS	120000
 #define X1_REPLY_MS	10000
 #define X1_HOLD_MS	20000

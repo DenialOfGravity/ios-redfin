@@ -911,13 +911,28 @@ static uint32_t utun_af(const uint8_t *p, size_t n)
 	}
 }
 
+/* dpmux=<n> in cell.on (Claude 2026-11-08, default 1): the QMAP mux id for TX frames and the RX mux filter; cell.c's
+ * WDS Bind Mux Data Port uses the same word, so bind and framing agree */
+static int cell_word_int(const char *key, int def);
+static int mux_id = -1;
+static uint8_t dp_mux(void)
+{
+	if (mux_id < 0) {
+		mux_id = cell_word_int("dpmux=", 1);
+		if (mux_id < 1 || mux_id > 254)
+			mux_id = 1;
+		LOG("dpmux: QMAP mux id %d", mux_id);
+	}
+	return (uint8_t) mux_id;
+}
+
 /* an IP packet coming from the modem, already out of its QMAP frame */
 static void rx_to_utun(void *unused, uint8_t mux, const uint8_t *p, size_t n)
 {
 	uint32_t af = utun_af(p, n);
 	ssize_t got;
 
-	if (mux != 1) {		/* mux 0 is the QMAP command channel (already counted by
+	if (mux != dp_mux()) {		/* mux 0 is the QMAP command channel (already counted by
 				 * qmap_deagg), anything else is not this call's mux id */
 		return;
 	}
@@ -1044,7 +1059,7 @@ static int tx_drain(void)
 
 static int tx_send(const uint8_t *ip, size_t len)
 {
-	size_t n = qmap_frame(tx_frame, sizeof(tx_frame), ip, len, 1);
+	size_t n = qmap_frame(tx_frame, sizeof(tx_frame), ip, len, dp_mux());
 	uint32_t idx = tx_wp % TX_BUFS;
 
 	if (!n) {
