@@ -127,6 +127,8 @@ static int level, announced, allowed, auto_sent;
 static uint32_t smem_base;
 static uint64_t next_check, first_poll, allow_ms;
 static int m_up;			/* the modem's 0x31 instance 2 */
+static int stats_s;			/* ipastats=N */
+static void stats_list(const char *what, const uint8_t *p, uint16_t l);
 static uint32_t m_node, m_port;
 static int reg_up, reg_want = -1, cmplt_seen, drv_ok, ind_sent;	/* this modem session */
 static uint32_t reg_node, reg_port;
@@ -543,6 +545,17 @@ static void on_server_req(const struct qrtr_hdr *h, const struct qmi_msg *m)
 static void on_client(const struct qmi_msg *m)
 {
 	char out[256];
+	if (m->type == QMI_RESPONSE && m->id == 0x30) {
+		uint16_t l = 0;
+		const uint8_t *r = qmi_get(m, 0x02, &l), *p;
+		if (r && l >= 4 && (r[0] | r[1] << 8))
+			printf("[%6llu] ipaqmi: data stats -> result %u error %#x\n", TS(), r[0] | r[1] << 8, r[2] | r[3] << 8);
+		if ((p = qmi_get(m, 0x11, &l)))
+			stats_list("UL src", p, l);
+		if ((p = qmi_get(m, 0x12, &l)))
+			stats_list("DL dst", p, l);
+		return;
+	}
 	if (m->type == QMI_RESPONSE && m->id == MSG_FILTER_INSTALLED_NOTIF && notif_txn && m->txn == notif_txn) {
 		uint16_t l = 0;
 		const uint8_t *r = qmi_get(m, 0x02, &l);
@@ -668,6 +681,7 @@ static void read_words(int *lv, uint32_t *base)
 	*lv = v == 1 || v == 2 ? (int)v : 0;
 	ipa_word = word(b, "ipa=") == 1;
 	noflt = word(b, "ipanoflt=") == 1;
+	stats_s = (int)word(b, "ipastats=");
 	notif = word(b, "ipanotif=") == 1;
 	v = word(b, "ipasmem=");
 	*base = v > 0 && v < 0x10000 ? (uint32_t)v : 0;	/* IPA shared memory is 12 KB + base: anything bigger is a typo */
@@ -756,6 +770,45 @@ static void cli_poll(uint64_t now)
 		cli_done("ipaqmi: bad request\n");
 }
 
+/* ipastats=N (Claude 2026-11-08, read only): every N s ask the modem's IPA service GET_DATA_STATS (0x30, stats type 1 =
+ * per pipe, redbull ipa_qmi_service_v01): its IPA-level UL (0x11) / DL (0x12) packet counts per pipe, logged. */
+static uint64_t stats_next;
+static uint16_t stats_txn;
+
+static void send_stats(void)
+{
+	struct qmi_buf q;
+	if (!m_up)
+		return;
+	stats_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(&q, QMI_REQUEST, stats_txn, 0x30);
+	qmi_tlv_u32(&q, 0x01, 1);
+	size_t n = qmi_finish(&q);
+	send_from(IPAQMI_CLIENT_PORT, m_node, m_port, q.b, n);
+}
+
+static void stats_list(const char *what, const uint8_t *p, uint16_t l)
+{
+	char line[600];
+	int k = 0;
+	unsigned cnt = l ? p[0] : 0;
+	for (unsigned i = 0; i < cnt && 1u + 36u * (i + 1) <= l && k < 520; i++) {
+		const uint8_t *e = p + 1 + 36 * i;
+		uint32_t pipe;
+		uint64_t v4p, v4b, v6p, v6b;
+		memcpy(&pipe, e, 4);
+		memcpy(&v4p, e + 4, 8);
+		memcpy(&v4b, e + 12, 8);
+		memcpy(&v6p, e + 20, 8);
+		memcpy(&v6b, e + 28, 8);
+		k += snprintf(line + k, sizeof(line) - k, " [pipe %u v4 %llu/%lluB v6 %llu/%lluB]", pipe, (unsigned long long)v4p,
+			      (unsigned long long)v4b, (unsigned long long)v6p, (unsigned long long)v6b);
+	}
+	printf("[%6llu] ipaqmi: data stats %s (%u):%s\n", TS(), what, cnt, k ? line : " none");
+}
+
 void ipaqmi_poll(void)
 {
 	uint64_t now = link_ms();
@@ -772,6 +825,10 @@ void ipaqmi_poll(void)
 	if (!level)
 		return;
 	cli_poll(now);
+	if (stats_s > 0 && drv_ok && now >= stats_next) {
+		stats_next = now + 1000ull * (unsigned)stats_s;
+		send_stats();
+	}
 	if (pend_txn && now > pend_ms && now - pend_ms > REPLY_MS) {
 		printf("[%6llu] ipaqmi: INIT_DRIVER txn %u unanswered in %d s (not resent; a late answer is still logged)\n", TS(),
 		       pend_txn, REPLY_MS / 1000);
