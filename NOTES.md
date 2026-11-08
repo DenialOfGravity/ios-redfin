@@ -560,3 +560,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 ipagsi (agent): log IPA ROUTE reg; p2route=<ep> sets default/frag pipe
 - 2026-11-08 58acc7e: IPA ROUTE was 0; p2route=16 + RX up: rx 0, blips unchanged, ch7 +1 per blip
 - 2026-11-08 ipagsi (Claude): p2routedis=1 sets ROUTE_DIS with p2route (RX-side test)
+- 2026-11-08 3169036 p2routedis: ROUTE 01200021, rx still 0, blips continue -> RX side (ch7/ep16) suspect
