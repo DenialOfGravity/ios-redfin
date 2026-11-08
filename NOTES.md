@@ -574,3 +574,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 37ac4af: ipaqmi ipanoflt=1 (leave INSTALL_FILTER_RULE unanswered, as mainline): no change.
 - 2026-11-08 3a7ac4e: qmapv5=1 (WDA QMAPV5, ep2/ep16 hdr 8 + inline csum, v5 TX header, v5-aware deagg) + UL filter TLV dump: no change.
 - 2026-11-08 b877003: ipaqmi ipanotif=1 (FILTER_INSTALLED_NOTIF as Android): modem accepts; WDS rxok 0 -> 13, modem DL ch0 now moves, DL routed to pipe 10 (route table 5 catch-all).
+- 2026-11-08 3f35329: ipagsi p2stat16=1 (ep2 status -> ep16, RX hex dump), p2rxdump=1, p2sweep=1. Result: every UL packet exception SW_FILT (0x20), no filter rule hit, metadata correct: the IPA filter/route tables were never initialised by immediate commands (ch5 stalls).
