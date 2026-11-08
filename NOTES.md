@@ -577,3 +577,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 3f35329: ipagsi p2stat16=1 (ep2 status -> ep16, RX hex dump), p2rxdump=1, p2sweep=1. Result: every UL packet exception SW_FILT (0x20), no filter rule hit, metadata correct: the IPA filter/route tables were never initialised by immediate commands (ch5 stalls).
 - 2026-11-08 c54969f: ipagsi p2lan=1 (ep9/ch14 AP_LAN_RX, works) + p2cmd5=1 (ch5/ep7 DMA->ep9 + IP_PACKET_INIT: still never fetched).
 - 2026-11-08 6a8fce6: p2cmdqos= (ch5 QOS before start; redbull 0x0008040f: no change) + ep7/ep2 register dump. SW_FILT persists with the ep2 nhash entry's target zeroed; ep2 metadata matches the modem's route rule only with HDR_EXT little endian (0).
+- 2026-11-08 d9afd28: ipagsi p2cmdev=<ring> (ch5 own event ring: still stalls) + p2cmdch2=1 (IP_PACKET_INIT on ch2: EXECUTED, next packet to ep16 with exception 0). Immediate commands can go through ch2.
