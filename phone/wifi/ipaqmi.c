@@ -403,6 +403,40 @@ static void reply_ok(const struct qrtr_hdr *h, const struct qmi_msg *m)
 	send_from(IPAQMI_PORT, h->src_node, h->src_port, q.b, qmi_finish(&q));
 }
 
+/* ipanotif=1 (Claude 2026-11-08, opt-in): after answering INSTALL_FILTER_RULE, send the modem FILTER_INSTALLED_NOTIF
+ * (0x24, AP -> modem's 0x31/2) as Android's rmnet_ipa.c ipa3_wwan_add_ul_flt_rule_to_ipa() does: 0x01 source pipe u32 =
+ * APPS_WAN_PROD (ep 2), 0x02 install status u16 = success, 0x03 filter_index_list = empty (u8 0), 0x17 rule ids (u8
+ * count, u32 each) = the ids of the modem's specs.  The modem already put its UL rules in ep2's filter slot itself
+ * (ipatbl=1 dump), so only the notification is sent; its answer is logged on the client port. */
+static int notif;
+static uint16_t notif_txn;
+
+static void send_fltr_notif(const uint8_t *ids, unsigned k)
+{
+	struct qmi_buf q;
+	uint8_t empty = 0;
+	if (!m_up) {
+		printf("[%6llu] ipaqmi: FILTER_INSTALLED_NOTIF not sent: the modem's 0x31/%u is not known\n", TS(),
+		       IPAQMI_MODEM_INSTANCE);
+		return;
+	}
+	notif_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(&q, QMI_REQUEST, notif_txn, MSG_FILTER_INSTALLED_NOTIF);
+	qmi_tlv_u32(&q, 0x01, 2);
+	uint8_t st[2] = { 0, 0 };
+	qmi_tlv(&q, 0x02, st, 2);
+	qmi_tlv(&q, 0x03, &empty, 1);
+	qmi_tlv(&q, 0x17, ids, (uint16_t)(1 + 4 * k));
+	size_t n = qmi_finish(&q);
+	printf("[%6llu] ipaqmi: > FILTER_INSTALLED_NOTIF txn %u to %u:%x: source pipe 2, success, %u rule ids\n", TS(),
+	       notif_txn, m_node, m_port, k);
+	hex_line("> FILTER_INSTALLED_NOTIF", q.b, n);
+	if (send_from(IPAQMI_CLIENT_PORT, m_node, m_port, q.b, n))
+		printf("[%6llu] ipaqmi: FILTER_INSTALLED_NOTIF: link send failed (not repeated)\n", TS());
+}
+
 static void on_install_filter(const struct qrtr_hdr *h, const struct qmi_msg *m)
 {
 	struct qmi_buf q;
@@ -433,6 +467,13 @@ static void on_install_filter(const struct qrtr_hdr *h, const struct qmi_msg *m)
 			if (cnt > k)
 				printf("[%6llu] ipaqmi:   %u rules, ids of the first %u answered (MAX_NUM_Q6_RULE)\n", TS(), cnt, k);
 			qmi_tlv(&q, 0x11, ids, (uint16_t)(1 + 4 * k));	/* rule_id list: u8 count, u32 ids */
+			if (notif) {
+				size_t n0 = qmi_finish(&q);
+				hex_line("> INSTALL_FILTER_RULE resp", q.b, n0);
+				send_from(IPAQMI_PORT, h->src_node, h->src_port, q.b, n0);
+				send_fltr_notif(ids, k);
+				return;
+			}
 		}
 	}
 	size_t n = qmi_finish(&q);
@@ -502,6 +543,14 @@ static void on_server_req(const struct qrtr_hdr *h, const struct qmi_msg *m)
 static void on_client(const struct qmi_msg *m)
 {
 	char out[256];
+	if (m->type == QMI_RESPONSE && m->id == MSG_FILTER_INSTALLED_NOTIF && notif_txn && m->txn == notif_txn) {
+		uint16_t l = 0;
+		const uint8_t *r = qmi_get(m, 0x02, &l);
+		printf("[%6llu] ipaqmi: FILTER_INSTALLED_NOTIF -> result %u error %#x\n", TS(),
+		       r && l >= 4 ? (unsigned)(r[0] | r[1] << 8) : 0xffff, r && l >= 4 ? (unsigned)(r[2] | r[3] << 8) : 0xffff);
+		notif_txn = 0;
+		return;
+	}
 	if (m->type != QMI_RESPONSE || m->id != MSG_INIT_DRIVER || !pend_txn || m->txn != pend_txn) {
 		printf("[%6llu] ipaqmi:   not the answer to an INIT_DRIVER we wait for (pending txn %u)\n", TS(), pend_txn);
 		return;
@@ -619,6 +668,7 @@ static void read_words(int *lv, uint32_t *base)
 	*lv = v == 1 || v == 2 ? (int)v : 0;
 	ipa_word = word(b, "ipa=") == 1;
 	noflt = word(b, "ipanoflt=") == 1;
+	notif = word(b, "ipanotif=") == 1;
 	v = word(b, "ipasmem=");
 	*base = v > 0 && v < 0x10000 ? (uint32_t)v : 0;	/* IPA shared memory is 12 KB + base: anything bigger is a typo */
 }
