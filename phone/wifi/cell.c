@@ -69,7 +69,9 @@ static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 #define NSTEPS (int)(sizeof(steps) / sizeof(steps[0]))
 
 static unsigned ss_dom;	/* domain=N (default 0 = CS only) */
-static int dp_mux = 1, dp_iface = 1;	/* dpmux= / dpiface= in cell.on (Claude 2026-11-08), default 1 */
+static int dp_mux = 1, dp_iface = 1;
+static int stats_s;			/* wdsstats=N (Claude 2026-11-08): WDS Get Packet Statistics every N s while the call is held */
+static uint64_t stats_next;	/* dpmux= / dpiface= in cell.on (Claude 2026-11-08), default 1 */
 static int enabled, opts, allowed, step = -1, done_once[NSTEPS], fails[NSTEPS], timeouts;
 static uint64_t allow_ms, first_poll, next_send;
 static uint16_t txn = 1, want_txn;
@@ -763,6 +765,9 @@ static int read_opts(void)
 			dp_mux = 1;
 		if (dp_iface < 0)
 			dp_iface = 1;
+		stats_s = (w = strstr(b, "wdsstats=")) ? atoi(w + 9) : 0;
+		if (stats_s < 0)
+			stats_s = 0;
 	}
 	rd_fam = strstr(b, "ipfam=6") ? 6 : 4;
 	if (strstr(b, "datatest=1"))
@@ -1456,6 +1461,8 @@ static int x1_send_svc(int svc, uint16_t id)
 			qmi_tlv_u8(q, 0x31, (uint8_t)wds_default);
 	} else if (id == 0x2d)
 		qmi_tlv_u32(q, 0x10, X1_MASK);
+	else if (id == 0x24)
+		qmi_tlv_u32(q, 0x01, 0x0cff);	/* tx/rx ok, err, overflow, bytes ok, tx/rx dropped (libqmi wds Get Packet Statistics) */
 	else
 		qmi_tlv_u32(q, 0x01, x1_handle);
 	size_t len = qmi_finish(q);
@@ -1671,6 +1678,39 @@ static void x1_answer(const struct qmi_msg *m)
 		snprintf(x1_res, sizeof(x1_res), "err%#x(end %s/%s:%s)", e, end, vt, vr);
 		printf("[%6llu] cell: WRITE wds start network -> refused err %#x call-end=%s verbose=%s:%s%s%s\n",
 		       (unsigned long long)now, e, end, vt, vr, ext, late ? " (late answer)" : "");
+	} else if (m->id == 0x24) {
+		x1_state = X1_WAIT;
+		if (e) {
+			printf("[%6llu] cell: wds stats err%#x\n", (unsigned long long)now, e);
+			return;
+		}
+		/* 0x10..0x15 u32 tx ok, rx ok, tx err, rx err, tx ovf, rx ovf; 0x19/0x1a u64 tx/rx bytes ok;
+		 * 0x1d/0x1e u32 tx/rx dropped.  Absent = "-" */
+		static const uint8_t t32[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x1d, 0x1e };
+		static const char *n32[] = { "txok", "rxok", "txerr", "rxerr", "txovf", "rxovf", "txdrop", "rxdrop" };
+		char line[400];
+		int k = 0;
+		for (unsigned i = 0; i < sizeof(t32); i++) {
+			uint16_t l;
+			const uint8_t *p = qmi_get(m, t32[i], &l);
+			uint32_t v;
+			if (p && l >= 4) {
+				memcpy(&v, p, 4);
+				k += snprintf(line + k, sizeof(line) - k, " %s=%u", n32[i], v);
+			} else
+				k += snprintf(line + k, sizeof(line) - k, " %s=-", n32[i]);
+		}
+		for (uint8_t t = 0x19; t <= 0x1a; t++) {
+			uint16_t l;
+			const uint8_t *p = qmi_get(m, t, &l);
+			uint64_t v;
+			if (p && l >= 8) {
+				memcpy(&v, p, 8);
+				k += snprintf(line + k, sizeof(line) - k, " %s=%llu", t == 0x19 ? "txbytes" : "rxbytes",
+					      (unsigned long long)v);
+			}
+		}
+		printf("[%6llu] cell: wds stats%s\n", (unsigned long long)now, line);
 	} else if (m->id == 0x2d) {
 		x1_state = X1_WAIT;
 		if (e)
@@ -1745,7 +1785,7 @@ static int x1_poll(uint64_t now)
 			x1_state = X1_DONE;
 			x1_late = 1;	/* x1_txn kept: a late handle is still stopped */
 			snprintf(x1_res, sizeof(x1_res), "start-noanswer");
-		} else if (x1_id == 0x2d) {
+		} else if (x1_id == 0x2d || x1_id == 0x24) {
 			x1_state = X1_WAIT;
 			x1_txn = 0;
 		} else {
@@ -1762,6 +1802,14 @@ static int x1_poll(uint64_t now)
 	if (x1_state == X1_UP) {
 		x1_state = X1_SET;
 		if (!x1_send(0x2d))
+			return 1;
+		x1_state = X1_WAIT;
+		return 0;
+	}
+	if (x1_state == X1_WAIT && stats_s && now >= stats_next) {
+		stats_next = now + 1000ull * (unsigned)stats_s;
+		x1_state = X1_SET;
+		if (!x1_send(0x24))
 			return 1;
 		x1_state = X1_WAIT;
 		return 0;
