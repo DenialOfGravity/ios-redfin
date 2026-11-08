@@ -1006,8 +1006,20 @@ static int rx_event(const struct gsi_evt *e)
 		rx_bytes += e->len;
 		if (pm_rd(ctx.rx_buf_pa[idx], bounce, e->len))
 			LOG("rx buffer read failed: %s", strerror(errno));
-		else
+		else {
+			static int dump_on = -1;
+			static unsigned dumped;
+			if (dump_on < 0)
+				dump_on = cell_word_int("p2stat16=", 0) == 1 || cell_word_int("p2rxdump=", 0) == 1;
+			if (dump_on && dumped < 40) {	/* the first 40 RX buffers as hex (status messages, frames) */
+				char hx[3 * 64 + 1];
+				unsigned n = e->len < 64 ? e->len : 64;
+				for (unsigned i = 0; i < n; i++)
+					snprintf(hx + 3 * i, 4, " %02x", bounce[i]);
+				LOG("rx dump %u len %u:%s", dumped++, e->len, hx);
+			}
 			qmap_deagg(bounce, e->len, rx_to_utun, NULL, &ctx.rx_st);
+		}
 	}
 	if (rx_post_one(idx))
 		return 1;
@@ -1524,6 +1536,13 @@ static void ep_program(int ep, int status)
 		seq = EP_SEQ_2_PASS_SKIP_LAST_UC;
 		if (status)
 			st = EP_STATUS_EN | EP_MODEM_AP_RX << EP_STATUS_ENDP_SHIFT;
+		if (cell_word_int("p2stat16=", 0) == 1) {
+			/* p2stat16=1 (Claude 2026-11-08, diagnostic): ep2's IPA status messages to OUR RX endpoint instead
+			 * of the modem's ep14: one status per UL packet (filter/route rule ids, route table, metadata,
+			 * destination pipe), dumped as hex by rx_event */
+			st = EP_STATUS_EN | (uint32_t) EP_MDM_RX << EP_STATUS_ENDP_SHIFT;
+			LOG("p2: p2stat16=1: ep%d status -> ep%d", ep, EP_MDM_RX);
+		}
 		if (cell_word_int("qmapv5=", 0) == 1) {
 			/* qmapv5=1 (Claude 2026-11-08): mainline v4.7 AP_MODEM_TX checksum=true: header 4 + 4, CS_OFFLOAD_EN
 			 * INLINE (1) and CS_METADATA_HDR_OFFSET 1 (the v5 header right after the MAP header, in words) */
@@ -2073,6 +2092,27 @@ static void p2_poll(void)
 			diag_at = link_ms();
 			diag_n++;
 			p2_diag("stalled");
+		}
+	}
+	{
+		/* p2sweep=1 (Claude 2026-11-08, diagnostic): every 15 s another way for ep2 to read the QMAP metadata the
+		 * modem's route table 1 matches on (mux id under mask 0x00ff0000): v0 header metadata offset 0, big endian
+		 * (as programmed); v1 offset 0 little endian; v2 offset 1 big endian; v3 offset 1 little endian.  Logged,
+		 * so `wds stats` / status dumps can be lined up with the variant. */
+		static int sw = -1;
+		static uint64_t sw_at;
+		static unsigned sv;
+		if (sw < 0)
+			sw = cell_word_int("p2sweep=", 0) == 1;
+		if (sw && link_ms() - sw_at >= 15000) {
+			static const uint32_t hdr[4] = { 4 | 1u << 6, 4 | 1u << 6, 4 | 1u << 6 | 1u << 7, 4 | 1u << 6 | 1u << 7 };
+			static const uint32_t ext[4] = { 1, 0, 1, 0 };
+			unsigned v = sv++ % 4;
+			sw_at = link_ms();
+			wr32(IPA_ENDP_HDR(EP_MDM_TX), hdr[v]);
+			wr32(IPA_ENDP_HDR_EXT(EP_MDM_TX), ext[v]);
+			LOG("p2sweep: variant %u: ep%d hdr %08x ext %08x (tx posted %u)", v, EP_MDM_TX,
+			    rd32(IPA_ENDP_HDR(EP_MDM_TX)), rd32(IPA_ENDP_HDR_EXT(EP_MDM_TX)), tx_wp);
 		}
 	}
 	if (link_ms() - p2_stat >= 10000) {
