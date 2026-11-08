@@ -33,6 +33,7 @@
 #include "pmem.h"
 #include "link.h"
 #include "ipagsi.h"
+#include "ipaprobe.h"
 #include "ipnet.h"
 #include "cell.h"
 
@@ -935,6 +936,7 @@ static void rx_to_utun(void *unused, uint8_t mux, const uint8_t *p, size_t n)
 	uint32_t af = utun_af(p, n);
 	ssize_t got;
 
+	ipaprobe_pkt("rx", mux, p, n);		/* p2pkt / p2probe (ipaprobe.c): decode, probe replies */
 	if (mux != dp_mux()) {		/* mux 0 is the QMAP command channel (already counted by
 				 * qmap_deagg), anything else is not this call's mux id */
 		return;
@@ -1104,6 +1106,8 @@ static int tx_send(const uint8_t *ip, size_t len)
 	}
 	size_t n = v5 ? qmap5_frame(tx_frame, TX_CAP, ip, len, dp_mux()) : qmap_frame(tx_frame, sizeof(tx_frame), ip, len, dp_mux());
 	uint32_t idx = tx_wp % TX_BUFS;
+
+	ipaprobe_pkt("tx", dp_mux(), ip, len);	/* p2pkt=2 */
 
 	if (!n) {
 		ctx.tx_st.bad++;
@@ -2396,6 +2400,7 @@ static void p2_poll(void)
 		return;
 	p2_drain();
 	tx_pump();
+	ipaprobe_poll(&ctx.call, tx_send, TX_BUFS - (tx_wp - tx_done), rd32);	/* p2probe=N (ipaprobe.c) */
 	{
 		static unsigned seen_wp, diag_n;
 		static uint64_t diag_at;
@@ -2870,6 +2875,7 @@ void ipagsi_poll(void)
 		return;
 	}
 	rx_drain();
+	ipaprobe_poll(&ctx.call, tx_send, TX_BUFS - (tx_wp - tx_done), rd32);
 	tx_drain();
 	tx_pump();
 	if (link_ms() - ctx.stat_ms >= 10000) {
