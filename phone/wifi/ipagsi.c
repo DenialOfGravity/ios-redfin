@@ -1559,6 +1559,10 @@ static void ep_program(int ep, int status)
 	if (ep == EP_MDM_TX) {
 		hdr = 4 | 1u << 6;		/* HDR_LEN 4, OFST_METADATA_VALID (offset 0) */
 		ext = 1;			/* HDR_ENDIANNESS: big endian */
+		if (cell_word_int("p2le=", 0) == 1) {
+			ext = 0;	/* p2le=1 (Claude 2026-11-08): little endian, the only order whose metadata matches the modem's route rule */
+			LOG("p2: p2le=1: ep%d HDR_EXT little endian", ep);
+		}
 		seq = EP_SEQ_2_PASS_SKIP_LAST_UC;
 		if (status)
 			st = EP_STATUS_EN | EP_MODEM_AP_RX << EP_STATUS_ENDP_SHIFT;
