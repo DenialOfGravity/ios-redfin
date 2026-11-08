@@ -1860,8 +1860,44 @@ static void p2_cmd_poll(void)
 	}
 }
 
+/* p2ackloop=1: a polled client never runs an irq handler, so with the EE0 irq config in place the status bits stay
+ * asserted.  Acknowledge them on every poll (and log the first few non-zero sets) to see whether that stops the modem's
+ * channel start from blipping. */
+static void p2_ackloop(void)
+{
+	static int on = -1, logged;
+	uint32_t ch, evc, ieob, glob, gen;
+
+	if (on < 0)
+		on = cell_word_int("p2ackloop=", 0);
+	if (!on || !(rd32(GSI_BASE + 0x12180) & 1))
+		return;
+	ch = rd32(GSI_BASE + 0x12090);
+	evc = rd32(GSI_BASE + 0x12094);
+	ieob = rd32(GSI_BASE + 0x120b0);
+	glob = rd32(GSI_BASE + 0x12100);
+	gen = rd32(GSI_BASE + 0x12118);
+	if (!(ch | evc | ieob | glob | gen))
+		return;
+	if (logged < 12) {
+		logged++;
+		LOG("p2ackloop: ch %08x ev %08x ieob %08x glob %08x gsi %08x", ch, evc, ieob, glob, gen);
+	}
+	if (ch)
+		wr32(GSI_BASE + 0x120a0, ch);
+	if (evc)
+		wr32(GSI_BASE + 0x120a4, evc);
+	if (ieob)
+		wr32(GSI_BASE + 0x120c0, ieob);
+	if (glob)
+		wr32(GSI_BASE + 0x12110, glob);
+	if (gen)
+		wr32(GSI_BASE + 0x12128, gen);
+}
+
 static void p2_poll(void)
 {
+	p2_ackloop();
 	if (p2_cmd) {
 		p2_cmd_poll();
 		return;
