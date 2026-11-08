@@ -1494,6 +1494,15 @@ static void ep_program(int ep, int status)
 		seq = EP_SEQ_2_PASS_SKIP_LAST_UC;
 		if (status)
 			st = EP_STATUS_EN | EP_MODEM_AP_RX << EP_STATUS_ENDP_SHIFT;
+		if (cell_word_int("p2loop=", 0)) {
+			/* p2loop=1 (Claude): RX-side self test without the modem.  ep2 in DMA mode with ep16 as its destination
+			 * (as mainline's ep7 -> ep9): every TX packet is copied by the IPA straight to AP_MODEM_RX, so it must
+			 * show up on ch7 if ch7/ep16 work.  Seq type DMA (0) as for ep7, no status messages.  Test only. */
+			mode = EP_MODE_DMA | (uint32_t) EP_MDM_RX << EP_MODE_DEST_SHIFT;
+			seq = 0;
+			st = 0;
+			LOG("p2: p2loop=1: ep2 DMA -> ep%d (mode %08x), no modem in the path", EP_MDM_RX, mode);
+		}
 	} else {
 		hdr = 4 | 1u << 6 | 1u << 7 | 1u << 19 | 2u << 20;	/* len 4, metadata valid at offset 1 (mux id), pkt size valid at offset 2 */
 		ext = 1 | 1u << 1 | 1u << 3;	/* big endian, TOTAL_LEN_OR_PAD_VALID, PAYLOAD_LEN_INC_PADDING (pad align 0) */
