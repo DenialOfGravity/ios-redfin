@@ -553,3 +553,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 e34fb22 x1keep call restart: the restart triggers the modem's ch4-7 cycle (on demand); with irq config it blips; TX stays 3/3 across
 - 2026-11-08 ipagsi p2ackloop=1 (agent): ack EE0 irq status every poll
 - 2026-11-08 7ad4af0 p2ackloop: only ieob bit2 pending, acked; blips still; EE1 blips right after each TX completion (downlink with no RX side?)
+- 2026-11-08 7ad4af0 p2join=40 with config: joined, no crash, TX 3/3, rx 0, EE1 still blips after TX and at restart
