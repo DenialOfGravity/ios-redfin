@@ -8,6 +8,7 @@
  *   wland ipahw smmu                  IPA DMA streams 0x520 (AP) and 0x522 (uC) on translation-off context banks
  *                                   (radio.c smmu_stream_identity, the same setup the WLAN stream uses)
  *   wland ipahw hwinit [--dry-run] [--route]   the registers downstream ipa3_post_init / ipa3_init_hw write on v4.7
+ *   wland ipahw memdump [OFST LEN]    read-only dump of the local memory (default: flt/rt tables, drop stats)
  *   wland ipahw meminit [--dry-run]   local memory: zero above the uC area, canaries of downstream ipa_4_7_mem_part,
  *                                   LOCAL_PKT_PROC_CNTXT base
  *
@@ -180,11 +181,59 @@ int ipa_meminit(void)
 	return 0;
 }
 
+/* memdump [OFST LEN] (read only, Claude 2026-11-08): the local memory as 32-bit words, 16 bytes a line, runs of
+ * identical lines folded to "*" (od style).  Default: the filter and route tables (0x280..0x600 of downstream
+ * ipa_4_7_mem_part: v4/v6 flt hash/nhash, v4/v6 rt hash/nhash, with their canaries) and the drop stats (0x27b0+0x20).
+ * Tells whether the table entries are still the zeros meminit wrote or point at rules (modem or anyone else). */
+static void memdump_range(uint64_t m, uint32_t o, uint32_t n)
+{
+	uint32_t prev[4] = { 0 }, cur[4];
+	int have = 0, folded = 0;
+	for (uint32_t a = o; a < o + n; a += 16) {
+		for (int i = 0; i < 4; i++)
+			cur[i] = rd32(m + a + 4u * i);
+		if (have && !memcmp(cur, prev, sizeof(cur))) {
+			if (!folded)
+				printf("ipa: mem *\n");
+			folded = 1;
+			continue;
+		}
+		printf("ipa: mem %#06x: %08x %08x %08x %08x\n", a, cur[0], cur[1], cur[2], cur[3]);
+		memcpy(prev, cur, sizeof(cur));
+		have = 1;
+		folded = 0;
+	}
+}
+
+static int memdump(int argc, char **argv)
+{
+	if (gate())
+		return 1;
+	uint32_t base, size;
+	shared_mem(&base, &size);
+	uint64_t m = IPA_SHARED + base;
+	printf("ipa: local memory base %#x size %#x (window %#llx)\n", base, size, (unsigned long long)IPA_SHARED);
+	if (argc > 3) {
+		uint32_t o = (uint32_t)strtoul(argv[2], NULL, 0) & ~15u, n = (uint32_t)strtoul(argv[3], NULL, 0);
+		if (o + n > size || n == 0) {
+			printf("ipa: range %#x+%#x outside the local memory\n", o, n);
+			return 1;
+		}
+		memdump_range(m, o, n);
+		return 0;
+	}
+	printf("ipa: tables 0x280..0x600 (flt v4/v6 hash/nhash 0x288/0x308/0x388/0x408, rt v4/v6 hash/nhash 0x488/0x508/0x588/0x608)\n");
+	memdump_range(m, 0x280, 0x380 + 0x80);
+	printf("ipa: stats_drop 0x27b0+0x20\n");
+	memdump_range(m, 0x27b0, 0x20);
+	return 0;
+}
+
 int ipa_main(int argc, char **argv)
 {
 	/* argv[0] = "ipahw", argv[1] = subcommand */
 	if (argc < 2) {
-		fprintf(stderr, "usage: wland ipahw regs|smmu|hwinit [--dry-run] [--route]|meminit [--dry-run]\n");
+		fprintf(stderr, "usage: wland ipahw regs|smmu|hwinit [--dry-run] [--route]|meminit [--dry-run]|memdump [OFST LEN]\n");
 		return 2;
 	}
 	int route = 0;
@@ -202,6 +251,8 @@ int ipa_main(int argc, char **argv)
 		return hwinit(route);
 	if (!strcmp(argv[1], "meminit"))
 		return ipa_meminit();
+	if (!strcmp(argv[1], "memdump"))
+		return memdump(argc, argv);
 	fprintf(stderr, "wland ipa: unknown subcommand %s\n", argv[1]);
 	return 2;
 }
