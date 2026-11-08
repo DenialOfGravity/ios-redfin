@@ -1052,11 +1052,18 @@ static int tx_send(const uint8_t *ip, size_t len)
 		return -1;
 	}
 	if (!tx_buf_pa[idx]) {
-		tx_buf_pa[idx] = ring_mem(TX_CAP, 4096);
-		if (!tx_buf_pa[idx]) {
-			LOG("tx buffer pm_alloc failed");
-			return -1;
+		/* one block for all TX_BUFS buffers (Claude 2026-11-08): one pm_alloc each ran out of /dev/pmem
+		 * allocations after 27 packets ("alloc 2048: No space left on device") next to the 32 RX buffers */
+		static uint64_t tx_block;
+		if (!tx_block) {
+			tx_block = ring_mem((uint64_t) TX_BUFS * TX_CAP, 4096);
+			if (!tx_block) {
+				LOG("tx buffer block (%u x %u) pm_alloc failed", TX_BUFS, TX_CAP);
+				return -1;
+			}
+			LOG("tx buffers: one block of %u x %u at %llx", TX_BUFS, TX_CAP, (unsigned long long) tx_block);
 		}
+		tx_buf_pa[idx] = tx_block + (uint64_t) idx * TX_CAP;
 	}
 	if (pm_wr(tx_buf_pa[idx], tx_frame, lo_on ? (n + 3) & ~(size_t) 3 : n)) {
 		LOG("tx buffer write failed: %s", strerror(errno));
