@@ -1340,7 +1340,8 @@ static void fail_state(void)
  * p2join=<s>, p2ep=before|after (when ipagsi_endpoints() runs, default after the join).
  * One reader for ring 2 tells TX and RX events apart by the channel id.  No channel 5, no tables. */
 static int p2_stage;			/* 0 off, 1 waiting for the modem, 2 running */
-static int p2_tx_only, p2_ep_before;
+static int p2_tx_only, p2_ep_before, p2_rec_done;
+static long p2_rec_s = -1;
 static int p2_cmd;			/* p2cmd=1: command channel test (below) */
 static int p2_cmd_setup(void);
 static void p2_irq_setup(void);
@@ -1523,6 +1524,8 @@ static int p2_prog = 1, p2_status = 1;
 static int p2_setup(void)
 {
 	p2_tx_only = cell_word_int("p2tx=", 0);
+	p2_rec_s = cell_word_num("p2rec=", -1);
+	p2_rec_done = 0;
 	p2_join_s = (unsigned) cell_word_int("p2join=", 0);
 	p2_ep_before = cell_word_has("p2ep=before");
 	p2_prog = cell_word_int("p2prog=", 1);
@@ -1727,6 +1730,7 @@ static int p2_tx_recreate(void)
 	uint64_t t0;
 
 	p2_irq_setup();
+	tx_wp = tx_done = 0;
 	LOG("p2: recreate ch2/ev2: ch2 %s ev2 %x", ch_state_name(ch_state(CH_MDM_TX)), ev_state(EV_TX));
 	wr32(GSI_CH_CMD, CH_CMD_STOP << 24 | CH_MDM_TX);
 	for (t0 = link_ms(); ch_state(CH_MDM_TX) != CH_ST_STOPPED && link_ms() - t0 < 300;)
@@ -1820,6 +1824,13 @@ static void p2_poll(void)
 			dump_n--;
 		dump_at = link_ms() + 250;
 		ee_dump();
+	}
+	if (p2_tx_only && p2_rec_s >= 0 && !p2_rec_done && link_ms() >= p2_t0 + (uint64_t) p2_rec_s * 1000) {
+		/* p2rec=<s> (with p2tx=1): irq setup + re-create ch2/ev2 once, s seconds after setup, no modem cycle needed */
+		p2_rec_done = 1;
+		LOG("p2: p2rec: recreating ch2/ev2 now (send the UDP after this line)");
+		if (p2_tx_recreate())
+			LOG("p2: p2rec: recreate FAILED");
 	}
 	if (p2_stage == 1) {
 		int go = 0;
