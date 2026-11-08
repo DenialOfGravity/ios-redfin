@@ -150,6 +150,60 @@ static int hwinit(int route)
 	return 0;
 }
 
+/* ipatbl=1 in /var/local/cell.on (Claude 2026-11-08, opt-in): the filter/route table init mainline's
+ * ipa_table_setup() and downstream's _ipa_init_flt4_v3/_ipa_init_rt4_v3 do before INIT_DRIVER.  Without it the
+ * tables are all zeros: filter bitmap 0 (the modem then put its DL filter for ep5 in slot 0) and every slot
+ * "address 0".  With it:
+ *   filter tables v4/v6 hash/nhash (0x288/0x308/0x388/0x408, 15 slots): slot 0 = endpoint bitmap, IPA < v5.0
+ *     format (endpoint X -> bit X+1): ep2 AP_MODEM_TX, ep5 MODEM_AP_TX, ep8 MODEM_DL_NLO_TX (mainline
+ *     ipa_data-v4.7.c filter_support) = 0x248; slots 1..14 = the zero rule.
+ *   route tables v4/v6 hash/nhash (0x488/0x508/0x588/0x608, 15 entries; modem 0-7, AP 8-14) = the zero rule.
+ * The zero rule: 8 zero bytes in DDR ("no filtering / no routing"), allocated once and kept for the life of
+ * wland (the IPA reads it by physical address; the IPA AP stream is translation-off, ipa_smmu). */
+#define FLT_EP_BITMAP	((1u << 2 | 1u << 5 | 1u << 8) << 1)
+static uint64_t zero_rule_pa;
+
+static int cell_flag(const char *w)
+{
+	char b[512] = "";
+	FILE *f = fopen("/var/local/cell.on", "r");
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	return strstr(b, w) != NULL;
+}
+
+static void slot_wr(uint64_t a, uint64_t v)
+{
+	wr32(a, (uint32_t)v);
+	wr32(a + 4, (uint32_t)(v >> 32));
+}
+
+static void tables_init(uint64_t m)
+{
+	static const uint32_t flt[] = { 0x288, 0x308, 0x388, 0x408 }, rt[] = { 0x488, 0x508, 0x588, 0x608 };
+	static const uint8_t zero[64];
+	if (!zero_rule_pa) {
+		zero_rule_pa = pm_alloc(4096, 4096);
+		if (!zero_rule_pa || pm_wr(zero_rule_pa, zero, sizeof(zero))) {
+			printf("ipa: ipatbl=1: zero rule alloc/write failed: tables left as zeros\n");
+			zero_rule_pa = 0;
+			return;
+		}
+	}
+	for (unsigned t = 0; t < 4; t++) {
+		slot_wr(m + flt[t], FLT_EP_BITMAP);
+		for (unsigned i = 1; i < 15; i++)
+			slot_wr(m + flt[t] + 8u * i, zero_rule_pa);
+		for (unsigned i = 0; i < 15; i++)
+			slot_wr(m + rt[t] + 8u * i, zero_rule_pa);
+	}
+	printf("ipa: ipatbl=1: filter bitmap %#x (ep2/5/8), all filter and route slots -> zero rule %#llx\n",
+	       FLT_EP_BITMAP, (unsigned long long)zero_rule_pa);
+}
+
 int ipa_meminit(void)
 {
 	if (gate())
@@ -178,6 +232,8 @@ int ipa_meminit(void)
 	}
 	printf("ipa: %s %u canaries (0xdeadbeef)\n", dry ? "would write" : "wrote", (unsigned)(sizeof(can) / sizeof(can[0])));
 	wrr("LOCAL_PKT_PROC_CNTXT", LOCAL_PKT_PROC_CNTXT, base + 0xad0);	/* modem_hdr_proc_ctx_ofst 0xad0 */
+	if (!dry && cell_flag("ipatbl=1"))
+		tables_init(m);
 	return 0;
 }
 
