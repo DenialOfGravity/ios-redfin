@@ -2223,6 +2223,56 @@ static void p2_poll(void)
 			goto failed;
 		if (p2_cmd5 && cmd5_setup())
 			goto failed;
+		if (cell_word_int("p2tblcmd=", 0) == 1) {
+			/* p2tblcmd=1 (Claude 2026-11-08): the table-init immediate commands on ch2 (commands on ch2 are executed,
+			 * experiment A), as mainline ipa_table_init_add: IP_V4/V6_FILTER_INIT (3/4), IP_V4/V6_ROUTING_INIT (7/8),
+			 * payload {hash_rules_addr, flags (hash size 11:0, hash local 27:12, nhash size 39:28, nhash local 55:40),
+			 * nhash_rules_addr}.  The DDR images are copies of the current SRAM tables (bitmap + the modem's slots),
+			 * so the contents stay the same; then a filter/route hash flush. */
+			static const struct { uint8_t op; uint16_t h, n; } t[4] = {
+				{ 3, 0x288, 0x308 }, { 4, 0x388, 0x408 }, { 7, 0x488, 0x508 }, { 8, 0x588, 0x608 } };
+			const uint32_t sz = 0x78;
+			uint64_t blk = ring_mem(4096, 4096);
+			struct gsi_ring *r = &ctx.ch[CH_MDM_TX];
+			int ok = blk != 0;
+			for (int i = 0; ok && i < 4; i++) {
+				uint8_t img[0x78];
+				uint64_t hi = blk + 0x100u * i, ni = blk + 0x100u * i + 0x80, pl = blk + 0x800 + 0x20u * i;
+				uint64_t pay[3];
+				struct gsi_tre tre;
+				if (pm_rd(0x01e50000ull + t[i].h, img, sz) || pm_wr(hi, img, sz) ||
+				    pm_rd(0x01e50000ull + t[i].n, img, sz) || pm_wr(ni, img, sz)) {
+					ok = 0;
+					break;
+				}
+				pay[0] = hi;
+				pay[1] = (uint64_t) sz | (uint64_t) t[i].h << 12 | (uint64_t) sz << 28 | (uint64_t) t[i].n << 40;
+				pay[2] = ni;
+				if (pm_wr(pl, pay, sizeof(pay))) {
+					ok = 0;
+					break;
+				}
+				tre.addr = pl;
+				tre.len = t[i].op;
+				tre.resv = 0;
+				tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+				if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre))) {
+					ok = 0;
+					break;
+				}
+				r->wp++;
+				tx_wp++;
+				LOG("p2tblcmd: op %u hash %03x nhash %03x size %x flags %016llx (image %llx/%llx)", t[i].op, t[i].h, t[i].n,
+				    sz, (unsigned long long) pay[1], (unsigned long long) hi, (unsigned long long) ni);
+			}
+			if (ok) {
+				ch_doorbell(CH_MDM_TX);
+				delay_ms(50);
+				wr32(IPA_BASE + 0x14c, 0x1111);	/* FILT_ROUT_HASH_FLUSH: v4/v6 filter and router */
+				LOG("p2tblcmd: 4 table-init commands posted on ch2 (tx_wp %u), hash flushed; ch2 completed %u", tx_wp, tx_done);
+			} else
+				LOG("p2tblcmd: FAILED to build/post the commands");
+		}
 		if (cell_word_int("p2cmdch2=", 0) == 1) {
 			/* p2cmdch2=1 (Claude 2026-11-08, "experiment A"): one IP_PACKET_INIT immediate command on ch2 (dest ep16).
 			 * If the IPA executes commands from ch2, the next ch2 packet goes to ep16 without processing (status: dst 16,
