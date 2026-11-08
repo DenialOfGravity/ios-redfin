@@ -535,3 +535,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 ipagsi p2rec=<s> (agent): tx-only, irq setup + re-create ch2/ev2 s seconds after setup
 - 2026-11-08 66c55f3 p2rec=20 (with and without p2ack): ch2/ev2 re-created cleanly after the irq setup, TX still completed 0
 - 2026-11-08 66c55f3 p2rec=1 / p2rec=0 (+p2ack): both TX 0 -> irq config must precede the first EE0 command
+- 2026-11-08 ipagsi p2irq=4 (agent): irq setup first, ev2+ch2 only allocated at setup; ep2 + ch2 START at the join

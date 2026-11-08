@@ -1340,7 +1340,7 @@ static void fail_state(void)
  * p2join=<s>, p2ep=before|after (when ipagsi_endpoints() runs, default after the join).
  * One reader for ring 2 tells TX and RX events apart by the channel id.  No channel 5, no tables. */
 static int p2_stage;			/* 0 off, 1 waiting for the modem, 2 running */
-static int p2_tx_only, p2_ep_before, p2_rec_done;
+static int p2_tx_only, p2_ep_before, p2_rec_done, p2_chdefer;
 static long p2_rec_s = -1;
 static int p2_cmd;			/* p2cmd=1: command channel test (below) */
 static int p2_cmd_setup(void);
@@ -1536,8 +1536,15 @@ static int p2_setup(void)
 	}
 	if (cell_word_int("p2low=", 0) && lo_init())
 		return -1;
+	p2_chdefer = 0;
 	if (cell_word_int("p2irq=", 0) == 1)	/* p2irq=2: later, at the join (after the modem's start cycle) */
 		p2_irq_setup();
+	else if (cell_word_int("p2irq=", 0) == 4) {
+		/* p2irq=4: irq config before the first EE0 command (what makes ch2 serviced), but ev2 + ch2 are only ALLOCATED
+		 * now; ep2 programming and ch2 START wait for the join, so the modem's start sequence sees one fewer live AP unit */
+		p2_irq_setup();
+		p2_chdefer = !p2_tx_only;
+	}
 	p2_cmd = cell_word_int("p2cmd=", 0);
 	if (p2_cmd)
 		return p2_cmd_setup();
@@ -1572,15 +1579,19 @@ static int p2_setup(void)
 		}
 	}
 	set_state("setup-3");
-	if (p2_prog) {
-		ep_program(EP_MDM_TX, p2_status);	/* before the channel is started, as mainline */
-		if (p2_ep_before && !p2_tx_only)
-			ep_program(EP_MDM_RX, 0);
+	if (p2_chdefer) {
+		LOG("p2: p2irq=4: ev2 + ch2 allocated only (ch2 %s); ep2 + START at the join", ch_state_name(ch_state(CH_MDM_TX)));
+	} else {
+		if (p2_prog) {
+			ep_program(EP_MDM_TX, p2_status);	/* before the channel is started, as mainline */
+			if (p2_ep_before && !p2_tx_only)
+				ep_program(EP_MDM_RX, 0);
+		}
+		if (ch_start(CH_MDM_TX))
+			return -1;
 	}
-	if (ch_start(CH_MDM_TX))
-		return -1;
-	LOG("p2: tx ch up (ev2 + ch2 started: 3 units); tx_only %d join timeout %u s endpoints %s", p2_tx_only,
-	    p2_join_s, p2_ep_before ? "before" : "after");
+	LOG("p2: tx ch up (ev2 + ch2 %s: 3 units); tx_only %d join timeout %u s endpoints %s",
+	    p2_chdefer ? "allocated" : "started", p2_tx_only, p2_join_s, p2_ep_before ? "before" : "after");
 	if (p2_ep_before || p2_tx_only)
 		ipagsi_endpoints();	/* read only */
 	p2_t0 = link_ms();
@@ -1856,6 +1867,13 @@ static void p2_poll(void)
 			p2_irq_setup();
 		else if (cell_word_int("p2irq=", 0) == 3 && p2_tx_recreate())
 			goto failed;
+		if (p2_chdefer) {
+			if (p2_prog)
+				ep_program(EP_MDM_TX, p2_status);
+			if (ch_start(CH_MDM_TX))
+				goto failed;
+			LOG("p2: p2irq=4: ch2 started at the join");
+		}
 		if (ch_alloc_program(CH_MDM_RX, EV_TX, RX_TRE_CNT, 0, 0, tlv_rx))
 			goto failed;
 		if (p2_prog && !p2_ep_before)
