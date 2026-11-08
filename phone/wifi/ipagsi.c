@@ -1760,7 +1760,7 @@ static int p2_setup(void)
 /* p2lan=1 / p2cmd5=1 (Claude 2026-11-08): the AP_LAN_RX pipe (ep 9, ch 14) as a plain RX pipe on the shared ring, and
  * the command channel (ch 5, ep 7, DMA to ep 9 as mainline) after it, both at the join (after the modem's channels are
  * up).  Goal: get immediate commands through ch 5 (the IPA table init needs them; SW_FILT on every UL packet). */
-static int p2_lan, p2_cmd5;
+static int p2_lan, p2_cmd5, cmd5_ring = -1;
 static uint64_t lan_block, cmd5_buf;
 static unsigned lan_ev, cmd5_ev, cmd5_posted;
 
@@ -1816,7 +1816,14 @@ static void lan_event(const struct gsi_evt *e)
 static int cmd5_setup(void)
 {
 	uint8_t pl[8] = { EP_MDM_TX, 0, 0, 0, 0, 0, 0, 0 };	/* IP_PACKET_INIT: dest pipe ep2 (harmless) */
-	if (ch_alloc_program(CH_CMDTX, EV_TX, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
+	cmd5_ring = cell_word_int("p2cmdev=", -1);	/* p2cmdev=<ring> (Claude 2026-11-08): ch5 on its own event ring, as mainline */
+	if (cmd5_ring >= 0 && cmd5_ring < 8 && cmd5_ring != EV_TX) {
+		if (ev_alloc_program(cmd5_ring, EV_CNT))
+			return -1;
+		LOG("p2cmd5: p2cmdev=%d: ch5 on its own event ring %d", cmd5_ring, cmd5_ring);
+	} else
+		cmd5_ring = EV_TX;
+	if (ch_alloc_program(CH_CMDTX, cmd5_ring, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
 		return -1;
 	wr32(IPA_ENDP_MODE(EP_CMDTX), 3 | (uint32_t) EP_LAN_RX << 4);	/* mainline ep7: DMA to AP_LAN_RX */
 	wr32(IPA_ENDP_SEQ(EP_CMDTX), 0);
@@ -1868,6 +1875,13 @@ static int cmd5_setup(void)
 static void p2_drain(void)
 {
 	struct gsi_evt e;
+
+	if (p2_cmd5 && cmd5_ring >= 0 && cmd5_ring != EV_TX)
+		while (ev_read(cmd5_ring, &e) == 1) {
+			cmd5_ev++;
+			LOG("p2cmd5: COMMAND COMPLETED on ring %d: event %u type %02x code %02x ch %u len %u", cmd5_ring, cmd5_ev,
+			    e.type, e.code, e.chid, e.len);
+		}
 
 	while (ev_read(EV_TX, &e) == 1) {
 		if (e.chid == CH_MDM_TX) {
@@ -2209,6 +2223,29 @@ static void p2_poll(void)
 			goto failed;
 		if (p2_cmd5 && cmd5_setup())
 			goto failed;
+		if (cell_word_int("p2cmdch2=", 0) == 1) {
+			/* p2cmdch2=1 (Claude 2026-11-08, "experiment A"): one IP_PACKET_INIT immediate command on ch2 (dest ep16).
+			 * If the IPA executes commands from ch2, the next ch2 packet goes to ep16 without processing (status: dst 16,
+			 * exception 0).  Counted as one TX slot so tx_wp/tx_done stay in step with the completion event. */
+			static uint64_t c2buf;
+			uint8_t pl[8] = { EP_MDM_RX, 0, 0, 0, 0, 0, 0, 0 };
+			struct gsi_ring *r = &ctx.ch[CH_MDM_TX];
+			struct gsi_tre tre;
+			if (!c2buf)
+				c2buf = ring_mem(64, 64);
+			if (c2buf && !pm_wr(c2buf, pl, sizeof(pl))) {
+				tre.addr = c2buf;
+				tre.len = 0x10;		/* IPA_CMD_IP_PACKET_INIT */
+				tre.resv = 0;
+				tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+				if (!pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre))) {
+					r->wp++;
+					tx_wp++;
+					ch_doorbell(CH_MDM_TX);
+					LOG("p2cmdch2: IP_PACKET_INIT (dest ep%d) posted on ch2, tx_wp %u", EP_MDM_RX, tx_wp);
+				}
+			}
+		}
 		if (utun_up())
 			goto failed;
 		p2_stage = 2;
