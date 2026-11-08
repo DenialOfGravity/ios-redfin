@@ -1764,9 +1764,14 @@ static int p2_tx_recreate(void)
 	p2_irq_setup();
 	tx_wp = tx_done = 0;
 	LOG("p2: recreate ch2/ev2: ch2 %s ev2 %x", ch_state_name(ch_state(CH_MDM_TX)), ev_state(EV_TX));
-	wr32(GSI_CH_CMD, CH_CMD_STOP << 24 | CH_MDM_TX);
-	for (t0 = link_ms(); ch_state(CH_MDM_TX) != CH_ST_STOPPED && link_ms() - t0 < 300;)
-		delay_ms(1);
+	/* mainline (gsi_channel_stop_retry) re-issues STOP while the channel is in stop-in-proc: up to 10 times, 1 ms apart */
+	for (int tries = 0; tries < 40 && ch_state(CH_MDM_TX) != CH_ST_STOPPED; tries++) {
+		wr32(GSI_CH_CMD, CH_CMD_STOP << 24 | CH_MDM_TX);
+		for (t0 = link_ms(); ch_state(CH_MDM_TX) != CH_ST_STOPPED && link_ms() - t0 < 20;)
+			delay_ms(1);
+		if (tries && ch_state(CH_MDM_TX) == CH_ST_STOPPED)
+			LOG("p2: recreate: stop done after %d retries", tries);
+	}
 	if (ch_state(CH_MDM_TX) != CH_ST_STOPPED) {
 		LOG("p2: recreate: ch2 stop failed, state %s", ch_state_name(ch_state(CH_MDM_TX)));
 		return -1;

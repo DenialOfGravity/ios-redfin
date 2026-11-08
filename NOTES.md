@@ -547,3 +547,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 d405efa same day: p2irq=4 no start; p2tx=1 without irq config: modem start at +28 s HOLDS 208 s+
 - 2026-11-08 d405efa p2rec=70 x2: void (no modem start); recreate fails with unserviced TREs on ch2 (stop-in-proc)
 - 2026-11-08 d405efa p2rec=240 valid: modem start holds through irq config written after it; ch2 STOP hangs (stop-in-proc) even empty
+- 2026-11-08 ipagsi (agent): p2_tx_recreate re-issues STOP up to 40x (stop-in-proc retry)
