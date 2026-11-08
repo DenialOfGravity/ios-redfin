@@ -23,6 +23,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables);	/* tables: 0 = no ch
 void ipagsi_stop(const char *why);	/* polling and the utun end; the GSI/IPA are left as they are (no reset) */
 int ipagsi_running(void);		/* setup reached "up": X1 holds the call while it runs (x1hold=1) */
 const char *ipagsi_state(void);		/* for cell.status: off | setup-1..setup-8 | up | failed-N | stopped */
+int ipagsi_early(void);		/* p2early=1: ev2/ch2 + table/header init before INIT_DRIVER (wland.c IPA auto step 7) */
 void ipagsi_poll(void);			/* wland.c net_idle */
 
 /*

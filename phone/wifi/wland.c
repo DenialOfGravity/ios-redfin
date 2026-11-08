@@ -1370,6 +1370,8 @@ static void ipa_step(uint64_t now)
 		ia_next = now + 2000;	/* the modem registers with our 0x31/1 first (it did at once on 2026-11-06) */
 		return;
 	case 7:
+		if (ipagsi_early())
+			printf("ipa: auto step 7: p2early setup FAILED (INIT_DRIVER sent anyway)\n");
 		printf("ipa: auto step 7 INIT_DRIVER (as ipaqmi=2, once)\n");
 		rc = ipaqmi_ipa_send();
 		if (!rc)

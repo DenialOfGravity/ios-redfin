@@ -1423,6 +1423,7 @@ static long p2_rec_s = -1;
 static int p2_cmd;			/* p2cmd=1: command channel test (below) */
 static int p2_cmd_setup(void);
 static void p2_irq_setup(void);
+static int early_done;	/* p2early=1 ran (ipagsi_early) */
 static int p2_tx_recreate(void);
 static unsigned p2_join_s;		/* 0 = wait forever (default) */
 static uint64_t p2_t0, p2_seen, p2_stat;
@@ -1686,7 +1687,7 @@ static int p2_setup(void)
 		ctx.active = 1;
 		return 0;
 	}
-	if (cell_word_int("p2irq=", 0) == 1)	/* p2irq=2: later, at the join (after the modem's start cycle) */
+	if (cell_word_int("p2irq=", 0) == 1 && !early_done)	/* p2irq=2: later, at the join (after the modem's start cycle) */
 		p2_irq_setup();
 	else if (cell_word_int("p2irq=", 0) == 4) {
 		/* p2irq=4: irq config before the first EE0 command (what makes ch2 serviced), but ev2 + ch2 are only ALLOCATED
@@ -1698,8 +1699,10 @@ static int p2_setup(void)
 	if (p2_cmd)
 		return p2_cmd_setup();
 	set_state("setup-2");
-	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
+	if (!early_done && (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx)))
 		return -1;
+	if (early_done)
+		LOG("p2: p2early: ev2 + ch2 already up (before INIT_DRIVER), reused");
 	{
 		long q = cell_word_num("p2qos=", -1);	/* experiment: override ch 2's QOS register (prefetch mode etc.) */
 
@@ -1736,7 +1739,7 @@ static int p2_setup(void)
 			if (p2_ep_before && !p2_tx_only)
 				ep_program(EP_MDM_RX, 0);
 		}
-		if (ch_start(CH_MDM_TX))
+		if (!early_done && ch_start(CH_MDM_TX))
 			return -1;
 	}
 	LOG("p2: tx ch up (ev2 + ch2 %s: 3 units); tx_only %d join timeout %u s endpoints %s",
@@ -1873,6 +1876,130 @@ static int cmd5_setup(void)
 	}
 	LOG("p2cmd5: ep7 mode %08x seq %08x, ch5 started, IP_PACKET_INIT posted (wp %u)", rd32(IPA_ENDP_MODE(EP_CMDTX)),
 	    rd32(IPA_ENDP_SEQ(EP_CMDTX)), ctx.ch[CH_CMDTX].wp);
+	return 0;
+}
+
+/* the header + table-init immediate commands on ch2 (p2tblcmd=1 at the join, or p2early=1 before INIT_DRIVER);
+ * bump: count each command as a TX slot (at the join, where the TX bookkeeping is live).  0 = posted */
+static int tblcmd_post(int bump)
+{
+		/* p2tblcmd=1 (Claude 2026-11-08): the table-init immediate commands on ch2 (commands on ch2 are executed,
+		 * experiment A), as mainline ipa_table_init_add: IP_V4/V6_FILTER_INIT (3/4), IP_V4/V6_ROUTING_INIT (7/8),
+		 * payload {hash_rules_addr, flags (hash size 11:0, hash local 27:12, nhash size 39:28, nhash local 55:40),
+		 * nhash_rules_addr}.  The DDR images are copies of the current SRAM tables (bitmap + the modem's slots),
+		 * so the contents stay the same; then a filter/route hash flush. */
+		static const struct { uint8_t op; uint16_t h, n; } t[4] = {
+			{ 3, 0x288, 0x308 }, { 4, 0x388, 0x408 }, { 7, 0x488, 0x508 }, { 8, 0x588, 0x608 } };
+		const uint32_t sz = 0x78;
+		uint64_t blk = ring_mem(4096, 4096);
+		struct gsi_ring *r = &ctx.ch[CH_MDM_TX];
+		int ok = blk != 0;
+		if (ok) {
+			/* HDR_INIT_LOCAL (9) first, as mainline ipa_mem_setup: the header table (modem 0x688+0x240 and AP
+			 * 0x8c8+0x200, contiguous: 0x688 + 0x440), image = the current SRAM contents.  Without it the route
+			 * rule's header insertion gives the modem a NULL header ("ipa_ipfltr.c:1686 pkt_hdr != NULL") */
+			static uint8_t himg[0x440];
+			uint64_t hb = ring_mem(0x1000, 4096), pl = blk + 0xf00;
+			uint64_t pay[2];
+			struct gsi_tre tre;
+			if (!hb || pm_rd(0x01e50000ull + 0x688, himg, sizeof(himg)) || pm_wr(hb, himg, sizeof(himg)))
+				ok = 0;
+			else {
+				pay[0] = hb;
+				pay[1] = (uint64_t) (0x440u | 0x688u << 12);
+				if (pm_wr(pl, pay, sizeof(pay)))
+					ok = 0;
+				else {
+					tre.addr = pl;
+					tre.len = 9;
+					tre.resv = 0;
+					tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+					if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre)))
+						ok = 0;
+					else {
+						r->wp++;
+						if (bump) tx_wp++;
+						LOG("p2tblcmd: HDR_INIT_LOCAL 0x688 + 0x440 (image %llx, first words %02x%02x%02x%02x)",
+						    (unsigned long long) hb, himg[0], himg[1], himg[2], himg[3]);
+					}
+				}
+			}
+		}
+		for (int i = 0; ok && i < 4; i++) {
+			uint8_t img[0x78];
+			uint64_t hi = blk + 0x100u * i, ni = blk + 0x100u * i + 0x80, pl = blk + 0x800 + 0x20u * i;
+			uint64_t pay[3];
+			struct gsi_tre tre;
+			if (pm_rd(0x01e50000ull + t[i].h, img, sz) || pm_wr(hi, img, sz) ||
+			    pm_rd(0x01e50000ull + t[i].n, img, sz) || pm_wr(ni, img, sz)) {
+				ok = 0;
+				break;
+			}
+			pay[0] = hi;
+			pay[1] = (uint64_t) sz | (uint64_t) t[i].h << 12 | (uint64_t) sz << 28 | (uint64_t) t[i].n << 40;
+			pay[2] = ni;
+			if (pm_wr(pl, pay, sizeof(pay))) {
+				ok = 0;
+				break;
+			}
+			tre.addr = pl;
+			tre.len = t[i].op;
+			tre.resv = 0;
+			tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+			if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre))) {
+				ok = 0;
+				break;
+			}
+			r->wp++;
+			if (bump) tx_wp++;
+			LOG("p2tblcmd: op %u hash %03x nhash %03x size %x flags %016llx (image %llx/%llx)", t[i].op, t[i].h, t[i].n,
+			    sz, (unsigned long long) pay[1], (unsigned long long) hi, (unsigned long long) ni);
+		}
+		if (ok) {
+			ch_doorbell(CH_MDM_TX);
+			delay_ms(50);
+			wr32(IPA_BASE + 0x14c, 0x1111);	/* FILT_ROUT_HASH_FLUSH: v4/v6 filter and router */
+			LOG("p2tblcmd: header + 4 table-init commands posted on ch2 (tx_wp %u), hash flushed; ch2 completed %u", tx_wp, tx_done);
+		} else
+			LOG("p2tblcmd: FAILED to build/post the commands");
+		return ok ? 0 : -1;
+}
+
+/* p2early=1 (Claude 2026-11-08): called by wland's IPA bring-up right before INIT_DRIVER (auto step 7).  As mainline
+ * ipa_mem_setup + ipa_table_setup do before the modem learns the layout: ev2 + ch2 (3 GSI units, the safe count while
+ * the modem starts its channels), then HDR_INIT_LOCAL + V4/V6 ROUTING/FILTER_INIT on ch2 (immediate commands work there,
+ * experiment A) with the images ipatbl=1 wrote at meminit (bitmap + zero-rule slots).  The modem then writes its own
+ * slots/headers into tables the IPA already knows.  ipagsi_start's p2late setup reuses ev2/ch2. 0 = done or not asked. */
+int ipagsi_early(void)
+{
+	if (cell_word_int("p2early=", 0) != 1 || early_done)
+		return 0;
+	LOG("p2early: before INIT_DRIVER: ev2 + ch2 + table/header init");
+	if (cell_word_int("p2irq=", 0) == 1)
+		p2_irq_setup();
+	if (ev_alloc_program(EV_TX, 128) || ch_alloc_program(CH_MDM_TX, EV_TX, TX_TRE_CNT, 1, 0, tlv_tx))
+		return -1;
+	ep_program(EP_MDM_TX, cell_word_int("p2status=", 1));
+	if (ch_start(CH_MDM_TX))
+		return -1;
+	if (tblcmd_post(0))
+		return -1;
+	{
+		struct gsi_evt e;
+		unsigned n = 0;
+		uint64_t t0 = link_ms();
+		while (n < 5 && link_ms() - t0 < 1000) {
+			if (ev_read(EV_TX, &e) == 1) {
+				n++;
+				LOG("p2early: completion %u type %02x code %02x ch %u", n, e.type, e.code, e.chid);
+			} else
+				delay_ms(5);
+		}
+		LOG("p2early: %u of 5 commands completed in %llu ms", n, (unsigned long long) (link_ms() - t0));
+		if (n < 5)
+			return -1;
+	}
+	early_done = 1;
 	return 0;
 }
 
@@ -2227,87 +2354,8 @@ static void p2_poll(void)
 			goto failed;
 		if (p2_cmd5 && cmd5_setup())
 			goto failed;
-		if (cell_word_int("p2tblcmd=", 0) == 1) {
-			/* p2tblcmd=1 (Claude 2026-11-08): the table-init immediate commands on ch2 (commands on ch2 are executed,
-			 * experiment A), as mainline ipa_table_init_add: IP_V4/V6_FILTER_INIT (3/4), IP_V4/V6_ROUTING_INIT (7/8),
-			 * payload {hash_rules_addr, flags (hash size 11:0, hash local 27:12, nhash size 39:28, nhash local 55:40),
-			 * nhash_rules_addr}.  The DDR images are copies of the current SRAM tables (bitmap + the modem's slots),
-			 * so the contents stay the same; then a filter/route hash flush. */
-			static const struct { uint8_t op; uint16_t h, n; } t[4] = {
-				{ 3, 0x288, 0x308 }, { 4, 0x388, 0x408 }, { 7, 0x488, 0x508 }, { 8, 0x588, 0x608 } };
-			const uint32_t sz = 0x78;
-			uint64_t blk = ring_mem(4096, 4096);
-			struct gsi_ring *r = &ctx.ch[CH_MDM_TX];
-			int ok = blk != 0;
-			if (ok) {
-				/* HDR_INIT_LOCAL (9) first, as mainline ipa_mem_setup: the header table (modem 0x688+0x240 and AP
-				 * 0x8c8+0x200, contiguous: 0x688 + 0x440), image = the current SRAM contents.  Without it the route
-				 * rule's header insertion gives the modem a NULL header ("ipa_ipfltr.c:1686 pkt_hdr != NULL") */
-				static uint8_t himg[0x440];
-				uint64_t hb = ring_mem(0x1000, 4096), pl = blk + 0xf00;
-				uint64_t pay[2];
-				struct gsi_tre tre;
-				if (!hb || pm_rd(0x01e50000ull + 0x688, himg, sizeof(himg)) || pm_wr(hb, himg, sizeof(himg)))
-					ok = 0;
-				else {
-					pay[0] = hb;
-					pay[1] = (uint64_t) (0x440u | 0x688u << 12);
-					if (pm_wr(pl, pay, sizeof(pay)))
-						ok = 0;
-					else {
-						tre.addr = pl;
-						tre.len = 9;
-						tre.resv = 0;
-						tre.flags = TRE_IMMD_CMD | TRE_IEOT;
-						if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre)))
-							ok = 0;
-						else {
-							r->wp++;
-							tx_wp++;
-							LOG("p2tblcmd: HDR_INIT_LOCAL 0x688 + 0x440 (image %llx, first words %02x%02x%02x%02x)",
-							    (unsigned long long) hb, himg[0], himg[1], himg[2], himg[3]);
-						}
-					}
-				}
-			}
-			for (int i = 0; ok && i < 4; i++) {
-				uint8_t img[0x78];
-				uint64_t hi = blk + 0x100u * i, ni = blk + 0x100u * i + 0x80, pl = blk + 0x800 + 0x20u * i;
-				uint64_t pay[3];
-				struct gsi_tre tre;
-				if (pm_rd(0x01e50000ull + t[i].h, img, sz) || pm_wr(hi, img, sz) ||
-				    pm_rd(0x01e50000ull + t[i].n, img, sz) || pm_wr(ni, img, sz)) {
-					ok = 0;
-					break;
-				}
-				pay[0] = hi;
-				pay[1] = (uint64_t) sz | (uint64_t) t[i].h << 12 | (uint64_t) sz << 28 | (uint64_t) t[i].n << 40;
-				pay[2] = ni;
-				if (pm_wr(pl, pay, sizeof(pay))) {
-					ok = 0;
-					break;
-				}
-				tre.addr = pl;
-				tre.len = t[i].op;
-				tre.resv = 0;
-				tre.flags = TRE_IMMD_CMD | TRE_IEOT;
-				if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre))) {
-					ok = 0;
-					break;
-				}
-				r->wp++;
-				tx_wp++;
-				LOG("p2tblcmd: op %u hash %03x nhash %03x size %x flags %016llx (image %llx/%llx)", t[i].op, t[i].h, t[i].n,
-				    sz, (unsigned long long) pay[1], (unsigned long long) hi, (unsigned long long) ni);
-			}
-			if (ok) {
-				ch_doorbell(CH_MDM_TX);
-				delay_ms(50);
-				wr32(IPA_BASE + 0x14c, 0x1111);	/* FILT_ROUT_HASH_FLUSH: v4/v6 filter and router */
-				LOG("p2tblcmd: header + 4 table-init commands posted on ch2 (tx_wp %u), hash flushed; ch2 completed %u", tx_wp, tx_done);
-			} else
-				LOG("p2tblcmd: FAILED to build/post the commands");
-		}
+		if (cell_word_int("p2tblcmd=", 0) == 1 && !early_done)
+			tblcmd_post(1);
 		if (cell_word_int("p2cmdch2=", 0) == 1) {
 			/* p2cmdch2=1 (Claude 2026-11-08, "experiment A"): one IP_PACKET_INIT immediate command on ch2 (dest ep16).
 			 * If the IPA executes commands from ch2, the next ch2 packet goes to ep16 without processing (status: dst 16,
