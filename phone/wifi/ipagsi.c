@@ -1508,6 +1508,10 @@ static void ep_program(int ep, int status)
 		ext = 1 | 1u << 1 | 1u << 3;	/* big endian, TOTAL_LEN_OR_PAD_VALID, PAYLOAD_LEN_INC_PADDING (pad align 0) */
 		mmask = 0xff000000u;		/* cpu_to_be32(0xff) */
 		aggr = 1 | 4u << EP_AGGR_TYPE_SHIFT | 6u << EP_AGGR_BYTE_SHIFT | 5u << EP_AGGR_TIME_SHIFT | EP_AGGR_SW_EOF;
+		if (cell_word_int("p2noaggr=", 0)) {
+			aggr = 0;	/* p2noaggr=1 (Claude): AGGR_EN = bypass, one packet per RX buffer (test) */
+			LOG("p2: p2noaggr=1: ep%d aggregation off", ep);
+		}
 	}
 	wr32(IPA_ENDP_CFG(ep), cfg);
 	if (ep == EP_MDM_TX)

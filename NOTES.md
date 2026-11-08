@@ -562,3 +562,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 ipagsi (Claude): p2routedis=1 sets ROUTE_DIS with p2route (RX-side test)
 - 2026-11-08 3169036 p2routedis: ROUTE 01200021, rx still 0, blips continue -> RX side (ch7/ep16) suspect
 - 2026-11-08 ipagsi (Claude): p2loop=1 ep2 DMA -> ep16 RX self test
+- 2026-11-08 ipagsi (Claude): p2noaggr=1 ep16 aggregation bypass (test)
