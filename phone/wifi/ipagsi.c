@@ -1546,6 +1546,19 @@ static int p2_setup(void)
 	}
 	if (cell_word_int("p2low=", 0) && lo_init())
 		return -1;
+	{
+		/* IPA ROUTE register (default route pipe / fragment pipe / retain header): mainline ipa_route_config() writes it
+		 * for the AP; ipagsi never did.  Always logged; p2route=<ep> (decimal, e.g. 16) writes default+frag pipe = ep. */
+		long rt = cell_word_num("p2route=", -1);
+
+		LOG("p2: IPA ROUTE reg %08x (def pipe %u frag pipe %u retain %u dis %u)", rd32(IPA_BASE + 0x48),
+		    rd32(IPA_BASE + 0x48) >> 1 & 31, rd32(IPA_BASE + 0x48) >> 17 & 31, rd32(IPA_BASE + 0x48) >> 24 & 1,
+		    rd32(IPA_BASE + 0x48) & 1);
+		if (rt >= 0) {
+			wr32(IPA_BASE + 0x48, (uint32_t) rt << 1 | (uint32_t) rt << 17 | 1u << 24);
+			LOG("p2: p2route=%ld: ROUTE reg -> %08x", rt, rd32(IPA_BASE + 0x48));
+		}
+	}
 	p2_chdefer = 0;
 	p2_irqonly = 0;
 	if (cell_word_int("p2irq=", 0) == 5) {

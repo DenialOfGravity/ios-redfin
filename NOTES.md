@@ -557,3 +557,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 ipagsi (agent): EE1 ring pointers/qos/scratch on every CHANGED eedump line
 - 2026-11-08 461528e blip dump: each blip moves EE1 ch3 and ch7 rp by one element; ch4-6 never move
 - 2026-11-08 461528e cold boot (full power-off): same blips, TX 3/3, rx 0; status bar signal/operator + Cellular Data settings work (user)
+- 2026-11-08 ipagsi (agent): log IPA ROUTE reg; p2route=<ep> sets default/frag pipe
