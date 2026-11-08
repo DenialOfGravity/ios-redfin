@@ -271,10 +271,20 @@ static void ee_dump(void)
 				LOG("  EE1 ch %d: %08x %08x %08x %08x", i, rd32(GSI_CH_C_CNTXT_0(i) + 0x4000),
 				    rd32(GSI_CH_C_CNTXT_1(i) + 0x4000), rd32(GSI_CH_C_CNTXT_2(i) + 0x4000),
 				    rd32(GSI_CH_C_CNTXT_3(i) + 0x4000));
+			if (c1[i] != '0')	/* read / write pointers, QOS, scratch */
+				LOG("  EE1 ch %d rp/wp %08x/%08x qos %08x scr %08x %08x %08x %08x", i,
+				    rd32(GSI_CH_C_CNTXT_0(i) + 0x4010), rd32(GSI_CH_C_CNTXT_0(i) + 0x4018),
+				    rd32(GSI_CH_C_QOS(i) + 0x4000), rd32(GSI_CH_C_SCRATCH_0(i) + 0x4000),
+				    rd32(GSI_CH_C_SCRATCH_1(i) + 0x4000), rd32(GSI_CH_C_SCRATCH_2(i) + 0x4000),
+				    rd32(GSI_CH_C_SCRATCH_3(i) + 0x4000));
 			if (e1[i] != '0')
 				LOG("  EE1 evt %d: %08x %08x %08x %08x", i, rd32(GSI_EV_CH_E_CNTXT_0(i) + 0x4000),
 				    rd32(GSI_EV_CH_E_CNTXT_1(i) + 0x4000), rd32(GSI_EV_CH_E_CNTXT_2(i) + 0x4000),
 				    rd32(GSI_EV_CH_E_CNTXT_3(i) + 0x4000));
+			if (e1[i] != '0')	/* event ring read / write pointers, moderation, scratch */
+				LOG("  EE1 evt %d rp/wp %08x/%08x mod %08x scr %08x %08x", i, rd32(GSI_EV_CH_E_CNTXT_4(i) + 0x4000),
+				    rd32(GSI_EV_CH_E_CNTXT_4(i) + 0x4008), rd32(GSI_EV_CH_E_CNTXT_8(i) + 0x4000),
+				    rd32(GSI_EV_CH_E_CNTXT_12(i) + 0x4000), rd32(GSI_EV_CH_E_CNTXT_13(i) + 0x4000));
 		}
 	}
 	snprintf(prev, sizeof(prev), "%s", sig);
