@@ -440,6 +440,8 @@ static void on_install_filter(const struct qrtr_hdr *h, const struct qmi_msg *m)
 	send_from(IPAQMI_PORT, h->src_node, h->src_port, q.b, n);
 }
 
+static int noflt;	/* ipanoflt=1: see read_words */
+
 static void on_server_req(const struct qrtr_hdr *h, const struct qmi_msg *m)
 {
 	uint8_t v = 0;
@@ -467,6 +469,10 @@ static void on_server_req(const struct qrtr_hdr *h, const struct qmi_msg *m)
 		printf("[%6llu] ipaqmi:   %s: answered with success\n", TS(), m->id == MSG_CONFIG ? "config" : "filters installed");
 		break;
 	case MSG_INSTALL_FILTER_RULE:
+		if (noflt) {
+			printf("[%6llu] ipaqmi:   install filter rule: NOT answered (ipanoflt=1, as mainline)\n", TS());
+			break;
+		}
 		on_install_filter(h, m);
 		break;
 	default:
@@ -577,6 +583,9 @@ static long word(const char *b, const char *key)
 	return -1;
 }
 
+/* ipanoflt=1 (Claude 2026-11-08, opt-in): INSTALL_FILTER_RULE (0x23) from the modem is logged but NOT answered, as
+ * mainline's IPA server does (it has no handler for it).  Default: answered with success + the rule ids, which tells
+ * the modem its UL rules are on our TX endpoint although nothing installs them. */
 static void read_words(int *lv, uint32_t *base)
 {
 	char b[512] = "";
@@ -592,6 +601,7 @@ static void read_words(int *lv, uint32_t *base)
 	long v = word(b, "ipaqmi=");
 	*lv = v == 1 || v == 2 ? (int)v : 0;
 	ipa_word = word(b, "ipa=") == 1;
+	noflt = word(b, "ipanoflt=") == 1;
 	v = word(b, "ipasmem=");
 	*base = v > 0 && v < 0x10000 ? (uint32_t)v : 0;	/* IPA shared memory is 12 KB + base: anything bigger is a typo */
 }
