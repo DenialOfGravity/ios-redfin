@@ -985,6 +985,25 @@ static int rx_prepost(void)
 	return 0;
 }
 
+/* p2sweep=2 (Claude 2026-11-08): per-variant tally of the IPA status messages ep2 sends to ep16 (p2stat16=1).  IPA v4.5
+ * ipa_pkt_status_hw: b0 opcode, b1 exception, b6 src ep, b7 dst ep (4:0), b8-11 metadata (LE), b12-15: flt local 0, hash 1,
+ * global 2, ret_hdr 3, rule id 13:4, rt local 14, hash 15, ucp 16, rt tbl 21:17, rt rule id 31:22 */
+static struct { unsigned st, exc, pkt; uint8_t last_exc, last_dst; uint32_t last_meta, last_fw; } sws;
+
+static void sw_tally(const uint8_t *b, unsigned len)
+{
+	if (len == 32 && (b[0] == 0x01 || b[0] == 0x02 || b[0] == 0x04 || b[0] == 0x08) && (b[6] & 0x1f) == EP_MDM_TX) {
+		sws.st++;
+		if (b[1])
+			sws.exc++;
+		sws.last_exc = b[1];
+		sws.last_dst = b[7] & 0x1f;
+		memcpy(&sws.last_meta, b + 8, 4);
+		memcpy(&sws.last_fw, b + 12, 4);
+	} else
+		sws.pkt++;
+}
+
 /* one completion event of channel 7 (own ring in the old layout, the shared ring 2 in gsistart=p2late):
  * hand the frame to the utun and re-post the buffer.  Returns 1 if the buffer could not be re-posted. */
 static unsigned long long rx_bytes;
@@ -1021,7 +1040,11 @@ static int rx_event(const struct gsi_evt *e)
 					snprintf(hx + 3 * i, 4, " %02x", bounce[i]);
 				LOG("rx dump %u len %u:%s", dumped++, e->len, hx);
 			}
-			qmap_deagg(bounce, e->len, rx_to_utun, NULL, &ctx.rx_st);
+			sw_tally(bounce, e->len);
+			if (e->len == 32 && bounce[0] == 0x01 && (bounce[6] & 0x1f) == EP_MDM_TX)
+				;	/* an ep2 status message: not a QMAP frame */
+			else
+				qmap_deagg(bounce, e->len, rx_to_utun, NULL, &ctx.rx_st);
 		}
 	}
 	if (rx_post_one(idx))
@@ -2225,8 +2248,29 @@ static void p2_poll(void)
 		static uint64_t sw_at;
 		static unsigned sv;
 		if (sw < 0)
-			sw = cell_word_int("p2sweep=", 0) == 1;
-		if (sw && link_ms() - sw_at >= 15000) {
+			sw = cell_word_int("p2sweep=", 0);
+		if (sw == 2 && link_ms() - sw_at >= 12000) {
+			/* p2sweep=2: ep2 metadata little endian (HDR_EXT 0) always; SEQ x CFG grid, 12 s each, summary of the
+			 * status messages seen in the previous variant */
+			static const uint32_t seqv[5] = { 0x04, 0x02, 0x06, 0x0a, 0x15 };
+			static int cur = -1;
+			if (cur >= 0) {
+				uint32_t fw = sws.last_fw;
+				LOG("p2sweep2: RESULT v%d seq %02x cfg %u: status %u exc %u (last exc %02x) other-rx %u | last dst %u "
+				    "meta %08x flt hash %u rule %u rt tbl %u rule %u | tx posted %u", cur, seqv[cur % 5], cur / 5,
+				    sws.st, sws.exc, sws.last_exc, sws.pkt, sws.last_dst, sws.last_meta, fw >> 1 & 1, fw >> 4 & 0x3ff,
+				    fw >> 17 & 0x1f, fw >> 22 & 0x3ff, tx_wp);
+			}
+			cur = (cur + 1) % 10;
+			memset(&sws, 0, sizeof(sws));
+			sw_at = link_ms();
+			wr32(IPA_ENDP_HDR_EXT(EP_MDM_TX), 0);
+			wr32(IPA_ENDP_SEQ(EP_MDM_TX), seqv[cur % 5]);
+			wr32(IPA_ENDP_CFG(EP_MDM_TX), (uint32_t) (cur / 5));
+			LOG("p2sweep2: v%d: ep2 seq %08x cfg %08x hdr_ext %08x", cur, rd32(IPA_ENDP_SEQ(EP_MDM_TX)),
+			    rd32(IPA_ENDP_CFG(EP_MDM_TX)), rd32(IPA_ENDP_HDR_EXT(EP_MDM_TX)));
+		}
+		if (sw == 1 && link_ms() - sw_at >= 15000) {
 			static const uint32_t hdr[4] = { 4 | 1u << 6, 4 | 1u << 6, 4 | 1u << 6 | 1u << 7, 4 | 1u << 6 | 1u << 7 };
 			static const uint32_t ext[4] = { 1, 0, 1, 0 };
 			unsigned v = sv++ % 4;
