@@ -550,3 +550,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 ipagsi (agent): p2_tx_recreate re-issues STOP up to 40x (stop-in-proc retry)
 - 2026-11-08 26a961a STOP retry: valid boot -> 40x STOP, still stop-in-proc, then modem crash ipa_hal.c:6885 (IRQ from top level IPA GSI)
 - 2026-11-08 ipagsi (agent): STOP retry opt-in p2stopn=N (default 1); cell.c (Claude): x1keep=1 leaves ipagsi running across a call stop
+- 2026-11-08 e34fb22 x1keep call restart: the restart triggers the modem's ch4-7 cycle (on demand); with irq config it blips; TX stays 3/3 across
