@@ -569,3 +569,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 61e671b: ipagsi TX buffers from one pmem block (per-buffer allocs ran out after 27 packets). Table dump: modem wrote UL routes (mux -> pipe 14), nothing routes to ep16; filter bitmap poke 0->8 changed nothing.
 - 2026-11-08 a1093d5: ipa ipatbl=1 (opt-in): filter bitmap ep2/5/8 + zero-rule slots before INIT_DRIVER (mainline ipa_table_setup). Modem then fills the right slots; its DL route table 5 sends only metadata 9 to ep16.
 - 2026-11-08 488ad8c: cell/ipagsi dpmux= (bind mux id + QMAP TX/RX mux) and dpiface= (endpoint iface id) words, default 1. dpmux=9 / dpiface=9: accepted, no RX change.
+- 2026-11-08 (488ad8c, live poke): route table 5 catch-all -> pipe 16: rx 0. Modem receives our UL (EE1 ch7 +1 per packet) but never moves its DL channels ch0/ch2: no DL enters the IPA.
