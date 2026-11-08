@@ -581,3 +581,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 8b49fbf: ipagsi p2tblcmd=1 (IP_V4/V6_FILTER_INIT + ROUTING_INIT on ch2, SRAM-copy images, hash flush) + p2le=1 (ep2 LE metadata): SW_FILT gone, UL -> ep14 via rule 524/rt 1; modem assert pkt_hdr != NULL.
 - 2026-11-08 fba5eda: p2tblcmd adds HDR_INIT_LOCAL (0x688+0x440) first: no crash, UL reaches ep14; modem UL consumer mostly stopped (SUSPENDED statuses), WDS txok 0.
 - 2026-11-08 0b12d84: ipagsi p2early=1 (ev2/ch2 + HDR_INIT_LOCAL/ROUTING/FILTER_INIT on ch2 before INIT_DRIVER, p2late reuses ch2): first DL packet (QMAP mux 1, TCP to our address) delivered to the utun; WDS rxok 2; UL reaches ep14 but txok 0.
+- 2026-11-08 a0ba7fa: ipaqmi ipastats=N (QMI IPA GET_DATA_STATS: modem answers without counters). qmapv5 with p2early: no change. End of session: see claude/redfin-status-2026-11-08.md.
