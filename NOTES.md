@@ -549,3 +549,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 d405efa p2rec=240 valid: modem start holds through irq config written after it; ch2 STOP hangs (stop-in-proc) even empty
 - 2026-11-08 ipagsi (agent): p2_tx_recreate re-issues STOP up to 40x (stop-in-proc retry)
 - 2026-11-08 26a961a STOP retry: valid boot -> 40x STOP, still stop-in-proc, then modem crash ipa_hal.c:6885 (IRQ from top level IPA GSI)
+- 2026-11-08 ipagsi (agent): STOP retry opt-in p2stopn=N (default 1); cell.c (Claude): x1keep=1 leaves ipagsi running across a call stop

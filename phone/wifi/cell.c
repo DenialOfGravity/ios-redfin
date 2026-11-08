@@ -52,7 +52,7 @@ static struct { uint32_t node, port; int up; } srv[NSVC];
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
 enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64, OPT_DATATEST = 128,
        OPT_NOLTE = 256, OPT_CSONLY = 512, OPT_X1HOLD = 1024, OPT_IPADATA = 2048,
-       OPT_IPACMD = 4096 };
+       OPT_IPACMD = 4096, OPT_X1KEEP = 8192 };
 #define OPT_SS		(OPT_NOLTE | OPT_CSONLY)
 static int p1_known, p1_present, p1_active, cur_mode = -1;
 /* X1 preconditions from the last whole round (-1 = not answered this round) */
@@ -769,6 +769,8 @@ static int read_opts(void)
 		o |= OPT_WDS;
 	if (strstr(b, "x1hold=1"))
 		o |= OPT_X1HOLD;				/* X1 does not stop the call after 20 s */
+	if (strstr(b, "x1keep=1"))
+		o |= OPT_X1KEEP;				/* a call stop leaves ipagsi running (call-restart test) */
 	if (strstr(b, "ipadata=1"))
 		o |= OPT_IPADATA | OPT_WDS | OPT_DATATEST;	/* the data path needs X1's call and data port */
 	if (strstr(b, "ipacmd=1"))
@@ -1759,7 +1761,10 @@ static int x1_poll(uint64_t now)
 			x1_stop_at = now + X1_HOLD_MS;	/* the data path still runs on this call: later */
 			return 0;
 		}
-		ipagsi_stop("wds stop network");
+		if (!(opts & OPT_X1KEEP))
+			ipagsi_stop("wds stop network");
+		else
+			printf("[%6llu] cell: x1keep=1: ipagsi left running across the call stop\n", (unsigned long long)now);
 		printf("[%6llu] cell: WRITE wds stop network handle=%#x\n", (unsigned long long)now, x1_handle);
 		x1_state = X1_STOP;
 		if (!x1_send(0x21))

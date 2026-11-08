@@ -1765,7 +1765,9 @@ static int p2_tx_recreate(void)
 	tx_wp = tx_done = 0;
 	LOG("p2: recreate ch2/ev2: ch2 %s ev2 %x", ch_state_name(ch_state(CH_MDM_TX)), ev_state(EV_TX));
 	/* mainline (gsi_channel_stop_retry) re-issues STOP while the channel is in stop-in-proc: up to 10 times, 1 ms apart */
-	for (int tries = 0; tries < 40 && ch_state(CH_MDM_TX) != CH_ST_STOPPED; tries++) {
+	int maxtry = cell_word_int("p2stopn=", 1);
+
+	for (int tries = 0; tries < maxtry && ch_state(CH_MDM_TX) != CH_ST_STOPPED; tries++) {
 		wr32(GSI_CH_CMD, CH_CMD_STOP << 24 | CH_MDM_TX);
 		for (t0 = link_ms(); ch_state(CH_MDM_TX) != CH_ST_STOPPED && link_ms() - t0 < 20;)
 			delay_ms(1);
