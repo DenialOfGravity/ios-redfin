@@ -138,6 +138,7 @@ struct gsi_evt {
 	uint8_t chid;
 } __attribute__((packed));
 #define EVT_CBCM	0x00
+#define EVT_XFER	0x22	/* transfer completion (Qualcomm GSI event type); code 0x02 = EOT, 0x04 = EOB, 0x01 = success */
 #define EVT_FLR		0x0e
 #define EVT_ERR		0x0f
 #define EVT_CODE_DATA	0x01
@@ -971,13 +972,15 @@ static int rx_prepost(void)
 static unsigned long long rx_bytes;
 static int rx_event(const struct gsi_evt *e)
 {
-	if (e->type != EVT_CBCM) {
+	if (e->type != EVT_CBCM && e->type != EVT_XFER) {
 		LOG("rx evt: type %02x code %02x ch %u len %u", e->type, e->code, e->chid, e->len);
 		ctx.rx_err++;
 		return 0;
 	}
-	if (e->code != EVT_CODE_DATA && e->code != EVT_CODE_THROW)
+	if (e->type == EVT_CBCM && e->code != EVT_CODE_DATA && e->code != EVT_CODE_THROW)
 		LOG("rx evt: unexpected code %02x len %u", e->code, e->len);
+	if (e->type == EVT_XFER && e->code != 0x01 && e->code != 0x02 && e->code != 0x04)
+		LOG("rx evt: xfer code %02x len %u", e->code, e->len);
 	unsigned idx = ctx.rx_done % RX_BUFS;
 
 	ctx.rx_done++;
