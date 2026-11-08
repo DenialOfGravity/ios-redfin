@@ -1797,6 +1797,25 @@ static int cmd5_setup(void)
 		return -1;
 	wr32(IPA_ENDP_MODE(EP_CMDTX), 3 | (uint32_t) EP_LAN_RX << 4);	/* mainline ep7: DMA to AP_LAN_RX */
 	wr32(IPA_ENDP_SEQ(EP_CMDTX), 0);
+	{
+		/* p2cmdqos=<v> (Claude 2026-11-08): ch5 QOS before start.  redbull ipa_gsi_setup_channel for APPS_CMD_PROD:
+		 * low_weight 15, max_prefetch one segment, direct mode, prefetch ESCAPE_BUF_ONLY, empty_lvl 8 = 0x0008040f
+		 * (GSI v2.5 layout: WRR 3:0, MAX_PREFETCH 8, USE_DB_ENG 9, PREFETCH_MODE 13:10, EMPTY_LVL 23:16) */
+		long q = cell_word_num("p2cmdqos=", -1);
+		if (q >= 0) {
+			wr32(GSI_CH_C_QOS(CH_CMDTX), (uint32_t) q);
+			LOG("p2cmd5: ch5 QOS -> %08x (p2cmdqos=)", rd32(GSI_CH_C_QOS(CH_CMDTX)));
+		}
+		char line[300];
+		int n = 0;
+		for (uint32_t o = 0; o < 0x70; o += 4)
+			n += snprintf(line + n, sizeof(line) - n, " %08x", rd32(IPA_BASE + 0x800 + 0x70 * EP_CMDTX + o));
+		LOG("p2cmd5: ep7 regs +0..+6c:%s", line);
+		n = 0;
+		for (uint32_t o = 0; o < 0x70; o += 4)
+			n += snprintf(line + n, sizeof(line) - n, " %08x", rd32(IPA_BASE + 0x800 + 0x70 * EP_MDM_TX + o));
+		LOG("p2cmd5: ep2 regs +0..+6c:%s", line);
+	}
 	if (ch_start(CH_CMDTX))
 		return -1;
 	cmd5_buf = ring_mem(64, 64);
