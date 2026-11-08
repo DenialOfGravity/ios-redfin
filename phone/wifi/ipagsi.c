@@ -2239,6 +2239,37 @@ static void p2_poll(void)
 			uint64_t blk = ring_mem(4096, 4096);
 			struct gsi_ring *r = &ctx.ch[CH_MDM_TX];
 			int ok = blk != 0;
+			if (ok) {
+				/* HDR_INIT_LOCAL (9) first, as mainline ipa_mem_setup: the header table (modem 0x688+0x240 and AP
+				 * 0x8c8+0x200, contiguous: 0x688 + 0x440), image = the current SRAM contents.  Without it the route
+				 * rule's header insertion gives the modem a NULL header ("ipa_ipfltr.c:1686 pkt_hdr != NULL") */
+				static uint8_t himg[0x440];
+				uint64_t hb = ring_mem(0x1000, 4096), pl = blk + 0xf00;
+				uint64_t pay[2];
+				struct gsi_tre tre;
+				if (!hb || pm_rd(0x01e50000ull + 0x688, himg, sizeof(himg)) || pm_wr(hb, himg, sizeof(himg)))
+					ok = 0;
+				else {
+					pay[0] = hb;
+					pay[1] = (uint64_t) (0x440u | 0x688u << 12);
+					if (pm_wr(pl, pay, sizeof(pay)))
+						ok = 0;
+					else {
+						tre.addr = pl;
+						tre.len = 9;
+						tre.resv = 0;
+						tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+						if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre)))
+							ok = 0;
+						else {
+							r->wp++;
+							tx_wp++;
+							LOG("p2tblcmd: HDR_INIT_LOCAL 0x688 + 0x440 (image %llx, first words %02x%02x%02x%02x)",
+							    (unsigned long long) hb, himg[0], himg[1], himg[2], himg[3]);
+						}
+					}
+				}
+			}
 			for (int i = 0; ok && i < 4; i++) {
 				uint8_t img[0x78];
 				uint64_t hi = blk + 0x100u * i, ni = blk + 0x100u * i + 0x80, pl = blk + 0x800 + 0x20u * i;
@@ -2273,7 +2304,7 @@ static void p2_poll(void)
 				ch_doorbell(CH_MDM_TX);
 				delay_ms(50);
 				wr32(IPA_BASE + 0x14c, 0x1111);	/* FILT_ROUT_HASH_FLUSH: v4/v6 filter and router */
-				LOG("p2tblcmd: 4 table-init commands posted on ch2 (tx_wp %u), hash flushed; ch2 completed %u", tx_wp, tx_done);
+				LOG("p2tblcmd: header + 4 table-init commands posted on ch2 (tx_wp %u), hash flushed; ch2 completed %u", tx_wp, tx_done);
 			} else
 				LOG("p2tblcmd: FAILED to build/post the commands");
 		}
