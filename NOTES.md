@@ -544,3 +544,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 404af76: modem start back; p2irqm=63 TX 3/3 + blip; p2irq=4 (ch2 only allocated) still blips -> blip from irq config itself; ch5 stalls with QOS 7/0x400/0
 - 2026-11-08 ipagsi p2irq=5 (agent): irq config only, no GSI command, no join
 - 2026-11-08 d405efa p2irq=5 m=63/m=1 + none control: no modem start in any (watched 320 s each)
+- 2026-11-08 d405efa same day: p2irq=4 no start; p2tx=1 without irq config: modem start at +28 s HOLDS 208 s+
