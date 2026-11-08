@@ -180,6 +180,9 @@ struct gsi_tre {
 #define EP_MDM_TX	2
 #define EP_MDM_RX	16
 #define EP_LAN_RX	9	/* IPA_ENDPOINT_AP_LAN_RX, channel 14: ep7's dma destination */
+#define CH_LAN_RX	14	/* redbull ipa_ep_mapping[IPA_4_7][APPS_LAN_CONS] = { 9, 14, 9, 9 }: ep 9, ch 14, tlv 9 */
+#define LAN_BUFS	8
+#define LAN_BUF_SZ	2048
 /* TLV FIFO sizes from ipa_data-v4.7.c (tlv_count for channels 5, 2 and 7).  This is *not* a
  * value written into a TRE: it is the number of TREs one transaction (one commit + one
  * doorbell) may hold, which is what sets max_outstanding_tre below.  The endpoint a transfer
@@ -211,7 +214,7 @@ static struct {
 	int tables;
 
 	struct gsi_ring ev[8];		/* event rings, by id (0, 2, 3; 4-7 for the ev4hi probe) */
-	struct gsi_ring ch[8];		/* channels, by id (2, 5, 7) */
+	struct gsi_ring ch[16];		/* channels, by id (2, 5, 7; 14 = AP_LAN_RX for p2lan=1) */
 
 	uint64_t rx_buf_pa[RX_BUFS];
 	uint32_t rx_wp;		/* RX TREs written (total) */
@@ -1731,6 +1734,95 @@ static int p2_setup(void)
 	return 0;
 }
 
+/* p2lan=1 / p2cmd5=1 (Claude 2026-11-08): the AP_LAN_RX pipe (ep 9, ch 14) as a plain RX pipe on the shared ring, and
+ * the command channel (ch 5, ep 7, DMA to ep 9 as mainline) after it, both at the join (after the modem's channels are
+ * up).  Goal: get immediate commands through ch 5 (the IPA table init needs them; SW_FILT on every UL packet). */
+static int p2_lan, p2_cmd5;
+static uint64_t lan_block, cmd5_buf;
+static unsigned lan_ev, cmd5_ev, cmd5_posted;
+
+static int lan_post(unsigned i)
+{
+	return ch_post_tre(CH_LAN_RX, lan_block + (uint64_t) i * LAN_BUF_SZ, LAN_BUF_SZ, 1);
+}
+
+static int lan_setup(void)
+{
+	lan_block = ring_mem((uint64_t) LAN_BUFS * LAN_BUF_SZ, 4096);
+	if (!lan_block) {
+		LOG("p2lan: buffer block failed");
+		return -1;
+	}
+	if (ch_alloc_program(CH_LAN_RX, EV_TX, 64, 0, 0, 9))
+		return -1;
+	/* ep 9 as a plain consumer: no header, no aggregation, no status, no HOL block */
+	wr32(IPA_ENDP_CFG(EP_LAN_RX), 0);
+	wr32(IPA_ENDP_HDR(EP_LAN_RX), 0);
+	wr32(IPA_ENDP_HDR_EXT(EP_LAN_RX), 0);
+	wr32(IPA_ENDP_AGGR(EP_LAN_RX), 0);
+	wr32(IPA_ENDP_HOL_EN(EP_LAN_RX), 0);
+	wr32(IPA_ENDP_STATUS(EP_LAN_RX), 0);
+	if (ch_start(CH_LAN_RX))
+		return -1;
+	for (unsigned i = 0; i < LAN_BUFS; i++)
+		if (lan_post(i))
+			return -1;
+	ch_doorbell(CH_LAN_RX);
+	LOG("p2lan: ep%d/ch%d up, %u x %u rx buffers at %llx", EP_LAN_RX, CH_LAN_RX, LAN_BUFS, LAN_BUF_SZ,
+	    (unsigned long long) lan_block);
+	return 0;
+}
+
+static void lan_event(const struct gsi_evt *e)
+{
+	unsigned i = lan_ev % LAN_BUFS;
+	uint8_t b[48] = { 0 };
+	lan_ev++;
+	if (lan_ev <= 30) {
+		char hx[3 * 48 + 1];
+		unsigned n = e->len < 48 ? e->len : 48;
+		pm_rd(lan_block + (uint64_t) i * LAN_BUF_SZ, b, n);
+		for (unsigned k = 0; k < n; k++)
+			snprintf(hx + 3 * k, 4, " %02x", b[k]);
+		LOG("p2lan: event %u type %02x code %02x len %u:%s", lan_ev, e->type, e->code, e->len, hx);
+	}
+	if (lan_post(i) == 0)
+		ch_doorbell(CH_LAN_RX);
+}
+
+static int cmd5_setup(void)
+{
+	uint8_t pl[8] = { EP_MDM_TX, 0, 0, 0, 0, 0, 0, 0 };	/* IP_PACKET_INIT: dest pipe ep2 (harmless) */
+	if (ch_alloc_program(CH_CMDTX, EV_TX, CMD_TRE_CNT, 1, 1, TLV_CMDTX))
+		return -1;
+	wr32(IPA_ENDP_MODE(EP_CMDTX), 3 | (uint32_t) EP_LAN_RX << 4);	/* mainline ep7: DMA to AP_LAN_RX */
+	wr32(IPA_ENDP_SEQ(EP_CMDTX), 0);
+	if (ch_start(CH_CMDTX))
+		return -1;
+	cmd5_buf = ring_mem(64, 64);
+	if (!cmd5_buf || pm_wr(cmd5_buf, pl, sizeof(pl))) {
+		LOG("p2cmd5: payload buffer failed");
+		return -1;
+	}
+	{
+		struct gsi_ring *r = &ctx.ch[CH_CMDTX];
+		struct gsi_tre tre;
+		uint32_t idx = r->wp % r->cnt;
+		tre.addr = cmd5_buf;
+		tre.len = 0x10;			/* opcode IPA_CMD_IP_PACKET_INIT */
+		tre.resv = 0;
+		tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+		if (pm_wr(r->pa + (uint64_t) idx * RING_ELEM, &tre, sizeof(tre)))
+			return -1;
+		r->wp++;
+		ch_doorbell(CH_CMDTX);
+		cmd5_posted++;
+	}
+	LOG("p2cmd5: ep7 mode %08x seq %08x, ch5 started, IP_PACKET_INIT posted (wp %u)", rd32(IPA_ENDP_MODE(EP_CMDTX)),
+	    rd32(IPA_ENDP_SEQ(EP_CMDTX)), ctx.ch[CH_CMDTX].wp);
+	return 0;
+}
+
 static void p2_drain(void)
 {
 	struct gsi_evt e;
@@ -1745,6 +1837,11 @@ static void p2_drain(void)
 			p2_rxev++;
 			if (rx_event(&e))
 				break;
+		} else if (e.chid == CH_LAN_RX && p2_lan) {
+			lan_event(&e);
+		} else if (e.chid == CH_CMDTX && p2_cmd5) {
+			cmd5_ev++;
+			LOG("p2cmd5: COMMAND COMPLETED: event %u type %02x code %02x len %u", cmd5_ev, e.type, e.code, e.len);
 		} else {
 			if (p2_unk++ < 8)
 				LOG("p2: event for unknown ch %u type %02x code %02x len %u", e.chid, e.type, e.code, e.len);
@@ -2064,6 +2161,12 @@ static void p2_poll(void)
 		if (rx_prepost())
 			goto failed;
 		LOG("p2: rx posted %u", RX_BUFS);
+		p2_lan = cell_word_int("p2lan=", 0) == 1;
+		p2_cmd5 = cell_word_int("p2cmd5=", 0) == 1;
+		if (p2_lan && lan_setup())
+			goto failed;
+		if (p2_cmd5 && cmd5_setup())
+			goto failed;
 		if (utun_up())
 			goto failed;
 		p2_stage = 2;
@@ -2115,6 +2218,9 @@ static void p2_poll(void)
 			    rd32(IPA_ENDP_HDR(EP_MDM_TX)), rd32(IPA_ENDP_HDR_EXT(EP_MDM_TX)), tx_wp);
 		}
 	}
+	if ((p2_lan || p2_cmd5) && link_ms() - p2_stat >= 10000)
+		LOG("p2lan/cmd5: lan events %u | ch5 posted %u completed %u, ch5 rp %08x wp %08x state %u", lan_ev, cmd5_posted,
+		    cmd5_ev, rd32(GSI_CH_C_CNTXT_0(CH_CMDTX) + 0x10), rd32(GSI_CH_C_CNTXT_0(CH_CMDTX) + 0x18), ch_state(CH_CMDTX));
 	if (link_ms() - p2_stat >= 10000) {
 		p2_stat = link_ms();
 		LOG("p2: tx posted %u completed %u (ev %u) | rx events %u bytes %llu pkts %u frames %u | unknown %u"
