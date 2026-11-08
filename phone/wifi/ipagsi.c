@@ -1555,8 +1555,13 @@ static int p2_setup(void)
 		    rd32(IPA_BASE + 0x48) >> 1 & 31, rd32(IPA_BASE + 0x48) >> 17 & 31, rd32(IPA_BASE + 0x48) >> 24 & 1,
 		    rd32(IPA_BASE + 0x48) & 1);
 		if (rt >= 0) {
-			wr32(IPA_BASE + 0x48, (uint32_t) rt << 1 | (uint32_t) rt << 17 | 1u << 24);
-			LOG("p2: p2route=%ld: ROUTE reg -> %08x", rt, rd32(IPA_BASE + 0x48));
+			/* p2routedis=1 (Claude): also set ROUTE_DIS (bit 0), so every packet goes to the default pipe without a
+			 * route-table lookup.  A test of the RX side alone: with def pipe 16, anything the IPA routes (our own TX,
+			 * the modem's downlink) should land on our RX ring if ch7/ep16 work.  Global register: test only. */
+			uint32_t dis = cell_word_int("p2routedis=", 0) ? 1u : 0u;
+
+			wr32(IPA_BASE + 0x48, (uint32_t) rt << 1 | (uint32_t) rt << 17 | 1u << 24 | dis);
+			LOG("p2: p2route=%ld%s: ROUTE reg -> %08x", rt, dis ? " p2routedis=1" : "", rd32(IPA_BASE + 0x48));
 		}
 	}
 	p2_chdefer = 0;

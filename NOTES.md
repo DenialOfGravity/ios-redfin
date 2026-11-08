@@ -559,3 +559,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 461528e cold boot (full power-off): same blips, TX 3/3, rx 0; status bar signal/operator + Cellular Data settings work (user)
 - 2026-11-08 ipagsi (agent): log IPA ROUTE reg; p2route=<ep> sets default/frag pipe
 - 2026-11-08 58acc7e: IPA ROUTE was 0; p2route=16 + RX up: rx 0, blips unchanged, ch7 +1 per blip
+- 2026-11-08 ipagsi (Claude): p2routedis=1 sets ROUTE_DIS with p2route (RX-side test)
