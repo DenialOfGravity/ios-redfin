@@ -567,3 +567,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 8f569ae (ws-n-ipa-gsi1): ipagsi RX loopback works end to end (p2loop=1 p2noaggr=1, accept type 0x22 events). Real modem path with p2noaggr: TX ok, rx 0, modem blips ~270 ms after first TX. Cell utun is not published to configd (netsvc up by hand works).
 - 2026-11-08 ac0c358: wland ipahw memdump [OFST LEN]: read-only dump of the IPA local memory (flt/rt tables, drop stats).
 - 2026-11-08 61e671b: ipagsi TX buffers from one pmem block (per-buffer allocs ran out after 27 packets). Table dump: modem wrote UL routes (mux -> pipe 14), nothing routes to ep16; filter bitmap poke 0->8 changed nothing.
+- 2026-11-08 a1093d5: ipa ipatbl=1 (opt-in): filter bitmap ep2/5/8 + zero-rule slots before INIT_DRIVER (mainline ipa_table_setup). Modem then fills the right slots; its DL route table 5 sends only metadata 9 to ep16.
