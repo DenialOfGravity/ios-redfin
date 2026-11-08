@@ -1340,7 +1340,7 @@ static void fail_state(void)
  * p2join=<s>, p2ep=before|after (when ipagsi_endpoints() runs, default after the join).
  * One reader for ring 2 tells TX and RX events apart by the channel id.  No channel 5, no tables. */
 static int p2_stage;			/* 0 off, 1 waiting for the modem, 2 running */
-static int p2_tx_only, p2_ep_before, p2_rec_done, p2_chdefer;
+static int p2_tx_only, p2_ep_before, p2_rec_done, p2_chdefer, p2_irqonly;
 static long p2_rec_s = -1;
 static int p2_cmd;			/* p2cmd=1: command channel test (below) */
 static int p2_cmd_setup(void);
@@ -1537,6 +1537,21 @@ static int p2_setup(void)
 	if (cell_word_int("p2low=", 0) && lo_init())
 		return -1;
 	p2_chdefer = 0;
+	p2_irqonly = 0;
+	if (cell_word_int("p2irq=", 0) == 5) {
+		/* p2irq=5: ONLY the irq config, no GSI command at all (no ev/ch alloc), no join: does the config alone make the
+		 * modem's start blip?  Watch EE1 with eedump=1. */
+		p2_irq_setup();
+		p2_irqonly = 1;
+		p2_stage = 1;
+		p2_t0 = link_ms();
+		p2_seen = 0;
+		p2_stat = link_ms();
+		set_state("p2-wait");
+		LOG("p2: p2irq=5: irq config only, no GSI command, no join");
+		ctx.active = 1;
+		return 0;
+	}
 	if (cell_word_int("p2irq=", 0) == 1)	/* p2irq=2: later, at the join (after the modem's start cycle) */
 		p2_irq_setup();
 	else if (cell_word_int("p2irq=", 0) == 4) {
@@ -1857,6 +1872,8 @@ static void p2_poll(void)
 		if (p2_tx_recreate())
 			LOG("p2: p2rec: recreate FAILED");
 	}
+	if (p2_irqonly)
+		return;
 	if (p2_stage == 1) {
 		int go = 0;
 
