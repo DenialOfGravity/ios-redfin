@@ -572,3 +572,5 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 (488ad8c, live poke): route table 5 catch-all -> pipe 16: rx 0. Modem receives our UL (EE1 ch7 +1 per packet) but never moves its DL channels ch0/ch2: no DL enters the IPA.
 - 2026-11-08 92e69f1: cell wdsstats=N (QMI WDS Get Packet Statistics every N s, logged). Modem counts txok=0 rxok=0 while 196 UL packets reach its ch7.
 - 2026-11-08 37ac4af: ipaqmi ipanoflt=1 (leave INSTALL_FILTER_RULE unanswered, as mainline): no change.
+- 2026-11-08 3a7ac4e: qmapv5=1 (WDA QMAPV5, ep2/ep16 hdr 8 + inline csum, v5 TX header, v5-aware deagg) + UL filter TLV dump: no change.
+- 2026-11-08 b877003: ipaqmi ipanotif=1 (FILTER_INSTALLED_NOTIF as Android): modem accepts; WDS rxok 0 -> 13, modem DL ch0 now moves, DL routed to pipe 10 (route table 5 catch-all).
