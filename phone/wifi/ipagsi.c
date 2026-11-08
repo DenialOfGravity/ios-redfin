@@ -895,7 +895,7 @@ static int ipagsi_dump_ipa(void)
  */
 
 static uint8_t bounce[RX_BUF_SZ];
-static uint8_t tx_frame[TX_CAP + QMAP_HDR];
+static uint8_t tx_frame[TX_CAP + QMAP_HDR + QMAP5_CSUM_HDR];
 static uint8_t utun_pkt[4 + 2048];		/* AF prefix + one IP packet (MTU 1500 + room) */
 
 /* the AF prefix for a packet, 0 = not IP we can hand to the utun */
@@ -1059,7 +1059,12 @@ static int tx_drain(void)
 
 static int tx_send(const uint8_t *ip, size_t len)
 {
-	size_t n = qmap_frame(tx_frame, sizeof(tx_frame), ip, len, dp_mux());
+	static int v5 = -1;
+	if (v5 < 0) {
+		v5 = cell_word_int("qmapv5=", 0) == 1;
+		LOG("tx: QMAP %s", v5 ? "v5 + checksum header (qmapv5=1)" : "v1");
+	}
+	size_t n = v5 ? qmap5_frame(tx_frame, TX_CAP, ip, len, dp_mux()) : qmap_frame(tx_frame, sizeof(tx_frame), ip, len, dp_mux());
 	uint32_t idx = tx_wp % TX_BUFS;
 
 	if (!n) {
@@ -1519,6 +1524,13 @@ static void ep_program(int ep, int status)
 		seq = EP_SEQ_2_PASS_SKIP_LAST_UC;
 		if (status)
 			st = EP_STATUS_EN | EP_MODEM_AP_RX << EP_STATUS_ENDP_SHIFT;
+		if (cell_word_int("qmapv5=", 0) == 1) {
+			/* qmapv5=1 (Claude 2026-11-08): mainline v4.7 AP_MODEM_TX checksum=true: header 4 + 4, CS_OFFLOAD_EN
+			 * INLINE (1) and CS_METADATA_HDR_OFFSET 1 (the v5 header right after the MAP header, in words) */
+			hdr = 8 | 1u << 6;
+			cfg = 1u << 1 | 1u << 3;
+			LOG("p2: qmapv5=1: ep%d header 8, checksum offload inline, csum header at word 1", ep);
+		}
 		if (cell_word_int("p2loop=", 0)) {
 			/* p2loop=1 (Claude): RX-side self test without the modem.  ep2 in DMA mode with ep16 as its destination
 			 * (as mainline's ep7 -> ep9): every TX packet is copied by the IPA straight to AP_MODEM_RX, so it must
@@ -1533,6 +1545,13 @@ static void ep_program(int ep, int status)
 		ext = 1 | 1u << 1 | 1u << 3;	/* big endian, TOTAL_LEN_OR_PAD_VALID, PAYLOAD_LEN_INC_PADDING (pad align 0) */
 		mmask = 0xff000000u;		/* cpu_to_be32(0xff) */
 		aggr = 1 | 4u << EP_AGGR_TYPE_SHIFT | 6u << EP_AGGR_BYTE_SHIFT | 5u << EP_AGGR_TIME_SHIFT | EP_AGGR_SW_EOF;
+		if (cell_word_int("qmapv5=", 0) == 1) {
+			/* qmapv5=1 (Claude 2026-11-08): mainline v4.7 AP_MODEM_RX checksum=true: header 4 + 4 (v5 csum
+			 * header), CS_OFFLOAD_EN INLINE (1) */
+			hdr = 8 | 1u << 6 | 1u << 7 | 1u << 19 | 2u << 20;
+			cfg = 1u << 1;
+			LOG("p2: qmapv5=1: ep%d header 8, checksum offload inline", ep);
+		}
 		if (cell_word_int("p2noaggr=", 0)) {
 			aggr = 0;	/* p2noaggr=1 (Claude): AGGR_EN = bypass, one packet per RX buffer (test) */
 			LOG("p2: p2noaggr=1: ep%d aggregation off", ep);

@@ -44,6 +44,27 @@ static inline size_t qmap_frame(uint8_t *out, size_t cap, const uint8_t *ip, siz
 	return len + QMAP_HDR;
 }
 
+/* QMAP v5 with the checksum header (rmnet MAP_CKSUMV5 egress, Linux rmnet_map_add_map_header +
+ * rmnet_map_v5_checksum_uplink_packet; Claude 2026-11-08): byte 0 = next-header bit 6, no padding, pkt_len = IP length
+ * only; then the 4-byte v5 header: header_info = type 2 (CSUM_OFFLOAD) << 1, csum_info 0 (no checksum requested), 2
+ * reserved.  Total length, or 0 if it does not fit */
+#define QMAP5_CSUM_HDR	4
+static inline size_t qmap5_frame(uint8_t *out, size_t cap, const uint8_t *ip, size_t len, uint8_t mux)
+{
+	if (len == 0 || len > 0xffff || len + QMAP_HDR + QMAP5_CSUM_HDR > cap)
+		return 0;
+	out[0] = 0x40;
+	out[1] = mux;
+	out[2] = (uint8_t)(len >> 8);
+	out[3] = (uint8_t)len;
+	out[4] = 2u << 1;
+	out[5] = 0;
+	out[6] = 0;
+	out[7] = 0;
+	memcpy(out + QMAP_HDR + QMAP5_CSUM_HDR, ip, len);
+	return len + QMAP_HDR + QMAP5_CSUM_HDR;
+}
+
 struct qmap_stats {
 	unsigned pkts, cmds, bad;	/* data frames handed on, command frames skipped, buffers cut short */
 };
@@ -58,7 +79,10 @@ static inline void qmap_deagg(const uint8_t *b, size_t len, void (*cb)(void *ctx
 		size_t plen = (size_t)b[at + 2] << 8 | b[at + 3];
 		if (plen == 0 && !cmd && !pad && mux == 0)
 			break;		/* zero fill after the last frame */
-		if (plen == 0 || at + QMAP_HDR + plen > len || pad > plen) {
+		/* QMAP v5 data frame: the next-header bit (6) says a 4-byte v5 header follows, not counted in pkt_len
+		 * (Linux rmnet_map_validate_packet_len); bit 6 is 0 in QMAP v1, so v1 frames are unaffected */
+		size_t xh = (!cmd && (b[at] & 0x40)) ? QMAP5_CSUM_HDR : 0;
+		if (plen == 0 || at + QMAP_HDR + xh + plen > len || pad > plen) {
 			st->bad++;
 			break;
 		}
@@ -66,9 +90,9 @@ static inline void qmap_deagg(const uint8_t *b, size_t len, void (*cb)(void *ctx
 			st->cmds++;
 		else {
 			st->pkts++;
-			cb(ctx, (uint8_t)mux, b + at + QMAP_HDR, plen - pad);
+			cb(ctx, (uint8_t)mux, b + at + QMAP_HDR + xh, plen - pad);
 		}
-		at += QMAP_HDR + plen;
+		at += QMAP_HDR + xh + plen;
 	}
 }
 

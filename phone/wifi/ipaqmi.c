@@ -468,7 +468,24 @@ static void on_server_req(const struct qrtr_hdr *h, const struct qmi_msg *m)
 		reply_ok(h, m);
 		printf("[%6llu] ipaqmi:   %s: answered with success\n", TS(), m->id == MSG_CONFIG ? "config" : "filters installed");
 		break;
-	case MSG_INSTALL_FILTER_RULE:
+	case MSG_INSTALL_FILTER_RULE: {
+		/* the whole request's TLVs to /var/local/ipa-ulflt.bin (Claude 2026-11-08): {u8 type, u16 len LE, value}
+		 * per TLV, to decode the modem's UL filter specs offline (not a credential or a dump of a partition) */
+		FILE *df = fopen("/var/local/ipa-ulflt.bin", "wb");
+		if (df) {
+			for (unsigned t = 0x10; t <= 0x1f; t++) {
+				uint16_t l = 0;
+				const uint8_t *v = qmi_get(m, (uint8_t)t, &l);
+				if (!v)
+					continue;
+				uint8_t th[3] = { (uint8_t)t, (uint8_t)l, (uint8_t)(l >> 8) };
+				fwrite(th, 1, 3, df);
+				fwrite(v, 1, l, df);
+			}
+			fclose(df);
+			printf("[%6llu] ipaqmi:   install filter rule: TLVs saved to /var/local/ipa-ulflt.bin\n", TS());
+		}
+	}
 		if (noflt) {
 			printf("[%6llu] ipaqmi:   install filter rule: NOT answered (ipanoflt=1, as mainline)\n", TS());
 			break;

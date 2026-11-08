@@ -70,6 +70,7 @@ static const struct { int svc; uint16_t id; int once, opt; } steps[] = {
 
 static unsigned ss_dom;	/* domain=N (default 0 = CS only) */
 static int dp_mux = 1, dp_iface = 1;
+static int qmapv5;		/* qmapv5=1 (Claude 2026-11-08): WDA UL/DL aggregation protocol 9 (QMAPV5) instead of 5 */
 static int stats_s;			/* wdsstats=N (Claude 2026-11-08): WDS Get Packet Statistics every N s while the call is held */
 static uint64_t stats_next;	/* dpmux= / dpiface= in cell.on (Claude 2026-11-08), default 1 */
 static int enabled, opts, allowed, step = -1, done_once[NSTEPS], fails[NSTEPS], timeouts;
@@ -765,6 +766,7 @@ static int read_opts(void)
 			dp_mux = 1;
 		if (dp_iface < 0)
 			dp_iface = 1;
+		qmapv5 = strstr(b, "qmapv5=1") != NULL;
 		stats_s = (w = strstr(b, "wdsstats=")) ? atoi(w + 9) : 0;
 		if (stats_s < 0)
 			stats_s = 0;
@@ -1430,8 +1432,8 @@ static void dp_tlvs(struct qmi_buf *q, int svc)
 		qmi_tlv(q, 0x11, p, sizeof(p));
 	} else if (svc == SVC_WDA) {
 		qmi_tlv_u32(q, 0x11, 2);	/* raw IP */
-		qmi_tlv_u32(q, 0x12, 5);	/* QMAP */
-		qmi_tlv_u32(q, 0x13, 5);
+		qmi_tlv_u32(q, 0x12, qmapv5 ? 9 : 5);	/* QMAP (5), or QMAPV5 (9, libqmi QmiWdaDataAggregationProtocol) */
+		qmi_tlv_u32(q, 0x13, qmapv5 ? 9 : 5);
 		qmi_tlv_u32(q, 0x15, 16);
 		qmi_tlv_u32(q, 0x16, 0x3800);
 		qmi_tlv(q, 0x17, ep, 8);
