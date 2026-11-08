@@ -541,3 +541,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-08 3b55fc3 gsistart=none controls x3 (03:07, 04:16, 08:29 CET): no modem ch4-7 start; 10 boots in a row; full power-off next
 - 2026-11-08 3b55fc3 call restart control: stop/start ok via cell.on toggle; eedump stops with ipagsi, EE1 not observable
 - 2026-11-08 ipagsi (agent): eedump kept after call stop; p2irqm bit5 inter-EE masks; p2qos also on ch5 in p2cmd
+- 2026-11-08 404af76: modem start back; p2irqm=63 TX 3/3 + blip; p2irq=4 (ch2 only allocated) still blips -> blip from irq config itself; ch5 stalls with QOS 7/0x400/0
