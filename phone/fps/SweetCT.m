@@ -260,12 +260,81 @@ ct_hook(void)
 	ct_write(@"CoreTelephonyClientMux proxies -> SCFakeCT");
 }
 
+/*
+ * Cellular Data switch (Claude 2026-11-09): Settings > Cellular's master switch reads/writes the cellular-data setting
+ * through PSCellularDataSettingsDetail (Preferences.framework) class methods, which end in CommCenter (absent here).
+ * Its class methods named isEnabled / setEnabled: are replaced: the state lives in /var/tmp/sweetcell.celldata ("1" on,
+ * "0" off; absent = on), which wland (ipagsi.c, celldata) follows: off = the cellular route is withdrawn and UL is dropped.
+ * Every class method of the class is logged once, so other names on this iOS build show up in the log.
+ */
+#define CELLDATA_FILE "/var/tmp/sweetcell.celldata"
+static int pd_hooked;
+
+static BOOL
+celldata_get(void)
+{
+	char b[4] = "";
+	FILE *f = fopen(CELLDATA_FILE, "r");
+	if (f == NULL) {
+		return YES;
+	}
+	size_t n = fread(b, 1, sizeof(b) - 1, f);
+	fclose(f);
+	return !(n > 0 && b[0] == '0');
+}
+
+static void
+celldata_set(BOOL on)
+{
+	FILE *f = fopen(CELLDATA_FILE ".new", "w");
+	if (f != NULL) {
+		fputs(on ? "1\n" : "0\n", f);
+		fclose(f);
+		rename(CELLDATA_FILE ".new", CELLDATA_FILE);
+	}
+	ct_write([NSString stringWithFormat:@"cellular data switch -> %s", on ? "ON" : "OFF"]);
+}
+
+static void
+pd_hook(void)
+{
+	Class c = objc_getClass("PSCellularDataSettingsDetail");
+	if (pd_hooked || c == Nil) {
+		return;
+	}
+	pd_hooked = 1;
+	Class mc = object_getClass(c);
+	unsigned n = 0;
+	Method *ms = class_copyMethodList(mc, &n);
+	NSMutableString *names = [NSMutableString string];
+	for (unsigned i = 0; i < n; i++) {
+		const char *nm = sel_getName(method_getName(ms[i]));
+		[names appendFormat:@" +%s", nm];
+		if (!strcmp(nm, "isEnabled")) {
+			method_setImplementation(ms[i], imp_implementationWithBlock(^BOOL(id me) {
+				return celldata_get();
+			}));
+		} else if (!strcmp(nm, "setEnabled:")) {
+			method_setImplementation(ms[i], imp_implementationWithBlock(^void(id me, BOOL on) {
+				celldata_set(on);
+			}));
+		}
+	}
+	free(ms);
+	ct_write([NSString stringWithFormat:@"PSCellularDataSettingsDetail hooked (state %s):%@", celldata_get() ? "on" : "off", names]);
+}
+
 static void
 ct_image_added(const struct mach_header *mh, intptr_t slide)
 {
 	Dl_info di;
-	if (ct_hooked || dladdr(mh, &di) == 0 || di.dli_fname == NULL ||
-	    strstr(di.dli_fname, "/CoreTelephony.framework/CoreTelephony") == NULL) {
+	if (dladdr(mh, &di) == 0 || di.dli_fname == NULL) {
+		return;
+	}
+	if (strstr(di.dli_fname, "/Preferences.framework/Preferences") != NULL) {
+		pd_hook();
+	}
+	if (ct_hooked || strstr(di.dli_fname, "/CoreTelephony.framework/CoreTelephony") == NULL) {
 		return;
 	}
 	ct_hook();	/* before any CoreTelephonyClient call can use the real proxy */
