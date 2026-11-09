@@ -8,7 +8,15 @@
  *      cache, libBasebandCapabilities) answers 0 instead of 1, so ABM takes its existing "Faking bootup"
  *      path instead of pushing modem firmware over Sahara. Also enabled by boot-arg sweetabmfake=1.
  *   4  IOKit trace (IOUserClient.cpp "IOK CommCenter: ..." lines) of CommCenter's matching/registry calls.
+ *   8  (1063) deferred publish: /dev/abpbridge is made at boot, but the baseband services are published only when
+ *      the bridge daemon (wland) has the device open and says ABPB_IOC_READY 1, so CommCenter/ABM never sees a
+ *      baseband nobody answers for. ABPB_IOC_READY 0 or closing the device marks it not ready again (see 0x20).
+ *   0x10 (1063) leave out AppleBasebandPCIPDPManagerBase (A/B for the 30 s "Start TIMEOUT: boot.mod" seen once in P1).
+ *   0x20 (1063) with 8: when wland says not ready / closes the device, also un-publish (terminate) the services;
+ *      without it they stay published (CommCenter keeps its sessions, frames queue in the ring until wland is back).
  * kern.sweet_abp can be written (root) to turn bits on at run time (never off).
+ * kern.sweet_abp_publish (1063): reads 1 when the services are published; write 1 = publish now, 0 = un-publish now
+ * (debugging; does not change the bits).
  *
  * /dev/abpbridge (root, 0600, one opener): wland reads every frame CommCenter writes to a pipe and writes
  * frames that complete CommCenter's reads on that pipe. Records, little-endian:
@@ -16,6 +24,7 @@
  *     type 0 DATA, 1 OPEN, 2 CLOSE, 3 START, 4 ABORT (1-4 only kernel -> wland; data = the selector's scalar)
  *     session: one per user client that opened the pipe (ABM opens qmux2 from several QMux instances at
  *     once, each its own QMUX stream); wland answers a frame with the same pipe + session.
+ * ioctl ABPB_IOC_READY (_IOW('B', 0x51, uint32_t)): 1 = wland can answer now, 0 = not any more (1063).
  * read() returns whole records only (as many as fit; EMSGSIZE if the first does not), blocks unless
  * O_NONBLOCK; select() works. write() takes one or more whole DATA records. The kernel -> wland queue is a
  * 256 KiB ring that also fills while nobody has the device open; when it is full, frames are dropped and
@@ -42,6 +51,7 @@
 #include <sys/proc_internal.h>
 #include <sys/uio.h>
 #include <sys/select.h>
+#include <sys/ioccom.h>
 #include <sys/sysctl.h>
 #include <sys/codesign.h>
 #include <miscfs/devfs/devfs.h>
@@ -63,12 +73,20 @@ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint3
 extern int SweetABPStats(char *buf, size_t len);
 extern void SweetABPSetBootstage(uint32_t stage);
 extern void SweetABPMessage(uint32_t code);
+extern int SweetABPPublish(bool on, const char *why);
+extern int SweetABPPublished(void);
 
 extern kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size,
     vm_machine_attribute_t attribute, vm_machine_attribute_val_t *value);
 
 #define ABP_BIT_SERVICES        1u
 #define ABP_BIT_FAKEBOOT        2u
+#define ABP_BIT_TRACE           4u
+#define ABP_BIT_DEFER           8u
+#define ABP_BIT_NOPDP           0x10u
+#define ABP_BIT_UNPUB_ON_CLOSE  0x20u
+#define ABP_BITS_ALL            0x3fu
+#define ABPB_IOC_READY          _IOW('B', 0x51, uint32_t)
 #define ABPB_MAGIC              0xAB51
 #define ABPB_RING               (256u * 1024u)
 #define ABPB_MAXFRAME           65536u
@@ -94,6 +112,8 @@ static struct {
 	struct selinfo sel;
 	bool open;
 	bool node;
+	bool ready;                     /* 1063: wland said ABPB_IOC_READY 1 (cleared on 0 / close) */
+	uint32_t readies;
 	uint32_t records, dropped, dropped_bytes;
 	uint64_t to_wland, from_wland;
 } ab;
@@ -186,12 +206,49 @@ ab_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused p
 static int
 ab_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
 {
+	bool was_ready;
 	lck_mtx_lock(&abp_lock);
 	ab.open = false;
+	was_ready = ab.ready;
+	ab.ready = false;
 	wakeup(&ab);
 	selwakeup(&ab.sel);
 	lck_mtx_unlock(&abp_lock);
-	printf("SWEET ABP: /dev/abpbridge closed\n");
+	printf("SWEET ABP: /dev/abpbridge closed%s\n", was_ready ? " (was ready: now not ready)" : "");
+	if (was_ready && (sweet_abp_flags & ABP_BIT_DEFER) && (sweet_abp_flags & ABP_BIT_UNPUB_ON_CLOSE)) {
+		SweetABPPublish(false, "bridge closed, sweetabp & 0x20");
+	}
+	return 0;
+}
+
+/* 1063: wland says it can (1) or cannot (0) answer for the modem now. */
+static int
+ab_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+{
+	if (cmd != ABPB_IOC_READY) {
+		return ENOTTY;
+	}
+	uint32_t v = *(uint32_t *)(void *)data;
+	bool was;
+	lck_mtx_lock(&abp_lock);
+	was = ab.ready;
+	ab.ready = v != 0;
+	if (ab.ready && !was) {
+		ab.readies++;
+	}
+	lck_mtx_unlock(&abp_lock);
+	printf("SWEET ABP: wland says %s (was %s)\n", v ? "READY" : "not ready", was ? "ready" : "not ready");
+	if (!(sweet_abp_flags & ABP_BIT_DEFER)) {
+		return 0;               /* published at boot already: nothing to do */
+	}
+	if (v) {
+		int e = SweetABPPublish(true, "wland ready");
+		return e == EALREADY ? 0 : e;
+	}
+	if (sweet_abp_flags & ABP_BIT_UNPUB_ON_CLOSE) {
+		int e = SweetABPPublish(false, "wland not ready, sweetabp & 0x20");
+		return e == EALREADY ? 0 : e;
+	}
 	return 0;
 }
 
@@ -313,7 +370,7 @@ static const struct cdevsw ab_cdevsw = {
 	.d_close      = ab_close,
 	.d_read       = ab_read,
 	.d_write      = ab_write,
-	.d_ioctl      = eno_ioctl,
+	.d_ioctl      = ab_ioctl,
 	.d_stop       = eno_stop,
 	.d_reset      = eno_reset,
 	.d_ttys       = NULL,
@@ -335,8 +392,13 @@ sweet_abp_apply(uint32_t bits)
 	ab.node = true;
 	int major = cdevsw_add(-1, &ab_cdevsw);
 	void *n = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "abpbridge");
-	printf("SWEET ABP: /dev/abpbridge %s (major %d)\n", n ? "ready" : "FAILED", major);
+	printf("SWEET ABP: /dev/abpbridge %s (major %d)\n", n ? "made" : "FAILED", major);
 	SweetABPStart();
+	if (sweet_abp_flags & ABP_BIT_DEFER) {
+		printf("SWEET ABP: deferred publish (sweetabp & 8): the services appear when wland says ready\n");
+	} else {
+		SweetABPPublish(true, "boot");
+	}
 }
 
 void
@@ -352,8 +414,10 @@ sweet_abp_init(void)
 	if (!on) {
 		return;
 	}
-	printf("SWEET ABP: sweetabp=0x%x (services %s, fake boot %s), bootstage %u\n", on,
-	    (on & ABP_BIT_SERVICES) ? "on" : "off", (on & ABP_BIT_FAKEBOOT) ? "on" : "off", sweet_abp_bootstage);
+	printf("SWEET ABP: sweetabp=0x%x (services %s%s%s%s, fake boot %s), bootstage %u\n", on,
+	    (on & ABP_BIT_SERVICES) ? "on" : "off", (on & ABP_BIT_DEFER) ? ", deferred to wland ready" : "",
+	    (on & ABP_BIT_NOPDP) ? ", no PDPManagerBase" : "", (on & ABP_BIT_UNPUB_ON_CLOSE) ? ", un-publish on close" : "",
+	    (on & ABP_BIT_FAKEBOOT) ? "on" : "off", sweet_abp_bootstage);
 	sweet_abp_apply(on);
 }
 
@@ -495,12 +559,35 @@ sysctl_abp(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int a
 			return EPERM;
 		}
 		printf("SWEET ABP: kern.sweet_abp 0x%x -> adds 0x%x\n", sweet_abp_flags, (uint32_t)v);
-		sweet_abp_apply((uint32_t)v & 7u);
+		sweet_abp_apply((uint32_t)v & ABP_BITS_ALL);
 	}
 	return e;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_abp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp, "I",
-    "redfin 1061: AppleBasebandPCI stand-in (1 services + /dev/abpbridge, 2 fake ABM boot in CommCenter); only adds bits");
+    "redfin 1061/1063: AppleBasebandPCI stand-in (1 services + /dev/abpbridge, 2 fake ABM boot, 4 trace, 8 publish on wland ready, "
+    "0x10 no PDPManagerBase, 0x20 un-publish on bridge close); only adds bits");
+
+static int
+sysctl_abp_publish(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = SweetABPPublished(), changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (e == 0 && changed) {
+		if (proc_suser(req->p) != 0) {
+			return EPERM;
+		}
+		if (!ab.node) {
+			return ENXIO;
+		}
+		e = SweetABPPublish(v != 0, v ? "kern.sweet_abp_publish=1" : "kern.sweet_abp_publish=0");
+		if (e == EALREADY) {
+			e = 0;
+		}
+	}
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_publish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_publish, "I",
+    "redfin 1063: 1 = baseband stand-ins published; write 1/0 to publish/un-publish now (debugging)");
 
 static int
 sysctl_abp_stage(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -532,18 +619,18 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_msg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_L
 static int
 sysctl_abp_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
 {
-	char *s = kalloc_data(1024, Z_WAITOK | Z_ZERO);
+	char *s = kalloc_data(2048, Z_WAITOK | Z_ZERO);
 	if (s == NULL) {
 		return ENOMEM;
 	}
-	int n = SweetABPStats(s, 1024);
+	int n = SweetABPStats(s, 2048);
 	lck_mtx_lock(&abp_lock);
-	snprintf(s + n, 1024 - (size_t)n, " | bridge %s queued %u B/%u rec, dropped %u (%u B), to wland %llu B, from wland %llu B"
-	    " | fakeboot state %d pid %d calls %u", ab.open ? "open" : "closed", ab_used(), ab.records, ab.dropped,
+	snprintf(s + n, 2048 - (size_t)n, " | bridge %s %s (ready %u x) queued %u B/%u rec, dropped %u (%u B), to wland %llu B, from wland %llu B"
+	    " | fakeboot state %d pid %d calls %u", ab.open ? "open" : "closed", ab.ready ? "READY" : "not ready", ab.readies, ab_used(), ab.records, ab.dropped,
 	    ab.dropped_bytes, ab.to_wland, ab.from_wland, abm_state, abm_pid, abm_count);
 	lck_mtx_unlock(&abp_lock);
 	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
-	kfree_data(s, 1024);
+	kfree_data(s, 2048);
 	return e;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_stats, "A",

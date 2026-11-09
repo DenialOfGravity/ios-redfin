@@ -23,6 +23,9 @@
  *   AppleIPAppender                       accept-all stub for ApplePDPHelper (it crashes on a NULL mutex in
  *                                         callScalarMethod when the service is missing).
  *
+ * 1063: SweetABPStart only sets up the pipes; SweetABPPublish(true/false) publishes / un-publishes the set (at boot,
+ * or with sweetabp & 8 when wland says it is ready on /dev/abpbridge; sweetabp & 0x10 leaves out PDPManagerBase).
+ *
  * Each user client that opens a pipe is a session (ABM opens qmux2 from several QMux instances at once).
  * Frames CommCenter writes go to /dev/abpbridge tagged with pipe + session (sweet_abp_c2w); frames wland writes
  * there for a session complete that session's oldest pending read or wait in a 128-frame queue (SweetABPDeliver). Every selector is logged the
@@ -49,6 +52,8 @@ extern "C" {
 #include <sys/errno.h>
 #include <kern/clock.h>
 void SweetABPStart(void);
+int SweetABPPublish(bool on, const char *why);
+int SweetABPPublished(void);
 int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
 int SweetABPStats(char *buf, size_t len);
 void SweetABPSetBootstage(uint32_t stage);
@@ -56,7 +61,11 @@ void SweetABPMessage(uint32_t code);
 bool SweetABPIs(const void *entry);
 void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
 extern uint32_t sweet_abp_bootstage;
+extern uint32_t sweet_abp_flags;
 }
+
+/* 1063: sweetabp bits read here (bsd/dev/sweet_abp.c has the full list) */
+#define ABP_BIT_NOPDP   0x10u   /* do not publish AppleBasebandPCIPDPManagerBase (A/B for the boot.mod start timeout) */
 
 #define ABP_NPIPES      2u
 #define ABP_MAXREADS    32u
@@ -125,7 +134,9 @@ struct abp_pipe {
 static abp_pipe abp_pipes[ABP_NPIPES];
 static IOService *abp_services[10];
 static unsigned abp_nservices;
-static bool abp_started;
+static bool abp_started;                /* pipes set up (locks); the services may still be unpublished (1063 deferred publish) */
+static IOLock *abp_svc_lock;            /* 1063: publish / unpublish against each other and the service loops */
+static uint32_t abp_publishes, abp_unpublishes;
 
 static void
 abp_hex(char *out, size_t outlen, const uint8_t *p, uint32_t len)
@@ -950,16 +961,28 @@ abp_publish(IOService *svc, IOService *provider, const char *name, const char *u
 	return true;
 }
 
+/* 1063: sets up the pipes only; the services are published by SweetABPPublish (at once, or when wland is ready). */
 void
 SweetABPStart(void)
 {
-	IOService *platform = IOService::getPlatform();
-	if (abp_started || platform == NULL) {
+	if (abp_started) {
 		return;
 	}
-	abp_started = true;
 	for (unsigned i = 0; i < ABP_NPIPES; i++) {
 		abp_pipes[i].lock = IOLockAlloc();
+	}
+	abp_svc_lock = IOLockAlloc();
+	abp_started = true;
+}
+
+/* Lock (abp_svc_lock) held. Publishes the whole set under the platform expert. */
+static void
+abp_publish_all(void)
+{
+	IOService *platform = IOService::getPlatform();
+	if (platform == NULL) {
+		IOLog("SWEET ABP: no platform expert yet: nothing published\n");
+		return;
 	}
 	/* /baseband of the D22AP (iPhone X) device tree */
 	SweetABPNub *nub = OSTypeAlloc(SweetABPNub);
@@ -1023,11 +1046,15 @@ SweetABPStart(void)
 			OSSafeReleaseNULL(tr);
 		}
 		abp_publish(tr, ctl, NULL, "AppleBasebandPCITraceUserClient");
-		AppleBasebandPCIPDPManagerBase *pdp = OSTypeAlloc(AppleBasebandPCIPDPManagerBase);
-		if (pdp && !pdp->init()) {
-			OSSafeReleaseNULL(pdp);
+		if (sweet_abp_flags & ABP_BIT_NOPDP) {
+			IOLog("SWEET ABP: AppleBasebandPCIPDPManagerBase not published (sweetabp & 0x10)\n");
+		} else {
+			AppleBasebandPCIPDPManagerBase *pdp = OSTypeAlloc(AppleBasebandPCIPDPManagerBase);
+			if (pdp && !pdp->init()) {
+				OSSafeReleaseNULL(pdp);
+			}
+			abp_publish(pdp, ctl, NULL, "AppleIPAppenderUserClient");
 		}
-		abp_publish(pdp, ctl, NULL, "AppleIPAppenderUserClient");
 	}
 	AppleIPAppender *ipa = OSTypeAlloc(AppleIPAppender);
 	if (ipa && !ipa->init()) {
@@ -1036,25 +1063,119 @@ SweetABPStart(void)
 	abp_publish(ipa, platform, NULL, "AppleIPAppenderUserClient");
 }
 
+/* Aborts every pending read on both pipes (all sessions); the sessions stay (their user clients close them). */
+static uint32_t
+abp_abort_all_reads(void)
+{
+	uint32_t total = 0;
+	for (unsigned p = 0; p < ABP_NPIPES; p++) {
+		abp_pipe *pp = &abp_pipes[p];
+		abp_read rs[ABP_MAXREADS];
+		uint32_t n;
+		IOLockLock(pp->lock);
+		n = pp->nreads;
+		memcpy(rs, pp->reads, n * sizeof(rs[0]));
+		pp->nreads = 0;
+		IOLockUnlock(pp->lock);
+		for (uint32_t i = 0; i < n; i++) {
+			io_user_reference_t a[1] = { 0 };
+			SweetABPAsync::done(rs[i].ref, kIOReturnAborted, a, 1);
+		}
+		total += n;
+	}
+	return total;
+}
+
+/*
+ * 1063: publish (on) or un-publish (off) the stand-ins. Un-publish terminates the top-level services (the nub, the
+ * PCI control with its pipes/trace/PDP children, AppleIPAppender); IOKit terminates their user clients, CommCenter
+ * sees its baseband go away. A later publish creates a fresh set. Returns 0, or EALREADY / ENXIO.
+ */
+int
+SweetABPPublish(bool on, const char *why)
+{
+	if (!abp_started) {
+		return ENXIO;
+	}
+	IOLockLock(abp_svc_lock);
+	if (on == (abp_nservices != 0)) {
+		IOLockUnlock(abp_svc_lock);
+		return EALREADY;
+	}
+	if (on) {
+		abp_publishes++;
+		IOLog("SWEET ABP: publishing the baseband services (%s, publish #%u)\n", why, abp_publishes);
+		abp_publish_all();
+		IOLockUnlock(abp_svc_lock);
+		return 0;
+	}
+	IOService *svcs[10];
+	unsigned n = abp_nservices;
+	memcpy(svcs, abp_services, n * sizeof(svcs[0]));
+	abp_nservices = 0;
+	abp_unpublishes++;
+	IOLockUnlock(abp_svc_lock);
+	uint32_t aborted = abp_abort_all_reads();
+	for (unsigned i = 0; i < n; i++) {
+		/* top level only: a provider's termination takes its children with it */
+		IOService *prov = svcs[i]->getProvider();
+		bool top = true;
+		for (unsigned j = 0; j < n; j++) {
+			top &= prov != svcs[j];
+		}
+		if (top) {
+			svcs[i]->terminate();
+		}
+	}
+	for (unsigned i = 0; i < n; i++) {
+		svcs[i]->release();
+	}
+	IOLog("SWEET ABP: un-published %u baseband services (%s), %u pending read(s) aborted\n", n, why, aborted);
+	return 0;
+}
+
+int
+SweetABPPublished(void)
+{
+	return abp_nservices != 0;
+}
+
 void
 SweetABPSetBootstage(uint32_t stage)
 {
+	if (!abp_started) {
+		return;
+	}
+	IOLockLock(abp_svc_lock);
 	for (unsigned i = 0; i < abp_nservices; i++) {
 		if (OSDynamicCast(AppleBasebandPCIControl, abp_services[i])) {
 			abp_services[i]->setProperty("bootstage", (unsigned long long)stage, 32);
 			IOLog("SWEET ABP: bootstage = %u\n", stage);
 		}
 	}
+	IOLockUnlock(abp_svc_lock);
 }
 
 void
 SweetABPMessage(uint32_t code)
 {
+	IOService *ctl = NULL;
+	if (!abp_started) {
+		return;
+	}
+	IOLockLock(abp_svc_lock);
 	for (unsigned i = 0; i < abp_nservices; i++) {
 		if (OSDynamicCast(AppleBasebandPCIControl, abp_services[i])) {
-			IOReturn r = abp_services[i]->messageClients(code, NULL, 0);
-			IOLog("SWEET ABP: general-interest message 0x%x to AppleBasebandPCIControl clients -> 0x%x\n", code, r);
+			ctl = abp_services[i];
+			ctl->retain();
+			break;
 		}
+	}
+	IOLockUnlock(abp_svc_lock);
+	if (ctl) {
+		IOReturn r = ctl->messageClients(code, NULL, 0);
+		IOLog("SWEET ABP: general-interest message 0x%x to AppleBasebandPCIControl clients -> 0x%x\n", code, r);
+		ctl->release();
 	}
 }
 
@@ -1073,7 +1194,9 @@ int
 SweetABPStats(char *buf, size_t len)
 {
 	size_t o = 0;
-	o += snprintf(buf + o, len - o, "bootstage %u mgr %llu bb %llu", sweet_abp_bootstage, abb_manager_state, abb_baseband_state);
+	o += snprintf(buf + o, len - o, "%s (%u services, published %u x, un-published %u x) | bootstage %u mgr %llu bb %llu",
+	    abp_nservices ? "published" : "NOT published", abp_nservices, abp_publishes, abp_unpublishes, sweet_abp_bootstage,
+	    abb_manager_state, abb_baseband_state);
 	for (unsigned i = 0; i < ABP_NPIPES && o < len; i++) {
 		abp_pipe *pp = &abp_pipes[i];
 		if (pp->lock == NULL) {
