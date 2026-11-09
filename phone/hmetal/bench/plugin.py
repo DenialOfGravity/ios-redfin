@@ -52,6 +52,9 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
     decodes, HM_XR_CHECK's 'changed after decode', HM_XR_WB_SYNC write-backs, held commits and scheduled waits
   - (hmv11) the surfaces line also counts the core's HM_XR_GPU decodes (xr_decode on the GPU, no ring barrier), their
     buffers, fallbacks to the processor and HM_XR_GPU_VERIFY's checks
+  - (hmv12) HM_SHADOW_WAIT=1 (default; HM_SHADOW_WAIT_MS=250): a copy of an unaligned surface's rows is not rewritten by
+    the processor while a committed buffer still reads or draws it (the refresh waits; an unmoved-seed HM_SHADOW_FRESH
+    refresh is put off instead), and a write-back is deferred to a later committed writer; 0 = as before
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -1573,6 +1576,166 @@ EDITS = [
      '\t[self commit];\n'
      '\t[self waitUntilScheduled];\n'
      '\treturn [self error] == nil;\n}\n'),
+    # (hmv12) HM_SHADOW_WAIT=1 (default; HM_SHADOW_WAIT_MS=250 the longest wait): a copy of an unaligned surface's rows
+    # (-hakiosShadow:) is the texture the GPU reads and draws, and the processor rewrote it at ENCODE time (the refresh:
+    # the seed moved, or HM_SHADOW_FRESH's once a buffer) while earlier committed buffers were still sampling or drawing
+    # it; the completion write-back read it while a later committed buffer was drawing it. A full-screen quad caught
+    # between its two triangles kept the old picture in one: the screenshots' (1125x2436, 4512-byte rows) diagonal split
+    # (IMG_0114: edges on the screen diagonal, 0.46 px a row) and the App Library's stale and ghosted snapshot (0112/0113).
+    # Now each such texture lists the committed buffers using it (readers until complete, writers until their write-back
+    # has run); a refresh waits for them, and a write-back is deferred to a later committed writer (whose own write-back,
+    # against the same base, carries both). 0 = as before.
+    ('static volatile long hm_surf_live, hm_surf_live_max, hm_shadow_copies, hm_shadow_forced;\n',
+     'static volatile long hm_surf_live, hm_surf_live_max, hm_shadow_copies, hm_shadow_forced;\n'
+     '/* (redfin hmv12) HM_SHADOW_WAIT: refreshes that waited for the GPU, the microseconds, waits cut at HM_SHADOW_WAIT_MS,\n'
+     ' * write-backs deferred to a later writer */\n'
+     'static volatile long hm_shadow_waits, hm_shadow_wait_us, hm_shadow_wait_cut, hm_shadow_wb_deferred, hm_shadow_fresh_put_off;\n'
+     'static int\nhm_shadow_wait(void)\n{\n'
+     '\tstatic int on = -1;\n\n'
+     '\tif (on < 0) {\n\t\tconst char *e = getenv("HM_SHADOW_WAIT");\n\n\t\ton = e == NULL || e[0] != \'0\';\n\t}\n'
+     '\treturn on;\n}\n'
+     'static double\nhm_shadow_wait_secs(void)\n{\n'
+     '\tstatic double secs = -1;\n\n'
+     '\tif (secs < 0) {\n\t\tconst char *e = getenv("HM_SHADOW_WAIT_MS");\n\n'
+     '\t\tsecs = (e != NULL && atoi(e) > 0 ? atoi(e) : 250) / 1e3;\n\t}\n'
+     '\treturn secs;\n}\n'),
+    ('\tunsigned long long _shadowFrame;   /* (redfin hmv8) hm_tr_frame() at its last refresh */\n',
+     '\tunsigned long long _shadowFrame;   /* (redfin hmv8) hm_tr_frame() at its last refresh */\n'
+     '\tNSMutableArray *_shadowUsers;      /* (redfin hmv12) HM_SHADOW_WAIT: { command buffer, writer } using the copy */\n'),
+    ('- (void)hakiosRefreshShadow;\n',
+     '- (void)hakiosRefreshShadow;\n'
+     '- (void)hakiosShadowUse:(id)cb writer:(BOOL)writer;   /* (redfin hmv12) */\n'
+     '- (void)hakiosWriteBackShadowFrom:(id)cb;\n'),
+    ('- (double)hakiosCreatedAt;\n',
+     '- (double)hakiosCreatedAt;\n- (BOOL)hakiosCommitted;   /* (redfin hmv12) */\n'),
+    ('- (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)hakios_metal_cb_status(_cb); }\n',
+     '- (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)hakios_metal_cb_status(_cb); }\n'
+     '- (BOOL)hakiosCommitted { return _committed; }   /* (redfin hmv12) a held commit too, before its send */\n'),
+    ('\t_shadowFrame = hm_tr_frame();\n',
+     '\tif (![self hakiosShadowWaitUsers:forced]) {   /* (redfin hmv12) HM_SHADOW_WAIT: no buffer still reading or drawing the copy */\n'
+     '\t\treturn;   /* (a forced refresh with buffers in flight: the next buffer tries again) */\n'
+     '\t}\n'
+     '\t_shadowFrame = hm_tr_frame();\n'),
+    ('- (void)hakiosRefreshShadow\n{\n',
+     '/* (redfin hmv12) HM_SHADOW_WAIT: CB reads (or, WRITER, draws and writes back) this copy. Readers stay listed until\n'
+     ' * their buffer completes, writers until their write-back has run; buffers not committed are not waited for (the one\n'
+     ' * being encoded), and one that only this list still holds was given up. */\n'
+     '- (void)hakiosShadowUse:(id)cb writer:(BOOL)writer\n{\n'
+     '\tif (_parent != nil) {\n\t\t[_parent hakiosShadowUse:cb writer:writer];\n\t\treturn;\n\t}\n'
+     '\tif (!_shadow || cb == nil || ![cb isKindOfClass:[HakiosMetalCommandBuffer class]] || !hm_shadow_wait()) {\n\t\treturn;\n\t}\n'
+     '\t@synchronized (self) {\n'
+     '\t\tif (_shadowUsers == nil) _shadowUsers = [[NSMutableArray alloc] init];\n'
+     '\t\t[self hakiosShadowPrune];\n'
+     '\t\tif (!writer) {\n'
+     '\t\t\tfor (NSArray *u in _shadowUsers) {\n'
+     '\t\t\t\tif ([u objectAtIndex:0] == cb) return;\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t\t[_shadowUsers addObject:[NSArray arrayWithObjects:cb, [NSNumber numberWithBool:writer], nil]];\n'
+     '\t}\n}\n\n'
+     '/* (lock held) readers whose buffer completed, and entries whose buffer nobody else holds */\n'
+     '- (void)hakiosShadowPrune\n{\n'
+     '\tNSMutableIndexSet *gone = [NSMutableIndexSet indexSet];\n\n'
+     '\tfor (NSUInteger i = 0; i < [_shadowUsers count]; i++) {\n'
+     '\t\tNSArray *u = [_shadowUsers objectAtIndex:i];\n'
+     '\t\tHakiosMetalCommandBuffer *b = [u objectAtIndex:0];\n\n'
+     '\t\tif ([b retainCount] <= 1 || (![[u objectAtIndex:1] boolValue] && hakios_metal_cb_status([b hakiosCommandBuffer]) >= HAKIOS_METAL_COMPLETED)) {\n'
+     '\t\t\t[gone addIndex:i];\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\t[_shadowUsers removeObjectsAtIndexes:gone];\n}\n\n'
+     '/* before the processor rewrites the copy: every committed buffer listed done with it (at most HM_SHADOW_WAIT_MS);\n'
+     ' * NO (and no wait) when ONLY_IF_IDLE and one is not: HM_SHADOW_FRESH\'s refresh with the seed unmoved is left to a\n'
+     ' * later buffer rather than stalling every frame behind the GPU */\n'
+     '- (BOOL)hakiosShadowWaitUsers:(BOOL)onlyIfIdle\n{\n'
+     '\tif (!hm_shadow_wait() || _shadowUsers == nil) {\n\t\treturn YES;\n\t}\n'
+     '\tconst double began = hm_now();\n'
+     '\tBOOL waited = NO;\n\n'
+     '\tfor (;;) {\n'
+     '\t\tBOOL busy = NO;\n\n'
+     '\t\t@synchronized (self) {\n'
+     '\t\t\t[self hakiosShadowPrune];\n'
+     '\t\t\tfor (NSArray *u in _shadowUsers) {\n'
+     '\t\t\t\tif ([(HakiosMetalCommandBuffer *)[u objectAtIndex:0] hakiosCommitted]) busy = YES;\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t\tif (!busy) break;\n'
+     '\t\tif (onlyIfIdle) {\n\t\t\t__sync_fetch_and_add(&hm_shadow_fresh_put_off, 1);\n\t\t\treturn NO;\n\t\t}\n'
+     '\t\tif (hm_now() - began > hm_shadow_wait_secs()) {\n'
+     '\t\t\t__sync_fetch_and_add(&hm_shadow_wait_cut, 1);\n'
+     '\t\t\tbreak;\n'
+     '\t\t}\n'
+     '\t\twaited = YES;\n'
+     '\t\tusleep(200);\n'
+     '\t}\n'
+     '\tif (waited) {\n'
+     '\t\t__sync_fetch_and_add(&hm_shadow_waits, 1);\n'
+     '\t\t__sync_fetch_and_add(&hm_shadow_wait_us, (long)((hm_now() - began) * 1e6));\n'
+     '\t}\n\treturn YES;\n}\n\n'
+     '/* the write-back of CB\'s drawing: deferred when a later committed buffer is still drawing the copy (reading it now\n'
+     ' * would catch that drawing half done); that buffer\'s write-back, against the same base, carries this one\'s too */\n'
+     '- (void)hakiosWriteBackShadowFrom:(id)cb\n{\n'
+     '\tif (_parent != nil) {\n\t\t[_parent hakiosWriteBackShadowFrom:cb];\n\t\treturn;\n\t}\n'
+     '\tBOOL later = NO;\n\n'
+     '\tif (hm_shadow_wait() && _shadowUsers != nil) {\n'
+     '\t\t@synchronized (self) {\n'
+     '\t\t\tfor (NSArray *u in _shadowUsers) {\n'
+     '\t\t\t\tHakiosMetalCommandBuffer *b = [u objectAtIndex:0];\n\n'
+     '\t\t\t\tif (b != cb && [[u objectAtIndex:1] boolValue] && [b hakiosCommitted] &&\n'
+     '\t\t\t\t    hakios_metal_cb_status([b hakiosCommandBuffer]) < HAKIOS_METAL_COMPLETED) {\n'
+     '\t\t\t\t\tlater = YES;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\tif (later) {\n'
+     '\t\t__sync_fetch_and_add(&hm_shadow_wb_deferred, 1);\n'
+     '\t} else {\n'
+     '\t\t[self hakiosWriteBackShadow];\n'
+     '\t}\n'
+     '\tif (_shadowUsers != nil) {\n'
+     '\t\t@synchronized (self) {\n'
+     '\t\t\tfor (NSUInteger i = 0; i < [_shadowUsers count]; i++) {\n'
+     '\t\t\t\tNSArray *u = [_shadowUsers objectAtIndex:i];\n\n'
+     '\t\t\t\tif ([u objectAtIndex:0] == cb && [[u objectAtIndex:1] boolValue]) {\n'
+     '\t\t\t\t\t[_shadowUsers removeObjectAtIndex:i];\n'
+     '\t\t\t\t\tbreak;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t}\n}\n\n'
+     '- (void)hakiosRefreshShadow\n{\n'),
+    ('\t\tCFRelease(_iosurface);\n\t}\n\tfree(_shadowBase);\n',
+     '\t\tCFRelease(_iosurface);\n\t}\n\tfree(_shadowBase);\n\t[_shadowUsers release];   /* (redfin hmv12) */\n'),
+    ('\t\t[(HakiosMetalTexture *)t hakiosRefreshShadow];\n\t\t{\n',
+     '\t\t[(HakiosMetalTexture *)t hakiosRefreshShadow];\n'
+     '\t\t[(HakiosMetalTexture *)t hakiosShadowUse:(id)cb writer:YES];   /* (redfin hmv12) HM_SHADOW_WAIT */\n\t\t{\n'),
+    ('\t\t\t\t(void)done;\n\t\t\t\t[drawn hakiosWriteBackShadow];\n',
+     '\t\t\t\t[drawn hakiosWriteBackShadowFrom:(id)done];   /* (redfin hmv12) */\n'),
+    ('\t[(HakiosMetalTexture *)texture hakiosRefreshShadow];\n'
+     '\tif ([(HakiosMetalTexture *)texture hakiosIsShadow] && ([(HakiosMetalTexture *)texture usage] & MTLTextureUsageShaderWrite) != 0) {\n',
+     '\t[(HakiosMetalTexture *)texture hakiosRefreshShadow];\n'
+     '\t[(HakiosMetalTexture *)texture hakiosShadowUse:_commandBuffer writer:NO];   /* (redfin hmv12) HM_SHADOW_WAIT */\n'
+     '\tif ([(HakiosMetalTexture *)texture hakiosIsShadow] && ([(HakiosMetalTexture *)texture usage] & MTLTextureUsageShaderWrite) != 0) {\n'
+     '\t\t[(HakiosMetalTexture *)texture hakiosShadowUse:_commandBuffer writer:YES];\n'),
+    ('\t\t\t[written hakiosWriteBackShadow];\n',
+     '\t\t\t[written hakiosWriteBackShadowFrom:cb];   /* (redfin hmv12) */\n'),
+    ('\ttable[index] = texture;\n\t[(HakiosMetalTexture *)texture hakiosRefreshShadow];\n',
+     '\ttable[index] = texture;\n\t[(HakiosMetalTexture *)texture hakiosRefreshShadow];\n'
+     '\t[(HakiosMetalTexture *)texture hakiosShadowUse:_commandBuffer writer:NO];   /* (redfin hmv12) HM_SHADOW_WAIT */\n'),
+    ('char line[700] = "", line2[800] = "";', 'char line[700] = "", line2[1200] = "";   /* (redfin hmv12) 800 -> 1200 */'),
+    ('\t\t\t\tmemcpy(xwas, xr, sizeof(xwas));\n\t\t\t\tcwas = copies, fwas = forced;\n',
+     '\t\t\t\t{   /* (redfin hmv12) HM_SHADOW_WAIT */\n'
+     '\t\t\t\t\tstatic long swas, uwas, cutwas, dwas, pwas;\n'
+     '\t\t\t\t\tconst long sw = hm_shadow_waits, us = hm_shadow_wait_us, cut = hm_shadow_wait_cut, d = hm_shadow_wb_deferred,\n'
+     '\t\t\t\t\t\t   po = hm_shadow_fresh_put_off;\n'
+     '\t\t\t\t\tconst int at4 = (int)strlen(line2);\n\n'
+     '\t\t\t\t\tsnprintf(line2 + at4, sizeof(line2) - (size_t)at4, "; copy refreshes that waited for the GPU %ld, %.1f ms avg, %ld cut "\n'
+     '\t\t\t\t\t\t "at the limit; write-backs deferred to a later writer %ld; unmoved-seed refreshes put off %ld (HM_SHADOW_WAIT)", sw - swas,\n'
+     '\t\t\t\t\t\t sw - swas ? (double)(us - uwas) / 1e3 / (double)(sw - swas) : 0.0, cut - cutwas, d - dwas, po - pwas);\n'
+     '\t\t\t\t\tswas = sw, uwas = us, cutwas = cut, dwas = d, pwas = po;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tmemcpy(xwas, xr, sizeof(xwas));\n\t\t\t\tcwas = copies, fwas = forced;\n'),
 ]
 
 
