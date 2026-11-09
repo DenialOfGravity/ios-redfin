@@ -648,6 +648,29 @@ std::unique_ptr<Bo> CommandQueue::takeCommandBo(size_t bytes, int* error) {
     return gpu_.newBo(std::max(bytes, kCommandBo), kBoGpuReadOnly | kBoWriteCombined, error);
 }
 
+// (redfin hmv8) HM_XR_SYNC: the kernel has one ring for every client and runs it in order, so the fence of an empty
+// submission made now passes only once everything any process submitted before it has run -- the GPU writes another
+// process (WebKit's GPU process, a Metal client on SweetMetal2) made into an IOSurface this process then reads on the
+// processor. Its IB (one CP_NOP) goes back to the pool only once passed; one the GPU has not passed in time is kept aside.
+int CommandQueue::ringBarrier(int64_t timeoutNs) {
+    int error = 0;
+    std::unique_ptr<Bo> bo = takeCommandBo(4, &error);
+    if (bo == nullptr || bo->cpu() == nullptr) return error != 0 ? error : ENOMEM;
+    const uint32_t nop = pm4::type7(pm4::kNop, 0);
+    memcpy(bo->cpu(), &nop, 4);
+    uint32_t fence = 0;
+    int e;
+    {
+        std::lock_guard<std::mutex> g(lock_);
+        e = gpu_.submit(id_, *bo, 0, 1, {}, &fence);
+    }
+    if (e == 0) e = gpu_.wait(id_, fence, timeoutNs);
+    std::lock_guard<std::mutex> g(lock_);
+    if (e == 0 || fence == 0) idle_.push_back(std::move(bo));
+    else barrierLate_.push_back(std::move(bo));
+    return e;
+}
+
 void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     cb->committedAt_ = gpu_.transport().nowNs();
     if (!cb->error_.empty()) {

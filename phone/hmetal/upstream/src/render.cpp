@@ -2857,6 +2857,18 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 // completion thread: one worker, a companion queued once however many buffers drew it before it ran.
 namespace {
 std::atomic<uint64_t> gPassSplits[4];   // (redfin hmv4) CommandBuffer::passSplits
+std::atomic<uint64_t> gXrStats[5];       // (redfin hmv8) CommandBuffer::xrStats
+// (redfin hmv8) HM_XR_SYNC: 0 off, else on (default 1) with HM_XR_SYNC_MS (default 50) the longest wait
+unsigned xrSyncMs() {
+    static const unsigned ms = [] {
+        const char* e = getenv("HM_XR_SYNC");
+        if (e != nullptr && e[0] == '0') return 0u;
+        const char* m = getenv("HM_XR_SYNC_MS");
+        const int v = m != nullptr && m[0] != 0 ? atoi(m) : 50;
+        return unsigned(v > 0 ? v : 50);
+    }();
+    return ms;
+}
 struct XrDrawn {
     std::shared_ptr<const Texture> source;
     std::shared_ptr<Texture::XrTarget> target;
@@ -2995,6 +3007,20 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
                     }
                 }
                 if (decoded == nullptr) {
+                    // (redfin hmv8) HM_XR_SYNC=1 (default): a surface's rows are read on the processor here, at encode
+                    // time, while what the GPU reads is ordered on the ring; another process's GPU writes into the
+                    // surface (submitted before CoreAnimation got its commit) may not have run yet. Once a buffer, before
+                    // its first decode of a surface: the ring passed everything submitted until now.
+                    if (t->surface() != 0 && !xrSynced_ && xrSyncMs() > 0) {
+                        xrSynced_ = true;
+                        const uint64_t t0 = queue_.gpu().transport().nowNs();
+                        const int e = queue_.ringBarrier(int64_t(xrSyncMs()) * 1000000);
+                        gXrStats[2]++;
+                        gXrStats[3] += (queue_.gpu().transport().nowNs() - t0) / 1000;
+                        if (e != 0) gXrStats[4]++;
+                    }
+                    gXrStats[0]++;
+                    if (t->surface() != 0) gXrStats[1]++;
                     std::shared_ptr<Texture> c = t->xrDecode(queue_.gpu(), &why);
                     if (c == nullptr) return refuseWork("an extended-range texture: " + why);
                     keepAlive(c);
@@ -3502,6 +3528,10 @@ bool CommandBuffer::append(CommandBuffer& other) {
     counts_.tiles += other.counts_.tiles;
     other.counts_ = Counts{};
     return true;
+}
+
+void CommandBuffer::xrStats(uint64_t out[5]) {
+    for (int i = 0; i < 5; i++) out[i] = gXrStats[i].load();
 }
 
 void CommandBuffer::passSplits(uint64_t out[4]) {

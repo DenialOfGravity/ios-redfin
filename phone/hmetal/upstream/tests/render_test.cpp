@@ -5867,6 +5867,50 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// (redfin hmv8) HM_XR_SYNC: an extended-range IOSurface (WebKit's 'w30r' tiles) is decoded on the processor at encode
+// time; before the first such decode of a buffer the ring is drained (an empty submission's fence waited for), so that
+// another process's GPU writes submitted before it have landed. Once per buffer, not per draw; none for a buffer without one.
+TEST(an_extended_range_surface_is_decoded_after_a_ring_barrier_once_a_buffer) {
+    Rig r;
+    r.fake->addSurface(31, 64, 16, 256, 0x77333072u);   // 'w30r'
+    TextureDesc d;
+    d.format = PixelFormat::kBGR10_XR;
+    d.width = 64;
+    d.height = 16;
+    d.usage = kTextureUsageRead;
+    std::string why;
+    auto x = Texture::wrapSurface(*r.gpu, 31, d, &why);
+    if (x == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    auto t = target(r, 64, 16);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {x.get()};
+    fsb.samplers = {&smp};
+    uint64_t s0[5], s1[5];
+    CommandBuffer::xrStats(s0);
+    const uint32_t submits0 = r.fake->stats().submits;
+    auto cb = r.queue->commandBuffer();
+    for (int i = 0; i < 3; i++) CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CommandBuffer::xrStats(s1);
+    CHECK_EQ(s1[2] - s0[2], 1u);   // one barrier
+    CHECK_EQ(s1[4] - s0[4], 0u);   // passed in time
+    CHECK_EQ(s1[1] - s0[1], 1u);   // one decode of the surface (the copy kept for the buffer's other draws)
+    CHECK_EQ(r.fake->stats().submits - submits0, 2u);   // the barrier's and the buffer's
+    auto cb2 = r.queue->commandBuffer();   // nothing extended-range: no barrier
+    CHECK(cb2->draw(flatProgram(), pass, wholeDraw(6), Bindings{}, Bindings{}));
+    cb2->commit();
+    cb2->waitUntilCompleted();
+    uint64_t s2[5];
+    CommandBuffer::xrStats(s2);
+    CHECK_EQ(s2[2], s1[2]);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 // (redfin hmv4) HM_XR_RT: a pass into an extended-range target is drawn into its RGBA16Float companion and, at the
 // buffer's completion, written back into the rows as XR codes; a texture over the rows samples the companion while it
 // is live. And decode then write-back gives every code back as it was (both twins, both layouts).

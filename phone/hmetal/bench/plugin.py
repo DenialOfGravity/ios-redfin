@@ -42,6 +42,11 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
   - (hmv7) HM_SPEC=2 (an uber shader drawn only through the program specialised for the draw's configuration, compiled
     on the spot), HM_DENY=word,... (pipelines whose label holds a word: the other pick, and their uber shaders as
     HM_SPEC=2), HM_HANG_BLAME=1 (default; after HM_HANG_BLAME_AFTER=2 hung buffers a program is drawn as HM_SPEC=2 draws it)
+  - (hmv8) HM_SHADOW_FRESH=1 (default): a read-only copy of an unaligned surface's rows made again once a command buffer
+    whatever its seed (0: only when the seed moved); HM_LOG_TIME=1 (default): the time of day in each line's prefix;
+    HM_TRACE's 10 s 'trace: surfaces:' line (live textures over IOSurfaces, row copies a s and forced ones, XR decodes,
+    ring barriers) and 'trace: display-sized surface N let go' (the display torn down: ms since the last buffer);
+    the core's HM_XR_SYNC (render.cpp) is set in the same env file
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -583,11 +588,32 @@ hm_tr_dump(const char *what, double ms)
 
 static unsigned long long hm_tr_frame(void) { return hm_tr.committed; }
 
+/* (redfin hmv8) surfaces: textures over an IOSurface alive now; copies of a surface's rows (-hakiosShadow:'s refreshes) and
+ * of them the ones made while the seed had not moved (HM_SHADOW_FRESH); the last buffer's numbers (display-off trace) */
+static volatile long hm_surf_live, hm_surf_live_max, hm_shadow_copies, hm_shadow_forced;
+static double hm_tr_last_done, hm_tr_last_enc, hm_tr_last_gpu;
+/* (redfin hmv8) HM_SHADOW_FRESH: 1 (default) a read-only copy of a surface's rows made again once a command buffer whatever
+ * its seed; 0 only when the seed moved (as before) */
+static int
+hm_shadow_fresh(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_SHADOW_FRESH");
+
+		on = e == NULL || e[0] != '0';
+	}
+	return on;
+}
+
 /* a buffer's numbers at its completion (seconds) */
 static void
 hm_tr_buffer(double encode, double commit, double gpu, double total)
 {
-	char line[700] = "";
+	char line[700] = "", line2[400] = "";
+
+	hm_tr_last_done = hm_now(), hm_tr_last_enc = encode, hm_tr_last_gpu = gpu;   /* (redfin hmv8) */
 
 	if (!hm_trace_on()) return;
 	hm_tr_event("buffer done: encode %.1f commit %.1f gpu %.1f ms", encode * 1e3, commit * 1e3, gpu * 1e3);
@@ -618,6 +644,22 @@ hm_tr_buffer(double encode, double commit, double gpu, double total)
 			snprintf(line + at, sizeof(line) - (size_t)at, "; passes reopened on the same target: %llu by a Clear, %llu by state, %llu by GMEM, "
 				 "%llu after a copy/dispatch/clear between", sp[0] - was[0], sp[1] - was[1], sp[2] - was[2], sp[3] - was[3]);
 			memcpy(was, sp, sizeof(was));
+			{   /* (redfin hmv8) the surfaces' line: live textures over IOSurfaces, copies a second, XR decodes and ring barriers */
+				static unsigned long long xwas[5];
+				static long cwas, fwas;
+				unsigned long long xr[5];
+				const double secs = now - hm_tr.since > 0 ? now - hm_tr.since : 1;
+				const long copies = hm_shadow_copies, forced = hm_shadow_forced;
+
+				hakios_metal_xr_stats(xr);
+				snprintf(line2, sizeof(line2), "trace: surfaces: %ld textures over IOSurfaces live (%ld most); row copies %.1f a s (%ld made "
+					 "with the seed unmoved: HM_SHADOW_FRESH); XR decodes %.1f a s (%llu of surfaces); ring barriers %llu, %.1f ms avg, "
+					 "%llu timed out (HM_XR_SYNC)", hm_surf_live, hm_surf_live_max, (copies - cwas) / secs, forced - fwas,
+					 (xr[0] - xwas[0]) / secs, xr[1] - xwas[1], xr[2] - xwas[2],
+					 xr[2] - xwas[2] ? (double)(xr[3] - xwas[3]) / 1e3 / (double)(xr[2] - xwas[2]) : 0.0, xr[4] - xwas[4]);
+				memcpy(xwas, xr, sizeof(xwas));
+				cwas = copies, fwas = forced;
+			}
 			hm_tr.since = now;
 			hm_tr.buffers = hm_tr.pipelines = hm_tr.hangs = 0;
 			hm_tr.encSum = hm_tr.encMax = hm_tr.comSum = hm_tr.comMax = hm_tr.gpuSum = hm_tr.gpuMax = hm_tr.pipeMs = hm_tr.pipeMax = 0;
@@ -625,6 +667,7 @@ hm_tr_buffer(double encode, double commit, double gpu, double total)
 	}
 	pthread_mutex_unlock(&hm_tr.lock);
 	if (line[0]) hm_print("%s\n", line);
+	if (line2[0]) hm_print("%s\n", line2);
 	if (total > 0.1) {
 		char what[160];
 
@@ -1128,6 +1171,8 @@ HMV7_FOR_NEW = r'''- (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buff
 		hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
 									 (unsigned)_specBinding, [key bytes], [key length]);
 		clock_gettime(CLOCK_MONOTONIC, &t1);
+		hm_tr_event("specialise (waited for) %s: %.0f ms", hakios_metal_program_name(_program),
+			    (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);   /* (redfin hmv8) */
 		hm_print("specialise (waited for, hmv7): %s for %u bytes of its buffer %d: %s%u instruction words, not %u, in %.0f ms\n",
 			 hakios_metal_program_name(_program), _specLength, _specBinding, p != NULL ? "" : "FAILED: ",
 			 p != NULL ? hakios_metal_program_stage_words(p, 1) : 0, hakios_metal_program_stage_words(_program, 1),
@@ -1409,6 +1454,57 @@ EDITS = [
     ('\t_specBinding = -1;\n\tif (hm_spec_off() || hakios_metal_program_stage_words(_program, 1) < 4096) return;\n',
      '\t_specBinding = -1;\n\tif (hakios_metal_program_stage_words(_program, 1) < 4096) return;   /* (redfin hmv7) kept with HM_SPEC=0 too */\n'),
     (HMV7_FOR_START, HMV7_FOR_END, HMV7_FOR_NEW),
+    ('static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));\n',
+     '#include <sys/time.h>   /* (redfin hmv8) HM_LOG_TIME */\n#include <time.h>\n'
+     'static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));\n'),
+    # (hmv8) HM_LOG_TIME=1 (default): the time of day in every line's prefix, inside the brackets (pull2.sh's sed keeps working)
+    ('\tn = snprintf(line, sizeof(line), "%s: ", who);\n',
+     '\t{   /* (redfin hmv8) HM_LOG_TIME */\n'
+     '\t\tstatic int stamp = -1;\n'
+     '\t\tif (stamp < 0) { const char *e = getenv("HM_LOG_TIME"); stamp = e == NULL || e[0] != \'0\'; }\n'
+     '\t\tif (stamp) {\n'
+     '\t\t\tstruct timeval tv;\n\t\t\tstruct tm tmv;\n'
+     '\t\t\tgettimeofday(&tv, NULL);\n\t\t\tlocaltime_r(&tv.tv_sec, &tmv);\n'
+     '\t\t\tn = snprintf(line, sizeof(line), "%.*s %02d:%02d:%02d.%03d]: ", (int)strlen(who) - 1, who, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,\n'
+     '\t\t\t\t     (int)(tv.tv_usec / 1000));\n'
+     '\t\t} else {\n\t\t\tn = snprintf(line, sizeof(line), "%s: ", who);\n\t\t}\n\t}\n'),
+    # (hmv8) the shadow copy's frame, for HM_SHADOW_FRESH
+    ('\tuint32_t _shadowSeed;\n',
+     '\tuint32_t _shadowSeed;\n\tunsigned long long _shadowFrame;   /* (redfin hmv8) hm_tr_frame() at its last refresh */\n'),
+    # (hmv8) HM_SHADOW_FRESH=1 (default): a read-only copy of a surface's rows is made again once a command buffer even when
+    # the seed has not moved: another process's GPU writes (SweetMetal2 in WebKit's GPU process) move no seed (the hmv4
+    # note), and the copy kept their old rows -- or none -- for as long as nothing else wrote the surface
+    ('\tif (!_shadow || _iosurface == NULL || (seed = IOSurfaceGetSeed(_iosurface)) == _shadowSeed) {\n\t\treturn;\n\t}\n',
+     '\tif (!_shadow || _iosurface == NULL) {\n\t\treturn;\n\t}\n'
+     '\tBOOL forced = NO;\n'
+     '\tif ((seed = IOSurfaceGetSeed(_iosurface)) == _shadowSeed) {   /* (redfin hmv8) HM_SHADOW_FRESH */\n'
+     '\t\tif (!hm_shadow_fresh() || _ycbcr != 0 || (_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0 ||\n'
+     '\t\t    _shadowFrame == hm_tr_frame()) {\n\t\t\treturn;\n\t\t}\n'
+     '\t\tforced = YES;\n\t}\n'
+     '\t_shadowFrame = hm_tr_frame();\n'
+     '\t__sync_fetch_and_add(&hm_shadow_copies, 1);\n'
+     '\tif (forced) __sync_fetch_and_add(&hm_shadow_forced, 1);\n'),
+    # (hmv8) live textures over IOSurfaces (HM_TRACE's surfaces line)
+    ('\tif (surface != NULL) {\n\t\tCFRetain(surface);\n\t}\n\tif (_iosurface != NULL) {\n\t\tCFRelease(_iosurface);\n\t}\n\t_iosurface = surface;\n',
+     '\tif (surface != NULL) {\n\t\tCFRetain(surface);\n\t}\n\tif (_iosurface != NULL) {\n\t\tCFRelease(_iosurface);\n\t}\n'
+     '\tif ((_iosurface == NULL) != (surface == NULL)) {   /* (redfin hmv8) */\n'
+     '\t\tconst long live = __sync_add_and_fetch(&hm_surf_live, surface != NULL ? 1 : -1);\n'
+     '\t\tif (live > hm_surf_live_max) hm_surf_live_max = live;\n\t}\n'
+     '\t_iosurface = surface;\n'),
+    # (hmv8) display-off trace: a texture over a display-sized surface let go (CA tears its display down on power-off), with
+    # the time since the last buffer completed and that buffer's numbers; and the live count
+    ('\tif (_iosurface != NULL) {\n\t\tCFRelease(_iosurface);\n\t}\n\tfree(_shadowBase);\n',
+     '\tif (_iosurface != NULL) {\n'
+     '\t\t__sync_fetch_and_sub(&hm_surf_live, 1);   /* (redfin hmv8) */\n'
+     '\t\tstatic int said;\n'
+     '\t\tif (hm_trace_on() && IOSurfaceGetWidth(_iosurface) * IOSurfaceGetHeight(_iosurface) >= 2000000 && _parent == nil &&\n'
+     '\t\t    (_usage & MTLTextureUsageRenderTarget) != 0 && said++ < 400) {\n'
+     '\t\t\thm_print("trace: display-sized surface %u (%zux%zu) let go (frame %llu, %.0f ms after the last buffer completed: encode %.1f GPU %.1f ms; "\n'
+     '\t\t\t\t "%ld textures over surfaces left)\\n", IOSurfaceGetID(_iosurface), IOSurfaceGetWidth(_iosurface), IOSurfaceGetHeight(_iosurface),\n'
+     '\t\t\t\t hm_tr_frame(), (hm_now() - hm_tr_last_done) * 1e3, hm_tr_last_enc * 1e3, hm_tr_last_gpu * 1e3, hm_surf_live);\n'
+     '\t\t\thm_tr_event("display-sized surface %u let go", IOSurfaceGetID(_iosurface));\n'
+     '\t\t}\n'
+     '\t\tCFRelease(_iosurface);\n\t}\n\tfree(_shadowBase);\n'),
     ('\thakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];\n',
      '\thakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];\n'
      '\tif (program == NULL) {   /* (redfin hmv7) an uber shader that may not run as it is, and no specialisation for this draw */\n'

@@ -342,6 +342,9 @@ public:
     // join that one: 0 it asked for a Clear, 1 its store/options/other attachments differ, 2 GMEM ended it, 3 something
     // else came between (a copy, a dispatch, a clear-only pass, a blit, the end of an encoder that closes) -- process-wide
     static void passSplits(uint64_t out[4]);
+    // (redfin hmv8) extended-range copies so far: [0] decoded on the processor (all), [1] of them over an IOSurface,
+    // [2] ring barriers before such a decode (HM_XR_SYNC), [3] microseconds waited in them, [4] barriers timed out
+    static void xrStats(uint64_t out[5]);
 private:
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
@@ -377,6 +380,7 @@ private:
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
     std::vector<std::pair<const Texture*, std::shared_ptr<Texture>>> xrDecoded_;   // (redfin hmv2) this buffer's decoded extended-range copies
+    bool xrSynced_ = false;   // (redfin hmv8) HM_XR_SYNC's ring barrier done for this buffer
     std::vector<std::pair<const void*, std::shared_ptr<void>>> xrDrawn_;   // (redfin hmv4) the XR companions it drew into (render.cpp)
     std::vector<std::function<void(CommandBuffer&)>> handlers_;
     std::mutex lock_;
@@ -451,6 +455,9 @@ public:
     // only now and then (CoreAnimation's: light frames between the heavy ones of an animation) counts as heavy
     uint32_t peakDraws(uint64_t kind, uint32_t ordinal);
     void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws);
+    // (redfin hmv8) until the GPU has run everything any client put on the ring before now (one ring, in order: an
+    // empty submission's fence covers it), or TIMEOUT_NS: 0, ETIMEDOUT or an errno. HM_XR_SYNC's barrier.
+    int ringBarrier(int64_t timeoutNs);
 
 
 private:
@@ -487,6 +494,7 @@ private:
     std::condition_variable changed_;
     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
     std::vector<std::unique_ptr<Bo>> idle_;
+    std::vector<std::unique_ptr<Bo>> barrierLate_;   // (redfin hmv8) a barrier's IB the GPU had not passed in time: never reused
     bool quit_ = false;
     std::thread thread_;
 };

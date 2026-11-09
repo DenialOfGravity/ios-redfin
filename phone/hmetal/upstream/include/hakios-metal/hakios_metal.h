@@ -85,6 +85,9 @@ void hakios_metal_compile_background(int on);
 /* (redfin hmv4) draw passes opened on the same colour target as the pass before them, by why they did not join it:
  * [0] a Clear asked, [1] store/options/attachments differ, [2] GMEM ended it, [3] a copy/dispatch/clear/blit between */
 void hakios_metal_pass_splits(unsigned long long out[4]);
+/* (redfin hmv8) extended-range copies: [0] decoded on the processor, [1] of them over an IOSurface, [2] ring barriers before
+ * such a decode (HM_XR_SYNC), [3] microseconds waited in them, [4] barriers that timed out */
+void hakios_metal_xr_stats(unsigned long long out[5]);
 /* (redfin hmv2) the encoder's one-time notices (a short constant binding padded, HM_CB_PAD) to FN instead of stderr */
 void hakios_metal_set_notice(void (*fn)(const char *text));
 

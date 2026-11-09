@@ -285,6 +285,12 @@ void hakios_metal_pass_splits(unsigned long long out[4]) {
     for (int i = 0; i < 4; i++) out[i] = v[i];
 }
 
+void hakios_metal_xr_stats(unsigned long long out[5]) {
+    uint64_t v[5];
+    CommandBuffer::xrStats(v);
+    for (int i = 0; i < 5; i++) out[i] = v[i];
+}
+
 void hakios_metal_set_notice(void (*fn)(const char*)) { render::setNotice(fn); }
 
 hakios_metal_library* hakios_metal_library_open(const void* data, size_t size) {
