@@ -12,7 +12,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <map>
+#include <thread>
 #include <vector>
 
 #include "hakios-metal/a6xx.hpp"
@@ -5863,4 +5865,65 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
         CHECK(std::string(cb->passSysmemWhy(0)).find("GMEM off") != std::string::npos);
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin hmv4) HM_XR_RT: a pass into an extended-range target is drawn into its RGBA16Float companion and, at the
+// buffer's completion, written back into the rows as XR codes; a texture over the rows samples the companion while it
+// is live. And decode then write-back gives every code back as it was (both twins, both layouts).
+TEST(an_extended_range_target_is_drawn_through_its_companion_and_written_back) {
+    Rig r;
+    auto t = target(r, 64, 32, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGR10_XR);
+    if (t == nullptr) return;
+    seed(*t);
+    auto cb = clearOnce(r, clearPass(t.get(), 0.25, 0.5, 1.0, 1.0));
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    // the write-back runs on a worker of its own after the completion: until the companion is no longer live
+    for (int i = 0; i < 400 && t->xrLive() != nullptr; i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(t->xrLive() == nullptr);
+    // codes round(v * 510 + 384): r 0.25 -> 512 (511.5 up), g 0.5 -> 639, b 1.0 -> 894; blue in bits 0-9
+    const uint32_t word = 894u | 639u << 10 | 512u << 20;
+    uint8_t want[4];
+    memcpy(want, &word, 4);
+    CHECK(allPixels(*t, want, 4));
+    {   // a draw into it is drawn (into the companion), not refused, and leaves it live until its write-back
+        RenderPass a;
+        a.color0 = t.get();
+        a.load = LoadAction::kLoad;
+        auto cb2 = r.queue->commandBuffer();
+        CHECK(cb2->draw(flatProgram(), a, wholeDraw(6), Bindings{}, Bindings{}));
+        CHECK(t->xrLive() != nullptr);
+        cb2->commit();
+        cb2->waitUntilCompleted();
+        CHECK(cb2->status() == CommandBuffer::kCompleted);
+        for (int i = 0; i < 400 && t->xrLive() != nullptr; i++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(t->xrLive() == nullptr);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
+    for (PixelFormat f : {PixelFormat::kBGR10_XR, PixelFormat::kBGR10_XR_sRGB, PixelFormat::kBGRA10_XR, PixelFormat::kBGRA10_XR_sRGB}) {
+        auto u = target(r, 1024, 2, kTextureUsageRenderTarget | kTextureUsageRead, f);
+        if (u == nullptr) continue;
+        const bool wide = u->info().bytesPerPixel == 8;
+        auto* rows = static_cast<uint8_t*>(u->contents());
+        for (uint32_t x = 0; x < 1024; x++) {
+            const uint32_t c = x, a = 1023 - x;
+            if (wide) {
+                const uint16_t w[4] = {uint16_t(c << 6), uint16_t(((c * 7) & 1023) << 6), uint16_t(((c * 13) & 1023) << 6), uint16_t((a < 384 ? 384 : a > 894 ? 894 : a) << 6)};
+                memcpy(rows + 8 * x, w, 8);
+            } else {
+                const uint32_t w = c | ((c * 7) & 1023) << 10 | ((c * 13) & 1023) << 20;
+                memcpy(rows + 4 * x, &w, 4);
+            }
+        }
+        std::vector<uint8_t> before(rows, rows + u->bytesPerRow());
+        std::string why;
+        auto x = u->xrTarget(*r.gpu, true, &why);
+        CHECK(x != nullptr);
+        if (x == nullptr) continue;
+        memset(rows, 0, u->bytesPerRow());
+        u->xrWriteBack(*x);
+        const bool same = memcmp(before.data(), rows, before.size()) == 0;
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "  %s: decode then write-back changed the codes\n", u->info().name);
+    }
 }

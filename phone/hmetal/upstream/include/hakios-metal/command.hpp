@@ -96,6 +96,8 @@ public:
     // a pass with no draw whose load action is Clear (render::encodeClear): the target filled with the clear colour, a
     // complete pass of its own. What an encoder that recorded no draw needs at its end; anything else is refused.
     bool clear(const RenderPass& pass, const render::Options& options = render::Options{});
+    // (redfin hmv4) PASS with its extended-range attachments drawn through their companions (render.cpp); false with *why
+    bool xrRedirect(const RenderPass& given, RenderPass* out, const RenderPass** use, std::string* why);
     // -copyFromTexture:...toTexture:... and the scaled copies under it: rectangle S of SRC's mip level SL into rectangle D
     // of DST's level DL by the 2D engine, a pass of its own (render::encodeBlit says what it takes)
     bool blit(const Texture& src, uint32_t srcLevel, render::BlitRect s, const Texture& dst, uint32_t dstLevel, render::BlitRect d, bool linear,
@@ -336,6 +338,7 @@ private:
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
     std::vector<std::pair<const Texture*, std::shared_ptr<Texture>>> xrDecoded_;   // (redfin hmv2) this buffer's decoded extended-range copies
+    std::vector<std::pair<const void*, std::shared_ptr<void>>> xrDrawn_;   // (redfin hmv4) the XR companions it drew into (render.cpp)
     std::vector<std::function<void(CommandBuffer&)>> handlers_;
     std::mutex lock_;
     std::condition_variable done_;

@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 #ifdef HAKIOS_METAL_MESA
 // Mesa's headers carry their own C++ guards (and templates behind them: no extern "C" around these) and are not clean
@@ -24,6 +26,8 @@ namespace hakios::metal {
 #ifndef HAKIOS_METAL_MESA
 
 bool hasCompiler() { return false; }
+CompileStats compileStats() { return CompileStats{}; }
+void setCompileBackground(bool) {}
 
 std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why, const FunctionConstants&) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
@@ -1318,17 +1322,64 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
 }
 }  // namespace
 
+// (redfin hmv4) Whose compile goes first. One compilation at a time (gCompilerLock), and a CoreAnimation uber shader
+// takes up to a second: the window server's render thread, asking for a pipeline it has not compiled before, waited
+// behind the specialiser's queue (hakios_metal_program_specialize, ~1 s each) and drew nothing for two seconds. A thread
+// marked background (hakios_metal_compile_background: the specialiser, the pre-warm) takes the compiler only while no
+// other thread waits for it (HM_COMPILE_PRIO=0: first come, as before); and a stage on disk is read without the lock.
+namespace {
+thread_local bool tBackground = false;
+thread_local CompileStats tStats;
+std::mutex gTurnLock;
+std::condition_variable gTurnFree;
+int gForegroundWaiting = 0;
+bool prioOn() {
+    static const bool on = [] { const char* e = getenv("HM_COMPILE_PRIO"); return e == nullptr || e[0] == 0 || atoi(e) != 0; }();
+    return on;
+}
+uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+// the compiler's lock, taken in turn: a background thread waits until no foreground one does
+class CompileTurn {
+public:
+    CompileTurn() {
+        const uint64_t t0 = nowNs();
+        const bool prio = prioOn();
+        if (prio && tBackground) {
+            std::unique_lock<std::mutex> g(gTurnLock);
+            gTurnFree.wait(g, [] { return gForegroundWaiting == 0; });
+        } else if (prio) {
+            std::lock_guard<std::mutex> g(gTurnLock);
+            gForegroundWaiting++;
+            counted_ = true;
+        }
+        lock_ = std::unique_lock<std::mutex>(gCompilerLock);
+        if (counted_) {
+            {
+                std::lock_guard<std::mutex> g(gTurnLock);
+                gForegroundWaiting--;
+            }
+            gTurnFree.notify_all();
+        }
+        tStats.waitNs += nowNs() - t0;
+    }
+private:
+    std::unique_lock<std::mutex> lock_;
+    bool counted_ = false;
+};
+}  // namespace
+
+void setCompileBackground(bool on) { tBackground = on; }
+CompileStats compileStats() { return tStats; }
+
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
                                            const KnownBuffer* known) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
-    if (theCompiler() == nullptr) {
-        refuse(why, noCompilerText());
-        return nullptr;
-    }
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
     const std::string cached = stageCacheWritable(name);
     if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) return s;
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
+            tStats.hits++;
+            return s;
+        }
     }
     if (!name.empty()) {
         const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
@@ -1337,9 +1388,22 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
             p = colon != nullptr ? colon + 1 : nullptr;
             if (dir.empty()) continue;
-            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) return s;
+            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
+                tStats.hits++;
+                return s;
+            }
         }
     }
+    CompileTurn turn;
+    if (theCompiler() == nullptr) {
+        refuse(why, noCompilerText());
+        return nullptr;
+    }
+    const uint64_t began = nowNs();
+    struct Count {
+        uint64_t began;
+        ~Count() { tStats.compileNs += nowNs() - began; tStats.misses++; }
+    } count{began};
     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {

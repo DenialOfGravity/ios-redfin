@@ -11,10 +11,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
 
 #include "hakios-metal/a6xx.hpp"
@@ -2843,12 +2846,119 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     return forgot;
 }
 
-bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsGiven, const Bindings& fsGiven,
+// (redfin hmv4) The extended-range colour attachments of a pass (HM_XR_RT=1): each replaced by its RGBA16Float companion
+// (Texture::xrTarget), whose texels the pass loads decoded from the surface when it loads and the companion is not live.
+// The buffer then writes each companion back into its surface's rows when it completes (HM_XR_WB=1), off the queue's
+// completion thread: one worker, a companion queued once however many buffers drew it before it ran.
+namespace {
+struct XrDrawn {
+    std::shared_ptr<const Texture> source;
+    std::shared_ptr<Texture::XrTarget> target;
+    uint64_t at = 0;   // the target's state after this buffer's last draw into it
+};
+class XrWriteBacks {
+public:
+    static XrWriteBacks& the() {
+        static XrWriteBacks* w = new XrWriteBacks;   // (never destroyed: its thread runs for the process)
+        return *w;
+    }
+    void post(const XrDrawn& d) {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            for (XrDrawn& q : q_) {
+                if (q.target == d.target) {   // queued already: the later state, and the source that drew it
+                    q = d;
+                    return;
+                }
+            }
+            q_.push_back(d);
+        }
+        more_.notify_one();
+    }
+private:
+    XrWriteBacks() : thread_([this] { run(); }) { thread_.detach(); }
+    void run() {
+        std::unique_lock<std::mutex> g(m_);
+        for (;;) {
+            more_.wait(g, [this] { return !q_.empty(); });
+            XrDrawn d = q_.front();
+            q_.pop_front();
+            g.unlock();
+            {
+                std::lock_guard<std::mutex> w(d.target->wb);
+                d.source->xrWriteBack(*d.target);
+            }
+            d.target->settled(d.at);
+            d = XrDrawn{};
+            g.lock();
+        }
+    }
+    std::mutex m_;
+    std::condition_variable more_;
+    std::deque<XrDrawn> q_;
+    std::thread thread_;
+};
+}  // namespace
+
+bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const RenderPass** use, std::string* why) {
+    *use = &given;
+    auto xrOf = [](const Texture* t) { return t != nullptr && t->info().xr != 0; };
+    bool any = xrOf(given.color0);
+    for (const ColorAttachment& a : given.more) any = any || xrOf(a.texture);
+    if (!any) return true;
+    *out = given;
+    auto redirect = [&](const Texture*& t, uint32_t level, LoadAction load) -> bool {
+        if (!xrOf(t)) return true;
+        if (level != 0) return render::refuse(why, std::string("a ") + t->info().name + " colour attachment at level " + render::n(level) + ": its companion has one level");
+        std::shared_ptr<Texture::XrTarget> x = t->xrTarget(queue_.gpu(), load == LoadAction::kLoad, why);
+        if (x == nullptr) return false;
+        const uint64_t at = x->drew();
+        keepAlive(x);
+        bool found = false;
+        for (auto& [key, rec] : xrDrawn_) {
+            if (key == x.get()) {
+                static_cast<XrDrawn*>(rec.get())->at = at;
+                found = true;
+            }
+        }
+        if (!found) {
+            auto rec = std::make_shared<XrDrawn>();
+            rec->source = Texture::byResourceId(t->resourceId());
+            rec->target = x;
+            rec->at = at;
+            if (xrDrawn_.empty() && Texture::xrWriteBackMode() != 0) {
+                addCompletedHandler([](CommandBuffer& cb) {
+                    if (cb.status() != kCompleted) return;
+                    for (auto& [key, r] : cb.xrDrawn_) {
+                        const XrDrawn* d = static_cast<const XrDrawn*>(r.get());
+                        if (d->source != nullptr) XrWriteBacks::the().post(*d);
+                    }
+                    cb.xrDrawn_.clear();
+                });
+            }
+            xrDrawn_.emplace_back(x.get(), rec);
+        }
+        t = x->tex.get();
+        return true;
+    };
+    if (!redirect(out->color0, out->level, out->load)) return false;
+    for (ColorAttachment& a : out->more) {
+        if (!redirect(a.texture, a.level, a.load)) return false;
+    }
+    *use = out;
+    return true;
+}
+
+bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, const Draw& d, const Bindings& vsGiven, const Bindings& fsGiven,
                          const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
     std::string why;
+    RenderPass xrPass;
+    const RenderPass* passIn = &passGiven;
+    if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
+    const RenderPass& pass = *passIn;
     // (redfin hmv2) an extended-range texture (BGR10_XR...) is sampled through its decoded copy (Texture::xrDecode, HM_XR=1),
     // decoded once per command buffer and kept until it completes
     Bindings vsXr, fsXr;
@@ -2862,6 +2972,14 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                 const Texture* decoded = nullptr;
                 for (const auto& [src, copy] : xrDecoded_) {
                     if (src == t) decoded = copy.get();
+                }
+                // (redfin hmv4) what a pass drew into it last, not yet in its rows: the companion itself
+                if (decoded == nullptr) {
+                    if (std::shared_ptr<Texture::XrTarget> live = t->xrLive()) {
+                        keepAlive(live);
+                        xrDecoded_.emplace_back(t, live->sample);
+                        decoded = live->sample.get();
+                    }
                 }
                 if (decoded == nullptr) {
                     std::shared_ptr<Texture> c = t->xrDecode(queue_.gpu(), &why);
@@ -3462,12 +3580,16 @@ void CommandBuffer::closePass() {
     open_.reset();
 }
 
-bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options) {
+bool CommandBuffer::clear(const RenderPass& passGiven, const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("clear after commit");
     }
     closePass();
     std::string why;
+    RenderPass xrPass;
+    const RenderPass* passIn = &passGiven;
+    if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
+    const RenderPass& pass = *passIn;
     Piece table;
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the pass's table: ") + why);

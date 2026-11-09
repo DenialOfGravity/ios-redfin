@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "hakios-metal/a6xx.hpp"
@@ -358,6 +359,39 @@ public:
     // the _sRGB twins' through the sRGB curve extended by symmetry, BGR10_XR's alpha 1. Two copies in turn, so that the
     // one a command buffer still on the GPU reads is not rewritten under it by the next. nullptr with *why
     std::shared_ptr<Texture> xrDecode(Gpu& gpu, std::string* why) const;
+    // (redfin hmv4) HM_XR_RT=1 (default): an extended-range texture drawn into. No A6xx format writes the XR codes, so
+    // a pass into one draws into an RGBA16Float companion of the same size (values as Metal's shader writes them, the
+    // _sRGB twins' linear), shared by every Texture over the same IOSurface. LIVE while the companion holds what was
+    // drawn last and the surface's rows do not yet: draws sample the companion then (xrLive), not a decoded copy of
+    // stale rows. At the completion of a buffer that drew it the companion is written back into the rows as XR codes
+    // (HM_XR_WB=1, default) and LIVE drops unless a later buffer drew it again (GEN). Before this a draw into an XR
+    // target was refused: the snapshots CoreAnimation renders that way (rotation, app switcher, unlock) kept whatever
+    // the surface held before -- an old landscape frame, or black.
+    struct XrTarget {
+        std::shared_ptr<Texture> tex;      // RGBA16Float, read | render target
+        std::shared_ptr<Texture> sample;   // what a draw samples: tex, or (BGR10_XR) tex with alpha read as 1
+        // bit 0 LIVE, above it GEN, the draws into it so far: a write-back drops LIVE only if no draw came after its own
+        std::atomic<uint64_t> state{0};
+        std::mutex wb;                     // one write-back (or decode into it) at a time
+        bool live() const { return (state.load() & 1) != 0; }
+        uint64_t drew() {                  // a draw into it: GEN + 1 and LIVE; the new state
+            uint64_t old = state.load(), now;
+            do now = (((old >> 1) + 1) << 1) | 1; while (!state.compare_exchange_weak(old, now));
+            return now;
+        }
+        bool settled(uint64_t at) {        // after the write-back of what state AT drew: not live, unless drawn since
+            return state.compare_exchange_strong(at, at & ~uint64_t(1));
+        }
+    };
+    // the companion to draw into in this texture's place, its texels decoded first from the rows when LOAD and it is
+    // not live (a pass that loads what the surface holds); nullptr with *why
+    std::shared_ptr<XrTarget> xrTarget(Gpu& gpu, bool load, std::string* why) const;
+    // the companion when it is live (holds newer texels than the rows), else nullptr
+    std::shared_ptr<XrTarget> xrLive() const;
+    // the companion's texels into this texture's rows as XR codes (the GPU is done with the buffer that drew them)
+    void xrWriteBack(const XrTarget& t) const;
+    static int xrRenderMode();   // HM_XR_RT: 1 (default) draw through the companion, 0 refuse as before
+    static int xrWriteBackMode();   // HM_XR_WB: 1 (default) write back at completion, 0 never (the companion stays live)
 
 private:
     static std::shared_ptr<Texture> wrapTwoPlanes(std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const std::string& name, const TextureDesc& desc,
@@ -386,6 +420,8 @@ private:
     mutable std::atomic<bool> stale_{false};
     mutable std::shared_ptr<Texture> xrCopy_[2];
     mutable std::atomic<uint32_t> xrNext_{0};
+    mutable std::shared_ptr<XrTarget> xrTarget_;   // (redfin hmv4) xrTarget's, under xrLock()
+    void xrDecodeInto(uint8_t* out, uint64_t outPitch) const;   // the rows decoded as RGBA16Float texels
 public:
     const Texture* staging() const { return staging_.get(); }
     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in

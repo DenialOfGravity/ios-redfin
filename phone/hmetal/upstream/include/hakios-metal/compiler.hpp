@@ -133,6 +133,15 @@ struct KnownBuffer {
     uint32_t binding = 0;
     std::vector<uint8_t> bytes;
 };
+// (redfin hmv4) this thread's compiles: time waiting for the compiler, time compiling, stages read from the disk cache
+// (hits) and compiled (misses), since the thread began; and whether the thread is background (its compiles wait while a
+// foreground thread waits: compiler.cpp CompileTurn, HM_COMPILE_PRIO)
+struct CompileStats {
+    uint64_t waitNs = 0, compileNs = 0;
+    uint32_t hits = 0, misses = 0;
+};
+CompileStats compileStats();
+void setCompileBackground(bool on);
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
                                            uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):

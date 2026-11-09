@@ -32,6 +32,11 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
   - (hmv3) HM_GMEM=0 (default: every pass sysmem) | 1 (upstream's metal_gmem_draws rule) | N (GMEM from N draws), ",T"
     at most T tiles; HM_PROF's frames are the buffers that drew the display's IOSurface when nothing is presented
     (the window server presents no drawable), and its classes carry colour attachment 0's load/store actions
+  - (hmv4) HM_TRACE=1 (pipelines' ms and their compiler share, 10 s buffer summaries, hangs past 100 ms with the last
+    20 events, stalls of an open buffer sampled, ca_prof by HM_CA_PROF_US); HM_PREWARM=1 (default; HM_PREWARM_DELAY s,
+    default 30) QuartzCore's library's pipelines made once in the background into the disk cache; the specialiser's
+    compiles background ones (core: HM_COMPILE_PRIO); HM_XR10=0 (default) no XR10 formats offered and 550/551 as BGRA8,
+    as SweetMetal2 does
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -488,6 +493,354 @@ DRAW_OLD2 = '_vsHighest, _fsHighest, hakios_metal_error());\n\t\thakios_metal_cb
 DRAW_NEW2 = ('_vsHighest, _fsHighest, hakios_metal_error(), hm_ca_info_of([_pipeline hakiosProgram]));   /* (redfin hmvar) */\n'
              '\t\thakios_metal_cb_refuse(cb, hakios_metal_error());')
 
+HMV4_HELPERS = r'''
+/* (redfin hmv4) HM_TRACE=1: what the window server's hangs are made of, cheap enough to leave on.
+ *   - every pipeline made: its ms, of them waiting for the compiler, stages compiled and read from the disk cache, the
+ *     frame (command buffers committed so far) and the thread ("trace: pipeline ..."; a pipeline past 50 ms is said
+ *     even without HM_TRACE)
+ *   - every 10 s: the buffers' encode (made to committed), commit (the call) and GPU (committed to completed) ms,
+ *     average and most; the pipelines made and their ms
+ *   - a buffer past 100 ms from made to completed: "trace: HANG" and the last 20 events (buffers, pipelines, the
+ *     specialiser, write-backs)
+ *   - a buffer still open (made, not committed) past 100 ms: the thread that made it sampled every 25 ms, its frames
+ *     ("trace: stall N ms: ...", at most 40 a stall): where the render thread is while nothing is committed
+ *   - the ca_prof sampler (every thread every HM_CA_PROF_US, default 25000 us: top stacks every 400 looks, 10 s) when
+ *     the boot-arg ca_prof= is absent; HM_CA_PROF_US=0 leaves it off */
+static int
+hm_trace_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_TRACE");
+		on = e != NULL && atoi(e) != 0;
+	}
+	return on;
+}
+
+#define HM_TR_RING 64
+static struct {
+	pthread_mutex_t lock;
+	unsigned next;
+	struct { double t; char what[160]; } ev[HM_TR_RING];
+	double since;
+	unsigned buffers, hangs, pipelines;
+	double encSum, encMax, comSum, comMax, gpuSum, gpuMax, pipeMs, pipeMax;
+	unsigned long long committed;
+} hm_tr = { PTHREAD_MUTEX_INITIALIZER };
+static volatile double hm_tr_open_at;           /* the oldest buffer made and not yet committed (0: none) */
+static volatile mach_port_t hm_tr_open_thread;   /* ...the thread that made it */
+
+static void hm_tr_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void
+hm_tr_event(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!hm_trace_on()) return;
+	pthread_mutex_lock(&hm_tr.lock);
+	{
+		typeof(hm_tr.ev[0]) *e = &hm_tr.ev[hm_tr.next++ % HM_TR_RING];
+
+		e->t = hm_now();
+		va_start(ap, fmt);
+		vsnprintf(e->what, sizeof(e->what), fmt, ap);
+		va_end(ap);
+	}
+	pthread_mutex_unlock(&hm_tr.lock);
+}
+
+static void
+hm_tr_dump(const char *what, double ms)
+{
+	typeof(hm_tr.ev[0]) copy[20];
+	unsigned n = 0, next;
+	const double now = hm_now();
+
+	pthread_mutex_lock(&hm_tr.lock);
+	next = hm_tr.next;
+	for (unsigned i = next >= 20 ? next - 20 : 0; i < next; i++) copy[n++] = hm_tr.ev[i % HM_TR_RING];
+	hm_tr.hangs++;
+	pthread_mutex_unlock(&hm_tr.lock);
+	hm_print("trace: HANG %s %.0f ms (frame %llu); the last %u events:\n", what, ms, hm_tr.committed, n);
+	for (unsigned i = 0; i < n; i++) hm_print("trace:   %7.1f ms ago: %s\n", (now - copy[i].t) * 1e3, copy[i].what);
+}
+
+static unsigned long long hm_tr_frame(void) { return hm_tr.committed; }
+
+/* a buffer's numbers at its completion (seconds) */
+static void
+hm_tr_buffer(double encode, double commit, double gpu, double total)
+{
+	char line[400] = "";
+
+	if (!hm_trace_on()) return;
+	hm_tr_event("buffer done: encode %.1f commit %.1f gpu %.1f ms", encode * 1e3, commit * 1e3, gpu * 1e3);
+	pthread_mutex_lock(&hm_tr.lock);
+	{
+		const double now = hm_now();
+
+		if (hm_tr.since == 0) hm_tr.since = now;
+		hm_tr.buffers++;
+		hm_tr.encSum += encode, hm_tr.comSum += commit, hm_tr.gpuSum += gpu;
+		if (encode > hm_tr.encMax) hm_tr.encMax = encode;
+		if (commit > hm_tr.comMax) hm_tr.comMax = commit;
+		if (gpu > hm_tr.gpuMax) hm_tr.gpuMax = gpu;
+		if (now - hm_tr.since >= 10.0) {
+			const double b = hm_tr.buffers ? hm_tr.buffers : 1;
+
+			snprintf(line, sizeof(line), "trace: %.1f s: %u buffers (%.1f a s); encode %.2f ms avg %.1f most; commit %.2f avg %.1f most; "
+				 "GPU %.2f avg %.1f most; %u pipelines made in %.0f ms (%.0f most); %u hangs past 100 ms",
+				 now - hm_tr.since, hm_tr.buffers, hm_tr.buffers / (now - hm_tr.since), hm_tr.encSum / b * 1e3, hm_tr.encMax * 1e3,
+				 hm_tr.comSum / b * 1e3, hm_tr.comMax * 1e3, hm_tr.gpuSum / b * 1e3, hm_tr.gpuMax * 1e3, hm_tr.pipelines, hm_tr.pipeMs,
+				 hm_tr.pipeMax, hm_tr.hangs);
+			hm_tr.since = now;
+			hm_tr.buffers = hm_tr.pipelines = hm_tr.hangs = 0;
+			hm_tr.encSum = hm_tr.encMax = hm_tr.comSum = hm_tr.comMax = hm_tr.gpuSum = hm_tr.gpuMax = hm_tr.pipeMs = hm_tr.pipeMax = 0;
+		}
+	}
+	pthread_mutex_unlock(&hm_tr.lock);
+	if (line[0]) hm_print("%s\n", line);
+	if (total > 0.1) {
+		char what[160];
+
+		snprintf(what, sizeof(what), "a buffer made to completed (encode %.0f, commit %.0f, GPU %.0f ms):", encode * 1e3, commit * 1e3, gpu * 1e3);
+		hm_tr_dump(what, total * 1e3);
+	}
+}
+
+/* a pipeline made: its ms and what of them the compiler's (the thread's compile stats before and after) */
+static void
+hm_tr_pipeline(NSString *label, double ms, double waitMs, double compileMs, unsigned compiled, unsigned cached)
+{
+	char name[64] = "";
+	const BOOL isMain = pthread_main_np() != 0;
+
+	pthread_getname_np(pthread_self(), name, sizeof(name));
+	if (hm_trace_on()) {
+		pthread_mutex_lock(&hm_tr.lock);
+		hm_tr.pipelines++;
+		hm_tr.pipeMs += ms;
+		if (ms > hm_tr.pipeMax) hm_tr.pipeMax = ms;
+		pthread_mutex_unlock(&hm_tr.lock);
+		hm_tr_event("pipeline %s: %.0f ms (wait %.0f, compile %.0f; %u compiled, %u cached) on %s", label != nil ? [label UTF8String] : "(no label)",
+			    ms, waitMs, compileMs, compiled, cached, name[0] ? name : isMain ? "main" : "(unnamed)");
+	}
+	if (hm_trace_on() || ms > 50) {
+		hm_print("trace: pipeline %s: %.0f ms (waited %.0f for the compiler, compiling %.0f; %u stages compiled, %u from the disk cache), "
+			 "frame %llu, thread %s\n", label != nil ? [label UTF8String] : "(no label)", ms, waitMs, compileMs, compiled, cached,
+			 hm_tr_frame(), name[0] ? name : isMain ? "main" : "(unnamed)");
+	}
+}
+
+/* the stall sampler: the thread with a buffer open past 100 ms, its frames every 25 ms */
+static void *
+hm_tr_watch(__unused void *argument)
+{
+	double stallAt = 0;
+	unsigned said = 0;
+
+	pthread_setname_np("hakios.trace.watch");
+	for (;;) {
+		usleep(25000);
+		const double opened = hm_tr_open_at;
+		const mach_port_t t = hm_tr_open_thread;
+
+		if (opened == 0 || t == MACH_PORT_NULL || hm_now() - opened < 0.1) {
+			continue;
+		}
+		if (opened != stallAt) {
+			stallAt = opened;
+			said = 0;
+		}
+		if (said++ >= 40) continue;
+		{
+			arm_thread_state64_t st;
+			mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+			uint64_t frames[12] = { 0 };
+			unsigned depth = 0;
+			char line[1400];
+			int at;
+
+			if (thread_suspend(t) != KERN_SUCCESS) continue;
+			if (thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&st, &count) == KERN_SUCCESS) {
+				uint64_t sp = arm_thread_state64_get_sp(st), fp = arm_thread_state64_get_fp(st), top = 0;
+				pthread_t pt = pthread_from_mach_thread_np(t);
+
+				if (pt != NULL) top = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(pt);
+				frames[depth++] = arm_thread_state64_get_pc(st);
+				frames[depth++] = arm_thread_state64_get_lr(st);
+				while (depth < 12 && top != 0 && fp >= sp && fp + 16 <= top && (fp & 15) == 0) {
+					const uint64_t *record = (const uint64_t *)(uintptr_t)fp;
+
+					frames[depth++] = record[1];
+					if (record[0] <= fp) break;
+					fp = record[0];
+				}
+			}
+			thread_resume(t);
+			at = snprintf(line, sizeof(line), "trace: stall %.0f ms (frame %llu):", (hm_now() - opened) * 1e3, hm_tr_frame());
+			for (unsigned d = 0; d < depth && at < (int)sizeof(line) - 100; d++) {
+				Dl_info where = { 0 };
+				const char *image = "?", *slash;
+				uint64_t a = frames[d] & 0x7fffffffffull, offset = a;   /* (the pointer's authentication bits off) */
+
+				if (a == 0) continue;
+				if (dladdr((void *)(uintptr_t)a, &where) != 0 && where.dli_fname != NULL) {
+					image = (slash = strrchr(where.dli_fname, '/')) != NULL ? slash + 1 : where.dli_fname;
+					offset -= (uint64_t)(uintptr_t)where.dli_fbase;
+				}
+				at += snprintf(line + at, sizeof(line) - (size_t)at, " %s+0x%llx(%s)", image, (unsigned long long)offset,
+					       where.dli_sname != NULL ? where.dli_sname : "?");
+			}
+			hm_print("%s\n", line);
+		}
+	}
+	return NULL;
+}
+
+/* a buffer made (the thread that made it is the one the sampler looks at while it stays open) */
+static void
+hm_tr_made(void)
+{
+	static dispatch_once_t once;
+
+	if (!hm_trace_on()) return;
+	dispatch_once(&once, ^{
+		pthread_t watcher;
+		pthread_create(&watcher, NULL, hm_tr_watch, NULL);
+		hm_print("trace: HM_TRACE=1: pipelines, 10 s buffer summaries, hangs past 100 ms with their last 20 events, stalls sampled\n");
+	});
+	if (hm_tr_open_at == 0) {
+		hm_tr_open_thread = pthread_mach_thread_np(pthread_self());
+		hm_tr_open_at = hm_now();
+	}
+}
+
+static void
+hm_tr_committed(double encode)
+{
+	if (!hm_trace_on()) return;
+	hm_tr_open_at = 0;
+	__atomic_add_fetch(&hm_tr.committed, 1, __ATOMIC_RELAXED);
+	if (encode > 0.05) hm_tr_event("buffer committed after %.0f ms of encoding", encode * 1e3);
+}
+
+/* (redfin hmv4) HM_PREWARM=1 (default): every pipeline QuartzCore's library names made once on a thread of its own, at
+ * background priority, HM_PREWARM_DELAY s (default 30) after the library opened, one at a time with a pause between, its
+ * compiles waiting while the render thread wants the compiler (hakios_metal_compile_background, HM_COMPILE_PRIO). Each
+ * stage lands in the disk cache (HM_CACHE_DIR), which outlives the process, so a pipeline CoreAnimation first asks for
+ * later -- a rotation, an app's first launch -- is a read of the cache, not a compile of up to a second on the render
+ * thread. The pipelines themselves are released at once. A run that found everything cached already says so in one line. */
+static int
+hm_prewarm_on(void)
+{
+	const char *e = getenv("HM_PREWARM");
+	return e == NULL || e[0] == 0 || atoi(e) != 0;
+}
+
+static void
+hm_prewarm_start(id library, NSString *path)
+{
+	static dispatch_once_t once;
+
+	if (library == nil || !hm_prewarm_on() || [path rangeOfString:@"QuartzCore.framework"].location == NSNotFound ||
+	    ![library respondsToSelector:@selector(pipelineNames)]) {
+		return;
+	}
+	dispatch_once(&once, ^{
+		const char *d = getenv("HM_PREWARM_DELAY");
+		const double delay = d != NULL && d[0] ? atof(d) : 30.0;
+		id held = [library retain];
+
+		hm_ca_load();
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+			SEL make = sel_registerName("newRenderPipelineStateWithName:options:reflection:error:");
+			NSArray *names = [[library pipelineNames] copy];
+			const double began = hm_now();
+			double w0 = 0, c0 = 0, w1 = 0, c1 = 0;
+			unsigned h0 = 0, m0 = 0, h1 = 0, m1 = 0, made = 0, failed = 0;
+
+			pthread_setname_np("hakios.prewarm");
+			hakios_metal_compile_background(1);
+			hakios_metal_compile_stats(&w0, &c0, &h0, &m0);
+			if (![held respondsToSelector:make]) {
+				hm_print("prewarm: the pipeline library answers no -newRenderPipelineStateWithName:...; nothing made\n");
+				[names release];
+				[held release];
+				return;
+			}
+			hm_print("prewarm: %lu pipelines of %s, one at a time in the background\n", (unsigned long)[names count], [path fileSystemRepresentation]);
+			for (NSString *name in names) {
+				@autoreleasepool {
+					NSError *error = nil;
+					unsigned mm = 0;
+					id state;
+
+					hakios_metal_compile_stats(NULL, NULL, NULL, &mm);
+					state = ((id (*)(id, SEL, NSString *, NSUInteger, id *, NSError **))objc_msgSend)(held, make, name, 0, NULL, &error);
+					if (state != nil) made++; else failed++;
+					[state release];
+					{
+						unsigned after = 0;
+						hakios_metal_compile_stats(NULL, NULL, NULL, &after);
+						if (after != mm) usleep(20000);   /* (a compile happened: the render thread's turn for a moment) */
+					}
+					if ((made + failed) % 100 == 0) {
+						hakios_metal_compile_stats(&w1, &c1, &h1, &m1);
+						hm_print("prewarm: %u of %lu made (%u refused), %u stages compiled, %u from the cache, %.0f s\n", made + failed,
+							 (unsigned long)[names count], failed, m1 - m0, h1 - h0, hm_now() - began);
+					}
+				}
+			}
+			hakios_metal_compile_stats(&w1, &c1, &h1, &m1);
+			hm_print("prewarm: done: %u pipelines made, %u refused; %u stages compiled (%.0f s compiling, %.0f s waiting for the render "
+				 "thread), %u from the disk cache; %.0f s in all\n", made, failed, m1 - m0, (c1 - c0) / 1e3, (w1 - w0) / 1e3, h1 - h0,
+				 hm_now() - began);
+			[names release];
+			[held release];
+		});
+	});
+}
+
+/* (redfin hmv4) HM_XR10=0 (default): no extended-range 10-bit formats, as SweetMetal2 answers (NativeBridgeMetalFrontend.mm:
+ * supportsExtendedXR10Formats 0, and 550/551 made BGRA8Unorm(_sRGB)). Asked nothing, _MTLDevice's answer let CoreAnimation
+ * draw its snapshots and wide-colour layers into BGR10_XR targets (refused here until HM_XR_RT) and ask for
+ * MTLPixelFormatRGB10A8_2P_XR10 (550) textures, which no table here has: the rotation's and the app switcher's snapshots
+ * then showed what their surfaces held before, an old landscape frame or black. HM_XR10=1: the device's own answer. */
+static int
+hm_xr10_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_XR10");
+		on = e != NULL && atoi(e) != 0;
+	}
+	return on;
+}
+
+static MTLPixelFormat
+hm_xr10_format(MTLPixelFormat f)
+{
+	if (hm_xr10_on() || (f != (MTLPixelFormat)550 && f != (MTLPixelFormat)551)) return f;
+	{
+		static int said;
+		if (!said++) hm_print("HM_XR10=0: pixel format %lu (RGB10A8_2P_XR10) served as BGRA8Unorm%s, as SweetMetal2 does\n", (unsigned long)f, f == 551 ? "_sRGB" : "");
+	}
+	return f == (MTLPixelFormat)550 ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatBGRA8Unorm_sRGB;
+}
+
+static MTLTextureDescriptor *
+hm_xr10_descriptor(MTLTextureDescriptor *d)
+{
+	if (d == nil || hm_xr10_format([d pixelFormat]) == [d pixelFormat]) return d;
+	d = [[d copy] autorelease];
+	[d setPixelFormat:hm_xr10_format([d pixelFormat])];
+	return d;
+}
+'''
+
 EDITS = [
     ('#define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"',
      '#define HM_CACHE_DIR  "/var/local/hmetal/cache"     /* (redfin hmbench) */'),
@@ -558,6 +911,68 @@ EDITS = [
     # (hmv2) HM_UBWC_RT: CoreAnimation's private render targets made compressed
     ('\t} else if (hm_compress(descriptor, usage)) {\n',
      '\t} else if (hm_compress(descriptor, usage) || hm_ubwc_rt(descriptor, usage)) {   /* (redfin hmv2) HM_UBWC_RT */\n'),
+    # (hmv4) HM_TRACE, HM_PREWARM: helpers after hmv3's
+    ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
+     HMV4_HELPERS + '/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE'),
+    # (hmv4) a pipeline's ms and its compiler's share
+    ("\thm_ca_pick_of[0][0] = hm_ca_pick_of[1][0] = '\\0';   /* (redfin hmvar) */\n",
+     "\tconst double hmTrBegan = hm_now();   /* (redfin hmv4) HM_TRACE: the pipeline's time, and the compiler's in it */\n"
+     "\tdouble hmTrW0 = 0, hmTrC0 = 0;\n\tunsigned hmTrH0 = 0, hmTrM0 = 0;\n\n"
+     "\thakios_metal_compile_stats(&hmTrW0, &hmTrC0, &hmTrH0, &hmTrM0);\n"
+     "\thm_ca_pick_of[0][0] = hm_ca_pick_of[1][0] = '\\0';   /* (redfin hmvar) */\n"),
+    ('\t\t\thm_ca_log_pipeline(descriptor, vs, fs, vsConstants, vsCount, fsConstants, fsCount, program,\n'
+     '\t\t\t\t\t   program == NULL ? hakios_metal_error() : NULL, retried);\n',
+     '\t\t\thm_ca_log_pipeline(descriptor, vs, fs, vsConstants, vsCount, fsConstants, fsCount, program,\n'
+     '\t\t\t\t\t   program == NULL ? hakios_metal_error() : NULL, retried);\n'
+     '\t\t\t{   /* (redfin hmv4) */\n'
+     '\t\t\t\tdouble w = 0, c = 0;\n\t\t\t\tunsigned h = 0, m = 0;\n\n'
+     '\t\t\t\thakios_metal_compile_stats(&w, &c, &h, &m);\n'
+     '\t\t\t\thm_tr_pipeline([descriptor label], (hm_now() - hmTrBegan) * 1e3, w - hmTrW0, c - hmTrC0, m - hmTrM0, h - hmTrH0);\n'
+     '\t\t\t}\n'),
+    # (hmv4) the specialiser's compiles are background ones (they wait while the render thread wants the compiler), traced
+    ('\t\tdispatch_async(compiling, ^{\n\t\t\tstruct timespec t0, t1;\n\n',
+     '\t\tdispatch_async(compiling, ^{\n\t\t\tstruct timespec t0, t1;\n\n'
+     '\t\t\thakios_metal_compile_background(1);   /* (redfin hmv4) */\n'),
+    ('\t\t\t} else if (hm_fps_on()) {\n\t\t\t\thm_print("specialise: %s for %u bytes',
+     '\t\t\t} else if (hm_fps_on() || hm_trace_on()) {   /* (redfin hmv4) */\n'
+     '\t\t\t\thm_tr_event("specialise %s: %.0f ms", hakios_metal_program_name(_program), (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);\n'
+     '\t\t\t\thm_print("specialise: %s for %u bytes'),
+    # (hmv4) the buffer's life for HM_TRACE: made, committed (and the commit call's time), completed
+    ('\t_createdAt = hm_now();\n', '\t_createdAt = hm_now();\n\thm_tr_made();   /* (redfin hmv4) */\n'),
+    ('\t_committed = YES;\n\t_committedAt = hm_now();\n',
+     '\t_committed = YES;\n\t_committedAt = hm_now();\n\thm_tr_committed(_committedAt - _createdAt);   /* (redfin hmv4) */\n'),
+    ('\t\thakios_metal_cb_commit(_cb, hm_completed, self);\n\t\thm_fps_commit(hm_now() - began);\n',
+     '\t\thakios_metal_cb_commit(_cb, hm_completed, self);\n\t\tself->_hmCommitSecs = hm_now() - began;   /* (redfin hmv4) */\n'
+     '\t\thm_fps_commit(hm_now() - began);\n'),
+    ('@public\n\tBOOL _hmFrame;', '@public\n\tdouble _hmCommitSecs;                    /* (redfin hmv4) HM_TRACE: the commit call\'s time */\n\tBOOL _hmFrame;'),
+    ('\tif (self->_hmFrame && !hm_presents_seen) {\n',
+     '\thm_tr_buffer([self GPUStartTime] - [self hakiosCreatedAt], self->_hmCommitSecs, hm_now() - [self GPUStartTime],\n'
+     '\t\t     hm_now() - [self hakiosCreatedAt]);   /* (redfin hmv4) HM_TRACE */\n'
+     '\tif (self->_hmFrame && !hm_presents_seen) {\n'),
+    # (hmv4) the ca_prof sampler by HM_TRACE when the boot-arg does not ask for it (HM_CA_PROF_US, default 25000)
+    ('\t\tif (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, "ca_prof=")) == NULL) return;\n'
+     '\t\tca_prof_us = (unsigned)atoi(at + 8);\n',
+     '\t\tif (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "ca_prof=")) != NULL) {\n'
+     '\t\t\tca_prof_us = (unsigned)atoi(at + 8);\n'
+     '\t\t} else if (hm_trace_on()) {   /* (redfin hmv4) */\n'
+     '\t\t\tconst char *us = getenv("HM_CA_PROF_US");\n'
+     '\t\t\tca_prof_us = us != NULL && us[0] ? (unsigned)atoi(us) : 25000;\n'
+     '\t\t} else {\n\t\t\treturn;\n\t\t}\n'),
+    # (hmv4) HM_XR10=0: no XR10 formats offered; 550/551 as BGRA8 (own-memory textures, views, pipelines)
+    ('- (uint64_t)registryID\n{\n',
+     '/* (redfin hmv4) HM_XR10 (see hm_xr10_on) */\n- (BOOL)supportsExtendedXR10Formats\n{\n\treturn hm_xr10_on() ? YES : NO;\n}\n\n'
+     '- (uint64_t)registryID\n{\n'),
+    ('- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor\n{\n\thakios_metal_texture *texture;\n\tMTLTextureUsage usage;\n\tMTLTextureSwizzleChannels swizzle;\n\n',
+     '- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor\n{\n\thakios_metal_texture *texture;\n\tMTLTextureUsage usage;\n\tMTLTextureSwizzleChannels swizzle;\n\n'
+     '\tdescriptor = hm_xr10_descriptor(descriptor);   /* (redfin hmv4) */\n'),
+    ('\t\t\t slices:(NSRange)slices asked:(SEL)cmd\n{\n\tHakiosMetalTexture *view;\n',
+     '\t\t\t slices:(NSRange)slices asked:(SEL)cmd\n{\n\tHakiosMetalTexture *view;\n\n\tpixelFormat = hm_xr10_format(pixelFormat);   /* (redfin hmv4) */\n'),
+    ('\tformat = (unsigned)[[[descriptor colorAttachments] objectAtIndexedSubscript:0] pixelFormat];\n',
+     '\tformat = (unsigned)hm_xr10_format([[[descriptor colorAttachments] objectAtIndexedSubscript:0] pixelFormat]);   /* (redfin hmv4) */\n'),
+    # (hmv4) HM_PREWARM: QuartzCore's library's pipelines made once in the background, into the disk cache
+    ('\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n\treturn library;\n',
+     '\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n'
+     '\thm_prewarm_start(library, path);   /* (redfin hmv4) */\n\treturn library;\n'),
 ]
 
 

@@ -269,6 +269,16 @@ int hakios_metal_ubwc(hakios_metal_device* d, unsigned* hbb, unsigned* swizzle, 
 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
 
+void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses) {
+    const CompileStats s = compileStats();
+    if (waitMs != nullptr) *waitMs = double(s.waitNs) / 1e6;
+    if (compileMs != nullptr) *compileMs = double(s.compileNs) / 1e6;
+    if (hits != nullptr) *hits = s.hits;
+    if (misses != nullptr) *misses = s.misses;
+}
+
+void hakios_metal_compile_background(int on) { setCompileBackground(on != 0); }
+
 void hakios_metal_set_notice(void (*fn)(const char*)) { render::setNotice(fn); }
 
 hakios_metal_library* hakios_metal_library_open(const void* data, size_t size) {

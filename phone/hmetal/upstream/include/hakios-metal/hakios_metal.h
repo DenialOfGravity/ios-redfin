@@ -77,6 +77,11 @@ uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 int hakios_metal_ubwc(hakios_metal_device *device, unsigned *highest_bank_bit, unsigned *swizzle_levels, unsigned *macrotile_mode);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
+/* (redfin hmv4) this thread's compiles so far: ms waiting for the compiler, ms compiling, stages read from the disk cache
+ * and stages compiled (any pointer may be NULL); and a thread marked background (1) compiles only while no other thread
+ * waits for the compiler (HM_COMPILE_PRIO=0: first come) */
+void hakios_metal_compile_stats(double *wait_ms, double *compile_ms, unsigned *hits, unsigned *misses);
+void hakios_metal_compile_background(int on);
 /* (redfin hmv2) the encoder's one-time notices (a short constant binding padded, HM_CB_PAD) to FN instead of stderr */
 void hakios_metal_set_notice(void (*fn)(const char *text));
 
