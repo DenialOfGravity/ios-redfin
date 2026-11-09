@@ -305,7 +305,7 @@ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* (redfin hmv7) HM_HANG_BLAME: how many hung command buffers drew with PROGRAM (only programs of at least
- * HM_HANG_BLAME_WORDS fragment words, default 1024, are counted; 0 otherwise) */
+ * HM_HANG_BLAME_WORDS fragment words, default 0 since hmv9 = every program, are counted; 0 otherwise) */
 unsigned hakios_metal_program_hangs(hakios_metal_program *program);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */

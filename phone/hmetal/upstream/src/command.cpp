@@ -773,9 +773,11 @@ std::map<const void*, uint32_t> gBlame;
 }  // namespace
 
 uint32_t CommandBuffer::blameWords() {
+    // (redfin hmv9) default 0: every program is tallied (was 1024: only the uber shaders, which left a small program that
+    // hangs uncounted); HM_HANG_BLAME_WORDS=1024 is hmv7's rule
     static const uint32_t w = [] {
         const char* e = getenv("HM_HANG_BLAME_WORDS");
-        return e != nullptr && e[0] != '\0' ? uint32_t(strtoul(e, nullptr, 0)) : 1024u;
+        return e != nullptr && e[0] != '\0' ? uint32_t(strtoul(e, nullptr, 0)) : 0u;
     }();
     return w;
 }
@@ -797,16 +799,27 @@ std::vector<std::string> CommandBuffer::blame() const {
         seen.push_back(&m);
     }
     std::lock_guard<std::mutex> g(gBlameLock);
+    uint32_t tallied = 0, once = 0;
     for (const Mark* m : seen) {
         if (m->words < blameWords()) continue;
         const uint32_t n = ++gBlame[m->what];
+        tallied++;
+        // (redfin hmv9) a line for a program now in 2 or more hung buffers (whatever its size: HM_HANG_BLAME blames it),
+        // and for a big one (1024 fragment words or more) the first time too; the others go into the count line
+        if (n < 2 && m->words < 1024) {
+            once++;
+            continue;
+        }
         char b[200];
         snprintf(b, sizeof b, "blame: %s(%p) fsw %u: in %u hung buffer%s now", m->name != nullptr ? m->name : "?", m->what, m->words, n, n == 1 ? "" : "s");
         out.push_back(b);
     }
-    if (out.empty()) {
+    if (tallied == 0) {
         out.push_back("blame: no program of " + std::to_string(blameWords()) + " fragment words or more in it (" + std::to_string(seen.size()) +
                       " programs): nothing blamed");
+    } else {
+        out.push_back("blame: " + std::to_string(tallied) + " of " + std::to_string(seen.size()) + " programs tallied, " + std::to_string(once) +
+                      " of them small and in their first hung buffer (no line)");
     }
     return out;
 }
@@ -847,7 +860,8 @@ std::string CommandBuffer::hangReport() const {
         std::string line = "   programs:";
         size_t n = 0;
         for (const Prog& p : progs) {
-            if (n++ == 8) { line += " ..."; break; }
+            // (redfin hmv9) every program, 8 a line (was: the first 8 and "...", which hid the rest of a 49-draw pass)
+            if (n++ % 8 == 0 && n > 1) { o << line << "\n"; line = "   programs (more):"; }
             snprintf(b, sizeof b, " %s(%p) x%u el %llu fsw %u pvt %u%s;", p.name != nullptr ? p.name : "?", p.what, p.draws, (unsigned long long)p.elements,
                      p.words, p.pvt & 0x7fffffffu, (p.pvt & 0x80000000u) ? "/wave" : "");
             line += b;

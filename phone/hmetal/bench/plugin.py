@@ -42,6 +42,8 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
   - (hmv7) HM_SPEC=2 (an uber shader drawn only through the program specialised for the draw's configuration, compiled
     on the spot), HM_DENY=word,... (pipelines whose label holds a word: the other pick, and their uber shaders as
     HM_SPEC=2), HM_HANG_BLAME=1 (default; after HM_HANG_BLAME_AFTER=2 hung buffers a program is drawn as HM_SPEC=2 draws it)
+  - (hmv9) the core's tally counts every program (HM_HANG_BLAME_WORDS default 0, was 1024): a small program in 2 hung buffers
+    gets its 'blame:' line too; an uber shader among them is then drawn as HM_SPEC=2 draws it
   - (hmv8) HM_SHADOW_FRESH=1 (default): a read-only copy of an unaligned surface's rows made again once a command buffer
     whatever its seed (0: only when the seed moved); HM_LOG_TIME=1 (default): the time of day in each line's prefix;
     HM_TRACE's 10 s 'trace: surfaces:' line (live textures over IOSurfaces, row copies a s and forced ones, XR decodes,
@@ -965,7 +967,7 @@ HMV7_HELPERS = r'''/* (redfin hmv7) Uber shaders that may not run as they are (b
  *                       other pick (exact -> own, own -> nearest, nearest -> own), and an uber shader among them drawn
  *                       as HM_SPEC=2 draws it
  *   HM_HANG_BLAME=1     (default) a program in HM_HANG_BLAME_AFTER (default 2) hung buffers (the core's tally: only
- *                       programs of HM_HANG_BLAME_WORDS fragment words or more, default 1024) is from then on drawn as
+ *                       programs of HM_HANG_BLAME_WORDS fragment words or more, default 0 since hmv9) is from then on drawn as
  *                       HM_SPEC=2 draws it, or left out if it cannot be specialised; 0 = the tally is only logged
  * A draw that would have to run such a program as it is (no configuration to fold, the specialisation failed) is left
  * out and said (the first 20, then every 100th). */

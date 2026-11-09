@@ -357,9 +357,10 @@ TEST(after_a_reset_the_buffers_behind_the_failed_one_are_sent_again) {
     CHECK(cb1->hangReport().find("1 copies/fills") != std::string::npos);
 }
 
-// (redfin hmv7) HM_HANG_BLAME: a hung buffer's programs of HM_HANG_BLAME_WORDS (1024) fragment words or more get a hang each
-// (one per buffer however often drawn in it); the small ones none; a buffer without a big one blames nothing
-TEST(a_hung_buffers_big_programs_are_blamed_once_per_buffer) {
+// (redfin hmv7/hmv9) HM_HANG_BLAME: every program of a hung buffer gets a hang (one per buffer however often drawn in
+// it; HM_HANG_BLAME_WORDS, default 0); a line for a big one (1024 words or more) at once, for a small one from its second
+// hung buffer, then a count line
+TEST(a_hung_buffers_programs_are_blamed_once_per_buffer_small_ones_from_two) {
     Rig r(true);
     static int big = 0, small = 0;
     auto cb = r.queue->commandBuffer();
@@ -367,19 +368,37 @@ TEST(a_hung_buffers_big_programs_are_blamed_once_per_buffer) {
     cb->mark(M{0, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32064, 0, &big, "uber"});
     cb->mark(M{10, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32064, 0, &big, "uber"});
     cb->mark(M{20, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32, 0, &small, "small"});
+    CHECK_EQ(CommandBuffer::blameWords(), 0u);
     CHECK_EQ(CommandBuffer::hangsOf(&big), 0u);
     auto lines = cb->blame();
-    CHECK_EQ(lines.size(), size_t(1));
+    CHECK_EQ(lines.size(), size_t(2));
     CHECK(lines[0].find("uber") != std::string::npos && lines[0].find("in 1 hung buffer now") != std::string::npos);
+    CHECK(lines[1].find("2 of 2 programs tallied, 1 of them small") != std::string::npos);
     CHECK_EQ(CommandBuffer::hangsOf(&big), 1u);
-    CHECK_EQ(CommandBuffer::hangsOf(&small), 0u);
-    CHECK(cb->blame()[0].find("in 2 hung buffers now") != std::string::npos);
+    CHECK_EQ(CommandBuffer::hangsOf(&small), 1u);
+    auto again = cb->blame();
+    CHECK_EQ(again.size(), size_t(3));
+    CHECK(again[0].find("uber") != std::string::npos && again[0].find("in 2 hung buffers now") != std::string::npos);
+    CHECK(again[1].find("small") != std::string::npos && again[1].find("fsw 32: in 2 hung buffers now") != std::string::npos);
     CHECK_EQ(CommandBuffer::hangsOf(&big), 2u);
+    CHECK_EQ(CommandBuffer::hangsOf(&small), 2u);
     auto cb2 = r.queue->commandBuffer();
-    cb2->mark(M{0, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32, 0, &small, "small"});
     auto none = cb2->blame();
     CHECK(none.size() == 1 && none[0].find("nothing blamed") != std::string::npos);
-    CHECK_EQ(CommandBuffer::hangsOf(&small), 0u);
+}
+
+// (redfin hmv9) the hang dump names every program of a pass, 8 a line (was: 8 and "...")
+TEST(a_hang_dump_names_every_program_of_a_pass) {
+    Rig r(true);
+    static int p[12];
+    auto cb = r.queue->commandBuffer();
+    using M = CommandBuffer::Mark;
+    for (int i = 0; i < 12; i++) cb->mark(M{uint32_t(i), CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32, 0, &p[i], i == 11 ? "last" : "p"});
+    cb->mark(M{20, CommandBuffer::kMarkPassEnd, 0, 64, 64, 80, 12, 0, 0, nullptr, nullptr});
+    const std::string rep = cb->hangReport();
+    CHECK(rep.find("last(") != std::string::npos);
+    CHECK(rep.find("programs (more):") != std::string::npos);
+    CHECK(rep.find("...") == std::string::npos);
 }
 
 namespace {
