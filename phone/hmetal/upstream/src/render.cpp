@@ -2782,6 +2782,10 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
 }
 
 void setNotice(void (*fn)(const char*)) { gNotice = fn; }
+// (redfin hmv6) a line for the plug-in's log (hang reports, reset recovery): the notice's sink, or stderr
+void notify(const std::string& text) {
+    if (gNotice != nullptr) gNotice(text.c_str()); else std::fprintf(stderr, "hakios-metal: %s\n", text.c_str());
+}
 
 }  // namespace render
 
@@ -2961,6 +2965,13 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     const RenderPass* passIn = &passGiven;
     if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
     const RenderPass& pass = *passIn;
+    if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP
+        const Texture* t = pass.color0;
+        mark(Mark{uint32_t(stream_.words().size()), kMarkDraw, 0, t != nullptr ? t->width() : 0, t != nullptr ? t->height() : 0,
+                  t != nullptr ? uint32_t(t->format()) : 0, d.vertexCount * std::max(d.instanceCount, 1u), program.fs.k.numWords,
+                  std::max(program.vs.k.pvtmemSize, program.fs.k.pvtmemSize) | (program.fs.k.pvtmemPerWave ? 0x80000000u : 0u), &program,
+                  program.name});
+    }
     // (redfin hmv2) an extended-range texture (BGR10_XR...) is sampled through its decoded copy (Texture::xrDecode, HM_XR=1),
     // decoded once per command buffer and kept until it completes
     Bindings vsXr, fsXr;
@@ -3370,6 +3381,10 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
     if (status_ > kEnqueued) {
         return fail("blit after commit");
     }
+    if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP: the source's size and format, the destination's in COUNT (w<<16|h)
+        mark(Mark{uint32_t(stream_.words().size()), kMarkBlit, 0, src.width(), src.height(), uint32_t(src.format()),
+                  (dst.width() << 16) | (dst.height() & 0xffff), 0, 0, &dst, nullptr});
+    }
     closePass();   // the copy reads what the draws before it wrote: their pass's tail first
     std::string why;
     // A copy of a level onto itself. Metal leaves it to the GPU, and an Apple GPU does it -- VectorKit (MapKit's snapshot
@@ -3590,6 +3605,11 @@ void CommandBuffer::closePass() {
     render::encodeEnd(tail, open_->pass, open_->table, open_->options);
     appendStream(stream_, tail);
     stampEnd();
+    if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP: the pass's end, GMEM or sysmem, its draws
+        const Texture* t = open_->pass.color0;
+        mark(Mark{uint32_t(stream_.words().size()), kMarkPassEnd, uint8_t(open_->gmem ? 1 : 0), t != nullptr ? t->width() : 0,
+                  t != nullptr ? t->height() : 0, t != nullptr ? uint32_t(t->format()) : 0, open_->draws, 0, 0, t, nullptr});
+    }
     open_.reset();
 }
 
@@ -3603,6 +3623,10 @@ bool CommandBuffer::clear(const RenderPass& passGiven, const render::Options& op
     const RenderPass* passIn = &passGiven;
     if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
     const RenderPass& pass = *passIn;
+    if (hangDumpOn() && pass.color0 != nullptr) {   // (redfin hmv6) HM_HANG_DUMP
+        mark(Mark{uint32_t(stream_.words().size()), kMarkClear, 0, pass.color0->width(), pass.color0->height(), uint32_t(pass.color0->format()), 0, 0, 0,
+                  pass.color0, nullptr});
+    }
     Piece table;
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the pass's table: ") + why);

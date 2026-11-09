@@ -381,6 +381,9 @@ private:
         if (b == bos_.end()) return ENOENT;
         Bo bo = b->second;
         bos_.erase(b);
+        // (redfin hmv6) what it was, for a submission that names it after this (ENOENT): the last 256 closed
+        closed_[handle] = Closed{bo.surfaceId, bo.bytes, bo.iova, bo.imported, nowNs()};
+        if (closed_.size() > 256) closed_.erase(closed_.begin());
         if (bo.cpu != nullptr) unmapLocked(bo);
         NativeAdrenoAbiBoFree f{bo.handle};
         const int e = errnoOf(method(NativeAdrenoMethodBoFree, &f, sizeof(f), nullptr, 0), NativeAdrenoMethodBoFree);
@@ -398,7 +401,23 @@ private:
         std::vector<Bo*> named(s.nr_bos);
         for (uint32_t i = 0; i < s.nr_bos; i++) {
             auto b = bos_.find(bos[i].handle);
-            if (b == bos_.end()) return ENOENT;
+            if (b == bos_.end()) {
+                // (redfin hmv6) say which: a handle the core still names after it was closed (hmt7: refused from frame 993
+                // on, after turning back to portrait, with no word of which buffer); the first 20, then every 100th
+                if (++enoents_ <= 20 || enoents_ % 100 == 0) {
+                    auto c = closed_.find(bos[i].handle);
+                    if (c != closed_.end()) {
+                        fprintf(stderr, "hakios-metal: submission %u names BO %u (entry %u of %u%s), closed %.1f ms ago: %s%u, %llu KB at 0x%llx: ENOENT\n",
+                                enoents_, bos[i].handle, i, s.nr_bos, (bos[i].flags & kSubmitBoWrite) ? ", written" : "",
+                                double(nowNs() - c->second.at) / 1e6, c->second.surfaceId ? "IOSurface " : (c->second.imported ? "user memory " : "own BO "),
+                                c->second.surfaceId, (unsigned long long)(c->second.bytes >> 10), (unsigned long long)c->second.iova);
+                    } else {
+                        fprintf(stderr, "hakios-metal: submission %u names BO %u (entry %u of %u), never this client's or closed long ago: ENOENT\n",
+                                enoents_, bos[i].handle, i, s.nr_bos);
+                    }
+                }
+                return ENOENT;
+            }
             named[i] = &b->second;
         }
         const Bo& ib = *named[cmd->submit_idx];
@@ -493,6 +512,9 @@ private:
     std::map<uint32_t, Bo> bos_;          // the core's handles
     std::map<uint32_t, uint64_t> queues_; // the core's queue ids -> the kernel's
     std::set<uint32_t> unserved_;
+    struct Closed { uint32_t surfaceId; uint64_t bytes, iova; bool imported; int64_t at; };
+    std::map<uint32_t, Closed> closed_;   // (redfin hmv6) the last 256 handles closed, for the ENOENT line
+    uint32_t enoents_ = 0;
     uint32_t nextHandle_ = 1, nextQueue_ = 1;
     uint32_t highestFence_ = 0, passedFence_ = 0;
 };

@@ -264,6 +264,8 @@ bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why);
 // (redfin hmv2) where the encoder's one-time notices go (a constant buffer padded, HM_CB_PAD): FN with the text, or
 // stderr when none is set
 void setNotice(void (*fn)(const char*));
+// (redfin hmv6) one line to the same sink (the hang reports and the reset recovery's steps)
+void notify(const std::string& text);
 
 }  // namespace render
 

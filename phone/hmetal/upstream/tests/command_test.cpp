@@ -327,3 +327,68 @@ TEST(big_copies_are_cut_into_packets_the_gpu_takes) {
     CHECK_EQ(static_cast<uint8_t*>(a->contents())[(16 << 20) - 1], 0x77);
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
+
+// (redfin hmv6) HM_RESET_RECOVER: the buffer the waiter was on when the reset gave everything up fails; the ones of the
+// queue given up behind it are sent again (the kernel keeps BOs and mappings over a reset) and complete, having run
+TEST(after_a_reset_the_buffers_behind_the_failed_one_are_sent_again) {
+    Rig r(true);
+    auto a = buffer(r, 4096);
+    auto b = buffer(r, 4096);
+    memset(a->contents(), 0, 4096);
+    memset(b->contents(), 0, 4096);
+    r.fake->pause();
+    int e = 0;
+    auto bad = r.gpu->newBo(4096, 0, &e);
+    static_cast<uint32_t*>(bad->cpu())[0] = pm4::type7(0x7f, 0) ^ (1u << 15);
+    uint32_t fence = 0;
+    CHECK_EQ(r.gpu->submit(0, *bad, 0, 1, {}, &fence), 0);   // hangs
+    auto cb1 = r.queue->commandBuffer();
+    CHECK(cb1->fill(*a, 0, 4096, 0x11));
+    cb1->commit();
+    auto cb2 = r.queue->commandBuffer();
+    CHECK(cb2->fill(*b, 0, 4096, 0x22));
+    cb2->commit();
+    r.fake->resume();
+    cb2->waitUntilCompleted();
+    CHECK(cb1->status() == CommandBuffer::kError);              // the one the waiter was on: failed
+    CHECK(cb1->error().find("given up") != std::string::npos);
+    CHECK(cb2->status() == CommandBuffer::kCompleted);          // behind it: sent again, and run
+    CHECK_EQ(static_cast<uint8_t*>(b->contents())[4095], 0x22);
+    CHECK(cb1->hangReport().find("1 copies/fills") != std::string::npos);
+}
+
+namespace {
+Gpu* gHandoverGpu = nullptr;
+std::shared_ptr<Buffer> gHandoverNew;
+void makeAnotherWhileDying() {
+    // what another thread does in the dying Buffer's window: asks for the same surface, finds the entry expired
+    SurfaceInfo info;
+    std::string why;
+    gHandoverNew = surfaceBuffer(*gHandoverGpu, 31, &info, &why);
+}
+}  // namespace
+
+// (redfin hmv6) a surface Buffer dying while another is made over the same kernel handle leaves the handle open for the
+// new one (was: closed it, and every later submission naming the surface was refused, ENOENT)
+TEST(a_surface_buffer_dying_while_a_new_one_is_made_hands_its_handle_over) {
+    Rig r;
+    r.fake->addSurface(31, 64, 64, 256, 0x42475241u);
+    SurfaceInfo info;
+    std::string why;
+    auto first = surfaceBuffer(*r.gpu, 31, &info, &why);
+    CHECK(first != nullptr);
+    const uint64_t before = surfaceHandovers();
+    gHandoverGpu = r.gpu.get();
+    gSurfaceDeleterHook = makeAnotherWhileDying;
+    first.reset();
+    gSurfaceDeleterHook = nullptr;
+    CHECK(gHandoverNew != nullptr);
+    CHECK_EQ(surfaceHandovers(), before + 1);
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->fill(*gHandoverNew, 0, 4096, 0x5a));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->surfaceBytes(31)[100], 0x5a);
+    gHandoverNew.reset();
+}

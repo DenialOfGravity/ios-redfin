@@ -1,11 +1,16 @@
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
+#include "hakios-metal/render.hpp"
+
+#include <cstdio>
+#include <sstream>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <map>
 #include <mutex>
+#include <cstdlib>
 #include <cstring>
 
 namespace hakios::metal {
@@ -202,7 +207,16 @@ namespace {
 // cannot be met by a Buffer still being destroyed.
 std::mutex gSurfaceLock;
 std::map<std::pair<const Gpu*, uint32_t>, std::weak_ptr<Buffer>> gSurfaceBuffers;
+std::atomic<uint64_t> gSurfaceHandovers{0};
+// (redfin hmv6) HM_SURFACE_HANDOVER=1 (default): a dying surface Buffer whose handle a new Buffer took leaves it open (0: closes it, as before)
+bool surfaceHandoverOn() {
+    static const bool on = [] { const char* e = getenv("HM_SURFACE_HANDOVER"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
 }  // namespace
+
+void (*gSurfaceDeleterHook)() = nullptr;
+uint64_t surfaceHandovers() { return gSurfaceHandovers.load(); }
 
 std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo* info, std::string* why) {
     std::lock_guard<std::mutex> g(gSurfaceLock);
@@ -222,10 +236,23 @@ std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo*
         }
     }
     const uint64_t length = bo->size();
-    std::shared_ptr<Buffer> b(new Buffer(std::move(bo), length), [key](Buffer* x) {
+    Gpu* owner = &gpu;
+    std::shared_ptr<Buffer> b(new Buffer(std::move(bo), length), [key, owner](Buffer* x) {
+        if (gSurfaceDeleterHook != nullptr) gSurfaceDeleterHook();
         std::lock_guard<std::mutex> g(gSurfaceLock);
         auto it = gSurfaceBuffers.find(key);
-        if (it != gSurfaceBuffers.end() && it->second.expired()) gSurfaceBuffers.erase(it);
+        if (it != gSurfaceBuffers.end() && it->second.expired()) {
+            gSurfaceBuffers.erase(it);
+        } else if (it != gSurfaceBuffers.end() && surfaceHandoverOn()) {
+            // (redfin hmv6) Between this Buffer's last reference going (often the waiter thread, a completed command
+            // buffer letting go) and this lock, surfaceBuffer met the entry expired and made a NEW Buffer over the same
+            // kernel handle (the transport answers the same handle while the BO is open). Closing it here closed the
+            // new Buffer's handle: every later submission naming that surface was refused with ENOENT (hmt7: the
+            // display surfaces 630/631 after turning back to portrait, 'the driver refused the submission: No such file
+            // or directory' from frame 993 until lock/unlock made new ones). The handle is the new Buffer's now.
+            gSurfaceHandovers.fetch_add(1);
+            owner->disown(x->takeBo());
+        }
         delete x;
     });
     gSurfaceBuffers[key] = b;
@@ -438,6 +465,7 @@ bool CommandBuffer::copy(const Buffer& from, uint64_t fromOffset, const Buffer& 
     if (status_ > kEnqueued) {
         return fail("copy after commit");
     }
+    if (hangDumpOn()) mark(Mark{uint32_t(stream_.words().size()), kMarkCopy, uint8_t(0), 0, 0, 0, uint32_t(length), 0, 0, nullptr, nullptr});   // (redfin hmv6)
     if (fromOffset > from.length() || length > from.length() - fromOffset || toOffset > to.length() ||
         length > to.length() - toOffset) {
         return fail("copy outside a buffer");
@@ -479,6 +507,7 @@ bool CommandBuffer::fill(const Buffer& b, uint64_t offset, uint64_t length, uint
     if (status_ > kEnqueued) {
         return fail("fill after commit");
     }
+    if (hangDumpOn()) mark(Mark{uint32_t(stream_.words().size()), kMarkCopy, uint8_t(1), 0, 0, 0, uint32_t(length), 0, 0, nullptr, nullptr});   // (redfin hmv6)
     if (offset % 4 || length % 4) {
         return fail("fill of " + std::to_string(length) + " bytes at " + std::to_string(offset) +
                     ": the command processor writes words, so both must be multiples of 4");
@@ -650,8 +679,157 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         return;
     }
     cb->status_ = CommandBuffer::kScheduled;
+    cb->submittedWords_ = uint32_t(w.size());   // (redfin hmv6) for the hang report and a send again after a reset
+    cb->submittedIova_ = cb->commands_->gpuAddress();
     inFlight_.push_back(std::move(cb));
     changed_.notify_all();
+}
+
+// (redfin hmv6) HM_RESET_RECOVER=1 (default): after a reset (the kernel's GPU reset gives up everything it had been
+// given: the hung submission and every one behind it in the ring, their fences set as passed), the buffer the waiter
+// was on fails (it hung, or the GPU was reset under it) and the buffers of this queue given up behind it are sent again,
+// once each, when nothing committed after the reset has gone to the GPU yet (else they would run after newer frames:
+// they fail as given up, as before). Our kernel keeps every BO, mapping and queue over a reset (xnu 0108 a6_recover:
+// soft reset + CP init, page tables and SMMU banks kept; 0115: CreateQueue is the one ring, the BO table is the
+// client's), so the same command IB, at the same address, is still good. 0: as before (every one of them fails).
+namespace {
+bool resetRecoverOn() {
+    static const bool on = [] { const char* e = getenv("HM_RESET_RECOVER"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+}  // namespace
+
+void CommandQueue::recoverAfterReset(CommandBuffer& hung, uint64_t faults) {
+    // (lock_ held) inFlight_.front() is HUNG
+    size_t behind = 0, after = 0;
+    for (size_t i = 1; i < inFlight_.size(); i++) {
+        if (inFlight_[i]->faultsAtCommit_ < faults) behind++; else after++;
+    }
+    render::notify("reset recovery: 1/3 GPU reset " + std::to_string(faults) + ": the buffer on fence " + std::to_string(hung.fence_) +
+                   " failed (it hung, or the GPU was reset under it); " + std::to_string(behind) + " of this queue's buffers given up behind it, " +
+                   std::to_string(after) + " committed since the reset");
+    if (behind == 0) {
+        render::notify("reset recovery: 2/3 nothing else to send again; 3/3 BOs, mappings and the queue are the kernel's still (nothing to make again)");
+        return;
+    }
+    if (after != 0) {
+        render::notify("reset recovery: 2/3 not sent again: " + std::to_string(after) + " newer buffers already went to the GPU (the old ones would run after them); " +
+                       std::to_string(behind) + " fail as given up");
+        return;
+    }
+    uint32_t sent = 0, refused = 0;
+    for (size_t i = 1; i < inFlight_.size(); i++) {
+        CommandBuffer& cb = *inFlight_[i];
+        if (cb.commands_ == nullptr || cb.submittedWords_ == 0 || cb.resubmits_ != 0) {
+            refused++;
+            continue;
+        }
+        const uint32_t old = cb.fence_;
+        uint32_t fence = 0;
+        const int e = gpu_.submit(id_, *cb.commands_, 0, cb.submittedWords_, cb.uses_, &fence);
+        if (e != 0) {
+            render::notify("reset recovery: 2/3 buffer on fence " + std::to_string(old) + " not sent again: " + strerror(e));
+            refused++;
+            continue;
+        }
+        cb.fence_ = fence;
+        cb.faultsAtCommit_ = faults;
+        cb.resubmits_++;
+        sent++;
+        render::notify("reset recovery: 2/3 buffer on fence " + std::to_string(old) + " sent again as fence " + std::to_string(fence) + " (" +
+                       std::to_string(cb.submittedWords_) + " words at 0x" + [&] { char b[24]; snprintf(b, sizeof b, "%llx", (unsigned long long)cb.submittedIova_); return std::string(b); }() + ")");
+    }
+    render::notify("reset recovery: 3/3 " + std::to_string(sent) + " sent again, " + std::to_string(refused) + " left to fail; BOs, mappings and the queue kept (the kernel's)");
+}
+
+bool CommandBuffer::hangDumpOn() {
+    static const bool on = [] { const char* e = getenv("HM_HANG_DUMP"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+
+std::string CommandBuffer::hangReport() const {
+    if (!hangDumpOn()) return "";
+    std::ostringstream o;
+    char b[160];
+    uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, blits = 0, clears = 0;
+    for (const Mark& m : marks_) {
+        switch (m.kind) {
+        case kMarkDraw: draws++; break;
+        case kMarkPassEnd: passes++; break;
+        case kMarkDispatch: dispatches++; break;
+        case kMarkCopy: copies++; break;
+        case kMarkBlit: blits++; break;
+        case kMarkClear: clears++; break;
+        }
+    }
+    snprintf(b, sizeof b, "IB at 0x%llx, %u words (klog 'ib1 <base> rem N': the CP had fetched to word %u-N, less its prefetch)",
+             (unsigned long long)submittedIova_, submittedWords_, submittedWords_);
+    o << b << "\n";
+    o << passes << " passes, " << draws << " draws, " << dispatches << " dispatches, " << copies << " copies/fills, " << blits << " blits, " << clears
+      << " clears; XR companions drawn " << xrDrawn_.size() << ", XR copies decoded " << xrDecoded_.size() << "; sent again " << resubmits_
+      << (marksLost_ ? "; marks lost " + std::to_string(marksLost_) : std::string()) << "\n";
+    // each pass: its words, target, mode, draws, and its programs (name, address, fragment words, private bytes)
+    struct Prog { const void* what; const char* name; uint32_t words, pvt, draws; uint64_t elements; };
+    std::vector<Prog> progs;
+    uint32_t start = 0, firstDraw = ~0u, printed = 0;
+    const uint32_t maxPasses = 24;
+    uint32_t pass = 0;
+    auto flushProgs = [&]() {
+        std::string line = "   programs:";
+        size_t n = 0;
+        for (const Prog& p : progs) {
+            if (n++ == 8) { line += " ..."; break; }
+            snprintf(b, sizeof b, " %s(%p) x%u el %llu fsw %u pvt %u%s;", p.name != nullptr ? p.name : "?", p.what, p.draws, (unsigned long long)p.elements,
+                     p.words, p.pvt & 0x7fffffffu, (p.pvt & 0x80000000u) ? "/wave" : "");
+            line += b;
+        }
+        if (!progs.empty()) o << line << "\n";
+        progs.clear();
+    };
+    for (const Mark& m : marks_) {
+        if (m.kind == kMarkDraw) {
+            if (firstDraw == ~0u) firstDraw = m.word;
+            bool found = false;
+            for (Prog& p : progs) {
+                if (p.what == m.what) { p.draws++; p.elements += m.count; found = true; }
+            }
+            if (!found) progs.push_back(Prog{m.what, m.name, m.words, m.pvt, 1, m.count});
+            continue;
+        }
+        const bool show = passes <= maxPasses || pass + maxPasses >= passes;   // (the last ones when there are many)
+        if (m.kind == kMarkPassEnd) {
+            if (show) {
+                snprintf(b, sizeof b, " pass %u: words %u-%u, %ux%u format %u, %s, %u draws", pass, start, m.word, m.w, m.h, m.fmt, m.gmem ? "GMEM" : "sysmem", m.count);
+                o << b << "\n";
+                flushProgs();
+                printed++;
+            } else {
+                progs.clear();
+            }
+            pass++;
+            start = m.word;
+            firstDraw = ~0u;
+            continue;
+        }
+        if (show) {
+            switch (m.kind) {
+            case kMarkDispatch:
+                snprintf(b, sizeof b, " dispatch at word %u: %s(%p) groups %ux%ux%u local %u, %u words, pvt %u", m.word, m.name != nullptr ? m.name : "?", m.what,
+                         m.w, m.h, m.fmt, m.count, m.words, m.pvt & 0x7fffffffu);
+                break;
+            case kMarkCopy: snprintf(b, sizeof b, " %s at word %u: %u bytes", m.gmem ? "fill" : "copy", m.word, m.count); break;
+            case kMarkBlit:
+                snprintf(b, sizeof b, " blit at word %u: %ux%u format %u into %ux%u (%p)", m.word, m.w, m.h, m.fmt, m.count >> 16, m.count & 0xffff, m.what);
+                break;
+            case kMarkClear: snprintf(b, sizeof b, " clear at word %u: %ux%u format %u", m.word, m.w, m.h, m.fmt); break;
+            default: b[0] = 0; break;
+            }
+            o << b << "\n";
+        }
+        start = m.word;
+    }
+    (void)printed;
+    return o.str();
 }
 
 void CommandQueue::waiter() {
@@ -681,6 +859,21 @@ void CommandQueue::waiter() {
                                    "kernel waits for nothing again in this run";
         } else if (e != 0) {
             cb->error_ = std::string("waiting for it failed: ") + strerror(e);
+        }
+        // (redfin hmv6) HM_HANG_DUMP: what the hung (or given-up-first) buffer held; HM_RESET_RECOVER: the others again
+        const bool front = givenUp && (e == ETIMEDOUT || e == EIO) && cb->faultsAtCommit_ < faults && faults > hangsReported_;
+        if (front && CommandBuffer::hangDumpOn()) {
+            std::istringstream lines(cb->hangReport());
+            std::string line;
+            while (std::getline(lines, line)) render::notify("hang: fence " + std::to_string(cb->fence_) + ": " + line);
+        }
+        if (front) {
+            hangsReported_ = faults;
+            if (resetRecoverOn()) {
+                g.lock();
+                recoverAfterReset(*cb, faults);
+                g.unlock();
+            }
         }
         cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError);
         g.lock();

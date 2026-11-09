@@ -618,6 +618,11 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
         return fail("dispatch after commit");
     }
     if (!freshen(bindings)) return false;
+    if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP: the groups (0 0 0: indirect) and the local size
+        mark(Mark{uint32_t(stream_.words().size()), kMarkDispatch, 0, groups != nullptr ? groups[0] : 0, groups != nullptr ? groups[1] : 0,
+                  groups != nullptr ? groups[2] : 0, (local != nullptr ? local[0] : k.localSize[0]) * (local != nullptr ? local[1] * local[2] : k.localSize[1] * k.localSize[2]),
+                  k.numWords, k.pvtmemSize | (k.pvtmemPerWave ? 0x80000000u : 0u), &k, k.name});
+    }
     std::string why;
     const uint64_t program = programAddress(k, &why);
     if (program == 0) {

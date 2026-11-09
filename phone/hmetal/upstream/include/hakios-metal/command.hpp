@@ -43,6 +43,8 @@ public:
     void* contents() const { return bo_->cpu(); }
     uint64_t gpuAddress() const { return bo_->gpuAddress(); }
     const Bo& bo() const { return *bo_; }
+    // (redfin hmv6) the Bo out of a Buffer being destroyed whose handle another Buffer now holds (surfaceBuffer's deleter)
+    std::unique_ptr<Bo> takeBo() { return std::move(bo_); }
 
 private:
     std::unique_ptr<Bo> bo_;
@@ -58,6 +60,10 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset);
 // lives: a second ask for the same surface gets the same Buffer (the kernel's handle for it is one), so that the
 // handle is closed once, by the last owner. nullptr with *why.
 std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo* info, std::string* why);
+// (redfin hmv6) test hook: run by a surface Buffer's deleter before it takes the surface lock (the window another thread
+// can make a new Buffer over the same handle in); and how many dying Buffers handed their handle over so far
+extern void (*gSurfaceDeleterHook)();
+uint64_t surfaceHandovers();
 
 class CommandBuffer : public std::enable_shared_from_this<CommandBuffer> {
 public:
@@ -193,9 +199,26 @@ public:
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
     const char* passSysmemWhy(size_t i) const { return i < profiled_.size() ? profiled_[i].sysmemWhy.c_str() : ""; }
 
+    // (redfin hmv6) HM_HANG_DUMP=1 (default): what the buffer holds, recorded as it is encoded (a few words a draw), for
+    // the lines a hung or given-up buffer prints (CommandQueue's waiter, through render::notify): the command IB's GPU
+    // address and size (the kernel's 'ib1 <base> rem <n>' then points at word size-n, less the CP's prefetch), the
+    // passes (target size and format, GMEM or sysmem, draws, word range), the programs drawn (name, address, fragment
+    // words, private memory), dispatches, copies, blits, clears and the XR companions. Empty when off.
+    std::string hangReport() const;
+    enum MarkKind : uint8_t { kMarkDraw = 0, kMarkPassEnd = 1, kMarkDispatch = 2, kMarkCopy = 3, kMarkBlit = 4, kMarkClear = 5 };
+    struct Mark { uint32_t word; MarkKind kind; uint8_t gmem; uint32_t w, h, fmt, count, words, pvt; const void* what; const char* name; };
+    void mark(const Mark& m) { if (marks_.size() < kMaxMarks) marks_.push_back(m); else marksLost_++; }
+    static bool hangDumpOn();
+    static constexpr size_t kMaxMarks = 4096;
+
 private:
     friend class CommandQueue;
     explicit CommandBuffer(CommandQueue& queue) : queue_(queue) {}
+    std::vector<Mark> marks_;
+    uint32_t marksLost_ = 0;
+    uint32_t submittedWords_ = 0;   // (redfin hmv6) the command IB as submitted: its size and GPU address
+    uint64_t submittedIova_ = 0;
+    uint32_t resubmits_ = 0;        // (redfin hmv6) times sent again after a reset gave it up (HM_RESET_RECOVER)
 public:
     ~CommandBuffer();   // (its stamp buffers back to the queue: read until the last reader lets go, which is now)
 private:
@@ -430,6 +453,8 @@ private:
     void submit(std::shared_ptr<CommandBuffer> cb);
     void waiter();
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
+    void recoverAfterReset(CommandBuffer& hung, uint64_t faults);   // (redfin hmv6) HM_RESET_RECOVER, lock_ held
+    uint64_t hangsReported_ = 0;                                       // (redfin hmv6) the reset count the waiter last acted on
 
     Gpu& gpu_;
     std::shared_ptr<Texture> null_;   // (under lock_) nullTexture's
