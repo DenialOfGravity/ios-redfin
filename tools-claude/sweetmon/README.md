@@ -61,6 +61,8 @@ First time only: `collector.py --make-key` writes `agent/sweetmon.key` (the agen
 - **Kernel log rate:** bytes/s the kernel writes, and the top tags of the last 60 s. A tag is the `SWEET XXX` prefix
   or the first word of the line. Click a tag to filter the log by it.
 - **Kernel log:** a live tail with a regex filter, pause and clear. The whole log is in `logs/mon/klog-<boot>.txt`.
+  The selector in the title switches to `wland` (and other followed files) or `os_log`; for os_log it shows an on/off
+  box and the process filter (comma-separated, empty = all; `apply` restarts it with the new filter).
 - **Trace:**
   - kind *kdebug* runs sweettrace in the daemon. Mode *buffer* sends the trace after stop (no load on the link while
     it records); *stream* sends it while it records. Filter *f* keeps only the frame chain; *none* keeps everything.
@@ -84,7 +86,10 @@ Agent actions (`agent/inbox/NAME.req`):
     mon frames on|off | mon rate MS            light frame mode / sample period
     mon klog-pa PA | mon klog-pa auto          the kernel log ring address (default: the KNOWN-GOOD kernel's KLOG_PA.txt,
                                                then 0x101d0ef08 of r63a)
-    mon install                                daemon + key onto the phone, start it
+    mon oslog on [PROC,PROC..] | mon oslog off   the phone's os_log -> logs/mon/oslog-<boot>.txt (off by default)
+    mon tail add NAME PATH | tail del NAME | tail list | logs   follow phone files -> logs/mon/NAME-<boot>.log
+                                               (default: wland = /var/local/wland.log)
+    mon install                                daemon + key onto the phone, quit the old daemon, start the new one
 
 Files (all under the project folder):
 
@@ -96,6 +101,9 @@ Files (all under the project folder):
   `[sweetmon: N bytes of kernel log lost here]` marker shows where the ring overran while disconnected. This
   replaces `klog PA` pulls.
 - `logs/mon/metrics-YYYYMMDD.jsonl`: one compact line per sample (for later plots).
+- `logs/mon/wland-<boottime>.log` (wland's log, always followed) and `logs/mon/oslog-<boottime>.txt` (os_log while
+  `mon oslog on`): live, gap-filled like the kernel log; `[sweetmon: ...]` lines mark rotation, truncation, lost bytes
+  and the oslog child's starts and exits. now.json `logs` has file, bytes, B/s, on/off and lost per stream.
 - `logs/traces/NAME-MMDD-HHMMSS/`: `trace.swtr` (or `prof.bin`), `meta.json` (sizes, MB/s, phone-side
   counters), `summary.json` (`sweet-trace.py --summary-json`), `report.txt` (the analyzer output), and
   `prof.folded` for profiler traces.
@@ -108,7 +116,8 @@ HTTP API (127.0.0.1:8765):
   `/api/traces/DIR/{summary.json,report.txt,meta.json,prof.folded}`, and `/api/stream` (SSE events: init, sample,
   klog, link, hello, trace, speed, frames).
 - POST (JSON): `/api/trace/start {kind,name,secs,opts}`, `/api/trace/stop {abort}`, `/api/cmd {cmd}`,
-  `/api/link {link}`, `/api/speed {mb}`, `/api/frames {on}`, `/api/klog-pa {pa}`, `/api/rate {ms}`.
+  `/api/link {link}`, `/api/speed {mb}`, `/api/frames {on}`, `/api/klog-pa {pa}`, `/api/rate {ms}`,
+  `/api/oslog {on,filter,level}`, `/api/tail {op,name,path}`. GET `/api/log?name=NAME&n=N&grep=RE`, `/api/logs`.
 
 ## Test without the phone
 
@@ -117,4 +126,7 @@ HTTP API (127.0.0.1:8765):
 The test runs the fake daemon on 127.0.0.2 (USB) and 127.0.0.3 (Wi-Fi). It checks connect and auth, samples into
 now.json, klog gap fill, ring overrun, both trace modes (byte-identical to the source), abort, the profiler path,
 speed test, frames, klog-pa, link switching (including auto by speed), a wrong key and a phone reboot, and calls
-every API endpoint.
+every API endpoint. Log streams: wland tail (appends, truncation, rotation, gap fill after a drop and a collector
+restart, ring overrun), oslog (off by default, on with a filter, child death and restart, off), a daemon restart, an
+old daemon. Section 12 builds the real `phone/tools/sweetmon.c` for the host with `cc` (its Linux stubs) and runs the
+log streams against it, plus old daemon / old collector compatibility (sources from git `OLD_REF`).

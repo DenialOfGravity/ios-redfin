@@ -2,6 +2,9 @@
 # e2e-test.sh SRC.swtr [WORKDIR]: collector.py against fakephone.py on loopback (usb=127.0.0.2, wifi=127.0.0.3),
 # every API endpoint with curl, trace round trips compared with cmp. Needs python3, curl; tools-claude/sweet-trace.py
 # and sweet-prof.py next to this folder's parent (or in $TOOLS) for the analysis step.
+# Section 12 builds the real daemon (phone/tools/sweetmon.c, host stubs) with cc when the source is found
+# ($SWEETMON_SRC = the repo's phone/tools, default ../../phone/tools from here) and runs the log streams against it,
+# plus old daemon / old collector compatibility (sources from git $OLD_REF, default ef2252a = before log streams).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 SRC=${1:?usage: e2e-test.sh SRC.swtr [WORKDIR]}
@@ -52,15 +55,56 @@ echo 210434 > "$W/sysctl/kern.sweet_usb_tx_frames"; echo 144198 > "$W/sysctl/ker
 cp "$TOOLS"/sweet-trace.py "$TOOLS"/sweet-prof.py "$W/tools-claude/" 2>/dev/null || echo "(no analyzers in $TOOLS)"
 echo 'klog PA 0x101d0ef08  (_sweet_log_total 0xfffffe0007d0ef08)' > "$W/builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt"
 printf 'KNOWN GOOD\nKernel:   builds/xnu/ws-y-ram-aca60f47b8/ (branch ws-y-ram)\n' > "$W/KNOWN-GOOD.txt"
+# fake /var/local/bin/oslog: numbered lines per process (pid=P n=N), exits 3 while $W/oslog-die exists
+cat > "$W/fakebin/oslog" <<EOF2
+#!/bin/bash
+echo \$\$ >> "$W/oslog.pids"
+echo "fake oslog pid \$\$ args: \$*"
+n=0; while :; do n=\$((n + 1)); echo "oslog pid=\$\$ n=\$n args=\$*"; [ -e "$W/oslog-die" ] && exit 3; sleep 0.1; done
+EOF2
+chmod +x "$W/fakebin/oslog"
+# the phone's /var/local/wland.log (default tail) = $W/phone/var/local/wland.log for the fake
+PH=$W/phone/var/local; WL=$PH/wland.log; mkdir -p "$PH"
+wl() { python3 -c 'import sys; f=open(sys.argv[1],"a"); f.write("".join("wland line %d\n" % i for i in range(int(sys.argv[2]), int(sys.argv[3]) + 1)))' "$1" "$2" "$3"; }
+wl "$WL" 1 20
+# once FILE A B [MORE..]: every "wland line N" (A <= N <= B) exactly once, in order
+once() { python3 - "$@" <<'EOF2'
+import re, sys
+t = open(sys.argv[1], errors='replace').read()
+ns = [int(x) for x in re.findall(r'^wland line (\d+)$', t, re.M)]
+for a, b in zip(sys.argv[2::2], sys.argv[3::2]):
+    want = list(range(int(a), int(b) + 1))
+    got = [n for n in ns if int(a) <= n <= int(b)]
+    assert got == want, 'lines %s..%s: %d found, first diff %s' % (a, b, len(got), next(((i, g, w) for i, (g, w) in enumerate(zip(got, want)) if g != w), None))
+EOF2
+}
+# oslog_ok FILE: per oslog process the numbers are 1..k without gaps or duplicates (gap fill across reconnects)
+oslog_ok() { python3 - "$1" <<'EOF2'
+import re, sys, collections
+seen = collections.defaultdict(list)
+for pid, n in re.findall(r'^oslog pid=(\d+) n=(\d+) ', open(sys.argv[1], errors='replace').read(), re.M):
+    seen[pid].append(int(n))
+assert seen, 'no oslog lines'
+for pid, ns in seen.items():
+    assert ns == list(range(1, len(ns) + 1)), 'pid %s: %d lines, first bad at %s' % (pid, len(ns), next(i for i, n in enumerate(ns) if n != i + 1))
+print('  oslog: %s' % ', '.join('pid %s %d lines' % (p, len(n)) for p, n in seen.items()))
+EOF2
+}
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+lastpid() { tail -1 "$1" 2>/dev/null; }
 python3 "$H/collector.py" --root "$W" --make-key >/dev/null && [ -s "$W/agent/sweetmon.key" ] && ok "--make-key" || bad "--make-key"
 python3 "$H/fakephone.py" --key-file "$W/agent/sweetmon.key" --trace "$SRC" --speedup 5 --ctl-port $CTL --nproc 298 --link-mbps usb=4 --link-mbps wifi=60 \
-	--klog-dump "$W/fake-klog.txt" > "$W/fake.log" 2>&1 &
+	--klog-dump "$W/fake-klog.txt" --file-root "$W/phone" --oslog-bin "$W/fakebin/oslog" --log-ring 65536 > "$W/fake.log" 2>&1 &
 FP=$!
 sleep 1
-python3 "$H/collector.py" --root "$W" --http-port 18765 --usb-host 127.0.0.2 --poke-host 127.0.0.2 --poke-port 15141 \
-	--ssh-port 1 --ssh-bin "$W/fakebin/ssh" --usb-probe-every 3 --ping-every 2 > "$W/collector.out" 2>&1 &
-CP=$!
-trap 'kill $FP $CP 2>/dev/null' EXIT
+start_collector() {
+	python3 "$H/collector.py" --root "$W" --http-port 18765 --usb-host 127.0.0.2 --poke-host 127.0.0.2 --poke-port 15141 \
+		--ssh-port 1 --ssh-bin "$W/fakebin/ssh" --usb-probe-every 3 --ping-every 2 >> "$W/collector.out" 2>&1 &
+	CP=$!
+}
+start_collector
+DP= CP2= CP3= DP3=
+trap 'kill $FP $CP $DP $CP2 $CP3 $DP3 2>/dev/null' EXIT
 T0=$(date +%s)
 
 # 1. connect, auth, samples, now.json
@@ -125,6 +169,77 @@ ctl drop >/dev/null; sleep 0.2; ctl burst 4500000 >/dev/null
 waitfor 15 'd["link"]["authed"] and d["klog"]["lost_bytes"]>0' && ok "ring overrun while disconnected -> lost bytes counted + marker" \
 	&& grep -q 'sweetmon: .* bytes of kernel log lost' "$KF" || bad "lost bytes"
 
+# 4b. log streams (fake daemon): the wland tail (default config), oslog (off by default, on/off, child death),
+#     gap fill across reconnects and a collector restart, truncation/rotation, ring overrun, daemon restart, old daemon
+WF=$W/logs/mon/wland-$BOOT.log; OF=$W/logs/mon/oslog-$BOOT.txt
+waitfor 10 'd["logs"]["wland"]["bytes"] > 0 and d["logs"]["wland"]["on"]' && once "$WF" 1 20 \
+	&& ok "wland tail on by default: phone file -> $(basename "$WF")" || bad "wland tail: $(curl -s $API/api/now | j 'd.get("logs")')"
+[ "$(curl -s $API/api/now | j 'd["logs"]["oslog"]["on"] is False')" = True ] && [ ! -e "$OF" ] && [ ! -e "$W/oslog.pids" ] \
+	&& ok "oslog off by default (no child, no file)" || bad "oslog default"
+wl "$WL" 21 40; sleep 1.5
+once "$WF" 1 40 && ok "wland appends arrive" || bad "wland appends"
+ctl drop >/dev/null; sleep 0.2; wl "$WL" 41 300
+waitfor 15 'd["link"]["authed"]' && sleep 1.5
+once "$WF" 1 300 && ok "wland gap fill after a drop: lines written while disconnected arrive exactly once" || bad "wland gap fill"
+: > "$WL"; wl "$WL" 1001 1010; sleep 1.5
+grep -q 'wland.log truncated' "$WF" && once "$WF" 1001 1010 && ok "wland truncated -> marker + new content" || bad "wland truncate"
+mv "$WL" "$WL.prev"; wl "$WL" 2001 2010; sleep 1.5
+grep -q 'wland.log was replaced' "$WF" && once "$WF" 2001 2010 && ok "wland rotated (renamed + new file, like wland's start) -> marker + new file" || bad "wland rotate"
+ctl 'down usb' >/dev/null; ctl 'down wifi' >/dev/null      # ~80 KB in 3 polls while nobody reads: > the fake's 64 KiB ring
+wl "$WL" 3001 4600; sleep 0.7; wl "$WL" 4601 6200; sleep 0.7; wl "$WL" 6201 8000; sleep 0.7
+ctl 'up usb' >/dev/null; ctl 'up wifi' >/dev/null
+waitfor 15 'd["link"]["authed"] and d["logs"]["wland"]["lost"] > 0' && grep -q 'bytes of wland lost here' "$WF" && once "$WF" 7900 8000 \
+	&& ok "wland ring overrun while disconnected -> lost bytes counted + marker, newest lines kept" || bad "wland overrun"
+r=$(SWEETMON_API=$API python3 "$H/collector.py" ctl oslog on CommCenter,wland)
+[ $? = 0 ] && waitfor 10 'd["logs"]["oslog"]["bytes"] > 0 and d["logs"]["oslog"]["on"]' && grep -q 'args: CommCenter wland' "$OF" \
+	&& [ "$(j 'd["oslog"]["on"] and d["oslog"]["filter"]=="CommCenter,wland"' < "$W/logs/mon/config.json")" = True ] \
+	&& ok "mon oslog on CommCenter,wland -> child with the filter as arguments, $(basename "$OF"), saved in config.json" || bad "oslog on: $r"
+P1=$(lastpid "$W/oslog.pids")
+touch "$W/oslog-die"; sleep 0.5; rm -f "$W/oslog-die"
+waitfor 10 'd["logs"]["oslog"]["starts"] == 2' && grep -q 'oslog exited with status 3 .* restart in 1 s' "$OF" && ! alive "$P1" \
+	&& alive "$(lastpid "$W/oslog.pids")" && ok "oslog child died -> marker, restarted after 1 s" || bad "oslog restart: $(curl -s $API/api/now | j 'd["logs"]["oslog"]')"
+P2=$(lastpid "$W/oslog.pids")
+ctl drop >/dev/null; sleep 2
+waitfor 15 'd["link"]["authed"]' && sleep 1.5
+[ "$(lastpid "$W/oslog.pids")" = "$P2" ] && alive "$P2" && oslog_ok "$OF" \
+	&& ok "reconnect: oslog child kept, its lines gap-filled (none lost or doubled)" || bad "oslog gap fill"
+kill $CP; wait $CP 2>/dev/null; sleep 0.3; wl "$WL" 8001 8050; sleep 2
+start_collector
+waitfor 20 'd["link"]["authed"]' && sleep 2
+once "$WF" 7900 8050 && oslog_ok "$OF" && [ "$(lastpid "$W/oslog.pids")" = "$P2" ] \
+	&& ok "collector restart: wland + oslog gap-filled from state.json positions" || bad "collector restart gap fill"
+r=$(SWEETMON_API=$API python3 "$H/collector.py" ctl oslog off)
+sleep 1.5
+! alive "$P2" && grep -q 'oslog off: asked by the client' "$OF" && grep -q 'oslog stopped (killed by signal 15' "$OF" \
+	&& [ "$(j 'd["oslog"]["on"]' < "$W/logs/mon/config.json")" = False ] && ok "mon oslog off -> child killed, marker, saved" || bad "oslog off: $r"
+SWEETMON_API=$API python3 "$H/collector.py" ctl oslog on CommCenter >/dev/null; sleep 1; P3=$(lastpid "$W/oslog.pids")
+ctl drop >/dev/null; sleep 0.2; ctl newdaemon >/dev/null
+waitfor 15 'd["link"]["authed"] and d["logs"]["oslog"]["bytes"] > 0' && sleep 1.5; wl "$WL" 9001 9010; sleep 1.5
+grep -q 'the phone daemon restarted' "$WF" && once "$WF" 2001 2010 9001 9010 && [ "$(lastpid "$W/oslog.pids")" != "$P3" ] \
+	&& alive "$(lastpid "$W/oslog.pids")" && grep -q "args: CommCenter$" "$OF" \
+	&& ok "daemon restart (new log epoch): tail resumes with new=1 (no old lines again), oslog re-applied from config.json" || bad "new daemon epoch"
+SWEETMON_API=$API python3 "$H/collector.py" ctl oslog off >/dev/null
+echo 'mtl line 1' > "$PH/mtl.log"
+r=$(SWEETMON_API=$API python3 "$H/collector.py" ctl tail add mtl /var/local/mtl.log); sleep 1.5
+grep -q 'mtl line 1' "$W/logs/mon/mtl-$BOOT.log" && [ "$(j '"mtl" in d["tails"]' < "$W/logs/mon/config.json")" = True ] \
+	&& SWEETMON_API=$API python3 "$H/collector.py" ctl tail list | grep -q '^log mtl: tail /var/local/mtl.log' \
+	&& ok "mon tail add mtl /var/local/mtl.log + tail list" || bad "tail add: $r"
+r=$(SWEETMON_API=$API python3 "$H/collector.py" ctl tail del mtl)
+[ "$(j '"mtl" not in d["tails"]' < "$W/logs/mon/config.json")" = True ] && [ "$(ctl state | j '"mtl" not in d["logs"]')" = True ] \
+	&& ok "mon tail del mtl" || bad "tail del: $r"
+[ "$(SWEETMON_API=$API python3 "$H/collector.py" ctl tail add bad ../x | grep -c '"ok": false')" = 1 ] && ok "tail add with a bad path refused" || bad "tail bad path"
+[ "$(curl -s "$API/api/log?name=wland&n=5&grep=line%208" | j 'len(d["lines"])>0 and all("line 8" in l for l in d["lines"])')" = True ] \
+	&& [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/log?name=nosuch")" = 404 ] && curl -s $API/ | grep -q 'id="logsel"' \
+	&& ok "GET /api/log?name=wland&grep=, 404 for an unknown stream, dashboard log selector" || bad "/api/log"
+timeout 3 curl -s -N "$API/api/stream" > "$W/sse2.txt" & SP=$!; sleep 0.5; wl "$WL" 9011 9012; wait $SP
+grep -q '^event: log' "$W/sse2.txt" && ok "SSE log events" || bad "SSE log"
+ctl nologs >/dev/null; ctl drop >/dev/null
+waitfor 15 'd["link"]["authed"] and "older sweetmon" in (d["logs"]["wland"]["status"] or "")' \
+	&& [ "$(SWEETMON_API=$API python3 "$H/collector.py" ctl oslog on x | grep -c 'saved; applied on connect')" = 1 ] \
+	&& waitfor 5 'd["link"]["authed"]' && ok "old daemon (no log streams in hello): link and samples fine, logs say why" || bad "old daemon compat"
+SWEETMON_API=$API python3 "$H/collector.py" ctl oslog off >/dev/null
+ctl logs >/dev/null; ctl drop >/dev/null; waitfor 15 'd["link"]["authed"] and not (d["logs"]["wland"]["status"] or "").startswith("daemon without")'
+
 # 5. trace round trips
 for mode in buffer stream; do
 	t1=$(date +%s.%N)
@@ -172,7 +287,7 @@ PD=$!
 r=$(post /api/speed '{"mb":24}' 120); wait $PD
 [ "$(echo "$r" | j 'd["ok"] and d["bytes"]==24*1048576 and d["pc_s"]>4')" = True ] \
 	&& [ "$(j 'd["ok"] and d["msg"]=="during-speed"' < "$W/ping-during.json")" = True ] \
-	&& ! grep -q 'unsolicited reply' "$W/logs/mon/collector.log" \
+	&& ! grep -q "unsolicited reply {'cmd': 'speed'" "$W/logs/mon/collector.log" \
 	&& ok "slow speed test: ping answered first, speed reply still matched ($(echo "$r" | j 'd["mbps"]') MB/s in $(echo "$r" | j 'd["pc_s"]') s, no unsolicited reply)" \
 	|| bad "reply matching: speed $r ping $(cat "$W/ping-during.json")"
 # USB fast path (xnu 1034): set over ssh after auth with "sctl NAME VALUE", read back, shown in now.json and snap
@@ -260,6 +375,96 @@ python3 "$H/collector.py" ctl status > "$W/ctl.txt" && python3 "$H/collector.py"
 python3 "$H/collector.py" ctl trace c1 kdebug 2 mode=buffer >/dev/null && python3 "$H/collector.py" ctl wait 60 >/dev/null && ok "ctl trace + wait" || bad "ctl trace"
 kill $FP; sleep 3
 [ "$(curl -s $API/api/now | j 'not d["link"]["authed"]')" = True ] && ok "phone gone -> collector up, link down" || bad "phone gone"
+
+# 12. the real daemon: phone/tools/sweetmon.c built for the host (its Linux stubs) + a second collector (klog off)
+SRCD=${SWEETMON_SRC:-$H/../../phone/tools}
+OLD_REF=${OLD_REF:-ef2252a}
+if [ -f "$SRCD/sweetmon.c" ] && command -v cc >/dev/null; then
+	RW=$W/real; RWL=$RW/phone/wland.log; API2=http://127.0.0.1:18766
+	mkdir -p "$RW/logs/mon" "$RW/agent" "$RW/phone"; cp "$W/agent/sweetmon.key" "$RW/agent/"
+	KEY=$(cat "$RW/agent/sweetmon.key")
+	cc -O1 -Wall -Wextra -o "$RW/sweetmon" "$SRCD/sweetmon.c" "$SRCD/lz4/lz4.c" -lpthread 2> "$RW/cc.log" \
+		&& ok "host build of $(cd "$SRCD" && pwd)/sweetmon.c ($(grep -c 'warning:' "$RW/cc.log") warnings)" || bad "host build: $(head -5 "$RW/cc.log")"
+	wl "$RWL" 1 50
+	printf '{"link":"usb","klog_off":true,"usb_fast":null,"tails":{"wland":"%s"},"oslog":{"on":false,"filter":""}}\n' "$RWL" > "$RW/logs/mon/config.json"
+	"$RW/sweetmon" -k "$KEY" -p 15150 -O "$W/fakebin/oslog" -R 64 2> "$RW/daemon.err" & DP=$!
+	start_c2() { python3 "$H/collector.py" --root "$RW" --http-port 18766 --usb-host 127.0.0.1 --port 15150 --no-autostart \
+		--ssh-port 1 --ssh-bin "$W/fakebin/ssh" --ping-every 2 >> "$RW/collector.out" 2>&1 & CP2=$!; }
+	w2() { local API=$API2; waitfor "$@"; }
+	ctl2() { SWEETMON_API=$API2 python3 "$H/collector.py" ctl "$@"; }
+	cpu_ms() { python3 -c 'import os,sys; f=open("/proc/%s/stat" % sys.argv[1]).read().rsplit(")",1)[1].split(); print((int(f[11])+int(f[12]))*1000//os.sysconf("SC_CLK_TCK"))' "$1"; }
+	sleep 0.3; start_c2
+	w2 15 'd["link"]["authed"] and d["logs"]["wland"]["bytes"] > 0' && RB=$(curl -s $API2/api/now | j 'd["phone"]["boottime"]') \
+		&& RWF=$RW/logs/mon/wland-$RB.log && once "$RWF" 1 50 && ok "real daemon: tail add, file -> $(basename "$RWF")" || bad "real daemon tail: $(curl -s $API2/api/now | j 'd.get("logs")')"
+	wl "$RWL" 51 60; sleep 1.6
+	: > "$RWL"; wl "$RWL" 1001 1005; sleep 1.6
+	wl "$RWL" 1006 1010; sleep 1.2       # then truncated and rewritten past the old end between two polls:
+	python3 -c 'import sys; open(sys.argv[1], "w").write("".join("wland line %d\n" % i for i in range(1011, 1201)))' "$RWL"; sleep 1.6
+	mv "$RWL" "$RWL.prev"; wl "$RWL" 2001 2010; sleep 1.6
+	once "$RWF" 1 60 1001 1010 1011 1200 2001 2010 && grep -q 'wland.log truncated' "$RWF" \
+		&& grep -q 'rewritten past the old end' "$RWF" && grep -q 'wland.log was replaced' "$RWF" \
+		&& ok "real daemon: appends, truncation (shorter and rewritten past the old end), rotation" || bad "real daemon truncate/rotate: $(grep sweetmon "$RWF")"
+	kill $CP2; wait $CP2 2>/dev/null; wl "$RWL" 2011 2400; start_c2
+	w2 15 'd["link"]["authed"]' && sleep 2.5
+	once "$RWF" 2001 2400 && ok "real daemon: collector restart -> lines written meanwhile arrive exactly once (tail add from=POS)" || bad "real daemon gap fill"
+	kill $CP2; wait $CP2 2>/dev/null
+	wl "$RWL" 3001 5000; sleep 1.3; wl "$RWL" 5001 7000; sleep 1.3; wl "$RWL" 7001 9000; sleep 1.3        # ~100 KB > the 64 KiB ring
+	start_c2
+	w2 15 'd["link"]["authed"] and d["logs"]["wland"]["lost"] > 0' && sleep 1 && grep -q 'bytes of wland lost here' "$RWF" && once "$RWF" 8500 9000 \
+		&& ok "real daemon: 64 KiB ring overrun while no client -> lost marker, newest bytes kept ($(curl -s $API2/api/now | j 'd["logs"]["wland"]["lost"]') B lost)" || bad "real daemon overrun"
+	[ "$(curl -s $API2/api/now | j 'd["logs"]["oslog"]["on"] is False and not d["logs"]["oslog"].get("pid")')" = True ] && ok "real daemon: oslog off by default" || bad "real oslog default"
+	ROF=$RW/logs/mon/oslog-$RB.txt
+	r=$(ctl2 oslog on CommCenter,wland); w2 10 'd["logs"]["oslog"]["bytes"] > 0' && sleep 0.5
+	RP1=$(lastpid "$W/oslog.pids")
+	grep -q "started: $W/fakebin/oslog CommCenter wland (pid $RP1, start 1)" "$ROF" && alive "$RP1" && [ "$(ps -o ppid= -p "$RP1" | tr -d ' ')" = "$DP" ] \
+		&& ok "real daemon: oslog on CommCenter,wland -> posix_spawn child of the daemon with the filter, $(basename "$ROF")" || bad "real oslog on: $r"
+	touch "$W/oslog-die"; sleep 0.4; rm -f "$W/oslog-die"
+	w2 10 'd["logs"]["oslog"]["starts"] == 2 and d["logs"]["oslog"]["pid"] > 0' && ! alive "$RP1" && grep -q 'oslog exited with status 3 after .* restart in 1 s' "$ROF" \
+		&& ok "real daemon: oslog died -> reaped, marker, restarted after 1 s" \
+		|| bad "real oslog restart: $(curl -s $API2/api/now | j 'd["logs"]["oslog"]') RP1 $RP1 $(ps -o stat= -p "$RP1") $(grep -c 'restart in 1 s' "$ROF")"
+	RP2=$(lastpid "$W/oslog.pids"); kill $CP2; wait $CP2 2>/dev/null; sleep 2; start_c2
+	w2 15 'd["link"]["authed"]' && sleep 1.5
+	oslog_ok "$ROF" && [ "$(lastpid "$W/oslog.pids")" = "$RP2" ] && ok "real daemon: oslog keeps running without a client, gap-filled on reconnect" || bad "real oslog gap"
+	r=$(ctl2 oslog off); sleep 1.5
+	! alive "$RP2" && grep -q 'oslog stopped (killed by signal 15' "$ROF" && ok "real daemon: oslog off -> child killed (SIGTERM) and reaped" || bad "real oslog off: $r"
+	# cost: tails idle, oslog off, collector connected (rate 1000, process table every 2nd sample), then no client
+	sleep 1; c0=$(cpu_ms $DP); sleep 10; c1=$(cpu_ms $DP)
+	kill $CP2; wait $CP2 2>/dev/null; sleep 1; c2=$(cpu_ms $DP); sleep 10; c3=$(cpu_ms $DP)
+	[ $((c1 - c0)) -le 100 ] && [ $((c3 - c2)) -le 50 ] && ok "real daemon cost (host): $((c1 - c0)) ms in 10 s with the collector, $((c3 - c2)) ms in 10 s without (tail polled 1/s)" \
+		|| bad "real daemon cost: $((c1 - c0)) / $((c3 - c2)) ms per 10 s"
+	# old collector + new daemon (oslog on: the daemon has streams, but sends no L frame to a client that did not ask)
+	start_c2; w2 15 'd["link"]["authed"]'; ctl2 oslog on wland >/dev/null; sleep 1; RP3=$(lastpid "$W/oslog.pids"); kill $CP2; wait $CP2 2>/dev/null
+	OW=$W/oldc; mkdir -p "$OW/logs/mon" "$OW/agent" "$OW/tool"; cp "$RW/agent/sweetmon.key" "$OW/agent/"
+	printf '{"link":"usb","klog_off":true,"usb_fast":null}\n' > "$OW/logs/mon/config.json"
+	if git -C "$SRCD" show "$OLD_REF:tools-claude/sweetmon/collector.py" > "$OW/tool/collector.py" 2>/dev/null && cp "$H/lz4py.py" "$OW/tool/"; then
+		python3 "$OW/tool/collector.py" --root "$OW" --http-port 18767 --usb-host 127.0.0.1 --port 15150 --no-autostart \
+			--ssh-port 1 --ssh-bin "$W/fakebin/ssh" > "$OW/collector.out" 2>&1 & CP3=$!
+		(API=http://127.0.0.1:18767; waitfor 15 'd["link"]["authed"] and d.get("cpu") is not None') && sleep 3 \
+			&& ! grep -q "unknown frame type 'L'" "$OW/logs/mon/collector.log" && alive "$RP3" \
+			&& ok "old collector ($OLD_REF) + new daemon with an oslog stream running: samples, no L frames" || bad "old collector compat"
+		kill $CP3; wait $CP3 2>/dev/null
+	else echo "SKIP old collector: no git $OLD_REF in $SRCD"; fi
+	kill $DP; wait $DP 2>/dev/null; sleep 0.3
+	! alive "$RP3" && ok "real daemon exit (SIGTERM) kills its oslog child" || bad "oslog child left after the daemon exit"
+	# old daemon + new collector
+	OD=$W/oldd; mkdir -p "$OD/lz4" "$OD/logs/mon" "$OD/agent"; cp "$RW/agent/sweetmon.key" "$OD/agent/"
+	if git -C "$SRCD" show "$OLD_REF:phone/tools/sweetmon.c" > "$OD/sweetmon.c" 2>/dev/null && cp "$SRCD"/lz4/lz4.[ch] "$OD/lz4/" \
+		&& cc -O1 -o "$OD/sweetmon" "$OD/sweetmon.c" "$OD/lz4/lz4.c" -lpthread 2>/dev/null; then
+		printf '{"link":"usb","klog_off":true,"usb_fast":null,"tails":{"wland":"%s"}}\n' "$RWL" > "$OD/logs/mon/config.json"
+		"$OD/sweetmon" -k "$KEY" -p 15151 2>/dev/null & DP3=$!; sleep 0.3
+		python3 "$H/collector.py" --root "$OD" --http-port 18768 --usb-host 127.0.0.1 --port 15151 --no-autostart \
+			--ssh-port 1 --ssh-bin "$W/fakebin/ssh" > "$OD/collector.out" 2>&1 & CP3=$!
+		(API=http://127.0.0.1:18768; waitfor 15 'd["link"]["authed"] and d.get("cpu") is not None and "older sweetmon" in (d["logs"]["wland"]["status"] or "")') \
+			&& [ "$(SWEETMON_API=http://127.0.0.1:18768 python3 "$H/collector.py" ctl oslog on x | grep -c 'saved; applied on connect')" = 1 ] \
+			&& [ "$(curl -s http://127.0.0.1:18768/api/cmd -X POST -d '{"cmd":"oslog status"}' | j 'd["ok"] is False and "unknown" in d["msg"]')" = True ] \
+			&& (API=http://127.0.0.1:18768; sleep 2; waitfor 5 'd["link"]["authed"]') && ! grep -q Traceback "$OD/collector.out" \
+			&& ok "old daemon ($OLD_REF) + new collector: samples, logs say 'older sweetmon', unknown commands answered, session kept" || bad "old daemon compat"
+		kill $CP3 $DP3; wait $CP3 $DP3 2>/dev/null
+	else echo "SKIP old daemon: no git $OLD_REF in $SRCD (or no cc)"; fi
+	grep -q Traceback "$RW/collector.out" && bad "real-daemon collector stderr has a traceback" || true
+else
+	echo "SKIP 12 (real daemon): no $SRCD/sweetmon.c or no cc"
+fi
 grep -c ERROR "$W/logs/mon/collector.log" | sed 's/^/collector.log ERROR lines: /'
 grep -q Traceback "$W/collector.out" && bad "collector stderr has a traceback" || ok "no traceback in collector stderr"
 echo "total $(( $(date +%s) - T0 )) s, failures $FAIL"

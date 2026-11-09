@@ -180,8 +180,11 @@ a { color: var(--accent); }
   </section>
 
   <section class="panel c7">
-    <h2>Kernel log <span class="sub" id="klog-file"></span>
-      <span class="right ctl"><input type="text" id="kfilter" placeholder="filter (regex)" style="width:220px">
+    <h2><select id="logsel" title="which log: the kernel log, a followed phone file (mon tail) or os_log (mon oslog)"><option value="klog">Kernel log</option></select>
+      <span class="sub" id="klog-file"></span>
+      <span class="right ctl"><span id="oslogctl" class="ctl" style="display:none"><label title="os_log streamer on the phone (costs CPU there; off by default)"><input type="checkbox" id="oslog-on"> on</label>
+      <input type="text" id="oslog-filter" placeholder="processes: CommCenter,wland (empty = all)" style="width:200px"><button class="btn" id="oslog-apply">apply</button></span>
+      <input type="text" id="kfilter" placeholder="filter (regex)" style="width:220px">
       <button class="btn" id="kpause">pause</button><button class="btn" id="kclear">clear</button></span></h2>
     <pre class="klog" id="klog"></pre>
   </section>
@@ -381,7 +384,7 @@ function onSnap(s) {
   // klog
   const k = s.klog;
   $('#klog-sub').textContent = 'now ' + fmt((k.bps_kernel || 0) / 1024, 1) + ' KB/s' + (k.lost_bytes ? ', lost ' + k.lost_bytes + ' B' : '');
-  $('#klog-file').textContent = (k.file || '') + (k.status && !String(k.status).startsWith('ok') ? ' — ' + k.status : '');
+  logsUI(s.logs || {}, k);
   const mt = Math.max(1, ...k.top_tags.map((x) => x.bps));
   $('#tags tbody').innerHTML = k.top_tags.map((x) => '<tr data-tag="' + esc(x.tag) + '"><td>' + esc(x.tag) + '</td><td class="n">' + x.bps + '</td><td class="n">' + x.lines_s + '</td><td><div class="bar"><span style="width:' + (x.bps / mt * 100) + '%;background:var(--s7)"></span></div></td></tr>').join('');
   if (s.trace) showTrace(s.trace);
@@ -400,26 +403,66 @@ $('#proc thead').addEventListener('click', (e) => { const k = e.target.dataset.k
 $('#proc tbody').addEventListener('click', (e) => { const tr = e.target.closest('tr'); if (!tr) return; S.target = tr.dataset.name; $('#tr-target').value = S.target; $('#tr-kind').value = 'prof'; $('#tr-name').value = S.target.replace(/[^A-Za-z0-9._-]/g, '_'); kindUI(); procTable(); });
 $('#tags tbody').addEventListener('click', (e) => { const tr = e.target.closest('tr'); if (!tr) return; $('#kfilter').value = '^\\[[ 0-9.]*\\] ' + tr.dataset.tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); renderKlog(true); });
 
-// ------------------------------------------------------------------ klog tail
+// ------------------------------------------------------------------ log tail: klog or a log stream (logsel)
 const KMAX = 4000;
+S.logsel = 'klog'; S.logs = {}; S.logview = {};
+try { S.logsel = localStorage.getItem('sm-logsel') || 'klog'; } catch (e) {}
+const curLines = () => S.logsel === 'klog' ? S.klog : (S.logs[S.logsel] || (S.logs[S.logsel] = []));
+function logsUI(lv, k) {
+  S.logview = lv;
+  const sel = $('#logsel'), names = ['klog', ...Object.keys(lv).sort()];
+  if ([...sel.options].map((o) => o.value).join() !== names.join()) {
+    sel.innerHTML = names.map((n) => '<option value="' + esc(n) + '">' + (n === 'klog' ? 'Kernel log' : n === 'oslog' ? 'os_log' : esc(n) + ' log') + '</option>').join('');
+    if (!names.includes(S.logsel)) S.logsel = 'klog';
+    sel.value = S.logsel;
+  }
+  const v = lv[S.logsel];
+  $('#klog-file').textContent = S.logsel === 'klog' ? (k.file || '') + (k.status && !String(k.status).startsWith('ok') ? ' — ' + k.status : '')
+    : v ? (v.file || '(no file yet)') + (v.kind === 'file' ? ' ← ' + (v.path || '') : '') + ', ' + fmt((v.bps || 0) / 1024, 1) + ' KB/s' + (v.lost ? ', lost ' + v.lost + ' B' : '') + (v.status ? ' — ' + v.status : '') : '';
+  $('#oslogctl').style.display = S.logsel === 'oslog' ? '' : 'none';
+  const o = lv.oslog;
+  if (o) { $('#oslog-on').checked = !!o.on; if (document.activeElement !== $('#oslog-filter') && !S.oslogDirty) $('#oslog-filter').value = o.filter || ''; }
+}
+async function selectLog(name) {
+  S.logsel = name; try { localStorage.setItem('sm-logsel', name); } catch (e) {}
+  if (name !== 'klog' && !(S.logs[name] || []).length) { try { const r = await api('/api/log?name=' + encodeURIComponent(name) + '&n=800'); S.logs[name] = r.lines || []; } catch (e) {} }
+  if (S.snap) logsUI(S.snap.logs || {}, S.snap.klog || {});
+  renderKlog(true);
+}
+function addLog(d) {
+  const a = S.logs[d.name] || (S.logs[d.name] = []);
+  a.push(...d.lines); if (a.length > KMAX) a.splice(0, a.length - KMAX);
+  if (d.name === S.logsel && !S.kpaused) renderKlog();
+}
+$('#logsel').addEventListener('change', (e) => selectLog(e.target.value));
+$('#oslog-filter').addEventListener('input', () => { S.oslogDirty = true; });
+async function oslogSet(on) {
+  const r = await api('/api/oslog', { on, filter: $('#oslog-filter').value.trim() });
+  S.oslogDirty = false;
+  if (r.logs && S.snap) { S.snap.logs = r.logs; logsUI(r.logs, S.snap.klog || {}); }
+  if (r.ok === false) alert(r.msg);
+}
+$('#oslog-on').addEventListener('change', (e) => oslogSet(e.target.checked));
+$('#oslog-apply').addEventListener('click', () => oslogSet(true));
 function addKlog(lines) {
   if (S.kpaused) { S.kpending.push(...lines); if (S.kpending.length > KMAX) S.kpending.splice(0, S.kpending.length - KMAX); $('#kpause').textContent = 'resume (' + S.kpending.length + ')'; return; }
   S.klog.push(...lines); if (S.klog.length > KMAX) S.klog.splice(0, S.klog.length - KMAX);
-  renderKlog();
+  if (S.logsel === 'klog') renderKlog();
 }
 let kre = null, kreSrc = null;
 function renderKlog(force) {
   const el = $('#klog'), src = $('#kfilter').value;
   if (src !== kreSrc) { kreSrc = src; try { kre = src ? new RegExp(src, 'i') : null; $('#kfilter').style.borderColor = ''; } catch (e) { kre = null; $('#kfilter').style.borderColor = 'var(--critical)'; } }
   const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-  let rows = kre ? S.klog.filter((l) => kre.test(l)) : S.klog;
+  const all = curLines();
+  let rows = kre ? all.filter((l) => kre.test(l)) : all;
   rows = rows.slice(-1200);
   el.innerHTML = rows.map((l) => { const e = esc(l); if (!kre) return e; return e.replace(new RegExp('(' + esc(src).replace(/^\^/, '') + ')', 'i'), '<span class="m">$1</span>'); }).join('\n');
   if (atBottom || force) el.scrollTop = el.scrollHeight;
 }
 $('#kfilter').addEventListener('input', () => renderKlog(true));
-$('#kpause').addEventListener('click', () => { S.kpaused = !S.kpaused; $('#kpause').textContent = S.kpaused ? 'resume' : 'pause'; if (!S.kpaused) { const p = S.kpending; S.kpending = []; addKlog(p); } });
-$('#kclear').addEventListener('click', () => { S.klog = []; S.kpending = []; renderKlog(); });
+$('#kpause').addEventListener('click', () => { S.kpaused = !S.kpaused; $('#kpause').textContent = S.kpaused ? 'resume' : 'pause'; if (!S.kpaused) { const p = S.kpending; S.kpending = []; addKlog(p); renderKlog(); } });
+$('#kclear').addEventListener('click', () => { if (S.logsel === 'klog') { S.klog = []; S.kpending = []; } else S.logs[S.logsel] = []; renderKlog(); });
 
 // ------------------------------------------------------------------ API
 async function api(path, body) {
@@ -491,12 +534,14 @@ function pushH(h) { S.hist.push(h); S.lastT = h.t; const lim = h.t - 960; while 
 async function init() {
   try { const h = await api('/api/history?secs=900'); S.hist = h; if (h.length) S.lastT = h[h.length - 1].t; } catch (e) {}
   try { const k = await api('/api/klog?n=800'); S.klog = k.lines || []; renderKlog(true); } catch (e) {}
+  if (S.logsel !== 'klog') selectLog(S.logsel);
   try { const n = await api('/api/now'); if (n.cpu) onSnap(n); else showLink(n.link); } catch (e) {}
   loadTraces(); redraw();
   const es = new EventSource('/api/stream');
   es.addEventListener('init', (e) => { const d = JSON.parse(e.data); if (d.link) showLink(d.link); if (d.trace) showTrace(d.trace); });
   es.addEventListener('sample', (e) => { const d = JSON.parse(e.data); pushH(d.h); onSnap(d.snap); redraw(); });
   es.addEventListener('klog', (e) => addKlog(JSON.parse(e.data).lines));
+  es.addEventListener('log', (e) => addLog(JSON.parse(e.data)));
   es.addEventListener('link', (e) => showLink(JSON.parse(e.data)));
   es.addEventListener('hello', (e) => { const d = JSON.parse(e.data); showLink(d.link); });
   es.addEventListener('trace', (e) => { const t = JSON.parse(e.data); showTrace(t); if (!ACTIVE.includes(t.state) || t.state === 'analyzing') loadTraces(); });

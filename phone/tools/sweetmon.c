@@ -1,7 +1,7 @@
 /*
  * sweetmon: low-overhead monitor daemon for the redfin port (design and wire protocol: docs/redfin/sweetmon.md).
  *
- *   sweetmon [-D] [-p PORT] [-k TOKEN | -K] [-l LOGFILE] [-v]
+ *   sweetmon [-D] [-p PORT] [-k TOKEN | -K] [-l LOGFILE] [-v] [-O OSLOG] [-R KIB]
  *   sweetmon -Z IN OUT      compress IN into the LZ4 frame format the daemon sends (test of the writer)
  *
  *   -D        daemonize (double fork, setsid, stdio to /dev/null)
@@ -9,11 +9,17 @@
  *   -k TOKEN  auth token (default: first line of /var/local/sweetmon.key, hex); -K: no auth (tests only)
  *   -l FILE   debug log (default none: nothing is written to flash)
  *   -v        verbose (debug log to stderr when not daemonized)
+ *   -O OSLOG  the os_log streamer the "oslog on" command stream runs (default /var/local/bin/oslog)
+ *   -R KIB    RAM ring per log stream (default 1024 KiB; 64..16384)
  *
  * One process, single-threaded event loop (poll) with timers; one worker thread only while a trace or a pmem read
  * runs. One authenticated client at a time (a new authenticated client replaces the old one). Frames: u32 LE len
  * (bytes after it) + u8 type + payload. Phone -> PC: H hello, S sample, K klog, R reply, T trace chunk, E trace end,
- * F frame stats, P speed filler. PC -> phone: C command line.
+ * F frame stats, P speed filler, L log stream bytes. PC -> phone: C command line.
+ *
+ * Log streams (tail add / oslog on): named byte streams (a followed file, or the stdout of one child started with
+ * posix_spawn) kept in a RAM ring each and sent as L frames to the client that asked for them; they keep collecting
+ * while no client is connected, so the PC can fill the gap after a reconnect ("from=POS").
  *
  * kdebug traces are byte-compatible with phone/tools/sweettrace.c (ws-u-lab: header, kd_buf events, thread map,
  * the -F/-f reduction), sent as one LZ4 frame (independent 4 MiB blocks, no checksums) in T chunks of <= 1 MiB.
@@ -25,6 +31,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -42,6 +49,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -1811,6 +1819,698 @@ static void speed_pump(void)
 	}
 }
 
+/* ------------------------------------------------------------------------------------------------ log streams */
+
+/*
+ * A log stream is a named byte stream with a RAM ring (ls_cap, default 1 MiB) and a position: the number of bytes
+ * the stream has produced since this daemon made it (hello "log_epoch" names the daemon instance, so the PC knows
+ * whether its saved position still means anything). Kinds:
+ *   file ("tail add NAME PATH"): PATH followed by offset, polled every TAIL_POLL_MS whether or not a client is
+ *        connected. inode/dev change = rotated or recreated: the rest of the old file, then the new one from 0;
+ *        size < offset = truncated: from 0. Each case writes a "[sweetmon: ...]" line into the stream.
+ *   cmd  ("oslog on [FILTER]"): one child (posix_spawn, stdout+stderr into a pipe), read at most every CMD_READ_MS;
+ *        restarted with backoff while on, killed on off, on daemon exit and after CMD_IDLE_MS without a client.
+ * Bytes go out as L frames (u8 name length, name, u64 LE position of the first byte, bytes) only to a client that
+ * asked for the stream (tail add / oslog on, optional from=POS); an older client never sees an L frame.
+ * No SIGCHLD handler: the one child is reaped with waitpid(pid, WNOHANG) on the loop.
+ */
+#define NSTREAM         8
+#define LS_NAME         24
+#define LS_PATH         256
+#define LS_READ         (64u << 10)
+#define TAIL_POLL_MS    1000
+#define CMD_READ_MS     100
+#define CMD_CHECK_MS    1000
+#define CMD_KILL_MS     2000
+#define CMD_IDLE_MS     (600u * 1000)
+#define CMD_BACKOFF_MIN 1000
+#define CMD_BACKOFF_MAX 60000
+#define CMD_RAN_OK_MS   30000
+
+enum { LS_FILE = 1, LS_CMD = 2 };
+struct lstream {
+	int kind;                       /* 0: free slot */
+	char name[LS_NAME], path[LS_PATH];
+	uint8_t *ring;
+	size_t cap;
+	uint64_t total, cpos, sent;     /* produced; next byte for the client; bytes sent */
+	int sub;                        /* the active client asked for it */
+	uint8_t last;                   /* last byte produced (markers start on a new line) */
+	/* file */
+	int fd, opened, start_end, gone_noted;
+	dev_t dev;
+	ino_t ino;
+	uint64_t off, next_ms, skipped;
+	unsigned rotated, truncated;
+	uint8_t fp[32];                 /* the last bytes read before off: a file rewritten past off shows up as a change */
+	size_t fpn;
+	/* cmd */
+	int on, pfd, levels, respawn, status;
+	pid_t pid;
+	char filter[LS_PATH];
+	unsigned starts;
+	uint64_t start_ms, restart_ms, backoff_ms, kill_ms, rd_ms, check_ms;
+};
+static struct lstream lss[NSTREAM];
+static size_t ls_cap = 1u << 20;
+static const char *oslog_bin = "/var/local/bin/oslog";
+static char log_epoch[40];
+static uint64_t noclient_ms;            /* when the last client went (0: never had one) */
+static uint8_t ls_rbuf[LS_READ];
+extern char **environ;
+static int set_nb(int fd);
+
+static uint64_t ls_lo(const struct lstream *s) { return s->total > s->cap ? s->total - s->cap : 0; }
+
+static void ls_put(struct lstream *s, const void *p, size_t n)
+{
+	if (n == 0)
+		return;
+	if (s->ring == NULL) {
+		if ((s->ring = malloc(ls_cap)) == NULL)
+			return;
+		s->cap = ls_cap;
+	}
+	const uint8_t *b = p;
+	s->last = b[n - 1];
+	if (n > s->cap) {
+		s->total += n - s->cap;
+		b += n - s->cap;
+		n = s->cap;
+	}
+	while (n > 0) {
+		size_t off = (size_t)(s->total % s->cap), a = s->cap - off < n ? s->cap - off : n;
+		memcpy(s->ring + off, b, a);
+		s->total += a;
+		b += a;
+		n -= a;
+	}
+}
+
+/* "[sweetmon: ...]" line in the stream itself (the PC writes it into the file like any other byte) */
+static void ls_note(struct lstream *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void ls_note(struct lstream *s, const char *fmt, ...)
+{
+	char m[600];
+	int k = snprintf(m, sizeof(m), "%s[sweetmon: ", s->total > 0 && s->last != '\n' ? "\n" : "");
+	va_list ap;
+	va_start(ap, fmt);
+	k += vsnprintf(m + k, sizeof(m) - (size_t)k - 3, fmt, ap);
+	va_end(ap);
+	if (k > (int)sizeof(m) - 3)
+		k = (int)sizeof(m) - 3;
+	m[k++] = ']';
+	m[k++] = '\n';
+	ls_put(s, m, (size_t)k);
+	dbg("log %s: %.*s", s->name, k - 1, m);
+}
+
+static struct lstream *ls_find(const char *name)
+{
+	for (int i = 0; i < NSTREAM; i++)
+		if (lss[i].kind && strcmp(lss[i].name, name) == 0)
+			return &lss[i];
+	return NULL;
+}
+
+static struct lstream *ls_new(const char *name, int kind)
+{
+	for (int i = 0; i < NSTREAM; i++) {
+		struct lstream *s = &lss[i];
+		if (s->kind == 0) {
+			memset(s, 0, sizeof(*s));
+			s->kind = kind;
+			s->fd = s->pfd = -1;
+			snprintf(s->name, sizeof(s->name), "%s", name);
+			return s;
+		}
+	}
+	return NULL;
+}
+
+static int ls_name_ok(const char *n)
+{
+	size_t l = strlen(n);
+	if (l == 0 || l >= LS_NAME)
+		return 0;
+	for (size_t i = 0; i < l; i++)
+		if (!((n[i] >= 'a' && n[i] <= 'z') || (n[i] >= 'A' && n[i] <= 'Z') || (n[i] >= '0' && n[i] <= '9') || n[i] == '_' ||
+		    n[i] == '-' || n[i] == '.'))
+			return 0;
+	return 1;
+}
+
+/* L frames while there is room in the queue */
+static void ls_pump(void)
+{
+	if (cl == NULL || !cl->authed)
+		return;
+	for (int i = 0; i < NSTREAM; i++) {
+		struct lstream *s = &lss[i];
+		if (!s->kind || !s->sub || s->ring == NULL)
+			continue;
+		while (cl->queued < Q_PRODUCE && s->cpos < s->total) {
+			uint64_t lo = ls_lo(s);
+			if (s->cpos < lo)
+				s->cpos = lo;       /* overwritten while nobody read it: the PC sees the jump (lost bytes) */
+			uint64_t n = s->total - s->cpos;
+			if (n > K_PIECE)
+				n = K_PIECE;
+			size_t off = (size_t)(s->cpos % s->cap);
+			if (n > s->cap - off)
+				n = s->cap - off;
+			uint8_t hd[1 + LS_NAME + 8];
+			size_t nl = strlen(s->name);
+			hd[0] = (uint8_t)nl;
+			memcpy(hd + 1, s->name, nl);
+			for (int b = 0; b < 8; b++)
+				hd[1 + nl + b] = (uint8_t)(s->cpos >> (8 * b));
+			if (send_frame(cl, 'L', hd, 1 + nl + 8, s->ring + off, (size_t)n, 0) < 0)
+				return;
+			s->cpos += n;
+			s->sent += n;
+		}
+	}
+}
+
+/* ---- file streams */
+
+static void ls_file_close(struct lstream *s)
+{
+	if (s->fd >= 0)
+		close(s->fd);
+	s->fd = -1;
+}
+
+/* bytes [off, upto) of the open file into the ring; more than the ring holds: skip to the newest ring's worth */
+static void ls_file_read(struct lstream *s, uint64_t upto)
+{
+	if (upto > s->off + ls_cap) {
+		uint64_t skip = upto - ls_cap - s->off;
+		ls_note(s, "%llu bytes of %s skipped (it grew faster than the %zu KiB ring is read)", (unsigned long long)skip,
+		    s->path, ls_cap >> 10);
+		s->skipped += skip;
+		s->off += skip;
+	}
+	while (s->off < upto) {
+		size_t want = upto - s->off < LS_READ ? (size_t)(upto - s->off) : LS_READ;
+		ssize_t r = pread(s->fd, ls_rbuf, want, (off_t)s->off);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		ls_put(s, ls_rbuf, (size_t)r);
+		s->off += (uint64_t)r;
+		size_t k = (size_t)r < sizeof(s->fp) ? (size_t)r : sizeof(s->fp);
+		if (k < sizeof(s->fp) && s->fpn + k > sizeof(s->fp)) {
+			memmove(s->fp, s->fp + (s->fpn + k - sizeof(s->fp)), sizeof(s->fp) - k);
+			s->fpn = sizeof(s->fp) - k;
+		} else if (k == sizeof(s->fp)) {
+			s->fpn = 0;
+		}
+		memcpy(s->fp + s->fpn, ls_rbuf + (size_t)r - k, k);
+		s->fpn += k;
+	}
+}
+
+static void ls_file_poll(struct lstream *s)
+{
+	struct stat st, fs;
+	int have = stat(s->path, &st) == 0 && S_ISREG(st.st_mode);
+	if (s->fd >= 0 && (!have || st.st_ino != s->ino || st.st_dev != s->dev)) {
+		if (fstat(s->fd, &fs) == 0 && (uint64_t)fs.st_size > s->off)
+			ls_file_read(s, (uint64_t)fs.st_size);  /* what was written to the old file before the switch */
+		ls_file_close(s);
+		s->rotated++;
+		if (have)
+			ls_note(s, "%s was replaced (rotated or recreated): following the new file from its start", s->path);
+		else {
+			ls_note(s, "%s is gone: waiting for it", s->path);
+			s->gone_noted = 1;
+		}
+	}
+	if (!have)
+		return;
+	if (s->fd < 0) {
+		s->fd = open(s->path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+		if (s->fd < 0 || fstat(s->fd, &fs) < 0) {
+			ls_file_close(s);
+			return;
+		}
+		s->dev = fs.st_dev;
+		s->ino = fs.st_ino;
+		if (!s->opened) {               /* first open: the newest ring's worth, or only new bytes with new=1 */
+			uint64_t sz = (uint64_t)fs.st_size;
+			s->off = s->start_end ? sz : sz > ls_cap ? sz - ls_cap : 0;
+		} else {
+			s->off = 0;
+			if (s->gone_noted)
+				ls_note(s, "%s is back: following it from its start", s->path);
+		}
+		s->opened = 1;
+		s->gone_noted = 0;
+		s->fpn = 0;
+	}
+	if (fstat(s->fd, &fs) < 0)
+		return;
+	int rewritten = 0;
+	if ((uint64_t)fs.st_size > s->off && s->fpn > 0 && s->off >= s->fpn) {       /* grown: still the same bytes before off? */
+		uint8_t b[sizeof(s->fp)];
+		rewritten = pread(s->fd, b, s->fpn, (off_t)(s->off - s->fpn)) != (ssize_t)s->fpn || memcmp(b, s->fp, s->fpn) != 0;
+	}
+	if ((uint64_t)fs.st_size < s->off || rewritten) {
+		s->truncated++;
+		ls_note(s, "%s truncated (%llu -> %llu bytes%s): reading it from the start", s->path, (unsigned long long)s->off,
+		    (unsigned long long)fs.st_size, rewritten ? ", rewritten past the old end" : "");
+		s->off = 0;
+		s->fpn = 0;
+	}
+	if ((uint64_t)fs.st_size > s->off)
+		ls_file_read(s, (uint64_t)fs.st_size);
+}
+
+/* ---- command streams (oslog) */
+
+static int ls_filter_ok(const char *f)
+{
+	if (strlen(f) >= LS_PATH)
+		return 0;
+	for (; *f; f++)
+		if (!((*f >= 'a' && *f <= 'z') || (*f >= 'A' && *f <= 'Z') || (*f >= '0' && *f <= '9') || *f == '_' || *f == '-' ||
+		    *f == '.' || *f == ','))
+			return 0;
+	return 1;
+}
+
+static int ls_cmd_spawn(struct lstream *s, uint64_t now)
+{
+	char fl[LS_PATH], *argv[40], *save = NULL;
+	int ac = 0, p[2];
+	argv[ac++] = (char *)oslog_bin;
+	if (s->levels)
+		argv[ac++] = (char *)"-l";
+	snprintf(fl, sizeof(fl), "%s", s->filter);
+	for (char *t = strtok_r(fl, ",", &save); t != NULL && ac < 38; t = strtok_r(NULL, ",", &save))
+		argv[ac++] = t;
+	argv[ac] = NULL;
+	if (pipe(p) < 0)
+		return -1;
+	posix_spawn_file_actions_t fa;
+	posix_spawnattr_t at;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 2);
+	posix_spawn_file_actions_addclose(&fa, p[0]);
+	posix_spawn_file_actions_addclose(&fa, p[1]);
+	posix_spawnattr_init(&at);
+	sigset_t def, none;
+	sigemptyset(&def);
+	sigaddset(&def, SIGPIPE);               /* ignored here; the child must die when the daemon (the reader) is gone */
+	sigaddset(&def, SIGTERM);
+	sigaddset(&def, SIGINT);
+	sigaddset(&def, SIGHUP);
+	sigaddset(&def, SIGCHLD);
+	sigemptyset(&none);
+	posix_spawnattr_setsigdefault(&at, &def);
+	posix_spawnattr_setsigmask(&at, &none);
+	short flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETPGROUP;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+	flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;   /* Darwin: only 0-2 reach the child (sockets, /dev/pmem stay here) */
+#endif
+	posix_spawnattr_setflags(&at, flags);
+	posix_spawnattr_setpgroup(&at, 0);
+	pid_t pid = 0;
+	int e = posix_spawn(&pid, oslog_bin, &fa, &at, argv, environ);
+	posix_spawn_file_actions_destroy(&fa);
+	posix_spawnattr_destroy(&at);
+	close(p[1]);
+	if (e != 0) {
+		close(p[0]);
+		errno = e;
+		return -1;
+	}
+	set_nb(p[0]);
+	s->pid = pid;
+	s->pfd = p[0];
+	s->starts++;
+	s->start_ms = now;
+	s->rd_ms = now;
+	s->check_ms = now + CMD_CHECK_MS;
+	s->kill_ms = 0;
+	char shown[LS_PATH + 40];
+	size_t k = (size_t)snprintf(shown, sizeof(shown), "%s", oslog_bin);
+	for (int i = 1; i < ac && k < sizeof(shown); i++)
+		k += (size_t)snprintf(shown + k, sizeof(shown) - k, " %s", argv[i]);
+	ls_note(s, "%s started: %s (pid %d, start %u)", s->name, shown, (int)pid, s->starts);
+	return 0;
+}
+
+/* read what the child wrote (EOF: the child is exiting; it is reaped by ls_cmd_reap) */
+static void ls_cmd_read(struct lstream *s, uint64_t now)
+{
+	for (int round = 0; round < 16 && s->pfd >= 0; round++) {
+		ssize_t r = read(s->pfd, ls_rbuf, sizeof(ls_rbuf));
+		if (r > 0) {
+			ls_put(s, ls_rbuf, (size_t)r);
+			continue;
+		}
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+			close(s->pfd);
+			s->pfd = -1;
+			s->check_ms = now;      /* reap now */
+		}
+		break;
+	}
+	s->rd_ms = now + CMD_READ_MS;           /* batch: at most one read burst per CMD_READ_MS */
+}
+
+static void ls_cmd_reap(struct lstream *s, uint64_t now)
+{
+	if (s->pid <= 0)
+		return;
+	int st = 0;
+	pid_t r = waitpid(s->pid, &st, WNOHANG);
+	if (r == 0) {
+		if (s->kill_ms && now >= s->kill_ms) {
+			kill(s->pid, SIGKILL);
+			s->kill_ms = 0;
+		}
+		return;
+	}
+	if (r < 0 && errno == EINTR)
+		return;
+	if (s->pfd >= 0)
+		ls_cmd_read(s, now);            /* the last words */
+	if (s->pfd >= 0) {
+		close(s->pfd);
+		s->pfd = -1;
+	}
+	char how[48];
+	if (r < 0)
+		snprintf(how, sizeof(how), "gone (waitpid: %s)", strerror(errno));
+	else if (WIFSIGNALED(st))
+		snprintf(how, sizeof(how), "killed by signal %d", WTERMSIG(st));
+	else
+		snprintf(how, sizeof(how), "exited with status %d", WEXITSTATUS(st));
+	s->status = r < 0 ? -1 : st;
+	uint64_t ran = now - s->start_ms;
+	s->pid = 0;
+	s->kill_ms = 0;
+	if (!s->on) {
+		ls_note(s, "%s stopped (%s after %.1f s)", s->name, how, (double)ran / 1000);
+	} else if (s->respawn) {
+		s->respawn = 0;
+		s->restart_ms = now;
+		s->backoff_ms = CMD_BACKOFF_MIN;
+		ls_note(s, "%s stopped for the new settings (%s)", s->name, how);
+	} else {
+		/* restart after 1 s, 2 s, 4 s .. 60 s while it keeps dying quickly; 1 s again after a run of >= 30 s */
+		uint64_t wait = ran >= CMD_RAN_OK_MS || s->backoff_ms < CMD_BACKOFF_MIN ? CMD_BACKOFF_MIN : s->backoff_ms;
+		s->restart_ms = now + wait;
+		s->backoff_ms = wait * 2 > CMD_BACKOFF_MAX ? CMD_BACKOFF_MAX : wait * 2;
+		ls_note(s, "%s %s after %.1f s: restart in %.0f s", s->name, how, (double)ran / 1000, (double)wait / 1000);
+	}
+}
+
+static void ls_cmd_stop(struct lstream *s, uint64_t now, const char *why)
+{
+	s->on = 0;
+	s->respawn = 0;
+	if (s->pid > 0) {
+		kill(s->pid, SIGTERM);
+		s->kill_ms = now + CMD_KILL_MS;
+		s->check_ms = now;
+	}
+	if (why != NULL)
+		ls_note(s, "%s off: %s", s->name, why);
+}
+
+/* every loop turn: file polls, child reaping/restarts/kill escalation, the idle switch-off */
+static void ls_tick(uint64_t now)
+{
+	for (int i = 0; i < NSTREAM; i++) {
+		struct lstream *s = &lss[i];
+		if (s->kind == LS_FILE && now >= s->next_ms) {
+			ls_file_poll(s);
+			s->next_ms = now + TAIL_POLL_MS;
+		} else if (s->kind == LS_CMD) {
+			if (s->on && cl == NULL && noclient_ms && now - noclient_ms > CMD_IDLE_MS)
+				ls_cmd_stop(s, now, "no client for 600 s (the collector turns it on again when it connects)");
+			if (s->pid > 0 && now >= s->check_ms) {
+				ls_cmd_reap(s, now);
+				s->check_ms = now + (s->kill_ms ? 100 : CMD_CHECK_MS);
+			}
+			if (s->on && s->pid <= 0 && now >= s->restart_ms && ls_cmd_spawn(s, now) < 0) {
+				uint64_t wait = s->backoff_ms < CMD_BACKOFF_MIN ? CMD_BACKOFF_MIN : s->backoff_ms;
+				s->restart_ms = now + wait;
+				s->backoff_ms = wait * 2 > CMD_BACKOFF_MAX ? CMD_BACKOFF_MAX : wait * 2;
+				ls_note(s, "%s: cannot start %s: %s (retry in %.0f s)", s->name, oslog_bin, strerror(errno),
+				    (double)wait / 1000);
+			}
+		}
+	}
+}
+
+/* the earliest time ls_tick has work (for the poll timeout) */
+static uint64_t ls_next(uint64_t next)
+{
+	for (int i = 0; i < NSTREAM; i++) {
+		const struct lstream *s = &lss[i];
+		uint64_t t = UINT64_MAX;
+		if (s->kind == LS_FILE)
+			t = s->next_ms;
+		else if (s->kind == LS_CMD) {
+			if (s->pid > 0)
+				t = s->check_ms;
+			if (s->pfd >= 0 && s->rd_ms < t)
+				t = s->rd_ms;   /* when its pipe is polled again */
+			if (s->on && s->pid <= 0 && s->restart_ms < t)
+				t = s->restart_ms;
+			if (s->on && cl == NULL && noclient_ms && noclient_ms + CMD_IDLE_MS + 1 < t)
+				t = noclient_ms + CMD_IDLE_MS + 1;
+		}
+		if (t < next)
+			next = t;
+	}
+	return next;
+}
+
+static void ls_shutdown(void)
+{
+	for (int i = 0; i < NSTREAM; i++) {
+		struct lstream *s = &lss[i];
+		if (s->kind == LS_CMD && s->pid > 0) {
+			kill(s->pid, SIGTERM);
+			int st;
+			for (int k = 0; k < 25 && waitpid(s->pid, &st, WNOHANG) == 0; k++)
+				usleep(20000);
+			if (kill(s->pid, 0) == 0) {
+				kill(s->pid, SIGKILL);
+				waitpid(s->pid, &st, 0);
+			}
+			s->pid = 0;
+		}
+		if (s->pfd >= 0)
+			close(s->pfd);
+		ls_file_close(s);
+	}
+}
+
+static void ls_json(struct jb *j, const struct lstream *s)
+{
+	jb_pf(j, "{\"name\":");
+	jb_str(j, s->name, LS_NAME);
+	jb_pf(j, ",\"kind\":\"%s\",\"pos\":%llu,\"start\":%llu,\"total\":%llu,\"sent\":%llu,\"sub\":%s,\"ring_kb\":%zu",
+	    s->kind == LS_FILE ? "file" : "cmd", (unsigned long long)s->cpos, (unsigned long long)ls_lo(s),
+	    (unsigned long long)s->total, (unsigned long long)s->sent, s->sub ? "true" : "false", ls_cap >> 10);
+	if (s->kind == LS_FILE) {
+		jb_pf(j, ",\"path\":");
+		jb_str(j, s->path, LS_PATH);
+		jb_pf(j, ",\"open\":%s,\"off\":%llu,\"rotated\":%u,\"truncated\":%u,\"skipped\":%llu}", s->fd >= 0 ? "true" : "false",
+		    (unsigned long long)s->off, s->rotated, s->truncated, (unsigned long long)s->skipped);
+	} else {
+		jb_pf(j, ",\"on\":%s,\"pid\":%d,\"filter\":", s->on ? "true" : "false", (int)s->pid);
+		jb_str(j, s->filter, LS_PATH);
+		jb_pf(j, ",\"levels\":%s,\"starts\":%u,\"status\":%d,\"bin\":", s->levels ? "true" : "false", s->starts, s->status);
+		jb_str(j, oslog_bin, LS_PATH);
+		jb_pf(j, "}");
+	}
+}
+
+static void ls_reply(struct conn *c, const char *cmd, int ok, const struct lstream *s, const char *msg)
+{
+	struct jb j = { 0, 0, 0 };
+	jb_pf(&j, ",\"epoch\":\"%s\"", log_epoch);
+	if (s != NULL) {
+		jb_pf(&j, ",\"stream\":");
+		ls_json(&j, s);
+	}
+	reply(c, cmd, ok, j.p, "%s", msg);
+	free(j.p);
+}
+
+static void ls_list_reply(struct conn *c, const char *cmd)
+{
+	struct jb j = { 0, 0, 0 };
+	jb_pf(&j, ",\"epoch\":\"%s\",\"streams\":[", log_epoch);
+	int first = 1;
+	for (int i = 0; i < NSTREAM; i++)
+		if (lss[i].kind) {
+			jb_pf(&j, "%s", first ? "" : ",");
+			ls_json(&j, &lss[i]);
+			first = 0;
+		}
+	jb_pf(&j, "]");
+	int n = 0;
+	for (int i = 0; i < NSTREAM; i++)
+		n += lss[i].kind != 0;
+	reply(c, cmd, 1, j.p, "%d streams", n);
+	free(j.p);
+}
+
+/* k=v options of tail add / oslog on: from=POS (the client's next wanted position), new=1, level=all */
+struct ls_opts { int has_from, start_end, levels, bad; uint64_t from; const char *pos[4]; int npos; };
+static void ls_opts(char **av, int ac, int first, struct ls_opts *o)
+{
+	memset(o, 0, sizeof(*o));
+	for (int i = first; i < ac; i++) {
+		if (strncmp(av[i], "from=", 5) == 0) {
+			o->has_from = 1;
+			o->from = strtoull(av[i] + 5, NULL, 0);
+		} else if (strcmp(av[i], "new=1") == 0) {
+			o->start_end = 1;
+		} else if (strcmp(av[i], "level=all") == 0) {
+			o->levels = 1;
+		} else if (strchr(av[i], '=') == NULL && o->npos < 4) {
+			o->pos[o->npos++] = av[i];
+		} else {
+			o->bad = 1;
+		}
+	}
+}
+
+/* the client wants this stream from POS (or everything still in the ring) */
+static void ls_subscribe(struct lstream *s, const struct ls_opts *o)
+{
+	uint64_t lo = ls_lo(s);
+	s->sub = 1;
+	s->cpos = !o->has_from || o->from > s->total ? lo : o->from < lo ? lo : o->from;
+}
+
+static void cmd_tail(struct conn *c, char **av, int ac)
+{
+	struct ls_opts o;
+	if (ac >= 2 && strcmp(av[1], "list") == 0) {
+		ls_list_reply(c, "tail");
+		return;
+	}
+	if (ac >= 3 && strcmp(av[1], "del") == 0) {
+		struct lstream *s = ls_find(av[2]);
+		if (s == NULL || s->kind != LS_FILE) {
+			ls_reply(c, "tail", 0, NULL, s ? "not a file stream" : "no such stream");
+			return;
+		}
+		ls_file_close(s);
+		free(s->ring);
+		memset(s, 0, sizeof(*s));
+		s->fd = s->pfd = -1;
+		ls_reply(c, "tail", 1, NULL, "deleted");
+		return;
+	}
+	ls_opts(av, ac, 2, &o);
+	if (ac < 4 || strcmp(av[1], "add") != 0 || o.npos != 2 || o.bad) {
+		ls_reply(c, "tail", 0, NULL, "usage: tail add NAME PATH [from=POS] [new=1] | tail del NAME | tail list");
+		return;
+	}
+	const char *name = o.pos[0], *path = o.pos[1];
+	if (!ls_name_ok(name) || path[0] != '/' || strlen(path) >= LS_PATH) {
+		ls_reply(c, "tail", 0, NULL, "NAME: [A-Za-z0-9_.-]{1,23}; PATH: absolute, < 256 bytes");
+		return;
+	}
+	struct lstream *s = ls_find(name);
+	if (s != NULL && s->kind != LS_FILE) {
+		ls_reply(c, "tail", 0, NULL, "NAME is a command stream");
+		return;
+	}
+	if (s == NULL) {
+		if ((s = ls_new(name, LS_FILE)) == NULL) {
+			ls_reply(c, "tail", 0, NULL, "too many streams (8)");
+			return;
+		}
+		snprintf(s->path, sizeof(s->path), "%s", path);
+		s->start_end = o.start_end;
+		ls_file_poll(s);
+		s->next_ms = now_ms() + TAIL_POLL_MS;
+	} else if (strcmp(s->path, path) != 0) {        /* same stream (positions go on), another file */
+		ls_file_close(s);
+		ls_note(s, "now following %s (was %s)", path, s->path);
+		snprintf(s->path, sizeof(s->path), "%s", path);
+		s->opened = 0;
+		s->start_end = o.start_end;
+		ls_file_poll(s);
+		s->next_ms = now_ms() + TAIL_POLL_MS;
+	}
+	ls_subscribe(s, &o);
+	ls_reply(c, "tail", 1, s, s->fd >= 0 ? "following" : "waiting for the file");
+}
+
+static void cmd_oslog(struct conn *c, char **av, int ac)
+{
+	struct lstream *s = ls_find("oslog");
+	uint64_t now = now_ms();
+	if (ac < 2 || strcmp(av[1], "status") == 0) {
+		ls_reply(c, "oslog", 1, s, s && s->on ? "on" : "off");
+		return;
+	}
+	if (strcmp(av[1], "off") == 0) {
+		if (s != NULL && s->on)
+			ls_cmd_stop(s, now, "asked by the client");
+		ls_reply(c, "oslog", 1, s, "off");
+		return;
+	}
+	struct ls_opts o;
+	ls_opts(av, ac, 2, &o);
+	const char *f = o.npos ? o.pos[0] : "";
+	if (strcmp(av[1], "on") != 0 || o.npos > 1 || o.bad || !ls_filter_ok(f)) {
+		ls_reply(c, "oslog", 0, s, "usage: oslog on [PROC,PROC..|all] [level=all] [from=POS] | oslog off | oslog status");
+		return;
+	}
+	if (strcmp(f, "all") == 0)
+		f = "";
+	if (s == NULL && (s = ls_new("oslog", LS_CMD)) == NULL) {
+		ls_reply(c, "oslog", 0, NULL, "too many streams (8)");
+		return;
+	}
+	int changed = strcmp(s->filter, f) != 0 || s->levels != o.levels;
+	snprintf(s->filter, sizeof(s->filter), "%s", f);
+	s->levels = o.levels;
+	const char *msg = "on (running)";
+	if (s->pid > 0 && (changed || !s->on)) {        /* running with other settings, or still being stopped */
+		kill(s->pid, SIGTERM);
+		s->kill_ms = now + CMD_KILL_MS;
+		s->check_ms = now;
+		s->respawn = 1;
+		s->on = 1;
+		msg = "on (restarting with the new settings)";
+	} else if (s->pid <= 0) {
+		s->on = 1;
+		s->backoff_ms = CMD_BACKOFF_MIN;
+		if (ls_cmd_spawn(s, now) < 0) {
+			char m[LS_PATH + 64];
+			snprintf(m, sizeof(m), "cannot start %s: %s", oslog_bin, strerror(errno));
+			s->on = 0;
+			ls_reply(c, "oslog", 0, s, m);
+			return;
+		}
+		msg = "on (started)";
+	}
+	ls_subscribe(s, &o);
+	ls_reply(c, "oslog", 1, s, msg);
+}
+
 /* ------------------------------------------------------------------------------------------------ commands */
 
 static void hello(struct conn *c)
@@ -1842,7 +2542,7 @@ static void hello(struct conn *c)
 	else
 		jb_pf(&j, "},\"klog_pa\":null,\"version\":");
 	jb_str(&j, SWEETMON_VERSION, 64);
-	jb_pf(&j, ",\"auth\":%s}", token ? "true" : "false");
+	jb_pf(&j, ",\"auth\":%s,\"logs\":1,\"log_epoch\":\"%s\"}", token ? "true" : "false", log_epoch);
 	send_json(c, 'H', &j, 0);
 	free(j.p);
 }
@@ -2109,6 +2809,14 @@ static void cmd_info(struct conn *c)
 	    "\"queued\":%zu,\"tx_bytes\":%llu,\"dropped\":%llu", js[job.state], job.id, job.kind, job.z.n,
 	    (unsigned long long)self_rss_kb(), (double)self_cpu_us() / 1000, c->queued, (unsigned long long)tx_bytes,
 	    (unsigned long long)dropped_frames);
+	jb_pf(&j, ",\"log_epoch\":\"%s\",\"logs\":[", log_epoch);
+	for (int i = 0, first = 1; i < NSTREAM; i++)
+		if (lss[i].kind) {
+			jb_pf(&j, "%s", first ? "" : ",");
+			ls_json(&j, &lss[i]);
+			first = 0;
+		}
+	jb_pf(&j, "]");
 	reply(c, "info", 1, j.p, "sweetmon");
 	free(j.p);
 }
@@ -2119,6 +2827,8 @@ static void activate(struct conn *c)
 		conn_close(cl);
 	c->authed = 1;
 	cl = c;
+	for (int i = 0; i < NSTREAM; i++)
+		lss[i].sub = 0;         /* L frames only after this client's own tail add / oslog on */
 	sp.n = 0;               /* deltas of the first sample: since the previous one (or daemon start) */
 	temps_resolve();
 	next_sample_ms = now_ms() + rate_ms;
@@ -2222,6 +2932,12 @@ static void command(struct conn *c, char *line)
 		spd.t0 = abs_now();
 		spd.cpu0 = self_cpu_us();
 		speed_pump();
+	} else if (strcmp(cmd, "tail") == 0) {
+		cmd_tail(c, av, ac);
+	} else if (strcmp(cmd, "oslog") == 0) {
+		cmd_oslog(c, av, ac);
+	} else if (strcmp(cmd, "logs") == 0) {
+		ls_list_reply(c, cmd);
 	} else if (strcmp(cmd, "ping") == 0) {
 		reply(c, cmd, 1, NULL, "%s", ac > 1 ? av[1] : "");
 	} else if (strcmp(cmd, "info") == 0) {
@@ -2259,6 +2975,9 @@ static void conn_close(struct conn *c)
 		frames_release();
 		kl.on = 0;
 		spd.on = 0;
+		for (int i = 0; i < NSTREAM; i++)
+			lss[i].sub = 0;         /* the streams go on collecting into their rings */
+		noclient_ms = now_ms();
 		free(kbuf);
 		kbuf = NULL;
 	}
@@ -2382,7 +3101,7 @@ int main(int argc, char **argv)
 	int port = 5150, daemon_mode = 0, noauth = 0, o;
 	const char *logpath = NULL;
 	mach_timebase_info(&tb);
-	while ((o = getopt(argc, argv, "Dp:k:Kl:vZ")) != -1) {
+	while ((o = getopt(argc, argv, "Dp:k:Kl:vZO:R:")) != -1) {
 		switch (o) {
 		case 'D': daemon_mode = 1; break;
 		case 'p': port = atoi(optarg); break;
@@ -2390,12 +3109,18 @@ int main(int argc, char **argv)
 		case 'K': noauth = 1; break;
 		case 'l': logpath = optarg; break;
 		case 'v': verbose = 1; break;
+		case 'O': oslog_bin = optarg; break;
+		case 'R': {
+			long k = atol(optarg);
+			ls_cap = (size_t)(k < 64 ? 64 : k > 16384 ? 16384 : k) << 10;
+			break;
+		}
 		case 'Z':
 			if (optind + 2 > argc)
 				return fprintf(stderr, "usage: sweetmon -Z IN OUT\n"), 2;
 			return lz4_file(argv[optind], argv[optind + 1]);
 		default:
-			fprintf(stderr, "usage: sweetmon [-D] [-p PORT] [-k TOKEN | -K] [-l LOGFILE] [-v] | sweetmon -Z IN OUT\n");
+			fprintf(stderr, "usage: sweetmon [-D] [-p PORT] [-k TOKEN | -K] [-l LOGFILE] [-v] [-O OSLOG] [-R KIB] | sweetmon -Z IN OUT\n");
 			return 2;
 		}
 	}
@@ -2443,6 +3168,7 @@ int main(int argc, char **argv)
 	sigaction(SIGHUP, &act, NULL);
 	plat_init();
 	t_start_abs = abs_now();
+	snprintf(log_epoch, sizeof(log_epoch), "%d.%lld", (int)getpid(), (long long)time(NULL));
 	sample_base();
 	for (int i = 0; i < NCONN; i++)
 		conns[i].fd = -1;
@@ -2463,6 +3189,7 @@ int main(int argc, char **argv)
 			if (cl == NULL || cl->queued == 0 || now > quit_ms)
 				break;
 		}
+		ls_tick(now);
 		int active = cl != NULL && cl->authed;
 		int quiet = job.state == J_RUN && job.quiet;
 		if (active) {
@@ -2483,12 +3210,15 @@ int main(int argc, char **argv)
 			}
 			job_pump();
 			speed_pump();
-			if (!quiet)
+			if (!quiet) {
 				klog_pump();
+				ls_pump();
+			}
 		}
 		/* poll */
-		struct pollfd pf[3 + NCONN];
-		struct conn *pc[3 + NCONN];
+		struct pollfd pf[3 + NCONN + NSTREAM];
+		struct conn *pc[3 + NCONN + NSTREAM];
+		struct lstream *pls[3 + NCONN + NSTREAM];
 		int np = 0;
 		pf[np].fd = ls; pf[np].events = POLLIN; pc[np++] = NULL;
 		pf[np].fd = sigpipe_fd[0]; pf[np].events = POLLIN; pc[np++] = NULL;
@@ -2503,14 +3233,22 @@ int main(int argc, char **argv)
 			pf[np].events = (short)(POLLIN | (c->qh != NULL ? POLLOUT : 0));
 			pc[np++] = c;
 		}
-		int timeout = -1;
+		int nconn_end = np;
 		now = now_ms();
-		if (active) {
-			uint64_t next = next_sample_ms;
-			if (kl.on && kl.next_ms < next)
-				next = kl.next_ms;
-			timeout = next > now ? (int)(next - now) : 0;
-		}
+		for (int i = 0; i < NSTREAM; i++)       /* child pipes, each at most every CMD_READ_MS */
+			if (lss[i].kind == LS_CMD && lss[i].pfd >= 0 && now >= lss[i].rd_ms) {
+				pf[np].fd = lss[i].pfd;
+				pf[np].events = POLLIN;
+				pc[np] = NULL;
+				pls[np++] = &lss[i];
+			}
+		int timeout = -1;
+		uint64_t next = active ? next_sample_ms : UINT64_MAX;
+		if (active && kl.on && kl.next_ms < next)
+			next = kl.next_ms;
+		next = ls_next(next);
+		if (next != UINT64_MAX)
+			timeout = next > now ? (next - now > 60000 ? 60000 : (int)(next - now)) : 0;
 		if (pending && (timeout < 0 || timeout > 1000))
 			timeout = 1000;
 		if (quit_req)
@@ -2560,7 +3298,10 @@ int main(int argc, char **argv)
 				}
 			}
 		}
-		for (int i = 3; i < np; i++) {
+		for (int i = nconn_end; i < np; i++)
+			if (pf[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+				ls_cmd_read(pls[i], now_ms());
+		for (int i = 3; i < nconn_end; i++) {
 			struct conn *c = pc[i];
 			if (c->fd < 0 || c->fd != pf[i].fd)
 				continue;
@@ -2575,6 +3316,7 @@ int main(int argc, char **argv)
 	dbg("exit (%s)", sig_stop ? "signal" : quit_req ? "quit" : "poll error");
 	job_abort();
 	frames_release();
+	ls_shutdown();
 	if (strcmp(kd_owner, "none") != 0)
 		kd(KERN_KDREMOVE, 0, NULL, NULL);
 	for (int i = 0; i < NCONN; i++)

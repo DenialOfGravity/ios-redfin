@@ -21,8 +21,10 @@ a dashboard. It replaces `klog PA` pulls, hand-run sweettrace and repeated `phon
 | tests | `tools-claude/sweetmon/fakephone.py`, `e2e-test.sh` | fake daemon + end-to-end test, no phone needed |
 | test client | `tools/sweetmon-client.py` | raw protocol client. Don't use it while the collector runs (single client slot, see 7) |
 
-Daemon flags (`sweetmon.c` usage): `sweetmon [-D] [-p PORT] [-k TOKEN | -K] [-l LOGFILE] [-v]`, `sweetmon -Z IN OUT`
-(LZ4 writer test). `-D` daemonizes. Without a key file it refuses to start unless `-k`/`-K` (no auth, tests only).
+Daemon flags (`sweetmon.c` usage): `sweetmon [-D] [-p PORT] [-k TOKEN | -K] [-l LOGFILE] [-v] [-O OSLOG] [-R KIB]`,
+`sweetmon -Z IN OUT` (LZ4 writer test). `-D` daemonizes. Without a key file it refuses to start unless `-k`/`-K` (no
+auth, tests only). `-O` = the os_log streamer for `oslog on` (default /var/local/bin/oslog), `-R` = RAM ring per log
+stream (default 1024 KiB).
 
 **Not started by launchd yet.** After every phone reboot the daemon must be started again. The collector does this
 by itself: when the phone answers ssh but not 5150, it runs `ssh root@HOST /var/local/bin/sweetmon -D` (key
@@ -76,7 +78,11 @@ All `mon` arguments must match `[A-Za-z0-9._=,:/ -]`. Each returns JSON from the
 | `mon klog-pa PA` / `mon klog-pa auto` | set / clear the kernel log ring address (see recipe 9.6) |
 | `mon rate MS` | sample period 200..10000 ms (process table stays every 2nd sample). Default 1000 |
 | `mon cmd LINE` | raw daemon command (debugging only, e.g. `mon cmd info`, `mon cmd ping x`) |
-| `mon install` | `files put` newest `builds/userland/*/sweetmon` -> /var/local/bin/sweetmon (755), the key over ssh (600), start `sweetmon -D` |
+| `mon oslog on [PROC,PROC..]` | start the phone's os_log streamer (`/var/local/bin/oslog PROC PROC..`, substring match on the process name) inside the daemon; output -> `logs/mon/oslog-<boot>.txt`. No list = all processes (heavy). `level=all` adds info+debug. Saved in config.json and re-applied on every connect. **Off by default: it costs phone CPU while on** |
+| `mon oslog off` / `mon oslog status` | stop it (child killed) / show it |
+| `mon tail add NAME PATH` | follow a phone file -> `logs/mon/NAME-<boot>.log` (saved, re-applied on connect). Default: `wland` = `/var/local/wland.log` |
+| `mon tail del NAME` / `mon tail list` / `mon logs` | stop following / list the streams (file, bytes, B/s, lost, pid) |
+| `mon install` | `files put` newest `builds/userland/*/sweetmon` -> /var/local/bin/sweetmon (755), the key over ssh (600), `quit` to the running daemon, start `sweetmon -D` |
 
 kdebug options (`k=v`, passed to the daemon's `trace start kdebug`):
 
@@ -103,11 +109,14 @@ All under `$HOME/mnt/iOS_Pixel5/` in device_bash. Read with head/grep/python; no
 |---|---|
 | `logs/mon/now.json` | latest merged snapshot, rewritten atomically every sample (1 s) |
 | `logs/mon/klog-<boottime>.txt` | full kernel log of that boot (boottime = unix seconds from hello), gap-filled after reconnects |
+| `logs/mon/wland-<boottime>.log` | wland's own log (/var/local/wland.log on the phone), followed live, gap-filled; `[sweetmon: ...]` lines mark rotation (wland renames it to .prev at each start), truncation and lost bytes |
+| `logs/mon/oslog-<boottime>.txt` | os_log lines while `mon oslog on` (format of `oslog`: time, type, process[pid], subsystem, message); `[sweetmon: oslog started/exited/stopped ...]` lines mark the child's life |
+| `logs/mon/<NAME>-<boottime>.log` | any other `mon tail add NAME PATH` |
 | `logs/mon/metrics-YYYYMMDD.jsonl` | one compact line per sample (flushed every 10 samples) |
 | `logs/mon/collector.log` | collector events: connects, daemon starts, traces, speed tests, warnings |
-| `logs/mon/config.json` | `link, rate_ms, top_every, top, frames[, klog_pa]` |
+| `logs/mon/config.json` | `link, rate_ms, top_every, top, frames, usb_fast, tails{NAME: PATH}, oslog{on, filter[, level]}[, klog_pa]` |
 | `logs/mon/phone.json` | remembered Wi-Fi address, last hello, per-link speed results |
-| `logs/mon/state.json` | `boot, klog_pos, klog_file, klog_lost` (gap fill across collector restarts) |
+| `logs/mon/state.json` | `boot, klog_pos, klog_file, klog_lost, logs{NAME: pos, epoch, lost, file, size}` (gap fill across collector restarts) |
 | `logs/mon/collector.json` | collector pid, start time, HTTP address |
 | `logs/traces/NAME-MMDD-HHMMSS/` | one finished trace (below) |
 
@@ -129,6 +138,9 @@ All under `$HOME/mnt/iOS_Pixel5/` in device_bash. Read with head/grep/python; no
   `interval_s`. cpu_pct is % of one core.
 - `klog`: `bps_kernel` (bytes/s the kernel writes), `bps_rx`, `top_tags[{tag,bps,lines_s}]`, `file`, `pos`,
   `lost_bytes`, `status` (which PA and where it came from), `pa`.
+- `logs.{wland,oslog,NAME}`: `kind` (file|cmd), `on`, `file`, `bytes` (file size), `bps` (30 s), `lost`, `pos`, `path`
+  (tails) / `filter`, `pid`, `starts` (oslog), `rotated`, `truncated`, `status` (last reply, or why there are none:
+  `daemon without log streams (older sweetmon; mon install)`).
 - `crashes[{ts,name,pid,sig,line}]` (last 10 CRASH lines), `self.{cpu_pct,cpu_ms_s,rss_mb,tx_bps,klog_bps}`
   (the daemon's own cost), `frames` (null unless frames mode), `frames_on`, `trace` (current or last trace's meta),
   `hot[]` (the collector's "what makes it hot/slow" lines, most important first).
@@ -164,7 +176,9 @@ x5]`. One file per local day; up to 10 most recent rows may still be in the writ
 - Panels: CPU busy per core; cluster clocks; temperatures; GPU busy + owners; memory; frames (checkbox = light frame
   mode); processes (sortable; **click a row to make it the profiler target**: kind switches to kernel profiler, name
   and target are filled in); kernel log rate + top tags (click a tag to filter the log); kernel log tail (regex
-  filter, pause, clear); trace form and trace list (size, transfer time, links to report/summary).
+  filter, pause, clear; the selector in its title switches between the kernel log, `wland` and other tails, and
+  `os_log`, which also shows the oslog on/off box and the process filter); trace form and trace list (size, transfer
+  time, links to report/summary).
 - Trace form: kind kdebug or kernel profiler, name, seconds; kdebug: mode, filter f/none, quiet; profiler: target,
   Hz. One Start/Stop button, plus abort. The form offers `mode=stream`, but the daemon refuses it: leave it on buffer.
 - Picking a profiler target: sort Processes by CPU % or wakeups/s, click the suspect, set seconds (5-10) and Hz
@@ -232,6 +246,17 @@ The ring address comes from, in order: config.json `klog_pa` (set by `mon klog-p
 printable text at the end of the ring) and refuses a wrong one. After going back to the known-good kernel:
 `mon klog-pa auto`. Check `klog.status` in now.json.
 
+### 6.7 CommCenter experiment without pulls (oslog + wland streams)
+1. `mon oslog on CommCenter,wland` (once; it stays on across reconnects until `mon oslog off`). `mon logs` shows
+   `log oslog: oslog on [CommCenter,wland] -> logs/mon/oslog-<boot>.txt ..., pid N`.
+2. Restart CommCenter the way the experiment does (there is no launchctl on the phone: e.g. kill its pid from
+   now.json `procs` or `phone psx`, and launchd starts it again). wland's log needs nothing: it is followed all the time.
+3. Read on the PC, no agent round trip: `logs/mon/oslog-<boot>.txt` (grep `CommCenter`), `logs/mon/wland-<boot>.log`,
+   and `logs/mon/klog-<boot>.txt` for the kernel side; same boottime in all three names (now.json `logs.*.file`).
+   Line up times: oslog lines carry wall-clock time, klog lines uptime (`phone.boottime` + uptime = wall clock).
+4. `mon oslog off` when done (the child costs CPU on the phone). `[sweetmon: N bytes of oslog lost here]` means the
+   1 MiB ring overran while no collector was connected: narrow the filter.
+
 ## 7. Overhead and rules
 
 | Setting / action | Phone cost (measured 2026-10-29) |
@@ -244,6 +269,7 @@ printable text at the end of the ring) and refuses a wrong one. After going back
 | USB link (old path) | 1.23 MB/s, 2 ms ping |
 | Wi-Fi link | 0.8 MB/s, ~42 ms ping, and wland uses ~3x its idle CPU while streaming |
 | frames mode | sees ~90 Hz vsync; small kdebug cost everywhere while on |
+| log streams | a followed file: one stat per second (also without a client); oslog: the streamer's own CPU (off by default) plus one pipe read per 100 ms; 1 MiB RAM per stream. Host build, streams idle: ~1 ms/s with the collector, 0 without (phone not measured yet) |
 
 Rules:
 - Stay at `rate 1000` except for short, deliberate high-rate windows. Watch `self.cpu_ms_s`.
@@ -271,6 +297,12 @@ Rules:
   the collector resolves the wrong pending command. The real result is in collector.log as `unsolicited reply
   {'cmd': 'speed', ... 'mbps': ...}`. A fix is coming.
 - `phone.nproc` / `procs.nproc` are null in current samples.
+- Log streams: a file truncated and refilled to more than its old size between two 1 s polls is caught only through
+  the 32 bytes before the old offset (a rewrite with identical bytes there is missed). After a daemon restart within
+  a boot, lines written to a followed file while no daemon ran are missing (the collector marks the spot). oslog is
+  switched off by the daemon after 10 min without a client; the collector turns it on again on connect.
+- At the first boot after a reboot, `tail add wland` may still see last boot's wland.log until wland starts and
+  renames it to .prev (a "was replaced" line follows).
 - Agent requests are serial: long `mon wait`/`mon speed` calls block the agent for everyone.
 
 ## 9. Troubleshooting
@@ -287,6 +319,9 @@ Rules:
 | trace done but report.txt says analyzer error | run sweet-trace.py by hand on trace.swtr; the .swtr is fine |
 | prof: "no SWEET PROF: start line" | USB down or the kernel lacks the profiler; poke works only over USB |
 | dashboard empty, API fine | browser tab stuck on old SSE: reload |
+| now.json `logs.*.status` "daemon without log streams" | the phone runs an older sweetmon: `mon install` (needs a userland build with ws-n-mon-logs) |
+| `mon oslog on` refused "cannot start /var/local/bin/oslog" | oslog missing on the phone: install it from the userland build (`files put .../oslog /var/local/bin/oslog 755`) |
+| oslog file has `oslog exited ... restart in N s` lines repeating | the streamer keeps dying (diagnosticd/entitlement?): read the lines above the marker; `mon oslog off` |
 
 ## 10. Today's findings (2026-10-29), a worked example
 

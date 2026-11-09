@@ -5,6 +5,7 @@ dashboard without the phone. Python 3 stdlib only.
   fakephone.py [--listen usb=127.0.0.2 --listen wifi=127.0.0.3] [--port 5150] [--key HEX | --key-file F | -K]
                [--trace FILE.swtr] [--trace-lz4 FILE.lz4] [--klog-pa 0x101d0ef08] [--ctl-port 15199]
                [--poke-port 15141] [--klog-dump FILE] [--speedup 1]
+               [--file-root DIR] [--oslog-bin PROG] [--log-ring BYTES] [--no-logs]
 
 Speaks H/S/K/R/T/E/F/P: hello, samples every `rate` ms (process table every TOPEVERY), a fake kernel log ring
 (4 MiB, total counter) with SWEET THERMAL/CPUFREQ/BATTERY/GPU/FB lines every 5 s plus chatter, traces (kdebug: the
@@ -12,6 +13,10 @@ Speaks H/S/K/R/T/E/F/P: hello, samples every `rate` ms (process table every TOPE
 mode), pmem (a generated SWPROF1 buffer for the kernel profiler), frames on|off, speed, ping, info, quit.
 Kernel profiler pokes ("p prof start NAME HZ SECS", "p prof stop") arrive on UDP --poke-port like the real
 command server and print SWEET PROF: start/done lines into the fake log.
+Log streams like the daemon (L frames; tail add/del/list, oslog on/off/status, logs): a phone PATH is the PC file
+--file-root + PATH (followed by offset: rotation by inode, truncation by size and by the bytes before the offset);
+oslog runs --oslog-bin with the filter's process names as arguments (restart with backoff when it dies, killed on
+off); each stream keeps the newest --log-ring bytes while no client reads it. --no-logs: an older daemon without them.
 
 Test control (UDP --ctl-port on 127.0.0.1, one word per datagram, answer in the reply datagram):
   drop                 close the client connection
@@ -21,9 +26,13 @@ Test control (UDP --ctl-port on 127.0.0.1, one word per datagram, answer in the 
   badframe             send malformed S/K/T/E frames and an unknown type
   crash NAME           print a CRASH line;   hot / cool  thermal level 1 / 0 lines;  load N  busy % base
   state                JSON of the fake's state
+  newdaemon            a daemon restart without a reboot: new log_epoch, streams gone (the client is dropped)
+  nologs / logs        hello without / with the log stream feature from the next connection (old daemon)
 """
 import argparse
 import asyncio
+import re
+import signal
 import json
 import math
 import os
@@ -152,6 +161,59 @@ def make_prof(name='backboardd', nrec=3000):
 
 
 # ---------------------------------------------------------------- the fake phone
+class FakeStream:
+    """one log stream: the newest `cap` bytes of everything produced, positions = bytes produced (like the daemon)"""
+    def __init__(self, name, kind, cap):
+        self.name, self.kind, self.cap = name, kind, cap
+        self.buf = bytearray()
+        self.total = 0
+        self.cpos = 0
+        self.sub = False
+        self.path = ''
+        self.fd = None
+        self.ino = None
+        self.off = 0
+        self.opened = False
+        self.start_end = False
+        self.gone = False
+        self.fp = b''
+        self.rotated = self.truncated = 0
+        self.on = False
+        self.filter = ''
+        self.levels = False
+        self.proc = None
+        self.reader = None
+        self.starts = 0
+        self.backoff = 1.0
+        self.restart_at = None
+        self.respawn = False
+
+    def lo(self):
+        return max(0, self.total - self.cap)
+
+    def put(self, data):
+        if not data:
+            return
+        self.buf += data
+        self.total += len(data)
+        if len(self.buf) > self.cap:
+            del self.buf[:len(self.buf) - self.cap]
+
+    def note(self, msg):
+        nl = b'\n' if self.buf and self.buf[-1:] != b'\n' else b''
+        self.put(nl + ('[sweetmon: %s]\n' % msg).encode())
+
+    def json(self):
+        d = {'name': self.name, 'kind': self.kind, 'pos': self.cpos, 'start': self.lo(), 'total': self.total,
+             'sub': self.sub, 'ring_kb': self.cap >> 10}
+        if self.kind == 'file':
+            d.update(path=self.path, open=self.fd is not None, off=self.off, rotated=self.rotated, truncated=self.truncated)
+        else:
+            d.update(on=self.on, pid=self.proc.pid if self.proc and self.proc.returncode is None else 0,
+                     filter=self.filter, levels=self.levels, starts=self.starts)
+        return d
+
+
 class Phone:
     def __init__(self, a):
         self.a = a
@@ -184,6 +246,9 @@ class Phone:
         self.prof_pa = 0x129784000
         self.speedup = a.speedup
         self.cmd_log = []
+        self.streams = {}
+        self.log_epoch = '%d.%d' % (os.getpid(), int(time.time()))
+        self.logs_feature = not a.no_logs
         self.lines_at_boot()
 
     def up(self):
@@ -264,7 +329,8 @@ class Phone:
     def hello(self):
         return {'v': 1, 'pid': os.getpid(), 'uptime_s': round(self.up(), 1), 'ncpu': 8, 'tb_numer': 125,
                 'tb_denom': 3, 'boottime': self.boot, 'ifaces': {'en0': self.a.wifi_addr, 'en2': '192.168.7.2'},
-                'klog_pa': self.a.hello_pa, 'version': 'fakephone-1'}
+                'klog_pa': self.a.hello_pa, 'version': 'fakephone-1',
+                **({'logs': 1, 'log_epoch': self.log_epoch} if self.logs_feature else {})}
 
     async def handle(self, r, w, lname):
         authed = not self.key
@@ -289,6 +355,8 @@ class Phone:
                         self.client = writer_ref
                         if old and old['w'] is not w:
                             old['w'].close()
+                        for st in self.streams.values():
+                            st.sub = False
                         await self.send(w, 'R', {'cmd': 'auth', 'ok': True, 'msg': 'ok'})
                         writer_ref['tasks'].append(asyncio.ensure_future(self.sampler(writer_ref)))
                     else:
@@ -306,6 +374,9 @@ class Phone:
             if self.client is writer_ref:
                 self.client = None
                 self.klog_on = False
+                for st in self.streams.values():
+                    st.sub = False
+                self.noclient_t = time.time()
             w.close()
 
     async def command(self, c, line):
@@ -391,8 +462,221 @@ class Phone:
         elif word == 'quit':
             await R(True, 'bye')
             w.close()
+        elif word in ('tail', 'oslog', 'logs') and self.logs_feature:
+            await self.log_cmd(word, a, R)
         else:
             await R(False, 'unknown command %s' % word)
+
+    # -------------------------------------------------------------- log streams (like sweetmon.c ls_*)
+    def phone_path(self, path):
+        return os.path.join(self.a.file_root, path.lstrip('/')) if self.a.file_root else path
+
+    def file_poll(self, st):
+        p = self.phone_path(st.path)
+        try:
+            ps = os.stat(p)
+            have = True
+        except OSError:
+            have = False
+        if st.fd is not None and (not have or ps.st_ino != st.ino):
+            try:
+                st.fd.seek(st.off)
+                st.put(st.fd.read())
+            except OSError:
+                pass
+            st.fd.close()
+            st.fd = None
+            st.rotated += 1
+            if have:
+                st.note('%s was replaced (rotated or recreated): following the new file from its start' % st.path)
+            else:
+                st.note('%s is gone: waiting for it' % st.path)
+                st.gone = True
+        if not have:
+            return
+        if st.fd is None:
+            try:
+                st.fd = open(p, 'rb')
+            except OSError:
+                return
+            fs = os.fstat(st.fd.fileno())
+            st.ino = fs.st_ino
+            if not st.opened:
+                st.off = fs.st_size if st.start_end else max(0, fs.st_size - st.cap)
+            else:
+                st.off = 0
+                if st.gone:
+                    st.note('%s is back: following it from its start' % st.path)
+            st.opened, st.gone, st.fp = True, False, b''
+        size = os.fstat(st.fd.fileno()).st_size
+        rewritten = False
+        if size > st.off and st.fp and st.off >= len(st.fp):
+            st.fd.seek(st.off - len(st.fp))
+            rewritten = st.fd.read(len(st.fp)) != st.fp
+        if size < st.off or rewritten:
+            st.truncated += 1
+            st.note('%s truncated (%d -> %d bytes%s): reading it from the start' % (
+                st.path, st.off, size, ', rewritten past the old end' if rewritten else ''))
+            st.off, st.fp = 0, b''
+        if size > st.off:
+            if size - st.off > st.cap:
+                st.note('%d bytes of %s skipped (it grew faster than the ring is read)' % (size - st.cap - st.off, st.path))
+                st.off = size - st.cap
+            st.fd.seek(st.off)
+            d = st.fd.read(size - st.off)
+            st.put(d)
+            st.off += len(d)
+            st.fp = (st.fp + d)[-32:]
+
+    async def oslog_spawn(self, st):
+        argv = [self.a.oslog_bin] + (['-l'] if st.levels else []) + [x for x in st.filter.split(',') if x]
+        try:
+            st.proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL,
+                                                           stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        except OSError as e:
+            st.proc = None
+            return str(e)
+        st.starts += 1
+        st.t_start = time.time()
+        st.note('oslog started: %s (pid %d, start %d)' % (' '.join(argv), st.proc.pid, st.starts))
+        st.reader = asyncio.ensure_future(self.oslog_read(st, st.proc))
+        return None
+
+    async def oslog_read(self, st, proc):
+        while True:
+            d = await proc.stdout.read(65536)
+            if not d:
+                break
+            st.put(d)
+        rc = await proc.wait()
+        how = 'killed by signal %d' % -rc if rc < 0 else 'exited with status %d' % rc
+        ran = time.time() - st.t_start
+        if st.proc is proc:
+            st.proc = None
+        if not st.on:
+            st.note('oslog stopped (%s after %.1f s)' % (how, ran))
+        elif st.respawn:
+            st.respawn = False
+            st.note('oslog stopped for the new settings (%s)' % how)
+            st.restart_at = time.time()
+        else:
+            wait = 1.0 if ran >= 30 else max(1.0, st.backoff)
+            st.backoff = min(60.0, wait * 2)
+            st.restart_at = time.time() + wait
+            st.note('oslog %s after %.1f s: restart in %.0f s' % (how, ran, wait))
+
+    def oslog_kill(self, st):
+        if st.proc and st.proc.returncode is None:
+            try:
+                st.proc.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    async def log_tick(self):
+        """file polls (also without a client), oslog restarts, L frames to a subscribed client"""
+        self.noclient_t = time.time()
+        while True:
+            await asyncio.sleep(0.25)
+            for st in list(self.streams.values()):
+                if st.kind == 'file':
+                    try:
+                        self.file_poll(st)
+                    except OSError:
+                        pass
+                elif st.on and st.proc is None and st.restart_at is not None and time.time() >= st.restart_at:
+                    st.restart_at = None
+                    err = await self.oslog_spawn(st)
+                    if err:
+                        st.restart_at = time.time() + st.backoff
+                        st.note('oslog: cannot start %s: %s' % (self.a.oslog_bin, err))
+            c = self.client
+            if not (c and c['authed']):
+                continue
+            try:
+                for st in list(self.streams.values()):
+                    while st.sub and st.cpos < st.total:
+                        st.cpos = max(st.cpos, st.lo())
+                        i = st.cpos - st.lo()
+                        d = bytes(st.buf[i:i + (256 << 10)])
+                        nm = st.name.encode()
+                        await self.send(c['w'], 'L', bytes([len(nm)]) + nm + struct.pack('<Q', st.cpos) + d)
+                        st.cpos += len(d)
+            except (ConnectionError, OSError):
+                pass
+
+    def log_sub(self, st, kv):
+        st.sub = True
+        frm = kv.get('from')
+        st.cpos = st.lo() if frm is None or int(frm) > st.total else max(st.lo(), int(frm))
+
+    async def log_cmd(self, word, a, R):
+        kv = dict(x.split('=', 1) for x in a[1:] if '=' in x)
+        pos = [x for x in a[1:] if '=' not in x]
+        L = lambda st: {'epoch': self.log_epoch, 'stream': st.json() if st else None}
+        if word == 'logs' or pos[:1] == ['list']:
+            return await R(True, '%d streams' % len(self.streams), epoch=self.log_epoch,
+                           streams=[x.json() for x in self.streams.values()])
+        if word == 'tail':
+            if pos[:1] == ['del'] and len(pos) == 2:
+                st = self.streams.get(pos[1])
+                if not st or st.kind != 'file':
+                    return await R(False, 'no such stream', **L(None))
+                if st.fd:
+                    st.fd.close()
+                del self.streams[pos[1]]
+                return await R(True, 'deleted', **L(None))
+            if pos[:1] != ['add'] or len(pos) != 3 or not re.fullmatch(r'[A-Za-z0-9_.-]{1,23}', pos[1]) \
+                    or not pos[2].startswith('/'):
+                return await R(False, 'usage: tail add NAME PATH [from=POS] [new=1] | tail del NAME | tail list', **L(None))
+            st = self.streams.get(pos[1])
+            if st and st.kind != 'file':
+                return await R(False, 'NAME is a command stream', **L(None))
+            if st is None:
+                st = self.streams[pos[1]] = FakeStream(pos[1], 'file', self.a.log_ring)
+                st.path, st.start_end = pos[2], kv.get('new') == '1'
+                self.file_poll(st)
+            elif st.path != pos[2]:
+                if st.fd:
+                    st.fd.close()
+                    st.fd = None
+                st.note('now following %s (was %s)' % (pos[2], st.path))
+                st.path, st.opened, st.start_end = pos[2], False, kv.get('new') == '1'
+                self.file_poll(st)
+            self.log_sub(st, kv)
+            return await R(True, 'following' if st.fd else 'waiting for the file', **L(st))
+        # oslog
+        st = self.streams.get('oslog')
+        sub = pos[0] if pos else 'status'
+        if sub == 'status':
+            return await R(True, 'on' if st and st.on else 'off', **L(st))
+        if sub == 'off':
+            if st and st.on:
+                st.on = False
+                st.note('oslog off: asked by the client')
+                self.oslog_kill(st)
+            return await R(True, 'off', **L(st))
+        f = pos[1] if len(pos) > 1 else ''
+        if sub != 'on' or len(pos) > 2 or not re.fullmatch(r'[A-Za-z0-9_.,-]*', f):
+            return await R(False, 'usage: oslog on [PROC,PROC..|all] [level=all] [from=POS] | oslog off', **L(st))
+        f = '' if f == 'all' else f
+        if st is None:
+            st = self.streams['oslog'] = FakeStream('oslog', 'cmd', self.a.log_ring)
+        changed = (st.filter, st.levels) != (f, kv.get('level') == 'all')
+        st.filter, st.levels = f, kv.get('level') == 'all'
+        msg = 'on (running)'
+        if st.proc and st.proc.returncode is None and (changed or not st.on):
+            st.on, st.respawn = True, True
+            self.oslog_kill(st)
+            msg = 'on (restarting with the new settings)'
+        elif not st.proc:
+            st.on, st.backoff = True, 1.0
+            err = await self.oslog_spawn(st)
+            if err:
+                st.on = False
+                return await R(False, 'cannot start %s: %s' % (self.a.oslog_bin, err), **L(st))
+            msg = 'on (started)'
+        self.log_sub(st, kv)
+        await R(True, msg, **L(st))
 
     async def send_klog(self, w, pos):
         data = self.ring_bytes(pos)
@@ -640,6 +924,7 @@ class Phone:
                 w.write(self.frame(t, pl))
             return 'sent bad frames'
         if c == 'reboot':
+            self.control('newdaemon')       # a reboot also starts a new daemon (new log epoch, no streams)
             self.boot = int(time.time())
             self.t0 = time.time()
             self.up0 = 0.0
@@ -668,7 +953,22 @@ class Phone:
         if c == 'state':
             return json.dumps({'total': self.total, 'boot': self.boot, 'client': bool(self.client),
                                'klog_on': self.klog_on, 'down': sorted(self.down), 'trace': bool(self.trace),
-                               'cmds': self.cmd_log[-40:], 'tx': self.tx})
+                               'cmds': self.cmd_log[-40:], 'tx': self.tx,
+                               'logs': {n: x.json() for n, x in self.streams.items()}})
+        if c == 'newdaemon':
+            for st in self.streams.values():
+                st.on = False
+                self.oslog_kill(st)
+                if st.fd:
+                    st.fd.close()
+            self.streams = {}
+            self.log_epoch = '%d.%d' % (os.getpid(), int(time.time() * 1000))
+            if self.client:
+                self.client['w'].close()
+            return 'new daemon, log epoch %s' % self.log_epoch
+        if c in ('nologs', 'logs'):
+            self.logs_feature = c == 'logs'
+            return 'log streams %s from the next connection' % ('on' if self.logs_feature else 'off')
         return 'unknown'
 
     async def listen(self, name):
@@ -688,7 +988,12 @@ class Phone:
         print('fakephone pid %d: %s port %d, ctl udp %d, poke udp %s:%d' % (os.getpid(), self.a.listen, self.a.port,
                                                                            self.a.ctl_port, self.a.poke_host,
                                                                            self.a.poke_port), flush=True)
-        await asyncio.gather(self.klog_gen(), self.chatter(), self.klog_push())
+        try:
+            await asyncio.gather(self.klog_gen(), self.chatter(), self.klog_push(), self.log_tick())
+        finally:
+            for st in self.streams.values():
+                st.on = False
+                self.oslog_kill(st)
 
 
 def main():
@@ -712,6 +1017,10 @@ def main():
     ap.add_argument('--nproc', type=int, default=17, help='processes in the fake table (the real phone has ~300)')
     ap.add_argument('--speedup', type=float, default=1.0, help='time runs this much faster for the log/samples')
     ap.add_argument('--gen-swtr', metavar='OUT', help='write the generated small .swtr and exit')
+    ap.add_argument('--file-root', default='', help='tail streams: phone PATH = FILE_ROOT/PATH on the PC')
+    ap.add_argument('--oslog-bin', default='/var/local/bin/oslog', help='the program "oslog on" runs')
+    ap.add_argument('--log-ring', type=int, default=1 << 20, help='bytes kept per log stream (the daemon: 1 MiB)')
+    ap.add_argument('--no-logs', action='store_true', help='behave like a daemon without log streams')
     a = ap.parse_args()
     if a.gen_swtr:
         open(a.gen_swtr, 'wb').write(make_swtr())

@@ -67,8 +67,13 @@
 #                              started by itself when the agent starts and when the phone's USB network comes up)
 #   mon ARGS                   the collector's API: trace NAME [kdebug|prof] [SECS] [k=v ...] | stop | snap | traces
 #                              | wait [SECS] | link usb|wifi|auto | speed [MB] | frames on|off | klog-pa PA | rate MS
+#                              | oslog on [PROC,PROC..|all] [level=all] | oslog off | oslog status   (os_log -> logs/mon/
+#                              oslog-<boot>.txt; off by default, costs phone CPU while on; saved, re-applied on connect)
+#                              | tail add NAME PATH | tail del NAME | tail list | logs   (phone file -> logs/mon/NAME-<boot>.log;
+#                              default tail: wland /var/local/wland.log)
 #   mon install                files put the newest builds/userland/*/sweetmon -> /var/local/bin/sweetmon 755, the key
-#                              agent/sweetmon.key -> /var/local/sweetmon.key (600, ssh), then start `sweetmon -D`
+#                              agent/sweetmon.key -> /var/local/sweetmon.key (600, ssh), stop the running daemon
+#                              (`quit` through the collector), then start the new one with `sweetmon -D`
 #
 # Local builds (tools-claude/localbuild, in WSL as this user, never root; output and logs in builds/):
 #   build-env                  what the build host has (cores, memory, disk, toolchain, SDKs)
@@ -467,8 +472,10 @@ run() {	# one request line
 			[ -f "$P/agent/sweetmon.key" ] || python3 -I "$MON" --root "$P" --make-key
 			(cd "$REPO" && timeout 300 python3 -I tools/flame-files.py put "$bin" /var/local/bin/sweetmon 755) || return 1
 			timeout 30 "${PSSH[@]}" 'umask 077; cat > /var/local/sweetmon.key; chmod 600 /var/local/sweetmon.key' < "$P/agent/sweetmon.key" || return 1
+			# a running (old) daemon keeps port 5150: ask it to exit, then start the new binary
+			mon_running && timeout 20 python3 -I "$MON" ctl cmd quit 2>/dev/null | grep -q '"bye"' && { echo "old daemon asked to quit"; sleep 2; }
 			timeout 30 "${PSSH[@]}" '/var/local/bin/sweetmon -D </dev/null >/dev/null 2>&1; sleep 1; ls -l /var/local/sweetmon.key'
-			echo "key installed, sweetmon -D started"
+			echo "key installed, sweetmon -D started (the collector reconnects; mon-status shows the hello version)"
 			return 0
 		fi
 		[[ $rest =~ ^[A-Za-z0-9._=,:/\ -]+$ ]] || { echo "bad arguments"; return 1; }

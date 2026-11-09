@@ -9,11 +9,14 @@ Protocol and design: docs/redfin/sweetmon.md (branch ws-z-mon). Python 3 stdlib 
   collector.py ctl CMD ...                   client for the phone agent's `mon ...` actions (talks to the API):
       status | snap | trace NAME [kdebug|prof] [SECS] [k=v ...] | stop | traces | wait [SECS] | link usb|wifi|auto
       | speed [MB] | frames on|off | klog-pa PA | usb-fast [POLL_US TXBATCH | off] | cmd TEXT
+      | oslog on [PROC,PROC..|all] [level=all] | oslog off | oslog status | tail add NAME PATH | tail del NAME | tail list
 
 Files (under --root, default /mnt/c/ClaudeProjects/iOS_Pixel5):
   logs/mon/now.json             latest merged snapshot (rewritten atomically every sample)
   logs/mon/metrics-YYYYMMDD.jsonl  one compact line per sample
   logs/mon/klog-<boottime>.txt  the full kernel log of that boot (gap-filled after reconnects)
+  logs/mon/<NAME>-<boottime>.log  a followed phone file (tail streams, default wland = /var/local/wland.log)
+  logs/mon/oslog-<boottime>.txt the phone's os_log while `oslog on` (off by default; gap-filled like the klog)
   logs/mon/collector.log        this program's log;  logs/mon/config.json, phone.json, state.json
   logs/traces/NAME-MMDD-HHMMSS/ trace.swtr (or prof.bin), meta.json, summary.json, report.txt
 """
@@ -44,6 +47,12 @@ DEFAULT_KLOG_PA = '0x101d0ef08'     # r63a (builds/xnu/ws-y-ram-aca60f47b8/KLOG_
 PORT = 5150
 TRACE_COLLECTOR_OPTS = ('app',)    # trace k=v options used by the collector's analysis only, never sent to the phone
 MAX_FRAME = 4 << 20
+DEFAULT_TAILS = {'wland': '/var/local/wland.log'}     # phone/wifi/wland.c WLAND_LOG (renamed to .prev at each start)
+R_LOG_NAME = re.compile(r'[A-Za-z0-9_.-]{1,23}')
+R_LOG_PATH = re.compile(r'/[A-Za-z0-9_.,:/+-]{1,250}')
+R_OSLOG_FILTER = re.compile(r'[A-Za-z0-9_.,-]{0,250}')
+R_LOG_STARTED = re.compile(r' started: .*\(pid (\d+), start (\d+)\)\]$')
+R_LOG_ENDED = re.compile(r' (?:stopped|exited with status|killed by signal) ')
 CLUSTERS = (('silver', range(0, 6)), ('gold', range(6, 7)), ('prime', range(7, 8)))
 TEMP_KEYS = ('silver', 'gold', 'prime', 'cpuss', 'gpu', 'ddr', 'camera', 'npu', 'aoss')
 log = logging.getLogger('sweetmon')
@@ -339,6 +348,35 @@ class Trace:
                 'transfer_mbps': round(self.zbytes / 1e6 / x_el, 2) if x_el > 0.05 else None, 'end': self.end}
 
 
+class LogStream:
+    """one phone log stream (L frames): a followed file (kind file) or the oslog child's output (kind cmd), written to
+    logs/mon/<name>-<boot>.log|.txt; pos = the daemon's stream position of the next byte (gap fill, like klog_pos)"""
+    def __init__(self, name, kind):
+        self.name, self.kind = name, kind
+        self.f = None
+        self.pos = None
+        self.epoch = None
+        self.lost = 0
+        self.partial = b''
+        self.lines = collections.deque(maxlen=4000)
+        self.seq = 0
+        self.rx_hist = collections.deque(maxlen=60)
+        self.info = None            # the daemon's view of the stream (last reply)
+        self.msg = None
+
+    def bps(self, t):
+        h = [x for x in self.rx_hist if t - x[0] <= 30]
+        return int(sum(b for _, b in h) / 30) if h else 0
+
+    def view(self, root, t):
+        i = self.info or {}
+        return {'kind': self.kind, 'file': os.path.relpath(self.f.name, root) if self.f else None,
+                'bytes': self.f.tell() if self.f else 0, 'bps': self.bps(t), 'pos': self.pos, 'lost': self.lost,
+                'path': i.get('path'), 'filter': i.get('filter'), 'pid': i.get('pid'), 'open': i.get('open'),
+                'rotated': i.get('rotated'), 'truncated': i.get('truncated'), 'starts': i.get('starts'),
+                'status': self.msg}
+
+
 class Collector:
     def __init__(self, a):
         self.a = a
@@ -356,6 +394,8 @@ class Collector:
         self.cfg.setdefault('top', 15)
         self.cfg.setdefault('frames', False)
         self.cfg.setdefault('usb_fast', dict(USB_FAST_DEFAULT))
+        self.cfg.setdefault('tails', dict(DEFAULT_TAILS))
+        self.cfg.setdefault('oslog', {'on': False, 'filter': ''})
         self.phone_cfg = read_json(os.path.join(self.mon, 'phone.json'), {}) or {}
         self.state = read_json(os.path.join(self.mon, 'state.json'), {}) or {}
         self.key = None
@@ -395,6 +435,8 @@ class Collector:
         self.klog_rx_hist = collections.deque(maxlen=30)
         self.klog_ok = None
         self.klog_pa = None
+        self.logs = {}              # name -> LogStream
+        self.logs_msg = None        # why there are no log streams (old daemon)
         self.watchers = []
         self.proc_acc_ms = 0
         self.procs_view = {'by_cpu': [], 'by_wakeups': []}
@@ -417,7 +459,10 @@ class Collector:
 
     def save_state(self):
         st = {'boot': self.klog_boot, 'klog_pos': self.klog_pos, 'klog_file': self.klog_f.name if self.klog_f else None,
-              'klog_lost': self.klog_lost, 'saved': now_s()}
+              'klog_lost': self.klog_lost, 'saved': now_s(),
+              'logs': {n: {'pos': ls.pos, 'epoch': ls.epoch, 'lost': ls.lost, 'kind': ls.kind,
+                           'file': ls.f.name if ls.f else None, 'size': ls.f.tell() if ls.f else 0}
+                       for n, ls in self.logs.items()}}
         atomic_json(os.path.join(self.mon, 'state.json'), st)
 
     def load_key(self):
@@ -639,6 +684,7 @@ class Collector:
             await self.cmd('rate %d %d' % (self.cfg['rate_ms'], self.cfg['top_every']))
             await self.cmd('top %d' % self.cfg['top'])
             await self.start_klog()
+            await self.start_logs()
             if self.cfg.get('frames'):
                 await self.cmd('frames on')
             tasks.append(asyncio.ensure_future(self.usb_fast_apply(host)))
@@ -666,6 +712,8 @@ class Collector:
                 self.link_msg = 'link lost'
             self.write_now_link()
             self.klog_flush_partial()
+            for ls in self.logs.values():
+                self.log_flush_partial(ls)
             self.save_state()
             tr = self.trace
             if tr and tr.state in ('transferring',) and tr.kind != 'prof':
@@ -793,6 +841,16 @@ class Collector:
                 self.klog_boot = self.state['boot']
                 self.klog_pos = self.state.get('klog_pos')
                 self.klog_lost = self.state.get('klog_lost', 0)
+                for n, v in (self.state.get('logs') or {}).items():
+                    if R_LOG_NAME.fullmatch(n) and isinstance(v, dict):
+                        ls = self.log_stream(n, v.get('kind') or ('cmd' if n == 'oslog' else 'file'))
+                        ls.pos, ls.epoch, ls.lost = v.get('pos'), v.get('epoch'), v.get('lost') or 0
+                        try:    # stream bytes written after the last save (state.json is saved every few s)
+                            grown = os.path.getsize(v['file']) - int(v.get('size') or 0) if v.get('file') else 0
+                        except (OSError, TypeError, ValueError):
+                            grown = 0
+                        if ls.pos is not None and grown > 0:
+                            ls.pos += grown
             if self.klog_boot is None or abs(self.klog_boot - boot) > 3:
                 if self.klog_boot is not None:
                     log.info('new boot (boottime %s, was %s): new klog file', boot, self.klog_boot)
@@ -805,6 +863,13 @@ class Collector:
                 if self.klog_f:
                     self.klog_f.close()
                     self.klog_f = None
+                for ls in self.logs.values():
+                    self.log_flush_partial(ls)
+                    if ls.f:
+                        ls.f.close()
+                        ls.f = None
+                    ls.pos = ls.epoch = None
+                    ls.lost = 0
             if not self.klog_f:
                 self.klog_f = open(os.path.join(self.mon, 'klog-%d.txt' % self.klog_boot), 'ab')
             self.save_state()
@@ -872,10 +937,173 @@ class Collector:
                 if self.speed['t_first'] is None:
                     self.speed['t_first'] = time.perf_counter()
                 self.speed['t_last'] = time.perf_counter()
+        elif t == 'L':
+            nl = p[0] if p else 0
+            if len(p) >= 9 + nl and nl:
+                self.on_log(p[1:1 + nl].decode('ascii', 'replace'), struct.unpack_from('<Q', p, 1 + nl)[0], p[9 + nl:])
         elif t == 'H':
             self.on_hello(json.loads(p))
         else:
             log.info('unknown frame type %r (%d bytes)', t, len(p))
+
+    # ---------------------------------------------------------------- log streams (tail files, oslog)
+    def log_stream(self, name, kind):
+        ls = self.logs.get(name)
+        if ls is None:
+            ls = self.logs[name] = LogStream(name, kind)
+        return ls
+
+    def log_supported(self):
+        return bool((self.hello or {}).get('logs'))
+
+    def log_open(self, ls):
+        if not ls.f and self.klog_boot is not None:
+            ls.f = open(os.path.join(self.mon, '%s-%d.%s' % (ls.name, self.klog_boot, 'txt' if ls.kind == 'cmd' else 'log')),
+                        'ab')
+        return ls.f
+
+    def log_from(self, ls):
+        """the from=/new=1 argument for this stream on this daemon (hello log_epoch): resume at our position when it is
+        the same daemon; a restarted daemon numbers its streams from 0 again"""
+        epoch = (self.hello or {}).get('log_epoch')
+        if ls.pos is not None and ls.epoch == epoch:
+            return ' from=%d' % ls.pos
+        arg = ''
+        if ls.pos is not None:
+            self.log_marker(ls, b'[sweetmon collector: the phone daemon restarted (log epoch %s -> %s); what was written '
+                                b'meanwhile may be missing here]\n' % (str(ls.epoch).encode(), str(epoch).encode()))
+            arg = ' new=1' if ls.kind == 'file' else ''
+        ls.pos = None
+        ls.epoch = epoch
+        return arg
+
+    def log_reply(self, ls, rep):
+        if rep.get('stream'):
+            ls.info = rep['stream']
+        ls.msg = ('' if rep.get('ok') else 'refused: ') + str(rep.get('msg'))
+        return rep
+
+    async def start_logs(self):
+        """after every connect: the configured tails and oslog (config.json tails / oslog), like usb_fast"""
+        if not self.log_supported():
+            self.logs_msg = 'daemon without log streams (older sweetmon; mon install)'
+            if self.cfg.get('tails') or (self.cfg.get('oslog') or {}).get('on'):
+                log.info('log streams: %s', self.logs_msg)
+            for ls in self.logs.values():
+                ls.msg = self.logs_msg
+            return
+        self.logs_msg = None
+        rep = await self.cmd('logs')
+        have = {x.get('name'): x for x in rep.get('streams') or []} if rep.get('ok') else {}
+        for name, x in have.items():
+            if x.get('kind') == 'file' and name not in self.cfg['tails']:
+                await self.cmd('tail del %s' % name)
+        for name, path in sorted(self.cfg['tails'].items()):
+            await self.tail_add(name, path)
+        await self.oslog_apply(have.get('oslog'))
+
+    async def tail_add(self, name, path):
+        ls = self.log_stream(name, 'file')
+        rep = self.log_reply(ls, await self.cmd('tail add %s %s%s' % (name, path, self.log_from(ls))))
+        log.info('tail %s %s: %s', name, path, rep.get('msg'))
+        return rep
+
+    async def oslog_apply(self, daemon_view=None):
+        o = self.cfg.get('oslog') or {}
+        ls = self.log_stream('oslog', 'cmd')
+        if o.get('on'):
+            line = 'oslog on %s%s' % (o.get('filter') or 'all', ' level=all' if o.get('level') == 'all' else '')
+            rep = self.log_reply(ls, await self.cmd(line + self.log_from(ls)))
+            log.info('%s: %s', line, rep.get('msg'))
+            return rep
+        if daemon_view is None or daemon_view.get('on') or daemon_view.get('pid'):
+            return self.log_reply(ls, await self.cmd('oslog off'))
+        ls.info = daemon_view
+        ls.msg = 'off'
+        return {'cmd': 'oslog', 'ok': True, 'msg': 'off'}
+
+    def on_log(self, name, pos, data):
+        if not data or not R_LOG_NAME.fullmatch(name):
+            return
+        ls = self.log_stream(name, 'cmd' if name == 'oslog' else 'file')
+        if ls.pos is not None:
+            end = pos + len(data)
+            if end <= ls.pos:
+                return
+            if pos < ls.pos:
+                data = data[ls.pos - pos:]
+                pos = ls.pos
+            elif pos > ls.pos:
+                lost = pos - ls.pos
+                ls.lost += lost
+                log.warning('%s gap: %d bytes lost (the phone ring overran before we read them)', name, lost)
+                ls.pos = pos
+                self.log_marker(ls, b'[sweetmon: %d bytes of %s lost here]\n' % (lost, name.encode()))
+        ls.pos = pos + len(data)
+        ls.rx_hist.append((now_s(), len(data)))
+        self.log_write(ls, data)
+
+    def log_write(self, ls, data, marker=False):
+        f = self.log_open(ls)
+        if f:
+            f.write(data)
+            f.flush()
+        buf = ls.partial + data if not marker else data
+        parts = buf.split(b'\n')
+        tail = parts.pop()
+        if not marker:
+            ls.partial = tail
+            if len(ls.partial) > 8192:
+                parts.append(ls.partial)
+                ls.partial = b''
+        out = [x.decode('utf-8', 'replace').rstrip('\r') for x in parts if x.strip()]
+        for s in out:
+            ls.seq += 1
+            ls.lines.append(s)
+            if ls.kind == 'cmd' and s.startswith('[sweetmon: ') and not marker:     # the daemon's child notes
+                m = R_LOG_STARTED.search(s)
+                i = ls.info = ls.info or {}
+                if m:
+                    i['pid'], i['starts'] = int(m.group(1)), int(m.group(2))
+                elif R_LOG_ENDED.search(s):
+                    i['pid'] = 0
+        if out:
+            self.emit('log', {'name': ls.name, 'lines': out[-400:], 'seq': ls.seq})
+
+    def log_flush_partial(self, ls):
+        """end an unfinished line (link lost, marker): a newline in the file, the line to the tail view"""
+        if ls.partial:
+            p, ls.partial = ls.partial, b''
+            if ls.f:
+                ls.f.write(b'\n')
+                ls.f.flush()
+            ls.seq += 1
+            ls.lines.append(p.decode('utf-8', 'replace').rstrip('\r'))
+            self.emit('log', {'name': ls.name, 'lines': [ls.lines[-1]], 'seq': ls.seq})
+
+    def log_marker(self, ls, text):
+        """a collector-made line in the file; state.json right away (its file size must match the stream position)"""
+        self.log_flush_partial(ls)
+        self.log_write(ls, text, marker=True)
+        self.save_state()
+
+    def logs_view(self, t):
+        v = {n: ls.view(self.root, t) for n, ls in sorted(self.logs.items())}
+        for n, path in (self.cfg.get('tails') or {}).items():
+            v.setdefault(n, {'kind': 'file', 'file': None, 'bytes': 0, 'bps': 0, 'lost': 0, 'status': self.logs_msg})
+            v[n]['on'] = True
+            v[n].setdefault('path', path)
+            if not v[n].get('path'):
+                v[n]['path'] = path
+        o = self.cfg.get('oslog') or {}
+        v.setdefault('oslog', {'kind': 'cmd', 'file': None, 'bytes': 0, 'bps': 0, 'lost': 0, 'status': self.logs_msg})
+        v['oslog'].update(on=bool(o.get('on')), filter=o.get('filter') or '')
+        for n in v:
+            if n not in (self.cfg.get('tails') or {}) and n != 'oslog':
+                v[n]['on'] = False
+            if self.logs_msg:
+                v[n]['status'] = self.logs_msg
+        return v
 
     # ---------------------------------------------------------------- klog
     def on_klog(self, pos, data):
@@ -1159,6 +1387,7 @@ class Collector:
                      'file': os.path.relpath(self.klog_f.name, self.root) if self.klog_f else None,
                      'pos': self.klog_pos, 'lost_bytes': self.klog_lost, 'status': self.klog_ok, 'pa': self.klog_pa},
             'crashes': list(self.crashes)[:10],
+            'logs': self.logs_view(t),
             'self': selfv,
             'frames': fr,
             'frames_on': bool(self.cfg.get('frames')),
@@ -1166,6 +1395,8 @@ class Collector:
         }
         snap['hot'] = self.explain(snap)
         self.snap = snap
+        if self.sample_n % 5 == 0 and self.logs:
+            self.save_state()
         self.rx_hist.append((t, self.rx_bytes))
         h = {'t': round(t, 2), 'up': up, 'busy': busy, 'mhz': [cl[c]['mhz'] for c in ('silver', 'gold', 'prime')],
              'temp': temps, 'lvl': snap['thermal']['level'], 'gpu': gpu['busy_pct'] if gpu and gpu_age is not None
@@ -1687,6 +1918,23 @@ class Collector:
                 rows = [x for x in rows if rx.search(x[1])]
             return self.respond(w, 200, {'seq': self.line_seq, 'lines': [x[1] for x in rows[-n:]],
                                          'file': self.klog_f and os.path.relpath(self.klog_f.name, self.root)})
+        if path == '/api/log':
+            ls = self.logs.get(q.get('name', ''))
+            if ls is None:
+                return self.respond(w, 404, {'ok': False, 'msg': 'no such log stream (have: %s)' % ', '.join(sorted(self.logs))})
+            n = max(1, min(int(q.get('n', 200)), 4000))
+            rows = list(ls.lines)
+            if q.get('grep'):
+                try:
+                    rx = re.compile(q['grep'], re.I)
+                except re.error as e:
+                    return self.respond(w, 400, {'ok': False, 'msg': 'bad regex: %s' % e})
+                rows = [x for x in rows if rx.search(x)]
+            return self.respond(w, 200, {'name': ls.name, 'seq': ls.seq, 'lines': rows[-n:],
+                                         'file': ls.f and os.path.relpath(ls.f.name, self.root)})
+        if path == '/api/logs':
+            return self.respond(w, 200, {'ok': True, 'logs': self.logs_view(now_s()), 'tails': self.cfg.get('tails'),
+                                         'oslog': self.cfg.get('oslog'), 'msg': self.logs_msg})
         if path == '/api/traces':
             cur = self.trace.info() if self.trace else None
             return self.respond(w, 200, {'current': cur, 'traces': self.list_traces()})
@@ -1757,6 +2005,69 @@ class Collector:
             st = await self.usb_fast_apply(self.host)
             return self.respond(w, 200, {'ok': not st.get('error'), 'msg': st.get('error') or 'ok', 'usb_fast': st,
                                          'usb_fast_cfg': self.cfg.get('usb_fast')})
+        if path == '/api/oslog':
+            # {"on":true,"filter":"CommCenter,wland","level":"all"} | {"on":false} | {} (status); saved in config.json
+            o = dict(self.cfg.get('oslog') or {})
+            if 'on' in J or 'value' in J:
+                v = J.get('on', J.get('value'))
+                o['on'] = v in (True, 1, 'on', '1', 'true')
+            if 'filter' in J:
+                f = str(J.get('filter') or '').strip()
+                if f == 'all':
+                    f = ''
+                if not R_OSLOG_FILTER.fullmatch(f):
+                    return self.respond(w, 400, {'ok': False, 'msg': 'filter: process names, comma-separated (A-Za-z0-9_.-)'})
+                o['filter'] = f
+            if 'level' in J:
+                o['level'] = 'all' if J.get('level') in ('all', True, 1) else 'default'
+            if o != self.cfg.get('oslog'):
+                self.cfg['oslog'] = o
+                self.save_cfg()
+                log.info('oslog config %s', o)
+            if not self.authed or not self.log_supported():
+                return self.respond(w, 200, {'ok': True, 'msg': 'saved; applied on connect' +
+                                             (' (%s)' % self.logs_msg if self.logs_msg else ''), 'oslog': o,
+                                             'logs': self.logs_view(now_s())})
+            if 'on' in J or 'value' in J or 'filter' in J or 'level' in J:
+                rep = await self.oslog_apply()
+            else:
+                rep = self.log_reply(self.log_stream('oslog', 'cmd'), await self.cmd('oslog status'))
+            return self.respond(w, 200, dict(rep, oslog=o, logs=self.logs_view(now_s())))
+        if path == '/api/tail':
+            # {"op":"add","name":"wland","path":"/var/local/wland.log"} | {"op":"del","name":..} | {"op":"list"}
+            op = str(J.get('op') or 'list')
+            name = str(J.get('name') or '')
+            tails = dict(self.cfg.get('tails') or {})
+            if op == 'list':
+                rep = await self.cmd('tail list') if self.authed and self.log_supported() else {'ok': True, 'msg': 'not connected'}
+                return self.respond(w, 200, dict(rep, tails=tails, logs=self.logs_view(now_s())))
+            if not R_LOG_NAME.fullmatch(name) or name == 'oslog':
+                return self.respond(w, 400, {'ok': False, 'msg': 'NAME: [A-Za-z0-9_.-]{1,23}, not oslog'})
+            if op == 'add':
+                pth = str(J.get('path') or '')
+                if not R_LOG_PATH.fullmatch(pth) or '..' in pth:
+                    return self.respond(w, 400, {'ok': False, 'msg': 'PATH: absolute phone path'})
+                tails[name] = pth
+            elif op == 'del':
+                if name not in tails:
+                    return self.respond(w, 400, {'ok': False, 'msg': 'no tail %s (have: %s)' % (name, ', '.join(tails))})
+                del tails[name]
+            else:
+                return self.respond(w, 400, {'ok': False, 'msg': 'op: add | del | list'})
+            self.cfg['tails'] = tails
+            self.save_cfg()
+            if not self.authed or not self.log_supported():
+                return self.respond(w, 200, {'ok': True, 'msg': 'saved; applied on connect' +
+                                             (' (%s)' % self.logs_msg if self.logs_msg else ''), 'tails': tails})
+            if op == 'add':
+                rep = await self.tail_add(name, tails[name])
+            else:
+                rep = await self.cmd('tail del %s' % name)
+                ls = self.logs.get(name)
+                if ls:
+                    self.log_flush_partial(ls)
+                    ls.msg = 'deleted'
+            return self.respond(w, 200, dict(rep, tails=tails, logs=self.logs_view(now_s())))
         if path == '/api/rate':
             ms = max(200, min(int(J.get('ms') or J.get('value') or 1000), 10000))
             self.cfg['rate_ms'] = ms
@@ -1772,6 +2083,7 @@ class Collector:
                 'link': self.link_info(), 'hello': self.hello, 'config': self.cfg,
                 'klog': {'status': self.klog_ok, 'pos': self.klog_pos, 'lost': self.klog_lost,
                          'file': self.klog_f and os.path.relpath(self.klog_f.name, self.root)},
+                'logs': self.logs_view(now_s()), 'logs_msg': self.logs_msg,
                 'trace': self.trace.info() if self.trace else None,
                 'last_trace': self.traces_done[0] if self.traces_done else None, 'speed': self.speed_res,
                 'pa_candidates': self.pa_candidates()}
@@ -1851,6 +2163,7 @@ def ctl(argv, api):
             'connected' if L['authed'] else L['msg'], L['rtt_ms'], L['reconnects']))
         print('klog: %s, file %s, pos %s, lost %s' % (s['klog']['status'], s['klog']['file'], s['klog']['pos'],
                                                     s['klog']['lost']))
+        print(logs_text(s.get('logs') or {}))
         if s.get('trace'):
             print('trace:', json.dumps(s['trace'], default=str))
         elif s.get('last_trace'):
@@ -1920,8 +2233,59 @@ def ctl(argv, api):
         return out(call('/api/rate', {'ms': int(rest[0]) if rest else 1000}))
     if c == 'cmd':
         return out(call('/api/cmd', {'cmd': ' '.join(rest)}))
+    if c == 'oslog':
+        v = rest[0] if rest else 'status'
+        if v == 'on':
+            body = {'on': True, 'filter': ''}
+            for x in rest[1:]:
+                if x.startswith('level='):
+                    body['level'] = x[6:]
+                else:
+                    body['filter'] = x
+        elif v == 'off':
+            body = {'on': False}
+        elif v == 'status':
+            body = {}
+        else:
+            print('mon oslog on [PROC,PROC..|all] [level=all] | off | status')
+            return 1
+        r = call('/api/oslog', body)
+        print(logs_text(r.get('logs') or {}))
+        r.pop('logs', None)
+        return out(r)
+    if c == 'tail':
+        v = rest[0] if rest else 'list'
+        if v == 'add' and len(rest) == 3:
+            body = {'op': 'add', 'name': rest[1], 'path': rest[2]}
+        elif v == 'del' and len(rest) == 2:
+            body = {'op': 'del', 'name': rest[1]}
+        elif v == 'list':
+            body = {'op': 'list'}
+        else:
+            print('mon tail add NAME PATH | tail del NAME | tail list')
+            return 1
+        r = call('/api/tail', body)
+        print(logs_text(r.get('logs') or {}))
+        r.pop('logs', None)
+        return out(r)
+    if c == 'logs':
+        r = call('/api/logs')
+        print(logs_text(r.get('logs') or {}))
+        return 0
     print('unknown: %s' % c)
     return 1
+
+
+def logs_text(lv):
+    """one line per log stream (status / snap / oslog / tail)"""
+    out = []
+    for n, v in sorted(lv.items()):
+        what = ('oslog %s%s' % ('on' if v.get('on') else 'off', ' [%s]' % v['filter'] if v.get('filter') else ' [all]'
+                                if v.get('on') else '')) if v.get('kind') == 'cmd' else 'tail %s' % v.get('path')
+        out.append('log %s: %s -> %s, %s bytes, %s B/s, lost %s%s%s' % (
+            n, what, v.get('file'), v.get('bytes'), v.get('bps'), v.get('lost'),
+            ', pid %s' % v['pid'] if v.get('pid') else '', '; %s' % v['status'] if v.get('status') else ''))
+    return '\n'.join(out) if out else 'log streams: none'
 
 
 def snap_text(s):
@@ -1984,6 +2348,8 @@ def snap_text(s):
     k = s['klog']
     print('klog %s B/s (kernel), rx %s B/s; %s; top: %s' % (k['bps_kernel'], k['bps_rx'], k['file'], ', '.join(
         '%s %s B/s' % (x['tag'], x['bps']) for x in k['top_tags'][:5])))
+    if s.get('logs'):
+        print(logs_text(s['logs']))
     for cr in s.get('crashes', [])[:3]:
         print('crash: [%.1f] %s' % (cr['ts'], cr['line']))
     if s.get('trace'):

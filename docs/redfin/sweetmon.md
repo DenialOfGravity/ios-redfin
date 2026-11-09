@@ -9,7 +9,7 @@ start/stop traces from a dashboard button or from Claude (phone agent); no more 
 
 | Piece | Where | What |
 |---|---|---|
-| `sweetmon` | phone, /var/local/bin/sweetmon (source phone/tools/sweetmon.c) | one small daemon: samples, tails the kernel log ring, records traces in RAM, serves one TCP client |
+| `sweetmon` | phone, /var/local/bin/sweetmon (source phone/tools/sweetmon.c) | one small daemon: samples, tails the kernel log ring, records traces in RAM, follows log files and the os_log streamer (log streams), serves one TCP client |
 | collector | PC/WSL, tools-claude/sweetmon/collector.py (python3 stdlib only) | connects to the phone (USB or Wi-Fi), keeps everything on disk, serves the dashboard + JSON API |
 | dashboard | tools-claude/sweetmon/dashboard.html, served at http://localhost:8765/ | live charts, process table, klog tail, trace buttons |
 | agent actions | tools-claude/phone-agent.sh `mon ...` | Claude's hook: start/stop traces, snapshots, link choice, install |
@@ -34,6 +34,10 @@ Data that already exists and is reused (no kernel change needed for v1):
   while a trace runs; data is LZ4-compressed and sent after stop. "stream" mode sends chunks during the trace.
 - The daemon reports its own CPU time and memory in every sample, so its cost is always visible.
 - nice 10. Timers via kevent/select, not busy loops.
+- Log streams (ws-n-mon-logs): a followed file costs one stat()+fstat() per second (also with no client: that is how the
+  gap stays fillable); the oslog child is off by default and only runs between `oslog on` and `oslog off` (its pipe is
+  read at most every 100 ms). Each stream keeps the newest 1 MiB (`-R KIB`) in RAM; nothing is written to flash.
+  Measured on the host build: ~1 ms/s with the collector connected and the streams idle, 0 without a client.
 
 ## Wire protocol (TCP 5150 on all interfaces; one client; a new authenticated client replaces the old one)
 
@@ -56,6 +60,10 @@ one `R` reply: JSON `{"cmd":"<first word>","ok":true|false,"msg":"...", ...}`.
 | `E` | JSON trace end `{"id":..,"kind":"kdebug"|"pmem","bytes":<uncompressed>,"zbytes":..,"events":..,"threads":..,"wrapped":bool,"lost":..,"secs":..,"cpu_ms":<daemon cpu used for it>}` | after the last `T` |
 | `F` | JSON frame stats (light frame mode, below) | every period while on |
 | `P` | filler bytes (speed test) | after `speed` |
+| `L` | u8 name length N, N bytes stream name, u64 LE stream position of the first byte, then the bytes | log stream data, only to a client that asked for that stream (`tail add` / `oslog on`) |
+
+Hello additions (ws-n-mon-logs): `"logs":1` (the daemon has log streams; absent = older daemon: the collector skips
+them) and `"log_epoch":"PID.UNIXTIME"` (this daemon instance; stream positions restart at 0 in a new one).
 
 ### Commands
 - `auth TOKEN`
@@ -79,6 +87,27 @@ one `R` reply: JSON `{"cmd":"<first word>","ok":true|false,"msg":"...", ...}`.
 - `ping X` -> `R` msg X (round-trip time).
 - `info` -> `R` with build, config, kdebug owner state, memory use.
 - `quit` -> daemon exits (the collector restarts it over ssh when wanted).
+- Log streams. A stream is a named byte stream with a RAM ring (newest 1 MiB, daemon flag `-R KIB`); its position is
+  the number of bytes it produced since this daemon made it. Streams live on when the client goes (they keep filling
+  their ring); a new client gets no `L` frame until it asks for a stream. Every reply carries `"epoch"` and
+  `"stream":{name,kind,pos,start,total,sent,sub,ring_kb, file: path,open,off,rotated,truncated,skipped | cmd: on,pid,
+  filter,levels,starts,status,bin}` (`start` = oldest position still in the ring).
+  - `tail add NAME PATH [from=POS] [new=1]` follow PATH (NAME `[A-Za-z0-9_.-]{1,23}`, PATH absolute). Polled every 1 s:
+    new bytes by offset; inode/dev changed (renamed + recreated, as wland does at start) = the rest of the old file,
+    then the new one from 0; size below the offset, or the 32 bytes before the offset changed (rewritten past the old
+    end) = truncated, from 0; file gone = waits. Each case puts a `[sweetmon: ...]` line into the stream. First open
+    sends the newest ring's worth of the file (`new=1`: only bytes written after it). Same NAME, other PATH = the
+    same stream (positions go on) following the other file. `from=POS`: send from POS (older than the ring: from the
+    ring start, the PC sees the jump as lost bytes); without it: everything still in the ring.
+  - `tail del NAME`, `tail list` (= `logs`: `"streams":[...]`).
+  - `oslog on [PROC,PROC..|all] [level=all] [from=POS]` start `/var/local/bin/oslog [-l] PROC PROC..` (daemon flag
+    `-O PATH`) with posix_spawn (stdin /dev/null, stdout+stderr into a pipe, own process group, default signal
+    dispositions); stream name `oslog`. Already running with the same settings: just subscribes; other settings:
+    SIGTERM and a restart. If it dies while on: restarted after 1 s, 2 s, 4 s .. 60 s (1 s again after a run of >= 30 s).
+    `oslog off`: SIGTERM (SIGKILL after 2 s), reaped with waitpid(WNOHANG) on the loop (no SIGCHLD handler). Killed
+    on daemon exit, and switched off after 10 min without any client (the collector turns it on again). Start,
+    exit and stop are `[sweetmon: oslog started: ... (pid N, start K)]` etc. lines in the stream. `oslog status`.
+  - An older daemon answers these with `"unknown command"` (ok false); the session goes on.
 
 ### Sample `S`
 ```
@@ -106,18 +135,25 @@ pure-python LZ4 frame decoder tools/lz4py.py), then runs `sweet-trace.py --summa
   logs/mon/phone.json), `auto` = USB if it answers, else Wi-Fi. Reconnects every 2 s. When the phone answers ssh but
   not 5150 it starts the daemon: `ssh root@HOST /var/local/bin/sweetmon -D` (agent key ~/.ssh/redfin-claude).
 - On connect: auth, `rate`, `klog PA` (from logs/mon/config.json `klog_pa`, default the KLOG_PA of the newest status
-  doc's kernel; `mon klog-pa PA` changes it), `klog from POS` after a reconnect within the same boot.
-- Writes: logs/mon/now.json (latest merged snapshot, every sample — Claude reads this file directly),
+  doc's kernel; `mon klog-pa PA` changes it), `klog from POS` after a reconnect within the same boot. Then, when the
+  hello has `logs`: `logs` (tails the daemon has but config.json doesn't: `tail del`), `tail add NAME PATH` for each
+  config.json `tails` entry and `oslog on FILTER` when config.json `oslog.on` (else `oslog off` if it still runs), each
+  with `from=POS` (state.json position, same `log_epoch`) or, after a daemon restart within the boot, `new=1` and a
+  `[sweetmon collector: the phone daemon restarted ...]` line in the file.
+- Writes: logs/mon/<NAME>-<boot>.log (tail streams), logs/mon/oslog-<boot>.txt (`[sweetmon: N bytes of NAME lost
+  here]` where a ring overran), logs/mon/now.json (latest merged snapshot, every sample — Claude reads this file directly),
   logs/mon/metrics-YYYYMMDD.jsonl (every sample), logs/mon/klog-<boot>.txt (the full kernel log, appended; replaces
   `klog PA` pulls), logs/traces/... . Parses the klog lines above into the snapshot (cpufreq, gpu, battery, thermal level).
 - HTTP 127.0.0.1:8765: `/` dashboard, `/api/stream` (SSE: hello, sample, klog lines, trace events), `/api/now`,
   `/api/history?secs=N`, `/api/klog?n=N&grep=RE`, `POST /api/trace/start` (JSON: kind kdebug|prof, name, secs, opts),
   `POST /api/trace/stop`, `GET /api/traces`, `POST /api/cmd` (raw command, for debugging), `POST /api/link` (usb|wifi|auto),
-  `POST /api/speed` (MB), `POST /api/frames` (on|off).
+  `POST /api/speed` (MB), `POST /api/frames` (on|off), `GET /api/log?name=NAME&n=N&grep=RE`, `GET /api/logs`,
+  `POST /api/oslog` ({on, filter, level}), `POST /api/tail` ({op: add|del|list, name, path}); SSE event `log`.
 - Kernel profiler traces (kind prof): poke `p prof start NAME HZ SECS` through tools/flame-cmd.py (USB only), wait for
   the `SWEET PROF: ... buffer N KiB at pa 0x...` line in the klog stream, then `pmem PA LEN`, then sweet-prof.py.
 
 ## Agent actions (Claude)
 `mon-start` / `mon-stop` / `mon-status` (collector process), `mon trace NAME [kdebug|prof] [SECS] [k=v...]`,
 `mon stop`, `mon snap` (text summary of now.json), `mon link usb|wifi|auto`, `mon speed [MB]`, `mon frames on|off`,
-`mon install` (files put sweetmon + key, start it), `mon klog-pa PA`. Results also land as files in logs/mon and logs/traces.
+`mon install` (files put sweetmon + key, quit the old daemon, start it), `mon klog-pa PA`, `mon oslog on [PROCS]|off|status`,
+`mon tail add NAME PATH|del NAME|list`, `mon logs`. Results also land as files in logs/mon and logs/traces.
