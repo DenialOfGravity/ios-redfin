@@ -927,21 +927,7 @@ a6xx::TexConst Texture::sampledDescriptor() const {
         d.dword[0] = (d.dword[0] & ~A6XX_TEX_CONST_0_SAMPLES__MASK) |
                      A6XX_TEX_CONST_0_SAMPLES(desc_.samples == 4 ? MSAA_FOUR : MSAA_TWO);
     }
-    if (ubwc_) {
-        // a UBWC texture (fdl6_view_init, fd6_view.c:251-306): TILE6_3, TILE_ALL (fdl6_layout sets it for UBWC on a
-        // chip without has_ubwc_linear_mipmap_fallback), and the flag buffer's address, pitch, layer and blocks
-        // (a tiled layout holds every 8-bit format in WZYX order: fd6_texture_swap gives WZYX for one that is not linear,
-        // and the 2D copy that fills it from the linear rows reorders a BGRA texture's bytes so)
-        d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3) |
-                     A6XX_TEX_CONST_0_SWAP(WZYX);
-        d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG;
-        const uint64_t flags = flagAddress();
-        d.dword[7] = uint32_t(flags);
-        d.dword[8] = uint32_t(flags >> 32);
-        d.dword[9] |= A6XX_TEX_CONST_9_FLAG_BUFFER_ARRAY_PITCH(ubwcLayerSize_ >> 2);
-        d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) |
-                       A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
-    }
+    if (ubwc_) ubwcDescriptor(d);
     if (info_->depth) {
         // the depth plane as the TP reads it (fdl6_view_init over a depth layout): TILE6_3, and TILE_ALL since every level
         // of a depth layout is tiled (fd6_layout.c:157-164 "Linear D/S is not supported by HW"); FMT6_32_FLOAT, the depth
@@ -962,10 +948,32 @@ a6xx::TexConst Texture::sampledDescriptor() const {
     return d;
 }
 
+void Texture::ubwcDescriptor(a6xx::TexConst& d) const {
+    using namespace a6xx;
+    // a UBWC texture (fdl6_view_init, fd6_view.c:251-306): TILE6_3, TILE_ALL (fdl6_layout sets it for UBWC on a
+    // chip without has_ubwc_linear_mipmap_fallback), and the flag buffer's address, pitch, layer and blocks
+    // (a tiled layout holds every 8-bit format in WZYX order: fd6_texture_swap gives WZYX for one that is not linear,
+    // and the 2D copy that fills it from the linear rows reorders a BGRA texture's bytes so)
+    d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3) |
+                 A6XX_TEX_CONST_0_SWAP(WZYX);
+    d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG;
+    const uint64_t flags = flagAddress();
+    d.dword[7] = uint32_t(flags);
+    d.dword[8] = uint32_t(flags >> 32);
+    d.dword[9] |= A6XX_TEX_CONST_9_FLAG_BUFFER_ARRAY_PITCH(ubwcLayerSize_ >> 2);
+    d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) |
+                   A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
+}
+
 a6xx::TexConst Texture::levelDescriptor(uint32_t level) const {
     const TextureLevel L = this->level(level);
     a6xx::TexConst d = texture2d(levelAddress(level), L.width, L.height, uint32_t(L.pitch), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),
                                  info_->fmt6, info_->swap, info_->hasAlpha, info_->srgb);
+    // (redfin hmv3) a compressed render target (HM_UBWC_RT) read by a framebuffer fetch in sysmem: its tiles and flag
+    // buffer, as sampledDescriptor gives them -- this descriptor took it as linear rows, so a fetching draw read the
+    // compressed bytes as pixels (the likely cause of hmt4's whitish-green dock and search-pill material under
+    // HM_UBWC_RT=1, a blend CoreAnimation does by fetch). One level is all a compressed texture has.
+    if (ubwc_ && level == 0) ubwcDescriptor(d);
     d.dword[0] = swizzleWord(d.dword[0]);
     return d;
 }

@@ -72,7 +72,7 @@ shim_env(void)
 		if (line[0] == '\0' || line[0] == '#') {
 			continue;
 		}
-		/* (hmv2) and the core's HM_* switches: HM_CB_PAD, HM_XR, HM_PROF, HM_UBWC_RT */
+		/* (hmv2) and the core's HM_* switches: HM_CB_PAD, HM_XR, HM_PROF, HM_UBWC_RT; (hmv3) HM_GMEM */
 		if (eq == NULL || (strncmp(line, "HAKIOS_METAL_", 13) != 0 && strncmp(line, "HM_", 3) != 0)) {
 			shim_log("env: left out: %s", line);
 			continue;

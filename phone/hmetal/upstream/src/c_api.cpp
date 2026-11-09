@@ -928,6 +928,11 @@ void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb* cb, unsigned draws) {
     cb->cb->setGmemMinDraws(draws);
 }
 
+void hakios_metal_cb_set_gmem_max_tiles(hakios_metal_cb* cb, unsigned tiles) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, tiles] { cb->cb->setGmemMaxTiles(tiles); });
+    cb->cb->setGmemMaxTiles(tiles);
+}
+
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmemBinning(on != 0); });
     cb->cb->setGmemBinning(on != 0);
@@ -992,6 +997,15 @@ int hakios_metal_cb_pass_info(hakios_metal_cb* cb, unsigned i, unsigned* format,
     if (cleared) *cleared = t[i].clearBytes;
     if (loaded) *loaded = t[i].loadBytes;
     if (stored) *stored = t[i].storeBytes;
+    return int(t.size());
+}
+
+int hakios_metal_cb_pass_actions(hakios_metal_cb* cb, unsigned i, unsigned* load, unsigned* store) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    if (load) *load = t[i].loadAction;
+    if (store) *store = t[i].storeAction;
     return int(t.size());
 }
 

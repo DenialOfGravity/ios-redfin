@@ -5787,6 +5787,43 @@ TEST(a_visibility_stream_overflow_turns_the_binning_off) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// (redfin hmv3) HM_GMEM=N,T: a pass whose whole-window plan has more tiles than the limit is drawn in sysmem and says
+// why; under a limit it keeps, GMEM as before. And each profiled pass carries colour attachment 0's load and store actions.
+TEST(a_pass_of_more_tiles_than_the_limit_is_drawn_in_sysmem) {
+    Rig r;
+    auto t = target(r, 1024, 1024);
+    RenderPass a;
+    a.color0 = t.get();
+    a.load = LoadAction::kDontCare;
+    auto run = [&](uint32_t limit, uint32_t* tiles) {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setGmemMaxTiles(limit);
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(6), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        const auto p = cb->passTimes();
+        CHECK_EQ(p.size(), 1u);
+        if (p.size() != 1) return std::string("no pass");
+        *tiles = p[0].tiles;
+        CHECK_EQ(uint32_t(p[0].loadAction), uint32_t(LoadAction::kDontCare));
+        CHECK_EQ(uint32_t(p[0].storeAction), uint32_t(StoreAction::kStore));
+        return std::string(cb->passSysmemWhy(0));
+    };
+    uint32_t tiles = 0;
+    CHECK(run(0, &tiles).empty());
+    CHECK(tiles >= 1);
+    // (the limit is on the whole window's plan, judged as the pass opens: 1024 x 1024 RGBA8 is 4 MiB, more than any
+    // chip's GMEM holds in one tile, however few of the tiles the draws then reach)
+    const std::string why = run(1, &tiles);
+    CHECK_EQ(tiles, 0u);
+    CHECK(why.find("more than HM_GMEM's limit of 1") != std::string::npos);
+    CHECK(run(100000, &tiles).empty());
+    CHECK(tiles >= 1);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 // Why each profiled pass stayed in sysmem, pass by pass (CommandBuffer::passSysmemWhy): a pass with depth says so while
 // the GMEM pass beside it says nothing; a pass of 1 draw under a bar of 2 names the bar; GMEM off names the boot-arg
 TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {

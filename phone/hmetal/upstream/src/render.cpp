@@ -2985,6 +2985,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     } else if (options.gmem && gmem_) {
         gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
         if (!tileable) gmemWhy_ = gmemWhy;
+        if (gmem && gmemMaxTiles_ != 0 && plan.tiles() > gmemMaxTiles_) {
+            // (redfin hmv3, HM_GMEM=N,T) too many bins: each loads and stores its share and replays the draws
+            gmem = false;
+            gmemWhy_ = std::to_string(plan.tiles()) + " tiles, more than HM_GMEM's limit of " + std::to_string(gmemMaxTiles_);
+        }
         if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
             // (a light pass is most of CoreAnimation's, and recording each of its draws twice was 7.5 us a draw on the
@@ -3090,6 +3095,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                     const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
                     if (t == nullptr) continue;
                     if (i == 0) pt.format = uint32_t(t->format()), pt.tiling = t->compressed() ? 1 : 0;
+                    if (i == 0) pt.loadAction = uint8_t(pass.load), pt.storeAction = uint8_t(pass.store);   // (redfin hmv3, HM_PROF)
                     const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
                     if (la == LoadAction::kClear) pt.clearBytes += uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel;
                 }

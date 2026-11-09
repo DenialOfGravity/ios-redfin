@@ -144,7 +144,10 @@ public:
                       // (redfin hmv2, HM_PROF) colour attachment 0's MTLPixelFormat and layout (0 linear, 1 UBWC), and the
                       // bytes the pass's colour attachments had cleared (the sysmem fill, or a GMEM clear's tiles), loaded
                       // into GMEM and stored back from it (a sysmem pass loads and stores nothing: it draws into memory)
-                      uint32_t format = 0; uint8_t tiling = 0; uint64_t clearBytes = 0, loadBytes = 0, storeBytes = 0; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+                      uint32_t format = 0; uint8_t tiling = 0; uint64_t clearBytes = 0, loadBytes = 0, storeBytes = 0;
+                      // (redfin hmv3, HM_PROF) colour attachment 0's MTLLoadAction and MTLStoreAction as the pass asked them
+                      // (0xff: no colour attachment)
+                      uint8_t loadAction = 0xff, storeAction = 0xff; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
@@ -168,6 +171,10 @@ public:
     // 22 ms in GMEM against 17 to 31 in sysmem, its passes of 45 to 49 draws 8 to 10 against 6 to 8, its light ones 5
     // against 0.13.
     void setGmemMinDraws(uint32_t draws) { gmemMinDraws_ = draws; }
+    // (redfin hmv3, HM_GMEM=N,T) GMEM only for a pass whose whole-window plan (as it opens) has at most TILES tiles (bins); 0: no limit. A620's
+    // 512 KiB GMEM holds a full 1125x2436 BGRA8 screen in 52 tiles, each a load and a store of its bin and every draw
+    // replayed: a pass of many tiles loses to drawing it straight into memory
+    void setGmemMaxTiles(uint32_t tiles) { gmemMaxTiles_ = tiles; }
     // render::Options::gmemBinning for this buffer's draws besides each draw's own (either asks for it)
     void setGmemBinning(bool on) { gmemBinning_ = on; }
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
@@ -199,6 +206,7 @@ private:
     bool gmem_ = true;
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;
+    uint32_t gmemMaxTiles_ = 0;   // (redfin hmv3) setGmemMaxTiles'
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)

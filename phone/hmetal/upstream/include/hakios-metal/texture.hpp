@@ -345,6 +345,8 @@ public:
     a6xx::TexConst sampledDescriptor() const;
     // ...of mip level L alone: what a framebuffer fetch reads of an attachment drawn at that level
     a6xx::TexConst levelDescriptor(uint32_t level) const;
+    // (redfin hmv3) a UBWC texture's fields into D (TILE6_3, WZYX, TILE_ALL, FLAG and the flag buffer): sampledDescriptor's and levelDescriptor's
+    void ubwcDescriptor(a6xx::TexConst& d) const;
     // the descriptor a stib/ldib addresses it through, at IBO slot numSsbos + index: the same without PITCHALIGN,
     // MIPLVLS and SAMPLES (fd6_view.c:383-397)
     a6xx::TexConst storageDescriptor() const;

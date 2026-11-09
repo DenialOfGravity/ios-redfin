@@ -487,6 +487,8 @@ void hakios_metal_cb_set_gmem_off(hakios_metal_cb *cb, unsigned bits);
 void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
 /* GMEM only for a pass whose like had at least DRAWS draws the last time (CommandBuffer::setGmemMinDraws); 0: off */
 void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
+/* (redfin hmv3) GMEM only for a pass of at most TILES tiles (CommandBuffer::setGmemMaxTiles); 0: no limit */
+void hakios_metal_cb_set_gmem_max_tiles(hakios_metal_cb *cb, unsigned tiles);
 /* CB's GMEM passes binned by the hardware first, each tile drawing only the draws that reach it (CommandBuffer::setGmemBinning) */
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
 /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */
@@ -505,6 +507,9 @@ int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);
  * attachments had cleared, loaded into GMEM and stored from it; the count of passes, -1 past them (any pointer NULL) */
 int hakios_metal_cb_pass_info(hakios_metal_cb *cb, unsigned i, unsigned *format, unsigned *tiling, unsigned long long *cleared,
     unsigned long long *loaded, unsigned long long *stored);
+/* (redfin hmv3) profiled pass I's colour attachment 0 load and store actions (MTLLoadAction 0 DontCare 1 Load 2 Clear,
+ * MTLStoreAction 0 DontCare 1 Store; 255 no colour attachment); the count of passes, -1 past them (either pointer NULL) */
+int hakios_metal_cb_pass_actions(hakios_metal_cb *cb, unsigned i, unsigned *load, unsigned *store);
 /* why CB's last pass refused for GMEM was refused ("" when none was); valid while CB lives */
 const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);
 /* why profiled pass I (hakios_metal_cb_pass_time's) of draws was drawn in sysmem, "" for a GMEM pass or past the passes;

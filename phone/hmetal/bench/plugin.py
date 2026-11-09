@@ -28,6 +28,10 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
     A pipeline that fails to link with a function compiled whole is linked once more with the label pick.
   - (hmvar) one line per render pipeline: "CA pipeline LABEL: vs NAME [pick] constants N (...) | fs ... | ok/refused",
     HAKIOS_METAL_CA_LOG=0 silences it; a refused draw names its pipeline's label and picks.
+  - (hmv2) HM_PROF=2's per-pass profile, HM_UBWC_RT=1 compressed CA render targets, the core's notices in this log
+  - (hmv3) HM_GMEM=0 (default: every pass sysmem) | 1 (upstream's metal_gmem_draws rule) | N (GMEM from N draws), ",T"
+    at most T tiles; HM_PROF's frames are the buffers that drew the display's IOSurface when nothing is presented
+    (the window server presents no drawable), and its classes carry colour attachment 0's load/store actions
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -216,7 +220,11 @@ hm_notice(const char *text)
 /* (redfin hmv2) HM_PROF in the environment: 1 the metal_fps report (every 2 s; boot-arg metal_fps does the same), 2 that
  * and every 5 s where the GPU's time goes: passes a frame, draws a pass, each kind of pass's GPU time from its
  * CP_ALWAYS_ON_COUNTER stamps, sysmem or GMEM (tiles), the target's format and layout, and the bytes cleared, loaded
- * into GMEM and stored from it */
+ * into GMEM and stored from it. (hmv3) and colour attachment 0's load/store actions, by class and over all draw passes.
+ * (hmv3) A frame is a presentDrawable where the process presents so; the window server never does (it draws into the
+ * display's IOSurfaces), so there a frame is a command buffer with a render pass into an IOSurface as large as the
+ * largest drawn so far (hm_frame_target): hmv2's "frames" stayed 0 and its "a frame" figures were per 5 s window */
+static int hm_presents_seen;   /* (redfin hmv3) a presentDrawable completed in this process */
 static int
 hm_prof_level(void)
 {
@@ -232,6 +240,7 @@ hm_prof_level(void)
 #define HM_PROF_CLASSES 24
 struct hm_prof_class {
 	unsigned kind, format, width, height, tiling, gmem, count, draws, tiles;
+	unsigned load, store;   /* (redfin hmv3) colour attachment 0's MTLLoadAction / MTLStoreAction, 255 none */
 	double us;
 	unsigned long long cleared, loaded, stored;
 };
@@ -239,6 +248,7 @@ static struct {
 	pthread_mutex_t lock;
 	double since;
 	unsigned presents, buffers, passes, draws, gmemPasses, tiles, other;
+	unsigned loads[4];   /* (redfin hmv3) draw passes by colour attachment 0's load action: DontCare, Load, Clear, none */
 	double gpuUs, passUs;
 	unsigned long long cleared, loaded, stored;
 	unsigned hist[6];   /* draw passes by their draws: 0, 1, 2-4, 5-15, 16-55, 56 and more */
@@ -272,7 +282,7 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 		hm_prof.buffers++;
 		hm_prof.gpuUs += gpu * 1e6;
 		for (unsigned i = 0;; i++) {
-			unsigned kind = 0, w = 0, h = 0, draws = 0, format = 0, tiling = 0, gmem;
+			unsigned kind = 0, w = 0, h = 0, draws = 0, format = 0, tiling = 0, gmem, la = 255, sa = 255;
 			unsigned long long c = 0, l = 0, st = 0;
 			double us = 0;
 			int tiles, k;
@@ -282,7 +292,11 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 			}
 			hakios_metal_cb_pass_info(cb, i, &format, &tiling, &c, &l, &st);
 			tiles = hakios_metal_cb_pass_tiles(cb, i);
+			hakios_metal_cb_pass_actions(cb, i, &la, &sa);   /* (redfin hmv3) */
 			gmem = tiles > 0;
+			if (kind == 0) {
+				hm_prof.loads[la < 3 ? la : 3]++;
+			}
 			hm_prof.passes++;
 			hm_prof.draws += draws;
 			hm_prof.passUs += us;
@@ -296,7 +310,8 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 			}
 			for (k = 0; k < HM_PROF_CLASSES; k++) {
 				struct hm_prof_class *x = &hm_prof.cls[k];
-				if (x->count == 0 || (x->kind == kind && x->format == format && x->width == w && x->height == h && x->tiling == tiling && x->gmem == gmem)) {
+				if (x->count == 0 || (x->kind == kind && x->format == format && x->width == w && x->height == h && x->tiling == tiling && x->gmem == gmem &&
+				    x->load == la && x->store == sa)) {
 					break;
 				}
 			}
@@ -307,6 +322,7 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 			{
 				struct hm_prof_class *x = &hm_prof.cls[k];
 				x->kind = kind, x->format = format, x->width = w, x->height = h, x->tiling = tiling, x->gmem = gmem;
+				x->load = la, x->store = sa;
 				x->count++, x->draws += draws, x->tiles += gmem ? (unsigned)tiles : 0, x->us += us;
 				x->cleared += c, x->loaded += l, x->stored += st;
 			}
@@ -318,11 +334,13 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 
 		hm_print("prof: %.1f s: %u frames (%.1f fps), %u buffers, %u passes (%.1f a frame), %u draws (%.1f a pass); GPU %.2f ms a frame "
 			 "(buffers), %.2f (passes' stamps); GMEM %u passes, %u tiles; MB a frame cleared %.2f, loaded %.2f, stored %.2f; draw passes by "
-			 "draws 0:%u 1:%u 2-4:%u 5-15:%u 16-55:%u 56+:%u%s\n",
+			 "draws 0:%u 1:%u 2-4:%u 5-15:%u 16-55:%u 56+:%u; draw passes by load DontCare:%u Load:%u Clear:%u none:%u (%s)%s\n",
 			 secs, hm_prof.presents, hm_prof.presents / secs, hm_prof.buffers, hm_prof.passes, hm_prof.passes / frames, hm_prof.draws,
 			 hm_prof.passes != 0 ? (double)hm_prof.draws / hm_prof.passes : 0.0, hm_prof.gpuUs / 1e3 / frames, hm_prof.passUs / 1e3 / frames,
 			 hm_prof.gmemPasses, hm_prof.tiles, hm_prof.cleared / 1e6 / frames, hm_prof.loaded / 1e6 / frames, hm_prof.stored / 1e6 / frames,
 			 hm_prof.hist[0], hm_prof.hist[1], hm_prof.hist[2], hm_prof.hist[3], hm_prof.hist[4], hm_prof.hist[5],
+			 hm_prof.loads[0], hm_prof.loads[1], hm_prof.loads[2], hm_prof.loads[3],
+			 hm_presents_seen ? "frames = presentDrawable" : "frames = buffers that drew the display's IOSurface",
 			 hm_prof.other != 0 ? " (passes past the classes not listed)" : "");
 		qsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);
 		for (int k = 0; k < 12 && hm_prof.cls[k].count != 0; k++) {
@@ -332,8 +350,10 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 			if (x->gmem) {
 				snprintf(tiles, sizeof(tiles), ", %.1f tiles", (double)x->tiles / x->count);
 			}
-			hm_print("prof:   %-8s fmt %3u %4ux%-4u %-6s %-6s x%-5u %5.1f draws, %7.1f us a pass, %6.2f ms a frame; KB a pass cleared %.0f loaded %.0f stored %.0f%s\n",
+			hm_print("prof:   %-8s fmt %3u %4ux%-4u %-6s %-6s %s/%s x%-5u %5.1f draws, %7.1f us a pass, %6.2f ms a frame; KB a pass cleared %.0f loaded %.0f stored %.0f%s\n",
 				 x->kind < 4 ? kinds[x->kind] : "?", x->format, x->width, x->height, x->tiling ? "UBWC" : "linear",
+				 x->load == 0 ? "dontcare" : x->load == 1 ? "load" : x->load == 2 ? "clear" : "-",
+				 x->store == 0 ? "dontcare" : x->store == 1 ? "store" : "-",
 				 x->gmem ? "GMEM" : "sysmem", x->count, (double)x->draws / x->count, x->us / x->count, x->us / 1e3 / frames,
 				 x->cleared / 1e3 / x->count, x->loaded / 1e3 / x->count, x->stored / 1e3 / x->count,
 				 tiles);
@@ -361,6 +381,68 @@ hm_ubwc_rt(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	       (usage & MTLTextureUsageRenderTarget) != 0 && (usage & MTLTextureUsageShaderWrite) == 0 &&
 	       (usage & ~(MTLTextureUsage)(MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead)) == 0 &&
 	       [descriptor storageMode] == MTLStorageModePrivate;
+}
+'''
+
+HMV3_HELPERS = r'''
+/* (redfin hmv3) HM_GMEM in the environment (bench/m2shim.m passes it from /var/local/hmetal/ca/env): where a render pass
+ * is drawn.
+ *   0      every pass in sysmem, straight into memory (as metal2vulkan's TU_DEBUG=sysmem); the default unless the
+ *          boot-args name metal_gmem=1 or metal_gmem_draws=
+ *   1      upstream's rule: GMEM for a pass of at least metal_gmem_draws draws (56 unless the boot-arg says), boot-arg
+ *          metal_gmem=1 and metal_gmem_off as before; the default when the boot-args name either
+ *   N >= 2 GMEM for a pass of at least N draws
+ *   ...,T  (any of the above) and only where the pass's plan has at most T tiles (bins)
+ * Why 0: hmt4 on the A620 (512 KiB GMEM) drew the 1125x2436 BGRA8 screen in 52 tiles. A GMEM pass of ~91 draws took
+ * 15.2 ms (0.29 ms a tile; each pass loading ~11 MB and storing 11-22 MB, ~2.5-3 ms of bandwidth alone, and every
+ * draw replayed in each tile it reaches), 62-66 % of the GPU's time; a full-screen sysmem pass of ~18 draws took 1.7 ms,
+ * so ~91 draws in sysmem come to ~8-9 ms, and m2v (Turnip, sysmem) draws the same frames in 8.9 ms. */
+static int
+hm_gmem_mode(unsigned *tiles)
+{
+	static int mode = -1;
+	static unsigned limit;
+
+	if (mode < 0) {
+		const char *e = getenv("HM_GMEM"), *comma;
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const int bootarg = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+				    (strstr(args, "metal_gmem=1") != NULL || strstr(args, "metal_gmem_draws=") != NULL);
+		int m;
+
+		if (e == NULL || e[0] == '\0') {
+			m = bootarg ? 1 : 0;
+		} else {
+			m = atoi(e);
+			if (m < 0) m = 0;
+			if ((comma = strchr(e, ',')) != NULL && atoi(comma + 1) > 0) limit = (unsigned)atoi(comma + 1);
+		}
+		hm_print("HM_GMEM=%s: %s%s%u%s\n", e != NULL ? e : (bootarg ? "unset (boot-arg metal_gmem*: upstream's rule)" : "unset (default 0)"),
+			 m == 0 ? "every pass in sysmem" : m == 1 ? "upstream's rule (metal_gmem_draws, 56 unless the boot-arg says)" : "GMEM for passes of at least N draws",
+			 limit != 0 ? ", at most " : "", limit, limit != 0 ? " tiles" : "");
+		mode = m;
+	}
+	if (tiles != NULL) *tiles = limit;
+	return mode;
+}
+
+/* (redfin hmv3) whether a render pass into TEXTURE draws the display: an IOSurface target as large as the largest seen */
+static BOOL
+hm_frame_target(id texture)
+{
+	static unsigned long long largest;
+	unsigned long long area;
+
+	if (texture == nil || ![texture respondsToSelector:@selector(iosurface)] || [texture iosurface] == NULL) {
+		return NO;
+	}
+	area = (unsigned long long)[texture width] * [texture height];
+	if (area < largest) {
+		return NO;
+	}
+	largest = area;
+	return YES;
 }
 '''
 
@@ -440,6 +522,30 @@ EDITS = [
     # (hmv2) the notice hook, the profile and the render-target switch's helpers, before hm_bitcode_for as hmvar's
     ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
      HMV2_HELPERS + '/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE'),
+    # (hmv3) HM_GMEM and the frame mark's helpers, after hmv2's
+    ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
+     HMV3_HELPERS + '/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE'),
+    # (hmv3) HM_GMEM: sysmem / GMEM per command buffer, read once
+    ('\t\thakios_metal_cb_set_gmem(_cb, hm_gmem_on() || hm_gmem_draws() != 0);\n\t\thakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());\n',
+     '\t\t{   /* (redfin hmv3) HM_GMEM: 0 sysmem (default), 1 upstream\'s rule, N GMEM from N draws; ,T at most T tiles */\n'
+     '\t\t\tunsigned tiles = 0;\n'
+     '\t\t\tconst int mode = hm_gmem_mode(&tiles);\n\n'
+     '\t\t\thakios_metal_cb_set_gmem(_cb, mode == 1 ? (hm_gmem_on() || hm_gmem_draws() != 0) : mode >= 2);\n'
+     '\t\t\thakios_metal_cb_set_gmem_min_draws(_cb, mode == 1 ? hm_gmem_draws() : mode >= 2 ? (unsigned)mode : 0);\n'
+     '\t\t\thakios_metal_cb_set_gmem_max_tiles(_cb, tiles);\n'
+     '\t\t}\n'),
+    # (hmv3) a frame: the command buffer that drew the display's IOSurface (the window server presents no drawable)
+    ('\tNSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */\n',
+     '\tNSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */\n'
+     '@public\n\tBOOL _hmFrame;                           /* (redfin hmv3, public: hm_completed is a C function) a render pass here drew the display\'s IOSurface (hm_frame_target) */\n'),
+    ('\t\thm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);\n\n\t\t[encoder hakiosTakeResolves:descriptor];',
+     '\t\thm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);\n'
+     '\t\tif (hm_frame_target(texture)) _hmFrame = YES;   /* (redfin hmv3) */\n\n\t\t[encoder hakiosTakeResolves:descriptor];'),
+    ('\thm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);\n',
+     '\tif (self->_hmFrame && !hm_presents_seen) {\n\t\thm_fps_note(YES, 0, 0, NULL);   /* (redfin hmv3) a frame drawn, nothing presented */\n\t}\n'
+     '\thm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);\n'),
+    ('\t\t[drawable release];\n\t\thm_fps_note(YES, 0, 0, NULL);\n',
+     '\t\t[drawable release];\n\t\thm_presents_seen = 1;   /* (redfin hmv3) */\n\t\thm_fps_note(YES, 0, 0, NULL);\n'),
     # (hmv2) the core's notices into this log, set where the device is made
     ('\t{   /* (redfin hmvar) */\n\t\tunsigned hbb = 0, swz = 0, mt = 0;\n',
      '\thakios_metal_set_notice(hm_notice);   /* (redfin hmv2) */\n\t{   /* (redfin hmvar) */\n\t\tunsigned hbb = 0, swz = 0, mt = 0;\n'),
