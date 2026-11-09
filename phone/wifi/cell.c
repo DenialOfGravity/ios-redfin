@@ -2280,13 +2280,14 @@ static unsigned bcd_digits(const char *d, uint8_t *out)	/* swapped nibbles, F pa
 static void sms_send(void)
 {
 	char text[96];
-	uint8_t pdu[180], ud[160], da[12];
+	uint8_t pdu[182], ud[160], da[12];
 	unsigned k = 0, dal, septets;
 	struct qmi_buf *q = xs_start(0x20);
 	if (!q)
 		return;
 	snprintf(text, sizeof(text), "redfin iOS: cellular data and SMS test, t=%llus", (unsigned long long)link_ms() / 1000);
 	septets = gsm7_pack(text, ud, sizeof(ud));
+	pdu[k++] = 0x00;			/* SMSC address length 0: the SIM's service centre (Qualcomm WMS wants the SCA byte; without it: err 0x30) */
 	pdu[k++] = 0x01;			/* SMS-SUBMIT, no validity period, no status report */
 	pdu[k++] = 0x00;			/* message reference: the modem fills it in */
 	pdu[k++] = (uint8_t)strlen(sms_num);	/* destination: number of digits */
