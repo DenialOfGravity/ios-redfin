@@ -14,6 +14,8 @@
  * Trip: each backboardd start on hakios-metal appends its time to /var/local/hmetal/ca/bbd-hm.starts; the third start within
  * 120 s renames the flag to bbd-hm.tripped and takes SweetMetal2, so a window server that keeps dying on hakios-metal
  * comes back on SweetMetal2 by itself. Switching: touch / rm the flag, then psx -k backboardd.
+ * (hmvar) /var/local/hmetal/ca/env: HAKIOS_METAL_* KEY=VALUE lines set in backboardd before the plug-in loads
+ * (HAKIOS_METAL_CA_PICK=exact|own|nearest, HAKIOS_METAL_CA_LOG=0, ...), read at each start.
  * Manual reference counting, as the plug-ins.
  */
 #import <Foundation/Foundation.h>
@@ -31,6 +33,7 @@
 #define HM_FLAG   "/var/local/hmetal/ca/bbd-hm"
 #define HM_STARTS "/var/local/hmetal/ca/bbd-hm.starts"
 #define SHIM_LOG  "/var/local/hmetal/ca/shim.log"
+#define HM_ENV    "/var/local/hmetal/ca/env"   /* (hmvar) KEY=VALUE lines, HAKIOS_METAL_* keys only, set in backboardd */
 
 static void
 shim_log(const char *fmt, ...)
@@ -51,6 +54,35 @@ shim_log(const char *fmt, ...)
 }
 
 /* the third hakios-metal start within 120 s: no more */
+/* (hmvar) the plug-in's switches without a rebuild: HM_ENV's lines KEY=VALUE, each KEY starting HAKIOS_METAL_ (anything
+ * else is left out and said), e.g. HAKIOS_METAL_CA_PICK=own; edit the file, then psx -k backboardd */
+static void
+shim_env(void)
+{
+	FILE *f = fopen(HM_ENV, "r");
+	char line[256];
+
+	if (f == NULL) {
+		return;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *eq = strchr(line, '='), *end = line + strcspn(line, "\r\n");
+
+		*end = '\0';
+		if (line[0] == '\0' || line[0] == '#') {
+			continue;
+		}
+		if (eq == NULL || strncmp(line, "HAKIOS_METAL_", 13) != 0) {
+			shim_log("env: left out: %s", line);
+			continue;
+		}
+		*eq = '\0';
+		setenv(line, eq + 1, 1);
+		shim_log("env: %s=%s", line, eq + 1);
+	}
+	fclose(f);
+}
+
 static bool
 shim_tripped(void)
 {
@@ -88,6 +120,7 @@ shim_tripped(void)
 	/* (self not released: before -init, _MTLDevice's -dealloc reads what -init never set; both plug-ins do the same) */
 	if (strcmp(getprogname(), "backboardd") == 0 && access(HM_FLAG, F_OK) == 0 && !shim_tripped()) {
 		setenv("HAKIOS_METAL_LOG", "/var/local/hmetal/ca/bbd-hm.log", 1);
+		shim_env();
 		NSBundle *b = [NSBundle bundleWithPath:@HM_BUNDLE];
 		NSError *e = nil;
 		if (b != nil && [b loadAndReturnError:&e]) {

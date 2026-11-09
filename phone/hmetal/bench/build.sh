@@ -4,7 +4,7 @@
 #   hmbench.metallib      hakios-metal's own AIR kernels (tri_attr_vs, tri_tex_fs, tri_color_fs) in a container made
 #                         by bench/mkmetallib.py (llvm-as of the .ll; no Apple tool, no Apple metallib) -> /var/local/hmetal/
 #   HakiosMetal.bundle    hakios' render-capable plug-in (HakiosMetalCA.m, fetched at the pinned commit, never committed;
-#                         bench/plugin.py's three edits) over out/libhakios-metal.a -> /var/local/hmetal/HakiosMetal.bundle
+#                         bench/plugin.py's edits) over out/libhakios-metal.a -> /var/local/hmetal/HakiosMetal.bundle
 # HMB_LIBS: Mesa's archives when the library is built with MESA=1 (phone/hmetal/build.sh passes its LIBS).
 # Needs: $CC (ios-cc), llvm-as (LLVM 15+: opaque pointers), python3, curl (or HMB_CA_SRC=FILE).
 set -e

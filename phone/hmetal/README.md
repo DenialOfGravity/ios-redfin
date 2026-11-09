@@ -72,7 +72,22 @@ Logs `/var/local/hmetal/bench-<dev>.log`, lines `RESULT dev wl draws enc_us us/d
   `bench/mkmetallib.py` (our MTLB writer). No Apple metallib.
 - The hakios plug-in is upstream's render-capable one, `userland/src/HakiosMetalCA.m`, fetched by `bench/build.sh` at
   2631f5d (sha256 pinned) and never committed: its origin (vcvkk/darwin-redwood) has a licence hakios lists as "to
-  verify". `bench/plugin.py` makes three edits (cache under /var/local/hmetal, device for `HAKIOS_METAL_ALL` processes).
+  verify". `bench/plugin.py` edits it by exact text (cache under /var/local/hmetal, device for `HAKIOS_METAL_ALL` processes, log copy, the CA pick).
+- CoreAnimation's uber shaders in the plug-in (window server test, hmvar): `HAKIOS_METAL_CA_PICK` = `exact` (default: the
+  pinned plug-in's pre-specialised variant from QuartzCore's default.pipelinelib only where the function's or the pipeline's
+  label names one exactly; a run-time pipeline is compiled from QuartzCore's default.metallib function with its own
+  constants, both stages), `own` (always the function: H3 fix 1), `nearest` (upstream 3b9db78's label pick with
+  hm_ca_nearest; also `HAKIOS_METAL_CA_VARIANTS=1`, as before). exact/own need QuartzCore's default.metallib, else nearest.
+  A pipeline that does not link compiled whole is linked again with the label pick. One log line per pipeline:
+  `CA pipeline LABEL: vs NAME [pick] constants N (zero count; idx=value ...) | fs ... | ok|refused: why`; a refused draw
+  ends with `[pipeline LABEL: vs PICK, fs PICK]`. `HAKIOS_METAL_CA_LOG=0` silences the pipeline lines. Set them without a
+  rebuild in `/var/local/hmetal/ca/env` (KEY=VALUE, HAKIOS_METAL_* only; m2shim sets them in backboardd), then
+  `psx -k backboardd`.
+- The variant tables are not built or committed: the plug-in reads the phone's own QuartzCore files at run time.
+  `bench/ca-variants.py QC [--compare QC2] [--replay bbd-hm.log] [--table OUT]` reads the same files off the phone
+  (QC = apple-ref/16.7 or a QuartzCore.framework copy: default.metallib and default.pipelinelib/ are plain files in the
+  framework directory, not in the dyld shared cache), checks hm_ca_nearest's label form, and replays a log's draw labels
+  through the three picks. `--selftest` runs on a synthetic library; `--table` refuses a path inside the repository.
   The generic MIT plug-in (`HakiosMetal.m`) cannot render (stand-in pipeline states, no render encoder).
 - Pipelines on the hakios side need its compiler (`MESA=1`) or its compiled-stage cache (`HAKIOS_METAL_CACHE`,
   `/var/local/hmetal/cache`); without either, W3/W4 report "no pipeline" and W1/W2 still run.
