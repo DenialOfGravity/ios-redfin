@@ -11,6 +11,7 @@
  *   sensd --daemon               the boot job (launchd org.iosonpixel.sensd): waits for the DSP, streams what
  *                                iOS asks for (ReportInterval via MOTION_GET_WANT), recovers from DSP restarts;
  *                                off with /var/local/sensd.off
+ *                                proximity on demand (below): /var/local/sensd.conf "prox_ondemand 0|1", "prox_bks 0|1"
  * Options: --dump (every QMI message in hex), --secs N (stop after N s), --no-motion (print only),
  *          --no-orient (no type-10 orientation samples from accel), --no-follow (daemon: stream everything),
  *          --node N --port P (skip the service lookup), --qrtr-fd FD (an inherited fd instead of the device),
@@ -23,6 +24,18 @@
  * TYPE) locks backboardd's effective device orientation instead (BKSHIDServicesUnlockOrientation first: a second
  * lock is ignored while one is held). TYPE is the lock type (unknown enum, default 0); TYPE -1 uses
  * BKSHIDServicesSetDeviceInterfaceOrientation(orientation) instead. Needs sensd-ents.plist's entitlements.
+ *
+ * Proximity on demand (daemon, default on): the TCS3701 sits under the OLED and its IR emitter shows through the panel,
+ * so prox streams only while something asks for it, any of:
+ *   - backboardd: BKSHIDServicesProximityDetectionActive() true (UIDevice proximityMonitoringEnabled -> UIKit ->
+ *     BKSHIDServicesRequestProximityDetectionMode; SpringBoard/CoverSheet/calls use the same backboardd mode). Polled
+ *     once a second on its own thread (never blocks the sample loop);
+ *   - the kernel's SweetHIDProx service (only with sweetmotion bit 0x08): an open client and a non-zero ReportInterval;
+ *   - the file /var/local/sensd.prox-on (manual test).
+ * It stops 3 s after the last request goes away and then posts one "far" sample if the last one was "near", so iOS is
+ * never left thinking something covers the screen. ALS (same chip, separate SEE sensor and engine) is not affected.
+ * /var/local/sensd.conf (read every 2 s): "prox_ondemand 0" = old behaviour (prox streams unless iOS set its
+ * ReportInterval to 0), "prox_bks 0" = do not ask backboardd (service and file only).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -35,6 +48,7 @@
 #include <sys/stat.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <mach/mach_time.h>
 #include "rqrtr.h"
 #include "sensor.h"
 
@@ -126,6 +140,123 @@ static void *inject_thread(void *arg)
 		inject_done = want;
 		last = now;
 	}
+}
+
+/* Proximity on demand: config, backboardd poll thread, decision (see the header). */
+#define SENSD_CONF	"/var/local/sensd.conf"
+#define PROX_ON_FILE	"/var/local/sensd.prox-on"
+#define PROX_OFF_DELAY_MS 3000
+static struct { int ondemand, bks; time_t mtime; int loaded; } pcfg = { 1, 1, 0, 0 };
+static volatile int prox_bks_state = -1;	/* -1 unknown / not polled, 0 inactive, 1 active */
+static int prox_bks_started;
+static long prox_want_ms = -100000;		/* last time something asked for prox */
+
+static void read_conf(void)
+{
+	struct stat st;
+	if (stat(SENSD_CONF, &st) != 0) {
+		if (pcfg.loaded) {
+			pcfg.ondemand = pcfg.bks = 1;
+			pcfg.loaded = 0;
+			stamp();
+			printf("sensd: %s gone: prox_ondemand 1 prox_bks 1\n", SENSD_CONF);
+		}
+		return;
+	}
+	if (pcfg.loaded && st.st_mtime == pcfg.mtime)
+		return;
+	FILE *f = fopen(SENSD_CONF, "r");
+	if (!f)
+		return;
+	char line[128], key[64];
+	int v, od = 1, bks = 1;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "%63s %d", key, &v) != 2 || key[0] == '#')
+			continue;
+		if (!strcmp(key, "prox_ondemand"))
+			od = v != 0;
+		else if (!strcmp(key, "prox_bks"))
+			bks = v != 0;
+	}
+	fclose(f);
+	pcfg.ondemand = od;
+	pcfg.bks = bks;
+	pcfg.mtime = st.st_mtime;
+	pcfg.loaded = 1;
+	stamp();
+	printf("sensd: %s: prox_ondemand %d prox_bks %d\n", SENSD_CONF, od, bks);
+}
+
+static void *prox_bks_thread(void *arg)
+{
+	unsigned char (*active)(void) = (unsigned char (*)(void))arg;
+	for (;;) {
+		if (pcfg.ondemand && pcfg.bks) {
+			int a = active() & 1;
+			if (a != prox_bks_state) {
+				stamp();
+				printf("sensd: backboardd proximity detection %s\n", a ? "active" : "inactive");
+			}
+			prox_bks_state = a;
+		} else {
+			prox_bks_state = -1;
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
+static void prox_bks_start(void)
+{
+	if (prox_bks_started)
+		return;
+	prox_bks_started = 1;
+	void *h = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+	void *fn = h ? dlsym(h, "BKSHIDServicesProximityDetectionActive") : NULL;
+	pthread_t t;
+	if (!fn || pthread_create(&t, NULL, prox_bks_thread, fn) != 0) {
+		printf("sensd: BKSHIDServicesProximityDetectionActive unavailable (%s): prox follows the service/file only\n",
+		    h ? "no symbol" : dlerror());
+		return;
+	}
+	pthread_detach(t);
+	printf("sensd: polling backboardd's proximity detection (BKSHIDServicesProximityDetectionActive %p)\n", fn);
+}
+
+/* Prox on (1) or off (0) under on-demand; *why names the request. */
+static int prox_wanted(const struct motion_want *w, int have, const char **why)
+{
+	struct stat st;
+	long now = sensor_now_ms();
+	int svc = have && (w->present & (1u << MOTION_PROX)) && w->clients[MOTION_PROX] > 0 &&
+	    w->interval_set[MOTION_PROX] && w->interval_us[MOTION_PROX] != 0;
+	*why = NULL;
+	if (pcfg.bks && prox_bks_state == 1)
+		*why = "backboardd proximity detection active";
+	else if (svc)
+		*why = "SweetHIDProx client with a ReportInterval";
+	else if (stat(PROX_ON_FILE, &st) == 0)
+		*why = PROX_ON_FILE;
+	if (*why) {
+		prox_want_ms = now;
+		return 1;
+	}
+	return now - prox_want_ms < PROX_OFF_DELAY_MS;
+}
+
+/* Prox stopped while the last sample said "near": tell iOS "far". */
+static void prox_post_far(struct sensor *s)
+{
+	if (s->count == 0 || s->v[0] < 0.5f)
+		return;
+	struct motion_sample m = { .type = MOTION_TYPE_PROX, .ts_mach = mach_absolute_time() };
+	m.v[0] = 0;
+	m.v[1] = 0;
+	s->v[0] = 0;
+	if (opt.motion_fd >= 0 && write(opt.motion_fd, &m, sizeof(m)) == (ssize_t)sizeof(m))
+		opt.written++;
+	stamp();
+	printf("sensd: prox: last sample was near: posted far\n");
 }
 
 static void out(void *ctx, struct sensor *s, const struct motion_sample *m)
@@ -333,6 +464,9 @@ static int run(struct sensor *ss, int n, int daemon)
 				printf("sensd: orientation has no clients: orientation off\n");
 			}
 			orient_clients_seen = orient_want;
+			read_conf();
+			if (opt.follow && pcfg.ondemand && pcfg.bks)
+				prox_bks_start();
 			for (int i = 0; i < n; i++) {
 				struct sensor *s = &ss[i];
 				if (s->fd < 0)
@@ -347,6 +481,9 @@ static int run(struct sensor *ss, int n, int daemon)
 						hz = hz < 1 ? 1 : (hz > 200 ? 200 : hz);
 					}
 				}
+				const char *prox_why = NULL;
+				if (idx == MOTION_PROX && opt.follow && pcfg.ondemand)
+					on = prox_wanted(&w, have, &prox_why);
 				/*
 				 * The orientation service has a client (backboardd): keep accel running at a low rate to feed
 				 * the orientation filter even when iOS set accel's ReportInterval to 0; its samples are then
@@ -364,15 +501,21 @@ static int run(struct sensor *ss, int n, int daemon)
 				}
 				if (on && (!s->active || (!s->k->on_change && (s->hz < hz * 0.9f || s->hz > hz * 1.1f)))) {
 					stamp();
-					printf("sensd: %s: start%s %.1f Hz\n", s->k->alias, s->active ? " (new rate)" : "",
-					    s->k->on_change ? 0.0 : hz);
+					printf("sensd: %s: start%s %.1f Hz%s%s%s\n", s->k->alias, s->active ? " (new rate)" : "",
+					    s->k->on_change ? 0.0 : hz, prox_why ? " (on demand: " : "", prox_why ? prox_why : "",
+					    prox_why ? ")" : "");
 					if (sensor_start(&env, s, hz))
 						return -1;
 				} else if (!on && s->active) {
 					stamp();
-					printf("sensd: %s: stop (iOS set ReportInterval 0)\n", s->k->alias);
+					if (idx == MOTION_PROX && opt.follow && pcfg.ondemand)
+						printf("sensd: prox: stop (on demand: nothing asks for proximity)\n");
+					else
+						printf("sensd: %s: stop (iOS set ReportInterval 0)\n", s->k->alias);
 					if (sensor_stop(&env, s))
 						return -1;
+					if (idx == MOTION_PROX)
+						prox_post_far(s);
 				}
 			}
 		}
