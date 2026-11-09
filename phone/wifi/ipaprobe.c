@@ -75,6 +75,8 @@ static const char *probe_match(const uint8_t *ip, size_t n, unsigned proto, unsi
 	const uint8_t *l4 = ip + ihl;
 
 	if (proto == 1 && n >= ihl + 8) {
+		if (l4[0] == 0 && (l4[4] << 8 | l4[5]) == PROBE_ICMP_ID && (l4[6] & 0x40))
+			return NULL;	/* p2keep reply */
 		if (l4[0] == 0 && (l4[4] << 8 | l4[5]) == PROBE_ICMP_ID) {
 			snprintf(d, sizeof(d), "ICMP echo reply seq %u", l4[6] << 8 | l4[7]);
 			return d;
@@ -418,6 +420,25 @@ void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *, siz
 			LOG("p2probe=%d: %s rounds of 10 test packets, 20 s apart, from the call's address", probe_mode,
 			    probe_mode == 1 ? "6" : "endless");
 		probe_at = link_ms() + 5000;		/* first round 5 s after up */
+	}
+	{	/* p2keep=N (Claude 2026-11-09): one ICMP echo to the gateway every N s (1-30), to see whether steady light UL keeps
+		 * the modem's UL pipe from going to sleep. ~120 bytes per round trip. */
+		static int keep = -1;
+		static uint64_t keep_at;
+		static unsigned kseq;
+		if (keep < 0) {
+			keep = word_int("p2keep=", 0);
+			if (keep > 30)
+				keep = 30;
+			if (keep > 0)
+				LOG("p2keep=%d: gateway echo every %d s", keep, keep);
+		}
+		if (keep > 0 && c->ip && tx_free > 2 && link_ms() >= keep_at) {
+			uint8_t kb[96];
+			size_t kn = mk_icmp(kb, c->ip, c->gw, 0x4000 + (kseq++ & 0x3fff), ipid++);
+			keep_at = link_ms() + 1000ull * (unsigned) keep;
+			send(kb, kn);
+		}
 	}
 	if (!probe_mode || !c->ip)
 		return;
