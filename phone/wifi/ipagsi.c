@@ -1086,6 +1086,7 @@ static void rx_drain(void)
 
 static uint64_t tx_buf_pa[TX_BUFS];
 static uint32_t tx_wp, tx_done;
+static uint64_t last_tx_ms;
 
 static int tx_drain(void)
 {
@@ -1138,6 +1139,7 @@ static int tx_send(const uint8_t *ip, size_t len)
 	tx_wp++;
 	ch_doorbell(CH_MDM_TX);
 	ctx.tx_pkts++;
+	last_tx_ms = link_ms();
 	return 0;
 }
 
@@ -1707,7 +1709,7 @@ static void p2_wake(void)
 	}
 	if (!mode)
 		return;
-	if (tx_wp == tx_done) {
+	if (link_ms() - last_tx_ms > 3000) {	/* TX completions only mean the GSI took our TRE; stuck packets sit inside the IPA */
 		episode = 0;
 		return;
 	}
@@ -1717,8 +1719,8 @@ static void p2_wake(void)
 	n_seen++;
 	if (!episode) {
 		episode = 1;
-		LOG("p2wake: ep14 SUSPENDED with %u UL pending (seen %u): EE1 ch7 state %u | IRQ_STTS ee0 %08x ee1 %08x | IRQ_EN ee0 %08x ee1 %08x"
-		    " | SUSPEND_INFO ee0 %08x ee1 %08x | SUSPEND_EN ee0 %08x ee1 %08x%s", tx_wp - tx_done, n_seen,
+		LOG("p2wake: ep14 SUSPENDED %llu ms after a TX (seen %u): EE1 ch7 state %u | IRQ_STTS ee0 %08x ee1 %08x | IRQ_EN ee0 %08x ee1 %08x"
+		    " | SUSPEND_INFO ee0 %08x ee1 %08x | SUSPEND_EN ee0 %08x ee1 %08x%s", (unsigned long long) (link_ms() - last_tx_ms), n_seen,
 		    (unsigned) (rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf), rd32(IPA_IRQ_STTS_EE(0)), rd32(IPA_IRQ_STTS_EE(1)),
 		    rd32(IPA_IRQ_EN_EE(0)), rd32(IPA_IRQ_EN_EE(1)), rd32(IPA_SUSPEND_IRQ_INFO_EE(0)), rd32(IPA_SUSPEND_IRQ_INFO_EE(1)),
 		    rd32(IPA_SUSPEND_IRQ_EN_EE(0)), rd32(IPA_SUSPEND_IRQ_EN_EE(1)), mode == 1 ? " -> clearing suspend" : "");
