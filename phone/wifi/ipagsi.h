@@ -67,6 +67,9 @@ static inline size_t qmap5_frame(uint8_t *out, size_t cap, const uint8_t *ip, si
 	return len + QMAP_HDR + QMAP5_CSUM_HDR;
 }
 
+/* optional: every QMAP command frame (header included) as received; set by ipagsi.c */
+static void (*qmap_cmd_cb)(const uint8_t *frame, size_t n);
+
 struct qmap_stats {
 	unsigned pkts, cmds, bad;	/* data frames handed on, command frames skipped, buffers cut short */
 };
@@ -88,9 +91,11 @@ static inline void qmap_deagg(const uint8_t *b, size_t len, void (*cb)(void *ctx
 			st->bad++;
 			break;
 		}
-		if (cmd)
+		if (cmd) {
 			st->cmds++;
-		else {
+			if (qmap_cmd_cb)
+				qmap_cmd_cb(b + at, QMAP_HDR + plen);
+		} else {
 			st->pkts++;
 			cb(ctx, (uint8_t)mux, b + at + QMAP_HDR + xh, plen - pad);
 		}

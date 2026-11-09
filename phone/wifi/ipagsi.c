@@ -1691,6 +1691,75 @@ static void cellroute(int up)
 	}
 }
 
+/* QMAP command frames from the modem (Claude 2026-11-09).  Linux rmnet_map_control_command: after the 4-byte QMAP header,
+ * u8 command_name, u8 cmd_type (bits 1:0: 0 request, 1 ack, 2 unsupported, 3 invalid), u16 reserved, u32 transaction id, data.
+ * Names: 1 FLOW_DISABLE, 2 FLOW_ENABLE (rmnet), 10 DFC_CONFIG, 11 DFC_IND, 12 DFC_QUERY, 13 DFC_END_MARKER, 14 DFC_POWERSAVE
+ * (Android dfc_qmap.c).  Always logged (first 40, then every 50th).  p2qmapack=1: requests are answered as rmnet does
+ * (rmnet_map_send_ack: the same frame with cmd_type ACK) and sent the way Android's ipa3_wwan_xmit sends command frames:
+ * IP_PACKET_INIT to the modem's Q6_LAN_CONS (ep10), then the frame, both on ch2. */
+#define EP_Q6_LAN_CONS	10
+static unsigned qcmd_n, qcmd_acked;
+static uint64_t qcmd_pl, qcmd_buf;
+static int qmap_cmd_tx(const uint8_t *frame, size_t n)
+{
+	struct gsi_ring *r = &ctx.ch[CH_MDM_TX];
+	struct gsi_tre tre;
+	uint8_t pl[8] = { EP_Q6_LAN_CONS, 0, 0, 0, 0, 0, 0, 0 };
+
+	if (n > 256 || tx_wp - tx_done > TX_BUFS - 2)
+		return -1;
+	if (!qcmd_pl) {
+		qcmd_pl = ring_mem(64, 64);
+		qcmd_buf = ring_mem(256, 64);
+		if (!qcmd_pl || !qcmd_buf)
+			return -1;
+	}
+	if (pm_wr(qcmd_pl, pl, sizeof(pl)) || pm_wr(qcmd_buf, frame, (n + 3) & ~(size_t) 3))
+		return -1;
+	tre.addr = qcmd_pl;
+	tre.len = 0x10;			/* IPA_CMD_IP_PACKET_INIT */
+	tre.resv = 0;
+	tre.flags = TRE_IMMD_CMD | TRE_IEOT;
+	if (pm_wr(r->pa + (uint64_t) (r->wp % r->cnt) * RING_ELEM, &tre, sizeof(tre)))
+		return -1;
+	r->wp++;
+	tx_wp++;
+	if (ch_post_tre(CH_MDM_TX, qcmd_buf, (uint32_t) n, 1))
+		return -1;
+	tx_wp++;
+	ch_doorbell(CH_MDM_TX);
+	return 0;
+}
+
+static void qmap_cmd_rx(const uint8_t *f, size_t n)
+{
+	static const char *nm[16] = { "?0", "FLOW_DISABLE", "FLOW_ENABLE", "?3", "?4", "?5", "?6", "?7", "?8", "?9",
+				      "DFC_CONFIG", "DFC_IND", "DFC_QUERY", "DFC_END_MARKER", "DFC_POWERSAVE", "?15" };
+	static int ack = -1;
+	char hx[3 * 32 + 1] = "";
+	if (n < 12)
+		return;
+	if (ack < 0)
+		ack = cell_word_int("p2qmapack=", 0) == 1;
+	unsigned name = f[4], type = f[5] & 3;
+	uint32_t txn = (uint32_t) f[8] << 24 | (uint32_t) f[9] << 16 | (uint32_t) f[10] << 8 | f[11];
+	qcmd_n++;
+	if (qcmd_n <= 40 || qcmd_n % 50 == 0) {
+		for (unsigned i = 0; i < n && i < 32; i++)
+			snprintf(hx + 3 * i, 4, " %02x", f[i]);
+		LOG("qmap cmd #%u: %s (%u) type %u txn %08x len %zu:%s", qcmd_n, name < 16 ? nm[name] : "?", name, type, txn, n, hx);
+	}
+	if (ack && type == 0) {
+		uint8_t a[256];
+		memcpy(a, f, n);
+		a[5] = (uint8_t) ((a[5] & ~3u) | 1);	/* ACK */
+		if (qmap_cmd_tx(a, n) == 0)
+			qcmd_acked++;
+		if (qcmd_acked <= 10 || qcmd_acked % 50 == 0)
+			LOG("qmap cmd: acked %s txn %08x (%u acks)", name < 16 ? nm[name] : "?", txn, qcmd_acked);
+	}
+}
+
 /* p2wake=1 (Claude 2026-11-09, runtime toggle, re-read every 10 s): when UL is pending and the modem's consumer pipe ep14 has
  * its SUSPEND bit set (the first packet after idle gets status opcode 0x08 SUSPENDED and waits 10-18 s for the modem's own
  * wake-up), clear the bit, as Android's suspend handler does for suspended consumer pipes.  p2wake=2 only logs.  Also logs the
@@ -1846,6 +1915,7 @@ static int p2_setup(void)
 	if (p2_tx_only) {
 		if (utun_up())
 			return -1;
+		qmap_cmd_cb = qmap_cmd_rx;
 		p2_stage = 2;
 		set_state("up");
 		LOG("p2: tx-only running, utun %s", ctx.utun_name);
@@ -2554,9 +2624,9 @@ static void p2_poll(void)
 		    cmd5_ev, rd32(GSI_CH_C_CNTXT_0(CH_CMDTX) + 0x10), rd32(GSI_CH_C_CNTXT_0(CH_CMDTX) + 0x18), ch_state(CH_CMDTX));
 	if (link_ms() - p2_stat >= 10000) {
 		p2_stat = link_ms();
-		LOG("p2: tx posted %u completed %u (ev %u) | rx events %u bytes %llu pkts %u frames %u | unknown %u"
+		LOG("p2: tx posted %u completed %u (ev %u) | rx events %u bytes %llu pkts %u frames %u | qmap cmds %u acked %u | unknown %u"
 		    " | errors rx %u tx %u bad %u other-af %u", tx_wp, tx_done, p2_txev, p2_rxev, rx_bytes, ctx.rx_pkts,
-		    ctx.rx_st.pkts, p2_unk, ctx.rx_err, ctx.tx_err, ctx.tx_st.bad, ctx.tx_other);
+		    ctx.rx_st.pkts, ctx.rx_st.cmds, qcmd_acked, p2_unk, ctx.rx_err, ctx.tx_err, ctx.tx_st.bad, ctx.tx_other);
 	}
 }
 
