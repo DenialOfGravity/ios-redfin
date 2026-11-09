@@ -10,7 +10,7 @@
 // The libraries are read where they lie (a phone's or an image's /System/Library/...): nothing of them is copied,
 // kept or printed but function names, counts and the compiler's own sentences.
 //
-//   sweep [-v] [-f FUNCTION] [-c INDEX=VALUE]... LIBRARY.metallib...
+//   sweep [-v] [--chip ID] [-f FUNCTION] [-c INDEX=VALUE]... LIBRARY.metallib...
 //     -v: a line per function; -f: that function alone; -c: a function constant's value, as a pipeline supplies
 //     it (with IR3_SHADER_DEBUG=disasm the listing of one specialisation is what comes out)
 //
@@ -21,12 +21,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/compiler.hpp"
 #include "hakios-metal/metallib.hpp"
 
@@ -113,6 +115,14 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             only = argv[++i];
+        } else if (std::strcmp(argv[i], "--chip") == 0 && i + 1 < argc) {
+            // (redfin) the chip the compiler is made for: 0x06020000 = the A620 (default: the A635, as before)
+            const a6xx::ChipInfo* c = a6xx::chipFor(uint32_t(std::strtoul(argv[++i], nullptr, 0)));
+            if (c == nullptr) {
+                std::fprintf(stderr, "sweep: no chip %s\n", argv[i]);
+                return 2;
+            }
+            a6xx::selectChip(*c);
         } else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             unsigned index = 0;
             unsigned long long value = 0;
