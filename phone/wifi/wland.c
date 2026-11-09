@@ -46,6 +46,7 @@
 #include "radio.h"
 #include "ipnet.h"
 #include "bridge.h"
+#include "abpbridge.h"
 #include "cell.h"
 #include "ipa.h"
 #include "ipaqmi.h"
@@ -966,6 +967,7 @@ static void net_idle(void)
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
 	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 	ipagsi_poll();	/* the IPA/GSI data path and its utun, only after cell.c started it (ipagsi.c) */
+	abpbridge_poll();	/* kernel 1061 /dev/abpbridge <-> Apple CommCenter, only with abpbridge=1 in cell.on (abpbridge.c) */
 }
 
 static int net(unsigned secs)
