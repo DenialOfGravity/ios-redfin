@@ -256,7 +256,31 @@ static bool listed(void)
 		 * Extended-range (XR10) formats: the frontend withholds them so backboardd keeps an 8-bit framebuffer; other
 		 * processes may render into them (AegirPoster's CAMetalLayer throws "unsupported extended range format" without).
 		 */
-		if (device && strcmp(getprogname(), "backboardd") != 0)
+		/*
+		 * (redfin hmv11) /var/local/mtl2-env SWEET_XR10_NO=name,name,...: those processes (getprogname(), e.g.
+		 * com.apple.WebKit.GPU) answer NO as backboardd does, so Core Animation in them allocates 8-bit BGRA layers
+		 * instead of 'w30r' BGR10_XR ones. Unset (default): YES everywhere but backboardd, as before. Why: WebKit's GPU
+		 * process aborted at 19:42:23 (var10 run) on "render pipeline: Compile(InvalidDescriptor(ColorAttachment
+		 * { index: 2 }))" for CA spec Pw30rBsovXw_TpblA2Xhf (a pipeline drawing INTO a w30r tile), after which Safari's
+		 * tiles stopped; and hakios-metal's backboardd has to convert every w30r tile it composites.
+		 */
+		bool xr10No = false;
+		if (const char *no = getenv("SWEET_XR10_NO")) {
+			const char *me = getprogname();
+			const size_t n = strlen(me);
+			for (const char *p = no; *p; ) {
+				const char *e = strchr(p, ',');
+				const size_t len = e ? (size_t)(e - p) : strlen(p);
+				if ((len == n && strncmp(p, me, n) == 0) || (len == 1 && *p == '*'))
+					xr10No = true;
+				p += len + (e ? 1 : 0);
+			}
+		}
+		if (device && xr10No) {
+			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
+					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return NO; }), "B16@0:8");
+			sm2_log("extended-range XR10 formats: answered NO (SWEET_XR10_NO)");
+		} else if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return YES; }), "B16@0:8");
 		/*
