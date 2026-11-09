@@ -1087,6 +1087,7 @@ static void rx_drain(void)
 static uint64_t tx_buf_pa[TX_BUFS];
 static uint32_t tx_wp, tx_done;
 static int celldata_off;		/* iOS Cellular Data switch off (celldata_poll) */
+static uint64_t last_utun_ms;		/* last UL packet read from the utun (iOS), for ipaprobe p2keepidle */
 static uint64_t last_tx_ms;
 static uint32_t ch7_wp_at_tx;	/* EE1 ch7 (the modem's UL consumer, ep14) write pointer at the first UL packet of a burst */
 
@@ -1169,6 +1170,7 @@ static void tx_pump(void)
 			ctx.tx_st.bad++;
 			continue;
 		}
+		last_utun_ms = link_ms();	/* real (iOS) traffic: p2keepidle window */
 		if (celldata_off) {	/* iOS switched cellular data off: nothing goes out */
 			ctx.tx_other++;
 			continue;
@@ -2985,6 +2987,11 @@ int ipagsi_ul_stuck(void)
 	if (!ctx.active || !last_tx_ms || now - last_tx_ms < 300 || now - last_tx_ms > 5000)
 		return 0;
 	return rd32(GSI_CH_C_CNTXT_0(7) + 0x4000 + 0x18) == ch7_wp_at_tx;
+}
+
+uint64_t ipagsi_last_utun_ms(void)
+{
+	return last_utun_ms;
 }
 
 uint64_t ipagsi_last_tx_ms(void)

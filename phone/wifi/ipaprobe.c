@@ -423,17 +423,21 @@ void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *, siz
 	}
 	{	/* p2keep=N (Claude 2026-11-09): one ICMP echo to the gateway every N s (1-30), to see whether steady light UL keeps
 		 * the modem's UL pipe from going to sleep. ~120 bytes per round trip. */
-		static int keep = -1;
+		static int keep = -1, keepidle;
 		static uint64_t keep_at;
 		static unsigned kseq;
 		if (keep < 0) {
 			keep = word_int("p2keep=", 0);
 			if (keep > 30)
 				keep = 30;
+			keepidle = word_int("p2keepidle=", 0);
 			if (keep > 0)
-				LOG("p2keep=%d: gateway echo every %d s", keep, keep);
+				LOG("p2keep=%d: gateway echo every %d s%s%d%s", keep, keep, keepidle ? ", only within " : "", keepidle,
+				    keepidle ? " s of iOS traffic" : "");
 		}
-		if (keep > 0 && c->ip && tx_free > 2 && link_ms() >= keep_at) {
+		uint64_t lu = ipagsi_last_utun_ms();
+		int in_window = !keepidle || (lu && link_ms() - lu < 1000ull * (unsigned) keepidle);
+		if (keep > 0 && in_window && c->ip && tx_free > 2 && link_ms() >= keep_at) {
 			uint8_t kb[96];
 			size_t kn = mk_icmp(kb, c->ip, c->gw, 0x4000 + (kseq++ & 0x3fff), ipid++);
 			keep_at = link_ms() + 1000ull * (unsigned) keep;
