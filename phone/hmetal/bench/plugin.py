@@ -37,6 +37,8 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
     default 30) QuartzCore's library's pipelines made once in the background into the disk cache; the specialiser's
     compiles background ones (core: HM_COMPILE_PRIO); HM_XR10=0 (default) no XR10 formats offered and 550/551 as BGRA8,
     as SweetMetal2 does
+  - (hmv5) HM_SPEC=0 (default): no uber-shader specialisation (1 = hakios' background specialiser, which preceded every
+    GPU hang in hmt6); HM_FAILLOG=1 (default): command buffers that end in error or leave work out are said
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -896,6 +898,47 @@ hm_surface_gen(uint32_t id, uint32_t bump)
 }
 '''
 
+HMV5_HELPERS = r'''/* (redfin hmv5) HM_FAILLOG=1 (default): failed buffers and left-out work said (bench/plugin.py) */
+static int
+hm_faillog_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_FAILLOG");
+		on = e == NULL || e[0] == 0 || atoi(e) != 0;
+	}
+	return on;
+}
+
+static unsigned hm_failed_total, hm_skipped_total;
+
+static void
+hm_fail_note(hakios_metal_cb *cb)
+{
+	const char *last = NULL;
+	unsigned skipped;
+
+	if (!hm_faillog_on() || cb == NULL) return;
+	if (hakios_metal_cb_status(cb) == HAKIOS_METAL_ERROR) {
+		const unsigned n = __atomic_add_fetch(&hm_failed_total, 1, __ATOMIC_RELAXED);
+
+		if (n <= 20 || n % 100 == 0) {
+			hm_print("trace: buffer failed (#%u, frame %llu): %s\n", n, hm_tr_frame(), hakios_metal_cb_error(cb));
+		}
+	}
+	skipped = hakios_metal_cb_skipped(cb, &last);
+	if (skipped != 0) {
+		const unsigned n = __atomic_add_fetch(&hm_skipped_total, 1, __ATOMIC_RELAXED);
+
+		if (n <= 20 || n % 100 == 0) {
+			hm_print("trace: buffer left %u things out (#%u, frame %llu); the last: %s\n", skipped, n, hm_tr_frame(),
+				 last != NULL ? last : "?");
+		}
+	}
+}
+'''
+
 EDITS = [
     ('#define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"',
      '#define HM_CACHE_DIR  "/var/local/hmetal/cache"     /* (redfin hmbench) */'),
@@ -1102,6 +1145,28 @@ EDITS = [
      '\t\t\t\t      _ycbcr ? "YCbCr converted" : "rows", IOSurfaceGetWidth(_iosurface), IOSurfaceGetHeight(_iosurface),\n'
      '\t\t\t\t      IOSurfaceGetBytesPerRow(_iosurface), seed, ms);\n'
      '\t}\n'),
+    # (hmv5) HM_SPEC=0 (default): no uber-shader specialisation (hakios' background recompile of fixed_frag_lph_cpf for
+    # its constant buffer's bytes). hmt6: all 19 GPU hangs (kernel "v2 fence wait: GPU hang or fault ... the job of
+    # pid <backboardd> hung", 2 s each, reset) came 0.2-2.9 s after a "specialise: fixed_vert_lph_gen+fixed_frag_lph_cpf"
+    # line; the one at 13850 took MobileSafari's and WebKit.GPU's SweetMetal2 devices down (WaitFence timeouts,
+    # "device refused: DeviceLost"): the black web view. HM_SPEC=1 = upstream's specialiser again.
+    ('\t\toff = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_nospec") != NULL;\n\t}\n\treturn off != 0;\n',
+     '\t\toff = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_nospec") != NULL;\n'
+     '\t\t{   /* (redfin hmv5) HM_SPEC: 0 (default) off, 1 on */\n'
+     '\t\t\tconst char *e = getenv("HM_SPEC");\n\n'
+     '\t\t\tif (e == NULL || e[0] == 0 || atoi(e) == 0) off = 1;\n'
+     '\t\t\thm_print("uber-shader specialisation %s (HM_SPEC=%s)\\n", off ? "off" : "on", e != NULL ? e : "unset");\n'
+     '\t\t}\n\t}\n\treturn off != 0;\n'),
+    # (hmv5) HM_FAILLOG=1 (default): a command buffer that ends in error, or that left work out (refused draws, copies,
+    # passes skipped), is said: first 20 of each, then every 100th. Such a buffer reaches the GPU with nothing (error)
+    # or less than asked, and nothing said it before (the error was only built if CoreAnimation asked). hmt6: after the
+    # turn back to portrait CA swapped 93-255 frames per 5 s while backboardd's GPU submits fell to 9 and 0 (kernel
+    # SWEET GPU / SCANOUT gate lines): frames without their GPU work, the frozen screen.
+    ('\thm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);\n\t/* hakios-metal\'s queue thread',
+     '\thm_fail_note(cb);   /* (redfin hmv5) HM_FAILLOG */\n'
+     '\thm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);\n\t/* hakios-metal\'s queue thread'),
+    ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
+     HMV5_HELPERS + '/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE'),
     # (hmv4) HM_PREWARM: QuartzCore's library's pipelines made once in the background, into the disk cache
     ('\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n\treturn library;\n',
      '\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n'
