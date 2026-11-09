@@ -799,6 +799,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			ipaqmi_handle(h, d, n);	/* only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 			return;
 		}
+		if (h->dst_port >= ABP_PORT0 && h->dst_port < ABP_PORT0 + ABP_NPORTS) {
+			abpbridge_qrtr(h, d, n);	/* abpbridge=2: the modem's answers to Apple CommCenter (abpbridge.c) */
+			return;
+		}
 		if (h->dst_port == TFTP_PORT || (h->dst_port >= TFTP_XFER_PORT0 && h->dst_port < TFTP_XFER_PORT0 + TFTP_XFERS)) {
 			tftp_handle(h, d, n);
 			return;
@@ -817,12 +821,15 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			wlfw_new_server(w[3], w[4]);
 		cell_server(w[1], w[2], w[3], w[4]);
 		ipaqmi_server(w[1], w[2], w[3], w[4]);
+		abpbridge_server(w[1], w[2], w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
 		cell_server_gone(w[3], w[4]);
 		ipaqmi_server_gone(w[3], w[4]);
+		abpbridge_server_gone(w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_BYE) {
 		cell_server_gone(h->src_node, 0xffffffffu);
 		ipaqmi_server_gone(h->src_node, 0xffffffffu);
+		abpbridge_server_gone(h->src_node, 0xffffffffu);
 	}
 }
 
@@ -967,7 +974,7 @@ static void net_idle(void)
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
 	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 	ipagsi_poll();	/* the IPA/GSI data path and its utun, only after cell.c started it (ipagsi.c) */
-	abpbridge_poll();	/* kernel 1061 /dev/abpbridge <-> Apple CommCenter, only with abpbridge=1 in cell.on (abpbridge.c) */
+	abpbridge_poll();	/* kernel 1061/1063 /dev/abpbridge <-> Apple CommCenter, only with abpbridge=1|2 in cell.on (abpbridge.c) */
 }
 
 static int net(unsigned secs)
@@ -975,6 +982,7 @@ static int net(unsigned secs)
 	if (getenv("WLAND_VERBOSE"))
 		verbose_link = atoi(getenv("WLAND_VERBOSE"));
 	link_idle = net_idle;
+	abpbridge_early();	/* abpbridge=N: open /dev/abpbridge before the modem link (the kernel queues CommCenter's frames) */
 	signal(SIGUSR1, on_usr1);
 	signal(SIGCHLD, SIG_IGN);	/* netsvc children (ipnet.c) reap themselves */
 	if (link_up(net_cb, 5000))
