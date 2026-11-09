@@ -333,6 +333,8 @@ static int wait_state(uint64_t reg, unsigned shift, unsigned from, unsigned ms, 
  * One block is taken and bump-allocated; ring/TX buffer allocations use it while lo_on is set. */
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <spawn.h>
+#include <sys/wait.h>
 struct lo_alloc { uint64_t size, pa; };
 #ifndef FASTRPC_ALLOC
 #define FASTRPC_ALLOC _IOWR('f', 2, struct lo_alloc)
@@ -1650,9 +1652,21 @@ static void ipstr4(uint32_t a, char *b, size_t n)
 	const uint8_t *p = (const uint8_t *) &a;
 	snprintf(b, n, "%u.%u.%u.%u", p[0], p[1], p[2], p[3]);
 }
+static int run_argv(char *const argv[])
+{
+	pid_t pid;
+	int st = -1;
+	extern char **environ;
+	if (posix_spawn(&pid, argv[0], NULL, NULL, argv, environ))
+		return -1;
+	if (waitpid(pid, &st, 0) < 0)
+		return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -2;
+}
 static void cellroute(int up)
 {
-	char cmd[256], ip[16], mask[16], gw[16], d1[16], d2[16];
+	char ip[16], mask[16], gw[16], d1[16], d2[16];
+	int r;
 	if (up) {
 		if (route_pub || cell_word_int("cellroute=", 0) != 1 || ctx.utun_fd < 0)
 			return;
@@ -1661,16 +1675,18 @@ static void cellroute(int up)
 		ipstr4(ctx.call.gw, gw, sizeof(gw));
 		ipstr4(ctx.call.dns1 ? ctx.call.dns1 : ctx.call.gw, d1, sizeof(d1));
 		ipstr4(ctx.call.dns2 ? ctx.call.dns2 : ctx.call.dns1 ? ctx.call.dns1 : ctx.call.gw, d2, sizeof(d2));
-		snprintf(cmd, sizeof(cmd), "/var/local/bin/netsvc up %s %s %s %s %s %s >/dev/null 2>&1", ctx.utun_name, ip, mask, gw, d1, d2);
+		char *argv[] = { "/var/local/bin/netsvc", "up", ctx.utun_name, ip, mask, gw, d1, d2, NULL };
 		route_pub = 1;
+		r = run_argv(argv);
+		LOG("cellroute: netsvc up %s %s %s %s %s %s -> %d", ctx.utun_name, ip, mask, gw, d1, d2, r);
 	} else {
 		if (!route_pub)
 			return;
-		snprintf(cmd, sizeof(cmd), "/var/local/bin/netsvc down %s >/dev/null 2>&1", ctx.utun_name);
+		char *argv[] = { "/var/local/bin/netsvc", "down", ctx.utun_name, NULL };
 		route_pub = 0;
+		r = run_argv(argv);
+		LOG("cellroute: netsvc down %s -> %d", ctx.utun_name, r);
 	}
-	int r = system(cmd);
-	LOG("cellroute: %s -> %d", cmd, r);
 }
 
 /* p2wake=1 (Claude 2026-11-09, runtime toggle, re-read every 10 s): when UL is pending and the modem's consumer pipe ep14 has
