@@ -34,10 +34,10 @@ index 685ae15..69c7176 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_abp.c b/bsd/dev/sweet_abp.c
 new file mode 100644
-index 0000000..6f8a7c1
+index 0000000..0dc3574
 --- /dev/null
 +++ b/bsd/dev/sweet_abp.c
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,550 @@
 +/*
 + * redfin 1061: AppleBasebandPCI stand-in, BSD half (the IOKit half is iokit/Kernel/arm/SweetABP.cpp).
 + *
@@ -51,8 +51,10 @@ index 0000000..6f8a7c1
 + *
 + * /dev/abpbridge (root, 0600, one opener): wland reads every frame CommCenter writes to a pipe and writes
 + * frames that complete CommCenter's reads on that pipe. Records, little-endian:
-+ *     u16 magic 0xAB50 | u8 pipe (0 qmux1, 1 qmux2) | u8 type | u32 len | len bytes
++ *     u16 magic 0xAB51 | u8 pipe (0 qmux1, 1 qmux2) | u8 type | u32 session | u32 len | len bytes
 + *     type 0 DATA, 1 OPEN, 2 CLOSE, 3 START, 4 ABORT (1-4 only kernel -> wland; data = the selector's scalar)
++ *     session: one per user client that opened the pipe (ABM opens qmux2 from several QMux instances at
++ *     once, each its own QMUX stream); wland answers a frame with the same pipe + session.
 + * read() returns whole records only (as many as fit; EMSGSIZE if the first does not), blocks unless
 + * O_NONBLOCK; select() works. write() takes one or more whole DATA records. The kernel -> wland queue is a
 + * 256 KiB ring that also fills while nobody has the device open; when it is full, frames are dropped and
@@ -91,12 +93,12 @@ index 0000000..6f8a7c1
 +#include <libkern/libkern.h>
 +
 +void sweet_abp_init(void);
-+void sweet_abp_c2w(unsigned pipe, unsigned type, const void *data, uint32_t len);
++void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
 +void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
 +
 +/* SweetABP.cpp */
 +extern void SweetABPStart(void);
-+extern int SweetABPDeliver(unsigned pipe, const void *data, uint32_t len);
++extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
 +extern int SweetABPStats(char *buf, size_t len);
 +extern void SweetABPSetBootstage(uint32_t stage);
 +extern void SweetABPMessage(uint32_t code);
@@ -106,7 +108,7 @@ index 0000000..6f8a7c1
 +
 +#define ABP_BIT_SERVICES        1u
 +#define ABP_BIT_FAKEBOOT        2u
-+#define ABPB_MAGIC              0xAB50
++#define ABPB_MAGIC              0xAB51
 +#define ABPB_RING               (256u * 1024u)
 +#define ABPB_MAXFRAME           65536u
 +#define ABP_NPIPES              2u
@@ -118,6 +120,7 @@ index 0000000..6f8a7c1
 +	uint16_t magic;
 +	uint8_t pipe;
 +	uint8_t type;
++	uint32_t sess;
 +	uint32_t len;
 +};
 +
@@ -178,9 +181,9 @@ index 0000000..6f8a7c1
 +
 +/* CommCenter wrote a frame (or opened/closed/started/aborted a pipe): queue it for wland. Never blocks. */
 +void
-+sweet_abp_c2w(unsigned pipe, unsigned type, const void *data, uint32_t len)
++sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len)
 +{
-+	struct abpb_hdr h = { .magic = ABPB_MAGIC, .pipe = (uint8_t)pipe, .type = (uint8_t)type, .len = len };
++	struct abpb_hdr h = { .magic = ABPB_MAGIC, .pipe = (uint8_t)pipe, .type = (uint8_t)type, .sess = sess, .len = len };
 +	if (len > ABPB_MAXFRAME) {
 +		return;
 +	}
@@ -308,7 +311,7 @@ index 0000000..6f8a7c1
 +			break;
 +		}
 +		if (h.type == 0) {
-+			int d = SweetABPDeliver(h.pipe, buf + off + sizeof(h), h.len);
++			int d = SweetABPDeliver(h.pipe, h.sess, buf + off + sizeof(h), h.len);
 +			if (d) {
 +				e = d;
 +				break;
@@ -667,10 +670,10 @@ index 5911cb0..02337af 100644
  	}
 diff --git a/iokit/Kernel/arm/SweetABP.cpp b/iokit/Kernel/arm/SweetABP.cpp
 new file mode 100644
-index 0000000..697a2c8
+index 0000000..8377911
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetABP.cpp
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,1077 @@
 +/*
 + * redfin 1061: stand-ins for Apple's baseband IOKit drivers, so the real CommCenter (AppleBasebandManager runs
 + * inside it) finds a baseband. Published only with boot-arg sweetabp & 1 (bsd/dev/sweet_abp.c), under the
@@ -695,8 +698,9 @@ index 0000000..697a2c8
 + *   AppleIPAppender                       accept-all stub for ApplePDPHelper (it crashes on a NULL mutex in
 + *                                         callScalarMethod when the service is missing).
 + *
-+ * Frames CommCenter writes go to /dev/abpbridge (sweet_abp_c2w); frames wland writes there complete the
-+ * pipe's oldest pending read or wait in a 64-frame queue (SweetABPDeliver). Every selector is logged the
++ * Each user client that opens a pipe is a session (ABM opens qmux2 from several QMux instances at once).
++ * Frames CommCenter writes go to /dev/abpbridge tagged with pipe + session (sweet_abp_c2w); frames wland writes
++ * there for a session complete that session's oldest pending read or wait in a 128-frame queue (SweetABPDeliver). Every selector is logged the
 + * first times it is used, every property read from these services is logged (IOUserClient.cpp), and the
 + * first 64 frames per pipe and direction are logged with their first 24 bytes. "SWEET ABP:".
 + */
@@ -720,18 +724,18 @@ index 0000000..697a2c8
 +#include <sys/errno.h>
 +#include <kern/clock.h>
 +void SweetABPStart(void);
-+int SweetABPDeliver(unsigned pipe, const void *data, uint32_t len);
++int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
 +int SweetABPStats(char *buf, size_t len);
 +void SweetABPSetBootstage(uint32_t stage);
 +void SweetABPMessage(uint32_t code);
 +bool SweetABPIs(const void *entry);
-+void sweet_abp_c2w(unsigned pipe, unsigned type, const void *data, uint32_t len);
++void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
 +extern uint32_t sweet_abp_bootstage;
 +}
 +
 +#define ABP_NPIPES      2u
-+#define ABP_MAXREADS    8u
-+#define ABP_RXQ         64u
++#define ABP_MAXREADS    32u
++#define ABP_RXQ         128u
 +#define ABP_MAXFRAME    65536u
 +#define ABP_LOGFRAMES   64u
 +#define ABP_LOGLINES    600u
@@ -767,22 +771,30 @@ index 0000000..697a2c8
 +	OSAsyncReference64 ref;
 +	mach_vm_address_t addr;
 +	uint32_t size;
++	uint32_t sess;
 +	task_t task;
 +};
 +
++/*
++ * Several user clients can have the same pipe open at once (ABM opens qmux2 from more than one QMux instance,
++ * each its own QMUX stream with its own CTL transaction ids). Each open user client is a session: its writes
++ * go to wland tagged with the session id, and wland's frames for a session complete only that session's reads.
++ */
 +struct abp_pipe {
 +	IOLock *lock;
-+	AppleBasebandPCIUserClient *uc;         /* the latest opener */
 +	abp_read reads[ABP_MAXREADS];
 +	uint32_t nreads;
 +	struct {
 +		uint8_t *buf;
 +		uint32_t len;
++		uint32_t sess;
 +	} rxq[ABP_RXQ];
-+	uint32_t rxh, rxn;
++	uint32_t rxn;
 +	uint32_t sync_waiters;
++	uint32_t next_sess, live;
++	uint32_t live_ids[32];          /* open sessions (0 = free slot) */
 +	uint64_t wr_frames, wr_bytes, rd_frames, rd_bytes;
-+	uint32_t drops, truncs, opens;
++	uint32_t drops, truncs, opens, stale;
 +};
 +
 +static abp_pipe abp_pipes[ABP_NPIPES];
@@ -801,14 +813,14 @@ index 0000000..697a2c8
 +}
 +
 +static void
-+abp_log_frame(unsigned pipe, const char *dir, const uint8_t *p, uint32_t len, uint64_t nth)
++abp_log_frame(unsigned pipe, uint32_t sess, const char *dir, const uint8_t *p, uint32_t len, uint64_t nth)
 +{
 +	if (nth >= ABP_LOGFRAMES) {
 +		return;
 +	}
 +	char h[64];
 +	abp_hex(h, sizeof(h), p, len < 24 ? len : 24);
-+	ABPLOG("%s %s #%llu len %u: %s%s", abp_pipe_names[pipe], dir, nth, len, h, len > 24 ? "..." : "");
++	ABPLOG("%s/%u %s #%llu len %u: %s%s", abp_pipe_names[pipe], sess, dir, nth, len, h, len > 24 ? "..." : "");
 +}
 +
 +/* Copy a frame into a pending async read's user buffer and complete it (no locks held). */
@@ -840,16 +852,33 @@ index 0000000..697a2c8
 +	}
 +}
 +
-+/* Pending reads end without data (close, client died): aborted, or just released when the port is gone. */
++/* A session ends (close, client died): its pending reads are aborted (or just released when the port is gone)
++ * and frames queued for it are dropped. */
 +static void
-+abp_flush_reads(unsigned pipe, bool send)
++abp_end_session(unsigned pipe, uint32_t sess, bool send)
 +{
 +	abp_pipe *pp = &abp_pipes[pipe];
 +	abp_read rs[ABP_MAXREADS];
++	uint32_t n = 0, q = 0;
 +	IOLockLock(pp->lock);
-+	uint32_t n = pp->nreads;
-+	memcpy(rs, pp->reads, n * sizeof(rs[0]));
-+	pp->nreads = 0;
++	for (uint32_t i = 0; i < pp->nreads;) {
++		if (pp->reads[i].sess == sess) {
++			rs[n++] = pp->reads[i];
++			pp->reads[i] = pp->reads[--pp->nreads];
++		} else {
++			i++;
++		}
++	}
++	for (uint32_t i = 0; i < pp->rxn;) {
++		if (pp->rxq[i].sess == sess) {
++			IOFreeData(pp->rxq[i].buf, pp->rxq[i].len ? pp->rxq[i].len : 1);
++			memmove(&pp->rxq[i], &pp->rxq[i + 1], (pp->rxn - i - 1) * sizeof(pp->rxq[0]));
++			pp->rxn--;
++			q++;
++		} else {
++			i++;
++		}
++	}
 +	IOLockUnlock(pp->lock);
 +	for (uint32_t i = 0; i < n; i++) {
 +		if (send) {
@@ -859,27 +888,43 @@ index 0000000..697a2c8
 +			SweetABPAsync::drop(rs[i].ref);
 +		}
 +	}
-+	if (n) {
-+		ABPLOG("%s: %u pending read(s) %s", abp_pipe_names[pipe], n, send ? "aborted" : "dropped (client gone)");
++	if (n || q) {
++		ABPLOG("%s/%u: %u pending read(s) %s, %u queued frame(s) dropped", abp_pipe_names[pipe], sess, n,
++		    send ? "aborted" : "released (client gone)", q);
 +	}
 +}
 +
 +int
-+SweetABPDeliver(unsigned pipe, const void *data, uint32_t len)
++SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len)
 +{
 +	if (pipe >= ABP_NPIPES || !abp_started || len > ABP_MAXFRAME) {
 +		return EINVAL;
 +	}
 +	abp_pipe *pp = &abp_pipes[pipe];
 +	IOLockLock(pp->lock);
++	bool known = false;
++	for (unsigned i = 0; sess && i < 32; i++) {
++		known |= pp->live_ids[i] == sess;
++	}
++	if (!known) {           /* the session ended (CommCenter gave up or restarted): dropped */
++		uint32_t st = pp->stale++;
++		IOLockUnlock(pp->lock);
++		if (st < 20) {
++			ABPLOG("%s/%u: session not open: wland frame of %u bytes dropped", abp_pipe_names[pipe], sess, len);
++		}
++		return 0;
++	}
 +	uint64_t nth = pp->rd_frames++;
 +	pp->rd_bytes += len;
-+	if (pp->nreads) {
-+		abp_read rd = pp->reads[0];
++	for (uint32_t i = 0; i < pp->nreads; i++) {
++		if (pp->reads[i].sess != sess) {
++			continue;
++		}
++		abp_read rd = pp->reads[i];
++		memmove(&pp->reads[i], &pp->reads[i + 1], (pp->nreads - i - 1) * sizeof(pp->reads[0]));
 +		pp->nreads--;
-+		memmove(&pp->reads[0], &pp->reads[1], pp->nreads * sizeof(pp->reads[0]));
 +		IOLockUnlock(pp->lock);
-+		abp_log_frame(pipe, "<- wland (to a pending read)", (const uint8_t *)data, len, nth);
++		abp_log_frame(pipe, sess, "<- wland (to a pending read)", (const uint8_t *)data, len, nth);
 +		abp_complete_read(pipe, &rd, (const uint8_t *)data, len);
 +		return 0;
 +	}
@@ -888,7 +933,7 @@ index 0000000..697a2c8
 +		pp->rd_frames--;
 +		pp->rd_bytes -= len;
 +		IOLockUnlock(pp->lock);
-+		ABPLOG("%s: no read pending and %u frames queued: wland frame of %u bytes refused", abp_pipe_names[pipe], ABP_RXQ, len);
++		ABPLOG("%s/%u: no read pending and %u frames queued: wland frame of %u bytes refused", abp_pipe_names[pipe], sess, ABP_RXQ, len);
 +		return ENOSPC;
 +	}
 +	uint8_t *copy = (uint8_t *)IOMallocData(len ? len : 1);
@@ -897,31 +942,33 @@ index 0000000..697a2c8
 +		return ENOMEM;
 +	}
 +	memcpy(copy, data, len);
-+	uint32_t slot = (pp->rxh + pp->rxn) % ABP_RXQ;
-+	pp->rxq[slot].buf = copy;
-+	pp->rxq[slot].len = len;
++	pp->rxq[pp->rxn].buf = copy;
++	pp->rxq[pp->rxn].len = len;
++	pp->rxq[pp->rxn].sess = sess;
 +	pp->rxn++;
 +	if (pp->sync_waiters) {
 +		IOLockWakeup(pp->lock, &pp->rxn, false);
 +	}
 +	IOLockUnlock(pp->lock);
-+	abp_log_frame(pipe, "<- wland (queued)", (const uint8_t *)data, len, nth);
++	abp_log_frame(pipe, sess, "<- wland (queued)", (const uint8_t *)data, len, nth);
 +	return 0;
 +}
 +
-+/* Lock held. Takes the oldest queued frame; the caller frees it with IOFreeData(buf, len ? len : 1). */
++/* Lock held. Takes the oldest frame queued for sess; the caller frees it with IOFreeData(buf, len ? len : 1). */
 +static bool
-+abp_rx_pop(abp_pipe *pp, uint8_t **buf, uint32_t *len)
++abp_rx_pop(abp_pipe *pp, uint32_t sess, uint8_t **buf, uint32_t *len)
 +{
-+	if (pp->rxn == 0) {
-+		return false;
++	for (uint32_t i = 0; i < pp->rxn; i++) {
++		if (pp->rxq[i].sess != sess) {
++			continue;
++		}
++		*buf = pp->rxq[i].buf;
++		*len = pp->rxq[i].len;
++		memmove(&pp->rxq[i], &pp->rxq[i + 1], (pp->rxn - i - 1) * sizeof(pp->rxq[0]));
++		pp->rxn--;
++		return true;
 +	}
-+	*buf = pp->rxq[pp->rxh].buf;
-+	*len = pp->rxq[pp->rxh].len;
-+	pp->rxq[pp->rxh].buf = NULL;
-+	pp->rxh = (pp->rxh + 1) % ABP_RXQ;
-+	pp->rxn--;
-+	return true;
++	return false;
 +}
 +
 +/* Output structure (inband or descriptor) helpers. */
@@ -1194,6 +1241,7 @@ index 0000000..697a2c8
 +	OSDeclareDefaultStructors(AppleBasebandPCIUserClient);
 +	task_t fTask;
 +	unsigned fPipe;
++	uint32_t fSess;                 /* 0 = not open */
 +	uint32_t fCalls[0x10];
 +	void detachFromPipe(bool send);
 +public:
@@ -1231,16 +1279,22 @@ index 0000000..697a2c8
 +AppleBasebandPCIUserClient::detachFromPipe(bool send)
 +{
 +	abp_pipe *pp = &abp_pipes[fPipe];
-+	bool mine;
++	uint32_t sess;
 +	IOLockLock(pp->lock);
-+	mine = pp->uc == this;
-+	if (mine) {
-+		pp->uc = NULL;
++	sess = fSess;
++	fSess = 0;
++	if (sess) {
++		pp->live--;
++		for (unsigned i = 0; i < 32; i++) {
++			if (pp->live_ids[i] == sess) {
++				pp->live_ids[i] = 0;
++			}
++		}
 +	}
 +	IOLockUnlock(pp->lock);
-+	if (mine) {
-+		abp_flush_reads(fPipe, send);
-+		sweet_abp_c2w(fPipe, ABPB_CLOSE, NULL, 0);
++	if (sess) {
++		abp_end_session(fPipe, sess, send);
++		sweet_abp_c2w(fPipe, sess, ABPB_CLOSE, NULL, 0);
 +	}
 +}
 +
@@ -1272,13 +1326,26 @@ index 0000000..697a2c8
 +	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
 +
 +	switch (selector) {
-+	case 0: {       /* open */
++	case 0: {       /* open: a new session */
++		bool fresh = false;
 +		IOLockLock(pp->lock);
-+		pp->uc = this;
++		if (fSess == 0) {
++			fSess = ++pp->next_sess;
++			pp->live++;
++			fresh = true;
++			for (unsigned i = 0; i < 32; i++) {
++				if (pp->live_ids[i] == 0) {
++					pp->live_ids[i] = fSess;
++					break;
++				}
++			}
++		}
 +		pp->opens++;
++		uint32_t live = pp->live;
 +		IOLockUnlock(pp->lock);
 +		uint64_t v = in0;
-+		sweet_abp_c2w(fPipe, ABPB_OPEN, &v, sizeof(v));
++		sweet_abp_c2w(fPipe, fSess, ABPB_OPEN, &v, sizeof(v));
++		ABPLOG("%s/%u: open%s (%u session(s) open)", abp_pipe_names[fPipe], fSess, fresh ? "" : " again", live);
 +		break;
 +	}
 +	case 1:         /* close */
@@ -1327,8 +1394,8 @@ index 0000000..697a2c8
 +			uint64_t nth = pp->wr_frames++;
 +			pp->wr_bytes += len;
 +			IOLockUnlock(pp->lock);
-+			abp_log_frame(fPipe, "-> wland", buf, len, nth);
-+			sweet_abp_c2w(fPipe, ABPB_DATA, buf, len);
++			abp_log_frame(fPipe, fSess, "-> wland", buf, len, nth);
++			sweet_abp_c2w(fPipe, fSess, ABPB_DATA, buf, len);
 +		}
 +		IOFreeData(buf, len ? len : 1);
 +		if (r == kIOReturnSuccess && async) {
@@ -1346,10 +1413,11 @@ index 0000000..697a2c8
 +			rd.addr = in0;
 +			rd.size = (uint32_t)in1;
 +			rd.task = fTask;
++			rd.sess = fSess;
 +			uint8_t *fb = NULL;
 +			uint32_t fl = 0;
 +			IOLockLock(pp->lock);
-+			if (abp_rx_pop(pp, &fb, &fl)) {
++			if (abp_rx_pop(pp, fSess, &fb, &fl)) {
 +				IOLockUnlock(pp->lock);
 +				abp_complete_read(fPipe, &rd, fb, fl);
 +				IOFreeData(fb, fl ? fl : 1);
@@ -1365,13 +1433,13 @@ index 0000000..697a2c8
 +			uint8_t *fb = NULL;
 +			uint32_t fl = 0;
 +			IOLockLock(pp->lock);
-+			if (!abp_rx_pop(pp, &fb, &fl)) {
++			if (!abp_rx_pop(pp, fSess, &fb, &fl)) {
 +				AbsoluteTime dl;
 +				clock_interval_to_deadline(2000, kMillisecondScale, &dl);
 +				pp->sync_waiters++;
 +				IOLockSleepDeadline(pp->lock, &pp->rxn, dl, THREAD_ABORTSAFE);
 +				pp->sync_waiters--;
-+				abp_rx_pop(pp, &fb, &fl);
++				abp_rx_pop(pp, fSess, &fb, &fl);
 +			}
 +			IOLockUnlock(pp->lock);
 +			if (fb == NULL) {
@@ -1387,7 +1455,27 @@ index 0000000..697a2c8
 +	case 6:         /* abortChannelAsync */
 +	case 7: {       /* startChannelAsync */
 +		uint64_t v = in0;
-+		sweet_abp_c2w(fPipe, selector == 7 ? ABPB_START : ABPB_ABORT, &v, sizeof(v));
++		sweet_abp_c2w(fPipe, fSess, selector == 7 ? ABPB_START : ABPB_ABORT, &v, sizeof(v));
++		if (selector == 6 && fSess) {
++			/* abort: this session's pending reads end (aborted); queued frames stay */
++			abp_read rs[ABP_MAXREADS];
++			uint32_t n = 0;
++			IOLockLock(pp->lock);
++			for (uint32_t i = 0; i < pp->nreads;) {
++				if (pp->reads[i].sess == fSess) {
++					rs[n++] = pp->reads[i];
++					memmove(&pp->reads[i], &pp->reads[i + 1], (pp->nreads - i - 1) * sizeof(pp->reads[0]));
++					pp->nreads--;
++				} else {
++					i++;
++				}
++			}
++			IOLockUnlock(pp->lock);
++			for (uint32_t i = 0; i < n; i++) {
++				io_user_reference_t a0[1] = { 0 };
++				SweetABPAsync::done(rs[i].ref, kIOReturnAborted, a0, 1);
++			}
++		}
 +		if (async) {
 +			io_user_reference_t a[1] = { 0 };
 +			sendAsyncResult64(args->asyncReference, kIOReturnSuccess, a, 1);
@@ -1655,9 +1743,9 @@ index 0000000..697a2c8
 +			continue;
 +		}
 +		IOLockLock(pp->lock);
-+		o += snprintf(buf + o, len - o, " | %s opens %u %s, CC wrote %llu fr/%llu B, wland gave %llu fr/%llu B, reads pending %u, queued %u, drops %u, truncs %u",
-+		    abp_pipe_names[i], pp->opens, pp->uc ? "open" : "closed", pp->wr_frames, pp->wr_bytes, pp->rd_frames, pp->rd_bytes,
-+		    pp->nreads, pp->rxn, pp->drops, pp->truncs);
++		o += snprintf(buf + o, len - o, " | %s opens %u (%u live) %s, CC wrote %llu fr/%llu B, wland gave %llu fr/%llu B, reads pending %u, queued %u, drops %u, truncs %u, stale %u",
++		    abp_pipe_names[i], pp->opens, pp->live, pp->live ? "open" : "closed", pp->wr_frames, pp->wr_bytes, pp->rd_frames, pp->rd_bytes,
++		    pp->nreads, pp->rxn, pp->drops, pp->truncs, pp->stale);
 +		IOLockUnlock(pp->lock);
 +	}
 +	return (int)(o < len ? o : len - 1);
