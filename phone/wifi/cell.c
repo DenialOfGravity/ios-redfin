@@ -2405,8 +2405,10 @@ static void xs_answer(const struct qmi_msg *m)
 	uint16_t l;
 	const uint8_t *p;
 	if (xs_svc == SVC_WDA && m->id == 0x2e) {
-		printf("[%6llu] cell: WRITE wda set powersave mode flag %d -> %s (err %#x) after %llu ms\n", (unsigned long long)now,
-		       ps_want == 2, e ? "refused" : "ok", e, (unsigned long long)(now - xs_sent_ms));
+		static unsigned n_ps;
+		if (ps_want != 3 || ++n_ps <= 6 || n_ps % 20 == 0 || e)
+			printf("[%6llu] cell: WRITE wda set powersave mode flag %d -> %s (err %#x) after %llu ms (%u sent)\n", (unsigned long long)now,
+			       ps_sent == 2, e ? "refused" : "ok", e, (unsigned long long)(now - xs_sent_ms), n_ps);
 	} else if (xs_svc == SVC_WMS && m->id == 0x01) {
 		printf("[%6llu] cell: WRITE wms set event report -> %s (err %#x)\n", (unsigned long long)now, e ? "refused" : "ok", e);
 	} else if (xs_svc == SVC_WMS && m->id == 0x20) {
@@ -2442,7 +2444,23 @@ static void xs_poll(uint64_t now)
 		}
 		return;
 	}
-	if (ps_want && ps_want != ps_sent && srv[SVC_WDA].up && x1_state == X1_WAIT) {
+	if (ps_want == 3 && srv[SVC_WDA].up && x1_state == X1_WAIT) {
+		/* wdaps=3 (Claude 2026-11-09): Android qmi_rmnet's dance: power save ON after 3 s without UL, OFF as soon as a new UL
+		 * packet is posted.  The OFF request is what wakes the modem's data task (its UL channel otherwise stays stopped
+		 * for 10-50 s when RRC is idle). ps_sent: 1 = flag 0 sent (off), 2 = flag 1 sent (on). */
+		uint64_t lt = ipagsi_last_tx_ms();
+		int want = (lt && now - lt < 3000) ? 1 : 2;
+		if (want != ps_sent) {
+			struct qmi_buf *q = xs_start(0x2e);
+			if (!q)
+				return;
+			qmi_tlv_u8(q, 0x01, want == 2);
+			xs_send(SVC_WDA, 0x2e, q);
+			free(q);
+			ps_sent = want;
+			return;
+		}
+	} else if (ps_want && ps_want != 3 && ps_want != ps_sent && srv[SVC_WDA].up && x1_state == X1_WAIT) {
 		struct qmi_buf *q = xs_start(0x2e);
 		if (!q)
 			return;

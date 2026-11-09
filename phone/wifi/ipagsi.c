@@ -2875,6 +2875,11 @@ void ipagsi_stop(const char *why)
 	set_state("stopped");
 }
 
+uint64_t ipagsi_last_tx_ms(void)
+{
+	return last_tx_ms;
+}
+
 int ipagsi_running(void)
 {
 	return ctx.active;
