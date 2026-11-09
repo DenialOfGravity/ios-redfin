@@ -3735,8 +3735,7 @@ std::shared_ptr<CommandBuffer> CommandBuffer::xrDecodeDeferred() {
             pre->keepAlive(l.source);
             pre->keepAlive(l.copy);
             l.gpu = true;
-            gXrGpu[0]++;
-            gXrStats[5]++;   // (still a decode at commit)
+            gXrGpu[0]++;   // (gXrStats[5], deferred decodes, counted at the draw)
         }
         if (pre != nullptr && pre->counts().dispatches == 0) pre = nullptr;
         if (pre == nullptr) {
