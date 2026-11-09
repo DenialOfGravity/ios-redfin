@@ -1086,6 +1086,7 @@ static void rx_drain(void)
 
 static uint64_t tx_buf_pa[TX_BUFS];
 static uint32_t tx_wp, tx_done;
+static int celldata_off;		/* iOS Cellular Data switch off (celldata_poll) */
 static uint64_t last_tx_ms;
 
 static int tx_drain(void)
@@ -1163,6 +1164,10 @@ static void tx_pump(void)
 		}
 		if ((size_t) n < 4 + 20) {
 			ctx.tx_st.bad++;
+			continue;
+		}
+		if (celldata_off) {	/* iOS switched cellular data off: nothing goes out */
+			ctx.tx_other++;
 			continue;
 		}
 		memcpy(&af, pkt, 4);
@@ -1689,6 +1694,29 @@ static void cellroute(int up)
 		r = run_argv(argv);
 		LOG("cellroute: netsvc down %s -> %d", ctx.utun_name, r);
 	}
+}
+
+/* celldata_off is declared near tx_pump */
+/* celldata (Claude 2026-11-09): the iOS Settings > Cellular Data switch (SweetCT writes /var/tmp/sweetcell.celldata: "0" off,
+ * "1" or absent on).  Checked every 2 s; off = cellroute withdrawn and utun packets dropped (the call itself stays up). */
+static void celldata_poll(void)
+{
+	static uint64_t at;
+	char b[4] = "";
+	if (link_ms() - at < 2000)
+		return;
+	at = link_ms();
+	FILE *f = fopen("/var/tmp/sweetcell.celldata", "r");
+	int off = 0;
+	if (f) {
+		off = fread(b, 1, sizeof(b) - 1, f) > 0 && b[0] == '0';
+		fclose(f);
+	}
+	if (off == celldata_off)
+		return;
+	celldata_off = off;
+	LOG("celldata: iOS Cellular Data switch %s", off ? "OFF: route withdrawn, UL dropped" : "ON: route published");
+	cellroute(!off);
 }
 
 /* QMAP command frames from the modem (Claude 2026-11-09).  Linux rmnet_map_control_command: after the 4-byte QMAP header,
@@ -2562,6 +2590,7 @@ static void p2_poll(void)
 	p2_drain();
 	tx_pump();
 	p2_wake();
+	celldata_poll();
 	ipaprobe_tput(ctx.utun_name);
 	ipaprobe_poll(&ctx.call, tx_send, TX_BUFS - (tx_wp - tx_done), rd32);	/* p2probe=N (ipaprobe.c) */
 	{
