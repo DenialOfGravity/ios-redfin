@@ -209,6 +209,12 @@ public:
     struct Mark { uint32_t word; MarkKind kind; uint8_t gmem; uint32_t w, h, fmt, count, words, pvt; const void* what; const char* name; };
     void mark(const Mark& m) { if (marks_.size() < kMaxMarks) marks_.push_back(m); else marksLost_++; }
     static bool hangDumpOn();
+    // (redfin hmv7) HM_HANG_BLAME: the programs of a hung buffer with at least blameWords() fragment words (the uber
+    // shaders: the only ones with loops CoreAnimation's data steer) each get one more hang to their name; hangsOf()
+    // answers the count (0 for a program never blamed), blame() says what this hang added
+    static uint32_t blameWords();
+    static uint32_t hangsOf(const void* program);
+    std::vector<std::string> blame() const;
     static constexpr size_t kMaxMarks = 4096;
 
 private:

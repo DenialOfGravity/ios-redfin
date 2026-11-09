@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <sstream>
+#include <string>
 
 #include <algorithm>
 #include <atomic>
@@ -742,6 +743,51 @@ void CommandQueue::recoverAfterReset(CommandBuffer& hung, uint64_t faults) {
     render::notify("reset recovery: 3/3 " + std::to_string(sent) + " sent again, " + std::to_string(refused) + " left to fail; BOs, mappings and the queue kept (the kernel's)");
 }
 
+// (redfin hmv7) HM_HANG_BLAME's tally: program (the core Program a draw mark names) -> hangs it was in
+namespace {
+std::mutex gBlameLock;
+std::map<const void*, uint32_t> gBlame;
+}  // namespace
+
+uint32_t CommandBuffer::blameWords() {
+    static const uint32_t w = [] {
+        const char* e = getenv("HM_HANG_BLAME_WORDS");
+        return e != nullptr && e[0] != '\0' ? uint32_t(strtoul(e, nullptr, 0)) : 1024u;
+    }();
+    return w;
+}
+
+uint32_t CommandBuffer::hangsOf(const void* program) {
+    std::lock_guard<std::mutex> g(gBlameLock);
+    auto it = gBlame.find(program);
+    return it == gBlame.end() ? 0 : it->second;
+}
+
+std::vector<std::string> CommandBuffer::blame() const {
+    std::vector<std::string> out;
+    std::vector<const Mark*> seen;
+    for (const Mark& m : marks_) {
+        if (m.kind != kMarkDraw || m.what == nullptr) continue;
+        bool dup = false;
+        for (const Mark* o : seen) dup = dup || o->what == m.what;
+        if (dup) continue;
+        seen.push_back(&m);
+    }
+    std::lock_guard<std::mutex> g(gBlameLock);
+    for (const Mark* m : seen) {
+        if (m->words < blameWords()) continue;
+        const uint32_t n = ++gBlame[m->what];
+        char b[200];
+        snprintf(b, sizeof b, "blame: %s(%p) fsw %u: in %u hung buffer%s now", m->name != nullptr ? m->name : "?", m->what, m->words, n, n == 1 ? "" : "s");
+        out.push_back(b);
+    }
+    if (out.empty()) {
+        out.push_back("blame: no program of " + std::to_string(blameWords()) + " fragment words or more in it (" + std::to_string(seen.size()) +
+                      " programs): nothing blamed");
+    }
+    return out;
+}
+
 bool CommandBuffer::hangDumpOn() {
     static const bool on = [] { const char* e = getenv("HM_HANG_DUMP"); return e == nullptr || e[0] != '0'; }();
     return on;
@@ -866,6 +912,9 @@ void CommandQueue::waiter() {
             std::istringstream lines(cb->hangReport());
             std::string line;
             while (std::getline(lines, line)) render::notify("hang: fence " + std::to_string(cb->fence_) + ": " + line);
+        }
+        if (front && CommandBuffer::hangDumpOn()) {   // (redfin hmv7) HM_HANG_BLAME's tally (the marks are HM_HANG_DUMP's)
+            for (const std::string& line : cb->blame()) render::notify("hang: fence " + std::to_string(cb->fence_) + ": " + line);
         }
         if (front) {
             hangsReported_ = faults;

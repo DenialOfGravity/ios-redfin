@@ -357,6 +357,31 @@ TEST(after_a_reset_the_buffers_behind_the_failed_one_are_sent_again) {
     CHECK(cb1->hangReport().find("1 copies/fills") != std::string::npos);
 }
 
+// (redfin hmv7) HM_HANG_BLAME: a hung buffer's programs of HM_HANG_BLAME_WORDS (1024) fragment words or more get a hang each
+// (one per buffer however often drawn in it); the small ones none; a buffer without a big one blames nothing
+TEST(a_hung_buffers_big_programs_are_blamed_once_per_buffer) {
+    Rig r(true);
+    static int big = 0, small = 0;
+    auto cb = r.queue->commandBuffer();
+    using M = CommandBuffer::Mark;
+    cb->mark(M{0, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32064, 0, &big, "uber"});
+    cb->mark(M{10, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32064, 0, &big, "uber"});
+    cb->mark(M{20, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32, 0, &small, "small"});
+    CHECK_EQ(CommandBuffer::hangsOf(&big), 0u);
+    auto lines = cb->blame();
+    CHECK_EQ(lines.size(), size_t(1));
+    CHECK(lines[0].find("uber") != std::string::npos && lines[0].find("in 1 hung buffer now") != std::string::npos);
+    CHECK_EQ(CommandBuffer::hangsOf(&big), 1u);
+    CHECK_EQ(CommandBuffer::hangsOf(&small), 0u);
+    CHECK(cb->blame()[0].find("in 2 hung buffers now") != std::string::npos);
+    CHECK_EQ(CommandBuffer::hangsOf(&big), 2u);
+    auto cb2 = r.queue->commandBuffer();
+    cb2->mark(M{0, CommandBuffer::kMarkDraw, 0, 64, 64, 80, 6, 32, 0, &small, "small"});
+    auto none = cb2->blame();
+    CHECK(none.size() == 1 && none[0].find("nothing blamed") != std::string::npos);
+    CHECK_EQ(CommandBuffer::hangsOf(&small), 0u);
+}
+
 namespace {
 Gpu* gHandoverGpu = nullptr;
 std::shared_ptr<Buffer> gHandoverNew;

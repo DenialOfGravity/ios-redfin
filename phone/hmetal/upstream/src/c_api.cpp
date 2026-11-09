@@ -1246,6 +1246,12 @@ unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stag
     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;
 }
 
+// (redfin hmv7) HM_HANG_BLAME: the hangs counted against the program a draw with P names (CompiledProgram::program)
+unsigned hakios_metal_program_hangs(hakios_metal_program* p) {
+    if (p == nullptr || p->program == nullptr) return 0;
+    return CommandBuffer::hangsOf(&p->program->program);
+}
+
 // FUNCTION of LIBRARY as WANT (a vertex or a fragment function): its bitcode, or nullptr with the reason left
 static bool functionBitcode(hakios_metal_library* l, const char* function, MetalFunction::Type want, const uint8_t** bytes, uint64_t* length) {
     const MetalFunction* f = l->lib.find(function != nullptr ? function : "");

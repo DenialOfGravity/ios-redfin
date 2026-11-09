@@ -39,6 +39,9 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
     as SweetMetal2 does
   - (hmv5) HM_SPEC=0 (default): no uber-shader specialisation (1 = hakios' background specialiser, which preceded every
     GPU hang in hmt6); HM_FAILLOG=1 (default): command buffers that end in error or leave work out are said
+  - (hmv7) HM_SPEC=2 (an uber shader drawn only through the program specialised for the draw's configuration, compiled
+    on the spot), HM_DENY=word,... (pipelines whose label holds a word: the other pick, and their uber shaders as
+    HM_SPEC=2), HM_HANG_BLAME=1 (default; after HM_HANG_BLAME_AFTER=2 hung buffers a program is drawn as HM_SPEC=2 draws it)
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -160,8 +163,18 @@ BITCODE_FOR_NEW = r'''	if (name == nil || ![name hasPrefix:@"fixed_"]) {
 		return own;
 	}
 	{   /* (redfin hmvar) HAKIOS_METAL_CA_PICK: exact (default), own, nearest (= HAKIOS_METAL_CA_VARIANTS=1, upstream's pick) */
-		const int mode = hm_ca_force_nearest ? HM_CA_NEAREST : hm_ca_pick_mode();
+		int mode = hm_ca_force_nearest ? HM_CA_NEAREST : hm_ca_pick_mode();
 		const char *how = NULL;
+
+		/* (redfin hmv7) HM_DENY: a pipeline whose label holds one of its words gets the other pick */
+		if (pipeline != nil && hm_v7_denied_text([pipeline UTF8String])) {
+			const int was = mode;
+
+			mode = mode == HM_CA_EXACT ? HM_CA_OWN : mode == HM_CA_OWN ? HM_CA_NEAREST : HM_CA_OWN;
+			if (mode == HM_CA_OWN && own == nil) mode = HM_CA_NEAREST;
+			hm_print("HM_DENY: pipeline %s (%s): pick %s instead of %s\n", [pipeline UTF8String], [name UTF8String],
+				 mode == HM_CA_OWN ? "own" : "nearest", was == HM_CA_EXACT ? "exact" : was == HM_CA_OWN ? "own" : "nearest");
+		}
 
 		if (mode == HM_CA_OWN && own != nil) {
 			hm_ca_note(vertex, "own", nil);
@@ -898,6 +911,118 @@ hm_surface_gen(uint32_t id, uint32_t bump)
 }
 '''
 
+HMV7_HELPERS = r'''/* (redfin hmv7) Uber shaders that may not run as they are (bench/plugin.py). hmt7 (var6): every one of backboardd's GPU
+ * resets (2 s with the CP inside the buffer, SP/HLSQ busy, VFD idle: a fragment shader that never ends) was a buffer
+ * drawing fixed_vert_lph_gen+fixed_frag_lph_cpf, the 32064-word uber shader (the pipelinelib's frag.A2Xghfc), which
+ * walks its configuration buffer's bytes at run time (62 loops whose trip counts are bytes of that buffer). The
+ * specialised program (hakios_metal_program_specialize: the buffer's bytes folded in) has no such loop.
+ *   HM_SPEC=2           every uber shader drawn only through the program specialised for the draw's configuration,
+ *                       compiled on the spot the first time a configuration is seen (the draw waits, ~1 s), never as it is
+ *   HM_DENY=a,b,...     pipelines whose CA line (draw label, picks, variant labels) holds one of the words: made with the
+ *                       other pick (exact -> own, own -> nearest, nearest -> own), and an uber shader among them drawn
+ *                       as HM_SPEC=2 draws it
+ *   HM_HANG_BLAME=1     (default) a program in HM_HANG_BLAME_AFTER (default 2) hung buffers (the core's tally: only
+ *                       programs of HM_HANG_BLAME_WORDS fragment words or more, default 1024) is from then on drawn as
+ *                       HM_SPEC=2 draws it, or left out if it cannot be specialised; 0 = the tally is only logged
+ * A draw that would have to run such a program as it is (no configuration to fold, the specialisation failed) is left
+ * out and said (the first 20, then every 100th). */
+static int
+hm_v7_spec_wait_all(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_SPEC");
+
+		on = e != NULL && atoi(e) == 2;
+	}
+	return on;
+}
+
+static int
+hm_v7_blame_after(void)   /* 0: HM_HANG_BLAME=0 */
+{
+	static int after = -1;
+
+	if (after < 0) {
+		const char *e = getenv("HM_HANG_BLAME"), *a = getenv("HM_HANG_BLAME_AFTER");
+
+		after = e != NULL && e[0] != '\0' && atoi(e) == 0 ? 0 : (a != NULL && atoi(a) > 0 ? atoi(a) : 2);
+		hm_print("HM_HANG_BLAME=%s: %s; HM_SPEC=%s; HM_DENY=%s\n", e != NULL ? e : "unset (1)",
+			 after ? "a program in that many hung buffers is drawn only specialised from then on" : "hangs only counted",
+			 getenv("HM_SPEC") != NULL ? getenv("HM_SPEC") : "unset", getenv("HM_DENY") != NULL ? getenv("HM_DENY") : "unset");
+		if (after) hm_print("HM_HANG_BLAME_AFTER=%d\n", after);
+	}
+	return after;
+}
+
+/* YES when TEXT holds one of HM_DENY's comma-separated words */
+static BOOL
+hm_v7_denied_text(const char *text)
+{
+	const char *e = getenv("HM_DENY");
+
+	if (e == NULL || e[0] == '\0' || text == NULL) return NO;
+	while (*e != '\0') {
+		const char *end = strchr(e, ',');
+		const size_t n = end != NULL ? (size_t)(end - e) : strlen(e);
+		char word[128];
+
+		if (n > 0 && n < sizeof(word)) {
+			memcpy(word, e, n);
+			word[n] = '\0';
+			if (strstr(text, word) != NULL) return YES;
+		}
+		if (end == NULL) break;
+		e = end + 1;
+	}
+	return NO;
+}
+
+/* how PROGRAM (a pipeline's own) may be drawn: 0 as it is, 1 only through its specialisations; said once per program */
+static int
+hm_v7_wait(hakios_metal_program *program)
+{
+	static NSMutableSet *said;
+	const char *why = NULL;
+	char text[96];
+	const int after = hm_v7_blame_after();
+	const unsigned hangs = after ? hakios_metal_program_hangs(program) : 0;
+
+	if (hm_v7_spec_wait_all()) {
+		why = "HM_SPEC=2";
+	} else if (after && hangs >= (unsigned)after) {
+		snprintf(text, sizeof(text), "HM_HANG_BLAME: in %u hung buffers", hangs);
+		why = text;
+	} else if (getenv("HM_DENY") != NULL && hm_v7_denied_text(hm_ca_info_of(program))) {
+		why = "HM_DENY";
+	}
+	if (why == NULL) return 0;
+	@synchronized ([NSMutableArray class]) {
+		NSValue *key = [NSValue valueWithPointer:program];
+
+		if (said == nil) said = [[NSMutableSet alloc] init];
+		if (![said containsObject:key]) {
+			[said addObject:key];
+			hm_print("blame: %s (%p, %s): %s; from now on drawn only through programs specialised for its configuration\n",
+				 hakios_metal_program_name(program), (void *)program, hm_ca_info_of(program), why);
+		}
+	}
+	return 1;
+}
+
+static void
+hm_v7_left_out(hakios_metal_program *program, const char *why)
+{
+	static unsigned n;
+
+	if (n++ < 20 || n % 100 == 0) {
+		hm_print("blame: a draw of %s left out (%u so far): %s\n", hakios_metal_program_name(program), n, why);
+	}
+}
+
+'''
+
 HMV5_HELPERS = r'''/* (redfin hmv5) HM_FAILLOG=1 (default): failed buffers and left-out work said (bench/plugin.py) */
 static int
 hm_faillog_on(void)
@@ -938,6 +1063,112 @@ hm_fail_note(hakios_metal_cb *cb)
 	}
 }
 '''
+
+# (hmv7) uber shaders that may not run as they are: HM_SPEC=2 / HM_DENY / HM_HANG_BLAME (HMV7_HELPERS)
+HMV7_FOR_START = '- (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count\n{\n'
+HMV7_FOR_END = '\t\t\t[self release];\n\t\t});\n\t}\n\treturn found;\n}\n'
+HMV7_FOR_NEW = r'''- (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+{
+	static dispatch_queue_t compiling;
+	static dispatch_once_t once;
+
+	/* (redfin hmv7) the fragment is kept whatever HM_SPEC says (hakiosKeepFragment), so that a blamed or denied uber
+	 * shader can still be specialised; HM_SPEC=0 alone draws the pipeline's own program, as before */
+	if (_specialised == nil) return _program;
+	const int wait = hm_v7_wait(_program);
+	if (!wait && hm_spec_off()) return _program;
+	if (_specBinding < 0 || (unsigned)_specBinding >= count || buffers[_specBinding] == NULL) {
+		if (wait) hm_v7_left_out(_program, "no configuration buffer bound to fold");
+		return wait ? NULL : _program;
+	}
+	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
+	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
+	if (bytes == NULL || at > length || length - at < _specLength) {
+		if (wait) hm_v7_left_out(_program, "its configuration buffer is shorter than the program reads");
+		return wait ? NULL : _program;
+	}
+	NSData *key = [NSData dataWithBytes:bytes + at length:_specLength];
+	hakios_metal_program *found = wait ? NULL : _program;
+	BOOL start = NO, mine = NO;
+
+	@synchronized(self) {
+		id have = [_specialised objectForKey:key];
+
+		if ([have isKindOfClass:[NSValue class]]) {   /* (a failed one is a string, never an NSValue) */
+			found = (hakios_metal_program *)[have pointerValue];
+		} else if (have == nil && wait) {
+			[_specialised setObject:[NSNull null] forKey:key];   /* (no limit: each one is a configuration CA draws) */
+			mine = YES;
+		} else if (have == nil && [_specialised count] < 64) {
+			[_specialised setObject:[NSNull null] forKey:key];
+			start = YES;
+		} else if (wait && [have isKindOfClass:[NSString class]]) {
+			found = NULL;   /* its specialisation failed before */
+		}
+	}
+	if (wait && found == NULL && !mine) {
+		/* being specialised on the queue (asked for before the blame): wait for it, up to 5 s */
+		for (int i = 0; i < 2500 && found == NULL; i++) {
+			id have;
+
+			@synchronized(self) {
+				have = [_specialised objectForKey:key];
+			}
+			if ([have isKindOfClass:[NSValue class]]) found = (hakios_metal_program *)[have pointerValue];
+			else if (![have isKindOfClass:[NSNull class]]) break;
+			else usleep(2000);
+		}
+		if (found == NULL) hm_v7_left_out(_program, "its specialisation for this configuration failed or is not done in 5 s");
+		return found;
+	}
+	if (mine) {
+		struct timespec t0, t1;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+									 (unsigned)_specBinding, [key bytes], [key length]);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		hm_print("specialise (waited for, hmv7): %s for %u bytes of its buffer %d: %s%u instruction words, not %u, in %.0f ms\n",
+			 hakios_metal_program_name(_program), _specLength, _specBinding, p != NULL ? "" : "FAILED: ",
+			 p != NULL ? hakios_metal_program_stage_words(p, 1) : 0, hakios_metal_program_stage_words(_program, 1),
+			 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+		if (p == NULL) hm_print("specialise: %s\n", hakios_metal_error());
+		@synchronized(self) {
+			[_specialised setObject:p != NULL ? (id)[NSValue valueWithPointer:p] : (id)@"failed" forKey:key];
+		}
+		if (p == NULL) hm_v7_left_out(_program, "its specialisation for this configuration failed");
+		return p;
+	}
+	if (start) {
+		dispatch_once(&once, ^{
+			compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+		});
+		[self retain];
+		dispatch_async(compiling, ^{
+			struct timespec t0, t1;
+
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+										 (unsigned)_specBinding, [key bytes], [key length]);
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			if (p == NULL) {
+				hm_print("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
+					 hakios_metal_error());
+			} else if (hm_fps_on()) {
+				hm_print("specialise: %s for %u bytes of its buffer %d: %u instruction words, not %u, in %.0f ms\n", hakios_metal_program_name(_program),
+					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
+					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+			}
+			@synchronized(self) {
+				[_specialised setObject:p != NULL ? (id)[NSValue valueWithPointer:p] : (id)@"failed" forKey:key];
+			}
+			[self release];
+		});
+	}
+	return found;
+}
+'''
+
 
 EDITS = [
     ('#define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"',
@@ -1171,6 +1402,18 @@ EDITS = [
     ('\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n\treturn library;\n',
      '\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n'
      '\thm_prewarm_start(library, path);   /* (redfin hmv4) */\n\treturn library;\n'),
+    # (hmv7) HM_SPEC=2 / HM_DENY / HM_HANG_BLAME (HMV7_HELPERS): helpers before hmv5's, the draw's program picked by them
+    ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
+     HMV7_HELPERS + '/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE'),
+    # the fragment kept for every uber shader (HM_SPEC=0 too): a blamed one is specialised on demand
+    ('\t_specBinding = -1;\n\tif (hm_spec_off() || hakios_metal_program_stage_words(_program, 1) < 4096) return;\n',
+     '\t_specBinding = -1;\n\tif (hakios_metal_program_stage_words(_program, 1) < 4096) return;   /* (redfin hmv7) kept with HM_SPEC=0 too */\n'),
+    (HMV7_FOR_START, HMV7_FOR_END, HMV7_FOR_NEW),
+    ('\thakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];\n',
+     '\thakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];\n'
+     '\tif (program == NULL) {   /* (redfin hmv7) an uber shader that may not run as it is, and no specialisation for this draw */\n'
+     '\t\treturn;\n'
+     '\t}\n'),
 ]
 
 
