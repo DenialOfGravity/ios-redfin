@@ -72,6 +72,9 @@ hakios_metal_device *hakios_metal_open_fake(void);
 void hakios_metal_close(hakios_metal_device *device);
 /* the chip id (0x06030500 on the phone: the kernel's GPU_ID is 0, the chip id is what names the GPU) */
 uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
+/* (redfin) UBWC as the driver says the kernel programmed it (highest bank bit, swizzle levels, macrotile mode); returns 1
+ * when those are the driver's words, 0 when they are the chip table's */
+int hakios_metal_ubwc(hakios_metal_device *device, unsigned *highest_bank_bit, unsigned *swizzle_levels, unsigned *macrotile_mode);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
 

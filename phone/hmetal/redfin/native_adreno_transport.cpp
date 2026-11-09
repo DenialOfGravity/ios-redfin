@@ -103,6 +103,11 @@ public:
             return false;
         }
         free_[info_.va_start] = info_.va_size;
+        // (redfin) what the kernel says it programmed, once per open: UBWC is the kernel's (xnu 0904 writes
+        // RB/TPL1/SP_NC_MODE_CNTL and UCHE_MODE_CNTL), Gpu::ubwc() takes these words over the chip table's
+        fprintf(stderr, "hakios-metal: NativeAdreno chip %#x, GMEM %u KiB at %#llx, UBWC %u: highest bank bit %u, swizzle levels %#x, "
+                        "macrotile %u, flags %#x\n", info_.chip_id, info_.gmem_bytes / 1024, (unsigned long long)info_.gmem_base,
+                info_.ubwc_version, info_.highest_bank_bit, info_.ubwc_swizzle, info_.macrotile_mode, info_.flags);
         return true;
     }
 

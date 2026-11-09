@@ -31,7 +31,17 @@ void selectChip(const ChipInfo& c) { gChip.store(&c, std::memory_order_relaxed);
 }  // namespace a6xx
 
 Gpu::Gpu(std::unique_ptr<Transport> transport) : t_(std::move(transport)) {
-    if (const a6xx::ChipInfo* c = a6xx::chipFor(chipId())) a6xx::selectChip(*c);
+    const a6xx::ChipInfo* c = a6xx::chipFor(chipId());
+    if (c != nullptr) a6xx::selectChip(*c);
+    // (redfin) UBWC as the kernel programmed it: the driver's words when it says all three, else the chip table's
+    uint64_t hbb = 0, swz = 0, mt = 0;
+    const a6xx::ChipInfo& t = c != nullptr ? *c : a6xx::chip();
+    if (param(kParamHighestBankBit, &hbb) == 0 && param(kParamUbwcSwizzle, &swz) == 0 && param(kParamMacrotileMode, &mt) == 0 &&
+        hbb >= 13 && hbb <= 16) {
+        ubwc_ = UbwcConfig{uint32_t(hbb), uint32_t(swz), uint32_t(mt), true};
+    } else {
+        ubwc_ = UbwcConfig{t.highestBankBit, t.ubwcSwizzle, t.macrotileMode, false};
+    }
 }
 
 int Gpu::param(uint32_t which, uint64_t* value) {

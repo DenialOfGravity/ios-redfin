@@ -154,6 +154,14 @@ struct BoUse {
     bool write;
 };
 
+// (redfin) UBWC as the driver says the kernel programmed it; fromDriver false: the chip table's (a6xx::ChipInfo)
+struct UbwcConfig {
+    uint32_t highestBankBit = 0;
+    uint32_t bankSwizzleLevels = 0;
+    uint32_t macrotileMode = 0;
+    bool fromDriver = false;
+};
+
 class Gpu {
 public:
     // (redfin) asks the transport for the chip id and selects that chip's row (a6xx::selectChip) when there is one
@@ -163,6 +171,8 @@ public:
     int param(uint32_t which, uint64_t* value);
     // the chip id without the speed bin above it: 0x06030500 on the phone, 0 if the driver does not say
     uint32_t chipId();
+    // (redfin) the UBWC configuration, read once when the Gpu is made
+    const UbwcConfig& ubwc() const { return ubwc_; }
     // how many times the kernel has reset a hung GPU in this run (0 when it cannot say)
     uint64_t faults();
 
@@ -204,6 +214,7 @@ private:
     std::atomic<uint64_t> allocated_{0};
     void release(Bo& bo);
     std::unique_ptr<Transport> t_;
+    UbwcConfig ubwc_;
 };
 
 }  // namespace hakios::metal

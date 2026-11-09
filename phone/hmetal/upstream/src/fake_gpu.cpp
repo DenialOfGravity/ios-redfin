@@ -2533,10 +2533,10 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         case kParamPpPgtable: p->value = 0; return 0;
         case kParamFaults: p->value = stats_.recoveries; return 0;
         case kParamSuspends: p->value = 0; return 0;
-        case kParamHighestBankBit: p->value = 14; return 0;
+        case kParamHighestBankBit: p->value = chip_->highestBankBit; return 0;   // (redfin) the chip's kernel's
         case kParamRaytracing: p->value = 0; return 0;
-        case kParamUbwcSwizzle: p->value = 6; return 0;
-        case kParamMacrotileMode: p->value = 1; return 0;
+        case kParamUbwcSwizzle: p->value = chip_->ubwcSwizzle; return 0;
+        case kParamMacrotileMode: p->value = chip_->macrotileMode; return 0;
         default: return EINVAL;                                      // (kIOReturnBadArgument there: VA_START, VA_SIZE among them)
         }
     }

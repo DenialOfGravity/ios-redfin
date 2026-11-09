@@ -1282,3 +1282,47 @@ TEST(a_stencil_view_reads_the_s8_plane) {
     auto depthOnly = Texture::make(r.gpu, z, &why);
     CHECK(depthOnly != nullptr && Texture::view(depthOnly, PixelFormat::kX32Stencil8, TextureType::k2D, 0, 1, 0, 1, &why) == nullptr);
 }
+
+// (redfin) An A620 compressed texture with the UBWC the redfin kernel programs (xnu 0904: highest bank bit 14, UBWC 3,
+// AMSBC, swizzle levels 2+3, macrotile 0): Gpu takes the kernel's words, and the layout is fdl6_layout's (Mesa 25.0.7
+// fd6_layout.c), which on a6xx does not depend on them -- the bank bit and swizzle are the GPU's own, applied the same on
+// write and read by the NC_MODE_CNTL registers the kernel wrote. 1080 x 2340 RGBA8, by hand from fd6_layout.c: pitch
+// align(4320, 256) = 4352, rows align(2340, 16) = 2352; flag buffer: 16 x 4 blocks, pitch align(68, 64) = 128,
+// height align(585, 16) = 592, 128 x 592 = 75776 -> 77824 (4 KiB), first; the pixels at 77824, 2352 x 4352 = 10235904.
+TEST(an_a620_compressed_texture_takes_the_kernels_ubwc_and_fdl6s_layout) {
+    const a6xx::ChipInfo& before = a6xx::chip();
+    {
+        Gpu gpu(std::make_unique<FakeGpu>(a6xx::kChipA620));
+        CHECK(&a6xx::chip() == &a6xx::kChipA620);
+        CHECK(gpu.ubwc().fromDriver);
+        CHECK_EQ(gpu.ubwc().highestBankBit, 14u);
+        CHECK_EQ(gpu.ubwc().bankSwizzleLevels, 6u);
+        CHECK_EQ(gpu.ubwc().macrotileMode, 0u);
+        CHECK_EQ(a6xx::kChipA620.highestBankBit, 14u);   // the table's fallback, as the kernel (Mesa's FD620 row says 15)
+        TextureDesc d;
+        d.format = PixelFormat::kRGBA8Unorm;
+        d.width = 1080;
+        d.height = 2340;
+        d.usage = kTextureUsageRead | kTextureUsageRenderTarget;
+        d.compressed = true;
+        std::string why;
+        auto t = Texture::make(gpu, d, &why);
+        if (t == nullptr && why.find("this build has none") != std::string::npos) {
+            std::printf("       (no Mesa in this build: %s; the A620 UBWC layout was not computed)\n", why.c_str());
+        } else {
+            CHECK(t != nullptr);
+            if (t != nullptr) {
+                CHECK(t->compressed());
+                CHECK_EQ(t->bytesPerRow(), 4352ull);
+                CHECK_EQ(t->gpuAddress() - t->buffer()->gpuAddress(), 77824ull);
+                CHECK_EQ(t->flagAddress(), t->buffer()->gpuAddress());
+                CHECK_EQ(t->flagPitch(), 128u);
+                CHECK_EQ(t->flagLayerSize(), 77824u);
+                CHECK(t->buffer()->length() >= 77824ull + 10235904ull);
+            } else {
+                std::printf("       %s\n", why.c_str());
+            }
+        }
+    }
+    a6xx::selectChip(before);
+}

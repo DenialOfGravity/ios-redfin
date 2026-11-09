@@ -421,6 +421,8 @@ int main(int argc, char** argv) {
     std::printf("probe: GPU %llu, chip id 0x%llx, %llu MHz, FAULTS %llu%s\n", (unsigned long long)id, (unsigned long long)chip,
                 (unsigned long long)(freq / 1000000), (unsigned long long)gpu.faults(),
                 recover ? "; the GPU will be hung on purpose at the end (--recover)" : "");
+    std::printf("probe: UBWC highest bank bit %u, swizzle levels %#x, macrotile %u (%s)\n", gpu.ubwc().highestBankBit,
+                gpu.ubwc().bankSwizzleLevels, gpu.ubwc().macrotileMode, gpu.ubwc().fromDriver ? "the driver's" : "the chip table's: the driver did not say");
     {
         // what this processor's writes and reads of a GPU buffer cost against its own memory: a draw writes some 3 KB
         // of descriptors into one, and an uncached mapping makes each store a bus transaction

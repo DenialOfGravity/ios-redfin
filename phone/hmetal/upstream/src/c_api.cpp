@@ -259,6 +259,13 @@ hakios_metal_device* hakios_metal_open_fake(void) { return deviceOn(std::make_un
 void hakios_metal_close(hakios_metal_device* d) { delete d; }
 
 uint64_t hakios_metal_gpu_id(hakios_metal_device* d) { return d->gpu->chipId(); }
+int hakios_metal_ubwc(hakios_metal_device* d, unsigned* hbb, unsigned* swizzle, unsigned* macrotile) {
+    const UbwcConfig& u = d->gpu->ubwc();
+    if (hbb != nullptr) *hbb = u.highestBankBit;
+    if (swizzle != nullptr) *swizzle = u.bankSwizzleLevels;
+    if (macrotile != nullptr) *macrotile = u.macrotileMode;
+    return u.fromDriver ? 1 : 0;
+}
 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
 

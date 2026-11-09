@@ -1468,7 +1468,14 @@ struct ChipInfo {
     uint32_t gmemCcuColorCacheFraction;   // QUARTER = 4
     uint32_t tileAlignW, tileAlignH, gmemAlignW, gmemAlignH, tileMaxW, tileMaxH;
     uint32_t numVscPipes;
-    uint32_t highestBankBit;      // Mesa's default; the kernel's GET_PARAM HIGHEST_BANK_BIT is what UBWC uses
+    // (redfin) UBWC as the kernel programs it (RB/TPL1/SP_NC_MODE_CNTL, UCHE_MODE_CNTL): what the GPU swizzles by. The
+    // driver says these (GET_PARAM HIGHEST_BANK_BIT / UBWC_SWIZZLE / MACROTILE_MODE; NativeAdreno DeviceInfo) and Gpu
+    // takes its words (Gpu::ubwc()); these are what a driver that does not say is taken to have programmed. Nothing in
+    // hakios-metal computes with them: fdl6_layout and fdl6_view_init (Mesa 25.0.7) do not read them on a6xx, and only
+    // fdl6_memcpy_*tiled* (CPU access to tiled pixels, which texture.cpp refuses) would.
+    uint32_t highestBankBit;
+    uint32_t ubwcSwizzle;         // bank swizzle levels: bit0 level 1, bit1 level 2, bit2 level 3
+    uint32_t macrotileMode;       // 0 four channel, 1 eight channel
     ChipMagic magic;
 };
 
@@ -1479,7 +1486,8 @@ inline constexpr ChipInfo kChipA635{
     /*indirectDrawWfmQuirk*/ false, /*depthBoundsRequireDepthTestQuirk*/ false, /*invalidateBeforeState*/ false, /*pvtPerWaveFiberScale*/ 1,
     kNumCcu, kNumSpCores, kFibersPerSp, kCsSharedMemSize, kWaveGranularity, kInstrCacheSize, /*regSizeVec4*/ 64,
     kSysmemPerCcuDepthCacheSize, kSysmemPerCcuColorCacheSize, kGmemBytes, kGmemCcuColorCacheFraction,
-    kTileAlignW, kTileAlignH, kGmemAlignW, kGmemAlignH, kTileMaxW, kTileMaxH, /*numVscPipes*/ 32, /*hbb*/ 15,
+    kTileAlignW, kTileAlignH, kGmemAlignW, kGmemAlignH, kTileMaxW, kTileMaxH, /*numVscPipes*/ 32,
+    /*hbb, swizzle, macrotile: what hakios' FakeGpu answers for redwood's kernel (Mesa's table: hbb 15)*/ 14, 6, 1,
     {kMagicPcPowerCntl, kMagicTpl1DbgEcoCntl, kMagicGrasDbgEcoCntl, kMagicSpChickenBits, kMagicUcheClientPf, kMagicPcModeCntl,
      kMagicSpDbgEcoCntl, kMagicRbDbgEcoCntl, kMagicRbDbgEcoCntl, kMagicHlsqDbgEcoCntl, kMagicRbUnknown8E01, kMagicVpcDbgEcoCntl,
      kMagicUcheUnknown0E12},
@@ -1498,7 +1506,8 @@ inline constexpr ChipInfo kChipA620{
     /*indirectDrawWfmQuirk*/ true, /*depthBoundsRequireDepthTestQuirk*/ true, /*invalidateBeforeState*/ true, /*pvtPerWaveFiberScale*/ 2,
     /*numCcu*/ 1, /*numSpCores*/ 1, /*fibersPerSp*/ 128 * 16, /*csSharedMemSize*/ 32 * 1024, /*waveGranularity*/ 2,
     /*instrCacheSize*/ 64, /*regSizeVec4*/ 96, 0x10000, 0x10000, /*gmemBytes*/ 512 * 1024, /*QUARTER*/ 4,
-    32, 16, 16, 4, 1024, 1008, /*numVscPipes*/ 32, /*hbb (Mesa default)*/ 15,
+    32, 16, 16, 4, 1024, 1008, /*numVscPipes*/ 32,
+    /*hbb, swizzle, macrotile: xnu 0904 (DT highest-bank-bit 14, lower_bit 1; Mesa's FD620 row says 15)*/ 14, 6, 0,
     {/*PC_POWER_CNTL*/ 0, /*TPL1_DBG_ECO_CNTL*/ 0x01008000, /*GRAS_DBG_ECO_CNTL*/ 0, /*SP_CHICKEN_BITS*/ 0x00000400,
      /*UCHE_CLIENT_PF*/ 0x00000004, /*PC_MODE_CNTL*/ 0x1f, /*SP_DBG_ECO_CNTL*/ 0x01000000, /*RB_DBG_ECO_CNTL*/ 0x04100000,
      /*RB_DBG_ECO_CNTL_blit*/ 0x04100000, /*HLSQ_DBG_ECO_CNTL*/ 0, /*RB_UNKNOWN_8E01*/ 0, /*VPC_DBG_ECO_CNTL*/ 0x02000000,

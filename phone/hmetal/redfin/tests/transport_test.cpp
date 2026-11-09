@@ -66,6 +66,8 @@ TEST(transport_opens_and_answers_the_chip) {
     CHECK_EQ(v, 0ull);
     CHECK_EQ(r.gpu->param(kParamHighestBankBit, &v), 0);
     CHECK_EQ(v, 14ull);
+    CHECK(r.gpu->ubwc().fromDriver && r.gpu->ubwc().highestBankBit == 14);   // (redfin) DeviceInfo's, through the transport
+    CHECK_EQ(r.gpu->ubwc().macrotileMode, FakeGpu::defaultChip()->macrotileMode);
     CHECK_EQ(r.gpu->param(0x55, &v), EINVAL);   // an unknown param: EINVAL as hakios's kernel
 }
 

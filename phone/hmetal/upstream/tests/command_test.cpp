@@ -66,11 +66,13 @@ TEST(gpu_params) {
     CHECK_EQ(r.gpu->param(kParamPriorities, &v), 0);
     CHECK_EQ(v, 1ull);
     CHECK_EQ(r.gpu->param(kParamHighestBankBit, &v), 0);
-    CHECK_EQ(v, 14ull);
+    CHECK_EQ(v, 14ull);                                     // both chips' kernels (A620: xnu 0904)
     CHECK_EQ(r.gpu->param(kParamUbwcSwizzle, &v), 0);
     CHECK_EQ(v, 6ull);
     CHECK_EQ(r.gpu->param(kParamMacrotileMode, &v), 0);
-    CHECK_EQ(v, 1ull);
+    CHECK_EQ(v, uint64_t(FakeGpu::defaultChip()->macrotileMode));   // (redfin) A635 1, A620 0
+    CHECK_EQ(r.gpu->ubwc().highestBankBit, 14u);
+    CHECK(r.gpu->ubwc().fromDriver);
     CHECK_EQ(r.gpu->param(0x0e, &v), EINVAL);               // VA_START: "addresses are ours to give"
     CHECK_EQ(r.gpu->param(0x0f, &v), EINVAL);               // VA_SIZE
     CHECK_EQ(r.gpu->param(0x99, &v), EINVAL);

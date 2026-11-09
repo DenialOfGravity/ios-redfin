@@ -269,6 +269,14 @@ EDITS = [
     (PICK_RESET_OLD, PICK_RESET_NEW),
     (LINK_OLD, LINK_NEW),
     (DRAW_OLD, DRAW_NEW),
+    # (hmvar) the UBWC words beside the device's line, as hakios-metal took them at open
+    ('\t_name = [[NSString alloc] initWithFormat:@"Adreno (hakios-metal, chip %#llx)", (unsigned long long)hakios_metal_gpu_id(_gpu)];\n',
+     '\t_name = [[NSString alloc] initWithFormat:@"Adreno (hakios-metal, chip %#llx)", (unsigned long long)hakios_metal_gpu_id(_gpu)];\n'
+     '\t{   /* (redfin hmvar) */\n'
+     '\t\tunsigned hbb = 0, swz = 0, mt = 0;\n'
+     '\t\tconst int said = hakios_metal_ubwc(_gpu, &hbb, &swz, &mt);\n'
+     '\t\thm_print("UBWC: highest bank bit %u, swizzle levels %#x, macrotile %u (%s)\\n", hbb, swz, mt, said ? "the kernel\'s" : "the chip table\'s: the kernel did not say");\n'
+     '\t}\n'),
     (DRAW_OLD2, DRAW_NEW2),
 ]
 
