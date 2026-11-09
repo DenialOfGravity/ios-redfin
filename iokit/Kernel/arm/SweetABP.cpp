@@ -51,6 +51,7 @@ extern "C" {
 #include <sys/proc.h>
 #include <sys/errno.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 void SweetABPStart(void);
 int SweetABPPublish(bool on, const char *why);
 int SweetABPPublished(void);
@@ -58,10 +59,12 @@ int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len
 int SweetABPStats(char *buf, size_t len);
 void SweetABPSetBootstage(uint32_t stage);
 void SweetABPMessage(uint32_t code);
+void SweetABPBasebandMessage(uint32_t code);
 bool SweetABPIs(const void *entry);
 void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
 extern uint32_t sweet_abp_bootstage;
 extern uint32_t sweet_abp_flags;
+extern uint32_t sweet_abp_readyms;
 }
 
 /* 1063: sweetabp bits read here (bsd/dev/sweet_abp.c has the full list) */
@@ -397,6 +400,26 @@ static uint64_t abb_manager_state;
 static uint64_t abb_baseband_state;
 static uint32_t abb_calls[0x40];
 
+/*
+ * 1064: AppleBaseband reset state + reset-detect messages (Claude 2026-11-09).
+ * ABM's ResetDetection polls "get reset" (sel 0x03) and listens for general-interest messages on AppleBaseband
+ * (libTelephonyBaseband _TelephonyBasebandResetCallback -> ABM ResetDetection::resetDetectCallback):
+ *   0xe3ff8000 = baseband reset detected (blocks added with reset=1, e.g. 'Baseband Crash Recovery'),
+ *   0xe3ff8001 = baseband alive (blocks added with reset=0, e.g. 'Wait for Ready on Fake Boot').
+ * With the fake boot, "Wait for Ready on Fake Boot" was satisfied by the first poll, so ABM's boot finished ~30 ms after
+ * the manager started, often BEFORE ipc.mod / radio.mod registered for EventBasebandBootStateChange: they never saw
+ * "booted", the QMI transport was never engaged (no "Engaging"), boot.mod hit its 30 s start timeout and CommCenter
+ * never opened the pipes (P2 runs: about half of all CommCenter starts).
+ * kern.sweet_abp_readyms = N > 0: when ABM starts (AppleBaseband sel 0x16 manager state 1) the baseband reads as "in
+ * reset" for N ms, then comes out of reset with the 0xe3ff8001 message, like a real modem finishing its boot.
+ * 0 (default) = the old behaviour (never in reset). kern.sweet_abp_bbmsg sends one message by hand (see sweet_abp.c).
+ */
+static volatile uint32_t abb_in_reset;
+static thread_call_t abb_ready_tc;
+static uint32_t abb_readies;
+
+static void abb_ready_fire(thread_call_param_t, thread_call_param_t);
+
 class AppleBasebandUserClient : public IOUserClient
 {
 	OSDeclareDefaultStructors(AppleBasebandUserClient);
@@ -433,7 +456,9 @@ AppleBasebandUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		has_out = false;
 		break;
 	}
-	case 0x03:      /* get reset: not in reset */
+	case 0x03:      /* get reset: 1064 in reset while kern.sweet_abp_readyms runs, else not */
+		out = abb_in_reset;
+		break;
 	case 0x12:      /* get reset request: none */
 	case 0x11:      /* get EFS erase done */
 	case 0x1c:      /* get property */
@@ -447,6 +472,20 @@ AppleBasebandUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case 0x16:
 		abb_manager_state = in0;
 		has_out = false;
+		if (in0 == 1 && sweet_abp_readyms > 0) {
+			/* 1064: ABM starting: the baseband is "in reset" for readyms, then alive */
+			uint32_t ms = sweet_abp_readyms > 30000 ? 30000 : sweet_abp_readyms;
+			if (abb_ready_tc == NULL) {
+				abb_ready_tc = thread_call_allocate(abb_ready_fire, NULL);
+			}
+			if (abb_ready_tc != NULL) {
+				uint64_t deadline;
+				abb_in_reset = 1;
+				clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+				thread_call_enter_delayed(abb_ready_tc, deadline);
+				IOLog("SWEET ABP: ABM starting: baseband in reset for %u ms (kern.sweet_abp_readyms)\n", ms);
+			}
+		}
 		break;
 	case 0x17:
 		out = abb_manager_state;
@@ -1179,6 +1218,45 @@ SweetABPMessage(uint32_t code)
 	}
 }
 
+/* 1064: a general-interest message to AppleBaseband's clients (ABM ResetDetection); tracks the reset state it implies */
+void
+SweetABPBasebandMessage(uint32_t code)
+{
+	IOService *bb = NULL;
+	if (!abp_started) {
+		return;
+	}
+	if (code == 0xe3ff8000u) {
+		abb_in_reset = 1;
+	} else if (code == 0xe3ff8001u) {
+		abb_in_reset = 0;
+	}
+	IOLockLock(abp_svc_lock);
+	for (unsigned i = 0; i < abp_nservices; i++) {
+		if (OSDynamicCast(AppleBaseband, abp_services[i])) {
+			bb = abp_services[i];
+			bb->retain();
+			break;
+		}
+	}
+	IOLockUnlock(abp_svc_lock);
+	if (bb) {
+		IOReturn r = bb->messageClients(code, NULL, 0);
+		IOLog("SWEET ABP: message 0x%x to AppleBaseband clients -> 0x%x (in reset %u)\n", code, r, abb_in_reset);
+		bb->release();
+	} else {
+		IOLog("SWEET ABP: message 0x%x: AppleBaseband not published\n", code);
+	}
+}
+
+static void
+abb_ready_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	abb_readies++;
+	IOLog("SWEET ABP: baseband out of reset (#%u): alive message\n", abb_readies);
+	SweetABPBasebandMessage(0xe3ff8001u);
+}
+
 bool
 SweetABPIs(const void *entry)
 {
@@ -1194,9 +1272,9 @@ int
 SweetABPStats(char *buf, size_t len)
 {
 	size_t o = 0;
-	o += snprintf(buf + o, len - o, "%s (%u services, published %u x, un-published %u x) | bootstage %u mgr %llu bb %llu",
+	o += snprintf(buf + o, len - o, "%s (%u services, published %u x, un-published %u x) | bootstage %u mgr %llu bb %llu reset %u readyms %u readies %u",
 	    abp_nservices ? "published" : "NOT published", abp_nservices, abp_publishes, abp_unpublishes, sweet_abp_bootstage,
-	    abb_manager_state, abb_baseband_state);
+	    abb_manager_state, abb_baseband_state, abb_in_reset, sweet_abp_readyms, abb_readies);
 	for (unsigned i = 0; i < ABP_NPIPES && o < len; i++) {
 		abp_pipe *pp = &abp_pipes[i];
 		if (pp->lock == NULL) {

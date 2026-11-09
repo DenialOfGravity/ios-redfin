@@ -73,6 +73,8 @@ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint3
 extern int SweetABPStats(char *buf, size_t len);
 extern void SweetABPSetBootstage(uint32_t stage);
 extern void SweetABPMessage(uint32_t code);
+extern void SweetABPBasebandMessage(uint32_t code);
+uint32_t sweet_abp_readyms;     /* 1064: ms the baseband stays "in reset" after ABM starts (0 = never; SweetABP.cpp) */
 extern int SweetABPPublish(bool on, const char *why);
 extern int SweetABPPublished(void);
 
@@ -615,6 +617,40 @@ sysctl_abp_msg(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused i
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_msg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_msg, "I",
     "redfin 1061: write N = general-interest message N to AppleBasebandPCIControl's clients (experiments)");
+
+/* 1064 */
+static int
+sysctl_abp_readyms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = (int)sweet_abp_readyms, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (e == 0 && changed) {
+		sweet_abp_readyms = v < 0 ? 0 : (uint32_t)v;
+		printf("SWEET ABP: readyms = %u\n", sweet_abp_readyms);
+	}
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_readyms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_readyms, "I",
+    "redfin 1064: ms AppleBaseband reads as in reset after ABM starts, then 'alive' (0 = never in reset, the 1061 behaviour)");
+
+static int
+sysctl_abp_bbmsg(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = 0, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (e == 0 && changed) {
+		uint32_t code = (uint32_t)v;
+		if (v == 1) {
+			code = 0xe3ff8000u;     /* reset detected */
+		} else if (v == 2) {
+			code = 0xe3ff8001u;     /* alive */
+		}
+		SweetABPBasebandMessage(code);
+	}
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_bbmsg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_bbmsg, "I",
+    "redfin 1064: write 1 = 'reset detected' (0xe3ff8000), 2 = 'alive' (0xe3ff8001), other N = message N to AppleBaseband's clients");
 
 static int
 sysctl_abp_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
