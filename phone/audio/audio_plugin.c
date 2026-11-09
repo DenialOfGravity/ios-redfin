@@ -881,6 +881,8 @@ codec_read(int16_t *samples, UInt32 frames)
 
 static void actuator_start(void);
 static void actuator_stop(void);
+static void speaker_tune_start(void);
+static void speaker_tune_stop(void);
 
 static OSStatus
 start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
@@ -897,6 +899,9 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		if (d->output != 0) {
 			written = refused = 0;
 			say("redwood: audio: playing\n");
+			if (d->object == OBJECT_SPEAKER) {
+				speaker_tune_start();
+			}
 		}
 		if (d->object == OBJECT_CODEC) {
 			codec_open();
@@ -927,6 +932,9 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		} else if (d->output != 0) {
 			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
 			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
+			if (d->object == OBJECT_SPEAKER) {
+				speaker_tune_stop();
+			}
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -1183,6 +1191,188 @@ actuator_write(int16_t *samples, UInt32 frames, UInt64 when)
 	}
 }
 
+/*
+ * The speaker's tuning switches (ws-speaker-tune; userland, no image). Read from SPEAKER_TUNE_FILE at
+ * each start of the speaker's I/O: words KEY=VALUE, any order; a missing file or key = the old path
+ * (nothing changed). What each run wrote is measured either way and said at its end, one line:
+ * "speaker run S s: peak L/R, full-scale samples, DC L/R, tune ...".
+ *
+ *   prefill=MS   MS ms (0..200) of silence written ahead of the first block: the kernel's feeder
+ *                (sweet_sound.c period_fill) pads a period it cannot fill from the ring with zeros
+ *                in the middle of the sound, so a ring that starts empty gives gaps (clicks) until
+ *                it has a block of slack; this gives it the slack at once (costs MS of latency)
+ *   atten=DB     DB dB (0..30) of digital attenuation: headroom before the kernel's guard gain
+ *                (sndgain, default +12 dB) and its peak limiter
+ *   hpf=HZ       a further 4th-order high-pass (two Butterworth biquads) at HZ (0 = off, 100..1000):
+ *                less cone excursion than the guard's 2nd-order 200 Hz one
+ *   swap=1       left and right exchanged (iOS L -> slot 0 -> 0x40, the top/earpiece amp; R -> 0x41,
+ *                the bottom speaker)
+ *   mix=stereo|mono|bottom|top   both channels as they are, (L+R)/2 to both, or one speaker only
+ *                (after swap)
+ */
+#define SPEAKER_TUNE_FILE       "/private/var/local/speaker-tune"
+#define TUNE_MIX_STEREO         0
+#define TUNE_MIX_MONO           1
+#define TUNE_MIX_BOTTOM         2
+#define TUNE_MIX_TOP            3
+
+static struct {
+	Boolean active;                 /* anything to do to the samples */
+	unsigned prefill_ms, atten_db, hpf_hz, swap, mix;
+	float gain;
+	double b0, b1, b2, a1, a2;      /* the high-pass biquad (both stages the same) */
+	double z[2][2][2];              /* [stage][channel][state] */
+} tune;
+
+static struct {
+	UInt64 frames, full_scale, clipped_after;
+	int peak[2], peak_after;
+	int64_t sum[2];
+} sr;
+
+static unsigned
+tune_number(const char *text, const char *key, unsigned fallback, unsigned top)
+{
+	const char *at = strstr(text, key);
+	unsigned v = 0;
+	Boolean any = false;
+
+	if (at == NULL) {
+		return fallback;
+	}
+	for (at += strlen(key); *at >= '0' && *at <= '9'; at++) {
+		v = v * 10 + (unsigned)(*at - '0');
+		any = true;
+		if (v > 100000) {
+			break;
+		}
+	}
+	return !any ? fallback : v > top ? top : v;
+}
+
+static void
+speaker_tune_start(void)
+{
+	char text[256] = "";
+	int f = open(SPEAKER_TUNE_FILE, O_RDONLY);
+
+	if (f >= 0) {
+		ssize_t n = read(f, text, sizeof(text) - 1);
+
+		text[n > 0 ? n : 0] = 0;
+		close(f);
+	}
+	memset(&tune, 0, sizeof(tune));
+	memset(&sr, 0, sizeof(sr));
+	tune.prefill_ms = tune_number(text, "prefill=", 0, 200);
+	tune.atten_db = tune_number(text, "atten=", 0, 30);
+	tune.hpf_hz = tune_number(text, "hpf=", 0, 1000);
+	if (tune.hpf_hz != 0 && tune.hpf_hz < 100) {
+		tune.hpf_hz = 100;
+	}
+	tune.swap = tune_number(text, "swap=", 0, 1);
+	tune.mix = strstr(text, "mix=mono") ? TUNE_MIX_MONO : strstr(text, "mix=bottom") ? TUNE_MIX_BOTTOM :
+	    strstr(text, "mix=top") ? TUNE_MIX_TOP : TUNE_MIX_STEREO;
+	tune.gain = (float)pow(10.0, -(double)tune.atten_db / 20.0);
+	if (tune.hpf_hz != 0) {
+		/* RBJ high-pass, Q = 1/sqrt(2) */
+		double w = 2.0 * M_PI * tune.hpf_hz / REDWOOD_AUDIO_RATE, c = cos(w), al = sin(w) / (2.0 * M_SQRT1_2), a0 = 1.0 + al;
+
+		tune.b0 = (1.0 + c) / 2.0 / a0;
+		tune.b1 = -(1.0 + c) / a0;
+		tune.b2 = (1.0 + c) / 2.0 / a0;
+		tune.a1 = -2.0 * c / a0;
+		tune.a2 = (1.0 - al) / a0;
+	}
+	tune.active = tune.atten_db != 0 || tune.hpf_hz != 0 || tune.swap != 0 || tune.mix != TUNE_MIX_STEREO;
+	if (tune.prefill_ms != 0 && sink >= 0) {
+		static int16_t zeros[2 * 9600];         /* 200 ms */
+		size_t bytes = (size_t)(REDWOOD_AUDIO_RATE / 1000 * tune.prefill_ms) * REDWOOD_AUDIO_FRAME;
+
+		(void)write(sink, zeros, bytes);
+	}
+	if (text[0] != 0) {
+		say("redwood: audio: speaker tune: prefill %u ms, atten %u dB, hpf %u Hz, swap %u, mix %u\n", tune.prefill_ms,
+		    tune.atten_db, tune.hpf_hz, tune.swap, tune.mix);
+	}
+}
+
+static void
+speaker_tune_stop(void)
+{
+	UInt64 n = sr.frames != 0 ? sr.frames : 1;
+
+	if (!tune.active) {
+		sr.peak_after = sr.peak[0] > sr.peak[1] ? sr.peak[0] : sr.peak[1];
+	}
+	say("redwood: audio: speaker run %llu.%02llu s: in peak %d/%d, full-scale %llu, DC %lld/%lld; out peak %d, "
+	    "clipped %llu (prefill %u, atten %u, hpf %u, swap %u, mix %u)\n", sr.frames / REDWOOD_AUDIO_RATE,
+	    sr.frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, sr.peak[0], sr.peak[1], sr.full_scale,
+	    (long long)(sr.sum[0] / (int64_t)n), (long long)(sr.sum[1] / (int64_t)n), sr.peak_after, sr.clipped_after,
+	    tune.prefill_ms, tune.atten_db, tune.hpf_hz, tune.swap, tune.mix);
+}
+
+/* On the I/O thread: measured always; changed only by what SPEAKER_TUNE_FILE turned on. */
+static void
+speaker_tune(int16_t *samples, UInt32 frames)
+{
+	for (UInt32 i = 0; i < frames; i++) {
+		for (unsigned c = 0; c < 2; c++) {
+			int v = samples[2 * i + c];
+
+			sr.sum[c] += v;
+			v = v < 0 ? -v : v;
+			sr.peak[c] = v > sr.peak[c] ? v : sr.peak[c];
+			sr.full_scale += v >= 32767;
+		}
+	}
+	sr.frames += frames;
+	if (!tune.active) {
+		return;
+	}
+	for (UInt32 i = 0; i < frames; i++) {
+		double x[2] = { samples[2 * i] * (double)tune.gain, samples[2 * i + 1] * (double)tune.gain };
+
+		if (tune.hpf_hz != 0) {
+			for (unsigned st = 0; st < 2; st++) {
+				for (unsigned c = 0; c < 2; c++) {
+					double *z = tune.z[st][c], y = tune.b0 * x[c] + z[0];
+
+					z[0] = tune.b1 * x[c] - tune.a1 * y + z[1];
+					z[1] = tune.b2 * x[c] - tune.a2 * y;
+					x[c] = y;
+				}
+			}
+		}
+		if (tune.swap) {
+			double t = x[0];
+
+			x[0] = x[1];
+			x[1] = t;
+		}
+		/* channel 0 = the top/earpiece amp (0x40), 1 = the bottom speaker (0x41) */
+		if (tune.mix == TUNE_MIX_MONO) {
+			x[0] = x[1] = (x[0] + x[1]) * 0.5;
+		} else if (tune.mix == TUNE_MIX_BOTTOM) {
+			x[0] = 0;
+		} else if (tune.mix == TUNE_MIX_TOP) {
+			x[1] = 0;
+		}
+		for (unsigned c = 0; c < 2; c++) {
+			long v = lrint(x[c]);
+			int a;
+
+			if (v > 32767 || v < -32768) {
+				sr.clipped_after++;
+				v = v > 32767 ? 32767 : -32768;
+			}
+			samples[2 * i + c] = (int16_t)v;
+			a = v < 0 ? (int)-v : (int)v;
+			sr.peak_after = a > sr.peak_after ? a : sr.peak_after;
+		}
+	}
+}
+
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
     __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
@@ -1201,6 +1391,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames, io_host_time(cycle));
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+		speaker_tune(buffer, frames);
 		speaker_note(buffer, frames, io_host_time(cycle));
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
