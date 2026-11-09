@@ -72,6 +72,10 @@ static unsigned ss_dom;	/* domain=N (default 0 = CS only) */
 static int dp_mux = 1, dp_iface = 1;
 static int qmapv5;		/* qmapv5=1 (Claude 2026-11-08): WDA UL/DL aggregation protocol 9 (QMAPV5) instead of 5 */
 static int stats_s;			/* wdsstats=N (Claude 2026-11-08): WDS Get Packet Statistics every N s while the call is held */
+static int dorm_s;			/* wdsdorm=N (Claude 2026-11-09): WDS Get Dormancy Status 0x30 every N s while the call is held: 1 =
+				 * dormant, 2 = not dormant.  Packets that really reach the air leave dormancy for a few seconds;
+				 * packets the modem drops internally never do.  Logged only on a change. */
+static uint64_t dorm_next;
 static uint64_t stats_next;	/* dpmux= / dpiface= in cell.on (Claude 2026-11-08), default 1 */
 static int enabled, opts, allowed, step = -1, done_once[NSTEPS], fails[NSTEPS], timeouts;
 static uint64_t allow_ms, first_poll, next_send;
@@ -770,6 +774,9 @@ static int read_opts(void)
 		stats_s = (w = strstr(b, "wdsstats=")) ? atoi(w + 9) : 0;
 		if (stats_s < 0)
 			stats_s = 0;
+		dorm_s = (w = strstr(b, "wdsdorm=")) ? atoi(w + 8) : 0;
+		if (dorm_s < 0)
+			dorm_s = 0;
 	}
 	rd_fam = strstr(b, "ipfam=6") ? 6 : 4;
 	if (strstr(b, "datatest=1"))
@@ -1463,6 +1470,8 @@ static int x1_send_svc(int svc, uint16_t id)
 			qmi_tlv_u8(q, 0x31, (uint8_t)wds_default);
 	} else if (id == 0x2d)
 		qmi_tlv_u32(q, 0x10, X1_MASK);
+	else if (id == 0x30)
+		;				/* Get Dormancy Status: no input TLVs */
 	else if (id == 0x24)
 		qmi_tlv_u32(q, 0x01, 0x0cff);	/* tx/rx ok, err, overflow, bytes ok, tx/rx dropped (libqmi wds Get Packet Statistics) */
 	else
@@ -1713,6 +1722,21 @@ static void x1_answer(const struct qmi_msg *m)
 			}
 		}
 		printf("[%6llu] cell: wds stats%s\n", (unsigned long long)now, line);
+	} else if (m->id == 0x30) {
+		static int last = -1;
+		static unsigned n_dormant, n_active;
+		uint16_t l;
+		const uint8_t *p = qmi_get(m, 0x01, &l);
+		int v = (!e && p && l >= 1) ? p[0] : -2;
+		x1_state = X1_WAIT;
+		if (v == 1)
+			n_dormant++;
+		else if (v == 2)
+			n_active++;
+		if (v != last || (n_dormant + n_active) % 12 == 0)
+			printf("[%6llu] cell: wds dormancy %s (err%#x) dormant %u active %u polls\n", (unsigned long long)now,
+			       v == 1 ? "DORMANT" : v == 2 ? "ACTIVE (RRC connected: traffic on the air)" : "?", e, n_dormant, n_active);
+		last = v;
 	} else if (m->id == 0x2d) {
 		x1_state = X1_WAIT;
 		if (e)
@@ -1787,7 +1811,7 @@ static int x1_poll(uint64_t now)
 			x1_state = X1_DONE;
 			x1_late = 1;	/* x1_txn kept: a late handle is still stopped */
 			snprintf(x1_res, sizeof(x1_res), "start-noanswer");
-		} else if (x1_id == 0x2d || x1_id == 0x24) {
+		} else if (x1_id == 0x2d || x1_id == 0x24 || x1_id == 0x30) {
 			x1_state = X1_WAIT;
 			x1_txn = 0;
 		} else {
@@ -1804,6 +1828,14 @@ static int x1_poll(uint64_t now)
 	if (x1_state == X1_UP) {
 		x1_state = X1_SET;
 		if (!x1_send(0x2d))
+			return 1;
+		x1_state = X1_WAIT;
+		return 0;
+	}
+	if (x1_state == X1_WAIT && dorm_s && now >= dorm_next) {
+		dorm_next = now + 1000ull * (unsigned)dorm_s;
+		x1_state = X1_SET;
+		if (!x1_send(0x30))
 			return 1;
 		x1_state = X1_WAIT;
 		return 0;

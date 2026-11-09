@@ -39,7 +39,7 @@ static int word_int(const char *key, int def)
 #define PROBE_SPORT	40000		/* + probe index (TCP and UDP source ports) */
 
 static int pkt_mode = -1;
-static unsigned pkt_logged;
+static unsigned pkt_logged, rx_logged;
 
 static const char *ipstr(uint32_t a_be, char *b)		/* a_be: network order, 4 bytes as in the header */
 {
@@ -124,9 +124,10 @@ void ipaprobe_pkt(const char *dir, uint8_t mux, const uint8_t *ip, size_t n)
 		pm = probe_match(ip, n, proto, ihl);
 	if (pm)
 		LOG("probe REPLY: %s", pm);
-	if (!(pkt_mode >= 2 || (pkt_mode == 1 && is_rx)) || pkt_logged >= PKT_LOG_MAX)
+	if (!(pkt_mode >= 2 || (pkt_mode == 1 && is_rx)))
 		return;
-	pkt_logged++;
+	if (is_rx ? rx_logged++ >= PKT_LOG_MAX : pkt_logged++ >= PKT_LOG_MAX)	/* RX and TX capped separately */
+		return;
 	ipstr(*(const uint32_t *) (ip + 12), s);
 	ipstr(*(const uint32_t *) (ip + 16), t);
 	switch (proto) {
@@ -247,10 +248,13 @@ static size_t mk_dns(uint8_t *b, uint32_t src, uint32_t dst, unsigned idx, const
 	}
 }
 
-static size_t mk_syn(uint8_t *b, uint32_t src, uint32_t dst, unsigned idx, unsigned dport, unsigned id)
+/* TCP SYN; opts = 1: iOS-like 44-byte header (MSS, NOP, wscale, NOP, NOP, timestamps, SACK-permitted, EOL), which on
+ * 11-08 matched the modem's catch-all rule 524 (rt 1) like iOS's own SYNs; opts = 0: plain 24-byte header (MSS only),
+ * which matches the modem's TCP-SYN rule 515 (rt 3). */
+static size_t mk_syn(uint8_t *b, uint32_t src, uint32_t dst, unsigned idx, unsigned dport, unsigned id, int opts)
 {
 	uint8_t *l4 = b + 20;
-	size_t tl = 24;		/* 20 + MSS option */
+	size_t tl = opts ? 44 : 24;
 
 	memset(l4, 0, tl);
 	put16(l4 + 0, PROBE_SPORT + idx);
@@ -260,6 +264,16 @@ static size_t mk_syn(uint8_t *b, uint32_t src, uint32_t dst, unsigned idx, unsig
 	l4[13] = 0x02;		/* SYN */
 	put16(l4 + 14, 65535);
 	l4[20] = 2; l4[21] = 4; put16(l4 + 22, 1400);	/* MSS */
+	if (opts) {
+		l4[24] = 1;				/* NOP */
+		l4[25] = 3; l4[26] = 3; l4[27] = 6;	/* window scale 6 */
+		l4[28] = 1; l4[29] = 1;			/* NOP NOP */
+		l4[30] = 8; l4[31] = 10;		/* timestamps */
+		l4[32] = 0x5a; l4[33] = 0x5a; l4[34] = 0; l4[35] = (uint8_t) id;
+		l4[36] = l4[37] = l4[38] = l4[39] = 0;
+		l4[40] = 4; l4[41] = 2;			/* SACK permitted */
+		l4[42] = 0; l4[43] = 0;			/* EOL */
+	}
 	put16(l4 + 16, csum16(l4, tl, pseudo(src, dst, 6, tl)));
 	return ip_hdr(b, src, dst, 6, tl, id) + tl;
 }
@@ -300,7 +314,7 @@ void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *, siz
 	if (probe_mode < 0) {
 		probe_mode = word_int("p2probe=", 0);
 		if (probe_mode)
-			LOG("p2probe=%d: %s rounds of 7 test packets, 20 s apart, from the call's address", probe_mode,
+			LOG("p2probe=%d: %s rounds of 10 test packets, 20 s apart, from the call's address", probe_mode,
 			    probe_mode == 1 ? "6" : "endless");
 		probe_at = link_ms() + 5000;		/* first round 5 s after up */
 	}
@@ -330,9 +344,11 @@ void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *, siz
 	case 2: n = mk_dns(b, c->ip, c->dns1 ? c->dns1 : a4(8, 8, 8, 8), 2, "captive.apple.com", ipid++); what = "DNS A captive.apple.com -> dns1"; break;
 	case 3: n = mk_dns(b, c->ip, a4(8, 8, 8, 8), 3, "captive.apple.com", ipid++); what = "DNS A captive.apple.com -> 8.8.8.8"; break;
 	case 4: n = mk_dns(b, c->ip, a4(1, 1, 1, 1), 4, "one.one.one.one", ipid++); what = "DNS A one.one.one.one -> 1.1.1.1"; break;
-	case 5: n = mk_syn(b, c->ip, a4(1, 1, 1, 1), 5, 80, ipid++); what = "TCP SYN -> 1.1.1.1:80"; break;
-	case 6: n = mk_syn(b, c->ip, a4(1, 1, 1, 1), 6, 443, ipid++); what = "TCP SYN -> 1.1.1.1:443"; break;
-	case 7: n = mk_syn(b, c->ip, a4(8, 8, 8, 8), 7, 53, ipid++); what = "TCP SYN -> 8.8.8.8:53"; break;
+	case 5: n = mk_syn(b, c->ip, a4(1, 1, 1, 1), 5, 80, ipid++, 0); what = "TCP SYN -> 1.1.1.1:80"; break;
+	case 6: n = mk_syn(b, c->ip, a4(1, 1, 1, 1), 6, 443, ipid++, 0); what = "TCP SYN -> 1.1.1.1:443"; break;
+	case 7: n = mk_syn(b, c->ip, a4(8, 8, 8, 8), 7, 53, ipid++, 0); what = "TCP SYN -> 8.8.8.8:53"; break;
+	case 8: n = mk_syn(b, c->ip, a4(104, 18, 14, 92), 8, 443, ipid++, 1); what = "iOS-like SYN (44 B hdr) -> 104.18.14.92:443 (answered RST on 11-08)"; break;
+	case 9: n = mk_syn(b, c->ip, a4(104, 18, 14, 92), 9, 443, ipid++, 0); what = "plain SYN -> 104.18.14.92:443"; break;
 	}
 	if (n) {
 		if (send(b, n))
@@ -340,7 +356,7 @@ void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *, siz
 		else
 			LOG("probe %d sent: %s (%zu bytes)", probe_step, what, n);
 	}
-	if (++probe_step > 7) {
+	if (++probe_step > 9) {
 		probe_step = 0;
 		probe_at = link_ms() + 20000;
 		pend = 1;
