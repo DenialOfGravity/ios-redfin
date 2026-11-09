@@ -2612,6 +2612,7 @@ static int sweet_iolog_parsed;
 static uint32_t sweet_iolog_lines;
 /* redfin 0980: sweetbtlog=1 traces the Bluetooth daemons (instead of the default pair), up to 1000 lines */
 extern "C" int sweet_btlog_on(void);
+extern "C" uint32_t sweet_abp_flags;
 #define SWEET_BT_PROCS "bluetoothd,BlueTool,wirelessproxd,bluetoothuserd,BTLEServer"
 
 static bool
@@ -2624,9 +2625,13 @@ sweet_iolog(char *name, size_t len)
 		} else if (sweet_btlog_on()) {
 			strlcat(sweet_iolog_names, "," SWEET_BT_PROCS, sizeof(sweet_iolog_names));
 		}
+		/* redfin 1061: sweetabp & 4 also traces CommCenter (the AppleBasebandPCI stand-in), up to 1500 lines */
+		if (sweet_abp_flags & 4) {
+			strlcat(sweet_iolog_names, ",CommCenter", sizeof(sweet_iolog_names));
+		}
 		sweet_iolog_parsed = 1;
 	}
-	if (sweet_iolog_lines >= (sweet_btlog_on() ? 1000u : 400u)) {
+	if (sweet_iolog_lines >= (sweet_btlog_on() ? 1000u : (sweet_abp_flags & 4) ? 1500u : 400u)) {
 		return false;
 	}
 	proc_selfname(name, (int)len);
@@ -2663,11 +2668,23 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 /* redfin 0982: every property read from the sweetbtnub stand-in nubs (iokit/Kernel/arm/SweetBTNub.cpp) */
 extern "C" bool SweetBTNubIs(const void *entry);
-static uint32_t sweet_btnub_reads;
+extern "C" bool SweetABPIs(const void *entry);      /* 1061: the AppleBasebandPCI stand-ins (SweetABP.cpp) */
+static uint32_t sweet_btnub_reads, sweet_abp_reads;
 
 static void
 sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
 {
+	if (SweetABPIs(entry)) {
+		if (sweet_abp_reads++ < 400) {
+			char pn[32];
+			proc_selfname(pn, (int)sizeof(pn));
+			OSObject *av = key ? entry->copyProperty(key) : NULL;
+			IOLog("SWEET ABP: %s reads %s.%s (%s) -> %s\n", pn, entry->getName(), key ? key : "*", how,
+			    key ? (av ? "found" : "MISSING") : "all");
+			OSSafeReleaseNULL(av);
+		}
+		return;
+	}
 	if (!SweetBTNubIs(entry) || sweet_btnub_reads >= 500) {
 		return;
 	}

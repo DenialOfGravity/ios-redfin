@@ -2082,9 +2082,12 @@ SYSCTL_INT(_vm, OID_AUTO, shared_region_persistence, CTLFLAG_RW | CTLFLAG_LOCKED
  * ENOMEM	shared region is empty
  * EFAULT	bad address for "start_address"
  */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+extern void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
+#endif
 int
 shared_region_check_np(
-	__unused struct proc                    *p,
+	struct proc                             *p,
 	struct shared_region_check_np_args      *uap,
 	__unused int                            *retvalp)
 {
@@ -2153,6 +2156,12 @@ shared_region_check_np(
 					error = copyout(&start_address,
 					    (user_addr_t) uap->start_address,
 					    sizeof(start_address));
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+					if (error == 0) {
+						/* redfin 1061: ABM fake boot in CommCenter (sweetabp=2): bsd/dev/sweet_abp.c */
+						sweet_abp_dyld_hook(p, start_address);
+					}
+#endif
 					if (error != 0) {
 						SHARED_REGION_TRACE_ERROR(
 							("shared_region: %p [%d(%s)] "
