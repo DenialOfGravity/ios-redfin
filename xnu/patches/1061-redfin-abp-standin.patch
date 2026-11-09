@@ -1,0 +1,1569 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 9 Nov 2026 12:00:00 +0100
+Subject: [PATCH] 1061 redfin: AppleBasebandPCI stand-in, /dev/abpbridge, ABM
+ fake boot in CommCenter (sweetabp, default off)
+
+Boot-arg sweetabp (bitmask, default 0: nothing changes): 1 publishes stand-ins
+for Apple's baseband drivers (a "baseband" nub with the D22AP config,
+AppleBaseband, AppleBasebandPCIControl with bootstage, AppleBasebandPCIInterface
+qmux1/qmux2 with the AppleBasebandPCI user-client ABI: open/close/write/read
+sync+async/start/abort) and /dev/abpbridge, which hands every frame CommCenter
+writes to wland and completes CommCenter's reads with wland's frames. 2 (or
+sweetabmfake=1): in a process named CommCenter, shared_region_check_np()
+verifies the 10 instructions of capabilities::bb::abm::shouldBoot() in the
+shared cache and makes that one page a private copy-on-write copy where it
+returns 0 (cs_allow_invalid + VM_PROT_COPY, as a debugger does), so ABM takes
+its "Faking bootup" path. Sysctls kern.sweet_abp (add bits at run time),
+kern.sweet_abp_bootstage, kern.sweet_abp_msg, kern.sweet_abp_stats.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC32FNcvdmiSrHtBxEq
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 685ae15..69c7176 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -133,6 +133,7 @@ bsd/dev/sweet_charger.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_geniuart.c		standard
+ bsd/dev/sweet_btbridge.c		standard
++bsd/dev/sweet_abp.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_abp.c b/bsd/dev/sweet_abp.c
+new file mode 100644
+index 0000000..6f8a7c1
+--- /dev/null
++++ b/bsd/dev/sweet_abp.c
+@@ -0,0 +1,547 @@
++/*
++ * redfin 1061: AppleBasebandPCI stand-in, BSD half (the IOKit half is iokit/Kernel/arm/SweetABP.cpp).
++ *
++ * Boot-arg sweetabp (bitmask, default 0 = nothing at all):
++ *   1  publish the stand-in services (baseband nub, AppleBaseband, AppleBasebandPCIControl, the
++ *      AppleBasebandPCIInterface pipes qmux1/qmux2) and /dev/abpbridge;
++ *   2  "fake boot": in every process named CommCenter, capabilities::bb::abm::shouldBoot() (dyld shared
++ *      cache, libBasebandCapabilities) answers 0 instead of 1, so ABM takes its existing "Faking bootup"
++ *      path instead of pushing modem firmware over Sahara. Also enabled by boot-arg sweetabmfake=1.
++ * kern.sweet_abp can be written (root) to turn bits on at run time (never off).
++ *
++ * /dev/abpbridge (root, 0600, one opener): wland reads every frame CommCenter writes to a pipe and writes
++ * frames that complete CommCenter's reads on that pipe. Records, little-endian:
++ *     u16 magic 0xAB50 | u8 pipe (0 qmux1, 1 qmux2) | u8 type | u32 len | len bytes
++ *     type 0 DATA, 1 OPEN, 2 CLOSE, 3 START, 4 ABORT (1-4 only kernel -> wland; data = the selector's scalar)
++ * read() returns whole records only (as many as fit; EMSGSIZE if the first does not), blocks unless
++ * O_NONBLOCK; select() works. write() takes one or more whole DATA records. The kernel -> wland queue is a
++ * 256 KiB ring that also fills while nobody has the device open; when it is full, frames are dropped and
++ * counted (CommCenter's write still succeeds, like a modem that loses a frame). Nothing here blocks the
++ * kernel: CommCenter's writes never wait.
++ *
++ * The fake-boot patch (bit 2): from shared_region_check_np() (dyld asks for the shared cache address as
++ * one of the first things a process does), for a process named "CommCenter": compute the cache slide from
++ * the mapped cache header, read the 10 instructions of shouldBoot() at cache VA 0x1ae1df4a8 (iOS 16.7
++ * 20H392 iPhone10,3 cache) and compare them with the expected bytes (refuse and log on any difference),
++ * then do what a debugger does to set a breakpoint: cs_allow_invalid() (CS_DEBUGGED), a private
++ * copy-on-write copy of that one page (vm_protect VM_PROT_COPY), write "mov w0,#0" over "mov w0,#1",
++ * back to r-x, I-cache sync, read back. Only that process's map changes; no file is touched.
++ * Log lines "SWEET ABP:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/uio.h>
++#include <sys/select.h>
++#include <sys/sysctl.h>
++#include <sys/codesign.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <mach/vm_param.h>
++#include <mach/vm_attributes.h>
++#include <vm/vm_map.h>
++#include <libkern/libkern.h>
++
++void sweet_abp_init(void);
++void sweet_abp_c2w(unsigned pipe, unsigned type, const void *data, uint32_t len);
++void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
++
++/* SweetABP.cpp */
++extern void SweetABPStart(void);
++extern int SweetABPDeliver(unsigned pipe, const void *data, uint32_t len);
++extern int SweetABPStats(char *buf, size_t len);
++extern void SweetABPSetBootstage(uint32_t stage);
++extern void SweetABPMessage(uint32_t code);
++
++extern kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size,
++    vm_machine_attribute_t attribute, vm_machine_attribute_val_t *value);
++
++#define ABP_BIT_SERVICES        1u
++#define ABP_BIT_FAKEBOOT        2u
++#define ABPB_MAGIC              0xAB50
++#define ABPB_RING               (256u * 1024u)
++#define ABPB_MAXFRAME           65536u
++#define ABP_NPIPES              2u
++
++uint32_t sweet_abp_flags;
++uint32_t sweet_abp_bootstage = 2;       /* AppleBasebandPCIControl "bootstage": < 2 = "boot stage down" for ABM */
++
++struct abpb_hdr {
++	uint16_t magic;
++	uint8_t pipe;
++	uint8_t type;
++	uint32_t len;
++};
++
++static LCK_GRP_DECLARE(abp_grp, "sweet-abp");
++static LCK_MTX_DECLARE(abp_lock, &abp_grp);
++
++static struct {
++	uint8_t buf[ABPB_RING];
++	uint32_t head, tail;            /* head - tail = bytes present */
++	struct selinfo sel;
++	bool open;
++	bool node;
++	uint32_t records, dropped, dropped_bytes;
++	uint64_t to_wland, from_wland;
++} ab;
++
++/* ---- kernel -> wland ring ---- */
++
++static uint32_t
++ab_used(void)
++{
++	return ab.head - ab.tail;
++}
++
++static void
++ab_put(const void *src, uint32_t len)
++{
++	const uint8_t *s = src;
++	while (len) {
++		uint32_t off = ab.head % ABPB_RING;
++		uint32_t run = ABPB_RING - off;
++		if (run > len) {
++			run = len;
++		}
++		memcpy(ab.buf + off, s, run);
++		ab.head += run;
++		s += run;
++		len -= run;
++	}
++}
++
++static void
++ab_peek(void *dst, uint32_t at, uint32_t len)
++{
++	uint8_t *d = dst;
++	while (len) {
++		uint32_t off = at % ABPB_RING;
++		uint32_t run = ABPB_RING - off;
++		if (run > len) {
++			run = len;
++		}
++		memcpy(d, ab.buf + off, run);
++		at += run;
++		d += run;
++		len -= run;
++	}
++}
++
++/* CommCenter wrote a frame (or opened/closed/started/aborted a pipe): queue it for wland. Never blocks. */
++void
++sweet_abp_c2w(unsigned pipe, unsigned type, const void *data, uint32_t len)
++{
++	struct abpb_hdr h = { .magic = ABPB_MAGIC, .pipe = (uint8_t)pipe, .type = (uint8_t)type, .len = len };
++	if (len > ABPB_MAXFRAME) {
++		return;
++	}
++	lck_mtx_lock(&abp_lock);
++	if (ABPB_RING - ab_used() < sizeof(h) + len) {
++		if (ab.dropped++ < 20) {
++			printf("SWEET ABP: bridge queue full (%u bytes, wland %s): dropped a %u-byte frame of pipe %u\n",
++			    ab_used(), ab.open ? "open" : "not open", len, pipe);
++		}
++		ab.dropped_bytes += len;
++		lck_mtx_unlock(&abp_lock);
++		return;
++	}
++	ab_put(&h, sizeof(h));
++	if (len) {
++		ab_put(data, len);
++	}
++	ab.records++;
++	ab.to_wland += len;
++	wakeup(&ab);
++	selwakeup(&ab.sel);
++	lck_mtx_unlock(&abp_lock);
++}
++
++static int
++ab_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&abp_lock);
++	if (ab.open) {
++		lck_mtx_unlock(&abp_lock);
++		return EBUSY;
++	}
++	ab.open = true;
++	printf("SWEET ABP: /dev/abpbridge opened (%u bytes / %u records waiting)\n", ab_used(), ab.records);
++	lck_mtx_unlock(&abp_lock);
++	return 0;
++}
++
++static int
++ab_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&abp_lock);
++	ab.open = false;
++	wakeup(&ab);
++	selwakeup(&ab.sel);
++	lck_mtx_unlock(&abp_lock);
++	printf("SWEET ABP: /dev/abpbridge closed\n");
++	return 0;
++}
++
++static int
++ab_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	int e = 0, moved = 0;
++	uint8_t *tmp = NULL;
++	lck_mtx_lock(&abp_lock);
++	while (ab_used() == 0) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&abp_lock);
++			return EWOULDBLOCK;
++		}
++		e = msleep(&ab, &abp_lock, PZERO | PCATCH, "abpbrd", NULL);
++		if (e) {
++			lck_mtx_unlock(&abp_lock);
++			return e;
++		}
++	}
++	while (ab_used() >= sizeof(struct abpb_hdr)) {
++		struct abpb_hdr h;
++		ab_peek(&h, ab.tail, sizeof(h));
++		uint32_t rec = (uint32_t)sizeof(h) + h.len;
++		if (rec > uio_resid(uio)) {
++			if (moved == 0) {
++				e = EMSGSIZE;
++			}
++			break;
++		}
++		if (tmp == NULL) {
++			tmp = kalloc_data(sizeof(h) + ABPB_MAXFRAME, Z_WAITOK);
++			if (tmp == NULL) {
++				e = ENOMEM;
++				break;
++			}
++		}
++		ab_peek(tmp, ab.tail, rec);
++		ab.tail += rec;
++		ab.records--;
++		lck_mtx_unlock(&abp_lock);
++		e = uiomove((caddr_t)tmp, (int)rec, uio);
++		lck_mtx_lock(&abp_lock);
++		if (e) {
++			break;
++		}
++		moved++;
++	}
++	lck_mtx_unlock(&abp_lock);
++	if (tmp) {
++		kfree_data(tmp, sizeof(struct abpb_hdr) + ABPB_MAXFRAME);
++	}
++	return e;
++}
++
++static int
++ab_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	user_ssize_t n = uio_resid(uio);
++	if (n <= 0) {
++		return 0;
++	}
++	if (n > (user_ssize_t)(sizeof(struct abpb_hdr) + ABPB_MAXFRAME)) {
++		return EMSGSIZE;
++	}
++	uint32_t total = (uint32_t)n;
++	uint8_t *buf = kalloc_data(total, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	int e = uiomove((caddr_t)buf, (int)total, uio);
++	uint32_t off = 0;
++	while (e == 0 && off + sizeof(struct abpb_hdr) <= total) {
++		struct abpb_hdr h;
++		memcpy(&h, buf + off, sizeof(h));
++		if (h.magic != ABPB_MAGIC || h.len > total - off - sizeof(h) || h.pipe >= ABP_NPIPES) {
++			e = EINVAL;
++			break;
++		}
++		if (h.type == 0) {
++			int d = SweetABPDeliver(h.pipe, buf + off + sizeof(h), h.len);
++			if (d) {
++				e = d;
++				break;
++			}
++			lck_mtx_lock(&abp_lock);
++			ab.from_wland += h.len;
++			lck_mtx_unlock(&abp_lock);
++		}
++		off += (uint32_t)sizeof(h) + h.len;
++	}
++	if (e == 0 && off != total) {
++		e = EINVAL;
++	}
++	kfree_data(buf, total);
++	return e;
++}
++
++static int
++ab_select(__unused dev_t dev, int which, void *wql, proc_t p)
++{
++	int ready = 0;
++	lck_mtx_lock(&abp_lock);
++	if (which == FREAD) {
++		if (ab_used()) {
++			ready = 1;
++		} else {
++			selrecord(p, &ab.sel, wql);
++		}
++	} else if (which == FWRITE) {
++		ready = 1;
++	}
++	lck_mtx_unlock(&abp_lock);
++	return ready;
++}
++
++static const struct cdevsw ab_cdevsw = {
++	.d_open       = ab_open,
++	.d_close      = ab_close,
++	.d_read       = ab_read,
++	.d_write      = ab_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = ab_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static void
++sweet_abp_apply(uint32_t bits)
++{
++	sweet_abp_flags |= bits;
++	if (!(sweet_abp_flags & ABP_BIT_SERVICES) || ab.node) {
++		return;
++	}
++	ab.node = true;
++	int major = cdevsw_add(-1, &ab_cdevsw);
++	void *n = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "abpbridge");
++	printf("SWEET ABP: /dev/abpbridge %s (major %d)\n", n ? "ready" : "FAILED", major);
++	SweetABPStart();
++}
++
++void
++sweet_abp_init(void)
++{
++	uint32_t on = 0, fake = 0;
++	PE_parse_boot_argn("sweetabp", &on, sizeof(on));
++	PE_parse_boot_argn("sweetabmfake", &fake, sizeof(fake));
++	PE_parse_boot_argn("sweetabpstage", &sweet_abp_bootstage, sizeof(sweet_abp_bootstage));
++	if (fake) {
++		on |= ABP_BIT_FAKEBOOT;
++	}
++	if (!on) {
++		return;
++	}
++	printf("SWEET ABP: sweetabp=0x%x (services %s, fake boot %s), bootstage %u\n", on,
++	    (on & ABP_BIT_SERVICES) ? "on" : "off", (on & ABP_BIT_FAKEBOOT) ? "on" : "off", sweet_abp_bootstage);
++	sweet_abp_apply(on);
++}
++
++/* ---- fake boot: capabilities::bb::abm::shouldBoot() -> 0 in CommCenter ---- */
++
++#define ABM_SHOULDBOOT_VA       0x1ae1df4a8ULL          /* unslid cache VA, iOS 16.7 20H392 iPhone10,3 */
++#define ABM_PATCH_WORD          6                        /* 0x1ae1df4c0: mov w0, #0x1 */
++#define ABM_INSN_RET1           0x52800020u
++#define ABM_INSN_RET0           0x52800000u
++static const uint32_t abm_expect[10] = {
++	0xa9bf7bfd,     /* stp fp, lr, [sp, #-0x10]! */
++	0x910003fd,     /* mov fp, sp */
++	0xf019f5c8,     /* adrp x8, sOnce@page */
++	0xf9421908,     /* ldr x8, [x8, #0x430] */
++	0xb100051f,     /* cmn x8, #1 */
++	0x54000081,     /* b.ne +0x10 (dispatch_once) */
++	0x52800020,     /* mov w0, #1   <- becomes mov w0, #0 */
++	0xa8c17bfd,     /* ldp fp, lr, [sp], #0x10 */
++	0xd65f03c0,     /* ret */
++	0xf019f5c0,     /* adrp x0, sOnce@page */
++};
++
++static int abm_state;                   /* 0 never tried, 1 patched, 2 already patched, < 0 the step that failed */
++static int abm_pid;
++static uint32_t abm_count;
++
++static void
++abm_words(const char *what, const uint32_t *w)
++{
++	printf("SWEET ABP: fake boot: %s %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", what,
++	    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]);
++}
++
++void
++sweet_abp_dyld_hook(void *pv, uint64_t cache_start)
++{
++	proc_t p = (proc_t)pv;
++	char name[32];
++	if (!(sweet_abp_flags & ABP_BIT_FAKEBOOT) || cache_start == 0) {
++		return;
++	}
++	proc_selfname(name, (int)sizeof(name));
++	if (strcmp(name, "CommCenter") != 0) {
++		return;
++	}
++	int pid = proc_selfpid();
++	uint8_t hdr[0x20];
++	uint64_t map0 = 0;
++	uint32_t w[10], back = 0;
++	int st = 0;
++	kern_return_t kr = KERN_SUCCESS;
++	abm_count++;
++	if (copyin((user_addr_t)cache_start, hdr, sizeof(hdr)) || memcmp(hdr, "dyld_v1", 7) != 0) {
++		printf("SWEET ABP: fake boot: pid %d: no dyld cache header at 0x%llx: refused\n", pid, cache_start);
++		st = -1;
++		goto out;
++	}
++	uint32_t moff;
++	memcpy(&moff, hdr + 0x10, sizeof(moff));
++	if (moff < 0x18 || moff > 0x1000 || copyin((user_addr_t)(cache_start + moff), &map0, sizeof(map0))) {
++		printf("SWEET ABP: fake boot: pid %d: bad mapping offset 0x%x: refused\n", pid, moff);
++		st = -2;
++		goto out;
++	}
++	uint64_t slide = cache_start - map0;
++	uint64_t fn = ABM_SHOULDBOOT_VA + slide;
++	if (copyin((user_addr_t)fn, w, sizeof(w))) {
++		printf("SWEET ABP: fake boot: pid %d: cannot read shouldBoot at 0x%llx (slide 0x%llx): refused\n", pid, fn, slide);
++		st = -3;
++		goto out;
++	}
++	bool same = true;
++	for (int i = 0; i < 10; i++) {
++		if (w[i] != abm_expect[i] && !(i == ABM_PATCH_WORD && w[i] == ABM_INSN_RET0)) {
++			same = false;
++		}
++	}
++	if (!same) {
++		printf("SWEET ABP: fake boot: pid %d: shouldBoot at 0x%llx (cache 0x%llx, slide 0x%llx) differs: refused\n",
++		    pid, fn, cache_start, slide);
++		abm_words("found   ", w);
++		abm_words("expected", abm_expect);
++		st = -4;
++		goto out;
++	}
++	if (w[ABM_PATCH_WORD] == ABM_INSN_RET0) {
++		printf("SWEET ABP: fake boot: pid %d: shouldBoot at 0x%llx already returns 0\n", pid, fn);
++		st = 2;
++		goto out;
++	}
++	if (!cs_allow_invalid(p)) {
++		printf("SWEET ABP: fake boot: pid %d: cs_allow_invalid refused: refused\n", pid);
++		st = -5;
++		goto out;
++	}
++	vm_map_t map = current_map();
++	uint64_t pmask = (uint64_t)vm_map_page_mask(map);
++	uint64_t pg = (fn + 4 * ABM_PATCH_WORD) & ~pmask;
++	uint64_t pend = pg + pmask + 1;
++	kr = vm_map_protect(map, pg, pend, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, FALSE);
++	if (kr != KERN_SUCCESS) {
++		printf("SWEET ABP: fake boot: pid %d: vm_protect(COPY|rw) of 0x%llx failed (%d)\n", pid, pg, kr);
++		st = -6;
++		goto out;
++	}
++	uint32_t ret0 = ABM_INSN_RET0;
++	int ce = copyout(&ret0, (user_addr_t)(fn + 4 * ABM_PATCH_WORD), sizeof(ret0));
++	kr = vm_map_protect(map, pg, pend, VM_PROT_READ | VM_PROT_EXECUTE, FALSE);
++	if (ce || kr != KERN_SUCCESS) {
++		printf("SWEET ABP: fake boot: pid %d: write %d / vm_protect(r-x) %d failed\n", pid, ce, kr);
++		st = -7;
++		goto out;
++	}
++	vm_machine_attribute_val_t v = MATTR_VAL_CACHE_SYNC;
++	kr = mach_vm_machine_attribute(map, fn + 4 * ABM_PATCH_WORD, 4, MATTR_CACHE, &v);
++	if (copyin((user_addr_t)(fn + 4 * ABM_PATCH_WORD), &back, sizeof(back)) || back != ABM_INSN_RET0) {
++		printf("SWEET ABP: fake boot: pid %d: read-back 0x%08x: patch not in place\n", pid, back);
++		st = -8;
++		goto out;
++	}
++	printf("SWEET ABP: fake boot: pid %d CommCenter: shouldBoot() at 0x%llx (cache 0x%llx, slide 0x%llx) now returns 0 "
++	    "(word 0x%llx 0x%08x -> 0x%08x, private copy of page 0x%llx, cache sync %d, csflags 0x%llx)\n", pid, fn, cache_start,
++	    slide, fn + 4 * ABM_PATCH_WORD, ABM_INSN_RET1, back, pg, kr, (unsigned long long)proc_getcsflags(p));
++	st = 1;
++out:
++	abm_state = st;
++	abm_pid = pid;
++}
++
++/* ---- sysctls ---- */
++
++static int
++sysctl_abp(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = (int)sweet_abp_flags, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e == 0 && changed) {
++		if (proc_suser(req->p) != 0) {
++			return EPERM;
++		}
++		printf("SWEET ABP: kern.sweet_abp 0x%x -> adds 0x%x\n", sweet_abp_flags, (uint32_t)v);
++		sweet_abp_apply((uint32_t)v & (ABP_BIT_SERVICES | ABP_BIT_FAKEBOOT));
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_abp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp, "I",
++    "redfin 1061: AppleBasebandPCI stand-in (1 services + /dev/abpbridge, 2 fake ABM boot in CommCenter); only adds bits");
++
++static int
++sysctl_abp_stage(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = (int)sweet_abp_bootstage, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e == 0 && changed) {
++		sweet_abp_bootstage = (uint32_t)v;
++		SweetABPSetBootstage((uint32_t)v);
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_bootstage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_stage, "I",
++    "redfin 1061: AppleBasebandPCIControl bootstage property (ABM: < 2 = down)");
++
++static int
++sysctl_abp_msg(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = 0, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e == 0 && changed) {
++		SweetABPMessage((uint32_t)v);
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_msg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_msg, "I",
++    "redfin 1061: write N = general-interest message N to AppleBasebandPCIControl's clients (experiments)");
++
++static int
++sysctl_abp_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char *s = kalloc_data(1024, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	int n = SweetABPStats(s, 1024);
++	lck_mtx_lock(&abp_lock);
++	snprintf(s + n, 1024 - (size_t)n, " | bridge %s queued %u B/%u rec, dropped %u (%u B), to wland %llu B, from wland %llu B"
++	    " | fakeboot state %d pid %d calls %u", ab.open ? "open" : "closed", ab_used(), ab.records, ab.dropped,
++	    ab.dropped_bytes, ab.to_wland, ab.from_wland, abm_state, abm_pid, abm_count);
++	lck_mtx_unlock(&abp_lock);
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, 1024);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_stats, "A",
++    "redfin 1061: AppleBasebandPCI stand-in counters");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9e52e1a..e300261 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -76,6 +76,7 @@ extern void sweet_audio_init(void);
+ extern void redwood_adsp_init(void);
+ extern void sweet_geniuart_init(void);
+ extern void sweet_btbridge_init(void);
++extern void sweet_abp_init(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+@@ -884,6 +885,7 @@ sweet_ufs_init(void)
+ 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
+ 	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
+ 	sweet_btbridge_init();	/* /dev/cu.bluetooth etc. <-> btd (btbridge=1): bsd/dev/sweet_btbridge.c */
++	sweet_abp_init();	/* 1061: AppleBasebandPCI stand-in + /dev/abpbridge (sweetabp=1|2): bsd/dev/sweet_abp.c */
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index bb4a5d8..f49a9cc 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2082,9 +2082,12 @@ SYSCTL_INT(_vm, OID_AUTO, shared_region_persistence, CTLFLAG_RW | CTLFLAG_LOCKED
+  * ENOMEM	shared region is empty
+  * EFAULT	bad address for "start_address"
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
++#endif
+ int
+ shared_region_check_np(
+-	__unused struct proc                    *p,
++	struct proc                             *p,
+ 	struct shared_region_check_np_args      *uap,
+ 	__unused int                            *retvalp)
+ {
+@@ -2153,6 +2156,12 @@ shared_region_check_np(
+ 					error = copyout(&start_address,
+ 					    (user_addr_t) uap->start_address,
+ 					    sizeof(start_address));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++					if (error == 0) {
++						/* redfin 1061: ABM fake boot in CommCenter (sweetabp=2): bsd/dev/sweet_abp.c */
++						sweet_abp_dyld_hook(p, start_address);
++					}
++#endif
+ 					if (error != 0) {
+ 						SHARED_REGION_TRACE_ERROR(
+ 							("shared_region: %p [%d(%s)] "
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 5911cb0..02337af 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2663,11 +2663,23 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /* redfin 0982: every property read from the sweetbtnub stand-in nubs (iokit/Kernel/arm/SweetBTNub.cpp) */
+ extern "C" bool SweetBTNubIs(const void *entry);
+-static uint32_t sweet_btnub_reads;
++extern "C" bool SweetABPIs(const void *entry);      /* 1061: the AppleBasebandPCI stand-ins (SweetABP.cpp) */
++static uint32_t sweet_btnub_reads, sweet_abp_reads;
+ 
+ static void
+ sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
+ {
++	if (SweetABPIs(entry)) {
++		if (sweet_abp_reads++ < 400) {
++			char pn[32];
++			proc_selfname(pn, (int)sizeof(pn));
++			OSObject *av = key ? entry->copyProperty(key) : NULL;
++			IOLog("SWEET ABP: %s reads %s.%s (%s) -> %s\n", pn, entry->getName(), key ? key : "*", how,
++			    key ? (av ? "found" : "MISSING") : "all");
++			OSSafeReleaseNULL(av);
++		}
++		return;
++	}
+ 	if (!SweetBTNubIs(entry) || sweet_btnub_reads >= 500) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetABP.cpp b/iokit/Kernel/arm/SweetABP.cpp
+new file mode 100644
+index 0000000..0d9b23e
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetABP.cpp
+@@ -0,0 +1,884 @@
++/*
++ * redfin 1061: stand-ins for Apple's baseband IOKit drivers, so the real CommCenter (AppleBasebandManager runs
++ * inside it) finds a baseband. Published only with boot-arg sweetabp & 1 (bsd/dev/sweet_abp.c), under the
++ * platform expert:
++ *
++ *   "baseband" nub (SweetABPNub)          IOServiceNameMatching("baseband"): compatible "baseband,n41" and the
++ *                                         D22AP 40-byte `config` (timings in ms), as the iPhone X device tree
++ *                                         /baseband node (libTelephonyBasebandDynamic reads `config`).
++ *     AppleBaseband                       power/GPIO controller. User client type 0: sel 0xf self-identify
++ *                                         (struct 0x40), every scalar selector succeeds; reads report "not in
++ *                                         reset, PMU ext on, no reset request", manager/baseband state are
++ *                                         stored and read back (Get/Set 0x17/0x16, 0x1a/0x1b).
++ *   AppleBasebandPCIControl               `bootstage` = kern.sweet_abp_bootstage (default 2; ABM treats < 2 as
++ *                                         "boot stage down"). sel 0 open, 1 close, 2 readLogsAsync (held,
++ *                                         never completed: no logs), 3 loggerTune.
++ *     AppleBasebandPCIInterface x2        ABPInterfaceProtocol "qmux1" (pipe 0), "qmux2" (pipe 1). User client:
++ *                                         sel 0 open, 1 close, 2 write (sync struct / async {addr,len}),
++ *                                         3 read (sync struct, waits <= 2 s / async {addr,size}, completion
++ *                                         args {length}), 6/7 abort/start channel (completed at once),
++ *                                         anything else kIOReturnUnsupported.
++ *
++ * Frames CommCenter writes go to /dev/abpbridge (sweet_abp_c2w); frames wland writes there complete the
++ * pipe's oldest pending read or wait in a 64-frame queue (SweetABPDeliver). Every selector is logged the
++ * first times it is used, every property read from these services is logged (IOUserClient.cpp), and the
++ * first 64 frames per pipe and direction are logged with their first 24 bytes. "SWEET ABP:".
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSNumber.h>
++
++extern "C" {
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++void SweetABPStart(void);
++int SweetABPDeliver(unsigned pipe, const void *data, uint32_t len);
++int SweetABPStats(char *buf, size_t len);
++void SweetABPSetBootstage(uint32_t stage);
++void SweetABPMessage(uint32_t code);
++bool SweetABPIs(const void *entry);
++void sweet_abp_c2w(unsigned pipe, unsigned type, const void *data, uint32_t len);
++extern uint32_t sweet_abp_bootstage;
++}
++
++#define ABP_NPIPES      2u
++#define ABP_MAXREADS    8u
++#define ABP_RXQ         64u
++#define ABP_MAXFRAME    65536u
++#define ABP_LOGFRAMES   64u
++#define ABP_LOGLINES    600u
++
++enum { ABPB_DATA = 0, ABPB_OPEN = 1, ABPB_CLOSE = 2, ABPB_START = 3, ABPB_ABORT = 4 };
++
++static const char * const abp_pipe_names[ABP_NPIPES] = { "qmux1", "qmux2" };
++
++static uint32_t abp_lines;
++#define ABPLOG(fmt, ...) do { if (abp_lines < ABP_LOGLINES) { abp_lines++; IOLog("SWEET ABP: " fmt "\n", ##__VA_ARGS__); } } while (0)
++
++class AppleBasebandPCIUserClient;
++
++struct abp_read {
++	OSAsyncReference64 ref;
++	mach_vm_address_t addr;
++	uint32_t size;
++	task_t task;
++};
++
++struct abp_pipe {
++	IOLock *lock;
++	AppleBasebandPCIUserClient *uc;         /* the latest opener */
++	abp_read reads[ABP_MAXREADS];
++	uint32_t nreads;
++	struct {
++		uint8_t *buf;
++		uint32_t len;
++	} rxq[ABP_RXQ];
++	uint32_t rxh, rxn;
++	uint32_t sync_waiters;
++	uint64_t wr_frames, wr_bytes, rd_frames, rd_bytes;
++	uint32_t drops, truncs, opens;
++};
++
++static abp_pipe abp_pipes[ABP_NPIPES];
++static IOService *abp_services[6];
++static unsigned abp_nservices;
++static bool abp_started;
++
++static void
++abp_hex(char *out, size_t outlen, const uint8_t *p, uint32_t len)
++{
++	size_t o = 0;
++	for (uint32_t i = 0; i < len && o + 3 < outlen; i++) {
++		o += snprintf(out + o, outlen - o, "%02x", p[i]);
++	}
++	out[o < outlen ? o : outlen - 1] = 0;
++}
++
++static void
++abp_log_frame(unsigned pipe, const char *dir, const uint8_t *p, uint32_t len, uint64_t nth)
++{
++	if (nth >= ABP_LOGFRAMES) {
++		return;
++	}
++	char h[64];
++	abp_hex(h, sizeof(h), p, len < 24 ? len : 24);
++	ABPLOG("%s %s #%llu len %u: %s%s", abp_pipe_names[pipe], dir, nth, len, h, len > 24 ? "..." : "");
++}
++
++/* Copy a frame into a pending async read's user buffer and complete it (no locks held). */
++static void
++abp_complete_read(unsigned pipe, abp_read *rd, const uint8_t *data, uint32_t len)
++{
++	uint32_t n = len;
++	if (n > rd->size) {
++		abp_pipes[pipe].truncs++;
++		ABPLOG("%s: a %u-byte frame truncated to the read's %u bytes", abp_pipe_names[pipe], len, rd->size);
++		n = rd->size;
++	}
++	IOReturn r = kIOReturnSuccess;
++	if (n) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(rd->addr, n, kIODirectionIn, rd->task);
++		r = md ? md->prepare() : kIOReturnNoMemory;
++		if (r == kIOReturnSuccess) {
++			if (md->writeBytes(0, data, n) != n) {
++				r = kIOReturnVMError;
++			}
++			md->complete();
++		}
++		OSSafeReleaseNULL(md);
++	}
++	io_user_reference_t a[1] = { r == kIOReturnSuccess ? n : 0 };
++	IOReturn s = IOUserClient::sendAsyncResult64(rd->ref, r, a, 1);
++	IOUserClient::releaseAsyncReference64(rd->ref);
++	if (r != kIOReturnSuccess || s != kIOReturnSuccess) {
++		ABPLOG("%s: read completion copy 0x%x send 0x%x", abp_pipe_names[pipe], r, s);
++	}
++}
++
++/* Pending reads end without data (close, client died): aborted, or just released when the port is gone. */
++static void
++abp_flush_reads(unsigned pipe, bool send)
++{
++	abp_pipe *pp = &abp_pipes[pipe];
++	abp_read rs[ABP_MAXREADS];
++	IOLockLock(pp->lock);
++	uint32_t n = pp->nreads;
++	memcpy(rs, pp->reads, n * sizeof(rs[0]));
++	pp->nreads = 0;
++	IOLockUnlock(pp->lock);
++	for (uint32_t i = 0; i < n; i++) {
++		if (send) {
++			io_user_reference_t a[1] = { 0 };
++			IOUserClient::sendAsyncResult64(rs[i].ref, kIOReturnAborted, a, 1);
++		}
++		IOUserClient::releaseAsyncReference64(rs[i].ref);
++	}
++	if (n) {
++		ABPLOG("%s: %u pending read(s) %s", abp_pipe_names[pipe], n, send ? "aborted" : "dropped (client gone)");
++	}
++}
++
++int
++SweetABPDeliver(unsigned pipe, const void *data, uint32_t len)
++{
++	if (pipe >= ABP_NPIPES || !abp_started || len > ABP_MAXFRAME) {
++		return EINVAL;
++	}
++	abp_pipe *pp = &abp_pipes[pipe];
++	IOLockLock(pp->lock);
++	uint64_t nth = pp->rd_frames++;
++	pp->rd_bytes += len;
++	if (pp->nreads) {
++		abp_read rd = pp->reads[0];
++		pp->nreads--;
++		memmove(&pp->reads[0], &pp->reads[1], pp->nreads * sizeof(pp->reads[0]));
++		IOLockUnlock(pp->lock);
++		abp_log_frame(pipe, "<- wland (to a pending read)", (const uint8_t *)data, len, nth);
++		abp_complete_read(pipe, &rd, (const uint8_t *)data, len);
++		return 0;
++	}
++	if (pp->rxn >= ABP_RXQ) {
++		pp->drops++;
++		pp->rd_frames--;
++		pp->rd_bytes -= len;
++		IOLockUnlock(pp->lock);
++		ABPLOG("%s: no read pending and %u frames queued: wland frame of %u bytes refused", abp_pipe_names[pipe], ABP_RXQ, len);
++		return ENOSPC;
++	}
++	uint8_t *copy = (uint8_t *)IOMallocData(len ? len : 1);
++	if (copy == NULL) {
++		IOLockUnlock(pp->lock);
++		return ENOMEM;
++	}
++	memcpy(copy, data, len);
++	uint32_t slot = (pp->rxh + pp->rxn) % ABP_RXQ;
++	pp->rxq[slot].buf = copy;
++	pp->rxq[slot].len = len;
++	pp->rxn++;
++	if (pp->sync_waiters) {
++		IOLockWakeup(pp->lock, &pp->rxn, false);
++	}
++	IOLockUnlock(pp->lock);
++	abp_log_frame(pipe, "<- wland (queued)", (const uint8_t *)data, len, nth);
++	return 0;
++}
++
++/* Lock held. Takes the oldest queued frame; the caller frees it with IOFreeData(buf, len ? len : 1). */
++static bool
++abp_rx_pop(abp_pipe *pp, uint8_t **buf, uint32_t *len)
++{
++	if (pp->rxn == 0) {
++		return false;
++	}
++	*buf = pp->rxq[pp->rxh].buf;
++	*len = pp->rxq[pp->rxh].len;
++	pp->rxq[pp->rxh].buf = NULL;
++	pp->rxh = (pp->rxh + 1) % ABP_RXQ;
++	pp->rxn--;
++	return true;
++}
++
++/* Output structure (inband or descriptor) helpers. */
++static uint32_t
++abp_struct_in(IOExternalMethodArguments *args, uint8_t *dst, uint32_t max)
++{
++	if (args->structureInputDescriptor != NULL) {
++		uint32_t n = (uint32_t)args->structureInputDescriptor->getLength();
++		if (n > max) {
++			n = max;
++		}
++		return (uint32_t)args->structureInputDescriptor->readBytes(0, dst, n);
++	}
++	uint32_t n = args->structureInputSize;
++	if (n > max) {
++		n = max;
++	}
++	if (n && args->structureInput) {
++		memcpy(dst, args->structureInput, n);
++	}
++	return n;
++}
++
++static IOReturn
++abp_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		if (len > args->structureOutputDescriptor->getLength()) {
++			len = (uint32_t)args->structureOutputDescriptor->getLength();
++		}
++		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		args->structureOutputDescriptorSize = len;
++		return kIOReturnSuccess;
++	}
++	if (args->structureOutput == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (len > args->structureOutputSize) {
++		len = args->structureOutputSize;
++	}
++	memcpy(args->structureOutput, buf, len);
++	args->structureOutputSize = len;
++	return kIOReturnSuccess;
++}
++
++static void
++abp_log_call(const char *who, uint32_t selector, IOExternalMethodArguments *args, IOReturn r)
++{
++	char p[32];
++	proc_selfname(p, (int)sizeof(p));
++	ABPLOG("%s %s sel 0x%x%s in[%u]={0x%llx,0x%llx,0x%llx} struct %u out[%u] -> 0x%x", p, who, selector,
++	    args->asyncWakePort != MACH_PORT_NULL ? " (async)" : "", args->scalarInputCount,
++	    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL, args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++	    args->scalarInputCount > 2 ? args->scalarInput[2] : 0ULL,
++	    args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize,
++	    args->scalarOutputCount, r);
++}
++
++/* ---------------- services ---------------- */
++
++class SweetABPNub : public IOService
++{
++	OSDeclareDefaultStructors(SweetABPNub);
++};
++OSDefineMetaClassAndStructors(SweetABPNub, IOService);
++
++class AppleBaseband : public IOService
++{
++	OSDeclareDefaultStructors(AppleBaseband);
++};
++OSDefineMetaClassAndStructors(AppleBaseband, IOService);
++
++class AppleBasebandPCIControl : public IOService
++{
++	OSDeclareDefaultStructors(AppleBasebandPCIControl);
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIControl, IOService);
++
++class AppleBasebandPCIInterface : public IOService
++{
++	OSDeclareDefaultStructors(AppleBasebandPCIInterface);
++public:
++	unsigned fPipe;
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIInterface, IOService);
++
++/* ---------------- AppleBaseband user client ---------------- */
++
++static uint64_t abb_manager_state;
++static uint64_t abb_baseband_state;
++static uint32_t abb_calls[0x40];
++
++class AppleBasebandUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleBasebandUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBasebandUserClient, IOUserClient);
++
++IOReturn
++AppleBasebandUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBasebandUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	IOReturn r = kIOReturnSuccess;
++	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	uint64_t out = 0;
++	bool has_out = true;
++	switch (selector) {
++	case 0x0f: {    /* self-identify: struct in 0x40 */
++		uint8_t id[0x40];
++		bzero(id, sizeof(id));
++		uint32_t n = abp_struct_in(args, id, sizeof(id));
++		char h[100];
++		abp_hex(h, sizeof(h), id, n < 32 ? n : 32);
++		ABPLOG("AppleBaseband identify (%u bytes): %s", n, h);
++		has_out = false;
++		break;
++	}
++	case 0x03:      /* get reset: not in reset */
++	case 0x12:      /* get reset request: none */
++	case 0x11:      /* get EFS erase done */
++	case 0x1c:      /* get property */
++	case 0x2a:      /* coredump-ready status */
++		out = 0;
++		break;
++	case 0x0b:      /* PMU ext-on */
++	case 0x10:      /* diag ready */
++		out = 1;
++		break;
++	case 0x16:
++		abb_manager_state = in0;
++		has_out = false;
++		break;
++	case 0x17:
++		out = abb_manager_state;
++		break;
++	case 0x1b:
++		abb_baseband_state = in0;
++		has_out = false;
++		break;
++	case 0x1a:
++		out = abb_baseband_state;
++		break;
++	default:        /* reset, power on, powercycle, VBUS, mux, wake votes, ...: done */
++		out = 0;
++		break;
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = (i == 0 && has_out) ? out : 0;
++	}
++	if (args->structureOutputDescriptor == NULL && args->structureOutput && args->structureOutputSize) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	uint32_t slot = selector < 0x40 ? selector : 0x3f;
++	if (abb_calls[slot]++ < 6 || selector == 0x16 || selector == 0x1b) {
++		abp_log_call("AppleBaseband", selector, args, r);
++		if (args->scalarOutputCount) {
++			ABPLOG("AppleBaseband sel 0x%x answers 0x%llx", selector, args->scalarOutput[0]);
++		}
++	}
++	return r;
++}
++
++/* ---------------- AppleBasebandPCIControl user client ---------------- */
++
++static uint32_t abc_calls[0x10];
++
++class AppleBasebandPCIControlUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleBasebandPCIControlUserClient);
++	OSAsyncReference64 fLogRefs[4];
++	uint32_t fNLogRefs;
++	IOLock *fLock;
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIControlUserClient, IOUserClient);
++
++bool
++AppleBasebandPCIControlUserClient::start(IOService *provider)
++{
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	return fLock != NULL;
++}
++
++void
++AppleBasebandPCIControlUserClient::free(void)
++{
++	if (fLock) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++AppleBasebandPCIControlUserClient::clientClose(void)
++{
++	if (fLock) {
++		IOLockLock(fLock);
++		uint32_t n = fNLogRefs;
++		fNLogRefs = 0;
++		IOLockUnlock(fLock);
++		for (uint32_t i = 0; i < n; i++) {
++			IOUserClient::releaseAsyncReference64(fLogRefs[i]);
++		}
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBasebandPCIControlUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	IOReturn r = kIOReturnSuccess;
++	switch (selector) {
++	case 0:         /* open */
++	case 1:         /* close */
++	case 3:         /* loggerTune */
++		break;
++	case 2:         /* readLogsAsync: there are no modem logs; hold the request */
++		if (args->asyncWakePort == MACH_PORT_NULL) {
++			r = kIOReturnUnsupported;
++			break;
++		}
++		IOLockLock(fLock);
++		if (fNLogRefs < 4) {
++			bcopy(args->asyncReference, fLogRefs[fNLogRefs], sizeof(OSAsyncReference64));
++			fNLogRefs++;
++		} else {
++			r = kIOReturnNoResources;
++		}
++		IOLockUnlock(fLock);
++		break;
++	default:
++		r = kIOReturnUnsupported;
++		break;
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (abc_calls[selector < 0x10 ? selector : 0xf]++ < 6) {
++		abp_log_call("AppleBasebandPCIControl", selector, args, r);
++	}
++	return r;
++}
++
++/* ---------------- AppleBasebandPCIInterface user client ---------------- */
++
++class AppleBasebandPCIUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleBasebandPCIUserClient);
++	task_t fTask;
++	unsigned fPipe;
++	uint32_t fCalls[0x10];
++	void detachFromPipe(bool send);
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientDied(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCIUserClient, IOUserClient);
++
++bool
++AppleBasebandPCIUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++bool
++AppleBasebandPCIUserClient::start(IOService *provider)
++{
++	AppleBasebandPCIInterface *ifc = OSDynamicCast(AppleBasebandPCIInterface, provider);
++	if (ifc == NULL || ifc->fPipe >= ABP_NPIPES || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fPipe = ifc->fPipe;
++	return true;
++}
++
++void
++AppleBasebandPCIUserClient::detachFromPipe(bool send)
++{
++	abp_pipe *pp = &abp_pipes[fPipe];
++	bool mine;
++	IOLockLock(pp->lock);
++	mine = pp->uc == this;
++	if (mine) {
++		pp->uc = NULL;
++	}
++	IOLockUnlock(pp->lock);
++	if (mine) {
++		abp_flush_reads(fPipe, send);
++		sweet_abp_c2w(fPipe, ABPB_CLOSE, NULL, 0);
++	}
++}
++
++IOReturn
++AppleBasebandPCIUserClient::clientClose(void)
++{
++	detachFromPipe(true);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBasebandPCIUserClient::clientDied(void)
++{
++	ABPLOG("%s: client died", abp_pipe_names[fPipe]);
++	detachFromPipe(false);
++	return IOUserClient::clientDied();
++}
++
++IOReturn
++AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	abp_pipe *pp = &abp_pipes[fPipe];
++	bool async = args->asyncWakePort != MACH_PORT_NULL;
++	bool completed = false;         /* async request finished here (completion sent, reference released) */
++	IOReturn r = kIOReturnSuccess;
++	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++
++	switch (selector) {
++	case 0: {       /* open */
++		IOLockLock(pp->lock);
++		pp->uc = this;
++		pp->opens++;
++		IOLockUnlock(pp->lock);
++		uint64_t v = in0;
++		sweet_abp_c2w(fPipe, ABPB_OPEN, &v, sizeof(v));
++		break;
++	}
++	case 1:         /* close */
++		detachFromPipe(true);
++		break;
++	case 2: {       /* write */
++		uint8_t *buf;
++		uint32_t len;
++		if (async) {
++			len = (uint32_t)in1;
++			if (len > ABP_MAXFRAME) {
++				r = kIOReturnBadArgument;
++				break;
++			}
++			buf = (uint8_t *)IOMallocData(len ? len : 1);
++			if (buf == NULL) {
++				r = kIOReturnNoMemory;
++				break;
++			}
++			if (len) {
++				IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(in0, len, kIODirectionOut, fTask);
++				r = md ? md->prepare() : kIOReturnNoMemory;
++				if (r == kIOReturnSuccess) {
++					if (md->readBytes(0, buf, len) != len) {
++						r = kIOReturnVMError;
++					}
++					md->complete();
++				}
++				OSSafeReleaseNULL(md);
++			}
++		} else {
++			len = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++			if (len > ABP_MAXFRAME) {
++				r = kIOReturnBadArgument;
++				break;
++			}
++			buf = (uint8_t *)IOMallocData(len ? len : 1);
++			if (buf == NULL) {
++				r = kIOReturnNoMemory;
++				break;
++			}
++			len = abp_struct_in(args, buf, len);
++		}
++		if (r == kIOReturnSuccess) {
++			IOLockLock(pp->lock);
++			uint64_t nth = pp->wr_frames++;
++			pp->wr_bytes += len;
++			IOLockUnlock(pp->lock);
++			abp_log_frame(fPipe, "-> wland", buf, len, nth);
++			sweet_abp_c2w(fPipe, ABPB_DATA, buf, len);
++		}
++		IOFreeData(buf, len ? len : 1);
++		if (r == kIOReturnSuccess && async) {
++			io_user_reference_t a[1] = { len };
++			sendAsyncResult64(args->asyncReference, kIOReturnSuccess, a, 1);
++			releaseAsyncReference64(args->asyncReference);
++			completed = true;
++		}
++		break;
++	}
++	case 3: {       /* read */
++		if (async) {
++			abp_read rd;
++			bcopy(args->asyncReference, rd.ref, sizeof(rd.ref));
++			rd.addr = in0;
++			rd.size = (uint32_t)in1;
++			rd.task = fTask;
++			uint8_t *fb = NULL;
++			uint32_t fl = 0;
++			IOLockLock(pp->lock);
++			if (abp_rx_pop(pp, &fb, &fl)) {
++				IOLockUnlock(pp->lock);
++				abp_complete_read(fPipe, &rd, fb, fl);
++				IOFreeData(fb, fl ? fl : 1);
++				completed = true;
++			} else if (pp->nreads < ABP_MAXREADS) {
++				pp->reads[pp->nreads++] = rd;
++				IOLockUnlock(pp->lock);
++			} else {
++				IOLockUnlock(pp->lock);
++				r = kIOReturnNoResources;
++			}
++		} else {
++			uint8_t *fb = NULL;
++			uint32_t fl = 0;
++			IOLockLock(pp->lock);
++			if (!abp_rx_pop(pp, &fb, &fl)) {
++				AbsoluteTime dl;
++				clock_interval_to_deadline(2000, kMillisecondScale, &dl);
++				pp->sync_waiters++;
++				IOLockSleepDeadline(pp->lock, &pp->rxn, dl, THREAD_ABORTSAFE);
++				pp->sync_waiters--;
++				abp_rx_pop(pp, &fb, &fl);
++			}
++			IOLockUnlock(pp->lock);
++			if (fb == NULL) {
++				r = kIOReturnTimeout;
++				args->structureOutputSize = 0;
++			} else {
++				r = abp_struct_out(args, fb, fl);
++				IOFreeData(fb, fl ? fl : 1);
++			}
++		}
++		break;
++	}
++	case 6:         /* abortChannelAsync */
++	case 7: {       /* startChannelAsync */
++		uint64_t v = in0;
++		sweet_abp_c2w(fPipe, selector == 7 ? ABPB_START : ABPB_ABORT, &v, sizeof(v));
++		if (async) {
++			io_user_reference_t a[1] = { 0 };
++			sendAsyncResult64(args->asyncReference, kIOReturnSuccess, a, 1);
++			releaseAsyncReference64(args->asyncReference);
++			completed = true;
++		}
++		break;
++	}
++	default:
++		r = kIOReturnUnsupported;
++		break;
++	}
++	(void)completed;
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (selector != 2 && selector != 3 && fCalls[selector < 0x10 ? selector : 0xf]++ < 8) {
++		abp_log_call(abp_pipe_names[fPipe], selector, args, r);
++	} else if ((selector == 2 || selector == 3) && fCalls[selector]++ < 3) {
++		abp_log_call(abp_pipe_names[fPipe], selector, args, r);
++	}
++	return r;
++}
++
++/* ---------------- publishing ---------------- */
++
++static void
++put_data(IORegistryEntry *e, const char *key, const void *bytes, unsigned len)
++{
++	OSData *v = OSData::withBytes(bytes, len);
++	if (v) {
++		e->setProperty(key, v);
++		v->release();
++	}
++}
++
++static bool
++abp_publish(IOService *svc, IOService *provider, const char *name, const char *ucclass)
++{
++	if (svc == NULL) {        /* already init()ed by the caller */
++		return false;
++	}
++	svc->setProperty("SweetABP", true);
++	if (ucclass) {
++		svc->setProperty(kIOUserClientClassKey, ucclass);
++	}
++	if (!svc->attach(provider)) {
++		svc->release();
++		return false;
++	}
++	if (name) {
++		svc->setName(name);
++	}
++	if (!svc->start(provider)) {
++		svc->detach(provider);
++		svc->release();
++		return false;
++	}
++	svc->registerService();
++	if (abp_nservices < sizeof(abp_services) / sizeof(abp_services[0])) {
++		abp_services[abp_nservices++] = svc;
++	}
++	IOLog("SWEET ABP: published %s (%s) under %s\n", svc->getName(), svc->getMetaClass()->getClassName(), provider->getName());
++	return true;
++}
++
++void
++SweetABPStart(void)
++{
++	IOService *platform = IOService::getPlatform();
++	if (abp_started || platform == NULL) {
++		return;
++	}
++	abp_started = true;
++	for (unsigned i = 0; i < ABP_NPIPES; i++) {
++		abp_pipes[i].lock = IOLockAlloc();
++	}
++	/* /baseband of the D22AP (iPhone X) device tree */
++	SweetABPNub *nub = OSTypeAlloc(SweetABPNub);
++	IOService *bbparent = platform;
++	if (nub) {
++		static const char compat[] = "baseband,n41";
++		static const uint32_t config[10] = { 0xfa, 0x1f4, 0x4844, 0x3e8, 0x64, 0x64, 0x83, 0x25, 0x14, 0x64 };
++		if (nub->init()) {
++			put_data(nub, "compatible", compat, sizeof(compat));
++			put_data(nub, "device_type", "baseband", 9);
++			put_data(nub, "config", config, sizeof(config));
++			nub->setProperty("SweetABP", true);
++			if (nub->attach(platform)) {
++				nub->setName("baseband");
++				if (nub->start(platform)) {
++					nub->registerService();
++					bbparent = nub;
++					if (abp_nservices < sizeof(abp_services) / sizeof(abp_services[0])) {
++						abp_services[abp_nservices++] = nub;
++					}
++					IOLog("SWEET ABP: published baseband nub (config 40 bytes, baseband,n41) under %s\n", platform->getName());
++				} else {
++					nub->detach(platform);
++					nub->release();
++				}
++			} else {
++				nub->release();
++			}
++		} else {
++			nub->release();
++		}
++	}
++	AppleBaseband *abb = OSTypeAlloc(AppleBaseband);
++	if (abb && !abb->init()) {
++		OSSafeReleaseNULL(abb);
++	}
++	abp_publish(abb, bbparent, NULL, "AppleBasebandUserClient");
++	AppleBasebandPCIControl *ctl = OSTypeAlloc(AppleBasebandPCIControl);
++	if (ctl && !ctl->init()) {
++		OSSafeReleaseNULL(ctl);
++	}
++	if (ctl) {
++		ctl->setProperty("bootstage", (unsigned long long)sweet_abp_bootstage, 32);
++	}
++	if (ctl && abp_publish(ctl, platform, NULL, "AppleBasebandPCIControlUserClient")) {
++		for (unsigned i = 0; i < ABP_NPIPES; i++) {
++			AppleBasebandPCIInterface *ifc = OSTypeAlloc(AppleBasebandPCIInterface);
++			if (ifc && !ifc->init()) {
++				OSSafeReleaseNULL(ifc);
++			}
++			if (ifc == NULL) {
++				continue;
++			}
++			ifc->fPipe = i;
++			ifc->setProperty("ABPInterfaceProtocol", abp_pipe_names[i]);
++			ifc->setProperty("ABPInterfaceIndex", (unsigned long long)(i + 4), 32);
++			abp_publish(ifc, ctl, NULL, "AppleBasebandPCIUserClient");
++		}
++	}
++}
++
++void
++SweetABPSetBootstage(uint32_t stage)
++{
++	for (unsigned i = 0; i < abp_nservices; i++) {
++		if (OSDynamicCast(AppleBasebandPCIControl, abp_services[i])) {
++			abp_services[i]->setProperty("bootstage", (unsigned long long)stage, 32);
++			IOLog("SWEET ABP: bootstage = %u\n", stage);
++		}
++	}
++}
++
++void
++SweetABPMessage(uint32_t code)
++{
++	for (unsigned i = 0; i < abp_nservices; i++) {
++		if (OSDynamicCast(AppleBasebandPCIControl, abp_services[i])) {
++			IOReturn r = abp_services[i]->messageClients(code, NULL, 0);
++			IOLog("SWEET ABP: general-interest message 0x%x to AppleBasebandPCIControl clients -> 0x%x\n", code, r);
++		}
++	}
++}
++
++bool
++SweetABPIs(const void *entry)
++{
++	for (unsigned i = 0; entry != NULL && i < abp_nservices; i++) {
++		if (abp_services[i] == entry) {
++			return true;
++		}
++	}
++	return false;
++}
++
++int
++SweetABPStats(char *buf, size_t len)
++{
++	size_t o = 0;
++	o += snprintf(buf + o, len - o, "bootstage %u mgr %llu bb %llu", sweet_abp_bootstage, abb_manager_state, abb_baseband_state);
++	for (unsigned i = 0; i < ABP_NPIPES && o < len; i++) {
++		abp_pipe *pp = &abp_pipes[i];
++		if (pp->lock == NULL) {
++			continue;
++		}
++		IOLockLock(pp->lock);
++		o += snprintf(buf + o, len - o, " | %s opens %u %s, CC wrote %llu fr/%llu B, wland gave %llu fr/%llu B, reads pending %u, queued %u, drops %u, truncs %u",
++		    abp_pipe_names[i], pp->opens, pp->uc ? "open" : "closed", pp->wr_frames, pp->wr_bytes, pp->rd_frames, pp->rd_bytes,
++		    pp->nreads, pp->rxn, pp->drops, pp->truncs);
++		IOLockUnlock(pp->lock);
++	}
++	return (int)(o < len ? o : len - 1);
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index b2871d5..01771e3 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,6 +20,7 @@ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitc
+ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBTNub.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetABP.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
