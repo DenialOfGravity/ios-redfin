@@ -667,10 +667,10 @@ index 5911cb0..02337af 100644
  	}
 diff --git a/iokit/Kernel/arm/SweetABP.cpp b/iokit/Kernel/arm/SweetABP.cpp
 new file mode 100644
-index 0000000..5de5b60
+index 0000000..697a2c8
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetABP.cpp
-@@ -0,0 +1,903 @@
+@@ -0,0 +1,992 @@
 +/*
 + * redfin 1061: stand-ins for Apple's baseband IOKit drivers, so the real CommCenter (AppleBasebandManager runs
 + * inside it) finds a baseband. Published only with boot-arg sweetabp & 1 (bsd/dev/sweet_abp.c), under the
@@ -691,6 +691,9 @@ index 0000000..5de5b60
 + *                                         3 read (sync struct, waits <= 2 s / async {addr,size}, completion
 + *                                         args {length}), 6/7 abort/start channel (completed at once),
 + *                                         anything else kIOReturnUnsupported.
++ *     AppleBasebandPCITrace               accept-all stub (every selector succeeds, zeroed outputs).
++ *   AppleIPAppender                       accept-all stub for ApplePDPHelper (it crashes on a NULL mutex in
++ *                                         callScalarMethod when the service is missing).
 + *
 + * Frames CommCenter writes go to /dev/abpbridge (sweet_abp_c2w); frames wland writes there complete the
 + * pipe's oldest pending read or wait in a 64-frame queue (SweetABPDeliver). Every selector is logged the
@@ -783,7 +786,7 @@ index 0000000..5de5b60
 +};
 +
 +static abp_pipe abp_pipes[ABP_NPIPES];
-+static IOService *abp_services[6];
++static IOService *abp_services[8];
 +static unsigned abp_nservices;
 +static bool abp_started;
 +
@@ -1409,6 +1412,82 @@ index 0000000..5de5b60
 +	return r;
 +}
 +
++/* ---------------- accept-all stand-ins: AppleIPAppender (ApplePDPHelper), AppleBasebandPCITrace ---------------- */
++
++class AppleIPAppender : public IOService
++{
++	OSDeclareDefaultStructors(AppleIPAppender);
++};
++OSDefineMetaClassAndStructors(AppleIPAppender, IOService);
++
++class AppleBasebandPCITrace : public IOService
++{
++	OSDeclareDefaultStructors(AppleBasebandPCITrace);
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCITrace, IOService);
++
++/* Every selector succeeds with zeroed outputs; async requests are accepted and never completed. */
++static uint32_t abs_calls[2][0x20];
++
++class SweetABPStubUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(SweetABPStubUserClient);
++protected:
++	unsigned fKind;         /* 0 AppleIPAppender, 1 AppleBasebandPCITrace */
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetABPStubUserClient, IOUserClient);
++
++IOReturn
++SweetABPStubUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetABPStubUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor != NULL) {
++		uint32_t n = (uint32_t)args->structureOutputDescriptor->getLength();
++		uint8_t z[256];
++		bzero(z, sizeof(z));
++		for (uint32_t o = 0; o < n; o += sizeof(z)) {
++			args->structureOutputDescriptor->writeBytes(o, z, n - o < sizeof(z) ? n - o : sizeof(z));
++		}
++		args->structureOutputDescriptorSize = n;
++	} else if (args->structureOutput && args->structureOutputSize) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	if (abs_calls[fKind & 1][selector < 0x20 ? selector : 0x1f]++ < 4) {
++		abp_log_call(fKind ? "AppleBasebandPCITrace" : "AppleIPAppender", selector, args, kIOReturnSuccess);
++	}
++	return kIOReturnSuccess;
++}
++
++class AppleIPAppenderUserClient : public SweetABPStubUserClient
++{
++	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE { fKind = 0; return SweetABPStubUserClient::start(provider); }
++};
++OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, SweetABPStubUserClient);
++
++class AppleBasebandPCITraceUserClient : public SweetABPStubUserClient
++{
++	OSDeclareDefaultStructors(AppleBasebandPCITraceUserClient);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE { fKind = 1; return SweetABPStubUserClient::start(provider); }
++};
++OSDefineMetaClassAndStructors(AppleBasebandPCITraceUserClient, SweetABPStubUserClient);
++
 +/* ---------------- publishing ---------------- */
 +
 +static void
@@ -1519,7 +1598,17 @@ index 0000000..5de5b60
 +			ifc->setProperty("ABPInterfaceIndex", (unsigned long long)(i + 4), 32);
 +			abp_publish(ifc, ctl, NULL, "AppleBasebandPCIUserClient");
 +		}
++		AppleBasebandPCITrace *tr = OSTypeAlloc(AppleBasebandPCITrace);
++		if (tr && !tr->init()) {
++			OSSafeReleaseNULL(tr);
++		}
++		abp_publish(tr, ctl, NULL, "AppleBasebandPCITraceUserClient");
 +	}
++	AppleIPAppender *ipa = OSTypeAlloc(AppleIPAppender);
++	if (ipa && !ipa->init()) {
++		OSSafeReleaseNULL(ipa);
++	}
++	abp_publish(ipa, platform, NULL, "AppleIPAppenderUserClient");
 +}
 +
 +void
