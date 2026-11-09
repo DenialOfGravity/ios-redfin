@@ -39,7 +39,22 @@
  *     0x02 0x002e ok            action: fwd | ok | err:<code> | drop
  *     0xe2 * err:0x5e
  * Never FORWARDED whatever the file says: Apple-only services (svc >= 0xe0) and Apple message ids (>= 0x5500); ok,
- * err:<code> and drop lines for them do apply (a fwd line for them becomes err abperr).
+ * err:<code>, resp:<hex> and drop lines for them do apply (a fwd line for them becomes err abperr).
+ * r3 (2026-11-09) more actions and trigger lines, all re-read with the file (no rebuild):
+ *     0xe2 0xe010 resp:1001000102...   success answered here WITH these TLVs (hex of t|len16|value ..., the result TLV
+ *                                      0x02 is added in front); spaces not allowed inside the hex, '.' or '_' may separate
+ *     on 0x0b 0x002e ind 0x0032 <hex>  after the answer to (svc, msg) went to CommCenter (a modem success or a local
+ *                                      ok/resp), send that client indication <msg> of the same service with TLVs <hex>
+ *     on 0x03 0x0003 replay 0x004d 0x004e [map 01=14,..]
+ *                                      after a SUCCESS answer to (svc, msg), the router itself sends GET <msg 0x004d> to
+ *                                      the modem (from that client's QRTR port; only if the policy forwards it, so
+ *                                      protected messages can never be sent this way) and returns the modem's answer to
+ *                                      that client as indication <0x004e> (result TLV dropped, TLV ids remapped by
+ *                                      'map a=b'): "replay the current state" for a modem that sent its indications
+ *                                      long before CommCenter registered. One line per (svc, msg, kind) is used (all
+ *                                      matching 'on' lines run, in file order).
+ * Every SDU from the modem is checked (msg len and TLVs must add up) before it goes to CommCenter: a malformed one is
+ * dropped and logged ("abp: MALFORMED"), as one truncated PBM indication ABM-ASSERTed CommCenter in P2 run1.
  * Every new (svc, msg) is logged once with the action and why ("abp: NEW ..."); a policy reload logs them again.
  *
  * READY: the kernel (1063, sweetabp & 8) publishes the baseband services only after ABPB_IOC_READY 1. Mode 1 says
@@ -142,6 +157,7 @@ static struct mst *mst_get(unsigned svc, unsigned msg)
 	return &mst[nmst++];
 }
 
+#define TRG_MAXMAP	8	/* r3 replay: TLV id remaps per 'on' line */
 #define NPEND	512
 static struct pend {
 	int used;
@@ -149,7 +165,13 @@ static struct pend {
 	uint16_t txn, msg;
 	uint8_t svc;
 	uint64_t t;
+	/* r3 replay: a GET the router sent itself; its answer becomes indication ind_msg to (pipe, sess, svc, cid) */
+	int replay;
+	uint32_t rpipe, rsess;
+	uint8_t rcid, nmap, map[TRG_MAXMAP][2];
+	uint16_t ind_msg;
 } pend[NPEND];
+static uint16_t replay_txn = 0xff00;	/* router-made GETs use txn 0xff00..0xfffe */
 
 static const char *svc_name(unsigned s)
 {
@@ -182,8 +204,8 @@ static const char *ctl_name(unsigned m)
 
 /* ---- policy ---- */
 
-enum { ACT_FWD, ACT_OK, ACT_ERR, ACT_DROP, ACT_LOCAL };
-static const char *act_name[] = { "fwd", "ok", "err", "drop", "local" };
+enum { ACT_FWD, ACT_OK, ACT_ERR, ACT_DROP, ACT_LOCAL, ACT_RESP };
+static const char *act_name[] = { "fwd", "ok", "err", "drop", "local", "resp" };
 #define POL_ANY		(-1)
 #define POL_ABPERR	(-1)	/* err code: abperr (default 0x5e) */
 
@@ -191,6 +213,22 @@ struct pol {
 	int svc, msg, act, err;
 	const char *why;
 };
+
+/* r3 trigger lines ("on svc msg ind|replay ...") */
+enum { TRG_IND, TRG_REPLAY };
+#define NTRG	64
+static struct trg {
+	int svc, msg, kind;
+	uint16_t m2, m3;		/* ind: indication msg; replay: GET msg, indication msg */
+	uint8_t map[TRG_MAXMAP][2];	/* replay: TLV id a -> b */
+	int nmap;
+	const uint8_t *data;		/* ind: TLVs */
+	uint16_t dlen;
+} trg[NTRG];
+static int ntrg;
+static uint8_t pol_data[16384];	/* hex data of resp/ind lines (one policy load) */
+static uint32_t pol_dlen;
+static unsigned malformed, replays, synth_inds;
 
 /*
  * Built-in defaults (P2). Exact (svc, msg) entries win over the (svc, POL_ANY) entry; a service with no entry is
@@ -259,6 +297,10 @@ static const struct pol abp_builtin[] = {
 	/* other standard services kept away from the modem for now */
 	{ 0x09, POL_ANY, ACT_ERR, POL_ABPERR, "VOICE: not in P2" },
 	{ 0x06, POL_ANY, ACT_ERR, POL_ABPERR, "PDS: not in P2" },
+	/* r3: locationd (through ABM's 'location' QMux) asks the baseband for a HardReset whenever QMI_PDS_RESET fails
+	 * (P2 run1: "Reset requested ... AP-triggered: locationd Qmi Error Response: QMI_ERR_NOT_SUPPORTED,MSG,
+	 * qmi::pds::QMI_PDS_RESET" every ~5 s): answered success here, never forwarded */
+	{ 0x06, 0x0000, ACT_OK, 0, "PDS reset: answered here (an error makes locationd reset the baseband)" },
 	{ 0x10, POL_ANY, ACT_ERR, POL_ABPERR, "LOC: not in P2" },
 	{ 0x08, POL_ANY, ACT_ERR, POL_ABPERR, "AT: not in P2" },
 	{ 0x22, POL_ANY, ACT_OK, 0, "COEX: answered success here (would change LTE/Wi-Fi/BT coexistence under wland's Wi-Fi)" },
@@ -270,6 +312,7 @@ static const struct pol abp_builtin[] = {
 
 #define NOVR	256
 static struct pol ovr[NOVR];
+static struct { const uint8_t *data; uint16_t dlen; } ovr_data[NOVR];	/* r3: resp:<hex> of ovr[i] */
 static int novr;
 static time_t ovr_mtime;
 static off_t ovr_size;
@@ -284,6 +327,111 @@ static int parse_num(const char *s, int *v)
 	return 0;
 }
 
+/* hex string ("0102ab", '.', '_' and ':' ignored) into pol_data; NULL on a bad string or a full buffer */
+static const uint8_t *parse_hex(const char *h, uint16_t *len)
+{
+	uint8_t *start = pol_data + pol_dlen;
+	uint32_t n = 0;
+	int hi = -1;
+	for (; *h; h++) {
+		int v;
+		if (*h == '.' || *h == '_' || *h == ':')
+			continue;
+		if (*h >= '0' && *h <= '9')
+			v = *h - '0';
+		else if (*h >= 'a' && *h <= 'f')
+			v = *h - 'a' + 10;
+		else if (*h >= 'A' && *h <= 'F')
+			v = *h - 'A' + 10;
+		else
+			return NULL;
+		if (hi < 0) {
+			hi = v;
+			continue;
+		}
+		if (pol_dlen + n >= sizeof(pol_data))
+			return NULL;
+		start[n++] = (uint8_t)(hi << 4 | v);
+		hi = -1;
+	}
+	if (hi >= 0 || n > 4096)
+		return NULL;
+	pol_dlen += n;
+	*len = (uint16_t)n;
+	return start;
+}
+
+/* TLVs t|len16|value must add up exactly */
+static int tlvs_ok(const uint8_t *p, uint32_t n)
+{
+	while (n) {
+		if (n < 3)
+			return 0;
+		uint32_t l = (uint32_t)(p[1] | (p[2] << 8));
+		if (l > n - 3)
+			return 0;
+		p += 3 + l;
+		n -= 3 + l;
+	}
+	return 1;
+}
+
+/* "on svc msg ind <msg> <hex>" / "on svc msg replay <get> <ind> [map a=b,c=d]"; 0 ok */
+static int parse_trigger(char *line, int ln)
+{
+	char w[7][256];
+	int k = sscanf(line, "%255s %255s %255s %255s %255s %255s %255s", w[0], w[1], w[2], w[3], w[4], w[5], w[6]);
+	struct trg t;
+	int a, b;
+	memset(&t, 0, sizeof(t));
+	if (k < 5 || ntrg >= NTRG || parse_num(w[1], &t.svc) || t.svc < 1 || t.svc > 255 || parse_num(w[2], &t.msg) ||
+	    parse_num(w[4], &a) || a < 0 || a > 0xffff)
+		goto bad;
+	t.m2 = (uint16_t)a;
+	if (!strcmp(w[3], "ind")) {
+		t.kind = TRG_IND;
+		if (k >= 6) {
+			t.data = parse_hex(w[5], &t.dlen);
+			if (!t.data || !tlvs_ok(t.data, t.dlen))
+				goto bad;
+		}
+	} else if (!strcmp(w[3], "replay")) {
+		t.kind = TRG_REPLAY;
+		if (k < 6 || parse_num(w[5], &b) || b < 0 || b > 0xffff)
+			goto bad;
+		t.m3 = (uint16_t)b;
+		if (k >= 7 && strncmp(w[6], "map", 3))
+			goto bad;
+		if (k >= 7) {
+			/* "map" then the pairs in the rest of the line */
+			char *m = strstr(line, "map");
+			m += 3;
+			while (*m && t.nmap < TRG_MAXMAP) {
+				unsigned x, y;
+				while (*m == ' ' || *m == '\t' || *m == ',')
+					m++;
+				if (!*m || *m == '\n' || *m == '\r')
+					break;
+				if (sscanf(m, "%x=%x", &x, &y) != 2 || x > 255 || y > 255)
+					goto bad;
+				t.map[t.nmap][0] = (uint8_t)x;
+				t.map[t.nmap][1] = (uint8_t)y;
+				t.nmap++;
+				while (*m && *m != ',' && *m != ' ' && *m != '\t')
+					m++;
+			}
+		}
+	} else {
+		goto bad;
+	}
+	trg[ntrg++] = t;
+	return 0;
+bad:
+	printf("abp: %s line %d: bad 'on' line (on <svc> <msg> ind <msg> [<hex>] | on <svc> <msg> replay <get> <ind> [map a=b,..])\n",
+	       ABP_POLICY, ln);
+	return -1;
+}
+
 static void policy_load(int force)
 {
 	struct stat sb;
@@ -291,6 +439,8 @@ static void policy_load(int force)
 		if (novr || ovr_mtime) {
 			printf("[%6llu] abp: %s gone: built-in policy only\n", (unsigned long long)link_ms(), ABP_POLICY);
 			novr = 0;
+			ntrg = 0;
+			pol_dlen = 0;
 			ovr_mtime = 0;
 			nseen = 0;	/* decisions are logged again */
 		}
@@ -303,17 +453,25 @@ static void policy_load(int force)
 	FILE *f = fopen(ABP_POLICY, "r");
 	if (!f)
 		return;
-	char line[256];
+	static char line[12288];
 	int n = 0, bad = 0, ln = 0;
+	ntrg = 0;
+	pol_dlen = 0;
 	while (fgets(line, sizeof(line), f) && n < NOVR) {
-		char a[64], b[64], c[64];
+		char a[64], b[64], c[8400];
 		ln++;
 		char *h = strchr(line, '#');
 		if (h)
 			*h = 0;
-		if (sscanf(line, "%63s %63s %63s", a, b, c) != 3)
+		if (sscanf(line, "%63s", a) == 1 && !strcmp(a, "on")) {
+			bad += parse_trigger(line, ln) != 0;
+			continue;
+		}
+		if (sscanf(line, "%63s %63s %8399s", a, b, c) != 3)
 			continue;
 		struct pol p = { 0, POL_ANY, ACT_ERR, POL_ABPERR, "conf" };
+		const uint8_t *pdata = NULL;
+		uint16_t pdlen = 0;
 		if (parse_num(a, &p.svc) || p.svc < 1 || p.svc > 255 || (strcmp(b, "*") && parse_num(b, &p.msg))) {
 			printf("abp: %s line %d: bad svc/msg\n", ABP_POLICY, ln);
 			bad++;
@@ -329,19 +487,26 @@ static void policy_load(int force)
 			p.act = ACT_ERR;
 		else if (!strcmp(c, "err"))
 			p.act = ACT_ERR;
+		else if (!strncmp(c, "resp:", 5) && (pdata = parse_hex(c + 5, &pdlen)) != NULL && tlvs_ok(pdata, pdlen))
+			p.act = ACT_RESP;
 		else {
-			printf("abp: %s line %d: bad action '%s' (fwd | ok | err:<code> | drop)\n", ABP_POLICY, ln, c);
+			printf("abp: %s line %d: bad action '%.40s' (fwd | ok | err:<code> | drop | resp:<hex TLVs>)\n", ABP_POLICY, ln, c);
 			bad++;
 			continue;
 		}
+		ovr_data[n].data = pdata;
+		ovr_data[n].dlen = pdlen;
 		ovr[n++] = p;
 	}
 	fclose(f);
 	novr = n;
 	nseen = 0;
-	printf("[%6llu] abp: policy %s: %d override line(s)%s, decisions logged again\n", (unsigned long long)link_ms(), ABP_POLICY,
-	       n, bad ? " (some lines refused)" : "");
+	printf("[%6llu] abp: policy %s: %d override line(s), %d trigger line(s)%s, decisions logged again\n", (unsigned long long)link_ms(),
+	       ABP_POLICY, n, ntrg, bad ? " (some lines refused)" : "");
 }
+
+static const uint8_t *dec_data;	/* ACT_RESP: the TLVs of the last decide() */
+static uint16_t dec_dlen;
 
 /* the action for (svc, msg); *err = the error code, *why = the reason (for the log) */
 static int decide(unsigned svc, unsigned msg, int *err, const char **why, char *whybuf, size_t wl)
@@ -362,8 +527,14 @@ static int decide(unsigned svc, unsigned msg, int *err, const char **why, char *
 	for (size_t i = 0; i < sizeof(abp_builtin) / sizeof(abp_builtin[0]) && !p; i++)
 		if (abp_builtin[i].svc == (int)svc && abp_builtin[i].msg == POL_ANY)
 			p = &abp_builtin[i];
+	dec_data = NULL;
+	dec_dlen = 0;
 	if (p) {
 		a = p->act;
+		if (from_conf) {
+			dec_data = ovr_data[p - ovr].data;
+			dec_dlen = ovr_data[p - ovr].dlen;
+		}
 		if (p->err != POL_ABPERR)
 			*err = p->err;
 		snprintf(whybuf, wl, "%s%s", from_conf ? "conf " : "", p->why);
@@ -805,8 +976,9 @@ static void ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 	send_frame(pipe, b, o);
 }
 
-/* a request answered here: success without TLVs (ok) or a QMI failure (err) */
-static void svc_local(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail, int code)
+/* a request answered here: success without TLVs (ok), success with the policy's TLVs (resp) or a QMI failure (err) */
+static void svc_local_tlv(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail, int code, const uint8_t *tl,
+			  uint16_t tn)
 {
 	struct mst *m = mst_get(svc, (unsigned)(s[3] | (s[4] << 8)));
 	if (m) {
@@ -818,19 +990,131 @@ static void svc_local(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *
 		}
 		mst_dirty = 1;
 	}
-	uint8_t b[32];
+	static uint8_t b[32 + 4096];
 	uint32_t o = 13;		/* QMUX 6 + SDU header 7 */
 	uint16_t res[2] = { (uint16_t)(fail ? 1 : 0), (uint16_t)(fail ? code : 0) };
 	put_tlv(b, &o, 0x02, res, 4);
+	if (!fail && tl && tn && o + tn <= sizeof(b)) {
+		memcpy(b + o, tl, tn);
+		o += tn;
+	}
 	b[6] = 0x02;			/* response */
 	b[7] = s[1];			/* txid u16 */
 	b[8] = s[2];
 	b[9] = s[3];			/* msg id */
 	b[10] = s[4];
-	b[11] = (uint8_t)(o - 13);
-	b[12] = 0;
+	b[11] = (uint8_t)((o - 13) & 0xff);
+	b[12] = (uint8_t)((o - 13) >> 8);
 	finish_qmux(b, o, svc, cid);
 	send_frame(pipe, b, o);
+}
+
+static void svc_local(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail, int code)
+{
+	svc_local_tlv(pipe, svc, cid, s, fail, code, NULL, 0);
+}
+
+/* an indication (svc, msg, TLVs) to one CommCenter client */
+static void send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn)
+{
+	static uint8_t b[16 + 65536];
+	static uint16_t itx = 1;
+	if (13 + tn > sizeof(b))
+		return;
+	b[6] = 0x04;			/* indication */
+	b[7] = (uint8_t)itx;
+	b[8] = (uint8_t)(itx >> 8);
+	itx = (uint16_t)(itx + 1 ? itx + 1 : 1);
+	b[9] = (uint8_t)msg;
+	b[10] = (uint8_t)(msg >> 8);
+	b[11] = (uint8_t)(tn & 0xff);
+	b[12] = (uint8_t)(tn >> 8);
+	if (tn)
+		memcpy(b + 13, tl, tn);
+	finish_qmux(b, 13 + tn, svc, cid);
+	uint32_t pp = cur_pipe;
+	send_to(pipe, sess, b, 13 + tn);
+	cur_pipe = pp;
+}
+
+static void pend_add(struct pend *x)
+{
+	int slot = -1;
+	uint64_t oldest = ~0ull;
+	for (int i = 0; i < NPEND; i++) {
+		if (!pend[i].used) {
+			slot = i;
+			break;
+		}
+		if (pend[i].t < oldest) {
+			oldest = pend[i].t;
+			slot = i;
+		}
+	}
+	pend[slot] = *x;
+	pend[slot].used = 1;
+	pend[slot].t = link_ms();
+}
+
+static struct cl *cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, int create);
+
+/*
+ * r3: the 'on' lines for (svc, msg) after a successful answer went to CommCenter client (pipe, sess, svc, cid):
+ * synthesized indications and state replays (GET to the modem, answer re-wrapped as an indication).
+ */
+static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg)
+{
+	for (int i = 0; i < ntrg; i++) {
+		struct trg *t = &trg[i];
+		if (t->svc != (int)svc || t->msg != (int)msg)
+			continue;
+		if (t->kind == TRG_IND) {
+			synth_inds++;
+			printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
+			       svc_name(svc), svc, msg, t->m2, t->dlen, pipe_name[pipe], sess, cid);
+			send_ind(pipe, sess, svc, cid, t->m2, t->data, t->dlen);
+			continue;
+		}
+		/* replay: only a GET the policy itself would forward (protected / Apple / data messages never go out this way) */
+		int code;
+		const char *why;
+		char wb[128];
+		if (decide(svc, t->m2, &code, &why, wb, sizeof(wb)) != ACT_FWD) {
+			printf("[%6llu] abp: on %s(0x%02x) 0x%04x: replay GET 0x%04x refused (policy: %s)\n", (unsigned long long)link_ms(),
+			       svc_name(svc), svc, msg, t->m2, why);
+			continue;
+		}
+		int si = srv_find(svc);
+		struct cl *c = cl_get(pipe, sess, svc, cid, 1);
+		if (si < 0 || !c)
+			continue;
+		uint8_t q[7] = { 0x00, 0, 0, (uint8_t)t->m2, (uint8_t)(t->m2 >> 8), 0, 0 };
+		struct pend x;
+		memset(&x, 0, sizeof(x));
+		if (++replay_txn == 0xffff)
+			replay_txn = 0xff00;
+		q[1] = (uint8_t)replay_txn;
+		q[2] = (uint8_t)(replay_txn >> 8);
+		x.port = c->port;
+		x.txn = replay_txn;
+		x.msg = t->m2;
+		x.svc = (uint8_t)svc;
+		x.replay = 1;
+		x.rpipe = pipe;
+		x.rsess = sess;
+		x.rcid = (uint8_t)cid;
+		x.ind_msg = t->m3;
+		x.nmap = (uint8_t)t->nmap;
+		memcpy(x.map, t->map, sizeof(x.map));
+		if (qrtr_send(QRTR_TYPE_DATA, c->port, srv[si].node, srv[si].port, q, sizeof(q))) {
+			cnt.sendfail++;
+			continue;
+		}
+		pend_add(&x);
+		replays++;
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: replay GET 0x%04x -> indication 0x%04x for %s/%u cid %u (txn 0x%04x)\n",
+		       (unsigned long long)link_ms(), svc_name(svc), svc, msg, t->m2, t->m3, pipe_name[pipe], sess, cid, replay_txn);
+	}
 }
 
 /* a request for the modem: SDU unchanged over QRTR from this client's port */
@@ -852,25 +1136,13 @@ static void svc_forward(unsigned pipe, unsigned svc, unsigned cid, const uint8_t
 	}
 	c->fwd++;
 	cnt.fwd++;
-	uint16_t txn = (uint16_t)(s[1] | (s[2] << 8)), msg = (uint16_t)(s[3] | (s[4] << 8));
-	int slot = -1;
-	uint64_t oldest = ~0ull;
-	for (int i = 0; i < NPEND; i++) {
-		if (!pend[i].used) {
-			slot = i;
-			break;
-		}
-		if (pend[i].t < oldest) {
-			oldest = pend[i].t;
-			slot = i;
-		}
-	}
-	pend[slot].used = 1;
-	pend[slot].port = c->port;
-	pend[slot].txn = txn;
-	pend[slot].msg = msg;
-	pend[slot].svc = (uint8_t)svc;
-	pend[slot].t = link_ms();
+	struct pend x;
+	memset(&x, 0, sizeof(x));
+	x.port = c->port;
+	x.txn = (uint16_t)(s[1] | (s[2] << 8));
+	x.msg = (uint16_t)(s[3] | (s[4] << 8));
+	x.svc = (uint8_t)svc;
+	pend_add(&x);
 }
 
 static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n)
@@ -943,6 +1215,12 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 	case ACT_OK:
 		cnt.local_ok++;
 		svc_local(pipe, svc, cid, s, 0, 0);
+		run_triggers(pipe, cur_sess, svc, cid, msg);
+		break;
+	case ACT_RESP:
+		cnt.local_ok++;
+		svc_local_tlv(pipe, svc, cid, s, 0, 0, dec_data, dec_dlen);
+		run_triggers(pipe, cur_sess, svc, cid, msg);
 		break;
 	case ACT_ERR:
 		cnt.local_err++;
@@ -994,6 +1272,59 @@ void abpbridge_server_gone(uint32_t node, uint32_t port)
 /* QRTR DATA to one of our router ports: a response or an indication for a CommCenter client */
 void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 {
+	/* r3: the answer to a GET the router sent itself (replay) becomes an indication; it never reaches CommCenter as a response */
+	if (n >= 7 && d[0] == 0x02) {
+		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
+		for (int i = 0; i < NPEND; i++) {
+			struct pend *x = &pend[i];
+			if (!x->used || !x->replay || x->port != h->dst_port || x->txn != txn)
+				continue;
+			x->used = 0;
+			uint32_t ml = (uint32_t)(d[5] | (d[6] << 8));
+			if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
+				malformed++;
+				printf("[%6llu] abp: MALFORMED replay answer %s(0x%02x) msg 0x%04x (%u bytes): dropped\n", (unsigned long long)link_ms(),
+				       svc_name(x->svc), x->svc, x->msg, n);
+				return;
+			}
+			struct qmi_msg qm;
+			uint16_t rl = 0;
+			const uint8_t *r = NULL;
+			if (!qmi_parse(d, n, &qm))
+				r = qmi_get(&qm, 0x02, &rl);
+			unsigned res = r && rl >= 4 ? (unsigned)(r[0] | (r[1] << 8)) : 0xffff;
+			unsigned er = r && rl >= 4 ? (unsigned)(r[2] | (r[3] << 8)) : 0xffff;
+			if (res != 0) {
+				printf("[%6llu] abp: replay %s(0x%02x) GET 0x%04x: modem error 0x%x, no indication\n", (unsigned long long)link_ms(),
+				       svc_name(x->svc), x->svc, x->msg, er);
+				return;
+			}
+			static uint8_t t[65536];
+			uint32_t o = 0;
+			const uint8_t *p = d + 7;
+			for (uint32_t k = 0; k + 3 <= ml;) {
+				unsigned id = p[k], l = (unsigned)(p[k + 1] | (p[k + 2] << 8));
+				if (id != 0x02) {
+					unsigned nid = id;
+					for (int m = 0; m < x->nmap; m++)
+						if (x->map[m][0] == id)
+							nid = x->map[m][1];
+					t[o++] = (uint8_t)nid;
+					memcpy(t + o, p + k + 1, 2 + l);
+					o += 2 + l;
+				}
+				k += 3 + l;
+			}
+			synth_inds++;
+			printf("[%6llu] abp: replay %s(0x%02x) GET 0x%04x -> indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n",
+			       (unsigned long long)link_ms(), svc_name(x->svc), x->svc, x->msg, x->ind_msg, o, pipe_name[x->rpipe], x->rsess, x->rcid);
+			/* only while that CommCenter client still exists */
+			struct cl *c = cl_get(x->rpipe, x->rsess, x->svc, x->rcid, 0);
+			if (c)
+				send_ind(x->rpipe, x->rsess, x->svc, x->rcid, x->ind_msg, t, o);
+			return;
+		}
+	}
 	struct cl *c = NULL;
 	for (int i = 0; i < NCL && !c; i++)
 		if (cl[i].used == 1 && cl[i].port == h->dst_port)
@@ -1008,8 +1339,20 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		}
 		return;
 	}
+	/* r3: never hand CommCenter an SDU whose lengths do not add up (QMIServiceMsg.cpp:94 exception -> ABM ASSERT) */
+	unsigned ml = d[5] | (d[6] << 8);
+	if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
+		malformed++;
+		char hx[3 * 48 + 8];
+		hexline(hx, sizeof(hx), d, n < 40 ? n : 40);
+		printf("[%6llu] abp: MALFORMED %s from the modem for %s(0x%02x) cid %u (%u bytes, msg len %u): dropped: %s\n",
+		       (unsigned long long)link_ms(), d[0] == 0x04 ? "indication" : d[0] == 0x02 ? "response" : "frame", svc_name(c->svc), c->svc,
+		       c->cid, n, ml, hx);
+		return;
+	}
+	unsigned res = 0xffff, rmsg = (unsigned)(d[3] | (d[4] << 8));
 	if (d[0] == 0x02) {		/* a response: the pending request and its result */
-		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8)), msg = (uint16_t)(d[3] | (d[4] << 8));
+		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8)), msg = (uint16_t)rmsg;
 		for (int i = 0; i < NPEND; i++)
 			if (pend[i].used && pend[i].port == h->dst_port && pend[i].txn == txn) {
 				pend[i].used = 0;
@@ -1020,7 +1363,8 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		const uint8_t *r = NULL;
 		if (!qmi_parse(d, n, &qm))
 			r = qmi_get(&qm, 0x02, &rl);
-		unsigned res = r && rl >= 4 ? (unsigned)(r[0] | (r[1] << 8)) : 0xffff, err = r && rl >= 4 ? (unsigned)(r[2] | (r[3] << 8)) : 0xffff;
+		res = r && rl >= 4 ? (unsigned)(r[0] | (r[1] << 8)) : 0xffff;
+		unsigned err = r && rl >= 4 ? (unsigned)(r[2] | (r[3] << 8)) : 0xffff;
 		struct mst *m = mst_get(c->svc, msg);
 		if (m) {
 			if (res == 0) {
@@ -1040,8 +1384,7 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			}
 		}
 	}
-	unsigned ml = d[5] | (d[6] << 8);
-	uint32_t len = 7 + (ml < n - 7 ? ml : n - 7);
+	uint32_t len = 7 + ml;
 	static uint8_t b[6 + ABP_MAXFRAME];
 	if (6 + len > sizeof(b))
 		return;
@@ -1054,8 +1397,13 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		c->resp++;
 		cnt.resp++;
 	}
+	uint32_t pp = cur_pipe, cpipe = c->pipe, csess = c->sess;
+	unsigned csvc = c->svc, ccid = c->cid;
 	cur_pipe = c->pipe;
 	send_to(c->pipe, c->sess, b, 6 + len);
+	cur_pipe = pp;
+	if (d[0] == 0x02 && res == 0)
+		run_triggers(cpipe, csess, csvc, ccid, rmsg);
 }
 
 /* the per-(svc, msg) table: svc msg action count ok err[last code] noanswer */
@@ -1069,7 +1417,7 @@ static void mst_table(const char *why)
 		if (m->err)
 			snprintf(e, sizeof(e), "[0x%x]", m->last_err);
 		printf("abp:  %02x %-12s %04x %-5s %u %u %u%s %u\n", m->svc, svc_name(m->svc), m->msg,
-		       m->count || m->act ? act_name[m->act < 5 ? m->act : 4] : "-", m->count, m->ok, m->err, e, m->noans);
+		       m->count || m->act ? act_name[m->act < 6 ? m->act : 4] : "-", m->count, m->ok, m->err, e, m->noans);
 	}
 	mst_dirty = 0;
 }
@@ -1229,9 +1577,9 @@ void abpbridge_poll(void)
 				nidle += cl[i].used == 2;
 			}
 			printf("[%6llu] abp: stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; "
-			       "%d router clients (%d idle); no server %u, send fail %u, late %u\n", (unsigned long long)now, nframes_in, nframes_out,
-			       cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped, ncl, nidle, cnt.noserver, cnt.sendfail,
-			       late);
+			       "%d router clients (%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u\n",
+			       (unsigned long long)now, nframes_in, nframes_out, cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped,
+			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds);
 			if (mst_dirty)
 				mst_table("60 s");
 		}

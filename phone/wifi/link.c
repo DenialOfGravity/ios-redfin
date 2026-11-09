@@ -322,25 +322,49 @@ static void handle_data(const uint8_t *d, uint32_t n)
 		LOG("qrtr: version %u\n", hd.version);
 		return;
 	}
-	if (qrtr_cb)
-		qrtr_cb(&hd, d + sizeof(hd), n - sizeof(hd) < hd.size ? n - sizeof(hd) : hd.size);
+	if (!qrtr_cb)
+		return;
+	/*
+	 * 2026-11-09 (P2 run1, CommCenter ABM ASSERT on a truncated PBM indication): the callback can re-enter link_poll()
+	 * (confirm_rx -> qrtr_resume_tx -> link_send waiting for a modem intent, or a router forward), which reassembles the
+	 * next packet into the same static rxbuf while the outer callback still reads it. Each nesting level gets its own copy.
+	 */
+	static uint8_t cpy[3][sizeof(rxbuf)];
+	static int depth;
+	uint32_t pl = n - sizeof(hd) < hd.size ? n - (uint32_t)sizeof(hd) : hd.size;
+	const uint8_t *p = d + sizeof(hd);
+	if (depth < 3) {
+		memcpy(cpy[depth], p, pl);
+		p = cpy[depth];
+	} else {
+		LOG("qrtr: callback nesting %d: packet not copied\n", depth);
+	}
+	depth++;
+	qrtr_cb(&hd, p, pl);
+	depth--;
 }
 
 int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
 	      const void *payload, uint32_t len)
 {
-	static uint8_t b[65536 + 64];
+	/* one TX buffer per nesting level: link_send may poll, and a nested qrtr_send must not overwrite ours (2026-11-09) */
+	static uint8_t bb[3][65536 + 64];
+	static int depth;
+	uint8_t *b = bb[depth < 3 ? depth : 2];
 	struct qrtr_hdr hd = {
 		.version = 1, .type = type, .src_node = QRTR_NODE_APPS, .src_port = src_port,
 		.confirm_rx = 0, .size = len, .dst_node = dst_node, .dst_port = dst_port,
 	};
 	uint32_t padded = (len + 3) & ~3u;
-	if (sizeof(hd) + padded > sizeof(b))
+	if (sizeof(hd) + padded > sizeof(bb[0]))
 		return -1;
 	memset(b + sizeof(hd) + len, 0, padded - len);
 	memcpy(b, &hd, sizeof(hd));
 	memcpy(b + sizeof(hd), payload, len);
-	return link_send(b, sizeof(hd) + padded);
+	depth++;
+	int r = link_send(b, sizeof(hd) + padded);
+	depth--;
+	return r;
 }
 
 int qrtr_new_server(uint32_t service, uint32_t version, uint32_t instance, uint32_t port)
