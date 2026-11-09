@@ -2122,6 +2122,9 @@ void cell_poll(void)
 		if (now - sent_ms > REPLY_MS) {
 			printf("[%6llu] cell: no answer from %s to %#x in 5 s\n", (unsigned long long)now, svc_name[steps[step].svc],
 			       steps[step].id);
+			/* P2 reg 2026-11-09: a lost RESUME_TX of ours leaves the modem's flow control towards CELL_PORT shut */
+			if (srv[steps[step].svc].up)
+				qrtr_kick(CELL_PORT, srv[steps[step].svc].node, srv[steps[step].svc].port);
 			if (++fails[step] == MAX_FAILS)
 				printf("[%6llu] cell: %#x dropped until cell.on changes\n", (unsigned long long)now, steps[step].id);
 			if (++timeouts >= MAX_TIMEOUTS) {

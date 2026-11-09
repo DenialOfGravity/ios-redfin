@@ -4,6 +4,7 @@
  * channel. The modem is QRTR node 0; we are node 1.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "ipcc.h"
@@ -224,6 +225,45 @@ static int rx_one(void)
 	return 1;
 }
 
+/*
+ * 2026-11-09 (P2 reg): no re-entrancy. A packet that arrives while a QRTR callback runs or while a qrtr_send waits for a
+ * modem intent is queued (copied) and dispatched by the outermost link_poll; link_idle never runs nested. Before, the
+ * nesting went 4 deep under the router's replay bursts (link.c's per-level copies ran out: "packet not copied"; nested
+ * qrtr_sends shared a TX buffer, so a RESUME_TX could be overwritten by another packet: the modem then never sent to that
+ * port again = NAS answered nobody, wland's cell.c included), and abpbridge_poll ran inside its own forward (its read
+ * buffer overwritten: "abp: bad record", CommCenter requests lost -> ATCS_TIMEOUT).
+ */
+static int cb_depth, send_depth, idle_depth;
+struct rxq { struct rxq *next; struct qrtr_hdr hd; uint32_t n; uint8_t d[]; };
+static struct rxq *qhead, *qtail;
+static unsigned qlen, qmax, qdrop;
+
+static void dispatch(const struct qrtr_hdr *hd, const uint8_t *p, uint32_t pl)
+{
+	cb_depth++;
+	qrtr_cb(hd, p, pl);
+	cb_depth--;
+}
+
+static void drain(void)
+{
+	while (qhead && !cb_depth && !send_depth) {
+		struct rxq *e = qhead;
+		qhead = e->next;
+		if (!qhead)
+			qtail = NULL;
+		qlen--;
+		dispatch(&e->hd, e->d, e->n);
+		free(e);
+	}
+}
+
+void link_queue_stats(unsigned *max, unsigned *dropped)
+{
+	*max = qmax;
+	*dropped = qdrop;
+}
+
 int link_poll(unsigned ms)
 {
 	uint64_t end = now_ms() + ms;
@@ -231,8 +271,13 @@ int link_poll(unsigned ms)
 	do {
 		while (rx_one())
 			n++;
-		if (link_idle)
+		drain();
+		if (link_idle && !idle_depth && !cb_depth && !send_depth) {
+			idle_depth++;
 			link_idle();
+			idle_depth--;
+			drain();
+		}
 		if (ms)
 			delay_ms(1);
 	} while (now_ms() < end);
@@ -324,24 +369,36 @@ static void handle_data(const uint8_t *d, uint32_t n)
 	}
 	if (!qrtr_cb)
 		return;
-	/*
-	 * 2026-11-09 (P2 run1, CommCenter ABM ASSERT on a truncated PBM indication): the callback can re-enter link_poll()
-	 * (confirm_rx -> qrtr_resume_tx -> link_send waiting for a modem intent, or a router forward), which reassembles the
-	 * next packet into the same static rxbuf while the outer callback still reads it. Each nesting level gets its own copy.
-	 */
-	static uint8_t cpy[3][sizeof(rxbuf)];
-	static int depth;
 	uint32_t pl = n - sizeof(hd) < hd.size ? n - (uint32_t)sizeof(hd) : hd.size;
 	const uint8_t *p = d + sizeof(hd);
-	if (depth < 3) {
-		memcpy(cpy[depth], p, pl);
-		p = cpy[depth];
-	} else {
-		LOG("qrtr: callback nesting %d: packet not copied\n", depth);
+	if (cb_depth || send_depth || qhead) {
+		/* nested (or older packets still waiting): keep the order, dispatch from the outermost link_poll */
+		struct rxq *e = malloc(sizeof(*e) + pl);
+		if (!e || qlen >= 4096) {
+			free(e);
+			qdrop++;
+			LOG("qrtr: rx queue full (%u): packet %u:%x -> %x dropped\n", qlen, hd.src_node, hd.src_port, hd.dst_port);
+			return;
+		}
+		e->next = NULL;
+		e->hd = hd;
+		e->n = pl;
+		memcpy(e->d, p, pl);
+		if (qtail)
+			qtail->next = e;
+		else
+			qhead = e;
+		qtail = e;
+		if (++qlen > qmax)
+			qmax = qlen;
+		drain();
+		return;
 	}
-	depth++;
-	qrtr_cb(&hd, p, pl);
-	depth--;
+	/* outermost: the callback may send, and a send polls the link, which reassembles into rxbuf: own copy */
+	static uint8_t cpy[sizeof(rxbuf)];
+	memcpy(cpy, p, pl);
+	dispatch(&hd, cpy, pl);
+	drain();
 }
 
 int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
@@ -362,7 +419,9 @@ int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 	memcpy(b, &hd, sizeof(hd));
 	memcpy(b + sizeof(hd), payload, len);
 	depth++;
+	send_depth++;
 	int r = link_send(b, sizeof(hd) + padded);
+	send_depth--;
 	depth--;
 	return r;
 }
@@ -379,4 +438,12 @@ int qrtr_resume_tx(const struct qrtr_hdr *h)
 	/* struct qrtr_ctrl_pkt: cmd, then client { node, port } (the union's first two words) */
 	uint32_t pkt[5] = { QRTR_TYPE_RESUME_TX, h->dst_node, h->dst_port, 0, 0 };
 	return qrtr_send(QRTR_TYPE_RESUME_TX, h->dst_port, h->src_node, h->src_port, pkt, sizeof(pkt));
+}
+
+/* An unsolicited RESUME_TX from our port to a remote sender: un-blocks the remote's flow control towards that port if a
+ * RESUME_TX of ours was lost (harmless otherwise: the remote just clears its pending count). 2026-11-09 (P2 reg). */
+int qrtr_kick(uint32_t our_port, uint32_t rnode, uint32_t rport)
+{
+	uint32_t pkt[5] = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, our_port, 0, 0 };
+	return qrtr_send(QRTR_TYPE_RESUME_TX, our_port, rnode, rport, pkt, sizeof(pkt));
 }

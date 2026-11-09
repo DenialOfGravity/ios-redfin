@@ -53,6 +53,9 @@
  *                                      'map a=b'): "replay the current state" for a modem that sent its indications
  *                                      long before CommCenter registered. One line per (svc, msg, kind) is used (all
  *                                      matching 'on' lines run, in file order).
+ * P2 reg (2026-11-09): an 'on' line may end in "if <tlv>": it runs only when the request carried TLV <tlv> with a non-zero
+ * first byte (e.g. "on 0x03 0x0003 replay 0x004d 0x004e if 18": sys info only to a client that enabled sys info inds).
+ * A forwarded request unanswered for 5 s sends an unsolicited RESUME_TX from its port to the server (abpkick=0: off).
  * Every SDU from the modem is checked (msg len and TLVs must add up) before it goes to CommCenter: a malformed one is
  * dropped and logged ("abp: MALFORMED"), as one truncated PBM indication ABM-ASSERTed CommCenter in P2 run1.
  * Every new (svc, msg) is logged once with the action and why ("abp: NEW ..."); a policy reload logs them again.
@@ -170,6 +173,8 @@ static struct pend {
 	uint32_t rpipe, rsess;
 	uint8_t rcid, nmap, map[TRG_MAXMAP][2];
 	uint16_t ind_msg;
+	/* P2 reg: the request's TLVs (first 96 bytes), for 'if <tlv>' triggers on its answer */
+	uint8_t rqn, rq[96];
 } pend[NPEND];
 static uint16_t replay_txn = 0xff00;	/* router-made GETs use txn 0xff00..0xfffe */
 
@@ -224,11 +229,13 @@ static struct trg {
 	int nmap;
 	const uint8_t *data;		/* ind: TLVs */
 	uint16_t dlen;
+	int cond;			/* P2 reg 'if <tlv>': only when the request had TLV <tlv> with a non-zero first byte; -1 always */
 } trg[NTRG];
 static int ntrg;
 static uint8_t pol_data[16384];	/* hex data of resp/ind lines (one policy load) */
 static uint32_t pol_dlen;
-static unsigned malformed, replays, synth_inds;
+static unsigned malformed, replays, synth_inds, badrec;
+static int kickon = 1;		/* abpkick=0 turns the lost-RESUME_TX recovery off */
 
 /*
  * Built-in defaults (P2). Exact (svc, msg) entries win over the (svc, POL_ANY) entry; a service with no entry is
@@ -380,10 +387,20 @@ static int tlvs_ok(const uint8_t *p, uint32_t n)
 static int parse_trigger(char *line, int ln)
 {
 	char w[7][256];
-	int k = sscanf(line, "%255s %255s %255s %255s %255s %255s %255s", w[0], w[1], w[2], w[3], w[4], w[5], w[6]);
 	struct trg t;
-	int a, b;
 	memset(&t, 0, sizeof(t));
+	t.cond = -1;
+	/* P2 reg: optional trailing "if <tlv>" (cut off before the rest is parsed) */
+	char *iff = strstr(line, " if ");
+	if (iff) {
+		unsigned c;
+		if (sscanf(iff + 4, "%x", &c) != 1 || c > 255)
+			goto bad;
+		t.cond = (int)c;
+		*iff = 0;
+	}
+	int k = sscanf(line, "%255s %255s %255s %255s %255s %255s %255s", w[0], w[1], w[2], w[3], w[4], w[5], w[6]);
+	int a, b;
 	if (k < 5 || ntrg >= NTRG || parse_num(w[1], &t.svc) || t.svc < 1 || t.svc > 255 || parse_num(w[2], &t.msg) ||
 	    parse_num(w[4], &a) || a < 0 || a > 0xffff)
 		goto bad;
@@ -427,7 +444,7 @@ static int parse_trigger(char *line, int ln)
 	trg[ntrg++] = t;
 	return 0;
 bad:
-	printf("abp: %s line %d: bad 'on' line (on <svc> <msg> ind <msg> [<hex>] | on <svc> <msg> replay <get> <ind> [map a=b,..])\n",
+	printf("abp: %s line %d: bad 'on' line (on <svc> <msg> ind <msg> [<hex>] | on <svc> <msg> replay <get> <ind> [map a=b,..]; optional ' if <tlv>' at the end)\n",
 	       ABP_POLICY, ln);
 	return -1;
 }
@@ -1062,12 +1079,28 @@ static struct cl *cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
  * r3: the 'on' lines for (svc, msg) after a successful answer went to CommCenter client (pipe, sess, svc, cid):
  * synthesized indications and state replays (GET to the modem, answer re-wrapped as an indication).
  */
-static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg)
+/* the first byte of TLV id in a TLV list; -1 if absent or empty */
+static int tlv_byte(const uint8_t *p, uint32_t n, unsigned id)
+{
+	for (uint32_t k = 0; k + 3 <= n;) {
+		unsigned l = (unsigned)(p[k + 1] | (p[k + 2] << 8));
+		if (k + 3 + l > n)
+			return -1;
+		if (p[k] == id)
+			return l ? p[k + 3] : -1;
+		k += 3 + l;
+	}
+	return -1;
+}
+
+static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *rq, uint32_t rqn)
 {
 	for (int i = 0; i < ntrg; i++) {
 		struct trg *t = &trg[i];
 		if (t->svc != (int)svc || t->msg != (int)msg)
 			continue;
+		if (t->cond >= 0 && tlv_byte(rq, rqn, (unsigned)t->cond) <= 0)
+			continue;	/* P2 reg: this request did not enable that indication */
 		if (t->kind == TRG_IND) {
 			synth_inds++;
 			printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
@@ -1142,6 +1175,9 @@ static void svc_forward(unsigned pipe, unsigned svc, unsigned cid, const uint8_t
 	x.txn = (uint16_t)(s[1] | (s[2] << 8));
 	x.msg = (uint16_t)(s[3] | (s[4] << 8));
 	x.svc = (uint8_t)svc;
+	uint32_t tn = len - 7 < sizeof(x.rq) ? len - 7 : (uint32_t)sizeof(x.rq);
+	x.rqn = (uint8_t)tn;
+	memcpy(x.rq, s + 7, tn);
 	pend_add(&x);
 }
 
@@ -1215,12 +1251,12 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 	case ACT_OK:
 		cnt.local_ok++;
 		svc_local(pipe, svc, cid, s, 0, 0);
-		run_triggers(pipe, cur_sess, svc, cid, msg);
+		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8)));
 		break;
 	case ACT_RESP:
 		cnt.local_ok++;
 		svc_local_tlv(pipe, svc, cid, s, 0, 0, dec_data, dec_dlen);
-		run_triggers(pipe, cur_sess, svc, cid, msg);
+		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8)));
 		break;
 	case ACT_ERR:
 		cnt.local_err++;
@@ -1351,11 +1387,15 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		return;
 	}
 	unsigned res = 0xffff, rmsg = (unsigned)(d[3] | (d[4] << 8));
+	uint8_t rq[96];
+	uint32_t rqn = 0;
 	if (d[0] == 0x02) {		/* a response: the pending request and its result */
 		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8)), msg = (uint16_t)rmsg;
 		for (int i = 0; i < NPEND; i++)
 			if (pend[i].used && pend[i].port == h->dst_port && pend[i].txn == txn) {
 				pend[i].used = 0;
+				rqn = pend[i].rqn;
+				memcpy(rq, pend[i].rq, rqn);
 				break;
 			}
 		struct qmi_msg qm;
@@ -1403,7 +1443,7 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	send_to(c->pipe, c->sess, b, 6 + len);
 	cur_pipe = pp;
 	if (d[0] == 0x02 && res == 0)
-		run_triggers(cpipe, csess, csvc, ccid, rmsg);
+		run_triggers(cpipe, csess, csvc, ccid, rmsg, rq, rqn);
 }
 
 /* the per-(svc, msg) table: svc msg action count ok err[last code] noanswer */
@@ -1464,6 +1504,8 @@ static void read_words(void)
 		cidfail = w ? atoi(w + 11) : 0;
 		w = strstr(b, "abpreuse=");
 		reuse = w ? atoi(w + 9) : 1;
+		w = strstr(b, "abpkick=");
+		kickon = w ? atoi(w + 8) : 1;
 		w = strstr(b, "abpdump=");
 		dumpword = w ? atoi(w + 8) : 0;
 	}
@@ -1530,6 +1572,28 @@ void abpbridge_early(void)
 	update_ready();
 }
 
+/*
+ * P2 reg (2026-11-09): a forwarded request unanswered for 5 s -> an unsolicited RESUME_TX from that router port to the
+ * modem's server (at most once per port per 5 s). After the link.c nesting bug the modem had stopped sending to the
+ * pooled NAS ports (a lost RESUME_TX = the modem's flow control towards that port never re-opens); the pool kept
+ * handing those dead ports to every new CommCenter client. Disable with abpkick=0.
+ */
+static unsigned kicks;
+static uint64_t kick_t[ABP_NPORTS];
+static void kick(uint32_t port, unsigned svc, uint64_t now)
+{
+	int si = srv_find(svc);
+	if (!kickon || si < 0 || port < ABP_PORT0 || port >= ABP_PORT0 + ABP_NPORTS)
+		return;
+	if (kick_t[port - ABP_PORT0] && now - kick_t[port - ABP_PORT0] < 5000)
+		return;
+	kick_t[port - ABP_PORT0] = now;
+	kicks++;
+	printf("[%6llu] abp: kick: RESUME_TX port %#x -> %s server 0:%x (a request got no answer in 5 s)\n", (unsigned long long)now,
+	       port, svc_name(svc), srv[si].port);
+	qrtr_kick(port, srv[si].node, srv[si].port);
+}
+
 void abpbridge_poll(void)
 {
 	uint64_t now = link_ms();
@@ -1554,6 +1618,7 @@ void abpbridge_poll(void)
 		for (int i = 0; i < NPEND; i++)
 			if (pend[i].used && now - pend[i].t > 5000) {
 				pend[i].used = 0;
+				kick(pend[i].port, pend[i].svc, now);
 				struct mst *m = mst_get(pend[i].svc, pend[i].msg);
 				if (m) {
 					m->noans++;
@@ -1572,14 +1637,17 @@ void abpbridge_poll(void)
 	if (mode >= 2 && now >= next_stats) {
 		if (next_stats) {
 			int ncl = 0, nidle = 0;
+			unsigned qmx, qdr;
+			link_queue_stats(&qmx, &qdr);
 			for (int i = 0; i < NCL; i++) {
 				ncl += cl[i].used == 1;
 				nidle += cl[i].used == 2;
 			}
 			printf("[%6llu] abp: stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; "
-			       "%d router clients (%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u\n",
+			       "%d router clients (%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u; "
+			       "bad records %u, kicks %u, rxq max %u drop %u\n",
 			       (unsigned long long)now, nframes_in, nframes_out, cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped,
-			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds);
+			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr);
 			if (mst_dirty)
 				mst_table("60 s");
 		}
@@ -1597,6 +1665,7 @@ void abpbridge_poll(void)
 			struct abpb_hdr h;
 			memcpy(&h, rbuf + off, sizeof(h));
 			if (h.magic != ABPB_MAGIC || h.len > (uint32_t)r - off - sizeof(h)) {
+				badrec++;
 				printf("[%6llu] abp: bad record at %u (magic 0x%x len %u)\n", (unsigned long long)now, off, h.magic, h.len);
 				return;
 			}
