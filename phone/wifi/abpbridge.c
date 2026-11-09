@@ -55,6 +55,8 @@
  *                                      matching 'on' lines run, in file order).
  * P2 reg (2026-11-09): an 'on' line may end in "if <tlv>": it runs only when the request carried TLV <tlv> with a non-zero
  * first byte (e.g. "on 0x03 0x0003 replay 0x004d 0x004e if 18": sys info only to a client that enabled sys info inds).
+ * "strip <svc> <msg> <tlv>[,..]" lines remove TLVs from that (svc, msg) on the way to CommCenter (responses, indications,
+ * replays): Apple's NAS SysInfo handler asserts (boost::optional get) on the modem's 1-byte TLV 0x26.
  * A forwarded request unanswered for 5 s sends an unsolicited RESUME_TX from its port to the server (abpkick=0: off).
  * Every SDU from the modem is checked (msg len and TLVs must add up) before it goes to CommCenter: a malformed one is
  * dropped and logged ("abp: MALFORMED"), as one truncated PBM indication ABM-ASSERTed CommCenter in P2 run1.
@@ -236,6 +238,66 @@ static uint8_t pol_data[16384];	/* hex data of resp/ind lines (one policy load) 
 static uint32_t pol_dlen;
 static unsigned malformed, replays, synth_inds, badrec;
 static int kickon = 1;		/* abpkick=0 turns the lost-RESUME_TX recovery off */
+/* P2 reg: "strip <svc> <msg> <tlv>[,<tlv>..]": those TLVs are removed from every modem message (response, indication,
+ * replay) of (svc, msg) before it reaches CommCenter (Apple's parsers assert on some Qualcomm TLVs, e.g. NAS SysInfo 0x26) */
+#define NSTRIP	32
+static struct strip { int svc, msg; uint8_t ids[32]; int nids; } strips[NSTRIP];
+static int nstrip;
+static unsigned stripped;
+
+/* drop the TLVs listed for (svc, msg) from TLV list p (n bytes) in place; returns the new length */
+static uint32_t strip_tlvs(unsigned svc, unsigned msg, uint8_t *p, uint32_t n)
+{
+	const struct strip *st = NULL;
+	for (int i = 0; i < nstrip && !st; i++)
+		if (strips[i].svc == (int)svc && strips[i].msg == (int)msg)
+			st = &strips[i];
+	if (!st)
+		return n;
+	uint32_t o = 0;
+	for (uint32_t k = 0; k + 3 <= n;) {
+		uint32_t l = 3u + (uint32_t)(p[k + 1] | (p[k + 2] << 8));
+		if (k + l > n)
+			break;
+		int drop = 0;
+		for (int j = 0; j < st->nids; j++)
+			drop |= st->ids[j] == p[k];
+		if (drop)
+			stripped++;
+		else {
+			memmove(p + o, p + k, l);
+			o += l;
+		}
+		k += l;
+	}
+	return o;
+}
+
+static int parse_num(const char *s, int *v);
+static int parse_strip(char *line, int ln)
+{
+	char w[4][256];
+	struct strip t;
+	memset(&t, 0, sizeof(t));
+	if (sscanf(line, "%255s %255s %255s %255s", w[0], w[1], w[2], w[3]) != 4 || nstrip >= NSTRIP || parse_num(w[1], &t.svc) ||
+	    parse_num(w[2], &t.msg))
+		goto bad;
+	for (char *m = w[3]; *m && t.nids < 32;) {
+		unsigned x;
+		if (sscanf(m, "%x", &x) != 1 || x > 255)
+			goto bad;
+		t.ids[t.nids++] = (uint8_t)x;
+		while (*m && *m != ',')
+			m++;
+		if (*m == ',')
+			m++;
+	}
+	strips[nstrip++] = t;
+	return 0;
+bad:
+	printf("abp: %s line %d: bad 'strip' line (strip <svc> <msg> <tlv>[,<tlv>..])\n", ABP_POLICY, ln);
+	return -1;
+}
 
 /*
  * Built-in defaults (P2). Exact (svc, msg) entries win over the (svc, POL_ANY) entry; a service with no entry is
@@ -457,6 +519,7 @@ static void policy_load(int force)
 			printf("[%6llu] abp: %s gone: built-in policy only\n", (unsigned long long)link_ms(), ABP_POLICY);
 			novr = 0;
 			ntrg = 0;
+			nstrip = 0;
 			pol_dlen = 0;
 			ovr_mtime = 0;
 			nseen = 0;	/* decisions are logged again */
@@ -473,6 +536,7 @@ static void policy_load(int force)
 	static char line[12288];
 	int n = 0, bad = 0, ln = 0;
 	ntrg = 0;
+	nstrip = 0;
 	pol_dlen = 0;
 	while (fgets(line, sizeof(line), f) && n < NOVR) {
 		char a[64], b[64], c[8400];
@@ -482,6 +546,10 @@ static void policy_load(int force)
 			*h = 0;
 		if (sscanf(line, "%63s", a) == 1 && !strcmp(a, "on")) {
 			bad += parse_trigger(line, ln) != 0;
+			continue;
+		}
+		if (sscanf(line, "%63s", a) == 1 && !strcmp(a, "strip")) {
+			bad += parse_strip(line, ln) != 0;
 			continue;
 		}
 		if (sscanf(line, "%63s %63s %8399s", a, b, c) != 3)
@@ -518,8 +586,8 @@ static void policy_load(int force)
 	fclose(f);
 	novr = n;
 	nseen = 0;
-	printf("[%6llu] abp: policy %s: %d override line(s), %d trigger line(s)%s, decisions logged again\n", (unsigned long long)link_ms(),
-	       ABP_POLICY, n, ntrg, bad ? " (some lines refused)" : "");
+	printf("[%6llu] abp: policy %s: %d override line(s), %d trigger line(s), %d strip line(s)%s, decisions logged again\n", (unsigned long long)link_ms(),
+	       ABP_POLICY, n, ntrg, nstrip, bad ? " (some lines refused)" : "");
 }
 
 static const uint8_t *dec_data;	/* ACT_RESP: the TLVs of the last decide() */
@@ -1351,6 +1419,7 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 				}
 				k += 3 + l;
 			}
+			o = strip_tlvs(x->svc, x->ind_msg, t, o);
 			synth_inds++;
 			printf("[%6llu] abp: replay %s(0x%02x) GET 0x%04x -> indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n",
 			       (unsigned long long)link_ms(), svc_name(x->svc), x->svc, x->msg, x->ind_msg, o, pipe_name[x->rpipe], x->rsess, x->rcid);
@@ -1429,6 +1498,14 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (6 + len > sizeof(b))
 		return;
 	memcpy(b + 6, d, len);
+	if (nstrip) {
+		uint32_t nl = strip_tlvs(c->svc, rmsg, b + 13, ml);
+		if (nl != ml) {
+			b[11] = (uint8_t)nl;
+			b[12] = (uint8_t)(nl >> 8);
+			len = 7 + nl;
+		}
+	}
 	finish_qmux(b, 6 + len, c->svc, c->cid);
 	if (d[0] == 0x04) {
 		c->ind++;
@@ -1645,9 +1722,9 @@ void abpbridge_poll(void)
 			}
 			printf("[%6llu] abp: stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; "
 			       "%d router clients (%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u; "
-			       "bad records %u, kicks %u, rxq max %u drop %u\n",
+			       "bad records %u, kicks %u, rxq max %u drop %u, stripped %u\n",
 			       (unsigned long long)now, nframes_in, nframes_out, cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped,
-			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr);
+			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr, stripped);
 			if (mst_dirty)
 				mst_table("60 s");
 		}
