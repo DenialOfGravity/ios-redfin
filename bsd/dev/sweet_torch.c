@@ -52,8 +52,10 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include "sweet_spmi.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern int sweet_thermal_torch_dc(void);        /* 1062: sweet_thermal.c */
 extern kern_return_t thread_terminate(thread_t);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
@@ -98,6 +100,17 @@ void sweet_torch_flash_off(void);
 #define FLASH_MA_CAP     300u
 #define FLASH_MS_CAP     100u
 #define PREFLASH_MS_CAP  500u
+/*
+ * 1062: the temperature-alarm probe is tried ALARM_TRIES times, ALARM_GAP_MS apart (r5au1f: one read raced
+ * sweet_keys.c and the torch refused everything for the whole boot). Without the alarm the torch still works,
+ * at most sweettorch_noalarm_ma per channel (default 50, never above sweettorch_ma), and goes off when tsens
+ * (the camera block, else the hottest sensor) reaches sweettorch_tsens_dc deci-degC (default 550).
+ * sysctl kern.sweet_torch_reinit = 1: probe again (and start the driver again if it had stopped).
+ */
+#define ALARM_TRIES      5u
+#define ALARM_GAP_MS     20u
+#define NOALARM_MA_DEFAULT 50u
+#define TSENS_DC_DEFAULT 550
 
 struct tc_chan {
 	vm_offset_t obs, chnl;  /* read (observer) and write channel of one peripheral */
@@ -107,6 +120,9 @@ static struct {
 	vm_offset_t core, cnfg;
 	struct tc_chan fl, alarm;
 	bool alarm_gen2;
+	bool alarm_ok;                  /* 1062: the PMIC temperature alarm probed fine */
+	unsigned noalarm_ma;            /* 1062 */
+	int tsens_dc;                   /* 1062 */
 	unsigned max_ma, max_s;
 	bool ready, dead, lit, on_the_fly;
 	bool flash;                     /* 0933: lit as a flash (the safety timer running) */
@@ -122,6 +138,10 @@ static volatile uint32_t torch_req_ms;  /* 0 = until max_s */
 static volatile unsigned torch_level;   /* last sysctl level */
 static LCK_GRP_DECLARE(torch_grp, "sweet_torch");
 static LCK_MTX_DECLARE(torch_lock, &torch_grp);        /* 0933: the camera's flash calls and this thread */
+static volatile uint32_t torch_running;         /* 1062: torch_thread exists */
+static volatile uint32_t torch_reinit_req;      /* 1062: kern.sweet_torch_reinit while it runs */
+static unsigned torch_reinits;
+static int torch_alarm_pub;                     /* 1062: kern.sweet_torch_alarm */
 
 static uint32_t
 tc_rd32(vm_offset_t base, uint32_t off)
@@ -193,11 +213,13 @@ tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
 		return -1;
 	}
 	for (unsigned attempt = 0; attempt < 3; attempt++) {
+		int bus = sweet_spmi_bus_lock();        /* 1062: command, status and data as one */
 		if (write) {
 			tc_wr32(ch, 0x10, *val);
 		}
 		tc_wr32(ch, 0x00, ((write ? 0u : 1u) << 27) | ((uint32_t)reg << 4));
 		uint32_t st = 0;
+		uint8_t data = 0;
 		unsigned i;
 		for (i = 0; i < 1000; i++) {
 			st = tc_rd32(ch, 0x08);
@@ -206,6 +228,10 @@ tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
 			}
 			delay(1);
 		}
+		if (i < 1000 && !write && !(st & 0xeu)) {
+			data = (uint8_t)tc_rd32(ch, 0x18);
+		}
+		sweet_spmi_bus_unlock(bus);
 		if (i == 1000) {
 			printf("SWEET TORCH: spmi %s %x:%#x timeout\n", write ? "write" : "read", c->sid, at);
 			tc.dead = true;
@@ -219,7 +245,7 @@ tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
 			return -1;
 		}
 		if (!write) {
-			*val = (uint8_t)tc_rd32(ch, 0x18);
+			*val = data;
 		}
 		return 0;
 	}
@@ -455,7 +481,7 @@ tc_check(void)
 	uint8_t rt = 0, s1 = 0, s2 = 0, alarm = 0;
 	static uint8_t otst_said = 0xff;
 	if (tc_read(FL_INT_RT_STS, &rt) || tc_read(FL_STATUS1, &s1) || tc_read(FL_STATUS2, &s2) ||
-	    tc_xfer(&tc.alarm, false, 0x08, &alarm)) {
+	    (tc.alarm_ok && tc_xfer(&tc.alarm, false, 0x08, &alarm))) {
 		tc.dead = true;
 		return false;
 	}
@@ -465,6 +491,14 @@ tc_check(void)
 		printf("SWEET TORCH: PM8150L temperature stage %u: off\n", stage);
 		tc.dead = true;
 		return false;
+	}
+	if (!tc.alarm_ok) {     /* 1062: tsens instead; off (not stopped) when hot */
+		int dc = sweet_thermal_torch_dc();
+		if (dc != -9999 && dc >= tc.tsens_dc) {
+			printf("SWEET TORCH: tsens %d.%d C >= %d.%d C (no temp alarm): off\n", dc / 10, dc % 10,
+			    tc.tsens_dc / 10, tc.tsens_dc % 10);
+			return false;
+		}
 	}
 	/*
 	 * r15c: STATUS1 0x1 and INT_RT_STS 0x4 for one check, 0.7 s after lighting, gone at the next read
@@ -490,8 +524,44 @@ tc_check(void)
 	return true;
 }
 
+/* 1062: the cap per channel now (lower without the temperature alarm) */
+static unsigned
+tc_cap_ma(void)
+{
+	return tc.alarm_ok || tc.noalarm_ma > tc.max_ma ? tc.max_ma : tc.noalarm_ma;
+}
+
+/* 1062: the PM8150L temperature alarm (SID 4, 0x2400): TYPE 0x09, SUBTYPE 0x08 (GEN1) / 0x09 (GEN2), STATUS */
+static bool
+tc_probe_alarm(const char *why)
+{
+	uint8_t atype = 0, asub = 0, astatus = 0;
+	tc.alarm_ok = false;
+	torch_alarm_pub = 0;
+	for (unsigned t = 1; t <= ALARM_TRIES; t++) {
+		atype = asub = astatus = 0;
+		if (!tc_xfer(&tc.alarm, false, 0x04, &atype) && !tc_xfer(&tc.alarm, false, 0x05, &asub) &&
+		    !tc_xfer(&tc.alarm, false, 0x08, &astatus) && atype == 0x09 && (asub == 0x08 || asub == 0x09)) {
+			tc.alarm_gen2 = asub == 0x09;
+			tc.alarm_ok = true;
+			torch_alarm_pub = 1;
+			printf("SWEET TORCH: PM8150L temperature alarm GEN%u, status %#x (%s, try %u)\n", tc.alarm_gen2 ? 2 : 1,
+			    astatus, why, t);
+			return true;
+		}
+		printf("SWEET TORCH: PM8150L temperature alarm: type %#x subtype %#x: try %u of %u failed (%s)%s\n", atype, asub,
+		    t, ALARM_TRIES, why, t < ALARM_TRIES ? ", again in 20 ms" : "");
+		if (t < ALARM_TRIES) {
+			tc_sleep(ALARM_GAP_MS);
+		}
+	}
+	printf("SWEET TORCH: no temp alarm: torch limited to %u mA / thermal cutoff via tsens at %d.%d C (now %d)\n",
+	    tc_cap_ma(), tc.tsens_dc / 10, tc.tsens_dc % 10, sweet_thermal_torch_dc());
+	return false;
+}
+
 static void
-torch_thread(void *arg __unused, wait_result_t wr __unused)
+torch_thread(void *arg, wait_result_t wr __unused)
 {
 	uint32_t mode = 0;
 	PE_parse_boot_argn("sweettorch", &mode, sizeof(mode));
@@ -504,21 +574,25 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
 	PE_parse_boot_argn("sweettorch_flash_ma", &tc.flash_ma, sizeof(tc.flash_ma));
 	tc.flash_ma = tc.flash_ma == 0 ? FLASH_MA_DEFAULT : tc.flash_ma > FLASH_MA_CAP ? FLASH_MA_CAP : tc.flash_ma;
 	tc.max_s = tc.max_s == 0 ? TORCH_S_DEFAULT : tc.max_s > TORCH_S_CAP ? TORCH_S_CAP : tc.max_s;
-	tc_sleep(6000);
-	tc.core = ml_io_map(SP_CORE_PA, 0x2000);
-	tc.cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
-	if (!tc.core || !tc.cnfg || !tc_find_channel(&tc.fl, FL_SID, FL_PERIPH, mode >= 2) ||
-	    !tc_find_channel(&tc.alarm, 4, 0x24, false)) {
+	tc.noalarm_ma = NOALARM_MA_DEFAULT;
+	PE_parse_boot_argn("sweettorch_noalarm_ma", &tc.noalarm_ma, sizeof(tc.noalarm_ma));
+	tc.noalarm_ma = tc.noalarm_ma == 0 ? 1 : tc.noalarm_ma;
+	tc.tsens_dc = TSENS_DC_DEFAULT;
+	PE_parse_boot_argn("sweettorch_tsens_dc", &tc.tsens_dc, sizeof(tc.tsens_dc));
+	if (arg == NULL) {
+		tc_sleep(6000);
+	} else {
+		printf("SWEET TORCH: started again (kern.sweet_torch_reinit)\n");
+	}
+	if (!tc.core) {
+		tc.core = ml_io_map(SP_CORE_PA, 0x2000);
+		tc.cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
+	}
+	if (!tc.core || !tc.cnfg || (!tc.fl.obs && !tc_find_channel(&tc.fl, FL_SID, FL_PERIPH, mode >= 2)) ||
+	    (!tc.alarm.obs && !tc_find_channel(&tc.alarm, 4, 0x24, false))) {
 		goto out;
 	}
-	uint8_t atype = 0, asub = 0, astatus = 0;
-	if (tc_xfer(&tc.alarm, false, 0x04, &atype) || tc_xfer(&tc.alarm, false, 0x05, &asub) ||
-	    tc_xfer(&tc.alarm, false, 0x08, &astatus) || atype != 0x09 || (asub != 0x08 && asub != 0x09)) {
-		printf("SWEET TORCH: PM8150L temperature alarm: type %#x subtype %#x: not usable\n", atype, asub);
-		goto out;
-	}
-	tc.alarm_gen2 = asub == 0x09;
-	printf("SWEET TORCH: PM8150L temperature alarm GEN%u, status %#x\n", tc.alarm_gen2 ? 2 : 1, astatus);
+	(void)tc_probe_alarm("start");  /* 1062: retried; without it the torch is limited, not refused */
 	uint8_t type = 0, sub = 0, chicken = 0;
 	if (tc_read(FL_TYPE, &type) || tc_read(FL_SUBTYPE, &sub)) {
 		goto out;
@@ -542,8 +616,8 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 	tc_dump("configured");
 	tc.ready = true;
-	printf("SWEET TORCH: ready: at most %u mA per channel, %u s at a time; current change while lit %s\n",
-	    tc.max_ma, tc.max_s, tc.on_the_fly ? "yes" : "no");
+	printf("SWEET TORCH: ready: at most %u mA per channel, %u s at a time; current change while lit %s%s\n",
+	    tc_cap_ma(), tc.max_s, tc.on_the_fly ? "yes" : "no", tc.alarm_ok ? "" : "; no temp alarm (tsens cutoff)");
 	if (mode >= 3) {
 		(void)sweet_torch_set(5, 400);
 	}
@@ -552,19 +626,25 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
 		uint64_t deadline;
 		clock_interval_to_deadline(tc.lit ? 100 : 60000, NSEC_PER_MSEC, &deadline);
 		(void)assert_wait_deadline(&torch_chan, THREAD_UNINT, deadline);
-		if (torch_req & (1u << 31)) {
+		if ((torch_req & (1u << 31)) || torch_reinit_req) {
 			clear_wait(current_thread(), THREAD_AWAKENED);
 		} else {
 			thread_block(THREAD_CONTINUE_NULL);
 		}
 		lck_mtx_lock(&torch_lock);
+		if (__atomic_exchange_n(&torch_reinit_req, 0, __ATOMIC_ACQ_REL)) {
+			(void)tc_probe_alarm("kern.sweet_torch_reinit");      /* 1062 */
+			if (tc.lit && !tc.flash && tc.lit_ma > tc_cap_ma()) {
+				(void)tc_on(tc_cap_ma());
+			}
+		}
 		uint32_t req = __atomic_exchange_n(&torch_req, 0, __ATOMIC_ACQ_REL);
 		uint64_t now = mach_absolute_time();
 		if (req & (1u << 31)) {
-			unsigned ma = req & 0xffffu, ms = torch_req_ms;
+			unsigned ma = req & 0xffffu, ms = torch_req_ms, cap = tc_cap_ma();
 			if (ma == 0) {
 				tc_off("asked");
-			} else if (tc_on(ma > tc.max_ma ? tc.max_ma : ma) == 0) {
+			} else if (tc_on(ma > cap ? cap : ma) == 0) {
 				uint64_t span;
 				unsigned limit = ms && ms < tc.max_s * 1000u ? ms : tc.max_s * 1000u;
 				nanoseconds_to_absolutetime((uint64_t)limit * NSEC_PER_MSEC, &span);
@@ -572,7 +652,10 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
 			}
 		}
 		if (tc.lit) {
-			if (!tc_check()) {
+			if (!tc_check() && !tc.dead) {
+				tc_off("tsens");       /* 1062: hot without the alarm: off, the driver stays */
+				torch_level = 0;
+			} else if (tc.dead) {
 				uint8_t raw[0x16];
 				for (unsigned i = 0; i < sizeof(raw); i++) {
 					if (tc_read((uint8_t)(0x06 + i), &raw[i])) {
@@ -599,6 +682,7 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
 	lck_mtx_unlock(&torch_lock);
 out:
 	tc.ready = false;
+	__atomic_store_n(&torch_running, 0, __ATOMIC_RELEASE);
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }
@@ -673,11 +757,56 @@ sysctl_sweet_torch SYSCTL_HANDLER_ARGS
 		return EINVAL;
 	}
 	torch_level = (unsigned)value;
-	unsigned ma = value == 0 ? 0 : (tc.max_ma * (unsigned)value + 999u) / 1000u;
+	unsigned ma = value == 0 ? 0 : (tc_cap_ma() * (unsigned)value + 999u) / 1000u;
 	return sweet_torch_set(ma, 0);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_torch, "I", "SWEET flashlight: level 0..1000 (0 off)");
+
+/* 1062: write 1 = probe the temperature alarm again; if the driver had stopped, start it again (no 6 s wait) */
+static int
+sysctl_sweet_torch_reinit SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, (int)torch_reinits, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value != 1) {
+		return EINVAL;
+	}
+	uint32_t mode = 0;
+	PE_parse_boot_argn("sweettorch", &mode, sizeof(mode));
+	if (!mode) {
+		return ENODEV;
+	}
+	torch_reinits++;
+	if (__atomic_load_n(&torch_running, __ATOMIC_ACQUIRE) && tc.ready && !tc.dead) {
+		__atomic_store_n(&torch_reinit_req, 1, __ATOMIC_RELEASE);
+		thread_wakeup(&torch_chan);
+		return 0;
+	}
+	uint32_t idle = 0;
+	if (!__atomic_compare_exchange_n(&torch_running, &idle, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		return EBUSY;   /* still starting or stopping */
+	}
+	lck_mtx_lock(&torch_lock);
+	tc.dead = false;
+	tc.lit = tc.flash = false;
+	lck_mtx_unlock(&torch_lock);
+	thread_t t;
+	if (kernel_thread_start(torch_thread, (void *)1, &t) != KERN_SUCCESS) {
+		__atomic_store_n(&torch_running, 0, __ATOMIC_RELEASE);
+		return ENOMEM;
+	}
+	thread_deallocate(t);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_torch_reinit, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_torch_reinit, "I", "1062: 1 = probe the temperature alarm again / restart the torch driver");
+SYSCTL_INT(_kern, OID_AUTO, sweet_torch_alarm, CTLFLAG_RD | CTLFLAG_LOCKED, &torch_alarm_pub, 0,
+    "1062: 1 = the PMIC temperature alarm is in use");
 
 void
 sweet_torch_init(void)
@@ -688,8 +817,11 @@ sweet_torch_init(void)
 		return;
 	}
 	thread_t t;
+	__atomic_store_n(&torch_running, 1, __ATOMIC_RELEASE);
 	if (kernel_thread_start(torch_thread, NULL, &t) == KERN_SUCCESS) {
 		thread_deallocate(t);
+	} else {
+		__atomic_store_n(&torch_running, 0, __ATOMIC_RELEASE);
 	}
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */

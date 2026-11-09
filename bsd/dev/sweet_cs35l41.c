@@ -34,6 +34,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include "sweet_spmi.h"
 #include <sys/systm.h>
 #include <sys/errno.h>
 
@@ -126,6 +127,7 @@ spmi(unsigned which, unsigned reg, bool write, uint8_t *val)
 		SAY("spmi %s %s reg %#x refused (apid %#x owner %u)\n", write ? "write" : "read", allowed[which].name, reg, apid, owner);
 		return -1;
 	}
+	int bus = sweet_spmi_bus_lock();        /* 1062 */
 	if (write) {
 		if (sp_chnl[which] == 0) {
 			sp_chnl[which] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
@@ -141,16 +143,19 @@ spmi(unsigned which, unsigned reg, bool write, uint8_t *val)
 
 		if (st & 1u) {
 			if (st & 0x0eu) {
+				sweet_spmi_bus_unlock(bus);
 				SAY("spmi %s reg %#x status %#x\n", allowed[which].name, reg, st);
 				return -1;
 			}
 			if (!write) {
 				*val = (uint8_t)mrd(ch, 0x18);
 			}
+			sweet_spmi_bus_unlock(bus);
 			return 0;
 		}
 		delay(1);
 	}
+	sweet_spmi_bus_unlock(bus);
 	SAY("spmi %s reg %#x timeout\n", allowed[which].name, reg);
 	return -1;
 }

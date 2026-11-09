@@ -15,6 +15,15 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
  */
 int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
 int sweet_spmi_write_enabled(void);
+/*
+ * 1062: one lock for every SPMI transaction of every sweet driver (keys, torch, camera GPIOs, haptic,
+ * CS35L41 GPIOs, battery/charger/thermal/RTC here): command, status and data of one transfer can no
+ * longer interleave with another driver's. sweet_spmi_bus_lock() returns whether it took the lock
+ * (boot-arg sweetspmilock=0 or sysctl kern.sweet_spmi_lock=0: no lock, the old behaviour); pass that
+ * to sweet_spmi_bus_unlock(). Thread context only (a mutex; the transfers spin up to 1 ms).
+ */
+int sweet_spmi_bus_lock(void);
+void sweet_spmi_bus_unlock(int held);
 #ifdef __cplusplus
 }
 #endif

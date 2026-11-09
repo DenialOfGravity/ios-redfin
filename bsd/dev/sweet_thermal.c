@@ -170,6 +170,14 @@ ts_sample(void)
 	t_max = m;
 }
 
+/* 1062: for sweet_torch.c without the PMIC temperature alarm: the camera block's tsens, else the hottest; TS_NONE (-9999) = none */
+int sweet_thermal_torch_dc(void);
+int
+sweet_thermal_torch_dc(void)
+{
+	return t_camera != TS_NONE ? t_camera : t_max;
+}
+
 /* "41.3" or "--" */
 static const char *
 ts_fmt(char *buf, size_t len, int v)

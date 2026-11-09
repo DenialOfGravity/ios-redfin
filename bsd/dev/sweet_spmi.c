@@ -22,9 +22,75 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <machine/machine_routines.h>
+#include <sys/errno.h>
+#include <sys/sysctl.h>
+#include <kern/locks.h>
 #include <IOKit/IOLocks.h>
 #include <pexpert/pexpert.h>
 #include "sweet_spmi.h"
+
+/*
+ * 1062: the shared SPMI transaction lock (sweet_spmi.h). r5au1f's boot: sweet_keys.c and sweet_torch.c
+ * read at the same moment and got each other's bytes (keys pon=0x9 = the temperature alarm's TYPE,
+ * torch subtype 0x1): the torch refused to start and keys saw fake presses.
+ * kern.sweet_spmi_lock (boot-arg sweetspmilock, default 1): 0 = every driver on its own again.
+ * kern.sweet_spmi_lock_waits (RD): transfers that found the lock taken (= would have overlapped).
+ */
+static LCK_GRP_DECLARE(sp_bus_grp, "sweet_spmi_bus");
+static LCK_MTX_DECLARE(sp_bus_mtx, &sp_bus_grp);
+static int sp_bus_on = -1;
+static unsigned sp_bus_waits;
+
+int
+sweet_spmi_bus_lock(void)
+{
+	if (sp_bus_on < 0) {
+		int v = 1;
+		(void)PE_parse_boot_argn("sweetspmilock", &v, sizeof(v));
+		sp_bus_on = v != 0;
+		printf("SWEET SPMI: shared transaction lock %s (sweetspmilock=%d)\n", sp_bus_on ? "on" : "OFF", v);
+	}
+	if (!sp_bus_on) {
+		return 0;
+	}
+	if (!lck_mtx_try_lock(&sp_bus_mtx)) {
+		__atomic_fetch_add(&sp_bus_waits, 1u, __ATOMIC_RELAXED);
+		lck_mtx_lock(&sp_bus_mtx);
+	}
+	return 1;
+}
+
+void
+sweet_spmi_bus_unlock(int held)
+{
+	if (held) {
+		lck_mtx_unlock(&sp_bus_mtx);
+	}
+}
+
+static int
+sysctl_sweet_spmi_lock SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	if (sp_bus_on < 0) {
+		sweet_spmi_bus_unlock(sweet_spmi_bus_lock());   /* boot-arg default, logged once */
+	}
+	int value = sp_bus_on, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value != 0 && value != 1) {
+		return EINVAL;
+	}
+	sp_bus_on = value;      /* a holder still unlocks with its own "held" */
+	printf("SWEET SPMI: shared transaction lock %s (sysctl)\n", value ? "on" : "OFF");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_spmi_lock, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_spmi_lock, "I", "1062: one lock for all sweet SPMI transfers (0 = off)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_spmi_lock_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &sp_bus_waits, 0,
+    "1062: SPMI transfers that waited for another driver's");
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 
@@ -120,6 +186,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
 	}
 	unsigned off = 0x80u * apid;
 	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+	int bus = sweet_spmi_bus_lock();        /* 1062 (lock order: sp_lock, then the bus lock) */
 	__asm__ volatile("dmb oshst" ::: "memory");
 	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
 	__asm__ volatile("dsb osh" ::: "memory");
@@ -127,15 +194,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
 		if (status & 1u) {
 			if (status & 0x0eu) {
+				sweet_spmi_bus_unlock(bus);
 				IOLockUnlock(sp_lock);
 				return -1;
 			}
 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+			sweet_spmi_bus_unlock(bus);
 			IOLockUnlock(sp_lock);
 			return 0;
 		}
 		delay(1);
 	}
+	sweet_spmi_bus_unlock(bus);
 	sp_poisoned[apid] = true;
 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
 	    sid, addr, apid);
@@ -210,6 +280,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
 	}
 	uint32_t status = 0;
 	unsigned t;
+	int bus = sweet_spmi_bus_lock();        /* 1062 */
 	__asm__ volatile ("dmb oshst" ::: "memory");
 	*(volatile uint32_t *)(ch + 0x10u) = val;                       /* WDATA0 */
 	__asm__ volatile ("dmb oshst" ::: "memory");
@@ -222,6 +293,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
 		}
 		delay(1);
 	}
+	sweet_spmi_bus_unlock(bus);
 	if (!(status & 1u)) {
 		sp_poisoned[apid] = true;
 	}

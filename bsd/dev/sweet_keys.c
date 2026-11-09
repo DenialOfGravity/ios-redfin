@@ -14,6 +14,7 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include "sweet_spmi.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern void sweet_hid_key(int key, int down);
@@ -33,6 +34,15 @@ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
 static uint32_t keys_version, keys_last_status;
 static bool keys_started;
 static int keys_sleep_chan;
+/*
+ * 1062: a key change is reported only if the peripheral still reads back as itself: TYPE (0x04) and
+ * SUBTYPE (0x05) equal to what init read, and the RT_STS byte reads the same again. A read that raced
+ * another driver's (r5au1f: pon=0x9, volup 0x80) is dropped. Boot-arg sweetkeyscheck=0: off.
+ */
+static uint8_t keys_pon_type, keys_pon_sub, keys_gpio_type, keys_gpio_sub;
+static bool keys_pon_id, keys_gpio_id;
+static int keys_check = 1;
+static unsigned keys_dropped;
 
 static uint32_t
 keys_rd(vm_offset_t base, uint32_t off)
@@ -68,21 +78,40 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
 	}
 	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+	bool ok = false;
+	int bus = sweet_spmi_bus_lock();        /* 1062 */
 	__asm__ volatile("dmb oshst" ::: "memory");
 	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
 	__asm__ volatile("dsb osh" ::: "memory");
 	for (unsigned i = 0; i < 1000; ++i) {
 		keys_last_status = keys_rd(keys_obs, off + 0x08u);
 		if (keys_last_status & 1u) {
-			if (keys_last_status & 0x0eu) {
-				return false;
+			if (!(keys_last_status & 0x0eu)) {
+				*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+				ok = true;
 			}
-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
-			return true;
+			break;
 		}
 		delay(1);
 	}
-	return false;
+	sweet_spmi_bus_unlock(bus);
+	return ok;
+}
+
+/* 1062: the peripheral's TYPE/SUBTYPE as init saw them, and the RT byte again equal to val */
+static bool
+keys_still(uint16_t apid, uint16_t base, uint16_t rt, bool known, uint8_t type, uint8_t sub, uint8_t val,
+    uint8_t *t, uint8_t *s, uint8_t *again)
+{
+	if (!keys_check) {
+		return true;
+	}
+	*t = *s = *again = 0xee;
+	if (!known) {   /* init could not confirm the identity: the second read alone */
+		return keys_read(apid, rt, again) && *again == val;
+	}
+	return keys_read(apid, base + 0x04u, t) && keys_read(apid, base + 0x05u, s) &&
+	       keys_read(apid, rt, again) && *t == type && *s == sub && *again == val;
 }
 
 static void
@@ -114,6 +143,25 @@ keys_thread(void *arg, wait_result_t result)
 		} else {
 			errors = 0;
 		}
+		/* 1062: a change only if the read is confirmed (keys_still) */
+		bool pchg = pok && (now[0] != state[0] || now[2] != state[2]), gchg = gok && now[1] != state[1];
+		uint8_t t, s, again;
+		if (pchg && !keys_still(keys_pon_apid, 0x0800u, KEYS_PON_RT, keys_pon_id, keys_pon_type, keys_pon_sub,
+		    pon, &t, &s, &again)) {
+			if (keys_dropped++ < 40) {
+				printf("SWEET KEYS: pon read %#x dropped: type %#x/%#x subtype %#x/%#x again %#x\n",
+				    pon, t, keys_pon_type, s, keys_pon_sub, again);
+			}
+			pok = false;
+		}
+		if (gchg && !keys_still(keys_gpio_apid, KEYS_GPIO_BASE, KEYS_GPIO_RT, keys_gpio_id, keys_gpio_type,
+		    keys_gpio_sub, gpio, &t, &s, &again)) {
+			if (keys_dropped++ < 40) {
+				printf("SWEET KEYS: volup read %#x dropped: type %#x/%#x subtype %#x/%#x again %#x\n",
+				    gpio, t, keys_gpio_type, s, keys_gpio_sub, again);
+			}
+			gok = false;
+		}
 		for (int k = 0; k < 3; ++k) {
 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
 				state[k] = now[k];
@@ -136,6 +184,7 @@ sweet_keys_init(void)
 	}
 	keys_started = true;
 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+	(void)PE_parse_boot_argn("sweetkeyscheck", &keys_check, sizeof(keys_check));
 	if (!enabled) {
 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
 		return;
@@ -176,6 +225,18 @@ sweet_keys_init(void)
 	if (!pok && !gok) {
 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
 	}
+	/* 1062: the identity a later key change is checked against (two equal reads each) */
+	uint8_t t2 = 0, s2 = 0;
+	keys_pon_id = keys_read(keys_pon_apid, 0x0804u, &keys_pon_type) && keys_read(keys_pon_apid, 0x0805u, &keys_pon_sub) &&
+	    keys_read(keys_pon_apid, 0x0804u, &t2) && keys_read(keys_pon_apid, 0x0805u, &s2) &&
+	    t2 == keys_pon_type && s2 == keys_pon_sub;
+	keys_gpio_id = keys_gpio_apid != KEYS_NO_APID && keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x04u, &keys_gpio_type) &&
+	    keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &keys_gpio_sub) &&
+	    keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x04u, &t2) && keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &s2) &&
+	    t2 == keys_gpio_type && s2 == keys_gpio_sub && keys_gpio_type == 0x10;
+	printf("SWEET KEYS: check %s: pon type %#x subtype %#x%s, volup type %#x subtype %#x%s\n", keys_check ? "on" : "off",
+	    keys_pon_type, keys_pon_sub, keys_pon_id ? "" : " (unconfirmed)", keys_gpio_type, keys_gpio_sub,
+	    keys_gpio_id ? "" : " (unconfirmed)");
 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 	if (kr == KERN_SUCCESS) {
 		thread_deallocate(thread);

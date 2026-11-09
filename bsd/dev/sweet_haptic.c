@@ -38,6 +38,7 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include "sweet_spmi.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
@@ -192,6 +193,7 @@ hap_spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
 	if (!ch) {
 		return -1;
 	}
+	int bus = sweet_spmi_bus_lock();        /* 1062 */
 	if (write) {
 		hap_wr(ch, 0x10, *val);
 	}
@@ -200,16 +202,19 @@ hap_spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
 		uint32_t st = hap_rd(ch, 0x08);
 		if (st & 1u) {
 			if (st & 0x0eu) {
+				sweet_spmi_bus_unlock(bus);
 				printf("SWEET HAPTIC: spmi %x:%x status %#x\n", sid, addr, st);
 				return -1;
 			}
 			if (!write) {
 				*val = (uint8_t)hap_rd(ch, 0x18);
 			}
+			sweet_spmi_bus_unlock(bus);
 			return 0;
 		}
 		delay(1);
 	}
+	sweet_spmi_bus_unlock(bus);
 	printf("SWEET HAPTIC: spmi %x:%x timeout\n", sid, addr);
 	return -1;
 }
