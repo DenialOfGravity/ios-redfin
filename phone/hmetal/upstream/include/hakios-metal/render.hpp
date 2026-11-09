@@ -248,6 +248,9 @@ struct Program {
     // found in the NIR: a stage that only reads them may be replayed tile by tile (gmemDrawOk). A program not made by
     // linkProgram says all: unknown is taken as writing.
     uint8_t ssboWrites = 3;
+    // (redfin hmv2) each stage's (0 the VS, 1 the FS) constant buffers at Metal index n < 32: the end of the furthest byte
+    // its loads read (Resource::readEnd; 0 not known), for the short-binding padding (pushedRanges, HM_CB_PAD)
+    uint32_t cbReadEnd[2][32]{};
 };
 
 namespace render {
@@ -257,6 +260,10 @@ namespace render {
 // *why: an FS varying no VS output serves (ir3 would read zeros through regid 63.0; refused here by slot), a VS without
 // a position, more than kMaxStageOutputs entries. Implemented in src/link.cpp.
 bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why);
+
+// (redfin hmv2) where the encoder's one-time notices go (a constant buffer padded, HM_CB_PAD): FN with the text, or
+// stderr when none is set
+void setNotice(void (*fn)(const char*));
 
 }  // namespace render
 

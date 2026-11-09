@@ -934,6 +934,36 @@ bool writesMemoryOf(nir_shader* nir) {
     return false;
 }
 
+// (redfin hmv2) Resource::readEnd of each constant buffer: the furthest byte the stage's load_ubo of that block reach in
+// the NIR as ir3 takes it (after the front end's specialisation by the function constants and ir3_nir_post_finalize's
+// optimisation, so a branch the constants made dead has gone): a constant offset's load ends at offset + its bytes, any
+// other at its range_base + range (~0u when unbounded). ir3's pushed range is this rounded out to 64 bytes on gen 6
+// (const_upload_unit 4 vec4, ir3_nir_analyze_ubo_ranges.c get_ubo_load_range), which is what pushedRanges checks a binding against
+void cbReadEnds(nir_shader* nir, std::vector<Resource>* resources) {
+    uint32_t end[32] = {};
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(in->src[0])) continue;
+                const uint32_t b = nir_src_as_uint(in->src[0]);
+                if (b >= 32) continue;
+                uint32_t e = ~0u;
+                if (nir_src_is_const(in->src[1])) {
+                    e = uint32_t(nir_src_as_uint(in->src[1])) + in->def.num_components * in->def.bit_size / 8;
+                } else if (nir_intrinsic_range(in) != ~0u) {
+                    e = nir_intrinsic_range_base(in) + nir_intrinsic_range(in);
+                }
+                end[b] = std::max(end[b], e);
+            }
+        }
+    }
+    for (Resource& r : *resources) {
+        if (r.kind == Resource::kConstantBuffer && r.index < 32) r.readEnd = end[r.index];
+    }
+}
+
 bool walkOutputClasses(nir_shader* nir, OutputClasses& oc, std::string* why) {
     nir_foreach_shader_out_variable(var, nir) {
         unsigned loc = var->data.location;
@@ -1217,6 +1247,7 @@ void stageCacheSave(const std::string& path, const CompiledStage& s) {
         w.str(r.typeName);
         w.u32(r.argbufSet);
         w.u32(r.argbufOffset);
+        w.u32(r.readEnd);
     }
     w.u32(uint32_t(s.varyingNames.size()));
     for (const std::string& v : s.varyingNames) w.str(v);
@@ -1263,6 +1294,7 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
         res.typeName = r.str();
         res.argbufSet = r.u32();
         res.argbufOffset = r.u32();
+        res.readEnd = r.u32();
     }
     s->varyingNames.resize(r.u32());
     for (std::string& v : s->varyingNames) v = r.str();
@@ -1366,6 +1398,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
     if (!compileVariant(t, PassOrder::kGraphics, why)) return nullptr;
     KernelHome home{out->stage.k, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;
+    cbReadEnds(t.nir, &out->resources);
     if (!fillStage(t, classes, out->stage, why)) return nullptr;
     // the fetch slots lowerFbRead made: sampled 2D floats the draw fills with the targets, and a stage that reads its
     // targets (the barrier before its draws keys on fbRead, which ir3 no longer sees: it has no txf_ms_fb left)
@@ -1558,6 +1591,11 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
     out->program.fs = F;
     out->program.fsIboBase = fs->iboBase;
     out->program.ssboWrites = uint8_t((vs->writesMemory ? 1 : 0) | (fs->writesMemory ? 2 : 0));
+    for (int st = 0; st < 2; st++) {
+        for (const Resource& r : (st == 0 ? vs : fs)->resources) {
+            if (r.kind == Resource::kConstantBuffer && r.index < 32) out->program.cbReadEnd[st][r.index] = r.readEnd;
+        }
+    }
     out->program.name = out->name.c_str();
     return out;
 }

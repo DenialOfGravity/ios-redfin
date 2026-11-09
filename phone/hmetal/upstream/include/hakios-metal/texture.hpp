@@ -87,6 +87,15 @@ enum class PixelFormat : uint32_t {
     // ycbcr_matrix (fixed_frag's fc_has_ycbcr_matrix). The TP's NV12 format reads exactly that. Over a surface alone,
     // and for reading alone.
     kYCbCr8_420_2P = 500,
+    // (redfin hmv2) Apple's extended-range formats, over an IOSurface alone and for reading alone ('w30r' surfaces: the
+    // posters' wide-gamut layers): BGR10_XR is blue in bits 0-9, green, red, the top two bits zero; BGRA10_XR four
+    // 16-bit words, blue, green, red, alpha, each code in the word's top 10 bits (metal2vulkan fill_value.rs). A colour
+    // reads (code - 384) / 510, which no A6xx format decodes: a draw samples an RGBA16Float copy this processor decodes
+    // (Texture::xrDecode, HM_XR=1, the default); HM_XR=2 samples the raw codes as unorm (wrong values, no copy)
+    kBGRA10_XR = 552,
+    kBGRA10_XR_sRGB = 553,
+    kBGR10_XR = 554,
+    kBGR10_XR_sRGB = 555,
     // ASTC, 128 bits a block of W x H texels: what an asset catalogue's images are on Apple's GPUs (ImageIO stages them
     // through -newTextureLayoutWithDescriptor:). Sampled alone; written by -replaceRegion: in whole blocks.
     // ETC2 and EAC, 4 x 4 blocks of 8 bytes (one or three channels, a 1-bit alpha) or 16 (two channels, or RGBA): sampled
@@ -185,7 +194,11 @@ struct FormatInfo {
     // PVRTC1 at 2 or 4 bits a texel: stored as the RGBA8 it decodes to, the processor decoding a whole level when it is
     // written (decodePvrtc), since no A6xx unit reads it; 0 for every other format
     uint32_t pvrtcBpp = 0;
+    // (redfin hmv2) an extended-range format: 1 BGR10_XR, 2 its _sRGB twin, 3 BGRA10_XR, 4 its _sRGB twin; 0 for the rest
+    uint8_t xr = 0;
 };
+// HM_XR (redfin hmv2): 0 the extended-range formats refused, 1 (default) decoded into a copy for each draw, 2 sampled raw
+int xrMode();
 // PVRTC1 data of a W x H level (BPP 2 or 4) into W x H RGBA8 texels, row after row
 void decodePvrtc(const uint8_t* data, uint32_t w, uint32_t h, uint32_t bpp, uint8_t* rgba);
 // how many bytes of PVRTC1 a W x H level is: blocks of 4 x 4 (8 x 4 at 2 bpp), at least two each way, eight bytes each
@@ -338,6 +351,11 @@ public:
     // whether a shader that addresses a texture as T (its dim and array form) addresses this one as what it is: the
     // TP reads the descriptor's TYPE and DEPTH, not the instruction's dimension, so any other pairing reads wrong texels
     bool isShaped(const KernelTexture& t) const;
+    // (redfin hmv2) an extended-range texture over a surface (FormatInfo::xr, HM_XR=1): the RGBA16Float texture a draw
+    // samples in its place, its texels decoded now from the surface's rows by this processor -- a colour (code - 384) / 510,
+    // the _sRGB twins' through the sRGB curve extended by symmetry, BGR10_XR's alpha 1. Two copies in turn, so that the
+    // one a command buffer still on the GPU reads is not rewritten under it by the next. nullptr with *why
+    std::shared_ptr<Texture> xrDecode(Gpu& gpu, std::string* why) const;
 
 private:
     static std::shared_ptr<Texture> wrapTwoPlanes(std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const std::string& name, const TextureDesc& desc,
@@ -364,6 +382,8 @@ private:
     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
     std::shared_ptr<Texture> staging_;
     mutable std::atomic<bool> stale_{false};
+    mutable std::shared_ptr<Texture> xrCopy_[2];
+    mutable std::atomic<uint32_t> xrNext_{0};
 public:
     const Texture* staging() const { return staging_.get(); }
     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in
@@ -371,6 +391,10 @@ public:
 private:
     uint64_t ubwcOffset_ = 0;
     uint32_t ubwcPitch_ = 0, ubwcLayerSize_ = 0, ubwcLogW_ = 0, ubwcLogH_ = 0;
+    void takeUbwc(const Texture& p) {
+        ubwc_ = p.ubwc_, ubwcOffset_ = p.ubwcOffset_, ubwcPitch_ = p.ubwcPitch_, ubwcLayerSize_ = p.ubwcLayerSize_;
+        ubwcLogW_ = p.ubwcLogW_, ubwcLogH_ = p.ubwcLogH_;
+    }
 };
 
 // The border colour table a sampler's BCOLOR indexes, 128 bytes an entry: Metal's MTLSamplerBorderColor in its own

@@ -44,6 +44,10 @@ struct Resource {
     // offset in it; INDEX is then the binding the front end allocated it, not a Metal index. ~0u: not a member
     uint32_t argbufSet = ~0u;
     uint32_t argbufOffset = 0;
+    // (redfin hmv2) a constant buffer: the end, in bytes from its bound offset, of the furthest load the stage as compiled
+    // makes of it (after its function constants and ir3's own optimisation; ~0u when a load's offset is not bounded), 0
+    // when not known. ir3 pushes whole groups of 4 vec4 on this chip (const_upload_unit), so its range can run past this.
+    uint32_t readEnd = 0;
 };
 
 // Argument buffers: every member among RESOURCES bound into B from what its set holds -- the eight bytes at the

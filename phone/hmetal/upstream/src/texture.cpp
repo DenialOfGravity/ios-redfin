@@ -79,6 +79,12 @@ constexpr FormatInfo kFormats[] = {
     {PixelFormat::kRG11B10Float, FMT6_11_11_10_FLOAT, 4, WZYX, false, false, kElemFloat, "RG11B10Float"},
     {PixelFormat::kRGB10A2Unorm, FMT6_10_10_10_2_UNORM, 4, WZYX, true, false, kElemFloat, "RGB10A2Unorm", false, false, false, 1, 1, FMT6_10_10_10_2_UNORM_DEST},
     {PixelFormat::kBGR10A2Unorm, FMT6_10_10_10_2_UNORM, 4, WXYZ, true, false, kElemFloat, "BGR10A2Unorm", false, false, false, 1, 1, FMT6_10_10_10_2_UNORM_DEST},
+    // (redfin hmv2) the extended-range formats as the TP can read their bytes, the codes as unorm (HM_XR=2; HM_XR=1 samples
+    // a decoded RGBA16Float copy instead): BGR10_XR as B10G10R10A2's layout with no alpha, BGRA10_XR as BGRA16's
+    {PixelFormat::kBGR10_XR, FMT6_10_10_10_2_UNORM, 4, WXYZ, false, false, kElemFloat, "BGR10_XR", false, false, false, 1, 1, FMT6_NONE, 0, 1},
+    {PixelFormat::kBGR10_XR_sRGB, FMT6_10_10_10_2_UNORM, 4, WXYZ, false, false, kElemFloat, "BGR10_XR_sRGB", false, false, false, 1, 1, FMT6_NONE, 0, 2},
+    {PixelFormat::kBGRA10_XR, FMT6_16_16_16_16_UNORM, 8, WXYZ, true, false, kElemFloat, "BGRA10_XR", false, false, false, 1, 1, FMT6_NONE, 0, 3},
+    {PixelFormat::kBGRA10_XR_sRGB, FMT6_16_16_16_16_UNORM, 8, WXYZ, true, false, kElemFloat, "BGRA10_XR_sRGB", false, false, false, 1, 1, FMT6_NONE, 0, 4},
     {PixelFormat::kRGBA32Uint, FMT6_32_32_32_32_UINT, 16, WZYX, true, false, kElemUint, "RGBA32Uint"},
     {PixelFormat::kRGBA32Float, FMT6_32_32_32_32_FLOAT, 16, WZYX, true, false, kElemFloat, "RGBA32Float"},
     // Z32_FLOAT is FMT6_32_FLOAT to the TP and the 2D engine (fd6_format_table.c:330 VT(Z32_FLOAT, 32_FLOAT, WZYX)) and
@@ -190,9 +196,115 @@ uint32_t lodFixed(float lod) {
 
 const FormatInfo* formatInfo(PixelFormat format) {
     for (const FormatInfo& f : kFormats) {
-        if (f.format == format) return &f;
+        if (f.format == format) return f.xr != 0 && xrMode() == 0 ? nullptr : &f;
     }
     return nullptr;
+}
+
+int xrMode() {
+    static const int mode = [] { const char* e = getenv("HM_XR"); return e == nullptr || e[0] == 0 ? 1 : atoi(e); }();
+    return mode;
+}
+
+namespace {
+// a float as a half's bits, rounded to nearest even (no NaN or infinity comes here: the codes decode to [-0.753, 1.255])
+uint16_t halfOf(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t e = int32_t((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = x & 0x7fffffu;
+    if (e >= 31) return uint16_t(sign | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return uint16_t(sign);
+        m |= 0x800000u;
+        const uint32_t shift = uint32_t(14 - e);
+        uint32_t h = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1), halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (h & 1))) h++;
+        return uint16_t(sign | h);
+    }
+    uint32_t h = (uint32_t(e) << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;
+    return uint16_t(sign | h);
+}
+
+// an extended-range code (10 bits) as Metal reads it: (c - 384) / 510; the _sRGB twins' colours then through the sRGB
+// curve, odd about 0 (Apple's extended sRGB). As a half's bits.
+uint16_t xrHalf(uint32_t code, bool srgb) {
+    float v = (float(code) - 384.0f) / 510.0f;
+    if (srgb) {
+        const float a = std::fabs(v);
+        const float l = a <= 0.04045f ? a / 12.92f : std::pow((a + 0.055f) / 1.055f, 2.4f);
+        v = v < 0 ? -l : l;
+    }
+    return halfOf(v);
+}
+}  // namespace
+
+std::shared_ptr<Texture> Texture::xrDecode(Gpu& gpu, std::string* why) const {
+    const uint8_t xr = info_->xr;
+    if (xr == 0 || xrMode() != 1) return nullptr;
+    if (desc_.type != TextureType::k2D || desc_.mipLevels != 1) {
+        refuse(why, std::string("a ") + info_->name + " texture that is not one level of 2D: the decoded copy is made of those alone");
+        return nullptr;
+    }
+    const uint8_t* rows = buffer_->contents() != nullptr ? static_cast<const uint8_t*>(buffer_->contents()) + offset_ : nullptr;
+    if (rows == nullptr) {
+        refuse(why, std::string("a ") + info_->name + " texture over IOSurface " + n(surface_) + ": mapped nowhere for this processor to decode it");
+        return nullptr;
+    }
+    const uint32_t slot = xrNext_.fetch_add(1) & 1;
+    std::shared_ptr<Texture>& copy = xrCopy_[slot];
+    if (copy == nullptr) {
+        TextureDesc d;
+        d.format = PixelFormat::kRGBA16Float;
+        d.width = desc_.width;
+        d.height = desc_.height;
+        d.usage = kTextureUsageRead;
+        copy = make(gpu, d, why);
+        if (copy == nullptr) return nullptr;
+    }
+    uint8_t* out = static_cast<uint8_t*>(copy->contents());
+    if (out == nullptr) {
+        refuse(why, "the decoded copy of a " + std::string(info_->name) + " texture is mapped nowhere");
+        return nullptr;
+    }
+    const bool srgb = xr == 2 || xr == 4;
+    [[maybe_unused]] const uint64_t rowBytes = uint64_t(desc_.width) * info_->bytesPerPixel;
+#if defined(__aarch64__)
+    // another process's GPU wrote the surface: this processor's lines of it may be stale, so they are dropped first
+    for (uint32_t y = 0; y < desc_.height; y++) {
+        uintptr_t a = reinterpret_cast<uintptr_t>(rows + uint64_t(y) * pitch_) & ~uintptr_t(63);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(rows + uint64_t(y) * pitch_ + rowBytes);
+        for (; a < end; a += 64) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+#endif
+    std::vector<uint16_t> line(size_t(desc_.width) * 4);
+    for (uint32_t y = 0; y < desc_.height; y++) {
+        const uint8_t* in = rows + uint64_t(y) * pitch_;
+        for (uint32_t x = 0; x < desc_.width; x++) {
+            uint32_t b, g, r, a;
+            if (xr <= 2) {
+                uint32_t w;
+                memcpy(&w, in + 4ull * x, 4);
+                b = w & 1023, g = (w >> 10) & 1023, r = (w >> 20) & 1023, a = ~0u;
+            } else {
+                uint16_t w[4];
+                memcpy(w, in + 8ull * x, 8);
+                b = w[0] >> 6, g = w[1] >> 6, r = w[2] >> 6, a = w[3] >> 6;
+            }
+            line[4 * x + 0] = xrHalf(r, srgb);
+            line[4 * x + 1] = xrHalf(g, srgb);
+            line[4 * x + 2] = xrHalf(b, srgb);
+            // (alpha is linear: (code - 384) / 510 clamped to [0, 1] as Metal reads it; BGR10_XR has none, 1)
+            line[4 * x + 3] = a == ~0u ? 0x3c00 : halfOf(std::min(1.0f, std::max(0.0f, (float(a) - 384.0f) / 510.0f)));
+        }
+        memcpy(out + uint64_t(y) * copy->bytesPerRow(), line.data(), line.size() * 2);
+    }
+    return copy;
 }
 
 uint64_t texturePitch(const FormatInfo& format, uint32_t width) {
@@ -319,6 +431,10 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
     const FormatInfo* info = formatInfo(desc.format);
     if (info == nullptr) {
         refuse(why, "pixel format " + n(uint32_t(desc.format)) + ": not one of the formats served (texture.hpp: PixelFormat)");
+        return false;
+    }
+    if (info->xr != 0) {
+        refuse(why, std::string("a ") + info->name + " texture of its own memory: the extended-range formats are served over an IOSurface alone, for reading");
         return false;
     }
     if (info->twoPlane) {
@@ -448,9 +564,12 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         // UBWC as Mesa lays it out for this chip (fdl6_layout with the tile mode and UBWC asked for, as turnip asks when
         // an image is optimal): the flag buffer first, then the tiled data, at offsets fdl gives
 #ifdef HAKIOS_METAL_MESA
-        if (desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1 ||
-            (desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm)) {
-            refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm or BGRA8Unorm is what is served");
+        // (redfin hmv2: and their sRGB twins, the same storage, for CoreAnimation's render targets under HM_UBWC_RT; never
+        // one a kernel stores to, whose image descriptor names no flag buffer)
+        if (desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1 || (desc.usage & kTextureUsageWrite) != 0 ||
+            (desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm && desc.format != PixelFormat::kRGBA8UnormSrgb &&
+             desc.format != PixelFormat::kBGRA8UnormSrgb)) {
+            refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm or BGRA8Unorm (or sRGB), not shader-written, is what is served");
             return nullptr;
         }
         // (rows for this processor only for one it does not draw into: a render target's truth is what the GPU drew,
@@ -879,6 +998,7 @@ std::shared_ptr<Texture> Texture::swizzled(const std::shared_ptr<Texture>& textu
     std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
     t->chroma_ = p.chroma_;
     t->layerPitch_ = p.layerPitch_;
+    t->takeUbwc(p);   // (redfin hmv2: a compressed render target's swizzled view reads it compressed too)
     // over the parent's: a component naming red reads what the parent's red reads
     for (int c = 0; c < 4; c++) t->swizzle_[c] = swizzle[c] < 2 ? swizzle[c] : p.swizzle_[swizzle[c] - 2];
     return t;
@@ -973,6 +1093,8 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         {0x32433066u, 8},   // '2C0f': two floats
         {0x52476841u, 8},   // 'RGhA': four halves
         {0x52476641u, 16},  // 'RGfA': four floats
+        {0x77333072u, 4},   // 'w30r': BGR10_XR (redfin hmv2)
+        {0x26773461u, 8},   // '&w4a': BGRA10_XR (redfin hmv2)
     };
     uint32_t surfaceBytes = 0;
     for (const FourCC& f : kFourCCs) {
@@ -1068,6 +1190,23 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
                                        uint32_t baseSlice, uint32_t slices, std::string* why) {
     // (a view of a compressed texture is a view of its rows: their layout is the one a view reinterprets)
     if (parent->staging_ != nullptr) return view(parent->staging_, format, type, baseLevel, levels, baseSlice, slices, why);
+    if (parent->ubwc_) {
+        // (redfin hmv2) a compressed render target (HM_UBWC_RT) has no rows to reinterpret: a view of it in a format of the
+        // same storage (its sRGB twin), as the whole 2D texture, reads it compressed; any other is refused
+        const FormatInfo* vi = formatInfo(format);
+        if (vi == nullptr || vi->fmt6 != parent->info_->fmt6 || vi->bytesPerPixel != parent->info_->bytesPerPixel || type != TextureType::k2D ||
+            baseLevel != 0 || levels != 1 || baseSlice != 0 || slices != 1) {
+            refuse(why, "a view in pixel format " + n(uint32_t(format)) + " of a compressed " + parent->info_->name +
+                            " render target: its own storage format as the whole 2D texture is what is served");
+            return nullptr;
+        }
+        TextureDesc d = parent->desc_;
+        d.format = format;
+        std::shared_ptr<Texture> t = adopt(new Texture(parent->buffer_, d, vi, parent->pitch_, parent->offset_, parent->pitchAlign_, parent->surface_));
+        t->takeUbwc(*parent);
+        for (int c = 0; c < 4; c++) t->swizzle_[c] = parent->swizzle_[c];
+        return t;
+    }
     const Texture& p = *parent;
     const FormatInfo* info = formatInfo(format);
     const bool layered = p.type() == TextureType::k2DArray || p.type() == TextureType::kCube || p.type() == TextureType::kCubeArray;

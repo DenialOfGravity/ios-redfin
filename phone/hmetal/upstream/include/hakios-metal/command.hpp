@@ -140,7 +140,11 @@ public:
     // what each costs, beside what it was (a draw pass with its target's size and its draws, a copy, a clear, a
     // dispatch). Read once the buffer has completed. metal_fps names a frame's slowest passes with it.
     enum PassKind : uint32_t { kPassDraw = 0, kPassCopy = 1, kPassClear = 2, kPassDispatch = 3 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy;
+                      // (redfin hmv2, HM_PROF) colour attachment 0's MTLPixelFormat and layout (0 linear, 1 UBWC), and the
+                      // bytes the pass's colour attachments had cleared (the sysmem fill, or a GMEM clear's tiles), loaded
+                      // into GMEM and stored back from it (a sysmem pass loads and stores nothing: it draws into memory)
+                      uint32_t format = 0; uint8_t tiling = 0; uint64_t clearBytes = 0, loadBytes = 0, storeBytes = 0; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
@@ -323,6 +327,7 @@ private:
     std::vector<BoUse> uses_;
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
+    std::vector<std::pair<const Texture*, std::shared_ptr<Texture>>> xrDecoded_;   // (redfin hmv2) this buffer's decoded extended-range copies
     std::vector<std::function<void(CommandBuffer&)>> handlers_;
     std::mutex lock_;
     std::condition_variable done_;

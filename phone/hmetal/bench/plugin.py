@@ -205,6 +205,165 @@ BITCODE_FOR_NEW = r'''	if (name == nil || ![name hasPrefix:@"fixed_"]) {
 }
 '''
 
+HMV2_HELPERS = r'''
+/* (redfin hmv2) the core's one-time notices (a short constant binding padded, HM_CB_PAD) into this log */
+static void
+hm_notice(const char *text)
+{
+	hm_print("%s\n", text);
+}
+
+/* (redfin hmv2) HM_PROF in the environment: 1 the metal_fps report (every 2 s; boot-arg metal_fps does the same), 2 that
+ * and every 5 s where the GPU's time goes: passes a frame, draws a pass, each kind of pass's GPU time from its
+ * CP_ALWAYS_ON_COUNTER stamps, sysmem or GMEM (tiles), the target's format and layout, and the bytes cleared, loaded
+ * into GMEM and stored from it */
+static int
+hm_prof_level(void)
+{
+	static int level = -1;
+
+	if (level < 0) {
+		const char *e = getenv("HM_PROF");
+		level = e != NULL ? atoi(e) : 0;
+	}
+	return level;
+}
+
+#define HM_PROF_CLASSES 24
+struct hm_prof_class {
+	unsigned kind, format, width, height, tiling, gmem, count, draws, tiles;
+	double us;
+	unsigned long long cleared, loaded, stored;
+};
+static struct {
+	pthread_mutex_t lock;
+	double since;
+	unsigned presents, buffers, passes, draws, gmemPasses, tiles, other;
+	double gpuUs, passUs;
+	unsigned long long cleared, loaded, stored;
+	unsigned hist[6];   /* draw passes by their draws: 0, 1, 2-4, 5-15, 16-55, 56 and more */
+	struct hm_prof_class cls[HM_PROF_CLASSES];
+} hm_prof = { PTHREAD_MUTEX_INITIALIZER };
+
+static int
+hm_prof_cmp(const void *a, const void *b)
+{
+	const double x = ((const struct hm_prof_class *)a)->us, y = ((const struct hm_prof_class *)b)->us;
+	return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void
+hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
+{
+	static const char *const kinds[] = {"draw", "copy", "clear", "dispatch"};
+	double now;
+
+	if (hm_prof_level() < 2) {
+		return;
+	}
+	pthread_mutex_lock(&hm_prof.lock);
+	now = hm_now();
+	if (hm_prof.since == 0) {
+		hm_prof.since = now;
+	}
+	if (present) {
+		hm_prof.presents++;
+	} else if (cb != NULL) {
+		hm_prof.buffers++;
+		hm_prof.gpuUs += gpu * 1e6;
+		for (unsigned i = 0;; i++) {
+			unsigned kind = 0, w = 0, h = 0, draws = 0, format = 0, tiling = 0, gmem;
+			unsigned long long c = 0, l = 0, st = 0;
+			double us = 0;
+			int tiles, k;
+
+			if (hakios_metal_cb_pass_time(cb, i, &kind, &w, &h, &draws, &us) <= (int)i) {
+				break;
+			}
+			hakios_metal_cb_pass_info(cb, i, &format, &tiling, &c, &l, &st);
+			tiles = hakios_metal_cb_pass_tiles(cb, i);
+			gmem = tiles > 0;
+			hm_prof.passes++;
+			hm_prof.draws += draws;
+			hm_prof.passUs += us;
+			hm_prof.cleared += c, hm_prof.loaded += l, hm_prof.stored += st;
+			if (gmem) {
+				hm_prof.gmemPasses++;
+				hm_prof.tiles += (unsigned)tiles;
+			}
+			if (kind == 0) {
+				hm_prof.hist[draws == 0 ? 0 : draws == 1 ? 1 : draws < 5 ? 2 : draws < 16 ? 3 : draws < 56 ? 4 : 5]++;
+			}
+			for (k = 0; k < HM_PROF_CLASSES; k++) {
+				struct hm_prof_class *x = &hm_prof.cls[k];
+				if (x->count == 0 || (x->kind == kind && x->format == format && x->width == w && x->height == h && x->tiling == tiling && x->gmem == gmem)) {
+					break;
+				}
+			}
+			if (k == HM_PROF_CLASSES) {
+				hm_prof.other++;
+				continue;
+			}
+			{
+				struct hm_prof_class *x = &hm_prof.cls[k];
+				x->kind = kind, x->format = format, x->width = w, x->height = h, x->tiling = tiling, x->gmem = gmem;
+				x->count++, x->draws += draws, x->tiles += gmem ? (unsigned)tiles : 0, x->us += us;
+				x->cleared += c, x->loaded += l, x->stored += st;
+			}
+		}
+	}
+	if (now - hm_prof.since >= 5.0) {
+		const double secs = now - hm_prof.since;
+		const double frames = hm_prof.presents != 0 ? hm_prof.presents : 1;
+
+		hm_print("prof: %.1f s: %u frames (%.1f fps), %u buffers, %u passes (%.1f a frame), %u draws (%.1f a pass); GPU %.2f ms a frame "
+			 "(buffers), %.2f (passes' stamps); GMEM %u passes, %u tiles; MB a frame cleared %.2f, loaded %.2f, stored %.2f; draw passes by "
+			 "draws 0:%u 1:%u 2-4:%u 5-15:%u 16-55:%u 56+:%u%s\n",
+			 secs, hm_prof.presents, hm_prof.presents / secs, hm_prof.buffers, hm_prof.passes, hm_prof.passes / frames, hm_prof.draws,
+			 hm_prof.passes != 0 ? (double)hm_prof.draws / hm_prof.passes : 0.0, hm_prof.gpuUs / 1e3 / frames, hm_prof.passUs / 1e3 / frames,
+			 hm_prof.gmemPasses, hm_prof.tiles, hm_prof.cleared / 1e6 / frames, hm_prof.loaded / 1e6 / frames, hm_prof.stored / 1e6 / frames,
+			 hm_prof.hist[0], hm_prof.hist[1], hm_prof.hist[2], hm_prof.hist[3], hm_prof.hist[4], hm_prof.hist[5],
+			 hm_prof.other != 0 ? " (passes past the classes not listed)" : "");
+		qsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);
+		for (int k = 0; k < 12 && hm_prof.cls[k].count != 0; k++) {
+			const struct hm_prof_class *x = &hm_prof.cls[k];
+			char tiles[32] = "";
+
+			if (x->gmem) {
+				snprintf(tiles, sizeof(tiles), ", %.1f tiles", (double)x->tiles / x->count);
+			}
+			hm_print("prof:   %-8s fmt %3u %4ux%-4u %-6s %-6s x%-5u %5.1f draws, %7.1f us a pass, %6.2f ms a frame; KB a pass cleared %.0f loaded %.0f stored %.0f%s\n",
+				 x->kind < 4 ? kinds[x->kind] : "?", x->format, x->width, x->height, x->tiling ? "UBWC" : "linear",
+				 x->gmem ? "GMEM" : "sysmem", x->count, (double)x->draws / x->count, x->us / x->count, x->us / 1e3 / frames,
+				 x->cleared / 1e3 / x->count, x->loaded / 1e3 / x->count, x->stored / 1e3 / x->count,
+				 tiles);
+		}
+		memset(&hm_prof.since, 0, sizeof(hm_prof) - offsetof(__typeof__(hm_prof), since));
+	}
+	pthread_mutex_unlock(&hm_prof.lock);
+}
+
+/* (redfin hmv2) HM_UBWC_RT=1: CoreAnimation's own render targets compressed too -- a private 2D, one-level, single-sampled
+ * RGBA8 or BGRA8 (or sRGB) texture drawn into and sampled, never written by a kernel. 0 (default) linear, as before */
+static BOOL
+hm_ubwc_rt(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_UBWC_RT");
+		on = e != NULL && e[0] == '1';
+		hm_print("HM_UBWC_RT=%s: render targets %s\n", e != NULL ? e : "unset", on ? "compressed (UBWC) where served" : "linear");
+	}
+	return on && [descriptor textureType] == MTLTextureType2D && [descriptor mipmapLevelCount] == 1 && [descriptor sampleCount] == 1 &&
+	       ([descriptor pixelFormat] == MTLPixelFormatRGBA8Unorm || [descriptor pixelFormat] == MTLPixelFormatBGRA8Unorm ||
+		[descriptor pixelFormat] == MTLPixelFormatRGBA8Unorm_sRGB || [descriptor pixelFormat] == MTLPixelFormatBGRA8Unorm_sRGB) &&
+	       (usage & MTLTextureUsageRenderTarget) != 0 && (usage & MTLTextureUsageShaderWrite) == 0 &&
+	       (usage & ~(MTLTextureUsage)(MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead)) == 0 &&
+	       [descriptor storageMode] == MTLStorageModePrivate;
+}
+'''
+
 PICK_RESET_OLD = ('\tvsAir = hm_bitcode_for(vs, [descriptor label], YES);\n'
                   '\tfsAir = fs != nil ? hm_bitcode_for(fs, [descriptor label], NO) : nil;   /* nil: the built-in fragment function */\n')
 PICK_RESET_NEW = '\thm_ca_pick_of[0][0] = hm_ca_pick_of[1][0] = \'\\0\';   /* (redfin hmvar) */\n' + PICK_RESET_OLD
@@ -278,6 +437,21 @@ EDITS = [
      '\t\thm_print("UBWC: highest bank bit %u, swizzle levels %#x, macrotile %u (%s)\\n", hbb, swz, mt, said ? "the kernel\'s" : "the chip table\'s: the kernel did not say");\n'
      '\t}\n'),
     (DRAW_OLD2, DRAW_NEW2),
+    # (hmv2) the notice hook, the profile and the render-target switch's helpers, before hm_bitcode_for as hmvar's
+    ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
+     HMV2_HELPERS + '/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE'),
+    # (hmv2) the core's notices into this log, set where the device is made
+    ('\t{   /* (redfin hmvar) */\n\t\tunsigned hbb = 0, swz = 0, mt = 0;\n',
+     '\thakios_metal_set_notice(hm_notice);   /* (redfin hmv2) */\n\t{   /* (redfin hmvar) */\n\t\tunsigned hbb = 0, swz = 0, mt = 0;\n'),
+    # (hmv2) HM_PROF >= 1 turns on what boot-arg metal_fps does (the GPU's stamps a pass included)
+    ('\t\ton = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps") != NULL;\n',
+     '\t\ton = hm_prof_level() >= 1 || (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps") != NULL);   /* (redfin hmv2) HM_PROF */\n'),
+    # (hmv2) HM_PROF=2's per-pass summary, fed from each completed buffer and each present
+    ('\tif (present) {\n\t\thm_fps.presents++;\n\t} else {\n',
+     '\thm_prof_note(cb, gpu, present);   /* (redfin hmv2) HM_PROF=2 */\n\tif (present) {\n\t\thm_fps.presents++;\n\t} else {\n'),
+    # (hmv2) HM_UBWC_RT: CoreAnimation's private render targets made compressed
+    ('\t} else if (hm_compress(descriptor, usage)) {\n',
+     '\t} else if (hm_compress(descriptor, usage) || hm_ubwc_rt(descriptor, usage)) {   /* (redfin hmv2) HM_UBWC_RT */\n'),
 ]
 
 

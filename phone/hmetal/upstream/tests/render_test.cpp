@@ -7,6 +7,7 @@
 // (hakios-metal-probe stage 9).
 //
 // SPDX-License-Identifier: MIT
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -2076,7 +2077,19 @@ TEST(a_draw_refuses_a_constant_range_it_cannot_serve_by_name) {
     auto page = newBuffer(*r.gpu, colour->bo().size(), &why);
     Bindings tail;
     tail.buffers = {Binding{page.get(), page->bo().size() - 16}};
-    refusedWith(p, tail, "tri_cflat_fs_air reads 64 bytes at 0 of constant buffer 0; 16 are bound and 16 mapped behind the offset");
+    // (redfin hmv2) HM_CB_PAD, on by default: that short binding is padded instead of refused -- the 16 bound bytes and 48
+    // zeros -- and said once for the program, with what the stage's loads reach (not known for a fixture)
+    {
+        static std::string said;
+        render::setNotice([](const char* text) { said += text; said += "\n"; });
+        Encoded e(r, p, pass, wholeDraw(), render::Options{}, Bindings{}, tail);
+        CHECK(e.ok);
+        Encoded again(r, p, pass, wholeDraw(), render::Options{}, Bindings{}, tail);
+        CHECK(again.ok);
+        render::setNotice(nullptr);
+        CHECK(said.find("padded: tri_cflat_fs_air pushes 64 bytes at 0 of constant buffer 0, 16 bound: the bound bytes and zeros past them; its loads reach ? (not known)") == 0);
+        CHECK_EQ(std::count(said.begin(), said.end(), '\n'), 1);
+    }
     // a range past the stage's constlen (the twin of the constlen the fixture carries)
     Program short_ = p;
     short_.fs.k.constlen = 0;

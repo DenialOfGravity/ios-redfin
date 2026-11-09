@@ -77,6 +77,8 @@ uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 int hakios_metal_ubwc(hakios_metal_device *device, unsigned *highest_bank_bit, unsigned *swizzle_levels, unsigned *macrotile_mode);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
+/* (redfin hmv2) the encoder's one-time notices (a short constant binding padded, HM_CB_PAD) to FN instead of stderr */
+void hakios_metal_set_notice(void (*fn)(const char *text));
 
 hakios_metal_buffer *hakios_metal_buffer_new(hakios_metal_device *device, uint64_t length);
 void hakios_metal_buffer_free(hakios_metal_buffer *buffer);
@@ -499,6 +501,10 @@ void hakios_metal_cb_gmem_counts(hakios_metal_cb *cb, unsigned *passes, unsigned
 /* pass I's colour attachments as a mask, and those its draws wrote or read (a GMEM pass's; 0 for a sysmem one): -1 past the passes */
 int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *attached, unsigned *touched);
 int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);
+/* (redfin hmv2) profiled pass I's colour attachment 0 (MTLPixelFormat, layout 0 linear / 1 UBWC) and the bytes its colour
+ * attachments had cleared, loaded into GMEM and stored from it; the count of passes, -1 past them (any pointer NULL) */
+int hakios_metal_cb_pass_info(hakios_metal_cb *cb, unsigned i, unsigned *format, unsigned *tiling, unsigned long long *cleared,
+    unsigned long long *loaded, unsigned long long *stored);
 /* why CB's last pass refused for GMEM was refused ("" when none was); valid while CB lives */
 const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);
 /* why profiled pass I (hakios_metal_cb_pass_time's) of draws was drawn in sysmem, "" for a GMEM pass or past the passes;

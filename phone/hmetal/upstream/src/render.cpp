@@ -9,8 +9,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <set>
 #include <tuple>
 
 #include "hakios-metal/a6xx.hpp"
@@ -217,12 +221,39 @@ struct PushedRange {
     uint32_t copyAt = 0;
     const Buffer* buffer = nullptr;
     uint64_t bufferOffset = 0;
+    // (redfin hmv2, HM_CB_PAD) a binding shorter than the range: only its first PAD_DWORDS are copied (by the command
+    // processor into the table's slot, or by this processor into WORDS), the rest of the range zeros
+    bool padded = false;
+    uint32_t padDwords = 0;
 };
+
+// HM_CB_PAD: 1 (default) a constant buffer bound shorter than the range the stage pushes, past the pages mapped behind
+// it, is padded with zeros (Apple's GPUs read only what the shader's loads reach; ir3 pushes whole groups of 64 bytes);
+// 2 also one whose range runs past the bound length but not past the pages (loaded as is before: the bytes after the
+// binding, whatever they are); 0 the refusal as before
+int cbPad() {
+    static const int mode = [] { const char* e = getenv("HM_CB_PAD"); return e == nullptr || e[0] == 0 ? 1 : atoi(e); }();
+    return mode;
+}
+bool cbPadOn() { return cbPad() != 0; }
+
+// what a padding is told once per program, stage and buffer (render::setNotice; stderr without one)
+void (*gNotice)(const char*) = nullptr;
+std::mutex gPadSeenLock;
+std::set<std::tuple<const void*, uint32_t, uint32_t>> gPadSeen;
+void noticeOnce(const void* key, uint32_t stage, uint32_t block, const std::string& text) {
+    {
+        std::lock_guard<std::mutex> g(gPadSeenLock);
+        if (!gPadSeen.insert({key, stage, block}).second) return;
+    }
+    if (gNotice != nullptr) gNotice(text.c_str()); else std::fprintf(stderr, "hakios-metal: %s\n", text.c_str());
+}
 
 // The stage's pushed ranges against its own [[buffer(n)]] table, by compute's rules (compute.cpp: the range is ir3's,
 // in whole vec4 and padded -- a 16-byte float4 is pushed as 64 bytes -- so the read must stay inside the bound object's
 // pages, not inside the length bound; it must land inside the stage's constlen). False with *why naming the stage.
-bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* out, std::string* why) {
+bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* out, std::string* why, const uint32_t* readEnd = nullptr,
+                  const void* key = nullptr) {
     const Kernel& k = s.k;
     auto name = [&s]() { return std::string(stageName(s)); };   // (built only for a refusal: a string a draw is an allocation a draw)
     for (uint32_t i = 0; i < k.numUboRanges; i++) {
@@ -252,7 +283,23 @@ bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* o
         if (r.sizeDwords == 0 || r.sizeDwords % 4 != 0) {
             return refuse(why, name() + ": a constant range of " + n(r.sizeDwords) + " dwords, not a whole number of vec4");
         }
-        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
+        bool padded = false;
+        uint32_t padDwords = 0;
+        const uint64_t reach = uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4;
+        if ((reach > mapped || (cbPad() == 2 && reach > bytes)) && cbPadOn() && r.offsetVec4 + r.sizeDwords / 4 <= k.constlen) {
+            // (redfin hmv2) CoreAnimation binds 16 or 48 bytes where fixed_vert_lph_spc's 64-byte range is pushed: the
+            // bound bytes, the rest zeros. Exact when the stage's loads end inside the binding (READ_END, the NIR's)
+            const uint64_t from = uint64_t(r.startDword) * 4;
+            const uint64_t have = bytes > from ? std::min<uint64_t>(bytes - from, uint64_t(r.sizeDwords) * 4) : 0;
+            padded = true;
+            padDwords = uint32_t(have / 4);
+            const uint32_t re = readEnd != nullptr && r.block < 32 ? readEnd[r.block] : 0;
+            noticeOnce(key, s.kind, r.block,
+                       std::string("padded: ") + name() + " pushes " + n(r.sizeDwords * 4) + " bytes at " + n(from) + " of constant buffer " + n(r.block) +
+                           ", " + n(bytes) + " bound: the bound bytes and zeros past them; its loads reach " +
+                           (re == 0 ? std::string("? (not known)") : re == ~0u ? std::string("an unbounded offset") : "byte " + n(re)) + ": " +
+                           (re != 0 && re != ~0u && re <= bytes ? "exact (the zeros are never read)" : "NOT exact (a load reads past the binding)"));
+        } else if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
             return refuse(why, name() + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) + "; " +
                                    n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset");
         }
@@ -260,7 +307,9 @@ bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* o
             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
         }
         PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, {}};
-        if (p.from % 16 != 0) {
+        p.padded = padded;
+        p.padDwords = padDwords;
+        if (p.from % 16 != 0 || padded) {
             p.copy = true;
             p.buffer = x.buffer;
             p.bufferOffset = x.offset + 4ull * r.startDword;
@@ -571,8 +620,8 @@ bool placeCopies(std::vector<PushedRange>* ranges, uint32_t* at, const Stage& st
             return refuse(why, std::string(stageName(stage)) + ": a constant buffer is bound at an address the CP cannot load from (not a multiple of 16), the table has no room to copy it to, and it is mapped nowhere to copy from");
         }
         r.copy = false;
-        r.words.resize(r.units * 4);
-        memcpy(r.words.data(), static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset, 16ull * r.units);
+        r.words.assign(r.units * 4, 0u);
+        memcpy(r.words.data(), static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset, r.padded ? 4ull * r.padDwords : 16ull * r.units);
     }
     return true;
 }
@@ -914,8 +963,17 @@ void fillStream(pm4::Stream& stream, const Texture& target, const ClearWords& c,
     reg(stream, REG_A6XX_SP_2D_DST_FORMAT, sp2dDstFormat(colorFmt(f), f.element == kElemInt, f.element == kElemUint, f.srgb));
     regs(stream, REG_A6XX_GRAS_2D_DST_TL, {regXY(0, 0), regXY(W - 1, H - 1)});
     regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {c.value[0], c.value[1], c.value[2], c.value[3]});
-    regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
-    regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
+    if (target.compressed()) {
+        // (redfin hmv2) a Clear of a UBWC target (HM_UBWC_RT): r2d_dst over a UBWC view as the copy into one does it --
+        // TILE6_3, WZYX (the CCU ignores the swap of a tiled layout: fd6_pipe2swap), FLAGS and the flag buffer; the
+        // colour's channels go in component order, so the bytes land as the RB's own writes and the TP's WZYX read them
+        regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), TILE6_3, WZYX, f.srgb) | A6XX_RB_2D_DST_INFO_FLAGS, uint32_t(at), uint32_t(at >> 32),
+                                                A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
+        regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {uint32_t(target.flagAddress()), uint32_t(target.flagAddress() >> 32), A6XX_RB_2D_DST_FLAGS_PITCH(target.flagPitch())});
+    } else {
+        regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
+        regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
+    }
     command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
 }
 
@@ -999,8 +1057,8 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
         const FormatInfo& f = t.info();
         // (attachment 0's sentences are the ones a single target always had; a later one's name its index)
         const std::string which = "colour attachment " + n(i), of = i == 0 ? std::string() : " of " + which, at = i == 0 ? std::string() : which + ": ";
-        if (t.compressed() && (i == 0 ? pass.load : pass.more[i - 1].load) == LoadAction::kClear) {
-            return refuse(why, at + "a Clear of a compressed texture: the 2D engine's fill writes linear rows (not served yet)");
+        if (f.xr != 0) {
+            return refuse(why, at + "a " + f.name + " texture as a colour attachment: the extended-range formats are sampled alone (no A6xx format writes them)");
         }
         if ((t.usage() & kTextureUsageRenderTarget) == 0) {
             return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of +
@@ -1274,7 +1332,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     }
     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
     std::vector<PushedRange> vsRanges, fsRanges;
-    if (!pushedRanges(vs, vsBindings, &vsRanges, why) || !pushedRanges(fs, fsBindings, &fsRanges, why)) {
+    if (!pushedRanges(vs, vsBindings, &vsRanges, why, program.cbReadEnd[0], &program) || !pushedRanges(fs, fsBindings, &fsRanges, why, program.cbReadEnd[1], &program)) {
         return false;
     }
     {
@@ -1752,7 +1810,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
             if (r.copy) {
                 // (the copy landed before the load reads it: CP_WAIT_MEM_WRITES, then the micro engine caught up, as
                 // turnip waits after its own CP_MEM_TO_MEM)
-                stream.memcpy(table + r.copyAt, r.from, r.units * 4);
+                if (r.padded) {
+                    // the slot's zeros now (this processor writes the table), the bound bytes over them by the CP
+                    memset(tableCpu + r.copyAt, 0, 16ull * r.units);
+                    if (r.padDwords != 0) stream.memcpy(table + r.copyAt, r.from, r.padDwords);
+                } else {
+                    stream.memcpy(table + r.copyAt, r.from, r.units * 4);
+                }
                 stream.packet(pm4::kWaitMemWrites, nullptr, 0);
                 stream.waitForMe();
                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, table + r.copyAt);
@@ -2552,13 +2616,14 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     if (sf.depth || df.depth) {
         return refuse(why, std::string("a copy of a ") + (sf.depth ? sf.name : df.name) + " texture: a depth texture is tiled, the 2D copy is written for linear ones");
     }
-    if (src.compressed()) {
-        return refuse(why, "a copy from a compressed texture: the 2D copy reads linear ones (not served yet)");
+    if (src.compressed() && (srcLevel != 0 || src.samples() != 1 || dst.compressed())) {
+        // (redfin hmv2: a compressed render target, HM_UBWC_RT, is read by the 2D engine through its flags, r2d_src)
+        return refuse(why, "a copy from a compressed texture: its level 0 into a linear texture is what is served");
     }
     if (dst.compressed() && (sf.fmt6 != df.fmt6 || dstLevel != 0 || linear)) {
         return refuse(why, "a copy into a compressed texture: from its own format, pixel for pixel, into level 0 is what is served");
     }
-    if (sf.fmt6 != df.fmt6 || (sf.swap != df.swap && !dst.compressed())) {
+    if (sf.fmt6 != df.fmt6 || (sf.swap != df.swap && !dst.compressed() && !src.compressed())) {
         return refuse(why, std::string("a copy from ") + sf.name + " to " + df.name + ": the two must be one pixel format (an sRGB pair is one)");
     }
     if (srcLevel >= src.levels() || dstLevel >= dst.levels()) {
@@ -2602,7 +2667,8 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     // for 1, 2 and 4 bytes (a unorm8 copy is exact), 32-bit uint pairs and quads for 8 and 16. RGBA8Snorm and
     // RGBA16Unorm, which Resident Evil 4 uploads, go that way; nothing about them is converted, so nothing can be wrong.
     a6xx_format srcFmt = sf.fmt6, dstFmt = colorFmt(df);
-    a3xx_color_swap srcSwap = sf.swap, dstSwap = df.swap;
+    // (a compressed source is in WZYX order whatever its format's swap: the CCU ignores the swap of a tiled layout)
+    a3xx_color_swap srcSwap = src.compressed() ? WZYX : sf.swap, dstSwap = df.swap;
     bool dstInt = df.element == kElemInt, dstUint = df.element == kElemUint;
     uint32_t ifmt;
     switch (df.fmt6) {
@@ -2645,9 +2711,18 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     const a3xx_msaa_samples srcSamples = src.samples() == 4 ? MSAA_FOUR : src.samples() == 2 ? MSAA_TWO : MSAA_ONE;
     const uint32_t srcInfo = sp2dSrcInfo(srcFmt, srcSwap, srgb, linear && scaled) | A6XX_SP_PS_2D_SRC_INFO_SAMPLES(srcSamples) |
                              (srcSamples != MSAA_ONE && sf.element == kElemFloat ? A6XX_SP_PS_2D_SRC_INFO_SAMPLES_AVERAGE : 0u);
-    regs(stream, REG_A6XX_SP_PS_2D_SRC_INFO, {srcInfo, sp2dSrcSize(SL.width, SL.height), uint32_t(from),
-                                              uint32_t(from >> 32), sp2dSrcPitch(uint32_t(SL.pitch))});
-    regs(stream, REG_A6XX_SP_PS_2D_SRC_FLAGS, {0, 0, 0});
+    if (src.compressed()) {
+        // (redfin hmv2) from a UBWC layout (r2d_src over a UBWC view; fdl6_view_init's TPL1_A2D_SRC_TEXTURE_INFO): TILE6_3,
+        // FLAGS (bit 12), and the flag buffer's address and pitch (tu_cs_image_flag_ref)
+        const uint32_t tiled = (srcInfo & ~A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK) | (uint32_t(TILE6_3) << A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT) | 0x1000u;
+        regs(stream, REG_A6XX_SP_PS_2D_SRC_INFO, {tiled, sp2dSrcSize(SL.width, SL.height), uint32_t(from), uint32_t(from >> 32), sp2dSrcPitch(uint32_t(SL.pitch))});
+        regs(stream, REG_A6XX_SP_PS_2D_SRC_FLAGS, {uint32_t(src.flagAddress()), uint32_t(src.flagAddress() >> 32),
+                                                   A6XX_RB_2D_DST_FLAGS_PITCH(src.flagPitch())});   // (TPL1_A2D_SRC_TEXTURE_FLAG_PITCH: bits 0-7, shr 6)
+    } else {
+        regs(stream, REG_A6XX_SP_PS_2D_SRC_INFO, {srcInfo, sp2dSrcSize(SL.width, SL.height), uint32_t(from),
+                                                  uint32_t(from >> 32), sp2dSrcPitch(uint32_t(SL.pitch))});
+        regs(stream, REG_A6XX_SP_PS_2D_SRC_FLAGS, {0, 0, 0});
+    }
     if (dst.compressed()) {
         // into a UBWC layout (r2d_dst over a UBWC view, tu_clear_blit.cc; fdl6_view_init's RB_2D_DST_INFO): TILE6_3, WZYX
         // (the layout's order, the source's swap reordering a BGRA texture's bytes into it), FLAGS, and its flag buffer
@@ -2701,6 +2776,8 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
     stream.waitForIdle();
     passTail(stream, table, o, false);
 }
+
+void setNotice(void (*fn)(const char*)) { gNotice = fn; }
 
 }  // namespace render
 
@@ -2766,15 +2843,46 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     return forgot;
 }
 
-bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
+bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsGiven, const Bindings& fsGiven,
                          const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
+    std::string why;
+    // (redfin hmv2) an extended-range texture (BGR10_XR...) is sampled through its decoded copy (Texture::xrDecode, HM_XR=1),
+    // decoded once per command buffer and kept until it completes
+    Bindings vsXr, fsXr;
+    const Bindings* vsIn = &vsGiven;
+    const Bindings* fsIn = &fsGiven;
+    if (xrMode() == 1) {
+        for (const auto& [given, with, at] : {std::tuple<const Bindings*, Bindings*, const Bindings**>{&vsGiven, &vsXr, &vsIn}, {&fsGiven, &fsXr, &fsIn}}) {
+            for (size_t i = 0; i < given->textures.size(); i++) {
+                const Texture* t = given->textures[i];
+                if (t == nullptr || t->info().xr == 0) continue;
+                const Texture* decoded = nullptr;
+                for (const auto& [src, copy] : xrDecoded_) {
+                    if (src == t) decoded = copy.get();
+                }
+                if (decoded == nullptr) {
+                    std::shared_ptr<Texture> c = t->xrDecode(queue_.gpu(), &why);
+                    if (c == nullptr) return refuseWork("an extended-range texture: " + why);
+                    keepAlive(c);
+                    xrDecoded_.emplace_back(t, c);
+                    decoded = c.get();
+                }
+                if (*at != with) {
+                    *with = *given;
+                    *at = with;
+                }
+                with->textures[i] = decoded;
+            }
+        }
+    }
+    const Bindings& vsBindings = *vsIn;
+    const Bindings& fsBindings = *fsIn;
     // A compressed texture whose rows this processor changed since the GPU last copied them in (Texture::staging): the
     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
-    std::string why;
     // the null texture's slot is the front end's, not the application's: the queue's texture goes there, over anything
     // bound at that index (an application cannot know the index, so whatever it bound there was not meant for it)
     Bindings vsWithNull, fsWithNull;
@@ -2976,6 +3084,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             stampStart(kPassDraw, first ? first->width() : 0, first ? first->height() : 0);
             if (profiled_.size() > stamped) {
                 profiled_.back().tuneKey = tuneKey;
+                // (redfin hmv2, HM_PROF) the targets' format, layout and cleared bytes (load and store: the GMEM tail's)
+                PassTime& pt = profiled_.back();
+                for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                    const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
+                    if (t == nullptr) continue;
+                    if (i == 0) pt.format = uint32_t(t->format()), pt.tiling = t->compressed() ? 1 : 0;
+                    const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
+                    if (la == LoadAction::kClear) pt.clearBytes += uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel;
+                }
                 // (why not GMEM, pass by pass: the last reason alone named whichever pass came last, and the heavy
                 // full-screen pass of SpringBoard's "home" stayed in sysmem without its reason ever being seen)
                 if (!gmem) {
@@ -3321,6 +3438,15 @@ void CommandBuffer::closePass() {
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) attached |= (i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture) != nullptr ? 1u << i : 0u;
             profiled_.back().attached = attached;
             profiled_.back().touched = uint8_t(open_->written | open_->read);
+            // (redfin hmv2, HM_PROF) the tiles' loads and stores over the plan's area, per attachment loaded or stored
+            const uint64_t areaPx = uint64_t(plan.area[2] - plan.area[0] + 1) * (plan.area[3] - plan.area[1] + 1);
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+                if (t == nullptr) continue;
+                const uint64_t b = areaPx * t->info().bytesPerPixel;
+                if ((load >> i) & 1) profiled_.back().loadBytes += b;
+                if ((store >> i) & 1) profiled_.back().storeBytes += b;
+            }
         }
     }
     pm4::Stream tail;

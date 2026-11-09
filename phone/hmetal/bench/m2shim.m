@@ -15,7 +15,7 @@
  * 120 s renames the flag to bbd-hm.tripped and takes SweetMetal2, so a window server that keeps dying on hakios-metal
  * comes back on SweetMetal2 by itself. Switching: touch / rm the flag, then psx -k backboardd.
  * (hmvar) /var/local/hmetal/ca/env: HAKIOS_METAL_* KEY=VALUE lines set in backboardd before the plug-in loads
- * (HAKIOS_METAL_CA_PICK=exact|own|nearest, HAKIOS_METAL_CA_LOG=0, ...), read at each start.
+ * (HAKIOS_METAL_CA_PICK=exact|own|nearest, HAKIOS_METAL_CA_LOG=0, ...; hmv2: HM_* too), read at each start.
  * Manual reference counting, as the plug-ins.
  */
 #import <Foundation/Foundation.h>
@@ -33,7 +33,7 @@
 #define HM_FLAG   "/var/local/hmetal/ca/bbd-hm"
 #define HM_STARTS "/var/local/hmetal/ca/bbd-hm.starts"
 #define SHIM_LOG  "/var/local/hmetal/ca/shim.log"
-#define HM_ENV    "/var/local/hmetal/ca/env"   /* (hmvar) KEY=VALUE lines, HAKIOS_METAL_* keys only, set in backboardd */
+#define HM_ENV    "/var/local/hmetal/ca/env"   /* (hmvar) KEY=VALUE lines, HAKIOS_METAL_* and (hmv2) HM_* keys, set in backboardd */
 
 static void
 shim_log(const char *fmt, ...)
@@ -72,7 +72,8 @@ shim_env(void)
 		if (line[0] == '\0' || line[0] == '#') {
 			continue;
 		}
-		if (eq == NULL || strncmp(line, "HAKIOS_METAL_", 13) != 0) {
+		/* (hmv2) and the core's HM_* switches: HM_CB_PAD, HM_XR, HM_PROF, HM_UBWC_RT */
+		if (eq == NULL || (strncmp(line, "HAKIOS_METAL_", 13) != 0 && strncmp(line, "HM_", 3) != 0)) {
 			shim_log("env: left out: %s", line);
 			continue;
 		}

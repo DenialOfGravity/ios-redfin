@@ -269,6 +269,8 @@ int hakios_metal_ubwc(hakios_metal_device* d, unsigned* hbb, unsigned* swizzle, 
 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
 
+void hakios_metal_set_notice(void (*fn)(const char*)) { render::setNotice(fn); }
+
 hakios_metal_library* hakios_metal_library_open(const void* data, size_t size) {
     auto* l = new hakios_metal_library;
     l->bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
@@ -978,6 +980,19 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* 
     *attached = t[i].attached;
     *touched = t[i].touched;
     return 0;
+}
+
+int hakios_metal_cb_pass_info(hakios_metal_cb* cb, unsigned i, unsigned* format, unsigned* tiling, unsigned long long* cleared, unsigned long long* loaded,
+                              unsigned long long* stored) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    if (format) *format = t[i].format;
+    if (tiling) *tiling = t[i].tiling;
+    if (cleared) *cleared = t[i].clearBytes;
+    if (loaded) *loaded = t[i].loadBytes;
+    if (stored) *stored = t[i].storeBytes;
+    return int(t.size());
 }
 
 int hakios_metal_cb_pass_tiles(hakios_metal_cb* cb, unsigned i) {
