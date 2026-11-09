@@ -22,7 +22,7 @@
 
 #define ABP_DEV		"/dev/abpbridge"
 #define ABP_LOG		"/var/local/abpbridge.log"
-#define ABPB_MAGIC	0xAB50
+#define ABPB_MAGIC	0xAB51
 #define ABP_MAXFRAME	65536
 #define NPIPES		2
 #define QMI_ERR_NOT_SUPPORTED	0x5e
@@ -31,6 +31,7 @@ struct abpb_hdr {
 	uint16_t magic;
 	uint8_t pipe;
 	uint8_t type;
+	uint32_t sess;		/* one per CommCenter user client on the pipe (ABM opens qmux2 several times) */
 	uint32_t len;
 } __attribute__((packed));
 
@@ -39,7 +40,9 @@ static int fd = -1, want, err_code = QMI_ERR_NOT_SUPPORTED;
 static uint64_t next_check, t0;
 static FILE *lf;
 static uint8_t rbuf[sizeof(struct abpb_hdr) * 8 + ABP_MAXFRAME * 2];
-static uint8_t cids[256][32];		/* [svc][cid] in use (cid 1..255 as bits) */
+#define NSESS	32
+static struct { uint32_t pipe, sess; uint8_t cids[256][32]; } st[NSESS];	/* per session: [svc][cid] in use */
+static uint32_t cur_pipe, cur_sess;	/* the session of the frame being handled */
 static unsigned nframes_in, nframes_out, nseen;
 static struct { uint8_t svc; uint16_t msg; } seen[512];
 
@@ -121,7 +124,8 @@ static void note_seen(const char *pn, unsigned svc, unsigned msg)
 static void log_frame(unsigned pipe, const char *dir, const uint8_t *f, uint32_t n)
 {
 	char h[3 * 96 + 8], t[600];
-	const char *pn = pipe < NPIPES ? pipe_name[pipe] : "?";
+	char pn[24];
+	snprintf(pn, sizeof(pn), "%s/%u", pipe < NPIPES ? pipe_name[pipe] : "?", cur_sess);
 	hexline(h, sizeof(h), f, n < 80 ? n : 80);
 	if (lf) {
 		char full[3 * 2048];
@@ -162,7 +166,7 @@ static void log_frame(unsigned pipe, const char *dir, const uint8_t *f, uint32_t
 static int send_frame(unsigned pipe, const uint8_t *f, uint32_t n)
 {
 	uint8_t b[sizeof(struct abpb_hdr) + 1024];
-	struct abpb_hdr h = { ABPB_MAGIC, (uint8_t)pipe, 0, n };
+	struct abpb_hdr h = { ABPB_MAGIC, (uint8_t)pipe, 0, cur_sess, n };
 	if (fd < 0 || n > sizeof(b) - sizeof(h))
 		return -1;
 	memcpy(b, &h, sizeof(h));
@@ -196,8 +200,32 @@ static void finish_qmux(uint8_t *b, uint32_t n, unsigned svc, unsigned cid)
 	b[5] = (uint8_t)cid;
 }
 
+/* the client-id table of (pipe, sess); a free or the oldest slot is taken for a new session */
+static uint8_t (*sess_cids(uint32_t pipe, uint32_t sess))[32]
+{
+	unsigned best = 0;
+	for (unsigned i = 0; i < NSESS; i++) {
+		if (st[i].sess == sess && st[i].pipe == pipe)
+			return st[i].cids;
+		if (st[i].sess < st[best].sess)
+			best = i;
+	}
+	memset(&st[best], 0, sizeof(st[best]));
+	st[best].pipe = pipe;
+	st[best].sess = sess;
+	return st[best].cids;
+}
+
+static void sess_end(uint32_t pipe, uint32_t sess)
+{
+	for (unsigned i = 0; i < NSESS; i++)
+		if (st[i].sess == sess && st[i].pipe == pipe)
+			memset(&st[i], 0, sizeof(st[i]));
+}
+
 static int cid_alloc(unsigned svc)
 {
+	uint8_t (*cids)[32] = sess_cids(cur_pipe, cur_sess);
 	for (unsigned c = 1; c < 255; c++)
 		if (!(cids[svc][c / 8] & (1u << (c % 8)))) {
 			cids[svc][c / 8] |= (uint8_t)(1u << (c % 8));
@@ -222,7 +250,7 @@ static void ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 			req_svc = tl[i + 3];
 		if (t == 0x01 && msg == 0x23 && l >= 2 && i + 3 + l <= tn) {
 			unsigned sv = tl[i + 3], c = tl[i + 4];
-			cids[sv][c / 8] &= (uint8_t) ~(1u << (c % 8));
+			sess_cids(cur_pipe, cur_sess)[sv][c / 8] &= (uint8_t) ~(1u << (c % 8));
 		}
 		i += 3 + l;
 	}
@@ -236,7 +264,7 @@ static void ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 			put_tlv(b, &o, 0x02, res, 4);
 			uint8_t v[2] = { (uint8_t)req_svc, (uint8_t)c };
 			put_tlv(b, &o, 0x01, v, 2);
-			printf("[%6llu] abp: %s gave %s(0x%02x) client id %d\n", (unsigned long long)link_ms(), pipe_name[pipe],
+			printf("[%6llu] abp: %s/%u gave %s(0x%02x) client id %d\n", (unsigned long long)link_ms(), pipe_name[pipe], cur_sess,
 			       svc_name((unsigned)req_svc), req_svc, c);
 		}
 	} else if (msg == 0x23) {	/* ReleaseClientId: echo {svc, cid} */
@@ -299,21 +327,25 @@ static void svc_reject(unsigned pipe, unsigned svc, unsigned cid, const uint8_t 
 	send_frame(pipe, b, o);
 }
 
-static void handle(unsigned pipe, unsigned type, const uint8_t *d, uint32_t n)
+static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n)
 {
 	if (pipe >= NPIPES)
 		return;
+	cur_pipe = pipe;
+	cur_sess = sess;
 	if (type != 0) {
 		static const char *ev[] = { "data", "OPEN", "CLOSE", "START", "ABORT" };
 		unsigned long long v = 0;
 		if (n >= 8)
 			memcpy(&v, d, 8);
-		printf("[%6llu] abp: t+%.1fs %s %s (arg 0x%llx)\n", (unsigned long long)link_ms(), secs(), pipe_name[pipe],
+		printf("[%6llu] abp: t+%.1fs %s/%u %s (arg 0x%llx)\n", (unsigned long long)link_ms(), secs(), pipe_name[pipe], sess,
 		       type < 5 ? ev[type] : "?", v);
 		if (lf) {
-			fprintf(lf, "%.3f %s event %s arg 0x%llx\n", secs(), pipe_name[pipe], type < 5 ? ev[type] : "?", v);
+			fprintf(lf, "%.3f %s/%u event %s arg 0x%llx\n", secs(), pipe_name[pipe], sess, type < 5 ? ev[type] : "?", v);
 			fflush(lf);
 		}
+		if (type == 2)
+			sess_end(pipe, sess);
 		return;
 	}
 	nframes_in++;
@@ -362,7 +394,7 @@ void abpbridge_poll(void)
 					       (unsigned long long)now, ABP_DEV, strerror(errno));
 			} else {
 				t0 = now;
-				memset(cids, 0, sizeof(cids));
+				memset(st, 0, sizeof(st));
 				nseen = 0;
 				if (!lf)
 					lf = fopen(ABP_LOG, "a");
@@ -397,7 +429,7 @@ void abpbridge_poll(void)
 				printf("[%6llu] abp: bad record at %u (magic 0x%x len %u)\n", (unsigned long long)now, off, h.magic, h.len);
 				return;
 			}
-			handle(h.pipe, h.type, rbuf + off + sizeof(h), h.len);
+			handle(h.pipe, h.sess, h.type, rbuf + off + sizeof(h), h.len);
 			off += (uint32_t)sizeof(h) + h.len;
 		}
 	}
