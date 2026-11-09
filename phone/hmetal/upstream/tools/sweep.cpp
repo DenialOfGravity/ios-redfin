@@ -10,7 +10,7 @@
 // The libraries are read where they lie (a phone's or an image's /System/Library/...): nothing of them is copied,
 // kept or printed but function names, counts and the compiler's own sentences.
 //
-//   sweep [-v] [--chip ID] [-f FUNCTION] [-c INDEX=VALUE]... LIBRARY.metallib...
+//   sweep [-v] [-l] [--chip ID] [-f FUNCTION] [-c INDEX=VALUE]... LIBRARY.metallib...
 //     -v: a line per function; -f: that function alone; -c: a function constant's value, as a pipeline supplies
 //     it (with IR3_SHADER_DEBUG=disasm the listing of one specialisation is what comes out)
 //
@@ -38,6 +38,7 @@ namespace {
 // compile in a child: true when it compiled; else *why is the refusal, or "the compiler aborted: " and the last line
 // the child printed (Mesa's assertion)
 FunctionConstants gConstants;
+bool gListing = false;   // -l: the child keeps its stderr (IR3_SHADER_DEBUG=disasm prints there), aborts not caught
 
 bool compileApart(bool kernel, const uint8_t* bc, uint64_t len, std::string* why) {
     int fds[2];
@@ -49,7 +50,7 @@ bool compileApart(bool kernel, const uint8_t* bc, uint64_t len, std::string* why
     pid_t pid = fork();
     if (pid == 0) {
         close(fds[0]);
-        dup2(fds[1], 2);   // the child's assertion text goes up the pipe too
+        if (!gListing) dup2(fds[1], 2);   // the child's assertion text goes up the pipe too
         std::string w;
         bool ok = kernel ? compileAir(bc, len, &w, gConstants) != nullptr : compileStage(bc, len, &w, gConstants) != nullptr;
         std::string msg = std::string(ok ? "OK\n" : "NO\n") + w;
@@ -115,6 +116,8 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             only = argv[++i];
+        } else if (std::strcmp(argv[i], "-l") == 0) {
+            gListing = true;
         } else if (std::strcmp(argv[i], "--chip") == 0 && i + 1 < argc) {
             // (redfin) the chip the compiler is made for: 0x06020000 = the A620 (default: the A635, as before)
             const a6xx::ChipInfo* c = a6xx::chipFor(uint32_t(std::strtoul(argv[++i], nullptr, 0)));
