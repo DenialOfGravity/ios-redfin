@@ -592,3 +592,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
 - 2026-11-09: ipagsi: QMAP command frames from the modem logged (name/type/txn, 'qmap cmd #N'), counted in the p2 stats line; p2qmapack=1 answers requests with cmd_type ACK via IP_PACKET_INIT -> ep10 (Q6_LAN_CONS) + frame on ch2, as Android's rmnet/ipa3_wwan_xmit.
 - 2026-11-09: iOS Cellular Data switch: SweetCT (ws-n-celldata 27efaa0) replaces +[PSCellularDataSettingsDetail isEnabled/setEnabled:] with /var/tmp/sweetcell.celldata; ipagsi celldata_poll follows it every 2 s (off = netsvc down + UL dropped, on = netsvc up).
 - 2026-11-09: p2nudge=1 (cell.c + ipagsi_ul_stuck): UL posted 300 ms-5 s ago and the modem's UL ring (EE1 ch7 WP) unchanged -> WDS Get Packet Service Status as a GLINK wake-up, max 2/s.
+- 2026-11-09: p2nudge=1 (WDS 0x22 as a GLINK wake-up) did NOT help: 100+ nudges during an 80 s stall. p2nudge=2: WDS Go Active 0x26 instead (leave dormancy -> service request).

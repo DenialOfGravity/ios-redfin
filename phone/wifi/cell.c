@@ -2412,8 +2412,12 @@ static void xs_answer(const struct qmi_msg *m)
 		if (ps_want != 3 || ++n_ps <= 6 || n_ps % 20 == 0 || e)
 			printf("[%6llu] cell: WRITE wda set powersave mode flag %d -> %s (err %#x) after %llu ms (%u sent)\n", (unsigned long long)now,
 			       ps_sent == 2, e ? "refused" : "ok", e, (unsigned long long)(now - xs_sent_ms), n_ps);
-	} else if (xs_svc == SVC_WDS && m->id == 0x22) {
-		;	/* p2nudge answer: nothing to do */
+	} else if (xs_svc == SVC_WDS && (m->id == 0x22 || m->id == 0x26)) {
+		static unsigned n_ga_err;
+		if (m->id == 0x26 && e && (++n_ga_err <= 5 || n_ga_err % 50 == 0))
+			printf("[%6llu] cell: p2nudge: WDS Go Active -> err %#x (%u)\n", (unsigned long long)now, e, n_ga_err);
+		else if (m->id == 0x26 && !e && n_ga_err == 0 && nudges <= 3)
+			printf("[%6llu] cell: p2nudge: WDS Go Active -> ok after %llu ms\n", (unsigned long long)now, (unsigned long long)(now - xs_sent_ms));
 	} else if (xs_svc == SVC_WMS && m->id == 0x01) {
 		printf("[%6llu] cell: WRITE wms set event report -> %s (err %#x)\n", (unsigned long long)now, e ? "refused" : "ok", e);
 	} else if (xs_svc == SVC_WMS && m->id == 0x20) {
@@ -2478,14 +2482,16 @@ static void xs_poll(uint64_t now)
 	if (nudge_on && srv[SVC_WDS].up && now - nudge_at >= 500 && ipagsi_ul_stuck()) {
 		/* p2nudge=1 (Claude 2026-11-09): wake the modem with a harmless QMI query (WDS Get Packet Service Status 0x22): a
 		 * GLINK message interrupts the modem out of power collapse, and its data task may then service the IPA */
-		struct qmi_buf *q = xs_start(0x22);
+		/* p2nudge=2: WDS Go Active 0x26 (leave dormancy: the modem sends a service request and RRC reconnects) */
+		uint16_t nid = nudge_on == 2 ? 0x26 : 0x22;
+		struct qmi_buf *q = xs_start(nid);
 		if (!q)
 			return;
 		nudge_at = now;
-		xs_send(SVC_WDS, 0x22, q);
+		xs_send(SVC_WDS, nid, q);
 		free(q);
 		if (++nudges <= 10 || nudges % 50 == 0)
-			printf("[%6llu] cell: p2nudge: UL waiting, modem UL ring idle -> QMI nudge #%u\n", (unsigned long long)now, nudges);
+			printf("[%6llu] cell: p2nudge: UL waiting, modem UL ring idle -> QMI nudge #%u (%s)\n", (unsigned long long)now, nudges, nudge_on == 2 ? "Go Active" : "pkt status");
 		return;
 	}
 	if (srv[SVC_WMS].up && !wms_evt) {
