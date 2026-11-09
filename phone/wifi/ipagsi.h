@@ -21,6 +21,7 @@ void ipagsi_start(const struct ipagsi_call *c, int tables);	/* tables: 0 = no ch
 							   One attempt per wland run: after it has run (up, failed
 							   or stopped) a second start is refused with a log. */
 void ipagsi_stop(const char *why);	/* polling and the utun end; the GSI/IPA are left as they are (no reset) */
+int ipagsi_ul_stuck(void);		/* UL waiting and the modem's UL ring idle (cell.c p2nudge) */
 uint64_t ipagsi_last_tx_ms(void);	/* link_ms() of the last UL packet posted (0 none); cell.c wdaps=3 */
 int ipagsi_running(void);		/* setup reached "up": X1 holds the call while it runs (x1hold=1) */
 const char *ipagsi_state(void);		/* for cell.status: off | setup-1..setup-8 | up | failed-N | stopped */

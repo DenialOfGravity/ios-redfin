@@ -1088,6 +1088,7 @@ static uint64_t tx_buf_pa[TX_BUFS];
 static uint32_t tx_wp, tx_done;
 static int celldata_off;		/* iOS Cellular Data switch off (celldata_poll) */
 static uint64_t last_tx_ms;
+static uint32_t ch7_wp_at_tx;	/* EE1 ch7 (the modem's UL consumer, ep14) write pointer at the first UL packet of a burst */
 
 static int tx_drain(void)
 {
@@ -1140,6 +1141,8 @@ static int tx_send(const uint8_t *ip, size_t len)
 	tx_wp++;
 	ch_doorbell(CH_MDM_TX);
 	ctx.tx_pkts++;
+	if (link_ms() - last_tx_ms > 1000 || !ch7_wp_at_tx)	/* the first packet of a burst: remember where the modem's UL ring was */
+		ch7_wp_at_tx = rd32(GSI_CH_C_CNTXT_0(7) + 0x4000 + 0x18);
 	last_tx_ms = link_ms();
 	return 0;
 }
@@ -2972,6 +2975,16 @@ void ipagsi_stop(const char *why)
 		ctx.utun_fd = -1;
 	}
 	set_state("stopped");
+}
+
+/* p2nudge (cell.c): UL posted 300 ms - 5 s ago and the modem's UL consumer ring has not moved since: the modem's data task is
+ * asleep.  Read-only (one EE1 register, the same one ipaprobe reads). */
+int ipagsi_ul_stuck(void)
+{
+	uint64_t now = link_ms();
+	if (!ctx.active || !last_tx_ms || now - last_tx_ms < 300 || now - last_tx_ms > 5000)
+		return 0;
+	return rd32(GSI_CH_C_CNTXT_0(7) + 0x4000 + 0x18) == ch7_wp_at_tx;
 }
 
 uint64_t ipagsi_last_tx_ms(void)
