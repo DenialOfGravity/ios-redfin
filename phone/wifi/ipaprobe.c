@@ -9,6 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "link.h"
 #include "cell.h"
@@ -302,6 +310,99 @@ static int probe_mode = -1, probe_round, probe_step, pend;
 static uint64_t probe_at;
 static uint32_t ptr0[8];
 static unsigned ipid = 0x5a00;
+
+/* p2tput=N (Claude 2026-11-09): one bounded HTTP download of N MB (1-3; the SIM's data cap is small) through the phone's own
+ * TCP stack over the utun (IP_BOUND_IF), 20 s after up: speed.cloudflare.com/__down?bytes=... Logs bytes, time, Mbit/s. */
+static volatile int tput_state;		/* 0 not started, 1 running, 2 done */
+static unsigned tput_mb;
+static char tput_if[32];
+#ifndef IP_BOUND_IF
+#define IP_BOUND_IF 25
+#endif
+static void *tput_thread(void *arg)
+{
+	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *ai = NULL;
+	unsigned want = tput_mb * 1048576u;
+	int fd = -1, idx = (int) if_nametoindex(tput_if);
+	char req[256], buf[16384];
+	struct timeval t0, t1, tv = { 60, 0 };
+	unsigned long long got = 0;
+	int rc = getaddrinfo("speed.cloudflare.com", "80", &hints, &ai);
+	if (rc || !ai) {
+		LOG("tput: getaddrinfo: %s", gai_strerror(rc));
+		goto out;
+	}
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		goto out;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	if (idx > 0 && setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx)))
+		LOG("tput: IP_BOUND_IF %s: %s", tput_if, strerror(errno));
+	gettimeofday(&t0, NULL);
+	if (connect(fd, ai->ai_addr, ai->ai_addrlen)) {
+		LOG("tput: connect: %s", strerror(errno));
+		goto out;
+	}
+	gettimeofday(&t1, NULL);
+	LOG("tput: connected to %s via %s in %ld ms, GET %u bytes", inet_ntoa(((struct sockaddr_in *) ai->ai_addr)->sin_addr), tput_if,
+	    (long) ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000), want);
+	snprintf(req, sizeof(req), "GET /__down?bytes=%u HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: redfin-ipaprobe\r\nConnection: close\r\n\r\n", want);
+	if (write(fd, req, strlen(req)) < 0)
+		goto out;
+	gettimeofday(&t0, NULL);
+	for (;;) {
+		ssize_t n = read(fd, buf, sizeof(buf));
+		if (n <= 0) {
+			if (n < 0)
+				LOG("tput: read: %s after %llu bytes", strerror(errno), got);
+			break;
+		}
+		got += (unsigned long long) n;
+		if (got >= want + 400)
+			break;
+	}
+	gettimeofday(&t1, NULL);
+	{
+		double sec = (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_usec - t0.tv_usec) / 1e6;
+		LOG("tput: RESULT %llu bytes in %.2f s = %.2f Mbit/s (%s)", got, sec, sec > 0 ? got * 8.0 / sec / 1e6 : 0.0,
+		    got >= want ? "complete" : "SHORT");
+	}
+out:
+	if (fd >= 0)
+		close(fd);
+	if (ai)
+		freeaddrinfo(ai);
+	tput_state = 2;
+	return NULL;
+}
+
+void ipaprobe_tput(const char *ifname)
+{
+	static uint64_t at;
+	pthread_t th;
+	if (tput_state)
+		return;
+	if (!at) {
+		int n = word_int("p2tput=", 0);
+		if (n <= 0) {
+			tput_state = 2;
+			return;
+		}
+		tput_mb = n > 3 ? 3 : (unsigned) n;
+		at = link_ms() + 20000;
+		snprintf(tput_if, sizeof(tput_if), "%s", ifname);
+		LOG("p2tput=%u: HTTP download of %u MB via %s in 20 s", tput_mb, tput_mb, tput_if);
+		return;
+	}
+	if (link_ms() < at)
+		return;
+	tput_state = 1;
+	if (pthread_create(&th, NULL, tput_thread, NULL))
+		tput_state = 2;
+	else
+		pthread_detach(th);
+}
 
 void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *, size_t), unsigned tx_free,
 		   uint32_t (*rd)(uint64_t))

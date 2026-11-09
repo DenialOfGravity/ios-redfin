@@ -44,10 +44,15 @@
 #include "qmi.h"
 #include "ipagsi.h"
 
-enum { SVC_DMS, SVC_NAS, SVC_UIM, SVC_WDS, SVC_DPM, SVC_WDA, NSVC };
-static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b, 0x01, 0x2f, 0x1a };
-static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds", "dpm", "wda" };
+enum { SVC_DMS, SVC_NAS, SVC_UIM, SVC_WDS, SVC_DPM, SVC_WDA, SVC_WMS, NSVC };
+static const uint32_t svc_id[NSVC] = { 0x02, 0x03, 0x0b, 0x01, 0x2f, 0x1a, 0x05 };
+static const char *svc_name[NSVC] = { "dms", "nas", "uim", "wds", "dpm", "wda", "wms" };
 static struct { uint32_t node, port; int up; } srv[NSVC];
+static uint16_t xs_id, xs_txn;	/* extras (WDA powersave, SMS): the request in flight */
+static void xs_read_words(const char *b);	/* extras: cell.on words */
+static void xs_answer(const struct qmi_msg *m);
+static void sms_ind(const struct qmi_msg *m);
+static void xs_poll(uint64_t now);
 
 /* opt: 0 = always (the fe5bee5 set), else only with that word in /var/local/cell.on (OPT_*) */
 enum { OPT_SLOTS = 1, OPT_HW = 2, OPT_SWITCH = 4, OPT_ONLINE = 8, OPT_LPM = 16, OPT_PIN = 32, OPT_WDS = 64, OPT_DATATEST = 128,
@@ -777,6 +782,7 @@ static int read_opts(void)
 		dorm_s = (w = strstr(b, "wdsdorm=")) ? atoi(w + 8) : 0;
 		if (dorm_s < 0)
 			dorm_s = 0;
+		xs_read_words(b);
 	}
 	rd_fam = strstr(b, "ipfam=6") ? 6 : 4;
 	if (strstr(b, "datatest=1"))
@@ -1971,8 +1977,19 @@ void cell_server_gone(uint32_t node, uint32_t port)
 void cell_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 {
 	struct qmi_msg m;
-	if (qmi_parse(d, n, &m) || m.type != QMI_RESPONSE)
-		return;			/* indications: none registered for */
+	if (qmi_parse(d, n, &m))
+		return;
+	if (m.type == QMI_INDICATION) {
+		if (srv[SVC_WMS].up && h->src_port == srv[SVC_WMS].port && h->src_node == srv[SVC_WMS].node)
+			sms_ind(&m);	/* WMS event report: a new SMS arrived */
+		return;
+	}
+	if (m.type != QMI_RESPONSE)
+		return;
+	if (xs_txn && m.txn == xs_txn && m.id == xs_id) {
+		xs_answer(&m);
+		return;
+	}
 	if (x1_mine(&m)) {
 		x1_answer(&m);
 		return;
@@ -2074,6 +2091,8 @@ void cell_poll(void)
 		}
 	}
 	pin_poll();
+	if (enabled && allowed)
+		xs_poll(now);		/* extras: WDA powersave, SMS (own request slot, own txn) */
 	if (allowed && now >= allow_ms && x1_poll(now))
 		return;			/* an X1 request is out (also after cell.on went: a started call is still stopped) */
 	if (!enabled || !allowed || now < allow_ms)
@@ -2147,4 +2166,307 @@ int cell_print(void)
 		fputs(line, stdout);
 	fclose(f);
 	return 0;
+}
+
+/*
+ * ---------------------------------------------------------------------------------------------------------------
+ * Extras (Claude 2026-11-09), one request in flight at a time (xs_id/xs_txn), all opt-in by cell.on words:
+ *   wdaps=1|2   WDA Set Powersave Mode 0x2e once the call is up: 1 = flag 0 (no power save: deliver at once, what
+ *               Android's qmi_rmnet sends when traffic starts), 2 = flag 1 (power save).  Re-sent when the word changes.
+ *   sms=NUMBER  one SMS-SUBMIT (3GPP PDU, 7-bit text, SIM's SMSC) to NUMBER (digits, international, with or without a
+ *               leading 00 or +) through WMS Raw Send 0x20; once per NUMBER value.  With a WMS server up, Set Event Report
+ *               (0x01, new-message reports) is sent once; an incoming SMS is read with Raw Read 0x22 and logged
+ *               (`cell: sms from ...`), then deleted from the SIM/NV store is NOT done (left as is).
+ */
+static int ps_want, ps_sent = -1;
+static char sms_num[24], sms_done[24];
+static int xs_svc;
+static uint64_t xs_sent_ms;
+static int wms_evt;			/* Set Event Report sent */
+static uint8_t sms_rd_store; static uint32_t sms_rd_idx; static int sms_rd_pending;
+
+static void xs_read_words(const char *b)
+{
+	const char *w = strstr(b, "wdaps=");
+	ps_want = w ? atoi(w + 6) : 0;
+	sms_num[0] = 0;
+	if ((w = strstr(b, "sms="))) {
+		w += 4;
+		if (*w == '+')
+			w++;
+		else if (w[0] == '0' && w[1] == '0')
+			w += 2;
+		size_t n = 0;
+		while (n < sizeof(sms_num) - 1 && w[n] >= '0' && w[n] <= '9')
+			n++;
+		if (n >= 6) {
+			memcpy(sms_num, w, n);
+			sms_num[n] = 0;
+		}
+	}
+}
+
+static int xs_send(int svc, uint16_t id, struct qmi_buf *q)
+{
+	size_t len = qmi_finish(q);
+	qrtr_send(QRTR_TYPE_DATA, CELL_PORT, srv[svc].node, srv[svc].port, q->b, (uint32_t)len);
+	xs_svc = svc;
+	xs_id = id;
+	xs_sent_ms = link_ms();
+	return 0;
+}
+
+static struct qmi_buf *xs_start(uint16_t id)
+{
+	struct qmi_buf *q = malloc(sizeof(*q));
+	if (!q)
+		return NULL;
+	xs_txn = txn++;
+	if (!txn)
+		txn = 1;
+	qmi_start(q, QMI_REQUEST, xs_txn, id);
+	return q;
+}
+
+/* GSM 03.38 7-bit packing of ASCII text (letters, digits, space and most punctuation share the codes) */
+static unsigned gsm7_pack(const char *t, uint8_t *out, unsigned cap)
+{
+	unsigned n = strlen(t), bits = 0, bytes = 0;
+	uint32_t acc = 0;
+	memset(out, 0, cap);
+	for (unsigned i = 0; i < n && bytes < cap; i++) {
+		acc |= (uint32_t)((uint8_t)t[i] & 0x7f) << bits;
+		bits += 7;
+		while (bits >= 8 && bytes < cap) {
+			out[bytes++] = (uint8_t)acc;
+			acc >>= 8;
+			bits -= 8;
+		}
+	}
+	if (bits && bytes < cap)
+		out[bytes++] = (uint8_t)acc;
+	return n;
+}
+
+static unsigned gsm7_unpack(const uint8_t *in, unsigned septets, char *out, unsigned cap)
+{
+	unsigned bits = 0, k = 0;
+	uint32_t acc = 0;
+	const uint8_t *p = in;
+	for (unsigned i = 0; i < septets && k + 1 < cap; i++) {
+		while (bits < 7) {
+			acc |= (uint32_t)*p++ << bits;
+			bits += 8;
+		}
+		uint8_t c = acc & 0x7f;
+		acc >>= 7;
+		bits -= 7;
+		out[k++] = (c >= 32 && c < 127) ? (char)c : '?';
+	}
+	out[k] = 0;
+	return k;
+}
+
+static unsigned bcd_digits(const char *d, uint8_t *out)	/* swapped nibbles, F padded; returns octets */
+{
+	unsigned n = strlen(d), o = 0;
+	for (unsigned i = 0; i < n; i += 2) {
+		uint8_t lo = d[i] - '0', hi = (i + 1 < n) ? d[i + 1] - '0' : 0xf;
+		out[o++] = (uint8_t)(hi << 4 | lo);
+	}
+	return o;
+}
+
+static void sms_send(void)
+{
+	char text[96];
+	uint8_t pdu[180], ud[160], da[12];
+	unsigned k = 0, dal, septets;
+	struct qmi_buf *q = xs_start(0x20);
+	if (!q)
+		return;
+	snprintf(text, sizeof(text), "redfin iOS: cellular data and SMS test, t=%llus", (unsigned long long)link_ms() / 1000);
+	septets = gsm7_pack(text, ud, sizeof(ud));
+	pdu[k++] = 0x01;			/* SMS-SUBMIT, no validity period, no status report */
+	pdu[k++] = 0x00;			/* message reference: the modem fills it in */
+	pdu[k++] = (uint8_t)strlen(sms_num);	/* destination: number of digits */
+	pdu[k++] = 0x91;			/* international, ISDN */
+	dal = bcd_digits(sms_num, da);
+	memcpy(pdu + k, da, dal);
+	k += dal;
+	pdu[k++] = 0x00;			/* PID */
+	pdu[k++] = 0x00;			/* DCS: GSM 7-bit */
+	pdu[k++] = (uint8_t)septets;		/* UDL in septets */
+	unsigned udb = (septets * 7 + 7) / 8;
+	memcpy(pdu + k, ud, udb);
+	k += udb;
+	uint8_t tlv[4 + sizeof(pdu)];
+	tlv[0] = 6;				/* format: 3GPP (WMS_MESSAGE_FORMAT_GW_PP) */
+	tlv[1] = (uint8_t)k;
+	tlv[2] = (uint8_t)(k >> 8);
+	memcpy(tlv + 3, pdu, k);
+	qmi_tlv(q, 0x01, tlv, (uint16_t)(3 + k));
+	printf("[%6llu] cell: WRITE wms raw send: SMS-SUBMIT to +%s, %u septets, %u-byte TPDU\n", (unsigned long long)link_ms(),
+	       sms_num, septets, k);
+	xs_send(SVC_WMS, 0x20, q);
+	free(q);
+	snprintf(sms_done, sizeof(sms_done), "%s", sms_num);
+}
+
+static void sms_read(void)
+{
+	struct qmi_buf *q = xs_start(0x22);
+	uint8_t v[5] = { sms_rd_store };
+	if (!q)
+		return;
+	memcpy(v + 1, &sms_rd_idx, 4);
+	qmi_tlv(q, 0x01, v, 5);
+	qmi_tlv_u8(q, 0x10, 1);		/* message mode GW */
+	xs_send(SVC_WMS, 0x22, q);
+	free(q);
+	sms_rd_pending = 0;
+}
+
+static void sms_decode_deliver(const uint8_t *p, unsigned n)
+{
+	char from[32] = "?", text[200] = "";
+	unsigned k = 0;
+	if (n < 12)
+		return;
+	uint8_t fo = p[k++];
+	unsigned oal = p[k++];			/* originating address, digits */
+	uint8_t toa = p[k++];
+	unsigned oab = (oal + 1) / 2;
+	if (k + oab + 2 + 7 + 1 > n)
+		return;
+	if ((toa & 0x70) == 0x50) {		/* alphanumeric sender */
+		char a[24];
+		gsm7_unpack(p + k, oal * 4 / 7, a, sizeof(a));
+		snprintf(from, sizeof(from), "'%s'", a);
+	} else {
+		unsigned j = 0;
+		if ((toa & 0x70) == 0x10)
+			from[j++] = '+';
+		for (unsigned i = 0; i < oal && j < sizeof(from) - 1; i++)
+			from[j++] = (char)('0' + ((i & 1) ? p[k + i / 2] >> 4 : p[k + i / 2] & 0xf));
+		from[j] = 0;
+	}
+	k += oab;
+	uint8_t pid = p[k++], dcs = p[k++];
+	k += 7;					/* SCTS */
+	unsigned udl = p[k++];
+	if (fo & 0x40) {			/* UDH present: skip it (concatenation etc.) */
+		unsigned udhl = p[k];
+		if ((dcs & 0x0c) == 0) {	/* 7-bit: UDH takes ceil((udhl+1)*8/7) septets */
+			unsigned sk = ((udhl + 1) * 8 + 6) / 7;
+			if (sk < udl) {
+				/* unpack from the septet boundary after the UDH */
+				char all[320];
+				gsm7_unpack(p + k, udl, all, sizeof(all));
+				snprintf(text, sizeof(text), "%s", all + sk);
+			}
+		} else if (k + 1 + udhl < n)
+			snprintf(text, sizeof(text), "%.*s", (int)(n - k - 1 - udhl), (const char *)p + k + 1 + udhl);
+	} else if ((dcs & 0x0c) == 0)
+		gsm7_unpack(p + k, udl, text, sizeof(text));
+	else if ((dcs & 0x0c) == 0x04 && k + udl <= n)
+		snprintf(text, sizeof(text), "%.*s", (int)udl, (const char *)p + k);
+	else
+		snprintf(text, sizeof(text), "(dcs %#x, %u bytes, not decoded)", dcs, udl);
+	printf("[%6llu] cell: SMS from %s (pid %#x dcs %#x): %s\n", (unsigned long long)link_ms(), from, pid, dcs, text);
+}
+
+static void sms_ind(const struct qmi_msg *m)
+{
+	uint16_t l;
+	const uint8_t *p;
+	if (m->id != 0x01)
+		return;
+	if ((p = qmi_get(m, 0x11, &l)) && l >= 5) {	/* MT message: storage u8, index u32 */
+		sms_rd_store = p[0];
+		memcpy(&sms_rd_idx, p + 1, 4);
+		sms_rd_pending = 1;
+		printf("[%6llu] cell: sms: new message in store %u index %u\n", (unsigned long long)link_ms(), p[0], sms_rd_idx);
+	} else if ((p = qmi_get(m, 0x10, &l)) && l >= 4) {	/* transfer route MT: ack ind u8, format u8, len u16, data */
+		uint16_t dl;
+		memcpy(&dl, p + 2, 2);
+		printf("[%6llu] cell: sms: transfer-route message, format %u, %u bytes\n", (unsigned long long)link_ms(), p[1], dl);
+		if (p[1] == 6 && 4 + dl <= l)
+			sms_decode_deliver(p + 4, dl);
+	} else
+		printf("[%6llu] cell: sms: event report without a message TLV\n", (unsigned long long)link_ms());
+}
+
+static void xs_answer(const struct qmi_msg *m)
+{
+	uint64_t now = link_ms();
+	unsigned e = qerr(m);
+	uint16_t l;
+	const uint8_t *p;
+	if (xs_svc == SVC_WDA && m->id == 0x2e) {
+		printf("[%6llu] cell: WRITE wda set powersave mode flag %d -> %s (err %#x) after %llu ms\n", (unsigned long long)now,
+		       ps_want == 2, e ? "refused" : "ok", e, (unsigned long long)(now - xs_sent_ms));
+	} else if (xs_svc == SVC_WMS && m->id == 0x01) {
+		printf("[%6llu] cell: WRITE wms set event report -> %s (err %#x)\n", (unsigned long long)now, e ? "refused" : "ok", e);
+	} else if (xs_svc == SVC_WMS && m->id == 0x20) {
+		uint16_t mid = 0, cause = 0;
+		if ((p = qmi_get(m, 0x02, &l)) && l >= 2)
+			memcpy(&mid, p, 2);
+		if ((p = qmi_get(m, 0x10, &l)) && l >= 2)
+			memcpy(&cause, p, 2);
+		printf("[%6llu] cell: WRITE wms raw send -> %s (err %#x) message id %u cause %#x after %llu ms\n", (unsigned long long)now,
+		       e ? "refused" : "SENT", e, mid, cause, (unsigned long long)(now - xs_sent_ms));
+	} else if (xs_svc == SVC_WMS && m->id == 0x22) {
+		if (!e && (p = qmi_get(m, 0x01, &l)) && l >= 4) {	/* tag u8, format u8, len u16, data */
+			uint16_t dl;
+			memcpy(&dl, p + 2, 2);
+			if (p[1] == 6 && 4 + dl <= l)
+				sms_decode_deliver(p + 4, dl);
+			else
+				printf("[%6llu] cell: sms: read format %u, %u bytes (not 3GPP)\n", (unsigned long long)now, p[1], dl);
+		} else
+			printf("[%6llu] cell: sms: raw read err %#x\n", (unsigned long long)now, e);
+	}
+	xs_id = 0;
+	xs_txn = 0;
+}
+
+static void xs_poll(uint64_t now)
+{
+	if (xs_id) {
+		if (now - xs_sent_ms > 15000) {
+			printf("[%6llu] cell: extras: %s %#x unanswered in 15 s (not repeated)\n", (unsigned long long)now, svc_name[xs_svc], xs_id);
+			xs_id = 0;
+			xs_txn = 0;
+		}
+		return;
+	}
+	if (ps_want && ps_want != ps_sent && srv[SVC_WDA].up && x1_state == X1_WAIT) {
+		struct qmi_buf *q = xs_start(0x2e);
+		if (!q)
+			return;
+		qmi_tlv_u8(q, 0x01, ps_want == 2);
+		xs_send(SVC_WDA, 0x2e, q);
+		free(q);
+		ps_sent = ps_want;
+		return;
+	}
+	if (srv[SVC_WMS].up && !wms_evt) {
+		struct qmi_buf *q = xs_start(0x01);
+		if (!q)
+			return;
+		qmi_tlv_u8(q, 0x10, 1);		/* report new MT messages */
+		xs_send(SVC_WMS, 0x01, q);
+		free(q);
+		wms_evt = 1;
+		return;
+	}
+	if (srv[SVC_WMS].up && sms_rd_pending) {
+		sms_read();
+		return;
+	}
+	if (sms_num[0] && strcmp(sms_num, sms_done) && srv[SVC_WMS].up && nas_reg == 1) {
+		sms_send();
+		return;
+	}
 }

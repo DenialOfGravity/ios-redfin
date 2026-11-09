@@ -19,4 +19,5 @@
 void ipaprobe_pkt(const char *dir, uint8_t mux, const uint8_t *ip, size_t n);	/* rx_to_utun / tx_send */
 void ipaprobe_poll(const struct ipagsi_call *c, int (*send)(const uint8_t *ip, size_t len), unsigned tx_free,
 		   uint32_t (*rd32)(uint64_t pa));
+void ipaprobe_tput(const char *utun_name);	/* p2tput=N: one bounded HTTP download through the utun (ipagsi p2_poll, after up) */
 #endif

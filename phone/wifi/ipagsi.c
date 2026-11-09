@@ -1642,6 +1642,78 @@ static void ep_program(int ep, int status)
 
 static int p2_prog = 1, p2_status = 1;
 
+/* cellroute=1 (Claude 2026-11-09): publish the utun to iOS (netsvc: address, router, DNS) when the data path is up, and take it
+ * down when it stops.  Until now this was done by hand after every boot. */
+static int route_pub;
+static void ipstr4(uint32_t a, char *b, size_t n)
+{
+	const uint8_t *p = (const uint8_t *) &a;
+	snprintf(b, n, "%u.%u.%u.%u", p[0], p[1], p[2], p[3]);
+}
+static void cellroute(int up)
+{
+	char cmd[256], ip[16], mask[16], gw[16], d1[16], d2[16];
+	if (up) {
+		if (route_pub || cell_word_int("cellroute=", 0) != 1 || ctx.utun_fd < 0)
+			return;
+		ipstr4(ctx.call.ip, ip, sizeof(ip));
+		ipstr4(ctx.call.mask ? ctx.call.mask : htonl(0xffffff00u), mask, sizeof(mask));
+		ipstr4(ctx.call.gw, gw, sizeof(gw));
+		ipstr4(ctx.call.dns1 ? ctx.call.dns1 : ctx.call.gw, d1, sizeof(d1));
+		ipstr4(ctx.call.dns2 ? ctx.call.dns2 : ctx.call.dns1 ? ctx.call.dns1 : ctx.call.gw, d2, sizeof(d2));
+		snprintf(cmd, sizeof(cmd), "/var/local/bin/netsvc up %s %s %s %s %s %s >/dev/null 2>&1", ctx.utun_name, ip, mask, gw, d1, d2);
+		route_pub = 1;
+	} else {
+		if (!route_pub)
+			return;
+		snprintf(cmd, sizeof(cmd), "/var/local/bin/netsvc down %s >/dev/null 2>&1", ctx.utun_name);
+		route_pub = 0;
+	}
+	int r = system(cmd);
+	LOG("cellroute: %s -> %d", cmd, r);
+}
+
+/* p2wake=1 (Claude 2026-11-09, runtime toggle, re-read every 10 s): when UL is pending and the modem's consumer pipe ep14 has
+ * its SUSPEND bit set (the first packet after idle gets status opcode 0x08 SUSPENDED and waits 10-18 s for the modem's own
+ * wake-up), clear the bit, as Android's suspend handler does for suspended consumer pipes.  p2wake=2 only logs.  Also logs the
+ * IPA suspend-IRQ registers of EE0/EE1 (0x3030/0x3034: which EE is told) and the modem's ch7 state, once per episode. */
+#define IPA_IRQ_STTS_EE(n)		(IPA_BASE + 0x3008 + 0x1000 * (n))
+#define IPA_IRQ_EN_EE(n)		(IPA_BASE + 0x300c + 0x1000 * (n))
+#define IPA_SUSPEND_IRQ_INFO_EE(n)	(IPA_BASE + 0x3030 + 0x1000 * (n))
+#define IPA_SUSPEND_IRQ_EN_EE(n)	(IPA_BASE + 0x3034 + 0x1000 * (n))
+static void p2_wake(void)
+{
+	static int mode = -1, episode, n_clear, n_seen;
+	static uint64_t mode_at;
+	if (link_ms() - mode_at >= 10000) {
+		mode_at = link_ms();
+		mode = cell_word_int("p2wake=", 0);
+	}
+	if (!mode)
+		return;
+	if (tx_wp == tx_done) {
+		episode = 0;
+		return;
+	}
+	uint32_t ctrl = rd32(IPA_ENDP_CTRL(EP_MODEM_AP_RX));
+	if (!(ctrl & EP_CTRL_SUSPEND))
+		return;
+	n_seen++;
+	if (!episode) {
+		episode = 1;
+		LOG("p2wake: ep14 SUSPENDED with %u UL pending (seen %u): EE1 ch7 state %u | IRQ_STTS ee0 %08x ee1 %08x | IRQ_EN ee0 %08x ee1 %08x"
+		    " | SUSPEND_INFO ee0 %08x ee1 %08x | SUSPEND_EN ee0 %08x ee1 %08x%s", tx_wp - tx_done, n_seen,
+		    (unsigned) (rd32(GSI_CH_C_CNTXT_0(7) + 0x4000) >> CH_STATE_SHIFT & 0xf), rd32(IPA_IRQ_STTS_EE(0)), rd32(IPA_IRQ_STTS_EE(1)),
+		    rd32(IPA_IRQ_EN_EE(0)), rd32(IPA_IRQ_EN_EE(1)), rd32(IPA_SUSPEND_IRQ_INFO_EE(0)), rd32(IPA_SUSPEND_IRQ_INFO_EE(1)),
+		    rd32(IPA_SUSPEND_IRQ_EN_EE(0)), rd32(IPA_SUSPEND_IRQ_EN_EE(1)), mode == 1 ? " -> clearing suspend" : "");
+	}
+	if (mode == 1) {
+		wr32(IPA_ENDP_CTRL(EP_MODEM_AP_RX), ctrl & ~EP_CTRL_SUSPEND);
+		if (++n_clear <= 3 || n_clear % 50 == 0)
+			LOG("p2wake: cleared ep14 suspend (%u times), ctrl now %08x", n_clear, rd32(IPA_ENDP_CTRL(EP_MODEM_AP_RX)));
+	}
+}
+
 static int p2_setup(void)
 {
 	p2_tx_only = cell_word_int("p2tx=", 0);
@@ -2388,6 +2460,7 @@ static void p2_poll(void)
 		p2_stage = 2;
 		set_state("up");
 		LOG("up (p2late, join %s)", go == 1 ? "cycle" : "timeout");
+		cellroute(1);
 		return;
 	failed:
 		LOG("p2: join FAILED");
@@ -2400,6 +2473,8 @@ static void p2_poll(void)
 		return;
 	p2_drain();
 	tx_pump();
+	p2_wake();
+	ipaprobe_tput(ctx.utun_name);
 	ipaprobe_poll(&ctx.call, tx_send, TX_BUFS - (tx_wp - tx_done), rd32);	/* p2probe=N (ipaprobe.c) */
 	{
 		static unsigned seen_wp, diag_n;
@@ -2769,6 +2844,7 @@ failed:
 
 void ipagsi_stop(const char *why)
 {
+	cellroute(0);
 	if (!ctx.active)		/* cell.c calls this unconditionally when its options change */
 		return;
 	LOG("stopping (%s)", why);
