@@ -477,7 +477,16 @@ void Texture::xrWriteBack(const XrTarget& t) const {
                 memcpy(o + 8ull * x, w, 8);
             }
         }
+#if defined(__aarch64__)
+        // to memory now: these rows are written without an IOSurface lock, so no seed tells the transport to clean them
+        uintptr_t a = reinterpret_cast<uintptr_t>(o) & ~uintptr_t(63);
+        const uintptr_t end = reinterpret_cast<uintptr_t>(o) + uint64_t(desc_.width) * info_->bytesPerPixel;
+        for (; a < end; a += 64) __asm__ volatile("dc cvac, %0" ::"r"(a) : "memory");
+#endif
     }
+#if defined(__aarch64__)
+    __asm__ volatile("dsb sy" ::: "memory");
+#endif
 }
 
 uint64_t texturePitch(const FormatInfo& format, uint32_t width) {
@@ -1252,7 +1261,10 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         if (t != nullptr) t->surface_ = surfaceId;
         return t;
     }
-    if (s.planes > 1) {
+    // (redfin hmv4) a 'b3a8' surface (CoreAnimation's deep layer: BGRA plane + A8 plane, Metal's RGB10A8_2P_XR10 550) read
+    // as BGRA8 over its first plane, the alpha plane left out, as SweetMetal2 serves it (HM_XR10=0 asks for that format)
+    const bool b3a8 = s.pixelFormat == 0x62336138u && s.planes == 2 && info->bytesPerPixel == 4 && info->xr == 0;
+    if (s.planes > 1 && !b3a8) {
         refuse(why, name + " has " + n(s.planes) + " planes: a single-plane surface is what is served");
         return nullptr;
     }
@@ -1279,6 +1291,7 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         {0x52476641u, 16},  // 'RGfA': four floats
         {0x77333072u, 4},   // 'w30r': BGR10_XR (redfin hmv2)
         {0x26773461u, 8},   // '&w4a': BGRA10_XR (redfin hmv2)
+        {0x62336138u, 4},   // 'b3a8': its BGRA plane (redfin hmv4)
     };
     uint32_t surfaceBytes = 0;
     for (const FourCC& f : kFourCCs) {

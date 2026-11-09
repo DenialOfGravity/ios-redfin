@@ -26,6 +26,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -54,6 +55,20 @@ void dcacheFlush(const void* p, size_t n, bool before) {
     for (; a < end; a += 64) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
     __asm__ volatile("dsb sy" ::: "memory");
 #endif
+}
+
+// (redfin hmv4, from ws-hm-perf 663a295) HM_FLUSH=all: every imported BO a submission names is cleaned before it, every
+// time (as before). Default: an IOSurface's pages are cleaned only when its seed (moved on by every write unlock: a CPU
+// wrote it, in this process or another) differs from the seed at this client's last clean or invalidate of them, as
+// phone/metal2's flushSurfaces. Userptr imports have no seed: always cleaned. Was: every surface a submission named,
+// ~11 MB of dc civac per display surface on every commit (backboardd's commit 0.7-1.2 ms, 302 ms of 2.1 s in CC).
+// The core's own CPU writes into surface rows (XR write-back) clean their rows themselves.
+bool flushAll() {
+    static const bool all = [] {
+        const char* e = getenv("HM_FLUSH");
+        return e != nullptr && strcmp(e, "all") == 0;
+    }();
+    return all;
 }
 
 int errnoOf(kern_return_t r, uint32_t method) {
@@ -222,6 +237,8 @@ private:
         IOSurfaceRef surface = nullptr;
         uint32_t lastFence = 0;  // the fence of the last submission that named it
         uint32_t writeFence = 0; // ...that named it as written (imported: invalidate once this passed)
+        uint32_t cleanSeed = 0;  // a surface's: its seed at the last clean/invalidate here (seedKnown)
+        bool seedKnown = false;
     };
 
     kern_return_t method(uint32_t m, const void* in, size_t inSize, void* out, size_t outSize) {
@@ -387,8 +404,16 @@ private:
         const Bo& ib = *named[cmd->submit_idx];
         if (uint64_t(cmd->submit_offset) + cmd->size > ib.bytes) return EINVAL;
         // imported pages the GPU reads (or overwrites in part): what the CPU wrote goes to memory first
+        const bool all = flushAll();
         for (Bo* b : named) {
-            if (b->imported) dcacheFlush(b->importBase, b->bytes, true);
+            if (!b->imported) continue;
+            if (b->surface != nullptr && !all) {
+                const uint32_t seed = IOSurfaceGetSeed(b->surface);   // before the flush: a write after it moves it on
+                if (b->seedKnown && b->cleanSeed == seed) continue;
+                b->cleanSeed = seed;
+                b->seedKnown = true;
+            }
+            dcacheFlush(b->importBase, b->bytes, true);
         }
         NativeAdrenoAbiSubmit q{};
         q.buffer_count = 1;
@@ -423,6 +448,7 @@ private:
             if (b.imported && b.writeFence != 0 && b.writeFence <= passedFence_) {
                 dcacheFlush(b.importBase, b.bytes, false);
                 b.writeFence = 0;
+                if (b.surface != nullptr && b.seedKnown) b.cleanSeed = IOSurfaceGetSeed(b.surface);   // (just invalidated: clean)
             }
         }
         return 0;

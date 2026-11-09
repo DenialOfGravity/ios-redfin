@@ -82,6 +82,9 @@ int hakios_metal_has_compiler(void);
  * waits for the compiler (HM_COMPILE_PRIO=0: first come) */
 void hakios_metal_compile_stats(double *wait_ms, double *compile_ms, unsigned *hits, unsigned *misses);
 void hakios_metal_compile_background(int on);
+/* (redfin hmv4) draw passes opened on the same colour target as the pass before them, by why they did not join it:
+ * [0] a Clear asked, [1] store/options/attachments differ, [2] GMEM ended it, [3] a copy/dispatch/clear/blit between */
+void hakios_metal_pass_splits(unsigned long long out[4]);
 /* (redfin hmv2) the encoder's one-time notices (a short constant binding padded, HM_CB_PAD) to FN instead of stderr */
 void hakios_metal_set_notice(void (*fn)(const char *text));
 

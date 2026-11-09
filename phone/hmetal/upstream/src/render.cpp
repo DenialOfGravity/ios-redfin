@@ -8,6 +8,7 @@
 #include "hakios-metal/render.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2851,6 +2852,7 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 // The buffer then writes each companion back into its surface's rows when it completes (HM_XR_WB=1), off the queue's
 // completion thread: one worker, a companion queued once however many buffers drew it before it ran.
 namespace {
+std::atomic<uint64_t> gPassSplits[4];   // (redfin hmv4) CommandBuffer::passSplits
 struct XrDrawn {
     std::shared_ptr<const Texture> source;
     std::shared_ptr<Texture::XrTarget> target;
@@ -3090,6 +3092,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         joins = false;
     }
     if (!joins) {
+        // (redfin hmv4) why a pass on the same target as the last did not go on (CommandBuffer::passSplits)
+        const Texture* before = open_ != nullptr ? open_->pass.color0 : lastClosed_;
+        if (pass.color0 != nullptr && before == pass.color0) {
+            const int why = open_ == nullptr ? 3 : pass.load == LoadAction::kClear ? 0 : (open_->gmem && !tileable) ? 2 : 1;
+            gPassSplits[why].fetch_add(1, std::memory_order_relaxed);
+        }
         closePass();
     }
     render::GmemPlan plan;
@@ -3481,10 +3489,15 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
+void CommandBuffer::passSplits(uint64_t out[4]) {
+    for (int i = 0; i < 4; i++) out[i] = gPassSplits[i].load(std::memory_order_relaxed);
+}
+
 void CommandBuffer::closePass() {
     if (open_ == nullptr) {
         return;
     }
+    lastClosed_ = open_->pass.color0;
     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, open_->draws);
     if (open_->dual) {
         // recorded both ways: tiles for a pass of enough draws, else the sysmem words, head and all

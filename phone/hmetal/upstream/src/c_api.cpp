@@ -279,6 +279,12 @@ void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hit
 
 void hakios_metal_compile_background(int on) { setCompileBackground(on != 0); }
 
+void hakios_metal_pass_splits(unsigned long long out[4]) {
+    uint64_t v[4];
+    CommandBuffer::passSplits(v);
+    for (int i = 0; i < 4; i++) out[i] = v[i];
+}
+
 void hakios_metal_set_notice(void (*fn)(const char*)) { render::setNotice(fn); }
 
 hakios_metal_library* hakios_metal_library_open(const void* data, size_t size) {

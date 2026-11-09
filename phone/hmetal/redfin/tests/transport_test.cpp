@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <thread>
+#include <cstdlib>
 
 #include "fake_native_adreno.hpp"
 #include "hakios-metal/a6xx.hpp"
@@ -162,6 +163,51 @@ TEST(transport_cpu_prep_waits_for_the_bos_last_fence) {
     later.join();
     CHECK_EQ(static_cast<uint32_t*>(dst->cpu())[0], 0xabcdu);
     r.gpu->cpuFini(*dst);
+}
+
+// (ws-hm-perf) The clean before a submission is skipped while the surface's seed is the one of this client's last clean or
+// invalidate of it (phone/metal2 flushSurfaces' rule); a new seed (a CPU write unlock) cleans again. HM_FLUSH=all: always.
+TEST(transport_surface_clean_skipped_by_seed) {
+    if (getenv("HM_FLUSH") != nullptr) return;
+    Rig r;
+    const uint32_t id = 78, rowBytes = 256, w = 64, h = 16;
+    uint8_t* pixels = fakena::addSurface(id, w, h, rowBytes, 0x42475241);
+    fakena::setSurfaceSeed(id, 5);
+    memset(pixels, 0x22, rowBytes * h);
+    SurfaceInfo info;
+    int e = 0;
+    auto bo = r.gpu->surfaceBo(id, &info, &e);
+    CHECK(bo != nullptr);
+    if (bo == nullptr) return;
+    auto ib = r.gpu->newBo(4096, 0, &e);
+    uint32_t fence = 0;
+    const auto c0 = fakena::counts();
+    CHECK_EQ(run(r, *ib, memWrite(ib->gpuAddress() + 2048, {1}), {{bo.get(), false}}, &fence), 0);
+    CHECK_EQ(fakena::counts().cleans, c0.cleans + 1);   // never cleaned here: cleaned
+    CHECK(fakena::gpuViewOfImport(pixels, 4)[0] == 0x22);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(run(r, *ib, memWrite(ib->gpuAddress() + 2048, {2}), {{bo.get(), false}}, &fence), 0);
+    CHECK_EQ(fakena::counts().cleans, c0.cleans + 1);   // the same seed: skipped
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    // the CPU writes and unlocks: a new seed, cleaned again
+    memset(pixels, 0x33, 4);
+    fakena::setSurfaceSeed(id, 6);
+    CHECK_EQ(run(r, *ib, memWrite(ib->gpuAddress() + 2048, {3}), {{bo.get(), false}}, &fence), 0);
+    CHECK_EQ(fakena::counts().cleans, c0.cleans + 2);
+    CHECK(fakena::gpuViewOfImport(pixels, 4)[0] == 0x33);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    // the GPU writes it: invalidated after the fence (the CPU sees it), and the next submission at that seed skips
+    CHECK_EQ(run(r, *ib, memWrite(bo->gpuAddress() + 64, {0xfeedf00d}), {{bo.get(), true}}, &fence), 0);
+    CHECK_EQ(fakena::counts().cleans, c0.cleans + 2);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(fakena::counts().invalidates, c0.invalidates + 1);
+    uint32_t got = 0;
+    memcpy(&got, pixels + 64, 4);
+    CHECK_EQ(got, 0xfeedf00du);
+    CHECK_EQ(run(r, *ib, memWrite(ib->gpuAddress() + 2048, {4}), {{bo.get(), false}}, &fence), 0);
+    CHECK_EQ(fakena::counts().cleans, c0.cleans + 2);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    bo.reset();
 }
 
 // An IOSurface's pages: imported, mapped, described; the GPU sees what the CPU wrote only after the clean, and the

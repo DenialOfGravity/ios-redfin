@@ -17,3 +17,4 @@ uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef s);
 size_t IOSurfaceGetPlaneCount(IOSurfaceRef s);
 void* IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s, size_t plane);
 size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef s, size_t plane);
+uint32_t IOSurfaceGetSeed(IOSurfaceRef s);   // (fakena::setSurfaceSeed; else a new value every call)

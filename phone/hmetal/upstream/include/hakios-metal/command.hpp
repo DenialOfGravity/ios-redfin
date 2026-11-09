@@ -72,7 +72,10 @@ public:
     void commit();
     void waitUntilCompleted();
     // how long the GPU had it: from commit to the fence, in nanoseconds (Metal's GPUStartTime..GPUEndTime, roughly)
-    int64_t gpuNanoseconds() const { return completedAt_ - committedAt_; }
+    // (redfin hmv4) 0 for a buffer that never went through the queue's waiter (refused, failed or finished empty: its
+    // completedAt_ stays 0, and the difference was minus the commit's clock -- HM_PROF's "GPU -44796 ms a frame", metal_fps's
+    // "GPU busy -558252356 ms")
+    int64_t gpuNanoseconds() const { return committedAt_ != 0 && completedAt_ > committedAt_ ? completedAt_ - committedAt_ : 0; }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -304,6 +307,13 @@ private:
     void closePass();
     void useAttachments(const RenderPass& pass);
     std::unique_ptr<OpenPass> open_;
+    const Texture* lastClosed_ = nullptr;   // (redfin hmv4) the colour attachment 0 of the pass closed last (pass splits)
+public:
+    // (redfin hmv4) a draw pass opened on the same colour attachment 0 as the pass just before it, by why it did not
+    // join that one: 0 it asked for a Clear, 1 its store/options/other attachments differ, 2 GMEM ended it, 3 something
+    // else came between (a copy, a dispatch, a clear-only pass, a blit, the end of an encoder that closes) -- process-wide
+    static void passSplits(uint64_t out[4]);
+private:
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
     // GPU spent 3 us on it. A piece is the command buffer's: written once, used for writing, kept until completion.

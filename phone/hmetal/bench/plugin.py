@@ -572,7 +572,7 @@ static unsigned long long hm_tr_frame(void) { return hm_tr.committed; }
 static void
 hm_tr_buffer(double encode, double commit, double gpu, double total)
 {
-	char line[400] = "";
+	char line[700] = "";
 
 	if (!hm_trace_on()) return;
 	hm_tr_event("buffer done: encode %.1f commit %.1f gpu %.1f ms", encode * 1e3, commit * 1e3, gpu * 1e3);
@@ -588,12 +588,21 @@ hm_tr_buffer(double encode, double commit, double gpu, double total)
 		if (gpu > hm_tr.gpuMax) hm_tr.gpuMax = gpu;
 		if (now - hm_tr.since >= 10.0) {
 			const double b = hm_tr.buffers ? hm_tr.buffers : 1;
+			static unsigned long long was[4];
+			unsigned long long sp[4];
+			int at;
+
+			hakios_metal_pass_splits(sp);
 
 			snprintf(line, sizeof(line), "trace: %.1f s: %u buffers (%.1f a s); encode %.2f ms avg %.1f most; commit %.2f avg %.1f most; "
 				 "GPU %.2f avg %.1f most; %u pipelines made in %.0f ms (%.0f most); %u hangs past 100 ms",
 				 now - hm_tr.since, hm_tr.buffers, hm_tr.buffers / (now - hm_tr.since), hm_tr.encSum / b * 1e3, hm_tr.encMax * 1e3,
 				 hm_tr.comSum / b * 1e3, hm_tr.comMax * 1e3, hm_tr.gpuSum / b * 1e3, hm_tr.gpuMax * 1e3, hm_tr.pipelines, hm_tr.pipeMs,
 				 hm_tr.pipeMax, hm_tr.hangs);
+			at = (int)strlen(line);
+			snprintf(line + at, sizeof(line) - (size_t)at, "; passes reopened on the same target: %llu by a Clear, %llu by state, %llu by GMEM, "
+				 "%llu after a copy/dispatch/clear between", sp[0] - was[0], sp[1] - was[1], sp[2] - was[2], sp[3] - was[3]);
+			memcpy(was, sp, sizeof(was));
 			hm_tr.since = now;
 			hm_tr.buffers = hm_tr.pipelines = hm_tr.hangs = 0;
 			hm_tr.encSum = hm_tr.encMax = hm_tr.comSum = hm_tr.comMax = hm_tr.gpuSum = hm_tr.gpuMax = hm_tr.pipeMs = hm_tr.pipeMax = 0;
@@ -839,6 +848,52 @@ hm_xr10_descriptor(MTLTextureDescriptor *d)
 	[d setPixelFormat:hm_xr10_format([d pixelFormat])];
 	return d;
 }
+
+/* (redfin hmv4) HM_ROTFIX=1 (default): a turned framebuffer (a landscape texture over the portrait display surface, drawn
+ * into a texture of its own and turned into the surface at commit) loads what the SURFACE holds when the surface was
+ * written since that texture last turned into it. Before, its own texture kept the last landscape frame it drew: after
+ * a turn to portrait (passes straight into the surface) and back, or with another texture over the same surface, a pass
+ * that loads (CoreAnimation redraws only what changed) put that old landscape frame back -- the stale landscape UI and
+ * the Notes app flashing. Each IOSurface drawn into counts its writes here (hm_surface_gen). */
+static int
+hm_rotfix_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_ROTFIX");
+		on = e == NULL || e[0] == 0 || atoi(e) != 0;
+	}
+	return on;
+}
+
+#define HM_SURF_GENS 512
+static struct { uint32_t id, gen; } hm_surf_gens[HM_SURF_GENS];
+static pthread_mutex_t hm_surf_gen_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* the surface's write count, after BUMP more (a pass drew into it) */
+static uint32_t
+hm_surface_gen(uint32_t id, uint32_t bump)
+{
+	uint32_t gen = 0;
+
+	if (id == 0) return 0;
+	pthread_mutex_lock(&hm_surf_gen_lock);
+	for (unsigned i = id % HM_SURF_GENS, n = 0; n < HM_SURF_GENS; i = (i + 1) % HM_SURF_GENS, n++) {
+		if (hm_surf_gens[i].id == id || hm_surf_gens[i].id == 0) {
+			hm_surf_gens[i].id = id;
+			gen = hm_surf_gens[i].gen += bump;
+			break;
+		}
+		if (n == HM_SURF_GENS - 1) {   /* full: start again (a refresh too many is the cost) */
+			memset(hm_surf_gens, 0, sizeof(hm_surf_gens));
+			hm_surf_gens[id % HM_SURF_GENS].id = id;
+			gen = hm_surf_gens[id % HM_SURF_GENS].gen = bump + 1;
+		}
+	}
+	pthread_mutex_unlock(&hm_surf_gen_lock);
+	return gen;
+}
 '''
 
 EDITS = [
@@ -969,6 +1024,84 @@ EDITS = [
      '\t\t\t slices:(NSRange)slices asked:(SEL)cmd\n{\n\tHakiosMetalTexture *view;\n\n\tpixelFormat = hm_xr10_format(pixelFormat);   /* (redfin hmv4) */\n'),
     ('\tformat = (unsigned)[[[descriptor colorAttachments] objectAtIndexedSubscript:0] pixelFormat];\n',
      '\tformat = (unsigned)hm_xr10_format([[[descriptor colorAttachments] objectAtIndexedSubscript:0] pixelFormat]);   /* (redfin hmv4) */\n'),
+    # (hmv4) HM_ROTFIX: a turned framebuffer loads the surface when the surface was written since it last turned into it
+    ('\thakios_metal_texture *_turnedSurface; /* a framebuffer with a rotation: the surface itself, upright, that _texture is turned into */\n',
+     '\thakios_metal_texture *_turnedSurface; /* a framebuffer with a rotation: the surface itself, upright, that _texture is turned into */\n'
+     '\tuint32_t _turnGen;                  /* (redfin hmv4) the surface\'s write count when _texture last matched it (HM_ROTFIX) */\n'
+     '\tBOOL _turnGenKnown;\n'),
+    ('- (void)hakiosSetTurned:(hakios_metal_texture *)surface rotation:(unsigned)rotation;\n',
+     '- (void)hakiosSetTurned:(hakios_metal_texture *)surface rotation:(unsigned)rotation;\n'
+     '- (void)hakiosRefreshTurned:(hakios_metal_cb *)cb;   /* (redfin hmv4) */\n'),
+    ('/* the framebuffer as drawn, turned into the surface the display scans out */\n- (void)hakiosTurnInto:(hakios_metal_cb *)cb\n{\n'
+     '\tif (_turnedSurface != NULL && hakios_metal_cb_blit_rotated(cb, _texture, _turnedSurface, _turn) != 0) {\n'
+     '\t\tHM_ONCE("refused: a turned framebuffer\'s copy into its surface: %s\\n", hakios_metal_error());\n\t}\n}\n',
+     '/* the framebuffer as drawn, turned into the surface the display scans out */\n- (void)hakiosTurnInto:(hakios_metal_cb *)cb\n{\n'
+     '\tif (_turnedSurface != NULL && hakios_metal_cb_blit_rotated(cb, _texture, _turnedSurface, _turn) != 0) {\n'
+     '\t\tHM_ONCE("refused: a turned framebuffer\'s copy into its surface: %s\\n", hakios_metal_error());\n\t}\n'
+     '\tif (_turnedSurface != NULL && _iosurface != NULL) {   /* (redfin hmv4) the surface now holds this texture\'s frame */\n'
+     '\t\t_turnGen = hm_surface_gen(IOSurfaceGetID(_iosurface), 1);\n\t\t_turnGenKnown = YES;\n\t}\n}\n\n'
+     '/* (redfin hmv4) HM_ROTFIX: before a pass that loads, the surface turned back into this texture if something else wrote it */\n'
+     '- (void)hakiosRefreshTurned:(hakios_metal_cb *)cb\n{\n'
+     '\tif (_turnedSurface == NULL || _iosurface == NULL || !hm_rotfix_on()) return;\n'
+     '\tconst uint32_t gen = hm_surface_gen(IOSurfaceGetID(_iosurface), 0);\n'
+     '\tif (_turnGenKnown && gen == _turnGen) return;\n'
+     '\tif (hakios_metal_cb_blit_rotated(cb, _turnedSurface, _texture, _turn == 2 ? 2 : 4 - _turn) != 0) {\n'
+     '\t\tHM_ONCE("refused: a surface turned back into its turned framebuffer (HM_ROTFIX): %s\\n", hakios_metal_error());\n'
+     '\t\treturn;\n\t}\n'
+     '\thm_tr_event("turned framebuffer over surface %u loaded from the surface (write %u, had %u)", IOSurfaceGetID(_iosurface), gen, _turnGen);\n'
+     '\t_turnGen = gen;\n\t_turnGenKnown = YES;\n}\n'),
+    ('\t\tif (t != nil && [t isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)t hakiosIsTurned]) {\n'
+     '\t\t\t[(HakiosMetalCommandBuffer *)cb hakiosTurnAtCommit:t];\n\t\t\tcontinue;\n\t\t}\n',
+     '\t\tif (t != nil && [t isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)t hakiosIsTurned]) {\n'
+     '\t\t\tif ([[[d colorAttachments] objectAtIndexedSubscript:i] loadAction] == MTLLoadActionLoad) {   /* (redfin hmv4) HM_ROTFIX */\n'
+     '\t\t\t\t[(HakiosMetalTexture *)t hakiosRefreshTurned:[(HakiosMetalCommandBuffer *)cb hakiosCommandBuffer]];\n\t\t\t}\n'
+     '\t\t\t[(HakiosMetalCommandBuffer *)cb hakiosTurnAtCommit:t];\n\t\t\tcontinue;\n\t\t}\n'
+     '\t\tif (t != nil && [t isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)t iosurface] != NULL) {\n'
+     '\t\t\thm_surface_gen(IOSurfaceGetID([(HakiosMetalTexture *)t iosurface]), 1);   /* (redfin hmv4) a pass straight into a surface */\n\t\t}\n'),
+    # (hmv4) HM_TRACE: every texture made over an IOSurface (rotation, WebKit, switcher snapshots: what arrives)
+    ('\t\t\t surface != NULL ? IOSurfaceGetID(surface) : 0);\n\t}\n\tMTLTextureUsage usage;\n\thakios_metal_texture *texture;\n\tHakiosMetalTexture *t;\n',
+     '\t\t\t surface != NULL ? IOSurfaceGetID(surface) : 0);\n\t}\n'
+     '\tdescriptor = hm_xr10_descriptor(descriptor);   /* (redfin hmv4) HM_XR10=0: 550/551 (a b3a8 surface) as BGRA8 over its first plane */\n'
+     '\tif (hm_trace_on() && surface != NULL && descriptor != nil) {   /* (redfin hmv4) */\n'
+     '\t\tconst uint32_t fcc = IOSurfaceGetPixelFormat(surface);\n'
+     '\t\tconst NSUInteger rot = [descriptor respondsToSelector:sel_getUid("rotation")] ?\n'
+     '\t\t\t((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, sel_getUid("rotation")) : 0;\n'
+     '\t\thm_print("trace: surface %u %zux%zu rows %zu \'%c%c%c%c\' planes %zu seed %u alloc %zu -> texture %lux%lu format %lu usage %#lx plane %lu rotation %lu (frame %llu)\\n",\n'
+     '\t\t\t IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface),\n'
+     '\t\t\t (char)(fcc >> 24), (char)(fcc >> 16), (char)(fcc >> 8), (char)fcc, IOSurfaceGetPlaneCount(surface), IOSurfaceGetSeed(surface),\n'
+     '\t\t\t IOSurfaceGetAllocSize(surface), (unsigned long)[descriptor width], (unsigned long)[descriptor height],\n'
+     '\t\t\t (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor usage], (unsigned long)plane, (unsigned long)rot, hm_tr_frame());\n'
+     '\t}\n'
+     '\tMTLTextureUsage usage;\n\thakios_metal_texture *texture;\n\tHakiosMetalTexture *t;\n'),
+    # (hmv4) the YCbCr copy by tables (the per-pixel float formula, ~30 ms a full-screen picture), and HM_TRACE's copy line
+    ('\t\t\tconst float y = (yl[i] - yo) * ys, cb = (cl[c] - 128.0f) * cs, cr = (cl[c + 1] - 128.0f) * cs;\n'
+     '\t\t\tconst float r = y + 2.0f * (1.0f - kr) * cr, b = y + 2.0f * (1.0f - kb) * cb;\n'
+     '\t\t\tconst float g = (y - kr * r - kb * b) / kg;\n',
+     '\t\t\t/* (redfin hmv4) the same formula, linear in each input: by tables of 256 (built once a copy) */\n'
+     '\t\t\tconst float y = tY[yl[i]], r = y + tRcr[cl[c + 1]], b = y + tBcb[cl[c]], g = y - tGcb[cl[c]] - tGcr[cl[c + 1]];\n'
+     '\t\t\t(void)kg;\n'),
+    ('\tuint8_t *rows = malloc(w * h * 4);\n\n\tif (rows == NULL || luma == NULL || chroma == NULL || cw == 0 || ch == 0) {\n',
+     '\tuint8_t *rows = malloc(w * h * 4);\n'
+     '\tfloat tY[256], tRcr[256], tBcb[256], tGcb[256], tGcr[256];   /* (redfin hmv4) */\n\n'
+     '\tfor (int v = 0; v < 256; v++) {\n'
+     '\t\tconst float c = (v - 128.0f) * cs;\n\n'
+     '\t\ttY[v] = (v - yo) * ys;\n'
+     '\t\ttRcr[v] = 2.0f * (1.0f - kr) * c;\n'
+     '\t\ttBcb[v] = 2.0f * (1.0f - kb) * c;\n'
+     '\t\ttGcr[v] = kr * 2.0f * (1.0f - kr) * c / kg;\n'
+     '\t\ttGcb[v] = kb * 2.0f * (1.0f - kb) * c / kg;\n'
+     '\t}\n'
+     '\tif (rows == NULL || luma == NULL || chroma == NULL || cw == 0 || ch == 0) {\n'),
+    ('\thm_fps_shadow(YES, hm_now() - began);\n',
+     '\thm_fps_shadow(YES, hm_now() - began);\n'
+     '\tif (hm_trace_on() || hm_now() - began > 0.008) {   /* (redfin hmv4) a surface copied in on the processor */\n'
+     '\t\tconst double ms = (hm_now() - began) * 1e3;\n\n'
+     '\t\thm_tr_event("surface %u copied in (%s, %zux%zu rows %zu): %.1f ms", IOSurfaceGetID(_iosurface), _ycbcr ? "YCbCr" : "rows",\n'
+     '\t\t\t    IOSurfaceGetWidth(_iosurface), IOSurfaceGetHeight(_iosurface), IOSurfaceGetBytesPerRow(_iosurface), ms);\n'
+     '\t\tif (ms > 8) hm_print("trace: surface %u copied in on the processor (%s, %zux%zu, rows %zu, seed %u): %.1f ms\\n", IOSurfaceGetID(_iosurface),\n'
+     '\t\t\t\t      _ycbcr ? "YCbCr converted" : "rows", IOSurfaceGetWidth(_iosurface), IOSurfaceGetHeight(_iosurface),\n'
+     '\t\t\t\t      IOSurfaceGetBytesPerRow(_iosurface), seed, ms);\n'
+     '\t}\n'),
     # (hmv4) HM_PREWARM: QuartzCore's library's pipelines made once in the background, into the disk cache
     ('\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n\treturn library;\n',
      '\tif (error != NULL) *error = library != nil ? nil : (second != nil ? second : first);\n'
