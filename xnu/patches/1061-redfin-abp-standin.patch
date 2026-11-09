@@ -667,10 +667,10 @@ index 5911cb0..02337af 100644
  	}
 diff --git a/iokit/Kernel/arm/SweetABP.cpp b/iokit/Kernel/arm/SweetABP.cpp
 new file mode 100644
-index 0000000..0d9b23e
+index 0000000..5de5b60
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetABP.cpp
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,903 @@
 +/*
 + * redfin 1061: stand-ins for Apple's baseband IOKit drivers, so the real CommCenter (AppleBasebandManager runs
 + * inside it) finds a baseband. Published only with boot-arg sweetabp & 1 (bsd/dev/sweet_abp.c), under the
@@ -706,6 +706,7 @@ index 0000000..0d9b23e
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOLocks.h>
 +#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSString.h>
 +#include <libkern/c++/OSNumber.h>
@@ -740,6 +741,24 @@ index 0000000..0d9b23e
 +#define ABPLOG(fmt, ...) do { if (abp_lines < ABP_LOGLINES) { abp_lines++; IOLog("SWEET ABP: " fmt "\n", ##__VA_ARGS__); } } while (0)
 +
 +class AppleBasebandPCIUserClient;
++
++/* sendAsyncResult64 is protected in IOUserClient: reached through a subclass (never instantiated) */
++class SweetABPAsync : public IOUserClient
++{
++public:
++	static IOReturn
++	done(OSAsyncReference64 ref, IOReturn result, io_user_reference_t *args, UInt32 n)
++	{
++		IOReturn r = sendAsyncResult64(ref, result, args, n);
++		releaseAsyncReference64(ref);
++		return r;
++	}
++	static void
++	drop(OSAsyncReference64 ref)
++	{
++		releaseAsyncReference64(ref);
++	}
++};
 +
 +struct abp_read {
 +	OSAsyncReference64 ref;
@@ -812,8 +831,7 @@ index 0000000..0d9b23e
 +		OSSafeReleaseNULL(md);
 +	}
 +	io_user_reference_t a[1] = { r == kIOReturnSuccess ? n : 0 };
-+	IOReturn s = IOUserClient::sendAsyncResult64(rd->ref, r, a, 1);
-+	IOUserClient::releaseAsyncReference64(rd->ref);
++	IOReturn s = SweetABPAsync::done(rd->ref, r, a, 1);
 +	if (r != kIOReturnSuccess || s != kIOReturnSuccess) {
 +		ABPLOG("%s: read completion copy 0x%x send 0x%x", abp_pipe_names[pipe], r, s);
 +	}
@@ -833,9 +851,10 @@ index 0000000..0d9b23e
 +	for (uint32_t i = 0; i < n; i++) {
 +		if (send) {
 +			io_user_reference_t a[1] = { 0 };
-+			IOUserClient::sendAsyncResult64(rs[i].ref, kIOReturnAborted, a, 1);
++			SweetABPAsync::done(rs[i].ref, kIOReturnAborted, a, 1);
++		} else {
++			SweetABPAsync::drop(rs[i].ref);
 +		}
-+		IOUserClient::releaseAsyncReference64(rs[i].ref);
 +	}
 +	if (n) {
 +		ABPLOG("%s: %u pending read(s) %s", abp_pipe_names[pipe], n, send ? "aborted" : "dropped (client gone)");
