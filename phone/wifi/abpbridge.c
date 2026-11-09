@@ -14,6 +14,16 @@
  *               its own QRTR port (ABP_PORT0..), so the modem's responses and indications come back unambiguously
  *               and are returned to that session with the QMUX header (svc, cid); OK = answered here with success
  *               and no TLVs; ERR:<code> = answered here with a QMI failure; DROP = no answer.
+ * Run 2 (2026-11-09): router clients are POOLED per service (abpreuse=1, default in mode 2): a released client's
+ * QRTR port (and so its modem-side client) goes idle and is given to the next CommCenter client of that service
+ * instead of a DEL_CLIENT + new port, so CommCenter's session restarts cannot pile up modem clients (run 1: NAS stopped
+ * answering everyone, wland's cell.c too, after 3 CommCenter restarts leaked ~20 NAS clients; the modem kept sending
+ * PBM indications to released ports, so it did not act on our DEL_CLIENT). abpreuse=0 = run-1 behaviour. Packets to a
+ * router port with no active client (idle, released) are dropped silently and counted as "late".
+ * Diagnostics (mode 2): every forwarded request is tracked (port + txn) for 5 s; the first answer per (svc, msg) is
+ * logged once with the modem's result TLV ("abp: ANSWER ..." / "NO ANSWER after 5 s"); per-(svc, msg) counters
+ * (action, count, ok, err [last code], no answer, late) print as a table every 60 s when they changed; abpdump=N
+ * (any new non-zero value) prints the table at once.
  * Other words: abplog=1 (P1-style frame log: every frame in wland.log + full hex in ABP_LOG; always on in mode 1),
  * abperr=N (the error code of the built-in "err" entries, default 0x5e), abpcidfail=1 (GetClientId fails with
  * 0x1f INVALID_SERVICE_TYPE for a forwarded service the modem has no server for; default: the client id is given
@@ -28,7 +38,8 @@
  *     # svc msg action          svc/msg: hex (0x..) or decimal, msg '*' = every message of the service
  *     0x02 0x002e ok            action: fwd | ok | err:<code> | drop
  *     0xe2 * err:0x5e
- * Never forwarded whatever the file says: Apple-only services (svc >= 0xe0) and Apple message ids (>= 0x5500).
+ * Never FORWARDED whatever the file says: Apple-only services (svc >= 0xe0) and Apple message ids (>= 0x5500); ok,
+ * err:<code> and drop lines for them do apply (a fwd line for them becomes err abperr).
  * Every new (svc, msg) is logged once with the action and why ("abp: NEW ..."); a policy reload logs them again.
  *
  * READY: the kernel (1063, sweetabp & 8) publishes the baseband services only after ABPB_IOC_READY 1. Mode 1 says
@@ -46,6 +57,7 @@
 #include "abpbridge.h"
 #include "cell.h"
 #include "link.h"
+#include "qmi.h"
 
 #define ABP_DEV		"/dev/abpbridge"
 #define ABP_LOG		"/var/local/abpbridge.log"
@@ -98,12 +110,46 @@ static int srv_find(unsigned svc)
 
 #define NCL	256
 static struct cl {
-	int used;
+	int used;			/* 0 free, 1 active (a CommCenter client), 2 idle (pooled: port + modem client kept) */
 	uint32_t pipe, sess, port;
 	uint8_t svc, cid;
 	unsigned fwd, resp, ind;
 } cl[NCL];
 static uint32_t next_port_gen;
+static int reuse = 1, dumpword, dumpword_old;
+static unsigned late;
+
+/* ---- per-(svc, msg) counters and the pending forwarded requests ---- */
+
+#define NMST	1024
+static struct mst {
+	uint8_t svc, act;
+	uint16_t msg, last_err;
+	unsigned count, ok, err, noans, answered_logged;
+} mst[NMST];
+static int nmst, mst_dirty;
+
+static struct mst *mst_get(unsigned svc, unsigned msg)
+{
+	for (int i = 0; i < nmst; i++)
+		if (mst[i].svc == svc && mst[i].msg == msg)
+			return &mst[i];
+	if (nmst >= NMST)
+		return NULL;
+	memset(&mst[nmst], 0, sizeof(mst[0]));
+	mst[nmst].svc = (uint8_t)svc;
+	mst[nmst].msg = (uint16_t)msg;
+	return &mst[nmst++];
+}
+
+#define NPEND	512
+static struct pend {
+	int used;
+	uint32_t port;
+	uint16_t txn, msg;
+	uint8_t svc;
+	uint64_t t;
+} pend[NPEND];
 
 static const char *svc_name(unsigned s)
 {
@@ -215,7 +261,7 @@ static const struct pol abp_builtin[] = {
 	{ 0x06, POL_ANY, ACT_ERR, POL_ABPERR, "PDS: not in P2" },
 	{ 0x10, POL_ANY, ACT_ERR, POL_ABPERR, "LOC: not in P2" },
 	{ 0x08, POL_ANY, ACT_ERR, POL_ABPERR, "AT: not in P2" },
-	{ 0x22, POL_ANY, ACT_ERR, POL_ABPERR, "COEX: would change LTE/Wi-Fi/BT coexistence under wland's Wi-Fi" },
+	{ 0x22, POL_ANY, ACT_OK, 0, "COEX: answered success here (would change LTE/Wi-Fi/BT coexistence under wland's Wi-Fi)" },
 	{ 0x24, POL_ANY, ACT_ERR, POL_ABPERR, "PDC: modem configuration (MBN) selection: protected" },
 	{ 0x2b, POL_ANY, ACT_ERR, POL_ABPERR, "SSCTL: subsystem restart: protected" },
 	{ 0x29, POL_ANY, ACT_ERR, POL_ABPERR, "RFRPE: RF settings: protected" },
@@ -485,29 +531,76 @@ static void finish_qmux(uint8_t *b, uint32_t n, unsigned svc, unsigned cid)
 
 /* ---- router clients ---- */
 
-static void cl_free(struct cl *c, const char *why)
+static void pend_drop_port(uint32_t port)
+{
+	for (int i = 0; i < NPEND; i++)
+		if (pend[i].used && pend[i].port == port)
+			pend[i].used = 0;	/* its answer, if it comes, counts as late */
+}
+
+/* really give the port back: DEL_CLIENT to the modem */
+static void cl_destroy(struct cl *c, const char *why)
 {
 	if (!c->used)
 		return;
+	pend_drop_port(c->port);
 	/* tell the modem the client is gone (Linux qrtr_port_remove: DEL_CLIENT from that port to the control port) */
 	uint32_t pkt[5] = { QRTR_TYPE_DEL_CLIENT, QRTR_NODE_APPS, c->port, 0, 0 };
 	qrtr_send(QRTR_TYPE_DEL_CLIENT, c->port, QRTR_NODE_BCAST, QRTR_PORT_CTRL, pkt, sizeof(pkt));
-	printf("[%6llu] abp: %s/%u %s(0x%02x) cid %u port %#x released (%s; %u fwd, %u resp, %u ind)\n", (unsigned long long)link_ms(),
-	       pipe_name[c->pipe], c->sess, svc_name(c->svc), c->svc, c->cid, c->port, why, c->fwd, c->resp, c->ind);
+	printf("[%6llu] abp: %s(0x%02x) port %#x given back to the modem (DEL_CLIENT; %s)\n", (unsigned long long)link_ms(),
+	       svc_name(c->svc), c->svc, c->port, why);
 	memset(c, 0, sizeof(*c));
+}
+
+/* a CommCenter client ends: pooled (abpreuse=1) or destroyed */
+static void cl_free(struct cl *c, const char *why)
+{
+	if (c->used != 1)
+		return;
+	if (logframes || !reuse)
+		printf("[%6llu] abp: %s/%u %s(0x%02x) cid %u port %#x released (%s; %u fwd, %u resp, %u ind)%s\n", (unsigned long long)link_ms(),
+		       pipe_name[c->pipe], c->sess, svc_name(c->svc), c->svc, c->cid, c->port, why, c->fwd, c->resp, c->ind,
+		       reuse ? " -> idle pool" : "");
+	if (!reuse) {
+		cl_destroy(c, why);
+		return;
+	}
+	pend_drop_port(c->port);
+	c->used = 2;
+	c->pipe = c->sess = 0;
+	c->cid = 0;
 }
 
 static struct cl *cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, int create)
 {
-	struct cl *fr = NULL;
+	struct cl *fr = NULL, *idle = NULL, *anyidle = NULL;
 	for (int i = 0; i < NCL; i++) {
-		if (cl[i].used && cl[i].pipe == pipe && cl[i].sess == sess && cl[i].svc == svc && cl[i].cid == cid)
+		if (cl[i].used == 1 && cl[i].pipe == pipe && cl[i].sess == sess && cl[i].svc == svc && cl[i].cid == cid)
 			return &cl[i];
 		if (!cl[i].used && !fr)
 			fr = &cl[i];
+		if (cl[i].used == 2 && cl[i].svc == svc && !idle)
+			idle = &cl[i];
+		if (cl[i].used == 2 && !anyidle)
+			anyidle = &cl[i];
 	}
 	if (!create)
 		return NULL;
+	if (idle && reuse) {		/* the pooled modem client of this service gets the new owner */
+		idle->used = 1;
+		idle->pipe = pipe;
+		idle->sess = sess;
+		idle->cid = (uint8_t)cid;
+		idle->fwd = idle->resp = idle->ind = 0;
+		if (logframes)
+			printf("[%6llu] abp: %s/%u %s(0x%02x) cid %u -> pooled QRTR port %#x\n", (unsigned long long)link_ms(),
+			       pipe_name[pipe], sess, svc_name(svc), svc, cid, idle->port);
+		return idle;
+	}
+	if (!fr && anyidle) {
+		cl_destroy(anyidle, "table full: oldest idle of another service");
+		fr = anyidle;
+	}
 	if (!fr) {
 		static unsigned told;
 		if (told++ < 5)
@@ -520,12 +613,13 @@ static struct cl *cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
 		uint32_t p = ABP_PORT0 + (next_port_gen++ % ABP_NPORTS);
 		int busy = 0;
 		for (int i = 0; i < NCL; i++)
-			busy |= cl[i].used && cl[i].port == p;
+			busy |= cl[i].used && cl[i].port == p;	/* idle ports stay ours too */
 		if (!busy)
 			port = p;
 	}
 	if (!port)
 		return NULL;
+	pend_drop_port(port);
 	memset(fr, 0, sizeof(*fr));
 	fr->used = 1;
 	fr->pipe = pipe;
@@ -539,17 +633,24 @@ static struct cl *cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
 	return fr;
 }
 
+/* only router clients (ports ABP_PORT0..) of that CommCenter session: wland's own QMI clients are never touched */
 static void cl_free_sess(uint32_t pipe, uint32_t sess, const char *why)
 {
+	unsigned n = 0;
 	for (int i = 0; i < NCL; i++)
-		if (cl[i].used && cl[i].pipe == pipe && cl[i].sess == sess)
+		if (cl[i].used == 1 && cl[i].pipe == pipe && cl[i].sess == sess) {
 			cl_free(&cl[i], why);
+			n++;
+		}
+	if (n && !logframes && reuse)
+		printf("[%6llu] abp: %s/%u: %u router client(s) to the idle pool (%s)\n", (unsigned long long)link_ms(),
+		       pipe < NPIPES ? pipe_name[pipe] : "?", sess, n, why);
 }
 
 static void cl_free_all(const char *why)
 {
 	for (int i = 0; i < NCL; i++)
-		cl_free(&cl[i], why);
+		cl_destroy(&cl[i], why);
 }
 
 /* ---- CTL, per session ---- */
@@ -707,6 +808,16 @@ static void ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 /* a request answered here: success without TLVs (ok) or a QMI failure (err) */
 static void svc_local(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail, int code)
 {
+	struct mst *m = mst_get(svc, (unsigned)(s[3] | (s[4] << 8)));
+	if (m) {
+		if (fail) {
+			m->err++;
+			m->last_err = (uint16_t)code;
+		} else {
+			m->ok++;
+		}
+		mst_dirty = 1;
+	}
 	uint8_t b[32];
 	uint32_t o = 13;		/* QMUX 6 + SDU header 7 */
 	uint16_t res[2] = { (uint16_t)(fail ? 1 : 0), (uint16_t)(fail ? code : 0) };
@@ -741,6 +852,25 @@ static void svc_forward(unsigned pipe, unsigned svc, unsigned cid, const uint8_t
 	}
 	c->fwd++;
 	cnt.fwd++;
+	uint16_t txn = (uint16_t)(s[1] | (s[2] << 8)), msg = (uint16_t)(s[3] | (s[4] << 8));
+	int slot = -1;
+	uint64_t oldest = ~0ull;
+	for (int i = 0; i < NPEND; i++) {
+		if (!pend[i].used) {
+			slot = i;
+			break;
+		}
+		if (pend[i].t < oldest) {
+			oldest = pend[i].t;
+			slot = i;
+		}
+	}
+	pend[slot].used = 1;
+	pend[slot].port = c->port;
+	pend[slot].txn = txn;
+	pend[slot].msg = msg;
+	pend[slot].svc = (uint8_t)svc;
+	pend[slot].t = link_ms();
 }
 
 static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n)
@@ -781,6 +911,11 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 	unsigned msg = s[3] | (s[4] << 8);
 	if (mode < 2) {			/* P1 observe */
 		note_seen(svc, msg, "err", "abpbridge=1 observe");
+	struct mst *mo = mst_get(svc, msg);
+	if (mo) {
+		mo->count++;
+		mo->act = ACT_ERR;
+	}
 		cnt.local_err++;
 		svc_local(pipe, svc, cid, s, 1, err_code);
 		return;
@@ -795,6 +930,12 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 	else
 		snprintf(an, sizeof(an), "%s", act_name[a]);
 	note_seen(svc, msg, an, why);
+	struct mst *ms = mst_get(svc, msg);
+	if (ms) {
+		ms->count++;
+		ms->act = (uint8_t)a;
+		mst_dirty = 1;
+	}
 	switch (a) {
 	case ACT_FWD:
 		svc_forward(pipe, svc, cid, s, sn);
@@ -843,8 +984,10 @@ void abpbridge_server_gone(uint32_t node, uint32_t port)
 				       svc_name(srv[i].svc));
 			/* the router clients of that service: their modem-side state went with it */
 			for (int k = 0; k < NCL; k++)
-				if (cl[k].used && cl[k].svc == srv[i].svc && srv_find(srv[i].svc) < 0)
-					cl_free(&cl[k], "modem server gone");
+				if (cl[k].used && cl[k].svc == srv[i].svc && srv_find(srv[i].svc) < 0) {
+					pend_drop_port(cl[k].port);
+					memset(&cl[k], 0, sizeof(cl[k]));	/* the modem side is gone already: no DEL_CLIENT */
+				}
 		}
 }
 
@@ -853,13 +996,49 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 {
 	struct cl *c = NULL;
 	for (int i = 0; i < NCL && !c; i++)
-		if (cl[i].used && cl[i].port == h->dst_port)
+		if (cl[i].used == 1 && cl[i].port == h->dst_port)
 			c = &cl[i];
 	if (!c || fd < 0 || n < 7) {
-		if (cnt.noport++ < 20)
-			printf("[%6llu] abp: QRTR %u bytes from %u:%x to port %#x: no router client (dropped)\n", (unsigned long long)link_ms(),
-			       n, h->src_node, h->src_port, h->dst_port);
+		late++;			/* a released / idle router port (or the bridge closed): dropped silently */
+		if (n >= 7 && d[0] == 0x02) {
+			uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
+			for (int i = 0; i < NPEND; i++)
+				if (pend[i].used && pend[i].port == h->dst_port && pend[i].txn == txn)
+					pend[i].used = 0;
+		}
 		return;
+	}
+	if (d[0] == 0x02) {		/* a response: the pending request and its result */
+		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8)), msg = (uint16_t)(d[3] | (d[4] << 8));
+		for (int i = 0; i < NPEND; i++)
+			if (pend[i].used && pend[i].port == h->dst_port && pend[i].txn == txn) {
+				pend[i].used = 0;
+				break;
+			}
+		struct qmi_msg qm;
+		uint16_t rl = 0;
+		const uint8_t *r = NULL;
+		if (!qmi_parse(d, n, &qm))
+			r = qmi_get(&qm, 0x02, &rl);
+		unsigned res = r && rl >= 4 ? (unsigned)(r[0] | (r[1] << 8)) : 0xffff, err = r && rl >= 4 ? (unsigned)(r[2] | (r[3] << 8)) : 0xffff;
+		struct mst *m = mst_get(c->svc, msg);
+		if (m) {
+			if (res == 0) {
+				m->ok++;
+			} else {
+				m->err++;
+				m->last_err = (uint16_t)err;
+			}
+			mst_dirty = 1;
+			if (!m->answered_logged) {
+				m->answered_logged = 1;
+				printf("[%6llu] abp: ANSWER %s(0x%02x) msg 0x%04x: %s", (unsigned long long)link_ms(), svc_name(c->svc), c->svc, msg,
+				       res == 0 ? "success" : res == 0xffff ? "no result TLV" : "FAILURE");
+				if (res != 0 && res != 0xffff)
+					printf(" error 0x%x", err);
+				printf(" (%u bytes)\n", n);
+			}
+		}
 	}
 	unsigned ml = d[5] | (d[6] << 8);
 	uint32_t len = 7 + (ml < n - 7 ? ml : n - 7);
@@ -877,6 +1056,22 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 	cur_pipe = c->pipe;
 	send_to(c->pipe, c->sess, b, 6 + len);
+}
+
+/* the per-(svc, msg) table: svc msg action count ok err[last code] noanswer */
+static void mst_table(const char *why)
+{
+	printf("[%6llu] abp: table (%s, %d rows, late %u): svc msg action count ok err[code] noans\n", (unsigned long long)link_ms(), why,
+	       nmst, late);
+	for (int i = 0; i < nmst; i++) {
+		struct mst *m = &mst[i];
+		char e[24] = "";
+		if (m->err)
+			snprintf(e, sizeof(e), "[0x%x]", m->last_err);
+		printf("abp:  %02x %-12s %04x %-5s %u %u %u%s %u\n", m->svc, svc_name(m->svc), m->msg,
+		       m->count || m->act ? act_name[m->act < 5 ? m->act : 4] : "-", m->count, m->ok, m->err, e, m->noans);
+	}
+	mst_dirty = 0;
 }
 
 /* ---- device, words, ready ---- */
@@ -903,6 +1098,8 @@ static void read_words(void)
 	mode = 0;
 	logframes = 0;
 	cidfail = 0;
+	reuse = 1;
+	dumpword = 0;
 	err_code = QMI_ERR_NOT_SUPPORTED;
 	if (f) {
 		size_t k = fread(b, 1, sizeof(b) - 1, f);
@@ -917,6 +1114,10 @@ static void read_words(void)
 		logframes = w ? atoi(w + 7) : 0;
 		w = strstr(b, "abpcidfail=");
 		cidfail = w ? atoi(w + 11) : 0;
+		w = strstr(b, "abpreuse=");
+		reuse = w ? atoi(w + 9) : 1;
+		w = strstr(b, "abpdump=");
+		dumpword = w ? atoi(w + 8) : 0;
 	}
 	if (mode == 1)
 		logframes = 1;		/* P1 observe always logs every frame */
@@ -1001,15 +1202,38 @@ void abpbridge_poll(void)
 	if (fd < 0)
 		return;
 	update_ready();
+	if (mode >= 2) {
+		for (int i = 0; i < NPEND; i++)
+			if (pend[i].used && now - pend[i].t > 5000) {
+				pend[i].used = 0;
+				struct mst *m = mst_get(pend[i].svc, pend[i].msg);
+				if (m) {
+					m->noans++;
+					mst_dirty = 1;
+					if (!m->answered_logged) {
+						m->answered_logged = 1;
+						printf("[%6llu] abp: ANSWER %s(0x%02x) msg 0x%04x: NO ANSWER after 5 s\n", (unsigned long long)now,
+						       svc_name(pend[i].svc), pend[i].svc, pend[i].msg);
+					}
+				}
+			}
+	}
+	if (dumpword && dumpword != dumpword_old)
+		mst_table("abpdump");
+	dumpword_old = dumpword;
 	if (mode >= 2 && now >= next_stats) {
 		if (next_stats) {
-			int ncl = 0;
-			for (int i = 0; i < NCL; i++)
-				ncl += cl[i].used;
+			int ncl = 0, nidle = 0;
+			for (int i = 0; i < NCL; i++) {
+				ncl += cl[i].used == 1;
+				nidle += cl[i].used == 2;
+			}
 			printf("[%6llu] abp: stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; "
-			       "%d router clients; no server %u, send fail %u, no port %u\n", (unsigned long long)now, nframes_in, nframes_out,
-			       cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped, ncl, cnt.noserver, cnt.sendfail,
-			       cnt.noport);
+			       "%d router clients (%d idle); no server %u, send fail %u, late %u\n", (unsigned long long)now, nframes_in, nframes_out,
+			       cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped, ncl, nidle, cnt.noserver, cnt.sendfail,
+			       late);
+			if (mst_dirty)
+				mst_table("60 s");
 		}
 		next_stats = now + 60000;
 	}
