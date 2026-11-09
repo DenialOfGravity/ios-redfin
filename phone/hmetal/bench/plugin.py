@@ -50,6 +50,8 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
   - (hmv10) HM_SCHED_WAIT=1 (default): -waitUntilScheduled waits for a held commit's send (was: returned at once), and
     -commitAndWaitUntilSubmitted = -commit + -waitUntilScheduled; the surfaces line also counts the core's HM_XR_LATE
     decodes, HM_XR_CHECK's 'changed after decode', HM_XR_WB_SYNC write-backs, held commits and scheduled waits
+  - (hmv11) the surfaces line also counts the core's HM_XR_GPU decodes (xr_decode on the GPU, no ring barrier), their
+    buffers, fallbacks to the processor and HM_XR_GPU_VERIFY's checks
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -688,6 +690,18 @@ hm_tr_buffer(double encode, double commit, double gpu, double total)
 						 "scheduled waits %ld (HM_SCHED_WAIT)", xr[5] - xwas[5], xr[6] - xwas[6], xr[7] - xwas[7], xr[8] - xwas[8],
 						 xr[8] - xwas[8] ? (double)(xr[9] - xwas[9]) / 1e3 / (double)(xr[8] - xwas[8]) : 0.0, held - hwas, waits - wwas);
 					hwas = held, wwas = waits;
+				}
+				{   /* (redfin hmv11) HM_XR_GPU */
+					static unsigned long long gwas[6];
+					unsigned long long g[6];
+					const int at3 = (int)strlen(line2);
+
+					hakios_metal_xr_gpu_stats(g);
+					snprintf(line2 + at3, sizeof(line2) - (size_t)at3, "; XR GPU decodes %llu in %llu buffers, %.2f ms avg to encode, "
+						 "%llu fell back to the processor, verified %llu (%llu differ) (HM_XR_GPU)", g[0] - gwas[0], g[1] - gwas[1],
+						 g[1] - gwas[1] ? (double)(g[5] - gwas[5]) / 1e3 / (double)(g[1] - gwas[1]) : 0.0, g[2] - gwas[2], g[3] - gwas[3],
+						 g[4] - gwas[4]);
+					memcpy(gwas, g, sizeof(gwas));
 				}
 				memcpy(xwas, xr, sizeof(xwas));
 				cwas = copies, fwas = forced;

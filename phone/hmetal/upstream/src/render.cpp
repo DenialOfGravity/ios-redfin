@@ -23,7 +23,9 @@
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/compiler.hpp"
 #include "hakios-metal/texture.hpp"
+#include "../tests/fixtures/xr_decode_bc.hpp"   // (redfin hmv11) HM_XR_GPU's kernel
 
 namespace hakios::metal {
 
@@ -3609,9 +3611,163 @@ void CommandBuffer::xrStats(uint64_t out[10]) {
     for (int i = 0; i < 10; i++) out[i] = gXrStats[i].load();
 }
 
+// (redfin hmv11) HM_XR_GPU=1 (default): the deferred decodes on the GPU (xr_decode); 0: on the processor (hmv10)
+namespace {
+bool xrGpuOn() {
+    static const bool on = [] { const char* e = getenv("HM_XR_GPU"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+// (redfin hmv11) HM_XR_GPU_VERIFY=N (default 4): the first N GPU decodes compared, at their completion, with a
+// processor decode of the same rows (every 8th row) and said; 0 none
+uint32_t xrGpuVerifyCount() {
+    static const uint32_t n = [] { const char* e = getenv("HM_XR_GPU_VERIFY"); return e != nullptr && e[0] != 0 ? uint32_t(strtoul(e, nullptr, 0)) : 4u; }();
+    return n;
+}
+std::atomic<uint64_t> gXrGpu[6];
+// xr_decode compiled once a process (nullptr: no compiler, or it refused -- said once) and its tables in a buffer
+struct XrKernel {
+    std::unique_ptr<CompiledKernel> k;
+    std::shared_ptr<Buffer> table;
+};
+const XrKernel* xrKernel(Gpu& gpu) {
+    static std::mutex m;
+    static XrKernel* made = nullptr;
+    static bool tried = false;
+    std::lock_guard<std::mutex> g(m);
+    if (tried) return made;
+    tried = true;
+    std::string why;
+    if (!hasCompiler()) {
+        render::notify("HM_XR_GPU: no shader compiler in this build; extended-range surfaces decoded on the processor");
+        return nullptr;
+    }
+    auto x = std::make_unique<XrKernel>();
+    x->k = compileAir(kernels::xr_decode_bc, sizeof kernels::xr_decode_bc, &why);
+    if (x->k == nullptr) {
+        render::notify("HM_XR_GPU: xr_decode refused by the compiler (" + why + "); extended-range surfaces decoded on the processor");
+        return nullptr;
+    }
+    const std::vector<uint32_t>& t = Texture::xrGpuTable();
+    x->table = newBuffer(gpu, 4 * t.size(), &why);
+    if (x->table == nullptr || x->table->contents() == nullptr) {
+        render::notify("HM_XR_GPU: no buffer for xr_decode's tables (" + why + "); extended-range surfaces decoded on the processor");
+        return nullptr;
+    }
+    memcpy(x->table->contents(), t.data(), 4 * t.size());
+    render::notify("HM_XR_GPU: xr_decode compiled (" + std::to_string(x->k->kernel.numWords) + " words, " + std::to_string(x->k->resources.size()) +
+                   " resources); extended-range surfaces decoded on the GPU, ordered on the ring (no barrier wait)");
+    made = x.release();
+    return made;
+}
+}  // namespace
+
+void CommandBuffer::xrGpuStats(uint64_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = gXrGpu[i].load();
+}
+
 // (redfin hmv10) HM_XR_LATE: everything the GPU ran before now (any process's), then the rows decoded
-void CommandBuffer::xrDecodeDeferred() {
-    if (xrLate_.empty()) return;
+// (redfin hmv11) HM_XR_GPU: or, without any wait, a buffer of xr_decode dispatches for the queue to send just before this one
+std::shared_ptr<CommandBuffer> CommandBuffer::xrDecodeDeferred() {
+    if (xrLate_.empty()) return nullptr;
+    std::shared_ptr<CommandBuffer> pre;
+    if (xrGpuOn()) {
+        const uint64_t t0 = queue_.gpu().transport().nowNs();
+        const XrKernel* xk = xrKernel(queue_.gpu());
+        for (XrLate& l : xrLate_) {
+            if (xk == nullptr || l.source == nullptr || l.copy == nullptr) break;
+            const Texture& src = *l.source;
+            const Texture& dst = *l.copy;
+            const uint8_t xr = src.info().xr;
+            const uint32_t bpp = src.info().bytesPerPixel;
+            if (xr == 0 || (bpp != 4 && bpp != 8) || src.bytesPerRow() % 4 != 0 || dst.bytesPerRow() % 8 != 0 || src.buffer() == nullptr ||
+                dst.buffer() == nullptr || dst.compressed() || src.compressed() || dst.width() < src.width() || dst.height() < src.height()) {
+                gXrGpu[2]++;
+                continue;
+            }
+            if (pre == nullptr) {
+                pre = queue_.commandBuffer();
+                std::string why;
+                std::shared_ptr<Buffer> params = queue_.takeBuffer(4096, &why);
+                if (params == nullptr || params->contents() == nullptr) {
+                    pre = nullptr;
+                    break;
+                }
+                pre->keep(xk->table);
+                pre->paramsXr_ = params;
+            }
+            // each dispatch its own 32 bytes of the parameters' page (128 dispatches a page: a frame has a handful)
+            const uint64_t at = 32ull * pre->paramsXrUsed_;
+            if (at + 32 > pre->paramsXr_->length()) {
+                gXrGpu[2]++;
+                continue;
+            }
+            pre->paramsXrUsed_++;
+            const uint32_t p[6] = {src.width(), src.height(), uint32_t(src.bytesPerRow() / 4), uint32_t(dst.bytesPerRow() / 4), bpp == 8 ? 1u : 0u,
+                                   (xr == 2 || xr == 4) ? 1024u : 0u};
+            memcpy(static_cast<uint8_t*>(pre->paramsXr_->contents()) + at, p, sizeof p);
+            const uint64_t srcOff = src.gpuAddress() - src.buffer()->gpuAddress();
+            const uint64_t dstOff = dst.gpuAddress() - dst.buffer()->gpuAddress();
+            std::vector<Binding> b(4);
+            b[0] = Binding{pre->paramsXr_.get(), at};
+            b[1] = Binding{src.buffer().get(), srcOff};
+            b[2] = Binding{dst.buffer().get(), dstOff};
+            b[3] = Binding{xk->table.get(), 0};
+            const uint32_t local[3] = {8, 8, 1};
+            const uint32_t groups[3] = {(src.width() + 7) / 8, (src.height() + 7) / 8, 1};
+            if (!pre->dispatch(xk->k->kernel, groups, local, b)) {
+                static std::atomic<uint32_t> said{0};
+                if (said.fetch_add(1) < 8) render::notify("HM_XR_GPU: xr_decode dispatch refused (" + pre->error() + "); that surface decoded on the processor");
+                gXrGpu[2]++;
+                // (a buffer in error sends nothing: every surface of this one goes to the processor)
+                pre = nullptr;
+                break;
+            }
+            pre->keep(src.buffer());
+            pre->keep(dst.buffer());
+            pre->keepAlive(l.source);
+            pre->keepAlive(l.copy);
+            l.gpu = true;
+            gXrGpu[0]++;
+            gXrStats[5]++;   // (still a decode at commit)
+        }
+        if (pre != nullptr && pre->counts().dispatches == 0) pre = nullptr;
+        if (pre == nullptr) {
+            for (XrLate& l : xrLate_) l.gpu = false;
+        } else {
+            gXrGpu[1]++;
+            // (the parameters' page back to the pool once the GPU is done; the verify on the first few)
+            std::vector<std::pair<std::shared_ptr<const Texture>, std::shared_ptr<Texture>>> verify;
+            for (XrLate& l : xrLate_) {
+                if (!l.gpu) continue;
+                static std::atomic<uint32_t> verified{0};
+                if (verified.load() < xrGpuVerifyCount() && verified.fetch_add(1) < xrGpuVerifyCount()) verify.emplace_back(l.source, l.copy);
+            }
+            CommandQueue* q = &queue_;
+            pre->addCompletedHandler([q, verify](CommandBuffer& cb) {
+                if (cb.status() == kCompleted) {
+                    for (const auto& [s, c] : verify) {
+                        uint64_t checked = 0;
+                        const uint64_t bad = s->xrVerify(*c, &checked);
+                        gXrGpu[3]++;
+                        if (bad != 0) gXrGpu[4]++;
+                        render::notify("HM_XR_GPU_VERIFY: surface " + render::n(s->surface()) + " (" + render::n(s->width()) + "x" + render::n(s->height()) +
+                                       " " + s->info().name + "): " + std::to_string(bad) + " of " + std::to_string(checked) +
+                                       " texels differ from the processor's decode" + (bad != 0 ? " (or WebKit wrote it again since)" : ""));
+                    }
+                } else {
+                    render::notify("HM_XR_GPU: the decode buffer failed: " + cb.error());
+                }
+                q->giveBuffer(std::move(cb.paramsXr_));
+            });
+        }
+        gXrGpu[5] += (queue_.gpu().transport().nowNs() - t0) / 1000;
+    }
+    bool cpu = false;
+    for (const XrLate& l : xrLate_) cpu = cpu || (!l.gpu && l.source != nullptr && l.copy != nullptr);
+    if (!cpu) {
+        if (!xrCheckOn()) xrLate_.clear();
+        return pre;
+    }
     if (xrSyncMs() > 0) {
         const uint64_t t0 = queue_.gpu().transport().nowNs();
         const int e = queue_.ringBarrier(int64_t(xrSyncMs()) * 1000000);
@@ -3620,12 +3776,13 @@ void CommandBuffer::xrDecodeDeferred() {
         if (e != 0) gXrStats[4]++;
     }
     for (XrLate& l : xrLate_) {
-        if (l.source == nullptr || l.copy == nullptr) continue;
+        if (l.gpu || l.source == nullptr || l.copy == nullptr) continue;
         gXrStats[0]++;
         gXrStats[1]++;
         l.decoded = l.source->xrDecodeLate(*l.copy, xrCheckOn() ? &l.sum : nullptr);
     }
     if (!xrCheckOn()) xrLate_.clear();
+    return pre;
 }
 
 void CommandBuffer::passSplits(uint64_t out[4]) {

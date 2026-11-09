@@ -291,6 +291,12 @@ void hakios_metal_xr_stats(unsigned long long out[10]) {
     for (int i = 0; i < 10; i++) out[i] = v[i];
 }
 
+void hakios_metal_xr_gpu_stats(unsigned long long out[6]) {
+    uint64_t v[6];
+    CommandBuffer::xrGpuStats(v);
+    for (int i = 0; i < 6; i++) out[i] = v[i];
+}
+
 void hakios_metal_set_notice(void (*fn)(const char*)) { render::setNotice(fn); }
 
 hakios_metal_library* hakios_metal_library_open(const void* data, size_t size) {

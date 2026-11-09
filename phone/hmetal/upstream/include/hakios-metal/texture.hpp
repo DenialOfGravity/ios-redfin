@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
@@ -368,6 +369,12 @@ public:
     // (redfin hmv10) HM_XR_CHECK: a sum of every 16th row of the surface's codes (this processor's lines of them dropped
     // first): one taken at the decode and one at completion differ when another process's GPU wrote the rows after
     uint64_t xrRowsSum() const;
+    // (redfin hmv11) HM_XR_GPU: the tables the xr_decode kernel reads, 3072 words each a half in its low 16 bits -- [0, 1024)
+    // the codes' linear values, [1024, 2048) the _sRGB twins', [2048, 3072) alpha -- the processor decode's own
+    static const std::vector<uint32_t>& xrGpuTable();
+    // (redfin hmv11) HM_XR_GPU_VERIFY: texels of COPY (an RGBA16Float copy the GPU decoded) that differ from this
+    // surface's rows decoded on the processor now (every 8th row), out of *CHECKED
+    uint64_t xrVerify(const Texture& copy, uint64_t* checked) const;
     // (redfin hmv4) HM_XR_RT=1 (default): an extended-range texture drawn into. No A6xx format writes the XR codes, so
     // a pass into one draws into an RGBA16Float companion of the same size (values as Metal's shader writes them, the
     // _sRGB twins' linear), shared by every Texture over the same IOSurface. LIVE while the companion holds what was

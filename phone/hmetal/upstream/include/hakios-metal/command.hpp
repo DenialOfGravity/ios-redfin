@@ -350,7 +350,16 @@ public:
     static void xrStats(uint64_t out[10]);
     // (redfin hmv10) HM_XR_LATE: the decodes deferred to the commit, done now (CommandQueue::submit, before the IB goes)
     // after one ring barrier
-    void xrDecodeDeferred();
+    // (redfin hmv11) HM_XR_GPU=1 (default): decoded on the GPU instead, by the xr_decode kernel (tools/kernels/xr_decode.ll)
+    // in a command buffer of their own that the queue submits just before this one: the one kernel ring runs it after
+    // every submission any process (WebKit's GPU process) made before, and this buffer's draws after it -- no ring barrier,
+    // no processor decode. Returned for submit to send first; nullptr when nothing went to the GPU (the processor
+    // decoded whatever there was, as hmv10: HM_XR_GPU=0, no compiler, or the kernel refused)
+    std::shared_ptr<CommandBuffer> xrDecodeDeferred();
+    // (redfin hmv11) [0] surfaces decoded on the GPU, [1] decode buffers sent, [2] fallbacks to the processor (no kernel /
+    // a dispatch refused), [3] GPU decodes checked against a processor decode (HM_XR_GPU_VERIFY), [4] of them that differed,
+    // [5] microseconds encoding the decode buffers
+    static void xrGpuStats(uint64_t out[6]);
 private:
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
@@ -392,8 +401,11 @@ private:
         std::shared_ptr<Texture> copy;
         uint64_t sum = 0;
         bool decoded = false;
+        bool gpu = false;   // (redfin hmv11) decoded by xr_decode on the GPU (HM_XR_GPU): no processor sum to check
     };
     std::vector<XrLate> xrLate_;
+    std::shared_ptr<Buffer> paramsXr_;   // (redfin hmv11) HM_XR_GPU: a decode buffer's parameters, 32 bytes a dispatch
+    uint32_t paramsXrUsed_ = 0;
     std::vector<std::pair<const void*, std::shared_ptr<void>>> xrDrawn_;   // (redfin hmv4) the XR companions it drew into (render.cpp)
     std::vector<std::function<void(CommandBuffer&)>> handlers_;
     std::mutex lock_;

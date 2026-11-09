@@ -414,6 +414,40 @@ uint64_t Texture::xrRowsSum() const {
     return h;
 }
 
+// (redfin hmv11) HM_XR_GPU: xrDecodeInto's tables for the xr_decode kernel
+const std::vector<uint32_t>& Texture::xrGpuTable() {
+    static const std::vector<uint32_t> t = [] {
+        std::vector<uint32_t> v(3072);
+        const uint16_t* lin = xrTable(false);
+        const uint16_t* srgb = xrTable(true);
+        for (uint32_t c = 0; c < 1024; c++) {
+            v[c] = lin[c];
+            v[1024 + c] = srgb[c];
+            v[2048 + c] = halfOf(std::min(1.0f, std::max(0.0f, (float(c) - 384.0f) / 510.0f)));
+        }
+        return v;
+    }();
+    return t;
+}
+
+uint64_t Texture::xrVerify(const Texture& copy, uint64_t* checked) const {
+    *checked = 0;
+    const uint8_t* got = static_cast<const uint8_t*>(copy.contents());
+    if (got == nullptr || buffer_->contents() == nullptr || info_->xr == 0 || copy.width() < desc_.width || copy.height() < desc_.height) return 0;
+    std::vector<uint8_t> want(size_t(copy.bytesPerRow()) * desc_.height);
+    xrDecodeInto(want.data(), copy.bytesPerRow());
+    uint64_t bad = 0;
+    for (uint32_t y = 0; y < desc_.height; y += 8) {
+        const uint8_t* g = got + uint64_t(y) * copy.bytesPerRow();
+        const uint8_t* w = want.data() + uint64_t(y) * copy.bytesPerRow();
+        for (uint32_t x = 0; x < desc_.width; x++) {
+            (*checked)++;
+            if (memcmp(g + 8ull * x, w + 8ull * x, 8) != 0) bad++;
+        }
+    }
+    return bad;
+}
+
 std::shared_ptr<Texture::XrTarget> Texture::xrTarget(Gpu& gpu, bool load, std::string* why) const {
     if (info_->xr == 0 || xrMode() != 1 || xrRenderMode() == 0) {
         refuse(why, std::string("a ") + info_->name + " texture as a colour attachment: the extended-range formats are sampled alone (no A6xx format writes them; HM_XR_RT=0)");
