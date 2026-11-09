@@ -98,3 +98,39 @@ Logs `/var/local/hmetal/bench-<dev>.log`, lines `RESULT dev wl draws enc_us us/d
 - Install a changed Mach-O under a new name and `mv` it into place: overwriting in place kept the old file's code
   signature attached to the vnode ("code signature does not cover entire file").
 - First numbers and the frame comparison: project folder logs/hmetal/bench-summary-2026-11-06.md.
+
+## Dispatcher: every process on hakios-metal, SweetMetal2 as the fallback (hmapp, bench/m2shim.m)
+
+The kernel's IOAccelerator names SweetMetal2 (MetalPluginName/MetalPluginClassName = SweetMetal2 / SweetMTL2Device), so
+Metal opens `/System/Library/Extensions/SweetMetal2.bundle` in every process. Its executable is the dispatcher
+(bench/m2shim.m), which picks a driver per process (getprogname) and loads it as a plain bundle:
+
+| path (/var/local/hmetal/...) | what |
+|---|---|
+| `lib/HakiosMetal.bundle` | hakios-metal (before the switch: `ca/HakiosMetal.bundle`, used when lib/ lacks it) |
+| `lib/SweetMetal2.bundle` | the real SweetMetal2 (before the switch: `/var/local/SweetMetal2.bundle.pre-hmca`) |
+| `env` | the one env file (before the switch: `ca/env`). `KEY=V` backboardd's (as before); `*:KEY=V` every hakios-metal process; `NAME:KEY=V` one process. Keys HAKIOS_METAL_* and HM_* only. |
+| `all-off` | exists: every process on SweetMetal2 (backboardd still follows `ca/bbd-hm`) |
+| `m2-procs` | names kept on SweetMetal2 (one a line, `#` comments, `*` = all) |
+| `hm-only` | exists: only the names it lists go to hakios-metal (staged roll-out); absent: every process does |
+| `m2-fallback` | names the crash fallback put on SweetMetal2; edit to clear (and rm the process's `.m2` marker) |
+| `ca/bbd-hm` | backboardd on hakios-metal while it exists (H3; its own trip renames it `bbd-hm.tripped`) |
+| `log/NAME.log` | each process's lines (dispatcher + plug-in) where it may append; else `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.log` |
+| `cache/` | compiled stages, written by backboardd (prewarmed: HM_PREWARM); read-only seed for every other process, whose own writable cache is `$DARWIN_USER_CACHE_DIR/hakios-metal-cache` (HM_PREWARM=0 there) |
+
+Crash fallback per process: each start on hakios-metal is recorded in `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.starts`
+(writable even for sandboxed processes; a clean exit adds `x pid`); the 3rd start within 120 s whose earlier ones did
+not exit cleanly puts the process on SweetMetal2 for good (name appended to `m2-fallback` when writable, marker
+`hakios-metal-NAME.m2` beside the starts file). XR10 is off in every hakios-metal process (HM_XR10=0 forced:
+supportsExtendedXR10Formats NO, so CoreAnimation makes BGRA8 layers and tiles another process samples with no decode);
+`HM_XR10_ALLOW=1` in a process's env lets its HM_XR10 stand. Host test: `cc -o t bench/m2shim_test.c && ./t` (bench/build.sh runs it).
+
+Multi-process on our kernel: each process opens its own v2 client (IOAcceleratorES type 0x4147) and gets its own 4 GiB
+GPU window (64 windows, xnu/patches/0115 sweet_gpu_window_alloc), BOs from the one kernel GPU pool (as Turnip's); all
+clients submit to the one ring, so another process's earlier submissions (an IOSurface it drew) are ordered before ours.
+An IOSurface made elsewhere is imported as the caller's own pages (userptr) and cleaned/invalidated around submissions
+(Cache maintenance above). The compiled-stage cache writes `.tmp` + rename, so readers never see half a file.
+
+Later (kernel/ADT, not done): an accelerator that names a `HakiosMetal` plug-in directly (MetalPluginName =
+HakiosMetal, the dispatcher as that bundle and SweetMetal2.bundle back to the real one), so /System's SweetMetal2 is
+no longer replaced.

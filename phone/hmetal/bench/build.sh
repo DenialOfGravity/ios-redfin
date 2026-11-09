@@ -50,6 +50,8 @@ codesign -f -s - "$B" 2>/dev/null || codesign -f -s - "$B/HakiosMetal" 2>/dev/nu
 nm -u "$B/HakiosMetal" 2>/dev/null | grep -c . | sed 's/^/HakiosMetal: undefined symbols: /' || true
 # 4. (H3) the SweetMetal2 stand-in for the window-server test (bench/m2shim.m): -> /System/Library/Extensions/SweetMetal2.bundle
 #    for the test only, the real bundle kept at /var/local/SweetMetal2.bundle.pre-hmca
+#    (hmapp) the dispatcher's choice on the build host first (bench/m2shim_test.c includes m2shim.m without Objective-C)
+${HOSTCC:-cc} -Wno-format-truncation -o "$O/obj/m2shim_test" m2shim_test.c && "$O/obj/m2shim_test"
 S=$O/SweetMetal2-shim.bundle
 rm -rf "$S" && mkdir -p "$S"
 "$CC" -x objective-c -fno-objc-arc -O2 -g -Wall -Wno-deprecated-declarations -bundle -o "$S/SweetMetal2" m2shim.m \
