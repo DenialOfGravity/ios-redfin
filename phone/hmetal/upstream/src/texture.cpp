@@ -344,7 +344,7 @@ void Texture::xrDecodeInto(uint8_t* out, uint64_t outPitch) const {
     }
 }
 
-std::shared_ptr<Texture> Texture::xrDecode(Gpu& gpu, std::string* why) const {
+std::shared_ptr<Texture> Texture::xrDecode(Gpu& gpu, std::string* why, bool now) const {
     const uint8_t xr = info_->xr;
     if (xr == 0 || xrMode() != 1) return nullptr;
     if (desc_.type != TextureType::k2D || desc_.mipLevels != 1) {
@@ -356,6 +356,18 @@ std::shared_ptr<Texture> Texture::xrDecode(Gpu& gpu, std::string* why) const {
         refuse(why, std::string("a ") + info_->name + " texture over IOSurface " + n(surface_) + ": mapped nowhere for this processor to decode it");
         return nullptr;
     }
+    std::shared_ptr<Texture> copy = xrCopyFor(gpu, why);
+    if (copy == nullptr || !now) return copy;
+    uint8_t* out = static_cast<uint8_t*>(copy->contents());
+    if (out == nullptr) {
+        refuse(why, "the decoded copy of a " + std::string(info_->name) + " texture is mapped nowhere");
+        return nullptr;
+    }
+    xrDecodeInto(out, copy->bytesPerRow());
+    return copy;
+}
+
+std::shared_ptr<Texture> Texture::xrCopyFor(Gpu& gpu, std::string* why) const {
     const uint32_t slot = xrNext_.fetch_add(1) & 1;
     std::shared_ptr<Texture>& copy = xrCopy_[slot];
     // (redfin hmv4) a copy a buffer still in flight holds (its keepAlive: more than this slot's reference) is not
@@ -370,13 +382,36 @@ std::shared_ptr<Texture> Texture::xrDecode(Gpu& gpu, std::string* why) const {
         copy = make(gpu, d, why);
         if (copy == nullptr) return nullptr;
     }
-    uint8_t* out = static_cast<uint8_t*>(copy->contents());
-    if (out == nullptr) {
-        refuse(why, "the decoded copy of a " + std::string(info_->name) + " texture is mapped nowhere");
-        return nullptr;
-    }
-    xrDecodeInto(out, copy->bytesPerRow());
     return copy;
+}
+
+bool Texture::xrDecodeLate(Texture& copy, uint64_t* sum) const {
+    uint8_t* out = static_cast<uint8_t*>(copy.contents());
+    if (out == nullptr || buffer_->contents() == nullptr || info_->xr == 0) return false;
+    xrDecodeInto(out, copy.bytesPerRow());   // (drops this processor's lines of the rows first)
+    if (sum != nullptr) *sum = xrRowsSum();
+    return true;
+}
+
+uint64_t Texture::xrRowsSum() const {
+    if (buffer_->contents() == nullptr || info_->xr == 0) return 0;
+    const uint8_t* rows = static_cast<const uint8_t*>(buffer_->contents()) + offset_;
+    const uint64_t rowBytes = uint64_t(desc_.width) * info_->bytesPerPixel & ~uint64_t(7);
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t y = 0; y < desc_.height; y += 16) {
+        const uint8_t* r = rows + uint64_t(y) * pitch_;
+#if defined(__aarch64__)
+        for (uintptr_t a = reinterpret_cast<uintptr_t>(r) & ~uintptr_t(63); a < reinterpret_cast<uintptr_t>(r + rowBytes); a += 64)
+            __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+        __asm__ volatile("dsb sy" ::: "memory");
+#endif
+        for (uint64_t x = 0; x < rowBytes; x += 8) {
+            uint64_t v;
+            memcpy(&v, r + x, 8);
+            h = (h ^ v) * 1099511628211ull;
+        }
+    }
+    return h;
 }
 
 std::shared_ptr<Texture::XrTarget> Texture::xrTarget(Gpu& gpu, bool load, std::string* why) const {

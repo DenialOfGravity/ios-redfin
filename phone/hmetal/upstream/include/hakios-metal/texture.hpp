@@ -358,7 +358,16 @@ public:
     // samples in its place, its texels decoded now from the surface's rows by this processor -- a colour (code - 384) / 510,
     // the _sRGB twins' through the sRGB curve extended by symmetry, BGR10_XR's alpha 1. Two copies in turn, so that the
     // one a command buffer still on the GPU reads is not rewritten under it by the next. nullptr with *why
-    std::shared_ptr<Texture> xrDecode(Gpu& gpu, std::string* why) const;
+    // (redfin hmv10) NOW false: the copy alone, its texels decoded later by xrDecodeLate (HM_XR_LATE)
+    std::shared_ptr<Texture> xrDecode(Gpu& gpu, std::string* why, bool now = true) const;
+    // (redfin hmv10) HM_XR_LATE: xrDecode's copy (the slot's, or a new one) without its texels -- decoded later, at commit,
+    // by xrDecodeLate; nullptr with *why
+    std::shared_ptr<Texture> xrCopyFor(Gpu& gpu, std::string* why) const;
+    // the rows decoded now into COPY (xrCopyFor's); false when either is mapped nowhere. SUM: xrRowsSum's as decoded
+    bool xrDecodeLate(Texture& copy, uint64_t* sum = nullptr) const;
+    // (redfin hmv10) HM_XR_CHECK: a sum of every 16th row of the surface's codes (this processor's lines of them dropped
+    // first): one taken at the decode and one at completion differ when another process's GPU wrote the rows after
+    uint64_t xrRowsSum() const;
     // (redfin hmv4) HM_XR_RT=1 (default): an extended-range texture drawn into. No A6xx format writes the XR codes, so
     // a pass into one draws into an RGBA16Float companion of the same size (values as Metal's shader writes them, the
     // _sRGB twins' linear), shared by every Texture over the same IOSurface. LIVE while the companion holds what was

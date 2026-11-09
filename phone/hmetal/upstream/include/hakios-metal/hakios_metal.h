@@ -87,7 +87,7 @@ void hakios_metal_compile_background(int on);
 void hakios_metal_pass_splits(unsigned long long out[4]);
 /* (redfin hmv8) extended-range copies: [0] decoded on the processor, [1] of them over an IOSurface, [2] ring barriers before
  * such a decode (HM_XR_SYNC), [3] microseconds waited in them, [4] barriers that timed out */
-void hakios_metal_xr_stats(unsigned long long out[5]);
+void hakios_metal_xr_stats(unsigned long long out[10]);   /* (redfin hmv10) 10: [5]-[9] HM_XR_LATE/CHECK/WB_SYNC */
 /* (redfin hmv2) the encoder's one-time notices (a short constant binding padded, HM_CB_PAD) to FN instead of stderr */
 void hakios_metal_set_notice(void (*fn)(const char *text));
 

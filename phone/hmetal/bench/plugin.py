@@ -47,6 +47,9 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
     HM_TRACE's 10 s 'trace: surfaces:' line (live textures over IOSurfaces, row copies a s and forced ones, XR decodes,
     ring barriers) and 'trace: display-sized surface N let go' (the display torn down: ms since the last buffer);
     the core's HM_XR_SYNC (render.cpp) is set in the same env file
+  - (hmv10) HM_SCHED_WAIT=1 (default): -waitUntilScheduled waits for a held commit's send (was: returned at once), and
+    -commitAndWaitUntilSubmitted = -commit + -waitUntilScheduled; the surfaces line also counts the core's HM_XR_LATE
+    decodes, HM_XR_CHECK's 'changed after decode', HM_XR_WB_SYNC write-backs, held commits and scheduled waits
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -591,6 +594,25 @@ static unsigned long long hm_tr_frame(void) { return hm_tr.committed; }
 /* (redfin hmv8) surfaces: textures over an IOSurface alive now; copies of a surface's rows (-hakiosShadow:'s refreshes) and
  * of them the ones made while the seed had not moved (HM_SHADOW_FRESH); the last buffer's numbers (display-off trace) */
 static volatile long hm_surf_live, hm_surf_live_max, hm_shadow_copies, hm_shadow_forced;
+/* (redfin hmv10) commits held (sent later from the queue's serial queue: an event waited for, or one held before them)
+ * and -waitUntilScheduled calls that waited for such a send (HM_SCHED_WAIT) */
+static volatile long hm_held_commits, hm_sched_waits;
+/* (redfin hmv10) HM_SCHED_WAIT=1 (default): -waitUntilScheduled (and -commitAndWaitUntilSubmitted) of a held commit waits
+ * until it has reached the GPU, as Metal's does. Was: returned at once. CoreAnimation swaps after it: the kernel's
+ * direct-scanout and panel paths show a frame once the swapper's last submitted fence passes (0976/0989), so a frame
+ * swapped before its buffer was submitted was shown while the GPU was still drawing it (painted top to bottom). 0: as before */
+static int
+hm_sched_wait(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_SCHED_WAIT");
+
+		on = e == NULL || e[0] != '0';
+	}
+	return on;
+}
 static double hm_tr_last_done, hm_tr_last_enc, hm_tr_last_gpu;
 /* (redfin hmv8) HM_SHADOW_FRESH: 1 (default) a read-only copy of a surface's rows made again once a command buffer whatever
  * its seed; 0 only when the seed moved (as before) */
@@ -611,7 +633,7 @@ hm_shadow_fresh(void)
 static void
 hm_tr_buffer(double encode, double commit, double gpu, double total)
 {
-	char line[700] = "", line2[400] = "";
+	char line[700] = "", line2[800] = "";
 
 	hm_tr_last_done = hm_now(), hm_tr_last_enc = encode, hm_tr_last_gpu = gpu;   /* (redfin hmv8) */
 
@@ -645,9 +667,9 @@ hm_tr_buffer(double encode, double commit, double gpu, double total)
 				 "%llu after a copy/dispatch/clear between", sp[0] - was[0], sp[1] - was[1], sp[2] - was[2], sp[3] - was[3]);
 			memcpy(was, sp, sizeof(was));
 			{   /* (redfin hmv8) the surfaces' line: live textures over IOSurfaces, copies a second, XR decodes and ring barriers */
-				static unsigned long long xwas[5];
-				static long cwas, fwas;
-				unsigned long long xr[5];
+				static unsigned long long xwas[10];
+				static long cwas, fwas, hwas, wwas;
+				unsigned long long xr[10];
 				const double secs = now - hm_tr.since > 0 ? now - hm_tr.since : 1;
 				const long copies = hm_shadow_copies, forced = hm_shadow_forced;
 
@@ -657,6 +679,16 @@ hm_tr_buffer(double encode, double commit, double gpu, double total)
 					 "%llu timed out (HM_XR_SYNC)", hm_surf_live, hm_surf_live_max, (copies - cwas) / secs, forced - fwas,
 					 (xr[0] - xwas[0]) / secs, xr[1] - xwas[1], xr[2] - xwas[2],
 					 xr[2] - xwas[2] ? (double)(xr[3] - xwas[3]) / 1e3 / (double)(xr[2] - xwas[2]) : 0.0, xr[4] - xwas[4]);
+				{   /* (redfin hmv10) */
+					const int at2 = (int)strlen(line2);
+					const long held = hm_held_commits, waits = hm_sched_waits;
+
+					snprintf(line2 + at2, sizeof(line2) - (size_t)at2, "; XR decodes at commit %llu (HM_XR_LATE), checked %llu, changed after "
+						 "decode %llu (HM_XR_CHECK); write-backs at completion %llu, %.1f ms avg (HM_XR_WB_SYNC); held commits %ld, "
+						 "scheduled waits %ld (HM_SCHED_WAIT)", xr[5] - xwas[5], xr[6] - xwas[6], xr[7] - xwas[7], xr[8] - xwas[8],
+						 xr[8] - xwas[8] ? (double)(xr[9] - xwas[9]) / 1e3 / (double)(xr[8] - xwas[8]) : 0.0, held - hwas, waits - wwas);
+					hwas = held, wwas = waits;
+				}
 				memcpy(xwas, xr, sizeof(xwas));
 				cwas = copies, fwas = forced;
 			}
@@ -1510,6 +1542,23 @@ EDITS = [
      '\tif (program == NULL) {   /* (redfin hmv7) an uber shader that may not run as it is, and no specialisation for this draw */\n'
      '\t\treturn;\n'
      '\t}\n'),
+    # (hmv10) HM_SCHED_WAIT: held commits counted; -waitUntilScheduled waits for a held commit's send; and
+    # -commitAndWaitUntilSubmitted (QuartzCore 16.7 calls it; SweetMetal2 has it) = -commit + -waitUntilScheduled
+    ('\t\t_sent = dispatch_semaphore_create(0);\n',
+     '\t\t_sent = dispatch_semaphore_create(0);\n\t\t__sync_fetch_and_add(&hm_held_commits, 1);   /* (redfin hmv10) */\n'),
+    ('\t/* committed: hakios_metal_cb_commit returned with it scheduled, so there is nothing left to wait for */\n}\n',
+     '\t/* committed: hakios_metal_cb_commit returned with it scheduled, so there is nothing left to wait for -- (redfin hmv10)\n'
+     '\t * unless it was held: then until it has been sent (HM_SCHED_WAIT) */\n'
+     '\tif (_committed && _sent != NULL && hm_sched_wait()) {\n'
+     '\t\t__sync_fetch_and_add(&hm_sched_waits, 1);\n'
+     '\t\tdispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);\n'
+     '\t\tdispatch_semaphore_signal(_sent);\n'
+     '\t}\n}\n\n'
+     '/* (redfin hmv10) private Metal API CoreAnimation uses before its swap: committed and on the GPU when it returns */\n'
+     '- (BOOL)commitAndWaitUntilSubmitted\n{\n'
+     '\t[self commit];\n'
+     '\t[self waitUntilScheduled];\n'
+     '\treturn [self error] == nil;\n}\n'),
 ]
 
 

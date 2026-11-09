@@ -5888,7 +5888,7 @@ TEST(an_extended_range_surface_is_decoded_after_a_ring_barrier_once_a_buffer) {
     Bindings fsb;
     fsb.textures = {x.get()};
     fsb.samplers = {&smp};
-    uint64_t s0[5], s1[5];
+    uint64_t s0[10], s1[10];
     CommandBuffer::xrStats(s0);
     const uint32_t submits0 = r.fake->stats().submits;
     auto cb = r.queue->commandBuffer();
@@ -5905,10 +5905,91 @@ TEST(an_extended_range_surface_is_decoded_after_a_ring_barrier_once_a_buffer) {
     CHECK(cb2->draw(flatProgram(), pass, wholeDraw(6), Bindings{}, Bindings{}));
     cb2->commit();
     cb2->waitUntilCompleted();
-    uint64_t s2[5];
+    uint64_t s2[10];
     CommandBuffer::xrStats(s2);
     CHECK_EQ(s2[2], s1[2]);
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin hmv10) HM_XR_LATE (default): a surface's decoded copy is filled at the commit, after the ring barrier, not at
+// the draw: rows another process's GPU writes between CoreAnimation's draw and its commit are what is drawn. And
+// HM_XR_CHECK compares the rows at completion with those decoded (unchanged here: nothing counted as stale).
+TEST(an_extended_range_surface_is_decoded_at_the_commit) {
+    Rig r;
+    r.fake->addSurface(32, 64, 16, 256, 0x77333072u);   // 'w30r'
+    TextureDesc d;
+    d.format = PixelFormat::kBGR10_XR;
+    d.width = 64;
+    d.height = 16;
+    d.usage = kTextureUsageRead;
+    std::string why;
+    auto x = Texture::wrapSurface(*r.gpu, 32, d, &why);
+    if (x == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    auto* rows = static_cast<uint8_t*>(x->contents());
+    CHECK(rows != nullptr);
+    if (rows == nullptr) return;
+    auto fill = [&](uint32_t code) {
+        const uint32_t w = code | code << 10 | code << 20;
+        for (uint32_t y = 0; y < 16; y++)
+            for (uint32_t i = 0; i < 64; i++) memcpy(rows + 256 * y + 4 * i, &w, 4);
+    };
+    fill(384);   // 0.0: black
+    auto t = target(r, 64, 16);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {x.get()};
+    fsb.samplers = {&smp};
+    uint64_t s0[10], s1[10];
+    CommandBuffer::xrStats(s0);
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    fill(894);   // 1.0, written after the draws (WebKit's GPU, before CoreAnimation's commit)
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CommandBuffer::xrStats(s1);
+    CHECK_EQ(s1[5] - s0[5], 1u);   // one deferred decode (the second draw takes the same copy)
+    CHECK_EQ(s1[1] - s0[1], 1u);
+    CHECK_EQ(s1[2] - s0[2], 1u);   // one barrier, at the commit
+    CHECK_EQ(s1[6] - s0[6], 1u);   // checked at completion...
+    CHECK_EQ(s1[7] - s0[7], 0u);   // ...and unchanged
+    cb.reset();
+    // the copy the buffer drew (slot 0: the fake runs no shader, so the copy is read, not the target), taken back
+    // without a decode once its buffer let go of it: the next copy is slot 1's, the one after slot 0's again
+    CHECK(x->xrDecode(*r.gpu, &why, false) != nullptr);
+    auto copy = x->xrDecode(*r.gpu, &why, false);
+    CHECK(copy != nullptr && copy->contents() != nullptr);
+    if (copy != nullptr && copy->contents() != nullptr) {
+        uint16_t texel[4];
+        memcpy(texel, copy->contents(), 8);
+        CHECK_EQ(texel[0], 0x3c00u);   // 1.0: the rows as they were at the commit
+        CHECK_EQ(texel[1], 0x3c00u);
+        CHECK_EQ(texel[2], 0x3c00u);
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin hmv10) HM_XR_WB_SYNC (default): the write-back is done when the buffer's completion is: the rows hold the XR
+// codes by the time waitUntilCompleted returns (and the buffer's completed handlers run), with no worker to wait for
+TEST(an_extended_range_targets_write_back_is_done_at_completion) {
+    Rig r;
+    auto t = target(r, 64, 32, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGR10_XR);
+    if (t == nullptr) return;
+    seed(*t);
+    uint64_t s0[10], s1[10];
+    CommandBuffer::xrStats(s0);
+    auto cb = clearOnce(r, clearPass(t.get(), 0.25, 0.5, 1.0, 1.0));
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK(t->xrLive() == nullptr);
+    const uint32_t word = 894u | 639u << 10 | 512u << 20;
+    uint8_t want[4];
+    memcpy(want, &word, 4);
+    CHECK(allPixels(*t, want, 4));
+    CommandBuffer::xrStats(s1);
+    CHECK_EQ(s1[8] - s0[8], 1u);
 }
 
 // (redfin hmv4) HM_XR_RT: a pass into an extended-range target is drawn into its RGBA16Float companion and, at the

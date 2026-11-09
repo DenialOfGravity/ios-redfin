@@ -2857,17 +2857,41 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 // completion thread: one worker, a companion queued once however many buffers drew it before it ran.
 namespace {
 std::atomic<uint64_t> gPassSplits[4];   // (redfin hmv4) CommandBuffer::passSplits
-std::atomic<uint64_t> gXrStats[5];       // (redfin hmv8) CommandBuffer::xrStats
-// (redfin hmv8) HM_XR_SYNC: 0 off, else on (default 1) with HM_XR_SYNC_MS (default 50) the longest wait
+std::atomic<uint64_t> gXrStats[10];      // (redfin hmv8, hmv10) CommandBuffer::xrStats
+// (redfin hmv8) HM_XR_SYNC: 0 off, else on (default 1) with HM_XR_SYNC_MS the longest wait -- (redfin hmv10) default 250
+// (was 50: var8's Safari run timed out 18 of 182 barriers while the ring was 100-200 ms deep behind WebKit's tiles, and a
+// tile decoded then was decoded before WebKit's GPU wrote it: blank, kept on screen until CoreAnimation drew it again)
 unsigned xrSyncMs() {
     static const unsigned ms = [] {
         const char* e = getenv("HM_XR_SYNC");
         if (e != nullptr && e[0] == '0') return 0u;
         const char* m = getenv("HM_XR_SYNC_MS");
-        const int v = m != nullptr && m[0] != 0 ? atoi(m) : 50;
-        return unsigned(v > 0 ? v : 50);
+        const int v = m != nullptr && m[0] != 0 ? atoi(m) : 250;
+        return unsigned(v > 0 ? v : 250);
     }();
     return ms;
+}
+// (redfin hmv10) HM_XR_LATE=1 (default): a surface's decode at the commit, just before the IB goes to the kernel (after
+// the ring barrier), not at the draw's encode: CoreAnimation's encode of a frame took 30-110 ms in var8's Safari run, and
+// the WebKit GPU work CoreAnimation's commit waits for may reach the ring during it. 0: at the draw (as hmv8).
+bool xrLateOn() {
+    static const bool on = [] { const char* e = getenv("HM_XR_LATE"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+// (redfin hmv10) HM_XR_CHECK=1 (default): at a buffer's completion, a sum of every 16th row of each surface it decoded,
+// against the sum at the decode: a difference = another process's GPU wrote the rows after they were read (the drawn copy
+// was stale). Counted ('changed after decode' in the plug-in's surfaces line) and the first 40 said. 0: no check.
+bool xrCheckOn() {
+    static const bool on = [] { const char* e = getenv("HM_XR_CHECK"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+// (redfin hmv10) HM_XR_WB_SYNC=1 (default): an XR target's write-back into its surface's rows done on the completion
+// thread, before the buffer's completed handlers (CoreAnimation's) run: the rows are whole when Metal says the work is
+// done, as on an iPhone. 0: on the write-back worker, after (hmv4): a reader of the surface outside this process (or a
+// display path) could see the rows rewritten top to bottom. Write-backs of more than 8 ms are said (first 40).
+bool xrWbSyncOn() {
+    static const bool on = [] { const char* e = getenv("HM_XR_WB_SYNC"); return e == nullptr || e[0] != '0'; }();
+    return on;
 }
 struct XrDrawn {
     std::shared_ptr<const Texture> source;
@@ -2949,7 +2973,27 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
                     if (cb.status() != kCompleted) return;
                     for (auto& [key, r] : cb.xrDrawn_) {
                         const XrDrawn* d = static_cast<const XrDrawn*>(r.get());
-                        if (d->source != nullptr) XrWriteBacks::the().post(*d);
+                        if (d->source == nullptr) continue;
+                        if (!xrWbSyncOn()) {
+                            XrWriteBacks::the().post(*d);
+                            continue;
+                        }
+                        // (redfin hmv10) HM_XR_WB_SYNC: here, before the buffer's own handlers
+                        const uint64_t t0 = cb.queue_.gpu().transport().nowNs();
+                        {
+                            std::lock_guard<std::mutex> w(d->target->wb);
+                            d->source->xrWriteBack(*d->target);
+                        }
+                        d->target->settled(d->at);
+                        const uint64_t us = (cb.queue_.gpu().transport().nowNs() - t0) / 1000;
+                        gXrStats[8]++;
+                        gXrStats[9] += us;
+                        static std::atomic<uint32_t> said{0};
+                        if (us > 8000 && said.fetch_add(1) < 40) {
+                            render::notify("XR write-back of surface " + render::n(d->source->surface()) + " (" + render::n(d->source->width()) +
+                                           "x" + render::n(d->source->height()) + ") on the completion thread: " + render::n(uint32_t(us / 1000)) +
+                                           " ms (HM_XR_WB_SYNC)");
+                        }
                     }
                     cb.xrDrawn_.clear();
                 });
@@ -3005,6 +3049,37 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
                         xrDecoded_.emplace_back(t, live->sample);
                         decoded = live->sample.get();
                     }
+                }
+                if (decoded == nullptr && t->surface() != 0 && xrLateOn()) {
+                    // (redfin hmv10) HM_XR_LATE: the copy now, its texels at the commit (xrDecodeDeferred)
+                    std::shared_ptr<Texture> c = t->xrDecode(queue_.gpu(), &why, false);
+                    if (c == nullptr) return refuseWork("an extended-range texture: " + why);
+                    if (xrLate_.empty() && xrCheckOn()) {
+                        addCompletedHandler([](CommandBuffer& cb) {
+                            if (cb.status() != kCompleted) return;
+                            for (XrLate& l : cb.xrLate_) {
+                                if (!l.decoded || l.source == nullptr) continue;
+                                gXrStats[6]++;
+                                if (l.source->xrRowsSum() == l.sum) continue;
+                                gXrStats[7]++;
+                                static std::atomic<uint32_t> said{0};
+                                if (said.fetch_add(1) < 40) {
+                                    render::notify("XR surface " + render::n(l.source->surface()) + " (" + render::n(l.source->width()) + "x" +
+                                                   render::n(l.source->height()) + ") changed after its decode: another process's GPU wrote it "
+                                                   "after the ring barrier; the copy drawn was stale (HM_XR_CHECK)");
+                                }
+                            }
+                            cb.xrLate_.clear();
+                        });
+                    }
+                    keepAlive(c);
+                    XrLate l;
+                    l.source = Texture::byResourceId(t->resourceId());
+                    l.copy = c;
+                    xrLate_.push_back(std::move(l));
+                    xrDecoded_.emplace_back(t, c);
+                    decoded = c.get();
+                    gXrStats[5]++;
                 }
                 if (decoded == nullptr) {
                     // (redfin hmv8) HM_XR_SYNC=1 (default): a surface's rows are read on the processor here, at encode
@@ -3530,8 +3605,27 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
-void CommandBuffer::xrStats(uint64_t out[5]) {
-    for (int i = 0; i < 5; i++) out[i] = gXrStats[i].load();
+void CommandBuffer::xrStats(uint64_t out[10]) {
+    for (int i = 0; i < 10; i++) out[i] = gXrStats[i].load();
+}
+
+// (redfin hmv10) HM_XR_LATE: everything the GPU ran before now (any process's), then the rows decoded
+void CommandBuffer::xrDecodeDeferred() {
+    if (xrLate_.empty()) return;
+    if (xrSyncMs() > 0) {
+        const uint64_t t0 = queue_.gpu().transport().nowNs();
+        const int e = queue_.ringBarrier(int64_t(xrSyncMs()) * 1000000);
+        gXrStats[2]++;
+        gXrStats[3] += (queue_.gpu().transport().nowNs() - t0) / 1000;
+        if (e != 0) gXrStats[4]++;
+    }
+    for (XrLate& l : xrLate_) {
+        if (l.source == nullptr || l.copy == nullptr) continue;
+        gXrStats[0]++;
+        gXrStats[1]++;
+        l.decoded = l.source->xrDecodeLate(*l.copy, xrCheckOn() ? &l.sum : nullptr);
+    }
+    if (!xrCheckOn()) xrLate_.clear();
 }
 
 void CommandBuffer::passSplits(uint64_t out[4]) {

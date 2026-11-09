@@ -344,7 +344,13 @@ public:
     static void passSplits(uint64_t out[4]);
     // (redfin hmv8) extended-range copies so far: [0] decoded on the processor (all), [1] of them over an IOSurface,
     // [2] ring barriers before such a decode (HM_XR_SYNC), [3] microseconds waited in them, [4] barriers timed out
-    static void xrStats(uint64_t out[5]);
+    // (redfin hmv10) [5] decodes deferred to the commit (HM_XR_LATE), [6] of them checked at completion (HM_XR_CHECK),
+    // [7] of those whose rows had changed by then (another process's GPU wrote them after the decode: a stale copy drawn),
+    // [8] write-backs on the completion thread (HM_XR_WB_SYNC), [9] microseconds in them
+    static void xrStats(uint64_t out[10]);
+    // (redfin hmv10) HM_XR_LATE: the decodes deferred to the commit, done now (CommandQueue::submit, before the IB goes)
+    // after one ring barrier
+    void xrDecodeDeferred();
 private:
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
@@ -381,6 +387,13 @@ private:
     std::vector<std::shared_ptr<const void>> keptAny_;
     std::vector<std::pair<const Texture*, std::shared_ptr<Texture>>> xrDecoded_;   // (redfin hmv2) this buffer's decoded extended-range copies
     bool xrSynced_ = false;   // (redfin hmv8) HM_XR_SYNC's ring barrier done for this buffer
+    struct XrLate {   // (redfin hmv10) HM_XR_LATE: a copy to decode at commit, and its rows' sum then (HM_XR_CHECK)
+        std::shared_ptr<const Texture> source;
+        std::shared_ptr<Texture> copy;
+        uint64_t sum = 0;
+        bool decoded = false;
+    };
+    std::vector<XrLate> xrLate_;
     std::vector<std::pair<const void*, std::shared_ptr<void>>> xrDrawn_;   // (redfin hmv4) the XR companions it drew into (render.cpp)
     std::vector<std::function<void(CommandBuffer&)>> handlers_;
     std::mutex lock_;

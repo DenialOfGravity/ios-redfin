@@ -285,10 +285,10 @@ void hakios_metal_pass_splits(unsigned long long out[4]) {
     for (int i = 0; i < 4; i++) out[i] = v[i];
 }
 
-void hakios_metal_xr_stats(unsigned long long out[5]) {
-    uint64_t v[5];
+void hakios_metal_xr_stats(unsigned long long out[10]) {
+    uint64_t v[10];
     CommandBuffer::xrStats(v);
-    for (int i = 0; i < 5; i++) out[i] = v[i];
+    for (int i = 0; i < 10; i++) out[i] = v[i];
 }
 
 void hakios_metal_set_notice(void (*fn)(const char*)) { render::setNotice(fn); }
