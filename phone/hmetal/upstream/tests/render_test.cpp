@@ -19,6 +19,7 @@
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/compiler.hpp"
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
@@ -5871,6 +5872,8 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
 // time; before the first such decode of a buffer the ring is drained (an empty submission's fence waited for), so that
 // another process's GPU writes submitted before it have landed. Once per buffer, not per draw; none for a buffer without one.
 TEST(an_extended_range_surface_is_decoded_after_a_ring_barrier_once_a_buffer) {
+    CommandBuffer::setXrGpuForTesting(0);   // (redfin hmv11) the processor's decode, HM_XR_GPU=0
+    struct Back { ~Back() { CommandBuffer::setXrGpuForTesting(-1); } } back;
     Rig r;
     r.fake->addSurface(31, 64, 16, 256, 0x77333072u);   // 'w30r'
     TextureDesc d;
@@ -5915,6 +5918,8 @@ TEST(an_extended_range_surface_is_decoded_after_a_ring_barrier_once_a_buffer) {
 // the draw: rows another process's GPU writes between CoreAnimation's draw and its commit are what is drawn. And
 // HM_XR_CHECK compares the rows at completion with those decoded (unchanged here: nothing counted as stale).
 TEST(an_extended_range_surface_is_decoded_at_the_commit) {
+    CommandBuffer::setXrGpuForTesting(0);   // (redfin hmv11) the processor's decode, HM_XR_GPU=0
+    struct Back { ~Back() { CommandBuffer::setXrGpuForTesting(-1); } } back;
     Rig r;
     r.fake->addSurface(32, 64, 16, 256, 0x77333072u);   // 'w30r'
     TextureDesc d;
@@ -5970,6 +5975,69 @@ TEST(an_extended_range_surface_is_decoded_at_the_commit) {
         CHECK_EQ(texel[2], 0x3c00u);
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin hmv11) HM_XR_GPU (default): the deferred decode goes to the GPU in a buffer of its own, sent just before the
+// one that draws: no ring barrier, nothing decoded on the processor. Without a compiler (a host build without Mesa) the
+// surface falls back to the processor's decode after the barrier, counted.
+TEST(an_extended_range_surface_is_decoded_on_the_gpu_before_the_buffer) {
+    CommandBuffer::setXrGpuForTesting(1);
+    struct Back { ~Back() { CommandBuffer::setXrGpuForTesting(-1); } } back;
+    Rig r;
+    r.fake->addSurface(33, 64, 16, 256, 0x77333072u);   // 'w30r'
+    TextureDesc d;
+    d.format = PixelFormat::kBGR10_XR;
+    d.width = 64;
+    d.height = 16;
+    d.usage = kTextureUsageRead;
+    std::string why;
+    auto x = Texture::wrapSurface(*r.gpu, 33, d, &why);
+    if (x == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    auto t = target(r, 64, 16);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {x.get()};
+    fsb.samplers = {&smp};
+    uint64_t s0[10], s1[10], g0[6], g1[6];
+    CommandBuffer::xrStats(s0);
+    CommandBuffer::xrGpuStats(g0);
+    const uint32_t submits0 = r.fake->stats().submits;
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CommandBuffer::xrStats(s1);
+    CommandBuffer::xrGpuStats(g1);
+    CHECK_EQ(s1[5] - s0[5], 1u);   // one deferred decode either way
+    if (hasCompiler()) {
+        CHECK_EQ(g1[0] - g0[0], 1u);   // on the GPU
+        CHECK_EQ(g1[1] - g0[1], 1u);   // in one buffer of its own
+        CHECK_EQ(g1[2] - g0[2], 0u);
+        CHECK_EQ(s1[2] - s0[2], 0u);   // no ring barrier
+        CHECK_EQ(s1[1] - s0[1], 0u);   // no processor decode
+        CHECK_EQ(r.fake->stats().submits - submits0, 2u);   // the decode's buffer and the drawing one
+    } else {
+        CHECK_EQ(g1[0] - g0[0], 0u);
+        CHECK_EQ(g1[2] - g0[2], 1u);   // fell back
+        CHECK_EQ(s1[1] - s0[1], 1u);   // to the processor
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin hmv11) the GPU decode's tables are the processor's: code 384 is 0.0, 894 1.0, alpha clamped
+TEST(the_gpu_decode_tables_match_the_processor_decode) {
+    const std::vector<uint32_t>& t = Texture::xrGpuTable();
+    CHECK_EQ(t.size(), 3072u);
+    CHECK_EQ(t[384], 0u);
+    CHECK_EQ(t[894], 0x3c00u);
+    CHECK_EQ(t[1024 + 384], 0u);
+    CHECK_EQ(t[1024 + 894], 0x3c00u);
+    CHECK_EQ(t[2048 + 0], 0u);
+    CHECK_EQ(t[2048 + 1023], 0x3c00u);
 }
 
 // (redfin hmv10) HM_XR_WB_SYNC (default): the write-back is done when the buffer's completion is: the rows hold the XR

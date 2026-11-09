@@ -3613,9 +3613,11 @@ void CommandBuffer::xrStats(uint64_t out[10]) {
 
 // (redfin hmv11) HM_XR_GPU=1 (default): the deferred decodes on the GPU (xr_decode); 0: on the processor (hmv10)
 namespace {
+std::atomic<int> gXrGpuForce{-1};   // (CommandBuffer::setXrGpuForTesting) -1: the environment's
 bool xrGpuOn() {
     static const bool on = [] { const char* e = getenv("HM_XR_GPU"); return e == nullptr || e[0] != '0'; }();
-    return on;
+    const int f = gXrGpuForce.load();
+    return f < 0 ? on : f != 0;
 }
 // (redfin hmv11) HM_XR_GPU_VERIFY=N (default 4): the first N GPU decodes compared, at their completion, with a
 // processor decode of the same rows (every 8th row) and said; 0 none
@@ -3661,6 +3663,8 @@ const XrKernel* xrKernel(Gpu& gpu) {
 }
 }  // namespace
 
+void CommandBuffer::setXrGpuForTesting(int on) { gXrGpuForce = on; }
+
 void CommandBuffer::xrGpuStats(uint64_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = gXrGpu[i].load();
 }
@@ -3674,7 +3678,11 @@ std::shared_ptr<CommandBuffer> CommandBuffer::xrDecodeDeferred() {
         const uint64_t t0 = queue_.gpu().transport().nowNs();
         const XrKernel* xk = xrKernel(queue_.gpu());
         for (XrLate& l : xrLate_) {
-            if (xk == nullptr || l.source == nullptr || l.copy == nullptr) break;
+            if (l.source == nullptr || l.copy == nullptr) continue;
+            if (xk == nullptr) {
+                gXrGpu[2]++;
+                continue;
+            }
             const Texture& src = *l.source;
             const Texture& dst = *l.copy;
             const uint8_t xr = src.info().xr;

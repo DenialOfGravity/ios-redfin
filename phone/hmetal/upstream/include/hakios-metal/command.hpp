@@ -360,6 +360,8 @@ public:
     // a dispatch refused), [3] GPU decodes checked against a processor decode (HM_XR_GPU_VERIFY), [4] of them that differed,
     // [5] microseconds encoding the decode buffers
     static void xrGpuStats(uint64_t out[6]);
+    // (redfin hmv11) tests: 1 / 0 HM_XR_GPU on / off whatever the environment says, -1 the environment's again
+    static void setXrGpuForTesting(int on);
 private:
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
