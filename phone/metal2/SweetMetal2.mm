@@ -22,7 +22,7 @@
 
 extern "C" void sm2_logs(const char *s)
 {
-	char buf[700];
+	char buf[1500];	/* u-t: the T 5s line runs to ~800 (u-perfctr: T tu-perf lines up to 1400) */
 	int n = snprintf(buf, sizeof(buf), "MTL2[%d %s]: %s\n", getpid(), getprogname(), s);
 	if (n > (int)sizeof(buf) - 1)
 		n = (int)sizeof(buf) - 1;
@@ -144,6 +144,15 @@ static bool listed(void)
 			sm2_log("not listed (/var/local/mtl2-clients): no Metal device");
 			return;
 		}
+		/* Turnip's per-name BO census (TU_DEBUG=bos, every 300 submits: phone/turnip/patches/0101) into
+		 * /var/local/tubos/NAME-PID.log while /var/local/tubos exists (mode 777) */
+		if (access("/var/local/tubos", W_OK) == 0) {
+			char log[256];
+			snprintf(log, sizeof(log), "/var/local/tubos/%s-%d.log", getprogname(), getpid());
+			setenv("TU_DEBUG", "bos", 1);
+			setenv("MESA_LOG_FILE", log, 1);
+			sm2_log("BO census -> %s", log);
+		}
 		NSString *bundle = [[NSBundle bundleForClass:[SweetMTL2Device class]] bundlePath];
 		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
 		char cache[256];
@@ -166,6 +175,13 @@ static bool listed(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		/* the runtime's VkPipeline makings count into the telemetry (V row) */
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
+		/* u-t (r31): backboardd's frame timeline ("native-metal: T 5s" lines, Turnip's pass times) on unless
+		 * /var/local/mtl2-env says SWEET_TIMELINE=0; the shadow-copy repack (bridge 0104) off unless it says
+		 * SWEET_SHADOW_REPACK=1 (it changed nothing measurable); SWEET_TU_GPU_WAIT=1 lets Turnip leave its
+		 * waits on submitted fences to the GPU (phone/turnip/patches/0105) */
+		if (!strcmp(getprogname(), "backboardd"))
+			setenv("SWEET_TIMELINE", "1", 0);
+		setenv("SWEET_SHADOW_REPACK", "0", 0);
 		/* debugging: KEY=VALUE lines of /var/local/mtl2-env into this process's environment */
 		if (FILE *ef = fopen("/var/local/mtl2-env", "r")) {
 			char line[256];
@@ -179,6 +195,23 @@ static bool listed(void)
 				}
 			}
 			fclose(ef);
+		}
+		/* r34: Mesa's shader disk cache (Turnip is built with it) in this process's m2v cache directory: compiled ir3 shaders are
+		 * found across restarts even where the runtime's per-making VkPipelineCache records miss. SWEET_MESA_CACHE=0 turns it off. */
+		{
+			const char *knob = getenv("SWEET_MESA_CACHE");
+			if (knob && !strcmp(knob, "0")) {
+				setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+				sm2_log("Mesa shader cache off (SWEET_MESA_CACHE=0)");
+			} else {
+				char mesa[300];
+				snprintf(mesa, sizeof(mesa), "%s/mesa", cache);
+				mkdir(mesa, 0777);
+				setenv("MESA_SHADER_CACHE_DIR", mesa, 0);
+				setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 0);
+				setenv("MESA_SHADER_CACHE_DISABLE", "false", 0);
+				sm2_log("Mesa shader cache %s (%s)", getenv("MESA_SHADER_CACHE_DIR"), access(mesa, W_OK) == 0 ? "writable" : "NOT writable");
+			}
 		}
 		/* debugging: Turnip options for this process from /var/local/mtl2-tu-debug (TU_DEBUG), its log to /var/local/turnip-<proc>.log */
 		{
@@ -200,11 +233,22 @@ static bool listed(void)
 		uint64_t registryID = 0;
 		IORegistryEntryGetRegistryEntryID(port, &registryID);
 		double t0 = CFAbsoluteTimeGetCurrent();
-		@try {
-			device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
-		} @catch (NSException *e) {
-			sm2_log("device: exception %s", e.reason.UTF8String);
-			device = nil;
+		/*
+		 * rotfb3: a relaunched backboardd opened its device while the kernel was still freeing the crashed one's GPU pool
+		 * (r62b: "device refused: device: OutOfMemory(Device)" at 3979.2 s, the old client's 438 MB freed by 3983.2 s), and
+		 * stayed on Core Animation's CPU renderer. An OutOfMemory refusal is tried again, once a second, up to 8 times.
+		 */
+		for (int attempt = 0; attempt < 9; attempt++) {
+			@try {
+				device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
+			} @catch (NSException *e) {
+				sm2_log("device: exception %s", e.reason.UTF8String);
+				device = nil;
+			}
+			if (device || !strstr(nmb_last_error(), "OutOfMemory") || attempt == 8)
+				break;
+			sm2_log("device refused (%s): again in 1 s (%d of 8)", nmb_last_error(), attempt + 1);
+			sleep(1);
 		}
 		sm2_log("device %s in %.0f ms (cache %s)%s%s", device ? [[device name] UTF8String] : "refused",
 			(CFAbsoluteTimeGetCurrent() - t0) * 1000, cache, device ? "" : ": ", device ? "" : nmb_last_error());
@@ -215,6 +259,20 @@ static bool listed(void)
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return YES; }), "B16@0:8");
+		/*
+		 * Render-target rotation: _MTLDevice answers YES, so Core Animation draws its landscape framebuffer as a
+		 * rotated (rotation 1/3) texture over the portrait panel surface. metal2vulkan holds such a texture through a
+		 * shadow image and a rotation kernel copy in and out of every pass: ~220 ms of GPU a frame on the Adreno 620
+		 * (r62b: GPU 99% busy, 30-60 of 60 frames a second dropped, landscape after ~10 s with no animation). Answering
+		 * NO makes CA keep the portrait framebuffer and rotate in its own composite, as on GPUs without the feature.
+		 * /var/local/mtl2-env SWEET_RT_ROTATION=1 keeps Metal's answer.
+		 */
+		const char *rt = getenv("SWEET_RT_ROTATION");
+		if (device && !(rt && atoi(rt))) {
+			class_replaceMethod(object_getClass(device), sel_registerName("supportsRenderTargetTextureRotation"),
+					    imp_implementationWithBlock(^BOOL(id me) { (void)me; return NO; }), "B16@0:8");
+			sm2_log("render-target rotation: answered NO (SWEET_RT_ROTATION=1 keeps Metal's)");
+		}
 		/* image bases, for symbolicating pstack samples (atos -o out/SweetMetal2.dSYM -l BASE ADDR) */
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
@@ -223,6 +281,19 @@ static bool listed(void)
 		if (vk)
 			dladdr(vk, &tu);
 		sm2_log("images: SweetMetal2 %p, libvulkan_freedreno %p", self.dli_fbase, tu.dli_fbase);
+		/* u-t: Turnip's pass timeline report (phone/turnip/patches/0105) for the frontend's T line */
+		if (th) {
+			native_bridge_metal_pass_report = (size_t (*)(char *, size_t, unsigned))dlsym(th, "sweet_tu_pass_report");
+			/* u-tr: Turnip's CPU profile (phone/turnip/patches/0110, SWEET_TU_CPUPROF=1) */
+			native_bridge_metal_cpu_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_cpu_report");
+			/* u-ub: Turnip's UBWC census (phone/turnip/patches/0111; SWEET_UBWC from /var/local/mtl2-env) */
+			native_bridge_metal_ubwc_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_ubwc_report");
+			native_bridge_metal_draw_report = (size_t (*)(char *, size_t))dlsym(th, "sweet_tu_draw_report");
+			/* u-perfctr: Turnip 0113's hardware counters (SWEET_TU_PERFCTR=<preset>) */
+			native_bridge_metal_perf_report = (size_t (*)(char *, size_t, unsigned))dlsym(th, "sweet_tu_perf_report");
+			if (!native_bridge_metal_pass_report && !strcmp(getprogname(), "backboardd"))
+				sm2_log("timeline: sweet_tu_pass_report not exported by Turnip: no pass times");
+		}
 		/* backboardd: the frontend's counters every 10 s, into /var/local/mtl2.log only (with /var/local/mtl2-telemetry) */
 		if (device && !strcmp(getprogname(), "backboardd"))
 			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -232,7 +303,7 @@ static bool listed(void)
 						continue;
 					static char text[8192];
 					native_bridge_metal_telemetry(text, sizeof(text));
-					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
+					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND | O_CREAT, 0666);	/* made if missing (r19a had none) */
 					if (fd >= 0) {
 						dprintf(fd, "MTL2[%d %s]: telemetry\n%s", getpid(), getprogname(), text);
 						close(fd);

@@ -1,0 +1,144 @@
+name: userland
+
+# iOS 16 arm64 userland for SSH into the phone: dropbear (root-only, pubkey
+# only) and dash. Built with the runner's Xcode iOS SDK, ad hoc signed.
+# Also wland (phone/wifi, sunfish constants), fastrpcd (phone/fastrpc, GPL-3.0+) and phone/tools. Install with
+# tools/sunfish-install-ssh.sh over the kernel file server.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [sunfish, redfin]
+    paths: [.github/workflows/userland.yml, "phone/**"]
+
+env:
+  DROPBEAR_VER: "2022.83"
+  DASH_VER: "0.5.12"
+  TOYBOX_VER: "0.8.11"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Toolchain
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          mkdir -p $HOME/bin
+          printf '#!/bin/sh\nexec %s -arch arm64 -isysroot %s -miphoneos-version-min=16.0 "$@"\n' \
+            "$(xcrun -f clang)" "$SDK" > $HOME/bin/ios-cc
+          chmod +x $HOME/bin/ios-cc
+          echo "$HOME/bin" >> $GITHUB_PATH
+          mkdir -p out
+
+      - name: dropbear
+        run: |
+          curl -fsSL https://matt.ucc.asn.au/dropbear/releases/dropbear-$DROPBEAR_VER.tar.bz2 | tar xj
+          cd dropbear-$DROPBEAR_VER
+          cat > localoptions.h <<'EOF'
+          #define DROPBEAR_SVR_PASSWORD_AUTH 0
+          #define DROPBEAR_SVR_PAM_AUTH 0
+          #define DROPBEAR_SVR_PUBKEY_AUTH 1
+          #define DROPBEAR_SVR_MULTIUSER 1
+          #define DROPBEAR_X11FWD 0
+          #define DEFAULT_PATH "/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          #define DEFAULT_ROOT_PATH "/var/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          #define DSS_PRIV_FILENAME "/private/etc/dropbear/dropbear_dss_host_key"
+          #define RSA_PRIV_FILENAME "/private/etc/dropbear/dropbear_rsa_host_key"
+          #define ECDSA_PRIV_FILENAME "/private/etc/dropbear/dropbear_ecdsa_host_key"
+          #define ED25519_PRIV_FILENAME "/private/etc/dropbear/dropbear_ed25519_host_key"
+          EOF
+          ./configure --host=aarch64-apple-darwin CC=ios-cc --disable-zlib --disable-syslog \
+            --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
+            --disable-loginfunc --disable-pututline --disable-pututxline --disable-harden
+          make -j4 PROGRAMS="dropbear dropbearkey scp dbclient" MULTI=1
+          cp dropbearmulti ../out/
+
+      - name: dash
+        run: |
+          curl -fsSL http://gondor.apana.org.au/~herbert/dash/files/dash-$DASH_VER.tar.gz | tar xz
+          cd dash-$DASH_VER
+          # iOS 16 lacks strchrnul (newer SDKs weak-import it -> PC 0 crash)
+          ./configure --host=aarch64-apple-darwin CC=ios-cc CC_FOR_BUILD=clang \
+            ac_cv_func_strchrnul=no
+          make -j4
+          cp src/dash ../out/
+
+      - name: toybox
+        continue-on-error: true
+        run: |
+          brew install gnu-sed >/dev/null
+          export PATH="$(brew --prefix gnu-sed)/libexec/gnubin:$PATH"
+          curl -fsSL https://landley.net/toybox/downloads/toybox-$TOYBOX_VER.tar.gz | tar xz
+          cd toybox-$TOYBOX_VER
+          # iOS SDK has no sys/disk.h (macOS block-device ioctls used by portability.c)
+          mkdir -p ios-inc/sys
+          printf '#include <sys/ioctl.h>\n#include <stdint.h>\n#define DKIOCGETBLOCKSIZE _IOR(%s, 24, uint32_t)\n#define DKIOCGETBLOCKCOUNT _IOR(%s, 25, uint64_t)\n' "'d'" "'d'" > ios-inc/sys/disk.h
+          make macos_defconfig HOSTCC=cc
+          CC=ios-cc HOSTCC=cc CFLAGS="-I$PWD/ios-inc" make -j4 toybox
+          cp toybox ../out/
+
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: wland + phone tools
+        run: |
+          cd repo
+          sh phone/wifi/build.sh
+          cp phone/wifi/out/wland ../out/
+          sh phone/sensors/test.sh > ../out/sensd-test.log 2>&1 || { echo "::warning::sensd host tests failed"; tail -20 ../out/sensd-test.log; }
+          sh phone/sensors/build.sh && cp phone/sensors/out/sensd ../out/ || echo "::warning::sensd failed"
+          sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/bluetool phone/bt/out/tlv_test.log ../out/
+          sh phone/fastrpc/test.sh > ../out/fastrpcd-test.log 2>&1 || { echo "::warning::fastrpcd host tests failed"; tail -20 ../out/fastrpcd-test.log; }
+          sh phone/fastrpc/build.sh
+          cp phone/fastrpc/out/fastrpcd phone/fastrpc/org.iosonpixel.fastrpcd.plist ../out/
+          bash phone/tools/build.sh || echo "::warning::some phone tools failed"
+          sh phone/haptics/build.sh && cp phone/haptics/out/SweetHaptics.dylib ../out/ || echo "::warning::SweetHaptics.dylib failed"
+          sh phone/fps/build.sh && cp phone/fps/out/SweetFPS.dylib ../out/ || echo "::warning::SweetFPS.dylib failed"
+          # (the build's output goes out with the files: the run's own logs cannot be fetched from Claude's container)
+          sh phone/audio/build.sh > ../out/audio-build.log 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test phone/audio/out/camera_test phone/audio/out/camera_avtest phone/audio/out/mg_test phone/audio/out/vt_test phone/audio/out/mic_test ../out/ || { echo "::warning::RedwoodAudio.driver failed"; tail -40 ../out/audio-build.log; }
+          for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump autolock; do
+            [ -f phone/tools/out/$t ] && cp phone/tools/out/$t ../out/ || true
+          done
+
+      - name: Check and sign
+        run: |
+          cd out
+          for b in $(find . -maxdepth 1 -type f | sed "s|^./||"); do
+            if nm -m "$b" | grep -q "weak external"; then
+              echo "::warning::$b has weak imports:"; nm -m "$b" | grep "weak external"
+            fi
+            case $b in dash|dropbearmulti|toybox) codesign -f -s - "$b";; esac  # others keep their entitlements
+            file "$b"
+          done
+          find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-userland
+          path: out/
+
+      # The kernel also goes to branch builds-userland (one force-pushed commit), so it can be fetched with git
+      # where artifact downloads are blocked: git fetch --depth 1 origin builds-userland
+      - name: Publish to the builds-userland branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          P=$RUNNER_TEMP/publish
+          rm -rf "$P" && mkdir -p "$P" && cd "$P"
+          git init -q -b builds-userland
+          cp -R "$GITHUB_WORKSPACE"/out/. .
+          printf 'source %s\nref %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_RUN_ID" > BUILD.txt
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "iOS userland from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-userland
+          # Also to builds-userland-<ref>: workstream branches building at the same time must not clobber each other
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-userland:builds-userland-"$GITHUB_REF_NAME"

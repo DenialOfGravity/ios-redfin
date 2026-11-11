@@ -7,8 +7,18 @@ bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT
 git init -q "$bearssl_tmp"
-git -C "$bearssl_tmp" fetch -q --depth 1 \
-    https://www.bearssl.org/git/BearSSL "$bearssl_sha"
+# bearssl.org first; GitHub mirrors holding the same pinned commit as fallbacks
+# (the sha check below guarantees identical sources whichever one answers).
+bearssl_ok=0
+for bearssl_url in https://www.bearssl.org/git/BearSSL \
+    https://github.com/edmaren/BearSSL https://github.com/ckdur/bearssl \
+    https://github.com/mitchcapper/BearSSL https://github.com/webcpporg/bearssl; do
+    if git -C "$bearssl_tmp" fetch -q --depth 1 "$bearssl_url" "$bearssl_sha"; then
+        bearssl_ok=1; break
+    fi
+    echo "bearssl: $bearssl_url failed, trying the next mirror" >&2
+done
+[[ $bearssl_ok == 1 ]]
 git -C "$bearssl_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
 python3 - "$bearssl_tmp" <<'PY'

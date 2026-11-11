@@ -25,3 +25,10 @@ tools/flamebridge/FlameBridge.app/Contents/MacOS/
 tools/flamebridge/FlameBridge.app/Contents/_CodeSignature/
 *.ipa
 .DS_Store
+
+# redfin recon output (live DT has the serial)
+recon/
+
+# devices/<dev>/pull-firmware.sh output: the vendor's firmware, never committed
+fw-redfin/
+fw-*/

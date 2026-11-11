@@ -15,8 +15,11 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      clean:
+        description: ignore the incremental build cache (full build)
+        default: "false"
   push:
-    branches: [main]
+    branches: [main, redfin]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -31,6 +34,9 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -67,12 +73,79 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      # Incremental builds: dxb/xnu (patched source), dxb/build/xnu.obj and the fakeroot (mig, ctf tools,
+      # libfirehose, headers) come from the last successful run. The new patch set is applied to a pristine
+      # copy of the source with build.sh's own patches(); rsync --checksum then copies only files whose
+      # content changed, so make recompiles just those. A miss or clean=true is the old full build.
+      - name: Restore incremental build cache
+        id: cache
+        if: inputs.clean != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/build/xnu.obj
+            dxb/fakeroot
+          key: xnu-inc-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: xnu-inc-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
+
+      - name: Re-patch cached source (changed files only)
+        if: steps.cache.outputs.cache-matched-key != ''
+        working-directory: dxb
+        run: |
+          set -euo pipefail
+          P=$RUNNER_TEMP/prep
+          rm -rf "$P" && mkdir -p "$P"
+          cp -a xnu "$P/xnu"
+          (cd "$P/xnu" && git checkout -q -- . && git clean -fdqx)
+          ln -s "$PWD/patches" "$P/patches"
+          (
+            WORK_DIR=$P CODEQL=0 KDKROOT=${KDKROOT:-/nonexistent}
+            running() { echo "$*"; }; warning() { echo "$*"; }; error() { echo "$*" >&2; }
+            eval "$(sed -n '/^patches() {/,/^}/p' build.sh)"
+            patches
+          )
+          rsync -rlc --no-times --delete --exclude .git --itemize-changes "$P/xnu/" xnu/ | grep -v '^\.' | head -50 || true
+          # build.sh must not re-run its seds over the tree (they rewrite files and bump mtimes)
+          sed -i '' 's/^    patches$/    true # patched by the cache step/' build.sh
+          rm -rf build/xnu.obj/kernel.* fakeroot/System/Library/Kernels/kernel.*
+
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # On a failed build: the compiler's errors to branch builds-xnu-log (fetchable with git where logs are not)
+      - name: Publish the build errors
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          P=$RUNNER_TEMP/errlog
+          rm -rf "$P" && mkdir -p "$P" && cd "$P"
+          git init -q -b builds-xnu-log
+          grep -n -E 'error:|error generated|errors generated|\*\*\* \[' "$RUNNER_TEMP/build.log" | head -300 > errors.txt || true
+          grep -n -B3 -A12 -E ' error:' "$RUNNER_TEMP/build.log" | head -1500 > errors-context.txt || true
+          tail -300 "$RUNNER_TEMP/build.log" > tail.txt || true
+          printf 'source %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > BUILD.txt
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "build errors of $GITHUB_RUN_ID"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu-log
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu-log:builds-xnu-log-"$GITHUB_REF_NAME"
+
+      - name: Save incremental build cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dxb/xnu
+            dxb/build/xnu.obj
+            dxb/fakeroot
+          key: xnu-inc-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
 
       - name: Package build tree for local compiles
         if: always()
@@ -122,3 +195,24 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # The kernel also goes to branch builds-xnu (one force-pushed commit), so it can be fetched with git
+      # where artifact downloads are blocked: git fetch --depth 1 origin builds-xnu
+      - name: Publish to the builds-xnu branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          P=$RUNNER_TEMP/publish
+          rm -rf "$P" && mkdir -p "$P" && cd "$P"
+          git init -q -b builds-xnu
+          for f in "$GITHUB_WORKSPACE"/out/kernel.*; do [ -f "$f" ] && gzip -9 -c "$f" > "$(basename "$f").gz"; done  # not the .link dirs
+          cp "$GITHUB_WORKSPACE/out/SHA256SUMS" .
+          printf 'source %s\nref %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_RUN_ID" > BUILD.txt
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "xnu kernel from $GITHUB_REF_NAME ${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu
+          # Also to builds-xnu-<ref>: workstream branches building at the same time must not clobber each other
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" builds-xnu:builds-xnu-"$GITHUB_REF_NAME"

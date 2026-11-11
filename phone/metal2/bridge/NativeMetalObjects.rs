@@ -21,6 +21,7 @@ use metal2vulkan_runtime::{
     ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    IoSurfaceYCbCr, SurfaceYCbCrMatrix,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -688,6 +689,16 @@ pub struct NmbTextureDescriptor {
 
 pub struct NmbTexture(Texture);
 
+/// SweetMetal2: a texture descriptor's `rotation` (SPI, 0-4) and `framebufferOnly`, which `NmbTextureDescriptor` does not carry.
+/// Core Animation's landscape framebuffer is a 2436x1125 texture of rotation 1 or 3 over the panel's portrait 1125x2436 surface
+/// (4608-byte rows): without its rotation the runtime checks 2436 x 4 = 9744 bytes a row against 4608 and refuses it (RowPitch),
+/// every frame, so backboardd composites nothing while the UI is in landscape.
+#[repr(C)]
+pub struct NmbTextureExtras {
+    pub rotation: u64,
+    pub framebuffer_only: u64,
+}
+
 fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescriptor, String> {
     let d = get(d)?;
     let mut out = TextureDescriptor::default();
@@ -725,6 +736,153 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
         };
         Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
     })
+}
+
+/// The facts of a planar IOSurface a two-plane YCbCr texture reads (SweetMetal2: `NmbSurfaceFacts` in the header). `matrix` is the
+/// surface's YCbCr matrix attachment: 0 none, 1 ITU_R_601_4, 2 ITU_R_709_2, 3 ITU_R_2020, 4 SMPTE_240M_1995, 5 another value.
+#[repr(C)]
+pub struct NmbSurfaceFacts {
+    pub pixel_format: u32,
+    pub matrix: u32,
+    pub plane: u64,
+    pub width: u64,
+    pub height: u64,
+    pub chroma_offset: u64,
+    pub chroma_bytes_per_row: u64,
+}
+
+/// `newTextureWithDescriptor:iosurface:plane:` over a planar surface's buffer with the surface's facts: a two-plane YCbCr texture
+/// (`YCBCR8_420_2P` over a `420f`/`420v` surface's plane 0) is then the runtime's converted texture (`ycbcr.rs`: the GPU converts the planes,
+/// bilinear chroma, the surface's matrix and range), other formats are the plane as `nmb_texture_new_on_buffer` makes it.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
+                                             bytes_per_row: u64, planar: bool, facts: *const NmbSurfaceFacts) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let descriptor = texture_descriptor(descriptor)?;
+        let buffer = &get(buffer)?.0;
+        let f = get(facts)?;
+        let mut ycbcr = IoSurfaceYCbCr::new(f.pixel_format, f.plane, [f.width, f.height], f.chroma_offset, f.chroma_bytes_per_row);
+        let matrix = match f.matrix {
+            1 => Some(SurfaceYCbCrMatrix::from_attachment("ITU_R_601_4")),
+            2 => Some(SurfaceYCbCrMatrix::from_attachment("ITU_R_709_2")),
+            3 => Some(SurfaceYCbCrMatrix::from_attachment("ITU_R_2020")),
+            4 => Some(SurfaceYCbCrMatrix::from_attachment("SMPTE_240M_1995")),
+            5 => Some(SurfaceYCbCrMatrix::from_attachment("")),
+            _ => None,
+        };
+        if let Some(matrix) = matrix {
+            ycbcr = ycbcr.with_matrix(matrix);
+        }
+        let plane = IoSurfacePlane::new(offset, bytes_per_row, planar).with_ycbcr(ycbcr);
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, plane);
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over surface"))?)))
+    })
+}
+
+/// rotfb4: the runtime's rotated-texture copies since the process began: copies in, copies in skipped (the frame still held the
+/// plane), copies back, bytes moved, kernel dispatches.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_rotated_copy_stats(out: *mut u64) {
+    guard((), || {
+        let out = get_mut(out as *mut [u64; 5])?;
+        *out = metal2vulkan_runtime::rotated_copy_stats();
+        Ok(())
+    })
+}
+
+/// rotfb4: the CPU wrote a rotated texture's plane (its IOSurface's seed moved): every rotated frame is copied in again.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_rotated_planes_written() {
+    metal2vulkan_runtime::rotated_planes_written();
+}
+
+/// `nmb_texture_new_on_buffer` over an IOSurface plane with the descriptor's rotation and framebufferOnly (`NmbTextureExtras`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_on_surface_rotated(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
+                                                     bytes_per_row: u64, planar: bool, extras: *const NmbTextureExtras) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let mut descriptor = texture_descriptor(descriptor)?;
+        let x = get(extras)?;
+        descriptor.rotation = x.rotation;
+        descriptor.framebuffer_only = x.framebuffer_only != 0;
+        let buffer = &get(buffer)?.0;
+        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, planar));
+        Ok(boxed(NmbTexture(texture.map_err(e("texture over rotated surface"))?)))
+    })
+}
+
+/// A texture's `rotation` and `framebufferOnly` (`NmbTextureExtras`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_extras(texture: *const NmbTexture, out: *mut NmbTextureExtras) {
+    guard((), || {
+        let t = &get(texture)?.0;
+        let out = get_mut(out)?;
+        *out = NmbTextureExtras { rotation: t.rotation(), framebuffer_only: u64::from(t.framebuffer_only()) };
+        Ok(())
+    })
+}
+
+/// SweetMetal2: the generation of a two-plane YCbCr texture's planes (its surface's seed + 1; 0 = unknown): the runtime converts them
+/// again only when it changes (bridge patch 0103). False for any other texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_converted_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || Ok(get(texture)?.0.set_converted_generation(generation)))
+}
+
+/// SweetMetal2: the surface seed + 1 (0 = the bytes changed some other way) a shadowed texture over a surface's bytes is bound at: its
+/// copy in is skipped while its image holds that seed's bytes (bridge patch 0107, env SWEET_SHADOW_SEED=1). False for any other texture
+/// or with the knob off.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_bytes_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || Ok(get(texture)?.0.set_bytes_generation(generation)))
+}
+
+/// SweetMetal2: the runtime's shadow copy counts since the process started (bridge patch 0104), into the caller's five words:
+/// copies recorded, their texel bytes, of them repacked through the kernel, YCbCr copies in skipped, linear layouts refused.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_shadow_counts(out: *mut u64) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let counts = metal2vulkan_runtime::sweet_counts::snapshot();
+    // SAFETY: the caller passes five writable words.
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, counts.len()) };
+    true
+}
+
+/// SweetMetal2: whether the runtime times its render encoders' steps (bridge patch 0106, env `SWEET_DRAWSTAT=1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat_on() -> bool {
+    metal2vulkan_runtime::sweet_drawstat::on()
+}
+
+/// SweetMetal2 (u-combo): bridge patch 0111's scratch trim from the next pass on, from the frontend's live knobs
+/// (/var/local/mtl2-live SWEET_M2V_SCRATCH): 0 off, 1 on, negative = the env value (SWEET_M2V_SCRATCH at startup) again.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_scratch_live(value: i32) {
+    metal2vulkan_runtime::sweet_drawstat::set_scratch_live(value.clamp(-1, 1) as i8);
+}
+
+/// SweetMetal2: the runtime's render encoder step times and counts since the process started (bridge patch 0106), as
+/// (nanoseconds, count) pairs into the caller's `2 * capacity` words: the number of steps written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat(out: *mut u64, capacity: usize) -> usize {
+    if out.is_null() || capacity == 0 {
+        return 0;
+    }
+    // SAFETY: the caller passes `2 * capacity` writable words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2 * capacity) };
+    metal2vulkan_runtime::sweet_drawstat::snapshot(out)
+}
+
+/// SweetMetal2: the name of render encoder step `index` (a static NUL-terminated string), or null past the last.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_sweet_drawstat_name(index: usize) -> *const c_char {
+    static NAMES: std::sync::OnceLock<Vec<std::ffi::CString>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        metal2vulkan_runtime::sweet_drawstat::NAMES.iter().map(|n| std::ffi::CString::new(*n).unwrap_or_default()).collect()
+    });
+    names.get(index).map_or(std::ptr::null(), |n| n.as_ptr())
 }
 
 /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
@@ -1458,6 +1616,45 @@ pub extern "C" fn nmb_command_buffer_gpu_time(command_buffer: *const NmbCommandB
         let command_buffer = &get(command_buffer)?.0;
         let time = if end { command_buffer.gpu_end_time() } else { command_buffer.gpu_start_time() };
         time.map_err(e("GPU time"))
+    })
+}
+
+/// SweetMetal2 (u-t): the host times at which the scheduler began submitting the command buffer's first batch (`end` false) and
+/// finished submitting its last (Metal's `kernelStartTime`/`kernelEndTime`), in seconds of the runtime's host clock (as the GPU
+/// times). 0 where it was never submitted.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_kernel_time(command_buffer: *const NmbCommandBuffer, end: bool) -> f64 {
+    guard(0.0, || {
+        let command_buffer = &get(command_buffer)?.0;
+        Ok(if end { command_buffer.kernel_end_time() } else { command_buffer.kernel_start_time() })
+    })
+}
+
+/// SweetMetal2 (u-t): the runtime's submission counts the frame timeline reports (`WorkCounts`, totals since the device was made), in
+/// this order: vkQueueSubmit calls, VkCommandBuffers submitted, commits handed to another thread's pass, internal submissions,
+/// staging submissions, queue drains (a full wait for the device's queues), timeline waits, encoders re-encoded, shadow copies:
+/// nine words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_sched_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        let c = get(device)?.0.work_counts();
+        let words = [
+            c.queue_submissions,
+            c.command_buffers_submitted,
+            c.commits_handed_off,
+            c.internal_submissions,
+            c.staging_submissions,
+            c.queue_drains,
+            c.timeline_waits,
+            c.encoders_reencoded,
+            c.shadow_copies,
+        ];
+        // SAFETY: the header's nine words.
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+        Ok(true)
     })
 }
 

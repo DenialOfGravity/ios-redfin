@@ -6,7 +6,10 @@
 #   openapp  BUNDLE_ID [URL]: launch an app                   lsreg    LaunchServices registration (no uicache)
 #   netsvc   SystemConfiguration network service for an IF    nettest  DNS, TCP, then HTTPS
 #   oslog    stream the unified log                           prefs    CFPreferences read/write (no defaults)
+#   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
+#   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
+#   sweetmon    monitor daemon: samples, klog tail, kdebug traces over TCP 5150 (docs/redfin/sweetmon.md)
 #   expt, exq, runmigrator: one-off probes of ExtensionFoundation and DataMigration (runmigrator needs
 #   com.apple.migrationpluginwrapper's entitlements, not in git)
 set -euo pipefail
@@ -23,9 +26,16 @@ build() {	# NAME SOURCE [FLAGS...]
 		codesign -f -s - "out/$name"
 	fi
 }
-for c in membw pstack psx; do build $c $c.c; done
-for m in expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
+for c in membw pstack psx sweettrace simpin; do build $c $c.c; done
+for m in autolock expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
+build memwarn memwarn.c
+build pmem pmem.c
+build a2s a2s.c
+build sweetmon sweetmon.c lz4/lz4.c -DSWEETMON_VERSION="\"$(git rev-parse --short HEAD 2>/dev/null || date +%F)\""
+build imgdump imgdump.c -lobjc
 ls -l out
+# Venus hardware video (redfin track V, off unless /var/local/venus.on): its own build, copies into the userland output
+sh ../video/build.sh || echo "WARN phone/video build failed"

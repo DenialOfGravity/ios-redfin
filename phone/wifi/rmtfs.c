@@ -19,7 +19,8 @@
 #include "scm.h"
 
 #define RMTFS_DIR	"/var/local/fw/rmtfs"
-#define BUF_SIZE	0x200000u
+#define RMTFS_PA	0xE1000000ull	/* below 4 GB: see rmtfs_init */
+#define BUF_SIZE	0x280000u	/* redfin: modem asks 2621440 (DT rmtfs_sharedmem 0x280000); sunfish 2 MB */
 #define SECTOR		512
 
 enum { RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND };
@@ -52,27 +53,38 @@ int rmtfs_init(void)
 	struct timeval bt;
 	size_t btl = sizeof(bt);
 	sysctlbyname("kern.boottime", &bt, &btl, NULL, 0);
+	/* kern.boottime comes from the RTC (1970 here) and could repeat across reboots: kern.bootsessionuuid decides
+	   when both this boot and the file have one */
+	char uuid[40] = "-", fuuid[40] = "-";
+	btl = sizeof(uuid) - 1;
+	if (sysctlbyname("kern.bootsessionuuid", uuid, &btl, NULL, 0) || !uuid[0] || strchr(uuid, ' '))
+		snprintf(uuid, sizeof(uuid), "-");
 	FILE *f = fopen(RMTFS_DIR "/.buffer", "r");
 	long long fb = 0;
 	unsigned long long fpa = 0;
 	if (f) {
-		if (fscanf(f, "%lld %llx", &fb, &fpa) != 2)
+		if (fscanf(f, "%lld %llx %39s", &fb, &fpa, fuuid) < 2)
 			fpa = 0;
 		fclose(f);
 	}
-	if (fpa && fb == (long long)bt.tv_sec) {
+	int same = strcmp(uuid, "-") && strcmp(fuuid, "-") ? !strcmp(uuid, fuuid) : fb == (long long)bt.tv_sec;
+	if (fpa && same) {
 		buf_pa = fpa;
 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
 	} else {
-		uint64_t a = pm_alloc(BUF_SIZE + 0x2000, 0x1000);
-		if (!a)
-			return -1;
-		buf_pa = a + 0x1000;
+		/*
+		 * sunfish: the modem takes rmtfs buffer addresses as 32 bits; a
+		 * pm_alloc buffer above 4 GB (0x1_0613d000) was truncated and the
+		 * modem died with "XPU violation". Use fixed low RAM that XNU does
+		 * not manage, after radio.c's CE pool (0xE0000000 + 16 MB), with a
+		 * guard page on each side as msm_sharedmem.
+		 */
+		buf_pa = RMTFS_PA + 0x1000;
 		static const uint32_t src[] = { VMID_HLOS }, dst[] = { VMID_HLOS, VMID_MSS_MSA };
 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
 			return -1;
 		if ((f = fopen(RMTFS_DIR "/.buffer", "w"))) {
-			fprintf(f, "%lld %llx\n", (long long)bt.tv_sec, (unsigned long long)buf_pa);
+			fprintf(f, "%lld %llx %s\n", (long long)bt.tv_sec, (unsigned long long)buf_pa, uuid);
 			fclose(f);
 		}
 	}
@@ -158,7 +170,8 @@ void rmtfs_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	case RMTFS_ALLOC_BUFF: {
 		uint32_t size = 0;
 		qmi_get_u32(&m, 2, &size);
-		printf("rmtfs: alloc %u bytes for %u -> %llx\n", size, caller, (unsigned long long)buf_pa);
+		printf("rmtfs: alloc %u bytes for %u -> %s %llx (buffer %u)\n", size, caller,
+		       size <= BUF_SIZE ? "granted" : "REFUSED", (unsigned long long)buf_pa, BUF_SIZE);
 		if (size <= BUF_SIZE) {
 			qmi_tlv_result(&q, 0, 0);
 			qmi_tlv_u64(&q, 0x10, buf_pa);

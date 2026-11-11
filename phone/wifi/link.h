@@ -30,5 +30,7 @@ int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 	      const void *payload, uint32_t len);
 int qrtr_new_server(uint32_t service, uint32_t version, uint32_t instance, uint32_t port);
 int qrtr_resume_tx(const struct qrtr_hdr *h);
+int qrtr_kick(uint32_t our_port, uint32_t rnode, uint32_t rport);	/* unsolicited RESUME_TX (lost-resume recovery) */
+void link_queue_stats(unsigned *max, unsigned *dropped);
 
 #endif

@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the flame (Pixel 4, SM8150) live FDT. The kernel's
 built-in drivers still match the Redmi names (xiaomi,sweet, qcom,kryo470,
 sweet,display), so those stay next to the flame ones.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--camera] [--flash] [--backlight] [--gamut]
 """
 import hashlib, os, struct, sys
 
@@ -21,16 +21,24 @@ MEM_SIZE = 0x4d000000
 # limited below 4G. ABL puts the ramdisk (our payload) at 0x84700000 or, if
 # big, 0xc0000000, so XNU takes 0x1_00000000 up (same size as on the Redmi).
 HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
+# redfin (live DT /memory): DDR 0x80000000+0x3bb00000, 0xc0000000+3G, 0x180000000+4G = 8 GB, contiguous from
+# 0xc0000000 to 0x280000000 with no reserved-memory node above 4G (the CMA pools are below 4G). XNU takes all of
+# 0x100000000-0x27ec00000 (6 GiB - 20 MiB); the log stashes sit above it (LOGSTASH_*, shim/ramlog.c, sweet_ufs.c 1033)
+# and 0x27fc00000-0x280000000 is never touched (Linux's top-of-RAM reserved pages; ABL may use it).
+# Was 0xf8c00000 (sunfish's 6 GB phone: RAM ends 0x1fcc00000): 2 GiB of the Pixel 5 sat unused.
+HIGH_MEM_SIZE = 0x17ec00000
+PANIC_LOG_PA_REDFIN = 0x27f000000   # pram, 512 KiB
+MIRROR_PA_REDFIN = 0x27f200000      # sweet_ufs.c SWEET_MIRROR_PA: 4 KiB header + 4 MiB ring
+MAILBOX_PA_REDFIN = 0x27f800000     # shim/ramlog.c MAILBOX_PA
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 # cont_splash_region; ABL scans it out (autorefreshed command-mode panel)
-FB, FB_SIZE = 0x9c400000, 0x2400000
+FB, FB_SIZE = 0xa0000000, 0x2300000  # redfin (live DT); sunfish 0x9c000000/0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2280, 1080 * 4
+FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -62,13 +70,66 @@ def d22ap_product(path=D22AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+
+def d22ap_product_child(child, path=D22AP_ADT):
+    """Properties of /product/CHILD of the real D22AP tree (None if missing). /product/haptics
+    ("closed-loop", MobileGestalt's DeviceSupportsClosedLoopHaptics) makes iOS play its haptics as
+    waveforms on the Actuator audio device (HackiOS mkidentity.py); without it UIKit plays none."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for g in c.children:
+                d = dict((k, v) for k, f, v in g.props)
+                if d.get('name') == cstr(child):
+                    return [(k, v) for k, f, v in g.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
+def d22ap_backlight(max_nits, path=D22AP_ADT):
+    """--backlight (redfin 0973, opt-in): the D22AP tree's /backlight node (max-nit-value, Nits2DAC and marketing
+    tables, restriction factors), for anything in the userland that reads the panel's nits from the device tree.
+    max-nit-value, aab-constraint-lmax and LmaxProduct (16.16) are redfin's panel (S6E3HC2, 500 nits, as
+    SweetFramebuffer.cpp's 500 nits <-> level 1023), not the iPhone X's; LminProduct (2 nits) and LmidProduct (155)
+    stay. The function-* references (iBoot callbacks into nodes we do not have) are left out."""
+    if not os.path.exists(path):
+        print(f'warning: {path} missing, no /backlight node', file=sys.stderr)
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'backlight\0':
+            props = [(k, v) for k, f, v in c.props
+                     if not f and k not in ('name', 'AAPL,phandle') and not k.startswith('function-')]
+            # nits (u32) and 16.16 nits: the panel's maximum instead of the iPhone X's 750 / 674 / 675
+            over = {'max-nit-value': struct.pack('<I', max_nits), 'aab-constraint-lmax': struct.pack('<I', max_nits),
+                    'LmaxProduct': struct.pack('<I', max_nits << 16)}
+            return [(k, over.get(k, v)) for k, v in props]
+    print(f'warning: {path}: no /backlight node', file=sys.stderr)
+    return None
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
 
-PANIC_LOG_PA = 0x1fd000000
+PANIC_LOG_PA = PANIC_LOG_PA_REDFIN  # was 0x1f9000000 (sunfish), inside XNU's range since 1033
 PANIC_LOG_SIZE = 0x80000
+
+
+# CAMERA (HackiOS xnuloader/loader.c, cam=5 / torch=N): MobileGestalt finds the cameras at
+# IODeviceTree:/arm-io/isp (its camera-rear / camera-front: still-camera, rear-/front-facing-camera),
+# and SpringBoard shows Camera.app only then. The node has neither compatible nor device_type, so no
+# driver matches it. /product/camera "flash" is MobileGestalt's camera-flash: without it Control
+# Center has no flashlight button. Only what this phone has is said; the rest of the iPhone X's
+# camera node (pearl, burst, slow motion ...) is left out. MobileGestalt caches its answers: move
+# its cache aside once after changing these (/private/var/containers/Shared/SystemGroup/
+# systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist).
+def isp_node(ph):
+    return node('isp', [ph(), ('camera-rear', u32(1)), ('camera-front', u32(1))])
+
+
+def product_camera_node(ph, flash):
+    return node('camera', [ph()] + ([('flash', u32(1))] if flash else []))
 
 
 def node(name, props=(), children=()):
@@ -78,8 +139,11 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backlight=False, gamut=False):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    camera=True: /arm-io/isp (Camera.app on the home screen); flash=True: /product/camera flash
+    (the flashlight in Control Center). See CAMERA below.
+    gamut=True (--gamut, opt-in): /product artwork-display-gamut P3 -> sRGB (see below)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
@@ -141,9 +205,12 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SMP: all eight cores in physical-core order (flame: 0-3 Cortex-A55,
-    # 4-6 Cortex-A76, 7 the A76 prime core), one homogeneous cluster. The
-    # kernel defaults to one and uses cpus=N to select an initial prefix.
+    # SMP: all eight cores in physical-core order (redfin/lito: 0-5 Cortex-A55
+    # "silver", 6 the A76 "gold", 7 the A76 "prime"), one homogeneous cluster.
+    # The kernel defaults to one and uses cpus=N to select an initial prefix.
+    # cluster-type stays 0: this kernel has MAX_CPU_CLUSTERS 1 and no
+    # __ARM_AMP__, and ml_parse_cpu_topology() would give a 'P' core cluster
+    # id 1 (out of range). Big-core placement is patch 0147/0962 (sweetbig).
     # QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
@@ -161,7 +228,8 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2841600000 if core == 7 else 2419200000 if core >= 4 else 1785600000)),
+            # redfin cpufreq-hw top rows (0962): silver 1804.8, gold 2208, prime 2400 MHz
+            ('clock-frequency', u32(2400000000 if core == 7 else 2208000000 if core == 6 else 1804800000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -207,7 +275,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + ([isp_node(ph)] if camera else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -218,7 +286,7 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     # iBoot's panic region (pe_init.c check_for_panic_log): RAM above XNU's range
-    # (which ends at 0x1fcc00000) and below the console mirror at 0x1fe000000.
+    # (which ends at 0x27ec00000 on redfin since 1033) and below the console mirror at 0x27f200000.
     pram = node('pram', [ph(), ('reg', struct.pack('<2Q', PANIC_LOG_PA, PANIC_LOG_SIZE))])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -244,7 +312,21 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     product_props = d22ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # --gamut (from ios-topaz 3eacb48 / HackiOS 40e4ddc): the iPhone X says 'P3', so MobileGestalt answers
+    # HasExtendedColorDisplay and WebKit draws page tiles into 10-bit surfaces ('w30r', 'b3a8'); HackiOS's
+    # kernel lacked them (blank Safari). Opt-in here because kernel 0124 already provides them to WebContent
+    # (Safari works with Metal v2) and sRGB changes what every app is told about the display: try it only
+    # if Safari/Photos pages are blank again, or to drop the 0124 10-bit special case.
+    if gamut and product_props:
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
+    haptics = d22ap_product_child('haptics')
+    product_children = [node('haptics', [ph()] + haptics)] if haptics else []
+    if flash or camera:
+        product_children.append(product_camera_node(ph, flash))
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
+    bl_props = d22ap_backlight(500) if backlight else None
+    if bl_props:
+        product.append(node('backlight', [ph()] + bl_props))
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
@@ -262,7 +344,9 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 camera='--camera' in sys.argv, flash='--flash' in sys.argv, backlight='--backlight' in sys.argv,
+                 gamut='--gamut' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

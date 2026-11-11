@@ -155,7 +155,9 @@ def add_poke_to_adt(adt_blob, script):
     return adt.serialize(root)
 
 
-GPU_FW = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02')
+# redfin Adreno 620 (kgsl adreno_gpu_core_a620): a650 GMU + SQE, a620 zap. a620_zap.mdt's only
+# PT_LOAD segment is b02 (paddr 0x5000, 0x68c bytes, relocatable): it goes at pil_gpu_region's start.
+GPU_FW = ('a650_gmu.bin', 'a650_sqe.fw', 'a620_zap.mdt', 'a620_zap.b02')
 
 
 def add_gpufw_to_adt(adt_blob, fw_dir):

@@ -67,9 +67,8 @@ static void mem_wr(uint64_t pa, const void *buf, uint32_t len)
 
 /* ---------------------------------------------------------------- apps SMMU */
 
-#define SMMU_PA		0x15000000ull
-#define SMMU_SIZE	0x00100000u
-#define WLAN_SID	0x640
+/* SMMU_PA, SMMU_SIZE: radio.h (shared with ipa.c) */
+#define WLAN_SID	0xc0	/* redfin lito icnss iommus <&apps_smmu 0xC0 0x1> (sunfish 0x240, flame 0x640) */
 #define WLAN_SID_MASK	0x1
 #define CB_CBAR		0x0001f000u	/* S1 translation, S2 bypass, as ABL's banks */
 #define CB_CBA2R	0x00000001u	/* AArch64 */
@@ -83,8 +82,15 @@ static int sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
 	return ((id ^ sid) & ~(m | mask) & 0x7fff) == 0;
 }
 
-int smmu_wlan_identity(void)
+int smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
 {
+	return sid_match(smr, sid, mask);
+}
+
+/* the same translation-off bank setup for any stream (ipa.c: IPA 0x520/0x522); 0 = matched as written */
+int smmu_stream_identity(uint32_t sid, uint32_t smask, const char *label)
+{
+	int ok;
 	uint64_t s = SMMU_PA;
 	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
 	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
@@ -103,13 +109,13 @@ int smmu_wlan_identity(void)
 		}
 		if (((s2cr >> 16) & 3) == 0)
 			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
-		if (sid_match(smr, WLAN_SID, WLAN_SID_MASK)) {
+		if (sid_match(smr, sid, smask)) {
 			uint32_t c = s2cr & 0xff;
 			uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
 			printf("smmu: SMR%u %08x already matches %#x: S2CR %08x, CB%u SCTLR %08x CBAR %08x\n", i, smr,
-			       WLAN_SID, s2cr, c, rd32(cbp), rd32(s + psize + 4 * c));
-			smmu_done = ((s2cr >> 16) & 3) == 0 && !(rd32(cbp) & 1);
-			return smmu_done ? 0 : -1;
+			       sid, s2cr, c, rd32(cbp), rd32(s + psize + 4 * c));
+			ok = ((s2cr >> 16) & 3) == 0 && !(rd32(cbp) & 1);
+			return ok ? 0 : -1;
 		}
 	}
 	/* lowest free bank that nothing points at and nobody set up (the top ones may be secure) */
@@ -136,15 +142,21 @@ int smmu_wlan_identity(void)
 	wr32(gr1 + 4 * cb, CB_CBAR);
 	wr32(cbp, CB_SCTLR);				/* SCTLR last */
 	wr32(s + 0xc00 + 4 * slot, (uint32_t)cb);	/* S2CR: translate (type 0) through this bank */
-	wr32(s + 0x800 + 4 * slot, (1u << 31) | (WLAN_SID_MASK << 16) | WLAN_SID);	/* SMR valid last */
+	wr32(s + 0x800 + 4 * slot, (1u << 31) | (smask << 16) | sid);	/* SMR valid last */
 	wr32(s + 0x70, 0);				/* sTLBGSYNC */
 	for (int i = 0; i < 1000 && (rd32(s + 0x74) & 1); i++)
 		delay_ms(1);
 	uint32_t smr = rd32(s + 0x800 + 4 * slot), s2cr = rd32(s + 0xc00 + 4 * slot);
-	smmu_done = (smr >> 31) && sid_match(smr, WLAN_SID, WLAN_SID_MASK) && ((s2cr >> 16) & 3) == 0 &&
+	ok = (smr >> 31) && sid_match(smr, sid, smask) && ((s2cr >> 16) & 3) == 0 &&
 		    (s2cr & 0xff) == (uint32_t)cb;
-	printf("smmu: WLAN %#x/%#x -> CB%d via SMR%d: SMR %08x S2CR %08x SCTLR %08x CBAR %08x -> %s\n", WLAN_SID,
-	       WLAN_SID_MASK, cb, slot, smr, s2cr, rd32(cbp), rd32(gr1 + 4 * cb), smmu_done ? "ok" : "NOT as written");
+	printf("smmu: %s %#x/%#x -> CB%d via SMR%d: SMR %08x S2CR %08x SCTLR %08x CBAR %08x -> %s\n", label, sid,
+	       smask, cb, slot, smr, s2cr, rd32(cbp), rd32(gr1 + 4 * cb), ok ? "ok" : "NOT as written");
+	return ok ? 0 : -1;
+}
+
+int smmu_wlan_identity(void)
+{
+	smmu_done = smmu_stream_identity(WLAN_SID, WLAN_SID_MASK, "WLAN") == 0;
 	return smmu_done ? 0 : -1;
 }
 
@@ -393,7 +405,7 @@ static void htc_connect(uint16_t svc)
 }
 
 /* WMI waits here while its endpoint has no credit */
-#define WMIQ_LEN	8
+#define WMIQ_LEN	32
 #define WMIQ_MAX	2040
 static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
 static uint16_t wmiq_len[WMIQ_LEN];
@@ -535,7 +547,7 @@ static void htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
 #define ABI_NS1			0x00004c4du	/* "ML" */
 #define SVC_RX_FULL_REORDER	65
 #define SVC_EXTEND_ADDRESS	179
-#define NUM_PEERS		33
+#define NUM_PEERS		33	/* ath10k wcn3990: TARGET_HL_TLV_NUM_PEERS */
 #define NUM_VDEVS		4
 #define MAX_MEM_REQS		8
 #define MAX_MEM_TOTAL		(4u << 20)
@@ -544,7 +556,48 @@ struct wmi_mem_req { uint32_t req_id, unit_size, num_unit_info, num_units; };
 static uint32_t wmi_svc_map[32], wmi_svc_ext[4], wmi_nreq;
 static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
 static int wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
+static uint32_t wmi_eeprom_rd = 0xffffffff;	/* HAL_REG_CAPABILITIES.eeprom_rd */
 static uint8_t wmi_mac[6];
+static uint32_t wmi_rf_chains;
+static uint32_t wmi_ht_cap_info;		/* SERVICE_READY ht_cap_info (ath10k WMI_HT_CAP_*) */
+/*
+ * Test hook: /var/local/wlan-steps.conf, a hex mask of ath10k station steps we used to skip (default all on):
+ * bit 0 keepalive off, bit 1 sta ps params, bit 2 rts threshold, bit 3 vdev start in HT20 mode;
+ * bits 4-6 (ours, before vdev start): sta ps mode off, pdev tx power limits, vdev wmm;
+ * probes: bit 7 vdev start on 2437 MHz instead of a scan, bit 8 no HTT setup.
+ */
+static uint32_t w_steps = 0x7f;
+static int w_steps_read;
+static uint32_t steps(void)
+{
+	if (!w_steps_read) {
+		w_steps_read = 1;
+		FILE *f = fopen("/var/local/wlan-steps.conf", "r");
+		unsigned v;
+		if (f && fscanf(f, "%x", &v) == 1)
+			w_steps = v;
+		if (f)
+			fclose(f);
+		printf("radio: steps %#x\n", w_steps);
+	}
+	return w_steps;
+}
+/*
+ * B57 (Yofuness/ios-flame b13a681): 802.11n HT20 association with WMM, or the legacy 11g/11a one of before.
+ * redfin 2026-11-04: off by default (as before); on with env WLAND_HT=1 or a line "ht=1" in /var/local/wland.conf
+ * (wland's settings; the network and its key stay in wlan.conf).
+ */
+static int w_ht = -1;
+static int ht_on(void)
+{
+	if (w_ht < 0) {
+		w_ht = wland_setting("ht", 0) != 0;
+		printf("radio: ht %d\n", w_ht);
+	}
+	return w_ht;
+}
+static int w_pdev_param(uint32_t param, uint32_t value);
+static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim);
 
 /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
 static int wmi_svc(uint32_t bit)
@@ -592,7 +645,13 @@ static void wmi_svc_ready(const uint8_t *p, uint32_t len)
 			memcpy(&fw, v, 4);
 			memcpy(&a0, v + 4, 4);
 			memcpy(&rf, v + 36, 4);
-			LOG("wmi: fw %08x abi %08x rf chains %u", fw, a0, rf);
+			wmi_rf_chains = rf;
+			if (l >= 44)
+				memcpy(&wmi_ht_cap_info, v + 40, 4);
+			LOG("wmi: fw %08x abi %08x rf chains %u ht caps %#x", fw, a0, rf, wmi_ht_cap_info);
+		} else if (tag == 0x21 && l >= 4) {	/* WMI_TLV_TAG_STRUCT_HAL_REG_CAPABILITIES */
+			memcpy(&wmi_eeprom_rd, v, 4);
+			LOG("wmi: eeprom regdomain %#x", wmi_eeprom_rd);
 		} else if (tag == TAG_ARRAY_UINT32 && !wmi_seen_bmap) {
 			wmi_seen_bmap = 1;
 			memcpy(wmi_svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wmi_svc_map)));
@@ -655,8 +714,8 @@ static void wmi_send_init(void)
 		rc[3] = NUM_VDEVS;
 	}
 	rc[4] = 2;					/* peer keys */
-	rc[5] = NUM_PEERS * 2;				/* tids */
-	rc[6] = 16;					/* ast skid limit */
+	rc[5] = 33 * 2;					/* tids: TARGET_TLV_NUM_TIDS */
+	rc[6] = 16;					/* ast skid limit: TARGET_HL_TLV_AST_SKID_LIMIT */
 	rc[7] = 0x7;					/* tx chain mask */
 	rc[8] = 0x7;					/* rx chain mask */
 	rc[9] = 0x64; rc[10] = 0x64; rc[11] = 0x64; rc[12] = 0x28;
@@ -678,7 +737,7 @@ static void wmi_send_init(void)
 	rc[35] = 6;					/* keepalive patterns */
 	rc[37] = 1;
 	rc[38] = 1;
-	rc[43] = 1u << 9;				/* MGMT_BUNDLE_TX_COMPL */
+	rc[43] = 1u << 9;				/* host_capab: WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL as ath10k */
 	p = put_tlv(p, TAG_RESOURCE_CONFIG, sizeof(rc));
 	memcpy(p, rc, sizeof(rc));
 	p += sizeof(rc);
@@ -707,6 +766,7 @@ static const uint16_t scan_freqs[] = {
 	5745, 5765, 5785, 5805, 5825,
 };
 #define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
+#define NFREQ_MAX 64
 #define NBSS 64
 
 struct bss {
@@ -730,6 +790,22 @@ static int scan_send_start(void)
 {
 	static uint8_t m[512];
 	uint8_t *p = m, *c;
+	/* test hook: /var/local/wlan-scan.conf lists the only frequencies to scan (MHz, one per line) */
+	static uint32_t sf[NFREQ_MAX], nsf;
+	static int sf_read;
+	if (!sf_read) {
+		sf_read = 1;
+		FILE *f = fopen("/var/local/wlan-scan.conf", "r");
+		unsigned v;
+		while (f && nsf < NFREQ_MAX && fscanf(f, "%u", &v) == 1)
+			sf[nsf++] = v;
+		if (f)
+			fclose(f);
+		if (!nsf)
+			for (; nsf < NFREQ; nsf++)
+				sf[nsf] = scan_freqs[nsf];
+		LOG("scan: %u frequencies%s", nsf, nsf == NFREQ ? "" : " (wlan-scan.conf)");
+	}
 	memset(m, 0, sizeof(m));
 	c = put_tlv(p, TAG_START_SCAN_CMD, 100);
 	c = put32(c, 0xa000 | (scans + 1));		/* scan_id */
@@ -748,15 +824,15 @@ static int scan_send_start(void)
 	c = put32(c, 5);				/* probe delay */
 	c = put32(c, (0x01 | 0x10) ^ 0x20);		/* passive, chan stat; probe-req filter inverted on TLV */
 	c = put32(c, 0);
-	c = put32(c, NFREQ);
+	c = put32(c, nsf);
 	c = put32(c, 1);				/* bssids */
 	c = put32(c, 0);				/* ssids */
 	c = put32(c, 0);				/* ie_len */
 	c = put32(c, 3);				/* num_probes */
 	p = c + 16;					/* mac addr + mask: zero */
-	c = put_tlv(p, TAG_ARRAY_UINT32, NFREQ * 4);
-	for (uint32_t i = 0; i < NFREQ; i++)
-		c = put32(c, scan_freqs[i]);
+	c = put_tlv(p, TAG_ARRAY_UINT32, nsf * 4);
+	for (uint32_t i = 0; i < nsf; i++)
+		c = put32(c, sf[i]);
 	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
 	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);	/* bssid: broadcast */
 	memset(c, 0xff, 6);
@@ -772,12 +848,53 @@ static void scan_start(void)
 	if (scan_started)
 		return;
 	scan_started = 1;
-	/* channel list, every channel passive: nothing is transmitted */
+	if (steps() & 0x200) {			/* probe: no regdomain, pdev params, dbglog or channel list */
+		LOG("probe: regdomain/pdev/dbglog/chan list skipped");
+		goto vdev_create;
+	}
+	/*
+	 * sunfish: WMI_PDEV_SET_REGDOMAIN first (ath10k_regd_update; tag 0x51, cmd 0x4001), with the
+	 * firmware's own eeprom code, FCC conformance limits. The HL3.2.2 firmware asserted in vdev
+	 * start (first TX) without it and with every channel passive.
+	 */
+	{
+		uint8_t rd[4 + 24] = { 0 }, *q = put_tlv(rd, 0x51, 24);
+		uint32_t code = wmi_eeprom_rd != 0xffffffff ? (wmi_eeprom_rd & 0xffff) : 0;
+		q = put32(q, 0);	/* pdev */
+		q = put32(q, code);
+		q = put32(q, code);
+		q = put32(q, code);
+		q = put32(q, 0x10);	/* CTL_FCC 2 GHz */
+		put32(q, 0x10);		/* CTL_FCC 5 GHz */
+		int rc = wmi_send(0x4001, rd, sizeof(rd));
+		LOG("regdomain: %#x -> %d", code, rc);
+	}
+	/*
+	 * ath10k_start's pdev setup. Above all the chain masks: INIT says 0x7 (3 chains), the firmware has 2 and
+	 * ath10k narrows it here ((1 << num_rf_chains) - 1); without it the fw indexes per-chain state past 2.
+	 */
+	{
+		uint32_t mask = (wmi_rf_chains >= 1 && wmi_rf_chains <= 3) ? (1u << wmi_rf_chains) - 1 : 3;
+		static const uint32_t pp[][2] = { { 0x22, 1 }, { 0x0a, 1 }, { 0x2c, 1 }, { 0x23, 0 }, { 0x25, 1 } };
+		int e = 0;
+		for (uint32_t i = 0; i < sizeof(pp) / sizeof(pp[0]); i++)
+			e |= w_pdev_param(pp[i][0], pp[i][1]);
+		e |= w_pdev_param(1, mask) | w_pdev_param(2, mask);
+		/* fw debug log: all modules verbose (ath10k_wmi_tlv_op_gen_dbglog_cfg; cmd 0x1d003, tag 0xbe) */
+		uint8_t dl[4 + 8 + 4], *q = put_tlv(dl, 0xbe, 8);
+		q = put32(q, 1);
+		q = put32(q, 0xffffu << 16);
+		put_tlv(q, TAG_ARRAY_UINT32, 0);
+		LOG("dbglog: verbose %s", wmi_send(0x1d003, dl, sizeof(dl)) ? "FAILED" : "on");
+		LOG("pdev: chain mask %#x (rf chains %u), pmf/bw/idle-ps/ani %s", mask, wmi_rf_chains, e ? "FAILED" : "ok");
+	}
+	/* channel list: 2.4 GHz 1-11 and 5 GHz 36-48 may transmit, the rest passive */
 	p = put32(put_tlv(p, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ);
 	p = put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
 	for (uint32_t i = 0; i < NFREQ; i++) {
 		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0;
-		uint32_t flags = mode | (1u << 7) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
+		int tx_ok = (scan_freqs[i] >= 2412 && scan_freqs[i] <= 2462) || (scan_freqs[i] >= 5180 && scan_freqs[i] <= 5240);
+		uint32_t flags = mode | (tx_ok ? 0 : (1u << 7)) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
 		c = put_tlv(p, TAG_CHANNEL, 24);
 		c = put32(c, scan_freqs[i]);
 		c = put32(c, scan_freqs[i]);
@@ -787,6 +904,10 @@ static void scan_start(void)
 		p = put32(c, 40u << 8);
 	}
 	int a = wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
+	if (0) {
+vdev_create:
+		a = 0;
+	}
 	uint8_t v[4 + 20] = { 0 };
 	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
 	c = put32(c, 0);				/* vdev 0 */
@@ -794,6 +915,50 @@ static void scan_start(void)
 	c = put32(c, 0);
 	memcpy(c, radio_mac, 6);
 	int b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
+	/* ath10k_add_interface: vdev NSS from the chain mask (2 streams), WMI_TLV_VDEV_PARAM_NSS 0x22 */
+	{
+		uint32_t nss = wmi_rf_chains >= 1 && wmi_rf_chains <= 3 ? wmi_rf_chains : 2;
+		uint8_t vp[4 + 12], *q = put_tlv(vp, 0x5f, 12);
+		q = put32(q, 0);
+		q = put32(q, 0x22);
+		put32(q, nss);
+		LOG("vdev: nss %u %s", nss, wmi_send(0x5008, vp, sizeof(vp)) ? "FAILED" : "ok");
+	}
+	/* ath10k_add_interface for a station, after NSS */
+	if (steps() & 1) {			/* ath10k_mac_vif_disable_keepalive: STA_KEEPALIVE 0x1c005, interval 0 */
+		uint8_t ka[4 + 16 + 4 + 16] = { 0 }, *q = put_tlv(ka, 0x7f, 16);
+		q = put32(q, 0);
+		q = put32(q, 1);		/* enabled */
+		q = put32(q, 1);		/* method: null frame */
+		q = put32(q, 0);		/* interval 0: off */
+		put_tlv(q, 0x80, 16);		/* arp response: zero */
+		LOG("vdev: keepalive off %s", wmi_send(0x1c005, ka, sizeof(ka)) ? "FAILED" : "ok");
+	}
+	if (steps() & 2) {			/* sta ps: rx wake policy WAKE, tx wake threshold ALWAYS, pspoll count NO_MAX */
+		static const uint32_t ps[3][2] = { { 0, 0 }, { 1, 1 }, { 2, 0 } };
+		int e = 0;
+		for (int i = 0; i < 3; i++) {
+			uint8_t m[4 + 12], *q = put_tlv(m, 0x6d, 12);
+			q = put32(q, 0);
+			q = put32(q, ps[i][0]);
+			put32(q, ps[i][1]);
+			e |= wmi_send(0x9002, m, sizeof(m));
+		}
+		LOG("vdev: sta ps params %s", e ? "FAILED" : "ok");
+	}
+	if (steps() & 4) {			/* ath10k_mac_set_rts: vdev param 1, wiphy default (u32)-1 */
+		uint8_t m[4 + 12], *q = put_tlv(m, 0x5f, 12);
+		q = put32(q, 0);
+		q = put32(q, 1);
+		put32(q, 0xffffffffu);
+		LOG("vdev: rts threshold %s", wmi_send(0x5008, m, sizeof(m)) ? "FAILED" : "ok");
+	}
+	if (steps() & 0x80) {			/* probe: vdev start on 2437 MHz, no scan at all */
+		fflush(stdout);
+		LOG("probe: vdev start 2437 MHz without a scan: %s", w_vdev_start(2437, 100, 1) ? "FAILED" : "sent");
+		fflush(stdout);
+		return;
+	}
 	scanning = !scan_send_start();
 	LOG("scan: channel list (%u) %s, vdev %s, passive scan %s", NFREQ, a ? "FAILED" : "ok", b ? "FAILED" : "ok",
 	    scanning ? "requested" : "FAILED");
@@ -1065,6 +1230,12 @@ static void htt_start(void)
 
 	if (htt_state != 0)
 		return;
+	if (steps() & 0x100) {			/* probe: no HTT setup at all */
+		LOG("probe: HTT setup skipped");
+		htt_state = 2;
+		scan_start();
+		return;
+	}
 	if (!(pa = pool_alloc(ring + bank + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE))) {
 		LOG("htt: no memory, scanning without it");
 		scan_start();
@@ -1157,8 +1328,21 @@ static void htt_rx(const uint8_t *p, uint32_t len)
 #define TAG_STA_PS_MODE		0x6c
 #define TAG_MGMT_TX		0x1a6
 #define PEER_FLAG_AUTH		0x1
+#define PEER_FLAG_QOS		0x2
 #define PEER_FLAG_NEED_PTK_4WAY	0x4
+#define PEER_FLAG_HT		0x1000
+#define PEER_FLAG_STBC		0x8000
+#define PEER_PARAM_SMPS_STATE	1
 #define PEER_PARAM_AUTHORIZE	3
+/* B57 HT20: rate caps (ath10k WMI_RC_*) and HT Capabilities bits (IEEE80211_HT_CAP_*) */
+#define RC_SGI			0x04
+#define RC_HT			0x08
+#define RC_TX_STBC		0x20
+#define HTCAP_SGI20		0x0020
+#define HTCAP_TX_STBC		0x0080
+#define HTCAP_RX_STBC		0x0300
+#define HTCAP_SM_PS_OFF		0x000c	/* WLAN_HT_CAP_SM_PS_DISABLED << 2 */
+#define HTCAP_PEER_MASK		0x1073	/* LDPC, 20/40, GF, SGI20/40, DSSS/CCK40: kept only if we have them too */
 #define WMI_CIPHER_TKIP		2
 #define WMI_CIPHER_CCMP		4
 #define FC_ASSOC_REQ		0x00
@@ -1173,7 +1357,8 @@ static void htt_rx(const uint8_t *p, uint32_t len)
 #define TXF0_MAC_HDR		0x01
 #define TXF0_NO_ENCRYPT		0x04
 #define TXF0_NATIVE		(1u << 5)
-#define TXF1_TID_NONQOS		(16u << 6)
+#define TXF1_TID(t)		((uint32_t)(t) << 6)
+#define TID_NONQOS		16	/* HTT_DATA_TX_EXT_TID_NON_QOS_MCAST_BCAST */
 #define TXF1_POSTPONED		(1u << 11)
 #define PREFETCH_LEN		50
 
@@ -1183,8 +1368,11 @@ static int s_join_asked, s_result = -1;
 static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
 static uint8_t s_body[768];				/* the AP's beacon elements */
 static uint32_t s_body_len, s_freq, s_aid, s_tries, s_desc, s_msg1s;
+static uint32_t s_kicks;				/* deauths/disassocs taken while authenticating/associating (re-auth) */
 static uint64_t s_deadline;
 static int s_rsn, s_start_resp, s_ptk_set;
+static int s_ht, s_qos, s_ht_refused;		/* B57: HT20 asked in the assoc request / peer is QoS; AP refused HT */
+static const char *s_ht_why;			/* why this join is legacy */
 static int32_t s_start_status;
 static uint8_t s_assoc_req[512];
 static uint32_t s_assoc_req_len;
@@ -1204,7 +1392,8 @@ static uint8_t *w_channel(uint8_t *p, uint32_t freq)
 	c = put32(c, freq);
 	c = put32(c, freq);
 	c = put32(c, 0);
-	c = put32(c, freq < 4000 ? 1 : 0);
+	/* ath10k chan_to_phymode for an HT AP: 11NG_HT20 (5) / 11NA_HT20 (4); bit 3 off: legacy 11G (1) / 11A (0) */
+	c = put32(c, (steps() & 8) ? (freq < 4000 ? 5 : 4) : (freq < 4000 ? 1 : 0));
 	c = put32(c, (40u << 8) | (40u << 16));
 	return put32(c, 40u << 8);
 }
@@ -1272,7 +1461,7 @@ static int crypto_selftest(void)
 
 /* ---- HTT data TX */
 
-static int htt_tx_frame(const uint8_t *f, uint32_t len, int clear)
+static int htt_tx_frame(const uint8_t *f, uint32_t len, int clear, uint32_t tid)
 {
 	uint8_t m[20 + 52] = { 0 }, ext[HTT_EXT_DESC_SIZE] = { 0 }, *p = m;
 	uint32_t id, pf = (MIN(len, (uint32_t)PREFETCH_LEN) + 3) & ~3u;
@@ -1294,7 +1483,7 @@ static int htt_tx_frame(const uint8_t *f, uint32_t len, int clear)
 	mem_wr(htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE, ext, sizeof(ext));
 	*p++ = H2T_TX_FRM;
 	*p++ = (uint8_t)(TXF0_MAC_HDR | TXF0_NATIVE | (clear ? TXF0_NO_ENCRYPT : 0));
-	p = put16(p, (uint16_t)(TXF1_TID_NONQOS | TXF1_POSTPONED));	/* vdev 0 */
+	p = put16(p, (uint16_t)(TXF1_TID(tid) | TXF1_POSTPONED));	/* vdev 0 */
 	p = put16(p, (uint16_t)len);
 	p = put16(p, (uint16_t)id);
 	p = put64(p, htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE);
@@ -1322,6 +1511,32 @@ static void htt_tx_compl(const uint8_t *p, uint32_t len)
 }
 
 /* ---- WMI commands for the join (layouts: ath10k wmi-tlv) */
+
+/* ath10k_start / ath10k_conf_tx: pdev tx power limits (0.5 dBm units) and vdev WMM (mac80211 STA defaults)
+ * are set before the first vdev start; without them the firmware asserted there (RT:0x1084/0x1089). */
+static int w_pdev_param(uint32_t param, uint32_t value)
+{
+	uint8_t m[4 + 12], *p = put_tlv(m, 0x52, 12);
+	p = put32(p, 0);
+	p = put32(p, param);
+	put32(p, value);
+	return wmi_send(0x4003, m, sizeof(m));
+}
+
+static int w_vdev_wmm(void)
+{
+	/* BE, BK, VI, VO: cwmin, cwmax, aifs, txop (32 us units), acm, no_ack */
+	static const uint32_t ac[4][6] = { { 15, 1023, 3, 0, 0, 0 }, { 15, 1023, 7, 0, 0, 0 },
+					   { 7, 15, 2, 94, 0, 0 }, { 3, 7, 2, 47, 0, 0 } };
+	uint8_t m[4 + 4 + 4 * 28] = { 0 }, *p = put_tlv(m, 0xc7, 4 + 4 * 28);
+	p = put32(p, 0);				/* vdev 0 */
+	for (int i = 0; i < 4; i++) {
+		p = put32(p, 0);			/* dummy */
+		for (int j = 0; j < 6; j++)
+			p = put32(p, ac[i][j]);
+	}
+	return wmi_send(0x500d, m, sizeof(m));
+}
 
 static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
 {
@@ -1409,34 +1624,104 @@ static uint32_t w_ap_rates(uint8_t *out)
 	return n;
 }
 
-static int w_peer_assoc(uint32_t caps)
+/* ---- B57: HT20 (ath10k_get_ht_cap for one stream at 20 MHz, mac80211 ieee80211_ht_cap_ie_to_sta_ht_cap) */
+
+/* ours: SM power save off, SGI20 and RX STBC (1 stream) if the firmware has them; no TX STBC, LDPC or 40 MHz */
+static uint16_t w_own_htcap(void)
 {
-	uint8_t m[4 + 76 + 4 + 16 + 4 + 4 + 16] = { 0 }, *p, *r, rates[16];
-	uint32_t n = w_ap_rates(rates), rl = (MIN(n, 16u) + 3) & ~3u;
+	uint16_t c = HTCAP_SM_PS_OFF;
+	if (wmi_ht_cap_info & 0x02)			/* WMI_HT_CAP_HT20_SGI */
+		c |= HTCAP_SGI20;
+	if (wmi_ht_cap_info & 0x30)			/* WMI_HT_CAP_RX_STBC */
+		c |= 0x0100;
+	return c;
+}
+
+/* a WMM element (00:50:f2 type 2) of subtype 0 (information) or 1 (parameters) */
+static const uint8_t *find_wmm(const uint8_t *ies, uint32_t len)
+{
+	for (uint32_t o = 0; o + 2 <= len && o + 2 + ies[o + 1] <= len; o += 2 + ies[o + 1])
+		if (ies[o] == 221 && ies[o + 1] >= 7 && ies[o + 2] == 0x00 && ies[o + 3] == 0x50 && ies[o + 4] == 0xf2 &&
+		    ies[o + 5] == 2 && ies[o + 6] <= 1)
+			return ies + o;
+	return NULL;
+}
+
+/* ath10k_parse_mpdudensity: the HT A-MPDU density code -> microseconds */
+static uint32_t w_mpdu_density(uint32_t d)
+{
+	static const uint8_t us[8] = { 0, 1, 1, 1, 2, 4, 8, 16 };
+	return us[d & 7];
+}
+
+/*
+ * PEER_ASSOC (ath10k_wmi_tlv_op_gen_peer_assoc). ht = the AP's HT Capabilities element (assoc response) or NULL
+ * for a legacy 11g/11a peer; the HT part is ath10k_peer_assoc_h_ht on mac80211's intersection of the AP's caps
+ * with ours, qos is ath10k_peer_assoc_h_qos (station: the AP does WMM), phymode ath10k_peer_assoc_h_phymode.
+ */
+static int w_peer_assoc(uint32_t caps, const uint8_t *ht, int qos)
+{
+	uint8_t m[4 + 76 + 4 + 16 + 4 + 8 + 4 + 16] = { 0 }, *p, *r, rates[16], hr[8];
+	uint32_t n = w_ap_rates(rates), rl = (MIN(n, 16u) + 3) & ~3u, nht = 0, hl;
+	uint32_t flags = PEER_FLAG_AUTH | (s_rsn ? PEER_FLAG_NEED_PTK_4WAY : 0) | (qos ? PEER_FLAG_QOS : 0);
+	uint32_t htc = 0, mpdu = 0, dens = 0, rc = 0, phy = s_freq < 4000 ? 1 : 0;	/* 11g / 11a */
+	if (ht) {
+		uint16_t own = w_own_htcap();
+		htc = (uint32_t)(ht[2] | ht[3] << 8) & (own | ~(uint32_t)HTCAP_PEER_MASK) & 0xffff;
+		htc &= ~(uint32_t)HTCAP_RX_STBC;		/* we have no TX STBC */
+		if (!(own & HTCAP_RX_STBC))
+			htc &= ~(uint32_t)HTCAP_TX_STBC;
+		mpdu = (1u << (13 + (ht[4] & 3))) - 1;	/* IEEE80211_HT_MAX_AMPDU_FACTOR + factor */
+		dens = w_mpdu_density((uint32_t)ht[4] >> 2);
+		flags |= PEER_FLAG_HT;
+		rc = RC_HT | ((htc & HTCAP_SGI20) ? RC_SGI : 0);
+		if (htc & HTCAP_TX_STBC) {
+			rc |= RC_TX_STBC;
+			flags |= PEER_FLAG_STBC;
+		}
+		for (uint32_t i = 0; i < 8; i++)	/* one stream: MCS 0-7 the AP receives */
+			if (ht[5] & (1u << i))
+				hr[nht++] = (uint8_t)i;
+		if (!nht)				/* ath10k: no rx mask -> MCS 0-7 (the fw asserts else) */
+			for (; nht < 8; nht++)
+				hr[nht] = (uint8_t)nht;
+		phy = s_freq < 4000 ? 5 : 4;		/* 11NG_HT20 / 11NA_HT20 */
+	}
+	hl = (nht + 3) & ~3u;
 	p = put_tlv(m, TAG_PEER_ASSOC, 76);
 	p = put_mac(p, s_bssid);
 	p = put32(p, 0);
 	p = put32(p, 1);				/* new assoc */
 	p = put32(p, s_aid);
-	p = put32(p, PEER_FLAG_AUTH | (s_rsn ? PEER_FLAG_NEED_PTK_4WAY : 0));
+	p = put32(p, flags);
 	p = put32(p, caps);
 	p = put32(p, 1);				/* listen interval */
-	p += 4 * 4;					/* ht caps, max mpdu, density, rate caps */
+	p = put32(p, htc);
+	p = put32(p, mpdu);
+	p = put32(p, dens);
+	p = put32(p, rc);
 	p = put32(p, 1);				/* nss */
 	p = put32(p, 0);				/* vht caps */
-	p = put32(p, s_freq < 4000 ? 1 : 0);		/* phy mode: 11g / 11a */
+	p = put32(p, phy);
 	p += 8;
 	p = put32(p, MIN(n, 16u));
-	p = put32(p, 0);
+	p = put32(p, nht);
 	r = put_tlv(p, TAG_ARRAY_BYTE, rl);
 	for (uint32_t i = 0; i < n && i < 16; i++) {
 		uint8_t v = rates[i] & 0x7f;
 		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80) : v;
 	}
 	p = r + rl;
-	p = put_tlv(p, TAG_ARRAY_BYTE, 0);
+	r = put_tlv(p, TAG_ARRAY_BYTE, hl);
+	memcpy(r, hr, nht);
+	p = r + hl;
 	put_tlv(p, TAG_VHT_RATE_SET, 16);
-	return wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + 4 + 16);
+	int e = wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + hl + 4 + 16);
+	if (ht) {					/* ath10k_setup_peer_smps: the AP's SM power save */
+		static const uint32_t smps[4] = { 1, 2, 0, 0 };	/* static, dynamic, (invalid), disabled */
+		e |= w_peer_param(PEER_PARAM_SMPS_STATE, smps[(htc >> 2) & 3]);
+	}
+	return e;
 }
 
 static int w_install_key(int group, uint32_t idx, uint32_t cipher, const uint8_t *key, uint32_t klen)
@@ -1506,6 +1791,22 @@ static void w_build_assoc_req(void)
 		memcpy(p, s_rsn_ie, sizeof(s_rsn_ie));
 		p += sizeof(s_rsn_ie);
 	}
+	if (s_ht) {
+		/* B57: HT Capabilities (mac80211 ieee80211_add_ht_ie) and WMM information (ieee80211_add_wmm_info_ie) */
+		static const uint8_t wmm[9] = { 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };	/* QoS info 0: no U-APSD */
+		uint16_t c = w_own_htcap();
+		*p++ = 45;
+		*p++ = 26;
+		memset(p, 0, 26);
+		p[0] = (uint8_t)c;
+		p[1] = (uint8_t)(c >> 8);
+		p[2] = 0x03 | (6 << 2);			/* A-MPDU: 64K (factor 3), density 8 us (ath10k) */
+		p[3] = 0xff;				/* RX MCS 0-7 */
+		p[15] = 0x01;				/* TX MCS set defined */
+		p += 26;
+		memcpy(p, wmm, sizeof(wmm));
+		p += sizeof(wmm);
+	}
 	s_assoc_req_len = (uint32_t)(p - f);
 }
 
@@ -1527,7 +1828,12 @@ static int w_tx_ether(const uint8_t *e, uint32_t len, int clear)
 	memcpy(f + 24, snap, 6);
 	memcpy(f + 30, e + 12, 2);			/* ethertype */
 	memcpy(f + 32, e + 14, len - 14);
-	return htt_tx_frame(f, len - 14 + 32, clear);
+	/*
+	 * B57: to a QoS (WMM) peer every frame goes with a TID, so the firmware can aggregate (A-MPDU; it runs the
+	 * ADDBA itself, ath10k_ampdu_action). Native wifi carries no QoS control field (ath10k_tx_h_nwifi strips it);
+	 * the TID rides in the HTT descriptor (ath10k_htt_tx_get_tid): best effort 0, EAPOL 7 as mac80211 sends it.
+	 */
+	return htt_tx_frame(f, len - 14 + 32, clear, s_qos ? (clear ? 7u : 0u) : TID_NONQOS);
 }
 
 int radio_tx_ether(const uint8_t *e, uint32_t len)
@@ -1556,12 +1862,17 @@ static void w_teardown(void)
 		w_link(0);
 	s_state = S_IDLE;
 	s_ptk_set = 0;
+	s_qos = 0;
 }
 
 static void w_join_end(int result)
 {
 	if (result) {
 		LOG("join: failed (%s) in state %u", strerror(result), s_state);
+		if (s_ht && s_state == S_ASSOC && !s_ht_refused) {	/* B57: an AP that won't take our HT request */
+			s_ht_refused = 1;
+			LOG("join: no association with HT: legacy from the next try (until wland restarts)");
+		}
 		w_teardown();
 	} else {
 		s_state = S_UP;
@@ -1612,10 +1923,28 @@ static void w_join_begin(void)
 	if (tim && tim[1] >= 2 && tim[3])
 		dtim = tim[3];
 	s_msg1s = 0;
+	s_kicks = 0;
 	s_start_resp = 0;
-	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s", (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
-	    s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open");
-	w_ps_off();
+	/* B57: HT20 + WMM when the AP has both (mac80211 keeps HT only with WMM), ht=1 and the firmware has HT */
+	const uint8_t *ht = find_ie(s_body, s_body_len, 45);
+	s_ht_why = !ht_on() ? "ht=0" : s_ht_refused ? "AP refused HT" : !(wmi_ht_cap_info & 1) ? "fw has no HT" :
+		   !ht || ht[1] < 26 ? "AP has no HT" : !find_wmm(s_body, s_body_len) ? "AP has no WMM" : NULL;
+	s_ht = s_ht_why == NULL;
+	s_qos = 0;
+	LOG("join: '%.*s' %02x:%02x:%02x:**:**:** %u MHz %d dBm %s, asking %s", (int)s_ssid_len, s_ssid, s_bssid[0],
+	    s_bssid[1], s_bssid[2], s_freq, bss[best].rssi, s_rsn ? "WPA2" : "open", s_ht ? "HT20" : "legacy");
+	/* steps bits 4-6: our own pre-start commands (ath10k does not send these before vdev start) */
+	if (steps() & 0x10)
+		w_ps_off();
+	int t2 = 0, t5 = 0, wm = 0;
+	if (steps() & 0x20) {
+		t2 = w_pdev_param(3, 40);
+		t5 = w_pdev_param(4, 40);
+	}
+	if (steps() & 0x40)
+		wm = w_vdev_wmm();
+	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
+	fflush(stdout);
 	if (w_vdev_start(s_freq, bcn, dtim)) {
 		w_join_end(EIO);
 		return;
@@ -1650,7 +1979,18 @@ static void sta_mgmt_rx(const uint8_t *f, uint32_t len)
 			w_join_end(ECONNREFUSED);
 			return;
 		}
-		w_peer_assoc((uint32_t)(f[24] | f[25] << 8));
+		/* B57: HT and QoS as the assoc response grants them (mac80211 ieee80211_assoc_success) */
+		const uint8_t *ht = s_ht ? find_ie(f + 30, len - 30, 45) : NULL;
+		s_qos = s_ht && find_wmm(f + 30, len - 30) != NULL;
+		if (ht && (ht[1] < 26 || !s_qos))
+			ht = NULL;
+		if (ht)
+			LOG("assoc HT20 (MCS0-7, A-MPDU)%s", s_qos ? ", WMM" : "");
+		else
+			LOG("assoc legacy %s (%s)%s", s_freq < 4000 ? "11g" : "11a",
+			    !s_ht ? s_ht_why : "assoc reply has no HT/WMM", s_qos ? ", WMM" : "");
+		if (w_peer_assoc((uint32_t)(f[24] | f[25] << 8), ht, s_qos))
+			LOG("join: peer assoc FAILED to send");
 		uint8_t m[20], *p = put_tlv(m, TAG_VDEV_UP, 16);
 		p = put32(p, 0);
 		p = put32(p, s_aid);
@@ -1666,10 +2006,23 @@ static void sta_mgmt_rx(const uint8_t *f, uint32_t len)
 		}
 	} else if (fc == FC_DEAUTH || fc == FC_DISASSOC) {
 		LOG("join: the AP ended the link, reason %u (state %u)", v, s_state);
-		if (s_state == S_UP)
+		if (s_state == S_UP) {
 			w_link_lost("deauth/disassoc");
-		else
+		} else if ((s_state == S_AUTH || s_state == S_ASSOC) && s_kicks < 3) {
+			/*
+			 * redfin 2026-10-28: an AP that still holds this MAC's association from before a reboot ends it
+			 * (deauth/disassoc, e.g. reason 8) when the new authentication arrives, then accepts a fresh one.
+			 * Failing here cost wifid's whole auto-join retry (~28 s). Authenticate again, at most 3 times
+			 * (wpa_supplicant reconnects the same way).
+			 */
+			s_kicks++;
+			LOG("join: an older association ended (reason %u): authenticating again (%u/3)", v, s_kicks);
+			s_state = S_AUTH;
+			s_tries = 0;				/* sta_poll sends the authentication at the deadline */
+			s_deadline = link_ms() + 150;
+		} else {
 			w_join_end(s_state == S_4WAY ? EAUTH : ECONNREFUSED);
+		}
 	}
 }
 
@@ -1685,6 +2038,7 @@ static void sta_wmi_event(uint32_t id, const uint8_t *t, uint32_t len)
 	if (id == EV_VDEV_START_RESP && l >= 16) {	/* {vdev, req, type, status} */
 		s_start_status = (int32_t)v[3];
 		s_start_resp = 1;
+		LOG("vdev start resp: status %d", s_start_status);
 	} else if (id == EV_PEER_STA_KICKOUT && s_state == S_UP) {
 		w_link_lost("peer kickout");
 	} else if (id == EV_ROAM && l >= 12) {
@@ -1968,6 +2322,19 @@ static void wmi_rx(const uint8_t *d, uint32_t len)
 	case EV_ROAM:
 		sta_wmi_event(id, d + 4, len - 4);
 		break;
+	case 0x1d003:					/* WMI_TLV_DEBUG_MESG_EVENTID: fw dbglog, raw words */
+		for (uint32_t o = 4; o + 4 <= len; o += 32) {
+			char line[128];
+			int n = 0;
+			for (uint32_t k = o; k < o + 32 && k + 4 <= len; k += 4) {
+				uint32_t w;
+				memcpy(&w, d + k, 4);
+				n += snprintf(line + n, sizeof(line) - n, " %08x", w);
+			}
+			LOG("dbglog%s", line);
+		}
+		fflush(stdout);
+		break;
 	default:
 		break;
 	}
@@ -2083,6 +2450,26 @@ unsigned radio_ssid(uint8_t ssid[32], uint8_t bssid[6])
 	if (bssid)
 		memcpy(bssid, s_bssid, 6);
 	return s_ssid_len;
+}
+
+/* the joined network's signal as the scans/beacons last heard it: 0 and *rssi, *age_ms, or -1 when not joined */
+int radio_link_rssi(int *rssi, uint32_t *age_ms)
+{
+	if (s_state != S_UP)
+		return -1;
+	for (uint32_t i = 0; i < nbss; i++)
+		if (!memcmp(bss[i].bssid, s_bssid, 6)) {
+			*rssi = bss[i].rssi;
+			*age_ms = (uint32_t)MIN(link_ms() - bss[i].last_ms, 0xffffffffull);
+			return 0;
+		}
+	return -1;
+}
+
+/* the joined link's rate for wifid (Mbit/s): HT20 MCS 7 long GI, else 54 (11g/11a); 0 when not joined */
+unsigned radio_link_rate(void)
+{
+	return s_state != S_UP ? 0 : s_ht ? 65 : 54;
 }
 
 /* a scan as soon as the radio can, also while joined (radio_rescan is only for an idle radio) */

@@ -24,9 +24,9 @@
 #include "ufs.h"
 #include "util.h"
 
-#define IMEM_RESTART_REASON	0x146bf65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146ab65cUL	/* redfin (lito) qcom,msm-imem@146ab000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PON_SOFT_RB_SPARE	0x88f		/* PM8150 (SID 0) PON, reason in [7:1] */
+#define PON_SOFT_RB_SPARE	0x88f		/* redfin: PM8150 (SID 0) PON, reason in [7:1] (as flame) */
 #define PON_REASON_BOOTLOADER	0x02
 #define PON_PS_HOLD_RESET_CTL	0x85a		/* [3:0] type */
 #define PON_PS_HOLD_RESET_CTL2	0x85b		/* [7] enable */
@@ -200,10 +200,45 @@ static void log_gic(void)
 	}
 }
 
+/*
+ * redfin PMIC GPIOs (LV/MV subtype): Linux pinctrl sets these, ABL doesn't.
+ *  - PM8150L (SID 4) GPIO5 = volume_up (lito-redbull-common.dtsi gpio_keys): input,
+ *    30 uA pull-up, VIN 0. GPIOn regs at 0xc000 + (n-1)*0x100.
+ *  - No PMIC GPIO for touch power: the sec_ts panel runs from pm8150_l17 (3.3 V,
+ *    regulator-always-on, RPMh) plus TLMM GPIO35 (bus switch, low), GPIO8 reset.
+ *    (sunfish had PM6150 GPIO4 touch power and PM6150L GPIO2 vol+.)
+ * Regs: 0x40 MODE (LV/MV: dir 0 in / 1 out), 0x41 VIN, 0x42 PULL,
+ * 0x44 OUT_SOURCE ([7] invert: high for source 0), 0x45 OUT_CTL, 0x46 EN.
+ */
+static void pmic_gpio_dump(const char *what, uint32_t sid, uint32_t base)
+{
+	uint8_t v[8] = {0}, sub = 0;
+	spmi_read(sid, base + 0x05, &sub);
+	for (int i = 0; i < 7; i++)
+		spmi_read(sid, base + 0x40 + i, &v[i]);
+	spmi_read(sid, base + 0x08, &v[7]);	/* STATUS1 (input level in [0]) */
+	log_printf("pmic %s sid%u %x: sub %x mode %x vin %x pull %x in %x src %x out %x en %x st %x\n",
+		   what, sid, base, sub, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+}
+
+#define VOLUP_SID	4
+#define VOLUP_GPIO	0xc400	/* PM8150L GPIO5 */
+
+static void redfin_pmic_gpios(void)
+{
+	pmic_gpio_dump("volup", VOLUP_SID, VOLUP_GPIO);
+	/* volume up: input with pull-up */
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x40, 0);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x41, 0);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x42, 0);
+	spmi_write(VOLUP_SID, VOLUP_GPIO + 0x46, 0x80);
+	pmic_gpio_dump("volup", VOLUP_SID, VOLUP_GPIO);
+}
+
 /* Plain RAM where XNU will live: is it there and writable with the MMU off? */
 static void log_ram(void)
 {
-	static const uint64_t probe[] = { 0x100000000ULL, 0x180000000ULL, 0x1fff00000ULL };
+	static const uint64_t probe[] = { 0x100000000ULL, 0x200000000ULL, 0x27ebfc000ULL };
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
 		volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)probe[i];
 		uint64_t old = p[0];
@@ -228,6 +263,7 @@ void shim_main(uintptr_t dtb)
 		log_pmic();
 		set_reboot_bootloader();
 		set_hard_reset();
+		redfin_pmic_gpios();
 	}
 	/* Probe runs reset themselves; only an XNU boot arms the watchdog. */
 	wdt_off();
@@ -281,7 +317,8 @@ void shim_main(uintptr_t dtb)
 	sde_sample("before", 8, 20);
 	uintptr_t fb = sde.pipe ? rd32(sde.pipe + 0x14) : 0;
 	uint32_t stride = sde.pipe ? rd32(sde.pipe + 0x24) & 0xffff : 0;
-	if (!con_init(fb, stride)) {
+	int con_ok = !con_init(fb, stride);
+	if (con_ok) {
 		con_clear(0xff203040);
 		con_str("FLAME", "shim probe v1");
 	}
@@ -300,5 +337,34 @@ void shim_main(uintptr_t dtb)
 	log_ram();
 	log_printf("done, resetting\n");
 	save_log("done");
+#ifdef SHIM_HOLDLOG
+	/* sunfish bring-up: no working UFS log yet, so show it and wait. */
+	/* redfin: the log is longer than one screen, so show it a page at a time,
+	 * 20 s per page, "-- page N --" at the top, then reset. */
+	if (con_ok) {
+		unsigned off = 0, page = 0;
+		while (off < log_len) {
+			con_clear(0xff203040);
+			con_home();
+			page++;
+			char tag[16] = "-- page ", *t = tag + 8;
+			if (page >= 10)
+				*t++ = (char)('0' + page / 10);
+			*t++ = (char)('0' + page % 10);
+			*t++ = ' ';
+			*t++ = '-';
+			*t++ = '-';
+			*t++ = '\n';
+			con_text(tag, (unsigned)(t - tag), YELLOW);
+			unsigned n = con_text(log_buf + off, log_len - off, WHITE);
+			if (n == 0)
+				break;
+			off += n;
+			uint64_t t0 = ticks_now();
+			while (ticks_now() - t0 < 20ull * 19200000)
+				;
+		}
+	}
+#endif
 	reset();
 }

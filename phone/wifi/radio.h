@@ -2,8 +2,15 @@
 #define RADIO_H
 #include <stdint.h>
 
+/* apps SMMU (SMMUv2, 0x15000000): also used by ipa.c for the IPA streams */
+#define SMMU_PA		0x15000000ull
+#define SMMU_SIZE	0x00100000u
+/* does a valid-or-not SMR value (id 14:0, mask 30:16) match stream SID with extra mask bits MASK */
+int smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask);
+
 /* The WLAN DMA stream (apps SMMU 0x640/0x1) through a translation-off bank; before the modem boots. 0 = ok. */
 int smmu_wlan_identity(void);
+int smmu_stream_identity(uint32_t sid, uint32_t smask, const char *label);
 int radio_start(void);		/* after WLFW mission mode: copy engines, HTC, then WMI/HTT/scan from radio_poll */
 void radio_poll(void);		/* called from the link's idle loop */
 void radio_summary(void);	/* the networks heard so far */
@@ -28,6 +35,10 @@ struct radio_bss {
 int radio_heard(unsigned i, struct radio_bss *out);	/* 0, or -1 past the last */
 int radio_scanning(void);	/* a scan runs or is due */
 int radio_joined(void);
+int radio_link_rssi(int *rssi, uint32_t *age_ms);	/* joined network's last heard RSSI; -1 when not joined */
+unsigned radio_link_rate(void);	/* joined link's rate, Mbit/s (0: not joined) */
+/* wland's settings (wland.c): env WLAND_<KEY> (upper case), else a "key=N" line in /var/local/wland.conf, else def */
+int wland_setting(const char *key, int def);
 unsigned radio_ssid(uint8_t ssid[32], uint8_t bssid[6]);	/* of the network joined or being joined; 0 when idle */
 int radio_tx_ether(const uint8_t *frame, uint32_t len);	/* an Ethernet frame out; 0 = queued */
 extern void (*radio_rx_hook)(const uint8_t *frame, uint32_t len);	/* Ethernet frames in */
