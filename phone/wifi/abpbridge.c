@@ -2368,6 +2368,16 @@ static void read_words(void)
 	}
 	if (mode == 1)
 		logframes = 1;		/* P1 observe always logs every frame */
+	/* P4 phase 1 (kernel 1068): with sweetbb & 2 the kernel's router owns qmux1/qmux2 (/dev/abpbridge refuses to open) */
+	uint32_t bb = 0;
+	size_t bl = sizeof(bb);
+	if (mode && !sysctlbyname("kern.sweet_bb", &bb, &bl, NULL, 0) && (bb & 2)) {
+		static int told;
+		if (!told++)
+			printf("[%6llu] abp: abpbridge=%d ignored: kern.sweet_bb=0x%x, the kernel router answers CommCenter\n",
+			       (unsigned long long)link_ms(), mode, bb);
+		mode = 0;
+	}
 }
 
 static void dev_open(uint64_t now)

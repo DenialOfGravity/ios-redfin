@@ -3,10 +3,15 @@
  * qcom_glink_native.c and net/qrtr to talk QMI to the modem. Polled, one
  * channel. The modem is QRTR node 0; we are node 1.
  */
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include "ipcc.h"
 #include "glink.h"
 #include "link.h"
@@ -29,6 +34,33 @@ static uint8_t rxbuf[65536];
 static uint32_t rxoff;
 
 static qrtr_cb_t qrtr_cb;
+
+/*
+ * P4 phase 1 (kernel 1067, research/cc/P4-design.md s.7): with boot-arg sweetbb & 1 the kernel owns the GLINK edge and
+ * QRTR node 1; wland's link is then /dev/sweet-mqrtr ("raw": one QRTR packet per read/write, struct qrtr_hdr + payload,
+ * as on the wire), and everything above (ports, servers, WLFW, cell.c, rmtfs/tftp/pd-mapper, ipaqmi, ssctl) is unchanged.
+ * MQRTR_IOC_UP makes the kernel's link again after our PAS boot (as glink_init did). WLAND_LINK=glink forces the old link.
+ */
+#define MQRTR_DEV	"/dev/sweet-mqrtr"
+#define MQRTR_IOC_UP	_IOW('q', 0x21, uint32_t)
+static int raw_fd = -1;
+
+static int kernel_link_wanted(void)
+{
+	uint32_t v = 0;
+	size_t n = sizeof(v);
+	const char *e = getenv("WLAND_LINK");
+	if (e && !strcmp(e, "glink"))
+		return 0;
+	if (sysctlbyname("kern.sweet_bb", &v, &n, NULL, 0))
+		return 0;
+	return (v & 1) != 0;
+}
+
+int link_is_kernel(void)
+{
+	return raw_fd >= 0;
+}
 
 int verbose_link = 1;
 unsigned link_stats[4];
@@ -264,12 +296,29 @@ void link_queue_stats(unsigned *max, unsigned *dropped)
 	*dropped = qdrop;
 }
 
+/* one packet from the kernel's link (raw mode); 0 when nothing is waiting */
+static int raw_rx_one(void)
+{
+	static uint8_t pkt[sizeof(struct qrtr_hdr) + 65536 + 64];
+	ssize_t r = read(raw_fd, pkt, sizeof(pkt));
+	if (r <= 0) {
+		if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			static unsigned told;
+			if (told++ < 5)
+				printf("link: %s read: %s\n", MQRTR_DEV, strerror(errno));
+		}
+		return 0;
+	}
+	handle_data(pkt, (uint32_t)r);
+	return 1;
+}
+
 int link_poll(unsigned ms)
 {
 	uint64_t end = now_ms() + ms;
 	int n = 0;
 	do {
-		while (rx_one())
+		while (raw_fd >= 0 ? raw_rx_one() : rx_one())
 			n++;
 		drain();
 		if (link_idle && !idle_depth && !cb_depth && !send_depth) {
@@ -287,6 +336,22 @@ int link_poll(unsigned ms)
 int link_up(qrtr_cb_t cb, unsigned timeout_ms)
 {
 	qrtr_cb = cb;
+	if (raw_fd < 0 && kernel_link_wanted()) {
+		raw_fd = open(MQRTR_DEV, O_RDWR | O_NONBLOCK);
+		if (raw_fd < 0) {
+			printf("link: kernel link wanted (kern.sweet_bb & 1) but %s: %s\n", MQRTR_DEV, strerror(errno));
+			return -1;
+		}
+	}
+	if (raw_fd >= 0) {
+		uint32_t ms = timeout_ms;
+		if (ioctl(raw_fd, MQRTR_IOC_UP, &ms)) {
+			printf("link: kernel link: IPCRTR not open (%s)\n", strerror(errno));
+			return -1;
+		}
+		printf("glink: IPCRTR open (kernel link, %s)\n", MQRTR_DEV);
+		return 0;
+	}
 	if (glink_init())
 		return -1;
 	glink_send(GLINK_CMD_VERSION, 1, FEAT_INTENT_REUSE, NULL, 0);
@@ -314,6 +379,15 @@ static int find_intent(uint32_t len)
 /* One packet into one of the modem's intents (requested if none fits), in chunks of 8K as Linux does. */
 int link_send(const void *data, uint32_t len)
 {
+	if (raw_fd >= 0) {
+		/* the kernel sends it (waiting for a modem intent itself, at most 3 s) */
+		if (write(raw_fd, data, len) == (ssize_t)len)
+			return 0;
+		static unsigned told;
+		if (told++ < 20)
+			printf("link: %s write of %u bytes: %s\n", MQRTR_DEV, len, strerror(errno));
+		return -1;
+	}
 	uint64_t start = now_ms(), end = start + 3000;
 	int i, asked = 0;
 	while ((i = find_intent(len)) < 0) {
