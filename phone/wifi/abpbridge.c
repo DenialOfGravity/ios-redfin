@@ -62,6 +62,13 @@
  * dropped and logged ("abp: MALFORMED"), as one truncated PBM indication ABM-ASSERTed CommCenter in P2 run1.
  * Every new (svc, msg) is logged once with the action and why ("abp: NEW ..."); a policy reload logs them again.
  *
+ * n12z (2026-11-12) abpholdnas=N (cell.on, default 1): NAS (svc 0x03) indications to CommCenter (state replays, 'on' line
+ * indications and the modem's own) are HELD while no BSP activation indication (0xe2 0xb00c ind) has gone to a live
+ * CommCenter session, and released in order right after it is sent (or after the hold timeout: 1 = 5000 ms, N >= 100 = N ms;
+ * a timeout opens the gate for that session too). The gate opens abpholddly=N ms (default 500) after the activation
+ * indication, as CommCenter only reaches kProvisioned ~10 ms after "Baseband is now activated". P5 SOS: the SysInfo replay said "registered" ~0.2 s before activation, so
+ * CommCenter published kEmergencyOnly (service not yet provisioned) and never re-published. abpholdnas=0: no hold (f651489).
+ *
  * READY: the kernel (1063, sweetabp & 8) publishes the baseband services only after ABPB_IOC_READY 1. Mode 1 says
  * ready right after opening; mode 2 once the modem's DMS, NAS and UIM servers are known on QRTR, and not ready
  * when one of them goes away.
@@ -1035,6 +1042,126 @@ static int send_frame(unsigned pipe, const uint8_t *f, uint32_t n)
 	return send_to(pipe, cur_sess, f, n);
 }
 
+/*
+ * n12z: NAS indication hold until BSP activation (abpholdnas, see the top). The gate is one CommCenter session: the one
+ * the 0xb00c activation indication went to (or the one whose held indication timed out); it closes when that session
+ * ends (CommCenter restart), so every CommCenter start is held again.
+ */
+#define NHOLD		64
+#define HOLD_MAXF	4096
+static int holdnas = 1;			/* 0 off, 1 on (5000 ms), >= 100 on with that timeout (ms) */
+static struct hold { int used; uint32_t pipe, sess; uint8_t svc, cid; uint16_t msg; uint32_t n; uint64_t t; uint8_t f[HOLD_MAXF]; } holdq[NHOLD];
+static int nhold;			/* queued, oldest first */
+static int gate_set, holddly = 500;	/* abpholddly=N: the gate opens N ms after the activation indication (CommCenter
+					 * moves to kProvisioned ~10 ms after "Baseband is now activated"; default 500) */
+static uint64_t gate_at;
+static uint32_t gate_pipe, gate_sess;
+static unsigned held_cnt, held_rel_bsp, held_rel_to, held_drop;
+
+static int sess_live(uint32_t pipe, uint32_t sess)
+{
+	for (unsigned i = 0; i < NSESS; i++)
+		if (st[i].sess && st[i].sess == sess && st[i].pipe == pipe)
+			return 1;
+	return 0;
+}
+
+static int hold_gate_open(void)
+{
+	if (gate_set && !sess_live(gate_pipe, gate_sess)) {
+		gate_set = 0;
+		gate_at = 0;
+		printf("[%6llu] abp: holdnas: gate closed (session %s/%u ended): NAS indications held until the next BSP activation\n",
+		       (unsigned long long)link_ms(), gate_pipe < NPIPES ? pipe_name[gate_pipe] : "?", gate_sess);
+	}
+	return gate_set && link_ms() >= gate_at;
+}
+
+static int cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid);
+
+/* send the oldest k held frames (to clients that still exist) */
+static void hold_release(int k, const char *why)
+{
+	uint32_t pp = cur_pipe;
+	int sent = 0, gone = 0;
+	for (int i = 0; i < k && i < nhold; i++) {
+		struct hold *h = &holdq[i];
+		if (cid_live(h->pipe, h->sess, h->svc, h->cid)) {
+			cur_pipe = h->pipe;
+			send_to(h->pipe, h->sess, h->f, h->n);
+			sent++;
+		} else {
+			gone++;
+			held_drop++;
+		}
+	}
+	cur_pipe = pp;
+	if (k > nhold)
+		k = nhold;
+	memmove(holdq, holdq + k, sizeof(holdq[0]) * (size_t)(nhold - k));
+	nhold -= k;
+	if (sent || gone)
+		printf("[%6llu] abp: holdnas: released %d held NAS indication(s) (%s)%s%d client(s) gone\n", (unsigned long long)link_ms(),
+		       sent, why, gone ? ", dropped for " : ", ", gone);
+}
+
+static void hold_open(uint32_t pipe, uint32_t sess, int dly, const char *why)
+{
+	if (!gate_set || gate_pipe != pipe || gate_sess != sess)
+		printf("[%6llu] abp: holdnas: gate open on %s/%u in %d ms (%s), %d held\n", (unsigned long long)link_ms(),
+		       pipe < NPIPES ? pipe_name[pipe] : "?", sess, dly, why, nhold);
+	else
+		dly = 0;		/* already open there: no new delay */
+	gate_set = 1;
+	gate_pipe = pipe;
+	gate_sess = sess;
+	gate_at = link_ms() + (uint64_t)(dly > 0 ? dly : 0);
+	if (nhold && !dly)
+		hold_release(nhold, why);
+}
+
+/* a whole QMUX frame (01 | len | flags | svc | cid | SDU) for CommCenter: 1 = held here, 0 = send it now */
+static int hold_frame(uint32_t pipe, uint32_t sess, const uint8_t *f, uint32_t n)
+{
+	if (!holdnas || n < 13 || n > HOLD_MAXF || f[4] != 0x03 || f[6] != 0x04 || hold_gate_open())
+		return 0;
+	if (nhold == NHOLD)
+		hold_release(1, "queue full");
+	struct hold *h = &holdq[nhold++];
+	h->used = 1;
+	h->pipe = pipe;
+	h->sess = sess;
+	h->svc = f[4];
+	h->cid = f[5];
+	h->msg = (uint16_t)(f[9] | (f[10] << 8));
+	h->n = n;
+	h->t = link_ms();
+	memcpy(h->f, f, n);
+	held_cnt++;
+	printf("[%6llu] abp: holdnas: NAS indication 0x%04x to %s/%u cid %u held (no BSP activation yet; %d held)\n",
+	       (unsigned long long)h->t, h->msg, pipe < NPIPES ? pipe_name[pipe] : "?", sess, h->cid, nhold);
+	return 1;
+}
+
+static void hold_poll(uint64_t now)
+{
+	uint64_t to = holdnas >= 100 ? (uint64_t)holdnas : 5000;
+	if (!nhold)
+		return;
+	if (!holdnas) {
+		hold_release(nhold, "abpholdnas=0");
+		return;
+	}
+	if (hold_gate_open()) {
+		hold_release(nhold, "gate open");
+		return;
+	}
+	if (now - holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
+		held_rel_to++;
+		hold_open(holdq[0].pipe, holdq[0].sess, 0, "timeout, no BSP activation");
+	}
+}
+
 /* append TLV t to buf at *o */
 static void put_tlv(uint8_t *b, uint32_t *o, unsigned t, const void *v, unsigned l)
 {
@@ -1391,9 +1518,16 @@ static void send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, u
 	if (tn)
 		memcpy(b + 13, tl, tn);
 	finish_qmux(b, 13 + tn, svc, cid);
+	if (hold_frame(pipe, sess, b, 13 + tn))
+		return;
 	uint32_t pp = cur_pipe;
 	send_to(pipe, sess, b, 13 + tn);
 	cur_pipe = pp;
+	if (holdnas && svc == 0xe2 && msg == 0xb00c) {	/* n12z: BSP activation went out: release the held NAS state */
+		if (nhold)
+			held_rel_bsp++;
+		hold_open(pipe, sess, holddly, "BSP activation 0xb00c sent");
+	}
 }
 
 static void pend_add(struct pend *x)
@@ -2154,6 +2288,8 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 	uint32_t pp = cur_pipe, cpipe = c->pipe, csess = c->sess;
 	unsigned csvc = c->svc, ccid = c->cid;
+	if (d[0] == 0x04 && hold_frame(c->pipe, c->sess, b, 6 + len))
+		return;		/* n12z: held until BSP activation */
 	cur_pipe = c->pipe;
 	send_to(c->pipe, c->sess, b, 6 + len);
 	cur_pipe = pp;
@@ -2203,6 +2339,8 @@ static void read_words(void)
 	cidfail = 0;
 	reuse = 1;
 	dumpword = 0;
+	holdnas = 1;
+	holddly = 500;
 	err_code = QMI_ERR_NOT_SUPPORTED;
 	if (f) {
 		size_t k = fread(b, 1, sizeof(b) - 1, f);
@@ -2223,6 +2361,10 @@ static void read_words(void)
 		kickon = w ? atoi(w + 8) : 1;
 		w = strstr(b, "abpdump=");
 		dumpword = w ? atoi(w + 8) : 0;
+		w = strstr(b, "abpholdnas=");
+		holdnas = w ? atoi(w + 11) : 1;
+		w = strstr(b, "abpholddly=");
+		holddly = w ? atoi(w + 11) : 500;
 	}
 	if (mode == 1)
 		logframes = 1;		/* P1 observe always logs every frame */
@@ -2259,6 +2401,8 @@ static void dev_open(uint64_t now)
 static void dev_close(uint64_t now, const char *why)
 {
 	cl_free_all(why);
+	nhold = 0;		/* n12z: held NAS indications die with the bridge */
+	gate_set = 0;
 	close(fd);
 	fd = -1;
 	ready = -1;
@@ -2349,6 +2493,7 @@ void abpbridge_poll(void)
 	if (mode >= 2) {
 		simid_poll(now);	/* n12b */
 		bbr_poll(now);
+		hold_poll(now);		/* n12z */
 	}
 	if (dumpword && dumpword != dumpword_old)
 		mst_table("abpdump");
@@ -2364,9 +2509,10 @@ void abpbridge_poll(void)
 			}
 			printf("[%6llu] abp: stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; "
 			       "%d router clients (%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u; "
-			       "bad records %u, kicks %u, rxq max %u drop %u, stripped %u\n",
+			       "bad records %u, kicks %u, rxq max %u drop %u, stripped %u; holdnas=%d held %u (rel bsp %u, timeout %u, gone %u)\n",
 			       (unsigned long long)now, nframes_in, nframes_out, cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped,
-			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr, stripped);
+			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr, stripped,
+			       holdnas, held_cnt, held_rel_bsp, held_rel_to, held_drop);
 			if (mst_dirty)
 				mst_table("60 s");
 		}
