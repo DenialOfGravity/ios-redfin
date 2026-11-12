@@ -2814,8 +2814,19 @@ struct apr_header {
 static struct {
 	uint32_t opcode, token, length;
 	uint32_t words[64];
+	uint16_t port;                  /* 1065: the answer's source port */
 	volatile bool there;
 } apr_answer;
+/*
+ * 1065: APRV2_IBASIC_EVT_ACCEPTED (payload: the command's opcode, 4 bytes) is the voice services' (MVM/CVS/CVP)
+ * "queued, the result follows" for a command they run later (start voice, detach, destroy): not the answer. The
+ * waiter keeps waiting for the APR_BASIC_RSP_RESULT after it; if that does not come in time, it gets this.
+ */
+#define APRV2_IBASIC_EVT_ACCEPTED       0x000100beu
+static struct {
+	uint32_t token, opcode;
+	uint16_t port;
+} apr_accepted;
 static uint32_t apr_in, apr_out, apr_next_token = 1;
 static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
 static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
@@ -2866,11 +2877,21 @@ apr_input(const uint8_t *data, uint32_t length)
 		    "%#x %#x\n", header.from_service, header.from_domain, header.from_port, header.to_service, header.to_domain,
 		    header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2], w[3]);
 	}
+	if (header.opcode == APRV2_IBASIC_EVT_ACCEPTED && apr_waited_for != 0 && header.token == apr_waited_for) {
+		uint32_t accepted = 0;
+
+		memcpy(&accepted, data + header_length, payload < sizeof(accepted) ? payload : sizeof(accepted));
+		apr_accepted.opcode = accepted;
+		apr_accepted.port = header.from_port;
+		apr_accepted.token = header.token;
+		return;
+	}
 	bzero(apr_answer.words, sizeof(apr_answer.words));
 	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
 	apr_answer.length = payload;
 	apr_answer.opcode = header.opcode;
 	apr_answer.token = header.token;
+	apr_answer.port = header.from_port;
 	apr_answer.there = true;
 }
 
@@ -2882,6 +2903,18 @@ apr_input(const uint8_t *data, uint32_t length)
 bool
 redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
     uint32_t ms, struct redwood_apr_answer *answer)
+{
+	return redwood_adsp_apr_ports(service, port, port, token, opcode, payload, length, ms, answer);
+}
+
+/*
+ * 1065 (sweet_voice.c): the same with the source and destination ports apart, as the voice services want them
+ * (q6voice.c: source = the session's index, destination = the MVM/CVS/CVP handle, 0 to create one). The
+ * answer's source port (a create's new handle) comes back in answer->port.
+ */
+bool
+redwood_adsp_apr_ports(uint8_t service, uint16_t from_port, uint16_t port, uint32_t token, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t ms, struct redwood_apr_answer *answer)
 {
 	uint8_t packet[sizeof(struct apr_header) + 256];
 	struct apr_header *header = (struct apr_header *)packet;
@@ -2896,7 +2929,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
 	header->size = (uint16_t)(sizeof(*header) + length);
 	header->from_service = service;
 	header->from_domain = APR_DOMAIN_APPS;
-	header->from_port = port;
+	header->from_port = from_port;
 	header->to_service = service;
 	header->to_domain = APR_DOMAIN_ADSP;
 	header->to_port = port;
@@ -2920,6 +2953,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
 	}
 	header->token = token;
 	apr_answer.there = false;
+	apr_accepted.token = 0;
 	apr_waited_for = token;
 	error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
 	if (error != 0) {
@@ -2933,11 +2967,24 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
 					answer->opcode = apr_answer.opcode;
 					answer->token = apr_answer.token;
 					answer->length = apr_answer.length;
+					answer->port = apr_answer.port;
 					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
 				}
 				break;
 			}
 			sleep_ms(1);
+		}
+		if (!answered && apr_accepted.token == token) {
+			/* 1065: accepted, but its result did not come within ms */
+			answered = true;
+			if (answer != NULL) {
+				bzero(answer->words, sizeof(answer->words));
+				answer->opcode = APRV2_IBASIC_EVT_ACCEPTED;
+				answer->token = token;
+				answer->length = 4;
+				answer->port = apr_accepted.port;
+				answer->words[0] = apr_accepted.opcode;
+			}
 		}
 	}
 	apr_waited_for = 0;

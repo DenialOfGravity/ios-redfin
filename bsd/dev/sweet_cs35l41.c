@@ -49,6 +49,7 @@ void sweet_amp_stop(void);
 bool sweet_amp_ready(void);
 void sweet_amp_status(void);
 void sweet_amp_reprobe(void);
+void sweet_amp_select(uint32_t mask);
 int sweet_audio_pmic_gpio(unsigned sid, unsigned peripheral, int high);
 
 #define SAY(...)                printf("SWEET AMP: " __VA_ARGS__)
@@ -292,6 +293,7 @@ static LCK_MTX_DECLARE(reprobe_lock, &amp_lock_group);
 #define CS_REPROBE_GAP_US       10000000ull     /* at least 10 s between two tries of one amplifier */
 #define CS_REPROBE_OTP_MS       30u             /* (boot probe: 100) so the ON path stays short */
 static uint32_t below_now = CS_VOL_MAX_BELOW + 1;
+static volatile uint32_t amp_mask = 3;          /* 1065: which amplifiers sweet_amp_start() may power (bit i = amps[i]) */
 static bool gave_up, warned_temp;
 
 static int
@@ -677,7 +679,7 @@ sweet_amp_start(void)
 		uint32_t s1 = 0, pwr2 = 0;
 		int err;
 
-		if (!a->prepared || a->on) {
+		if (!a->prepared || a->on || !(amp_mask & (1u << i))) {
 			any |= a->on;
 			continue;
 		}
@@ -696,16 +698,15 @@ sweet_amp_start(void)
 }
 
 /* Muted, GLOBAL_EN off, PDN_DONE waited for, the pdn patch: powered down (cs35l41_main_amp_event POST_PMD). */
-void
-sweet_amp_stop(void)
+static void
+amp_off(struct amp *a)
 {
-	for (unsigned i = 0; i < 2; i++) {
-		struct amp *a = &amps[i];
+	{
 		uint32_t s1 = 0;
 		unsigned ms;
 
 		if (!a->on) {
-			continue;
+			return;
 		}
 		(void)cs_bits(a, CS_AMP_OUT_MUTE, 0x10, 0x10);
 		(void)cs_bits(a, CS_PWR_CTRL1, 1, 0);
@@ -720,6 +721,36 @@ sweet_amp_stop(void)
 		(void)cs_bits(a, CS_PWR_CTRL2, 0x01, 0);
 		a->on = false;
 		SAY("%s: off (%s)\n", a->name, ms < 100 ? "PDN_DONE" : "PDN NOT SEEN");
+	}
+}
+
+void
+sweet_amp_stop(void)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		amp_off(&amps[i]);
+	}
+}
+
+/*
+ * 1065 (sweet_voice.c): only the amplifiers in `mask' may be powered (bit 0 = 0x40, slot 0, top/earpiece: Android's
+ * "handset" path; bit 1 = 0x41, slot 1, bottom: "speaker-mono"); one that is on and not in it is powered down now.
+ * 0 or 3 = both (the default, as before).
+ */
+void
+sweet_amp_select(uint32_t mask)
+{
+	mask &= 3;
+	mask = mask == 0 ? 3 : mask;
+	if (mask != amp_mask) {
+		SAY("amplifiers allowed: %s%s%s\n", (mask & 1) ? amps[0].name : "", mask == 3 ? " and " : "",
+		    (mask & 2) ? amps[1].name : "");
+	}
+	amp_mask = mask;
+	for (unsigned i = 0; i < 2; i++) {
+		if (!(mask & (1u << i))) {
+			amp_off(&amps[i]);
+		}
 	}
 }
 

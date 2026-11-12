@@ -919,6 +919,7 @@ static bool ring_primed;
 static volatile uint32_t ios_wants;
 static volatile uint64_t ios_closed_us;
 static volatile bool stopping, record_wanted, running;
+static volatile bool voice_wants;               /* 1065: a call holds the path up (kern.sweet_voice, sweet_voice.c) */
 static uint32_t record_secs;
 static int mic_wake;
 static LCK_GRP_DECLARE(mic_lock_group, "sweet-mic");
@@ -1080,7 +1081,7 @@ listen(void)
 
 	while (!stopping) {
 		uint64_t now = now_us();
-		bool wanted = ios_wants || now - ios_closed_us < 3000000ull || record_wanted;
+		bool wanted = ios_wants || now - ios_closed_us < 3000000ull || record_wanted || voice_wants;
 
 		if (!wanted) {
 			break;
@@ -1143,20 +1144,21 @@ static void
 mic_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	while (!stopping) {
-		if (!ios_wants && !record_wanted) {
+		if (!ios_wants && !record_wanted && !voice_wants) {
 			assert_wait_timeout((event_t)&mic_wake, THREAD_UNINT, 500, NSEC_PER_MSEC);
 			thread_block(THREAD_CONTINUE_NULL);
 			continue;
 		}
 		if (path_broken && !record_wanted) {
 			/* (given up until the reader closes and opens again) */
-			while (ios_wants && !stopping && !record_wanted) {
+			while ((ios_wants || voice_wants) && !stopping && !record_wanted) {
 				sleep_ms(100);
 			}
 			path_broken = false;
 			continue;
 		}
-		SAY("%s: the mic path comes up\n", record_wanted ? "recording" : "iOS opened /dev/redwood-mic");
+		SAY("%s: the mic path comes up\n", record_wanted ? "recording" : voice_wants ? "a call (kern.sweet_voice)" :
+		    "iOS opened /dev/redwood-mic");
 		if (!path_up()) {
 			SAY("THE MIC PATH DID NOT COME UP\n");
 			path_broken = true;
@@ -1208,6 +1210,37 @@ sweet_mic_status(void)
 	    running ? "mic=1" : "off", path_is_up ? "UP" : "down", path_broken ? " (broken)" : "", path_ups,
 	    ios_wants ? "reading" : "-", codec_found ? (codec_p ? "rt5514p" : "rt5514") : "not found", reads_done, read_errors,
 	    ring_written, ring_read);
+}
+
+/*
+ * 1065: a call holds the microphones' path up as an open /dev/redwood-mic does (the DSP's voice processor takes port
+ * 0x9001's samples next to our record session; the ring just runs on). Released: down 3 s later unless iOS reads.
+ */
+bool
+redwood_mic_voice_hold(bool on, uint32_t wait_ms)
+{
+	if (!running) {
+		SAY("voice: no mic path (needs mic=1)\n");
+		return false;
+	}
+	if (!on) {
+		if (voice_wants) {
+			voice_wants = false;
+			ios_closed_us = now_us();
+			SAY("voice: released by the call\n");
+		}
+		return false;
+	}
+	if (!voice_wants) {
+		voice_wants = true;
+		path_broken = false;
+		thread_wakeup(&mic_wake);
+		SAY("voice: held by a call\n");
+	}
+	for (uint32_t ms = 0; !path_is_up && ms < wait_ms; ms += 10) {
+		sleep_ms(10);
+	}
+	return path_is_up;
 }
 
 void

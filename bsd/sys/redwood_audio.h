@@ -108,6 +108,7 @@ void redwood_audio_record_fed(const int16_t *frames, uint32_t count);
 struct redwood_apr_answer {
 	uint32_t opcode, token, length;         /* length: of the payload, in bytes */
 	uint32_t words[64];
+	uint16_t port;                          /* 1065: the answer's source port (a voice session's new handle) */
 };
 typedef bool (*redwood_apr_events_t)(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload,
     uint32_t length);
@@ -115,6 +116,9 @@ typedef bool (*redwood_apr_events_t)(uint8_t service, uint16_t port, uint32_t op
 bool redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
     uint32_t wait_ms, struct redwood_apr_answer *answer);
 void redwood_adsp_apr_events(redwood_apr_events_t handler);
+/* 1065: with the source port apart from the destination port (the voice services: sweet_voice.c) */
+bool redwood_adsp_apr_ports(uint8_t service, uint16_t from_port, uint16_t port, uint32_t token, uint32_t opcode,
+    const void *payload, uint32_t length, uint32_t wait_ms, struct redwood_apr_answer *answer);
 const uint8_t *redwood_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void redwood_adsp_fw_free(const uint8_t *data, uint64_t size);
 
@@ -130,6 +134,17 @@ void redwood_adsp_apr_events_second(redwood_apr_events_t handler);
 bool redwood_audio_recording_mic(void);
 void redwood_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
 void redwood_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
+/*
+ * 1065, in-call audio (bsd/dev/sweet_voice.c, kern.sweet_voice). The microphones' path held up for a call
+ * (as if /dev/redwood-mic were open): true once it is up (waits at most wait_ms); false = released or not up.
+ */
+bool redwood_mic_voice_hold(bool on, uint32_t wait_ms);
+/*
+ * The speakers' port 0x9040 and the amplifiers held for a call: amps bit 0 = 0x40 (slot 0, top/earpiece),
+ * bit 1 = 0x41 (slot 1, bottom speaker), at `below' eighths of a dB under Android's level; 0 = the call is over
+ * (what the call alone brought up is taken down; the amplifiers follow what iOS plays again). True: the port runs.
+ */
+bool redwood_sound_voice(uint32_t amps, uint32_t below);
 #endif
 
 #endif /* _SYS_REDWOOD_AUDIO_H_ */

@@ -102,6 +102,7 @@ extern void sweet_amp_stop(void);
 extern bool sweet_amp_ready(void);
 extern void sweet_amp_status(void);
 extern void sweet_amp_reprobe(void);
+extern void sweet_amp_select(uint32_t mask);
 /* bsd/dev/sweet_mic.c */
 extern int sweet_mic_cmd(uint32_t seconds);
 extern void sweet_mic_status(void);
@@ -986,6 +987,12 @@ tone_for(uint32_t ms)
 
 static volatile bool amps_on, amps_held_off, amps_given_up, watcher_runs;
 static volatile uint32_t below_wanted;          /* set by poke `a gain`; applied by the watcher */
+/*
+ * 1065, a call (redwood_sound_voice(), sweet_voice.c): which amplifiers it holds on (bit 0 = 0x40 earpiece, bit 1 = 0x41
+ * speaker; 0 = no call) and at what level; the watcher applies them (voice_applied / voice_below_applied).
+ */
+static volatile uint32_t voice_amps, voice_below = 240, voice_applied, voice_below_applied;
+static bool voice_own_port, voice_direct_amps;         /* (no watcher: what the call brought up itself) */
 static uint32_t amp_starts;
 
 static const char *
@@ -1037,8 +1044,9 @@ watch(void)
 	watcher_runs = true;
 	while (!stopping) {
 		uint64_t now = now_us(), until = tone_until_us, sounded = last_sound_us;
+		uint32_t vmask = voice_amps, vbelow = voice_below;
 		bool wanted = (now < until + QUIET_BEFORE_OFF_US && until != 0) ||
-		    (level >= 4 && !ios_muted && sounded != 0 && now - sounded < QUIET_BEFORE_OFF_US);
+		    (level >= 4 && !ios_muted && sounded != 0 && now - sounded < QUIET_BEFORE_OFF_US) || vmask != 0;
 		uint32_t b, g;
 		bool m;
 
@@ -1051,21 +1059,43 @@ watch(void)
 			}
 			below = ~0u;            /* (applied just below, with iOS's part) */
 		}
+		if (vmask != voice_applied || (vmask != 0 && vbelow != voice_below_applied)) {
+			/* 1065: a call began, changed amplifier or level, or ended */
+			if (vmask != 0) {
+				sweet_amp_select(vmask);
+				redwood_guard_attenuation(vbelow);
+				if (amps_on) {
+					(void)sweet_amp_volume(vbelow);
+					(void)sweet_amp_start();        /* (the one the call wants, if it was not on) */
+				}
+				SAY("voice: the call holds amplifier%s %s at %s dB under Android's level\n", vmask == 3 ? "s" : "",
+				    vmask == 1 ? "0x40 (earpiece)" : vmask == 2 ? "0x41 (speaker)" : "0x40 and 0x41", db(t, vbelow));
+			} else {
+				amps_off("the call ended");
+				sweet_amp_select(3);
+				redwood_guard_attenuation(below + ios_below);
+				SAY("voice: the call let the amplifiers go\n");
+			}
+			voice_applied = vmask;
+			voice_below_applied = vbelow;
+		}
 		if (below_wanted != below) {
 			uint32_t effective;
 
 			below = below_wanted;
 			effective = below + ios_below;
-			redwood_guard_attenuation(effective);
+			redwood_guard_attenuation(voice_applied ? voice_below_applied : effective);
 			if (amps_on) {
-				(void)sweet_amp_volume(effective);
+				(void)sweet_amp_volume(voice_applied ? voice_below_applied : effective);
 			}
 			SAY("amplifiers' level: %s dB under Android's (sndbelow/gain %s + iOS %s)\n", db(t, effective), db(t2, below),
 			    db(t3, ios_below));
 		}
 		if (wanted && !amps_on && !amps_held_off && !amps_given_up && sweet_amp_ready()) {
+			uint32_t at = voice_applied ? voice_below_applied : below + ios_below;      /* 1065: a call's level */
+
 			/* the guard is armed at the level they will play at before they are started */
-			redwood_guard_attenuation(below + ios_below);
+			redwood_guard_attenuation(at);
 			guard_say("(silence before)");
 			if (!sweet_amp_start()) {
 				SAY("THE AMPLIFIERS DID NOT START: given up\n");
@@ -1076,19 +1106,21 @@ watch(void)
 				amp_starts++;
 				/* faded in from 30 dB further down, 6 dB a step */
 				for (uint32_t extra = 240; extra > 0; extra -= 48) {
-					(void)sweet_amp_volume(below + ios_below + extra);
+					(void)sweet_amp_volume(at + extra);
 					sleep_ms(8);
 				}
-				(void)sweet_amp_volume(below + ios_below);
+				(void)sweet_amp_volume(at);
 				last_look = now_us();
 				ios_peak = 0;
-				SAY("amplifiers ON at %s dB under Android's level (start %u)\n", db(t, below + ios_below), amp_starts);
+				SAY("amplifiers ON at %s dB under Android's level (start %u%s)\n", db(t, at), amp_starts,
+				    voice_applied ? ", for a call" : "");
 			}
 		} else if (amps_on && (!wanted || amps_held_off)) {
 			if (level >= 4) {
 				SAY("what iOS wrote while they were on peaked at %u of 32768\n", ios_peak);
 			}
-			amps_off(amps_held_off ? "poke a off" : ios_muted ? "iOS muted" : "2 s of silence");
+			amps_off(amps_held_off ? "poke a off" : ios_muted ? "iOS muted" : vmask != voice_applied ? "the call ended" :
+			    "2 s of silence");
 		} else if (amps_on && now - last_look >= 200000) {
 			last_look = now;
 			if (!sweet_amp_healthy()) {
@@ -1263,6 +1295,9 @@ redwood_sound_dsp_up(void)
 void
 redwood_sound_dsp_down(void)
 {
+	if (voice_own_port || voice_direct_amps) {
+		(void)redwood_sound_voice(0, 0);        /* 1065 */
+	}
 	if (running) {
 		take_down();
 	}
@@ -1271,6 +1306,92 @@ redwood_sound_dsp_down(void)
 void
 redwood_sound_quiesce(void)
 {
+}
+
+/* ---- 1065: a call (bsd/dev/sweet_voice.c) ---------------------------------------------------------------------- */
+
+/*
+ * The port 0x9040 and the amplifiers for a call. With sound>=3 the watcher owns the amplifiers: it is told and
+ * waited for. Without (sound=0, or the path down): the call brings up the votes, pins, clock and port itself
+ * (no ADM/ASM: the DSP's voice processor is the port's only client then) and drives the amplifiers directly; at
+ * the call's end it takes down only what it brought up.
+ */
+bool
+redwood_sound_voice(uint32_t amps, uint32_t level_below)
+{
+	char t[16];
+	bool up;
+
+	amps &= 3;
+	level_below = level_below < below_min ? below_min : level_below;
+	if (watcher_runs && !stopping) {
+		voice_below = level_below;
+		voice_amps = amps;
+		for (unsigned ms = 0; ms < 2000 && (voice_applied != amps || (amps != 0 && voice_below_applied != level_below)); ms += 10) {
+			sleep_ms(10);
+		}
+		SAY("voice: %s (watcher; port 0x9040 %s, amplifiers %s)\n", amps ? "held" : "released", port_on ? "running" : "DOWN",
+		    amps_on ? "on" : amps_held_off ? "held off (poke a off)" : amps_given_up ? "GIVEN UP" : "off");
+		return amps != 0 && port_on;
+	}
+	lck_mtx_lock(&sound_lock);
+	if (amps != 0 && !port_on && !voice_own_port) {
+		if (running && !taken_down) {
+			SAY("voice: sound=%u's path is being set up or is not up: the port is not taken over\n", level);
+			lck_mtx_unlock(&sound_lock);
+			return false;
+		}
+		SAY("voice: no speaker path running (sound=%u): the call brings up QUIN_TDM_RX_0 0x9040 itself\n", level);
+		PE_parse_boot_argn("sndlpi", &use_lpi, sizeof(use_lpi));
+		(void)vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO");
+		(void)vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC");
+		(void)pins_on();
+		voice_own_port = true;
+		if (!afe_on()) {
+			SAY("voice: port 0x9040 DID NOT START\n");
+			afe_off();
+			pins_off();
+			devote(LPASS_HW_DCODEC_BLOCK);
+			devote(LPASS_HW_MACRO_BLOCK);
+			voice_own_port = false;
+			lck_mtx_unlock(&sound_lock);
+			return false;
+		}
+	}
+	if (amps != 0) {
+		if (!sweet_amp_prepare()) {
+			SAY("voice: no amplifier ready: the call is not heard\n");
+		} else {
+			sweet_amp_select(amps);
+			(void)sweet_amp_volume(level_below);
+			if (!sweet_amp_start()) {
+				SAY("voice: THE AMPLIFIER DID NOT START\n");
+			} else {
+				voice_direct_amps = true;
+				SAY("voice: amplifier%s %s on at %s dB under Android's level (direct)\n", amps == 3 ? "s" : "",
+				    amps == 1 ? "0x40 (earpiece)" : amps == 2 ? "0x41 (speaker)" : "0x40 and 0x41", db(t, level_below));
+			}
+		}
+	} else {
+		if (voice_direct_amps) {
+			sweet_amp_stop();
+			sweet_amp_select(3);
+			voice_direct_amps = false;
+		}
+		if (voice_own_port) {
+			afe_off();
+			pins_off();
+			devote(LPASS_HW_DCODEC_BLOCK);
+			devote(LPASS_HW_MACRO_BLOCK);
+			voice_own_port = false;
+			SAY("voice: the call's own port 0x9040 is stopped and put back\n");
+		}
+	}
+	voice_applied = amps;
+	voice_below_applied = level_below;
+	up = amps != 0 && port_on;
+	lck_mtx_unlock(&sound_lock);
+	return up;
 }
 
 /* ---- poke `a ...` (bsd/dev/sweet_poke.c) -------------------------------------------------------------------------- */
