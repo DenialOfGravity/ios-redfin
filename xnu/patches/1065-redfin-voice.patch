@@ -31,18 +31,44 @@ index 69c7176..f61fab6 100644
  bsd/dev/redwood_net.c		standard
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
-index 2a8495b..a7bc4b8 100644
+index 2a8495b..9a4cd9b 100644
 --- a/bsd/dev/sweet_adsp.c
 +++ b/bsd/dev/sweet_adsp.c
-@@ -2814,6 +2814,7 @@ struct apr_header {
+@@ -2814,8 +2814,19 @@ struct apr_header {
  static struct {
  	uint32_t opcode, token, length;
  	uint32_t words[64];
 +	uint16_t port;                  /* 1065: the answer's source port */
  	volatile bool there;
  } apr_answer;
++/*
++ * 1065: APRV2_IBASIC_EVT_ACCEPTED (payload: the command's opcode, 4 bytes) is the voice services' (MVM/CVS/CVP)
++ * "queued, the result follows" for a command they run later (start voice, detach, destroy): not the answer. The
++ * waiter keeps waiting for the APR_BASIC_RSP_RESULT after it; if that does not come in time, it gets this.
++ */
++#define APRV2_IBASIC_EVT_ACCEPTED       0x000100beu
++static struct {
++	uint32_t token, opcode;
++	uint16_t port;
++} apr_accepted;
  static uint32_t apr_in, apr_out, apr_next_token = 1;
-@@ -2871,6 +2872,7 @@ apr_input(const uint8_t *data, uint32_t length)
+ static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
+ static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
+@@ -2866,11 +2877,21 @@ apr_input(const uint8_t *data, uint32_t length)
+ 		    "%#x %#x\n", header.from_service, header.from_domain, header.from_port, header.to_service, header.to_domain,
+ 		    header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2], w[3]);
+ 	}
++	if (header.opcode == APRV2_IBASIC_EVT_ACCEPTED && apr_waited_for != 0 && header.token == apr_waited_for) {
++		uint32_t accepted = 0;
++
++		memcpy(&accepted, data + header_length, payload < sizeof(accepted) ? payload : sizeof(accepted));
++		apr_accepted.opcode = accepted;
++		apr_accepted.port = header.from_port;
++		apr_accepted.token = header.token;
++		return;
++	}
+ 	bzero(apr_answer.words, sizeof(apr_answer.words));
+ 	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
  	apr_answer.length = payload;
  	apr_answer.opcode = header.opcode;
  	apr_answer.token = header.token;
@@ -50,7 +76,7 @@ index 2a8495b..a7bc4b8 100644
  	apr_answer.there = true;
  }
  
-@@ -2882,6 +2884,18 @@ apr_input(const uint8_t *data, uint32_t length)
+@@ -2882,6 +2903,18 @@ apr_input(const uint8_t *data, uint32_t length)
  bool
  redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
      uint32_t ms, struct redwood_apr_answer *answer)
@@ -69,7 +95,7 @@ index 2a8495b..a7bc4b8 100644
  {
  	uint8_t packet[sizeof(struct apr_header) + 256];
  	struct apr_header *header = (struct apr_header *)packet;
-@@ -2896,7 +2910,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
+@@ -2896,7 +2929,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
  	header->size = (uint16_t)(sizeof(*header) + length);
  	header->from_service = service;
  	header->from_domain = APR_DOMAIN_APPS;
@@ -78,7 +104,15 @@ index 2a8495b..a7bc4b8 100644
  	header->to_service = service;
  	header->to_domain = APR_DOMAIN_ADSP;
  	header->to_port = port;
-@@ -2933,6 +2947,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
+@@ -2920,6 +2953,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
+ 	}
+ 	header->token = token;
+ 	apr_answer.there = false;
++	apr_accepted.token = 0;
+ 	apr_waited_for = token;
+ 	error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
+ 	if (error != 0) {
+@@ -2933,12 +2967,25 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
  					answer->opcode = apr_answer.opcode;
  					answer->token = apr_answer.token;
  					answer->length = apr_answer.length;
@@ -86,6 +120,24 @@ index 2a8495b..a7bc4b8 100644
  					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
  				}
  				break;
+ 			}
+ 			sleep_ms(1);
+ 		}
++		if (!answered && apr_accepted.token == token) {
++			/* 1065: accepted, but its result did not come within ms */
++			answered = true;
++			if (answer != NULL) {
++				bzero(answer->words, sizeof(answer->words));
++				answer->opcode = APRV2_IBASIC_EVT_ACCEPTED;
++				answer->token = token;
++				answer->length = 4;
++				answer->port = apr_accepted.port;
++				answer->words[0] = apr_accepted.opcode;
++			}
++		}
+ 	}
+ 	apr_waited_for = 0;
+ 	lck_mtx_unlock(&apr_lock);
 diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
 index 361d342..d9cdf84 100644
 --- a/bsd/dev/sweet_cs35l41.c
@@ -471,10 +523,10 @@ index f03f27a..3728447 100644
  static const char *
 diff --git a/bsd/dev/sweet_voice.c b/bsd/dev/sweet_voice.c
 new file mode 100644
-index 0000000..6fe1522
+index 0000000..750588a
 --- /dev/null
 +++ b/bsd/dev/sweet_voice.c
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,579 @@
 +/*
 + * redfin (Pixel 5): in-call audio through the audio DSP's voice services. Patch 1065.
 + *
@@ -533,6 +585,7 @@ index 0000000..6fe1522
 +#define APR_SVC_CVS             10
 +#define APR_SVC_CVP             11
 +#define APR_BASIC_RSP_RESULT    0x000110e8u
++#define APRV2_IBASIC_EVT_ACCEPTED 0x000100beu     /* "queued": sweet_adsp.c waits past it for the result */
 +#define APR_WAIT_MS             1000
 +#define VOICE_INDEX             5               /* q6voice.c voice_get_idx_for_session(VOICEMMODE1): the source port */
 +
@@ -635,11 +688,21 @@ index 0000000..6fe1522
 +		SAY("%s: ok\n", what);
 +		return wanted == 0;
 +	}
++	if (answer->opcode == APRV2_IBASIC_EVT_ACCEPTED && answer->words[0] == opcode) {
++		/* accepted (4 bytes: the opcode), and its result did not come within APR_WAIT_MS: taken as ok */
++		SAY("%s: accepted, no result within %u ms: taken as ok\n", what, APR_WAIT_MS);
++		return wanted == 0;
++	}
 +	if (wanted != 0 && answer->opcode == wanted) {
 +		return true;
 +	}
-+	SAY("%s: unexpected answer: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length, answer->words[0],
-+	    answer->words[1]);
++	if (answer->length >= 8) {
++		SAY("%s: unexpected answer: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length,
++		    answer->words[0], answer->words[1]);
++	} else {
++		SAY("%s: unexpected answer: opcode %#x, %u bytes: %#x\n", what, answer->opcode, answer->length,
++		    answer->words[0]);
++	}
 +	return false;
 +}
 +
