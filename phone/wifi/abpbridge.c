@@ -74,6 +74,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include "abpbridge.h"
 #include "cell.h"
 #include "link.h"
@@ -226,7 +227,7 @@ struct pol {
 
 struct fref { int tlv, off, len, add, hasadd; };	/* n12b: a request field "RQ<tlv>:<off>:<len>[+<n>]" */
 /* r3 trigger lines ("on svc msg ind|replay ...") */
-enum { TRG_IND, TRG_REPLAY };
+enum { TRG_IND, TRG_REPLAY, TRG_BBRESET };
 #define NTRG	64
 static struct trg {
 	int svc, msg, kind;
@@ -488,6 +489,16 @@ static int parse_fref(const char *s, struct fref *f)
 	unsigned t;
 	int off, len, add = 0, k = 0;
 	memset(f, 0, sizeof(*f));
+	if (s[0] >= '0' && s[0] <= '9') {	/* a number: "if RQ01:0:1=4" */
+		char *e;
+		long v = strtol(s, &e, 0);
+		if (e == s)
+			return -1;
+		f->tlv = -1;
+		f->len = 1;
+		f->add = (int)v;
+		return 0;
+	}
 	if ((s[0] != 'R' && s[0] != 'r') || (s[1] != 'Q' && s[1] != 'q'))
 		return -1;
 	if (sscanf(s + 2, "%x:%d:%d%n", &t, &off, &len, &k) != 3 || t > 255 || off < 0 || off > 4096 || len < 1 || len > 64)
@@ -547,6 +558,10 @@ static int fref_get(const struct fref *f, const uint8_t *rq, uint32_t rqn, int d
 static int fref_num(const struct fref *f, const uint8_t *rq, uint32_t rqn, uint32_t *x)
 {
 	uint8_t b[64];
+	if (f->tlv < 0) {
+		*x = (uint32_t)f->add;
+		return 0;
+	}
 	if (f->len > 4 || fref_get(f, rq, rqn, 0, b))
 		return -1;
 	*x = 0;
@@ -689,6 +704,8 @@ static int parse_trigger(char *line, int ln)
 			if (!t.data || !tlvs_ok(t.data, t.dlen))
 				goto bad;
 		}
+	} else if (!strcmp(w[3], "bbreset")) {
+		t.kind = TRG_BBRESET;	/* n12b: m2 = ms the services stay un-published */
 	} else if (!strcmp(w[3], "replay")) {
 		t.kind = TRG_REPLAY;
 		if (k < 6 || parse_num(w[5], &b) || b < 0 || b > 0xffff)
@@ -1649,6 +1666,38 @@ static void simid_poll(uint64_t now)
 	simid_read(c, si, 0x6f07);
 }
 
+/*
+ * n12b: "on <svc> <msg> bbreset <ms> [if ..]": an emulated baseband reset. ABM's soft reset is DMS Set Operating Mode
+ * (0x002e) to Reset (TLV 0x01 = 4), which the router answers itself (wland owns the modem's mode); ABM then waits ~12 s
+ * for "reset detection" (its pipe reads failing), falls back to a hard reset that fails too ("Reset failed ...
+ * kInternalError"), and the carrier-bundle push FSM treats the push as failed and starts over. This un-publishes the
+ * kernel's baseband stand-ins 100 ms after the answer (kern.sweet_abp_publish=0: pending reads end kIOReturnAborted, as
+ * a modem going down) and publishes them again <ms> later, as a modem coming back. The real modem is not touched.
+ */
+static uint64_t bbr_unpub_at, bbr_pub_at;
+static unsigned bbresets;
+static void bbr_publish(int on)
+{
+	int v = on;
+	if (sysctlbyname("kern.sweet_abp_publish", NULL, NULL, &v, sizeof(v)))
+		printf("[%6llu] abp: bbreset: kern.sweet_abp_publish=%d: %s\n", (unsigned long long)link_ms(), on, strerror(errno));
+	else
+		printf("[%6llu] abp: bbreset: baseband services %s (emulated reset #%u)\n", (unsigned long long)link_ms(),
+		       on ? "published again" : "un-published", bbresets);
+}
+
+static void bbr_poll(uint64_t now)
+{
+	if (bbr_unpub_at && now >= bbr_unpub_at) {
+		bbr_unpub_at = 0;
+		bbr_publish(0);
+	}
+	if (bbr_pub_at && !bbr_unpub_at && now >= bbr_pub_at) {
+		bbr_pub_at = 0;
+		bbr_publish(1);
+	}
+}
+
 static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *rq, uint32_t rqn)
 {
 	for (int i = 0; i < ntrg; i++) {
@@ -1664,6 +1713,16 @@ static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
 		}
 		if (t->kind == TRG_IND) {
 			trg_ind(pipe, sess, svc, cid, msg, t, rq, rqn, "");
+			continue;
+		}
+		if (t->kind == TRG_BBRESET) {
+			if (!bbr_unpub_at && !bbr_pub_at) {
+				bbresets++;
+				bbr_unpub_at = link_ms() + 100;
+				bbr_pub_at = bbr_unpub_at + (t->m2 < 200 ? 200 : t->m2);
+				printf("[%6llu] abp: on %s(0x%02x) 0x%04x: emulated baseband reset #%u (un-publish in 100 ms for %u ms)\n",
+				       (unsigned long long)link_ms(), svc_name(svc), svc, msg, bbresets, t->m2 < 200 ? 200 : t->m2);
+			}
 			continue;
 		}
 		/* replay: only a GET the policy itself would forward (protected / Apple / data messages never go out this way) */
@@ -2237,8 +2296,10 @@ void abpbridge_poll(void)
 				}
 			}
 	}
-	if (mode >= 2)
+	if (mode >= 2) {
 		simid_poll(now);	/* n12b */
+		bbr_poll(now);
+	}
 	if (dumpword && dumpword != dumpword_old)
 		mst_table("abpdump");
 	dumpword_old = dumpword;
