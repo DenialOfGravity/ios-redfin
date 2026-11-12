@@ -1,0 +1,1085 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 12 Nov 2026 15:30:00 +0100
+Subject: [PATCH] 1065 redfin: in-call audio through the ADSP voice services
+ (kern.sweet_voice; default off)
+
+kern.sweet_voice 1 (earpiece) / 2 (speaker): hold the mic path (0x9001) and the
+speaker port (0x9040) with the call's amplifier (0x40 earpiece / 0x41 speaker,
+Android's "handset" / "speaker-mono"), then q6voice's modem-voice sequence: MVM
+and CVS passive sessions "11C05000" (VoiceMMode1), dual control, CVP full
+control V3 (tx 0x9001, rx 0x9040, topology NONE), device channels, media
+formats, topology commit, enable, attach, TX unmute, START_VOICE. 0 = stop,
+detach, destroy CVP + MVM (CVS kept), let go of ports/amps. Variants:
+kern.sweet_voice_opts, _vsid, _below_ear, _below_spk. Logs "SWEET VOICE: ...".
+redwood_adsp_apr_ports(): source port apart from destination, answer->port.
+sweet_amp_select(): which amplifiers may run (default both: unchanged).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC32FNcvdmiSrHtBxEq
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 69c7176..f61fab6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -134,6 +134,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_geniuart.c		standard
+ bsd/dev/sweet_btbridge.c		standard
+ bsd/dev/sweet_abp.c			standard
++bsd/dev/sweet_voice.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 2a8495b..a7bc4b8 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -2814,6 +2814,7 @@ struct apr_header {
+ static struct {
+ 	uint32_t opcode, token, length;
+ 	uint32_t words[64];
++	uint16_t port;                  /* 1065: the answer's source port */
+ 	volatile bool there;
+ } apr_answer;
+ static uint32_t apr_in, apr_out, apr_next_token = 1;
+@@ -2871,6 +2872,7 @@ apr_input(const uint8_t *data, uint32_t length)
+ 	apr_answer.length = payload;
+ 	apr_answer.opcode = header.opcode;
+ 	apr_answer.token = header.token;
++	apr_answer.port = header.from_port;
+ 	apr_answer.there = true;
+ }
+ 
+@@ -2882,6 +2884,18 @@ apr_input(const uint8_t *data, uint32_t length)
+ bool
+ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+     uint32_t ms, struct redwood_apr_answer *answer)
++{
++	return redwood_adsp_apr_ports(service, port, port, token, opcode, payload, length, ms, answer);
++}
++
++/*
++ * 1065 (sweet_voice.c): the same with the source and destination ports apart, as the voice services want them
++ * (q6voice.c: source = the session's index, destination = the MVM/CVS/CVP handle, 0 to create one). The
++ * answer's source port (a create's new handle) comes back in answer->port.
++ */
++bool
++redwood_adsp_apr_ports(uint8_t service, uint16_t from_port, uint16_t port, uint32_t token, uint32_t opcode, const void *payload,
++    uint32_t length, uint32_t ms, struct redwood_apr_answer *answer)
+ {
+ 	uint8_t packet[sizeof(struct apr_header) + 256];
+ 	struct apr_header *header = (struct apr_header *)packet;
+@@ -2896,7 +2910,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
+ 	header->size = (uint16_t)(sizeof(*header) + length);
+ 	header->from_service = service;
+ 	header->from_domain = APR_DOMAIN_APPS;
+-	header->from_port = port;
++	header->from_port = from_port;
+ 	header->to_service = service;
+ 	header->to_domain = APR_DOMAIN_ADSP;
+ 	header->to_port = port;
+@@ -2933,6 +2947,7 @@ redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode
+ 					answer->opcode = apr_answer.opcode;
+ 					answer->token = apr_answer.token;
+ 					answer->length = apr_answer.length;
++					answer->port = apr_answer.port;
+ 					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
+ 				}
+ 				break;
+diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
+index 361d342..d9cdf84 100644
+--- a/bsd/dev/sweet_cs35l41.c
++++ b/bsd/dev/sweet_cs35l41.c
+@@ -49,6 +49,7 @@ void sweet_amp_stop(void);
+ bool sweet_amp_ready(void);
+ void sweet_amp_status(void);
+ void sweet_amp_reprobe(void);
++void sweet_amp_select(uint32_t mask);
+ int sweet_audio_pmic_gpio(unsigned sid, unsigned peripheral, int high);
+ 
+ #define SAY(...)                printf("SWEET AMP: " __VA_ARGS__)
+@@ -292,6 +293,7 @@ static LCK_MTX_DECLARE(reprobe_lock, &amp_lock_group);
+ #define CS_REPROBE_GAP_US       10000000ull     /* at least 10 s between two tries of one amplifier */
+ #define CS_REPROBE_OTP_MS       30u             /* (boot probe: 100) so the ON path stays short */
+ static uint32_t below_now = CS_VOL_MAX_BELOW + 1;
++static volatile uint32_t amp_mask = 3;          /* 1065: which amplifiers sweet_amp_start() may power (bit i = amps[i]) */
+ static bool gave_up, warned_temp;
+ 
+ static int
+@@ -677,7 +679,7 @@ sweet_amp_start(void)
+ 		uint32_t s1 = 0, pwr2 = 0;
+ 		int err;
+ 
+-		if (!a->prepared || a->on) {
++		if (!a->prepared || a->on || !(amp_mask & (1u << i))) {
+ 			any |= a->on;
+ 			continue;
+ 		}
+@@ -696,16 +698,15 @@ sweet_amp_start(void)
+ }
+ 
+ /* Muted, GLOBAL_EN off, PDN_DONE waited for, the pdn patch: powered down (cs35l41_main_amp_event POST_PMD). */
+-void
+-sweet_amp_stop(void)
++static void
++amp_off(struct amp *a)
+ {
+-	for (unsigned i = 0; i < 2; i++) {
+-		struct amp *a = &amps[i];
++	{
+ 		uint32_t s1 = 0;
+ 		unsigned ms;
+ 
+ 		if (!a->on) {
+-			continue;
++			return;
+ 		}
+ 		(void)cs_bits(a, CS_AMP_OUT_MUTE, 0x10, 0x10);
+ 		(void)cs_bits(a, CS_PWR_CTRL1, 1, 0);
+@@ -723,6 +724,36 @@ sweet_amp_stop(void)
+ 	}
+ }
+ 
++void
++sweet_amp_stop(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		amp_off(&amps[i]);
++	}
++}
++
++/*
++ * 1065 (sweet_voice.c): only the amplifiers in `mask' may be powered (bit 0 = 0x40, slot 0, top/earpiece: Android's
++ * "handset" path; bit 1 = 0x41, slot 1, bottom: "speaker-mono"); one that is on and not in it is powered down now.
++ * 0 or 3 = both (the default, as before).
++ */
++void
++sweet_amp_select(uint32_t mask)
++{
++	mask &= 3;
++	mask = mask == 0 ? 3 : mask;
++	if (mask != amp_mask) {
++		SAY("amplifiers allowed: %s%s%s\n", (mask & 1) ? amps[0].name : "", mask == 3 ? " and " : "",
++		    (mask & 2) ? amps[1].name : "");
++	}
++	amp_mask = mask;
++	for (unsigned i = 0; i < 2; i++) {
++		if (!(mask & (1u << i))) {
++			amp_off(&amps[i]);
++		}
++	}
++}
++
+ /* No error reported: true. On an error both are powered down and not started again this boot. */
+ bool
+ sweet_amp_healthy(void)
+diff --git a/bsd/dev/sweet_mic.c b/bsd/dev/sweet_mic.c
+index b8ef1e3..ccb786d 100644
+--- a/bsd/dev/sweet_mic.c
++++ b/bsd/dev/sweet_mic.c
+@@ -919,6 +919,7 @@ static bool ring_primed;
+ static volatile uint32_t ios_wants;
+ static volatile uint64_t ios_closed_us;
+ static volatile bool stopping, record_wanted, running;
++static volatile bool voice_wants;               /* 1065: a call holds the path up (kern.sweet_voice, sweet_voice.c) */
+ static uint32_t record_secs;
+ static int mic_wake;
+ static LCK_GRP_DECLARE(mic_lock_group, "sweet-mic");
+@@ -1080,7 +1081,7 @@ listen(void)
+ 
+ 	while (!stopping) {
+ 		uint64_t now = now_us();
+-		bool wanted = ios_wants || now - ios_closed_us < 3000000ull || record_wanted;
++		bool wanted = ios_wants || now - ios_closed_us < 3000000ull || record_wanted || voice_wants;
+ 
+ 		if (!wanted) {
+ 			break;
+@@ -1143,20 +1144,21 @@ static void
+ mic_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+ 	while (!stopping) {
+-		if (!ios_wants && !record_wanted) {
++		if (!ios_wants && !record_wanted && !voice_wants) {
+ 			assert_wait_timeout((event_t)&mic_wake, THREAD_UNINT, 500, NSEC_PER_MSEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 			continue;
+ 		}
+ 		if (path_broken && !record_wanted) {
+ 			/* (given up until the reader closes and opens again) */
+-			while (ios_wants && !stopping && !record_wanted) {
++			while ((ios_wants || voice_wants) && !stopping && !record_wanted) {
+ 				sleep_ms(100);
+ 			}
+ 			path_broken = false;
+ 			continue;
+ 		}
+-		SAY("%s: the mic path comes up\n", record_wanted ? "recording" : "iOS opened /dev/redwood-mic");
++		SAY("%s: the mic path comes up\n", record_wanted ? "recording" : voice_wants ? "a call (kern.sweet_voice)" :
++		    "iOS opened /dev/redwood-mic");
+ 		if (!path_up()) {
+ 			SAY("THE MIC PATH DID NOT COME UP\n");
+ 			path_broken = true;
+@@ -1210,6 +1212,37 @@ sweet_mic_status(void)
+ 	    ring_written, ring_read);
+ }
+ 
++/*
++ * 1065: a call holds the microphones' path up as an open /dev/redwood-mic does (the DSP's voice processor takes port
++ * 0x9001's samples next to our record session; the ring just runs on). Released: down 3 s later unless iOS reads.
++ */
++bool
++redwood_mic_voice_hold(bool on, uint32_t wait_ms)
++{
++	if (!running) {
++		SAY("voice: no mic path (needs mic=1)\n");
++		return false;
++	}
++	if (!on) {
++		if (voice_wants) {
++			voice_wants = false;
++			ios_closed_us = now_us();
++			SAY("voice: released by the call\n");
++		}
++		return false;
++	}
++	if (!voice_wants) {
++		voice_wants = true;
++		path_broken = false;
++		thread_wakeup(&mic_wake);
++		SAY("voice: held by a call\n");
++	}
++	for (uint32_t ms = 0; !path_is_up && ms < wait_ms; ms += 10) {
++		sleep_ms(10);
++	}
++	return path_is_up;
++}
++
+ void
+ redwood_mic_dsp_up(void)
+ {
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index f03f27a..3728447 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -102,6 +102,7 @@ extern void sweet_amp_stop(void);
+ extern bool sweet_amp_ready(void);
+ extern void sweet_amp_status(void);
+ extern void sweet_amp_reprobe(void);
++extern void sweet_amp_select(uint32_t mask);
+ /* bsd/dev/sweet_mic.c */
+ extern int sweet_mic_cmd(uint32_t seconds);
+ extern void sweet_mic_status(void);
+@@ -986,6 +987,12 @@ tone_for(uint32_t ms)
+ 
+ static volatile bool amps_on, amps_held_off, amps_given_up, watcher_runs;
+ static volatile uint32_t below_wanted;          /* set by poke `a gain`; applied by the watcher */
++/*
++ * 1065, a call (redwood_sound_voice(), sweet_voice.c): which amplifiers it holds on (bit 0 = 0x40 earpiece, bit 1 = 0x41
++ * speaker; 0 = no call) and at what level; the watcher applies them (voice_applied / voice_below_applied).
++ */
++static volatile uint32_t voice_amps, voice_below = 240, voice_applied, voice_below_applied;
++static bool voice_own_port, voice_direct_amps;         /* (no watcher: what the call brought up itself) */
+ static uint32_t amp_starts;
+ 
+ static const char *
+@@ -1037,8 +1044,9 @@ watch(void)
+ 	watcher_runs = true;
+ 	while (!stopping) {
+ 		uint64_t now = now_us(), until = tone_until_us, sounded = last_sound_us;
++		uint32_t vmask = voice_amps, vbelow = voice_below;
+ 		bool wanted = (now < until + QUIET_BEFORE_OFF_US && until != 0) ||
+-		    (level >= 4 && !ios_muted && sounded != 0 && now - sounded < QUIET_BEFORE_OFF_US);
++		    (level >= 4 && !ios_muted && sounded != 0 && now - sounded < QUIET_BEFORE_OFF_US) || vmask != 0;
+ 		uint32_t b, g;
+ 		bool m;
+ 
+@@ -1051,21 +1059,43 @@ watch(void)
+ 			}
+ 			below = ~0u;            /* (applied just below, with iOS's part) */
+ 		}
++		if (vmask != voice_applied || (vmask != 0 && vbelow != voice_below_applied)) {
++			/* 1065: a call began, changed amplifier or level, or ended */
++			if (vmask != 0) {
++				sweet_amp_select(vmask);
++				redwood_guard_attenuation(vbelow);
++				if (amps_on) {
++					(void)sweet_amp_volume(vbelow);
++					(void)sweet_amp_start();        /* (the one the call wants, if it was not on) */
++				}
++				SAY("voice: the call holds amplifier%s %s at %s dB under Android's level\n", vmask == 3 ? "s" : "",
++				    vmask == 1 ? "0x40 (earpiece)" : vmask == 2 ? "0x41 (speaker)" : "0x40 and 0x41", db(t, vbelow));
++			} else {
++				amps_off("the call ended");
++				sweet_amp_select(3);
++				redwood_guard_attenuation(below + ios_below);
++				SAY("voice: the call let the amplifiers go\n");
++			}
++			voice_applied = vmask;
++			voice_below_applied = vbelow;
++		}
+ 		if (below_wanted != below) {
+ 			uint32_t effective;
+ 
+ 			below = below_wanted;
+ 			effective = below + ios_below;
+-			redwood_guard_attenuation(effective);
++			redwood_guard_attenuation(voice_applied ? voice_below_applied : effective);
+ 			if (amps_on) {
+-				(void)sweet_amp_volume(effective);
++				(void)sweet_amp_volume(voice_applied ? voice_below_applied : effective);
+ 			}
+ 			SAY("amplifiers' level: %s dB under Android's (sndbelow/gain %s + iOS %s)\n", db(t, effective), db(t2, below),
+ 			    db(t3, ios_below));
+ 		}
+ 		if (wanted && !amps_on && !amps_held_off && !amps_given_up && sweet_amp_ready()) {
++			uint32_t at = voice_applied ? voice_below_applied : below + ios_below;      /* 1065: a call's level */
++
+ 			/* the guard is armed at the level they will play at before they are started */
+-			redwood_guard_attenuation(below + ios_below);
++			redwood_guard_attenuation(at);
+ 			guard_say("(silence before)");
+ 			if (!sweet_amp_start()) {
+ 				SAY("THE AMPLIFIERS DID NOT START: given up\n");
+@@ -1076,19 +1106,21 @@ watch(void)
+ 				amp_starts++;
+ 				/* faded in from 30 dB further down, 6 dB a step */
+ 				for (uint32_t extra = 240; extra > 0; extra -= 48) {
+-					(void)sweet_amp_volume(below + ios_below + extra);
++					(void)sweet_amp_volume(at + extra);
+ 					sleep_ms(8);
+ 				}
+-				(void)sweet_amp_volume(below + ios_below);
++				(void)sweet_amp_volume(at);
+ 				last_look = now_us();
+ 				ios_peak = 0;
+-				SAY("amplifiers ON at %s dB under Android's level (start %u)\n", db(t, below + ios_below), amp_starts);
++				SAY("amplifiers ON at %s dB under Android's level (start %u%s)\n", db(t, at), amp_starts,
++				    voice_applied ? ", for a call" : "");
+ 			}
+ 		} else if (amps_on && (!wanted || amps_held_off)) {
+ 			if (level >= 4) {
+ 				SAY("what iOS wrote while they were on peaked at %u of 32768\n", ios_peak);
+ 			}
+-			amps_off(amps_held_off ? "poke a off" : ios_muted ? "iOS muted" : "2 s of silence");
++			amps_off(amps_held_off ? "poke a off" : ios_muted ? "iOS muted" : vmask != voice_applied ? "the call ended" :
++			    "2 s of silence");
+ 		} else if (amps_on && now - last_look >= 200000) {
+ 			last_look = now;
+ 			if (!sweet_amp_healthy()) {
+@@ -1263,6 +1295,9 @@ redwood_sound_dsp_up(void)
+ void
+ redwood_sound_dsp_down(void)
+ {
++	if (voice_own_port || voice_direct_amps) {
++		(void)redwood_sound_voice(0, 0);        /* 1065 */
++	}
+ 	if (running) {
+ 		take_down();
+ 	}
+@@ -1273,6 +1308,92 @@ redwood_sound_quiesce(void)
+ {
+ }
+ 
++/* ---- 1065: a call (bsd/dev/sweet_voice.c) ---------------------------------------------------------------------- */
++
++/*
++ * The port 0x9040 and the amplifiers for a call. With sound>=3 the watcher owns the amplifiers: it is told and
++ * waited for. Without (sound=0, or the path down): the call brings up the votes, pins, clock and port itself
++ * (no ADM/ASM: the DSP's voice processor is the port's only client then) and drives the amplifiers directly; at
++ * the call's end it takes down only what it brought up.
++ */
++bool
++redwood_sound_voice(uint32_t amps, uint32_t level_below)
++{
++	char t[16];
++	bool up;
++
++	amps &= 3;
++	level_below = level_below < below_min ? below_min : level_below;
++	if (watcher_runs && !stopping) {
++		voice_below = level_below;
++		voice_amps = amps;
++		for (unsigned ms = 0; ms < 2000 && (voice_applied != amps || (amps != 0 && voice_below_applied != level_below)); ms += 10) {
++			sleep_ms(10);
++		}
++		SAY("voice: %s (watcher; port 0x9040 %s, amplifiers %s)\n", amps ? "held" : "released", port_on ? "running" : "DOWN",
++		    amps_on ? "on" : amps_held_off ? "held off (poke a off)" : amps_given_up ? "GIVEN UP" : "off");
++		return amps != 0 && port_on;
++	}
++	lck_mtx_lock(&sound_lock);
++	if (amps != 0 && !port_on && !voice_own_port) {
++		if (running && !taken_down) {
++			SAY("voice: sound=%u's path is being set up or is not up: the port is not taken over\n", level);
++			lck_mtx_unlock(&sound_lock);
++			return false;
++		}
++		SAY("voice: no speaker path running (sound=%u): the call brings up QUIN_TDM_RX_0 0x9040 itself\n", level);
++		PE_parse_boot_argn("sndlpi", &use_lpi, sizeof(use_lpi));
++		(void)vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO");
++		(void)vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC");
++		(void)pins_on();
++		voice_own_port = true;
++		if (!afe_on()) {
++			SAY("voice: port 0x9040 DID NOT START\n");
++			afe_off();
++			pins_off();
++			devote(LPASS_HW_DCODEC_BLOCK);
++			devote(LPASS_HW_MACRO_BLOCK);
++			voice_own_port = false;
++			lck_mtx_unlock(&sound_lock);
++			return false;
++		}
++	}
++	if (amps != 0) {
++		if (!sweet_amp_prepare()) {
++			SAY("voice: no amplifier ready: the call is not heard\n");
++		} else {
++			sweet_amp_select(amps);
++			(void)sweet_amp_volume(level_below);
++			if (!sweet_amp_start()) {
++				SAY("voice: THE AMPLIFIER DID NOT START\n");
++			} else {
++				voice_direct_amps = true;
++				SAY("voice: amplifier%s %s on at %s dB under Android's level (direct)\n", amps == 3 ? "s" : "",
++				    amps == 1 ? "0x40 (earpiece)" : amps == 2 ? "0x41 (speaker)" : "0x40 and 0x41", db(t, level_below));
++			}
++		}
++	} else {
++		if (voice_direct_amps) {
++			sweet_amp_stop();
++			sweet_amp_select(3);
++			voice_direct_amps = false;
++		}
++		if (voice_own_port) {
++			afe_off();
++			pins_off();
++			devote(LPASS_HW_DCODEC_BLOCK);
++			devote(LPASS_HW_MACRO_BLOCK);
++			voice_own_port = false;
++			SAY("voice: the call's own port 0x9040 is stopped and put back\n");
++		}
++	}
++	voice_applied = amps;
++	voice_below_applied = level_below;
++	up = amps != 0 && port_on;
++	lck_mtx_unlock(&sound_lock);
++	return up;
++}
++
+ /* ---- poke `a ...` (bsd/dev/sweet_poke.c) -------------------------------------------------------------------------- */
+ 
+ static const char *
+diff --git a/bsd/dev/sweet_voice.c b/bsd/dev/sweet_voice.c
+new file mode 100644
+index 0000000..6fe1522
+--- /dev/null
++++ b/bsd/dev/sweet_voice.c
+@@ -0,0 +1,568 @@
++/*
++ * redfin (Pixel 5): in-call audio through the audio DSP's voice services. Patch 1065.
++ *
++ * A call's voice runs between the modem and the ADSP: the modem's vocoder hands its PCM to the DSP's voice
++ * manager (MVM) and stream (CVS), and the voice processor (CVP) plays it on an AFE RX port and takes the
++ * microphone from an AFE TX port. The modem owns the call's full-control sessions; Android's apps side (q6voice.c)
++ * only creates passive sessions under the modem's VSID name, a CVP on the device ports, attaches it and starts
++ * voice. Nothing did that here, so calls connected silent both ways (research/cc/P3-audio-result.md).
++ *
++ * Reference: the redbull kernel (LineageOS android_kernel_google_redbull) techpack/audio/dsp/q6voice.c
++ * voc_start_voice_call() / voice_setup_vocproc() / voc_end_voice_call(), include/dsp/q6voice.h, and the phone's
++ * mixer_paths_noextcodec_snd.xml: "voicemmode1-call handset/speaker" = QUIN_TDM_RX_0 (0x9040) + PRI_TDM_TX_0
++ * (0x9001); "handset" = "Main AMP Enable Switch" only (the left amplifier 0x40, slot 0, the top/earpiece one),
++ * "voice-speaker" -> "speaker-mono" = "R Main AMP" only (0x41, slot 1, bottom). QUIN_TDM_RX_0 runs 2 channels
++ * (S32_LE), PRI_TDM_TX_0 one (S16_LE), both 48 kHz.
++ *
++ * kern.sweet_voice: 0 off (default: nothing here runs), 1 earpiece, 2 speaker. 0 -> 1/2 on this file's thread:
++ *   1 the microphones' path held up (sweet_mic.c, as an open /dev/redwood-mic: AFE 0x9001 + the ALC5513)
++ *   2 the speakers' port 0x9040 held and the call's amplifier on (sweet_sound.c: the watcher's with sound>=3,
++ *     else the call brings the port up itself), at kern.sweet_voice_below_ear / _spk
++ *   3 MVM version (VSS_IVERSION_CMD_GET), MVM and CVS passive sessions named after the VSID ("11C05000" =
++ *     VoiceMMode1), MVM dual control, CVP full control V3 (V2 if CVD < 2.2): tx 0x9001, rx 0x9040, topology
++ *     NONE, network NONE, EC internal mixing; CVD >= 2.2: device channels (tx 1, rx 1) and topology commit;
++ *     CVD >= 2.3: the RX/TX endpoint media formats; CVP enable, MVM attach vocproc, CVS TX unmute, MVM start voice
++ * 1 <-> 2: only the amplifier changes. -> 0: MVM stop voice, detach vocproc, CVP and MVM destroyed (CVS kept for
++ * the next call, as q6voice does for modem voice), the amplifiers and ports let go (released only if nothing
++ * else holds them: media keeps 0x9040, an open /dev/redwood-mic keeps 0x9001).
++ * Variants (kern.sweet_voice_opts, bits; 0 = the q6voice sequence above):
++ *   1 no dual control       2 behave as CVD < 2.2 (V2 create; no device channels / commit)
++ *   4 no media formats      8 also MFC output 2 ch (as q6voice for CVP >= 2)      16 topologies TX SM ECNS V2 /
++ *   RX default instead of NONE      32 destroy the CVS too at the end      64 RX media format 1 ch / 16 bits
++ * kern.sweet_voice_vsid: the session name's VSID (default 0x11C05000; 0 = "default modem voice").
++ * A failed start is undone and kern.sweet_voice reads 0 again. Never returns to fastboot.
++ *
++ * Log lines: "SWEET VOICE: ...".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/redwood_audio.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define SAY(...)                printf("SWEET VOICE: " __VA_ARGS__)
++
++#define APR_SVC_MVM             9
++#define APR_SVC_CVS             10
++#define APR_SVC_CVP             11
++#define APR_BASIC_RSP_RESULT    0x000110e8u
++#define APR_WAIT_MS             1000
++#define VOICE_INDEX             5               /* q6voice.c voice_get_idx_for_session(VOICEMMODE1): the source port */
++
++#define VSS_IVERSION_CMD_GET                            0x00011378u
++#define VSS_IVERSION_RSP_GET                            0x00011379u
++#define VSS_IMVM_CMD_CREATE_PASSIVE_CONTROL_SESSION     0x000110ffu
++#define VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL            0x00011327u
++#define VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION  0x00011140u
++#define VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2 0x000112bfu
++#define VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3 0x00013169u
++#define VSS_IVOCPROC_CMD_TOPOLOGY_SET_DEV_CHANNELS      0x00013199u
++#define VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT                0x00013198u
++#define VSS_ICOMMON_CMD_SET_PARAM_V2                    0x0001133du
++#define VSS_IVOCPROC_CMD_ENABLE                         0x000100c6u
++#define VSS_IMVM_CMD_ATTACH_VOCPROC                     0x0001123eu
++#define VSS_IMVM_CMD_DETACH_VOCPROC                     0x0001123fu
++#define VSS_IVOLUME_CMD_MUTE_V2                         0x0001138bu
++#define VSS_IMVM_CMD_START_VOICE                        0x00011190u
++#define VSS_IMVM_CMD_STOP_VOICE                         0x00011192u
++#define APRV2_IBASIC_CMD_DESTROY_SESSION                0x0001003cu
++
++#define VSS_IVOCPROC_TOPOLOGY_ID_NONE                   0x00010f70u
++#define VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2          0x00010f89u
++#define VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT             0x00010f77u
++#define VSS_ICOMMON_CAL_NETWORK_ID_NONE                 0x0001135eu
++#define VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING         0x00010f7cu
++#define VSS_IVOCPROC_PORT_ID_NONE                       0xffffu
++#define VSS_MODULE_CVD_GENERIC                          0x0001316eu
++#define VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO           0x00013253u
++#define VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO           0x00013254u
++#define AUDPROC_MODULE_ID_MFC                           0x00010912u
++#define AUDPROC_PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT        0x00010913u
++
++#define RX_PORT                 0x9040          /* QUIN_TDM_RX_0: the two CS35L41 */
++#define TX_PORT                 0x9001          /* PRI_TDM_TX_0: the ALC5513's DMIC 1 */
++#define RATE                    48000
++#define PCM_CHANNEL_FL          1
++#define PCM_CHANNEL_FR          2
++#define PCM_CHANNEL_FC          3
++#define SESSION_NAME_LEN        20
++#define AMP_EAR                 1u              /* sweet_cs35l41.c amps[0] 0x40, slot 0 */
++#define AMP_SPEAKER             2u              /* amps[1] 0x41, slot 1 */
++
++#define OPT_NO_DUAL             1u
++#define OPT_OLD_CVD             2u
++#define OPT_NO_MEDIA_FMT        4u
++#define OPT_MFC                 8u
++#define OPT_CAL_TOPOLOGIES      16u
++#define OPT_DESTROY_CVS         32u
++#define OPT_RX_MONO16           64u
++
++static int voice_target;                        /* kern.sweet_voice: 0 off, 1 earpiece, 2 speaker */
++static int voice_state;                         /* what runs */
++static uint32_t voice_opts, voice_vsid = 0x11c05000u, below_ear = 240, below_speaker = 160, below_applied;
++static uint16_t mvm_handle, cvs_handle, cvp_handle;
++static int cvd_major = -1, cvd_minor;
++static bool mic_held, port_held, dual_done, attached, started;
++static bool thread_up;
++static int voice_wake;
++static uint32_t starts, failures;
++static LCK_GRP_DECLARE(voice_lock_group, "sweet-voice");
++static LCK_MTX_DECLARE(thread_lock, &voice_lock_group);
++
++static const char *
++dsp_error(uint32_t status)
++{
++	static const char *const names[] = { "ok", "failed", "bad parameter", "unsupported", "version", "unexpected", "panic",
++		                             "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted",
++		                             "preempted", "continue", "immediate", "not implemented", "need more", "no memory",
++		                             "not there" };
++
++	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "unknown error";
++}
++
++/*
++ * One command to a voice service, from our source port VOICE_INDEX to `handle' (0: the service itself), its answer
++ * waited for: true for the basic answer with status 0 (*answer has it, with the new handle in answer->port), or for
++ * the opcode `wanted'.
++ */
++static bool
++vcmd(const char *what, uint8_t service, uint16_t handle, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted,
++    struct redwood_apr_answer *answer)
++{
++	struct redwood_apr_answer local;
++
++	if (answer == NULL) {
++		answer = &local;
++	}
++	bzero(answer, sizeof(*answer));
++	if (!redwood_adsp_apr_ports(service, VOICE_INDEX, handle, 0, opcode, payload, length, APR_WAIT_MS, answer)) {
++		SAY("%s (opcode %#x to %s handle %u): NO ANSWER\n", what, opcode, service == APR_SVC_MVM ? "MVM" :
++		    service == APR_SVC_CVS ? "CVS" : "CVP", handle);
++		return false;
++	}
++	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
++		if (answer->words[1] != 0) {
++			SAY("%s: REFUSED: %s (%u)\n", what, dsp_error(answer->words[1]), answer->words[1]);
++			return false;
++		}
++		SAY("%s: ok\n", what);
++		return wanted == 0;
++	}
++	if (wanted != 0 && answer->opcode == wanted) {
++		return true;
++	}
++	SAY("%s: unexpected answer: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length, answer->words[0],
++	    answer->words[1]);
++	return false;
++}
++
++/* VSS_ICOMMON_CMD_SET_PARAM_V2, in band (mem_handle 0), one parameter with a v1 header, to the CVP */
++static bool
++cvp_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	struct {
++		uint32_t mem_handle;
++		uint64_t mem_address;
++		uint32_t mem_size;
++		uint32_t module, param;
++		uint16_t size, reserved;
++		uint8_t data[96];
++	} __attribute__((packed)) p;
++
++	if (size > sizeof(p.data)) {
++		return false;
++	}
++	bzero(&p, sizeof(p));
++	p.mem_size = 12u + size;
++	p.module = module;
++	p.param = param;
++	p.size = size;
++	memcpy(p.data, data, size);
++	return vcmd(what, APR_SVC_CVP, cvp_handle, VSS_ICOMMON_CMD_SET_PARAM_V2, &p, 28u + size, 0, NULL);
++}
++
++static void
++cvd_version(void)
++{
++	struct redwood_apr_answer answer;
++	char version[32];
++	const char *c;
++	int major = 0, minor = 0;
++
++	if (cvd_major >= 0) {
++		return;
++	}
++	if (!vcmd("MVM: CVD version", APR_SVC_MVM, 0, VSS_IVERSION_CMD_GET, NULL, 0, VSS_IVERSION_RSP_GET, &answer)) {
++		SAY("CVD version unknown: taken as 0.0 (q6voice's default)\n");
++		cvd_major = 0;
++		cvd_minor = 0;
++		return;
++	}
++	bzero(version, sizeof(version));
++	memcpy(version, answer.words, sizeof(version) - 1);
++	for (c = version; *c >= '0' && *c <= '9'; c++) {
++		major = major * 10 + (*c - '0');
++	}
++	if (*c == '.') {
++		for (c++; *c >= '0' && *c <= '9'; c++) {
++			minor = minor * 10 + (*c - '0');
++		}
++	}
++	cvd_major = major;
++	cvd_minor = minor;
++	SAY("CVD version \"%s\" (%d.%d)\n", version, major, minor);
++}
++
++static bool
++cvd_at_least(int major, int minor)
++{
++	return cvd_major > major || (cvd_major == major && cvd_minor >= minor);
++}
++
++static uint32_t
++amps_for(int state)
++{
++	return state == 2 ? AMP_SPEAKER : state == 1 ? AMP_EAR : 0;
++}
++
++static uint32_t
++below_for(int state)
++{
++	return state == 2 ? below_speaker : below_ear;
++}
++
++/* the sessions taken down, the ports and amplifiers let go: whatever of it is there */
++static void
++voice_down(const char *why)
++{
++	uint16_t handle;
++
++	SAY("STOP (%s)\n", why);
++	if (started) {
++		(void)vcmd("MVM: stop voice", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_STOP_VOICE, NULL, 0, 0, NULL);
++		started = false;
++	}
++	if (attached) {
++		handle = cvp_handle;
++		(void)vcmd("MVM: detach vocproc", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_DETACH_VOCPROC, &handle, sizeof(handle), 0, NULL);
++		attached = false;
++	}
++	if (cvp_handle != 0) {
++		(void)vcmd("CVP: destroyed", APR_SVC_CVP, cvp_handle, APRV2_IBASIC_CMD_DESTROY_SESSION, NULL, 0, 0, NULL);
++		cvp_handle = 0;
++	}
++	if (cvs_handle != 0 && (voice_opts & OPT_DESTROY_CVS)) {
++		(void)vcmd("CVS: destroyed", APR_SVC_CVS, cvs_handle, APRV2_IBASIC_CMD_DESTROY_SESSION, NULL, 0, 0, NULL);
++		cvs_handle = 0;
++	}
++	if (mvm_handle != 0) {
++		(void)vcmd("MVM: destroyed", APR_SVC_MVM, mvm_handle, APRV2_IBASIC_CMD_DESTROY_SESSION, NULL, 0, 0, NULL);
++		mvm_handle = 0;
++	}
++	dual_done = false;
++	if (port_held) {
++		(void)redwood_sound_voice(0, 0);
++		port_held = false;
++		SAY("speaker port / amplifiers let go\n");
++	}
++	if (mic_held) {
++		(void)redwood_mic_voice_hold(false, 0);
++		mic_held = false;
++		SAY("mic path let go\n");
++	}
++	voice_state = 0;
++	SAY("OFF\n");
++}
++
++static bool
++voice_up(int target)
++{
++	struct redwood_apr_answer answer;
++	char name[SESSION_NAME_LEN];
++	bool old_cvd, rx_mono = (voice_opts & OPT_RX_MONO16) != 0;
++	uint16_t handle;
++	const char *step = "?";
++
++	starts++;
++	SAY("START %u: %s, opts %#x, VSID %#x, amplifier level %u/8 dB under Android's\n", starts, target == 2 ? "speaker" : "earpiece",
++	    voice_opts, voice_vsid, below_for(target));
++
++	/* 1 the microphones */
++	step = "mic path";
++	mic_held = true;
++	if (!redwood_mic_voice_hold(true, 3000)) {
++		SAY("mic path (PRI_TDM_TX_0 0x9001) NOT UP: the other side will not hear us (going on)\n");
++	} else {
++		SAY("mic path up: PRI_TDM_TX_0 0x9001 runs\n");
++	}
++
++	/* 2 the speakers' port and the call's amplifier */
++	step = "speaker port";
++	port_held = true;
++	below_applied = below_for(target);
++	if (!redwood_sound_voice(amps_for(target), below_applied)) {
++		SAY("speaker port QUIN_TDM_RX_0 0x9040 NOT RUNNING: we will not hear the other side (going on)\n");
++	} else {
++		SAY("speaker port 0x9040 runs; amplifier %s held for the call\n", target == 2 ? "0x41 (speaker)" : "0x40 (earpiece)");
++	}
++
++	/* 3 the voice sessions (q6voice.c voc_start_voice_call) */
++	cvd_version();
++	old_cvd = (voice_opts & OPT_OLD_CVD) != 0 || !cvd_at_least(2, 2);
++	bzero(name, sizeof(name));
++	if (voice_vsid == 0) {
++		strlcpy(name, "default modem voice", sizeof(name));
++	} else {
++		snprintf(name, sizeof(name), "%08X", voice_vsid);
++	}
++
++	step = "MVM create";
++	if (mvm_handle == 0) {
++		char what[64];
++
++		snprintf(what, sizeof(what), "MVM: passive control session \"%s\"", name);
++		if (!vcmd(what, APR_SVC_MVM, 0, VSS_IMVM_CMD_CREATE_PASSIVE_CONTROL_SESSION, name, sizeof(name), 0, &answer)) {
++			goto fail;
++		}
++		mvm_handle = answer.port;
++		SAY("MVM handle %u\n", mvm_handle);
++	}
++	step = "CVS create";
++	if (cvs_handle == 0) {
++		char what[64];
++
++		snprintf(what, sizeof(what), "CVS: passive control session \"%s\"", name);
++		if (!vcmd(what, APR_SVC_CVS, 0, VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION, name, sizeof(name), 0, &answer)) {
++			goto fail;
++		}
++		cvs_handle = answer.port;
++		SAY("CVS handle %u\n", cvs_handle);
++	} else {
++		SAY("CVS handle %u (kept from the last call)\n", cvs_handle);
++	}
++	step = "dual control";
++	if (!(voice_opts & OPT_NO_DUAL) && !dual_done) {
++		uint8_t enable = 1;     /* struct vss_imvm_cmd_set_policy_dual_control_t { bool enable_flag; } __packed */
++
++		if (!vcmd("MVM: dual control on", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL, &enable, sizeof(enable), 0,
++		    NULL)) {
++			goto fail;
++		}
++		dual_done = true;
++	}
++
++	/* voice_setup_vocproc() */
++	step = "CVP create";
++	{
++		struct {
++			uint16_t direction, tx_port;
++			uint32_t tx_topology;
++			uint16_t rx_port;
++			uint32_t rx_topology, profile, mode;
++			uint16_t ec_ref_port;
++			char name[SESSION_NAME_LEN];
++		} __attribute__((packed)) create;
++		char what[96];
++
++		bzero(&create, sizeof(create));
++		create.direction = 2;
++		create.tx_port = TX_PORT;
++		create.rx_port = RX_PORT;
++		create.tx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2 : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
++		create.rx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
++		create.profile = VSS_ICOMMON_CAL_NETWORK_ID_NONE;
++		create.mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
++		create.ec_ref_port = VSS_IVOCPROC_PORT_ID_NONE;
++		snprintf(what, sizeof(what), "CVP: full control %s, tx %#x rx %#x, topologies %#x/%#x", old_cvd ? "V2" : "V3", TX_PORT,
++		    RX_PORT, create.tx_topology, create.rx_topology);
++		if (!vcmd(what, APR_SVC_CVP, 0, old_cvd ? VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2 :
++		    VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3, &create, sizeof(create), 0, &answer)) {
++			goto fail;
++		}
++		cvp_handle = answer.port;
++		SAY("CVP handle %u\n", cvp_handle);
++	}
++	if (!old_cvd) {
++		uint16_t channels[2] = { 1, 1 };        /* tx, rx: q6voice's VSS_NUM_DEV_CHANNELS_1 for rx with CVP < 2 */
++
++		step = "device channels";
++		(void)vcmd("CVP: device channels tx 1, rx 1", APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_TOPOLOGY_SET_DEV_CHANNELS, channels,
++		    sizeof(channels), 0, NULL);
++	}
++	if (!(voice_opts & OPT_NO_MEDIA_FMT) && !old_cvd && cvd_at_least(2, 3)) {
++		struct {
++			uint32_t port;
++			uint16_t channels, bits;
++			uint32_t rate;
++			uint8_t map[32];
++		} __attribute__((packed)) rx, tx;
++
++		step = "media formats";
++		bzero(&rx, sizeof(rx));
++		bzero(&tx, sizeof(tx));
++		rx.port = RX_PORT;
++		rx.channels = rx_mono ? 1 : 2;
++		rx.bits = rx_mono ? 16 : 32;
++		rx.rate = RATE;
++		rx.map[0] = rx_mono ? PCM_CHANNEL_FC : PCM_CHANNEL_FL;
++		rx.map[1] = rx_mono ? 0 : PCM_CHANNEL_FR;
++		tx.port = TX_PORT;
++		tx.channels = 1;
++		tx.bits = 16;
++		tx.rate = RATE;
++		tx.map[0] = PCM_CHANNEL_FC;
++		(void)cvp_param(rx_mono ? "CVP: RX endpoint 0x9040, 1 ch x 16 bits, 48 kHz" : "CVP: RX endpoint 0x9040, 2 ch x 32 bits, 48 kHz",
++		    VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
++		(void)cvp_param("CVP: TX endpoint 0x9001, 1 ch x 16 bits, 48 kHz", VSS_MODULE_CVD_GENERIC,
++		    VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
++	}
++	if (!old_cvd) {
++		step = "topology commit";
++		(void)vcmd("CVP: topology commit", APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT, NULL, 0, 0, NULL);
++	}
++	if (voice_opts & OPT_MFC) {
++		struct {
++			uint32_t rate;
++			uint16_t bits, channels;
++			uint16_t type[32];
++		} __attribute__((packed)) mfc;
++
++		step = "MFC";
++		bzero(&mfc, sizeof(mfc));
++		mfc.rate = RATE;
++		mfc.bits = 16;
++		mfc.channels = 2;
++		mfc.type[0] = PCM_CHANNEL_FL;
++		mfc.type[1] = PCM_CHANNEL_FR;
++		(void)cvp_param("CVP: MFC output 2 ch, 48 kHz", AUDPROC_MODULE_ID_MFC, AUDPROC_PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT, &mfc,
++		    sizeof(mfc));
++	}
++	step = "CVP enable";
++	if (!vcmd("CVP: enable", APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_ENABLE, NULL, 0, 0, NULL)) {
++		goto fail;
++	}
++	step = "attach vocproc";
++	handle = cvp_handle;
++	if (!vcmd("MVM: attach vocproc", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_ATTACH_VOCPROC, &handle, sizeof(handle), 0, NULL)) {
++		goto fail;
++	}
++	attached = true;
++	{
++		uint16_t mute[3] = { 0, 0, 0 };         /* TX, unmuted, no ramp (q6voice's stream_tx default) */
++
++		(void)vcmd("CVS: TX unmuted", APR_SVC_CVS, cvs_handle, VSS_IVOLUME_CMD_MUTE_V2, mute, sizeof(mute), 0, NULL);
++	}
++	step = "start voice";
++	if (!vcmd("MVM: START_VOICE", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_START_VOICE, NULL, 0, 0, NULL)) {
++		goto fail;
++	}
++	started = true;
++	voice_state = target;
++	SAY("START_VOICE ok: CALL AUDIO UP on the %s (MVM %u, CVS %u, CVP %u)\n", target == 2 ? "speaker" : "earpiece", mvm_handle,
++	    cvs_handle, cvp_handle);
++	return true;
++fail:
++	failures++;
++	SAY("START FAILED at %s (failure %u): undoing\n", step, failures);
++	voice_down("start failed");
++	return false;
++}
++
++static void
++voice_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	for (;;) {
++		int target = voice_target;
++
++		if (target == voice_state) {
++			if (voice_state != 0 && below_for(voice_state) != below_applied) {
++				below_applied = below_for(voice_state);
++				(void)redwood_sound_voice(amps_for(voice_state), below_applied);
++				SAY("amplifier level now %u/8 dB under Android's\n", below_applied);
++			}
++			assert_wait_timeout((event_t)&voice_wake, THREAD_UNINT, 500, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++			continue;
++		}
++		if (target == 0) {
++			voice_down("kern.sweet_voice 0");
++		} else if (voice_state != 0) {
++			SAY("route: %s -> %s\n", voice_state == 2 ? "speaker" : "earpiece", target == 2 ? "speaker" : "earpiece");
++			below_applied = below_for(target);
++			(void)redwood_sound_voice(amps_for(target), below_applied);
++			voice_state = target;
++		} else if (!voice_up(target)) {
++			if (voice_target == target) {
++				voice_target = 0;
++			}
++		}
++	}
++}
++
++static int
++sysctl_voice(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = voice_target, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++
++	if (e != 0 || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&thread_lock);
++	if (!thread_up && v != 0) {
++		thread_t thread;
++
++		if (kernel_thread_start(voice_thread, NULL, &thread) != KERN_SUCCESS) {
++			lck_mtx_unlock(&thread_lock);
++			SAY("no thread\n");
++			return ENOMEM;
++		}
++		thread_deallocate(thread);
++		thread_up = true;
++	}
++	lck_mtx_unlock(&thread_lock);
++	SAY("kern.sweet_voice = %d (%s; was %d)\n", v, v == 0 ? "off" : v == 1 ? "earpiece" : "speaker", voice_target);
++	voice_target = v;
++	thread_wakeup(&voice_wake);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice, "I",
++    "redfin 1065: in-call audio through the ADSP voice services: 0 off (default), 1 earpiece, 2 speaker");
++
++static int
++sysctl_voice_number(__unused struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
++{
++	uint32_t *p = arg1;
++	int v = (int)*p, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++
++	if (e == 0 && changed) {
++		*p = (uint32_t)v;
++		SAY("%s = %#x\n", arg2 == 0 ? "opts" : arg2 == 1 ? "vsid" : arg2 == 2 ? "below_ear" : "below_spk", *p);
++		thread_wakeup(&voice_wake);
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_opts, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &voice_opts, 0, sysctl_voice_number, "I",
++    "redfin 1065: variants (bits): 1 no dual control, 2 as CVD<2.2, 4 no media formats, 8 MFC 2 ch, 16 cal topologies, "
++    "32 destroy CVS, 64 RX format 1 ch/16 bit");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_vsid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &voice_vsid, 1, sysctl_voice_number, "I",
++    "redfin 1065: the VSID the passive sessions are named after (0x11C05000 VoiceMMode1; 0 = \"default modem voice\")");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_ear, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &below_ear, 2, sysctl_voice_number,
++    "I", "redfin 1065: earpiece amplifier level, 1/8 dB under Android's (default 240; never under 48)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_spk, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &below_speaker, 3,
++    sysctl_voice_number, "I", "redfin 1065: speaker amplifier level, 1/8 dB under Android's (default 160; never under 48)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/sys/redwood_audio.h b/bsd/sys/redwood_audio.h
+index eb549c3..b919bce 100644
+--- a/bsd/sys/redwood_audio.h
++++ b/bsd/sys/redwood_audio.h
+@@ -108,6 +108,7 @@ void redwood_audio_record_fed(const int16_t *frames, uint32_t count);
+ struct redwood_apr_answer {
+ 	uint32_t opcode, token, length;         /* length: of the payload, in bytes */
+ 	uint32_t words[64];
++	uint16_t port;                          /* 1065: the answer's source port (a voice session's new handle) */
+ };
+ typedef bool (*redwood_apr_events_t)(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload,
+     uint32_t length);
+@@ -115,6 +116,9 @@ typedef bool (*redwood_apr_events_t)(uint8_t service, uint16_t port, uint32_t op
+ bool redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+     uint32_t wait_ms, struct redwood_apr_answer *answer);
+ void redwood_adsp_apr_events(redwood_apr_events_t handler);
++/* 1065: with the source port apart from the destination port (the voice services: sweet_voice.c) */
++bool redwood_adsp_apr_ports(uint8_t service, uint16_t from_port, uint16_t port, uint32_t token, uint32_t opcode,
++    const void *payload, uint32_t length, uint32_t wait_ms, struct redwood_apr_answer *answer);
+ const uint8_t *redwood_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
+ void redwood_adsp_fw_free(const uint8_t *data, uint64_t size);
+ 
+@@ -130,6 +134,17 @@ void redwood_adsp_apr_events_second(redwood_apr_events_t handler);
+ bool redwood_audio_recording_mic(void);
+ void redwood_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
+ void redwood_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
++/*
++ * 1065, in-call audio (bsd/dev/sweet_voice.c, kern.sweet_voice). The microphones' path held up for a call
++ * (as if /dev/redwood-mic were open): true once it is up (waits at most wait_ms); false = released or not up.
++ */
++bool redwood_mic_voice_hold(bool on, uint32_t wait_ms);
++/*
++ * The speakers' port 0x9040 and the amplifiers held for a call: amps bit 0 = 0x40 (slot 0, top/earpiece),
++ * bit 1 = 0x41 (slot 1, bottom speaker), at `below' eighths of a dB under Android's level; 0 = the call is over
++ * (what the call alone brought up is taken down; the amplifiers follow what iOS plays again). True: the port runs.
++ */
++bool redwood_sound_voice(uint32_t amps, uint32_t below);
+ #endif
+ 
+ #endif /* _SYS_REDWOOD_AUDIO_H_ */
