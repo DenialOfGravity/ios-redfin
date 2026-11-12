@@ -62,8 +62,10 @@
 #include <mach/vm_attributes.h>
 #include <vm/vm_map.h>
 #include <libkern/libkern.h>
+#include "sweet_bb.h"
 
 void sweet_abp_init(void);
+void sweet_bb_init(void);       /* 1067: sweet_bb.c */
 void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
 void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
 
@@ -170,6 +172,10 @@ sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uin
 	if (len > ABPB_MAXFRAME) {
 		return;
 	}
+	if (sweet_bb & SBB_QMUX) {      /* 1068: the kernel router answers (sweet_qmux.c), not wland */
+		sweet_qmux_c2w(pipe, sess, type, data, len);
+		return;
+	}
 	lck_mtx_lock(&abp_lock);
 	if (ABPB_RING - ab_used() < sizeof(h) + len) {
 		if (ab.dropped++ < 20) {
@@ -194,6 +200,10 @@ sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uin
 static int
 ab_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
 {
+	if (sweet_bb & SBB_QMUX) {
+		printf("SWEET ABP: /dev/abpbridge refused: the kernel router owns qmux1/qmux2 (sweetbb & 2)\n");
+		return EBUSY;
+	}
 	lck_mtx_lock(&abp_lock);
 	if (ab.open) {
 		lck_mtx_unlock(&abp_lock);
@@ -223,34 +233,36 @@ ab_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused 
 	return 0;
 }
 
-/* 1063: wland says it can (1) or cannot (0) answer for the modem now. */
+/* 1063: the bridge (wland, or 1068's kernel router) says it can (1) or cannot (0) answer for the modem now. */
+void
+sweet_abp_set_ready(bool v, const char *why)
+{
+	bool was;
+	lck_mtx_lock(&abp_lock);
+	was = ab.ready;
+	ab.ready = v;
+	if (ab.ready && !was) {
+		ab.readies++;
+	}
+	lck_mtx_unlock(&abp_lock);
+	printf("SWEET ABP: %s says %s (was %s)\n", why, v ? "READY" : "not ready", was ? "ready" : "not ready");
+	if (!(sweet_abp_flags & ABP_BIT_DEFER)) {
+		return;                 /* published at boot already: nothing to do */
+	}
+	if (v) {
+		SweetABPPublish(true, why);
+	} else if (sweet_abp_flags & ABP_BIT_UNPUB_ON_CLOSE) {
+		SweetABPPublish(false, "not ready, sweetabp & 0x20");
+	}
+}
+
 static int
 ab_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
 {
 	if (cmd != ABPB_IOC_READY) {
 		return ENOTTY;
 	}
-	uint32_t v = *(uint32_t *)(void *)data;
-	bool was;
-	lck_mtx_lock(&abp_lock);
-	was = ab.ready;
-	ab.ready = v != 0;
-	if (ab.ready && !was) {
-		ab.readies++;
-	}
-	lck_mtx_unlock(&abp_lock);
-	printf("SWEET ABP: wland says %s (was %s)\n", v ? "READY" : "not ready", was ? "ready" : "not ready");
-	if (!(sweet_abp_flags & ABP_BIT_DEFER)) {
-		return 0;               /* published at boot already: nothing to do */
-	}
-	if (v) {
-		int e = SweetABPPublish(true, "wland ready");
-		return e == EALREADY ? 0 : e;
-	}
-	if (sweet_abp_flags & ABP_BIT_UNPUB_ON_CLOSE) {
-		int e = SweetABPPublish(false, "wland not ready, sweetabp & 0x20");
-		return e == EALREADY ? 0 : e;
-	}
+	sweet_abp_set_ready(*(uint32_t *)(void *)data != 0, "wland");
 	return 0;
 }
 
@@ -407,6 +419,7 @@ void
 sweet_abp_init(void)
 {
 	uint32_t on = 0, fake = 0;
+	sweet_bb_init();        /* 1067: boot-arg sweetbb (kernel modem link / QMI router), before the bridge is made */
 	PE_parse_boot_argn("sweetabp", &on, sizeof(on));
 	PE_parse_boot_argn("sweetabmfake", &fake, sizeof(fake));
 	PE_parse_boot_argn("sweetabpstage", &sweet_abp_bootstage, sizeof(sweet_abp_bootstage));

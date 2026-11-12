@@ -162,7 +162,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 static LCK_GRP_DECLARE(adsp_lock_group, "redwood-adsp");
 /* (redwood_wifi.c's locks; on redfin the modem's Wi-Fi runs in userland, phone/wifi, which opens the AOP mailbox once at its start) */
 static LCK_MTX_DECLARE(redwood_aop_mailbox_lock, &adsp_lock_group);
-static LCK_MTX_DECLARE(redwood_smem_alloc_lock, &adsp_lock_group);
+LCK_MTX_DECLARE(redwood_smem_alloc_lock, &adsp_lock_group);   /* (1067: sweet_bb.c allocates under it too) */
 
 #define STEPS                   11
 
