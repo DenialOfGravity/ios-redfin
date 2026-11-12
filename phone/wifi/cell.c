@@ -719,6 +719,11 @@ static void send_step(void)
 }
 
 /* wland: Wi-Fi's WLFW bring-up is over (ok or not): cell may start 15 s later */
+int cell_started(void)
+{
+	return enabled && allowed && link_ms() >= allow_ms;
+}
+
 void cell_allow(void)
 {
 	if (!allowed) {

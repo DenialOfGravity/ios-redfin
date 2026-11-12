@@ -48,6 +48,7 @@
 #include "bridge.h"
 #include "abpbridge.h"
 #include "cell.h"
+#include "ssctl.h"
 #include "ipa.h"
 #include "ipaqmi.h"
 #include "ipagsi.h"
@@ -791,6 +792,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			cell_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port == SSCTL_PORT) {
+			ssctl_handle(h, d, n);	/* ssctladsp=1 in cell.on (ssctl.c) */
+			return;
+		}
 		if (h->dst_port == PDMAPPER_PORT) {
 			pdmapper_handle(h, d, n);
 			return;
@@ -820,14 +825,17 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		if (w[1] == WLFW_SERVICE)
 			wlfw_new_server(w[3], w[4]);
 		cell_server(w[1], w[2], w[3], w[4]);
+		ssctl_server(w[1], w[2], w[3], w[4]);
 		ipaqmi_server(w[1], w[2], w[3], w[4]);
 		abpbridge_server(w[1], w[2], w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
 		cell_server_gone(w[3], w[4]);
+		ssctl_server_gone(w[3], w[4]);
 		ipaqmi_server_gone(w[3], w[4]);
 		abpbridge_server_gone(w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_BYE) {
 		cell_server_gone(h->src_node, 0xffffffffu);
+		ssctl_server_gone(h->src_node, 0xffffffffu);
 		ipaqmi_server_gone(h->src_node, 0xffffffffu);
 		abpbridge_server_gone(h->src_node, 0xffffffffu);
 	}
@@ -972,6 +980,7 @@ static void net_idle(void)
 	join_poll();
 	ipa_auto_poll();	/* before cell_poll: its holds are in place before cell's first PIN verify could go */
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
+	ssctl_poll();	/* SSCTL adsp after-powerup to the modem, only with ssctladsp=1 in cell.on (ssctl.c) */
 	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 	ipagsi_poll();	/* the IPA/GSI data path and its utun, only after cell.c started it (ipagsi.c) */
 	abpbridge_poll();	/* kernel 1061/1063 /dev/abpbridge <-> Apple CommCenter, only with abpbridge=1|2 in cell.on (abpbridge.c) */
