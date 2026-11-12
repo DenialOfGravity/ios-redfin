@@ -879,6 +879,9 @@ codec_read(int16_t *samples, UInt32 frames)
 	mic_heard += have;
 }
 
+static void actuator_start(void);
+static void actuator_stop(void);
+
 static OSStatus
 start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
 {
@@ -898,6 +901,9 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		if (d->object == OBJECT_CODEC) {
 			codec_open();
 		}
+		if (d->object == OBJECT_ACTUATOR) {
+			actuator_start();
+		}
 	}
 	pthread_mutex_unlock(&lock);
 	return 0;
@@ -913,6 +919,9 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	}
 	pthread_mutex_lock(&lock);
 	if (d->running != 0 && --d->running == 0) {
+		if (d->object == OBJECT_ACTUATOR) {
+			actuator_stop();
+		}
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
 		} else if (d->output != 0) {
@@ -966,16 +975,189 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 /*
  * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
  * CoreHaptics' patterns, UIKit's feedbacks, as waveforms of one channel -- goes to the kernel's motor
- * driver (/dev/redwood-haptic, bsd/dev/redwood_haptic.c, haptic=5), which plays Android's own
- * waveforms on the phone's motor by it. (iOS plays on this device at all only because the device
- * tree says the phone's haptics are "closed-loop": see mkidentity.py.) Said the first times, with
- * how loud.
+ * driver (/dev/redwood-haptic, bsd/dev/sweet_audio.c, xnu 0914), which turns each write's peak into a
+ * DRV2624 drive level. (iOS plays on this device at all only because the device tree says the phone's
+ * haptics are "closed-loop": see mkadt.py.)
+ *
+ * Haptics apart from sound (ws-haptic-decouple). The virtual audio device runs the actuator together
+ * with the speaker: every "playing" comes twice, and the actuator's frames add up to about half the
+ * speaker's (r63a / live 2026-11-05: 109 s of actuator for 204 s of speaker), with peaks pinned at
+ * 17681 (AUHapticsProtection's ceiling in 'd22_actuator_general'), so what is played reaches the motor
+ * and the phone buzzes with its speaker. A DRV2624 is not a Taptic Engine: it cannot render audio, and
+ * the kernel's level follower drives it flat out for anything over a third of full scale. So what the
+ * actuator plays is judged in bursts (activity over HAP_ACTIVE, ended by HAP_BURST_END of quiet):
+ *
+ *   mode 0 (default, decoupled): a burst that starts while the speaker is silent is a haptic and is felt
+ *          whole (taps, UIKit/CoreHaptics feedback, vibrate, the ringer's vibration with no tone). A burst
+ *          that starts with sound on the speaker (within HAP_NEAR of its onset) is felt for its first
+ *          HAP_PAIRED ms only -- the tap iOS pairs with a click, the keyboard, the charger -- and then
+ *          silenced for as long as the speaker stays audible: what follows is the sound's copy.
+ *   mode 1 (coupled, the old behaviour): everything goes to the motor.
+ *   mode 2 (strict): nothing reaches the motor while the speaker is audible (within HAP_NEAR).
+ *
+ * The mode is the number in /private/var/local/haptic-audio (missing or unreadable: 0), read each time
+ * the actuator starts, so it changes without a restart. Silenced frames go to the kernel as zeros.
+ * Each actuator run ends with one line: its bursts, how they were judged, how long was felt and muted.
  */
-static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
+#define HAPTIC_MODE_FILE        "/private/var/local/haptic-audio"
+#define HAP_ACTIVE              1000    /* the kernel's HAP_FLOOR: under it the motor is off anyway */
+#define SPK_AUDIBLE             64      /* a speaker block's peak over this (-54 dBFS): sound */
+#define HAP_BURST_END_MS        30
+#define HAP_NEAR_MS             30
+#define HAP_DECIDE_MS           12      /* a burst's onset is judged once its first 12 ms are in */
+#define HAP_PAIRED_MS           60
+#define HAP_RECHECK_MS          100     /* ... and once more at 100 ms, when the speaker's blocks are surely in */
+#define SPK_BLOCKS              64      /* the speaker's last writes: >= 1.3 s at 1024 frames */
+#define HAP_SAID_MAX            400
+
+static int haptic = -1;          /* the motor driver; -2: not there */
 static unsigned haptic_said;
+static int haptic_mode;
+
+/* The speaker's recent writes, by host time: written on its I/O thread, read on the actuator's. */
+static struct {
+	volatile UInt64 start, end;
+	volatile int peak;
+} spk[SPK_BLOCKS];
+static volatile unsigned spk_next;
+
+static UInt64
+frames_to_ticks(UInt64 frames)
+{
+	return (UInt64)((Float64)frames * ticks_per_frame);
+}
+
+static UInt64
+io_host_time(const AudioServerPlugInIOCycleInfo *cycle)
+{
+	return cycle != NULL && cycle->mOutputTime.mHostTime != 0 ? cycle->mOutputTime.mHostTime : mach_absolute_time();
+}
 
 static void
-actuator_write(const int16_t *samples, UInt32 frames)
+speaker_note(const int16_t *samples, UInt32 frames, UInt64 when)
+{
+	int peak = 0;
+	unsigned i = spk_next % SPK_BLOCKS;
+
+	for (UInt32 k = 0; k < frames * REDWOOD_AUDIO_CHANNELS; k++) {
+		int v = samples[k] < 0 ? -samples[k] : samples[k];
+
+		peak = v > peak ? v : peak;
+	}
+	spk[i].end = 0;                 /* invalid while it changes */
+	spk[i].start = when;
+	spk[i].peak = peak;
+	spk[i].end = when + frames_to_ticks(frames);
+	spk_next++;
+}
+
+/* Is the speaker audible anywhere in [from, to]? */
+static Boolean
+speaker_audible(UInt64 from, UInt64 to)
+{
+	for (unsigned i = 0; i < SPK_BLOCKS; i++) {
+		UInt64 end = spk[i].end, start = spk[i].start;
+
+		if (end != 0 && spk[i].peak > SPK_AUDIBLE && start <= to && end >= from) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* this actuator run */
+static struct {
+	Boolean in_burst, decided, with_sound, rechecked;
+	UInt64 onset, last_active;      /* host times */
+	unsigned bursts, haptic_bursts, sound_bursts;
+	UInt64 felt, muted, frames;     /* frames */
+	int peak;
+} hr;
+
+static void
+actuator_start(void)
+{
+	char buf[16] = "";
+	int f = open(HAPTIC_MODE_FILE, O_RDONLY);
+
+	if (f >= 0) {
+		ssize_t n = read(f, buf, sizeof(buf) - 1);
+
+		buf[n > 0 ? n : 0] = 0;
+		close(f);
+	}
+	haptic_mode = buf[0] >= '0' && buf[0] <= '2' ? buf[0] - '0' : 0;
+	memset(&hr, 0, sizeof(hr));
+}
+
+static void
+actuator_stop(void)
+{
+	if ((hr.bursts > 0 || hr.peak > 0) && haptic_said < HAP_SAID_MAX) {
+		haptic_said++;
+		say("redwood: audio: actuator run %llu.%02llu s, mode %d: %u bursts (%u haptic, %u with sound), felt %llu ms, "
+		    "muted %llu ms, peak %d of 32768%s\n", hr.frames / REDWOOD_AUDIO_RATE,
+		    hr.frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, haptic_mode, hr.bursts, hr.haptic_bursts,
+		    hr.sound_bursts, hr.felt * 1000 / REDWOOD_AUDIO_RATE, hr.muted * 1000 / REDWOOD_AUDIO_RATE, hr.peak,
+		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
+	}
+}
+
+/* Should this block (of an actuator run, at host time when, with this peak) reach the motor? */
+static Boolean
+actuator_felt(int peak, UInt64 when, UInt32 frames)
+{
+	UInt64 near = frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_NEAR_MS / 1000);
+	UInt64 end = when + frames_to_ticks(frames);
+
+	if (peak >= HAP_ACTIVE) {
+		if (!hr.in_burst || when > hr.last_active + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_BURST_END_MS / 1000)) {
+			hr.in_burst = true;
+			hr.decided = hr.with_sound = hr.rechecked = false;
+			hr.onset = when;
+			hr.bursts++;
+		}
+		hr.last_active = end;
+	}
+	if (haptic_mode == 1) {
+		return true;
+	}
+	if (haptic_mode == 2) {
+		return !speaker_audible(when - near, end + near);
+	}
+	if (!hr.in_burst) {
+		return true;            /* quiet: nothing to feel either way */
+	}
+	if (!hr.decided && end >= hr.onset + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_DECIDE_MS / 1000)) {
+		hr.decided = true;
+		hr.with_sound = speaker_audible(hr.onset - near, hr.onset + near);
+		if (hr.with_sound) {
+			hr.sound_bursts++;
+		} else {
+			hr.haptic_bursts++;
+		}
+	}
+	if (hr.decided && !hr.with_sound && !hr.rechecked &&
+	    end >= hr.onset + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_RECHECK_MS / 1000)) {
+		/* the speaker's blocks for the onset may have come after the first judgement: once more */
+		hr.rechecked = true;
+		if (speaker_audible(hr.onset - near, hr.onset + near)) {
+			hr.with_sound = true;
+			hr.haptic_bursts--;
+			hr.sound_bursts++;
+		}
+	}
+	if (!hr.decided || !hr.with_sound) {
+		return true;
+	}
+	if (when < hr.onset + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_PAIRED_MS / 1000)) {
+		return true;            /* the tap paired with a sound */
+	}
+	return !speaker_audible(when - near, end + near);
+}
+
+static void
+actuator_write(int16_t *samples, UInt32 frames, UInt64 when)
 {
 	int peak = 0;
 
@@ -984,6 +1166,14 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 		peak = v > peak ? v : peak;
 	}
+	hr.frames += frames;
+	hr.peak = peak > hr.peak ? peak : hr.peak;
+	if (!actuator_felt(peak, when, frames)) {
+		memset(samples, 0, (size_t)frames * 2);  /* in place: the HAL's own buffer, done with after this */
+		hr.muted += frames;
+	} else if (peak >= HAP_ACTIVE) {
+		hr.felt += frames;
+	}
 	if (haptic == -1) {
 		haptic = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
 		haptic = haptic >= 0 ? haptic : -2;
@@ -991,16 +1181,11 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	if (haptic >= 0) {
 		(void)write(haptic, samples, (size_t)frames * 2);
 	}
-	if (peak > 0 && haptic_said < 12) {
-		haptic_said++;
-		say("redwood: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
-		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
-	}
 }
 
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
-    __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
+    __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
     __unused void *secondary)
 {
 	const struct device *d = device_of(stream);
@@ -1014,8 +1199,9 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		/* the speaker's and Hawking's inputs: silence */
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
-		actuator_write(buffer, frames);
+		actuator_write(buffer, frames, io_host_time(cycle));
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+		speaker_note(buffer, frames, io_host_time(cycle));
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
 			refused += frames;

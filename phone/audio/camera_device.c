@@ -672,6 +672,8 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 }
 
 static void torch_set(struct stream *s, CFTypeRef value);
+static bool torch_ui(void);
+static void torch_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 static double
 dict_number(CFDictionaryRef d, const char *name, double otherwise)
@@ -1065,6 +1067,14 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		torch_set(s, value);
 		return 0;
 	}
+	if (key_is(key, "HighCurrentTorchEnabled")) {
+		/* redfin (torch1): the flashlight sets this before TorchLevel; the kernel's current is capped anyway */
+		if (torch_ui()) {
+			torch_log("%s: HighCurrentTorchEnabled %s (taken; the current stays within sweettorch_ma)", s->camera->name,
+			    value == kCFBooleanTrue ? "true" : "false");
+		}
+		return 0;
+	}
 	/* ---- redfin (plan B4): exposure ---- */
 	if (key_is(key, "LockAENow") || key_is(key, "UnlockAENow")) {
 		double on = 1;
@@ -1233,12 +1243,155 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	return 0;
 }
 
-/* the flashlight: TorchLevel (0 to 1) as thousandths to the kernel (HackiOS: /dev/redwood-torch; redfin: a sysctl) */
+/*
+ * the flashlight: TorchLevel (0 to 1) as thousandths to the kernel (HackiOS: /dev/redwood-torch; redfin: a sysctl).
+ *
+ * redfin (torch1): Control Centre's flashlight (AVFlashlight -> mediaserverd's FigFlashlight, CMCapture) takes the
+ * back wide camera's stream from the device vendor (-[BWFigCaptureDeviceVendor copyStreamForFlashlightWithPosition:1
+ * deviceType:2 forDevice:]), sets HighCurrentTorchEnabled on it if listed, then TorchLevel (a float 0..1) for every
+ * level change and 0 for off. Its own level, availability (the vendor's active device) and overheating
+ * (FigCaptureThermalMonitor's maxTorchLevel < 1) are kept in CMCapture, not asked of the stream.
+ * Flag /var/local/camera-torch-ui (no file = on; a file starting with '0' = off, as before): every torch call is
+ * written to /var/tmp/camera-torch.log, and while lit the level is written again every TORCH_REARM_S so the
+ * kernel's on-time limit (sweettorch_secs, 120 s) does not put out a flashlight Control Centre shows as on; that
+ * stops after TORCH_MAX_S, when the camera block reaches TORCH_HOT_DC, or when the kernel no longer has it lit (a
+ * fault, or another program turned it off).
+ */
+#define TORCH_FLAG      "/var/local/camera-torch-ui"
+#define TORCH_LOG       "/var/tmp/camera-torch.log"
+#define TORCH_REARM_S   100             /* < sweettorch_secs (120) */
+#define TORCH_MAX_S     1800            /* half an hour at most, then off */
+#define TORCH_HOT_DC    600             /* kern.sweet_temp_camera, deci-degC */
+
+static pthread_mutex_t torch_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t torch_cond = PTHREAD_COND_INITIALIZER;
+static unsigned torch_want;             /* what the capture stack asked for, thousandths */
+static uint64_t torch_generation;
+static bool torch_keeper;
+
+static bool
+torch_ui(void)
+{
+	char c = '1';
+	int fd = open(TORCH_FLAG, O_RDONLY);
+
+	if (fd >= 0) {
+		if (read(fd, &c, 1) != 1) {
+			c = '1';
+		}
+		close(fd);
+	}
+	return c != '0';
+}
+
+static void torch_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+static void
+torch_log(const char *format, ...)
+{
+	char line[300];
+	struct timeval tv;
+	va_list ap;
+	int fd, n;
+
+	gettimeofday(&tv, NULL);
+	n = snprintf(line, sizeof(line), "%ld.%03d [%d] ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid());
+	va_start(ap, format);
+	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 2) {
+		n = sizeof(line) - 2;
+	}
+	say("torch: %s", line);
+	line[n++] = '\n';
+	if ((fd = open(TORCH_LOG, O_WRONLY | O_APPEND | O_CREAT, 0644)) >= 0) {
+		write(fd, line, (size_t)n);
+		close(fd);
+	}
+}
+
+static int
+sysctl_int(const char *name, int *value)
+{
+	size_t size = sizeof(*value);
+
+	return sysctlbyname(name, value, &size, NULL, 0);
+}
+
+static int
+torch_write(unsigned thousandths)
+{
+	int kernel_level = (int)thousandths;
+
+	return sysctlbyname("kern.sweet_torch", NULL, NULL, &kernel_level, sizeof(kernel_level));
+}
+
+/* while lit: the level again before the kernel's time limit; see above */
+static void *
+torch_keep(void *arg)
+{
+	uint64_t since = mach_absolute_time();
+	mach_timebase_info_data_t tb;
+
+	(void)arg;
+	mach_timebase_info(&tb);
+	pthread_mutex_lock(&torch_lock);
+	while (torch_want > 0) {
+		uint64_t generation = torch_generation;
+		struct timespec until;
+		struct timeval now;
+
+		gettimeofday(&now, NULL);
+		until.tv_sec = now.tv_sec + TORCH_REARM_S;
+		until.tv_nsec = now.tv_usec * 1000;
+		while (torch_want > 0 && generation == torch_generation &&
+		    pthread_cond_timedwait(&torch_cond, &torch_lock, &until) == 0) {
+		}
+		if (torch_want == 0) {
+			break;
+		}
+		if (generation != torch_generation) {
+			since = mach_absolute_time();   /* a new level: its own time */
+			continue;
+		}
+		unsigned want = torch_want;
+		int kernel = 0, camera = 0;
+		double lit_s = (double)(mach_absolute_time() - since) * tb.numer / tb.denom / 1e9;
+		const char *why = NULL;
+
+		if (sysctl_int("kern.sweet_torch", &kernel) != 0 || kernel == 0) {
+			why = "the kernel no longer has it lit (fault, time limit or another program)";
+		} else if (sysctl_int("kern.sweet_temp_camera", &camera) == 0 && camera >= TORCH_HOT_DC) {
+			why = "the camera block is hot";
+		} else if (lit_s >= TORCH_MAX_S) {
+			why = "on for the longest time allowed";
+		} else if (!torch_ui()) {
+			why = "flag " TORCH_FLAG " is 0";
+		}
+		if (why != NULL) {
+			torch_want = 0;
+			(void)torch_write(0);
+			torch_log("off after %.0f s: %s (kernel %d, camera %d.%d C)", lit_s, why, kernel, camera / 10, camera % 10);
+			break;
+		}
+		if (torch_write(want) != 0) {
+			torch_log("again at %u of 1000 NOT TAKEN (%s): off", want, strerror(errno));
+			torch_want = 0;
+			break;
+		}
+		torch_log("again at %u of 1000 after %.0f s (camera %d.%d C)", want, lit_s, camera / 10, camera % 10);
+	}
+	torch_keeper = false;
+	pthread_mutex_unlock(&torch_lock);
+	return NULL;
+}
+
 static void
 torch_set(struct stream *s, CFTypeRef value)
 {
 	float level = 0;
 	uint32_t thousandths;
+	bool ui = torch_ui();
 
 	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
 		CFNumberGetValue(value, kCFNumberFloatType, &level);
@@ -1246,13 +1399,34 @@ torch_set(struct stream *s, CFTypeRef value)
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
 	thousandths = (uint32_t)(level * 1000 + 0.5f);
 	/* redfin: the kernel's flashlight is sysctl kern.sweet_torch (xnu 0918, sweettorch=2), thousandths as here */
-	int kernel_level = (int)thousandths;
-	(void)s;
-	if (sysctlbyname("kern.sweet_torch", NULL, NULL, &kernel_level, sizeof(kernel_level)) != 0) {
-		say("the flashlight at %u of 1000 NOT TAKEN (kern.sweet_torch: %s)", thousandths, strerror(errno));
+	if (torch_write(thousandths) != 0) {
+		int e = errno;
+
+		say("the flashlight at %u of 1000 NOT TAKEN (kern.sweet_torch: %s)", thousandths, strerror(e));
+		if (ui) {
+			torch_log("%s: TorchLevel %.3f -> %u of 1000 NOT TAKEN (%s)", s->camera->name, level, thousandths, strerror(e));
+		}
+		thousandths = 0;
+	} else if (ui) {
+		torch_log("%s: TorchLevel %.3f -> %u of 1000", s->camera->name, level, thousandths);
 	} else {
 		say("the flashlight at %u of 1000", thousandths);
 	}
+	pthread_mutex_lock(&torch_lock);
+	torch_want = ui ? thousandths : 0;
+	torch_generation++;
+	pthread_cond_broadcast(&torch_cond);
+	if (torch_want > 0 && !torch_keeper) {
+		pthread_t t;
+
+		torch_keeper = pthread_create(&t, NULL, torch_keep, NULL) == 0;
+		if (torch_keeper) {
+			pthread_detach(t);
+		} else {
+			torch_log("no keeper thread: the kernel puts it out after its time limit");
+		}
+	}
+	pthread_mutex_unlock(&torch_lock);
 }
 
 /* ---- the frames ------------------------------------------------------------------------------------- */
