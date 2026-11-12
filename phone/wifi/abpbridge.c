@@ -473,6 +473,7 @@ static int tlvs_ok(const uint8_t *p, uint32_t n)
 #define SIM_IMSI_LEN	8
 static struct {
 	uint8_t iccid[SIM_ICCID_LEN], imsi[SIM_IMSI_LEN];
+	uint8_t iccid_ef[SIM_ICCID_LEN], imsi_ef[9];	/* as on the card: only for redacting the frame log */
 	int have_iccid, have_imsi, refresh, tries;
 	unsigned gen, reads, snoops;
 	uint64_t next;
@@ -918,10 +919,28 @@ static void note_seen(unsigned svc, unsigned msg, const char *act, const char *w
 }
 
 /* log one frame (abplog=1 or mode 1); dir "CC->" (CommCenter wrote it) or "->CC" (our answer / the modem's) */
+/* n12b: a copy of frame f with the SIM identity (reading order and card order) overwritten by 0xee, for the logs */
+static const uint8_t *redact(const uint8_t *f, uint32_t n)
+{
+	static uint8_t rb[6 + ABP_MAXFRAME];
+	if ((!simid.have_iccid && !simid.have_imsi) || n > sizeof(rb))
+		return f;
+	memcpy(rb, f, n);
+	const uint8_t *pat[4] = { simid.iccid, simid.iccid_ef, simid.imsi, simid.imsi_ef + 1 };
+	const uint32_t pl[4] = { SIM_ICCID_LEN, SIM_ICCID_LEN, SIM_IMSI_LEN - 1, 8 };
+	const int on[4] = { simid.have_iccid, simid.have_iccid, simid.have_imsi, simid.have_imsi };
+	for (int k = 0; k < 4; k++)
+		for (uint32_t i = 0; on[k] && i + pl[k] <= n; i++)
+			if (!memcmp(rb + i, pat[k], pl[k]))
+				memset(rb + i, 0xee, pl[k]);
+	return rb;
+}
+
 static void log_frame(unsigned pipe, const char *dir, const uint8_t *f, uint32_t n)
 {
 	if (!logframes)
 		return;
+	f = redact(f, n);	/* n12b: never the ICCID / IMSI in a log */
 	char h[3 * 96 + 8], t[600];
 	char pn[24];
 	snprintf(pn, sizeof(pn), "%s/%u", pipe < NPIPES ? pipe_name[pipe] : "?", cur_sess);
@@ -1539,6 +1558,10 @@ static void simid_from_read(unsigned file, const uint8_t *tl, uint32_t tn, const
 	} else {
 		return;
 	}
+	if (ic)
+		memcpy(simid.iccid_ef, ef, SIM_ICCID_LEN);
+	else
+		memcpy(simid.imsi_ef, ef, cl < 9 ? cl : 9);
 	uint8_t *have = ic ? simid.iccid : simid.imsi;
 	int *known = ic ? &simid.have_iccid : &simid.have_imsi;
 	uint32_t len = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
@@ -1943,7 +1966,7 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
 		malformed++;
 		char hx[3 * 48 + 8];
-		hexline(hx, sizeof(hx), d, n < 40 ? n : 40);
+		hexline(hx, sizeof(hx), redact(d, n), n < 40 ? n : 40);
 		printf("[%6llu] abp: MALFORMED %s from the modem for %s(0x%02x) cid %u (%u bytes, msg len %u): dropped: %s\n",
 		       (unsigned long long)link_ms(), d[0] == 0x04 ? "indication" : d[0] == 0x02 ? "response" : "frame", svc_name(c->svc), c->svc,
 		       c->cid, n, ml, hx);
