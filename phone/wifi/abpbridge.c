@@ -239,6 +239,7 @@ static struct trg {
 	int cond;			/* P2 reg 'if <tlv>': only when the request had TLV <tlv> with a non-zero first byte; -1 always */
 	const char *tmpl;		/* n12b: ind data with placeholders (expanded at send time) */
 	int ceq;			/* n12b 'if RQ..=RQ..': only when both request fields are equal */
+	int tosvc;			/* n12b 'ind <svc>:<msg>': to every CommCenter client of service <svc> (0 = the requester) */
 	struct fref fa, fb;
 } trg[NTRG];
 static int ntrg;
@@ -689,6 +690,13 @@ static int parse_trigger(char *line, int ln)
 	}
 	int k = sscanf(line, "%255s %255s %255s %255s %255s %255s %255s", w[0], w[1], w[2], w[3], w[4], w[5], w[6]);
 	int a, b;
+	char *colon = k >= 5 && !strcmp(w[3], "ind") ? strchr(w[4], ':') : NULL;
+	if (colon) {			/* n12b: "ind <svc>:<msg>" */
+		*colon = 0;
+		if (parse_num(w[4], &t.tosvc) || t.tosvc < 1 || t.tosvc > 255)
+			goto bad;
+		memmove(w[4], colon + 1, strlen(colon + 1) + 1);
+	}
 	if (k < 5 || ntrg >= NTRG || parse_num(w[1], &t.svc) || t.svc < 1 || t.svc > 255 || parse_num(w[2], &t.msg) ||
 	    parse_num(w[4], &a) || a < 0 || a > 0xffff)
 		goto bad;
@@ -1265,7 +1273,11 @@ static void ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 	}
 	if (msg == 0x22) {		/* GetClientId */
 		int c = -1, e = 0;
-		if (req_svc > 0 && req_svc < 0xe0 && mode >= 2 && cidfail && srv_find((unsigned)req_svc) < 0)
+		int local_svc = 0;	/* n12b: a service the policy file answers here ("<svc> * ok|resp|err|drop") gets client ids */
+		for (int i = 0; i < novr; i++)
+			if (ovr[i].svc == req_svc && ovr[i].msg == POL_ANY && ovr[i].act != ACT_FWD)
+				local_svc = 1;
+		if (req_svc > 0 && req_svc < 0xe0 && mode >= 2 && cidfail && !local_svc && srv_find((unsigned)req_svc) < 0)
 			e = QMI_ERR_INVALID_SERVICE_TYPE;	/* abpcidfail=1: as a QMUX without that service would */
 		else
 			c = req_svc >= 0 ? cid_alloc((unsigned)req_svc) : -1;
@@ -1485,6 +1497,33 @@ static void sub_note(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, u
 static int trg_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const struct trg *t, const uint8_t *rq,
 		   uint32_t rqn, const char *why)
 {
+	if (t->tosvc) {		/* n12b: to every CommCenter client of service tosvc */
+		static uint8_t xb[4096];
+		const uint8_t *tl = t->data;
+		uint32_t tn = t->dlen;
+		int miss = 0;
+		if (t->tmpl) {
+			int n = tmpl_expand(t->tmpl, rq, rqn, 0, xb, sizeof(xb), &miss);
+			if (n < 0 || miss || !tlvs_ok(xb, (uint32_t)n))
+				return -1;
+			tl = xb;
+			tn = (uint32_t)n;
+		}
+		unsigned sent = 0;
+		for (unsigned i = 0; i < NSESS; i++) {
+			if (!st[i].sess)
+				continue;
+			for (unsigned c = 1; c < 255; c++)
+				if ((st[i].cids[t->tosvc][c / 8] >> (c % 8)) & 1) {
+					send_ind(st[i].pipe, st[i].sess, (unsigned)t->tosvc, c, t->m2, tl, tn);
+					sent++;
+				}
+		}
+		synth_inds += sent;
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication %s(0x%02x) 0x%04x (%u TLV bytes) to %u client(s)\n", (unsigned long long)link_ms(),
+		       svc_name(svc), svc, msg, svc_name((unsigned)t->tosvc), t->tosvc, t->m2, tn, sent);
+		return sent ? 0 : -1;
+	}
 	if (!t->tmpl) {
 		synth_inds++;
 		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
