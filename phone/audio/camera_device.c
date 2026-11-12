@@ -49,6 +49,7 @@
 #include <stddef.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include "camera_isp.h"
 
 void redwood_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -506,6 +507,7 @@ struct stream {
 	pthread_mutex_t lock;
 	volatile bool   running;
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
+	uint64_t        asked_ms;       /* (redfin, cam-idle) when the stream was last begun (stream_begin), monotonic ms */
 	/*
 	 * redfin (B8): the worker threads. Each has the generation it was started for and goes when that is not the
 	 * stream's any more; a stop waits for them a while (workers, worker_gone), not for ever: a worker can be
@@ -1990,6 +1992,75 @@ worker_pause(const struct stream *s, unsigned generation, unsigned ms)
 	}
 }
 
+/*
+ * redfin (cam-idle): a worker whose frames nobody wants goes. mediaserverd's format probe at its start
+ * (csu_getBackings) reserves the streams and gives them back, never starting the graph: the frames went on for
+ * ever (35% of a core, the sensor on). With no graph running, no PixelBufferHandler and no photograph asked for
+ * for IDLE_MS (and no stream_begin in that time), the worker stops the stream itself and the kernel turns the
+ * sensor off; the next RequestStreams or start begins it again. /var/local/redwood-cam-keepalive: as before.
+ */
+#define IDLE_MS         2000u
+#define KEEPALIVE_FLAG  "/private/var/local/redwood-cam-keepalive"
+
+static uint64_t
+monotonic_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+static bool
+camera_keepalive(void)
+{
+	return access(KEEPALIVE_FLAG, F_OK) == 0;
+}
+
+/* whether the stream was stopped for want of anyone wanting its frames (under the stream's lock: no race with stream_begin) */
+static bool
+stream_idle(struct stream *s, unsigned generation, uint64_t *since)
+{
+	uint64_t now = monotonic_ms();
+	bool busy, stopped = false;
+
+	if (now - *since < IDLE_MS) {
+		/* (checked below only once the time is up: a lock a frame is cheap, but not needed) */
+		pthread_mutex_lock(&s->lock);
+		busy = s->graph_running || s->stills_wanted > 0;
+		for (int i = 0; !busy && i < OUTPUTS; i++) {
+			busy = s->out[i].handler != NULL;
+		}
+		if (busy) {
+			*since = now;
+		}
+		pthread_mutex_unlock(&s->lock);
+		return false;
+	}
+	if (camera_keepalive()) {
+		*since = now;
+		return false;
+	}
+	pthread_mutex_lock(&s->lock);
+	busy = s->graph_running || s->stills_wanted > 0 || now - s->asked_ms < IDLE_MS;
+	for (int i = 0; !busy && i < OUTPUTS; i++) {
+		busy = s->out[i].handler != NULL;
+	}
+	if (busy) {
+		*since = now;
+	} else if (s->running && s->generation == generation) {
+		s->running = false;
+		s->generation++;
+		stopped = true;
+	}
+	pthread_mutex_unlock(&s->lock);
+	if (stopped) {
+		say("stream: nobody has wanted the %s's frames for %u ms (no graph, no handler): they stop, the sensor off (%llu frames)",
+		    s->camera->name, IDLE_MS, (unsigned long long)s->frames);
+	}
+	return stopped;
+}
+
 /* one worker has the kernel's camera open at a time: the next waits for the last to close it */
 static pthread_mutex_t device_owner = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2027,9 +2098,14 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	struct shot shot = { 0 };
 	unsigned failures = 0;
 	const char *why = "stopped";
+	uint64_t idle_since = monotonic_ms();
 
 	isp_init(&isp);
 	while (buffer != NULL && worker_wanted(s, generation)) {
+		if (stream_idle(s, generation, &idle_since)) {
+			why = "nobody wants them";
+			break;
+		}
 		ssize_t n = read(device, buffer, bytes);
 		const struct redwood_camera_frame *f = (const void *)buffer;
 		size_t need;
@@ -2434,14 +2510,20 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	struct worker_start *start;
 	pthread_attr_t attributes;
 	pthread_t thread;
+	bool running;
 
+	/* (redfin, cam-idle: asked_ms and running under the lock, as the worker's idle stop reads and sets them) */
+	pthread_mutex_lock(&s->lock);
+	s->asked_ms = monotonic_ms();
 	if (graph) {
-		pthread_mutex_lock(&s->lock);
 		s->graph_running = true;
-		pthread_mutex_unlock(&s->lock);
+	}
+	running = s->running;
+	pthread_mutex_unlock(&s->lock);
+	if (graph) {
 		say("stream: the graph starts the stream (format %d)", s->format_index);
 	}
-	if (s->running) {
+	if (running) {
 		return 0;
 	}
 	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
@@ -2457,8 +2539,10 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	s->frames = 0;
 	s->mode_wanted = false;
 	start->o = o;
+	pthread_mutex_lock(&s->lock);
 	start->generation = ++s->generation;
 	s->running = true;
+	pthread_mutex_unlock(&s->lock);
 	pthread_mutex_lock(&s->worker_lock);
 	s->workers++;
 	pthread_mutex_unlock(&s->worker_lock);
@@ -2499,9 +2583,9 @@ stream_stop(CMBaseObjectRef o)
 	for (int i = 0; i < OUTPUTS; i++) {
 		let_go(&s->out[i]);
 	}
-	pthread_mutex_unlock(&s->lock);
 	s->running = false;
 	s->generation++;
+	pthread_mutex_unlock(&s->lock);
 	/* (redfin, B8: not for ever: the worker may be in the kernel's read while the sensor starts or stops; it goes when that returns) */
 	if (!workers_gone(s, 1500)) {
 		say("stream: its worker is still in the kernel: left to finish on its own");
@@ -2716,6 +2800,7 @@ device_request_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef op
 	 * streams through here, but it never calls the FigCaptureStream start method, so start the stream's
 	 * frame worker from the reservation. stream_start is idempotent (it no-ops when already running),
 	 * and relinquish does not stop the worker, so the reservation thrash does not tear it down.
+	 * redfin (cam-idle): a worker nobody takes frames from stops itself after IDLE_MS (stream_idle()).
 	 */
 	if (streams != NULL) {
 		CFIndex n = CFArrayGetCount(streams);
@@ -2744,10 +2829,31 @@ device_relinquish_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef
 	return 0;
 }
 
+/*
+ * redfin (cam-idle): the device going (invalidated, or its last reference gone) stops its streams' frames: the
+ * workers hold a reference to their stream each, so the stream's own finalize never comes while one runs.
+ * /var/local/redwood-cam-keepalive: as before (nothing stopped).
+ */
+static void
+device_stop_streams(struct device *d, const char *why)
+{
+	if (d->streams == NULL || camera_keepalive()) {
+		return;
+	}
+	for (CFIndex i = 0, n = CFArrayGetCount(d->streams); i < n; i++) {
+		CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(d->streams, i);
+
+		if (st != NULL && stream_of(st)->running) {
+			say("device: %s: the %s's frames stop", why, stream_of(st)->camera->name);
+			(void)stream_stop(st);
+		}
+	}
+}
+
 static OSStatus
 device_invalidate(CMBaseObjectRef o)
 {
-	(void)o;
+	device_stop_streams(derived_storage(o), "invalidated");
 	return 0;
 }
 
@@ -2756,6 +2862,7 @@ device_finalize(CMBaseObjectRef o)
 {
 	struct device *d = derived_storage(o);
 
+	device_stop_streams(d, "finalized");
 	if (d->streams) {
 		CFRelease(d->streams);
 	}
