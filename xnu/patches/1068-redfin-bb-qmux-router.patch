@@ -1,0 +1,3083 @@
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+index 441cca0..9aef53b 100644
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -1068,6 +1068,10 @@ sbb_thread(__unused void *param, __unused wait_result_t wr)
+ 			unsigned k = 0;
+ 			while (k++ < 512 && (p = q_pop(&q_router)) != NULL) {
+ 				if (p->h.type == SBB_QRTR_DATA) {
++					if (p->h.confirm_rx) {  /* the sender waits for this (Linux qrtr_port_post) */
++						uint32_t rt[5] = { SBB_QRTR_RESUME_TX, SBB_NODE_APPS, p->h.dst_port, 0, 0 };
++						sbb_qrtr_send(SBB_QRTR_RESUME_TX, p->h.dst_port, p->h.src_node, p->h.src_port, rt, sizeof(rt));
++					}
+ 					sweet_qmux_qrtr(&p->h, p->d, p->n);
+ 				} else {
+ 					uint32_t w[5] = { 0, 0, 0, 0, 0 };
+@@ -1179,7 +1183,7 @@ mq_read(__unused dev_t d, struct uio *uio, int ioflag)
+ static int
+ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
+ {
+-	struct sbb_qrtr_hdr h;
++	struct sbb_qrtr_hdr h = { 0, 0, 0, 0, 0, 0, 0, 0 };
+ 	user_ssize_t n = uio_resid(uio);
+ 	if (n < (user_ssize_t)sizeof(h) || n > (user_ssize_t)(sizeof(h) + 65536)) {
+ 		return EINVAL;
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 3427ce6..795ddea 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -1,52 +1,3041 @@
+ /*
+- * redfin 1067: stub of the kernel QMI router (filled in by 1068). With sweetbb & 2 and this stub nothing answers
+- * CommCenter: do not boot 1067 alone with sweetbb & 2.
++ * redfin 1068 (P4 phase 1, research/cc/P4-design.md s.4.2/4.3/5): the QMUX <-> QRTR router in the kernel, behind the
++ * AppleBasebandPCI stand-in's qmux1/qmux2 pipes (SweetABP.cpp), with boot-arg sweetbb & 2. A port of wland's
++ * phone/wifi/abpbridge.c (ws-n-abp-router 53df921 = a84cf84 router + ssctl), mode 2 ("router") only, with the same
++ * behaviour: CommCenter's frames reach it straight from SweetABP (sweet_abp_c2w), its answers go straight back
++ * (SweetABPDeliver), and the modem is reached over the kernel's own QRTR link (sweet_bb.c). No /dev/abpbridge round trip.
++ *
++ * Per CommCenter session (one per user client of a pipe): CTL (svc 0) answered here (GetClientId/Release/Sync/
++ * SetDataFormat/GetVersionInfo). Other requests go through the policy: FORWARD = to the modem's QMI server over QRTR,
++ * each (pipe, session, svc, cid) from its own router port (0x4000..0x43ff, pooled per service when released), the SDU
++ * unchanged; OK / ERR:<code> / RESP:<TLVs or template> = answered here; DROP = no answer.
++ *
++ * Policy = the built-in table (below; kern.sweet_qmi_rules picks the list) + override text with abpbridge.c's grammar:
++ *     svc msg fwd|ok|err[:code]|drop|resp:<hex or template>      ('*' = every msg of the service)
++ *     on svc msg ind <msg>|<svc>:<msg> [<hex or template>] [if <tlv> | if RQ..=RQ..]
++ *     on svc msg replay <get> <ind> [map a=b,..] [if ..]
++ *     on svc msg bbreset <ms> [msg|unpub] [if ..]
++ *     strip svc msg tlv[,tlv..]
++ *   templates: <id>{ICCID} <id>{IMSI} {RQ<tlv>:<off>:<len>[+n]}  (SIM identity read from the card at run time, kept in
++ *   kernel memory only, never logged, never written anywhere; frame logs are redacted).
++ * The override text comes from (first that exists): text written to kern.sweet_qmi_policy (empty string = forget it),
++ * /var/local/abp-policy.conf (re-read when it changes, checked every 10 s, kern.sweet_qmi_policy_file=0 ignores it),
++ * else the built-in default below = agent/stage/abp-policy.voice.conf (BSP 0xb00c activation + SIM identity indication,
++ * 0xb001 chip info, 0xa000/0xa001 carrier-bundle segment acks, MFSE 0x2c + RFS sync (same token, reset-after-sync 0),
++ * bbreset emulation of ABM's soft reset, PDS answers for locationd, NAS SysInfo/SigInfo replays + TLV 0x26 strip,
++ * VOICE forwarded).
++ *
++ * Kept from abpbridge.c: per-(svc, msg) "NEW" decision lines, first ANSWER per (svc, msg), MALFORMED checks on every SDU
++ * from the modem, NO ANSWER after 5 s + an unsolicited RESUME_TX ("kick"), client pooling, replays, synthesized
++ * indications, strips, SIM identity snooping (CommCenter's own UIM 0x0020 EF_ICCID/EF_IMSI reads) and the router's own
++ * reads (every 5 s while an indication waits for it), NAS indication hold until the BSP activation indication (+500 ms),
++ * bbreset (reset-detected 100 ms after the DMS reset answer, alive <ms> later: SweetABPBasebandMessage, or un/re-publish).
++ * Ready: the stand-ins are published (sweetabp & 8) once the modem's DMS, NAS and UIM servers are known.
++ *
++ * Safety (s.5): kern.sweet_qmi_filter 0 = pass (built-in protection list off: only the hard floor and the override text),
++ * 1 = protect (default), 2 = protect + every frame in the kernel log (SIM identity redacted). kern.sweet_qmi_rules 0 = the
++ * P2 list as abpbridge.c (default), 1 = the option-1 list (s.5.3 with the user's 2026-11-12 decisions: NAS/UIM/DMS state
++ * changes and COEX forwarded, network scan 1/60 s, DMS reset still emulated, SIM PIN changes and SIM file writes blocked;
++ * data services stay with wland in phase 1). The hard floor (never forwarded, whatever the text says): DMS 0x0038 0x003a
++ * 0x0048 0x004a 0x0050 0x0052, DMS 0x002e with mode 6 (persistent LPM), UIM 0x0029, all of PDC 0x24, SAR 0x11, RFRPE 0x29,
++ * SSCTL 0x2b; Apple-only services (>= 0xe0) and Apple message ids (>= 0x5500) are never forwarded either.
++ * Tunables (RW): kern.sweet_qmux_err (0x5e), _cidfail (0), _reuse (1), _kick (1), _holdnas (1), _holddly (500);
++ * kern.sweet_qmux_dump (write: the per-(svc, msg) table to the log). RD kern.sweet_bb_stats (sweet_bb.c).
++ * Log lines "SWEET QMUX:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>         /* rootvnode */
++#include <sys/kauth.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_bb.h"
+ 
+-bool
+-sweet_qmux_on(void)
++extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
++extern void SweetABPBasebandMessage(uint32_t code);
++extern int SweetABPPublish(bool on, const char *why);
++
++#define LOG(fmt, ...)           printf("SWEET QMUX: [%6llu] " fmt, (unsigned long long)sbb_ms(), ##__VA_ARGS__)
++#define NPIPES                  2u
++#define ABP_MAXFRAME            65536u
++#define QMI_ERR_NOT_SUPPORTED   0x5e
++#define QMI_ERR_INVALID_SERVICE_TYPE 0x1f
++#define QMI_ERR_CLIENT_IDS_EXHAUSTED 0x05
++#define QMI_ERR_DEVICE_IN_USE   0x17
++#define POLICY_PATH             "/private/var/local/abp-policy.conf"
++#define POLICY_MAX              (64u << 10)
++
++static const char *pipe_name[NPIPES] = { "qmux1", "qmux2" };
++
++/* tunables (abpbridge.c's cell.on words) */
++static int qmi_filter = 1, qmi_rules = 0, err_code = QMI_ERR_NOT_SUPPORTED, cidfail = 0, reuse = 1, kickon = 1;
++static int holdnas = 1, holddly = 500, policy_file = 1;
++static bool on;
++static int ready = -1;
++
++/* ---- the modem's QMI servers ---- */
++
++#define NSRV    96
++static struct { uint32_t svc, inst, node, port; int up; } srv[NSRV];
++
++static int
++srv_find(unsigned svc)
++{
++	int best = -1;
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up && srv[i].svc == svc && (best < 0 || srv[i].inst < srv[best].inst)) {
++			best = i;
++		}
++	}
++	return best;
++}
++
++/* ---- router clients ---- */
++
++#define NCL     256
++struct cl {
++	int used;                       /* 0 free, 1 active, 2 idle (pooled) */
++	uint32_t pipe, sess, port;
++	uint8_t svc, cid;
++	unsigned fwd, resp, ind;
++};
++static struct cl cl[NCL];
++static uint32_t next_port_gen;
++static unsigned late;
++
++#define NMST    1024
++struct mst {
++	uint8_t svc, act;
++	uint16_t msg, last_err;
++	unsigned count, ok, err, noans, answered_logged;
++};
++
++#define TRG_MAXMAP      8
++#define NPEND           512
++struct pend {
++	int used;
++	uint32_t port;
++	uint16_t txn, msg;
++	uint8_t svc;
++	uint64_t t;
++	int replay;
++	uint32_t rpipe, rsess;
++	uint8_t rcid, nmap, map[TRG_MAXMAP][2];
++	uint16_t ind_msg;
++	uint8_t rqn, rq[96];
++	uint8_t simread;
++	uint16_t file;
++};
++
++#define NSESS   32
++struct sess_st {
++	uint32_t pipe, sess;
++	uint8_t cids[256][32];
++};
++
++#define NHOLD   64
++#define HOLD_MAXF 4096
++struct hold {
++	int used;
++	uint32_t pipe, sess;
++	uint8_t svc, cid;
++	uint16_t msg;
++	uint32_t n;
++	uint64_t t;
++	uint8_t f[HOLD_MAXF];
++};
++
++/* the big state: allocated only when the router is on */
++static struct qbig {
++	struct mst mst[NMST];
++	struct pend pend[NPEND];
++	struct sess_st st[NSESS];
++	struct hold holdq[NHOLD];
++	uint8_t ind_buf[16 + ABP_MAXFRAME];
++	uint8_t ans_buf[6 + ABP_MAXFRAME];
++	uint8_t rep_buf[ABP_MAXFRAME];
++	uint8_t red_buf[6 + ABP_MAXFRAME];
++	uint8_t loc_buf[32 + 4096];
++	uint8_t trg_buf[4096];
++	uint8_t tmp_buf[4096];
++	uint8_t res_buf[4096];
++	char line[12288];
++} *B;
++static int nmst, mst_dirty, nhold;
++
++static uint32_t cur_pipe, cur_sess;
++static unsigned nframes_in, nframes_out, nseen;
++static struct { uint8_t svc; uint16_t msg; } seen[1024];
++static struct {
++	unsigned fwd, local_ok, local_err, dropped, resp, ind, noserver, sendfail, floor, ratelimited;
++} cnt;
++static struct { unsigned fwd, local, denied; } svc_cnt[256];
++static uint16_t replay_txn = 0xff00;
++static unsigned malformed, replays, synth_inds, stripped, kicks;
++
++static struct mst *
++mst_get(unsigned svc, unsigned msg)
++{
++	for (int i = 0; i < nmst; i++) {
++		if (B->mst[i].svc == svc && B->mst[i].msg == msg) {
++			return &B->mst[i];
++		}
++	}
++	if (nmst >= NMST) {
++		return NULL;
++	}
++	bzero(&B->mst[nmst], sizeof(B->mst[0]));
++	B->mst[nmst].svc = (uint8_t)svc;
++	B->mst[nmst].msg = (uint16_t)msg;
++	return &B->mst[nmst++];
++}
++
++static const char *
++svc_name(unsigned s)
++{
++	switch (s) {
++	case 0x00: return "CTL"; case 0x01: return "WDS"; case 0x02: return "DMS"; case 0x03: return "NAS";
++	case 0x04: return "QOS"; case 0x05: return "WMS"; case 0x06: return "PDS"; case 0x07: return "AUTH";
++	case 0x08: return "AT"; case 0x09: return "VOICE"; case 0x0a: return "CAT"; case 0x0b: return "UIM";
++	case 0x0c: return "PBM"; case 0x0f: return "TEST"; case 0x10: return "LOC"; case 0x11: return "SAR";
++	case 0x12: return "IMSS"; case 0x1a: return "WDA"; case 0x22: return "COEX"; case 0x24: return "PDC";
++	case 0x29: return "RFRPE"; case 0x2a: return "DSD"; case 0x2b: return "SSCTL"; case 0x2c: return "MFSE";
++	case 0x2f: return "DPM"; case 0x30: return "DFS"; case 0x52: return "MS";
++	case 0xe1: return "AUDIO(apple)"; case 0xe2: return "BSP(apple)"; case 0xe3: return "CIQ(apple)";
++	case 0xe4: return "AWD(apple)"; case 0xe5: return "VINYL(apple)"; case 0xe6: return "MAVIMS(apple)";
++	case 0xe7: return "ELQM(apple)"; case 0xe8: return "P2P(apple)"; case 0xe9: return "APPS(apple)";
++	case 0xea: return "SFT(apple)";
++	}
++	return "?";
++}
++
++static const char *
++ctl_name(unsigned m)
++{
++	switch (m) {
++	case 0x20: return "SetInstanceId"; case 0x21: return "GetVersionInfo"; case 0x22: return "GetClientId";
++	case 0x23: return "ReleaseClientId"; case 0x24: return "RevokeClientIdInd"; case 0x25: return "InvalidClientIdInd";
++	case 0x26: return "SetDataFormat"; case 0x27: return "Sync"; case 0x28: return "RegPwrSaveMode";
++	case 0x29: return "ConfigPwrSaveSettings"; case 0x2a: return "SetPwrSaveMode"; case 0x2b: return "GetPwrSaveMode";
++	}
++	return "?";
++}
++
++/* ---- small string helpers (no libc here) ---- */
++
++static int
++hexval(char c)
++{
++	if (c >= '0' && c <= '9') {
++		return c - '0';
++	}
++	if (c >= 'a' && c <= 'f') {
++		return c - 'a' + 10;
++	}
++	if (c >= 'A' && c <= 'F') {
++		return c - 'A' + 10;
++	}
++	return -1;
++}
++
++static bool
++is_space(char c)
+ {
++	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++/* a number, C style (0x.. hex, decimal, optional '-'), the whole string; 0 ok */
++static int
++parse_num(const char *s, int *v)
++{
++	long x = 0;
++	int neg = 0, digits = 0;
++	if (*s == '-') {
++		neg = 1;
++		s++;
++	}
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++		s += 2;
++		for (; *s && hexval(*s) >= 0; s++, digits++) {
++			x = x * 16 + hexval(*s);
++			if (x > 0x7fffffffL) {
++				return -1;
++			}
++		}
++	} else {
++		for (; *s >= '0' && *s <= '9'; s++, digits++) {
++			x = x * 10 + (*s - '0');
++			if (x > 0x7fffffffL) {
++				return -1;
++			}
++		}
++	}
++	if (!digits || *s) {
++		return -1;
++	}
++	*v = (int)(neg ? -x : x);
++	return 0;
++}
++
++/* leading decimal digits of s: value and how many characters; -1 if none */
++static int
++dec_prefix(const char *s, int *v, int *k)
++{
++	long x = 0;
++	int n = 0;
++	for (; s[n] >= '0' && s[n] <= '9'; n++) {
++		x = x * 10 + (s[n] - '0');
++		if (x > 0x7fffffffL) {
++			return -1;
++		}
++	}
++	if (!n) {
++		return -1;
++	}
++	*v = (int)x;
++	*k = n;
++	return 0;
++}
++
++/* leading hex digits of s (no 0x) */
++static int
++hex_prefix(const char *s, unsigned *v, int *k)
++{
++	unsigned x = 0;
++	int n = 0;
++	for (; hexval(s[n]) >= 0 && n < 8; n++) {
++		x = x * 16 + (unsigned)hexval(s[n]);
++	}
++	if (!n) {
++		return -1;
++	}
++	*v = x;
++	*k = n;
++	return 0;
++}
++
++/* up to max whitespace-separated words of line, each cut to wl-1 chars; the count */
++static int
++split_words(const char *line, char (*w)[256], int max)
++{
++	int n = 0;
++	const char *p = line;
++	while (n < max) {
++		while (*p && is_space(*p)) {
++			p++;
++		}
++		if (!*p) {
++			break;
++		}
++		int k = 0;
++		while (*p && !is_space(*p)) {
++			if (k < 255) {
++				w[n][k++] = *p;
++			}
++			p++;
++		}
++		w[n][k] = 0;
++		n++;
++	}
++	return n;
++}
++
++static const char *
++find_str(const char *s, const char *what)
++{
++	return strnstr(s, what, strlen(s) + 1);
++}
++
++/* ---- policy ---- */
++
++enum { ACT_FWD, ACT_OK, ACT_ERR, ACT_DROP, ACT_LOCAL, ACT_RESP };
++static const char *act_name[] = { "fwd", "ok", "err", "drop", "local", "resp" };
++#define POL_ANY         (-1)
++#define POL_ABPERR      (-1)
++
++struct pol {
++	int svc, msg, act, err;
++	const char *why;
++	int rate_ms;                    /* rules 1: a forwarded message at most once per rate_ms (else err 0x17) */
++};
++
++struct fref { int tlv, off, len, add, hasadd; };
++enum { TRG_IND, TRG_REPLAY, TRG_BBRESET };
++#define NTRG    64
++struct trg {
++	int svc, msg, kind;
++	uint16_t m2, m3;
++	uint8_t map[TRG_MAXMAP][2];
++	int nmap;
++	const uint8_t *data;
++	uint16_t dlen;
++	int cond;
++	const char *tmpl;
++	int ceq;
++	int tosvc;
++	struct fref fa, fb;
++};
++static struct trg trg[NTRG];
++static int ntrg;
++static uint8_t pol_data[16384];
++static uint32_t pol_dlen;
++#define NSTRIP  32
++static struct strip { int svc, msg; uint8_t ids[32]; int nids; } strips[NSTRIP];
++static int nstrip;
++
++static uint32_t
++strip_tlvs(unsigned svc, unsigned msg, uint8_t *p, uint32_t n)
++{
++	const struct strip *s = NULL;
++	for (int i = 0; i < nstrip && !s; i++) {
++		if (strips[i].svc == (int)svc && strips[i].msg == (int)msg) {
++			s = &strips[i];
++		}
++	}
++	if (!s) {
++		return n;
++	}
++	uint32_t o = 0;
++	for (uint32_t k = 0; k + 3 <= n;) {
++		uint32_t l = 3u + (uint32_t)(p[k + 1] | (p[k + 2] << 8));
++		if (k + l > n) {
++			break;
++		}
++		int drop = 0;
++		for (int j = 0; j < s->nids; j++) {
++			drop |= s->ids[j] == p[k];
++		}
++		if (drop) {
++			stripped++;
++		} else {
++			memmove(p + o, p + k, l);
++			o += l;
++		}
++		k += l;
++	}
++	return o;
++}
++
++static int
++parse_strip(const char *line, int ln)
++{
++	char w[4][256];
++	struct strip t;
++	bzero(&t, sizeof(t));
++	if (split_words(line, w, 4) != 4 || nstrip >= NSTRIP || parse_num(w[1], &t.svc) || parse_num(w[2], &t.msg)) {
++		goto bad;
++	}
++	for (const char *m = w[3]; *m && t.nids < 32;) {
++		unsigned x;
++		int k;
++		if (hex_prefix(m, &x, &k) || x > 255) {
++			goto bad;
++		}
++		t.ids[t.nids++] = (uint8_t)x;
++		m += k;
++		if (*m == ',') {
++			m++;
++		} else if (*m) {
++			goto bad;
++		}
++	}
++	strips[nstrip++] = t;
++	return 0;
++bad:
++	LOG("policy line %d: bad 'strip' line (strip <svc> <msg> <tlv>[,<tlv>..])\n", ln);
++	return -1;
++}
++
++/*
++ * The built-in protection lists. Exact (svc, msg) entries win over (svc, POL_ANY); a service with no entry is forwarded
++ * when it is a standard one (< 0xe0) the modem offers, else err.
++ */
++static const struct pol rules_p2[] = {     /* kern.sweet_qmi_rules 0: abpbridge.c's abp_builtin, unchanged */
++	{ 0x02, POL_ANY, ACT_FWD, 0, "DMS", 0 },
++	{ 0x02, 0x0000, ACT_OK, 0, "DMS reset: protected", 0 },
++	{ 0x02, 0x002e, ACT_OK, 0, "DMS set operating mode: protected (wland owns the mode)", 0 },
++	{ 0x02, 0x0027, ACT_ERR, POL_ABPERR, "DMS UIM set PIN protection: protected", 0 },
++	{ 0x02, 0x0029, ACT_ERR, POL_ABPERR, "DMS UIM unblock PIN: protected", 0 },
++	{ 0x02, 0x002a, ACT_ERR, POL_ABPERR, "DMS UIM change PIN: protected", 0 },
++	{ 0x02, 0x0032, ACT_ERR, POL_ABPERR, "DMS activate automatic: protected", 0 },
++	{ 0x02, 0x0033, ACT_ERR, POL_ABPERR, "DMS activate manual: protected", 0 },
++	{ 0x02, 0x0035, ACT_ERR, POL_ABPERR, "DMS set user lock state: protected", 0 },
++	{ 0x02, 0x0036, ACT_ERR, POL_ABPERR, "DMS set user lock code: protected", 0 },
++	{ 0x02, 0x0038, ACT_ERR, POL_ABPERR, "DMS write user data: protected", 0 },
++	{ 0x02, 0x003a, ACT_ERR, POL_ABPERR, "DMS restore factory defaults: protected", 0 },
++	{ 0x02, 0x0041, ACT_ERR, POL_ABPERR, "DMS UIM set CK protection: protected", 0 },
++	{ 0x02, 0x0042, ACT_ERR, POL_ABPERR, "DMS UIM unblock CK: protected", 0 },
++	{ 0x02, 0x0048, ACT_ERR, POL_ABPERR, "DMS set firmware preference: protected", 0 },
++	{ 0x02, 0x004a, ACT_ERR, POL_ABPERR, "DMS delete stored image: protected", 0 },
++	{ 0x02, 0x0050, ACT_ERR, POL_ABPERR, "DMS set boot image download mode: protected", 0 },
++	{ 0x02, 0x0052, ACT_ERR, POL_ABPERR, "DMS set service programming code: protected", 0 },
++	{ 0x03, POL_ANY, ACT_FWD, 0, "NAS", 0 },
++	{ 0x03, 0x0000, ACT_OK, 0, "NAS reset: protected", 0 },
++	{ 0x03, 0x0001, ACT_OK, 0, "NAS abort: protected", 0 },
++	{ 0x03, 0x0021, ACT_ERR, POL_ABPERR, "NAS network scan: protected (drops service while it runs)", 0 },
++	{ 0x03, 0x0022, ACT_OK, 0, "NAS initiate network register: protected", 0 },
++	{ 0x03, 0x0023, ACT_OK, 0, "NAS initiate attach: protected", 0 },
++	{ 0x03, 0x0027, ACT_ERR, POL_ABPERR, "NAS set preferred networks: protected", 0 },
++	{ 0x03, 0x0029, ACT_ERR, POL_ABPERR, "NAS set forbidden networks: protected", 0 },
++	{ 0x03, 0x002a, ACT_ERR, POL_ABPERR, "NAS set technology preference: protected", 0 },
++	{ 0x03, 0x002d, ACT_ERR, POL_ABPERR, "NAS set ACCOLC: protected", 0 },
++	{ 0x03, 0x0030, ACT_ERR, POL_ABPERR, "NAS set device config: protected", 0 },
++	{ 0x03, 0x0033, ACT_OK, 0, "NAS set system selection preference: protected (wland's nolte/csonly own it)", 0 },
++	{ 0x03, 0x0057, ACT_ERR, POL_ABPERR, "NAS update AKEY: protected", 0 },
++	{ 0x0b, POL_ANY, ACT_FWD, 0, "UIM", 0 },
++	{ 0x0b, 0x0000, ACT_OK, 0, "UIM reset: protected", 0 },
++	{ 0x0b, 0x0022, ACT_ERR, POL_ABPERR, "UIM write transparent: protected", 0 },
++	{ 0x0b, 0x0023, ACT_ERR, POL_ABPERR, "UIM write record: protected", 0 },
++	{ 0x0b, 0x0025, ACT_ERR, POL_ABPERR, "UIM set PIN protection (enable/disable): protected", 0 },
++	{ 0x0b, 0x0027, ACT_ERR, POL_ABPERR, "UIM unblock PIN: protected", 0 },
++	{ 0x0b, 0x0028, ACT_ERR, POL_ABPERR, "UIM change PIN: protected", 0 },
++	{ 0x0b, 0x0029, ACT_ERR, POL_ABPERR, "UIM depersonalization: protected", 0 },
++	{ 0x0b, 0x0030, ACT_OK, 0, "UIM power down: protected", 0 },
++	{ 0x0b, 0x0031, ACT_OK, 0, "UIM power up: protected", 0 },
++	{ 0x0b, 0x0033, ACT_OK, 0, "UIM change provisioning session: protected", 0 },
++	{ 0x0b, 0x0046, ACT_ERR, POL_ABPERR, "UIM switch slot: protected", 0 },
++	{ 0x05, POL_ANY, ACT_FWD, 0, "WMS", 0 },
++	{ 0x0a, POL_ANY, ACT_FWD, 0, "CAT", 0 },
++	{ 0x0c, POL_ANY, ACT_FWD, 0, "PBM", 0 },
++	{ 0x01, POL_ANY, ACT_ERR, POL_ABPERR, "WDS: data stays with wland (P4)", 0 },
++	{ 0x04, POL_ANY, ACT_ERR, POL_ABPERR, "QOS: data stays with wland (P4)", 0 },
++	{ 0x1a, POL_ANY, ACT_ERR, POL_ABPERR, "WDA: data stays with wland (P4)", 0 },
++	{ 0x2a, POL_ANY, ACT_ERR, POL_ABPERR, "DSD: data stays with wland (P4)", 0 },
++	{ 0x2f, POL_ANY, ACT_ERR, POL_ABPERR, "DPM: data stays with wland (P4)", 0 },
++	{ 0x30, POL_ANY, ACT_ERR, POL_ABPERR, "DFS: data stays with wland (P4)", 0 },
++	{ 0x09, POL_ANY, ACT_ERR, POL_ABPERR, "VOICE: not in P2", 0 },
++	{ 0x06, POL_ANY, ACT_ERR, POL_ABPERR, "PDS: not in P2", 0 },
++	{ 0x06, 0x0000, ACT_OK, 0, "PDS reset: answered here (an error makes locationd reset the baseband)", 0 },
++	{ 0x10, POL_ANY, ACT_ERR, POL_ABPERR, "LOC: not in P2", 0 },
++	{ 0x08, POL_ANY, ACT_ERR, POL_ABPERR, "AT: not in P2", 0 },
++	{ 0x22, POL_ANY, ACT_OK, 0, "COEX: answered success here (would change LTE/Wi-Fi/BT coexistence under wland's Wi-Fi)", 0 },
++	{ 0x24, POL_ANY, ACT_ERR, POL_ABPERR, "PDC: modem configuration (MBN) selection: protected", 0 },
++	{ 0x2b, POL_ANY, ACT_ERR, POL_ABPERR, "SSCTL: subsystem restart: protected", 0 },
++	{ 0x29, POL_ANY, ACT_ERR, POL_ABPERR, "RFRPE: RF settings: protected", 0 },
++	{ 0x11, POL_ANY, ACT_ERR, POL_ABPERR, "SAR: RF power: protected", 0 },
++};
++
++static const struct pol rules_o1[] = {     /* kern.sweet_qmi_rules 1: P4-design s.5.3 + the user's 2026-11-12 decisions */
++	{ 0x02, POL_ANY, ACT_FWD, 0, "DMS", 0 },
++	{ 0x02, 0x002e, ACT_FWD, 0, "DMS set operating mode: forwarded (reset mode 4 emulated, mode 6 hard floor)", 0 },
++	{ 0x02, 0x0027, ACT_ERR, POL_ABPERR, "DMS UIM set PIN protection: blocked (user: SIM PIN change blocked for now)", 0 },
++	{ 0x02, 0x0029, ACT_ERR, POL_ABPERR, "DMS UIM unblock PIN: protected (wrong PUK bricks the SIM)", 0 },
++	{ 0x02, 0x002a, ACT_ERR, POL_ABPERR, "DMS UIM change PIN: blocked (user: SIM PIN change blocked for now)", 0 },
++	{ 0x02, 0x0032, ACT_ERR, POL_ABPERR, "DMS activate automatic: protected", 0 },
++	{ 0x02, 0x0033, ACT_ERR, POL_ABPERR, "DMS activate manual: protected", 0 },
++	{ 0x02, 0x0035, ACT_ERR, POL_ABPERR, "DMS set user lock state: protected", 0 },
++	{ 0x02, 0x0036, ACT_ERR, POL_ABPERR, "DMS set user lock code: protected", 0 },
++	{ 0x02, 0x0041, ACT_ERR, POL_ABPERR, "DMS UIM set CK protection: protected", 0 },
++	{ 0x02, 0x0042, ACT_ERR, POL_ABPERR, "DMS UIM unblock CK: protected", 0 },
++	{ 0x03, POL_ANY, ACT_FWD, 0, "NAS", 0 },
++	{ 0x03, 0x0021, ACT_FWD, 0, "NAS network scan: forwarded, once per 60 s", 60000 },
++	{ 0x03, 0x0027, ACT_ERR, POL_ABPERR, "NAS set preferred networks: protected (persistent)", 0 },
++	{ 0x03, 0x0029, ACT_ERR, POL_ABPERR, "NAS set forbidden networks: protected (persistent)", 0 },
++	{ 0x03, 0x002a, ACT_ERR, POL_ABPERR, "NAS set technology preference: protected (persistent)", 0 },
++	{ 0x03, 0x002d, ACT_ERR, POL_ABPERR, "NAS set ACCOLC: protected", 0 },
++	{ 0x03, 0x0030, ACT_ERR, POL_ABPERR, "NAS set device config: protected", 0 },
++	{ 0x03, 0x0057, ACT_ERR, POL_ABPERR, "NAS update AKEY: protected", 0 },
++	{ 0x0b, POL_ANY, ACT_FWD, 0, "UIM", 0 },
++	{ 0x0b, 0x0022, ACT_ERR, POL_ABPERR, "UIM write transparent: blocked (user: SIM file writes blocked for now)", 0 },
++	{ 0x0b, 0x0023, ACT_ERR, POL_ABPERR, "UIM write record: blocked (user: SIM file writes blocked for now)", 0 },
++	{ 0x0b, 0x0025, ACT_ERR, POL_ABPERR, "UIM set PIN protection: blocked (user: SIM PIN change blocked for now)", 0 },
++	{ 0x0b, 0x0027, ACT_ERR, POL_ABPERR, "UIM unblock PIN: protected (wrong PUK bricks the SIM)", 0 },
++	{ 0x0b, 0x0028, ACT_ERR, POL_ABPERR, "UIM change PIN: blocked (user: SIM PIN change blocked for now)", 0 },
++	{ 0x0b, 0x0046, ACT_ERR, POL_ABPERR, "UIM switch slot: protected", 0 },
++	{ 0x05, POL_ANY, ACT_FWD, 0, "WMS", 0 },
++	{ 0x0a, POL_ANY, ACT_FWD, 0, "CAT", 0 },
++	{ 0x0c, POL_ANY, ACT_FWD, 0, "PBM", 0 },
++	{ 0x09, POL_ANY, ACT_FWD, 0, "VOICE", 0 },
++	{ 0x09, 0x0040, ACT_OK, 0, "VOICE set config: answered here (modem NV)", 0 },
++	{ 0x09, 0x0033, ACT_ERR, POL_ABPERR, "VOICE set SUPS: protected (network-side change)", 0 },
++	{ 0x09, 0x0039, ACT_ERR, POL_ABPERR, "VOICE set barring password: protected", 0 },
++	{ 0x22, POL_ANY, ACT_FWD, 0, "COEX: forwarded (user: Wi-Fi/LTE coexistence messages forwarded)", 0 },
++	{ 0x01, POL_ANY, ACT_ERR, POL_ABPERR, "WDS: data stays with wland until phase 4", 0 },
++	{ 0x04, POL_ANY, ACT_ERR, POL_ABPERR, "QOS: data stays with wland until phase 4", 0 },
++	{ 0x1a, POL_ANY, ACT_ERR, POL_ABPERR, "WDA: data stays with wland until phase 4", 0 },
++	{ 0x2a, POL_ANY, ACT_ERR, POL_ABPERR, "DSD: data stays with wland until phase 4", 0 },
++	{ 0x2f, POL_ANY, ACT_ERR, POL_ABPERR, "DPM: data stays with wland until phase 4", 0 },
++	{ 0x30, POL_ANY, ACT_ERR, POL_ABPERR, "DFS: data stays with wland until phase 4", 0 },
++	{ 0x06, POL_ANY, ACT_ERR, POL_ABPERR, "PDS: answered by the policy text", 0 },
++	{ 0x06, 0x0000, ACT_OK, 0, "PDS reset: answered here (an error makes locationd reset the baseband)", 0 },
++	{ 0x10, POL_ANY, ACT_ERR, POL_ABPERR, "LOC: unsupported", 0 },
++	{ 0x08, POL_ANY, ACT_ERR, POL_ABPERR, "AT: unsupported", 0 },
++};
++
++/* never forwarded, whatever the lists or the text say (s.5.2) */
++static bool
++hard_floor(unsigned svc, unsigned msg, const uint8_t *rq, uint32_t rqn, const char **why)
++{
++	if (svc == 0x02 && (msg == 0x0038 || msg == 0x003a || msg == 0x0048 || msg == 0x004a || msg == 0x0050 || msg == 0x0052)) {
++		*why = "hard floor: DMS NV / firmware / factory / SPC";
++		return true;
++	}
++	if (svc == 0x02 && msg == 0x002e && rq) {
++		for (uint32_t k = 0; k + 3 <= rqn;) {
++			uint32_t l = (uint32_t)(rq[k + 1] | (rq[k + 2] << 8));
++			if (k + 3 + l > rqn) {
++				break;
++			}
++			if (rq[k] == 0x01 && l >= 1 && rq[k + 3] == 6) {
++				*why = "hard floor: DMS persistent LPM (mode 6)";
++				return true;
++			}
++			k += 3 + l;
++		}
++	}
++	if (svc == 0x0b && msg == 0x0029) {
++		*why = "hard floor: UIM depersonalization";
++		return true;
++	}
++	if (svc == 0x24 || svc == 0x11 || svc == 0x29 || svc == 0x2b) {
++		*why = "hard floor: PDC / SAR / RFRPE / SSCTL";
++		return true;
++	}
+ 	return false;
+ }
+ 
++#define NOVR    256
++static struct pol ovr[NOVR];
++static struct { const uint8_t *data; uint16_t dlen; const char *tmpl; } ovr_data[NOVR];
++static int novr;
++static uint64_t rate_last[NOVR];        /* (rules_o1 index -> last forward time; only rate-limited entries use it) */
++
++static const uint8_t *
++parse_hex(const char *h, uint16_t *len)
++{
++	uint8_t *start = pol_data + pol_dlen;
++	uint32_t n = 0;
++	int hi = -1;
++	for (; *h; h++) {
++		int v;
++		if (*h == '.' || *h == '_' || *h == ':') {
++			continue;
++		}
++		v = hexval(*h);
++		if (v < 0) {
++			return NULL;
++		}
++		if (hi < 0) {
++			hi = v;
++			continue;
++		}
++		if (pol_dlen + n >= sizeof(pol_data)) {
++			return NULL;
++		}
++		start[n++] = (uint8_t)(hi << 4 | v);
++		hi = -1;
++	}
++	if (hi >= 0 || n > 4096) {
++		return NULL;
++	}
++	pol_dlen += n;
++	*len = (uint16_t)n;
++	return start;
++}
++
++static int
++tlvs_ok(const uint8_t *p, uint32_t n)
++{
++	while (n) {
++		if (n < 3) {
++			return 0;
++		}
++		uint32_t l = (uint32_t)(p[1] | (p[2] << 8));
++		if (l > n - 3) {
++			return 0;
++		}
++		p += 3 + l;
++		n -= 3 + l;
++	}
++	return 1;
++}
++
++/* ---- SIM identity (n12b): kernel memory only, never logged, never written ---- */
++
++#define SIM_ICCID_LEN   10
++#define SIM_IMSI_LEN    8
++static struct {
++	uint8_t iccid[SIM_ICCID_LEN], imsi[SIM_IMSI_LEN];
++	uint8_t iccid_ef[SIM_ICCID_LEN], imsi_ef[9];
++	int have_iccid, have_imsi, refresh, tries;
++	unsigned gen, reads;
++	uint64_t next;
++} simid;
++static char pol_text[8192];
++static uint32_t pol_tlen;
++
++/* "RQ<tlv>:<off>:<len>[+<n>]" or a number; 0 ok */
++static int
++parse_fref(const char *s, struct fref *f)
++{
++	unsigned t;
++	int off, len, add = 0, k;
++	bzero(f, sizeof(*f));
++	if (s[0] >= '0' && s[0] <= '9') {
++		int v;
++		if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++			unsigned x;
++			if (hex_prefix(s + 2, &x, &k)) {
++				return -1;
++			}
++			v = (int)x;
++		} else if (dec_prefix(s, &v, &k)) {
++			return -1;
++		}
++		f->tlv = -1;
++		f->len = 1;
++		f->add = v;
++		return 0;
++	}
++	if ((s[0] != 'R' && s[0] != 'r') || (s[1] != 'Q' && s[1] != 'q')) {
++		return -1;
++	}
++	s += 2;
++	if (hex_prefix(s, &t, &k) || t > 255 || s[k] != ':') {
++		return -1;
++	}
++	s += k + 1;
++	if (dec_prefix(s, &off, &k) || s[k] != ':') {
++		return -1;
++	}
++	s += k + 1;
++	if (dec_prefix(s, &len, &k)) {
++		return -1;
++	}
++	s += k;
++	if (off > 4096 || len < 1 || len > 64) {
++		return -1;
++	}
++	if (*s == '+') {
++		if (dec_prefix(s + 1, &add, &k) || (len != 1 && len != 2 && len != 4)) {
++			return -1;
++		}
++		f->hasadd = 1;
++	}
++	f->tlv = (int)t;
++	f->off = off;
++	f->len = len;
++	f->add = add;
++	return 0;
++}
++
++static const uint8_t *
++tlv_find(const uint8_t *p, uint32_t n, unsigned id, uint32_t *len)
++{
++	for (uint32_t k = 0; k + 3 <= n;) {
++		uint32_t l = (uint32_t)(p[k + 1] | (p[k + 2] << 8));
++		if (k + 3 + l > n) {
++			return NULL;
++		}
++		if (p[k] == id) {
++			*len = l;
++			return p + k + 3;
++		}
++		k += 3 + l;
++	}
++	return NULL;
++}
++
++static int
++fref_get(const struct fref *f, const uint8_t *rq, uint32_t rqn, int dummy, uint8_t *out)
++{
++	uint32_t l = 0;
++	const uint8_t *v = dummy ? NULL : tlv_find(rq, rqn, (unsigned)f->tlv, &l);
++	if (dummy) {
++		bzero(out, (size_t)f->len);
++	} else {
++		if (!v || (uint32_t)f->off + (uint32_t)f->len > l) {
++			return -1;
++		}
++		memcpy(out, v + f->off, (size_t)f->len);
++	}
++	if (f->hasadd) {
++		uint32_t x = 0;
++		for (int i = 0; i < f->len; i++) {
++			x |= (uint32_t)out[i] << (8 * i);
++		}
++		x += (uint32_t)f->add;
++		for (int i = 0; i < f->len; i++) {
++			out[i] = (uint8_t)(x >> (8 * i));
++		}
++	}
++	return 0;
++}
++
++static int
++fref_num(const struct fref *f, const uint8_t *rq, uint32_t rqn, uint32_t *x)
++{
++	uint8_t b[64];
++	if (f->tlv < 0) {
++		*x = (uint32_t)f->add;
++		return 0;
++	}
++	if (f->len > 4 || fref_get(f, rq, rqn, 0, b)) {
++		return -1;
++	}
++	*x = 0;
++	for (int i = 0; i < f->len; i++) {
++		*x |= (uint32_t)b[i] << (8 * i);
++	}
++	return 0;
++}
++
++/* template h -> bytes; -1 bad / no room, -2 a request field missing; *missing: an ICCID/IMSI TLV left out */
++static int
++tmpl_expand(const char *h, const uint8_t *rq, uint32_t rqn, int dummy, uint8_t *out, uint32_t room, int *missing)
++{
++	uint32_t o = 0;
++	int hi = -1;
++	*missing = 0;
++	for (; *h; h++) {
++		if (*h == '.' || *h == '_' || *h == ':') {
++			continue;
++		}
++		if (*h == '{') {
++			const char *e = strchr(h, '}');
++			if (!e || hi >= 0) {
++				return -1;
++			}
++			size_t nl = (size_t)(e - h - 1);
++			if ((nl == 5 && !strncmp(h + 1, "ICCID", 5)) || (nl == 4 && !strncmp(h + 1, "IMSI", 4))) {
++				int ic = nl == 5;
++				uint32_t l = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
++				if (dummy || (ic ? simid.have_iccid : simid.have_imsi)) {
++					if (o + 2 + l > room) {
++						return -1;
++					}
++					out[o++] = (uint8_t)l;
++					out[o++] = 0;
++					if (dummy) {
++						memset(out + o, 0xff, l);
++					} else {
++						memcpy(out + o, ic ? simid.iccid : simid.imsi, l);
++					}
++					o += l;
++				} else {
++					if (!o) {
++						return -1;
++					}
++					o--;
++					*missing = 1;
++				}
++			} else {
++				struct fref f;
++				if (parse_fref(h + 1, &f) || o + (uint32_t)f.len > room) {
++					return -1;
++				}
++				if (fref_get(&f, rq, rqn, dummy, out + o)) {
++					return -2;
++				}
++				o += (uint32_t)f.len;
++			}
++			h = e;
++			continue;
++		}
++		int v = hexval(*h);
++		if (v < 0) {
++			return -1;
++		}
++		if (hi < 0) {
++			hi = v;
++			continue;
++		}
++		if (o >= room) {
++			return -1;
++		}
++		out[o++] = (uint8_t)(hi << 4 | v);
++		hi = -1;
++	}
++	return hi >= 0 ? -1 : (int)o;
++}
++
++static int
++tmpl_sim(const char *h)
++{
++	return h && (find_str(h, "{ICCID}") || find_str(h, "{IMSI}"));
++}
++
++static const char *
++parse_tmpl(const char *h)
++{
++	int miss, n = tmpl_expand(h, NULL, 0, 1, B->tmp_buf, sizeof(B->tmp_buf), &miss);
++	size_t l = strlen(h);
++	if (n < 0 || !tlvs_ok(B->tmp_buf, (uint32_t)n) || pol_tlen + l + 1 > sizeof(pol_text)) {
++		return NULL;
++	}
++	char *t = pol_text + pol_tlen;
++	memcpy(t, h, l + 1);
++	pol_tlen += (uint32_t)l + 1;
++	return t;
++}
++
++/* "on svc msg ind|replay|bbreset ..." (line is modified: the 'if' part is cut off) */
++static int
++parse_trigger(char *line, int ln)
++{
++	char w[7][256];
++	struct trg t;
++	bzero(&t, sizeof(t));
++	t.cond = -1;
++	char *iff = __DECONST(char *, find_str(line, " if "));
++	if (iff) {
++		char *c = iff + 4;
++		while (*c == ' ') {
++			c++;
++		}
++		char *eq = strchr(c, '=');
++		if (eq) {
++			if (parse_fref(c, &t.fa) || parse_fref(eq + 1, &t.fb) || t.fa.len > 4 || t.fb.len > 4) {
++				goto bad;
++			}
++			t.ceq = 1;
++		} else {
++			unsigned x;
++			int k;
++			if (hex_prefix(c, &x, &k) || x > 255) {
++				goto bad;
++			}
++			t.cond = (int)x;
++		}
++		*iff = 0;
++	}
++	int k = split_words(line, w, 7);
++	int a, b;
++	char *colon = k >= 5 && !strcmp(w[3], "ind") ? strchr(w[4], ':') : NULL;
++	if (colon) {
++		*colon = 0;
++		if (parse_num(w[4], &t.tosvc) || t.tosvc < 1 || t.tosvc > 255) {
++			goto bad;
++		}
++		memmove(w[4], colon + 1, strlen(colon + 1) + 1);
++	}
++	if (k < 5 || ntrg >= NTRG || parse_num(w[1], &t.svc) || t.svc < 1 || t.svc > 255 || parse_num(w[2], &t.msg) ||
++	    parse_num(w[4], &a) || a < 0 || a > 0xffff) {
++		goto bad;
++	}
++	t.m2 = (uint16_t)a;
++	if (!strcmp(w[3], "ind")) {
++		t.kind = TRG_IND;
++		if (k >= 6 && strchr(w[5], '{')) {
++			t.tmpl = parse_tmpl(w[5]);
++			if (!t.tmpl) {
++				goto bad;
++			}
++		} else if (k >= 6) {
++			t.data = parse_hex(w[5], &t.dlen);
++			if (!t.data || !tlvs_ok(t.data, t.dlen)) {
++				goto bad;
++			}
++		}
++	} else if (!strcmp(w[3], "bbreset")) {
++		t.kind = TRG_BBRESET;
++		if (k >= 6 && !strcmp(w[5], "unpub")) {
++			t.m3 = 1;
++		} else if (k >= 6 && strcmp(w[5], "msg")) {
++			goto bad;
++		}
++	} else if (!strcmp(w[3], "replay")) {
++		t.kind = TRG_REPLAY;
++		if (k < 6 || parse_num(w[5], &b) || b < 0 || b > 0xffff) {
++			goto bad;
++		}
++		t.m3 = (uint16_t)b;
++		if (k >= 7 && strncmp(w[6], "map", 3)) {
++			goto bad;
++		}
++		if (k >= 7) {
++			const char *m = find_str(line, "map");
++			m += 3;
++			while (*m && t.nmap < TRG_MAXMAP) {
++				unsigned x, y;
++				int kx, ky;
++				while (*m == ' ' || *m == '\t' || *m == ',') {
++					m++;
++				}
++				if (!*m || *m == '\n' || *m == '\r') {
++					break;
++				}
++				if (hex_prefix(m, &x, &kx) || m[kx] != '=' || hex_prefix(m + kx + 1, &y, &ky) || x > 255 || y > 255) {
++					goto bad;
++				}
++				t.map[t.nmap][0] = (uint8_t)x;
++				t.map[t.nmap][1] = (uint8_t)y;
++				t.nmap++;
++				m += kx + 1 + ky;
++			}
++		}
++	} else {
++		goto bad;
++	}
++	trg[ntrg++] = t;
++	return 0;
++bad:
++	LOG("policy line %d: bad 'on' line\n", ln);
++	return -1;
++}
++
++/*
++ * The built-in default override text: agent/stage/abp-policy.voice.conf (the policy on the phone since n12w), the same
++ * lines wland's router read from /var/local/abp-policy.conf. Used when no file and no pushed text.
++ */
++static const char policy_default[] =
++    "0xe2 * err:0x5e\n"
++    "0xe4 * ok\n"
++    "0xe1 * ok\n"
++    "0xe7 * ok\n"
++    "0x06 0x0000 ok\n"
++    "on 0x03 0x0003 replay 0x004d 0x004e if 18\n"
++    "0x03 0x5557 ok\n"
++    "on 0x03 0x0003 replay 0x004f 0x0051 if 19\n"
++    "strip 0x03 0x004e 26\n"
++    "strip 0x03 0x004d 26\n"
++    "0x06 * ok\n"
++    "0x06 0x0036 resp:0102000100\n"
++    "0xe2 0xb00c ok\n"
++    "on 0xe2 0xb00c ind 0xb00c 01010000.4f010002.50010002.56010001.57010001.42{ICCID}.43{IMSI}\n"
++    "0xe2 0xb001 resp:010800e140950078563412\n"
++    "0xe2 0xa000 resp:400200{RQ01:2:2+1}\n"
++    "on 0xe2 0xa000 ind 0xa001 010200{RQ01:0:1}0010010001 if RQ01:2:2+1=RQ01:4:2\n"
++    "0xe2 0xe00d ok\n"
++    "0x03 0x555b ok\n"
++    "on 0x02 0x002e bbreset 1500 msg if RQ01:0:1=4\n"
++    "0x2c * ok\n"
++    "on 0x02 0x002e ind 0x2c:0x0800 10010000 if RQ01:0:1=4\n"
++    "0x2c 0x0020 resp:100400{RQ01:0:4}\n"
++    "0x01 0x00c8 ok\n"
++    "0x06 0x0020 resp:0102000101\n"
++    "0x09 * fwd\n"
++    "0x09 0x0040 ok\n"
++    "0x09 0x0033 err:0x5e\n"
++    "0x09 0x0039 err:0x5e\n";
++
++/* the text's lines -> ovr / trg / strips (replaces the previous load) */
++static void
++policy_parse(const char *text, size_t len, const char *src)
++{
++	int n = 0, bad = 0, ln = 0;
++	ntrg = 0;
++	nstrip = 0;
++	pol_dlen = 0;
++	pol_tlen = 0;
++	for (size_t at = 0; at < len && n < NOVR;) {
++		size_t e = at;
++		while (e < len && text[e] != '\n' && text[e] != 0) {
++			e++;
++		}
++		size_t l = e - at < sizeof(B->line) - 1 ? e - at : sizeof(B->line) - 1;
++		memcpy(B->line, text + at, l);
++		B->line[l] = 0;
++		at = e + 1;
++		ln++;
++		char *line = B->line;
++		char *h = strchr(line, '#');
++		if (h) {
++			*h = 0;
++		}
++		char w[3][256];
++		int k = split_words(line, w, 3);
++		if (k >= 1 && !strcmp(w[0], "on")) {
++			bad += parse_trigger(line, ln) != 0;
++			continue;
++		}
++		if (k >= 1 && !strcmp(w[0], "strip")) {
++			bad += parse_strip(line, ln) != 0;
++			continue;
++		}
++		if (k != 3) {
++			continue;
++		}
++		/* the action word may be longer than 255 (resp:<hex>): take it from the line itself */
++		const char *c = line;
++		for (int sk = 0; sk < 2; sk++) {
++			while (*c && is_space(*c)) {
++				c++;
++			}
++			while (*c && !is_space(*c)) {
++				c++;
++			}
++		}
++		while (*c && is_space(*c)) {
++			c++;
++		}
++		char *ce = __DECONST(char *, c);
++		while (*ce && !is_space(*ce)) {
++			ce++;
++		}
++		*ce = 0;
++		struct pol p = { 0, POL_ANY, ACT_ERR, POL_ABPERR, "conf", 0 };
++		const uint8_t *pdata = NULL;
++		const char *ptmpl = NULL;
++		uint16_t pdlen = 0;
++		if (parse_num(w[0], &p.svc) || p.svc < 1 || p.svc > 255 || (strcmp(w[1], "*") && parse_num(w[1], &p.msg))) {
++			LOG("policy %s line %d: bad svc/msg\n", src, ln);
++			bad++;
++			continue;
++		}
++		if (!strcmp(c, "fwd")) {
++			p.act = ACT_FWD;
++		} else if (!strcmp(c, "ok")) {
++			p.act = ACT_OK;
++		} else if (!strcmp(c, "drop")) {
++			p.act = ACT_DROP;
++		} else if (!strncmp(c, "err:", 4) && !parse_num(c + 4, &p.err)) {
++			p.act = ACT_ERR;
++		} else if (!strcmp(c, "err")) {
++			p.act = ACT_ERR;
++		} else if (!strncmp(c, "resp:", 5) && strchr(c + 5, '{') && (ptmpl = parse_tmpl(c + 5)) != NULL) {
++			p.act = ACT_RESP;
++		} else if (!strncmp(c, "resp:", 5) && (pdata = parse_hex(c + 5, &pdlen)) != NULL && tlvs_ok(pdata, pdlen)) {
++			p.act = ACT_RESP;
++		} else {
++			LOG("policy %s line %d: bad action (fwd | ok | err:<code> | drop | resp:<hex TLVs>)\n", src, ln);
++			bad++;
++			continue;
++		}
++		ovr_data[n].data = pdata;
++		ovr_data[n].dlen = pdlen;
++		ovr_data[n].tmpl = ptmpl;
++		ovr[n++] = p;
++	}
++	novr = n;
++	nseen = 0;
++	LOG("policy %s: %d override line(s), %d trigger line(s), %d strip line(s)%s, decisions logged again\n", src, n, ntrg,
++	    nstrip, bad ? " (some lines refused)" : "");
++}
++
++/* policy sources: pushed text (sysctl) > the file > the built-in default */
++enum { SRC_DEFAULT, SRC_FILE, SRC_PUSHED };
++static int pol_src = -1;
++static int64_t file_mtime = -1, file_size = -1;
++static LCK_GRP_DECLARE(qmux_grp, "sweet-qmux");
++static LCK_MTX_DECLARE(push_lock, &qmux_grp);
++static char *push_text;                 /* pending text written to kern.sweet_qmi_policy (NULL none) */
++static size_t push_len;
++static bool push_pending, push_clear;
++static bool have_pushed;
++
++/* read the policy file if it changed; 1 = loaded, 0 = unchanged, -1 = absent */
++static int
++policy_file_check(bool force)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int left = 0;
++	if (rootvnode == NULLVP || vnode_lookup(POLICY_PATH, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	VATTR_WANTED(&va, va_modify_time);
++	if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size > POLICY_MAX) {
++		vnode_put(vp);
++		return -1;
++	}
++	int64_t mt = (int64_t)va.va_modify_time.tv_sec, sz = (int64_t)va.va_data_size;
++	if (!force && pol_src == SRC_FILE && mt == file_mtime && sz == file_size) {
++		vnode_put(vp);
++		return 0;
++	}
++	size_t n = (size_t)sz;
++	char *buf = kalloc_data(n + 1, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		vnode_put(vp);
++		return -1;
++	}
++	int e = n ? vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &left,
++	    vfs_context_proc(ctx)) : 0;
++	vnode_put(vp);
++	if (e != 0 || left != 0) {
++		kfree_data(buf, n + 1);
++		LOG("policy %s: read error %d\n", POLICY_PATH, e);
++		return -1;
++	}
++	file_mtime = mt;
++	file_size = sz;
++	pol_src = SRC_FILE;
++	policy_parse(buf, n, "/var/local/abp-policy.conf");
++	kfree_data(buf, n + 1);
++	return 1;
++}
++
++static void
++policy_poll(bool force)
++{
++	lck_mtx_lock(&push_lock);
++	char *t = push_pending ? push_text : NULL;
++	size_t tl = push_len;
++	bool clear = push_clear;
++	if (push_pending) {
++		push_text = NULL;
++		push_len = 0;
++		push_pending = false;
++		push_clear = false;
++	}
++	lck_mtx_unlock(&push_lock);
++	if (t) {
++		pol_src = SRC_PUSHED;
++		have_pushed = true;
++		policy_parse(t, tl, "kern.sweet_qmi_policy");
++		kfree_data(t, tl + 1);
++		return;
++	}
++	if (clear) {
++		have_pushed = false;
++		force = true;
++		LOG("policy: pushed text forgotten\n");
++	}
++	if (have_pushed) {
++		return;
++	}
++	int r = policy_file && rootvnode != NULLVP ? policy_file_check(force) : -1;
++	if (r < 0 && (pol_src != SRC_DEFAULT || force)) {
++		pol_src = SRC_DEFAULT;
++		file_mtime = file_size = -1;
++		policy_parse(policy_default, sizeof(policy_default) - 1, "built-in default (abp-policy.voice.conf)");
++	}
++}
++
++static const uint8_t *dec_data;
++static uint16_t dec_dlen;
++static const char *dec_tmpl;
++static int dec_rate;                    /* index into rules_o1 of a rate-limited forward, else -1 */
++
++/* the action for (svc, msg) with the request's TLVs (rq may be NULL: replay GETs); *err the code, why for the log */
++static int
++decide(unsigned svc, unsigned msg, const uint8_t *rq, uint32_t rqn, int *err, char *whybuf, size_t wl)
++{
++	const struct pol *p = NULL;
++	const struct pol *tab = qmi_rules == 1 ? rules_o1 : rules_p2;
++	size_t ntab = qmi_rules == 1 ? sizeof(rules_o1) / sizeof(rules_o1[0]) : sizeof(rules_p2) / sizeof(rules_p2[0]);
++	int a, from_conf = 0;
++	*err = err_code;
++	dec_rate = -1;
++	for (int i = 0; i < novr && !p; i++) {
++		if (ovr[i].svc == (int)svc && ovr[i].msg == (int)msg) {
++			p = &ovr[i];
++		}
++	}
++	for (int i = 0; i < novr && !p; i++) {
++		if (ovr[i].svc == (int)svc && ovr[i].msg == POL_ANY) {
++			p = &ovr[i];
++		}
++	}
++	from_conf = p != NULL;
++	if (qmi_filter != 0) {
++		for (size_t i = 0; i < ntab && !p; i++) {
++			if (tab[i].svc == (int)svc && tab[i].msg == (int)msg) {
++				p = &tab[i];
++			}
++		}
++		for (size_t i = 0; i < ntab && !p; i++) {
++			if (tab[i].svc == (int)svc && tab[i].msg == POL_ANY) {
++				p = &tab[i];
++			}
++		}
++	}
++	dec_data = NULL;
++	dec_dlen = 0;
++	dec_tmpl = NULL;
++	if (p) {
++		a = p->act;
++		if (from_conf) {
++			dec_data = ovr_data[p - ovr].data;
++			dec_dlen = ovr_data[p - ovr].dlen;
++			dec_tmpl = ovr_data[p - ovr].tmpl;
++		} else if (p->rate_ms && tab == rules_o1) {
++			dec_rate = (int)(p - rules_o1);
++		}
++		if (p->err != POL_ABPERR) {
++			*err = p->err;
++		}
++		snprintf(whybuf, wl, "%s%s", from_conf ? "conf " : "", p->why);
++	} else if (svc >= 0xe0) {
++		a = ACT_ERR;
++		snprintf(whybuf, wl, "Apple-only service");
++	} else {
++		a = ACT_FWD;
++		snprintf(whybuf, wl, "standard service%s", qmi_filter == 0 ? " (filter 0: pass)" : "");
++	}
++	/* DMS operating mode with the option-1 list: reset (mode 4) stays emulated here (bbreset), others go to the modem */
++	if (a == ACT_FWD && !from_conf && svc == 0x02 && msg == 0x002e && qmi_rules == 1) {
++		uint32_t l = 0;
++		const uint8_t *m = rq ? tlv_find(rq, rqn, 0x01, &l) : NULL;
++		if (m && l >= 1 && m[0] == 4) {
++			a = ACT_OK;
++			snprintf(whybuf, wl, "DMS set operating mode reset: emulated here (radio-only soft reset)");
++		}
++	}
++	const char *fw = NULL;
++	if (a == ACT_FWD && svc >= 0xe0) {
++		a = ACT_ERR;
++		*err = err_code;
++		snprintf(whybuf, wl, "Apple-only service: never forwarded");
++	} else if (a == ACT_FWD && msg >= 0x5500) {
++		a = ACT_ERR;
++		*err = err_code;
++		snprintf(whybuf, wl, "Apple message id: never forwarded");
++	} else if (a == ACT_FWD && hard_floor(svc, msg, rq, rqn, &fw)) {
++		a = ACT_ERR;
++		*err = err_code;
++		cnt.floor++;
++		snprintf(whybuf, wl, "%s", fw);
++	} else if (a == ACT_FWD && srv_find(svc) < 0) {
++		a = ACT_ERR;
++		*err = err_code;
++		snprintf(whybuf, wl, "no modem server for svc 0x%02x", svc);
++	}
++	return a;
++}
++
++/* ---- logging ---- */
++
++static void
++hexline(char *out, size_t outlen, const uint8_t *p, uint32_t n)
++{
++	size_t o = 0;
++	out[0] = 0;
++	for (uint32_t i = 0; i < n && o + 4 < outlen; i++) {
++		o += (size_t)snprintf(out + o, outlen - o, "%02x%s", p[i], (i + 1) % 4 == 0 && i + 1 < n ? " " : "");
++	}
++}
++
++static void
++note_seen(unsigned svc, unsigned msg, const char *act, const char *why)
++{
++	for (unsigned i = 0; i < nseen; i++) {
++		if (seen[i].svc == svc && seen[i].msg == msg) {
++			return;
++		}
++	}
++	if (nseen < sizeof(seen) / sizeof(seen[0])) {
++		seen[nseen].svc = (uint8_t)svc;
++		seen[nseen].msg = (uint16_t)msg;
++		nseen++;
++	}
++	LOG("NEW #%u %s/%u svc 0x%02x %s msg 0x%04x%s%s -> %s (%s)\n", nseen, pipe_name[cur_pipe], cur_sess, svc, svc_name(svc),
++	    msg, svc == 0 ? " " : "", svc == 0 ? ctl_name(msg) : "", act, why);
++}
++
++/* a copy of frame f with the SIM identity overwritten by 0xee (for logs) */
++static const uint8_t *
++redact(const uint8_t *f, uint32_t n)
++{
++	uint8_t *rb = B->red_buf;
++	if ((!simid.have_iccid && !simid.have_imsi) || n > sizeof(B->red_buf)) {
++		return f;
++	}
++	memcpy(rb, f, n);
++	const uint8_t *pat[4] = { simid.iccid, simid.iccid_ef, simid.imsi, simid.imsi_ef + 1 };
++	const uint32_t pl[4] = { SIM_ICCID_LEN, SIM_ICCID_LEN, SIM_IMSI_LEN - 1, 8 };
++	const int son[4] = { simid.have_iccid, simid.have_iccid, simid.have_imsi, simid.have_imsi };
++	for (int k = 0; k < 4; k++) {
++		for (uint32_t i = 0; son[k] && i + pl[k] <= n; i++) {
++			if (!memcmp(rb + i, pat[k], pl[k])) {
++				memset(rb + i, 0xee, pl[k]);
++			}
++		}
++	}
++	return rb;
++}
++
++/* kern.sweet_qmi_filter 2: every frame, first 64 bytes, redacted */
++static void
++log_frame(unsigned pipe, uint32_t sess, const char *dir, const uint8_t *f, uint32_t n)
++{
++	char h[3 * 64 + 8];
++	if (qmi_filter < 2) {
++		return;
++	}
++	f = redact(f, n);
++	hexline(h, sizeof(h), f, n < 64 ? n : 64);
++	LOG("%s/%u %s len %u: %s%s\n", pipe < NPIPES ? pipe_name[pipe] : "?", sess, dir, n, h, n > 64 ? ".." : "");
++}
++
++/* ---- to CommCenter ---- */
++
++static int
++send_to(unsigned pipe, uint32_t sess, const uint8_t *f, uint32_t n)
++{
++	if (n > ABP_MAXFRAME) {
++		return -1;
++	}
++	log_frame(pipe, sess, "->CC", f, n);
++	nframes_out++;
++	int e = SweetABPDeliver(pipe, sess, f, n);
++	if (e) {
++		static unsigned told;
++		if (told++ < 20) {
++			LOG("deliver to %s/%u (%u bytes) failed: %d\n", pipe < NPIPES ? pipe_name[pipe] : "?", sess, n, e);
++		}
++		return -1;
++	}
++	return 0;
++}
++
++static int
++send_frame(unsigned pipe, const uint8_t *f, uint32_t n)
++{
++	return send_to(pipe, cur_sess, f, n);
++}
++
++/* ---- NAS hold until BSP activation (n12z) ---- */
++
++static int gate_set;
++static uint64_t gate_at;
++static uint32_t gate_pipe, gate_sess;
++static unsigned held_cnt, held_rel_bsp, held_rel_to, held_drop;
++
++static int
++sess_live(uint32_t pipe, uint32_t sess)
++{
++	for (unsigned i = 0; i < NSESS; i++) {
++		if (B->st[i].sess && B->st[i].sess == sess && B->st[i].pipe == pipe) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int
++hold_gate_open(void)
++{
++	if (gate_set && !sess_live(gate_pipe, gate_sess)) {
++		gate_set = 0;
++		gate_at = 0;
++		LOG("holdnas: gate closed (session %s/%u ended): NAS indications held until the next BSP activation\n",
++		    gate_pipe < NPIPES ? pipe_name[gate_pipe] : "?", gate_sess);
++	}
++	return gate_set && sbb_ms() >= gate_at;
++}
++
++static int cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid);
++
++static void
++hold_release(int k, const char *why)
++{
++	int sent = 0, gone = 0;
++	if (k > nhold) {
++		k = nhold;
++	}
++	for (int i = 0; i < k; i++) {
++		struct hold *h = &B->holdq[i];
++		if (cid_live(h->pipe, h->sess, h->svc, h->cid)) {
++			send_to(h->pipe, h->sess, h->f, h->n);
++			sent++;
++		} else {
++			gone++;
++			held_drop++;
++		}
++	}
++	memmove(B->holdq, B->holdq + k, sizeof(B->holdq[0]) * (size_t)(nhold - k));
++	nhold -= k;
++	if (sent || gone) {
++		LOG("holdnas: released %d held NAS indication(s) (%s), %d client(s) gone\n", sent, why, gone);
++	}
++}
++
++static void
++hold_open(uint32_t pipe, uint32_t sess, int dly, const char *why)
++{
++	if (!gate_set || gate_pipe != pipe || gate_sess != sess) {
++		LOG("holdnas: gate open on %s/%u in %d ms (%s), %d held\n", pipe < NPIPES ? pipe_name[pipe] : "?", sess, dly, why, nhold);
++	} else {
++		dly = 0;
++	}
++	gate_set = 1;
++	gate_pipe = pipe;
++	gate_sess = sess;
++	gate_at = sbb_ms() + (uint64_t)(dly > 0 ? dly : 0);
++	if (nhold && !dly) {
++		hold_release(nhold, why);
++	}
++}
++
++static int
++hold_frame(uint32_t pipe, uint32_t sess, const uint8_t *f, uint32_t n)
++{
++	if (!holdnas || n < 13 || n > HOLD_MAXF || f[4] != 0x03 || f[6] != 0x04 || hold_gate_open()) {
++		return 0;
++	}
++	if (nhold == NHOLD) {
++		hold_release(1, "queue full");
++	}
++	struct hold *h = &B->holdq[nhold++];
++	h->used = 1;
++	h->pipe = pipe;
++	h->sess = sess;
++	h->svc = f[4];
++	h->cid = f[5];
++	h->msg = (uint16_t)(f[9] | (f[10] << 8));
++	h->n = n;
++	h->t = sbb_ms();
++	memcpy(h->f, f, n);
++	held_cnt++;
++	LOG("holdnas: NAS indication 0x%04x to %s/%u cid %u held (no BSP activation yet; %d held)\n", h->msg,
++	    pipe < NPIPES ? pipe_name[pipe] : "?", sess, h->cid, nhold);
++	return 1;
++}
++
++static void
++hold_poll(uint64_t now)
++{
++	uint64_t to = holdnas >= 100 ? (uint64_t)holdnas : 5000;
++	if (!nhold) {
++		return;
++	}
++	if (!holdnas) {
++		hold_release(nhold, "holdnas=0");
++		return;
++	}
++	if (hold_gate_open()) {
++		hold_release(nhold, "gate open");
++		return;
++	}
++	if (now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
++		held_rel_to++;
++		hold_open(B->holdq[0].pipe, B->holdq[0].sess, 0, "timeout, no BSP activation");
++	}
++}
++
++static void
++put_tlv(uint8_t *b, uint32_t *o, unsigned t, const void *v, unsigned l)
++{
++	b[(*o)++] = (uint8_t)t;
++	b[(*o)++] = (uint8_t)l;
++	b[(*o)++] = (uint8_t)(l >> 8);
++	memcpy(b + *o, v, l);
++	*o += l;
++}
++
++static void
++finish_qmux(uint8_t *b, uint32_t n, unsigned svc, unsigned cid)
++{
++	b[0] = 0x01;
++	b[1] = (uint8_t)((n - 1) & 0xff);
++	b[2] = (uint8_t)((n - 1) >> 8);
++	b[3] = 0x80;
++	b[4] = (uint8_t)svc;
++	b[5] = (uint8_t)cid;
++}
++
++/* ---- router clients ---- */
++
++static void
++pend_drop_port(uint32_t port)
++{
++	for (int i = 0; i < NPEND; i++) {
++		if (B->pend[i].used && B->pend[i].port == port) {
++			B->pend[i].used = 0;
++		}
++	}
++}
++
++static void
++cl_destroy(struct cl *c, const char *why)
++{
++	if (!c->used) {
++		return;
++	}
++	pend_drop_port(c->port);
++	uint32_t pkt[5] = { SBB_QRTR_DEL_CLIENT, SBB_NODE_APPS, c->port, 0, 0 };
++	sbb_qrtr_send(SBB_QRTR_DEL_CLIENT, c->port, SBB_NODE_BCAST, SBB_PORT_CTRL, pkt, sizeof(pkt));
++	LOG("%s(0x%02x) port %#x given back to the modem (DEL_CLIENT; %s)\n", svc_name(c->svc), c->svc, c->port, why);
++	bzero(c, sizeof(*c));
++}
++
++static void
++cl_free(struct cl *c, const char *why)
++{
++	if (c->used != 1) {
++		return;
++	}
++	if (!reuse) {
++		LOG("%s/%u %s(0x%02x) cid %u port %#x released (%s; %u fwd, %u resp, %u ind)\n", pipe_name[c->pipe], c->sess,
++		    svc_name(c->svc), c->svc, c->cid, c->port, why, c->fwd, c->resp, c->ind);
++		cl_destroy(c, why);
++		return;
++	}
++	pend_drop_port(c->port);
++	c->used = 2;
++	c->pipe = c->sess = 0;
++	c->cid = 0;
++}
++
++static struct cl *
++cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, int create)
++{
++	struct cl *fr = NULL, *idle = NULL, *anyidle = NULL;
++	for (int i = 0; i < NCL; i++) {
++		if (cl[i].used == 1 && cl[i].pipe == pipe && cl[i].sess == sess && cl[i].svc == svc && cl[i].cid == cid) {
++			return &cl[i];
++		}
++		if (!cl[i].used && !fr) {
++			fr = &cl[i];
++		}
++		if (cl[i].used == 2 && cl[i].svc == svc && !idle) {
++			idle = &cl[i];
++		}
++		if (cl[i].used == 2 && !anyidle) {
++			anyidle = &cl[i];
++		}
++	}
++	if (!create) {
++		return NULL;
++	}
++	if (idle && reuse) {
++		idle->used = 1;
++		idle->pipe = pipe;
++		idle->sess = sess;
++		idle->cid = (uint8_t)cid;
++		idle->fwd = idle->resp = idle->ind = 0;
++		return idle;
++	}
++	if (!fr && anyidle) {
++		cl_destroy(anyidle, "table full: oldest idle of another service");
++		fr = anyidle;
++	}
++	if (!fr) {
++		static unsigned told;
++		if (told++ < 5) {
++			LOG("all %d router clients in use: request refused\n", NCL);
++		}
++		return NULL;
++	}
++	uint32_t port = 0;
++	for (unsigned k = 0; k < SBB_QMUX_NPORTS && !port; k++) {
++		uint32_t pt = SBB_QMUX_PORT0 + (next_port_gen++ % SBB_QMUX_NPORTS);
++		int busy = 0;
++		for (int i = 0; i < NCL; i++) {
++			busy |= cl[i].used && cl[i].port == pt;
++		}
++		if (!busy) {
++			port = pt;
++		}
++	}
++	if (!port) {
++		return NULL;
++	}
++	pend_drop_port(port);
++	bzero(fr, sizeof(*fr));
++	fr->used = 1;
++	fr->pipe = pipe;
++	fr->sess = sess;
++	fr->svc = (uint8_t)svc;
++	fr->cid = (uint8_t)cid;
++	fr->port = port;
++	int s = srv_find(svc);
++	LOG("%s/%u %s(0x%02x) cid %u -> QRTR port %#x -> modem %u:%x\n", pipe_name[pipe], sess, svc_name(svc), svc, cid, port,
++	    s >= 0 ? srv[s].node : 0, s >= 0 ? srv[s].port : 0);
++	return fr;
++}
++
++static void
++cl_free_sess(uint32_t pipe, uint32_t sess, const char *why)
++{
++	unsigned n = 0;
++	for (int i = 0; i < NCL; i++) {
++		if (cl[i].used == 1 && cl[i].pipe == pipe && cl[i].sess == sess) {
++			cl_free(&cl[i], why);
++			n++;
++		}
++	}
++	if (n && reuse) {
++		LOG("%s/%u: %u router client(s) to the idle pool (%s)\n", pipe < NPIPES ? pipe_name[pipe] : "?", sess, n, why);
++	}
++}
++
++/* ---- CTL ---- */
++
++static uint8_t(*sess_cids(uint32_t pipe, uint32_t sess))[32]
++{
++	unsigned best = 0;
++	for (unsigned i = 0; i < NSESS; i++) {
++		if (B->st[i].sess == sess && B->st[i].pipe == pipe) {
++			return B->st[i].cids;
++		}
++		if (B->st[i].sess < B->st[best].sess) {
++			best = i;
++		}
++	}
++	if (B->st[best].sess) {
++		cl_free_sess(B->st[best].pipe, B->st[best].sess, "session slot reused");
++	}
++	bzero(&B->st[best], sizeof(B->st[best]));
++	B->st[best].pipe = pipe;
++	B->st[best].sess = sess;
++	return B->st[best].cids;
++}
++
++static void
++sess_end(uint32_t pipe, uint32_t sess)
++{
++	for (unsigned i = 0; i < NSESS; i++) {
++		if (B->st[i].sess == sess && B->st[i].pipe == pipe) {
++			bzero(&B->st[i], sizeof(B->st[i]));
++		}
++	}
++	cl_free_sess(pipe, sess, "session closed");
++}
++
++static int
++cid_alloc(unsigned svc)
++{
++	uint8_t(*cids)[32] = sess_cids(cur_pipe, cur_sess);
++	for (unsigned c = 1; c < 255; c++) {
++		if (!(cids[svc][c / 8] & (1u << (c % 8)))) {
++			cids[svc][c / 8] |= (uint8_t)(1u << (c % 8));
++			return (int)c;
++		}
++	}
++	return -1;
++}
++
++static uint32_t
++version_list(uint8_t *v, uint32_t max)
++{
++	static const uint8_t fixed[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x09, 0x0a, 0x0b, 0x0c, 0x1a, 0x22, 0x24, 0x2a, 0x2b, 0x30 };
++	uint8_t list[128];
++	unsigned n = 0;
++	list[n++] = 0x00;
++	for (unsigned s = 1; s < 0xe0 && n < sizeof(list); s++) {
++		if (srv_find(s) >= 0) {
++			list[n++] = (uint8_t)s;
++		}
++	}
++	if (n <= 1) {
++		memcpy(list, fixed, sizeof(fixed));
++		n = sizeof(fixed);
++	}
++	if (1 + n * 5 > max) {
++		n = (max - 1) / 5;
++	}
++	v[0] = (uint8_t)n;
++	for (unsigned i = 0; i < n; i++) {
++		v[1 + i * 5] = list[i];
++		v[2 + i * 5] = 1;
++		v[3 + i * 5] = 0;
++		v[4 + i * 5] = 0x40;
++		v[5 + i * 5] = 0;
++	}
++	return 1 + n * 5;
++}
++
++static void
++ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
++{
++	unsigned tx = s[1], msg = s[2] | (s[3] << 8), ml = s[4] | (s[5] << 8);
++	const uint8_t *tl = s + 6;
++	uint32_t tn = sn - 6 < ml ? sn - 6 : ml;
++	uint8_t b[1024];
++	uint32_t o = 12;
++	uint16_t res[2] = { 0, 0 };
++	int req_svc = -1;
++	note_seen(0, msg, "local", "CTL");
++	for (uint32_t i = 0; i + 3 <= tn;) {
++		unsigned t = tl[i], l = tl[i + 1] | (tl[i + 2] << 8);
++		if (t == 0x01 && l >= 1 && i + 3 + l <= tn) {
++			req_svc = tl[i + 3];
++		}
++		if (t == 0x01 && msg == 0x23 && l >= 2 && i + 3 + l <= tn) {
++			unsigned sv = tl[i + 3], c = tl[i + 4];
++			sess_cids(cur_pipe, cur_sess)[sv][c / 8] &= (uint8_t) ~(1u << (c % 8));
++			struct cl *k = cl_get(cur_pipe, cur_sess, sv, c, 0);
++			if (k) {
++				cl_free(k, "ReleaseClientId");
++			}
++		}
++		i += 3 + l;
++	}
++	if (msg == 0x22) {
++		int c = -1, e = 0;
++		int local_svc = 0;
++		for (int i = 0; i < novr; i++) {
++			if (ovr[i].svc == req_svc && ovr[i].msg == POL_ANY && ovr[i].act != ACT_FWD) {
++				local_svc = 1;
++			}
++		}
++		if (req_svc > 0 && req_svc < 0xe0 && cidfail && !local_svc && srv_find((unsigned)req_svc) < 0) {
++			e = QMI_ERR_INVALID_SERVICE_TYPE;
++		} else {
++			c = req_svc >= 0 ? cid_alloc((unsigned)req_svc) : -1;
++		}
++		if (c < 0) {
++			res[0] = 1;
++			res[1] = (uint16_t)(e ? e : QMI_ERR_CLIENT_IDS_EXHAUSTED);
++			put_tlv(b, &o, 0x02, res, 4);
++			LOG("%s/%u GetClientId %s(0x%02x) refused (error 0x%x)\n", pipe_name[pipe], cur_sess, svc_name((unsigned)req_svc),
++			    req_svc, res[1]);
++		} else {
++			put_tlv(b, &o, 0x02, res, 4);
++			uint8_t v[2] = { (uint8_t)req_svc, (uint8_t)c };
++			put_tlv(b, &o, 0x01, v, 2);
++		}
++	} else if (msg == 0x23) {
++		put_tlv(b, &o, 0x02, res, 4);
++		for (uint32_t i = 0; i + 3 <= tn;) {
++			unsigned t = tl[i], l = tl[i + 1] | (tl[i + 2] << 8);
++			if (t == 0x01 && l == 2 && i + 5 <= tn) {
++				put_tlv(b, &o, 0x01, tl + i + 3, 2);
++			}
++			i += 3 + l;
++		}
++	} else if (msg == 0x21) {
++		uint8_t v[1 + 128 * 5];
++		uint32_t vl = version_list(v, (uint32_t)(sizeof(b) - 40 < sizeof(v) ? sizeof(b) - 40 : sizeof(v)));
++		put_tlv(b, &o, 0x02, res, 4);
++		put_tlv(b, &o, 0x01, v, vl);
++	} else if (msg == 0x26) {
++		put_tlv(b, &o, 0x02, res, 4);
++		for (uint32_t i = 0; i + 3 <= tn;) {
++			unsigned t = tl[i], l = tl[i + 1] | (tl[i + 2] << 8);
++			if (t == 0x10 && i + 3 + l <= tn && l <= 4) {
++				put_tlv(b, &o, 0x10, tl + i + 3, l);
++			}
++			i += 3 + l;
++		}
++	} else if (msg == 0x27) {
++		put_tlv(b, &o, 0x02, res, 4);
++		for (unsigned i = 0; i < NSESS; i++) {
++			if (B->st[i].sess == cur_sess && B->st[i].pipe == cur_pipe) {
++				bzero(B->st[i].cids, sizeof(B->st[i].cids));
++			}
++		}
++		cl_free_sess(cur_pipe, cur_sess, "CTL Sync");
++	} else {
++		put_tlv(b, &o, 0x02, res, 4);
++	}
++	b[6] = 0x01;
++	b[7] = (uint8_t)tx;
++	b[8] = (uint8_t)msg;
++	b[9] = (uint8_t)(msg >> 8);
++	b[10] = (uint8_t)((o - 12) & 0xff);
++	b[11] = (uint8_t)((o - 12) >> 8);
++	finish_qmux(b, o, 0, 0);
++	send_frame(pipe, b, o);
++}
++
++static void
++svc_local_tlv(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail, int code, const uint8_t *tl, uint16_t tn)
++{
++	struct mst *m = mst_get(svc, (unsigned)(s[3] | (s[4] << 8)));
++	if (m) {
++		if (fail) {
++			m->err++;
++			m->last_err = (uint16_t)code;
++		} else {
++			m->ok++;
++		}
++		mst_dirty = 1;
++	}
++	if (fail) {
++		svc_cnt[svc & 0xff].denied++;
++	} else {
++		svc_cnt[svc & 0xff].local++;
++	}
++	uint8_t *b = B->loc_buf;
++	uint32_t o = 13;
++	uint16_t res[2] = { (uint16_t)(fail ? 1 : 0), (uint16_t)(fail ? code : 0) };
++	put_tlv(b, &o, 0x02, res, 4);
++	if (!fail && tl && tn && o + tn <= sizeof(B->loc_buf)) {
++		memcpy(b + o, tl, tn);
++		o += tn;
++	}
++	b[6] = 0x02;
++	b[7] = s[1];
++	b[8] = s[2];
++	b[9] = s[3];
++	b[10] = s[4];
++	b[11] = (uint8_t)((o - 13) & 0xff);
++	b[12] = (uint8_t)((o - 13) >> 8);
++	finish_qmux(b, o, svc, cid);
++	send_frame(pipe, b, o);
++}
++
++static void
++svc_local(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail, int code)
++{
++	svc_local_tlv(pipe, svc, cid, s, fail, code, NULL, 0);
++}
++
++static void
++send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn)
++{
++	static uint16_t itx = 1;
++	uint8_t *b = B->ind_buf;
++	if (13 + tn > sizeof(B->ind_buf)) {
++		return;
++	}
++	b[6] = 0x04;
++	b[7] = (uint8_t)itx;
++	b[8] = (uint8_t)(itx >> 8);
++	itx = (uint16_t)(itx + 1 ? itx + 1 : 1);
++	b[9] = (uint8_t)msg;
++	b[10] = (uint8_t)(msg >> 8);
++	b[11] = (uint8_t)(tn & 0xff);
++	b[12] = (uint8_t)(tn >> 8);
++	if (tn) {
++		memmove(b + 13, tl, tn);
++	}
++	finish_qmux(b, 13 + tn, svc, cid);
++	if (hold_frame(pipe, sess, b, 13 + tn)) {
++		return;
++	}
++	send_to(pipe, sess, b, 13 + tn);
++	if (holdnas && svc == 0xe2 && msg == 0xb00c) {
++		if (nhold) {
++			held_rel_bsp++;
++		}
++		hold_open(pipe, sess, holddly, "BSP activation 0xb00c sent");
++	}
++}
++
++static void
++pend_add(struct pend *x)
++{
++	int slot = -1;
++	uint64_t oldest = ~0ull;
++	for (int i = 0; i < NPEND; i++) {
++		if (!B->pend[i].used) {
++			slot = i;
++			break;
++		}
++		if (B->pend[i].t < oldest) {
++			oldest = B->pend[i].t;
++			slot = i;
++		}
++	}
++	B->pend[slot] = *x;
++	B->pend[slot].used = 1;
++	B->pend[slot].t = sbb_ms();
++}
++
++static int
++tlv_byte(const uint8_t *p, uint32_t n, unsigned id)
++{
++	for (uint32_t k = 0; k + 3 <= n;) {
++		unsigned l = (unsigned)(p[k + 1] | (p[k + 2] << 8));
++		if (k + 3 + l > n) {
++			return -1;
++		}
++		if (p[k] == id) {
++			return l ? p[k + 3] : -1;
++		}
++		k += 3 + l;
++	}
++	return -1;
++}
++
++/* ---- SIM identity subscribers ---- */
++
++#define NSUB    8
++static struct sub {
++	int used, pending;
++	uint32_t pipe, sess;
++	uint8_t svc, cid;
++	uint16_t msg, m2;
++	uint8_t rqn, rq[96];
++	uint64_t t;
++} subs[NSUB];
++
++static int
++cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid)
++{
++	for (unsigned i = 0; i < NSESS; i++) {
++		if (B->st[i].sess && B->st[i].sess == sess && B->st[i].pipe == pipe) {
++			return (B->st[i].cids[svc & 0xff][(cid & 0xff) / 8] >> (cid % 8)) & 1;
++		}
++	}
++	return 0;
++}
++
++static void
++sub_note(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, unsigned m2, const uint8_t *rq, uint32_t rqn, int pending)
++{
++	int k = -1;
++	for (int i = 0; i < NSUB; i++) {
++		if (subs[i].used && subs[i].pipe == pipe && subs[i].sess == sess && subs[i].svc == svc && subs[i].cid == cid &&
++		    subs[i].msg == msg && subs[i].m2 == m2) {
++			k = i;
++		}
++	}
++	for (int i = 0; i < NSUB && k < 0; i++) {
++		if (!subs[i].used || !cid_live(subs[i].pipe, subs[i].sess, subs[i].svc, subs[i].cid)) {
++			k = i;
++		}
++	}
++	if (k < 0) {
++		k = 0;
++		for (int i = 1; i < NSUB; i++) {
++			if (subs[i].t < subs[k].t) {
++				k = i;
++			}
++		}
++	}
++	struct sub *s = &subs[k];
++	s->used = 1;
++	s->pending = pending;
++	s->pipe = pipe;
++	s->sess = sess;
++	s->svc = (uint8_t)svc;
++	s->cid = (uint8_t)cid;
++	s->msg = (uint16_t)msg;
++	s->m2 = (uint16_t)m2;
++	s->rqn = (uint8_t)(rqn < sizeof(s->rq) ? rqn : sizeof(s->rq));
++	if (rq && s->rqn) {
++		memcpy(s->rq, rq, s->rqn);
++	}
++	s->t = sbb_ms();
++}
++
++static int
++trg_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const struct trg *t, const uint8_t *rq, uint32_t rqn,
++    const char *why)
++{
++	uint8_t *xb = B->trg_buf;
++	if (t->tosvc) {
++		const uint8_t *tl = t->data;
++		uint32_t tn = t->dlen;
++		int miss = 0;
++		if (t->tmpl) {
++			int n = tmpl_expand(t->tmpl, rq, rqn, 0, xb, sizeof(B->trg_buf), &miss);
++			if (n < 0 || miss || !tlvs_ok(xb, (uint32_t)n)) {
++				return -1;
++			}
++			tl = xb;
++			tn = (uint32_t)n;
++		}
++		unsigned sent = 0;
++		for (unsigned i = 0; i < NSESS; i++) {
++			if (!B->st[i].sess) {
++				continue;
++			}
++			for (unsigned c = 1; c < 255; c++) {
++				if ((B->st[i].cids[t->tosvc][c / 8] >> (c % 8)) & 1) {
++					send_ind(B->st[i].pipe, B->st[i].sess, (unsigned)t->tosvc, c, t->m2, tl, tn);
++					sent++;
++				}
++			}
++		}
++		synth_inds += sent;
++		LOG("on %s(0x%02x) 0x%04x: indication %s(0x%02x) 0x%04x (%u TLV bytes) to %u client(s)\n", svc_name(svc), svc, msg,
++		    svc_name((unsigned)t->tosvc), t->tosvc, t->m2, tn, sent);
++		return sent ? 0 : -1;
++	}
++	if (!t->tmpl) {
++		synth_inds++;
++		LOG("on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", svc_name(svc), svc, msg, t->m2, t->dlen,
++		    pipe_name[pipe], sess, cid);
++		send_ind(pipe, sess, svc, cid, t->m2, t->data, t->dlen);
++		return 0;
++	}
++	int miss = 0, n = tmpl_expand(t->tmpl, rq, rqn, 0, xb, sizeof(B->trg_buf), &miss);
++	if (n < 0 || !tlvs_ok(xb, (uint32_t)n)) {
++		LOG("on %s(0x%02x) 0x%04x: indication 0x%04x not sent (%s)\n", svc_name(svc), svc, msg, t->m2,
++		    n == -2 ? "the request lacks a template field" : "template does not expand to whole TLVs");
++		return -1;
++	}
++	if (tmpl_sim(t->tmpl)) {
++		sub_note(pipe, sess, svc, cid, msg, t->m2, rq, rqn, miss);
++	}
++	if (miss) {
++		LOG("on %s(0x%02x) 0x%04x: indication 0x%04x to %s/%u cid %u deferred: SIM identity not read yet (ICCID %s, IMSI %s)\n",
++		    svc_name(svc), svc, msg, t->m2, pipe_name[pipe], sess, cid, simid.have_iccid ? "known" : "unknown",
++		    simid.have_imsi ? "known" : "unknown");
++		return 1;
++	}
++	synth_inds++;
++	LOG("on %s(0x%02x) 0x%04x: indication 0x%04x (%d TLV bytes, template%s%s) to %s/%u cid %u\n", svc_name(svc), svc, msg, t->m2, n,
++	    tmpl_sim(t->tmpl) ? " with the SIM identity" : "", why, pipe_name[pipe], sess, cid);
++	send_ind(pipe, sess, svc, cid, t->m2, xb, (uint32_t)n);
++	return 0;
++}
++
++static void
++simid_changed(void)
++{
++	for (int i = 0; i < NSUB; i++) {
++		struct sub *s = &subs[i];
++		if (!s->used) {
++			continue;
++		}
++		if (!cid_live(s->pipe, s->sess, s->svc, s->cid)) {
++			s->used = 0;
++			continue;
++		}
++		for (int k = 0; k < ntrg; k++) {
++			if (trg[k].kind == TRG_IND && trg[k].svc == s->svc && trg[k].msg == s->msg && trg[k].m2 == s->m2 && trg[k].tmpl) {
++				trg_ind(s->pipe, s->sess, s->svc, s->cid, s->msg, &trg[k], s->rq, s->rqn, ", SIM identity changed");
++				break;
++			}
++		}
++	}
++}
++
++/* a successful UIM Read Transparent answer's TLVs for EF file: the identity (values never logged) */
++static void
++simid_from_read(unsigned file, const uint8_t *tl, uint32_t tn, const char *src)
++{
++	uint32_t l = 0;
++	const uint8_t *v = tlv_find(tl, tn, 0x11, &l);
++	if (!v || l < 2 || (uint32_t)(v[0] | (v[1] << 8)) + 2 > l) {
++		return;
++	}
++	uint32_t clen = (uint32_t)(v[0] | (v[1] << 8));
++	const uint8_t *ef = v + 2;
++	uint8_t val[SIM_ICCID_LEN];
++	int ic;
++	if (file == 0x2fe2) {
++		if (clen != SIM_ICCID_LEN) {
++			return;
++		}
++		for (uint32_t i = 0; i < SIM_ICCID_LEN; i++) {
++			val[i] = (uint8_t)(ef[i] << 4 | ef[i] >> 4);
++		}
++		ic = 1;
++	} else if (file == 0x6f07) {
++		uint8_t dg[16];
++		uint32_t nd = 0;
++		if (clen < 2 || !ef[0] || ef[0] > 8 || clen < 1u + ef[0]) {
++			return;
++		}
++		for (uint32_t i = 1; i <= ef[0]; i++) {
++			uint8_t lo = ef[i] & 0xf, hi = ef[i] >> 4;
++			if (i > 1) {
++				if (lo > 9) {
++					break;
++				}
++				dg[nd++] = lo;
++			}
++			if (hi > 9) {
++				break;
++			}
++			dg[nd++] = hi;
++		}
++		if (nd < 6 || nd > 15) {
++			return;
++		}
++		for (uint32_t i = 0; i < SIM_IMSI_LEN; i++) {
++			uint8_t a = 2 * i < nd ? dg[2 * i] : 0xf, b = 2 * i + 1 < nd ? dg[2 * i + 1] : 0xf;
++			val[i] = (uint8_t)(a << 4 | b);
++		}
++		ic = 0;
++	} else {
++		return;
++	}
++	if (ic) {
++		memcpy(simid.iccid_ef, ef, SIM_ICCID_LEN);
++	} else {
++		memcpy(simid.imsi_ef, ef, clen < 9 ? clen : 9);
++	}
++	uint8_t *have = ic ? simid.iccid : simid.imsi;
++	int *known = ic ? &simid.have_iccid : &simid.have_imsi;
++	uint32_t len = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
++	int changed = !*known || memcmp(have, val, len);
++	if (changed) {
++		LOG("SIM identity: %s %u bytes %s (from %s)\n", ic ? "ICCID" : "IMSI", len, *known ? "CHANGED" : "read", src);
++		memcpy(have, val, len);
++		*known = 1;
++		simid.gen++;
++	}
++	bzero(val, sizeof(val));
++	if (simid.have_iccid && simid.have_imsi) {
++		simid.refresh = 0;
++		simid.tries = 0;
++	}
++	if (changed) {
++		simid_changed();
++	}
++}
++
++static void
++simid_read(struct cl *c, int si, unsigned file)
++{
++	static const uint8_t iccid[20] = { 0x01, 2, 0, 0x06, 0x00, 0x02, 5, 0, 0xe2, 0x2f, 2, 0x00, 0x3f, 0x03, 4, 0, 0, 0, 0, 0 };
++	static const uint8_t imsi[22] = { 0x01, 2, 0, 0x00, 0x00, 0x02, 7, 0, 0x07, 0x6f, 4, 0x00, 0x3f, 0xff, 0x7f, 0x03, 4, 0, 0, 0, 0, 0 };
++	const uint8_t *tl = file == 0x2fe2 ? iccid : imsi;
++	uint32_t tn = file == 0x2fe2 ? sizeof(iccid) : sizeof(imsi);
++	uint8_t q[7 + 22];
++	if (++replay_txn == 0xffff) {
++		replay_txn = 0xff00;
++	}
++	q[0] = 0x00;
++	q[1] = (uint8_t)replay_txn;
++	q[2] = (uint8_t)(replay_txn >> 8);
++	q[3] = 0x20;
++	q[4] = 0x00;
++	q[5] = (uint8_t)tn;
++	q[6] = 0;
++	memcpy(q + 7, tl, tn);
++	if (sbb_qrtr_send(SBB_QRTR_DATA, c->port, srv[si].node, srv[si].port, q, 7 + tn)) {
++		cnt.sendfail++;
++		return;
++	}
++	struct pend x;
++	bzero(&x, sizeof(x));
++	x.port = c->port;
++	x.txn = replay_txn;
++	x.msg = 0x20;
++	x.svc = 0x0b;
++	x.simread = 1;
++	x.file = (uint16_t)file;
++	pend_add(&x);
++	simid.reads++;
++}
++
++static void
++simid_poll(uint64_t now)
++{
++	int need = simid.refresh;
++	for (int i = 0; i < NSUB && !need; i++) {
++		if (subs[i].used && subs[i].pending && cid_live(subs[i].pipe, subs[i].sess, subs[i].svc, subs[i].cid)) {
++			need = 1;
++		}
++	}
++	if (!need || now < simid.next) {
++		return;
++	}
++	simid.next = now + 5000;
++	if (simid.refresh && ++simid.tries > 3) {
++		simid.refresh = 0;
++		simid.tries = 0;
++		if (simid.have_iccid && simid.have_imsi) {
++			return;
++		}
++	}
++	int si = srv_find(0x0b), code;
++	char wb[128];
++	if (si < 0 || decide(0x0b, 0x0020, NULL, 0, &code, wb, sizeof(wb)) != ACT_FWD) {
++		return;
++	}
++	struct cl *c = NULL;
++	for (int i = 0; i < NCL && !c; i++) {
++		if (cl[i].used == 1 && cl[i].svc == 0x0b) {
++			c = &cl[i];
++		}
++	}
++	for (int i = 0; i < NCL && !c; i++) {
++		if (cl[i].used == 2 && cl[i].svc == 0x0b) {
++			c = &cl[i];
++		}
++	}
++	if (!c) {
++		return;
++	}
++	LOG("SIM identity: reading EF_ICCID and EF_IMSI (UIM 0x0020 from port %#x)\n", c->port);
++	simid_read(c, si, 0x2fe2);
++	simid_read(c, si, 0x6f07);
++}
++
++/* ---- bbreset (emulated baseband reset for ABM's soft reset; the modem is not touched) ---- */
++
++static uint64_t bbr_unpub_at, bbr_pub_at;
++static unsigned bbresets;
++static int bbr_unpub;
++
++static void
++bbr_publish(int up)
++{
++	if (bbr_unpub) {
++		int e = SweetABPPublish(up != 0, up ? "bbreset: modem back" : "bbreset: modem down");
++		LOG("bbreset: %s the stand-ins (%d, emulated reset #%u)\n", up ? "publish" : "un-publish", e, bbresets);
++	} else {
++		SweetABPBasebandMessage(up ? 0xe3ff8001u : 0xe3ff8000u);
++		LOG("bbreset: AppleBaseband message %s (emulated reset #%u)\n", up ? "alive" : "reset detected", bbresets);
++	}
++}
++
++static void
++bbr_poll(uint64_t now)
++{
++	if (bbr_unpub_at && now >= bbr_unpub_at) {
++		bbr_unpub_at = 0;
++		bbr_publish(0);
++	}
++	if (bbr_pub_at && !bbr_unpub_at && now >= bbr_pub_at) {
++		bbr_pub_at = 0;
++		bbr_publish(1);
++	}
++}
++
++static void
++run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *rq, uint32_t rqn)
++{
++	for (int i = 0; i < ntrg; i++) {
++		struct trg *t = &trg[i];
++		if (t->svc != (int)svc || t->msg != (int)msg) {
++			continue;
++		}
++		if (t->cond >= 0 && tlv_byte(rq, rqn, (unsigned)t->cond) <= 0) {
++			continue;
++		}
++		if (t->ceq) {
++			uint32_t a, b;
++			if (fref_num(&t->fa, rq, rqn, &a) || fref_num(&t->fb, rq, rqn, &b) || a != b) {
++				continue;
++			}
++		}
++		if (t->kind == TRG_IND) {
++			trg_ind(pipe, sess, svc, cid, msg, t, rq, rqn, "");
++			continue;
++		}
++		if (t->kind == TRG_BBRESET) {
++			if (!bbr_unpub_at && !bbr_pub_at) {
++				bbresets++;
++				bbr_unpub = t->m3 == 1;
++				bbr_unpub_at = sbb_ms() + 100;
++				bbr_pub_at = bbr_unpub_at + (t->m2 < 200 ? 200 : t->m2);
++				LOG("on %s(0x%02x) 0x%04x: emulated baseband reset #%u (%s in 100 ms, for %u ms)\n", svc_name(svc), svc, msg,
++				    bbresets, bbr_unpub ? "un-publish" : "reset-detect message", t->m2 < 200 ? 200 : t->m2);
++			}
++			continue;
++		}
++		int code;
++		char wb[128];
++		if (decide(svc, t->m2, NULL, 0, &code, wb, sizeof(wb)) != ACT_FWD || dec_rate >= 0) {
++			LOG("on %s(0x%02x) 0x%04x: replay GET 0x%04x refused (policy: %s)\n", svc_name(svc), svc, msg, t->m2, wb);
++			continue;
++		}
++		int si = srv_find(svc);
++		struct cl *c = cl_get(pipe, sess, svc, cid, 1);
++		if (si < 0 || !c) {
++			continue;
++		}
++		uint8_t q[7] = { 0x00, 0, 0, (uint8_t)t->m2, (uint8_t)(t->m2 >> 8), 0, 0 };
++		struct pend x;
++		bzero(&x, sizeof(x));
++		if (++replay_txn == 0xffff) {
++			replay_txn = 0xff00;
++		}
++		q[1] = (uint8_t)replay_txn;
++		q[2] = (uint8_t)(replay_txn >> 8);
++		x.port = c->port;
++		x.txn = replay_txn;
++		x.msg = t->m2;
++		x.svc = (uint8_t)svc;
++		x.replay = 1;
++		x.rpipe = pipe;
++		x.rsess = sess;
++		x.rcid = (uint8_t)cid;
++		x.ind_msg = t->m3;
++		x.nmap = (uint8_t)t->nmap;
++		memcpy(x.map, t->map, sizeof(x.map));
++		if (sbb_qrtr_send(SBB_QRTR_DATA, c->port, srv[si].node, srv[si].port, q, sizeof(q))) {
++			cnt.sendfail++;
++			continue;
++		}
++		pend_add(&x);
++		replays++;
++		LOG("on %s(0x%02x) 0x%04x: replay GET 0x%04x -> indication 0x%04x for %s/%u cid %u (txn 0x%04x)\n", svc_name(svc), svc, msg,
++		    t->m2, t->m3, pipe_name[pipe], sess, cid, replay_txn);
++	}
++}
++
++static void
++svc_forward(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t sn)
++{
++	int si = srv_find(svc);
++	struct cl *c = si >= 0 ? cl_get(pipe, cur_sess, svc, cid, 1) : NULL;
++	unsigned ml = s[5] | (s[6] << 8);
++	uint32_t len = 7 + (ml < sn - 7 ? ml : sn - 7);
++	if (!c) {
++		cnt.noserver++;
++		svc_local(pipe, svc, cid, s, 1, si < 0 ? QMI_ERR_NOT_SUPPORTED : QMI_ERR_CLIENT_IDS_EXHAUSTED);
++		return;
++	}
++	if (sbb_qrtr_send(SBB_QRTR_DATA, c->port, srv[si].node, srv[si].port, s, len)) {
++		cnt.sendfail++;
++		svc_local(pipe, svc, cid, s, 1, 0x03);
++		return;
++	}
++	c->fwd++;
++	cnt.fwd++;
++	svc_cnt[svc & 0xff].fwd++;
++	struct pend x;
++	bzero(&x, sizeof(x));
++	x.port = c->port;
++	x.txn = (uint16_t)(s[1] | (s[2] << 8));
++	x.msg = (uint16_t)(s[3] | (s[4] << 8));
++	x.svc = (uint8_t)svc;
++	uint32_t tn = len - 7 < sizeof(x.rq) ? len - 7 : (uint32_t)sizeof(x.rq);
++	x.rqn = (uint8_t)tn;
++	memcpy(x.rq, s + 7, tn);
++	pend_add(&x);
++}
++
++/* one record from SweetABP (CommCenter wrote a frame / opened, closed, started, aborted a pipe) */
++static void
++handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n)
++{
++	if (pipe >= NPIPES) {
++		return;
++	}
++	cur_pipe = pipe;
++	cur_sess = sess;
++	if (type != 0) {
++		static const char *ev[] = { "data", "OPEN", "CLOSE", "START", "ABORT" };
++		unsigned long long v = 0;
++		if (n >= 8) {
++			memcpy(&v, d, 8);
++		}
++		LOG("%s/%u %s (arg 0x%llx)\n", pipe_name[pipe], sess, type < 5 ? ev[type] : "?", v);
++		if (type == 2) {
++			sess_end(pipe, sess);
++		}
++		return;
++	}
++	nframes_in++;
++	log_frame(pipe, sess, "CC->", d, n);
++	if (n < 6 || d[0] != 0x01) {
++		return;
++	}
++	unsigned svc = d[4], cid = d[5];
++	const uint8_t *s = d + 6;
++	uint32_t sn = n - 6;
++	if (svc == 0) {
++		if (sn >= 6 && s[0] == 0x00) {
++			ctl_answer(pipe, s, sn);
++		}
++		return;
++	}
++	if (sn < 7 || s[0] != 0x00) {
++		return;
++	}
++	unsigned msg = s[3] | (s[4] << 8);
++	uint32_t rl = sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8));
++	int code;
++	char wb[160];
++	int a = decide(svc, msg, s + 7, rl, &code, wb, sizeof(wb));
++	if (a == ACT_FWD && dec_rate >= 0) {
++		uint64_t now = sbb_ms();
++		uint64_t *last = &rate_last[dec_rate];
++		if (*last && now - *last < (uint64_t)rules_o1[dec_rate].rate_ms) {
++			a = ACT_ERR;
++			code = QMI_ERR_DEVICE_IN_USE;
++			cnt.ratelimited++;
++			snprintf(wb, sizeof(wb), "rate limited (once per %d ms)", rules_o1[dec_rate].rate_ms);
++		} else {
++			*last = now;
++		}
++	}
++	char an[24];
++	if (a == ACT_ERR) {
++		snprintf(an, sizeof(an), "err:0x%x", code);
++	} else {
++		snprintf(an, sizeof(an), "%s", act_name[a]);
++	}
++	note_seen(svc, msg, an, wb);
++	struct mst *ms = mst_get(svc, msg);
++	if (ms) {
++		ms->count++;
++		ms->act = (uint8_t)a;
++		mst_dirty = 1;
++	}
++	switch (a) {
++	case ACT_FWD:
++		svc_forward(pipe, svc, cid, s, sn);
++		break;
++	case ACT_OK:
++		cnt.local_ok++;
++		svc_local(pipe, svc, cid, s, 0, 0);
++		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
++		break;
++	case ACT_RESP:
++		if (dec_tmpl) {
++			int miss = 0, tn = tmpl_expand(dec_tmpl, s + 7, rl, 0, B->res_buf, sizeof(B->res_buf), &miss);
++			if (tn < 0 || !tlvs_ok(B->res_buf, (uint32_t)tn)) {
++				cnt.local_err++;
++				svc_local(pipe, svc, cid, s, 1, 0x11);
++				break;
++			}
++			cnt.local_ok++;
++			svc_local_tlv(pipe, svc, cid, s, 0, 0, B->res_buf, (uint16_t)tn);
++			run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
++			break;
++		}
++		cnt.local_ok++;
++		svc_local_tlv(pipe, svc, cid, s, 0, 0, dec_data, dec_dlen);
++		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
++		break;
++	case ACT_ERR:
++		cnt.local_err++;
++		svc_local(pipe, svc, cid, s, 1, code);
++		break;
++	default:
++		cnt.dropped++;
++		svc_cnt[svc & 0xff].denied++;
++		break;
++	}
++}
++
++/* ---- from the link (sweetbb thread) ---- */
++
+ void
+-sweet_qmux_start(void)
++sweet_qmux_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
+ {
+-	printf("SWEET QMUX: not in this kernel (1067 stub)\n");
++	int fr = -1;
++	if (!on) {
++		return;
++	}
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up && srv[i].svc == service && srv[i].inst == instance && srv[i].node == node && srv[i].port == port) {
++			return;
++		}
++		if (!srv[i].up && fr < 0) {
++			fr = i;
++		}
++	}
++	if (fr < 0) {
++		return;
++	}
++	srv[fr].svc = service;
++	srv[fr].inst = instance;
++	srv[fr].node = node;
++	srv[fr].port = port;
++	srv[fr].up = 1;
+ }
+ 
+ void
+-sweet_qmux_c2w(__unused unsigned pipe, __unused uint32_t sess, __unused unsigned type, __unused const void *data, __unused uint32_t len)
++sweet_qmux_server_gone(uint32_t node, uint32_t port)
+ {
++	if (!on) {
++		return;
++	}
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up && srv[i].node == node && (port == 0xffffffffu || srv[i].port == port)) {
++			srv[i].up = 0;
++			LOG("modem server svc 0x%02x (%s) gone\n", srv[i].svc, svc_name(srv[i].svc));
++			for (int k = 0; k < NCL; k++) {
++				if (cl[k].used && cl[k].svc == srv[i].svc && srv_find(srv[i].svc) < 0) {
++					pend_drop_port(cl[k].port);
++					bzero(&cl[k], sizeof(cl[k]));
++				}
++			}
++		}
++	}
++}
++
++/* the 7-byte SDU header's result TLV of a response: res/err (0xffff = none) */
++static void
++result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err)
++{
++	uint32_t ml = (uint32_t)(d[5] | (d[6] << 8)), rl = 0;
++	const uint8_t *r = ml <= n - 7 ? tlv_find(d + 7, ml, 0x02, &rl) : NULL;
++	*res = r && rl >= 4 ? (unsigned)(r[0] | (r[1] << 8)) : 0xffff;
++	*err = r && rl >= 4 ? (unsigned)(r[2] | (r[3] << 8)) : 0xffff;
+ }
+ 
+ void
+-sweet_qmux_poll(void)
++sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ {
++	if (!on) {
++		return;
++	}
++	if (n >= 7 && d[0] == 0x02) {
++		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
++		for (int i = 0; i < NPEND; i++) {
++			struct pend *x = &B->pend[i];
++			if (!x->used || !(x->replay || x->simread) || x->port != h->dst_port || x->txn != txn) {
++				continue;
++			}
++			x->used = 0;
++			if (x->simread) {
++				uint32_t sl = (uint32_t)(d[5] | (d[6] << 8));
++				unsigned res, er;
++				if (sl > n - 7 || !tlvs_ok(d + 7, sl)) {
++					return;
++				}
++				result_of(d, n, &res, &er);
++				if (res != 0) {
++					LOG("SIM identity: EF %04x read failed (error 0x%x)\n", x->file, er);
++					return;
++				}
++				simid_from_read(x->file, d + 7, sl, "the router's read");
++				return;
++			}
++			uint32_t ml = (uint32_t)(d[5] | (d[6] << 8));
++			if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
++				malformed++;
++				LOG("MALFORMED replay answer %s(0x%02x) msg 0x%04x (%u bytes): dropped\n", svc_name(x->svc), x->svc, x->msg, n);
++				return;
++			}
++			unsigned res, er;
++			result_of(d, n, &res, &er);
++			if (res != 0) {
++				LOG("replay %s(0x%02x) GET 0x%04x: modem error 0x%x, no indication\n", svc_name(x->svc), x->svc, x->msg, er);
++				return;
++			}
++			uint8_t *t = B->rep_buf;
++			uint32_t o = 0;
++			const uint8_t *p = d + 7;
++			for (uint32_t k = 0; k + 3 <= ml;) {
++				unsigned id = p[k], l = (unsigned)(p[k + 1] | (p[k + 2] << 8));
++				if (id != 0x02) {
++					unsigned nid = id;
++					for (int m = 0; m < x->nmap; m++) {
++						if (x->map[m][0] == id) {
++							nid = x->map[m][1];
++						}
++					}
++					t[o++] = (uint8_t)nid;
++					memcpy(t + o, p + k + 1, 2 + l);
++					o += 2 + l;
++				}
++				k += 3 + l;
++			}
++			o = strip_tlvs(x->svc, x->ind_msg, t, o);
++			synth_inds++;
++			LOG("replay %s(0x%02x) GET 0x%04x -> indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", svc_name(x->svc), x->svc,
++			    x->msg, x->ind_msg, o, pipe_name[x->rpipe], x->rsess, x->rcid);
++			if (cl_get(x->rpipe, x->rsess, x->svc, x->rcid, 0)) {
++				send_ind(x->rpipe, x->rsess, x->svc, x->rcid, x->ind_msg, t, o);
++			}
++			return;
++		}
++	}
++	struct cl *c = NULL;
++	for (int i = 0; i < NCL && !c; i++) {
++		if (cl[i].used == 1 && cl[i].port == h->dst_port) {
++			c = &cl[i];
++		}
++	}
++	if (!c || n < 7) {
++		late++;
++		if (n >= 7 && d[0] == 0x02) {
++			uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
++			for (int i = 0; i < NPEND; i++) {
++				if (B->pend[i].used && B->pend[i].port == h->dst_port && B->pend[i].txn == txn) {
++					B->pend[i].used = 0;
++				}
++			}
++		}
++		return;
++	}
++	unsigned ml = d[5] | (d[6] << 8);
++	if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
++		char hx[3 * 48 + 8];
++		malformed++;
++		hexline(hx, sizeof(hx), redact(d, n), n < 40 ? n : 40);
++		LOG("MALFORMED %s from the modem for %s(0x%02x) cid %u (%u bytes, msg len %u): dropped: %s\n",
++		    d[0] == 0x04 ? "indication" : d[0] == 0x02 ? "response" : "frame", svc_name(c->svc), c->svc, c->cid, n, ml, hx);
++		return;
++	}
++	unsigned res = 0xffff, rmsg = (unsigned)(d[3] | (d[4] << 8));
++	uint8_t rq[96];
++	uint32_t rqn = 0;
++	if (d[0] == 0x02) {
++		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
++		unsigned er;
++		for (int i = 0; i < NPEND; i++) {
++			if (B->pend[i].used && B->pend[i].port == h->dst_port && B->pend[i].txn == txn) {
++				B->pend[i].used = 0;
++				rqn = B->pend[i].rqn;
++				memcpy(rq, B->pend[i].rq, rqn);
++				break;
++			}
++		}
++		result_of(d, n, &res, &er);
++		struct mst *m = mst_get(c->svc, rmsg);
++		if (m) {
++			if (res == 0) {
++				m->ok++;
++			} else {
++				m->err++;
++				m->last_err = (uint16_t)er;
++			}
++			mst_dirty = 1;
++			if (!m->answered_logged) {
++				m->answered_logged = 1;
++				LOG("ANSWER %s(0x%02x) msg 0x%04x: %s error 0x%x (%u bytes)\n", svc_name(c->svc), c->svc, rmsg,
++				    res == 0 ? "success" : res == 0xffff ? "no result TLV" : "FAILURE", res == 0 ? 0 : er, n);
++			}
++		}
++	}
++	if (d[0] == 0x02 && res == 0 && c->svc == 0x0b && rmsg == 0x0020 && rqn) {
++		uint32_t fl = 0;
++		const uint8_t *fv = tlv_find(rq, rqn, 0x02, &fl);
++		if (fv && fl >= 3) {
++			simid_from_read((unsigned)(fv[0] | (fv[1] << 8)), d + 7, ml, "CommCenter's read");
++		}
++	}
++	if (d[0] == 0x04 && c->svc == 0x0b && rmsg == 0x0032 && !simid.refresh) {
++		simid.refresh = 1;
++		simid.tries = 0;
++		simid.next = sbb_ms() + 2000;
++	}
++	uint32_t len = 7 + ml;
++	uint8_t *b = B->ans_buf;
++	if (6 + len > sizeof(B->ans_buf)) {
++		return;
++	}
++	memcpy(b + 6, d, len);
++	if (nstrip) {
++		uint32_t nl = strip_tlvs(c->svc, rmsg, b + 13, ml);
++		if (nl != ml) {
++			b[11] = (uint8_t)nl;
++			b[12] = (uint8_t)(nl >> 8);
++			len = 7 + nl;
++		}
++	}
++	finish_qmux(b, 6 + len, c->svc, c->cid);
++	if (d[0] == 0x04) {
++		c->ind++;
++		cnt.ind++;
++	} else {
++		c->resp++;
++		cnt.resp++;
++	}
++	uint32_t cpipe = c->pipe, csess = c->sess;
++	unsigned csvc = c->svc, ccid = c->cid;
++	if (d[0] == 0x04 && hold_frame(c->pipe, c->sess, b, 6 + len)) {
++		return;
++	}
++	send_to(cpipe, csess, b, 6 + len);
++	if (d[0] == 0x02 && res == 0) {
++		run_triggers(cpipe, csess, csvc, ccid, rmsg, rq, rqn);
++	}
+ }
+ 
++/* ---- CommCenter's records (from SweetABP, any thread) -> the sweetbb thread ---- */
++
++struct c2w {
++	struct c2w *next;
++	uint32_t pipe, sess, type, len;
++	uint8_t d[];
++};
++static LCK_MTX_DECLARE(c2w_lock, &qmux_grp);
++static struct c2w *c2w_first, *c2w_last;
++static uint32_t c2w_bytes, c2w_count;
++static unsigned c2w_dropped;
++
+ void
+-sweet_qmux_server(__unused uint32_t service, __unused uint32_t instance, __unused uint32_t node, __unused uint32_t port)
++sweet_qmux_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len)
++{
++	if (!on || len > ABP_MAXFRAME) {
++		return;
++	}
++	struct c2w *r = kalloc_data(sizeof(*r) + len, Z_WAITOK);
++	if (r == NULL) {
++		c2w_dropped++;
++		return;
++	}
++	r->next = NULL;
++	r->pipe = pipe;
++	r->sess = sess;
++	r->type = type;
++	r->len = len;
++	if (len) {
++		memcpy(r->d, data, len);
++	}
++	lck_mtx_lock(&c2w_lock);
++	if (c2w_bytes + len > (4u << 20) || c2w_count >= 4096) {
++		lck_mtx_unlock(&c2w_lock);
++		kfree_data(r, sizeof(*r) + len);
++		if (c2w_dropped++ < 20) {
++			printf("SWEET QMUX: CommCenter's queue full: a %u-byte record of pipe %u dropped\n", len, pipe);
++		}
++		return;
++	}
++	if (c2w_last) {
++		c2w_last->next = r;
++	} else {
++		c2w_first = r;
++	}
++	c2w_last = r;
++	c2w_bytes += len;
++	c2w_count++;
++	lck_mtx_unlock(&c2w_lock);
++	sbb_wake();
++}
++
++/* ---- timers, ready, stats ---- */
++
++static uint64_t next_check, next_stats, last_kick[SBB_QMUX_NPORTS];
++static int dump_req;
++
++static void
++kick(uint32_t port, unsigned svc, uint64_t now)
++{
++	int si = srv_find(svc);
++	if (!kickon || si < 0 || port < SBB_QMUX_PORT0 || port >= SBB_QMUX_PORT0 + SBB_QMUX_NPORTS) {
++		return;
++	}
++	if (last_kick[port - SBB_QMUX_PORT0] && now - last_kick[port - SBB_QMUX_PORT0] < 5000) {
++		return;
++	}
++	last_kick[port - SBB_QMUX_PORT0] = now;
++	kicks++;
++	LOG("kick: RESUME_TX port %#x -> %s server %u:%x (a request got no answer in 5 s)\n", port, svc_name(svc), srv[si].node,
++	    srv[si].port);
++	uint32_t pkt[5] = { SBB_QRTR_RESUME_TX, SBB_NODE_APPS, port, 0, 0 };
++	sbb_qrtr_send(SBB_QRTR_RESUME_TX, port, srv[si].node, srv[si].port, pkt, sizeof(pkt));
++}
++
++static void
++mst_table(const char *why)
++{
++	LOG("table (%s, %d rows, late %u): svc msg action count ok err[code] noans\n", why, nmst, late);
++	for (int i = 0; i < nmst; i++) {
++		struct mst *m = &B->mst[i];
++		LOG(" %02x %-12s %04x %-5s %u %u %u[0x%x] %u\n", m->svc, svc_name(m->svc), m->msg,
++		    m->count || m->act ? act_name[m->act < 6 ? m->act : 4] : "-", m->count, m->ok, m->err, m->last_err, m->noans);
++	}
++	mst_dirty = 0;
++}
++
++static void
++update_ready(void)
+ {
++	int ok = srv_find(0x02) >= 0 && srv_find(0x03) >= 0 && srv_find(0x0b) >= 0;
++	if (ok == ready) {
++		return;
++	}
++	ready = ok;
++	sweet_abp_set_ready(ok != 0, ok ? "kernel router (modem DMS, NAS and UIM servers known)" :
++	    "kernel router (a modem DMS/NAS/UIM server missing)");
+ }
+ 
+ void
+-sweet_qmux_server_gone(__unused uint32_t node, __unused uint32_t port)
++sweet_qmux_poll(void)
+ {
++	if (!on) {
++		return;
++	}
++	uint64_t now = sbb_ms();
++	/* CommCenter's records first, in order */
++	for (unsigned k = 0; k < 256; k++) {
++		lck_mtx_lock(&c2w_lock);
++		struct c2w *r = c2w_first;
++		if (r) {
++			c2w_first = r->next;
++			if (!c2w_first) {
++				c2w_last = NULL;
++			}
++			c2w_bytes -= r->len;
++			c2w_count--;
++		}
++		lck_mtx_unlock(&c2w_lock);
++		if (!r) {
++			break;
++		}
++		handle(r->pipe, r->sess, r->type, r->d, r->len);
++		kfree_data(r, sizeof(*r) + r->len);
++	}
++	if (now >= next_check) {
++		next_check = now + 10000;
++		policy_poll(false);
++	} else if (push_pending || push_clear) {
++		policy_poll(false);
++	}
++	update_ready();
++	for (int i = 0; i < NPEND; i++) {
++		struct pend *x = &B->pend[i];
++		if (x->used && now - x->t > 5000) {
++			x->used = 0;
++			kick(x->port, x->svc, now);
++			struct mst *m = mst_get(x->svc, x->msg);
++			if (m) {
++				m->noans++;
++				mst_dirty = 1;
++				if (!m->answered_logged) {
++					m->answered_logged = 1;
++					LOG("ANSWER %s(0x%02x) msg 0x%04x: NO ANSWER after 5 s\n", svc_name(x->svc), x->svc, x->msg);
++				}
++			}
++		}
++	}
++	simid_poll(now);
++	bbr_poll(now);
++	hold_poll(now);
++	if (dump_req) {
++		dump_req = 0;
++		mst_table("kern.sweet_qmux_dump");
++	}
++	if (now >= next_stats) {
++		if (next_stats) {
++			int ncl = 0, nidle = 0;
++			for (int i = 0; i < NCL; i++) {
++				ncl += cl[i].used == 1;
++				nidle += cl[i].used == 2;
++			}
++			LOG("stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; %d router clients "
++			    "(%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u; kicks %u, stripped %u, "
++			    "floor %u, rate %u; holdnas=%d held %u (rel bsp %u, timeout %u, gone %u)\n", nframes_in, nframes_out, cnt.fwd,
++			    cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped, ncl, nidle, cnt.noserver, cnt.sendfail, late,
++			    malformed, replays, synth_inds, kicks, stripped, cnt.floor, cnt.ratelimited, holdnas, held_cnt, held_rel_bsp,
++			    held_rel_to, held_drop);
++		}
++		next_stats = now + 60000;
++	}
++}
++
++bool
++sweet_qmux_on(void)
++{
++	return on;
+ }
+ 
+ void
+-sweet_qmux_qrtr(__unused const struct sbb_qrtr_hdr *h, __unused const uint8_t *d, __unused uint32_t n)
++sweet_qmux_start(void)
+ {
++	B = kalloc_data(sizeof(*B), Z_WAITOK | Z_ZERO);
++	if (B == NULL) {
++		printf("SWEET QMUX: no memory for the router (%lu bytes): off\n", (unsigned long)sizeof(*B));
++		return;
++	}
++	PE_parse_boot_argn("sweetqmifilter", &qmi_filter, sizeof(qmi_filter));
++	PE_parse_boot_argn("sweetqmirules", &qmi_rules, sizeof(qmi_rules));
++	on = true;
++	policy_poll(true);      /* (the built-in default: the root is not mounted yet) */
++	LOG("router on (%lu bytes of state), filter %d, rules %d (%s), err 0x%x, reuse %d, kick %d, holdnas %d/%d ms\n",
++	    (unsigned long)sizeof(*B), qmi_filter, qmi_rules, qmi_rules == 1 ? "option-1 list" : "P2 list", err_code, reuse, kickon,
++	    holdnas, holddly);
+ }
+ 
+ int
+ sweet_qmux_stats(char *buf, size_t len)
+ {
+-	return snprintf(buf, len, "no router (1067 stub)");
++	int o, ncl = 0, nidle = 0;
++	if (!on) {
++		return snprintf(buf, len, "router off (sweetbb & 2 not set)");
++	}
++	for (int i = 0; i < NCL; i++) {
++		ncl += cl[i].used == 1;
++		nidle += cl[i].used == 2;
++	}
++	o = snprintf(buf, len, "router on, ready %d, filter %d, rules %d, policy %s (%d ovr, %d trg, %d strip) | frames in %u out %u | fwd %u "
++	    "resp %u ind %u | local ok %u err %u drop %u | clients %d (+%d idle) | noserver %u sendfail %u late %u malformed %u "
++	    "replays %u synth %u kicks %u floor %u rate %u | held %u (bsp %u, to %u, gone %u) | SIM id %s/%s gen %u reads %u | "
++	    "bbresets %u | CC queue %u (%u B, dropped %u) | per svc fwd/local/denied/live:",
++	    ready, qmi_filter, qmi_rules, pol_src == SRC_PUSHED ? "pushed" : pol_src == SRC_FILE ? "file" : "built-in default", novr,
++	    ntrg, nstrip, nframes_in, nframes_out, cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped, ncl, nidle,
++	    cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, kicks, cnt.floor, cnt.ratelimited, held_cnt,
++	    held_rel_bsp, held_rel_to, held_drop, simid.have_iccid ? "known" : "unknown", simid.have_imsi ? "known" : "unknown",
++	    simid.gen, simid.reads, bbresets, c2w_count, c2w_bytes, c2w_dropped);
++	for (unsigned s = 0; s < 256 && o < (int)len - 48; s++) {
++		int live = 0;
++		for (int i = 0; i < NCL; i++) {
++			live += cl[i].used == 1 && cl[i].svc == s;
++		}
++		if (svc_cnt[s].fwd || svc_cnt[s].local || svc_cnt[s].denied || live) {
++			o += snprintf(buf + o, len - (size_t)o, " %s(%02x) %u/%u/%u/%d", svc_name(s), s, svc_cnt[s].fwd, svc_cnt[s].local,
++			    svc_cnt[s].denied, live);
++		}
++	}
++	return o < (int)len ? o : (int)len - 1;
++}
++
++/* ---- sysctls ---- */
++
++static int
++sysctl_qint SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg2)
++	int *p = (int *)arg1, v = *p, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e == 0 && changed) {
++		if (proc_suser(req->p) != 0) {
++			return EPERM;
++		}
++		*p = v;
++		printf("SWEET QMUX: kern.%s = %d\n", oidp->oid_name, v);
++	}
++	return e;
++}
++#define QINT(name, var, desc) \
++	SYSCTL_PROC(_kern, OID_AUTO, name, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &var, 0, sysctl_qint, "I", desc)
++QINT(sweet_qmi_filter, qmi_filter, "redfin 1068: 0 pass (hard floor + policy text only), 1 protect (default), 2 protect + frame log");
++QINT(sweet_qmi_rules, qmi_rules, "redfin 1068: built-in list 0 = P2 (abpbridge.c, default), 1 = option-1 (P4-design s.5.3 + user decisions)");
++QINT(sweet_qmux_err, err_code, "redfin 1068: QMI error of the built-in err entries (abperr, default 0x5e)");
++QINT(sweet_qmux_cidfail, cidfail, "redfin 1068: 1 = GetClientId fails for a service the modem lacks (abpcidfail)");
++QINT(sweet_qmux_reuse, reuse, "redfin 1068: 1 = released router clients pooled per service (abpreuse, default 1)");
++QINT(sweet_qmux_kick, kickon, "redfin 1068: 1 = RESUME_TX kick after 5 s without an answer (abpkick, default 1)");
++QINT(sweet_qmux_holdnas, holdnas, "redfin 1068: NAS indications held until BSP activation (abpholdnas: 0 off, 1 = 5 s, >= 100 ms)");
++QINT(sweet_qmux_holddly, holddly, "redfin 1068: ms after the BSP activation indication before held NAS indications go (abpholddly, 500)");
++QINT(sweet_qmi_policy_file, policy_file, "redfin 1068: 1 = /var/local/abp-policy.conf overrides the built-in default text (checked every 10 s)");
++
++static int
++sysctl_dump SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e == 0 && changed && v) {
++		dump_req = 1;
++		sbb_wake();
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qmux_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_dump, "I",
++    "redfin 1068: write 1 = the per-(svc, msg) table to the kernel log");
++
++static int
++sysctl_policy SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char sum[160];
++	snprintf(sum, sizeof(sum), "%s: %d override, %d trigger, %d strip line(s)", pol_src == SRC_PUSHED ? "pushed" :
++	    pol_src == SRC_FILE ? "/var/local/abp-policy.conf" : "built-in default", novr, ntrg, nstrip);
++	int e = SYSCTL_OUT(req, sum, strlen(sum) + 1);
++	if (e || req->newptr == USER_ADDR_NULL) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	size_t n0 = req->newlen - req->newidx, n = n0;
++	if (n > POLICY_MAX) {
++		return E2BIG;
++	}
++	char *t = kalloc_data(n0 + 1, Z_WAITOK | Z_ZERO);
++	if (t == NULL) {
++		return ENOMEM;
++	}
++	e = SYSCTL_IN(req, t, n0);
++	if (e) {
++		kfree_data(t, n0 + 1);
++		return e;
++	}
++	while (n && (t[n - 1] == 0 || is_space(t[n - 1]))) {
++		n--;
++	}
++	char *x = NULL;
++	if (n && !(n == 1 && t[0] == '-')) {
++		x = kalloc_data(n + 1, Z_WAITOK | Z_ZERO);
++		if (x == NULL) {
++			kfree_data(t, n0 + 1);
++			return ENOMEM;
++		}
++		memcpy(x, t, n);
++	}
++	kfree_data(t, n0 + 1);
++	lck_mtx_lock(&push_lock);
++	if (push_text) {
++		kfree_data(push_text, push_len + 1);
++		push_text = NULL;
++		push_len = 0;
++	}
++	if (x == NULL) {
++		push_clear = true;      /* back to the file / the default at the next round */
++		push_pending = false;
++		next_check = 0;
++	} else {
++		push_text = x;
++		push_len = n;
++		push_pending = true;
++		push_clear = false;
++	}
++	lck_mtx_unlock(&push_lock);
++	sbb_wake();
++	return 0;
+ }
+-#endif
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_policy, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_policy, "A",
++    "redfin 1068: reads the policy source; write = load this policy text (abp-policy.conf grammar), '-' or empty = back to the file/default");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
