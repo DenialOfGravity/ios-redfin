@@ -177,6 +177,9 @@ static struct pend {
 	uint16_t ind_msg;
 	/* P2 reg: the request's TLVs (first 96 bytes), for 'if <tlv>' triggers on its answer */
 	uint8_t rqn, rq[96];
+	/* n12b: the router's own EF read (SIM identity); its answer never reaches CommCenter */
+	uint8_t simread;
+	uint16_t file;
 } pend[NPEND];
 static uint16_t replay_txn = 0xff00;	/* router-made GETs use txn 0xff00..0xfffe */
 
@@ -221,6 +224,7 @@ struct pol {
 	const char *why;
 };
 
+struct fref { int tlv, off, len, add, hasadd; };	/* n12b: a request field "RQ<tlv>:<off>:<len>[+<n>]" */
 /* r3 trigger lines ("on svc msg ind|replay ...") */
 enum { TRG_IND, TRG_REPLAY };
 #define NTRG	64
@@ -232,6 +236,9 @@ static struct trg {
 	const uint8_t *data;		/* ind: TLVs */
 	uint16_t dlen;
 	int cond;			/* P2 reg 'if <tlv>': only when the request had TLV <tlv> with a non-zero first byte; -1 always */
+	const char *tmpl;		/* n12b: ind data with placeholders (expanded at send time) */
+	int ceq;			/* n12b 'if RQ..=RQ..': only when both request fields are equal */
+	struct fref fa, fb;
 } trg[NTRG];
 static int ntrg;
 static uint8_t pol_data[16384];	/* hex data of resp/ind lines (one policy load) */
@@ -381,7 +388,7 @@ static const struct pol abp_builtin[] = {
 
 #define NOVR	256
 static struct pol ovr[NOVR];
-static struct { const uint8_t *data; uint16_t dlen; } ovr_data[NOVR];	/* r3: resp:<hex> of ovr[i] */
+static struct { const uint8_t *data; uint16_t dlen; const char *tmpl; } ovr_data[NOVR];	/* r3: resp:<hex> of ovr[i]; n12b: template */
 static int novr;
 static time_t ovr_mtime;
 static off_t ovr_size;
@@ -445,6 +452,200 @@ static int tlvs_ok(const uint8_t *p, uint32_t n)
 	return 1;
 }
 
+/*
+ * n12b (2026-11-12): templates in resp:<hex> and 'on .. ind <msg> <hex>' data, expanded when the message is sent.
+ * After UniXNU/QcomBaseband (BSD-2-Clause, baseband/coachz_bb_data.h + coachz_baseband.cpp): an Apple modem answers the
+ * BSP activation register (0xe2 0xb00c) with an indication carrying the SIM's ICCID and IMSI it read itself, and acks each
+ * carrier-bundle segment (0xe2 0xa000) with the next segment number. Placeholders (inside the hex, no spaces):
+ *   <id>{ICCID}   TLV <id> = 10 bytes, the ICCID in reading order (BCD, F-padded), as wland read it from the card
+ *   <id>{IMSI}    TLV <id> = 8 bytes, the IMSI in reading order (BCD, F-padded)
+ *                 (both include the TLV length; while not known the whole TLV is left out, and an indication with one is
+ *                  deferred until the card has been read; it is sent again whenever the card's identity changes)
+ *   {RQ<tlv>:<off>:<len>[+<n>]}   <len> bytes copied from the request's TLV <tlv> (hex) at byte <off>; with +<n> (len 1, 2
+ *                 or 4) the little-endian value plus n. A request without that field gets QMI error 0x11 (missing arg) for a
+ *                 resp line, and no indication for an 'on' line.
+ * 'on' lines may also end in "if RQ<a>=RQ<b>" (two field references, compared as numbers), e.g. last segment:
+ *   0xe2 0xa000 resp:400200{RQ01:2:2+1}
+ *   on 0xe2 0xa000 ind 0xa001 010200{RQ01:0:1}0010010001 if RQ01:2:2+1=RQ01:4:2
+ * ICCID/IMSI values are never logged (lengths only).
+ */
+#define SIM_ICCID_LEN	10
+#define SIM_IMSI_LEN	8
+static struct {
+	uint8_t iccid[SIM_ICCID_LEN], imsi[SIM_IMSI_LEN];
+	int have_iccid, have_imsi, refresh, tries;
+	unsigned gen, reads, snoops;
+	uint64_t next;
+} simid;
+static char pol_text[8192];	/* template texts of one policy load */
+static uint32_t pol_tlen;
+
+
+/* "RQ<tlv>:<off>:<len>[+<n>]" (s up to '}' or '=' or end); 0 ok */
+static int parse_fref(const char *s, struct fref *f)
+{
+	unsigned t;
+	int off, len, add = 0, k = 0;
+	memset(f, 0, sizeof(*f));
+	if ((s[0] != 'R' && s[0] != 'r') || (s[1] != 'Q' && s[1] != 'q'))
+		return -1;
+	if (sscanf(s + 2, "%x:%d:%d%n", &t, &off, &len, &k) != 3 || t > 255 || off < 0 || off > 4096 || len < 1 || len > 64)
+		return -1;
+	s += 2 + k;
+	if (*s == '+') {
+		if (sscanf(s + 1, "%d", &add) != 1 || (len != 1 && len != 2 && len != 4))
+			return -1;
+		f->hasadd = 1;
+	}
+	f->tlv = (int)t;
+	f->off = off;
+	f->len = len;
+	f->add = add;
+	return 0;
+}
+
+/* the value of TLV id in list p (n bytes): pointer and length, NULL if absent */
+static const uint8_t *tlv_find(const uint8_t *p, uint32_t n, unsigned id, uint32_t *len)
+{
+	for (uint32_t k = 0; k + 3 <= n;) {
+		uint32_t l = (uint32_t)(p[k + 1] | (p[k + 2] << 8));
+		if (k + 3 + l > n)
+			return NULL;
+		if (p[k] == id) {
+			*len = l;
+			return p + k + 3;
+		}
+		k += 3 + l;
+	}
+	return NULL;
+}
+
+/* the field's bytes (with +n applied) into out; dummy: zeros; 0 ok, -1 the request does not have it */
+static int fref_get(const struct fref *f, const uint8_t *rq, uint32_t rqn, int dummy, uint8_t *out)
+{
+	uint32_t l = 0;
+	const uint8_t *v = dummy ? NULL : tlv_find(rq, rqn, (unsigned)f->tlv, &l);
+	if (dummy) {
+		memset(out, 0, (size_t)f->len);
+	} else {
+		if (!v || (uint32_t)f->off + (uint32_t)f->len > l)
+			return -1;
+		memcpy(out, v + f->off, (size_t)f->len);
+	}
+	if (f->hasadd) {
+		uint32_t x = 0;
+		for (int i = 0; i < f->len; i++)
+			x |= (uint32_t)out[i] << (8 * i);
+		x += (uint32_t)f->add;
+		for (int i = 0; i < f->len; i++)
+			out[i] = (uint8_t)(x >> (8 * i));
+	}
+	return 0;
+}
+
+static int fref_num(const struct fref *f, const uint8_t *rq, uint32_t rqn, uint32_t *x)
+{
+	uint8_t b[64];
+	if (f->len > 4 || fref_get(f, rq, rqn, 0, b))
+		return -1;
+	*x = 0;
+	for (int i = 0; i < f->len; i++)
+		*x |= (uint32_t)b[i] << (8 * i);
+	return 0;
+}
+
+static int hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+/*
+ * expand template h: the bytes (length) into out; -1 bad template / no room, -2 a request field is missing.
+ * dummy: every placeholder as if known (load-time check). *missing: an ICCID/IMSI TLV was left out (not known yet).
+ */
+static int tmpl_expand(const char *h, const uint8_t *rq, uint32_t rqn, int dummy, uint8_t *out, uint32_t room, int *missing)
+{
+	uint32_t o = 0;
+	int hi = -1;
+	*missing = 0;
+	for (; *h; h++) {
+		if (*h == '.' || *h == '_' || *h == ':')
+			continue;
+		if (*h == '{') {
+			const char *e = strchr(h, '}');
+			if (!e || hi >= 0)
+				return -1;
+			size_t nl = (size_t)(e - h - 1);
+			if ((nl == 5 && !strncmp(h + 1, "ICCID", 5)) || (nl == 4 && !strncmp(h + 1, "IMSI", 4))) {
+				int ic = nl == 5;
+				uint32_t l = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
+				if (dummy || (ic ? simid.have_iccid : simid.have_imsi)) {
+					if (o + 2 + l > room)
+						return -1;
+					out[o++] = (uint8_t)l;
+					out[o++] = 0;
+					if (dummy)
+						memset(out + o, 0xff, l);
+					else
+						memcpy(out + o, ic ? simid.iccid : simid.imsi, l);
+					o += l;
+				} else {
+					if (!o)
+						return -1;
+					o--;		/* the TLV id: the whole TLV is left out */
+					*missing = 1;
+				}
+			} else {
+				struct fref f;
+				if (parse_fref(h + 1, &f) || o + (uint32_t)f.len > room)
+					return -1;
+				if (fref_get(&f, rq, rqn, dummy, out + o))
+					return -2;
+				o += (uint32_t)f.len;
+			}
+			h = e;
+			continue;
+		}
+		int v = hexval(*h);
+		if (v < 0)
+			return -1;
+		if (hi < 0) {
+			hi = v;
+			continue;
+		}
+		if (o >= room)
+			return -1;
+		out[o++] = (uint8_t)(hi << 4 | v);
+		hi = -1;
+	}
+	return hi >= 0 ? -1 : (int)o;
+}
+
+static int tmpl_sim(const char *h)
+{
+	return h && (strstr(h, "{ICCID}") || strstr(h, "{IMSI}"));
+}
+
+/* a template into pol_text, checked (dummy expansion must be whole TLVs); NULL if bad */
+static const char *parse_tmpl(const char *h)
+{
+	uint8_t b[4096];
+	int miss, n = tmpl_expand(h, NULL, 0, 1, b, sizeof(b), &miss);
+	size_t l = strlen(h);
+	if (n < 0 || !tlvs_ok(b, (uint32_t)n) || pol_tlen + l + 1 > sizeof(pol_text))
+		return NULL;
+	char *t = pol_text + pol_tlen;
+	memcpy(t, h, l + 1);
+	pol_tlen += (uint32_t)l + 1;
+	return t;
+}
+
 /* "on svc msg ind <msg> <hex>" / "on svc msg replay <get> <ind> [map a=b,c=d]"; 0 ok */
 static int parse_trigger(char *line, int ln)
 {
@@ -456,9 +657,18 @@ static int parse_trigger(char *line, int ln)
 	char *iff = strstr(line, " if ");
 	if (iff) {
 		unsigned c;
-		if (sscanf(iff + 4, "%x", &c) != 1 || c > 255)
-			goto bad;
-		t.cond = (int)c;
+		char *eq = strchr(iff + 4, '=');
+		while (iff[4] == ' ')
+			iff++;
+		if (eq) {		/* n12b: "if RQ..=RQ.." */
+			if (parse_fref(iff + 4, &t.fa) || parse_fref(eq + 1, &t.fb) || t.fa.len > 4 || t.fb.len > 4)
+				goto bad;
+			t.ceq = 1;
+		} else {
+			if (sscanf(iff + 4, "%x", &c) != 1 || c > 255)
+				goto bad;
+			t.cond = (int)c;
+		}
 		*iff = 0;
 	}
 	int k = sscanf(line, "%255s %255s %255s %255s %255s %255s %255s", w[0], w[1], w[2], w[3], w[4], w[5], w[6]);
@@ -469,7 +679,11 @@ static int parse_trigger(char *line, int ln)
 	t.m2 = (uint16_t)a;
 	if (!strcmp(w[3], "ind")) {
 		t.kind = TRG_IND;
-		if (k >= 6) {
+		if (k >= 6 && strchr(w[5], '{')) {
+			t.tmpl = parse_tmpl(w[5]);	/* n12b */
+			if (!t.tmpl)
+				goto bad;
+		} else if (k >= 6) {
 			t.data = parse_hex(w[5], &t.dlen);
 			if (!t.data || !tlvs_ok(t.data, t.dlen))
 				goto bad;
@@ -538,6 +752,7 @@ static void policy_load(int force)
 	ntrg = 0;
 	nstrip = 0;
 	pol_dlen = 0;
+	pol_tlen = 0;
 	while (fgets(line, sizeof(line), f) && n < NOVR) {
 		char a[64], b[64], c[8400];
 		ln++;
@@ -556,6 +771,7 @@ static void policy_load(int force)
 			continue;
 		struct pol p = { 0, POL_ANY, ACT_ERR, POL_ABPERR, "conf" };
 		const uint8_t *pdata = NULL;
+		const char *ptmpl = NULL;
 		uint16_t pdlen = 0;
 		if (parse_num(a, &p.svc) || p.svc < 1 || p.svc > 255 || (strcmp(b, "*") && parse_num(b, &p.msg))) {
 			printf("abp: %s line %d: bad svc/msg\n", ABP_POLICY, ln);
@@ -572,6 +788,8 @@ static void policy_load(int force)
 			p.act = ACT_ERR;
 		else if (!strcmp(c, "err"))
 			p.act = ACT_ERR;
+		else if (!strncmp(c, "resp:", 5) && strchr(c + 5, '{') && (ptmpl = parse_tmpl(c + 5)) != NULL)
+			p.act = ACT_RESP;	/* n12b: template */
 		else if (!strncmp(c, "resp:", 5) && (pdata = parse_hex(c + 5, &pdlen)) != NULL && tlvs_ok(pdata, pdlen))
 			p.act = ACT_RESP;
 		else {
@@ -581,6 +799,7 @@ static void policy_load(int force)
 		}
 		ovr_data[n].data = pdata;
 		ovr_data[n].dlen = pdlen;
+		ovr_data[n].tmpl = ptmpl;
 		ovr[n++] = p;
 	}
 	fclose(f);
@@ -592,6 +811,7 @@ static void policy_load(int force)
 
 static const uint8_t *dec_data;	/* ACT_RESP: the TLVs of the last decide() */
 static uint16_t dec_dlen;
+static const char *dec_tmpl;	/* n12b: ACT_RESP template */
 
 /* the action for (svc, msg); *err = the error code, *why = the reason (for the log) */
 static int decide(unsigned svc, unsigned msg, int *err, const char **why, char *whybuf, size_t wl)
@@ -614,11 +834,13 @@ static int decide(unsigned svc, unsigned msg, int *err, const char **why, char *
 			p = &abp_builtin[i];
 	dec_data = NULL;
 	dec_dlen = 0;
+	dec_tmpl = NULL;
 	if (p) {
 		a = p->act;
 		if (from_conf) {
 			dec_data = ovr_data[p - ovr].data;
 			dec_dlen = ovr_data[p - ovr].dlen;
+			dec_tmpl = ovr_data[p - ovr].tmpl;
 		}
 		if (p->err != POL_ABPERR)
 			*err = p->err;
@@ -1161,6 +1383,249 @@ static int tlv_byte(const uint8_t *p, uint32_t n, unsigned id)
 	return -1;
 }
 
+/*
+ * n12b: the SIM identity for {ICCID}/{IMSI} templates, read from the card through the modem as an Apple baseband does
+ * itself: CommCenter's own UIM Read Transparent answers (EF_ICCID 0x2fe2, EF_IMSI 0x6f07) are looked at on their way back,
+ * and while an indication waits for them (or after a UIM status change indication) the router reads both files itself
+ * (UIM 0x0020 from a CommCenter UIM client's port, read-only, every 5 s while needed). Indications that used them are
+ * remembered per CommCenter client and sent again when the identity changes (another SIM). Values are never logged.
+ */
+#define NSUB	8
+static struct sub {
+	int used, pending;
+	uint32_t pipe, sess;
+	uint8_t svc, cid;
+	uint16_t msg, m2;
+	uint8_t rqn, rq[96];
+	uint64_t t;
+} subs[NSUB];
+
+/* is client id cid of svc held by CommCenter session (pipe, sess)? (no session slot is taken) */
+static int cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid)
+{
+	for (unsigned i = 0; i < NSESS; i++)
+		if (st[i].sess && st[i].sess == sess && st[i].pipe == pipe)
+			return (st[i].cids[svc & 0xff][(cid & 0xff) / 8] >> (cid % 8)) & 1;
+	return 0;
+}
+
+static void sub_note(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, unsigned m2, const uint8_t *rq,
+		     uint32_t rqn, int pending)
+{
+	int k = -1;
+	for (int i = 0; i < NSUB; i++)
+		if (subs[i].used && subs[i].pipe == pipe && subs[i].sess == sess && subs[i].svc == svc && subs[i].cid == cid &&
+		    subs[i].msg == msg && subs[i].m2 == m2)
+			k = i;
+	for (int i = 0; i < NSUB && k < 0; i++)
+		if (!subs[i].used || !cid_live(subs[i].pipe, subs[i].sess, subs[i].svc, subs[i].cid))
+			k = i;
+	if (k < 0) {
+		k = 0;
+		for (int i = 1; i < NSUB; i++)
+			if (subs[i].t < subs[k].t)
+				k = i;
+	}
+	struct sub *s = &subs[k];
+	s->used = 1;
+	s->pending = pending;
+	s->pipe = pipe;
+	s->sess = sess;
+	s->svc = (uint8_t)svc;
+	s->cid = (uint8_t)cid;
+	s->msg = (uint16_t)msg;
+	s->m2 = (uint16_t)m2;
+	s->rqn = (uint8_t)(rqn < sizeof(s->rq) ? rqn : sizeof(s->rq));
+	if (rq && s->rqn)
+		memcpy(s->rq, rq, s->rqn);
+	s->t = link_ms();
+}
+
+/* an 'on .. ind' line's indication (data or template) to one client; 0 sent, 1 deferred (SIM identity unknown), -1 not sent */
+static int trg_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const struct trg *t, const uint8_t *rq,
+		   uint32_t rqn, const char *why)
+{
+	if (!t->tmpl) {
+		synth_inds++;
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
+		       svc_name(svc), svc, msg, t->m2, t->dlen, pipe_name[pipe], sess, cid);
+		send_ind(pipe, sess, svc, cid, t->m2, t->data, t->dlen);
+		return 0;
+	}
+	static uint8_t b[4096];
+	int miss = 0, n = tmpl_expand(t->tmpl, rq, rqn, 0, b, sizeof(b), &miss);
+	if (n < 0 || !tlvs_ok(b, (uint32_t)n)) {
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x not sent (%s)\n", (unsigned long long)link_ms(), svc_name(svc), svc,
+		       msg, t->m2, n == -2 ? "the request lacks a template field" : "template does not expand to whole TLVs");
+		return -1;
+	}
+	if (tmpl_sim(t->tmpl))
+		sub_note(pipe, sess, svc, cid, msg, t->m2, rq, rqn, miss);
+	if (miss) {
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x to %s/%u cid %u deferred: SIM identity not read yet (ICCID %s, IMSI %s)\n",
+		       (unsigned long long)link_ms(), svc_name(svc), svc, msg, t->m2, pipe_name[pipe], sess, cid, simid.have_iccid ? "known" : "unknown",
+		       simid.have_imsi ? "known" : "unknown");
+		return 1;
+	}
+	synth_inds++;
+	printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%d TLV bytes, template%s%s) to %s/%u cid %u\n", (unsigned long long)link_ms(),
+	       svc_name(svc), svc, msg, t->m2, n, tmpl_sim(t->tmpl) ? " with the SIM identity" : "", why, pipe_name[pipe], sess, cid);
+	send_ind(pipe, sess, svc, cid, t->m2, b, (uint32_t)n);
+	return 0;
+}
+
+/* the identity changed or became known: the remembered indications again */
+static void simid_changed(void)
+{
+	for (int i = 0; i < NSUB; i++) {
+		struct sub *s = &subs[i];
+		if (!s->used)
+			continue;
+		if (!cid_live(s->pipe, s->sess, s->svc, s->cid)) {
+			s->used = 0;
+			continue;
+		}
+		for (int k = 0; k < ntrg; k++)
+			if (trg[k].kind == TRG_IND && trg[k].svc == s->svc && trg[k].msg == s->msg && trg[k].m2 == s->m2 && trg[k].tmpl) {
+				trg_ind(s->pipe, s->sess, s->svc, s->cid, s->msg, &trg[k], s->rq, s->rqn, ", SIM identity changed");
+				break;
+			}
+	}
+}
+
+/* a successful UIM Read Transparent answer's TLVs (tl, tn) for EF file: the content (TLV 0x11 {u16 len, data}) */
+static void simid_from_read(unsigned file, const uint8_t *tl, uint32_t tn, const char *src)
+{
+	uint32_t l = 0;
+	const uint8_t *v = tlv_find(tl, tn, 0x11, &l);
+	if (!v || l < 2 || (uint32_t)(v[0] | (v[1] << 8)) + 2 > l)
+		return;
+	uint32_t cl = (uint32_t)(v[0] | (v[1] << 8));
+	const uint8_t *ef = v + 2;
+	uint8_t val[SIM_ICCID_LEN];
+	int ic;
+	if (file == 0x2fe2) {
+		/* EF_ICCID keeps each digit pair low nibble first: swapped into reading order (QcomBaseband cbd_iccid_from_ef) */
+		if (cl != SIM_ICCID_LEN)
+			return;
+		for (uint32_t i = 0; i < SIM_ICCID_LEN; i++)
+			val[i] = (uint8_t)(ef[i] << 4 | ef[i] >> 4);
+		ic = 1;
+	} else if (file == 0x6f07) {
+		/* EF_IMSI: length byte, digit 1 in the high nibble of the first byte (above the parity nibble), then pairs low
+		 * nibble first; repacked in reading order, F-padded (QcomBaseband cbd_imsi_from_ef) */
+		uint8_t dg[16];
+		uint32_t nd = 0;
+		if (cl < 2 || !ef[0] || ef[0] > 8 || cl < 1u + ef[0])
+			return;
+		for (uint32_t i = 1; i <= ef[0]; i++) {
+			uint8_t lo = ef[i] & 0xf, hi = ef[i] >> 4;
+			if (i > 1) {
+				if (lo > 9)
+					break;
+				dg[nd++] = lo;
+			}
+			if (hi > 9)
+				break;
+			dg[nd++] = hi;
+		}
+		if (nd < 6 || nd > 15)
+			return;
+		for (uint32_t i = 0; i < SIM_IMSI_LEN; i++) {
+			uint8_t a = 2 * i < nd ? dg[2 * i] : 0xf, b = 2 * i + 1 < nd ? dg[2 * i + 1] : 0xf;
+			val[i] = (uint8_t)(a << 4 | b);
+		}
+		ic = 0;
+	} else {
+		return;
+	}
+	uint8_t *have = ic ? simid.iccid : simid.imsi;
+	int *known = ic ? &simid.have_iccid : &simid.have_imsi;
+	uint32_t len = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
+	int changed = !*known || memcmp(have, val, len);
+	if (changed) {
+		printf("[%6llu] abp: SIM identity: %s %u bytes %s (from %s)\n", (unsigned long long)link_ms(), ic ? "ICCID" : "IMSI", len,
+		       *known ? "CHANGED" : "read", src);
+		memcpy(have, val, len);
+		*known = 1;
+		simid.gen++;
+	}
+	if (simid.have_iccid && simid.have_imsi) {
+		simid.refresh = 0;
+		simid.tries = 0;
+	}
+	if (changed)
+		simid_changed();
+}
+
+/* the router's own read of EF file from CommCenter UIM client c's port */
+static void simid_read(struct cl *c, int si, unsigned file)
+{
+	static const uint8_t iccid[20] = { 0x01, 2, 0, 0x06, 0x00, 0x02, 5, 0, 0xe2, 0x2f, 2, 0x00, 0x3f, 0x03, 4, 0, 0, 0, 0, 0 };
+	static const uint8_t imsi[22] = { 0x01, 2, 0, 0x00, 0x00, 0x02, 7, 0, 0x07, 0x6f, 4, 0x00, 0x3f, 0xff, 0x7f, 0x03, 4, 0, 0, 0, 0, 0 };
+	const uint8_t *tl = file == 0x2fe2 ? iccid : imsi;
+	uint32_t tn = file == 0x2fe2 ? sizeof(iccid) : sizeof(imsi);
+	uint8_t q[7 + 22];
+	if (++replay_txn == 0xffff)
+		replay_txn = 0xff00;
+	q[0] = 0x00;
+	q[1] = (uint8_t)replay_txn;
+	q[2] = (uint8_t)(replay_txn >> 8);
+	q[3] = 0x20;
+	q[4] = 0x00;
+	q[5] = (uint8_t)tn;
+	q[6] = 0;
+	memcpy(q + 7, tl, tn);
+	if (qrtr_send(QRTR_TYPE_DATA, c->port, srv[si].node, srv[si].port, q, 7 + tn)) {
+		cnt.sendfail++;
+		return;
+	}
+	struct pend x;
+	memset(&x, 0, sizeof(x));
+	x.port = c->port;
+	x.txn = replay_txn;
+	x.msg = 0x20;
+	x.svc = 0x0b;
+	x.simread = 1;
+	x.file = (uint16_t)file;
+	pend_add(&x);
+	simid.reads++;
+}
+
+static void simid_poll(uint64_t now)
+{
+	int need = simid.refresh;
+	for (int i = 0; i < NSUB && !need; i++)
+		if (subs[i].used && subs[i].pending && cid_live(subs[i].pipe, subs[i].sess, subs[i].svc, subs[i].cid))
+			need = 1;
+	if (!need || now < simid.next)
+		return;
+	simid.next = now + 5000;
+	if (simid.refresh && ++simid.tries > 3) {
+		simid.refresh = 0;
+		simid.tries = 0;
+		if (simid.have_iccid && simid.have_imsi)
+			return;
+	}
+	int si = srv_find(0x0b), code;
+	const char *why;
+	char wb[128];
+	if (si < 0 || decide(0x0b, 0x0020, &code, &why, wb, sizeof(wb)) != ACT_FWD)
+		return;
+	struct cl *c = NULL;
+	for (int i = 0; i < NCL && !c; i++)
+		if (cl[i].used == 1 && cl[i].svc == 0x0b)
+			c = &cl[i];
+	for (int i = 0; i < NCL && !c; i++)
+		if (cl[i].used == 2 && cl[i].svc == 0x0b)
+			c = &cl[i];
+	if (!c)
+		return;
+	printf("[%6llu] abp: SIM identity: reading EF_ICCID and EF_IMSI (UIM 0x0020 from port %#x)\n", (unsigned long long)now, c->port);
+	simid_read(c, si, 0x2fe2);
+	simid_read(c, si, 0x6f07);
+}
+
 static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *rq, uint32_t rqn)
 {
 	for (int i = 0; i < ntrg; i++) {
@@ -1169,11 +1634,13 @@ static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
 			continue;
 		if (t->cond >= 0 && tlv_byte(rq, rqn, (unsigned)t->cond) <= 0)
 			continue;	/* P2 reg: this request did not enable that indication */
+		if (t->ceq) {		/* n12b: "if RQ..=RQ.." */
+			uint32_t a, b;
+			if (fref_num(&t->fa, rq, rqn, &a) || fref_num(&t->fb, rq, rqn, &b) || a != b)
+				continue;
+		}
 		if (t->kind == TRG_IND) {
-			synth_inds++;
-			printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
-			       svc_name(svc), svc, msg, t->m2, t->dlen, pipe_name[pipe], sess, cid);
-			send_ind(pipe, sess, svc, cid, t->m2, t->data, t->dlen);
+			trg_ind(pipe, sess, svc, cid, msg, t, rq, rqn, "");
 			continue;
 		}
 		/* replay: only a GET the policy itself would forward (protected / Apple / data messages never go out this way) */
@@ -1322,6 +1789,20 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8)));
 		break;
 	case ACT_RESP:
+		if (dec_tmpl) {		/* n12b: template, expanded with this request's TLVs */
+			static uint8_t tb[4096];
+			uint32_t rl = sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8));
+			int miss = 0, tn = tmpl_expand(dec_tmpl, s + 7, rl, 0, tb, sizeof(tb), &miss);
+			if (tn < 0 || !tlvs_ok(tb, (uint32_t)tn)) {
+				cnt.local_err++;
+				svc_local(pipe, svc, cid, s, 1, 0x11 /* QMI_ERR_MISSING_ARG */);
+				break;
+			}
+			cnt.local_ok++;
+			svc_local_tlv(pipe, svc, cid, s, 0, 0, tb, (uint16_t)tn);
+			run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
+			break;
+		}
 		cnt.local_ok++;
 		svc_local_tlv(pipe, svc, cid, s, 0, 0, dec_data, dec_dlen);
 		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8)));
@@ -1381,9 +1862,22 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
 		for (int i = 0; i < NPEND; i++) {
 			struct pend *x = &pend[i];
-			if (!x->used || !x->replay || x->port != h->dst_port || x->txn != txn)
+			if (!x->used || !(x->replay || x->simread) || x->port != h->dst_port || x->txn != txn)
 				continue;
 			x->used = 0;
+			if (x->simread) {	/* n12b: the router's own EF read */
+				uint32_t sl = (uint32_t)(d[5] | (d[6] << 8)), rl2 = 0;
+				if (sl > n - 7 || !tlvs_ok(d + 7, sl))
+					return;
+				const uint8_t *r2 = tlv_find(d + 7, sl, 0x02, &rl2);
+				if (!r2 || rl2 < 4 || r2[0] | r2[1]) {
+					printf("[%6llu] abp: SIM identity: EF %04x read failed (error 0x%x)\n", (unsigned long long)link_ms(), x->file,
+					       r2 && rl2 >= 4 ? (unsigned)(r2[2] | (r2[3] << 8)) : 0xffffu);
+					return;
+				}
+				simid_from_read(x->file, d + 7, sl, "the router's read");
+				return;
+			}
 			uint32_t ml = (uint32_t)(d[5] | (d[6] << 8));
 			if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
 				malformed++;
@@ -1492,6 +1986,18 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 				printf(" (%u bytes)\n", n);
 			}
 		}
+	}
+	/* n12b: CommCenter's own EF_ICCID / EF_IMSI reads give the SIM identity; a UIM status change asks for a fresh read */
+	if (d[0] == 0x02 && res == 0 && c->svc == 0x0b && rmsg == 0x0020 && rqn) {
+		uint32_t fl = 0;
+		const uint8_t *fv = tlv_find(rq, rqn, 0x02, &fl);
+		if (fv && fl >= 3)
+			simid_from_read((unsigned)(fv[0] | (fv[1] << 8)), d + 7, ml, "CommCenter's read");
+	}
+	if (d[0] == 0x04 && c->svc == 0x0b && rmsg == 0x0032 && !simid.refresh) {
+		simid.refresh = 1;
+		simid.tries = 0;
+		simid.next = link_ms() + 2000;
 	}
 	uint32_t len = 7 + ml;
 	static uint8_t b[6 + ABP_MAXFRAME];
@@ -1708,6 +2214,8 @@ void abpbridge_poll(void)
 				}
 			}
 	}
+	if (mode >= 2)
+		simid_poll(now);	/* n12b */
 	if (dumpword && dumpword != dumpword_old)
 		mst_table("abpdump");
 	dumpword_old = dumpword;
