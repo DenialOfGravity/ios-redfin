@@ -1,8 +1,20 @@
 diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
-index 441cca0..9aef53b 100644
+index 441cca0..3fcfe1d 100644
 --- a/bsd/dev/sweet_bb.c
 +++ b/bsd/dev/sweet_bb.c
-@@ -1068,6 +1068,10 @@ sbb_thread(__unused void *param, __unused wait_result_t wr)
+@@ -687,6 +687,11 @@ rx_one(void)
+ 		break;
+ 	case GLINK_CMD_OPEN: {
+ 		uint32_t nl = (p2 + 7) & ~7u;
++		if (p2 > 256) {                 /* (no channel name is that long: a broken FIFO, not something to wait for) */
++			gl.unknown_cmds++;
++			adv = avail;
++			break;
++		}
+ 		if (avail < 8 + nl) {
+ 			return 0;
+ 		}
+@@ -1068,6 +1073,10 @@ sbb_thread(__unused void *param, __unused wait_result_t wr)
  			unsigned k = 0;
  			while (k++ < 512 && (p = q_pop(&q_router)) != NULL) {
  				if (p->h.type == SBB_QRTR_DATA) {
@@ -13,7 +25,7 @@ index 441cca0..9aef53b 100644
  					sweet_qmux_qrtr(&p->h, p->d, p->n);
  				} else {
  					uint32_t w[5] = { 0, 0, 0, 0, 0 };
-@@ -1179,7 +1183,7 @@ mq_read(__unused dev_t d, struct uio *uio, int ioflag)
+@@ -1179,7 +1188,7 @@ mq_read(__unused dev_t d, struct uio *uio, int ioflag)
  static int
  mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
  {
