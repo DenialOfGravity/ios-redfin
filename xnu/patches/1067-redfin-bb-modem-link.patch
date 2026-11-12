@@ -1,0 +1,1609 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f61fab6..b1b91b7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -135,6 +135,8 @@ bsd/dev/sweet_geniuart.c		standard
+ bsd/dev/sweet_btbridge.c		standard
+ bsd/dev/sweet_abp.c			standard
+ bsd/dev/sweet_voice.c			standard
++bsd/dev/sweet_bb.c			standard
++bsd/dev/sweet_qmux.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_abp.c b/bsd/dev/sweet_abp.c
+index e5d0b23..692d33b 100644
+--- a/bsd/dev/sweet_abp.c
++++ b/bsd/dev/sweet_abp.c
+@@ -62,8 +62,10 @@
+ #include <mach/vm_attributes.h>
+ #include <vm/vm_map.h>
+ #include <libkern/libkern.h>
++#include "sweet_bb.h"
+ 
+ void sweet_abp_init(void);
++void sweet_bb_init(void);       /* 1067: sweet_bb.c */
+ void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
+ void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
+ 
+@@ -170,6 +172,10 @@ sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uin
+ 	if (len > ABPB_MAXFRAME) {
+ 		return;
+ 	}
++	if (sweet_bb & SBB_QMUX) {      /* 1068: the kernel router answers (sweet_qmux.c), not wland */
++		sweet_qmux_c2w(pipe, sess, type, data, len);
++		return;
++	}
+ 	lck_mtx_lock(&abp_lock);
+ 	if (ABPB_RING - ab_used() < sizeof(h) + len) {
+ 		if (ab.dropped++ < 20) {
+@@ -194,6 +200,10 @@ sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uin
+ static int
+ ab_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+ {
++	if (sweet_bb & SBB_QMUX) {
++		printf("SWEET ABP: /dev/abpbridge refused: the kernel router owns qmux1/qmux2 (sweetbb & 2)\n");
++		return EBUSY;
++	}
+ 	lck_mtx_lock(&abp_lock);
+ 	if (ab.open) {
+ 		lck_mtx_unlock(&abp_lock);
+@@ -223,34 +233,36 @@ ab_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused
+ 	return 0;
+ }
+ 
+-/* 1063: wland says it can (1) or cannot (0) answer for the modem now. */
+-static int
+-ab_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
++/* 1063: the bridge (wland, or 1068's kernel router) says it can (1) or cannot (0) answer for the modem now. */
++void
++sweet_abp_set_ready(bool v, const char *why)
+ {
+-	if (cmd != ABPB_IOC_READY) {
+-		return ENOTTY;
+-	}
+-	uint32_t v = *(uint32_t *)(void *)data;
+ 	bool was;
+ 	lck_mtx_lock(&abp_lock);
+ 	was = ab.ready;
+-	ab.ready = v != 0;
++	ab.ready = v;
+ 	if (ab.ready && !was) {
+ 		ab.readies++;
+ 	}
+ 	lck_mtx_unlock(&abp_lock);
+-	printf("SWEET ABP: wland says %s (was %s)\n", v ? "READY" : "not ready", was ? "ready" : "not ready");
++	printf("SWEET ABP: %s says %s (was %s)\n", why, v ? "READY" : "not ready", was ? "ready" : "not ready");
+ 	if (!(sweet_abp_flags & ABP_BIT_DEFER)) {
+-		return 0;               /* published at boot already: nothing to do */
++		return;                 /* published at boot already: nothing to do */
+ 	}
+ 	if (v) {
+-		int e = SweetABPPublish(true, "wland ready");
+-		return e == EALREADY ? 0 : e;
++		SweetABPPublish(true, why);
++	} else if (sweet_abp_flags & ABP_BIT_UNPUB_ON_CLOSE) {
++		SweetABPPublish(false, "not ready, sweetabp & 0x20");
+ 	}
+-	if (sweet_abp_flags & ABP_BIT_UNPUB_ON_CLOSE) {
+-		int e = SweetABPPublish(false, "wland not ready, sweetabp & 0x20");
+-		return e == EALREADY ? 0 : e;
++}
++
++static int
++ab_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
++{
++	if (cmd != ABPB_IOC_READY) {
++		return ENOTTY;
+ 	}
++	sweet_abp_set_ready(*(uint32_t *)(void *)data != 0, "wland");
+ 	return 0;
+ }
+ 
+@@ -407,6 +419,7 @@ void
+ sweet_abp_init(void)
+ {
+ 	uint32_t on = 0, fake = 0;
++	sweet_bb_init();        /* 1067: boot-arg sweetbb (kernel modem link / QMI router), before the bridge is made */
+ 	PE_parse_boot_argn("sweetabp", &on, sizeof(on));
+ 	PE_parse_boot_argn("sweetabmfake", &fake, sizeof(fake));
+ 	PE_parse_boot_argn("sweetabpstage", &sweet_abp_bootstage, sizeof(sweet_abp_bootstage));
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 004615f..5fb6f02 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -162,7 +162,7 @@ extern kern_return_t thread_terminate(thread_t thread);
+ static LCK_GRP_DECLARE(adsp_lock_group, "redwood-adsp");
+ /* (redwood_wifi.c's locks; on redfin the modem's Wi-Fi runs in userland, phone/wifi, which opens the AOP mailbox once at its start) */
+ static LCK_MTX_DECLARE(redwood_aop_mailbox_lock, &adsp_lock_group);
+-static LCK_MTX_DECLARE(redwood_smem_alloc_lock, &adsp_lock_group);
++LCK_MTX_DECLARE(redwood_smem_alloc_lock, &adsp_lock_group);   /* (1067: sweet_bb.c allocates under it too) */
+ 
+ #define STEPS                   11
+ 
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+new file mode 100644
+index 0000000..441cca0
+--- /dev/null
++++ b/bsd/dev/sweet_bb.c
+@@ -0,0 +1,1364 @@
++/*
++ * redfin 1067 (P4 phase 1, research/cc/P4-design.md s.2/s.7): the kernel owns the GLINK edge to the modem (MPSS) and QRTR
++ * node 1 on it, instead of wland's userland link (phone/wifi/glink.c + link.c, polled through /dev/pmem).
++ *
++ * Boot-arg sweetbb (bitmask, RO mirror kern.sweet_bb; default 0 = nothing here runs, wland keeps its own link):
++ *   0x01  kernel link: SMEM items 478/479/480 with the modem, the IPCRTR channel, QRTR node 1, and /dev/sweet-mqrtr for
++ *         wland (raw QRTR packets: wland keeps its own ports, servers and clients: WLFW, cell.c, rmtfs/tftp/pd-mapper, ipaqmi,
++ *         ssctl). wland still boots the modem (PAS) and then says MQRTR_IOC_UP; the link is (re)made at each UP.
++ *   0x02  kernel QMI router (sweet_qmux.c) behind the AppleBasebandPCI stand-in's qmux1/qmux2 (needs sweetabp & 1);
++ *         implies 0x01. /dev/abpbridge refuses to open (wland's abpbridge stays off).
++ *   0x04.. later phases (bb_ctl, rfs, data plane): accepted and ignored here.
++ *
++ * /dev/sweet-mqrtr (root 0600, one opener):
++ *   ioctl MQRTR_IOC_UP (u32 timeout ms): (re)make the link after the modem was (re)started: our FIFO ends start over,
++ *         GLINK VERSION, wait for the modem's IPCRTR open (as wland's link_up). 0 or ETIMEDOUT / ENXIO.
++ *   read()  one packet: struct sbb_qrtr_hdr (32 bytes, as on the wire) + payload (hdr.size bytes). Everything from the
++ *         modem that is not for the kernel: DATA to wland's ports, the modem's control packets (NEW/DEL_SERVER, BYE,
++ *         DEL_CLIENT, RESUME_TX, ...); HELLO is answered here and not passed on. At open, the servers already known are
++ *         given again as NEW_SERVER packets. Blocks unless O_NONBLOCK; select() works. 8192 packets / 4 MiB wait at most,
++ *         more are dropped and counted.
++ *   write() one packet the same way: header (type, src_port, dst_node, dst_port, size; src_node and version are set here)
++ *         + payload. With 0x02, wland may not use the router's ports (0x4000..0x43ff): EPERM.
++ * The link is polled by one kernel thread "sweetbb" (1 ms while there was traffic in the last 2 s, else
++ * kern.sweet_mlink_idle_us, default 4000), as wland's link_poll did; IPCC interrupt: not used yet (phase 1 = poll).
++ * sysctls: RO kern.sweet_bb, RO kern.sweet_bb_state (link + servers + queues), RW kern.sweet_mlink_idle_us,
++ *   RW kern.sweet_mdm_up (reads the link state 0 down / 1 version done / 2 IPCRTR open; write 1 = make the link again).
++ * Log lines "SWEET BB:". Nothing here returns to fastboot, ever.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/select.h>
++#include <sys/ioccom.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include "sweet_bb.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern lck_mtx_t redwood_smem_alloc_lock;      /* sweet_adsp.c: our side's SMEM allocations, under the TCSR mutex too */
++
++void sweet_bb_init(void);
++
++#define SAY(...)                printf("SWEET BB: " __VA_ARGS__)
++
++uint32_t sweet_bb;
++
++static LCK_GRP_DECLARE(sbb_grp, "sweet-bb");
++static LCK_MTX_DECLARE(ml_lock, &sbb_grp);      /* the GLINK FIFOs, intents, channel state */
++static LCK_MTX_DECLARE(q_lock, &sbb_grp);       /* the packet queues (taken inside ml_lock, never the other way) */
++static LCK_MTX_DECLARE(wait_lock, &sbb_grp);    /* the thread's sleep */
++
++/* ---- time ---- */
++
++uint64_t
++sbb_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++/* ---- registers: SMEM (carve-out, device mapping: 32-bit accesses only), TCSR mutex, IPCC ---- */
++
++#define SMEM_PHYS               0x80900000UL    /* lito smem_mem (wland smem.h) */
++#define SMEM_SIZE               0x00200000u
++#define SMEM_HOST_APPS          0u
++#define SMEM_HOST_MODEM         1u
++#define SMEM_HOST_GLOBAL        0xfffeu
++#define SMEM_CANARY             0xa5a5u
++#define TCSR_MUTEX3_PHYS        0x01f43000UL    /* TCSR hardware mutex 3 (SMEM), as Linux and wland smem.c */
++#define APPS_PROC_ID            1u
++#define IPCC_PHYS               0x00408000UL
++#define IPCC_SEND_ID            0x0c
++#define DB_MODEM_GLINK          ((2u << 16) | 0u)       /* client MPSS 2, signal GLINK_QMP 0 (wland ipcc.h) */
++#define ITEM_GLINK_DESC         478u
++#define ITEM_GLINK_TX           479u            /* ours: apps -> modem */
++#define ITEM_GLINK_RX           480u            /* the modem's */
++#define GLINK_TX_FIFO_SIZE      16384u
++
++static vm_offset_t smem_va, tcsr_va, ipcc_va;
++
++static inline uint32_t
++rd32(vm_offset_t va)
++{
++	return *(volatile uint32_t *)va;
++}
++
++static inline void
++wr32(vm_offset_t va, uint32_t v)
++{
++	*(volatile uint32_t *)va = v;
++}
++
++static inline uint16_t
++rd16(vm_offset_t va)
++{
++	uint32_t w = rd32(va & ~(vm_offset_t)3);
++	return (uint16_t)(w >> (8 * (va & 2)));
++}
++
++static inline void
++settle(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++regs_map(void)
++{
++	if (smem_va == 0) {
++		smem_va = ml_io_map(SMEM_PHYS, SMEM_SIZE);
++	}
++	if (tcsr_va == 0) {
++		tcsr_va = ml_io_map(TCSR_MUTEX3_PHYS, 0x1000);
++	}
++	if (ipcc_va == 0) {
++		ipcc_va = ml_io_map(IPCC_PHYS, 0x1000);
++	}
++	return smem_va && tcsr_va && ipcc_va;
++}
++
++static void
++ring_modem(void)
++{
++	wr32(ipcc_va + IPCC_SEND_ID, DB_MODEM_GLINK);
++}
++
++/* ---- SMEM (port of wland smem.c: partitions the apps CPU is part of, or the global one, only) ---- */
++
++#define PTABLE_OFF              (SMEM_SIZE - 0x1000u)
++
++struct sbb_part {
++	vm_offset_t va;
++	uint32_t size, cacheline;
++	uint16_t host0, host1;
++};
++
++static int
++smem_part(unsigned host, struct sbb_part *out)
++{
++	vm_offset_t pt = smem_va + PTABLE_OFF;
++	if (rd32(pt) != 0x434f5424u) {          /* "$TOC" */
++		return -1;
++	}
++	uint32_t n = rd32(pt + 8);
++	for (uint32_t i = 0; i < n && i < 32; i++) {
++		vm_offset_t e = pt + 32 + 48 * (vm_offset_t)i;
++		uint32_t off = rd32(e), size = rd32(e + 4), hosts = rd32(e + 12);
++		uint16_t h0 = (uint16_t)hosts, h1 = (uint16_t)(hosts >> 16);
++		if (!off || !size || off >= SMEM_SIZE || size > SMEM_SIZE - off) {
++			continue;
++		}
++		bool global = h0 == SMEM_HOST_GLOBAL && h1 == SMEM_HOST_GLOBAL;
++		bool ours = (h0 == SMEM_HOST_APPS && h1 == host) || (h1 == SMEM_HOST_APPS && h0 == host);
++		if ((host == SMEM_HOST_GLOBAL && global) || (host != SMEM_HOST_GLOBAL && ours)) {
++			out->va = smem_va + off;
++			out->size = size;
++			out->cacheline = rd32(e + 16);
++			out->host0 = h0;
++			out->host1 = h1;
++			return rd32(out->va) == 0x54525024u ? 0 : -1;   /* "$PRT" */
++		}
++	}
++	return -1;
++}
++
++static int
++part_get(const struct sbb_part *p, unsigned item, vm_offset_t *va, uint32_t *size)
++{
++	uint32_t free_unc = rd32(p->va + 12), free_cac = rd32(p->va + 16);
++	if (free_unc > p->size || free_cac > p->size) {
++		return -2;
++	}
++	for (vm_offset_t e = p->va + 32; e < p->va + free_unc;) {
++		if (rd16(e) != SMEM_CANARY) {
++			return -2;
++		}
++		uint16_t it = rd16(e + 2);
++		uint32_t sz = rd32(e + 4);
++		uint16_t pad_data = rd16(e + 8), pad_hdr = rd16(e + 10);
++		if (sz > p->size) {
++			return -2;
++		}
++		if (it == item) {
++			*va = e + 16 + pad_hdr;
++			*size = sz - pad_data;
++			return 0;
++		}
++		e += 16 + pad_hdr + sz;
++	}
++	uint32_t cl = p->cacheline ? p->cacheline : 64;
++	uint32_t hdr = (16 + cl - 1) & ~(cl - 1);
++	for (vm_offset_t e = p->va + p->size - hdr; e > p->va + free_cac;) {
++		if (rd16(e) != SMEM_CANARY) {
++			return -2;
++		}
++		uint16_t it = rd16(e + 2);
++		uint32_t sz = rd32(e + 4);
++		if (sz > p->size) {
++			return -2;
++		}
++		if (it == item) {
++			*va = e - sz;
++			*size = sz - rd16(e + 8);
++			return 0;
++		}
++		e -= sz + hdr;
++	}
++	return -1;
++}
++
++static int
++smem_get(unsigned item, vm_offset_t *va, uint32_t *size)
++{
++	struct sbb_part p;
++	if (smem_part(SMEM_HOST_MODEM, &p) == 0 && part_get(&p, item, va, size) == 0) {
++		return 0;
++	}
++	if (smem_part(SMEM_HOST_GLOBAL, &p) == 0 && part_get(&p, item, va, size) == 0) {
++		return 0;
++	}
++	return -1;
++}
++
++static int
++smem_alloc(unsigned item, uint32_t size, vm_offset_t *va)
++{
++	uint32_t got;
++	struct sbb_part p;
++	int r = -1;
++	if (smem_get(item, va, &got) == 0) {
++		return 0;
++	}
++	if (smem_part(SMEM_HOST_MODEM, &p) != 0) {
++		return -1;
++	}
++	lck_mtx_lock(&redwood_smem_alloc_lock);
++	bool locked = false;
++	for (int i = 0; i < 100000 && !locked; i++) {
++		wr32(tcsr_va, APPS_PROC_ID);
++		locked = rd32(tcsr_va) == APPS_PROC_ID;
++	}
++	if (locked) {
++		uint32_t free_unc = rd32(p.va + 12), free_cac = rd32(p.va + 16);
++		uint32_t asize = (size + 7) & ~7u;
++		if (free_unc + 16 + asize <= free_cac && free_cac <= p.size) {
++			vm_offset_t e = p.va + free_unc;
++			wr32(e, SMEM_CANARY | ((uint32_t)item << 16));
++			wr32(e + 4, asize);
++			wr32(e + 8, asize - size);              /* padding_data, padding_hdr 0 */
++			wr32(e + 12, 0);
++			for (uint32_t o = 0; o < asize; o += 4) {
++				wr32(e + 16 + o, 0);
++			}
++			settle();
++			wr32(p.va + 12, free_unc + 16 + asize);
++			settle();
++			*va = e + 16;
++			r = 0;
++		}
++		wr32(tcsr_va, 0);
++	}
++	lck_mtx_unlock(&redwood_smem_alloc_lock);
++	return r;
++}
++
++/* ---- GLINK (port of wland glink.c + link.c: one channel, IPCRTR) ---- */
++
++#define GLINK_CMD_VERSION       0
++#define GLINK_CMD_VERSION_ACK   1
++#define GLINK_CMD_OPEN          2
++#define GLINK_CMD_CLOSE         3
++#define GLINK_CMD_OPEN_ACK      4
++#define GLINK_CMD_INTENT        5
++#define GLINK_CMD_RX_DONE       6
++#define GLINK_CMD_RX_INTENT_REQ 7
++#define GLINK_CMD_RX_INTENT_REQ_ACK 8
++#define GLINK_CMD_TX_DATA       9
++#define GLINK_CMD_CLOSE_ACK     11
++#define GLINK_CMD_TX_DATA_CONT  12
++#define GLINK_CMD_READ_NOTIF    13
++#define GLINK_CMD_RX_DONE_W_REUSE 14
++#define GLINK_CMD_SIGNALS       15
++#define LCID                    1u
++#define N_INTENTS               8u
++#define INTENT_SIZE             4096u
++#define FEAT_INTENT_REUSE       1u
++#define MAX_RINTENTS            256
++#define RXBUF_SIZE              65536u
++
++static struct {
++	vm_offset_t desc, tx, rx;
++	uint32_t tx_len, rx_len;
++	uint32_t rcid;
++	int state;                      /* 0 down, 1 version done, 2 IPCRTR open both ways */
++	bool open_tx, open_acked, opened_by_remote, version_done, intent_req_acked, hello_due;
++	struct { uint32_t size, iid; bool busy; } ri[MAX_RINTENTS];
++	int nri;
++	uint32_t next_iid;
++	uint8_t *rxbuf;
++	uint32_t rxoff;
++	uint32_t ups, reinits;
++	uint64_t last_traffic;
++	/* counters */
++	uint64_t rx_pkts, tx_pkts, rx_bytes, tx_bytes;
++	uint32_t intent_reqs, tx_fail, unknown_cmds, rx_other_ch, too_big;
++} gl;
++
++#define DESC_TX_TAIL            0
++#define DESC_TX_HEAD            4
++#define DESC_RX_TAIL            8
++#define DESC_RX_HEAD            12
++
++/* one command (8-byte header + a + b, padded to 8) into the TX FIFO and ring; -1 when it does not fit now */
++static int
++glink_cmd2(uint16_t cmd, uint16_t p1, uint32_t p2, const void *a, uint32_t alen, const void *b, uint32_t blen)
++{
++	uint8_t h[8];
++	uint32_t n = 8 + alen + blen, padded = (n + 7) & ~7u;
++	uint32_t head = rd32(gl.desc + DESC_TX_HEAD), tail = rd32(gl.desc + DESC_TX_TAIL);
++	if (head >= gl.tx_len || tail >= gl.tx_len || (head & 3)) {
++		return -1;
++	}
++	uint32_t avail = tail <= head ? gl.tx_len - head + tail : tail - head;
++	if (avail < padded + 16) {
++		return -1;
++	}
++	memcpy(h, &cmd, 2);
++	memcpy(h + 2, &p1, 2);
++	memcpy(h + 4, &p2, 4);
++	const uint8_t *da = a, *db = b;
++	for (uint32_t i = 0; i < padded; i += 4) {
++		uint8_t w4[4] = { 0, 0, 0, 0 };
++		for (uint32_t k = 0; k < 4; k++) {
++			uint32_t at = i + k;
++			if (at < 8) {
++				w4[k] = h[at];
++			} else if (at - 8 < alen) {
++				w4[k] = da[at - 8];
++			} else if (at - 8 - alen < blen) {
++				w4[k] = db[at - 8 - alen];
++			}
++		}
++		uint32_t w;
++		memcpy(&w, w4, 4);
++		wr32(gl.tx + head, w);
++		head += 4;
++		if (head >= gl.tx_len) {
++			head -= gl.tx_len;
++		}
++	}
++	settle();
++	wr32(gl.desc + DESC_TX_HEAD, head);
++	ring_modem();
++	return 0;
++}
++
++static int
++glink_cmd(uint16_t cmd, uint16_t p1, uint32_t p2, const void *data, uint32_t len)
++{
++	return glink_cmd2(cmd, p1, p2, data, len, NULL, 0);
++}
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t head = rd32(gl.desc + DESC_RX_HEAD), tail = rd32(gl.desc + DESC_RX_TAIL);
++	if (head >= gl.rx_len || tail >= gl.rx_len) {
++		return 0;
++	}
++	return head < tail ? gl.rx_len - tail + head : head - tail;
++}
++
++static void
++rx_peek(void *buf, uint32_t off, uint32_t len)
++{
++	uint32_t t = rd32(gl.desc + DESC_RX_TAIL) + off;
++	uint8_t *b = buf;
++	uint32_t w = 0, wat = ~0u;
++	while (t >= gl.rx_len) {
++		t -= gl.rx_len;
++	}
++	for (uint32_t i = 0; i < len; i++) {
++		if ((t & ~3u) != wat) {
++			wat = t & ~3u;
++			w = rd32(gl.rx + wat);
++		}
++		b[i] = (uint8_t)(w >> (8 * (t & 3)));
++		if (++t >= gl.rx_len) {
++			t = 0;
++		}
++	}
++}
++
++static void
++rx_advance(uint32_t len)
++{
++	uint32_t t = rd32(gl.desc + DESC_RX_TAIL) + len;
++	while (t >= gl.rx_len) {
++		t -= gl.rx_len;
++	}
++	wr32(gl.desc + DESC_RX_TAIL, t);
++}
++
++/* ---- packet queues: to the router (kernel thread) and to wland (/dev/sweet-mqrtr) ---- */
++
++struct sbb_pkt {
++	struct sbb_pkt *next;
++	struct sbb_qrtr_hdr h;
++	uint32_t n;
++	uint8_t d[];
++};
++struct sbb_q {
++	struct sbb_pkt *first, *last;
++	uint32_t count, bytes, max_count, max_bytes;
++	uint64_t in, dropped;
++};
++static struct sbb_q q_router = { .max_count = 8192, .max_bytes = 4u << 20 };
++static struct sbb_q q_wland = { .max_count = 8192, .max_bytes = 4u << 20 };
++static struct {
++	bool open;
++	pid_t pid;
++	struct selinfo sel;
++	uint64_t writes, write_bytes, reads;
++	uint32_t refused;
++} dev;
++
++static void
++pkt_free(struct sbb_pkt *p)
++{
++	kfree_data(p, sizeof(*p) + p->n);
++}
++
++/* q_lock held */
++static bool
++q_put_locked(struct sbb_q *q, const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	if (q->count >= q->max_count || q->bytes + n > q->max_bytes) {
++		q->dropped++;
++		return false;
++	}
++	struct sbb_pkt *p = kalloc_data(sizeof(*p) + n, Z_WAITOK);
++	if (p == NULL) {
++		q->dropped++;
++		return false;
++	}
++	p->next = NULL;
++	p->h = *h;
++	p->n = n;
++	if (n) {
++		memcpy(p->d, d, n);
++	}
++	if (q->last) {
++		q->last->next = p;
++	} else {
++		q->first = p;
++	}
++	q->last = p;
++	q->count++;
++	q->bytes += n;
++	q->in++;
++	return true;
++}
++
++static struct sbb_pkt *
++q_pop(struct sbb_q *q)
++{
++	lck_mtx_lock(&q_lock);
++	struct sbb_pkt *p = q->first;
++	if (p) {
++		q->first = p->next;
++		if (!q->first) {
++			q->last = NULL;
++		}
++		q->count--;
++		q->bytes -= p->n;
++	}
++	lck_mtx_unlock(&q_lock);
++	return p;
++}
++
++static void
++q_clear(struct sbb_q *q)
++{
++	struct sbb_pkt *p;
++	while ((p = q_pop(q)) != NULL) {
++		pkt_free(p);
++	}
++}
++
++static void
++to_wland(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	lck_mtx_lock(&q_lock);
++	bool ok = dev.open && q_put_locked(&q_wland, h, d, n);
++	if (!dev.open) {
++		q_wland.dropped++;
++	}
++	if (ok) {
++		wakeup(&q_wland);
++		selwakeup(&dev.sel);
++	}
++	lck_mtx_unlock(&q_lock);
++	if (!ok && dev.open && (q_wland.dropped < 10 || q_wland.dropped % 1000 == 0)) {
++		SAY("wland's queue full (%u packets, %u bytes): packet type %u to port %#x dropped (%llu dropped)\n", q_wland.count,
++		    q_wland.bytes, h->type, h->dst_port, q_wland.dropped);
++	}
++}
++
++static void
++to_router(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	lck_mtx_lock(&q_lock);
++	bool ok = q_put_locked(&q_router, h, d, n);
++	lck_mtx_unlock(&q_lock);
++	if (!ok && (q_router.dropped < 10 || q_router.dropped % 1000 == 0)) {
++		SAY("router's queue full: packet type %u to port %#x dropped (%llu dropped)\n", h->type, h->dst_port, q_router.dropped);
++	}
++}
++
++/* ---- the modem's QRTR servers (for wland's replay at open and for the state sysctl) ---- */
++
++#define NSRV    96
++static struct { uint32_t svc, inst, node, port; bool up; } srv[NSRV];
++
++static void
++srv_add(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port)
++{
++	int fr = -1;
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up && srv[i].svc == svc && srv[i].inst == inst && srv[i].node == node && srv[i].port == port) {
++			return;
++		}
++		if (!srv[i].up && fr < 0) {
++			fr = i;
++		}
++	}
++	if (fr >= 0) {
++		srv[fr].svc = svc;
++		srv[fr].inst = inst;
++		srv[fr].node = node;
++		srv[fr].port = port;
++		srv[fr].up = true;
++	}
++}
++
++static void
++srv_gone(uint32_t node, uint32_t port)
++{
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up && srv[i].node == node && (port == 0xffffffffu || srv[i].port == port)) {
++			srv[i].up = false;
++		}
++	}
++}
++
++static bool
++router_port(uint32_t port)
++{
++	return (sweet_bb & SBB_QMUX) && port >= SBB_QMUX_PORT0 && port < SBB_QMUX_PORT0 + SBB_QMUX_NPORTS;
++}
++
++/* a whole QRTR packet from the modem (ml_lock held): sorted into the queues; nothing is sent from here but GLINK commands */
++static void
++qrtr_in(const uint8_t *d, uint32_t n)
++{
++	struct sbb_qrtr_hdr h;
++	if (n < sizeof(h)) {
++		return;
++	}
++	memcpy(&h, d, sizeof(h));
++	if (h.version != 1) {
++		return;
++	}
++	uint32_t pl = n - (uint32_t)sizeof(h) < h.size ? n - (uint32_t)sizeof(h) : h.size;
++	const uint8_t *p = d + sizeof(h);
++	gl.rx_pkts++;
++	gl.rx_bytes += pl;
++	gl.last_traffic = sbb_ms();
++	if (h.type == SBB_QRTR_DATA) {
++		if (router_port(h.dst_port)) {
++			to_router(&h, p, pl);
++		} else {
++			to_wland(&h, p, pl);
++		}
++		return;
++	}
++	uint32_t w[5] = { 0, 0, 0, 0, 0 };
++	memcpy(w, p, pl < sizeof(w) ? pl : sizeof(w));
++	switch (h.type) {
++	case SBB_QRTR_HELLO:
++		gl.hello_due = true;                    /* answered by the thread (a DATA needs an intent: not under the pump) */
++		SAY("modem node %u says HELLO\n", h.src_node);
++		return;
++	case SBB_QRTR_NEW_SERVER:
++		srv_add(w[1], w[2], w[3], w[4]);
++		break;
++	case SBB_QRTR_DEL_SERVER:
++		srv_gone(w[3], w[4]);
++		break;
++	case SBB_QRTR_BYE:
++		srv_gone(h.src_node, 0xffffffffu);
++		break;
++	case SBB_QRTR_RESUME_TX:
++		if (router_port(h.dst_port)) {
++			return;                         /* the router does not flow-control its sends */
++		}
++		break;
++	default:
++		break;
++	}
++	if (sweet_bb & SBB_QMUX) {
++		to_router(&h, p, pl);
++	}
++	to_wland(&h, p, pl);
++}
++
++static void
++send_open(void)
++{
++	static const char name[] = "IPCRTR";
++	glink_cmd(GLINK_CMD_OPEN, LCID, sizeof(name), name, sizeof(name));
++	gl.open_tx = true;
++}
++
++static void
++advertise_intents(void)
++{
++	uint32_t p[N_INTENTS * 2];
++	for (uint32_t i = 0; i < N_INTENTS; i++) {
++		p[2 * i] = INTENT_SIZE;
++		p[2 * i + 1] = i + 1;
++	}
++	glink_cmd(GLINK_CMD_INTENT, LCID, N_INTENTS, p, sizeof(p));
++}
++
++/* one command from the FIFO (ml_lock held); 0 if incomplete */
++static int
++rx_one(void)
++{
++	uint32_t avail = rx_avail();
++	if (avail < 8) {
++		return 0;
++	}
++	uint8_t h[16];
++	rx_peek(h, 0, 8);
++	uint16_t cmd, p1;
++	uint32_t p2;
++	memcpy(&cmd, h, 2);
++	memcpy(&p1, h + 2, 2);
++	memcpy(&p2, h + 4, 4);
++	uint32_t adv = 8;
++
++	switch (cmd) {
++	case GLINK_CMD_VERSION:
++		glink_cmd(GLINK_CMD_VERSION_ACK, 1, p2 & FEAT_INTENT_REUSE, NULL, 0);
++		if (!gl.version_done) {
++			glink_cmd(GLINK_CMD_VERSION, 1, FEAT_INTENT_REUSE, NULL, 0);
++		}
++		break;
++	case GLINK_CMD_VERSION_ACK:
++		gl.version_done = true;
++		if (gl.state < 1) {
++			gl.state = 1;
++		}
++		break;
++	case GLINK_CMD_OPEN: {
++		uint32_t nl = (p2 + 7) & ~7u;
++		if (avail < 8 + nl) {
++			return 0;
++		}
++		char name[64];
++		bzero(name, sizeof(name));
++		rx_peek(name, 8, p2 < 63 ? p2 : 63);
++		adv += nl;
++		glink_cmd(GLINK_CMD_OPEN_ACK, p1, 0, NULL, 0);
++		if (strcmp(name, "IPCRTR") == 0) {
++			gl.rcid = p1;
++			gl.opened_by_remote = true;
++			if (!gl.open_tx) {
++				send_open();
++			}
++		}
++		break;
++	}
++	case GLINK_CMD_OPEN_ACK:
++		if (p1 == LCID && !gl.open_acked) {
++			gl.open_acked = true;
++			advertise_intents();
++		}
++		break;
++	case GLINK_CMD_CLOSE:
++		glink_cmd(GLINK_CMD_CLOSE_ACK, p1, 0, NULL, 0);
++		if (p1 == gl.rcid && gl.opened_by_remote) {
++			SAY("the modem closed IPCRTR\n");
++			gl.opened_by_remote = false;
++			gl.state = gl.version_done ? 1 : 0;
++		}
++		break;
++	case GLINK_CMD_CLOSE_ACK:
++		break;
++	case GLINK_CMD_INTENT: {
++		uint32_t len = 8 + p2 * 8;
++		if (p2 > 1024) {
++			adv = avail;
++			break;
++		}
++		if (avail < len) {
++			return 0;
++		}
++		for (uint32_t i = 0; i < p2; i++) {
++			uint32_t pr[2];
++			rx_peek(pr, 8 + i * 8, 8);
++			if (p1 == gl.rcid && gl.opened_by_remote && gl.nri < MAX_RINTENTS) {
++				gl.ri[gl.nri].size = pr[0];
++				gl.ri[gl.nri].iid = pr[1];
++				gl.ri[gl.nri].busy = false;
++				gl.nri++;
++			}
++		}
++		adv = (len + 7) & ~7u;
++		break;
++	}
++	case GLINK_CMD_RX_DONE:
++	case GLINK_CMD_RX_DONE_W_REUSE:
++		if (p1 != gl.rcid) {
++			break;
++		}
++		for (int i = 0; i < gl.nri; i++) {
++			if (gl.ri[i].iid == p2) {
++				if (cmd == GLINK_CMD_RX_DONE) {
++					gl.ri[i] = gl.ri[--gl.nri];
++				} else {
++					gl.ri[i].busy = false;
++				}
++				break;
++			}
++		}
++		break;
++	case GLINK_CMD_RX_INTENT_REQ:
++		if (p1 == gl.rcid) {
++			uint32_t p[2] = { p2 > INTENT_SIZE ? p2 : INTENT_SIZE, gl.next_iid++ };
++			glink_cmd(GLINK_CMD_INTENT, LCID, 1, p, sizeof(p));
++			glink_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, LCID, 1, NULL, 0);
++		} else {
++			glink_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, 0, 0, NULL, 0);
++		}
++		break;
++	case GLINK_CMD_RX_INTENT_REQ_ACK:
++		gl.intent_req_acked = true;
++		break;
++	case GLINK_CMD_TX_DATA:
++	case GLINK_CMD_TX_DATA_CONT: {
++		if (avail < 16) {
++			return 0;
++		}
++		rx_peek(h, 0, 16);
++		uint32_t chunk, left;
++		memcpy(&chunk, h + 8, 4);
++		memcpy(&left, h + 12, 4);
++		if (chunk > gl.rx_len) {
++			adv = avail;
++			gl.unknown_cmds++;
++			break;
++		}
++		uint32_t len = 16 + chunk;
++		if (avail < len) {
++			return 0;
++		}
++		if (gl.rxoff + chunk <= RXBUF_SIZE) {
++			rx_peek(gl.rxbuf + gl.rxoff, 16, chunk);
++		} else {
++			gl.too_big++;
++		}
++		gl.rxoff += chunk;
++		adv = (len + 7) & ~7u;
++		if (p1 != gl.rcid) {
++			gl.rx_other_ch++;
++			gl.rxoff = 0;
++			break;
++		}
++		if (!left) {
++			rx_advance(adv);
++			uint32_t n = gl.rxoff;
++			gl.rxoff = 0;
++			glink_cmd(GLINK_CMD_RX_DONE_W_REUSE, LCID, p2, NULL, 0);
++			if (n <= RXBUF_SIZE) {
++				qrtr_in(gl.rxbuf, n);
++			}
++			return 1;
++		}
++		break;
++	}
++	case GLINK_CMD_READ_NOTIF:
++		ring_modem();
++		break;
++	case GLINK_CMD_SIGNALS:
++		break;
++	default:
++		gl.unknown_cmds++;
++		if (gl.unknown_cmds <= 10) {
++			SAY("glink: unknown command %u (%u %#x): the FIFO's %u bytes dropped\n", cmd, p1, p2, avail);
++		}
++		adv = avail;
++		break;
++	}
++	rx_advance(adv);
++	return 1;
++}
++
++/* everything the modem has written (ml_lock held) */
++static int
++pump_locked(void)
++{
++	int n = 0;
++	if (gl.state == 0 && !gl.version_done && gl.desc == 0) {
++		return 0;
++	}
++	while (n < 4096 && rx_one()) {
++		n++;
++	}
++	return n;
++}
++
++bool
++sbb_link_open(void)
++{
++	return gl.state == 2;
++}
++
++/* (re)make the link: our FIFO ends start over (Linux qcom_glink_smem_register), VERSION; the modem opens IPCRTR */
++static int
++link_reinit(uint32_t timeout_ms, const char *why)
++{
++	vm_offset_t rx;
++	uint32_t rxlen = 0, txlen = 0;
++	if (!regs_map()) {
++		SAY("link: cannot map SMEM/TCSR/IPCC\n");
++		return ENXIO;
++	}
++	lck_mtx_lock(&ml_lock);
++	gl.reinits++;
++	gl.state = 0;
++	gl.open_tx = gl.open_acked = gl.opened_by_remote = gl.version_done = gl.intent_req_acked = gl.hello_due = false;
++	gl.nri = 0;
++	gl.rxoff = 0;
++	gl.next_iid = 100;
++	gl.desc = 0;
++	if (gl.rxbuf == NULL) {
++		gl.rxbuf = kalloc_data(RXBUF_SIZE, Z_WAITOK | Z_ZERO);
++	}
++	if (gl.rxbuf == NULL || smem_alloc(ITEM_GLINK_DESC, 32, &gl.desc) != 0 ||
++	    smem_alloc(ITEM_GLINK_TX, GLINK_TX_FIFO_SIZE, &gl.tx) != 0 || smem_get(ITEM_GLINK_TX, &gl.tx, &txlen) != 0 ||
++	    smem_get(ITEM_GLINK_RX, &rx, &rxlen) != 0 || txlen < 64 || rxlen < 64) {
++		gl.desc = 0;
++		lck_mtx_unlock(&ml_lock);
++		SAY("link (%s): SMEM items 478/479/480 not there (the modem not booted?)\n", why);
++		return ENXIO;
++	}
++	gl.rx = rx;
++	gl.tx_len = txlen & ~3u;
++	gl.rx_len = rxlen & ~3u;
++	wr32(gl.desc + DESC_RX_TAIL, 0);
++	wr32(gl.desc + DESC_TX_HEAD, 0);
++	settle();
++	glink_cmd(GLINK_CMD_VERSION, 1, FEAT_INTENT_REUSE, NULL, 0);
++	lck_mtx_unlock(&ml_lock);
++	/* the router forgets the modem's servers and its clients there (as a BYE) */
++	struct sbb_qrtr_hdr bye = { 1, SBB_QRTR_BYE, SBB_NODE_MODEM, SBB_PORT_CTRL, 0, 20, SBB_NODE_APPS, SBB_PORT_CTRL };
++	uint32_t byew[5] = { SBB_QRTR_BYE, 0, 0, 0, 0 };
++	for (int i = 0; i < NSRV; i++) {
++		srv[i].up = false;
++	}
++	if (sweet_bb & SBB_QMUX) {
++		lck_mtx_lock(&q_lock);
++		q_put_locked(&q_router, &bye, (const uint8_t *)byew, sizeof(byew));
++		lck_mtx_unlock(&q_lock);
++	}
++	SAY("link (%s): desc %#lx tx fifo %u, rx fifo %u: VERSION sent, waiting for IPCRTR\n", why, (unsigned long)(gl.desc - smem_va +
++	    SMEM_PHYS), gl.tx_len, gl.rx_len);
++	sbb_wake();
++	uint64_t end = sbb_ms() + (timeout_ms ? timeout_ms : 5000);
++	while (sbb_ms() < end) {
++		lck_mtx_lock(&ml_lock);
++		pump_locked();
++		bool up = gl.open_acked && gl.opened_by_remote;
++		if (up) {
++			gl.state = 2;
++			gl.ups++;
++		}
++		lck_mtx_unlock(&ml_lock);
++		if (up) {
++			SAY("link: IPCRTR open (rcid %u, up #%u)\n", gl.rcid, gl.ups);
++			sbb_wake();
++			return 0;
++		}
++		sleep_us(2000);
++	}
++	SAY("link: IPCRTR not open after %u ms (version %d, remote open %d, ack %d)\n", timeout_ms, gl.version_done, gl.opened_by_remote,
++	    gl.open_acked);
++	return ETIMEDOUT;
++}
++
++static int
++find_intent(uint32_t len)
++{
++	int best = -1;
++	for (int i = 0; i < gl.nri; i++) {
++		if (!gl.ri[i].busy && gl.ri[i].size >= len && (best < 0 || gl.ri[i].size < gl.ri[best].size)) {
++			best = i;
++		}
++	}
++	return best;
++}
++
++/*
++ * One QRTR packet into one of the modem's intents (requested if none fits), in 8 KiB chunks. ml_lock is held for the whole
++ * packet (waits sleep with it held, pumping the modem's FIFO themselves), so packets never interleave and an intent found
++ * stays ours; at most 3 s, as wland's link_send.
++ */
++static int
++link_send(const uint8_t *data, uint32_t len)
++{
++	uint64_t end = sbb_ms() + 3000;
++	int asked = 0, i;
++	uint32_t iid;
++	lck_mtx_lock(&ml_lock);
++	if (gl.state != 2) {
++		lck_mtx_unlock(&ml_lock);
++		return ENOTCONN;
++	}
++	while ((i = find_intent(len)) < 0) {
++		if (!asked || gl.intent_req_acked) {
++			if (asked > 3) {
++				goto fail;
++			}
++			gl.intent_req_acked = false;
++			gl.intent_reqs++;
++			glink_cmd(GLINK_CMD_RX_INTENT_REQ, LCID, len, NULL, 0);
++			asked++;
++		}
++		if (sbb_ms() > end || gl.state != 2) {
++			goto fail;
++		}
++		pump_locked();
++		if ((i = find_intent(len)) >= 0) {
++			break;
++		}
++		sleep_us(300);
++	}
++	gl.ri[i].busy = true;
++	iid = gl.ri[i].iid;
++	for (uint32_t off = 0; off < len;) {
++		uint32_t chunk = len - off > 8192 ? 8192 : len - off;
++		uint32_t hdr[2] = { chunk, len - off - chunk };
++		while (glink_cmd2(off ? GLINK_CMD_TX_DATA_CONT : GLINK_CMD_TX_DATA, LCID, iid, hdr, 8, data + off, chunk) != 0) {
++			if (sbb_ms() > end) {
++				goto fail;
++			}
++			pump_locked();
++			sleep_us(200);
++		}
++		off += chunk;
++	}
++	gl.tx_pkts++;
++	gl.tx_bytes += len;
++	gl.last_traffic = sbb_ms();
++	lck_mtx_unlock(&ml_lock);
++	return 0;
++fail:
++	gl.tx_fail++;
++	lck_mtx_unlock(&ml_lock);
++	if (gl.tx_fail <= 20 || gl.tx_fail % 100 == 0) {
++		SAY("link: cannot send %u bytes (intents %d, failure #%u)\n", len, gl.nri, gl.tx_fail);
++	}
++	return EIO;
++}
++
++static int
++qrtr_send_hdr(const struct sbb_qrtr_hdr *in, const void *payload, uint32_t len)
++{
++	struct sbb_qrtr_hdr h = *in;
++	uint32_t padded = (len + 3) & ~3u;
++	if (padded > RXBUF_SIZE) {
++		return EMSGSIZE;
++	}
++	h.version = 1;
++	h.src_node = SBB_NODE_APPS;
++	h.size = len;
++	uint8_t *b = kalloc_data(sizeof(h) + padded, Z_WAITOK | Z_ZERO);
++	if (b == NULL) {
++		return ENOMEM;
++	}
++	memcpy(b, &h, sizeof(h));
++	if (len) {
++		memcpy(b + sizeof(h), payload, len);
++	}
++	int e = link_send(b, (uint32_t)sizeof(h) + padded);
++	kfree_data(b, sizeof(h) + padded);
++	return e;
++}
++
++int
++sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len)
++{
++	struct sbb_qrtr_hdr h = { 1, type, SBB_NODE_APPS, src_port, 0, len, dst_node, dst_port };
++	return qrtr_send_hdr(&h, data, len);
++}
++
++/* ---- the thread ---- */
++
++static bool wake_flag;
++static uint32_t idle_us = 4000;
++static uint64_t rounds;
++
++void
++sbb_wake(void)
++{
++	lck_mtx_lock(&wait_lock);
++	wake_flag = true;
++	wakeup(&wake_flag);
++	lck_mtx_unlock(&wait_lock);
++}
++
++static void
++sbb_thread(__unused void *param, __unused wait_result_t wr)
++{
++	SAY("thread up (sweetbb=0x%x)\n", sweet_bb);
++	for (;;) {
++		rounds++;
++		lck_mtx_lock(&ml_lock);
++		if (gl.desc != 0) {
++			pump_locked();
++		}
++		bool hello = gl.hello_due && gl.state == 2;
++		if (hello) {
++			gl.hello_due = false;
++		}
++		lck_mtx_unlock(&ml_lock);
++		if (hello) {
++			uint32_t pkt[5] = { SBB_QRTR_HELLO, 0, 0, 0, 0 };
++			int e = sbb_qrtr_send(SBB_QRTR_HELLO, SBB_PORT_CTRL, SBB_NODE_MODEM, SBB_PORT_CTRL, pkt, sizeof(pkt));
++			SAY("HELLO answered (%d)\n", e);
++		}
++		if (sweet_bb & SBB_QMUX) {
++			struct sbb_pkt *p;
++			unsigned k = 0;
++			while (k++ < 512 && (p = q_pop(&q_router)) != NULL) {
++				if (p->h.type == SBB_QRTR_DATA) {
++					sweet_qmux_qrtr(&p->h, p->d, p->n);
++				} else {
++					uint32_t w[5] = { 0, 0, 0, 0, 0 };
++					memcpy(w, p->d, p->n < sizeof(w) ? p->n : sizeof(w));
++					if (p->h.type == SBB_QRTR_NEW_SERVER) {
++						sweet_qmux_server(w[1], w[2], w[3], w[4]);
++					} else if (p->h.type == SBB_QRTR_DEL_SERVER) {
++						sweet_qmux_server_gone(w[3], w[4]);
++					} else if (p->h.type == SBB_QRTR_BYE) {
++						sweet_qmux_server_gone(p->h.src_node, 0xffffffffu);
++					}
++				}
++				pkt_free(p);
++			}
++			sweet_qmux_poll();
++		}
++		uint64_t now = sbb_ms();
++		uint32_t us = gl.desc == 0 ? 100000 : (now - gl.last_traffic < 2000 ? 1000 : (idle_us < 1000 ? 1000 : idle_us));
++		struct timespec ts = { .tv_sec = us / 1000000, .tv_nsec = (long)(us % 1000000) * 1000 };
++		lck_mtx_lock(&wait_lock);
++		if (!wake_flag) {
++			(void)msleep(&wake_flag, &wait_lock, PZERO, "sweetbb", &ts);
++		}
++		wake_flag = false;
++		lck_mtx_unlock(&wait_lock);
++	}
++}
++
++/* ---- /dev/sweet-mqrtr ---- */
++
++#define MQRTR_IOC_UP            _IOW('q', 0x21, uint32_t)
++
++static int
++mq_open(__unused dev_t d, __unused int flags, __unused int devtype, proc_t p)
++{
++	lck_mtx_lock(&q_lock);
++	if (dev.open) {
++		lck_mtx_unlock(&q_lock);
++		return EBUSY;
++	}
++	dev.open = true;
++	dev.pid = proc_pid(p);
++	/* the servers already known, again as NEW_SERVER packets (wland learns them as if the modem had just said so) */
++	unsigned n = 0;
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up) {
++			struct sbb_qrtr_hdr h = { 1, SBB_QRTR_NEW_SERVER, srv[i].node, SBB_PORT_CTRL, 0, 20, SBB_NODE_APPS, SBB_PORT_CTRL };
++			uint32_t w[5] = { SBB_QRTR_NEW_SERVER, srv[i].svc, srv[i].inst, srv[i].node, srv[i].port };
++			n += q_put_locked(&q_wland, &h, (const uint8_t *)w, sizeof(w));
++		}
++	}
++	lck_mtx_unlock(&q_lock);
++	SAY("/dev/sweet-mqrtr opened by pid %d (link state %d, %u servers given again)\n", dev.pid, gl.state, n);
++	return 0;
++}
++
++static int
++mq_close(__unused dev_t d, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&q_lock);
++	dev.open = false;
++	selthreadclear(&dev.sel);
++	wakeup(&q_wland);
++	lck_mtx_unlock(&q_lock);
++	q_clear(&q_wland);
++	SAY("/dev/sweet-mqrtr closed (pid %d): %llu packets read, %llu written (%llu bytes), %u refused, %llu dropped\n", dev.pid,
++	    dev.reads, dev.writes, dev.write_bytes, dev.refused, q_wland.dropped);
++	return 0;
++}
++
++static int
++mq_read(__unused dev_t d, struct uio *uio, int ioflag)
++{
++	struct sbb_pkt *p;
++	int e = 0;
++	lck_mtx_lock(&q_lock);
++	while ((p = q_wland.first) == NULL) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&q_lock);
++			return EWOULDBLOCK;
++		}
++		e = msleep(&q_wland, &q_lock, PCATCH | PZERO, "mqrtr", NULL);
++		if (e) {
++			lck_mtx_unlock(&q_lock);
++			return e;
++		}
++	}
++	if (uio_resid(uio) < (user_ssize_t)(sizeof(p->h) + p->n)) {
++		lck_mtx_unlock(&q_lock);
++		return EMSGSIZE;
++	}
++	q_wland.first = p->next;
++	if (!q_wland.first) {
++		q_wland.last = NULL;
++	}
++	q_wland.count--;
++	q_wland.bytes -= p->n;
++	lck_mtx_unlock(&q_lock);
++	p->h.size = p->n;
++	e = uiomove((caddr_t)&p->h, sizeof(p->h), uio);
++	if (e == 0 && p->n) {
++		e = uiomove((caddr_t)p->d, (int)p->n, uio);
++	}
++	dev.reads++;
++	pkt_free(p);
++	return e;
++}
++
++static int
++mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
++{
++	struct sbb_qrtr_hdr h;
++	user_ssize_t n = uio_resid(uio);
++	if (n < (user_ssize_t)sizeof(h) || n > (user_ssize_t)(sizeof(h) + 65536)) {
++		return EINVAL;
++	}
++	int e = uiomove((caddr_t)&h, sizeof(h), uio);
++	if (e) {
++		return e;
++	}
++	uint32_t len = (uint32_t)(n - (user_ssize_t)sizeof(h));
++	if (h.size < len) {
++		len = h.size;           /* (padding after the payload is not ours to send twice) */
++	}
++	if (router_port(h.src_port) || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
++		dev.refused++;
++		return EPERM;
++	}
++	uint8_t *b = NULL;
++	if (len) {
++		b = kalloc_data(len, Z_WAITOK);
++		if (b == NULL) {
++			return ENOMEM;
++		}
++		e = uiomove((caddr_t)b, (int)len, uio);
++	}
++	if (e == 0) {
++		e = qrtr_send_hdr(&h, b, len);
++	}
++	if (b) {
++		kfree_data(b, len);
++	}
++	if (e == 0) {
++		dev.writes++;
++		dev.write_bytes += len;
++	}
++	return e;
++}
++
++static int
++mq_ioctl(__unused dev_t d, u_long cmd, caddr_t data, __unused int flag, __unused proc_t p)
++{
++	if (cmd != MQRTR_IOC_UP) {
++		return ENOTTY;
++	}
++	uint32_t ms = *(uint32_t *)(void *)data;
++	return link_reinit(ms > 30000 ? 30000 : ms, "MQRTR_IOC_UP");
++}
++
++static int
++mq_select(__unused dev_t d, int which, void *wql, proc_t p)
++{
++	int ready = 1;
++	if (which == FREAD) {
++		lck_mtx_lock(&q_lock);
++		ready = q_wland.first != NULL;
++		if (!ready) {
++			selrecord(p, &dev.sel, wql);
++		}
++		lck_mtx_unlock(&q_lock);
++	}
++	return ready;
++}
++
++static const struct cdevsw mq_cdevsw = {
++	.d_open       = mq_open,
++	.d_close      = mq_close,
++	.d_read       = mq_read,
++	.d_write      = mq_write,
++	.d_ioctl      = mq_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = mq_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* ---- sysctls ---- */
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bb, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_bb, 0,
++    "redfin 1067: boot-arg sweetbb (0x01 kernel modem link + /dev/sweet-mqrtr, 0x02 kernel QMI router; 0 = wland does both)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_mlink_idle_us, CTLFLAG_RW | CTLFLAG_LOCKED, &idle_us, 0,
++    "redfin 1067: the modem link's poll period after 2 s without traffic (us, >= 1000; 1 ms while there is traffic)");
++
++static int
++sysctl_mdm_up SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gl.state, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e == 0 && changed) {
++		if (proc_suser(req->p) != 0) {
++			return EPERM;
++		}
++		if (!(sweet_bb & SBB_LINK)) {
++			return ENXIO;
++		}
++		if (v == 1) {
++			e = link_reinit(5000, "kern.sweet_mdm_up=1");
++		}
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mdm_up, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_mdm_up, "I",
++    "redfin 1067: modem link state (0 down, 1 GLINK version done, 2 IPCRTR open); write 1 = make the link again (after a modem start)");
++
++static int
++sysctl_bb_state SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 4096;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	int o = snprintf(s, cap, "sweetbb 0x%x | link state %d (ups %u, reinits %u) rcid %u intents %d | rx %llu pkts %llu B, tx %llu pkts %llu B, "
++	    "intent reqs %u, tx fail %u, unknown %u, other ch %u, too big %u | wland dev %s pid %d: queued %u (%u B) in %llu dropped %llu, "
++	    "read %llu written %llu refused %u | router q %u in %llu dropped %llu | thread rounds %llu | servers:",
++	    sweet_bb, gl.state, gl.ups, gl.reinits, gl.rcid, gl.nri, gl.rx_pkts, gl.rx_bytes, gl.tx_pkts, gl.tx_bytes, gl.intent_reqs,
++	    gl.tx_fail, gl.unknown_cmds, gl.rx_other_ch, gl.too_big, dev.open ? "open" : "closed", dev.pid, q_wland.count, q_wland.bytes,
++	    q_wland.in, q_wland.dropped, dev.reads, dev.writes, dev.refused, q_router.count, q_router.in, q_router.dropped, rounds);
++	for (int i = 0; i < NSRV && o < (int)cap - 32; i++) {
++		if (srv[i].up) {
++			o += snprintf(s + o, cap - (size_t)o, " %x:%x@%u:%x", srv[i].svc, srv[i].inst, srv[i].node, srv[i].port);
++		}
++	}
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bb_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_bb_state, "A",
++    "redfin 1067: kernel modem link, wland device and the modem's QRTR servers (svc:inst@node:port, hex)");
++
++static int
++sysctl_bb_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 8192;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	int o = sweet_qmux_stats(s, cap);
++	int e = SYSCTL_OUT(req, s, (size_t)o + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_bb_stats, "A",
++    "redfin 1068: kernel QMI router counters, per service fwd/local/denied, live clients");
++
++/* ---- start ---- */
++
++void
++sweet_bb_init(void)
++{
++	uint32_t v = 0;
++	thread_t th;
++	PE_parse_boot_argn("sweetbb", &v, sizeof(v));
++	if (v & SBB_QMUX) {
++		v |= SBB_LINK;
++	}
++	sweet_bb = v;
++	if (!v) {
++		return;
++	}
++	SAY("sweetbb=0x%x: modem link=%s qmux=%s%s\n", v, (v & SBB_LINK) ? "kernel" : "wland", (v & SBB_QMUX) ? "kernel" : "wland",
++	    (v & ~SBB_BITS) ? " (later-phase bits ignored by this kernel)" : "");
++	int major = cdevsw_add(-1, &mq_cdevsw);
++	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "sweet-mqrtr");
++	SAY("/dev/sweet-mqrtr %s (major %d)\n", node ? "made" : "FAILED", major);
++	if (v & SBB_QMUX) {
++		sweet_qmux_start();
++	}
++	if (kernel_thread_start(sbb_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		SAY("no thread: nothing will move\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_bb.h b/bsd/dev/sweet_bb.h
+new file mode 100644
+index 0000000..370e483
+--- /dev/null
++++ b/bsd/dev/sweet_bb.h
+@@ -0,0 +1,52 @@
++/*
++ * redfin 1067/1068 (P4 phase 1): the kernel side of the modem (MPSS) link and the QMI router.
++ * sweet_bb.c: boot-arg sweetbb, the GLINK/QRTR link to the modem, /dev/sweet-mqrtr, the "sweetbb" thread.
++ * sweet_qmux.c: the QMUX <-> QRTR router behind the AppleBasebandPCI stand-in's qmux1/qmux2 (port of wland abpbridge.c).
++ */
++#ifndef _SWEET_BB_H_
++#define _SWEET_BB_H_
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SBB_LINK                0x01u   /* kernel GLINK/QRTR to the modem + /dev/sweet-mqrtr (wland's link backend) */
++#define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
++#define SBB_BITS                0x03u   /* bits this kernel implements (0x04.. are later phases: accepted, ignored) */
++
++#define SBB_NODE_MODEM          0u
++#define SBB_NODE_APPS           1u
++#define SBB_NODE_BCAST          0xffffffffu
++#define SBB_PORT_CTRL           0xfffffffeu
++
++#define SBB_QMUX_PORT0          0x4000u /* router client ports (as wland's ABP_PORT0): one per (pipe, session, svc, cid) */
++#define SBB_QMUX_NPORTS         0x400u
++
++enum {
++	SBB_QRTR_DATA = 1, SBB_QRTR_HELLO, SBB_QRTR_BYE, SBB_QRTR_NEW_SERVER, SBB_QRTR_DEL_SERVER, SBB_QRTR_DEL_CLIENT,
++	SBB_QRTR_RESUME_TX, SBB_QRTR_EXIT, SBB_QRTR_PING, SBB_QRTR_NEW_LOOKUP, SBB_QRTR_DEL_LOOKUP,
++};
++
++struct sbb_qrtr_hdr {
++	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
++};
++
++extern uint32_t sweet_bb;               /* boot-arg sweetbb (RO kern.sweet_bb) */
++
++/* sweet_bb.c */
++uint64_t sbb_ms(void);
++void sbb_wake(void);
++bool sbb_link_open(void);
++int sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
++
++/* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
++bool sweet_qmux_on(void);
++void sweet_qmux_start(void);
++void sweet_qmux_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
++void sweet_qmux_poll(void);
++void sweet_qmux_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port);
++void sweet_qmux_server_gone(uint32_t node, uint32_t port);
++void sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n);
++int sweet_qmux_stats(char *buf, size_t len);
++
++/* sweet_abp.c */
++void sweet_abp_set_ready(bool ready, const char *why);
++#endif
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+new file mode 100644
+index 0000000..3427ce6
+--- /dev/null
++++ b/bsd/dev/sweet_qmux.c
+@@ -0,0 +1,52 @@
++/*
++ * redfin 1067: stub of the kernel QMI router (filled in by 1068). With sweetbb & 2 and this stub nothing answers
++ * CommCenter: do not boot 1067 alone with sweetbb & 2.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "sweet_bb.h"
++
++bool
++sweet_qmux_on(void)
++{
++	return false;
++}
++
++void
++sweet_qmux_start(void)
++{
++	printf("SWEET QMUX: not in this kernel (1067 stub)\n");
++}
++
++void
++sweet_qmux_c2w(__unused unsigned pipe, __unused uint32_t sess, __unused unsigned type, __unused const void *data, __unused uint32_t len)
++{
++}
++
++void
++sweet_qmux_poll(void)
++{
++}
++
++void
++sweet_qmux_server(__unused uint32_t service, __unused uint32_t instance, __unused uint32_t node, __unused uint32_t port)
++{
++}
++
++void
++sweet_qmux_server_gone(__unused uint32_t node, __unused uint32_t port)
++{
++}
++
++void
++sweet_qmux_qrtr(__unused const struct sbb_qrtr_hdr *h, __unused const uint8_t *d, __unused uint32_t n)
++{
++}
++
++int
++sweet_qmux_stats(char *buf, size_t len)
++{
++	return snprintf(buf, len, "no router (1067 stub)");
++}
++#endif
