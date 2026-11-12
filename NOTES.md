@@ -424,3 +424,4 @@ Each defaults off (= ce44728 behaviour) unless noted; knobs via the process env 
   Slot 0x46 (logical 1 -> physical 1, once per cell.on change, only if P1 holds a card and is inactive; rmtfs images
   copied to *.pre-slot first) and `online=1` / `online=0` DMS Set Operating Mode 0x2e online / low power (2 tries, only
   if the mode differs; *.pre-online copies first). An offline (3) modem refuses (0x35); no reset is ever sent.
+- 1066 voice diagnostics: MVM/CVS/CVP unasked events logged ("SWEET VOICE: event", CVS STREAM READY = the modem vocoder runs on our session); kern.sweet_voice_opts 128 activity events, 256 RX DTMF detection, 512 RX unmute, 1024 TTY 0; CVS recreated on a VSID change (r5v1c)
