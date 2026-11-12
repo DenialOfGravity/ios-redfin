@@ -705,7 +705,11 @@ static int parse_trigger(char *line, int ln)
 				goto bad;
 		}
 	} else if (!strcmp(w[3], "bbreset")) {
-		t.kind = TRG_BBRESET;	/* n12b: m2 = ms the services stay un-published */
+		t.kind = TRG_BBRESET;	/* n12b: m2 = ms of the reset; m3 = 1 'unpub' (un-publish the stand-ins), 0 'msg' (default) */
+		if (k >= 6 && !strcmp(w[5], "unpub"))
+			t.m3 = 1;
+		else if (k >= 6 && strcmp(w[5], "msg"))
+			goto bad;
 	} else if (!strcmp(w[3], "replay")) {
 		t.kind = TRG_REPLAY;
 		if (k < 6 || parse_num(w[5], &b) || b < 0 || b > 0xffff)
@@ -1669,21 +1673,26 @@ static void simid_poll(uint64_t now)
 /*
  * n12b: "on <svc> <msg> bbreset <ms> [if ..]": an emulated baseband reset. ABM's soft reset is DMS Set Operating Mode
  * (0x002e) to Reset (TLV 0x01 = 4), which the router answers itself (wland owns the modem's mode); ABM then waits ~12 s
- * for "reset detection" (its pipe reads failing), falls back to a hard reset that fails too ("Reset failed ...
- * kInternalError"), and the carrier-bundle push FSM treats the push as failed and starts over. This un-publishes the
- * kernel's baseband stand-ins 100 ms after the answer (kern.sweet_abp_publish=0: pending reads end kIOReturnAborted, as
- * a modem going down) and publishes them again <ms> later, as a modem coming back. The real modem is not touched.
+ * for "reset detection" (libBasebandManager ResetDetection: TelephonyBasebandRegisterForReset = AppleBaseband
+ * general-interest messages 0xe3ff8000 reset detected / 0xe3ff8001 alive, and TelephonyBasebandGetReset), falls back to a
+ * hard reset that fails too ("Reset failed ... kInternalError"), and the carrier-bundle push FSM treats the push as
+ * failed and starts over. 'msg' (default): 100 ms after the answer kern.sweet_abp_bbmsg=1 (kernel 1064: "reset
+ * detected" to AppleBaseband's clients), <ms> later =2 ("alive"). 'unpub': un-publish the kernel's stand-ins instead
+ * (kern.sweet_abp_publish=0, pending reads end kIOReturnAborted) and publish them again <ms> later (n12b exp5: ABM did
+ * not take that as reset detection). The real modem is not touched.
  */
 static uint64_t bbr_unpub_at, bbr_pub_at;
 static unsigned bbresets;
+static int bbr_unpub;
 static void bbr_publish(int on)
 {
-	int v = on;
-	if (sysctlbyname("kern.sweet_abp_publish", NULL, NULL, &v, sizeof(v)))
-		printf("[%6llu] abp: bbreset: kern.sweet_abp_publish=%d: %s\n", (unsigned long long)link_ms(), on, strerror(errno));
+	int v = bbr_unpub ? on : (on ? 2 : 1);
+	const char *k = bbr_unpub ? "kern.sweet_abp_publish" : "kern.sweet_abp_bbmsg";
+	if (sysctlbyname(k, NULL, NULL, &v, sizeof(v)))
+		printf("[%6llu] abp: bbreset: %s=%d: %s\n", (unsigned long long)link_ms(), k, v, strerror(errno));
 	else
-		printf("[%6llu] abp: bbreset: baseband services %s (emulated reset #%u)\n", (unsigned long long)link_ms(),
-		       on ? "published again" : "un-published", bbresets);
+		printf("[%6llu] abp: bbreset: %s=%d (%s, emulated reset #%u)\n", (unsigned long long)link_ms(), k, v,
+		       on ? "modem back" : "modem down", bbresets);
 }
 
 static void bbr_poll(uint64_t now)
@@ -1718,10 +1727,12 @@ static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
 		if (t->kind == TRG_BBRESET) {
 			if (!bbr_unpub_at && !bbr_pub_at) {
 				bbresets++;
+				bbr_unpub = t->m3 == 1;
 				bbr_unpub_at = link_ms() + 100;
 				bbr_pub_at = bbr_unpub_at + (t->m2 < 200 ? 200 : t->m2);
-				printf("[%6llu] abp: on %s(0x%02x) 0x%04x: emulated baseband reset #%u (un-publish in 100 ms for %u ms)\n",
-				       (unsigned long long)link_ms(), svc_name(svc), svc, msg, bbresets, t->m2 < 200 ? 200 : t->m2);
+				printf("[%6llu] abp: on %s(0x%02x) 0x%04x: emulated baseband reset #%u (%s in 100 ms, for %u ms)\n",
+				       (unsigned long long)link_ms(), svc_name(svc), svc, msg, bbresets, bbr_unpub ? "un-publish" : "reset-detect message",
+				       t->m2 < 200 ? 200 : t->m2);
 			}
 			continue;
 		}
