@@ -2832,6 +2832,7 @@ static bool audio_up;                   /* the core service has said that the au
 static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
 static redwood_apr_events_t apr_events; /* the sound's (redwood_sound.c): what nobody waits for */
 static redwood_apr_events_t apr_events_second;  /* the microphones' (redwood_mic.c) */
+static redwood_apr_events_t apr_events_voice;   /* 1066: the voice services' (sweet_voice.c), MVM/CVS/CVP only */
 static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
 
 /* A packet from the DSP's audio services. From the link's thread. */
@@ -2859,6 +2860,11 @@ apr_input(const uint8_t *data, uint32_t length)
 
 		bzero(words, sizeof(words));
 		memcpy(words, data + header_length, payload < sizeof(words) ? payload : sizeof(words));
+		if (apr_events_voice != NULL && header.from_service >= 9 && header.from_service <= 11 &&
+		    apr_events_voice(header.from_service, header.from_port, header.opcode, header.token, words,
+		    payload < sizeof(words) ? payload : sizeof(words))) {
+			return;         /* 1066 */
+		}
 		if (events != NULL && events(header.from_service, header.from_port, header.opcode, header.token, words,
 		    payload < sizeof(words) ? payload : sizeof(words))) {
 			return;
@@ -3002,6 +3008,13 @@ void
 redwood_adsp_apr_events_second(redwood_apr_events_t handler)
 {
 	apr_events_second = handler;
+}
+
+/* 1066: the voice services' events (sweet_voice.c), asked first for what MVM/CVS/CVP send unasked */
+void
+redwood_adsp_apr_events_voice(redwood_apr_events_t handler)
+{
+	apr_events_voice = handler;
 }
 
 /* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */

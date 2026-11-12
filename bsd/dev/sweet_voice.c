@@ -107,6 +107,28 @@ extern void thread_deallocate(thread_t);
 #define OPT_CAL_TOPOLOGIES      16u
 #define OPT_DESTROY_CVS         32u
 #define OPT_RX_MONO16           64u
+/*
+ * 1066 (diagnostics and q6voice steps not in 1065's sequence; the unasked events of MVM/CVS/CVP are always logged:
+ * "SWEET VOICE: event ...", the first 40 of a call then every 50th, counts at STOP):
+ *   128 MVM: listen for the voice activity event class (q6voice's mic-break listener)
+ *   256 CVS: RX DTMF detection on: keys pressed on the far phone log "RX DTMF <low>/<high> Hz" = the downlink reaches the DSP
+ *   512 CVS and CVP: RX explicitly unmuted (VSS_IVOLUME_CMD_MUTE_V2 direction RX)
+ *  1024 CVS: TTY mode 0 (q6voice voice_send_tty_mode_cmd(), always sent there, before START)
+ */
+#define OPT_LISTEN              128u
+#define OPT_RX_DTMF             256u
+#define OPT_RX_UNMUTE           512u
+#define OPT_TTY                 1024u
+
+#define VSS_INOTIFY_CMD_LISTEN_FOR_EVENT_CLASS          0x00012e56u
+#define VSS_INOTIFY_CMD_CANCEL_EVENT_CLASS              0x00012e57u
+#define VSS_ICOMMON_EVENT_CLASS_VOICE_ACTIVITY_UPDATE   0x000131efu
+#define VSS_ICOMMON_EVT_VOICE_ACTIVITY_UPDATE           0x000131f0u
+#define VSS_ISTREAM_CMD_SET_RX_DTMF_DETECTION           0x00011027u
+#define VSS_ISTREAM_EVT_RX_DTMF_DETECTED                0x0001101au
+#define VSS_ISTREAM_EVT_READY                           0x000110fcu
+#define VSS_ISTREAM_EVT_NOT_READY                       0x000110fdu
+#define VSS_ISTREAM_CMD_SET_TTY_MODE                    0x00011196u
 
 static int voice_target;                        /* kern.sweet_voice: 0 off, 1 earpiece, 2 speaker */
 static int voice_state;                         /* what runs */
@@ -117,6 +139,45 @@ static bool mic_held, port_held, dual_done, attached, started;
 static bool thread_up;
 static int voice_wake;
 static uint32_t starts, failures;
+static uint32_t cvs_vsid;                       /* 1066: the VSID the kept CVS was named after */
+static bool listening, dtmf_on;
+static volatile uint32_t ev_all, ev_ready, ev_not_ready, ev_activity, ev_dtmf, ev_other;
+
+/* 1066: what MVM/CVS/CVP send unasked (sweet_adsp.c's link thread). Answers to our own commands are not seen here. */
+static bool
+voice_event(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
+{
+	const char *svc = service == APR_SVC_MVM ? "MVM" : service == APR_SVC_CVS ? "CVS" : "CVP";
+	uint32_t n = ++ev_all;
+	bool say = n <= 40 || n % 50 == 0;
+
+	if (opcode == VSS_ISTREAM_EVT_READY) {
+		ev_ready++;
+		say = true;
+		SAY("event %u: %s port %u: STREAM READY (the modem's vocoder runs on this session)\n", n, svc, port);
+	} else if (opcode == VSS_ISTREAM_EVT_NOT_READY) {
+		ev_not_ready++;
+		say = true;
+		SAY("event %u: %s port %u: STREAM NOT READY\n", n, svc, port);
+	} else if (opcode == VSS_ISTREAM_EVT_RX_DTMF_DETECTED) {
+		ev_dtmf++;
+		say = true;
+		SAY("event %u: %s port %u: RX DTMF %u/%u Hz (the downlink reaches the DSP)\n", n, svc, port,
+		    payload[0] & 0xffff, payload[0] >> 16);
+	} else if (opcode == VSS_ICOMMON_EVT_VOICE_ACTIVITY_UPDATE) {
+		ev_activity++;
+		if (say) {
+			SAY("event %u: %s port %u: voice activity %#x\n", n, svc, port, payload[0]);
+		}
+	} else {
+		ev_other++;
+		if (say) {
+			SAY("event %u: %s port %u: opcode %#x token %u, %u bytes: %#x %#x %#x\n", n, svc, port, opcode, token, length,
+			    payload[0], payload[1], payload[2]);
+		}
+	}
+	return true;
+}
 static LCK_GRP_DECLARE(voice_lock_group, "sweet-voice");
 static LCK_MTX_DECLARE(thread_lock, &voice_lock_group);
 
@@ -259,6 +320,22 @@ voice_down(const char *why)
 	uint16_t handle;
 
 	SAY("STOP (%s)\n", why);
+	SAY("events this call: %u (stream ready %u, not ready %u, activity %u, RX DTMF %u, other %u)\n", ev_all, ev_ready,
+	    ev_not_ready, ev_activity, ev_dtmf, ev_other);
+	if (dtmf_on && cvs_handle != 0) {
+		uint32_t enable = 0;
+
+		(void)vcmd("CVS: RX DTMF detection off", APR_SVC_CVS, cvs_handle, VSS_ISTREAM_CMD_SET_RX_DTMF_DETECTION, &enable,
+		    sizeof(enable), 0, NULL);
+	}
+	dtmf_on = false;
+	if (listening && mvm_handle != 0) {
+		uint32_t class_id = VSS_ICOMMON_EVENT_CLASS_VOICE_ACTIVITY_UPDATE;
+
+		(void)vcmd("MVM: stop listening", APR_SVC_MVM, mvm_handle, VSS_INOTIFY_CMD_CANCEL_EVENT_CLASS, &class_id, sizeof(class_id),
+		    0, NULL);
+	}
+	listening = false;
 	if (started) {
 		(void)vcmd("MVM: stop voice", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_STOP_VOICE, NULL, 0, 0, NULL);
 		started = false;
@@ -349,6 +426,11 @@ voice_up(int target)
 		SAY("MVM handle %u\n", mvm_handle);
 	}
 	step = "CVS create";
+	if (cvs_handle != 0 && cvs_vsid != voice_vsid) {
+		/* 1066: the kept CVS carries the old VSID's name */
+		(void)vcmd("CVS: destroyed (VSID changed)", APR_SVC_CVS, cvs_handle, APRV2_IBASIC_CMD_DESTROY_SESSION, NULL, 0, 0, NULL);
+		cvs_handle = 0;
+	}
 	if (cvs_handle == 0) {
 		char what[64];
 
@@ -357,6 +439,7 @@ voice_up(int target)
 			goto fail;
 		}
 		cvs_handle = answer.port;
+		cvs_vsid = voice_vsid;
 		SAY("CVS handle %u\n", cvs_handle);
 	} else {
 		SAY("CVS handle %u (kept from the last call)\n", cvs_handle);
@@ -473,6 +556,30 @@ voice_up(int target)
 
 		(void)vcmd("CVS: TX unmuted", APR_SVC_CVS, cvs_handle, VSS_IVOLUME_CMD_MUTE_V2, mute, sizeof(mute), 0, NULL);
 	}
+	if (voice_opts & OPT_TTY) {
+		uint32_t mode = 0;
+
+		(void)vcmd("CVS: TTY mode 0", APR_SVC_CVS, cvs_handle, VSS_ISTREAM_CMD_SET_TTY_MODE, &mode, sizeof(mode), 0, NULL);
+	}
+	if (voice_opts & OPT_RX_UNMUTE) {
+		uint16_t rx[3] = { 1, 0, 0 };           /* RX, unmuted, no ramp */
+
+		(void)vcmd("CVS: RX unmuted", APR_SVC_CVS, cvs_handle, VSS_IVOLUME_CMD_MUTE_V2, rx, sizeof(rx), 0, NULL);
+		(void)vcmd("CVP: RX unmuted", APR_SVC_CVP, cvp_handle, VSS_IVOLUME_CMD_MUTE_V2, rx, sizeof(rx), 0, NULL);
+	}
+	if (voice_opts & OPT_LISTEN) {
+		uint32_t class_id = VSS_ICOMMON_EVENT_CLASS_VOICE_ACTIVITY_UPDATE;
+
+		listening = vcmd("MVM: listen for voice activity", APR_SVC_MVM, mvm_handle, VSS_INOTIFY_CMD_LISTEN_FOR_EVENT_CLASS, &class_id,
+		    sizeof(class_id), 0, NULL);
+	}
+	if (voice_opts & OPT_RX_DTMF) {
+		uint32_t enable = 1;
+
+		dtmf_on = vcmd("CVS: RX DTMF detection on", APR_SVC_CVS, cvs_handle, VSS_ISTREAM_CMD_SET_RX_DTMF_DETECTION, &enable,
+		    sizeof(enable), 0, NULL);
+	}
+	ev_all = ev_ready = ev_not_ready = ev_activity = ev_dtmf = ev_other = 0;
 	step = "start voice";
 	if (!vcmd("MVM: START_VOICE", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_START_VOICE, NULL, 0, 0, NULL)) {
 		goto fail;
@@ -543,6 +650,7 @@ sysctl_voice(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int
 		}
 		thread_deallocate(thread);
 		thread_up = true;
+		redwood_adsp_apr_events_voice(voice_event);    /* 1066 */
 	}
 	lck_mtx_unlock(&thread_lock);
 	SAY("kern.sweet_voice = %d (%s; was %d)\n", v, v == 0 ? "off" : v == 1 ? "earpiece" : "speaker", voice_target);
@@ -569,7 +677,8 @@ sysctl_voice_number(__unused struct sysctl_oid *oidp, void *arg1, int arg2, stru
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_opts, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &voice_opts, 0, sysctl_voice_number, "I",
     "redfin 1065: variants (bits): 1 no dual control, 2 as CVD<2.2, 4 no media formats, 8 MFC 2 ch, 16 cal topologies, "
-    "32 destroy CVS, 64 RX format 1 ch/16 bit");
+    "32 destroy CVS, 64 RX format 1 ch/16 bit; 1066: 128 MVM activity events, 256 CVS RX DTMF detection, 512 RX unmute, "
+    "1024 TTY mode 0");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_vsid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &voice_vsid, 1, sysctl_voice_number, "I",
     "redfin 1065: the VSID the passive sessions are named after (0x11C05000 VoiceMMode1; 0 = \"default modem voice\")");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_ear, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &below_ear, 2, sysctl_voice_number,

@@ -130,6 +130,8 @@ bool redwood_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t
 void redwood_audio_dsp_memory_put(void);
 /* a second handler of the DSP's events (the microphones'), asked when the first does not take one */
 void redwood_adsp_apr_events_second(redwood_apr_events_t handler);
+/* 1066: a handler for what the voice services (MVM 9, CVS 10, CVP 11) send unasked, asked before the others */
+void redwood_adsp_apr_events_voice(redwood_apr_events_t handler);
 /* boot-arg rec_sound_mic=1: the recording (rec_sound=N) has what the microphone hears (given with redwood_audio_record_fed()) */
 bool redwood_audio_recording_mic(void);
 void redwood_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
