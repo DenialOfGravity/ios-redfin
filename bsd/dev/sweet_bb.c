@@ -687,6 +687,11 @@ rx_one(void)
 		break;
 	case GLINK_CMD_OPEN: {
 		uint32_t nl = (p2 + 7) & ~7u;
+		if (p2 > 256) {                 /* (no channel name is that long: a broken FIFO, not something to wait for) */
+			gl.unknown_cmds++;
+			adv = avail;
+			break;
+		}
 		if (avail < 8 + nl) {
 			return 0;
 		}
@@ -1068,6 +1073,10 @@ sbb_thread(__unused void *param, __unused wait_result_t wr)
 			unsigned k = 0;
 			while (k++ < 512 && (p = q_pop(&q_router)) != NULL) {
 				if (p->h.type == SBB_QRTR_DATA) {
+					if (p->h.confirm_rx) {  /* the sender waits for this (Linux qrtr_port_post) */
+						uint32_t rt[5] = { SBB_QRTR_RESUME_TX, SBB_NODE_APPS, p->h.dst_port, 0, 0 };
+						sbb_qrtr_send(SBB_QRTR_RESUME_TX, p->h.dst_port, p->h.src_node, p->h.src_port, rt, sizeof(rt));
+					}
 					sweet_qmux_qrtr(&p->h, p->d, p->n);
 				} else {
 					uint32_t w[5] = { 0, 0, 0, 0, 0 };
@@ -1179,7 +1188,7 @@ mq_read(__unused dev_t d, struct uio *uio, int ioflag)
 static int
 mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
 {
-	struct sbb_qrtr_hdr h;
+	struct sbb_qrtr_hdr h = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	user_ssize_t n = uio_resid(uio);
 	if (n < (user_ssize_t)sizeof(h) || n > (user_ssize_t)(sizeof(h) + 65536)) {
 		return EINVAL;
