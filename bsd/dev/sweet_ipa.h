@@ -25,7 +25,8 @@ void sweet_ipa_qrtr_in(uint32_t type, uint32_t src_node, uint32_t src_port, uint
  * WDS StartNetworkInterface until then. Lock-free, never blocks. */
 int sweet_ipa_ready(void);
 /* optional, for the router / PDP manager: a call came up (or went) on mux; gw = the call's IPv4 gateway (network order,
- * 0 = unknown) for the keep-alive. Arms the RX join like the first packet does. */
+ * 0 = unknown) for the keep-alive. Arms the RX join like the first packet does; up 0 forgets the mux's gateway (1080).
+ * Called by the QMI router (sweet_qmux.c, 1080) when CommCenter's calls come and go. */
 void sweet_ipa_call(uint32_t mux, int up, uint32_t gw);
 __END_DECLS
 #endif

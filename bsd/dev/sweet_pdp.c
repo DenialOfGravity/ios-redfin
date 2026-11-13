@@ -427,6 +427,31 @@ sweet_pdp_link(uint32_t unit, int up)
 	return 0;
 }
 
+/* 1080: the unit that carries QMAP mux id mux (-1 none) */
+int
+sweet_pdp_mux_unit(uint32_t mux)
+{
+	for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
+		if (os_atomic_load(&pdp_mux[i], relaxed) == (mux & 0xff)) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+/* 1080: pdp_ip<unit> carries mux from now on (the QMI router learned CommCenter's binding); 0 ok */
+int
+sweet_pdp_set_mux(uint32_t unit, uint32_t mux)
+{
+	if (unit >= SWEET_PDP_NUNITS || mux > 255) {
+		return EINVAL;
+	}
+	uint32_t old = os_atomic_load(&pdp_mux[unit], relaxed);
+	os_atomic_store(&pdp_mux[unit], mux, relaxed);
+	SAY("mux table: pdp_ip%u mux %u -> %u (CommCenter's binding)\n", unit, old, mux);
+	return 0;
+}
+
 void
 sweet_pdp_block(uint32_t index, int on)
 {

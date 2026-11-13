@@ -20,6 +20,8 @@ void sweet_pdp_set_output(sweet_pdp_output_fn fn);      /* NULL = drop (counted)
 int  sweet_pdp_link(uint32_t unit, int up);
 void sweet_pdp_block(uint32_t index, int on);           /* AppleIPAppender blockPDPTraffic */
 void sweet_pdp_unblock_all(void);
+int  sweet_pdp_mux_unit(uint32_t mux);                 /* 1080: unit carrying QMAP mux id mux, -1 none */
+int  sweet_pdp_set_mux(uint32_t unit, uint32_t mux);   /* 1080: the QMI router learned CommCenter's binding */
 __END_DECLS
 
 #endif

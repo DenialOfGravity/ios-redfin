@@ -1806,6 +1806,9 @@ sweet_ipa_call(uint32_t mux, int up, uint32_t gw)
 	if (up && gw) {
 		gw_mux[mux & 0xff] = gw;
 	}
+	if (!up) {
+		gw_mux[mux & 0xff] = 0;         /* 1080: the call went: no keep-alive to its old gateway */
+	}
 	if (up) {
 		lck_mtx_lock(&ipa_lock);
 		arm_req = 1;
