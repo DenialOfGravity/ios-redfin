@@ -19,7 +19,7 @@
  *   sweet_pdp_link(unit, up)                          link state.
  *   sweet_pdp_block(index, on)                        AppleIPAppender blockPDPTraffic: output dropped while set.
  * Sysctls: kern.sweet_pdp_mux (RW string, 8 mux ids, default unit + 1), kern.sweet_pdp_mtu (RW int),
- * kern.sweet_pdp_stats (RO string), kern.sweet_pdp_test (RW int: N = loopback self-test on pdp_ipN, -1 = off).
+ * kern.sweet_pdp_stats (RO string), kern.sweet_pdp_test (RW int: N = loopback self-test on pdp_ipN, -1 = off; 1089: 8 or 255 = off too).
  * Self-test: unit N's link goes up and its output answers IPv4 ICMP echo requests with echo replies through
  * sweet_pdp_input, so `ifconfig pdp_ipN 10.99.0.1 10.99.0.2 up; ping 10.99.0.2` proves the ifnet path end to end.
  * Turning it off gives the unit back to the registered hook and the link state it had before.
@@ -488,7 +488,10 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
 	if (!sweet_pdp_enabled() || !os_atomic_load(&pdp_created, acquire)) {
 		return ENXIO;
 	}
-	if (v < -1 || v >= SWEET_PDP_NUNITS) {
+	if (v == 255 || v == (int)SWEET_PDP_NUNITS) {
+		v = -1;         /* 1089: "off" for tools that cannot write -1 (sctl) */
+	}
+	if (v < -1 || v >= (int)SWEET_PDP_NUNITS) {     /* 1089: signed compare (8u made -1 EINVAL) */
 		return EINVAL;
 	}
 	lck_mtx_lock(&pdp_mtx);
@@ -512,7 +515,7 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_test, "I",
-    "redfin 1075: loopback self-test (N = pdp_ipN link up, its output echoes IPv4 ICMP echo requests back as replies; -1 off)");
+    "redfin 1075: loopback self-test (N = pdp_ipN link up, its output echoes IPv4 ICMP echo requests back as replies; -1, 8 or 255 off)");
 
 static int
 sysctl_pdp_mtu SYSCTL_HANDLER_ARGS

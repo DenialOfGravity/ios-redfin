@@ -47,6 +47,8 @@
  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
  * 1085: kern.sweet_qmi_plmnblip (0 off default, 1 on): _plmnblip_ms after a re-publish SysInfo shot, one SysInfo indication
  *       with the LTE PLMN's MNC changed to 9s, then the modem's real one 300 ms later (CommCenter re-publishes, SOS gone).
+ * 1089: bug fix: the poll's clock is re-read after CommCenter's records; entries stamped after it no longer wrap to
+ *       "5 s old" (bogus NO ANSWER + kick, lost request copy -> data mux -1, instant hold/own-request timeouts).
  * 1088: kern.sweet_data_opts & 0x4 (default on): the router's own WDA SetDataFormat (wland's X1 values) once per modem
  *       boot when data forwarding is on (CommCenter never sends one here); StartNetworkInterface held until it is answered.
  * 1087: kern.sweet_qmi_republish 4 = as 3, plus the PLMN withheld from CommCenter until the activation went (NAS
@@ -1675,7 +1677,7 @@ hold_poll(uint64_t now)
 	if (act_waiting || wh_active(now)) {
 		return;         /* 1084/1087: no hold timeout while the activation is deferred / the PLMN is withheld */
 	}
-	if (now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
+	if (now > B->holdq[0].t && now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {   /* 1089 */
 		held_rel_to++;
 		hold_open(B->holdq[0].pipe, B->holdq[0].sess, 0, "timeout, no BSP activation");
 	}
@@ -4154,7 +4156,7 @@ data_poll(uint64_t now)
 			    pipe_name[h->pipe], h->sess, h->cid, (unsigned long long)(now - h->t), !(data_opts & DOPT_WDA_OWN) ? "not the "
 			    "router's (opts & 0x4 clear)" : wda_st == 2 ? "set" : "gave up");
 			d_start(h->pipe, h->cid, h->f, h->n);
-		} else if (h->kind == DH_START && now - h->t >= D_HELD_START_MS) {
+		} else if (h->kind == DH_START && now > h->t && now - h->t >= D_HELD_START_MS) {
 			dst.to_start++;
 			d_hold_answer(h, QMI_ERR_CALL_FAILED, sweet_ipa_ready() ? "the router's WDA SetDataFormat not answered in 15 s" :
 			    "IPA data plane not ready in 15 s");
@@ -4168,7 +4170,7 @@ data_poll(uint64_t now)
 			dst.rel_prof++;
 			d_prof_log(h->pipe, h->cid, h->msg, h->f + 7, h->n - 7, "released (backup acknowledged)");
 			d_fwd(h->pipe, h->svc, h->cid, h->f, h->n);
-		} else if (h->kind == DH_PROF && now - h->t >= D_HELD_PROF_MS) {
+		} else if (h->kind == DH_PROF && now > h->t && now - h->t >= D_HELD_PROF_MS) {
 			dst.to_prof++;
 			d_hold_answer(h, QMI_ERR_DEVICE_NOT_READY, "no acknowledged profile backup in 60 s");
 		} else if (h->kind == DH_PROF && pb_state == 0) {
@@ -4177,7 +4179,7 @@ data_poll(uint64_t now)
 	}
 	for (int i = 0; i < D_NOWN; i++) {
 		struct down *o = &D->own[i];
-		if (!o->used || now - o->t < D_OWN_MS) {
+		if (!o->used || now <= o->t || now - o->t < D_OWN_MS) {   /* 1089 */
 			continue;
 		}
 		o->used = 0;
@@ -4940,6 +4942,7 @@ sweet_qmux_poll(void)
 		handle(r->pipe, r->sess, r->type, r->d, r->len);
 		kfree_data(r, sizeof(*r) + r->len);
 	}
+	now = sbb_ms();                 /* 1089: the records above stamped pending/held/own entries later than the old now */
 	if (now >= next_check) {
 		next_check = now + 10000;
 		policy_poll(false);
@@ -4949,7 +4952,7 @@ sweet_qmux_poll(void)
 	update_ready();
 	for (int i = 0; i < NPEND; i++) {
 		struct pend *x = &B->pend[i];
-		if (x->used && now - x->t > 5000) {
+		if (x->used && now > x->t && now - x->t > 5000) {      /* 1089: no unsigned wrap for entries newer than now */
 			x->used = 0;
 			if (dtmflog) {  /* 1086: which request it was */
 				LOG("NO ANSWER in 5 s: %s(0x%02x) msg 0x%04x txn %u port %#x\n", svc_name(x->svc), x->svc, x->msg, x->txn, x->port);
