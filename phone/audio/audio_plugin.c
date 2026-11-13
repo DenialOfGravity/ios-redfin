@@ -50,6 +50,21 @@
  * device, and leaves it there -- its routing tables keep the iPhone X's speaker in software volume
  * mode, so the volume buttons and Control Center scale the samples themselves, and at 0 what is
  * written is silence (on which the kernel keeps the amplifiers off).
+ *
+ * The receiver (ws-n-call-route; only with the flag file /var/local/redwood-call-route, read when the plug-in loads:
+ * absent or 0 = all of the above and nothing more). VirtualAudio's codec device (Device_Codec_Aspen, the one made for
+ * the UID "Codec") makes its output ports from the codec's output mute controls: "Built-In Receiver" when the device
+ * has kAudioDevicePropertyMute on output element 3, "Built-In Speaker" on element 4 (AudioObjectHasProperty({'mute',
+ * 'outp', 3|4}), VirtualAudio 0x24006c/0x240358). Without a receiver port a call has one output only and the in-call
+ * screen shows no route (Speaker) button. So with the flag:
+ *   1  "Codec" also gets a stereo output (what iOS plays to the receiver; thrown away: call audio runs in the DSP) and a
+ *      mute control on output element 3 = the receiver port
+ *   2  as 1, and a mute control on element 4 too (the speaker port then comes from the codec as on an iPhone; an
+ *      experiment: today's speaker port comes from "Speaker", and two of them may upset VirtualAudio)
+ * What VirtualAudio does with the mutes is how it picks the port: the receiver unmuted = Receiver, the receiver muted
+ * (or element 4 unmuted) = Speaker. Each change goes to the kernel (ioctl REDWOOD_AUDIO_SET_CALL_ROUTE, xnu 1086:
+ * kern.sweet_voice_route), which moves a running call between the earpiece and speaker amplifiers. Logged by the
+ * kernel as "SWEET VOICE: iOS route: Receiver|Speaker".
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFPlugInCOM.h>
@@ -197,8 +212,22 @@ enum {
 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
-	OBJECT_LAST = OBJECT_CODEC_SOURCE
+	OBJECT_CODEC_OUTPUT,            /* call route: the codec's output (the receiver's), with the flag file only */
+	OBJECT_RECEIVER_MUTE,           /* call route: the codec output's mute, element 3 (the receiver port) */
+	OBJECT_SPEAKER_MUTE,            /* call route: the codec output's mute, element 4 (flag 2 only) */
+	OBJECT_LAST = OBJECT_SPEAKER_MUTE
 };
+
+#define CALL_ROUTE_FILE         "/private/var/local/redwood-call-route"
+#define RECEIVER_ELEMENT        3
+#define SPEAKER_ELEMENT         4
+#define kAudioBooleanControlClassID     'togl'
+#define kAudioMuteControlClassID        'mute'
+#define kAudioBooleanControlPropertyValue 'bcvl'
+static int call_route;                  /* the flag: 0 none, 1 receiver, 2 receiver + speaker on the codec */
+static UInt32 mutes[2] = { 1, 1 };      /* the receiver's and the codec speaker's mute, as VirtualAudio set them */
+static int route_told;                  /* what the kernel was told last: 0 nothing yet */
+static UInt64 receiver_frames;
 
 #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
 
@@ -342,6 +371,49 @@ release(__unused void *driver)
 	return 1;
 }
 
+/*
+ * Call route: the receiver unmuted = Receiver (1); else the speaker element unmuted (flag 2) or the receiver muted =
+ * Speaker (2). Told to the kernel when it changes. With the lock held.
+ */
+static void
+route_to_kernel(const char *why)
+{
+	uint32_t route = !mutes[0] ? 1 : 2;
+
+	if (call_route < 1 || (int)route == route_told) {
+		return;
+	}
+	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_ROUTE, &route) < 0) {
+		say("redwood: audio: call route %s (%s) could not be given to the kernel (%s)\n", route == 1 ? "Receiver" : "Speaker", why,
+		    strerror(errno));
+		return;
+	}
+	route_told = (int)route;
+	say("redwood: audio: call route %s (%s: receiver %s, codec speaker %s)\n", route == 1 ? "Receiver" : "Speaker", why,
+	    mutes[0] ? "muted" : "on", mutes[1] ? "muted" : "on");
+}
+
+static void
+call_route_flag(void)
+{
+	char buf[8] = "";
+	int f = open(CALL_ROUTE_FILE, O_RDONLY);
+
+	if (f >= 0) {
+		ssize_t n = read(f, buf, sizeof(buf) - 1);
+
+		buf[n > 0 ? n : 0] = 0;
+		close(f);
+	}
+	call_route = buf[0] >= '1' && buf[0] <= '2' ? buf[0] - '0' : 0;
+	if (call_route >= 1) {
+		devices[3].output = OBJECT_CODEC_OUTPUT;        /* "Codec" */
+		devices[3].output_channels = 2;
+	}
+	say("redwood: audio: call route %d (%s): %s\n", call_route, CALL_ROUTE_FILE, call_route == 0 ? "no receiver (as before)" :
+	    call_route == 1 ? "the codec has the receiver (output element 3)" : "the codec has the receiver and a speaker (elements 3, 4)");
+}
+
 static OSStatus
 initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef the_host)
 {
@@ -351,6 +423,7 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	mach_timebase_info(&timebase);
 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / REDWOOD_AUDIO_RATE;
 	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+	call_route_flag();
 	say("redwood: audio: the speaker is with the HAL (%s: %s)\n", REDWOOD_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
 	return 0;
 }
@@ -447,6 +520,35 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		}
 		return v;
+	}
+	if ((object == OBJECT_RECEIVER_MUTE && call_route >= 1) || (object == OBJECT_SPEAKER_MUTE && call_route >= 2)) {
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioBooleanControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioMuteControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_CODEC);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(object == OBJECT_RECEIVER_MUTE ? RECEIVER_ELEMENT : SPEAKER_ELEMENT);
+			break;
+		case kAudioBooleanControlPropertyValue:
+			WORD(mutes[object == OBJECT_SPEAKER_MUTE]);
+			break;
+		}
+		return v;
+	}
+	if (object == OBJECT_RECEIVER_MUTE || object == OBJECT_SPEAKER_MUTE) {
+		return v;               /* not there without the flag */
 	}
 	if (object == OBJECT_CODEC_SOURCE) {
 		switch (selector) {
@@ -573,6 +675,13 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
 				LIST(OBJECT_CODEC_SOURCE);
 			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeInput &&
+			    call_route >= 1) {
+				LIST(OBJECT_RECEIVER_MUTE);
+				if (call_route >= 2) {
+					LIST(OBJECT_SPEAKER_MUTE);
+				}
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
@@ -581,6 +690,12 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			}
 			if (d->object == OBJECT_CODEC) {
 				LIST(OBJECT_CODEC_SOURCE);
+				if (call_route >= 1) {
+					LIST(OBJECT_RECEIVER_MUTE);
+				}
+				if (call_route >= 2) {
+					LIST(OBJECT_SPEAKER_MUTE);
+				}
 			}
 			v.empty = v.size == 0;
 			break;
@@ -700,6 +815,8 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
 	} else if (object == OBJECT_CODEC_SOURCE) {
 		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
+	} else if (object == OBJECT_RECEIVER_MUTE || object == OBJECT_SPEAKER_MUTE) {
+		*settable = address->mSelector == kAudioBooleanControlPropertyValue;
 	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
@@ -794,6 +911,21 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		pthread_mutex_unlock(&lock);
 		if (host != NULL) {
 			host->PropertiesChanged(host, OBJECT_SPEAKER_VOLUME, 2, changed);
+		}
+		return 0;
+	}
+	if (object == OBJECT_RECEIVER_MUTE || object == OBJECT_SPEAKER_MUTE) {
+		AudioObjectPropertyAddress changed = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, 0 };
+
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&lock);
+		mutes[object == OBJECT_SPEAKER_MUTE] = *(const UInt32 *)data != 0;
+		route_to_kernel(object == OBJECT_SPEAKER_MUTE ? "speaker mute" : "receiver mute");
+		pthread_mutex_unlock(&lock);
+		if (host != NULL) {
+			host->PropertiesChanged(host, object, 1, &changed);
 		}
 		return 0;
 	}
@@ -894,7 +1026,7 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	if (d->running++ == 0) {
 		d->anchor = mach_absolute_time();
 		d->periods = 0;
-		if (d->output != 0) {
+		if (d->output != 0 && d->object != OBJECT_CODEC) {
 			written = refused = 0;
 			say("redwood: audio: playing\n");
 		}
@@ -924,6 +1056,10 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		}
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
+			if (receiver_frames > 0) {
+				say("redwood: audio: the receiver was played %llu frames (thrown away)\n", receiver_frames);
+				receiver_frames = 0;
+			}
 		} else if (d->output != 0) {
 			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
 			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
@@ -1198,6 +1334,8 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationReadInput) {
 		/* the speaker's and Hawking's inputs: silence */
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_CODEC_OUTPUT) {
+		receiver_frames += frames;      /* the receiver: thrown away (a call's audio runs in the DSP, xnu 1065) */
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames, io_host_time(cycle));
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
