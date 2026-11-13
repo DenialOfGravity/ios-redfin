@@ -1,0 +1,151 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2050031..ed94d95 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -831,7 +831,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_recover_stats, CTLTYPE_STRING | CTLFLAG_R
+     sysctl_sweet_ufs_recover_stats, "A", "redfin 1069: UFS error handling counters");
+ 
+ /*
+- * redfin 1077: UFS link-death diagnostics (kern.sweet_ufs_diag, boot-arg sweetufsdiag; default 0 = nothing changes).
++ * redfin 1077: UFS link-death diagnostics (kern.sweet_ufs_diag, boot-arg sweetufs & 1|2 (1078), older name sweetufsdiag=1|3; default 0 = nothing changes).
+  * Read-only MMIO, no UIC/DME command, no RPMh vote, no storage I/O, no sleeping on I/O, no lock that I/O holds.
+  *   0  off
+  *   1  armed: one snapshot when the link is healthy (at boot with the boot-arg, else when 1 is written) and, at the FIRST
+@@ -1259,15 +1259,15 @@ udx_set(int value, const char *why)
+ 	}
+ }
+ 
+-/* sweet_ufs_init, after ufs_take_over_host and before the first command: the link as ABL left it */
++/* sweet_ufs_init, after ufs_take_over_host and before the first command (after 1078's votes when those are on) */
+ static void
+-udx_boot(void)
++udx_boot(uint32_t bits)
+ {
+-	uint32_t d = 0;
+-	if (!PE_parse_boot_argn("sweetufsdiag", &d, sizeof(d)) || (d != 1 && d != 3)) {
++	uint32_t d = (bits & 2) ? 3 : (bits & 1) ? 1 : 0;
++	if (!d) {
+ 		return;
+ 	}
+-	udx_set((int)d, "boot, link as ABL left it");
++	udx_set((int)d, (bits & 4) ? "boot, after the 1078 power votes" : "boot, link as ABL left it");
+ 	printf("SWEET UFSDIAG: mode %u (%s)\n", d, d == 3 ? "first-timeout dump + 1 Hz watcher" : "first-timeout dump");
+ }
+ 
+@@ -1308,6 +1308,103 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_ufs_diag_phy, CTLFLAG_RW | CTLFLAG_LOCKED, &ud
+     "redfin 1077: 0 = the UFS diagnostics skip the PHY registers");
+ 
+ 
++/*
++ * redfin 1078: UFS power ownership (boot-arg sweetufs & 4; default off = no vote, the rails stay as ABL and the other
++ * subsystems leave them). The kernel holds, from the apps DRV's ACTIVE set, the votes Android's UFS drivers hold on
++ * redfin, so no other subsystem's vote change can take the UFS PHY or device supply away (research/cc/
++ * M1-ufs-hang-analysis.md s.5). Sent once, in sweet_ufs_init before the first command after the handoff; never
++ * un-voted, no sleep/wake set (sweet_rpmh has no sleep/wake programming; idle power collapse is off).
++ * Values (live redfin DT, recon/live.dtb; LineageOS redbull drivers):
++ *   qphy.lvl ARC 1   ufsphy_mem qcom,rpmh-resource-name = "qphy.lvl"; phy-qcom-ufs.c ufs_qcom_phy_setup_rpmh_rsc() writes
++ *                    data = 1 (on), RPMH_ACTIVE_ONLY_STATE, before the PHY rails
++ *   ldoa5  880 mV    vdda-phy (pm8150_l5, DT range 720-1056 mV): the UFS PHY asks 800-925 mV (phy-qcom-ufs.c
++ *                    VDDA_PHY_MIN_UV/MAX_UV), the other L5 users that run here ask 880 mV fixed (hsphy@88e3000 and
++ *                    ssphy@88e8000 qcom,vdd-voltage-level <0 880000 880000>, mdss_dsi_phy0 supply-min/max 880000): Android's
++ *                    aggregate with USB or the display on is 880 mV; 800 mV from this DRV could lower the rail under USB/DSI
++ *   ldoa9  1200 mV   vdda-pll + vddp-ref-clk (pm8150_l9, DT range 1152-1320 mV): phy-qcom-ufs.c VDDA_PLL_MIN_UV and
++ *                    VDDP_REF_CLK_MIN/MAX_UV 1200000
++ *   ldoc7  2950 mV   vcc (pm8150a_l7, DT range 2704-3304 mV): ufshc vcc-voltage-level <2950000 2960000> (ufshcd-pltfrm min)
++ *   smpa4  1800 mV   vccq2 (pm8150_s4, DT fixed 1800 mV); voltage + enable = exactly what btd/wland send (1800, 1); mode
++ *                    AUTO (PMIC5 HFSMPS raw 6): DT qcom,supported-modes <RET AUTO>, thresholds <0 1> uA, vccq2 load 800 mA.
++ *                    btd/wland never write the mode field, so there is no field both sides write. Skipped with sweetufs & 8.
++ * LDO mode HPM (PMIC5 LDO raw 7): DT qcom,supported-modes <LPM HPM>, qcom,mode-threshold-currents <0 1>, and the UFS loads
++ * (vdda-phy 90200 uA, vdda-pll 19000 uA, vcc 800000 uA) are above 1 uA. Same apps DRV as wland/btd: per field the last
++ * write wins; none of these resources is in wland's or btd's table (ldoa1/14, ldoc2/10/11, smpa4 v+en, cx/mss.lvl).
++ * Read-back: sweet_rpmh_write returns 0 only after every command of the TCS reported issued + completed (the ACK);
++ * the aggregated rail state is not readable from APPS.
++ */
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++static char ufs_pwr_state[400] = "off (boot-arg sweetufs & 4 not set)";
++
++static void
++ufs_pwr_vote(uint32_t bits)
++{
++	static const struct {
++		const char *res, *what;
++		unsigned n;
++		uint32_t off[3], val[3];
++		bool s4;
++	} v[] = {
++		{ "qphy.lvl", "ARC level 1 (UFS PHY on)", 1, { 0 }, { 1 }, false },
++		{ "ldoa5", "880 mV HPM on (vdda-phy)", 3, { 0, 8, 4 }, { 880, 7, 1 }, false },
++		{ "ldoa9", "1200 mV HPM on (vdda-pll, vddp-ref-clk)", 3, { 0, 8, 4 }, { 1200, 7, 1 }, false },
++		{ "ldoc7", "2950 mV HPM on (vcc)", 3, { 0, 8, 4 }, { 2950, 7, 1 }, false },
++		{ "smpa4", "1800 mV AUTO on (vccq2)", 3, { 0, 8, 4 }, { 1800, 6, 1 }, true },
++	};
++	uint64_t ns;
++	int p;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	p = snprintf(ufs_pwr_state, sizeof(ufs_pwr_state), "votes at %llu.%03llu s:", ns / NSEC_PER_SEC,
++	    (ns % NSEC_PER_SEC) / NSEC_PER_MSEC);
++	printf("SWEET UFS PWR: holding UFS power from the apps DRV at %llu.%03llu s (sweetufs 0x%x)\n", ns / NSEC_PER_SEC,
++	    (ns % NSEC_PER_SEC) / NSEC_PER_MSEC, bits);
++	for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
++		uint32_t addr = 0;
++		if (v[i].s4 && (bits & 8)) {
++			printf("SWEET UFS PWR: %s not voted (sweetufs & 8)\n", v[i].res);
++			p += snprintf(ufs_pwr_state + p, sizeof(ufs_pwr_state) - (size_t)p, " %s skipped;", v[i].res);
++			continue;
++		}
++		int fe = sweet_rpmh_find(v[i].res, &addr);
++		int e = fe ? fe : sweet_rpmh_write(v[i].res, v[i].n, v[i].off, v[i].val);
++		if (!e) {
++			printf("SWEET UFS PWR: %s addr 0x%x %s sent/ack\n", v[i].res, addr, v[i].what);
++		} else {
++			printf("SWEET UFS PWR: %s addr 0x%x %s NOT acked (error %d%s)\n", v[i].res, addr, v[i].what, e,
++			    fe ? ", cmd-db lookup" : "");
++		}
++		p += snprintf(ufs_pwr_state + p, sizeof(ufs_pwr_state) - (size_t)p, " %s %s %s;", v[i].res, v[i].what,
++		    e ? "FAILED" : "ack");
++		if (p >= (int)sizeof(ufs_pwr_state)) {
++			p = (int)sizeof(ufs_pwr_state) - 1;
++		}
++	}
++}
++
++static int
++sysctl_sweet_ufs_pwr SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, ufs_pwr_state, strlen(ufs_pwr_state) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_pwr, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_ufs_pwr, "A",
++    "redfin 1078: UFS power votes held by the kernel (boot-arg sweetufs & 4)");
++
++/* boot-arg sweetufs (1077/1078): 1 diag first-timeout dump + boot snapshot, 2 diag watcher, 4 power votes, 8 no smpa4 vote */
++static uint32_t
++ufs_bootbits(void)
++{
++	uint32_t b = 0, d = 0;
++	if (PE_parse_boot_argn("sweetufs", &b, sizeof(b))) {
++		return b;
++	}
++	if (PE_parse_boot_argn("sweetufsdiag", &d, sizeof(d)) && (d == 1 || d == 3)) {
++		return d;               /* 1077's older name: 1 = dump, 3 = dump + watcher */
++	}
++	return 0;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -1775,7 +1872,11 @@ sweet_ufs_init(void)
+ 		ufs_pm_snapshot();              /* 1069: the link as ABL made it, before anything can go wrong */
+ 	}
+ 	if (!error) {
+-		udx_boot();                     /* 1077: boot-arg sweetufsdiag=1|3: registers while the link is healthy */
++		uint32_t ub = ufs_bootbits();   /* boot-arg sweetufs: 1 diag dump, 2 diag watcher, 4 power votes, 8 no smpa4 */
++		if (ub & 4) {
++			ufs_pwr_vote(ub);       /* 1078: before the first command after the handoff */
++		}
++		udx_boot(ub);                   /* 1077: registers while the link is healthy */
+ 	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
