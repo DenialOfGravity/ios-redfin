@@ -380,12 +380,34 @@ static int find_intent(uint32_t len)
 int link_send(const void *data, uint32_t len)
 {
 	if (raw_fd >= 0) {
-		/* the kernel sends it (waiting for a modem intent itself, at most 3 s) */
-		if (write(raw_fd, data, len) == (ssize_t)len)
+		/*
+		 * The kernel sends it (waiting for a modem intent itself, at most 3 s). Kernel 1067/1068 consume only header +
+		 * hdr.size bytes and leave our 4-byte padding, so a sent packet can come back as a short write (r5bb1a: every
+		 * QMI message with a payload not a multiple of 4 was reported failed, with a stale errno). Sent = at least the
+		 * header + payload were taken; 1069 consumes the padding too.
+		 */
+		const struct qrtr_hdr *qh = data;
+		uint32_t want = len;
+		if (len >= sizeof(*qh) && qh->size <= len - sizeof(*qh))
+			want = (uint32_t)sizeof(*qh) + qh->size;
+		ssize_t r;
+		do {
+			r = write(raw_fd, data, len);
+		} while (r < 0 && errno == EINTR);
+		if (r >= (ssize_t)want)
 			return 0;
-		static unsigned told;
-		if (told++ < 20)
-			printf("link: %s write of %u bytes: %s\n", MQRTR_DEV, len, strerror(errno));
+		static unsigned told, fails;
+		int e = r < 0 ? errno : 0;
+		fails++;
+		if (told++ < 20 || fails % 100 == 0) {
+			if (r < 0)
+				printf("link: %s write of %u bytes (type %u to %u:%#x): %s (failure #%u)\n", MQRTR_DEV, len,
+				       len >= sizeof(*qh) ? qh->type : 0, len >= sizeof(*qh) ? qh->dst_node : 0,
+				       len >= sizeof(*qh) ? qh->dst_port : 0, strerror(e), fails);
+			else
+				printf("link: %s write of %u bytes: short (%zd, needed %u) (failure #%u)\n", MQRTR_DEV, len, r, want,
+				       fails);
+		}
 		return -1;
 	}
 	uint64_t start = now_ms(), end = start + 3000;
