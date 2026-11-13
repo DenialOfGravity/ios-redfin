@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/sweet_pdp.c b/bsd/dev/sweet_pdp.c
+index 62a725e..fcf81cc 100644
+--- a/bsd/dev/sweet_pdp.c
++++ b/bsd/dev/sweet_pdp.c
+@@ -19,7 +19,7 @@
+  *   sweet_pdp_link(unit, up)                          link state.
+  *   sweet_pdp_block(index, on)                        AppleIPAppender blockPDPTraffic: output dropped while set.
+  * Sysctls: kern.sweet_pdp_mux (RW string, 8 mux ids, default unit + 1), kern.sweet_pdp_mtu (RW int),
+- * kern.sweet_pdp_stats (RO string), kern.sweet_pdp_test (RW int: N = loopback self-test on pdp_ipN, -1 = off).
++ * kern.sweet_pdp_stats (RO string), kern.sweet_pdp_test (RW int: N = loopback self-test on pdp_ipN, -1 = off; 1089: 8 or 255 = off too).
+  * Self-test: unit N's link goes up and its output answers IPv4 ICMP echo requests with echo replies through
+  * sweet_pdp_input, so `ifconfig pdp_ipN 10.99.0.1 10.99.0.2 up; ping 10.99.0.2` proves the ifnet path end to end.
+  * Turning it off gives the unit back to the registered hook and the link state it had before.
+@@ -488,6 +488,9 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
+ 	if (!sweet_pdp_enabled() || !os_atomic_load(&pdp_created, acquire)) {
+ 		return ENXIO;
+ 	}
++	if (v == 255 || v == SWEET_PDP_NUNITS) {
++		v = -1;         /* 1089: "off" for tools that cannot write -1 (sctl) */
++	}
+ 	if (v < -1 || v >= SWEET_PDP_NUNITS) {
+ 		return EINVAL;
+ 	}
+@@ -512,7 +515,7 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_test, "I",
+-    "redfin 1075: loopback self-test (N = pdp_ipN link up, its output echoes IPv4 ICMP echo requests back as replies; -1 off)");
++    "redfin 1075: loopback self-test (N = pdp_ipN link up, its output echoes IPv4 ICMP echo requests back as replies; -1, 8 or 255 off)");
+ 
+ static int
+ sysctl_pdp_mtu SYSCTL_HANDLER_ARGS
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 99e2cb8..b12d5b6 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -47,6 +47,8 @@
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
+  * 1085: kern.sweet_qmi_plmnblip (0 off default, 1 on): _plmnblip_ms after a re-publish SysInfo shot, one SysInfo indication
+  *       with the LTE PLMN's MNC changed to 9s, then the modem's real one 300 ms later (CommCenter re-publishes, SOS gone).
++ * 1089: bug fix: the poll's clock is re-read after CommCenter's records; entries stamped after it no longer wrap to
++ *       "5 s old" (bogus NO ANSWER + kick, lost request copy -> data mux -1, instant hold/own-request timeouts).
+  * 1088: kern.sweet_data_opts & 0x4 (default on): the router's own WDA SetDataFormat (wland's X1 values) once per modem
+  *       boot when data forwarding is on (CommCenter never sends one here); StartNetworkInterface held until it is answered.
+  * 1087: kern.sweet_qmi_republish 4 = as 3, plus the PLMN withheld from CommCenter until the activation went (NAS
+@@ -1675,7 +1677,7 @@ hold_poll(uint64_t now)
+ 	if (act_waiting || wh_active(now)) {
+ 		return;         /* 1084/1087: no hold timeout while the activation is deferred / the PLMN is withheld */
+ 	}
+-	if (now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
++	if (now > B->holdq[0].t && now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {   /* 1089 */
+ 		held_rel_to++;
+ 		hold_open(B->holdq[0].pipe, B->holdq[0].sess, 0, "timeout, no BSP activation");
+ 	}
+@@ -4154,7 +4156,7 @@ data_poll(uint64_t now)
+ 			    pipe_name[h->pipe], h->sess, h->cid, (unsigned long long)(now - h->t), !(data_opts & DOPT_WDA_OWN) ? "not the "
+ 			    "router's (opts & 0x4 clear)" : wda_st == 2 ? "set" : "gave up");
+ 			d_start(h->pipe, h->cid, h->f, h->n);
+-		} else if (h->kind == DH_START && now - h->t >= D_HELD_START_MS) {
++		} else if (h->kind == DH_START && now > h->t && now - h->t >= D_HELD_START_MS) {
+ 			dst.to_start++;
+ 			d_hold_answer(h, QMI_ERR_CALL_FAILED, sweet_ipa_ready() ? "the router's WDA SetDataFormat not answered in 15 s" :
+ 			    "IPA data plane not ready in 15 s");
+@@ -4168,7 +4170,7 @@ data_poll(uint64_t now)
+ 			dst.rel_prof++;
+ 			d_prof_log(h->pipe, h->cid, h->msg, h->f + 7, h->n - 7, "released (backup acknowledged)");
+ 			d_fwd(h->pipe, h->svc, h->cid, h->f, h->n);
+-		} else if (h->kind == DH_PROF && now - h->t >= D_HELD_PROF_MS) {
++		} else if (h->kind == DH_PROF && now > h->t && now - h->t >= D_HELD_PROF_MS) {
+ 			dst.to_prof++;
+ 			d_hold_answer(h, QMI_ERR_DEVICE_NOT_READY, "no acknowledged profile backup in 60 s");
+ 		} else if (h->kind == DH_PROF && pb_state == 0) {
+@@ -4177,7 +4179,7 @@ data_poll(uint64_t now)
+ 	}
+ 	for (int i = 0; i < D_NOWN; i++) {
+ 		struct down *o = &D->own[i];
+-		if (!o->used || now - o->t < D_OWN_MS) {
++		if (!o->used || now <= o->t || now - o->t < D_OWN_MS) {   /* 1089 */
+ 			continue;
+ 		}
+ 		o->used = 0;
+@@ -4940,6 +4942,7 @@ sweet_qmux_poll(void)
+ 		handle(r->pipe, r->sess, r->type, r->d, r->len);
+ 		kfree_data(r, sizeof(*r) + r->len);
+ 	}
++	now = sbb_ms();                 /* 1089: the records above stamped pending/held/own entries later than the old now */
+ 	if (now >= next_check) {
+ 		next_check = now + 10000;
+ 		policy_poll(false);
+@@ -4949,7 +4952,7 @@ sweet_qmux_poll(void)
+ 	update_ready();
+ 	for (int i = 0; i < NPEND; i++) {
+ 		struct pend *x = &B->pend[i];
+-		if (x->used && now - x->t > 5000) {
++		if (x->used && now > x->t && now - x->t > 5000) {      /* 1089: no unsigned wrap for entries newer than now */
+ 			x->used = 0;
+ 			if (dtmflog) {  /* 1086: which request it was */
+ 				LOG("NO ANSWER in 5 s: %s(0x%02x) msg 0x%04x txn %u port %#x\n", svc_name(x->svc), x->svc, x->msg, x->txn, x->port);
