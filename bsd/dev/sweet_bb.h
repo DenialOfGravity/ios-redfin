@@ -13,7 +13,7 @@
 #define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
 #define SBB_REALBOOT            0x40u   /* 1071 (P4 phase 2b): ABM's real baseband boot against an emulated Mav17 BHI/Sahara
 					 * target (pipes pbl/sahara, images discarded); the shouldBoot=0 page patch is off */
-#define SBB_BITS                0x43u   /* bits this kernel implements (others are later phases: accepted, ignored) */
+#define SBB_BITS                0x53u   /* bits this kernel implements (others are later phases: accepted, ignored) */
 
 #define SBB_NODE_MODEM          0u
 #define SBB_NODE_APPS           1u
