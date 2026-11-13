@@ -1340,6 +1340,13 @@ sysctl_mdm_up SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mdm_up, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_mdm_up, "I",
     "redfin 1067: modem link state (0 down, 1 GLINK version done, 2 IPCRTR open); write 1 = make the link again (after a modem start)");
 
+/* 1071: the same value for the AppleBasebandPCI stand-in's real-boot emulation (SweetABP.cpp, sweetbb & 0x40) */
+int
+sbb_link_state(void)
+{
+	return gl.state;
+}
+
 static int
 sysctl_bb_state SYSCTL_HANDLER_ARGS
 {
@@ -1405,6 +1412,9 @@ sweet_bb_init(void)
 	int major = cdevsw_add(-1, &mq_cdevsw);
 	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "sweet-mqrtr");
 	SAY("/dev/sweet-mqrtr %s (major %d)\n", node ? "made" : "FAILED", major);
+	if (v & SBB_REALBOOT) {
+		SAY("sweetbb & 0x40: real ABM baseband boot (emulated Mav17 BHI/Sahara on pipes pbl/sahara, images discarded)\n");
+	}
 	if (v & SBB_QMUX) {
 		sweet_qmux_start();
 	}

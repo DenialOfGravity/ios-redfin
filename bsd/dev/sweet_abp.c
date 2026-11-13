@@ -39,6 +39,18 @@
  * copy-on-write copy of that one page (vm_protect VM_PROT_COPY), write "mov w0,#0" over "mov w0,#1",
  * back to r-x, I-cache sync, read back. Only that process's map changes; no file is touched.
  * Log lines "SWEET ABP:".
+ *
+ * 1071 (P4 phase 2b): with boot-arg sweetbb & 0x40 (sweet_bb.h SBB_REALBOOT) the fake boot is OFF even when sweetabp & 2
+ * (or sweetabmfake) asks for it: ABM runs its real performBootup (BBUpdater, Mav17 firmware from the Preboot personalized
+ * folder) against the emulated BHI ("pbl") and Sahara ("sahara") pipes of SweetABP.cpp, which throw the images away.
+ * sweetabp & 2 without sweetbb & 0x40 keeps the page patch (fallback). Knobs (sysctl, RW):
+ *   kern.sweet_abm_upwait_ms  ms AppleBaseband "power on" waits for kern.sweet_mdm_up == 2 (default 60000; 0 = no wait)
+ *   kern.sweet_abm_img        Sahara image id the target asks for in READ_DATA (default 0x17 = EUR10 item RPM)
+ *   kern.sweet_abm_imglen     bytes asked for (default 0x40; the data is counted and dropped)
+ *   kern.sweet_abm_chipid     chip id in the BHI MSM HW ID register (reg 3, u32 at +4)
+ *   kern.sweet_abm_snum       serial number register (reg 0)
+ *   kern.sweet_abm_stats      the emulation's state and counters
+ * Log lines "SWEET ABM:".
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -77,6 +89,13 @@ extern void SweetABPSetBootstage(uint32_t stage);
 extern void SweetABPMessage(uint32_t code);
 extern void SweetABPBasebandMessage(uint32_t code);
 uint32_t sweet_abp_readyms;     /* 1064: ms the baseband stays "in reset" after ABM starts (0 = never; SweetABP.cpp) */
+/* 1071: real-boot emulation knobs (SweetABP.cpp) */
+uint32_t sweet_abm_upwait_ms = 60000;
+uint32_t sweet_abm_img = 0x17;
+uint32_t sweet_abm_imglen = 0x40;
+uint32_t sweet_abm_chipid = 0x000940e1;
+uint32_t sweet_abm_snum = 0x5eed0001;
+extern int SweetABMStats(char *buf, size_t len);
 extern int SweetABPPublish(bool on, const char *why);
 extern int SweetABPPublished(void);
 
@@ -426,6 +445,12 @@ sweet_abp_init(void)
 	if (fake) {
 		on |= ABP_BIT_FAKEBOOT;
 	}
+	if ((sweet_bb & SBB_REALBOOT) && (on & ABP_BIT_FAKEBOOT)) {
+		printf("SWEET ABM: sweetbb & 0x40: the shouldBoot=0 page patch (sweetabp & 2 / sweetabmfake) is disabled, ABM boots for real\n");
+	}
+	if ((sweet_bb & SBB_REALBOOT) && !(on & ABP_BIT_SERVICES)) {
+		printf("SWEET ABM: sweetbb & 0x40 without sweetabp & 1: no AppleBasebandPCI stand-in, nothing to boot against\n");
+	}
 	if (!on) {
 		return;
 	}
@@ -455,7 +480,8 @@ static const uint32_t abm_expect[10] = {
 	0xf019f5c0,     /* adrp x0, sOnce@page */
 };
 
-static int abm_state;                   /* 0 never tried, 1 patched, 2 already patched, < 0 the step that failed */
+static int abm_state;                   /* 0 never tried, 1 patched, 2 already patched, 3 skipped (1071 real boot), < 0 failed step */
+static uint32_t abm_skipped;
 static int abm_pid;
 static uint32_t abm_count;
 
@@ -476,6 +502,13 @@ sweet_abp_dyld_hook(void *pv, uint64_t cache_start)
 	}
 	proc_selfname(name, (int)sizeof(name));
 	if (strcmp(name, "CommCenter") != 0) {
+		return;
+	}
+	if (sweet_bb & SBB_REALBOOT) {  /* 1071: real ABM boot: no page patch */
+		if (abm_skipped++ < 4) {
+			printf("SWEET ABM: CommCenter pid %d: shouldBoot() left alone (sweetbb & 0x40, real boot)\n", proc_selfpid());
+		}
+		abm_state = 3;
 		return;
 	}
 	int pid = proc_selfpid();
@@ -684,4 +717,32 @@ sysctl_abp_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_stats, "A",
     "redfin 1061: AppleBasebandPCI stand-in counters");
+/* ---- 1071: real ABM boot (sweetbb & 0x40) knobs ---- */
+
+SYSCTL_UINT(_kern, OID_AUTO, sweet_abm_upwait_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_abm_upwait_ms, 0,
+    "redfin 1071: ms AppleBaseband power-on waits for kern.sweet_mdm_up == 2 under sweetbb & 0x40 (0 = no wait)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_abm_img, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_abm_img, 0,
+    "redfin 1071: Sahara image id the emulated target asks for (default 0x17 = RPM)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_abm_imglen, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_abm_imglen, 0,
+    "redfin 1071: bytes the emulated Sahara target asks for (counted, dropped; 1..0x1000)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_abm_chipid, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_abm_chipid, 0,
+    "redfin 1071: chip id in the emulated BHI MSM HW ID register");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_abm_snum, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_abm_snum, 0,
+    "redfin 1071: emulated BHI serial number register");
+
+static int
+sysctl_abm_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char *s = kalloc_data(1024, Z_WAITOK | Z_ZERO);
+	if (s == NULL) {
+		return ENOMEM;
+	}
+	int n = SweetABMStats(s, 1024);
+	snprintf(s + n, 1024 - (size_t)n, " | shouldBoot patch state %d (3 = skipped for real boot)", abm_state);
+	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
+	kfree_data(s, 1024);
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_abm_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_abm_stats, "A",
+    "redfin 1071: real ABM boot emulation (BHI/Sahara) state and counters");
 #endif /* ARM64_BOARD_CONFIG_SWEET */

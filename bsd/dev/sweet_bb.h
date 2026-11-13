@@ -10,7 +10,9 @@
 
 #define SBB_LINK                0x01u   /* kernel GLINK/QRTR to the modem + /dev/sweet-mqrtr (wland's link backend) */
 #define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
-#define SBB_BITS                0x03u   /* bits this kernel implements (0x04.. are later phases: accepted, ignored) */
+#define SBB_REALBOOT            0x40u   /* 1071 (P4 phase 2b): ABM's real baseband boot against an emulated Mav17 BHI/Sahara
+					 * target (pipes pbl/sahara, images discarded); the shouldBoot=0 page patch is off */
+#define SBB_BITS                0x43u   /* bits this kernel implements (others are later phases: accepted, ignored) */
 
 #define SBB_NODE_MODEM          0u
 #define SBB_NODE_APPS           1u
@@ -35,6 +37,7 @@ extern uint32_t sweet_bb;               /* boot-arg sweetbb (RO kern.sweet_bb) *
 uint64_t sbb_ms(void);
 void sbb_wake(void);
 bool sbb_link_open(void);
+int sbb_link_state(void);               /* 1071: kern.sweet_mdm_up (0 down, 1 version done, 2 IPCRTR open) */
 int sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
 
 /* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
