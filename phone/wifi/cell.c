@@ -790,7 +790,7 @@ static int read_opts(void)
 		xs_read_words(b);
 	}
 	rd_fam = strstr(b, "ipfam=6") ? 6 : 4;
-	if (strstr(b, "datatest=1"))
+	if (strstr(b, "datatest=1") && !link_kernel_data())	/* xnu 1076: no data call of our own */
 		o |= OPT_DATATEST;
 	if (strstr(b, "slots=1"))
 		o |= OPT_SLOTS;
@@ -806,9 +806,9 @@ static int read_opts(void)
 		o |= OPT_X1HOLD;				/* X1 does not stop the call after 20 s */
 	if (strstr(b, "x1keep=1"))
 		o |= OPT_X1KEEP;				/* a call stop leaves ipagsi running (call-restart test) */
-	if (strstr(b, "ipadata=1"))
+	if (strstr(b, "ipadata=1") && !link_kernel_data())
 		o |= OPT_IPADATA | OPT_WDS | OPT_DATATEST;	/* the data path needs X1's call and data port */
-	if (strstr(b, "ipacmd=1"))
+	if (strstr(b, "ipacmd=1") && !link_kernel_data())
 		o |= OPT_IPACMD | OPT_IPADATA;			/* also set up channel 5 (its table init is not written yet) */
 	if (strstr(b, "nolte=1"))
 		o |= OPT_NOLTE;

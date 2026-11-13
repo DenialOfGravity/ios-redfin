@@ -57,6 +57,22 @@ static int kernel_link_wanted(void)
 	return (v & 1) != 0;
 }
 
+/* xnu 1076: with kern.sweet_bb & 0x10 the kernel owns IPA meminit, GSI, IPA QMI (0x31) and DPM: wland keeps the
+ * platform steps (IP0 vote, PAS ipa_fws, SMMU) and SMP2P "ipa", hands over through kern.sweet_ipa_up, and runs no
+ * ipa/ipagsi/ipaqmi bring-up and no data call (X1) of its own. One log line. */
+int link_kernel_data(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		uint32_t b = 0;
+		size_t n = sizeof(b);
+		v = !sysctlbyname("kern.sweet_bb", &b, &n, NULL, 0) && (b & 0x10);
+		if (v)
+			printf("wland: kern.sweet_bb & 0x10: the kernel owns the IPA data path (xnu 1076): wland does IP0/PAS/SMMU + SMP2P \"ipa\" only, no ipa/ipagsi/ipaqmi bring-up, no data call of its own\n");
+	}
+	return v;
+}
+
 int link_is_kernel(void)
 {
 	return raw_fd >= 0;
