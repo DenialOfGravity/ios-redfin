@@ -8,6 +8,7 @@
 #   oslog    stream the unified log                           prefs    CFPreferences read/write (no defaults)
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
+#   smemdump toc | pair H0 H1 [watch N] [--read]: SMEM $TOC and GLINK FIFO indices of a host pair (read-only)
 #   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
 #   sweetmon    monitor daemon: samples, klog tail, kdebug traces over TCP 5150 (docs/redfin/sweetmon.md)
 #   expt, exq, runmigrator: one-off probes of ExtensionFoundation and DataMigration (runmigrator needs
@@ -26,7 +27,7 @@ build() {	# NAME SOURCE [FLAGS...]
 		codesign -f -s - "out/$name"
 	fi
 }
-for c in membw pstack psx sweettrace simpin; do build $c $c.c; done
+for c in membw pstack psx sweettrace simpin smemdump; do build $c $c.c; done
 for m in autolock expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
