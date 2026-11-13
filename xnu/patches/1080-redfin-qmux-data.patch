@@ -1,0 +1,1513 @@
+diff --git a/bsd/dev/sweet_ipa.c b/bsd/dev/sweet_ipa.c
+index 48c56de..a6a4a89 100644
+--- a/bsd/dev/sweet_ipa.c
++++ b/bsd/dev/sweet_ipa.c
+@@ -1806,6 +1806,9 @@ sweet_ipa_call(uint32_t mux, int up, uint32_t gw)
+ 	if (up && gw) {
+ 		gw_mux[mux & 0xff] = gw;
+ 	}
++	if (!up) {
++		gw_mux[mux & 0xff] = 0;         /* 1080: the call went: no keep-alive to its old gateway */
++	}
+ 	if (up) {
+ 		lck_mtx_lock(&ipa_lock);
+ 		arm_req = 1;
+diff --git a/bsd/dev/sweet_ipa.h b/bsd/dev/sweet_ipa.h
+index 427bfb2..9ef6331 100644
+--- a/bsd/dev/sweet_ipa.h
++++ b/bsd/dev/sweet_ipa.h
+@@ -25,7 +25,8 @@ void sweet_ipa_qrtr_in(uint32_t type, uint32_t src_node, uint32_t src_port, uint
+  * WDS StartNetworkInterface until then. Lock-free, never blocks. */
+ int sweet_ipa_ready(void);
+ /* optional, for the router / PDP manager: a call came up (or went) on mux; gw = the call's IPv4 gateway (network order,
+- * 0 = unknown) for the keep-alive. Arms the RX join like the first packet does. */
++ * 0 = unknown) for the keep-alive. Arms the RX join like the first packet does; up 0 forgets the mux's gateway (1080).
++ * Called by the QMI router (sweet_qmux.c, 1080) when CommCenter's calls come and go. */
+ void sweet_ipa_call(uint32_t mux, int up, uint32_t gw);
+ __END_DECLS
+ #endif
+diff --git a/bsd/dev/sweet_pdp.c b/bsd/dev/sweet_pdp.c
+index 301ee25..62a725e 100644
+--- a/bsd/dev/sweet_pdp.c
++++ b/bsd/dev/sweet_pdp.c
+@@ -427,6 +427,31 @@ sweet_pdp_link(uint32_t unit, int up)
+ 	return 0;
+ }
+ 
++/* 1080: the unit that carries QMAP mux id mux (-1 none) */
++int
++sweet_pdp_mux_unit(uint32_t mux)
++{
++	for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
++		if (os_atomic_load(&pdp_mux[i], relaxed) == (mux & 0xff)) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* 1080: pdp_ip<unit> carries mux from now on (the QMI router learned CommCenter's binding); 0 ok */
++int
++sweet_pdp_set_mux(uint32_t unit, uint32_t mux)
++{
++	if (unit >= SWEET_PDP_NUNITS || mux > 255) {
++		return EINVAL;
++	}
++	uint32_t old = os_atomic_load(&pdp_mux[unit], relaxed);
++	os_atomic_store(&pdp_mux[unit], mux, relaxed);
++	SAY("mux table: pdp_ip%u mux %u -> %u (CommCenter's binding)\n", unit, old, mux);
++	return 0;
++}
++
+ void
+ sweet_pdp_block(uint32_t index, int on)
+ {
+diff --git a/bsd/dev/sweet_pdp.h b/bsd/dev/sweet_pdp.h
+index f0f6c5d..4159f98 100644
+--- a/bsd/dev/sweet_pdp.h
++++ b/bsd/dev/sweet_pdp.h
+@@ -20,6 +20,8 @@ void sweet_pdp_set_output(sweet_pdp_output_fn fn);      /* NULL = drop (counted)
+ int  sweet_pdp_link(uint32_t unit, int up);
+ void sweet_pdp_block(uint32_t index, int on);           /* AppleIPAppender blockPDPTraffic */
+ void sweet_pdp_unblock_all(void);
++int  sweet_pdp_mux_unit(uint32_t mux);                 /* 1080: unit carrying QMAP mux id mux, -1 none */
++int  sweet_pdp_set_mux(uint32_t unit, uint32_t mux);   /* 1080: the QMI router learned CommCenter's binding */
+ __END_DECLS
+ 
+ #endif
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 6b77d43..bd1985a 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -43,6 +43,9 @@
+  * kern.sweet_qmux_dump (write: the per-(svc, msg) table to the log). RD kern.sweet_bb_stats (sweet_bb.c).
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
+  * 1073: kern.sweet_qmi_republish (0 off default, 1 auto once per CommCenter session, write 2 = now), _republish_ms (20).
++ * 1080: with sweetbb & 0x10 and kern.sweet_qmi_rules 1, CommCenter owns cellular data (WDS/WDA/QOS/DSD/DFS forwarded with
++ *       translation, see the data section before handle()); kern.sweet_data_fwd (kill switch), _opts, _stats,
++ *       kern.sweet_wds_profiles_bak / _ack / kern.sweet_wds_gate_ids (profile-write gate).
+  * Log lines "SWEET QMUX:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -59,7 +62,10 @@
+ #include <kern/thread_call.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
++#include <stdarg.h>
+ #include "sweet_bb.h"
++#include "sweet_ipa.h"
++#include "sweet_pdp.h"
+ 
+ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
+ extern void SweetABPBasebandMessage(uint32_t code);
+@@ -111,9 +117,17 @@ struct cl {
+ 	int used;                       /* 0 free, 1 active, 2 idle (pooled) */
+ 	uint32_t pipe, sess, port;
+ 	uint8_t svc, cid;
++	uint8_t dat;                    /* 1080: a CommCenter data client (used 3 = closing: StopNetworkInterface out) */
+ 	unsigned fwd, resp, ind;
+ };
+ static struct cl cl[NCL];
++
++/* 1080 (CommCenter owns cellular data): the data services and the hooks the code before the data section calls */
++#define DSVC(s)                 ((s) == 0x01 || (s) == 0x04 || (s) == 0x1a || (s) == 0x2a || (s) == 0x30)
++static bool data_active(void);
++static bool d_port_reserved(uint32_t port);
++static void d_cl_gone(struct cl *c);
++static int d_release(struct cl *c, const char *why);
+ static uint32_t next_port_gen;
+ static unsigned late;
+ 
+@@ -1237,6 +1251,10 @@ decide(unsigned svc, unsigned msg, const uint8_t *rq, uint32_t rqn, int *err, ch
+ 		}
+ 	}
+ 	from_conf = p != NULL;
++	static const struct pol data_pol = { 0, POL_ANY, ACT_FWD, 0, "data: CommCenter owns cellular data (1080, kern.sweet_data_fwd)", 0 };
++	if (!p && DSVC(svc) && data_active()) {
++		p = &data_pol;
++	}
+ 	if (qmi_filter != 0) {
+ 		for (size_t i = 0; i < ntab && !p; i++) {
+ 			if (tab[i].svc == (int)svc && tab[i].msg == (int)msg) {
+@@ -1553,6 +1571,7 @@ cl_destroy(struct cl *c, const char *why)
+ 	if (!c->used) {
+ 		return;
+ 	}
++	d_cl_gone(c);                   /* 1080 */
+ 	pend_drop_port(c->port);
+ 	uint32_t pkt[5] = { SBB_QRTR_DEL_CLIENT, SBB_NODE_APPS, c->port, 0, 0 };
+ 	sbb_qrtr_send(SBB_QRTR_DEL_CLIENT, c->port, SBB_NODE_BCAST, SBB_PORT_CTRL, pkt, sizeof(pkt));
+@@ -1566,6 +1585,9 @@ cl_free(struct cl *c, const char *why)
+ 	if (c->used != 1) {
+ 		return;
+ 	}
++	if (d_release(c, why)) {        /* 1080: CommCenter's WDS/QOS data clients: calls stopped, never pooled */
++		return;
++	}
+ 	if (!reuse) {
+ 		LOG("%s/%u %s(0x%02x) cid %u port %#x released (%s; %u fwd, %u resp, %u ind)\n", pipe_name[c->pipe], c->sess,
+ 		    svc_name(c->svc), c->svc, c->cid, c->port, why, c->fwd, c->resp, c->ind);
+@@ -1621,7 +1643,7 @@ cl_get(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, int create)
+ 	uint32_t port = 0;
+ 	for (unsigned k = 0; k < SBB_QMUX_NPORTS && !port; k++) {
+ 		uint32_t pt = SBB_QMUX_PORT0 + (next_port_gen++ % SBB_QMUX_NPORTS);
+-		int busy = 0;
++		int busy = d_port_reserved(pt);
+ 		for (int i = 0; i < NCL; i++) {
+ 			busy |= cl[i].used && cl[i].port == pt;
+ 		}
+@@ -2543,6 +2565,1124 @@ svc_forward(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_
+ 	pend_add(&x);
+ }
+ 
++static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err);
++/*
++ * ---- 1080 (P4 M3c): CommCenter owns cellular data ----
++ * Active only when sweetbb & 0x10 (SBB_DATA: 1075 pdp_ip + 1076 kernel IPA) AND kern.sweet_qmi_rules = 1 AND
++ * kern.sweet_data_fwd = 1 (default 1; write 0 = data services answered err 0x5e again, no reboot: live calls stopped,
++ * data clients given back). Otherwise nothing below runs and the router behaves exactly as before.
++ *   - WDS 0x01, WDA 0x1a, QOS 0x04, DSD 0x2a, DFS 0x30 forwarded per client (the policy text's exact/wildcard lines still
++ *     win); DPM stays err (the kernel IPA opens the DPM port itself). WDS/QOS clients are never pooled: released (CTL
++ *     Release / Sync / session close) -> StopNetworkInterface for every packet data handle learned from its
++ *     StartNetworkInterface answers (own txn from the client's port, answers not forwarded), DEL_CLIENT after the last
++ *     answer or 5 s.
++ *   - WDA SetDataFormat 0x0020: link layer / aggregation / endpoint TLVs rewritten to what sweet_ipa.c implements (wland's
++ *     proven X1 request with qmapv5=1: 0x11 raw IP 2, 0x12/0x13 QMAPv5 9, 0x15 DL 16 datagrams, 0x16 DL 0x3800 bytes,
++ *     0x17 endpoint {4 embedded, 1}; 0x10 QoS header and 0x19 flow control forced 0 when sent; missing ones added); the
++ *     answer (and GetDataFormat 0x0021's) shows CommCenter its own values for the ids it sent (0x10-0x16, same length).
++ *   - WDS BindMuxDataPort 0x00a2 / QOS BindDataPort 0x002b: endpoint TLV 0x10 = {4, 1} (added when absent); mux TLV 0x11
++ *     recorded per client; a mux missing from kern.sweet_pdp_mux is given a free pdp_ip unit (logged).
++ *   - WDS 0x5564 (Apple-only) answered success here.
++ *   - WDS StartNetworkInterface 0x0020 held until sweet_ipa_ready() (15 s, then QMI error 0x0e CALL_FAILED); at most 6
++ *     per minute per mux (else 0x0e). Success -> pdp_ip link up + sweet_ipa_call(mux, 1, gw); the IPv4 gateway comes
++ *     from CommCenter's own GetRuntimeSettings answer, else after 2 s from the router's own 0x002d on that client's port
++ *     (answer not forwarded). StopNetworkInterface answer / PktSrvcStatus ind "disconnected" / client gone -> when the
++ *     mux has no live handle left: sweet_ipa_call(mux, 0, 0) + pdp_ip link down.
++ *   - Profile-write gate (user decision D2): WDS Create/Modify/Delete profile (0x0027/0x0028/0x0029) and the ids in
++ *     kern.sweet_wds_gate_ids (default 0x004a set default profile, 0x0093 set LTE attach PDN list) are held until the
++ *     modem's 3GPP profile list + every profile's settings (0x002a/0x002b, read-only, router port 0x43ff, credential TLVs
++ *     0x1b/0x1c/0x9b/0x9c removed) were exposed once by RO root-only kern.sweet_wds_profiles_bak and userland wrote 1
++ *     to kern.sweet_wds_profiles_ack (agent/stage/wds-profile-backup.sh); 60 s max, then QMI error 0x34. The backup is
++ *     started at CommCenter's first WDS request, before any write. After the ack each write passes, logged with the
++ *     profile and TLV ids only.
++ *   - kern.sweet_data_stats (RO), kern.sweet_data_fwd (kill switch), kern.sweet_data_opts (1 = drop WDA request TLVs
++ *     outside 0x10-0x19, 2 = add WDS bind client type 0x13 = 1 tethered as wland did; default 0).
++ * Logs "SWEET QMUX: data: ..." and "SWEET QMUX: profile backup ...".
++ */
++#define QMI_ERR_CALL_FAILED     0x0e
++#define QMI_ERR_DEVICE_NOT_READY 0x34
++#define DOPT_WDA_STRIP          0x1
++#define DOPT_BIND_TETH          0x2
++#define D_HELD_START_MS         15000u
++#define D_HELD_PROF_MS          60000u
++#define D_GW_WAIT_MS            2000u
++#define D_OWN_MS                5000u
++#define D_CLOSE_MS              5000u
++#define D_RATE_N                6
++#define D_RATE_MS               60000u
++#define D_PROF_PORT             (SBB_QMUX_PORT0 + SBB_QMUX_NPORTS - 1u)
++#define D_NH                    4
++#define D_NHOLD                 16
++#define D_HOLD_MAXF             2048u
++#define D_NOWN                  32
++#define D_NPROF                 24
++#define D_BAK_MAX               (48u << 10)
++#define D_NGATE                 8
++
++static int data_fwd = 1, data_opts = 0;
++static int data_was;                    /* data_active() as the thread saw it last (logs + kill switch) */
++static uint16_t gate_ids[D_NGATE] = { 0x0027, 0x0028, 0x0029, 0x004a, 0x0093 };     /* [0..2] always */
++static int ngate = 5;
++
++struct dcl {                            /* per router client, same index as cl[] */
++	uint8_t mux, nh, closing, gw_state;     /* gw_state: 0 -, 1 waiting for CommCenter's 0x002d, 2 own 0x002d out, 3 done */
++	uint32_t h[D_NH];
++	uint64_t at;                            /* closing deadline / end of the gateway wait */
++};
++enum { DH_START = 1, DH_PROF };
++struct dhold {
++	int used, kind;
++	uint32_t pipe, sess, n;
++	uint8_t svc, cid;
++	uint16_t msg;
++	uint64_t t;
++	uint8_t f[D_HOLD_MAXF];
++};
++enum { DO_STOP = 1, DO_GW, DO_PLIST, DO_PSET };
++struct down {
++	int used, kind, ci;
++	uint32_t port, hd;
++	uint16_t txn, msg;
++	uint8_t idx;
++	uint64_t t;
++};
++static struct qdata {
++	struct dcl d[NCL];
++	struct dhold hold[D_NHOLD];
++	struct down own[D_NOWN];
++	struct { uint8_t up; uint32_t gw; uint64_t st[D_RATE_N]; } mx[256];
++	uint8_t wda_req[512];                   /* CommCenter's last WDA SetDataFormat TLVs, as it sent them */
++	uint32_t wda_n;
++	uint8_t tbuf[D_HOLD_MAXF + 64];         /* a translated request SDU */
++	uint8_t pidx[D_NPROF];
++	int nprof, pnext;
++	char bak[D_BAK_MAX];
++	uint32_t bakn;
++} *D;
++static uint16_t d_txn = 0xfe00;
++static struct {
++	unsigned held_start, rel_start, to_start, rate, held_prof, rel_prof, to_prof, prof_writes, wda_tr, wda_ans, bind_tr,
++	    gw_own, gw_cc, stops_sent, starts_ok, starts_err, local5564, muxmap, ups, downs, closes;
++} dst;
++static int pb_state;                    /* 0 none, 1 list out, 2 settings out, 3 ready (exposed), 4 acked */
++static int pb_tries, pb_n;
++static volatile int pb_ack;
++static LCK_MTX_DECLARE(bak_lock, &qmux_grp);
++
++static bool
++data_active(void)
++{
++	return D != NULL && (sweet_bb & SBB_DATA) && qmi_rules == 1 && data_fwd;
++}
++
++static struct dcl *
++d_of(struct cl *c)
++{
++	return &D->d[c - cl];
++}
++
++static void
++ip4s(char *o, size_t ol, uint32_t be)
++{
++	const uint8_t *b = (const uint8_t *)&be;
++	snprintf(o, ol, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
++}
++
++/* TLV ids of tl as "01,10,11" */
++static void
++tlv_ids(char *o, size_t ol, const uint8_t *tl, uint32_t tn)
++{
++	size_t k = 0;
++	o[0] = 0;
++	for (uint32_t i = 0; i + 3 <= tn && k + 4 < ol;) {
++		k += (size_t)snprintf(o + k, ol - k, "%s%02x", i ? "," : "", tl[i]);
++		i += 3 + (uint32_t)(tl[i + 1] | (tl[i + 2] << 8));
++	}
++}
++
++static int
++tlv_u32(const uint8_t *tl, uint32_t tn, unsigned id, uint32_t *v)
++{
++	uint32_t l = 0;
++	const uint8_t *p = tlv_find(tl, tn, id, &l);
++	if (!p || l < 4) {
++		return -1;
++	}
++	*v = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++	return 0;
++}
++
++/* live packet data handles on mux (all data clients) */
++static int
++d_mux_handles(unsigned mux)
++{
++	int n = 0;
++	for (int i = 0; i < NCL; i++) {
++		if (cl[i].used && cl[i].dat && D->d[i].mux == mux) {
++			n += D->d[i].nh;
++		}
++	}
++	return n;
++}
++
++/* a request of the router's own from port to the modem's svc server; 0 sent */
++static int
++d_own_send(int kind, int ci, uint32_t port, unsigned svc, unsigned msg, const uint8_t *tl, uint32_t tn, uint32_t hd, uint8_t idx)
++{
++	int si = srv_find(svc), k = -1;
++	uint8_t b[7 + 64];
++	if (si < 0 || tn > 64) {
++		return -1;
++	}
++	for (int i = 0; i < D_NOWN && k < 0; i++) {
++		if (!D->own[i].used) {
++			k = i;
++		}
++	}
++	if (k < 0) {
++		return -1;
++	}
++	d_txn = d_txn >= 0xfeff ? 0xfe00 : (uint16_t)(d_txn + 1);
++	b[0] = 0x00;
++	b[1] = (uint8_t)d_txn;
++	b[2] = (uint8_t)(d_txn >> 8);
++	b[3] = (uint8_t)msg;
++	b[4] = (uint8_t)(msg >> 8);
++	b[5] = (uint8_t)tn;
++	b[6] = 0;
++	if (tn) {
++		memcpy(b + 7, tl, tn);
++	}
++	if (sbb_qrtr_send(SBB_QRTR_DATA, port, srv[si].node, srv[si].port, b, 7 + tn)) {
++		return -1;
++	}
++	struct down *o = &D->own[k];
++	o->used = 1;
++	o->kind = kind;
++	o->ci = ci;
++	o->port = port;
++	o->hd = hd;
++	o->txn = d_txn;
++	o->msg = (uint16_t)msg;
++	o->idx = idx;
++	o->t = sbb_ms();
++	return 0;
++}
++
++/* ---- calls: pdp_ip links + the kernel IPA ---- */
++
++static void
++d_call_down(unsigned mux, const char *why)
++{
++	if (!D->mx[mux].up || d_mux_handles(mux)) {
++		return;
++	}
++	int u = sweet_pdp_mux_unit(mux);
++	D->mx[mux].up = 0;
++	D->mx[mux].gw = 0;
++	dst.downs++;
++	sweet_ipa_call(mux, 0, 0);
++	if (u >= 0) {
++		(void)sweet_pdp_link((uint32_t)u, 0);
++	}
++	LOG("data: call down: mux %u, no live handle (%s): sweet_ipa_call(%u, 0), pdp_ip%d link down\n", mux, why, mux, u);
++}
++
++static void
++d_call_up(struct cl *c, uint32_t hd)
++{
++	struct dcl *x = d_of(c);
++	unsigned mux = x->mux;
++	if (!mux) {
++		LOG("data: call up on %s/%u WDS cid %u handle 0x%x, but the client never bound a mux: no pdp_ip mapping\n",
++		    pipe_name[c->pipe], c->sess, c->cid, hd);
++		return;
++	}
++	int u = sweet_pdp_mux_unit(mux);
++	D->mx[mux].up = 1;
++	dst.ups++;
++	if (u >= 0) {
++		(void)sweet_pdp_link((uint32_t)u, 1);
++	}
++	sweet_ipa_call(mux, 1, D->mx[mux].gw);
++	LOG("data: call up: %s/%u WDS cid %u handle 0x%x mux %u -> pdp_ip%d link up, sweet_ipa_call(%u, 1)\n", pipe_name[c->pipe],
++	    c->sess, c->cid, hd, mux, u, mux);
++	if (x->gw_state != 3 || !D->mx[mux].gw) {
++		x->gw_state = 1;
++		x->at = sbb_ms() + D_GW_WAIT_MS;
++	}
++}
++
++static void
++d_gw_known(struct cl *c, uint32_t gw_be, const char *src)
++{
++	struct dcl *x = d_of(c);
++	char a[20];
++	x->gw_state = 3;
++	if (!x->mux || !gw_be) {
++		return;
++	}
++	ip4s(a, sizeof(a), gw_be);
++	if (D->mx[x->mux].gw != gw_be) {
++		LOG("data: mux %u IPv4 gateway %s (%s)\n", x->mux, a, src);
++	}
++	D->mx[x->mux].gw = gw_be;
++	if (D->mx[x->mux].up) {
++		sweet_ipa_call(x->mux, 1, gw_be);
++	}
++}
++
++static void
++d_handle_add(struct cl *c, uint32_t hd)
++{
++	struct dcl *x = d_of(c);
++	for (int i = 0; i < x->nh; i++) {
++		if (x->h[i] == hd) {
++			return;
++		}
++	}
++	if (x->nh < D_NH) {
++		x->h[x->nh++] = hd;
++	} else {
++		LOG("data: %s/%u WDS cid %u: more than %d live handles, 0x%x not tracked\n", pipe_name[c->pipe], c->sess, c->cid, D_NH, hd);
++	}
++}
++
++static int
++d_handle_del(struct dcl *x, uint32_t hd)
++{
++	for (int i = 0; i < x->nh; i++) {
++		if (x->h[i] == hd) {
++			x->h[i] = x->h[--x->nh];
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* a mux CommCenter bound: give it a pdp_ip unit when kern.sweet_pdp_mux has none */
++static void
++d_mux_map(unsigned mux)
++{
++	if (!mux || sweet_pdp_mux_unit(mux) >= 0) {
++		return;
++	}
++	for (uint32_t u = 0; u < SWEET_PDP_NUNITS; u++) {
++		int busy = 0;
++		for (int i = 0; i < NCL; i++) {
++			busy |= cl[i].used && cl[i].dat && D->d[i].mux && sweet_pdp_mux_unit(D->d[i].mux) == (int)u;
++		}
++		if (!busy) {
++			dst.muxmap++;
++			LOG("data: CommCenter bound mux %u, not in kern.sweet_pdp_mux: pdp_ip%u carries it from now on\n", mux, u);
++			(void)sweet_pdp_set_mux(u, mux);
++			return;
++		}
++	}
++	LOG("data: CommCenter bound mux %u, not in kern.sweet_pdp_mux and every pdp_ip unit is in use: its packets are dropped\n", mux);
++}
++
++/* ---- client lifetime (cl_free / cl_destroy / server gone) ---- */
++
++static void
++d_cl_gone(struct cl *c)
++{
++	if (!D || !c->dat) {
++		return;
++	}
++	struct dcl *x = d_of(c);
++	unsigned mux = x->mux;
++	int had = x->nh;
++	for (int i = 0; i < D_NOWN; i++) {
++		if (D->own[i].used && D->own[i].ci == (int)(c - cl)) {
++			D->own[i].used = 0;
++		}
++	}
++	bzero(x, sizeof(*x));
++	if (had && mux) {
++		d_call_down(mux, "client gone");
++	}
++}
++
++/* cl_free of a data client: 1 = handled here (WDS/QOS: never pooled) */
++static int
++d_release(struct cl *c, const char *why)
++{
++	if (!D || !c->dat) {
++		return 0;
++	}
++	if (c->svc != 0x01 && c->svc != 0x04) {     /* WDA/DSD/DFS: pooled as before, as a plain client again */
++		bzero(d_of(c), sizeof(struct dcl));
++		c->dat = 0;
++		return 0;
++	}
++	struct dcl *x = d_of(c);
++	int sent = 0;
++	dst.closes++;
++	for (int i = 0; i < x->nh; i++) {
++		uint8_t t[7] = { 0x01, 4, 0, (uint8_t)x->h[i], (uint8_t)(x->h[i] >> 8), (uint8_t)(x->h[i] >> 16), (uint8_t)(x->h[i] >> 24) };
++		if (d_own_send(DO_STOP, (int)(c - cl), c->port, 0x01, 0x0021, t, sizeof(t), x->h[i], 0) == 0) {
++			sent++;
++			dst.stops_sent++;
++		}
++	}
++	LOG("data: %s/%u %s(0x%02x) cid %u port %#x released (%s): %d live handle(s), %d StopNetworkInterface sent, not pooled\n",
++	    pipe_name[c->pipe], c->sess, svc_name(c->svc), c->svc, c->cid, c->port, why, x->nh, sent);
++	if (!sent) {
++		cl_destroy(c, why);
++		return 1;
++	}
++	c->used = 3;                            /* closing: matches no CommCenter frame, keeps its port until the answers */
++	x->closing = 1;
++	x->at = sbb_ms() + D_CLOSE_MS;
++	return 1;
++}
++
++/* ---- profile backup (read-only) ---- */
++
++static void
++bak_add(const char *fmt, ...) __printflike(1, 2);
++static void
++bak_add(const char *fmt, ...)
++{
++	va_list ap;
++	lck_mtx_lock(&bak_lock);
++	if (D->bakn < D_BAK_MAX - 1) {
++		va_start(ap, fmt);
++		int k = vsnprintf(D->bak + D->bakn, D_BAK_MAX - D->bakn, fmt, ap);
++		va_end(ap);
++		if (k > 0) {
++			D->bakn = D->bakn + (uint32_t)k < D_BAK_MAX - 1 ? D->bakn + (uint32_t)k : D_BAK_MAX - 1;
++		}
++	}
++	lck_mtx_unlock(&bak_lock);
++}
++
++static void
++bak_hex(const uint8_t *p, uint32_t n)
++{
++	lck_mtx_lock(&bak_lock);
++	for (uint32_t i = 0; i < n && D->bakn + 3 < D_BAK_MAX; i++) {
++		static const char hx[] = "0123456789abcdef";
++		D->bak[D->bakn++] = hx[p[i] >> 4];
++		D->bak[D->bakn++] = hx[p[i] & 15];
++	}
++	D->bak[D->bakn] = 0;
++	lck_mtx_unlock(&bak_lock);
++}
++
++static void
++pb_start(const char *why)
++{
++	uint8_t t[4] = { 0x10, 1, 0, 0 };       /* profile type 0 = 3GPP */
++	if (pb_state != 0 || pb_tries >= 3 || srv_find(0x01) < 0) {
++		return;
++	}
++	pb_tries++;
++	lck_mtx_lock(&bak_lock);
++	D->bakn = 0;
++	D->bak[0] = 0;
++	lck_mtx_unlock(&bak_lock);
++	D->nprof = D->pnext = 0;
++	if (d_own_send(DO_PLIST, -1, D_PROF_PORT, 0x01, 0x002a, t, sizeof(t), 0, 0)) {
++		LOG("profile backup: cannot send Get Profile List (try %d)\n", pb_tries);
++		return;
++	}
++	pb_state = 1;
++	LOG("profile backup: reading the modem's 3GPP profile list (read-only, router port %#x, %s, try %d)\n", D_PROF_PORT, why, pb_tries);
++}
++
++static void
++pb_fail(const char *why)
++{
++	LOG("profile backup FAILED (%s, try %d of 3): profile writes stay held (then QMI error 0x%x)\n", why, pb_tries,
++	    QMI_ERR_DEVICE_NOT_READY);
++	pb_state = 0;
++	uint32_t pkt[5] = { SBB_QRTR_DEL_CLIENT, SBB_NODE_APPS, D_PROF_PORT, 0, 0 };
++	sbb_qrtr_send(SBB_QRTR_DEL_CLIENT, D_PROF_PORT, SBB_NODE_BCAST, SBB_PORT_CTRL, pkt, sizeof(pkt));
++}
++
++static void
++pb_next(void)
++{
++	if (D->pnext >= D->nprof) {
++		bak_add("END %d\n", D->nprof);
++		pb_state = 3;
++		pb_n = D->nprof;
++		uint32_t pkt[5] = { SBB_QRTR_DEL_CLIENT, SBB_NODE_APPS, D_PROF_PORT, 0, 0 };
++		sbb_qrtr_send(SBB_QRTR_DEL_CLIENT, D_PROF_PORT, SBB_NODE_BCAST, SBB_PORT_CTRL, pkt, sizeof(pkt));
++		printf("SWEET QMUX: profile backup ready (%d profiles): read kern.sweet_wds_profiles_bak, save it, then write 1 to "
++		    "kern.sweet_wds_profiles_ack\n", D->nprof);
++		return;
++	}
++	uint8_t t[5] = { 0x01, 2, 0, 0, D->pidx[D->pnext] };
++	if (d_own_send(DO_PSET, -1, D_PROF_PORT, 0x01, 0x002b, t, sizeof(t), 0, D->pidx[D->pnext])) {
++		pb_fail("cannot send Get Profile Settings");
++		return;
++	}
++	pb_state = 2;
++}
++
++static void
++pb_answer(struct down *o, const uint8_t *d, uint32_t ml, unsigned res, unsigned er)
++{
++	const uint8_t *tl = d + 7;
++	if (o->kind == DO_PLIST) {
++		uint32_t l = 0;
++		const uint8_t *v = res == 0 ? tlv_find(tl, ml, 0x01, &l) : NULL;
++		if (!v || l < 1) {
++			char why[48];
++			snprintf(why, sizeof(why), "Get Profile List error 0x%x", res == 0 ? 0xffff : er);
++			pb_fail(why);
++			return;
++		}
++		bak_add("SWEET-WDS-PROFILES v1 (redfin 1080; modem 3GPP profiles; TLVs 0x1b/0x1c/0x9b/0x9c removed)\nlist ");
++		bak_hex(v, l);
++		bak_add("\n");
++		unsigned n = v[0];
++		uint32_t k = 1;
++		for (unsigned i = 0; i < n && k + 3 <= l; i++) {
++			if (D->nprof < D_NPROF) {
++				D->pidx[D->nprof++] = v[k + 1];
++			}
++			k += 3 + v[k + 2];
++		}
++		LOG("profile backup: %u profile(s) listed, reading %d\n", n, D->nprof);
++		pb_next();
++		return;
++	}
++	/* DO_PSET: every TLV but the result and the credentials */
++	uint8_t *t = B->tmp_buf;
++	uint32_t o2 = 0, dropped = 0;
++	for (uint32_t k = 0; k + 3 <= ml;) {
++		uint32_t l = 3u + (uint32_t)(tl[k + 1] | (tl[k + 2] << 8));
++		unsigned id = tl[k];
++		if (id == 0x1b || id == 0x1c || id == 0x9b || id == 0x9c) {
++			dropped++;
++		} else if (id != 0x02 && o2 + l <= sizeof(B->tmp_buf)) {
++			memcpy(t + o2, tl + k, l);
++			o2 += l;
++		}
++		k += l;
++	}
++	bak_add("profile 0 %u %s 0x%x ", o->idx, res == 0 ? "ok" : "err", res == 0 ? 0 : er);
++	bak_hex(t, o2);
++	bak_add("\n");
++	LOG("profile backup: profile %u: %s, %u TLV bytes kept, %u credential TLV(s) removed\n", o->idx, res == 0 ? "read" :
++	    "error", o2, dropped);
++	D->pnext++;
++	pb_next();
++}
++
++/* ---- the router's own answers (first look at every modem response) ---- */
++
++static int
++d_own_answer(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	if (!D || n < 7 || d[0] != 0x02) {
++		return 0;
++	}
++	uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
++	struct down *o = NULL;
++	for (int i = 0; i < D_NOWN && !o; i++) {
++		if (D->own[i].used && D->own[i].port == h->dst_port && D->own[i].txn == txn) {
++			o = &D->own[i];
++		}
++	}
++	if (!o) {
++		return 0;
++	}
++	o->used = 0;
++	uint32_t ml = (uint32_t)(d[5] | (d[6] << 8));
++	unsigned res = 0xffff, er = 0xffff;
++	if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
++		malformed++;
++		LOG("data: MALFORMED answer to the router's own msg 0x%04x: dropped\n", o->msg);
++		return 1;
++	}
++	result_of(d, n, &res, &er);
++	struct cl *c = o->ci >= 0 && o->ci < NCL && cl[o->ci].used && cl[o->ci].dat ? &cl[o->ci] : NULL;
++	switch (o->kind) {
++	case DO_STOP:
++		LOG("data: own StopNetworkInterface handle 0x%x (port %#x): %s 0x%x\n", o->hd, o->port, res == 0 ? "ok" : "error",
++		    res == 0 ? 0 : er);
++		if (c) {
++			struct dcl *x = d_of(c);
++			unsigned mux = x->mux;
++			d_handle_del(x, o->hd);
++			if (!x->nh) {
++				d_call_down(mux, "router's StopNetworkInterface");
++				if (x->closing) {
++					cl_destroy(c, "released after StopNetworkInterface");
++				}
++			}
++		}
++		break;
++	case DO_GW: {
++		uint32_t v;
++		if (c && res == 0 && tlv_u32(d + 7, ml, 0x20, &v) == 0) {
++			dst.gw_own++;
++			d_gw_known(c, __builtin_bswap32(v), "router's own GetRuntimeSettings");
++		} else {
++			if (c) {
++				d_of(c)->gw_state = 3;
++			}
++			LOG("data: own GetRuntimeSettings: %s (no IPv4 gateway: keep-alive uses kern.sweet_pdp_gw)\n", res == 0 ?
++			    "no TLV 0x20" : "error");
++		}
++		break;
++	}
++	default:
++		pb_answer(o, d, ml, res, er);
++		break;
++	}
++	return 1;
++}
++
++/* ---- CommCenter's answers / indications on data clients (in place, same lengths) ---- */
++
++static void
++wda_show_own(uint8_t *tl, uint32_t tn, int *rew)
++{
++	for (uint32_t k = 0; k + 3 <= tn;) {
++		uint32_t l = (uint32_t)(tl[k + 1] | (tl[k + 2] << 8)), cl2 = 0;
++		unsigned id = tl[k];
++		const uint8_t *cv = id >= 0x10 && id <= 0x16 ? tlv_find(D->wda_req, D->wda_n, id, &cl2) : NULL;
++		if (cv && cl2 == l && memcmp(tl + k + 3, cv, l)) {
++			memcpy(tl + k + 3, cv, l);
++			(*rew)++;
++		}
++		k += 3 + l;
++	}
++}
++
++static void
++d_answer(struct cl *c, uint8_t *sdu, uint32_t len, const uint8_t *rq, uint32_t rqn)
++{
++	unsigned type = sdu[0], msg = (unsigned)(sdu[3] | (sdu[4] << 8)), res = 0xffff, er = 0xffff;
++	uint8_t *tl = sdu + 7;
++	uint32_t tn = len - 7, v;
++	struct dcl *x = d_of(c);
++	if (type == 0x02) {
++		result_of(sdu, len, &res, &er);
++	}
++	if (c->svc == 0x1a && type == 0x02 && (msg == 0x0020 || msg == 0x0021)) {
++		char m[160];
++		uint32_t a[7] = { 0, 0, 0, 0, 0, 0, 0 };
++		static const uint8_t ids[7] = { 0x11, 0x12, 0x13, 0x15, 0x16, 0x17, 0x18 };
++		for (int i = 0; i < 7; i++) {
++			(void)tlv_u32(tl, tn, ids[i], &a[i]);
++		}
++		snprintf(m, sizeof(m), "link %u ul %u dl %u dl max %u/%#x ul max %u/%#x", a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
++		int rew = 0;
++		if (res == 0 && D->wda_n) {
++			wda_show_own(tl, tn, &rew);
++		}
++		dst.wda_ans++;
++		LOG("data: WDA %s answer: %s 0x%x, modem: %s; %d TLV(s) rewritten to CommCenter's own values\n", msg == 0x0020 ?
++		    "SetDataFormat" : "GetDataFormat", res == 0 ? "success" : "FAILURE", res == 0 ? 0 : er, m, rew);
++		return;
++	}
++	if (c->svc == 0x04 && type == 0x02 && msg == 0x002b) {
++		int mx = tlv_byte(rq, rqn, 0x11);
++		LOG("data: QOS BindDataPort %s/%u cid %u mux %d: %s 0x%x\n", pipe_name[c->pipe], c->sess, c->cid, mx, res == 0 ?
++		    "ok" : "error", res == 0 ? 0 : er);
++		if (res == 0 && mx > 0) {
++			x->mux = (uint8_t)mx;
++		}
++		return;
++	}
++	if (c->svc != 0x01) {
++		return;
++	}
++	if (type == 0x02 && msg == 0x00a2) {
++		int mx = tlv_byte(rq, rqn, 0x11);
++		LOG("data: WDS BindMuxDataPort %s/%u cid %u mux %d: %s 0x%x\n", pipe_name[c->pipe], c->sess, c->cid, mx, res == 0 ?
++		    "ok" : "error", res == 0 ? 0 : er);
++		if (res == 0 && mx > 0) {
++			x->mux = (uint8_t)mx;
++			d_mux_map((unsigned)mx);
++		}
++	} else if (type == 0x02 && msg == 0x0020) {
++		if (res == 0 && tlv_u32(tl, tn, 0x01, &v) == 0) {
++			dst.starts_ok++;
++			d_handle_add(c, v);
++			d_call_up(c, v);
++		} else {
++			uint32_t l1 = 0, l2 = 0;
++			const uint8_t *ce = tlv_find(tl, tn, 0x10, &l1), *vb = tlv_find(tl, tn, 0x11, &l2);
++			ce = ce && l1 >= 2 ? ce : NULL;
++			vb = vb && l2 >= 4 ? vb : NULL;
++			dst.starts_err++;
++			LOG("data: StartNetworkInterface %s/%u cid %u mux %u: error 0x%x, end reason %d, verbose %d:%d\n",
++			    pipe_name[c->pipe], c->sess, c->cid, x->mux, er, ce ? (int)(ce[0] | (ce[1] << 8)) : -1,
++			    vb ? (int)(vb[0] | (vb[1] << 8)) : -1, vb ? (int)(int16_t)(vb[2] | (vb[3] << 8)) : 0);
++		}
++	} else if (type == 0x02 && msg == 0x0021) {
++		uint32_t hd;
++		if (tlv_u32(rq, rqn, 0x01, &hd) == 0) {
++			int had = d_handle_del(x, hd);
++			LOG("data: StopNetworkInterface %s/%u cid %u handle 0x%x mux %u: %s 0x%x%s\n", pipe_name[c->pipe], c->sess, c->cid,
++			    hd, x->mux, res == 0 ? "ok" : "error", res == 0 ? 0 : er, had ? "" : " (handle not tracked)");
++			d_call_down(x->mux, "StopNetworkInterface");
++		}
++	} else if (type == 0x02 && msg == 0x002d && res == 0) {
++		if (tlv_u32(tl, tn, 0x20, &v) == 0) {
++			dst.gw_cc++;
++			d_gw_known(c, __builtin_bswap32(v), "CommCenter's GetRuntimeSettings");
++		}
++	} else if (type == 0x04 && msg == 0x0022) {
++		int st = tlv_byte(tl, tn, 0x01);
++		LOG("data: PktSrvcStatus %s/%u cid %u mux %u: %s\n", pipe_name[c->pipe], c->sess, c->cid, x->mux, st == 1 ?
++		    "disconnected" : st == 2 ? "connected" : st == 3 ? "suspended" : st == 4 ? "authenticating" : "unknown");
++		if (st == 1 && x->nh) {
++			x->nh = 0;
++			d_call_down(x->mux, "PktSrvcStatus disconnected");
++		}
++	}
++}
++
++/* ---- CommCenter's data requests ---- */
++
++static void
++d_fwd(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t sn)
++{
++	svc_forward(pipe, svc, cid, s, sn);
++	struct cl *c = cl_get(pipe, cur_sess, svc, cid, 0);
++	if (c && !c->dat) {
++		c->dat = 1;
++		bzero(d_of(c), sizeof(struct dcl));
++	}
++}
++
++/* copy s's header to tbuf; returns the TLV write offset (7) */
++static uint32_t
++tb_begin(const uint8_t *s)
++{
++	memcpy(D->tbuf, s, 7);
++	return 7;
++}
++
++static uint32_t
++tb_end(uint32_t o)
++{
++	D->tbuf[5] = (uint8_t)(o - 7);
++	D->tbuf[6] = (uint8_t)((o - 7) >> 8);
++	return o;
++}
++
++static void
++tb_u32(uint32_t *o, unsigned id, uint32_t v)
++{
++	put_tlv(D->tbuf, o, id, &v, 4);
++}
++
++/* WDA SetDataFormat -> what sweet_ipa.c implements */
++static uint32_t
++wda_translate(const uint8_t *s, const uint8_t *tl, uint32_t tn, char *log, size_t ll)
++{
++	static const uint8_t need[6] = { 0x11, 0x12, 0x13, 0x15, 0x16, 0x17 };
++	uint32_t o = tb_begin(s), have = 0;
++	size_t lo = 0;
++	log[0] = 0;
++	for (uint32_t k = 0; k + 3 <= tn;) {
++		uint32_t l = (uint32_t)(tl[k + 1] | (tl[k + 2] << 8)), nv = 0;
++		unsigned id = tl[k];
++		if (k + 3 + l > tn) {
++			break;
++		}
++		const uint8_t *v = tl + k + 3;
++		int known = 1;
++		uint32_t cv = l == 4 ? (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24) : (l == 1 ? v[0] : 0xffffffffu);
++		switch (id) {
++		case 0x11: nv = 2; break;
++		case 0x12: case 0x13: nv = 9; break;
++		case 0x15: nv = 16; break;
++		case 0x16: nv = 0x3800; break;
++		case 0x10: case 0x19: nv = 0; break;
++		case 0x17: nv = 1; break;
++		default: known = 0; break;
++		}
++		if (o + 3 + l + 8 > sizeof(D->tbuf)) {
++			break;
++		}
++		if (lo + 24 < ll) {
++			lo += (size_t)snprintf(log + lo, ll - lo, " %02x", id);
++			if (l == 1 || l == 4) {
++				lo += (size_t)snprintf(log + lo, ll - lo, "=%u", cv);
++			} else if (id == 0x17 && l == 8) {
++				lo += (size_t)snprintf(log + lo, ll - lo, "={%u,%u}", v[0] | v[1] << 8, v[4] | v[5] << 8);
++			} else {
++				lo += (size_t)snprintf(log + lo, ll - lo, "(%u B)", l);
++			}
++		}
++		if (known && id == 0x17 && l == 8) {
++			uint32_t ep[2] = { 4, 1 };
++			put_tlv(D->tbuf, &o, id, ep, 8);
++		} else if (known && (id == 0x10 || id == 0x19) && l == 1) {
++			uint8_t z = 0;
++			put_tlv(D->tbuf, &o, id, &z, 1);
++		} else if (known && id != 0x10 && id != 0x19 && id != 0x17 && l == 4) {
++			tb_u32(&o, id, nv);
++		} else if (!known && (data_opts & DOPT_WDA_STRIP) && (id < 0x10 || id > 0x19)) {
++			if (lo + 4 < ll) {
++				lo += (size_t)snprintf(log + lo, ll - lo, "[dropped]");
++			}
++		} else {
++			memcpy(D->tbuf + o, tl + k, 3 + l);     /* unknown id or unexpected length: untouched */
++			o += 3 + l;
++		}
++		for (int i = 0; i < 6; i++) {
++			have |= need[i] == id ? 1u << i : 0;
++		}
++		k += 3 + l;
++	}
++	for (int i = 0; i < 6; i++) {
++		if (!(have & (1u << i))) {
++			if (need[i] == 0x17) {
++				uint32_t ep[2] = { 4, 1 };
++				put_tlv(D->tbuf, &o, 0x17, ep, 8);
++			} else {
++				tb_u32(&o, need[i], need[i] == 0x11 ? 2 : need[i] == 0x15 ? 16 : need[i] == 0x16 ? 0x3800 : 9);
++			}
++		}
++	}
++	return tb_end(o);
++}
++
++/* WDS BindMuxDataPort / QOS BindDataPort: endpoint TLV 0x10 = {4, 1}, the rest untouched */
++static uint32_t
++bind_translate(const uint8_t *s, unsigned svc, const uint8_t *tl, uint32_t tn)
++{
++	uint32_t o = tb_begin(s), ep[2] = { 4, 1 };
++	int had_ep = 0, had_ct = 0;
++	for (uint32_t k = 0; k + 3 <= tn;) {
++		uint32_t l = (uint32_t)(tl[k + 1] | (tl[k + 2] << 8));
++		if (k + 3 + l > tn || o + 3 + l + 22 > sizeof(D->tbuf)) {
++			break;
++		}
++		if (tl[k] == 0x10) {
++			had_ep = 1;
++			put_tlv(D->tbuf, &o, 0x10, ep, 8);
++		} else {
++			had_ct |= svc == 0x01 && tl[k] == 0x13;
++			memcpy(D->tbuf + o, tl + k, 3 + l);
++			o += 3 + l;
++		}
++		k += 3 + l;
++	}
++	if (!had_ep) {
++		put_tlv(D->tbuf, &o, 0x10, ep, 8);
++	}
++	if (svc == 0x01 && !had_ct && (data_opts & DOPT_BIND_TETH)) {
++		tb_u32(&o, 0x13, 1);
++	}
++	return tb_end(o);
++}
++
++static int
++d_is_gated(unsigned msg)
++{
++	for (int i = 0; i < ngate; i++) {
++		if (gate_ids[i] == msg) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static void
++d_prof_log(unsigned pipe, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn, const char *what)
++{
++	char ids[96];
++	uint32_t l = 0;
++	const uint8_t *p = tlv_find(tl, tn, 0x01, &l);
++	tlv_ids(ids, sizeof(ids), tl, tn);
++	dst.prof_writes++;
++	LOG("data: WDS profile write 0x%04x from %s/%u cid %u profile %s%d (type %d), TLVs %s: %s\n", msg, pipe_name[pipe], cur_sess,
++	    cid, p && l >= 2 ? "" : "-", p && l >= 2 ? p[1] : 0, p && l >= 1 ? p[0] : -1, ids, what);
++}
++
++static int
++d_hold(int kind, unsigned pipe, unsigned svc, unsigned cid, unsigned msg, const uint8_t *s, uint32_t sn)
++{
++	for (int i = 0; i < D_NHOLD; i++) {
++		struct dhold *h = &D->hold[i];
++		if (!h->used && sn <= D_HOLD_MAXF) {
++			h->used = 1;
++			h->kind = kind;
++			h->pipe = pipe;
++			h->sess = cur_sess;
++			h->svc = (uint8_t)svc;
++			h->cid = (uint8_t)cid;
++			h->msg = (uint16_t)msg;
++			h->t = sbb_ms();
++			h->n = sn;
++			memcpy(h->f, s, sn);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* StartNetworkInterface to the modem (the IPA is ready): per-mux rate limit */
++static void
++d_start(unsigned pipe, unsigned cid, const uint8_t *s, uint32_t sn)
++{
++	struct cl *c = cl_get(pipe, cur_sess, 0x01, cid, 0);
++	unsigned mux = c && c->dat ? d_of(c)->mux : 0;
++	uint64_t now = sbb_ms(), *st = D->mx[mux].st;
++	int n = 0, old = 0;
++	for (int i = 0; i < D_RATE_N; i++) {
++		n += st[i] && now - st[i] < D_RATE_MS;
++		if (st[i] < st[old]) {
++			old = i;
++		}
++	}
++	if (n >= D_RATE_N) {
++		dst.rate++;
++		LOG("data: StartNetworkInterface %s/%u cid %u mux %u refused: rate limit (%d per minute per mux): error 0x%x\n",
++		    pipe_name[pipe], cur_sess, cid, mux, D_RATE_N, QMI_ERR_CALL_FAILED);
++		svc_local(pipe, 0x01, cid, s, 1, QMI_ERR_CALL_FAILED);
++		return;
++	}
++	st[old] = now;
++	LOG("data: StartNetworkInterface %s/%u cid %u mux %u -> modem\n", pipe_name[pipe], cur_sess, cid, mux);
++	d_fwd(pipe, 0x01, cid, s, sn);
++}
++
++static void
++d_request(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t sn, uint32_t rl)
++{
++	unsigned msg = (unsigned)(s[3] | (s[4] << 8));
++	const uint8_t *tl = s + 7;
++	uint32_t len = 7 + rl, n;
++	char lg[200];
++	if (svc == 0x01 && pb_state == 0) {
++		pb_start("CommCenter's first WDS request");
++	}
++	if (svc == 0x01 && msg == 0x0020) {
++		if (!sweet_ipa_ready()) {
++			if (d_hold(DH_START, pipe, svc, cid, msg, s, len)) {
++				LOG("data: StartNetworkInterface %s/%u cid %u: IPA not ready and the hold queue is full: error 0x%x\n",
++				    pipe_name[pipe], cur_sess, cid, QMI_ERR_CALL_FAILED);
++				svc_local(pipe, svc, cid, s, 1, QMI_ERR_CALL_FAILED);
++				return;
++			}
++			dst.held_start++;
++			LOG("data: StartNetworkInterface %s/%u cid %u held: IPA data plane not ready (kern.sweet_ipa_state != 3; %u s max)\n",
++			    pipe_name[pipe], cur_sess, cid, D_HELD_START_MS / 1000);
++			return;
++		}
++		d_start(pipe, cid, s, len);
++		return;
++	}
++	if (svc == 0x01 && d_is_gated(msg)) {
++		if (pb_state != 4) {
++			if (d_hold(DH_PROF, pipe, svc, cid, msg, s, len)) {
++				svc_local(pipe, svc, cid, s, 1, QMI_ERR_DEVICE_NOT_READY);
++				LOG("data: WDS profile write 0x%04x: hold queue full: error 0x%x\n", msg, QMI_ERR_DEVICE_NOT_READY);
++				return;
++			}
++			dst.held_prof++;
++			d_prof_log(pipe, cid, msg, tl, rl, "held until the modem's profiles are backed up and acknowledged");
++			if (pb_state == 0) {
++				pb_start("a profile write");
++			}
++			return;
++		}
++		d_prof_log(pipe, cid, msg, tl, rl, "forwarded (backup acknowledged)");
++		d_fwd(pipe, svc, cid, s, len);
++		return;
++	}
++	if (svc == 0x1a && msg == 0x0020) {
++		D->wda_n = rl <= sizeof(D->wda_req) ? rl : 0;
++		memcpy(D->wda_req, tl, D->wda_n);
++		n = wda_translate(s, tl, rl, lg, sizeof(lg));
++		dst.wda_tr++;
++		LOG("data: WDA SetDataFormat from %s/%u cid %u: CommCenter%s -> modem: link 2 raw-ip, ul/dl 9 QMAPv5, dl max 16/0x3800, "
++		    "endpoint {4,1}%s\n", pipe_name[pipe], cur_sess, cid, lg, D->wda_n ? "" : " (request too long to echo back)");
++		d_fwd(pipe, svc, cid, D->tbuf, n);
++		return;
++	}
++	if ((svc == 0x01 && msg == 0x00a2) || (svc == 0x04 && msg == 0x002b)) {
++		tlv_ids(lg, sizeof(lg), tl, rl);
++		n = bind_translate(s, svc, tl, rl);
++		dst.bind_tr++;
++		LOG("data: %s %s from %s/%u cid %u mux %d (TLVs %s): endpoint 0x10 -> {4,1}\n", svc_name(svc), svc == 0x01 ?
++		    "BindMuxDataPort" : "BindDataPort", pipe_name[pipe], cur_sess, cid, tlv_byte(tl, rl, 0x11), lg);
++		d_fwd(pipe, svc, cid, D->tbuf, n);
++		return;
++	}
++	d_fwd(pipe, svc, cid, s, len);
++}
++
++/* ---- the thread's round ---- */
++
++static void
++d_hold_answer(struct dhold *h, int code, const char *why)
++{
++	cur_pipe = h->pipe;
++	cur_sess = h->sess;
++	if (cid_live(h->pipe, h->sess, h->svc, h->cid)) {
++		svc_local(h->pipe, h->svc, h->cid, h->f, 1, code);
++	}
++	LOG("data: held %s 0x%04x of %s/%u cid %u answered error 0x%x (%s)\n", svc_name(h->svc), h->msg, pipe_name[h->pipe], h->sess,
++	    h->cid, code, why);
++	h->used = 0;
++}
++
++static void
++data_poll(uint64_t now)
++{
++	if (!D) {
++		return;
++	}
++	int act = data_active();
++	if (act != data_was) {
++		LOG("data: %s (sweetbb 0x%x, kern.sweet_qmi_rules %d, kern.sweet_data_fwd %d)\n", act ? "ON: WDS/WDA/QOS/DSD/DFS "
++		    "forwarded for CommCenter (1080)" : "off: data services answered err again", sweet_bb, qmi_rules, data_fwd);
++		if (!act) {
++			for (int i = 0; i < NCL; i++) {
++				if (cl[i].used == 1 && cl[i].dat) {
++					cl_free(&cl[i], "data mode off");
++				}
++			}
++			for (int i = 0; i < D_NHOLD; i++) {
++				if (D->hold[i].used) {
++					d_hold_answer(&D->hold[i], err_code, "data mode off");
++				}
++			}
++		}
++		data_was = act;
++	}
++	if (pb_ack) {
++		pb_ack = 0;
++		if (pb_state == 3) {
++			pb_state = 4;
++			lck_mtx_lock(&bak_lock);
++			D->bakn = 0;
++			D->bak[0] = 0;
++			lck_mtx_unlock(&bak_lock);
++			printf("SWEET QMUX: profile backup acknowledged by userland (%d profiles saved): WDS profile writes pass, each logged\n",
++			    pb_n);
++		}
++	}
++	for (int i = 0; i < D_NHOLD; i++) {
++		struct dhold *h = &D->hold[i];
++		if (!h->used) {
++			continue;
++		}
++		if (h->kind == DH_START && act && sweet_ipa_ready()) {
++			cur_pipe = h->pipe;
++			cur_sess = h->sess;
++			h->used = 0;
++			if (!cid_live(h->pipe, h->sess, h->svc, h->cid)) {
++				LOG("data: held StartNetworkInterface of %s/%u cid %u: client gone, dropped\n", pipe_name[h->pipe], h->sess, h->cid);
++				continue;
++			}
++			dst.rel_start++;
++			LOG("data: held StartNetworkInterface of %s/%u cid %u released after %llu ms (IPA ready)\n", pipe_name[h->pipe],
++			    h->sess, h->cid, (unsigned long long)(now - h->t));
++			d_start(h->pipe, h->cid, h->f, h->n);
++		} else if (h->kind == DH_START && now - h->t >= D_HELD_START_MS) {
++			dst.to_start++;
++			d_hold_answer(h, QMI_ERR_CALL_FAILED, "IPA data plane not ready in 15 s");
++		} else if (h->kind == DH_PROF && act && pb_state == 4) {
++			cur_pipe = h->pipe;
++			cur_sess = h->sess;
++			h->used = 0;
++			if (!cid_live(h->pipe, h->sess, h->svc, h->cid)) {
++				continue;
++			}
++			dst.rel_prof++;
++			d_prof_log(h->pipe, h->cid, h->msg, h->f + 7, h->n - 7, "released (backup acknowledged)");
++			d_fwd(h->pipe, h->svc, h->cid, h->f, h->n);
++		} else if (h->kind == DH_PROF && now - h->t >= D_HELD_PROF_MS) {
++			dst.to_prof++;
++			d_hold_answer(h, QMI_ERR_DEVICE_NOT_READY, "no acknowledged profile backup in 60 s");
++		} else if (h->kind == DH_PROF && pb_state == 0) {
++			pb_start("a held profile write");
++		}
++	}
++	for (int i = 0; i < D_NOWN; i++) {
++		struct down *o = &D->own[i];
++		if (!o->used || now - o->t < D_OWN_MS) {
++			continue;
++		}
++		o->used = 0;
++		LOG("data: the router's own msg 0x%04x (port %#x) got no answer in %u s\n", o->msg, o->port, D_OWN_MS / 1000);
++		if (o->kind == DO_GW && o->ci >= 0 && cl[o->ci].dat) {
++			D->d[o->ci].gw_state = 3;
++		} else if (o->kind == DO_PLIST || o->kind == DO_PSET) {
++			pb_fail("no answer");
++		}
++	}
++	for (int i = 0; i < NCL; i++) {
++		struct dcl *x = &D->d[i];
++		if (!cl[i].used || !cl[i].dat) {
++			continue;
++		}
++		if (x->closing && now >= x->at) {
++			unsigned mux = x->mux;
++			LOG("data: closing client port %#x: %d StopNetworkInterface answer(s) missing after %u s: given back anyway\n",
++			    cl[i].port, x->nh, D_CLOSE_MS / 1000);
++			x->nh = 0;
++			d_call_down(mux, "client released");
++			cl_destroy(&cl[i], "released (stop answers missing)");
++		} else if (cl[i].used == 1 && x->gw_state == 1 && now >= x->at) {
++			if (D->mx[x->mux].gw) {
++				x->gw_state = 3;
++			} else if (d_own_send(DO_GW, i, cl[i].port, 0x01, 0x002d,
++			    (const uint8_t[]){ 0x10, 4, 0, 0x14, 0xa3, 0, 0 }, 7, 0, 0) == 0) {
++				x->gw_state = 2;
++				LOG("data: no gateway from CommCenter in %u s: the router's own GetRuntimeSettings on port %#x (answer not "
++				    "forwarded)\n", D_GW_WAIT_MS / 1000, cl[i].port);
++			} else {
++				x->gw_state = 3;
++			}
++		}
++	}
++}
++
++static int
++data_stats(char *buf, size_t len)
++{
++	int o;
++	if (!D) {
++		return snprintf(buf, len, "data module off (sweetbb & 0x10 not set or router off)");
++	}
++	o = snprintf(buf, len, "data %s (sweetbb 0x%x rules %d fwd %d opts %d) | fwd WDS %u WDA %u QOS %u DSD %u DFS %u | starts ok %u "
++	    "err %u held %u released %u timeout %u rate-limited %u | translations WDA %u (answers %u) bind %u | gw cc %u own %u | "
++	    "stops sent %u closes %u | ups %u downs %u muxmap %u | 5564 local %u | profiles: backup %s (%d) writes %u held %u "
++	    "released %u timeout %u | handles per mux:", data_active() ? "ON" : "off", sweet_bb, qmi_rules, data_fwd, data_opts,
++	    svc_cnt[0x01].fwd, svc_cnt[0x1a].fwd, svc_cnt[0x04].fwd, svc_cnt[0x2a].fwd, svc_cnt[0x30].fwd, dst.starts_ok,
++	    dst.starts_err, dst.held_start, dst.rel_start, dst.to_start, dst.rate, dst.wda_tr, dst.wda_ans, dst.bind_tr, dst.gw_cc,
++	    dst.gw_own, dst.stops_sent, dst.closes, dst.ups, dst.downs, dst.muxmap, dst.local5564, pb_state == 0 ? "none" :
++	    pb_state == 1 ? "listing" : pb_state == 2 ? "reading" : pb_state == 3 ? "ready" : "acked", pb_n, dst.prof_writes,
++	    dst.held_prof, dst.rel_prof, dst.to_prof);
++	for (unsigned m = 1; m < 256 && o < (int)len - 40; m++) {
++		int h = d_mux_handles(m);
++		if (h || D->mx[m].up) {
++			o += snprintf(buf + o, len - (size_t)o, " %u:%d%s", m, h, D->mx[m].up ? "(up)" : "");
++		}
++	}
++	int held = 0;
++	for (int i = 0; i < D_NHOLD; i++) {
++		held += D->hold[i].used;
++	}
++	if (o < (int)len - 24) {
++		o += snprintf(buf + o, len - (size_t)o, " | held now %d", held);
++	}
++	return o < (int)len ? o : (int)len - 1;
++}
++
++static bool
++d_port_reserved(uint32_t port)
++{
++	return D != NULL && port == D_PROF_PORT;
++}
++
+ /* one record from SweetABP (CommCenter wrote a frame / opened, closed, started, aborted a pipe) */
+ static void
+ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n)
+@@ -2588,6 +3728,13 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
+ 	if (svc == 0x03 && msg == 0x0003) {
+ 		nasreg_note(pipe, sess, cid, s + 7, rl);        /* 1073 */
+ 	}
++	if (svc == 0x01 && msg == 0x5564 && data_active()) {     /* 1080: Apple-only WDS message, answered here */
++		note_seen(svc, msg, "ok", "data: Apple-only WDS 0x5564 answered success here (1080)");
++		cnt.local_ok++;
++		dst.local5564++;
++		svc_local(pipe, svc, cid, s, 0, 0);
++		return;
++	}
+ 	int a = decide(svc, msg, s + 7, rl, &code, wb, sizeof(wb));
+ 	if (a == ACT_FWD && dec_rate >= 0) {
+ 		uint64_t now = sbb_ms();
+@@ -2616,7 +3763,11 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
+ 	}
+ 	switch (a) {
+ 	case ACT_FWD:
+-		svc_forward(pipe, svc, cid, s, sn);
++		if (DSVC(svc) && data_active()) {
++			d_request(pipe, svc, cid, s, sn, rl);   /* 1080: translations, holds, the profile gate */
++		} else {
++			svc_forward(pipe, svc, cid, s, sn);
++		}
+ 		break;
+ 	case ACT_OK:
+ 		cnt.local_ok++;
+@@ -2786,6 +3937,7 @@ sweet_qmux_server_gone(uint32_t node, uint32_t port)
+ 			LOG("modem server svc 0x%02x (%s) gone\n", srv[i].svc, svc_name(srv[i].svc));
+ 			for (int k = 0; k < NCL; k++) {
+ 				if (cl[k].used && cl[k].svc == srv[i].svc && srv_find(srv[i].svc) < 0) {
++					d_cl_gone(&cl[k]);      /* 1080 */
+ 					pend_drop_port(cl[k].port);
+ 					bzero(&cl[k], sizeof(cl[k]));
+ 				}
+@@ -2810,6 +3962,9 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 	if (!on) {
+ 		return;
+ 	}
++	if (d_own_answer(h, d, n)) {    /* 1080: an answer to the router's own data request */
++		return;
++	}
+ 	if (n >= 7 && d[0] == 0x02) {
+ 		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
+ 		for (int i = 0; i < NPEND; i++) {
+@@ -2988,6 +4143,9 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 			len = 7 + nl;
+ 		}
+ 	}
++	if (c->dat && D) {
++		d_answer(c, b + 6, len, rq, rqn);       /* 1080: learn handles/mux/gateway; WDA answers show CommCenter its values */
++	}
+ 	finish_qmux(b, 6 + len, c->svc, c->cid);
+ 	if (d[0] == 0x04) {
+ 		c->ind++;
+@@ -3159,6 +4317,7 @@ sweet_qmux_poll(void)
+ 	bbr_poll(now);
+ 	hold_poll(now);
+ 	repub_poll(now);
++	data_poll(now);                 /* 1080 */
+ 	if (dump_req) {
+ 		dump_req = 0;
+ 		mst_table("kern.sweet_qmux_dump");
+@@ -3196,6 +4355,11 @@ sweet_qmux_start(void)
+ 		return;
+ 	}
+ 	vauto_tc = thread_call_allocate_with_options(vauto_call, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);  /* 1074 */
++	if (sweet_bb & SBB_DATA) {      /* 1080: the data section's state (active only with kern.sweet_qmi_rules 1) */
++		D = kalloc_data(sizeof(*D), Z_WAITOK | Z_ZERO);
++		printf("SWEET QMUX: data section %s (%lu bytes): CommCenter owns data when kern.sweet_qmi_rules = 1 and "
++		    "kern.sweet_data_fwd = 1\n", D ? "ready" : "NO MEMORY: off", (unsigned long)sizeof(*D));
++	}
+ 	PE_parse_boot_argn("sweetqmifilter", &qmi_filter, sizeof(qmi_filter));
+ 	PE_parse_boot_argn("sweetqmirules", &qmi_rules, sizeof(qmi_rules));
+ 	on = true;
+@@ -3405,4 +4569,154 @@ sysctl_policy SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_policy, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_policy, "A",
+     "redfin 1068: reads the policy source; write = load this policy text (abp-policy.conf grammar), '-' or empty = back to the file/default");
++/* ---- 1080 sysctls ---- */
++
++static int
++sysctl_data_fwd SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = data_fwd, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	data_fwd = v;
++	printf("SWEET QMUX: kern.sweet_data_fwd = %d\n", v);
++	sbb_wake();
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_data_fwd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_data_fwd, "I",
++    "redfin 1080: 1 (default) = with sweetbb & 0x10 and kern.sweet_qmi_rules 1 CommCenter's WDS/WDA/QOS/DSD/DFS go to the modem; "
++    "0 = answered err 0x5e (live calls stopped)");
++QINT(sweet_data_opts, data_opts, "redfin 1080: 1 = drop WDA SetDataFormat TLVs outside 0x10-0x19, 2 = add WDS bind client type 0x13 = 1");
++
++static int
++sysctl_data_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *b = kalloc_data(2048, Z_WAITOK | Z_ZERO);
++	if (b == NULL) {
++		return ENOMEM;
++	}
++	int n = data_stats(b, 2048);
++	int e = SYSCTL_OUT(req, b, (size_t)n + 1);
++	kfree_data(b, 2048);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_data_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_data_stats, "A",
++    "redfin 1080: CommCenter data forwarding: per service forwards, starts/holds/rate, translations, handles per mux, profile gate");
++
++static int
++sysctl_wds_bak SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr != USER_ADDR_NULL || proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (D == NULL) {
++		return SYSCTL_OUT(req, "off", 4);
++	}
++	char *b = kalloc_data(D_BAK_MAX, Z_WAITOK | Z_ZERO);
++	if (b == NULL) {
++		return ENOMEM;
++	}
++	size_t n;
++	lck_mtx_lock(&bak_lock);
++	if (pb_state == 3) {
++		memcpy(b, D->bak, D->bakn);
++		n = D->bakn;
++	} else {
++		n = (size_t)snprintf(b, D_BAK_MAX, "state %d (%s)", pb_state, pb_state == 0 ? "none yet" : pb_state == 4 ?
++		    "acknowledged: exposed once, cleared" : "reading");
++	}
++	lck_mtx_unlock(&bak_lock);
++	b[n] = 0;
++	int e = SYSCTL_OUT(req, b, n + 1);
++	kfree_data(b, D_BAK_MAX);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_profiles_bak, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_bak, "A",
++    "redfin 1080: root only: the modem's WDS profile backup (hex TLVs, no credentials) until kern.sweet_wds_profiles_ack");
++
++static int
++sysctl_wds_ack SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = pb_state == 4, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v != 1) {
++		return EINVAL;
++	}
++	if (pb_state != 3) {
++		return pb_state == 4 ? 0 : EBUSY;
++	}
++	pb_ack = 1;
++	sbb_wake();
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_profiles_ack, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_ack, "I",
++    "redfin 1080: write 1 after saving kern.sweet_wds_profiles_bak: CommCenter's WDS profile writes then pass (EBUSY = not ready)");
++
++static int
++sysctl_gate_ids SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[96];
++	int o = 0;
++	for (int i = 0; i < ngate; i++) {
++		o += snprintf(s + o, sizeof(s) - (size_t)o, "%s0x%04x", i ? " " : "", gate_ids[i]);
++	}
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	if (e || req->newptr == USER_ADDR_NULL) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	char t[96];
++	size_t n = req->newlen - req->newidx;
++	if (n >= sizeof(t)) {
++		return E2BIG;
++	}
++	bzero(t, sizeof(t));
++	e = SYSCTL_IN(req, t, n);
++	if (e) {
++		return e;
++	}
++	uint16_t ids[D_NGATE] = { 0x0027, 0x0028, 0x0029 };
++	int k = 3;
++	char w[D_NGATE + 4][256];
++	int nw = split_words(t, w, D_NGATE + 4);
++	for (int i = 0; i < nw; i++) {
++		int v;
++		if (parse_num(w[i], &v) || v < 1 || v >= 0x5500) {
++			return EINVAL;
++		}
++		if (v == 0x27 || v == 0x28 || v == 0x29) {
++			continue;
++		}
++		if (k >= D_NGATE) {
++			return E2BIG;
++		}
++		ids[k++] = (uint16_t)v;
++	}
++	memcpy(gate_ids, ids, sizeof(ids));
++	ngate = k;
++	printf("SWEET QMUX: kern.sweet_wds_gate_ids: %d WDS message ids held until the profile backup is acknowledged\n", k);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_gate_ids, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_gate_ids, "A",
++    "redfin 1080: WDS message ids held until the profile backup is acknowledged (0x0027-0x0029 always; write the extra ids)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
