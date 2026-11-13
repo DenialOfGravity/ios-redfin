@@ -410,4 +410,120 @@ out:
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 	return error;
 }
+/*
+ * redfin 1077: read-only views for the UFS diagnostics (sweet_ufs.c, kern.sweet_ufs_diag). Nothing here writes a TCS
+ * register or sends a vote. The first call maps and checks the RSC and cmd-db as a vote would (rh_map, under the
+ * lock, without waiting: EBUSY if a vote is in flight); after that the reads take no lock, so a vote is never refused
+ * because of them. The TCS command registers hold what this DRV last programmed into each TCS (lito DT order: ACTIVE
+ * 0-1, SLEEP 2-4, WAKE 5-7); the aggregated RPMh state of a resource cannot be read from the APPS side.
+ */
+static bool rh_ro_ok;
+
+static int
+rh_ro_ready(void)
+{
+	if (rh_ro_ok) {
+		return 0;
+	}
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+		return EBUSY;
+	}
+	int error = rh_poisoned ? EIO : rh_map();
+	if (!error) {
+		rh_ro_ok = true;
+	}
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+
+int sweet_rpmh_tcs_peek(unsigned t, uint32_t *enable, uint32_t *addr, uint32_t *data, unsigned max, unsigned *ncmd);
+int
+sweet_rpmh_tcs_peek(unsigned t, uint32_t *enable, uint32_t *addr, uint32_t *data, unsigned max, unsigned *ncmd)
+{
+	int error = rh_ro_ready();
+	if (error) {
+		return error;
+	}
+	if (t >= RH_NORMAL_N) {
+		return EINVAL;
+	}
+	uint32_t b = t * RH_TCS_STRIDE;
+	unsigned n = MIN(rh_ncpt, max);
+	*enable = rh_read(rh_tcs, b + RH_ENABLE);
+	for (unsigned i = 0; i < n; i++) {
+		addr[i] = rh_read(rh_tcs, b + RH_ADDR + i * RH_CMD_STRIDE);
+		data[i] = rh_read(rh_tcs, b + RH_DATA + i * RH_CMD_STRIDE);
+	}
+	*ncmd = n;
+	return 0;
+}
+
+/* cmd-db walk: exact (name -> address) or nearest (address -> "name+offset", offset <= 0xc within the same slave) */
+static int
+rh_ro_walk(const char *want, uint32_t address, uint32_t *found, char *out, unsigned len)
+{
+	uint32_t best = 0, best_e = 0;
+	for (unsigned i = 0; i < 8; ++i) {
+		uint32_t h = 8u + 16u * i;
+		unsigned slave = rh_db16(h);
+		if (!slave) {
+			break;
+		}
+		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+		unsigned count = rh_db16(h + 6);
+		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
+			return EINVAL;
+		}
+		for (unsigned j = 0; j < count; ++j) {
+			uint32_t e = entries + RH_DB_ENTRY * j;
+			uint32_t a = rh_read(rh_db, e + 16);
+			if (want) {
+				char id[9];
+				uint32_t k0 = rh_read(rh_db, e), k1 = rh_read(rh_db, e + 4);
+				for (unsigned c = 0; c < 8; c++) {
+					id[c] = (char)((c < 4 ? k0 : k1) >> (8u * (c % 4)));
+				}
+				id[8] = 0;
+				if (!strncmp(id, want, 8)) {
+					*found = a;
+					return 0;
+				}
+			} else if (a <= address && address - a <= 0xcu && (a >> 16) == (address >> 16) && (!best_e || a > best)) {
+				best = a;
+				best_e = e;
+			}
+		}
+	}
+	if (want || !best_e) {
+		return ENODEV;
+	}
+	char id[9];
+	uint32_t k0 = rh_read(rh_db, best_e), k1 = rh_read(rh_db, best_e + 4);
+	for (unsigned c = 0; c < 8; c++) {
+		id[c] = (char)((c < 4 ? k0 : k1) >> (8u * (c % 4)));
+	}
+	id[8] = 0;
+	if (address == best) {
+		snprintf(out, len, "%s", id);
+	} else {
+		snprintf(out, len, "%s+%x", id, address - best);
+	}
+	return 0;
+}
+
+int sweet_rpmh_name(uint32_t address, char *out, unsigned len);
+int
+sweet_rpmh_name(uint32_t address, char *out, unsigned len)
+{
+	int error = rh_ro_ready();
+	return error ? error : rh_ro_walk(NULL, address, NULL, out, len);
+}
+
+int sweet_rpmh_find(const char *res, uint32_t *address);
+int
+sweet_rpmh_find(const char *res, uint32_t *address)
+{
+	int error = rh_ro_ready();
+	return error ? error : rh_ro_walk(res, 0, address, NULL, 0);
+}
 #endif /* ARM64_BOARD_CONFIG_SWEET */
