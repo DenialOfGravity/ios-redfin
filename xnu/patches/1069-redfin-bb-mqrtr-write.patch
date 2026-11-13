@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+index 3fcfe1d..8e05a9f 100644
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -948,7 +948,7 @@ static int
+ link_send(const uint8_t *data, uint32_t len)
+ {
+ 	uint64_t end = sbb_ms() + 3000;
+-	int asked = 0, i;
++	int asked = 0, i, e;
+ 	uint32_t iid;
+ 	lck_mtx_lock(&ml_lock);
+ 	if (gl.state != 2) {
+@@ -995,11 +995,12 @@ link_send(const uint8_t *data, uint32_t len)
+ 	return 0;
+ fail:
+ 	gl.tx_fail++;
++	e = gl.state != 2 ? ENOTCONN : (sbb_ms() > end ? ETIMEDOUT : EIO);
+ 	lck_mtx_unlock(&ml_lock);
+ 	if (gl.tx_fail <= 20 || gl.tx_fail % 100 == 0) {
+-		SAY("link: cannot send %u bytes (intents %d, failure #%u)\n", len, gl.nri, gl.tx_fail);
++		SAY("link: cannot send %u bytes (intents %d, failure #%u, error %d)\n", len, gl.nri, gl.tx_fail, e);
+ 	}
+-	return EIO;
++	return e;
+ }
+ 
+ static int
+@@ -1197,27 +1198,33 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
+ 	if (e) {
+ 		return e;
+ 	}
+-	uint32_t len = (uint32_t)(n - (user_ssize_t)sizeof(h));
+-	if (h.size < len) {
+-		len = h.size;           /* (padding after the payload is not ours to send twice) */
+-	}
++	/*
++	 * 1069: the whole write is consumed (header + payload + the sender's padding to 4 bytes); only hdr.size bytes of it are
++	 * the payload (qrtr_send_hdr pads again). 1067/1068 consumed header + hdr.size only, so a packet that WAS sent came back
++	 * as a short write for every payload not a multiple of 4, and wland reported it failed with a stale errno (r5bb1a:
++	 * IPA INIT_DRIVER "link send failed" although the modem answered it). Errors: EPERM (router port / bad type),
++	 * ENOTCONN (link down), ETIMEDOUT (no modem intent / FIFO room in 3 s), EIO, ENOMEM; then nothing was sent.
++	 * Blocking (at most 3 s, as wland's own link_send) even with O_NONBLOCK; select() says writable always.
++	 */
++	uint32_t rest = (uint32_t)(n - (user_ssize_t)sizeof(h));
++	uint32_t len = h.size < rest ? h.size : rest;
+ 	if (router_port(h.src_port) || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
+ 		dev.refused++;
+ 		return EPERM;
+ 	}
+ 	uint8_t *b = NULL;
+-	if (len) {
+-		b = kalloc_data(len, Z_WAITOK);
++	if (rest) {
++		b = kalloc_data(rest, Z_WAITOK);
+ 		if (b == NULL) {
+ 			return ENOMEM;
+ 		}
+-		e = uiomove((caddr_t)b, (int)len, uio);
++		e = uiomove((caddr_t)b, (int)rest, uio);
+ 	}
+ 	if (e == 0) {
+ 		e = qrtr_send_hdr(&h, b, len);
+ 	}
+ 	if (b) {
+-		kfree_data(b, len);
++		kfree_data(b, rest);
+ 	}
+ 	if (e == 0) {
+ 		dev.writes++;
