@@ -1339,6 +1339,23 @@ static void ipa_end(int ok, const char *why)
 	cell_ipa_hold(0, ok ? "IPA bring-up done" : "IPA bring-up failed");
 }
 
+/* xnu 1076 handoff (kern.sweet_bb & 0x10): kern.sweet_ipa_up = 1 (kernel meminit; blocks until done) / 2 (kernel QMI) */
+static int kipa_up(int v)
+{
+	if (sysctlbyname("kern.sweet_ipa_up", NULL, NULL, &v, sizeof(v))) {
+		printf("ipa: kern.sweet_ipa_up=%d: %s\n", v, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+static int kipa_get(const char *name)
+{
+	int v = -100;
+	size_t n = sizeof(v);
+	return sysctlbyname(name, &v, &n, NULL, 0) ? -100 : v;
+}
+
 /* one step; on success the next one IA_GAP_MS later */
 static void ipa_step(uint64_t now)
 {
@@ -1360,6 +1377,11 @@ static void ipa_step(uint64_t now)
 		rc = ipa_smmu();
 		break;
 	case 4:
+		if (link_kernel_data()) {
+			printf("ipa: auto step 4 kernel meminit (kern.sweet_ipa_up=1, xnu 1076)\n");
+			rc = kipa_up(1);
+			break;
+		}
 		printf("ipa: auto step 4 meminit\n");
 		rc = ipa_meminit();
 		break;
@@ -1368,6 +1390,32 @@ static void ipa_step(uint64_t now)
 		rc = smp2p_ipa(3);
 		break;
 	case 6:
+		if (link_kernel_data()) {
+			/* xnu 1076: the kernel announces 0x31/1, waits for 0x31/2, runs p2early, sends INIT_DRIVER (as steps 6-8) */
+			if (!ia_since) {
+				ia_since = now;
+				printf("ipa: auto step 6 kernel QMI (kern.sweet_ipa_up=2): waiting for its INIT_DRIVER answer (max %d s)\n",
+				       (IA_SERVER_MS + IA_ANSWER_MS) / 1000);
+				if (kipa_up(2)) {
+					ipa_end(0, "step 6: kern.sweet_ipa_up=2 refused");
+					return;
+				}
+			}
+			int drv = kipa_get("kern.sweet_ipa_drv"), st = kipa_get("kern.sweet_ipa_state");
+			if (drv > 0 || drv < 0 || st < 0) {
+				printf("ipa: auto step 6 kernel: INIT_DRIVER %s, kern.sweet_ipa_state %d (%llu ms)\n",
+				       drv > 0 ? "ACCEPTED" : "not accepted", st, (unsigned long long)(now - ia_since));
+				ipa_end(drv > 0, drv > 0 ? "kernel INIT_DRIVER accepted (no wland data port: CommCenter/the kernel own data)" :
+					"kernel IPA bring-up failed (see SWEET IPA: in the klog)");
+				return;
+			}
+			if (now - ia_since > IA_SERVER_MS + IA_ANSWER_MS) {
+				ipa_end(0, "step 6: no kernel INIT_DRIVER answer in time");
+				return;
+			}
+			ia_next = now + 500;
+			return;
+		}
 		if (!ia_since) {
 			ia_since = now;
 			printf("ipa: auto step 6 ipaqmi on (as ipaqmi=1), the modem's 0x31/2 (max %d s)\n", IA_SERVER_MS / 1000);
