@@ -48,6 +48,7 @@
 #include <mach/mach_types.h>
 #include "sweet_bb.h"
 #include "sweet_ssr.h"                  /* 1070 */
+#include "sweet_ipa.h"                  /* 1076 */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
@@ -600,6 +601,10 @@ qrtr_in(const uint8_t *d, uint32_t n)
 	gl.rx_bytes += pl;
 	gl.last_traffic = sbb_ms();
 	if (h.type == SBB_QRTR_DATA) {
+		if ((sweet_bb & SBB_DATA) && sweet_ipa_port(h.dst_port)) {  /* 1076: the kernel IPA QMI ports (sweet_ipa.c) */
+			sweet_ipa_qrtr_in(h.type, h.src_node, h.src_port, h.dst_port, h.confirm_rx, p, pl);
+			return;
+		}
 		if (h.dst_port == SWEET_SSR_MDM_PORT) {     /* 1070: the kernel's SSCTL client port (sweet_ssr.c) */
 			sweet_ssr_qrtr_in(SWEET_SSR_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, p, pl);
 			return;
@@ -1060,6 +1065,24 @@ sbb_smem_copy(unsigned item, void *buf, uint32_t max, uint32_t *size)
 	return 0;
 }
 
+/* 1076: the first server of a service, whatever its instance (DPM 0x2f for the IPA data port) */
+bool
+sbb_server_svc(uint32_t svc, uint32_t *node, uint32_t *port, uint32_t *verinst)
+{
+	bool found = false;
+	lck_mtx_lock(&ml_lock);
+	for (int i = 0; i < NSRV && !found; i++) {
+		if (srv[i].up && srv[i].svc == svc) {
+			*node = srv[i].node;
+			*port = srv[i].port;
+			*verinst = srv[i].inst;
+			found = true;
+		}
+	}
+	lck_mtx_unlock(&ml_lock);
+	return found;
+}
+
 bool
 sbb_server(uint32_t svc, uint32_t inst, uint32_t *node, uint32_t *port, uint32_t *version)
 {
@@ -1251,7 +1274,8 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
 	 */
 	uint32_t rest = (uint32_t)(n - (user_ssize_t)sizeof(h));
 	uint32_t len = h.size < rest ? h.size : rest;
-	if (router_port(h.src_port) || h.src_port == SWEET_SSR_MDM_PORT || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
+	if (router_port(h.src_port) || h.src_port == SWEET_SSR_MDM_PORT || ((sweet_bb & SBB_DATA) && sweet_ipa_port(h.src_port)) ||
+	    h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
 		dev.refused++;
 		return EPERM;
 	}
@@ -1407,7 +1431,7 @@ sweet_bb_init(void)
 	thread_t th;
 	sweet_ssr_init();                       /* 1070: modem crash reason + SSCTL notices (own boot-args, own thread) */
 	PE_parse_boot_argn("sweetbb", &v, sizeof(v));
-	if (v & SBB_QMUX) {
+	if (v & (SBB_QMUX | SBB_DATA)) {       /* 1076: the kernel IPA data path needs the kernel link too */
 		v |= SBB_LINK;
 	}
 	sweet_bb = v;
@@ -1427,6 +1451,9 @@ sweet_bb_init(void)
 	}
 	if (kernel_thread_start(sbb_thread, NULL, &th) == KERN_SUCCESS) {
 		thread_deallocate(th);
+		if (v & SBB_DATA) {
+			sweet_ipa_init();       /* 1076: kernel IPA data path (its own thread; nothing mapped until wland's handoff) */
+		}
 	} else {
 		SAY("no thread: nothing will move\n");
 	}

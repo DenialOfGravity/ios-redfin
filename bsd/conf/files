@@ -139,6 +139,7 @@ bsd/dev/sweet_voice.c			standard
 bsd/dev/sweet_bb.c			standard
 bsd/dev/sweet_qmux.c			standard
 bsd/dev/sweet_ssr.c			standard
+bsd/dev/sweet_ipa.c			standard
 bsd/dev/redwood_sta.c		standard
 bsd/dev/redwood_net.c		standard
 bsd/dev/redwood_apple80211.c	standard
