@@ -86,6 +86,11 @@ extern uint32_t sweet_abm_upwait_ms, sweet_abm_img, sweet_abm_imglen, sweet_abm_
 extern uint32_t sweet_abp_bootstage;
 extern uint32_t sweet_abp_flags;
 extern uint32_t sweet_abp_readyms;
+/* 1075: bsd/dev/sweet_pdp.c (pdp_ip0..7, sweetbb & 0x10) */
+bool sweet_pdp_enabled(void);
+void sweet_pdp_publish(void);
+void sweet_pdp_block(uint32_t index, int on);
+void sweet_pdp_unblock_all(void);
 }
 
 /* 1063: sweetabp bits read here (bsd/dev/sweet_abp.c has the full list) */
@@ -1309,7 +1314,10 @@ class AppleBasebandPCIPDPManagerBase : public IOService
 };
 OSDefineMetaClassAndStructors(AppleBasebandPCIPDPManagerBase, IOService);
 
-/* Every selector succeeds with zeroed outputs; async requests are accepted and never completed. */
+/* Every selector succeeds with zeroed outputs; async requests are accepted and never completed.
+ * 1075: with sweetbb & 0x10, AppleIPAppender's selectors go to ipa_method() instead (below). */
+static IOReturn ipa_method(uint32_t selector, IOExternalMethodArguments *args);
+static volatile SInt32 ipa_clients;
 static uint32_t abs_calls[2][0x20];
 
 class SweetABPStubUserClient : public IOUserClient
@@ -1327,6 +1335,9 @@ OSDefineMetaClassAndStructors(SweetABPStubUserClient, IOUserClient);
 IOReturn
 SweetABPStubUserClient::clientClose(void)
 {
+	if (fKind == 0 && sweet_pdp_enabled() && ipa_clients > 0 && OSDecrementAtomic(&ipa_clients) == 1) {
+		sweet_pdp_unblock_all();        /* 1075: the last AppleIPAppender client is gone: no stale blockPDPTraffic */
+	}
 	terminate();
 	return kIOReturnSuccess;
 }
@@ -1335,6 +1346,9 @@ IOReturn
 SweetABPStubUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
 {
+	if (fKind == 0 && sweet_pdp_enabled()) {
+		return ipa_method(selector, args);
+	}
 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
 		args->scalarOutput[i] = 0;
 	}
@@ -1355,11 +1369,156 @@ SweetABPStubUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 	return kIOReturnSuccess;
 }
 
+/*
+ * 1075: AppleIPAppender selectors (only with sweetbb & 0x10; research/cc/P4-u2-classes.md Q3). Sizes are checked
+ * (kIOReturnBadArgument on a mismatch, which ApplePDPHelper only logs); answers: success with zeroed outputs,
+ * 0x02 getFlow returns what 0x00 addFlow stored, 0x0a no wake buffer (0 bytes), 0x11 trailer not enabled (0),
+ * 0x12 no keepalive frames (0 bytes), 0x10 blockPDPTraffic sets the pdp_ip output block flag, 0x14 accepted and never
+ * completed. One klog line per selector, the first time it is called.
+ */
+#define IPA_SO_FIXED    0u      /* struct out: caller gives >= sout, gets sout zeroed bytes */
+#define IPA_SO_EMPTY    1u      /* struct out: any size (multiple of sout if sout), answered with 0 bytes */
+#define IPA_SO_UPTO     2u      /* struct out: caller gives <= sout, all of it zeroed */
+struct ipa_sel {
+	const char *name;
+	uint8_t nin, nout, somode;
+	uint16_t sin, sout;
+};
+static const struct ipa_sel ipa_sels[] = {
+	{ "addFlow", 0, 0, IPA_SO_FIXED, 8, 0 },
+	{ "removeFlow", 1, 0, IPA_SO_FIXED, 0, 0 },
+	{ "getFlow", 1, 1, IPA_SO_FIXED, 0, 0 },
+	{ "enable", 1, 1, IPA_SO_FIXED, 0, 0 },
+	{ "setDormancyInterval", 0, 0, IPA_SO_FIXED, 8, 0 },
+	{ "getDormancyTime", 0, 1, IPA_SO_FIXED, 0, 0 },
+	{ "getTimeAdjustment", 0, 0, IPA_SO_FIXED, 0, 8 },
+	{ "getStatus", 0, 0, IPA_SO_FIXED, 0, 0xb8 },
+	{ "setLinkQualityMetric", 1, 0, IPA_SO_FIXED, 0, 0 },
+	{ "restartDormancyCheck", 0, 0, IPA_SO_FIXED, 0, 0 },
+	{ "copyWakeBuffer", 1, 0, IPA_SO_EMPTY, 0, 0 },
+	{ "reportLinkThroughput", 0, 0, IPA_SO_FIXED, 0x20, 0 },
+	{ "getOpenPortsExt", 3, 0, IPA_SO_UPTO, 0, 0x1000 },
+	{ "enableLowPowerPDPThrottle", 1, 0, IPA_SO_FIXED, 0, 0 },
+	{ "activateLowPowerPDPThrottle", 1, 0, IPA_SO_FIXED, 0, 0 },
+	{ "getNumLowPowerPDPThrottleStats", 0, 0, IPA_SO_FIXED, 0, 0xc },
+	{ "blockPDPTraffic", 2, 0, IPA_SO_FIXED, 0, 0 },
+	{ "enableMetadataTrailer", 1, 1, IPA_SO_FIXED, 0, 0 },
+	{ "getKeepaliveOffloadFrames", 1, 0, IPA_SO_EMPTY, 0, 0x84 },
+	{ "notifyDedicatedBearer", 0, 0, IPA_SO_FIXED, 0x10, 0x10 },
+	{ "registerFilterRuleCallBack", 2, 0, IPA_SO_FIXED, 0, 0 },
+};
+#define IPA_NSELS       (sizeof(ipa_sels) / sizeof(ipa_sels[0]))
+static uint8_t ipa_seen[0x20], ipa_bad_seen[0x20];
+static uint32_t ipa_flow[16];           /* addFlow: traffic class -> flow id (getFlow only) */
+
+static IOReturn
+ipa_method(uint32_t selector, IOExternalMethodArguments *args)
+{
+	const struct ipa_sel *s = selector < IPA_NSELS ? &ipa_sels[selector] : NULL;
+	uint32_t sin = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
+	uint32_t soc = args->structureOutputDescriptor ? (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+	uint32_t sout = 0;
+	IOReturn r = kIOReturnSuccess;
+	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+		args->scalarOutput[i] = 0;
+	}
+	if (s == NULL) {
+		sout = soc;     /* not in Q3: today's answer (success, zeroed outputs) */
+	} else if (args->scalarInputCount != s->nin || args->scalarOutputCount != s->nout || sin != s->sin) {
+		r = kIOReturnBadArgument;
+	} else if (s->somode == IPA_SO_FIXED) {
+		if (soc < s->sout) {
+			r = kIOReturnBadArgument;
+		}
+		sout = s->sout;
+	} else if (s->somode == IPA_SO_EMPTY) {
+		if (s->sout && soc % s->sout) {
+			r = kIOReturnBadArgument;
+		}
+		sout = 0;
+	} else {
+		if (soc > s->sout) {
+			r = kIOReturnBadArgument;
+		}
+		sout = soc;
+	}
+	if (r == kIOReturnSuccess) {
+		uint8_t in[0x20];
+		bzero(in, sizeof(in));
+		(void)abp_struct_in(args, in, sizeof(in));
+		switch (selector) {
+		case 0x00: {    /* addFlow {u32 trafficClass, u32 flowId} */
+			uint32_t tc, fl;
+			memcpy(&tc, in, 4);
+			memcpy(&fl, in + 4, 4);
+			ipa_flow[tc & 15] = fl;
+			break;
+		}
+		case 0x01:
+			ipa_flow[args->scalarInput[0] & 15] = 0;
+			break;
+		case 0x02:
+			args->scalarOutput[0] = ipa_flow[args->scalarInput[0] & 15];
+			break;
+		case 0x10: {    /* blockPDPTraffic(pdp index, block) */
+			uint64_t idx = args->scalarInput[0], on = args->scalarInput[1] != 0;
+			if (idx < 32) {
+				sweet_pdp_block((uint32_t)idx, (int)on);
+				IOLog("SWEET ABP: 1075 blockPDPTraffic pdp %llu %s\n", idx, on ? "blocked" : "unblocked");
+			} else {
+				r = kIOReturnBadArgument;
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	if (r == kIOReturnSuccess && sout) {
+		uint8_t z[256];
+		bzero(z, sizeof(z));
+		if (args->structureOutputDescriptor != NULL) {
+			for (uint32_t o = 0; o < sout; o += sizeof(z)) {
+				args->structureOutputDescriptor->writeBytes(o, z, sout - o < sizeof(z) ? sout - o : sizeof(z));
+			}
+		} else if (args->structureOutput != NULL) {
+			bzero(args->structureOutput, sout);
+		}
+	}
+	if (args->structureOutputDescriptor != NULL) {
+		args->structureOutputDescriptorSize = r == kIOReturnSuccess ? sout : 0;
+	} else {
+		args->structureOutputSize = r == kIOReturnSuccess ? sout : 0;
+	}
+	uint32_t k = selector < 0x20 ? selector : 0x1f;
+	uint8_t *seen = r == kIOReturnSuccess ? ipa_seen : ipa_bad_seen;
+	if (!seen[k]) {
+		seen[k] = 1;
+		char p[32];
+		proc_selfname(p, (int)sizeof(p));
+		IOLog("SWEET ABP: 1075 %s AppleIPAppender sel 0x%x %s%s in[%u]={0x%llx,0x%llx} struct in %u out %u/%u -> 0x%x\n", p, selector,
+		    s ? s->name : "unknown", args->asyncWakePort != MACH_PORT_NULL ? " (async)" : "", args->scalarInputCount,
+		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL, args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
+		    sin, sout, soc, r);
+	}
+	return r;
+}
+
 class AppleIPAppenderUserClient : public SweetABPStubUserClient
 {
 	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
 public:
-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE { fKind = 0; return SweetABPStubUserClient::start(provider); }
+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE
+	{
+		fKind = 0;
+		if (!SweetABPStubUserClient::start(provider)) {
+			return false;
+		}
+		if (sweet_pdp_enabled()) {
+			OSIncrementAtomic(&ipa_clients);
+		}
+		return true;
+	}
 };
 OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, SweetABPStubUserClient);
 
@@ -1564,6 +1723,7 @@ SweetABPPublish(bool on, const char *why)
 		IOLog("SWEET ABP: publishing the baseband services (%s, publish #%u)\n", why, abp_publishes);
 		abp_publish_all();
 		IOLockUnlock(abp_svc_lock);
+		sweet_pdp_publish();            /* 1075: pdp_ip0..7 once, only with sweetbb & 0x10 */
 		return 0;
 	}
 	IOService *svcs[12];
