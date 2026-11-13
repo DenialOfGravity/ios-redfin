@@ -7,6 +7,7 @@
 #   netsvc   SystemConfiguration network service for an IF    nettest  DNS, TCP, then HTTPS
 #   oslog    stream the unified log                           prefs    CFPreferences read/write (no defaults)
 #   sctl     NAME [INT|0xHEX|STRING]: read/write a sysctl (strings of any length)
+#   pdptest  list | ping N [COUNT]: pdp_ip interfaces of xnu 1075 and its loopback self-test
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
 #   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
@@ -36,6 +37,7 @@ build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServic
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
 build memwarn memwarn.c
 build sctl sctl.c
+build pdptest pdptest.c
 build pmem pmem.c
 build a2s a2s.c
 build sweetmon sweetmon.c lz4/lz4.c -DSWEETMON_VERSION="\"$(git rev-parse --short HEAD 2>/dev/null || date +%F)\""
