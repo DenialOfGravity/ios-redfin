@@ -123,6 +123,7 @@
 #include <vm/pmap.h>
 #include <arm/caches_internal.h>
 #include <sys/sysctl.h>                 /* (0956: kern.sweet_adsp_services) */
+#include "sweet_ssr.h"                  /* 1070 */
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -2719,6 +2720,27 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 
 static bool qrtr_deliver(const struct qrtr_header *header, const uint8_t *data, uint32_t length);   /* 0956 */
 
+/* 1070 (sweet_ssr.c): our QRTR on the DSP's link and the servers it told of, for the SSCTL notices */
+int
+redwood_qrtr_send(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+{
+	return qrtr_out_packet(type, from_port, to_node, to_port, data, length);
+}
+
+bool
+redwood_qrtr_server(uint32_t service, uint32_t instance, uint32_t *node, uint32_t *port, uint32_t *version)
+{
+	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+		if (qrtr_servers[i].there && qrtr_servers[i].service == service && (qrtr_servers[i].instance >> 8) == instance) {
+			*node = qrtr_servers[i].node;
+			*port = qrtr_servers[i].port;
+			*version = qrtr_servers[i].instance & 0xff;
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 qrtr_input(const uint8_t *data, uint32_t length)
 {
@@ -2771,6 +2793,11 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	}
 	if (header.to_port == PDM_PORT && pdm_on) {
 		pdm_input(&header, data + at, header.size);     /* 0951 */
+		return;
+	}
+	if (header.to_port == SWEET_SSR_ADSP_PORT) {
+		sweet_ssr_qrtr_in(SWEET_SSR_ADSP, header.type, header.from_node, header.from_port, header.confirm, data + at,
+		    header.size);                   /* 1070: SSCTL client port (sweet_ssr.c) */
 		return;
 	}
 	if (qrtr_deliver(&header, data + at, header.size)) {

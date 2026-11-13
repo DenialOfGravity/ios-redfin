@@ -47,6 +47,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include "sweet_bb.h"
+#include "sweet_ssr.h"                  /* 1070 */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
@@ -599,6 +600,10 @@ qrtr_in(const uint8_t *d, uint32_t n)
 	gl.rx_bytes += pl;
 	gl.last_traffic = sbb_ms();
 	if (h.type == SBB_QRTR_DATA) {
+		if (h.dst_port == SWEET_SSR_MDM_PORT) {     /* 1070: the kernel's SSCTL client port (sweet_ssr.c) */
+			sweet_ssr_qrtr_in(SWEET_SSR_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, p, pl);
+			return;
+		}
 		if (router_port(h.dst_port)) {
 			to_router(&h, p, pl);
 		} else {
@@ -1033,6 +1038,44 @@ sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 	return qrtr_send_hdr(&h, data, len);
 }
 
+/* ---- 1070 (sweet_ssr.c): SMEM items read-only, the modem's QRTR servers ---- */
+
+/* copies up to max bytes of an item (modem partition, else the global one); its size in *size. 0 or -1 (absent) */
+int
+sbb_smem_copy(unsigned item, void *buf, uint32_t max, uint32_t *size)
+{
+	vm_offset_t va;
+	uint32_t sz = 0;
+	if (!regs_map() || smem_get(item, &va, &sz) != 0) {
+		return -1;
+	}
+	*size = sz;
+	uint32_t n = sz < max ? sz : max;
+	for (uint32_t o = 0; o < n; o += 4) {          /* device mapping: 32-bit reads */
+		uint32_t w = rd32(va + o);
+		uint32_t k = n - o < 4 ? n - o : 4;
+		memcpy((uint8_t *)buf + o, &w, k);
+	}
+	return 0;
+}
+
+bool
+sbb_server(uint32_t svc, uint32_t inst, uint32_t *node, uint32_t *port, uint32_t *version)
+{
+	bool found = false;
+	lck_mtx_lock(&ml_lock);
+	for (int i = 0; i < NSRV && !found; i++) {
+		if (srv[i].up && srv[i].svc == svc && (srv[i].inst >> 8) == inst) {
+			*node = srv[i].node;
+			*port = srv[i].port;
+			*version = srv[i].inst & 0xff;
+			found = true;
+		}
+	}
+	lck_mtx_unlock(&ml_lock);
+	return found;
+}
+
 /* ---- the thread ---- */
 
 static bool wake_flag;
@@ -1201,7 +1244,7 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
 	if (h.size < len) {
 		len = h.size;           /* (padding after the payload is not ours to send twice) */
 	}
-	if (router_port(h.src_port) || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
+	if (router_port(h.src_port) || h.src_port == SWEET_SSR_MDM_PORT || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
 		dev.refused++;
 		return EPERM;
 	}
@@ -1348,6 +1391,7 @@ sweet_bb_init(void)
 {
 	uint32_t v = 0;
 	thread_t th;
+	sweet_ssr_init();                       /* 1070: modem crash reason + SSCTL notices (own boot-args, own thread) */
 	PE_parse_boot_argn("sweetbb", &v, sizeof(v));
 	if (v & SBB_QMUX) {
 		v |= SBB_LINK;
