@@ -1,0 +1,518 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e300261..d5291fe 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -93,6 +93,25 @@ extern void sweet_usb_probe(void);
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++/* 1069 (kern.sweet_ufs_recover): error status, UIC commands, Qualcomm vendor timers (Linux ufshci.h, ufs-qcom.h) */
++#define REG_UECPA       0x38
++#define REG_UECDL       0x3c
++#define REG_UECN        0x40
++#define REG_UECT        0x44
++#define REG_UECDME      0x48
++#define REG_UTMRLDBR    0x78
++#define REG_UICCMD      0x90
++#define REG_UCMDARG1    0x94
++#define REG_UCMDARG2    0x98
++#define REG_UCMDARG3    0x9c
++#define REG_QC_SYS1CLK_1US      0xc0
++#define REG_QC_TX_SYMBOL_CLK    0xc4
++#define REG_QC_LINK_STARTUP_TMR 0xd8
++#define REG_QC_CFG2             0xe0
++#define IS_UPMS         (1u << 4)
++#define IS_UCCS         (1u << 10)
++#define IS_FATAL        ((1u << 2) | (1u << 11) | (1u << 12) | (1u << 16) | (1u << 17))  /* UE DFES UTPES HCFES SBFES */
++#define HCS_UCRDY       (1u << 3)
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -260,8 +279,12 @@ dma_clean(uint32_t off, uint32_t len)
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
++int sweet_ufs_recover;                  /* 1069: 0 off (as before), 1 log, 2 + abort/retry, 3 + host reset (sweet_ssr.c reads it) */
++static void ufs_diag(const char *what, uint8_t op);
++static uint32_t ufs_sim_fail;           /* kern.sweet_ufs_recover_test=1: the next command fails without being sent */
++
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -319,6 +342,11 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	if (ufs_sim_fail && sweet_ufs_recover >= 1) {
++		ufs_sim_fail--;
++		printf("SWEET UFS: command 0x%02x: simulated timeout (kern.sweet_ufs_recover_test), not sent\n", cdb[0]);
++		return ETIMEDOUT;
++	}
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -334,8 +362,21 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
++			if (sweet_ufs_recover >= 1) {
++				ufs_diag("timeout", cdb[0]);
++			}
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			if (sweet_ufs_recover >= 1) {
++				/* as Linux ufshcd_clear_cmd: the slot must be free before it is used again */
++				for (int i = 0; i < 1000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++					delay(100);
++				}
++				if (ufs_rd(REG_UTRLDBR) & 1) {
++					printf("SWEET UFS: slot 0 still busy 100 ms after UTRLCLR\n");
++				}
++				ufs_wr(REG_IS, ufs_rd(REG_IS));
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -366,11 +407,423 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		if (sweet_ufs_recover >= 1) {
++			ufs_diag("failed", cdb[0]);
++		}
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * 1069: error handling (kern.sweet_ufs_recover, boot-arg sweetufsrec; default 0 = the driver as before 1069).
++ * Reference: Linux ufshcd.c (ufshcd_print_host_regs / ufshcd_clear_cmd / ufshcd_err_handler -> ufshcd_reset_and_restore
++ * -> ufshcd_hba_enable + ufshcd_link_startup + ufshcd_verify_dev_init + ufshcd_config_pwr_mode) and ufs-qcom.c.
++ *   1  log: at a timeout or a failed command, the error bits (IS, HCS with its UTP error code, UEC PA/DL/N/T/DME, doorbells,
++ *      the descriptor's OCS and the response UPIU); after a timeout the slot is cleared and waited for (<= 100 ms).
++ *   2  + retry: the same request is issued again once (same LBA, same data in the bounce buffer: READ/WRITE(10),
++ *      SYNCHRONIZE CACHE and TEST UNIT READY are idempotent; nothing is skipped or reported done that was not done).
++ *   3  + host reset when the retry fails: HCE off/on, the vendor timers ABL set put back, DME_LINKSTARTUP (3 tries),
++ *      our request list again, NOP OUT/IN, the power mode ABL negotiated (gears, lanes, series, termination, timeouts;
++ *      read with DME_GET while the link was healthy) restored, TEST UNIT READY; then the request once more.
++ *      No device reset (no GPIO; the device keeps its cache and its state), no task management.
++ *      At most one reset per 2 s; after 5 failed resets in a row only 1/2 run until a request succeeds again.
++ * If everything fails the error goes up as before (EIO/ETIMEDOUT). kern.sweet_ufs_recover_stats counts it all.
++ * kern.sweet_ufs_recover_test (write): 1 = the next command fails as a timeout without being sent (tests 2), 2 = host reset
++ * now + TEST UNIT READY (tests 3 on a healthy link; needs recover=3).
++ */
++#define UIC_DME_GET             0x01u
++#define UIC_DME_SET             0x02u
++#define UIC_DME_LINKSTARTUP     0x16u
++
++#define PA_ACTIVETXDATALANES    0x1560u
++#define PA_TXGEAR               0x1568u
++#define PA_TXTERMINATION        0x1569u
++#define PA_HSSERIES             0x156au
++#define PA_PWRMODE              0x1571u
++#define PA_ACTIVERXDATALANES    0x1580u
++#define PA_RXGEAR               0x1583u
++#define PA_RXTERMINATION        0x1584u
++#define PA_LOCAL_TX_LCC_ENABLE  0x155eu
++#define PA_PWRMODEUSERDATA0     0x15b0u
++
++static struct {
++	uint32_t timeouts, errors, retries, retry_ok, resets, reset_ok, reset_fail, fail_streak, gave_up, sim;
++	uint64_t last_reset;
++} ufs_ur;
++
++/* the link as ABL left it (DME_GET at boot or when recover is set to 3) */
++static const uint16_t pm_attr[] = {
++	PA_RXGEAR, PA_ACTIVERXDATALANES, PA_RXTERMINATION, PA_TXGEAR, PA_ACTIVETXDATALANES, PA_TXTERMINATION, PA_HSSERIES,
++	PA_PWRMODEUSERDATA0, PA_PWRMODEUSERDATA0 + 1, PA_PWRMODEUSERDATA0 + 2, PA_PWRMODEUSERDATA0 + 3,
++	PA_PWRMODEUSERDATA0 + 4, PA_PWRMODEUSERDATA0 + 5, 0xd041, 0xd042, 0xd043,  /* DME_Local FC0/TC0/AFC0 timeouts */
++};
++#define PM_N    (sizeof(pm_attr) / sizeof(pm_attr[0]))
++static struct {
++	bool have;
++	uint32_t v[PM_N];
++	uint32_t pwrmode, lcc;
++	bool lcc_ok;
++	uint32_t qc[4];                 /* SYS1CLK_1US, TX_SYMBOL_CLK, LINK_STARTUP_TMR, CFG2 */
++} ufs_pm;
++static const uint32_t qc_reg[4] = { REG_QC_SYS1CLK_1US, REG_QC_TX_SYMBOL_CLK, REG_QC_LINK_STARTUP_TMR, REG_QC_CFG2 };
++
++static void
++ufs_diag(const char *what, uint8_t op)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint32_t is = ufs_rd(REG_IS), hcs = ufs_rd(REG_HCS);
++
++	if (*what == 't') {
++		ufs_ur.timeouts++;
++	} else {
++		ufs_ur.errors++;
++	}
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD + offsetof(struct ucd, resp), 32);
++	/* the UEC registers clear when read: read once, print once */
++	uint32_t pa = ufs_rd(REG_UECPA), dl = ufs_rd(REG_UECDL), n = ufs_rd(REG_UECN), t = ufs_rd(REG_UECT), dme = ufs_rd(REG_UECDME);
++	printf("SWEET UFS ERR: %s op 0x%02x: IS 0x%x%s%s%s%s%s%s HCS 0x%x (utp err %u tag %u lun %u, upmcrs %u) HCE 0x%x "
++	    "DBR 0x%x RSR 0x%x TMDBR 0x%x | UEC pa 0x%x dl 0x%x n 0x%x t 0x%x dme 0x%x | OCS 0x%x upiu 0x%x resp 0x%x status 0x%x\n",
++	    what, op, is, (is & (1u << 2)) ? " UE" : "", (is & (1u << 11)) ? " DFES" : "", (is & (1u << 12)) ? " UTPES" : "",
++	    (is & (1u << 16)) ? " HCFES" : "", (is & (1u << 17)) ? " SBFES" : "", (is & (1u << 5 | 1u << 6)) ? " HIBERN8" : "",
++	    hcs, (hcs >> 12) & 0xf, (hcs >> 16) & 0xff, (hcs >> 24) & 0xff, (hcs >> 8) & 7, ufs_rd(REG_HCE), ufs_rd(REG_UTRLDBR),
++	    ufs_rd(REG_UTRLRSR), ufs_rd(REG_UTMRLDBR), pa, dl, n, t, dme, utrd->dw2 & 0xff, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++}
++
++/* one UIC command (UFSHCI 5.6.x): 0 or an errno; *val = UCMDARG3 afterwards */
++static int
++ufs_uic(uint32_t cmd, uint32_t attr, uint32_t val, uint32_t *out, uint32_t timeout_ms)
++{
++	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCS) & HCS_UCRDY); i++) {
++		delay(100);
++	}
++	if (!(ufs_rd(REG_HCS) & HCS_UCRDY)) {
++		printf("SWEET UFS REC: UIC 0x%x attr 0x%x: controller not ready for UIC commands (HCS 0x%x)\n", cmd, attr, ufs_rd(REG_HCS));
++		return EBUSY;
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	ufs_wr(REG_UCMDARG1, attr << 16);
++	ufs_wr(REG_UCMDARG2, 0);
++	ufs_wr(REG_UCMDARG3, val);
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UICCMD, cmd);
++	for (uint32_t i = 0; i < timeout_ms * 10 && !(ufs_rd(REG_IS) & IS_UCCS); i++) {
++		delay(100);
++	}
++	if (!(ufs_rd(REG_IS) & IS_UCCS)) {
++		printf("SWEET UFS REC: UIC 0x%x attr 0x%x: no completion in %u ms\n", cmd, attr, timeout_ms);
++		return ETIMEDOUT;
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	uint32_t rc = ufs_rd(REG_UCMDARG2) & 0xff;
++	if (out) {
++		*out = ufs_rd(REG_UCMDARG3);
++	}
++	if (rc) {
++		printf("SWEET UFS REC: UIC 0x%x attr 0x%x: result code %u\n", cmd, attr, rc);
+ 		return EIO;
+ 	}
+ 	return 0;
+ }
+ 
++/* sweet_ufs_lock held, no request outstanding */
++static void
++ufs_pm_snapshot(void)
++{
++	bool ok = true;
++	for (unsigned i = 0; i < PM_N && ok; i++) {
++		ok = ufs_uic(UIC_DME_GET, pm_attr[i], 0, &ufs_pm.v[i], 100) == 0;
++	}
++	ok = ok && ufs_uic(UIC_DME_GET, PA_PWRMODE, 0, &ufs_pm.pwrmode, 100) == 0;
++	ufs_pm.lcc_ok = ufs_uic(UIC_DME_GET, PA_LOCAL_TX_LCC_ENABLE, 0, &ufs_pm.lcc, 100) == 0;
++	for (unsigned i = 0; i < 4; i++) {
++		ufs_pm.qc[i] = ufs_rd(qc_reg[i]);
++	}
++	ufs_pm.have = ok;
++	printf("SWEET UFS REC: link %s: pwrmode 0x%x gear rx %u tx %u, lanes rx %u tx %u, term rx %u tx %u, series %u, tx lcc %d; "
++	    "qc 1us 0x%x sym 0x%x lst 0x%x cfg2 0x%x\n", ok ? "saved" : "NOT READ (no power mode restore after a reset)", ufs_pm.pwrmode,
++	    ufs_pm.v[0], ufs_pm.v[3], ufs_pm.v[1], ufs_pm.v[4], ufs_pm.v[2], ufs_pm.v[5], ufs_pm.v[6], ufs_pm.lcc_ok ? (int)ufs_pm.lcc : -1, ufs_pm.qc[0], ufs_pm.qc[1], ufs_pm.qc[2],
++	    ufs_pm.qc[3]);
++}
++
++/* Linux ufshcd_change_power_mode + ufshcd_uic_change_pwr_mode, with the values ABL had negotiated */
++static int
++ufs_pm_restore(void)
++{
++	uint32_t txm = ufs_pm.pwrmode & 0xf, rxm = (ufs_pm.pwrmode >> 4) & 0xf;
++	if (!ufs_pm.have || !((txm == 1 || txm == 4) && (rxm == 1 || rxm == 4))) {
++		printf("SWEET UFS REC: no saved fast mode (pwrmode 0x%x): the link stays in PWM-G1 (slow, data safe)\n", ufs_pm.pwrmode);
++		return ENOENT;
++	}
++	for (unsigned i = 0; i < PM_N; i++) {
++		if (ufs_uic(UIC_DME_SET, pm_attr[i], ufs_pm.v[i], NULL, 100) != 0) {
++			return EIO;
++		}
++	}
++	ufs_wr(REG_IS, IS_UPMS);
++	if (ufs_uic(UIC_DME_SET, PA_PWRMODE, ufs_pm.pwrmode, NULL, 500) != 0) {
++		return EIO;
++	}
++	for (int i = 0; i < 5000 && !(ufs_rd(REG_IS) & IS_UPMS); i++) {
++		delay(100);
++	}
++	uint32_t is = ufs_rd(REG_IS), st = (ufs_rd(REG_HCS) >> 8) & 7;
++	ufs_wr(REG_IS, IS_UPMS);
++	if (!(is & IS_UPMS) || st != 1) {       /* PWR_LOCAL */
++		printf("SWEET UFS REC: power mode change to 0x%x: %s, status %u\n", ufs_pm.pwrmode, (is & IS_UPMS) ? "done" : "no UPMS", st);
++		return EIO;
++	}
++	return 0;
++}
++
++/* NOP OUT -> NOP IN in slot 0 (Linux ufshcd_verify_dev_init: 10 tries) */
++static int
++ufs_nop(void)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++
++	for (int t = 0; t < 10; t++) {
++		bzero(utrd, sizeof(*utrd));
++		bzero(ucd, offsetof(struct ucd, prdt));
++		ucd->cmd[0] = 0x00;             /* NOP OUT */
++		ucd->cmd[3] = ++su.tag;
++		utrd->dw0 = (1u << 28) | (1u << 24);
++		utrd->dw2 = 0x0f;
++		utrd->ucdba = (uint32_t)ucd_pa;
++		utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++		utrd->resp = (512u / 4) << 16 | (512u / 4);
++		dma_sync(DMA_UTRL, sizeof(*utrd));
++		dma_sync(DMA_UCD, offsetof(struct ucd, prdt));
++		__builtin_arm_dsb(0xf);
++		ufs_wr(REG_UTRLDBR, 1);
++		for (int i = 0; i < 500 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++			delay(100);
++		}
++		if (ufs_rd(REG_UTRLDBR) & 1) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			for (int i = 0; i < 1000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++				delay(100);
++			}
++			continue;
++		}
++		__builtin_arm_dsb(0xf);
++		ufs_wr(REG_IS, ufs_rd(REG_IS));
++		dma_sync(DMA_UTRL, sizeof(*utrd));
++		dma_sync(DMA_UCD + offsetof(struct ucd, resp), 32);
++		if ((utrd->dw2 & 0xff) == 0 && ucd->resp[0] == 0x20 && ucd->resp[6] == 0) {
++			return 0;
++		}
++	}
++	return EIO;
++}
++
++/* sweet_ufs_lock held: Linux ufshcd_reset_and_restore without the device reset */
++static int
++ufs_host_reset(const char *why)
++{
++	int e = 0;
++	ufs_ur.resets++;
++	ufs_ur.last_reset = mach_absolute_time();
++	printf("SWEET UFS REC: host reset #%u (%s)\n", ufs_ur.resets, why);
++	for (int round = 0; round < 2; round++) {
++		ufs_wr(REG_UTRLRSR, 0);
++		ufs_wr(REG_HCE, 0);
++		for (int i = 0; i < 100 && (ufs_rd(REG_HCE) & 1); i++) {
++			delay(100);
++		}
++		delay(1000);
++		/* ufs-qcom's hce/link-startup notifications program these; HCE may or may not reset them: put ABL's back */
++		for (unsigned i = 0; i < 4; i++) {
++			uint32_t now = ufs_rd(qc_reg[i]);
++			if (ufs_pm.have && now != ufs_pm.qc[i]) {
++				printf("SWEET UFS REC: vendor reg 0x%x 0x%x -> 0x%x (ABL's)\n", qc_reg[i], now, ufs_pm.qc[i]);
++				ufs_wr(qc_reg[i], ufs_pm.qc[i]);
++			}
++		}
++		ufs_wr(REG_HCE, 1);
++		delay(1000);
++		for (int i = 0; i < 50 && !(ufs_rd(REG_HCE) & 1); i++) {
++			delay(1000);
++		}
++		if (!(ufs_rd(REG_HCE) & 1)) {
++			printf("SWEET UFS REC: HCE did not come back (HCS 0x%x)\n", ufs_rd(REG_HCS));
++			e = EIO;
++			continue;
++		}
++		ufs_wr(REG_IE, 0);
++		ufs_wr(REG_IS, ufs_rd(REG_IS));
++		if (ufs_pm.lcc_ok && ufs_pm.lcc == 0) {
++			(void)ufs_uic(UIC_DME_SET, PA_LOCAL_TX_LCC_ENABLE, 0, NULL, 100);      /* ufs-qcom pre link startup */
++		}
++		e = EIO;
++		for (int t = 0; t < 3 && e; t++) {
++			e = ufs_uic(UIC_DME_LINKSTARTUP, 0, 0, NULL, 500);
++			if (e == 0 && !(ufs_rd(REG_HCS) & HCS_DP)) {
++				printf("SWEET UFS REC: link startup done but no device present (HCS 0x%x)\n", ufs_rd(REG_HCS));
++				e = ENXIO;
++			}
++			ufs_wr(REG_IS, ufs_rd(REG_IS));
++		}
++		if (e == 0) {
++			break;
++		}
++	}
++	if (e == 0) {
++		for (int i = 0; i < 1000 && !(ufs_rd(REG_HCS) & HCS_UTRLRDY); i++) {
++			delay(100);
++		}
++		uint64_t list = su.dma_pa + DMA_UTRL;
++		ufs_wr(REG_UTRLBA, (uint32_t)list);
++		ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++		ufs_wr(REG_UTRLRSR, 1);
++		if (!(ufs_rd(REG_HCS) & HCS_UTRLRDY) || ufs_rd(REG_UTRLBA) != (uint32_t)list ||
++		    ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) || !(ufs_rd(REG_UTRLRSR) & 1)) {
++			printf("SWEET UFS REC: host did not take our request list again (HCS 0x%x)\n", ufs_rd(REG_HCS));
++			e = EIO;
++		}
++	}
++	if (e == 0 && (e = ufs_nop()) != 0) {
++		printf("SWEET UFS REC: no NOP IN from the device\n");
++	}
++	if (e == 0) {
++		int pe = ufs_pm_restore();
++		printf("SWEET UFS REC: power mode %s\n", pe == 0 ? "restored (as ABL set it)" : "NOT restored: PWM-G1");
++		static const uint8_t tur[6] = { 0x00 };
++		for (int i = 0; i < 3 && (e = ufs_scsi_once(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (e == 0) {
++		ufs_ur.reset_ok++;
++		ufs_ur.fail_streak = 0;
++	} else {
++		ufs_ur.reset_fail++;
++		ufs_ur.fail_streak++;
++	}
++	printf("SWEET UFS REC: host reset #%u %s (ok %u, failed %u)\n", ufs_ur.resets, e == 0 ? "OK" : "FAILED", ufs_ur.reset_ok, ufs_ur.reset_fail);
++	return e;
++}
++
++/* every command goes through here (sweet_ufs_lock held) */
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	int e = ufs_scsi_once(cdb, cdb_len, len, write);
++	int level = sweet_ufs_recover;
++	if (e == 0 || level < 2) {
++		if (e == 0 && ufs_ur.fail_streak) {
++			ufs_ur.fail_streak = 0;
++		}
++		return e;
++	}
++	ufs_ur.retries++;
++	e = ufs_scsi_once(cdb, cdb_len, len, write);
++	if (e == 0) {
++		ufs_ur.retry_ok++;
++		printf("SWEET UFS REC: command 0x%02x OK on the retry\n", cdb[0]);
++		return 0;
++	}
++	if (level >= 3) {
++		uint64_t gap;
++		nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &gap);
++		if (ufs_ur.fail_streak >= 5) {
++			if (ufs_ur.gave_up++ % 100 == 0) {
++				printf("SWEET UFS REC: %u host resets in a row failed: no more resets until a command succeeds\n", ufs_ur.fail_streak);
++			}
++		} else if (ufs_ur.last_reset && mach_absolute_time() - ufs_ur.last_reset < gap) {
++			ufs_ur.gave_up++;
++		} else if (ufs_host_reset(e == ETIMEDOUT ? "timeout after retry" : "error after retry") == 0) {
++			ufs_ur.retries++;
++			e = ufs_scsi_once(cdb, cdb_len, len, write);
++			if (e == 0) {
++				ufs_ur.retry_ok++;
++				printf("SWEET UFS REC: command 0x%02x OK after the host reset\n", cdb[0]);
++				return 0;
++			}
++		}
++	}
++	printf("SWEET UFS REC: command 0x%02x still failing (%d): error to the caller\n", cdb[0], e);
++	return e;
++}
++
++static int
++sysctl_sweet_ufs_recover SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_ufs_recover, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 3) {
++		return EINVAL;
++	}
++	if (value >= 3 && su.ready && !ufs_pm.have) {
++		lck_mtx_lock(&sweet_ufs_lock);
++		ufs_pm_snapshot();
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
++	sweet_ufs_recover = value;
++	printf("SWEET UFS REC: mode %d (%s)\n", value, value == 3 ? "log + retry + host reset" : value == 2 ? "log + retry" :
++	    value == 1 ? "log" : "off");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_recover, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_ufs_recover, "I",
++    "redfin 1069: UFS errors: 0 off (as before), 1 log error bits, 2 + retry the request, 3 + host reset and retry");
++
++static int
++sysctl_sweet_ufs_recover_test SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, 0, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (!su.ready || sweet_ufs_recover < 2) {
++		return ENXIO;           /* (a simulated failure with no retry would reach the file system) */
++	}
++	if (value == 1) {
++		ufs_ur.sim++;
++		lck_mtx_lock(&sweet_ufs_lock);
++		ufs_sim_fail = 1;
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("SWEET UFS REC: test: the next command fails as a timeout without being sent\n");
++		return 0;
++	}
++	if (value == 2) {
++		if (sweet_ufs_recover < 3) {
++			return EPERM;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		error = ufs_host_reset("kern.sweet_ufs_recover_test=2");
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return error;
++	}
++	return EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_recover_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_ufs_recover_test,
++    "I", "redfin 1069: write 1 = next UFS command fails without being sent (needs recover >= 2); 2 = host reset now (recover 3)");
++
++static int
++sysctl_sweet_ufs_recover_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[256];
++	int n = snprintf(s, sizeof(s), "mode %d | timeouts %u errors %u | retries %u ok %u | resets %u ok %u failed %u streak %u | "
++	    "gave up %u | simulated %u | link saved %d pwrmode 0x%x", sweet_ufs_recover, ufs_ur.timeouts, ufs_ur.errors, ufs_ur.retries,
++	    ufs_ur.retry_ok, ufs_ur.resets, ufs_ur.reset_ok, ufs_ur.reset_fail, ufs_ur.fail_streak, ufs_ur.gave_up, ufs_ur.sim, ufs_pm.have, ufs_pm.pwrmode);
++	return SYSCTL_OUT(req, s, (size_t)MIN(n, (int)sizeof(s) - 1) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_recover_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_ufs_recover_stats, "A", "redfin 1069: UFS error handling counters");
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -828,8 +1281,15 @@ sweet_ufs_init(void)
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
++	uint32_t rec = 0;
++	PE_parse_boot_argn("sweetufsrec", &rec, sizeof(rec));
++	sweet_ufs_recover = rec <= 3 ? (int)rec : 0;
++
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++	if (!error && sweet_ufs_recover >= 3) {
++		ufs_pm_snapshot();              /* 1069: the link as ABL made it, before anything can go wrong */
++	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
