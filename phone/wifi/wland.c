@@ -822,8 +822,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, h->src_node, QRTR_PORT_CTRL, hello, sizeof(hello));
 	} else if (w[0] == QRTR_TYPE_NEW_SERVER) {
 		printf("qrtr:   server service %#x instance %#x at %u:%x\n", w[1], w[2], w[3], w[4]);
-		if (w[1] == WLFW_SERVICE)
+		if (w[1] == WLFW_SERVICE) {
 			wlfw_new_server(w[3], w[4]);
+			pdmapper_wlan_up();
+		}
 		cell_server(w[1], w[2], w[3], w[4]);
 		ssctl_server(w[1], w[2], w[3], w[4]);
 		ipaqmi_server(w[1], w[2], w[3], w[4]);
