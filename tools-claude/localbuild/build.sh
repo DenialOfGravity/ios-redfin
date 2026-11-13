@@ -105,7 +105,7 @@ EOH
 	sh phone/audio/build.sh > "$U/audio-build.log" 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test \
 		phone/audio/out/camera_test phone/audio/out/camera_avtest phone/audio/out/mg_test phone/audio/out/vt_test "$U/" ||
 		{ say "WARN RedwoodAudio.driver failed"; tail -40 "$U/audio-build.log"; }
-	for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump mic_test; do
+	for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump mic_test pdptest; do
 		[ -f phone/tools/out/$t ] && cp phone/tools/out/$t "$U/"; [ -f phone/audio/out/$t ] && cp phone/audio/out/$t "$U/"
 	done
 	cd "$U"
