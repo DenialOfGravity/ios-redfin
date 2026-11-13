@@ -29,6 +29,7 @@
  *   1 no dual control       2 behave as CVD < 2.2 (V2 create; no device channels / commit)
  *   4 no media formats      8 also MFC output 2 ch (as q6voice for CVP >= 2)      16 topologies TX SM ECNS V2 /
  *   RX default instead of NONE      32 destroy the CVS too at the end      64 RX media format 1 ch / 16 bits
+ * 1074: kern.sweet_voice_auto (sweet_qmux.c) drives the same switch from the modem's call states (sweet_voice_auto()).
  * kern.sweet_voice_vsid: the session name's VSID (default 0x11C05000; 0 = "default modem voice").
  * A failed start is undone and kern.sweet_voice reads 0 again. Never returns to fastboot.
  *
@@ -137,6 +138,7 @@ static uint16_t mvm_handle, cvs_handle, cvp_handle;
 static int cvd_major = -1, cvd_minor;
 static bool mic_held, port_held, dual_done, attached, started;
 static bool thread_up;
+static bool auto_owned;                         /* 1074: the running session was started by kern.sweet_voice_auto */
 static int voice_wake;
 static uint32_t starts, failures;
 static uint32_t cvs_vsid;                       /* 1066: the VSID the kept CVS was named after */
@@ -654,12 +656,68 @@ sysctl_voice(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int
 	}
 	lck_mtx_unlock(&thread_lock);
 	SAY("kern.sweet_voice = %d (%s; was %d)\n", v, v == 0 ? "off" : v == 1 ? "earpiece" : "speaker", voice_target);
+	auto_owned = false;     /* 1074: set by hand: kern.sweet_voice_auto leaves this session alone */
 	voice_target = v;
 	thread_wakeup(&voice_wake);
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice, "I",
     "redfin 1065: in-call audio through the ADSP voice services: 0 off (default), 1 earpiece, 2 speaker");
+
+/*
+ * 1074: the automatic trigger (kern.sweet_voice_auto in sweet_qmux.c, from the modem's VOICE call states; called on a
+ * thread call). target 1/2: start (or re-route) only if nothing runs or the running session is the trigger's own; a
+ * session set by hand (kern.sweet_voice) is left alone. target 0: stop only a session the trigger started.
+ * The same path as the sysctl: voice_target + the voice thread.
+ */
+int sweet_voice_auto(int target, const char *why);
+int
+sweet_voice_auto(int target, const char *why)
+{
+	bool wake = false;
+
+	if (target < 0 || target > 2) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&thread_lock);
+	if (target != 0) {
+		if (voice_target != 0 && !auto_owned) {
+			lck_mtx_unlock(&thread_lock);
+			SAY("auto: %s, but kern.sweet_voice %d was set by hand: left alone\n", why, voice_target);
+			return 0;
+		}
+		if (!thread_up) {
+			thread_t thread;
+
+			if (kernel_thread_start(voice_thread, NULL, &thread) != KERN_SUCCESS) {
+				lck_mtx_unlock(&thread_lock);
+				SAY("auto: no thread\n");
+				return ENOMEM;
+			}
+			thread_deallocate(thread);
+			thread_up = true;
+			redwood_adsp_apr_events_voice(voice_event);
+		}
+		auto_owned = true;
+		if (voice_target != target) {
+			SAY("auto: %s -> %s (was %d)\n", why, target == 1 ? "earpiece" : "speaker", voice_target);
+			voice_target = target;
+			wake = true;
+		}
+	} else if (auto_owned) {
+		auto_owned = false;
+		if (voice_target != 0) {
+			SAY("auto: %s -> off\n", why);
+			voice_target = 0;
+			wake = true;
+		}
+	}
+	lck_mtx_unlock(&thread_lock);
+	if (wake) {
+		thread_wakeup(&voice_wake);
+	}
+	return 0;
+}
 
 static int
 sysctl_voice_number(__unused struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
