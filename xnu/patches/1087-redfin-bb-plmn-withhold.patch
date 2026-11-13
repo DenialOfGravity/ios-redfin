@@ -1,0 +1,263 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 0447bfc..0686bc3 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -47,6 +47,8 @@
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
+  * 1085: kern.sweet_qmi_plmnblip (0 off default, 1 on): _plmnblip_ms after a re-publish SysInfo shot, one SysInfo indication
+  *       with the LTE PLMN's MNC changed to 9s, then the modem's real one 300 ms later (CommCenter re-publishes, SOS gone).
++ * 1087: kern.sweet_qmi_republish 4 = as 3, plus the PLMN withheld from CommCenter until the activation went (NAS
++ *       indications held without the 5 s timeout, up to _withhold_s 600; PLMN TLVs stripped from NAS GET answers).
+  * 1084: kern.sweet_qmi_republish 3 = BSP activation deferred until the modem has service (_wait_s 45), then the shot.
+  * 1082: re-publish clients = NAS 0x0003 TLV 0x18/0x19 (not 0x12/0x13), fallbacks, choice logged; manual line timing fixed.
+  * 1073: kern.sweet_qmi_republish (0 off default, 1 auto once per CommCenter session, write 2 = now), _republish_ms (20).
+@@ -92,6 +94,9 @@ static const char *pipe_name[NPIPES] = { "qmux1", "qmux2" };
+ static int qmi_filter = 1, qmi_rules = 0, err_code = QMI_ERR_NOT_SUPPORTED, cidfail = 0, reuse = 1, kickon = 1;
+ static int holdnas = 1, holddly = 500, policy_file = 1;
+ static int repub_mode = 0, repub_ms = 20;       /* 1073: kern.sweet_qmi_republish (0 off), kern.sweet_qmi_republish_ms */
++static int wh_s = 600;                          /* 1087: kern.sweet_qmi_withhold_s (mode 4: longest PLMN withholding) */
++static uint64_t wh_start;                       /* 1087: first withheld frame of this CommCenter session (0 none) */
++static unsigned wh_held, wh_stripped, wh_logged;
+ static int repub_wait_s = 45;                   /* 1084: kern.sweet_qmi_republish_wait_s (mode 3: longest activation deferral) */
+ static int act_waiting;                         /* 1084: a BSP activation indication is being deferred */
+ static volatile int repub_now;                  /* 1073: kern.sweet_qmi_republish=2 written (manual shot) */
+@@ -1452,6 +1457,7 @@ hold_gate_open(void)
+ 	if (gate_set && !sess_live(gate_pipe, gate_sess)) {
+ 		gate_set = 0;
+ 		gate_at = 0;
++		wh_start = 0;   /* 1087 */
+ 		LOG("holdnas: gate closed (session %s/%u ended): NAS indications held until the next BSP activation\n",
+ 		    gate_pipe < NPIPES ? pipe_name[gate_pipe] : "?", gate_sess);
+ 	}
+@@ -1460,7 +1466,7 @@ hold_gate_open(void)
+ 
+ static int cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid);
+ 
+-static void
++static int
+ hold_release(int k, const char *why)
+ {
+ 	int sent = 0, gone = 0;
+@@ -1482,6 +1488,105 @@ hold_release(int k, const char *why)
+ 	if (sent || gone) {
+ 		LOG("holdnas: released %d held NAS indication(s) (%s), %d client(s) gone\n", sent, why, gone);
+ 	}
++	return sent;
++}
++
++/*
++ * ---- 1087: kern.sweet_qmi_republish = 4: the network identity withheld until the BSP activation went ----
++ * research/cc/P5-sos2-result.md. SpringBoard shows SOS while CoreTelephony's display status is EmergencyOnly; CommCenter
++ * publishes it on few events, one of them "Computed MCC/MNC changed" (sub_1003b0fac). Today CommCenter learns 206-01 long
++ * before the activation (the 5 s hold timeout fires while the SIM PIN is not entered), publishes kEmergencyOnly at
++ * kUnavailable -> kUnknown and never again. Mode 4 only orders and holds genuine modem data: NAS indications stay held
++ * (newest of each kept) with no 5 s timeout until the activation went (+republish_ms, then the shot), and CommCenter's own
++ * NAS GET answers in that window lose their PLMN-carrying optional TLVs (= "not reported"); the answers are not held,
++ * because the window lasts as long as the PIN entry (240 s on 2026-11-13), far beyond a QMI request's wait.
++ * Stripped (ids from CommCenter's own parsers, libCommCenterMCommandDrivers): GetSysInfo 0x004d: 0x15 CDMA, 0x16 HDR,
++ * 0x17 GSM, 0x18 WCDMA, 0x19 LTE, 0x25 TD-SCDMA, 0x4b NR5G system info (network id / MCC-MNC), 0x2f CDMA derived MCC;
++ * GetServingSystem 0x0024: 0x12 current PLMN, 0x27 MNC PCS digit; GetCellLocationInfo 0x0043: every TLV but the result.
++ * Kept: service status TLVs (0x10-0x14, 0x24, 0x4a), LTE emergency bearer/access-barred (0x39, 0x3e), SIM reject info,
++ * GetHomeNetwork 0x0025 (mandatory TLV: the SIM's home PLMN, which CommCenter reads from the SIM itself anyway).
++ * Escape: kern.sweet_qmi_republish 3 (or 0) at run time ends the withholding (the 5 s timeout releases the queue).
++ */
++static int
++wh_active(uint64_t now)
++{
++	if (repub_mode != 4 || hold_gate_open()) {
++		return 0;
++	}
++	if (wh_start && now - wh_start >= (uint64_t)(wh_s > 0 ? wh_s : 0) * 1000) {
++		if (wh_logged != 0xffffffffu) {
++			wh_logged = 0xffffffffu;
++			printf("SWEET QMUX: republish: PLMN withholding ended after %d s without an activation (%u held, %u stripped)\n",
++			    wh_s, wh_held, wh_stripped);
++		}
++		return 0;
++	}
++	return 1;
++}
++
++static void
++wh_note(uint64_t now)
++{
++	if (!wh_start) {
++		wh_start = now ? now : 1;
++		wh_held = wh_stripped = wh_logged = 0;
++		printf("SWEET QMUX: republish: mode 4: PLMN withheld from CommCenter until the BSP activation (up to %d s)\n", wh_s);
++	}
++}
++
++static const uint8_t wh_ids_4d[] = { 0x15, 0x16, 0x17, 0x18, 0x19, 0x25, 0x4b, 0x2f };
++static const uint8_t wh_ids_24[] = { 0x12, 0x27 };
++
++static uint32_t
++wh_strip(unsigned msg, uint8_t *p, uint32_t n)
++{
++	const uint8_t *ids = NULL;
++	int nids = 0, all = 0;
++	if (msg == 0x004d) {
++		ids = wh_ids_4d;
++		nids = (int)sizeof(wh_ids_4d);
++	} else if (msg == 0x0024) {
++		ids = wh_ids_24;
++		nids = (int)sizeof(wh_ids_24);
++	} else if (msg == 0x0043) {
++		all = 1;
++	} else {
++		return n;
++	}
++	uint32_t o = 0;
++	int k0 = 0;
++	char dropped[64];
++	int dl = 0;
++	dropped[0] = 0;
++	for (uint32_t k = 0; k + 3 <= n;) {
++		uint32_t l = 3u + (uint32_t)(p[k + 1] | (p[k + 2] << 8));
++		if (k + l > n) {
++			break;
++		}
++		int drop = all && p[k] != 0x02;
++		for (int j = 0; j < nids; j++) {
++			drop |= ids[j] == p[k];
++		}
++		if (drop) {
++			k0++;
++			if (dl < (int)sizeof(dropped) - 4) {
++				dl += snprintf(dropped + dl, sizeof(dropped) - (size_t)dl, "%s%02x", dl ? "," : "", p[k]);
++			}
++		} else {
++			memmove(p + o, p + k, l);
++			o += l;
++		}
++		k += l;
++	}
++	if (k0) {
++		wh_stripped++;
++		if (wh_logged < 12) {
++			wh_logged++;
++			LOG("republish: mode 4: NAS answer 0x%04x to CommCenter without TLV(s) %s (PLMN withheld until activation)\n", msg,
++			    dropped);
++		}
++	}
++	return o;
+ }
+ 
+ static void
+@@ -1507,7 +1612,13 @@ hold_frame(uint32_t pipe, uint32_t sess, const uint8_t *f, uint32_t n)
+ 	if (hold_bypass || !holdnas || n < 13 || n > HOLD_MAXF || f[4] != 0x03 || f[6] != 0x04 || hold_gate_open()) {
+ 		return 0;
+ 	}
+-	if (act_waiting) {      /* 1084: while the activation waits (up to 45 s) keep only the newest of each indication */
++	uint64_t whn = sbb_ms();
++	int wh = wh_active(whn);        /* 1087 */
++	if (wh) {
++		wh_note(whn);
++		wh_held++;
++	}
++	if (act_waiting || wh) {        /* 1084/1087: while the activation waits keep only the newest of each indication */
+ 		uint16_t m = (uint16_t)(f[9] | (f[10] << 8));
+ 		for (int i = 0; i < nhold; i++) {
+ 			struct hold *o = &B->holdq[i];
+@@ -1550,11 +1661,17 @@ hold_poll(uint64_t now)
+ 		return;
+ 	}
+ 	if (hold_gate_open()) {
+-		hold_release(nhold, "gate open");
++		int k = hold_release(nhold, "gate open");
++		if (repub_mode == 4 && wh_start) {      /* 1087 */
++			printf("SWEET QMUX: republish: PLMN withheld until activation (%u indication(s) held, %u answer(s) stripped/held)\n",
++			    wh_held, wh_stripped);
++			printf("SWEET QMUX: republish: released after activation: %d indication(s) delivered\n", k);
++			wh_start = 0;
++		}
+ 		return;
+ 	}
+-	if (act_waiting) {
+-		return;         /* 1084: no hold timeout while the activation is deferred (the gate opens when it goes) */
++	if (act_waiting || wh_active(now)) {
++		return;         /* 1084/1087: no hold timeout while the activation is deferred / the PLMN is withheld */
+ 	}
+ 	if (now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
+ 		held_rel_to++;
+@@ -1963,7 +2080,7 @@ send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg,
+ 		if (nhold) {
+ 			held_rel_bsp++;
+ 		}
+-		hold_open(pipe, sess, holddly, "BSP activation 0xb00c sent");
++		hold_open(pipe, sess, repub_mode == 4 ? repub_ms : holddly, "BSP activation 0xb00c sent");
+ 	}
+ }
+ 
+@@ -2588,7 +2705,7 @@ repub_send(int kind, int fallback)
+ static void
+ repub_arm(uint32_t pipe, uint32_t sess)
+ {
+-	if ((repub_mode != 1 && repub_mode != 3) || (rp_done && rp_done_pipe == pipe && rp_done_sess == sess) ||
++	if ((repub_mode != 1 && repub_mode != 3 && repub_mode != 4) || (rp_done && rp_done_pipe == pipe && rp_done_sess == sess) ||
+ 	    (rp_armed && rp_pipe == pipe && rp_sess == sess)) {
+ 		return;
+ 	}
+@@ -2703,7 +2820,7 @@ repub_poll(uint64_t now)
+ 	if (!rp_armed || now < rp_at) {
+ 		return;
+ 	}
+-	if ((repub_mode != 1 && repub_mode != 3) || !sess_live(rp_pipe, rp_sess)) {
++	if ((repub_mode != 1 && repub_mode != 3 && repub_mode != 4) || !sess_live(rp_pipe, rp_sess)) {
+ 		rp_armed = 0;
+ 		return;
+ 	}
+@@ -2786,7 +2903,7 @@ nas_ss_note(const uint8_t *p, uint32_t n)
+ static int
+ act_defer(uint32_t pipe, uint32_t sess, unsigned cid, const uint8_t *tl, uint32_t tn)
+ {
+-	if (act_bypass || repub_mode != 3 || srv_usable || tn > sizeof(actq.tl) ||
++	if (act_bypass || (repub_mode != 3 && repub_mode != 4) || srv_usable || tn > sizeof(actq.tl) ||
+ 	    (act_rel_set && act_rel_pipe == pipe && act_rel_sess == sess)) {
+ 		return 0;
+ 	}
+@@ -2857,7 +2974,7 @@ act_poll(uint64_t now)
+ 		printf("SWEET QMUX: republish: modem srv full after %llu ms: activation delivered (%u poll(s))\n",
+ 		    (unsigned long long)(now - act_since), act_probes);
+ 		go = 1;
+-	} else if (repub_mode != 3) {
++	} else if (repub_mode != 3 && repub_mode != 4) {
+ 		printf("SWEET QMUX: republish: mode %d now: deferred activation delivered after %llu ms\n", repub_mode,
+ 		    (unsigned long long)(now - act_since));
+ 		go = 1;
+@@ -4548,6 +4665,16 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 		return;
+ 	}
+ 	memcpy(b + 6, d, len);
++	if (d[0] == 0x02 && c->svc == 0x03 && (rmsg == 0x004d || rmsg == 0x0024 || rmsg == 0x0043) && wh_active(sbb_ms())) {
++		wh_note(sbb_ms());      /* 1087 */
++		uint32_t nl = wh_strip(rmsg, b + 13, ml);
++		if (nl != ml) {
++			b[11] = (uint8_t)nl;
++			b[12] = (uint8_t)(nl >> 8);
++			len = 7 + nl;
++			ml = nl;
++		}
++	}
+ 	if (nstrip) {
+ 		uint32_t nl = strip_tlvs(c->svc, rmsg, b + 13, ml);
+ 		if (nl != ml) {
+@@ -4861,7 +4988,7 @@ sysctl_repub SYSCTL_HANDLER_ARGS
+ 	if (proc_suser(req->p) != 0) {
+ 		return EPERM;
+ 	}
+-	if (v < 0 || v > 3) {
++	if (v < 0 || v > 4) {
+ 		return EINVAL;
+ 	}
+ 	if (v == 2) {
+@@ -4908,7 +5035,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_auto, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_republish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_repub, "I",
+     "redfin 1073: 0 off (default), 1 = once per CommCenter session the modem's fresh NAS SysInfo/SigInfo as indications "
+     "kern.sweet_qmi_republish_ms after BSP activation; write 2 = send them now; 3 = as 1, the BSP activation deferred until the "
+-    "modem has service (1084)");
++    "modem has service (1084); 4 = as 3, the PLMN withheld from CommCenter until the activation (1087)");
++QINT(sweet_qmi_withhold_s, wh_s, "redfin 1087: mode 4: longest PLMN withholding in s per CommCenter session (600), then the old 5 s hold timeout");
+ QINT(sweet_qmi_plmnblip, plmnblip, "redfin 1085: 1 = after a re-publish SysInfo shot, a SysInfo with another MNC then the real one (CommCenter re-publishes its registration status: no SOS); 0 off (default)");
+ QINT(sweet_qmi_plmnblip_ms, plmnblip_ms, "redfin 1085: delay in ms from the shot to the PLMN blip (1500)");
+ QINT(sweet_qmi_republish_wait_s, repub_wait_s, "redfin 1084: mode 3: longest wait in s for modem service before the BSP activation goes anyway (45)");
