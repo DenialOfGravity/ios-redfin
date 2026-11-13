@@ -1,0 +1,255 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 0686bc3..81de42b 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -47,6 +47,8 @@
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
+  * 1085: kern.sweet_qmi_plmnblip (0 off default, 1 on): _plmnblip_ms after a re-publish SysInfo shot, one SysInfo indication
+  *       with the LTE PLMN's MNC changed to 9s, then the modem's real one 300 ms later (CommCenter re-publishes, SOS gone).
++ * 1088: kern.sweet_data_opts & 0x4 (default on): the router's own WDA SetDataFormat (wland's X1 values) once per modem
++ *       boot when data forwarding is on (CommCenter never sends one here); StartNetworkInterface held until it is answered.
+  * 1087: kern.sweet_qmi_republish 4 = as 3, plus the PLMN withheld from CommCenter until the activation went (NAS
+  *       indications held without the 5 s timeout, up to _withhold_s 600; PLMN TLVs stripped from NAS GET answers).
+  * 1084: kern.sweet_qmi_republish 3 = BSP activation deferred until the modem has service (_wait_s 45), then the shot.
+@@ -3071,6 +3073,7 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
+ #define QMI_ERR_DEVICE_NOT_READY 0x34
+ #define DOPT_WDA_STRIP          0x1
+ #define DOPT_BIND_TETH          0x2
++#define DOPT_WDA_OWN            0x4     /* 1088: the router sends its own WDA SetDataFormat (default on) */
+ #define D_HELD_START_MS         15000u
+ #define D_HELD_PROF_MS          60000u
+ #define D_GW_WAIT_MS            2000u
+@@ -3079,6 +3082,9 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
+ #define D_RATE_N                6
+ #define D_RATE_MS               60000u
+ #define D_PROF_PORT             (SBB_QMUX_PORT0 + SBB_QMUX_NPORTS - 1u)
++#define D_WDA_PORT              (SBB_QMUX_PORT0 + SBB_QMUX_NPORTS - 2u)        /* 1088: the router's WDA client */
++#define D_WDA_RETRY_MS          10000u
++#define D_WDA_TRIES             3
+ #define D_NH                    4
+ #define D_NHOLD                 16
+ #define D_HOLD_MAXF             2048u
+@@ -3087,7 +3093,7 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
+ #define D_BAK_MAX               (48u << 10)
+ #define D_NGATE                 8
+ 
+-static int data_fwd = 1, data_opts = 0;
++static int data_fwd = 1, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default */
+ static int data_was;                    /* data_active() as the thread saw it last (logs + kill switch) */
+ static uint16_t gate_ids[D_NGATE] = { 0x0027, 0x0028, 0x0029, 0x004a, 0x0093 };     /* [0..2] always */
+ static int ngate = 5;
+@@ -3106,7 +3112,7 @@ struct dhold {
+ 	uint64_t t;
+ 	uint8_t f[D_HOLD_MAXF];
+ };
+-enum { DO_STOP = 1, DO_GW, DO_PLIST, DO_PSET };
++enum { DO_STOP = 1, DO_GW, DO_PLIST, DO_PSET, DO_WDA };
+ struct down {
+ 	int used, kind, ci;
+ 	uint32_t port, hd;
+@@ -3135,6 +3141,21 @@ static struct {
+ static int pb_state;                    /* 0 none, 1 list out, 2 settings out, 3 ready (exposed), 4 acked */
+ static int pb_tries, pb_n;
+ static volatile int pb_ack;
++/*
++ * 1088: the router's own WDA SetDataFormat. On an iPhone ABM's DataModule sets the data format once per baseband boot;
++ * here ABM's boot is answered by the router, so CommCenter never even allocates a WDA client (2026-11-13: no CTL
++ * GetClientId for 0x1a, kern.sweet_data_stats "fwd WDA 0") and the modem's IPA endpoint keeps its default format.
++ * With kern.sweet_data_opts & 0x4 (default on) and data forwarding active, once sweet_ipa_ready(): WDA 0x0020 from the
++ * router's own port D_WDA_PORT with wland's proven X1 values (0x11 raw IP 2, 0x12/0x13 QMAPv5 9, 0x15 DL 16 datagrams,
++ * 0x16 DL 0x3800 bytes, 0x17 endpoint {4 embedded, 1}); answer logged; 3 tries 10 s apart; sent again when the WDA
++ * server goes or moves (modem restart). WDS StartNetworkInterface stays held (the 15 s hold) until it is answered.
++ * Bit clear = no router WDA request (StartNetworkInterface waits for the IPA only, as 1080 did).
++ */
++static int wda_st;                      /* 0 not sent, 1 out, 2 modem ok, 3 error/no answer */
++static int wda_tries;
++static uint32_t wda_node, wda_port;
++static uint64_t wda_next;
++static unsigned wda_res = 0xffff, wda_err = 0xffff;
+ static LCK_MTX_DECLARE(bak_lock, &qmux_grp);
+ 
+ static bool
+@@ -3600,6 +3621,9 @@ d_own_answer(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 		}
+ 		break;
+ 	}
++	case DO_WDA:
++		wda_own_answer(d + 7, ml, res, er);     /* 1088 */
++		break;
+ 	default:
+ 		pb_answer(o, d, ml, res, er);
+ 		break;
+@@ -3919,6 +3943,79 @@ d_start(unsigned pipe, unsigned cid, const uint8_t *s, uint32_t sn)
+ 	d_fwd(pipe, 0x01, cid, s, sn);
+ }
+ 
++/* 1088: StartNetworkInterface may go: the IPA is up and the router's WDA SetDataFormat (if enabled) was answered or gave up */
++static bool
++d_start_ok(void)
++{
++	return sweet_ipa_ready() && (!(data_opts & DOPT_WDA_OWN) || wda_st == 2 || (wda_st == 3 && wda_tries >= D_WDA_TRIES));
++}
++
++static void
++wda_own_poll(uint64_t now)
++{
++	int si = srv_find(0x1a);
++	if (wda_st && (si < 0 || srv[si].node != wda_node || srv[si].port != wda_port)) {
++		LOG("data: WDA server %s: the router's WDA SetDataFormat is due again (1088)\n", si < 0 ? "gone" : "moved (modem restart)");
++		wda_st = 0;
++		wda_tries = 0;
++		wda_next = 0;
++	}
++	if (!(data_opts & DOPT_WDA_OWN) || !data_active() || si < 0 || wda_st == 1 || wda_st == 2 || now < wda_next ||
++	    wda_tries >= D_WDA_TRIES || !sweet_ipa_ready()) {
++		return;
++	}
++	uint8_t t[64];
++	uint32_t o = 0, v, ep[2] = { 4, 1 };
++	static const uint8_t ids[5] = { 0x11, 0x12, 0x13, 0x15, 0x16 };
++	static const uint32_t val[5] = { 2, 9, 9, 16, 0x3800 };
++	for (int i = 0; i < 5; i++) {
++		v = val[i];
++		put_tlv(t, &o, ids[i], &v, 4);
++	}
++	put_tlv(t, &o, 0x17, ep, 8);
++	if (d_own_send(DO_WDA, -1, D_WDA_PORT, 0x1a, 0x0020, t, o, 0, 0)) {
++		wda_next = now + D_WDA_RETRY_MS;
++		LOG("data: the router's WDA SetDataFormat could not be sent (no slot / send failed): retry in %u s\n", D_WDA_RETRY_MS / 1000);
++		return;
++	}
++	wda_tries++;
++	wda_st = 1;
++	wda_node = srv[si].node;
++	wda_port = srv[si].port;
++	LOG("data: the router's own WDA SetDataFormat -> modem %u:%#x from port %#x (1088, kern.sweet_data_opts & 0x4, try %d of %d): "
++	    "link 2 raw-ip, ul/dl 9 QMAPv5, dl max 16/0x3800, endpoint {4,1}\n", wda_node, wda_port, D_WDA_PORT, wda_tries, D_WDA_TRIES);
++}
++
++static void
++wda_own_answer(const uint8_t *tl, uint32_t tn, unsigned res, unsigned er)
++{
++	char b[160];
++	size_t k = 0;
++	static const uint8_t ids[6] = { 0x11, 0x12, 0x13, 0x15, 0x16, 0x17 };
++	b[0] = 0;
++	for (int i = 0; i < 6; i++) {
++		uint32_t l = 0;
++		const uint8_t *p = tlv_find(tl, tn, ids[i], &l);
++		if (!p || k + 24 >= sizeof(b)) {
++			continue;
++		}
++		if (l == 4) {
++			k += (size_t)snprintf(b + k, sizeof(b) - k, " %02x=%u", ids[i], (unsigned)(p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24));
++		} else if (l == 8) {
++			k += (size_t)snprintf(b + k, sizeof(b) - k, " %02x={%u,%u}", ids[i], (unsigned)(p[0] | p[1] << 8), (unsigned)(p[4] | p[5] << 8));
++		} else {
++			k += (size_t)snprintf(b + k, sizeof(b) - k, " %02x(%u B)", ids[i], l);
++		}
++	}
++	wda_res = res;
++	wda_err = er;
++	wda_st = res == 0 ? 2 : 3;
++	wda_next = sbb_ms() + D_WDA_RETRY_MS;
++	LOG("data: the router's WDA SetDataFormat answer: %s 0x%x (try %d of %d); modem now:%s%s\n", res == 0 ? "success" : "error",
++	    res == 0 ? 0 : er, wda_tries, D_WDA_TRIES, b[0] ? b : " (no format TLVs)", res == 0 ? "" : wda_tries >= D_WDA_TRIES ?
++	    " - giving up: StartNetworkInterface no longer waits for it" : " - retry in 10 s");
++}
++
+ static void
+ d_request(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t sn, uint32_t rl)
+ {
+@@ -3930,7 +4027,7 @@ d_request(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t
+ 		pb_start("CommCenter's first WDS request");
+ 	}
+ 	if (svc == 0x01 && msg == 0x0020) {
+-		if (!sweet_ipa_ready()) {
++		if (!d_start_ok()) {           /* 1088: IPA ready and the router's WDA SetDataFormat answered */
+ 			if (d_hold(DH_START, pipe, svc, cid, msg, s, len)) {
+ 				LOG("data: StartNetworkInterface %s/%u cid %u: IPA not ready and the hold queue is full: error 0x%x\n",
+ 				    pipe_name[pipe], cur_sess, cid, QMI_ERR_CALL_FAILED);
+@@ -3938,8 +4035,9 @@ d_request(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t
+ 				return;
+ 			}
+ 			dst.held_start++;
+-			LOG("data: StartNetworkInterface %s/%u cid %u held: IPA data plane not ready (kern.sweet_ipa_state != 3; %u s max)\n",
+-			    pipe_name[pipe], cur_sess, cid, D_HELD_START_MS / 1000);
++			LOG("data: StartNetworkInterface %s/%u cid %u held: %s (%u s max)\n", pipe_name[pipe], cur_sess, cid,
++			    !sweet_ipa_ready() ? "IPA data plane not ready (kern.sweet_ipa_state != 3)" : "the router's WDA SetDataFormat "
++			    "not answered yet (1088)", D_HELD_START_MS / 1000);
+ 			return;
+ 		}
+ 		d_start(pipe, cid, s, len);
+@@ -4036,12 +4134,13 @@ data_poll(uint64_t now)
+ 			    pb_n);
+ 		}
+ 	}
++	wda_own_poll(now);              /* 1088 */
+ 	for (int i = 0; i < D_NHOLD; i++) {
+ 		struct dhold *h = &D->hold[i];
+ 		if (!h->used) {
+ 			continue;
+ 		}
+-		if (h->kind == DH_START && act && sweet_ipa_ready()) {
++		if (h->kind == DH_START && act && d_start_ok()) {
+ 			cur_pipe = h->pipe;
+ 			cur_sess = h->sess;
+ 			h->used = 0;
+@@ -4050,12 +4149,14 @@ data_poll(uint64_t now)
+ 				continue;
+ 			}
+ 			dst.rel_start++;
+-			LOG("data: held StartNetworkInterface of %s/%u cid %u released after %llu ms (IPA ready)\n", pipe_name[h->pipe],
+-			    h->sess, h->cid, (unsigned long long)(now - h->t));
++			LOG("data: held StartNetworkInterface of %s/%u cid %u released after %llu ms (IPA ready, WDA format %s)\n",
++			    pipe_name[h->pipe], h->sess, h->cid, (unsigned long long)(now - h->t), !(data_opts & DOPT_WDA_OWN) ? "not the "
++			    "router's (opts & 0x4 clear)" : wda_st == 2 ? "set" : "gave up");
+ 			d_start(h->pipe, h->cid, h->f, h->n);
+ 		} else if (h->kind == DH_START && now - h->t >= D_HELD_START_MS) {
+ 			dst.to_start++;
+-			d_hold_answer(h, QMI_ERR_CALL_FAILED, "IPA data plane not ready in 15 s");
++			d_hold_answer(h, QMI_ERR_CALL_FAILED, sweet_ipa_ready() ? "the router's WDA SetDataFormat not answered in 15 s" :
++			    "IPA data plane not ready in 15 s");
+ 		} else if (h->kind == DH_PROF && act && pb_state == 4) {
+ 			cur_pipe = h->pipe;
+ 			cur_sess = h->sess;
+@@ -4084,6 +4185,10 @@ data_poll(uint64_t now)
+ 			D->d[o->ci].gw_state = 3;
+ 		} else if (o->kind == DO_PLIST || o->kind == DO_PSET) {
+ 			pb_fail("no answer");
++		} else if (o->kind == DO_WDA) {
++			wda_st = 3;
++			wda_next = now + D_WDA_RETRY_MS;
++			LOG("data: the router's WDA SetDataFormat: no answer (try %d of %d)\n", wda_tries, D_WDA_TRIES);
+ 		}
+ 	}
+ 	for (int i = 0; i < NCL; i++) {
+@@ -4142,13 +4247,17 @@ data_stats(char *buf, size_t len)
+ 	if (o < (int)len - 24) {
+ 		o += snprintf(buf + o, len - (size_t)o, " | held now %d", held);
+ 	}
++	if (o < (int)len - 64) {        /* 1088 */
++		o += snprintf(buf + o, len - (size_t)o, " | router WDA format %s (tries %d, result %u/0x%x)", !(data_opts & DOPT_WDA_OWN) ?
++		    "off" : wda_st == 0 ? "not sent" : wda_st == 1 ? "out" : wda_st == 2 ? "set" : "error", wda_tries, wda_res, wda_err);
++	}
+ 	return o < (int)len ? o : (int)len - 1;
+ }
+ 
+ static bool
+ d_port_reserved(uint32_t port)
+ {
+-	return D != NULL && port == D_PROF_PORT;
++	return D != NULL && (port == D_PROF_PORT || port == D_WDA_PORT);
+ }
+ 
+ /* one record from SweetABP (CommCenter wrote a frame / opened, closed, started, aborted a pipe) */
+@@ -5144,7 +5253,8 @@ sysctl_data_fwd SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_data_fwd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_data_fwd, "I",
+     "redfin 1080: 1 (default) = with sweetbb & 0x10 and kern.sweet_qmi_rules 1 CommCenter's WDS/WDA/QOS/DSD/DFS go to the modem; "
+     "0 = answered err 0x5e (live calls stopped)");
+-QINT(sweet_data_opts, data_opts, "redfin 1080: 1 = drop WDA SetDataFormat TLVs outside 0x10-0x19, 2 = add WDS bind client type 0x13 = 1");
++QINT(sweet_data_opts, data_opts, "redfin 1080: 1 = drop WDA SetDataFormat TLVs outside 0x10-0x19, 2 = add WDS bind client type 0x13 = 1; "
++    "1088: 4 (default on) = the router sends its own WDA SetDataFormat once per modem boot, StartNetworkInterface waits for it");
+ 
+ static int
+ sysctl_data_stats SYSCTL_HANDLER_ARGS
