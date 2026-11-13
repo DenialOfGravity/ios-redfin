@@ -1,0 +1,1092 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4e88457..ae88ff9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -139,6 +139,7 @@ bsd/dev/sweet_voice.c			standard
+ bsd/dev/sweet_bb.c			standard
+ bsd/dev/sweet_qmux.c			standard
+ bsd/dev/sweet_ssr.c			standard
++bsd/dev/sweet_qfwd.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 4a46667..67db13e 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -124,6 +124,7 @@
+ #include <arm/caches_internal.h>
+ #include <sys/sysctl.h>                 /* (0956: kern.sweet_adsp_services) */
+ #include "sweet_ssr.h"                  /* 1070 */
++#include "sweet_qfwd.h"                 /* 1081 */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -2507,6 +2508,37 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
+ 	return error;
+ }
+ 
++/* 1081 (sweet_qfwd.c, its thread only): a packet of the modem's node forwarded to the DSP, source node and confirm kept */
++int
++redwood_qrtr_send_as(uint32_t type, uint32_t from_node, uint32_t from_port, uint32_t confirm, uint32_t to_node, uint32_t to_port,
++    const void *data, uint32_t length)
++{
++	uint32_t padded = (length + 3) & ~3u;
++	struct qrtr_header *packet;
++	int error;
++
++	packet = kalloc_data(sizeof(*packet) + padded, Z_WAITOK | Z_ZERO);
++	if (packet == NULL) {
++		return ENOMEM;
++	}
++	packet->version = 1;
++	packet->type = type;
++	packet->from_node = from_node;
++	packet->from_port = from_port;
++	packet->confirm = confirm;
++	packet->size = length;
++	packet->to_node = to_node;
++	packet->to_port = to_port;
++	if (length) {
++		memcpy(packet + 1, data, length);
++	}
++	error = glink_send(&glink.channel[CHANNEL_QRTR], packet, (uint32_t)sizeof(*packet) + padded);
++	qlog_packet(">", packet, data, length, error);
++	kfree_data(packet, sizeof(*packet) + padded);
++	qrtr_out += error == 0;
++	return error;
++}
++
+ /*
+  * 0951: pd-mapper, the service registry locator (QMI service 0x40), in the kernel: the DSP's PD
+  * framework asks it which protection domain offers a service (tms/servreg, avs/audio) before it
+@@ -2775,6 +2807,11 @@ qrtr_input(const uint8_t *data, uint32_t length)
+ 		qrtr_peer = header.from_node;
+ 	}
+ 	qlog_packet("<", &header, data + at, header.size, 0);
++	/* 1081: servers/HELLO/BYE noted for the forwarder; DATA/RESUME_TX for the modem's node are its (no RESUME_TX of ours) */
++	if (sweet_qfwd_rx(SWEET_QFWD_ADSP, header.type, header.from_node, header.from_port, header.confirm, header.to_node,
++	    header.to_port, data + at, header.size)) {
++		return;
++	}
+ 	if (header.type == QRTR_RESUME_TX) {
+ 		return;
+ 	}
+@@ -4314,6 +4351,7 @@ link_stop(void)
+ 	lck_mtx_unlock(&glink_lock);
+ 	bzero(qrtr_servers, sizeof(qrtr_servers));
+ 	qrtr_peer = 0;
++	sweet_qfwd_link_down(SWEET_QFWD_ADSP);         /* 1081: the modem forgets the DSP's servers (BYE) */
+ 	fastrpc_dsp_down("the link is down");
+ }
+ 
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+index 42c2ab8..14b6812 100644
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -9,6 +9,7 @@
+  *   0x02  kernel QMI router (sweet_qmux.c) behind the AppleBasebandPCI stand-in's qmux1/qmux2 (needs sweetabp & 1);
+  *         implies 0x01. /dev/abpbridge refuses to open (wland's abpbridge stays off).
+  *   0x04.. later phases (bb_ctl, rfs, data plane): accepted and ignored here.
++ *   0x20 / 0x80  1081: QRTR forwarding modem <-> audio DSP at boot, kern.sweet_qrtr_fwd = 1 / 2 (sweet_qfwd.c; needs 0x01).
+  *
+  * /dev/sweet-mqrtr (root 0600, one opener):
+  *   ioctl MQRTR_IOC_UP (u32 timeout ms): (re)make the link after the modem was (re)started: our FIFO ends start over,
+@@ -48,6 +49,7 @@
+ #include <mach/mach_types.h>
+ #include "sweet_bb.h"
+ #include "sweet_ssr.h"                  /* 1070 */
++#include "sweet_qfwd.h"                 /* 1081 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -599,6 +601,10 @@ qrtr_in(const uint8_t *d, uint32_t n)
+ 	gl.rx_pkts++;
+ 	gl.rx_bytes += pl;
+ 	gl.last_traffic = sbb_ms();
++	/* 1081: servers/HELLO/BYE noted for the forwarder; DATA/RESUME_TX for the audio DSP's node are its (only queued) */
++	if (sweet_qfwd_rx(SWEET_QFWD_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, h.dst_node, h.dst_port, p, pl)) {
++		return;
++	}
+ 	if (h.type == SBB_QRTR_DATA) {
+ 		if (h.dst_port == SWEET_SSR_MDM_PORT) {     /* 1070: the kernel's SSCTL client port (sweet_ssr.c) */
+ 			sweet_ssr_qrtr_in(SWEET_SSR_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, p, pl);
+@@ -902,6 +908,7 @@ link_reinit(uint32_t timeout_ms, const char *why)
+ 	for (int i = 0; i < NSRV; i++) {
+ 		srv[i].up = false;
+ 	}
++	sweet_qfwd_link_down(SWEET_QFWD_MODEM);        /* 1081: the audio DSP forgets the modem's servers (BYE) */
+ 	if (sweet_bb & SBB_QMUX) {
+ 		lck_mtx_lock(&q_lock);
+ 		q_put_locked(&q_router, &bye, (const uint8_t *)byew, sizeof(byew));
+@@ -1009,7 +1016,7 @@ fail:
+ }
+ 
+ static int
+-qrtr_send_hdr(const struct sbb_qrtr_hdr *in, const void *payload, uint32_t len)
++qrtr_send_pkt(const struct sbb_qrtr_hdr *in, const void *payload, uint32_t len, bool keep_src)
+ {
+ 	struct sbb_qrtr_hdr h = *in;
+ 	uint32_t padded = (len + 3) & ~3u;
+@@ -1017,7 +1024,9 @@ qrtr_send_hdr(const struct sbb_qrtr_hdr *in, const void *payload, uint32_t len)
+ 		return EMSGSIZE;
+ 	}
+ 	h.version = 1;
+-	h.src_node = SBB_NODE_APPS;
++	if (!keep_src) {
++		h.src_node = SBB_NODE_APPS;
++	}
+ 	h.size = len;
+ 	uint8_t *b = kalloc_data(sizeof(h) + padded, Z_WAITOK | Z_ZERO);
+ 	if (b == NULL) {
+@@ -1032,6 +1041,21 @@ qrtr_send_hdr(const struct sbb_qrtr_hdr *in, const void *payload, uint32_t len)
+ 	return e;
+ }
+ 
++static int
++qrtr_send_hdr(const struct sbb_qrtr_hdr *in, const void *payload, uint32_t len)
++{
++	return qrtr_send_pkt(in, payload, len, false);
++}
++
++/* 1081 (sweet_qfwd.c, its thread only): a packet of the audio DSP's node forwarded to the modem, source node kept */
++int
++sbb_qrtr_send_as(uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t confirm, uint32_t dst_node, uint32_t dst_port,
++    const void *data, uint32_t len)
++{
++	struct sbb_qrtr_hdr h = { 1, type, src_node, src_port, confirm, len, dst_node, dst_port };
++	return qrtr_send_pkt(&h, data, len, true);
++}
++
+ int
+ sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len)
+ {
+@@ -1425,6 +1449,9 @@ sweet_bb_init(void)
+ 	if (v & SBB_QMUX) {
+ 		sweet_qmux_start();
+ 	}
++	if (v & SBB_LINK) {
++		sweet_qfwd_init(v);             /* 1081: QRTR forwarding modem <-> audio DSP (kern.sweet_qrtr_fwd, default off) */
++	}
+ 	if (kernel_thread_start(sbb_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 	} else {
+diff --git a/bsd/dev/sweet_bb.h b/bsd/dev/sweet_bb.h
+index dd7ce22..8a0ceb7 100644
+--- a/bsd/dev/sweet_bb.h
++++ b/bsd/dev/sweet_bb.h
+@@ -12,7 +12,7 @@
+ #define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
+ #define SBB_REALBOOT            0x40u   /* 1071 (P4 phase 2b): ABM's real baseband boot against an emulated Mav17 BHI/Sahara
+ 					 * target (pipes pbl/sahara, images discarded); the shouldBoot=0 page patch is off */
+-#define SBB_BITS                0x53u   /* bits this kernel implements (others are later phases: accepted, ignored) */
++#define SBB_BITS                0xf3u   /* bits this kernel implements (1081: + 0x20/0x80 QRTR forwarder) (others are later phases: accepted, ignored) */
+ 
+ #define SBB_NODE_MODEM          0u
+ #define SBB_NODE_APPS           1u
+diff --git a/bsd/dev/sweet_qfwd.c b/bsd/dev/sweet_qfwd.c
+new file mode 100644
+index 0000000..cc87ce2
+--- /dev/null
++++ b/bsd/dev/sweet_qfwd.c
+@@ -0,0 +1,861 @@
++/*
++ * redfin 1081: QRTR forwarding between the modem (MPSS, node 0, sweet_bb.c) and the audio DSP (ADSP, node 5,
++ * sweet_adsp.c) through our kernel (QRTR node 1), as Linux net/qrtr/qrtr.c does between two remote nodes:
++ * qrtr_node_rx_work -> qrtr_fwd_ctrl_pkt (control packets to every other node for which qrtr_must_forward says so) and
++ * qrtr_fwd_pkt (DATA / RESUME_TX whose dst_node is not ours, to that node's link). Note: on redfin's Android that
++ * forwarding is OFF for control packets (lito.dtsi gives no qcom,net-id, so every edge is net_id 1 and
++ * qrtr_must_forward is false); this is an experiment beyond Android, default off.
++ *
++ * kern.sweet_qrtr_fwd (RW, root; boot default from sweetbb bit 0x20 = 1, bit 0x80 = 2, or boot-arg qrtrfwd=N):
++ *   0  off (default): nothing changes; the hooks only note each side's servers and HELLO/BYE (for the replay).
++ *   1  control: the servers each remote announces (NEW_SERVER for its own node only) are announced to the other remote
++ *      with their own node ids (a server of node 5 stays "node 5" to the modem, as Linux keeps cb->src_node); DEL_SERVER,
++ *      BYE and DEL_CLIENT likewise. The known list of each side is replayed to the other when the switch turns on, when
++ *      the filter changes and 200 ms after the other remote's HELLO; turning it off sends DEL_SERVER for every server
++ *      announced. DATA/RESUME_TX addressed to the other remote's node are dropped and counted (they were never ours).
++ *   2  control + data: DATA and RESUME_TX whose dst_node is the other remote (and src_node the sending remote) go to the
++ *      other link unchanged (confirm_rx kept; the receiver's RESUME_TX comes back the same way): the kernel is no endpoint
++ *      for them (no RESUME_TX of ours, no local delivery).
++ * kern.sweet_qrtr_fwd_svc (RW int): 0 = every service (default), N = only service N may cross (66 = 0x42 servreg notifier).
++ * kern.sweet_qrtr_fwd_svcs (RW string): up to 8 service ids ("0x42,0x2b"); non-empty overrides _svc. Data cross only
++ *   when one end is a known server of an allowed service; DEL_CLIENT only for clients that crossed (or with no filter).
++ * kern.sweet_qrtr_fwd_stats (RO string): counters each way, per service (first 16 seen), drops, queue.
++ * Loops: a packet only goes to the link of its dst_node (never back where it came from), only packets whose source
++ * (header node, or the server's node in NEW/DEL_SERVER) is the sending remote itself are forwarded (no third-party
++ * relay, our own node 1 never). Bounded queue (256 packets / 512 KiB, kalloc Z_NOWAIT in the RX paths); the sends are
++ * made by the thread "sweetqfwd" only, with no lock of ours held.
++ * Log lines "SWEET QFWD:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include "sweet_bb.h"
++#include "sweet_qfwd.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define SAY(...)                printf("SWEET QFWD: " __VA_ARGS__)
++
++#define QF_CTRL                 0xfffffffeu
++#define QF_APPS                 1u
++enum { T_DATA = 1, T_HELLO = 2, T_BYE = 3, T_NEW_SERVER = 4, T_DEL_SERVER = 5, T_DEL_CLIENT = 6, T_RESUME_TX = 7 };
++
++#define NSIDE                   2
++#define QF_NSRV                 128
++#define QF_NCLI                 64
++#define QF_NSVCSTAT             16
++#define QF_NSEEN                128
++#define QF_QMAX                 256u
++#define QF_QBYTES               (512u << 10)
++#define QF_MAXPKT               0x10000u
++#define QF_SYNC_BATCH           32
++
++#define SWEETBB_QFWD_CTL        0x20u   /* sweetbb bit: kern.sweet_qrtr_fwd = 1 at boot */
++#define SWEETBB_QFWD_DATA       0x80u   /* sweetbb bit: kern.sweet_qrtr_fwd = 2 at boot */
++
++static const char *const side_name[NSIDE] = { "modem", "adsp" };
++
++static LCK_GRP_DECLARE(qf_grp, "sweet-qfwd");
++static LCK_MTX_DECLARE(qf_lock, &qf_grp);      /* everything below; a leaf: nothing else is taken under it, no send */
++
++static uint32_t qf_mode;
++static uint32_t qf_svc;
++static uint32_t qf_svcs[8], qf_nsvcs;
++static char qf_svcs_str[96];
++static bool qf_started;
++static bool qf_wake_flag;
++
++static uint32_t nid[NSIDE] = { 0u, 5u };       /* the remotes' QRTR nodes (learned from their HELLO) */
++static bool up[NSIDE];                          /* HELLO seen since the link last went down */
++static uint64_t sync_at[NSIDE];                 /* ms: (re)announce the other side's servers TO this side; 0 = nothing due */
++
++static struct qf_srv {
++	uint32_t svc, inst, port;
++	bool up, announced;                     /* announced: to the OTHER side's link */
++} srv[NSIDE][QF_NSRV];
++static struct {
++	uint32_t port;
++	bool used;
++} cli[NSIDE][QF_NCLI];                          /* client ports of each side whose data crossed (for DEL_CLIENT) */
++static struct {
++	uint32_t node, svc, inst;
++} seen[QF_NSEEN];
++static unsigned nseen;
++static struct {
++	uint32_t svc;
++	uint64_t ctl, data;
++} svcstat[QF_NSVCSTAT];
++static unsigned nsvcstat;
++static struct {
++	uint64_t ctl[NSIDE], data[NSIDE], resume[NSIDE], bye[NSIDE], delcli[NSIDE], withdrawn[NSIDE];   /* FROM side s */
++	uint64_t qfull, nomem, sendfail, filtered, mode1_data, toobig, replays, hellos[NSIDE], downs[NSIDE];
++} st;
++
++struct qf_pkt {
++	struct qf_pkt *next;
++	unsigned to;
++	uint32_t type, src_node, src_port, confirm, dst_node, dst_port, n;
++	uint8_t d[];
++};
++static struct qf_pkt *q_first, *q_last;
++static uint32_t q_count, q_bytes;
++
++static uint64_t
++now_ms(void)
++{
++	return sbb_ms();
++}
++
++/* ---- filter and stats (qf_lock held) ---- */
++
++static bool
++filter_all(void)
++{
++	return qf_nsvcs == 0 && qf_svc == 0;
++}
++
++static bool
++svc_allowed(uint32_t svc)
++{
++	if (qf_nsvcs) {
++		for (uint32_t i = 0; i < qf_nsvcs; i++) {
++			if (qf_svcs[i] == svc) {
++				return true;
++			}
++		}
++		return false;
++	}
++	return qf_svc == 0 || qf_svc == svc;
++}
++
++static void
++svc_count(uint32_t svc, bool data)
++{
++	for (unsigned i = 0; i < nsvcstat; i++) {
++		if (svcstat[i].svc == svc) {
++			if (data) {
++				svcstat[i].data++;
++			} else {
++				svcstat[i].ctl++;
++			}
++			return;
++		}
++	}
++	if (nsvcstat < QF_NSVCSTAT) {
++		svcstat[nsvcstat].svc = svc;
++		svcstat[nsvcstat].ctl = data ? 0 : 1;
++		svcstat[nsvcstat].data = data ? 1 : 0;
++		nsvcstat++;
++	}
++}
++
++/* a server of side s at port whose service may cross (svc out), or NULL */
++static struct qf_srv *
++srv_at(unsigned s, uint32_t port, bool allowed_only)
++{
++	for (int i = 0; i < QF_NSRV; i++) {
++		if (srv[s][i].up && srv[s][i].port == port && (!allowed_only || svc_allowed(srv[s][i].svc))) {
++			return &srv[s][i];
++		}
++	}
++	return NULL;
++}
++
++static void
++cli_note(unsigned s, uint32_t port)
++{
++	int fr = -1;
++	for (int i = 0; i < QF_NCLI; i++) {
++		if (cli[s][i].used && cli[s][i].port == port) {
++			return;
++		}
++		if (!cli[s][i].used && fr < 0) {
++			fr = i;
++		}
++	}
++	if (fr >= 0) {
++		cli[s][fr].used = true;
++		cli[s][fr].port = port;
++	}
++}
++
++static bool
++cli_take(unsigned s, uint32_t port)
++{
++	for (int i = 0; i < QF_NCLI; i++) {
++		if (cli[s][i].used && cli[s][i].port == port) {
++			cli[s][i].used = false;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* ---- the queue (qf_lock held; p allocated by the caller, Z_NOWAIT) ---- */
++
++static bool
++q_put_locked(struct qf_pkt *p)
++{
++	if (q_count >= QF_QMAX || q_bytes + p->n > QF_QBYTES) {
++		st.qfull++;
++		return false;
++	}
++	p->next = NULL;
++	if (q_last) {
++		q_last->next = p;
++	} else {
++		q_first = p;
++	}
++	q_last = p;
++	q_count++;
++	q_bytes += p->n;
++	qf_wake_flag = true;
++	wakeup(&qf_wake_flag);
++	return true;
++}
++
++static struct qf_pkt *
++pkt_new(unsigned to, uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t confirm, uint32_t dst_node, uint32_t dst_port,
++    const void *d, uint32_t n)
++{
++	struct qf_pkt *p = kalloc_data(sizeof(*p) + n, Z_NOWAIT);
++	if (p == NULL) {
++		return NULL;
++	}
++	p->next = NULL;
++	p->to = to;
++	p->type = type;
++	p->src_node = src_node;
++	p->src_port = src_port;
++	p->confirm = confirm;
++	p->dst_node = dst_node;
++	p->dst_port = dst_port;
++	p->n = n;
++	if (n) {
++		memcpy(p->d, d, n);
++	}
++	return p;
++}
++
++static void
++pkt_free(struct qf_pkt *p)
++{
++	kfree_data(p, sizeof(*p) + p->n);
++}
++
++/* a control packet of ours on behalf of side s's node, to the other side (qf_lock held) */
++static void
++ctl_put_locked(unsigned s, uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3, uint32_t w4)
++{
++	uint32_t w[5] = { cmd, w1, w2, w3, w4 };
++	unsigned o = 1 - s;
++	struct qf_pkt *p = pkt_new(o, cmd, nid[s], QF_CTRL, 0, nid[o], QF_CTRL, w, sizeof(w));
++	if (p == NULL) {
++		st.nomem++;
++		return;
++	}
++	if (!q_put_locked(p)) {
++		pkt_free(p);
++	}
++}
++
++/* side s is gone (BYE, its link down, or a new HELLO without a BYE): the other side forgets it (qf_lock held) */
++static void
++side_down_locked(unsigned s, const char *why)
++{
++	unsigned o = 1 - s, announced = 0, known = 0;
++	for (int i = 0; i < QF_NSRV; i++) {
++		known += srv[s][i].up;
++		announced += srv[s][i].up && srv[s][i].announced;
++		srv[s][i].up = srv[s][i].announced = false;
++		srv[o][i].announced = false;    /* s forgot what it was told */
++	}
++	for (int i = 0; i < QF_NCLI; i++) {
++		cli[s][i].used = false;
++	}
++	if (announced && qf_started) {
++		ctl_put_locked(s, T_BYE, 0, 0, 0, 0);
++		st.bye[s]++;
++	}
++	if (known || announced) {
++		SAY("%s node %u %s: %u servers forgotten, %u had been announced to %s%s\n", side_name[s], nid[s], why, known, announced,
++		    side_name[o], announced && qf_started ? " (BYE sent on)" : "");
++		st.downs[s]++;
++	}
++}
++
++/* ---- the hooks (RX paths: no sleep, no send) ---- */
++
++bool
++sweet_qfwd_rx(unsigned s, uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t confirm, uint32_t dst_node,
++    uint32_t dst_port, const uint8_t *d, uint32_t n)
++{
++	if (s >= NSIDE) {
++		return false;
++	}
++	unsigned o = 1 - s;
++	if (type == T_DATA || type == T_RESUME_TX) {
++		uint32_t mode = qf_mode;
++		/* only packets of the sending remote, addressed to the other remote, never to/from us */
++		if (mode == 0 || !qf_started || dst_node != nid[o] || src_node != nid[s] || nid[o] == nid[s] || dst_node == QF_APPS ||
++		    src_node == QF_APPS) {
++			return false;
++		}
++		if (n > QF_MAXPKT) {
++			lck_mtx_lock(&qf_lock);
++			st.toobig++;
++			lck_mtx_unlock(&qf_lock);
++			return true;
++		}
++		if (mode < 2) {
++			lck_mtx_lock(&qf_lock);
++			uint64_t k = ++st.mode1_data;
++			lck_mtx_unlock(&qf_lock);
++			if (k <= 5 || k % 1000 == 0) {
++				SAY("mode 1: type %u %u:%#x -> %u:%#x (%u bytes) for %s dropped (%llu); kern.sweet_qrtr_fwd=2 forwards data\n", type,
++				    src_node, src_port, dst_node, dst_port, n, side_name[o], k);
++			}
++			return true;
++		}
++		struct qf_pkt *p = pkt_new(o, type, src_node, src_port, confirm, dst_node, dst_port, d, n);
++		lck_mtx_lock(&qf_lock);
++		struct qf_srv *sv = srv_at(o, dst_port, true);
++		if (sv == NULL) {
++			sv = srv_at(s, src_port, true);
++		}
++		if (!filter_all() && sv == NULL) {
++			st.filtered++;
++			lck_mtx_unlock(&qf_lock);
++			if (p) {
++				pkt_free(p);
++			}
++			return true;
++		}
++		if (type == T_DATA && srv_at(s, src_port, false) == NULL) {
++			cli_note(s, src_port);
++		}
++		if (p == NULL) {
++			st.nomem++;
++		} else if (!q_put_locked(p)) {
++			pkt_free(p);
++		} else if (sv != NULL) {
++			svc_count(sv->svc, true);
++		}
++		lck_mtx_unlock(&qf_lock);
++		return true;
++	}
++
++	uint32_t w[5] = { 0, 0, 0, 0, 0 };
++	memcpy(w, d, n < sizeof(w) ? n : sizeof(w));
++	switch (type) {
++	case T_HELLO:
++		lck_mtx_lock(&qf_lock);
++		st.hellos[s]++;
++		if (src_node != QF_APPS && src_node != QF_CTRL) {
++			nid[s] = src_node;
++		}
++		/*
++		 * As Linux's name service (ctrl_cmd_hello): the sender gets every server again; its own known servers stay (a
++		 * restart without BYE is caught by the link-down hooks). It may have forgotten what it was told: announce again.
++		 */
++		for (int i = 0; i < QF_NSRV; i++) {
++			srv[o][i].announced = false;
++		}
++		up[s] = true;
++		sync_at[s] = now_ms() + 200;           /* the other side's servers, once our HELLO answer is out */
++		if (qf_started && qf_mode) {
++			qf_wake_flag = true;
++			wakeup(&qf_wake_flag);
++		}
++		lck_mtx_unlock(&qf_lock);
++		break;
++	case T_NEW_SERVER:
++		/* the remote's own servers only (w: svc, inst, node, port); an empty one is a lookup's end marker */
++		if (n < 20 || w[1] == 0 || w[3] != nid[s] || src_node != nid[s]) {
++			break;
++		}
++		lck_mtx_lock(&qf_lock);
++		{
++			int fr = -1, at = -1;
++			for (int i = 0; i < QF_NSRV; i++) {
++				if (srv[s][i].up && srv[s][i].svc == w[1] && srv[s][i].inst == w[2] && srv[s][i].port == w[4]) {
++					at = i;
++					break;
++				}
++				if (!srv[s][i].up && fr < 0) {
++					fr = i;
++				}
++			}
++			if (at < 0 && fr >= 0) {
++				srv[s][fr].svc = w[1];
++				srv[s][fr].inst = w[2];
++				srv[s][fr].port = w[4];
++				srv[s][fr].up = true;
++				srv[s][fr].announced = false;
++				at = fr;
++			}
++			if (at >= 0 && !srv[s][at].announced && up[o] && sync_at[o] == 0) {
++				sync_at[o] = now_ms();
++				if (qf_started && qf_mode) {
++					qf_wake_flag = true;
++					wakeup(&qf_wake_flag);
++				}
++			}
++		}
++		lck_mtx_unlock(&qf_lock);
++		break;
++	case T_DEL_SERVER:
++		if (n < 20 || w[3] != nid[s]) {
++			break;
++		}
++		lck_mtx_lock(&qf_lock);
++		for (int i = 0; i < QF_NSRV; i++) {
++			if (srv[s][i].up && srv[s][i].port == w[4] && (w[1] == 0 || srv[s][i].svc == w[1])) {
++				if (srv[s][i].announced && qf_started) {
++					ctl_put_locked(s, T_DEL_SERVER, srv[s][i].svc, srv[s][i].inst, nid[s], srv[s][i].port);
++					st.ctl[s]++;
++					svc_count(srv[s][i].svc, false);
++				}
++				srv[s][i].up = srv[s][i].announced = false;
++			}
++		}
++		lck_mtx_unlock(&qf_lock);
++		break;
++	case T_BYE:
++		if (src_node != nid[s]) {
++			break;
++		}
++		lck_mtx_lock(&qf_lock);
++		side_down_locked(s, "says BYE");
++		up[s] = false;
++		lck_mtx_unlock(&qf_lock);
++		break;
++	case T_DEL_CLIENT:
++		/* w: node, port */
++		if (n < 12 || w[1] != nid[s] || qf_mode == 0 || !qf_started) {
++			break;
++		}
++		lck_mtx_lock(&qf_lock);
++		if ((cli_take(s, w[2]) || filter_all()) && up[o]) {
++			ctl_put_locked(s, T_DEL_CLIENT, w[1], w[2], 0, 0);
++			st.delcli[s]++;
++		}
++		lck_mtx_unlock(&qf_lock);
++		break;
++	default:
++		break;
++	}
++	return false;
++}
++
++void
++sweet_qfwd_link_down(unsigned s)
++{
++	if (s >= NSIDE) {
++		return;
++	}
++	lck_mtx_lock(&qf_lock);
++	side_down_locked(s, "link down");
++	up[s] = false;
++	sync_at[s] = 0;
++	lck_mtx_unlock(&qf_lock);
++}
++
++/* ---- the thread: sends ---- */
++
++static int
++send_to(unsigned to, uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t confirm, uint32_t dst_node, uint32_t dst_port,
++    const void *d, uint32_t n)
++{
++	if (to == SWEET_QFWD_MODEM) {
++		return sbb_qrtr_send_as(type, src_node, src_port, confirm, dst_node, dst_port, d, n);
++	}
++	return redwood_qrtr_send_as(type, src_node, src_port, confirm, dst_node, dst_port, d, n);
++}
++
++static void
++first_announce_log(unsigned s, uint32_t svc, uint32_t inst, uint32_t port)
++{
++	bool fresh = true;
++	lck_mtx_lock(&qf_lock);
++	for (unsigned i = 0; i < nseen; i++) {
++		if (seen[i].node == nid[s] && seen[i].svc == svc && seen[i].inst == inst) {
++			fresh = false;
++			break;
++		}
++	}
++	if (fresh && nseen < QF_NSEEN) {
++		seen[nseen].node = nid[s];
++		seen[nseen].svc = svc;
++		seen[nseen].inst = inst;
++		nseen++;
++	}
++	lck_mtx_unlock(&qf_lock);
++	if (fresh) {
++		SAY("%s %u:%#x svc %#x inst %u (v%u) -> announced to %s\n", side_name[s], nid[s], port, svc, inst >> 8, inst & 0xff,
++		    side_name[1 - s]);
++	}
++}
++
++/* (re)announce / withdraw the servers of side 1-t to side t, at most a batch per round */
++static void
++sync_side(unsigned t)
++{
++	struct {
++		uint32_t cmd, svc, inst, port;
++	} act[QF_SYNC_BATCH];
++	unsigned na = 0, s = 1 - t;
++	uint64_t now = now_ms();
++	lck_mtx_lock(&qf_lock);
++	if (!up[t] || sync_at[t] == 0 || now < sync_at[t]) {
++		lck_mtx_unlock(&qf_lock);
++		return;
++	}
++	uint32_t node = nid[s], to_node = nid[t];
++	bool more = false;
++	for (int i = 0; i < QF_NSRV; i++) {
++		struct qf_srv *v = &srv[s][i];
++		bool should = qf_mode != 0 && v->up && svc_allowed(v->svc);
++		if (should == v->announced || (!v->up && !v->announced)) {
++			continue;
++		}
++		if (na == QF_SYNC_BATCH) {
++			more = true;
++			break;
++		}
++		act[na].cmd = should ? T_NEW_SERVER : T_DEL_SERVER;
++		act[na].svc = v->svc;
++		act[na].inst = v->inst;
++		act[na].port = v->port;
++		na++;
++		v->announced = should;          /* optimistic; undone below if the send fails */
++	}
++	sync_at[t] = more ? now : 0;
++	lck_mtx_unlock(&qf_lock);
++	if (na) {
++		SAY("%s %u servers of %s node %u to %s node %u\n", qf_mode ? "announcing" : "withdrawing", na, side_name[s], node,
++		    side_name[t], to_node);
++	}
++	for (unsigned k = 0; k < na; k++) {
++		uint32_t w[5] = { act[k].cmd, act[k].svc, act[k].inst, node, act[k].port };
++		int e = send_to(t, act[k].cmd, node, QF_CTRL, 0, to_node, QF_CTRL, w, sizeof(w));
++		lck_mtx_lock(&qf_lock);
++		if (e == 0) {
++			st.ctl[s]++;
++			if (act[k].cmd == T_DEL_SERVER) {
++				st.withdrawn[s]++;
++			}
++			svc_count(act[k].svc, false);
++		} else {
++			uint64_t f = ++st.sendfail;
++			for (int i = 0; i < QF_NSRV; i++) {
++				struct qf_srv *v = &srv[s][i];
++				if (v->up && v->svc == act[k].svc && v->inst == act[k].inst && v->port == act[k].port) {
++					v->announced = act[k].cmd != T_NEW_SERVER;
++				}
++			}
++			if (sync_at[t] == 0 || sync_at[t] < now_ms() + 2000) {
++				sync_at[t] = now_ms() + 2000;
++			}
++			lck_mtx_unlock(&qf_lock);
++			if (f <= 20 || f % 100 == 0) {
++				SAY("%s of svc %#x inst %u (node %u port %#x) to %s FAILED (error %d, failure #%llu): again in 2 s\n",
++				    act[k].cmd == T_NEW_SERVER ? "announcement" : "withdrawal", act[k].svc, act[k].inst >> 8, node, act[k].port,
++				    side_name[t], e, f);
++			}
++			continue;
++		}
++		lck_mtx_unlock(&qf_lock);
++		if (act[k].cmd == T_NEW_SERVER) {
++			first_announce_log(s, act[k].svc, act[k].inst, act[k].port);
++		}
++	}
++}
++
++static void
++send_pkt(struct qf_pkt *p)
++{
++	unsigned from = 1 - p->to;
++	int e = send_to(p->to, p->type, p->src_node, p->src_port, p->confirm, p->dst_node, p->dst_port, p->d, p->n);
++	lck_mtx_lock(&qf_lock);
++	uint64_t f = 0;
++	if (e == 0) {
++		if (p->type == T_DATA) {
++			st.data[from]++;
++		} else if (p->type == T_RESUME_TX) {
++			st.resume[from]++;
++		}
++	} else {
++		f = ++st.sendfail;
++	}
++	lck_mtx_unlock(&qf_lock);
++	if (e != 0 && (f <= 20 || f % 100 == 0)) {
++		SAY("type %u %u:%#x -> %u:%#x (%u bytes) to %s NOT SENT (error %d, failure #%llu)\n", p->type, p->src_node, p->src_port,
++		    p->dst_node, p->dst_port, p->n, side_name[p->to], e, f);
++	}
++}
++
++static void
++qf_thread(__unused void *param, __unused wait_result_t wr)
++{
++	SAY("thread up (mode %u)\n", qf_mode);
++	for (;;) {
++		struct qf_pkt *p;
++		unsigned k = 0;
++		for (;;) {
++			lck_mtx_lock(&qf_lock);
++			p = q_first;
++			if (p) {
++				q_first = p->next;
++				if (!q_first) {
++					q_last = NULL;
++				}
++				q_count--;
++				q_bytes -= p->n;
++			}
++			lck_mtx_unlock(&qf_lock);
++			if (p == NULL) {
++				break;
++			}
++			send_pkt(p);
++			pkt_free(p);
++			if (++k % 64 == 0) {
++				sync_side(SWEET_QFWD_MODEM);    /* announcements are not starved by a data stream */
++				sync_side(SWEET_QFWD_ADSP);
++			}
++		}
++		sync_side(SWEET_QFWD_MODEM);
++		sync_side(SWEET_QFWD_ADSP);
++		lck_mtx_lock(&qf_lock);
++		bool pending = sync_at[0] != 0 || sync_at[1] != 0;
++		uint32_t ms = pending ? 50 : 1000;
++		struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L };
++		if (!qf_wake_flag && q_first == NULL) {
++			(void)msleep(&qf_wake_flag, &qf_lock, PZERO, "sweetqfwd", &ts);
++		}
++		qf_wake_flag = false;
++		lck_mtx_unlock(&qf_lock);
++	}
++}
++
++/* ---- sysctls ---- */
++
++static void
++resync_all_locked(void)
++{
++	uint64_t now = now_ms();
++	for (unsigned t = 0; t < NSIDE; t++) {
++		if (up[t]) {
++			sync_at[t] = now;
++		}
++	}
++	st.replays++;
++	qf_wake_flag = true;
++	wakeup(&qf_wake_flag);
++}
++
++static int
++sysctl_qfwd SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)qf_mode, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (!qf_started) {
++		return ENXIO;                   /* needs the kernel modem link (sweetbb & 1) */
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&qf_lock);
++	uint32_t old = qf_mode;
++	qf_mode = (uint32_t)v;
++	resync_all_locked();
++	lck_mtx_unlock(&qf_lock);
++	SAY("kern.sweet_qrtr_fwd %u -> %u (%s); nodes modem %u%s adsp %u%s\n", old, qf_mode, qf_mode == 0 ? "off: withdrawing" :
++	    qf_mode == 1 ? "control" : "control + data", nid[0], up[0] ? " up" : "", nid[1], up[1] ? " up" : "");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qrtr_fwd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_qfwd, "I",
++    "redfin 1081: QRTR forwarding modem <-> audio DSP (0 off, 1 server announcements, 2 + data and RESUME_TX)");
++
++static int
++sysctl_qfwd_svc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)qf_svc, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v < 0) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&qf_lock);
++	qf_svc = (uint32_t)v;
++	resync_all_locked();
++	lck_mtx_unlock(&qf_lock);
++	SAY("kern.sweet_qrtr_fwd_svc = %#x (%s)\n", qf_svc, qf_svc ? "only this service" : "every service");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qrtr_fwd_svc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_qfwd_svc, "I",
++    "redfin 1081: 0 = every service may cross (default), N = only QMI service N (66 = 0x42 servreg notifier)");
++
++static uint32_t
++parse_num(const char **sp, bool *ok)
++{
++	const char *s = *sp;
++	uint32_t v = 0, base = 10;
++	*ok = false;
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++		base = 16;
++		s += 2;
++	}
++	for (;; s++) {
++		uint32_t d;
++		if (*s >= '0' && *s <= '9') {
++			d = (uint32_t)(*s - '0');
++		} else if (base == 16 && *s >= 'a' && *s <= 'f') {
++			d = (uint32_t)(*s - 'a' + 10);
++		} else if (base == 16 && *s >= 'A' && *s <= 'F') {
++			d = (uint32_t)(*s - 'A' + 10);
++		} else {
++			break;
++		}
++		if (d >= base) {
++			break;
++		}
++		v = v * base + d;
++		*ok = true;
++	}
++	*sp = s;
++	return v;
++}
++
++static int
++sysctl_qfwd_svcs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[sizeof(qf_svcs_str)];
++	int changed = 0;
++	lck_mtx_lock(&qf_lock);
++	strlcpy(buf, qf_svcs_str, sizeof(buf));
++	lck_mtx_unlock(&qf_lock);
++	int e = sysctl_io_string(req, buf, sizeof(buf), 0, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	uint32_t list[8], nl = 0;
++	const char *s = buf;
++	while (*s) {
++		if (*s == ',' || *s == ' ' || *s == '\n' || *s == '\t') {
++			s++;
++			continue;
++		}
++		bool ok;
++		uint32_t v = parse_num(&s, &ok);
++		if (!ok || nl >= 8 || (*s && *s != ',' && *s != ' ' && *s != '\n' && *s != '\t')) {
++			return EINVAL;
++		}
++		list[nl++] = v;
++	}
++	lck_mtx_lock(&qf_lock);
++	memcpy(qf_svcs, list, sizeof(list[0]) * nl);
++	qf_nsvcs = nl;
++	strlcpy(qf_svcs_str, buf, sizeof(qf_svcs_str));
++	resync_all_locked();
++	lck_mtx_unlock(&qf_lock);
++	SAY("kern.sweet_qrtr_fwd_svcs = \"%s\" (%u services%s)\n", buf, nl, nl ? "" : ": kern.sweet_qrtr_fwd_svc decides");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qrtr_fwd_svcs, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_qfwd_svcs, "A",
++    "redfin 1081: up to 8 QMI service ids that may cross (\"0x42,0x2b\"); empty = kern.sweet_qrtr_fwd_svc decides");
++
++static int
++sysctl_qfwd_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 2048;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&qf_lock);
++	unsigned known[NSIDE] = { 0, 0 }, ann[NSIDE] = { 0, 0 };
++	for (unsigned t = 0; t < NSIDE; t++) {
++		for (int i = 0; i < QF_NSRV; i++) {
++			known[t] += srv[t][i].up;
++			ann[t] += srv[t][i].up && srv[t][i].announced;
++		}
++	}
++	int o = snprintf(s, cap, "mode %u svc %#x svcs \"%s\" thread %s | modem node %u %s, %u servers (%u announced to adsp), hello %llu "
++	    "down %llu | adsp node %u %s, %u servers (%u announced to modem), hello %llu down %llu | m2a ctl %llu data %llu resume %llu bye "
++	    "%llu delcli %llu withdrawn %llu | a2m ctl %llu data %llu resume %llu bye %llu delcli %llu withdrawn %llu | drops qfull %llu "
++	    "nomem %llu sendfail %llu filtered %llu mode1data %llu toobig %llu | replays %llu | queue %u (%u B) | per svc (ctl/data):",
++	    qf_mode, qf_svc, qf_svcs_str, qf_started ? "up" : "none", nid[0], up[0] ? "up" : "down", known[0], ann[0], st.hellos[0],
++	    st.downs[0], nid[1], up[1] ? "up" : "down", known[1], ann[1], st.hellos[1], st.downs[1], st.ctl[0], st.data[0], st.resume[0],
++	    st.bye[0], st.delcli[0], st.withdrawn[0], st.ctl[1], st.data[1], st.resume[1], st.bye[1], st.delcli[1], st.withdrawn[1],
++	    st.qfull, st.nomem, st.sendfail, st.filtered, st.mode1_data, st.toobig, st.replays, q_count, q_bytes);
++	for (unsigned i = 0; i < nsvcstat && o > 0 && o < (int)cap - 48; i++) {
++		o += snprintf(s + o, cap - (size_t)o, " %#x:%llu/%llu", svcstat[i].svc, svcstat[i].ctl, svcstat[i].data);
++	}
++	lck_mtx_unlock(&qf_lock);
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qrtr_fwd_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_qfwd_stats, "A",
++    "redfin 1081: QRTR forwarder counters (m2a = from the modem to the audio DSP, a2m the other way), per service ctl/data");
++
++/* ---- start (sweet_bb_init, with the kernel modem link only) ---- */
++
++void
++sweet_qfwd_init(uint32_t sweetbb)
++{
++	uint32_t v = 0;
++	thread_t th;
++	if (sweetbb & SWEETBB_QFWD_DATA) {
++		v = 2;
++	} else if (sweetbb & SWEETBB_QFWD_CTL) {
++		v = 1;
++	}
++	(void)PE_parse_boot_argn("qrtrfwd", &v, sizeof(v));
++	if (v > 2) {
++		v = 2;
++	}
++	if (kernel_thread_start(qf_thread, NULL, &th) != KERN_SUCCESS) {
++		SAY("no thread: forwarding stays off\n");
++		return;
++	}
++	thread_deallocate(th);
++	lck_mtx_lock(&qf_lock);
++	qf_started = true;
++	qf_mode = v;
++	if (v) {
++		resync_all_locked();
++	}
++	lck_mtx_unlock(&qf_lock);
++	SAY("ready (kern.sweet_qrtr_fwd %u)\n", v);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_qfwd.h b/bsd/dev/sweet_qfwd.h
+new file mode 100644
+index 0000000..868701d
+--- /dev/null
++++ b/bsd/dev/sweet_qfwd.h
+@@ -0,0 +1,33 @@
++/*
++ * redfin 1081: QRTR forwarding between the modem (MPSS, sweet_bb.c) and the audio DSP (ADSP, sweet_adsp.c) through
++ * our kernel, as Linux net/qrtr/qrtr.c does between two remote nodes (qrtr_fwd_ctrl_pkt / qrtr_fwd_pkt). Default off:
++ * kern.sweet_qrtr_fwd. See sweet_qfwd.c.
++ */
++#ifndef _SWEET_QFWD_H_
++#define _SWEET_QFWD_H_
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_QFWD_MODEM        0u
++#define SWEET_QFWD_ADSP         1u
++
++/* sweet_qfwd.c */
++void sweet_qfwd_init(uint32_t sweetbb);
++/*
++ * Every QRTR packet a remote sends us, before the link's own handling (sweet_bb.c qrtr_in with ml_lock held,
++ * sweet_adsp.c qrtr_input on its link thread). Never sleeps, never sends: it notes servers/HELLO/BYE and queues.
++ * true: the packet was for the other remote (DATA / RESUME_TX to its node) and is the forwarder's now; the caller
++ * must not handle it. Control packets are always handed back (false): local clients see what they saw before.
++ */
++bool sweet_qfwd_rx(unsigned side, uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t confirm, uint32_t dst_node,
++    uint32_t dst_port, const uint8_t *payload, uint32_t len);
++/* a link went down (the modem link remade, the DSP's link stopped) */
++void sweet_qfwd_link_down(unsigned side);
++
++/* sweet_bb.c: one QRTR packet to the modem with the given source node (not ours) */
++int sbb_qrtr_send_as(uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t confirm, uint32_t dst_node, uint32_t dst_port,
++    const void *data, uint32_t len);
++/* sweet_adsp.c: the same to the audio DSP */
++int redwood_qrtr_send_as(uint32_t type, uint32_t from_node, uint32_t from_port, uint32_t confirm, uint32_t to_node, uint32_t to_port,
++    const void *data, uint32_t length);
++#endif
