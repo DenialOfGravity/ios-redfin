@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index cf65744..f0a03e0 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -42,6 +42,8 @@
+  * Tunables (RW): kern.sweet_qmux_err (0x5e), _cidfail (0), _reuse (1), _kick (1), _holdnas (1), _holddly (500);
+  * kern.sweet_qmux_dump (write: the per-(svc, msg) table to the log). RD kern.sweet_bb_stats (sweet_bb.c).
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
++ * 1085: kern.sweet_qmi_plmnblip (0 off default, 1 on): _plmnblip_ms after a re-publish SysInfo shot, one SysInfo indication
++ *       with the LTE PLMN's MNC changed to 9s, then the modem's real one 300 ms later (CommCenter re-publishes, SOS gone).
+  * 1084: kern.sweet_qmi_republish 3 = BSP activation deferred until the modem has service (_wait_s 45), then the shot.
+  * 1082: re-publish clients = NAS 0x0003 TLV 0x18/0x19 (not 0x12/0x13), fallbacks, choice logged; manual line timing fixed.
+  * 1073: kern.sweet_qmi_republish (0 off default, 1 auto once per CommCenter session, write 2 = now), _republish_ms (20).
+@@ -87,6 +89,7 @@ static int repub_mode = 0, repub_ms = 20;       /* 1073: kern.sweet_qmi_republis
+ static int repub_wait_s = 45;                   /* 1084: kern.sweet_qmi_republish_wait_s (mode 3: longest activation deferral) */
+ static int act_waiting;                         /* 1084: a BSP activation indication is being deferred */
+ static volatile int repub_now;                  /* 1073: kern.sweet_qmi_republish=2 written (manual shot) */
++static int plmnblip = 0, plmnblip_ms = 1500;    /* 1085: kern.sweet_qmi_plmnblip, kern.sweet_qmi_plmnblip_ms */
+ static int voice_auto = 0;                      /* 1074: kern.sweet_voice_auto: 0 off, 1 earpiece, 2 speaker on a call */
+ static bool on;
+ static int ready = -1;
+@@ -2567,9 +2570,100 @@ repub_arm(uint32_t pipe, uint32_t sess)
+ 	rp_at = rp_act + (uint64_t)(repub_ms > 0 ? repub_ms : 0);
+ }
+ 
++/*
++ * ---- 1085: kern.sweet_qmi_plmnblip: make CommCenter re-publish its registration status after provisioning ----
++ * research/cc/P5-sos2-result.md. SpringBoard's status bar (SystemStatusServer STTelephonyStatusDomainDataProvider) shows
++ * SOS when CoreTelephony's registration display status is kCTRegistrationStatusEmergencyOnly, and re-reads it only on
++ * CommCenter's kRegistrationDisplayStatusNotification. CommCenter 16.7 publishes (sub_1006e93e4) only on: a provisioned-
++ * state change to a non-kProvisioned value (reported status then can never be registered: registered -> kEmergencyOnly),
++ * the 10 s adjust timer, IMS registration, call active/type changes, and "Computed MCC/MNC changed" (sub_1003b0fac).
++ * With 1084 the modem is registered when the BSP activation goes, so the kUnavailable -> kUnknown publish says
++ * kEmergencyOnly, kUnknown -> kProvisioned does not publish, MCC/MNC are already known, and the bar stays SOS.
++ * Mode 1: plmnblip_ms after the shot's SysInfo indication (so CommCenter is kProvisioned), one copy of it with the LTE
++ * system info PLMN (TLV 0x19, network id at offset 19) MNC digits set to '9' (MCC kept: home-country logic unchanged),
++ * then the unchanged copy 300 ms later. Each MCC/MNC change makes CommCenter publish the reported status, now
++ * kRegisteredRoaming/Home. The copies use the shot's content; a real modem SysInfo in between restores the PLMN too.
++ */
++static struct {
++	int step;                       /* 0 idle, 1 blip due, 2 restore due */
++	uint64_t at;
++	uint32_t pipe, sess, n;
++	unsigned cid, svc, msg;
++	uint8_t tl[ABP_MAXFRAME];
++} blip;
++static uint32_t blip_sent;
++
++static void
++blip_arm(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t n)
++{
++	if (!plmnblip || svc != 0x03 || msg != 0x004e || n > sizeof(blip.tl)) {
++		return;
++	}
++	blip.pipe = pipe;
++	blip.sess = sess;
++	blip.svc = svc;
++	blip.cid = cid;
++	blip.msg = msg;
++	blip.n = n;
++	memcpy(blip.tl, tl, n);
++	blip.at = sbb_ms() + (uint64_t)(plmnblip_ms > 0 ? plmnblip_ms : 0);
++	blip.step = 1;
++	printf("SWEET QMUX: plmnblip: armed for %s/%u cid %u, %d ms\n", pipe_name[pipe], sess, cid, plmnblip_ms);
++}
++
++static void
++blip_poll(uint64_t now)
++{
++	if (!blip.step || now < blip.at) {
++		return;
++	}
++	if (!plmnblip || !cl_get(blip.pipe, blip.sess, blip.svc, blip.cid, 0)) {
++		printf("SWEET QMUX: plmnblip: %s, nothing sent\n", plmnblip ? "client gone" : "switched off");
++		blip.step = 0;
++		return;
++	}
++	if (blip.step == 2) {
++		hold_bypass = 1;
++		send_ind(blip.pipe, blip.sess, blip.svc, blip.cid, blip.msg, blip.tl, blip.n);
++		hold_bypass = 0;
++		blip_sent++;
++		printf("SWEET QMUX: plmnblip: real SysInfo 0x%04x again (%u TLV bytes) to %s/%u cid %u [t=%llu ms]\n", blip.msg, blip.n,
++		    pipe_name[blip.pipe], blip.sess, blip.cid, (unsigned long long)now);
++		blip.step = 0;
++		return;
++	}
++	uint32_t ll = 0;
++	const uint8_t *lte = tlv_find(blip.tl, blip.n, 0x19, &ll);
++	if (lte == NULL || ll < 26 || lte[19] != 1 || lte[20] < '0' || lte[20] > '9' || lte[23] < '0' || lte[23] > '9') {
++		printf("SWEET QMUX: plmnblip: no LTE PLMN in TLV 0x19 (len %u, valid %d), nothing sent\n", lte ? ll : 0,
++		    lte && ll >= 20 ? lte[19] : -1);
++		blip.step = 0;
++		return;
++	}
++	uint8_t m[3];
++	uint8_t *w = (uint8_t *)(uintptr_t)lte;
++	memcpy(m, w + 23, 3);
++	for (int i = 0; i < 3; i++) {
++		if (w[23 + i] >= '0' && w[23 + i] <= '9') {
++			w[23 + i] = (w[23 + i] == '9') ? '8' : '9';     /* never the real MNC */
++		}
++	}
++	hold_bypass = 1;
++	send_ind(blip.pipe, blip.sess, blip.svc, blip.cid, blip.msg, blip.tl, blip.n);
++	hold_bypass = 0;
++	blip_sent++;
++	printf("SWEET QMUX: plmnblip: SysInfo 0x%04x with MNC %c%c%c instead of the modem's to %s/%u cid %u [t=%llu ms]\n", blip.msg,
++	    w[23], w[24], w[25] >= '0' && w[25] <= '9' ? w[25] : ' ', pipe_name[blip.pipe], blip.sess, blip.cid,
++	    (unsigned long long)now);
++	memcpy(w + 23, m, 3);
++	blip.step = 2;
++	blip.at = now + 300;
++}
++
+ static void
+ repub_poll(uint64_t now)
+ {
++	blip_poll(now);
+ 	if (repub_now) {
+ 		repub_now = 0;
+ 		if (!repub_send(2, 1)) {
+@@ -3146,6 +3240,7 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 					hold_bypass = 1;
+ 					send_ind(x->rpipe, x->rsess, x->svc, x->rcid, x->ind_msg, t, o);
+ 					hold_bypass = 0;
++					blip_arm(x->rpipe, x->rsess, x->svc, x->rcid, x->ind_msg, t, o);        /* 1085 */
+ 				}
+ 				return;
+ 			}
+@@ -3593,6 +3688,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_republish, CTLTYPE_INT | CTLFLAG_RW | CTL
+     "redfin 1073: 0 off (default), 1 = once per CommCenter session the modem's fresh NAS SysInfo/SigInfo as indications "
+     "kern.sweet_qmi_republish_ms after BSP activation; write 2 = send them now; 3 = as 1, the BSP activation deferred until the "
+     "modem has service (1084)");
++QINT(sweet_qmi_plmnblip, plmnblip, "redfin 1085: 1 = after a re-publish SysInfo shot, a SysInfo with another MNC then the real one (CommCenter re-publishes its registration status: no SOS); 0 off (default)");
++QINT(sweet_qmi_plmnblip_ms, plmnblip_ms, "redfin 1085: delay in ms from the shot to the PLMN blip (1500)");
+ QINT(sweet_qmi_republish_wait_s, repub_wait_s, "redfin 1084: mode 3: longest wait in s for modem service before the BSP activation goes anyway (45)");
+ QINT(sweet_qmi_policy_file, policy_file, "redfin 1068: 1 = /var/local/abp-policy.conf overrides the built-in default text (checked every 10 s)");
+ 
