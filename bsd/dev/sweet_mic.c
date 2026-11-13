@@ -379,6 +379,8 @@ bus_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, 
 
 static bool codec_found, codec_p;               /* codec_p: VENDOR_ID1 0x80, the rt5514p (PLL2) */
 static uint32_t mic_gain = 23;                   /* "ADC1 Capture Volume" (0.75 dB steps from -17.25 dB) */
+static uint32_t gain_applied = 23;               /* 1086: what the codec has now */
+static volatile int voice_gain_db;               /* 1086: kern.sweet_voice_gain_tx (redwood_mic_voice_gain()) */
 
 static int
 rt_raw_read(uint32_t reg, uint32_t *val)
@@ -513,6 +515,7 @@ codec_init(void)
 	SAY("codec (%s) %s: DSP_A TDM 8 x 32, 16-bit words, PLL%u from BCLK 12.288 MHz, DMIC1 -> Stereo1, ADC1 gain %u\n",
 	    codec_p ? "rt5514p" : "rt5514", err ? "CONFIGURATION FAILED" : "configured", codec_p ? 2 : 1, mic_gain);
 	codec_found = !err;
+	gain_applied = mic_gain;        /* 1086 */
 	return codec_found;
 }
 
@@ -920,6 +923,34 @@ static volatile uint32_t ios_wants;
 static volatile uint64_t ios_closed_us;
 static volatile bool stopping, record_wanted, running;
 static volatile bool voice_wants;               /* 1065: a call holds the path up (kern.sweet_voice, sweet_voice.c) */
+
+/* 1086: the ADC gain wanted now: micgain, moved by kern.sweet_voice_gain_tx while a call holds the path */
+static uint32_t
+gain_wanted(void)
+{
+	int g = (int)mic_gain + (voice_wants ? (voice_gain_db * 4 + (voice_gain_db < 0 ? -1 : 1)) / 3 : 0);
+
+	return g < 0 ? 0 : g > 63 ? 63 : (uint32_t)g;
+}
+
+/* on the mic thread only (the codec's bus is that thread's) */
+static void
+gain_apply(void)
+{
+	uint32_t g = gain_wanted();
+
+	if (!codec_found || g == gain_applied) {
+		return;
+	}
+	if (rt_bits(RT_DOWNFILTER0_CTRL1, 0x3fu << 1, g << 1) || rt_bits(RT_DOWNFILTER0_CTRL2, 0x3fu << 1, g << 1)) {
+		SAY("ADC1 gain %u -> %u: FAILED\n", gain_applied, g);
+		gain_applied = 0xffffffffu;     /* tried again at the next period */
+		return;
+	}
+	SAY("ADC1 gain %u -> %u (%s)\n", gain_applied == 0xffffffffu ? 0 : gain_applied, g,
+	    voice_wants ? "kern.sweet_voice_gain_tx" : "micgain");
+	gain_applied = g;
+}
 static uint32_t record_secs;
 static int mic_wake;
 static LCK_GRP_DECLARE(mic_lock_group, "sweet-mic");
@@ -1096,6 +1127,7 @@ listen(void)
 			continue;
 		}
 		OSBitAndAtomic(~(1u << next), &read_ready);
+		gain_apply();   /* 1086 */
 		{
 			int16_t *samples = (int16_t *)(mic_memory + 4096u * next);
 			uint32_t got = read_sizes[next] / 2;
@@ -1216,6 +1248,12 @@ sweet_mic_status(void)
  * 1065: a call holds the microphones' path up as an open /dev/redwood-mic does (the DSP's voice processor takes port
  * 0x9001's samples next to our record session; the ring just runs on). Released: down 3 s later unless iOS reads.
  */
+void
+redwood_mic_voice_gain(int db)
+{
+	voice_gain_db = db;     /* the mic thread applies it (gain_apply()) */
+}
+
 bool
 redwood_mic_voice_hold(bool on, uint32_t wait_ms)
 {

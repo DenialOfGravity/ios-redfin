@@ -141,6 +141,7 @@ void redwood_mic_dsp_down(void);        /* before the DSP is shut down at the ru
  * (as if /dev/redwood-mic were open): true once it is up (waits at most wait_ms); false = released or not up.
  */
 bool redwood_mic_voice_hold(bool on, uint32_t wait_ms);
+void redwood_mic_voice_gain(int db);    /* 1086: the ADC gain during a call, dB relative to micgain (0 = micgain) */
 /*
  * The speakers' port 0x9040 and the amplifiers held for a call: amps bit 0 = 0x40 (slot 0, top/earpiece),
  * bit 1 = 0x41 (slot 1, bottom speaker), at `below' eighths of a dB under Android's level; 0 = the call is over

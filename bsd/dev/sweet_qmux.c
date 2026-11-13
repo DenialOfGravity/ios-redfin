@@ -97,6 +97,13 @@ static int act_waiting;                         /* 1084: a BSP activation indica
 static volatile int repub_now;                  /* 1073: kern.sweet_qmi_republish=2 written (manual shot) */
 static int plmnblip = 0, plmnblip_ms = 1500;    /* 1085: kern.sweet_qmi_plmnblip, kern.sweet_qmi_plmnblip_ms */
 static int voice_auto = 0;                      /* 1074: kern.sweet_voice_auto: 0 off, 1 earpiece, 2 speaker on a call */
+/*
+ * 1086: kern.sweet_voice_dtmflog (default 1; log lines only): every VOICE Burst/Start/Stop DTMF (0x0028/0x0029/0x002a)
+ * request with its call id and digit(s) (DTMF digits only: no numbers are read), every answer with result and latency,
+ * every VOICE DTMF indication, every Apple AUDIO (0xe1) request id, and the message of any request left without an
+ * answer for 5 s. "SWEET QMUX: [...] DTMF ..." / "AUDIO(apple) req ..." / "NO ANSWER ...".
+ */
+static int dtmflog = 1;
 static bool on;
 static int ready = -1;
 
@@ -4105,6 +4112,35 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
 		ms->act = (uint8_t)a;
 		mst_dirty = 1;
 	}
+	if (dtmflog && svc == 0x09 && msg >= 0x0028 && msg <= 0x002a) {     /* 1086 */
+		uint32_t tl = 0;
+		const uint8_t *t = tlv_find(s + 7, rl, 0x01, &tl);
+		char dg[24] = "";
+
+		if (t && msg == 0x0029 && tl >= 2) {
+			snprintf(dg, sizeof(dg), " digit '%c'", t[1] >= 0x20 && t[1] < 0x7f ? t[1] : '?');
+		} else if (t && msg == 0x0028 && tl >= 2) {
+			unsigned k = 0;
+			for (; k < t[1] && k + 2 < tl && k < 16; k++) {
+				dg[k] = t[k + 2] >= 0x20 && t[k + 2] < 0x7f ? (char)t[k + 2] : '?';
+			}
+			dg[k] = 0;
+		}
+		LOG("DTMF CC-> VOICE 0x%04x %s txn %u cid %u: call id %d%s%s (%u TLV bytes) -> %s\n", msg, msg == 0x0028 ? "BURST" :
+		    msg == 0x0029 ? "START" : "STOP", (unsigned)(s[1] | (s[2] << 8)), cid, t && tl >= 1 ? t[0] : -1,
+		    msg == 0x0028 ? " digits " : "", dg, rl, an);
+	} else if (dtmflog && svc == 0xe1) {
+		char ids[64];
+		int io = 0;
+
+		ids[0] = 0;
+		for (uint32_t k = 0; k + 3 <= rl && io < (int)sizeof(ids) - 12;) {
+			unsigned l = (unsigned)(s[7 + k + 1] | (s[7 + k + 2] << 8));
+			io += snprintf(ids + io, sizeof(ids) - (size_t)io, "%s%02x/%u", k ? "," : "", s[7 + k], l);
+			k += 3 + l;
+		}
+		LOG("AUDIO(apple) req 0x%04x cid %u, TLVs %s -> %s\n", msg, cid, ids[0] ? ids : "none", an);
+	}
 	switch (a) {
 	case ACT_FWD:
 		if (DSVC(svc) && data_active()) {
@@ -4437,12 +4473,14 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	unsigned res = 0xffff, rmsg = (unsigned)(d[3] | (d[4] << 8));
 	uint8_t rq[96];
 	uint32_t rqn = 0;
+	uint64_t sent_at = 0;   /* 1086 */
 	if (d[0] == 0x02) {
 		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
 		unsigned er;
 		for (int i = 0; i < NPEND; i++) {
 			if (B->pend[i].used && B->pend[i].port == h->dst_port && B->pend[i].txn == txn) {
 				B->pend[i].used = 0;
+				sent_at = B->pend[i].t;
 				rqn = B->pend[i].rqn;
 				memcpy(rq, B->pend[i].rq, rqn);
 				break;
@@ -4481,6 +4519,21 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		nas_srv_note(d + 7, ml);        /* 1084 */
 	} else if (c->svc == 0x03 && rmsg == 0x0024 && (d[0] == 0x04 || res == 0)) {
 		nas_ss_note(d + 7, ml);
+	}
+	if (dtmflog && c->svc == 0x09 && rmsg >= 0x0028 && rmsg <= 0x002a) {        /* 1086 */
+		uint32_t tl = 0;
+		const uint8_t *t = tlv_find(d + 7, ml, d[0] == 0x04 ? 0x01 : 0x10, &tl);
+
+		if (d[0] == 0x02) {
+			unsigned r2, e2;
+			result_of(d, n, &r2, &e2);
+			LOG("DTMF <-modem VOICE 0x%04x answer txn %u: %s error 0x%x, call id %d, after %llu ms\n", rmsg,
+			    (unsigned)(d[1] | (d[2] << 8)), r2 == 0 ? "success" : "FAILURE", r2 == 0 ? 0 : e2, t && tl >= 1 ? t[0] : -1,
+			    sent_at ? (unsigned long long)(sbb_ms() - sent_at) : 0ull);
+		} else {
+			LOG("DTMF <-modem VOICE ind 0x%04x: call id %d, event %d, digit '%c' (%u TLV bytes)\n", rmsg, t && tl >= 1 ? t[0] : -1,
+			    t && tl >= 2 ? t[1] : -1, t && tl >= 3 && t[2] >= 0x20 && t[2] < 0x7f ? t[2] : '-', ml);
+		}
 	}
 	if (c->svc == 0x09 && voice_auto) {     /* 1074 */
 		if (d[0] == 0x04 && rmsg == 0x002e) {
@@ -4661,6 +4714,9 @@ sweet_qmux_poll(void)
 		struct pend *x = &B->pend[i];
 		if (x->used && now - x->t > 5000) {
 			x->used = 0;
+			if (dtmflog) {  /* 1086: which request it was */
+				LOG("NO ANSWER in 5 s: %s(0x%02x) msg 0x%04x txn %u port %#x\n", svc_name(x->svc), x->svc, x->msg, x->txn, x->port);
+			}
 			kick(x->port, x->svc, now);
 			struct mst *m = mst_get(x->svc, x->msg);
 			if (m) {
@@ -4787,6 +4843,7 @@ QINT(sweet_qmi_rules, qmi_rules, "redfin 1068: built-in list 0 = P2 (abpbridge.c
 QINT(sweet_qmux_err, err_code, "redfin 1068: QMI error of the built-in err entries (abperr, default 0x5e)");
 QINT(sweet_qmux_cidfail, cidfail, "redfin 1068: 1 = GetClientId fails for a service the modem lacks (abpcidfail)");
 QINT(sweet_qmux_reuse, reuse, "redfin 1068: 1 = released router clients pooled per service (abpreuse, default 1)");
+QINT(sweet_voice_dtmflog, dtmflog, "redfin 1086: 1 = log VOICE DTMF requests/answers/indications, Apple AUDIO request ids, unanswered requests (default 1)");
 QINT(sweet_qmux_kick, kickon, "redfin 1068: 1 = RESUME_TX kick after 5 s without an answer (abpkick, default 1)");
 QINT(sweet_qmux_holdnas, holdnas, "redfin 1068: NAS indications held until BSP activation (abpholdnas: 0 off, 1 = 5 s, >= 100 ms)");
 QINT(sweet_qmux_holddly, holddly, "redfin 1068: ms after the BSP activation indication before held NAS indications go (abpholddly, 500)");

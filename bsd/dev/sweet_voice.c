@@ -34,6 +34,18 @@
  * A failed start is undone and kern.sweet_voice reads 0 again. Never returns to fastboot.
  *
  * Log lines: "SWEET VOICE: ...".
+ *
+ * 1086 (route and gains; self-contained, deletable in one commit; all defaults = 1085's behaviour):
+ *   kern.sweet_voice_route 0 (default: unset) / 1 earpiece / 2 speaker: a running call is switched at once (the same
+ *     amplifier-only switch as kern.sweet_voice 1 <-> 2: the CVP stays, the call is not torn down), whoever started it;
+ *     kern.sweet_voice_auto starts the next call in this mode instead of its own. Anybody may write it.
+ *     The same from iOS: /dev/redwood-audio ioctl REDWOOD_AUDIO_SET_CALL_ROUTE (RedwoodAudio, flag file
+ *     /var/local/redwood-call-route): applied to a running call; with no call it is kept for the auto start only if it
+ *     came within ROUTE_IOS_FRESH_MS before it (iOS routes a new call as it starts; an older value is media's route).
+ *   kern.sweet_voice_gain_rx (dB, default 0, -30..+24): the call's amplifier level relative to kern.sweet_voice_below_ear
+ *     / _spk (louder = positive); sweet_sound.c's hard cap (6 dB under Android's level) still applies.
+ *   kern.sweet_voice_gain_tx (dB, default 0, -12..+24): the mic's ADC gain during a call relative to the boot-arg
+ *     micgain (0.75 dB steps, sweet_mic.c redwood_mic_voice_gain()); back to micgain when the call lets the mic go.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <kern/clock.h>
@@ -143,6 +155,10 @@ static int voice_wake;
 static uint32_t starts, failures;
 static uint32_t cvs_vsid;                       /* 1066: the VSID the kept CVS was named after */
 static bool listening, dtmf_on;
+static int voice_route;                         /* 1086: kern.sweet_voice_route: 0 unset, 1 earpiece, 2 speaker */
+static uint64_t route_ios_at;                   /* 1086: when iOS (the ioctl) set it last, mach_absolute_time(); 0 = by hand */
+static int gain_rx_db, gain_tx_db;              /* 1086 */
+#define ROUTE_IOS_FRESH_MS      15000
 static volatile uint32_t ev_all, ev_ready, ev_not_ready, ev_activity, ev_dtmf, ev_other;
 
 /* 1066: what MVM/CVS/CVP send unasked (sweet_adsp.c's link thread). Answers to our own commands are not seen here. */
@@ -312,7 +328,9 @@ amps_for(int state)
 static uint32_t
 below_for(int state)
 {
-	return state == 2 ? below_speaker : below_ear;
+	int below = (int)(state == 2 ? below_speaker : below_ear) - gain_rx_db * 8;   /* 1086: gain_rx */
+
+	return below < 0 ? 0 : (uint32_t)below;
 }
 
 /* the sessions taken down, the ports and amplifiers let go: whatever of it is there */
@@ -699,6 +717,21 @@ sweet_voice_auto(int target, const char *why)
 			redwood_adsp_apr_events_voice(voice_event);
 		}
 		auto_owned = true;
+		if (voice_route != 0 && voice_target == 0) {   /* 1086: the next call in kern.sweet_voice_route's mode */
+			uint64_t ms = 0;
+
+			if (route_ios_at != 0) {
+				absolutetime_to_nanoseconds(mach_absolute_time() - route_ios_at, &ms);
+				ms /= NSEC_PER_MSEC;
+			}
+			if (route_ios_at == 0 || ms < ROUTE_IOS_FRESH_MS) {
+				SAY("auto: kern.sweet_voice_route %d (%s) instead of %d\n", voice_route, route_ios_at ? "from iOS" : "set by hand",
+				    target);
+				target = voice_route;
+			}
+		} else if (voice_route != 0 && voice_target != 0) {
+			target = voice_target;  /* running: the route keeps what it chose */
+		}
 		if (voice_target != target) {
 			SAY("auto: %s -> %s (was %d)\n", why, target == 1 ? "earpiece" : "speaker", voice_target);
 			voice_target = target;
@@ -743,4 +776,82 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_ear, CTLTYPE_INT | CTLFLAG_RW | C
     "I", "redfin 1065: earpiece amplifier level, 1/8 dB under Android's (default 240; never under 48)");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_spk, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &below_speaker, 3,
     sysctl_voice_number, "I", "redfin 1065: speaker amplifier level, 1/8 dB under Android's (default 160; never under 48)");
+
+/* ---- 1086: route and gains ---- */
+static void
+route_set(int route, bool from_ios)
+{
+	lck_mtx_lock(&thread_lock);
+	voice_route = route;
+	route_ios_at = from_ios ? mach_absolute_time() : 0;
+	if (route != 0 && voice_target != 0 && voice_target != route) {
+		SAY("route: %s -> %s (kern.sweet_voice_route%s)\n", voice_target == 2 ? "speaker" : "earpiece",
+		    route == 2 ? "speaker" : "earpiece", from_ios ? ", from iOS" : "");
+		voice_target = route;
+	}
+	lck_mtx_unlock(&thread_lock);
+	thread_wakeup(&voice_wake);
+}
+
+/* sweet_audio.c's REDWOOD_AUDIO_SET_CALL_ROUTE (RedwoodAudio): 1 earpiece (iOS: Receiver), 2 speaker */
+int sweet_voice_route_from_ios(int route);
+int
+sweet_voice_route_from_ios(int route)
+{
+	if (route < 0 || route > 2) {
+		return EINVAL;
+	}
+	SAY("iOS route: %s%s\n", route == 2 ? "Speaker" : route == 1 ? "Receiver" : "unset",
+	    voice_state ? "" : " (no call running: kept for an auto start within 15 s)");
+	route_set(route, true);
+	return 0;
+}
+
+static int
+sysctl_voice_route(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = voice_route, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+
+	if (e != 0 || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 2) {
+		return EINVAL;
+	}
+	SAY("kern.sweet_voice_route = %d (%s)\n", v, v == 0 ? "unset" : v == 1 ? "earpiece" : "speaker");
+	route_set(v, false);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_route, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_voice_route, "I", "redfin 1086: 0 unset (default), 1 earpiece, 2 speaker: switches a running call; the next auto call's mode");
+
+static int
+sysctl_voice_gain(__unused struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int *p = arg1;
+	int v = *p, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+
+	if (e != 0 || !changed) {
+		return e;
+	}
+	if (arg2 == 0 ? (v < -30 || v > 24) : (v < -12 || v > 24)) {
+		return EINVAL;
+	}
+	*p = v;
+	if (arg2 == 0) {
+		SAY("kern.sweet_voice_gain_rx = %d dB: earpiece %u/8, speaker %u/8 dB under Android's (cap 48/8)\n", v, below_for(1),
+		    below_for(2));
+		thread_wakeup(&voice_wake);     /* the voice thread re-applies the level of a running call */
+	} else {
+		SAY("kern.sweet_voice_gain_tx = %d dB (mic ADC gain during calls)\n", v);
+		redwood_mic_voice_gain(v);
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_gain_rx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, &gain_rx_db, 0,
+    sysctl_voice_gain, "I", "redfin 1086: call amplifier level, dB relative to below_ear/below_spk (default 0, -30..24; cap 6 dB under Android's)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_gain_tx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, &gain_tx_db, 1,
+    sysctl_voice_gain, "I", "redfin 1086: call mic ADC gain, dB relative to boot-arg micgain (default 0, -12..24)");
 #endif /* ARM64_BOARD_CONFIG_SWEET */

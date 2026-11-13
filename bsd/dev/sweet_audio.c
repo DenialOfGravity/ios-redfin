@@ -39,6 +39,8 @@ struct sweet_audio_volume {
 	uint32_t muted;
 };
 #define SWEET_AUDIO_SET_VOLUME  _IOW('r', 1, struct sweet_audio_volume)
+#define SWEET_AUDIO_SET_CALL_ROUTE _IOW('r', 2, uint32_t)      /* 1086: 1 Receiver, 2 Speaker (sweet_voice.c) */
+extern int sweet_voice_route_from_ios(int route);
 #define AUDIO_RATE              48000u
 #define MINOR_AUDIO             0
 #define MINOR_HAPTIC            1
@@ -156,6 +158,9 @@ sa_write(dev_t dev, struct uio *uio, __unused int ioflag)
 static int
 sa_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
 {
+	if (minor(dev) == MINOR_AUDIO && cmd == SWEET_AUDIO_SET_CALL_ROUTE) {
+		return sweet_voice_route_from_ios((int)*(uint32_t *)data);      /* 1086 */
+	}
 	if (minor(dev) != MINOR_AUDIO || cmd != SWEET_AUDIO_SET_VOLUME) {
 		return ENOTTY;
 	}
