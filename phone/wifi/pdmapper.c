@@ -3,9 +3,17 @@
  * the modem's PD framework which protection domains provide a service. The
  * table is the firmware's own .jsn files (vendor/firmware/modemuw.jsn and
  * the radio's modemr.jsn), as github.com/andersson/pd-mapper reads them.
+ *
+ * T1 (P3 voice link, Claude 2026-11-13): word pdmapadsp=1 in /var/local/cell.on (read at every query; 0/absent =
+ * the modem-only table as before) adds redfin's ADSP/CDSP jsn domains (vendor/firmware adspr, adsps, adspua,
+ * cdspr.jsn), as Android's pd-mapper serves them: "avs/audio" -> msm/adsp/audio_pd 74, "tms/servreg" -> 6 domains.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include "cell.h"
 #include "link.h"
 #include "pdmapper.h"
 #include "qmi.h"
@@ -13,13 +21,34 @@
 #define GET_DOMAIN_LIST	0x21
 #define PFR		0x24	/* protection domain failure report */
 
-static const struct { const char *service, *domain; uint32_t instance; } db[] = {
-	{ "tms/servreg", "msm/modem/root_pd", 180 },
-	{ "gps/gps_service", "msm/modem/root_pd", 180 },
-	{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
-	{ "tms/servreg", "msm/modem/wlan_pd", 180 },
-	{ "wlan/fw", "msm/modem/wlan_pd", 180 },
+static const struct { const char *service, *domain; uint32_t instance; int adsp; } db[] = {
+	{ "tms/servreg", "msm/modem/root_pd", 180, 0 },		/* modemr.jsn */
+	{ "gps/gps_service", "msm/modem/root_pd", 180, 0 },
+	{ "kernel/elf_loader", "msm/modem/wlan_pd", 180, 0 },	/* modemuw.jsn */
+	{ "tms/servreg", "msm/modem/wlan_pd", 180, 0 },
+	{ "wlan/fw", "msm/modem/wlan_pd", 180, 0 },
+	{ "tms/servreg", "msm/adsp/root_pd", 74, 1 },		/* adspr.jsn (pdmapadsp=1 only) */
+	{ "tms/servreg", "msm/adsp/sensor_pd", 74, 1 },		/* adsps.jsn */
+	{ "tms/servreg", "msm/adsp/audio_pd", 74, 1 },		/* adspua.jsn */
+	{ "avs/audio", "msm/adsp/audio_pd", 74, 1 },
+	{ "tms/servreg", "msm/cdsp/root_pd", 76, 1 },		/* cdspr.jsn */
 };
+
+/* pdmapadsp= in cell.on (0 when the file or the word is missing) */
+static int pdmapadsp(void)
+{
+	char b[2048];
+	int fd = open(CELL_ON, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	ssize_t k = read(fd, b, sizeof(b) - 1);
+	close(fd);
+	if (k <= 0)
+		return 0;
+	b[k] = 0;
+	const char *w = strstr(b, "pdmapadsp=");
+	return w ? atoi(w + 10) : 0;
+}
 
 int pdmapper_init(void)
 {
@@ -58,8 +87,9 @@ void pdmapper_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		uint8_t list[512];
 		size_t o = 1;
 		uint16_t total = 0;
+		int adsp = pdmapadsp() == 1;
 		for (unsigned i = 0; i < sizeof(db) / sizeof(db[0]); i++) {
-			if (strcmp(db[i].service, name))
+			if (strcmp(db[i].service, name) || (db[i].adsp && !adsp))
 				continue;
 			if (total++ < offset)
 				continue;
@@ -74,7 +104,7 @@ void pdmapper_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			o += 4;
 			list[0]++;
 		}
-		printf("pd-mapper: \"%s\" -> %u domain(s)\n", name, total);
+		printf("pd-mapper: \"%s\" -> %u domain(s)%s\n", name, total, adsp ? " (pdmapadsp=1)" : "");
 		qmi_tlv_result(&q, 0, 0);
 		qmi_tlv(&q, 0x10, &total, 2);
 		uint16_t rev = 1;
