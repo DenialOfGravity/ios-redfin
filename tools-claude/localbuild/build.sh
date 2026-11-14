@@ -1,13 +1,13 @@
 #!/bin/bash
 # Local builds: the same steps as .github/workflows/{shim,userland,metal2,xnu}.yml, on Linux.
-#   build.sh TARGET [REF]       TARGET shim | userland | metal2 | xnu;  REF branch or commit (default redfin-qol)
+#   build.sh TARGET [REF]       TARGET shim | userland | metal2 | xnu | hmetal | hmesa | hmetal-mesa;  REF branch or commit (default redfin-qol)
 # Source: REF of DenialOfGravity/ios-flame-redfin, fetched fresh each run into $WORK/TARGET/repo (the build trees
 # beside it are kept, so rebuilds are incremental). Result: $P/builds/TARGET/<REF>-<sha>/ (+ BUILD.txt, build.log).
 # Env: XNU_CLEAN=1 (xnu: ignore the incremental tree), XNU_KEEP_GOING=0 (stop at the first error), JOBS=N.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/env.sh"
-P=${P:-/mnt/c/ClaudeProjects/iOS_Pixel5}
+P=${P:-/mnt/d/ClaudeProjects/iOS_Pixel5}
 T=${1:?target}; REF=${2:-redfin-qol}
 TW=$WORK/$T; R=$TW/repo
 mkdir -p "$TW"
@@ -15,6 +15,8 @@ exec 9>"$TW.lock"; flock -w 1800 9 || die "another $T build is still running"	# 
 START=$(date +%s)
 
 # ---- source at REF ----
+# REF "agent/stage/NAME.bundle/BRANCH" (bundle path under $P) builds BRANCH from a git bundle instead of GitHub (commit not pushed yet)
+case $REF in *.bundle/*) REPO_URL=$P/${REF%%.bundle/*}.bundle; REF=${REF#*.bundle/}; [ -f "$REPO_URL" ] || die "no bundle $REPO_URL";; esac
 MIRROR=$SRC/ios-redfin.git
 [ -d "$MIRROR" ] || git init -q --bare "$MIRROR"
 git -C "$MIRROR" fetch -q "$REPO_URL" "+$REF:refs/lb/$T" || die "cannot fetch $REF"	# per target: parallel builds
@@ -97,7 +99,7 @@ EOH
 	sh phone/wifi/build.sh && cp phone/wifi/out/wland "$U/" || say "WARN wland failed"
 	sh phone/sensors/test.sh > "$U/sensd-test.log" 2>&1 || { say "WARN sensd host tests failed"; tail -20 "$U/sensd-test.log"; }
 	sh phone/sensors/build.sh && cp phone/sensors/out/sensd "$U/" || say "WARN sensd failed"
-	sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/tlv_test.log "$U/" || say "WARN btd failed"
+	sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/tlv_test.log "$U/" && { cp phone/bt/out/bluetool "$U/" 2>/dev/null || true; } || say "WARN btd failed"
 	sh phone/fastrpc/test.sh > "$U/fastrpcd-test.log" 2>&1 || { say "WARN fastrpcd host tests failed"; tail -20 "$U/fastrpcd-test.log"; }
 	sh phone/fastrpc/build.sh && cp phone/fastrpc/out/fastrpcd phone/fastrpc/org.iosonpixel.fastrpcd.plist "$U/" || say "WARN fastrpcd failed"
 	bash phone/tools/build.sh || say "WARN some phone tools failed"
@@ -105,7 +107,7 @@ EOH
 	sh phone/audio/build.sh > "$U/audio-build.log" 2>&1 && cp -R phone/audio/out/RedwoodAudio.driver phone/audio/out/sound_test \
 		phone/audio/out/camera_test phone/audio/out/camera_avtest phone/audio/out/mg_test phone/audio/out/vt_test "$U/" ||
 		{ say "WARN RedwoodAudio.driver failed"; tail -40 "$U/audio-build.log"; }
-	for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump mic_test; do
+	for t in psx pstack netsvc nettest oslog prefs openapp lsreg memwarn pmem a2s imgdump mic_test autolock sweettrace sweetmon smemdump; do
 		[ -f phone/tools/out/$t ] && cp phone/tools/out/$t "$U/"; [ -f phone/audio/out/$t ] && cp phone/audio/out/$t "$U/"
 	done
 	cd "$U"
@@ -154,6 +156,10 @@ build_metal2() {
 	echo "$wh" > "$TW/turnip-build/.lb-wrappers"
 	local M2=$SRC/metal2vulkan
 	[ -d "$M2/.git" ] || git clone -q https://github.com/steelbrain/metal2vulkan.git "$M2"
+	# the checkout's own pin where its workflow names one (ws-u-m2vup: f6a96b7d), else 720ef1ce; fetched when missing
+	local pin; pin=$(sed -n 's/^ *M2V_COMMIT: *\([0-9a-f]*\).*/\1/p' .github/workflows/metal2.yml 2>/dev/null | head -1)
+	M2V_COMMIT=${pin:-$M2V_COMMIT}; say "metal2vulkan at $M2V_COMMIT"
+	git -C "$M2" cat-file -e "$M2V_COMMIT^{commit}" 2>/dev/null || git -C "$M2" fetch -q origin || return 1
 	rm -rf work/metal2vulkan && git clone -q --shared "$M2" work/metal2vulkan && git -C work/metal2vulkan checkout -q "$M2V_COMMIT" || return 1
 	for p in phone/metal2/bridge/patches/*.patch; do echo "apply $p"; git -C work/metal2vulkan apply --whitespace=nowarn "$PWD/$p" || return 1; done
 	sed -i "s|/opt/homebrew/opt/llvm/bin/llvm-as|$(command -v llvm-as)|" tools/build-m2v-bridge.sh
@@ -166,6 +172,42 @@ build_metal2() {
 		codesign -f -s - phone/turnip/out/v2test || true
 	(cd phone/metal2/out && tar cf - --exclude='*.dSYM' .) | tar xf - -C "$OUT"; mkdir -p "$OUT/turnip"	# dSYM (190 MB) stays in WSL; cp -R phone/turnip/out/. "$OUT/turnip/" 2>/dev/null
 	[ -d "$OUT/SweetMetal2.bundle" ]
+}
+
+# ---- hmetal (hakios-metal on NativeAdreno: phone/hmetal/build.sh; no CI workflow) ----
+build_hmetal() {
+	ios_env
+	cd "$R"
+	sh phone/hmetal/build.sh || return 1
+	cp phone/hmetal/out/libhakios-metal.a phone/hmetal/out/hakios-metal-probe phone/hmetal/out/SHA256SUMS phone/hmetal/out/hmetal-host-tests.txt "$OUT/"
+	[ -d phone/hmetal/out/bench ] && cp -R phone/hmetal/out/bench "$OUT/" || true	# hmbench (ws-hm-bench): hmbench, metallib, HakiosMetal.bundle
+	[ -f "$OUT/hakios-metal-probe" ]
+}
+
+# ---- hmesa (Mesa 25.0.7 + hakios' AIR front end for hakios-metal MESA=1: phone/hmetal/mesa/build-mesa.sh) ----
+# host build (host tests, fixtures' ir3_compiler) and iOS arm64 static libs, kept in $WORK/hmesa/mesa (incremental);
+# $WORK/hmesa/mesa/hmesa.env names them for `build hmetal-mesa`. Out: MANIFEST.txt, hmesa.env, fixtures/ (A620 compiler
+# fixtures + the A635 ones re-made, a635-diff.txt)
+HMESA_W=$WORK/hmesa/mesa
+build_hmesa() {
+	cd "$R"
+	local V=$WORK/metal2-venv
+	[ -x "$V/bin/meson" ] || { python3 -m venv "$V" && "$V/bin/pip" install -q meson mako pyyaml packaging; } || return 1
+	local t; t=$(dl https://archive.mesa3d.org/mesa-25.0.7.tar.xz) || return 1
+	# host first, without the iOS wrappers on PATH (their ar/nm/strip are for Mach-O)
+	PATH="$V/bin:$PATH" PARTS=host bash phone/hmetal/mesa/build-mesa.sh "$HMESA_W" "$t" || return 1
+	( set -a; . "$HMESA_W/hmesa.env"; set +a; bash phone/hmetal/mesa/gen-fixtures.sh "$OUT/fixtures" ) || return 1
+	ios_env
+	PATH="$V/bin:$PATH" PARTS=ios bash phone/hmetal/mesa/build-mesa.sh "$HMESA_W" "$t" || return 1
+	cp "$HMESA_W/MANIFEST.txt" "$HMESA_W/hmesa.env" "$OUT/"
+	grep -c "^ios " "$OUT/MANIFEST.txt"
+}
+# ---- hmetal-mesa (phone/hmetal/build.sh with MESA=1 against the hmesa build) ----
+build_hmetal-mesa() {
+	[ -f "$HMESA_W/hmesa.env" ] || { say "no $HMESA_W/hmesa.env: build hmesa first"; return 1; }
+	set -a; . "$HMESA_W/hmesa.env"; set +a
+	export MESA=1
+	build_hmetal && cp phone/hmetal/out/MESA.txt "$OUT/"
 }
 
 # ---- xnu (xnu.yml) ----
