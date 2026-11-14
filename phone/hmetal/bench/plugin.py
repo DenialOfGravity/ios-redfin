@@ -1959,6 +1959,24 @@ HMC_EDITS = [
     # item 5: the pre-warm, rebuilt on the cache's manifests
     ('/* (redfin hmv4) HM_PREWARM=1 (default): every pipeline QuartzCore\'s library names made once on a thread of its own, at\n',
      '\t\t\t[names release];\n\t\t\t[held release];\n\t\t});\n\t});\n}\n', PREWARM_NEW),
+    # coordinator: ca-prof only when asked for (HM_CA_PROF_US=N or the boot-arg), no longer by HM_TRACE alone
+    ('\t\t\tca_prof_us = us != NULL && us[0] ? (unsigned)atoi(us) : 25000;\n',
+     '\t\t\tca_prof_us = us != NULL && us[0] ? (unsigned)atoi(us) : 0;   /* (redfin hm-cache) was 25000: 79 % of the log, screen off too */\n'),
+    # coordinator: the HANG trace's GPU time split into queued and running; HM_HANG_EXEC=1 (default) reports only a
+    # buffer whose own time (encode + commit + running) passed 100 ms, not one that only queued behind others
+    ('static double hm_tr_last_done, hm_tr_last_enc, hm_tr_last_gpu;\n',
+     'static double hm_tr_last_done, hm_tr_last_enc, hm_tr_last_gpu;\n'
+     'static __thread double hm_tr_split_q, hm_tr_split_r;   /* (redfin hm-cache) the buffer being completed: queued, running (s) */\n'
+     'static int\nhm_hang_exec_on(void)\n{\n\tstatic int on = -1;\n\n\tif (on < 0) {\n\t\tconst char *e = getenv("HM_HANG_EXEC");\n'
+     '\t\ton = e == NULL || e[0] == 0 || atoi(e) != 0;\n\t}\n\treturn on;\n}\n'),
+    ('\tif (total > 0.1) {\n\t\tchar what[160];\n\n\t\tsnprintf(what, sizeof(what), "a buffer made to completed (encode %.0f, commit %.0f, GPU %.0f ms):", encode * 1e3, commit * 1e3, gpu * 1e3);\n',
+     '\tif (total > 0.1 && (!hm_hang_exec_on() || encode + commit + hm_tr_split_r > 0.1)) {   /* (redfin hm-cache) HM_HANG_EXEC */\n\t\tchar what[200];\n\n'
+     '\t\tsnprintf(what, sizeof(what), "a buffer made to completed (encode %.0f, commit %.0f, GPU %.0f ms = queued %.0f + running %.0f):", encode * 1e3,\n'
+     '\t\t\t commit * 1e3, gpu * 1e3, hm_tr_split_q * 1e3, hm_tr_split_r * 1e3);\n'),
+    ('\thm_tr_buffer([self GPUStartTime] - [self hakiosCreatedAt], self->_hmCommitSecs, hm_now() - [self GPUStartTime],\n',
+     '\t{   /* (redfin hm-cache) the GPU time split for the HANG trace */\n\t\tint64_t q = 0, r = 0;\n\n'
+     '\t\thakios_metal_cb_gpu_split(cb, &q, &r);\n\t\thm_tr_split_q = (double)q / 1e9, hm_tr_split_r = (double)r / 1e9;\n\t}\n'
+     '\thm_tr_buffer([self GPUStartTime] - [self hakiosCreatedAt], self->_hmCommitSecs, hm_now() - [self GPUStartTime],\n'),
 ]
 EDITS += HMC_EDITS
 

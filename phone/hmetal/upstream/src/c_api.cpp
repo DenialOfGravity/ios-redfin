@@ -1735,5 +1735,10 @@ int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb* cb) {
     syncOne(cb);
     return cb->cb->gpuNanoseconds();
 }
+void hakios_metal_cb_gpu_split(hakios_metal_cb* cb, int64_t* queued, int64_t* running) {
+    syncOne(cb);
+    if (queued != nullptr) *queued = cb->cb->queuedNanoseconds();
+    if (running != nullptr) *running = cb->cb->runningNanoseconds();
+}
 
 }  // extern "C"

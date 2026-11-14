@@ -590,6 +590,9 @@ enum hakios_metal_status hakios_metal_cb_status(hakios_metal_cb *cb);
 const char *hakios_metal_cb_error(hakios_metal_cb *cb);
 /* how long the GPU had it, in nanoseconds (commit to fence), once completed */
 int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb *cb);
+/* (redfin hm-cache) that time split: queued behind the buffers before it on the ring (commit to the completion of the
+ * one before), and running (from then to its fence); either pointer may be NULL */
+void hakios_metal_cb_gpu_split(hakios_metal_cb *cb, int64_t *queued, int64_t *running);
 
 #ifdef __cplusplus
 }
