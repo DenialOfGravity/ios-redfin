@@ -6,6 +6,7 @@
 #   openapp  BUNDLE_ID [URL]: launch an app                   lsreg    LaunchServices registration (no uicache)
 #   netsvc   SystemConfiguration network service for an IF    nettest  DNS, TCP, then HTTPS
 #   oslog    stream the unified log                           prefs    CFPreferences read/write (no defaults)
+#   oslogshow FROM_EPOCH TO_EPOCH [-l] [PROC...]: the persisted unified log (log show), e.g. a past cold boot
 #   sctl     NAME [INT|0xHEX|STRING]: read/write a sysctl (strings of any length)
 #   pdptest  list | ping N [COUNT]: pdp_ip interfaces of xnu 1075 and its loopback self-test
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
@@ -31,7 +32,7 @@ build() {	# NAME SOURCE [FLAGS...]
 # SweetControl.app + sweetctl (ws-n-ctl): first, so a failing tool below (set -e) cannot skip it
 sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
 for c in membw pstack psx sweettrace; do build $c $c.c; done
-for m in autolock expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
+for m in autolock expt exq nettest openapp oslog oslogshow prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
