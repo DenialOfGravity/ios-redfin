@@ -1,4 +1,4 @@
-From 1928856990d83cd5f931a2908e72b8ad7fb6bf8b Mon Sep 17 00:00:00 2001
+From db8c4c794075ebb8de85069dcf76a9e79632393c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 14 Nov 2026 21:29:08 +0100
 Subject: [PATCH] 1101 redfin: backlight-calibration-parameters in
@@ -21,7 +21,7 @@ once (restart backboardd after). Default 7: bit 8 off at boot until proven
  2 files changed, 63 insertions(+), 13 deletions(-)
 
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index 0059c96..11b4d5d 100644
+index 0059c96..4ce7789 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -1889,8 +1889,23 @@ extern uint32_t sweet_fb_hz;
@@ -46,7 +46,7 @@ index 0059c96..11b4d5d 100644
 +}
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_bl_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bl_fix, "I",
 +    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; "
-+    "1100/1101: 8 backlight-calibration-parameters (live; restart backboardd)"); 1100: 8 backlight-calibration-parameters (at boot)");
++    "1100/1101: 8 backlight-calibration-parameters (live; restart backboardd)");
  SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
      "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
  SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
