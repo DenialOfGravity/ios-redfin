@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <map>
@@ -6119,4 +6120,235 @@ TEST(an_extended_range_target_is_drawn_through_its_companion_and_written_back) {
         CHECK(same);
         if (!same) std::fprintf(stderr, "  %s: decode then write-back changed the codes\n", u->info().name);
     }
+}
+
+// (redfin hmyc) HM_YCBCR=native: the processor's conversion (the GPU kernel's integers, ycbcr_decode.ll) against a
+// floating-point reference over every (Y, Cb, Cr) of each matrix and range: within 1 LSB, alpha 255; 540 the planes
+TEST(the_ycbcr_conversion_is_within_one_lsb_of_the_reference) {
+    for (int mode = 0; mode < 4; mode++) {
+        const int matrix = 1 + (mode & 1);
+        const bool full = (mode & 2) != 0;
+        const double kr = matrix == 2 ? 0.2126 : 0.299, kb = matrix == 2 ? 0.0722 : 0.114, kg = 1 - kr - kb;
+        int worst = 0;
+        uint64_t over = 0;
+        uint8_t luma[2], chroma[2], out[8];
+        for (int y = 0; y < 256; y++) {
+            for (int cb = 0; cb < 256; cb++) {
+                for (int cr = 0; cr < 256; cr++) {
+                    luma[0] = uint8_t(y), luma[1] = uint8_t(255 - y), chroma[0] = uint8_t(cb), chroma[1] = uint8_t(cr);
+                    Texture::ycbcrConvertRows(luma, 2, chroma, 2, 1, 1, matrix, full, false, out, 8);
+                    const double yy = full ? y : (y - 16) * 255.0 / 219.0, s = full ? 1.0 : 255.0 / 224.0;
+                    const double R = yy + 2 * (1 - kr) * (cr - 128) * s, B = yy + 2 * (1 - kb) * (cb - 128) * s, G = (yy - kr * R - kb * B) / kg;
+                    const double want[3] = {R, G, B};
+                    for (int c = 0; c < 3; c++) {
+                        const double v = std::floor(want[c] + 0.5);
+                        const int e = v < 0 ? 0 : v > 255 ? 255 : int(v);
+                        const int d = std::abs(int(out[c]) - e);
+                        worst = std::max(worst, d);
+                        if (d > 1) over++;
+                    }
+                    if (out[3] != 255) over++;
+                }
+            }
+        }
+        CHECK(worst <= 1);
+        CHECK_EQ(over, 0u);
+    }
+    // 540: R Cr, G Y, B Cb; a 2x2 block shares its chroma pair (4:2:0), the next pair the next block
+    const uint8_t l[8] = {10, 20, 30, 40, 50, 60, 70, 80}, c[4] = {100, 200, 101, 201};
+    uint8_t o[32];
+    Texture::ycbcrConvertRows(l, 4, c, 4, 4, 2, 1, true, true, o, 16);
+    CHECK_EQ(o[0], 200u);
+    CHECK_EQ(o[1], 10u);
+    CHECK_EQ(o[2], 100u);
+    CHECK_EQ(o[4 + 1], 20u);
+    CHECK_EQ(o[4 + 0], 200u);
+    CHECK_EQ(o[8 + 0], 201u);
+    CHECK_EQ(o[8 + 2], 101u);
+    CHECK_EQ(o[16 + 4 + 1], 60u);   // row 1 takes row 0's chroma
+    CHECK_EQ(o[16 + 4 + 0], 200u);
+    CHECK_EQ(o[3], 255u);
+    // the coefficients are BT.601 full range's familiar ones in 16.16 (1.402, 0.344136, 0.714136, 1.772)
+    int32_t k[6];
+    Texture::ycbcrCoefficients(1, true, k);
+    CHECK_EQ(k[0], 65536);
+    CHECK_EQ(k[1], 91881);
+    CHECK_EQ(k[4], 116130);
+    CHECK_EQ(k[5], 0);
+    Texture::ycbcrCoefficients(2, false, k);
+    CHECK_EQ(k[0], 76309);
+    CHECK_EQ(k[5], 16);
+}
+
+// (redfin hmyc) a known NV12 picture through both paths: a draw samples the RGBA8 copy in the two-plane texture's place,
+// decoded once on the GPU in a buffer of its own sent first (or, without a compiler, on the processor -- the same
+// bytes); a second buffer takes the copy as it is until the surface's generation moves
+TEST(a_ycbcr_surface_is_sampled_through_its_decoded_copy) {
+    CommandBuffer::setYcbcrGpuForTesting(1);
+    struct Back { ~Back() { CommandBuffer::setYcbcrGpuForTesting(-1); } } back;
+    Rig r;
+    const uint32_t k420v = 0x34323076u, W = 36, H = 10, row = 64;
+    r.fake->addSurface(41, W, H, row, k420v, 0, 2);
+    Texture::Ycbcr yc;
+    yc.matrix = 1;
+    yc.full = false;
+    yc.lumaOffset = 0;
+    yc.lumaRow = row;
+    yc.chromaOffset = uint64_t(row) * H;
+    yc.chromaRow = row;
+    std::string why;
+    auto x = Texture::wrapSurfaceYcbcr(*r.gpu, 41, W, H, yc, &why);
+    CHECK(x != nullptr);
+    if (x == nullptr) {
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK(x->ycbcrDecoded());
+    CHECK(x->format() == PixelFormat::kYCbCr8_420_2P);
+    // the pattern: a luma ramp, and chroma pairs walking both axes
+    uint8_t* m = static_cast<uint8_t*>(x->buffer()->contents());
+    CHECK(m != nullptr);
+    if (m == nullptr) return;
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t i = 0; i < W; i++) m[y * row + i] = uint8_t(16 + (i * 7 + y * 13) % 220);
+    for (uint32_t y = 0; y < H / 2; y++)
+        for (uint32_t i = 0; i < W; i += 2) m[yc.chromaOffset + y * row + i] = uint8_t(16 + i * 6 + y), m[yc.chromaOffset + y * row + i + 1] = uint8_t(240 - i * 5 - y * 3);
+    std::vector<uint8_t> want(W * H * 4);
+    Texture::ycbcrConvertRows(m, row, m + yc.chromaOffset, row, W, H, 1, false, false, want.data(), W * 4);
+    auto t = target(r, W, H);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {x.get()};
+    fsb.samplers = {&smp};
+    uint64_t y0[8], y1[8], y2[8];
+    CommandBuffer::ycbcrStats(y0);
+    const uint32_t submits0 = r.fake->stats().submits;
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CommandBuffer::ycbcrStats(y1);
+    bool decode = true;
+    uint64_t gen = 7;
+    auto copy = x->ycbcrCopyFor(*r.gpu, &decode, &gen, &why);
+    CHECK(copy != nullptr && !decode && gen == 0);   // the copy decoded, taken as it is
+    if (hasCompiler()) {
+        CHECK_EQ(y1[0] - y0[0], 1u);   // one GPU decode for the two draws
+        CHECK_EQ(y1[1] - y0[1], 1u);   // in one buffer of its own
+        CHECK_EQ(y1[2] - y0[2], 0u);   // nothing on the processor
+        CHECK_EQ(r.fake->stats().submits - submits0, 2u);
+    } else {
+        CHECK_EQ(y1[0] - y0[0], 0u);
+        CHECK_EQ(y1[2] - y0[2], 1u);   // the processor's conversion
+        // (the fake runs no shader: only the processor's copy has bytes to compare)
+        if (copy != nullptr && copy->contents() != nullptr) {
+            uint64_t bad = 0;
+            for (uint32_t y = 0; y < H; y++)
+                bad += memcmp(static_cast<const uint8_t*>(copy->contents()) + y * copy->bytesPerRow(), want.data() + y * W * 4, W * 4) != 0;
+            CHECK_EQ(bad, 0u);
+        }
+    }
+    copy.reset();
+    // a second buffer: the same copy, no decode
+    auto cb2 = r.queue->commandBuffer();
+    CHECK(cb2->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb2->commit();
+    cb2->waitUntilCompleted();
+    CommandBuffer::ycbcrStats(y2);
+    CHECK_EQ(y2[0] + y2[2], y1[0] + y1[2]);
+    CHECK_EQ(y2[6] - y1[6], 1u);
+    // the surface changed: decoded again, into the other copy
+    x->ycbcrTouch(1);
+    auto cb3 = r.queue->commandBuffer();
+    CHECK(cb3->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb3->commit();
+    cb3->waitUntilCompleted();
+    uint64_t y3[8];
+    CommandBuffer::ycbcrStats(y3);
+    CHECK_EQ((y3[0] + y3[2]) - (y2[0] + y2[2]), 1u);
+    CHECK_EQ(y3[7], y0[7]);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin hmyc) the GPU fallback: HM_YCBCR_GPU=0 converts on the processor, the same bytes as the reference
+TEST(a_ycbcr_surface_falls_back_to_the_processor) {
+    CommandBuffer::setYcbcrGpuForTesting(0);
+    struct Back { ~Back() { CommandBuffer::setYcbcrGpuForTesting(-1); } } back;
+    Rig r;
+    const uint32_t k420f = 0x34323066u, W = 20, H = 6, row = 64;
+    r.fake->addSurface(42, W, H, row, k420f, 0, 2);
+    Texture::Ycbcr yc;
+    yc.matrix = 2;
+    yc.lumaRow = row;
+    yc.chromaOffset = uint64_t(row) * H;
+    yc.chromaRow = row;
+    yc.planes = true;
+    std::string why;
+    auto x = Texture::wrapSurfaceYcbcr(*r.gpu, 42, W, H, yc, &why);
+    CHECK(x != nullptr);
+    if (x == nullptr) return;
+    uint8_t* m = static_cast<uint8_t*>(x->buffer()->contents());
+    for (uint32_t i = 0; i < row * H * 3 / 2; i++) m[i] = uint8_t(i * 29 + 3);
+    auto t = target(r, W, H);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {x.get()};
+    fsb.samplers = {&smp};
+    uint64_t y0[8], y1[8];
+    CommandBuffer::ycbcrStats(y0);
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CommandBuffer::ycbcrStats(y1);
+    CHECK_EQ(y1[0] - y0[0], 0u);
+    CHECK_EQ(y1[2] - y0[2], 1u);
+    bool decode = true;
+    uint64_t gen = 0;
+    auto copy = x->ycbcrCopyFor(*r.gpu, &decode, &gen, &why);
+    CHECK(copy != nullptr && !decode);
+    if (copy != nullptr && copy->contents() != nullptr) {
+        const uint8_t* o = static_cast<const uint8_t*>(copy->contents());
+        CHECK_EQ(o[0], m[yc.chromaOffset + 1]);   // R Cr
+        CHECK_EQ(o[1], m[0]);                     // G Y
+        CHECK_EQ(o[2], m[yc.chromaOffset]);       // B Cb
+        CHECK_EQ(o[3], 255u);
+    }
+}
+
+// (redfin hmyc) what wrapSurfaceYcbcr refuses: rows or starts not a multiple of 4, a plane off the end, a one-plane
+// surface, no matrix
+TEST(a_ycbcr_texture_refuses_planes_the_kernel_cannot_read) {
+    Rig r;
+    r.fake->addSurface(43, 32, 8, 64, 0x34323066u, 0, 2);
+    r.fake->addSurface(44, 32, 8, 128, 0x42475241u);
+    Texture::Ycbcr yc;
+    yc.matrix = 1;
+    yc.lumaRow = 64;
+    yc.chromaOffset = 64 * 8;
+    yc.chromaRow = 64;
+    std::string why;
+    CHECK(Texture::wrapSurfaceYcbcr(*r.gpu, 43, 32, 8, yc, &why) != nullptr);
+    auto refused = [&](uint32_t id, const Texture::Ycbcr& y, const char* want) {
+        std::string w;
+        CHECK(Texture::wrapSurfaceYcbcr(*r.gpu, id, 32, 8, y, &w) == nullptr);
+        CHECK(has(w, want));
+        if (!has(w, want)) std::fprintf(stderr, "  got \"%s\"\n", w.c_str());
+    };
+    Texture::Ycbcr odd = yc;
+    odd.lumaRow = 66;
+    refused(43, odd, "multiples of 4 bytes");
+    Texture::Ycbcr off = yc;
+    off.chromaOffset = 1 << 20;
+    refused(43, off, "inside the surface");
+    refused(44, yc, "two-plane '420f' or '420v' surface");
+    Texture::Ycbcr none = yc;
+    none.matrix = 0;
+    refused(43, none, "BT.601 (1) or BT.709 (2)");
 }

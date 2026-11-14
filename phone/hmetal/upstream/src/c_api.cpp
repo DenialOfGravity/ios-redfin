@@ -291,6 +291,20 @@ void hakios_metal_xr_stats(unsigned long long out[10]) {
     for (int i = 0; i < 10; i++) out[i] = v[i];
 }
 
+void hakios_metal_ycbcr_stats(unsigned long long out[8]) {
+    uint64_t v[8];
+    CommandBuffer::ycbcrStats(v);
+    for (int i = 0; i < 8; i++) out[i] = v[i];
+}
+
+int hakios_metal_ycbcr_mode(void) { return Texture::ycbcrMode(); }
+
+void hakios_metal_ycbcr_convert(const void* luma, uint64_t lumaRow, const void* chroma, uint64_t chromaRow, unsigned width, unsigned height,
+                                unsigned matrix, int full, int planes, void* out, uint64_t outRow) {
+    Texture::ycbcrConvertRows(static_cast<const uint8_t*>(luma), lumaRow, static_cast<const uint8_t*>(chroma), chromaRow, width, height, int(matrix),
+                              full != 0, planes != 0, static_cast<uint8_t*>(out), outRow);
+}
+
 void hakios_metal_xr_gpu_stats(unsigned long long out[6]) {
     uint64_t v[6];
     CommandBuffer::xrGpuStats(v);
@@ -639,6 +653,31 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d
                                                           unsigned height, unsigned usage, uint64_t chromaOffset, unsigned chromaRowBytes) {
     const Texture::SurfacePlane chroma{chromaOffset, chromaRowBytes};
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, &chroma);
+}
+
+hakios_metal_texture* hakios_metal_texture_new_ycbcr(hakios_metal_device* d, unsigned surfaceId, unsigned width, unsigned height, uint64_t lumaOffset,
+                                                     unsigned lumaRow, uint64_t chromaOffset, unsigned chromaRow, unsigned matrix, int full, int planes) {
+    Texture::Ycbcr yc;
+    yc.matrix = uint8_t(matrix > 255 ? 0 : matrix);
+    yc.full = full != 0;
+    yc.planes = planes != 0;
+    yc.lumaOffset = lumaOffset;
+    yc.lumaRow = lumaRow;
+    yc.chromaOffset = chromaOffset;
+    yc.chromaRow = chromaRow;
+    std::string why;
+    std::shared_ptr<Texture> t = Texture::wrapSurfaceYcbcr(*d->gpu, surfaceId, width, height, yc, &why);
+    if (t == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(t);
+    return r;
+}
+
+void hakios_metal_texture_ycbcr_touch(hakios_metal_texture* t, uint64_t gen) {
+    if (t != nullptr && t->texture != nullptr) t->texture->ycbcrTouch(gen);
 }
 
 hakios_metal_texture* hakios_metal_texture_new_buffer(hakios_metal_buffer* b, unsigned type, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage,

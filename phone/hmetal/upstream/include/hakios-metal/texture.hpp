@@ -409,6 +409,45 @@ public:
     static int xrRenderMode();   // HM_XR_RT: 1 (default) draw through the companion, 0 refuse as before
     static int xrWriteBackMode();   // HM_XR_WB: 1 (default) write back at completion, 0 never (the companion stays live)
 
+    // (redfin hmyc) HM_YCBCR=native (the default; cpu: the plug-in's processor copy, as before): a two-plane '420f' /
+    // '420v' surface sampled as Metal's YCbCr8_420_2P (500, CoreAnimation's photos and video frames) or RGB8_420_2P (540,
+    // VideoToolbox's live wallpaper frames). Apple's texture unit converts YCbCr to RGB as it samples and CoreAnimation's
+    // fixed_frag takes a 500 sample as the colour (its own fc_has_ycbcr_matrix path is for two textures of the planes,
+    // not for this format); the A6xx TP returns (Y, Cb, Cr) raw. So a draw samples, in the texture's place, an RGBA8
+    // copy that the ycbcr_decode kernel (tools/kernels/ycbcr_decode.ll) converts on the GPU straight from the surface's
+    // two planes, in a buffer of its own sent just before the drawing one (as HM_XR_GPU). The copy is kept and decoded
+    // again only when the plug-in says the surface changed (ycbcrTouch, its seed): a still picture is converted once.
+    struct Ycbcr {
+        uint8_t matrix = 0;        // 1 BT.601, 2 BT.709 (0: not such a texture)
+        bool full = true;          // full range ('420f'), else video range ('420v': luma 16-235, chroma 16-240)
+        bool planes = false;       // 540: the planes as they are, R Cr, G Y, B Cb (VideoToolbox applies the matrix itself)
+        uint64_t lumaOffset = 0, chromaOffset = 0;   // in the surface's memory
+        uint32_t lumaRow = 0, chromaRow = 0;
+    };
+    // the texture over surface SURFACEID's two planes; refused (WHY) unless both planes lie in the surface with rows and
+    // starts that are multiples of 4 bytes (the kernel reads words) and rows that hold the width
+    static std::shared_ptr<Texture> wrapSurfaceYcbcr(Gpu& gpu, uint32_t surfaceId, uint32_t width, uint32_t height, const Ycbcr& yc,
+                                                     std::string* why);
+    bool ycbcrDecoded() const { return yc_.matrix != 0; }
+    const Ycbcr& ycbcr() const { return yc_; }
+    // the surface's contents are GEN now (the plug-in's IOSurface seed): the next draw decodes again if it moved
+    void ycbcrTouch(uint64_t gen) const;
+    // the copy a draw samples: the last one decoded, if it is of the surface's GEN (DECODE false), else one no buffer in
+    // flight holds, to be decoded at commit (DECODE true, GEN the generation it will hold)
+    std::shared_ptr<Texture> ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t* gen, std::string* why) const;
+    // a decode of GEN into COPY was sent (or done on the processor): later draws take COPY without decoding
+    void ycbcrDone(const std::shared_ptr<Texture>& copy, uint64_t gen) const;
+    // the processor's decode into COPY (the GPU's fallback): the same integers as the kernel, bit for bit
+    bool ycbcrDecodeInto(Texture& copy) const;
+    // 16.16 fixed point {Y scale, Cr->R, Cb->G, Cr->G, Cb->B, luma offset} of MATRIX (1 BT.601, 2 BT.709) and range
+    static void ycbcrCoefficients(int matrix, bool full, int32_t k[6]);
+    // the conversion itself, by rows (4:2:0, nearest chroma), into RGBA8 OUT: ycbcr_decode's arithmetic on the processor;
+    // also the plug-in's HM_YCBCR=cpu copy, so both paths draw the same bytes
+    static void ycbcrConvertRows(const uint8_t* luma, uint64_t lumaRow, const uint8_t* chroma, uint64_t chromaRow, uint32_t width,
+                                 uint32_t height, int matrix, bool full, bool planes, uint8_t* out, uint64_t outRow);
+    // HM_YCBCR: 1 native (default), 0 cpu (the plug-in reads it; the core serves wrapSurfaceYcbcr either way)
+    static int ycbcrMode();
+
 private:
     static std::shared_ptr<Texture> wrapTwoPlanes(std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const std::string& name, const TextureDesc& desc,
                                                   const FormatInfo* info, const SurfacePlane* chroma, std::string* why);
@@ -438,6 +477,12 @@ private:
     mutable std::atomic<uint32_t> xrNext_{0};
     mutable std::shared_ptr<XrTarget> xrTarget_;   // (redfin hmv4) xrTarget's, under xrLock()
     void xrDecodeInto(uint8_t* out, uint64_t outPitch) const;   // the rows decoded as RGBA16Float texels
+    Ycbcr yc_;                                       // (redfin hmyc) wrapSurfaceYcbcr's
+    mutable std::mutex ycLock_;
+    mutable uint64_t ycGen_ = 0;                     // the surface's contents (ycbcrTouch)
+    mutable std::shared_ptr<Texture> ycCopy_[2];     // the copies decoded into, by turns
+    mutable int ycDoneSlot_ = -1;                    // the slot decoded last (sent), and of which generation
+    mutable uint64_t ycDoneGen_ = 0;
 public:
     const Texture* staging() const { return staging_.get(); }
     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in

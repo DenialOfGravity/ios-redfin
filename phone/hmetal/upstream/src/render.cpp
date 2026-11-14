@@ -26,6 +26,7 @@
 #include "hakios-metal/compiler.hpp"
 #include "hakios-metal/texture.hpp"
 #include "../tests/fixtures/xr_decode_bc.hpp"   // (redfin hmv11) HM_XR_GPU's kernel
+#include "../tests/fixtures/ycbcr_decode_bc.hpp"   // (redfin hmyc) HM_YCBCR=native's kernel
 
 namespace hakios::metal {
 
@@ -3112,6 +3113,44 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             }
         }
     }
+    // (redfin hmyc) a two-plane YCbCr surface (Texture::wrapSurfaceYcbcr, HM_YCBCR=native) is sampled through its RGBA8
+    // copy: decoded on the GPU at commit (ycbcrDecodeDeferred) when the surface changed since the copy was decoded, else
+    // that copy as it is. Once per buffer and texture.
+    Bindings vsYc, fsYc;
+    for (const auto& [with, at] : {std::pair<Bindings*, const Bindings**>{&vsYc, &vsIn}, {&fsYc, &fsIn}}) {
+        const Bindings* given = *at;
+        for (size_t i = 0; i < given->textures.size(); i++) {
+            const Texture* t = given->textures[i];
+            if (t == nullptr || !t->ycbcrDecoded()) continue;
+            const Texture* decoded = nullptr;
+            for (const auto& [src, copy] : ycDecoded_) {
+                if (src == t) decoded = copy.get();
+            }
+            if (decoded == nullptr) {
+                bool decode = false;
+                uint64_t gen = 0;
+                std::shared_ptr<Texture> c = t->ycbcrCopyFor(queue_.gpu(), &decode, &gen, &why);
+                if (c == nullptr) return refuseWork("a two-plane YCbCr texture's RGBA8 copy: " + why);
+                keepAlive(c);
+                if (decode) {
+                    YcLate l;
+                    l.source = Texture::byResourceId(t->resourceId());
+                    l.copy = c;
+                    l.gen = gen;
+                    ycLate_.push_back(std::move(l));
+                } else {
+                    ycbcrCountReuse();
+                }
+                ycDecoded_.emplace_back(t, c);
+                decoded = c.get();
+            }
+            if (*at != with) {
+                *with = **at;
+                *at = with;
+            }
+            with->textures[i] = decoded;
+        }
+    }
     const Bindings& vsBindings = *vsIn;
     const Bindings& fsBindings = *fsIn;
     // A compressed texture whose rows this processor changed since the GPU last copied them in (Texture::staging): the
@@ -3789,6 +3828,176 @@ std::shared_ptr<CommandBuffer> CommandBuffer::xrDecodeDeferred() {
         l.decoded = l.source->xrDecodeLate(*l.copy, xrCheckOn() ? &l.sum : nullptr);
     }
     if (!xrCheckOn()) xrLate_.clear();
+    return pre;
+}
+
+// (redfin hmyc) HM_YCBCR=native: ycbcr_decode compiled once a process (nullptr: no compiler, or it refused -- said once)
+namespace {
+// [0] decodes on the GPU, [1] decode buffers sent, [2] decodes on the processor (no kernel / a dispatch refused / no
+// parameters page), [3] GPU decodes checked (HM_YCBCR_VERIFY), [4] of them that differed, [5] microseconds encoding,
+// [6] draws that took a copy decoded before (no decode), [7] copies the processor could not decode either
+std::atomic<uint64_t> gYc[8];
+std::atomic<int> gYcGpuForce{-1};
+bool ycbcrGpuOn() {
+    static const bool on = [] { const char* e = getenv("HM_YCBCR_GPU"); return e == nullptr || e[0] != '0'; }();
+    const int f = gYcGpuForce.load();
+    return f < 0 ? on : f != 0;
+}
+uint32_t ycbcrVerifyCount() {
+    static const uint32_t n = [] { const char* e = getenv("HM_YCBCR_VERIFY"); return e != nullptr && e[0] != 0 ? uint32_t(strtoul(e, nullptr, 0)) : 2u; }();
+    return n;
+}
+const CompiledKernel* ycKernel() {
+    static std::mutex m;
+    static CompiledKernel* made = nullptr;
+    static bool tried = false;
+    std::lock_guard<std::mutex> g(m);
+    if (tried) return made;
+    tried = true;
+    std::string why;
+    if (!hasCompiler()) {
+        render::notify("HM_YCBCR: no shader compiler in this build; two-plane YCbCr surfaces converted on the processor");
+        return nullptr;
+    }
+    std::unique_ptr<CompiledKernel> k = compileAir(kernels::ycbcr_decode_bc, sizeof kernels::ycbcr_decode_bc, &why);
+    if (k == nullptr) {
+        render::notify("HM_YCBCR: ycbcr_decode refused by the compiler (" + why + "); two-plane YCbCr surfaces converted on the processor");
+        return nullptr;
+    }
+    render::notify("HM_YCBCR: ycbcr_decode compiled (" + std::to_string(k->kernel.numWords) + " words, " + std::to_string(k->resources.size()) +
+                   " resources); two-plane YCbCr surfaces converted on the GPU from their planes, ordered on the ring");
+    made = k.release();
+    return made;
+}
+}  // namespace
+
+void CommandBuffer::ycbcrCountReuse() { gYc[6]++; }
+void CommandBuffer::setYcbcrGpuForTesting(int on) { gYcGpuForce = on; }
+void CommandBuffer::ycbcrStats(uint64_t out[8]) {
+    for (int i = 0; i < 8; i++) out[i] = gYc[i].load();
+}
+
+// (redfin hmyc) the two-plane YCbCr copies this buffer's draws sample, decoded by ycbcr_decode in a buffer of their own
+// that the queue sends just before this one (the one kernel ring runs it after every write submitted before, and this
+// buffer's draws after it); whatever could not go to the GPU is converted here, on the processor, the same integers
+std::shared_ptr<CommandBuffer> CommandBuffer::ycbcrDecodeDeferred() {
+    if (ycLate_.empty()) return nullptr;
+    const uint64_t t0 = queue_.gpu().transport().nowNs();
+    std::shared_ptr<CommandBuffer> pre;
+    const CompiledKernel* yk = ycbcrGpuOn() ? ycKernel() : nullptr;
+    for (YcLate& l : ycLate_) {
+        if (yk == nullptr || l.source == nullptr || l.copy == nullptr) break;
+        const Texture& src = *l.source;
+        const Texture& dst = *l.copy;
+        const Texture::Ycbcr& yc = src.ycbcr();
+        if (src.buffer() == nullptr || dst.buffer() == nullptr || dst.compressed() || dst.bytesPerRow() % 4 != 0 || dst.width() < src.width() ||
+            dst.height() < src.height() || yc.matrix == 0) {
+            continue;
+        }
+        if (pre == nullptr) {
+            pre = queue_.commandBuffer();
+            std::string why;
+            std::shared_ptr<Buffer> params = queue_.takeBuffer(4096, &why);
+            if (params == nullptr || params->contents() == nullptr) {
+                pre = nullptr;
+                break;
+            }
+            pre->paramsYc_ = params;
+        }
+        // each dispatch its own 64 bytes of the parameters' page (64 a page: a frame has one or two)
+        const uint64_t at = 64ull * pre->paramsYcUsed_;
+        if (at + 64 > pre->paramsYc_->length()) continue;
+        pre->paramsYcUsed_++;
+        // the surface bound from the 64-byte line where its first plane starts (a storage buffer's start is 64-aligned);
+        // the planes as word offsets from there
+        const uint64_t base = std::min(yc.lumaOffset, yc.chromaOffset) & ~uint64_t(63);
+        int32_t p[16] = {int32_t(src.width()), int32_t(src.height()), int32_t((yc.lumaOffset - base) / 4), int32_t(yc.lumaRow / 4),
+                         int32_t((yc.chromaOffset - base) / 4), int32_t(yc.chromaRow / 4), int32_t(dst.bytesPerRow() / 4), yc.planes ? 1 : 0};
+        Texture::ycbcrCoefficients(yc.matrix, yc.full, p + 8);
+        memcpy(static_cast<uint8_t*>(pre->paramsYc_->contents()) + at, p, sizeof p);
+        const uint64_t dstOff = dst.gpuAddress() - dst.buffer()->gpuAddress();
+        std::vector<Binding> b(3);
+        b[0] = Binding{pre->paramsYc_.get(), at};
+        b[1] = Binding{src.buffer().get(), base};
+        b[2] = Binding{dst.buffer().get(), dstOff};
+        const uint32_t local[3] = {8, 8, 1};
+        const uint32_t groups[3] = {((src.width() + 3) / 4 + 7) / 8, (src.height() + 7) / 8, 1};
+        if (!pre->dispatch(yk->kernel, groups, local, b)) {
+            static std::atomic<uint32_t> said{0};
+            if (said.fetch_add(1) < 8) render::notify("HM_YCBCR: ycbcr_decode dispatch refused (" + pre->error() + "); converted on the processor");
+            // (a buffer in error sends nothing: every surface of this one goes to the processor)
+            pre = nullptr;
+            break;
+        }
+        pre->keep(src.buffer());
+        pre->keep(dst.buffer());
+        pre->keepAlive(l.source);
+        pre->keepAlive(l.copy);
+        l.gpu = true;
+    }
+    if (pre != nullptr && pre->counts().dispatches == 0) pre = nullptr;
+    if (pre == nullptr) {
+        for (YcLate& l : ycLate_) l.gpu = false;
+    } else {
+        gYc[1]++;
+        std::vector<std::pair<std::shared_ptr<const Texture>, std::shared_ptr<Texture>>> verify;
+        for (YcLate& l : ycLate_) {
+            if (!l.gpu) continue;
+            gYc[0]++;
+            static std::atomic<uint32_t> verified{0};
+            if (verified.load() < ycbcrVerifyCount() && verified.fetch_add(1) < ycbcrVerifyCount()) verify.emplace_back(l.source, l.copy);
+        }
+        CommandQueue* q = &queue_;
+        pre->addCompletedHandler([q, verify](CommandBuffer& cb) {
+            if (cb.status() == kCompleted) {
+                // (redfin hmyc) HM_YCBCR_VERIFY=N (default 2): the first N GPU decodes against the processor's conversion
+                // of the surface as it is now (a decoder that wrote it again since shows as a difference)
+                for (const auto& [s, c] : verify) {
+                    const Texture::Ycbcr& yc = s->ycbcr();
+                    std::vector<uint8_t> want(uint64_t(s->width()) * s->height() * 4);
+                    Texture& cc = *c;
+                    const uint8_t* got = static_cast<const uint8_t*>(cc.contents());
+                    const uint8_t* base = s->buffer() != nullptr ? static_cast<const uint8_t*>(s->buffer()->contents()) : nullptr;
+                    if (got == nullptr || base == nullptr) continue;
+                    Texture::ycbcrConvertRows(base + yc.lumaOffset, yc.lumaRow, base + yc.chromaOffset, yc.chromaRow, s->width(), s->height(),
+                                              yc.matrix, yc.full, yc.planes, want.data(), uint64_t(s->width()) * 4);
+                    uint64_t bad = 0, worst = 0;
+                    for (uint32_t y = 0; y < s->height(); y++) {
+                        const uint8_t* g = got + uint64_t(y) * cc.bytesPerRow();
+                        const uint8_t* w = want.data() + uint64_t(y) * s->width() * 4;
+                        for (uint64_t i = 0; i < uint64_t(s->width()) * 4; i++) {
+                            const uint64_t d = g[i] > w[i] ? g[i] - w[i] : w[i] - g[i];
+                            if (d != 0) bad++;
+                            if (d > worst) worst = d;
+                        }
+                    }
+                    gYc[3]++;
+                    if (bad != 0) gYc[4]++;
+                    render::notify("HM_YCBCR_VERIFY: surface " + render::n(s->surface()) + " (" + render::n(s->width()) + "x" + render::n(s->height()) +
+                                   (yc.planes ? " planes" : yc.matrix == 2 ? " BT.709" : " BT.601") + (yc.full ? " full" : " video") + "): " +
+                                   std::to_string(bad) + " of " + std::to_string(uint64_t(s->width()) * s->height() * 4) +
+                                   " bytes differ from the processor's conversion, worst " + std::to_string(worst) +
+                                   (bad != 0 ? " (or the surface was written again since)" : ""));
+                }
+            } else {
+                render::notify("HM_YCBCR: the decode buffer failed: " + cb.error());
+            }
+            q->giveBuffer(std::move(cb.paramsYc_));
+        });
+    }
+    for (YcLate& l : ycLate_) {
+        if (l.source == nullptr || l.copy == nullptr) continue;
+        if (!l.gpu) {
+            gYc[2]++;
+            if (!l.source->ycbcrDecodeInto(*l.copy)) {
+                gYc[7]++;
+                continue;
+            }
+        }
+        l.source->ycbcrDone(l.copy, l.gen);
+    }
+    ycLate_.clear();
+    gYc[5] += (queue_.gpu().transport().nowNs() - t0) / 1000;
     return pre;
 }
 

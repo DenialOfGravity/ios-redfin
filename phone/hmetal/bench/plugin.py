@@ -55,6 +55,10 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
   - (hmv12) HM_SHADOW_WAIT=1 (default; HM_SHADOW_WAIT_MS=250): a copy of an unaligned surface's rows is not rewritten by
     the processor while a committed buffer still reads or draws it (the refresh waits; an unmoved-seed HM_SHADOW_FRESH
     refresh is put off instead), and a write-back is deferred to a later committed writer; 0 = as before
+  - (hmyc) HM_YCBCR=native (default) | cpu: '420f'/'420v' surfaces sampled as 500/540 are wrapped over both planes
+    (hakios_metal_texture_new_ycbcr) and converted to RGBA8 on the GPU by the core (ycbcr_decode), only when the seed moves;
+    the processor copy (cpu, or planes the kernel cannot read) uses the core's integers; one matrix rule (hm_ycbcr_kind:
+    attachment, else HD '420v' BT.709, else BT.601); YCbCr counts in the surfaces line
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -1736,6 +1740,148 @@ EDITS = [
      '\t\t\t\t\tswas = sw, uwas = us, cutwas = cut, dwas = d, pwas = po;\n'
      '\t\t\t\t}\n'
      '\t\t\t\tmemcpy(xwas, xr, sizeof(xwas));\n\t\t\t\tcwas = copies, fwas = forced;\n'),
+]
+
+# (redfin hmyc) HM_YCBCR=native (default) | cpu: a two-plane '420f' / '420v' surface sampled as 500 (CoreAnimation's photos,
+# the HEIC wallpaper, video frames) or 540 (VideoToolbox's live wallpaper frames) is no longer converted to RGBA8 on the
+# processor (24-68 ms a 1080x1920 frame, h6): the core wraps both planes (hakios_metal_texture_new_ycbcr) and a draw
+# samples an RGBA8 copy the GPU converts from them (ycbcr_decode), again only when the surface's seed moves. Planes the
+# kernel cannot read (rows or starts not a multiple of 4 bytes), or HM_YCBCR=cpu, keep the processor copy, which now uses
+# the core's integers (hakios_metal_ycbcr_convert) so both paths draw the same bytes. The matrix: the surface's
+# IOSurfaceYCbCrMatrix attachment as before, and without one (SweetSurface drops values) an HD '420v' picture (a decoder's,
+# 1280x720 and up) is BT.709, as CoreVideo tags those and SweetMetal2 reads them; everything else BT.601 as before.
+EDITS += [
+    ('\tMTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */\n',
+     '\tMTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */\n'
+     '\tBOOL _ycbcrNative;                  /* (redfin hmyc) HM_YCBCR=native: the core converts on the GPU (no copy here) */\n'
+     '\tuint32_t _ycbcrSeed;                /* (redfin hmyc) ... the surface seed it was last told */\n'),
+    ('- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;\n',
+     '- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;\n'
+     '- (void)hakiosYCbCrNative:(IOSurfaceRef)surface format:(MTLPixelFormat)format;   /* (redfin hmyc) */\n'),
+    ('- (MTLPixelFormat)pixelFormat       { return _ycbcr != 0 ? _ycbcrFormat : (MTLPixelFormat)hakios_metal_texture_format(_texture); }',
+     '- (MTLPixelFormat)pixelFormat       { return _ycbcr != 0 || _ycbcrNative ? _ycbcrFormat : (MTLPixelFormat)hakios_metal_texture_format(_texture); }'),
+    ('\t\thakios_metal_texture *copy = NULL;\n\t\tif (hm_compress_ok() && [descriptor width] * [descriptor height] >= 65536) {\n',
+     '\t\t/* (redfin hmyc) HM_YCBCR=native (default): no copy on the processor -- the core\'s texture over both planes, which\n'
+     '\t\t * draws sample through an RGBA8 copy the GPU converts from them (ycbcr_decode), again only when the seed moves.\n'
+     '\t\t * HM_YCBCR=cpu, or planes the kernel cannot read: the RGBA8 copy below. */\n'
+     '\t\tif (hakios_metal_ycbcr_mode() == 1) {\n'
+     '\t\t\tint matrix = 1, full = 1;\n'
+     '\t\t\tconst uint8_t *b0 = IOSurfaceGetBaseAddress(surface), *p0 = IOSurfaceGetBaseAddressOfPlane(surface, 0),\n'
+     '\t\t\t\t      *p1 = IOSurfaceGetBaseAddressOfPlane(surface, 1);\n'
+     '\t\t\thakios_metal_texture *yt = NULL;\n\n'
+     '\t\t\thm_ycbcr_kind(surface, &matrix, &full);\n'
+     '\t\t\tif (b0 != NULL && p0 != NULL && p1 != NULL && p0 >= b0 && p1 >= b0) {\n'
+     '\t\t\t\tyt = hakios_metal_texture_new_ycbcr(_gpu, IOSurfaceGetID(surface), (unsigned)[descriptor width], (unsigned)[descriptor height],\n'
+     '\t\t\t\t\t\t\t\t     (uint64_t)(p0 - b0), (unsigned)IOSurfaceGetBytesPerRowOfPlane(surface, 0),\n'
+     '\t\t\t\t\t\t\t\t     (uint64_t)(p1 - b0), (unsigned)IOSurfaceGetBytesPerRowOfPlane(surface, 1),\n'
+     '\t\t\t\t\t\t\t\t     (unsigned)matrix, full, [descriptor pixelFormat] == 540);\n'
+     '\t\t\t}\n'
+     '\t\t\tif (yt != NULL) {\n'
+     '\t\t\t\tHM_ONCE("a two-plane YCbCr surface sampled as format %lu is converted on the GPU from its planes, again when the "\n'
+     '\t\t\t\t\t"surface changes (HM_YCBCR=native)\\n", (unsigned long)[descriptor pixelFormat]);\n'
+     '\t\t\t\tt = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:yt descriptor:descriptor usage:MTLTextureUsageShaderRead];\n'
+     '\t\t\t\t[t hakiosYCbCrNative:surface format:[descriptor pixelFormat]];\n'
+     '\t\t\t\treturn t;\n'
+     '\t\t\t}\n'
+     '\t\t\t{\n'
+     '\t\t\t\tstatic int said;\n\n'
+     '\t\t\t\tif (said++ < 8) hm_print("HM_YCBCR: surface %u (%lux%lu, planes of %zu and %zu bytes a row) not converted on the GPU: %s; "\n'
+     '\t\t\t\t\t\t\t "an RGBA8 copy on the processor\\n", IOSurfaceGetID(surface), (unsigned long)[descriptor width],\n'
+     '\t\t\t\t\t\t\t (unsigned long)[descriptor height], IOSurfaceGetBytesPerRowOfPlane(surface, 0),\n'
+     '\t\t\t\t\t\t\t IOSurfaceGetBytesPerRowOfPlane(surface, 1), hakios_metal_error());\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t\thakios_metal_texture *copy = NULL;\n\t\tif (hm_compress_ok() && [descriptor width] * [descriptor height] >= 65536) {\n'),
+    # the matrix and range, one rule for both paths
+    ('\tCFTypeRef matrix = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceYCbCrMatrix"));\n\n\t_ycbcr = 1;\n',
+     '_ycbcrFull = IOSurfaceGetPixelFormat(surface) != 0x34323076;   /* not \'420v\' */\n',
+     '\tint matrix = 1, full = 1;   /* (redfin hmyc) hm_ycbcr_kind: the native path\'s rule */\n\n'
+     '\thm_ycbcr_kind(surface, &matrix, &full);\n'
+     '\t_ycbcr = matrix;\n'
+     '\t_ycbcrFormat = format;\n'
+     '\t_ycbcrFull = full != 0;\n'),
+    ('- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format\n{\n',
+     '/* (redfin hmyc) the matrix (1 BT.601, 2 BT.709) and range of a two-plane surface: its IOSurfaceYCbCrMatrix attachment\n'
+     ' * when it has one; without (SweetSurface drops values), an HD \'420v\' picture (1280x720 and up, a decoder\'s) BT.709 as\n'
+     ' * CoreVideo tags those and SweetMetal2 takes them, anything else BT.601 (the wallpaper\'s HEIC, the camera\'s 420f).\n'
+     ' * Full range unless \'420v\'. */\n'
+     'static void\n'
+     'hm_ycbcr_kind(IOSurfaceRef surface, int *matrix, int *full)\n'
+     '{\n'
+     '\tCFTypeRef value = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceYCbCrMatrix"));\n'
+     '\tconst BOOL video = IOSurfaceGetPixelFormat(surface) == 0x34323076;   /* \'420v\' */\n\n'
+     '\t*full = !video;\n'
+     '\t*matrix = video && IOSurfaceGetWidth(surface) * IOSurfaceGetHeight(surface) >= 1280 * 720 ? 2 : 1;\n'
+     '\tif (value != NULL) {\n'
+     '\t\tif (CFGetTypeID(value) == CFStringGetTypeID()) {\n'
+     '\t\t\tif (CFStringFind((CFStringRef)value, CFSTR("709"), 0).location != kCFNotFound) *matrix = 2;\n'
+     '\t\t\telse if (CFStringFind((CFStringRef)value, CFSTR("601"), 0).location != kCFNotFound) *matrix = 1;\n'
+     '\t\t}\n'
+     '\t\tCFRelease(value);\n'
+     '\t}\n'
+     '}\n\n'
+     '- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format\n{\n'),
+    ('- (void)hakiosConvertYCbCr\n{\n',
+     '\t(void)hakios_metal_texture_replace(_texture, 0, 0, (unsigned)w, (unsigned)h, rows, (uint64_t)w * 4);\n\tfree(rows);\n}\n',
+     '/* (redfin hmyc) HM_YCBCR=native: the GPU converts at the next draw whenever the surface\'s seed moved (hakiosRefreshShadow\n'
+     ' * tells the core at each bind); nothing is copied here */\n'
+     '- (void)hakiosYCbCrNative:(IOSurfaceRef)surface format:(MTLPixelFormat)format\n'
+     '{\n'
+     '\t[self hakiosSetIOSurface:surface plane:0];\n'
+     '\t_ycbcrNative = YES;\n'
+     '\t_ycbcrFormat = format;\n'
+     '\t_ycbcrSeed = IOSurfaceGetSeed(surface);\n'
+     '\thakios_metal_texture_ycbcr_touch(_texture, _ycbcrSeed);\n'
+     '}\n\n'
+     '/* (redfin hmyc) the core\'s conversion (hakios_metal_ycbcr_convert): the integers ycbcr_decode uses on the GPU, so\n'
+     ' * HM_YCBCR=cpu and native draw the same bytes (nearest chroma, 16.16 fixed point, within 1 LSB of the exact formula);\n'
+     ' * 540 the planes as they are (R Cr, G Y, B Cb) -- VideoToolbox applies the matrix itself */\n'
+     '- (void)hakiosConvertYCbCr\n'
+     '{\n'
+     '\tconst size_t w = hakios_metal_texture_width(_texture), h = hakios_metal_texture_height(_texture);\n'
+     '\tconst uint8_t *luma = IOSurfaceGetBaseAddressOfPlane(_iosurface, 0), *chroma = IOSurfaceGetBaseAddressOfPlane(_iosurface, 1);\n'
+     '\tconst size_t lumaRow = IOSurfaceGetBytesPerRowOfPlane(_iosurface, 0), chromaRow = IOSurfaceGetBytesPerRowOfPlane(_iosurface, 1);\n'
+     '\tconst size_t cw = IOSurfaceGetWidthOfPlane(_iosurface, 1), ch = IOSurfaceGetHeightOfPlane(_iosurface, 1);\n'
+     '\tuint8_t *rows = malloc(w * h * 4);\n\n'
+     '\tif (rows == NULL || luma == NULL || chroma == NULL || cw < (w + 1) / 2 || ch < (h + 1) / 2 || lumaRow < w || chromaRow < 2 * cw) {\n'
+     '\t\tfree(rows);\n'
+     '\t\treturn;\n'
+     '\t}\n'
+     '\thakios_metal_ycbcr_convert(luma, lumaRow, chroma, chromaRow, (unsigned)w, (unsigned)h, (unsigned)_ycbcr, _ycbcrFull ? 1 : 0,\n'
+     '\t\t\t\t   _ycbcrFormat == (MTLPixelFormat)540, rows, (uint64_t)w * 4);\n'
+     '\t(void)hakios_metal_texture_replace(_texture, 0, 0, (unsigned)w, (unsigned)h, rows, (uint64_t)w * 4);\n'
+     '\tfree(rows);\n'
+     '}\n'),
+    ('\t\t[_parent hakiosRefreshShadow];   /* the rows a view reads are its parent\'s, copy included */\n\t\treturn;\n\t}\n',
+     '\t\t[_parent hakiosRefreshShadow];   /* the rows a view reads are its parent\'s, copy included */\n\t\treturn;\n\t}\n'
+     '\tif (_ycbcrNative && _iosurface != NULL) {   /* (redfin hmyc) the GPU converts again at the next draw if the seed moved */\n'
+     '\t\tconst uint32_t ys = IOSurfaceGetSeed(_iosurface);\n\n'
+     '\t\tif (ys != _ycbcrSeed) {\n'
+     '\t\t\t_ycbcrSeed = ys;\n'
+     '\t\t\thakios_metal_texture_ycbcr_touch(_texture, ys);\n'
+     '\t\t}\n'
+     '\t\treturn;\n'
+     '\t}\n'),
+    ('\tchar line[700] = "", line2[1200] = "";   /* (redfin hmv12) 800 -> 1200 */\n',
+     '\tchar line[700] = "", line2[1600] = "";   /* (redfin hmv12) 800 -> 1200; (redfin hmyc) -> 1600 */\n'),
+    ('\t\t\t\t{   /* (redfin hmv12) HM_SHADOW_WAIT */\n',
+     '\t\t\t\t{   /* (redfin hmyc) HM_YCBCR=native */\n'
+     '\t\t\t\t\tstatic unsigned long long ywas[8];\n'
+     '\t\t\t\t\tunsigned long long y[8];\n'
+     '\t\t\t\t\tconst int aty = (int)strlen(line2);\n\n'
+     '\t\t\t\t\thakios_metal_ycbcr_stats(y);\n'
+     '\t\t\t\t\tsnprintf(line2 + aty, sizeof(line2) - (size_t)aty, "; YCbCr GPU decodes %llu in %llu buffers, %.2f ms avg to encode, "\n'
+     '\t\t\t\t\t\t "copies reused %llu, processor %llu, undecoded %llu, verified %llu (%llu differ) (HM_YCBCR)", y[0] - ywas[0],\n'
+     '\t\t\t\t\t\t y[1] - ywas[1], y[1] - ywas[1] ? (double)(y[5] - ywas[5]) / 1e3 / (double)(y[1] - ywas[1]) : 0.0, y[6] - ywas[6],\n'
+     '\t\t\t\t\t\t y[2] - ywas[2], y[7] - ywas[7], y[3] - ywas[3], y[4] - ywas[4]);\n'
+     '\t\t\t\t\tmemcpy(ywas, y, sizeof(ywas));\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\t{   /* (redfin hmv12) HM_SHADOW_WAIT */\n'),
+]
+EDITS += [
+    ('static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));\n',
+     'static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));\n'
+     'static void hm_ycbcr_kind(IOSurfaceRef surface, int *matrix, int *full);   /* (redfin hmyc) */\n'),
 ]
 
 
