@@ -137,6 +137,7 @@ bsd/dev/sweet_abp.c			standard
 bsd/dev/sweet_pdp.c			standard
 bsd/dev/sweet_voice.c			standard
 bsd/dev/sweet_vproxy.c			standard
+bsd/dev/sweet_voicedev.c		standard
 bsd/dev/sweet_bb.c			standard
 bsd/dev/sweet_qmux.c			standard
 bsd/dev/sweet_ssr.c			standard

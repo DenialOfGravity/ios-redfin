@@ -73,6 +73,7 @@ extern void sweet_haptic_init(void);
 extern void sweet_torch_init(void);
 extern void sweet_cam_init(void);
 extern void sweet_audio_init(void);
+extern void sweet_voicedev_init(void);     /* 1091 */
 extern void redwood_adsp_init(void);
 extern void sweet_geniuart_init(void);
 extern void sweet_btbridge_init(void);
@@ -1949,6 +1950,7 @@ sweet_ufs_init(void)
 	sweet_torch_init();	/* redfin flash LED (sweettorch=2): bsd/dev/sweet_torch.c */
 	sweet_cam_init();	/* redfin camera sensors (sweetcam=1/2): bsd/dev/sweet_cam.c */
 	sweet_audio_init();	/* /dev/redwood-audio, /dev/redwood-haptic: bsd/dev/sweet_audio.c */
+	sweet_voicedev_init();	/* 1091: /dev/redwood-voice (idle unless kern.sweet_voice_proxy 2): bsd/dev/sweet_voicedev.c */
 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
 	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
 	sweet_btbridge_init();	/* /dev/cu.bluetooth etc. <-> btd (btbridge=1): bsd/dev/sweet_btbridge.c */

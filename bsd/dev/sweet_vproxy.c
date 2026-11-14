@@ -26,6 +26,11 @@
  * next second's downlink frames lose one 48 kHz frame each, after underruns they gain one; the same for the mic ring
  * (over 60 ms: one sample more consumed per frame, after underruns one less).
  *
+ * 1091: kern.sweet_voice_proxy 2 = the same ports and thread, but the PCM goes to userland: downlink frames to
+ * /dev/redwood-voice's read() (sweet_voicedev_dl) instead of the speakers' call ring, uplink frames from its write()
+ * (sweet_voicedev_ul) instead of the mic ring; the call mode stays on (iOS's own playback in 10 ms periods). The rate
+ * is the one set with REDWOOD_VOICE_SET_RATE, else opts 2 as in mode 1. Nobody on the device: silence both ways.
+ *
  * Log lines: "SWEET VOICE PROXY: ..." (the study's B2 list), 1 s statistics for the first 10 s of a call, then every
  * 10 s, and the totals at the call's end; kern.sweet_voice_proxy_stats (read only) has them too.
  */
@@ -56,6 +61,11 @@ bool sweet_vproxy_run(void);
 void sweet_vproxy_stop(const char *why);
 void sweet_vproxy_dtmf(uint32_t low, uint32_t high);
 uint32_t sweet_vproxy_rate(void);
+/* 1091: mode 2, the call's PCM to/from userland (bsd/dev/sweet_voicedev.c, /dev/redwood-voice) */
+extern void sweet_voicedev_call(bool up, uint32_t rate, int mode);
+extern void sweet_voicedev_dl(const int16_t *s, uint32_t n, uint64_t mach);
+extern void sweet_voicedev_ul(int16_t *out, uint32_t n);
+extern uint32_t sweet_voicedev_rate_wanted(void);
 
 #define SAY(...)                printf("SWEET VOICE PROXY: " __VA_ARGS__)
 
@@ -296,6 +306,9 @@ sweet_vproxy_prepare(int mode, uint32_t opts)
 	bzero(&px.started, sizeof(px.started));
 	px.mode = mode;
 	px.rate = (opts & OPT_8K) ? 8000 : 16000;
+	if (mode == 2 && sweet_voicedev_rate_wanted() != 0) {
+		px.rate = sweet_voicedev_rate_wanted();         /* 1091: the plug-in's REDWOOD_VOICE_SET_RATE */
+	}
 	px.samples = px.rate / 100;
 	px.bytes = px.samples * 2;
 	if (px.va == 0) {
@@ -602,6 +615,10 @@ dl_frame(unsigned slot)
 	}
 	cw.dl_peak = peak > cw.dl_peak ? peak : cw.dl_peak;
 	dtmf_frame(x, n, at);
+	if (px.mode == 2) {
+		sweet_voicedev_dl(x, n, at);    /* 1091: to /dev/redwood-voice, not played here */
+		return;
+	}
 	for (uint32_t i = 0; i < n; i++) {
 		int32_t prev = i ? x[i - 1] : dl_prev;
 
@@ -647,6 +664,20 @@ ul_frame(unsigned slot)
 	uint32_t n = px.samples, f = OUT_RATE / px.rate, need = n * f, take = need, peak = 0;
 	uint64_t written, avail;
 
+	if (px.mode == 2) {
+		int16_t pcm[160];
+
+		sweet_voicedev_ul(pcm, n);      /* 1091: from /dev/redwood-voice (silence when nothing is there) */
+		for (uint32_t i = 0; i < n; i++) {
+			int32_t a = pcm[i] < 0 ? -(int32_t)pcm[i] : pcm[i];
+
+			dst[i] = pcm[i];
+			peak = (uint32_t)a > peak ? (uint32_t)a : peak;
+		}
+		cw.ul_peak = peak > cw.ul_peak ? peak : cw.ul_peak;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		return;
+	}
 	(void)redwood_mic_voice_peek(0, in, 0, &written);       /* (only *written wanted) */
 	if (!ul_primed) {
 		if (written < MIC_KEEP) {
@@ -845,22 +876,28 @@ sweet_vproxy_run(void)
 		redwood_sound_call_state(&a, &b, &c, &d);
 		sound_underruns_seen = c;
 	}
-	if (!heard) {
+	if (!heard && px.mode == 1) {
 		SAY("mode 1: NO PLAYBACK STREAM RUNS (boot-arg sound < 2): the downlink is read but not heard\n");
 	}
 	stop_req = false;
 	thread_runs = true;
 	running = true;
+	if (px.mode == 2) {
+		sweet_voicedev_call(true, px.rate, px.mode);    /* 1091: before the first frame */
+	}
 	if (kernel_thread_start(px_thread, NULL, &thread) != KERN_SUCCESS) {
 		thread_runs = false;
 		running = false;
 		redwood_sound_call_mode(false);
+		if (px.mode == 2) {
+			sweet_voicedev_call(false, 0, 0);
+		}
 		SAY("FALLBACK: no data thread\n");
 		return false;
 	}
 	thread_deallocate(thread);
-	SAY("RUNNING: mode %d, %u Hz mono 16 bit, 10 ms frames; downlink -> speakers' call ring, mic ring -> uplink\n", px.mode,
-	    px.rate);
+	SAY("RUNNING: mode %d, %u Hz mono 16 bit, 10 ms frames; %s\n", px.mode, px.rate, px.mode == 2 ?
+	    "downlink -> /dev/redwood-voice read, its write -> uplink" : "downlink -> speakers' call ring, mic ring -> uplink");
 	return true;
 }
 
@@ -876,6 +913,9 @@ sweet_vproxy_stop(const char *why)
 		}
 		if (thread_runs) {
 			SAY("the data thread did not stop within 500 ms\n");
+		}
+		if (px.mode == 2) {
+			sweet_voicedev_call(false, 0, 0);       /* 1091: a blocked reader returns 0 bytes */
 		}
 		redwood_sound_call_mode(false);
 		{

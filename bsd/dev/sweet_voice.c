@@ -55,6 +55,7 @@
  *     0x2000, endpoint media info 1 ch x 16 bit at the proxy's rate, topology commit, MVM START_VOICE) and the AP's
  *     data path starts. Any failure: back to 0x9001/0x9040 in the same start (switched back, or the session made again
  *     on them), the reason logged ("SWEET VOICE PROXY: FALLBACK ...").
+ *   1091: kern.sweet_voice_proxy 2 = as 1, but the PCM goes through /dev/redwood-voice (bsd/dev/sweet_voicedev.c).
  *   kern.sweet_voice_proxy_opts (bits, 0 default): 1 the CVP created on the proxy ports from the start (no switch);
  *     2 8 kHz instead of 16 kHz; 4 host-PCM probe: one VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory) to the
  *     CVP after START_VOICE, its status logged only (stopped again if it was taken).
@@ -998,16 +999,17 @@ sysctl_voice_proxy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unus
 	if (e != 0 || !changed) {
 		return e;
 	}
-	if (v < 0 || v > 1) {
+	if (v < 0 || v > 2) {
 		return EINVAL;
 	}
 	voice_proxy = v;
 	printf("SWEET VOICE PROXY: kern.sweet_voice_proxy = %d (%s; applies at the next call start%s)\n", v, v == 0 ? "direct path" :
-	    "proxy loopback", voice_state != 0 ? ", the running call keeps its path" : "");
+	    v == 1 ? "proxy loopback" : "proxy PCM via /dev/redwood-voice", voice_state != 0 ? ", the running call keeps its path" : "");
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy, "I",
-    "redfin 1090: 0 direct path (default), 1 the call's CVP on the AFE RT proxy ports, PCM looped through the AP; next call");
+    "redfin 1090/1091: 0 direct path (default), 1 the call's CVP on the AFE RT proxy ports, PCM looped through the AP, 2 the same "
+    "with the PCM through /dev/redwood-voice (userland); next call");
 
 static int
 sysctl_voice_proxy_opts(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
