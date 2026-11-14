@@ -1,8 +1,9 @@
-# /var/local/hmetal/env (hm-int2): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
+# /var/local/hmetal/env (hm-int3): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
 # KEY=V        backboardd's
 # *:KEY=V      every hakios-metal process (backboardd too)
 # NAME:KEY=V   the process NAME (getprogname)
 # Keys HAKIOS_METAL_* and HM_* only. Applied in file order, the last one wins.
+# Only the switches that differ from the build's compiled default are set here; the commented lines are opt-ins.
 
 # backboardd: as on the phone since var12, HM_TRACE now off (1: on; the log rotates at 16 MB -> bbd-hm.log.1)
 HAKIOS_METAL_CA_PICK=exact
@@ -17,3 +18,32 @@ HM_HANG_BLAME=1
 *:HM_CA_DEEP_FB=0
 *:HM_CA_FB_COMPRESSION=0
 *:HM_CA_IOSURFACE_COMPRESSION=0
+
+# (hm-int3) the stage cache's check, for the first days on cache format 2: one stage or kernel in 20 read from the
+# cache, the memo or a seed compiled again in the background and compared ("hm-cache: verify ok N of M" / "STALE").
+# Back to 0 (the compiled default, off) once no STALE line has shown for a few days.
+*:HM_CACHE_VERIFY=20
+
+# (hm-int3) the pre-warm (compiled default 1 in every process that loads QuartzCore's library) in backboardd alone: since
+# hm-int2 every process is on hakios-metal, and N apps re-compiling the same manifests at once after a format change is
+# N times the work for one cache. The other processes find the stages backboardd made.
+*:HM_PREWARM=0
+HM_PREWARM=1
+
+# ---- opt-ins and switches at their compiled default (uncomment to change) ----
+# two-plane YCbCr ('420f'/'420v') surfaces: native = decoded on the GPU by ycbcr_decode (default); cpu = the processor copy
+#*:HM_YCBCR=cpu
+# an unseen configuration of a denied uber shader specialised on the queue, its draws left out meanwhile (default 0: waited for)
+#HM_SPEC_ASYNC=1
+# fold CA's constant scratch config struct (default 0). Part of the cache key: turning it on compiles every stage again
+#HM_SCRATCH_FOLD=1
+# the "compile: pipeline ..." wall/CPU lines (default: on with HM_PROF>=1)
+#HM_COMPILE_LOG=1
+# the pre-warm's start, seconds after QuartzCore's library is loaded (default 60)
+#HM_PREWARM_DELAY=60
+# ca-prof (default off; was on with HM_TRACE)
+#HM_CA_PROF_US=25000
+# the HANG trace: queued + running split, buffers that only queued skipped (default 1; 0: every slow buffer as before)
+#HM_HANG_EXEC=0
+# the cache key: format (default: HAKIOS_METAL_CACHE_FORMAT + the Mesa id) | build (the old key: empty after any core change)
+#HM_CACHE_KEY=build

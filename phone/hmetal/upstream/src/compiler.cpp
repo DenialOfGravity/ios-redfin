@@ -43,6 +43,10 @@ std::string stageCacheFileName(const void*, size_t, const FunctionConstants&, ui
 const char* stageCacheKeyText() { return ""; }
 bool stageManifestRead(const std::string&, StageManifest*) { return false; }
 RewarmCounts stageCacheRewarm(int (*)(void*), void*) { return {}; }
+bool compileManifestEntry(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*) {
+    *why = "no compiler in this build";
+    return false;
+}
 
 std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why, const FunctionConstants&) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
@@ -1274,8 +1278,9 @@ std::string noCompilerText() {
 }
 }  // namespace
 
-std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
+namespace {
+// (redfin hm-int3) one compile of a kernel, no cache; the caller holds the compiler (compileAirFresh's CompileTurn)
+std::unique_ptr<CompiledKernel> compileAirOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
     if (theCompiler() == nullptr) {
         refuse(why, noCompilerText());
         return nullptr;
@@ -1301,6 +1306,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
     out->threadgroupArgBase = t.info.threadgroup_arg_base;
     return out;
 }
+}  // namespace
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
@@ -1353,7 +1359,7 @@ constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
 // bundle swap no longer empties it. A forgotten bump is what HM_CACHE_VERIFY=N is for. HM_CACHE_KEY=build: the old
 // key, the hash of this file, the headers and the Mesa archives (HAKIOS_METAL_CACHE_BUILD), empty after any core change.
 #ifndef HAKIOS_METAL_CACHE_FORMAT
-#define HAKIOS_METAL_CACHE_FORMAT 1
+#define HAKIOS_METAL_CACHE_FORMAT 2   // 2: hm-int3 (ycbcr_decode + hm-cache codegen; kernels cached)
 #endif
 #ifndef HAKIOS_METAL_MESA_ID
 #define HAKIOS_METAL_MESA_ID "unknown-mesa"
@@ -1839,6 +1845,225 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     return chosen;
 }
 
+// ---- (redfin hm-int3) compute kernels in the stage cache (compiler.hpp kKernelCacheTag) ----
+namespace {
+constexpr uint32_t kKernelBlobMagic = 0x4b434d48;   // "HMCK"
+std::string kernelCacheBlob(const CompiledKernel& k) {
+    CacheWriter w;
+    w.u32(kKernelBlobMagic);
+    w.raw(&k.kernel, sizeof(k.kernel));
+    w.u32(uint32_t(k.words.size()));
+    w.raw(k.words.data(), k.words.size() * 4);
+    w.u32(uint32_t(k.immediates.size()));
+    w.raw(k.immediates.data(), k.immediates.size() * 4);
+    w.u32(uint32_t(k.resources.size()));
+    for (const Resource& r : k.resources) {
+        w.u32(uint32_t(r.kind));
+        w.u32(r.index);
+        w.u32(r.sizeBytes);
+        const uint8_t flags[8] = {r.read, r.write, r.irWrite, r.textureDim, r.textureArray, r.element, r.nullTexture, r.inlineSampler};
+        w.raw(flags, sizeof(flags));
+        w.str(r.typeName);
+        w.u32(r.argbufSet);
+        w.u32(r.argbufOffset);
+        w.u32(r.readEnd);
+    }
+    w.u32(uint32_t(k.inlineSamplers.size()));
+    for (const auto& is : k.inlineSamplers) {
+        w.u32(is.first);
+        w.raw(&is.second, sizeof(is.second));
+    }
+    w.u32(k.threadgroupBytes);
+    w.u32(k.hasThreadgroupArg ? 1 : 0);
+    w.u32(k.threadgroupArgBase);
+    w.str(k.name);
+    w.str(k.listing);
+    return w.out;
+}
+// what HM_CACHE_VERIFY compares for a kernel (as stageCacheDigest: code and tables, not pointers or the listing)
+std::string kernelCacheDigest(const CompiledKernel& k) {
+    CacheWriter w;
+    w.u32(uint32_t(k.words.size()));
+    w.raw(k.words.data(), k.words.size() * 4);
+    w.u32(uint32_t(k.immediates.size()));
+    w.raw(k.immediates.data(), k.immediates.size() * 4);
+    for (const Resource& r : k.resources) {
+        w.u32(uint32_t(r.kind));
+        w.u32(r.index);
+        w.u32(r.sizeBytes);
+        w.u32(r.readEnd);
+    }
+    const Kernel& kk = k.kernel;
+    const uint32_t shape[7] = {kk.numWords, kk.numImmediates, kk.pvtmemSize, kk.numSsbos, kk.numTextureSlots, k.threadgroupBytes,
+                               k.threadgroupArgBase};
+    w.raw(shape, sizeof(shape));
+    return w.out;
+}
+std::unique_ptr<CompiledKernel> kernelCacheParse(const std::string& data) {
+    CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
+    auto k = std::make_unique<CompiledKernel>();
+    if (r.u32() != kKernelBlobMagic || !r.raw(&k->kernel, sizeof(k->kernel))) return nullptr;
+    k->words.resize(r.u32());
+    r.raw(k->words.data(), k->words.size() * 4);
+    k->immediates.resize(r.u32());
+    r.raw(k->immediates.data(), k->immediates.size() * 4);
+    k->resources.resize(r.u32());
+    for (Resource& res : k->resources) {
+        res.kind = Resource::Kind(r.u32());
+        res.index = r.u32();
+        res.sizeBytes = r.u32();
+        uint8_t flags[8] = {};
+        r.raw(flags, sizeof(flags));
+        res.read = flags[0], res.write = flags[1], res.irWrite = flags[2], res.textureDim = flags[3];
+        res.textureArray = flags[4], res.element = flags[5], res.nullTexture = flags[6], res.inlineSampler = flags[7];
+        res.typeName = r.str();
+        res.argbufSet = r.u32();
+        res.argbufOffset = r.u32();
+        res.readEnd = r.u32();
+    }
+    k->inlineSamplers.resize(r.u32());
+    for (auto& is : k->inlineSamplers) {
+        is.first = r.u32();
+        r.raw(&is.second, sizeof(is.second));
+    }
+    k->threadgroupBytes = r.u32();
+    k->hasThreadgroupArg = r.u32() != 0;
+    k->threadgroupArgBase = r.u32();
+    k->name = r.str();
+    k->listing = r.str();
+    if (!r.ok || r.p != r.end) return nullptr;
+    k->kernel.words = k->words.data();
+    k->kernel.numWords = uint32_t(k->words.size());
+    k->kernel.immediates = k->immediates.empty() ? nullptr : k->immediates.data();
+    k->kernel.numImmediates = uint32_t(k->immediates.size());
+    k->kernel.name = k->name.c_str();
+    k->kernel.source = "";
+    return k;
+}
+std::unique_ptr<CompiledKernel> kernelCacheLoad(const std::string& path, std::string* blob) {
+    std::string data;
+    if (!readFile(path, &data)) return nullptr;
+    std::unique_ptr<CompiledKernel> k = kernelCacheParse(data);
+    if (k != nullptr && blob != nullptr) *blob = std::move(data);
+    return k;
+}
+std::unique_ptr<CompiledKernel> kernelMemoFind(const std::string& key) {
+    if (!memoOn() || key.empty()) return nullptr;
+    std::shared_ptr<const std::string> blob;
+    {
+        std::lock_guard<std::mutex> g(gMemoLock);
+        auto it = gMemo.find(key);
+        if (it == gMemo.end()) return nullptr;
+        blob = it->second;
+    }
+    return kernelCacheParse(*blob);
+}
+// a compile, no cache, counted as compileStageFresh counts one
+std::unique_ptr<CompiledKernel> compileAirFresh(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+    CompileTurn turn;
+    const uint64_t began = nowNs(), cpu0 = threadCpuNs();
+    std::unique_ptr<CompiledKernel> k = compileAirOnce(bitcode, size, why, constants);
+    tStats.compileNs += nowNs() - began;
+    tStats.cpuNs += threadCpuNs() - cpu0;
+    tStats.misses++;
+    return k;
+}
+// HM_CACHE_VERIFY for a kernel read from the memo, the cache or a seed (verifyLater's counters and words)
+void verifyKernelLater(const std::string& name, const std::string& where, const CompiledKernel& cached, const void* bitcode, size_t size,
+                       const FunctionConstants& constants) {
+    const unsigned every = verifyEvery();
+    if (every == 0 || gVerifyHits.fetch_add(1) % every != 0) return;
+    auto bc = std::make_shared<std::string>(static_cast<const char*>(bitcode), size);
+    auto digest = std::make_shared<std::string>(kernelCacheDigest(cached));
+    const uint32_t words = uint32_t(cached.words.size());
+    const std::string writable = stageCacheWritable(name);
+    const std::string shown = name.empty() ? "kernel " + cached.name : name.substr(1);
+    runDetached([=] {
+        tBackground = true;
+        std::string why;
+        std::unique_ptr<CompiledKernel> fresh = compileAirFresh(bc->data(), bc->size(), &why, constants);
+        const unsigned checked = gVerifyChecked.fetch_add(1) + 1;
+        if (fresh == nullptr) {
+            render::notify("hm-cache: verify " + shown + " (" + where + ", kernel): compiles no more: " + why);
+            return;
+        }
+        if (kernelCacheDigest(*fresh) == *digest) {
+            if (checked <= 8 || checked % 50 == 0)
+                render::notify("hm-cache: verify ok " + std::to_string(checked - gVerifyStale.load()) + " of " + std::to_string(checked) + " (" + where +
+                               ", kernel " + fresh->name + ")");
+            return;
+        }
+        gVerifyStale++;
+        render::notify("hm-cache: STALE " + shown + " (" + where + ", kernel): cached " + std::to_string(words) + " words, compiled now " +
+                       std::to_string(fresh->words.size()) + "; " + std::to_string(gVerifyStale.load()) + " stale of " + std::to_string(checked) +
+                       " checked (bump HAKIOS_METAL_CACHE_FORMAT)");
+        if (!writable.empty()) writeFileAtomically(writable, kernelCacheBlob(*fresh));
+    }, size_t(8) << 20);
+}
+}  // namespace
+
+std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+    const std::string name = stageCacheName(bitcode, size, constants, kKernelCacheTag, nullptr);
+    std::string memoKey = name;
+    if (memoKey.empty() && memoOn()) {
+        Hash128 h;
+        const uint32_t chip[3] = {a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u, kKernelCacheTag};
+        h.mix(chip, sizeof(chip));
+        h.mix(bitcode, size);
+        for (const FunctionConstant& c : constants) {
+            h.mix(&c.index, sizeof(c.index));
+            h.mix(&c.bits, sizeof(c.bits));
+        }
+        memoKey = "/" + h.hex() + ".kernel";
+    }
+    if (std::unique_ptr<CompiledKernel> k = kernelMemoFind(memoKey)) {
+        tStats.hits++;
+        tStats.memoHits++;
+        verifyKernelLater(name, "memo", *k, bitcode, size, constants);
+        return k;
+    }
+    const std::string cached = stageCacheWritable(name);
+    if (!cached.empty()) {
+        std::string blob;
+        if (std::unique_ptr<CompiledKernel> k = kernelCacheLoad(cached, &blob)) {
+            tStats.hits++;
+            memoKeep(memoKey, std::move(blob));
+            verifyKernelLater(name, "cache", *k, bitcode, size, constants);
+            return k;
+        }
+    }
+    if (!name.empty()) {
+        const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+        for (const char* p = seed; p != nullptr && *p != 0;) {
+            const char* colon = strchr(p, ':');
+            const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
+            p = colon != nullptr ? colon + 1 : nullptr;
+            if (dir.empty()) continue;
+            std::string blob;
+            if (std::unique_ptr<CompiledKernel> k = kernelCacheLoad(dir + name, &blob)) {
+                tStats.hits++;
+                tStats.seedHits++;
+                memoKeep(memoKey, std::move(blob));
+                verifyKernelLater(name, "seed " + dir, *k, bitcode, size, constants);
+                return k;
+            }
+        }
+    }
+    std::unique_ptr<CompiledKernel> k = compileAirFresh(bitcode, size, why, constants);
+    if (k != nullptr) {
+        std::string blob = kernelCacheBlob(*k);
+        if (!cached.empty() && writeFileAtomically(cached, blob)) stageManifestSave(name, bitcode, size, constants, kKernelCacheTag, nullptr);
+        memoKeep(memoKey, std::move(blob));
+    }
+    return k;
+}
+
+bool compileManifestEntry(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+                          const KnownBuffer* known) {
+    if (iboBase == kKernelCacheTag) return compileAir(bitcode, size, why, constants) != nullptr;
+    return compileStage(bitcode, size, why, constants, iboBase, known) != nullptr;
+}
+
 // (redfin hm-cache) a manifest (stageManifestSave) read back
 bool stageManifestRead(const std::string& path, StageManifest* m) {
     std::string data;
@@ -1905,7 +2130,7 @@ RewarmCounts stageCacheRewarm(int (*busy)(void*), void* ctx) {
         }
         for (int i = 0; busy != nullptr && busy(ctx) && i < 600; i++) usleep(100000);   // (at most a minute a stage)
         std::string why;
-        if (compileStage(bc.data(), bc.size(), &why, m.constants, m.iboBase, kp) != nullptr) n.made++;
+        if (compileManifestEntry(bc.data(), bc.size(), &why, m.constants, m.iboBase, kp)) n.made++;
         else n.failed++;
     }
     return n;

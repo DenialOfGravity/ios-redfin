@@ -6231,6 +6231,7 @@ TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) {
     cb->commit();
     cb->waitUntilCompleted();
     CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(cb->queuedNanoseconds() + cb->runningNanoseconds(), cb->gpuNanoseconds());
     CommandBuffer::ycbcrStats(y1);
     bool decode = true;
     uint64_t gen = 7;
@@ -6241,7 +6242,10 @@ TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) {
         CHECK_EQ(y1[1] - y0[1], 1u);   // in one buffer of its own
         CHECK_EQ(y1[2] - y0[2], 0u);   // nothing on the processor
         CHECK_EQ(r.fake->stats().submits - submits0, 2u);
+        // (hm-int3) the decode buffer's time is the frame's running time, not its queue (the HANG split): never apart
+        CHECK(cb->decodeRunningNanoseconds() >= 0 && cb->decodeRunningNanoseconds() <= cb->runningNanoseconds());
     } else {
+        CHECK_EQ(cb->decodeRunningNanoseconds(), 0);
         CHECK_EQ(y1[0] - y0[0], 0u);
         CHECK_EQ(y1[2] - y0[2], 1u);   // the processor's conversion
         // (the fake runs no shader: only the processor's copy has bytes to compare)

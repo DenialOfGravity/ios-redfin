@@ -678,9 +678,15 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     cb->stream_.waitForIdle();
     // (redfin hmv10) HM_XR_LATE: the extended-range surfaces' copies, now (a ring barrier first); (redfin hmv11) HM_XR_GPU:
     // or a buffer of GPU decodes, sent first so the ring runs it between WebKit's writes and this buffer's draws
-    if (std::shared_ptr<CommandBuffer> pre = cb->xrDecodeDeferred()) submit(std::move(pre));
+    if (std::shared_ptr<CommandBuffer> pre = cb->xrDecodeDeferred()) {
+        pre->preFor_ = cb;   // (redfin hm-int3) its running time is this buffer's (queuedNanoseconds)
+        submit(std::move(pre));
+    }
     // (redfin hmyc) HM_YCBCR=native: the two-plane YCbCr copies, decoded on the GPU in a buffer sent just before
-    if (std::shared_ptr<CommandBuffer> pre = cb->ycbcrDecodeDeferred()) submit(std::move(pre));
+    if (std::shared_ptr<CommandBuffer> pre = cb->ycbcrDecodeDeferred()) {
+        pre->preFor_ = cb;
+        submit(std::move(pre));
+    }
     const std::vector<uint32_t>& w = cb->stream_.words();
     int error = 0;
     cb->commands_ = takeCommandBo(4 * w.size(), &error);
@@ -914,6 +920,9 @@ void CommandQueue::waiter() {
         cb->completedAt_ = gpu_.transport().nowNs();
         cb->startedAt_ = std::max(cb->committedAt_, lastCompletedAt_);
         lastCompletedAt_ = cb->completedAt_;
+        if (std::shared_ptr<CommandBuffer> owner = cb->preFor_.lock()) {   // (redfin hm-int3) a decode buffer's time
+            owner->preRunningNs_.fetch_add(cb->runningNanoseconds(), std::memory_order_relaxed);
+        }
         // A fence that passed is not yet a submission that ran. When the kernel resets a hung GPU (gpu_recover=1) it
         // gives up everything the GPU had been given, the hung submission and those behind it in the ring, by setting
         // the fence word to the last submission's number -- so their waits end as if they had run (hakios_gpu_recover:

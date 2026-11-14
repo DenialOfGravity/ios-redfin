@@ -84,10 +84,17 @@ public:
     int64_t gpuNanoseconds() const { return committedAt_ != 0 && completedAt_ > committedAt_ ? completedAt_ - committedAt_ : 0; }
     // (redfin hm-cache) gpuNanoseconds split: queued behind the buffers committed before it on the one ring (commit to
     // the completion of the one before), and running (from then to its own fence). Both 0 as gpuNanoseconds is.
-    int64_t queuedNanoseconds() const { return gpuNanoseconds() != 0 && startedAt_ > committedAt_ ? startedAt_ - committedAt_ : 0; }
-    int64_t runningNanoseconds() const {
-        return gpuNanoseconds() == 0 ? 0 : completedAt_ - (startedAt_ > committedAt_ ? startedAt_ : committedAt_);
+    // (redfin hm-int3) the decode buffers submit sends just before this one (ycbcrDecodeDeferred, xrDecodeDeferred) are
+    // this buffer's work: their running time is counted as this buffer's running, not as its queue, so a slow or hung
+    // decode is reported on the frame it belongs to (HM_HANG_EXEC) and never as a buffer of its own
+    int64_t queuedNanoseconds() const {
+        if (gpuNanoseconds() == 0 || startedAt_ <= committedAt_) return 0;
+        const int64_t q = startedAt_ - committedAt_ - preRunningNs_.load(std::memory_order_relaxed);
+        return q > 0 ? q : 0;
     }
+    int64_t runningNanoseconds() const { return gpuNanoseconds() == 0 ? 0 : gpuNanoseconds() - queuedNanoseconds(); }
+    // (redfin hm-int3) of runningNanoseconds, the decode buffers sent just before it (0: none, or not complete yet)
+    int64_t decodeRunningNanoseconds() const { return preRunningNs_.load(std::memory_order_relaxed); }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -445,6 +452,10 @@ private:
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
     int64_t startedAt_ = 0;   // (redfin hm-cache) when the ring got to it: the completion of the buffer before it
+    // (redfin hm-int3) a decode buffer: the buffer it was sent for (its running time is added to that one's
+    // preRunningNs_ at completion); and, on that buffer, the sum of its decode buffers' running times
+    std::weak_ptr<CommandBuffer> preFor_;
+    std::atomic<int64_t> preRunningNs_{0};
 };
 
 class CommandQueue {

@@ -22,6 +22,7 @@
 #include "fixtures/fill_id_air.hpp"
 #include "fixtures/a620/fill_id_air.hpp"
 #include "fixtures/tex_copy_air.hpp"
+#include "fixtures/ycbcr_decode_bc.hpp"   // (hm-int3) a kernel through the stage cache
 #include "fixtures/a620/tex_copy_air.hpp"
 #include "fixtures/tex_fill_air.hpp"
 #include "fixtures/a620/tex_fill_air.hpp"
@@ -1512,6 +1513,69 @@ TEST(a_compiled_stage_comes_back_from_the_memo_and_leaves_a_manifest) {
     CHECK_EQ(n.manifests, 1u);
     CHECK_EQ(n.present, 1u);
     CHECK_EQ(n.made, 0u);
+    remove(src.c_str());
+    remove((std::string(base) + "/bc/" + m.bitcodeName).c_str());
+    remove((std::string(base) + name).c_str());
+    rmdir((std::string(base) + "/src").c_str());
+    rmdir((std::string(base) + "/bc").c_str());
+    rmdir(base);
+    unsetenv("HAKIOS_METAL_CACHE");
+}
+
+// (redfin hm-int3) a compute kernel (compileAir: ycbcr_decode here) goes through the stage cache as a stage does: compiled
+// once, then answered by the memo, filed in the writable cache with a manifest tagged as a kernel (kKernelCacheTag),
+// read back from the file alone (memo off) the same, and made again by the pre-warm once its file is gone
+TEST(a_compute_kernel_goes_through_the_stage_cache) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the cache did not run)\n");
+        return;
+    }
+    const uint8_t* bc = kernels::ycbcr_decode_bc;
+    const size_t size = sizeof kernels::ycbcr_decode_bc;
+    char base[] = "/tmp/hakios-metal-kcache-test-XXXXXX";
+    CHECK(mkdtemp(base) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", base, 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    unsetenv("HM_STAGE_MEMO");
+    unsetenv("HM_CACHE_MANIFEST");
+    std::string why;
+    const CompileStats a = compileStats();
+    auto first = compileAir(bc, size, &why);
+    auto again = compileAir(bc, size, &why);
+    const CompileStats b = compileStats();
+    CHECK(first != nullptr && again != nullptr);
+    if (first == nullptr || again == nullptr) return;
+    CHECK(first->words == again->words && again->kernel.words == again->words.data());
+    CHECK_EQ(again->kernel.numWords, uint32_t(again->words.size()));
+    CHECK(first->name == again->name && first->threadgroupBytes == again->threadgroupBytes);
+    CHECK_EQ(first->resources.size(), again->resources.size());
+    CHECK_EQ(b.misses - a.misses, 1u);
+    CHECK_EQ(b.memoHits - a.memoHits, 1u);
+    const std::string name = stageCacheFileName(bc, size, {}, kKernelCacheTag, nullptr);
+    CHECK(!name.empty() && name != stageCacheFileName(bc, size, {}, 0, nullptr));
+    StageManifest m;
+    const std::string src = std::string(base) + "/src" + name.substr(0, name.size() - 6) + ".src";
+    CHECK(stageManifestRead(src, &m));
+    CHECK(m.iboBase == kKernelCacheTag && !m.hasKnown && m.bitcodeSize == size);
+    // the file alone
+    setenv("HM_STAGE_MEMO", "0", 1);
+    auto fromFile = compileAir(bc, size, &why);
+    const CompileStats c = compileStats();
+    CHECK(fromFile != nullptr && fromFile->words == first->words && fromFile->immediates == first->immediates);
+    CHECK_EQ(c.misses - b.misses, 0u);
+    CHECK_EQ(c.hits - b.hits, 1u);
+    unsetenv("HM_STAGE_MEMO");
+    // the pre-warm: present, then (its file gone) made again by compileAir
+    RewarmCounts n = stageCacheRewarm(nullptr, nullptr);
+    CHECK_EQ(n.manifests, 1u);
+    CHECK_EQ(n.present, 1u);
+    remove((std::string(base) + name).c_str());
+    setenv("HM_STAGE_MEMO", "0", 1);   // (the memo would answer without writing the file)
+    n = stageCacheRewarm(nullptr, nullptr);
+    unsetenv("HM_STAGE_MEMO");
+    CHECK_EQ(n.made, 1u);
+    CHECK_EQ(n.failed, 0u);
+    CHECK(access((std::string(base) + name).c_str(), R_OK) == 0);
     remove(src.c_str());
     remove((std::string(base) + "/bc/" + m.bitcodeName).c_str());
     remove((std::string(base) + name).c_str());

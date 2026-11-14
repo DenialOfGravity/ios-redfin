@@ -173,6 +173,13 @@ struct RewarmCounts {
     uint32_t manifests = 0, present = 0, made = 0, failed = 0, unreadable = 0;
 };
 RewarmCounts stageCacheRewarm(int (*busy)(void*), void* ctx);
+// (redfin hm-int3) compute kernels (compileAir: ycbcr_decode, xr_decode, an app's compute pipelines) go through the same
+// stage cache, memo, seed directories, manifests, pre-warm and HM_CACHE_VERIFY as the stages; their key's IBO_BASE slot
+// holds this tag (no stage has an IBO_BASE that large), and a manifest carrying it is compiled again by compileAir
+constexpr uint32_t kKernelCacheTag = 0x4c4e524bu;   // "KRNL"
+// a manifest's stage or kernel compiled again, into the cache as compileStage / compileAir file it (the pre-warm, hm-seed)
+bool compileManifestEntry(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+                          const KnownBuffer* known);
 
 // VS and FS linked (render::link, and with Mesa present cross-checked against ir3_link_shaders) for a colour target of
 // COLOR0's format. nullptr with *why: the refusals render.hpp names for a stage (attributes, several colour outputs,

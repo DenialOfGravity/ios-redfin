@@ -92,7 +92,7 @@ int build(const std::string& cache, const std::string& seed) {
                                               n.c_str(), stageName.c_str(), here.c_str() + 1, key.c_str());
         }
         std::string why;
-        if (compileStage(bc.data(), bc.size(), &why, constants, iboBase, kp) != nullptr) {
+        if (compileManifestEntry(bc.data(), bc.size(), &why, constants, iboBase, kp)) {   // (hm-int3: kernels too)
             made++;
         } else {
             refused++;
