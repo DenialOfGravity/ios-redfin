@@ -46,6 +46,18 @@
  *     / _spk (louder = positive); sweet_sound.c's hard cap (6 dB under Android's level) still applies.
  *   kern.sweet_voice_gain_tx (dB, default 0, -12..+24): the mic's ADC gain during a call relative to the boot-arg
  *     micgain (0.75 dB steps, sweet_mic.c redwood_mic_voice_gain()); back to micgain when the call lets the mic go.
+ *
+ * 1090 (experiment E1 of research/cc/BBA-design-study.md; the AP side in bsd/dev/sweet_vproxy.c):
+ *   kern.sweet_voice_proxy 0 (default: today's direct path, nothing below runs) / 1 proxy loopback: read when a call's
+ *     voice session starts (by hand or kern.sweet_voice_auto); a change applies to the next call. With 1 the AFE RT
+ *     proxy ports come up first (sweet_vproxy_prepare()), the session starts as today on 0x9001/0x9040, then the CVP
+ *     is switched (q6voice.c voc_disable_device()/voc_enable_device(): MVM PAUSE_VOICE, CVP SET_DEVICE_V3 tx 0x2001 rx
+ *     0x2000, endpoint media info 1 ch x 16 bit at the proxy's rate, topology commit, MVM START_VOICE) and the AP's
+ *     data path starts. Any failure: back to 0x9001/0x9040 in the same start (switched back, or the session made again
+ *     on them), the reason logged ("SWEET VOICE PROXY: FALLBACK ...").
+ *   kern.sweet_voice_proxy_opts (bits, 0 default): 1 the CVP created on the proxy ports from the start (no switch);
+ *     2 8 kHz instead of 16 kHz; 4 host-PCM probe: one VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory) to the
+ *     CVP after START_VOICE, its status logged only (stopped again if it was taken).
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <kern/clock.h>
@@ -161,6 +173,27 @@ static int gain_rx_db, gain_tx_db;              /* 1086 */
 #define ROUTE_IOS_FRESH_MS      15000
 static volatile uint32_t ev_all, ev_ready, ev_not_ready, ev_activity, ev_dtmf, ev_other;
 
+/* 1090: the voice proxy (bsd/dev/sweet_vproxy.c) */
+extern bool sweet_vproxy_prepare(int mode, uint32_t opts);
+extern bool sweet_vproxy_run(void);
+extern void sweet_vproxy_stop(const char *why);
+extern void sweet_vproxy_dtmf(uint32_t low, uint32_t high);
+extern uint32_t sweet_vproxy_rate(void);
+#define PROXY_RX_PORT           0x2000          /* RT_PROXY_PORT_001_RX: the downlink, read by the AP */
+#define PROXY_TX_PORT           0x2001          /* RT_PROXY_PORT_001_TX: the uplink, written by the AP */
+#define POPT_CREATE             1u
+#define POPT_8K                 2u
+#define POPT_HOSTPCM            4u
+#define VSS_IMVM_CMD_PAUSE_VOICE                        0x0001137du
+#define VSS_IVOCPROC_CMD_SET_DEVICE_V3                  0x0001316au
+#define VSS_IVPCM_CMD_START_V2                          0x00011339u
+#define VSS_IVPCM_CMD_STOP                              0x0001100bu
+#define VSS_IVPCM_TAP_POINT_TX_DEFAULT                  0x00011289u
+static int voice_proxy;                         /* kern.sweet_voice_proxy */
+static uint32_t proxy_opts;                     /* kern.sweet_voice_proxy_opts */
+static bool proxy_up;                           /* this call runs on the proxy ports (the AFE side is up) */
+static bool proxy_refused;                      /* this start: the proxy failed once, the session is made again directly */
+
 /* 1066: what MVM/CVS/CVP send unasked (sweet_adsp.c's link thread). Answers to our own commands are not seen here. */
 static bool
 voice_event(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
@@ -182,6 +215,9 @@ voice_event(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, con
 		say = true;
 		SAY("event %u: %s port %u: RX DTMF %u/%u Hz (the downlink reaches the DSP)\n", n, svc, port,
 		    payload[0] & 0xffff, payload[0] >> 16);
+		if (proxy_up) {
+			sweet_vproxy_dtmf(payload[0] & 0xffff, payload[0] >> 16);      /* 1090: the latency line */
+		}
 	} else if (opcode == VSS_ICOMMON_EVT_VOICE_ACTIVITY_UPDATE) {
 		ev_activity++;
 		if (say) {
@@ -334,6 +370,133 @@ below_for(int state)
 }
 
 /* the sessions taken down, the ports and amplifiers let go: whatever of it is there */
+/*
+ * The CVP's endpoint media formats. 1090: proxy = the RT proxy ports (1 ch x 16 bit at `rate' both ways); otherwise
+ * today's 0x9040/0x9001 formats, with today's log lines.
+ */
+static void
+media_formats(bool proxy, uint32_t rate)
+{
+	bool rx_mono = (voice_opts & OPT_RX_MONO16) != 0;
+	struct {
+		uint32_t port;
+		uint16_t channels, bits;
+		uint32_t rate;
+		uint8_t map[32];
+	} __attribute__((packed)) rx, tx;
+
+	bzero(&rx, sizeof(rx));
+	bzero(&tx, sizeof(tx));
+	if (proxy) {
+		char what[80];
+
+		rx.port = PROXY_RX_PORT;
+		rx.channels = 1;
+		rx.bits = 16;
+		rx.rate = rate;
+		rx.map[0] = PCM_CHANNEL_FC;
+		tx = rx;
+		tx.port = PROXY_TX_PORT;
+		snprintf(what, sizeof(what), "CVP: RX endpoint 0x2000, 1 ch x 16 bits, %u Hz", rate);
+		(void)cvp_param(what, VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
+		snprintf(what, sizeof(what), "CVP: TX endpoint 0x2001, 1 ch x 16 bits, %u Hz", rate);
+		(void)cvp_param(what, VSS_MODULE_CVD_GENERIC, VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
+		return;
+	}
+	rx.port = RX_PORT;
+	rx.channels = rx_mono ? 1 : 2;
+	rx.bits = rx_mono ? 16 : 32;
+	rx.rate = RATE;
+	rx.map[0] = rx_mono ? PCM_CHANNEL_FC : PCM_CHANNEL_FL;
+	rx.map[1] = rx_mono ? 0 : PCM_CHANNEL_FR;
+	tx.port = TX_PORT;
+	tx.channels = 1;
+	tx.bits = 16;
+	tx.rate = RATE;
+	tx.map[0] = PCM_CHANNEL_FC;
+	(void)cvp_param(rx_mono ? "CVP: RX endpoint 0x9040, 1 ch x 16 bits, 48 kHz" : "CVP: RX endpoint 0x9040, 2 ch x 32 bits, 48 kHz",
+	    VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
+	(void)cvp_param("CVP: TX endpoint 0x9001, 1 ch x 16 bits, 48 kHz", VSS_MODULE_CVD_GENERIC,
+	    VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
+}
+
+/*
+ * 1090: the running call's CVP moved to the proxy ports (to_proxy) or back to 0x9001/0x9040 (q6voice.c
+ * voc_disable_device() + voc_enable_device(): pause, set device V3, media info, commit, start).
+ */
+static bool
+cvp_switch(bool to_proxy, uint32_t rate)
+{
+	struct {
+		uint16_t tx_port;
+		uint32_t tx_topology;
+		uint16_t rx_port;
+		uint32_t rx_topology, mode;
+		uint16_t ec_ref_port;
+	} __attribute__((packed)) dev;
+	uint16_t tx = to_proxy ? PROXY_TX_PORT : TX_PORT, rx = to_proxy ? PROXY_RX_PORT : RX_PORT;
+	char what[80];
+
+	if (!vcmd("MVM: pause voice", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_PAUSE_VOICE, NULL, 0, 0, NULL)) {
+		printf("SWEET VOICE PROXY: MVM pause: FAILED\n");
+		return false;
+	}
+	bzero(&dev, sizeof(dev));
+	dev.tx_port = tx;
+	dev.rx_port = rx;
+	dev.tx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2 : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+	dev.rx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+	dev.mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
+	dev.ec_ref_port = VSS_IVOCPROC_PORT_ID_NONE;
+	snprintf(what, sizeof(what), "CVP: set device V3 tx %#x rx %#x", tx, rx);
+	if (!vcmd(what, APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_SET_DEVICE_V3, &dev, sizeof(dev), 0, NULL)) {
+		printf("SWEET VOICE PROXY: MVM pause: ok; CVP set device V3 tx %#x rx %#x: FAILED\n", tx, rx);
+		return false;
+	}
+	if (!(voice_opts & OPT_NO_MEDIA_FMT)) {
+		media_formats(to_proxy, rate);
+	}
+	(void)vcmd("CVP: topology commit", APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT, NULL, 0, 0, NULL);
+	if (!vcmd("MVM: START_VOICE", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_START_VOICE, NULL, 0, 0, NULL)) {
+		printf("SWEET VOICE PROXY: MVM pause: ok; CVP set device V3 tx %#x rx %#x: ok; media info: sent; commit: sent; MVM start: "
+		    "FAILED\n", tx, rx);
+		return false;
+	}
+	printf("SWEET VOICE PROXY: MVM pause: ok; CVP set device V3 tx %#x rx %#x: ok; media info: %s; commit: ok; MVM start: ok\n",
+	    tx, rx, (voice_opts & OPT_NO_MEDIA_FMT) ? "not sent (opts 4)" : "sent");
+	return true;
+}
+
+/* 1090, opts 4: is host PCM there? One VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory): only its status logged. */
+static void
+hostpcm_probe(uint32_t rate)
+{
+	struct {
+		uint32_t mem_handle, taps;
+		uint32_t tap_point;
+		uint16_t direction, rate, duration;
+	} __attribute__((packed)) start = { 0, 1, VSS_IVPCM_TAP_POINT_TX_DEFAULT, 0, (uint16_t)rate, 0 };
+	struct redwood_apr_answer answer;
+
+	bzero(&answer, sizeof(answer));
+	if (!redwood_adsp_apr_ports(APR_SVC_CVP, VOICE_INDEX, cvp_handle, 0, VSS_IVPCM_CMD_START_V2, &start, sizeof(start),
+	    APR_WAIT_MS, &answer)) {
+		printf("SWEET VOICE PROXY: host PCM probe: VSS_IVPCM_CMD_START_V2 -> NO ANSWER\n");
+		return;
+	}
+	if (answer.opcode == APR_BASIC_RSP_RESULT && answer.words[0] == VSS_IVPCM_CMD_START_V2) {
+		printf("SWEET VOICE PROXY: host PCM probe: VSS_IVPCM_CMD_START_V2 -> %s (%u)%s\n", dsp_error(answer.words[1]),
+		    answer.words[1], answer.words[1] == 0 ? ": TAKEN (host PCM exists); stopped again" :
+		    answer.words[1] == 3 || answer.words[1] == 17 ? ": not supported here" : "");
+		if (answer.words[1] == 0) {
+			(void)vcmd("CVP: host PCM stopped (probe)", APR_SVC_CVP, cvp_handle, VSS_IVPCM_CMD_STOP, NULL, 0, 0, NULL);
+		}
+		return;
+	}
+	printf("SWEET VOICE PROXY: host PCM probe: VSS_IVPCM_CMD_START_V2 -> answer opcode %#x, %u bytes: %#x %#x\n", answer.opcode,
+	    answer.length, answer.words[0], answer.words[1]);
+}
+
 static void
 voice_down(const char *why)
 {
@@ -378,6 +541,10 @@ voice_down(const char *why)
 		mvm_handle = 0;
 	}
 	dual_done = false;
+	if (proxy_up) {
+		sweet_vproxy_stop(why);         /* 1090: after the CVP is gone: the data thread, the call mode, the AFE ports */
+		proxy_up = false;
+	}
 	if (port_held) {
 		(void)redwood_sound_voice(0, 0);
 		port_held = false;
@@ -397,7 +564,7 @@ voice_up(int target)
 {
 	struct redwood_apr_answer answer;
 	char name[SESSION_NAME_LEN];
-	bool old_cvd, rx_mono = (voice_opts & OPT_RX_MONO16) != 0;
+	bool old_cvd, proxy_tried = false;
 	uint16_t handle;
 	const char *step = "?";
 
@@ -422,6 +589,15 @@ voice_up(int target)
 		SAY("speaker port QUIN_TDM_RX_0 0x9040 NOT RUNNING: we will not hear the other side (going on)\n");
 	} else {
 		SAY("speaker port 0x9040 runs; amplifier %s held for the call\n", target == 2 ? "0x41 (speaker)" : "0x40 (earpiece)");
+	}
+
+	/* 1090: the AFE proxy ports first (the CVP is created on them, or switched to them after START_VOICE) */
+	proxy_up = false;
+	if (voice_proxy != 0 && !proxy_refused) {
+		printf("SWEET VOICE PROXY: call start with kern.sweet_voice_proxy %d, opts %#x: %s\n", voice_proxy, proxy_opts,
+		    (proxy_opts & POPT_CREATE) ? "CVP created on the proxy ports" : "CVP switched to the proxy ports after START_VOICE");
+		proxy_up = sweet_vproxy_prepare(voice_proxy, proxy_opts);
+		proxy_tried = proxy_up;
 	}
 
 	/* 3 the voice sessions (q6voice.c voc_start_voice_call) */
@@ -492,13 +668,17 @@ voice_up(int target)
 		create.direction = 2;
 		create.tx_port = TX_PORT;
 		create.rx_port = RX_PORT;
+		if (proxy_up && (proxy_opts & POPT_CREATE)) {
+			create.tx_port = PROXY_TX_PORT;         /* 1090 */
+			create.rx_port = PROXY_RX_PORT;
+		}
 		create.tx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2 : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
 		create.rx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
 		create.profile = VSS_ICOMMON_CAL_NETWORK_ID_NONE;
 		create.mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
 		create.ec_ref_port = VSS_IVOCPROC_PORT_ID_NONE;
-		snprintf(what, sizeof(what), "CVP: full control %s, tx %#x rx %#x, topologies %#x/%#x", old_cvd ? "V2" : "V3", TX_PORT,
-		    RX_PORT, create.tx_topology, create.rx_topology);
+		snprintf(what, sizeof(what), "CVP: full control %s, tx %#x rx %#x, topologies %#x/%#x", old_cvd ? "V2" : "V3", create.tx_port,
+		    create.rx_port, create.tx_topology, create.rx_topology);
 		if (!vcmd(what, APR_SVC_CVP, 0, old_cvd ? VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2 :
 		    VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3, &create, sizeof(create), 0, &answer)) {
 			goto fail;
@@ -514,31 +694,8 @@ voice_up(int target)
 		    sizeof(channels), 0, NULL);
 	}
 	if (!(voice_opts & OPT_NO_MEDIA_FMT) && !old_cvd && cvd_at_least(2, 3)) {
-		struct {
-			uint32_t port;
-			uint16_t channels, bits;
-			uint32_t rate;
-			uint8_t map[32];
-		} __attribute__((packed)) rx, tx;
-
 		step = "media formats";
-		bzero(&rx, sizeof(rx));
-		bzero(&tx, sizeof(tx));
-		rx.port = RX_PORT;
-		rx.channels = rx_mono ? 1 : 2;
-		rx.bits = rx_mono ? 16 : 32;
-		rx.rate = RATE;
-		rx.map[0] = rx_mono ? PCM_CHANNEL_FC : PCM_CHANNEL_FL;
-		rx.map[1] = rx_mono ? 0 : PCM_CHANNEL_FR;
-		tx.port = TX_PORT;
-		tx.channels = 1;
-		tx.bits = 16;
-		tx.rate = RATE;
-		tx.map[0] = PCM_CHANNEL_FC;
-		(void)cvp_param(rx_mono ? "CVP: RX endpoint 0x9040, 1 ch x 16 bits, 48 kHz" : "CVP: RX endpoint 0x9040, 2 ch x 32 bits, 48 kHz",
-		    VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
-		(void)cvp_param("CVP: TX endpoint 0x9001, 1 ch x 16 bits, 48 kHz", VSS_MODULE_CVD_GENERIC,
-		    VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
+		media_formats(proxy_up && (proxy_opts & POPT_CREATE), sweet_vproxy_rate());
 	}
 	if (!old_cvd) {
 		step = "topology commit";
@@ -608,11 +765,65 @@ voice_up(int target)
 	voice_state = target;
 	SAY("START_VOICE ok: CALL AUDIO UP on the %s (MVM %u, CVS %u, CVP %u)\n", target == 2 ? "speaker" : "earpiece", mvm_handle,
 	    cvs_handle, cvp_handle);
+	if (proxy_up) {
+		/* 1090: onto the proxy ports (unless created there), then the AP's data path */
+		bool on_proxy = (proxy_opts & POPT_CREATE) != 0;
+
+		if (!on_proxy) {
+			on_proxy = cvp_switch(true, sweet_vproxy_rate());
+			if (!on_proxy) {
+				printf("SWEET VOICE PROXY: FALLBACK: the CVP switch failed: back to 0x9001/0x9040\n");
+				if (!cvp_switch(false, RATE)) {
+					printf("SWEET VOICE PROXY: FALLBACK: the switch back failed too: the session is made again directly\n");
+					sweet_vproxy_stop("switch back failed");
+					proxy_up = false;
+					step = "proxy switch back";
+					goto fail;
+				}
+			}
+		}
+		if (on_proxy && !sweet_vproxy_run()) {
+			on_proxy = false;
+			if (proxy_opts & POPT_CREATE) {
+				step = "proxy data thread";
+				goto fail;
+			}
+			printf("SWEET VOICE PROXY: FALLBACK: no data path: back to 0x9001/0x9040\n");
+			if (!cvp_switch(false, RATE)) {
+				sweet_vproxy_stop("switch back failed");
+				proxy_up = false;
+				step = "proxy switch back";
+				goto fail;
+			}
+		}
+		if (!on_proxy) {
+			sweet_vproxy_stop("fallback to the direct path");
+			proxy_up = false;
+		} else {
+			printf("SWEET VOICE PROXY: CALL AUDIO THROUGH THE AP (mode %d, %u Hz): CVP on 0x2001/0x2000\n", voice_proxy,
+			    sweet_vproxy_rate());
+		}
+	}
+	if (proxy_opts & POPT_HOSTPCM) {
+		hostpcm_probe((proxy_opts & POPT_8K) ? 8000 : 16000);
+	}
 	return true;
 fail:
 	failures++;
 	SAY("START FAILED at %s (failure %u): undoing\n", step, failures);
-	voice_down("start failed");
+	{
+		bool retry = proxy_tried;
+
+		voice_down("start failed");
+		if (retry && !proxy_refused) {
+			/* 1090: the proxy's part failed: the same start once more on today's ports */
+			printf("SWEET VOICE PROXY: FALLBACK: the start failed at %s with the proxy: made again on 0x9001/0x9040\n", step);
+			proxy_refused = true;
+			retry = voice_up(target);
+			proxy_refused = false;
+			return retry;
+		}
+	}
 	return false;
 }
 
@@ -776,6 +987,42 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_ear, CTLTYPE_INT | CTLFLAG_RW | C
     "I", "redfin 1065: earpiece amplifier level, 1/8 dB under Android's (default 240; never under 48)");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_spk, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &below_speaker, 3,
     sysctl_voice_number, "I", "redfin 1065: speaker amplifier level, 1/8 dB under Android's (default 160; never under 48)");
+
+/* ---- 1090: the voice proxy's switches ---- */
+static int
+sysctl_voice_proxy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = voice_proxy, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+
+	if (e != 0 || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 1) {
+		return EINVAL;
+	}
+	voice_proxy = v;
+	printf("SWEET VOICE PROXY: kern.sweet_voice_proxy = %d (%s; applies at the next call start%s)\n", v, v == 0 ? "direct path" :
+	    "proxy loopback", voice_state != 0 ? ", the running call keeps its path" : "");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy, "I",
+    "redfin 1090: 0 direct path (default), 1 the call's CVP on the AFE RT proxy ports, PCM looped through the AP; next call");
+
+static int
+sysctl_voice_proxy_opts(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = (int)proxy_opts, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+
+	if (e == 0 && changed) {
+		proxy_opts = (uint32_t)v & 7u;
+		printf("SWEET VOICE PROXY: kern.sweet_voice_proxy_opts = %#x\n", proxy_opts);
+	}
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_opts, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy_opts,
+    "I", "redfin 1090: bits 1 CVP created on the proxy ports (no switch), 2 8 kHz (default 16 kHz), 4 host-PCM probe (status only)");
 
 /* ---- 1086: route and gains ---- */
 static void

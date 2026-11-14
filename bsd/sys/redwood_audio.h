@@ -148,6 +148,20 @@ void redwood_mic_voice_gain(int db);    /* 1086: the ADC gain during a call, dB 
  * (what the call alone brought up is taken down; the amplifiers follow what iOS plays again). True: the port runs.
  */
 bool redwood_sound_voice(uint32_t amps, uint32_t below);
+/*
+ * 1090, the voice proxy (bsd/dev/sweet_vproxy.c, kern.sweet_voice_proxy). A handler for what the AFE sends unasked
+ * (asked before the others; NULL = none). The memory the DSP sees held for it (sweet_sound.c's SMMU stream; the proxy's
+ * own buffer). The playback stream's call mode: 10 ms periods, at most 3 queued (instead of 8 x 20 ms), fed from a call
+ * ring (48 kHz stereo) mixed with what iOS plays; off = back to 8 x 20 ms. The mic ring read with a cursor of one's own.
+ */
+void redwood_adsp_apr_events_proxy(redwood_apr_events_t handler);
+bool redwood_sound_dsp_space(bool on);
+bool redwood_sound_call_mode_on(bool on);       /* true: the playback stream runs, so the call ring is heard */
+void redwood_sound_call_mode(bool on);
+uint32_t redwood_sound_call_put(const int16_t *stereo, uint32_t frames);
+void redwood_sound_call_state(uint32_t *ring_frames, uint32_t *queued_frames, uint32_t *underruns, uint32_t *periods);
+uint32_t redwood_sound_call_gain_q15(void);     /* undoes the feeder's sndgain for the call's PCM (Q15 factor) */
+bool redwood_mic_voice_peek(uint64_t from, int16_t *out, uint32_t count, uint64_t *written);
 #endif
 
 #endif /* _SYS_REDWOOD_AUDIO_H_ */

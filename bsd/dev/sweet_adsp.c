@@ -2860,6 +2860,7 @@ static uint32_t apr_waited_for;         /* the token a question waits for the an
 static redwood_apr_events_t apr_events; /* the sound's (redwood_sound.c): what nobody waits for */
 static redwood_apr_events_t apr_events_second;  /* the microphones' (redwood_mic.c) */
 static redwood_apr_events_t apr_events_voice;   /* 1066: the voice services' (sweet_voice.c), MVM/CVS/CVP only */
+static redwood_apr_events_t apr_events_proxy;   /* 1090: the voice proxy's (sweet_vproxy.c), AFE only; NULL unless a call runs on it */
 static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
 
 /* A packet from the DSP's audio services. From the link's thread. */
@@ -2887,6 +2888,12 @@ apr_input(const uint8_t *data, uint32_t length)
 
 		bzero(words, sizeof(words));
 		memcpy(words, data + header_length, payload < sizeof(words) ? payload : sizeof(words));
+		redwood_apr_events_t proxy = apr_events_proxy;
+
+		if (proxy != NULL && header.from_service == 4 && proxy(header.from_service, header.from_port, header.opcode,
+		    header.token, words, payload < sizeof(words) ? payload : sizeof(words))) {
+			return;         /* 1090 */
+		}
 		if (apr_events_voice != NULL && header.from_service >= 9 && header.from_service <= 11 &&
 		    apr_events_voice(header.from_service, header.from_port, header.opcode, header.token, words,
 		    payload < sizeof(words) ? payload : sizeof(words))) {
@@ -3042,6 +3049,17 @@ void
 redwood_adsp_apr_events_voice(redwood_apr_events_t handler)
 {
 	apr_events_voice = handler;
+}
+
+/*
+ * 1090: the voice proxy's handler (sweet_vproxy.c), asked first for what the AFE sends that nobody waits for: its
+ * RT proxy data acks (tokens of its own, never a waiter's) and AFE_EVENT_RT_PROXY_PORT_STATUS. Set only while a call
+ * runs on the proxy ports (kern.sweet_voice_proxy), NULL otherwise: then nothing changes for the other handlers.
+ */
+void
+redwood_adsp_apr_events_proxy(redwood_apr_events_t handler)
+{
+	apr_events_proxy = handler;
 }
 
 /* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */

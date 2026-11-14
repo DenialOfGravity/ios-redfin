@@ -658,6 +658,17 @@ redwood_audio_dsp_memory_put(void)
 	space_put(1);
 }
 
+/* 1090: the voice proxy (sweet_vproxy.c) holds the DSP's view of memory (the SMMU stream) for its own buffer: user 2 */
+bool
+redwood_sound_dsp_space(bool on)
+{
+	if (!on) {
+		space_put(2);
+		return true;
+	}
+	return space_get(2);
+}
+
 /* ---- ADM and ASM: the path and the stream ------------------------------------------------------------------- */
 
 #define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
@@ -862,19 +873,71 @@ static volatile bool stopping, feeder_runs;
 static uint64_t sent_periods, failed_sends, tone_periods, silent_periods;
 static uint32_t guard_periods;
 
+/*
+ * 1090: the call mode (redwood_sound_call_mode(), from sweet_vproxy.c while a call runs on the AFE proxy ports with
+ * kern.sweet_voice_proxy 1): periods of 10 ms, at most CALL_QUEUED at the DSP (30 ms instead of 8 x 20 ms = 160 ms),
+ * filled from the call ring (the downlink, 48 kHz stereo) with what iOS plays mixed in. Off: 8 x 20 ms again (the
+ * periods held back are queued again). Nothing of it runs while call_mode is false.
+ */
+#define CALL_PERIOD_FRAMES      480             /* 10 ms */
+#define CALL_QUEUED             3
+#define CALL_RING_FRAMES        8192            /* 170 ms; a power of two, the indices run on */
+static volatile bool call_mode;
+static bool call_primed;
+static int16_t call_ring[CALL_RING_FRAMES * 2];
+static volatile uint32_t call_head, call_tail;  /* frames: written by the proxy, taken by the feeder */
+static volatile uint32_t call_underruns, call_overruns, call_periods, queued_frames;
+static uint32_t period_frames_of[PERIODS], guard_half;
+
+static int16_t
+mix16(int16_t a, int16_t b)
+{
+	int32_t v = (int32_t)a + b;
+
+	return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+}
+
 static void
-period_fill(unsigned period)
+period_fill(unsigned period, uint32_t frames)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
 	bool toning = now_us() < tone_until_us;
-	uint32_t n = 0;
+	uint32_t n = 0, c = 0;
 
+	if (call_mode) {
+		/* 1090: the call's downlink first */
+		uint32_t tail = call_tail, available = call_head - tail;
+
+		if (!call_primed && available >= frames) {
+			call_primed = true;
+		}
+		if (call_primed) {
+			c = available < frames ? available : frames;
+			if (c < frames) {
+				call_underruns++;
+				call_primed = false;
+			}
+			OSMemoryBarrier();
+			for (uint32_t i = 0; i < c; i++) {
+				samples[2 * i] = call_ring[2 * ((tail + i) % CALL_RING_FRAMES)];
+				samples[2 * i + 1] = call_ring[2 * ((tail + i) % CALL_RING_FRAMES) + 1];
+			}
+			OSMemoryBarrier();
+			call_tail = tail + c;
+		}
+		call_periods++;
+	}
 	if (!toning && level >= 4) {
 		uint32_t tail = ring_tail, available = ring_head - tail;
 
-		n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+		n = available < frames ? available : frames;
 		OSMemoryBarrier();
 		for (uint32_t i = 0; i < n; i++) {
+			if (i < c) {
+				samples[2 * i] = mix16(samples[2 * i], ring[2 * ((tail + i) % RING_FRAMES)]);
+				samples[2 * i + 1] = mix16(samples[2 * i + 1], ring[2 * ((tail + i) % RING_FRAMES) + 1]);
+				continue;
+			}
 			samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
 			samples[2 * i + 1] = ring[2 * ((tail + i) % RING_FRAMES) + 1];
 		}
@@ -882,7 +945,7 @@ period_fill(unsigned period)
 		ring_tail = tail + n;
 		fed_frames += n;
 	}
-	for (unsigned frame = n; frame < PERIOD_FRAMES; frame++) {
+	for (unsigned frame = n > c ? n : c; frame < frames; frame++) {
 		int16_t sample = toning ? tone[tone_at++ % 48] : 0;
 
 		samples[2 * frame] = sample;
@@ -895,17 +958,19 @@ period_fill(unsigned period)
 	}
 	if (level >= 3) {
 		/* every period, silence too: its filter and its averages go on (sweet_guard.c) */
-		redwood_guard_process(samples, PERIOD_FRAMES);
-		guard_periods++;
+		redwood_guard_process(samples, frames);
+		if (frames == PERIOD_FRAMES || (++guard_half & 1) == 0) {
+			guard_periods++;        /* (1090: counted in 20 ms) */
+		}
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");       /* (write-combining: out to memory before the DSP is told) */
 }
 
 static bool
-period_write(unsigned period)
+period_write(unsigned period, uint32_t frames)
 {
 	uint64_t address = (buffer_pa + 4096 * period) | AUDIO_SID_BITS;
-	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), map_handle, PERIOD_BYTES, period, 0, 0, 0 };
+	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), map_handle, frames * 4, period, 0, 0, 0 };
 
 	return redwood_adsp_apr(APR_SVC_ASM, STREAM_PORT, WRITE_TOKEN | period, ASM_DATA_CMD_WRITE_V2, write, sizeof(write), 0, NULL);
 }
@@ -916,12 +981,15 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t done_before = written_done;
 	uint64_t began = now_us(), last_report = began;
 	bool said_none = false;
+	uint32_t inflight = 0, idle = 0;        /* 1090: periods at the DSP / given back and held (call mode) */
 
 	returned = 0;
 	for (unsigned p = 0; p < PERIODS; p++) {
-		period_fill(p);
-		if (period_write(p)) {
+		period_fill(p, PERIOD_FRAMES);
+		if (period_write(p, PERIOD_FRAMES)) {
 			sent_periods++;
+			inflight |= 1u << p;
+			period_frames_of[p] = PERIOD_FRAMES;
 		} else {
 			failed_sends++;
 		}
@@ -930,20 +998,32 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 	while (!stopping) {
 		uint32_t back = returned;
 		uint64_t now = now_us();
+		bool cm = call_mode;
+		uint32_t frames = cm ? CALL_PERIOD_FRAMES : PERIOD_FRAMES, most = cm ? CALL_QUEUED : PERIODS, q = 0;
 
 		if (back != 0) {
 			OSBitAndAtomic(~back, &returned);
-			for (unsigned p = 0; p < PERIODS; p++) {
-				if (back & (1u << p)) {
-					period_fill(p);
-					if (period_write(p)) {
-						sent_periods++;
-					} else {
-						failed_sends++;
-					}
-				}
+			inflight &= ~back;
+			idle |= back;
+		}
+		/* (without the call mode every period given back is filled and written again at once, lowest first, as before) */
+		while (idle != 0 && (uint32_t)__builtin_popcount(inflight) < most) {
+			unsigned p = (unsigned)__builtin_ctz(idle);
+
+			idle &= ~(1u << p);
+			period_fill(p, frames);
+			if (period_write(p, frames)) {
+				sent_periods++;
+				inflight |= 1u << p;
+				period_frames_of[p] = frames;
+			} else {
+				failed_sends++;
 			}
 		}
+		for (unsigned p = 0; p < PERIODS; p++) {
+			q += (inflight & (1u << p)) ? period_frames_of[p] : 0;
+		}
+		queued_frames = q;
 		if (!said_none && written_done == done_before && now - began > 1000000) {
 			SAY("feeder: THE DSP HAS GIVEN NO PERIOD BACK IN A SECOND\n");
 			smmu_faults("(no WRITE_DONE)");
@@ -956,7 +1036,7 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (returned == 0 && !stopping) {
 			/* (a WRITE_DONE between the test and the wait is picked up at the 40 ms timeout: 160 ms are queued) */
-			assert_wait_timeout((event_t)&feeder_wake, THREAD_UNINT, 40, NSEC_PER_MSEC);
+			assert_wait_timeout((event_t)&feeder_wake, THREAD_UNINT, cm ? 5 : 40, NSEC_PER_MSEC);   /* 1090: 30 ms queued in a call */
 			thread_block(THREAD_CONTINUE_NULL);
 		}
 	}
@@ -965,6 +1045,80 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 	    tone_periods, silent_periods, ios_frames, ios_dropped, fed_frames);
 	feeder_runs = false;
 	thread_terminate(current_thread());
+}
+
+/* ---- 1090: the call mode's interface (sweet_vproxy.c) ---- */
+
+bool redwood_sound_call_mode_on(bool on);
+void
+redwood_sound_call_mode(bool on)
+{
+	(void)redwood_sound_call_mode_on(on);
+}
+
+/* true: the stream runs (sound >= 2), so what is put in the call ring is played */
+bool
+redwood_sound_call_mode_on(bool on)
+{
+	if (on && !call_mode) {
+		call_tail = call_head;
+		call_primed = false;
+		call_underruns = call_overruns = call_periods = 0;
+		OSMemoryBarrier();
+		call_mode = true;
+		SAY("call mode ON: periods of 10 ms, at most %u at the DSP (was %u x 20 ms; the 20 ms ones drain first)%s\n",
+		    CALL_QUEUED, PERIODS, feeder_runs ? "" : " -- NO STREAM RUNS (sound < 2): the call ring is not played");
+	} else if (!on && call_mode) {
+		call_mode = false;
+		SAY("call mode off: %u periods of 10 ms, %u underruns, %u overruns; back to %u x 20 ms\n", call_periods,
+		    call_underruns, call_overruns, PERIODS);
+	}
+	thread_wakeup(&feeder_wake);
+	return feeder_runs;
+}
+
+/* From the proxy's thread: never waits. 48 kHz stereo frames; what does not fit is dropped (counted). */
+uint32_t
+redwood_sound_call_put(const int16_t *stereo, uint32_t frames)
+{
+	uint32_t head = call_head, room = CALL_RING_FRAMES - (head - call_tail), taken = frames < room ? frames : room;
+
+	if (!call_mode) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < taken; i++) {
+		call_ring[2 * ((head + i) % CALL_RING_FRAMES)] = stereo[2 * i];
+		call_ring[2 * ((head + i) % CALL_RING_FRAMES) + 1] = stereo[2 * i + 1];
+	}
+	OSMemoryBarrier();
+	call_head = head + taken;
+	if (taken < frames) {
+		call_overruns++;
+	}
+	return taken;
+}
+
+void
+redwood_sound_call_state(uint32_t *ring_frames, uint32_t *queued, uint32_t *underruns, uint32_t *periods)
+{
+	*ring_frames = call_head - call_tail;
+	*queued = queued_frames;
+	*underruns = call_underruns;
+	*periods = call_periods;
+}
+
+/* Q15: the feeder's sndgain (sound=4: iOS keeps its peaks that far under full scale) undone for the call's PCM, 1 dB steps */
+uint32_t
+redwood_sound_call_gain_q15(void)
+{
+	static const uint32_t db_q15[8] = { 32768, 29205, 26029, 23198, 20675, 18427, 16423, 14637 }; /* 0..-7 dB */
+	uint32_t g = level >= 4 ? guard_gain : 0, whole = (g + 4) / 8, v = 32768;
+
+	while (whole >= 6) {
+		v /= 2;         /* (6 dB ~ a half) */
+		whole -= 6;
+	}
+	return v * db_q15[whole] / 32768;
 }
 
 /* The tone for ms (into whatever plays). */

@@ -967,6 +967,26 @@ ring_put(const int16_t *samples, uint32_t count)
 	__atomic_store_n(&ring_written, at + count, __ATOMIC_RELEASE);
 }
 
+/*
+ * 1090: the voice proxy (sweet_vproxy.c) reads the ring with a cursor of its own, never waiting and never moving
+ * /dev/redwood-mic's: count samples from `from' if they are all there and not yet overwritten (false otherwise);
+ * *written = the ring's write position either way.
+ */
+bool
+redwood_mic_voice_peek(uint64_t from, int16_t *out, uint32_t count, uint64_t *written)
+{
+	uint64_t w = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
+
+	*written = w;
+	if (from + count > w || w - from > RING_FRAMES - 2 * MIC_PERIOD_FRAMES) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		out[i] = ring[(from + i) % RING_FRAMES];
+	}
+	return true;
+}
+
 static int
 mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
