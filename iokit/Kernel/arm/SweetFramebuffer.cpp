@@ -538,7 +538,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
  */
 extern "C" {
 uint32_t sweet_bl_trace = 3;
-uint32_t sweet_bl_fix = 7;      /* 1101: 8 (backlight-calibration-parameters) off at boot until proven; sweetblfix=15 */
+uint32_t sweet_bl_fix = 11;     /* 1102: 1 + 2 + 8 (calibration proven on rk1f); 4 (ALS keep-alive) off: pointless once the panel range is right */
 }
 static IOSimpleLock *sweet_blt_lock;
 static uint64_t sweet_blt_refill;
