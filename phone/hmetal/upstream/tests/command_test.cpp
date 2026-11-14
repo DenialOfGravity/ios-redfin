@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 
 #include "hakios-metal/command.hpp"
@@ -76,6 +77,47 @@ TEST(gpu_params) {
     CHECK_EQ(r.gpu->param(0x0e, &v), EINVAL);               // VA_START: "addresses are ours to give"
     CHECK_EQ(r.gpu->param(0x0f, &v), EINVAL);               // VA_SIZE
     CHECK_EQ(r.gpu->param(0x99, &v), EINVAL);
+}
+
+// (redfin) every submission carries two CP_ALWAYS_ON_COUNTER stamps, first and last: the GPU's own start and end
+TEST(a_command_buffer_carries_its_gpu_times) {
+    if (getenv("HM_GPU_STAMPS") != nullptr) return;
+    Rig r;
+    auto a = buffer(r, 4096), b = buffer(r, 4096);
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->copy(*a, 0, *b, 0, 4096));
+    int64_t s = 0, e = 0;
+    CHECK(!cb->gpuTimes(&s, &e));   // not completed
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK(cb->gpuTimes(&s, &e));
+    CHECK(e > s);                    // (the fake's counter counts its stamps: the end is the later one)
+    CHECK(cb->committedNs() != 0);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin ws-hm-perf) an empty command buffer is not sent to the GPU: it completes in its turn, after the one before it
+TEST(an_empty_command_buffer_completes_in_order_unsent) {
+    if (getenv("HM_EMPTY_SUBMIT") != nullptr) return;
+    Rig r(true, 2000);   // (the GPU 2 ms a submission: the empty one must wait for the copy's)
+    auto a = buffer(r, 4096), b = buffer(r, 4096);
+    auto work = r.queue->commandBuffer();
+    CHECK(work->copy(*a, 0, *b, 0, 4096));
+    std::atomic<int> order{0};
+    int workAt = 0, emptyAt = 0;
+    work->addCompletedHandler([&](CommandBuffer&) { workAt = ++order; });
+    auto empty = r.queue->commandBuffer();
+    empty->addCompletedHandler([&](CommandBuffer&) { emptyAt = ++order; });
+    const uint32_t before = r.fake->stats().submits;
+    work->commit();
+    empty->commit();
+    empty->waitUntilCompleted();
+    CHECK(empty->status() == CommandBuffer::kCompleted);
+    CHECK(work->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(workAt, 1);
+    CHECK_EQ(emptyAt, 2);
+    CHECK_EQ(r.fake->stats().submits, before + 1);
 }
 
 TEST(copy_moves_the_bytes) {

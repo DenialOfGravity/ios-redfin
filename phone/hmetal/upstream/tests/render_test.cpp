@@ -8,6 +8,7 @@
 //
 // SPDX-License-Identifier: MIT
 #include <algorithm>
+#include <cstdlib>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -2547,7 +2548,10 @@ TEST(a_clear_packs_the_colour_as_each_format_holds_it) {
     const Case cases[] = {
         {PixelFormat::kRGBA8Unorm, {0.25, 0.5, 0.75, 1.0}, 4, {64, 128, 191, 255}},
         {PixelFormat::kBGRA8Unorm, {0.25, 0.5, 0.75, 1.0}, 4, {191, 128, 64, 255}},
-        {PixelFormat::kRGBA8Unorm, {-1.0, 2.0, 0.5 / 255.0, 1.5 / 255.0}, 4, {0, 255, 0, 2}},   // clamped; 0.5 and 1.5 to even
+        // clamped; 0.5/255 and 1.5/255 as floats are 0.50000003 and 1.50000003 units: to nearest, 1 and 2 (redfin: the
+        // A620's answer through Turnip; with HM_CLEAR_ROUND=even the float product 0.5 / 1.5 went to even, 0 and 2)
+        {PixelFormat::kRGBA8Unorm, {-1.0, 2.0, 0.5 / 255.0, 1.5 / 255.0}, 4, {0, 255, uint8_t(getenv("HM_CLEAR_ROUND") ? 0 : 1), 2}},
+        {PixelFormat::kBGRA8Unorm, {0.3, 0.3, 0.3, 1.0}, 4, {uint8_t(getenv("HM_CLEAR_ROUND") ? 76 : 77), uint8_t(getenv("HM_CLEAR_ROUND") ? 76 : 77), uint8_t(getenv("HM_CLEAR_ROUND") ? 76 : 77), 255}},   // hmbench W2's colour: m2v 77
         // linear 0.5 is sRGB 0.7354 -> 187.5 -> 188; alpha stays linear: 0.5 -> 128
         {PixelFormat::kRGBA8UnormSrgb, {0.5, 0.5, 0.5, 0.5}, 4, {188, 188, 188, 128}},
         {PixelFormat::kBGRA8UnormSrgb, {1.0, 0.0, 0.002, 1.0}, 4, {7, 0, 255, 255}},   // 0.002 * 12.92 * 255 = 6.6 -> 7, then swapped
@@ -5757,6 +5761,31 @@ TEST(a_pass_whose_like_was_light_is_recorded_for_sysmem_alone) {
         CHECK_EQ(cb->counts().gmemPasses, want);
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (redfin ws-hm-perf) A pass whose like had the same draws the last 4 times is decided by that as it opens and recorded
+// one way: 5 draws under a bar of 8 (above half of it, so recorded both ways at first) sysmem alone from the 5th time on,
+// saying why; 10 draws GMEM alone, the picture the same. HM_DUAL=upstream: both ways every time.
+TEST(a_pass_whose_like_was_steady_is_recorded_one_way) {
+    NoDeadFill noDeadFill;   // (redfin hm-int4: its identical draws are counted as recorded, none taken back)
+    if (getenv("HM_DUAL") != nullptr) return;
+    for (const auto& [draws, want] : {std::pair<int, uint32_t>{5, 0}, {10, 1}}) {
+        Rig r;
+        auto t = target(r);
+        RenderPass a;
+        a.color0 = t.get();
+        for (int round = 0; round < 6; round++) {
+            auto cb = r.queue->commandBuffer();
+            cb->setGmemMinDraws(8);
+            for (int i = 0; i < draws; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(6), Bindings{}, Bindings{}));
+            CHECK_EQ(cb->gmemRefusal().find("the last 4 times") != std::string::npos, round >= 4 && want == 0);
+            cb->commit();
+            cb->waitUntilCompleted();
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            CHECK_EQ(cb->counts().gmemPasses, want);
+        }
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
 }
 
 // A DontCare attachment is not loaded when the granules past its edge stay in its rows: 100 x 36 (the right edge in the

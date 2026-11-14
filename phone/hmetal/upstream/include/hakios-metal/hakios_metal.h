@@ -626,6 +626,9 @@ int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb *cb);
 /* (redfin hm-cache) that time split: queued behind the buffers before it on the ring (commit to the completion of the
  * one before), and running (from then to its fence); either pointer may be NULL */
 void hakios_metal_cb_gpu_split(hakios_metal_cb *cb, int64_t *queued, int64_t *running);
+/* (redfin) the GPU's own start and end of a completed buffer (CP_ALWAYS_ON_COUNTER stamps), as nanoseconds after its
+ * commit (*start_ns may be negative by the calibration's error): 0, or -1 when there are none (not completed, HM_GPU_STAMPS=0) */
+int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *end_ns);
 
 #ifdef __cplusplus
 }

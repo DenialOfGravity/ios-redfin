@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <cstdlib>
 #include <initializer_list>
 #include <mutex>
 #include <set>
@@ -524,10 +525,21 @@ float linearToSrgb(float c) {
     return 1.0f;
 }
 
-// tu_pack_float32_for_unorm(v, 8): _mesa_lroundevenf(CLAMP(v, 0, 1) * 255)
+// (redfin ws-hm-perf) The float clear value times 255 in double, rounded to nearest: what the A620 writes for the same
+// float when Turnip clears (SweetMetal2, TU_DEBUG=sysmem: 0.3 -> 77). The old packing (HM_CLEAR_ROUND=even) was
+// tu_pack_float32_for_unorm(v, 8) = _mesa_lroundevenf(CLAMP(v, 0, 1) * 255) in float, where 0.3f * 255.0f rounds to
+// exactly 76.5f and then to the even 76; the exact product 76.500003 is above the half.
+bool clearRoundEven() {
+    static const bool even = [] {
+        const char* e = getenv("HM_CLEAR_ROUND");
+        return e != nullptr && strcmp(e, "even") == 0;
+    }();
+    return even;
+}
 uint32_t unorm8Of(float v) {
     float c = v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;
-    return uint32_t(std::nearbyint(c * 255.0f));
+    if (clearRoundEven()) return uint32_t(std::nearbyint(c * 255.0f));
+    return uint32_t(std::floor(double(c) * 255.0 + 0.5));
 }
 
 // What a Clear writes: the 2D engine's intermediate format and RB_2D_SRC_SOLID_C0..3, the clear colour packed per
@@ -2816,6 +2828,23 @@ void appendStream(pm4::Stream& to, const pm4::Stream& from) {
 // time for a draw (12.4 us measured, probe "pass cost") goes on reading them. Written whatever it holds: a register
 // that is a command (HLSQ_INVALIDATE_CMD). Forgotten: everything, at a packet that may change registers behind the
 // stream's back -- anything but the waits, loads, draws, events and markers a draw is made of.
+// (redfin ws-hm-perf) switches, read once: HM_DUAL=upstream (a pass recorded both ways while its like had half the
+// GMEM bar or more), HM_SCRATCH=0 (four new streams a draw)
+static bool dualUpstream() {
+    static const bool v = [] {
+        const char* e = getenv("HM_DUAL");
+        return e != nullptr && strcmp(e, "upstream") == 0;
+    }();
+    return v;
+}
+static bool scratchOn() {
+    static const bool v = [] {
+        const char* e = getenv("HM_SCRATCH");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
 bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegShadow& regs) {
     bool forgot = false;
     using namespace a6xx;
@@ -3346,9 +3375,18 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             kind = render::tuneKeyOf(pass);
             ordinal = ordinals_[kind]++;
             const uint32_t peak = queue_.peakDraws(kind, ordinal);
+            uint32_t steady = 0;
             if (peak != 0 && peak < gmemMinDraws_ / 2) {
                 gmem = false;
                 gmemWhy_ = "its like had " + std::to_string(peak) + " draws at most lately";
+            } else if (!dualUpstream() && queue_.stableDraws(kind, ordinal, &steady)) {
+                // (redfin ws-hm-perf) its like had the same draws the last 4 times: decided now by that, and recorded
+                // one way only (both ways was each draw encoded twice: some 40% of a draw's CPU on the phone). One that
+                // changes after all is decided as it ends next time. HM_DUAL=upstream: both ways until the end.
+                if (steady < gmemMinDraws_) {
+                    gmem = false;
+                    gmemWhy_ = "its like had " + std::to_string(steady) + " draws the last 4 times";
+                }
             } else {
                 dual = true;
             }
@@ -3366,7 +3404,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         }
     }
     Piece passTable;
-    pm4::Stream head, body, headSys, bodySys;
+    // (redfin ws-hm-perf) the command buffer's scratch streams, emptied, not four new vectors a draw: each grew from
+    // nothing by doubling, a dozen allocations and copies a draw (HM_SCRATCH=0: new ones)
+    pm4::Stream localStreams[4];
+    pm4::Stream* streams = scratchOn() ? scratch_ : localStreams;
+    for (int i = 0; i < 4; i++) streams[i].clear();
+    pm4::Stream &head = streams[0], &body = streams[1], &headSys = streams[2], &bodySys = streams[3];
     if (!joins) {
         if (!piece(render::kTableBytes, &passTable, &why)) {
             return fail(std::string("no memory for the pass's table: ") + why);

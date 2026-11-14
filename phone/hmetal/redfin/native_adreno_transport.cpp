@@ -25,6 +25,8 @@
 #include <IOSurface/IOSurfaceRef.h>   // (on Linux: tests/shim's)
 
 #include <cerrno>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +36,7 @@
 #include <vector>
 
 #include "NativeAdrenoABI.h"
+#include "hakios-metal/prof.hpp"
 
 namespace hakios::metal {
 
@@ -140,7 +143,7 @@ public:
             if (i->info == kInfoGetOffset) { i->value = 0; return 0; }
             return EINVAL;
         }
-        case kGemClose: return size == sizeof(DrmGemClose) ? closeBo(static_cast<DrmGemClose*>(data)->handle) : EINVAL;
+        case kGemClose: return size == sizeof(DrmGemClose) ? closeBo(static_cast<DrmGemClose*>(data)->handle, &g) : EINVAL;
         case kGemCpuPrep: {
             if (size != sizeof(MsmGemCpuPrep)) return EINVAL;
             auto* p = static_cast<MsmGemCpuPrep*>(data);
@@ -376,7 +379,10 @@ private:
         bo.token = 0;
     }
 
-    int closeBo(uint32_t handle) {
+    int closeBo(uint32_t handle, std::unique_lock<std::mutex>* g = nullptr) {
+        // (an imported buffer's pages stay the caller's while a fence's flush outside the lock may still touch them:
+        // wait for that before the import goes)
+        if (g != nullptr) flushed_.wait(*g, [this] { return flushing_ == 0; });
         auto b = bos_.find(handle);
         if (b == bos_.end()) return ENOENT;
         Bo bo = b->second;
@@ -441,7 +447,12 @@ private:
         q.buffers[0].iova = ib.iova + cmd->submit_offset;
         q.buffers[0].bytes = cmd->size;
         NativeAdrenoAbiSubmitReply r{};
-        if (kern_return_t k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r))) return errnoOf(k, NativeAdrenoMethodSubmit);
+        kern_return_t k;
+        {
+            prof::Scope t(prof::kIoSubmit);
+            k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+        }
+        if (k != KERN_SUCCESS) return errnoOf(k, NativeAdrenoMethodSubmit);
         const uint32_t fence = uint32_t(r.fence);
         for (uint32_t i = 0; i < s.nr_bos; i++) {
             named[i]->lastFence = fence;
@@ -459,16 +470,35 @@ private:
         NativeAdrenoAbiWaitFence w{fence, uint64_t(left > 0 ? left : 0)};
         // the wait without our lock: the core's completion thread waits while its commit thread submits
         g.unlock();
-        const int e = errnoOf(method(NativeAdrenoMethodWaitFence, &w, sizeof(w), nullptr, 0), NativeAdrenoMethodWaitFence);
+        int e;
+        {
+            prof::Scope t(prof::kWaitIo);
+            e = errnoOf(method(NativeAdrenoMethodWaitFence, &w, sizeof(w), nullptr, 0), NativeAdrenoMethodWaitFence);
+        }
         g.lock();
         if (e != 0) return e;
         if (fence > passedFence_) passedFence_ = fence;
+        // the ranges are taken under the lock and flushed without it: a submission on the caller's thread does not
+        // wait for megabytes of dc civac here. The BO is held meanwhile (flushing_: closeBo waits for it).
+        std::vector<std::pair<void*, uint64_t>> ranges;
         for (auto& [h, b] : bos_) {
             if (b.imported && b.writeFence != 0 && b.writeFence <= passedFence_) {
-                dcacheFlush(b.importBase, b.bytes, false);
+                ranges.emplace_back(b.importBase, b.bytes);
                 b.writeFence = 0;
                 if (b.surface != nullptr && b.seedKnown) b.cleanSeed = IOSurfaceGetSeed(b.surface);   // (just invalidated: clean)
             }
+        }
+        if (!ranges.empty()) {
+            prof::Scope t(prof::kFlushAfter);
+            flushing_++;
+            g.unlock();
+            for (const auto& [p, n] : ranges) {
+                dcacheFlush(p, n, false);
+                prof::bytes(false, n, false);
+            }
+            g.lock();
+            flushing_--;
+            flushed_.notify_all();
         }
         return 0;
     }
@@ -506,6 +536,8 @@ private:
     io_connect_t c_;
     mach_timebase_info_data_t timebase_{};
     std::mutex lock_;
+    std::condition_variable flushed_;   // flushing_ back to 0
+    unsigned flushing_ = 0;             // fence flushes running outside lock_
     NativeAdrenoAbiParams params_{};
     NativeAdrenoAbiDeviceInfo info_{};
     std::map<uint64_t, uint64_t> free_;   // GPU address -> bytes free there

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <sstream>
 #include <string>
+#include "hakios-metal/prof.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <cstdlib>
 #include <cstring>
+#include <cstdlib>
 
 namespace hakios::metal {
 
@@ -471,6 +473,16 @@ void CommandQueue::noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws) {
     lastDraws_[kindKey(kind, ordinal)] = draws;
     Peak& p = peakDraws_[kindKey(kind, ordinal)];
     if (draws >= p.draws || ++p.below >= 16) p.draws = draws, p.below = 0;
+    p.same = draws == p.last ? p.same + 1 : 0;
+    p.last = draws;
+}
+
+bool CommandQueue::stableDraws(uint64_t kind, uint32_t ordinal, uint32_t* draws) {
+    std::lock_guard<std::mutex> g(lock_);
+    auto it = peakDraws_.find(kindKey(kind, ordinal));
+    if (it == peakDraws_.end() || it->second.same < 3) return false;
+    *draws = it->second.last;
+    return true;
 }
 
 uint32_t CommandQueue::peakDraws(uint64_t kind, uint32_t ordinal) {
@@ -580,6 +592,16 @@ CommandBuffer::~CommandBuffer() {
 }
 
 void CommandBuffer::finish(Status s) {
+    // (redfin) the counter stamps read now, and the piece let go: a slab held past finish is not given back to the
+    // queue's pool, and the next buffer then makes a new one (4 kernel calls)
+    if (gpuStamps_.buffer != nullptr) {
+        if (s == kCompleted) {
+            const auto* t = reinterpret_cast<const volatile uint64_t*>(gpuStamps_.contents());
+            gpuTicks_[0] = t[0];
+            gpuTicks_[1] = t[1];
+        }
+        gpuStamps_ = Piece{};
+    }
     status_ = s;
     if (s == kCompleted && counts_.binnedPasses != 0) queue_.checkVsc();
     if (s == kCompleted && tuning_) {
@@ -819,14 +841,86 @@ int CommandQueue::ringBarrier(int64_t timeoutNs) {
     return e;
 }
 
+namespace {
+bool gpuStampsOn() {
+    static const bool on = [] {
+        const char* e = getenv("HM_GPU_STAMPS");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+constexpr uint32_t kAlwaysOnCounter = 0x0980;   // REG_A6XX_CP_ALWAYS_ON_COUNTER (CommandBuffer::stamp's)
+}  // namespace
+
+static bool emptySkipOn() {
+    static const bool v = [] {
+        const char* e = getenv("HM_EMPTY_SUBMIT");
+        return e == nullptr || strcmp(e, "1") != 0;
+    }();
+    return v;
+}
+
+static bool faultsAtCommitAsked() {
+    static const bool v = [] {
+        const char* e = getenv("HM_FAULTS_AT_COMMIT");
+        return e != nullptr && strcmp(e, "1") == 0;
+    }();
+    return v;
+}
+
+void CommandQueue::calibrate() {
+    {
+        std::lock_guard<std::mutex> g(calibLock_);
+        if (calibrated_ && gpu_.transport().nowNs() - calibNs_ < 500000000) return;
+    }
+    const int64_t before = gpu_.transport().nowNs();
+    uint64_t ticks = 0;
+    if (gpu_.param(kParamTimestamp, &ticks) != 0 || ticks == 0) return;
+    const int64_t after = gpu_.transport().nowNs();
+    std::lock_guard<std::mutex> g(calibLock_);
+    calibNs_ = before + (after - before) / 2;
+    calibTicks_ = ticks;
+    calibrated_ = true;
+}
+
+bool CommandQueue::ticksToNs(uint64_t ticks, int64_t* ns) {
+    std::lock_guard<std::mutex> g(calibLock_);
+    if (!calibrated_) return false;
+    // 19.2 MHz: 1e9 / 19.2e6 = 52.083 ns a tick, as 625 / 12
+    *ns = calibNs_ + (int64_t(ticks - calibTicks_) * 625) / 12;
+    return true;
+}
+
+bool CommandBuffer::gpuTimes(int64_t* startNs, int64_t* endNs) const {
+    if (status_.load() != kCompleted) return false;
+    const uint64_t a = gpuTicks_[0], b = gpuTicks_[1];
+    if (a == 0 || b < a) return false;
+    return queue_.ticksToNs(a, startNs) && queue_.ticksToNs(b, endNs);
+}
+
 void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
+    prof::Scope whole(prof::kSubmit);
     if (poolTrimOn()) maybeTrim();   // (redfin hm-int4) HM_POOL_TRIM
     cb->committedAt_ = gpu_.transport().nowNs();
     if (!cb->error_.empty()) {
         cb->finish(CommandBuffer::kError);   // a blit that was refused: nothing of it reaches the GPU
         return;
     }
-    cb->closePass();   // the last pass's tail
+    if (emptySkipOn() && cb->open_ == nullptr && cb->stream_.size() == 0 && cb->uses_.empty()) {
+        // (redfin ws-hm-perf) nothing recorded: not sent to the GPU (two kernel calls and a fence wait), completed by the
+        // waiter in its turn, after every buffer committed before it -- what Metal promises of it. HM_EMPTY_SUBMIT=1: sent.
+        std::unique_lock<std::mutex> g(lock_);
+        cb->status_ = CommandBuffer::kCommitted;
+        cb->unsubmitted_ = true;
+        cb->status_ = CommandBuffer::kScheduled;
+        inFlight_.push_back(std::move(cb));
+        changed_.notify_all();
+        return;
+    }
+    {
+        prof::Scope t(prof::kClosePass);
+        cb->closePass();   // the last pass's tail
+    }
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();
@@ -841,20 +935,64 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         pre->preFor_ = cb;
         submit(std::move(pre));
     }
+    // (redfin) the GPU's own start and end: the counter into a piece of this buffer's, first and after the idle above
+    uint32_t pre[4] = {}, post[4] = {};
+    if (gpuStampsOn()) {
+        std::string why;
+        if (cb->piece(16, &cb->gpuStamps_, &why)) {
+            const uint64_t at = cb->gpuStamps_.gpuAddress();
+            memset(cb->gpuStamps_.contents(), 0, 16);
+            const uint32_t head = pm4::type7(a6xx::CP_REG_TO_MEM, 3);
+            const uint32_t reg = a6xx::CP_REG_TO_MEM_0_REG(kAlwaysOnCounter) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B;
+            const uint32_t a[4] = {head, reg, uint32_t(at), uint32_t(at >> 32)};
+            const uint32_t b[4] = {head, reg, uint32_t(at + 8), uint32_t((at + 8) >> 32)};
+            memcpy(pre, a, sizeof pre);
+            memcpy(post, b, sizeof post);
+            calibrate();
+        } else {
+            cb->gpuStamps_ = CommandBuffer::Piece{};
+        }
+    }
+    const bool stamped = cb->gpuStamps_.buffer != nullptr;
     const std::vector<uint32_t>& w = cb->stream_.words();
+    const size_t total = w.size() + (stamped ? 8 : 0);
     int error = 0;
-    cb->commands_ = takeCommandBo(4 * w.size(), &error);
+    {
+        prof::Scope t(prof::kCommandBo);
+        cb->commands_ = takeCommandBo(4 * total, &error);
+    }
     if (cb->commands_ == nullptr) {
         cb->error_ = std::string("no memory for the command stream: ") + strerror(error);
         cb->finish(CommandBuffer::kError);
         return;
     }
     // the stream is written in order, as write-combined memory wants it, and read back by nobody
-    memcpy(cb->commands_->cpu(), w.data(), 4 * w.size());
+    {
+        prof::Scope t(prof::kCopyWords);
+        auto* to = static_cast<uint8_t*>(cb->commands_->cpu());
+        if (stamped) {
+            memcpy(to, pre, sizeof pre);
+            memcpy(to + sizeof pre, w.data(), 4 * w.size());
+            memcpy(to + sizeof pre + 4 * w.size(), post, sizeof post);
+        } else {
+            memcpy(to, w.data(), 4 * w.size());
+        }
+    }
     std::unique_lock<std::mutex> g(lock_);  // the fences of one queue are handed out in commit order
     cb->status_ = CommandBuffer::kCommitted;
-    cb->faultsAtCommit_ = gpu_.faults();
-    int e = gpu_.submit(id_, *cb->commands_, 0, uint32_t(w.size()), cb->uses_, &cb->fence_);
+    {
+        // (redfin ws-hm-perf) the reset count the waiter saw last, not a kernel call (some 40 us on the phone) at every
+        // commit: HM_FAULTS_AT_COMMIT=1 asks the kernel as before. The one difference: a reset the waiter has not seen
+        // yet when this buffer is committed is counted against it too (it was given up with the ring anyway, unless it
+        // was committed after the reset and before the waiter's next look).
+        prof::Scope t(prof::kFaultsCommit);
+        cb->faultsAtCommit_ = faultsAtCommitAsked() || !faultsKnown_.load() ? gpu_.faults() : faultsSeen_.load();
+    }
+    int e;
+    {
+        prof::Scope t(prof::kGpuSubmit);
+        e = gpu_.submit(id_, *cb->commands_, 0, uint32_t(total), cb->uses_, &cb->fence_);
+    }
     if (e != 0) {
         cb->error_ = std::string("the driver refused the submission: ") + strerror(e);
         idle_.push_back(std::move(cb->commands_));
@@ -1070,6 +1208,18 @@ void CommandQueue::waiter() {
         }
         std::shared_ptr<CommandBuffer> cb = inFlight_.front();
         g.unlock();
+        if (cb->unsubmitted_) {
+            // (the buffers before it have completed: it has nothing of its own to wait for)
+            cb->completedAt_ = gpu_.transport().nowNs();
+            {
+                prof::Scope t(prof::kFinish);
+                cb->finish(CommandBuffer::kCompleted);
+            }
+            prof::buffer();
+            g.lock();
+            inFlight_.pop_front();
+            continue;
+        }
         int e = gpu_.wait(id_, cb->fence_, kPatienceNs);
         cb->completedAt_ = gpu_.transport().nowNs();
         cb->startedAt_ = std::max(cb->committedAt_, lastCompletedAt_);
@@ -1077,12 +1227,16 @@ void CommandQueue::waiter() {
         if (std::shared_ptr<CommandBuffer> owner = cb->preFor_.lock()) {   // (redfin hm-int3) a decode buffer's time
             owner->preRunningNs_.fetch_add(cb->runningNanoseconds(), std::memory_order_relaxed);
         }
+        const uint64_t faultsBegan = prof::on() ? prof::now() : 0;
         // A fence that passed is not yet a submission that ran. When the kernel resets a hung GPU (gpu_recover=1) it
         // gives up everything the GPU had been given, the hung submission and those behind it in the ring, by setting
         // the fence word to the last submission's number -- so their waits end as if they had run (hakios_gpu_recover:
         // "submissions up to N are given up as done"). FAULTS counts the resets; one more since the commit says so.
         uint64_t faults = gpu_.faults();
+        faultsSeen_.store(faults);
+        faultsKnown_.store(true);
         bool givenUp = faults > cb->faultsAtCommit_;
+        if (faultsBegan != 0) prof::add(prof::kFaultsDone, prof::now() - faultsBegan);
         if (e == 0 && givenUp) {
             cb->error_ = "given up by a reset of the GPU (it hung on this submission or on one before it): not run";
             e = EIO;
@@ -1112,7 +1266,11 @@ void CommandQueue::waiter() {
                 g.unlock();
             }
         }
-        cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError);
+        {
+            prof::Scope t(prof::kFinish);   // (ws-hm-perf)
+            cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError);
+        }
+        prof::buffer();
         g.lock();
         inFlight_.pop_front();
         if (cb->commands_ != nullptr) {

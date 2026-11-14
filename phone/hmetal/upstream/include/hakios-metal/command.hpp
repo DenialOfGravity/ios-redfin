@@ -109,6 +109,12 @@ public:
     int64_t runningNanoseconds() const { return gpuNanoseconds() == 0 ? 0 : gpuNanoseconds() - queuedNanoseconds(); }
     // (redfin hm-int3) of runningNanoseconds, the decode buffers sent just before it (0: none, or not complete yet)
     int64_t decodeRunningNanoseconds() const { return preRunningNs_.load(std::memory_order_relaxed); }
+    // (redfin) the GPU's own start and end of it, from CP_ALWAYS_ON_COUNTER stamps the submission writes before its first
+    // packet and after its final wait for idle (HM_GPU_STAMPS=0: none), as nanoseconds of the transport's nowNs clock
+    // (the counter's 19.2 MHz put on that clock by the queue's calibration against GET_PARAM TIMESTAMP). False when the
+    // buffer has not completed, carried no stamps, or the stamps are not in order; committedNs is nowNs at the commit.
+    bool gpuTimes(int64_t* startNs, int64_t* endNs) const;
+    int64_t committedNs() const { return committedAt_; }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -481,6 +487,10 @@ private:
     // preRunningNs_ at completion); and, on that buffer, the sum of its decode buffers' running times
     std::weak_ptr<CommandBuffer> preFor_;
     std::atomic<int64_t> preRunningNs_{0};
+    Piece gpuStamps_;                                   // (redfin) the two counter stamps, when gpuStamps_.buffer (until finish)
+    uint64_t gpuTicks_[2] = {0, 0};                     // ...as finish read them
+    bool unsubmitted_ = false;                          // (redfin) empty: completed in order without the GPU
+    pm4::Stream scratch_[4];                            // (redfin) draw()'s head, body, headSys, bodySys, reused
 };
 
 class CommandQueue {
@@ -554,6 +564,8 @@ public:
     // (redfin hmv8) until the GPU has run everything any client put on the ring before now (one ring, in order: an
     // empty submission's fence covers it), or TIMEOUT_NS: 0, ETIMEDOUT or an errno. HM_XR_SYNC's barrier.
     int ringBarrier(int64_t timeoutNs);
+    // (redfin) whether the pass at that place has had the same number of draws the last 4 times, and *DRAWS that number
+    bool stableDraws(uint64_t kind, uint32_t ordinal, uint32_t* draws);
 
 
 private:
@@ -563,6 +575,15 @@ private:
     std::atomic<int64_t> lastTrimNs_{0}, lastPoolUseNs_{0}, lastPrivateUseNs_{0};
     void submit(std::shared_ptr<CommandBuffer> cb);
     void waiter();
+    // (redfin) the always-on counter (19.2 MHz ticks) against nowNs: a pair read together, again at most every 0.5 s
+    void calibrate();
+    bool ticksToNs(uint64_t ticks, int64_t* ns);
+    std::mutex calibLock_;
+    int64_t calibNs_ = 0;
+    uint64_t calibTicks_ = 0;
+    bool calibrated_ = false;
+    std::atomic<uint64_t> faultsSeen_{0};   // (redfin) GET_PARAM FAULTS as the waiter read it last
+    std::atomic<bool> faultsKnown_{false};
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
     void recoverAfterReset(CommandBuffer& hung, uint64_t faults);   // (redfin hmv6) HM_RESET_RECOVER, lock_ held
     int64_t lastCompletedAt_ = 0;   // (redfin hm-cache) the waiter's last completion (CommandBuffer::startedAt_)
@@ -588,7 +609,7 @@ private:
     struct Tune { double us[2] = {0, 0}; uint32_t runs[2] = {0, 0}; uint32_t passes = 0; };
     std::unordered_map<uint64_t, Tune> tune_;   // (under lock_) preferGmem's, by target
     std::unordered_map<uint64_t, uint32_t> lastDraws_;   // (under lock_) noteDraws', by kind and ordinal
-    struct Peak { uint32_t draws = 0, below = 0; };
+    struct Peak { uint32_t draws = 0, below = 0, last = ~0u, same = 0; };   // (redfin: last, same -- stableDraws')
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
     std::condition_variable changed_;
     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
