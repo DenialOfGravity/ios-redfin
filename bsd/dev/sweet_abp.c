@@ -98,6 +98,8 @@ uint32_t sweet_abm_snum = 0x5eed0001;
 extern int SweetABMStats(char *buf, size_t len);
 extern int SweetABPPublish(bool on, const char *why);
 extern int SweetABPPublished(void);
+extern int SweetBBVPublish(bool on, const char *why);   /* 1092: SweetABP.cpp */
+extern int SweetBBVPublished(void);
 
 extern kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size,
     vm_machine_attribute_t attribute, vm_machine_attribute_val_t *value);
@@ -636,6 +638,27 @@ sysctl_abp_publish(__unused struct sysctl_oid *oidp, __unused void *arg1, __unus
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_publish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_publish, "I",
     "redfin 1063: 1 = baseband stand-ins published; write 1/0 to publish/un-publish now (debugging)");
+
+/* 1092: the "Baseband Voice" IOService (SweetABP.cpp); needs the sweetabp services (SweetABPStart) */
+static int
+sysctl_bbv_service(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = SweetBBVPublished(), changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (e == 0 && changed) {
+		if (proc_suser(req->p) != 0) {
+			return EPERM;
+		}
+		e = SweetBBVPublish(v != 0, v ? "kern.sweet_bbv_service=1" : "kern.sweet_bbv_service=0");
+		if (e == EALREADY) {
+			e = 0;
+		}
+	}
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_bbv_service, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_bbv_service, "I",
+    "redfin 1092: 1 = IOService \"Baseband Voice\" published (BasebandVoice.driver stands down at mediaserverd start); "
+    "write 1/0 to publish/terminate (default 0, boot-arg sweetbbv=1)");
 
 static int
 sysctl_abp_stage(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)

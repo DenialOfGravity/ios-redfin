@@ -72,6 +72,8 @@ extern "C" {
 void SweetABPStart(void);
 int SweetABPPublish(bool on, const char *why);
 int SweetABPPublished(void);
+int SweetBBVPublish(bool on, const char *why);       /* 1092 */
+int SweetBBVPublished(void);
 int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
 int SweetABPStats(char *buf, size_t len);
 void SweetABPSetBootstage(uint32_t stage);
@@ -169,6 +171,7 @@ static IOService *abp_services[12];
 static unsigned abp_nservices;
 static bool abp_started;                /* pipes set up (locks); the services may still be unpublished (1063 deferred publish) */
 static IOLock *abp_svc_lock;            /* 1063: publish / unpublish against each other and the service loops */
+static IOLock *bbv_lock;                /* 1092: "Baseband Voice" publish / terminate */
 static uint32_t abp_publishes, abp_unpublishes;
 
 static void
@@ -1584,7 +1587,16 @@ SweetABPStart(void)
 	}
 	abp_svc_lock = IOLockAlloc();
 	abm_lock = IOLockAlloc();
+	bbv_lock = IOLockAlloc();      /* 1092 */
 	abp_started = true;
+	/* 1092: "Baseband Voice" from boot only with boot-arg sweetbbv=1 (before mediaserverd loads BasebandVoice.driver) */
+	uint32_t bbv = 0;
+	PE_parse_boot_argn("sweetbbv", &bbv, sizeof(bbv));
+	if (bbv) {
+		SweetBBVPublish(true, "boot-arg sweetbbv");
+	} else {
+		IOLog("SWEET BBV: \"Baseband Voice\" not published (default; boot-arg sweetbbv=1 or kern.sweet_bbv_service=1)\n");
+	}
 }
 
 /* Lock (abp_svc_lock) held. Publishes the whole set under the platform expert. */
@@ -1755,6 +1767,110 @@ int
 SweetABPPublished(void)
 {
 	return abp_nservices != 0;
+}
+
+/*
+ * 1092: "Baseband Voice". BasebandVoice.driver (HAL plug-in in mediaserverd) decides once, when it loads, whether it
+ * publishes its own PCIe baseband audio device: IOServiceGetMatchingService(IOServiceNameMatching("Baseband Voice"))
+ * finding a service = "BVCanPublishBasebandVoice: NO (I2S device present)", as on a real D22 whose kernel I2S device
+ * has that name. The stock driver reads nothing from the service (BBA study A1: existence only), so the service has
+ * no properties of its own beyond "SweetABP" (marks it as ours) and opens nothing on it; an IOServiceOpen is logged
+ * (first 8) and refused with kIOReturnUnsupported. Our RedwoodAudio plug-in provides the HAL device of that name.
+ * Published under the platform expert, independent of the stand-in set (SweetABPPublish never touches it).
+ * Default off; boot-arg sweetbbv=1 publishes it from SweetABPStart; kern.sweet_bbv_service 1/0 publishes/terminates
+ * it at run time (mediaserverd decides only when it starts: restart it after a change).
+ */
+class SweetBasebandVoice : public IOService
+{
+	OSDeclareDefaultStructors(SweetBasebandVoice);
+public:
+	using IOService::newUserClient;
+	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(SweetBasebandVoice, IOService);
+
+static IOService *bbv_service;
+static uint32_t bbv_publishes, bbv_unpublishes, bbv_opens;
+
+IOReturn
+SweetBasebandVoice::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+    IOUserClient **handler)
+{
+	(void)owningTask; (void)securityID; (void)properties;
+	uint32_t n = OSIncrementAtomic((SInt32 *)&bbv_opens) + 1;
+	if (n <= 8) {
+		char pname[32];
+		proc_selfname(pname, sizeof(pname));
+		IOLog("SWEET BBV: open of \"Baseband Voice\" (type %u) by pid %d %s: unsupported (#%u)\n", (unsigned)type,
+		    proc_selfpid(), pname, n);
+	}
+	if (handler) {
+		*handler = NULL;
+	}
+	return kIOReturnUnsupported;
+}
+
+/* 0 ok, EALREADY when already in that state, ENXIO before SweetABPStart / without a platform expert, ENOMEM. */
+extern "C" int
+SweetBBVPublish(bool on, const char *why)
+{
+	if (!abp_started || bbv_lock == NULL) {
+		return ENXIO;
+	}
+	IOLockLock(bbv_lock);
+	if (on == (bbv_service != NULL)) {
+		IOLockUnlock(bbv_lock);
+		return EALREADY;
+	}
+	if (!on) {
+		IOService *svc = bbv_service;
+		bbv_service = NULL;
+		bbv_unpublishes++;
+		IOLockUnlock(bbv_lock);
+		svc->terminate();
+		svc->release();
+		IOLog("SWEET BBV: \"Baseband Voice\" terminated (%s, #%u)\n", why, bbv_unpublishes);
+		return 0;
+	}
+	IOService *platform = IOService::getPlatform();
+	if (platform == NULL) {
+		IOLockUnlock(bbv_lock);
+		IOLog("SWEET BBV: no platform expert yet: \"Baseband Voice\" not published (%s)\n", why);
+		return ENXIO;
+	}
+	SweetBasebandVoice *svc = OSTypeAlloc(SweetBasebandVoice);
+	if (svc == NULL || !svc->init()) {
+		OSSafeReleaseNULL(svc);
+		IOLockUnlock(bbv_lock);
+		return ENOMEM;
+	}
+	svc->setProperty("SweetABP", true);
+	if (!svc->attach(platform)) {
+		svc->release();
+		IOLockUnlock(bbv_lock);
+		return ENOMEM;
+	}
+	svc->setName("Baseband Voice");
+	if (!svc->start(platform)) {
+		svc->detach(platform);
+		svc->release();
+		IOLockUnlock(bbv_lock);
+		return ENXIO;
+	}
+	svc->registerService();
+	bbv_service = svc;              /* the attach keeps the registry's reference; this one is ours */
+	bbv_publishes++;
+	IOLockUnlock(bbv_lock);
+	IOLog("SWEET BBV: published \"Baseband Voice\" (SweetBasebandVoice) under %s (%s, #%u)\n", platform->getName(), why,
+	    bbv_publishes);
+	return 0;
+}
+
+extern "C" int
+SweetBBVPublished(void)
+{
+	return bbv_service != NULL;
 }
 
 void
