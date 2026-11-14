@@ -3016,6 +3016,71 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
     return true;
 }
 
+// (redfin hm-int4) HM_DEADFILL=1 (default; 0: every draw recorded, as hm-int3): SweetMetal2's SWEET_DEADFILL mode 1 in
+// the pass recording. A draw that a later draw of the same pass overwrites completely is taken back out of the stream:
+// the later one has the same geometry (the same program, the same vertex bindings, or vertex bytes equal, the same draw
+// numbers, viewport and scissor: the same pixels rasterised), and writes every one of them opaquely (no blending, all
+// four channels, no discard, no sample mask, no framebuffer read, no depth or stencil, one sample); the earlier one
+// writes nothing but colour 0 (no device buffer, image or visibility write). Only the pass's last draw is taken back
+// (nothing recorded after it: the stream ends with its words), and only in sysmem with no per-draw stamps; HM_HANG_DUMP's
+// marks move with it. CoreAnimation draws a full-screen opaque fill of a layer and then fills it again in the same
+// pass; the first is
+// ~1.7 ms of a sysmem pass on the A620 for nothing. Counted in Counts::fillsDropped and hakios_metal_fills_dropped().
+std::atomic<uint64_t> gFillsDropped{0};
+bool deadFillOn() {
+    const char* e = getenv("HM_DEADFILL");
+    return e == nullptr || e[0] == 0 || atoi(e) != 0;
+}
+// a draw that writes colour 0 alone and nothing else (it may be taken back), and that writes every pixel it covers
+// opaquely (it may take back another): bit 1 and bit 2
+uint32_t deadFillRole(const Program& program, const RenderPass& pass, const Draw& d) {
+    if (pass.color0 == nullptr || pass.depth != nullptr || pass.stencil != nullptr || pass.color0->samples() != 1 || program.samples > 1) return 0;
+    if (d.visibilityMode != 0 || d.indirect != nullptr || d.instanceCount != 1) return 0;
+    if (render::drawnAttachments(program, pass) != 1u) return 0;
+    if ((program.vs.k.numSsbos != 0 && (program.ssboWrites & 1)) || (program.fs.k.numSsbos != 0 && (program.ssboWrites & 2))) return 0;
+    for (const Stage* s : {&program.vs, &program.fs}) {
+        for (uint32_t i = 0; i < kMaxTextureSlots && i < s->k.numTextureSlots; i++) {
+            if (s->k.textures[i].kind == kTexImage) return 0;
+        }
+    }
+    uint32_t role = 1;
+    if (!program.blend.enabled && (program.blend.writeMask & 0xf) == 0xf && !program.fs.hasKill && !program.fs.writesSmask && !program.fs.fbRead &&
+        program.fs.sampleMaskRegid == a6xx::kRegidNone) {
+        role |= 2;
+    }
+    return role;
+}
+// the geometry a draw rasterises, as bytes: equal keys, equal pixels covered. A vertex buffer is named by its object and
+// offset, or, when it is a small one (setVertexBytes: at most 4 KB from the offset), by its bytes
+std::vector<uint8_t> deadFillKey(const Program& program, const Draw& d, const Bindings& vs) {
+    std::vector<uint8_t> k;
+    auto add = [&](const void* p, size_t n) { k.insert(k.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
+    const Program* pp = &program;
+    add(&pp, sizeof pp);
+    const uint32_t nums[] = {uint32_t(d.primitive), d.cullMode, d.winding, d.vertexStart, d.vertexCount, d.instanceCount, d.indexType,
+                             uint32_t(d.baseVertex), d.baseInstance};
+    add(nums, sizeof nums);
+    add(&d.indexBuffer, sizeof d.indexBuffer);
+    add(&d.indexOffset, sizeof d.indexOffset);
+    add(&d.viewport, sizeof d.viewport);
+    add(&d.scissor, sizeof d.scissor);
+    for (const Binding& b : vs.buffers) {
+        const uint64_t len = b.buffer != nullptr && b.buffer->length() > b.offset ? b.buffer->length() - b.offset : 0;
+        if (b.buffer != nullptr && len <= 4096 && b.buffer->contents() != nullptr) {
+            const uint64_t tag = len;
+            add(&tag, sizeof tag);
+            add(static_cast<const uint8_t*>(b.buffer->contents()) + b.offset, size_t(len));
+        } else {
+            add(&b.buffer, sizeof b.buffer);
+            add(&b.offset, sizeof b.offset);
+        }
+    }
+    for (const Texture* t : vs.textures) add(&t, sizeof t);
+    for (const Sampler* s : vs.samplers) add(&s, sizeof s);
+    return k;
+}
+uint64_t fillsDropped() { return gFillsDropped.load(std::memory_order_relaxed); }
+
 bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, const Draw& d, const Bindings& vsGiven, const Bindings& fsGiven,
                          const render::Options& options) {
     if (status_ > kEnqueued) {
@@ -3320,6 +3385,30 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             return refuseWork(why);
         }
     }
+    // (redfin hm-int4) HM_DEADFILL: the pass's last draw taken back when this one overwrites every pixel of it
+    const uint32_t dfRole = !profileDraws_ && deadFillOn() ? deadFillRole(program, pass, d) : 0;
+    std::vector<uint8_t> dfKey;
+    if (dfRole != 0) dfKey = deadFillKey(program, d, *vsb);
+    if (joins && (dfRole & 2) && !open_->gmem && !open_->dual && open_->df.armed && stream_.size() == open_->df.end && open_->df.key == dfKey) {
+        if (hangDumpOn() && !marks_.empty() && marks_.back().word == open_->df.end) {
+            // (HM_HANG_DUMP's marks: the one of the draw taken back goes, this draw's starts where that one did)
+            Mark cur = marks_.back();
+            marks_.pop_back();
+            if (!marks_.empty() && marks_.back().kind == kMarkDraw && marks_.back().word >= open_->df.start) marks_.pop_back();
+            cur.word = uint32_t(open_->df.start);
+            marks_.push_back(cur);
+        }
+        stream_.truncate(open_->df.start);
+        open_->regs = open_->df.regs;
+        open_->staticKey = open_->df.staticKey;
+        open_->lastFetched = open_->df.lastFetched;
+        open_->draws--;
+        counts_.draws--;
+        if ((profile_ || tuning_) && !profiled_.empty() && profiled_.back().draws != 0) profiled_.back().draws--;
+        counts_.fillsDropped++;
+        gFillsDropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (open_ != nullptr) open_->df.armed = false;
     render::Options encodeOptions = options;
     // The state a draw's program and pass alone decide (render::Options' zsNone, mrt, msaaOff, renderCntl, lrzOff, vpc,
     // fsInputs, fsOutputs: register writes and nothing else) is not encoded again for a draw whose program, blending,
@@ -3454,6 +3543,14 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         drawsProfiled_.push_back(dt);
         drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
     }
+    // (redfin hm-int4) HM_DEADFILL: this draw may be taken back by the next: the stream and dedup state from before it
+    const bool dfArm = dfRole != 0 && !open_->gmem && !open_->dual && &into == &stream_ && !timed;
+    if (dfArm) {
+        open_->df.start = stream_.size();
+        open_->df.regs = open_->regs;
+        open_->df.staticKey = open_->staticKey;
+        open_->df.lastFetched = open_->lastFetched;
+    }
     if (options.dedupRegs && open_->options.dedupRegs) {
         bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
         if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
@@ -3463,6 +3560,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         if (open_->dual) appendStream(open_->sysStream, bodySys);
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
+    if (dfArm) {
+        open_->df.end = stream_.size();
+        open_->df.key = std::move(dfKey);
+        open_->df.armed = true;
+    }
     counts_.draws++;
     if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing

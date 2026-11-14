@@ -1310,6 +1310,8 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     return r;
 }
 
+unsigned long long hakios_metal_fills_dropped(void) { return fillsDropped(); }
+
 void hakios_metal_pool_stats(unsigned long long out[8]) {
     uint64_t s[kPoolKinds + 2];
     poolStats(s);

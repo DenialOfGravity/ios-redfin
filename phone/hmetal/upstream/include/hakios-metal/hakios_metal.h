@@ -348,6 +348,9 @@ int hakios_metal_known_read_mask(const void *fs_bitcode, size_t fs_size, const h
  * idle memory let go now (FORCE 1: all of it; 0: what HM_POOL_IDLE_S says): the bytes freed. */
 void hakios_metal_pool_stats(unsigned long long out[8]);
 unsigned long long hakios_metal_pool_trim(int force);
+/* (redfin hm-int4) HM_DEADFILL: the draws taken back in this process so far (a pass's draw that the next draw of the
+ * same geometry overwrote opaquely) */
+unsigned long long hakios_metal_fills_dropped(void);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* (redfin hmv7) HM_HANG_BLAME: how many hung command buffers drew with PROGRAM (only programs of at least

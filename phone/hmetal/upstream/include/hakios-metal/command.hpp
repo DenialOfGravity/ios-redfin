@@ -44,6 +44,8 @@ void poolStats(uint64_t out[kPoolKinds + 2]);
 // every queue's idle memory let go (CommandQueue::trim); FORCE: what is idle at all, not only what has been for HM_POOL_IDLE_S.
 // Returns the bytes freed. Called by newBuffer when the kernel refuses an allocation, and past HM_POOL_SOFT_MB.
 uint64_t trimAllQueues(bool force);
+// (redfin hm-int4) HM_DEADFILL's draws taken back in this process, every command buffer (render.cpp)
+uint64_t fillsDropped();
 class Buffer {
 public:
     Buffer(std::unique_ptr<Bo> bo, uint64_t length) : bo_(std::move(bo)), length_(length) {}
@@ -169,7 +171,8 @@ public:
     // What the buffer holds, counted as it is recorded: passes opened (each a pass start, its flushes and the wait for
     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
-    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0,
+                    fillsDropped = 0; };   // (redfin hm-int4) fillsDropped: HM_DEADFILL's draws taken back (render.cpp)   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
     // of each pass and after its tail -- whose wait for idle makes the end the end -- for the first kMaxProfiled passes:
@@ -356,6 +359,16 @@ private:
         uint32_t clearWords[kMaxColorOutputs][4] = {};
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
+        // (redfin hm-int4) HM_DEADFILL: the pass's last draw, when a later draw of the same geometry may take it back
+        // (render.cpp deadFillKey): where its words are in the stream and the dedup state from before them
+        struct DeadFill {
+            bool armed = false;
+            size_t start = 0, end = 0;
+            RegShadow regs;
+            std::vector<uint8_t> staticKey;
+            bool lastFetched = false;
+            std::vector<uint8_t> key;
+        } df;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
     };
     void closePass();

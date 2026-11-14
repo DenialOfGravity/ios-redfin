@@ -5614,6 +5614,57 @@ TEST(the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target) {
     CHECK_EQ(u->counts().gmemPasses, 1u);
 }
 
+// (redfin hm-int4) HM_DEADFILL: a draw the next draw of the same geometry overwrites opaquely is taken back -- the stream
+// of [fill, fill] is the stream of [fill] word for word and one draw is counted dropped; not with HM_DEADFILL=0, not when
+// the later draw blends, covers other pixels (another vertex count), or something came between them (a draw of another
+// geometry); and a third identical fill takes back the second (each time only the last)
+TEST(a_fill_overwritten_by_the_next_of_the_same_geometry_is_taken_back) {
+    Rig r;
+    auto t = target(r);
+    RenderPass a;
+    a.color0 = t.get();
+    render::Options o;
+    o.gmem = false;
+    const Program fill = flatProgram();
+    Program blended = flatProgram();
+    blended.blend.enabled = true;
+    blended.blend.srcRgb = blended.blend.srcAlpha = 1, blended.blend.dstRgb = blended.blend.dstAlpha = 1;
+    auto run = [&](std::initializer_list<std::pair<const Program*, uint32_t>> draws, uint32_t* dropped, uint32_t* drawn) {
+        auto cb = r.queue->commandBuffer();
+        for (const auto& [p, n] : draws) CHECK(cb->draw(*p, a, wholeDraw(n), Bindings{}, Bindings{}, o));
+        const size_t words = cb->streamWords();
+        *dropped = cb->counts().fillsDropped;
+        *drawn = cb->counts().draws;
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        return words;
+    };
+    uint32_t dropped = 0, drawn = 0;
+    const size_t one = run({{&fill, 3}}, &dropped, &drawn);
+    CHECK(dropped == 0 && drawn == 1);
+    const uint64_t before = fillsDropped();
+    CHECK_EQ(run({{&fill, 3}, {&fill, 3}}, &dropped, &drawn), one);
+    CHECK(dropped == 1 && drawn == 1);
+    CHECK_EQ(fillsDropped(), before + 1);
+    CHECK_EQ(run({{&fill, 3}, {&fill, 3}, {&fill, 3}}, &dropped, &drawn), one);
+    CHECK(dropped == 2 && drawn == 1);
+    setenv("HM_DEADFILL", "0", 1);
+    CHECK(run({{&fill, 3}, {&fill, 3}}, &dropped, &drawn) > one);
+    CHECK(dropped == 0 && drawn == 2);
+    unsetenv("HM_DEADFILL");
+    run({{&fill, 3}, {&blended, 3}}, &dropped, &drawn);
+    CHECK(dropped == 0 && drawn == 2);
+    run({{&fill, 3}, {&fill, 6}}, &dropped, &drawn);
+    CHECK(dropped == 0 && drawn == 2);
+    run({{&fill, 3}, {&fill, 6}, {&fill, 3}}, &dropped, &drawn);
+    CHECK(dropped == 0 && drawn == 3);
+    // (a blended draw is not taken back by a later blended one either: it does not overwrite)
+    run({{&blended, 3}, {&blended, 3}}, &dropped, &drawn);
+    CHECK(dropped == 0 && drawn == 2);
+}
+
 // GMEM for a pass of enough draws, decided at its end: the pass is recorded both ways and the words of one go to the
 // stream -- 1 draw and 3 draws under a minimum of 2, and 2 fetching draws (whose sysmem side has a table of its own: the
 // fetch reads memory there); and a pass in which a draw a tile cannot replay comes (a visibility count) goes on in

@@ -77,6 +77,7 @@ public:
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
     void clear() { words_.clear(); }
+    void truncate(size_t n) { if (n < words_.size()) words_.resize(n); }   // (redfin hm-int4) HM_DEADFILL's take-back
 
 private:
     void command(uint32_t opcode, uint32_t count);

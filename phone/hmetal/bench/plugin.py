@@ -2342,10 +2342,28 @@ static void
 hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 {
 """
+# HM_DEADFILL's count on the HM_PROF line
+HMI4_PROF_OLD = '''			 hm_presents_seen ? "frames = presentDrawable" : "frames = buffers that drew the display's IOSurface",
+			 hm_prof.other != 0 ? " (passes past the classes not listed)" : "");
+'''
+HMI4_PROF_NEW = '''			 hm_presents_seen ? "frames = presentDrawable" : "frames = buffers that drew the display's IOSurface",
+			 hm_prof.other != 0 ? " (passes past the classes not listed)" : "");
+		{   /* (redfin hm-int4) HM_DEADFILL: draws taken back in these seconds; and the pool */
+			static unsigned long long droppedBefore;
+			const unsigned long long dropped = hakios_metal_fills_dropped();
+			const char *df = getenv("HM_DEADFILL");
+
+			hm_print("prof: fills dropped %llu (%.1f a frame; HM_DEADFILL=%s)\\n", dropped - droppedBefore, (dropped - droppedBefore) / frames,
+				 df != NULL ? df : "1");
+			droppedBefore = dropped;
+			hm_pool_note(now, 1);
+		}
+'''
 HMI4_EDITS += [
     ('static BOOL hm_fps_on(void);', 'static BOOL hm_fps_on(void);\nstatic void hm_pool_note(double now, int force);   /* (redfin hm-int4) HM_POOL_LOG */'),
     (HMI4_POOL_FN_OLD, HMI4_POOL_FN_NEW),
     (HMI4_POOL_OLD, HMI4_POOL_NEW),
+    (HMI4_PROF_OLD, HMI4_PROF_NEW),
 ]
 EDITS += HMI4_EDITS
 
