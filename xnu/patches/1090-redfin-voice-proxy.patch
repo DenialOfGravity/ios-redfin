@@ -772,7 +772,7 @@ index e61365d..0cdea79 100644
  route_set(int route, bool from_ios)
 diff --git a/bsd/dev/sweet_vproxy.c b/bsd/dev/sweet_vproxy.c
 new file mode 100644
-index 0000000..8e6f77a
+index 0000000..01e1f30
 --- /dev/null
 +++ b/bsd/dev/sweet_vproxy.c
 @@ -0,0 +1,913 @@
@@ -895,7 +895,7 @@ index 0000000..8e6f77a
 +	uint32_t dl_under, ul_under, dl_over, ul_over;
 +	int32_t dl_slip, ul_slip;
 +};
-+static struct win w, total;
++static struct win cw, ct;              /* this second, this call */
 +static uint64_t call_began_us, last_dl_mach;
 +static int dl_slip_mode, ul_slip_mode;          /* -1 drop one frame/sample per frame, +1 add one, 0 none */
 +static uint64_t ul_cursor;
@@ -1378,7 +1378,7 @@ index 0000000..8e6f77a
 +		x[i] = v;
 +		peak = a > peak ? a : peak;
 +	}
-+	w.dl_peak = peak > w.dl_peak ? peak : w.dl_peak;
++	cw.dl_peak = peak > cw.dl_peak ? peak : cw.dl_peak;
 +	dtmf_frame(x, n, at);
 +	for (uint32_t i = 0; i < n; i++) {
 +		int32_t prev = i ? x[i - 1] : dl_prev;
@@ -1395,25 +1395,25 @@ index 0000000..8e6f77a
 +	dl_prev = x[n - 1];
 +	if (dl_slip_mode < 0) {
 +		o--;                    /* one 48 kHz frame less */
-+		w.dl_slip--;
++		cw.dl_slip--;
 +	} else if (dl_slip_mode > 0) {
 +		out[2 * o] = out[2 * o - 2];
 +		out[2 * o + 1] = out[2 * o - 1];
 +		o++;
-+		w.dl_slip++;
++		cw.dl_slip++;
 +	}
 +	if (redwood_sound_call_put(out, o) < o) {
-+		w.dl_over++;
++		cw.dl_over++;
 +	}
 +	redwood_sound_call_state(&ring, &queued, &under, &periods);
 +	if (under != sound_underruns_seen) {
-+		w.dl_under += under - sound_underruns_seen;
++		cw.dl_under += under - sound_underruns_seen;
 +		sound_underruns_seen = under;
 +	}
-+	w.dl_ring_min = ring < w.dl_ring_min ? ring : w.dl_ring_min;
-+	w.dl_ring_max = ring > w.dl_ring_max ? ring : w.dl_ring_max;
-+	w.dl_ring_sum += ring;
-+	w.dl_rings++;
++	cw.dl_ring_min = ring < cw.dl_ring_min ? ring : cw.dl_ring_min;
++	cw.dl_ring_max = ring > cw.dl_ring_max ? ring : cw.dl_ring_max;
++	cw.dl_ring_sum += ring;
++	cw.dl_rings++;
 +}
 +
 +/* An uplink slot is free: the next 10 ms of the microphone, 48 kHz -> 16/8 kHz (the average of each 3/6 samples) */
@@ -1437,12 +1437,12 @@ index 0000000..8e6f77a
 +	if (avail > MIC_MOST) {
 +		ul_cursor = written - MIC_KEEP;
 +		avail = MIC_KEEP;
-+		w.ul_over++;
++		cw.ul_over++;
 +	}
-+	w.ul_ring_min = avail < w.ul_ring_min ? (uint32_t)avail : w.ul_ring_min;
-+	w.ul_ring_max = avail > w.ul_ring_max ? (uint32_t)avail : w.ul_ring_max;
-+	w.ul_ring_sum += avail;
-+	w.rings++;
++	cw.ul_ring_min = avail < cw.ul_ring_min ? (uint32_t)avail : cw.ul_ring_min;
++	cw.ul_ring_max = avail > cw.ul_ring_max ? (uint32_t)avail : cw.ul_ring_max;
++	cw.ul_ring_sum += avail;
++	cw.rings++;
 +	if (ul_slip_mode < 0) {
 +		take = need + 1;        /* one sample more consumed */
 +	} else if (ul_slip_mode > 0) {
@@ -1450,14 +1450,14 @@ index 0000000..8e6f77a
 +	}
 +	if (!redwood_mic_voice_peek(ul_cursor, in, need + 1 > take ? need + 1 : take, &written) &&
 +	    !redwood_mic_voice_peek(ul_cursor, in, need, &written)) {
-+		w.ul_under++;
++		cw.ul_under++;
 +		goto silence;
 +	}
 +	if (take > need && avail < take) {
 +		take = need;
 +	}
 +	ul_cursor += take;
-+	w.ul_slip += (int32_t)need - (int32_t)take;
++	cw.ul_slip += (int32_t)need - (int32_t)take;
 +	for (uint32_t i = 0; i < n; i++) {
 +		int32_t sum = 0;
 +
@@ -1468,7 +1468,7 @@ index 0000000..8e6f77a
 +		dst[i] = (int16_t)sum;
 +		peak = (uint32_t)(sum < 0 ? -sum : sum) > peak ? (uint32_t)(sum < 0 ? -sum : sum) : peak;
 +	}
-+	w.ul_peak = peak > w.ul_peak ? peak : w.ul_peak;
++	cw.ul_peak = peak > cw.ul_peak ? peak : cw.ul_peak;
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	return;
 +silence:
@@ -1507,20 +1507,20 @@ index 0000000..8e6f77a
 +				continue;
 +			}
 +			if (db & (1u << s)) {
-+				w.dl_fail++;
++				cw.dl_fail++;
 +				dl_retry |= 1u << s;    /* sent again at the next 10 ms tick, not at once */
 +				continue;
 +			}
 +			if (last_dl_mach != 0) {
 +				uint32_t gap = (uint32_t)(mach_us(dl_at[s]) - mach_us(last_dl_mach));
 +
-+				w.gap_min = gap < w.gap_min ? gap : w.gap_min;
-+				w.gap_max = gap > w.gap_max ? gap : w.gap_max;
-+				w.gap_sum += gap;
-+				w.gaps++;
++				cw.gap_min = gap < cw.gap_min ? gap : cw.gap_min;
++				cw.gap_max = gap > cw.gap_max ? gap : cw.gap_max;
++				cw.gap_sum += gap;
++				cw.gaps++;
 +			}
 +			last_dl_mach = dl_at[s];
-+			w.dl++;
++			cw.dl++;
 +			dl_frame(s);
 +			if (!dl_issue(s)) {
 +				dl_retry |= 1u << s;
@@ -1531,11 +1531,11 @@ index 0000000..8e6f77a
 +				continue;
 +			}
 +			if (ub & (1u << s)) {
-+				w.ul_fail++;
++				cw.ul_fail++;
 +				ul_retry |= 1u << s;
 +				continue;
 +			}
-+			w.ul++;
++			cw.ul++;
 +			ul_frame(s);
 +			if (!ul_issue(s)) {
 +				ul_retry |= 1u << s;
@@ -1561,27 +1561,27 @@ index 0000000..8e6f77a
 +			seconds++;
 +			window_us = now;
 +			redwood_sound_call_state(&ring, &queued, &under, &periods);
-+			if (!said_no_dl && total.dl + w.dl == 0) {
-+				SAY("THE DSP GIVES NO DOWNLINK FRAMES on %#x (%u read errors; AFE events: start %u stop %u)\n", PORT_RX, w.dl_fail,
++			if (!said_no_dl && ct.dl + cw.dl == 0) {
++				SAY("THE DSP GIVES NO DOWNLINK FRAMES on %#x (%u read errors; AFE events: start %u stop %u)\n", PORT_RX, cw.dl_fail,
 +				    ev_start, ev_stop);
 +				said_no_dl = true;
 +			}
-+			if (!said_no_ul && total.ul + w.ul == 0) {
-+				SAY("THE DSP TAKES NO UPLINK FRAMES on %#x (%u write errors)\n", PORT_TX, w.ul_fail);
++			if (!said_no_ul && ct.ul + cw.ul == 0) {
++				SAY("THE DSP TAKES NO UPLINK FRAMES on %#x (%u write errors)\n", PORT_TX, cw.ul_fail);
 +				said_no_ul = true;
 +			}
 +			/* the slips for the next second: the rings' least fill over this one */
-+			dl_slip_mode = w.dl_under ? 1 : (w.dl_rings && w.dl_ring_min > 960) ? -1 : 0;
-+			ul_slip_mode = w.ul_under ? 1 : (w.rings && w.ul_ring_min > 2880) ? -1 : 0;
++			dl_slip_mode = cw.dl_under ? 1 : (cw.dl_rings && cw.dl_ring_min > 960) ? -1 : 0;
++			ul_slip_mode = cw.ul_under ? 1 : (cw.rings && cw.ul_ring_min > 2880) ? -1 : 0;
 +			if (seconds <= 10 || seconds % 10 == 0) {
-+				stats_format(line, sizeof(line), "1s", &w, queued);
++				stats_format(line, sizeof(line), "1s", &cw, queued);
 +				SAY("%s\n", line);
 +			}
 +			lck_mtx_lock(&stats_lock);
-+			win_add(&total, &w);
-+			stats_format(stats_text, sizeof(stats_text), "call so far", &total, queued);
++			win_add(&ct, &cw);
++			stats_format(stats_text, sizeof(stats_text), "call so far", &ct, queued);
 +			lck_mtx_unlock(&stats_lock);
-+			win_reset(&w);
++			win_reset(&cw);
 +		}
 +		if (__atomic_load_n(&dl_done, __ATOMIC_ACQUIRE) == 0 && __atomic_load_n(&ul_done, __ATOMIC_ACQUIRE) == 0 && !stop_req) {
 +			assert_wait_timeout((event_t)&px_wake, THREAD_UNINT, 10, NSEC_PER_MSEC);
@@ -1589,8 +1589,8 @@ index 0000000..8e6f77a
 +		}
 +	}
 +	lck_mtx_lock(&stats_lock);
-+	win_add(&total, &w);
-+	win_reset(&w);
++	win_add(&ct, &cw);
++	win_reset(&cw);
 +	lck_mtx_unlock(&stats_lock);
 +	thread_runs = false;
 +	thread_wakeup(&thread_runs);
@@ -1604,8 +1604,8 @@ index 0000000..8e6f77a
 +	thread_t thread;
 +	bool heard;
 +
-+	win_reset(&w);
-+	win_reset(&total);
++	win_reset(&cw);
++	win_reset(&ct);
 +	dl_done = ul_done = dl_bad = ul_bad = 0;
 +	last_dl_mach = 0;
 +	dl_slip_mode = ul_slip_mode = 0;
@@ -1662,7 +1662,7 @@ index 0000000..8e6f77a
 +
 +			redwood_sound_call_state(&ring, &queued, &under, &periods);
 +			lck_mtx_lock(&stats_lock);
-+			stats_format(line, sizeof(line), "call end", &total, queued);
++			stats_format(line, sizeof(line), "call end", &ct, queued);
 +			strlcpy(stats_text, line, sizeof(stats_text));
 +			lck_mtx_unlock(&stats_lock);
 +			SAY("%s (%llu s; DTMF latency last %d ms; AFE events start %u stop %u low %u high %u)\n", line,
