@@ -82,6 +82,12 @@ public:
     // completedAt_ stays 0, and the difference was minus the commit's clock -- HM_PROF's "GPU -44796 ms a frame", metal_fps's
     // "GPU busy -558252356 ms")
     int64_t gpuNanoseconds() const { return committedAt_ != 0 && completedAt_ > committedAt_ ? completedAt_ - committedAt_ : 0; }
+    // (redfin hm-cache) gpuNanoseconds split: queued behind the buffers committed before it on the one ring (commit to
+    // the completion of the one before), and running (from then to its own fence). Both 0 as gpuNanoseconds is.
+    int64_t queuedNanoseconds() const { return gpuNanoseconds() != 0 && startedAt_ > committedAt_ ? startedAt_ - committedAt_ : 0; }
+    int64_t runningNanoseconds() const {
+        return gpuNanoseconds() == 0 ? 0 : completedAt_ - (startedAt_ > committedAt_ ? startedAt_ : committedAt_);
+    }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -438,6 +444,7 @@ private:
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
+    int64_t startedAt_ = 0;   // (redfin hm-cache) when the ring got to it: the completion of the buffer before it
 };
 
 class CommandQueue {
@@ -515,6 +522,7 @@ private:
     void waiter();
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
     void recoverAfterReset(CommandBuffer& hung, uint64_t faults);   // (redfin hmv6) HM_RESET_RECOVER, lock_ held
+    int64_t lastCompletedAt_ = 0;   // (redfin hm-cache) the waiter's last completion (CommandBuffer::startedAt_)
     uint64_t hangsReported_ = 0;                                       // (redfin hmv6) the reset count the waiter last acted on
 
     Gpu& gpu_;

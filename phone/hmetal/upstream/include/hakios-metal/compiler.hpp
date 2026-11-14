@@ -139,6 +139,11 @@ struct KnownBuffer {
 struct CompileStats {
     uint64_t waitNs = 0, compileNs = 0;
     uint32_t hits = 0, misses = 0;
+    // (redfin hm-cache) of the hits, from the process's memo and from a seed directory; this thread's CPU time in its
+    // compiles (compileNs is wall time: the two apart are time spent waiting for a core); the front end's and the
+    // known buffer's folding's share of compileNs
+    uint32_t memoHits = 0, seedHits = 0;
+    uint64_t cpuNs = 0, translateNs = 0, foldNs = 0;
 };
 CompileStats compileStats();
 void setCompileBackground(bool on);
@@ -148,6 +153,26 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
 // the one that spills less, then the one with fewer registers; WITH on a tie. (CoreAnimation's fixed_frag_lph_cpf: 48
 // registers and 512 bytes of spills with the preamble, 21 and none without; its draws 6.6 ms each so, 2.6 without.)
 bool preferWithoutPreamble(const Kernel& with, const Kernel& without);
+// (redfin hm-cache) the file name (with its leading '/') a stage is filed under in the cache, "" when neither
+// HAKIOS_METAL_CACHE nor HAKIOS_METAL_CACHE_SEED is set; and the text the key starts from (HM_CACHE_KEY): bench/hm-seed
+std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionConstants& constants = {}, uint32_t iboBase = 0,
+                               const KnownBuffer* known = nullptr);
+const char* stageCacheKeyText();
+// (redfin hm-cache) what compileStage writes beside a stage it compiled into the writable cache (HM_CACHE_MANIFEST=1):
+// DIR/src/NAME.src, the bitcode in DIR/bc/BITCODE_NAME
+struct StageManifest {
+    std::string key, stageName, bitcodeName;
+    uint32_t bitcodeSize = 0, iboBase = 0;
+    FunctionConstants constants;
+    bool hasKnown = false;
+    KnownBuffer known;
+};
+bool stageManifestRead(const std::string& path, StageManifest* m);
+// (redfin hm-cache) the pre-warm (compiler.cpp stageCacheRewarm): the manifests' stages missing under this key compiled
+struct RewarmCounts {
+    uint32_t manifests = 0, present = 0, made = 0, failed = 0, unreadable = 0;
+};
+RewarmCounts stageCacheRewarm(int (*busy)(void*), void* ctx);
 
 // VS and FS linked (render::link, and with Mesa present cross-checked against ir3_link_shaders) for a colour target of
 // COLOR0's format. nullptr with *why: the refusals render.hpp names for a stage (attributes, several colour outputs,

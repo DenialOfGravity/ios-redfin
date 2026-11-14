@@ -7,6 +7,16 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <atomic>
+#include <deque>
+#include <map>
+#include <memory>
+#include <functional>
+#include <pthread.h>
+#include <ctime>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
 
 #ifdef HAKIOS_METAL_MESA
 // Mesa's headers carry their own C++ guards (and templates behind them: no extern "C" around these) and are not clean
@@ -19,6 +29,7 @@
 #include "common/freedreno_dev_info.h"
 #include "util/ralloc.h"
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/render.hpp"
 #endif
 
 namespace hakios::metal {
@@ -28,6 +39,10 @@ namespace hakios::metal {
 bool hasCompiler() { return false; }
 CompileStats compileStats() { return CompileStats{}; }
 void setCompileBackground(bool) {}
+std::string stageCacheFileName(const void*, size_t, const FunctionConstants&, uint32_t, const KnownBuffer*) { return {}; }
+const char* stageCacheKeyText() { return ""; }
+bool stageManifestRead(const std::string&, StageManifest*) { return false; }
+RewarmCounts stageCacheRewarm(int (*)(void*), void*) { return {}; }
 
 std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why, const FunctionConstants&) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
@@ -54,26 +69,44 @@ bool argumentBufferLayout(const void*, size_t, uint32_t, std::vector<std::pair<u
 namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
+std::mutex gBackgroundCompilerLock;   // (redfin hm-cache) the background threads' compiler's (HM_COMPILE_SPLIT)
+// (redfin hm-cache) where a compile's time goes, this thread's totals (CompileStats): the front end, the known buffer's
+// folding (a specialisation), and the rest (ir3 and the stage's tables)
+thread_local uint64_t tTranslateNs = 0, tFoldNs = 0;
+bool envOn(const char* name, bool fallback) {
+    const char* e = getenv(name);
+    return e == nullptr || e[0] == 0 ? fallback : atoi(e) != 0;
+}
+uint64_t monoNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 
 // one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row and
 // (redfin) 0x06020000 to FD620 through its 0x060200ff wildcard. The chip is the device's own (a6xx::chip(), selected
 // when the Gpu was made), so a Gpu must exist before the first compile; one GPU per process
+ir3_compiler* makeCompiler() {
+    fd_dev_id id{};
+    id.gpu_id = 0;
+    id.chip_id = a6xx::chip().chipId;
+    // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
+    // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
+    // set 0, which this driver never binds
+    ir3_compiler_options options{};
+    options.bindless_fb_read_descriptor = -1;
+    // the GLSL type cache, which ir3 uses for the driver UBOs' types (get_driver_ubo_type: a module's constant table
+    // is read through one); held for the life of the process, as the compiler is
+    glsl_type_singleton_init_or_ref();
+    return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
+}
+// (redfin hm-cache) HM_COMPILE_SPLIT=1 (default): a thread marked background (the pre-warm, the specialiser's queue,
+// HM_CACHE_VERIFY's checks) compiles on a second ir3 compiler under a lock of its own (CompileTurn), so the render
+// thread never waits behind a background compile that runs at background priority on a little core -- the wait that
+// made AdrenoMetal's window server spend 755 ms of wall time on 88 ms of compiling (UniXNU/AdrenoMetal c135133).
+// One compilation at a time per compiler still: compileStage flips has_preamble on the compiler it holds.
+thread_local int tCompilerSlot = 0;   // 1 inside a background CompileTurn with the split on
 ir3_compiler* theCompiler() {
-    static ir3_compiler* compiler = [] {
-        fd_dev_id id{};
-        id.gpu_id = 0;
-        id.chip_id = a6xx::chip().chipId;
-        // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
-        // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
-        // set 0, which this driver never binds
-        ir3_compiler_options options{};
-        options.bindless_fb_read_descriptor = -1;
-        // the GLSL type cache, which ir3 uses for the driver UBOs' types (get_driver_ubo_type: a module's constant table
-        // is read through one); held for the life of the process, as the compiler is
-        glsl_type_singleton_init_or_ref();
-        return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
-    }();
-    return compiler;
+    static ir3_compiler* compiler = makeCompiler();
+    if (tCompilerSlot == 0) return compiler;
+    static ir3_compiler* background = makeCompiler();
+    return background;
 }
 
 bool refuse(std::string* why, const std::string& text) {
@@ -270,6 +303,116 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
     return true;
 }
 
+// (redfin hm-cache) HM_SCRATCH_FOLD=1 (default 0 until tested on the phone): from xm6661885/hakios-xnu-kernel-umi-fixes
+// 05f7477 hakios-metal/src/compiler.cpp (MIT), unchanged but for this note. On the host it takes a specialisation of
+// fixed_frag_lph_cpf from ~530 ms to ~200 ms (ir3's part from ~390 ms to ~7 ms): the uber shader's configuration
+// struct, copied into scratch by its static_init, is answered at compile time and the branches on it fold away. The
+// value is part of the stage cache's key (stageCacheName), so a stage compiled either way is never taken for the other.
+// A load of private memory (scratch) at a constant offset whose bytes are known: every store that writes them is a
+// constant at a constant offset in ONE block outside any loop, that block runs before the load (it dominates it, or it
+// is the load's own and the stores come first), and the reaching store of each byte is the last of them there. This
+// is how iOS 16.5's CoreAnimation uber shaders specialise. Their air.static_init copies the 58 function constants into
+// program-scope variables, the 31 of the FragmentShaderConfig into ONE zero-initialised struct
+// (fc_fragment_shader_config) field by field. The front end folds a scalar such variable (plan_global_folding); the
+// struct goes to scratch, so without this every branch on texture_function, blend_function, dest_index ... stayed in
+// the code -- 22 000 lines of NIR, every texture slot taken, and "reads its render targets through slots past the 16"
+// for every specialisation. Sound only while no store can reach a byte the scan did not see: one store at a
+// non-constant offset turns the pass off, and a byte also written by a value not constant, or in a second block or a
+// loop, is never answered.
+bool inLoop(nir_block* block) {
+    for (nir_cf_node* n = block->cf_node.parent; n != nullptr; n = n->parent)
+        if (n->type == nir_cf_node_loop) return true;
+    return false;
+}
+
+bool forwardConstantScratch(nir_shader* nir) {
+    struct Write { nir_intrinsic_instr* store; uint8_t value; bool constant; };
+    std::vector<std::vector<Write>> bytes;
+    bool usable = true, loads = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_metadata_require(impl, nir_metadata_dominance | nir_metadata_instr_index);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic == nir_intrinsic_load_scratch) {
+                    loads = true;
+                    continue;
+                }
+                if (in->intrinsic != nir_intrinsic_store_scratch) continue;
+                if (!nir_src_is_const(in->src[1]) || in->src[0].ssa->bit_size % 8 != 0) {
+                    usable = false;
+                    continue;
+                }
+                const unsigned width = in->src[0].ssa->bit_size / 8, mask = nir_intrinsic_write_mask(in);
+                const uint64_t at = nir_src_as_uint(in->src[1]);
+                const bool constant = nir_src_is_const(in->src[0]);
+                for (unsigned c = 0; c < in->src[0].ssa->num_components && usable; c++) {
+                    if (!(mask & (1u << c))) continue;
+                    const uint64_t v = constant ? nir_src_comp_as_uint(in->src[0], c) : 0;
+                    for (unsigned k = 0; k < width; k++) {
+                        const uint64_t at_b = at + c * width + k;
+                        if (at_b >= (1u << 20)) {
+                            usable = false;
+                            break;
+                        }
+                        if (at_b >= bytes.size()) bytes.resize(at_b + 1);
+                        bytes[at_b].push_back(Write{in, uint8_t(v >> (8 * k)), constant});
+                    }
+                }
+            }
+        }
+    }
+    if (!usable || !loads || bytes.empty()) return false;
+    bool progress = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_builder b = nir_builder_create(impl);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic != nir_intrinsic_load_scratch || !nir_src_is_const(in->src[0]) || in->def.bit_size % 8 != 0) continue;
+                const unsigned width = in->def.bit_size / 8, comps = in->def.num_components;
+                const uint64_t at = nir_src_as_uint(in->src[0]);
+                if (at + uint64_t(width) * comps > bytes.size()) continue;
+                bool ok = true;
+                nir_const_value values[NIR_MAX_VEC_COMPONENTS];
+                for (unsigned c = 0; c < comps && ok; c++) {
+                    uint64_t v = 0;
+                    for (unsigned k = 0; k < width && ok; k++) {
+                        const Write* reaching = nullptr;
+                        for (const Write& w : bytes[at + c * width + k]) {
+                            nir_block* wb = w.store->instr.block;
+                            ok = w.constant && nir_cf_node_get_function(&wb->cf_node) == impl && !inLoop(wb) &&
+                                 (reaching == nullptr || reaching->store->instr.block == wb);
+                            if (!ok) break;
+                            const bool before = wb == block ? w.store->instr.index < instr->index : nir_block_dominates(wb, block);
+                            if (!before) {
+                                ok = wb != block;   // after the load in its own block: it does not reach the load
+                                if (!ok) break;
+                                ok = false;          // in a block that does not run first: not answered
+                                break;
+                            }
+                            if (reaching == nullptr || reaching->store->instr.index < w.store->instr.index) reaching = &w;
+                        }
+                        ok = ok && reaching != nullptr;
+                        if (ok) v |= uint64_t(reaching->value) << (8 * k);
+                    }
+                    values[c] = nir_const_value_for_raw_uint(v, in->def.bit_size);
+                }
+                if (!ok) continue;
+                b.cursor = nir_before_instr(instr);
+                nir_def_replace(&in->def, nir_build_imm(&b, comps, in->def.bit_size, values));
+                progress = true;
+            }
+        }
+        nir_metadata_preserve(impl, nir_metadata_control_flow);
+    }
+    return progress;
+}
+
+bool scratchFoldOn() { return envOn("HM_SCRATCH_FOLD", false); }
+
 bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
     t.mem = ralloc_context(nullptr);
     air_constant_value* constants = nullptr;
@@ -286,18 +429,37 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
     options.constants = constants;
     options.num_constants = numConstants;
     const char* error = nullptr;
+    const uint64_t t0 = monoNs();
     t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
+    const uint64_t t1 = monoNs();
+    tTranslateNs += t1 - t0;
     if (t.nir == nullptr) return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
     // the known buffer's reads folded, its offsets folded first (a field's offset is the front end's arithmetic on the
     // pointer), until nothing more folds: a value read may decide the offset of another read
     // (called directly, not under NIR_PASS: a debug build validates the whole shader after each, and an uber shader
     // takes rounds of this. nir_copy_prop's own answer does not count: on CoreAnimation's uber shader it says it made
     // progress every time, 21 000 rounds and on)
-    for (bool progress = known != nullptr; progress;) {
+    bool scratch = false;
+    if (scratchFoldOn()) {   // (redfin hm-cache) HM_SCRATCH_FOLD: the constant scratch struct too (forwardConstantScratch)
+        nir_foreach_function_impl(impl, t.nir) {
+            nir_foreach_block(block, impl) {
+                nir_foreach_instr(instr, block) {
+                    scratch |= instr->type == nir_instr_type_intrinsic && nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scratch;
+                }
+            }
+        }
+    }
+    for (bool progress = known != nullptr || scratch; progress;) {
         nir_copy_prop(t.nir);
         progress = nir_opt_constant_folding(t.nir);
-        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        if (known != nullptr) progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        if (scratch) {
+            progress = forwardConstantScratch(t.nir) || progress;
+            progress = nir_opt_dead_cf(t.nir) || progress;
+            progress = nir_opt_dce(t.nir) || progress;
+        }
     }
+    tFoldNs += monoNs() - t1;
     return true;
 }
 
@@ -1183,16 +1345,51 @@ struct CacheReader {
     }
 };
 constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
-// What the compiler is, for the cache's key: the Makefile's hash of this file, the driver's headers and the Mesa
-// archives linked in (HAKIOS_METAL_CACHE_BUILD), so that a stage compiled before stays good across a rebuild of the
-// library that changed nothing of the compiler -- with __DATE__ and __TIME__ every rebuild of the plug-in (any file
-// of the core recompiles them all) emptied a cache that var_store had kept across boots, and the window server paid
-// its 66 to 103 first compiles again. Without the define, the old key: a build is its own.
+// What the compiler is, for the cache's key.
+// (redfin hm-cache) HM_CACHE_KEY=format (default): the stage format's version below, BUMPED BY HAND whenever what a
+// compile produces or what Stage/Kernel hold changes (codegen, a lowering, the AIR front end's output, the layout this
+// file writes), plus the Mesa this is linked against (its version and a hash of our Mesa patches and AIR front end:
+// HAKIOS_METAL_MESA_ID, build.sh). A rebuild of the plug-in or a change elsewhere in the core then keeps the cache, so a
+// bundle swap no longer empties it. A forgotten bump is what HM_CACHE_VERIFY=N is for. HM_CACHE_KEY=build: the old
+// key, the hash of this file, the headers and the Mesa archives (HAKIOS_METAL_CACHE_BUILD), empty after any core change.
+#ifndef HAKIOS_METAL_CACHE_FORMAT
+#define HAKIOS_METAL_CACHE_FORMAT 1
+#endif
+#ifndef HAKIOS_METAL_MESA_ID
+#define HAKIOS_METAL_MESA_ID "unknown-mesa"
+#endif
+#define HM_STR2(x) #x
+#define HM_STR(x) HM_STR2(x)
+const char* const kCacheFormat = "hm-stage-format " HM_STR(HAKIOS_METAL_CACHE_FORMAT) " mesa " HAKIOS_METAL_MESA_ID;
 #ifdef HAKIOS_METAL_CACHE_BUILD
 const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
 #else
 const char* const kCacheBuild = __DATE__ " " __TIME__;
 #endif
+const char* cacheKeyText() {
+    static const char* key = [] {
+        const char* e = getenv("HM_CACHE_KEY");
+        return e != nullptr && strcmp(e, "build") == 0 ? kCacheBuild : kCacheFormat;
+    }();
+    return key;
+}
+
+// The 128-bit hash the cache names files by
+struct Hash128 {
+    uint64_t h[2] = {0xcbf29ce484222325ull, 0x84222325cbf29ce4ull};
+    void mix(const void* p, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t b = static_cast<const uint8_t*>(p)[i];
+            h[0] = (h[0] ^ b) * 0x100000001b3ull;
+            h[1] = (h[1] ^ b) * 0x1000193ull + (h[1] >> 29);
+        }
+    }
+    std::string hex() const {
+        char t[40];
+        snprintf(t, sizeof(t), "%016llx%016llx", (unsigned long long)h[0], (unsigned long long)h[1]);
+        return t;
+    }
+};
 
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an
@@ -1201,29 +1398,22 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
     if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
-    uint64_t h[2] = {0xcbf29ce484222325ull, 0x84222325cbf29ce4ull};
-    auto mix = [&](const void* p, size_t n) {
-        for (size_t i = 0; i < n; i++) {
-            const uint8_t b = static_cast<const uint8_t*>(p)[i];
-            h[0] = (h[0] ^ b) * 0x100000001b3ull;
-            h[1] = (h[1] ^ b) * 0x1000193ull + (h[1] >> 29);
-        }
-    };
-    const uint32_t layout[3] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase};
-    mix(kCacheBuild, strlen(kCacheBuild));
-    mix(layout, sizeof(layout));
-    mix(bitcode, size);
+    Hash128 h;
+    // (redfin hm-cache) and the chip: the host's hm-seed compiles for the phone's (--chip), the tests for two
+    const uint32_t layout[5] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u};
+    const char* key = cacheKeyText();
+    h.mix(key, strlen(key));
+    h.mix(layout, sizeof(layout));
+    h.mix(bitcode, size);
     for (const FunctionConstant& c : constants) {
-        mix(&c.index, sizeof(c.index));
-        mix(&c.bits, sizeof(c.bits));
+        h.mix(&c.index, sizeof(c.index));
+        h.mix(&c.bits, sizeof(c.bits));
     }
     if (known != nullptr) {
-        mix(&known->binding, sizeof(known->binding));
-        mix(known->bytes.data(), known->bytes.size());
+        h.mix(&known->binding, sizeof(known->binding));
+        h.mix(known->bytes.data(), known->bytes.size());
     }
-    char name[64];
-    snprintf(name, sizeof(name), "/%016llx%016llx.stage", (unsigned long long)h[0], (unsigned long long)h[1]);
-    return name;
+    return "/" + h.hex() + ".stage";
 }
 
 // the writable cache's path for NAME, "" when there is none
@@ -1233,7 +1423,31 @@ std::string stageCacheWritable(const std::string& name) {
     return std::string(dir) + name;
 }
 
-void stageCacheSave(const std::string& path, const CompiledStage& s) {
+bool writeFileAtomically(const std::string& path, const std::string& data) {
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return false;
+    const bool written = fwrite(data.data(), 1, data.size(), f) == data.size();
+    fclose(f);
+    if (!written || rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool readFile(const std::string& path, std::string* data) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    data->clear();
+    char chunk[65536];
+    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data->append(chunk, n);
+    fclose(f);
+    return true;
+}
+
+// the stage as the cache file holds it
+std::string stageCacheBlob(const CompiledStage& s) {
     CacheWriter w;
     w.u32(kCacheMagic);
     w.raw(&s.stage, sizeof(s.stage));
@@ -1264,21 +1478,30 @@ void stageCacheSave(const std::string& path, const CompiledStage& s) {
     w.u32(s.writesMemory ? 1 : 0);
     w.str(s.name);
     w.str(s.listing);
-    const std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return;
-    const bool written = fwrite(w.out.data(), 1, w.out.size(), f) == w.out.size();
-    fclose(f);
-    if (!written || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
+    return w.out;
 }
 
-std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (f == nullptr) return nullptr;
-    std::string data;
-    char chunk[65536];
-    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
-    fclose(f);
+// What HM_CACHE_VERIFY compares: the code and the tables a draw reads, not the Stage's bytes as they lie in memory
+// (its pointers differ between any two compiles) nor the listing
+std::string stageCacheDigest(const CompiledStage& s) {
+    CacheWriter w;
+    w.u32(uint32_t(s.words.size()));
+    w.raw(s.words.data(), s.words.size() * 4);
+    w.u32(uint32_t(s.immediates.size()));
+    w.raw(s.immediates.data(), s.immediates.size() * 4);
+    for (const Resource& r : s.resources) {
+        w.u32(uint32_t(r.kind));
+        w.u32(r.index);
+        w.u32(r.sizeBytes);
+        w.u32(r.readEnd);
+    }
+    const Kernel& k = s.stage.k;
+    const uint32_t shape[6] = {k.numWords, k.numImmediates, k.pvtmemSize, k.numSsbos, k.numTextureSlots, uint32_t(s.stage.kind)};
+    w.raw(shape, sizeof(shape));
+    return w.out;
+}
+
+std::unique_ptr<CompiledStage> stageCacheParse(const std::string& data) {
     CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
     auto s = std::make_unique<CompiledStage>();
     if (r.u32() != kCacheMagic || !r.raw(&s->stage, sizeof(s->stage))) return nullptr;
@@ -1320,13 +1543,109 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
     s->stage.k.source = "";
     return s;
 }
+
+std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, std::string* blob = nullptr) {
+    std::string data;
+    if (!readFile(path, &data)) return nullptr;
+    std::unique_ptr<CompiledStage> s = stageCacheParse(data);
+    if (s != nullptr && blob != nullptr) *blob = std::move(data);
+    return s;
+}
+
+// (redfin hm-cache) HM_STAGE_MEMO=1 (default): the stages this process has compiled or read, kept as their cache
+// bytes (at most HM_STAGE_MEMO_MB, default 48 MB, the oldest let go first), so that a stage asked for again -- a
+// specialisation of a pipeline CoreAnimation made anew after the display slept, the same configuration on another
+// pipeline object -- is neither compiled nor read from the disk again. Kept without a cache directory too.
+std::mutex gMemoLock;
+std::map<std::string, std::shared_ptr<const std::string>> gMemo;
+std::deque<std::string> gMemoOrder;
+size_t gMemoBytes = 0;
+bool memoOn() { return envOn("HM_STAGE_MEMO", true); }   // (read each time: the host tests turn it off and on)
+size_t memoLimit() {
+    static const size_t mb = [] { const char* e = getenv("HM_STAGE_MEMO_MB"); return e != nullptr && e[0] ? size_t(atoi(e)) : size_t(48); }();
+    return mb << 20;
+}
+std::unique_ptr<CompiledStage> memoFind(const std::string& key) {
+    if (!memoOn() || key.empty()) return nullptr;
+    std::shared_ptr<const std::string> blob;
+    {
+        std::lock_guard<std::mutex> g(gMemoLock);
+        auto it = gMemo.find(key);
+        if (it == gMemo.end()) return nullptr;
+        blob = it->second;
+    }
+    return stageCacheParse(*blob);
+}
+void memoKeep(const std::string& key, std::string blob) {
+    if (!memoOn() || key.empty() || blob.size() > memoLimit()) return;
+    std::lock_guard<std::mutex> g(gMemoLock);
+    if (gMemo.count(key) != 0) return;
+    gMemoBytes += blob.size();
+    gMemo.emplace(key, std::make_shared<const std::string>(std::move(blob)));
+    gMemoOrder.push_back(key);
+    while (gMemoBytes > memoLimit() && !gMemoOrder.empty()) {
+        auto it = gMemo.find(gMemoOrder.front());
+        if (it != gMemo.end()) {
+            gMemoBytes -= it->second->size();
+            gMemo.erase(it);
+        }
+        gMemoOrder.pop_front();
+    }
+}
+
+// (redfin hm-cache) HM_CACHE_MANIFEST=1 (default): beside each stage compiled into the writable cache, what made it --
+// DIR/src/NAME.src (the constants, IBO_BASE, the known buffer, the bitcode's name) and the bitcode once,
+// DIR/bc/HASH.bc -- so that a host (bench/hm-seed) can compile the same stages again into a cache-seed directory after
+// HAKIOS_METAL_CACHE_FORMAT changes, without the phone drawing every screen again. The bitcode is the phone's own
+// (Apple's QuartzCore functions among it): it stays on the phone and in the PC's project folder, never in git.
+constexpr uint32_t kManifestMagic = 0x52534d48;   // "HMSR"
+bool manifestOn() { return envOn("HM_CACHE_MANIFEST", true); }
+void stageManifestSave(const std::string& name, const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase,
+                       const KnownBuffer* known) {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (!manifestOn() || dir == nullptr || dir[0] == 0 || name.size() < 2) return;
+    Hash128 bh;
+    bh.mix(bitcode, size);
+    const std::string bcName = bh.hex() + ".bc";
+    const std::string d(dir);
+    mkdir((d + "/src").c_str(), 0755);
+    mkdir((d + "/bc").c_str(), 0755);
+    const std::string bcPath = d + "/bc/" + bcName;
+    if (access(bcPath.c_str(), F_OK) != 0) writeFileAtomically(bcPath, std::string(static_cast<const char*>(bitcode), size));
+    CacheWriter w;
+    w.u32(kManifestMagic);
+    w.str(cacheKeyText());
+    w.str(name.substr(1));   // (the stage's file name, for a host's check that it hashes the same)
+    w.str(bcName);
+    w.u32(uint32_t(size));
+    w.u32(iboBase);
+    w.u32(uint32_t(constants.size()));
+    for (const FunctionConstant& c : constants) {
+        w.u32(c.index);
+        w.raw(&c.bits, sizeof(c.bits));
+    }
+    w.u32(known != nullptr ? 1 : 0);
+    if (known != nullptr) {
+        w.u32(known->binding);
+        w.str(std::string(known->bytes.begin(), known->bytes.end()));
+    }
+    writeFileAtomically(d + "/src" + name.substr(0, name.size() - 6) + ".src", w.out);
+}
 }  // namespace
+
+// (redfin hm-cache) for bench/hm-seed: the name a stage is filed under, "" without a cache configured
+std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
+    return stageCacheName(bitcode, size, constants, iboBase, known);
+}
+const char* stageCacheKeyText() { return cacheKeyText(); }
 
 // (redfin hmv4) Whose compile goes first. One compilation at a time (gCompilerLock), and a CoreAnimation uber shader
 // takes up to a second: the window server's render thread, asking for a pipeline it has not compiled before, waited
 // behind the specialiser's queue (hakios_metal_program_specialize, ~1 s each) and drew nothing for two seconds. A thread
 // marked background (hakios_metal_compile_background: the specialiser, the pre-warm) takes the compiler only while no
 // other thread waits for it (HM_COMPILE_PRIO=0: first come, as before); and a stage on disk is read without the lock.
+// (redfin hm-cache) With HM_COMPILE_SPLIT=1 (default) a background thread has a compiler of its own (theCompiler), and
+// the two never wait for each other.
 namespace {
 thread_local bool tBackground = false;
 thread_local CompileStats tStats;
@@ -1337,12 +1656,28 @@ bool prioOn() {
     static const bool on = [] { const char* e = getenv("HM_COMPILE_PRIO"); return e == nullptr || e[0] == 0 || atoi(e) != 0; }();
     return on;
 }
-uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+bool splitOn() {
+    static const bool on = envOn("HM_COMPILE_SPLIT", true);
+    return on;
+}
+uint64_t nowNs() { return monoNs(); }
+uint64_t threadCpuNs() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
 // the compiler's lock, taken in turn: a background thread waits until no foreground one does
 class CompileTurn {
 public:
     CompileTurn() {
         const uint64_t t0 = nowNs();
+        if (tBackground && splitOn()) {
+            lock_ = std::unique_lock<std::mutex>(gBackgroundCompilerLock);
+            tCompilerSlot = 1;
+            slot_ = true;
+            tStats.waitNs += nowNs() - t0;
+            return;
+        }
         const bool prio = prioOn();
         if (prio && tBackground) {
             std::unique_lock<std::mutex> g(gTurnLock);
@@ -1362,22 +1697,119 @@ public:
         }
         tStats.waitNs += nowNs() - t0;
     }
+    ~CompileTurn() {
+        if (slot_) tCompilerSlot = 0;
+    }
 private:
     std::unique_lock<std::mutex> lock_;
     bool counted_ = false;
+    bool slot_ = false;
 };
+
+// (redfin hm-cache) HM_CACHE_VERIFY=N: one stage in N read from the cache (or the memo) compiled again on a thread of
+// its own, marked background, and compared (stageCacheDigest). A difference is said ("hm-cache: STALE ...": the
+// stage format changed and HAKIOS_METAL_CACHE_FORMAT was not bumped, or the host that made a seed compiles otherwise)
+// and the writable cache's file replaced by the new compile; a match is counted ("hm-cache: verify ok N of M").
+// 0 or unset: off.
+// a detached thread of STACK bytes running FN: std::thread's is 512 KB on Darwin, and ir3 over an uber shader recurses
+// deeper (AdrenoMetal c135133: >= 2 MiB for a compile thread)
+void runDetached(std::function<void()> fn, size_t stack) {
+    auto* f = new std::function<void()>(std::move(fn));
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, stack);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    auto body = [](void* p) -> void* {
+        auto* g = static_cast<std::function<void()>*>(p);
+        (*g)();
+        delete g;
+        return nullptr;
+    };
+    if (pthread_create(&t, &a, body, f) != 0) delete f;
+    pthread_attr_destroy(&a);
+}
+unsigned verifyEvery() {
+    static const unsigned n = [] { const char* e = getenv("HM_CACHE_VERIFY"); return e != nullptr && e[0] ? unsigned(atoi(e)) : 0u; }();
+    return n;
+}
+std::atomic<unsigned> gVerifyHits{0}, gVerifyChecked{0}, gVerifyStale{0};
+std::unique_ptr<CompiledStage> compileStageFresh(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants,
+                                                 uint32_t iboBase, const KnownBuffer* known);
+void verifyLater(const std::string& name, const std::string& where, const CompiledStage& cached, const void* bitcode, size_t size,
+                 const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
+    const unsigned every = verifyEvery();
+    if (every == 0 || gVerifyHits.fetch_add(1) % every != 0) return;
+    auto bc = std::make_shared<std::string>(static_cast<const char*>(bitcode), size);
+    auto kb = known != nullptr ? std::make_shared<KnownBuffer>(*known) : nullptr;
+    auto digest = std::make_shared<std::string>(stageCacheDigest(cached));
+    const uint32_t words = uint32_t(cached.words.size());
+    const std::string writable = stageCacheWritable(name);
+    runDetached([=] {
+        tBackground = true;
+        std::string why;
+        std::unique_ptr<CompiledStage> fresh = compileStageFresh(bc->data(), bc->size(), &why, constants, iboBase, kb.get());
+        const unsigned checked = gVerifyChecked.fetch_add(1) + 1;
+        if (fresh == nullptr) {
+            render::notify("hm-cache: verify " + name.substr(1) + " (" + where + "): compiles no more: " + why);
+            return;
+        }
+        if (stageCacheDigest(*fresh) == *digest) {
+            if (checked <= 8 || checked % 50 == 0)
+                render::notify("hm-cache: verify ok " + std::to_string(checked - gVerifyStale.load()) + " of " + std::to_string(checked) + " (" + where + ")");
+            return;
+        }
+        gVerifyStale++;
+        render::notify("hm-cache: STALE " + name.substr(1) + " (" + where + "): cached " + std::to_string(words) + " words, compiled now " +
+                       std::to_string(fresh->words.size()) + "; " + std::to_string(gVerifyStale.load()) + " stale of " + std::to_string(checked) +
+                       " checked (bump HAKIOS_METAL_CACHE_FORMAT)");
+        if (!writable.empty()) writeFileAtomically(writable, stageCacheBlob(*fresh));
+    }, size_t(8) << 20);
+}
 }  // namespace
 
 void setCompileBackground(bool on) { tBackground = on; }
-CompileStats compileStats() { return tStats; }
+CompileStats compileStats() {
+    CompileStats s = tStats;
+    s.translateNs = tTranslateNs;
+    s.foldNs = tFoldNs;
+    return s;
+}
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
                                            const KnownBuffer* known) {
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
+    // the memo's key: the cache's name, or (no cache configured) the same hash made here
+    std::string memoKey = name;
+    if (memoKey.empty() && memoOn()) {
+        Hash128 h;
+        const uint32_t chip[2] = {a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u};
+        h.mix(chip, sizeof(chip));
+        h.mix(bitcode, size);
+        for (const FunctionConstant& c : constants) {
+            h.mix(&c.index, sizeof(c.index));
+            h.mix(&c.bits, sizeof(c.bits));
+        }
+        h.mix(&iboBase, sizeof(iboBase));
+        if (known != nullptr) {
+            h.mix(&known->binding, sizeof(known->binding));
+            h.mix(known->bytes.data(), known->bytes.size());
+        }
+        memoKey = "/" + h.hex();
+    }
+    if (std::unique_ptr<CompiledStage> s = memoFind(memoKey)) {
+        tStats.hits++;
+        tStats.memoHits++;
+        verifyLater(name, "memo", *s, bitcode, size, constants, iboBase, known);
+        return s;
+    }
     const std::string cached = stageCacheWritable(name);
     if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
+        std::string blob;
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached, &blob)) {
             tStats.hits++;
+            memoKeep(memoKey, std::move(blob));
+            verifyLater(name, "cache", *s, bitcode, size, constants, iboBase, known);
             return s;
         }
     }
@@ -1388,22 +1820,115 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
             p = colon != nullptr ? colon + 1 : nullptr;
             if (dir.empty()) continue;
-            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
+            std::string blob;
+            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name, &blob)) {
                 tStats.hits++;
+                tStats.seedHits++;
+                memoKeep(memoKey, std::move(blob));
+                verifyLater(name, "seed " + dir, *s, bitcode, size, constants, iboBase, known);
                 return s;
             }
         }
     }
+    std::unique_ptr<CompiledStage> chosen = compileStageFresh(bitcode, size, why, constants, iboBase, known);
+    if (chosen != nullptr) {
+        std::string blob = stageCacheBlob(*chosen);
+        if (!cached.empty() && writeFileAtomically(cached, blob)) stageManifestSave(name, bitcode, size, constants, iboBase, known);
+        memoKeep(memoKey, std::move(blob));
+    }
+    return chosen;
+}
+
+// (redfin hm-cache) a manifest (stageManifestSave) read back
+bool stageManifestRead(const std::string& path, StageManifest* m) {
+    std::string data;
+    if (!readFile(path, &data)) return false;
+    CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
+    if (r.u32() != kManifestMagic) return false;
+    m->key = r.str();
+    m->stageName = r.str();
+    m->bitcodeName = r.str();
+    m->bitcodeSize = r.u32();
+    m->iboBase = r.u32();
+    m->constants.resize(r.u32() & 0xffff);
+    for (FunctionConstant& c : m->constants) {
+        c.index = r.u32();
+        r.raw(&c.bits, sizeof(c.bits));
+    }
+    m->hasKnown = r.u32() != 0;
+    if (m->hasKnown) {
+        m->known.binding = r.u32();
+        const std::string b = r.str();
+        m->known.bytes.assign(b.begin(), b.end());
+    }
+    return r.ok && r.p == r.end;
+}
+
+// (redfin hm-cache) the pre-warm: every manifest of the writable cache whose stage is in neither the cache nor a seed
+// under this build's key (after HAKIOS_METAL_CACHE_FORMAT or the Mesa changed, or a stage the cache lost) compiled
+// again, one at a time, from the bitcode kept beside it; while BUSY(CTX) answers non-zero (frames being drawn) it waits.
+// The calling thread should be marked background (setCompileBackground) and run at a low priority.
+RewarmCounts stageCacheRewarm(int (*busy)(void*), void* ctx) {
+    RewarmCounts n;
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir == nullptr || dir[0] == 0) return n;
+    const std::string d(dir);
+    std::vector<std::string> names;
+    if (DIR* dd = opendir((d + "/src").c_str())) {
+        for (dirent* e; (e = readdir(dd)) != nullptr;) {
+            const std::string f = e->d_name;
+            if (f.size() > 4 && f.compare(f.size() - 4, 4, ".src") == 0) names.push_back(f);
+        }
+        closedir(dd);
+    }
+    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+    for (const std::string& f : names) {
+        n.manifests++;
+        StageManifest m;
+        std::string bc;
+        if (!stageManifestRead(d + "/src/" + f, &m) || !readFile(d + "/bc/" + m.bitcodeName, &bc) || bc.size() != m.bitcodeSize) {
+            n.unreadable++;
+            continue;
+        }
+        const KnownBuffer* kp = m.hasKnown ? &m.known : nullptr;
+        const std::string name = stageCacheName(bc.data(), bc.size(), m.constants, m.iboBase, kp);
+        bool have = access((d + name).c_str(), R_OK) == 0;
+        for (const char* p = seed; !have && p != nullptr && *p != 0;) {
+            const char* colon = strchr(p, ':');
+            const std::string sd(p, colon != nullptr ? size_t(colon - p) : strlen(p));
+            p = colon != nullptr ? colon + 1 : nullptr;
+            have = !sd.empty() && access((sd + name).c_str(), R_OK) == 0;
+        }
+        if (have) {
+            n.present++;
+            continue;
+        }
+        for (int i = 0; busy != nullptr && busy(ctx) && i < 600; i++) usleep(100000);   // (at most a minute a stage)
+        std::string why;
+        if (compileStage(bc.data(), bc.size(), &why, m.constants, m.iboBase, kp) != nullptr) n.made++;
+        else n.failed++;
+    }
+    return n;
+}
+
+namespace {
+// a compile, no cache: the preamble's second try as compileStage has always made it
+std::unique_ptr<CompiledStage> compileStageFresh(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants,
+                                                 uint32_t iboBase, const KnownBuffer* known) {
     CompileTurn turn;
     if (theCompiler() == nullptr) {
         refuse(why, noCompilerText());
         return nullptr;
     }
-    const uint64_t began = nowNs();
+    const uint64_t began = nowNs(), cpu0 = threadCpuNs();
     struct Count {
-        uint64_t began;
-        ~Count() { tStats.compileNs += nowNs() - began; tStats.misses++; }
-    } count{began};
+        uint64_t began, cpu0;
+        ~Count() {
+            tStats.compileNs += nowNs() - began;
+            tStats.cpuNs += threadCpuNs() - cpu0;
+            tStats.misses++;
+        }
+    } count{began, cpu0};
     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
@@ -1415,9 +1940,10 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         theCompiler()->has_preamble = true;
         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
     }
-    if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
     return chosen;
 }
+}  // namespace
+
 
 
 

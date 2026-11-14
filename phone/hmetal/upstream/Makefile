@@ -75,6 +75,12 @@ $(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
 
 sweep: $(HOSTOUT)/sweep
 
+# (redfin hm-cache) the stage cache's host tool (tools/hm-seed.cpp): `make MESA=1 out/host-mesa/hm-seed`, with
+# CXXFLAGS='-O2 -g -DHAKIOS_METAL_MESA_ID=\"...\"' as phone/hmetal/build.sh makes it, so that its key is the phone's
+$(HOSTOUT)/hm-seed: tools/hm-seed.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -pthread -o $@ tools/hm-seed.cpp $(HOST) $(HOSTLIBS)
+
 # (with the compiler in, compiler_test compiles every tools/kernels/*.ll against its fixture: their bitcode must be there)
 # (redfin) CHIP=a620 or CHIP=a635 runs the suite as that chip (default: both, one after the other)
 CHIP      ?= a635 a620

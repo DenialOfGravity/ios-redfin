@@ -912,6 +912,8 @@ void CommandQueue::waiter() {
         g.unlock();
         int e = gpu_.wait(id_, cb->fence_, kPatienceNs);
         cb->completedAt_ = gpu_.transport().nowNs();
+        cb->startedAt_ = std::max(cb->committedAt_, lastCompletedAt_);
+        lastCompletedAt_ = cb->completedAt_;
         // A fence that passed is not yet a submission that ran. When the kernel resets a hung GPU (gpu_recover=1) it
         // gives up everything the GPU had been given, the hung submission and those behind it in the ring, by setting
         // the fence word to the last submission's number -- so their waits end as if they had run (hakios_gpu_recover:

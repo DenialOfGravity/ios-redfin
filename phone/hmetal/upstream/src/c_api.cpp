@@ -279,6 +279,24 @@ void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hit
 
 void hakios_metal_compile_background(int on) { setCompileBackground(on != 0); }
 
+unsigned hakios_metal_compile_stats_more(double* out, unsigned count) {
+    const CompileStats s = compileStats();
+    const double v[7] = {double(s.cpuNs) / 1e6, double(s.translateNs) / 1e6, double(s.foldNs) / 1e6, double(s.memoHits), double(s.seedHits),
+                         double(s.hits), double(s.misses)};
+    unsigned n = 0;
+    for (; out != nullptr && n < count && n < 7; n++) out[n] = v[n];
+    return n;
+}
+
+const char* hakios_metal_cache_key(void) { return stageCacheKeyText(); }
+
+void hakios_metal_cache_rewarm(int (*busy)(void*), void* ctx, unsigned out[5]) {
+    const RewarmCounts n = stageCacheRewarm(busy, ctx);
+    if (out != nullptr) {
+        out[0] = n.manifests, out[1] = n.present, out[2] = n.made, out[3] = n.failed, out[4] = n.unreadable;
+    }
+}
+
 void hakios_metal_pass_splits(unsigned long long out[4]) {
     uint64_t v[4];
     CommandBuffer::passSplits(v);
@@ -1755,6 +1773,11 @@ const char* hakios_metal_cb_error(hakios_metal_cb* cb) {
 int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb* cb) {
     syncOne(cb);
     return cb->cb->gpuNanoseconds();
+}
+void hakios_metal_cb_gpu_split(hakios_metal_cb* cb, int64_t* queued, int64_t* running) {
+    syncOne(cb);
+    if (queued != nullptr) *queued = cb->cb->queuedNanoseconds();
+    if (running != nullptr) *running = cb->cb->runningNanoseconds();
 }
 
 }  // extern "C"
