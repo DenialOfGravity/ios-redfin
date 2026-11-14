@@ -59,6 +59,8 @@
  *   kern.sweet_voice_proxy_opts (bits, 0 default): 1 the CVP created on the proxy ports from the start (no switch);
  *     2 8 kHz instead of 16 kHz; 4 host-PCM probe: one VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory) to the
  *     CVP after START_VOICE, its status logged only (stopped again if it was taken).
+ *   1095: the CVP is created on the proxy ports by default (as opts 1); opts 8 = 1090's switch after START_VOICE (opts 1
+ *     wins over 8). Pacing of the data path: kern.sweet_voice_proxy_pace (bsd/dev/sweet_vproxy.c).
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <kern/clock.h>
@@ -186,6 +188,9 @@ extern void sweet_qmux_vocoder_note(uint32_t rate_hz, int up);  /* 1093: sweet_q
 #define POPT_CREATE             1u
 #define POPT_8K                 2u
 #define POPT_HOSTPCM            4u
+#define POPT_SWITCH             8u              /* 1095: switch after START_VOICE (1090 without opts 1) */
+/* 1095: in proxy mode the CVP is created on the proxy ports unless opts 8 (and not 1) asks for the old switch */
+#define PROXY_CREATE()          ((proxy_opts & POPT_CREATE) != 0 || (proxy_opts & POPT_SWITCH) == 0)
 #define VSS_IMVM_CMD_PAUSE_VOICE                        0x0001137du
 #define VSS_IVOCPROC_CMD_SET_DEVICE_V3                  0x0001316au
 #define VSS_IVPCM_CMD_START_V2                          0x00011339u
@@ -598,7 +603,7 @@ voice_up(int target)
 	proxy_up = false;
 	if (voice_proxy != 0 && !proxy_refused) {
 		printf("SWEET VOICE PROXY: call start with kern.sweet_voice_proxy %d, opts %#x: %s\n", voice_proxy, proxy_opts,
-		    (proxy_opts & POPT_CREATE) ? "CVP created on the proxy ports" : "CVP switched to the proxy ports after START_VOICE");
+		    (PROXY_CREATE()) ? "CVP created on the proxy ports" : "CVP switched to the proxy ports after START_VOICE");
 		proxy_up = sweet_vproxy_prepare(voice_proxy, proxy_opts);
 		proxy_tried = proxy_up;
 	}
@@ -671,7 +676,7 @@ voice_up(int target)
 		create.direction = 2;
 		create.tx_port = TX_PORT;
 		create.rx_port = RX_PORT;
-		if (proxy_up && (proxy_opts & POPT_CREATE)) {
+		if (proxy_up && (PROXY_CREATE())) {
 			create.tx_port = PROXY_TX_PORT;         /* 1090 */
 			create.rx_port = PROXY_RX_PORT;
 		}
@@ -698,7 +703,7 @@ voice_up(int target)
 	}
 	if (!(voice_opts & OPT_NO_MEDIA_FMT) && !old_cvd && cvd_at_least(2, 3)) {
 		step = "media formats";
-		media_formats(proxy_up && (proxy_opts & POPT_CREATE), sweet_vproxy_rate());
+		media_formats(proxy_up && (PROXY_CREATE()), sweet_vproxy_rate());
 	}
 	if (!old_cvd) {
 		step = "topology commit";
@@ -770,7 +775,7 @@ voice_up(int target)
 	    cvs_handle, cvp_handle);
 	if (proxy_up) {
 		/* 1090: onto the proxy ports (unless created there), then the AP's data path */
-		bool on_proxy = (proxy_opts & POPT_CREATE) != 0;
+		bool on_proxy = (PROXY_CREATE()) != 0;
 
 		if (!on_proxy) {
 			on_proxy = cvp_switch(true, sweet_vproxy_rate());
@@ -787,7 +792,7 @@ voice_up(int target)
 		}
 		if (on_proxy && !sweet_vproxy_run()) {
 			on_proxy = false;
-			if (proxy_opts & POPT_CREATE) {
+			if (PROXY_CREATE()) {
 				step = "proxy data thread";
 				goto fail;
 			}
@@ -1021,13 +1026,14 @@ sysctl_voice_proxy_opts(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
 
 	if (e == 0 && changed) {
-		proxy_opts = (uint32_t)v & 7u;
+		proxy_opts = (uint32_t)v & 15u;   /* 1095: + 8 = the old switch after START_VOICE */
 		printf("SWEET VOICE PROXY: kern.sweet_voice_proxy_opts = %#x\n", proxy_opts);
 	}
 	return e;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_opts, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy_opts,
-    "I", "redfin 1090: bits 1 CVP created on the proxy ports (no switch), 2 8 kHz (default 16 kHz), 4 host-PCM probe (status only)");
+    "I", "redfin 1090/1095: bits 1 CVP created on the proxy ports (the default since 1095), 2 8 kHz (default 16 kHz), 4 host-PCM probe "
+    "(status only), 8 switch to the proxy ports after START_VOICE (1090 without 1)");
 
 /* ---- 1086: route and gains ---- */
 static void
