@@ -399,6 +399,35 @@ private:
         return e;
     }
 
+    // (redfin hm-int5) HM_GATE_FLAG=1 (default 0: the kernel side does not exist yet): a submission that writes the display
+    // surface -- an imported IOSurface named for writing whose size is HM_GATE_FLAG_SURF (default 1125x2436, the panel's
+    // surfaces as CoreAnimation's window server draws them; WxH) -- carries kSubmitFlagWritesDisplay in
+    // NativeAdrenoAbiSubmit.reserved, for a kernel whose scanout gate (p scanout gate 1|2) holds only flagged submissions
+    // of the swapper; every other submission is sent bare and passes the gate. A kernel that refuses the field (all before
+    // it) turns the flag off for the process at its first refusal (the submission is sent again without it).
+    static constexpr uint32_t kSubmitFlagWritesDisplay = 1u;
+    bool gateFlagRefused_ = false;
+    uint32_t gateFlagged_ = 0, gateBare_ = 0;
+    uint32_t gateFlag(const MsmSubmitBo* bos, const std::vector<Bo*>& named, uint32_t n) {
+        const char* e = getenv("HM_GATE_FLAG");
+        if (gateFlagRefused_ || e == nullptr || atoi(e) == 0) return 0;
+        uint32_t w = 1125, h = 2436;
+        if (const char* sz = getenv("HM_GATE_FLAG_SURF")) {
+            unsigned a = 0, b = 0;
+            if (sscanf(sz, "%ux%u", &a, &b) == 2) w = a, h = b;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const Bo* b = named[i];
+            if ((bos[i].flags & kSubmitBoWrite) == 0 || !b->imported || b->surface == nullptr) continue;
+            if (IOSurfaceGetWidth(b->surface) == w && IOSurfaceGetHeight(b->surface) == h) {
+                if (gateFlagged_++ == 0) fprintf(stderr, "hakios-metal: HM_GATE_FLAG: first submission flagged (writes IOSurface %u, %ux%u)\n", b->surfaceId, w, h);
+                return kSubmitFlagWritesDisplay;
+            }
+        }
+        gateBare_++;
+        return 0;
+    }
+
     int submit(MsmGemSubmit& s) {
         if (s.nr_cmds != 1 || s.nr_bos == 0 || (s.queueid != 0 && queues_.count(s.queueid) == 0)) return EINVAL;
         const auto* bos = reinterpret_cast<const MsmSubmitBo*>(uintptr_t(s.bos));
@@ -443,6 +472,7 @@ private:
         NativeAdrenoAbiSubmit q{};
         q.buffer_count = 1;
         q.queue = 0;   // one ring (xnu 0115: every queue is queue 0)
+        q.reserved = gateFlag(bos, named, s.nr_bos);   // (redfin hm-int5) HM_GATE_FLAG
         q.buffers[0].handle = ib.handle;
         q.buffers[0].iova = ib.iova + cmd->submit_offset;
         q.buffers[0].bytes = cmd->size;
@@ -451,6 +481,14 @@ private:
         {
             prof::Scope t(prof::kIoSubmit);
             k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+            if (k == kIOReturnBadArgument && q.reserved != 0) {
+                // (redfin hm-int5) a kernel without the flag (it wants the field 0): off for this process, sent again bare
+                gateFlagRefused_ = true;
+                fprintf(stderr, "hakios-metal: HM_GATE_FLAG: the kernel refuses a submission's flags (its NativeAdrenoAbiSubmit.reserved must be 0); "
+                                "flag off for this process\n");
+                q.reserved = 0;
+                k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+            }
         }
         if (k != KERN_SUCCESS) return errnoOf(k, NativeAdrenoMethodSubmit);
         const uint32_t fence = uint32_t(r.fence);

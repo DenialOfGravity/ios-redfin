@@ -21,6 +21,7 @@ namespace fakena {
 struct Counts {
     uint32_t allocs = 0, imports = 0, maps = 0, frees = 0, submits = 0, waits = 0, cpuMaps = 0, queuesMade = 0;
     uint32_t cleans = 0, invalidates = 0, unsupported = 0;
+    uint32_t flaggedSubmits = 0;   // (redfin hm-int5) submissions with NativeAdrenoAbiSubmit.reserved bit 0 (HM_GATE_FLAG)
     uint64_t lastSubmitIova = 0, lastSubmitBytes = 0;
 };
 
@@ -43,6 +44,8 @@ uint8_t* addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBy
 void removeSurfaces();
 // IOSurfaceGetSeed's answer for ID from now on (a surface no CPU writes keeps one seed; a lock/unlock moves it on)
 void setSurfaceSeed(uint32_t id, uint32_t seed);
+// (redfin hm-int5) the submit flag HM_GATE_FLAG sets (reserved bit 0) accepted from now on (false: refused, as every kernel so far)
+void setSubmitFlagsAccepted(bool on);
 int surfaceRefs(uint32_t id);   // references the transport holds (lookups not yet released)
 
 // What the GPU's copy of an import holds now (its FakeGpu buffer), for a test to tell a clean from none

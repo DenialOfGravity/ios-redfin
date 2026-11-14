@@ -212,6 +212,46 @@ TEST(transport_surface_clean_skipped_by_seed) {
 
 // An IOSurface's pages: imported, mapped, described; the GPU sees what the CPU wrote only after the clean, and the
 // CPU sees what the GPU wrote only after the invalidate at the fence
+// (redfin hm-int5) HM_GATE_FLAG=1: a submission that writes a surface of the display's size (HM_GATE_FLAG_SURF) carries
+// the flag, one that only reads it or writes another surface does not; a kernel that refuses the flag (the fake's
+// default, as every kernel so far) gets the submission again bare and the flag is off for the process from then on
+TEST(transport_flags_the_submission_that_writes_the_display_surface) {
+    setenv("HM_GATE_FLAG", "1", 1);
+    setenv("HM_GATE_FLAG_SURF", "64x16", 1);
+    struct Back { ~Back() { unsetenv("HM_GATE_FLAG"); unsetenv("HM_GATE_FLAG_SURF"); fakena::setSubmitFlagsAccepted(false); } } back;
+    fakena::setSubmitFlagsAccepted(true);
+    Rig r;
+    uint8_t* display = fakena::addSurface(81, 64, 16, 256, 0x42475241);
+    fakena::addSurface(82, 32, 16, 128, 0x42475241);
+    (void)display;
+    SurfaceInfo info;
+    int e = 0;
+    auto disp = r.gpu->surfaceBo(81, &info, &e);
+    auto other = r.gpu->surfaceBo(82, &info, &e);
+    auto ib = r.gpu->newBo(4096, 0, &e);
+    CHECK(disp != nullptr && other != nullptr && ib != nullptr);
+    if (disp == nullptr || other == nullptr || ib == nullptr) return;
+    uint32_t fence = 0;
+    const auto c0 = fakena::counts();
+    CHECK_EQ(run(r, *ib, memWrite(disp->gpuAddress() + 64, {1}), {{disp.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 1);
+    CHECK_EQ(run(r, *ib, memWrite(ib->gpuAddress() + 2048, {2}), {{disp.get(), false}}, &fence), 0);   // read only
+    CHECK_EQ(run(r, *ib, memWrite(other->gpuAddress() + 64, {3}), {{other.get(), true}}, &fence), 0);   // another size
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 1);
+    CHECK_EQ(fakena::counts().submits, c0.submits + 3);
+    // a kernel without the flag: refused once, sent again bare, and not flagged again
+    fakena::setSubmitFlagsAccepted(false);
+    CHECK_EQ(run(r, *ib, memWrite(disp->gpuAddress() + 64, {4}), {{disp.get(), true}}, &fence), 0);
+    CHECK_EQ(run(r, *ib, memWrite(disp->gpuAddress() + 64, {5}), {{disp.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(fakena::counts().submits, c0.submits + 5);
+    CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 1);
+    disp.reset();
+    other.reset();
+}
+
 TEST(transport_surface_import_cleans_and_invalidates) {
     Rig r;
     const uint32_t id = 77, rowBytes = 256, w = 64, h = 16;

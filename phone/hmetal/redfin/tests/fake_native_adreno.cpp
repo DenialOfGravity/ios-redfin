@@ -46,6 +46,7 @@ struct Service {
 };
 
 std::recursive_mutex gLock;
+bool gFlagsAccepted = false;   // (redfin hm-int5) setSubmitFlagsAccepted
 // one service per installed FakeGpu (tests make several rigs at once); the newest is what IOServiceOpen opens, and a
 // connection is the service's index + 0x4147 << 8
 std::vector<std::unique_ptr<Service>> gServices;
@@ -217,7 +218,9 @@ IOReturn method(Service& s, uint32_t m, const void* in, size_t inSize, void* out
     case NativeAdrenoMethodSubmit: {
         IN(NativeAdrenoAbiSubmit);
         OUT(NativeAdrenoAbiSubmitReply);
-        if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || rq->reserved) return kIOReturnBadArgument;
+        // (redfin hm-int5) flags: refused as every kernel so far does, unless setSubmitFlagsAccepted (HM_GATE_FLAG's kernel)
+        if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || (rq->reserved && !gFlagsAccepted) || (rq->reserved & ~1u)) return kIOReturnBadArgument;
+        if (rq->reserved & 1u) s.counts.flaggedSubmits++;
         if (rq->buffer_count != 1) return kIOReturnUnsupported;   // (this fake: one IB, as the transport sends)
         const NativeAdrenoAbiSubmitBuffer& ib = rq->buffers[0];
         if ((ib.bytes & 3) || ib.bytes == 0 || ib.iova < kWinBase || ib.iova + ib.bytes > kWinBase + kWinSize) return kIOReturnBadArgument;
@@ -324,6 +327,8 @@ uint8_t* addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBy
     gSurfaces[id] = std::move(f);
     return b;
 }
+
+void setSubmitFlagsAccepted(bool on) { gFlagsAccepted = on; }
 
 void setSurfaceSeed(uint32_t id, uint32_t seed) {
     std::lock_guard<std::recursive_mutex> g(gLock);
