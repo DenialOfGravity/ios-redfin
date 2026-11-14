@@ -509,14 +509,42 @@ shim_ca_prefs(void)
 	if ((e = getenv("HM_CA_FB_COMPRESSION")) == NULL || atoi(e) == 0) set |= 2;
 	if ((e = getenv("HM_CA_IOSURFACE_COMPRESSION")) == NULL || atoi(e) == 0) set |= 4;
 	if (set & 2) setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+	/* (hm-int4) In the argument domain (volatile: this process only, never written to disk), not the app's own: the
+	 * hm-int2/int3 CFPreferencesSetAppValue went through cfprefsd and was PERSISTED into each process's plist
+	 * (/var/mobile/Library/Preferences/com.apple.backboardd.plist ...), so HM_CA_*=1 could not undo it. A value an
+	 * earlier shim persisted is removed (CFPreferencesSetAppValue NULL + synchronize), whatever the switch says. */
+	char did[160] = "";
 #ifndef SHIM_HOST_TEST
-	if (set & 1) CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-	if (set & 2) CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-	if (set & 4) CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+	{
+		static const char *const names[3] = {"CAEnableDeepFramebuffer", "CAEnableFramebufferCompression", "CAEnableIOSurfaceCompression"};
+		NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+		NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+		NSMutableDictionary *args = [NSMutableDictionary dictionaryWithDictionary:[d volatileDomainForName:NSArgumentDomain] ?: @{}];
+		int removed = 0;
+
+		for (int i = 0; i < 3; i++) {
+			CFStringRef key = CFStringCreateWithCString(NULL, names[i], kCFStringEncodingUTF8);
+			CFPropertyListRef stale = CFPreferencesCopyValue(key, kCFPreferencesCurrentApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+
+			if (stale != NULL) {   /* persisted by an earlier shim (or anyone): gone */
+				CFRelease(stale);
+				CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
+				removed |= 1 << i;
+			}
+			if (set & (1 << i)) [args setObject:@NO forKey:(NSString *)key];
+			else [args removeObjectForKey:(NSString *)key];
+			CFRelease(key);
+		}
+		if (removed) CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+		[d setVolatileDomain:args forName:NSArgumentDomain];
+		snprintf(did, sizeof(did), "; set in the argument domain (not persisted)%s%s%s%s", removed ? "; removed stale persisted value(s):" : "",
+			 removed & 1 ? " deep" : "", removed & 2 ? " fbcomp" : "", removed & 4 ? " iosurfcomp" : "");
+		[pool release];
+	}
 #endif
 	shim_log("CA prefs: CAEnableDeepFramebuffer=%s CAEnableFramebufferCompression=%s CAEnableIOSurfaceCompression=%s "
-		 "(HM_CA_DEEP_FB / HM_CA_FB_COMPRESSION / HM_CA_IOSURFACE_COMPRESSION: 0 set false, 1 CA's own)",
-		 set & 1 ? "false" : "CA's", set & 2 ? "false" : "CA's", set & 4 ? "false" : "CA's");
+		 "(HM_CA_DEEP_FB / HM_CA_FB_COMPRESSION / HM_CA_IOSURFACE_COMPRESSION: 0 set false, 1 CA's own)%s",
+		 set & 1 ? "false" : "CA's", set & 2 ? "false" : "CA's", set & 4 ? "false" : "CA's", did);
 	return set;
 }
 
