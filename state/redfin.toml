@@ -4,7 +4,7 @@ schema = 1
 device = "redfin"
 adopted = "2026-11-14T16:58:10Z"
 from_dump = "state/snapshots/2026-11-14T1650Z-adopt.dump"
-note = "bootstrapped by state.py adopt; source = \"unknown\" entries need a decision (resolve or retire)"
+note = "bootstrapped by state.py adopt 2026-11-14, provenance resolved by hand (ws-tools-state 235f83b+); remaining unknown: fastrpcd (source known, binary not reproducible)"
 known_good_baseline = """
 === BASELINE 2026-11-14 (boot rbb2b) ===
 Kernel ws-n-bba2 7100798 (builds/xnu/ws-n-bba2-7100798df6, sha256 33bb5524..., klog PA 0x101d76f18), base r5p3a, cmdline.bb19u15. Lacks 1094.
@@ -231,11 +231,13 @@ note = "vmd disabled 2026-10-29 (user decision; revisit with telephony)"
 
 [[file]]
 path = "/System/Library/xpc/launchd.plist"
-source = "unknown"
-sha256 = "ae563fa868b68153e886d944d0a85eb215a9b5218cec6eefc54a00c77719a286"
+source = "state/files/launchd.plist-395dba3a6a"
+sha256 = "395dba3a6a2a9853fb019875609cbf48d5f4af04bf745f207db1386096eef1ed"
 mode = "644"
 owner = "0:0"
 restart = "reboot"
+hold = "next boot window: adds org.iosonpixel.sweetearly (phone/boot); the phone has ae563fa8 = this minus that job"
+note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs (dropbear, wland, btd, fastrpcd, fstypeovr, sensdprobe, sweetearly), vmd moved out; made by tools/launchd-add-job.py from the phone copy; never in git"
 
 [[file]]
 path = "/var/local/bin/a2s"
@@ -308,11 +310,12 @@ owner = "0:0"
 
 [[file]]
 path = "/var/local/bin/fastrpcd"
-source = "unknown"
+source = "unknown-binary"
 sha256 = "1bc4a68c5d1f3a668428ff5ec8d9d46ffdbbce964061162f096b1498aa800dd6"
 mode = "755"
 owner = "0:0"
 restart = "fastrpcd"
+note = "source phone/fastrpc (first commit 559321a 2026-10-26); this 128288-byte binary of 2026-10-26 09:37 matches no build folder, CI artefact or local rebuild of 559321a/3b1017a/b005fa5 (110-111 KB): built by an unrecorded toolchain; rebuild + install in a reboot/restart window to replace it"
 
 [[file]]
 path = "/var/local/bin/flingtrace.sh"
@@ -358,10 +361,11 @@ owner = "0:0"
 
 [[file]]
 path = "/var/local/bin/lsreg"
-source = "unknown"
+source = "ci:origin/builds-userland-ws-d-fastrpc@5a2e980a73:lsreg"
 sha256 = "af3f5837ef8fe7f3f603dd76aaac04a5d5a149a4a4de2567dd92b8c05ab51c77"
 mode = "755"
 owner = "0:0"
+note = "CI artefact, first seen in builds-userland-ws-d-fastrpc 5a2e980 (iOS userland from ws-d-fastrpc b005fa5, run 40295571814, 2026-10-26); identical in 5 later CI artefact commits; source phone/tools/lsreg.m; a local rebuild differs (other toolchain)"
 
 [[file]]
 path = "/var/local/bin/mic_test"
@@ -372,24 +376,27 @@ owner = "0:0"
 
 [[file]]
 path = "/var/local/bin/netsvc"
-source = "unknown"
+source = "ci:origin/builds-userland-ws-d-fastrpc@5a2e980a73:netsvc"
 sha256 = "a1c049ba084c601d796a2046a1808954e8953535206538b3bf1a062991724309"
 mode = "755"
 owner = "0:0"
+note = "CI artefact, first seen in builds-userland-ws-d-fastrpc 5a2e980 (iOS userland from ws-d-fastrpc b005fa5, run 40295571814, 2026-10-26); identical in 5 later CI artefact commits; source phone/tools/netsvc.m; a local rebuild differs (other toolchain)"
 
 [[file]]
 path = "/var/local/bin/nettest"
-source = "unknown"
+source = "ci:origin/builds-userland-ws-d-fastrpc@5a2e980a73:nettest"
 sha256 = "8dc41afcb209b49e98cd9eac5e2fdc518d601a73ea3b035b968972abbffb0f3f"
 mode = "755"
 owner = "0:0"
+note = "CI artefact, first seen in builds-userland-ws-d-fastrpc 5a2e980 (iOS userland from ws-d-fastrpc b005fa5, run 40295571814, 2026-10-26); identical in 5 later CI artefact commits; source phone/tools/nettest.m; a local rebuild differs (other toolchain)"
 
 [[file]]
 path = "/var/local/bin/openapp"
-source = "unknown"
+source = "ci:origin/builds-userland-ws-d-fastrpc@5a2e980a73:openapp"
 sha256 = "562fd44a6d045c5be808ad75090ef67c9b2f1c5630f196d1ec1b05071863c78d"
 mode = "755"
 owner = "0:0"
+note = "CI artefact, first seen in builds-userland-ws-d-fastrpc 5a2e980 (iOS userland from ws-d-fastrpc b005fa5, run 40295571814, 2026-10-26); identical in 5 later CI artefact commits; source phone/tools/openapp.m; a local rebuild differs (other toolchain)"
 
 [[file]]
 path = "/var/local/bin/oslog"
@@ -427,17 +434,19 @@ sha = "a93b1bb869"
 
 [[file]]
 path = "/var/local/bin/prefs"
-source = "unknown"
+source = "ci:origin/builds-userland-ws-d-fastrpc@5a2e980a73:prefs"
 sha256 = "10a99f3039aa7c79cdcc9b0de8bcf00f6205447231757659a56975b429090e82"
 mode = "755"
 owner = "0:0"
+note = "CI artefact, first seen in builds-userland-ws-d-fastrpc 5a2e980 (iOS userland from ws-d-fastrpc b005fa5, run 40295571814, 2026-10-26); identical in 5 later CI artefact commits; source phone/tools/prefs.m; a local rebuild differs (other toolchain)"
 
 [[file]]
 path = "/var/local/bin/pstack"
-source = "unknown"
+source = "ci:origin/builds-userland-ws-d-fastrpc@5a2e980a73:pstack"
 sha256 = "d2475f15f483914aae9adf06090a64b5808a1fd06963b59a7e4f44c6d251311d"
 mode = "755"
 owner = "0:0"
+note = "CI artefact, first seen in builds-userland-ws-d-fastrpc 5a2e980 (iOS userland from ws-d-fastrpc b005fa5, run 40295571814, 2026-10-26); identical in 5 later CI artefact commits; source phone/tools/pstack.c; a local rebuild differs (other toolchain)"
 
 [[file]]
 path = "/var/local/bin/psx"
@@ -466,33 +475,29 @@ restart = "sensd"
 
 [[file]]
 path = "/var/local/bin/sensd-probe.sh"
-source = "unknown"
-sha256 = "b7bf21a182d33de9eff79664134ed3b049cab360ab6ff3c32ef0eb61f1e784de"
+source = "repo:phone/boot/sensd-probe.sh"
+sha256 = "2b5f4b08cb406911e8b176592e41c7021142563f8b37165c5062435b1e8c5a03"
 mode = "755"
 owner = "0:0"
 restart = "reboot"
-
-[[file]]
-path = "/var/local/bin/sensd2"
-source = "unknown"
-sha256 = "5de7493c69aa39063ad312f68e6d9ea16e641db801a7be0262fc93b26951e679"
-mode = "755"
-owner = "0:0"
+hold = "with launchd.plist (next boot window): drops the sweet-sysctl hook line (phone copy b7bf21a1 = this + that line)"
 
 [[file]]
 path = "/var/local/bin/simpin"
-source = "unknown"
+source = "state/files/tools-235f83b/simpin"
 sha256 = "c80fd02f34315a7ddd9a043108a6cc03adca71df39947f9411720eccc8d486bc"
 mode = "755"
 owner = "0:0"
+note = "byte-identical local rebuild of phone/tools/simpin.c (main)"
 
 [[file]]
 path = "/var/local/bin/sweet-sysctl.sh"
-source = "agent/stage/sweet-sysctl.sh"
+source = "repo:phone/boot/sweet-sysctl.sh"
 sha256 = "bc8509021d61a862af843030f7dec701b290889d539918d97b9f1c6edf36ebe8"
 mode = "755"
 owner = "0:0"
 restart = "reboot"
+note = "started by the sensd-probe.sh hook until the sweetearly job is live; retire it then"
 
 [[file]]
 path = "/var/local/bin/sweetctl"
@@ -615,6 +620,50 @@ sha256 = "99d57d12db6a6a81545466c3da776c1c64e5d6b1d81a6b4a5d5441afbf53a950"
 mode = "644"
 owner = "0:0"
 
+[[file]]
+path = "/var/local/bin/toybox-full"
+source = "state/files/tools-235f83b/toybox-full"
+target = "phone tools"
+ref = "ws-tools-state"
+sha = "235f83b"
+sha256 = "3aaf5e564aa0008b9c6a6ea956d7b3c175069cb172df228393ed52560898a25c"
+mode = "755"
+owner = "0:0"
+note = "toybox with grep/tr/sort/killall/which/seq/timeout/sha*sum (the stock phone toybox has no grep/tr/sort)"
+
+[[file]]
+path = "/var/local/bin/sweetstate"
+source = "state/files/tools-235f83b/sweetstate"
+target = "phone tools"
+ref = "ws-tools-state"
+sha = "235f83b"
+sha256 = "2bd24fa9b043d5cefe19aae880597f0660fc453e5c24d0c1ed580aa5932f6891"
+mode = "755"
+owner = "0:0"
+note = "state dump helper: all kern.sweet_* (OID walk), process start times, mapped bundles"
+
+[[file]]
+path = "/var/local/tools/bin/sctl"
+source = "state/files/tools-235f83b/sctl"
+target = "phone tools"
+ref = "ws-tools-state"
+sha = "235f83b"
+sha256 = "4f0342c3c049ea0992e32e45efacbef4b7c087d07b71a6bf3e928fd5ffd5ce40"
+mode = "755"
+owner = "0:0"
+note = "sctl with -a [PREFIX] (213a432 + ws-tools-state); replaces /var/local/bin/sctl in a later window"
+
+[[file]]
+path = "/var/local/bin/sweet-early.sh"
+source = "repo:phone/boot/sweet-early.sh"
+target = "phone tools"
+ref = "ws-tools-state"
+sha = "235f83b"
+sha256 = "bdd73a57bed42c5c36385039204564d8f942616a6d050ffc8cf6595c5acd1fa4"
+mode = "755"
+owner = "0:0"
+note = "boot sysctls + scratch wipe; run by the launchd job org.iosonpixel.sweetearly once launchd.plist is updated"
+
 
 # Bundle directories: every file with its sha256; apply installs the whole bundle from source.
 [[bundle]]
@@ -633,11 +682,11 @@ note = "copied from the phone's own vendor/firmware partitions: never in git, ne
 
 [[bundle]]
 path = "/Applications/SweetControl.app"
-source = "builds/userland/2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf-2e899aa8d6/SweetControl.app"
+source = "builds/userland/ws-n-ctl-496dd46c22/SweetControl.app"
 target = "userland"
-ref = "2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf"
-sha = "2e899aa8d6"
-note = "3 of 6 files match builds/userland/2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf-2e899aa8d6/SweetControl.app"
+ref = "ws-n-ctl"
+sha = "496dd46c22"
+note = "all files match the ws-n-ctl 496dd46 build (the 2e899aa build has a newer binary/Info.plist/CodeResources)"
 CFBundleIdentifier = "org.iosonpixel.sweetcontrol"
 CFBundleShortVersionString = "1.0"
 CFBundleVersion = "1"
@@ -649,11 +698,11 @@ source = "builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/Re
 target = "userland"
 ref = "a93b1bb86943466b57716125a619cf948a86e50e"
 sha = "a93b1bb869"
-note = "3 of 4 files match builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/RedwoodAudio.driver"
+note = "all 3 bundle files match a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
 restart = "mediaserverd"
 CFBundleIdentifier = "com.redwood.audio"
 CFBundleVersion = "1"
-files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "3638a0ca4d83a999f51776f66bbc49d18ef5c170707fa0bfedeab527c896f821", "RedwoodAudio.pre-s4" = "", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
+files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "3638a0ca4d83a999f51776f66bbc49d18ef5c170707fa0bfedeab527c896f821", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
 
 [[bundle]]
 path = "/System/Library/Extensions/SweetMetal2.bundle"
@@ -680,7 +729,7 @@ restart = "backboardd"
 CFBundleIdentifier = "org.redfin.hakios-metal-bench"
 CFBundleVersion = "1"
 files = { HakiosMetal = "3bed764207d66a15feb41d9bfb5c372387caee65b20263c59e060bf632a849a1", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "b1e4c2303d89a38ce23f9f0d81233ebd402e7b89fac767e886b6c07a9757fe3e" }
-note = "2 of 3 files found in builds/hmetal-mesa/ws-hm-int2-504c000bde/bench/HakiosMetal.bundle"
+note = "every installed file matches the source build (the build folder also has a dSYM that is not installed)"
 target = "hmetal-mesa"
 ref = "ws-hm-int2"
 sha = "504c000bde"
@@ -693,10 +742,10 @@ CFBundleIdentifier = "org.iosonpixel.SweetMetal2"
 CFBundleShortVersionString = "0.1"
 CFBundleVersion = "1"
 files = { "Info.plist" = "82f7230b96029d524d5b34207b4519d485e2d79cd72e8502551b59783c7c5914", SweetMetal2 = "095ce048f6c0b90dcac54e781daa90eb4f1e3c99a698cb7474b2d0cd93e05c7c", "_CodeSignature/CodeResources" = "36cf4d56011e1d861de889da837b965b836af4e79711913841b83a6206fa9f07", "libvulkan_freedreno.dylib" = "f158ab2a86c78be63a8a7825fc60e10586f903028bb5eb8e2b2fdd56092d190b" }
-note = "3 of 4 files found in builds/metal2/da1d8a3bf8542d5db1e29ae6c70b7816cd3fde87-da1d8a3bf8/SweetMetal2.bundle"
+note = "every installed file matches the source build"
 target = "metal2"
 ref = ""
-sha = ""
+sha = "da1d8a3bf8"
 
 
 # Symlinks.
@@ -868,6 +917,54 @@ target = "/var/local/bin/toybox"
 path = "/var/local/bin/xargs"
 target = "/var/local/bin/toybox"
 
+[[link]]
+path = "/var/local/tools/bin/grep"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/egrep"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/fgrep"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/tr"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/sort"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/killall"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/which"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/seq"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/timeout"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/sha256sum"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/md5sum"
+target = "/var/local/bin/toybox-full"
+
+[[link]]
+path = "/var/local/tools/bin/sha1sum"
+target = "/var/local/bin/toybox-full"
+
 
 # Small config/flag/env files with their content (content wins; sha256 only for secret or redacted files: never their content).
 [[flag]]
@@ -880,10 +977,8 @@ restart = "wland"
 
 [[flag]]
 path = "/var/local/cell.on"
-redacted = 1
-sha256 = "c3426287881b32989571061781ff8c2eb8bc93ea1deb436c4693299b491e74e9"
 content = """
-slots=1 pin=@PHONE@ online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=1 gsistart=p2late p2irq=1 p2irqm=63 p2join=40 p2noaggr=1 p2route=16 ipatbl=1 ipanotif=1 p2early=1 qmapv5=1 x1keep=1 cellroute=1 wdaps=1 p2keep=3 p2keepidle=120 pdmapadsp=1
+slots=1 pin=1 online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=1 gsistart=p2late p2irq=1 p2irqm=63 p2join=40 p2noaggr=1 p2route=16 ipatbl=1 ipanotif=1 p2early=1 qmapv5=1 x1keep=1 cellroute=1 wdaps=1 p2keep=3 p2keepidle=120 pdmapadsp=1
 
 
 
@@ -891,6 +986,7 @@ slots=1 pin=@PHONE@ online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=
 """
 mode = "644"
 restart = "wland"
+note = "pin=1 turns on wland's SIM PIN socket (cell.c) for /var/local/bin/simpin; the PIN itself is never in a file"
 
 [[flag]]
 path = "/var/local/hmetal/ca/env"
@@ -3408,4 +3504,12 @@ reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
 [[retired]]
 path = "/var/local/wland.log.gsi1-fd390dc-c2joint-r3"
 reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/bin/sensd2"
+reason = "old sensd variant (1970 date, 106800 B): no source found on any branch or in PF, nothing launches it (launchd runs sensd)"
+
+[[retired]]
+path = "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver/RedwoodAudio.pre-s4"
+reason = "backup binary (dcc81fd) kept inside the plug-in bundle: the build has it in builds/userland"
 

@@ -692,8 +692,9 @@ def compute_diff(m, d):
                 bad.append(f'{rel} missing')
             elif d.sha.get(q) and d.sha[q] != h:
                 bad.append(f'{rel} {d.sha[q][:12]}!={h[:12]}')
+        retired_paths = {r['path'] for r in m.get('retired', [])}
         extra = [q[len(p) + 1:] for q, x in d.files.items() if q.startswith(p + '/') and x['type'] == 'f'
-                 and q[len(p) + 1:] not in bd.get('files', {})]
+                 and q[len(p) + 1:] not in bd.get('files', {}) and q not in retired_paths]
         bad += [f'{e} unexpected' for e in extra]
         if bad:
             dr.add('hash', p, '; '.join(bad[:6]) + (f' (+{len(bad) - 6})' if len(bad) > 6 else ''), fix='install')
@@ -908,7 +909,7 @@ def cmd_apply(m, tp, a):
             if e.get('firmware'):
                 manual.append(f'{p}: firmware copy: never written by state.py')
                 continue
-            if src in ('unknown', 'stock', 'moved-aside', 'firmware-copy') or not src:
+            if src in ('unknown', 'stock', 'moved-aside', 'firmware-copy') or src.startswith('unknown') or not src:
                 manual.append(f'{p}: source "{src}": cannot install (resolve the source in the manifest)')
                 continue
             plan.append(('chmod' if k == 'mode' else 'chown' if k == 'owner' else 'install', p, e))
@@ -1037,6 +1038,12 @@ def as_list(x):
 def source_path(e, m=None):
     """local file for an entry's source: PF-relative path, or repo:PATH (from the manifest's git ref, else REPO)"""
     src = e['source']
+    if src.startswith('ci:'):  # ci:BRANCH@COMMIT:PATH = a CI artefact committed to a builds-* branch
+        ref, path = src[3:].split(':', 1)
+        out = os.path.join(STATE, 'tmp', 'ci-src', ref.replace('/', '_').replace('@', '_'), path)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        open(out, 'wb').write(git_show(ref.split('@', 1)[1], path))
+        return out
     if not src.startswith('repo:'):
         return os.path.join(PF, src)
     rel = src[len('repo:'):]

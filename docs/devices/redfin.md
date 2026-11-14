@@ -38,6 +38,6 @@ Made by `tools/docs-gen.py redfin` from [devices/redfin/device.conf](../../devic
 | battery | partial | charge level is an estimate (SDAM-seeded coulomb count + voltage, 0966); not calibrated |
 | charging | partial | charges while iOS runs, slowly on the PC's USB cable (SMB5 policy 0967/0968); full-rate charging in fastboot |
 | sensors | partial | accelerometer, gyroscope, orientation via the ADSP (fastrpcd, sensd); auto-rotate works (1031; landscape 3-5 s); proximity on demand (r5au1s) |
-| cellular | partial | CommCenter + kernel QMI router (1067-1095): native SIM PIN, registration, SMS, voice calls with two-way audio; mobile data moving from wland to CommCenter + kernel IPA (1075/1076/1080), not passing data on rbb2b; no home/lock-screen bars, no speakerphone button, no DTMF uplink |
+| cellular | partial | CommCenter + kernel QMI router (1067-1095): native SIM PIN, registration, SMS, voice calls with two-way audio; mobile data through CommCenter + kernel IPA (1075/1076/1080) blocked by Apple's activation check (next: route N1, feed CommCenter the activation state); no home/lock-screen bars, no speakerphone button, no DTMF uplink |
 | nfc | missing | not started |
 | gps | missing | not started |

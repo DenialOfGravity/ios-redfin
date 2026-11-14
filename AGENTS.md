@@ -1,4 +1,4 @@
-# Working on ios-flame
+# Working on ios-redfin (Pixel 5; forked from ios-flame, the Pixel 4 port)
 
 - Read `README.md`, then `NOTES.md` (hardware facts, ABL boot image rules, test loop) and the top of
   `HANDOFF.md` ("Start here": the newest state, newest first). ios-sweet's history is in `docs/ios-sweet/`.
@@ -22,6 +22,12 @@
 - To change the phone: edit the manifest in your worktree branch, push, then the phone agent request
   `state apply --manifest git:origin/BRANCH:state/redfin.toml` (dry run first with `--dry-run`). It installs only
   what drifted, restarts only the processes named, re-dumps and verifies. It never reboots or flashes.
+- Never write a file on the phone in place, least of all a Mach-O, dylib, bundle file, plist or `_CodeSignature`
+  file, and also not for rollbacks: put it as `NAME.st-new` in the same directory and `mv` it over the target (a new
+  vnode). Writing over a mapped binary keeps the vnode's cached code-signature blob of the OLD file, new pages fail
+  the hash check ("CODE SIGNING: cs_invalid_page ... allowing (remove VALID)"), every process that loads the file
+  loses CS_VALID and tccd refuses its entitled requests (the 2026-11-14 SpringBoard crash loop). `state apply` does
+  this itself and fails if new cs_invalid_page lines show in the live kernel log.
 - No ad-hoc `files put`, `phone cp/mv`, hand-edited flags, env or conf files on the phone. The one exception is
   `/var/local/scratch/` (ignored by `state diff`, wiped at boot).
 - Experiments flip values with `state set KEY VALUE --temp` (recorded in `PF/state/temp-overrides.json`), then

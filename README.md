@@ -30,16 +30,16 @@ The exact phone state (every installed file with its build, flags, boot sysctls)
 | Sound | Both CS35L41 speaker amps through the audio DSP: ringtones, system sounds, media, volume control (software limiter, no speaker-protection firmware) |
 | Microphone | Records from the rt5514 mics |
 | Camera | **Camera.app** preview and photos on the back (IMX363) and front (IMX355) cameras; the ultra-wide streams frames. Torch from **Control Center** (1062) |
-| Wi-Fi | `wland` drives the radio; **Settings -> Wi-Fi** scans and joins |
+| Wi-Fi | `wland` drives the radio; **Settings -> Wi-Fi** scans and joins (manual join) |
 | Bluetooth | WCN3998 through `btd-bridge`: scan, pairing, headphone (A2DP) media audio |
-| Cellular | Apple's own **CommCenter** against the modem through the kernel QMI router (1067-1095): **native SIM PIN** entry, registration (roaming works), **SMS**, **voice calls with two-way audio** (ADSP voice path). Mobile data worked through `wland` on 2026-11-09 and is being moved to CommCenter + the kernel IPA data path (1075/1076/1080; not passing data on this baseline) |
+| Cellular | Apple's own **CommCenter** against the modem through the kernel QMI router (1067-1095): **native SIM PIN** entry, registration (roaming works), **SMS**, **voice calls with two-way audio** (ADSP voice path). Mobile data worked through `wland` on 2026-11-09; through CommCenter + the kernel IPA data path (1075/1076/1080) it is blocked by Apple's activation check; next stage "N1": feed CommCenter the activation state |
 | USB | Ethernet to the PC: SSH (dropbear), a kernel file server, a command server and the live kernel log |
 | Battery, charging | Percentage from the fuel gauge (coulomb-counted estimate). **The phone charges while iOS runs**, slowly on the PC's USB cable; full-rate charging in fastboot |
 | Sensors | Accelerometer, gyro, light, compass, pressure through `fastrpcd` + `sensd`; **auto-rotation** (3-5 s to landscape); proximity on demand |
 | Apps | The stock apps from the IPSW (Settings, Safari, Messages, Phone, Camera, Photos, Notes, Weather, ...) |
 | Time | PMIC RTC |
 
-**Not working yet:** mobile data on the CommCenter/kernel path, signal bars on the home and lock screen (they show
+**Not working yet:** mobile data through CommCenter (Apple's activation check; route N1 next), signal bars on the home and lock screen (they show
 inside apps), the speakerphone button and keypad (DTMF) tones during a call, call audio on Bluetooth headsets,
 hardware video decode/encode and camera video recording, GPS, NFC, the fingerprint sensor, SEP, App Store and
 Apple ID services.
