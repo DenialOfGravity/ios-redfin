@@ -1415,6 +1415,38 @@ TEST(a_specialisation_through_the_front_end_memo_and_the_shrink_is_the_plain_one
     CHECK(first->listing.find("c0.") == std::string::npos);
 }
 
+// (redfin hm-int5) HM_FE_PRE: the kept front-end NIR made SSA and shrunk once, before any configuration folds, gives the
+// same specialised program, word for word, and the same read mask as hm-int4's path (HM_FE_PRE=0)
+TEST(a_specialisation_from_the_pre_shrunk_front_end_is_the_same_program) {
+    if (!hasCompiler()) return;
+    std::vector<uint8_t> bc = bitcodeOf("tri_cflat_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    const float c[4] = {0.0625f, 0.3125f, 0.5625f, 0.8125f};   // (a configuration of its own)
+    KnownBuffer known;
+    known.binding = 0;
+    known.bytes.assign(reinterpret_cast<const uint8_t*>(c), reinterpret_cast<const uint8_t*>(c) + 16);
+    std::string why;
+    setenv("HM_STAGE_MEMO", "0", 1);
+    setenv("HM_FE_PRE", "0", 1);
+    auto before = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    std::vector<uint8_t> maskBefore;
+    const int readBefore = knownReadMask(bc.data(), bc.size(), {}, 0, 32, &maskBefore, &why);
+    unsetenv("HM_FE_PRE");
+    auto after = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    auto again = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    std::vector<uint8_t> maskAfter;
+    const int readAfter = knownReadMask(bc.data(), bc.size(), {}, 0, 32, &maskAfter, &why);
+    unsetenv("HM_STAGE_MEMO");
+    CHECK(before != nullptr && after != nullptr && again != nullptr);
+    if (before == nullptr || after == nullptr || again == nullptr) return;
+    CHECK(before->words == after->words);
+    CHECK(after->words == again->words);
+    CHECK(before->immediates == after->immediates);
+    CHECK_EQ(readBefore, readAfter);
+    CHECK(maskBefore == maskAfter);
+}
+
 // (redfin hm-int4) air.sincos: sin returned, cos written through the pointer (PridePoster's updateParticles,
 // refused by hm-int3 as "a pointer where a number belongs"); compiled for x = 0 the stage writes sin 0 = 0 and cos 0 = 1
 TEST(sincos_writes_its_cosine_through_the_pointer) {

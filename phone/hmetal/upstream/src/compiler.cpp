@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <thread>
 #include <pthread.h>
 #include <ctime>
 #include <sys/stat.h>
@@ -446,6 +447,30 @@ constexpr size_t kFeMemoMax = 8;
 std::mutex gFeMemoLock;
 std::vector<FrontEndMemo*> gFeMemo;
 bool feMemoOn() { return envOn("HM_FE_MEMO", true); }
+// (redfin hm-int5) HM_FE_PRE=1 (default): the kept front-end NIR (HM_FE_MEMO) is first put through the passes every
+// specialisation of it runs before the known buffer can fold anything -- the variables' copies split and lowered, the
+// locals made SSA, copies propagated, constants folded, dead control flow and code dropped -- once, when it is kept.
+// Each specialisation then clones and folds that smaller shader (the phone's int4 run: clone ~30 ms + folding ~25 ms of
+// a ~85 ms specialisation of CoreAnimation's fixed_frag_lph_cpf, the uber shader's locals still memory). knownReadMask
+// reads the same NIR, so a configuration's mask is that of the shader that is specialised. Not part of the stage cache's
+// key: only configuration-independent NIR passes, which the specialisation's own shrink runs too, moved before the fold
+// (host, the 11 configurations the phone waited for in its first int4 minute: the same stages, word for word, by fnv;
+// 28.4 -> 12.2 ms median, front end 11.7 -> 4.3, folding 11.0 -> 3.9); HM_CACHE_VERIFY would say STALE if one differed.
+// 0: as hm-int4 (the front end's NIR kept as it came).
+bool fePreOn() { return envOn("HM_FE_PRE", true); }
+void fePreShrink(nir_shader* nir) {
+    for (int round = 0; round < 16; round++) {
+        bool progress = false;
+        progress = nir_split_var_copies(nir) || progress;
+        progress = nir_lower_var_copies(nir) || progress;
+        progress = nir_lower_vars_to_ssa(nir) || progress;
+        nir_copy_prop(nir);
+        progress = nir_opt_constant_folding(nir) || progress;
+        progress = nir_opt_dead_cf(nir) || progress;
+        progress = nir_opt_dce(nir) || progress;
+        if (!progress) break;
+    }
+}
 uint64_t feHash(const void* bitcode, size_t size) {
     uint64_t h = 1469598103934665603ull;
     const uint8_t* p = static_cast<const uint8_t*>(bitcode);
@@ -460,7 +485,7 @@ std::vector<std::pair<uint32_t, uint64_t>> feConstants(const FunctionConstants& 
 }
 // (under gFeMemoLock)
 FrontEndMemo* feMemoFind(uint64_t hash, size_t size, const std::vector<std::pair<uint32_t, uint64_t>>& constants) {
-    const uint32_t flags = codegenFlags();
+    const uint32_t flags = codegenFlags() | (fePreOn() ? 4u : 0u);
     for (FrontEndMemo* m : gFeMemo) {
         if (m->hash == hash && m->size == size && m->flags == flags && m->constants == constants) return m;
     }
@@ -498,7 +523,7 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
             m = new FrontEndMemo;
             m->hash = hash;
             m->size = size;
-            m->flags = codegenFlags();
+            m->flags = codegenFlags() | (fePreOn() ? 4u : 0u);
             m->constants = key;
             m->mem = ralloc_context(nullptr);
             m->nir = air_to_nir(m->mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &m->info, &error);
@@ -509,6 +534,7 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
                 tTranslateNs += monoNs() - t0;
                 return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
             }
+            if (fePreOn()) fePreShrink(m->nir);   // (redfin hm-int5) HM_FE_PRE
             gFeMemo.push_back(m);
         }
         if (m != nullptr) {
@@ -1556,6 +1582,60 @@ std::string stageCacheWritable(const std::string& name) {
     return std::string(dir) + name;
 }
 
+// (redfin hm-int5) HM_CACHE_WRITE_ASYNC=1 (default): a specialisation's new stage (and its manifest, which hashes the
+// whole bitcode) is written to the disk cache by one writer thread after the compile has returned, so the thread that
+// waited for the stage does not also wait for the disk. A read of the cache in this process first lets the pending
+// writes finish (cacheWritesDrain: nothing to wait for unless one is queued). 0: written before returning (hm-int4).
+namespace {
+// (never destroyed: the writer thread waits on these for the life of the process, and a condition variable destroyed at
+// exit with a thread waiting on it hangs the exit)
+struct CacheWrites {
+    std::mutex lock;
+    std::condition_variable more, done;
+    std::deque<std::function<void()>> q;
+    int busy = 0;
+    std::atomic<int> pending{0};
+};
+CacheWrites& cacheWrites() {
+    static CacheWrites* w = new CacheWrites;
+    return *w;
+}
+void cacheWriterRun() {
+    CacheWrites& w = cacheWrites();
+    std::unique_lock<std::mutex> g(w.lock);
+    for (;;) {
+        w.more.wait(g, [&w] { return !w.q.empty(); });
+        std::function<void()> f = std::move(w.q.front());
+        w.q.pop_front();
+        w.busy++;
+        g.unlock();
+        f();
+        g.lock();
+        w.busy--;
+        w.pending--;
+        w.done.notify_all();
+    }
+}
+}  // namespace
+bool cacheWriteAsyncOn() { return envOn("HM_CACHE_WRITE_ASYNC", true); }
+void cacheWriteLater(std::function<void()> f) {
+    CacheWrites& w = cacheWrites();
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread(cacheWriterRun).detach(); });
+    {
+        std::lock_guard<std::mutex> g(w.lock);
+        w.pending++;
+        w.q.push_back(std::move(f));
+    }
+    w.more.notify_one();
+}
+void cacheWritesDrain() {
+    CacheWrites& w = cacheWrites();
+    if (w.pending.load() == 0) return;
+    std::unique_lock<std::mutex> g(w.lock);
+    w.done.wait(g, [&w] { return w.q.empty() && w.busy == 0; });
+}
+
 bool writeFileAtomically(const std::string& path, const std::string& data) {
     const std::string tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
@@ -1678,6 +1758,7 @@ std::unique_ptr<CompiledStage> stageCacheParse(const std::string& data) {
 }
 
 std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, std::string* blob = nullptr) {
+    cacheWritesDrain();   // (redfin hm-int5) HM_CACHE_WRITE_ASYNC: this process's own writes first
     std::string data;
     if (!readFile(path, &data)) return nullptr;
     std::unique_ptr<CompiledStage> s = stageCacheParse(data);
@@ -1768,6 +1849,7 @@ void stageManifestSave(const std::string& name, const void* bitcode, size_t size
 
 // (redfin hm-cache) for bench/hm-seed: the name a stage is filed under, "" without a cache configured
 std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
+    cacheWritesDrain();   // (redfin hm-int5) HM_CACHE_WRITE_ASYNC
     return stageCacheName(bitcode, size, constants, iboBase, known);
 }
 const char* stageCacheKeyText() { return cacheKeyText(); }
@@ -2015,7 +2097,15 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     std::unique_ptr<CompiledStage> chosen = compileStageFresh(bitcode, size, why, constants, iboBase, known);
     if (chosen != nullptr) {
         std::string blob = stageCacheBlob(*chosen);
-        if (!cached.empty() && writeFileAtomically(cached, blob)) stageManifestSave(name, bitcode, size, constants, iboBase, known);
+        if (!cached.empty() && known != nullptr && cacheWriteAsyncOn()) {   // (redfin hm-int5) after returning
+            auto bc = std::make_shared<std::string>(static_cast<const char*>(bitcode), size);
+            auto kb = std::make_shared<KnownBuffer>(*known);
+            cacheWriteLater([cached, blob, name, bc, constants, iboBase, kb] {
+                if (writeFileAtomically(cached, blob)) stageManifestSave(name, bc->data(), bc->size(), constants, iboBase, kb.get());
+            });
+        } else if (!cached.empty() && writeFileAtomically(cached, blob)) {
+            stageManifestSave(name, bitcode, size, constants, iboBase, known);
+        }
         memoKeep(memoKey, std::move(blob));
     }
     return chosen;
@@ -2117,6 +2207,7 @@ std::unique_ptr<CompiledKernel> kernelCacheParse(const std::string& data) {
     return k;
 }
 std::unique_ptr<CompiledKernel> kernelCacheLoad(const std::string& path, std::string* blob) {
+    cacheWritesDrain();   // (redfin hm-int5) HM_CACHE_WRITE_ASYNC: this process's own writes first
     std::string data;
     if (!readFile(path, &data)) return nullptr;
     std::unique_ptr<CompiledKernel> k = kernelCacheParse(data);
@@ -2242,6 +2333,7 @@ bool compileManifestEntry(const void* bitcode, size_t size, std::string* why, co
 
 // (redfin hm-cache) a manifest (stageManifestSave) read back
 bool stageManifestRead(const std::string& path, StageManifest* m) {
+    cacheWritesDrain();   // (redfin hm-int5) HM_CACHE_WRITE_ASYNC: this process's own writes first
     std::string data;
     if (!readFile(path, &data)) return false;
     CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
@@ -2270,6 +2362,7 @@ bool stageManifestRead(const std::string& path, StageManifest* m) {
 // again, one at a time, from the bitcode kept beside it; while BUSY(CTX) answers non-zero (frames being drawn) it waits.
 // The calling thread should be marked background (setCompileBackground) and run at a low priority.
 RewarmCounts stageCacheRewarm(int (*busy)(void*), void* ctx) {
+    cacheWritesDrain();   // (redfin hm-int5) HM_CACHE_WRITE_ASYNC
     RewarmCounts n;
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     if (dir == nullptr || dir[0] == 0) return n;

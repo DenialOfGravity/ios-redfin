@@ -196,6 +196,7 @@ int timeOne(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    setenv("HM_CACHE_WRITE_ASYNC", "0", 0);   // (redfin hm-int5) every stage on disk before the tool exits
     if (argc >= 4 && !strcmp(argv[1], "build")) {
         for (int i = 4; i + 1 < argc; i++) {
             if (!strcmp(argv[i], "--chip") && !selectChipArg(argv[i + 1])) return 2;

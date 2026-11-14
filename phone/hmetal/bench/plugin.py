@@ -2399,6 +2399,31 @@ HMI5_EDITS = [
      '\t_pass.depth_slope_scale = slopeScale;\n'
      '\t_pass.depth_bias_clamp = clamp;\n'),
 ]
+# (hm-int5 item 2) HM_SPEC_STEAL=1 (default): a configuration queued on the specialiser's queue (a pipeline that may still
+# draw its own program asked for it) that a draw must now wait for (the program was denied or blamed since) is compiled
+# by the waiting thread itself, at its own QoS, instead of the waiter polling behind the user-initiated serial queue and
+# whatever it holds before that one; the queued block finds it taken and does nothing. 0: as hm-int4.
+HMI5_EDITS += [
+    ('static int\nhm_spec_qos_on(void)\n{',
+     'static int\nhm_spec_steal_on(void)\n{\n\tstatic int on = -1;\n\n\tif (on < 0) {\n\t\tconst char *e = getenv("HM_SPEC_STEAL");\n'
+     '\t\ton = e == NULL || e[0] == 0 || atoi(e) != 0;\n\t}\n\treturn on;\n}\n\n'
+     '/* (redfin hm-int5) the mark of a configuration queued and not yet started (HM_SPEC_STEAL) */\n'
+     'static id\nhm_spec_queued(void)\n{\n\tstatic id mark;\n\tstatic dispatch_once_t once;\n\n'
+     '\tdispatch_once(&once, ^{ mark = [[NSObject alloc] init]; });\n\treturn mark;\n}\n\n'
+     'static int\nhm_spec_qos_on(void)\n{'),
+    ('\t\t} else if (have == nil && [_specialised count] < 64) {\n\t\t\t[_specialised setObject:[NSNull null] forKey:key];\n\t\t\tstart = YES;\n',
+     '\t\t} else if (have == nil && [_specialised count] < 64) {\n\t\t\t[_specialised setObject:(hm_spec_steal_on() ? hm_spec_queued() : [NSNull null]) forKey:key];\n\t\t\tstart = YES;\n'
+     '\t\t} else if (wait && have == hm_spec_queued()) {   /* (redfin hm-int5) HM_SPEC_STEAL: queued, not started: this thread compiles it */\n'
+     '\t\t\t[_specialised setObject:[NSNull null] forKey:key];\n\t\t\tmine = YES;\n'),
+    ('\t\tdispatch_async(compiling, ^{\n\t\t\tstruct timespec t0, t1;\n\n\t\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n',
+     '\t\tdispatch_async(compiling, ^{\n\t\t\tstruct timespec t0, t1;\n\n'
+     '\t\t\tif (hm_spec_steal_on()) {   /* (redfin hm-int5) taken over by a waiting thread: nothing left to do */\n'
+     '\t\t\t\tBOOL taken;\n\n\t\t\t\t@synchronized(self) {\n\t\t\t\t\ttaken = [_specialised objectForKey:key] != hm_spec_queued();\n'
+     '\t\t\t\t\tif (!taken) [_specialised setObject:[NSNull null] forKey:key];\n\t\t\t\t}\n'
+     '\t\t\t\tif (taken) {\n\t\t\t\t\tif (hm_fps_on()) hm_print("specialise: %s: a waiting draw compiled it first (HM_SPEC_STEAL)\\n", hakios_metal_program_name(_program));\n'
+     '\t\t\t\t\t[self release];\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t}\n'
+     '\t\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n'),
+]
 EDITS += HMI5_EDITS
 
 
