@@ -6183,7 +6183,7 @@ TEST(the_ycbcr_conversion_is_within_one_lsb_of_the_reference) {
 // (redfin hmyc) a known NV12 picture through both paths: a draw samples the RGBA8 copy in the two-plane texture's place,
 // decoded once on the GPU in a buffer of its own sent first (or, without a compiler, on the processor -- the same
 // bytes); a second buffer takes the copy as it is until the surface's generation moves
-TEST(a_ycbcr_surface_is_sampled_through_its_decoded_copy) {
+TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) {
     CommandBuffer::setYcbcrGpuForTesting(1);
     struct Back { ~Back() { CommandBuffer::setYcbcrGpuForTesting(-1); } } back;
     Rig r;
@@ -6275,7 +6275,7 @@ TEST(a_ycbcr_surface_is_sampled_through_its_decoded_copy) {
 }
 
 // (redfin hmyc) the GPU fallback: HM_YCBCR_GPU=0 converts on the processor, the same bytes as the reference
-TEST(a_ycbcr_surface_falls_back_to_the_processor) {
+TEST(a_two_plane_surface_falls_back_to_the_processor_decode) {
     CommandBuffer::setYcbcrGpuForTesting(0);
     struct Back { ~Back() { CommandBuffer::setYcbcrGpuForTesting(-1); } } back;
     Rig r;
@@ -6324,7 +6324,7 @@ TEST(a_ycbcr_surface_falls_back_to_the_processor) {
 
 // (redfin hmyc) what wrapSurfaceYcbcr refuses: rows or starts not a multiple of 4, a plane off the end, a one-plane
 // surface, no matrix
-TEST(a_ycbcr_texture_refuses_planes_the_kernel_cannot_read) {
+TEST(a_two_plane_surface_ycbcr_texture_refuses_unreadable_planes) {
     Rig r;
     r.fake->addSurface(43, 32, 8, 64, 0x34323066u, 0, 2);
     r.fake->addSurface(44, 32, 8, 128, 0x42475241u);
