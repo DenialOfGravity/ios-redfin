@@ -1313,15 +1313,65 @@ sysctl_sweet_surfkeep SYSCTL_HANDLER_ARGS
 	if (error || !changed) {
 		return error;
 	}
-	if (value < 0 || value > 1) {
+	if (value < 0 || value > 2) {      /* 1096: 2 = CA archive-decode surfaces only (default) */
 		return EINVAL;
 	}
 	sweet_surfkeep = (uint32_t)value;
-	printf("SWEET SURF: surfkeep %d (1048: recorded key sets keep their row; new surfaces)\n", value);
+	printf("SWEET SURF: surfkeep %d (%s; new surfaces)\n", value, value == 2 ? "1096: archive-decode surfaces keep their row" :
+	    value == 1 ? "1048: recorded key sets keep their row" : "every row 64-aligned");
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_surfkeep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    0, 0, sysctl_sweet_surfkeep, "I", "SWEET SURF: recorded key-set surfaces keep their explicit row (1048)");
+    0, 0, sysctl_sweet_surfkeep, "I", "SWEET SURF: explicit rows kept: 0 none, 1 <= 9 keys (1048), 2 CA archive decode only (1096, default)");
+
+/* redfin 1096: kern.sweet_surfpad (iokit/Kernel/arm/SweetSurface.cpp sweet_surface_pad): allocations cover whole 4-row groups */
+extern uint32_t sweet_surfpad, sweet_surfpad_grew;
+extern uint32_t sweet_surface_pad(void);
+static int
+sysctl_sweet_surfpad SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, (int)sweet_surface_pad(), sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	sweet_surfpad = (uint32_t)value;
+	printf("SWEET SURF: surfpad %d (1096: allocations padded to 4-row groups; new surfaces)\n", value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_surfpad, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_surfpad, "I", "SWEET SURF: pad allocations to whole 4-row groups for GMEM 16x4 blits (1096, default 1)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_surfpad_grew, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_surfpad_grew, 0,
+    "SWEET SURF: surfaces whose allocation grew by kern.sweet_surfpad (1096)");
+
+/* redfin 1096: kern.sweet_surfalign_limits: the alignment masks of IOSurfaceRootUserClient selector 13 */
+extern uint32_t sweet_surfalign_limits;
+extern uint32_t sweet_surface_limits_mask(void);
+static int
+sysctl_sweet_surfalign_limits SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	(void)sweet_surface_limits_mask();     /* reads the boot-arg once */
+	int error = sysctl_io_number(req, (int)sweet_surfalign_limits, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 65536 || (value > 1 && (value & (value - 1)) != 0)) {
+		return EINVAL;
+	}
+	sweet_surfalign_limits = (uint32_t)value;
+	printf("SWEET SURF: surfalign_limits %d: selector 13 answers row mask %u (1096; processes that start IOSurface now)\n",
+	    value, sweet_surface_limits_mask());
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_surfalign_limits, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_surfalign_limits, "I",
+    "SWEET SURF: IOSurface limits row alignment: 1 = 0159's (64, default), 0 = none, 2^n = that (1096)");
 
 static int present_wait_locked(uint32_t k, const char *why);
 

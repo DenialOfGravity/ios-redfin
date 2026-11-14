@@ -38,6 +38,8 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/c++/OSSymbol.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
 
@@ -511,12 +513,128 @@ uint32_t
 sweet_surface_keep_row(void)
 {
 	if (sweet_surfkeep == 0xffffffffu) {
-		uint32_t v = 1;	/* default on since 2026-11-05 (sweetsurfkeep=0 = old rounding) */
+		/*
+		 * 1096: default 2 (was 1 since 2026-11-05): keep the explicit row only for CA's archive-decode surfaces
+		 * (sweet_surface_archive_decode). sweetsurfkeep=1 = 1048 as it was (<= 9 keys), 0 = always round.
+		 */
+		uint32_t v = 2;
 		PE_parse_boot_argn("sweetsurfkeep", &v, sizeof(v));
-		sweet_surfkeep = v ? 1 : 0;
+		sweet_surfkeep = v > 2 ? 2 : v;
 	}
 	return sweet_surfkeep;
 }
+
+/*
+ * redfin 1096: kern.sweet_surfkeep 2. 1048 kept the row of every surface made from <= 9 keys with an explicit
+ * IOSurfaceBytesPerRow. The surfaces it was written for (klogs 11-05..11-14, "SWEET SURF: 1048 ... kept") are CA's
+ * archive decoder's: 6 keys, made in the client (SpringBoard, MobilePhone, InCallService, Preferences, Quick Look),
+ * small (glyph/icon size), 'LA08' or 'BGRA', CPU-written from a recorded blob, never a render target or a display
+ * surface. Others in the <= 9 set were not: MobileSafari's 7-key 1125x2436 'BGRA' (4512-byte rows), Quick Look's
+ * 7-key thumbnails. backboardd's display surfaces have 11 keys (never kept). Mode 2 keeps the row only when all of:
+ * <= 6 keys, explicit row, not backboardd, under 1 M pixels. Everything else gets 0159/0940's 64-byte rows.
+ */
+#define SWEET_SURFKEEP_MAX_KEYS         6
+#define SWEET_SURFKEEP_MAX_PIXELS       (1u << 20)
+static bool
+sweet_surface_archive_decode(SweetSurface *s, OSDictionary *props, const char *who)
+{
+	return props->getCount() <= SWEET_SURFKEEP_MAX_KEYS && props->getObject("IOSurfaceBytesPerRow") != NULL &&
+	       strcmp(who, "backboardd") != 0 && (uint64_t)s->width * s->height < SWEET_SURFKEEP_MAX_PIXELS;
+}
+
+/* The key names of a create (first 24 decisions of mode 2 logged, to check the archive-decode test on the phone). */
+static void
+sweet_surface_key_names(OSDictionary *props, char *buf, size_t len)
+{
+	size_t at = 0;
+	buf[0] = 0;
+	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
+	if (it == NULL) {
+		return;
+	}
+	OSSymbol *k;
+	while ((k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL && at + 2 < len) {
+		const char *n = k->getCStringNoCopy();
+		if (strncmp(n, "IOSurface", 9) == 0) {
+			n += 9;
+		}
+		int w = snprintf(buf + at, len - at, "%s%s", at ? "," : "", n);
+		if (w < 0) {
+			break;
+		}
+		at += (size_t)w;
+	}
+	it->release();
+}
+
+/*
+ * redfin 1096: kern.sweet_surfpad 0|1 (boot-arg sweetsurfpad, default 1). The A6xx GMEM blits (tile load/store,
+ * hakios-metal's GMEM restore) move 16x4-pixel blocks, so a pass over an imported surface whose height is not a
+ * multiple of 4 reads (and may write) up to 3 rows past its last one. The allocation covers whole 4-row groups
+ * for the surface and each plane (rows, sizes and offsets the client sees do not change; only allocSize can grow).
+ * New surfaces only. kern.sweet_surfpad_grew counts surfaces whose allocation grew by it.
+ */
+extern "C" uint32_t sweet_surfpad;
+uint32_t sweet_surfpad = 0xffffffffu;
+extern "C" uint32_t sweet_surfpad_grew;
+uint32_t sweet_surfpad_grew;
+extern "C" uint32_t sweet_surface_pad(void);
+uint32_t
+sweet_surface_pad(void)
+{
+	if (sweet_surfpad == 0xffffffffu) {
+		uint32_t v = 1;
+		PE_parse_boot_argn("sweetsurfpad", &v, sizeof(v));
+		sweet_surfpad = v ? 1 : 0;
+	}
+	return sweet_surfpad;
+}
+
+/*
+ * redfin 1096: kern.sweet_surfalign_limits (boot-arg sweetsurfalignlim, default 1). What IOSurfaceRootUserClient
+ * selector 13 (limits, 0x18 bytes) answers as the offset (+0) and bytes-per-row (+4) alignment masks, which
+ * IOSurface.framework hands to IOSurfaceAlignProperty / IOSurfaceGetPropertyAlignment: 1 = the row alignment this
+ * kernel rounds to (0159's sweetsurfalign, 64: mask 63, as before 1096), 0 = no alignment (masks 0, test only),
+ * a power of two N >= 2 = mask N - 1 (e.g. 256, to see whether a client follows the mask). Read at each query
+ * (a process asks once, when IOSurface.framework starts in it).
+ */
+extern "C" uint32_t sweet_surfalign_limits;
+uint32_t sweet_surfalign_limits = 0xffffffffu;
+static uint32_t sweet_surface_row_align(void);
+extern "C" uint32_t sweet_surface_limits_mask(void);
+uint32_t
+sweet_surface_limits_mask(void)
+{
+	if (sweet_surfalign_limits == 0xffffffffu) {
+		uint32_t v = 1;
+		PE_parse_boot_argn("sweetsurfalignlim", &v, sizeof(v));
+		sweet_surfalign_limits = (v <= 1 || (v & (v - 1)) == 0) ? v : 1;
+	}
+	uint32_t v = sweet_surfalign_limits;
+	if (v == 0) {
+		return 0;
+	}
+	if (v == 1) {
+		uint32_t a = sweet_surface_row_align();
+		return a > 1 ? a - 1 : 0;
+	}
+	return v - 1;
+}
+
+/* 0159's row alignment (boot-arg sweetsurfalign=N, default 64, 0 = as asked); 1096 made it a function for selector 13. */
+static uint32_t
+sweet_surface_row_align(void)
+{
+	static uint32_t row_align = 0xffffffffu;
+	if (row_align == 0xffffffffu) {
+		uint32_t v = 64;
+		PE_parse_boot_argn("sweetsurfalign", &v, sizeof(v));
+		row_align = (v & (v - 1)) == 0 ? v : 0;
+	}
+	return row_align;
+}
+
+static uint32_t sweet_surface_keep2_logged;    /* 1096: mode-2 decisions logged with their key names (first 24) */
 
 /* Geometry from the creation properties (IOSurface.h keys). */
 static IOReturn
@@ -577,7 +695,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	 * every frame (6.6 ms of backboardd's ~12 ms frame). Creators read the rows back with
 	 * IOSurfaceGetBytesPerRow.
 	 */
-	static uint32_t row_align = 0xffffffffu;
+	uint32_t row_align = sweet_surface_row_align();
 	/*
 	 * 0940: the planes' rows too (boot-arg sweetsurfplanar=0: not), and a surface with plane info of one
 	 * plane like one without (Core Animation's A8/RG8/BGRA layers still reached Turnip at 96/160/224-byte
@@ -587,11 +705,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	 * 0927's lock result). sweetsurfalign=0 turns all of it off.
 	 */
 	static uint32_t planar_align = 0xffffffffu;
-	if (row_align == 0xffffffffu) {
-		uint32_t v = 64;
-		PE_parse_boot_argn("sweetsurfalign", &v, sizeof(v));
-		row_align = (v & (v - 1)) == 0 ? v : 0;
-		v = 1;
+	if (planar_align == 0xffffffffu) {
+		uint32_t v = 1;
 		PE_parse_boot_argn("sweetsurfplanar", &v, sizeof(v));
 		planar_align = v ? row_align : 0;
 	}
@@ -604,12 +719,21 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	 * only. Line SWEET SURF: 1048 ... for the first 32 such surfaces whose row 0159 would round (also with 0).
 	 */
 	bool recorded = props->getCount() <= 9 && props->getObject("IOSurfaceBytesPerRow") != NULL;
-	bool keep_row = recorded && sweet_surface_keep_row() != 0;
+	uint32_t keep_mode = sweet_surface_keep_row();
+	/* 1096: mode 2 keeps the row of CA's archive-decode surfaces only (sweet_surface_archive_decode) */
+	bool keep_row = recorded && (keep_mode == 1 || (keep_mode == 2 && sweet_surface_archive_decode(s, props, who)));
 	if (recorded && row_align > 1 && (s->bytesPerRow & (row_align - 1)) != 0) {
 		if (sweet_surface_keep_logged < 32) {
 			sweet_surface_keep_logged++;
 			IOLog("SWEET SURF: 1048 %u keys %ux%u fmt 0x%x row %u %s (%s)\n", props->getCount(), s->width, s->height,
 			    s->pixelFormat, s->bytesPerRow, keep_row ? "kept" : "rounded", who);
+		}
+		if (keep_mode == 2 && sweet_surface_keep2_logged < 24) {
+			char keys[192];
+			sweet_surface_keep2_logged++;
+			sweet_surface_key_names(props, keys, sizeof(keys));
+			IOLog("SWEET SURF: 1096 surfkeep 2: %s %ux%u fmt 0x%x row %u %s; keys %s\n", who, s->width, s->height,
+			    s->pixelFormat, s->bytesPerRow, keep_row ? "kept (archive decode)" : "rounded to 64", keys);
 		}
 	}
 	if (!keep_row && row_align > 1 && (one_plane || plane_info == NULL || (plane_info->getCount() == 1 && planar_align > 1))) {
@@ -708,9 +832,35 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 		}
 	}
 
+	/* 1096 kern.sweet_surfpad: whole 4-row groups behind the surface and each plane (GMEM 16x4 blocks) */
+	uint64_t pad_end = end;
+	if (sweet_surface_pad() != 0) {
+		uint32_t rows = sweet_div_up(s->height, s->elementHeight);
+		uint64_t e = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * ((rows + 3) & ~3u);
+		if (s->planeCount == 0 && e > pad_end) {
+			pad_end = e;
+		}
+		for (uint32_t i = 0; i < s->planeCount; i++) {
+			const struct sweet_surface_plane *p = &s->planes[i];
+			uint32_t prow = sweet_div_up(p->height, p->elementHeight);
+			uint64_t pe = (uint64_t)p->offset + (uint64_t)p->bytesPerRow * ((prow + 3) & ~3u);
+			if ((uint64_t)p->offset + p->size > pe) {
+				pe = (uint64_t)p->offset + p->size;
+			}
+			if (pe > pad_end) {
+				pad_end = pe;
+			}
+		}
+	}
 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
 	if (alloc < end) {
 		alloc = end;
+	}
+	if (round_page(alloc) < round_page(pad_end)) {
+		OSIncrementAtomic((volatile SInt32 *)&sweet_surfpad_grew);
+	}
+	if (alloc < pad_end) {
+		alloc = pad_end;
 	}
 	alloc = round_page(alloc);
 	if (alloc == 0 || alloc > SWEET_SURFACE_MAX_ALLOC) {
@@ -1134,8 +1284,9 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	switch (selector) {
 	case kSweetSurfaceLimits: {
 		uint8_t limits[0x18] = { 0 };
-		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
-		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
+		uint32_t mask = sweet_surface_limits_mask();   /* 1096 kern.sweet_surfalign_limits (1: 63, as before) */
+		put32(limits, 0x0, mask);
+		put32(limits, 0x4, mask);
 		limits[0x16] = 1;
 		sweet_surf_log_once("sel", selector);
 		return sweet_struct_out(args, limits, sizeof(limits));
