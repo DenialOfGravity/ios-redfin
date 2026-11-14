@@ -55,6 +55,14 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
   - (hmv12) HM_SHADOW_WAIT=1 (default; HM_SHADOW_WAIT_MS=250): a copy of an unaligned surface's rows is not rewritten by
     the processor while a committed buffer still reads or draws it (the refresh waits; an unmoved-seed HM_SHADOW_FRESH
     refresh is put off instead), and a write-back is deferred to a later committed writer; 0 = as before
+  - (hm-cache) HM_COMPILE_LOG (default with HM_PROF>=1): "compile: pipeline ...: wall, compiling, CPU, front end, folding,
+    waited; compiled, cached (memo, seed)"; the waited-for specialisation's line says where its stage came from (compiled,
+    memo, cache, seed), its CPU ms and the configuration's bytes; HM_SPEC_QOS=1 (default) the specialiser's queue at
+    user-initiated QoS on the core's background compiler; HM_SPEC_ASYNC=0 (default; 1: an unseen configuration of a
+    denied uber shader compiled on the queue and its draws left out meanwhile); HM_PREWARM=1 (default) rebuilt on the
+    stage cache's manifests (missing stages under the current key compiled at utility QoS after HM_PREWARM_DELAY=60 s,
+    waiting while frames are drawn); ca-prof only with HM_CA_PROF_US=N or the boot-arg (was on with HM_TRACE);
+    HM_HANG_EXEC=1 (default): the HANG trace splits GPU time into queued + running and skips buffers that only queued
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
@@ -1737,6 +1745,151 @@ EDITS = [
      '\t\t\t\t}\n'
      '\t\t\t\tmemcpy(xwas, xr, sizeof(xwas));\n\t\t\t\tcwas = copies, fwas = forced;\n'),
 ]
+
+# ---- (redfin hm-cache) the stage cache, compile waits, the pre-warm, ca-prof, the HANG split (bench/plugin.py) ----
+HMC_HELPERS = r'''/* (redfin hm-cache) helpers of the cache / compile-wait edits (bench/plugin.py):
+ *   HM_COMPILE_LOG=1 (default with HM_PROF>=1): a pipeline whose stages were compiled or took 20 ms: "compile: pipeline
+ *     LABEL: wall W ms, compiling C ms (CPU P ms; front end F, folding K), waited for the compiler X ms; N compiled, H
+ *     cached (M memo, S seed)". Wall much above CPU = the thread waited for a core or a lock, not for the compiler.
+ *   HM_SPEC_ASYNC=0 (default): a configuration of a denied/blamed uber shader not specialised before is specialised
+ *     on the asking thread and the draw waits (the uber program itself must never draw: it hangs the GPU). 1: it is
+ *     specialised on the specialiser's queue and the draw is left out until it is done (a layer missing for ~0.4 s,
+ *     possibly kept in a cached offscreen texture: test before making it the default).
+ *   HM_SPEC_QOS=1 (default): the specialiser's queue at user-initiated QoS, its compiles on the core's background
+ *     compiler (HM_COMPILE_SPLIT), so a render thread that waits for one is not waiting behind a default-QoS queue. */
+static int
+hm_compile_log_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_COMPILE_LOG");
+		on = e != NULL && e[0] ? atoi(e) != 0 : hm_prof_level() >= 1;
+	}
+	return on;
+}
+
+static int
+hm_spec_async(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_SPEC_ASYNC");
+		on = e != NULL && atoi(e) != 0;
+	}
+	return on;
+}
+
+static int
+hm_spec_qos_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_SPEC_QOS");
+		on = e == NULL || e[0] == 0 || atoi(e) != 0;
+	}
+	return on;
+}
+
+/* the thread's compile figures: [0] wait ms [1] compile ms [2] hits [3] misses, then hakios_metal_compile_stats_more's
+ * [4] CPU ms [5] front end ms [6] folding ms [7] memo hits [8] seed hits */
+static void
+hm_compile_snap(double out[9])
+{
+	unsigned h = 0, m = 0;
+
+	memset(out, 0, 9 * sizeof(double));
+	hakios_metal_compile_stats(&out[0], &out[1], &h, &m);
+	out[2] = h, out[3] = m;
+	hakios_metal_compile_stats_more(out + 4, 5);
+}
+
+static void
+hm_compile_note(const char *what, double wallMs, const double a[9], const double b[9])
+{
+	if (!hm_compile_log_on() || (b[3] - a[3] == 0 && wallMs < 20)) return;
+	hm_print("compile: %s: wall %.0f ms, compiling %.0f ms (CPU %.0f ms; front end %.0f, folding %.0f), waited for the compiler %.0f ms; "
+		 "%.0f compiled, %.0f cached (%.0f memo, %.0f seed)\n", what, wallMs, b[1] - a[1], b[4] - a[4], b[5] - a[5], b[6] - a[6],
+		 b[0] - a[0], b[3] - a[3], b[2] - a[2], b[7] - a[7], b[8] - a[8]);
+}
+
+/* how a specialisation's stage came: compiled, or read from the memo, a seed or the cache */
+static const char *
+hm_compile_source(const double a[9], const double b[9])
+{
+	return b[3] > a[3] ? "compiled" : b[7] > a[7] ? "from the memo" : b[8] > a[8] ? "from a seed" : b[2] > a[2] ? "from the cache" : "?";
+}
+
+'''
+
+SPEC_MINE_NEW = r'''		struct timespec t0, t1;
+		double ca[9], cb[9];
+
+		hm_compile_snap(ca);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+									 (unsigned)_specBinding, [key bytes], [key length]);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		hm_compile_snap(cb);
+		hm_tr_event("specialise (waited for) %s: %.0f ms", hakios_metal_program_name(_program),
+			    (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);   /* (redfin hmv8) */
+		{   /* (redfin hm-cache) where the stage came from, the CPU time, and the configuration's bytes */
+			char hex[2 * 256 + 1] = "";
+			const unsigned char *kb = [key bytes];
+
+			for (NSUInteger i = 0; i < [key length] && i < 256; i++) snprintf(hex + 2 * i, 3, "%02x", kb[i]);
+			hm_print("specialise (waited for, hmv7): %s for %u bytes of its buffer %d: %s%u instruction words, not %u, in %.0f ms "
+				 "(%s; CPU %.0f ms, front end %.0f, folding %.0f); configuration %s\n",
+				 hakios_metal_program_name(_program), _specLength, _specBinding, p != NULL ? "" : "FAILED: ",
+				 p != NULL ? hakios_metal_program_stage_words(p, 1) : 0, hakios_metal_program_stage_words(_program, 1),
+				 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, hm_compile_source(ca, cb), cb[4] - ca[4],
+				 cb[5] - ca[5], cb[6] - ca[6], hex);
+		}
+		if (p == NULL) hm_print("specialise: %s\n", hakios_metal_error());
+'''
+
+HMC_EDITS = [
+    # helpers, before hm_tr_pipeline (after hm_prof_level, before the pipeline and specialiser code that use them)
+    ('/* a pipeline made: its ms and what of them the compiler\'s (the thread\'s compile stats before and after) */\n',
+     HMC_HELPERS + '/* a pipeline made: its ms and what of them the compiler\'s (the thread\'s compile stats before and after) */\n'),
+    # item 4: wall vs CPU per pipeline (HM_PROF / HM_COMPILE_LOG)
+    ('\thakios_metal_compile_stats(&hmTrW0, &hmTrC0, &hmTrH0, &hmTrM0);\n',
+     '\thakios_metal_compile_stats(&hmTrW0, &hmTrC0, &hmTrH0, &hmTrM0);\n\tdouble hmCa[9];\n\n\thm_compile_snap(hmCa);   /* (redfin hm-cache) */\n'),
+    ('\t\t\t\thakios_metal_compile_stats(&w, &c, &h, &m);\n',
+     '\t\t\t\thakios_metal_compile_stats(&w, &c, &h, &m);\n'
+     '\t\t\t\t{   /* (redfin hm-cache) HM_COMPILE_LOG */\n'
+     '\t\t\t\t\tdouble hmCb[9];\n\t\t\t\t\tchar what[300];\n\n'
+     '\t\t\t\t\thm_compile_snap(hmCb);\n'
+     '\t\t\t\t\tsnprintf(what, sizeof(what), "pipeline %s", [descriptor label] != nil ? [[descriptor label] UTF8String] : "(no label)");\n'
+     '\t\t\t\t\thm_compile_note(what, (hm_now() - hmTrBegan) * 1e3, hmCa, hmCb);\n'
+     '\t\t\t\t}\n'),
+    # the specialisation the draw waits for: its source (memo / cache / seed / compiled), CPU, configuration bytes
+    ('\t\tstruct timespec t0, t1;\n\n\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n\t\thakios_metal_program *p = hakios_metal_program_specialize(',
+     '\t\tif (p == NULL) hm_print("specialise: %s\\n", hakios_metal_error());\n', SPEC_MINE_NEW),
+    # HM_SPEC_ASYNC (opt-in): a configuration not specialised before compiled on the queue, its draws left out meanwhile
+    ('\tif (wait && found == NULL && !mine) {\n\t\t/* being specialised on the queue',
+     '\tif (mine && hm_spec_async()) {   /* (redfin hm-cache) HM_SPEC_ASYNC=1 */\n'
+     '\t\tmine = NO;\n\t\tstart = YES;\n'
+     '\t\thm_v7_left_out(_program, "its specialisation for this configuration is being compiled (HM_SPEC_ASYNC)");\n'
+     '\t} else if (wait && found == NULL && !mine && hm_spec_async()) {\n'
+     '\t\thm_v7_left_out(_program, "its specialisation for this configuration is being compiled or failed (HM_SPEC_ASYNC)");\n'
+     '\t\treturn NULL;\n\t}\n'
+     '\tif (wait && found == NULL && !mine) {\n\t\t/* being specialised on the queue'),
+    # HM_SPEC_QOS: the specialiser's queue at user-initiated QoS, on the background compiler
+    ('\t\t\tcompiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);\n',
+     '\t\t\tcompiling = dispatch_queue_create("hakios.metal.specialise", hm_spec_qos_on() ?   /* (redfin hm-cache) HM_SPEC_QOS */\n'
+     '\t\t\t\tdispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0) : DISPATCH_QUEUE_SERIAL);\n'),
+    ('\t\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n\t\t\thakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,\n'
+     '\t\t\t\t\t\t\t\t\t\t (unsigned)_specBinding, [key bytes], [key length]);\n\t\t\tclock_gettime(CLOCK_MONOTONIC, &t1);\n',
+     '\t\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n\t\t\tif (hm_spec_qos_on()) hakios_metal_compile_background(1);   /* (redfin hm-cache) the background compiler */\n'
+     '\t\t\thakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,\n'
+     '\t\t\t\t\t\t\t\t\t\t (unsigned)_specBinding, [key bytes], [key length]);\n'
+     '\t\t\thakios_metal_compile_background(0);   /* (a GCD worker: nothing kept for its next block) */\n'
+     '\t\t\tclock_gettime(CLOCK_MONOTONIC, &t1);\n'),
+]
+EDITS += HMC_EDITS
 
 
 def apply(src, edits=EDITS):
