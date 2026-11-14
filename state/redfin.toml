@@ -2,7 +2,7 @@
 [meta]
 schema = 1
 device = "redfin"
-adopted = "2026-11-14T16:57:12Z"
+adopted = "2026-11-14T16:58:10Z"
 from_dump = "state/snapshots/2026-11-14T1650Z-adopt.dump"
 note = "bootstrapped by state.py adopt; source = \"unknown\" entries need a decision (resolve or retire)"
 known_good_baseline = """
@@ -465,6 +465,14 @@ sha = "9ce81fa9db"
 restart = "sensd"
 
 [[file]]
+path = "/var/local/bin/sensd-probe.sh"
+source = "unknown"
+sha256 = "b7bf21a182d33de9eff79664134ed3b049cab360ab6ff3c32ef0eb61f1e784de"
+mode = "755"
+owner = "0:0"
+restart = "reboot"
+
+[[file]]
 path = "/var/local/bin/sensd2"
 source = "unknown"
 sha256 = "5de7493c69aa39063ad312f68e6d9ea16e641db801a7be0262fc93b26951e679"
@@ -863,6 +871,14 @@ target = "/var/local/bin/toybox"
 
 # Small config/flag/env files with their content (content wins; sha256 only for secret or redacted files: never their content).
 [[flag]]
+path = "/var/local/abp-policy.conf"
+secret = true
+sha256 = "80bcf593e307952e4285dd337da6e0935d111fc5ea60908a7ea049e2bb340354"
+source = "agent/stage/abp-policy.voice.conf"
+mode = "644"
+restart = "wland"
+
+[[flag]]
 path = "/var/local/cell.on"
 redacted = 1
 sha256 = "c3426287881b32989571061781ff8c2eb8bc93ea1deb436c4693299b491e74e9"
@@ -1031,12 +1047,25 @@ mode = "644"
 restart = "mediaserverd"
 
 [[flag]]
+path = "/var/local/sweetcell.conf"
+content = """
+hooks=0
+"""
+mode = "644"
+restart = "SpringBoard"
+
+[[flag]]
 path = "/var/local/sweetfps"
 content = """
 0 90
 """
 mode = "644"
 restart = "SpringBoard"
+
+[[flag]]
+path = "/var/local/sweetpin.off"
+content = ""
+mode = "644"
 
 [[flag]]
 path = "/var/local/wland.conf"
@@ -1075,14 +1104,6 @@ reason = "pre-change backup: the git manifest history is the backup now"
 [[retired]]
 path = "/System/Library/xpc/launchd.plist.with-cc"
 reason = "old launchd.plist copy (the live one is managed)"
-
-[[retired]]
-path = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/MobileGestalt.plist.before-camera"
-reason = "pre-change backup: the git manifest history is the backup now"
-
-[[retired]]
-path = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist.pre-cellradio"
-reason = "pre-change backup: the git manifest history is the backup now"
 
 [[retired]]
 path = "/var/local/RedwoodAudio.driver.knowngood-03de277"
@@ -1175,10 +1196,6 @@ reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt
 [[retired]]
 path = "/var/local/SweetMetal2.bundle.pre-rotfb"
 reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
-
-[[retired]]
-path = "/var/local/abp-policy.conf"
-reason = "old abp-policy variant (secret-class file: never copied off the phone)"
 
 [[retired]]
 path = "/var/local/abp-policy.conf.pre-n12b"
@@ -1281,10 +1298,6 @@ path = "/var/local/abp-policy.r3.conf"
 reason = "old abp-policy variant (secret-class file: never copied off the phone)"
 
 [[retired]]
-path = "/var/local/av.log"
-reason = "one-off script/marker from an old test"
-
-[[retired]]
 path = "/var/local/backup"
 reason = "hand backups (MobileGestalt / Info.plist tars, 2026-11-04/05)"
 
@@ -1375,10 +1388,6 @@ reason = "one-off test tool (rebuild from builds/userland when needed)"
 [[retired]]
 path = "/var/local/bin/sctl.pre-m0"
 reason = "pre-change backup: the git manifest history is the backup now"
-
-[[retired]]
-path = "/var/local/bin/sensd-probe.sh"
-reason = "old build copy of a daemon/tool kept by hand"
 
 [[retired]]
 path = "/var/local/bin/sensd-probe.sh.pre-sns"
@@ -2045,30 +2054,6 @@ path = "/var/local/hexagon.tgz"
 reason = "one-off dump/test output (copy to PF/logs if still wanted)"
 
 [[retired]]
-path = "/var/local/hmetal-probe-fix1.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal-probe-fix2.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal-probe-fix3.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal-probe-mesa1.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal-probe-mesa2.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal-probe1.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
 path = "/var/local/hmetal/HakiosMetal.bundle"
 reason = "one-off hmetal probe/bench output (2026-11-06..09)"
 
@@ -2081,19 +2066,7 @@ path = "/var/local/hmetal/SweetMetal2-shim.bundle.knowngood-6740748"
 reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
 
 [[retired]]
-path = "/var/local/hmetal/bench-hm.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
 path = "/var/local/hmetal/bench-hm.out"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal/bench-m2v-try.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal/bench-m2v.log"
 reason = "one-off hmetal probe/bench output (2026-11-06..09)"
 
 [[retired]]
@@ -2147,42 +2120,6 @@ reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in 
 [[retired]]
 path = "/var/local/hmetal/ca/HakiosMetal.bundle.var8"
 reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-exact2-prev.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-f1.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-h4-pad2.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-h4-u0.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-h4-u1.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-own-prev.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-own-runs-hmt3.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-pre-hmt3.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/bbd-hm-run1.log"
-reason = "one-off hmetal test log"
 
 [[retired]]
 path = "/var/local/hmetal/ca/bbd-hm.log"
@@ -2241,31 +2178,11 @@ path = "/var/local/hmetal/ca/h3b-stage-mtimes.txt"
 reason = "one-off hmetal test log"
 
 [[retired]]
-path = "/var/local/hmetal/ca/h6tail.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/h6user.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
-path = "/var/local/hmetal/ca/h7tail.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
 path = "/var/local/hmetal/ca/shim"
 reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
 
 [[retired]]
-path = "/var/local/hmetal/ca/shim-pre-hmt4.log"
-reason = "one-off hmetal test log"
-
-[[retired]]
 path = "/var/local/hmetal/ca/shim.apps"
-reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
-
-[[retired]]
-path = "/var/local/hmetal/ca/shim.log"
 reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
 
 [[retired]]
@@ -2369,35 +2286,11 @@ path = "/var/local/hmetal/perf1"
 reason = "one-off hmetal probe/bench output (2026-11-06..09)"
 
 [[retired]]
-path = "/var/local/hmetal/perf1.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
 path = "/var/local/hmetal/perf1.sh"
 reason = "one-off hmetal probe/bench output (2026-11-06..09)"
 
 [[retired]]
-path = "/var/local/hmetal/probe-int-59ffeee.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal/probe-var.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal/probe-var2.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal/t-hm.log"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
 path = "/var/local/hmetal/t-hm.out"
-reason = "one-off hmetal probe/bench output (2026-11-06..09)"
-
-[[retired]]
-path = "/var/local/hmetal/t.log"
 reason = "one-off hmetal probe/bench output (2026-11-06..09)"
 
 [[retired]]
@@ -2491,18 +2384,6 @@ reason = "one-off dump/test output (copy to PF/logs if still wanted)"
 [[retired]]
 path = "/var/local/loc5.txt"
 reason = "one-off dump/test output (copy to PF/logs if still wanted)"
-
-[[retired]]
-path = "/var/local/modem-profiles-20261113-180026.bak"
-reason = "hand backup"
-
-[[retired]]
-path = "/var/local/modem-profiles-20261114-010200.bak"
-reason = "hand backup"
-
-[[retired]]
-path = "/var/local/modem-profiles-20261114-014027.bak"
-reason = "hand backup"
 
 [[retired]]
 path = "/var/local/mtb.text"
@@ -2757,10 +2638,6 @@ path = "/var/local/sweet-sysctl.conf.pre-m9p"
 reason = "pre-change backup: the git manifest history is the backup now"
 
 [[retired]]
-path = "/var/local/sweetcell.conf"
-reason = "old flag variant (pre-sweetctl / pre-p5)"
-
-[[retired]]
 path = "/var/local/sweetcell.conf.pre-p5-absent"
 reason = "pre-change backup: the git manifest history is the backup now"
 
@@ -2783,10 +2660,6 @@ reason = "pre-change backup: the git manifest history is the backup now"
 [[retired]]
 path = "/var/local/sweethud.pre-sweetctl-absent"
 reason = "pre-change backup: the git manifest history is the backup now"
-
-[[retired]]
-path = "/var/local/sweetpin.off"
-reason = "old flag variant (pre-sweetctl / pre-p5)"
 
 [[retired]]
 path = "/var/local/sweetpin.on.knowngood-nopin"

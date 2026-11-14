@@ -1035,15 +1035,14 @@ RETIRE_RULES = [  # (regex on the path, reason); first match wins; a matching di
     (r'\.knowngood[^/]*$', 'known-good copy: known-good tracking retired; the git manifest history replaces it'),
     (r'\.(bak|orig)$|-orig$', 'hand backup'),
     (r'/launchd\.plist\.[^/]+$', 'old launchd.plist copy (the live one is managed)'),
-    (r'/bin/(wland|sensd|btd-bridge|venusctl|sctl|sensd2|hakios-metal-probe)[.-][^/]+$', 'old build copy of a daemon/tool kept by hand'),
+    (r'/bin/(wland|sensd|btd-bridge|venusctl|sctl|sensd2)\.[^/]+$|/bin/hakios-metal-probe-[^/]+$', 'old build copy of a daemon/tool kept by hand'),
     (r'/bin/hakios-metal-probe$', 'one-off Metal probe (2026-11-06)'),
     (r'/(wland|btd)\.log\.(?!prev$)[^/]+$', 'saved log copy from an old test run (copy to PF/logs if still wanted)'),
-    (r'/(abp-policy\.conf|abp-policy)\.[^/]+$|/abp-policy\.r3\.conf$', 'old abp-policy variant (secret-class file: never copied off the phone)'),
+    (r'/abp-policy\.conf\.[^/]+$|/abp-policy\.r3\.conf$', 'old abp-policy variant (secret-class file: never copied off the phone)'),
     (r'/cell\.on\.[^/]+$', 'old cell.on variant'),
     (r'/mtl2-(env|live|clients)\.[^/]+$', 'old Metal env variant'),
     (r'/hmetal/ca/env\.[^/]+$|/hmetal/ca/bbd-hm\.starts\.[^/]+$', 'old hmetal env/start log variant'),
     (r'/sweet-sysctl\.conf\.[^/]+$', 'old sysctl conf variant'),
-    (r'/(sweetcell|sweetpin|sweethud|sweetfps|wland\.conf)\.[^/]+$', 'old flag variant (pre-sweetctl / pre-p5)'),
     (r'/var/local/[^/]+\.(text|nv12|tar|tgz|ips|data|str)$', 'one-off dump/test output (copy to PF/logs if still wanted)'),
     (r'/var/local/(bb8|cmcc|cst2?|fcss|fms|s1|s2|stubs|bks|l6|loc[0-9]|o[0-9]+m?|or10|oslog-s4|wfr2-[^/]+|cellnet|celestial)(\.[a-z]+)?$', 'one-off dump/test output (copy to PF/logs if still wanted)'),
     (r'/var/local/hmetal/[^/]+\.(log|out|bin|metallib)$|/var/local/hmetal/perf1(\.sh|\.log)?$|/var/local/hmetal-probe[^/]*\.log$|/var/local/hmetal/HakiosMetal\.bundle$', 'one-off hmetal probe/bench output (2026-11-06..09)'),
@@ -1139,6 +1138,8 @@ def cmd_adopt(d, a, base=None):
         if any(p.startswith(b + '/') for b in seen_bundle):
             continue
         why = None if gmatch(p, mg['stock']) else retire_reason(p, x)
+        if why and gmatch(p, mg['volatile']) and 'MB log' not in why:
+            why = None  # written by something running (logs, modem-profiles-*.bak): not a leftover
         if why:
             retired.append(dict(path=p, reason=why))
             if x['type'] == 'd':
