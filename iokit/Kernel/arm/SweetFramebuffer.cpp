@@ -538,7 +538,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
  */
 extern "C" {
 uint32_t sweet_bl_trace = 3;
-uint32_t sweet_bl_fix = 15;     /* 1100: + 8 (backlight-calibration-parameters) */
+uint32_t sweet_bl_fix = 7;      /* 1101: 8 (backlight-calibration-parameters) off at boot until proven; sweetblfix=15 */
 }
 static IOSimpleLock *sweet_blt_lock;
 static uint64_t sweet_blt_refill;
@@ -1009,35 +1009,68 @@ AppleARMBacklight::publishNits(uint32_t level)
  * LminProduct 2 (16.16); here the S6E3HC2 at the 500 nits 0906/0973 assume, mid 155, min 2. The current keys are
  * left out (CoreBrightness keeps its defaults for them, as now).
  */
+/*
+ * 1101: 1100's dictionary crashed backboardd (NULL deref in CFNumberGetValue, lr = CoreBrightness 0x1af0d8aa4): the
+ * Display init does CFNumberGetValue(CFDictionaryGetValue(dict, key), kCFNumberFloatType, &f) WITHOUT a NULL check
+ * for nine keys, then divides each by 65536 (16.16 fixed point):
+ *   current-for-max-backlight, current-for-mid-backlight, hardware-max-current-limit (mA),
+ *   lMaxProduct, lMidProduct, lMinProduct, lMaxPanel, lMidPanel, lMinPanel (nits).
+ * Only milliAmps2NitsScaleFactor is checked (left out). All nine are published, as 16.16 integers. Currents: 20 mA
+ * at 500 nits, 6.2 mA at 155 (proportional), 25 mA hardware limit; non-zero so no division by zero.
+ * kern.sweet_bl_fix & 8 is now live: writing the sysctl publishes or removes the dictionary (then restart
+ * backboardd to make CoreBrightness read it again).
+ */
+static AppleARMBacklight *sweet_bl_service;    /* 1101: for the kern.sweet_bl_fix handler; never released */
+
 void
 AppleARMBacklight::publishCalibration(void)
 {
 	if (!(sweet_bl_fix & 8)) {
-		IOLog("SWEET BL: 1100 backlight-calibration-parameters not published (kern.sweet_bl_fix & 8 off)\n");
+		if (getProperty("backlight-calibration-parameters") != NULL) {
+			removeProperty("backlight-calibration-parameters");
+			IOLog("SWEET BL: 1101 backlight-calibration-parameters removed (kern.sweet_bl_fix & 8 off)\n");
+		} else {
+			IOLog("SWEET BL: 1101 backlight-calibration-parameters not published (kern.sweet_bl_fix & 8 off)\n");
+		}
 		return;
 	}
+#define SWEET_Q16(milli) ((unsigned long long)(((uint64_t)(milli) << 16) / 1000))
 	static const struct {
 		const char *key;
-		uint32_t value;
+		uint32_t milli;         /* value x 1000 */
 	} cal[] = {
-		{ "lMaxProduct", SWEET_BL_MAX_NITS }, { "lMidProduct", 155 }, { "lMinProduct", SWEET_BL_MIN_NITS },
-		{ "lMaxPanel", SWEET_BL_MAX_NITS }, { "lMidPanel", 155 }, { "lMinPanel", SWEET_BL_MIN_NITS },
+		{ "current-for-max-backlight", 20000 }, { "current-for-mid-backlight", 6200 },
+		{ "hardware-max-current-limit", 25000 },
+		{ "lMaxProduct", SWEET_BL_MAX_NITS * 1000 }, { "lMidProduct", 155000 }, { "lMinProduct", SWEET_BL_MIN_NITS * 1000 },
+		{ "lMaxPanel", SWEET_BL_MAX_NITS * 1000 }, { "lMidPanel", 155000 }, { "lMinPanel", SWEET_BL_MIN_NITS * 1000 },
 	};
 	OSDictionary *d = OSDictionary::withCapacity(sizeof(cal) / sizeof(cal[0]));
 	if (d == NULL) {
 		return;
 	}
 	for (unsigned i = 0; i < sizeof(cal) / sizeof(cal[0]); i++) {
-		OSNumber *n = OSNumber::withNumber((unsigned long long)cal[i].value, 32);
-		if (n != NULL) {
-			d->setObject(cal[i].key, n);
-			n->release();
+		OSNumber *n = OSNumber::withNumber(SWEET_Q16(cal[i].milli), 32);
+		if (n == NULL) {
+			d->release();
+			return;
 		}
+		d->setObject(cal[i].key, n);
+		n->release();
 	}
+#undef SWEET_Q16
 	setProperty("backlight-calibration-parameters", d);
 	d->release();
-	IOLog("SWEET BL: 1100 backlight-calibration-parameters published: lMax/lMid/lMin Panel+Product %u/155/%u nits\n",
-	    SWEET_BL_MAX_NITS, SWEET_BL_MIN_NITS);
+	IOLog("SWEET BL: 1101 backlight-calibration-parameters published (16.16): lMax/lMid/lMin Panel+Product %u/155/%u nits, "
+	    "current max/mid/limit 20/6.2/25 mA\n", SWEET_BL_MAX_NITS, SWEET_BL_MIN_NITS);
+}
+
+/* 1101: kern.sweet_bl_fix written (sweet_gpu.c): bit 8 takes effect now */
+extern "C" void
+sweet_bl_fix_changed(void)
+{
+	if (sweet_bl_service != NULL) {
+		sweet_bl_service->publishCalibration();
+	}
 }
 
 IOReturn
@@ -1222,6 +1255,8 @@ AppleCLCD::start(IOService *provider)
 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
 		if (bl != NULL && bl->init() && bl->attach(this)) {
 			bl->fFB = this;
+			sweet_bl_service = bl;  /* 1101 */
+			bl->retain();
 			bl->setProperty("backlight-control", true);
 			bl->publish(SWEET_BL_MAX / 2);
 			bl->registerService();

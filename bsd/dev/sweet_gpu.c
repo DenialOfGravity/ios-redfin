@@ -1889,8 +1889,23 @@ extern uint32_t sweet_fb_hz;
 extern uint32_t sweet_bl_trace, sweet_bl_fix;
 SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_trace, 0,
     "SWEET BLT: 1 backlight/AppleCLCD property reads+writes, 2 IOMFB user-client calls (1099)");
-SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_fix, 0,
-    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; 1100: 8 backlight-calibration-parameters (at boot)");
+/* 1101: kern.sweet_bl_fix is a handler: bit 8 (backlight-calibration-parameters) publishes/removes at once */
+extern void sweet_bl_fix_changed(void);
+static int
+sysctl_sweet_bl_fix SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = (int)sweet_bl_fix, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error == 0 && changed) {
+		sweet_bl_fix = (uint32_t)value;
+		sweet_bl_fix_changed();
+	}
+	return error;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_bl_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bl_fix, "I",
+    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; "
+    "1100/1101: 8 backlight-calibration-parameters (live; restart backboardd)");
 SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
