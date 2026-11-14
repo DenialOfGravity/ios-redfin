@@ -139,7 +139,14 @@ HM_TRACE is off unless the env says 1; the plug-in's log copy rotates at 16 MB (
 `ca/shim.log` and the process log at start. Luma boost: `luma-boost` = 1 on, else off; backboardd applies it with
 CASetDebugOption(91 = CA_DISABLE_LUMA_BOOST) and hakios-metal draws the pass while the knob is on (its address in
 HM_LUMA_KNOB); SweetMetal2 processes get SWEET_LUMA_BOOST (a line in mtl2-env/mtl2-live still wins there).
-Template env file: bench/hm-env.default. Host test: `cc -o t bench/m2shim_test.c && ./t` (bench/build.sh runs it).
+Template env file: bench/hm-env.default.
+
+**Install by copy + rename, never in place** (bench/hm-install.sh SRC TAG; `restore TAG` rolls back the same way). A driver
+Mach-O overwritten in place while processes map it keeps the kernel's signature blob of the old file: new pages fail their
+hashes (`CODE SIGNING: cs_invalid_page ... allowing (remove VALID)` in the klog), the process loses CS_VALID, tccd stops
+trusting its entitlements and its first TCC request aborts it (SpringBoard crash-looped on kTCCServiceMotion, 2026-11-14).
+The dispatcher says so in one `CODE SIGNATURE ...` line (klog, syslog, shim.log) when a process starts Metal without
+CS_VALID or loses it while loading a driver. Host test: `cc -o t bench/m2shim_test.c && ./t` (bench/build.sh runs it).
 
 Multi-process on our kernel: each process opens its own v2 client (IOAcceleratorES type 0x4147) and gets its own 4 GiB
 GPU window (64 windows, xnu/patches/0115 sweet_gpu_window_alloc), BOs from the one kernel GPU pool (as Turnip's); all
