@@ -7,6 +7,7 @@
 // One line per check, "probe: ok ..." or "probe: FAIL ...", and a last line with the count; the exit status is the
 // number of failures. Run it from a job list (hakios: RC_JOBS, EXTRA=).
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -1850,6 +1851,7 @@ int main(int argc, char** argv) {
     //   9y. the VS's driver params: tri_base_vs's [[base_vertex]] and [[instance_id]] from a base instance, plain and indexed
     //   9z. private memory: tri_pvt_fs fills a 128-word array a fiber and reads it back at the pixel's index
     //   9m2. a '420f' IOSurface as one YCbCr8_420_2P texture, sampled: the order the TP gives Y, Cb and Cr in
+    //   9m3. (redfin hmyc) '420f' and '420v' surfaces through HM_YCBCR=native's GPU decode, against the processor's conversion
     //   9l2. lines: tri_flat's vertices 1 and 2 as a line list and as a line strip, the diagonal one pixel wide
     //   9k2. a 1D texture: tri_tex1d_fs samples four texels at tri_color's red, texel floor(4 r) exactly
     {
@@ -6150,6 +6152,129 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (yuv != nullptr) CFRelease(yuv);
+            }
+            // 9m3. (redfin hmyc) HM_YCBCR=native: a '420f' and a '420v' 64x64 surface, a luma ramp and chroma walking both
+            // axes, wrapped by Texture::wrapSurfaceYcbcr and sampled whole by tri_tex over the RGBA8 target: what the draw
+            // reads is the copy ycbcr_decode converted on the GPU from both planes, which must be the processor's
+            // conversion (Texture::ycbcrConvertRows, within 1 LSB of the exact formula) byte for byte. A second buffer
+            // with the surface unchanged decodes nothing; after the CPU writes it and the generation moves, the draw
+            // reads the new picture.
+            for (int kind = 0; kind < 2; kind++) {
+                const bool video = kind == 1;
+                CFMutableDictionaryRef props = CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                auto setIn = [&](CFMutableDictionaryRef d, CFStringRef key, int v) {
+                    CFNumberRef n = CFNumberCreate(nullptr, kCFNumberIntType, &v);
+                    CFDictionarySetValue(d, key, n);
+                    CFRelease(n);
+                };
+                setIn(props, kIOSurfaceWidth, int(W));
+                setIn(props, kIOSurfaceHeight, int(H));
+                setIn(props, kIOSurfacePixelFormat, int(video ? 0x34323076 : 0x34323066));
+                setIn(props, kIOSurfaceAllocSize, int(W * H + W * H / 2));
+                CFMutableArrayRef planes = CFArrayCreateMutable(nullptr, 2, &kCFTypeArrayCallBacks);
+                for (int pl = 0; pl < 2; pl++) {
+                    CFMutableDictionaryRef d = CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                    setIn(d, kIOSurfacePlaneWidth, int(pl == 0 ? W : W / 2));
+                    setIn(d, kIOSurfacePlaneHeight, int(pl == 0 ? H : H / 2));
+                    setIn(d, kIOSurfacePlaneBytesPerElement, pl == 0 ? 1 : 2);
+                    setIn(d, kIOSurfacePlaneBytesPerRow, int(W));
+                    setIn(d, kIOSurfacePlaneOffset, pl == 0 ? 0 : int(W * H));
+                    setIn(d, kIOSurfacePlaneSize, int(pl == 0 ? W * H : W * H / 2));
+                    CFArrayAppendValue(planes, d);
+                    CFRelease(d);
+                }
+                CFDictionarySetValue(props, kIOSurfacePlaneInfo, planes);
+                CFRelease(planes);
+                IOSurfaceRef yuv = IOSurfaceCreate(props);
+                CFRelease(props);
+                const std::string name = std::string("ycbcr native, '") + (video ? "420v' BT.709 video" : "420f' BT.601 full") + " range";
+                Sampler smp;
+                std::string swhy;
+                if (yuv == nullptr || IOSurfaceGetPlaneCount(yuv) != 2 || !makeSampler(SamplerDesc{}, &smp, &swhy)) {
+                    report(false, name + ": a 64x64 surface of two planes and a nearest sampler: " +
+                                      (yuv == nullptr ? std::string("IOSurfaceCreate returned NULL") : "planes " + std::to_string(IOSurfaceGetPlaneCount(yuv))) + swhy);
+                    if (yuv != nullptr) CFRelease(yuv);
+                    continue;
+                }
+                auto fill = [&](uint32_t salt) {
+                    IOSurfaceLock(yuv, 0, nullptr);
+                    auto* y0 = static_cast<uint8_t*>(IOSurfaceGetBaseAddressOfPlane(yuv, 0));
+                    auto* c0 = static_cast<uint8_t*>(IOSurfaceGetBaseAddressOfPlane(yuv, 1));
+                    const size_t yr = IOSurfaceGetBytesPerRowOfPlane(yuv, 0), cr = IOSurfaceGetBytesPerRowOfPlane(yuv, 1);
+                    for (uint32_t j = 0; j < H; j++)
+                        for (uint32_t i = 0; i < W; i++) y0[j * yr + i] = uint8_t((i * 3 + j * 5 + salt) & 255);
+                    for (uint32_t j = 0; j < H / 2; j++)
+                        for (uint32_t i = 0; i < W / 2; i++) {
+                            c0[j * cr + 2 * i] = uint8_t((i * 8 + salt) & 255);
+                            c0[j * cr + 2 * i + 1] = uint8_t((255 - j * 8 + salt) & 255);
+                        }
+                    IOSurfaceUnlock(yuv, 0, nullptr);
+                };
+                fill(0);
+                auto* base = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(yuv));
+                Texture::Ycbcr yc;
+                yc.matrix = video ? 2 : 1;
+                yc.full = !video;
+                yc.lumaOffset = uint64_t(static_cast<uint8_t*>(IOSurfaceGetBaseAddressOfPlane(yuv, 0)) - base);
+                yc.lumaRow = uint32_t(IOSurfaceGetBytesPerRowOfPlane(yuv, 0));
+                yc.chromaOffset = uint64_t(static_cast<uint8_t*>(IOSurfaceGetBaseAddressOfPlane(yuv, 1)) - base);
+                yc.chromaRow = uint32_t(IOSurfaceGetBytesPerRowOfPlane(yuv, 1));
+                auto yt = Texture::wrapSurfaceYcbcr(gpu, IOSurfaceGetID(yuv), W, H, yc, &why);
+                if (yt == nullptr) {
+                    report(false, name + ": Texture::wrapSurfaceYcbcr: " + why);
+                    CFRelease(yuv);
+                    continue;
+                }
+                const Program texProg{kernels::tri_color_vs_air, kernels::tri_tex_fs_air, Linkage{}, "tri_tex"};
+                auto drawAndCompare = [&](uint32_t salt, uint64_t* decodes, std::string* detail) -> uint32_t {
+                    uint64_t s0[8], s1[8];
+                    CommandBuffer::ycbcrStats(s0);
+                    fillBo(*t, canary);
+                    RenderPass rp;
+                    rp.color0 = t.get();
+                    Bindings fsb;
+                    fsb.textures = {yt.get()};
+                    fsb.samplers = {&smp};
+                    auto cb = queue->commandBuffer();
+                    bool ok = cb->draw(texProg, rp, drawOf(0, 6), Bindings{}, fsb);
+                    if (ok) {
+                        cb->commit();
+                        cb->waitUntilCompleted();
+                    }
+                    CommandBuffer::ycbcrStats(s1);
+                    *decodes = (s1[0] - s0[0]) * 1000 + (s1[2] - s0[2]);
+                    std::vector<uint8_t> want(W * H * 4);
+                    IOSurfaceLock(yuv, kIOSurfaceLockReadOnly, nullptr);
+                    Texture::ycbcrConvertRows(base + yc.lumaOffset, yc.lumaRow, base + yc.chromaOffset, yc.chromaRow, W, H, yc.matrix, yc.full, false,
+                                              want.data(), W * 4);
+                    IOSurfaceUnlock(yuv, kIOSurfaceLockReadOnly, nullptr);
+                    std::vector<uint8_t> bo = textureBo(*t);
+                    uint32_t right = 0, worst = 0;
+                    for (uint32_t k = 0; k < W * H; k++) {
+                        const uint8_t* got = bo.data() + (k / W) * t->bytesPerRow() + uint64_t(k % W) * 4;
+                        const uint8_t* w = want.data() + 4 * uint64_t(k);
+                        uint32_t d = 0;
+                        for (int c = 0; c < 4; c++) d = std::max(d, uint32_t(std::abs(int(got[c]) - int(w[c]))));
+                        worst = std::max(worst, d);
+                        right += d == 0;
+                    }
+                    (void)salt;
+                    *detail = ", worst " + std::to_string(worst) + (ok ? status(*cb, gpu) : ": " + cb->error());
+                    return ok && completed(*cb) ? right : 0;
+                };
+                uint64_t d1 = 0, d2 = 0, d3 = 0;
+                std::string x1, x2, x3;
+                const uint32_t r1 = drawAndCompare(0, &d1, &x1);
+                const uint32_t r2 = drawAndCompare(0, &d2, &x2);
+                fill(77);
+                yt->ycbcrTouch(1);
+                const uint32_t r3 = drawAndCompare(77, &d3, &x3);
+                report(r1 == W * H && r2 == W * H && r3 == W * H && d1 == 1000 && d2 == 0 && d3 == 1000,
+                       name + ": " + std::to_string(r1) + ", " + std::to_string(r2) + " (unchanged), " + std::to_string(r3) +
+                           " (rewritten) of 4096 pixels the processor's conversion; GPU decodes " + std::to_string(d1 / 1000) + "/" +
+                           std::to_string(d2 / 1000) + "/" + std::to_string(d3 / 1000) + " (want 1/0/1), processor " + std::to_string(d1 % 1000) + "/" +
+                           std::to_string(d2 % 1000) + "/" + std::to_string(d3 % 1000) + x1 + x3);
+                CFRelease(yuv);
             }
             // the refusal: an ID no surface has
             TextureDesc td;

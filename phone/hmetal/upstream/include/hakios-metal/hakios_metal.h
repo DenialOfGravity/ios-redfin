@@ -91,6 +91,24 @@ void hakios_metal_xr_stats(unsigned long long out[10]);   /* (redfin hmv10) 10: 
 /* (redfin hmv11) HM_XR_GPU: [0] surfaces decoded on the GPU, [1] decode buffers sent, [2] fallbacks to the processor,
  * [3] GPU decodes verified (HM_XR_GPU_VERIFY), [4] of them that differed, [5] microseconds encoding the decode buffers */
 void hakios_metal_xr_gpu_stats(unsigned long long out[6]);
+/* (redfin hmyc) HM_YCBCR=native: [0] GPU decodes of two-plane YCbCr surfaces, [1] decode buffers, [2] processor
+ * conversions (fallback), [3] GPU decodes verified (HM_YCBCR_VERIFY), [4] of them that differed, [5] microseconds encoding,
+ * [6] draws that sampled a copy decoded before, [7] copies left undecoded */
+void hakios_metal_ycbcr_stats(unsigned long long out[8]);
+/* (redfin hmyc) HM_YCBCR: 1 native (default), 0 cpu (the plug-in's own RGBA8 copy, as before) */
+int hakios_metal_ycbcr_mode(void);
+/* (redfin hmyc) a texture over a two-plane '420f' / '420v' surface that draws sample as RGBA8, converted on the GPU from
+ * both planes (LUMA_* / CHROMA_*: each plane's start in the surface's memory and its row bytes, multiples of 4); MATRIX 1
+ * BT.601, 2 BT.709; FULL 1 '420f' range, 0 video range; PLANES 1: Metal's RGB8_420_2P (540), the planes as they are
+ * (R Cr, G Y, B Cb). NULL with the reason (hakios_metal_error): rows or starts the kernel cannot read, a plane outside the
+ * surface, a surface that is not two-plane 420f / 420v. Its pixel format reads as YCbCr8_420_2P (500). */
+hakios_metal_texture *hakios_metal_texture_new_ycbcr(hakios_metal_device *device, unsigned surface_id, unsigned width, unsigned height,
+    uint64_t luma_offset, unsigned luma_row_bytes, uint64_t chroma_offset, unsigned chroma_row_bytes, unsigned matrix, int full, int planes);
+/* (redfin hmyc) the surface under such a texture changed (GEN: its IOSurface seed): the next draw converts it again */
+void hakios_metal_texture_ycbcr_touch(hakios_metal_texture *texture, uint64_t gen);
+/* (redfin hmyc) the same conversion on the processor (the HM_YCBCR=cpu copy): RGBA8 rows into OUT, bit for bit the GPU's */
+void hakios_metal_ycbcr_convert(const void *luma, uint64_t luma_row_bytes, const void *chroma, uint64_t chroma_row_bytes, unsigned width,
+    unsigned height, unsigned matrix, int full, int planes, void *out, uint64_t out_row_bytes);
 /* (redfin hmv2) the encoder's one-time notices (a short constant binding padded, HM_CB_PAD) to FN instead of stderr */
 void hakios_metal_set_notice(void (*fn)(const char *text));
 

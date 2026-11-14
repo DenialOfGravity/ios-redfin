@@ -362,7 +362,17 @@ public:
     static void xrGpuStats(uint64_t out[6]);
     // (redfin hmv11) tests: 1 / 0 HM_XR_GPU on / off whatever the environment says, -1 the environment's again
     static void setXrGpuForTesting(int on);
+    // (redfin hmyc) HM_YCBCR=native: the two-plane YCbCr copies this buffer's draws sample, decoded by ycbcr_decode
+    // (tools/kernels/ycbcr_decode.ll) in a buffer of their own that submit sends just before this one; what the GPU could
+    // not take (HM_YCBCR_GPU=0, no compiler, a dispatch refused) converted on the processor now. nullptr: nothing on the GPU
+    std::shared_ptr<CommandBuffer> ycbcrDecodeDeferred();
+    // [0] GPU decodes, [1] decode buffers, [2] processor conversions, [3] GPU decodes verified (HM_YCBCR_VERIFY), [4] of
+    // them that differed, [5] microseconds encoding, [6] draws that took a copy decoded before, [7] copies left undecoded
+    static void ycbcrStats(uint64_t out[8]);
+    // tests: 1 | 0 the GPU decode on | off whatever HM_YCBCR_GPU says, -1 the environment's again
+    static void setYcbcrGpuForTesting(int on);
 private:
+    static void ycbcrCountReuse();
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
     // GPU spent 3 us on it. A piece is the command buffer's: written once, used for writing, kept until completion.
@@ -406,6 +416,17 @@ private:
         bool gpu = false;   // (redfin hmv11) decoded by xr_decode on the GPU (HM_XR_GPU): no processor sum to check
     };
     std::vector<XrLate> xrLate_;
+    // (redfin hmyc) this buffer's two-plane YCbCr copies (render.cpp), and those to decode at commit
+    std::vector<std::pair<const Texture*, std::shared_ptr<Texture>>> ycDecoded_;
+    struct YcLate {
+        std::shared_ptr<const Texture> source;
+        std::shared_ptr<Texture> copy;
+        uint64_t gen = 0;    // the surface's generation it will hold
+        bool gpu = false;
+    };
+    std::vector<YcLate> ycLate_;
+    std::shared_ptr<Buffer> paramsYc_;   // a decode buffer's parameters, 64 bytes a dispatch
+    uint32_t paramsYcUsed_ = 0;
     std::shared_ptr<Buffer> paramsXr_;   // (redfin hmv11) HM_XR_GPU: a decode buffer's parameters, 32 bytes a dispatch
     uint32_t paramsXrUsed_ = 0;
     std::vector<std::pair<const void*, std::shared_ptr<void>>> xrDrawn_;   // (redfin hmv4) the XR companions it drew into (render.cpp)

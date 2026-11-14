@@ -1423,6 +1423,135 @@ std::shared_ptr<Texture> Texture::wrapTwoPlanes(std::shared_ptr<Buffer> buffer, 
     return t;
 }
 
+// (redfin hmyc) HM_YCBCR=native: a '420f' / '420v' surface's two planes, read by ycbcr_decode as words of the surface's
+// memory (never by the TP: a draw samples the decoded copy), so a pitch or a start needs only to be a multiple of 4
+std::shared_ptr<Texture> Texture::wrapSurfaceYcbcr(Gpu& gpu, uint32_t surfaceId, uint32_t width, uint32_t height, const Ycbcr& yc, std::string* why) {
+    SurfaceInfo s;
+    std::shared_ptr<Buffer> buffer = surfaceBuffer(gpu, surfaceId, &s, why);
+    if (buffer == nullptr) return nullptr;
+    const std::string name = "IOSurface " + n(surfaceId);
+    const uint32_t f420 = 0x34323066u, v420 = 0x34323076u;   // '420f', '420v'
+    if (s.planes != 2 || (s.pixelFormat != f420 && s.pixelFormat != v420) || (yc.matrix != 1 && yc.matrix != 2)) {
+        refuse(why, "a YCbCr texture over " + name + " of " + n(s.planes) + " plane(s), pixel format " + n(s.pixelFormat) + " and matrix " +
+                        n(yc.matrix) + ": a two-plane '420f' or '420v' surface, BT.601 (1) or BT.709 (2), is what it takes");
+        return nullptr;
+    }
+    if (width == 0 || height == 0 || width > 16384 || height > 16384 || width > s.width || height > s.height) {
+        refuse(why, "a " + n(width) + " x " + n(height) + " YCbCr texture over the " + n(s.width) + " x " + n(s.height) + " " + name);
+        return nullptr;
+    }
+    const uint64_t cw = (uint64_t(width) + 1) / 2, ch = (uint64_t(height) + 1) / 2;
+    if (yc.lumaRow % 4 != 0 || yc.lumaOffset % 4 != 0 || yc.lumaRow < width || yc.lumaOffset + uint64_t(yc.lumaRow) * height > s.size ||
+        yc.chromaRow % 4 != 0 || yc.chromaOffset % 4 != 0 || yc.chromaRow < 2 * cw || yc.chromaOffset + uint64_t(yc.chromaRow) * ch > s.size) {
+        refuse(why, name + "'s planes, luma rows of " + n(yc.lumaRow) + " bytes from " + n(yc.lumaOffset) + ", chroma rows of " + n(yc.chromaRow) +
+                        " from " + n(yc.chromaOffset) + ", in its " + n(s.size) + " bytes: each plane wants a pitch and a start that are multiples "
+                        "of 4 bytes, rows that hold its width, and its rows inside the surface");
+        return nullptr;
+    }
+    TextureDesc d;
+    d.format = PixelFormat::kYCbCr8_420_2P;
+    d.width = width;
+    d.height = height;
+    d.usage = kTextureUsageRead;
+    std::shared_ptr<Texture> t = adopt(new Texture(std::move(buffer), d, formatInfo(d.format), yc.lumaRow, yc.lumaOffset, 0));
+    t->chroma_ = SurfacePlane{yc.chromaOffset, yc.chromaRow};
+    t->yc_ = yc;
+    t->surface_ = surfaceId;
+    return t;
+}
+
+void Texture::ycbcrTouch(uint64_t gen) const {
+    std::lock_guard<std::mutex> g(ycLock_);
+    ycGen_ = gen;
+}
+
+std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t* gen, std::string* why) const {
+    std::lock_guard<std::mutex> g(ycLock_);
+    *gen = ycGen_;
+    if (ycDoneSlot_ >= 0 && ycDoneGen_ == ycGen_ && ycCopy_[ycDoneSlot_] != nullptr) {
+        *decode = false;
+        return ycCopy_[ycDoneSlot_];
+    }
+    *decode = true;
+    // a slot neither decoded last (a buffer may be about to draw it) nor held by a buffer in flight (more than the slot's
+    // own reference); else a new copy in the other slot (the old one lives on in the buffers that hold it)
+    int slot = ycDoneSlot_ == 0 ? 1 : 0;
+    std::shared_ptr<Texture>& copy = ycCopy_[slot];
+    if (copy != nullptr && copy.use_count() > 1) copy = nullptr;
+    if (copy == nullptr) {
+        TextureDesc d;
+        d.format = PixelFormat::kRGBA8Unorm;
+        d.width = desc_.width;
+        d.height = desc_.height;
+        d.usage = kTextureUsageRead;
+        copy = make(gpu, d, why);
+        if (copy == nullptr) return nullptr;
+    }
+    return copy;
+}
+
+void Texture::ycbcrDone(const std::shared_ptr<Texture>& copy, uint64_t gen) const {
+    std::lock_guard<std::mutex> g(ycLock_);
+    for (int i = 0; i < 2; i++) {
+        if (ycCopy_[i] == copy) {
+            ycDoneSlot_ = i;
+            ycDoneGen_ = gen;
+            return;
+        }
+    }
+}
+
+void Texture::ycbcrCoefficients(int matrix, bool full, int32_t k[6]) {
+    const double kr = matrix == 2 ? 0.2126 : 0.299, kb = matrix == 2 ? 0.0722 : 0.114, kg = 1.0 - kr - kb;
+    const double ys = full ? 1.0 : 255.0 / 219.0, cs = full ? 1.0 : 255.0 / 224.0;
+    k[0] = int32_t(std::lround(65536.0 * ys));
+    k[1] = int32_t(std::lround(65536.0 * 2.0 * (1.0 - kr) * cs));
+    k[2] = int32_t(std::lround(65536.0 * 2.0 * (1.0 - kb) * kb / kg * cs));
+    k[3] = int32_t(std::lround(65536.0 * 2.0 * (1.0 - kr) * kr / kg * cs));
+    k[4] = int32_t(std::lround(65536.0 * 2.0 * (1.0 - kb) * cs));
+    k[5] = full ? 0 : 16;
+}
+
+void Texture::ycbcrConvertRows(const uint8_t* luma, uint64_t lumaRow, const uint8_t* chroma, uint64_t chromaRow, uint32_t width, uint32_t height,
+                               int matrix, bool full, bool planes, uint8_t* out, uint64_t outRow) {
+    int32_t k[6];
+    ycbcrCoefficients(matrix, full, k);
+    auto c8 = [](int32_t v) { return uint32_t(v < 0 ? 0 : v > 255 ? 255 : v); };
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* l = luma + uint64_t(y) * lumaRow;
+        const uint8_t* c = chroma + uint64_t(y / 2) * chromaRow;
+        uint32_t* o = reinterpret_cast<uint32_t*>(out + uint64_t(y) * outRow);
+        for (uint32_t x = 0; x < width; x++) {
+            const int32_t yv = l[x], cb = c[x & ~1u], cr = c[(x & ~1u) + 1];
+            uint32_t v;
+            if (planes) {
+                v = uint32_t(cr) | uint32_t(yv) << 8 | uint32_t(cb) << 16;
+            } else {
+                // (the kernel's integers: an arithmetic shift, floor((v + 0.5) * 65536 / 65536))
+                const int32_t yy = k[0] * (yv - k[5]) + 32768;
+                const int32_t r = (yy + k[1] * (cr - 128)) >> 16, g = (yy - k[2] * (cb - 128) - k[3] * (cr - 128)) >> 16,
+                              b = (yy + k[4] * (cb - 128)) >> 16;
+                v = c8(r) | c8(g) << 8 | c8(b) << 16;
+            }
+            o[x] = v | 0xff000000u;
+        }
+    }
+}
+
+bool Texture::ycbcrDecodeInto(Texture& copy) const {
+    uint8_t* out = static_cast<uint8_t*>(copy.contents());
+    const uint8_t* base = buffer_->contents() != nullptr ? static_cast<const uint8_t*>(buffer_->contents()) : nullptr;
+    if (out == nullptr || base == nullptr || yc_.matrix == 0 || copy.width() < desc_.width || copy.height() < desc_.height) return false;
+    ycbcrConvertRows(base + yc_.lumaOffset, yc_.lumaRow, base + yc_.chromaOffset, yc_.chromaRow, desc_.width, desc_.height, yc_.matrix, yc_.full,
+                     yc_.planes, out, copy.bytesPerRow());
+    return true;
+}
+
+int Texture::ycbcrMode() {
+    static const int mode = [] { const char* e = getenv("HM_YCBCR"); return e != nullptr && strcmp(e, "cpu") == 0 ? 0 : 1; }();
+    return mode;
+}
+
 std::shared_ptr<Texture> Texture::overBuffer(std::shared_ptr<Buffer> buffer, uint64_t offset, uint64_t bytesPerRow, const TextureDesc& desc, std::string* why) {
     const FormatInfo* info = formatInfo(desc.format);
     if (info == nullptr || info->depth || info->twoPlane || info->blockW > 1) {
