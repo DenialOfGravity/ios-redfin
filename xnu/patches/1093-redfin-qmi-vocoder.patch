@@ -7,19 +7,22 @@ redfin 1093: router answers for CommCenter's Apple AUDIO (0xe1) vocoder messages
   ids logged once, TLV ids/lengths only). kern.sweet_qmi_vocoder_type (default 0x10). sweet_voice.c notes call start/end.
 
 diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
-index b12d5b6..b4bdb84 100644
+index b12d5b6..093771f 100644
 --- a/bsd/dev/sweet_qmux.c
 +++ b/bsd/dev/sweet_qmux.c
-@@ -81,6 +81,8 @@ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint3
+@@ -81,6 +81,11 @@ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint3
  extern void SweetABPBasebandMessage(uint32_t code);
  extern int SweetABPPublish(bool on, const char *why);
  extern int sweet_voice_auto(int target, const char *why);      /* sweet_voice.c (1074) */
 +extern uint32_t sweet_vproxy_rate(void);                        /* sweet_vproxy.c (1090): the proxy's rate, 0 = not running */
 +void sweet_qmux_vocoder_note(uint32_t rate_hz, int up);         /* 1093: from sweet_voice.c at a call's start and end */
++static int qmi_vocoder = 0, qmi_voc_type = 0x10, qmi_codec_ind = 0, qmi_codec_tlv = 0x11;   /* 1093 (below) */
++static struct { int used; unsigned pipe, cid; uint32_t sess; } e1cl;
++static uint16_t voc_answer(uint8_t *b, size_t bn);
  
  #define LOG(fmt, ...)           printf("SWEET QMUX: [%6llu] " fmt, (unsigned long long)sbb_ms(), ##__VA_ARGS__)
  #define NPIPES                  2u
-@@ -4380,6 +4382,20 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
+@@ -4380,6 +4385,20 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
  		break;
  	case ACT_OK:
  		cnt.local_ok++;
@@ -40,7 +43,7 @@ index b12d5b6..b4bdb84 100644
  		svc_local(pipe, svc, cid, s, 0, 0);
  		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
  		break;
-@@ -4411,6 +4427,178 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
+@@ -4411,6 +4430,176 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
  	}
  }
  
@@ -60,8 +63,6 @@ index b12d5b6..b4bdb84 100644
 + *   Apple's names for 0x10..0x15 are not resolved offline: CommCenter's "Got Vocoder Info: <name>" tells).
 + * 0x002d (interface status) and the rest keep the blank "ok": the study finds nothing waiting for them.
 + */
-+static int qmi_vocoder = 0, qmi_voc_type = 0x10, qmi_codec_ind = 0, qmi_codec_tlv = 0x11;
-+static struct { int used; unsigned pipe, cid; uint32_t sess; } e1cl;
 +static volatile int voc_pending;
 +static volatile int voc_call_up;
 +static uint32_t voc_codec;                      /* the modem's speech codec (qcril CODEC_*), 0 = none seen this call */
@@ -219,7 +220,7 @@ index b12d5b6..b4bdb84 100644
  /*
   * ---- 1074: automatic call audio (kern.sweet_voice_auto) ----
   * research/cc/P3-audio-result.md s.4 B: the modem's VOICE (0x09) All Call Status indication 0x002e (TLV 0x01) and the
-@@ -4764,6 +4952,9 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+@@ -4764,6 +4953,9 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
  			    t && tl >= 2 ? t[1] : -1, t && tl >= 3 && t[2] >= 0x20 && t[2] < 0x7f ? t[2] : '-', ml);
  		}
  	}
@@ -229,7 +230,7 @@ index b12d5b6..b4bdb84 100644
  	if (c->svc == 0x09 && voice_auto) {     /* 1074 */
  		if (d[0] == 0x04 && rmsg == 0x002e) {
  			vauto_parse(d + 7, ml, 0x01, "All Call Status ind");
-@@ -4979,6 +5170,7 @@ sweet_qmux_poll(void)
+@@ -4979,6 +5171,7 @@ sweet_qmux_poll(void)
  		mst_table("kern.sweet_qmux_dump");
  	}
  	data_poll(now);                 /* 1080 */
@@ -237,7 +238,7 @@ index b12d5b6..b4bdb84 100644
  	if (now >= next_stats) {
  		if (next_stats) {
  			int ncl = 0, nidle = 0;
-@@ -5084,6 +5276,10 @@ QINT(sweet_qmux_err, err_code, "redfin 1068: QMI error of the built-in err entri
+@@ -5084,6 +5277,10 @@ QINT(sweet_qmux_err, err_code, "redfin 1068: QMI error of the built-in err entri
  QINT(sweet_qmux_cidfail, cidfail, "redfin 1068: 1 = GetClientId fails for a service the modem lacks (abpcidfail)");
  QINT(sweet_qmux_reuse, reuse, "redfin 1068: 1 = released router clients pooled per service (abpreuse, default 1)");
  QINT(sweet_voice_dtmflog, dtmflog, "redfin 1086: 1 = log VOICE DTMF requests/answers/indications, Apple AUDIO request ids, unanswered requests (default 1)");
