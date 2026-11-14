@@ -784,10 +784,6 @@ def report(dr, d, m, as_json=False, out=sys.stdout):
     hdr = (f"manifest {m.get('_spec')} | phone: kern.uuid {d.h.get('kern.uuid', '?')}, up "
            f"{fmt_dur(d.h.get('uptime'))}, {len(d.files)} paths, {len(d.sysctl)} sysctls, {len(d.procs)} processes")
     print(hdr, file=out)
-    if not real:
-        print(f"state diff: no drift ({len(m.get('file', []))} files, {len(m.get('bundle', []))} bundles, "
-              f"{len(m.get('flag', []))} flags, {len(m.get('sysctl', {})) + len(m.get('sysctl_expect', {}))} sysctls, "
-              f"{len(m.get('process', []))} processes)", file=out)
     for k in DRIFT_KINDS:
         its = dr.of(k)
         if not its:
@@ -798,6 +794,11 @@ def report(dr, d, m, as_json=False, out=sys.stdout):
             print(f"  {i['path']}  {i['detail']}".rstrip(), file=out)
         if len(its) > lim:
             print(f'  ... {len(its) - lim} more (--json for all)', file=out)
+    if not real:
+        info = ', '.join(f'{k} {len(dr.of(k))}' for k in ('retired', 'temp') if dr.of(k))
+        print(f"state diff: no drift ({len(m.get('file', []))} files, {len(m.get('bundle', []))} bundles, "
+              f"{len(m.get('flag', []))} flags, {len(m.get('sysctl', {})) + len(m.get('sysctl_expect', {}))} sysctls, "
+              f"{len(m.get('process', []))} processes{'; ' + info if info else ''})", file=out)
     if real:
         print(f'state diff: DRIFT {len(real)} item(s): ' +
               ', '.join(f'{k} {len(dr.of(k))}' for k in DRIFT_KINDS if dr.of(k) and k not in INFO_KINDS), file=out)
