@@ -5614,6 +5614,40 @@ TEST(the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target) {
     CHECK_EQ(u->counts().gmemPasses, 1u);
 }
 
+// (redfin hm-int4) the host's encode cost of a draw, as hmbench W3 measures it on the phone (CPU only, the fake GPU):
+// HM_BENCH_DRAWS=N records N passes of 40 draws with a texture and a buffer bound each and prints us a draw. Off (a
+// return) without the variable, so the suite's time is not touched
+TEST(host_encode_cost_of_a_draw_when_asked) {
+    const char* e = getenv("HM_BENCH_DRAWS");
+    if (e == nullptr) return;
+    const int passes = atoi(e) > 0 ? atoi(e) : 50;
+    Rig r;
+    auto t = target(r, 1125, 2436);
+    RenderPass a;
+    a.color0 = t.get();
+    render::Options o;
+    o.gmem = false;
+    const Program p = colorProgram();
+    std::string why;
+    auto vb = newBuffer(*r.gpu, 4096, &why);
+    Bindings vs;
+    vs.buffers.push_back(Binding{vb.get(), 0});
+    NoDeadFill noDeadFill;
+    double us = 0;
+    uint64_t draws = 0;
+    for (int k = 0; k < passes; k++) {
+        auto cb = r.queue->commandBuffer();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 40; i++) CHECK(cb->draw(p, a, wholeDraw(3 + 3 * (i % 2), 1125, 2436), vs, Bindings{}, o));
+        const auto t1 = std::chrono::steady_clock::now();
+        us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+        draws += 40;
+        cb->commit();
+        cb->waitUntilCompleted();
+    }
+    std::printf("       host encode: %.2f us a draw over %llu draws\n", us / double(draws), (unsigned long long)draws);
+}
+
 // (redfin hm-int4) HM_DEADFILL: a draw the next draw of the same geometry overwrites opaquely is taken back -- the stream
 // of [fill, fill] is the stream of [fill] word for word and one draw is counted dropped; not with HM_DEADFILL=0, not when
 // the later draw blends, covers other pixels (another vertex count), or something came between them (a draw of another
