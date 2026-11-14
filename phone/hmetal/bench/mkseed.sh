@@ -16,7 +16,10 @@ MODE=${1:?compile or harvest}; CACHE=${2:?CACHE}; SEED=${3:?SEED}
 mkdir -p "$SEED"
 case $MODE in
 compile)
-	"$HERE/hm-seed" build "$CACHE" "$SEED" --chip 0x06020000 ;;
+	# (hm-int5) the key the stages were made under, beside SEED.tgz as SEED.key (hm-install.sh says it)
+	"$HERE/hm-seed" build "$CACHE" "$SEED" --chip 0x06020000 > "$SEED.log" 2>&1 || { cat "$SEED.log"; exit 1; }
+	cat "$SEED.log"
+	sed -n 's/.*key "\([^"]*\)".*/\1/p' "$SEED.log" | head -1 > "$(dirname "$SEED")/$(basename "$SEED").key" ;;
 harvest)
 	n=0; for f in "$CACHE"/*.stage; do [ -f "$f" ] || continue; cp "$f" "$SEED/"; n=$((n + 1)); done
 	echo "mkseed: $n stages harvested into $SEED" ;;

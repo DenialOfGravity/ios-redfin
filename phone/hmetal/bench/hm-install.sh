@@ -65,6 +65,11 @@ restore)
 	for f in HakiosMetal Info.plist _CodeSignature/CodeResources; do restore "$DST_HM/$f" "$TAG"; done
 	restore "$DST_ENV" "$TAG"
 	restore "$DST_ENV.default" "$TAG"
+	# (hm-int5) the seed: the one before this install back, by rename
+	if [ -d "/var/local/hmetal/cache-seed.pre-$TAG" ]; then
+		[ -e /var/local/hmetal/cache-seed ] && $T mv /var/local/hmetal/cache-seed "/var/local/hmetal/cache-seed.undone.$$"
+		$T mv "/var/local/hmetal/cache-seed.pre-$TAG" /var/local/hmetal/cache-seed && echo "seed: restored"
+	fi
 	[ -f "/var/local/bin/hmbench.pre-$TAG" ] && restore /var/local/bin/hmbench "$TAG"
 	[ -f "/var/local/hmetal/hmbench.metallib.pre-$TAG" ] && restore /var/local/hmetal/hmbench.metallib "$TAG"
 	;;
@@ -80,6 +85,23 @@ restore)
 	if [ "${HMI_BENCH:-0}" = 1 ]; then
 		[ -f "$SRC/hmbench" ] && put "$SRC/hmbench" /var/local/bin/hmbench "$TAG"
 		[ -f "$SRC/hmbench.metallib" ] && put "$SRC/hmbench.metallib" /var/local/hmetal/hmbench.metallib "$TAG"
+	fi
+	# (hm-int5) the stage-cache seed, when the build folder carries one: cache-seed.tgz, made on the PC by seed/mkseed.sh
+	# compile with THIS build's hm-seed. It is valid for this build's cache key alone (HAKIOS_METAL_CACHE_FORMAT + the Mesa
+	# id, BUILD's KEY.txt): a stage of another key is never looked up, so an old seed is harmless but useless. Unpacked into
+	# cache-seed.new, then renamed over cache-seed (the one before kept as cache-seed.pre-TAG once); every process reads it
+	# through HAKIOS_METAL_CACHE_SEED (the dispatcher's "/var/local/hmetal/cache:/var/local/hmetal/cache-seed")
+	if [ -f "$SRC/cache-seed.tgz" ]; then
+		SEED=/var/local/hmetal/cache-seed
+		$T mkdir -p "$SEED.new.$$"
+		$T zcat "$SRC/cache-seed.tgz" | (cd "$SEED.new.$$" && $T tar xf -) || { echo "seed: unpack failed; $SEED left as it was"; exit 1; }
+		n=$($T ls "$SEED.new.$$" | $T grep -c '\.stage$' || true)
+		if [ -e "$SEED" ]; then
+			if [ ! -e "$SEED.pre-$TAG" ]; then $T mv "$SEED" "$SEED.pre-$TAG"; else $T mv "$SEED" "$SEED.old.$$"; fi
+		fi
+		$T mv "$SEED.new.$$" "$SEED"
+		$T chmod -R a+rX "$SEED"
+		echo "seed: $n stages in $SEED ($([ -f "$SRC/cache-seed.key" ] && $T cat "$SRC/cache-seed.key" || echo 'key not recorded'))"
 	fi
 	# host-only parts, never installed: seed/ (hm-seed, mkseed.sh: run on the PC), *.dSYM
 	[ -f "$SRC/SHA256SUMS" ] && echo "build SHA256SUMS: $($T grep 'HakiosMetal.bundle/HakiosMetal' "$SRC/SHA256SUMS" | $T cut -c1-16) HakiosMetal"
