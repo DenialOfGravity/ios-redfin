@@ -5652,6 +5652,54 @@ TEST(host_encode_cost_of_a_draw_when_asked) {
     std::printf("       host encode: %.2f us a draw over %llu draws\n", us / double(draws), (unsigned long long)draws);
 }
 
+// (redfin hm-int4) the bin layout of the phone's full-screen passes on this chip (umi 05f7477's tile-planner fixes as a
+// check): 1125x2436 (the display) and 1080x2340, from the origin and from an odd one, in one and two 4-byte attachments --
+// no bin wider than tile_max_w (1024) or taller than tile_max_h, widths and heights on the tile alignment, the bins
+// covering the area, each bin's attachments inside their share of GMEM. Printed for the record.
+TEST(the_bin_layout_of_full_screen_passes_stays_inside_the_chips_limits) {
+    const a6xx::ChipInfo& c = a6xx::chip();
+    for (const auto& [W, H] : {std::pair<uint32_t, uint32_t>{1125, 2436}, {1080, 2340}, {1024, 1024}, {1056, 64}}) {
+        for (uint32_t atts : {1u, 2u}) {
+            for (uint32_t ox : {0u, 37u}) {
+                render::GmemPlan p;
+                uint32_t before = 0;
+                for (uint32_t i = 0; i < atts; i++) {
+                    p.bpp[i] = 4;
+                    p.base[i] = uint32_t(uint64_t(a6xx::gmemCcuColorOffset(c)) * before / (4 * atts)) & ~0x3fffu;
+                    before += 4;
+                    p.room[i] = (uint32_t(uint64_t(a6xx::gmemCcuColorOffset(c)) * before / (4 * atts)) & ~0x3fffu) - p.base[i];
+                }
+                const uint32_t area[4] = {ox, ox / 2, W - 1, H - 1};
+                CHECK(render::gmemTiles(&p, area));
+                const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
+                CHECK(p.binW != 0 && p.binW <= c.tileMaxW && p.binW % c.tileAlignW == 0);
+                CHECK(p.binH != 0 && p.binH <= c.tileMaxH && p.binH % c.tileAlignH == 0);
+                CHECK(p.x0 <= area[0] && p.x0 % c.tileAlignW == 0 && p.y0 % c.tileAlignH == 0);
+                CHECK(uint64_t(p.cols) * p.binW >= w && uint64_t(p.rows) * p.binH >= h);
+                for (uint32_t i = 0; i < atts; i++) CHECK(uint64_t(p.binW) * p.binH * p.bpp[i] <= p.room[i]);
+                if (ox == 0) {
+                    std::printf("       %s %ux%u, %u attachment(s): %u x %u bins of %ux%u (%u tiles)\n", c.name, W, H, atts, p.cols, p.rows, p.binW,
+                                p.binH, p.tiles());
+                }
+            }
+        }
+    }
+}
+
+// (redfin hm-int4) the A620 row against Mesa 25.0.7's freedreno_devices.py GPUId(620) (a6xx_gen1, a6xx_base): tiles,
+// VSC pipes, GMEM's CCU share, and the magic registers -- none of the A618's (tile_align_h 32, other ECO values)
+TEST(the_a620_row_is_mesas_fd620) {
+    const a6xx::ChipInfo& c = a6xx::kChipA620;
+    CHECK(c.tileAlignW == 32 && c.tileAlignH == 16 && c.tileMaxW == 1024 && c.tileMaxH == 1008 && c.numVscPipes == 32);
+    CHECK(c.gmemAlignW == 16 && c.gmemAlignH == 4 && c.gmemBytes == 512 * 1024 && c.gmemCcuColorCacheFraction == 4 && c.numCcu == 1);
+    CHECK(c.fibersPerSp == 128 * 16 && c.waveGranularity == 2 && c.csSharedMemSize == 32 * 1024 && c.gen == 1);
+    const a6xx::ChipMagic& m = c.magic;
+    CHECK(m.pcPowerCntl == 0 && m.tpl1DbgEcoCntl == 0x01008000 && m.grasDbgEcoCntl == 0 && m.spChickenBits == 0x400);
+    CHECK(m.ucheClientPf == 4 && m.pcModeCntl == 0x1f && m.spDbgEcoCntl == 0x01000000 && m.rbDbgEcoCntl == 0x04100000);
+    CHECK(m.rbDbgEcoCntlBlit == 0x04100000 && m.hlsqDbgEcoCntl == 0 && m.rbUnknown8E01 == 0 && m.vpcDbgEcoCntl == 0x02000000);
+    CHECK(m.ucheUnknown0E12 == 1);
+}
+
 // (redfin hm-int4) HM_DEADFILL: a draw the next draw of the same geometry overwrites opaquely is taken back -- the stream
 // of [fill, fill] is the stream of [fill] word for word and one draw is counted dropped; not with HM_DEADFILL=0, not when
 // the later draw blends, covers other pixels (another vertex count), or something came between them (a draw of another
