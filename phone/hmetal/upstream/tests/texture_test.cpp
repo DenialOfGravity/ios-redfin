@@ -751,6 +751,28 @@ TEST(a_multisample_texture_is_its_samples_side_by_side) {
     CHECK(has(refusedMake(r, bad), "a render target (4) alone, is served"));
 }
 
+// (redfin hm-int4) Depth16Unorm (250; PridePosterExtension's, refused by hm-int3): a depth texture of 2 bytes a texel,
+// tiled as fdl6 lays out cpp 2 (pitch to 128 texels, rows to 16); a depth attachment like Depth32Float, sampled as R16Unorm
+TEST(a_depth16_texture_is_made_as_a_tiled_depth_of_two_bytes) {
+    Rig r;
+    TextureDesc z;
+    z.format = PixelFormat::kDepth16Unorm;
+    z.width = 100;
+    z.height = 20;
+    z.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    std::string why;
+    auto t = Texture::make(r.gpu, z, &why);
+    CHECK(t != nullptr);
+    if (t == nullptr) {
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK(t->info().depth);
+    CHECK_EQ(t->info().bytesPerPixel, 2u);
+    CHECK_EQ(t->bytesPerRow(), 256u);   // 100 texels to 128, 2 bytes each
+    CHECK_EQ(t->depthPlaneBytes(), 8192u);   // 20 rows to 32, 8 KiB (4096-aligned)
+}
+
 // A multisample Depth32Float is fdl6's tiled layout at cpp 4 * samples: its pitch aligned to 64 such texels and its rows
 // counted to 16. The single-sample depth of the same size is the control (cpp 4, 64 texels of 4 bytes).
 TEST(a_multisample_depth_is_tiled_at_its_samples_cpp) {

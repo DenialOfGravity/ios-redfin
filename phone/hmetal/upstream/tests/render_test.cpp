@@ -128,6 +128,11 @@ Stage handFs() {
     return s;
 }
 Program handProgram() { return Program{handVs(), handFs(), Linkage{}, "hand_vs+hand_fs"}; }
+// (redfin hm-int4) HM_DEADFILL off for a test whose identical draws must all be recorded
+struct NoDeadFill {
+    NoDeadFill() { setenv("HM_DEADFILL", "0", 1); }
+    ~NoDeadFill() { unsetenv("HM_DEADFILL"); }
+};
 Program flatProgram() { return Program{kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, Linkage{}, "tri_flat"}; }
 Program colorProgram() { return Program{kernels::tri_color_vs_air, kernels::tri_color_fs_air, Linkage{}, "tri_color"}; }
 
@@ -2860,6 +2865,7 @@ TEST(a_profiled_command_buffer_lists_its_passes) {
 // carries the pass's whole state; with dedupRegs off it writes as many. Both buffers complete on the fake, whose checks
 // hold each draw's state together, so the registers left out were the ones already holding their values.
 TEST(a_draw_in_an_open_pass_leaves_out_registers_already_holding_their_values) {
+    NoDeadFill noDeadFill;   // (redfin hm-int4: its identical draws are counted as recorded, none taken back)
     Rig r;
     auto t = target(r);
     RenderPass a;
@@ -3454,7 +3460,7 @@ TEST(a_draw_refuses_a_depth_setup_it_cannot_serve) {
     dr.depth = DepthState{1, true};
     refused(r, flatProgram(), pass, dr, "a depth test (compare 1, write) with no depth attachment");
     pass.depth = colour.get();
-    refused(r, flatProgram(), pass, dr, "a RGBA8Unorm texture as the depth attachment: Depth32Float (252) is served");
+    refused(r, flatProgram(), pass, dr, "a RGBA8Unorm texture as the depth attachment: Depth32Float (252) and Depth16Unorm (250) are served");
     pass.depth = small.get();
     refused(r, flatProgram(), pass, dr, "a 32 x 32 depth attachment (level 0) beside a 64 x 64 colour attachment (level 0): a depth attachment smaller than the colour leaves pixels without one");
     pass.depth = d.get();
@@ -5391,6 +5397,7 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
 }
 
 TEST(a_pass_in_gmem_loads_and_stores_every_tile_in_place) {
+    NoDeadFill noDeadFill;   // (redfin hm-int4: its identical draws are counted as recorded, none taken back)
     for (const auto& [w, h] : {std::pair<uint32_t, uint32_t>{64, 64}, {1125, 2436}, {100, 37}}) {
         for (int gmem = 0; gmem < 2; gmem++) {
             Rig r;
@@ -5649,6 +5656,7 @@ TEST(gmem_for_a_pass_of_enough_draws_decided_at_its_end) {
 // one of 1 stays in sysmem though 10 clears a bar of 8, saying why; the next like it, after 10, is GMEM again, and so is
 // one after a light one that followed a heavy one (the peak, not the last time, decides)
 TEST(a_pass_whose_like_was_light_is_recorded_for_sysmem_alone) {
+    NoDeadFill noDeadFill;   // (redfin hm-int4: its identical draws are counted as recorded, none taken back)
     Rig r;
     auto t = target(r);
     RenderPass a;

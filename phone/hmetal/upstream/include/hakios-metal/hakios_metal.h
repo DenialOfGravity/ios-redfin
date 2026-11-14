@@ -342,6 +342,12 @@ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base
  * leave it out and its value may be given as 0. Translates the function once (kept in the front-end memo, HM_FE_MEMO). */
 int hakios_metal_known_read_mask(const void *fs_bitcode, size_t fs_size, const hakios_metal_constant *fs_constants,
     unsigned fs_count, unsigned binding, unsigned char *mask, size_t length);
+/* (redfin hm-int4) this process's GPU memory in bytes: [0] the app's buffers, [1] textures, [2] the queues' pieces and slabs
+ * (held or in their reuse pools), [3] program words, [4] private memory (spills), [5] tables (VSC, kernel tables), [6] of [2]
+ * the reuse pools' free bytes, [7] every GEM object the process made (the rest of it: command streams). And the queues'
+ * idle memory let go now (FORCE 1: all of it; 0: what HM_POOL_IDLE_S says): the bytes freed. */
+void hakios_metal_pool_stats(unsigned long long out[8]);
+unsigned long long hakios_metal_pool_trim(int force);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* (redfin hmv7) HM_HANG_BLAME: how many hung command buffers drew with PROGRAM (only programs of at least

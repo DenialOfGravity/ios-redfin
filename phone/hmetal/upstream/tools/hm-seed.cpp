@@ -218,6 +218,19 @@ int main(int argc, char** argv) {
         sleep(getenv("HM_CACHE_VERIFY") != nullptr ? 3 : 0);   // (the verify threads)
         return r;
     }
+    if (argc >= 4 && !strcmp(argv[1], "kernel")) {   // (redfin hm-int4) a compute function through compileAir: hm-seed kernel LIB FN [--chip ID]
+        for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], "--chip") && !selectChipArg(argv[i + 1])) return 2;
+        std::string data, why;
+        MetalLibrary lib;
+        if (!readAll(argv[2], &data) || !lib.parse(reinterpret_cast<const uint8_t*>(data.data()), data.size())) return 2;
+        const MetalFunction* f = lib.find(argv[3]);
+        const uint8_t* bc = nullptr;
+        uint64_t len = 0;
+        if (f == nullptr || !lib.bitcode(*f, &bc, &len)) return 2;
+        auto k = compileAir(bc, len, &why, {});
+        std::printf("hm-seed: kernel %s: %s %zu words\n", argv[3], k ? "ok" : why.c_str(), k ? k->words.size() : size_t(0));
+        return k ? 0 : 1;
+    }
     if (argc >= 4 && !strcmp(argv[1], "time")) {
         if (!hasCompiler()) return std::fprintf(stderr, "hm-seed: no compiler in this build (MESA=1)\n"), 2;
         return timeOne(argc - 2, argv + 2);

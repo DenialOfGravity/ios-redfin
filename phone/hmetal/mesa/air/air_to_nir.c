@@ -256,6 +256,9 @@ slot_base(struct air_ctx *c, const struct air_val *v, unsigned *index)
 }
 
 static struct air_val *air_val_agg(struct air_ctx *c, unsigned n);
+static bool slot_base(struct air_ctx *c, const struct air_val *v, unsigned *index);
+static bool slot_at_const(struct air_ctx *c, const struct air_val *v, unsigned *index, uint64_t *off);
+static struct air_val **slot_cell(struct air_ctx *c, unsigned s, uint64_t off, const struct air_type *want);
 
 /* A pointer into a slot at a byte offset the translator knows: class SLOT, a
  * binding in range, and an offset that is constant or absent.
@@ -3890,6 +3893,33 @@ val_leaves(struct air_ctx *c, const struct air_type *t, struct air_val *v,
                        v->kind == AIR_VAL_AGG ? "an aggregate" : "a pointer");
    out[(*n)++] = v->def;
    return true;
+}
+
+/* (redfin hm-int4) air_store_local: an intrinsic's out-parameter, written as AIR_OP_STORE writes it (a local's slot, a
+ * member of it at a constant offset, or the memory the pointer resolves to) */
+bool
+air_store_local(struct air_ctx *c, const struct air_value *ptr, const struct air_type *type, nir_def *def)
+{
+   struct air_val *p = air_get(c, ptr);
+   if (!p)
+      return false;
+   unsigned s;
+   uint64_t off;
+   if (slot_base(c, p, &s) && c->slots[s].type == type && !c->slots[s].init) {
+      c->slots[s].val = air_val_ssa(c, def);
+      return true;
+   }
+   if (slot_at_const(c, p, &s, &off) && !c->slots[s].init) {
+      struct air_val **cell = slot_cell(c, s, off, type);
+      if (cell) {
+         *cell = air_val_ssa(c, def);
+         return true;
+      }
+   }
+   /* the rest as AIR_OP_STORE's last step: memory a pointer resolves to (an alloca'd local, thread memory) */
+   if (p->kind == AIR_VAL_PTR)
+      return air_store_ptr(c, p->ptr, def, def->bit_size / 8);
+   return air_error(c, "intrinsic: an out-parameter written through something that is not a pointer");
 }
 
 /* the callee's side: the tree, back out of its parameters */

@@ -36,9 +36,19 @@ class CommandQueue;
 class Texture;
 
 // a buffer a program sees: a GEM object with its length (MTLBuffer's -length may be less than the object's size)
+// (redfin hm-int4) what this process's GPU memory is held for, by kind (HM_POOL accounting: hakios_metal_pool_stats):
+// a Buffer made by newBuffer is counted under its kind until it is destroyed
+enum PoolKind : uint8_t { kPoolApp = 0, kPoolTexture, kPoolPieces, kPoolProgram, kPoolPrivate, kPoolTable, kPoolKinds };
+// [kind] bytes held now; [kPoolKinds] the queues' reuse pools' free bytes; [kPoolKinds + 1] every GEM object of the process
+void poolStats(uint64_t out[kPoolKinds + 2]);
+// every queue's idle memory let go (CommandQueue::trim); FORCE: what is idle at all, not only what has been for HM_POOL_IDLE_S.
+// Returns the bytes freed. Called by newBuffer when the kernel refuses an allocation, and past HM_POOL_SOFT_MB.
+uint64_t trimAllQueues(bool force);
 class Buffer {
 public:
     Buffer(std::unique_ptr<Bo> bo, uint64_t length) : bo_(std::move(bo)), length_(length) {}
+    ~Buffer();
+    void countAs(PoolKind kind);   // (redfin hm-int4) newBuffer's: counted under KIND until destroyed
     uint64_t length() const { return length_; }
     void* contents() const { return bo_->cpu(); }
     uint64_t gpuAddress() const { return bo_->gpuAddress(); }
@@ -49,9 +59,11 @@ public:
 private:
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
+    uint64_t counted_ = 0;
+    PoolKind kind_ = kPoolApp;
 };
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, PoolKind kind = kPoolApp);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.
@@ -468,6 +480,11 @@ public:
     Gpu& gpu() { return gpu_; }
     // the buffers kept for command streams, idle (to see that they are given back and used again)
     size_t idleCommandBuffers();
+    // (redfin hm-int4) the queue's idle memory let go: the reuse pool, command BOs past 8, private memory no buffer in flight
+    // uses, and (FORCE) programs no command buffer holds. Without FORCE only what has not been used for HM_POOL_IDLE_S
+    // seconds (default 10; 0: never by time) and what is never used again (an outgrown private buffer). The bytes freed.
+    uint64_t trim(bool force);
+    uint64_t freeBytes();
     // What a draw binds at the slot the front end reserves for Metal's null texture (Kernel: KernelTexture::isNull): a
     // 1x1 RGBA8Unorm texture of zeros, made at the first ask, the same for every draw of the queue. Zero is an
     // assumption, not a reading -- nothing reachable says what Apple's null texture samples as (nir_air.h) -- and this
@@ -528,7 +545,9 @@ public:
 
 private:
     friend class CommandBuffer;
-    CommandQueue(Gpu& gpu, uint32_t id) : gpu_(gpu), id_(id) {}
+    CommandQueue(Gpu& gpu, uint32_t id);
+    void maybeTrim();   // (redfin hm-int4) trim(false) at most once a second
+    std::atomic<int64_t> lastTrimNs_{0}, lastPoolUseNs_{0}, lastPrivateUseNs_{0};
     void submit(std::shared_ptr<CommandBuffer> cb);
     void waiter();
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);

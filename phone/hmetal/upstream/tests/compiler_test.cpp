@@ -1415,6 +1415,29 @@ TEST(a_specialisation_through_the_front_end_memo_and_the_shrink_is_the_plain_one
     CHECK(first->listing.find("c0.") == std::string::npos);
 }
 
+// (redfin hm-int4) air.sincos: sin returned, cos written through the pointer (PridePoster's updateParticles,
+// refused by hm-int3 as "a pointer where a number belongs"); compiled for x = 0 the stage writes sin 0 = 0 and cos 0 = 1
+TEST(sincos_writes_its_cosine_through_the_pointer) {
+    if (!hasCompiler()) return;
+    std::vector<uint8_t> bc = bitcodeOf("tri_sincos_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    std::string why;
+    auto generic = compileStage(bc.data(), bc.size(), &why);
+    CHECK(generic != nullptr);
+    if (generic == nullptr) {
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK(generic->listing.find("sin") != std::string::npos && generic->listing.find("cos") != std::string::npos);
+    const float zero = 0.0f;
+    KnownBuffer known;
+    known.binding = 0;
+    known.bytes.assign(reinterpret_cast<const uint8_t*>(&zero), reinterpret_cast<const uint8_t*>(&zero) + 4);
+    auto folded = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    CHECK(folded != nullptr && folded->listing.find("sin") == std::string::npos && folded->listing.find("cos") == std::string::npos);
+}
+
 TEST(a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less) {
     Kernel with{}, without{};
     with.pvtmemSize = 512, with.maxReg = 47;

@@ -2644,6 +2644,22 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (handled)
       return true;
 
+   /* (redfin hm-int4) air.sincos.fN(x, ptr cosval): sin(x) returned, cos(x) written through the pointer -- Metal's
+    * sincos(x, thread T& cosval). math_op would resolve the pointer as a number ("a pointer where a number belongs":
+    * PridePoster's updateParticles) */
+   if ((!strcmp(n.part[0], "sincos") || !strcmp(n.part[0], "fast_sincos")) && in->num_operands == 3) {
+      nir_def *x = air_get_ssa(c, in->operands[1]);
+      if (!x)
+         return false;
+      bool was_exact = c->b.exact;
+      c->b.exact = false;
+      nir_def *sn = nir_fsin(&c->b, x), *cs = nir_fcos(&c->b, x);
+      c->b.exact = was_exact;
+      if (!air_store_local(c, in->operands[2], in->base.type, cs))
+         return false;
+      air_set(c, &in->base, air_val_ssa(c, sn));
+      return true;
+   }
    if (!math_op(c, in, &n, &handled))
       return false;
    if (handled)

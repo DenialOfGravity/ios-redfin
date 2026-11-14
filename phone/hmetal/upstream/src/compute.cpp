@@ -680,6 +680,7 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
         }
     }
     if (scratch != nullptr) use(*scratch, true);
+    if (scratch != nullptr) keepAlive(scratch);   // (redfin hm-int4) CommandQueue::trim may let the queue's go
     if (args != nullptr) use(*args, false);   // the CP reads the counts from it as it runs
     // every texture bound, the kernel's or not (an extra one is harmless to name): its memory is used for the flight and
     // kept alive until completion, written when the kernel stores through it

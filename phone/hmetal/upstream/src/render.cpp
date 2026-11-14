@@ -1109,7 +1109,7 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
     if (pass.depth != nullptr) {
         const Texture& d = *pass.depth;
         if (!d.info().depth) {
-            return refuse(why, std::string("a ") + d.info().name + " texture as the depth attachment: Depth32Float (252) is served");
+            return refuse(why, std::string("a ") + d.info().name + " texture as the depth attachment: Depth32Float (252) and Depth16Unorm (250) are served");
         }
         if (d.samples() != firstAttachment(pass)->samples()) {
             return refuse(why, "a depth attachment of " + n(d.samples()) + " sample(s) beside colour of " + n(firstAttachment(pass)->samples()) +
@@ -1693,10 +1693,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         const Texture& d = *pass.depth;
         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
+        // (redfin hm-int4) Depth16Unorm: DEPTH6_16 (2 bytes a pixel); the rest DEPTH6_32
+        const a6xx_depth_format depthFmt = d.format() == PixelFormat::kDepth16Unorm ? DEPTH6_16 : DEPTH6_32;
         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO,
-             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
+             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(depthFmt), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
               A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32), 0});
-        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32));
+        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(depthFmt));
         regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, {0, 0, 0});
         if (pass.stencil != nullptr) {
             // the S8 plane as a separate stencil buffer (tu6_emit_zs's D32_SFLOAT_S8_UINT branch): SEPARATE_STENCIL, its
@@ -3200,6 +3202,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         }
         to->privateMemory = pm;
         use(*scratch, true);
+        keepAlive(scratch);   // (redfin hm-int4) the queue may let an outgrown or idle one go (CommandQueue::trim)
     }
     // the two programs' words, once per command buffer, and the draw's table, in pieces (command.hpp: Piece): a piece is
     // 256-byte aligned, so SP_xS_OBJ_START is 128-byte aligned as the ST6_SHADER preload wants it (tu_shader.cc:1313-1316)
@@ -3689,7 +3692,7 @@ const XrKernel* xrKernel(Gpu& gpu) {
         return nullptr;
     }
     const std::vector<uint32_t>& t = Texture::xrGpuTable();
-    x->table = newBuffer(gpu, 4 * t.size(), &why);
+    x->table = newBuffer(gpu, 4 * t.size(), &why, kPoolTable);
     if (x->table == nullptr || x->table->contents() == nullptr) {
         render::notify("HM_XR_GPU: no buffer for xr_decode's tables (" + why + "); extended-range surfaces decoded on the processor");
         return nullptr;

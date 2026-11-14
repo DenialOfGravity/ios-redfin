@@ -81,6 +81,7 @@ enum class PixelFormat : uint32_t {
     kBGR10A2Unorm = 94,    // blue in the low 10 bits (B10G10R10A2_UNORM): the same layout, the swap WXYZ    // three unsigned floats packed in 32 bits, red in the low 11 (Gallium's R11G11B10_FLOAT): an HDR target
     kRGBA32Uint = 123,
     kRGBA32Float = 125,
+    kDepth16Unorm = 250,   // (redfin hm-int4) a depth attachment as Depth32Float is, 2 bytes a pixel: Z16 (DEPTH6_16, FMT6_16_UNORM)
     kDepth32Float = 252,   // a depth attachment only: tiled (TILE6_3), since the hardware has no linear depth buffer
     kDepth32FloatStencil8 = 260,
     kX32Stencil8 = 261,    // a view of a Depth32Float_Stencil8 texture's S8 plane, sampled as a uint: Texture::view alone   // the same depth plane and a separate S8 plane after it (turnip's D32_SFLOAT_S8_UINT)

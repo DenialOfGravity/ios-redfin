@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <map>
 #include <mutex>
@@ -62,16 +63,85 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset) {
 std::atomic<uint32_t> gBuffersMade{0}, gBuffersReused{0};
 std::atomic<uint64_t> gBytesMade{0};
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why) {
+// (redfin hm-int4) HM_POOL: this process's GPU memory by kind, the queues that hold idle memory, the soft cap
+std::atomic<uint64_t> gPoolBytes[kPoolKinds];
+std::mutex gQueuesLock;
+std::vector<CommandQueue*> gQueues;
+std::atomic<Gpu*> gPoolGpu{nullptr};
+int64_t poolNowNs() { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+uint64_t poolSoftBytes() {
+    static const uint64_t mb = [] { const char* e = getenv("HM_POOL_SOFT_MB"); return e != nullptr ? uint64_t(strtoull(e, nullptr, 10)) : 0ull; }();
+    return mb << 20;
+}
+bool poolTrimOn() { const char* e = getenv("HM_POOL_TRIM"); return e == nullptr || e[0] == 0 || atoi(e) != 0; }   // (redfin hm-int4) 0: no trimming, outgrown private buffers kept (hm-int3)
+int64_t poolIdleNs() {
+    static const int64_t s = [] { const char* e = getenv("HM_POOL_IDLE_S"); return e != nullptr && e[0] != 0 ? int64_t(atoi(e)) : 10; }();
+    return s * 1000000000ll;
+}
+
+Buffer::~Buffer() {
+    if (counted_ != 0) gPoolBytes[kind_] -= counted_;
+}
+void Buffer::countAs(PoolKind kind) {
+    if (counted_ != 0) gPoolBytes[kind_] -= counted_;
+    kind_ = kind;
+    counted_ = bo_ != nullptr ? bo_->size() : 0;
+    gPoolBytes[kind_] += counted_;
+}
+
+void poolStats(uint64_t out[kPoolKinds + 2]) {
+    for (int i = 0; i < kPoolKinds; i++) out[i] = gPoolBytes[i].load(std::memory_order_relaxed);
+    uint64_t free = 0;
+    {
+        std::lock_guard<std::mutex> g(gQueuesLock);
+        for (CommandQueue* q : gQueues) free += q->freeBytes();
+    }
+    out[kPoolKinds] = free;
+    Gpu* gpu = gPoolGpu.load();
+    out[kPoolKinds + 1] = gpu != nullptr ? gpu->allocatedBytes() : 0;
+}
+
+uint64_t trimAllQueues(bool force) {
+    uint64_t freed = 0;
+    std::lock_guard<std::mutex> g(gQueuesLock);
+    for (CommandQueue* q : gQueues) freed += q->trim(force);
+    return freed;
+}
+
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, PoolKind kind) {
     gBuffersMade++;
     gBytesMade += length;
+    gPoolGpu.store(&gpu);
+    // (redfin hm-int4) HM_POOL_SOFT_MB=N (default 0, off): past N MB of this process's GPU memory the queues' idle memory
+    // is let go first; past it still, the allocation goes on and it is said (every 5 s at most): a soft cap, never a refusal
+    if (const uint64_t soft = poolSoftBytes(); soft != 0 && gpu.allocatedBytes() + length > soft) {
+        const uint64_t freed = trimAllQueues(true);
+        static std::atomic<int64_t> said{0};
+        const int64_t now = poolNowNs();
+        if (gpu.allocatedBytes() + length > soft && now - said.load() > 5000000000ll) {
+            said.store(now);
+            render::notify("pool: past HM_POOL_SOFT_MB (" + std::to_string(soft >> 20) + " MB): " + std::to_string(gpu.allocatedBytes() >> 20) +
+                           " MB held, " + std::to_string(freed >> 20) + " MB of idle memory let go, " + std::to_string(length) + " bytes more asked for");
+        }
+    }
     int error = 0;
     std::unique_ptr<Bo> bo = gpu.newBo(length, kBoWriteCombined, &error);
+    if (bo == nullptr) {
+        // (redfin hm-int4) the kernel's pool is short: the queues' idle memory let go, and once more
+        const uint64_t freed = trimAllQueues(true);
+        if (freed != 0) {
+            bo = gpu.newBo(length, kBoWriteCombined, &error);
+            render::notify("pool: the driver gave no buffer of " + std::to_string(length) + " bytes; " + std::to_string(freed >> 20) +
+                           " MB of idle memory let go; " + (bo != nullptr ? "given then" : "refused again"));
+        }
+    }
     if (bo == nullptr) {
         *why = "the driver gave no buffer of " + std::to_string(length) + " bytes: " + strerror(error);
         return nullptr;
     }
-    return addressed(new Buffer(std::move(bo), length));
+    std::shared_ptr<Buffer> b = addressed(new Buffer(std::move(bo), length));
+    if (b != nullptr) b->countAs(kind);
+    return b;
 }
 
 namespace {
@@ -146,9 +216,84 @@ uint64_t sizeClass(uint64_t bytes) {
 }
 }  // namespace
 
+CommandQueue::CommandQueue(Gpu& gpu, uint32_t id) : gpu_(gpu), id_(id) {
+    gPoolGpu.store(&gpu);
+    std::lock_guard<std::mutex> g(gQueuesLock);
+    gQueues.push_back(this);
+}
+
+uint64_t CommandQueue::freeBytes() {
+    std::lock_guard<std::mutex> g(poolLock_);
+    return freeBytes_;
+}
+
+void CommandQueue::maybeTrim() {
+    const int64_t now = poolNowNs();
+    if (now - lastTrimNs_.load() < 1000000000ll) return;
+    lastTrimNs_.store(now);
+    trim(false);
+}
+
+uint64_t CommandQueue::trim(bool force) {
+    const int64_t now = poolNowNs(), idle = poolIdleNs();
+    uint64_t freed = 0;
+    std::vector<std::shared_ptr<Buffer>> drop;   // (freed outside the locks)
+    std::vector<std::unique_ptr<Bo>> dropBo;
+    // (try_lock: newBuffer trims while a queue's own lock may be held by this thread -- programBuffer, privateMemory)
+    if (!poolTrimOn()) return 0;
+    if (force || (idle != 0 && now - lastPoolUseNs_.load() > idle)) {
+        std::unique_lock<std::mutex> g(poolLock_, std::try_to_lock);
+        if (g.owns_lock()) {
+        for (auto& [size, v] : freeBuffers_) {
+            for (auto& b : v) drop.push_back(std::move(b));
+        }
+        freeBuffers_.clear();
+        freed += freeBytes_;
+        freeBytes_ = 0;
+        }
+    }
+    if (std::unique_lock<std::mutex> g(lock_, std::try_to_lock); g.owns_lock()) {
+        // command BOs: 8 kept, the rest let go (each 64 KB or more; a burst of buffers in flight left many)
+        while (idle_.size() > 8) {
+            freed += idle_.back()->size();
+            dropBo.push_back(std::move(idle_.back()));
+            idle_.pop_back();
+        }
+        for (int l = 0; l < 2; l++) {
+            // an outgrown private buffer is never given out again: a command buffer in flight holds its own (keepAlive)
+            while (private_[l].size() > 1) {
+                freed += private_[l].front()->length();
+                drop.push_back(std::move(private_[l].front()));
+                private_[l].erase(private_[l].begin());
+            }
+            // the current one when no command buffer holds it and none asked for private memory for a while
+            if (!private_[l].empty() && private_[l].back().use_count() == 1 && (force || (idle != 0 && now - lastPrivateUseNs_.load() > idle))) {
+                freed += private_[l].back()->length();
+                drop.push_back(std::move(private_[l].back()));
+                private_[l].clear();
+                privatePerFiber_[l] = 0;
+            }
+        }
+        if (force) {
+            for (auto it = resident_.begin(); it != resident_.end();) {
+                if (it->second.buffer.use_count() == 1) {
+                    freed += it->second.buffer->length();
+                    residentBytes_ -= 4ull * it->second.words.size();
+                    drop.push_back(std::move(it->second.buffer));
+                    it = resident_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    return freed;
+}
+
 std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* why) {
     const uint64_t size = sizeClass(bytes);
     std::shared_ptr<Buffer> b;
+    lastPoolUseNs_.store(poolNowNs());
     {
         std::lock_guard<std::mutex> g(poolLock_);
         auto it = freeBuffers_.find(size);
@@ -158,7 +303,7 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             freeBytes_ -= size;
         }
     }
-    if (b == nullptr) return newBuffer(gpu_, size, why);
+    if (b == nullptr) return newBuffer(gpu_, size, why, kPoolPieces);
     gBuffersReused++;
     memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
     return b;
@@ -167,6 +312,7 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
 void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     // (only one no one else holds, of a size takeBuffer makes: a piece's buffer kept elsewhere is still someone's)
     if (b == nullptr || b.use_count() != 1 || b->contents() == nullptr || b->length() != sizeClass(b->length())) return;
+    lastPoolUseNs_.store(poolNowNs());
     std::lock_guard<std::mutex> g(poolLock_);
     if (freeBytes_ + b->length() > (32ull << 20)) return;
     freeBytes_ += b->length();
@@ -194,7 +340,7 @@ std::shared_ptr<Buffer> CommandQueue::programBuffer(const Kernel& k, std::string
         resident_.clear();
         residentBytes_ = 0;
     }
-    std::shared_ptr<Buffer> b = newBuffer(gpu_, 4ull * std::max<uint32_t>(k.numWords, 1), why);
+    std::shared_ptr<Buffer> b = newBuffer(gpu_, 4ull * std::max<uint32_t>(k.numWords, 1), why, kPoolProgram);
     if (b == nullptr || b->contents() == nullptr) return nullptr;
     memcpy(b->contents(), k.words, 4ull * k.numWords);
     resident_.emplace(k.words, Resident{std::vector<uint32_t>(k.words, k.words + k.numWords), b});
@@ -284,7 +430,7 @@ void CommandBuffer::stamp(uint32_t slot) {
 
 std::shared_ptr<Buffer> CommandQueue::vscBuffer(std::string* why) {
     std::lock_guard<std::mutex> g(lock_);
-    if (vsc_ == nullptr) vsc_ = newBuffer(gpu_, render::vscBytes(), why);
+    if (vsc_ == nullptr) vsc_ = newBuffer(gpu_, render::vscBytes(), why, kPoolTable);
     return vsc_;
 }
 
@@ -551,6 +697,10 @@ std::unique_ptr<CommandQueue> CommandQueue::make(Gpu& gpu, std::string* why) {
 
 CommandQueue::~CommandQueue() {
     {
+        std::lock_guard<std::mutex> g(gQueuesLock);
+        gQueues.erase(std::remove(gQueues.begin(), gQueues.end(), this), gQueues.end());
+    }
+    {
         std::lock_guard<std::mutex> g(lock_);
         quit_ = true;
     }
@@ -589,14 +739,17 @@ uint32_t waveScale() { return std::max(a6xx::chip().pvtPerWaveFiberScale, 1u); }
 }  // namespace
 
 std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
+    lastPrivateUseNs_.store(poolNowNs());
     std::lock_guard<std::mutex> g(lock_);
     const int l = perWave ? 1 : 0;
     if (privatePerFiber_[l] < bytes) {
         uint32_t perFiber = 512;
         while (perFiber < bytes) perFiber *= 2;
         const uint64_t perSp = (uint64_t(perFiber) * fibersPerSp() * (perWave ? waveScale() : 1u) + 4095) & ~uint64_t(4095);
-        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores(), why);
+        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores(), why, kPoolPrivate);
         if (b == nullptr) return nullptr;
+        // (redfin hm-int4) the outgrown one let go: a command buffer that used it holds its own (keepAlive)
+        if (poolTrimOn()) private_[l].clear();
         private_[l].push_back(std::move(b));
         privatePerFiber_[l] = perFiber;
     }
@@ -614,7 +767,7 @@ std::shared_ptr<Buffer> CommandQueue::privateMemoryScaled(uint32_t bytes, bool p
     uint32_t perFiber = 512;
     while (perFiber < bytes) perFiber *= 2;
     const uint64_t perSp = (uint64_t(perFiber) * fibersPerSp() * std::max(fiberScale, 1u) + 4095) & ~uint64_t(4095);
-    std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores() * std::max(bufferScale, 1u), why);
+    std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * spCores() * std::max(bufferScale, 1u), why, kPoolPrivate);
     if (b == nullptr) return nullptr;
     privateScaled_.push_back(b);
     out->address = b->gpuAddress();
@@ -667,6 +820,7 @@ int CommandQueue::ringBarrier(int64_t timeoutNs) {
 }
 
 void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
+    if (poolTrimOn()) maybeTrim();   // (redfin hm-int4) HM_POOL_TRIM
     cb->committedAt_ = gpu_.transport().nowNs();
     if (!cb->error_.empty()) {
         cb->finish(CommandBuffer::kError);   // a blit that was refused: nothing of it reaches the GPU

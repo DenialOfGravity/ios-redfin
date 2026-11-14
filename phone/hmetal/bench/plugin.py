@@ -2304,6 +2304,49 @@ HMI4_EDITS = [
     (HMI4_LOG_OLD, HMI4_LOG_NEW),
     (HMI4_LOG2_OLD, HMI4_LOG2_NEW),
 ]
+# HM_POOL_LOG=N (seconds; default 0 off, the env template sets 30 for every process): "pool: N MB: app A, textures T, pieces P
+# (free F), programs G, private V, tables B, command streams C" at most every N s, from the buffers' completions, and with
+# every HM_PROF report. The core trims idle memory (HM_POOL_TRIM=1, HM_POOL_IDLE_S=10) and on a refused allocation;
+# HM_POOL_SOFT_MB=N trims earlier and says so.
+HMI4_POOL_OLD = '\tconst double now = hm_now();\n\n\tif (!hm_fps_on()) {\n\t\treturn;\n\t}\n\tpthread_mutex_lock(&hm_fps.lock);\n\tif (hm_fps.since == 0) {\n'
+HMI4_POOL_NEW = '\tconst double now = hm_now();\n\n\thm_pool_note(now, 0);   /* (redfin hm-int4) HM_POOL_LOG */\n\tif (!hm_fps_on()) {\n\t\treturn;\n\t}\n\tpthread_mutex_lock(&hm_fps.lock);\n\tif (hm_fps.since == 0) {\n'
+HMI4_POOL_FN_OLD = 'static void\nhm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)\n{\n'
+HMI4_POOL_FN_NEW = r"""/* (redfin hm-int4) HM_POOL_LOG: this process's GPU memory by kind (hakios_metal_pool_stats), every N s at most; FORCE: now */
+static void
+hm_pool_note(double now, int force)
+{
+	static double every = -1, last = 0;
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+	if (every < 0) {
+		const char *e = getenv("HM_POOL_LOG");
+		every = e != NULL ? atof(e) : 0;
+	}
+	if (!force && (every <= 0 || now - last < every)) return;
+	pthread_mutex_lock(&lock);
+	if (!force && now - last < every) {
+		pthread_mutex_unlock(&lock);
+		return;
+	}
+	last = now;
+	pthread_mutex_unlock(&lock);
+	unsigned long long s[8];
+	hakios_metal_pool_stats(s);
+	const unsigned long long known = s[0] + s[1] + s[2] + s[3] + s[4] + s[5];
+	hm_print("pool: %.1f MB: app %.1f, textures %.1f, pieces %.1f (free %.1f), programs %.1f, private %.1f, tables %.1f, command streams %.1f\n",
+		 s[7] / 1048576.0, s[0] / 1048576.0, s[1] / 1048576.0, s[2] / 1048576.0, s[6] / 1048576.0, s[3] / 1048576.0, s[4] / 1048576.0,
+		 s[5] / 1048576.0, s[7] > known ? (s[7] - known) / 1048576.0 : 0.0);
+}
+
+static void
+hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
+{
+"""
+HMI4_EDITS += [
+    ('static BOOL hm_fps_on(void);', 'static BOOL hm_fps_on(void);\nstatic void hm_pool_note(double now, int force);   /* (redfin hm-int4) HM_POOL_LOG */'),
+    (HMI4_POOL_FN_OLD, HMI4_POOL_FN_NEW),
+    (HMI4_POOL_OLD, HMI4_POOL_NEW),
+]
 EDITS += HMI4_EDITS
 
 

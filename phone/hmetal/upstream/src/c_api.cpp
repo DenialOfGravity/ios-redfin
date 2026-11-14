@@ -1310,6 +1310,13 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     return r;
 }
 
+void hakios_metal_pool_stats(unsigned long long out[8]) {
+    uint64_t s[kPoolKinds + 2];
+    poolStats(s);
+    for (int i = 0; i < 8; i++) out[i] = s[i];
+}
+unsigned long long hakios_metal_pool_trim(int force) { return trimAllQueues(force != 0); }
+
 int hakios_metal_known_read_mask(const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
                                  unsigned binding, unsigned char* mask, size_t length) {
     if (fsBitcode == nullptr || fsSize == 0 || mask == nullptr) {

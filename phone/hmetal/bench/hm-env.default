@@ -29,7 +29,16 @@ HM_HANG_BLAME=1
 *:HM_PREWARM=0
 HM_PREWARM=1
 
+# (hm-int4) every hakios-metal process's GPU memory by kind every 30 s ("pool: N MB: app, textures, pieces (free),
+# programs, private, tables, command streams"): what mediaserverd's 252 MB is made of (debug-g1114)
+*:HM_POOL_LOG=30
+
 # ---- opt-ins and switches at their compiled default (uncomment to change) ----
+# (hm-int4) the queues' idle memory let go after HM_POOL_IDLE_S (default 10) and when the kernel refuses an allocation
+# (HM_POOL_TRIM=1); HM_POOL_SOFT_MB=N (default 0: off) trims earlier past N MB of the process's GPU memory and says so
+#*:HM_POOL_SOFT_MB=128
+#*:HM_POOL_TRIM=0
+#*:HM_POOL_IDLE_S=10
 # (hm-int4) the deny list is empty: an uber shader of HM_DENY_WORDS fragment words or more (default 24576: CA's
 # frag.A2Xghfc, 32064) is drawn only through its specialisations, which take ~30 ms on the host (HM_FE_MEMO, HM_SPEC_SHRINK)
 # instead of 300-530 ms. HM_DENY=A2Xghfc (hm-int3's line) still works and changes nothing beside it.

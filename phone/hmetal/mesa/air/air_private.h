@@ -279,6 +279,9 @@ bool air_error(struct air_ctx *c, const char *fmt, ...) PRINTFLIKE(2, 3);
 
 /* value bookkeeping */
 struct air_val *air_val_ssa(struct air_ctx *c, nir_def *def);
+/* (redfin hm-int4) DEF written through PTR (a value of type TYPE) as AIR_OP_STORE writes it; an error when PTR is not
+ * a pointer. For intrinsics with an out-parameter (air.sincos) */
+bool air_store_local(struct air_ctx *c, const struct air_value *ptr, const struct air_type *type, nir_def *def);
 struct air_val *air_val_ptr(struct air_ctx *c, struct air_ptr ptr);
 struct air_val *air_get(struct air_ctx *c, const struct air_value *v);
 void air_set(struct air_ctx *c, const struct air_value *v, struct air_val *val);

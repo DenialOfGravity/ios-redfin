@@ -90,6 +90,9 @@ constexpr FormatInfo kFormats[] = {
     // Z32_FLOAT is FMT6_32_FLOAT to the TP and the 2D engine (fd6_format_table.c:330 VT(Z32_FLOAT, 32_FLOAT, WZYX)) and
     // DEPTH6_32 to the RB (fd6_pipe2depth)
     {PixelFormat::kDepth32Float, FMT6_32_FLOAT, 4, WZYX, false, false, kElemFloat, "Depth32Float", true},
+    // (redfin hm-int4) Z16_UNORM: FMT6_16_UNORM to the TP and the 2D engine, DEPTH6_16 to the RB (fd6_format_table.c Z16_UNORM,
+    // fd6_pipe2depth); tiled as Depth32Float is (PridePosterExtension's textures, refused in hm-int3)
+    {PixelFormat::kDepth16Unorm, FMT6_16_UNORM, 2, WZYX, false, false, kElemFloat, "Depth16Unorm", true},
     // the S8 plane read as its own image (fdl6_view_init over a stencil layout): FMT6_8_UINT, tiled as the plane is laid
     // out (TILE6_3, its rows to 32, its pitch to 128) -- "depth" here for the tiling, which a stencil view shares
     {PixelFormat::kX32Stencil8, FMT6_8_UINT, 1, WZYX, false, false, kElemUint, "X32_Stencil8", true},
@@ -845,7 +848,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
             refuse(why, "no UBWC layout for a " + n(desc.width) + " x " + n(desc.height) + " texture on this chip");
             return nullptr;
         }
-        std::shared_ptr<Buffer> buffer = newBuffer(gpu, l.size, why);
+        std::shared_ptr<Buffer> buffer = newBuffer(gpu, l.size, why, kPoolTexture);
         if (buffer == nullptr) return nullptr;
         uint32_t bw = 0, bh = 0;
         fdl6_get_ubwc_blockwidth(&l, &bw, &bh);
@@ -865,7 +868,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         return nullptr;
 #endif
     }
-    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why);
+    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why, kPoolTexture);
     if (buffer == nullptr) {
         return nullptr;
     }
