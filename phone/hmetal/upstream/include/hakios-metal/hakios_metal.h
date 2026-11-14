@@ -336,6 +336,12 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+/* (redfin hm-int4) which of the first LENGTH bytes of the fragment function's constant buffer at [[buffer(BINDING)]] it
+ * reads (MASK[i] 1 or 0; all 1 when it reads that buffer at an offset known only at run time): how many, or -1 with the
+ * reason. A byte it does not read decides nothing hakios_metal_program_specialize folds: a configuration's key may
+ * leave it out and its value may be given as 0. Translates the function once (kept in the front-end memo, HM_FE_MEMO). */
+int hakios_metal_known_read_mask(const void *fs_bitcode, size_t fs_size, const hakios_metal_constant *fs_constants,
+    unsigned fs_count, unsigned binding, unsigned char *mask, size_t length);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* (redfin hmv7) HM_HANG_BLAME: how many hung command buffers drew with PROGRAM (only programs of at least

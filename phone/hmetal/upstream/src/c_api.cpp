@@ -1310,6 +1310,23 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     return r;
 }
 
+int hakios_metal_known_read_mask(const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
+                                 unsigned binding, unsigned char* mask, size_t length) {
+    if (fsBitcode == nullptr || fsSize == 0 || mask == nullptr) {
+        failed("a read mask needs the fragment function's bitcode and room for the mask");
+        return -1;
+    }
+    std::string why;
+    std::vector<uint8_t> m;
+    const int n = knownReadMask(fsBitcode, fsSize, constantsOf(fsConstants, fsCount), binding, length, &m, &why);
+    if (n < 0) {
+        failed(why);
+        return -1;
+    }
+    for (size_t i = 0; i < length; i++) mask[i] = i < m.size() ? m[i] : 1;
+    return n;
+}
+
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
     if (p == nullptr || stage > 1) return 0;
     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;

@@ -1370,6 +1370,22 @@ TEST(a_stage_compiled_for_its_constant_buffer_reads_none_of_it) {
     CHECK(other != nullptr && other->listing.find("c0.x") != std::string::npos);
 }
 
+// (redfin hm-int4) knownReadMask: tri_cflat_fs loads the float4 at [[buffer(0)]] bytes 0-15 and nothing else, so of 32
+// bytes 16 are read; of another binding none
+TEST(a_known_buffers_read_mask_is_the_bytes_the_stage_loads) {
+    if (!hasCompiler()) return;
+    std::vector<uint8_t> bc = bitcodeOf("tri_cflat_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    std::vector<uint8_t> mask;
+    std::string why;
+    CHECK_EQ(knownReadMask(bc.data(), bc.size(), {}, 0, 32, &mask, &why), 16);
+    CHECK_EQ(mask.size(), size_t(32));
+    for (size_t i = 0; i < mask.size(); i++) CHECK_EQ(int(mask[i]), i < 16 ? 1 : 0);
+    CHECK_EQ(knownReadMask(bc.data(), bc.size(), {}, 1, 32, &mask, &why), 0);   // (and from the memo the second time)
+    CHECK_EQ(knownReadMask(bc.data(), bc.size(), {}, 0, 32, &mask, &why), 16);
+}
+
 // (redfin hm-int4) a specialisation through the front-end memo (HM_FE_MEMO) and the early shrink (HM_SPEC_SHRINK) is the
 // same program as hm-int3's, word for word, the first time and from the memo
 TEST(a_specialisation_through_the_front_end_memo_and_the_shrink_is_the_plain_one) {

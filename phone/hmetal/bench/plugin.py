@@ -2147,6 +2147,117 @@ HMC_EDITS = [
 EDITS += HMC_EDITS
 
 # ---- (redfin hm-int4) HMI4_EDITS, applied last ----
+# HM_SPEC_MASK=1 (default; 0: the whole buffer as before): a configuration's key holds only the bytes of the uber shader's
+# buffer its fragment function reads (hakios_metal_known_read_mask: CoreAnimation's fixed_frag_lph_cpf reads 34 of the 52
+# bytes of its FragmentShaderConfig; the other 18 are padding and two fields only the CPU uses), the rest given as 0 to the
+# specialiser and the stage cache, so that what CA leaves in them makes no new configuration. The mask is taken once per
+# pipeline when the fragment is kept (one front-end translation, kept for the specialisations: HM_FE_MEMO), and printed:
+#   "spec mask: PROGRAM reads N of L bytes of its buffer B: rrr.rrr. ..."
+# Each first-time configuration's line now also names how many there are and the bytes it differs in from the nearest
+# earlier one ("new configuration #N; nearest #M differs in bytes 37,41"), so that a field that changes with every frame
+# shows as such.
+HMI4_IVARS_OLD = '\tint _specBinding;\n\tunsigned _specLength;\n\tNSMutableDictionary *_specialised;\n}'
+HMI4_IVARS_NEW = ('\tint _specBinding;\n\tunsigned _specLength;\n\tNSMutableDictionary *_specialised;\n'
+                  '\tunsigned char _specMask[256];   /* (redfin hm-int4) HM_SPEC_MASK: 1 for a byte of the buffer the fragment reads */\n'
+                  '\tint _specMaskRead;               /* how many it reads; -1: no mask (the whole buffer is the key) */\n'
+                  '\tunsigned _specSeen;              /* configurations specialised so far (the waited-for ones) */\n}')
+HMI4_KEEP_OLD = '\t_specialised = [[NSMutableDictionary alloc] init];\n}\n'
+HMI4_KEEP_NEW = r'''	_specialised = [[NSMutableDictionary alloc] init];
+	_specMaskRead = -1;
+	_specSeen = 0;
+	if (hm_spec_mask_on() && _specLength <= sizeof(_specMask)) {   /* (redfin hm-int4) HM_SPEC_MASK, on a utility queue */
+		[self retain];
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+			unsigned char mask[256];
+			char m[256 + 1] = "";
+
+			hakios_metal_compile_background(1);
+			const int r = hakios_metal_known_read_mask([_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+								   (unsigned)_specBinding, mask, _specLength);
+			hakios_metal_compile_background(0);
+			for (unsigned i = 0; r >= 0 && i < _specLength; i++) m[i] = mask[i] ? 'r' : '.';
+			if (r >= 0 && (unsigned)r < _specLength) {   /* (all read: nothing to leave out) */
+				memcpy(_specMask, mask, _specLength);
+				__atomic_store_n(&_specMaskRead, r, __ATOMIC_RELEASE);
+			}
+			hm_print("spec mask: %s reads %d of %u bytes of its buffer %d: %s%s\n", hakios_metal_program_name(_program), r, _specLength,
+				 _specBinding, r >= 0 ? m : "no mask: ", r >= 0 ? "" : hakios_metal_error());
+			[self release];
+		});
+	}
+}
+
+/* (redfin hm-int4) the configurations a pipeline was specialised for, against KEY: the nearest one (fewest bytes
+ * apart) and the bytes it differs in, into OUT */
+static void
+hm_spec_nearest(NSDictionary *seen, NSData *key, char *out, size_t size)
+{
+	const unsigned char *k = [key bytes];
+	NSData *best = nil;
+	unsigned bestN = ~0u;
+
+	for (NSData *o in seen) {
+		const unsigned char *b = [o bytes];
+		unsigned n = 0;
+
+		if (o == key || [o isEqual:key] || [o length] != [key length]) continue;
+		for (NSUInteger i = 0; i < [key length]; i++) n += b[i] != k[i];
+		if (n < bestN) bestN = n, best = o;
+	}
+	if (best == nil) {
+		snprintf(out, size, "the first");
+		return;
+	}
+	int at = snprintf(out, size, "nearest earlier one differs in %u byte(s):", bestN);
+	const unsigned char *b = [best bytes];
+
+	for (NSUInteger i = 0; i < [key length] && at > 0 && (size_t)at + 8 < size; i++) {
+		if (b[i] != k[i]) at += snprintf(out + at, size - at, " %u(%02x>%02x)", (unsigned)i, b[i], k[i]);
+	}
+}
+'''
+HMI4_HELPER_OLD = 'static int\nhm_spec_qos_on(void)\n{'
+HMI4_HELPER_NEW = r'''/* (redfin hm-int4) HM_SPEC_MASK: 1 (default) a configuration's key and specialisation without the bytes the fragment
+ * never reads; 0 the whole buffer, as before */
+static int
+hm_spec_mask_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_SPEC_MASK");
+		on = e == NULL || e[0] == 0 || atoi(e) != 0;
+	}
+	return on;
+}
+
+static int
+hm_spec_qos_on(void)
+{'''
+HMI4_KEY_OLD = '\tNSData *key = [NSData dataWithBytes:bytes + at length:_specLength];\n'
+HMI4_KEY_NEW = r'''	NSData *key;
+	if (__atomic_load_n(&_specMaskRead, __ATOMIC_ACQUIRE) >= 0) {   /* (redfin hm-int4) HM_SPEC_MASK: the bytes it never reads left out (as 0) */
+		unsigned char kb[256];
+
+		for (unsigned i = 0; i < _specLength; i++) kb[i] = _specMask[i] ? bytes[at + i] : 0;
+		key = [NSData dataWithBytes:kb length:_specLength];
+	} else {
+		key = [NSData dataWithBytes:bytes + at length:_specLength];
+	}
+'''
+HMI4_LOG_OLD = ('\t\t\tfor (NSUInteger i = 0; i < [key length] && i < 256; i++) snprintf(hex + 2 * i, 3, "%02x", kb[i]);\n'
+                '\t\t\thm_print("specialise (waited for, hmv7): %s for %u bytes of its buffer %d: %s%u instruction words, not %u, in %.0f ms "\n'
+                '\t\t\t\t "(%s; CPU %.0f ms, front end %.0f, folding %.0f); configuration %s\\n",\n')
+HMI4_LOG_NEW = ('\t\t\tchar near[400] = "";\n\n'
+                '\t\t\tfor (NSUInteger i = 0; i < [key length] && i < 256; i++) snprintf(hex + 2 * i, 3, "%02x", kb[i]);\n'
+                '\t\t\t@synchronized(self) {   /* (redfin hm-int4) which configuration this is, and how it differs */\n'
+                '\t\t\t\t_specSeen++;\n'
+                '\t\t\t\thm_spec_nearest(_specialised, key, near, sizeof(near));\n'
+                '\t\t\t}\n'
+                '\t\t\thm_print("specialise (waited for, hmv7): %s for %u bytes of its buffer %d: %s%u instruction words, not %u, in %.0f ms "\n'
+                '\t\t\t\t "(%s; CPU %.0f ms, front end %.0f, folding %.0f); configuration %s (#%u, %s%s)\\n",\n')
+HMI4_LOG2_OLD = '\t\t\t\t cb[5] - ca[5], cb[6] - ca[6], hex);\n'
+HMI4_LOG2_NEW = '\t\t\t\t cb[5] - ca[5], cb[6] - ca[6], hex, _specSeen, near, _specMaskRead >= 0 ? "; never-read bytes masked" : "");\n'
 # HM_DENY_WORDS=N (default 24576; 0 off): a kept uber shader whose own fragment program is N instruction words or more is
 # drawn only through its specialisations, as if HM_DENY named it. CoreAnimation's frag.A2Xghfc (fixed_frag_lph_cpf, 30784
 # words on the host, 32064 on the phone) is the one that hung the A620; with a specialisation at ~30 ms on the host
@@ -2186,6 +2297,12 @@ hm_deny_words(void)
 HMI4_EDITS = [
     (HMI4_DENYW_HELPER_OLD, HMI4_DENYW_HELPER_NEW),
     (HMI4_DENYW_OLD, HMI4_DENYW_NEW),
+    (HMI4_IVARS_OLD, HMI4_IVARS_NEW),
+    (HMI4_HELPER_OLD, HMI4_HELPER_NEW),
+    (HMI4_KEEP_OLD, HMI4_KEEP_NEW),
+    (HMI4_KEY_OLD, HMI4_KEY_NEW),
+    (HMI4_LOG_OLD, HMI4_LOG_NEW),
+    (HMI4_LOG2_OLD, HMI4_LOG2_NEW),
 ]
 EDITS += HMI4_EDITS
 

@@ -146,6 +146,11 @@ struct CompileStats {
     uint64_t cpuNs = 0, translateNs = 0, foldNs = 0;
 };
 CompileStats compileStats();
+// (redfin hm-int4) which of the first LENGTH bytes of the stage's constant buffer at [[buffer(BINDING)]] it reads at
+// constant offsets (MASK[i] 1/0; every byte 1 when it reads the buffer at an offset not constant): how many, or -1
+// with *why. A specialisation's KnownBuffer may zero the others: no fold can depend on them (compiler.cpp)
+int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
+                  std::vector<uint8_t>* mask, std::string* why);
 void setCompileBackground(bool on);
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
                                            uint32_t iboBase = 0, const KnownBuffer* known = nullptr);

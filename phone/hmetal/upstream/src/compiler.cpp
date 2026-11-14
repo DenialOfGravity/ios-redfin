@@ -57,6 +57,10 @@ std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* wh
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
 }
+int knownReadMask(const void*, size_t, const FunctionConstants&, uint32_t, size_t, std::vector<uint8_t>*, std::string* why) {
+    *why = "no compiler in this build";
+    return -1;
+}
 
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
@@ -1903,6 +1907,55 @@ CompileStats compileStats() {
     s.translateNs = tTranslateNs;
     s.foldNs = tFoldNs;
     return s;
+}
+
+// (redfin hm-int4) which of a constant buffer's first LENGTH bytes the stage reads, as the front end made it (its
+// offsets' arithmetic folded, nothing known): MASK[i] = 1 for a byte a load at a constant offset covers. Any load of the
+// buffer at an offset that is not constant then reads them all (every byte 1). The bytes it does not read cannot decide
+// anything a specialisation folds, so a configuration's key may leave them out. Returns how many bytes are read, -1
+// with *why when the front end refused the stage. Kept in the front-end memo (HM_FE_MEMO) with the NIR.
+int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
+                  std::vector<uint8_t>* mask, std::string* why) {
+    CompileTurn turn;
+    Translation t;
+    FrontEndMemo* m = nullptr;
+    if (!translate(bitcode, size, t, why, constants, nullptr, true, &m)) return -1;
+    if (m != nullptr) {
+        std::lock_guard<std::mutex> g(gFeMemoLock);
+        for (const auto& r : m->readMasks) {
+            if (r.first == binding && r.second.size() == length) {
+                *mask = r.second;
+                return int(std::count(mask->begin(), mask->end(), uint8_t(1)));
+            }
+        }
+    }
+    for (bool progress = true; progress;) {
+        nir_copy_prop(t.nir);
+        progress = nir_opt_constant_folding(t.nir);
+    }
+    std::vector<uint8_t> r(length, 0);
+    bool all = false;
+    nir_foreach_function_impl(impl, t.nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic != nir_intrinsic_load_ubo) continue;
+                if (!nir_src_is_const(in->src[0])) { all = true; continue; }   // (a buffer chosen at run time: may be this one)
+                if (nir_src_as_uint(in->src[0]) != binding) continue;
+                if (!nir_src_is_const(in->src[1]) || in->def.bit_size % 8 != 0) { all = true; continue; }
+                const uint64_t at = nir_src_as_uint(in->src[1]), n = uint64_t(in->def.num_components) * (in->def.bit_size / 8);
+                for (uint64_t i = at; i < at + n && i < length; i++) r[i] = 1;
+            }
+        }
+    }
+    if (all) std::fill(r.begin(), r.end(), uint8_t(1));
+    if (m != nullptr) {
+        std::lock_guard<std::mutex> g(gFeMemoLock);
+        m->readMasks.emplace_back(binding, r);
+    }
+    *mask = r;
+    return int(std::count(r.begin(), r.end(), uint8_t(1)));
 }
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,

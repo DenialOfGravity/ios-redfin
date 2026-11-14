@@ -158,6 +158,17 @@ int timeOne(int argc, char** argv) {
         return 2;
     }
     std::printf("hm-seed: %s: %llu bytes of bitcode, %zu constants\n", fn.c_str(), (unsigned long long)len, constants.size());
+    if (hasKnown) {   // (redfin hm-int4) the bytes of the known buffer the stage reads (knownReadMask)
+        std::vector<uint8_t> mask;
+        std::string why;
+        const int r = knownReadMask(bc, len, constants, known.binding, known.bytes.size(), &mask, &why);
+        std::string m;
+        for (uint8_t b : mask) m += b ? 'r' : '.';
+        std::printf("  read mask of buffer %u: %d of %zu bytes read: %s\n", known.binding, r, known.bytes.size(), r < 0 ? why.c_str() : m.c_str());
+        if (getenv("HM_SEED_MASKED") != nullptr && r >= 0) {
+            for (size_t i = 0; i < known.bytes.size(); i++) if (!mask[i]) known.bytes[i] = 0;
+        }
+    }
     for (int pass = (hasKnown && getenv("HM_SEED_SKIP_WHOLE") != nullptr) ? 1 : 0; pass < (hasKnown ? 2 : 1); pass++) {
         for (int i = 0; i < n; i++) {
             const CompileStats a = compileStats();
