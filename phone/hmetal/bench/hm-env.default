@@ -69,3 +69,26 @@ HM_PREWARM=1
 #HM_HANG_EXEC=0
 # the cache key: format (default: HAKIOS_METAL_CACHE_FORMAT + the Mesa id) | build (the old key: empty after any core change)
 #HM_CACHE_KEY=build
+# ---- (hm-int5) new switches, each at its compiled default (uncomment to change) ----
+# Depth16Unorm (250) as a depth attachment (PridePosterExtension): 0 = refused as in hm-int4
+#*:HM_DEPTH16=0
+# -setDepthBias: applied to draws with a depth attachment (GRAS_SU_POLY_OFFSET_*): 0 = ignored as in hm-int4
+#*:HM_DEPTH_BIAS=0
+# the specialiser's kept front-end NIR made SSA and shrunk once (specialisation ~2.3x faster on the host, same code): 0 = hm-int4
+#HM_FE_PRE=0
+# a specialisation's stage written to the disk cache after the compile returned (one writer thread): 0 = before returning
+#HM_CACHE_WRITE_ASYNC=0
+# a configuration queued on the specialiser's queue that a draw must wait for is compiled by the waiting thread: 0 = poll
+#HM_SPEC_STEAL=0
+# extended-range targets' write-back: gpu = xr_encode at the end of the drawing buffer (default); cpu = processor at completion
+#*:HM_XR_WB=cpu
+# the first N GPU write-backs checked against the processor's codes ("xr: encode verify ..."; default 4, 0 = none)
+#*:HM_XR_VERIFY=4
+# an XR companion sized to its IOSurface, shared by every texture over it, written back by region: 0 = the texture's size
+#*:HM_XR_SURFACE_SIZE=0
+# the first N companions said ("xr: companion WxH for surface S ... through a WxH texture ..."; default 12)
+#*:HM_XR_TRACE=12
+# the scanout gate's submit flag (backboardd): needs a kernel that honours NativeAdrenoAbiSubmit flag 1; an older kernel
+# refuses the flag once and it is turned off for the process (default 0 until the kernel side exists)
+#HM_GATE_FLAG=1
+#HM_GATE_FLAG_SURF=1125x2436
