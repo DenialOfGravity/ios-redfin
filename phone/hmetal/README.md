@@ -158,6 +158,8 @@ no longer replaced.
 The key a stage is filed under is the bitcode, its function constants, IBO_BASE, the known buffer (a specialisation's
 configuration) and `hm-stage-format N mesa VERSION+PATCHES` (compiler.cpp `HAKIOS_METAL_CACHE_FORMAT`, BUMP BY HAND when
 codegen, a lowering, the AIR front end's output or the Stage/Kernel layout changes; the Mesa id comes from build.sh).
+Compute kernels (compileAir: ycbcr_decode, xr_decode, apps' compute pipelines) are filed the same way since hm-int3, IBO_BASE
+= kKernelCacheTag ("KRNL"); their manifests are re-made by compileAir in the pre-warm and in hm-seed. Format 2 = hm-int3.
 A plug-in or core rebuild that changes no codegen keeps the cache. `HM_CACHE_KEY=build` = the old per-build key.
 Switches (all core env, set in `/var/local/hmetal/env`): `HM_CACHE_VERIFY=N` (1 in N hits compiled again in the
 background; "hm-cache: STALE ..." when it differs, the file replaced), `HM_STAGE_MEMO=1` (+`HM_STAGE_MEMO_MB=48`),
