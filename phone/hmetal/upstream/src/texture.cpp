@@ -298,21 +298,90 @@ int Texture::xrRenderMode() {
     return mode;
 }
 
+// (redfin hm-int5) HM_XR_WB=gpu (default, 2): the write-back is xr_encode, dispatched at the end of the buffer that drew
+// the companion (CommandBuffer::xrEncodeAppend), so the surface's rows are whole when that buffer's fence passes and any
+// later GPU work on the ring (backboardd's decode) reads them; cpu (or 1): on the processor at the buffer's completion
+// (hm-int4); 0: never (the companion stays live)
+namespace {
+std::atomic<int> gXrWbForce{-1};
+}  // namespace
+void Texture::setXrWriteBackModeForTesting(int mode) { gXrWbForce = mode; }
 int Texture::xrWriteBackMode() {
-    static const int mode = [] { const char* e = getenv("HM_XR_WB"); return e == nullptr || e[0] == 0 ? 1 : atoi(e); }();
+    if (gXrWbForce.load() >= 0) return gXrWbForce.load();
+    static const int mode = [] {
+        const char* e = getenv("HM_XR_WB");
+        if (e == nullptr || e[0] == 0 || !strcmp(e, "gpu")) return 2;
+        if (!strcmp(e, "cpu")) return 1;
+        return atoi(e);
+    }();
     return mode;
 }
 
-void Texture::xrDecodeInto(uint8_t* out, uint64_t outPitch) const {
+namespace {
+// the processor write-back's tables: the code of each of the 65536 halves, linear [0] and sRGB [1]
+const std::vector<uint16_t>* xrCodeTables() {
+    static std::vector<uint16_t> codes[2];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int s = 0; s < 2; s++) {
+            codes[s].resize(65536);
+            for (uint32_t h = 0; h < 65536; h++) codes[s][h] = uint16_t(xrCode(floatOfHalf(uint16_t(h)), s != 0));
+        }
+    });
+    return codes;
+}
+}  // namespace
+
+const std::vector<uint32_t>& Texture::xrEncodeTable() {
+    static const std::vector<uint32_t> t = [] {
+        const std::vector<uint16_t>* c = xrCodeTables();
+        std::vector<uint32_t> v(131072);
+        for (uint32_t i = 0; i < 65536; i++) v[i] = c[0][i], v[65536 + i] = c[1][i];
+        return v;
+    }();
+    return t;
+}
+
+const Texture* Texture::xrRenderView(const XrTarget& t) const {
+    if (t.tex->width() == desc_.width && t.tex->height() == desc_.height) return t.tex.get();
+    xrSampleView(t);
+    return xrRtView_ != nullptr ? xrRtView_.get() : t.tex.get();
+}
+
+std::shared_ptr<Texture> Texture::xrSampleView(const XrTarget& t) const {
+    if (t.tex->width() == desc_.width && t.tex->height() == desc_.height) return t.sample;
+    std::lock_guard<std::mutex> g(t.views);
+    if (xrViewsOf_ != &t) {
+        TextureDesc d;
+        d.format = PixelFormat::kRGBA16Float;
+        d.width = desc_.width;
+        d.height = desc_.height;
+        d.usage = kTextureUsageRead | kTextureUsageRenderTarget;
+        std::string why;
+        xrRtView_ = overBuffer(t.tex->buffer(), t.tex->gpuAddress() - t.tex->buffer()->gpuAddress(), t.tex->bytesPerRow(), d, &why);
+        xrSampleView_ = xrRtView_;
+        if (xrRtView_ != nullptr && info_->xr <= 2) {   // BGR10_XR: no alpha, read as 1
+            const uint8_t one[4] = {2, 3, 4, 1};
+            std::shared_ptr<Texture> v = swizzled(xrRtView_, one, &why);
+            if (v != nullptr) xrSampleView_ = v;
+        }
+        xrViewsOf_ = &t;
+    }
+    return xrSampleView_ != nullptr ? xrSampleView_ : t.sample;
+}
+
+void Texture::xrDecodeInto(uint8_t* out, uint64_t outPitch) const { xrDecodeRect(out, outPitch, desc_.width, desc_.height); }
+
+void Texture::xrDecodeRect(uint8_t* out, uint64_t outPitch, uint32_t W, uint32_t H) const {
     const uint8_t xr = info_->xr;
     const uint8_t* rows = static_cast<const uint8_t*>(buffer_->contents()) + offset_;
     const bool srgb = xr == 2 || xr == 4;
     const uint16_t* lut = xrTable(srgb);
     const uint16_t* alut = xrTable(false);
-    [[maybe_unused]] const uint64_t rowBytes = uint64_t(desc_.width) * info_->bytesPerPixel;
+    [[maybe_unused]] const uint64_t rowBytes = uint64_t(W) * info_->bytesPerPixel;
 #if defined(__aarch64__)
     // another process's GPU wrote the surface: this processor's lines of it may be stale, so they are dropped first
-    for (uint32_t y = 0; y < desc_.height; y++) {
+    for (uint32_t y = 0; y < H; y++) {
         uintptr_t a = reinterpret_cast<uintptr_t>(rows + uint64_t(y) * pitch_) & ~uintptr_t(63);
         const uintptr_t end = reinterpret_cast<uintptr_t>(rows + uint64_t(y) * pitch_ + rowBytes);
         for (; a < end; a += 64) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
@@ -326,18 +395,18 @@ void Texture::xrDecodeInto(uint8_t* out, uint64_t outPitch) const {
         return v;
     }();
     (void)alut;
-    std::vector<uint16_t> line(size_t(desc_.width) * 4);
-    for (uint32_t y = 0; y < desc_.height; y++) {
+    std::vector<uint16_t> line(size_t(W) * 4);
+    for (uint32_t y = 0; y < H; y++) {
         const uint8_t* in = rows + uint64_t(y) * pitch_;
         uint16_t* o = line.data();
         if (xr <= 2) {
-            for (uint32_t x = 0; x < desc_.width; x++, o += 4) {
+            for (uint32_t x = 0; x < W; x++, o += 4) {
                 uint32_t w;
                 memcpy(&w, in + 4ull * x, 4);
                 o[0] = lut[(w >> 20) & 1023], o[1] = lut[(w >> 10) & 1023], o[2] = lut[w & 1023], o[3] = 0x3c00;
             }
         } else {
-            for (uint32_t x = 0; x < desc_.width; x++, o += 4) {
+            for (uint32_t x = 0; x < W; x++, o += 4) {
                 uint16_t w[4];
                 memcpy(w, in + 8ull * x, 8);
                 o[0] = lut[w[2] >> 6], o[1] = lut[w[1] >> 6], o[2] = lut[w[0] >> 6], o[3] = alpha[w[3] >> 6];
@@ -451,6 +520,41 @@ uint64_t Texture::xrVerify(const Texture& copy, uint64_t* checked) const {
     return bad;
 }
 
+namespace render {
+void notify(const std::string& text);   // render.cpp: the plug-in's log
+}
+namespace {
+void xrNote(const char* line) { render::notify(line); }
+}  // namespace
+
+// (redfin hm-int5) HM_XR_SURFACE_SIZE=1 (default): a texture over an IOSurface draws into a companion of the
+// surface's size (its region at the same origin, xrRenderView), shared by every texture over that surface, decoded whole
+// from the rows; the write-back writes the texture's own region. 0: the companion is the texture's size (hm-int4: a
+// second texture of another size over the same surface got a companion of its own, which replaced the first one in the
+// surface's entry, and what one drew the other's load never saw)
+void Texture::xrCompanionSize(uint32_t* w, uint32_t* h) const {
+    static const bool on = [] { const char* e = getenv("HM_XR_SURFACE_SIZE"); return e == nullptr || e[0] == 0 || atoi(e) != 0; }();
+    *w = desc_.width;
+    *h = desc_.height;
+    if (on && surface_ != 0 && surfaceW_ >= desc_.width && surfaceH_ >= desc_.height) {
+        *w = surfaceW_;
+        *h = surfaceH_;
+    }
+}
+
+// (redfin hm-int5) HM_XR_TRACE=N (default 12): the first N companions a process uses said, with the surface's and the
+// texture's sizes and the load: what the write-back's region is ("xr: companion ...")
+void Texture::xrTrace(const XrTarget& t, bool load) const {
+    static const uint32_t n = [] { const char* e = getenv("HM_XR_TRACE"); return e != nullptr && e[0] ? uint32_t(atoi(e)) : 12u; }();
+    static std::atomic<uint32_t> said{0};
+    if (xrSaid_.exchange(true) || said.load() >= n || said.fetch_add(1) >= n) return;
+    char line[256];
+    snprintf(line, sizeof line, "xr: companion %ux%u for surface %u (%ux%u, %s) through a %ux%u texture at offset %llu, pitch %llu, load %d",
+             t.tex->width(), t.tex->height(), surface_, surfaceW_, surfaceH_, info_->name, desc_.width, desc_.height,
+             (unsigned long long)offset_, (unsigned long long)pitch_, load ? 1 : 0);
+    xrNote(line);
+}
+
 std::shared_ptr<Texture::XrTarget> Texture::xrTarget(Gpu& gpu, bool load, std::string* why) const {
     if (info_->xr == 0 || xrMode() != 1 || xrRenderMode() == 0) {
         refuse(why, std::string("a ") + info_->name + " texture as a colour attachment: the extended-range formats are sampled alone (no A6xx format writes them; HM_XR_RT=0)");
@@ -461,6 +565,8 @@ std::shared_ptr<Texture::XrTarget> Texture::xrTarget(Gpu& gpu, bool load, std::s
         return nullptr;
     }
     std::shared_ptr<XrTarget> t;
+    uint32_t cw = 0, ch = 0;
+    xrCompanionSize(&cw, &ch);
     {
         std::lock_guard<std::mutex> g(gXrLock);
         t = xrTarget_;
@@ -468,14 +574,14 @@ std::shared_ptr<Texture::XrTarget> Texture::xrTarget(Gpu& gpu, bool load, std::s
             auto it = gXrBySurface.find(surface_);
             if (it != gXrBySurface.end()) {
                 t = it->second.lock();
-                if (t != nullptr && (t->tex->width() != desc_.width || t->tex->height() != desc_.height)) t = nullptr;
+                if (t != nullptr && (t->tex->width() != cw || t->tex->height() != ch)) t = nullptr;
             }
         }
         if (t == nullptr) {
             TextureDesc d;
             d.format = PixelFormat::kRGBA16Float;
-            d.width = desc_.width;
-            d.height = desc_.height;
+            d.width = cw;
+            d.height = ch;
             d.usage = kTextureUsageRead | kTextureUsageRenderTarget;
             t = std::make_shared<XrTarget>();
             t->tex = make(gpu, d, why);
@@ -496,8 +602,10 @@ std::shared_ptr<Texture::XrTarget> Texture::xrTarget(Gpu& gpu, bool load, std::s
     }
     if (load && !t->live()) {
         std::lock_guard<std::mutex> g(t->wb);
-        if (!t->live()) xrDecodeInto(static_cast<uint8_t*>(t->tex->contents()), t->tex->bytesPerRow());
+        // (redfin hm-int5) the whole companion: every texture of the surface shares it
+        if (!t->live()) xrDecodeRect(static_cast<uint8_t*>(t->tex->contents()), t->tex->bytesPerRow(), cw, ch);
     }
+    xrTrace(*t, load);
     return t;   // (the caller marks the draw: XrTarget::drew)
 }
 
@@ -510,41 +618,37 @@ std::shared_ptr<Texture::XrTarget> Texture::xrLive() const {
         if (t == nullptr && surface_ != 0) {
             auto it = gXrBySurface.find(surface_);
             if (it != gXrBySurface.end()) t = it->second.lock();
-            if (t != nullptr && (t->tex->width() != desc_.width || t->tex->height() != desc_.height)) t = nullptr;
+            uint32_t cw = 0, ch = 0;
+            xrCompanionSize(&cw, &ch);
+            if (t != nullptr && (t->tex->width() != cw || t->tex->height() != ch)) t = nullptr;
         }
     }
     return t != nullptr && t->live() ? t : nullptr;
 }
 
-void Texture::xrWriteBack(const XrTarget& t) const {
+void Texture::xrWriteBack(const XrTarget& t, uint32_t w, uint32_t h) const {
+    const uint32_t W = w != 0 ? std::min(w, t.tex->width()) : desc_.width, H = h != 0 ? std::min(h, t.tex->height()) : desc_.height;
     uint8_t* rows = buffer_->contents() != nullptr ? static_cast<uint8_t*>(buffer_->contents()) + offset_ : nullptr;
     const uint8_t* from = static_cast<const uint8_t*>(t.tex->contents());
     if (rows == nullptr || from == nullptr) return;
     const uint8_t xr = info_->xr;
     const bool srgb = xr == 2 || xr == 4;
-    // the halves as codes, by a table of the 32768 positive halves (the sign through the curve's symmetry)
-    static std::vector<uint16_t> codes[2];
-    static std::once_flag once;
-    std::call_once(once, [] {
-        for (int s = 0; s < 2; s++) {
-            codes[s].resize(65536);
-            for (uint32_t h = 0; h < 65536; h++) codes[s][h] = uint16_t(xrCode(floatOfHalf(uint16_t(h)), s != 0));
-        }
-    });
+    // the halves as codes, by a table of every half (xrCodeTables, xr_encode's too)
+    const std::vector<uint16_t>* codes = xrCodeTables();
     const uint16_t* lut = codes[srgb ? 1 : 0].data();
     const uint16_t* alut = codes[0].data();
-    std::vector<uint16_t> line(size_t(desc_.width) * 4);
-    for (uint32_t y = 0; y < desc_.height; y++) {
+    std::vector<uint16_t> line(size_t(W) * 4);
+    for (uint32_t y = 0; y < H; y++) {
         memcpy(line.data(), from + uint64_t(y) * t.tex->bytesPerRow(), line.size() * 2);   // (one read of write-combined memory)
         uint8_t* o = rows + uint64_t(y) * pitch_;
         const uint16_t* in = line.data();
         if (xr <= 2) {
-            for (uint32_t x = 0; x < desc_.width; x++, in += 4) {
+            for (uint32_t x = 0; x < W; x++, in += 4) {
                 const uint32_t w = uint32_t(lut[in[2]]) | uint32_t(lut[in[1]]) << 10 | uint32_t(lut[in[0]]) << 20;
                 memcpy(o + 4ull * x, &w, 4);
             }
         } else {
-            for (uint32_t x = 0; x < desc_.width; x++, in += 4) {
+            for (uint32_t x = 0; x < W; x++, in += 4) {
                 const uint16_t w[4] = {uint16_t(lut[in[2]] << 6), uint16_t(lut[in[1]] << 6), uint16_t(lut[in[0]] << 6), uint16_t(alut[in[3]] << 6)};
                 memcpy(o + 8ull * x, w, 8);
             }
@@ -552,7 +656,7 @@ void Texture::xrWriteBack(const XrTarget& t) const {
 #if defined(__aarch64__)
         // to memory now: these rows are written without an IOSurface lock, so no seed tells the transport to clean them
         uintptr_t a = reinterpret_cast<uintptr_t>(o) & ~uintptr_t(63);
-        const uintptr_t end = reinterpret_cast<uintptr_t>(o) + uint64_t(desc_.width) * info_->bytesPerPixel;
+        const uintptr_t end = reinterpret_cast<uintptr_t>(o) + uint64_t(W) * info_->bytesPerPixel;
         for (; a < end; a += 64) __asm__ volatile("dc cvac, %0" ::"r"(a) : "memory");
 #endif
     }
@@ -1400,7 +1504,12 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     // TEX_CONST_2.PITCHALIGN: the largest k up to log2(cpp) with the pitch a multiple of 64 << k
     uint32_t pitchAlign = 0;
     while (pitchAlign < log2u(info->bytesPerPixel) && s.rowBytes % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-    return adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, pitchAlign, surfaceId));
+    std::shared_ptr<Texture> t = adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, pitchAlign, surfaceId));
+    if (t != nullptr) {   // (redfin hm-int5) the surface's own size: an extended-range companion is the surface's (xrTarget)
+        t->surfaceW_ = s.width;
+        t->surfaceH_ = s.height;
+    }
+    return t;
 }
 
 // A '420f' or '420v' surface as one YCbCr8_420_2P texture: plane 0 the luma rows the kernel describes, plane 1 the

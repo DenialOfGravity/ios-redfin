@@ -27,6 +27,7 @@
 #include "hakios-metal/compiler.hpp"
 #include "hakios-metal/texture.hpp"
 #include "../tests/fixtures/xr_decode_bc.hpp"   // (redfin hmv11) HM_XR_GPU's kernel
+#include "../tests/fixtures/xr_encode_bc.hpp"   // (redfin hm-int5) HM_XR_WB=gpu's kernel
 #include "../tests/fixtures/ycbcr_decode_bc.hpp"   // (redfin hmyc) HM_YCBCR=native's kernel
 
 namespace hakios::metal {
@@ -2935,7 +2936,63 @@ struct XrDrawn {
     std::shared_ptr<const Texture> source;
     std::shared_ptr<Texture::XrTarget> target;
     uint64_t at = 0;   // the target's state after this buffer's last draw into it
+    uint32_t w = 0, h = 0;   // (redfin hm-int5) the region to write back: the largest of the textures drawn through it
+    bool gpu = false;        // (redfin hm-int5) HM_XR_WB=gpu: written back by this buffer's xr_encode (xrEncodeAppend)
 };
+std::atomic<uint64_t> gXrEnc[5];   // (redfin hm-int5) CommandBuffer::xrEncodeStats
+// (redfin hm-int5) HM_XR_VERIFY=N (default 4): the first N GPU write-backs compared, at their buffer's completion, with
+// the processor's codes for the same texels (every 8th row): "xr: encode verify ..." (a later buffer that drew the
+// companion again before this completion makes a difference that is not the kernel's: said as such)
+void xrEncodeVerify(const XrDrawn& d) {
+    static const uint32_t n = [] { const char* e = getenv("HM_XR_VERIFY"); return e != nullptr && e[0] ? uint32_t(atoi(e)) : 4u; }();
+    static std::atomic<uint32_t> done{0};
+    if (n == 0 || done.load() >= n || done.fetch_add(1) >= n) return;
+    const Texture& c = *d.target->tex;
+    const Texture& t = *d.source;
+    const uint8_t* comp = static_cast<const uint8_t*>(c.contents());
+    const uint8_t* rows = static_cast<const uint8_t*>(t.contents());
+    if (comp == nullptr || rows == nullptr) return;
+    const std::vector<uint32_t>& tab = Texture::xrEncodeTable();
+    const uint8_t xr = t.info().xr;
+    const uint32_t lut = (xr == 2 || xr == 4) ? 65536u : 0u;
+    uint64_t checked = 0, differ = 0;
+    uint32_t fx = 0, fy = 0, fg = 0, fc = 0;
+    const uint64_t at = d.target->state.load();
+    for (uint32_t y = 0; y < d.h; y += 8) {
+        for (uint32_t x = 0; x < d.w; x++) {
+            uint16_t hv[4];
+            memcpy(hv, comp + uint64_t(y) * c.bytesPerRow() + 8ull * x, 8);
+            const uint32_t r = tab[lut + hv[0]], g = tab[lut + hv[1]], b = tab[lut + hv[2]];
+            uint32_t want[2], got[2] = {0, 0};
+            const bool wide = t.info().bytesPerPixel == 8;
+            if (!wide) {
+                want[0] = b | g << 10 | r << 20;
+                memcpy(got, rows + uint64_t(y) * t.bytesPerRow() + 4ull * x, 4);
+            } else {
+                want[0] = b << 6 | g << 22;
+                want[1] = r << 6 | tab[hv[3]] << 22;
+                memcpy(got, rows + uint64_t(y) * t.bytesPerRow() + 8ull * x, 8);
+            }
+            checked++;
+            if (got[0] != want[0] || (wide && got[1] != want[1])) {
+                if (differ++ == 0) fx = x, fy = y, fg = got[0], fc = want[0];
+            }
+        }
+    }
+    gXrEnc[3]++;
+    if (differ != 0) gXrEnc[4]++;
+    char line[320];
+    snprintf(line, sizeof line, "xr: encode verify surface %u (%ux%u region): %llu of %llu texels differ%s%s", t.surface(), d.w, d.h,
+             (unsigned long long)differ, (unsigned long long)checked, differ ? "" : " (GPU = processor)",
+             differ && (d.target->state.load() != at || (d.target->state.load() & 1)) ? "; the companion was drawn again since" : "");
+    std::string text(line);
+    if (differ != 0) {
+        char more[96];
+        snprintf(more, sizeof more, "; first at (%u, %u): GPU %#x, processor %#x", fx, fy, fg, fc);
+        text += more;
+    }
+    render::notify(text);
+}
 class XrWriteBacks {
 public:
     static XrWriteBacks& the() {
@@ -2966,7 +3023,7 @@ private:
             g.unlock();
             {
                 std::lock_guard<std::mutex> w(d.target->wb);
-                d.source->xrWriteBack(*d.target);
+                d.source->xrWriteBack(*d.target, d.w, d.h);
             }
             d.target->settled(d.at);
             d = XrDrawn{};
@@ -2997,7 +3054,10 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
         bool found = false;
         for (auto& [key, rec] : xrDrawn_) {
             if (key == x.get()) {
-                static_cast<XrDrawn*>(rec.get())->at = at;
+                XrDrawn* d = static_cast<XrDrawn*>(rec.get());
+                d->at = at;
+                d->w = std::max(d->w, t->width());   // (redfin hm-int5) another texture of the same surface
+                d->h = std::max(d->h, t->height());
                 found = true;
             }
         }
@@ -3006,12 +3066,19 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
             rec->source = Texture::byResourceId(t->resourceId());
             rec->target = x;
             rec->at = at;
+            rec->w = t->width();
+            rec->h = t->height();
             if (xrDrawn_.empty() && Texture::xrWriteBackMode() != 0) {
                 addCompletedHandler([](CommandBuffer& cb) {
                     if (cb.status() != kCompleted) return;
                     for (auto& [key, r] : cb.xrDrawn_) {
                         const XrDrawn* d = static_cast<const XrDrawn*>(r.get());
                         if (d->source == nullptr) continue;
+                        if (d->gpu) {   // (redfin hm-int5) HM_XR_WB=gpu: the rows were written by this buffer's xr_encode
+                            xrEncodeVerify(*d);
+                            d->target->settled(d->at);
+                            continue;
+                        }
                         if (!xrWbSyncOn()) {
                             XrWriteBacks::the().post(*d);
                             continue;
@@ -3020,7 +3087,7 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
                         const uint64_t t0 = cb.queue_.gpu().transport().nowNs();
                         {
                             std::lock_guard<std::mutex> w(d->target->wb);
-                            d->source->xrWriteBack(*d->target);
+                            d->source->xrWriteBack(*d->target, d->w, d->h);
                         }
                         d->target->settled(d->at);
                         const uint64_t us = (cb.queue_.gpu().transport().nowNs() - t0) / 1000;
@@ -3038,7 +3105,7 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
             }
             xrDrawn_.emplace_back(x.get(), rec);
         }
-        t = x->tex.get();
+        t = t->xrRenderView(*x);   // (redfin hm-int5) the companion, or this texture's region of its surface's
         return true;
     };
     if (!redirect(out->color0, out->level, out->load)) return false;
@@ -3149,8 +3216,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
                 if (decoded == nullptr) {
                     if (std::shared_ptr<Texture::XrTarget> live = t->xrLive()) {
                         keepAlive(live);
-                        xrDecoded_.emplace_back(t, live->sample);
-                        decoded = live->sample.get();
+                        std::shared_ptr<Texture> view = t->xrSampleView(*live);   // (redfin hm-int5)
+                        xrDecoded_.emplace_back(t, view);
+                        decoded = view.get();
                     }
                 }
                 if (decoded == nullptr && t->surface() != 0 && xrLateOn()) {
@@ -3858,6 +3926,99 @@ void CommandBuffer::setXrGpuForTesting(int on) { gXrGpuForce = on; }
 
 void CommandBuffer::xrGpuStats(uint64_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = gXrGpu[i].load();
+}
+
+// (redfin hm-int5) HM_XR_WB=gpu: xr_encode compiled once a process (through the stage cache's kernel path, as
+// xr_decode), its 512 KB table in a buffer; nullptr: no compiler or refused (said once): the processor writes back
+namespace {
+struct XrEncKernel {
+    std::unique_ptr<CompiledKernel> k;
+    std::shared_ptr<Buffer> table;
+};
+const XrEncKernel* xrEncodeKernel(Gpu& gpu) {
+    static std::mutex m;
+    static XrEncKernel* made = nullptr;
+    static bool tried = false;
+    std::lock_guard<std::mutex> g(m);
+    if (tried) return made;
+    tried = true;
+    std::string why;
+    if (!hasCompiler()) {
+        render::notify("HM_XR_WB=gpu: no shader compiler in this build; extended-range targets written back on the processor");
+        return nullptr;
+    }
+    auto x = std::make_unique<XrEncKernel>();
+    x->k = compileAir(kernels::xr_encode_bc, sizeof kernels::xr_encode_bc, &why);
+    if (x->k == nullptr) {
+        render::notify("HM_XR_WB=gpu: xr_encode refused by the compiler (" + why + "); extended-range targets written back on the processor");
+        return nullptr;
+    }
+    const std::vector<uint32_t>& t = Texture::xrEncodeTable();
+    x->table = newBuffer(gpu, 4 * t.size(), &why, kPoolTable);
+    if (x->table == nullptr || x->table->contents() == nullptr) {
+        render::notify("HM_XR_WB=gpu: no buffer for xr_encode's table (" + why + "); extended-range targets written back on the processor");
+        return nullptr;
+    }
+    memcpy(x->table->contents(), t.data(), 4 * t.size());
+    render::notify("HM_XR_WB=gpu: xr_encode compiled (" + std::to_string(x->k->kernel.numWords) +
+                   " words); extended-range targets written back on the GPU at the end of the buffer that drew them");
+    made = x.release();
+    return made;
+}
+}  // namespace
+
+void CommandBuffer::xrEncodeStats(uint64_t out[5]) {
+    for (int i = 0; i < 5; i++) out[i] = gXrEnc[i].load();
+}
+
+void CommandBuffer::xrEncodeAppend() {
+    if (xrDrawn_.empty() || Texture::xrWriteBackMode() != 2 || !error_.empty()) return;
+    const XrEncKernel* xk = xrEncodeKernel(queue_.gpu());
+    bool any = false;
+    for (auto& [key, r] : xrDrawn_) {
+        XrDrawn* d = static_cast<XrDrawn*>(r.get());
+        if (d->source == nullptr || d->target == nullptr || d->gpu) continue;
+        const Texture& comp = *d->target->tex;
+        const Texture& dst = *d->source;
+        const uint32_t bpp = dst.info().bytesPerPixel;
+        const uint8_t xr = dst.info().xr;
+        if (xk == nullptr || xr == 0 || (bpp != 4 && bpp != 8) || dst.bytesPerRow() % 4 != 0 || comp.bytesPerRow() % 8 != 0 || dst.buffer() == nullptr ||
+            comp.buffer() == nullptr || dst.compressed() || comp.compressed() || d->w == 0 || d->h == 0 || d->w > comp.width() || d->h > comp.height()) {
+            gXrEnc[2]++;
+            continue;
+        }
+        std::string why;
+        Piece params;
+        if (!piece(32, &params, &why)) {
+            gXrEnc[2]++;
+            continue;
+        }
+        const uint32_t p[6] = {d->w, d->h, uint32_t(comp.bytesPerRow() / 4), uint32_t(dst.bytesPerRow() / 4), bpp == 8 ? 1u : 0u,
+                               (xr == 2 || xr == 4) ? 65536u : 0u};
+        memcpy(params.contents(), p, sizeof p);
+        std::vector<Binding> b(4);
+        b[0] = Binding{params.buffer.get(), params.offset};
+        b[1] = Binding{comp.buffer().get(), comp.gpuAddress() - comp.buffer()->gpuAddress()};
+        b[2] = Binding{dst.buffer().get(), dst.gpuAddress() - dst.buffer()->gpuAddress()};
+        b[3] = Binding{xk->table.get(), 0};
+        const uint32_t local[3] = {8, 8, 1};
+        const uint32_t groups[3] = {(d->w + 7) / 8, (d->h + 7) / 8, 1};
+        if (!dispatch(xk->k->kernel, groups, local, b)) {
+            // (a refused dispatch leaves this buffer in error: what it drew is lost either way; said)
+            static std::atomic<uint32_t> said{0};
+            if (said.fetch_add(1) < 8) render::notify("HM_XR_WB=gpu: xr_encode dispatch refused (" + error() + ")");
+            gXrEnc[2]++;
+            return;
+        }
+        keep(xk->table);
+        keep(comp.buffer());
+        keep(dst.buffer());
+        keepAlive(d->target);
+        d->gpu = true;
+        any = true;
+        gXrEnc[0]++;
+    }
+    if (any) gXrEnc[1]++;
 }
 
 // (redfin hmv10) HM_XR_LATE: everything the GPU ran before now (any process's), then the rows decoded

@@ -393,6 +393,7 @@ public:
         // bit 0 LIVE, above it GEN, the draws into it so far: a write-back drops LIVE only if no draw came after its own
         std::atomic<uint64_t> state{0};
         std::mutex wb;                     // one write-back (or decode into it) at a time
+        mutable std::mutex views;          // (redfin hm-int5) a smaller texture's views of it being made
         bool live() const { return (state.load() & 1) != 0; }
         uint64_t drew() {                  // a draw into it: GEN + 1 and LIVE; the new state
             uint64_t old = state.load(), now;
@@ -408,9 +409,21 @@ public:
     std::shared_ptr<XrTarget> xrTarget(Gpu& gpu, bool load, std::string* why) const;
     // the companion when it is live (holds newer texels than the rows), else nullptr
     std::shared_ptr<XrTarget> xrLive() const;
+    // (redfin hm-int5) what a pass draws into and a draw samples in this texture's place: the companion itself, or, when
+    // the companion is its surface's and larger than this texture (a texture over part of a surface), a view of this
+    // texture's region of it (the same origin and rows)
+    const Texture* xrRenderView(const XrTarget& t) const;
+    std::shared_ptr<Texture> xrSampleView(const XrTarget& t) const;
+    // (redfin hm-int5) HM_XR_WB=gpu: xr_encode's table, 131072 words: the 10-bit code of each half (linear, then sRGB)
+    static const std::vector<uint32_t>& xrEncodeTable();
+    // (redfin hm-int5) the region a write-back writes: this texture's size (0 0 when the companion is not its own size)
+    uint32_t xrWidth() const { return desc_.width; }
+    uint32_t xrHeight() const { return desc_.height; }
     // the companion's texels into this texture's rows as XR codes (the GPU is done with the buffer that drew them)
-    void xrWriteBack(const XrTarget& t) const;
+    // (redfin hm-int5) W x H from the start (0: this texture's size): a companion several textures drew through
+    void xrWriteBack(const XrTarget& t, uint32_t w = 0, uint32_t h = 0) const;
     static int xrRenderMode();   // HM_XR_RT: 1 (default) draw through the companion, 0 refuse as before
+    static void setXrWriteBackModeForTesting(int mode);   // (redfin hm-int5) -1: the environment's; 0, 1 (cpu), 2 (gpu)
     static int xrWriteBackMode();   // HM_XR_WB: 1 (default) write back at completion, 0 never (the companion stays live)
 
     // (redfin hmyc) HM_YCBCR=native (the default; cpu: the plug-in's processor copy, as before): a two-plane '420f' /
@@ -480,7 +493,15 @@ private:
     mutable std::shared_ptr<Texture> xrCopy_[2];
     mutable std::atomic<uint32_t> xrNext_{0};
     mutable std::shared_ptr<XrTarget> xrTarget_;   // (redfin hmv4) xrTarget's, under xrLock()
-    void xrDecodeInto(uint8_t* out, uint64_t outPitch) const;   // the rows decoded as RGBA16Float texels
+    void xrDecodeInto(uint8_t* out, uint64_t outPitch) const;
+    // (redfin hm-int5) W x H of the rows from the texture's start (a companion's whole surface, not the texture's size)
+    void xrDecodeRect(uint8_t* out, uint64_t outPitch, uint32_t w, uint32_t h) const;
+    uint32_t surfaceW_ = 0, surfaceH_ = 0;   // (redfin hm-int5) wrapSurface's: the IOSurface's own size (0: not a surface)
+    mutable std::shared_ptr<Texture> xrRtView_, xrSampleView_;   // (redfin hm-int5) this texture's region of a larger companion
+    mutable const XrTarget* xrViewsOf_ = nullptr;
+    mutable std::atomic<bool> xrSaid_{false};   // (redfin hm-int5) HM_XR_TRACE: said once a texture
+    void xrCompanionSize(uint32_t* w, uint32_t* h) const;
+    void xrTrace(const XrTarget& t, bool load) const;   // the rows decoded as RGBA16Float texels
     Ycbcr yc_;                                       // (redfin hmyc) wrapSurfaceYcbcr's
     mutable std::mutex ycLock_;
     mutable uint64_t ycGen_ = 0;                     // the surface's contents (ycbcrTouch)

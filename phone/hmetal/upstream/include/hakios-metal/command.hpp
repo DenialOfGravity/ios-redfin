@@ -406,6 +406,14 @@ public:
     static void xrGpuStats(uint64_t out[6]);
     // (redfin hmv11) tests: 1 / 0 HM_XR_GPU on / off whatever the environment says, -1 the environment's again
     static void setXrGpuForTesting(int on);
+    // (redfin hm-int5) HM_XR_WB=gpu (default): every extended-range companion this buffer drew is written into its
+    // surface's rows by xr_encode (tools/kernels/xr_encode.ll) dispatched at the end of this buffer, at commit: the rows
+    // are whole when its fence passes, ordered on the ring before any later GPU work of any process, and no processor
+    // write-back is left. A companion the kernel could not take is written back on the processor at completion as before.
+    void xrEncodeAppend();
+    // (redfin hm-int5) [0] companions encoded on the GPU, [1] buffers that carried encodes, [2] fallbacks to the
+    // processor, [3] encodes checked against the processor's codes (HM_XR_VERIFY), [4] of them that differed
+    static void xrEncodeStats(uint64_t out[5]);
     // (redfin hmyc) HM_YCBCR=native: the two-plane YCbCr copies this buffer's draws sample, decoded by ycbcr_decode
     // (tools/kernels/ycbcr_decode.ll) in a buffer of their own that submit sends just before this one; what the GPU could
     // not take (HM_YCBCR_GPU=0, no compiler, a dispatch refused) converted on the processor now. nullptr: nothing on the GPU

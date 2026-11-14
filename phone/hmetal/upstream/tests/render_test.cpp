@@ -25,6 +25,7 @@
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
+#include "fixtures/xr_encode_bc.hpp"   // (redfin hm-int5)
 #include "fixtures/end_only.hpp"
 #include "fixtures/tri_attr_vs_air.hpp"
 #include "fixtures/tri_cflat_fs_air.hpp"
@@ -6303,6 +6304,121 @@ TEST(an_extended_range_targets_write_back_is_done_at_completion) {
     CHECK(allPixels(*t, want, 4));
     CommandBuffer::xrStats(s1);
     CHECK_EQ(s1[8] - s0[8], 1u);
+}
+
+// (redfin hm-int5) HM_XR_WB=gpu: xr_encode's table is the processor write-back's codes (round(v * 510 + 384), clamped;
+// the sRGB twin's half beside it), and the kernel compiles
+TEST(the_gpu_encode_table_is_the_processor_write_backs) {
+    const std::vector<uint32_t>& t = Texture::xrEncodeTable();
+    CHECK_EQ(t.size(), 131072u);
+    CHECK_EQ(t[0x0000], 384u);            // +0.0
+    CHECK_EQ(t[0x8000], 384u);            // -0.0
+    CHECK_EQ(t[0x3c00], 894u);            // 1.0
+    CHECK_EQ(t[0x3800], 639u);            // 0.5
+    CHECK_EQ(t[0xb800], 129u);            // -0.5
+    CHECK_EQ(t[0x7c00], 1023u);           // +inf, clamped
+    CHECK_EQ(t[65536 + 0x0000], 384u);    // the sRGB curve's 0 and 1
+    CHECK_EQ(t[65536 + 0x3c00], 894u);
+    CHECK(t[65536 + 0x3800] != t[0x3800]);   // 0.5 linear is not 0.5 encoded
+    if (!hasCompiler()) return;
+    std::string why;
+    auto k = compileAir(kernels::xr_encode_bc, sizeof kernels::xr_encode_bc, &why);
+    CHECK(k != nullptr);
+    if (k == nullptr) {
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK_EQ(k->resources.size(), 4u);
+    CHECK(k->kernel.numWords > 0);
+}
+
+// (redfin hm-int5) HM_XR_WB=gpu: the companion's write-back is a dispatch at the end of the buffer that drew it (one
+// submission, no buffer of its own, no processor write-back at completion), and the companion is settled (no longer
+// live) when that buffer completes. The fake runs no shader, so the rows are not judged here (HM_XR_VERIFY does that on
+// the phone); without a compiler it falls back to the processor
+TEST(an_extended_range_target_is_written_back_by_the_gpu_in_the_same_buffer) {
+    Texture::setXrWriteBackModeForTesting(2);
+    struct Back { ~Back() { Texture::setXrWriteBackModeForTesting(-1); } } back;
+    Rig r;
+    auto t = target(r, 64, 32, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGR10_XR);
+    if (t == nullptr) return;
+    seed(*t);
+    uint64_t s0[10], s1[10], e0[5], e1[5];
+    CommandBuffer::xrStats(s0);
+    CommandBuffer::xrEncodeStats(e0);
+    const uint32_t submits0 = r.fake->stats().submits, dispatches0 = r.fake->stats().dispatches;
+    auto cb = clearOnce(r, clearPass(t.get(), 0.25, 0.5, 1.0, 1.0));
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK(t->xrLive() == nullptr);
+    CommandBuffer::xrStats(s1);
+    CommandBuffer::xrEncodeStats(e1);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(r.fake->stats().submits - submits0, 1u);
+    if (hasCompiler()) {
+        CHECK_EQ(e1[0] - e0[0], 1u);
+        CHECK_EQ(e1[1] - e0[1], 1u);
+        CHECK_EQ(e1[2] - e0[2], 0u);
+        CHECK_EQ(s1[8] - s0[8], 0u);   // no processor write-back
+        CHECK_EQ(r.fake->stats().dispatches - dispatches0, 1u);
+    } else {
+        CHECK_EQ(e1[2] - e0[2], 1u);
+        CHECK_EQ(s1[8] - s0[8], 1u);
+    }
+}
+
+// (redfin hm-int5) HM_XR_SURFACE_SIZE: two textures of different sizes over one 'w30r' surface draw into one companion
+// of the surface's size (the smaller one through a view of its region), and a write-back writes the region drawn: a
+// Clear through the 32 x 8 texture changes those texels of the rows and no other (hm-int4: a companion each, the
+// second replacing the first in the surface's entry)
+TEST(textures_of_two_sizes_over_one_xr_iosurface_share_its_companion_and_write_back_their_region) {
+    Texture::setXrWriteBackModeForTesting(1);
+    struct Back { ~Back() { Texture::setXrWriteBackModeForTesting(-1); } } back;
+    Rig r;
+    r.fake->addSurface(41, 64, 16, 256, 0x77333072u);   // 'w30r'
+    TextureDesc d;
+    d.format = PixelFormat::kBGR10_XR;
+    d.width = 64;
+    d.height = 16;
+    d.usage = kTextureUsageRead | kTextureUsageRenderTarget;
+    std::string why;
+    auto whole = Texture::wrapSurface(*r.gpu, 41, d, &why);
+    d.width = 32;
+    d.height = 8;
+    auto part = Texture::wrapSurface(*r.gpu, 41, d, &why);
+    if (whole == nullptr || part == nullptr) {   // (e2e: the transport's service has no such surface, as the other XR tests)
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    const uint32_t old = 384u | 384u << 10 | 384u << 20;   // 0.0 everywhere
+    auto* rows = static_cast<uint8_t*>(const_cast<void*>(static_cast<const void*>(whole->contents())));
+    for (uint32_t y = 0; y < 16; y++)
+        for (uint32_t x = 0; x < 64; x++) memcpy(rows + 256u * y + 4u * x, &old, 4);
+    auto a = part->xrTarget(*r.gpu, false, &why);
+    auto b = whole->xrTarget(*r.gpu, false, &why);
+    CHECK(a != nullptr && a == b);
+    if (a == nullptr || a != b) return;
+    CHECK_EQ(a->tex->width(), 64u);
+    CHECK_EQ(a->tex->height(), 16u);
+    CHECK_EQ(part->xrRenderView(*a)->width(), 32u);
+    CHECK(whole->xrRenderView(*a) == a->tex.get());
+    auto cb = clearOnce(r, clearPass(part.get(), 0.25, 0.5, 1.0, 1.0));
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    const uint32_t word = 894u | 639u << 10 | 512u << 20;
+    uint32_t inside = 0, outside = 0, wrong = 0;
+    for (uint32_t y = 0; y < 16; y++) {
+        for (uint32_t x = 0; x < 64; x++) {
+            uint32_t v;
+            memcpy(&v, rows + 256u * y + 4u * x, 4);
+            const bool in = x < 32 && y < 8;
+            if (in && v == word) inside++;
+            else if (!in && v == old) outside++;
+            else wrong++;
+        }
+    }
+    CHECK_EQ(inside, 32u * 8u);
+    CHECK_EQ(outside, 64u * 16u - 32u * 8u);
+    CHECK_EQ(wrong, 0u);
 }
 
 // (redfin hmv4) HM_XR_RT: a pass into an extended-range target is drawn into its RGBA16Float companion and, at the

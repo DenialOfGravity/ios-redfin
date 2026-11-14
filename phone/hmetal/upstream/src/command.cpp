@@ -573,6 +573,7 @@ void CommandBuffer::commit() {
     if (status_ > kEnqueued) {
         return;  // Metal asserts here; committing twice does nothing at all in this driver
     }
+    xrEncodeAppend();   // (redfin hm-int5) HM_XR_WB=gpu: the companions' write-backs, the buffer's last work
     queue_.submit(shared_from_this());
 }
 

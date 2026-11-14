@@ -16,6 +16,9 @@ int main(int argc, char** argv) {
         argc -= 2;
     }
     using namespace hakios::metal;
+    // (redfin hm-int5) the fake GPU runs no shader: the suites' write-back checks read the processor's (HM_XR_WB=cpu);
+    // the GPU write-back's own tests ask for it (Texture::setXrWriteBackModeForTesting(2))
+    setenv("HM_XR_WB", "cpu", 0);
     if (want != nullptr && want[0] != 0) {
         if (strcmp(want, "a620") == 0) FakeGpu::defaultChip() = &a6xx::kChipA620;
         else if (strcmp(want, "a635") == 0) FakeGpu::defaultChip() = &a6xx::kChipA635;
