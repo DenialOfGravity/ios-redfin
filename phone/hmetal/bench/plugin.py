@@ -2146,6 +2146,49 @@ HMC_EDITS = [
 ]
 EDITS += HMC_EDITS
 
+# ---- (redfin hm-int4) HMI4_EDITS, applied last ----
+# HM_DENY_WORDS=N (default 24576; 0 off): a kept uber shader whose own fragment program is N instruction words or more is
+# drawn only through its specialisations, as if HM_DENY named it. CoreAnimation's frag.A2Xghfc (fixed_frag_lph_cpf, 30784
+# words on the host, 32064 on the phone) is the one that hung the A620; with a specialisation at ~30 ms on the host
+# (HM_FE_MEMO + HM_SPEC_SHRINK) the deny list need not name it. Said once per program, as the other reasons are:
+#   "blame: ... HM_DENY_WORDS (32064 fragment words, at least 24576); from now on drawn only through programs specialised ..."
+HMI4_DENYW_OLD = '''	} else if (getenv("HM_DENY") != NULL && hm_v7_denied_text(hm_ca_info_of(program))) {
+		why = "HM_DENY";
+	}
+'''
+HMI4_DENYW_NEW = '''	} else if (getenv("HM_DENY") != NULL && hm_v7_denied_text(hm_ca_info_of(program))) {
+		why = "HM_DENY";
+	} else if (hm_deny_words() != 0 && hakios_metal_program_stage_words(program, 1) >= hm_deny_words()) {
+		snprintf(text, sizeof(text), "HM_DENY_WORDS (%u fragment words, at least %u)", hakios_metal_program_stage_words(program, 1),
+			 hm_deny_words());   /* (redfin hm-int4) */
+		why = text;
+	}
+'''
+HMI4_DENYW_HELPER_OLD = '''/* YES when TEXT holds one of HM_DENY's comma-separated words */
+'''
+HMI4_DENYW_HELPER_NEW = '''/* (redfin hm-int4) HM_DENY_WORDS: the fragment size from which a kept uber shader is drawn only specialised (0: off) */
+static unsigned
+hm_deny_words(void)
+{
+	static int words = -1;
+
+	if (words < 0) {
+		const char *e = getenv("HM_DENY_WORDS");
+
+		words = e != NULL && e[0] != '\\0' ? atoi(e) : 24576;
+		if (words < 0) words = 0;
+	}
+	return (unsigned)words;
+}
+
+/* YES when TEXT holds one of HM_DENY's comma-separated words */
+'''
+HMI4_EDITS = [
+    (HMI4_DENYW_HELPER_OLD, HMI4_DENYW_HELPER_NEW),
+    (HMI4_DENYW_OLD, HMI4_DENYW_NEW),
+]
+EDITS += HMI4_EDITS
+
 
 def apply(src, edits=EDITS):
     for e in edits:

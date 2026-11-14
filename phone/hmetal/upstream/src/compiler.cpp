@@ -416,8 +416,55 @@ bool forwardConstantScratch(nir_shader* nir) {
 }
 
 bool scratchFoldOn() { return envOn("HM_SCRATCH_FOLD", false); }
+// (redfin hm-int4) HM_FC_OUTPUT_FOLD=1 (default): the front end leaves out a colour output whose air.function_constant
+// predicate the pipeline's constants make false, and llvm.used lists no longer keep the implicit predicates from folding
+// (umi 05f7477 air_to_nir.c, MIT). 0: every output written, as in hm-int3. Part of the stage cache's key with
+// HM_SCRATCH_FOLD (codegenFlags).
+bool fcOutputFoldOn() { return envOn("HM_FC_OUTPUT_FOLD", true); }
+uint32_t codegenFlags() { return (scratchFoldOn() ? 1u : 0u) | (fcOutputFoldOn() ? 0u : 2u); }
 
-bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
+// (redfin hm-int4) HM_FE_MEMO=1 (default): the front end's NIR of a stage that is specialised (compileStage with a
+// KnownBuffer) is kept, and every later specialisation of the same bitcode + constants starts from a clone of it instead
+// of translating the AIR again (CoreAnimation's fixed_frag_lph_cpf: ~100 ms of a ~370 ms specialisation on the host).
+// At most kFeMemoMax functions are kept, for the life of the process (their NIR and the front end's info, a few MB
+// each); later ones translate as before. The same entry answers knownReadMask. 0: translate every time, as hm-int3.
+struct FrontEndMemo {
+    uint64_t hash = 0;
+    size_t size = 0;
+    uint32_t flags = 0;
+    std::vector<std::pair<uint32_t, uint64_t>> constants;
+    void* mem = nullptr;
+    nir_shader* nir = nullptr;
+    air_shader_info info{};
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> readMasks;   // binding -> its bytes read (1) or not (0)
+};
+constexpr size_t kFeMemoMax = 8;
+std::mutex gFeMemoLock;
+std::vector<FrontEndMemo*> gFeMemo;
+bool feMemoOn() { return envOn("HM_FE_MEMO", true); }
+uint64_t feHash(const void* bitcode, size_t size) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t* p = static_cast<const uint8_t*>(bitcode);
+    for (size_t i = 0; i < size; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+std::vector<std::pair<uint32_t, uint64_t>> feConstants(const FunctionConstants& supplied) {
+    std::vector<std::pair<uint32_t, uint64_t>> c;
+    for (const FunctionConstant& f : supplied) c.emplace_back(f.index, f.bits);
+    std::sort(c.begin(), c.end());
+    return c;
+}
+// (under gFeMemoLock)
+FrontEndMemo* feMemoFind(uint64_t hash, size_t size, const std::vector<std::pair<uint32_t, uint64_t>>& constants) {
+    const uint32_t flags = codegenFlags();
+    for (FrontEndMemo* m : gFeMemo) {
+        if (m->hash == hash && m->size == size && m->flags == flags && m->constants == constants) return m;
+    }
+    return nullptr;
+}
+
+bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr,
+               bool memoWanted = false, FrontEndMemo** memoOut = nullptr) {
     t.mem = ralloc_context(nullptr);
     air_constant_value* constants = nullptr;
     unsigned numConstants = air_module_function_constants(t.mem, bitcode, size, &constants);
@@ -432,12 +479,46 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
     air_to_nir_options options{};
     options.constants = constants;
     options.num_constants = numConstants;
+    options.keep_false_outputs = !fcOutputFoldOn();   // (redfin hm-int4) HM_FC_OUTPUT_FOLD=0
     const char* error = nullptr;
     const uint64_t t0 = monoNs();
-    t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
+    // (redfin hm-int4) HM_FE_MEMO: a specialisation starts from the kept front-end NIR of its function
+    const bool memo = (known != nullptr || memoWanted) && feMemoOn();
+    bool fromMemo = false;
+    if (memo) {
+        const uint64_t hash = feHash(bitcode, size);
+        const auto key = feConstants(supplied);
+        std::lock_guard<std::mutex> g(gFeMemoLock);
+        FrontEndMemo* m = feMemoFind(hash, size, key);
+        if (m == nullptr && gFeMemo.size() < kFeMemoMax) {
+            m = new FrontEndMemo;
+            m->hash = hash;
+            m->size = size;
+            m->flags = codegenFlags();
+            m->constants = key;
+            m->mem = ralloc_context(nullptr);
+            m->nir = air_to_nir(m->mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &m->info, &error);
+            if (m->nir == nullptr) {
+                ralloc_free(m->mem);
+                delete m;
+                m = nullptr;
+                tTranslateNs += monoNs() - t0;
+                return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
+            }
+            gFeMemo.push_back(m);
+        }
+        if (m != nullptr) {
+            t.nir = nir_shader_clone(t.mem, m->nir);
+            t.info = m->info;   // (its arrays live in the memo's context, which is never freed)
+            if (memoOut != nullptr) *memoOut = m;
+            fromMemo = true;
+        }
+    }
+    if (!fromMemo) t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
     const uint64_t t1 = monoNs();
     tTranslateNs += t1 - t0;
     if (t.nir == nullptr) return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
+    if (memoWanted) return true;   // (knownReadMask: the NIR as the front end made it)
     // the known buffer's reads folded, its offsets folded first (a field's offset is the front end's arithmetic on the
     // pointer), until nothing more folds: a value read may decide the offset of another read
     // (called directly, not under NIR_PASS: a debug build validates the whole shader after each, and an uber shader
@@ -461,6 +542,25 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
             progress = forwardConstantScratch(t.nir) || progress;
             progress = nir_opt_dead_cf(t.nir) || progress;
             progress = nir_opt_dce(t.nir) || progress;
+        }
+    }
+    // (redfin hm-int4) HM_SPEC_SHRINK=1 (default): a specialisation's folded values reach its branches here, before
+    // ir3's passes see the whole uber shader. The front end's locals are memory (derefs) until nir_lower_vars_to_ssa, so
+    // the values read from the known buffer only decide the branches once they are SSA; dead_cf then drops the paths the
+    // configuration does not take. ir3_finalize_nir would get there too, through every pass over ~24 000 instructions.
+    // The passes are NIR's own, in the order its optimisation loops run them. 0: as hm-int3.
+    if (known != nullptr && envOn("HM_SPEC_SHRINK", true)) {
+        for (int round = 0; round < 16; round++) {
+            bool progress = false;
+            progress = nir_split_var_copies(t.nir) || progress;
+            progress = nir_lower_var_copies(t.nir) || progress;
+            progress = nir_lower_vars_to_ssa(t.nir) || progress;
+            nir_copy_prop(t.nir);
+            progress = nir_opt_constant_folding(t.nir) || progress;
+            progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+            progress = nir_opt_dead_cf(t.nir) || progress;
+            progress = nir_opt_dce(t.nir) || progress;
+            if (!progress) break;
         }
     }
     tFoldNs += monoNs() - t1;
@@ -843,9 +943,27 @@ bool usesSubgroup(nir_shader* nir) {
     return false;
 }
 
+// (redfin hm-int4) HM_COMPILE_PHASES=1: each phase of compileVariant's time on stderr (host diagnosis: hm-seed time)
+struct PhaseClock {
+    const bool on = getenv("HM_COMPILE_PHASES") != nullptr && atoi(getenv("HM_COMPILE_PHASES")) > 0;
+    uint64_t at = monoNs();
+    void mark(const char* what, nir_shader* nir) {
+        if (!on) return;
+        const uint64_t now = monoNs();
+        unsigned n = 0;
+        if (nir != nullptr) {
+            nir_foreach_function_impl(impl, nir) { nir_foreach_block(block, impl) { nir_foreach_instr(instr, block) { (void)instr; n++; } } }
+        }
+        std::fprintf(stderr, "  phase %-28s %7.1f ms  (%u NIR instructions after)\n", what, (now - at) / 1e6, n);
+        at = now;
+    }
+};
+
 bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     ir3_compiler* compiler = theCompiler();
     nir_shader* nir = t.nir;
+    PhaseClock clock;
+    clock.mark("(start)", nir);
     // what the consumer owes before ir3: the front end emits NIR's own system values, as the SPIR-V one does
     nir_lower_system_values(nir);
     nir_lower_compute_system_values(nir, nullptr);   // a no-op outside compute, run for every stage as ir3_cmdline.c runs it
@@ -865,7 +983,9 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     nir_shader_intrinsics_pass(nir, lowerHalfDerivative, nir_metadata_control_flow, nullptr);
     nir_shader_instructions_pass(nir, lowerUclz, nir_metadata_control_flow, nullptr);
     ir3_nir_lower_io_to_temporaries(nir);
+    clock.mark("lower_io_to_temporaries", nir);
     ir3_finalize_nir(compiler, &nirOptions, nir);
+    clock.mark("ir3_finalize_nir", nir);
     if (!lowerFbRead(nir, t.fbTargets, why)) return false;
 
     t.shader = static_cast<ir3_shader*>(rzalloc_size(nullptr, sizeof(ir3_shader)));
@@ -873,6 +993,7 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     t.shader->type = nir->info.stage;
     t.shader->nir = nir;
     ir3_nir_post_finalize(t.shader);
+    clock.mark("ir3_nir_post_finalize", nir);
     // (and what the widening left -- f2f16 of an f2f32 -- folded as ir3's own passes leave nothing to fold: its variant
     // lowering asserts that the loop has no more to do)
     if (nir_shader_intrinsics_pass(nir, widenHalfVarying, nir_metadata_control_flow, nullptr)) {
@@ -914,11 +1035,13 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     t.shader->variant_count = 1;
     if (nir->info.stage == MESA_SHADER_FRAGMENT && needsQuadHelpers(nir)) nir->info.fs.needs_quad_helper_invocations = true;
     if (ir3_compile_shader_nir(compiler, t.shader, v) != 0) return refuse(why, std::string("ir3 refused ") + t.name());
+    clock.mark("ir3_compile_shader_nir", nullptr);
     {
         std::string name = t.name();
         if (!fixPrefetchSamplers(nir, v, &name, why)) return false;
     }
     t.bin = static_cast<uint32_t*>(ir3_shader_assemble(v));
+    clock.mark("assemble", nullptr);
     if (t.bin == nullptr) return refuse(why, std::string("ir3 compiled ") + t.name() + " and could not assemble it");
     return true;
 }
@@ -1359,7 +1482,7 @@ constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
 // bundle swap no longer empties it. A forgotten bump is what HM_CACHE_VERIFY=N is for. HM_CACHE_KEY=build: the old
 // key, the hash of this file, the headers and the Mesa archives (HAKIOS_METAL_CACHE_BUILD), empty after any core change.
 #ifndef HAKIOS_METAL_CACHE_FORMAT
-#define HAKIOS_METAL_CACHE_FORMAT 2   // 2: hm-int3 (ycbcr_decode + hm-cache codegen; kernels cached)
+#define HAKIOS_METAL_CACHE_FORMAT 3   // 2: hm-int3 (ycbcr_decode + hm-cache codegen; kernels cached); 3: hm-int4 (fc output fold)
 #endif
 #ifndef HAKIOS_METAL_MESA_ID
 #define HAKIOS_METAL_MESA_ID "unknown-mesa"
@@ -1406,7 +1529,7 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
     Hash128 h;
     // (redfin hm-cache) and the chip: the host's hm-seed compiles for the phone's (--chip), the tests for two
-    const uint32_t layout[5] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u};
+    const uint32_t layout[5] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, a6xx::chip().chipId, codegenFlags()};
     const char* key = cacheKeyText();
     h.mix(key, strlen(key));
     h.mix(layout, sizeof(layout));
@@ -1789,7 +1912,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     std::string memoKey = name;
     if (memoKey.empty() && memoOn()) {
         Hash128 h;
-        const uint32_t chip[2] = {a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u};
+        const uint32_t chip[2] = {a6xx::chip().chipId, codegenFlags()};
         h.mix(chip, sizeof(chip));
         h.mix(bitcode, size);
         for (const FunctionConstant& c : constants) {
@@ -2007,7 +2130,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
     std::string memoKey = name;
     if (memoKey.empty() && memoOn()) {
         Hash128 h;
-        const uint32_t chip[3] = {a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u, kKernelCacheTag};
+        const uint32_t chip[3] = {a6xx::chip().chipId, codegenFlags(), kKernelCacheTag};
         h.mix(chip, sizeof(chip));
         h.mix(bitcode, size);
         for (const FunctionConstant& c : constants) {

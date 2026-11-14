@@ -158,7 +158,7 @@ int timeOne(int argc, char** argv) {
         return 2;
     }
     std::printf("hm-seed: %s: %llu bytes of bitcode, %zu constants\n", fn.c_str(), (unsigned long long)len, constants.size());
-    for (int pass = 0; pass < (hasKnown ? 2 : 1); pass++) {
+    for (int pass = (hasKnown && getenv("HM_SEED_SKIP_WHOLE") != nullptr) ? 1 : 0; pass < (hasKnown ? 2 : 1); pass++) {
         for (int i = 0; i < n; i++) {
             const CompileStats a = compileStats();
             timespec w0, w1, c0, c1;
@@ -169,9 +169,13 @@ int timeOne(int argc, char** argv) {
             clock_gettime(CLOCK_MONOTONIC, &w1);
             clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c1);
             const CompileStats b = compileStats();
+            if (s && getenv("HM_SEED_LISTING") != nullptr) std::printf("%s\n", s->listing.c_str());   // (redfin hm-int4)
             if (useCache) std::printf("  hits %u (memo %u, seed %u), misses %u\n", b.hits - a.hits, b.memoHits - a.memoHits, b.seedHits - a.seedHits, b.misses - a.misses);
-            std::printf("  %s #%d: %s %zu words, wall %.1f ms, cpu %.1f ms; front end %.1f, folding %.1f, rest %.1f ms\n",
-                        pass ? "specialised" : "whole", i, s ? "ok" : why.c_str(), s ? s->words.size() : size_t(0), ms(w0, w1), ms(c0, c1),
+            uint64_t sum = 1469598103934665603ull;   // (redfin hm-int4) the words' FNV-1a, to compare two ways of compiling
+            if (s) for (uint32_t w : s->words) sum = (sum ^ w) * 1099511628211ull;
+            if (s) for (uint32_t w : s->immediates) sum = (sum ^ w) * 1099511628211ull;
+            std::printf("  %s #%d: %s %zu words (fnv %016llx), wall %.1f ms, cpu %.1f ms; front end %.1f, folding %.1f, rest %.1f ms\n",
+                        pass ? "specialised" : "whole", i, s ? "ok" : why.c_str(), s ? s->words.size() : size_t(0), (unsigned long long)sum, ms(w0, w1), ms(c0, c1),
                         (b.translateNs - a.translateNs) / 1e6, (b.foldNs - a.foldNs) / 1e6,
                         ms(w0, w1) - (b.translateNs - a.translateNs) / 1e6 - (b.foldNs - a.foldNs) / 1e6);
         }

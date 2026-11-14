@@ -559,6 +559,12 @@ struct air_to_nir_options {
     * air.simd_ballot), and the layout of a set is in the metadata alone.
     */
    bool interface_only;
+
+   /* (redfin hm-int4) false: an output whose air.function_constant predicate
+    * the supplied constants make false is not written, and llvm.used lists do
+    * not keep a global from folding (umi 05f7477). true: every output written
+    * and llvm.used counted as an access, as before (HM_FC_OUTPUT_FOLD=0). */
+   bool keep_false_outputs;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

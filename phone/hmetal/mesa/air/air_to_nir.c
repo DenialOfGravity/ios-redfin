@@ -2638,6 +2638,8 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
    var->data.driver_location = c->nir->num_outputs++;
    c->outputs[field].location = location;
    c->outputs[field].index = index;
+   const struct air_md *fc = md_key_node(node, "air.function_constant");
+   c->outputs[field].predicate = fc && fc->num_ops && fc->ops[0] ? fc->ops[0]->value : NULL;
    c->outputs[field].var = var;
    return true;
 }
@@ -3693,6 +3695,23 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
             return air_error(c, "interface: field %u of the result has no output", i);
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
+         /* (redfin hm-int4, from umi 05f7477, MIT) An output under an
+          * air.function_constant predicate that the pipeline's constants make
+          * false does not exist in the specialised function: Metal's compiler
+          * drops it, and so does this. iOS 16's CoreAnimation uber shader
+          * returns all three colour targets, each gated (frg_has_color0..2,
+          * computed in its air.static_init from fc_attachment_count,
+          * fc_dest_index ...); the ones it does not draw to it fills with what
+          * it fetched from them, so writing them anyway reads and writes every
+          * attachment of the pass. A predicate whose value is not known here
+          * (the pipeline did not supply its constants) leaves the output
+          * written, as before. options->keep_false_outputs (HM_FC_OUTPUT_FOLD=0)
+          * writes them all, as before. */
+         if (!(c->options && c->options->keep_false_outputs)) {
+            struct air_global_plan *pred = foldable_global_plan(c, c->outputs[i].predicate);
+            if (pred && pred->known && pred->bits == 0)
+               continue;
+         }
          nir_def *d = v->elems[i]->def;
          if (io_is_boolean(rt->members[i]) && d->bit_size == 1)
             d = nir_b2iN(&c->b, d, 32);   /* see io_is_boolean */
@@ -5968,8 +5987,12 @@ plan_global_folding(struct air_ctx *c)
       bool ok = true;
       unsigned stores = 0;
 
+      /* (redfin hm-int4, from umi 05f7477) llvm.used / llvm.compiler.used
+       * are lists for the linker that keep the implicit predicates alive;
+       * naming a global there is no access. Off with keep_false_outputs. */
       for (unsigned k = 0; ok && k < c->m->num_globals; k++) {
-         if (k != i && const_mentions(c->m->globals[k]->init, &g->base, 8))
+         if (k != i && ((c->options && c->options->keep_false_outputs) || !c->global_plan[k].skip) &&
+             const_mentions(c->m->globals[k]->init, &g->base, 8))
             ok = false;
       }
 

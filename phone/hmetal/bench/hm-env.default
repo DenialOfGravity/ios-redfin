@@ -1,4 +1,4 @@
-# /var/local/hmetal/env (hm-int3): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
+# /var/local/hmetal/env (hm-int4): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
 # KEY=V        backboardd's
 # *:KEY=V      every hakios-metal process (backboardd too)
 # NAME:KEY=V   the process NAME (getprogname)
@@ -11,7 +11,6 @@ HM_CB_PAD=2
 HM_UBWC_RT=0
 HM_GMEM=0
 HM_TRACE=0
-HM_DENY=A2Xghfc
 HM_HANG_BLAME=1
 
 # CoreAnimation prefs the dispatcher sets in every hakios-metal process (0 = set false, as SweetMetal2 does; 1 = CA's own)
@@ -31,6 +30,17 @@ HM_HANG_BLAME=1
 HM_PREWARM=1
 
 # ---- opt-ins and switches at their compiled default (uncomment to change) ----
+# (hm-int4) the deny list is empty: an uber shader of HM_DENY_WORDS fragment words or more (default 24576: CA's
+# frag.A2Xghfc, 32064) is drawn only through its specialisations, which take ~30 ms on the host (HM_FE_MEMO, HM_SPEC_SHRINK)
+# instead of 300-530 ms. HM_DENY=A2Xghfc (hm-int3's line) still works and changes nothing beside it.
+#HM_DENY=A2Xghfc
+#HM_DENY_WORDS=24576
+# (hm-int4) the specialiser: the front end's NIR kept per uber shader (HM_FE_MEMO=1), the folded configuration's dead paths
+# dropped before ir3 (HM_SPEC_SHRINK=1), colour outputs under a false function-constant predicate left out (HM_FC_OUTPUT_FOLD=1,
+# part of the cache key); 0 restores hm-int3's way for each
+#HM_FE_MEMO=0
+#HM_SPEC_SHRINK=0
+#HM_FC_OUTPUT_FOLD=0
 # two-plane YCbCr ('420f'/'420v') surfaces: native = decoded on the GPU by ycbcr_decode (default); cpu = the processor copy
 #*:HM_YCBCR=cpu
 # an unseen configuration of a denied uber shader specialised on the queue, its draws left out meanwhile (default 0: waited for)

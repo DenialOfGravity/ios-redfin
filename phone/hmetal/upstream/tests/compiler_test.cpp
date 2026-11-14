@@ -1370,6 +1370,35 @@ TEST(a_stage_compiled_for_its_constant_buffer_reads_none_of_it) {
     CHECK(other != nullptr && other->listing.find("c0.x") != std::string::npos);
 }
 
+// (redfin hm-int4) a specialisation through the front-end memo (HM_FE_MEMO) and the early shrink (HM_SPEC_SHRINK) is the
+// same program as hm-int3's, word for word, the first time and from the memo
+TEST(a_specialisation_through_the_front_end_memo_and_the_shrink_is_the_plain_one) {
+    if (!hasCompiler()) return;
+    std::vector<uint8_t> bc = bitcodeOf("tri_cflat_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    const float c[4] = {0.125f, 0.375f, 0.625f, 0.875f};   // (a configuration of its own: no other test's stage memo entry)
+    KnownBuffer known;
+    known.binding = 0;
+    known.bytes.assign(reinterpret_cast<const uint8_t*>(c), reinterpret_cast<const uint8_t*>(c) + 16);
+    std::string why;
+    setenv("HM_STAGE_MEMO", "0", 1);
+    setenv("HM_FE_MEMO", "0", 1);
+    setenv("HM_SPEC_SHRINK", "0", 1);
+    auto plain = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    unsetenv("HM_FE_MEMO");
+    unsetenv("HM_SPEC_SHRINK");
+    auto first = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    auto again = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    unsetenv("HM_STAGE_MEMO");
+    CHECK(plain != nullptr && first != nullptr && again != nullptr);
+    if (plain == nullptr || first == nullptr || again == nullptr) return;
+    CHECK(plain->words == first->words);
+    CHECK(plain->words == again->words);
+    CHECK(plain->immediates == first->immediates);
+    CHECK(first->listing.find("c0.") == std::string::npos);
+}
+
 TEST(a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less) {
     Kernel with{}, without{};
     with.pvtmemSize = 512, with.maxReg = 47;
