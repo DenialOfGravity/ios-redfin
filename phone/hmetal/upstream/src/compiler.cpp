@@ -72,6 +72,10 @@ std::mutex gBackgroundCompilerLock;   // (redfin hm-cache) the background thread
 // (redfin hm-cache) where a compile's time goes, this thread's totals (CompileStats): the front end, the known buffer's
 // folding (a specialisation), and the rest (ir3 and the stage's tables)
 thread_local uint64_t tTranslateNs = 0, tFoldNs = 0;
+bool envOn(const char* name, bool fallback) {
+    const char* e = getenv(name);
+    return e == nullptr || e[0] == 0 ? fallback : atoi(e) != 0;
+}
 uint64_t monoNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 
 // one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row and
@@ -298,6 +302,116 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
     return true;
 }
 
+// (redfin hm-cache) HM_SCRATCH_FOLD=1 (default 0 until tested on the phone): from xm6661885/hakios-xnu-kernel-umi-fixes
+// 05f7477 hakios-metal/src/compiler.cpp (MIT), unchanged but for this note. On the host it takes a specialisation of
+// fixed_frag_lph_cpf from ~530 ms to ~200 ms (ir3's part from ~390 ms to ~7 ms): the uber shader's configuration
+// struct, copied into scratch by its static_init, is answered at compile time and the branches on it fold away. The
+// value is part of the stage cache's key (stageCacheName), so a stage compiled either way is never taken for the other.
+// A load of private memory (scratch) at a constant offset whose bytes are known: every store that writes them is a
+// constant at a constant offset in ONE block outside any loop, that block runs before the load (it dominates it, or it
+// is the load's own and the stores come first), and the reaching store of each byte is the last of them there. This
+// is how iOS 16.5's CoreAnimation uber shaders specialise. Their air.static_init copies the 58 function constants into
+// program-scope variables, the 31 of the FragmentShaderConfig into ONE zero-initialised struct
+// (fc_fragment_shader_config) field by field. The front end folds a scalar such variable (plan_global_folding); the
+// struct goes to scratch, so without this every branch on texture_function, blend_function, dest_index ... stayed in
+// the code -- 22 000 lines of NIR, every texture slot taken, and "reads its render targets through slots past the 16"
+// for every specialisation. Sound only while no store can reach a byte the scan did not see: one store at a
+// non-constant offset turns the pass off, and a byte also written by a value not constant, or in a second block or a
+// loop, is never answered.
+bool inLoop(nir_block* block) {
+    for (nir_cf_node* n = block->cf_node.parent; n != nullptr; n = n->parent)
+        if (n->type == nir_cf_node_loop) return true;
+    return false;
+}
+
+bool forwardConstantScratch(nir_shader* nir) {
+    struct Write { nir_intrinsic_instr* store; uint8_t value; bool constant; };
+    std::vector<std::vector<Write>> bytes;
+    bool usable = true, loads = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_metadata_require(impl, nir_metadata_dominance | nir_metadata_instr_index);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic == nir_intrinsic_load_scratch) {
+                    loads = true;
+                    continue;
+                }
+                if (in->intrinsic != nir_intrinsic_store_scratch) continue;
+                if (!nir_src_is_const(in->src[1]) || in->src[0].ssa->bit_size % 8 != 0) {
+                    usable = false;
+                    continue;
+                }
+                const unsigned width = in->src[0].ssa->bit_size / 8, mask = nir_intrinsic_write_mask(in);
+                const uint64_t at = nir_src_as_uint(in->src[1]);
+                const bool constant = nir_src_is_const(in->src[0]);
+                for (unsigned c = 0; c < in->src[0].ssa->num_components && usable; c++) {
+                    if (!(mask & (1u << c))) continue;
+                    const uint64_t v = constant ? nir_src_comp_as_uint(in->src[0], c) : 0;
+                    for (unsigned k = 0; k < width; k++) {
+                        const uint64_t at_b = at + c * width + k;
+                        if (at_b >= (1u << 20)) {
+                            usable = false;
+                            break;
+                        }
+                        if (at_b >= bytes.size()) bytes.resize(at_b + 1);
+                        bytes[at_b].push_back(Write{in, uint8_t(v >> (8 * k)), constant});
+                    }
+                }
+            }
+        }
+    }
+    if (!usable || !loads || bytes.empty()) return false;
+    bool progress = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_builder b = nir_builder_create(impl);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic != nir_intrinsic_load_scratch || !nir_src_is_const(in->src[0]) || in->def.bit_size % 8 != 0) continue;
+                const unsigned width = in->def.bit_size / 8, comps = in->def.num_components;
+                const uint64_t at = nir_src_as_uint(in->src[0]);
+                if (at + uint64_t(width) * comps > bytes.size()) continue;
+                bool ok = true;
+                nir_const_value values[NIR_MAX_VEC_COMPONENTS];
+                for (unsigned c = 0; c < comps && ok; c++) {
+                    uint64_t v = 0;
+                    for (unsigned k = 0; k < width && ok; k++) {
+                        const Write* reaching = nullptr;
+                        for (const Write& w : bytes[at + c * width + k]) {
+                            nir_block* wb = w.store->instr.block;
+                            ok = w.constant && nir_cf_node_get_function(&wb->cf_node) == impl && !inLoop(wb) &&
+                                 (reaching == nullptr || reaching->store->instr.block == wb);
+                            if (!ok) break;
+                            const bool before = wb == block ? w.store->instr.index < instr->index : nir_block_dominates(wb, block);
+                            if (!before) {
+                                ok = wb != block;   // after the load in its own block: it does not reach the load
+                                if (!ok) break;
+                                ok = false;          // in a block that does not run first: not answered
+                                break;
+                            }
+                            if (reaching == nullptr || reaching->store->instr.index < w.store->instr.index) reaching = &w;
+                        }
+                        ok = ok && reaching != nullptr;
+                        if (ok) v |= uint64_t(reaching->value) << (8 * k);
+                    }
+                    values[c] = nir_const_value_for_raw_uint(v, in->def.bit_size);
+                }
+                if (!ok) continue;
+                b.cursor = nir_before_instr(instr);
+                nir_def_replace(&in->def, nir_build_imm(&b, comps, in->def.bit_size, values));
+                progress = true;
+            }
+        }
+        nir_metadata_preserve(impl, nir_metadata_control_flow);
+    }
+    return progress;
+}
+
+bool scratchFoldOn() { return envOn("HM_SCRATCH_FOLD", false); }
+
 bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
     t.mem = ralloc_context(nullptr);
     air_constant_value* constants = nullptr;
@@ -324,10 +438,25 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
     // (called directly, not under NIR_PASS: a debug build validates the whole shader after each, and an uber shader
     // takes rounds of this. nir_copy_prop's own answer does not count: on CoreAnimation's uber shader it says it made
     // progress every time, 21 000 rounds and on)
-    for (bool progress = known != nullptr; progress;) {
+    bool scratch = false;
+    if (scratchFoldOn()) {   // (redfin hm-cache) HM_SCRATCH_FOLD: the constant scratch struct too (forwardConstantScratch)
+        nir_foreach_function_impl(impl, t.nir) {
+            nir_foreach_block(block, impl) {
+                nir_foreach_instr(instr, block) {
+                    scratch |= instr->type == nir_instr_type_intrinsic && nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scratch;
+                }
+            }
+        }
+    }
+    for (bool progress = known != nullptr || scratch; progress;) {
         nir_copy_prop(t.nir);
         progress = nir_opt_constant_folding(t.nir);
-        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        if (known != nullptr) progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        if (scratch) {
+            progress = forwardConstantScratch(t.nir) || progress;
+            progress = nir_opt_dead_cf(t.nir) || progress;
+            progress = nir_opt_dce(t.nir) || progress;
+        }
     }
     tFoldNs += monoNs() - t1;
     return true;
@@ -1236,10 +1365,6 @@ const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
 #else
 const char* const kCacheBuild = __DATE__ " " __TIME__;
 #endif
-bool envOn(const char* name, bool fallback) {
-    const char* e = getenv(name);
-    return e == nullptr || e[0] == 0 ? fallback : atoi(e) != 0;
-}
 const char* cacheKeyText() {
     static const char* key = [] {
         const char* e = getenv("HM_CACHE_KEY");
@@ -1274,7 +1399,7 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
     Hash128 h;
     // (redfin hm-cache) and the chip: the host's hm-seed compiles for the phone's (--chip), the tests for two
-    const uint32_t layout[4] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, a6xx::chip().chipId};
+    const uint32_t layout[5] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u};
     const char* key = cacheKeyText();
     h.mix(key, strlen(key));
     h.mix(layout, sizeof(layout));
@@ -1639,8 +1764,8 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     std::string memoKey = name;
     if (memoKey.empty() && memoOn()) {
         Hash128 h;
-        const uint32_t chip = a6xx::chip().chipId;
-        h.mix(&chip, sizeof(chip));
+        const uint32_t chip[2] = {a6xx::chip().chipId, scratchFoldOn() ? 1u : 0u};
+        h.mix(chip, sizeof(chip));
         h.mix(bitcode, size);
         for (const FunctionConstant& c : constants) {
             h.mix(&c.index, sizeof(c.index));
