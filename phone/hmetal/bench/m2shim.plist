@@ -7,7 +7,7 @@
 	<key>CFBundleName</key><string>SweetMetal2</string>
 	<key>CFBundlePackageType</key><string>BNDL</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-	<key>CFBundleShortVersionString</key><string>0.1-hmca-shim</string>
+	<key>CFBundleShortVersionString</key><string>0.2-hm-int2</string>
 	<key>CFBundleVersion</key><string>1</string>
 	<key>NSPrincipalClass</key><string>SweetMTL2Device</string>
 </dict>

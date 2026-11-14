@@ -55,10 +55,11 @@ ${HOSTCC:-cc} -Wno-format-truncation -o "$O/obj/m2shim_test" m2shim_test.c && "$
 S=$O/SweetMetal2-shim.bundle
 rm -rf "$S" && mkdir -p "$S"
 "$CC" -x objective-c -fno-objc-arc -O2 -g -Wall -Wno-deprecated-declarations -bundle -o "$S/SweetMetal2" m2shim.m \
-	-lobjc -framework Foundation -framework Metal 2>&1 | grep -v "was built for newer 'iOS' version" || true
+	-lobjc -framework Foundation -framework CoreFoundation -framework Metal 2>&1 | grep -v "was built for newer 'iOS' version" || true
 [ -f "$S/SweetMetal2" ]
 strip -x "$S/SweetMetal2" 2>/dev/null || true
 cp m2shim.plist "$S/Info.plist"
+cp hm-env.default "$O/hm-env.default"	# (hm-int2) the env file template -> /var/local/hmetal/env
 codesign -f -s - "$S" 2>/dev/null || codesign -f -s - "$S/SweetMetal2" 2>/dev/null || true
 rm -rf "$O/obj"
 (cd "$O" && { sha256sum hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2 2>/dev/null ||

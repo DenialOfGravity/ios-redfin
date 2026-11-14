@@ -1,0 +1,19 @@
+# /var/local/hmetal/env (hm-int2): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
+# KEY=V        backboardd's
+# *:KEY=V      every hakios-metal process (backboardd too)
+# NAME:KEY=V   the process NAME (getprogname)
+# Keys HAKIOS_METAL_* and HM_* only. Applied in file order, the last one wins.
+
+# backboardd: as on the phone since var12, HM_TRACE now off (1: on; the log rotates at 16 MB -> bbd-hm.log.1)
+HAKIOS_METAL_CA_PICK=exact
+HM_CB_PAD=2
+HM_UBWC_RT=0
+HM_GMEM=0
+HM_TRACE=0
+HM_DENY=A2Xghfc
+HM_HANG_BLAME=1
+
+# CoreAnimation prefs the dispatcher sets in every hakios-metal process (0 = set false, as SweetMetal2 does; 1 = CA's own)
+*:HM_CA_DEEP_FB=0
+*:HM_CA_FB_COMPRESSION=0
+*:HM_CA_IOSURFACE_COMPRESSION=0

@@ -99,7 +99,7 @@ Logs `/var/local/hmetal/bench-<dev>.log`, lines `RESULT dev wl draws enc_us us/d
   signature attached to the vnode ("code signature does not cover entire file").
 - First numbers and the frame comparison: project folder logs/hmetal/bench-summary-2026-11-06.md.
 
-## Dispatcher: every process on hakios-metal, SweetMetal2 as the fallback (hmapp, bench/m2shim.m)
+## Dispatcher: every process on hakios-metal, SweetMetal2 as the fallback (hmapp, hm-int2; bench/m2shim.m)
 
 The kernel's IOAccelerator names SweetMetal2 (MetalPluginName/MetalPluginClassName = SweetMetal2 / SweetMTL2Device), so
 Metal opens `/System/Library/Extensions/SweetMetal2.bundle` in every process. Its executable is the dispatcher
@@ -110,20 +110,36 @@ Metal opens `/System/Library/Extensions/SweetMetal2.bundle` in every process. It
 | `lib/HakiosMetal.bundle` | hakios-metal (before the switch: `ca/HakiosMetal.bundle`, used when lib/ lacks it) |
 | `lib/SweetMetal2.bundle` | the real SweetMetal2 (before the switch: `/var/local/SweetMetal2.bundle.pre-hmca`) |
 | `env` | the one env file (before the switch: `ca/env`). `KEY=V` backboardd's (as before); `*:KEY=V` every hakios-metal process; `NAME:KEY=V` one process. Keys HAKIOS_METAL_* and HM_* only. |
-| `all-off` | exists: every process on SweetMetal2 (backboardd still follows `ca/bbd-hm`) |
+| `hm-off` | exists: every process, backboardd too, on SweetMetal2 (the operator's global off switch) |
 | `m2-procs` | names kept on SweetMetal2 (one a line, `#` comments, `*` = all) |
-| `hm-only` | exists: only the names it lists go to hakios-metal (staged roll-out); absent: every process does |
-| `m2-fallback` | names the crash fallback put on SweetMetal2; edit to clear (and rm the process's `.m2` marker) |
-| `ca/bbd-hm` | backboardd on hakios-metal while it exists (H3; its own trip renames it `bbd-hm.tripped`) |
+| `luma-boost` | `1`: CoreAnimation's luma boost pass on (both drivers); absent/other: off (default). Looked at every 2 s by backboardd |
+| `m2-fallback` | `NAME KEY` lines the crash trip wrote; a line holds only while bundle KEY is installed |
+| `ca/bbd-hm.starts`, `ca/bbd-hm.tripped` | backboardd's crash-trip files (the same trip as every process's) |
 | `log/NAME.log` | each process's lines (dispatcher + plug-in) where it may append; else `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.log` |
 | `cache/` | compiled stages, written by backboardd (prewarmed: HM_PREWARM); read-only seed for every other process, whose own writable cache is `$DARWIN_USER_CACHE_DIR/hakios-metal-cache` (HM_PREWARM=0 there) |
 
-Crash fallback per process: each start on hakios-metal is recorded in `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.starts`
-(writable even for sandboxed processes; a clean exit adds `x pid`); the 3rd start within 120 s whose earlier ones did
-not exit cleanly puts the process on SweetMetal2 for good (name appended to `m2-fallback` when writable, marker
-`hakios-metal-NAME.m2` beside the starts file). XR10 is off in every hakios-metal process (HM_XR10=0 forced:
-supportsExtendedXR10Formats NO, so CoreAnimation makes BGRA8 layers and tiles another process samples with no decode);
-`HM_XR10_ALLOW=1` in a process's env lets its HM_XR10 stand. Host test: `cc -o t bench/m2shim_test.c && ./t` (bench/build.sh runs it).
+(hm-int2) hakios-metal is the default for every process, backboardd included; gone: `hm-only` (staged list), `all-off`
+and backboardd's `ca/bbd-hm` flag (ignored; backboardd logs a line when the old files are still there).
+
+Crash trip, one for every process: each start on hakios-metal adds `time pid KEY` to its starts file (backboardd:
+`ca/bbd-hm.starts`; others: `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.starts`, writable even when sandboxed), a clean exit
+`x pid`. The 3rd start within 120 s whose earlier ones (same KEY) did not exit cleanly puts the process on SweetMetal2:
+marker (`ca/bbd-hm.tripped` / `hakios-metal-NAME.m2`) holding KEY, `NAME KEY` in `m2-fallback`, and one line
+`m2shim[pid NAME]: TRIP NAME -> SweetMetal2: ...` to /dev/console (kernel log), syslog and `ca/shim.log`. KEY is the
+installed `HakiosMetal` executable's mtime and size, so installing a new bundle expires every trip (`trip expired: ...`
+line). Clear by hand: rm the marker and the m2-fallback line.
+
+Set in every hakios-metal process before the plug-in loads (env keys, so an env line flips each): `HM_CA_DEEP_FB=0`
+(CAEnableDeepFramebuffer=false), `HM_CA_FB_COMPRESSION=0` (CAEnableFramebufferCompression=false +
+CA_DISABLE_FRAMEBUFFER_COMPRESSION=1), `HM_CA_IOSURFACE_COMPRESSION=0` (CAEnableIOSurfaceCompression=false), as SweetMetal2
+does in its processes, so CA makes no 550/551 deep surfaces; `1` leaves CA's own value. One `CA prefs:` line a process.
+XR10 is off in every hakios-metal process (HM_XR10=0 forced: supportsExtendedXR10Formats NO, so CoreAnimation makes BGRA8
+layers and tiles another process samples with no decode); `HM_XR10_ALLOW=1` in a process's env lets its HM_XR10 stand.
+HM_TRACE is off unless the env says 1; the plug-in's log copy rotates at 16 MB (`NAME.log.1`), the dispatcher rotates
+`ca/shim.log` and the process log at start. Luma boost: `luma-boost` = 1 on, else off; backboardd applies it with
+CASetDebugOption(91 = CA_DISABLE_LUMA_BOOST) and hakios-metal draws the pass while the knob is on (its address in
+HM_LUMA_KNOB); SweetMetal2 processes get SWEET_LUMA_BOOST (a line in mtl2-env/mtl2-live still wins there).
+Template env file: bench/hm-env.default. Host test: `cc -o t bench/m2shim_test.c && ./t` (bench/build.sh runs it).
 
 Multi-process on our kernel: each process opens its own v2 client (IOAcceleratorES type 0x4147) and gets its own 4 GiB
 GPU window (64 windows, xnu/patches/0115 sweet_gpu_window_alloc), BOs from the one kernel GPU pool (as Turnip's); all
