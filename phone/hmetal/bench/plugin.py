@@ -1824,6 +1824,74 @@ hm_compile_source(const double a[9], const double b[9])
 
 '''
 
+PREWARM_NEW = r'''/* (redfin hm-cache) HM_PREWARM=1 (default): the pre-warm is the stage cache's own. Each stage compiled into the
+ * writable cache leaves a manifest beside it (core HM_CACHE_MANIFEST: src/NAME.src + bc/HASH.bc), so after
+ * HAKIOS_METAL_CACHE_FORMAT or the Mesa changed -- or a stage was lost -- the stages this process compiled before
+ * (CoreAnimation's pipelines and the specialisations of the denied uber shaders among them) are compiled again here, in
+ * the background, before they are asked for. A stage already in the cache or a seed under this key is skipped without a
+ * compile. The thread runs at utility QoS, on the core's background compiler (HM_COMPILE_SPLIT: the render thread never
+ * waits for it), starts HM_PREWARM_DELAY s (default 60) after QuartzCore's library opened, and waits while frames are
+ * being drawn (a buffer completed in the last 250 ms). (Before: QuartzCore's library's -pipelineNames, which answer
+ * nothing on this device: "prewarm: done: 0 pipelines made" on every boot.) */
+static int
+hm_prewarm_on(void)
+{
+	const char *e = getenv("HM_PREWARM");
+	return e == NULL || e[0] == 0 || atoi(e) != 0;
+}
+
+static int
+hm_prewarm_busy(__unused void *ctx)
+{
+	return hm_now() - hm_tr_last_done < 0.25;
+}
+
+static void *
+hm_prewarm_main(void *arg)
+{
+	const double delay = *(double *)arg;
+	unsigned n[5] = { 0 };
+	double a[9], b[9];
+
+	free(arg);
+	pthread_setname_np("hakios.prewarm");
+	pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+	hakios_metal_compile_background(1);
+	usleep((useconds_t)(delay * 1e6));
+	hm_compile_snap(a);
+	const double began = hm_now();
+	hm_print("prewarm: the cache's manifests, stages missing under key \"%s\" compiled again, while no frame is drawn\n", hakios_metal_cache_key());
+	hakios_metal_cache_rewarm(hm_prewarm_busy, NULL, n);
+	hm_compile_snap(b);
+	hm_print("prewarm: done: %u manifests, %u present, %u made, %u failed, %u unreadable; %.0f s compiling (CPU %.0f s), %.0f s in all\n",
+		 n[0], n[1], n[2], n[3], n[4], (b[1] - a[1]) / 1e3, (b[4] - a[4]) / 1e3, hm_now() - began);
+	return NULL;
+}
+
+static void
+hm_prewarm_start(id library, NSString *path)
+{
+	static dispatch_once_t once;
+
+	if (library == nil || !hm_prewarm_on() || [path rangeOfString:@"QuartzCore.framework"].location == NSNotFound) {
+		return;
+	}
+	dispatch_once(&once, ^{
+		const char *d = getenv("HM_PREWARM_DELAY");
+		double *delay = malloc(sizeof(double));
+		pthread_t th;
+		pthread_attr_t attr;
+
+		*delay = d != NULL && d[0] ? atof(d) : 60.0;
+		pthread_attr_init(&attr);
+		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+		pthread_attr_setstacksize(&attr, 4 << 20);   /* (the compiler's recursion over an uber shader) */
+		if (pthread_create(&th, &attr, hm_prewarm_main, delay) != 0) free(delay);
+		pthread_attr_destroy(&attr);
+	});
+}
+'''
+
 SPEC_MINE_NEW = r'''		struct timespec t0, t1;
 		double ca[9], cb[9];
 
@@ -1888,6 +1956,9 @@ HMC_EDITS = [
      '\t\t\t\t\t\t\t\t\t\t (unsigned)_specBinding, [key bytes], [key length]);\n'
      '\t\t\thakios_metal_compile_background(0);   /* (a GCD worker: nothing kept for its next block) */\n'
      '\t\t\tclock_gettime(CLOCK_MONOTONIC, &t1);\n'),
+    # item 5: the pre-warm, rebuilt on the cache's manifests
+    ('/* (redfin hmv4) HM_PREWARM=1 (default): every pipeline QuartzCore\'s library names made once on a thread of its own, at\n',
+     '\t\t\t[names release];\n\t\t\t[held release];\n\t\t});\n\t});\n}\n', PREWARM_NEW),
 ]
 EDITS += HMC_EDITS
 
