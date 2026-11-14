@@ -11,7 +11,8 @@
 #include <deque>
 #include <map>
 #include <memory>
-#include <thread>
+#include <functional>
+#include <pthread.h>
 #include <ctime>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -1710,6 +1711,24 @@ private:
 // stage format changed and HAKIOS_METAL_CACHE_FORMAT was not bumped, or the host that made a seed compiles otherwise)
 // and the writable cache's file replaced by the new compile; a match is counted ("hm-cache: verify ok N of M").
 // 0 or unset: off.
+// a detached thread of STACK bytes running FN: std::thread's is 512 KB on Darwin, and ir3 over an uber shader recurses
+// deeper (AdrenoMetal c135133: >= 2 MiB for a compile thread)
+void runDetached(std::function<void()> fn, size_t stack) {
+    auto* f = new std::function<void()>(std::move(fn));
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, stack);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    auto body = [](void* p) -> void* {
+        auto* g = static_cast<std::function<void()>*>(p);
+        (*g)();
+        delete g;
+        return nullptr;
+    };
+    if (pthread_create(&t, &a, body, f) != 0) delete f;
+    pthread_attr_destroy(&a);
+}
 unsigned verifyEvery() {
     static const unsigned n = [] { const char* e = getenv("HM_CACHE_VERIFY"); return e != nullptr && e[0] ? unsigned(atoi(e)) : 0u; }();
     return n;
@@ -1726,7 +1745,7 @@ void verifyLater(const std::string& name, const std::string& where, const Compil
     auto digest = std::make_shared<std::string>(stageCacheDigest(cached));
     const uint32_t words = uint32_t(cached.words.size());
     const std::string writable = stageCacheWritable(name);
-    std::thread([=] {
+    runDetached([=] {
         tBackground = true;
         std::string why;
         std::unique_ptr<CompiledStage> fresh = compileStageFresh(bc->data(), bc->size(), &why, constants, iboBase, kb.get());
@@ -1745,7 +1764,7 @@ void verifyLater(const std::string& name, const std::string& where, const Compil
                        std::to_string(fresh->words.size()) + "; " + std::to_string(gVerifyStale.load()) + " stale of " + std::to_string(checked) +
                        " checked (bump HAKIOS_METAL_CACHE_FORMAT)");
         if (!writable.empty()) writeFileAtomically(writable, stageCacheBlob(*fresh));
-    }).detach();
+    }, size_t(8) << 20);
 }
 }  // namespace
 
