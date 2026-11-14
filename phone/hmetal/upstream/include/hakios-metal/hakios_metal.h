@@ -82,6 +82,19 @@ int hakios_metal_has_compiler(void);
  * waits for the compiler (HM_COMPILE_PRIO=0: first come) */
 void hakios_metal_compile_stats(double *wait_ms, double *compile_ms, unsigned *hits, unsigned *misses);
 void hakios_metal_compile_background(int on);
+/* (redfin hm-cache) this thread's compile figures beyond hakios_metal_compile_stats, in OUT (any count of them, up to
+ * 8): [0] CPU ms in compiles (wall ms is compile_ms: the difference is time spent waiting for a core), [1] the front
+ * end's ms, [2] the known buffer's folding's ms (specialisations), [3] hits from the process's memo, [4] hits from a
+ * seed directory, [5] hits in all, [6] misses (compiled); the number filled is returned */
+unsigned hakios_metal_compile_stats_more(double *out, unsigned count);
+/* (redfin hm-cache) the text the stage cache's key starts from: "hm-stage-format N mesa ..." (HM_CACHE_KEY=format,
+ * the default) or the build's hash (HM_CACHE_KEY=build) */
+const char *hakios_metal_cache_key(void);
+/* (redfin hm-cache) the pre-warm: the stages the writable cache's manifests name that are missing under this build's
+ * key compiled again, one at a time, waiting while BUSY(CTX) answers non-zero; OUT (may be NULL): [0] manifests,
+ * [1] present already, [2] made, [3] failed, [4] unreadable. Call it from a background thread
+ * (hakios_metal_compile_background(1)). */
+void hakios_metal_cache_rewarm(int (*busy)(void *), void *ctx, unsigned out[5]);
 /* (redfin hmv4) draw passes opened on the same colour target as the pass before them, by why they did not join it:
  * [0] a Clear asked, [1] store/options/attachments differ, [2] GMEM ended it, [3] a copy/dispatch/clear/blit between */
 void hakios_metal_pass_splits(unsigned long long out[4]);

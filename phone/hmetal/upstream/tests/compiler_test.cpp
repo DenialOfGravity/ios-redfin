@@ -1426,6 +1426,9 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
         return out;
     };
     std::string why;
+    // (redfin hm-cache) the disk alone here: no memo (it would answer before the seed), no manifests (src/, bc/)
+    setenv("HM_STAGE_MEMO", "0", 1);
+    setenv("HM_CACHE_MANIFEST", "0", 1);
     setenv("HAKIOS_METAL_CACHE", writable.c_str(), 1);
     unsetenv("HAKIOS_METAL_CACHE_SEED");
     auto first = compileStage(bc.data(), bc.size(), &why);
@@ -1461,9 +1464,59 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
     }
     unsetenv("HAKIOS_METAL_CACHE");
     unsetenv("HAKIOS_METAL_CACHE_SEED");
+    unsetenv("HM_STAGE_MEMO");
+    unsetenv("HM_CACHE_MANIFEST");
     for (const std::string& d : {writable, seed, other}) {
         for (const std::string& n : files(d)) remove((d + "/" + n).c_str());
         rmdir(d.c_str());
     }
     rmdir(base);
+}
+
+// (redfin hm-cache) a stage compiled once comes back from the process's memo (no file read, no compile), and the
+// writable cache gets a manifest beside it (src/NAME.src naming bc/HASH.bc) that reads back as what made the stage;
+// the pre-warm then finds it present under this key and compiles nothing
+TEST(a_compiled_stage_comes_back_from_the_memo_and_leaves_a_manifest) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the cache did not run)\n");
+        return;
+    }
+    std::vector<uint8_t> bc = bitcodeOf("tri_flat_vs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    char base[] = "/tmp/hakios-metal-memo-test-XXXXXX";
+    CHECK(mkdtemp(base) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", base, 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    unsetenv("HM_STAGE_MEMO");
+    unsetenv("HM_CACHE_MANIFEST");
+    KnownBuffer known;   // (a configuration of its own, so that no earlier test's memo entry answers)
+    known.binding = 7;
+    known.bytes = {1, 2, 3, 4};
+    std::string why;
+    const CompileStats a = compileStats();
+    auto first = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    auto again = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    const CompileStats b = compileStats();
+    CHECK(first != nullptr && again != nullptr && first->words == again->words);
+    CHECK_EQ(b.misses - a.misses, 1u);
+    CHECK_EQ(b.memoHits - a.memoHits, 1u);
+    const std::string name = stageCacheFileName(bc.data(), bc.size(), {}, 0, &known);
+    CHECK(!name.empty());
+    StageManifest m;
+    const std::string src = std::string(base) + "/src" + name.substr(0, name.size() - 6) + ".src";
+    CHECK(stageManifestRead(src, &m));
+    CHECK(m.hasKnown && m.known.binding == 7 && m.known.bytes == known.bytes && m.bitcodeSize == bc.size());
+    CHECK(m.key == stageCacheKeyText() && "/" + m.stageName == name);
+    const RewarmCounts n = stageCacheRewarm(nullptr, nullptr);
+    CHECK_EQ(n.manifests, 1u);
+    CHECK_EQ(n.present, 1u);
+    CHECK_EQ(n.made, 0u);
+    remove(src.c_str());
+    remove((std::string(base) + "/bc/" + m.bitcodeName).c_str());
+    remove((std::string(base) + name).c_str());
+    rmdir((std::string(base) + "/src").c_str());
+    rmdir((std::string(base) + "/bc").c_str());
+    rmdir(base);
+    unsetenv("HAKIOS_METAL_CACHE");
 }

@@ -64,9 +64,17 @@ if [ -n "${MESA:-}" ]; then
 		[ -f "$B/$a" ] && LIBS="$LIBS $B/$a"
 	done
 	LIBS="$LIBS -lz -lm"
-	# the compiled-stage cache's key (src/compiler.cpp kCacheBuild), as upstream's Makefile makes it
+	# the compiled-stage cache's key (src/compiler.cpp): (redfin hm-cache) by default the stage format's version, bumped by
+	# hand in compiler.cpp (HAKIOS_METAL_CACHE_FORMAT), and the Mesa it is linked against -- its version and a hash of
+	# our Mesa patches and AIR front end (mesa/), not of the built archives, which differ between two builds of the same
+	# source; the old key (CB: this file, the headers and the archives, as upstream's Makefile makes it) is
+	# HM_CACHE_KEY=build at run time
 	CB=$(cat "$UP/src/compiler.cpp" "$UP"/include/hakios-metal/*.hpp $LIBS 2>/dev/null | sha256sum | cut -c1-24)
-	CXXFLAGS="$CXXFLAGS -DHAKIOS_METAL_MESA -DHAKIOS_METAL_CACHE_BUILD=\"$CB\" $DEFS $INC"
+	MV=$(cat "$S/VERSION" 2>/dev/null || echo "${MESA_VERSION:-unknown}")
+	MP=$(cd mesa && cat *.patch air/*.c air/*.h air/meson.build 2>/dev/null | sha256sum | cut -c1-12)
+	MID="$MV+$MP"
+	echo "$MID" > "$OUT/MESA_ID.txt"
+	CXXFLAGS="$CXXFLAGS -DHAKIOS_METAL_MESA -DHAKIOS_METAL_CACHE_BUILD=\"$CB\" -DHAKIOS_METAL_MESA_ID=\"$MID\" $DEFS $INC"
 fi
 CORE="pm4 gpu command compute texture render link compiler metallib c_api fake_gpu"
 rm -f "$OUT"/obj/*.o
