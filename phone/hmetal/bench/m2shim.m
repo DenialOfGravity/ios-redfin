@@ -513,7 +513,7 @@ shim_ca_prefs(void)
 	 * hm-int2/int3 CFPreferencesSetAppValue went through cfprefsd and was PERSISTED into each process's plist
 	 * (/var/mobile/Library/Preferences/com.apple.backboardd.plist ...), so HM_CA_*=1 could not undo it. A value an
 	 * earlier shim persisted is removed (CFPreferencesSetAppValue NULL + synchronize), whatever the switch says. */
-	char did[160] = "";
+	char did[320] = "";
 #ifndef SHIM_HOST_TEST
 	{
 		static const char *const names[3] = {"CAEnableDeepFramebuffer", "CAEnableFramebufferCompression", "CAEnableIOSurfaceCompression"};
@@ -522,10 +522,41 @@ shim_ca_prefs(void)
 		NSMutableDictionary *args = [NSMutableDictionary dictionaryWithDictionary:[d volatileDomainForName:NSArgumentDomain] ?: @{}];
 		int removed = 0;
 
+		int kept = 0;
 		for (int i = 0; i < 3; i++) {
 			CFStringRef key = CFStringCreateWithCString(NULL, names[i], kCFStringEncodingUTF8);
 			CFPropertyListRef stale = CFPreferencesCopyValue(key, kCFPreferencesCurrentApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
 
+			/*
+			 * (y1115) CAEnableDeepFramebuffer must be PERSISTED for backboardd. QuartzCore decides the display framebuffer
+			 * format once, in AppleDisplay's constructor (CADeviceUseCIF10: MGGetBoolAnswer("Aixt/MEN2O2B7f+8m4TxUA"),
+			 * true on D22, overridden by CFPreferencesGetAppBooleanValue("CAEnableDeepFramebuffer") when the key exists;
+			 * IOMFBDisplay::framebuffer_pixel_format returns 'b3a8' (MTLPixelFormat 550, RGB10A8 2P XR10) instead of
+			 * BGRA when it is true). That runs when backboardd creates its display, before CA loads the Metal plug-in
+			 * and so before this shim: the argument-domain value comes too late. A launch drew in BGRA only when an
+			 * earlier process had left the value persisted (int2/int3 shims, SweetMetal2), and this function then
+			 * deleted it, so the NEXT launch made 'b3a8' framebuffers (black screen, "Unexpected framebuffer format
+			 * b3a8"). Now: in backboardd, HM_CA_DEEP_FB=0 (default) persists false (read at the next launch, and kept);
+			 * HM_CA_DEEP_FB=1 removes it (CA's own choice from the next launch).
+			 */
+			if (i == 0 && strcmp(g_name, "backboardd") == 0) {
+				bool isfalse = stale != NULL && CFGetTypeID(stale) == CFBooleanGetTypeID() && !CFBooleanGetValue((CFBooleanRef)stale);
+				if (set & 1) {
+					if (!isfalse) {
+						CFPreferencesSetAppValue(key, kCFBooleanFalse, kCFPreferencesCurrentApplication);
+						removed |= 8;   /* persisted now */
+					}
+					kept = 1;
+				} else if (stale != NULL) {
+					CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
+					removed |= 1;
+				}
+				if (stale != NULL) CFRelease(stale);
+				if (set & 1) [args setObject:@NO forKey:(NSString *)key];
+				else [args removeObjectForKey:(NSString *)key];
+				CFRelease(key);
+				continue;
+			}
 			if (stale != NULL) {   /* persisted by an earlier shim (or anyone): gone */
 				CFRelease(stale);
 				CFPreferencesSetAppValue(key, NULL, kCFPreferencesCurrentApplication);
@@ -537,8 +568,11 @@ shim_ca_prefs(void)
 		}
 		if (removed) CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
 		[d setVolatileDomain:args forName:NSArgumentDomain];
-		snprintf(did, sizeof(did), "; set in the argument domain (not persisted)%s%s%s%s", removed ? "; removed stale persisted value(s):" : "",
-			 removed & 1 ? " deep" : "", removed & 2 ? " fbcomp" : "", removed & 4 ? " iosurfcomp" : "");
+		snprintf(did, sizeof(did), "; set in the argument domain (not persisted)%s%s%s%s%s%s",
+			 (removed & 7) ? "; removed stale persisted value(s):" : "",
+			 removed & 1 ? " deep" : "", removed & 2 ? " fbcomp" : "", removed & 4 ? " iosurfcomp" : "",
+			 removed & 8 ? "; deep=false persisted for backboardd's next launch (y1115)" : "",
+			 kept ? "; deep=false kept persisted (y1115)" : "");
 		[pool release];
 	}
 #endif
