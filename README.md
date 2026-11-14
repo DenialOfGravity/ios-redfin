@@ -13,32 +13,36 @@ Google's own bootloader. Nothing is flashed to the boot chain; the iOS root live
 > switched off (permissive AMFI and sandbox, stub keystore), and many parts are missing. Do not put anything
 > personal on it.
 
-## What works (2026-10-29, image r57a)
+## What works (2026-11-14, boot rbb2b: kernel ws-n-bba2 @ 7100798, not yet on main)
+
+The exact phone state (every installed file with its build, flags, boot sysctls) is `state/redfin.toml`;
+`tools/state.py diff` checks the phone against it (see `state/README.md`).
 
 | Area | State |
 | --- | --- |
 | Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU, RAM only. Every reset lands back in fastboot (the shim sets the PMIC reboot reason) |
 | CPU | All 8 cores (1x Cortex-A76 prime 2.4 GHz, 1x Cortex-A76 gold 2.2 GHz, 6x Cortex-A55 1.8 GHz), PSCI. DVFS governor with touch/frame boost, thermal caps from the SoC temperature sensors |
 | Storage | UFS; the iOS root is an HFS+ image in `userdata`, read/write, grown to fill the partition (~109 GiB). **Files -> On My iPhone** and **Settings -> iPhone Storage** work |
-| Display | The 1080x2340 Samsung command-mode panel, **90 Hz**. iOS sees an iPhone X (1125x2436); the Adreno 620 scales each frame to fit, double-buffered, with Apple's continuous corners. Brightness slider works (panel nits published to CoreBrightness) |
-| GPU / Metal | Metal on Mesa's Turnip Vulkan driver through metal2vulkan: backboardd, SpringBoard and apps render on the GPU, with a shader cache and pipeline prewarm. Home-screen swipes reach ~60 fps; Settings scrolling is ~20 fps (GPU-bound, being worked on) |
+| Display | The 1080x2340 Samsung command-mode panel, **90 Hz**, direct scanout. iOS sees an iPhone X (1125x2436). Brightness slider works |
+| GPU / Metal | backboardd renders through **native Metal** (HakiosMetal plug-in, chosen per process by the dispatcher in `SweetMetal2.bundle`); Mesa Turnip through metal2vulkan (SweetMetal2) stays as the fallback for the processes listed in `/var/local/hmetal/m2-procs`/`hm-only` |
 | Touch, buttons | Samsung sec_ts touch over SPI, interrupt-driven; power and volume keys |
-| Haptics | The DRV2624 motor plays iOS's UI haptics (RedwoodAudio.driver actuator device) |
-| Sound | Both CS35L41 speaker amps through the audio DSP: ringtones, system sounds, media, volume control. No speaker-protection firmware yet, so a software limiter keeps levels below Android's |
-| Microphone | Records from the ALC5513 (rt5514) mics |
-| Camera | **Camera.app** live preview and photos on the back (IMX363) and front (IMX355) cameras; the ultra-wide (IMX481) streams frames. Lens focus and flash are driven by the kernel |
-| Wi-Fi | The radio is driven from userland (`wland`); **Settings -> Wi-Fi works**: wifid joins at boot and rejoins after a dropped link |
-| Bluetooth | WCN3998 over UART through `btd`'s bridge: **Settings -> Bluetooth** scans and finds nearby devices; a basic connection to another phone works |
+| Haptics | The DRV2624 motor plays iOS's UI haptics |
+| Sound | Both CS35L41 speaker amps through the audio DSP: ringtones, system sounds, media, volume control (software limiter, no speaker-protection firmware) |
+| Microphone | Records from the rt5514 mics |
+| Camera | **Camera.app** preview and photos on the back (IMX363) and front (IMX355) cameras; the ultra-wide streams frames. Torch from **Control Center** (1062) |
+| Wi-Fi | `wland` drives the radio; **Settings -> Wi-Fi** scans and joins |
+| Bluetooth | WCN3998 through `btd-bridge`: scan, pairing, headphone (A2DP) media audio |
+| Cellular | Apple's own **CommCenter** against the modem through the kernel QMI router (1067-1095): **native SIM PIN** entry, registration (roaming works), **SMS**, **voice calls with two-way audio** (ADSP voice path). Mobile data worked through `wland` on 2026-11-09 and is being moved to CommCenter + the kernel IPA data path (1075/1076/1080; not passing data on this baseline) |
 | USB | Ethernet to the PC: SSH (dropbear), a kernel file server, a command server and the live kernel log |
-| Battery | Real percentage from the fuel gauge (seeded from the gauge, then coulomb-counted) |
-| Sensors | The DSP's sensor process stays up (`fastrpcd`); accelerometer, gyro, light, compass and pressure reach iOS as HID services through `sensd` |
-| Apps | The stock apps from the IPSW (Settings, Safari, Camera, Photos, Notes, Weather, Voice Memos, Calculator, Clock, ...) and app extensions (e.g. text-to-speech voices) |
+| Battery, charging | Percentage from the fuel gauge (coulomb-counted estimate). **The phone charges while iOS runs**, slowly on the PC's USB cable; full-rate charging in fastboot |
+| Sensors | Accelerometer, gyro, light, compass, pressure through `fastrpcd` + `sensd`; **auto-rotation** (3-5 s to landscape); proximity on demand |
+| Apps | The stock apps from the IPSW (Settings, Safari, Messages, Phone, Camera, Photos, Notes, Weather, ...) |
 | Time | PMIC RTC |
 
-**Not working yet:** charging while iOS runs (charge the phone in the bootloader), Wi-Fi signal bars (the signal
-patch is held back: it resets the phone on join), auto-rotation, auto-brightness and the proximity sensor, the
-Control Center flashlight button, Bluetooth pairing and audio profiles (untested), cellular, GPS, NFC, the
-fingerprint sensor, SEP, hardware video decode/encode, App Store and Apple ID services.
+**Not working yet:** mobile data on the CommCenter/kernel path, signal bars on the home and lock screen (they show
+inside apps), the speakerphone button and keypad (DTMF) tones during a call, call audio on Bluetooth headsets,
+hardware video decode/encode and camera video recording, GPS, NFC, the fingerprint sensor, SEP, App Store and
+Apple ID services.
 
 ## How it boots
 
