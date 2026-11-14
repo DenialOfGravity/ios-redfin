@@ -1,0 +1,250 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index b12d5b6..8ae2f7e 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -47,6 +47,8 @@
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
+  * 1085: kern.sweet_qmi_plmnblip (0 off default, 1 on): _plmnblip_ms after a re-publish SysInfo shot, one SysInfo indication
+  *       with the LTE PLMN's MNC changed to 9s, then the modem's real one 300 ms later (CommCenter re-publishes, SOS gone).
++ * 1094: kern.sweet_qmi_republish 5 = as 4 plus a split release (PLMN-less NAS 0x0024/0x004e first, full ones
++ *       kern.sweet_qmi_split_ms 300 later), so CommCenter applies the data bearer before the roaming state changes.
+  * 1089: bug fix: the poll's clock is re-read after CommCenter's records; entries stamped after it no longer wrap to
+  *       "5 s old" (bogus NO ANSWER + kick, lost request copy -> data mux -1, instant hold/own-request timeouts).
+  * 1088: kern.sweet_data_opts & 0x4 (default on): the router's own WDA SetDataFormat (wland's X1 values) once per modem
+@@ -1514,7 +1516,7 @@ hold_release(int k, const char *why)
+ static int
+ wh_active(uint64_t now)
+ {
+-	if (repub_mode != 4 || hold_gate_open()) {
++	if ((repub_mode != 4 && repub_mode != 5) || hold_gate_open()) {        /* 1094: 5 = 4 + split */
+ 		return 0;
+ 	}
+ 	if (wh_start && now - wh_start >= (uint64_t)(wh_s > 0 ? wh_s : 0) * 1000) {
+@@ -1653,9 +1655,151 @@ hold_frame(uint32_t pipe, uint32_t sess, const uint8_t *f, uint32_t n)
+ 	return 1;
+ }
+ 
++/*
++ * ---- 1094: kern.sweet_qmi_republish = 5: as 4, plus a split release ----
++ * research/cc/M3-context-assign.md H/I. At the activation release CommCenter learned the PLMN (roaming state) 60 ms
++ * before it applied the data bearer, so the one settings reconfiguration that would mark the Internet connection
++ * current was skipped ("No data bearer available, not reconfiguring with kUnknown"). Mode 5 releases the held NAS
++ * Serving System 0x0024 and SysInfo 0x004e indications first WITHOUT their PLMN-carrying TLVs (the same ids as 1087's
++ * answer stripping; TLVs removed only, nothing synthesised or altered), every other held indication as it is, then
++ * after kern.sweet_qmi_split_ms (300) the modem's full held 0x0024/0x004e unchanged. No split (plain release, logged)
++ * if no held 0x0024 says PS attached (TLV 0x01 byte 2 == 1) and no held 0x004e says LTE service full (TLV 0x14 byte 0
++ * == 2). Logs "republish: split 1/2 (no PLMN) sent ..." and "republish: split 2/2 (full) sent ..." with TLV ids only.
++ */
++#define SPLIT_N 8
++static int split_ms = 300;
++static struct {
++	int n;
++	uint64_t at;
++	struct { uint32_t pipe, sess, n; uint8_t f[HOLD_MAXF]; } q[SPLIT_N];
++} spl;
++static uint8_t spl_buf[HOLD_MAXF];
++
++static void
++tlv_idlist(char *o, size_t ol, const uint8_t *p, uint32_t n)
++{
++	size_t k = 0;
++	o[0] = 0;
++	for (uint32_t i = 0; i + 3 <= n && k + 4 < ol;) {
++		k += (size_t)snprintf(o + k, ol - k, "%s%02x", i ? "," : "", p[i]);
++		i += 3u + (uint32_t)(p[i + 1] | (p[i + 2] << 8));
++	}
++}
++
++/* copy of frame f without the PLMN-carrying TLVs of NAS msg (0x0024 / 0x004e); returns the new length */
++static uint32_t
++split_strip(const uint8_t *f, uint32_t n, unsigned msg, uint8_t *o)
++{
++	const uint8_t *ids = msg == 0x0024 ? wh_ids_24 : wh_ids_4d;
++	int nids = msg == 0x0024 ? (int)sizeof(wh_ids_24) : (int)sizeof(wh_ids_4d);
++	uint32_t tn = (uint32_t)(f[11] | (f[12] << 8)), w = 13;
++	if (13 + tn > n) {
++		return 0;
++	}
++	memcpy(o, f, 13);
++	for (uint32_t k = 0; k + 3 <= tn;) {
++		uint32_t l = 3u + (uint32_t)(f[13 + k + 1] | (f[13 + k + 2] << 8));
++		if (k + l > tn) {
++			return 0;
++		}
++		int drop = 0;
++		for (int j = 0; j < nids; j++) {
++			drop |= ids[j] == f[13 + k];
++		}
++		if (!drop) {
++			memcpy(o + w, f + 13 + k, l);
++			w += l;
++		}
++		k += l;
++	}
++	o[11] = (uint8_t)(w - 13);
++	o[12] = (uint8_t)((w - 13) >> 8);
++	o[1] = (uint8_t)(w - 1);
++	o[2] = (uint8_t)((w - 1) >> 8);
++	return w;
++}
++
++static int
++split_release(void)
++{
++	int ok = 0, sent = 0, held = 0;
++	for (int i = 0; i < nhold; i++) {
++		struct hold *h = &B->holdq[i];
++		uint32_t l = 0, tn = (uint32_t)(h->f[11] | (h->f[12] << 8));
++		if (h->svc != 0x03 || 13 + tn > h->n) {
++			continue;
++		}
++		const uint8_t *v = h->msg == 0x0024 ? tlv_find(h->f + 13, tn, 0x01, &l) : h->msg == 0x004e ? tlv_find(h->f + 13, tn,
++		    0x14, &l) : NULL;
++		if (v && ((h->msg == 0x0024 && l >= 3 && v[2] == 1) || (h->msg == 0x004e && l >= 1 && v[0] == 2))) {
++			ok = 1;
++		}
++	}
++	if (!ok || split_ms <= 0) {
++		printf("SWEET QMUX: republish: split: not done (%s): plain release\n", split_ms <= 0 ? "kern.sweet_qmi_split_ms <= 0" :
++		    "no held NAS 0x0024 with PS attached and no held 0x004e with LTE service full");
++		return hold_release(nhold, "gate open (no split)");
++	}
++	spl.n = 0;
++	for (int i = 0; i < nhold; i++) {
++		struct hold *h = &B->holdq[i];
++		if (!cid_live(h->pipe, h->sess, h->svc, h->cid)) {
++			held_drop++;
++			continue;
++		}
++		if (h->svc == 0x03 && (h->msg == 0x0024 || h->msg == 0x004e) && spl.n < SPLIT_N) {
++			uint32_t w = split_strip(h->f, h->n, h->msg, spl_buf);
++			if (w) {
++				char a[96], b[96];
++				tlv_idlist(a, sizeof(a), spl_buf + 13, w - 13);
++				tlv_idlist(b, sizeof(b), h->f + 13, h->n - 13);
++				send_to(h->pipe, h->sess, spl_buf, w);
++				printf("SWEET QMUX: republish: split 1/2 (no PLMN) sent: NAS 0x%04x cid %u TLVs %s (modem's: %s)\n", h->msg, h->cid,
++				    a, b);
++				spl.q[spl.n].pipe = h->pipe;
++				spl.q[spl.n].sess = h->sess;
++				spl.q[spl.n].n = h->n;
++				memcpy(spl.q[spl.n].f, h->f, h->n);
++				spl.n++;
++				held++;
++				continue;
++			}
++		}
++		send_to(h->pipe, h->sess, h->f, h->n);
++		sent++;
++	}
++	nhold = 0;
++	spl.at = sbb_ms() + (uint64_t)split_ms;
++	printf("SWEET QMUX: republish: split: %d PLMN-carrying indication(s) sent without the PLMN, %d other(s) as they are; the "
++	    "full ones in %d ms\n", held, sent, split_ms);
++	return sent + held;
++}
++
++static void
++split_poll(uint64_t now)
++{
++	if (!spl.n || now < spl.at) {
++		return;
++	}
++	for (int i = 0; i < spl.n; i++) {
++		uint8_t *f = spl.q[i].f;
++		char a[96];
++		tlv_idlist(a, sizeof(a), f + 13, spl.q[i].n - 13);
++		if (cid_live(spl.q[i].pipe, spl.q[i].sess, f[4], f[5])) {
++			hold_bypass = 1;
++			send_to(spl.q[i].pipe, spl.q[i].sess, f, spl.q[i].n);
++			hold_bypass = 0;
++			printf("SWEET QMUX: republish: split 2/2 (full) sent: NAS 0x%04x cid %u TLVs %s\n", (unsigned)(f[9] | (f[10] << 8)),
++			    f[5], a);
++		}
++	}
++	spl.n = 0;
++}
++
+ static void
+ hold_poll(uint64_t now)
+ {
++	split_poll(now);        /* 1094 */
+ 	uint64_t to = holdnas >= 100 ? (uint64_t)holdnas : 5000;
+ 	if (!nhold) {
+ 		return;
+@@ -1665,8 +1809,8 @@ hold_poll(uint64_t now)
+ 		return;
+ 	}
+ 	if (hold_gate_open()) {
+-		int k = hold_release(nhold, "gate open");
+-		if (repub_mode == 4 && wh_start) {      /* 1087 */
++		int k = (repub_mode == 5 && wh_start) ? split_release() : hold_release(nhold, "gate open");     /* 1094 */
++		if ((repub_mode == 4 || repub_mode == 5) && wh_start) {      /* 1087 */
+ 			printf("SWEET QMUX: republish: PLMN withheld until activation (%u indication(s) held, %u answer(s) stripped/held)\n",
+ 			    wh_held, wh_stripped);
+ 			printf("SWEET QMUX: republish: released after activation: %d indication(s) delivered\n", k);
+@@ -2084,7 +2228,7 @@ send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg,
+ 		if (nhold) {
+ 			held_rel_bsp++;
+ 		}
+-		hold_open(pipe, sess, repub_mode == 4 ? repub_ms : holddly, "BSP activation 0xb00c sent");
++		hold_open(pipe, sess, (repub_mode == 4 || repub_mode == 5) ? repub_ms : holddly, "BSP activation 0xb00c sent");
+ 	}
+ }
+ 
+@@ -2709,7 +2853,7 @@ repub_send(int kind, int fallback)
+ static void
+ repub_arm(uint32_t pipe, uint32_t sess)
+ {
+-	if ((repub_mode != 1 && repub_mode != 3 && repub_mode != 4) || (rp_done && rp_done_pipe == pipe && rp_done_sess == sess) ||
++	if ((repub_mode != 1 && repub_mode != 3 && repub_mode != 4 && repub_mode != 5) || (rp_done && rp_done_pipe == pipe && rp_done_sess == sess) ||
+ 	    (rp_armed && rp_pipe == pipe && rp_sess == sess)) {
+ 		return;
+ 	}
+@@ -2824,7 +2968,7 @@ repub_poll(uint64_t now)
+ 	if (!rp_armed || now < rp_at) {
+ 		return;
+ 	}
+-	if ((repub_mode != 1 && repub_mode != 3 && repub_mode != 4) || !sess_live(rp_pipe, rp_sess)) {
++	if ((repub_mode != 1 && repub_mode != 3 && repub_mode != 4 && repub_mode != 5) || !sess_live(rp_pipe, rp_sess)) {
+ 		rp_armed = 0;
+ 		return;
+ 	}
+@@ -2907,7 +3051,7 @@ nas_ss_note(const uint8_t *p, uint32_t n)
+ static int
+ act_defer(uint32_t pipe, uint32_t sess, unsigned cid, const uint8_t *tl, uint32_t tn)
+ {
+-	if (act_bypass || (repub_mode != 3 && repub_mode != 4) || srv_usable || tn > sizeof(actq.tl) ||
++	if (act_bypass || (repub_mode != 3 && repub_mode != 4 && repub_mode != 5) || srv_usable || tn > sizeof(actq.tl) ||
+ 	    (act_rel_set && act_rel_pipe == pipe && act_rel_sess == sess)) {
+ 		return 0;
+ 	}
+@@ -2978,7 +3122,7 @@ act_poll(uint64_t now)
+ 		printf("SWEET QMUX: republish: modem srv full after %llu ms: activation delivered (%u poll(s))\n",
+ 		    (unsigned long long)(now - act_since), act_probes);
+ 		go = 1;
+-	} else if (repub_mode != 3 && repub_mode != 4) {
++	} else if (repub_mode != 3 && repub_mode != 4 && repub_mode != 5) {
+ 		printf("SWEET QMUX: republish: mode %d now: deferred activation delivered after %llu ms\n", repub_mode,
+ 		    (unsigned long long)(now - act_since));
+ 		go = 1;
+@@ -5101,7 +5245,7 @@ sysctl_repub SYSCTL_HANDLER_ARGS
+ 	if (proc_suser(req->p) != 0) {
+ 		return EPERM;
+ 	}
+-	if (v < 0 || v > 4) {
++	if (v < 0 || v > 5) {           /* 1094: 5 */
+ 		return EINVAL;
+ 	}
+ 	if (v == 2) {
+@@ -5148,7 +5292,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_auto, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_republish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_repub, "I",
+     "redfin 1073: 0 off (default), 1 = once per CommCenter session the modem's fresh NAS SysInfo/SigInfo as indications "
+     "kern.sweet_qmi_republish_ms after BSP activation; write 2 = send them now; 3 = as 1, the BSP activation deferred until the "
+-    "modem has service (1084); 4 = as 3, the PLMN withheld from CommCenter until the activation (1087)");
++    "modem has service (1084); 4 = as 3, the PLMN withheld from CommCenter until the activation (1087); 5 = as 4, released "
++    "split: PLMN-less NAS 0x0024/0x004e first, the full ones kern.sweet_qmi_split_ms later (1094)");
++QINT(sweet_qmi_split_ms, split_ms, "redfin 1094: mode 5: ms between the PLMN-less and the full NAS 0x0024/0x004e at the activation release (300)");
+ QINT(sweet_qmi_withhold_s, wh_s, "redfin 1087: mode 4: longest PLMN withholding in s per CommCenter session (600), then the old 5 s hold timeout");
+ QINT(sweet_qmi_plmnblip, plmnblip, "redfin 1085: 1 = after a re-publish SysInfo shot, a SysInfo with another MNC then the real one (CommCenter re-publishes its registration status: no SOS); 0 off (default)");
+ QINT(sweet_qmi_plmnblip_ms, plmnblip_ms, "redfin 1085: delay in ms from the shot to the PLMN blip (1500)");
