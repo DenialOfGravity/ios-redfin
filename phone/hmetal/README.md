@@ -117,6 +117,8 @@ Metal opens `/System/Library/Extensions/SweetMetal2.bundle` in every process. It
 | `ca/bbd-hm` | backboardd on hakios-metal while it exists (H3; its own trip renames it `bbd-hm.tripped`) |
 | `log/NAME.log` | each process's lines (dispatcher + plug-in) where it may append; else `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.log` |
 | `cache/` | compiled stages, written by backboardd (prewarmed: HM_PREWARM); read-only seed for every other process, whose own writable cache is `$DARWIN_USER_CACHE_DIR/hakios-metal-cache` (HM_PREWARM=0 there) |
+| `cache/src/`, `cache/bc/` | (hm-cache) what made each stage compiled into `cache/` (HM_CACHE_MANIFEST=1): the pre-warm compiles the missing ones again after a key change, and `bench/mkseed.sh` on the PC makes a seed of them. Phone-only data (Apple bitcode): PF only, never git |
+| `cache-seed/` | read-only stages for every process, looked in after `cache/` (HAKIOS_METAL_CACHE_SEED); from `mkseed.sh compile` (host recompile under the current key) or `mkseed.sh harvest` |
 
 Crash fallback per process: each start on hakios-metal is recorded in `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.starts`
 (writable even for sandboxed processes; a clean exit adds `x pid`); the 3rd start within 120 s whose earlier ones did
@@ -134,3 +136,14 @@ An IOSurface made elsewhere is imported as the caller's own pages (userptr) and 
 Later (kernel/ADT, not done): an accelerator that names a `HakiosMetal` plug-in directly (MetalPluginName =
 HakiosMetal, the dispatcher as that bundle and SweetMetal2.bundle back to the real one), so /System's SweetMetal2 is
 no longer replaced.
+
+## Stage cache (hm-cache)
+
+The key a stage is filed under is the bitcode, its function constants, IBO_BASE, the known buffer (a specialisation's
+configuration) and `hm-stage-format N mesa VERSION+PATCHES` (compiler.cpp `HAKIOS_METAL_CACHE_FORMAT`, BUMP BY HAND when
+codegen, a lowering, the AIR front end's output or the Stage/Kernel layout changes; the Mesa id comes from build.sh).
+A plug-in or core rebuild that changes no codegen keeps the cache. `HM_CACHE_KEY=build` = the old per-build key.
+Switches (all core env, set in `/var/local/hmetal/env`): `HM_CACHE_VERIFY=N` (1 in N hits compiled again in the
+background; "hm-cache: STALE ..." when it differs, the file replaced), `HM_STAGE_MEMO=1` (+`HM_STAGE_MEMO_MB=48`),
+`HM_CACHE_MANIFEST=1`, `HM_COMPILE_SPLIT=1` (background threads on their own ir3 compiler: the render thread never waits
+behind one). Host tool `out/bench/seed/hm-seed` (`build CACHE SEED`, `time LIB FN ...`, `compile`, `rewarm`).

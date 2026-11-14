@@ -40,6 +40,15 @@ if [ "${HMETAL_HOST_TESTS:-1}" != 0 ]; then
 	make -s -C "$UP" test CXX="$HOSTCXX" >> "$OUT/hmetal-host-tests.txt" 2>&1 || { cat "$OUT/hmetal-host-tests.txt"; exit 1; }
 	make -s -C redfin/tests all CXX="$HOSTCXX" >> "$OUT/hmetal-host-tests.txt" 2>&1 || { cat "$OUT/hmetal-host-tests.txt"; exit 1; }
 	grep -E "^==|^chip:|tests, " "$OUT/hmetal-host-tests.txt"
+	# (redfin hm-cache) the stage cache's host tool, with the phone's key (HAKIOS_METAL_MESA_ID as below): out/bench/seed/
+	if [ -n "${MESA:-}" ]; then
+		HMID=$(cat "$MESA_SRC/VERSION" 2>/dev/null || echo "${MESA_VERSION:-unknown}")+$(cd mesa && cat *.patch air/*.c air/*.h air/meson.build 2>/dev/null | sha256sum | cut -c1-12)
+		make -s -C "$UP" MESA=1 CXX="$HOSTCXX" out/host-mesa/hm-seed CXXFLAGS="-O2 -g -DHAKIOS_METAL_MESA_ID=\\\"$HMID\\\"" ||
+			{ echo "hm-seed: build failed"; exit 1; }
+		mkdir -p "$OUT/bench/seed"
+		cp "$UP/out/host-mesa/hm-seed" bench/mkseed.sh "$OUT/bench/seed/"
+		echo "$HMID" > "$OUT/bench/seed/MESA_ID.txt"
+	fi
 fi
 
 # 2. the library: upstream's CORE list (Makefile), plus the transport; not upstream's iokit_transport.cpp (HakiosGPU)
