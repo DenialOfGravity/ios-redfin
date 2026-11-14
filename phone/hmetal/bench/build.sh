@@ -60,8 +60,9 @@ rm -rf "$S" && mkdir -p "$S"
 strip -x "$S/SweetMetal2" 2>/dev/null || true
 cp m2shim.plist "$S/Info.plist"
 cp hm-env.default "$O/hm-env.default"	# (hm-int2) the env file template -> /var/local/hmetal/env
+cp hm-install.sh "$O/hm-install.sh"	# (hm-int2b) installs by copy + rename (never in place)
 codesign -f -s - "$S" 2>/dev/null || codesign -f -s - "$S/SweetMetal2" 2>/dev/null || true
 rm -rf "$O/obj"
-(cd "$O" && { sha256sum hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2 2>/dev/null ||
-	shasum -a 256 hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2; }) > "$O/SHA256SUMS"
+(cd "$O" && { sha256sum hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2 hm-env.default hm-install.sh 2>/dev/null ||
+	shasum -a 256 hmbench hmbench.metallib HakiosMetal.bundle/HakiosMetal SweetMetal2-shim.bundle/SweetMetal2 hm-env.default hm-install.sh; }) > "$O/SHA256SUMS"
 ls -la "$O" "$B" "$S"
