@@ -71,6 +71,12 @@ uint64_t sweet_gpu_timestamp(void);
 int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
 uint64_t sweet_gpu_pool_avail(void);
 void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
+uint64_t sweet_gpu_pool_largest(void);                                  /* 1097 */
+void sweet_gpu_pool_limits(uint32_t *cap_mb, uint32_t *reserve_mb);     /* 1097: kern.sweet_gpu_cap_mb / _reserve_mb */
+void sweet_gpu_pool_dump(const char *why);                              /* 1097 */
+void sweet_mtl_clients_log(void);                                       /* 1097: below */
+uint64_t sweet_mtl_reuse_drain_all(void);                               /* 1097: below */
+extern uint32_t sweet_mtl_drainall;                                     /* 1097: kern.sweet_gpu_pool_drainall (sweet_gpu.c) */
 }
 
 #define SWEET_V2_OPEN_TYPE      0x4147  /* the darwin backend's default ('AG', as the AGX plugin's) */
@@ -162,7 +168,10 @@ class SweetAcceleratorUserClient : public IOUserClient {
 	char fName[32];
 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
 	bool fCapLogged;
+	uint32_t fRefused;              /* 1097: v2 allocations refused (cap, reserve or no pool block) */
 	bool v2PoolAllowed(uint64_t len);
+	friend void sweet_mtl_clients_log(void);
+	friend uint64_t sweet_mtl_reuse_drain_all(void);
 
 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
@@ -186,6 +195,106 @@ public:
 };
 
 OSDefineMetaClassAndStructors(SweetAcceleratorUserClient, IOUserClient);
+
+/*
+ * redfin 1097: the open v2 clients (at most one per GPU window), for the pool dump (kern.sweet_gpu_pool_dump: who holds
+ * what) and for taking every client's reuse cache back (0156 keeps up to 64 MB of freed >= 1 MB buffers per client,
+ * counted as used by the pool) when an allocation finds no block. Lock order: sweet_mtl_reg_lock, then a client's fLock.
+ */
+#define SWEET_MTL_REG_MAX       64
+static SweetAcceleratorUserClient *sweet_mtl_reg[SWEET_MTL_REG_MAX];
+static IOLock *sweet_mtl_reg_lock;
+
+static bool
+sweet_mtl_reg_ready(void)
+{
+	if (sweet_mtl_reg_lock == NULL) {
+		IOLock *lock = IOLockAlloc();
+		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&sweet_mtl_reg_lock)) {
+			IOLockFree(lock);
+		}
+	}
+	return sweet_mtl_reg_lock != NULL;
+}
+
+static void
+sweet_mtl_registry_add(SweetAcceleratorUserClient *c)
+{
+	if (!sweet_mtl_reg_ready()) {
+		return;
+	}
+	IOLockLock(sweet_mtl_reg_lock);
+	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
+		if (sweet_mtl_reg[i] == NULL) {
+			sweet_mtl_reg[i] = c;
+			break;
+		}
+	}
+	IOLockUnlock(sweet_mtl_reg_lock);
+}
+
+static void
+sweet_mtl_registry_remove(SweetAcceleratorUserClient *c)
+{
+	if (sweet_mtl_reg_lock == NULL) {
+		return;
+	}
+	IOLockLock(sweet_mtl_reg_lock);
+	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
+		if (sweet_mtl_reg[i] == c) {
+			sweet_mtl_reg[i] = NULL;
+		}
+	}
+	IOLockUnlock(sweet_mtl_reg_lock);
+}
+
+/* One klog line per open v2 client (the end of sweet_gpu_pool_dump). Counters read without the client's lock. */
+void
+sweet_mtl_clients_log(void)
+{
+	uint32_t cap, reserve, n = 0;
+	sweet_gpu_pool_limits(&cap, &reserve);
+	if (sweet_mtl_reg_lock == NULL) {
+		IOLog("SWEET MTL: pool clients: none yet (cap %u MB, reserve %u MB)\n", cap, reserve);
+		return;
+	}
+	IOLockLock(sweet_mtl_reg_lock);
+	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
+		SweetAcceleratorUserClient *c = sweet_mtl_reg[i];
+		if (c == NULL) {
+			continue;
+		}
+		n++;
+		IOLog("SWEET MTL: pool client %s[%d]%s: holds %llu MB (peak %llu), reuse cache %llu MB, allocs %u frees %u imports %u/%u, refused %u\n",
+		    c->fName, c->fPid, c->fSystem ? " (system)" : "", c->fPoolBytes >> 20, c->fPoolPeak >> 20, c->fReuseBytes >> 20,
+		    c->fAllocs, c->fFrees, c->fImports, c->fImportFrees, c->fRefused);
+	}
+	IOLockUnlock(sweet_mtl_reg_lock);
+	IOLog("SWEET MTL: pool clients: %u open; cap %u MB per client%s, reserve %u MB\n", n, cap, cap == 0 ? " (none)" : "", reserve);
+}
+
+/* Every client's reuse cache back to the pool: the bytes given back. Callers hold no client lock. */
+uint64_t
+sweet_mtl_reuse_drain_all(void)
+{
+	uint64_t got = 0;
+	if (sweet_mtl_reg_lock == NULL) {
+		return 0;
+	}
+	IOLockLock(sweet_mtl_reg_lock);
+	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
+		SweetAcceleratorUserClient *c = sweet_mtl_reg[i];
+		if (c == NULL || c->fLock == NULL) {
+			continue;
+		}
+		IOLockLock(c->fLock);
+		got += c->fReuseBytes;
+		c->v2ReuseDrain();
+		IOLockUnlock(c->fLock);
+	}
+	IOLockUnlock(sweet_mtl_reg_lock);
+	return got;
+}
 
 bool
 SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
@@ -215,6 +324,7 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
 		fSystem = !strcmp(fName, "backboardd") || !strcmp(fName, "SpringBoard");
 		fPid = proc_selfpid();
 		fV2 = true;
+		sweet_mtl_registry_add(this);   /* 1097 */
 	}
 	return true;
 }
@@ -227,27 +337,31 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
 bool
 SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
 {
-	static uint32_t cap_mb, reserve_mb;
-	if (cap_mb == 0) {
-		uint32_t v = 256;
-		PE_parse_boot_argn("sweetgpucap", &v, sizeof(v));
-		reserve_mb = 160;
-		PE_parse_boot_argn("sweetgpureserve", &reserve_mb, sizeof(reserve_mb));
-		cap_mb = v ? v : 0xffffffffu;
-	}
+	/* 1097: cap and reserve are kern.sweet_gpu_cap_mb / kern.sweet_gpu_reserve_mb (live; boot-args give the start values) */
+	uint32_t cap_mb, reserve_mb;
+	sweet_gpu_pool_limits(&cap_mb, &reserve_mb);
 	if (fSystem) {
 		return true;
 	}
 	const char *why = NULL;
-	if (fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
-		why = "its cap";
+	if (cap_mb != 0 && fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
+		why = "its cap (kern.sweet_gpu_cap_mb)";
 	} else if (sweet_gpu_pool_avail() < len + ((uint64_t)reserve_mb << 20)) {
-		why = "the compositor's reserve";
+		/* 1097: other clients' reuse caches count as used; give them back before refusing */
+		if (sweet_mtl_drainall != 0 && sweet_mtl_reuse_drain_all() != 0 &&
+		    sweet_gpu_pool_avail() >= len + ((uint64_t)reserve_mb << 20)) {
+			return true;
+		}
+		why = "the compositor's reserve (kern.sweet_gpu_reserve_mb)";
 	}
-	if (why != NULL && !fCapLogged) {
-		fCapLogged = true;
-		IOLog("SWEET MTL: v2 %s: %llu MB buffer refused (holds %llu MB, %llu MB of the pool free): %s\n", fName,
-		    len >> 20, fPoolBytes >> 20, sweet_gpu_pool_avail() >> 20, why);
+	if (why != NULL) {
+		fRefused++;
+		/* 1097: the first 4 refusals of a client and every 32nd (was: the first only) */
+		if (!fCapLogged || fRefused <= 4 || (fRefused & 31) == 0) {
+			fCapLogged = true;
+			IOLog("SWEET MTL: v2 %s: %llu MB buffer refused #%u (holds %llu MB, %llu MB of the pool free, largest block %llu KB): %s\n",
+			    fName, len >> 20, fRefused, fPoolBytes >> 20, sweet_gpu_pool_avail() >> 20, sweet_gpu_pool_largest() >> 10, why);
+		}
 	}
 	return why == NULL;
 }
@@ -269,6 +383,9 @@ SweetAcceleratorUserClient::free(void)
 	 */
 	if (fLastFence != 0 && (fV2 ? sweet_gpu_wait_fence_ns(fLastFence, 2000000000ULL) : sweet_gpu_wait_fence(fLastFence, 2000))) {
 		IOLog("SWEET MTL: client freed with fence %u still pending\n", fLastFence);
+	}
+	if (fV2) {
+		sweet_mtl_registry_remove(this);        /* 1097: before anything it holds goes */
 	}
 	if (fBO != NULL) {
 		IOLog("SWEET MTL: v2 %s closed (GPU pool: %llu MB held, peak %llu MB)\n", fName, fPoolBytes >> 20, fPoolPeak >> 20);
@@ -778,7 +895,17 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 				v2ReuseDrain();		/* give the cache back and try once more */
 				IOLockUnlock(fLock);
 				if (sweet_gpu_pool_alloc(len, &pa)) {
-					return kIOReturnNoMemory;
+					/* 1097: then every other client's cache (kern.sweet_gpu_pool_drainall), once more */
+					uint64_t back = sweet_mtl_drainall != 0 ? sweet_mtl_reuse_drain_all() : 0;
+					if (back == 0 || sweet_gpu_pool_alloc(len, &pa)) {
+						fRefused++;
+						if (fRefused <= 4 || (fRefused & 31) == 0) {
+							IOLog("SWEET MTL: v2 %s: no pool block of %llu bytes #%u (holds %llu MB, %llu MB of the pool free, "
+							    "largest block %llu KB, %llu MB of caches given back)\n", fName, len, fRefused, fPoolBytes >> 20,
+							    sweet_gpu_pool_avail() >> 20, sweet_gpu_pool_largest() >> 10, back >> 20);
+						}
+						return kIOReturnNoMemory;
+					}
 				}
 			}
 			md = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionInOut);
