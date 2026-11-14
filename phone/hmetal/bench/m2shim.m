@@ -241,6 +241,35 @@ shim_user_dir(int which, char *out, size_t size, const char *fallback)
 	if (out[strlen(out) - 1] != '/') strlcat(out, "/", size);
 }
 
+/* (hm-int2b) this process's code-signing status (csops CS_OPS_STATUS); CS_VALID = bit 0. A page whose hash does not
+ * match the signature the kernel holds for its file clears CS_VALID ("cs_invalid_page ... allowing (remove VALID)");
+ * tccd then no longer trusts the process's entitlements and a TCC request aborts it (SpringBoard, kTCCServiceMotion,
+ * 2026-11-14). The usual cause: a driver file overwritten IN PLACE while processes had it mapped (the vnode keeps the
+ * old signature): install by copy to NAME.new + mv (bench/hm-install.sh), or reboot. */
+#ifndef SHIM_HOST_TEST
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+static uint32_t
+shim_cs_status(void)
+{
+	uint32_t st = 0;
+
+	return csops(getpid(), 0 /* CS_OPS_STATUS */, &st, sizeof(st)) == 0 ? st : 0xffffffffu;
+}
+
+/* one line when loading WHAT took CS_VALID away (BEFORE: the status before it) */
+static void
+shim_cs_check(uint32_t before, const char *what)
+{
+	uint32_t now = shim_cs_status();
+
+	if (before != 0xffffffffu && now != 0xffffffffu && (before & 1) && !(now & 1)) {
+		shim_shout("CODE SIGNATURE lost CS_VALID loading %s (status %#x -> %#x): a page did not match the signature the kernel "
+			   "holds for the file -- installed in place over a mapped file? Reinstall by copy + rename (bench/hm-install.sh) "
+			   "or reboot; TCC requests of this process will now abort", what, before, now);
+	}
+}
+#endif
+
 /* the installed hakios-metal's key: its executable's mtime and size */
 static void
 shim_bundle_key(void)
@@ -365,8 +394,8 @@ shim_tripped(bool bbd)
 			fclose(f);
 			listed = true;
 		}
-		shim_shout("TRIP %s -> SweetMetal2: %ld starts on hakios-metal in %d s without a clean exit before this one; "
-			   "holds while bundle %s is installed (marker %s%s)", g_name, unclean, TRIP_WINDOW, g_key, marker,
+		shim_shout("TRIP %s -> SweetMetal2: start %ld on hakios-metal within %d s, the %ld before it without a clean exit; "
+			   "holds while bundle %s is installed (marker %s%s)", g_name, unclean + 1, TRIP_WINDOW, unclean, g_key, marker,
 			   listed ? ", m2-fallback" : ", m2-fallback not writable");
 		g_starts[0] = '\0';
 		return true;
@@ -566,9 +595,16 @@ shim_luma_watch(void)
 	const char *why = "";
 	bool bbd;
 	int luma;
+	uint32_t cs0;
 
 	shim_begin(getprogname() ?: "?");
 	bbd = strcmp(g_name, "backboardd") == 0;
+	cs0 = shim_cs_status();
+	if (cs0 != 0xffffffffu && !(cs0 & 1)) {
+		shim_shout("CODE SIGNATURE already without CS_VALID at Metal start (status %#x): this dispatcher or an image loaded "
+			   "before it failed its page hashes -- installed in place over a mapped file? Reinstall by copy + rename "
+			   "(bench/hm-install.sh) or reboot; TCC requests of this process will abort", cs0);
+	}
 	luma = shim_luma_file();
 	m2shim_luma_boost = luma;
 	/* (self not released: before -init, _MTLDevice's -dealloc reads what -init never set; both plug-ins do the same) */
@@ -579,6 +615,7 @@ shim_luma_watch(void)
 		if (b != nil && [b loadAndReturnError:&e]) {
 			Class cls = NSClassFromString(@"HakiosMetalDevice");
 			device = cls != Nil ? ((id (*)(id, SEL, mach_port_t))objc_msgSend)([cls alloc], @selector(initWithAcceleratorPort:), port) : nil;
+			shim_cs_check(cs0, shim_first(HM_BUNDLE, HM_BUNDLE0));
 			shim_log("hakios-metal (%s): class %s, device %s, bundle %s, log %s, cache %s, HM_TRACE %s", why,
 				 cls != Nil ? "found" : "MISSING", device != nil ? [[[device name] description] UTF8String] : "nil",
 				 g_key, g_log[0] ? g_log : "none", getenv("HAKIOS_METAL_CACHE") ?: "?", getenv("HM_TRACE") ?: "off");
@@ -601,6 +638,7 @@ shim_luma_watch(void)
 		return nil;
 	}
 	device = ((id (*)(id, SEL, mach_port_t))objc_msgSend)([cls alloc], @selector(initWithAcceleratorPort:), port);
+	shim_cs_check(cs0, real);
 	shim_log("SweetMetal2 (%s): device %s%s", why, device != nil ? "yes" : "nil",
 		 device == nil && !shim_m2_clients_has(g_name) ? " (not in " M2_CLIENTS ": SweetMetal2's gate gives none)" : "");
 	if (bbd && device != nil) shim_luma_watch();
