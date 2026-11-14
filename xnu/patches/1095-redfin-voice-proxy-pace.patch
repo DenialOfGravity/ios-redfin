@@ -1,0 +1,628 @@
+redfin 1095: voice proxy pacing (coder V3, 2026-11-14). Fixes 1090's robotic call audio.
+- Cause: the DSP answers RT-proxy READ_V2/WRITE_V2 at once (~0.6 ms); 1090 re-sent on each answer -> ~1700 frames/s
+  each way instead of 100. msm-pcm-afe-v2.c (mmap) paces with an hrtimer of one period, walking a multi-period buffer.
+- kern.sweet_voice_proxy_pace 1 (default, next call): one read on 0x2000 + one write on 0x2001 per 10 ms (absolute mach
+  deadline), 4 periods back to back per direction, a period reused only after its answer; downlink frame taken on the
+  answer in issue order. 0 = 1090's data path unchanged.
+- Call ring held at 30-60 ms (trim past 60 ms, -1 slip when min > 30 ms, +1 after underruns).
+- Per-second "1s: PACED dl N periods ..." line (first 30 s, then every 10 s): periods, gap, busy/lost/late, dup/zero
+  frames, rings, under/over/trim/slips, AFE LOW/HIGH_WM per port.
+- kern.sweet_voice_proxy_gain_dl / _ul (dB, -24..+24, default 0, live).
+- sweet_voice.c: CVP created on the proxy ports by default; kern.sweet_voice_proxy_opts 8 = 1090's switch after
+  START_VOICE (1 wins over 8); opts mask 7 -> 15.
+With kern.sweet_voice_proxy 0 nothing here runs (3adbc22 behaviour).
+
+diff --git a/bsd/dev/sweet_voice.c b/bsd/dev/sweet_voice.c
+index 935290b..1fdf157 100644
+--- a/bsd/dev/sweet_voice.c
++++ b/bsd/dev/sweet_voice.c
+@@ -59,6 +59,8 @@
+  *   kern.sweet_voice_proxy_opts (bits, 0 default): 1 the CVP created on the proxy ports from the start (no switch);
+  *     2 8 kHz instead of 16 kHz; 4 host-PCM probe: one VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory) to the
+  *     CVP after START_VOICE, its status logged only (stopped again if it was taken).
++ *   1095: the CVP is created on the proxy ports by default (as opts 1); opts 8 = 1090's switch after START_VOICE (opts 1
++ *     wins over 8). Pacing of the data path: kern.sweet_voice_proxy_pace (bsd/dev/sweet_vproxy.c).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/clock.h>
+@@ -186,6 +188,9 @@ extern void sweet_qmux_vocoder_note(uint32_t rate_hz, int up);  /* 1093: sweet_q
+ #define POPT_CREATE             1u
+ #define POPT_8K                 2u
+ #define POPT_HOSTPCM            4u
++#define POPT_SWITCH             8u              /* 1095: switch after START_VOICE (1090 without opts 1) */
++/* 1095: in proxy mode the CVP is created on the proxy ports unless opts 8 (and not 1) asks for the old switch */
++#define PROXY_CREATE()          ((proxy_opts & POPT_CREATE) != 0 || (proxy_opts & POPT_SWITCH) == 0)
+ #define VSS_IMVM_CMD_PAUSE_VOICE                        0x0001137du
+ #define VSS_IVOCPROC_CMD_SET_DEVICE_V3                  0x0001316au
+ #define VSS_IVPCM_CMD_START_V2                          0x00011339u
+@@ -598,7 +603,7 @@ voice_up(int target)
+ 	proxy_up = false;
+ 	if (voice_proxy != 0 && !proxy_refused) {
+ 		printf("SWEET VOICE PROXY: call start with kern.sweet_voice_proxy %d, opts %#x: %s\n", voice_proxy, proxy_opts,
+-		    (proxy_opts & POPT_CREATE) ? "CVP created on the proxy ports" : "CVP switched to the proxy ports after START_VOICE");
++		    (PROXY_CREATE()) ? "CVP created on the proxy ports" : "CVP switched to the proxy ports after START_VOICE");
+ 		proxy_up = sweet_vproxy_prepare(voice_proxy, proxy_opts);
+ 		proxy_tried = proxy_up;
+ 	}
+@@ -671,7 +676,7 @@ voice_up(int target)
+ 		create.direction = 2;
+ 		create.tx_port = TX_PORT;
+ 		create.rx_port = RX_PORT;
+-		if (proxy_up && (proxy_opts & POPT_CREATE)) {
++		if (proxy_up && (PROXY_CREATE())) {
+ 			create.tx_port = PROXY_TX_PORT;         /* 1090 */
+ 			create.rx_port = PROXY_RX_PORT;
+ 		}
+@@ -698,7 +703,7 @@ voice_up(int target)
+ 	}
+ 	if (!(voice_opts & OPT_NO_MEDIA_FMT) && !old_cvd && cvd_at_least(2, 3)) {
+ 		step = "media formats";
+-		media_formats(proxy_up && (proxy_opts & POPT_CREATE), sweet_vproxy_rate());
++		media_formats(proxy_up && (PROXY_CREATE()), sweet_vproxy_rate());
+ 	}
+ 	if (!old_cvd) {
+ 		step = "topology commit";
+@@ -770,7 +775,7 @@ voice_up(int target)
+ 	    cvs_handle, cvp_handle);
+ 	if (proxy_up) {
+ 		/* 1090: onto the proxy ports (unless created there), then the AP's data path */
+-		bool on_proxy = (proxy_opts & POPT_CREATE) != 0;
++		bool on_proxy = (PROXY_CREATE()) != 0;
+ 
+ 		if (!on_proxy) {
+ 			on_proxy = cvp_switch(true, sweet_vproxy_rate());
+@@ -787,7 +792,7 @@ voice_up(int target)
+ 		}
+ 		if (on_proxy && !sweet_vproxy_run()) {
+ 			on_proxy = false;
+-			if (proxy_opts & POPT_CREATE) {
++			if (PROXY_CREATE()) {
+ 				step = "proxy data thread";
+ 				goto fail;
+ 			}
+@@ -1021,13 +1026,14 @@ sysctl_voice_proxy_opts(__unused struct sysctl_oid *oidp, __unused void *arg1, _
+ 	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+ 
+ 	if (e == 0 && changed) {
+-		proxy_opts = (uint32_t)v & 7u;
++		proxy_opts = (uint32_t)v & 15u;   /* 1095: + 8 = the old switch after START_VOICE */
+ 		printf("SWEET VOICE PROXY: kern.sweet_voice_proxy_opts = %#x\n", proxy_opts);
+ 	}
+ 	return e;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_opts, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy_opts,
+-    "I", "redfin 1090: bits 1 CVP created on the proxy ports (no switch), 2 8 kHz (default 16 kHz), 4 host-PCM probe (status only)");
++    "I", "redfin 1090/1095: bits 1 CVP created on the proxy ports (the default since 1095), 2 8 kHz (default 16 kHz), 4 host-PCM probe "
++    "(status only), 8 switch to the proxy ports after START_VOICE (1090 without 1)");
+ 
+ /* ---- 1086: route and gains ---- */
+ static void
+diff --git a/bsd/dev/sweet_vproxy.c b/bsd/dev/sweet_vproxy.c
+index 45f16f3..452ae05 100644
+--- a/bsd/dev/sweet_vproxy.c
++++ b/bsd/dev/sweet_vproxy.c
+@@ -33,6 +33,21 @@
+  *
+  * Log lines: "SWEET VOICE PROXY: ..." (the study's B2 list), 1 s statistics for the first 10 s of a call, then every
+  * 10 s, and the totals at the call's end; kern.sweet_voice_proxy_stats (read only) has them too.
++ *
++ * 1095 (pacing): the DSP answers READ_V2/WRITE_V2 at once (APR_BASIC_RSP_RESULT within ~0.6 ms, whatever the rate);
++ * the answer is not a "10 ms of data is ready" signal. 1090 re-sent each read/write on its answer, so ~1700 frames a
++ * second went each way (17 x real time): the downlink was read out of the DSP's jitter buffer in fragments and
++ * overfilled the call ring, the uplink drained the mic ring. msm-pcm-afe-v2.c (mmap mode) paces both ports with an
++ * hrtimer of one period (poll_time = period bytes / bytes per second): each tick one READ_V2 / WRITE_V2 at the next
++ * period of a multi-period buffer (dsp_cnt walks 0..periods-1), and the answer only means "that period is done"
++ * (snd_pcm_period_elapsed). kern.sweet_voice_proxy_pace 1 (default; read at call start) does the same here: a
++ * thread on an absolute 10 ms deadline (mach time, no drift), PACE_PERIODS periods per direction laid out back to
++ * back in the mapped buffer, one read on 0x2000 and one write on 0x2001 per tick at the advancing period, a period
++ * used again only after its answer came (else "busy", counted); the downlink frame is taken when its read is
++ * answered, in issue order. The call ring is held at 30-60 ms: a frame that would take it past 60 ms is dropped
++ * ("trim"), over 30 ms at the least for a second -> -1 sample per frame for the next second, underruns -> +1.
++ * kern.sweet_voice_proxy_pace 0: exactly 1090's data path. kern.sweet_voice_proxy_gain_dl / _ul: dB (-24..+24,
++ * default 0 = untouched), live. 1 s lines for the first 30 s of a paced call (the ringback from ALERTING on).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/clock.h>
+@@ -100,6 +115,12 @@ extern uint32_t sweet_voicedev_rate_wanted(void);
+ #define OUT_RATE                48000
+ #define MIC_KEEP                1920            /* 40 ms behind the mic ring's writer */
+ #define MIC_MOST                4800            /* more than 100 ms behind: skipped forward (overrun) */
++/* 1095: the paced data path */
++#define PACE_PERIODS            4               /* periods per direction, back to back (msm-pcm-afe-v2.c's dsp_cnt ring) */
++#define PACE_LOST_TICKS         4               /* a read/write not answered within 4 periods: given up (counted "lost") */
++#define DL_RING_HIGH            2880            /* 60 ms at 48 kHz: a frame that would go past it is dropped (trim) */
++#define DL_RING_SLIP            1440            /* 30 ms: the least fill over a second above it -> -1 sample per frame */
++#define PACED_LINES_S           30              /* 1 s lines for the first 30 s (ringback included) */
+ 
+ static LCK_GRP_DECLARE(vproxy_lock_group, "sweet-vproxy");
+ static LCK_MTX_DECLARE(stats_lock, &vproxy_lock_group);
+@@ -116,6 +137,18 @@ static volatile uint64_t dl_at[SLOTS];          /* mach time of each read's ack
+ static volatile bool stop_req, thread_runs, running;
+ static int px_wake;
+ static volatile uint32_t ev_start, ev_stop, ev_lwm, ev_hwm;
++/* 1095 */
++static int vp_pace = 1;                         /* kern.sweet_voice_proxy_pace: 1 paced (default), 0 1090's path */
++static int vp_gain_db[2];                       /* kern.sweet_voice_proxy_gain_dl / _ul, dB, -24..+24 */
++static bool paced;                              /* this call's data path (vp_pace at its start) */
++static volatile uint32_t ev_wm[2][2];           /* [0x2000, 0x2001][LOW_WM, HIGH_WM] */
++static int16_t dl_last[160];                    /* the previous downlink frame (duplicate check) */
++static bool dl_last_ok;
++static const uint32_t gain_q12[49] = {          /* round(4096 * 10^(dB / 20)), -24..+24 dB */
++	258, 290, 325, 365, 410, 460, 516, 579, 649, 728, 817, 917, 1029, 1154, 1295, 1453, 1631, 1830, 2053, 2303, 2584, 2900,
++	3254, 3651, 4096, 4596, 5157, 5786, 6492, 7284, 8173, 9170, 10289, 11544, 12953, 14533, 16306, 18296, 20529, 23034,
++	25844, 28997, 32536, 36506, 40960, 45958, 51566, 57858, 64917,
++};
+ 
+ /* statistics: per window (1 s) and per call */
+ struct win {
+@@ -126,6 +159,8 @@ struct win {
+ 	uint64_t dl_ring_sum, ul_ring_sum;
+ 	uint32_t dl_under, ul_under, dl_over, ul_over;
+ 	int32_t dl_slip, ul_slip;
++	uint32_t dl_busy, ul_busy, late, dup, zero, trim, lost; /* 1095 */
++	uint32_t wm[4];                                 /* 1095: AFE LOW_WM/HIGH_WM events, rx lo, rx hi, tx lo, tx hi */
+ };
+ static struct win cw, ct;              /* this second, this call */
+ static uint64_t call_began_us, last_dl_mach;
+@@ -212,8 +247,10 @@ px_events(__unused uint8_t service, __unused uint16_t port, uint32_t opcode, uin
+ 			ev_stop++;
+ 		} else if (e == 2) {
+ 			ev_lwm++;
++			ev_wm[p == PORT_TX][0]++;
+ 		} else if (e == 3) {
+ 			ev_hwm++;
++			ev_wm[p == PORT_TX][1]++;
+ 		}
+ 		if (e < 2 || ev_lwm + ev_hwm <= 10) {
+ 			SAY("AFE event: port %#x %s\n", p, e < 4 ? names[e] : "?");
+@@ -553,6 +590,16 @@ win_add(struct win *t, const struct win *x)
+ 	t->ul_over += x->ul_over;
+ 	t->dl_slip += x->dl_slip;
+ 	t->ul_slip += x->ul_slip;
++	t->dl_busy += x->dl_busy;
++	t->ul_busy += x->ul_busy;
++	t->late += x->late;
++	t->dup += x->dup;
++	t->zero += x->zero;
++	t->trim += x->trim;
++	t->lost += x->lost;
++	for (int i = 0; i < 4; i++) {
++		t->wm[i] += x->wm[i];
++	}
+ }
+ 
+ /* fills, ms (ring frames at 48 kHz -> ms) */
+@@ -564,6 +611,18 @@ stats_format(char *b, size_t n, const char *head, const struct win *x, uint32_t
+ 	uint32_t gaps = x->gaps ? x->gaps : 1, ur = x->rings ? x->rings : 1, dr = x->dl_rings ? x->dl_rings : 1;
+ 	uint32_t dl_avg = (uint32_t)(x->dl_ring_sum / dr), ul_avg = (uint32_t)(x->ul_ring_sum / ur);
+ 
++	if (paced) {
++		/* 1095: periods actually done each way (~100/s), their spacing (~10000 us), what was lost or repeated */
++		snprintf(b, n, "%s: PACED dl %u periods (fail %u lost %u busy %u, gap min/avg/max %u/%u/%u us) ul %u periods (fail %u "
++		    "busy %u) late %u | dl dup %u zero %u peak %u ul peak %u | ring dl %u ms (min/max %u/%u) ul %u ms (min/max %u/%u) "
++		    "dsp queued %u ms | under dl %u ul %u, over dl %u ul %u, trim %u, slips dl %+d ul %+d | wm rx %u/%u tx %u/%u", head,
++		    x->dl, x->dl_fail, x->lost, x->dl_busy, x->gaps ? x->gap_min : 0, (uint32_t)(x->gap_sum / gaps), x->gap_max, x->ul,
++		    x->ul_fail, x->ul_busy, x->late, x->dup, x->zero, x->dl_peak, x->ul_peak, MS48(dl_avg),
++		    x->dl_rings ? MS48(x->dl_ring_min) : 0, MS48(x->dl_ring_max), MS48(ul_avg), x->rings ? MS48(x->ul_ring_min) : 0,
++		    MS48(x->ul_ring_max), MS48(queued_frames), x->dl_under, x->ul_under, x->dl_over, x->ul_over, x->trim, x->dl_slip,
++		    x->ul_slip, x->wm[0], x->wm[1], x->wm[2], x->wm[3]);
++		return;
++	}
+ 	snprintf(b, n, "%s: dl %u frames (fail %u, gap min/avg/max %u/%u/%u us) ul %u frames (fail %u) dl peak %u ul peak %u | "
+ 	    "ring dl %u ms ul %u ms | dsp queued %u ms | ring min/avg/max dl %u/%u/%u ms ul %u/%u/%u ms; under dl %u ul %u, "
+ 	    "over dl %u ul %u, slips dl %+d ul %+d", head, x->dl, x->dl_fail, x->gaps ? x->gap_min : 0, (uint32_t)(x->gap_sum / gaps),
+@@ -572,10 +631,39 @@ stats_format(char *b, size_t n, const char *head, const struct win *x, uint32_t
+ 	    MS48(ul_avg), MS48(x->ul_ring_max), x->dl_under, x->ul_under, x->dl_over, x->ul_over, x->dl_slip, x->ul_slip);
+ }
+ 
++/* 1095: where a slot lives in the mapped buffer: paced = periods back to back (msm-pcm-afe-v2.c), 1090 = 4 KB pages */
++static uint64_t
++dl_off(unsigned slot)
++{
++	return paced ? (uint64_t)slot * px.bytes : 4096ull * slot;
++}
++
++static uint64_t
++ul_off(unsigned slot)
++{
++	return UL_OFFSET + (paced ? (uint64_t)slot * px.bytes : 4096ull * slot);
++}
++
++/* 1095: v * gain (Q12), saturated */
++static int16_t
++gain_apply(int32_t v, uint32_t q12)
++{
++	v = (int32_t)(((int64_t)v * q12) >> 12);
++	return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
++}
++
++static uint32_t
++gain_now(int dir)
++{
++	int db = vp_gain_db[dir];
++
++	return gain_q12[(db < -24 ? -24 : db > 24 ? 24 : db) + 24];
++}
++
+ static bool
+ dl_issue(unsigned slot)
+ {
+-	uint64_t a = (px.pa + 4096ull * slot) | AUDIO_SID_BITS;
++	uint64_t a = (px.pa + dl_off(slot)) | AUDIO_SID_BITS;
+ 	struct {
+ 		uint16_t port, reserved;
+ 		uint32_t lsw, msw, handle, bytes;
+@@ -587,7 +675,7 @@ dl_issue(unsigned slot)
+ static bool
+ ul_issue(unsigned slot)
+ {
+-	uint64_t a = (px.pa + UL_OFFSET + 4096ull * slot) | AUDIO_SID_BITS;
++	uint64_t a = (px.pa + ul_off(slot)) | AUDIO_SID_BITS;
+ 	struct {
+ 		uint16_t port, reserved;
+ 		uint32_t lsw, msw, handle, bytes;
+@@ -600,18 +688,29 @@ ul_issue(unsigned slot)
+ static void
+ dl_frame(unsigned slot)
+ {
+-	const volatile int16_t *src = (const volatile int16_t *)(px.va + 4096ull * slot);
++	const volatile int16_t *src = (const volatile int16_t *)(px.va + dl_off(slot));
+ 	int16_t x[160], out[2 * 482];
+ 	uint32_t n = px.samples, f = OUT_RATE / px.rate, o = 0, gain = redwood_sound_call_gain_q15(), peak = 0, ring, queued, under,
+-	    periods;
++	    periods, g12 = gain_now(0);
+ 	uint64_t at = dl_at[slot];
++	bool same = dl_last_ok;
+ 
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		int16_t v = src[i];
+ 		uint32_t a = v < 0 ? (uint32_t)-(int32_t)v : (uint32_t)v;
+ 
+ 		x[i] = v;
+ 		peak = a > peak ? a : peak;
++		same = same && dl_last[i] == v;
++		dl_last[i] = v;
++	}
++	dl_last_ok = true;
++	/* 1095: a non-silent frame byte for byte the previous one (the same DSP period handed out twice) */
++	if (peak == 0) {
++		cw.zero++;
++	} else if (same) {
++		cw.dup++;
+ 	}
+ 	cw.dl_peak = peak > cw.dl_peak ? peak : cw.dl_peak;
+ 	dtmf_frame(x, n, at);
+@@ -626,6 +725,9 @@ dl_frame(unsigned slot)
+ 			int32_t v = prev + (x[i] - prev) * (int32_t)k / (int32_t)f;
+ 
+ 			v = (int32_t)(((int64_t)v * gain) >> 15);
++			if (g12 != 4096) {
++				v = gain_apply(v, g12);         /* 1095: kern.sweet_voice_proxy_gain_dl */
++			}
+ 			out[2 * o] = (int16_t)v;
+ 			out[2 * o + 1] = (int16_t)v;
+ 			o++;
+@@ -641,7 +743,15 @@ dl_frame(unsigned slot)
+ 		o++;
+ 		cw.dl_slip++;
+ 	}
+-	if (redwood_sound_call_put(out, o) < o) {
++	if (paced) {
++		/* 1095: the call ring held under 60 ms: a frame that would take it past is dropped */
++		redwood_sound_call_state(&ring, &queued, &under, &periods);
++		if (ring + o > DL_RING_HIGH) {
++			cw.trim++;
++			o = 0;
++		}
++	}
++	if (o != 0 && redwood_sound_call_put(out, o) < o) {
+ 		cw.dl_over++;
+ 	}
+ 	redwood_sound_call_state(&ring, &queued, &under, &periods);
+@@ -659,9 +769,9 @@ dl_frame(unsigned slot)
+ static void
+ ul_frame(unsigned slot)
+ {
+-	volatile int16_t *dst = (volatile int16_t *)(px.va + UL_OFFSET + 4096ull * slot);
++	volatile int16_t *dst = (volatile int16_t *)(px.va + ul_off(slot));
+ 	int16_t in[960 + 2];
+-	uint32_t n = px.samples, f = OUT_RATE / px.rate, need = n * f, take = need, peak = 0;
++	uint32_t n = px.samples, f = OUT_RATE / px.rate, need = n * f, take = need, peak = 0, g12 = gain_now(1);
+ 	uint64_t written, avail;
+ 
+ 	if (px.mode == 2) {
+@@ -669,8 +779,12 @@ ul_frame(unsigned slot)
+ 
+ 		sweet_voicedev_ul(pcm, n);      /* 1091: from /dev/redwood-voice (silence when nothing is there) */
+ 		for (uint32_t i = 0; i < n; i++) {
+-			int32_t a = pcm[i] < 0 ? -(int32_t)pcm[i] : pcm[i];
++			int32_t a;
+ 
++			if (g12 != 4096) {
++				pcm[i] = gain_apply(pcm[i], g12);       /* 1095: kern.sweet_voice_proxy_gain_ul */
++			}
++			a = pcm[i] < 0 ? -(int32_t)pcm[i] : pcm[i];
+ 			dst[i] = pcm[i];
+ 			peak = (uint32_t)a > peak ? (uint32_t)a : peak;
+ 		}
+@@ -718,6 +832,9 @@ ul_frame(unsigned slot)
+ 			sum += in[i * f + k];
+ 		}
+ 		sum /= (int32_t)f;
++		if (g12 != 4096) {
++			sum = gain_apply(sum, g12);     /* 1095: kern.sweet_voice_proxy_gain_ul */
++		}
+ 		dst[i] = (int16_t)sum;
+ 		peak = (uint32_t)(sum < 0 ? -sum : sum) > peak ? (uint32_t)(sum < 0 ? -sum : sum) : peak;
+ 	}
+@@ -850,6 +967,182 @@ px_thread(__unused void *parameter, __unused wait_result_t result)
+ 	thread_terminate(current_thread());
+ }
+ 
++/*
++ * 1095: the paced data path (kern.sweet_voice_proxy_pace 1), as msm-pcm-afe-v2.c's hrtimer callbacks: every 10 ms
++ * (absolute mach deadline) one READ_V2 on 0x2000 at downlink period dl_cnt and one WRITE_V2 on 0x2001 at uplink period
++ * ul_cnt, each counter walking 0..PACE_PERIODS-1. A period is used again only after the DSP answered it (else "busy",
++ * the tick skipped for that direction); an answer is the period done: the downlink frame is taken then, in issue
++ * order. No answer within PACE_LOST_TICKS periods: given up ("lost"). More than 3 periods late (the thread was not
++ * run): the schedule restarts from now ("late"), no burst of catch-up reads.
++ */
++static void
++px_thread_paced(__unused void *parameter, __unused wait_result_t result)
++{
++	uint64_t per_abs, next, window_us = now_us(), dl_sent[PACE_PERIODS], ul_sent[PACE_PERIODS];
++	unsigned dl_cnt = 0, ul_cnt = 0, dl_proc = 0;
++	uint32_t dl_pend = 0, ul_pend = 0, dl_acked = 0, ul_acked = 0, dl_badm = 0, ul_badm = 0, seconds = 0, wm_seen[4];
++	uint32_t ring, queued, under, periods;
++	bool said_no_dl = false, said_no_ul = false;
++
++	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &per_abs);
++	for (int i = 0; i < 4; i++) {
++		wm_seen[i] = ev_wm[i / 2][i % 2];
++	}
++	next = mach_absolute_time();
++	SAY("data: PACED: one read on %#x and one write on %#x every 10 ms, %u periods of %u B each way (kern.sweet_voice_proxy_pace 1)\n",
++	    PORT_RX, PORT_TX, PACE_PERIODS, px.bytes);
++	while (!stop_req) {
++		uint64_t m;
++
++		dl_acked |= __atomic_exchange_n(&dl_done, 0, __ATOMIC_ACQ_REL);
++		ul_acked |= __atomic_exchange_n(&ul_done, 0, __ATOMIC_ACQ_REL);
++		dl_badm |= __atomic_exchange_n(&dl_bad, 0, __ATOMIC_ACQ_REL);
++		ul_badm |= __atomic_exchange_n(&ul_bad, 0, __ATOMIC_ACQ_REL);
++		m = mach_absolute_time();
++
++		/* downlink answers, oldest first (the pending periods run from dl_proc up to dl_cnt) */
++		while (dl_pend & (1u << dl_proc)) {
++			uint32_t bit = 1u << dl_proc;
++
++			if (dl_acked & bit) {
++				dl_pend &= ~bit;
++				dl_acked &= ~bit;
++				if (dl_badm & bit) {
++					dl_badm &= ~bit;
++					cw.dl_fail++;
++				} else {
++					if (last_dl_mach != 0) {
++						uint32_t gap = (uint32_t)(mach_us(dl_at[dl_proc]) - mach_us(last_dl_mach));
++
++						cw.gap_min = gap < cw.gap_min ? gap : cw.gap_min;
++						cw.gap_max = gap > cw.gap_max ? gap : cw.gap_max;
++						cw.gap_sum += gap;
++						cw.gaps++;
++					}
++					last_dl_mach = dl_at[dl_proc];
++					cw.dl++;
++					dl_frame(dl_proc);
++				}
++			} else if (m - dl_sent[dl_proc] > PACE_LOST_TICKS * per_abs) {
++				dl_pend &= ~bit;
++				cw.lost++;
++			} else {
++				break;
++			}
++			dl_proc = (dl_proc + 1) % PACE_PERIODS;
++		}
++		/* uplink answers */
++		for (unsigned s = 0; s < PACE_PERIODS; s++) {
++			uint32_t bit = 1u << s;
++
++			if (!(ul_pend & bit)) {
++				continue;
++			}
++			if (ul_acked & bit) {
++				ul_pend &= ~bit;
++				if (ul_badm & bit) {
++					cw.ul_fail++;
++				} else {
++					cw.ul++;
++				}
++			} else if (m - ul_sent[s] > PACE_LOST_TICKS * per_abs) {
++				ul_pend &= ~bit;
++				cw.lost++;
++			}
++		}
++		ul_acked = ul_badm = 0;         /* (answers for periods no longer pending: dropped) */
++		dl_acked &= dl_pend;
++		dl_badm &= dl_pend;
++
++		/* the 10 ms tick */
++		if (m >= next) {
++			uint32_t bit;
++
++			if (m - next > 3 * per_abs) {
++				cw.late++;
++				next = m;
++			}
++			next += per_abs;
++			bit = 1u << dl_cnt;
++			if (dl_pend & bit) {
++				cw.dl_busy++;
++			} else {
++				dl_sent[dl_cnt] = m;
++				if (dl_issue(dl_cnt)) {
++					dl_pend |= bit;
++					dl_cnt = (dl_cnt + 1) % PACE_PERIODS;
++				} else {
++					cw.dl_fail++;   /* not sent (APR): the same period at the next tick */
++				}
++			}
++			bit = 1u << ul_cnt;
++			if (ul_pend & bit) {
++				cw.ul_busy++;
++			} else {
++				ul_frame(ul_cnt);
++				ul_sent[ul_cnt] = m;
++				if (ul_issue(ul_cnt)) {
++					ul_pend |= bit;
++					ul_cnt = (ul_cnt + 1) % PACE_PERIODS;
++				} else {
++					cw.ul_fail++;
++				}
++			}
++		}
++
++		if (now_us() - window_us >= 1000000) {
++			char line[sizeof(stats_text)];
++
++			seconds++;
++			window_us = now_us();
++			for (int i = 0; i < 4; i++) {
++				uint32_t v = ev_wm[i / 2][i % 2];
++
++				cw.wm[i] = v - wm_seen[i];
++				wm_seen[i] = v;
++			}
++			redwood_sound_call_state(&ring, &queued, &under, &periods);
++			if (!said_no_dl && ct.dl + cw.dl == 0) {
++				SAY("THE DSP GIVES NO DOWNLINK FRAMES on %#x (%u read errors, %u lost; AFE events: start %u stop %u)\n", PORT_RX,
++				    cw.dl_fail, cw.lost, ev_start, ev_stop);
++				said_no_dl = true;
++			}
++			if (!said_no_ul && ct.ul + cw.ul == 0) {
++				SAY("THE DSP TAKES NO UPLINK FRAMES on %#x (%u write errors)\n", PORT_TX, cw.ul_fail);
++				said_no_ul = true;
++			}
++			/* the slips for the next second: the call ring held at 30-60 ms, the mic ring as in 1090 */
++			dl_slip_mode = cw.dl_under ? 1 : (cw.dl_rings && cw.dl_ring_min > DL_RING_SLIP) ? -1 : 0;
++			ul_slip_mode = cw.ul_under ? 1 : (cw.rings && cw.ul_ring_min > 2880) ? -1 : 0;
++			if (seconds <= PACED_LINES_S || seconds % 10 == 0) {
++				stats_format(line, sizeof(line), "1s", &cw, queued);
++				SAY("%s\n", line);
++			}
++			lck_mtx_lock(&stats_lock);
++			win_add(&ct, &cw);
++			stats_format(stats_text, sizeof(stats_text), "call so far", &ct, queued);
++			lck_mtx_unlock(&stats_lock);
++			win_reset(&cw);
++		}
++
++		/* sleep to the next tick, or until an answer comes */
++		assert_wait_deadline((event_t)&px_wake, THREAD_UNINT, next);
++		if (stop_req || __atomic_load_n(&dl_done, __ATOMIC_ACQUIRE) != 0 || __atomic_load_n(&ul_done, __ATOMIC_ACQUIRE) != 0 ||
++		    mach_absolute_time() >= next) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	lck_mtx_lock(&stats_lock);
++	win_add(&ct, &cw);
++	win_reset(&cw);
++	lck_mtx_unlock(&stats_lock);
++	thread_runs = false;
++	thread_wakeup(&thread_runs);
++	thread_terminate(current_thread());
++}
++
+ /* After the CVP is on the proxy ports and voice started: the call mode on, the data thread started. */
+ bool
+ sweet_vproxy_run(void)
+@@ -868,6 +1161,8 @@ sweet_vproxy_run(void)
+ 	tone_on = false;
+ 	tone_onset_mach = 0;
+ 	dtmf_last_ms = 0x7fffffff;
++	paced = vp_pace != 0;           /* 1095: kern.sweet_voice_proxy_pace, read once per call */
++	dl_last_ok = false;
+ 	call_began_us = now_us();
+ 	heard = redwood_sound_call_mode_on(true);
+ 	{
+@@ -885,7 +1180,7 @@ sweet_vproxy_run(void)
+ 	if (px.mode == 2) {
+ 		sweet_voicedev_call(true, px.rate, px.mode);    /* 1091: before the first frame */
+ 	}
+-	if (kernel_thread_start(px_thread, NULL, &thread) != KERN_SUCCESS) {
++	if (kernel_thread_start(paced ? px_thread_paced : px_thread, NULL, &thread) != KERN_SUCCESS) {
+ 		thread_runs = false;
+ 		running = false;
+ 		redwood_sound_call_mode(false);
+@@ -896,8 +1191,10 @@ sweet_vproxy_run(void)
+ 		return false;
+ 	}
+ 	thread_deallocate(thread);
+-	SAY("RUNNING: mode %d, %u Hz mono 16 bit, 10 ms frames; %s\n", px.mode, px.rate, px.mode == 2 ?
+-	    "downlink -> /dev/redwood-voice read, its write -> uplink" : "downlink -> speakers' call ring, mic ring -> uplink");
++	SAY("RUNNING: mode %d, %u Hz mono 16 bit, 10 ms frames; %s; %s (gain dl %+d ul %+d dB)\n", px.mode, px.rate, px.mode == 2 ?
++	    "downlink -> /dev/redwood-voice read, its write -> uplink" : "downlink -> speakers' call ring, mic ring -> uplink",
++	    paced ? "PACED 10 ms (1095)" : "UNPACED, re-sent on each answer (1090; kern.sweet_voice_proxy_pace 0)", vp_gain_db[0],
++	    vp_gain_db[1]);
+ 	return true;
+ }
+ 
+@@ -919,7 +1216,7 @@ sweet_vproxy_stop(const char *why)
+ 		}
+ 		redwood_sound_call_mode(false);
+ 		{
+-			char line[400];
++			char line[sizeof(stats_text)];
+ 			uint32_t ring, queued, under, periods;
+ 
+ 			redwood_sound_call_state(&ring, &queued, &under, &periods);
+@@ -950,4 +1247,46 @@ sysctl_stats SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_stats, "A",
+     "redfin 1090: the voice proxy's counters (this call so far, or the last call's totals)");
++
++/* 1095 */
++static int
++sysctl_pace SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = vp_pace, error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	vp_pace = v;
++	SAY("kern.sweet_voice_proxy_pace = %d (%s; applies at the next call start)\n", v,
++	    v ? "paced: one read/write per 10 ms period" : "1090: re-sent on each answer");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_pace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pace, "I",
++    "redfin 1095: 1 (default) the proxy's reads/writes paced at one per 10 ms period, 0 = 1090 (re-sent on each answer)");
++
++static int
++sysctl_gain SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg2)
++	int dir = (int)(uintptr_t)arg1, v = vp_gain_db[dir], error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v < -24 || v > 24) {
++		return EINVAL;
++	}
++	vp_gain_db[dir] = v;
++	SAY("kern.sweet_voice_proxy_gain_%s = %+d dB (live)\n", dir ? "ul" : "dl", v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_gain_dl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, (void *)0, 0, sysctl_gain, "I",
++    "redfin 1095: downlink gain in dB on the proxy path (-24..+24, default 0)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_gain_ul, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, (void *)1, 0, sysctl_gain, "I",
++    "redfin 1095: uplink gain in dB on the proxy path (-24..+24, default 0)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
