@@ -81,6 +81,11 @@ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint3
 extern void SweetABPBasebandMessage(uint32_t code);
 extern int SweetABPPublish(bool on, const char *why);
 extern int sweet_voice_auto(int target, const char *why);      /* sweet_voice.c (1074) */
+extern uint32_t sweet_vproxy_rate(void);                        /* sweet_vproxy.c (1090): the proxy's rate, 0 = not running */
+void sweet_qmux_vocoder_note(uint32_t rate_hz, int up);         /* 1093: from sweet_voice.c at a call's start and end */
+static int qmi_vocoder = 0, qmi_voc_type = 0x10, qmi_codec_ind = 0, qmi_codec_tlv = 0x11;   /* 1093 (below) */
+static struct { int used; unsigned pipe, cid; uint32_t sess; } e1cl;
+static uint16_t voc_answer(uint8_t *b, size_t bn);
 
 #define LOG(fmt, ...)           printf("SWEET QMUX: [%6llu] " fmt, (unsigned long long)sbb_ms(), ##__VA_ARGS__)
 #define NPIPES                  2u
@@ -4380,6 +4385,20 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
 		break;
 	case ACT_OK:
 		cnt.local_ok++;
+		if (svc == 0xe1 && qmi_vocoder) {       /* 1093 */
+			e1cl.used = 1;
+			e1cl.pipe = pipe;
+			e1cl.sess = cur_sess;
+			e1cl.cid = cid;
+			if (msg == 0x002f) {
+				uint8_t vt[16];
+				uint16_t vn = voc_answer(vt, sizeof(vt));
+
+				svc_local_tlv(pipe, svc, cid, s, 0, 0, vt, vn);
+				run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
+				break;
+			}
+		}
 		svc_local(pipe, svc, cid, s, 0, 0);
 		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
 		break;
@@ -4409,6 +4428,176 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
 		svc_cnt[svc & 0xff].denied++;
 		break;
 	}
+}
+
+/*
+ * ---- 1093: real answers for CommCenter's Apple AUDIO service (0xe1): the vocoder ----
+ * research/cc/BBA-design-study.md A2. kern.sweet_qmi_vocoder 0 (default: the policy's blank "ok", as before) / 1:
+ *   0x002f GetVocoderType -> answer TLV 0x01 VocoderInfo {u8 QMI vocoder type, u8 rate code = kHz}
+ *   0x0030 VocoderTypeInfo indication (TLV 0x01 VocoderInfo + 0x10 I2SClockRateInfo {u8 kHz}) to CommCenter's 0xe1 client
+ *          when a call's voice session starts and when the modem's codec changes during it.
+ *   The I2S clock = the rate the kernel's voice session runs the AP side at (the proxy's 16/8 kHz, sweet_vproxy.c; with
+ *   no proxy the configured proxy rate). The vocoder rate = the modem's speech codec (VOICE indication
+ *   kern.sweet_qmi_codec_ind, codec enum in TLV kern.sweet_qmi_codec_tlv: qcril's CODEC_* numbering, AMR_NB 6, AMR_WB 7,
+ *   EVS 17-20) when the modem gave one, else the I2S rate; the log line names the source. kern.sweet_qmi_codec_ind 0
+ *   (default) = learn: each VOICE indication id other than All Call Status is logged once (TLV ids and lengths only:
+ *   never values, never numbers) while 1 is set. The router has no VOICE client of its own; CommCenter's own
+ *   registration decides which VOICE indications arrive. kern.sweet_qmi_vocoder_type: the type byte (default 0x10;
+ *   Apple's names for 0x10..0x15 are not resolved offline: CommCenter's "Got Vocoder Info: <name>" tells).
+ * 0x002d (interface status) and the rest keep the blank "ok": the study finds nothing waiting for them.
+ */
+static volatile int voc_pending;
+static volatile int voc_call_up;
+static uint32_t voc_codec;                      /* the modem's speech codec (qcril CODEC_*), 0 = none seen this call */
+static uint16_t voc_learned[32];
+static unsigned voc_nlearned;
+
+static const char *
+codec_name(uint32_t c)
+{
+	static const char *const nm[] = { "?", "QCELP13K", "EVRC", "EVRC_B", "EVRC_WB", "EVRC_NW", "AMR_NB", "AMR_WB", "GSM_EFR",
+		                          "GSM_FR", "GSM_HR", "G711U", "G723", "G711A", "G722", "G711AB", "G729", "EVS_NB", "EVS_WB",
+		                          "EVS_SWB", "EVS_FB" };
+	return c < sizeof(nm) / sizeof(nm[0]) ? nm[c] : "?";
+}
+
+static unsigned
+codec_khz(uint32_t c)
+{
+	return c == 4 || c == 5 || c == 7 || c == 14 || (c >= 18 && c <= 20) ? 16 : c >= 1 && c <= 20 ? 8 : 0;
+}
+
+/* what to say now: type, vocoder rate (kHz), I2S clock (kHz), and where each came from */
+static void
+voc_now(uint8_t *type, uint8_t *rate, uint8_t *i2s, char *src, size_t srcn)
+{
+	uint32_t prate = sweet_vproxy_rate();
+	unsigned ck = codec_khz(voc_codec);
+
+	*type = (uint8_t)qmi_voc_type;
+	*i2s = (uint8_t)(prate ? prate / 1000 : 16);
+	*rate = (uint8_t)(ck ? ck : *i2s);
+	snprintf(src, srcn, "vocoder rate from %s%s%s, I2S clock = %s", ck ? "the modem's speech codec " : "the kernel voice session",
+	    ck ? codec_name(voc_codec) : "", ck ? "" : " (no codec from the modem)", prate ? "the proxy's rate" :
+	    "16 kHz (no proxy running: the configured proxy rate)");
+}
+
+void
+sweet_qmux_vocoder_note(uint32_t rate_hz, int up)
+{
+	if (!up) {
+		voc_codec = 0;
+	}
+	voc_call_up = up;
+	voc_pending = up;               /* (nothing is said at a call's end) */
+	(void)rate_hz;
+}
+
+/* a VOICE indication from the modem to CommCenter (the router thread) */
+static void
+voc_snoop(unsigned msg, const uint8_t *p, uint32_t n)
+{
+	if (msg == 0x002e) {
+		return;
+	}
+	if (qmi_codec_ind != 0 && msg == (unsigned)qmi_codec_ind) {
+		uint32_t l = 0, c;
+		const uint8_t *t = tlv_find(p, n, (unsigned)qmi_codec_tlv, &l);
+
+		if (!t || l < 1) {
+			LOG("VOCODER: VOICE ind 0x%04x without TLV 0x%02x: no codec\n", msg, qmi_codec_tlv);
+			return;
+		}
+		c = l >= 4 ? (uint32_t)(t[0] | (t[1] << 8) | (t[2] << 16) | ((uint32_t)t[3] << 24)) : t[0];
+		if (c != voc_codec) {
+			LOG("VOCODER: the modem's speech codec %u (%s, %u kHz) from VOICE ind 0x%04x TLV 0x%02x (%u bytes)%s\n", c,
+			    codec_name(c), codec_khz(c), msg, qmi_codec_tlv, l, codec_khz(c) ? "" : " -- not a known codec: ignored");
+			if (codec_khz(c)) {
+				voc_codec = c;
+				voc_pending = voc_call_up;
+			}
+		}
+		return;
+	}
+	if (qmi_codec_ind == 0 && voc_nlearned < sizeof(voc_learned) / sizeof(voc_learned[0])) {
+		char ids[96];
+		int io = 0;
+
+		for (unsigned i = 0; i < voc_nlearned; i++) {
+			if (voc_learned[i] == msg) {
+				return;
+			}
+		}
+		voc_learned[voc_nlearned++] = (uint16_t)msg;
+		ids[0] = 0;
+		for (uint32_t k = 0; k + 3 <= n && io < (int)sizeof(ids) - 12;) {
+			unsigned l = (unsigned)(p[k + 1] | (p[k + 2] << 8));
+			io += snprintf(ids + io, sizeof(ids) - (size_t)io, "%s%02x/%u", k ? "," : "", p[k], l);
+			k += 3 + l;
+		}
+		LOG("VOCODER learn: VOICE ind 0x%04x (TLVs %s)%s\n", msg, ids[0] ? ids : "none",
+		    voc_call_up ? " during a call" : "");
+	}
+}
+
+/* 0x002f: the answer's TLVs */
+static uint16_t
+voc_answer(uint8_t *b, size_t bn)
+{
+	uint8_t type, rate, i2s;
+	char src[160];
+	uint32_t o = 0;
+	uint8_t v[2];
+
+	if (bn < 8) {
+		return 0;
+	}
+	voc_now(&type, &rate, &i2s, src, sizeof(src));
+	v[0] = type;
+	v[1] = rate;
+	put_tlv(b, &o, 0x01, v, 2);
+	LOG("VOCODER: AUDIO(apple) 0x002f GetVocoderType -> TLV 0x01 type 0x%02x rate %u kHz (%s)\n", type, rate, src);
+	return (uint16_t)o;
+}
+
+/* CommCenter's 0xe1 client (a local service: its cid is in the session's bitmap, not in cl[]) still there */
+static int
+e1_alive(void)
+{
+	for (unsigned i = 0; i < NSESS; i++) {
+		if (B->st[i].sess != 0 && B->st[i].sess == e1cl.sess && B->st[i].pipe == e1cl.pipe) {
+			return (B->st[i].cids[0xe1][e1cl.cid / 8] >> (e1cl.cid % 8)) & 1;
+		}
+	}
+	return 0;
+}
+
+static void
+voc_poll(void)
+{
+	uint8_t type, rate, i2s, t[16], v[2];
+	char src[160];
+	uint32_t o = 0;
+
+	if (!qmi_vocoder || !voc_pending) {
+		return;
+	}
+	if (!e1cl.used || !e1_alive()) {
+		if (voc_pending == 1) {
+			LOG("VOCODER: no CommCenter AUDIO(apple) client seen yet: the 0x0030 indication waits\n");
+			voc_pending = 2;
+		}
+		return;
+	}
+	voc_pending = 0;
+	voc_now(&type, &rate, &i2s, src, sizeof(src));
+	v[0] = type;
+	v[1] = rate;
+	put_tlv(t, &o, 0x01, v, 2);
+	put_tlv(t, &o, 0x10, &i2s, 1);
+	LOG("VOCODER: AUDIO(apple) ind 0x0030 VocoderTypeInfo -> %s/%u cid %u: type 0x%02x rate %u kHz, I2S %u kHz (%s)\n",
+	    pipe_name[e1cl.pipe], e1cl.sess, e1cl.cid, type, rate, i2s, src);
+	send_ind(e1cl.pipe, e1cl.sess, 0xe1, e1cl.cid, 0x0030, t, o);
 }
 
 /*
@@ -4764,6 +4953,9 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			    t && tl >= 2 ? t[1] : -1, t && tl >= 3 && t[2] >= 0x20 && t[2] < 0x7f ? t[2] : '-', ml);
 		}
 	}
+	if (c->svc == 0x09 && qmi_vocoder && d[0] == 0x04) {
+		voc_snoop(rmsg, d + 7, ml);     /* 1093 */
+	}
 	if (c->svc == 0x09 && voice_auto) {     /* 1074 */
 		if (d[0] == 0x04 && rmsg == 0x002e) {
 			vauto_parse(d + 7, ml, 0x01, "All Call Status ind");
@@ -4979,6 +5171,7 @@ sweet_qmux_poll(void)
 		mst_table("kern.sweet_qmux_dump");
 	}
 	data_poll(now);                 /* 1080 */
+	voc_poll();                     /* 1093 */
 	if (now >= next_stats) {
 		if (next_stats) {
 			int ncl = 0, nidle = 0;
@@ -5084,6 +5277,10 @@ QINT(sweet_qmux_err, err_code, "redfin 1068: QMI error of the built-in err entri
 QINT(sweet_qmux_cidfail, cidfail, "redfin 1068: 1 = GetClientId fails for a service the modem lacks (abpcidfail)");
 QINT(sweet_qmux_reuse, reuse, "redfin 1068: 1 = released router clients pooled per service (abpreuse, default 1)");
 QINT(sweet_voice_dtmflog, dtmflog, "redfin 1086: 1 = log VOICE DTMF requests/answers/indications, Apple AUDIO request ids, unanswered requests (default 1)");
+QINT(sweet_qmi_vocoder, qmi_vocoder, "redfin 1093: Apple AUDIO (0xe1): 0 blank ok (default), 1 real GetVocoderType answer + VocoderTypeInfo indication");
+QINT(sweet_qmi_vocoder_type, qmi_voc_type, "redfin 1093: the QMI vocoder type byte in VocoderInfo (default 0x10)");
+QINT(sweet_qmi_codec_ind, qmi_codec_ind, "redfin 1093: VOICE indication id with the speech codec (0 = learn: log VOICE indication ids)");
+QINT(sweet_qmi_codec_tlv, qmi_codec_tlv, "redfin 1093: that indication's codec TLV id (default 0x11)");
 QINT(sweet_qmux_kick, kickon, "redfin 1068: 1 = RESUME_TX kick after 5 s without an answer (abpkick, default 1)");
 QINT(sweet_qmux_holdnas, holdnas, "redfin 1068: NAS indications held until BSP activation (abpholdnas: 0 off, 1 = 5 s, >= 100 ms)");
 QINT(sweet_qmux_holddly, holddly, "redfin 1068: ms after the BSP activation indication before held NAS indications go (abpholddly, 500)");

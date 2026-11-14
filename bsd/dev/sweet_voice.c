@@ -180,6 +180,7 @@ extern bool sweet_vproxy_run(void);
 extern void sweet_vproxy_stop(const char *why);
 extern void sweet_vproxy_dtmf(uint32_t low, uint32_t high);
 extern uint32_t sweet_vproxy_rate(void);
+extern void sweet_qmux_vocoder_note(uint32_t rate_hz, int up);  /* 1093: sweet_qmux.c (acts only with kern.sweet_qmi_vocoder 1) */
 #define PROXY_RX_PORT           0x2000          /* RT_PROXY_PORT_001_RX: the downlink, read by the AP */
 #define PROXY_TX_PORT           0x2001          /* RT_PROXY_PORT_001_TX: the uplink, written by the AP */
 #define POPT_CREATE             1u
@@ -557,6 +558,7 @@ voice_down(const char *why)
 		SAY("mic path let go\n");
 	}
 	voice_state = 0;
+	sweet_qmux_vocoder_note(0, 0);  /* 1093 */
 	SAY("OFF\n");
 }
 
@@ -808,6 +810,7 @@ voice_up(int target)
 	if (proxy_opts & POPT_HOSTPCM) {
 		hostpcm_probe((proxy_opts & POPT_8K) ? 8000 : 16000);
 	}
+	sweet_qmux_vocoder_note(proxy_up ? sweet_vproxy_rate() : 0, 1);       /* 1093 */
 	return true;
 fail:
 	failures++;
