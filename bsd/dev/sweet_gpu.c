@@ -2395,6 +2395,31 @@ uint32_t sweet_mtl_drainall = 1;
 SYSCTL_UINT(_kern, OID_AUTO, sweet_gpu_pool_drainall, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mtl_drainall, 0,
     "SWEET GPU: a refused v2 allocation takes back every client's reuse cache first (1097, default 1)");
 
+/*
+ * redfin 1098: kern.sweet_mtl 1|2|3 (start value = boot-arg sweetmtl): the Metal plug-in IOAcceleratorES publishes,
+ * 1 SweetMetal/SweetMTLDevice, 2 SweetMetal2/SweetMTL2Device, 3 HakiosMetal/HakiosMetalDevice
+ * (/System/Library/Extensions/HakiosMetal.bundle must be there). For processes that make their Metal device later.
+ */
+extern int sweet_mtl_publish(int which);
+static int
+sysctl_sweet_mtl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_mtl_publish(-1), sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (sweet_mtl_publish(value) < 0) {
+		return EINVAL;
+	}
+	printf("SWEET MTL: Metal plug-in %d (%s; 1098; processes that create their device from now)\n", value,
+	    value == 3 ? "HakiosMetal" : value == 2 ? "SweetMetal2" : "SweetMetal");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mtl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_mtl, "I", "SWEET MTL: published Metal plug-in 1 SweetMetal, 2 SweetMetal2, 3 HakiosMetal (1098)");
+
 void
 sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
 {

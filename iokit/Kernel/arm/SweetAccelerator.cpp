@@ -76,6 +76,7 @@ void sweet_gpu_pool_limits(uint32_t *cap_mb, uint32_t *reserve_mb);     /* 1097:
 void sweet_gpu_pool_dump(const char *why);                              /* 1097 */
 void sweet_mtl_clients_log(void);                                       /* 1097: below */
 uint64_t sweet_mtl_reuse_drain_all(void);                               /* 1097: below */
+int sweet_mtl_publish(int which);                                       /* 1098: below */
 extern uint32_t sweet_mtl_drainall;                                     /* 1097: kern.sweet_gpu_pool_drainall (sweet_gpu.c) */
 }
 
@@ -110,6 +111,11 @@ public:
 
 OSDefineMetaClassAndStructors(SweetAccelerator, IOAcceleratorES);
 
+static SweetAccelerator *sweet_mtl_service;     /* 1098: the published service (kern.sweet_mtl), never released */
+static uint32_t sweet_mtl_which = 1;
+static const char *sweet_mtl_plugin_name(uint32_t which);
+static const char *sweet_mtl_class_name(uint32_t which);
+
 IOService *
 SweetAccelerator::probe(IOService *provider, SInt32 *score)
 {
@@ -124,18 +130,52 @@ SweetAccelerator::start(IOService *provider)
 	if (!IOService::start(provider)) {
 		return false;
 	}
-	/* sweetmtl=1: SweetMetal (host-made templates, phone/metal); sweetmtl=2: SweetMetal2 (metal2vulkan + Turnip, phone/metal2) */
+	/*
+	 * sweetmtl=1: SweetMetal (host-made templates, phone/metal); sweetmtl=2: SweetMetal2 (metal2vulkan + Turnip, phone/metal2);
+	 * 1098: sweetmtl=3: HakiosMetal (hakios-metal, phone/hmetal: /System/Library/Extensions/HakiosMetal.bundle, class
+	 * HakiosMetalDevice). kern.sweet_mtl changes the published names at run time (processes that create their Metal
+	 * device afterwards). Default unchanged (boot-arg).
+	 */
 	uint32_t which = 1;
 	PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
-	const char *plugin = which == 2 ? "SweetMetal2" : "SweetMetal";
-	setProperty("MetalPluginName", plugin);
-	setProperty("MetalPluginClassName", which == 2 ? "SweetMTL2Device" : "SweetMTLDevice");
-	setProperty("IOGLBundleName", plugin);
 	setProperty("model", "Adreno 620");	/* redfin (0904) */
 	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
+	sweet_mtl_service = this;
+	sweet_mtl_publish((int)which);
 	registerService();
-	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
+	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", sweet_mtl_plugin_name(sweet_mtl_which));
 	return true;
+}
+
+/* 1098: the plug-in names for sweetmtl / kern.sweet_mtl 1..3 */
+static const char *
+sweet_mtl_plugin_name(uint32_t which)
+{
+	return which == 3 ? "HakiosMetal" : which == 2 ? "SweetMetal2" : "SweetMetal";
+}
+
+static const char *
+sweet_mtl_class_name(uint32_t which)
+{
+	return which == 3 ? "HakiosMetalDevice" : which == 2 ? "SweetMTL2Device" : "SweetMTLDevice";
+}
+
+/* kern.sweet_mtl (bsd/dev/sweet_gpu.c): -1 = read only; 1..3 = publish those names. The current value, or -1 on a bad one. */
+int
+sweet_mtl_publish(int which)
+{
+	if (which < 0) {
+		return (int)sweet_mtl_which;
+	}
+	if (which < 1 || which > 3 || sweet_mtl_service == NULL) {
+		return -1;
+	}
+	sweet_mtl_which = (uint32_t)which;
+	const char *plugin = sweet_mtl_plugin_name(sweet_mtl_which);
+	sweet_mtl_service->setProperty("MetalPluginName", plugin);
+	sweet_mtl_service->setProperty("MetalPluginClassName", sweet_mtl_class_name(sweet_mtl_which));
+	sweet_mtl_service->setProperty("IOGLBundleName", plugin);
+	return which;
 }
 
 /* ---- user client ---- */
