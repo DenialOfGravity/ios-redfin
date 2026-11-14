@@ -9,6 +9,7 @@
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
 #   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
+#   sweetstate  state-dump helper: all kern.sweet_* sysctls, process start times, mapped bundles (tools/state.py)
 #   sweetmon    monitor daemon: samples, klog tail, kdebug traces over TCP 5150 (docs/redfin/sweetmon.md)
 #   expt, exq, runmigrator: one-off probes of ExtensionFoundation and DataMigration (runmigrator needs
 #   com.apple.migrationpluginwrapper's entitlements, not in git)
@@ -29,6 +30,8 @@ build() {	# NAME SOURCE [FLAGS...]
 # SweetControl.app + sweetctl (ws-n-ctl): first, so a failing tool below (set -e) cannot skip it
 sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
 for c in membw pstack psx sweettrace simpin; do build $c $c.c; done
+# sweetstate: helper of the state dump (phone/tools/sweetstate.sh; tools/state.py); optional, so it cannot fail the build
+build sweetstate sweetstate.c || echo "WARN sweetstate failed"
 for m in autolock expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices

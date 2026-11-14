@@ -1,0 +1,3538 @@
+# Desired state of the redfin phone. Edit in git, then `state apply` (tools/state.py, state/README.md).
+[meta]
+schema = 1
+device = "redfin"
+adopted = "2026-11-14T16:57:12Z"
+from_dump = "state/snapshots/2026-11-14T1650Z-adopt.dump"
+note = "bootstrapped by state.py adopt; source = \"unknown\" entries need a decision (resolve or retire)"
+known_good_baseline = """
+=== BASELINE 2026-11-14 (boot rbb2b) ===
+Kernel ws-n-bba2 7100798 (builds/xnu/ws-n-bba2-7100798df6, sha256 33bb5524..., klog PA 0x101d76f18), base r5p3a, cmdline.bb19u15. Lacks 1094.
+Plug-in RedwoodAudio s4 a93b1bb (sha256 3638a0ca...), backup RedwoodAudio.pre-s4 (aa51598a... = dcc81fd).
+Runtime: voice_proxy 0 (OLD direct audio active), pace 1, opts 0, bbv_service 0, voice_opts 1920, qmi_rules 0, qmi_vocoder 0, data_fwd 0, gains 0/0.
+Flags: redwood-call-route=4, sweetpin.off (native SIM PIN works), sweetcell.conf hooks=0.
+Works: native SIM PIN, calls (2-way audio), SMS, Wi-Fi (manual join), BT media. Data BLOCKED (activation gate). Bars missing on home/lock screen.
+Arm new call audio: sctl bbv_service 1; sctl voice_proxy 2; restart mediaserverd. Not promoted (no regression, no 1094).
+Handover doc: claude/redfin-handover-2026-11-14.md
+2026-11-14 hm-int2 504c000 install: backups /System/Library/Extensions/SweetMetal2.bundle -> /var/local/hmetal/SweetMetal2-shim.bundle.knowngood-6740748; /var/local/hmetal/lib/HakiosMetal.bundle -> /var/local/hmetal/lib/HakiosMetal.bundle.knowngood-var12; /var/local/hmetal/ca/env -> /var/local/hmetal/ca/env.knowngood-var12; /var/local/hmetal/m2-fallback -> /var/local/hmetal/m2-fallback.pre-int2"""
+
+# What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
+[boot]
+image = "rbb2b"
+base = "r5p3a"
+kernel_dir = "builds/xnu/ws-n-bba2-7100798df6"
+kernel_branch = "ws-n-bba2"
+kernel_sha = "7100798df600e7862abe7c4f4b90fe0dfda64685"
+kernel_uuid = "39034499-485D-3BAF-A4D6-C1C245D81EE3"
+cmdline_file = "agent/stage/cmdline.bb19u15"
+bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 ufslogsecs=2 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=3 sweetabp=15 sweetbb=19 sweetufs=15"
+
+# Paths state.py may write (roots) and how the dump is read. Outside roots or under firmware: apply refuses.
+[managed]
+roots = [
+  "/var/local",
+  "/System/Library/Extensions/SweetMetal2.bundle",
+  "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver",
+  "/System/Library/xpc",
+  "/Applications/SweetControl.app",
+  "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches",
+]
+ignore = [
+  "/var/local/scratch/*",
+  "/var/local/tmp/*",
+  "/var/local/m2v-cache/*",
+  "/var/local/hmetal/cache/*",
+  "/var/local/hmetal/log/*",
+  "/var/local/hmetal/dump/*",
+  "/var/local/fw/rmtfs/*",
+]
+volatile = [
+  "*.log",
+  "/var/local/wland.log.prev",
+  "/var/local/cell.status",
+  "/var/local/wland.boot",
+  "/var/local/wland.ipa",
+  "/var/local/hmetal/ca/bbd-hm.starts",
+  "/var/local/hmetal/ca/bbd-hm",
+  "/var/local/sweetctl/changes.log",
+  "/var/local/modem-profiles-*.bak",
+  "/var/local/ipa-ulflt.bin",
+  "/var/local/sensd-probe.log",
+  "/var/local/sweetmon.key",
+  "/var/local/sweethud",
+  "*.log.[0-9]",
+  "/var/local/hmetal/m2-fallback",
+  "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/*",
+]
+stock = [
+  "/System/Library/xpc/extensions.plist",
+  "/System/Library/xpc/extensions.plist.sig",
+  "/System/Library/xpc/launchd.plist.sig",
+]
+firmware = [
+  "/var/local/fw",
+  "/var/local/fw/*",
+  "/var/local/hexagon",
+  "/var/local/hexagon/*",
+  "/dev/*",
+]
+secret = [
+  "/var/local/abp-policy.conf*",
+  "/var/local/modem-profiles-*",
+  "*.key",
+  "*MobileGestalt*",
+  "/var/local/fw/rmtfs/*",
+]
+nohash = [
+  "./SweetMetal2.bundle.*",
+  "./RedwoodAudio.driver.*",
+  "./knowngood-r5au1s",
+  "./knowngood-r5au1s/*",
+  "./hmetal/ca/HakiosMetal.bundle.*",
+  "./hmetal/ca/shim.*",
+  "./hexagon.t*",
+  "./launchd.plist.*",
+  "./wland.log.*",
+  "./btd.log.*",
+  "./*.text",
+  "./*.nv12",
+  "./*.pre-*",
+]
+scratch = "/var/local/scratch"
+
+# Applied at every boot: generated into /var/local/sweet-sysctl.conf (read by /var/local/bin/sweet-sysctl.sh, started from sensd-probe.sh = launchd job org.iosonpixel.sensdprobe). apply also sets the running value.
+[sysctl]
+"kern.sweet_abp_readyms" = 2000
+"kern.sweet_mdm_crash" = 1
+"kern.sweet_voice_opts" = 1920
+"kern.sweet_voice_auto" = 1
+"kern.sweet_qmi_republish" = 4
+"kern.sweet_qmi_republish_wait_s" = 45
+"kern.sweet_qmi_republish_ms" = 3000
+"kern.sweet_voice_gain_rx" = 6
+"kern.sweet_voice_gain_tx" = 4
+
+# Runtime values diff checks but that are NOT written to the conf (kernel defaults, boot-args); apply sets them with sctl.
+[sysctl_expect]
+"kern.sweet_abm_upwait_ms" = 60000
+"kern.sweet_abp" = 15
+"kern.sweet_abp_publish" = 1
+"kern.sweet_bb" = 19
+"kern.sweet_bbv_service" = 0
+"kern.sweet_data_fwd" = 0
+"kern.sweet_fb_early_retire" = 0
+"kern.sweet_fb_hz" = 90
+"kern.sweet_gov_framehold" = 0
+"kern.sweet_gpu_dcvs" = 0
+"kern.sweet_gpu_dcvs_boost_ms" = 1000
+"kern.sweet_gpu_dcvs_floor" = 400
+"kern.sweet_gpu_ibmax" = 16
+"kern.sweet_gpu_tlb" = 0
+"kern.sweet_haptic" = 196
+"kern.sweet_ipa_arm" = 0
+"kern.sweet_ipa_drv" = 1
+"kern.sweet_ipa_ee1" = 0
+"kern.sweet_ipa_join_s" = 40
+"kern.sweet_mlink_idle_us" = 4000
+"kern.sweet_pdp_keep" = 3
+"kern.sweet_pdp_keepidle" = 120
+"kern.sweet_pdp_mtu" = 1492
+"kern.sweet_pdp_poll_us" = 1000
+"kern.sweet_pdp_test" = -1
+"kern.sweet_qmi_rules" = 0
+"kern.sweet_qmux_dump" = 0
+"kern.sweet_spmi_lock" = 1
+"kern.sweet_ssr_notify" = 0
+"kern.sweet_surfkeep" = 1
+"kern.sweet_torch" = 0
+"kern.sweet_torch_alarm" = 1
+"kern.sweet_torch_reinit" = 0
+"kern.sweet_ufs_diag" = 3
+"kern.sweet_ufs_diag_phy" = 1
+"kern.sweet_ufs_guard" = 1
+"kern.sweet_ufs_recover" = 0
+"kern.sweet_ufs_recover_test" = 0
+"kern.sweet_ui_bigcore" = 3
+"kern.sweet_usb_poll_us" = 100
+"kern.sweet_usb_recover" = 1
+"kern.sweet_venus" = 0
+"kern.sweet_voice" = 0
+"kern.sweet_voice_below_ear" = 240
+"kern.sweet_voice_below_spk" = 160
+"kern.sweet_voice_proxy" = 0
+"kern.sweet_voice_proxy_gain_dl" = 0
+"kern.sweet_voice_proxy_gain_ul" = 0
+"kern.sweet_voice_proxy_opts" = 0
+"kern.sweet_voice_proxy_pace" = 1
+"kern.sweet_voice_route" = 2
+"kern.sweet_vsync_lock" = 0
+"kern.sweet_vsyncphase" = 5000
+"kern.sweet_vsyncphase_grid" = 0
+"kern.sweet_wds_profiles_ack" = 0
+
+# Processes expected up. restart = the command apply runs after installing something that names this process.
+[[process]]
+name = "launchd"
+
+[[process]]
+name = "SpringBoard"
+
+[[process]]
+name = "backboardd"
+
+[[process]]
+name = "mediaserverd"
+
+[[process]]
+name = "CommCenter"
+
+[[process]]
+name = "wland"
+
+[[process]]
+name = "sensd"
+
+[[process]]
+name = "fastrpcd"
+
+[[process]]
+name = "btd-bridge"
+
+[[process]]
+name = "bluetoothd"
+
+[[process]]
+name = "wifid"
+
+[[process]]
+name = "sweetmon"
+restart = "/var/local/bin/psx -k sweetmon; /var/local/bin/sweetmon -D </dev/null >/dev/null 2>&1"
+
+[[process]]
+name = "configd"
+
+[[process]]
+name = "locationd"
+
+[[process]]
+name = "dropbearmulti"
+restart = "-"
+note = "ssh: never restarted by state.py"
+
+
+# Single files. source = PF-relative path of the build output (builds/<target>/<ref>-<sha10>/NAME), agent/stage/..., "stock" (Apple, untouched) or "unknown" (provenance not found: resolve or retire).
+[[file]]
+path = "/System/Library/xpc/com.apple.voicemail.vmd.job.plist.disabled"
+source = "moved-aside"
+sha256 = "c9004005be6dda9c556f4ec037f5e0d335e604ad952c8f5e8260534149a7bac0"
+mode = "644"
+owner = "0:0"
+note = "vmd disabled 2026-10-29 (user decision; revisit with telephony)"
+
+[[file]]
+path = "/System/Library/xpc/launchd.plist"
+source = "unknown"
+sha256 = "ae563fa868b68153e886d944d0a85eb215a9b5218cec6eefc54a00c77719a286"
+mode = "644"
+owner = "0:0"
+restart = "reboot"
+
+[[file]]
+path = "/var/local/bin/a2s"
+source = "r18b-user/a2s"
+sha256 = "99b021455d1c38328316bae73b1e432f9a7d2dd07e0b084d56a3c8db1f66b7d5"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/autolock"
+source = "builds/userland/52c34efb3e72c87add9ef6ff35b9cc8742f165eb-52c34efb3e/autolock"
+sha256 = "12fbe71161be469c248a931e7ad387a41c08bd70df253cc15a907d5bf128e873"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "52c34efb3e72c87add9ef6ff35b9cc8742f165eb"
+sha = "52c34efb3e"
+
+[[file]]
+path = "/var/local/bin/avplay"
+source = "builds/userland/ws-n-wland-int5-f0602dcaad/avplay"
+sha256 = "054b274061b064cd94e7c7a4aced3c13005b0f37915e4c9442cc9cfd61829f63"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-n-wland-int5"
+sha = "f0602dcaad"
+
+[[file]]
+path = "/var/local/bin/bluetool"
+source = "builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/bluetool"
+sha256 = "7633bf84bd1f11f4909e6d9500f0371cf118e3ece2e843789d8bb66314e6b6ad"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "a93b1bb86943466b57716125a619cf948a86e50e"
+sha = "a93b1bb869"
+
+[[file]]
+path = "/var/local/bin/btd"
+source = "r23-user/btd"
+sha256 = "f9f802636a24da3c11e4c4843ff528b21dd39fa5ad34b679a8b5a769dc0fc2af"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/btd-bridge"
+source = "builds/userland/ws-y-sensd-orient-3b82505fcd/btd"
+sha256 = "108b0a339f23c14da738fb8ae6a0304f158357d537de95b224d55200637f83c7"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-y-sensd-orient"
+sha = "3b82505fcd"
+restart = "btd-bridge"
+
+[[file]]
+path = "/var/local/bin/dash"
+source = "agent/stage/dash"
+sha256 = "3054c79b25c5dabf7a4ee24a1a09a8f76e576125dadf070866e7d6f6985790c1"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/dropbearmulti"
+source = "agent/stage/dropbearmulti"
+sha256 = "ed448e730eaffdf5ef1323b10a1b7e68c68c2524c126fd66c5ae2c34bcf35d90"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/fastrpcd"
+source = "unknown"
+sha256 = "1bc4a68c5d1f3a668428ff5ec8d9d46ffdbbce964061162f096b1498aa800dd6"
+mode = "755"
+owner = "0:0"
+restart = "fastrpcd"
+
+[[file]]
+path = "/var/local/bin/flingtrace.sh"
+source = "agent/tmp/flingtrace.sh"
+sha256 = "10aa4cc9599114cd1a13decc6342314fdf327c2ed84718040b59afd16f8f2a40"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/flingtrace2.sh"
+source = "agent/tmp/flingtrace2.sh"
+sha256 = "b1059dde80b9c4c86ed1abeb1ca08daa68f529703328de3bfcb686e4e22641b6"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/fstypeovr"
+source = "agent/stage/fstypeovr"
+sha256 = "2ba42b9e77fd62da209e148f3311dfdbd58e93e66112bc5b146aea0518dcbffb"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/g-quick.sh"
+source = "agent/stage/g-quick.sh"
+sha256 = "c589c517b48d4480fb29c12125280a22eff5e6c7e3f9b6695c8414d39e1986ea"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/hfsgrow"
+source = "agent/stage/hfsgrow2"
+sha256 = "a1103e3d9c3c0d5038f24712737a87532956ee468279fcc7375b6e4259badb93"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/imgdump"
+source = "agent/stage/imgdump4"
+sha256 = "33c21acaa35940652ff5fdbbbc72fad7516174397db2ab84343f744004eba540"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/lsreg"
+source = "unknown"
+sha256 = "af3f5837ef8fe7f3f603dd76aaac04a5d5a149a4a4de2567dd92b8c05ab51c77"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/mic_test"
+source = "r28-user/mic_test"
+sha256 = "6b7e4246bdfa3f738b756c2faa5c8339f1f3df52ef02b5bec8d5171cc8d36ba7"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/netsvc"
+source = "unknown"
+sha256 = "a1c049ba084c601d796a2046a1808954e8953535206538b3bf1a062991724309"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/nettest"
+source = "unknown"
+sha256 = "8dc41afcb209b49e98cd9eac5e2fdc518d601a73ea3b035b968972abbffb0f3f"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/openapp"
+source = "unknown"
+sha256 = "562fd44a6d045c5be808ad75090ef67c9b2f1c5630f196d1ec1b05071863c78d"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/oslog"
+source = "agent/stage/oslog"
+sha256 = "c4fc04699e1b86e7e554298c1d6004d9f05e0c5da3471e952ae0ab5ae65eb081"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/oslogs"
+source = "agent/stage/oslogs"
+sha256 = "056daca72032f57ab6f22fc0dc34240f479fb9a2d96799939d373a472eca81f0"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/pdptest"
+source = "builds/userland/2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf-2e899aa8d6/pdptest"
+sha256 = "82d841ff14c0975f9de2d91451e177760c636fde81a38d6af315c8ec7193d701"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf"
+sha = "2e899aa8d6"
+
+[[file]]
+path = "/var/local/bin/pmem"
+source = "builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/pmem"
+sha256 = "b2ef216328a80dcd2d35269b29fc8c8568bc1b000ff5ea22591d4c52b7afe528"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "a93b1bb86943466b57716125a619cf948a86e50e"
+sha = "a93b1bb869"
+
+[[file]]
+path = "/var/local/bin/prefs"
+source = "unknown"
+sha256 = "10a99f3039aa7c79cdcc9b0de8bcf00f6205447231757659a56975b429090e82"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/pstack"
+source = "unknown"
+sha256 = "d2475f15f483914aae9adf06090a64b5808a1fd06963b59a7e4f44c6d251311d"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/psx"
+source = "agent/stage/psx"
+sha256 = "e63ab6343e0cda4a4dfbb3fb2f864da56d1beed41690734e94493c38baad5034"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/sctl"
+source = "agent/stage/sctl-m0-213a432"
+sha256 = "66f13f0cc0f2e5f7dbe38c86850fe2369c18e9db2897ca4d253326c0cb57ec4b"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/sensd"
+source = "builds/userland/9ce81fa9db38e6e96744873d05631b942db7e3a4-9ce81fa9db/sensd"
+sha256 = "5f8a08bdb943fd2b1c5250bfdbc961199ba13d1e4af0b40576b60bc6f70e0978"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "9ce81fa9db38e6e96744873d05631b942db7e3a4"
+sha = "9ce81fa9db"
+restart = "sensd"
+
+[[file]]
+path = "/var/local/bin/sensd2"
+source = "unknown"
+sha256 = "5de7493c69aa39063ad312f68e6d9ea16e641db801a7be0262fc93b26951e679"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/simpin"
+source = "unknown"
+sha256 = "c80fd02f34315a7ddd9a043108a6cc03adca71df39947f9411720eccc8d486bc"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/sweet-sysctl.sh"
+source = "agent/stage/sweet-sysctl.sh"
+sha256 = "bc8509021d61a862af843030f7dec701b290889d539918d97b9f1c6edf36ebe8"
+mode = "755"
+owner = "0:0"
+restart = "reboot"
+
+[[file]]
+path = "/var/local/bin/sweetctl"
+source = "builds/userland/2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf-2e899aa8d6/sweetctl"
+sha256 = "2c038cc77860f13dbb3615b5b6799920b8203f35708fbe645f74aacafc60c179"
+mode = "4755"
+owner = "0:0"
+target = "userland"
+ref = "2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf"
+sha = "2e899aa8d6"
+
+[[file]]
+path = "/var/local/bin/sweetmon"
+source = "builds/userland/645854a7340a681bf6ab1740378059cab9a7a5c9-645854a734/sweetmon"
+sha256 = "ccfe84cca1f74df86e032ab027b26fdd4e584093678c1a80895e701941fb9684"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "645854a7340a681bf6ab1740378059cab9a7a5c9"
+sha = "645854a734"
+restart = "sweetmon"
+
+[[file]]
+path = "/var/local/bin/sweettrace"
+source = "builds/userland/ws-u-lab-d9a9c25217/sweettrace"
+sha256 = "d6fd649f9b24b5dd2ba51fe399472f64ca1c8134fc44077d70762ec3146eef8b"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-u-lab"
+sha = "d9a9c25217"
+
+[[file]]
+path = "/var/local/bin/toybox"
+source = "agent/stage/toybox"
+sha256 = "ef41ae0e891f508283ae281ff190f8a8e6f198d72696d9ed44af6454a45b5fa9"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/venusc"
+source = "builds/userland/ws-n-wland-int5-f0602dcaad/venusc"
+sha256 = "041a45f93f6a4eb252ee22d755ba946a1796b116aba6acd6ed5bd3ad1fa126ca"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-n-wland-int5"
+sha = "f0602dcaad"
+
+[[file]]
+path = "/var/local/bin/venusctl"
+source = "builds/userland/d4c2a0e88e47b5e8e00f171253f0fa8aef3deab1-d4c2a0e88e/venusctl"
+sha256 = "3aa8b31764687bc9946c57a4cdba6046889a4d159f4d7aacfc12124505e15c6d"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "d4c2a0e88e47b5e8e00f171253f0fa8aef3deab1"
+sha = "d4c2a0e88e"
+
+[[file]]
+path = "/var/local/bin/venusd"
+source = "builds/userland/fe5bee5df669cea69aafc117e622439e659cd894-fe5bee5df6/venusd"
+sha256 = "e85d199df5e157fc5885cc011a683017014b40d9eea9ec12ae4a16f32ecc4a4b"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "fe5bee5df669cea69aafc117e622439e659cd894"
+sha = "fe5bee5df6"
+
+[[file]]
+path = "/var/local/bin/vtdecode"
+source = "builds/userland/ws-n-wland-int5-f0602dcaad/vtdecode"
+sha256 = "f43ece7470fa31b38c445acd849a54837cf2792abd207fd1489ae8b5b0c6272a"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-n-wland-int5"
+sha = "f0602dcaad"
+
+[[file]]
+path = "/var/local/bin/wds-profile-backup.sh"
+source = "agent/stage/wds-profile-backup.sh"
+sha256 = "db7e4ac1a01364983ccc8e869c071d2cab4d44a3b9b05f3f24f04c3c2f4b27e3"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/wland"
+source = "builds/userland/ws-n-wland-int5-f0602dcaad/wland"
+sha256 = "291a65b8f3b5ffca3e3ea4894c6334ac66e6d9fe6ccabc4470ab28f997498cd7"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-n-wland-int5"
+sha = "f0602dcaad"
+restart = "wland"
+
+[[file]]
+path = "/var/local/lib/FPAPFS.dylib"
+source = "agent/stage/FPAPFS.dylib"
+sha256 = "8a3d315a26c7ba07b07f96a1ceddfdb9be66ceb85af1a1c97bd0c010c8af9d15"
+mode = "644"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/lib/SweetFPS.dylib"
+source = "builds/userland/27efaa0b29ea0e12a4959630fdec03dcde98d01f-27efaa0b29/SweetFPS.dylib"
+sha256 = "75766529f848e8713954cd23a53a01c0c0e8fa676c7aaf86dbf904d7472e5c8d"
+mode = "644"
+owner = "0:0"
+restart = "SpringBoard"
+target = "userland"
+ref = "27efaa0b29ea0e12a4959630fdec03dcde98d01f"
+sha = "27efaa0b29"
+
+[[file]]
+path = "/var/local/lib/SweetHaptics.dylib"
+source = "r11/SweetHaptics.dylib"
+sha256 = "99d57d12db6a6a81545466c3da776c1c64e5d6b1d81a6b4a5d5441afbf53a950"
+mode = "644"
+owner = "0:0"
+
+
+# Bundle directories: every file with its sha256; apply installs the whole bundle from source.
+[[bundle]]
+path = "/var/local/fw"
+source = "firmware-copy"
+files = { "adsp.b00" = "0270ff3da6555a5996a443ec67dd97e1c562775bb84521f476a633a97c9051de", "adsp.b01" = "82edc02030143dcaa83a33cee2c6ca777535462673e8209dd99146c83b47996b", "adsp.b02" = "9327dbbb1872340e0bb18e6dae2eff724580c0fc641dad881b588cedf1c08993", "adsp.b03" = "f1a9364332526998092a745802b9ab559740f4094168b502b98778f0ec914ab3", "adsp.b04" = "14878798ebaa255bca1c7e8ea5b288f3675d9080d37c64c742a1f83174d96b24", "adsp.b05" = "b9a03c5d68a3d4e817a00541d0e894926db82c3a53839b474e45f3993dbe5a3f", "adsp.b06" = "c4f2d605ef477622df0d5e590711583498b721450801073fcdbddf84f6a05ebe", "adsp.b07" = "5fcb33a1734cc746fa78d4ee17adafbd53bba758f14e5eb77bd029080db431ab", "adsp.b08" = "4692c1787190548c08a540d514bd4919cd6942cf11821d3d883ac16eb50cbcdc", "adsp.b09" = "e5d45097d691a850d05612be09fa746ded5766323e84dc6126f0f2ddfb2f8a13", "adsp.b10" = "4d6aa155332f55b24d69b8665a6bef04e24a433dc8882e62f5f20cafdef363cf", "adsp.b11" = "506652ac2ee610928977485481f6165cd6acd3881c7e343375a0c4157e105dd7", "adsp.b12" = "f5b3939da63ee92a217f08a15b14fe5ccc2de0acefd1258ac5720cd63faa0f3e", "adsp.b13" = "de03ec80d5eb3afd91f0432c394a11901b63a895c819d6677a3593959f209462", "adsp.b14" = "eac44da5484627d9cf4ad894a0efe6f440b8018995e214a23402d9d7ac57a314", "adsp.b15" = "f221c0d944263267efc830fda91d6c15b9c8c548c3325457ab22fc280a9faece", "adsp.b16" = "3ec458fe0205c4ddfb791a61416fabcf45c2b9a20a361116e4ac82c5494d3772", "adsp.b17" = "b2ebedb83d8f042f00efc30c66c559370d299ca74cc93c909f409ce6327ab8ac", "adsp.b18" = "b24a56c75c036fc621a7e2d0572b03e756fed503ad91deb098e767e135c505d8", "adsp.b19" = "024858b42c5a0afc2f132c979bbc5d8f3f2037845f9d5199c8fce010d5a483f8", "adsp.b20" = "ba8a7caa18430e9fdd1c1844586dffbe3db282cfb96ca6b627ad7a337fe0650d", "adsp.b21" = "f033e50e82730912783a8b5669882ff497ce0c71796f7036a1d7380dc372cf27", "adsp.b22" = "793dd18194116ab34ab06e753faefa8d882fb962beba46dbf4256264c74c5006", "adsp.b23" = "e1cf030b175a82b5c937acca74e97fce7d34a6f513a00c37c9973538b547ad05", "adsp.b24" = "bfde3b970d02bb8b54b4a8ae3ec17d3c02daae69230f364b77f7c1c0bd77ba6d", "adsp.b25" = "b7fa363c0c14d5b8e713311a20b8032772aa80789dcf6fc8d5f58b4815255fcb", "adsp.b26" = "6c54eec69e8d5cbe2968e2674b47667374c6060f965e86cb78a1b2dda9cb24ff", "adsp.b27" = "61f399c044ddcc4403c39ee22323c5f5939589d85168430d7accf6f7ee6e96a6", "adsp.b28" = "c85e7234464b4e70d81451ce3f9295ff0c56432f00b3a029c0059f3b419c89b9", "adsp.b29" = "a55ac855af326ecea720d5e1ffc4d8d0c471ee1b3c38df35c79def0be5f40fd4", "adsp.b30" = "566f987c6eb49c9889c507582f9851819a7a599e6d9c7338c4654393a90f8705", "adsp.b31" = "cc3ef1e6ab3e90a06ebb151b52988c410d2f0af26a61faa411fe01186a84a1a3", "adsp.b32" = "f0c75a6a091f5d709eb3c4b1a70e74346ac05d2ac28a06bc3c60c1a274471a15", "adsp.b33" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "adsp.b34" = "6aec908b2283a23c644c54f16ee9ed2428deda70140f802f7ae41079c0b58f1f", "adsp.b35" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "adsp.mdt" = "57c7ebbf89872b58b2248fc1478ef3cad204bfb6984209ba548fb168c5f3005d", "adspr.jsn" = "4781dc9312fa017b0e611c752dae2183c0f205af8300b28417a496dae511b0a5", "adsps.jsn" = "9723d9873223f83464246a234bef61569c3d6a07112448e4e7da870d4ce5972a", "adspua.jsn" = "d6c6376f53e5449eb4f7b9e5a30679ebc2a9afaad28c13ff171f979e7b1af1f6", "camera-imx355.tab" = "5509ebd2ff5718c49ee385069a47627d463ac9a34c980c536fae81b0dcb2864b", "camera-imx363.tab" = "9aa48aa8fb92c7b745b1863c883dd3e0891328a2297e005cff2aa2ec9bf5ca0d", "camera-imx481.tab" = "674a6e44a0a5b837589890353d19c0556c075673095418dba0122139c9084795", "crbtfw32.tlv" = "c12450f9ea633f0f13f66f631a16aff0337449dac7ce7fbb65e5c96a03c9c9b3", "crnv32.bin" = "2dce41f9a0239d30bc948950b437c7d1b1dcada22184ac101a9249e347ce3a22", "crnv32u.bin" = "dfbb20ac29dd8e1f6201d569c2748b04c211cd004c14d60e4463143b4bbb12d1", "ipa/ipa_fws.b00" = "377a47319b8cd417f607a8185f810953becc3b5b6fc73bc840389cade91a454c", "ipa/ipa_fws.b01" = "9af1c531819420492373ad301eb87c6e05a1505e1a9d096241913265fc50a6ed", "ipa/ipa_fws.b02" = "ba95fe2f41c8aaa8b3a46719e2ad3daf851fdab7fc1136bdab34defc33625bec", "ipa/ipa_fws.b03" = "14024088f436ebd24b097cb113b2177e12c939efdac0211d560c7cc498611507", "ipa/ipa_fws.b04" = "08a996d4efe3ac0d4e4d8948d2a6bcc24fda5138c2e196f9568245fbafee62a3", "ipa/ipa_fws.elf" = "60ac75e207d0c5f63c9b470541ebb02d9eca4b889987c6f64239f943469f0917", "ipa/ipa_fws.mdt" = "920ff3eda59beeec18df8ab895fee5ea1de6c58d46db3c692f441226d1ca0985", "modem/549_0_1.mbn" = "abd50e70c7b18f7504f362aa5c494f37bdc2528ede74378b1fde2277fc3b6356", "modem/549_0_2.mbn" = "b0267b03f5bc2655298aa7beba500e9877429d097003cb4a37bf78f14ac2ffc4", "modem/549_0_4.mbn" = "04e98e3569d91c768f04e753a19036cb652366ab16a4a61f1240b1fe1aaf2910", "modem/549_10_0.mbn" = "f4882ac730cab4dedf1a8ceeb6975bbb3650b7dc3b73b768f0e7721e903c3435", "modem/549_11_0.mbn" = "90e07ca877e1dad2c8397e5e7363eba46ea01fa91a2e2bb73a3f9030e83fb3ab", "modem/549_12_0.mbn" = "6fd9c3229a23b01954a8da4b582d62ee965fa9907781048b5d89d17fe6ef7bda", "modem/549_14_0.mbn" = "578b78a43b45d90b48748e33c01b826be6a6d4c066aff5336fb98e50db663a93", "modem/549_15_0.mbn" = "1b079e9fc3d854f290a01f9fe5390dd38a5ff307fe0eb9a88f7c0a5cb5775157", "modem/549_16_0.mbn" = "490c151ef566a5a0af202c99e7e91cb22438aafcc95670540e100ee48c051938", "modem/549_17_0.mbn" = "013cf14dc6c91a8010502048ac07f2b9d91e4cf7837b9f3a3605f7b1c7d962c7", "modem/549_18_0.mbn" = "6b3319f977616b7c3bcd2c1770c51f1471eb2a5559897211c97a3047923b7029", "modem/549_19_0.mbn" = "8188b89bdc554cf1bce211419f2dc67a95085f32da27684e3b4d8e26f03c0dbc", "modem/549_1_0.mbn" = "7bf837736daaafdc99726e59748c4d2024cdd850035a0cdd7f7f8d02332562ab", "modem/549_2_0.mbn" = "1b2e83a2234bfbbd0feb28a939babf4ba9a51f9fbb6f7a1eb9785f18bd5dde20", "modem/549_32_0.mbn" = "9cba358bcb3393c5400c541438dfdfff28120316f741aa1b50ef853e030c8b72", "modem/549_33_0.mbn" = "ea477be59a20698c88452aea18cd788de19a321d3ff99da4534dca78f2a1df9e", "modem/549_34_0.mbn" = "9597df689a7e3d7463440baea65f72b10a8d063b70eeccea7e4096ce38118659", "modem/549_35_0.mbn" = "27f3e992530c219227c87eae826f83da5784d3157265bd53bc713dc0e380dddc", "modem/549_36_0.mbn" = "33c72f585456a027d21c466f46b3f2add6da6a3085d74b9b955fc984f30ac72c", "modem/549_37_0.mbn" = "5142445445f72148a8578a3321e277d6d517962f027beb6039dd68f92e97048e", "modem/549_38_0.mbn" = "2936c689a517ee759a16f292cc66994895da5e6b098444da1c4f04cdf6029447", "modem/549_64_0.mbn" = "ba6bf775296b6bc06431559d49cf1e9156e3f01e9287f22cc6a9a39381bf2694", "modem/549_65_0.mbn" = "8d06fb694a208965c2d6e8a7dd74e743bf535e643c8810f0d89d1ffda6b817d0", "modem/549_66_0.mbn" = "d2436861613c3492b0c8d5c00d075f3291a699f7776cefe5e7e4bcb56c12a555", "modem/549_6a_0.mbn" = "8219f53822f018ada0edf1a802f63159ed8fb7841ad5247ae8d2930e482265bc", "modem/549_6b_0.mbn" = "15ea2279ddfaae579b930d3d52a4ea85a45b76318fc0615ea61aeedd65ca1375", "modem/549_6e_0.mbn" = "7edb2aa923360e3b5801f578a44a74fafcba22f7460db1a642ba57c75024e4fb", "modem/549_6f_0.mbn" = "20b275ad3ecd1bcfd28a22282690b76732a907f7cdfa08d8c5583b9f2f080daa", "modem/549_70_0.mbn" = "1bec3940bd14833db8f2a86375c326cfc693a8a04443c2a81f52fa5474304729", "modem/549_71_0.mbn" = "ed12ef36d0a8bea18cdad0864e6aff2310698667b4e67645922c519cf2261ad6", "modem/549_72_0.mbn" = "89fb75b7d36233dffaa7fb97505b32c4055ac25ae56bc77635b5d6d1da004f67", "modem/549_73_0.mbn" = "4a6f1fbcaf3aeaa211d35220158f7a8b7989e260d6823f2fd5c37b0954642f2a", "modem/549_74_0.mbn" = "a4cf2cff961344ba5d2946f8b506ee2cc9ee1ca78f8e0e2f75f925184f3cb845", "modem/549_75_0.mbn" = "b6d228cfb90c52b74b6859809b12a0c9156c538ced1981ddf06df3cab13acec6", "modem/549_76_0.mbn" = "a2400d251ec3c25f0edf7fbfb03b87b614b907e32d70fa1c984a863613272bdf", "modem/549_77_0.mbn" = "1842366221c631afd18c52c82efd6d2875807ce2098f00e5c2ebc7b256baae5e", "modem/549_78_0.mbn" = "8d04ded82cbe2bc5d7e5ea67472ec9374ebbeb3f87172258b4deea3dc2edc79c", "modem/549_79_0.mbn" = "5fe89e739d7be55c95acfa8db62a749dc52bb668a8cf3bd5b3a546d63cb45298", "modem/549_9_0.mbn" = "5a16cf4e6a2bab462f71e88f98c1524b64296de01b0258a36526c32e2284d475", "modem/549_a_0.mbn" = "4d7e024822578b4d339cf5ff1abd922df3d2fa7d28cd79ffc4cfe1d5dd2f2374", "modem/549_b_0.mbn" = "55423e4ab768e5a5f2f98a73bc890b95f722709e3202895bed35aeff18c9f8c4", "modem/549_c_0.mbn" = "65c08cc41bb7fe11f04a8b354238b4a1421748016552b87b3b1f570fc34d4723", "modem/549_d_0.mbn" = "e1aff8c5902c1ef13c58291631a5df43c0a2bb63de3849ff61416e829ddda432", "modem/549_e_0.mbn" = "3bb63893e6544b354b8f837d901be37daa7cbcaaca6b5929c425e17dc21ac439", "modem/549_f_0.mbn" = "31b7aa7f9942179ea5eb82473ed9a7d6e672807f1fef27ab8b91d0300fa468f7", "modem/576_0_0.mbn" = "dd76ffc88d5f9a22c7be7a526de8f4aaa7b70928dc5c4f9bb87508c8a3cf7d17", "modem/578_0.mbn" = "ac032ac7c2a8739bf1ae84586938fd2bb82eebf364c5fa1fa5240d169a14513b", "modem/578_1.mbn" = "4ea2d70aed4db492a513ca95b0140da7465b99e34f5f37ecdbde34e94a4fd48f", "modem/578_65.mbn" = "468c3656c4c88600e167c59e5d7fbea636c7d65bd0b50dae6c1df5d1f113310a", "modem/578_6e.mbn" = "4fb2a47985b1bb944f471b6a405214f11b6aaec04483e52f85979a057fa229d9", "modem/579_0.mbn" = "730288592592c1606bdf6fada356097006f2b8fdd37ca508067e7304cfa5270a", "modem/583_0_2.mbn" = "574bc6170e301b41fd1134519c39a2f798a05c3306ed3c2821abb08d5f514ef8", "modem/587_0_0.mbn" = "cbe11236c31b47928d91942dedb209ef6e2e3d16ed8c43c5e9f150af9abe3080", "modem/600_0.mbn" = "910ebb9f6bb00be25135a5bd6dc1513607f004637fcebdbe142579ab5a433b71", "modem/610_0_0.mbn" = "d04777097b1f3a0ae62c1bf7631d9e33244ffb27e6b438dea2e8e6270f1e738d", "modem/611_0.mbn" = "e39342a54b5fdf6cbb131ad32c248477564833b471f1fe5169f2686094dfeb77", "modem/614_0_0.mbn" = "fbc1f9209c9a125bf896ba1f1b9490e9ba688f1d36e0801905f4bd9a751e67a3", "modem/624_0_0.mbn" = "31a1290a76ac36d34b27acd5e202286785165936cb26ae1dba96fcca5e864216", "modem/833_0.mbn" = "e9ab528645de8821b1bdbfb28c87327e1ae7a1d7f521acd33502cc1a17c2e29b", "modem/bdwlan-redfin.bin" = "544a849da72e44dcfdf931b4f73c90af50fde4730bf1e969b07b79ac627fafef", "modem/bdwlan-u-redfin.bin" = "7b0add4f469df39c0b26167513da8931419e917a4d9058252c05e0f5cffe7b90", "modem/modem.b00" = "d4364e51b49d13cb3ae2fcff8fc4553b0b9e47145d8c5a3e57b1ad2ee1cdc2e1", "modem/modem.b01" = "a01a91d7dd0843be4d7eeb85fdb5abba7ea570490dbdb34261b4d9a50dbf26f8", "modem/modem.b02" = "a51716a05ede50aa409caa9c3c1091537fee9dee4522e6607c64f028e2484f51", "modem/modem.b03" = "5621e9c0c7adf7ee035acd82a2f459f176c56b6528b5a96559989df0d3ce49e9", "modem/modem.b04" = "224a2f87ba8861be3dbf83970aecaece0c5c2da8eb560485f2b223ae38c862df", "modem/modem.b05" = "545dab0f2010ac59dd518c8d17f95d1d3e02d5a224fe5c742786fc4a666ee858", "modem/modem.b06" = "82723fe603c7a64b4f83448e400f469324660b879fab79e03da0586d95250fee", "modem/modem.b07" = "a7246ed525701fd583b5cb4f3e94f3b81de2a68744871be9eb9ce491ec0e0494", "modem/modem.b08" = "0089f99791ae4994e611c40b75b514c0aeaadc3a9a28e7d926aa8167001f0c80", "modem/modem.b09" = "6d8dd8f8fe50ff2583b7cf16e52f7b9682308c68deb9441be767a256ea493750", "modem/modem.b10" = "316fcba33ee4f15ea2334dd4bbaddec3ce5c652e47d71b1c47003b92e5575e69", "modem/modem.b11" = "96887395fae9bf6d58cc5c9267950d61fb280122a346b1d8f8bfe31ea91bd3fe", "modem/modem.b12" = "0a73a3388cd35374f9388eb31d469e016793549ad0020c16961d3983b5a227ae", "modem/modem.b13" = "9113885370d7b052ca63a1ec4cf2ede424a39f0a10f8048b8c9b3e9194e6a278", "modem/modem.b14" = "b452c662d68db58d15384c2fed9cee04331ffa181e61dd493b7b54a81f8c9cd5", "modem/modem.b15" = "0941a91de080d0d2a8f4d9bcabac417e71766d3208ccbf4be3f9c6067fc2c65f", "modem/modem.b16" = "fe6c1c1afc919e7d27fc66d95f611c9824eb28c3d04a0ce0e075a5d6eaf1f09d", "modem/modem.b17" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "modem/modem.b18" = "04aa23688951190e8d7a96fda2184c30c2841b40cd5f7303a32badc9e98ea609", "modem/modem.b19" = "a26372e2c42ab4780f950ab215799b2f71f1f5c7e9e9daae4e5fa262de70cc84", "modem/modem.b20" = "151d7f202006876f15d78bff14fc994d128423d6e7748dcba169c3114599f90a", "modem/modem.b21" = "13ae2d35c1829dc6a476ec3b167e0fdad3a778f3b811471d1b70356570796d21", "modem/modem.b22" = "80b69e332268b3c5362d2d0dee050661706c980ec1336275aadf3124a4398328", "modem/modem.b23" = "a1283a5eb7a3817cc3382a3b4f8471a847c9708852c046d6f6463ded7f68dda5", "modem/modem.b24" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "modem/modem.b25" = "2eb188634a7fff2560a41ba042578cd8b6aa07025e3c222bdfcd475702911490", "modem/modem.b26" = "6d8dc2d168e81039d1e99f556724303f34cf682bb92a00898411c92a4fbd2f3b", "modem/modem.b27" = "fb55a6b0cad7ef1661bbf47ec4ec5d8faf30b1359e429d41875f9d0d6f764880", "modem/modem.b28" = "ed90970bbaef0565c1f0a604251395743e702a4876bddab1b97d0ee983d262dd", "modem/modem.b29" = "3595f1d19e2adb63428984890019de3bd9641c946ad5d45dd5ce1f6804830297", "modem/modem.b30" = "390fd09f5be6b787e0860808b233b077653c2981d39d2aada6d5a0bc6aefa224", "modem/modem.b31" = "acc818f9a4a789078f8494ec1c0af330f6b61f180271461f298d3569fa70056f", "modem/modem.b32" = "4d92adc2e978b89fc754c00aefc5429258a3437ebef36ea9f4156e6dc469a6a2", "modem/modem.b33" = "8c90e699e15d509229663dc48346e5e0df36e42963b4b0397a4dd4737591016b", "modem/modem.b34" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "modem/modem.mdt" = "0fa221cb65417992329a9bb6522f90bd5a51c9fef25a7ee93810347363f49f37", "modem/modemr.jsn" = "d9fb1cfc1804923699b971d0e04d858103ec71ff528d9fd151e4725e0f354eb7", "modem/modemuw.jsn" = "e75d94b61df3e86c5b3f7a976d93f726cb85f2b897a8ea80a0924b9bb9c1a3bf", "modem/wlanmdsp.mbn" = "ab763cae27ac4157d2794b47db19b62679679395ecd2dc4977c4c839a542c8aa", "rw/mcfg.tmp" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "rw/mcfg_swB68256FA610C6AD3C3CAF97FA0060FD7" = "e788f0f81fb3d27e7eab326dd6d24258a839d1c7bb312cd0dfcc84c0861e14e3", "rw/mcfg_swD7F052138AC26E3C113DC24B05A426C2" = "a7eaaa0d6c6524eec8c06066559400d228b428dcbb974844a0468357a29667d8", "rw/server_check.txt" = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "venus/venus.b00" = "a8e1aa221630f44b18b78740109bb043841e2d6df471b3c410e7f4d3dec49ee2", "venus/venus.b01" = "35fbbbeff2e318482edf6ef0aa8ce0ff08f324de6c1fff959ad5ed61f0cfef2c", "venus/venus.b02" = "2fd363b0c2f05ac4c4d17e17f3951c793d9738b9d42e0d9f07d9edecc3086e76", "venus/venus.b03" = "c86bfe86b06df341fb2b6f44c2b86993e26a5006e92297920e567247f9398961", "venus/venus.b04" = "43b09596e1496809aaa964b34c146580f0566c86bc9d7218a1288fd15fb93424", "venus/venus.mdt" = "a3f0303fd3bfdd69012d14aa098faf5ec8940c1838a99912b699cdff92b2b9d6" }
+firmware = true
+note = "copied from the phone's own vendor/firmware partitions: never in git, never written by state.py"
+
+[[bundle]]
+path = "/var/local/hexagon"
+source = "firmware-copy"
+files = { "persist/sensors/als.csv" = "70189a3dec919bb52ef2dae239d198b9fc8a17792e50e2d11b35be9ecff62408", "persist/sensors/als_gain_cal.csv" = "b887e11ac2d8669bf81cbe41655402b0dbc553996c27426ecd85847851f129ed", "persist/sensors/als_te2_delay_cal.csv" = "7db179c1e24b4aebf0b4b575fa7ab359de6b744ce3904034c97b7e95d68e8a8d", "persist/sensors/file1" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "persist/sensors/prox.csv" = "e4f7122cc8ad0834ef989c45760621036bac69e236628d836704ed660368130a", "persist/sensors/registry/factory_data/bmp380_0_platform.pressure.fac_cal" = "62244645ff7980c5776658ff94c995daef775bf7c90172aca4454eeb9612f17c", "persist/sensors/registry/factory_data/bmp380_0_platform.pressure.fac_cal.bias" = "f93b0484b206dc85d53493d5f2b997f8f8d8040b2c9e3af6fb0d6fe67e25081c", "persist/sensors/registry/factory_data/bmp380_0_platform.pressure.fac_cal.scale" = "173cd78638704a34deb785033db767deaf2ccb540de18278d7b67dd39096bf6e", "persist/sensors/registry/factory_data/bmp380_0_platform.temp.fac_cal" = "ba696a15be84a6871a18be96fc1f809c9908b60e747f079699fcf1ec32109ed7", "persist/sensors/registry/factory_data/bmp380_0_platform.temp.fac_cal.bias" = "972858a6ac33f70a4b2b0e4de6c4c7f8046a8b82fbb1f238b9543a8e6dfb13d4", "persist/sensors/registry/factory_data/bmp380_0_platform.temp.fac_cal.scale" = "b66501e5f4ebd5ccc7d1b6dc83161a7e869eb72f0f550a7b933068bb656bb86f", "persist/sensors/registry/factory_data/dynamic.fac_cal.accel.thermal.bias" = "389b653e0b1f8b33632cd1f9fafd84ab160682343ecf6dad23ffa971e36299f3", "persist/sensors/registry/factory_data/dynamic.fac_cal.accel.thermal.scale" = "aec6e4397df69a2b76814f1468c2bd6983da4c1ff01312a76a9c9e4fb7f92bba", "persist/sensors/registry/factory_data/dynamic.fac_cal.gyro.thermal.bias" = "f776b75304b5bd2a1fce068406f60830270d6b470dc6b95a7c6c4f8be901e5bf", "persist/sensors/registry/factory_data/dynamic.fac_cal.gyro.thermal.scale" = "6ec48c75fab3f1a8662d1b22bc45c7fc102212ede1ddaf6de6b0f2d7074638e4", "persist/sensors/registry/factory_data/lis2mdl_0_platform.mag.fac_cal" = "413b8db9f8ca684ba4c04cbc235b17bd873cbf1c74ea41bd702db2b9352a69e0", "persist/sensors/registry/factory_data/lis2mdl_0_platform.mag.fac_cal.bias" = "f6ebc1b0999f86ace22bcc9ed6fc4984b9a8b72392dfe90eb6f1f49d0f9e013f", "persist/sensors/registry/factory_data/lis2mdl_0_platform.mag.fac_cal.corr_mat" = "797cb90e10e68dde5c47a0bf078f365b9f8ea3bdf46d37d3143e8e5848854c88", "persist/sensors/registry/factory_data/lis2mdl_0_platform.temp.fac_cal" = "bf89e1bef39fc7be2edb1a61d7b57f5933a4d962798142202d91dad586c1cd19", "persist/sensors/registry/factory_data/lis2mdl_0_platform.temp.fac_cal.bias" = "d69f944adae66511afbdd5f663df6ba017ea1fde0c86601bebe78e1d016aad66", "persist/sensors/registry/factory_data/lis2mdl_0_platform.temp.fac_cal.scale" = "976ec844abdd491dcd560981e86f1dd4ac0dbfa8fac7b566378b2049318d3efe", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.accel.fac_cal" = "37e1acb26078da84471c6838add999a6eee32ba273283994db12b75737e65949", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.accel.fac_cal.bias" = "692eb6b7ca6ea8bdedde72733971996952e082f0e0f467069e06f9f8bc126146", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.accel.fac_cal.corr_mat" = "ed48348ca6c7552e23948bf5e28d67a3463128aaa58a7d3dff33214f0d4a8f55", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.gyro.fac_cal" = "0808cbaa5ad6a47d36b98b394aab378c546df3b8ebf96bc9085feae9664702a3", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.gyro.fac_cal.bias" = "3076f60364641b5f9f86c3ec81c97ceb75866594fc375386ea43505df0a7c69c", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.gyro.fac_cal.corr_mat" = "3da3134d5a7b405d522b7e2d2eb9046a51ad5a6ef85de2ca56a10135596632fd", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.temp.fac_cal" = "4373d16080faf77db5cd1520c87018be404e3d5800a37c5cf09a0d72c260eb22", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.temp.fac_cal.bias" = "d0bb0e708ebbc16a16fa2200c4079e1c0ba0c30d06cd827b1a3bea735389da1e", "persist/sensors/registry/factory_data/lsm6dsr_0_platform.temp.fac_cal.scale" = "9d3cea55d05eef87fc3e638f77b0d1860472f32549c6287323e8440ad40eec2d", "persist/sensors/registry/factory_data/sns_fac_registry" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "persist/sensors/registry/factory_data/tcs3701_0_platform.als.fac_cal" = "6a933cc0e651ca17f7a7aa32f8bc91ba2b020745e2b261e277e55efb99428d8c", "persist/sensors/registry/factory_data/tcs3701_0_platform.prox.fac_cal" = "ac4558e65823af944bf9dc2ecd683be6cd3e2e020ccc4d7b72b60c8ee55620ec", "persist/sensors/registry/registry/bmp380_0" = "eb25c0c086f9526cbb7298463ba3388fe957ded01cee18f72d7dc2ee25288f8a", "persist/sensors/registry/registry/bmp380_0.pressure" = "fca5180752152642c52331e6484702f53940bd11173c3fd077e46d01c1e985bc", "persist/sensors/registry/registry/bmp380_0.pressure.config" = "c2f46a0c703c700cc6b362bb932845974db802a0debf6cef16f6feb283ac48e8", "persist/sensors/registry/registry/bmp380_0.temp" = "d4ecd1149e076fd49d2d97d6e10428ef9c40b0829a708b36eaf614fe18f9e957", "persist/sensors/registry/registry/bmp380_0.temp.config" = "c77449ad1c2991abce51b24ed6202e9814241e6731c23eb24685372c978f09cf", "persist/sensors/registry/registry/bmp380_0_platform" = "f5f2cd29984e5c9c5355e09fcc0f1521c70625587dcc181b89fef630bb78c6e6", "persist/sensors/registry/registry/bmp380_0_platform.config" = "373225e343e3e7a6c3d8bf658aa81a8c597f73010550161bfc75831321c187aa", "persist/sensors/registry/registry/bmp380_0_platform.placement" = "a04944a78831c507211759bc263bc0bb50b44520bbd36681d1029b91fe6b2904", "persist/sensors/registry/registry/bmp380_0_platform.pressure" = "43e417ccf0116e826a404de745e2b2879f73a41651989d4eb17e7ac9c20180d4", "persist/sensors/registry/registry/bmp380_0_platform.temp" = "1059f64c4ea423f54b01e9d1187bef0eecdc47b75ef4bf8e8cec368d61c2b429", "persist/sensors/registry/registry/camera_vsync_0_platform" = "5b52d5b9a1ab43bc0cd1fd3b8d307ccad752737b6b158b67581b7e4f381d546d", "persist/sensors/registry/registry/camera_vsync_0_platform.config" = "4a43e3a3cdc9f80dea8e27cdb3ffe40c28fd4746b48b5c1ef6da870d12957239", "persist/sensors/registry/registry/camera_vsync_1_platform" = "6bf2a9933a127309e28b0fd172479034572071290a9750e0916e43d31b948109", "persist/sensors/registry/registry/camera_vsync_1_platform.config" = "8adf76b15fdd25c78115942c63c94144fc1bee211981e9208211c78af1d81d3a", "persist/sensors/registry/registry/camera_vsync_2_platform" = "7cbf72ade8551af7c9200759b40d8bd06d2f1e85fe74578e522c8c6d48b3d17f", "persist/sensors/registry/registry/camera_vsync_2_platform.config" = "afaa644544915e28f466aabb50b776b0bd675c253b14074492f89ac55dceb75c", "persist/sensors/registry/registry/lis2mdl_0" = "aee78703f3a54995d8924875143b3a6aabd1931ddc99091cb3ae50079800fc29", "persist/sensors/registry/registry/lis2mdl_0.mag" = "d9a298e0f7c9ca5cf19e5ce760ccbcafc9ef71620b39683563c88b05fe275dcc", "persist/sensors/registry/registry/lis2mdl_0.mag.config" = "11d8463ca6af21ec38d1d4d014515d0a1991495d567e3d06899c875bcf1e3dbe", "persist/sensors/registry/registry/lis2mdl_0.temp" = "f1fa320ac61aa811b32c7a05d7fa25940ea41d38857741faec0157969cf26cd3", "persist/sensors/registry/registry/lis2mdl_0.temp.config" = "19155b4394176fe7558ae56043704348a17fd9911a3cca280fbe111274ee486c", "persist/sensors/registry/registry/lis2mdl_0_platform" = "cd1346985924c09d852b91a0c3273a32a8d7c242c5d3de51842b464ddba16541", "persist/sensors/registry/registry/lis2mdl_0_platform.config" = "d759676e1755133b1ef6ee46e8e705db3974904cd1437cc34738cbc421d143b6", "persist/sensors/registry/registry/lis2mdl_0_platform.debug" = "fb3d42ca8ceb55466df7d1d528e218f6feace13613870f218bd6d70169aba156", "persist/sensors/registry/registry/lis2mdl_0_platform.mag" = "05b69c339bb5fb2ee9327449060b00fa6fc0273853553a34fbf1ec46e8cb3aee", "persist/sensors/registry/registry/lis2mdl_0_platform.orient" = "9845aa53b46d65c790dd195167b869ab1a7ff98abb0b6949c0a5ba406340a8df", "persist/sensors/registry/registry/lis2mdl_0_platform.placement" = "60a5aa696938e40d583a4c3c80f442cadcf30c6e5da4d5a604876c2552db7ee2", "persist/sensors/registry/registry/lis2mdl_0_platform.sensitivity" = "410f80233d55695f249252783b785920e628928203768d00f3080ac9aa318832", "persist/sensors/registry/registry/lis2mdl_0_platform.sensitivity_fast" = "25596ef8927e1e94297d63be7e5608e1939bba48434d951b2239dce5ad8e109d", "persist/sensors/registry/registry/lis2mdl_0_platform.temp" = "3695c684668c32af2fd3d79ce792cca31b980190cb639e0f051fda8a8fabbe35", "persist/sensors/registry/registry/lsm6dsr_0" = "246b1fc1ed2941fff7bee29d813da2a22688024ea352f7d9c4e11643e7c26b11", "persist/sensors/registry/registry/lsm6dsr_0.accel" = "c6cacf404a390b398f533e3da06ab4e8f1ef42fd7a7b7b09a23448cae6a010a4", "persist/sensors/registry/registry/lsm6dsr_0.accel.config" = "3dc997fbdde695db7ffdec5ff49b4ac0db99c6fb537e6bf3e5b39109b6a9dc1a", "persist/sensors/registry/registry/lsm6dsr_0.gyro" = "253a51e3b56f020a774fa8e3137a695f9c8957ce21a93b7282295c8fa1278110", "persist/sensors/registry/registry/lsm6dsr_0.gyro.config" = "0c6b52a32c91cc05004bbfa55466b61c5484cb7b9625f82c447ea71c5c30ce91", "persist/sensors/registry/registry/lsm6dsr_0.md" = "52aeab2044fb0372fb821a49768f7633c5be7a5f6e09fc530ee372a6e2da292e", "persist/sensors/registry/registry/lsm6dsr_0.md.config" = "e2b3915c7bb6d986709ee36ca2c1e0a976cf6158809d3e92c1654b6f5b298afc", "persist/sensors/registry/registry/lsm6dsr_0.temp" = "7c3a80f94339d39de90c72446040c18725cbfb33d2600ec46022d4b8e7c5a8c3", "persist/sensors/registry/registry/lsm6dsr_0.temp.config" = "5a69da5fabc37d0a6a33d1678dd8333750ea2ca2fb4f354554a6b7c641344c3e", "persist/sensors/registry/registry/lsm6dsr_0_platform" = "94b95868e219aea1780eadfa22fa79612e586a8298b3a6fc8aca6d3e0d25a0e9", "persist/sensors/registry/registry/lsm6dsr_0_platform.accel" = "b58b728f681881f5c6e15151b24ebfec12f7b4a666f1b65388e2d61ef63a33b5", "persist/sensors/registry/registry/lsm6dsr_0_platform.act" = "763d80aca63c825317a6b8492e31ca2345d9cc2b7e0efcd3f426e2bc6b6c763d", "persist/sensors/registry/registry/lsm6dsr_0_platform.act.config" = "f190a9d3919593109f62e01391d40202ffdcad411fc99e4b07c4c16eb36792d2", "persist/sensors/registry/registry/lsm6dsr_0_platform.config" = "3a6af82cf473b27ec453dfad6c4cc52ced432f650ebff9a48b1eb82db99d0ce2", "persist/sensors/registry/registry/lsm6dsr_0_platform.gyro" = "db2c88a1c2eb7028b4ee073e333bad78cefe24fa39f8b9780969b96cae346969", "persist/sensors/registry/registry/lsm6dsr_0_platform.md" = "3853919ff16c997f321ae23b138e637c493dbd9059c0c2a760729248170ea8db", "persist/sensors/registry/registry/lsm6dsr_0_platform.md.config" = "dcce0464e5e42d95dedafa2b38905fab101be14e97b1a72298ee526f51a0f661", "persist/sensors/registry/registry/lsm6dsr_0_platform.orient" = "4ad93a4a8b83774d2614d10ba730e1cde4f6467f6999fa0d0e7554f50ac4e9f4", "persist/sensors/registry/registry/lsm6dsr_0_platform.placement" = "deb4d9fb679977ba2c29918bb549fa352577e3c47c7764b686ea71d97185826a", "persist/sensors/registry/registry/lsm6dsr_0_platform.temp" = "a094d417d47bd79473324de97ac34795f4dcdea153f3f86ccb34edf1f8b65830", "persist/sensors/registry/registry/sensors_registry" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "persist/sensors/registry/registry/sns_amd" = "b4bf4e9bcd6f9f27747f60f879da867e20b654b536c83f23b9cb07e9d1af1227", "persist/sensors/registry/registry/sns_cm" = "982ee8c648dc3fe858e11e3a1435373224b6a35fde4d7ea5bff8fc5f4b9a8320", "persist/sensors/registry/registry/sns_device_orient_platform" = "6fd01a6419a43b7dd6bc0336cbec3a757d93fba3dbf13d1f441c9ce22545d727", "persist/sensors/registry/registry/sns_device_orient_platform.config" = "24d7d33c561637b6aaf2a3d853bd7ed49528c54e50c86155dd1d06b1deba1db2", "persist/sensors/registry/registry/sns_diag_config" = "2c556b62bb49661ba4d603f81d0dc79e21f8421abde4aa6cdac6e1634ccbc84b", "persist/sensors/registry/registry/sns_diag_sensor_datatype" = "c485be45ff26533edd28554d8c9fe9d87560e5b31d478a126bda927593f01ae3", "persist/sensors/registry/registry/sns_distance_bound_speed_for_motion_states" = "e7df2a98995a2d47a93e4df004ba93b0b090ca55f0fc5c7047d83b31baa94f52", "persist/sensors/registry/registry/sns_fmv_platform" = "2fd57d0709b62ed292aaadb1468fa84ca4dc414bb285569d092b5204d606ec34", "persist/sensors/registry/registry/sns_fmv_platform.config" = "578d45e14fc7370c77fab55427a218d90ef23e0aefbbc65777418822ee3eaeff", "persist/sensors/registry/registry/sns_geomag_rv" = "db1ca319c6e89bdc98372b8e56a03b363e2a732dda590dbdd67fca92cdeffbea", "persist/sensors/registry/registry/sns_geomag_rv.config" = "17307f1d1cf418f3eccec96f458f0c505ba5fc434c636d22b1267ea896a7985e", "persist/sensors/registry/registry/sns_gyro_cal_config" = "8e4e34133dbf9b5a53cf979ce1a8aaff40612ec0bd9e68acf195f88d699ed1ee", "persist/sensors/registry/registry/sns_irq" = "09e2b80d531638b947303088e17e9554bee19980bb7c40bd4929f2608fa0c5f1", "persist/sensors/registry/registry/sns_mag_cal_config" = "a21a35015d97a0ac3319956228a5ae71548e59485acd4f195197c6d2e65a96cc", "persist/sensors/registry/registry/sns_pedometer" = "2bb179d0afb7717b385dc52b04f307b1663cc28a3529ace9bb4cc4a423a03c12", "persist/sensors/registry/registry/sns_reg_config" = "2f72d7ee6b8faf32672887af2bcad86d41e8a31a0c5d1f333785aee63df9b40d", "persist/sensors/registry/registry/sns_rmd" = "56b4c41f21c5bfb65314b7848c737b99fa44ff63ed660b00c639da6e0a31246d", "persist/sensors/registry/registry/sns_rotv_platform" = "9bca4c687b1e556eed16fc5e49f4bd38e6e60b795e9493e8fcfe953c8892a2e4", "persist/sensors/registry/registry/sns_rotv_platform.config" = "7ae42fd9613f4529d0cc9a49c97cbfcbfa4791eed3fb2c1efa95d1072d98ec3c", "persist/sensors/registry/registry/sns_smd" = "d51991f665149a5cc46c55edd890966733d2e6ceee7b5996b48fe9b651acab21", "persist/sensors/registry/registry/sns_tilt" = "7ac98d831bdd2723bf88fee72c42df239abba3c114865c8f90b2b5d2e2f8cb0b", "persist/sensors/registry/registry/tcs3701_0" = "d7ec22f74240c3d5a9e81ea47cb41b645a04aeec63dda447fc4aaf7a85883bb6", "persist/sensors/registry/registry/tcs3701_0.als" = "aaf26dd10da95d1982148f17479c6de7800ca58d77ce7146a0a8292148114f5b", "persist/sensors/registry/registry/tcs3701_0.als.config" = "81302a890a9ebd15ebf7386b77facc3241f14c1b79fec16bd98c92cc8b106bdc", "persist/sensors/registry/registry/tcs3701_0.prox" = "61b1f78cfcafe5bf87f97c5b7c74681a9b7538f75a75f1c0045deeed7da8ce5c", "persist/sensors/registry/registry/tcs3701_0.prox.config" = "b85ba648ad2fb3ed7a98078d396442c3ea8710c256b56927c3c9f91d03db1a8c", "persist/sensors/registry/registry/tcs3701_0_platform" = "2d4b1dbb209c98248d1d0584c4cbe4275a07da942fa08f754e07fd6e04d168c6", "persist/sensors/registry/registry/tcs3701_0_platform.als" = "91500864a7433073b1654692a0050583f921e77e69d61f0d797d464e7db26f26", "persist/sensors/registry/registry/tcs3701_0_platform.als.params" = "a754bb8636bb45540fc1abdf6410094a3dd61073bfb02d9015506eed8a7d0da8", "persist/sensors/registry/registry/tcs3701_0_platform.config" = "2c94e4f7b4e9e19e601b88ad5e1b85a3bff806d1153a544d9cda6269ee73b73b", "persist/sensors/registry/registry/tcs3701_0_platform.placement" = "d129fc554f94a21bf309b2dd6ce542092cbf9a1b2ba7f67b2dcf45ecf8d8b1a3", "persist/sensors/registry/registry/tcs3701_0_platform.prox" = "7563a9c004dd1c94dba2b396032457f8a39fb670e1038e686e92618ee168f133", "persist/sensors/registry/registry/tcs3701_0_platform.prox.params" = "b222f162417dac28b703b7c4390fa615bfecb2336820580286627578ed822d8d", "persist/sensors/registry/registry/touch_gesture_0_platform" = "97489f46aa7c6ef474ec39b74a7ab68075bf7df1318baf01e99a3885bc27195b", "persist/sensors/registry/registry/touch_gesture_0_platform.config" = "9e97585efb91c155c4b752ff6916cf900d3402314fef23a2ac684cbd121d0e32", "persist/sensors/registry/sns_reg_version" = "9c7a6b1706fbd672af64d908c7bd1044958ce50801e86d112fbfbba57f1dd4ff", "persist/sensors/sensor_setting" = "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa", "persist/sensors/sensors_settings" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sys/devices/soc0/1" = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b", "sys/devices/soc0/CRM" = "9bcf79069cd4edc9c696712536d5bf3408fda07da8049592686452e128389336", "sys/devices/soc0/Variant" = "d115aa97b4b79f70b0622c4fa32ef43cb74cf41b9f7cdc812794c6d6ebe91470", "sys/devices/soc0/Version" = "61a14c5a1aa29ab87582c57355f16b94396541c152c310ca1864bfd438e3feee", "sys/devices/soc0/accessory_chip" = "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa", "sys/devices/soc0/build_id" = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b", "sys/devices/soc0/chip_family" = "0d5d04222ed04c0721ad853290178a90574e82a4823909c13cdb7914627acbd2", "sys/devices/soc0/chip_name" = "fed96967fd12f5b73653cba64425632766a55e38198fb191e49a71cf2b435a24", "sys/devices/soc0/family" = "8c5370614d11fc6d5ec4966bf00ce06ad5502b17aea04b2d9607826bf622cb7a", "sys/devices/soc0/foundry_id" = "1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2", "sys/devices/soc0/g_hw_platform" = "724937775217e57e9564d68939565fa5c81fd70da6fddeb9222278cface5aa8b", "sys/devices/soc0/g_platform_subtype_id" = "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3", "sys/devices/soc0/g_platform_version" = "7f52b5732a1b3f65739dc6caa49c00795991ae3b3ef945a84072a842969ea7b7", "sys/devices/soc0/hw_platform" = "304bcb920c7df50d01920d8d578d59860996821aaeecaf4bc4699ec58d862505", "sys/devices/soc0/image_crm_version" = "7aa780d7d098d83b589c9d907e3d716babe24c7220f6bbd91986bcb2efdbea54", "sys/devices/soc0/image_variant" = "f70bd7d7461d36cfac997f4207d4e8937a2a33b6b42f69c966e59789ad5cd945", "sys/devices/soc0/image_version" = "18a99d48cb7843527eb059293891bd96e5abdec664be7584ea1b84de5456db70", "sys/devices/soc0/images" = "52e4dc27d67a123b63862d6e5b1fa6485485020debb018c6589f8e70a400c6e4", "sys/devices/soc0/machine" = "3f10141b3017e84ec32ea1034fd0c608de97946646c86a20d8019c1891e00755", "sys/devices/soc0/ncluster_array_offset" = "0d79983e1dfec0db6940c9e6d2109ebb928ddbc970167299dbc1e475053c6486", "sys/devices/soc0/ndefective_parts_array_offset" = "3a883321b68c5a3e700d4893e80c2b92e0039d433d30396196ef467744e32db1", "sys/devices/soc0/nmodem_supported" = "0430108dea936c37cdcbc37f9e19ef99d2449b23bc973011922488225b1cfb20", "sys/devices/soc0/nproduct_id" = "0524bbbe0b369c11f354ac17d0882fa9a0d0281add7d00cc3ce812641ecdec51", "sys/devices/soc0/num_clusters" = "dcc0955d40c8cc43dcabd0c77f7b85836881586181bbfeabf73ec707f2b6e46b", "sys/devices/soc0/num_defective_parts" = "67e5e203c5c04b043b8bd3b731afd0072a4210e543fe722f344739efaa69be0d", "sys/devices/soc0/platform_subtype" = "c80c3db2b2cb606bacf75bac6c2e4b9221e58958b5c800a6b0031b726c3f4bc1", "sys/devices/soc0/platform_subtype_id" = "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa", "sys/devices/soc0/platform_version" = "0f3633c0ecb81f7639c3fe70873b438e74fb8960c68f7c39e6a8eac795e70a32", "sys/devices/soc0/pmic_die_revision" = "d5ae8a2d6ba4522d6c06ecc3384ec50e575e3b82758bbcab3c829b0709a76120", "sys/devices/soc0/pmic_model" = "b14d8919fe8353187d8a6944b8edc489efd36bc3d681cea4519ea8576ce06ebe", "sys/devices/soc0/raw_device_family" = "9d1a672796ee8a6d4d3e3b3c1bbfc54e9381f7b42561cff995d254580bb76e9a", "sys/devices/soc0/raw_device_number" = "67e5e203c5c04b043b8bd3b731afd0072a4210e543fe722f344739efaa69be0d", "sys/devices/soc0/raw_id" = "391feecb66047842a0fc32de91aea46cf48c7b6077e6ccc7800860c6beb75c95", "sys/devices/soc0/raw_version" = "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865", "sys/devices/soc0/revision" = "d526eb4e878a23ef26ae190031b4efd2d58ed66789ac049ea3dbaf74c9df7402", "sys/devices/soc0/select_image" = "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa", "sys/devices/soc0/serial_number" = "dd33d146816b4d6c7b0d2e1f7a95acf414b717d8f1c5c786cbfa934d4df223f6", "sys/devices/soc0/soc_id" = "e4df891c484d7abb985dadf539fa1883a646dab6337af5cae4159c587b7050cc", "sys/devices/soc0/uevent" = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b", "sys/devices/soc0/vendor" = "d6c44f832420d3db4addad883c9d1033938960c3739a34a6800d198a08f633d3", "usr/lib/qcom/adsp/AlacDecoderModule.so.1" = "f5b91b15cb4581e8fef68df8d598bd5bc2c76e0c6b751a9faf53e23e1d91e58d", "usr/lib/qcom/adsp/ApeDecoderModule.so.1" = "07ce7d80ee44119380f1d1d4c383bd7e8efdcbcb636456c15cd6c766f5a78a16", "usr/lib/qcom/adsp/AudioContextDetection.so.1" = "b24e82d5c3a737ceff1165ce9c8a3ef63ba9b7799fd7b9072ba4a42b54b0f110", "usr/lib/qcom/adsp/AudioSphereModule.so.1" = "fd72aae5da22582f86e4e2ef6b0799ac30ad0fb0c91b5658718e06ddec601ba6", "usr/lib/qcom/adsp/CFCMModule.so.1" = "81a4ade0b2a4d7e73c692ea34437d82d5d17f3f3e6227fe0b9d8866ecff33eae", "usr/lib/qcom/adsp/EtsiAmrWbPlusDecModule.so.1" = "27029f2b4b5e370d8ebe7578d949a0c154e0da7724c7a7b4c02bc1f6a8503fc7", "usr/lib/qcom/adsp/EtsiEaacPlusEncAndCmnModule.so.1" = "09c3cbb4731394ab22543db5434e56cd07d5bfd73e3c2e42af9a6077910f006e", "usr/lib/qcom/adsp/FlacDecoderModule.so.1" = "b98b38b640c8edd7875378a96a1e69db1dddebd7a46e5cac86329d80311f9252", "usr/lib/qcom/adsp/HeaacDecoderModule.so.1" = "9fd663900b9398487bc43b9b79329c0f50e87c322b5ed26d17360e4535f1a545", "usr/lib/qcom/adsp/LdacModule.so.1" = "a70ff1847af383f5ef3ac1cc713d2cbc2a04d3eb1fbad53573ce03187c8c0fed", "usr/lib/qcom/adsp/MIC2AMBModule.so.1" = "65217ec36109fe42d413dc9ced4ccb3f2bb799fde37e71c44775ee0a917a790f", "usr/lib/qcom/adsp/SAPlusCmnModule.so.1" = "91692c9118bf559aafcaf639ef3c8642538fb5b95ce0054c847d8f11e1c9e38b", "usr/lib/qcom/adsp/SVACmnModule.so.1" = "e76f8fb105ba01046615110d591938255beecca50ac146af107f65c921697666", "usr/lib/qcom/adsp/VorbisDecoderModule.so.1" = "00d08c088f13d874fc6b515e431e828c5b2fe3a0c2b43c78d7da16156ccb4fdf", "usr/lib/qcom/adsp/WmaProDecoderModule.so.1" = "3821e49ff936b137c5d3f0208e278f33164e5d67d2d5cb3f1978773c7ad631f4", "usr/lib/qcom/adsp/WmaStdDecoderModule.so.1" = "dfd6b26f18315601123b3923ad013e97148001d5b047937a1bd5c2c3d08042ad", "usr/lib/qcom/adsp/activity.napp_header" = "988ccb1d689d40012ec990b0a44b1440ad03dd703b651032b9f6be7bc4af9457", "usr/lib/qcom/adsp/activity.so" = "f19fed449bdd82924a812288b8d1202f2986e4a3b28543e71a73da673eb645a8", "usr/lib/qcom/adsp/ambient.napp_header" = "14996bbe84b32979b39b857c58582627411eb108bd3401413e18130b364e9bee", "usr/lib/qcom/adsp/ambient.so" = "935c814a33a129621cb96358f650639a1e1149967483f2c58e7b43928e0f4957", "usr/lib/qcom/adsp/ambient_micro.napp_header" = "deb4fa42ffd353b40ec1759ec915f1da63ca7a15783d5962c0fca09e291ff667", "usr/lib/qcom/adsp/ambient_micro.so" = "a8a7f6c6fae404a0c9c55a86f8285142431b507e83f421693f3ccd9ec57b3f38", "usr/lib/qcom/adsp/blue.napp_header" = "f7c12e958ecb3c1dc272098103e106867ba4c05f25125b61503efba5b20c7e80", "usr/lib/qcom/adsp/blue.so" = "b612429e795d72443c743293aeb6763fac8e1af29c23e7106aa7f2d87f17d0c6", "usr/lib/qcom/adsp/capi_v2_voice_imc_rx.so.1" = "4ae67056bc6a5fe56b6b09bfa03bd8e3d552321dd1b2891e5ed3a347de2ddc77", "usr/lib/qcom/adsp/capi_v2_voice_imc_tx.so.1" = "a8e2e03bffc25e6050b7d81399b5ae6fb5c6bd20b5bee46b03f9703756158b06", "usr/lib/qcom/adsp/capo.napp_header" = "2d2bb9d0b69c18015a15f72e9bf9fc5f01560fbf2e510ed5211df50bc7dc058b", "usr/lib/qcom/adsp/capo.so" = "65dbe419770f6e09aa72000ac7bcaf78227088316ba8ed7424298008ff4ca071", "usr/lib/qcom/adsp/cc.napp_header" = "66156d45cb9702e21f4049ce0e5b676f5243f2f64a2174ded63f29cde374e023", "usr/lib/qcom/adsp/cc.so" = "bf5b0e73dc3b51e64d0d03611d757d8b88a056bba5a6fb21fdcdd4e785a672dc", "usr/lib/qcom/adsp/cellinfo_tools.so" = "ef7edd40ae767b4c9a50089eeb865a93ce57f424290a3757b54b3f3753f0dd83", "usr/lib/qcom/adsp/chre_drv_loc.so" = "80ef77e49da3fba06f4b8964975baf10ce981243866c9c58857c4924ccb69fd0", "usr/lib/qcom/adsp/chre_drv_modem.so" = "9343ee71eca69d83ad4d4af8e86bbadcddc9be59e721e43b35cde0a33adb9d33", "usr/lib/qcom/adsp/chre_drv_wifi.so" = "9e445e38b34cadf84324e612df058dce69fff43c354d474b3130951a316c6109", "usr/lib/qcom/adsp/chre_pal.so" = "4a907dee1cfc2e40a66007ceb63677c715b4500b0e9371967304c230da33be08", "usr/lib/qcom/adsp/columbus.napp_header" = "923fe57b5f16646a6b8662c8aa7810323d1650c4630343b4229112941acc2109", "usr/lib/qcom/adsp/columbus.so" = "a6959086a2711b9457b5399219586a53445f37d15a7afc156b35b5e52ff61577", "usr/lib/qcom/adsp/drop.napp_header" = "a58e98151444632cc7400ff2aa30d000684d2745a9ad0659b2449dec3e06bfbb", "usr/lib/qcom/adsp/drop.so" = "c9f12c424df7c18d1c8f52ce7d07317e7cac6a0f72d917eeecb00813a04340d5", "usr/lib/qcom/adsp/fastrpc_shell_0" = "572deeb32626fef92fe8354120a66d8670d4460f33a1bd61be463f450458c7f8", "usr/lib/qcom/adsp/ffv_module_fv9.so.1" = "7e57ff7e6ef05bcacb4e3793850681b6a3dd8e5700b7d322c683e6ab5a51173d", "usr/lib/qcom/adsp/fluence_bs_module_fv9.so.1" = "9d8e70611d31688572b1b0c9384876af6229e4e4f430d924ce8d521e5533c8ff", "usr/lib/qcom/adsp/fluence_ef_module_fv9.so.1" = "319ecf6b08c25c1ecc8db23e045abcd9a23e2f845b81709c022ad4755da9067a", "usr/lib/qcom/adsp/fluence_pro_vc_module_fv9.so.1" = "2bcb746bbfac0b1de0fb6954d8da17c78b728730e61637e4a368c43af87688fe", "usr/lib/qcom/adsp/fluence_pro_vr_module_fv9.so.1" = "e4fe258537a2a738617a4ac10aa03072010d052c5388756841f4ec024d0b77ed", "usr/lib/qcom/adsp/fluence_sm_module_fv9.so.1" = "baf35cf12a13864d5f8c344bcdf433084609f61d3995395587b83439efd698c2", "usr/lib/qcom/adsp/fluence_voiceplus_module.so.1" = "c314d72b2bde0de0269f4b33f245d12e8d72f0f5b15b8e4dca4106c201ef17dc", "usr/lib/qcom/adsp/geofence.napp_header" = "2fbb140c1514858abe0658fd3418ef97ed3f0b5c62072b90b3c1b40558742e45", "usr/lib/qcom/adsp/geofence.so" = "55a0ab144b32549a1d6219c0635de64d44465f437c7d1c82e00a7ea2baed78c0", "usr/lib/qcom/adsp/gesture.napp_header" = "7544a84e03cd2bc17ae572385ae105203f625dbaf0c6451c0102dec140842f70", "usr/lib/qcom/adsp/gesture.so" = "99e4e322907f8feb9c15c1af3f21bb4080c7c6da061a171983d3459478cb4c22", "usr/lib/qcom/adsp/health.napp_header" = "50bb8cc61d64677de9f5b50d1cf67a63a60106ac5a8a0d06ac5ee51d6423297b", "usr/lib/qcom/adsp/health.so" = "50af2b8a19192870b38fe5994f98cd659a6f79e38f17aee1994ce5c3602776fc", "usr/lib/qcom/adsp/imu_cal.napp_header" = "24a05d20450989eb533f9286cbb8606366b4477b470a32d7e9fe7f6c98d2ba1b", "usr/lib/qcom/adsp/imu_cal.so" = "89a163cfcc9922f74ae50c5093daf235d391a8652c7989ed01623748ff7b8b0b", "usr/lib/qcom/adsp/ip_health.napp_header" = "2b7a2fad23aa0e4879ded3f1d7ea38782cdb5795fbbc985c452f996c4db59bdd", "usr/lib/qcom/adsp/ip_health.so" = "daf36eaf615cbdcf3d7b69506721378da9bf522d7338b02f97454fc326dae9d2", "usr/lib/qcom/adsp/libchre_slpi_skel.so" = "e5556f69105bde96a1cf52b0795a1c24a384277b250ec09a80af7df602624026", "usr/lib/qcom/adsp/libstabilitydomain_skel.so" = "aa0fc40154240ac0d2bb6c84e52be4960e3609d3d971dff55172fd648a2e9e6f", "usr/lib/qcom/adsp/libsysmon_skel.so" = "84fa17a2d5a63782f7fb71502da9a1c3a360937e2b31d2a19bd91114fd5dc909", "usr/lib/qcom/adsp/libsysmondomain_skel.so" = "51b15e3287b9f9d8ee1f4d0456b457cd0de77e6e5e8de6894d49be17c5f00cc1", "usr/lib/qcom/adsp/libsysmonquery_skel.so" = "594cbb10430d0bd09fa6db9840da7b0b2c54e07dbe6eb555b7736590dcac9060", "usr/lib/qcom/adsp/lowi_client.so" = "256dd810d8d0c6a8e776b984d56162fa3637148853565b4329099b3ecaa5417a", "usr/lib/qcom/adsp/map_CHRE_SHARED_LIBS_saipan.adsp.prodQ.txt" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "usr/lib/qcom/adsp/map_CUSTOM_SHARED_LIBS_saipan.adsp.prodQ.txt" = "1101d7b703505e30b2ffc6a2c31e0b568009585bbab07f0044b44fa6ff5da7de", "usr/lib/qcom/adsp/map_SENSOR_IMG_saipan.adsp.prodQ_SHARED_LIBS.txt" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "usr/lib/qcom/adsp/mm_fluence_sb_module.so.1" = "46c12173576e25b9fe53ba9e8a2572f1be5b20beb92ad3cee5db55681adcf1c1", "usr/lib/qcom/adsp/mmecns_module.so.1" = "cebfc5902b342d172bb25a031215d3204effb6699c2663a386ae1644f3c61e81", "usr/lib/qcom/adsp/motiondetector.napp_header" = "60dc04f037a6daab83ba158b4f132c53af4404a6af253ac4a57963398e502e43", "usr/lib/qcom/adsp/motiondetector.so" = "1650528503d3a4ecc5129c7d4b8c9e60e8bb07ae40367b864e1ee1ee3b13a5f1", "usr/lib/qcom/adsp/sd.napp_header" = "65bf2082d97f76de64d7e1cc9391ddb8dc653ccd4310aa9f067b6b29abbf3a03", "usr/lib/qcom/adsp/sd.so" = "0da21a91499fecae9a2ac301aa7b8a5d8f35267cb0d46d13faf153d4e248ef66", "usr/lib/qcom/adsp/sm_fluence_sb_module.so.1" = "b6495c4dd305ce0fa9aab1a0a602b02bccd80a6ea4e53b6b7ceb5b3a55a75302", "usr/lib/qcom/adsp/smartbatching.napp_header" = "cd9891c5844b2d29ffb0a5666332c4e1906859177a42fedb96dcb746dc14ca76", "usr/lib/qcom/adsp/smartbatching.so" = "3e62e35507a0a746db7420f6a3f27303d248e192f520c163fd3841458ef3f965", "usr/lib/qcom/adsp/smecns_v2_module_fv9.so.1" = "a9d2be22021fb71bcd59652f93e543265a802180440c3627421db53dffd076c3", "usr/lib/qcom/adsp/sns_bring_to_ear.so" = "aeb50c8885d43ee4c2a0c85d85a43b0f87cad1d5549c5edfdfee53042d8fa3c5", "usr/lib/qcom/adsp/uv_exposure.napp_header" = "e2a5502511ec768f426e8e42ec5893d8dee0042e79b21dd5d8af02fb2b42ba00", "usr/lib/qcom/adsp/uv_exposure.so" = "856c42210c7bd28b7046247199c7153280023dcde3e82b77db5ad062149816bb", "vendor/etc/acdbdata/Bluetooth_cal.acdb" = "15bb3f59a6794fde969d93d5f111a7dc2f58e9e1ae7f181f5db71946eae7702e", "vendor/etc/acdbdata/General_cal.acdb" = "838a54f3026bf9641c19894e61ba2061ac7d57979a59bdae5bb6a50ea8242654", "vendor/etc/acdbdata/Global_cal.acdb" = "fd1efab2c0b62cd1e8b382cb9ac9581c77d4fcfce76063f97b5a1828df13f546", "vendor/etc/acdbdata/Handset_cal.acdb" = "777cd88e2ef054ded4fbf240588d8cdab82c2befa2e050c95c00381cc0443afb", "vendor/etc/acdbdata/Hdmi_cal.acdb" = "f27b7f7afcb9cd24d3c4c99c10015b0a9d3f72c9c86a9ea12d0a5d4be006f897", "vendor/etc/acdbdata/Headset_cal.acdb" = "dd170203720224c12caa6d33cbffd8ff2ea90ac96a71cd35d1b8251bcb12f26c", "vendor/etc/acdbdata/MTP/MTP_Bluetooth_cal.acdb" = "988433114ba1289ab29d446fe0557f676ba5ef5ed622f34a2bacf19db7b6b042", "vendor/etc/acdbdata/MTP/MTP_General_cal.acdb" = "5447cb8be01a98374658668c77f42290564bfa5645cd22312b2395d1739eea19", "vendor/etc/acdbdata/MTP/MTP_Global_cal.acdb" = "9f6f84454e7d2afecebcc6417455ad1d8148fb69f9927df16cd5a21794d0df39", "vendor/etc/acdbdata/MTP/MTP_Handset_cal.acdb" = "33ba89b0d847417a926864b6f163bd53b85ae7de907cd5c6387816fb4a6aede0", "vendor/etc/acdbdata/MTP/MTP_Hdmi_cal.acdb" = "e8c449a33278372703a586a038e1b95c0b410879661875cc7221a69519a6e0e7", "vendor/etc/acdbdata/MTP/MTP_Headset_cal.acdb" = "0c2fbc3728ac19a3e9dc16b5d02a56e520a8d827fa50520dd4d70a372eab00ab", "vendor/etc/acdbdata/MTP/MTP_Speaker_cal.acdb" = "6260c6873a52734f84de5e0083359569d925aa9855d04d167f30a875821ec9cf", "vendor/etc/acdbdata/MTP/MTP_workspaceFile.qwsp" = "34e4dcd7c9ea67f79591ff8367f1af3cb31e7a4e420db5c1355ae39e148c4aa3", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_Bluetooth_cal.acdb" = "dfd76a7ceead645d4db03247c6dc3dddd818f590b3e05c114da937902236d3ec", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_General_cal.acdb" = "31f9843795a3f678c3450b532d7d67b185849c453e5f5143440390fa944b47ee", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_Global_cal.acdb" = "211e6ceaf4103ed3d976332ef942e2e7df9a27d5c66f635c1f27ff26965826ea", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_Handset_cal.acdb" = "820905ccd2504c65932c1ff3a0fbbdde9f5c23bfd160a5e667c30ddfda07224d", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_Hdmi_cal.acdb" = "7b74a25781d82d365252626edb2f5e702dbdc860fdcc81b94ec65526578b50b8", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_Headset_cal.acdb" = "51c1aeec120398ab7ceefc2f20ad8a3f83a55a185a2d9737d089d0ffe2f4fb05", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_Speaker_cal.acdb" = "8c87983f2127e23480f4c8e247465242ea0b7fff96dd3473ba6fc4e03e4250ed", "vendor/etc/acdbdata/MTP/lito-lagoonmtp-snd-card/MTP_Lagoon_workspaceFile.qwsp" = "a070d0230625d6dacfda90863e5a9dcfb3978ce0a08c8b962adf6daa46493231", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_Bluetooth_cal.acdb" = "717086d39d522cafdad98ebadd3340a29150cfd48b96ab3d49e456c1bdc1efc7", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_General_cal.acdb" = "0aff11b59e553fc73e6b914d010c6662edfdd2b9088fa5e50ccee455e2d7ea54", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_Global_cal.acdb" = "cffe52f600ee8eb512f775015124509e5e0c8bedbb7ba4a80ef20ac8101479a2", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_Handset_cal.acdb" = "4ed869a415c88837a054683d40fcee4e6c72f59006e1cec4986b8500fb764b7c", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_Hdmi_cal.acdb" = "c40aca80d7dda62e505f6ff8741fcf3550794542ba5fbe73554c7214b2c63006", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_Headset_cal.acdb" = "fb74eac36253109a64dcbf38c3138645748caa5b4ca1432b140e694142d514ab", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_Speaker_cal.acdb" = "5676cbd281bf63759ec6ca16cd3e268ad14e74040831aa517cc3e50b67a14db1", "vendor/etc/acdbdata/MTP/lito-orchidmtp-snd-card/MTP_Orchid_workspaceFile.qwsp" = "a015af4bdd6a4d04e9343f932e33fa5e36441f66e7f5152219588a16287903b1", "vendor/etc/acdbdata/QRD/QRD_Bluetooth_cal.acdb" = "1303beb6d4f0437fada40c551a75afcfc1ed8883c13dcbbfb978ad68bc48c05a", "vendor/etc/acdbdata/QRD/QRD_General_cal.acdb" = "12eb344b56b56c9f3a33e1f1166851cfcd73191b1db0286cf1d5b780921cb7e5", "vendor/etc/acdbdata/QRD/QRD_Global_cal.acdb" = "1768aed5fcbbf8d836583d8aba4d7d6d9af8a67adf4c7462a115e162a892911f", "vendor/etc/acdbdata/QRD/QRD_Handset_cal.acdb" = "f2551cac34e65a79cdd47defbc4dce6cc1af8ce27a37e04cff9182d698ebbab0", "vendor/etc/acdbdata/QRD/QRD_Hdmi_cal.acdb" = "e8c449a33278372703a586a038e1b95c0b410879661875cc7221a69519a6e0e7", "vendor/etc/acdbdata/QRD/QRD_Headset_cal.acdb" = "b062246965e169b72c20ee8a75e84da9ff0df491eb0cca9aca100ea893bf0602", "vendor/etc/acdbdata/QRD/QRD_Speaker_cal.acdb" = "9eda98210758cb2c181f654c6a7a579c22f2396d307c4d6e9d85e55583a6a676", "vendor/etc/acdbdata/QRD/QRD_workspaceFile.qwsp" = "caa24a53a2a2fd6cf044b8ba2dd8a1f23a353a4210f15146f3bf7ed61b9af960", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_Bluetooth_cal.acdb" = "5c833f1c2a86a24e93956ebb0127521db2945ebba8cad1616fa0a2f54ae6b138", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_General_cal.acdb" = "8cd3ccd6a579fbfd1bc5eaad072a40126917fe4f2bd7fa7f77b63f2db2fcd56a", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_Global_cal.acdb" = "567d2fd1ae931a1c5e9e2f9bdd03322bc1fa7f81c975172c8f807e2df74458ea", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_Handset_cal.acdb" = "14ce306b4b1526f7a4d1aa38e280ec3a5d4db8cf3a81a5b3004c063b74ddda1f", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_Hdmi_cal.acdb" = "298b73e4466ae0b5b1c5919a1556c9f20200b364eacfdb7bcda736cf2fabe7c7", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_Headset_cal.acdb" = "64675b2970bf0af043f95daf2fec7caa63e0cbde169334c92b579a7bc1ef0393", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_Speaker_cal.acdb" = "1c1bfead8e39fce42389eb7a3ff60b34dfe10f02e897dd2f681999e2b10bee15", "vendor/etc/acdbdata/QRD/lito-lagoonqrd-snd-card/QRD_Lagoon_workspaceFile.qwsp" = "1e9c7c6ac65af33953b8fc8c09043020770f13f3907258ea85b1609b6192d4df", "vendor/etc/acdbdata/Speaker_cal.acdb" = "fa9d4f12ce0145b68d604cb4335042b1152806937fc40155b5eadc0a70ad16f3", "vendor/etc/acdbdata/adsp_avs_config.acdb" = "f00169cfe0332e7033ef18cb4d2c68b35e9f3050e61519b76987ad5a459b045f", "vendor/etc/acdbdata/nn_ns_models/fai__2.0.0_0.1__3.0.0_0.0__eai_1.00.pmd" = "4b7e1b1f1d6763ca9a4b3d34ef5f5c625e225705cbe25e9d5a85d9363d4e5fe1", "vendor/etc/acdbdata/nn_ns_models/fai__2.2.0_0.1__3.0.0_0.0__eai_1.00.pmd" = "ebfb1a2246d62b4594def85252860f3b02241e433c8b376e517726fad1d9ee7e", "vendor/etc/acdbdata/nn_vad_models/fai_3.0.0_0.0_eai_1.00.pmd" = "d0d2bfe757f8220798d3539752a3301dba322e00374c219a19142adf4360332d", "vendor/etc/sensors/config/bmp380.json" = "2c1ae533f0bc1440546173242663c15c4ceb1e68812cd8c0dd620c9990614cc5", "vendor/etc/sensors/config/lis2mdl.json" = "80dc845f34eeec9269e0f78decb02e0175416ef2b263d990a1f61ef9ed8e3535", "vendor/etc/sensors/config/lsm6dsr.json" = "8c975d5b2219cb28079e0c440b61698c9e0643f2af7015dd5e7a7493b785f8c8", "vendor/etc/sensors/config/lsm6dsr_0_16g.json" = "a0377c55b9d93699406b6ce3fd5c5f88dee976cfaddf396551f707eeba033687", "vendor/etc/sensors/config/r3_lis2mdl_0.json" = "6aa33c2935d9a274a9417a27461c4537b8d9f072a98386921b78f02cecdbcc8b", "vendor/etc/sensors/config/r3_lis2mdl_0_evt.json" = "31ffa26852e56184e46d1cd247b3a793447a361ec4ecb18b992eab30f636f550", "vendor/etc/sensors/config/r3_lis2mdl_0_proto.json" = "bb03f62ef8ef711861b62174a99e0f1f059b79c40df28f3a4fcc1f1a7b808b1b", "vendor/etc/sensors/config/r3_lis2mdl_0_proto_1_1.json" = "8a650ef022142e6d7e7b6a446ae268e7ac74df1055f93125f40b91c15b600612", "vendor/etc/sensors/config/r3_lsm6dsr.json" = "84314b38ec4baedbff8c01dba059cf8d9815c888a585ead30a471870cd044f40", "vendor/etc/sensors/config/r3_lsm6dsr_evt_1_4.json" = "8898e0e1dd4c8a6e083a10d29bf8661e32d0818f5f8debc540aa51eee5a59e4e", "vendor/etc/sensors/config/r3_lsm6dsr_proto.json" = "b14475ee7e425a026a6a1a2ca9ab3cb21bce31a904962f0f8bf203e707d24816", "vendor/etc/sensors/config/r3_tcs3701.json" = "84c64f9882fd07dc664e9dcbb74155ab890f00970b137a553331869a8ce2c05e", "vendor/etc/sensors/config/r3_tcs3701_evt.json" = "08e5096f4d31460c9a1cd4e394074ba79b276503b726883be39a0b3fa648a8e9", "vendor/etc/sensors/config/r3_tcs3701_proto.json" = "0bb7348afe2dab7df8cb72dd0733c60cffbc2707a01860462de4d09561e90e70", "vendor/etc/sensors/config/r3_touch_gesture.json" = "fdb6c15562c0a60fe57c8c54a0aca2affeda0e5d3dab4b56edd3752400af0f66", "vendor/etc/sensors/config/sm7250_bmp380.json" = "49a61c5b149c412cf69ac3831e0a354d36bd84fff48647533795dfc9984216c7", "vendor/etc/sensors/config/sm7250_camera_vsync_0.json" = "be318de46c38d60edeaf3c9b76faa493fe2cc5bd15e30b664f387262bd9870a5", "vendor/etc/sensors/config/sm7250_camera_vsync_1.json" = "187b6199055232d4cd3430811b677d5ebb89e96fe7ac4c98338c7aee585ba569", "vendor/etc/sensors/config/sm7250_camera_vsync_2.json" = "2034bb2c29f6a833a476fbd68e882a53223b79ac9de2ebcf29b26a8806eb174a", "vendor/etc/sensors/config/sm7250_irq.json" = "d2b41e9305c01ff51c1530594d493944034f088d2d996471fcf02e66243a3481", "vendor/etc/sensors/config/sns_amd.json" = "76c4b9cc7055ed08ae66c24340279c773e381162e56b0a312f413164e4797a72", "vendor/etc/sensors/config/sns_cm.json" = "e7d1530a60c2721e555588e0c672e9c2084d6c964499b792e1cde5af34dd7042", "vendor/etc/sensors/config/sns_device_orient.json" = "e76a22761b5a91abbf5ce11d8d0b409b2fdab66b8e4b33727ea06913c7212b58", "vendor/etc/sensors/config/sns_diag_filter.json" = "88c5ec8e2c1e552eefc0f946f92b245ced717a1425a1bb1d5116341cee806184", "vendor/etc/sensors/config/sns_distance_bound.json" = "a2506549987eb400282482f940af5a70c78f572a4c643b5660a3052dcd16ab10", "vendor/etc/sensors/config/sns_fmv.json" = "082266a731d13b9e0f7589d40ee39b8caf1a9edfb6556c086dbabf58d39f7780", "vendor/etc/sensors/config/sns_geomag_rv.json" = "50172454fe079efc9c3aab6c869813a60fb7f9640347b93d835923eab26f1289", "vendor/etc/sensors/config/sns_gyro_cal.json" = "2e1f0c22504abf15e5749668dda13eb23c7685d5f259b482ce3d3919489b4f3c", "vendor/etc/sensors/config/sns_mag_cal.json" = "64a5a902fc307e341d02ece5acc09bcbbda84e91330210a2b460f5c65ba5bad5", "vendor/etc/sensors/config/sns_pedometer.json" = "bef186b60dd0c118d16d9229ac0d649b7a438b175441dbce1ecbc9ef3b91d54f", "vendor/etc/sensors/config/sns_rmd.json" = "8d40b701810a784792c34fa909374cbda4ffd7e267c5616fee6f0e5ad75aaa84", "vendor/etc/sensors/config/sns_rotv.json" = "9939e9f2e1c70a4c9f4cd10c15564041a0fdb96c50611e264b9f32d267f5ade7", "vendor/etc/sensors/config/sns_smd.json" = "26a60976b7a2cb25755bc41fe80f7af990181d8a04c44377c2f3c5b64e48cd4c", "vendor/etc/sensors/config/sns_tilt.json" = "ebcd184d815c868f1a83a4ac113795c7fc9bb3eeb2e331f8168a0d623f545c58", "vendor/etc/sensors/config/tcs3701.json" = "a86247294d141f01544dac00e4d4e267d2b95c6cb6fdc02013664848b0a03ecb", "vendor/etc/sensors/sns_reg_config" = "47fd1c0317c43974ceb5f71f0e70dfb69111e6376df6b4fdf2d52bddce97b039" }
+firmware = true
+note = "copied from the phone's own vendor/firmware partitions: never in git, never written by state.py"
+
+[[bundle]]
+path = "/Applications/SweetControl.app"
+source = "builds/userland/2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf-2e899aa8d6/SweetControl.app"
+target = "userland"
+ref = "2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf"
+sha = "2e899aa8d6"
+note = "3 of 6 files match builds/userland/2e899aa8d64685d43bd2ae9f2cf0a9713104bfdf-2e899aa8d6/SweetControl.app"
+CFBundleIdentifier = "org.iosonpixel.sweetcontrol"
+CFBundleShortVersionString = "1.0"
+CFBundleVersion = "1"
+files = { "AppIcon60x60@2x.png" = "bafb34036ef3e903128e7e839af6f71074a1befc211a4d6323bc91dbf649d619", "AppIcon60x60@3x.png" = "8309f4373f83b3e0481e28a41d298d996e1b8d7dd9e41a30b9863ee9a2fabe84", "Info.plist" = "ced1437a4164bb0247964e68032b348be5e321aa9a727b9f25c33e786d09ea5b", "Knobs.json" = "596db8f8c712f834159a4d0af6f41388250a0ca481cc7ec850f42ba863fff824", SweetControl = "409f9371d40940d01d9f2ca60e3d00251d415c1d6e04b553baa274d15ecda8c5", "_CodeSignature/CodeResources" = "9b0c7d0dd5a4e5ed8305a0f7691a264a54a46173641f275738c8e337d8c0c97b" }
+
+[[bundle]]
+path = "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
+source = "builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/RedwoodAudio.driver"
+target = "userland"
+ref = "a93b1bb86943466b57716125a619cf948a86e50e"
+sha = "a93b1bb869"
+note = "3 of 4 files match builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/RedwoodAudio.driver"
+restart = "mediaserverd"
+CFBundleIdentifier = "com.redwood.audio"
+CFBundleVersion = "1"
+files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "3638a0ca4d83a999f51776f66bbc49d18ef5c170707fa0bfedeab527c896f821", "RedwoodAudio.pre-s4" = "", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
+
+[[bundle]]
+path = "/System/Library/Extensions/SweetMetal2.bundle"
+source = "builds/hmetal-mesa/ws-hm-int2-504c000bde/bench/SweetMetal2-shim.bundle"
+restart = "backboardd"
+CFBundleIdentifier = "org.iosonpixel.SweetMetal2"
+CFBundleShortVersionString = "0.2-hm-int2"
+CFBundleVersion = "1"
+files = { "Info.plist" = "b14f9a74e5e69dafe644f3827dff0aa9d9cf752d4e64b48a4ab163b31d31c730", SweetMetal2 = "26d18922ff98ebca0773a1cc2b49b194b938d2c433adc50d36861bdd224fd11c", "_CodeSignature/CodeResources" = "0fa96e08637d3263c7e0ed5033c70b2517b8a748b587abc01fa26f207877402a" }
+target = "hmetal-mesa"
+ref = "ws-hm-int2"
+sha = "504c000bde"
+
+[[bundle]]
+path = "/var/local/disabled/SyncBundles/AirFair.syncBundle"
+source = "moved-aside"
+files = { AirFair = "43ec786f7e73a5c9f2bc961de5d60ec04229a25967848f66bab958d5389d562e", "Info.plist" = "ae47422287a3fc219f6b46f53acf52bf383f33f732b05d29bab779af33e82c1d", "_CodeSignature/CodeResources" = "3c727b0f043e463c0227db49cef54c5567715986d08a46c98923c9bb73585e5a" }
+note = "AirFair moved aside (FairPlay off; KNOWN-GOOD rk3a notes)"
+
+[[bundle]]
+path = "/var/local/hmetal/lib/HakiosMetal.bundle"
+source = "builds/hmetal-mesa/ws-hm-int2-504c000bde/bench/HakiosMetal.bundle"
+restart = "backboardd"
+CFBundleIdentifier = "org.redfin.hakios-metal-bench"
+CFBundleVersion = "1"
+files = { HakiosMetal = "3bed764207d66a15feb41d9bfb5c372387caee65b20263c59e060bf632a849a1", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "b1e4c2303d89a38ce23f9f0d81233ebd402e7b89fac767e886b6c07a9757fe3e" }
+note = "2 of 3 files found in builds/hmetal-mesa/ws-hm-int2-504c000bde/bench/HakiosMetal.bundle"
+target = "hmetal-mesa"
+ref = "ws-hm-int2"
+sha = "504c000bde"
+
+[[bundle]]
+path = "/var/local/hmetal/lib/SweetMetal2.bundle"
+source = "builds/metal2/da1d8a3bf8542d5db1e29ae6c70b7816cd3fde87-da1d8a3bf8/SweetMetal2.bundle"
+restart = "backboardd"
+CFBundleIdentifier = "org.iosonpixel.SweetMetal2"
+CFBundleShortVersionString = "0.1"
+CFBundleVersion = "1"
+files = { "Info.plist" = "82f7230b96029d524d5b34207b4519d485e2d79cd72e8502551b59783c7c5914", SweetMetal2 = "095ce048f6c0b90dcac54e781daa90eb4f1e3c99a698cb7474b2d0cd93e05c7c", "_CodeSignature/CodeResources" = "36cf4d56011e1d861de889da837b965b836af4e79711913841b83a6206fa9f07", "libvulkan_freedreno.dylib" = "f158ab2a86c78be63a8a7825fc60e10586f903028bb5eb8e2b2fdd56092d190b" }
+note = "3 of 4 files found in builds/metal2/da1d8a3bf8542d5db1e29ae6c70b7816cd3fde87-da1d8a3bf8/SweetMetal2.bundle"
+target = "metal2"
+ref = ""
+sha = ""
+
+
+# Symlinks.
+[[link]]
+path = "/var/local/bin/cat"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/chmod"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/cp"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/cut"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/date"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/dbclient"
+target = "/var/local/bin/dropbearmulti"
+
+[[link]]
+path = "/var/local/bin/dd"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/df"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/dropbear"
+target = "/var/local/bin/dropbearmulti"
+
+[[link]]
+path = "/var/local/bin/dropbearkey"
+target = "/var/local/bin/dropbearmulti"
+
+[[link]]
+path = "/var/local/bin/du"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/echo"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/env"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/find"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/grep"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/head"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/hexdump"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/id"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/kill"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/ln"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/ls"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/mkdir"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/mv"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/printf"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/ps"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/rm"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/scp"
+target = "/var/local/bin/dropbearmulti"
+
+[[link]]
+path = "/var/local/bin/sed"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/sleep"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/sort"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/stat"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/strings"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/tail"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/tar"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/tee"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/top"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/touch"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/tr"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/uname"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/uniq"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/wc"
+target = "/var/local/bin/toybox"
+
+[[link]]
+path = "/var/local/bin/xargs"
+target = "/var/local/bin/toybox"
+
+
+# Small config/flag/env files with their content (content wins; sha256 only for secret or redacted files: never their content).
+[[flag]]
+path = "/var/local/cell.on"
+redacted = 1
+sha256 = "c3426287881b32989571061781ff8c2eb8bc93ea1deb436c4693299b491e74e9"
+content = """
+slots=1 pin=@PHONE@ online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=1 gsistart=p2late p2irq=1 p2irqm=63 p2join=40 p2noaggr=1 p2route=16 ipatbl=1 ipanotif=1 p2early=1 qmapv5=1 x1keep=1 cellroute=1 wdaps=1 p2keep=3 p2keepidle=120 pdmapadsp=1
+
+
+
+ abpcidfail=1
+"""
+mode = "644"
+restart = "wland"
+
+[[flag]]
+path = "/var/local/hmetal/ca/env"
+content = """
+HAKIOS_METAL_CA_PICK=exact
+HM_CB_PAD=2
+HM_UBWC_RT=0
+HM_GMEM=0
+HM_TRACE=0
+HM_XR10=0
+HM_DENY=A2Xghfc
+HM_HANG_BLAME=1
+"""
+mode = "644"
+restart = "backboardd"
+
+[[flag]]
+path = "/var/local/hmetal/env"
+content = """
+# /var/local/hmetal/env (hm-int2): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
+# KEY=V        backboardd's
+# *:KEY=V      every hakios-metal process (backboardd too)
+# NAME:KEY=V   the process NAME (getprogname)
+# Keys HAKIOS_METAL_* and HM_* only. Applied in file order, the last one wins.
+
+# backboardd: as on the phone since var12, HM_TRACE now off (1: on; the log rotates at 16 MB -> bbd-hm.log.1)
+HAKIOS_METAL_CA_PICK=exact
+HM_CB_PAD=2
+HM_UBWC_RT=0
+HM_GMEM=0
+HM_TRACE=0
+HM_DENY=A2Xghfc
+HM_HANG_BLAME=1
+
+# CoreAnimation prefs the dispatcher sets in every hakios-metal process (0 = set false, as SweetMetal2 does; 1 = CA's own)
+*:HM_CA_DEEP_FB=0
+*:HM_CA_FB_COMPRESSION=0
+*:HM_CA_IOSURFACE_COMPRESSION=0
+"""
+mode = "644"
+
+[[flag]]
+path = "/var/local/hmetal/hm-only"
+content = """
+com.apple.WebKit.GPU
+"""
+mode = "666"
+restart = "backboardd"
+
+[[flag]]
+path = "/var/local/hmetal/m2-procs"
+content = """
+com.apple.WebKit.GPU
+"""
+mode = "666"
+restart = "backboardd"
+
+[[flag]]
+path = "/var/local/mtl2-clients"
+content = """
+SpringBoard
+com.apple.WebKit.GPU
+MobileSafari
+hmbench
+"""
+mode = "644"
+restart = "backboardd"
+
+[[flag]]
+path = "/var/local/mtl2-env"
+content = """
+TU_DEBUG=sysmem
+SWEET_UBWC=1
+SWEET_M2V_COLOR_WRITES=fetch
+SWEET_M2V_SCRATCH=1
+SWEET_TIMELINE=1
+SWEET_U0011=0
+SWEET_U0012=0
+SWEET_U0013=0
+SWEET_U0014=0
+SWEET_NILENC=1
+SWEET_PREWARM=2
+SWEET_LUMA_BOOST=0
+SWEET_DEADFILL=1
+# n1 test knobs 2026-11-04 (remove to revert)
+SWEET_SHADOW_CACHE=1
+SWEET_CULL=3
+SWEET_SPARE_IMAGES=1
+"""
+mode = "644"
+restart = "backboardd"
+
+[[flag]]
+path = "/var/local/mtl2-live"
+content = """
+SWEET_DEADFILL=2
+SWEET_LUMA_BOOST=1
+"""
+mode = "644"
+
+[[flag]]
+path = "/var/local/org.iosonpixel.fastrpcd.plist"
+content = """
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<!--
+  The fastrpcd boot job (the ADSP sensors PD's file service). iOS 16's launchd reads its jobs from
+  /System/Library/xpc/launchd.plist, not from this file: tools/redfin-install-hexagon-wsl.sh merges this
+  dictionary into its LaunchDaemons under /System/Library/LaunchDaemons/org.iosonpixel.fastrpcd.plist.
+  Binary /var/local/bin/fastrpcd; served tree /private/var/local/hexagon; log /var/local/fastrpcd.log.
+  fastrpcd waits for /dev/redwood-fastrpc and for the DSP to open its channel itself, so it can start at boot
+  before the DSP is up. When the DSP goes away it exits 3 and launchd starts it again (ThrottleInterval 5 s)
+  for the DSP that comes back. Off: /var/local/fastrpcd.off (it exits 0 and is not restarted).
+-->
+<plist version=\"1.0\">
+<dict>
+	<key>Label</key>
+	<string>org.iosonpixel.fastrpcd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/fastrpcd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/var/local/fastrpcd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/local/fastrpcd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>
+"""
+mode = "644"
+
+[[flag]]
+path = "/var/local/redwood-call-route"
+content = """
+4
+"""
+mode = "644"
+restart = "mediaserverd"
+
+[[flag]]
+path = "/var/local/sweetfps"
+content = """
+0 90
+"""
+mode = "644"
+restart = "SpringBoard"
+
+[[flag]]
+path = "/var/local/wland.conf"
+content = """
+ht=1
+"""
+mode = "644"
+restart = "wland"
+
+
+# Must NOT exist. diff lists them while present; `apply --retire` moves them to /var/local/scratch/retired-DATE/.
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.before-bt"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.before-cc"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.before-fastrpcd"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.before-ssh"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.before-vmd"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.pre-p2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/System/Library/xpc/launchd.plist.with-cc"
+reason = "old launchd.plist copy (the live one is managed)"
+
+[[retired]]
+path = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/MobileGestalt.plist.before-camera"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist.pre-cellradio"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.knowngood-03de277"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.knowngood-0d5d3fd"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.knowngood-ce4a241"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.pre-hap"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.pre-torch"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.r18f"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.r20"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/RedwoodAudio.driver.r20b"
+reason = "old RedwoodAudio plug-in copy; any version is in builds/userland"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.knowngood-r35"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.ovd-diag"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-combo"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-cpu2"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-g10"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-g9"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-hmca"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-n1"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-r48"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-r48g"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-r65"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-r66"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-r68"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-r69"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/SweetMetal2.bundle.pre-rotfb"
+reason = "old SweetMetal2 bundle copy (hand-kept backup); any version is rebuilt from builds/metal2"
+
+[[retired]]
+path = "/var/local/abp-policy.conf"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e3"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e4"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e5"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e6"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e7"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e8"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-n12b-e9"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-r3"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-reg"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-rfs"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-rfs2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-rfs3"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-sos"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.pre-voice"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.r3-bspok"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.r3b"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.r3d"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.reg1"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.reg2"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.reg3"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.conf.reg4"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/abp-policy.r3.conf"
+reason = "old abp-policy variant (secret-class file: never copied off the phone)"
+
+[[retired]]
+path = "/var/local/av.log"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/backup"
+reason = "hand backups (MobileGestalt / Info.plist tars, 2026-11-04/05)"
+
+[[retired]]
+path = "/var/local/bb8.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/bin/SweetMetal2.knowngood"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/bin/btd-bridge.68cef4c"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/btd-bridge.before-w1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/btd-bridge.f6fc88e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/btd-bridge.knowngood"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/bin/camera_avtest"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/camera_test"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/h1test.sh"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/hakios-metal-probe"
+reason = "one-off Metal probe (2026-11-06)"
+
+[[retired]]
+path = "/var/local/bin/hakios-metal-probe-fix"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/hakios-metal-probe-int"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/hakios-metal-probe-mesa"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/hakios-metal-probe-var"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/hakios-metal-probe-var2"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/hmbench"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/mg_test"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/mic_test-tcc"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/n12b-rep.sh"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/pimg"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/rgtest.sh"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/sctl.pre-m0"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/sensd-probe.sh"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/sensd-probe.sh.pre-sns"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/sensd-probe.sh.pre-sysctl"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/sensd.knowngood"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/bin/sensd.pre-prox"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/sensd.pre-sns"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/sensd.prox-9ce81fa"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/sound_test"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/stubt"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/venusctl.pre-v2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/venusctl.pre-v3"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/venusctl.pre-v4"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/venusctl.pre-v5"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/venusctl.pre-v6"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/vktest-gd"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/vktest-pf"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/vt_test"
+reason = "one-off test tool (rebuild from builds/userland when needed)"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-0509ad9"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-269c240"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-53df921"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-562121d"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-798dfdf"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-98a23a0"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-9e94b4c"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-a7abdab"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-a84cf84"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-ac39192"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-ea1eb25"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-ec77e95"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.abp-f651489"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.bb1-7f4e2cf"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.before-w1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.cfc-bad"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-0196fb7"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-0b12d84"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-0faa68a"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-1124a67"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-26a961a"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-2a18c75"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-3051133"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-3169036"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-37ac4af"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-3a7ac4e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-3b55fc3"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-3ec5221"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-3f35329"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-404af76"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-42875c0"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-44976ce"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-45d6f8c"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-45dd92a"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-461528e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-478221e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-488ad8c"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-4c1b306"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-5511103"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-58acc7e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-58f8d0a"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-5d54ae9"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-5e71b26"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-61e671b"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-64a1491"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-66c55f3"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-697cdb8"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-6a87046"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-6a8fce6"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-72f72f1"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-761b4b6"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-7ad4af0"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-7b0397e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-7d398a7"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-834b392"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-867c0ab"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-8730ee9"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-8b49fbf"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-8c727f0"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-8dae22b"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-8e237eb"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-8f569ae"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-92e69f1"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-9735086"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-9913389"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-9a9576e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-9d7b59e"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-9fe3b62"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a0ba7fa"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a1093d5"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a16ecd3"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a1c8338"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a3e0e2b"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a45ac02"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-a76dcaf"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-b64b047"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-b877003"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-bf09d1d"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-bfc74f6"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-c54969f"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-d405efa"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-d81cc43"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-d9afd28"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-daf5eb5"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-e165905"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-e198fca"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-e34fb22"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-e59808d"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-ead4c88"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-ed88147"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-f6242d7"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-f8e42d9"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-fba5eda"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.gsi1-fd390dc"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.int5-f0602dc"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.klink3-8c39c57"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.knowngood"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/bin/wland.knowngood-19073fc"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/bin/wland.memdump"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.pdmap-6804ce4"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-abp"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-auto"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-gsi1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-ipahw"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-n4"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-n6"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-pin"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-plumb"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-restart"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-ss"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.pre-wds"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/bin/wland.wfix-1712c66"
+reason = "old build copy of a daemon/tool kept by hand"
+
+[[retired]]
+path = "/var/local/bks.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/btd.log.pre-ws-y"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/btd.log.pre-ws-y2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/c30-chown.sh"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/c30-move.sh"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/camera-dump-still"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/camera_test.nv12"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cb.text"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/celestial.text"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cell.on.a0ba7fa"
+reason = "old cell.on variant"
+
+[[retired]]
+path = "/var/local/cell.on.abp"
+reason = "old cell.on variant"
+
+[[retired]]
+path = "/var/local/cell.on.diag-keep8"
+reason = "old cell.on variant"
+
+[[retired]]
+path = "/var/local/cell.on.knowngood-19073fc"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/cell.on.p2"
+reason = "old cell.on variant"
+
+[[retired]]
+path = "/var/local/cell.on.pre-abp"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-bb1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-cidfail"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-gsi1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-m9p"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-n12b-nolog"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-p2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-pdmap"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-pdmap0"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-plumb"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-run2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.pre-ssctl"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/cell.on.run2"
+reason = "old cell.on variant"
+
+[[retired]]
+path = "/var/local/cellnet.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cmcapture.text"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cmcc.data"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cmcc.str"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cmcc.text"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cst.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/cst2.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/fcss.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/fms.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/hexagon.tar"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/hexagon.tgz"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/hmetal-probe-fix1.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal-probe-fix2.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal-probe-fix3.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal-probe-mesa1.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal-probe-mesa2.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal-probe1.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/HakiosMetal.bundle"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/HakiosMetal.bundle.bench-c45f2ee"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/SweetMetal2-shim.bundle.knowngood-6740748"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/hmetal/bench-hm.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/bench-hm.out"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/bench-m2v-try.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/bench-m2v.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/bench-m2v.out"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle"
+reason = "hmt11 copy (ws-hm-var11): the plug-in moved to hmetal/lib in hmapp1 (KNOWN-GOOD 2026-11-09 20:01); check `sweetstate -M` shows no process mapping it before --retire"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.f1"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.run1"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var10"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var2"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var3"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var4"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var5"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var6"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var7"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/HakiosMetal.bundle.var8"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-exact2-prev.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-f1.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-h4-pad2.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-h4-u0.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-h4-u1.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-own-prev.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-own-runs-hmt3.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-pre-hmt3.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm-run1.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm.log"
+reason = "124 MB log: truncate/rotate (the writer recreates it)"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm.starts.pre-hmt3"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/bbd-hm.starts.pre-hmt4"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.knowngood-var12"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-1114"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt10"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt11"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt5"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt6"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt7"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt7b"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt8"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/env.pre-hmt9"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/ca/h3b-stage-mtimes.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/h6tail.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/h6user.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/h7tail.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim-pre-hmt4.log"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.apps"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.log"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.pre-hmapp"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var10"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var11"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var2"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var3"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var4"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var5"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var6"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var7"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/shim.var8"
+reason = "old Metal dispatcher shim copy (hmt runs); active = /System/Library/Extensions/SweetMetal2.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart-exact2.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart-h4a.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart-h4b.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart-h4c.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart-h4d.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart-own.txt"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/ca/tstart.sh"
+reason = "one-off hmetal test log"
+
+[[retired]]
+path = "/var/local/hmetal/h1.bin"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/h2.bin"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/hmbench.metallib"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/lib/HakiosMetal.bundle.knowngood-var12"
+reason = "old HakiosMetal variant (hmt/var runs 2026-11-06..09); active plug-in is hmetal/lib/HakiosMetal.bundle"
+
+[[retired]]
+path = "/var/local/hmetal/m2-fallback.pre-int2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/m2-procs.pre-int2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/hmetal/perf1"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/perf1.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/perf1.sh"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/probe-int-59ffeee.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/probe-var.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/probe-var2.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/t-hm.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/t-hm.out"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/t.log"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/hmetal/try-m2v.out"
+reason = "one-off hmetal probe/bench output (2026-11-06..09)"
+
+[[retired]]
+path = "/var/local/knowngood-r5au1s"
+reason = "r5au1s fallback copy (2026-11-09); known-good tracking retired 2026-11-05: git manifest + builds/ replace it"
+
+[[retired]]
+path = "/var/local/l6.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/launchd.plist.before-no-catimer"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/launchd.plist.before-quickwins"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/launchd.plist.hb90"
+reason = "old launchd.plist copy (the live one is managed)"
+
+[[retired]]
+path = "/var/local/launchd.plist.pre-fpapfs"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/launchd.plist.pre-fstypeovr"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/launchd.plist.pre-heartbeat"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/launchd.plist.pre-sweetfps"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/launchd.plist.sweetfps"
+reason = "old launchd.plist copy (the live one is managed)"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.e27cd783"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.hud-bad"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.knowngood-27efaa0"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.pre-cell"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.pre-celldata"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.pre-ctl"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.pre-pin"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.pre-ui2"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/lib/SweetFPS.dylib.pre-ui3"
+reason = "old dylib copy kept by hand"
+
+[[retired]]
+path = "/var/local/loc3.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/loc4.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/loc5.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/modem-profiles-20261113-180026.bak"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/modem-profiles-20261114-010200.bak"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/modem-profiles-20261114-014027.bak"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtb.text"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/mtl2-clients.before-camera"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-clients.pre-hmbench"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.gd-gmemubwc"
+reason = "old Metal env variant"
+
+[[retired]]
+path = "/var/local/mtl2-env.knowngood-r35"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/mtl2-env.p2-off"
+reason = "old Metal env variant"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-best"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-cpu2"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-cw"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-df"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-df1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-flush"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-g9"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-lb"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-n1test"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-op"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-ovd"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-r48"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-r65"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-r66"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-r68"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-r69"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-sweetctl"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-sys"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-tudebug-p4"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-u0"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-ws100"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.pre-ycbcr"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.r31-B"
+reason = "old Metal env variant"
+
+[[retired]]
+path = "/var/local/mtl2-env.r31-C"
+reason = "old Metal env variant"
+
+[[retired]]
+path = "/var/local/mtl2-env.r31-orig"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtl2-env.r34-orig"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtl2-env.r35g-orig"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtl2-env.r39gw-orig"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtl2-env.r42-orig"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtl2-env.r49-orig"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/mtl2-env.u-w-bak"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-env.u0"
+reason = "old Metal env variant"
+
+[[retired]]
+path = "/var/local/mtl2-live.pre-g10"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-live.pre-lb"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-live.pre-m1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-live.pre-n1"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-live.pre-sweetctl"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/mtl2-telemetry"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/o17.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/o19.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/o19m.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/o5.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/o7.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/or10.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/oslog-s4.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/s1.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/s2.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/sc-preferences.plist.bak"
+reason = "hand backup"
+
+[[retired]]
+path = "/var/local/sensd-probe.out"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/staged-before.txt"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/staged-revert.sh"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/stubs.bin"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/sweet-sysctl.conf.pre-m10p"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweet-sysctl.conf.pre-m13p"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweet-sysctl.conf.pre-m14p"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweet-sysctl.conf.pre-m6p"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweet-sysctl.conf.pre-m9p"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweetcell.conf"
+reason = "old flag variant (pre-sweetctl / pre-p5)"
+
+[[retired]]
+path = "/var/local/sweetcell.conf.pre-p5-absent"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweetcell.fakect.Preferences.pre-p5"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweetcell.on.pre-p5"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweetcell.reattach.pre-p5"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweetfps.pre-sweetctl"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweethud.pre-sweetctl-absent"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/sweetpin.off"
+reason = "old flag variant (pre-sweetctl / pre-p5)"
+
+[[retired]]
+path = "/var/local/sweetpin.on.knowngood-nopin"
+reason = "known-good copy: known-good tracking retired; the git manifest history replaces it"
+
+[[retired]]
+path = "/var/local/sweetsb.r"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/sweetsb.x"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/sweetsb.xm"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/sweetsb.y"
+reason = "one-off script/marker from an old test"
+
+[[retired]]
+path = "/var/local/wfr2-l.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os1.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os2.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os3.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os4.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os5.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os6.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-os7.txt"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-ref"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-wifi.plist.new"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-wifi.plist.new2"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wfr2-wifi.plist.preK12"
+reason = "one-off dump/test output (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.conf.pre-sweetctl-absent"
+reason = "pre-change backup: the git manifest history is the backup now"
+
+[[retired]]
+path = "/var/local/wland.log.3b55fc3-autofail"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.461528e-autofail"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.after-p2irqm0-died"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.bfc74f6-autofail"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.ead4c88-autofail"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.empty-r59a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0196fb7-c2join-r1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0196fb7-c2join-r2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0196fb7-c2join-r3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0b12d84-nostat"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0b12d84-p2early"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0faa68a-p2ee1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0faa68a-p2qos402-0faa68a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-0faa68a-p2qos802-0faa68a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-1124a67-loopnoaggr-1124a67"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-19073fc-keep8"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-26a961a-p2rec240-crash-26a961a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-26a961a-p2rec240-void-26a961a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-26a961a-p2rec240-void2-26a961a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-2a18c75-tlvbig"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3051133-p2tx-diag"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3169036-routedis-3169036"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-37ac4af-ipanoflt"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3a7ac4e-qmapv5"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-callrestart-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-none-control-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-none-control2-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-none-control3-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-none-control4-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-none-control5-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-p2irq4-nocycle-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3b55fc3-p2irq4-nocycle2-3b55fc3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3ec5221-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-3f35329-swfilt"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-404af76-p2cmdq0-404af76"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-404af76-p2cmdq1024-404af76"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-404af76-p2irq4-blip-404af76"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-404af76-p2irqm63tx-404af76"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-42875c0-loop-42875c0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-44976ce-alloc-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-45d6f8c-onestart-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-45dd92a-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-461528e-blipdump-461528e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-461528e-coldboot-461528e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-478221e-p2cmd-478221e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-488ad8c-catchall"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-488ad8c-dpiface9"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-488ad8c-dpmux9"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm0-died"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm0tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm1-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm16tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm1tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm28tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm2tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm4tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-4c1b306-p2irqm8tx-4c1b306"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-5511103-stab2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-58acc7e-route16-58acc7e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-58f8d0a-p2cmd2-58f8d0a"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-5d54ae9-late-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-5d54ae9-tlvmin-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-5e71b26-onering3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-5e71b26-swap-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-61e671b-txblock-poke"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-64a1491-eedump-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-64a1491-onering-long"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-66c55f3-p2rec0ack-66c55f3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-66c55f3-p2rec1ack-66c55f3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-66c55f3-p2rec20-66c55f3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-66c55f3-p2rec20ack-66c55f3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-697cdb8-p2irq2-697cdb8"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-6a87046-probe1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-6a87046-probe2-defprof"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-6a87046-probe3-mux9"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-6a8fce6-cmdqos"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-72f72f1-c2start-long"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-72f72f1-ch3-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-72f72f1-ev4-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-72f72f1-evonly-long"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-72f72f1-none-long"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-761b4b6-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7ad4af0-ackloop1-7ad4af0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7ad4af0-ackloop63-7ad4af0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7ad4af0-join40-7ad4af0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7b0397e-p2ack1-7b0397e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7b0397e-p2ack2-7b0397e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7b0397e-p2ackj2-nocycle-7b0397e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7b0397e-p2ackj2-nocycle2-7b0397e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7b0397e-p2ackj31-7b0397e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-7d398a7-goactive"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-834b392-WORKS"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-834b392-dorm-stat16"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-834b392-stat14"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-834b392-v5stat14"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-867c0ab-nudge1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8730ee9-p2late-r2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8730ee9-p2late-tx-r1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8b49fbf-tblcmd-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8c727f0-p2A-8c727f0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8c727f0-p2B-8c727f0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8c727f0-p2C-8c727f0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8dae22b-stab1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8e237eb-p2low"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8f569ae-pokefail"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8f569ae-realnoaggr"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-8f569ae-rxloop"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-92e69f1-wdsstats"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9735086-p2full-9735086"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9735086-p2full2-9735086"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9735086-p2full3-9735086"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9735086-p2noirq-9735086"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9735086-p2tx-ok-9735086"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9913389-p2irq-cmd-9913389"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9913389-p2irq-tx-9913389"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-c2start-eedump"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-c2start-r1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-c2start-r2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-c2start-r3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-ch3-eedump-clean"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-ch3-r1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-ch3-r2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-ch3-r3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9a9576e-none-eedump"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9d7b59e-p2irq3-nocycle-9d7b59e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9d7b59e-p2irq3-nocycle2-9d7b59e"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-9fe3b62-qmapack"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a0ba7fa-ipastats"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a0ba7fa-qmapv5-p2early"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a1093d5-ipatbl"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a16ecd3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a1c8338-p2late-ep"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a1c8338-p2tx-ep"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a3e0e2b-stable"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a45ac02-ids34-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-a76dcaf-p2dbg-a76dcaf"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-b64b047-alloc-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-b877003-earlypoke"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-b877003-ipanotif"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-b877003-notifctl"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-bf09d1d-ep2sweep"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-bfc74f6-p2xfer-bfc74f6"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-c54969f-cmd5"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-none-control6-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2irq2tx-hold-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2irq4-r3-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2irq5m1-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2irq5m63-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2rec240-valid-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2rec70-void-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2rec70-void2-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2rec70-void3-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2rec70-void4-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d405efa-p2rec70-void5-d405efa"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-d9afd28-cmdch2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-e165905-p2regs"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-e198fca-keep3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-e34fb22-x1keep-restart-e34fb22"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-e59808d-ev4hi-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-ead4c88-c2start"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-ead4c88-c7start"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-ead4c88-onetx-crash"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-ed88147-late-nostart"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-f6242d7-p2qos0"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-f6242d7-p2qos100"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-fba5eda-tblhdr"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-fd390dc-c2joint-r1"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-fd390dc-c2joint-r2"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
+[[retired]]
+path = "/var/local/wland.log.gsi1-fd390dc-c2joint-r3"
+reason = "saved log copy from an old test run (copy to PF/logs if still wanted)"
+
