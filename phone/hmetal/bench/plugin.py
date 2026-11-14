@@ -47,7 +47,7 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
     HM_TRACE's 10 s 'trace: surfaces:' line (live textures over IOSurfaces, row copies a s and forced ones, XR decodes,
     ring barriers) and 'trace: display-sized surface N let go' (the display torn down: ms since the last buffer);
     the core's HM_XR_SYNC (render.cpp) is set in the same env file
-  - (hmv10) HM_SCHED_WAIT=1 (default): -waitUntilScheduled waits for a held commit's send (was: returned at once), and
+  - (hmv10) (always since hm-int2; was HM_SCHED_WAIT) -waitUntilScheduled waits for a held commit's send (was: returned at once), and
     -commitAndWaitUntilSubmitted = -commit + -waitUntilScheduled; the surfaces line also counts the core's HM_XR_LATE
     decodes, HM_XR_CHECK's 'changed after decode', HM_XR_WB_SYNC write-backs, held commits and scheduled waits
   - (hmv11) the surfaces line also counts the core's HM_XR_GPU decodes (xr_decode on the GPU, no ring barrier), their
@@ -602,22 +602,6 @@ static volatile long hm_surf_live, hm_surf_live_max, hm_shadow_copies, hm_shadow
 /* (redfin hmv10) commits held (sent later from the queue's serial queue: an event waited for, or one held before them)
  * and -waitUntilScheduled calls that waited for such a send (HM_SCHED_WAIT) */
 static volatile long hm_held_commits, hm_sched_waits;
-/* (redfin hmv10) HM_SCHED_WAIT=1 (default): -waitUntilScheduled (and -commitAndWaitUntilSubmitted) of a held commit waits
- * until it has reached the GPU, as Metal's does. Was: returned at once. CoreAnimation swaps after it: the kernel's
- * direct-scanout and panel paths show a frame once the swapper's last submitted fence passes (0976/0989), so a frame
- * swapped before its buffer was submitted was shown while the GPU was still drawing it (painted top to bottom). 0: as before */
-static int
-hm_sched_wait(void)
-{
-	static int on = -1;
-
-	if (on < 0) {
-		const char *e = getenv("HM_SCHED_WAIT");
-
-		on = e == NULL || e[0] != '0';
-	}
-	return on;
-}
 static double hm_tr_last_done, hm_tr_last_enc, hm_tr_last_gpu;
 /* (redfin hmv8) HM_SHADOW_FRESH: 1 (default) a read-only copy of a surface's rows made again once a command buffer whatever
  * its seed; 0 only when the seed moved (as before) */
@@ -1566,7 +1550,7 @@ EDITS = [
     ('\t/* committed: hakios_metal_cb_commit returned with it scheduled, so there is nothing left to wait for */\n}\n',
      '\t/* committed: hakios_metal_cb_commit returned with it scheduled, so there is nothing left to wait for -- (redfin hmv10)\n'
      '\t * unless it was held: then until it has been sent (HM_SCHED_WAIT) */\n'
-     '\tif (_committed && _sent != NULL && hm_sched_wait()) {\n'
+     '\tif (_committed && _sent != NULL) {   /* always since hm-int2 (was HM_SCHED_WAIT) */\n'
      '\t\t__sync_fetch_and_add(&hm_sched_waits, 1);\n'
      '\t\tdispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);\n'
      '\t\tdispatch_semaphore_signal(_sent);\n'

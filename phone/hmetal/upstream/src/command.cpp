@@ -209,11 +209,6 @@ namespace {
 std::mutex gSurfaceLock;
 std::map<std::pair<const Gpu*, uint32_t>, std::weak_ptr<Buffer>> gSurfaceBuffers;
 std::atomic<uint64_t> gSurfaceHandovers{0};
-// (redfin hmv6) HM_SURFACE_HANDOVER=1 (default): a dying surface Buffer whose handle a new Buffer took leaves it open (0: closes it, as before)
-bool surfaceHandoverOn() {
-    static const bool on = [] { const char* e = getenv("HM_SURFACE_HANDOVER"); return e == nullptr || e[0] != '0'; }();
-    return on;
-}
 }  // namespace
 
 void (*gSurfaceDeleterHook)() = nullptr;
@@ -244,8 +239,8 @@ std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo*
         auto it = gSurfaceBuffers.find(key);
         if (it != gSurfaceBuffers.end() && it->second.expired()) {
             gSurfaceBuffers.erase(it);
-        } else if (it != gSurfaceBuffers.end() && surfaceHandoverOn()) {
-            // (redfin hmv6) Between this Buffer's last reference going (often the waiter thread, a completed command
+        } else if (it != gSurfaceBuffers.end()) {
+            // (redfin hmv6, unconditional since hm-int2: was HM_SURFACE_HANDOVER) Between this Buffer's last reference going (often the waiter thread, a completed command
             // buffer letting go) and this lock, surfaceBuffer met the entry expired and made a NEW Buffer over the same
             // kernel handle (the transport answers the same handle while the BO is open). Closing it here closed the
             // new Buffer's handle: every later submission naming that surface was refused with ENOENT (hmt7: the
