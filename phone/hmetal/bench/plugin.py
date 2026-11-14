@@ -1257,10 +1257,29 @@ EDITS = [
      'if (!all && getenv("HAKIOS_METAL_ALL") == NULL && (name == NULL || strcmp(name, "backboardd") != 0)) {   /* (redfin hmbench) */'),
     ('\t\thm_print_fd = fd;\n\t\t(void)!write(fd, line, strlen(line));\n',
      '\t\thm_print_fd = fd;\n\t\t(void)!write(fd, line, strlen(line));\n'
-     '\t\t{   /* (redfin H3) a copy into $HAKIOS_METAL_LOG */\n'
+     '\t\t{   /* (redfin H3) a copy into $HAKIOS_METAL_LOG; (redfin hm-int2) past 16 MB it becomes NAME.1, a new one starts */\n'
      '\t\t\tstatic int log_fd = -2;\n'
-     '\t\t\tif (log_fd == -2) { const char *p = getenv("HAKIOS_METAL_LOG"); log_fd = p ? open(p, O_WRONLY | O_APPEND | O_CREAT, 0666) : -1; }\n'
-     '\t\t\tif (log_fd >= 0) (void)!write(log_fd, line, strlen(line));\n'
+     '\t\t\tstatic long long log_bytes;\n'
+     '\t\t\tstatic char *log_path;\n'
+     '\t\t\tstatic pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;\n'
+     '\t\t\tpthread_mutex_lock(&log_lock);\n'
+     '\t\t\tif (log_fd == -2) {\n'
+     '\t\t\t\tconst char *p = getenv("HAKIOS_METAL_LOG");\n'
+     '\t\t\t\tstruct stat ls;\n'
+     '\t\t\t\tlog_path = p ? strdup(p) : NULL;\n'
+     '\t\t\t\tlog_fd = log_path ? open(log_path, O_WRONLY | O_APPEND | O_CREAT, 0666) : -1;\n'
+     '\t\t\t\tlog_bytes = log_fd >= 0 && fstat(log_fd, &ls) == 0 ? (long long)ls.st_size : 0;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (log_fd >= 0 && log_bytes > 16LL * 1024 * 1024) {\n'
+     '\t\t\t\tchar old[1100];\n'
+     '\t\t\t\tsnprintf(old, sizeof(old), "%s.1", log_path);\n'
+     '\t\t\t\trename(log_path, old);\n'
+     '\t\t\t\tclose(log_fd);\n'
+     '\t\t\t\tlog_fd = open(log_path, O_WRONLY | O_APPEND | O_CREAT, 0666);\n'
+     '\t\t\t\tlog_bytes = 0;\n'
+     '\t\t\t}\n'
+     '\t\t\tif (log_fd >= 0) { (void)!write(log_fd, line, strlen(line)); log_bytes += (long long)strlen(line); }\n'
+     '\t\t\tpthread_mutex_unlock(&log_lock);\n'
      '\t\t}\n'),
     # (hmvar) the pick's helpers, just before hm_bitcode_for
     ('/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE',
@@ -1721,6 +1740,24 @@ EDITS = [
      '\t\t\t\t}\n'
      '\t\t\t\tmemcpy(xwas, xr, sizeof(xwas));\n\t\t\t\tcwas = copies, fwas = forced;\n'),
 ]
+
+
+# (hm-int2) luma boost: the dispatcher's knob (m2shim.m, /var/local/hmetal/luma-boost; its address in HM_LUMA_KNOB) draws it
+# too, read at every luma_boost draw (CoreAnimation records none while the knob is off: CASetDebugOption(91))
+EDITS.append(('\t\tHM_ONCE("luma_boost: %s (metal_luma_boost=1 draws it)\\n", keep ? "drawn" : "left out, the picture as it is");\n\t}\n\treturn !keep;\n',
+              '\t\tHM_ONCE("luma_boost: %s (metal_luma_boost=1 or the luma-boost knob draws it)\\n", keep ? "drawn" : "left out, the picture as it is");\n\t}\n'
+              '\t{   /* (redfin hm-int2) the dispatcher\'s knob, its value now */\n'
+              '\t\tstatic volatile int *knob = (volatile int *)-1;\n\n'
+              '\t\tif (knob == (volatile int *)-1) {\n'
+              '\t\t\tconst char *a = getenv("HM_LUMA_KNOB");\n\n'
+              '\t\t\tknob = a != NULL ? (volatile int *)(uintptr_t)strtoull(a, NULL, 16) : NULL;\n'
+              '\t\t}\n'
+              '\t\tif (knob != NULL && *knob) {\n'
+              '\t\t\tHM_ONCE("luma_boost: drawn (the luma-boost knob is on)\\n");\n'
+              '\t\t\treturn NO;\n'
+              '\t\t}\n'
+              '\t}\n'
+              '\treturn !keep;\n'))
 
 
 def apply(src, edits=EDITS):
