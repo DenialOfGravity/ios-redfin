@@ -1,0 +1,1716 @@
+redfin 1090: experiment E1 "AP loopback" over the AFE RT proxy ports (coder V, 2026-11-14). research/cc/BBA-design-study.md B1-B3.
+- kern.sweet_voice_proxy 0 (default: today's direct path, nothing new runs) / 1: at the next call start the AFE RT proxy
+  ports 0x2000 (RX, downlink read by the AP) / 0x2001 (TX, uplink written by the AP) come up (register RT driver,
+  map 32 KB, RT_PROXY_CONFIG 16 kHz mono 16 bit 10 ms, start), the session starts as today, then the CVP is switched
+  (MVM PAUSE, CVP SET_DEVICE_V3, media info, commit, START). The kernel loops the PCM: downlink -> sweet_sound.c's
+  playback stream in "call mode" (3 x 10 ms periods instead of 8 x 20 ms) -> 0x9040 + the call's amplifier; mic ring
+  (0x9001, 48 kHz) averaged to 16 kHz -> 0x2001. Any failure falls back to 0x9001/0x9040 in the same start.
+- kern.sweet_voice_proxy_opts: 1 CVP created on the proxy ports (no switch), 2 8 kHz, 4 host-PCM probe (status only).
+- kern.sweet_voice_proxy_stats (RO): frames/s, gaps, ring fills, under/overruns, slips; DTMF latency line.
+- sweet_adsp.c: redwood_adsp_apr_events_proxy() (AFE handler asked first; NULL unless a proxy call runs).
+- New file bsd/dev/sweet_vproxy.c (the AP side), sweet_mic.c redwood_mic_voice_peek(), sweet_sound.c call mode.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 3226c99..f3c234c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -136,6 +136,7 @@ bsd/dev/sweet_btbridge.c		standard
+ bsd/dev/sweet_abp.c			standard
+ bsd/dev/sweet_pdp.c			standard
+ bsd/dev/sweet_voice.c			standard
++bsd/dev/sweet_vproxy.c			standard
+ bsd/dev/sweet_bb.c			standard
+ bsd/dev/sweet_qmux.c			standard
+ bsd/dev/sweet_ssr.c			standard
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 4a46667..edd94aa 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -2860,6 +2860,7 @@ static uint32_t apr_waited_for;         /* the token a question waits for the an
+ static redwood_apr_events_t apr_events; /* the sound's (redwood_sound.c): what nobody waits for */
+ static redwood_apr_events_t apr_events_second;  /* the microphones' (redwood_mic.c) */
+ static redwood_apr_events_t apr_events_voice;   /* 1066: the voice services' (sweet_voice.c), MVM/CVS/CVP only */
++static redwood_apr_events_t apr_events_proxy;   /* 1090: the voice proxy's (sweet_vproxy.c), AFE only; NULL unless a call runs on it */
+ static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
+ 
+ /* A packet from the DSP's audio services. From the link's thread. */
+@@ -2887,6 +2888,12 @@ apr_input(const uint8_t *data, uint32_t length)
+ 
+ 		bzero(words, sizeof(words));
+ 		memcpy(words, data + header_length, payload < sizeof(words) ? payload : sizeof(words));
++		redwood_apr_events_t proxy = apr_events_proxy;
++
++		if (proxy != NULL && header.from_service == 4 && proxy(header.from_service, header.from_port, header.opcode,
++		    header.token, words, payload < sizeof(words) ? payload : sizeof(words))) {
++			return;         /* 1090 */
++		}
+ 		if (apr_events_voice != NULL && header.from_service >= 9 && header.from_service <= 11 &&
+ 		    apr_events_voice(header.from_service, header.from_port, header.opcode, header.token, words,
+ 		    payload < sizeof(words) ? payload : sizeof(words))) {
+@@ -3044,6 +3051,17 @@ redwood_adsp_apr_events_voice(redwood_apr_events_t handler)
+ 	apr_events_voice = handler;
+ }
+ 
++/*
++ * 1090: the voice proxy's handler (sweet_vproxy.c), asked first for what the AFE sends that nobody waits for: its
++ * RT proxy data acks (tokens of its own, never a waiter's) and AFE_EVENT_RT_PROXY_PORT_STATUS. Set only while a call
++ * runs on the proxy ports (kern.sweet_voice_proxy), NULL otherwise: then nothing changes for the other handlers.
++ */
++void
++redwood_adsp_apr_events_proxy(redwood_apr_events_t handler)
++{
++	apr_events_proxy = handler;
++}
++
+ /* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
+ static bool
+ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
+diff --git a/bsd/dev/sweet_mic.c b/bsd/dev/sweet_mic.c
+index b9e2626..b3c38a9 100644
+--- a/bsd/dev/sweet_mic.c
++++ b/bsd/dev/sweet_mic.c
+@@ -967,6 +967,26 @@ ring_put(const int16_t *samples, uint32_t count)
+ 	__atomic_store_n(&ring_written, at + count, __ATOMIC_RELEASE);
+ }
+ 
++/*
++ * 1090: the voice proxy (sweet_vproxy.c) reads the ring with a cursor of its own, never waiting and never moving
++ * /dev/redwood-mic's: count samples from `from' if they are all there and not yet overwritten (false otherwise);
++ * *written = the ring's write position either way.
++ */
++bool
++redwood_mic_voice_peek(uint64_t from, int16_t *out, uint32_t count, uint64_t *written)
++{
++	uint64_t w = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
++
++	*written = w;
++	if (from + count > w || w - from > RING_FRAMES - 2 * MIC_PERIOD_FRAMES) {
++		return false;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		out[i] = ring[(from + i) % RING_FRAMES];
++	}
++	return true;
++}
++
+ static int
+ mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index 3728447..318c915 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -658,6 +658,17 @@ redwood_audio_dsp_memory_put(void)
+ 	space_put(1);
+ }
+ 
++/* 1090: the voice proxy (sweet_vproxy.c) holds the DSP's view of memory (the SMMU stream) for its own buffer: user 2 */
++bool
++redwood_sound_dsp_space(bool on)
++{
++	if (!on) {
++		space_put(2);
++		return true;
++	}
++	return space_get(2);
++}
++
+ /* ---- ADM and ASM: the path and the stream ------------------------------------------------------------------- */
+ 
+ #define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
+@@ -862,19 +873,71 @@ static volatile bool stopping, feeder_runs;
+ static uint64_t sent_periods, failed_sends, tone_periods, silent_periods;
+ static uint32_t guard_periods;
+ 
++/*
++ * 1090: the call mode (redwood_sound_call_mode(), from sweet_vproxy.c while a call runs on the AFE proxy ports with
++ * kern.sweet_voice_proxy 1): periods of 10 ms, at most CALL_QUEUED at the DSP (30 ms instead of 8 x 20 ms = 160 ms),
++ * filled from the call ring (the downlink, 48 kHz stereo) with what iOS plays mixed in. Off: 8 x 20 ms again (the
++ * periods held back are queued again). Nothing of it runs while call_mode is false.
++ */
++#define CALL_PERIOD_FRAMES      480             /* 10 ms */
++#define CALL_QUEUED             3
++#define CALL_RING_FRAMES        8192            /* 170 ms; a power of two, the indices run on */
++static volatile bool call_mode;
++static bool call_primed;
++static int16_t call_ring[CALL_RING_FRAMES * 2];
++static volatile uint32_t call_head, call_tail;  /* frames: written by the proxy, taken by the feeder */
++static volatile uint32_t call_underruns, call_overruns, call_periods, queued_frames;
++static uint32_t period_frames_of[PERIODS], guard_half;
++
++static int16_t
++mix16(int16_t a, int16_t b)
++{
++	int32_t v = (int32_t)a + b;
++
++	return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
++}
++
+ static void
+-period_fill(unsigned period)
++period_fill(unsigned period, uint32_t frames)
+ {
+ 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
+ 	bool toning = now_us() < tone_until_us;
+-	uint32_t n = 0;
++	uint32_t n = 0, c = 0;
++
++	if (call_mode) {
++		/* 1090: the call's downlink first */
++		uint32_t tail = call_tail, available = call_head - tail;
+ 
++		if (!call_primed && available >= frames) {
++			call_primed = true;
++		}
++		if (call_primed) {
++			c = available < frames ? available : frames;
++			if (c < frames) {
++				call_underruns++;
++				call_primed = false;
++			}
++			OSMemoryBarrier();
++			for (uint32_t i = 0; i < c; i++) {
++				samples[2 * i] = call_ring[2 * ((tail + i) % CALL_RING_FRAMES)];
++				samples[2 * i + 1] = call_ring[2 * ((tail + i) % CALL_RING_FRAMES) + 1];
++			}
++			OSMemoryBarrier();
++			call_tail = tail + c;
++		}
++		call_periods++;
++	}
+ 	if (!toning && level >= 4) {
+ 		uint32_t tail = ring_tail, available = ring_head - tail;
+ 
+-		n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
++		n = available < frames ? available : frames;
+ 		OSMemoryBarrier();
+ 		for (uint32_t i = 0; i < n; i++) {
++			if (i < c) {
++				samples[2 * i] = mix16(samples[2 * i], ring[2 * ((tail + i) % RING_FRAMES)]);
++				samples[2 * i + 1] = mix16(samples[2 * i + 1], ring[2 * ((tail + i) % RING_FRAMES) + 1]);
++				continue;
++			}
+ 			samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
+ 			samples[2 * i + 1] = ring[2 * ((tail + i) % RING_FRAMES) + 1];
+ 		}
+@@ -882,7 +945,7 @@ period_fill(unsigned period)
+ 		ring_tail = tail + n;
+ 		fed_frames += n;
+ 	}
+-	for (unsigned frame = n; frame < PERIOD_FRAMES; frame++) {
++	for (unsigned frame = n > c ? n : c; frame < frames; frame++) {
+ 		int16_t sample = toning ? tone[tone_at++ % 48] : 0;
+ 
+ 		samples[2 * frame] = sample;
+@@ -895,17 +958,19 @@ period_fill(unsigned period)
+ 	}
+ 	if (level >= 3) {
+ 		/* every period, silence too: its filter and its averages go on (sweet_guard.c) */
+-		redwood_guard_process(samples, PERIOD_FRAMES);
+-		guard_periods++;
++		redwood_guard_process(samples, frames);
++		if (frames == PERIOD_FRAMES || (++guard_half & 1) == 0) {
++			guard_periods++;        /* (1090: counted in 20 ms) */
++		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");       /* (write-combining: out to memory before the DSP is told) */
+ }
+ 
+ static bool
+-period_write(unsigned period)
++period_write(unsigned period, uint32_t frames)
+ {
+ 	uint64_t address = (buffer_pa + 4096 * period) | AUDIO_SID_BITS;
+-	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), map_handle, PERIOD_BYTES, period, 0, 0, 0 };
++	uint32_t write[8] = { (uint32_t)address, (uint32_t)(address >> 32), map_handle, frames * 4, period, 0, 0, 0 };
+ 
+ 	return redwood_adsp_apr(APR_SVC_ASM, STREAM_PORT, WRITE_TOKEN | period, ASM_DATA_CMD_WRITE_V2, write, sizeof(write), 0, NULL);
+ }
+@@ -916,12 +981,15 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
+ 	uint32_t done_before = written_done;
+ 	uint64_t began = now_us(), last_report = began;
+ 	bool said_none = false;
++	uint32_t inflight = 0, idle = 0;        /* 1090: periods at the DSP / given back and held (call mode) */
+ 
+ 	returned = 0;
+ 	for (unsigned p = 0; p < PERIODS; p++) {
+-		period_fill(p);
+-		if (period_write(p)) {
++		period_fill(p, PERIOD_FRAMES);
++		if (period_write(p, PERIOD_FRAMES)) {
+ 			sent_periods++;
++			inflight |= 1u << p;
++			period_frames_of[p] = PERIOD_FRAMES;
+ 		} else {
+ 			failed_sends++;
+ 		}
+@@ -930,20 +998,32 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
+ 	while (!stopping) {
+ 		uint32_t back = returned;
+ 		uint64_t now = now_us();
++		bool cm = call_mode;
++		uint32_t frames = cm ? CALL_PERIOD_FRAMES : PERIOD_FRAMES, most = cm ? CALL_QUEUED : PERIODS, q = 0;
+ 
+ 		if (back != 0) {
+ 			OSBitAndAtomic(~back, &returned);
+-			for (unsigned p = 0; p < PERIODS; p++) {
+-				if (back & (1u << p)) {
+-					period_fill(p);
+-					if (period_write(p)) {
+-						sent_periods++;
+-					} else {
+-						failed_sends++;
+-					}
+-				}
++			inflight &= ~back;
++			idle |= back;
++		}
++		/* (without the call mode every period given back is filled and written again at once, lowest first, as before) */
++		while (idle != 0 && (uint32_t)__builtin_popcount(inflight) < most) {
++			unsigned p = (unsigned)__builtin_ctz(idle);
++
++			idle &= ~(1u << p);
++			period_fill(p, frames);
++			if (period_write(p, frames)) {
++				sent_periods++;
++				inflight |= 1u << p;
++				period_frames_of[p] = frames;
++			} else {
++				failed_sends++;
+ 			}
+ 		}
++		for (unsigned p = 0; p < PERIODS; p++) {
++			q += (inflight & (1u << p)) ? period_frames_of[p] : 0;
++		}
++		queued_frames = q;
+ 		if (!said_none && written_done == done_before && now - began > 1000000) {
+ 			SAY("feeder: THE DSP HAS GIVEN NO PERIOD BACK IN A SECOND\n");
+ 			smmu_faults("(no WRITE_DONE)");
+@@ -956,7 +1036,7 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
+ 		}
+ 		if (returned == 0 && !stopping) {
+ 			/* (a WRITE_DONE between the test and the wait is picked up at the 40 ms timeout: 160 ms are queued) */
+-			assert_wait_timeout((event_t)&feeder_wake, THREAD_UNINT, 40, NSEC_PER_MSEC);
++			assert_wait_timeout((event_t)&feeder_wake, THREAD_UNINT, cm ? 5 : 40, NSEC_PER_MSEC);   /* 1090: 30 ms queued in a call */
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		}
+ 	}
+@@ -967,6 +1047,80 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
+ 	thread_terminate(current_thread());
+ }
+ 
++/* ---- 1090: the call mode's interface (sweet_vproxy.c) ---- */
++
++bool redwood_sound_call_mode_on(bool on);
++void
++redwood_sound_call_mode(bool on)
++{
++	(void)redwood_sound_call_mode_on(on);
++}
++
++/* true: the stream runs (sound >= 2), so what is put in the call ring is played */
++bool
++redwood_sound_call_mode_on(bool on)
++{
++	if (on && !call_mode) {
++		call_tail = call_head;
++		call_primed = false;
++		call_underruns = call_overruns = call_periods = 0;
++		OSMemoryBarrier();
++		call_mode = true;
++		SAY("call mode ON: periods of 10 ms, at most %u at the DSP (was %u x 20 ms; the 20 ms ones drain first)%s\n",
++		    CALL_QUEUED, PERIODS, feeder_runs ? "" : " -- NO STREAM RUNS (sound < 2): the call ring is not played");
++	} else if (!on && call_mode) {
++		call_mode = false;
++		SAY("call mode off: %u periods of 10 ms, %u underruns, %u overruns; back to %u x 20 ms\n", call_periods,
++		    call_underruns, call_overruns, PERIODS);
++	}
++	thread_wakeup(&feeder_wake);
++	return feeder_runs;
++}
++
++/* From the proxy's thread: never waits. 48 kHz stereo frames; what does not fit is dropped (counted). */
++uint32_t
++redwood_sound_call_put(const int16_t *stereo, uint32_t frames)
++{
++	uint32_t head = call_head, room = CALL_RING_FRAMES - (head - call_tail), taken = frames < room ? frames : room;
++
++	if (!call_mode) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < taken; i++) {
++		call_ring[2 * ((head + i) % CALL_RING_FRAMES)] = stereo[2 * i];
++		call_ring[2 * ((head + i) % CALL_RING_FRAMES) + 1] = stereo[2 * i + 1];
++	}
++	OSMemoryBarrier();
++	call_head = head + taken;
++	if (taken < frames) {
++		call_overruns++;
++	}
++	return taken;
++}
++
++void
++redwood_sound_call_state(uint32_t *ring_frames, uint32_t *queued, uint32_t *underruns, uint32_t *periods)
++{
++	*ring_frames = call_head - call_tail;
++	*queued = queued_frames;
++	*underruns = call_underruns;
++	*periods = call_periods;
++}
++
++/* Q15: the feeder's sndgain (sound=4: iOS keeps its peaks that far under full scale) undone for the call's PCM, 1 dB steps */
++uint32_t
++redwood_sound_call_gain_q15(void)
++{
++	static const uint32_t db_q15[8] = { 32768, 29205, 26029, 23198, 20675, 18427, 16423, 14637 }; /* 0..-7 dB */
++	uint32_t g = level >= 4 ? guard_gain : 0, whole = (g + 4) / 8, v = 32768;
++
++	while (whole >= 6) {
++		v /= 2;         /* (6 dB ~ a half) */
++		whole -= 6;
++	}
++	return v * db_q15[whole] / 32768;
++}
++
+ /* The tone for ms (into whatever plays). */
+ static void
+ tone_for(uint32_t ms)
+diff --git a/bsd/dev/sweet_voice.c b/bsd/dev/sweet_voice.c
+index e61365d..0cdea79 100644
+--- a/bsd/dev/sweet_voice.c
++++ b/bsd/dev/sweet_voice.c
+@@ -46,6 +46,18 @@
+  *     / _spk (louder = positive); sweet_sound.c's hard cap (6 dB under Android's level) still applies.
+  *   kern.sweet_voice_gain_tx (dB, default 0, -12..+24): the mic's ADC gain during a call relative to the boot-arg
+  *     micgain (0.75 dB steps, sweet_mic.c redwood_mic_voice_gain()); back to micgain when the call lets the mic go.
++ *
++ * 1090 (experiment E1 of research/cc/BBA-design-study.md; the AP side in bsd/dev/sweet_vproxy.c):
++ *   kern.sweet_voice_proxy 0 (default: today's direct path, nothing below runs) / 1 proxy loopback: read when a call's
++ *     voice session starts (by hand or kern.sweet_voice_auto); a change applies to the next call. With 1 the AFE RT
++ *     proxy ports come up first (sweet_vproxy_prepare()), the session starts as today on 0x9001/0x9040, then the CVP
++ *     is switched (q6voice.c voc_disable_device()/voc_enable_device(): MVM PAUSE_VOICE, CVP SET_DEVICE_V3 tx 0x2001 rx
++ *     0x2000, endpoint media info 1 ch x 16 bit at the proxy's rate, topology commit, MVM START_VOICE) and the AP's
++ *     data path starts. Any failure: back to 0x9001/0x9040 in the same start (switched back, or the session made again
++ *     on them), the reason logged ("SWEET VOICE PROXY: FALLBACK ...").
++ *   kern.sweet_voice_proxy_opts (bits, 0 default): 1 the CVP created on the proxy ports from the start (no switch);
++ *     2 8 kHz instead of 16 kHz; 4 host-PCM probe: one VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory) to the
++ *     CVP after START_VOICE, its status logged only (stopped again if it was taken).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/clock.h>
+@@ -161,6 +173,27 @@ static int gain_rx_db, gain_tx_db;              /* 1086 */
+ #define ROUTE_IOS_FRESH_MS      15000
+ static volatile uint32_t ev_all, ev_ready, ev_not_ready, ev_activity, ev_dtmf, ev_other;
+ 
++/* 1090: the voice proxy (bsd/dev/sweet_vproxy.c) */
++extern bool sweet_vproxy_prepare(int mode, uint32_t opts);
++extern bool sweet_vproxy_run(void);
++extern void sweet_vproxy_stop(const char *why);
++extern void sweet_vproxy_dtmf(uint32_t low, uint32_t high);
++extern uint32_t sweet_vproxy_rate(void);
++#define PROXY_RX_PORT           0x2000          /* RT_PROXY_PORT_001_RX: the downlink, read by the AP */
++#define PROXY_TX_PORT           0x2001          /* RT_PROXY_PORT_001_TX: the uplink, written by the AP */
++#define POPT_CREATE             1u
++#define POPT_8K                 2u
++#define POPT_HOSTPCM            4u
++#define VSS_IMVM_CMD_PAUSE_VOICE                        0x0001137du
++#define VSS_IVOCPROC_CMD_SET_DEVICE_V3                  0x0001316au
++#define VSS_IVPCM_CMD_START_V2                          0x00011339u
++#define VSS_IVPCM_CMD_STOP                              0x0001100bu
++#define VSS_IVPCM_TAP_POINT_TX_DEFAULT                  0x00011289u
++static int voice_proxy;                         /* kern.sweet_voice_proxy */
++static uint32_t proxy_opts;                     /* kern.sweet_voice_proxy_opts */
++static bool proxy_up;                           /* this call runs on the proxy ports (the AFE side is up) */
++static bool proxy_refused;                      /* this start: the proxy failed once, the session is made again directly */
++
+ /* 1066: what MVM/CVS/CVP send unasked (sweet_adsp.c's link thread). Answers to our own commands are not seen here. */
+ static bool
+ voice_event(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
+@@ -182,6 +215,9 @@ voice_event(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, con
+ 		say = true;
+ 		SAY("event %u: %s port %u: RX DTMF %u/%u Hz (the downlink reaches the DSP)\n", n, svc, port,
+ 		    payload[0] & 0xffff, payload[0] >> 16);
++		if (proxy_up) {
++			sweet_vproxy_dtmf(payload[0] & 0xffff, payload[0] >> 16);      /* 1090: the latency line */
++		}
+ 	} else if (opcode == VSS_ICOMMON_EVT_VOICE_ACTIVITY_UPDATE) {
+ 		ev_activity++;
+ 		if (say) {
+@@ -334,6 +370,133 @@ below_for(int state)
+ }
+ 
+ /* the sessions taken down, the ports and amplifiers let go: whatever of it is there */
++/*
++ * The CVP's endpoint media formats. 1090: proxy = the RT proxy ports (1 ch x 16 bit at `rate' both ways); otherwise
++ * today's 0x9040/0x9001 formats, with today's log lines.
++ */
++static void
++media_formats(bool proxy, uint32_t rate)
++{
++	bool rx_mono = (voice_opts & OPT_RX_MONO16) != 0;
++	struct {
++		uint32_t port;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[32];
++	} __attribute__((packed)) rx, tx;
++
++	bzero(&rx, sizeof(rx));
++	bzero(&tx, sizeof(tx));
++	if (proxy) {
++		char what[80];
++
++		rx.port = PROXY_RX_PORT;
++		rx.channels = 1;
++		rx.bits = 16;
++		rx.rate = rate;
++		rx.map[0] = PCM_CHANNEL_FC;
++		tx = rx;
++		tx.port = PROXY_TX_PORT;
++		snprintf(what, sizeof(what), "CVP: RX endpoint 0x2000, 1 ch x 16 bits, %u Hz", rate);
++		(void)cvp_param(what, VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
++		snprintf(what, sizeof(what), "CVP: TX endpoint 0x2001, 1 ch x 16 bits, %u Hz", rate);
++		(void)cvp_param(what, VSS_MODULE_CVD_GENERIC, VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
++		return;
++	}
++	rx.port = RX_PORT;
++	rx.channels = rx_mono ? 1 : 2;
++	rx.bits = rx_mono ? 16 : 32;
++	rx.rate = RATE;
++	rx.map[0] = rx_mono ? PCM_CHANNEL_FC : PCM_CHANNEL_FL;
++	rx.map[1] = rx_mono ? 0 : PCM_CHANNEL_FR;
++	tx.port = TX_PORT;
++	tx.channels = 1;
++	tx.bits = 16;
++	tx.rate = RATE;
++	tx.map[0] = PCM_CHANNEL_FC;
++	(void)cvp_param(rx_mono ? "CVP: RX endpoint 0x9040, 1 ch x 16 bits, 48 kHz" : "CVP: RX endpoint 0x9040, 2 ch x 32 bits, 48 kHz",
++	    VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
++	(void)cvp_param("CVP: TX endpoint 0x9001, 1 ch x 16 bits, 48 kHz", VSS_MODULE_CVD_GENERIC,
++	    VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
++}
++
++/*
++ * 1090: the running call's CVP moved to the proxy ports (to_proxy) or back to 0x9001/0x9040 (q6voice.c
++ * voc_disable_device() + voc_enable_device(): pause, set device V3, media info, commit, start).
++ */
++static bool
++cvp_switch(bool to_proxy, uint32_t rate)
++{
++	struct {
++		uint16_t tx_port;
++		uint32_t tx_topology;
++		uint16_t rx_port;
++		uint32_t rx_topology, mode;
++		uint16_t ec_ref_port;
++	} __attribute__((packed)) dev;
++	uint16_t tx = to_proxy ? PROXY_TX_PORT : TX_PORT, rx = to_proxy ? PROXY_RX_PORT : RX_PORT;
++	char what[80];
++
++	if (!vcmd("MVM: pause voice", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_PAUSE_VOICE, NULL, 0, 0, NULL)) {
++		printf("SWEET VOICE PROXY: MVM pause: FAILED\n");
++		return false;
++	}
++	bzero(&dev, sizeof(dev));
++	dev.tx_port = tx;
++	dev.rx_port = rx;
++	dev.tx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2 : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
++	dev.rx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
++	dev.mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
++	dev.ec_ref_port = VSS_IVOCPROC_PORT_ID_NONE;
++	snprintf(what, sizeof(what), "CVP: set device V3 tx %#x rx %#x", tx, rx);
++	if (!vcmd(what, APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_SET_DEVICE_V3, &dev, sizeof(dev), 0, NULL)) {
++		printf("SWEET VOICE PROXY: MVM pause: ok; CVP set device V3 tx %#x rx %#x: FAILED\n", tx, rx);
++		return false;
++	}
++	if (!(voice_opts & OPT_NO_MEDIA_FMT)) {
++		media_formats(to_proxy, rate);
++	}
++	(void)vcmd("CVP: topology commit", APR_SVC_CVP, cvp_handle, VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT, NULL, 0, 0, NULL);
++	if (!vcmd("MVM: START_VOICE", APR_SVC_MVM, mvm_handle, VSS_IMVM_CMD_START_VOICE, NULL, 0, 0, NULL)) {
++		printf("SWEET VOICE PROXY: MVM pause: ok; CVP set device V3 tx %#x rx %#x: ok; media info: sent; commit: sent; MVM start: "
++		    "FAILED\n", tx, rx);
++		return false;
++	}
++	printf("SWEET VOICE PROXY: MVM pause: ok; CVP set device V3 tx %#x rx %#x: ok; media info: %s; commit: ok; MVM start: ok\n",
++	    tx, rx, (voice_opts & OPT_NO_MEDIA_FMT) ? "not sent (opts 4)" : "sent");
++	return true;
++}
++
++/* 1090, opts 4: is host PCM there? One VSS_IVPCM_CMD_START_V2 (TX tap, read only, no memory): only its status logged. */
++static void
++hostpcm_probe(uint32_t rate)
++{
++	struct {
++		uint32_t mem_handle, taps;
++		uint32_t tap_point;
++		uint16_t direction, rate, duration;
++	} __attribute__((packed)) start = { 0, 1, VSS_IVPCM_TAP_POINT_TX_DEFAULT, 0, (uint16_t)rate, 0 };
++	struct redwood_apr_answer answer;
++
++	bzero(&answer, sizeof(answer));
++	if (!redwood_adsp_apr_ports(APR_SVC_CVP, VOICE_INDEX, cvp_handle, 0, VSS_IVPCM_CMD_START_V2, &start, sizeof(start),
++	    APR_WAIT_MS, &answer)) {
++		printf("SWEET VOICE PROXY: host PCM probe: VSS_IVPCM_CMD_START_V2 -> NO ANSWER\n");
++		return;
++	}
++	if (answer.opcode == APR_BASIC_RSP_RESULT && answer.words[0] == VSS_IVPCM_CMD_START_V2) {
++		printf("SWEET VOICE PROXY: host PCM probe: VSS_IVPCM_CMD_START_V2 -> %s (%u)%s\n", dsp_error(answer.words[1]),
++		    answer.words[1], answer.words[1] == 0 ? ": TAKEN (host PCM exists); stopped again" :
++		    answer.words[1] == 3 || answer.words[1] == 17 ? ": not supported here" : "");
++		if (answer.words[1] == 0) {
++			(void)vcmd("CVP: host PCM stopped (probe)", APR_SVC_CVP, cvp_handle, VSS_IVPCM_CMD_STOP, NULL, 0, 0, NULL);
++		}
++		return;
++	}
++	printf("SWEET VOICE PROXY: host PCM probe: VSS_IVPCM_CMD_START_V2 -> answer opcode %#x, %u bytes: %#x %#x\n", answer.opcode,
++	    answer.length, answer.words[0], answer.words[1]);
++}
++
+ static void
+ voice_down(const char *why)
+ {
+@@ -378,6 +541,10 @@ voice_down(const char *why)
+ 		mvm_handle = 0;
+ 	}
+ 	dual_done = false;
++	if (proxy_up) {
++		sweet_vproxy_stop(why);         /* 1090: after the CVP is gone: the data thread, the call mode, the AFE ports */
++		proxy_up = false;
++	}
+ 	if (port_held) {
+ 		(void)redwood_sound_voice(0, 0);
+ 		port_held = false;
+@@ -397,7 +564,7 @@ voice_up(int target)
+ {
+ 	struct redwood_apr_answer answer;
+ 	char name[SESSION_NAME_LEN];
+-	bool old_cvd, rx_mono = (voice_opts & OPT_RX_MONO16) != 0;
++	bool old_cvd, proxy_tried = false;
+ 	uint16_t handle;
+ 	const char *step = "?";
+ 
+@@ -424,6 +591,15 @@ voice_up(int target)
+ 		SAY("speaker port 0x9040 runs; amplifier %s held for the call\n", target == 2 ? "0x41 (speaker)" : "0x40 (earpiece)");
+ 	}
+ 
++	/* 1090: the AFE proxy ports first (the CVP is created on them, or switched to them after START_VOICE) */
++	proxy_up = false;
++	if (voice_proxy != 0 && !proxy_refused) {
++		printf("SWEET VOICE PROXY: call start with kern.sweet_voice_proxy %d, opts %#x: %s\n", voice_proxy, proxy_opts,
++		    (proxy_opts & POPT_CREATE) ? "CVP created on the proxy ports" : "CVP switched to the proxy ports after START_VOICE");
++		proxy_up = sweet_vproxy_prepare(voice_proxy, proxy_opts);
++		proxy_tried = proxy_up;
++	}
++
+ 	/* 3 the voice sessions (q6voice.c voc_start_voice_call) */
+ 	cvd_version();
+ 	old_cvd = (voice_opts & OPT_OLD_CVD) != 0 || !cvd_at_least(2, 2);
+@@ -492,13 +668,17 @@ voice_up(int target)
+ 		create.direction = 2;
+ 		create.tx_port = TX_PORT;
+ 		create.rx_port = RX_PORT;
++		if (proxy_up && (proxy_opts & POPT_CREATE)) {
++			create.tx_port = PROXY_TX_PORT;         /* 1090 */
++			create.rx_port = PROXY_RX_PORT;
++		}
+ 		create.tx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2 : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+ 		create.rx_topology = (voice_opts & OPT_CAL_TOPOLOGIES) ? VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT : VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+ 		create.profile = VSS_ICOMMON_CAL_NETWORK_ID_NONE;
+ 		create.mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
+ 		create.ec_ref_port = VSS_IVOCPROC_PORT_ID_NONE;
+-		snprintf(what, sizeof(what), "CVP: full control %s, tx %#x rx %#x, topologies %#x/%#x", old_cvd ? "V2" : "V3", TX_PORT,
+-		    RX_PORT, create.tx_topology, create.rx_topology);
++		snprintf(what, sizeof(what), "CVP: full control %s, tx %#x rx %#x, topologies %#x/%#x", old_cvd ? "V2" : "V3", create.tx_port,
++		    create.rx_port, create.tx_topology, create.rx_topology);
+ 		if (!vcmd(what, APR_SVC_CVP, 0, old_cvd ? VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2 :
+ 		    VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3, &create, sizeof(create), 0, &answer)) {
+ 			goto fail;
+@@ -514,31 +694,8 @@ voice_up(int target)
+ 		    sizeof(channels), 0, NULL);
+ 	}
+ 	if (!(voice_opts & OPT_NO_MEDIA_FMT) && !old_cvd && cvd_at_least(2, 3)) {
+-		struct {
+-			uint32_t port;
+-			uint16_t channels, bits;
+-			uint32_t rate;
+-			uint8_t map[32];
+-		} __attribute__((packed)) rx, tx;
+-
+ 		step = "media formats";
+-		bzero(&rx, sizeof(rx));
+-		bzero(&tx, sizeof(tx));
+-		rx.port = RX_PORT;
+-		rx.channels = rx_mono ? 1 : 2;
+-		rx.bits = rx_mono ? 16 : 32;
+-		rx.rate = RATE;
+-		rx.map[0] = rx_mono ? PCM_CHANNEL_FC : PCM_CHANNEL_FL;
+-		rx.map[1] = rx_mono ? 0 : PCM_CHANNEL_FR;
+-		tx.port = TX_PORT;
+-		tx.channels = 1;
+-		tx.bits = 16;
+-		tx.rate = RATE;
+-		tx.map[0] = PCM_CHANNEL_FC;
+-		(void)cvp_param(rx_mono ? "CVP: RX endpoint 0x9040, 1 ch x 16 bits, 48 kHz" : "CVP: RX endpoint 0x9040, 2 ch x 32 bits, 48 kHz",
+-		    VSS_MODULE_CVD_GENERIC, VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO, &rx, sizeof(rx));
+-		(void)cvp_param("CVP: TX endpoint 0x9001, 1 ch x 16 bits, 48 kHz", VSS_MODULE_CVD_GENERIC,
+-		    VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO, &tx, sizeof(tx));
++		media_formats(proxy_up && (proxy_opts & POPT_CREATE), sweet_vproxy_rate());
+ 	}
+ 	if (!old_cvd) {
+ 		step = "topology commit";
+@@ -608,11 +765,65 @@ voice_up(int target)
+ 	voice_state = target;
+ 	SAY("START_VOICE ok: CALL AUDIO UP on the %s (MVM %u, CVS %u, CVP %u)\n", target == 2 ? "speaker" : "earpiece", mvm_handle,
+ 	    cvs_handle, cvp_handle);
++	if (proxy_up) {
++		/* 1090: onto the proxy ports (unless created there), then the AP's data path */
++		bool on_proxy = (proxy_opts & POPT_CREATE) != 0;
++
++		if (!on_proxy) {
++			on_proxy = cvp_switch(true, sweet_vproxy_rate());
++			if (!on_proxy) {
++				printf("SWEET VOICE PROXY: FALLBACK: the CVP switch failed: back to 0x9001/0x9040\n");
++				if (!cvp_switch(false, RATE)) {
++					printf("SWEET VOICE PROXY: FALLBACK: the switch back failed too: the session is made again directly\n");
++					sweet_vproxy_stop("switch back failed");
++					proxy_up = false;
++					step = "proxy switch back";
++					goto fail;
++				}
++			}
++		}
++		if (on_proxy && !sweet_vproxy_run()) {
++			on_proxy = false;
++			if (proxy_opts & POPT_CREATE) {
++				step = "proxy data thread";
++				goto fail;
++			}
++			printf("SWEET VOICE PROXY: FALLBACK: no data path: back to 0x9001/0x9040\n");
++			if (!cvp_switch(false, RATE)) {
++				sweet_vproxy_stop("switch back failed");
++				proxy_up = false;
++				step = "proxy switch back";
++				goto fail;
++			}
++		}
++		if (!on_proxy) {
++			sweet_vproxy_stop("fallback to the direct path");
++			proxy_up = false;
++		} else {
++			printf("SWEET VOICE PROXY: CALL AUDIO THROUGH THE AP (mode %d, %u Hz): CVP on 0x2001/0x2000\n", voice_proxy,
++			    sweet_vproxy_rate());
++		}
++	}
++	if (proxy_opts & POPT_HOSTPCM) {
++		hostpcm_probe((proxy_opts & POPT_8K) ? 8000 : 16000);
++	}
+ 	return true;
+ fail:
+ 	failures++;
+ 	SAY("START FAILED at %s (failure %u): undoing\n", step, failures);
+-	voice_down("start failed");
++	{
++		bool retry = proxy_tried;
++
++		voice_down("start failed");
++		if (retry && !proxy_refused) {
++			/* 1090: the proxy's part failed: the same start once more on today's ports */
++			printf("SWEET VOICE PROXY: FALLBACK: the start failed at %s with the proxy: made again on 0x9001/0x9040\n", step);
++			proxy_refused = true;
++			retry = voice_up(target);
++			proxy_refused = false;
++			return retry;
++		}
++	}
+ 	return false;
+ }
+ 
+@@ -777,6 +988,42 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_ear, CTLTYPE_INT | CTLFLAG_RW | C
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_below_spk, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &below_speaker, 3,
+     sysctl_voice_number, "I", "redfin 1065: speaker amplifier level, 1/8 dB under Android's (default 160; never under 48)");
+ 
++/* ---- 1090: the voice proxy's switches ---- */
++static int
++sysctl_voice_proxy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = voice_proxy, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++
++	if (e != 0 || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 1) {
++		return EINVAL;
++	}
++	voice_proxy = v;
++	printf("SWEET VOICE PROXY: kern.sweet_voice_proxy = %d (%s; applies at the next call start%s)\n", v, v == 0 ? "direct path" :
++	    "proxy loopback", voice_state != 0 ? ", the running call keeps its path" : "");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy, "I",
++    "redfin 1090: 0 direct path (default), 1 the call's CVP on the AFE RT proxy ports, PCM looped through the AP; next call");
++
++static int
++sysctl_voice_proxy_opts(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = (int)proxy_opts, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++
++	if (e == 0 && changed) {
++		proxy_opts = (uint32_t)v & 7u;
++		printf("SWEET VOICE PROXY: kern.sweet_voice_proxy_opts = %#x\n", proxy_opts);
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_opts, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice_proxy_opts,
++    "I", "redfin 1090: bits 1 CVP created on the proxy ports (no switch), 2 8 kHz (default 16 kHz), 4 host-PCM probe (status only)");
++
+ /* ---- 1086: route and gains ---- */
+ static void
+ route_set(int route, bool from_ios)
+diff --git a/bsd/dev/sweet_vproxy.c b/bsd/dev/sweet_vproxy.c
+new file mode 100644
+index 0000000..8e6f77a
+--- /dev/null
++++ b/bsd/dev/sweet_vproxy.c
+@@ -0,0 +1,913 @@
++/*
++ * redfin (Pixel 5): a call's PCM through the AP, over the audio DSP's AFE real-time proxy ports. Patch 1090
++ * (experiment E1 / S1b of research/cc/BBA-design-study.md, sections B1-B3).
++ *
++ * With kern.sweet_voice_proxy 1 (sweet_voice.c; 0 = default = nothing here runs) the call's voice processor (CVP)
++ * uses the AFE RT proxy ports instead of the TDM ports: RX RT_PROXY_PORT_001_RX 0x2000 (the DSP renders the downlink
++ * there and the AP reads it) and TX RT_PROXY_PORT_001_TX 0x2001 (the AP writes the uplink, the DSP captures it).
++ * This file is the AP's side of those ports, and in mode 1 the kernel loops the PCM straight back to today's hardware
++ * paths: downlink frames to the speakers' playback stream (sweet_sound.c, in its call mode of 3 x 10 ms periods, to
++ * QUIN_TDM_RX_0 0x9040 and the call's amplifier), the microphone ring (sweet_mic.c, PRI_TDM_TX_0 0x9001, 48 kHz)
++ * averaged down to the proxy's rate and written to 0x2001.
++ *
++ * Reference: the redbull kernel techpack/audio: dsp/q6afe.c afe_register_get_events() (AFE_SERVICE_CMD_REGISTER_RT_PORT
++ * _DRIVER, src/dest port 1), afe_cmd_memory_map() (AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS, pool SHMEM8_4K 3),
++ * afe_rt_proxy_port_read()/_write() (AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2/WRITE_V2: the frames live in mapped
++ * memory, not in the APR packet -- what msm-pcm-afe-v2.c does; there is no in-band variant), afe_callback() (the data
++ * acks are APR_BASIC_RSP_RESULT with payload[0] = the opcode; AFE_EVENT_RT_PROXY_PORT_STATUS payload u16 port, u16
++ * event); include/dsp/apr_audio-v2.h struct afe_param_id_rt_proxy_port_cfg (AFE_PARAM_ID_RT_PROXY_CONFIG 0x10213),
++ * asoc/msm-dai-q6-v2.c (frame_size = the period, jitter_allowance = half of it, water marks 0; 16-bit only).
++ *
++ * Data path: two READ_V2 kept outstanding on 0x2000 and two WRITE_V2 on 0x2001 (10 ms frames: 320 bytes at 16 kHz,
++ * 160 at 8 kHz), each sent again from this file's thread when its ack comes (the DSP paces both ways; the AFE's
++ * handler only marks the slot done: sweet_adsp.c redwood_adsp_apr_events_proxy(), on the link's thread, never waits).
++ * The tokens are 0x51xxxxxx (read) / 0x52xxxxxx (write), never a waiter's (those stay below 0x01000000).
++ * Slip (+-1 sample, the clocks share the 19.2 MHz crystal): once a second, if the call ring stayed over 20 ms the
++ * next second's downlink frames lose one 48 kHz frame each, after underruns they gain one; the same for the mic ring
++ * (over 60 ms: one sample more consumed per frame, after underruns one less).
++ *
++ * Log lines: "SWEET VOICE PROXY: ..." (the study's B2 list), 1 s statistics for the first 10 s of a call, then every
++ * 10 s, and the totals at the call's end; kern.sweet_voice_proxy_stats (read only) has them too.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <vm/memory_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/redwood_audio.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern kern_return_t thread_terminate(thread_t thread);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
++
++bool sweet_vproxy_prepare(int mode, uint32_t opts);
++bool sweet_vproxy_run(void);
++void sweet_vproxy_stop(const char *why);
++void sweet_vproxy_dtmf(uint32_t low, uint32_t high);
++uint32_t sweet_vproxy_rate(void);
++
++#define SAY(...)                printf("SWEET VOICE PROXY: " __VA_ARGS__)
++
++#define APR_SVC_AFE                                     4
++#define APR_BASIC_RSP_RESULT                            0x000110e8u
++#define APR_WAIT_MS                                     1000
++#define AFE_SERVICE_CMD_REGISTER_RT_PORT_DRIVER         0x000100e0u
++#define AFE_SERVICE_CMD_UNREGISTER_RT_PORT_DRIVER       0x000100e1u
++#define AFE_PORT_CMD_DEVICE_START                       0x000100e5u
++#define AFE_PORT_CMD_DEVICE_STOP                        0x000100e6u
++#define AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS          0x000100eau
++#define AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS       0x000100ebu
++#define AFE_SERVICE_CMD_SHARED_MEM_UNMAP_REGIONS        0x000100ecu
++#define AFE_PORT_DATA_CMD_RT_PROXY_PORT_WRITE_V2        0x000100edu
++#define AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2         0x000100eeu
++#define AFE_PORT_CMD_SET_PARAM_V2                       0x000100efu
++#define AFE_EVENT_RT_PROXY_PORT_STATUS                  0x00010105u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE                  0x0001020cu
++#define AFE_PARAM_ID_RT_PROXY_CONFIG                    0x00010213u
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL                  3
++
++#define PORT_RX                 0x2000          /* RT_PROXY_PORT_001_RX: the DSP renders, the AP reads (downlink) */
++#define PORT_TX                 0x2001          /* RT_PROXY_PORT_001_TX: the AP writes, the DSP captures (uplink) */
++#define AUDIO_SID_BITS          (1ull << 32)    /* sweet_sound.c: stream 0x1401's low bits, which the DSP strips */
++#define MEM_BYTES               (32 * 1024)     /* 4 download pages, 4 upload pages */
++#define SLOTS                   4
++#define IN_FLIGHT               2
++#define UL_OFFSET               (16 * 1024)
++#define DL_TOKEN                0x51000000u
++#define UL_TOKEN                0x52000000u
++#define OPT_8K                  2u              /* kern.sweet_voice_proxy_opts (sweet_voice.c) */
++#define OUT_RATE                48000
++#define MIC_KEEP                1920            /* 40 ms behind the mic ring's writer */
++#define MIC_MOST                4800            /* more than 100 ms behind: skipped forward (overrun) */
++
++static LCK_GRP_DECLARE(vproxy_lock_group, "sweet-vproxy");
++static LCK_MTX_DECLARE(stats_lock, &vproxy_lock_group);
++
++static struct {
++	vm_offset_t va;
++	uint64_t pa;
++	uint32_t handle, rate, samples, bytes;  /* frame: samples (10 ms), bytes */
++	int mode;
++	bool space, hooked, mapped, reg[2], started[2];
++} px;
++static volatile uint32_t dl_done, ul_done, dl_bad, ul_bad;      /* slots acked (bits), and acked with an error */
++static volatile uint64_t dl_at[SLOTS];          /* mach time of each read's ack */
++static volatile bool stop_req, thread_runs, running;
++static int px_wake;
++static volatile uint32_t ev_start, ev_stop, ev_lwm, ev_hwm;
++
++/* statistics: per window (1 s) and per call */
++struct win {
++	uint32_t dl, dl_fail, ul, ul_fail, dl_peak, ul_peak;
++	uint32_t gap_min, gap_max, gaps;
++	uint64_t gap_sum;
++	uint32_t dl_ring_min, dl_ring_max, ul_ring_min, ul_ring_max, rings, dl_rings;
++	uint64_t dl_ring_sum, ul_ring_sum;
++	uint32_t dl_under, ul_under, dl_over, ul_over;
++	int32_t dl_slip, ul_slip;
++};
++static struct win w, total;
++static uint64_t call_began_us, last_dl_mach;
++static int dl_slip_mode, ul_slip_mode;          /* -1 drop one frame/sample per frame, +1 add one, 0 none */
++static uint64_t ul_cursor;
++static bool ul_primed;
++static int16_t dl_prev;
++static uint32_t sound_underruns_seen;
++static int32_t dtmf_last_ms = 0x7fffffff;
++static char stats_text[512];
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static uint64_t
++mach_us(uint64_t t)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000;
++}
++
++static const char *
++dsp_error(uint32_t status)
++{
++	static const char *const names[] = { "ok", "failed", "bad parameter", "unsupported", "version", "unexpected", "panic",
++		                             "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted",
++		                             "preempted", "continue", "immediate", "not implemented", "need more", "no memory",
++		                             "not there" };
++
++	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "unknown error";
++}
++
++/* One AFE command and its answer (the shared waiter: setup and teardown only, on the voice thread). */
++static bool
++afe(uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted, struct redwood_apr_answer *answer,
++    const char **err)
++{
++	struct redwood_apr_answer local;
++
++	if (answer == NULL) {
++		answer = &local;
++	}
++	bzero(answer, sizeof(*answer));
++	*err = "ok";
++	if (!redwood_adsp_apr(APR_SVC_AFE, port, 0, opcode, payload, length, APR_WAIT_MS, answer)) {
++		*err = "no answer";
++		return false;
++	}
++	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
++		*err = dsp_error(answer->words[1]);
++		return answer->words[1] == 0 && wanted == 0;
++	}
++	if (wanted != 0 && answer->opcode == wanted) {
++		return true;
++	}
++	*err = "unexpected answer";
++	return false;
++}
++
++/* ---- the AFE's events and data acks: on the link's thread, never waits ---- */
++
++static bool
++px_events(__unused uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload,
++    uint32_t length)
++{
++	if (opcode == AFE_EVENT_RT_PROXY_PORT_STATUS && length >= 4) {
++		uint32_t p = payload[0] & 0xffff, e = payload[0] >> 16;
++		static const char *const names[] = { "START", "STOP", "LOW_WM", "HIGH_WM" };
++
++		if (p != PORT_RX && p != PORT_TX) {
++			return false;
++		}
++		if (e == 0) {
++			ev_start++;
++		} else if (e == 1) {
++			ev_stop++;
++		} else if (e == 2) {
++			ev_lwm++;
++		} else if (e == 3) {
++			ev_hwm++;
++		}
++		if (e < 2 || ev_lwm + ev_hwm <= 10) {
++			SAY("AFE event: port %#x %s\n", p, e < 4 ? names[e] : "?");
++		}
++		return true;
++	}
++	if (opcode != APR_BASIC_RSP_RESULT || length < 8) {
++		return false;
++	}
++	if ((token & 0xff000000u) == DL_TOKEN && payload[0] == AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2 && (token & 0xff) < SLOTS) {
++		dl_at[token & 0xff] = mach_absolute_time();
++		if (payload[1] != 0) {
++			OSBitOrAtomic(1u << (token & 0xff), &dl_bad);
++		}
++		OSBitOrAtomic(1u << (token & 0xff), &dl_done);
++		thread_wakeup(&px_wake);
++		return true;
++	}
++	if ((token & 0xff000000u) == UL_TOKEN && payload[0] == AFE_PORT_DATA_CMD_RT_PROXY_PORT_WRITE_V2 && (token & 0xff) < SLOTS) {
++		if (payload[1] != 0) {
++			OSBitOrAtomic(1u << (token & 0xff), &ul_bad);
++		}
++		OSBitOrAtomic(1u << (token & 0xff), &ul_done);
++		thread_wakeup(&px_wake);
++		return true;
++	}
++	return false;
++}
++
++/* ---- setup and teardown (the voice thread) ---- */
++
++static void
++undo(void)
++{
++	const char *err;
++
++	for (int i = 1; i >= 0; i--) {
++		uint16_t port = i ? PORT_TX : PORT_RX;
++		uint16_t p[2] = { port, 0 };
++
++		if (px.started[i]) {
++			(void)afe(0, AFE_PORT_CMD_DEVICE_STOP, p, sizeof(p), 0, NULL, &err);
++			SAY("AFE: port %#x stopped: %s\n", port, err);
++			px.started[i] = false;
++		}
++	}
++	if (px.mapped) {
++		uint32_t h = px.handle;
++
++		(void)afe(0, AFE_SERVICE_CMD_SHARED_MEM_UNMAP_REGIONS, &h, sizeof(h), 0, NULL, &err);
++		SAY("AFE: buffers unmapped: %s\n", err);
++		px.mapped = false;
++	}
++	for (int i = 1; i >= 0; i--) {
++		uint16_t port = i ? PORT_TX : PORT_RX;
++		uint16_t p[2] = { port, 0 };
++
++		if (px.reg[i]) {
++			(void)afe(1, AFE_SERVICE_CMD_UNREGISTER_RT_PORT_DRIVER, p, sizeof(p), 0, NULL, &err);
++			SAY("AFE: RT driver %#x unregistered: %s\n", port, err);
++			px.reg[i] = false;
++		}
++	}
++	if (px.hooked) {
++		redwood_adsp_apr_events_proxy(NULL);
++		px.hooked = false;
++	}
++	if (px.space) {
++		(void)redwood_sound_dsp_space(false);
++		px.space = false;
++	}
++}
++
++/*
++ * The AFE side, before the CVP is put on the ports: the RT driver registered for both ports, the buffers mapped, both
++ * ports configured (rate, mono, 16 bit, 10 ms frames, jitter half a frame) and started. False (everything undone):
++ * the call stays on today's ports.
++ */
++bool
++sweet_vproxy_prepare(int mode, uint32_t opts)
++{
++	struct redwood_apr_answer answer;
++	const char *err = "?";
++
++	if (running) {
++		SAY("prepare: the proxy runs already (a call that did not end?): not again\n");
++		return false;
++	}
++	bzero(&px.reg, sizeof(px.reg));
++	bzero(&px.started, sizeof(px.started));
++	px.mode = mode;
++	px.rate = (opts & OPT_8K) ? 8000 : 16000;
++	px.samples = px.rate / 100;
++	px.bytes = px.samples * 2;
++	if (px.va == 0) {
++		/* kept for the whole run: whatever the DSP still writes after a call lands in our own pages */
++		if (sweet_gpu_pool_alloc(MEM_BYTES, &px.pa) != 0 || px.pa == 0 || px.pa + MEM_BYTES > 0x100000000ull) {
++			SAY("FALLBACK: no GPU-pool memory below 4 GB for the proxy's buffers\n");
++			return false;
++		}
++		px.va = ml_io_map_unmappable(px.pa, MEM_BYTES, VM_WIMG_WCOMB);
++		if (px.va == 0) {
++			SAY("FALLBACK: the proxy's buffers cannot be mapped\n");
++			return false;
++		}
++	}
++	bzero((void *)px.va, MEM_BYTES);
++	if (!redwood_sound_dsp_space(true)) {
++		SAY("FALLBACK: the DSP's view of memory (SMMU stream 0x1401) is not to be had\n");
++		return false;
++	}
++	px.space = true;
++	redwood_adsp_apr_events_proxy(px_events);
++	px.hooked = true;
++	ev_start = ev_stop = ev_lwm = ev_hwm = 0;
++	for (int i = 0; i < 2; i++) {
++		uint16_t port = i ? PORT_TX : PORT_RX;
++		uint16_t p[2] = { port, 0 };
++		bool ok = afe(1, AFE_SERVICE_CMD_REGISTER_RT_PORT_DRIVER, p, sizeof(p), 0, NULL, &err);
++
++		if (!ok && strcmp(err, "no answer") == 0) {
++			/* q6afe.c afe_register_get_events() does not wait for an answer: none is not taken as a refusal */
++			SAY("AFE: RT driver %#x registered: ok (no answer within %u ms; Android does not wait for one)\n", port, APR_WAIT_MS);
++			ok = true;
++		} else {
++			SAY("AFE: RT driver %#x registered: %s%s\n", port, ok ? "" : "err ", err);
++		}
++		if (!ok) {
++			goto fail;
++		}
++		px.reg[i] = true;
++	}
++	{
++		uint64_t address = px.pa | AUDIO_SID_BITS;
++		struct {
++			uint16_t pool, regions;
++			uint32_t property;
++			uint32_t low, high, size;
++		} __attribute__((packed)) map = { ADSP_MEMORY_MAP_SHMEM8_4K_POOL, 1, 0, (uint32_t)address, (uint32_t)(address >> 32),
++			                          MEM_BYTES };
++
++		if (!afe(0, AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map), AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer,
++		    &err)) {
++			SAY("AFE: buffers mapped: FAILED: %s\n", err);
++			goto fail;
++		}
++		px.handle = answer.words[0];
++		px.mapped = true;
++		SAY("AFE: buffers mapped: handle %#x, %u bytes (DSP address %#llx)\n", px.handle, MEM_BYTES, address);
++	}
++	for (int i = 0; i < 2; i++) {
++		uint16_t port = i ? PORT_TX : PORT_RX;
++		struct {
++			uint16_t port, size;
++			uint32_t lsw, msw, handle;      /* in band */
++			uint32_t module, param;
++			uint16_t psize, reserved;
++			uint32_t version;
++			uint16_t bits, interleaved, frame, jitter, low_wm, high_wm;
++			uint32_t rate;
++			uint16_t channels, reserved2;
++		} __attribute__((packed)) cfg;
++		uint16_t start[2] = { port, 0 };
++		const char *err2 = "not tried";
++		bool ok;
++
++		bzero(&cfg, sizeof(cfg));
++		cfg.port = port;
++		cfg.size = (uint16_t)(sizeof(cfg) - 16);
++		cfg.module = AFE_MODULE_AUDIO_DEV_INTERFACE;
++		cfg.param = AFE_PARAM_ID_RT_PROXY_CONFIG;
++		cfg.psize = (uint16_t)(sizeof(cfg) - 28);
++		cfg.version = 1;
++		cfg.bits = 16;
++		cfg.interleaved = 1;
++		cfg.frame = (uint16_t)px.bytes;
++		cfg.jitter = (uint16_t)(px.bytes / 2);
++		cfg.rate = px.rate;
++		cfg.channels = 1;
++		ok = afe(0, AFE_PORT_CMD_SET_PARAM_V2, &cfg, sizeof(cfg), 0, NULL, &err);
++		if (ok) {
++			ok = afe(0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL, &err2);
++			px.started[i] = ok;
++		}
++		SAY("AFE: port %#x config %u Hz %u ch 16 bit frame %u B jitter %u B: %s; started: %s\n", port, px.rate, 1, px.bytes,
++		    px.bytes / 2, err, err2);
++		if (!ok) {
++			goto fail;
++		}
++	}
++	return true;
++fail:
++	SAY("FALLBACK: the AFE proxy ports did not come up: the call stays on today's ports (0x9001/0x9040)\n");
++	undo();
++	return false;
++}
++
++uint32_t
++sweet_vproxy_rate(void)
++{
++	return running || px.started[0] ? px.rate : 0;
++}
++
++/* ---- DTMF latency: the CVS's RX DTMF event (sweet_voice.c, link thread) against the tone in the proxy frames ---- */
++
++static const uint16_t dtmf_hz[8] = { 697, 770, 852, 941, 1209, 1336, 1477, 1633 };
++static const int32_t goertzel_q14[2][8] = {
++	{ 27980, 26956, 25701, 24219, 19073, 16325, 13085, 9315 },      /* 8 kHz: 2 cos(2 pi f / fs), Q14 */
++	{ 31548, 31281, 30951, 30556, 29144, 28361, 27409, 26258 },     /* 16 kHz */
++};
++static volatile uint64_t dtmf_event_mach;      /* 0: none pending */
++static volatile uint32_t dtmf_event_low, dtmf_event_high;
++static uint64_t tone_onset_mach;
++static uint32_t tone_low, tone_high;
++static bool tone_on;
++
++void
++sweet_vproxy_dtmf(uint32_t low, uint32_t high)
++{
++	if (!running) {
++		return;
++	}
++	dtmf_event_low = low;
++	dtmf_event_high = high;
++	OSMemoryBarrier();
++	dtmf_event_mach = mach_absolute_time();
++}
++
++static uint64_t
++goertzel(const int16_t *x, uint32_t n, int32_t c)
++{
++	int64_t s1 = 0, s2 = 0;
++
++	for (uint32_t i = 0; i < n; i++) {
++		int64_t s = x[i] + ((c * s1) >> 14) - s2;
++
++		s2 = s1;
++		s1 = s;
++	}
++	return (uint64_t)(s1 * s1 + s2 * s2 - ((c * s1) >> 14) * s2);
++}
++
++static void
++dtmf_say(uint64_t event, uint64_t seen, uint32_t lo, uint32_t hi)
++{
++	int64_t d = (int64_t)mach_us(seen) - (int64_t)mach_us(event);
++
++	dtmf_last_ms = (int32_t)(d / 1000);
++	SAY("DTMF %u/%u Hz: DSP event at %llu us, seen in proxy data at %llu us (%+d ms)%s (tone found %u/%u Hz)\n", dtmf_event_low,
++	    dtmf_event_high, mach_us(event) - call_began_us, mach_us(seen) - call_began_us, dtmf_last_ms,
++	    d < 0 ? " -- before the event" : "", lo, hi);
++}
++
++static void
++dtmf_frame(const int16_t *x, uint32_t n, uint64_t at)
++{
++	uint64_t energy = 0, best[2] = { 0, 0 };
++	uint32_t which[2] = { 0, 0 };
++	int r = px.rate == 16000;
++	bool present;
++	uint64_t ev;
++
++	for (uint32_t i = 0; i < n; i++) {
++		energy += (uint64_t)((int32_t)x[i] * x[i]);
++	}
++	if (energy > 33856ull * n) {    /* louder than about -45 dBFS */
++		for (int k = 0; k < 8; k++) {
++			uint64_t p = goertzel(x, n, goertzel_q14[r][k]);
++
++			if (p > best[k / 4]) {
++				best[k / 4] = p;
++				which[k / 4] = k;
++			}
++		}
++	}
++	/* each tone over 20 % of the frame's energy (a pure tone gives P ~ E * N / 2) */
++	present = energy > 33856ull * n && best[0] * 10 > energy * n && best[1] * 10 > energy * n;
++	if (present && !tone_on) {
++		tone_onset_mach = at;
++		tone_low = dtmf_hz[which[0]];
++		tone_high = dtmf_hz[which[1]];
++	}
++	tone_on = present;
++	ev = dtmf_event_mach;
++	if (ev == 0) {
++		return;
++	}
++	if (tone_onset_mach != 0 && tone_onset_mach < ev && mach_us(ev) - mach_us(tone_onset_mach) < 300000 && tone_on) {
++		dtmf_say(ev, tone_onset_mach, tone_low, tone_high);     /* the tone was in the frames before the event */
++		dtmf_event_mach = 0;
++	} else if (tone_on && tone_onset_mach >= ev) {
++		dtmf_say(ev, tone_onset_mach, tone_low, tone_high);
++		dtmf_event_mach = 0;
++	} else if (mach_us(at) > mach_us(ev) + 1000000) {
++		SAY("DTMF %u/%u Hz: DSP event at %llu us, NOT seen in the proxy data within 1 s\n", dtmf_event_low, dtmf_event_high,
++		    mach_us(ev) - call_began_us);
++		dtmf_event_mach = 0;
++	}
++}
++
++/* ---- the data thread ---- */
++
++static void
++win_reset(struct win *x)
++{
++	bzero(x, sizeof(*x));
++	x->gap_min = x->dl_ring_min = x->ul_ring_min = 0xffffffffu;
++}
++
++static void
++win_add(struct win *t, const struct win *x)
++{
++	t->dl += x->dl;
++	t->dl_fail += x->dl_fail;
++	t->ul += x->ul;
++	t->ul_fail += x->ul_fail;
++	t->dl_peak = t->dl_peak > x->dl_peak ? t->dl_peak : x->dl_peak;
++	t->ul_peak = t->ul_peak > x->ul_peak ? t->ul_peak : x->ul_peak;
++	t->gap_min = t->gap_min < x->gap_min ? t->gap_min : x->gap_min;
++	t->gap_max = t->gap_max > x->gap_max ? t->gap_max : x->gap_max;
++	t->gaps += x->gaps;
++	t->gap_sum += x->gap_sum;
++	t->dl_ring_min = t->dl_ring_min < x->dl_ring_min ? t->dl_ring_min : x->dl_ring_min;
++	t->dl_ring_max = t->dl_ring_max > x->dl_ring_max ? t->dl_ring_max : x->dl_ring_max;
++	t->ul_ring_min = t->ul_ring_min < x->ul_ring_min ? t->ul_ring_min : x->ul_ring_min;
++	t->ul_ring_max = t->ul_ring_max > x->ul_ring_max ? t->ul_ring_max : x->ul_ring_max;
++	t->rings += x->rings;
++	t->dl_rings += x->dl_rings;
++	t->dl_ring_sum += x->dl_ring_sum;
++	t->ul_ring_sum += x->ul_ring_sum;
++	t->dl_under += x->dl_under;
++	t->ul_under += x->ul_under;
++	t->dl_over += x->dl_over;
++	t->ul_over += x->ul_over;
++	t->dl_slip += x->dl_slip;
++	t->ul_slip += x->ul_slip;
++}
++
++/* fills, ms (ring frames at 48 kHz -> ms) */
++#define MS48(f)                 ((f) / 48)
++
++static void
++stats_format(char *b, size_t n, const char *head, const struct win *x, uint32_t queued_frames)
++{
++	uint32_t gaps = x->gaps ? x->gaps : 1, ur = x->rings ? x->rings : 1, dr = x->dl_rings ? x->dl_rings : 1;
++	uint32_t dl_avg = (uint32_t)(x->dl_ring_sum / dr), ul_avg = (uint32_t)(x->ul_ring_sum / ur);
++
++	snprintf(b, n, "%s: dl %u frames (fail %u, gap min/avg/max %u/%u/%u us) ul %u frames (fail %u) dl peak %u ul peak %u | "
++	    "ring dl %u ms ul %u ms | dsp queued %u ms | ring min/avg/max dl %u/%u/%u ms ul %u/%u/%u ms; under dl %u ul %u, "
++	    "over dl %u ul %u, slips dl %+d ul %+d", head, x->dl, x->dl_fail, x->gaps ? x->gap_min : 0, (uint32_t)(x->gap_sum / gaps),
++	    x->gap_max, x->ul, x->ul_fail, x->dl_peak, x->ul_peak, MS48(dl_avg), MS48(ul_avg), MS48(queued_frames),
++	    x->dl_rings ? MS48(x->dl_ring_min) : 0, MS48(dl_avg), MS48(x->dl_ring_max), x->rings ? MS48(x->ul_ring_min) : 0,
++	    MS48(ul_avg), MS48(x->ul_ring_max), x->dl_under, x->ul_under, x->dl_over, x->ul_over, x->dl_slip, x->ul_slip);
++}
++
++static bool
++dl_issue(unsigned slot)
++{
++	uint64_t a = (px.pa + 4096ull * slot) | AUDIO_SID_BITS;
++	struct {
++		uint16_t port, reserved;
++		uint32_t lsw, msw, handle, bytes;
++	} __attribute__((packed)) rd = { PORT_RX, 0, (uint32_t)a, (uint32_t)(a >> 32), px.handle, px.bytes };
++
++	return redwood_adsp_apr(APR_SVC_AFE, 0, DL_TOKEN | slot, AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2, &rd, sizeof(rd), 0, NULL);
++}
++
++static bool
++ul_issue(unsigned slot)
++{
++	uint64_t a = (px.pa + UL_OFFSET + 4096ull * slot) | AUDIO_SID_BITS;
++	struct {
++		uint16_t port, reserved;
++		uint32_t lsw, msw, handle, bytes;
++	} __attribute__((packed)) wr = { PORT_TX, 0, (uint32_t)a, (uint32_t)(a >> 32), px.handle, px.bytes };
++
++	return redwood_adsp_apr(APR_SVC_AFE, 0, UL_TOKEN | slot, AFE_PORT_DATA_CMD_RT_PROXY_PORT_WRITE_V2, &wr, sizeof(wr), 0, NULL);
++}
++
++/* A downlink frame came: to the speakers' call ring (mode 1), 16/8 kHz mono -> 48 kHz stereo, linear */
++static void
++dl_frame(unsigned slot)
++{
++	const volatile int16_t *src = (const volatile int16_t *)(px.va + 4096ull * slot);
++	int16_t x[160], out[2 * 482];
++	uint32_t n = px.samples, f = OUT_RATE / px.rate, o = 0, gain = redwood_sound_call_gain_q15(), peak = 0, ring, queued, under,
++	    periods;
++	uint64_t at = dl_at[slot];
++
++	for (uint32_t i = 0; i < n; i++) {
++		int16_t v = src[i];
++		uint32_t a = v < 0 ? (uint32_t)-(int32_t)v : (uint32_t)v;
++
++		x[i] = v;
++		peak = a > peak ? a : peak;
++	}
++	w.dl_peak = peak > w.dl_peak ? peak : w.dl_peak;
++	dtmf_frame(x, n, at);
++	for (uint32_t i = 0; i < n; i++) {
++		int32_t prev = i ? x[i - 1] : dl_prev;
++
++		for (uint32_t k = 1; k <= f; k++) {
++			int32_t v = prev + (x[i] - prev) * (int32_t)k / (int32_t)f;
++
++			v = (int32_t)(((int64_t)v * gain) >> 15);
++			out[2 * o] = (int16_t)v;
++			out[2 * o + 1] = (int16_t)v;
++			o++;
++		}
++	}
++	dl_prev = x[n - 1];
++	if (dl_slip_mode < 0) {
++		o--;                    /* one 48 kHz frame less */
++		w.dl_slip--;
++	} else if (dl_slip_mode > 0) {
++		out[2 * o] = out[2 * o - 2];
++		out[2 * o + 1] = out[2 * o - 1];
++		o++;
++		w.dl_slip++;
++	}
++	if (redwood_sound_call_put(out, o) < o) {
++		w.dl_over++;
++	}
++	redwood_sound_call_state(&ring, &queued, &under, &periods);
++	if (under != sound_underruns_seen) {
++		w.dl_under += under - sound_underruns_seen;
++		sound_underruns_seen = under;
++	}
++	w.dl_ring_min = ring < w.dl_ring_min ? ring : w.dl_ring_min;
++	w.dl_ring_max = ring > w.dl_ring_max ? ring : w.dl_ring_max;
++	w.dl_ring_sum += ring;
++	w.dl_rings++;
++}
++
++/* An uplink slot is free: the next 10 ms of the microphone, 48 kHz -> 16/8 kHz (the average of each 3/6 samples) */
++static void
++ul_frame(unsigned slot)
++{
++	volatile int16_t *dst = (volatile int16_t *)(px.va + UL_OFFSET + 4096ull * slot);
++	int16_t in[960 + 2];
++	uint32_t n = px.samples, f = OUT_RATE / px.rate, need = n * f, take = need, peak = 0;
++	uint64_t written, avail;
++
++	(void)redwood_mic_voice_peek(0, in, 0, &written);       /* (only *written wanted) */
++	if (!ul_primed) {
++		if (written < MIC_KEEP) {
++			goto silence;
++		}
++		ul_cursor = written - MIC_KEEP;
++		ul_primed = true;
++	}
++	avail = written - ul_cursor;
++	if (avail > MIC_MOST) {
++		ul_cursor = written - MIC_KEEP;
++		avail = MIC_KEEP;
++		w.ul_over++;
++	}
++	w.ul_ring_min = avail < w.ul_ring_min ? (uint32_t)avail : w.ul_ring_min;
++	w.ul_ring_max = avail > w.ul_ring_max ? (uint32_t)avail : w.ul_ring_max;
++	w.ul_ring_sum += avail;
++	w.rings++;
++	if (ul_slip_mode < 0) {
++		take = need + 1;        /* one sample more consumed */
++	} else if (ul_slip_mode > 0) {
++		take = need - 1;
++	}
++	if (!redwood_mic_voice_peek(ul_cursor, in, need + 1 > take ? need + 1 : take, &written) &&
++	    !redwood_mic_voice_peek(ul_cursor, in, need, &written)) {
++		w.ul_under++;
++		goto silence;
++	}
++	if (take > need && avail < take) {
++		take = need;
++	}
++	ul_cursor += take;
++	w.ul_slip += (int32_t)need - (int32_t)take;
++	for (uint32_t i = 0; i < n; i++) {
++		int32_t sum = 0;
++
++		for (uint32_t k = 0; k < f; k++) {
++			sum += in[i * f + k];
++		}
++		sum /= (int32_t)f;
++		dst[i] = (int16_t)sum;
++		peak = (uint32_t)(sum < 0 ? -sum : sum) > peak ? (uint32_t)(sum < 0 ? -sum : sum) : peak;
++	}
++	w.ul_peak = peak > w.ul_peak ? peak : w.ul_peak;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return;
++silence:
++	for (uint32_t i = 0; i < n; i++) {
++		dst[i] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++px_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	uint32_t dl_retry = 0, ul_retry = 0, seconds = 0;
++	uint64_t window_us = now_us(), last_retry_us = 0;
++	bool said_no_dl = false, said_no_ul = false;
++	uint32_t ring, queued, under, periods;
++
++	for (unsigned s = 0; s < IN_FLIGHT; s++) {
++		if (!dl_issue(s)) {
++			dl_retry |= 1u << s;
++		}
++		ul_frame(s);
++		if (!ul_issue(s)) {
++			ul_retry |= 1u << s;
++		}
++	}
++	SAY("data: %u reads on %#x and %u writes on %#x outstanding (%u-byte frames, 10 ms)\n", IN_FLIGHT, PORT_RX, IN_FLIGHT, PORT_TX,
++	    px.bytes);
++	while (!stop_req) {
++		uint32_t d = __atomic_exchange_n(&dl_done, 0, __ATOMIC_ACQ_REL), u = __atomic_exchange_n(&ul_done, 0, __ATOMIC_ACQ_REL);
++		uint32_t db = __atomic_exchange_n(&dl_bad, 0, __ATOMIC_ACQ_REL), ub = __atomic_exchange_n(&ul_bad, 0, __ATOMIC_ACQ_REL);
++		uint64_t now = now_us();
++
++		for (unsigned s = 0; s < SLOTS; s++) {
++			if (!(d & (1u << s))) {
++				continue;
++			}
++			if (db & (1u << s)) {
++				w.dl_fail++;
++				dl_retry |= 1u << s;    /* sent again at the next 10 ms tick, not at once */
++				continue;
++			}
++			if (last_dl_mach != 0) {
++				uint32_t gap = (uint32_t)(mach_us(dl_at[s]) - mach_us(last_dl_mach));
++
++				w.gap_min = gap < w.gap_min ? gap : w.gap_min;
++				w.gap_max = gap > w.gap_max ? gap : w.gap_max;
++				w.gap_sum += gap;
++				w.gaps++;
++			}
++			last_dl_mach = dl_at[s];
++			w.dl++;
++			dl_frame(s);
++			if (!dl_issue(s)) {
++				dl_retry |= 1u << s;
++			}
++		}
++		for (unsigned s = 0; s < SLOTS; s++) {
++			if (!(u & (1u << s))) {
++				continue;
++			}
++			if (ub & (1u << s)) {
++				w.ul_fail++;
++				ul_retry |= 1u << s;
++				continue;
++			}
++			w.ul++;
++			ul_frame(s);
++			if (!ul_issue(s)) {
++				ul_retry |= 1u << s;
++			}
++		}
++		if ((dl_retry | ul_retry) != 0 && now - last_retry_us >= 10000) {
++			last_retry_us = now;
++			for (unsigned s = 0; s < SLOTS; s++) {
++				if ((dl_retry & (1u << s)) && dl_issue(s)) {
++					dl_retry &= ~(1u << s);
++				}
++				if (ul_retry & (1u << s)) {
++					ul_frame(s);
++					if (ul_issue(s)) {
++						ul_retry &= ~(1u << s);
++					}
++				}
++			}
++		}
++		if (now - window_us >= 1000000) {
++			char line[400];
++
++			seconds++;
++			window_us = now;
++			redwood_sound_call_state(&ring, &queued, &under, &periods);
++			if (!said_no_dl && total.dl + w.dl == 0) {
++				SAY("THE DSP GIVES NO DOWNLINK FRAMES on %#x (%u read errors; AFE events: start %u stop %u)\n", PORT_RX, w.dl_fail,
++				    ev_start, ev_stop);
++				said_no_dl = true;
++			}
++			if (!said_no_ul && total.ul + w.ul == 0) {
++				SAY("THE DSP TAKES NO UPLINK FRAMES on %#x (%u write errors)\n", PORT_TX, w.ul_fail);
++				said_no_ul = true;
++			}
++			/* the slips for the next second: the rings' least fill over this one */
++			dl_slip_mode = w.dl_under ? 1 : (w.dl_rings && w.dl_ring_min > 960) ? -1 : 0;
++			ul_slip_mode = w.ul_under ? 1 : (w.rings && w.ul_ring_min > 2880) ? -1 : 0;
++			if (seconds <= 10 || seconds % 10 == 0) {
++				stats_format(line, sizeof(line), "1s", &w, queued);
++				SAY("%s\n", line);
++			}
++			lck_mtx_lock(&stats_lock);
++			win_add(&total, &w);
++			stats_format(stats_text, sizeof(stats_text), "call so far", &total, queued);
++			lck_mtx_unlock(&stats_lock);
++			win_reset(&w);
++		}
++		if (__atomic_load_n(&dl_done, __ATOMIC_ACQUIRE) == 0 && __atomic_load_n(&ul_done, __ATOMIC_ACQUIRE) == 0 && !stop_req) {
++			assert_wait_timeout((event_t)&px_wake, THREAD_UNINT, 10, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	lck_mtx_lock(&stats_lock);
++	win_add(&total, &w);
++	win_reset(&w);
++	lck_mtx_unlock(&stats_lock);
++	thread_runs = false;
++	thread_wakeup(&thread_runs);
++	thread_terminate(current_thread());
++}
++
++/* After the CVP is on the proxy ports and voice started: the call mode on, the data thread started. */
++bool
++sweet_vproxy_run(void)
++{
++	thread_t thread;
++	bool heard;
++
++	win_reset(&w);
++	win_reset(&total);
++	dl_done = ul_done = dl_bad = ul_bad = 0;
++	last_dl_mach = 0;
++	dl_slip_mode = ul_slip_mode = 0;
++	ul_primed = false;
++	dl_prev = 0;
++	dtmf_event_mach = 0;
++	tone_on = false;
++	tone_onset_mach = 0;
++	dtmf_last_ms = 0x7fffffff;
++	call_began_us = now_us();
++	heard = redwood_sound_call_mode_on(true);
++	{
++		uint32_t a, b, c, d;
++
++		redwood_sound_call_state(&a, &b, &c, &d);
++		sound_underruns_seen = c;
++	}
++	if (!heard) {
++		SAY("mode 1: NO PLAYBACK STREAM RUNS (boot-arg sound < 2): the downlink is read but not heard\n");
++	}
++	stop_req = false;
++	thread_runs = true;
++	running = true;
++	if (kernel_thread_start(px_thread, NULL, &thread) != KERN_SUCCESS) {
++		thread_runs = false;
++		running = false;
++		redwood_sound_call_mode(false);
++		SAY("FALLBACK: no data thread\n");
++		return false;
++	}
++	thread_deallocate(thread);
++	SAY("RUNNING: mode %d, %u Hz mono 16 bit, 10 ms frames; downlink -> speakers' call ring, mic ring -> uplink\n", px.mode,
++	    px.rate);
++	return true;
++}
++
++/* The call ended (or the switch failed): the thread stopped, the call mode off, the AFE side undone. */
++void
++sweet_vproxy_stop(const char *why)
++{
++	if (running) {
++		stop_req = true;
++		thread_wakeup(&px_wake);
++		for (unsigned ms = 0; ms < 500 && thread_runs; ms += 10) {
++			delay_for_interval(10, NSEC_PER_MSEC);
++		}
++		if (thread_runs) {
++			SAY("the data thread did not stop within 500 ms\n");
++		}
++		redwood_sound_call_mode(false);
++		{
++			char line[400];
++			uint32_t ring, queued, under, periods;
++
++			redwood_sound_call_state(&ring, &queued, &under, &periods);
++			lck_mtx_lock(&stats_lock);
++			stats_format(line, sizeof(line), "call end", &total, queued);
++			strlcpy(stats_text, line, sizeof(stats_text));
++			lck_mtx_unlock(&stats_lock);
++			SAY("%s (%llu s; DTMF latency last %d ms; AFE events start %u stop %u low %u high %u)\n", line,
++			    (now_us() - call_began_us) / 1000000, dtmf_last_ms == 0x7fffffff ? 0 : dtmf_last_ms, ev_start, ev_stop, ev_lwm,
++			    ev_hwm);
++		}
++		running = false;
++	}
++	SAY("STOP (%s)\n", why);
++	undo();
++}
++
++static int
++sysctl_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char b[sizeof(stats_text)];
++
++	lck_mtx_lock(&stats_lock);
++	strlcpy(b, stats_text[0] ? stats_text : "no call on the proxy yet", sizeof(b));
++	lck_mtx_unlock(&stats_lock);
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_proxy_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_stats, "A",
++    "redfin 1090: the voice proxy's counters (this call so far, or the last call's totals)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/sys/redwood_audio.h b/bsd/sys/redwood_audio.h
+index de06497..5695394 100644
+--- a/bsd/sys/redwood_audio.h
++++ b/bsd/sys/redwood_audio.h
+@@ -148,6 +148,20 @@ void redwood_mic_voice_gain(int db);    /* 1086: the ADC gain during a call, dB
+  * (what the call alone brought up is taken down; the amplifiers follow what iOS plays again). True: the port runs.
+  */
+ bool redwood_sound_voice(uint32_t amps, uint32_t below);
++/*
++ * 1090, the voice proxy (bsd/dev/sweet_vproxy.c, kern.sweet_voice_proxy). A handler for what the AFE sends unasked
++ * (asked before the others; NULL = none). The memory the DSP sees held for it (sweet_sound.c's SMMU stream; the proxy's
++ * own buffer). The playback stream's call mode: 10 ms periods, at most 3 queued (instead of 8 x 20 ms), fed from a call
++ * ring (48 kHz stereo) mixed with what iOS plays; off = back to 8 x 20 ms. The mic ring read with a cursor of one's own.
++ */
++void redwood_adsp_apr_events_proxy(redwood_apr_events_t handler);
++bool redwood_sound_dsp_space(bool on);
++bool redwood_sound_call_mode_on(bool on);       /* true: the playback stream runs, so the call ring is heard */
++void redwood_sound_call_mode(bool on);
++uint32_t redwood_sound_call_put(const int16_t *stereo, uint32_t frames);
++void redwood_sound_call_state(uint32_t *ring_frames, uint32_t *queued_frames, uint32_t *underruns, uint32_t *periods);
++uint32_t redwood_sound_call_gain_q15(void);     /* undoes the feeder's sndgain for the call's PCM (Q15 factor) */
++bool redwood_mic_voice_peek(uint64_t from, int16_t *out, uint32_t count, uint64_t *written);
+ #endif
+ 
+ #endif /* _SYS_REDWOOD_AUDIO_H_ */
