@@ -36,6 +36,8 @@ struct redwood_audio_volume {
 	uint32_t muted;
 };
 #define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
+/* xnu 1086: the call route iOS chose (RedwoodAudio with /var/local/redwood-call-route): 1 Receiver, 2 Speaker */
+#define REDWOOD_AUDIO_SET_CALL_ROUTE _IOW('r', 2, uint32_t)
 
 #ifdef KERNEL
 #include <stdbool.h>
