@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_pdp.c b/bsd/dev/sweet_pdp.c
-index 62a725e..fcf81cc 100644
+index 62a725e..85742be 100644
 --- a/bsd/dev/sweet_pdp.c
 +++ b/bsd/dev/sweet_pdp.c
 @@ -19,7 +19,7 @@
@@ -11,16 +11,18 @@ index 62a725e..fcf81cc 100644
   * Self-test: unit N's link goes up and its output answers IPv4 ICMP echo requests with echo replies through
   * sweet_pdp_input, so `ifconfig pdp_ipN 10.99.0.1 10.99.0.2 up; ping 10.99.0.2` proves the ifnet path end to end.
   * Turning it off gives the unit back to the registered hook and the link state it had before.
-@@ -488,6 +488,9 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
+@@ -488,7 +488,10 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
  	if (!sweet_pdp_enabled() || !os_atomic_load(&pdp_created, acquire)) {
  		return ENXIO;
  	}
-+	if (v == 255 || v == SWEET_PDP_NUNITS) {
+-	if (v < -1 || v >= SWEET_PDP_NUNITS) {
++	if (v == 255 || v == (int)SWEET_PDP_NUNITS) {
 +		v = -1;         /* 1089: "off" for tools that cannot write -1 (sctl) */
 +	}
- 	if (v < -1 || v >= SWEET_PDP_NUNITS) {
++	if (v < -1 || v >= (int)SWEET_PDP_NUNITS) {     /* 1089: signed compare (8u made -1 EINVAL) */
  		return EINVAL;
  	}
+ 	lck_mtx_lock(&pdp_mtx);
 @@ -512,7 +515,7 @@ sysctl_pdp_test SYSCTL_HANDLER_ARGS
  	return 0;
  }
