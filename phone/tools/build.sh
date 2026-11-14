@@ -29,7 +29,7 @@ build() {	# NAME SOURCE [FLAGS...]
 }
 # SweetControl.app + sweetctl (ws-n-ctl): first, so a failing tool below (set -e) cannot skip it
 sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
-for c in membw pstack psx sweettrace simpin; do build $c $c.c; done
+for c in membw pstack psx sweettrace simpin sctl; do build $c $c.c; done
 # sweetstate: helper of the state dump (phone/tools/sweetstate.sh; tools/state.py); optional, so it cannot fail the build
 build sweetstate sweetstate.c || echo "WARN sweetstate failed"
 for m in autolock expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done

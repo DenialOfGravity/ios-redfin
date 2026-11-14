@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd job for phone/boot/sweet-early.sh (boot sysctls + scratch wipe); added to the phone's launchd.plist by
+     tools/launchd-add-job.py. Takes effect at the next boot. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.iosonpixel.sweetearly</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/dash</string>
+		<string>/var/local/bin/sweet-early.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>UserName</key>
+	<string>root</string>
+	<key>Nice</key>
+	<integer>-20</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/var/local/sweet-early.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/local/sweet-early.out</string>
+</dict>
+</plist>

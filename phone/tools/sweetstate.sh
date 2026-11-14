@@ -29,6 +29,7 @@
 #   E text                        a non-fatal error
 set -u
 T=/var/local/bin/toybox
+[ -x /var/local/bin/toybox-full ] && T=/var/local/bin/toybox-full	# has grep/tr/sort (ws-tools-state)
 export PATH=/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 TAB=$(printf '\t')
 HELPER=/var/local/bin/sweetstate
@@ -68,7 +69,10 @@ secret_lines() {	# count | keep   (stdin)
 			r=
 			for t in $l; do
 				case $t in
-				*=*) secret_tok "${t%%=*}" && { c=$((c + 1)); t="${t%%=*}=@PHONE@"; };;
+				*=*) secret_tok "${t%%=*}" && case ${t#*=} in
+					0|1) ;;	# an on/off switch (cell.on pin=1 = wland's PIN socket on), not a secret
+					*) c=$((c + 1)); t="${t%%=*}=@PHONE@";;
+					esac;;
 				*) c=$((c + 1)); t=@PHONE@;;	# a bare word on such a line could be the value ("pin 1234")
 				esac
 				r="$r${r:+ }$t"

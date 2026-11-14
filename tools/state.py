@@ -228,7 +228,7 @@ class Direct:
 
     def put(self, local, remote, mode, owner):
         tmp = remote + '.st-new'
-        cmd = (f"{T} mkdir -p {shlex.quote(os.path.dirname(remote))} && cat > {shlex.quote(tmp)} && "
+        cmd = (f"{T} mkdir -p {shlex.quote(os.path.dirname(remote))} && {T} rm -f {shlex.quote(tmp)} && cat > {shlex.quote(tmp)} && "
                f"{T} chmod {mode} {shlex.quote(tmp)} && {T} chown {owner} {shlex.quote(tmp)} && "
                f"{T} mv -f {shlex.quote(tmp)} {shlex.quote(remote)} && {T} sha256sum {shlex.quote(remote)}")
         with open(local, 'rb') as f:
@@ -236,7 +236,8 @@ class Direct:
 
     def write(self, data, remote, mode='644', owner='0:0'):
         tmp = remote + '.st-new'
-        cmd = (f"cat > {shlex.quote(tmp)} && {T} chmod {mode} {shlex.quote(tmp)} && {T} chown {owner} {shlex.quote(tmp)}"
+        cmd = (f"{T} mkdir -p {shlex.quote(os.path.dirname(remote))} && {T} rm -f {shlex.quote(tmp)} && "
+               f"cat > {shlex.quote(tmp)} && {T} chmod {mode} {shlex.quote(tmp)} && {T} chown {owner} {shlex.quote(tmp)}"
                f" && {T} mv -f {shlex.quote(tmp)} {shlex.quote(remote)}")
         return self.sh(cmd, stdin=data)
 
@@ -301,14 +302,18 @@ class Agent:
         return self.req('phone ' + cmd, timeout)
 
     def put(self, local, remote, mode, owner):
-        rc, out = self.req(f'files put {local} {remote} {mode}')
-        if rc == 0 and owner != '0:0':
-            rc, o2 = self.sh(f'{T} chown {owner} {shlex.quote(remote)}')
-            out += o2
-        if rc == 0:
-            rc, o3 = self.sh(f'{T} sha256sum {shlex.quote(remote)}')
-            out += o3
-        return rc, out
+        # never in place: put to REMOTE.st-new in the same directory, then mv over the target (a new vnode)
+        tmp = remote + '.st-new'
+        rc, out = self.sh(f'{T} mkdir -p {shlex.quote(os.path.dirname(remote))} && {T} rm -f {shlex.quote(tmp)}')
+        if rc:
+            return rc, out
+        rc, o1 = self.req(f'files put {local} {tmp} {mode}')
+        out += o1
+        if rc:
+            return rc, out
+        rc, o2 = self.sh(f'{T} chmod {mode} {shlex.quote(tmp)} && {T} chown {owner} {shlex.quote(tmp)} && '
+                         f'{T} mv -f {shlex.quote(tmp)} {shlex.quote(remote)} && {T} sha256sum {shlex.quote(remote)}')
+        return rc, out + o2
 
     def write(self, data, remote, mode='644', owner='0:0'):
         tmpl = os.path.join(STATE, 'tmp', f'w-{os.getpid()}-{self.n}')
@@ -522,6 +527,14 @@ def by_sha(idx):
     return out
 
 
+def by_sha_all(idx):
+    out = {}
+    for key, info in sorted(idx['sums'].items(), key=lambda kv: -kv[1]['mtime']):
+        for rel, h in info['files'].items():
+            out.setdefault(h, []).append(f'{key}/{rel}')
+    return out
+
+
 def src_info(idx, source):
     """builds/<tgt>/<dir>/... -> (target, ref, sha10)"""
     m = re.match(r'builds/([^/]+)/([^/]+)', source or '')
@@ -544,9 +557,9 @@ class Drift:
         return [i for i in self.items if i['kind'] in kinds]
 
 
-DRIFT_KINDS = ['boot', 'missing', 'hash', 'mode', 'owner', 'link', 'flag', 'secret', 'unexpected', 'sysctl',
+DRIFT_KINDS = ['held', 'boot', 'missing', 'hash', 'mode', 'owner', 'link', 'flag', 'secret', 'unexpected', 'sysctl',
                'process', 'retired', 'temp', 'temp-lost', 'dump']
-INFO_KINDS = {'retired', 'temp', 'dump'}  # reported, but not "drift" for the exit code
+INFO_KINDS = {'retired', 'temp', 'dump', 'held'}  # reported, but not "drift" for the exit code
 
 
 def manifest_paths(m):
@@ -765,6 +778,11 @@ def compute_diff(m, d):
         if x['type'] == 'd' or p in roots or gmatch(p, ignore) or gmatch(p, volatile) or gmatch(p, stock):
             continue
         dr.add('unexpected', p, f"{x['type']} {x['size']} B {datetime.datetime.fromtimestamp(x['mtime'], datetime.timezone.utc):%Y-%m-%d}")
+    held = {e['path']: e['hold'] for e in m.get('file', []) + m.get('bundle', []) + m.get('flag', []) if e.get('hold')}
+    for i in dr.items:
+        if i['path'] in held and i['kind'] not in INFO_KINDS:
+            i['detail'] = f"[{i['kind']}] {i['detail']} - held: {held[i['path']]}"
+            i['kind'] = 'held'
     return dr
 
 
@@ -814,6 +832,36 @@ def fmt_dur(s):
 
 # ---------------------------------------------------------------- apply
 
+def live_log():
+    """(path, size) of the phone agent's newest live kernel log (logs/live-*.txt), or (None, 0)"""
+    d = os.path.join(PF, 'logs')
+    try:
+        c = [os.path.join(d, n) for n in os.listdir(d) if n.startswith('live-') and n.endswith('.txt')]
+    except OSError:
+        return None, 0
+    if not c:
+        return None, 0
+    p = max(c, key=os.path.getmtime)
+    return p, os.path.getsize(p)
+
+
+def cs_invalid_since(mark):
+    """kernel log lines with cs_invalid_page written since mark (from live_log()); None = no live log"""
+    p, off = mark
+    if not p:
+        return None
+    hits = []
+    try:
+        with open(p, 'rb') as f:
+            f.seek(off)
+            for line in f.read().decode(errors='replace').splitlines():
+                if 'cs_invalid_page' in line:
+                    hits.append(line.strip()[:200])
+    except OSError:
+        return None
+    return hits
+
+
 def check_writable(m, path):
     mg = m.get('managed', {})
     if not under(path, mg.get('roots', [])):
@@ -844,8 +892,14 @@ def cmd_apply(m, tp, a):
     flags = {f['path']: f for f in m.get('flag', [])}
     links = {l['path']: l for l in m.get('link', [])}
     plan, restart, manual = [], set(), []
+    held = {e['path']: e['hold'] for e in m.get('file', []) + m.get('bundle', []) + m.get('flag', []) if e.get('hold')}
     for i in dr.items:
         p, k = i['path'], i['kind']
+        if p in held and not a.include_held:
+            manual.append(f'{p}: held ({held[p]}): not applied without --include-held')
+            continue
+        if a.only_new and not (k == 'missing' and p not in d.files) and not (k == 'link' and p not in d.links):
+            continue
         if k == 'boot':
             manual.append(f'boot: {i["detail"]}')
         elif k in ('missing', 'hash', 'mode', 'owner') and (p in files or p in bundles):
@@ -881,6 +935,8 @@ def cmd_apply(m, tp, a):
             plan.append(('retire', p, None))
         elif k == 'unexpected':
             manual.append(f'{p}: unexpected (not in the manifest): add it, retire it, or move it to /var/local/scratch')
+    if a.only_new:
+        restart = set()  # --only-new: new files only, nothing restarted
     if 'reboot' in restart:
         manual.append('an installed entry needs a reboot to take effect (restart = "reboot"): not done by state.py')
     for p in [x[1] for x in plan if x[0] in ('install', 'flag', 'sysctl-conf', 'link', 'chmod', 'chown')]:
@@ -898,6 +954,7 @@ def cmd_apply(m, tp, a):
         print('dry run: nothing changed' if a.dry_run else 'nothing to do')
         return 0 if not manual else 1
     # unknown-provenance content is pulled to the PC before it is overwritten
+    mark = live_log()
     attic = os.path.join(STATE, 'attic', now_utc().strftime('%Y%m%dT%H%M%SZ'))
     by = by_sha(build_index())
     failed = 0
@@ -909,7 +966,7 @@ def cmd_apply(m, tp, a):
             if p in bundles:
                 failed += install_bundle(tp, e)
             else:
-                failed += install_file(tp, e)
+                failed += install_file(tp, e, m)
         elif op == 'chmod':
             r, o = tp.sh(f"{T} chmod {e['mode']} {shlex.quote(p)}")
             failed += r != 0
@@ -954,7 +1011,17 @@ def cmd_apply(m, tp, a):
         print(f'  restart {n}: {o.strip()[-200:] or "ok"}')
     if os.path.isdir(attic):
         print(f'  unknown-provenance originals saved under {os.path.relpath(attic, PF)}')
-    time.sleep(5 if rc else 0)
+    time.sleep(5)
+    cs = cs_invalid_since(mark)
+    if cs is None:
+        print('  kernel log check: no live kernel log (logs/live-*.txt) to check for cs_invalid_page')
+    elif cs:
+        print(f'  kernel log check: FAILED, {len(cs)} new cs_invalid_page line(s) (a file was written over a mapped binary?):')
+        for l in cs[:5]:
+            print('    ' + l)
+        failed += 1
+    else:
+        print('  kernel log check: no new cs_invalid_page lines')
     d2 = Dump(take_dump(m, tp))
     dr2 = compute_diff(m, d2)
     print('\nafter apply:')
@@ -967,8 +1034,25 @@ def as_list(x):
     return [] if not x else [x] if isinstance(x, str) else list(x)
 
 
-def install_file(tp, e):
-    src = os.path.join(PF, e['source'])
+def source_path(e, m=None):
+    """local file for an entry's source: PF-relative path, or repo:PATH (from the manifest's git ref, else REPO)"""
+    src = e['source']
+    if not src.startswith('repo:'):
+        return os.path.join(PF, src)
+    rel = src[len('repo:'):]
+    spec = (m or {}).get('_spec', default_spec())
+    out = os.path.join(STATE, 'tmp', 'repo-src', rel)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if spec.startswith('git:'):
+        open(out, 'wb').write(git_show(spec.split(':', 2)[1], rel))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(spec)))
+        open(out, 'wb').write(open(os.path.join(base, rel), 'rb').read())
+    return out
+
+
+def install_file(tp, e, m=None):
+    src = source_path(e, m)
     if not os.path.isfile(src):
         print(f"  {e['path']}: source {e['source']} not found")
         return 1
@@ -1136,9 +1220,9 @@ def cmd_adopt(d, a, base=None):
             continue
         if p in mg['roots'] and not re.search(r'\.(bundle|driver|app)$', p):
             continue
-        if any(p.startswith(b + '/') for b in seen_bundle):
-            continue
         why = None if gmatch(p, mg['stock']) else retire_reason(p, x)
+        if any(p.startswith(b + '/') for b in seen_bundle) and not why:
+            continue
         if why and gmatch(p, mg['volatile']) and 'MB log' not in why:
             why = None  # written by something running (logs, modem-profiles-*.bak): not a leftover
         if why:
@@ -1288,13 +1372,13 @@ def adopt_file(d, p, x, by, idx, firmware=False):
 
 def adopt_bundle(d, p, by, idx, skip=()):
     files = {q[len(p) + 1:]: d.sha.get(q, '') for q, x in sorted(d.files.items())
-             if q.startswith(p + '/') and x['type'] == 'f' and not gmatch(q, skip)}
+             if q.startswith(p + '/') and x['type'] == 'f' and not gmatch(q, skip) and not retire_reason(q, x)}
     srcs = {}
+    allby = by_sha_all(idx) if by else {}
     for rel, h in files.items():
-        s = by.get(h)
-        if s and s.endswith('/' + rel):
-            srcs.setdefault(s[:-len(rel) - 1], 0)
-            srcs[s[:-len(rel) - 1]] += 1
+        for s in allby.get(h, []):
+            if s.endswith('/' + rel):
+                srcs[s[:-len(rel) - 1]] = srcs.get(s[:-len(rel) - 1], 0) + 1
     src = max(srcs, key=srcs.get) if srcs else 'unknown'
     e = {'path': p, 'source': src}
     si = src_info(idx, src)
@@ -1514,6 +1598,8 @@ def main(argv):
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--retire', action='store_true')
+    ap.add_argument('--only-new', action='store_true', help='apply: only paths that do not exist yet; no restarts')
+    ap.add_argument('--include-held', action='store_true', help='apply: also entries with hold = "..."')
     ap.add_argument('--temp', action='store_true')
     ap.add_argument('--out')
     ap.add_argument('--known-good')
