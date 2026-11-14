@@ -1890,7 +1890,7 @@ extern uint32_t sweet_bl_trace, sweet_bl_fix;
 SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_trace, 0,
     "SWEET BLT: 1 backlight/AppleCLCD property reads+writes, 2 IOMFB user-client calls (1099)");
 SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_fix, 0,
-    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd");
+    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; 1100: 8 backlight-calibration-parameters (at boot)");
 SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");

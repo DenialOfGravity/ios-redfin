@@ -538,7 +538,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
  */
 extern "C" {
 uint32_t sweet_bl_trace = 3;
-uint32_t sweet_bl_fix = 7;
+uint32_t sweet_bl_fix = 15;     /* 1100: + 8 (backlight-calibration-parameters) */
 }
 static IOSimpleLock *sweet_blt_lock;
 static uint64_t sweet_blt_refill;
@@ -602,6 +602,46 @@ sweet_blt_fmt(const OSObject *co, char *buf, size_t len)
 	}
 }
 
+/*
+ * 1100: reads are logged once per (process, service, key, present/absent) instead of rate-limited (1099's
+ * limiter dropped the 72 lines that mattered at a cold boot); writes are always logged.
+ */
+static uint32_t sweet_blt_seen[1024];
+static uint32_t sweet_blt_nseen;
+
+static bool
+sweet_blt_first(int pid, const char *svc, const char *key, bool found)
+{
+	uint32_t h = 2166136261u;
+	for (const char *q = svc; *q; q++) {
+		h = (h ^ (uint8_t)*q) * 16777619u;
+	}
+	for (const char *q = key; *q; q++) {
+		h = (h ^ (uint8_t)*q) * 16777619u;
+	}
+	h = (h ^ (uint32_t)pid) * 16777619u;
+	h = (h ^ (found ? 1u : 2u)) * 16777619u;
+	h |= 1;
+	if (sweet_blt_lock == NULL) {
+		return false;
+	}
+	bool first = true;
+	IOSimpleLockLock(sweet_blt_lock);
+	for (uint32_t i = 0; i < sweet_blt_nseen; i++) {
+		if (sweet_blt_seen[i] == h) {
+			first = false;
+			break;
+		}
+	}
+	if (first && sweet_blt_nseen < sizeof(sweet_blt_seen) / sizeof(sweet_blt_seen[0])) {
+		sweet_blt_seen[sweet_blt_nseen++] = h;
+	} else if (first) {
+		first = false;  /* table full: no more read lines */
+	}
+	IOSimpleLockUnlock(sweet_blt_lock);
+	return first;
+}
+
 /* what: "read", "write", "read-all"; user-space callers only */
 static void
 sweet_blt_prop(const char *svc, const char *what, const char *key, const OSObject *value)
@@ -611,8 +651,11 @@ sweet_blt_prop(const char *svc, const char *what, const char *key, const OSObjec
 	}
 	int pid = proc_selfpid();
 	uint32_t dropped = 0;
-	if (pid <= 0 || !sweet_blt_take(&dropped)) {
+	if (pid <= 0) {
 		return;
+	}
+	if (what[0] == 'r' && !sweet_blt_first(pid, svc, key, value != NULL || what[4] == '-')) {
+		return;         /* 1100: reads once each */
 	}
 	char name[32], v[96];
 	proc_selfname(name, sizeof(name));
@@ -845,6 +888,7 @@ public:
 	bool fNitsDone;
 	void publish(uint32_t level);
 	void publishNits(uint32_t level);
+	void publishCalibration(void);  /* 1100 */
 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 	using IOService::copyProperty;
 	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;      /* 1099: kern.sweet_bl_trace */
@@ -943,10 +987,57 @@ AppleARMBacklight::publishNits(uint32_t level)
 		for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
 			setProperty(fixed[i].key, (unsigned long long)fixed[i].value, 32);
 		}
+		publishCalibration();   /* 1100 */
 		fNitsDone = true;
 		IOLog("SWEET BL: 0973 nits published: %u..%u nits (sweetnits=0: off)\n", SWEET_BL_MIN_NITS, SWEET_BL_MAX_NITS);
 	}
 	setProperty("brightness-nits", (unsigned long long)nits, 32);
+}
+
+/*
+ * redfin 1100 (kern.sweet_bl_fix & 8 at boot, default on): the panel luminance CoreBrightness really reads.
+ * CBDisplayModuleHIDiOS's Display init (CoreBrightness 0x1af0d8a2c..0x1af0d8c88) takes "backlight-calibration-
+ * parameters" from the backlight service (IORegistryEntryCreateCFProperty, no search), a dictionary of numbers read
+ * as float: lMaxProduct/lMidProduct/lMinProduct, lMaxPanel/lMidPanel/lMinPanel (nits), current-for-max/mid-backlight,
+ * hardware-max-current-limit, milliAmps2NitsScaleFactor. Absent (as with 0973's keys, which it never reads), its panel
+ * range stays at the defaults 0..1 nit: backboardd logs "End ramp: ... Lmin = 0.000000, Lmax = 1.000000", "Factor=1
+ * ... maxPanel=1.000000 minPanel=0.000000", "Changing nitsCap to 1.000000". At a cold boot auto-brightness turns on
+ * at the first ALS sample and ramps to its target clamped to that 1 nit ("Begin ramp: L_target=1.0000 Lmax=1.000000",
+ * then backboardd "brightness change:0.000977517 reason:BrightnessSystemDidChange"): DBV 1 of 1023, and every slider
+ * position maps to the same 1 nit. After a backboardd restart auto-brightness stays inactive and the slider's
+ * DisplayBrightness goes straight to the backlight. D22AP's ADT /backlight has LmaxProduct 674, LmidProduct 155,
+ * LminProduct 2 (16.16); here the S6E3HC2 at the 500 nits 0906/0973 assume, mid 155, min 2. The current keys are
+ * left out (CoreBrightness keeps its defaults for them, as now).
+ */
+void
+AppleARMBacklight::publishCalibration(void)
+{
+	if (!(sweet_bl_fix & 8)) {
+		IOLog("SWEET BL: 1100 backlight-calibration-parameters not published (kern.sweet_bl_fix & 8 off)\n");
+		return;
+	}
+	static const struct {
+		const char *key;
+		uint32_t value;
+	} cal[] = {
+		{ "lMaxProduct", SWEET_BL_MAX_NITS }, { "lMidProduct", 155 }, { "lMinProduct", SWEET_BL_MIN_NITS },
+		{ "lMaxPanel", SWEET_BL_MAX_NITS }, { "lMidPanel", 155 }, { "lMinPanel", SWEET_BL_MIN_NITS },
+	};
+	OSDictionary *d = OSDictionary::withCapacity(sizeof(cal) / sizeof(cal[0]));
+	if (d == NULL) {
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(cal) / sizeof(cal[0]); i++) {
+		OSNumber *n = OSNumber::withNumber((unsigned long long)cal[i].value, 32);
+		if (n != NULL) {
+			d->setObject(cal[i].key, n);
+			n->release();
+		}
+	}
+	setProperty("backlight-calibration-parameters", d);
+	d->release();
+	IOLog("SWEET BL: 1100 backlight-calibration-parameters published: lMax/lMid/lMin Panel+Product %u/155/%u nits\n",
+	    SWEET_BL_MAX_NITS, SWEET_BL_MIN_NITS);
 }
 
 IOReturn
@@ -961,8 +1052,7 @@ AppleARMBacklight::setProperties(OSObject *properties)
 	int32_t v = (int32_t)b->unsigned32BitValue();
 	uint32_t level = v < 0 ? 0 : (uint32_t)v > SWEET_BL_MAX ? SWEET_BL_MAX : (uint32_t)v;
 	static uint32_t logs;
-	uint32_t dropped = 0;
-	if (logs++ < 8 || ((sweet_bl_trace & 1) && sweet_blt_take(&dropped))) {    /* 1099: rate-limited, not 8 a boot */
+	if (logs++ < 8 || (sweet_bl_trace & 1)) {      /* 1099/1100: every one while tracing */
 		IOLog("SWEET BL: backlight brightness %u\n", level);
 	}
 	fFB->blSet(level);
@@ -5046,7 +5136,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	}
 	SWEET_TRACE_END(SWT_IOMFB_SEL, selector, ret, out[0], traceSwap);      /* 0994 */
 	if ((sweet_bl_trace & 2) && selector != kSweetFBSwapBegin && selector != kSweetFBSwapEnd &&
-	    selector != kSweetFBSwapWait && selector != kSweetFBGetCurrentAbsoluteTime) {
+	    selector != kSweetFBSwapWait && selector != kSweetFBGetCurrentAbsoluteTime &&
+	    selector != kSweetFBNotifications) {         /* 1100: 72 toggles the vsync callback ~20 times a second */
 		uint32_t dropped = 0;
 		if (sweet_blt_take(&dropped)) {         /* 1099 */
 			char name[32];
