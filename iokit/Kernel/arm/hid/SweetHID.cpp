@@ -879,6 +879,7 @@ public:
 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return gSweetSensorInfo[sensorIndex()].usage; }
 
 	int post(const struct sweet_motion_sample *s, IOHIDEvent **built = NULL);
+	void noteReal(void) { OSIncrementAtomic64((volatile SInt64 *)&fReal); }     /* 1099: a sample from sensd/poke */
 	int status(char *buf, int len);
 	void want(struct sweet_motion_want *w);
 	void relog();
@@ -903,6 +904,9 @@ private:
 	uint32_t        fLogged, fCopyTypes, fClients;
 	uint32_t        fInterval, fIntervalSet;
 	uint64_t        fEvents;
+	uint64_t        fReal;          /* 1099: samples from user space (sensd, poke m) */
+	uint64_t        fKeep;          /* 1099: keep-alive samples sent */
+	void            keepAliveArm(void);
 };
 OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
 
@@ -1102,6 +1106,7 @@ SweetHIDSensor::setProperties(OSObject *properties)
 	if (!it) {
 		return kIOReturnNoMemory;
 	}
+	bool armKeep = false;
 	IOLockLock(fLock);
 	while (const OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
 		OSObject *value = dict->getObject(key);
@@ -1110,6 +1115,7 @@ SweetHIDSensor::setProperties(OSObject *properties)
 		if (n && key->isEqualTo(kIOHIDReportIntervalKey)) {
 			fInterval = n->unsigned32BitValue();
 			fIntervalSet = 1;
+			armKeep = true;
 		}
 		/* Keep the sensor settings visible in the registry, as IOHIDEventService does. */
 		if (n && (key->isEqualTo(kIOHIDReportIntervalKey) || key->isEqualTo(kIOHIDBatchIntervalKey) ||
@@ -1120,7 +1126,32 @@ SweetHIDSensor::setProperties(OSObject *properties)
 	}
 	IOLockUnlock(fLock);
 	it->release();
+	if (armKeep) {
+		keepAliveArm();         /* 1099 */
+	}
 	return kIOReturnSuccess;
+}
+
+/*
+ * redfin 1099 (kern.sweet_bl_fix & 4, default on): until sensd's first ALS sample, a neutral 100 lux sample at the
+ * client's ReportInterval (100 ms at the fastest), as long as the client asks for samples (ReportInterval > 0).
+ * At a cold boot CoreBrightness configures the ALS and turns the display on at ~55 s, but sensd only starts at
+ * ~85 s: CoreBrightness then had one 100 lux sample (the 500 ms initial event, sent before it set ReportInterval)
+ * and nothing else; after a backboardd restart it starts with sensd's samples flowing. Log: "SWEET MOTION: als
+ * keep-alive". Stops for good at the first real sample.
+ */
+extern "C" uint32_t sweet_bl_fix;
+void
+SweetHIDSensor::keepAliveArm(void)
+{
+	if (sensorIndex() != SWEET_SENSOR_ALS || !(sweet_bl_fix & 4) || fReal != 0 || fInitTimer == NULL) {
+		return;
+	}
+	uint32_t us = fInterval;
+	if (us == 0) {
+		return;
+	}
+	fInitTimer->setTimeoutUS(us < 100000 ? 100000 : us);
 }
 
 IOHIDEvent *
@@ -1179,6 +1210,18 @@ SweetHIDSensor::initialFired(OSObject *owner, IOTimerEventSource *sender __unuse
 		struct sweet_motion_sample s = { 12, 3, 0, { 0x42c80000 /* 100.0f */, 0, 0, 0 } };
 		IOLog("SWEET MOTION: als: initial 100 lux event (%u clients)\n", self->fClients);
 		self->post(&s);
+		self->keepAliveArm();   /* 1099 */
+	} else if (self->sensorIndex() == SWEET_SENSOR_ALS && (sweet_bl_fix & 4) && self->fReal == 0 &&
+	    self->fClients != 0 && self->fIntervalSet && self->fInterval != 0) {
+		/* 1099: keep-alive until sensd */
+		struct sweet_motion_sample s = { 12, 3, 0, { 0x42c80000 /* 100.0f */, 0, 0, 0 } };
+		uint64_t k = ++self->fKeep;
+		if (k <= 3 || (k & (k - 1)) == 0) {
+			IOLog("SWEET MOTION: als keep-alive #%llu: 100 lux every %u us until sensd (1099, kern.sweet_bl_fix & 4)\n",
+			    k, self->fInterval);
+		}
+		self->post(&s);
+		self->keepAliveArm();
 	}
 }
 
@@ -1435,6 +1478,7 @@ sweet_hid_sensor(const struct sweet_motion_sample *s)
 	if (!gSweetSensors[i]) {
 		return ENODEV;
 	}
+	gSweetSensors[i]->noteReal();   /* 1099: ends the ALS keep-alive */
 	return gSweetSensors[i]->post(s);
 }
 

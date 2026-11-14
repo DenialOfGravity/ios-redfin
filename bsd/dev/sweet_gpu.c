@@ -1881,6 +1881,16 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase_grid, CTLTYPE_INT | CTLFLAG_RW | C
 /* redfin 1060: read-only frame counter for the FPS overlay (iokit/Kernel/arm/SweetFramebuffer.cpp) */
 extern uint64_t sweet_fb_frames;
 extern uint32_t sweet_fb_hz;
+/*
+ * 1099: the cold-boot brightness bug (SweetFramebuffer.cpp, SweetHID.cpp). kern.sweet_bl_trace bit 0 property
+ * reads/writes of AppleARMBacklight + AppleCLCD, bit 1 IOMFB calls ("SWEET BLT:", rate-limited); kern.sweet_bl_fix
+ * bit 0 IOMFBBrightnessLevel = factor (no DCS), bit 1 boot value 1.0, bit 2 ALS keep-alive until sensd.
+ */
+extern uint32_t sweet_bl_trace, sweet_bl_fix;
+SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_trace, 0,
+    "SWEET BLT: 1 backlight/AppleCLCD property reads+writes, 2 IOMFB user-client calls (1099)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_fix, 0,
+    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd");
 SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
