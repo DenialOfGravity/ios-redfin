@@ -793,6 +793,8 @@ int hakios_metal_format_block(unsigned pixelFormat, unsigned* blockW, unsigned* 
     return 1;
 }
 
+int hakios_metal_depth16_on(void) { return depth16On() ? 1 : 0; }   // (redfin hm-int5)
+
 int hakios_metal_texture_replace(hakios_metal_texture* t, unsigned x, unsigned y, unsigned w, unsigned h, const void* bytes, uint64_t bytesPerRow) {
     return hakios_metal_texture_replace_level(t, 0, x, y, w, h, bytes, bytesPerRow);
 }
@@ -1584,6 +1586,7 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         for (int i = 0; i < 4; i++) d.blendColor[i] = pass->blend_color[i];
         if (pass->depth_state_set) d.depth = DepthState{pass->depth_compare, pass->depth_write != 0};
         d.cullMode = pass->cull_mode;
+        d.depthBias = DepthBias{pass->depth_bias, pass->depth_slope_scale, pass->depth_bias_clamp};   // (redfin hm-int5)
         d.winding = pass->winding;
         if (pass->stencil_state_set) {
             auto face = [](const hakios_metal_render_pass::hakios_metal_stencil_face& f) {

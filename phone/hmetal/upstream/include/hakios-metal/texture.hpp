@@ -212,6 +212,9 @@ inline uint32_t blocksDown(const FormatInfo& f, uint32_t height) { return (heigh
 const FormatInfo* formatInfo(PixelFormat format);
 
 // the layout rule in one place, for the tests and for the plug-in's bufferBytesPerRow
+// (redfin hm-int5) HM_DEPTH16=1 (default): Depth16Unorm served as a depth attachment end to end (its tiled pitch to 256
+// bytes, PITCHALIGN 2, the RB's DEPTH6_16); 0: as hm-int4 (pitch to 128 bytes; the plug-in refuses 250 in a pipeline)
+bool depth16On();
 uint64_t texturePitch(const FormatInfo& format, uint32_t width);                    // align(width * cpp, 64 * cpp)
 uint64_t textureBytes(const FormatInfo& format, uint32_t width, uint32_t height, uint32_t levels = 1);   // align(align(height, 4) * pitch, 4096) for one level
 

@@ -561,11 +561,19 @@ void Texture::xrWriteBack(const XrTarget& t) const {
 #endif
 }
 
+bool depth16On() {
+    static const bool on = [] { const char* e = getenv("HM_DEPTH16"); return e == nullptr || e[0] == 0 || atoi(e) != 0; }();
+    return on;
+}
+
 uint64_t texturePitch(const FormatInfo& format, uint32_t width) {
     // fd6_layout.c:181-201 for a layout the driver chooses: pitchalign = cpp_shift, then pitch0 = align(width * cpp,
     // 1 << (pitchalign + 6)) = align(width * cpp, 64 * cpp); so a row is a multiple of 64 pixels
     // (a block format counts blocks across, as fdl_set_pitchalign does: nblocksx * cpp, cpp the block's bytes)
     uint64_t unit = 64ull * format.bytesPerPixel;
+    // (redfin hm-int5) a 2-byte depth (Depth16Unorm, tiled): fdl6_tile_alignment gives cpp 2 a pitchalign of 2, not
+    // cpp_shift 1, so its rows are a multiple of 256 bytes (128 texels), as a 4-byte depth's are; HM_DEPTH16=0: 128
+    if (format.depth && format.bytesPerPixel == 2 && depth16On()) unit = 256;
     return (uint64_t(blocksAcross(format, width)) * format.bytesPerPixel + unit - 1) / unit * unit;
 }
 
@@ -1154,7 +1162,9 @@ bool Texture::readSlices(uint32_t level, uint32_t x, uint32_t y, uint32_t z, uin
 a6xx::TexConst Texture::sampledDescriptor() const {
     // PITCHALIGN = log2(pitch alignment / 64) = log2(cpp) for the pitch texturePitch chose (fd6_layout.c:194-201, fd6_view.c:244);
     // a surface's rows carry the alignment their pitch has, wrapSurface worked it out
-    a6xx::TexConst d = texture2d(gpuAddress(), desc_.width, desc_.height, uint32_t(pitch_), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),
+    // (redfin hm-int5) a Depth16Unorm's layout has fdl6's tiled pitchalign 2 (texturePitch), so its PITCHALIGN is 2
+    const uint32_t ownAlign = info_->depth && info_->bytesPerPixel == 2 && desc_.samples == 1 && depth16On() ? 2u : log2u(info_->bytesPerPixel);
+    a6xx::TexConst d = texture2d(gpuAddress(), desc_.width, desc_.height, uint32_t(pitch_), pitchAlign_ != ~0u ? pitchAlign_ : ownAlign,
                                  info_->fmt6, info_->swap, info_->hasAlpha, info_->srgb, desc_.mipLevels, desc_.mipLevels > 1 ? buffer_->length() : 0);
     if (desc_.type == TextureType::k1D) {
         d.dword[2] = (d.dword[2] & ~A6XX_TEX_CONST_2_TYPE__MASK) | A6XX_TEX_CONST_2_TYPE(A6XX_TEX_1D);

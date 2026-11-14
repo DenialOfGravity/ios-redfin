@@ -3532,6 +3532,80 @@ TEST(the_fake_refuses_a_depth_draw_that_does_not_hold_together) {
     }
 }
 
+// (redfin hm-int5) Depth16Unorm (250, PridePosterExtension's) as a draw's depth attachment, end to end: fdl6's tiled
+// layout at cpp 2 (pitch to 256 bytes: 136 texels -> 272 -> 512, where hm-int4's 128-byte unit gave 384), DEPTH6_16 (1)
+// in RB_DEPTH_BUFFER_INFO and GRAS_SU_DEPTH_BUFFER_INFO, the depth Clear a CP_BLIT into FMT6_16_UNORM TILE6_3 through
+// R2D_FLOAT32 with the float's bits (tu_clear_blit.cc: Z16 is R2D_FLOAT32 too), the test and bias registers as a
+// Depth32Float's (the RB scales the bias by the format), the stream run by the fake GPU, which now models DEPTH6_16; its
+// sampled view FMT6_16_UNORM, TILE6_3, PITCHALIGN 2
+TEST(a_depth16_attachment_is_drawn_tested_cleared_and_sampled) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r, 136, 40);
+    auto d = target(r, 136, 40, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kDepth16Unorm);
+    CHECK(t != nullptr && d != nullptr);
+    if (t == nullptr || d == nullptr) return;
+    CHECK_EQ(d->bytesPerRow(), 512u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    pass.depth = d.get();
+    pass.depthLoad = LoadAction::kClear;
+    pass.clearDepth = 1.0;
+    Draw dr = wholeDraw();
+    dr.depth = DepthState{1, true};   // Less, write
+    dr.depthBias = DepthBias{2.0f, 1.5f, 0.0f};
+    Encoded e(r, flatProgram(), pass, dr);
+    CHECK(e.ok);
+    if (!e.ok) {
+        std::printf("       %s\n", e.error.c_str());
+        return;
+    }
+    CHECK_EQ(e.reg(REG_A6XX_RB_DEPTH_BUFFER_INFO), uint32_t(DEPTH6_16));
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), uint32_t(DEPTH6_16));
+    CHECK_EQ(e.reg(REG_A6XX_RB_DEPTH_BUFFER_PITCH), 512u >> 6);
+    CHECK_EQ(e.reg(REG_A6XX_RB_DEPTH_CNTL), 0x47u);
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_DEPTH_CNTL), 1u);
+    CHECK_EQ(e.reg(REG_A6XX_RB_2D_DST_INFO), uint32_t(FMT6_16_UNORM) | 3u << 8);
+    CHECK_EQ(e.reg(REG_A6XX_RB_2D_SRC_SOLID_C0), 0x3f800000u);
+    // the bias as given (slope 1.5, 2 units: the RB scales the units by Z16's resolution), POLY_OFFSET on
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_POLY_OFFSET_SCALE), 0x3fc00000u);
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_POLY_OFFSET_OFFSET), 0x40000000u);
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_POLY_OFFSET_OFFSET_CLAMP), 0u);
+    CHECK((e.reg(REG_A6XX_GRAS_SU_CNTL) & A6XX_GRAS_SU_CNTL_POLY_OFFSET) != 0);
+    {
+        Raw raw(r);
+        CHECK_EQ(raw.submit(e.stream.words()), 0);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        if (r.fake->stats().faults != 0) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+    }
+    // the hm-int4 layout (pitch 384) is what the fake now refuses: a DEPTH6_16 pitch is a multiple of 256
+    {
+        std::vector<uint32_t> w = e.stream.words();
+        w[e.findReg(REG_A6XX_RB_DEPTH_BUFFER_PITCH)] = 384u >> 6;
+        CHECK(has(faultOf(r, w), "not 4096-aligned, not a multiple of 256 a sample"));
+    }
+    const TexConst c = d->sampledDescriptor();
+    CHECK_EQ((c.dword[0] & A6XX_TEX_CONST_0_FMT__MASK) >> A6XX_TEX_CONST_0_FMT__SHIFT, uint32_t(FMT6_16_UNORM));
+    CHECK_EQ((c.dword[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_3));
+    CHECK_EQ((c.dword[2] & A6XX_TEX_CONST_2_PITCHALIGN__MASK) >> A6XX_TEX_CONST_2_PITCHALIGN__SHIFT, 2u);
+    // a pass that only clears it, through a command buffer on the fake: one tiled fill, no fault
+    RenderPass depthOnly = pass;
+    depthOnly.load = LoadAction::kLoad;
+    const uint32_t faultsBefore = r.fake->stats().faults, fillsBefore = r.fake->stats().tiledFills;   // (the one above)
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->clear(depthOnly));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, faultsBefore);
+    CHECK_EQ(r.fake->stats().tiledFills, fillsBefore + 1);
+    // GMEM keeps a pass with a depth attachment in sysmem, for Depth16Unorm as for Depth32Float
+    render::GmemPlan plan;
+    std::string why;
+    CHECK(!render::gmemPlan(pass, &plan, &why));
+    CHECK(has(why, "with depth or stencil: sysmem"));
+}
+
 // --- a texture over an IOSurface: the path to the screen's memory -----------------------------------------------------------
 
 TEST(a_texture_over_an_iosurface_draws_into_the_surfaces_memory) {

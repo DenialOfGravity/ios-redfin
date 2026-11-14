@@ -953,7 +953,8 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     const uint32_t bpp = bytesPerPixel(fmt);
     // a linear image of a known format, or the one tiled image this driver makes: a depth texture (FMT6_32_FLOAT, TILE6_3)
     const uint32_t tile = fieldOf(info, A6XX_RB_2D_DST_INFO_TILE_MODE__MASK, A6XX_RB_2D_DST_INFO_TILE_MODE__SHIFT);
-    const bool tiled = tile == TILE6_3 && (fmt == FMT6_32_FLOAT || fmt == FMT6_8_UINT);
+    // (redfin hm-int5) or a Depth16Unorm's (FMT6_16_UNORM, TILE6_3), filled as tu_clear_blit.cc clears Z16: R2D_FLOAT32
+    const bool tiled = tile == TILE6_3 && (fmt == FMT6_32_FLOAT || fmt == FMT6_8_UINT || (fmt == FMT6_16_UNORM && !copy));
     // ...or a UBWC one (TILE6_3 with FLAGS, RGBA8-sized, WZYX): what a copy fills a compressed texture through
     const bool ubwc = copy && tile == TILE6_3 && (info & A6XX_RB_2D_DST_INFO_FLAGS) != 0 && fmt == FMT6_8_8_8_8_UNORM &&
                       fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
@@ -975,6 +976,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     case FMT6_32_FLOAT: case FMT6_32_32_FLOAT: case FMT6_32_32_32_32_FLOAT: want = R2D_FLOAT32; break;
     case FMT6_32_UINT: case FMT6_32_32_32_32_UINT: want = R2D_INT32; break;
     case FMT6_8_UINT: want = R2D_INT8; break;
+    case FMT6_16_UNORM: want = tiled ? uint32_t(R2D_FLOAT32) : 0u; break;   // (redfin hm-int5) Z16's clear
     default: break;
     }
     if (ifmt != want) {
@@ -1777,8 +1779,8 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                 return false;
             }
         } else {
-            if (depthFormat != DEPTH6_32 || fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0) != depthFormat) {
-                fault(text("depth format %llu in RB_DEPTH_BUFFER_INFO and %llu in GRAS_SU_DEPTH_BUFFER_INFO: DEPTH6_32 in both is what this GPU model runs", depthFormat,
+            if ((depthFormat != DEPTH6_32 && depthFormat != DEPTH6_16) || fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0) != depthFormat) {
+                fault(text("depth format %llu in RB_DEPTH_BUFFER_INFO and %llu in GRAS_SU_DEPTH_BUFFER_INFO: DEPTH6_32 or DEPTH6_16 in both is what this GPU model runs", depthFormat,
                            fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0)));
                 return false;
             }
@@ -1795,7 +1797,11 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             const uint64_t width = (br & 0x3fff) + 1, rows = ((br >> 16 & 0x3fff) + 1 + 15) / 16 * 16;
             // (a multisample one holds the draw's sample count of 4-byte depths a texel: fdl6's cpp 4 * samples, its pitch a
             // multiple of 64 such texels)
-            if (base % 4096 != 0 || pitch % (256 * d.samples) != 0 || pitch < width * 4 * d.samples || at(base, rows * pitch) == nullptr) {
+            // (redfin hm-int5) DEPTH6_16: 2-byte depths, cpp 2 * samples, its pitch fdl6's 64 << max(log2(cpp), 2) bytes
+            const uint64_t cpp = (depthFormat == DEPTH6_16 ? 2ull : 4ull) * d.samples;
+            uint64_t unit = 256;
+            while (unit < 64 * cpp) unit *= 2;
+            if (base % 4096 != 0 || pitch % unit != 0 || pitch < width * cpp || at(base, rows * pitch) == nullptr) {
                 fault(text("the depth buffer at %#llx with a pitch of %llu bytes, ", base, pitch) + text("%llu rows, ", rows) +
                       text("%llu sample(s): not 4096-aligned, not a multiple of 256 a sample, narrower than the window, or outside every buffer", d.samples));
                 return false;

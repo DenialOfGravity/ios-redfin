@@ -323,6 +323,15 @@ struct DepthState {
     bool write = false;
 };
 
+// (redfin hm-int5) -setDepthBias:slopeScale:clamp:, the encoder's state each draw reads: GRAS_SU_POLY_OFFSET_SCALE,
+// _OFFSET and _OFFSET_CLAMP as tu6_emit_depth_bias writes them (the RB scales the constant by the depth format's
+// resolution: 2^-16 for DEPTH6_16, the exponent's for DEPTH6_32), GRAS_SU_CNTL POLY_OFFSET when any is not 0 and the
+// pass has a depth attachment. All 0 is Metal's default (no bias). HM_DEPTH_BIAS=0: never applied (as hm-int4).
+struct DepthBias {
+    float constant = 0.0f, slope = 0.0f, clamp = 0.0f;
+    bool any() const { return constant != 0.0f || slope != 0.0f || clamp != 0.0f; }
+};
+
 // MTLDepthStencilDescriptor's stencil half, the encoder's state each draw reads, and -setStencilReferenceValue:. A
 // face's COMPARE is an MTLCompareFunction and its three operations MTLStencilOperations (Keep 0 .. DecrementWrap 7),
 // which are adreno_compare_func's and adreno_stencil_op's numbers; ENABLED false is Metal's default (no
@@ -362,6 +371,7 @@ struct Draw {
     Scissor scissor{};                           // width 0: the whole target
     float blendColor[4] = {0, 0, 0, 0};          // -setBlendColorRed:green:blue:alpha: (RB_BLEND_*_F32), read by the BlendColor/BlendAlpha factors
     DepthState depth{};                          // -setDepthStencilState: (refused with a depth test and no depth attachment)
+    DepthBias depthBias{};                       // (redfin hm-int5) -setDepthBias:slopeScale:clamp:
     StencilState stencil{};                      // ...its stencil half (refused enabled with no stencil attachment)
     // -setVisibilityResultMode:offset: over the pass's visibilityResultBuffer: VISIBILITY_MODE an MTLVisibilityResultMode
     // (Disabled 0, Boolean 1, Counting 2). Either kept mode adds the samples the draw lets through (depth and stencil

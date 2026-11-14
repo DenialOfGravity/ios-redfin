@@ -245,6 +245,8 @@ unsigned hakios_metal_texture_bytes_per_pixel(hakios_metal_texture *texture);
 /* PIXEL_FORMAT's element as the core lays it out: BLOCK_W x BLOCK_H texels (1 x 1 but for a compressed format) in BYTES
  * bytes. 0 with the reason when the format is not served. */
 int hakios_metal_format_block(unsigned pixel_format, unsigned *block_w, unsigned *block_h, unsigned *bytes);
+/* (redfin hm-int5) 1 when Depth16Unorm (250) is served as a depth attachment (HM_DEPTH16, default 1), else 0 */
+int hakios_metal_depth16_on(void);
 /* a 3D texture (MTLTextureType3D) of DEPTH slices, one level, sampled alone (usage 1); its slices written and read as
  * -replaceRegion:...slice:withBytes:bytesPerRow:bytesPerImage: has them, Z to Z + D - 1 */
 hakios_metal_texture *hakios_metal_texture_new_3d(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
@@ -444,6 +446,8 @@ struct hakios_metal_render_pass {
 	unsigned color0_slice;                    /* color0's layer, face or plane drawn into (MTLRenderPassAttachmentDescriptor.slice) */
 	unsigned depth_level;                     /* the depth attachment's mip level drawn into */
 	unsigned depth_slice;                     /* a depth 2D array's layer drawn into (MTLRenderPassDepthAttachmentDescriptor.slice) */
+	/* (redfin hm-int5) -setDepthBias:slopeScale:clamp:, each draw reads them; 0 0 0 (a zeroed struct) is no bias */
+	float depth_bias, depth_slope_scale, depth_bias_clamp;
 };
 
 /* One draw: PROGRAM over VERTEX_COUNT vertices from VERTEX_START, PRIMITIVE an MTLPrimitiveType (Point 0, Line 1,

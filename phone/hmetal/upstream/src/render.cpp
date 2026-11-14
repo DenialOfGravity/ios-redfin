@@ -2048,13 +2048,17 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // first vertex provokes, no restart)
     if (o.rast) {
         reg(stream, REG_A6XX_GRAS_CL_CNTL, grasClCntl());
-        reg(stream, REG_A6XX_GRAS_SU_CNTL, grasSuCntl(draw.cullMode == 1, draw.cullMode == 2, draw.winding == 0));
+        // (redfin hm-int5) the draw's depth bias (DepthBias), with a depth attachment and HM_DEPTH_BIAS (default 1)
+        static const bool biasOn = [] { const char* e = getenv("HM_DEPTH_BIAS"); return e == nullptr || e[0] == 0 || atoi(e) != 0; }();
+        const bool bias = biasOn && pass.depth != nullptr && draw.depthBias.any();
+        reg(stream, REG_A6XX_GRAS_SU_CNTL, grasSuCntl(draw.cullMode == 1, draw.cullMode == 2, draw.winding == 0, 2, RECTANGULAR, bias));
         reg(stream, REG_A6XX_VPC_POLYGON_MODE, A6XX_VPC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
         reg(stream, REG_A6XX_PC_POLYGON_MODE, A6XX_PC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
         reg(stream, REG_A6XX_PC_RASTER_CNTL, 0);
         reg(stream, REG_A6XX_VPC_UNKNOWN_9107, 0);
         regs(stream, REG_A6XX_GRAS_SU_POINT_MINMAX, {grasSuPointMinmax(1, 0xffc0), grasSuPointSize(16)});
-        regs(stream, REG_A6XX_GRAS_SU_POLY_OFFSET_SCALE, {0, 0, 0});
+        regs(stream, REG_A6XX_GRAS_SU_POLY_OFFSET_SCALE,
+             {bias ? fui(draw.depthBias.slope) : 0u, bias ? fui(draw.depthBias.constant) : 0u, bias ? fui(draw.depthBias.clamp) : 0u});
         reg(stream, REG_A6XX_RB_UNKNOWN_8A00, 0);
         reg(stream, REG_A6XX_RB_UNKNOWN_8A10, 0);
         reg(stream, REG_A6XX_RB_UNKNOWN_8A20, 0);

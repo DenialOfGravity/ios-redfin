@@ -2368,6 +2368,40 @@ HMI4_EDITS += [
 EDITS += HMI4_EDITS
 
 
+# ---- hm-int5 ------------------------------------------------------------------------------------------------------
+# (hm-int5 item 1) HM_DEPTH16=1 (default): Depth16Unorm (250) is a depth attachment format a render pipeline may name
+# (PridePosterExtension's), made like Depth32Float (render-target usage, tiled) by usage Unknown and the heap's size
+# rule; the core lays it out and draws it (texture.cpp depth16On). 0: refused as hm-int4.
+# -setDepthBias:slopeScale:clamp: is kept in the pass (depth_bias, depth_slope_scale, depth_bias_clamp) and the core
+# applies it to each later draw with a depth attachment (HM_DEPTH_BIAS=0 there: never).
+HMI5_EDITS = [
+    ('\tif ([d depthAttachmentPixelFormat] != MTLPixelFormatInvalid && [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float &&\n'
+     '\t    [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {\n',
+     '\tif ([d depthAttachmentPixelFormat] != MTLPixelFormatInvalid && [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float &&\n'
+     '\t    [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8 &&\n'
+     '\t    !([d depthAttachmentPixelFormat] == MTLPixelFormatDepth16Unorm && hakios_metal_depth16_on())) {   /* (redfin hm-int5) HM_DEPTH16 */\n'),
+    ('"(260) are the depth formats served", (unsigned long)[d depthAttachmentPixelFormat]];',
+     '"(260) are the depth formats served (Depth16Unorm, 250, too unless HM_DEPTH16=0)", (unsigned long)[d depthAttachmentPixelFormat]];'),
+    ('\t\tif ([descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8) {\n'
+     '\t\t\tusage = MTLTextureUsageRenderTarget;',
+     '\t\tif ([descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8 ||\n'
+     '\t\t    [descriptor pixelFormat] == MTLPixelFormatDepth16Unorm) {   /* (redfin hm-int5) */\n'
+     '\t\t\tusage = MTLTextureUsageRenderTarget;'),
+    ('\tconst BOOL depth = [descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8;\n',
+     '\tconst BOOL depth = [descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8 ||\n'
+     '\t\t\t   [descriptor pixelFormat] == MTLPixelFormatDepth16Unorm;   /* (redfin hm-int5) */\n'),
+    ('\tif (depthBias != 0.0f || slopeScale != 0.0f || clamp != 0.0f) {\n'
+     '\t\tHM_ONCE("a depth bias (%g, slope %g, clamp %g) was set; there is no depth attachment, so it is not applied\\n",\n'
+     '\t\t\t(double)depthBias, (double)slopeScale, (double)clamp);\n'
+     '\t}\n',
+     '\t/* (redfin hm-int5) kept for each later draw; the core applies it with a depth attachment (HM_DEPTH_BIAS) */\n'
+     '\t_pass.depth_bias = depthBias;\n'
+     '\t_pass.depth_slope_scale = slopeScale;\n'
+     '\t_pass.depth_bias_clamp = clamp;\n'),
+]
+EDITS += HMI5_EDITS
+
+
 def apply(src, edits=EDITS):
     for e in edits:
         if len(e) == 2:
