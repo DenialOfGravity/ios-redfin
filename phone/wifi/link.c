@@ -3,9 +3,15 @@
  * qcom_glink_native.c and net/qrtr to talk QMI to the modem. Polled, one
  * channel. The modem is QRTR node 0; we are node 1.
  */
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include "ipcc.h"
 #include "glink.h"
 #include "link.h"
@@ -28,6 +34,49 @@ static uint8_t rxbuf[65536];
 static uint32_t rxoff;
 
 static qrtr_cb_t qrtr_cb;
+
+/*
+ * P4 phase 1 (kernel 1067, research/cc/P4-design.md s.7): with boot-arg sweetbb & 1 the kernel owns the GLINK edge and
+ * QRTR node 1; wland's link is then /dev/sweet-mqrtr ("raw": one QRTR packet per read/write, struct qrtr_hdr + payload,
+ * as on the wire), and everything above (ports, servers, WLFW, cell.c, rmtfs/tftp/pd-mapper, ipaqmi, ssctl) is unchanged.
+ * MQRTR_IOC_UP makes the kernel's link again after our PAS boot (as glink_init did). WLAND_LINK=glink forces the old link.
+ */
+#define MQRTR_DEV	"/dev/sweet-mqrtr"
+#define MQRTR_IOC_UP	_IOW('q', 0x21, uint32_t)
+static int raw_fd = -1;
+
+static int kernel_link_wanted(void)
+{
+	uint32_t v = 0;
+	size_t n = sizeof(v);
+	const char *e = getenv("WLAND_LINK");
+	if (e && !strcmp(e, "glink"))
+		return 0;
+	if (sysctlbyname("kern.sweet_bb", &v, &n, NULL, 0))
+		return 0;
+	return (v & 1) != 0;
+}
+
+/* xnu 1076: with kern.sweet_bb & 0x10 the kernel owns IPA meminit, GSI, IPA QMI (0x31) and DPM: wland keeps the
+ * platform steps (IP0 vote, PAS ipa_fws, SMMU) and SMP2P "ipa", hands over through kern.sweet_ipa_up, and runs no
+ * ipa/ipagsi/ipaqmi bring-up and no data call (X1) of its own. One log line. */
+int link_kernel_data(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		uint32_t b = 0;
+		size_t n = sizeof(b);
+		v = !sysctlbyname("kern.sweet_bb", &b, &n, NULL, 0) && (b & 0x10);
+		if (v)
+			printf("wland: kern.sweet_bb & 0x10: the kernel owns the IPA data path (xnu 1076): wland does IP0/PAS/SMMU + SMP2P \"ipa\" only, no ipa/ipagsi/ipaqmi bring-up, no data call of its own\n");
+	}
+	return v;
+}
+
+int link_is_kernel(void)
+{
+	return raw_fd >= 0;
+}
 
 int verbose_link = 1;
 unsigned link_stats[4];
@@ -224,15 +273,76 @@ static int rx_one(void)
 	return 1;
 }
 
+/*
+ * 2026-11-09 (P2 reg): no re-entrancy. A packet that arrives while a QRTR callback runs or while a qrtr_send waits for a
+ * modem intent is queued (copied) and dispatched by the outermost link_poll; link_idle never runs nested. Before, the
+ * nesting went 4 deep under the router's replay bursts (link.c's per-level copies ran out: "packet not copied"; nested
+ * qrtr_sends shared a TX buffer, so a RESUME_TX could be overwritten by another packet: the modem then never sent to that
+ * port again = NAS answered nobody, wland's cell.c included), and abpbridge_poll ran inside its own forward (its read
+ * buffer overwritten: "abp: bad record", CommCenter requests lost -> ATCS_TIMEOUT).
+ */
+static int cb_depth, send_depth, idle_depth;
+struct rxq { struct rxq *next; struct qrtr_hdr hd; uint32_t n; uint8_t d[]; };
+static struct rxq *qhead, *qtail;
+static unsigned qlen, qmax, qdrop;
+
+static void dispatch(const struct qrtr_hdr *hd, const uint8_t *p, uint32_t pl)
+{
+	cb_depth++;
+	qrtr_cb(hd, p, pl);
+	cb_depth--;
+}
+
+static void drain(void)
+{
+	while (qhead && !cb_depth && !send_depth) {
+		struct rxq *e = qhead;
+		qhead = e->next;
+		if (!qhead)
+			qtail = NULL;
+		qlen--;
+		dispatch(&e->hd, e->d, e->n);
+		free(e);
+	}
+}
+
+void link_queue_stats(unsigned *max, unsigned *dropped)
+{
+	*max = qmax;
+	*dropped = qdrop;
+}
+
+/* one packet from the kernel's link (raw mode); 0 when nothing is waiting */
+static int raw_rx_one(void)
+{
+	static uint8_t pkt[sizeof(struct qrtr_hdr) + 65536 + 64];
+	ssize_t r = read(raw_fd, pkt, sizeof(pkt));
+	if (r <= 0) {
+		if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			static unsigned told;
+			if (told++ < 5)
+				printf("link: %s read: %s\n", MQRTR_DEV, strerror(errno));
+		}
+		return 0;
+	}
+	handle_data(pkt, (uint32_t)r);
+	return 1;
+}
+
 int link_poll(unsigned ms)
 {
 	uint64_t end = now_ms() + ms;
 	int n = 0;
 	do {
-		while (rx_one())
+		while (raw_fd >= 0 ? raw_rx_one() : rx_one())
 			n++;
-		if (link_idle)
+		drain();
+		if (link_idle && !idle_depth && !cb_depth && !send_depth) {
+			idle_depth++;
 			link_idle();
+			idle_depth--;
+			drain();
+		}
 		if (ms)
 			delay_ms(1);
 	} while (now_ms() < end);
@@ -242,6 +352,22 @@ int link_poll(unsigned ms)
 int link_up(qrtr_cb_t cb, unsigned timeout_ms)
 {
 	qrtr_cb = cb;
+	if (raw_fd < 0 && kernel_link_wanted()) {
+		raw_fd = open(MQRTR_DEV, O_RDWR | O_NONBLOCK);
+		if (raw_fd < 0) {
+			printf("link: kernel link wanted (kern.sweet_bb & 1) but %s: %s\n", MQRTR_DEV, strerror(errno));
+			return -1;
+		}
+	}
+	if (raw_fd >= 0) {
+		uint32_t ms = timeout_ms;
+		if (ioctl(raw_fd, MQRTR_IOC_UP, &ms)) {
+			printf("link: kernel link: IPCRTR not open (%s)\n", strerror(errno));
+			return -1;
+		}
+		printf("glink: IPCRTR open (kernel link, %s)\n", MQRTR_DEV);
+		return 0;
+	}
 	if (glink_init())
 		return -1;
 	glink_send(GLINK_CMD_VERSION, 1, FEAT_INTENT_REUSE, NULL, 0);
@@ -269,6 +395,37 @@ static int find_intent(uint32_t len)
 /* One packet into one of the modem's intents (requested if none fits), in chunks of 8K as Linux does. */
 int link_send(const void *data, uint32_t len)
 {
+	if (raw_fd >= 0) {
+		/*
+		 * The kernel sends it (waiting for a modem intent itself, at most 3 s). Kernel 1067/1068 consume only header +
+		 * hdr.size bytes and leave our 4-byte padding, so a sent packet can come back as a short write (r5bb1a: every
+		 * QMI message with a payload not a multiple of 4 was reported failed, with a stale errno). Sent = at least the
+		 * header + payload were taken; 1069 consumes the padding too.
+		 */
+		const struct qrtr_hdr *qh = data;
+		uint32_t want = len;
+		if (len >= sizeof(*qh) && qh->size <= len - sizeof(*qh))
+			want = (uint32_t)sizeof(*qh) + qh->size;
+		ssize_t r;
+		do {
+			r = write(raw_fd, data, len);
+		} while (r < 0 && errno == EINTR);
+		if (r >= (ssize_t)want)
+			return 0;
+		static unsigned told, fails;
+		int e = r < 0 ? errno : 0;
+		fails++;
+		if (told++ < 20 || fails % 100 == 0) {
+			if (r < 0)
+				printf("link: %s write of %u bytes (type %u to %u:%#x): %s (failure #%u)\n", MQRTR_DEV, len,
+				       len >= sizeof(*qh) ? qh->type : 0, len >= sizeof(*qh) ? qh->dst_node : 0,
+				       len >= sizeof(*qh) ? qh->dst_port : 0, strerror(e), fails);
+			else
+				printf("link: %s write of %u bytes: short (%zd, needed %u) (failure #%u)\n", MQRTR_DEV, len, r, want,
+				       fails);
+		}
+		return -1;
+	}
 	uint64_t start = now_ms(), end = start + 3000;
 	int i, asked = 0;
 	while ((i = find_intent(len)) < 0) {
@@ -322,25 +479,63 @@ static void handle_data(const uint8_t *d, uint32_t n)
 		LOG("qrtr: version %u\n", hd.version);
 		return;
 	}
-	if (qrtr_cb)
-		qrtr_cb(&hd, d + sizeof(hd), n - sizeof(hd) < hd.size ? n - sizeof(hd) : hd.size);
+	if (!qrtr_cb)
+		return;
+	uint32_t pl = n - sizeof(hd) < hd.size ? n - (uint32_t)sizeof(hd) : hd.size;
+	const uint8_t *p = d + sizeof(hd);
+	if (cb_depth || send_depth || qhead) {
+		/* nested (or older packets still waiting): keep the order, dispatch from the outermost link_poll */
+		struct rxq *e = malloc(sizeof(*e) + pl);
+		if (!e || qlen >= 4096) {
+			free(e);
+			qdrop++;
+			LOG("qrtr: rx queue full (%u): packet %u:%x -> %x dropped\n", qlen, hd.src_node, hd.src_port, hd.dst_port);
+			return;
+		}
+		e->next = NULL;
+		e->hd = hd;
+		e->n = pl;
+		memcpy(e->d, p, pl);
+		if (qtail)
+			qtail->next = e;
+		else
+			qhead = e;
+		qtail = e;
+		if (++qlen > qmax)
+			qmax = qlen;
+		drain();
+		return;
+	}
+	/* outermost: the callback may send, and a send polls the link, which reassembles into rxbuf: own copy */
+	static uint8_t cpy[sizeof(rxbuf)];
+	memcpy(cpy, p, pl);
+	dispatch(&hd, cpy, pl);
+	drain();
 }
 
 int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
 	      const void *payload, uint32_t len)
 {
-	static uint8_t b[65536 + 64];
+	/* one TX buffer per nesting level: link_send may poll, and a nested qrtr_send must not overwrite ours (2026-11-09) */
+	static uint8_t bb[3][65536 + 64];
+	static int depth;
+	uint8_t *b = bb[depth < 3 ? depth : 2];
 	struct qrtr_hdr hd = {
 		.version = 1, .type = type, .src_node = QRTR_NODE_APPS, .src_port = src_port,
 		.confirm_rx = 0, .size = len, .dst_node = dst_node, .dst_port = dst_port,
 	};
 	uint32_t padded = (len + 3) & ~3u;
-	if (sizeof(hd) + padded > sizeof(b))
+	if (sizeof(hd) + padded > sizeof(bb[0]))
 		return -1;
 	memset(b + sizeof(hd) + len, 0, padded - len);
 	memcpy(b, &hd, sizeof(hd));
 	memcpy(b + sizeof(hd), payload, len);
-	return link_send(b, sizeof(hd) + padded);
+	depth++;
+	send_depth++;
+	int r = link_send(b, sizeof(hd) + padded);
+	send_depth--;
+	depth--;
+	return r;
 }
 
 int qrtr_new_server(uint32_t service, uint32_t version, uint32_t instance, uint32_t port)
@@ -355,4 +550,12 @@ int qrtr_resume_tx(const struct qrtr_hdr *h)
 	/* struct qrtr_ctrl_pkt: cmd, then client { node, port } (the union's first two words) */
 	uint32_t pkt[5] = { QRTR_TYPE_RESUME_TX, h->dst_node, h->dst_port, 0, 0 };
 	return qrtr_send(QRTR_TYPE_RESUME_TX, h->dst_port, h->src_node, h->src_port, pkt, sizeof(pkt));
+}
+
+/* An unsolicited RESUME_TX from our port to a remote sender: un-blocks the remote's flow control towards that port if a
+ * RESUME_TX of ours was lost (harmless otherwise: the remote just clears its pending count). 2026-11-09 (P2 reg). */
+int qrtr_kick(uint32_t our_port, uint32_t rnode, uint32_t rport)
+{
+	uint32_t pkt[5] = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, our_port, 0, 0 };
+	return qrtr_send(QRTR_TYPE_RESUME_TX, our_port, rnode, rport, pkt, sizeof(pkt));
 }

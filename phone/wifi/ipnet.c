@@ -128,6 +128,99 @@ static void tun_configure(void)
 	    e ? strerror(e) : "started");
 }
 
+/* a separate utun for the cellular path (ipagsi.c): the same dance as tun_open(), but the fd and
+ * the name belong to the caller and ipnet's own tun/tun_name/DHCP state is left alone */
+int ipnet_utun_open(char *name, size_t n)
+{
+	struct ctl_info ci;
+	struct sockaddr_ctl sc;
+	socklen_t nl = n;
+	int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+	if (fd < 0) {
+		LOG("utun: socket: %s", strerror(errno));
+		return -1;
+	}
+	memset(&ci, 0, sizeof(ci));
+	snprintf(ci.ctl_name, sizeof(ci.ctl_name), "com.apple.net.utun_control");
+	if (ioctl(fd, CTLIOCGINFO, &ci) < 0) {
+		LOG("utun CTLIOCGINFO: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	memset(&sc, 0, sizeof(sc));
+	sc.sc_len = sizeof(sc);
+	sc.sc_family = AF_SYSTEM;
+	sc.ss_sysaddr = AF_SYS_CONTROL;
+	sc.sc_id = ci.ctl_id;
+	sc.sc_unit = 0;					/* the next free utunN */
+	if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) < 0) {
+		LOG("utun connect: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, name, &nl) < 0) {
+		LOG("utun UTUN_OPT_IFNAME: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	LOG("utun (cell): %s", name);
+	return fd;
+}
+
+/* address, MTU and UP on that utun; all addresses network order, mask 0 = the point-to-point
+ * default.  Errors are logged and reported: a cellular path on an interface that did not come up
+ * is worse than no path at all. */
+int ipnet_utun_set(const char *name, uint32_t ip, uint32_t gw, uint32_t mask, unsigned mtu)
+{
+	struct ifaliasreq ifra;
+	struct sockaddr_in *a;
+	struct ifreq ifr;
+	int s = socket(AF_INET, SOCK_DGRAM, 0), err = 0;
+
+	if (s < 0) {
+		LOG("utun %s: socket: %s", name, strerror(errno));
+		return -1;
+	}
+	memset(&ifra, 0, sizeof(ifra));
+	snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "%s", name);
+	a = (struct sockaddr_in *)&ifra.ifra_addr;
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = ip;
+	a = (struct sockaddr_in *)&ifra.ifra_broadaddr;	/* utun: this is the point-to-point peer */
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = gw;
+	a = (struct sockaddr_in *)&ifra.ifra_mask;
+	a->sin_len = sizeof(*a);
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = mask ? mask : 0xffffffff;
+	if (ioctl(s, SIOCAIFADDR, &ifra) < 0) {
+		LOG("%s: SIOCAIFADDR: %s", name, strerror(errno));
+		err = -1;
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name);
+	if (mtu) {
+		ifr.ifr_mtu = (int)mtu;
+		if (ioctl(s, SIOCSIFMTU, &ifr) < 0)
+			LOG("%s: SIOCSIFMTU %u: %s", name, mtu, strerror(errno));
+	}
+	if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0) {
+		LOG("%s: SIOCGIFFLAGS: %s", name, strerror(errno));
+		err = -1;
+	} else {
+		ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+		if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
+			LOG("%s: SIOCSIFFLAGS: %s", name, strerror(errno));
+			err = -1;
+		}
+	}
+	close(s);
+	return err;
+}
+
 /* the link went down: the lease off the utun and out of configd (IPMonitor falls back to another service) */
 static void tun_unconfigure(void)
 {
