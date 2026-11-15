@@ -2245,6 +2245,56 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
 
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o) { passTail(stream, table, o, pass.depth != nullptr); }
 
+void encodeTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth) { passTail(stream, table, o, depth); }
+
+void encodeBarrier(pm4::Stream& stream, uint64_t words, bool color, bool depth) {
+    stream.waitForIdle();
+    if (color || depth) {
+        // (the colour CCU even for depth alone: a 2D fill or a clear may have gone through it -- tu_clear_sysmem_attachment
+        // cleans both for a depth attachment)
+        eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, words, 1, false);
+        waitForWord(stream, words, 1);
+        if (depth) {
+            eventTimestamp(stream, PC_CCU_FLUSH_DEPTH_TS, words + 4, 1, false);
+            waitForWord(stream, words + 4, 1);
+        }
+    }
+    event(stream, CACHE_INVALIDATE);
+    stream.waitForIdle();
+}
+
+void census(const std::vector<uint32_t>& w, SyncCensus* out) {
+    SyncCensus c;
+    c.words = uint32_t(w.size());
+    for (size_t i = 0; i < w.size();) {
+        const pm4::Header h = pm4::decode(w[i]);
+        if (h.kind == pm4::Header::kRegisters) {
+            c.registerWords += 1 + h.count;
+        } else {
+            switch (h.opcode) {
+            case pm4::kWaitForIdle: c.wfis++; break;
+            case CP_WAIT_REG_MEM: case CP_WAIT_MEM_GTE: c.waits++; break;
+            case pm4::kMemcpy: if (h.count >= 1 && i + 1 < w.size()) c.memcpyWords += w[i + 1]; break;
+            case CP_SET_MARKER: c.markers++; break;
+            case CP_BLIT: c.blits++; break;
+            case CP_EVENT_WRITE:
+                if (h.count >= 1 && i + 1 < w.size()) {
+                    const uint32_t ev = (w[i + 1] & CP_EVENT_WRITE_0_EVENT__MASK) >> CP_EVENT_WRITE_0_EVENT__SHIFT;
+                    if (ev == PC_CCU_FLUSH_COLOR_TS) c.ccuColorFlushes++;
+                    else if (ev == PC_CCU_FLUSH_DEPTH_TS) c.ccuDepthFlushes++;
+                    else if (ev == CACHE_FLUSH_TS) c.cacheFlushes++;
+                    else if (ev == CACHE_INVALIDATE) c.cacheInvalidates++;
+                    else if (ev == PC_CCU_INVALIDATE_COLOR || ev == PC_CCU_INVALIDATE_DEPTH) c.ccuInvalidates++;
+                }
+                break;
+            default: break;
+            }
+        }
+        i += 1 + h.count;
+    }
+    *out = c;
+}
+
 namespace {
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 uint32_t divUp(uint32_t v, uint32_t d) { return (v + d - 1) / d; }
@@ -2896,6 +2946,25 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 // completion thread: one worker, a companion queued once however many buffers drew it before it ran.
 namespace {
 std::atomic<uint64_t> gPassSplits[4];   // (redfin hmv4) CommandBuffer::passSplits
+// (ws-hm-perf2) HM_PASS_FLUSH / HM_PASS_STATIC / HM_PASS_MERGE, each -1 (the environment's) or what a test set
+std::atomic<int> gPassLazyForce{-1}, gPassStaticForce{-1}, gPassMergeForce{-1};
+bool envSwitch(const char* name, const char* offValue) {
+    const char* e = getenv(name);
+    return e == nullptr || strcmp(e, offValue) != 0;
+}
+// the GPU address range of a texture's memory (its buffer's, so two textures over one surface or one buffer meet)
+bool memoryOf(const Texture* t, uint64_t* lo, uint64_t* hi) {
+    if (t == nullptr || t->buffer() == nullptr) return false;
+    *lo = t->buffer()->gpuAddress();
+    *hi = *lo + std::max<uint64_t>(t->buffer()->length(), 1);
+    return true;
+}
+bool memoryOf(const Buffer* b, uint64_t* lo, uint64_t* hi) {
+    if (b == nullptr) return false;
+    *lo = b->gpuAddress();
+    *hi = *lo + std::max<uint64_t>(b->length(), 1);
+    return true;
+}
 std::atomic<uint64_t> gXrStats[10];      // (redfin hmv8, hmv10) CommandBuffer::xrStats
 // (redfin hmv8) HM_XR_SYNC: 0 off, else on (default 1) with HM_XR_SYNC_MS the longest wait -- (redfin hmv10) default 250
 // (was 50: var8's Safari run timed out 18 of 182 barriers while the ring was 100-200 ms deep behind WebKit's tiles, and a
@@ -3387,15 +3456,34 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
     // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
     // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
+    // (ws-hm-perf2) HM_PASS_MERGE: into an open sysmem pass the store actions do not matter -- its draws write memory
+    // whatever they are, and only a GMEM pass stores -- so a pass that differs from the open one by them alone joins it
+    // (Store kept where either asks for it); and the slices are compared, which a pass into another layer differs by
+    const bool merge = passMerge() && open_ != nullptr && !open_->gmem && !open_->dual;
     bool joins = open_ != nullptr && open_->pass.color0 == pass.color0 && open_->pass.level == pass.level && open_->pass.depth == pass.depth &&
                  open_->pass.stencil == pass.stencil && !(pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) &&
                  pass.load != LoadAction::kClear &&
-                 !(pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) && pass.store == open_->pass.store &&
-                 pass.depthStore == open_->pass.depthStore && std::memcmp(&open_->options, &options, sizeof options) == 0;
+                 !(pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) && (merge || pass.store == open_->pass.store) &&
+                 (merge || pass.depthStore == open_->pass.depthStore) && std::memcmp(&open_->options, &options, sizeof options) == 0 &&
+                 (!merge || (open_->pass.slice == pass.slice && open_->pass.depthSlice == pass.depthSlice));
     for (uint32_t i = 0; joins && i < kMaxColorOutputs - 1; i++) {
         // (the attachments past 0 the same textures and stores, none asking for a Clear: the same pass)
         const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
-        joins = a.texture == b.texture && a.level == b.level && a.store == b.store && (a.texture == nullptr || a.load != LoadAction::kClear);
+        joins = a.texture == b.texture && a.level == b.level && (merge || a.store == b.store) && (a.texture == nullptr || a.load != LoadAction::kClear) &&
+                (!merge || a.slice == b.slice);
+    }
+    if (joins && merge) {
+        bool differed = false;
+        auto keepStore = [&differed](StoreAction& open, StoreAction now) {
+            if (open == now) return;
+            differed = true;
+            open = StoreAction::kStore;
+        };
+        keepStore(open_->pass.store, pass.store);
+        keepStore(open_->pass.depthStore, pass.depthStore);
+        keepStore(open_->pass.stencilStore, pass.stencilStore);
+        for (uint32_t i = 0; i < kMaxColorOutputs - 1; i++) keepStore(open_->pass.more[i].store, pass.more[i].store);
+        if (differed) counts_.storeMerges++;
     }
     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
     // encodeInPass). A draw a tile cannot replay ends a GMEM pass and opens a sysmem one of its own.
@@ -3420,7 +3508,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             const int why = open_ == nullptr ? 3 : pass.load == LoadAction::kClear ? 0 : (open_->gmem && !tileable) ? 2 : 1;
             gPassSplits[why].fetch_add(1, std::memory_order_relaxed);
         }
-        closePass();
+        closePass(true);   // (ws-hm-perf2) another draw pass follows: HM_PASS_FLUSH=lazy may leave the tail out
     }
     render::GmemPlan plan;
     bool gmem = false, dual = false;
@@ -3475,6 +3563,46 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             gmem = queue_.preferGmem(tuneKey);
         }
     }
+    // (ws-hm-perf2) what earlier passes of this buffer left in the CCU (HM_PASS_FLUSH=lazy) or flushed without the texture
+    // caches dropped since (a pass that went on from the last, HM_PASS_STATIC) is made safe to read before this draw
+    // reads it: its textures, buffers, index and indirect buffers. A new pass whose attachments meet such memory in the
+    // other CCU (colour drawn as depth or the other way), or a GMEM pass (its tiles load through the caches), gets the
+    // full barrier too.
+    const bool carried = !joins && !gmem && !dual && passStatic() && carryOk_ && stream_.size() == carryEnd_;
+    if (!dirty_.empty() || (!flushed_.empty() && (carried || joins))) {
+        bool full = false, inval = false;
+        auto meet = [&](uint64_t lo, uint64_t hi) {
+            for (const Range& r : dirty_) full = full || (lo < r.hi && r.lo < hi);
+            for (const Range& r : flushed_) inval = inval || (lo < r.hi && r.lo < hi);
+        };
+        uint64_t lo, hi;
+        for (const Bindings* b : {vsb, fsb}) {
+            for (const Texture* t : b->textures) {
+                if (memoryOf(t, &lo, &hi)) meet(lo, hi);
+            }
+            for (const Binding& x : b->buffers) {
+                if (memoryOf(x.buffer, &lo, &hi)) meet(lo, hi);
+            }
+        }
+        if (memoryOf(d.indexBuffer, &lo, &hi)) meet(lo, hi);
+        if (memoryOf(d.indirect, &lo, &hi)) meet(lo, hi);
+        if (!joins) {
+            auto other = [&](const Texture* t, bool depth) {
+                if (!memoryOf(t, &lo, &hi)) return;
+                for (const Range& r : dirty_) full = full || (r.depth != depth && lo < r.hi && r.lo < hi);
+            };
+            other(pass.color0, false);
+            for (const ColorAttachment& a : pass.more) other(a.texture, false);
+            other(pass.depth, true);
+            other(pass.stencil, true);
+            if (gmem || dual) full = full || !dirty_.empty();
+        }
+        if (full) {
+            if (!barrier(true)) return false;
+        } else if (inval && (carried || joins)) {
+            if (!barrier(false)) return false;
+        }
+    }
     Piece passTable;
     // (redfin ws-hm-perf) the command buffer's scratch streams, emptied, not four new vectors a draw: each grew from
     // nothing by doubling, a dozen allocations and copies a draw (HM_SCRATCH=0: new ones)
@@ -3494,7 +3622,14 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
                 if (t != nullptr && la == LoadAction::kClear && render::gmemClearWords(t->info(), cc, gmemClearWords_[i])) gmemClears_ |= 1u << i;
             }
         }
-        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, options, gmemClears_) ||
+        // (ws-hm-perf2) HM_PASS_STATIC: going on from the sysmem pass just closed, the batch start (the invalidates, the
+        // static tables, the draw-state reset, the VFD sizes, the border colour bases) and the CCU's sysmem set-up with
+        // its WFI are what that pass's head already put in the registers: left out, and the window, MRT and draw
+        // state deduplicated against what that pass's draws left there
+        render::Options headOptions = options;
+        if (carried) headOptions.batchStart = headOptions.ccuCntl = false;
+        if (!carried && options.batchStart) flushed_.clear();   // (the batch start's CACHE_INVALIDATE)
+        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, headOptions, gmemClears_) ||
             (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, options))) {
             gmemClears_ = 0;
             return refuseWork(why);
@@ -3599,6 +3734,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         open_->pass = pass;
         open_->options = options;
         open_->table = passTable.gpuAddress();
+        if (carried) {
+            open_->regs = std::move(carryRegs_);
+            counts_.headsCarried++;
+        }
+        carryOk_ = false;
         if (dual) {
             appendDeduped(open_->sysStream, headSys, open_->regs);
             open_->headGmem = std::move(head);
@@ -4318,8 +4458,86 @@ void CommandBuffer::passSplits(uint64_t out[4]) {
     for (int i = 0; i < 4; i++) out[i] = gPassSplits[i].load(std::memory_order_relaxed);
 }
 
-void CommandBuffer::closePass() {
+bool CommandBuffer::passFlushLazy() {
+    static const bool env = envSwitch("HM_PASS_FLUSH", "always");
+    const int f = gPassLazyForce.load(std::memory_order_relaxed);
+    return f < 0 ? env : f != 0;
+}
+bool CommandBuffer::passStatic() {
+    static const bool env = envSwitch("HM_PASS_STATIC", "0");
+    const int f = gPassStaticForce.load(std::memory_order_relaxed);
+    return f < 0 ? env : f != 0;
+}
+bool CommandBuffer::passMerge() {
+    static const bool env = envSwitch("HM_PASS_MERGE", "0");
+    const int f = gPassMergeForce.load(std::memory_order_relaxed);
+    return f < 0 ? env : f != 0;
+}
+void CommandBuffer::setPassModesForTesting(int lazy, int carry, int merge) {
+    gPassLazyForce = lazy;
+    gPassStaticForce = carry;
+    gPassMergeForce = merge;
+}
+
+// (ws-hm-perf2) what a tail just flushed: the memory dirty_ named and the pass's attachments, in memory now, the texture
+// caches perhaps still holding what they read of it before (a CACHE_INVALIDATE drops that: the batch start's, a barrier's)
+void CommandBuffer::noteFlushed(const RenderPass& pass) {
+    for (const Range& r : dirty_) flushed_.push_back(r);
+    dirty_.clear();
+    uint64_t lo, hi;
+    for (const Texture* t : {pass.color0, pass.depth, pass.stencil}) {
+        if (memoryOf(t, &lo, &hi)) flushed_.push_back(Range{lo, hi, false});
+    }
+    for (const ColorAttachment& a : pass.more) {
+        if (memoryOf(a.texture, &lo, &hi)) flushed_.push_back(Range{lo, hi, false});
+    }
+}
+
+void CommandBuffer::flushDirty() {
+    if (dirty_.empty()) return;
+    std::string why;
+    Piece table;
+    if (!piece(render::kTableBytes, &table, &why)) {
+        fail(std::string("no memory for a pass's tail: ") + why);
+        return;
+    }
+    render::tableStart(table.contents());
+    bool depth = false;
+    for (const Range& r : dirty_) depth = depth || r.depth;
+    pm4::Stream tail;
+    render::encodeTail(tail, table.gpuAddress(), dirtyOptions_, depth);
+    appendStream(stream_, tail);
+    counts_.lazyTails++;
+    noteFlushed(RenderPass{});
+    carryOk_ = false;
+}
+
+bool CommandBuffer::barrier(bool full) {
+    std::string why;
+    Piece words;
+    if (!piece(64, &words, &why)) {
+        fail(std::string("no memory for a barrier: ") + why);
+        return false;
+    }
+    memset(words.contents(), 0, 16);
+    bool depth = false;
+    for (const Range& r : dirty_) depth = depth || r.depth;
+    const size_t before = stream_.size();
+    render::encodeBarrier(stream_, words.gpuAddress(), full, full && depth);
+    carryKeep(before);
+    if (full) {
+        counts_.barriers++;
+        dirty_.clear();
+    } else {
+        counts_.invalidates++;
+    }
+    flushed_.clear();
+    return true;
+}
+
+void CommandBuffer::closePass(bool lazy) {
     if (open_ == nullptr) {
+        if (!lazy) flushDirty();
         return;
     }
     lastClosed_ = open_->pass.color0;
@@ -4411,10 +4629,42 @@ void CommandBuffer::closePass() {
             }
         }
     }
-    pm4::Stream tail;
-    render::encodeEnd(tail, open_->pass, open_->table, open_->options);
-    appendStream(stream_, tail);
+    // (ws-hm-perf2) HM_PASS_FLUSH=lazy: a sysmem pass a draw pass follows ends with its colour (and depth) left in the
+    // CCU, as turnip ends one (tu6_sysmem_render_end: no flush; the barrier before whatever reads it does that). The next
+    // pass draws through the same CCU; a read of this memory gets CommandBuffer::barrier first, and anything else
+    // (a copy, a blit, a dispatch, a clear, the end of the buffer) the full tail first (closePass(false), flushDirty).
+    // A profiled pass keeps its WFI, so that its end stamp is still its end.
+    const bool skipTail = lazy && passFlushLazy() && !open_->gmem;
+    if (skipTail) {
+        if ((profile_ || tuning_) && !profiled_.empty()) stream_.waitForIdle();
+        uint64_t lo, hi;
+        for (const Texture* t : {open_->pass.color0}) {
+            if (memoryOf(t, &lo, &hi)) dirty_.push_back(Range{lo, hi, false});
+        }
+        for (const ColorAttachment& a : open_->pass.more) {
+            if (memoryOf(a.texture, &lo, &hi)) dirty_.push_back(Range{lo, hi, false});
+        }
+        for (const Texture* t : {open_->pass.depth, open_->pass.stencil}) {
+            if (memoryOf(t, &lo, &hi)) dirty_.push_back(Range{lo, hi, true});
+        }
+        dirtyOptions_ = open_->options;
+        counts_.tailsSkipped++;
+    } else {
+        bool depth = open_->pass.depth != nullptr;
+        for (const Range& r : dirty_) depth = depth || r.depth;
+        pm4::Stream tail;
+        render::encodeTail(tail, open_->table, open_->options, depth);
+        appendStream(stream_, tail);
+        noteFlushed(open_->pass);
+    }
     stampEnd();
+    // (ws-hm-perf2) HM_PASS_STATIC: the next draw pass may go on from this one's registers (a sysmem pass's: a GMEM one
+    // put the CCU in its own shape and back, and its tiles wrote registers past the shadow)
+    carryOk_ = !open_->gmem;
+    if (carryOk_) {
+        carryRegs_ = std::move(open_->regs);
+        carryEnd_ = stream_.size();
+    }
     if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP: the pass's end, GMEM or sysmem, its draws
         const Texture* t = open_->pass.color0;
         mark(Mark{uint32_t(stream_.words().size()), kMarkPassEnd, uint8_t(open_->gmem ? 1 : 0), t != nullptr ? t->width() : 0,

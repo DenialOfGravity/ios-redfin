@@ -597,6 +597,22 @@ bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass&
                   uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{}, const GmemPlan* gmem = nullptr,
                   bool afterFetch = false);
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& options = Options{});
+// (ws-hm-perf2) encodeEnd's tail without a pass: DEPTH flushes the depth CCU too. What the command buffer puts down
+// when a lazily ended pass's colour must reach memory (HM_PASS_FLUSH=lazy) before anything but another draw pass
+void encodeTail(pm4::Stream& stream, uint64_t table, const Options& options, bool depth);
+// (ws-hm-perf2) HM_PASS_FLUSH=lazy's barrier before a read of what earlier passes drew and left in the CCU: turnip's
+// sysmem barrier for a colour write read by a shader (FD_CCU_CLEAN_COLOR [| FD_CCU_CLEAN_DEPTH] | FD_CACHE_INVALIDATE,
+// with the WFI before and after as the framebuffer fetch's barrier has them here): a WFI, PC_CCU_FLUSH_COLOR_TS (and
+// PC_CCU_FLUSH_DEPTH_TS under DEPTH) writing 1 into WORDS (8 zeroed bytes) and waited for, CACHE_INVALIDATE, a WFI.
+// Without COLOR and DEPTH: the invalidate alone between the WFIs (what was flushed is in memory; the texture caches
+// may hold what they read of it before)
+void encodeBarrier(pm4::Stream& stream, uint64_t words, bool color, bool depth);
+// (ws-hm-perf2) what a stream spends on keeping the GPU's caches coherent, packet by packet (HM_PROF's sync line)
+struct SyncCensus {
+    uint32_t words = 0, registerWords = 0, wfis = 0, ccuColorFlushes = 0, ccuDepthFlushes = 0, cacheFlushes = 0, waits = 0,
+             cacheInvalidates = 0, ccuInvalidates = 0, memcpyWords = 0, markers = 0, blits = 0;
+};
+void census(const std::vector<uint32_t>& words, SyncCensus* out);
 
 // A pass with no draw: the batch start, the pass begin, the Clear's fill, the tail. What -[MTLRenderCommandEncoder
 // endEncoding] needs for an encoder that recorded nothing; any load action but kClear is refused (nothing to write).

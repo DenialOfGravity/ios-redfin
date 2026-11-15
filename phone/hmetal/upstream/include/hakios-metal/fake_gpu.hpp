@@ -159,6 +159,10 @@ public:
         uint32_t tileClears = 0;    // ...and clears in GMEM
         uint32_t binningPasses = 0, binnedDraws = 0, binData = 0;   // binning passes, the draws in them, tiles told their streams
         uint64_t storedPixels = 0;  // pixels the stores wrote: the whole target once, granule padding included, when the tiles tile it
+        // (ws-hm-perf2) sysmem FS textures read over memory still in the CCU or flushed without a CACHE_INVALIDATE since
+        // (a stale read on the GPU), and the last such read named
+        uint32_t staleSamples = 0;
+        std::string lastStale;
     };
 
     // ASYNC: submissions run on a thread of their own, after DELAY_US each, as the real GPU runs them after the call
@@ -292,6 +296,10 @@ private:
     std::deque<Job> jobs_;
     std::map<uint32_t, uint32_t> regs_;         // every register written, as written (type-4 packets)
     std::set<uint32_t> written_;                // ...of which those written in the submission running now
+    // (ws-hm-perf2) the coherence model: memory sysmem draws wrote, still in the CCU, and memory flushed out of it whose
+    // texture caches were not dropped since; the extent each target of the draw being judged writes
+    std::vector<std::pair<uint64_t, uint64_t>> ccuDirty_, cacheStale_;
+    uint64_t drawExtent_[8] = {};
     CsState cs_;
     StageLoads vs_, fs_;
     bool gfxIbosLoaded_ = false;   // the 3D IBO table's load into SB6_IBO in this submission

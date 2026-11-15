@@ -426,7 +426,9 @@ void CommandBuffer::stamp(uint32_t slot) {
     const uint64_t at = profileStamps_->gpuAddress() + 8ull * slot;
     const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(0x0980) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(at),
                            uint32_t(at >> 32)};
+    const size_t before = stream_.size();
     stream_.packet(a6xx::CP_REG_TO_MEM, w, 3);
+    carryKeep(before);   // (ws-hm-perf2) a stamp changes no register: the next pass may still go on from the last
     use(*profileStamps_, true);
 }
 
@@ -600,6 +602,10 @@ void CommandBuffer::finish(Status s) {
             const auto* t = reinterpret_cast<const volatile uint64_t*>(gpuStamps_.contents());
             gpuTicks_[0] = t[0];
             gpuTicks_[1] = t[1];
+            // (ws-hm-perf2) a decode buffer's GPU time, stamped, onto the buffer it was sent for (HM_PROF's sync line)
+            if (std::shared_ptr<CommandBuffer> owner = preFor_.lock()) {
+                if (t[1] > t[0] && t[0] != 0) owner->preGpuTicks_.fetch_add(t[1] - t[0], std::memory_order_relaxed);
+            }
         }
         gpuStamps_ = Piece{};
     }
@@ -638,6 +644,8 @@ bool CommandBuffer::copy(const Buffer& from, uint64_t fromOffset, const Buffer& 
     if (length == 0) {
         return true;
     }
+    counts_.cpCopies++;   // (ws-hm-perf2) no pass stamp times it: counted for HM_PROF
+    counts_.cpCopyBytes += length;
     if (fromOffset % 4 || toOffset % 4 || length % 4) {
         // the command processor moves words; a copy of bytes goes through the 2D engine instead (a pass of its own).
         // MapKit's snapshot service copies rows of 2 bytes into its textures.
@@ -683,6 +691,8 @@ bool CommandBuffer::fill(const Buffer& b, uint64_t offset, uint64_t length, uint
     if (length == 0) {
         return true;
     }
+    counts_.cpCopies++;   // (ws-hm-perf2) no pass stamp times it: counted for HM_PROF
+    counts_.cpCopyBytes += length;
     uint32_t word = uint32_t(value) * 0x01010101u;
     uint64_t words = length / 4, base = b.gpuAddress() + offset;
     // the first words written as they are, ...
@@ -892,6 +902,12 @@ bool CommandQueue::ticksToNs(uint64_t ticks, int64_t* ns) {
     return true;
 }
 
+int64_t CommandBuffer::gpuStampedNanoseconds() const {
+    if (status_.load() != kCompleted) return 0;
+    const uint64_t a = gpuTicks_[0], b = gpuTicks_[1];
+    return a != 0 && b > a ? int64_t(b - a) * 625 / 12 : 0;
+}
+
 bool CommandBuffer::gpuTimes(int64_t* startNs, int64_t* endNs) const {
     if (status_.load() != kCompleted) return false;
     const uint64_t a = gpuTicks_[0], b = gpuTicks_[1];
@@ -925,6 +941,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();
+    if (cb->profile_) render::census(cb->stream_.words(), &cb->census_);   // (ws-hm-perf2) HM_PROF's sync line
     // (redfin hmv10) HM_XR_LATE: the extended-range surfaces' copies, now (a ring barrier first); (redfin hmv11) HM_XR_GPU:
     // or a buffer of GPU decodes, sent first so the ring runs it between WebKit's writes and this buffer's draws
     if (std::shared_ptr<CommandBuffer> pre = cb->xrDecodeDeferred()) {

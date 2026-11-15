@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <tuple>
 #include <map>
 #include <thread>
 #include <vector>
@@ -6715,4 +6716,316 @@ TEST(a_two_plane_surface_ycbcr_texture_refuses_unreadable_planes) {
     Texture::Ycbcr none = yc;
     none.matrix = 0;
     refused(43, none, "BT.601 (1) or BT.709 (2)");
+}
+
+// --- (ws-hm-perf2) pass tails left out, heads that go on, passes merged across store actions --------------------------
+
+namespace {
+struct PassModes {
+    PassModes(int lazy, int carry, int merge) { CommandBuffer::setPassModesForTesting(lazy, carry, merge); }
+    ~PassModes() { CommandBuffer::setPassModesForTesting(-1, -1, -1); }
+};
+struct PassStep {
+    Texture* target;
+    Texture* sampled;      // the FS's texture 0 (tri_tex), or none (tri_flat)
+    bool gmem = false;     // render::Options::gmem for its draw
+    LoadAction load = LoadAction::kLoad;
+    uint32_t draws = 1;
+};
+struct PassRun {
+    CommandBuffer::Counts counts;
+    render::SyncCensus census;
+    uint32_t stale, faults;
+    CommandBuffer::Status status;
+    double encodeUs;
+};
+PassRun runPasses(Rig& r, std::initializer_list<PassStep> steps, bool profile = true) {
+    NoDeadFill noDeadFill;   // (every draw recorded: a later draw of the same geometry would take the earlier back)
+    Sampler smp = nearestClamp();
+    const uint32_t stale = r.fake->stats().staleSamples, faults = r.fake->stats().faults;
+    auto cb = r.queue->commandBuffer();
+    cb->setProfile(profile);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const PassStep& s : steps) {
+        RenderPass p;
+        p.color0 = s.target;
+        p.load = s.load;
+        p.clearColor[0] = 0.5;
+        render::Options o;
+        o.gmem = s.gmem;
+        Bindings fsb;
+        if (s.sampled != nullptr) {
+            fsb.textures = {s.sampled};
+            fsb.samplers = {&smp};
+        }
+        for (uint32_t i = 0; i < s.draws; i++) {
+            // (each draw another vertex count: none the dead fill takes back)
+            CHECK(cb->draw(s.sampled != nullptr ? texProgram() : flatProgram(), p, wholeDraw(3 + 3 * (i % 7), s.target->width(), s.target->height()), Bindings{},
+                           fsb, o));
+            p.load = LoadAction::kLoad;
+        }
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    cb->commit();
+    cb->waitUntilCompleted();
+    return PassRun{cb->counts(), cb->syncCensus(), r.fake->stats().staleSamples - stale, r.fake->stats().faults - faults, cb->status(), us};
+}
+}  // namespace
+
+// The coherence model the tests below stand on: a draw sampling the target its own pass is drawing (no framebuffer
+// fetch, no barrier) reads what is still in the CCU -- counted stale -- while a later pass's read after hm-int5's tail
+// and the next batch start's CACHE_INVALIDATE is not
+TEST(the_fakes_coherence_model_sees_a_read_of_colour_still_in_the_ccu) {
+    PassModes m(0, 0, 0);
+    Rig r;
+    auto a = target(r), b = target(r);
+    const PassRun self = runPasses(r, {{a.get(), nullptr}, {a.get(), a.get()}});
+    CHECK(self.stale >= 1);
+    CHECK_EQ(self.faults, 0u);
+    const PassRun later = runPasses(r, {{a.get(), nullptr}, {b.get(), a.get()}});
+    CHECK_EQ(later.stale, 0u);
+    CHECK_EQ(later.faults, 0u);
+}
+
+// HM_PASS_FLUSH=lazy: pass A draws, pass B samples A -- B gets the barrier (the CCU flushed, waited for, the caches
+// dropped) and A no tail of its own; hm-int5's way (always) the tail after A and none between. Neither reads stale.
+TEST(a_pass_that_samples_the_pass_before_gets_the_flush_lazily) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    {
+        PassModes m(1, 1, 1);
+        const PassRun x = runPasses(r, {{a.get(), nullptr}, {b.get(), a.get()}});
+        CHECK(x.status == CommandBuffer::kCompleted);
+        CHECK_EQ(x.faults, 0u);
+        CHECK_EQ(x.stale, 0u);
+        CHECK_EQ(x.counts.tailsSkipped, 1u);
+        CHECK_EQ(x.counts.barriers, 1u);
+        CHECK_EQ(x.census.ccuColorFlushes, 2u);   // the barrier's, the buffer's last tail
+        CHECK_EQ(x.census.cacheFlushes, 1u);      // the last tail's alone
+    }
+    {
+        PassModes m(0, 0, 0);
+        const PassRun x = runPasses(r, {{a.get(), nullptr}, {b.get(), a.get()}});
+        CHECK_EQ(x.faults, 0u);
+        CHECK_EQ(x.stale, 0u);
+        CHECK_EQ(x.counts.tailsSkipped, 0u);
+        CHECK_EQ(x.counts.barriers, 0u);
+        CHECK_EQ(x.census.ccuColorFlushes, 2u);   // a tail each
+        CHECK_EQ(x.census.cacheFlushes, 2u);
+    }
+}
+
+// ...and pass B into another target that does not read A: nothing between them, one tail at the end of the buffer (the
+// fake faults a buffer that ends with colour in the CCU); B's head goes on from A's (no batch start, no CCU set-up)
+TEST(an_unrelated_pass_after_another_gets_no_flush_between_and_one_at_the_end) {
+    Rig r;
+    auto a = target(r), b = target(r), c = target(r, 32, 32);
+    PassRun lazy, always;
+    {
+        PassModes m(1, 1, 1);
+        lazy = runPasses(r, {{a.get(), nullptr}, {b.get(), nullptr}, {c.get(), nullptr}});
+    }
+    {
+        PassModes m(0, 0, 0);
+        always = runPasses(r, {{a.get(), nullptr}, {b.get(), nullptr}, {c.get(), nullptr}});
+    }
+    for (const PassRun* x : {&lazy, &always}) {
+        CHECK(x->status == CommandBuffer::kCompleted);
+        CHECK_EQ(x->faults, 0u);
+        CHECK_EQ(x->stale, 0u);
+        CHECK_EQ(x->counts.passes, 3u);
+    }
+    CHECK_EQ(lazy.counts.tailsSkipped, 2u);
+    CHECK_EQ(lazy.counts.barriers, 0u);
+    CHECK_EQ(lazy.counts.headsCarried, 2u);
+    CHECK_EQ(lazy.census.ccuColorFlushes, 1u);
+    CHECK_EQ(lazy.census.cacheFlushes, 1u);
+    CHECK_EQ(always.census.ccuColorFlushes, 3u);
+    CHECK_EQ(always.census.cacheFlushes, 3u);
+    CHECK_EQ(always.counts.headsCarried, 0u);
+    CHECK(lazy.census.wfis < always.census.wfis);
+    CHECK(lazy.census.words < always.census.words);
+    CHECK(lazy.census.cacheInvalidates < always.census.cacheInvalidates);
+    std::printf("       three unrelated passes: lazy %u words, %u WFIs, %u waits, %u invalidates; always %u words, %u WFIs, %u waits, %u invalidates\n",
+                lazy.census.words, lazy.census.wfis, lazy.census.waits, lazy.census.cacheInvalidates, always.census.words, always.census.wfis,
+                always.census.waits, always.census.cacheInvalidates);
+}
+
+// The pass into the display's IOSurface (CoreAnimation's last): icons drawn first into a texture of their own, the
+// surface's pass sampling them -- the barrier before it, the full tail at the end of the buffer (what the display scans
+// out is in memory when the fence passes), nothing stale
+TEST(the_display_surface_pass_sees_the_icons_drawn_before_it_and_ends_flushed) {
+    PassModes m(1, 1, 1);
+    Rig r;
+    const uint32_t kBGRA = 0x42475241u;
+    r.fake->addSurface(9, 64, 64, 256, kBGRA);
+    TextureDesc d;
+    d.format = PixelFormat::kBGRA8Unorm;
+    d.width = d.height = 64;
+    d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    std::string why;
+    auto screen = Texture::wrapSurface(*r.gpu, 9, d, &why);
+    CHECK(screen != nullptr);
+    if (screen == nullptr) return;
+    auto icon = target(r, 16, 16);
+    const PassRun x = runPasses(r, {{screen.get(), nullptr}, {icon.get(), nullptr, false, LoadAction::kClear, 3}, {screen.get(), icon.get(), false, LoadAction::kLoad, 2}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.faults, 0u);
+    CHECK_EQ(x.stale, 0u);
+    CHECK_EQ(x.counts.barriers, 1u);
+    CHECK_EQ(x.counts.tailsSkipped, 2u);
+    CHECK_EQ(x.census.cacheFlushes, 1u);   // the end's
+    // the surface read back afterwards by a blit (a snapshot): the copy finds the colour in memory -- the open pass's
+    // full tail first, as hm-int5's
+    auto cb = r.queue->commandBuffer();
+    RenderPass p;
+    p.color0 = screen.get();
+    render::Options o;
+    o.gmem = false;
+    CHECK(cb->draw(flatProgram(), p, wholeDraw(3, 64, 64), Bindings{}, Bindings{}, o));
+    auto snap = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    const bool blitted = cb->blit(*screen, 0, render::BlitRect{0, 0, 64, 64}, *snap, 0, render::BlitRect{0, 0, 64, 64}, false);
+    CHECK(blitted);
+    if (!blitted) std::printf("       blit: %s / %s\n", cb->error().c_str(), cb->lastSkipped().c_str());
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(cb->counts().tailsSkipped, 0u);
+}
+
+// A draw that joins the open pass and samples what an earlier, lazily ended pass drew: the barrier inside the pass,
+// before that draw (a blur chain's later draws reading the pass before)
+TEST(a_draw_inside_a_pass_that_reads_an_earlier_pass_gets_the_barrier_there) {
+    PassModes m(1, 1, 1);
+    Rig r;
+    auto a = target(r), b = target(r);
+    Sampler smp = nearestClamp();
+    auto cb = r.queue->commandBuffer();
+    render::Options o;
+    o.gmem = false;
+    RenderPass pa, pb;
+    pa.color0 = a.get();
+    pb.color0 = b.get();
+    Bindings fsb;
+    fsb.textures = {a.get()};
+    fsb.samplers = {&smp};
+    const uint32_t stale = r.fake->stats().staleSamples;
+    CHECK(cb->draw(flatProgram(), pa, wholeDraw(3), Bindings{}, Bindings{}, o));
+    CHECK(cb->draw(flatProgram(), pb, wholeDraw(3), Bindings{}, Bindings{}, o));
+    CHECK_EQ(cb->counts().barriers, 0u);
+    CHECK(cb->draw(texProgram(), pb, wholeDraw(6), Bindings{}, fsb, o));
+    CHECK_EQ(cb->counts().passes, 2u);
+    CHECK_EQ(cb->counts().barriers, 1u);
+    CHECK(cb->draw(texProgram(), pb, wholeDraw(9), Bindings{}, fsb, o));   // (flushed and dropped already: no second)
+    CHECK_EQ(cb->counts().barriers, 1u);
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().staleSamples - stale, 0u);
+}
+
+// HM_PASS_STATIC without HM_PASS_FLUSH=lazy (always's tails): a pass that goes on from the last and reads what that
+// one drew drops the texture caches first (the batch start it leaves out did); one that reads nothing of it does not
+TEST(a_carried_head_after_a_full_tail_drops_the_texture_caches_before_a_read) {
+    PassModes m(0, 1, 1);
+    Rig r;
+    auto a = target(r), b = target(r), c = target(r);
+    const PassRun x = runPasses(r, {{a.get(), nullptr}, {b.get(), a.get()}, {c.get(), nullptr}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.faults, 0u);
+    CHECK_EQ(x.stale, 0u);
+    CHECK_EQ(x.counts.headsCarried, 2u);
+    CHECK_EQ(x.counts.invalidates, 1u);
+    CHECK_EQ(x.counts.barriers, 0u);
+}
+
+// A GMEM pass after a lazily ended sysmem pass it samples: the full barrier before the GMEM pass (its tiles load through
+// the caches), its own tail as before
+TEST(a_gmem_pass_after_a_lazily_ended_pass_gets_the_barrier_first) {
+    PassModes m(1, 1, 1);
+    Rig r;
+    auto a = target(r), b = target(r);
+    const PassRun x = runPasses(r, {{a.get(), nullptr}, {b.get(), a.get(), true}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.faults, 0u);
+    if (x.counts.gmemPasses == 1) {
+        CHECK_EQ(x.counts.barriers, 1u);
+        CHECK_EQ(x.counts.headsCarried, 0u);
+    } else {
+        std::printf("       (the second pass went to sysmem here: the GMEM half not exercised)\n");
+    }
+}
+
+// HM_PASS_MERGE: a pass into the open sysmem pass's attachments that differs only by its store action goes on in it
+// (Store kept); without the switch it opens a pass of its own; a GMEM-capable pass is never merged so
+TEST(a_pass_differing_only_by_its_store_action_joins_the_open_sysmem_pass) {
+    Rig r;
+    auto a = target(r);
+    auto run = [&]() {
+        auto cb = r.queue->commandBuffer();
+        render::Options o;
+        o.gmem = false;
+        RenderPass p;
+        p.color0 = a.get();
+        p.store = StoreAction::kStore;
+        CHECK(cb->draw(flatProgram(), p, wholeDraw(3), Bindings{}, Bindings{}, o));
+        p.store = StoreAction::kDontCare;
+        CHECK(cb->draw(flatProgram(), p, wholeDraw(6), Bindings{}, Bindings{}, o));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        return cb->counts();
+    };
+    {
+        PassModes m(1, 1, 1);
+        const auto c = run();
+        CHECK_EQ(c.passes, 1u);
+        CHECK_EQ(c.storeMerges, 1u);
+    }
+    {
+        PassModes m(1, 1, 0);
+        const auto c = run();
+        CHECK_EQ(c.passes, 2u);
+        CHECK_EQ(c.storeMerges, 0u);
+    }
+}
+
+// A frame as CoreAnimation draws the home screen (perf-g1115's HM_PROF classes, scaled to the fake): the display
+// 1125x2436 Load with 26 draws, the blur's 637x413 Clear sampling it (4), its 101x67 Clear sampling that (3), two 64x64
+// icon passes (Clear, 3 each), the display again Load sampling the blur and the icons (30): 69 draws, 6 passes. The
+// census of each mode printed for the record (and HM_BENCH_CA=N: N frames each way, the host's encode time a draw).
+TEST(a_coreanimation_like_frame_census_and_encode_cost) {
+    NoDeadFill noDeadFill;
+    Rig r;
+    auto screen = target(r, 1125, 2436), blur = target(r, 637, 413), small = target(r, 101, 67), i1 = target(r, 64, 64), i2 = target(r, 64, 64);
+    auto frame = [&](bool profile) {
+        return runPasses(r,
+                         {{screen.get(), nullptr, false, LoadAction::kLoad, 26},
+                          {blur.get(), screen.get(), false, LoadAction::kClear, 4},
+                          {small.get(), blur.get(), false, LoadAction::kClear, 3},
+                          {i1.get(), nullptr, false, LoadAction::kClear, 3},
+                          {i2.get(), nullptr, false, LoadAction::kClear, 3},
+                          {screen.get(), small.get(), false, LoadAction::kLoad, 15},
+                          {screen.get(), i1.get(), false, LoadAction::kLoad, 15}},
+                         profile);
+    };
+    const char* e = getenv("HM_BENCH_CA");
+    const int n = e != nullptr && atoi(e) > 0 ? atoi(e) : 0;
+    for (const auto& [name, lazy, carry] : {std::tuple<const char*, int, int>{"always (hm-int5)", 0, 0}, {"lazy", 1, 0}, {"lazy+static", 1, 1}}) {
+        PassModes m(lazy, carry, 1);
+        const PassRun x = frame(true);
+        CHECK(x.status == CommandBuffer::kCompleted);
+        CHECK_EQ(x.faults, 0u);
+        CHECK_EQ(x.stale, 0u);
+        const render::SyncCensus& c = x.census;
+        std::printf("       %-17s %u passes: %5u words (%u register), %2u WFIs, %u CCU flushes, %u cache flushes, %2u waits, %u invalidates "
+                    "(+%u CCU), tails left out %u, barriers %u+%u, heads carried %u\n",
+                    name, x.counts.passes, c.words, c.registerWords, c.wfis, c.ccuColorFlushes, c.cacheFlushes, c.waits, c.cacheInvalidates,
+                    c.ccuInvalidates, x.counts.tailsSkipped, x.counts.barriers, x.counts.invalidates, x.counts.headsCarried);
+        if (n > 0) {
+            double us = 0;
+            for (int i = 0; i < n; i++) us += frame(false).encodeUs;
+            std::printf("       %-17s host encode %.2f us a draw (%d frames of 69 draws)\n", name, us / (69.0 * n), n);
+        }
+    }
 }

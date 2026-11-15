@@ -178,7 +178,15 @@ public:
     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
     struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0,
-                    fillsDropped = 0; };   // (redfin hm-int4) fillsDropped: HM_DEADFILL's draws taken back (render.cpp)   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+                    fillsDropped = 0,
+                    // (ws-hm-perf2) HM_PASS_FLUSH=lazy / HM_PASS_STATIC / HM_PASS_MERGE: pass tails left out (the pass ended with
+                    // its colour in the CCU), barriers put down before a read of such colour (full: the CCU flushed; invalidate
+                    // alone: what an earlier tail flushed), full tails put down for what lazily ended passes left (before a copy,
+                    // a blit, a dispatch, a clear or the end), heads that went on from the pass before (no batch start, no
+                    // CCU set-up), draws joined to the open pass although their store actions differ; and the command
+                    // processor's own copies and fills (copy, fill), which no pass stamp times, with their bytes
+                    tailsSkipped = 0, barriers = 0, invalidates = 0, lazyTails = 0, headsCarried = 0, storeMerges = 0, cpCopies = 0;
+                    uint64_t cpCopyBytes = 0; };   // (redfin hm-int4) fillsDropped: HM_DEADFILL's draws taken back (render.cpp)   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
     // of each pass and after its tail -- whose wait for idle makes the end the end -- for the first kMaxProfiled passes:
@@ -377,8 +385,27 @@ private:
         } df;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
     };
-    void closePass();
+    // (ws-hm-perf2) LAZY (a draw opening the next pass, HM_PASS_FLUSH=lazy): a sysmem pass ends without its tail, its
+    // attachments noted as left in the CCU (dirty_); otherwise the tail, and what earlier lazily ended passes left
+    // flushed with it (or alone, with no pass open)
+    void closePass(bool lazy = false);
     void useAttachments(const RenderPass& pass);
+    // (ws-hm-perf2) memory a lazily ended pass drew into and left in the CCU (dirty_: colour or depth), and memory a tail
+    // flushed whose texture caches were not dropped since (flushed_): GPU address ranges, so that two textures over
+    // one surface or one buffer are the same memory
+    struct Range { uint64_t lo, hi; bool depth; };
+    std::vector<Range> dirty_, flushed_;
+    render::Options dirtyOptions_;
+    void flushDirty();               // the full tail for dirty_, with no pass open (closePass(false))
+    void noteFlushed(const RenderPass& pass);
+    // the head of the next draw pass may go on from the pass closed last (HM_PASS_STATIC): its register shadow and where
+    // the stream ended then (anything recorded since, but the stamps and barriers that keep it up to date, ends that)
+    RegShadow carryRegs_;
+    size_t carryEnd_ = size_t(-1);
+    bool carryOk_ = false;
+    void carryKeep(size_t before) { if (carryOk_ && before == carryEnd_) carryEnd_ = stream_.size(); }
+    // a barrier as encodeBarrier puts it, into the stream (a draw's read of dirty or flushed memory); false: no memory
+    bool barrier(bool full);
     std::unique_ptr<OpenPass> open_;
     const Texture* lastClosed_ = nullptr;   // (redfin hmv4) the colour attachment 0 of the pass closed last (pass splits)
 public:
@@ -406,6 +433,19 @@ public:
     static void xrGpuStats(uint64_t out[6]);
     // (redfin hmv11) tests: 1 / 0 HM_XR_GPU on / off whatever the environment says, -1 the environment's again
     static void setXrGpuForTesting(int on);
+    // (ws-hm-perf2) the pass switches, read once from the environment: HM_PASS_FLUSH=lazy (default) or always (hm-int5's
+    // tail after every pass), HM_PASS_STATIC=1 (default) or 0 (every pass its batch start and CCU set-up),
+    // HM_PASS_MERGE=1 (default) or 0 (a draw into the open sysmem pass's attachments joins it only with the same store
+    // actions, as hm-int5). Tests: 1 / 0 whatever the environment says, -1 the environment's again
+    static bool passFlushLazy();
+    static bool passStatic();
+    static bool passMerge();
+    static void setPassModesForTesting(int lazy, int carry, int merge);
+    // (ws-hm-perf2) HM_PROF's sync line: the submitted stream's census (render::census, made at submit when profiling)
+    // and the GPU's own time for it and for the decode buffers sent before it (CP_ALWAYS_ON_COUNTER stamps, ns; 0 none)
+    const render::SyncCensus& syncCensus() const { return census_; }
+    int64_t gpuStampedNanoseconds() const;
+    int64_t preGpuNanoseconds() const { return int64_t(preGpuTicks_.load(std::memory_order_relaxed)) * 625 / 12; }
     // (redfin hm-int5) HM_XR_WB=gpu (default): every extended-range companion this buffer drew is written into its
     // surface's rows by xr_encode (tools/kernels/xr_encode.ll) dispatched at the end of this buffer, at commit: the rows
     // are whole when its fence passes, ordered on the ring before any later GPU work of any process, and no processor
@@ -495,6 +535,8 @@ private:
     // preRunningNs_ at completion); and, on that buffer, the sum of its decode buffers' running times
     std::weak_ptr<CommandBuffer> preFor_;
     std::atomic<int64_t> preRunningNs_{0};
+    std::atomic<uint64_t> preGpuTicks_{0};   // (ws-hm-perf2) the decode buffers' own GPU time, stamped (preGpuNanoseconds)
+    render::SyncCensus census_;
     Piece gpuStamps_;                                   // (redfin) the two counter stamps, when gpuStamps_.buffer (until finish)
     uint64_t gpuTicks_[2] = {0, 0};                     // ...as finish read them
     bool unsubmitted_ = false;                          // (redfin) empty: completed in order without the GPU

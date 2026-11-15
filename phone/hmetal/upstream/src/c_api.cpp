@@ -1808,6 +1808,23 @@ void hakios_metal_cb_gpu_split(hakios_metal_cb* cb, int64_t* queued, int64_t* ru
     if (queued != nullptr) *queued = cb->cb->queuedNanoseconds();
     if (running != nullptr) *running = cb->cb->runningNanoseconds();
 }
+int hakios_metal_cb_sync_counts(hakios_metal_cb* cb, unsigned long long* out, int n) {
+    syncOne(cb);
+    const CommandBuffer& c = *cb->cb;
+    const render::SyncCensus& s = c.syncCensus();
+    const CommandBuffer::Counts& k = c.counts();
+    const unsigned long long v[24] = {(unsigned long long)std::max<int64_t>(0, c.gpuStampedNanoseconds()),
+                                      (unsigned long long)std::max<int64_t>(0, c.preGpuNanoseconds()),
+                                      s.words, s.registerWords, s.wfis, s.ccuColorFlushes, s.ccuDepthFlushes, s.cacheFlushes, s.waits,
+                                      s.cacheInvalidates, s.ccuInvalidates, s.memcpyWords, k.tailsSkipped, k.barriers, k.invalidates,
+                                      k.lazyTails, k.headsCarried, k.storeMerges, k.cpCopies, k.cpCopyBytes, k.passes, k.draws, s.blits,
+                                      s.markers};
+    if (out == nullptr || n <= 0) return 0;
+    const int m = std::min(n, 24);
+    for (int i = 0; i < m; i++) out[i] = v[i];
+    return m;
+}
+
 int hakios_metal_cb_gpu_times(hakios_metal_cb* cb, int64_t* start_ns, int64_t* end_ns) {
     syncOne(cb);
     int64_t s = 0, e = 0;

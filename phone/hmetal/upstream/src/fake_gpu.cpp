@@ -1497,6 +1497,7 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         if (unwritten) unwrittenMask |= 1u << t;
         d.mrtBases[t] = base;
         d.mrtFormats[t] = format;
+        drawExtent_[t] = counted * pitch;   // (ws-hm-perf2) what the coherence model takes the draw to write
         if (t == 0) {
             d.mrtFormat = format;
             d.mrtTileMode = tile;
@@ -1663,6 +1664,23 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                 fault(text("FS texture %llu in a tile reads target %llu's memory, which holds the target as it was before the pass", i, t));
                 return false;
             }
+        }
+    }
+    // (ws-hm-perf2) the coherence model, sysmem only: a FS texture over memory a draw, fill or copy wrote that has not
+    // been through PC_CCU_FLUSH_COLOR_TS and a CACHE_INVALIDATE after it is a stale read on the GPU -- counted and named
+    // (Stats::staleSamples), not a fault: a test asks for it
+    for (uint32_t i = 0; !inTile_ && i < d.fsTextureCount; i++) {
+        const uint32_t* td = reinterpret_cast<const uint32_t*>(at(d.fsTexConst + 64ull * i, 64));
+        if (td == nullptr) continue;
+        const uint64_t base = td[4] | uint64_t(fieldOf(td[5], A6XX_TEX_CONST_5_BASE_HI__MASK, A6XX_TEX_CONST_5_BASE_HI__SHIFT)) << 32;
+        if (base == 0) continue;
+        bool inCcu = false, inCache = false;
+        for (const auto& r : ccuDirty_) inCcu = inCcu || (base >= r.first && base < r.second);
+        for (const auto& r : cacheStale_) inCache = inCache || (base >= r.first && base < r.second);
+        if (inCcu || inCache) {
+            stats_.staleSamples++;
+            stats_.lastStale = text("FS texture %llu at %#llx: ", i, base) +
+                               (inCcu ? "still in the CCU (no PC_CCU_FLUSH_COLOR_TS since it was written)" : "flushed, but no CACHE_INVALIDATE since");
         }
     }
     {
@@ -1990,6 +2008,11 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     drawsInSubmission_++;
     drawsWithoutCcuFlush_++;
     drawsWithoutCacheFlush_++;
+    if (!inTile_) {
+        for (uint32_t t = 0; t < d.mrtCount; t++) {
+            if (((unwrittenMask >> t) & 1) == 0 && d.mrtBases[t] != 0) ccuDirty_.push_back({d.mrtBases[t], d.mrtBases[t] + drawExtent_[t]});
+        }
+    }
     samples_ += uint64_t(d.numIndices) * d.numInstances;
     d.vsConsts = vs_.consts;
     d.fsConsts = fs_.consts;
@@ -2247,6 +2270,9 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == BLIT && !eventBlit()) {
                     return false;
                 }
+                if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE) {
+                    cacheStale_.clear();   // (ws-hm-perf2) the texture caches dropped: what was flushed reads as memory holds it
+                }
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == ZPASS_DONE) {
                     if ((reg(REG_A6XX_RB_SAMPLE_COUNT_CONTROL) & A6XX_RB_SAMPLE_COUNT_CONTROL_COPY) == 0) {
                         fault("ZPASS_DONE without RB_SAMPLE_COUNT_CONTROL.COPY: no count is written");
@@ -2280,7 +2306,11 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     // what a draw needs after it: the colour CCU flushed to memory (tu6_emit_flushes / fd6_emit_flushes: the
                     // 4-word form with an address, freedreno_gpu_event.h:60-85 needs_seqno) and then the cache flush
                     uint32_t ev = fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT);
-                    if (ev == PC_CCU_FLUSH_COLOR_TS) drawsWithoutCcuFlush_ = 0;
+                    if (ev == PC_CCU_FLUSH_COLOR_TS) {
+                        drawsWithoutCcuFlush_ = 0;
+                        cacheStale_.insert(cacheStale_.end(), ccuDirty_.begin(), ccuDirty_.end());   // (ws-hm-perf2)
+                        ccuDirty_.clear();
+                    }
                     if (ev == PC_CCU_FLUSH_DEPTH_TS) drawsWithoutDepthFlush_ = 0;
                     if (ev == CACHE_FLUSH_TS) drawsWithoutCacheFlush_ = 0;
                 }
@@ -2473,6 +2503,8 @@ void FakeGpu::run(const Job& job) {
     passBegun_ = ccuCntlWritten_ = ccuCntlAfterWfi_ = lastWasWfi_ = inTile_ = binning_ = false;
     drawsInSubmission_ = drawsWithoutCcuFlush_ = drawsWithoutCacheFlush_ = drawsWithoutDepthFlush_ = 0;
     written_.clear();
+    ccuDirty_.clear();     // (ws-hm-perf2) the kernel invalidates both CCUs and the last submission ended flushed
+    cacheStale_.clear();
     bool ok = execute(job.address, job.words, 0);
     if (ok && drawsInSubmission_ != 0) {
         // the colour a draw wrote sits in the CCU until PC_CCU_FLUSH_COLOR_TS (the kernel's own end-of-submit fence

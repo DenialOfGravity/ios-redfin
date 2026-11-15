@@ -633,6 +633,17 @@ void hakios_metal_cb_gpu_split(hakios_metal_cb *cb, int64_t *queued, int64_t *ru
 /* (redfin) the GPU's own start and end of a completed buffer (CP_ALWAYS_ON_COUNTER stamps), as nanoseconds after its
  * commit (*start_ns may be negative by the calibration's error): 0, or -1 when there are none (not completed, HM_GPU_STAMPS=0) */
 int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *end_ns);
+/* (ws-hm-perf2) a completed buffer's sync line for HM_PROF, into OUT[0..N-1] (N at most 24; the count filled is returned):
+ * [0] the GPU's own time for it, ns (its CP_ALWAYS_ON_COUNTER stamps; 0 none), [1] the same for the decode buffers sent
+ * just before it, [2] stream words, [3] of them register writes, [4] CP_WAIT_FOR_IDLE, [5] PC_CCU_FLUSH_COLOR_TS,
+ * [6] PC_CCU_FLUSH_DEPTH_TS, [7] CACHE_FLUSH_TS, [8] waits on memory (CP_WAIT_REG_MEM, CP_WAIT_MEM_GTE),
+ * [9] CACHE_INVALIDATE, [10] CCU invalidates, [11] words the command processor copied (CP_MEMCPY), [12] pass
+ * tails left out (HM_PASS_FLUSH=lazy), [13] full barriers, [14] invalidate-only barriers, [15] full tails for lazily
+ * ended passes, [16] heads that went on from the pass before (HM_PASS_STATIC), [17] joins across store actions
+ * (HM_PASS_MERGE), [18] copies and fills by the command processor (unstamped), [19] their bytes, [20] passes,
+ * [21] draws, [22] CP_BLIT packets, [23] CP_SET_MARKER packets. The census ([2]-[11], [22], [23]) is made only for a
+ * profiled buffer (hakios_metal_cb_set_profile). */
+int hakios_metal_cb_sync_counts(hakios_metal_cb *cb, unsigned long long *out, int n);
 
 #ifdef __cplusplus
 }
