@@ -2592,15 +2592,15 @@ sysctl_sweet_scangate SYSCTL_HANDLER_ARGS
 	if (error || !changed) {
 		return error;
 	}
-	if (value < 0 || value > (what == 0 ? 3 : 1)) {
+	if (value < 0 || value > (what == 0 ? 4 : 2)) {        /* 1109: gate 4 (none), tribuf 2 (complete when off screen) */
 		return EINVAL;
 	}
 	return sweet_scan_gate_put(what, value);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    (void *)0, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: gate 0 back pressure, 1 CPU, 2 CP, 3 per surface (1105)");
+    (void *)0, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: gate 0 back pressure, 1 CPU, 2 CP, 3 per surface (1105), 4 none (1109)");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: honest SwapWait polls, 3-surface chain (0996 tribuf)");
+    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109)");
 
 /*
  * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
