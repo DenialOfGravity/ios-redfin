@@ -738,6 +738,7 @@ void CommandBuffer::finish(Status s) {
     }
     handlers_.clear();
     kept_.clear();
+    forgetKeeps();   // (ws-hm-plugcpu)
     slab_.reset();
     queue_.giveSlabs(&slabs_);   // (done with: the GPU has finished with this buffer, or never had it)
     keptAny_.clear();

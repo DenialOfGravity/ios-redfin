@@ -4581,11 +4581,212 @@ def apply(src, edits=EDITS):
     return src
 
 
+# (ws-hm-plugcpu) HM_PLUG_FAST=1: the plug-in's share of a draw's CPU cut, each piece behind the switch (0, the default:
+# today's code exactly). Applied to the finished text (after hmt_scopes), each by exact text as the others:
+#   - the specialisation lookup: each pipeline keeps the last configuration it answered with a finished specialisation
+#     (the key's bytes, masked or not, and the program) under an os_unfair_lock; the same bytes again are that program
+#     without an NSData key, the @synchronized lock or the dictionary. A program in _specialised is never replaced nor
+#     freed before the pipeline, so the remembered one is what the dictionary would answer. hm_v7_wait's answer kept
+#     once it is yes (it never turns back), asked again while no only when the program's hangs reach HM_HANG_BLAME's count
+#   - the encoder's bound slots: each slot's hakios handle taken when it is bound (setters), so that a draw walks no slot
+#     and sends no message per slot (buffers, textures, samplers; handles never change for an object's life)
+#   - the hooks (HM_DD, metal_trace/metal_skip, metal_dump=cfg, metal_fps=timeline) read once an encoder, at its
+#     making: none of them can change while it records (process-wide, read once); the luma-boost name test once a
+#     pipeline bound (the knob itself is still read every draw, as it can change at any time)
+# Not here: HMT's scopes (no-ops unless HM_TRACE/HM_PROF), the C interface's allocations (upstream c_api.cpp, the same
+# switch read there).
+HM_PLUGCPU_EDITS = [
+    # the switch, and the hooks' test functions declared before the encoder's making
+    ('/* boot-arg metal_nospec: every draw with the pipeline\'s own program, no uber shader specialised */\n',
+     '/* (ws-hm-plugcpu) HM_PLUG_FAST=1: the draw path\'s CPU cut (bench/plugin.py HM_PLUGCPU_EDITS); 0 (default) as before */\n'
+     'static int\n'
+     'hm_plug_fast(void)\n'
+     '{\n'
+     '\tstatic int on = -1;\n'
+     '\n'
+     '\tif (on < 0) {\n'
+     '\t\tconst char *e = getenv("HM_PLUG_FAST");\n'
+     '\n'
+     '\t\ton = e != NULL && e[0] == \'1\';\n'
+     '\t\tif (on) hm_print("plug fast: on (HM_PLUG_FAST=1): specialisation cache, bound handles, hooks read once an encoder\\n");\n'
+     '\t}\n'
+     '\treturn on;\n'
+     '}\n'
+     '\n'
+     '/* boot-arg metal_nospec: every draw with the pipeline\'s own program, no uber shader specialised */\n'),
+    ('@interface HakiosMetalRenderPipelineState : _MTLRenderPipelineState {\n',
+     '#include <os/lock.h>   /* (ws-hm-plugcpu) */\n'
+     'static int hm_plug_fast(void);\n'
+     'static BOOL hm_tracing(void);\n'
+     'static const char *hm_skip_word(void);\n'
+     '\n'
+     '/* (ws-hm-plugcpu) boot-arg metal_dump=cfg:NAME set (hm_dump_config does something) */\n'
+     'static BOOL\n'
+     'hm_dump_cfg_on(void)\n'
+     '{\n'
+     '\tstatic int on = -1;\n'
+     '\n'
+     '\tif (on < 0) {\n'
+     '\t\tchar args[1024] = {0};\n'
+     '\t\tsize_t size = sizeof(args) - 1;\n'
+     '\t\tconst char *at;\n'
+     '\n'
+     '\t\ton = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dump=cfg:")) != NULL &&\n'
+     '\t\t     at[strlen("metal_dump=cfg:")] != \'\\0\' && at[strlen("metal_dump=cfg:")] != \' \';\n'
+     '\t}\n'
+     '\treturn on != 0;\n'
+     '}\n'
+     '\n'
+     '@interface HakiosMetalRenderPipelineState : _MTLRenderPipelineState {\n'),
+    ('\tunsigned _specSeen;              /* configurations specialised so far (the waited-for ones) */\n}\n',
+     '\tunsigned _specSeen;              /* configurations specialised so far (the waited-for ones) */\n'
+     '\t/* (ws-hm-plugcpu) HM_PLUG_FAST: the last configuration answered with a finished specialisation */\n'
+     '\tos_unfair_lock _hmFastLock;\n'
+     '\tint _hmFastValid, _hmFastMasked;  /* _hmFastKey/_hmFastProg hold one; the key\'s never-read bytes as 0 (HM_SPEC_MASK) */\n'
+     '\tunsigned char _hmFastKey[256];\n'
+     '\thakios_metal_program *_hmFastProg;\n'
+     '\tint _hmFastWait;                 /* hm_v7_wait: 0 not asked, 1 yes (for good), 2 no when last asked */\n'
+     '}\n'),
+    # hm_v7_wait's answer
+    ('\tif (_specialised == nil) return _program;\n\tconst int wait = hm_v7_wait(_program);\n',
+     '\tif (_specialised == nil) return _program;\n'
+     '\tint wait;\n'
+     '\tif (!hm_plug_fast()) {\n'
+     '\t\twait = hm_v7_wait(_program);\n'
+     '\t} else if (_hmFastWait == 1) {   /* (ws-hm-plugcpu) yes stays yes */\n'
+     '\t\twait = 1;\n'
+     '\t} else if (_hmFastWait == 0) {\n'
+     '\t\twait = hm_v7_wait(_program);\n'
+     '\t\t_hmFastWait = wait ? 1 : 2;\n'
+     '\t} else {   /* no: what can turn it is the program\'s hangs (HM_HANG_BLAME); the rest is the environment, read once */\n'
+     '\t\tconst int after = hm_v7_blame_after();\n'
+     '\n'
+     '\t\twait = after && hakios_metal_program_hangs(_program) >= (unsigned)after ? hm_v7_wait(_program) : 0;\n'
+     '\t\tif (wait) _hmFastWait = 1;\n'
+     '\t}\n'),
+    # the cache's lookup, before the key object
+    ('\tNSData *key;\n\tif (__atomic_load_n(&_specMaskRead, __ATOMIC_ACQUIRE) >= 0) {   /* (redfin hm-int4) HM_SPEC_MASK: the bytes it never reads left out (as 0) */\n',
+     '\tconst int hmMasked = __atomic_load_n(&_specMaskRead, __ATOMIC_ACQUIRE) >= 0;   /* (ws-hm-plugcpu) read once for both */\n'
+     '\tif (hm_plug_fast()) {   /* (ws-hm-plugcpu) the same configuration as the last one answered: its program */\n'
+     '\t\tunsigned char kb[256];\n'
+     '\t\tconst unsigned char *kp = bytes + at;\n'
+     '\t\thakios_metal_program *hit = NULL;\n'
+     '\n'
+     '\t\tif (hmMasked) {\n'
+     '\t\t\tfor (unsigned i = 0; i < _specLength; i++) kb[i] = _specMask[i] ? bytes[at + i] : 0;\n'
+     '\t\t\tkp = kb;\n'
+     '\t\t}\n'
+     '\t\tos_unfair_lock_lock(&_hmFastLock);\n'
+     '\t\tif (_hmFastValid && _hmFastMasked == hmMasked && memcmp(_hmFastKey, kp, _specLength) == 0) hit = _hmFastProg;\n'
+     '\t\tos_unfair_lock_unlock(&_hmFastLock);\n'
+     '\t\tif (hit != NULL) return hit;\n'
+     '\t}\n'
+     '\tNSData *key;\n'
+     '\tif (hmMasked) {   /* (redfin hm-int4) HM_SPEC_MASK: the bytes it never reads left out (as 0) */\n'),
+    # ... and its filling, where the dictionary answered a finished one
+    ('\t\tif ([have isKindOfClass:[NSValue class]]) {   /* (a failed one is a string, never an NSValue) */\n'
+     '\t\t\tfound = (hakios_metal_program *)[have pointerValue];\n',
+     '\t\tif ([have isKindOfClass:[NSValue class]]) {   /* (a failed one is a string, never an NSValue) */\n'
+     '\t\t\tfound = (hakios_metal_program *)[have pointerValue];\n'
+     '\t\t\tif (hm_plug_fast() && found != NULL && [key length] <= sizeof(_hmFastKey)) {   /* (ws-hm-plugcpu) remembered */\n'
+     '\t\t\t\tos_unfair_lock_lock(&_hmFastLock);\n'
+     '\t\t\t\tmemcpy(_hmFastKey, [key bytes], [key length]);\n'
+     '\t\t\t\t_hmFastMasked = hmMasked;\n'
+     '\t\t\t\t_hmFastProg = found;\n'
+     '\t\t\t\t_hmFastValid = 1;\n'
+     '\t\t\t\tos_unfair_lock_unlock(&_hmFastLock);\n'
+     '\t\t\t}\n'),
+    # the encoder's state
+    ('\tNSMutableIndexSet *_visibilityCounted;      /* the result words (offset / 8) a draw of this encoder has counted into */\n}\n',
+     '\tNSMutableIndexSet *_visibilityCounted;      /* the result words (offset / 8) a draw of this encoder has counted into */\n'
+     '\t/* (ws-hm-plugcpu) HM_PLUG_FAST: each bound slot\'s hakios handle, taken by the setters; the switch and the hooks read\n'
+     '\t * at the encoder\'s making (bits: 1 HM_DD, 2 metal_trace/metal_skip, 4 metal_dump=cfg, 8 metal_fps=timeline);\n'
+     '\t * the bound pipeline\'s program a luma-boost one */\n'
+     '\thakios_metal_buffer *_hmVsH[HM_MAX_BUFFERS], *_hmFsH[HM_MAX_BUFFERS];\n'
+     '\thakios_metal_texture *_hmVsTexH[HM_MAX_TEXTURES], *_hmFsTexH[HM_MAX_TEXTURES];\n'
+     '\thakios_metal_sampler *_hmVsSampH[HM_MAX_SAMPLERS], *_hmFsSampH[HM_MAX_SAMPLERS];\n'
+     '\tint _hmFast, _hmHooks;\n'
+     '\tBOOL _hmPipeLuma;\n'
+     '}\n'),
+    ('\t_pass = *pass;\n\t_frontFacingWinding = MTLWindingClockwise;   /* Metal\'s default */\n\treturn self;\n',
+     '\t_pass = *pass;\n\t_frontFacingWinding = MTLWindingClockwise;   /* Metal\'s default */\n'
+     '\t_hmFast = hm_plug_fast();   /* (ws-hm-plugcpu) */\n'
+     '\tif (_hmFast) {\n'
+     '\t\t_hmHooks = (hm_dd_on() ? 1 : 0) | (hm_tracing() || hm_skip_word() != NULL ? 2 : 0) | (hm_dump_cfg_on() ? 4 : 0) |\n'
+     '\t\t\t   (hm_timeline_on() ? 8 : 0);\n'
+     '\t}\n'
+     '\treturn self;\n'),
+    ('\t\tsnprintf(_refused, sizeof(_refused), "the render pipeline state is not this device\'s");\n\t\treturn;\n\t}\n\t[state retain];\n\t[_pipeline release];\n\t_pipeline = state;\n}\n',
+     '\t\tsnprintf(_refused, sizeof(_refused), "the render pipeline state is not this device\'s");\n\t\treturn;\n\t}\n\t[state retain];\n\t[_pipeline release];\n\t_pipeline = state;\n'
+     '\tif (_hmFast) {   /* (ws-hm-plugcpu) the name is the program\'s for its life */\n'
+     '\t\tconst char *name = _pipeline != nil ? hakios_metal_program_name([_pipeline hakiosProgram]) : NULL;\n'
+     '\n'
+     '\t\t_hmPipeLuma = name != NULL && strstr(name, "+luma_boost_l") != NULL;\n'
+     '\t}\n'
+     '}\n'),
+    # the setters keep the handles
+    ('\t[buffer retain];\n\t[table[index] release];\n\ttable[index] = buffer;\n\toffsets[index] = offset;\n',
+     '\t[buffer retain];\n\t[table[index] release];\n\ttable[index] = buffer;\n\toffsets[index] = offset;\n'
+     '\tif (_hmFast) {   /* (ws-hm-plugcpu) */\n'
+     '\t\t(table == _vsBuffers ? _hmVsH : _hmFsH)[index] = buffer != nil ? [(HakiosMetalBuffer *)buffer hakiosBuffer] : NULL;\n'
+     '\t}\n'),
+    ('\tHakiosMetalTexture **table = vertex ? _vsTextures : _fsTextures;\n'
+     '\tunsigned *highest = vertex ? &_vsHighestTexture : &_fsHighestTexture;\n'
+     '\t[texture retain];\n\t[table[index] release];\n\ttable[index] = texture;\n',
+     '\tHakiosMetalTexture **table = vertex ? _vsTextures : _fsTextures;\n'
+     '\tunsigned *highest = vertex ? &_vsHighestTexture : &_fsHighestTexture;\n'
+     '\t[texture retain];\n\t[table[index] release];\n\ttable[index] = texture;\n'
+     '\tif (_hmFast) {   /* (ws-hm-plugcpu) */\n'
+     '\t\t(vertex ? _hmVsTexH : _hmFsTexH)[index] = texture != nil ? [(HakiosMetalTexture *)texture hakiosTexture] : NULL;\n'
+     '\t}\n'),
+    ('\tHakiosMetalSamplerState **table = vertex ? _vsSamplers : _fsSamplers;\n'
+     '\tunsigned *highest = vertex ? &_vsHighestSampler : &_fsHighestSampler;\n'
+     '\t[sampler retain];\n\t[table[index] release];\n\ttable[index] = sampler;\n',
+     '\tHakiosMetalSamplerState **table = vertex ? _vsSamplers : _fsSamplers;\n'
+     '\tunsigned *highest = vertex ? &_vsHighestSampler : &_fsHighestSampler;\n'
+     '\t[sampler retain];\n\t[table[index] release];\n\ttable[index] = sampler;\n'
+     '\tif (_hmFast) {   /* (ws-hm-plugcpu) */\n'
+     '\t\t(vertex ? _hmVsSampH : _hmFsSampH)[index] = sampler != nil ? [(HakiosMetalSamplerState *)sampler hakiosSampler] : NULL;\n'
+     '\t}\n'),
+    # the draw: the handles as the setters left them, no walk; the hooks as read at the making
+    ('\thakios_metal_buffer *vs[HM_MAX_BUFFERS], *fs[HM_MAX_BUFFERS];\n'
+     '\t/* an indirect draw\'s buffer, taken here so that no return below leaves it for the next draw */\n',
+     '\thakios_metal_buffer *vsArr[HM_MAX_BUFFERS], *fsArr[HM_MAX_BUFFERS];\n'
+     '\thakios_metal_buffer **vs = vsArr, **fs = fsArr;   /* (ws-hm-plugcpu) or the encoder\'s handles */\n'
+     '\t/* an indirect draw\'s buffer, taken here so that no return below leaves it for the next draw */\n'),
+    ('\thakios_metal_texture *fsTex[HM_MAX_TEXTURES], *vsTex[HM_MAX_TEXTURES];\n'
+     '\thakios_metal_sampler *fsSamp[HM_MAX_SAMPLERS], *vsSamp[HM_MAX_SAMPLERS];\n\n\tif (_pipeline == nil) {\n',
+     '\thakios_metal_texture *fsTexArr[HM_MAX_TEXTURES], *vsTexArr[HM_MAX_TEXTURES];\n'
+     '\thakios_metal_sampler *fsSampArr[HM_MAX_SAMPLERS], *vsSampArr[HM_MAX_SAMPLERS];\n'
+     '\thakios_metal_texture **fsTex = fsTexArr, **vsTex = vsTexArr;\n'
+     '\thakios_metal_sampler **fsSamp = fsSampArr, **vsSamp = vsSampArr;\n\n\tif (_pipeline == nil) {\n'),
+    ('\tfor (unsigned i = 0; i < _vsHighest; i++) {\n\t\tvs[i] = _vsBuffers[i] != nil ? [_vsBuffers[i] hakiosBuffer] : NULL;\n\t}\n',
+     '\tif (_hmFast && !(_hmHooks & 8)) {   /* (ws-hm-plugcpu) the setters\' handles (metal_fps=timeline: its walk below) */\n'
+     '\t\tvs = _hmVsH, fs = _hmFsH, fsTex = _hmFsTexH, vsTex = _hmVsTexH, fsSamp = _hmFsSampH, vsSamp = _hmVsSampH;\n'
+     '\t} else {\n'
+     '\tfor (unsigned i = 0; i < _vsHighest; i++) {\n\t\tvs[i] = _vsBuffers[i] != nil ? [_vsBuffers[i] hakiosBuffer] : NULL;\n\t}\n'),
+    ('\tfor (unsigned i = 0; i < _vsHighestSampler; i++) {\n\t\tvsSamp[i] = _vsSamplers[i] != nil ? [_vsSamplers[i] hakiosSampler] : NULL;\n\t}\n',
+     '\tfor (unsigned i = 0; i < _vsHighestSampler; i++) {\n\t\tvsSamp[i] = _vsSamplers[i] != nil ? [_vsSamplers[i] hakiosSampler] : NULL;\n\t}\n'
+     '\t}   /* (ws-hm-plugcpu) */\n'),
+    ('\thm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);\n\tif (hm_dd_on()) {   /* (ws-hm-alib) HM_DD */\n',
+     '\tif (!_hmFast || (_hmHooks & 4)) hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);   /* (ws-hm-plugcpu) */\n'
+     '\tif (_hmFast ? (_hmHooks & 1) != 0 : hm_dd_on()) {   /* (ws-hm-alib) HM_DD */\n'),
+    ('\tif (hm_trace_draw([_pipeline hakiosProgram], hakios_metal_program_name([_pipeline hakiosProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {\n'
+     '\t\treturn;\n\t}\n'
+     '\tif (hm_luma_boost_left_out(hakios_metal_program_name([_pipeline hakiosProgram]))) {\n',
+     '\tif ((!_hmFast || (_hmHooks & 2)) &&   /* (ws-hm-plugcpu) */\n'
+     '\t    hm_trace_draw([_pipeline hakiosProgram], hakios_metal_program_name([_pipeline hakiosProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {\n'
+     '\t\treturn;\n\t}\n'
+     '\tif ((!_hmFast || _hmPipeLuma) && hm_luma_boost_left_out(hakios_metal_program_name([_pipeline hakiosProgram]))) {   /* (ws-hm-plugcpu) */\n'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
+    src = apply(src, HM_PLUGCPU_EDITS)   # (ws-hm-plugcpu) on the finished text
     open(sys.argv[2], 'w').write(src)
-    print('plugin.py: %d edits, %d hm-trace scopes' % (len(EDITS), sum(scopes.values())))
+    print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS)))
 
 
 if __name__ == '__main__':
