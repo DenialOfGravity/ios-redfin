@@ -35,6 +35,10 @@
 #include <set>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "NativeAdrenoABI.h"
 #include "hakios-metal/prof.hpp"
 
@@ -117,10 +121,54 @@ int errnoOf(kern_return_t r, uint32_t method) {
     }
 }
 
+
+// (ws-hm-csdiff) HM_RD_DUMP=<dir>: the submissions this process sends, as Mesa's freedreno .rd files (cffdump, crashdec,
+// rddecompiler read them), so that hm's command stream and Turnip's (FD_RD_DUMP=trigger) can be decoded and diffed.
+// Unset, empty or "0" (the default): off, one cached branch per submission and nothing else. Set: the trigger file
+// <dir>/hm_<process>_<pid>.trigger (made at the first submission, mode 0666) is read before every submission; a number N
+// written into it dumps the next N submissions (-1: until 0 is written; HM_RD_DUMP_START=N arms N at the start), each as
+// <dir>/hm_<process>_<pid>_submit<NNNNN>.rd (plain, not gzipped): RD_CMD, RD_GPU_ID, then per BO an RD_GPUADDR and, for a
+// driver-made BO of at most HM_RD_DUMP_MAXKB KiB (default 4096) that the CPU has mapped, its RD_BUFFER_CONTENTS, then the
+// IB's RD_CMDSTREAM_ADDR. HM_RD_DUMP_BOS=all: every BO of this process, not only those the submission names (what the
+// core does not name, e.g. a texture read through a descriptor, is then decodable too). Imported memory (IOSurfaces,
+// userptr) gets its address and size only, unless HM_RD_DUMP_SURF=1. Taken before the kernel's Submit, under the lock.
+namespace rddump {
+struct Env {
+    std::string dir;
+    uint32_t maxBytes = 4096u << 10;
+    bool allBos = false, surfaces = false;
+    int start = 0;
+};
+Env readEnv() {
+        Env v;
+        const char* d = getenv("HM_RD_DUMP");
+        if (d != nullptr && d[0] != 0 && strcmp(d, "0") != 0) v.dir = d;
+        if (const char* m = getenv("HM_RD_DUMP_MAXKB"); m != nullptr && m[0] != 0) v.maxBytes = uint32_t(strtoul(m, nullptr, 10)) << 10;
+        if (const char* b = getenv("HM_RD_DUMP_BOS"); b != nullptr && strcmp(b, "all") == 0) v.allBos = true;
+        if (const char* f = getenv("HM_RD_DUMP_SURF"); f != nullptr && atoi(f) != 0) v.surfaces = true;
+        if (const char* n = getenv("HM_RD_DUMP_START"); n != nullptr && n[0] != 0) v.start = atoi(n);
+        return v;
+}
+const char* progName() {
+#ifdef __APPLE__
+    return getprogname();
+#else
+    return program_invocation_short_name;
+#endif
+}
+// Mesa's redump.h section ids
+enum : uint32_t { kRdCmd = 2, kRdGpuAddr = 3, kRdCmdstreamAddr = 6, kRdBufferContents = 12, kRdGpuId = 13 };
+bool section(FILE* f, uint32_t type, const void* data, uint32_t bytes) {
+    const uint32_t h[2] = {type, bytes};
+    return fwrite(h, 4, 2, f) == 2 && (bytes == 0 || fwrite(data, 1, bytes, f) == bytes);
+}
+}  // namespace rddump
+
 class NativeAdreno : public Transport {
 public:
     explicit NativeAdreno(io_connect_t c) : c_(c) { mach_timebase_info(&timebase_); }
     ~NativeAdreno() override {
+        if (rdTriggerFd_ >= 0) close(rdTriggerFd_);   // (ws-hm-csdiff) HM_RD_DUMP
         // what the core left open goes with the connection in the kernel too; free it here so a test's fake sees it
         std::vector<uint32_t> left;
         for (const auto& [h, b] : bos_) left.push_back(h);
@@ -139,6 +187,7 @@ public:
             return false;
         }
         params_ = q;
+        rd_ = rddump::readEnv();   // (ws-hm-csdiff) HM_RD_DUMP
         if (kern_return_t r = method(NativeAdrenoMethodGetDeviceInfo, nullptr, 0, &info_, sizeof(info_))) {
             *why = "NativeAdreno GetDeviceInfo failed: " + std::to_string(r);
             return false;
@@ -568,6 +617,7 @@ private:
             dcacheFlush(b->importBase, b->bytes, true);
             b->invalPending = false;   // (ws-hm-int6) dc civac: cleaned and invalidated
         }
+        if (!rd_.dir.empty() && rdArmed() != 0) rdDump(s, bos, named, ib, *cmd);   // (ws-hm-csdiff) HM_RD_DUMP
         NativeAdrenoAbiSubmit q{};
         q.buffer_count = 1;
         q.queue = 0;   // one ring (xnu 0115: every queue is queue 0)
@@ -684,6 +734,79 @@ private:
         }
     }
 
+    // (ws-hm-csdiff) HM_RD_DUMP (see rddump above): how many submissions are still to be dumped, read from the trigger
+    int rdArmed() {
+        const auto& e = rd_;
+        if (rdTriggerFd_ == -2) {   // first submission with the switch on
+            char path[512];
+            snprintf(path, sizeof path, "%s/hm_%s_%d.trigger", e.dir.c_str(), rddump::progName(), int(getpid()));
+            rdTriggerFd_ = open(path, O_RDWR | O_CREAT, 0666);
+            if (rdTriggerFd_ >= 0) fchmod(rdTriggerFd_, 0666);
+            rdLeft_ = e.start;
+            fprintf(stderr, "hakios-metal: HM_RD_DUMP: trigger %s (%s), %d submissions armed\n", path,
+                    rdTriggerFd_ >= 0 ? "open" : strerror(errno), rdLeft_);
+        }
+        if (rdTriggerFd_ >= 0) {
+            struct stat st {};
+            if (fstat(rdTriggerFd_, &st) == 0 && st.st_size > 0) {
+                char buf[32] = {};
+                const ssize_t n = pread(rdTriggerFd_, buf, sizeof buf - 1, 0);
+                if (ftruncate(rdTriggerFd_, 0) != 0) {}
+                if (n > 0) {
+                    rdLeft_ = int(strtol(buf, nullptr, 0));
+                    fprintf(stderr, "hakios-metal: HM_RD_DUMP: trigger says %d\n", rdLeft_);
+                }
+            }
+        }
+        return rdLeft_;
+    }
+
+    void rdDump(const MsmGemSubmit& s, const MsmSubmitBo* bos, const std::vector<Bo*>& named, const Bo& ib, const MsmSubmitCmd& cmd) {
+        const auto& e = rd_;
+        char path[600];
+        snprintf(path, sizeof path, "%s/hm_%s_%d_submit%05u.rd", e.dir.c_str(), rddump::progName(), int(getpid()), rdSeq_);
+        FILE* f = fopen(path, "wb");
+        if (f == nullptr) {
+            fprintf(stderr, "hakios-metal: HM_RD_DUMP: %s: %s\n", path, strerror(errno));
+            rdLeft_ = 0;
+            return;
+        }
+        char what[96];
+        const int wn = snprintf(what, sizeof what, "hm-dump %s submit %u", rddump::progName(), rdSeq_);
+        bool ok = rddump::section(f, rddump::kRdCmd, what, uint32_t(wn + 1));
+        // Mesa's gpu_id from the chip id 0xMMmmPPxx (A620 0x06020000 -> 620)
+        const uint32_t c = info_.chip_id;
+        const uint32_t gpuId = ((c >> 24) & 0xff) * 100 + ((c >> 16) & 0xff) * 10 + ((c >> 8) & 0xff);
+        ok = ok && rddump::section(f, rddump::kRdGpuId, &gpuId, 4);
+        std::set<uint32_t> done;
+        uint64_t contents = 0;
+        unsigned nbo = 0;
+        auto one = [&](const Bo& b) {
+            const uint32_t a[3] = {uint32_t(b.iova), uint32_t(b.bytes), uint32_t(b.iova >> 32)};
+            ok = ok && rddump::section(f, rddump::kRdGpuAddr, a, 12);
+            const void* p = b.imported ? (e.surfaces ? b.importBase : nullptr) : b.cpu;
+            if (p != nullptr && (b.bytes <= e.maxBytes || &b == &ib)) {   // the IB's own BO always
+                ok = ok && rddump::section(f, rddump::kRdBufferContents, p, uint32_t(b.bytes));
+                contents += b.bytes;
+            }
+            nbo++;
+        };
+        if (e.allBos) {
+            for (const auto& [h, b] : bos_) one(b);
+        } else {
+            for (uint32_t i = 0; i < s.nr_bos; i++)
+                if (done.insert(bos[i].handle).second) one(*named[i]);
+        }
+        const uint64_t at = ib.iova + cmd.submit_offset;
+        const uint32_t a[3] = {uint32_t(at), cmd.size / 4, uint32_t(at >> 32)};
+        ok = ok && rddump::section(f, rddump::kRdCmdstreamAddr, a, 12);
+        ok = (fclose(f) == 0) && ok;
+        fprintf(stderr, "hakios-metal: HM_RD_DUMP: %s: %u BOs, %llu KB of contents, IB %u dwords at 0x%llx%s\n", path, nbo,
+                (unsigned long long)(contents >> 10), cmd.size / 4, (unsigned long long)at, ok ? "" : " (WRITE FAILED)");
+        rdSeq_++;
+        if (rdLeft_ > 0) rdLeft_--;
+    }
+
     io_connect_t c_;
     mach_timebase_info_data_t timebase_{};
     std::mutex lock_;
@@ -700,6 +823,10 @@ private:
     uint32_t enoents_ = 0;
     uint32_t nextHandle_ = 1, nextQueue_ = 1;
     uint32_t highestFence_ = 0, passedFence_ = 0;
+    rddump::Env rd_;         // (ws-hm-csdiff) HM_RD_DUMP's switches, read when the transport starts
+    int rdTriggerFd_ = -2;   // (ws-hm-csdiff) HM_RD_DUMP: -2 not looked at yet, -1 no trigger file
+    int rdLeft_ = 0;
+    uint32_t rdSeq_ = 0;
 };
 
 }  // namespace

@@ -165,3 +165,11 @@ HM_PREWARM=1
 #HM_DEFER=0
 #HM_DEFER_NAME=hakios.metal.defer
 #HM_DEFER_THREAD=com.apple.coreanimation.
+
+# (ws-hm-csdiff) HM_RD_DUMP=<dir>: the command stream as Mesa .rd files for cffdump / tools-claude/rd-summary.py (default
+# off). With it set, write a number N into <dir>/hm_<process>_<pid>.trigger to dump the next N submissions as
+# <dir>/hm_<process>_<pid>_submitNNNNN.rd; HM_RD_DUMP_BOS=all every BO of the process (default: those the submission
+# names), HM_RD_DUMP_MAXKB=4096 the largest BO whose contents go in, HM_RD_DUMP_SURF=1 IOSurface contents too,
+# HM_RD_DUMP_START=N armed for N at the start. The directory must exist and be writable (mode 777).
+#HM_RD_DUMP=/var/local/hmetal/rd
+#HM_RD_DUMP_BOS=all
