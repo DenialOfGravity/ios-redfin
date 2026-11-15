@@ -3,6 +3,9 @@
 #include <cerrno>
 #include <cstring>
 #include <thread>
+#include <unistd.h>
+#include <cstdio>
+#include <string>
 #include <cstdlib>
 
 #include "fake_native_adreno.hpp"
@@ -430,4 +433,100 @@ TEST(transport_flush_after_lazy_leaves_the_display_surfaces_invalidate_for_the_c
     d.reset();
     CHECK_EQ(word(disp + 320), 0xf6u);
     o.reset();
+}
+
+// (ws-hm-csdiff) HM_RD_DUMP: off by default (no file, no trigger); on, the trigger arms N submissions and each becomes a
+// Mesa .rd file: RD_CMD, RD_GPU_ID, the named BOs (GPUADDR + contents), the IB's CMDSTREAM_ADDR
+namespace {
+std::vector<std::pair<uint32_t, std::vector<uint8_t>>> readRd(const std::string& path) {
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> out;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == nullptr) return out;
+    uint32_t h[2];
+    while (fread(h, 4, 2, f) == 2) {
+        std::vector<uint8_t> d(h[1]);
+        if (h[1] != 0 && fread(d.data(), 1, h[1], f) != h[1]) break;
+        out.emplace_back(h[0], std::move(d));
+    }
+    fclose(f);
+    return out;
+}
+std::string rdDir() {
+    char t[] = "/tmp/hm-rd-XXXXXX";
+    const char* d = mkdtemp(t);
+    return d != nullptr ? d : "";
+}
+}  // namespace
+
+TEST(transport_rd_dump_is_off_by_default) {
+    unsetenv("HM_RD_DUMP");
+    Rig r;
+    int e = 0;
+    auto ib = r.gpu->newBo(4096, 0, &e);
+    auto dst = r.gpu->newBo(4096, 0, &e);
+    uint32_t fence = 0;
+    CHECK_EQ(run(r, *ib, memWrite(dst->gpuAddress(), {1}), {{dst.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+}
+
+TEST(transport_rd_dump_trigger_writes_rd_files) {
+    const std::string dir = rdDir();
+    CHECK(!dir.empty());
+    setenv("HM_RD_DUMP", dir.c_str(), 1);
+    setenv("HM_RD_DUMP_START", "0", 1);
+    {
+        Rig r;
+        int e = 0;
+        auto ib = r.gpu->newBo(4096, 0, &e);
+        auto dst = r.gpu->newBo(8192, 0, &e);
+        uint32_t fence = 0;
+        // not armed yet: nothing written, the trigger file made
+        CHECK_EQ(run(r, *ib, memWrite(dst->gpuAddress(), {1}), {{dst.get(), true}}, &fence), 0);
+        const std::string trig = dir + "/hm_" + program_invocation_short_name + "_" + std::to_string(getpid()) + ".trigger";
+        CHECK(access(trig.c_str(), W_OK) == 0);
+        const std::string first = dir + "/hm_" + program_invocation_short_name + "_" + std::to_string(getpid()) + "_submit00000.rd";
+        CHECK(access(first.c_str(), F_OK) != 0);
+        // armed for 1: the next submission dumped, the one after not
+        FILE* t = fopen(trig.c_str(), "w");
+        CHECK(t != nullptr);
+        fputs("1\n", t);
+        fclose(t);
+        CHECK_EQ(run(r, *ib, memWrite(dst->gpuAddress() + 8, {0xcafe0001, 0xcafe0002}), {{dst.get(), true}}, &fence), 0);
+        CHECK_EQ(run(r, *ib, memWrite(dst->gpuAddress(), {3}), {{dst.get(), true}}, &fence), 0);
+        CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+        const std::string second = dir + "/hm_" + program_invocation_short_name + "_" + std::to_string(getpid()) + "_submit00001.rd";
+        CHECK(access(second.c_str(), F_OK) != 0);
+        auto s = readRd(first);
+        CHECK(s.size() >= 5);
+        if (s.size() >= 5) {
+            CHECK_EQ(s[0].first, 2u);   // RD_CMD
+            CHECK_EQ(s[1].first, 13u);  // RD_GPU_ID
+            uint32_t id = 0;
+            memcpy(&id, s[1].second.data(), 4);
+            const uint32_t c = r.gpu->chipId();
+            CHECK_EQ(id, ((c >> 24) & 0xff) * 100 + ((c >> 16) & 0xff) * 10 + ((c >> 8) & 0xff));
+            // the IB's BO and dst: GPUADDR then contents for each; the IB words are the stream that was sent
+            bool sawIb = false, sawDst = false;
+            for (size_t i = 2; i + 1 < s.size(); i++) {
+                if (s[i].first != 3u || s[i + 1].first != 12u) continue;
+                uint32_t a[3];
+                memcpy(a, s[i].second.data(), 12);
+                const uint64_t iova = a[0] | uint64_t(a[2]) << 32;
+                if (iova == ib->gpuAddress()) {
+                    sawIb = true;
+                    auto w = memWrite(dst->gpuAddress() + 8, {0xcafe0001, 0xcafe0002});
+                    CHECK(s[i + 1].second.size() == ib->size() && memcmp(s[i + 1].second.data(), w.data(), 4 * w.size()) == 0);
+                }
+                if (iova == dst->gpuAddress()) sawDst = a[1] == dst->size();
+            }
+            CHECK(sawIb && sawDst);
+            CHECK_EQ(s.back().first, 6u);   // RD_CMDSTREAM_ADDR: the IB, 5 dwords
+            uint32_t a[3];
+            memcpy(a, s.back().second.data(), 12);
+            CHECK_EQ(a[0] | uint64_t(a[2]) << 32, ib->gpuAddress());
+            CHECK_EQ(a[1], 5u);
+        }
+    }
+    unsetenv("HM_RD_DUMP");
+    unsetenv("HM_RD_DUMP_START");
 }
