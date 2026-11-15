@@ -77,6 +77,7 @@ extern void sweet_voicedev_init(void);     /* 1091 */
 extern void redwood_adsp_init(void);
 extern void sweet_geniuart_init(void);
 extern void sweet_btbridge_init(void);
+extern void sweet_nfc_init(void);
 extern void sweet_abp_init(void);
 extern void sweet_cpufreq_init(void);
 extern void sweet_pmem_init(void);
@@ -1954,6 +1955,7 @@ sweet_ufs_init(void)
 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
 	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
 	sweet_btbridge_init();	/* /dev/cu.bluetooth etc. <-> btd (btbridge=1): bsd/dev/sweet_btbridge.c */
+	sweet_nfc_init();	/* 1115: NFC P0 read-only ST54J probe (sweetnfc=1; default off): bsd/dev/sweet_nfc.c */
 	sweet_abp_init();	/* 1061: AppleBasebandPCI stand-in + /dev/abpbridge (sweetabp=1|2): bsd/dev/sweet_abp.c */
 	sweet_usb_probe();
 	return 0;

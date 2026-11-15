@@ -158,7 +158,21 @@ static struct {
 	vm_offset_t se, g18, g23, g52, west6, west49, south91;
 	bool ready, dead;
 	uint32_t irq_last;
+	uint32_t rx_depth;      /* 1115: RX FIFO depth in words (bus_init) */
 } bus;
+
+/*
+ * 1115: the bus is shared with the NFC controller (ST54J at 0x08, bsd/dev/sweet_nfc.c, boot-arg sweetnfc=1).
+ * sweet_se7_init() / sweet_se7_xfer() take se7_lock around bus_init() and around each transfer, so the
+ * codec's write+read pairs and NFC's packets never interleave. Without sweetnfc nobody else takes the lock.
+ */
+#define SE7_RX_MAX              64u     /* longest read; reads over 8 bytes drain the FIFO while it fills */
+#define NFC_ADDR_SE7            0x08
+static LCK_GRP_DECLARE(se7_lock_group, "sweet-se7");
+static LCK_MTX_DECLARE(se7_lock, &se7_lock_group);
+extern bool sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt);
+bool sweet_se7_init(void);
+int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
 
 static bool
 bus_clocks(void)
@@ -260,6 +274,7 @@ bus_init(void)
 	mwr(bus.se, 0x810, 0);
 	mwr(bus.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
 	mwr(bus.se, SE_IRQ_EN, SE_EVENTS);
+	bus.rx_depth = (rx >> 16) & 0x3fu;
 	bus.ready = mrd(bus.se, 0x260) == SE_PACK0 && !(mrd(bus.se, SE_TX_COUNT) & 0xfffffffu);
 	SAY("SE7 I2C %s\n", bus.ready ? "ready (100 kHz)" : "NOT READY");
 	bus.dead = !bus.ready;
@@ -283,14 +298,15 @@ bus_abort(void)
 	}
 }
 
-/* One FIFO message: TX at most 8 bytes or RX at most 8 bytes (sweet_haptic.c hap_msg_to) */
+/* One FIFO message: TX at most 8 bytes or RX at most 8 bytes (sweet_haptic.c hap_msg_to); 1115: RX up to
+ * SE7_RX_MAX for the NFC controller (the codec never reads more than 4) */
 static int
 bus_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
 {
 	unsigned sent = 0, got = 0;
 	int err = ETIMEDOUT;
 
-	if (!bus.ready || bus.dead || nt > 8 || nr > 8 || (nt && nr) || (!nt && !nr)) {
+	if (!bus.ready || bus.dead || nt > 8 || nr > SE7_RX_MAX || (nt && nr) || (!nt && !nr)) {
 		return EIO;
 	}
 	if (!wait_clear(bus.se, SE_STATUS, 1u)) {
@@ -329,7 +345,7 @@ bus_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, 
 			mwr(bus.se, SE_TX_WM, 0);
 		}
 		count = mrd(bus.se, SE_RX_COUNT) & 0x1ffffffu;
-		if (count > 4) {
+		if (count > (nr > 8 ? bus.rx_depth : 4u)) {    /* (1115: up to 8 bytes as before) */
 			err = EIO;
 			break;
 		}
@@ -352,6 +368,44 @@ bus_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, 
 		delay(1);
 	}
 	bus_abort();
+	return err;
+}
+
+/* 1115: bring the bus up (as the codec's first use did), under the bus lock. */
+bool
+sweet_se7_init(void)
+{
+	bool ok;
+
+	lck_mtx_lock(&se7_lock);
+	ok = bus_init();
+	lck_mtx_unlock(&se7_lock);
+	return ok;
+}
+
+/*
+ * 1115: write nt bytes, then (with a repeated start) read nr bytes; or only one of them. Under the bus lock.
+ * Writes to the NFC controller's address pass only if bsd/dev/sweet_nfc.c's fixed allow-list has them.
+ */
+int
+sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr)
+{
+	int err = 0;
+
+	if (!nt && !nr) {
+		return EINVAL;
+	}
+	if (addr == NFC_ADDR_SE7 && nt && !sweet_nfc_tx_allowed(tx, nt)) {
+		return EPERM;
+	}
+	lck_mtx_lock(&se7_lock);
+	if (nt) {
+		err = bus_msg(addr, tx, nt, NULL, 0, nr != 0);
+	}
+	if (!err && nr) {
+		err = bus_msg(addr, NULL, 0, rx, nr, false);
+	}
+	lck_mtx_unlock(&se7_lock);
 	return err;
 }
 
@@ -386,9 +440,8 @@ static int
 rt_raw_read(uint32_t reg, uint32_t *val)
 {
 	uint8_t tx[4] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg }, rx[4] = { 0 };
-	int err = bus_msg(CODEC_ADDR, tx, 4, NULL, 0, true);
+	int err = sweet_se7_xfer(CODEC_ADDR, tx, 4, rx, 4);    /* (1115: the same two messages, under the bus lock) */
 
-	err = err ? err : bus_msg(CODEC_ADDR, NULL, 0, rx, 4, false);
 	if (!err) {
 		*val = (uint32_t)rx[0] << 24 | (uint32_t)rx[1] << 16 | (uint32_t)rx[2] << 8 | rx[3];
 	}
@@ -400,7 +453,7 @@ rt_raw_write(uint32_t reg, uint32_t val)
 {
 	uint8_t tx[8] = { (uint8_t)(reg >> 24), (uint8_t)(reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg,
 		          (uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val };
-	int err = bus_msg(CODEC_ADDR, tx, 8, NULL, 0, false);
+	int err = sweet_se7_xfer(CODEC_ADDR, tx, 8, NULL, 0);
 
 	if (err) {
 		SAY("codec write %#x <- %#x FAILED (%d)\n", reg, val, err);
@@ -462,7 +515,7 @@ codec_init(void)
 	if (codec_found) {
 		return true;
 	}
-	if (!bus_init()) {
+	if (!sweet_se7_init()) {
 		return false;
 	}
 	(void)sweet_audio_pmic_gpio(2, 0xc5, 1);        /* "Audio LDO Mic1" (needs sndgpio=1) */
