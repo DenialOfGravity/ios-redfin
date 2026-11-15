@@ -125,3 +125,14 @@ HM_PREWARM=1
 # surface in another process (a screenshot or recorder's IOSurfaceLock) or a kernel CPU copy: an A/B switch, not a default
 #*:HM_FLUSH_AFTER=lazy
 #*:HM_FLUSH_AFTER_SURF=1125x2436
+
+# (hm-trace) HM_TRACE=1: per command buffer records (CPU per entry-point group, blocked, GPU per pass), first-use events
+# (compiles, disk-cache reads, GEM objects, maps, uploads, pipeline states) and hitch lines, in a 4 MB ring written to
+# /var/local/hmetal/trace/NAME-PID-SEQ.hmt on a touch of /var/local/hmetal/ca/trace-go (tools-claude/hm-trace.py reads
+# them). HM_TRACE=2 adds every draw; HM_TRACE_DRAW_TS=1 GPU-stamps each sysmem draw (RB_DONE_TS, not yet run on the
+# phone). Put "HM_TRACE=1" in place of the HM_TRACE=0 above (backboardd) or "*:HM_TRACE=1" for every process.
+#HM_TRACE_DRAW_TS=0
+#HM_TRACE_FLUSH_S=0
+# (hm-trace) read masks of the uber shaders filed in the stage cache and read back at pipeline creation (1, default):
+# a cold boot's first specialisations are keyed by the bytes the shader reads, so they come from the disk cache
+#HM_SPEC_MASK_DISK=1
