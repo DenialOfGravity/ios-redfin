@@ -1,4 +1,4 @@
-From 74a8901431d5328f98f5622e6222d2037e74c264 Mon Sep 17 00:00:00 2001
+From 400497c1c17c4f7026b2e5ef20649cc4c0ace927 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 19:14:01 +0100
 Subject: [PATCH] 1115 redfin: NFC P0 read-only ST54J probe (boot-arg
@@ -16,9 +16,9 @@ Without sweetnfc nothing is touched.
 ---
  bsd/conf/files      |   1 +
  bsd/dev/sweet_mic.c |  67 +++++-
- bsd/dev/sweet_nfc.c | 534 ++++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_nfc.c | 535 ++++++++++++++++++++++++++++++++++++++++++++
  bsd/dev/sweet_ufs.c |   2 +
- 4 files changed, 597 insertions(+), 7 deletions(-)
+ 4 files changed, 598 insertions(+), 7 deletions(-)
  create mode 100644 bsd/dev/sweet_nfc.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
@@ -171,10 +171,10 @@ index b3c38a9..f0caef4 100644
  	(void)sweet_audio_pmic_gpio(2, 0xc5, 1);        /* "Audio LDO Mic1" (needs sndgpio=1) */
 diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
 new file mode 100644
-index 0000000..7a516f2
+index 0000000..7ba7c86
 --- /dev/null
 +++ b/bsd/dev/sweet_nfc.c
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,535 @@
 +/*
 + * redfin (Pixel 5): NFC phase P0, a read-only probe of the ST54J NFC controller. Patch 1115.
 + *
@@ -224,6 +224,7 @@ index 0000000..7a516f2
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t thread);
 +extern bool sweet_se7_init(void);
 +extern int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
 +void sweet_nfc_init(void);
