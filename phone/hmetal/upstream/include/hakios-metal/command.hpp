@@ -228,6 +228,9 @@ public:
     // 512 KiB GMEM holds a full 1125x2436 BGRA8 screen in 52 tiles, each a load and a store of its bin and every draw
     // replayed: a pass of many tiles loses to drawing it straight into memory
     void setGmemMaxTiles(uint32_t tiles) { gmemMaxTiles_ = tiles; }
+    // (redfin ws-hm-ubwc) HM_GMEM=auto: with the tuner (setGmemTuned), a pass whose like had 5 draws or fewer last time
+    // stays in sysmem unmeasured (turnip's tu_autotune.cc fallback_use_bypass); the rest is measured both ways
+    void setGmemAuto(bool on) { gmemAuto_ = on; }
     // render::Options::gmemBinning for this buffer's draws besides each draw's own (either asks for it)
     void setGmemBinning(bool on) { gmemBinning_ = on; }
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
@@ -283,6 +286,7 @@ private:
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;
     uint32_t gmemMaxTiles_ = 0;   // (redfin hmv3) setGmemMaxTiles'
+    bool gmemAuto_ = false;       // (redfin ws-hm-ubwc) setGmemAuto's
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)

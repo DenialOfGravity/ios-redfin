@@ -155,6 +155,10 @@ public:
         uint32_t tiledFills = 0;    // ...of which into a TILE6_3 depth texture: judged, not written (the tiled order is not modelled)
         uint32_t tiles = 0;         // GMEM tiles begun (CP_SET_MARKER RM6_BIN_RENDER_START | USES_GMEM)
         uint32_t ubwcCopies = 0;   // 2D copies into a UBWC image
+        // (redfin ws-hm-ubwc) UBWC render targets: draws into one (RB_MRT TILE6_3 with FLAG_MRTS), 2D fills of one (a
+        // Clear), copies from one into another, copies from one into linear rows (judged, not carried out), and samples
+        // of one through a FLAG descriptor; a linear read or write of any of them is a fault
+        uint32_t ubwcDraws = 0, ubwcFills = 0, ubwcToUbwcCopies = 0, ubwcResolves = 0, ubwcSamples = 0;
         uint32_t tileLoads = 0, tileStores = 0;   // event blits, carried out between memory and the model's GMEM
         uint32_t tileClears = 0;    // ...and clears in GMEM
         uint32_t binningPasses = 0, binnedDraws = 0, binData = 0;   // binning passes, the draws in them, tiles told their streams
@@ -194,6 +198,9 @@ public:
     void addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBytes, uint32_t pixelFormat, uint32_t offset = 0, uint32_t planes = 1,
                     bool client = false);
     std::vector<uint8_t> surfaceBytes(uint32_t id);   // the surface's whole memory as it is now
+    // (redfin ws-hm-ubwc) surface ID is compressed with LAYOUT (kHakiosSurfaceUbwc answers it), as the redfin kernel says
+    // of a UBWC scanout surface; offsets from the surface's base
+    void addSurfaceUbwc(uint32_t id, const HakiosSurfaceUbwc& layout);
     std::vector<uint8_t> memory(uint64_t iova, uint64_t length);   // LENGTH bytes at a GPU address as they are now; empty outside every buffer
     void writeSurface(uint32_t id, uint64_t at, const void* bytes, uint64_t length);   // what another program drew there
     // stop running submissions until resume(): to see what a program does while the GPU is behind
@@ -288,6 +295,7 @@ private:
     };
     std::map<uint32_t, Surface> surfaces_;
     std::map<uint32_t, uint32_t> bufferSurface_;   // an open surface buffer's handle -> the surface's ID
+    std::map<uint32_t, HakiosSurfaceUbwc> surfaceUbwc_;   // (redfin ws-hm-ubwc) addSurfaceUbwc's
     std::set<uint32_t> queues_;
     // one counter for every queue, as the kernel keeps it (it reads no queue id): the last fence handed out, the last done
     uint32_t submitted_ = 0, completed_ = 0;
@@ -312,7 +320,8 @@ private:
     // inside a GMEM tile (between RM6_BIN_RENDER_START | USES_GMEM and RM6_BIN_RENDER_END), and GMEM itself: what the
     // event blits load and store (the draws rasterize nothing, so a tile holds what its load put there)
     bool inTile_ = false;
-    std::set<uint64_t> ubwcWritten_;   // the UBWC images a copy has written (their data addresses)
+    std::set<uint64_t> ubwcWritten_;   // the UBWC images written in compressed form (their data addresses): a copy, a fill or a draw
+    std::map<uint64_t, uint64_t> ubwcFlags_;   // (redfin ws-hm-ubwc) ...and the flag buffer each was written through
     uint32_t binQueued_ = 0;   // tiles' streams handed over (CP_SET_BIN_DATA5*) and not yet let go by RM6_BIN_END_OF_DRAWS
     bool binning_ = false;   // between RM6_BIN_VISIBILITY and the first tile: the draws only bin
     const a6xx::ChipInfo* chip_ = defaultChip();

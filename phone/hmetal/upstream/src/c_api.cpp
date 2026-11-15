@@ -1015,6 +1015,11 @@ void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb* cb, unsigned draws) {
     cb->cb->setGmemMinDraws(draws);
 }
 
+void hakios_metal_cb_set_gmem_auto(hakios_metal_cb* cb, int on) {   // (redfin ws-hm-ubwc) HM_GMEM=auto
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmemAuto(on != 0); });
+    cb->cb->setGmemAuto(on != 0);
+}
+
 void hakios_metal_cb_set_gmem_max_tiles(hakios_metal_cb* cb, unsigned tiles) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, tiles] { cb->cb->setGmemMaxTiles(tiles); });
     cb->cb->setGmemMaxTiles(tiles);

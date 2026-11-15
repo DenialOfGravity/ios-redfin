@@ -144,7 +144,10 @@ MrtWords mrtWords(const Texture& t, uint32_t level, uint32_t slice = 0) {
     MrtWords m{};
     // (a layer, a face or a depth plane: the slices are one 2D layout each, sliceBytes apart -- fd6_layout.c's layer_size)
     const uint64_t base = t.levelAddress(level) + (slice != 0 ? uint64_t(slice) * t.sliceBytes() : 0);
-    m.bufInfo = rbMrtBufInfo(colorFmt(f), t.compressed() ? TILE6_3 : TILE6_LINEAR, f.swap);
+    // (redfin ws-hm-ubwc) a compressed target's swap is WZYX, as fd6_color_swap gives it for every tiled layout ("CCU
+    // ignores swap and always uses WZYX when tiled", fd6_format_table.c): the order the TP's WZYX descriptor
+    // (ubwcDescriptor), the 2D engine's UBWC source and destination, and the fill all take the layout in
+    m.bufInfo = rbMrtBufInfo(colorFmt(f), t.compressed() ? TILE6_3 : TILE6_LINEAR, t.compressed() ? WZYX : f.swap);
     if (t.compressed()) {
         // its flag buffer, as tu6_emit_mrt / fd6 emit_mrt write it (fd6_view.c's FLAG_BUFFER_PITCH: the pitch, the layer
         // size over 4); RB_RENDER_CNTL.FLAG_MRTS turns its use on
@@ -911,6 +914,19 @@ bool gfxIbos(const Stage& vs, const Bindings& vsb, const Stage& fs, const Bindin
 // (tu6_blend_op, tu_util.h:288-291); MTLBlendFactor goes through the table below onto adreno_rb_blend_factor, the
 // way tu6_blend_factor maps Vulkan's (tu_util.h:246-271); MTLColorWriteMask's bits run Red 8 .. Alpha 1, the
 // component enable's Red 1 .. Alpha 8.
+// (redfin ws-hm-ubwc) HM_BLEND_OPT (default 0): replace-equivalent blends encoded as plain writes (blendWords)
+std::atomic<int> gBlendOpt{-1};   // -1: not read yet
+bool blendOptOn() {
+    int v = gBlendOpt.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = getenv("HM_BLEND_OPT");
+        v = e != nullptr && atoi(e) != 0 ? 1 : 0;
+        gBlendOpt.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+std::atomic<uint64_t> gBlendsMadeWrites{0};   // ...how many draws' targets it turned (HM_PROF reads nothing of it yet)
+
 struct BlendWords {
     bool enabled;
     uint32_t mrtControl, mrtBlendControl;
@@ -933,8 +949,15 @@ bool blendWords(const ColorBlend& b, const FormatInfo& f, BlendWords* out, std::
     }
     *out = BlendWords{};
     out->enabled = b.enabled;
+    // (redfin ws-hm-ubwc) HM_BLEND_OPT=1: a blend that is a plain write -- One and Zero with Add, colour and alpha --
+    // encoded as none: the RB reads the destination for every blended fragment whatever the factors (RB_MRT_CONTROL
+    // BLEND), and src * 1 + dst * 0 is src. 0 (default): as Metal asked.
+    if (b.enabled && blendOptOn() && b.srcRgb == 1 && b.dstRgb == 0 && b.srcAlpha == 1 && b.dstAlpha == 0 && b.rgbOp == 0 && b.alphaOp == 0) {
+        out->enabled = false;
+        gBlendsMadeWrites.fetch_add(1, std::memory_order_relaxed);
+    }
     out->mrtControl = rbMrtControl(components);
-    if (!b.enabled) {
+    if (!out->enabled) {
         return true;   // RB_MRT_BLEND_CONTROL 0 as turnip writes it for an attachment that does not blend
     }
     if (f.element != kElemFloat) {
@@ -2686,15 +2709,20 @@ bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
 
 uint32_t halfBitsOf(float f) { return halfOf(f); }
 
+void setBlendOpt(bool on) { gBlendOpt.store(on ? 1 : 0, std::memory_order_relaxed); }   // (redfin ws-hm-ubwc) tests
+uint64_t blendsMadeWrites() { return gBlendsMadeWrites.load(std::memory_order_relaxed); }
+
 bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, BlitRect s, const Texture& dst, uint32_t dstLevel, BlitRect d, bool linear,
                 uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
     const FormatInfo &sf = src.info(), &df = dst.info();
     if (sf.depth || df.depth) {
         return refuse(why, std::string("a copy of a ") + (sf.depth ? sf.name : df.name) + " texture: a depth texture is tiled, the 2D copy is written for linear ones");
     }
-    if (src.compressed() && (srcLevel != 0 || src.samples() != 1 || dst.compressed())) {
+    if (src.compressed() && (srcLevel != 0 || src.samples() != 1)) {
         // (redfin hmv2: a compressed render target, HM_UBWC_RT, is read by the 2D engine through its flags, r2d_src)
-        return refuse(why, "a copy from a compressed texture: its level 0 into a linear texture is what is served");
+        // (redfin ws-hm-ubwc: into a compressed one too, flags at both ends, as turnip's r2d copies UBWC to UBWC --
+        // CoreAnimation's backdrop capture copies one of its targets into another)
+        return refuse(why, "a copy from a compressed texture: its level 0, single-sampled, is what is served");
     }
     if (dst.compressed() && (sf.fmt6 != df.fmt6 || dstLevel != 0 || linear)) {
         return refuse(why, "a copy into a compressed texture: from its own format, pixel for pixel, into level 0 is what is served");
@@ -3559,8 +3587,16 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             ordinal = ordinals_[kind]++;
             const uint32_t last = queue_.lastDraws(kind, ordinal);
             const uint32_t cls = last <= 1 ? 0 : last < 16 ? 1 : last < 64 ? 2 : last < 128 ? 3 : 4;
-            tuneKey = (kind * 0x100000001b3ull ^ (uint64_t(ordinal) << 8 | cls)) | 1;
-            gmem = queue_.preferGmem(tuneKey);
+            if (gmemAuto_ && last <= 5) {
+                // (redfin ws-hm-ubwc, HM_GMEM=auto) turnip's fallback_use_bypass: 5 draws or fewer (its like's last time, 0
+                // for one never seen) is sysmem, and never measured in GMEM -- a light full-screen pass in tiles still
+                // loads (unless Clear/DontCare) and stores the whole target, 2.5-5 ms against well under 1 in sysmem
+                gmem = false;
+                gmemWhy_ = "auto: its like had " + std::to_string(last) + " draws last time (5 or fewer: sysmem)";
+            } else {
+                tuneKey = (kind * 0x100000001b3ull ^ (uint64_t(ordinal) << 8 | cls)) | 1;
+                gmem = queue_.preferGmem(tuneKey);
+            }
         }
     }
     // (ws-hm-perf2) what earlier passes of this buffer left in the CCU (HM_PASS_FLUSH=lazy) or flushed without the texture

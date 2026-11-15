@@ -466,6 +466,10 @@ public:
     static int ycbcrMode();
 
 private:
+    // (redfin ws-hm-ubwc) a surface the kernel made compressed, as a compressed texture over it (HM_UBWC_DISPLAY=1)
+    static std::shared_ptr<Texture> wrapUbwcSurface(Gpu& gpu, std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const HakiosSurfaceUbwc& u,
+                                                    const std::string& name, const TextureDesc& desc, const FormatInfo* info, uint32_t surfaceId,
+                                                    std::string* why);
     static std::shared_ptr<Texture> wrapTwoPlanes(std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const std::string& name, const TextureDesc& desc,
                                                   const FormatInfo* info, const SurfacePlane* chroma, std::string* why);
     Texture(std::shared_ptr<Buffer> buffer, const TextureDesc& desc, const FormatInfo* info, uint64_t pitch, uint64_t offset = 0,

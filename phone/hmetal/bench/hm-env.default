@@ -10,6 +10,13 @@ HAKIOS_METAL_CA_PICK=exact
 HM_CB_PAD=2
 HM_UBWC_RT=0
 HM_GMEM=0
+# (ws-hm-ubwc) HM_UBWC_RT=1: CA's private BGRA8/RGBA8 render targets UBWC (the phone check first); HM_GMEM=auto: per pass
+# (light passes, UBWC targets and plans over 8 tiles sysmem, the rest measured); HM_BLEND_OPT=1: One/Zero blends as
+# plain writes; HM_UBWC_DISPLAY=1 only with a kernel that makes the scanout surface UBWC (else it changes nothing)
+#HM_UBWC_RT=1
+#HM_GMEM=auto
+#*:HM_BLEND_OPT=1
+#HM_UBWC_DISPLAY=1
 HM_TRACE=0
 HM_HANG_BLAME=1
 
