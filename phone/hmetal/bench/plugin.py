@@ -2536,6 +2536,19 @@ HMI4_PROF_NEW = '''			 hm_presents_seen ? "frames = presentDrawable" : "frames =
 					 cs[6] - cullBefore[6], (cs[6] - cullBefore[6]) / frames, (cs[7] - cullBefore[7]) / 1e6 / frames);
 				for (int i = 0; i < 8; i++) cullBefore[i] = cs[i];
 			}
+			{   /* (ws-hm-pool) HM_RT_CACHE: render targets made from the reuse cache in these seconds, and GEM objects asked for */
+				static unsigned long long rcBefore[12];
+				unsigned long long rc[12];
+
+				hakios_metal_rt_cache_stats(rc);
+				hm_print("prof: rtcache %lluMB: hits %llu misses %llu (%.1f MB reused), held %.1f MB in %llu, evicted %llu, let go %llu, "
+					 "too big %llu; gem-new %llu (%.1f ms, %.2f ms each), retried %llu; HM_POOL_KEEP_MB=%s\\n",
+					 rc[11] >> 20, rc[0] - rcBefore[0], rc[1] - rcBefore[1], (rc[2] - rcBefore[2]) / 1048576.0, rc[3] / 1048576.0, rc[4],
+					 rc[5] - rcBefore[5], rc[6] - rcBefore[6], rc[7] - rcBefore[7], rc[8] - rcBefore[8], (rc[9] - rcBefore[9]) / 1e6,
+					 rc[8] != rcBefore[8] ? (rc[9] - rcBefore[9]) / 1e6 / (rc[8] - rcBefore[8]) : 0.0, rc[10] - rcBefore[10],
+					 getenv("HM_POOL_KEEP_MB") != NULL ? getenv("HM_POOL_KEEP_MB") : "0");
+				for (int i = 0; i < 12; i++) rcBefore[i] = rc[i];
+			}
 			hm_pool_note(now, 1);
 		}
 '''

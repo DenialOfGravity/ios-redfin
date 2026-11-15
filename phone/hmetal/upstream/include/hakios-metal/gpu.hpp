@@ -12,6 +12,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <list>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -153,6 +156,7 @@ public:
     uint64_t gpuAddress() const { return iova_; }
     void* cpu() const { return cpu_; }      // write-combined: write it in order, read it rarely
     void cpuAccess() const;                 // (ws-hm-int6) Gpu::cpuAccess for this buffer: before a CPU access of an import
+    Gpu& gpu() const { return gpu_; }       // (ws-hm-pool) the Gpu it came from (its reuse cache)
 
 private:
     friend class Gpu;
@@ -231,12 +235,51 @@ public:
 
     Transport& transport() { return *t_; }
 
+    // (ws-hm-pool) HM_RT_CACHE=N (MB, default 0: off): the GEM objects of released render targets kept, up to N MB, for
+    // the next render target of the same size or up to HM_RT_CACHE_SLACK % (default 25) bigger, instead of closed and
+    // asked of the kernel again (a pool range, its zeroing, a GPU and a CPU mapping: 1-27 ms on the phone). The least
+    // recently released go first past N MB; all of it goes when the kernel refuses an allocation (newBo retries once
+    // then) and on a forced trim. Only a Bo no command buffer holds any more reaches it (Buffer's deleter), so nothing
+    // in flight is handed out. HM_RT_CACHE_ZERO_KB=K: a reused one of K KB or less zeroed (default 0: contents
+    // undefined, as Metal's new textures are). HM_RT_PREWARM=KB[xN],...: objects of those sizes made into the cache
+    // when the Gpu is made.
+    struct BoCacheConfig {
+        uint64_t limitBytes = 0;
+        uint32_t slackPct = 25;
+        uint64_t zeroBytes = 0;
+    };
+    struct BoCacheStats {
+        uint64_t hits = 0, misses = 0, hitBytes = 0, held = 0, entries = 0, evicted = 0, dropped = 0, refused = 0;
+        uint64_t gemNew = 0, gemNewNs = 0, retries = 0, limit = 0;
+    };
+    void setBoCache(const BoCacheConfig& c);   // (tests; otherwise read from the environment when the Gpu is made)
+    BoCacheConfig boCache() const;
+    // a cached Bo of at least SIZE bytes (and at most SLACK % more), or nullptr: a miss (counted only when COUNT)
+    std::unique_ptr<Bo> cacheTake(uint64_t size, bool count = true);
+    // BO kept (nullptr back), or BO back when it is not (the cache off, or bigger than it): the caller closes it
+    std::unique_ptr<Bo> cacheGive(std::unique_ptr<Bo> bo);
+    // what has waited longer than OLDER_THAN_NS let go (0: all of it): the bytes
+    uint64_t cacheDrop(int64_t olderThanNs = 0);
+    BoCacheStats cacheStats();
+    ~Gpu();
+
 private:
     friend class Bo;
     std::atomic<uint64_t> allocated_{0};
     void release(Bo& bo);
     std::unique_ptr<Transport> t_;
     UbwcConfig ubwc_;
+    // (ws-hm-pool) the reuse cache: newest first; by size for the lookup
+    struct Cached {
+        std::unique_ptr<Bo> bo;
+        int64_t atNs;
+    };
+    mutable std::mutex cacheLock_;
+    BoCacheConfig cacheCfg_;
+    std::list<Cached> cacheLru_;
+    std::multimap<uint64_t, std::list<Cached>::iterator> cacheBySize_;
+    BoCacheStats cacheStats_;
+    std::atomic<uint64_t> gemNew_{0}, gemNewNs_{0}, gemRetries_{0};
 };
 
 }  // namespace hakios::metal

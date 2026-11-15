@@ -4,7 +4,10 @@
 #include "hakios-metal/trace.hpp"   // (redfin hm-trace)
 
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace hakios::metal {
 
@@ -43,6 +46,146 @@ Gpu::Gpu(std::unique_ptr<Transport> transport) : t_(std::move(transport)) {
     } else {
         ubwc_ = UbwcConfig{t.highestBankBit, t.ubwcSwizzle, t.macrotileMode, false};
     }
+    // (ws-hm-pool) HM_RT_CACHE / HM_RT_CACHE_SLACK / HM_RT_CACHE_ZERO_KB, and HM_RT_PREWARM
+    BoCacheConfig cc;
+    if (const char* e = getenv("HM_RT_CACHE"); e != nullptr && e[0] != 0) cc.limitBytes = uint64_t(strtoull(e, nullptr, 10)) << 20;
+    if (const char* e = getenv("HM_RT_CACHE_SLACK"); e != nullptr && e[0] != 0) cc.slackPct = uint32_t(atoi(e));
+    if (const char* e = getenv("HM_RT_CACHE_ZERO_KB"); e != nullptr && e[0] != 0) cc.zeroBytes = uint64_t(strtoull(e, nullptr, 10)) << 10;
+    cacheCfg_ = cc;
+    if (const char* e = getenv("HM_RT_PREWARM"); e != nullptr && e[0] != 0 && cc.limitBytes != 0) {
+        // "KB[xN],KB[xN],...": made now, into the cache, so that the first render targets of those sizes cost nothing
+        const char* p = e;
+        while (*p != 0) {
+            char* end = nullptr;
+            const uint64_t kb = strtoull(p, &end, 10);
+            if (end == p) break;
+            p = end;
+            unsigned count = 1;
+            if (*p == 'x' || *p == 'X') {
+                count = unsigned(strtoul(p + 1, &end, 10));
+                p = end;
+            }
+            for (unsigned i = 0; i < count && kb != 0; i++) {
+                int err = 0;
+                std::unique_ptr<Bo> bo = newBo(kb << 10, kBoWriteCombined, &err);
+                if (bo == nullptr) break;
+                bo = cacheGive(std::move(bo));
+                if (bo != nullptr) break;   // (did not fit: closed here)
+            }
+            while (*p != 0 && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+}
+
+// (ws-hm-pool) the reuse cache --------------------------------------------------------------------------------------
+namespace {
+int64_t cacheNowNs() {
+    return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+}  // namespace
+
+Gpu::~Gpu() { cacheDrop(0); }   // (the cached Bos close through this Gpu's transport: before it goes)
+
+void Gpu::setBoCache(const BoCacheConfig& c) {
+    {
+        std::lock_guard<std::mutex> g(cacheLock_);
+        cacheCfg_ = c;
+    }
+    if (c.limitBytes == 0) cacheDrop(0);
+}
+
+Gpu::BoCacheConfig Gpu::boCache() const {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    return cacheCfg_;
+}
+
+std::unique_ptr<Bo> Gpu::cacheTake(uint64_t size, bool count) {
+    const uint64_t want = (size + kPage - 1) & ~(kPage - 1);
+    std::lock_guard<std::mutex> g(cacheLock_);
+    if (cacheCfg_.limitBytes == 0) return nullptr;
+    auto it = cacheBySize_.lower_bound(want);
+    if (it == cacheBySize_.end() || it->first > want + want * cacheCfg_.slackPct / 100) {
+        if (count) cacheStats_.misses++;
+        return nullptr;
+    }
+    std::unique_ptr<Bo> bo = std::move(it->second->bo);
+    cacheLru_.erase(it->second);
+    cacheBySize_.erase(it);
+    cacheStats_.held -= bo->size();
+    cacheStats_.hits++;
+    cacheStats_.hitBytes += bo->size();
+    return bo;
+}
+
+std::unique_ptr<Bo> Gpu::cacheGive(std::unique_ptr<Bo> bo) {
+    if (bo == nullptr || !bo->owned_ || bo->cpu_ == nullptr || &bo->gpu_ != this) return bo;
+    std::vector<std::unique_ptr<Bo>> drop;   // (closed outside the lock)
+    {
+        std::lock_guard<std::mutex> g(cacheLock_);
+        if (cacheCfg_.limitBytes == 0) return bo;
+        if (bo->size() > cacheCfg_.limitBytes) {
+            cacheStats_.refused++;
+            return bo;
+        }
+        const uint64_t size = bo->size();
+        cacheLru_.push_front(Cached{std::move(bo), cacheNowNs()});
+        cacheBySize_.emplace(size, cacheLru_.begin());
+        cacheStats_.held += size;
+        // past the limit: the least recently released let go (never the one just kept: it fits alone)
+        while (cacheStats_.held > cacheCfg_.limitBytes && cacheLru_.size() > 1) {
+            auto last = std::prev(cacheLru_.end());
+            const uint64_t s = last->bo->size();
+            for (auto [a, b] = cacheBySize_.equal_range(s); a != b; ++a) {
+                if (a->second == last) {
+                    cacheBySize_.erase(a);
+                    break;
+                }
+            }
+            cacheStats_.held -= s;
+            cacheStats_.evicted++;
+            drop.push_back(std::move(last->bo));
+            cacheLru_.erase(last);
+        }
+    }
+    return nullptr;
+}
+
+uint64_t Gpu::cacheDrop(int64_t olderThanNs) {
+    std::vector<std::unique_ptr<Bo>> drop;
+    uint64_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> g(cacheLock_);
+        const int64_t now = cacheNowNs();
+        while (!cacheLru_.empty()) {
+            auto last = std::prev(cacheLru_.end());
+            if (olderThanNs != 0 && now - last->atNs < olderThanNs) break;   // (the rest are newer)
+            const uint64_t s = last->bo->size();
+            for (auto [a, b] = cacheBySize_.equal_range(s); a != b; ++a) {
+                if (a->second == last) {
+                    cacheBySize_.erase(a);
+                    break;
+                }
+            }
+            cacheStats_.held -= s;
+            cacheStats_.dropped++;
+            bytes += s;
+            drop.push_back(std::move(last->bo));
+            cacheLru_.erase(last);
+        }
+    }
+    return bytes;
+}
+
+Gpu::BoCacheStats Gpu::cacheStats() {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    BoCacheStats s = cacheStats_;
+    s.entries = cacheLru_.size();
+    s.limit = cacheCfg_.limitBytes;
+    s.gemNew = gemNew_.load(std::memory_order_relaxed);
+    s.gemNewNs = gemNewNs_.load(std::memory_order_relaxed);
+    s.retries = gemRetries_.load(std::memory_order_relaxed);
+    return s;
 }
 
 int Gpu::param(uint32_t which, uint64_t* value) {
@@ -86,8 +229,20 @@ std::unique_ptr<Bo> Gpu::newBo(uint64_t size, uint32_t flags, int* error) {
     MsmGemNew n{};
     n.size = (size + kPage - 1) & ~(kPage - 1);
     n.flags = flags;
+    gemNew_.fetch_add(1, std::memory_order_relaxed);   // (ws-hm-pool) counted, and timed below
+    struct TimeNew {
+        std::atomic<uint64_t>& ns;
+        int64_t t0;
+        ~TimeNew() { ns.fetch_add(uint64_t(cacheNowNs() - t0), std::memory_order_relaxed); }
+    } timeNew{gemNewNs_, cacheNowNs()};
     if ((*error = t_->call(kGemNew, &n, sizeof(n))) != 0) {
-        return nullptr;
+        // (ws-hm-pool) the kernel's pool short: what the reuse cache holds given back, and asked once more
+        if (cacheDrop(0) == 0) return nullptr;
+        gemRetries_.fetch_add(1, std::memory_order_relaxed);
+        n = MsmGemNew{};
+        n.size = (size + kPage - 1) & ~(kPage - 1);
+        n.flags = flags;
+        if ((*error = t_->call(kGemNew, &n, sizeof(n))) != 0) return nullptr;
     }
     MsmGemInfo info{};
     info.handle = n.handle;

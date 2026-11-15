@@ -54,6 +54,19 @@ HM_PREWARM=1
 #*:HM_POOL_SOFT_MB=128
 #*:HM_POOL_TRIM=0
 #*:HM_POOL_IDLE_S=10
+# (ws-hm-pool) HM_POOL_KEEP_MB=N (default 0): an idle trim keeps up to N MB of a queue's free slabs/pieces, its current
+# private buffer and 32 command streams (a forced trim still lets all go); suggested 16 for backboardd
+#backboardd:HM_POOL_KEEP_MB=16
+# (ws-hm-pool) HM_RT_CACHE=N MB (default 0: off): released render targets' GEM objects reused by the next render target
+# of their size (or up to HM_RT_CACHE_SLACK %, default 25, bigger); LRU past N MB; all let go on a refused allocation
+# (then retried) or a forced trim; never one a command buffer holds. HM_RT_CACHE_ZERO_KB=K zeroes reused ones up to K KB
+# (default 0: undefined, as Metal's). HM_RT_CACHE_IDLE_S=S lets entries older than S s go (default 0: never).
+# HM_RT_PREWARM=KB[xN],... makes those sizes into the cache when the device opens (e.g. 10976x2,32x4,16x4)
+#backboardd:HM_RT_CACHE=48
+#backboardd:HM_RT_CACHE_SLACK=25
+#backboardd:HM_RT_CACHE_ZERO_KB=0
+#backboardd:HM_RT_CACHE_IDLE_S=0
+#backboardd:HM_RT_PREWARM=10976x2
 # (hm-int4) the deny list is empty: an uber shader of HM_DENY_WORDS fragment words or more (default 24576: CA's
 # frag.A2Xghfc, 32064) is drawn only through its specialisations, which take ~30 ms on the host (HM_FE_MEMO, HM_SPEC_SHRINK)
 # instead of 300-530 ms. HM_DENY=A2Xghfc (hm-int3's line) still works and changes nothing beside it.

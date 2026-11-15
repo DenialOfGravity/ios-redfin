@@ -76,15 +76,31 @@ public:
     const Bo& bo() const { return *bo_; }
     // (redfin hmv6) the Bo out of a Buffer being destroyed whose handle another Buffer now holds (surfaceBuffer's deleter)
     std::unique_ptr<Bo> takeBo() { return std::move(bo_); }
+    // (ws-hm-pool) HM_RT_CACHE: a render target's memory, offered to the Gpu's reuse cache when the Buffer goes; and
+    // whether it came from there
+    bool recyclable() const { return recyclable_; }
+    bool reused() const { return reused_; }
 
 private:
+    friend std::shared_ptr<Buffer> newBuffer(Gpu&, uint64_t, std::string*, PoolKind, bool);
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
     uint64_t counted_ = 0;
     PoolKind kind_ = kPoolApp;
+    bool recyclable_ = false;
+    bool reused_ = false;
 };
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, PoolKind kind = kPoolApp);
+// RECYCLABLE (ws-hm-pool): memory whose old contents nobody may read (a render target's, undefined when made, as
+// Metal's are): taken from the Gpu's reuse cache when it holds one of the size, and given back to it when the Buffer goes
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, PoolKind kind = kPoolApp, bool recyclable = false);
+// (ws-hm-pool) HM_POOL_KEEP_MB=N (default 0): an idle trim keeps up to N MB of a queue's free pieces and its current
+// private buffer (a forced trim, the kernel's pool short, still lets all of it go); HM_RT_CACHE_IDLE_S=S (default 0:
+// never) the reuse cache's entries older than S s let go with the idle trims
+uint64_t poolKeepBytes();
+// the reuse cache's counters for the process's Gpu (Gpu::BoCacheStats in this order: hits, misses, hit bytes, held
+// bytes, entries, evicted, dropped, refused, gem-new calls, gem-new ns, retries after a refused allocation, the limit)
+void rtCacheStats(uint64_t out[12]);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.

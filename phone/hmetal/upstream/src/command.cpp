@@ -43,6 +43,14 @@ std::shared_ptr<Buffer> addressed(Buffer* raw) {
             auto it = gByAddress.find(at);
             if (it != gByAddress.end() && it->second.expired()) gByAddress.erase(it);
         }
+        // (ws-hm-pool) HM_RT_CACHE: the last owner gone -- no command buffer holds it (they keep() what they use until
+        // they finish) -- so its memory may serve the next render target; refused, it closes here
+        if (x->recyclable()) {
+            if (std::unique_ptr<Bo> bo = x->takeBo(); bo != nullptr) {
+                Gpu& g = bo->gpu();
+                bo = g.cacheGive(std::move(bo));
+            }
+        }
         delete x;
     });
     std::lock_guard<std::mutex> g(gAddressLock);
@@ -80,6 +88,16 @@ int64_t poolIdleNs() {
     static const int64_t s = [] { const char* e = getenv("HM_POOL_IDLE_S"); return e != nullptr && e[0] != 0 ? int64_t(atoi(e)) : 10; }();
     return s * 1000000000ll;
 }
+int64_t rtCacheIdleNs() {   // (ws-hm-pool) HM_RT_CACHE_IDLE_S
+    static const int64_t s = [] { const char* e = getenv("HM_RT_CACHE_IDLE_S"); return e != nullptr && e[0] != 0 ? int64_t(atoi(e)) : 0; }();
+    return s * 1000000000ll;
+}
+
+uint64_t poolKeepBytes() {   // (ws-hm-pool) HM_POOL_KEEP_MB
+    static const uint64_t mb = [] { const char* e = getenv("HM_POOL_KEEP_MB"); return e != nullptr && e[0] != 0 ? uint64_t(strtoull(e, nullptr, 10)) : 0ull; }();
+    return mb << 20;
+}
+
 
 Buffer::~Buffer() {
     if (counted_ != 0) gPoolBytes[kind_] -= counted_;
@@ -105,15 +123,45 @@ void poolStats(uint64_t out[kPoolKinds + 2]) {
 
 uint64_t trimAllQueues(bool force) {
     uint64_t freed = 0;
-    std::lock_guard<std::mutex> g(gQueuesLock);
-    for (CommandQueue* q : gQueues) freed += q->trim(force);
+    std::vector<Gpu*> gpus;
+    {
+        std::lock_guard<std::mutex> g(gQueuesLock);
+        for (CommandQueue* q : gQueues) {
+            freed += q->trim(force);
+            if (std::find(gpus.begin(), gpus.end(), &q->gpu()) == gpus.end()) gpus.push_back(&q->gpu());
+        }
+    }
+    // (ws-hm-pool) forced (the kernel's pool short, HM_POOL_SOFT_MB, hakios_metal_pool_trim(1)): the reuse cache too
+    // (each live queue's Gpu's: a queue never outlives its Gpu)
+    if (force) {
+        for (Gpu* gpu : gpus) freed += gpu->cacheDrop(0);
+    }
     return freed;
 }
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, PoolKind kind) {
+void rtCacheStats(uint64_t out[12]) {
+    Gpu* gpu = gPoolGpu.load();
+    const Gpu::BoCacheStats s = gpu != nullptr ? gpu->cacheStats() : Gpu::BoCacheStats{};
+    const uint64_t v[12] = {s.hits, s.misses, s.hitBytes, s.held, s.entries, s.evicted, s.dropped, s.refused, s.gemNew, s.gemNewNs, s.retries, s.limit};
+    for (int i = 0; i < 12; i++) out[i] = v[i];
+}
+
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, PoolKind kind, bool recyclable) {
     gBuffersMade++;
     gBytesMade += length;
     gPoolGpu.store(&gpu);
+    if (recyclable) {
+        // (ws-hm-pool) HM_RT_CACHE: a released render target's memory, when the cache holds one of the size
+        if (std::unique_ptr<Bo> bo = gpu.cacheTake(length); bo != nullptr) {
+            const uint64_t zero = gpu.boCache().zeroBytes;
+            if (zero != 0 && bo->size() <= zero && bo->cpu() != nullptr) std::memset(bo->cpu(), 0, bo->size());
+            std::shared_ptr<Buffer> b = addressed(new Buffer(std::move(bo), length));
+            b->recyclable_ = true;
+            b->reused_ = true;
+            b->countAs(kind);
+            return b;
+        }
+    }
     // (redfin hm-int4) HM_POOL_SOFT_MB=N (default 0, off): past N MB of this process's GPU memory the queues' idle memory
     // is let go first; past it still, the allocation goes on and it is said (every 5 s at most): a soft cap, never a refusal
     if (const uint64_t soft = poolSoftBytes(); soft != 0 && gpu.allocatedBytes() + length > soft) {
@@ -142,7 +190,10 @@ std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, P
         return nullptr;
     }
     std::shared_ptr<Buffer> b = addressed(new Buffer(std::move(bo), length));
-    if (b != nullptr) b->countAs(kind);
+    if (b != nullptr) {
+        b->countAs(kind);
+        b->recyclable_ = recyclable;
+    }
     return b;
 }
 
@@ -234,6 +285,7 @@ void CommandQueue::maybeTrim() {
     if (now - lastTrimNs_.load() < 1000000000ll) return;
     lastTrimNs_.store(now);
     trim(false);
+    if (const int64_t age = rtCacheIdleNs(); age != 0) gpu_.cacheDrop(age);   // (ws-hm-pool) HM_RT_CACHE_IDLE_S
 }
 
 uint64_t CommandQueue::trim(bool force) {
@@ -246,17 +298,37 @@ uint64_t CommandQueue::trim(bool force) {
     if (force || (idle != 0 && now - lastPoolUseNs_.load() > idle)) {
         std::unique_lock<std::mutex> g(poolLock_, std::try_to_lock);
         if (g.owns_lock()) {
+        const uint64_t keep = force ? 0 : poolKeepBytes();   // (ws-hm-pool) HM_POOL_KEEP_MB: an idle trim keeps that much
+        if (keep == 0) {
         for (auto& [size, v] : freeBuffers_) {
             for (auto& b : v) drop.push_back(std::move(b));
         }
         freeBuffers_.clear();
         freed += freeBytes_;
         freeBytes_ = 0;
+        } else {
+            // the biggest let go first, down to KEEP (the small slabs and streams are what every frame takes)
+            std::vector<uint64_t> sizes;
+            for (auto& [size, v] : freeBuffers_) sizes.push_back(size);
+            std::sort(sizes.rbegin(), sizes.rend());
+            for (uint64_t size : sizes) {
+                auto& v = freeBuffers_[size];
+                while (!v.empty() && freeBytes_ > keep) {
+                    freeBytes_ -= size;
+                    freed += size;
+                    drop.push_back(std::move(v.back()));
+                    v.pop_back();
+                }
+                if (freeBytes_ <= keep) break;
+            }
+        }
         }
     }
     if (std::unique_lock<std::mutex> g(lock_, std::try_to_lock); g.owns_lock()) {
         // command BOs: 8 kept, the rest let go (each 64 KB or more; a burst of buffers in flight left many)
-        while (idle_.size() > 8) {
+        // ((ws-hm-pool) HM_POOL_KEEP_MB set: 32 kept on an idle trim, a burst's worth)
+        const size_t keepStreams = !force && poolKeepBytes() != 0 ? 32 : 8;
+        while (idle_.size() > keepStreams) {
             freed += idle_.back()->size();
             dropBo.push_back(std::move(idle_.back()));
             idle_.pop_back();
@@ -269,7 +341,9 @@ uint64_t CommandQueue::trim(bool force) {
                 private_[l].erase(private_[l].begin());
             }
             // the current one when no command buffer holds it and none asked for private memory for a while
-            if (!private_[l].empty() && private_[l].back().use_count() == 1 && (force || (idle != 0 && now - lastPrivateUseNs_.load() > idle))) {
+            // ((ws-hm-pool) HM_POOL_KEEP_MB: an idle trim keeps it when it is no bigger than that)
+            if (!private_[l].empty() && private_[l].back().use_count() == 1 &&
+                (force || (idle != 0 && now - lastPrivateUseNs_.load() > idle && private_[l].back()->length() > poolKeepBytes()))) {
                 freed += private_[l].back()->length();
                 drop.push_back(std::move(private_[l].back()));
                 private_[l].clear();
