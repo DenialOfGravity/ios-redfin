@@ -6934,7 +6934,7 @@ TEST(an_extended_range_targets_write_back_is_done_at_completion) {
 // (ws-hm-alib) a 'b3a8' surface (CoreAnimation's deep snapshot: an XR10 colour plane and an A8 plane, Metal's
 // RGB10A8_2P_XR10) is served as BGR10_XR over its colour plane: drawn into through the companion and written back as XR
 // codes, then sampled (decoded). An XR format over a two-plane surface of another FourCC is still refused.
-TEST(a_b3a8_surfaces_colour_plane_is_drawn_and_read_as_bgr10_xr) {
+TEST(a_b3a8_two_plane_surface_is_drawn_and_read_as_bgr10_xr) {
     CommandBuffer::setXrGpuForTesting(0);
     struct Back { ~Back() { CommandBuffer::setXrGpuForTesting(-1); } } back;
     Rig r;
