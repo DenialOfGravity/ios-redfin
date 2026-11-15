@@ -1,0 +1,380 @@
+From ea39b384c557189918fb21b8af0e3c46f63e0753 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 02:44:27 +0100
+Subject: [PATCH 2/2] 1105 redfin: scanout gate 3 (per surface) and
+ kern.sweet_scangate_mode / _tribuf
+
+Gate 3: a display submit that names its surface (NativeAdrenoAbiSubmit.flags
+bits 8..31 = IOSurface id, with bit 0) is held only while that surface is on
+screen (shown) or queued for a latch (flipping, next, later[]), 50 ms cap; a
+display submit without an id, or a process that never flags, is gated as 1.
+With CoreAnimation's 2-surface chain that is the gate-1 wait (frame K+1 draws
+into K-1's surface, scanned until K latches); with 3 surfaces (tribuf 1: honest
+SwapWait polls, CA's swap ring holds 3 entries, AppleDisplay ctor) frame K+1
+draws into K-2's, free once K-1 latched, so K+1 renders while K waits.
+
+kern.sweet_scangate_mode 0..3 (= p scanout gate N, now also 3; boot default 1)
+and kern.sweet_scangate_tribuf 0|1 (= p scanout tribuf); either may be set
+before the scanout starts and is then its start value. 5 s line "SWEET
+SCANOUT: 5s gate3:" display submits with/without id, free / waited (on screen,
+pending) avg us, timeouts, overlapped frames, distinct surfaces in the chain.
+---
+ bsd/dev/sweet_gpu.c                   |  32 ++++-
+ iokit/Kernel/arm/SweetAccelerator.cpp |   2 +-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 187 +++++++++++++++++++++++---
+ iokit/Kernel/arm/SweetGPUABI.h        |   7 +
+ 4 files changed, 205 insertions(+), 23 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 10c1060..46945c5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2566,6 +2566,36 @@ static volatile int scangate_flag_pid = -1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scangate_flag, 0,
+     "SWEET SCANOUT: gate only display-writing submits of processes that flag them (1104, default 1)");
+ 
++/*
++ * 1105: kern.sweet_scangate_mode 0|1|2|3 (= p scanout gate N; boot default 1 = boot-arg sweetscangate): 0 SwapEnd back
++ * pressure, 1 the swapper's GPU submits wait on the CPU for the last swap's latch, 2 the CP waits for it, 3 per surface:
++ * a display submit that names its surface (flags bits 8..31) waits only while that surface is on screen or queued for a
++ * latch; one that does not is gated as 1. kern.sweet_scangate_tribuf 0|1 (= p scanout tribuf; default 0 = boot sweetfbx
++ * 0x40): honest SwapWait polls, so CoreAnimation keeps K-1's ring entry until K is latched and draws K+1 into a third
++ * surface (its swap ring holds 3). Either may be set before the scanout starts (then it is the start value).
++ */
++extern int sweet_scan_gate_get(int what);               /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern int sweet_scan_gate_put(int what, int value);
++static int
++sysctl_sweet_scangate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg2)
++	int what = (int)(uintptr_t)arg1;
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_scan_gate_get(what), sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > (what == 0 ? 3 : 1)) {
++		return EINVAL;
++	}
++	return sweet_scan_gate_put(what, value);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    (void *)0, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: gate 0 back pressure, 1 CPU, 2 CP, 3 per surface (1105)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: honest SwapWait polls, 3-surface chain (0996 tribuf)");
++
+ /*
+  * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
+  * for (p scanout gate 2); and each process's last fence (the swapper's frame is done at its own last submit, not at
+@@ -2645,7 +2675,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
+ 	int pid = proc_selfpid();
+ 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
+ 	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
+-	uint32_t gf = flags & 1u;
++	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
+ 	if (sweet_scangate_flag) {
+ 		if (gf) {
+ 			scangate_flag_pid = pid;
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 2a68e53..4881e33 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -44,7 +44,7 @@
+ #include "SweetSurface.h"
+ #include "SweetGPUABI.h"
+ #include "SweetTrace.h"     /* 0994 */
+-#define SWEET_V2_SUBMIT_FLAGS   NativeAdrenoAbiSubmitWritesDisplay      /* 1104: the submit flags this kernel takes */
++#define SWEET_V2_SUBMIT_FLAGS   (NativeAdrenoAbiSubmitWritesDisplay | NativeAdrenoAbiSubmitSurfaceMask)  /* 1104; 1105: + surface id */
+ #define SWEET_V2_IB_HW  128     /* 1038: = A6_SUBMIT_MAX_HW (bsd/dev/sweet_a6xx.h) */
+ 
+ extern "C" {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 965f027..69359ff 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3094,6 +3094,11 @@ static struct {
+ 	uint64_t      stGateAbs;
+ 	uint32_t      stGate, stGateWait, stGateTimeout;
+ 	uint32_t      stFlagDisp, stFlagBare, stUnflagged;      /* 1104: the swapper's submits flagged display / bare (not gated) / from a process that never flagged */
++	/* 1105: gate 3 (per surface): display submits with a surface id, without one (gated as 1), held for the surface on
++	 * screen / pending a latch, wait time, 50 ms timeouts, frames whose successor's display submit passed while they
++	 * were still pending (overlap), surfaces not held at all */
++	uint32_t      st3Id, st3NoId, st3Shown, st3Pending, st3Timeout, st3Overlap, st3Free;
++	uint64_t      st3Abs, st3OvSeq;
+ 	bool          geom;             /* the pipes are in the scaled direct geometry (fLock) */
+ 	bool          entering;
+ 	bool          thread;
+@@ -3376,6 +3381,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		}
+ 		sweet_scan_drop(&sweet_scan.next);
+ 		sweet_scan_pop_locked();
++		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);  /* 1105: a gate 3 wait on the dropped surface goes on */
+ 		if (sweet_scan.next != NULL) {
+ 			/* (the queue was full: the oldest went; this frame goes to the end) */
+ 			sweet_scan_word_locked((uint32_t)sweet_scan.nextSeq);
+@@ -3450,6 +3456,27 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+  * SwapEnd K waits until frame K is on screen (30 ms at most). K's own work is in the ring before its SwapEnd (0949),
+  * so this cannot hold up K's fence.
+  */
++/*
++ * 1105: with fLock. Is surface id held by the display: 1 on screen (shown), 2 flipping or queued for a latch (next,
++ * later[]), 0 not held (CA may draw into it: the scanout reads it no more and will not before its next SwapEnd).
++ */
++static uint32_t
++sweet_scan_surf_busy_locked(uint32_t id)
++{
++	if (sweet_scan.shown != NULL && sweet_scan.shown->id == id) {
++		return 1;
++	}
++	if ((sweet_scan.flipping != NULL && sweet_scan.flipping->id == id) || (sweet_scan.next != NULL && sweet_scan.next->id == id)) {
++		return 2;
++	}
++	for (uint32_t i = 0; i < sweet_scan.laterN; i++) {
++		if (sweet_scan.later[i].s != NULL && sweet_scan.later[i].s->id == id) {
++			return 2;
++		}
++	}
++	return 0;
++}
++
+ /*
+  * 1104: gf (sweet_gpu.c, kern.sweet_scangate_flag): bit 0 the submission writes the display surface, bit 1 its process
+  * flags its display submissions. A bare submission (bit 1 without bit 0) of the swapper is not gated: offscreen passes,
+@@ -3471,6 +3498,46 @@ sweet_scan_submit_gate(uint32_t gf)
+ 	IOLockLock(fb->fLock);
+ 	sweet_scan.stGate++;
+ 	SWEET_TRACE(SWT_GPU_GATE, sweet_scan.gate, sweet_scan.gateSeq, sweet_scan.shownSeq, sweet_scan.word);      /* 0994 */
++	uint32_t sid = (gf & 1u) ? gf >> 8 : 0;
++	if (sweet_scan.gate == 3 && sid != 0) {
++		/*
++		 * 1105: gate 3, a display submit that names its surface: held only while that surface is on screen or queued
++		 * for a latch (50 ms at most), not until the last swap is on screen. With CA's 2-surface chain the surface of
++		 * frame K+1 is K-1's, on screen until K latches: the same wait as gate 1. With 3 surfaces (tribuf 1) it is
++		 * K-2's, free once K-1 latched: K+1 renders while K waits for its latch.
++		 */
++		sweet_scan.st3Id++;
++		uint32_t b = sweet_scan_surf_busy_locked(sid);
++		if (b != 0) {
++			uint64_t dl, t0 = mach_absolute_time();
++			clock_interval_to_deadline(50, kMillisecondScale, &dl);
++			if (b == 1) {
++				sweet_scan.st3Shown++;
++			} else {
++				sweet_scan.st3Pending++;
++			}
++			SWEET_TRACE_START(SWT_GPU_GATE, proc_selfpid(), sid, sweet_scan.shownSeq, 3);
++			while (sweet_scan.on && sweet_scan.geom && sweet_scan.gate == 3 && sweet_scan_surf_busy_locked(sid) != 0) {
++				if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
++					sweet_scan.st3Timeout++;
++					break;
++				}
++			}
++			sweet_scan.st3Abs += mach_absolute_time() - t0;
++			SWEET_TRACE_END(SWT_GPU_GATE, proc_selfpid(), sid, sweet_scan.shownSeq, 3);
++		} else {
++			sweet_scan.st3Free++;
++		}
++		if ((sweet_scan.next != NULL || sweet_scan.flipping != NULL) && sweet_scan.seq != sweet_scan.st3OvSeq) {
++			sweet_scan.st3OvSeq = sweet_scan.seq;   /* the newest swap is not latched yet and its successor draws */
++			sweet_scan.st3Overlap++;
++		}
++		IOLockUnlock(fb->fLock);
++		return 0;
++	}
++	if (sweet_scan.gate == 3) {
++		sweet_scan.st3NoId++;   /* 1105: no surface id: gated as 1 below */
++	}
+ 	if (sweet_scan.gate == 2 && sweet_scan.geom) {
+ 		/* 0989: the CP waits instead of this thread: until the word reaches gateSeq (released after 50 ms) */
+ 		uint32_t ref = (uint32_t)sweet_scan.gateSeq;
+@@ -3494,7 +3561,8 @@ sweet_scan_submit_gate(uint32_t gf)
+ 		clock_interval_to_deadline(50, kMillisecondScale, &dl);    /* 0989: 30 -> 50 ms */
+ 		sweet_scan.stGateWait++;
+ 		SWEET_TRACE_START(SWT_GPU_GATE, proc_selfpid(), sweet_scan.gateSeq, sweet_scan.shownSeq, 0);   /* 0994 */
+-		while (sweet_scan.on && sweet_scan.geom && sweet_scan.gate == 1 && sweet_scan.shownSeq < sweet_scan.gateSeq) {
++		while (sweet_scan.on && sweet_scan.geom && (sweet_scan.gate == 1 || sweet_scan.gate == 3) &&
++		    sweet_scan.shownSeq < sweet_scan.gateSeq) {     /* 1105: 3 without a surface id waits as 1 */
+ 			if (IOLockSleepDeadline(fb->fLock, &sweet_scan.shownSeq, dl, THREAD_UNINT) == THREAD_TIMED_OUT) {
+ 				sweet_scan.stGateTimeout++;
+ 				break;
+@@ -3891,6 +3959,28 @@ sweet_scan_stats_locked(uint64_t now)
+ 		sweet_scan.stGateAbs = 0;
+ 		sweet_scan.stGate = sweet_scan.stGateWait = sweet_scan.stGateTimeout = 0;
+ 	}
++	if (sweet_scan.gate == 3 || sweet_scan.st3Id != 0 || sweet_scan.st3NoId != 0) {
++		/* 1105: gate 3; surfaces = distinct surfaces among the last 8 slot frames (CA's chain) */
++		uint32_t nd = 0;
++		for (uint32_t i = 0; i < 8; i++) {
++			bool dup = sweet_scan.chain[i] == 0;
++			for (uint32_t j = 0; j < i && !dup; j++) {
++				dup = sweet_scan.chain[j] == sweet_scan.chain[i];
++			}
++			nd += !dup;
++		}
++		uint64_t w3 = 0;
++		absolutetime_to_nanoseconds(sweet_scan.st3Abs, &w3);
++		uint32_t nw = sweet_scan.st3Shown + sweet_scan.st3Pending;
++		IOLog("SWEET SCANOUT: 5s gate3: display submits %u (no id %u, gated as 1) | free %u waited %u (on screen %u, pending "
++		    "%u) avg %llu us timeout %u | overlapped frames %u of %u | surfaces %u chain %u-%u tribuf %u\n", sweet_scan.st3Id,
++		    sweet_scan.st3NoId, sweet_scan.st3Free, nw, sweet_scan.st3Shown, sweet_scan.st3Pending, nw ? w3 / 1000 / nw : 0,
++		    sweet_scan.st3Timeout, sweet_scan.st3Overlap, sweet_scan.stFrames, nd, sweet_scan.stDepthMin, sweet_scan.stDepthMax,
++		    sweet_scan.tribuf ? 1 : 0);
++		sweet_scan.st3Id = sweet_scan.st3NoId = sweet_scan.st3Shown = sweet_scan.st3Pending = 0;
++		sweet_scan.st3Timeout = sweet_scan.st3Overlap = sweet_scan.st3Free = 0;
++		sweet_scan.st3Abs = 0;
++	}
+ 	if (sweet_scan.tribuf) {
+ 		/* 0996 */
+ 		IOLog("SWEET SCANOUT: 5s tribuf: polls busy %u done %u stale %u | gate at K-1 %u | short %u | chain %u-%u\n",
+@@ -3987,6 +4077,69 @@ sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec)
+ 	sweet_scan_set(fb, true, "auto (1046: sweetscanout=2, first slot swap)");
+ }
+ 
++/*
++ * 1105: kern.sweet_scangate_mode / kern.sweet_scangate_tribuf (bsd/dev/sweet_gpu.c) and p scanout gate|tribuf. Before the
++ * scanout has started (no thread yet) the value is kept and taken at the start instead of the boot-arg.
++ */
++static int sweet_scan_gate_req = -1, sweet_scan_tribuf_req = -1;
++
++extern "C" int sweet_scan_gate_get(int what);
++int
++sweet_scan_gate_get(int what)
++{
++	if (!sweet_scan.thread) {
++		int r = what == 0 ? sweet_scan_gate_req : sweet_scan_tribuf_req;
++		if (r >= 0) {
++			return r;
++		}
++		if (what == 0) {
++			uint32_t g = 1;
++			PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
++			return g <= 3 ? (int)g : 1;
++		}
++		return (sweet_fbx & SWEET_FBX_TRIBUF) != 0;
++	}
++	return what == 0 ? (int)sweet_scan.gate : (sweet_scan.tribuf ? 1 : 0);
++}
++
++extern "C" int sweet_scan_gate_put(int what, int v);
++int
++sweet_scan_gate_put(int what, int v)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++	if (v < 0 || v > (what == 0 ? 3 : 1)) {
++		return 22;     /* EINVAL (no errno.h in this file) */
++	}
++	if (what == 0) {
++		sweet_scan_gate_req = v;
++	} else {
++		sweet_scan_tribuf_req = v;
++	}
++	if (fb == NULL || !sweet_scan.thread) {
++		IOLog("SWEET SCANOUT: %s %d at the scanout's start (1105)\n", what == 0 ? "gate" : "tribuf", v);
++		return 0;
++	}
++	IOLockLock(fb->fLock);
++	if (what == 0) {
++		sweet_scan.gate = (uint32_t)v;
++		sweet_scan_release_locked();    /* 0989: nothing armed survives a change */
++		IOLockWakeup(fb->fLock, &sweet_scan, false);
++	} else {
++		sweet_scan.tribuf = v != 0;
++		sweet_scan.gateDepth = 2;
++	}
++	IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);   /* waiters re-check under the new rule */
++	IOLockUnlock(fb->fLock);
++	if (what == 0) {
++		IOLog("SWEET SCANOUT: gate %d (%s)\n", v, v == 0 ? "SwapEnd back pressure" : v == 1 ? "GPU submits wait on the CPU" :
++		    v == 2 ? "the CP waits for the latch" : "per surface: a display submit waits while its own surface is held");
++	} else {
++		IOLog("SWEET SCANOUT: tribuf %s (SwapWait polls %s, gate %s)\n", v ? "on" : "off",
++		    v ? "busy until latched" : "done at once for the newest", v ? "K-1 on screen at chain 3" : "K on screen");
++	}
++	return 0;
++}
++
+ /* p scanout 0|1 and the boot-arg: frames direct or the normal way. */
+ static void
+ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+@@ -3996,10 +4149,16 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+ 		return;
+ 	}
+ 	if (on && !sweet_scan.thread) {
+-		uint32_t g = 1;         /* 0989: boot-arg sweetscangate=0|1|2 (default 1, the CPU gate) */
++		uint32_t g = 1;         /* 0989: boot-arg sweetscangate=0|1|2 (default 1, the CPU gate); 1105: 3 */
+ 		PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
+-		sweet_scan.gate = g <= 2 ? g : 1;
++		sweet_scan.gate = g <= 3 ? g : 1;
+ 		sweet_scan.tribuf = (sweet_fbx & SWEET_FBX_TRIBUF) != 0;     /* 0996 */
++		if (sweet_scan_gate_req >= 0) {
++			sweet_scan.gate = (uint32_t)sweet_scan_gate_req;        /* 1105: kern.sweet_scangate_mode before the start */
++		}
++		if (sweet_scan_tribuf_req >= 0) {
++			sweet_scan.tribuf = sweet_scan_tribuf_req != 0;         /* 1105: kern.sweet_scangate_tribuf */
++		}
+ 		sweet_scan.thread = IOCreateThread(sweet_scan_thread, fb) != NULL;
+ 		if (!sweet_scan.thread) {
+ 			IOLog("SWEET SCANOUT: no thread: stays off\n");
+@@ -4035,8 +4194,8 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+  *   p hz 60|90 [tc] the panel's rate now (DCS 0x53), ticks and SyncRate with it; tc: tear-check line clock too
+  *   p mdp ...       0948: display-engine dump and scanout tests (above)
+  *   p scanout 0|1   0976: the direct scanout off / on (needs sweetscanout 1|2|3; 1046: 2 by default); no argument: the state
+- *   p scanout gate 0|1|2   0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
+- *                          CP waits for the latch (2; boot-arg sweetscangate)
++ *   p scanout gate 0|1|2|3 0985: SwapEnd back pressure (0), the swapper's GPU submits wait (1, default), 0989: the
++ *                          CP waits for the latch (2; boot-arg sweetscangate); 1105: 3 per surface (kern.sweet_scangate_mode)
+  *   p scanout corners 0|1  0986: corner mattes drawn into each direct frame (default off)
+  *   p scanout tribuf 0|1   0996: SwapWait polls (0x80000000) answer Busy until latched; gate by chain depth (off)
+  *   p vsync [MASK [LEAD_US]] | p vsync refresh [NS]   0995: tick timer options, IOMFBDisplayRefresh (above)
+@@ -4248,28 +4407,14 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 			while (v < end && *v == ' ') {
+ 				v++;
+ 			}
+-			IOLockLock(fLock);
+-			sweet_scan.gate = v < end && *v >= '0' && *v <= '2' ? (uint32_t)(*v - '0') : 1;
+-			sweet_scan_release_locked();    /* 0989: nothing armed survives a change */
+-			IOLockWakeup(fLock, &sweet_scan.shownSeq, false);
+-			IOLockWakeup(fLock, &sweet_scan, false);
+-			IOLockUnlock(fLock);
+-			IOLog("SWEET SCANOUT: gate %u (%s)\n", sweet_scan.gate, sweet_scan.gate == 0 ? "SwapEnd back pressure" :
+-			    sweet_scan.gate == 1 ? "GPU submits wait on the CPU" : "the CP waits for the latch");
++			(void)sweet_scan_gate_put(0, v < end && *v >= '0' && *v <= '3' ? *v - '0' : 1);   /* 1105: 3 */
+ 		} else if (end - q >= 6 && !strncmp(q, "tribuf", 6)) {
+ 			/* 0996: p scanout tribuf 0|1 */
+ 			const char *v = q + 6;
+ 			while (v < end && *v == ' ') {
+ 				v++;
+ 			}
+-			IOLockLock(fLock);
+-			sweet_scan.tribuf = v < end && *v == '1';
+-			sweet_scan.gateDepth = 2;
+-			IOLockWakeup(fLock, &sweet_scan.shownSeq, false);
+-			IOLockUnlock(fLock);
+-			IOLog("SWEET SCANOUT: tribuf %s (SwapWait polls %s, gate %s)\n", sweet_scan.tribuf ? "on" : "off",
+-			    sweet_scan.tribuf ? "busy until latched" : "done at once for the newest",
+-			    sweet_scan.tribuf ? "K-1 on screen at chain 3" : "K on screen");
++			(void)sweet_scan_gate_put(1, v < end && *v == '1');     /* 1105: shared with kern.sweet_scangate_tribuf */
+ 		} else if (q < end && (*q == '0' || *q == '1')) {
+ 			if (sweet_scan_auto_armed) {
+ 				sweet_scan_auto_armed = false;  /* 1046: the poke decides from now on */
+diff --git a/iokit/Kernel/arm/SweetGPUABI.h b/iokit/Kernel/arm/SweetGPUABI.h
+index b778cd5..5fe5400 100644
+--- a/iokit/Kernel/arm/SweetGPUABI.h
++++ b/iokit/Kernel/arm/SweetGPUABI.h
+@@ -92,6 +92,13 @@ struct NativeAdrenoAbiSubmit {
+ };
+ /* redfin 1104: NativeAdrenoAbiSubmit.flags bit 0: this submission writes a display (swap-chain) surface */
+ #define NativeAdrenoAbiSubmitWritesDisplay 1u
++/*
++ * redfin 1105: flags bits 8..31 (optional, with bit 0): the IOSurface id of the display surface this submission writes.
++ * Scanout gate 3 holds the submission only while that surface is on screen or queued for a latch; 0 = not given (the
++ * submission is gated as with gate 1). Bits 1..7 must be zero.
++ */
++#define NativeAdrenoAbiSubmitSurfaceShift  8
++#define NativeAdrenoAbiSubmitSurfaceMask   0xffffff00u
+ struct NativeAdrenoAbiMetadata {
+     uint64_t handle;              /* object identity */
+     uint32_t bytes;               /* set: length; get: requested capacity */
+-- 
+2.53.0
+
