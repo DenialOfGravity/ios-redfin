@@ -914,6 +914,19 @@ bool gfxIbos(const Stage& vs, const Bindings& vsb, const Stage& fs, const Bindin
 // (tu6_blend_op, tu_util.h:288-291); MTLBlendFactor goes through the table below onto adreno_rb_blend_factor, the
 // way tu6_blend_factor maps Vulkan's (tu_util.h:246-271); MTLColorWriteMask's bits run Red 8 .. Alpha 1, the
 // component enable's Red 1 .. Alpha 8.
+// (redfin ws-hm-ubwc) HM_BLEND_OPT (default 0): replace-equivalent blends encoded as plain writes (blendWords)
+std::atomic<int> gBlendOpt{-1};   // -1: not read yet
+bool blendOptOn() {
+    int v = gBlendOpt.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = getenv("HM_BLEND_OPT");
+        v = e != nullptr && atoi(e) != 0 ? 1 : 0;
+        gBlendOpt.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+std::atomic<uint64_t> gBlendsMadeWrites{0};   // ...how many draws' targets it turned (HM_PROF reads nothing of it yet)
+
 struct BlendWords {
     bool enabled;
     uint32_t mrtControl, mrtBlendControl;
@@ -936,8 +949,15 @@ bool blendWords(const ColorBlend& b, const FormatInfo& f, BlendWords* out, std::
     }
     *out = BlendWords{};
     out->enabled = b.enabled;
+    // (redfin ws-hm-ubwc) HM_BLEND_OPT=1: a blend that is a plain write -- One and Zero with Add, colour and alpha --
+    // encoded as none: the RB reads the destination for every blended fragment whatever the factors (RB_MRT_CONTROL
+    // BLEND), and src * 1 + dst * 0 is src. 0 (default): as Metal asked.
+    if (b.enabled && blendOptOn() && b.srcRgb == 1 && b.dstRgb == 0 && b.srcAlpha == 1 && b.dstAlpha == 0 && b.rgbOp == 0 && b.alphaOp == 0) {
+        out->enabled = false;
+        gBlendsMadeWrites.fetch_add(1, std::memory_order_relaxed);
+    }
     out->mrtControl = rbMrtControl(components);
-    if (!b.enabled) {
+    if (!out->enabled) {
         return true;   // RB_MRT_BLEND_CONTROL 0 as turnip writes it for an attachment that does not blend
     }
     if (f.element != kElemFloat) {
@@ -2638,6 +2658,9 @@ bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
 }
 
 uint32_t halfBitsOf(float f) { return halfOf(f); }
+
+void setBlendOpt(bool on) { gBlendOpt.store(on ? 1 : 0, std::memory_order_relaxed); }   // (redfin ws-hm-ubwc) tests
+uint64_t blendsMadeWrites() { return gBlendsMadeWrites.load(std::memory_order_relaxed); }
 
 bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, BlitRect s, const Texture& dst, uint32_t dstLevel, BlitRect d, bool linear,
                 uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {

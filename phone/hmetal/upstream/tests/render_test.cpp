@@ -6021,6 +6021,38 @@ TEST(gmem_auto_keeps_light_passes_and_compressed_targets_in_sysmem) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// (redfin ws-hm-ubwc) HM_BLEND_OPT: a blend of One and Zero with Add (colour and alpha) is a plain write, encoded with no
+// BLEND bits so that the RB reads no destination; any other factor or operation keeps its blend; off, as Metal asked
+TEST(blend_opt_encodes_a_replace_blend_as_a_plain_write) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Program p = flatProgram();
+    p.blend.enabled = true;   // One, Zero, Add: Metal's defaults
+    auto blendBits = [&](const Program& q) {
+        Encoded e(r, q, pass, wholeDraw());
+        CHECK(e.ok);
+        return std::make_pair(e.reg(regRbMrt(REG_A6XX_RB_MRT_CONTROL, 0)) & (A6XX_RB_MRT_CONTROL_BLEND | A6XX_RB_MRT_CONTROL_BLEND2),
+                              e.reg(REG_A6XX_RB_BLEND_CNTL) & A6XX_RB_BLEND_CNTL_ENABLE_BLEND__MASK);
+    };
+    render::setBlendOpt(false);
+    CHECK(blendBits(p).first != 0u && blendBits(p).second != 0u);
+    render::setBlendOpt(true);
+    const uint64_t before = render::blendsMadeWrites();
+    CHECK_EQ(blendBits(p).first, 0u);
+    CHECK_EQ(blendBits(p).second, 0u);
+    CHECK(render::blendsMadeWrites() > before);
+    Program over = p;
+    over.blend.dstRgb = 5;   // OneMinusSourceAlpha: source-over reads the destination
+    CHECK(blendBits(over).first != 0u);
+    Program maxed = p;
+    maxed.blend.rgbOp = 4;   // Max: reads it whatever the factors
+    CHECK(blendBits(maxed).first != 0u);
+    render::setBlendOpt(false);
+}
+
 // (redfin hm-int4) the host's encode cost of a draw, as hmbench W3 measures it on the phone (CPU only, the fake GPU):
 // HM_BENCH_DRAWS=N records N passes of 40 draws with a texture and a buffer bound each and prints us a draw. Off (a
 // return) without the variable, so the suite's time is not touched

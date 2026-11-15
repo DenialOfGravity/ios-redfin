@@ -614,6 +614,11 @@ struct BlitRect {
 // SP_PS_2D_SRC_INFO, tu6_blit_image) or not; an sRGB format so filtered is filtered in linear space, as Metal's
 // generateMipmaps does it, and an unfiltered copy moves the stored bytes. False with *why: a level or a rectangle outside the texture, a depth
 // texture, another format, a linear scale of an integer format, a texture copied into the very rectangle it is read from.
+// (redfin ws-hm-ubwc) HM_BLEND_OPT: blendWords encodes a One/Zero/Add blend as none (the RB then reads no destination);
+// read from the environment at first use, set here by the tests; and how many draws' targets it turned so far
+void setBlendOpt(bool on);
+uint64_t blendsMadeWrites();
+
 bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, BlitRect s, const Texture& dst, uint32_t dstLevel, BlitRect d, bool linear,
                 uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o = Options{});
 
