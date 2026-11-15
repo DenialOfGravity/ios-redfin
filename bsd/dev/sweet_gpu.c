@@ -2567,6 +2567,24 @@ extern uint32_t sweet_touch_trace;
 SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
 
+/*
+ * 1111: UBWC display surfaces (iokit/Kernel/arm/SweetSurface.cpp, SweetFramebuffer.cpp, SweetAccelerator.cpp). Inert
+ * unless the kernel booted with boot-arg sweetubwc=1|2 (UBWC-sized scanout slots). kern.sweet_ubwc_disp 1: scanout-slot
+ * surfaces created from now on are UBWC-ready, and a GPU client asking such a surface's BO metadata gets its UBWC
+ * layout and makes it compressed (default 0; sweetubwc=2 boots with 1). kern.sweet_ubwc_sspp / _mdss: the pipes'
+ * UBWC_STATIC value (0 auto) and the MDSS UBWC_STATIC (0 auto: written only if it reads 0; 1 never; else that value),
+ * read at each switch of the pipes to a compressed surface.
+ */
+int sweet_ubwc_disp = 0;
+int sweet_ubwc_sspp = 0;
+int sweet_ubwc_mdss = 0;
+SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_disp, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_disp, 0,
+    "SWEET SURF: new display surfaces UBWC-ready, compressed once hakios-metal asks (1111, needs boot-arg sweetubwc; default 0)");
+SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_sspp, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_sspp, 0,
+    "SWEET MDP: VIG UBWC_STATIC value for compressed scanout (1111, 0 = by decoder version)");
+SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_mdss, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_mdss, 0,
+    "SWEET MDP: MDSS UBWC_STATIC (1111, 0 = auto if zero, 1 = never write, else the value)");
+
 int sweet_scangate_flag = 1;
 static volatile int scangate_flag_pid = -1;
 SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scangate_flag, 0,

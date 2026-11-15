@@ -44,6 +44,17 @@ public:
 	volatile SInt32           displayUse;   /* 0976: frames of it the display holds (queued, flipping, shown) */
 	volatile SInt32           clientUse;    /* 0976: IOSurfaceIncrementUseCount - Decrement from userland */
 	volatile SInt32           clientUse1;   /* 0983: ... category 1 */
+	/*
+	 * 1111: UBWC display surface (kern.sweet_ubwc_disp, boot-arg sweetubwc). ubwcReady: a scanout-slot surface
+	 * created while the switch was on, sized for the compressed layout below (offsets from the surface's base = its
+	 * slot PA; meta plane first, then the colour plane, as Mesa's fdl6 and msm_media_info's RGBA8888_UBWC put
+	 * them). Its pixels stay linear (bytesPerRow, offset 0) until a GPU client asks the BO's NativeAdreno metadata
+	 * (hakios-metal under HM_UBWC_DISPLAY=1): from then on ubwcLive = 1 and the display engine scans it
+	 * compressed. All zero = linear, as before 1111.
+	 */
+	uint32_t                  ubwcMeta, ubwcMetaPitch, ubwcMetaSize, ubwcData, ubwcDataPitch;
+	uint8_t                   ubwcReady;
+	volatile uint8_t          ubwcLive;
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -61,6 +72,23 @@ SweetSurface *sweet_surface_copy(uint32_t id);
  */
 #define SWEET_SCAN_SLOTS                7
 #define SWEET_SCAN_SLOT_LEN             0xab8000ULL     /* 4608 x 2436, 16 KB pages */
+/*
+ * 1111: with boot-arg sweetubwc=1|2 the slots are made this long instead: a 1125x2436 RGBA8 UBWC surface, meta
+ * 128 x 624 (80 KB) + colour 4608 x 2448 (11016 KB) = 0xad6000, in 16 KB pages. Slot 0 then ends 0xa1ed8000, still
+ * below the backlight packet (0xa2200000).
+ */
+#define SWEET_SCAN_SLOT_LEN_UBWC        0xad8000ULL
+uint64_t sweet_surface_scan_len(void);
+/* 1111: boot-arg sweetubwc (0 default: as 1110; 1 UBWC-sized slots, kern.sweet_ubwc_disp 0; 2 also kern.sweet_ubwc_disp 1) */
+uint32_t sweet_surface_ubwc_boot(void);
+extern "C" int sweet_ubwc_disp;       /* 1111: kern.sweet_ubwc_disp (bsd/dev/sweet_gpu.c) */
+/*
+ * 1111: the scanout-slot surface whose memory starts at physical address pa (retained), or NULL: SweetAccelerator's
+ * GetMetadata finds the display surface behind an imported BO this way.
+ */
+SweetSurface *sweet_surface_scan_find_pa(uint64_t pa);
+#define SWEET_UBWC_VERSION              3       /* SM7250: Adreno 620 UBWC 3 */
+#define SWEET_UBWC_HBB                  14      /* SweetAccelerator GetDeviceInfo highest_bank_bit */
 uint32_t sweet_surface_scan_mode(void);
 SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
 /* 0979: the slots' memory made at boot (AppleCLCD::start, before userland fragments RAM); a slot's memory (retained) */

@@ -116,6 +116,96 @@ sweet_surface_scan_mode(void)
 	return (uint32_t)sweet_scan_boot;
 }
 
+/*
+ * 1111: UBWC display surfaces. boot-arg sweetubwc: 0 (absent) = everything as 1110; 1 = the scanout slots are made
+ * SWEET_SCAN_SLOT_LEN_UBWC long (+128 KB each, from the GPU pool, as the slots themselves), kern.sweet_ubwc_disp
+ * starts 0; 2 = the same and kern.sweet_ubwc_disp starts 1. kern.sweet_ubwc_disp (bsd/dev/sweet_gpu.c) is read at
+ * each scanout-slot create: 1 makes the new surface UBWC-ready (its UBWC layout fits the slot, allocSize grows to
+ * it); a ready surface turns compressed only when a GPU client asks its metadata (SweetAccelerator GetMetadata,
+ * while the sysctl is still 1). With sweetubwc 0 the sysctl has no effect.
+ */
+static int sweet_ubwc_boot_v = -1;
+
+uint32_t
+sweet_surface_ubwc_boot(void)
+{
+	if (sweet_ubwc_boot_v < 0) {
+		int m = 0;
+		PE_parse_boot_argn("sweetubwc", &m, sizeof(m));
+		sweet_ubwc_boot_v = m < 0 || m > 2 ? 0 : m;
+	}
+	return (uint32_t)sweet_ubwc_boot_v;
+}
+
+uint64_t
+sweet_surface_scan_len(void)
+{
+	return sweet_surface_ubwc_boot() != 0 ? SWEET_SCAN_SLOT_LEN_UBWC : SWEET_SCAN_SLOT_LEN;
+}
+
+/*
+ * 1111: the UBWC layout of a W x H RGBA8 surface, as fdl6_layout (TILE6_3, ubwc, one level) and msm_media_info's
+ * COLOR_FMT_RGBA8888_UBWC both give it: 16x4-pixel blocks, one meta byte each; meta pitch align(ceil(W/16), 64),
+ * meta rows align(ceil(H/4), 16), the plane 4 KB aligned; colour pitch align(W x 4, 256), rows align(H, 16).
+ * Meta at 0, colour after it. Returns the total bytes.
+ */
+static uint64_t
+sweet_ubwc_layout(SweetSurface *s)
+{
+	uint32_t W = s->width, H = s->height;
+	uint32_t mp = (((W + 15) / 16) + 63) & ~63u, mr = (((H + 3) / 4) + 15) & ~15u;
+	uint32_t msz = (mp * mr + 4095) & ~4095u;
+	uint32_t dp = (W * 4 + 255) & ~255u, dr = (H + 15) & ~15u;
+	s->ubwcMeta = 0;
+	s->ubwcMetaPitch = mp;
+	s->ubwcMetaSize = msz;
+	s->ubwcData = msz;
+	s->ubwcDataPitch = dp;
+	return (uint64_t)msz + (((uint64_t)dp * dr + 4095) & ~4095ULL);
+}
+
+/* 1111: (with the slot claimed) a UBWC-ready layout when kern.sweet_ubwc_disp is 1; NULL or why not */
+static const char *
+sweet_ubwc_ready(SweetSurface *s)
+{
+	if (sweet_surface_ubwc_boot() == 0 || !sweet_ubwc_disp) {
+		return NULL;
+	}
+	uint64_t total = sweet_ubwc_layout(s);
+	if (total > sweet_surface_scan_len() || s->ubwcDataPitch > 0xffff || s->ubwcDataPitch < s->width * 4) {
+		s->ubwcMeta = s->ubwcMetaPitch = s->ubwcMetaSize = s->ubwcData = s->ubwcDataPitch = 0;
+		return "UBWC layout larger than the slot";
+	}
+	s->ubwcReady = 1;
+	if (total > s->allocSize) {
+		s->allocSize = (uint32_t)total;         /* the client's IOSurfaceGetAllocSize covers both planes */
+	}
+	return NULL;
+}
+
+SweetSurface *
+sweet_surface_scan_find_pa(uint64_t pa)
+{
+	uint32_t id = 0;
+	if (pa == 0 || sweet_scan_lock == NULL) {
+		return NULL;
+	}
+	IOLockLock(sweet_scan_lock);
+	for (uint32_t n = 0; n < SWEET_SCAN_SLOTS; n++) {
+		if (sweet_scan_slot[n].owner != NULL && sweet_scan_slot[n].pa == pa) {
+			id = sweet_scan_slot[n].owner->id;
+			break;
+		}
+	}
+	IOLockUnlock(sweet_scan_lock);
+	SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
+	if (s != NULL && (s->scanSlot == 0 || s->scanPA != pa)) {
+		s->release();
+		s = NULL;
+	}
+	return s;
+}
+
 static void
 sweet_scan_release(SweetSurface *s)
 {
@@ -146,14 +236,14 @@ sweet_scan_make_locked(uint32_t n)
 			return false;
 		}
 		pa = 0;
-		if (sweet_gpu_pool_alloc(SWEET_SCAN_SLOT_LEN, &pa) != 0 || pa == 0 || pa + SWEET_SCAN_SLOT_LEN > (1ULL << 32)) {
+		if (sweet_gpu_pool_alloc(sweet_surface_scan_len(), &pa) != 0 || pa == 0 || pa + sweet_surface_scan_len() > (1ULL << 32)) {
 			IOLog("SWEET SURF: scanout slot %u: no %#llx bytes in the GPU pool below 4 GB (%#llx): no more RAM slots\n", n,
-			    SWEET_SCAN_SLOT_LEN, pa);
+			    sweet_surface_scan_len(), pa);
 			sweet_scan_ram_failed = true;   /* (a pool block above 4 GB would leak: the ranges are all below) */
 			return false;
 		}
 	}
-	sweet_scan_slot[n].md = IOMemoryDescriptor::withPhysicalAddress(pa, SWEET_SCAN_SLOT_LEN, kIODirectionInOut);
+	sweet_scan_slot[n].md = IOMemoryDescriptor::withPhysicalAddress(pa, sweet_surface_scan_len(), kIODirectionInOut);
 	sweet_scan_slot[n].pa = pa;
 	return sweet_scan_slot[n].md != NULL;
 }
@@ -183,6 +273,13 @@ sweet_surface_scan_reserve(void)
 		return;
 	}
 	PE_parse_boot_argn("sweetscanslots", &want, sizeof(want));
+	if (sweet_surface_ubwc_boot() != 0) {
+		if (sweet_surface_ubwc_boot() == 2) {
+			sweet_ubwc_disp = 1;
+		}
+		IOLog("SWEET SURF: ubwc: boot-arg sweetubwc=%u: slots %#llx bytes, kern.sweet_ubwc_disp %d\n",
+		    sweet_surface_ubwc_boot(), sweet_surface_scan_len(), sweet_ubwc_disp);
+	}
 	if (want > SWEET_SCAN_SLOTS - 1) {
 		want = SWEET_SCAN_SLOTS - 1;
 	}
@@ -193,7 +290,7 @@ sweet_surface_scan_reserve(void)
 		}
 		IOMemoryMap *map = n != 0 ? sweet_scan_slot[n].md->map(kIOMapWriteCombineCache) : NULL;
 		if (map != NULL) {
-			bzero((void *)map->getVirtualAddress(), (size_t)SWEET_SCAN_SLOT_LEN);     /* black, not old pool data */
+			bzero((void *)map->getVirtualAddress(), (size_t)sweet_surface_scan_len());     /* black, not old pool data */
 			__asm__ volatile ("dsb sy" ::: "memory");
 			map->release();
 		}
@@ -234,7 +331,7 @@ sweet_scan_claim(SweetSurface *s)
 	    s->elementHeight != 1) {
 		return "not one-plane BGRA";
 	}
-	if (s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > SWEET_SCAN_SLOT_LEN) {
+	if (s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > sweet_surface_scan_len()) {
 		return "offset, rows or size";
 	}
 	proc_selfname(name, sizeof(name));
@@ -261,16 +358,22 @@ sweet_scan_claim(SweetSurface *s)
 	s->scanSlot = n + 1;
 	s->scanPA = sweet_scan_slot[n].pa;
 	IOLockUnlock(sweet_scan_lock);
+	const char *notUbwc = sweet_ubwc_ready(s);      /* 1111 */
+	if (sweet_surface_ubwc_boot() != 0) {
+		IOLog("SWEET SURF: ubwc: %ux%u surface in slot %u: %s (meta %#x pitch %u size %#x, colour %#x pitch %u, alloc %#x, "
+		    "kern.sweet_ubwc_disp %d)\n", s->width, s->height, n, s->ubwcReady ? "UBWC-ready" : notUbwc != NULL ? notUbwc : "linear",
+		    s->ubwcMeta, s->ubwcMetaPitch, s->ubwcMetaSize, s->ubwcData, s->ubwcDataPitch, s->allocSize, sweet_ubwc_disp);
+	}
 	IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
 	if (b != NULL) {
 		s->mapCache = kIOMapDefaultCache;       /* as every surface; the scanout cleans CPU-written frames */
-		bzero(b->getBytesNoCopy(), (size_t)SWEET_SCAN_SLOT_LEN);
-		flush_dcache64((addr64_t)(uintptr_t)b->getBytesNoCopy(), (unsigned)SWEET_SCAN_SLOT_LEN, FALSE);
+		bzero(b->getBytesNoCopy(), (size_t)sweet_surface_scan_len());
+		flush_dcache64((addr64_t)(uintptr_t)b->getBytesNoCopy(), (unsigned)sweet_surface_scan_len(), FALSE);
 	} else {
 		s->mapCache = kIOMapWriteCombineCache;  /* as the panel's own surface */
 		uintptr_t va = s->kernelAddress();
 		if (va != 0) {
-			bzero((void *)va, (size_t)SWEET_SCAN_SLOT_LEN);
+			bzero((void *)va, (size_t)sweet_surface_scan_len());
 			__asm__ volatile ("dsb sy" ::: "memory");
 		}
 	}

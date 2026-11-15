@@ -1201,7 +1201,46 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 		return kIOReturnSuccess;        /* only for dma-buf exports, which Darwin has not */
 	case NativeAdrenoMethodGetMetadata: {
 		V2_OUT(NativeAdrenoAbiMetadata);
-		return kIOReturnSuccess;        /* bytes 0 */
+		/*
+		 * 1111: an imported BO that is a UBWC-ready display surface (SweetSurface 1111: a scanout slot made while
+		 * kern.sweet_ubwc_disp was 1) answers its UBWC layout while kern.sweet_ubwc_disp is 1: 'UBWC', then version,
+		 * meta offset, meta pitch, meta size, colour offset, colour pitch, highest bank bit (offsets from the surface's
+		 * base, as hakios-metal's HakiosSurfaceUbwc reads them). Asking commits the surface: from then on it is
+		 * scanned out compressed (ubwcLive). Every other BO, and every BO with the sysctl 0: bytes 0 (linear), as before.
+		 */
+		const NativeAdrenoAbiMetadata *rq = in != NULL && inSize == sizeof(NativeAdrenoAbiMetadata) ?
+		    (const NativeAdrenoAbiMetadata *)in : NULL;
+		if (rq == NULL || !sweet_ubwc_disp || sweet_surface_ubwc_boot() == 0) {
+			return kIOReturnSuccess;        /* bytes 0 */
+		}
+		uint64_t pa = 0;
+		IOByteCount len = 0;
+		IOLockLock(fLock);
+		SweetV2BO *bo = v2Find(rq->handle);
+		if (bo != NULL && bo->imported) {
+			pa = bo->md->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
+			len = bo->md->getLength();
+		}
+		IOLockUnlock(fLock);
+		SweetSurface *s = pa != 0 ? sweet_surface_scan_find_pa(pa) : NULL;
+		if (s == NULL || !s->ubwcReady || len < (uint64_t)s->ubwcData + (uint64_t)s->ubwcDataPitch * ((s->height + 15) & ~15u)) {
+			OSSafeReleaseNULL(s);
+			return kIOReturnSuccess;
+		}
+		uint32_t w[8] = { 0x43574255u /* 'UBWC' */, SWEET_UBWC_VERSION, s->ubwcMeta, s->ubwcMetaPitch, s->ubwcMetaSize,
+			          s->ubwcData, s->ubwcDataPitch, SWEET_UBWC_HBB };
+		if (rq->bytes >= sizeof(w)) {
+			memcpy(rp->text, w, sizeof(w));
+			rp->bytes = sizeof(w);
+			rp->handle = rq->handle;
+			if (!s->ubwcLive) {
+				s->ubwcLive = 1;
+				IOLog("SWEET MTL: v2 %s: ubwc: surface %u (slot %u, PA %#llx) compressed from now on (meta %#x/%u, colour %#x/%u)\n",
+				    fName, s->id, s->scanSlot - 1, s->scanPA, s->ubwcMeta, s->ubwcMetaPitch, s->ubwcData, s->ubwcDataPitch);
+			}
+		}
+		s->release();
+		return kIOReturnSuccess;
 	}
 	case NativeAdrenoMethodCreateQueue: {
 		V2_OUT(NativeAdrenoAbiQueueReply);

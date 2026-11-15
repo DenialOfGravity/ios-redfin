@@ -2461,6 +2461,16 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
 #define SSPP_SRC0               0x014u
 #define SSPP_YSTRIDE0           0x024u
 #define SSPP_FORMAT             0x030u  /* bit 8: alpha (SRCC3_EN) */
+/* 1111: UBWC fetch (upstream dpu_hw_sspp.c; MDSS offsets from 0x0ae00000 as every other here, msm_mdss.c) */
+#define SSPP_SRC2               0x01cu  /* UBWC: the meta plane */
+#define SSPP_YSTRIDE1           0x028u  /* UBWC: bits 15:0 the meta pitch */
+#define SSPP_UNPACK             0x034u
+#define SSPP_OP_MODE            0x038u  /* bit 0: BWC_EN */
+#define SSPP_UBWC_STATIC        0x044u
+#define SSPP_FETCH_CONFIG       0x048u
+#define SSPP_UBWC_ERROR         0x138u
+#define MDSS_UBWC_DEC_VERSION   0x058u
+#define MDSS_UBWC_STATIC        0x144u
 #define SSPP_PE(c, r)           (0x100u + 0x10u * (c) + 4u * (r))       /* pixel extension C0/C1C2/C3: LR, TB, REQ */
 #define QSEED                   0xa00u  /* lito DT qcom,sde-vig-qseed-off, "qseedv3lite" */
 #define QS_VERSION              (QSEED + 0x00)
@@ -2502,6 +2512,9 @@ static struct {
 	bool                active;         /* the pipes are ours; old[] holds what goes back */
 	bool                scan;           /* 0976: ... for the direct scanout (p scanout 0 gives them back) */
 	uint32_t            old[2][SWEET_MDP_NREGS];
+	bool                ufmt;           /* 1111: the pipes are set for a UBWC surface (kern.sweet_ubwc_disp) */
+	bool                usaved;         /* 1111: uold holds the format registers as they were before the first */
+	uint32_t            uold[2][7];     /* 1111: SRC2, YSTRIDE1, FORMAT, UNPACK, OP_MODE, UBWC_STATIC, FETCH_CONFIG */
 	vm_offset_t         smmu_va[6];
 	uint64_t            smmu_pa[6];
 } sweet_mdp;
@@ -2761,6 +2774,179 @@ sweet_mdp_flush(const char *what)
 	    sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
 }
 
+/*
+ * ---- 1111: UBWC display surfaces (kern.sweet_ubwc_disp, boot-arg sweetubwc; SweetSurface.cpp, SweetAccelerator.cpp) ----
+ * A scanout surface whose GPU client draws it compressed (ubwcLive) is fetched by VIG0/VIG1 through their UBWC decoder
+ * (VIG pipes have one, DMA pipes do not; the pipes and the QSEED3LITE 1125x2436 -> 1080x2340 scale stay as they are:
+ * the decoder sits before the scaler). Per pipe, as upstream dpu_hw_sspp_setup_format/_sourceaddress/_rects do for
+ * DRM_FORMAT_ABGR8888 + QCOM_COMPRESSED: SRC0 the colour plane, SRC2 the meta plane, YSTRIDE0 the colour pitch,
+ * YSTRIDE1 the meta pitch, FORMAT fetch mode 2 (bits 31:30), UNPACK R,G,B,A (0x03010002: the GPU writes compressed
+ * targets with swap WZYX, so byte 0 is red whatever the IOSurface's 'BGRA' says; the only RGB order the MDP's UBWC
+ * decoder has), OP_MODE BWC_EN, FETCH_CONFIG 0x87 | hbb-13 << 18, UBWC_STATIC by the decoder version (MDSS
+ * +0x58). The first switch saves these registers (uold); restore and a linear frame put them back. Nothing here runs
+ * unless a surface went ubwcLive, which needs boot-arg sweetubwc and kern.sweet_ubwc_disp 1.
+ *
+ * kern.sweet_ubwc_sspp (0 = auto as above; else the raw SSPP UBWC_STATIC value) and kern.sweet_ubwc_mdss (0 = auto:
+ * MDSS UBWC_STATIC written msm_mdss-style only if it reads 0; 1 = never written; else the raw value written): read
+ * at each switch to UBWC, so a variant is tried by a backboardd restart, no rebuild.
+ */
+extern "C" int sweet_ubwc_sspp, sweet_ubwc_mdss;
+static struct {
+	uint32_t frames, linear, switches, skipped, corners, errs[2];
+	uint64_t win;
+	bool     logged;
+} sweet_ubwc_st;
+
+static uint32_t
+sweet_ubwc_sspp_static(uint32_t fmt, uint32_t *ver)
+{
+	const uint32_t swz = 6, hbb = SWEET_UBWC_HBB - 13;      /* as the GPU: level 2+3 swizzle, hbb 14 */
+	uint32_t v = sweet_mdp_rd(MDSS_UBWC_DEC_VERSION) >> 28;
+	*ver = v;
+	if (sweet_ubwc_sspp != 0) {
+		return (uint32_t)sweet_ubwc_sspp;
+	}
+	uint32_t fast = (fmt & (1u << 8)) ? 1u << 31 : 0;
+	switch (v) {
+	case 1:
+		return fast | (swz & 1) | 1u << 8 | hbb << 4;
+	case 2:
+		return fast | swz | hbb << 4;
+	case 4:
+		return 1u << 30;
+	default:        /* 3 (SM7250), or an unreadable version: as 3 */
+		return 1u << 30 | swz | hbb << 4;
+	}
+}
+
+static void
+sweet_ubwc_mdss_setup(uint32_t ver)
+{
+	uint32_t cur = sweet_mdp_rd(MDSS_UBWC_STATIC), want = 0;
+	if (sweet_ubwc_mdss == 1) {
+		want = cur;
+	} else if (sweet_ubwc_mdss != 0) {
+		want = (uint32_t)sweet_ubwc_mdss;
+	} else if (cur == 0) {
+		/* msm_mdss_setup_ubwc_dec_{20,30,40}: swizzle 6, ubwc_static 1, hbb 14 (1), UBWC 3.0 encoder (bit 10) */
+		want = ver == 4 ? (6u & 1) | 1u << 4 | 1u << 10 : ver == 2 ? (6u & 1) | 1u << 4 : 6u | 1u << 3 | 1u << 4 | 1u << 10;
+	} else {
+		want = cur;
+	}
+	if (want != cur) {
+		sweet_mdp_wr(MDSS_UBWC_STATIC, want);
+	}
+	if (!sweet_ubwc_st.logged || want != cur) {
+		sweet_ubwc_st.logged = true;
+		IOLog("SWEET MDP: ubwc: decoder version %u (MDSS +0x58 %#x), MDSS UBWC_STATIC %#x -> %#x\n", ver,
+		    sweet_mdp_rd(MDSS_UBWC_DEC_VERSION), cur, want);
+	}
+}
+
+/* The pipes' format registers for surface s compressed (on) or back to what they were (off). */
+static void
+sweet_mdp_ubwc_fmt(bool on, SweetSurface *s)
+{
+	static const uint16_t r[7] = { SSPP_SRC2, SSPP_YSTRIDE1, SSPP_FORMAT, SSPP_UNPACK, SSPP_OP_MODE, SSPP_UBWC_STATIC,
+		                       SSPP_FETCH_CONFIG };
+	if (on == sweet_mdp.ufmt) {
+		return;
+	}
+	if (on && !sweet_mdp.usaved) {
+		for (uint32_t p = 0; p < 2; p++) {
+			for (uint32_t i = 0; i < 7; i++) {
+				sweet_mdp.uold[p][i] = sweet_mdp_rd(MDP_VIG(p) + r[i]);
+			}
+		}
+		sweet_mdp.usaved = true;
+	}
+	if (!sweet_mdp.usaved) {
+		return;
+	}
+	uint32_t ver = 0, st = on ? sweet_ubwc_sspp_static(sweet_mdp.uold[0][2], &ver) : 0;
+	if (on) {
+		sweet_ubwc_mdss_setup(ver);
+	}
+	for (uint32_t p = 0; p < 2; p++) {
+		uint32_t b = MDP_VIG(p);
+		if (!on) {
+			for (uint32_t i = 0; i < 7; i++) {
+				sweet_mdp_wr(b + r[i], sweet_mdp.uold[p][i]);
+			}
+			continue;
+		}
+		sweet_mdp_wr(b + SSPP_YSTRIDE1, (sweet_mdp.uold[p][1] & 0xffff0000u) | s->ubwcMetaPitch);
+		sweet_mdp_wr(b + SSPP_FORMAT, (sweet_mdp.uold[p][2] & ~(3u << 30)) | 2u << 30);
+		sweet_mdp_wr(b + SSPP_UNPACK, 0x03010002u);
+		sweet_mdp_wr(b + SSPP_OP_MODE, sweet_mdp.uold[p][4] | 1u);
+		sweet_mdp_wr(b + SSPP_UBWC_STATIC, st);
+		sweet_mdp_wr(b + SSPP_FETCH_CONFIG, 0x87u | (uint32_t)(SWEET_UBWC_HBB - 13) << 18);
+		(void)sweet_mdp_rd(b + SSPP_UBWC_ERROR);
+		sweet_mdp_wr(b + SSPP_UBWC_ERROR, 1u << 31);    /* clear */
+	}
+	sweet_mdp.ufmt = on;
+	sweet_ubwc_st.switches++;
+	static uint32_t logs;
+	if (logs < 16) {
+		logs++;
+		IOLog("SWEET MDP: ubwc: pipes %s (surface %u, format %#x -> %#x, unpack %#x, op %#x, static %#x, fetch %#x)\n",
+		    on ? "compressed" : "linear again", s != NULL ? s->id : 0, sweet_mdp.uold[0][2], sweet_mdp_rd(MDP_VIG(0) + SSPP_FORMAT),
+		    sweet_mdp_rd(MDP_VIG(0) + SSPP_UNPACK), sweet_mdp_rd(MDP_VIG(0) + SSPP_OP_MODE),
+		    sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_STATIC), sweet_mdp_rd(MDP_VIG(0) + SSPP_FETCH_CONFIG));
+	}
+}
+
+/*
+ * Surface s's planes into both pipes (latched at the next CTL0 flush): before 1111 only SRC0 = scanPA was written per
+ * flip, and a linear surface still gets exactly that (the format registers go back first if the last one was UBWC).
+ */
+static void
+sweet_mdp_scan_addr(SweetSurface *s)
+{
+	bool u = s->ubwcLive != 0;
+	if (u || sweet_mdp.ufmt) {
+		sweet_mdp_ubwc_fmt(u, s);
+	}
+	for (uint32_t p = 0; p < 2; p++) {
+		uint32_t b = MDP_VIG(p);
+		if (u) {
+			sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | s->ubwcDataPitch);
+			sweet_mdp_wr(b + SSPP_SRC2, (uint32_t)(s->scanPA + s->ubwcMeta));
+			sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)(s->scanPA + s->ubwcData));
+		} else {
+			sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)s->scanPA);
+		}
+	}
+	if (u) {
+		sweet_ubwc_st.frames++;
+	} else if (sweet_ubwc_st.switches != 0) {
+		sweet_ubwc_st.linear++;
+	}
+}
+
+/* restore: the format registers as they were (with sweet_mdp.lock; before the flush) */
+static void
+sweet_mdp_ubwc_restore(void)
+{
+	if (sweet_mdp.ufmt) {
+		sweet_mdp_ubwc_fmt(false, NULL);
+	}
+	sweet_mdp.usaved = false;
+}
+
+/* 1111: one line per 5 s while UBWC frames are scanned (the scanout statistics' window; fLock) */
+static void
+sweet_ubwc_stats_locked(void)
+{
+	if (sweet_ubwc_st.frames == 0 && sweet_ubwc_st.skipped == 0) {
+		return;
+	}
+	uint32_t e0 = sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_ERROR), e1 = sweet_mdp_rd(MDP_VIG(1) + SSPP_UBWC_ERROR);
+	IOLog("SWEET SCANOUT: 5s ubwc: frames %u linear %u switches %u not-presented %u corners-skipped %u | error vig0 %#x vig1 %#x\n",
+	    sweet_ubwc_st.frames, sweet_ubwc_st.linear, sweet_ubwc_st.switches, sweet_ubwc_st.skipped, sweet_ubwc_st.corners, e0, e1);
+	sweet_ubwc_st.frames = sweet_ubwc_st.linear = sweet_ubwc_st.switches = sweet_ubwc_st.skipped = sweet_ubwc_st.corners = 0;
+}
+
 /* With sweet_mdp.lock: stop the presents, wait out a flip in flight, save the pipes. */
 static bool
 sweet_mdp_take(AppleCLCD *fb, const char *what)
@@ -2812,6 +2998,7 @@ sweet_mdp_restore_locked(AppleCLCD *fb, const char *why)
 			sweet_mdp_wr(MDP_VIG(p) + sweet_mdp_regs[i], sweet_mdp.old[p][i]);
 		}
 	}
+	sweet_mdp_ubwc_restore();       /* 1111: nothing unless a UBWC surface was scanned */
 	sweet_mdp_flush("restore");
 	sweet_mdp_pipes("restored");
 	sweet_mdp.active = false;
@@ -2957,6 +3144,11 @@ sweet_mdp_ca(uint32_t slot)
 		sweet_mdp_pipes("ca");
 		IOLog("SWEET MDP: ca: slot %u is empty: the test pattern from its memory (PA %#llx) on screen\n", slot, pa);
 		return true;
+	}
+	if (s->ubwcLive) {
+		IOLog("SWEET MDP: ca: slot %u = surface %u is UBWC-compressed: not shown as linear rows (1111)\n", slot, s->id);
+		s->release();
+		return false;
 	}
 	uint32_t id = s->id, bpr = s->bytesPerRow, seed = s->state != NULL ?
 	    *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
@@ -3240,6 +3432,9 @@ sweet_scan_enter(AppleCLCD *fb, SweetSurface *s)
 			sweet_mdp_restore_locked(fb, "scanout geometry refused");
 			ok = false;
 		} else {
+			if (s->ubwcLive) {
+				sweet_mdp_scan_addr(s);         /* 1111: the compressed planes and format */
+			}
 			sweet_mdp_flush("scanout on");
 			IOLockLock(fb->fLock);
 			sweet_scan.geom = true;
@@ -4083,7 +4278,11 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 		}
 	}
 	if (sweet_scan.corners) {
-		sweet_scan_corners(fb, s);      /* 0986 */
+		if (s->ubwcLive) {
+			sweet_ubwc_st.corners++;        /* 1111: CPU writes into compressed planes would show as garbage */
+		} else {
+			sweet_scan_corners(fb, s);      /* 0986 */
+		}
 	}
 	sweet_scan.next = NULL;
 	uint64_t sSeq = sweet_scan.nextSeq, sAbs = sweet_scan.nextAbs;    /* 0979: a newer frame may come while entering */
@@ -4127,8 +4326,12 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
 		return sweet_scan.next != NULL;
 	}
-	sweet_mdp_wr(MDP_VIG(0) + SSPP_SRC0, (uint32_t)s->scanPA);
-	sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
+	if (s->ubwcLive || sweet_mdp.ufmt) {
+		sweet_mdp_scan_addr(s);         /* 1111: a UBWC surface, or the first linear one after it */
+	} else {
+		sweet_mdp_wr(MDP_VIG(0) + SSPP_SRC0, (uint32_t)s->scanPA);
+		sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
+	}
 	sweet_scan.flipFrame = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
 	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
 	SWEET_TRACE(SWT_SCAN_FLIP, sSwap, sSeq, now - sAbs, sweet_scan.flipFrame);    /* 0994 */
@@ -4155,6 +4358,9 @@ sweet_scan_stats_locked(uint64_t now)
 		return;
 	}
 	sweet_scan.stWin = now;
+	if (sweet_surface_ubwc_boot() != 0) {
+		sweet_ubwc_stats_locked();      /* 1111 */
+	}
 	if (sweet_scan.stFrames == 0 && sweet_scan.stNonslot == 0) {
 		return;
 	}
@@ -5240,6 +5446,27 @@ AppleCLCD::present(const uint8_t *rec)
 		return;         /* 0948: a p mdp test owns the pipes; the latest frame goes out after p mdp restore */
 	}
 	uint32_t mask = get32(rec, 0x104);
+	/*
+	 * 1111: a compressed (UBWC) surface is only ever scanned out directly: every present below reads it as linear rows
+	 * (CPU copy, GPU blit, crop copy) and would put its compressed bytes on the panel. Such a frame is not presented
+	 * (the last one stays); the direct path shows the next.
+	 */
+	for (uint32_t l = 0; sweet_surface_ubwc_boot() != 0 && mask != 0 && l < SWEET_FB_LAYERS; l++) {
+		uint32_t id = (mask & (1u << l)) ? get32(rec, 0x54 + 4 * l) : 0;
+		SweetSurface *u = id != 0 ? sweet_surface_copy(id) : NULL;
+		bool live = u != NULL && u->ubwcLive;
+		OSSafeReleaseNULL(u);
+		if (live) {
+			static uint32_t logs;
+			sweet_ubwc_st.skipped++;
+			if (logs < 4) {
+				logs++;
+				IOLog("SWEET FB: swap %u: surface %u is UBWC-compressed: not presented (only the direct scanout shows it)\n",
+				    get32(rec, 0x50), id);
+			}
+			return;
+		}
+	}
 
 
 	if (!fConsolePaused) {
