@@ -5251,6 +5251,11 @@ sweet_pt_pct(const uint16_t *h, uint32_t bins, uint32_t n, uint32_t pct)
  * 1114: kern.sweet_pace_dump=1 (bsd/dev/sweet_gpu.c, the sysctl caller's thread): print the ring since the last dump,
  * one "SWEET PACE: f" line per frame with its latch time. The records are copied out under the try-lock (hooks that
  * find it taken meanwhile drop their update), printed after. Returns the number printed.
+ * 1118: the kernel log cuts a message at 255 bytes (the 1114 line lost everything after "| disp ru" and its
+ * newline), so each record is printed as four lines f1..f4, each starting "SWEET PACE: fN <latch s.ms> id <id>",
+ * in that order (realistic lengths 100-170 bytes; even with every field at its type's maximum each stays under
+ * 255): f1 v + stages, f2 tick classes + swapper, f3 disp/rs/sb run/wait, f4 touch + ahead/subs.
+ * tools-claude/pace-k5.py joins them by (latch, id). The header line is split the same way (dump / dump-key).
  */
 extern "C" uint32_t sweet_pace_dump(void);
 uint32_t
@@ -5282,9 +5287,10 @@ sweet_pace_dump(void)
 	sweet_pt.ringLost += lost;
 	uint32_t missed = sweet_pt.xMissed;
 	sweet_pt_give();
-	IOLog("SWEET PACE: dump n %u lost %llu (trace %#x; ms; tick classes: swap/busy = CA polled SwapWait, all Busy/none = no "
-	    "poll, no swap/ok = polled done, no swap; pend = newest swap not latched at the tick; run/wait = big/little ms; "
-	    "missed updates %u)\n", n, lost, sweet_pace_trace, missed);
+	IOLog("SWEET PACE: dump n %u lost %llu (trace %#x; ms; 1118: 4 lines f1..f4 per frame; missed updates %u)\n", n,
+	    lost, sweet_pace_trace, missed);
+	IOLog("SWEET PACE: dump-key tick classes: swap/busy = CA polled SwapWait, all Busy/none = no poll, no swap/ok = "
+	    "polled done, no swap; pend = newest swap not latched at the tick; run/wait = big/little ms\n");
 #define PX(a) (a) / 1000, (a) % 1000 / 100
 	for (uint32_t i = 0; i < n; i++) {
 		auto *e = &b[i];
@@ -5297,20 +5303,26 @@ sweet_pace_dump(void)
 		} else {
 			snprintf(oc, sizeof(oc), "%u.%u", PX(x->onCore));
 		}
-		IOLog("SWEET PACE: f %llu.%03llu id %u v %u | idle %u.%u sub %u.%u gate %u.%u gpu %u.%u done->latch %u.%u "
-		    "(wait %u.%u flip->latch %u.%u) | ticks %u swap-gap busy %u none %u ok %u pend %u off %u polls %u/%u busy | "
-		    "tick->begin %u.%u on-core %s wait %u.%u cpu %u cls %u pend-at-tick %u | disp run %u.%u/%u.%u wait %u.%u/%u.%u "
-		    "| rs run %u.%u/%u.%u wait %u.%u/%u.%u | sb run %u.%u/%u.%u wait %u.%u/%u.%u | touch down %u up %u ev %u n %u "
-		    "| ahead %u subs %u\n",
-		    ns / 1000000000ULL, ns / 1000000ULL % 1000, e->id, e->k, PX(e->st[0]), PX(e->st[1]), PX(e->st[2]),
-		    PX(e->st[3]), PX(e->st[4]), PX(e->st[5]), PX(e->st[6]), x->ticks, x->tBusy, x->tNone, x->tOk, x->tPend,
-		    x->tOff, x->polls, x->pollsBusy, PX(x->tickBegin), oc, PX(x->curWait), x->cpu, x->cls, x->pendAtTick,
+		/* 1118: four messages (each under the kernel log's 255-byte cut), same latch + id, in this order */
+		unsigned long long sec = ns / 1000000000ULL, msec = ns / 1000000ULL % 1000;
+		IOLog("SWEET PACE: f1 %llu.%03llu id %u v %u | idle %u.%u sub %u.%u gate %u.%u gpu %u.%u done->latch %u.%u "
+		    "(wait %u.%u flip->latch %u.%u)\n",
+		    sec, msec, e->id, e->k, PX(e->st[0]), PX(e->st[1]), PX(e->st[2]),
+		    PX(e->st[3]), PX(e->st[4]), PX(e->st[5]), PX(e->st[6]));
+		IOLog("SWEET PACE: f2 %llu.%03llu id %u | ticks %u swap-gap busy %u none %u ok %u pend %u off %u polls %u/%u "
+		    "busy | tick->begin %u.%u on-core %s wait %u.%u cpu %u cls %u pend-at-tick %u\n",
+		    sec, msec, e->id, x->ticks, x->tBusy, x->tNone, x->tOk, x->tPend,
+		    x->tOff, x->polls, x->pollsBusy, PX(x->tickBegin), oc, PX(x->curWait), x->cpu, x->cls, x->pendAtTick);
+		IOLog("SWEET PACE: f3 %llu.%03llu id %u | disp run %u.%u/%u.%u wait %u.%u/%u.%u | rs run %u.%u/%u.%u wait "
+		    "%u.%u/%u.%u | sb run %u.%u/%u.%u wait %u.%u/%u.%u\n",
+		    sec, msec, e->id,
 		    PX(x->gap[0][0]), PX(x->gap[0][1]), PX(x->gap[0][2]), PX(x->gap[0][3]),
 		    PX(x->gap[1][0]), PX(x->gap[1][1]), PX(x->gap[1][2]), PX(x->gap[1][3]),
-		    PX(x->gap[2][0]), PX(x->gap[2][1]), PX(x->gap[2][2]), PX(x->gap[2][3]),
-		    x->down, x->upAgo, x->evAgo, x->events, e->ahead, e->nsub);
-		if ((i & 31) == 31) {
-			IOSleep(2);
+		    PX(x->gap[2][0]), PX(x->gap[2][1]), PX(x->gap[2][2]), PX(x->gap[2][3]));
+		IOLog("SWEET PACE: f4 %llu.%03llu id %u | touch down %u up %u ev %u n %u | ahead %u subs %u\n",
+		    sec, msec, e->id, x->down, x->upAgo, x->evAgo, x->events, e->ahead, e->nsub);
+		if ((i & 7) == 7) {
+			IOSleep(2);     /* (1118: every 8 records = 32 lines, as 1114's every 32 lines) */
 		}
 	}
 #undef PX
