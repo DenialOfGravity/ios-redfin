@@ -220,6 +220,16 @@ static struct {
 	vm_offset_t va;
 } sp_chnl[4];
 
+/* 1123: kern.sweet_chg=1 opens the same allow-listed path at run time (sweet_charger.c); 0 closes it again. */
+static int sp_wr_runtime;
+
+void
+sweet_spmi_write_runtime(int on)
+{
+	sp_wr_runtime = on != 0;
+	printf("SWEET CHG: SPMI charger writes %s at run time (kern.sweet_chg)\n", sp_wr_runtime ? "ENABLED" : "off");
+}
+
 int
 sweet_spmi_write_enabled(void)
 {
@@ -229,7 +239,7 @@ sweet_spmi_write_enabled(void)
 		sp_wr_enabled = v == 1;
 		printf("SWEET CHG: SPMI charger writes %s (sweetchg=%u)\n", sp_wr_enabled ? "ENABLED" : "off", v);
 	}
-	return sp_wr_enabled;
+	return sp_wr_enabled || sp_wr_runtime;
 }
 
 static vm_offset_t
@@ -259,7 +269,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
 	}
 	if (!sweet_spmi_write_enabled() || sid != 2 || !listed) {
 		printf("SWEET CHG: write %u:%04x = %02x refused (%s)\n", sid, addr, val,
-		    sp_wr_enabled ? "not on the allow-list" : "sweetchg=0");
+		    (sp_wr_enabled > 0 || sp_wr_runtime) ? "not on the allow-list" : "sweetchg=0, kern.sweet_chg=0");
 		return -1;
 	}
 	uint8_t before = 0, after = 0;

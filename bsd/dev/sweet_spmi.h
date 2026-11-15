@@ -15,6 +15,7 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
  */
 int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
 int sweet_spmi_write_enabled(void);
+void sweet_spmi_write_runtime(int on);       /* 1123: kern.sweet_chg */
 /*
  * 1062: one lock for every SPMI transaction of every sweet driver (keys, torch, camera GPIOs, haptic,
  * CS35L41 GPIOs, battery/charger/thermal/RTC here): command, status and data of one transfer can no
