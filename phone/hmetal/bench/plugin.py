@@ -2522,6 +2522,20 @@ HMI4_PROF_NEW = '''			 hm_presents_seen ? "frames = presentDrawable" : "frames =
 			hm_print("prof: fills dropped %llu (%.1f a frame; HM_DEADFILL=%s)\\n", dropped - droppedBefore, (dropped - droppedBefore) / frames,
 				 df != NULL ? df : "1");
 			droppedBefore = dropped;
+			{   /* (ws-hm-cull) HM_CULL / HM_DEADFILL=2: draws culled under a later opaque cover in these seconds */
+				static unsigned long long cullBefore[8];
+				unsigned long long cs[8];
+				const char *cl = getenv("HM_CULL");
+
+				hakios_metal_cull_stats(cs);
+				hm_print("prof: cull HM_CULL=%s: %llu draws culled (%.1f a frame), %.2f Mpx a frame (%.2f screens); by full cover %llu, "
+					 "part cover %llu; kept by a reader %llu; passes %llu; deadfill2 full-cover take-backs %llu (%.1f a frame, %.2f Mpx a frame)\n",
+					 cl != NULL ? cl : "0", cs[0] - cullBefore[0], (cs[0] - cullBefore[0]) / frames,
+					 (cs[1] - cullBefore[1]) / 1e6 / frames, (cs[1] - cullBefore[1]) / 2740500.0 / frames,
+					 cs[3] - cullBefore[3], cs[4] - cullBefore[4], cs[5] - cullBefore[5], cs[2] - cullBefore[2],
+					 cs[6] - cullBefore[6], (cs[6] - cullBefore[6]) / frames, (cs[7] - cullBefore[7]) / 1e6 / frames);
+				for (int i = 0; i < 8; i++) cullBefore[i] = cs[i];
+			}
 			hm_pool_note(now, 1);
 		}
 '''

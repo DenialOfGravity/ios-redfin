@@ -46,6 +46,25 @@ void poolStats(uint64_t out[kPoolKinds + 2]);
 uint64_t trimAllQueues(bool force);
 // (redfin hm-int4) HM_DEADFILL's draws taken back in this process, every command buffer (render.cpp)
 uint64_t fillsDropped();
+// (ws-hm-cull) HM_CULL / HM_DEADFILL=2 counts in this process (render.cpp cullResolve): OUT[0] draws culled, [1] their
+// pixels (each draw's area), [2] passes resolved, [3] culled under a full-target cover, [4] under a part cover, [5] draws
+// a reader kept, [6] HM_DEADFILL=2 take-backs under a full-target cover (also in fillsDropped), [7] their pixels
+void cullStats(uint64_t out[8]);
+// (ws-hm-cull) HM_CULL: one draw of the open pass, as cullNote (render.cpp) saw it
+struct PassCullNote {
+    size_t start = 0;                 // stream_ word where its words begin
+    uint32_t at[2] = {0, 0};          // stream_ words of its draw packets (CP_DRAW_INDX_OFFSET / CP_DRAW_INDIRECT_MULTI)
+    uint8_t nAt = 0;
+    uint8_t writes = 0, over = 0;     // attachments it writes; of them, those it overwrites opaquely (a cover)
+    bool victim = false;              // may be culled: no side effect, its area known, its draw packets found
+    bool cover = false, full = false; // a cover (CA's opaque rectangle), over the whole window
+    bool fetch = false;               // reads attachments where it draws (fetch, [[color(n)]], an attachment sampled)
+    bool blends = false;              // blending on an attachment it writes
+    bool dead = false;
+    int32_t r[4] = {0, 0, 0, 0};      // pixels it may touch, X0 Y0 X1 Y1 (X1 Y1 past the last)
+    int32_t c[4] = {0, 0, 0, 0};      // a cover's pixels written for certain, the same form
+    std::string name;                 // its label (HM_DD only)
+};
 class Buffer {
 public:
     Buffer(std::unique_ptr<Bo> bo, uint64_t length) : bo_(std::move(bo)), length_(length) {}
@@ -414,7 +433,17 @@ private:
             std::vector<uint8_t> key;
         } df;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
+        // (ws-hm-cull) HM_DEADFILL=2: the held draw's attachments written, and whether it may be taken back by a cover
+        uint8_t dfWrites = 0;
+        bool dfVictim = false;
+        uint64_t dfPx = 0;
+        // (ws-hm-cull) HM_CULL=1..3: the level read as the pass opened (0 off), whether the pass may cull (sysmem, no
+        // depth/stencil, one sample; never GMEM or both ways), and a note of each draw (render.cpp cullNote/cullResolve)
+        int cullLevel = 0;
+        bool cullOk = false;
+        std::vector<PassCullNote> cull;
     };
+    void cullResolve();   // (ws-hm-cull) HM_CULL: the open pass's covered draws made CP_NOPs (closePass, before anything else)
     // (ws-hm-perf2) LAZY (a draw opening the next pass, HM_PASS_FLUSH=lazy): a sysmem pass ends without its tail, its
     // attachments noted as left in the CCU (dirty_); otherwise the tail, and what earlier lazily ended passes left
     // flushed with it (or alone, with no pass open)

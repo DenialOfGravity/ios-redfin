@@ -384,6 +384,9 @@ unsigned long long hakios_metal_pool_trim(int force);
 /* (redfin hm-int4) HM_DEADFILL: the draws taken back in this process so far (a pass's draw that the next draw of the
  * same geometry overwrote opaquely) */
 unsigned long long hakios_metal_fills_dropped(void);
+/* (ws-hm-cull) HM_CULL / HM_DEADFILL=2 counts so far (OUT[8]: draws culled, their pixels, passes resolved, culled under a
+ * full-target cover, under a part cover, draws a reader kept, HM_DEADFILL=2 full-cover take-backs, their pixels) */
+void hakios_metal_cull_stats(unsigned long long out[8]);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* (redfin hmv7) HM_HANG_BLAME: how many hung command buffers drew with PROGRAM (only programs of at least

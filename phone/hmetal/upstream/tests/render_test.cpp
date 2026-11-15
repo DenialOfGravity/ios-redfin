@@ -8014,3 +8014,313 @@ TEST(a_traced_command_buffer_names_and_stamps_its_draws) {
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
+
+// --- (ws-hm-cull) HM_CULL=1..3 and HM_DEADFILL=2 --------------------------------------------------------------------------
+
+namespace {
+// CoreAnimation's opaque rectangle as cullNote knows it: the vertex function named fixed_vert_lph_spc, attribute 0 a
+// Float2 position at [[buffer(0)]] (tri_attr's 12-byte vertices), the transform the 64 bytes at [[buffer(1)]]
+struct CullRig {
+    Rig r;
+    std::shared_ptr<Texture> t = target(r), t1 = target(r);
+    RenderPass pass;
+    render::Options o;
+    std::vector<std::shared_ptr<Buffer>> keep;
+    uint64_t base[8] = {};
+    uint32_t drawsBefore = 0;
+    CullRig() {
+        pass.color0 = t.get();
+        o.gmem = false;
+        cullStats(base);
+    }
+    static Program lph(const char* label = "cover") {
+        Program p = attrProgram();
+        p.vs.k.name = "fixed_vert_lph_spc";
+        p.name = label;
+        return p;
+    }
+    // a rectangle in clip space (X0 Y0 X1 Y1) as two triangles sharing a diagonal, through the identity transform
+    Bindings rect(float x0, float y0, float x1, float y1, uint32_t colour = 0xff0000ffu) {
+        std::string why;
+        auto vb = newBuffer(*r.gpu, 6 * 12, &why);
+        auto mb = newBuffer(*r.gpu, 64, &why);
+        CHECK(vb != nullptr && mb != nullptr);
+        const float xy[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
+        uint8_t* v = static_cast<uint8_t*>(vb->contents());
+        for (int i = 0; i < 6; i++) {
+            memcpy(v + 12 * i, xy[i], 8);
+            memcpy(v + 12 * i + 8, &colour, 4);
+        }
+        const float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        memcpy(mb->contents(), m, 64);
+        keep.push_back(vb);
+        keep.push_back(mb);
+        Bindings b;
+        b.buffers = {Binding{vb.get(), 0}, Binding{mb.get(), 0}};
+        return b;
+    }
+    struct D {
+        const Program* p;
+        Bindings vs;
+        Draw d;
+        const RenderPass* pass = nullptr;
+    };
+    // the draws in one command buffer; the draws the fake ran
+    uint32_t run(const std::vector<D>& draws) {
+        drawsBefore = r.fake->stats().draws;
+        auto cb = r.queue->commandBuffer();
+        for (const D& x : draws) CHECK(cb->draw(*x.p, x.pass != nullptr ? *x.pass : pass, x.d, x.vs, Bindings{}, o));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        return r.fake->stats().draws - drawsBefore;
+    }
+    uint64_t delta(int i) {
+        uint64_t now[8];
+        cullStats(now);
+        const uint64_t d = now[i] - base[i];
+        base[i] = now[i];
+        return d;
+    }
+    void reset() { cullStats(base); }
+};
+struct CullEnv {
+    explicit CullEnv(const char* level, const char* deadfill = nullptr) {
+        setenv("HM_CULL", level, 1);
+        if (deadfill != nullptr) setenv("HM_DEADFILL", deadfill, 1);
+    }
+    ~CullEnv() {
+        unsetenv("HM_CULL");
+        unsetenv("HM_DEADFILL");
+    }
+};
+Draw scissored(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t n = 3) {
+    Draw d = wholeDraw(n);
+    d.scissor = Scissor{x, y, w, h};
+    return d;
+}
+}  // namespace
+
+// Off by default: a draw under a full-target opaque cover is drawn (HM_CULL unset, and 0)
+TEST(cull_is_off_by_default) {
+    CullRig c;
+    const Program flat = flatProgram(), cover = CullRig::lph();
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+    CullEnv e("0");
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+}
+
+// HM_CULL=1: a draw (any vertex function, its area the whole target) under a later full-target opaque rectangle is a
+// CP_NOP: the fake runs one draw of two, no fault; counted as culled under a full cover with its 64x64 pixels. A draw
+// after the cover, and the cover itself, stay. Two covers: the first cover and the draw under it both go.
+TEST(cull1_drops_a_draw_under_a_later_full_target_cover) {
+    CullRig c;
+    CullEnv e("1");
+    const Program flat = flatProgram(), cover = CullRig::lph();
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}}), 1u);
+    CHECK_EQ(c.delta(0), 1u);
+    CHECK_EQ(c.delta(1), 64u * 64u);
+    CHECK_EQ(c.delta(3), 1u);
+    CHECK_EQ(c.run({{&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}, {&flat, {}, wholeDraw(3)}}), 2u);   // (after the cover: drawn)
+    CHECK_EQ(c.delta(0), 0u);
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}, {&cover, c.rect(-1, -1, 1, 1, 0xff00ff00u), wholeDraw(6)}}), 1u);
+    CHECK_EQ(c.delta(0), 2u);
+}
+
+// Covers that must not cull: blended, a part of the target at level 1, a discarding fragment stage, a framebuffer
+// fetch, a write mask short of all four channels, a cull mode, a second instance, a vertex function that is not fixed_vert_lph_spc (its pixels unknown), a transform that is not an axis-aligned 2D map, a
+// rectangle that is not one (three vertices), and a cover of a pass with a depth attachment
+TEST(cull_never_takes_a_cover_it_cannot_prove_opaque_and_whole) {
+    CullRig c;
+    CullEnv e("1");
+    const Program flat = flatProgram();
+    auto none = [&](const Program& cover, Bindings vs, Draw d, const char* what) {
+        const uint32_t ran = c.run({{&flat, {}, wholeDraw(3)}, {&cover, vs, d}});
+        CHECK_EQ(ran, 2u);
+        const uint64_t culled = c.delta(0);
+        CHECK_EQ(culled, 0u);
+        if (ran != 2 || culled != 0) std::printf("       culled under: %s\n", what);
+    };
+    Program blended = CullRig::lph();
+    blended.blend.enabled = true;
+    blended.blend.srcRgb = blended.blend.srcAlpha = 4, blended.blend.dstRgb = blended.blend.dstAlpha = 5;
+    none(blended, c.rect(-1, -1, 1, 1), wholeDraw(6), "a blended cover");
+    none(CullRig::lph(), c.rect(-1, -1, 0, 1), wholeDraw(6), "half the target at level 1");
+    Program kill = CullRig::lph();
+    kill.fs.hasKill = 1;
+    none(kill, c.rect(-1, -1, 1, 1), wholeDraw(6), "a discarding cover");
+    // (a sample mask written: refused by the encoder, "no multisampling is served"; opaqueWrites refuses it too)
+    Program fetch = CullRig::lph();
+    fetch.fs.fbRead = 1;
+    none(fetch, c.rect(-1, -1, 1, 1), wholeDraw(6), "a fetching cover");
+    Program mask = CullRig::lph();
+    mask.blend.writeMask = 0xe;
+    none(mask, c.rect(-1, -1, 1, 1), wholeDraw(6), "a partial write mask");
+    Draw culled = wholeDraw(6);
+    culled.cullMode = 2;
+    none(CullRig::lph(), c.rect(-1, -1, 1, 1), culled, "a cull mode");
+    Draw twice = wholeDraw(6);
+    twice.instanceCount = 2;
+    none(CullRig::lph(), c.rect(-1, -1, 1, 1), twice, "two instances");
+    Program other = CullRig::lph();
+    other.vs.k.name = "fixed_vert_lph_gen";
+    none(other, c.rect(-1, -1, 1, 1), wholeDraw(6), "another vertex function");
+    Bindings skew = c.rect(-1, -1, 1, 1);
+    float m[16] = {1, 0.5f, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    memcpy(skew.buffers[1].buffer->contents(), m, 64);
+    none(CullRig::lph(), skew, wholeDraw(6), "a skewed transform");
+    none(CullRig::lph(), c.rect(-1, -1, 1, 1), wholeDraw(3), "three vertices");
+    Bindings far = c.rect(-1, -1, 1, 1);
+    float mz[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 2, 1};   // (z 2: outside the clip volume)
+    memcpy(far.buffers[1].buffer->contents(), mz, 64);
+    none(CullRig::lph(), far, wholeDraw(6), "a cover outside the clip volume");
+    // a pass with a depth attachment: never culled
+    auto z = target(c.r, 64, 64, kTextureUsageRenderTarget, PixelFormat::kDepth32Float);
+    RenderPass withDepth = c.pass;
+    withDepth.depth = z.get();
+    const Program cover = CullRig::lph();
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3), &withDepth}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6), &withDepth}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+}
+
+// Draws that must not be culled under a full cover: one that writes an attachment the cover does not (tri_mrt into
+// colours 0 and 1, the cover writes colour 0), one of another pass (another target), one counted into a visibility
+// result, and one before the cover's pass opened (the cover's pass is another: the first closed with its tail)
+TEST(cull_never_drops_a_draw_with_effects_the_cover_leaves) {
+    CullRig c;
+    CullEnv e("3");
+    const Program flat = flatProgram(), cover = CullRig::lph();
+    const Program mrt{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
+    RenderPass two = c.pass;
+    two.more[0].texture = c.t1.get();
+    CHECK_EQ(c.run({{&mrt, {}, wholeDraw(3), &two}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6), &two}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+    // (and the flat one in the same two-attachment pass writes colour 0 alone: culled)
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3), &two}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6), &two}}), 1u);
+    CHECK_EQ(c.delta(0), 1u);
+    RenderPass other;
+    other.color0 = c.t1.get();
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3), &other}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+    std::string why;
+    auto vis = newBuffer(*c.r.gpu, 64, &why);
+    Draw counted = wholeDraw(3);
+    counted.visibility = vis.get();
+    counted.visibilityMode = 1;
+    counted.visibilityReset = true;
+    CHECK_EQ(c.run({{&flat, {}, counted}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+}
+
+// HM_CULL=2: a cover of part of the target hides a draw whose pixels lie inside it -- known from its scissor (any
+// vertex function) or from fixed_vert_lph_spc's vertices -- but not one that reaches past it (the whole target, a
+// scissor one pixel wider, a rectangle one pixel past the cover's edge)
+TEST(cull2_drops_a_draw_inside_a_part_cover_and_no_other) {
+    CullRig c;
+    CullEnv e("2");
+    const Program flat = flatProgram(), cover = CullRig::lph(), small = CullRig::lph("small");
+    // the cover: x -1..0 = pixels 0..31, the whole height
+    CHECK_EQ(c.run({{&flat, {}, scissored(0, 0, 32, 64)}, {&cover, c.rect(-1, -1, 0, 1), wholeDraw(6)}}), 1u);
+    CHECK_EQ(c.delta(0), 1u);
+    CHECK_EQ(c.delta(4), 1u);
+    CHECK_EQ(c.delta(1), 32u * 64u);
+    CHECK_EQ(c.run({{&flat, {}, scissored(0, 0, 33, 64)}, {&cover, c.rect(-1, -1, 0, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&cover, c.rect(-1, -1, 0, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+    // a small rectangle (pixels 8..15 x 8..15, a pixel to spare each side) inside the cover: culled
+    CHECK_EQ(c.run({{&small, c.rect(-0.75f, -0.75f, -0.5f, -0.5f), wholeDraw(6)}, {&cover, c.rect(-1, -1, 0, 1), wholeDraw(6)}}), 1u);
+    CHECK_EQ(c.delta(0), 1u);
+    // one whose spare pixel crosses the cover's edge (pixels 24..32): drawn
+    CHECK_EQ(c.run({{&small, c.rect(-0.25f, -0.75f, 0.0f, -0.5f), wholeDraw(6)}, {&cover, c.rect(-1, -1, 0, 1), wholeDraw(6)}}), 2u);
+    CHECK_EQ(c.delta(0), 0u);
+}
+
+// A reader between the victim and the cover that writes an attachment the cover leaves keeps the victim: tri_mrt into
+// colours 0 and 1 with a framebuffer fetch (every level), or blending into colour 1 (levels 1-2; at 3 blending reads
+// only colour 1, which the victim never wrote, so the victim goes). A fetching reader that writes only what the cover
+// overwrites keeps nothing.
+TEST(cull_keeps_a_draw_a_reader_in_between_may_carry_forward) {
+    CullRig c;
+    const Program flat = flatProgram(), cover = CullRig::lph();
+    Program fetch{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt_fetch"};
+    fetch.fs.fbRead = 1;
+    Program blend1{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt_blend1"};
+    blend1.moreBlend[0].enabled = true;
+    blend1.moreBlend[0].srcRgb = blend1.moreBlend[0].srcAlpha = 4, blend1.moreBlend[0].dstRgb = blend1.moreBlend[0].dstAlpha = 5;
+    RenderPass two = c.pass;
+    two.more[0].texture = c.t1.get();
+    for (const char* level : {"1", "2", "3"}) {
+        CullEnv e(level);
+        // (the cover goes over colour 0 only; the reader writes colour 1 too: the reader is never culled, the victim kept)
+        CHECK_EQ(c.run({{&flat, {}, wholeDraw(3), &two}, {&fetch, {}, wholeDraw(3), &two}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6), &two}}), 3u);
+        CHECK_EQ(c.delta(0), 0u);
+        CHECK(c.delta(5) >= 1u);
+        const uint32_t ran = c.run({{&flat, {}, wholeDraw(3), &two}, {&blend1, {}, wholeDraw(3), &two}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6), &two}});
+        CHECK_EQ(ran, level[0] == '3' ? 2u : 3u);
+        CHECK_EQ(c.delta(0), level[0] == '3' ? 1u : 0u);
+        // a reader whose area does not meet the victim's (levels 2-3): the victim goes
+        if (level[0] != '1') {
+            CHECK_EQ(c.run({{&flat, {}, scissored(0, 0, 16, 64), &two}, {&fetch, {}, scissored(32, 0, 32, 64), &two}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6), &two}}), 2u);
+            CHECK_EQ(c.delta(0), 1u);
+        }
+    }
+    // a fetching reader that writes colour 0 alone (the cover overwrites it): the victim and the reader both go
+    CullEnv e("1");
+    Program fetch0 = flatProgram();
+    fetch0.fs.fbRead = 1;
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&fetch0, {}, wholeDraw(3)}, {&cover, c.rect(-1, -1, 1, 1), wholeDraw(6)}}), 1u);
+    CHECK_EQ(c.delta(0), 2u);
+}
+
+// HM_DEADFILL=2: CoreAnimation's full-screen fills differ in their colour, which is in their vertex bytes, so the old
+// rule (HM_DEADFILL=1: the same geometry key) never took one back -- shown here -- while =2 takes the earlier back under
+// the later full-target cover (the stream ends as one fill's), counted in fillsDropped and cullStats [6] [7]. Not for a
+// cover of part of the target, nor a blended one.
+TEST(deadfill2_takes_back_a_fill_under_a_full_target_cover_of_another_colour) {
+    CullRig c;
+    const Program fill = CullRig::lph("fill");
+    auto run = [&](std::vector<CullRig::D> draws, uint32_t* dropped) {
+        auto cb = c.r.queue->commandBuffer();
+        for (const auto& x : draws) CHECK(cb->draw(*x.p, c.pass, x.d, x.vs, Bindings{}, c.o));
+        *dropped = cb->counts().fillsDropped;
+        const size_t words = cb->streamWords();
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(c.r.fake->stats().faults, 0u);
+        return words;
+    };
+    uint32_t dropped = 0;
+    const size_t one = run({{&fill, c.rect(-1, -1, 1, 1, 0xff000000u), wholeDraw(6)}}, &dropped);
+    run({{&fill, c.rect(-1, -1, 1, 1, 0xff000000u), wholeDraw(6)}, {&fill, c.rect(-1, -1, 1, 1, 0xff383838u), wholeDraw(6)}}, &dropped);
+    CHECK_EQ(dropped, 0u);   // (HM_DEADFILL=1, the default: the colours differ, the keys differ)
+    {
+        CullEnv e("0", "2");
+        c.reset();
+        const uint64_t before = fillsDropped();
+        CHECK_EQ(run({{&fill, c.rect(-1, -1, 1, 1, 0xff000000u), wholeDraw(6)}, {&fill, c.rect(-1, -1, 1, 1, 0xff383838u), wholeDraw(6)}}, &dropped), one);
+        CHECK_EQ(dropped, 1u);
+        CHECK_EQ(fillsDropped(), before + 1);
+        CHECK_EQ(c.delta(6), 1u);
+        CHECK_EQ(c.delta(7), 64u * 64u);
+        run({{&fill, c.rect(-1, -1, 1, 1, 0xff000000u), wholeDraw(6)}, {&fill, c.rect(-1, -1, 0, 1, 0xff383838u), wholeDraw(6)}}, &dropped);
+        CHECK_EQ(dropped, 0u);
+        Program blended = CullRig::lph("blended");
+        blended.blend.enabled = true;
+        blended.blend.srcRgb = blended.blend.srcAlpha = 4, blended.blend.dstRgb = blended.blend.dstAlpha = 5;
+        run({{&fill, c.rect(-1, -1, 1, 1, 0xff000000u), wholeDraw(6)}, {&blended, c.rect(-1, -1, 1, 1, 0xff383838u), wholeDraw(6)}}, &dropped);
+        CHECK_EQ(dropped, 0u);
+    }
+    // with HM_CULL=1 and HM_DEADFILL=2 together: the take-back happens first, and its cull note goes with it
+    CullEnv e("1", "2");
+    c.reset();
+    const Program flat = flatProgram();
+    CHECK_EQ(c.run({{&flat, {}, wholeDraw(3)}, {&fill, c.rect(-1, -1, 1, 1, 0xff000000u), wholeDraw(6)}, {&fill, c.rect(-1, -1, 1, 1, 0xff383838u), wholeDraw(6)}}), 1u);
+    CHECK_EQ(c.delta(6), 2u);   // (the flat draw is the held one when the first fill comes: taken back too)
+    CHECK_EQ(c.delta(0), 0u);
+}

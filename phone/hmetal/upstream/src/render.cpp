@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -3334,6 +3335,305 @@ std::vector<uint8_t> deadFillKey(const Program& program, const Draw& d, const Bi
 }
 uint64_t fillsDropped() { return gFillsDropped.load(std::memory_order_relaxed); }
 
+// (ws-hm-cull) HM_CULL=1..3 (default 0: off, every draw drawn) and HM_DEADFILL=2. SweetMetal2's SWEET_CULL=3 (m1, after
+// Yofuness ios-flame's cull 3) and SWEET_DEADFILL's fill drop in hm, with hm's own knowledge of each shader instead of
+// CoreAnimation's pipeline labels. A pass is noted draw by draw (cullNote) and, as it closes (cullResolve, before its
+// tail), every draw a later cover hides has its draw packet turned into a CP_NOP of the same length: its state writes
+// stay (the draws after it were deduplicated against them), the vertices and pixels go.
+//   A cover: CoreAnimation's fixed_vert_lph_spc (clip position = the column-major 4x4 at the first other vertex binding
+//   times attribute 0; float4 with w 1 or float2, one z), one instance, not indirect, cull mode none, exactly one
+//   rectangle (six vertices: two triangles of its corners sharing a diagonal, or a four-vertex strip whose middle two
+//   are opposite corners), the transform an axis-aligned 2D map (w 1, z into [0, 1]), and an opaque writer: every
+//   attachment it writes with blending off and the full mask, no discard, no sample mask written, no framebuffer
+//   fetch or [[color(n)]] read, no device-buffer or image write, no visibility, no stencil. Its pixels written for
+//   certain: the rectangle through the transform and the viewport, rounded inward, within its draw area (viewport and
+//   scissor).
+//   A draw that may be culled (a victim): writes some attachment, no device-buffer or image write, no visibility, no
+//   stencil, not indirect, its draw area known (render::drawArea; for fixed_vert_lph_spc also its vertices' box, rounded
+//   outward with a pixel to spare), its draw packets found in the stream.
+//   It is culled by a later cover that is not culled itself when it writes no attachment the cover does not overwrite,
+//   its area lies inside the cover's pixels, and no surviving draw in between that may read what it drew writes an
+//   attachment the cover leaves (where that draw's area meets the victim's: levels 2-3). A reader: a framebuffer fetch,
+//   a [[color(n)]] argument, a texture over an attachment's memory; at levels 1-2 also blending on an attachment it
+//   writes (SweetMetal2's rule: any draw not of the cover's kind may read the destination).
+//   HM_CULL=1: only covers over the whole window; any such reader between keeps the victim.
+//   HM_CULL=2: covers of part of the window too (SweetMetal2's SWEET_CULL=3); readers kept by overlap.
+//   HM_CULL=3: as 2, but blending is not a read: a blended draw reads only the attachment it blends into, which the
+//   victim never wrote unless the cover overwrites it.
+// Passes that may cull: sysmem only (never GMEM or recorded both ways), no depth or stencil attachment, colour 0 of
+// one sample. The level is read as a pass opens; nothing is reordered.
+std::atomic<uint64_t> gCull[8];
+int cullLevelEnv() {
+    const char* e = getenv("HM_CULL");
+    const int v = e != nullptr && e[0] != 0 ? atoi(e) : 0;
+    return v < 0 ? 0 : v > 3 ? 3 : v;
+}
+int deadFillMode() {
+    const char* e = getenv("HM_DEADFILL");
+    return e == nullptr || e[0] == 0 ? 1 : atoi(e);
+}
+bool cullDdOn() {
+    const char* e = getenv("HM_DD");
+    return e != nullptr && atoi(e) != 0;
+}
+// HM_DD's line for a culled draw: the first 400, then at most 40 every 5 s
+void cullDd(const std::string& line) {
+    static std::atomic<uint64_t> said{0}, window{0}, inWindow{0};
+    const uint64_t n = said.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 400) {
+        const uint64_t w = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 5);
+        if (window.exchange(w) != w) inWindow = 0;
+        if (inWindow.fetch_add(1) >= 40) return;
+    }
+    render::notify(line);
+}
+void cullStats(uint64_t out[8]) {
+    for (int i = 0; i < 8; i++) out[i] = gCull[i].load(std::memory_order_relaxed);
+}
+
+namespace {
+
+// what a buffer binding holds from its offset: its bytes on the processor, or nothing
+const uint8_t* bindingBytes(const Binding& b, uint64_t* len) {
+    *len = 0;
+    if (b.buffer == nullptr || b.buffer->contents() == nullptr || b.buffer->length() <= b.offset) return nullptr;
+    *len = b.buffer->length() - b.offset;
+    return static_cast<const uint8_t*>(b.buffer->contents()) + b.offset;
+}
+
+// CoreAnimation's fixed_vert_lph_spc geometry in pixels: the box of its vertices (X0 Y0 X1 Y1, not rounded), and
+// whether they are exactly one rectangle drawn once (RECT). False when not known.
+bool caGeometry(const Program& p, const Draw& d, const Bindings& vs, double box[4], bool* rect) {
+    *rect = false;
+    if (p.vs.k.name == nullptr || strcmp(p.vs.k.name, "fixed_vert_lph_spc") != 0) return false;
+    if (d.indirect != nullptr || d.instanceCount != 1) return false;
+    const bool tri = d.primitive == Primitive::kTriangle, strip = d.primitive == Primitive::kTriangleStrip;
+    if (!(tri ? d.vertexCount >= 3 && d.vertexCount <= 64 && d.vertexCount % 3 == 0 : strip && d.vertexCount == 4)) return false;
+    const VertexAttribute& a = p.vertexDescriptor.attributes[0];
+    if ((a.format != VertexFormat::kFloat4 && a.format != VertexFormat::kFloat2) || a.bufferIndex >= vs.buffers.size()) return false;
+    const VertexLayout& layout = p.vertexDescriptor.layouts[a.bufferIndex];
+    if (layout.step != VertexStep::kPerVertex || layout.stride == 0) return false;
+    uint64_t len = 0;
+    const uint8_t* src = bindingBytes(vs.buffers[a.bufferIndex], &len);
+    if (src == nullptr) return false;
+    // the transform: the first vertex binding other than the position's, 16 floats (as SweetMetal2's dfTransform)
+    const float* m = nullptr;
+    float mat[16];
+    for (uint32_t k = 0; k < 8 && k < vs.buffers.size(); k++) {
+        if (k == a.bufferIndex || vs.buffers[k].buffer == nullptr) continue;
+        uint64_t ml = 0;
+        const uint8_t* mb = bindingBytes(vs.buffers[k], &ml);
+        if (mb == nullptr || ml < 64 || (vs.buffers[k].offset & 3) != 0) return false;
+        memcpy(mat, mb, sizeof mat);
+        m = mat;
+        break;
+    }
+    if (m == nullptr) return false;
+    for (int i = 0; i < 16; i++) {
+        if (!std::isfinite(m[i])) return false;
+    }
+    if (m[0] == 0 || m[5] == 0 || m[1] != 0 || m[2] != 0 || m[3] != 0 || m[4] != 0 || m[6] != 0 || m[7] != 0 || m[8] != 0 || m[9] != 0 ||
+        m[11] != 0 || m[15] != 1) {
+        return false;
+    }
+    const Viewport& vp = d.viewport;
+    if (!std::isfinite(vp.x) || !std::isfinite(vp.y) || !std::isfinite(vp.width) || !std::isfinite(vp.height) || !(vp.width > 0) || !(vp.height > 0)) {
+        return false;
+    }
+    const uint8_t* ix = nullptr;
+    uint64_t ilen = 0;
+    if (d.indexBuffer != nullptr) {
+        if (d.indexBuffer->contents() == nullptr || d.indexOffset >= d.indexBuffer->length()) return false;
+        ix = static_cast<const uint8_t*>(d.indexBuffer->contents()) + d.indexOffset;
+        ilen = d.indexBuffer->length() - d.indexOffset;
+    }
+    const uint32_t comps = a.format == VertexFormat::kFloat4 ? 4 : 2;
+    double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
+    float vx[6] = {}, vy[6] = {}, z0 = 0;
+    for (uint32_t k = 0; k < d.vertexCount; k++) {
+        int64_t v;
+        if (ix != nullptr) {
+            if (d.indexType == 0) {
+                if ((k + 1) * 2 > ilen) return false;
+                uint16_t t;
+                memcpy(&t, ix + k * 2, 2);
+                if (t == 0xffff) return false;   // (primitive restart)
+                v = t;
+            } else {
+                if ((k + 1) * 4 > ilen) return false;
+                uint32_t t;
+                memcpy(&t, ix + k * 4, 4);
+                if (t == 0xffffffffu) return false;
+                v = t;
+            }
+            v += d.baseVertex;
+        } else {
+            v = int64_t(d.vertexStart) + k;
+        }
+        if (v < 0) return false;
+        const uint64_t o = uint64_t(v) * layout.stride + a.offset;
+        if (o + comps * 4 > len) return false;
+        float q[4] = {0, 0, 0, 1};
+        memcpy(q, src + o, comps * 4);
+        if (q[3] != 1 || !std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2])) return false;
+        if (k == 0) {
+            z0 = q[2];
+        } else if (q[2] != z0) {
+            return false;
+        }
+        if (k < 6) vx[k] = q[0], vy[k] = q[1];
+        x0 = std::min(x0, double(q[0])), x1 = std::max(x1, double(q[0]));
+        y0 = std::min(y0, double(q[1])), y1 = std::max(y1, double(q[1]));
+    }
+    const double cz = double(m[10]) * z0 + m[14];
+    if (!(cz >= 0 && cz <= 1)) return false;   // (outside Metal's clip volume: nothing, or clipped)
+    // clip to pixels: Metal's NDC y up, the viewport's origin top-left
+    const double ax = vp.x + (double(m[0]) * x0 + m[12] + 1) * 0.5 * vp.width, bx = vp.x + (double(m[0]) * x1 + m[12] + 1) * 0.5 * vp.width;
+    const double ay = vp.y + (1 - (double(m[5]) * y0 + m[13])) * 0.5 * vp.height, by = vp.y + (1 - (double(m[5]) * y1 + m[13])) * 0.5 * vp.height;
+    box[0] = std::min(ax, bx), box[1] = std::min(ay, by), box[2] = std::max(ax, bx), box[3] = std::max(ay, by);
+    for (int i = 0; i < 4; i++) {
+        if (!(std::fabs(box[i]) < 1e6)) return false;
+    }
+    // one rectangle: every vertex a corner; two triangles of three distinct corners sharing a diagonal (or a strip of
+    // the four whose middle two are opposite)
+    if (!(x0 < x1 && y0 < y1) || d.vertexCount != (tri ? 6u : 4u)) return true;
+    unsigned id[6];
+    for (uint32_t k = 0; k < d.vertexCount; k++) {
+        const bool lx = vx[k] == float(x0), hx = vx[k] == float(x1), ly = vy[k] == float(y0), hy = vy[k] == float(y1);
+        if (!(lx || hx) || !(ly || hy)) return true;
+        id[k] = (hx ? 1u : 0u) | (hy ? 2u : 0u);
+    }
+    if (tri) {
+        if (id[0] == id[1] || id[0] == id[2] || id[1] == id[2] || id[3] == id[4] || id[3] == id[5] || id[4] == id[5]) return true;
+        const unsigned ma = (1u << id[0]) | (1u << id[1]) | (1u << id[2]), mb = (1u << id[3]) | (1u << id[4]) | (1u << id[5]), sh = ma & mb;
+        if ((ma | mb) != 15 || __builtin_popcount(sh) != 2 || ((unsigned(__builtin_ctz(sh)) ^ unsigned(31 - __builtin_clz(sh))) != 3)) return true;
+    } else {
+        const unsigned all = (1u << id[0]) | (1u << id[1]) | (1u << id[2]) | (1u << id[3]);
+        if (all != 15 || (id[1] ^ id[2]) != 3) return true;
+    }
+    *rect = true;
+    return true;
+}
+
+// a stage that writes memory other than its attachments, or a draw that counts or tests: never culled, never a cover
+bool sideEffects(const Program& program, const Draw& d) {
+    if ((program.vs.k.numSsbos != 0 && (program.ssboWrites & 1)) || (program.fs.k.numSsbos != 0 && (program.ssboWrites & 2))) return true;
+    for (const Stage* s : {&program.vs, &program.fs}) {
+        for (uint32_t i = 0; i < kMaxTextureSlots && i < s->k.numTextureSlots; i++) {
+            if (s->k.textures[i].kind == kTexImage) return true;
+        }
+    }
+    return d.visibilityMode != 0 || d.stencil.enabled || d.depth.write || d.indirect != nullptr;
+}
+
+// the attachments a draw writes opaquely: all it writes when every one has blending off and the full mask and the
+// fragment stage neither discards nor writes a sample mask nor reads its target (0: not an opaque writer)
+uint32_t opaqueWrites(const Program& program, const RenderPass& pass) {
+    const uint32_t w = render::drawnAttachments(program, pass);
+    if (w == 0 || program.samples > 1 || program.fs.hasKill || program.fs.writesSmask || program.fs.fbRead ||
+        program.fs.sampleMaskRegid != a6xx::kRegidNone) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        if (!((w >> i) & 1)) continue;
+        const ColorBlend& cb = i == 0 ? program.blend : program.moreBlend[i - 1];
+        if (cb.enabled || (cb.writeMask & 0xf) != 0xf) return 0;
+    }
+    for (uint32_t i = 0; i < kMaxTextureSlots && i < program.fs.k.numTextureSlots; i++) {
+        if (program.fs.k.textures[i].fbTarget != 0) return 0;
+    }
+    return w;
+}
+
+// a pass that may cull: sysmem decided by the caller, no depth or stencil, colour 0 of one sample
+bool cullPassOk(const RenderPass& pass) {
+    return pass.color0 != nullptr && pass.depth == nullptr && pass.stencil == nullptr && pass.color0->samples() == 1;
+}
+
+}  // namespace
+
+// (ws-hm-cull) one draw's note (before its words are appended at stream word START)
+PassCullNote cullNote(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vs, const Bindings& fs, size_t start,
+                          bool dd) {
+    PassCullNote n;
+    n.start = start;
+    const auto [W, H] = render::windowOf(pass);
+    n.writes = uint8_t(render::drawnAttachments(program, pass));
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        if (!((n.writes >> i) & 1)) continue;
+        const ColorBlend& cb = i == 0 ? program.blend : program.moreBlend[i - 1];
+        if (cb.enabled) n.blends = true;
+    }
+    n.fetch = program.fs.fbRead != 0;
+    for (uint32_t i = 0; i < kMaxTextureSlots && i < program.fs.k.numTextureSlots; i++) {
+        if (program.fs.k.textures[i].fbTarget != 0) n.fetch = true;
+    }
+    for (const Bindings* b : {&vs, &fs}) {
+        for (const Texture* t : b->textures) {
+            for (uint32_t i = 0; t != nullptr && i < kMaxColorOutputs; i++) {
+                const render::Attachment at = render::attachmentOf(pass, i);
+                if (at.texture != nullptr && t->buffer() == at.texture->buffer()) n.fetch = true;
+            }
+        }
+    }
+    uint32_t area[4];
+    const bool areaOk = render::drawArea(pass, d, area);
+    if (areaOk) {
+        n.r[0] = int32_t(area[0]), n.r[1] = int32_t(area[1]), n.r[2] = int32_t(area[2]) + 1, n.r[3] = int32_t(area[3]) + 1;
+    } else {
+        n.r[0] = 0, n.r[1] = 0, n.r[2] = int32_t(W), n.r[3] = int32_t(H);
+    }
+    double box[4];
+    bool rect = false;
+    const bool geo = caGeometry(program, d, vs, box, &rect);
+    if (geo && areaOk) {
+        // the vertices' box rounded outward, a pixel to spare, within the area
+        n.r[0] = std::max(n.r[0], int32_t(std::floor(box[0])) - 1), n.r[1] = std::max(n.r[1], int32_t(std::floor(box[1])) - 1);
+        n.r[2] = std::min(n.r[2], int32_t(std::ceil(box[2])) + 1), n.r[3] = std::min(n.r[3], int32_t(std::ceil(box[3])) + 1);
+        if (n.r[0] >= n.r[2] || n.r[1] >= n.r[3]) n.r[0] = n.r[1] = n.r[2] = n.r[3] = 0;   // (nothing drawn)
+    }
+    const bool fx = sideEffects(program, d);
+    n.victim = areaOk && !fx && n.writes != 0 && program.samples == 1;
+    if (geo && rect && areaOk && !fx && d.cullMode == 0) {
+        const uint32_t over = opaqueWrites(program, pass);
+        if (over != 0) {
+            // the pixels whose centres lie inside the rectangle for certain: rounded inward, within the area
+            // (and within the viewport rounded inward: drawArea's is rounded outward, and the rectangle is clipped at the
+            // viewport's own edges)
+            const Viewport& vp = d.viewport;
+            const int32_t c0 = std::max({int32_t(area[0]), int32_t(std::ceil(box[0])), int32_t(std::ceil(vp.x))});
+            const int32_t c1 = std::max({int32_t(area[1]), int32_t(std::ceil(box[1])), int32_t(std::ceil(vp.y))});
+            const int32_t c2 = std::min({int32_t(area[2]) + 1, int32_t(std::floor(box[2])), int32_t(std::floor(vp.x + vp.width))});
+            const int32_t c3 = std::min({int32_t(area[3]) + 1, int32_t(std::floor(box[3])), int32_t(std::floor(vp.y + vp.height))});
+            if (c0 < c2 && c1 < c3) {
+                n.cover = true;
+                n.over = uint8_t(over);
+                n.c[0] = c0, n.c[1] = c1, n.c[2] = c2, n.c[3] = c3;
+                n.full = c0 == 0 && c1 == 0 && c2 == int32_t(W) && c3 == int32_t(H);
+            }
+        }
+    }
+    if (dd) n.name = program.name != nullptr ? program.name : "?";
+    return n;
+}
+
+// (ws-hm-cull) the draw packets among stream words FROM..end (a draw's words just appended); false when a header does
+// not read back
+bool cullFindDraws(const pm4::Stream& s, size_t from, PassCullNote* n) {
+    const std::vector<uint32_t>& w = s.words();
+    n->nAt = 0;
+    for (size_t i = from; i < w.size();) {
+        const pm4::Header h = pm4::decode(w[i]);
+        if (h.kind == pm4::Header::kBad) return false;
+        if (h.kind == pm4::Header::kCommand && (h.opcode == a6xx::CP_DRAW_INDX_OFFSET || h.opcode == a6xx::CP_DRAW_INDIRECT_MULTI)) {
+            if (n->nAt >= 2) return false;
+            n->at[n->nAt++] = uint32_t(i);
+        }
+        i += 1 + h.count;
+    }
+    return n->nAt != 0;
+}
+
 namespace {
 const char* loadName(LoadAction a) { return a == LoadAction::kClear ? "clear" : a == LoadAction::kLoad ? "load" : "dontcare"; }
 
@@ -3765,10 +4065,35 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         }
     }
     // (redfin hm-int4) HM_DEADFILL: the pass's last draw taken back when this one overwrites every pixel of it
-    const uint32_t dfRole = !profileDraws_ && deadFillOn() ? deadFillRole(program, pass, d) : 0;
+    const int dfMode = !profileDraws_ ? deadFillMode() : 0;
+    const uint32_t dfRole = dfMode != 0 ? deadFillRole(program, pass, d) : 0;
     std::vector<uint8_t> dfKey;
     if (dfRole != 0) dfKey = deadFillKey(program, d, *vsb);
-    if (joins && (dfRole & 2) && !open_->gmem && !open_->dual && open_->df.armed && stream_.size() == open_->df.end && open_->df.key == dfKey) {
+    // (ws-hm-cull) HM_DEADFILL=2: a draw of no side effect that writes any attachments may be held too (dfVictim,
+    // dfWrites), and the next draw takes it back when it is a cover over the whole window (cullNote: CoreAnimation's
+    // opaque rectangle) overwriting every attachment the held one writes, whatever either's geometry. CoreAnimation's
+    // full-screen fills differ in their colour, which is in their vertex bytes: deadFillKey never matched them.
+    bool df2Victim = false, df2Full = false;
+    uint8_t df2Writes = 0, df2Over = 0;
+    uint64_t df2Px = 0;
+    if (dfMode >= 2 && cullPassOk(pass)) {
+        const PassCullNote cn = cullNote(program, pass, d, *vsb, *fsb, 0, false);
+        df2Victim = cn.victim && cn.r[0] < cn.r[2] && cn.r[1] < cn.r[3];
+        df2Writes = cn.writes;
+        df2Full = cn.cover && cn.full;
+        df2Over = cn.over;
+        df2Px = uint64_t(cn.r[2] - cn.r[0]) * uint64_t(cn.r[3] - cn.r[1]);
+    }
+    const bool dfKeyed = joins && (dfRole & 2) && open_->df.key == dfKey && !dfKey.empty();
+    const bool dfCovered = joins && df2Full && open_->dfVictim && (open_->dfWrites & ~df2Over) == 0;
+    if (joins && (dfKeyed || dfCovered) && !open_->gmem && !open_->dual && open_->df.armed && stream_.size() == open_->df.end) {
+        if (!dfKeyed) {
+            gCull[6].fetch_add(1, std::memory_order_relaxed);
+            gCull[7].fetch_add(open_->dfPx, std::memory_order_relaxed);
+            if (cullDdOn()) cullDd(std::string("dd: deadfill2: taken back under the full-target ") + (program.name != nullptr ? program.name : "?"));
+        }
+        // (ws-hm-cull) its HM_CULL note goes with it
+        if (!open_->cull.empty() && open_->cull.back().start >= open_->df.start) open_->cull.pop_back();
         if (hangDumpOn() && !marks_.empty() && marks_.back().word == open_->df.end) {
             // (HM_HANG_DUMP's marks: the one of the draw taken back goes, this draw's starts where that one did)
             Mark cur = marks_.back();
@@ -3879,6 +4204,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         }
         open_->dual = dual;
         open_->gmem = gmem;
+        open_->cullLevel = cullLevelEnv();   // (ws-hm-cull) HM_CULL, for the whole pass
+        open_->cullOk = open_->cullLevel != 0 && !gmem && !dual && cullPassOk(pass);
         open_->plan = plan;
         open_->clears = gmemClears_;
         memcpy(open_->clearWords, gmemClearWords_, sizeof open_->clearWords);
@@ -3950,8 +4277,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         traceDraws_.push_back(std::move(t));
     }
     // (redfin hm-int4) HM_DEADFILL: this draw may be taken back by the next: the stream and dedup state from before it
-    const bool dfArm = dfRole != 0 && !open_->gmem && !open_->dual && &into == &stream_ && !timed && !traceTs;   // (hm-trace: a stamped draw is not taken back)
+    const bool dfArm = (dfRole != 0 || df2Victim) && !open_->gmem && !open_->dual && &into == &stream_ && !timed && !traceTs;   // (hm-trace: a stamped draw is not taken back)
+    const size_t cullStart = stream_.size();   // (ws-hm-cull)
     if (dfArm) {
+        open_->dfVictim = df2Victim;   // (ws-hm-cull) HM_DEADFILL=2
+        open_->dfWrites = df2Writes;
+        open_->dfPx = df2Px;
         open_->df.start = stream_.size();
         open_->df.regs = open_->regs;
         open_->df.staticKey = open_->staticKey;
@@ -3964,6 +4295,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     } else {
         appendStream(into, body);
         if (open_->dual) appendStream(open_->sysStream, bodySys);
+    }
+    if (open_->cullOk && &into == &stream_) {
+        // (ws-hm-cull) HM_CULL: this draw noted, with where its draw packets are (before any stamp after it)
+        open_->cull.push_back(cullNote(program, pass, d, *vsb, *fsb, cullStart, cullDdOn()));
+        PassCullNote& cn = open_->cull.back();
+        if (!cullFindDraws(stream_, cullStart, &cn)) cn.victim = false;
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
     if (traceTs) traceStamp(uint32_t(traceDraws_.size() - 1));   // (redfin hm-trace)
@@ -4707,11 +5044,59 @@ bool CommandBuffer::barrier(bool full) {
     return true;
 }
 
+// (ws-hm-cull) HM_CULL: the open pass's draws a later cover hides become CP_NOPs (the rules: cullNote's comment). Covers
+// from the last back; a culled cover hides nothing.
+void CommandBuffer::cullResolve() {
+    if (open_ == nullptr) return;
+    std::vector<PassCullNote> v;
+    v.swap(open_->cull);
+    if (!open_->cullOk || open_->gmem || open_->dual || v.empty()) return;
+    const int level = open_->cullLevel;
+    gCull[2].fetch_add(1, std::memory_order_relaxed);
+    const bool dd = cullDdOn();
+    for (size_t di = v.size(); di-- > 0;) {
+        const PassCullNote& o = v[di];
+        if (o.dead || !o.cover || (level == 1 && !o.full)) continue;
+        for (size_t ei = di; ei-- > 0;) {
+            PassCullNote& f = v[ei];
+            if (f.dead || !f.victim || (f.writes & ~o.over) != 0 || f.r[0] >= f.r[2] || f.r[1] >= f.r[3]) continue;
+            if (f.r[0] < o.c[0] || f.r[1] < o.c[1] || f.r[2] > o.c[2] || f.r[3] > o.c[3]) continue;
+            // a surviving draw in between that may read what F drew and writes an attachment the cover leaves keeps F
+            // (level 1: wherever it draws; 2-3: where its area meets F's)
+            bool keep = false;
+            for (size_t m = ei + 1; m < di && !keep; m++) {
+                const PassCullNote& q = v[m];
+                if (q.dead || !(q.fetch || (level < 3 && q.blends)) || (q.writes & ~o.over) == 0) continue;
+                keep = level == 1 || (q.r[0] < f.r[2] && f.r[0] < q.r[2] && q.r[1] < f.r[3] && f.r[1] < q.r[3]);
+            }
+            if (keep) {
+                gCull[5].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            f.dead = true;
+            for (uint32_t k = 0; k < f.nAt; k++) {
+                const pm4::Header h = pm4::decode(stream_.words()[f.at[k]]);
+                stream_.patch(f.at[k], pm4::type7(pm4::kNop, h.count));
+            }
+            const uint64_t px = uint64_t(f.r[2] - f.r[0]) * uint64_t(f.r[3] - f.r[1]);
+            gCull[0].fetch_add(1, std::memory_order_relaxed);
+            gCull[1].fetch_add(px, std::memory_order_relaxed);
+            gCull[o.full ? 3 : 4].fetch_add(1, std::memory_order_relaxed);
+            if (dd) {
+                cullDd("dd: cull" + std::to_string(level) + ": " + f.name + " " + std::to_string(f.r[2] - f.r[0]) + "x" + std::to_string(f.r[3] - f.r[1]) + "@" +
+                       std::to_string(f.r[0]) + "," + std::to_string(f.r[1]) + " under " + (o.full ? "full " : "part ") + o.name + " " +
+                       std::to_string(o.c[2] - o.c[0]) + "x" + std::to_string(o.c[3] - o.c[1]) + "@" + std::to_string(o.c[0]) + "," + std::to_string(o.c[1]));
+            }
+        }
+    }
+}
+
 void CommandBuffer::closePass(bool lazy) {
     if (open_ == nullptr) {
         if (!lazy) flushDirty();
         return;
     }
+    cullResolve();   // (ws-hm-cull) HM_CULL
     lastClosed_ = open_->pass.color0;
     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, open_->draws);
     if (open_->dual) {

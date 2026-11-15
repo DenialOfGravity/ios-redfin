@@ -68,6 +68,12 @@ HM_PREWARM=1
 # (hm-int4) HM_DEADFILL=1 (default): a draw the next draw of the same geometry overwrites opaquely is taken back
 # (SweetMetal2's SWEET_DEADFILL mode 1); "prof: fills dropped N" with HM_PROF
 #*:HM_DEADFILL=0
+# (ws-hm-cull) HM_DEADFILL=2: also takes back a fill under the next draw when that is CA's opaque rectangle over the
+# whole target (CA's fills differ in colour: =1 never matched them). HM_CULL=1|2|3 (default 0): draws hidden by a later
+# opaque CA rectangle in the same pass become CP_NOPs (1 full-target covers, 2 part covers too = SWEET_CULL=3, 3 blending
+# not a read). "prof: cull ..." with HM_PROF; "dd: cull..." lines with HM_DD=1. Plain lines are backboardd's.
+#HM_DEADFILL=2
+#HM_CULL=2
 # two-plane YCbCr ('420f'/'420v') surfaces: native = decoded on the GPU by ycbcr_decode (default); cpu = the processor copy
 #*:HM_YCBCR=cpu
 # an unseen configuration of a denied uber shader specialised on the queue, its draws left out meanwhile (default 0: waited for)
