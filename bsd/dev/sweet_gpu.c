@@ -2561,6 +2561,12 @@ uint32_t sweet_scan_submit_gate(uint32_t gf);  /* 0985: SweetFramebuffer.cpp; 09
  * The flagged process is one pid (the newest that flagged): only the swapper (backboardd) is ever gated, and a new
  * backboardd is gated in full until its first flagged submission.
  */
+/* 1107: SweetFramebuffer.cpp (touch -> latch stages); kern.sweet_touch_trace 0|1, default 1 */
+void sweet_touch_trace_submit(int pid, uint64_t now);
+extern uint32_t sweet_touch_trace;
+SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
+    "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
+
 int sweet_scangate_flag = 1;
 static volatile int scangate_flag_pid = -1;
 SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scangate_flag, 0,
@@ -2674,6 +2680,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
 	/* 0985: CA's next frame waits for its last one on screen (direct scanout): here (gate 1) or in the CP (0989, gate 2) */
 	int pid = proc_selfpid();
 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
+	sweet_touch_trace_submit(pid, mach_absolute_time());    /* 1107: touch -> first submit, vsync -> submit */
 	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
 	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
 	if (sweet_scangate_flag) {
