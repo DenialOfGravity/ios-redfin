@@ -97,6 +97,8 @@ EOH
 	  cp toybox "$U/" ) || say "WARN toybox failed (continue-on-error in CI too)"
 	cd "$R"
 	sh phone/wifi/build.sh && cp phone/wifi/out/wland "$U/" || say "WARN wland failed"
+	sh phone/locd/test/run.sh > "$U/sweetlocd-test.log" 2>&1 || { say "WARN sweetlocd host tests failed"; tail -20 "$U/sweetlocd-test.log"; }
+	sh phone/locd/build.sh && cp phone/locd/out/sweetlocd phone/locd/org.iosonpixel.sweetlocd.plist "$U/" || say "WARN sweetlocd failed"
 	sh phone/sensors/test.sh > "$U/sensd-test.log" 2>&1 || { say "WARN sensd host tests failed"; tail -20 "$U/sensd-test.log"; }
 	sh phone/sensors/build.sh && cp phone/sensors/out/sensd "$U/" || say "WARN sensd failed"
 	sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/tlv_test.log "$U/" && { cp phone/bt/out/bluetool "$U/" 2>/dev/null || true; } || say "WARN btd failed"

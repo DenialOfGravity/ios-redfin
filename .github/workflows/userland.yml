@@ -91,6 +91,8 @@ jobs:
           cd repo
           sh phone/wifi/build.sh
           cp phone/wifi/out/wland ../out/
+          sh phone/locd/test/run.sh > ../out/sweetlocd-test.log 2>&1 || { echo "::warning::sweetlocd host tests failed"; tail -20 ../out/sweetlocd-test.log; }
+          sh phone/locd/build.sh && cp phone/locd/out/sweetlocd phone/locd/org.iosonpixel.sweetlocd.plist ../out/
           sh phone/sensors/test.sh > ../out/sensd-test.log 2>&1 || { echo "::warning::sensd host tests failed"; tail -20 ../out/sensd-test.log; }
           sh phone/sensors/build.sh && cp phone/sensors/out/sensd ../out/ || echo "::warning::sensd failed"
           sh phone/bt/build.sh && cp phone/bt/out/btd phone/bt/out/bluetool phone/bt/out/tlv_test.log ../out/
