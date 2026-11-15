@@ -381,6 +381,15 @@ int hakios_metal_known_read_mask_cached(const void *fs_bitcode, size_t fs_size, 
  * idle memory let go now (FORCE 1: all of it; 0: what HM_POOL_IDLE_S says): the bytes freed. */
 void hakios_metal_pool_stats(unsigned long long out[8]);
 unsigned long long hakios_metal_pool_trim(int force);
+/* (ws-hm-pool) HM_RT_CACHE: the render-target reuse cache's counters for this process, since it began: [0] hits, [1] misses,
+ * [2] bytes handed out again, [3] bytes held now, [4] objects held, [5] evicted past the limit, [6] let go by a trim or a
+ * refused allocation, [7] too big to keep, [8] GEM objects asked of the kernel (every one, any size), [9] their ns,
+ * [10] allocations retried after the cache was let go, [11] the limit in bytes (0: off). A forced pool trim lets it go. */
+void hakios_metal_rt_cache_stats(unsigned long long out[12]);
+/* (ws-hm-pool) the cache's limit (bytes, 0 off and emptied), slack (% bigger an object may be than asked) and zeroing
+ * (a reused object of ZERO_BYTES or less zeroed), as HM_RT_CACHE / _SLACK / _ZERO_KB set them when the device opens */
+void hakios_metal_rt_cache_set(hakios_metal_device *device, unsigned long long limit_bytes, unsigned slack_pct,
+    unsigned long long zero_bytes);
 /* (redfin hm-int4) HM_DEADFILL: the draws taken back in this process so far (a pass's draw that the next draw of the
  * same geometry overwrote opaquely) */
 unsigned long long hakios_metal_fills_dropped(void);

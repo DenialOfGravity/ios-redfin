@@ -1065,7 +1065,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
             refuse(why, "no UBWC layout for a " + n(desc.width) + " x " + n(desc.height) + " texture on this chip");
             return nullptr;
         }
-        std::shared_ptr<Buffer> buffer = newBuffer(gpu, l.size, why, kPoolTexture);
+        std::shared_ptr<Buffer> buffer = newBuffer(gpu, l.size, why, kPoolTexture, (desc.usage & kTextureUsageRenderTarget) != 0);   // (ws-hm-pool) HM_RT_CACHE
         if (buffer == nullptr) return nullptr;
         uint32_t bw = 0, bh = 0;
         fdl6_get_ubwc_blockwidth(&l, &bw, &bh);
@@ -1115,7 +1115,8 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         return nullptr;
 #endif
     }
-    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why, kPoolTexture);
+    // (ws-hm-pool) HM_RT_CACHE: a render target's memory may be a released one's (its contents undefined, as Metal's are)
+    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why, kPoolTexture, (desc.usage & kTextureUsageRenderTarget) != 0);
     if (buffer == nullptr) {
         return nullptr;
     }

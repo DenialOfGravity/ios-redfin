@@ -772,7 +772,7 @@ hakios_metal_texture* hakios_metal_texture_new_levels(hakios_metal_device* d, un
     if (hakios::trace::on()) {
         const uint64_t bytes = t->buffer() != nullptr ? t->buffer()->length() : 0;
         if (bytes >= hakios::trace::bigBytes() || (usage & 4u) != 0)   // (4: MTLTextureUsageRenderTarget)
-            hakios::trace::event((usage & 4u) != 0 ? "rt-new" : "texture-new",
+            hakios::trace::event((usage & 4u) != 0 ? (t->buffer() != nullptr && t->buffer()->reused() ? "rt-reuse" : "rt-new") : "texture-new",   // (ws-hm-pool)
                                  std::to_string(width) + "x" + std::to_string(height) + " fmt " + std::to_string(pixelFormat) + " levels " + std::to_string(levels),
                                  trT0, hakios::trace::nowNs() - trT0, bytes);
     }
@@ -1589,6 +1589,18 @@ void hakios_metal_pool_stats(unsigned long long out[8]) {
     for (int i = 0; i < 8; i++) out[i] = s[i];
 }
 unsigned long long hakios_metal_pool_trim(int force) { return trimAllQueues(force != 0); }
+void hakios_metal_rt_cache_stats(unsigned long long out[12]) {   // (ws-hm-pool)
+    uint64_t s[12];
+    rtCacheStats(s);
+    for (int i = 0; i < 12; i++) out[i] = s[i];
+}
+void hakios_metal_rt_cache_set(hakios_metal_device* d, unsigned long long limitBytes, unsigned slackPct, unsigned long long zeroBytes) {
+    Gpu::BoCacheConfig c;
+    c.limitBytes = limitBytes;
+    c.slackPct = slackPct;
+    c.zeroBytes = zeroBytes;
+    d->gpu->setBoCache(c);
+}
 
 int hakios_metal_known_read_mask(const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
                                  unsigned binding, unsigned char* mask, size_t length) {
