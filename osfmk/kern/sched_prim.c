@@ -5055,6 +5055,9 @@ static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display, 
  *      takes the other big core or falls back); keeps the display thread and the render server from kicking each other
  *   16 equal priority: a tagged thread also preempts an untagged thread of its own priority on a big core (not only a
  *      lower one); the preempted thread goes back to the run queue and takes any free core
+ *   32 (1121) threads named hakios.metal.defer* (hakios-metal's deferred recording thread, HM_DEFER) are tagged display
+ *      class like com.apple.coreanimation.display* (then placed by bit 1). Checked when the thread is named: set it
+ *      before the process using hakios-metal starts; clearing it does not untag threads already named
  * Topology (SM7250, Kryo 475): CPU0-5 silver (A55, 1.8 GHz), CPU6 gold (A76, 2.2 GHz), CPU7 prime (A76, 2.4 GHz); one
  * clutch pset; sweetgov's touch/frame boost (bsd/dev/sweet_cpufreq.c) holds both the gold and the prime domain.
  * sweet_ui_cpu_cls[cpu]: the tagged class running on each CPU (processor_state_update_from_thread; 0 none, 1 render-server,
@@ -5079,6 +5082,8 @@ sweet_ui_thread_named(void *uth, const char *name)
 		f = TH_SFLAG_SWEET_UI_DISPLAY;
 	} else if (strncmp(name, "com.apple.coreanimation.render-server", 37) == 0) {
 		f = TH_SFLAG_SWEET_UI_RS;
+	} else if ((sweet_ui_bigcore & 32) && strncmp(name, "hakios.metal.defer", 18) == 0) {
+		f = TH_SFLAG_SWEET_UI_DISPLAY;  /* 1121: hakios-metal's HM_DEFER recording thread, display class (bit 1 places it) */
 	}
 	if (f == 0 && !(th->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
 		return;
