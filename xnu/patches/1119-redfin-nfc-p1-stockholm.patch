@@ -1,4 +1,4 @@
-From e5822b2663ed775f03554cc42a533d08f3787692 Mon Sep 17 00:00:00 2001
+From a688aace70c81ea65768acde0aa38a3d04aa4398 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 21:07:34 +0100
 Subject: [PATCH] 1119 redfin: NFC P1 AppleStockholmControl +
@@ -7,9 +7,9 @@ Subject: [PATCH] 1119 redfin: NFC P1 AppleStockholmControl +
 ---
  bsd/dev/sweet_nfc.c           | 1074 ++++++++++++++++++++++++++++++++-
  iokit/Kernel/IOUserClient.cpp |   14 +-
- iokit/Kernel/arm/SweetNFC.cpp |  211 +++++++
+ iokit/Kernel/arm/SweetNFC.cpp |  212 +++++++
  iokit/conf/files.arm64        |    1 +
- 4 files changed, 1295 insertions(+), 5 deletions(-)
+ 4 files changed, 1296 insertions(+), 5 deletions(-)
  create mode 100644 iokit/Kernel/arm/SweetNFC.cpp
 
 diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
@@ -1173,10 +1173,10 @@ index 02b07e2..3b06727 100644
  	}
 diff --git a/iokit/Kernel/arm/SweetNFC.cpp b/iokit/Kernel/arm/SweetNFC.cpp
 new file mode 100644
-index 0000000..d774d21
+index 0000000..f912c92
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetNFC.cpp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,212 @@
 +/*
 + * redfin 1119: NFC P1, the IOKit half (bsd/dev/sweet_nfc.c holds the switch, the kernel control and the gateway).
 + *
@@ -1199,6 +1199,7 @@ index 0000000..d774d21
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOKitKeys.h>
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSString.h>
 +
