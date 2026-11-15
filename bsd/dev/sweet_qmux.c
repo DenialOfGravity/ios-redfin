@@ -4438,6 +4438,10 @@ d_port_reserved(uint32_t port)
  * HELLO in 30 s, /dev/sweet-mqrtr closed), says "not mine", or does not answer in kern.sweet_qmux_pds_ms (default 400);
  * 3 timeouts in a row = wland treated as gone until its next HELLO. Late answers are dropped. Default 0: no relay at
  * all, wland's HELLO is only answered (flags 0). PDS is never forwarded to the modem.
+ * 1124: "wland" above is now whichever client said HELLO first, on /dev/sweet-mqrtr (wland) or /dev/sweet-mqrtr-aux
+ * (sweetlocd, phone/locd): records are tagged with their device, the answers go back to that device and port. A second
+ * client's HELLO while the first is live (HELLO < 30 s, device open, < 3 timeouts) gets 0x84 flags 0x100 | the sysctl
+ * ("busy") and its records are ignored; the relay passes on when the first one says BYE, closes its device or goes quiet.
  */
 #define PDSR_MAGIC      0x52534450u     /* 'PDSR' */
 #define NPDSR           32
@@ -4450,7 +4454,9 @@ struct pdsr {
 };
 static int pds_relay = 0, pds_relay_ms = 400;
 static struct {
-	uint32_t port;                          /* wland's QRTR port (0 = not there) */
+	uint32_t port;                          /* the relay client's QRTR port (0 = not there) */
+	unsigned dev;                           /* 1124: its device: SBB_DEV_WLAND or SBB_DEV_AUX (sweetlocd) */
+	uint32_t busy_said;
 	uint64_t hello;
 	int fails;
 	uint32_t reqs, resp, unhandled, timeouts, local, inds, inds_drop, late, said;
@@ -4465,11 +4471,18 @@ static uint32_t pr_tag;
 static int pdsr_bypass;
 static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n);
 
-static int
-pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag, unsigned code,
-    const uint8_t *data, uint32_t len)
+static const char *
+pdsr_who(unsigned which)
 {
-	if (pr.port == 0 || len > 8192) {
+	return which == SBB_DEV_AUX ? "sweetlocd (aux)" : "wland";
+}
+
+/* 1124: to one client (dev, port) */
+static int
+pdsr_send_to(unsigned which, uint32_t port, uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag,
+    unsigned code, const uint8_t *data, uint32_t len)
+{
+	if (port == 0 || len > 8192) {
 		return -1;
 	}
 	uint8_t *b = kalloc_data(sizeof(struct pdsr) + len, Z_WAITOK);
@@ -4481,15 +4494,22 @@ pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess
 	if (len) {
 		memcpy(b + sizeof(h), data, len);
 	}
-	int e = sbb_wland_data(SBB_PDSR_PORT, pr.port, b, (uint32_t)sizeof(h) + len);
+	int e = sbb_dev_data(which, SBB_PDSR_PORT, port, b, (uint32_t)sizeof(h) + len);
 	kfree_data(b, sizeof(struct pdsr) + len);
 	return e;
+}
+
+static int
+pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag, unsigned code,
+    const uint8_t *data, uint32_t len)
+{
+	return pdsr_send_to(pr.dev, pr.port, op, cid, flags, pipe, sess, tag, code, data, len);
 }
 
 static bool
 pdsr_live(uint64_t now)
 {
-	return pds_relay == 1 && pr.port != 0 && sbb_wland_open() && now - pr.hello < 30000;
+	return pds_relay == 1 && pr.port != 0 && sbb_dev_open(pr.dev) && now - pr.hello < 30000;
 }
 
 static void
@@ -4558,7 +4578,7 @@ pdsr_relay(unsigned pipe, uint32_t sess, unsigned cid, unsigned msg, const uint8
 	prp[k].t = now;
 	prp[k].f = f;
 	pr.reqs++;
-	note_seen(0x06, msg, "wland", "1122: PDS relayed to wland (kern.sweet_qmux_pds 1)");
+	note_seen(0x06, msg, pdsr_who(pr.dev), "1122/1124: PDS relayed to the registered client (kern.sweet_qmux_pds 1)");
 	return 1;
 }
 
@@ -4593,9 +4613,9 @@ pdsr_cid(int alloc, unsigned cid)
 	}
 }
 
-/* a record from wland (the router thread, from the c2w queue) */
+/* a record from a relay client (the router thread, from the c2w queue; which = its device, 1124) */
 static void
-pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
+pdsr_in(unsigned which, uint32_t port, const uint8_t *d, uint32_t n)
 {
 	struct pdsr h;
 	if (n < sizeof(h)) {
@@ -4604,28 +4624,47 @@ pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
 	memcpy(&h, d, sizeof(h));
 	if (h.magic != PDSR_MAGIC || h.len > n - sizeof(h)) {
 		if (pr.said++ < 10) {
-			LOG("PDS relay: bad record from wland port %#x (%u bytes)\n", port, n);
+			LOG("PDS relay: bad record from %s port %#x (%u bytes)\n", pdsr_who(which), port, n);
 		}
 		return;
 	}
 	const uint8_t *data = d + sizeof(h);
 	uint64_t now = sbb_ms();
+	bool owner = pr.port == port && pr.dev == which;
+	if (!owner && pr.port != 0 && now - pr.hello < 30000 && pr.fails < 3 && sbb_dev_open(pr.dev)) {
+		/* 1124: another client holds the relay: it is told (0x84 flags 0x100) and nothing else of it is used */
+		if (h.op == 1) {
+			if (pr.busy_said++ < 10) {
+				LOG("PDS relay: %s at port %#x said HELLO, but %s at port %#x has the relay\n", pdsr_who(which), port,
+				    pdsr_who(pr.dev), pr.port);
+			}
+			(void)pdsr_send_to(which, port, 0x84, 0, 0x100u | (unsigned)pds_relay, 0, 0, 0, 0, NULL, 0);
+		}
+		return;
+	}
+	if (!owner && h.op != 1) {
+		return;                 /* not registered (no HELLO yet): ignored */
+	}
 	switch (h.op) {
 	case 1:         /* HELLO */
-		if (pr.port != port || now - pr.hello >= 30000 || pr.fails >= 3) {
-			LOG("PDS relay: wland at port %#x (kern.sweet_qmux_pds %d: %s)\n", port, pds_relay,
-			    pds_relay == 1 ? "locationd's PDS goes to wland" : "not used, PDS answered here");
+		if (!owner || now - pr.hello >= 30000 || pr.fails >= 3) {
+			LOG("PDS relay: %s at port %#x (kern.sweet_qmux_pds %d: %s)\n", pdsr_who(which), port, pds_relay,
+			    pds_relay == 1 ? "locationd's PDS goes there" : "not used, PDS answered here");
 		}
+		if (!owner && pr.port != 0) {
+			pdsr_drop_all("relay client changed");
+		}
+		pr.dev = which;
 		pr.port = port;
 		pr.hello = now;
 		pr.fails = 0;
 		(void)pdsr_send(0x84, 0, (unsigned)pds_relay, 0, 0, 0, 0, NULL, 0);
 		break;
 	case 4:         /* BYE */
-		LOG("PDS relay: wland said bye (%u relayed, %u answered by wland, %u not its own, %u timeouts, %u inds)\n", pr.reqs,
+		LOG("PDS relay: %s said bye (%u relayed, %u answered by it, %u not its own, %u timeouts, %u inds)\n", pdsr_who(pr.dev), pr.reqs,
 		    pr.resp, pr.unhandled, pr.timeouts, pr.inds);
 		pr.port = 0;
-		pdsr_drop_all("wland said bye");
+		pdsr_drop_all("client said bye");
 		break;
 	case 2: {       /* RESP */
 		int k = -1;
@@ -4636,14 +4675,14 @@ pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
 		}
 		if (k < 0) {
 			if (pr.late++ < 10) {
-				LOG("PDS relay: wland's answer to request %u came late (answered here already)\n", h.tag);
+				LOG("PDS relay: %s's answer to request %u came late (answered here already)\n", pdsr_who(which), h.tag);
 			}
 			break;
 		}
 		pr.fails = 0;
 		if (!(h.flags & 1)) {
 			pr.unhandled++;
-			pdsr_local(k, "wland: not its message");
+			pdsr_local(k, "client: not its message");
 			break;
 		}
 		uint32_t pipe = prp[k].pipe, sess = prp[k].sess;
@@ -4664,7 +4703,7 @@ pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
 		if (pds_relay == 1 && sess_live(h.pipe, h.sess) && cid_live(h.pipe, h.sess, 0x06, h.cid)) {
 			send_ind(h.pipe, h.sess, 0x06, h.cid, h.code, data, h.len);
 			if (pr.inds++ < 3) {
-				LOG("PDS relay: indication 0x%04x from wland to %s/%u cid %u (%u TLV bytes)\n", h.code,
+				LOG("PDS relay: indication 0x%04x from %s to %s/%u cid %u (%u TLV bytes)\n", h.code, pdsr_who(which),
 				    h.pipe < NPIPES ? pipe_name[h.pipe] : "?", h.sess, h.cid, h.len);
 			}
 		} else {
@@ -4688,17 +4727,18 @@ pdsr_poll(uint64_t now)
 		if (prp[i].used && now > prp[i].t && now - prp[i].t > (uint64_t)(pds_relay_ms > 0 ? pds_relay_ms : 400)) {
 			pr.timeouts++;
 			if (++pr.fails == 3) {
-				LOG("PDS relay: wland did not answer 3 times: PDS answered here until its next HELLO\n");
+				LOG("PDS relay: %s did not answer 3 times: PDS answered here until its next HELLO\n", pdsr_who(pr.dev));
 			}
-			pdsr_local(i, "wland's answer timed out");
+			pdsr_local(i, "the client's answer timed out");
 		}
 	}
 	if (pr.fails >= 3 && pr.port != 0) {
 		pr.port = 0;
-		pdsr_drop_all("wland gone");
+		pdsr_drop_all("client gone");
 	}
-	if (pds_relay != 1 || (pr.port != 0 && !sbb_wland_open())) {
-		if (pr.port != 0 && !sbb_wland_open()) {
+	if (pds_relay != 1 || (pr.port != 0 && !sbb_dev_open(pr.dev))) {
+		if (pr.port != 0 && !sbb_dev_open(pr.dev)) {
+			LOG("PDS relay: %s closed its device: PDS answered here until a client's next HELLO\n", pdsr_who(pr.dev));
 			pr.port = 0;
 		}
 		pdsr_drop_all("relay off");
@@ -4707,7 +4747,7 @@ pdsr_poll(uint64_t now)
 		next = now + 60000;
 		if (pr.reqs != last_reqs) {
 			last_reqs = pr.reqs;
-			LOG("PDS relay: %u relayed, %u answered by wland, %u not its own, %u timeouts, %u answered here, %u inds (%u dropped), "
+			LOG("PDS relay: %u relayed, %u answered by the client, %u not its own, %u timeouts, %u answered here, %u inds (%u dropped), "
 			    "%u late\n", pr.reqs, pr.resp, pr.unhandled, pr.timeouts, pr.local, pr.inds, pr.inds_drop, pr.late);
 		}
 	}
@@ -5580,7 +5620,7 @@ sweet_qmux_poll(void)
 			break;
 		}
 		if (r->type == SBB_PDSR_C2W) {
-			pdsr_in(r->sess, r->d, r->len);         /* 1122: from wland (sess = its QRTR port) */
+			pdsr_in(r->pipe, r->sess, r->d, r->len);        /* 1122/1124: from a relay client (pipe = device, sess = port) */
 		} else {
 			handle(r->pipe, r->sess, r->type, r->d, r->len);
 		}
@@ -5737,8 +5777,8 @@ QINT(sweet_qmi_codec_tlv, qmi_codec_tlv, "redfin 1093: that indication's codec T
 QINT(sweet_qmux_kick, kickon, "redfin 1068: 1 = RESUME_TX kick after 5 s without an answer (abpkick, default 1)");
 QINT(sweet_qmux_holdnas, holdnas, "redfin 1068: NAS indications held until BSP activation (abpholdnas: 0 off, 1 = 5 s, >= 100 ms)");
 QINT(sweet_qmux_holddly, holddly, "redfin 1068: ms after the BSP activation indication before held NAS indications go (abpholddly, 500)");
-QINT(sweet_qmux_pds, pds_relay, "redfin 1122: 0 PDS answered here as before (default), 1 relayed to wland (loc.on pds=1) with local fallback");
-QINT(sweet_qmux_pds_ms, pds_relay_ms, "redfin 1122: ms to wait for wland's PDS answer before the local answer (default 400)");
+QINT(sweet_qmux_pds, pds_relay, "redfin 1122/1124: 0 PDS answered here as before (default), 1 relayed to the client that said HELLO (sweetlocd or wland, loc.on pds=1) with local fallback");
+QINT(sweet_qmux_pds_ms, pds_relay_ms, "redfin 1122: ms to wait for the relay client's PDS answer before the local answer (default 400)");
 QINT(sweet_qmi_republish_ms, repub_ms, "redfin 1073: ms after the BSP activation indication before the auto re-publish GETs (20)");
 
 static int

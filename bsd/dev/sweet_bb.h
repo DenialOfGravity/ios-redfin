@@ -29,6 +29,20 @@
  */
 #define SBB_PDSR_PORT           (SBB_QMUX_PORT0 + SBB_QMUX_NPORTS - 3u)
 #define SBB_PDSR_C2W            0x50u
+/*
+ * 1124: a second QRTR client device, /dev/sweet-mqrtr-aux, for our own daemons other than wland (sweetlocd). Its own
+ * read queue and its own ports SBB_AUX_PORT0..+SBB_AUX_NPORTS: DATA from the modem to those ports goes only to it, the
+ * modem's servers are given again at open and NEW_SERVER/DEL_SERVER/BYE/DEL_CLIENT are copied to it; it never sees
+ * wland's or the router's traffic, and wland may not write from its ports. No link control (no MQRTR_IOC_UP): opening,
+ * closing or a crash of its process never touches the GLINK link that carries calls/SMS. kern.sweet_mqrtr_aux (default
+ * 0 = open fails ENXIO): bit 0 allowed, bit 1 = no QRTR DEL_CLIENT to the modem for its ports at close (default: sent,
+ * as Linux does for a closed socket, so the modem's QMI services drop that client and its LOC session).
+ * The PDS relay (1122) answers whichever client says HELLO first on either device (sbb_dev_*: SBB_DEV_WLAND/AUX).
+ */
+#define SBB_AUX_PORT0           0x4700u
+#define SBB_AUX_NPORTS          0x10u
+#define SBB_DEV_WLAND           0u
+#define SBB_DEV_AUX             1u
 
 enum {
 	SBB_QRTR_DATA = 1, SBB_QRTR_HELLO, SBB_QRTR_BYE, SBB_QRTR_NEW_SERVER, SBB_QRTR_DEL_SERVER, SBB_QRTR_DEL_CLIENT,
@@ -51,6 +65,8 @@ bool sbb_server_svc(uint32_t svc, uint32_t *node, uint32_t *port, uint32_t *veri
 int sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
 int sbb_wland_data(uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len);      /* 1122: DATA to wland only */
 bool sbb_wland_open(void);                                                                      /* 1122 */
+int sbb_dev_data(unsigned dev, uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len);  /* 1124: wland or aux */
+bool sbb_dev_open(unsigned dev);                                                                /* 1124 */
 
 /* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
 bool sweet_qmux_on(void);
