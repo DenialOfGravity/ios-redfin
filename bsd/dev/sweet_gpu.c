@@ -2634,6 +2634,56 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sw
     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
 
 /*
+ * 1116: colour management (SweetFramebuffer.cpp sweet_cm_st). kern.sweet_cm_trace (default 0): 1 "SWEET CM:" lines for
+ * the IOMFB colour selectors (17/27/50/54/55/57/68/84 ...) and PCC commits, 2 (on write) a DSPP0/1 + CTL0 dump.
+ * kern.sweet_cm (default 0): 1 CoreBrightness's SetMatrix (sel 55) on DSPP0/1 PCC at the next frame and GetMatrix /
+ * GetGammaTable answer what was set; 0 PCC bypass (identity) at the next frame.
+ */
+extern uint32_t sweet_cm_trace, sweet_cm;
+extern void sweet_cm_ctl(uint32_t what);
+
+static int
+sysctl_sweet_cm_trace SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = (int)sweet_cm_trace, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 3) {
+		return EINVAL;
+	}
+	sweet_cm_trace = (uint32_t)value;
+	printf("SWEET CM: trace %d (1116: 1 colour selectors + PCC commits, 2 DSPP/CTL0 dump now)\n", value);
+	if (value & 2) {
+		sweet_cm_ctl(2);
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_cm_trace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cm_trace, "I",
+    "SWEET CM: 1 trace the IOMFB colour selectors and PCC commits, 2 dump DSPP0/1 + CTL0 once (1116, default 0)");
+
+static int
+sysctl_sweet_cm SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = (int)sweet_cm, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	sweet_cm = (uint32_t)value;
+	sweet_cm_ctl(1);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_cm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cm, "I",
+    "SWEET CM: 1 SetMatrix (sel 55) on DSPP0/1 PCC + GetMatrix/GetGammaTable read-back; 0 PCC bypass (1116, default 0)");
+
+/*
  * 1111: UBWC display surfaces (iokit/Kernel/arm/SweetSurface.cpp, SweetFramebuffer.cpp, SweetAccelerator.cpp). Inert
  * unless the kernel booted with boot-arg sweetubwc=1|2 (UBWC-sized scanout slots). kern.sweet_ubwc_disp 1: scanout-slot
  * surfaces created from now on are UBWC-ready, and a GPU client asking such a surface's BO metadata gets its UBWC

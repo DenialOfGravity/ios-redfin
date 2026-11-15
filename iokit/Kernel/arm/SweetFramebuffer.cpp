@@ -97,8 +97,13 @@ enum {
 	kSweetFBGetID                   = 7,
 	kSweetFBGetDisplaySize          = 8,
 	kSweetFBRequestPowerChange      = 12,
+	kSweetFBSetGammaTable           = 17,   /* 1116: stored, traced (kern.sweet_cm_trace) */
 	kSweetFBIsMainDisplay           = 18,
+	kSweetFBGetGammaTable           = 27,   /* 1116: the stored table with kern.sweet_cm & 1 */
 	kSweetFBGetDotPitch             = 28,
+	kSweetFBSetBrightnessCorrection = 50,   /* 1116: stored */
+	kSweetFBGetMatrix               = 54,   /* 1116: the stored matrix with kern.sweet_cm & 1 */
+	kSweetFBSetMatrix               = 55,   /* 1116: DSPP PCC with kern.sweet_cm & 1 */
 	kSweetFBNotifications           = 72,
 	kSweetFBGetCurrentAbsoluteTime  = 77,   /* 0943 (sweetfbx & 1) */
 	kSweetFBGetBlock                = 79,   /* 0943 (sweetfbx & 1): block 0x40 = the current mode */
@@ -3336,6 +3341,627 @@ static struct {
 } sweet_scan;
 
 /*
+ * ---- 1116: colour management (Night Shift / True Tone) on the DSPP PCC (logs/research/nightshift-truetone-plan-2026-11-15.md
+ * P0 + P1) ----
+ *
+ * CoreBrightness picks a white point, QuartzCore (backboardd) turns it into a 3x3 matrix and calls
+ * IOMobileFramebufferSetMatrix(fb, 9, int64 S31.32[3][3], row-major) = IOMFB selector 55, then
+ * SetBrightnessCorrection (50, 16.16). Before 1116 the user client dropped 17/27/50/54/55 (default: case), and its
+ * GetMatrix (54) / GetGammaTable (27) answered zeros. The SM7250 DPU has a DSPP behind each layer mixer we scan out
+ * through (LM0 -> DSPP0, LM1 -> DSPP1; lito-sde.dtsi qcom,sde-dspp-off <0x55000 0x57000>) with a 3x3 PCC at +0x1700.
+ *
+ * kern.sweet_cm_trace (default 0; no register write):
+ *   bit 0  "SWEET CM:" lines for selectors 17/27 (gamma: size, checksum, a few entries), 19, 50, 51, 54, 55 (location and
+ *          the nine S31.32 values as decimals; each new matrix only), 57, 68, 69, 84, and every PCC commit; at most 20
+ *          lines a second (the number dropped goes with the next line)
+ *   bit 1  writing a value with it dumps DSPP0/1 (PCC enable/constants/coefficients, GC, IGC/PA/gamut op modes, DSPP
+ *          top) and CTL0 once, from the sysctl caller (also: p cm dump)
+ * kern.sweet_cm (default 0):
+ *   bit 0  the last accepted sel 55 matrix (location 9) goes to DSPP0 + DSPP1 PCC (1.0 = 0x8000, enable bit 0) at the
+ *          next direct-scanout flip, its DSPP flush bits (13, 14) ORed into that flip's CTL0 flush write. With no flip
+ *          (static screen) the scanout thread writes them itself once nothing is in flight (or after 50 ms), under
+ *          fLock, the lock every flip is written under (no scanout thread: the caller, under fLock). GetMatrix (54)
+ *          then answers the stored matrix (identity before the first one, or for another location) and GetGammaTable
+ *          (27) the table last set by 17 (zeros before one). With 0 both answer zeros as before 1116. Writing 0
+ *          disables PCC (bypass = identity) at the next frame.
+ * The matrix is stored (and guarded) with kern.sweet_cm 0 too, so turning it on applies CoreBrightness's current state.
+ * Guard (always): a matrix with a coefficient outside [-2, 2], every row sum < 0.15 (nearly black), or a row sum > 1.6 /
+ * a row's positive terms > 2 (clipping) is refused and logged, the previous one stays; identity is always taken.
+ * Gamma (GC/IGC) is never written: sel 17 is stored and traced only. The brightness correction (50) is stored only.
+ *
+ * Unverified on the phone (plan 2.1), hence the pokes: the register orientation (downstream sde_hw_color_proc_v4:
+ * plane = output at +4 * plane, coefficient of input R/G/B at +0x10/+0x1c/+0x28; upstream dpu_hw_dspp.c names them the
+ * other way round) and the negative encoding (until known, negatives are written as 0).
+ *   p cm                       state line
+ *   p cm dump                  the DSPP/CTL0 dump (as kern.sweet_cm_trace bit 1)
+ *   p cm test r|g|b|warm|id|rg|neg   a fixed matrix on PCC whatever kern.sweet_cm says (until p cm test off):
+ *                              r/g/b one channel only (whole screen red / green / blue: the channel order); warm =
+ *                              diag(1, 0.78, 0.55); id = identity with PCC enabled (no visible change: the write path);
+ *                              rg = R_out <- G_in (right orientation: red turns black, green turns yellow; transposed:
+ *                              red turns green, green stays green); neg = R_out = R - 0.5 G (negatives taken: white
+ *                              turns cyan-ish; written as 0: no change; read as a large positive: green turns yellow)
+ *   p cm test off              back to kern.sweet_cm
+ *   p cm swap [0|1]            1: write the transpose (input-major registers); no argument: toggle
+ *   p cm neg 0|1|2             negatives: 0 written as 0 (default), 1 two's complement (32 bits), 2 sign-magnitude
+ *                              (bit 17 sign, S2.15)
+ */
+#define MDP_DSPP(n)             (0x55000u + 0x2000u * (n))
+#define DSPP_PCC                0x1700u         /* lito-sde.dtsi qcom,sde-dspp-pcc <0x1700 0x00040000> */
+#define DSPP_GC                 0x17c0u         /* qcom,sde-dspp-gc <0x17c0 0x00010008> */
+#define MDP_DSPP_TOP            0x1300u         /* qcom,sde-dspp-top-off */
+#define MDP_FLUSH_DSPP01        0x6000u         /* CTL_FLUSH bits 13/14, DPU < 7 (dpu_hw_ctl.c) */
+#define SWEET_CM_ONE            0x8000          /* 1.0 in PCC units (S.15) */
+#define SWEET_CM_GAMMA_BYTES    3084u           /* 3 x 257 x u32 */
+
+extern "C" {
+uint32_t sweet_cm_trace = 0;    /* kern.sweet_cm_trace (bsd/dev/sweet_gpu.c) */
+uint32_t sweet_cm = 0;          /* kern.sweet_cm */
+void sweet_cm_ctl(uint32_t what);
+}
+
+static struct {
+	int64_t     m[9];           /* the last accepted sel 55 matrix, location 9 (S31.32, row = output) */
+	bool        have;
+	int64_t     seen[9];        /* the last one received (trace: new matrices only) */
+	uint32_t    seenLoc;
+	bool        seenAny;
+	uint32_t    gamma[SWEET_CM_GAMMA_BYTES / 4];
+	uint32_t    gammaSize;      /* bytes stored from the last sel 17, 0 = none */
+	uint32_t    bc;             /* sel 50 (16.16), stored only */
+	int32_t     test[9];        /* p cm test (PCC units, row = output) */
+	const char *testName;       /* NULL = no test */
+	bool        swap;
+	uint32_t    neg;
+	bool        dirty;          /* PCC differs from what it should be: commit at the next flip / idle look */
+	uint64_t    dirtyAbs;
+	bool        on;             /* PCC enabled by the last commit */
+	bool        touched;        /* PCC written at least once this boot (before that, bypass needs no write) */
+	int32_t     hw[9];          /* the last commit's coefficients */
+	uint32_t    nAccepted, nRefused, nCommits, nMerged, nLone, nNegClamped;
+	uint64_t    checkAbs;       /* a lone commit's flush, read back at the scanout thread's next look */
+	/* trace rate limit (racy by design: log lines only) */
+	uint64_t    trWin;
+	uint32_t    trN, trDropped;
+} sweet_cm_st;
+
+static const int32_t sweet_cm_ident[9] = { SWEET_CM_ONE, 0, 0, 0, SWEET_CM_ONE, 0, 0, 0, SWEET_CM_ONE };
+
+/* fixed point with SHIFT fraction bits as [-]d.dddd */
+static void
+sweet_cm_dec(char *b, size_t n, int64_t v, uint32_t shift)
+{
+	uint64_t a = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+	uint64_t fr = ((a & ((1ULL << shift) - 1)) * 10000ULL) >> shift;
+	snprintf(b, n, "%s%llu.%04llu", v < 0 ? "-" : "", a >> shift, fr);
+}
+
+static bool
+sweet_cm_tr_take(void)
+{
+	uint64_t now = mach_absolute_time(), ns;
+	absolutetime_to_nanoseconds(now - sweet_cm_st.trWin, &ns);
+	if (sweet_cm_st.trWin == 0 || ns >= NSEC_PER_SEC) {
+		sweet_cm_st.trWin = now;
+		sweet_cm_st.trN = 0;
+		if (sweet_cm_st.trDropped != 0) {
+			IOLog("SWEET CM: (%u lines dropped by the rate limit)\n", sweet_cm_st.trDropped);
+			sweet_cm_st.trDropped = 0;
+		}
+	}
+	if (sweet_cm_st.trN >= 20) {
+		sweet_cm_st.trDropped++;
+		return false;
+	}
+	sweet_cm_st.trN++;
+	return true;
+}
+
+/* nine values as "a b c | d e f | g h i" */
+static void
+sweet_cm_fmt9(char *b, size_t n, const int64_t *v, uint32_t shift)
+{
+	size_t o = 0;
+	for (uint32_t i = 0; i < 9 && o + 1 < n; i++) {
+		char d[24];
+		sweet_cm_dec(d, sizeof(d), v[i], shift);
+		int k = snprintf(b + o, n - o, "%s%s", i == 0 ? "" : (i % 3 == 0 ? " | " : " "), d);
+		if (k < 0) {
+			break;
+		}
+		o += (size_t)k;
+	}
+}
+
+static void
+sweet_cm_fmt9p(char *b, size_t n, const int32_t *c)
+{
+	int64_t v[9];
+	for (uint32_t i = 0; i < 9; i++) {
+		v[i] = c[i];
+	}
+	sweet_cm_fmt9(b, n, v, 15);
+}
+
+/* S31.32 -> PCC units (1.0 = 0x8000), rounded, clamped to [-4, 4) */
+static int32_t
+sweet_cm_to_pcc(int64_t v)
+{
+	if (v > (4LL << 32)) {
+		return 0x1ffff;
+	}
+	if (v < -(4LL << 32)) {
+		return -0x20000;
+	}
+	int64_t c = (v + (1LL << 16)) >> 17;
+	return (int32_t)(c > 0x1ffff ? 0x1ffff : (c < -0x20000 ? -0x20000 : c));
+}
+
+static bool
+sweet_cm_is_ident(const int32_t c[9])
+{
+	return memcmp(c, sweet_cm_ident, sizeof(sweet_cm_ident)) == 0;
+}
+
+/* Always on. NULL: taken; else why not. PCC units, row = output. */
+static const char *
+sweet_cm_guard(const int32_t c[9])
+{
+	if (sweet_cm_is_ident(c)) {
+		return NULL;
+	}
+	bool lit = false;
+	for (uint32_t i = 0; i < 9; i++) {
+		if (c[i] > 2 * SWEET_CM_ONE || c[i] < -2 * SWEET_CM_ONE) {
+			return "a coefficient outside [-2, 2]";
+		}
+	}
+	for (uint32_t r = 0; r < 3; r++) {
+		int32_t sum = 0, pos = 0;
+		for (uint32_t k = 0; k < 3; k++) {
+			sum += c[3 * r + k];
+			pos += c[3 * r + k] > 0 ? c[3 * r + k] : 0;
+		}
+		if (sum >= SWEET_CM_ONE * 15 / 100) {
+			lit = true;
+		}
+		if (sum > SWEET_CM_ONE * 16 / 10 || pos > 2 * SWEET_CM_ONE) {
+			return "a row would clip (sum > 1.6 or positive terms > 2)";
+		}
+	}
+	return lit ? NULL : "every row sum < 0.15 (nearly black)";
+}
+
+static uint32_t
+sweet_cm_enc(int32_t c, uint32_t *clamped)
+{
+	if (c >= 0) {
+		return (uint32_t)c;
+	}
+	switch (sweet_cm_st.neg) {
+	case 1:
+		return (uint32_t)c;                                     /* two's complement, sign-extended */
+	case 2:
+		return (1u << 17) | ((uint32_t)(-c) & 0x1ffffu);        /* sign-magnitude S2.15 */
+	default:
+		(*clamped)++;
+		return 0;
+	}
+}
+
+/* What PCC should hold now (fLock). False: bypass. */
+static bool
+sweet_cm_want_locked(int32_t c[9], const char **src)
+{
+	if (sweet_cm_st.testName != NULL) {
+		memcpy(c, sweet_cm_st.test, sizeof(sweet_cm_st.test));
+		*src = sweet_cm_st.testName;
+		return true;
+	}
+	if ((sweet_cm & 1) && sweet_cm_st.have) {
+		for (uint32_t i = 0; i < 9; i++) {
+			c[i] = sweet_cm_to_pcc(sweet_cm_st.m[i]);
+		}
+		if (!sweet_cm_is_ident(c)) {
+			*src = "SetMatrix";
+			return true;
+		}
+	}
+	memcpy(c, sweet_cm_ident, sizeof(sweet_cm_ident));
+	*src = "bypass";
+	return false;
+}
+
+/* Write DSPP0/1 PCC as it should be (fLock). False: nothing written (bypass and PCC never touched this boot). */
+static bool
+sweet_cm_write_locked(const char *how)
+{
+	int32_t c[9];
+	const char *src;
+	bool en = sweet_cm_want_locked(c, &src);
+	sweet_cm_st.dirty = false;
+	if (!en && !sweet_cm_st.touched) {
+		return false;   /* never written: leave ABL's state alone */
+	}
+	uint32_t enc[9], clamped = 0;
+	for (uint32_t i = 0; i < 9; i++) {
+		enc[i] = sweet_cm_enc(c[i], &clamped);
+	}
+	for (uint32_t n = 0; n < 2; n++) {
+		uint32_t b = MDP_DSPP(n) + DSPP_PCC;
+		if (!en) {
+			sweet_mdp_wr(b, 0);     /* PCC_EN off: bypass */
+			continue;
+		}
+		for (uint32_t p = 0; p < 3; p++) {
+			sweet_mdp_wr(b + 0x4 + 4 * p, 0);                      /* constant */
+			for (uint32_t k = 0; k < 7; k++) {
+				sweet_mdp_wr(b + 0x34 + 0xc * k + 4 * p, 0);   /* RG RB GB RGB RR GG BB */
+			}
+		}
+		for (uint32_t o = 0; o < 3; o++) {
+			for (uint32_t i = 0; i < 3; i++) {
+				uint32_t off = sweet_cm_st.swap ? 0x10 + 4 * i + 0xc * o : 0x10 + 4 * o + 0xc * i;
+				sweet_mdp_wr(b + off, enc[3 * o + i]);
+			}
+		}
+		sweet_mdp_wr(b, 1);     /* PCC_EN */
+	}
+	sweet_cm_st.touched = true;
+	sweet_cm_st.on = en;
+	memcpy(sweet_cm_st.hw, c, sizeof(c));
+	sweet_cm_st.nCommits++;
+	sweet_cm_st.nNegClamped += clamped;
+	if (((sweet_cm_trace & 1) || sweet_cm_st.testName != NULL || sweet_cm_st.nCommits <= 3) && sweet_cm_tr_take()) {
+		char t[200];
+		sweet_cm_fmt9p(t, sizeof(t), c);
+		IOLog("SWEET CM: PCC %s (%s, %s): [%s] swap %u neg %u%s\n", en ? "applied" : "off", src, how, t,
+		    sweet_cm_st.swap, sweet_cm_st.neg, clamped ? " (negatives written as 0)" : "");
+	}
+	return true;
+}
+
+/* From the direct-scanout flip (fLock), just before its CTL0 flush: the DSPP bits to OR into that write. */
+static uint32_t
+sweet_cm_flip_locked(void)
+{
+	if (__probable(!sweet_cm_st.dirty)) {
+		return 0;
+	}
+	if (!sweet_cm_write_locked("flip")) {
+		return 0;
+	}
+	sweet_cm_st.nMerged++;
+	return MDP_FLUSH_DSPP01;
+}
+
+/* A commit with its own flush (fLock): only where no flip is in flight. Pending bits are written back with it. */
+static void
+sweet_cm_lone_locked(uint64_t now)
+{
+	if (!sweet_cm_write_locked("idle")) {
+		return;
+	}
+	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) | MDP_FLUSH_DSPP01);
+	sweet_cm_st.nLone++;
+	sweet_cm_st.checkAbs = now;
+}
+
+/* The scanout thread's look (fLock): a change with no flip to carry it, and the read-back of a lone flush. */
+static void
+sweet_cm_idle_locked(uint64_t now)
+{
+	uint64_t ns;
+	if (sweet_cm_st.dirty && sweet_scan.flipping == NULL) {
+		absolutetime_to_nanoseconds(now - sweet_cm_st.dirtyAbs, &ns);
+		if (sweet_scan.next == NULL || !sweet_scan.on || ns > 50 * NSEC_PER_MSEC) {
+			sweet_cm_lone_locked(now);
+		}
+	}
+	if (sweet_cm_st.checkAbs != 0) {
+		absolutetime_to_nanoseconds(now - sweet_cm_st.checkAbs, &ns);
+		if (ns > 40 * NSEC_PER_MSEC) {
+			sweet_cm_st.checkAbs = 0;
+			if (((sweet_cm_trace & 1) || sweet_cm_st.testName != NULL || sweet_cm_st.nLone <= 3) && sweet_cm_tr_take()) {
+				uint32_t f = sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH);
+				IOLog("SWEET CM: lone flush %u: ctl0 flush %x (DSPP bits %s after %llu ms), PCC en %x/%x\n",
+				    sweet_cm_st.nLone, f, (f & MDP_FLUSH_DSPP01) ? "STILL PENDING" : "latched", ns / NSEC_PER_MSEC,
+				    sweet_mdp_rd(MDP_DSPP(0) + DSPP_PCC), sweet_mdp_rd(MDP_DSPP(1) + DSPP_PCC));
+			}
+		}
+	}
+}
+
+/* Something changed what PCC should hold (fLock). */
+static void
+sweet_cm_kick_locked(AppleCLCD *fb)
+{
+	sweet_cm_st.dirty = true;
+	sweet_cm_st.dirtyAbs = mach_absolute_time();
+	if (sweet_scan.thread) {
+		IOLockWakeup(fb->fLock, &sweet_scan, false);
+	} else {
+		sweet_cm_lone_locked(sweet_cm_st.dirtyAbs);
+	}
+}
+
+/* Read only: DSPP0/1 and CTL0 (no fLock needed; data ports are not read, they may auto-increment). */
+static void
+sweet_cm_dump(const char *why)
+{
+	for (uint32_t n = 0; n < 2; n++) {
+		uint32_t b = MDP_DSPP(n), p = b + DSPP_PCC, g = b + DSPP_GC, nz = 0;
+		for (uint32_t o = 0x34; o < 0x88; o += 4) {
+			nz += sweet_mdp_rd(p + o) != 0;
+		}
+		IOLog("SWEET CM: dump (%s) DSPP%u @%#x: PCC en %x const %x %x %x | coef +10.. %x %x %x %x %x %x %x %x %x | "
+		    "2nd-order non-zero %u | GC en %x idx %x %x %x swap %x | IGC op %x dither %x | PA op %x | gamut op %x\n",
+		    why, n, b, sweet_mdp_rd(p), sweet_mdp_rd(p + 0x4), sweet_mdp_rd(p + 0x8), sweet_mdp_rd(p + 0xc),
+		    sweet_mdp_rd(p + 0x10), sweet_mdp_rd(p + 0x14), sweet_mdp_rd(p + 0x18), sweet_mdp_rd(p + 0x1c),
+		    sweet_mdp_rd(p + 0x20), sweet_mdp_rd(p + 0x24), sweet_mdp_rd(p + 0x28), sweet_mdp_rd(p + 0x2c),
+		    sweet_mdp_rd(p + 0x30), nz, sweet_mdp_rd(g), sweet_mdp_rd(g + 0x8), sweet_mdp_rd(g + 0x10),
+		    sweet_mdp_rd(g + 0x18), sweet_mdp_rd(g + 0x1c), sweet_mdp_rd(b), sweet_mdp_rd(b + 0x82c),
+		    sweet_mdp_rd(b + 0x800), sweet_mdp_rd(b + 0x1000));
+	}
+	char t[160];
+	size_t o = 0;
+	for (uint32_t r = MDP_DSPP_TOP; r < MDP_DSPP_TOP + 0x80 && o + 16 < sizeof(t); r += 4) {
+		uint32_t v = sweet_mdp_rd(r);
+		if (v != 0) {
+			o += (size_t)snprintf(t + o, sizeof(t) - o, " +%x=%x", r - MDP_DSPP_TOP, v);
+		}
+	}
+	IOLog("SWEET CM: dump (%s) CTL0 layer0 %x layer1 %x top %x flush %x | DSPP top:%s\n", why,
+	    sweet_mdp_rd(MDP_CTL(0) + 0x0), sweet_mdp_rd(MDP_CTL(0) + 0x4), sweet_mdp_rd(MDP_CTL(0) + 0x14),
+	    sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH), o ? t : " (all zero)");
+}
+
+static void
+sweet_cm_state(const char *why)
+{
+	char t[200];
+	sweet_cm_fmt9p(t, sizeof(t), sweet_cm_st.hw);
+	IOLog("SWEET CM: %s: kern.sweet_cm %u trace %u | PCC %s [%s] | swap %u neg %u | test %s | SetMatrix taken %u refused "
+	    "%u%s | commits %u (at a flip %u, idle %u), negatives written as 0 %u | brightness corr %#x | gamma %u bytes\n",
+	    why, sweet_cm, sweet_cm_trace, sweet_cm_st.on ? "on" : (sweet_cm_st.touched ? "off" : "untouched"), t,
+	    sweet_cm_st.swap, sweet_cm_st.neg, sweet_cm_st.testName ? sweet_cm_st.testName : "off", sweet_cm_st.nAccepted,
+	    sweet_cm_st.nRefused, sweet_cm_st.have ? "" : " (none yet)", sweet_cm_st.nCommits, sweet_cm_st.nMerged,
+	    sweet_cm_st.nLone, sweet_cm_st.nNegClamped, sweet_cm_st.bc, sweet_cm_st.gammaSize);
+}
+
+/* sel 55 (externalMethod, no lock held): guard, store, apply. The status for the trace line. */
+static const char *
+sweet_cm_set_matrix(AppleCLCD *fb, uint32_t loc, const int64_t m[9])
+{
+	if (loc != 9) {
+		return "ignored (location is not 9)";
+	}
+	int32_t c[9];
+	for (uint32_t i = 0; i < 9; i++) {
+		c[i] = sweet_cm_to_pcc(m[i]);
+	}
+	const char *why = sweet_cm_guard(c);
+	IOLockLock(fb->fLock);
+	if (why != NULL) {
+		sweet_cm_st.nRefused++;
+		IOLockUnlock(fb->fLock);
+		if ((sweet_cm || sweet_cm_trace) && sweet_cm_tr_take()) {
+			char t[240];
+			sweet_cm_fmt9(t, sizeof(t), m, 32);
+			IOLog("SWEET CM: SetMatrix refused (%s), the previous one stays: [%s]\n", why, t);
+		}
+		return why;
+	}
+	bool change = !sweet_cm_st.have || memcmp(sweet_cm_st.m, m, sizeof(sweet_cm_st.m)) != 0;
+	memcpy(sweet_cm_st.m, m, sizeof(sweet_cm_st.m));
+	sweet_cm_st.have = true;
+	sweet_cm_st.nAccepted++;
+	if (change && (sweet_cm & 1) && sweet_cm_st.testName == NULL) {
+		sweet_cm_kick_locked(fb);
+	}
+	IOLockUnlock(fb->fLock);
+	return (sweet_cm & 1) ? "taken" : "stored (kern.sweet_cm 0)";
+}
+
+/* sel 54 with kern.sweet_cm & 1: the stored matrix, identity before one / for another location */
+static void
+sweet_cm_get_matrix(AppleCLCD *fb, uint32_t loc, int64_t m[9], const char **what)
+{
+	IOLockLock(fb->fLock);
+	if (loc == 9 && sweet_cm_st.have) {
+		memcpy(m, sweet_cm_st.m, sizeof(sweet_cm_st.m));
+		*what = "the stored matrix";
+	} else {
+		for (uint32_t i = 0; i < 9; i++) {
+			m[i] = (i % 4 == 0) ? (1LL << 32) : 0;
+		}
+		*what = "identity";
+	}
+	IOLockUnlock(fb->fLock);
+}
+
+/* kern.sweet_cm_trace & 1, after the selector ran (outputs filled in) */
+static void
+sweet_cm_trace_sel(uint32_t selector, IOExternalMethodArguments *args, IOReturn ret, const char *note)
+{
+	char name[32];
+	switch (selector) {
+	case 17: case 19: case 27: case 50: case 51: case 54: case 55: case 57: case 68: case 69: case 84:
+		break;
+	default:
+		return;
+	}
+	const uint8_t *in = args->structureInputDescriptor == NULL ? (const uint8_t *)args->structureInput : NULL;
+	uint32_t inSize = args->structureInputSize;
+	if (selector == 55 && in != NULL && inSize >= 72) {
+		int64_t m[9];
+		uint32_t loc = args->scalarInputCount ? (uint32_t)args->scalarInput[0] : 0xffffffffu;
+		memcpy(m, in, sizeof(m));
+		if (sweet_cm_st.seenAny && loc == sweet_cm_st.seenLoc && memcmp(m, sweet_cm_st.seen, sizeof(m)) == 0) {
+			return;         /* each new matrix only */
+		}
+		memcpy(sweet_cm_st.seen, m, sizeof(m));
+		sweet_cm_st.seenLoc = loc;
+		sweet_cm_st.seenAny = true;
+		if (!sweet_cm_tr_take()) {
+			return;
+		}
+		char t[240];
+		sweet_cm_fmt9(t, sizeof(t), m, 32);
+		proc_selfname(name, sizeof(name));
+		IOLog("SWEET CM: %s SetMatrix loc %u [%s] -> 0x%x %s\n", name, loc, t, ret, note ? note : "");
+		return;
+	}
+	if (!sweet_cm_tr_take()) {
+		return;
+	}
+	proc_selfname(name, sizeof(name));
+	if ((selector == 17 && in != NULL) || selector == 27) {
+		const uint8_t *tb = selector == 17 ? in : (args->structureOutputDescriptor == NULL ?
+		    (const uint8_t *)args->structureOutput : NULL);
+		uint32_t sz = selector == 17 ? inSize : args->structureOutputSize, sum = 0, e[9] = { 0 };
+		if (tb != NULL) {
+			for (uint32_t i = 0; i + 4 <= sz; i += 4) {
+				uint32_t w;
+				memcpy(&w, tb + i, 4);
+				sum = (sum << 1 | sum >> 31) ^ w;
+			}
+			for (uint32_t ch = 0; ch < 3; ch++) {
+				static const uint32_t at[3] = { 0, 128, 256 };
+				for (uint32_t k = 0; k < 3; k++) {
+					uint32_t off = (ch * 257 + at[k]) * 4;
+					if (off + 4 <= sz) {
+						memcpy(&e[ch * 3 + k], tb + off, 4);
+					}
+				}
+			}
+		}
+		IOLog("SWEET CM: %s %s %u bytes, checksum %08x, r[0,128,256] %x %x %x g %x %x %x b %x %x %x -> 0x%x %s\n", name,
+		    selector == 17 ? "SetGammaTable" : "GetGammaTable out", sz, sum, e[0], e[1], e[2], e[3], e[4], e[5], e[6],
+		    e[7], e[8], ret, note ? note : "");
+		return;
+	}
+	if (selector == 50 && args->scalarInputCount >= 1) {
+		char d[24];
+		sweet_cm_dec(d, sizeof(d), (int64_t)(uint32_t)args->scalarInput[0], 16);
+		IOLog("SWEET CM: %s SetBrightnessCorrection %#llx (%s) -> 0x%x (stored only)\n", name, args->scalarInput[0], d, ret);
+		return;
+	}
+	if (selector == 54) {
+		char t[240] = "";
+		if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL && args->structureOutputSize >= 72) {
+			int64_t m[9];
+			memcpy(m, args->structureOutput, sizeof(m));
+			sweet_cm_fmt9(t, sizeof(t), m, 32);
+		}
+		IOLog("SWEET CM: %s GetMatrix loc %llu out %u: [%s] -> 0x%x %s\n", name,
+		    args->scalarInputCount ? args->scalarInput[0] : 0ULL, args->structureOutputSize, t, ret, note ? note : "");
+		return;
+	}
+	uint64_t w = 0;
+	if (in != NULL && inSize > 0) {
+		memcpy(&w, in, inSize < 8 ? inSize : 8);
+	}
+	IOLog("SWEET CM: %s sel %u in %u [%#llx %#llx] struct %u [%#llx] out %u/%u [%#llx] -> 0x%x\n", name, selector,
+	    args->scalarInputCount, args->scalarInputCount ? args->scalarInput[0] : 0ULL,
+	    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL, inSize, w, args->scalarOutputCount,
+	    args->structureOutputSize, args->scalarOutputCount ? args->scalarOutput[0] : 0ULL, ret);
+}
+
+/* From the sysctl handlers (bsd/dev/sweet_gpu.c, no lock held): 1 kern.sweet_cm changed, 2 dump. */
+void
+sweet_cm_ctl(uint32_t what)
+{
+	AppleCLCD *fb = sweet_fb_instance;
+	if (what == 2) {
+		sweet_cm_dump("kern.sweet_cm_trace");
+		return;
+	}
+	if (fb == NULL) {
+		return;
+	}
+	IOLockLock(fb->fLock);
+	sweet_cm_kick_locked(fb);
+	IOLockUnlock(fb->fLock);
+	sweet_cm_state("kern.sweet_cm");
+}
+
+/* p cm ... (fbCmd, no lock held) */
+static void
+sweet_cm_cmd(AppleCLCD *fb, const char *q, const char *end)
+{
+	static const struct { const char *name; int32_t c[9]; } tests[] = {
+		{ "r",    { SWEET_CM_ONE, 0, 0, 0, 0, 0, 0, 0, 0 } },
+		{ "g",    { 0, 0, 0, 0, SWEET_CM_ONE, 0, 0, 0, 0 } },
+		{ "b",    { 0, 0, 0, 0, 0, 0, 0, 0, SWEET_CM_ONE } },
+		{ "warm", { SWEET_CM_ONE, 0, 0, 0, 0x63d7, 0, 0, 0, 0x4666 } },        /* 1, 0.78, 0.55 */
+		{ "id",   { SWEET_CM_ONE, 0, 0, 0, SWEET_CM_ONE, 0, 0, 0, SWEET_CM_ONE } },
+		{ "rg",   { 0, SWEET_CM_ONE, 0, 0, SWEET_CM_ONE, 0, 0, 0, SWEET_CM_ONE } },
+		{ "neg",  { SWEET_CM_ONE, -0x4000, 0, 0, SWEET_CM_ONE, 0, 0, 0, SWEET_CM_ONE } },
+	};
+	while (q < end && *q == ' ') {
+		q++;
+	}
+	const char *w = q;
+	while (q < end && *q != ' ') {
+		q++;
+	}
+	size_t wl = (size_t)(q - w);
+	while (q < end && *q == ' ') {
+		q++;
+	}
+	const char *a = q;
+	while (q < end && *q != ' ') {
+		q++;
+	}
+	size_t al = (size_t)(q - a);
+	if (wl == 4 && !strncmp(w, "dump", 4)) {
+		sweet_cm_dump("p cm dump");
+		return;
+	}
+	if (wl == 0) {
+		sweet_cm_state("p cm");
+		return;
+	}
+	IOLockLock(fb->fLock);
+	if (wl == 4 && !strncmp(w, "test", 4)) {
+		if (al == 3 && !strncmp(a, "off", 3)) {
+			sweet_cm_st.testName = NULL;
+		} else {
+			uint32_t i;
+			for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
+				if (strlen(tests[i].name) == al && !strncmp(tests[i].name, a, al)) {
+					break;
+				}
+			}
+			if (i == sizeof(tests) / sizeof(tests[0])) {
+				IOLockUnlock(fb->fLock);
+				IOLog("SWEET CM: p cm test r|g|b|warm|id|rg|neg|off\n");
+				return;
+			}
+			const char *why = sweet_cm_guard(tests[i].c);
+			if (why != NULL) {
+				IOLockUnlock(fb->fLock);
+				IOLog("SWEET CM: test %s refused by the guard (%s)\n", tests[i].name, why);
+				return;
+			}
+			memcpy(sweet_cm_st.test, tests[i].c, sizeof(sweet_cm_st.test));
+			sweet_cm_st.testName = tests[i].name;
+		}
+	} else if (wl == 4 && !strncmp(w, "swap", 4)) {
+		sweet_cm_st.swap = al ? *a == '1' : !sweet_cm_st.swap;
+	} else if (wl == 3 && !strncmp(w, "neg", 3)) {
+		sweet_cm_st.neg = (al && *a >= '0' && *a <= '2') ? (uint32_t)(*a - '0') : 0;
+	} else {
+		IOLockUnlock(fb->fLock);
+		IOLog("SWEET CM: p cm [dump | test r|g|b|warm|id|rg|neg|off | swap [0|1] | neg 0|1|2]\n");
+		return;
+	}
+	sweet_cm_kick_locked(fb);
+	IOLockUnlock(fb->fLock);
+	sweet_cm_state("p cm");
+}
+
+/*
  * 0989: the latched-frame word (gate 2). Only goes up: the frame on screen, or, to release every wait armed so far
  * (gate change, scanout off, leaving the direct geometry, a wait past 50 ms), the newest reference given out.
  */
@@ -5002,7 +5628,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
 		sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
 	}
 	sweet_scan.flipFrame = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
-	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
+	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01 | sweet_cm_flip_locked());    /* 1116: + DSPP0/1 PCC */
 	SWEET_TRACE(SWT_SCAN_FLIP, sSwap, sSeq, now - sAbs, sweet_scan.flipFrame);    /* 0994 */
 	sweet_scan.flipping = s;
 	sweet_scan.flipSeq = sSeq;
@@ -5121,6 +5747,9 @@ sweet_scan_thread(void *arg)
 	for (;;) {
 		uint64_t now = mach_absolute_time();
 		bool busy = sweet_scan.on && sweet_scan_step_locked(fb, now);
+		if (__improbable(sweet_cm_st.dirty || sweet_cm_st.checkAbs != 0)) {
+			sweet_cm_idle_locked(now);      /* 1116: a PCC change with no flip to carry it */
+		}
 		if (sweet_scan.on) {
 			sweet_scan_stats_locked(now);
 		}
@@ -5375,6 +6004,10 @@ extern "C" void sweet_prof_cmd(const char *s, const char *end);   /* 0991 */
 void
 AppleCLCD::fbCmd(const char *s, const char *end)
 {
+	if (end - s >= 2 && !strncmp(s, "cm", 2) && (end - s == 2 || s[2] == ' ')) {
+		sweet_cm_cmd(this, s + 2, end);         /* 1116 */
+		return;
+	}
 	if (end - s >= 4 && !strncmp(s, "disp", 4)) {
 		/* 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh) */
 		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
@@ -5594,7 +6227,7 @@ AppleCLCD::fbCmd(const char *s, const char *end)
 		}
 		return;
 	}
-	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1 | pace N [MIN_US]\n");
+	IOLog("SWEET FB: poke p: fc | hz 60|90 [tc] | fbx HEX | mdp dump|smmu|test|scale|ca|restore | scanout 0|1 | pace N [MIN_US] | cm ...\n");
 }
 
 extern "C" void sweet_fb_cmd(const char *s, const char *end);
@@ -6390,6 +7023,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	uint32_t outCount = 0;
 	bool structDone = false;        /* 0943: structureOutput filled in, not to be zeroed */
 	uint32_t traceSwap = 0;         /* 0994 */
+	const char *cmNote = NULL;      /* 1116 */
 	SWEET_TRACE_START(SWT_IOMFB_SEL, selector, args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
 	    args->scalarInputCount > 1 ? args->scalarInput[1] : 0, args->structureInputSize);
 
@@ -6461,6 +7095,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 				fFB->fPowerOff = off;
 				fFB->fFadeStep = 0;
 				fFB->fDirty = true;     /* on: redraw the latest frame */
+				if (!off && sweet_cm_st.touched) {
+					sweet_cm_kick_locked(fFB);      /* 1116: PCC again, in case the display power lost it */
+				}
 			}
 			IOLockUnlock(fFB->fLock);
 			if (off && sweet_scan_live()) {
@@ -6514,6 +7151,55 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			sweet_pt_wait(ret);     /* 1114: CA's can_update_ poll and its answer */
 		}
 		break;
+	/*
+	 * 1116: colour management (see sweet_cm_st). With kern.sweet_cm 0 the answers are as before 1116 (success, outputs
+	 * zero-filled below); 55/17/50 are only stored.
+	 */
+	case kSweetFBSetMatrix:
+		if (args->scalarInputCount >= 1 && args->structureInputDescriptor == NULL && args->structureInput != NULL &&
+		    args->structureInputSize >= 72) {
+			int64_t m[9];
+			memcpy(m, args->structureInput, sizeof(m));
+			cmNote = sweet_cm_set_matrix(fFB, (uint32_t)args->scalarInput[0], m);
+		}
+		break;
+	case kSweetFBGetMatrix:
+		if ((sweet_cm & 1) && args->structureOutputDescriptor == NULL && args->structureOutput != NULL &&
+		    args->structureOutputSize >= 72) {
+			int64_t m[9];
+			sweet_cm_get_matrix(fFB, args->scalarInputCount ? (uint32_t)args->scalarInput[0] : 9, m, &cmNote);
+			bzero(args->structureOutput, args->structureOutputSize);
+			memcpy(args->structureOutput, m, sizeof(m));
+			structDone = true;
+		}
+		break;
+	case kSweetFBSetGammaTable:
+		if (args->structureInputDescriptor == NULL && args->structureInput != NULL && args->structureInputSize > 0) {
+			uint32_t n = args->structureInputSize < SWEET_CM_GAMMA_BYTES ? args->structureInputSize : SWEET_CM_GAMMA_BYTES;
+			IOLockLock(fFB->fLock);
+			bzero(sweet_cm_st.gamma, sizeof(sweet_cm_st.gamma));
+			memcpy(sweet_cm_st.gamma, args->structureInput, n);
+			sweet_cm_st.gammaSize = n;
+			IOLockUnlock(fFB->fLock);
+			cmNote = "(stored; GC not written)";
+		}
+		break;
+	case kSweetFBGetGammaTable:
+		if ((sweet_cm & 1) && args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+			IOLockLock(fFB->fLock);
+			bzero(args->structureOutput, args->structureOutputSize);
+			uint32_t n = sweet_cm_st.gammaSize < args->structureOutputSize ? sweet_cm_st.gammaSize : args->structureOutputSize;
+			memcpy(args->structureOutput, sweet_cm_st.gamma, n);
+			IOLockUnlock(fFB->fLock);
+			structDone = true;
+			cmNote = n ? "(the stored table)" : "(zeros: no table set yet)";
+		}
+		break;
+	case kSweetFBSetBrightnessCorrection:
+		if (args->scalarInputCount >= 1) {
+			sweet_cm_st.bc = (uint32_t)args->scalarInput[0];
+		}
+		break;
 	default:
 		break;
 	}
@@ -6525,6 +7211,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		bzero(args->structureOutput, args->structureOutputSize);
 	}
 	SWEET_TRACE_END(SWT_IOMFB_SEL, selector, ret, out[0], traceSwap);      /* 0994 */
+	if (__improbable(sweet_cm_trace & 1)) {
+		sweet_cm_trace_sel(selector, args, ret, cmNote);        /* 1116 */
+	}
 	if ((sweet_bl_trace & 2) && selector != kSweetFBSwapBegin && selector != kSweetFBSwapEnd &&
 	    selector != kSweetFBSwapWait && selector != kSweetFBGetCurrentAbsoluteTime &&
 	    selector != kSweetFBNotifications) {         /* 1100: 72 toggles the vsync callback ~20 times a second */
