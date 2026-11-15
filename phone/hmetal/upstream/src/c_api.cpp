@@ -253,6 +253,7 @@ struct hakios_metal_cb {
     uint64_t indirectOffset = 0;
     std::shared_ptr<Deferrer> deferrer;   // the queue's, when it records deferred
     std::shared_ptr<DeferTally> pending = std::make_shared<DeferTally>();   // its jobs (ws-hm-defer: shared with them)
+    Bindings scratchVs, scratchFs;   // (ws-hm-plugcpu) HM_PLUG_FAST: the draws' tables, their arrays reused draw after draw
 };
 struct hakios_metal_texture {
     std::shared_ptr<Texture> texture;   // its Buffer is kept by every command buffer that dispatched over it
@@ -269,6 +270,19 @@ namespace {
 // deferred recording: whether this call is to be posted rather than done here, and copies of what it names that outlive
 // the caller's (the handles are a shared_ptr each: a copy keeps the object alive whatever the caller frees meanwhile)
 bool deferring(hakios_metal_cb* cb) { return cb->deferrer != nullptr && !Deferrer::inWorker(); }
+// (ws-hm-plugcpu) HM_PLUG_FAST=1: a draw through the C interface with no heap allocation of its own once warm (its
+// binding tables reused, each object kept once a command buffer: CommandBuffer::keepOnce); 0 (default) as before.
+// The same words either way (c_api_test plugfast_*). Read once; the tests set it with cApiPlugFastForTesting.
+std::atomic<int> plugFastSet{-1};
+bool plugFast() {
+    int v = plugFastSet.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = getenv("HM_PLUG_FAST");
+        v = e != nullptr && e[0] == '1';
+        plugFastSet.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
 void syncAll(hakios_metal_cb* cb) { if (cb->deferrer != nullptr) cb->deferrer->drainAll(); }
 void syncOne(hakios_metal_cb* cb) { if (cb->deferrer != nullptr) cb->deferrer->drain(cb->pending); }
 template <class H>
@@ -1752,6 +1766,16 @@ static RenderPass passOf(const struct hakios_metal_render_pass* pass) {
 }
 
 // the pass's texture objects, alive until the GPU is done with them, whatever the caller frees meanwhile
+// (ws-hm-plugcpu) HM_PLUG_FAST: the same, each object once a command buffer
+static void keepPassAliveOnce(hakios_metal_cb* cb, const struct hakios_metal_render_pass* pass) {
+    if (pass->color0 != nullptr) cb->cb->keepAliveOnce(pass->color0->texture);
+    for (const auto& m : pass->more) {
+        if (m.texture != nullptr) cb->cb->keepAliveOnce(m.texture->texture);
+    }
+    if (pass->depth != nullptr) cb->cb->keepAliveOnce(pass->depth->texture);
+    if (pass->visibility != nullptr) cb->cb->keepOnce(pass->visibility->buffer);
+}
+
 static void keepPassAlive(hakios_metal_cb* cb, const struct hakios_metal_render_pass* pass) {
     if (pass->color0 != nullptr) cb->cb->keepAlive(pass->color0->texture);
     for (const auto& m : pass->more) {
@@ -1783,15 +1807,26 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
     cb->indirect = nullptr;
     // the two [[buffer(n)]] tables by Metal's index (setVertexBuffer / setFragmentBuffer); render::encode reads what each
     // stage's pushed ranges name and refuses a range with nothing bound by name
-    auto table = [](hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
-        Bindings b;
+    // (ws-hm-plugcpu) HM_PLUG_FAST: into the command buffer's own two tables, emptied (every field as a new one's) with
+    // their arrays' memory kept; otherwise new ones, as before
+    const bool fast = plugFast();
+    Bindings vsOwn, fsOwn;
+    auto table = [fast](Bindings& b, hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
+        if (fast) {
+            std::vector<Binding> bufs = std::move(b.buffers);
+            std::vector<const Texture*> texs = std::move(b.textures);
+            std::vector<const Sampler*> smps = std::move(b.samplers);
+            b = Bindings{};
+            bufs.clear(), texs.clear(), smps.clear();
+            b.buffers = std::move(bufs), b.textures = std::move(texs), b.samplers = std::move(smps);
+        }
         b.buffers.resize(count);
         for (unsigned i = 0; i < count; i++) {
             if (buffers != nullptr && buffers[i] != nullptr) b.buffers[i] = Binding{buffers[i]->buffer.get(), offsets != nullptr ? offsets[i] : 0};
         }
-        return b;
     };
-    Bindings vsb = table(vsBuffers, vsOffsets, vsCount);
+    Bindings& vsb = fast ? cb->scratchVs : vsOwn;
+    table(vsb, vsBuffers, vsOffsets, vsCount);
     // the vertex stage's textures and samplers, as hakios_metal_cb_set_vertex_textures left them, and its own constexpr
     // samplers past them, as the fragment stage's below
     for (const auto& t : cb->vsTextures) vsb.textures.push_back(t.get());
@@ -1800,7 +1835,8 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         if (vsb.samplers.size() <= index) vsb.samplers.resize(index + 1, nullptr);
         vsb.samplers[index] = &sampler;
     }
-    Bindings fsb = table(fsBuffers, fsOffsets, fsCount);
+    Bindings& fsb = fast ? cb->scratchFs : fsOwn;
+    table(fsb, fsBuffers, fsOffsets, fsCount);
     // the fragment stage's [[texture(n)]] and [[sampler(n)]] by Metal's index (setFragmentTexture / setFragmentSamplerState)
     fsb.textures.resize(fsTextureCount, nullptr);
     for (unsigned i = 0; i < fsTextureCount; i++) {
@@ -1887,6 +1923,21 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
     if (!cb->cb->draw(p->program->program, rp, d, vsb, fsb)) {
         failed(cb->cb->error().empty() ? cb->cb->lastSkipped() : cb->cb->error());
         return -1;
+    }
+    if (fast) {   // (ws-hm-plugcpu) what follows, each object once a command buffer
+        for (unsigned i = 0; i < vsCount; i++) if (vsBuffers != nullptr && vsBuffers[i] != nullptr) cb->cb->keepOnce(vsBuffers[i]->buffer);
+        for (unsigned i = 0; i < fsCount; i++) if (fsBuffers != nullptr && fsBuffers[i] != nullptr) cb->cb->keepOnce(fsBuffers[i]->buffer);
+        if (target != nullptr) cb->cb->keepOnce(target->buffer());
+        keepPassAliveOnce(cb, pass);
+        cb->cb->keepAliveOnce(p->program);
+        for (unsigned i = 0; i < fsTextureCount; i++) {
+            if (fsTextures != nullptr && fsTextures[i] != nullptr) cb->cb->keepAliveOnce(fsTextures[i]->texture);
+        }
+        for (const auto& t : cb->vsTextures) {
+            if (t != nullptr) cb->cb->keepAliveOnce(t);
+        }
+        if (indirect != nullptr) cb->cb->keep(indirect);
+        return 0;
     }
     // the bound buffers live until the GPU has read them, whatever the caller frees meanwhile
     for (unsigned i = 0; i < vsCount; i++) if (vsBuffers != nullptr && vsBuffers[i] != nullptr) cb->cb->keep(vsBuffers[i]->buffer);
@@ -2029,7 +2080,8 @@ int hakios_metal_cb_draw_indexed(hakios_metal_cb* cb, hakios_metal_program* p, c
     }
     int r = drawCommon(cb, p, pass, viewport, scissor, primitive, 0, indexCount, instanceCount, indexBuffer, indexType, indexOffset, baseVertex, baseInstance,
                        vsBuffers, vsOffsets, vsCount, fsBuffers, fsOffsets, fsCount, fsTextures, fsTextureCount, fsSamplers, fsSamplerCount);
-    if (r == 0) cb->cb->keep(indexBuffer->buffer);   // the indices live until the GPU has read them, whatever the caller frees
+    if (r == 0 && plugFast()) cb->cb->keepOnce(indexBuffer->buffer);   // (ws-hm-plugcpu)
+    else if (r == 0) cb->cb->keep(indexBuffer->buffer);   // the indices live until the GPU has read them, whatever the caller frees
     return r;
 }
 
@@ -2123,3 +2175,17 @@ int hakios_metal_cb_gpu_times(hakios_metal_cb* cb, int64_t* start_ns, int64_t* e
 }
 
 }  // extern "C"
+
+// (ws-hm-plugcpu) for the host tests: HM_PLUG_FAST as if set (1), unset (0), or read again from the environment (-1);
+// the words a C command buffer recorded so far; how many objects its buffer keeps
+namespace hakios::metal {
+void cApiPlugFastForTesting(int on) { plugFastSet.store(on, std::memory_order_relaxed); }
+std::vector<uint32_t> cApiStreamForTesting(hakios_metal_cb* cb) {
+    syncAll(cb);
+    return cb->cb->streamForTesting();
+}
+size_t cApiKeptForTesting(hakios_metal_cb* cb) {
+    syncAll(cb);
+    return cb->cb->keptCountForTesting();
+}
+}  // namespace hakios::metal

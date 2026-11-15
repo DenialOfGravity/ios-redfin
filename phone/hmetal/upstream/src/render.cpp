@@ -4621,6 +4621,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
     other.uses_.clear();
     other.kept_.clear();
     other.keptAny_.clear();
+    other.forgetKeeps();   // (ws-hm-plugcpu) what it kept is this one's now
     counts_.passes += other.counts_.passes;
     counts_.draws += other.counts_.draws;
     counts_.dispatches += other.counts_.dispatches;

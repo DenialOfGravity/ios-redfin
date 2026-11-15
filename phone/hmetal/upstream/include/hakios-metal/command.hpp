@@ -180,6 +180,18 @@ public:
     void keep(std::shared_ptr<const Buffer> b) { kept_.push_back(std::move(b)); }
     // anything else it uses (a compiled kernel's words), the same way
     void keepAlive(std::shared_ptr<const void> p) { keptAny_.push_back(std::move(p)); }
+    // (ws-hm-plugcpu) HM_PLUG_FAST: keep() and keepAlive() left out for an object this buffer keeps already. An address
+    // in the small tables below was kept by this buffer (kept_/keptAny_ hold it until it completes, or the buffer it is
+    // appended to does), so it cannot have been freed and its address reused meanwhile; a slot overwritten by another
+    // address costs one more keep, as before. The tables are emptied with the lists.
+    template <class T>
+    void keepOnce(const std::shared_ptr<T>& b) {
+        if (b != nullptr && firstKeep(keepSeen_, b.get())) kept_.push_back(b);
+    }
+    template <class T>
+    void keepAliveOnce(const std::shared_ptr<T>& p) {
+        if (p != nullptr && firstKeep(keepAliveSeen_, static_cast<const void*>(p.get()))) keptAny_.push_back(p);
+    }
     // OTHER's recorded work after this one's, as if it had been recorded here: its packets, what it names and what it
     // keeps alive -- a parallel render encoder's sub-encoders each record into a command buffer of their own, from any
     // thread in any order, and are appended in the order they were made. OTHER is left empty and is not committed; an
@@ -564,6 +576,23 @@ private:
     std::vector<BoUse> uses_;
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
+    // (ws-hm-plugcpu) keepOnce/keepAliveOnce: addresses kept already, direct-mapped
+  public:
+    size_t keptCountForTesting() const { return kept_.size() + keptAny_.size(); }
+  private:
+    static constexpr unsigned kKeepSeen = 64;
+    const void* keepSeen_[kKeepSeen] = {};
+    const void* keepAliveSeen_[kKeepSeen] = {};
+    static bool firstKeep(const void** table, const void* p) {
+        const unsigned h = unsigned((uint64_t(uintptr_t(p)) >> 4) * 0x9E3779B97F4A7C15ull >> 58);   // 6 bits: kKeepSeen
+        if (table[h] == p) return false;
+        table[h] = p;
+        return true;
+    }
+    void forgetKeeps() {
+        for (auto& e : keepSeen_) e = nullptr;
+        for (auto& e : keepAliveSeen_) e = nullptr;
+    }
     std::vector<std::pair<const Texture*, std::shared_ptr<Texture>>> xrDecoded_;   // (redfin hmv2) this buffer's decoded extended-range copies
     bool xrSynced_ = false;   // (redfin hmv8) HM_XR_SYNC's ring barrier done for this buffer
     struct XrLate {   // (redfin hmv10) HM_XR_LATE: a copy to decode at commit, and its rows' sum then (HM_XR_CHECK)
