@@ -280,6 +280,7 @@ public:
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read)
     size_t streamWords() const { return stream_.words().size(); }
+    const std::vector<uint32_t>& streamForTesting() const { return stream_.words(); }   // (ws-hm-drawcpu)
     std::vector<PassTime> passTimes() const;
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
     const char* passSysmemWhy(size_t i) const { return i < profiled_.size() ? profiled_[i].sysmemWhy.c_str() : ""; }
@@ -429,9 +430,11 @@ private:
             size_t start = 0, end = 0;
             RegShadow regs;
             std::vector<uint8_t> staticKey;
+            render::DrawCache cache;   // (ws-hm-drawcpu)
             bool lastFetched = false;
             std::vector<uint8_t> key;
         } df;
+        render::DrawCache cache;   // (ws-hm-drawcpu) HM_DRAW_SKIP: what the pass's last draw left loaded (render::DrawCache)
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
         // (ws-hm-cull) HM_DEADFILL=2: the held draw's attachments written, and whether it may be taken back by a cover
         uint8_t dfWrites = 0;

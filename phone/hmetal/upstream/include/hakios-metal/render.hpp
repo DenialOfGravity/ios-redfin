@@ -592,10 +592,28 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
 // (GMEM: the pass's plan when it is drawn in tiles -- the attachments' bins in RB_MRT's BASE_GMEM, a framebuffer fetch
 // reading its bin in GMEM; nullptr in sysmem. AFTER_FETCH: the draw before it in the pass read its attachments too, so
 // in raster order a fetch needs no barrier)
+// (ws-hm-drawcpu) HM_DRAW_SKIP: what the draws of an open sysmem pass left loaded (CommandBuffer::draw keeps one a pass,
+// emptied wherever the pass's staticKey is, taken back with a HM_DEADFILL take-back): a draw given one leaves out what it
+// already holds, and leaves in it what the draw loaded
+struct DrawCache {
+    static constexpr uint32_t kSlots = 4;   // fragment textures and samplers remembered (a draw of more loads them)
+    bool valid = false;
+    uint64_t vsProgram = 0, fsProgram = 0;  // the stages whose preloads and immediates are in (0: not known)
+    bool fsTexKnown = false;
+    uint32_t fsNumTex = 0, fsNumSamp = 0;
+    uint32_t fsTexWords[kSlots][16] = {};
+    uint32_t fsSampWords[kSlots][4] = {};
+};
+// (ws-hm-drawcpu) HM_DRAW_SKIP=table: the draw's table taken once its size is known: bytes LO to HI of the table's
+// layout, LO 256-aligned; TAKE returns the piece's GPU address and its processor mapping (for bytes LO on)
+struct TableTaker {
+    bool (*take)(void* context, uint32_t lo, uint32_t hi, uint64_t* gpu, uint8_t** cpu, std::string* why);
+    void* context;
+};
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw,
                   const Bindings& vsBindings, const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram,
                   uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{}, const GmemPlan* gmem = nullptr,
-                  bool afterFetch = false);
+                  bool afterFetch = false, DrawCache* cache = nullptr, const TableTaker* taker = nullptr);
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& options = Options{});
 // (ws-hm-perf2) encodeEnd's tail without a pass: DEPTH flushes the depth CCU too. What the command buffer puts down
 // when a lazily ended pass's colour must reach memory (HM_PASS_FLUSH=lazy) before anything but another draw pass
@@ -647,6 +665,16 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
 // (what SP_PS_2D_SRC and RB_2D_DST take), the rest of the way being the rectangle's x, at most 0x4000 texels from there.
 // The two ranges must not overlap, as Metal asks of a copy. A pass of its own, with what it wrote in memory at its end.
 void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t length, uint64_t table, uint8_t* tableCpu, const Options& o = Options{});
+
+// (ws-hm-drawcpu) HM_DRAW_SKIP: state a draw leaves out because the last draw of the same open pass, with the same
+// program (CommandBuffer::draw's staticKey), left it in the GPU. Unset or 0: nothing left out (the stream as before).
+// A list of names or "all": prog (the two stages' shader preloads and immediates, when the program is the last draw's),
+// tex (the fragment stage's texture and sampler loads, when their descriptors are the last draw's), table (the draw's
+// own table only as large as the parts of it this draw uses, its descriptors alone written: was 8 KiB a draw, 2.5 KiB
+// of it set). Read once (reloadDrawSkipForTesting reads it again).
+enum : uint32_t { kSkipProgram = 1, kSkipTextures = 2, kSkipTable = 4, kSkipAll = 7 };
+uint32_t drawSkip();
+void reloadDrawSkipForTesting();
 
 }  // namespace render
 

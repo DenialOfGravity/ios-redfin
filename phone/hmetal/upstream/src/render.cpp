@@ -1380,7 +1380,8 @@ bool sysmemFetchFlush(bool sysmemFetch, const RenderPass& pass) {
 
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
-                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
+                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false, DrawCache* cache = nullptr,
+                const TableTaker* taker = nullptr) {
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -1672,14 +1673,63 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (whole) {
         tableStart(tableCpu);
     }
-    memset(tableCpu + kTableFbReadFlushAt, 0, 4);   // (the draw's own table: zero before the flush below writes it)
-    memcpy(tableCpu + kGfxIboAt, ibos.words, size_t(ibos.count) * 64);
-    memset(tableCpu + kFsTexConstAt, 0, kMaxTextureSlots * 64);
-    memset(tableCpu + kFsTexSampAt, 0, kMaxTextureSlots * 16);
-    memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, sizeof fsTex.texWords);
-    memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, sizeof fsTex.sampWords);
-    memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, sizeof vsTex.texWords);
-    memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, sizeof vsTex.sampWords);
+    // (ws-hm-drawcpu) HM_DRAW_SKIP=prog,tex: what the last draw of this pass loaded and this one would load the same
+    const bool skipProg = cache != nullptr && cache->valid && o.programVs && o.programFs && cache->vsProgram == vsProgram &&
+                          cache->fsProgram == fsProgram && vsProgram != 0 && fsProgram != 0;
+    const bool skipFsTex = cache != nullptr && cache->valid && cache->fsTexKnown && o.fsTextures && fsTex.numTex == cache->fsNumTex &&
+                           fsTex.numSamp == cache->fsNumSamp && fsTex.numTex <= DrawCache::kSlots && fsTex.numSamp <= DrawCache::kSlots &&
+                           std::memcmp(fsTex.texWords, cache->fsTexWords, 64ull * fsTex.numTex) == 0 &&
+                           std::memcmp(fsTex.sampWords, cache->fsSampWords, 16ull * fsTex.numSamp) == 0;
+    if (taker != nullptr && !whole && gmem == nullptr) {
+        // (ws-hm-drawcpu) HM_DRAW_SKIP=table: the parts of the table this draw reads, and a piece for them alone, the
+        // table's address being the piece's less LO (nothing below LO or from HI on is addressed)
+        uint32_t lo = ~0u, hi = 0;
+        auto need = [&](uint32_t a, uint32_t b) {
+            if (b <= a) return;
+            lo = std::min(lo, a);
+            hi = std::max(hi, b);
+        };
+        if (fs.fbRead) need(kTableFbReadFlushAt, kTableFbReadFlushAt + 4);
+        if (draw.visibilityMode != 0) need(0, 256);
+        need(kGfxIboAt, kGfxIboAt + 64 * ibos.count);
+        const bool fsLoads = o.fsTextures && fsTex.numTex != 0 && !skipFsTex;
+        const bool vsLoads = o.vsTextures && vsTex.numTex != 0;
+        if (fsLoads) need(kFsTexConstAt, kFsTexConstAt + 64 * fsTex.numTex);
+        if (fsLoads) need(kFsTexSampAt, kFsTexSampAt + 16 * fsTex.numSamp);
+        if (vsLoads) need(kVsTexConstAt, kVsTexConstAt + 64 * vsTex.numTex);
+        if (vsLoads) need(kVsTexSampAt, kVsTexSampAt + 16 * vsTex.numSamp);
+        for (const std::vector<PushedRange>* rs : {&vsRanges, &fsRanges}) {
+            for (const PushedRange& r : *rs) {
+                if (r.copy) need(r.copyAt, r.copyAt + 16 * r.units);
+            }
+        }
+        if (hi == 0) {
+            table = 0;
+            tableCpu = nullptr;
+        } else {
+            lo &= ~255u;
+            uint64_t gpu = 0;
+            uint8_t* cpu = nullptr;
+            if (!taker->take(taker->context, lo, hi, &gpu, &cpu, why)) return false;
+            table = gpu - lo;
+            tableCpu = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(cpu) - lo);
+            if (fs.fbRead) memset(tableCpu + kTableFbReadFlushAt, 0, 4);
+            memcpy(tableCpu + kGfxIboAt, ibos.words, size_t(ibos.count) * 64);
+            if (fsLoads) memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, 64ull * fsTex.numTex);
+            if (fsLoads) memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, 16ull * fsTex.numSamp);
+            if (vsLoads) memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, 64ull * vsTex.numTex);
+            if (vsLoads) memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, 16ull * vsTex.numSamp);
+        }
+    } else {
+        memset(tableCpu + kTableFbReadFlushAt, 0, 4);   // (the draw's own table: zero before the flush below writes it)
+        memcpy(tableCpu + kGfxIboAt, ibos.words, size_t(ibos.count) * 64);
+        memset(tableCpu + kFsTexConstAt, 0, kMaxTextureSlots * 64);
+        memset(tableCpu + kFsTexSampAt, 0, kMaxTextureSlots * 16);
+        memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, sizeof fsTex.texWords);
+        memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, sizeof fsTex.sampWords);
+        memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, sizeof vsTex.texWords);
+        memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, sizeof vsTex.sampWords);
+    }
     MrtWords mrts[kMaxColorOutputs] = {};
     uint32_t srgbMask = 0;
     for (uint32_t i = 0; i < numRt; i++) {
@@ -1877,8 +1927,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
              {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
               uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
-        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, chip().instrCacheSize), address);
-        if (s.k.numImmediates != 0) {
+        if (!skipProg) loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, chip().instrCacheSize), address);
+        if (s.k.numImmediates != 0 && !skipProg) {
             std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
             imm.resize((imm.size() + 3) & ~size_t(3), 0);
             loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
@@ -1932,7 +1982,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // SB6_FS_TEX as ST6_SHADER (16 bytes a unit), their pointer, the textures as ST6_CONSTANTS (64), their pointer, the
     // count; SP_FS_TEX_COUNT 0 without textures, so that no earlier owner's count is left (the register is context state).
     // SP_FS_CONFIG's NTEX and NSAMP (step 9) stay ir3's num_samp, as compute leaves SP_CS_CONFIG's.
-    if (o.fsTextures) {
+    if (o.fsTextures && !skipFsTex) {
         if (fsTex.numTex != 0) {
             uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_FS_TEX, fsTex.numSamp), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kFsTexSampAt)),
                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kFsTexSampAt) >> 32))};
@@ -2279,6 +2329,20 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (whole) {
         passTail(stream, table, o, pass.depth != nullptr);
     }
+    if (cache != nullptr) {
+        // (ws-hm-drawcpu) what this draw leaves loaded, for the next
+        const bool progIn = o.programVs && o.programFs && vsProgram != 0 && fsProgram != 0;
+        cache->vsProgram = progIn ? vsProgram : 0;
+        cache->fsProgram = progIn ? fsProgram : 0;
+        cache->fsTexKnown = o.fsTextures && fsTex.numTex <= DrawCache::kSlots && fsTex.numSamp <= DrawCache::kSlots;
+        if (cache->fsTexKnown && !skipFsTex) {
+            cache->fsNumTex = fsTex.numTex;
+            cache->fsNumSamp = fsTex.numSamp;
+            memcpy(cache->fsTexWords, fsTex.texWords, 64ull * fsTex.numTex);
+            memcpy(cache->fsSampWords, fsTex.sampWords, 16ull * fsTex.numSamp);
+        }
+        cache->valid = true;
+    }
     return true;
 }
 }  // namespace
@@ -2291,8 +2355,9 @@ bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass,
 
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                   const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
-                  const Options& o, const GmemPlan* gmem, bool afterFetch) {
-    return encodeDraw(stream, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, tableCpu, why, o, false, gmem, afterFetch);
+                  const Options& o, const GmemPlan* gmem, bool afterFetch, DrawCache* cache, const TableTaker* taker) {
+    return encodeDraw(stream, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, tableCpu, why, o, false, gmem, afterFetch, cache,
+                      taker);
 }
 
 bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, uint32_t skipClears) {
@@ -3017,6 +3082,25 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     }
     return forgot;
 }
+
+namespace render {
+namespace {
+uint32_t parseDrawSkip() {
+    const char* e = getenv("HM_DRAW_SKIP");
+    if (e == nullptr || e[0] == 0 || strcmp(e, "0") == 0) return 0;
+    if (strcmp(e, "all") == 0 || strcmp(e, "1") == 0) return kSkipAll;
+    uint32_t m = 0;
+    if (strstr(e, "prog") != nullptr) m |= kSkipProgram;
+    if (strstr(e, "tex") != nullptr) m |= kSkipTextures;
+    if (strstr(e, "table") != nullptr) m |= kSkipTable;
+    return m;
+}
+std::atomic<uint32_t> gDrawSkip{parseDrawSkip()};
+}  // namespace
+
+uint32_t drawSkip() { return gDrawSkip.load(std::memory_order_relaxed); }
+void reloadDrawSkipForTesting() { gDrawSkip.store(parseDrawSkip()); }
+}  // namespace render
 
 // (redfin hmv4) The extended-range colour attachments of a pass (HM_XR_RT=1): each replaced by its RGBA16Float companion
 // (Texture::xrTarget), whose texels the pass loads decoded from the surface when it loads and the companion is not live.
@@ -3870,8 +3954,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     if (fsProgram == 0) {
         return fail(std::string("no memory for the fragment program: ") + why);
     }
+    // (ws-hm-drawcpu) HM_DRAW_SKIP=table: a sysmem draw's table is taken by the encoder once it knows the parts it uses
+    const uint32_t skip = render::drawSkip();
     Piece table;
-    if (!piece(render::kTableBytes, &table, &why)) {
+    if (!(skip & render::kSkipTable) && !piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the draw's table: ") + why);
     }
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
@@ -4105,6 +4191,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         stream_.truncate(open_->df.start);
         open_->regs = open_->df.regs;
         open_->staticKey = open_->df.staticKey;
+        open_->cache = open_->df.cache;   // (ws-hm-drawcpu)
         open_->lastFetched = open_->df.lastFetched;
         open_->draws--;
         counts_.draws--;
@@ -4120,6 +4207,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
     // deduplication forget what the registers hold (staticKey emptied then).
     std::vector<uint8_t> staticKey;
+    bool staticSame = false;   // (ws-hm-drawcpu)
     if (options.dedupRegs) {
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
@@ -4130,6 +4218,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         add(program.moreBlend, sizeof program.moreBlend);
         add(&encodeOptions, sizeof encodeOptions);
         if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey) {
+            staticSame = true;
             encodeOptions.zsNone = encodeOptions.mrt = encodeOptions.msaaOff = encodeOptions.renderCntl = encodeOptions.lrzOff = false;
             encodeOptions.vpc = encodeOptions.fsInputs = encodeOptions.fsOutputs = false;
         }
@@ -4137,8 +4226,39 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
-    if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
-                              gmem ? &plan : nullptr, joins && (open_->lastFetched || render::fetchOrderMode() >= 2))) {
+    // (ws-hm-drawcpu) HM_DRAW_SKIP: in a sysmem pass going on with the same program (staticKey), what the last draw left
+    // loaded; in any other pass, or HM_DRAW_SKIP=table there, the whole table as before
+    render::DrawCache nextCache;
+    render::DrawCache* cache = nullptr;
+    if ((skip & (render::kSkipProgram | render::kSkipTextures)) && !gmem && !dual && options.dedupRegs) {
+        if (joins && staticSame && !open_->gmem && !open_->dual) nextCache = open_->cache;
+        if (!(skip & render::kSkipProgram)) nextCache.vsProgram = nextCache.fsProgram = 0;
+        if (!(skip & render::kSkipTextures)) nextCache.fsTexKnown = false;
+        cache = &nextCache;
+    }
+    struct TakeCtx {
+        CommandBuffer* cb;
+        Piece* piece;
+    } takeCtx{this, &table};
+    const render::TableTaker taker{[](void* c, uint32_t lo, uint32_t hi, uint64_t* gpu, uint8_t** cpu, std::string* w) {
+                                       TakeCtx* x = static_cast<TakeCtx*>(c);
+                                       if (!x->cb->piece(hi - lo, x->piece, w)) {
+                                           *w = "no memory for the draw's table: " + *w;
+                                           return false;
+                                       }
+                                       *gpu = x->piece->gpuAddress();
+                                       *cpu = x->piece->contents();
+                                       return true;
+                                   },
+                                   &takeCtx};
+    const bool compact = (skip & render::kSkipTable) && !gmem && !dual;
+    if ((skip & render::kSkipTable) && !compact && !piece(render::kTableBytes, &table, &why)) {
+        gmemClears_ = 0;
+        return fail(std::string("no memory for the draw's table: ") + why);
+    }
+    if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, compact ? 0 : table.gpuAddress(), compact ? nullptr : table.contents(),
+                              &why, encodeOptions, gmem ? &plan : nullptr, joins && (open_->lastFetched || render::fetchOrderMode() >= 2), cache,
+                              compact ? &taker : nullptr)) {
         gmemClears_ = 0;
         return refuseWork(why);
     }
@@ -4286,15 +4406,18 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         open_->df.start = stream_.size();
         open_->df.regs = open_->regs;
         open_->df.staticKey = open_->staticKey;
+        open_->df.cache = open_->cache;   // (ws-hm-drawcpu)
         open_->df.lastFetched = open_->lastFetched;
     }
     if (options.dedupRegs && open_->options.dedupRegs) {
         bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
         if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
         open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
+        open_->cache = (cache != nullptr && !forgot) ? nextCache : render::DrawCache{};   // (ws-hm-drawcpu)
     } else {
         appendStream(into, body);
         if (open_->dual) appendStream(open_->sysStream, bodySys);
+        open_->cache = render::DrawCache{};   // (ws-hm-drawcpu)
     }
     if (open_->cullOk && &into == &stream_) {
         // (ws-hm-cull) HM_CULL: this draw noted, with where its draw packets are (before any stamp after it)
