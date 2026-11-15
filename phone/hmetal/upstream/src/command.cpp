@@ -541,6 +541,48 @@ std::vector<CommandBuffer::DrawTime> CommandBuffer::drawTimes() const {
     return out;
 }
 
+// (redfin hm-trace) HM_TRACE_DRAW_TS: CP_EVENT_WRITE RB_DONE_TS with the TIMESTAMP bit, 64 bits of the GPU's always-on
+// counter (19.2 MHz) at SLOT once everything before it has left the render backend. The address is a trace buffer's that
+// no CP_WAIT_* polls (the bit is what made the dispatch tail's seqno polls spin, 28 October: never on those).
+void CommandBuffer::traceStamp(uint32_t slot) {
+    if (traceStamps_ == nullptr) {
+        std::string why;
+        traceStamps_ = queue_.takeBuffer(8 * kMaxTraceDraws, &why);
+        if (traceStamps_ == nullptr) {
+            traceDrawMode_ = traceDrawMode_ != 0 ? 1 : 0;
+            return;
+        }
+        memset(traceStamps_->contents(), 0, 8 * kMaxTraceDraws);
+        keep(traceStamps_);
+    }
+    const uint64_t at = traceStamps_->gpuAddress() + 8ull * slot;
+    const uint32_t w[4] = {a6xx::CP_EVENT_WRITE_0_EVENT(a6xx::RB_DONE_TS) | a6xx::CP_EVENT_WRITE_0_TIMESTAMP, uint32_t(at), uint32_t(at >> 32), 0};
+    const size_t before = stream_.size();
+    stream_.packet(a6xx::CP_EVENT_WRITE, w, 4);
+    carryKeep(before);   // (a timestamp changes no register)
+    use(*traceStamps_, true);
+}
+
+std::vector<CommandBuffer::TraceDraw> CommandBuffer::traceDraws() const {
+    std::vector<TraceDraw> out = traceDraws_;
+    const uint64_t* ts = traceStamps_ != nullptr ? static_cast<const uint64_t*>(traceStamps_->contents()) : nullptr;
+    const uint64_t* ps = profileStamps_ != nullptr ? static_cast<const uint64_t*>(profileStamps_->contents()) : nullptr;
+    uint64_t prev = 0;
+    uint32_t prevPass = 0xfffffffeu;
+    for (size_t i = 0; i < out.size(); i++) {
+        TraceDraw& t = out[i];
+        if (t.pass != prevPass) {   // a pass's first draw counts from the pass's start stamp (after the wait for idle before it)
+            prev = ps != nullptr && t.pass < profiled_.size() ? ps[2 * t.pass] : 0;
+            prevPass = t.pass;
+        }
+        if (!t.stamped || ts == nullptr) continue;
+        const uint64_t now = ts[i];
+        if (now != 0 && prev != 0 && now >= prev) t.gpuUs = double(now - prev) / 19.2;
+        if (now != 0) prev = now;
+    }
+    return out;
+}
+
 std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
     std::vector<PassTime> out = profiled_;
     if (profileStamps_ == nullptr) return {};
@@ -591,6 +633,7 @@ CommandBuffer::~CommandBuffer() {
     if (finished_) {
         queue_.giveBuffer(std::move(profileStamps_));
         queue_.giveBuffer(std::move(drawStamps_));
+        queue_.giveBuffer(std::move(traceStamps_));   // (redfin hm-trace)
     }
 }
 

@@ -24,6 +24,7 @@
 #include "hakios-metal/metallib.hpp"
 #include "../tests/fixtures/null_fs_bc.hpp"
 #include "hakios-metal/texture.hpp"
+#include "hakios-metal/trace.hpp"   // (redfin hm-trace)
 
 using namespace hakios::metal;
 
@@ -130,6 +131,7 @@ struct hakios_metal_cb {
     uint32_t threadgroupLength = 0;   // hakios_metal_cb_set_threadgroup_length's, for the dispatches that follow
     std::shared_ptr<Buffer> indirect;  // hakios_metal_cb_set_indirect's, for the next draw alone
     std::vector<CommandBuffer::DrawTime> drawTimes;   // hakios_metal_cb_draw_time's, read at its first call (I 0)
+    std::vector<CommandBuffer::TraceDraw> traceDraws; // (redfin hm-trace) hakios_metal_cb_trace_draw's, read at I 0
     uint64_t indirectOffset = 0;
     std::shared_ptr<Deferrer> deferrer;   // the queue's, when it records deferred
     std::atomic<int> pending{0};          // jobs posted for this buffer and not yet done
@@ -300,6 +302,17 @@ void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hit
 }
 
 void hakios_metal_compile_background(int on) { setCompileBackground(on != 0); }
+
+void hakios_metal_trace_set_sink(hakios_metal_trace_sink sink, void* ctx) {   // (redfin hm-trace)
+    hakios::trace::state().ctx.store(ctx);
+    hakios::trace::state().sink.store(sink, std::memory_order_release);
+}
+int64_t hakios_metal_trace_now_ns(void) { return hakios::trace::nowNs(); }
+void hakios_metal_cache_totals(unsigned long long out[12]) {
+    uint64_t t[12];
+    cacheTotals(t);
+    for (int i = 0; i < 12; i++) out[i] = t[i];
+}
 
 unsigned hakios_metal_compile_stats_more(double* out, unsigned count) {
     const CompileStats s = compileStats();
@@ -627,10 +640,18 @@ hakios_metal_texture* hakios_metal_texture_new_levels(hakios_metal_device* d, un
     desc.height = height;
     desc.usage = usage;
     std::string why;
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace)
     std::shared_ptr<Texture> t = Texture::make(*d->gpu, desc, &why);
     if (t == nullptr) {
         failed(why);
         return nullptr;
+    }
+    if (hakios::trace::on()) {
+        const uint64_t bytes = t->buffer() != nullptr ? t->buffer()->length() : 0;
+        if (bytes >= hakios::trace::bigBytes() || (usage & 4u) != 0)   // (4: MTLTextureUsageRenderTarget)
+            hakios::trace::event((usage & 4u) != 0 ? "rt-new" : "texture-new",
+                                 std::to_string(width) + "x" + std::to_string(height) + " fmt " + std::to_string(pixelFormat) + " levels " + std::to_string(levels),
+                                 trT0, hakios::trace::nowNs() - trT0, bytes);
     }
     auto* r = new hakios_metal_texture;
     r->texture = std::move(t);
@@ -824,10 +845,14 @@ int hakios_metal_texture_replace(hakios_metal_texture* t, unsigned x, unsigned y
 int hakios_metal_texture_replace_level(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned w, unsigned h, const void* bytes,
                                        uint64_t bytesPerRow) {
     std::string why;
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace)
     if (!t->texture->replace(level, x, y, w, h, bytes, bytesPerRow, &why)) {
         failed(why);
         return -1;
     }
+    if (hakios::trace::on() && uint64_t(h) * bytesPerRow >= hakios::trace::bigBytes())
+        hakios::trace::event("upload", std::to_string(w) + "x" + std::to_string(h) + " level " + std::to_string(level), trT0, hakios::trace::nowNs() - trT0,
+                             uint64_t(h) * bytesPerRow);
     return 0;
 }
 
@@ -1055,6 +1080,32 @@ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb* cb, int on) {
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setNullFsTextures(on != 0); });
     cb->cb->setNullFsTextures(on != 0);
+}
+
+void hakios_metal_cb_set_trace_draws(hakios_metal_cb* cb, int mode) {   // (redfin hm-trace)
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, mode] { cb->cb->setTraceDraws(mode); });
+    cb->cb->setTraceDraws(mode);
+}
+
+void hakios_metal_cb_trace_draw_cpu(hakios_metal_cb* cb, double us) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, us] { cb->cb->traceDrawCpu(us); });
+    cb->cb->traceDrawCpu(us);
+}
+
+int hakios_metal_cb_trace_draw(hakios_metal_cb* cb, unsigned i, const char** name, unsigned* fsWords, unsigned* pass, unsigned area[4], int* gmem,
+                               double* gpuUs, double* cpuUs) {
+    syncOne(cb);
+    if (cb->traceDraws.empty() || i == 0) cb->traceDraws = cb->cb->traceDraws();
+    if (i >= cb->traceDraws.size()) return i == 0 ? 0 : -1;
+    const CommandBuffer::TraceDraw& t = cb->traceDraws[i];
+    if (name) *name = t.name.c_str();
+    if (fsWords) *fsWords = t.fsWords;
+    if (pass) *pass = t.pass;
+    for (int k = 0; area != nullptr && k < 4; k++) area[k] = t.area[k];
+    if (gmem) *gmem = t.gmem ? 1 : 0;
+    if (gpuUs) *gpuUs = t.gpuUs;
+    if (cpuUs) *cpuUs = t.cpuUs;
+    return int(cb->traceDraws.size());
 }
 
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb* cb, int on) {
@@ -1285,6 +1336,16 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
                                                                  const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
                                                                  unsigned colorPixelFormat) {
     std::string why;
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace) the whole program: its stages (each an event too) and the link
+    struct TraceLink {
+        int64_t t0;
+        hakios_metal_program** made;
+        ~TraceLink() {
+            if (hakios::trace::on()) hakios::trace::event("program-new", *made != nullptr ? hakios_metal_program_name(*made) : "(refused)", t0, hakios::trace::nowNs() - t0, 0);
+        }
+    };
+    hakios_metal_program* trMade = nullptr;
+    TraceLink trLink{trT0, &trMade};
     std::unique_ptr<CompiledStage> vs = compileStage(vsBitcode, vsSize, &why, constantsOf(vsConstants, vsCount));
     if (vs == nullptr) {
         failed(why);
@@ -1304,7 +1365,8 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
         failed(why);
         return nullptr;
     }
-    return programOf(std::move(vs), std::move(fs), colorPixelFormat);
+    trMade = programOf(std::move(vs), std::move(fs), colorPixelFormat);   // (redfin hm-trace)
+    return trMade;
 }
 
 hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
@@ -1318,6 +1380,15 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     known.binding = binding;
     known.bytes.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + length);
     const Program& was = base->program->program;
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace)
+    struct TraceSpec {
+        int64_t t0;
+        hakios_metal_program* base;
+        size_t length;
+        ~TraceSpec() {
+            if (hakios::trace::on()) hakios::trace::event("program-specialise", hakios_metal_program_name(base), t0, hakios::trace::nowNs() - t0, length);
+        }
+    } trSpec{trT0, base, length};
     std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known);
     if (fs == nullptr) {
         failed(why);
@@ -1361,6 +1432,16 @@ int hakios_metal_known_read_mask(const void* fsBitcode, size_t fsSize, const hak
         failed(why);
         return -1;
     }
+    for (size_t i = 0; i < length; i++) mask[i] = i < m.size() ? m[i] : 1;
+    return n;
+}
+
+int hakios_metal_known_read_mask_cached(const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
+                                        unsigned binding, unsigned char* mask, size_t length) {   // (redfin hm-trace)
+    if (fsBitcode == nullptr || fsSize == 0 || mask == nullptr) return -2;
+    std::vector<uint8_t> m;
+    const int n = knownReadMaskCached(fsBitcode, fsSize, constantsOf(fsConstants, fsCount), binding, length, &m);
+    if (n < 0) return -2;
     for (size_t i = 0; i < length; i++) mask[i] = i < m.size() ? m[i] : 1;
     return n;
 }

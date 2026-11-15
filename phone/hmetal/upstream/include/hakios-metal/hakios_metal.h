@@ -100,6 +100,19 @@ void hakios_metal_compile_background(int on);
  * end's ms, [2] the known buffer's folding's ms (specialisations), [3] hits from the process's memo, [4] hits from a
  * seed directory, [5] hits in all, [6] misses (compiled); the number filled is returned */
 unsigned hakios_metal_compile_stats_more(double *out, unsigned count);
+/* (redfin hm-trace) HM_TRACE's first-use events: the core calls SINK (from whatever thread did the work) for each stage
+ * compiled or read from the disk cache or a seed, read mask taken or read back, program linked or specialised, GEM
+ * object of HM_TRACE_ALLOC_KB (64) KB or more made, IOSurface mapped, texture made and upload of that size: its kind,
+ * a name, when it began and how long it took (hakios_metal_trace_now_ns's clock), and its bytes. NULL: none (the
+ * default; every site is then one load). */
+typedef void (*hakios_metal_trace_sink)(const char *kind, const char *what, int64_t start_ns, int64_t dur_ns,
+    unsigned long long bytes, void *ctx);
+void hakios_metal_trace_set_sink(hakios_metal_trace_sink sink, void *ctx);
+int64_t hakios_metal_trace_now_ns(void);
+/* (redfin hm-trace) the process's stage-cache counts since it started (all threads): [0] stages and kernels compiled,
+ * [1] their ns, [2] read from the writable disk cache, [3] their ns, [4] read from a seed, [5] their ns, [6] memo hits,
+ * [7] read masks translated, [8] their ns, [9] read masks read from disk, [10] masks written, [11] stages written */
+void hakios_metal_cache_totals(unsigned long long out[12]);
 /* (redfin hm-cache) the text the stage cache's key starts from: "hm-stage-format N mesa ..." (HM_CACHE_KEY=format,
  * the default) or the build's hash (HM_CACHE_KEY=build) */
 const char *hakios_metal_cache_key(void);
@@ -357,6 +370,11 @@ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base
  * leave it out and its value may be given as 0. Translates the function once (kept in the front-end memo, HM_FE_MEMO). */
 int hakios_metal_known_read_mask(const void *fs_bitcode, size_t fs_size, const hakios_metal_constant *fs_constants,
     unsigned fs_count, unsigned binding, unsigned char *mask, size_t length);
+/* (redfin hm-trace) HM_SPEC_MASK_DISK=1 (default): the same mask as a hakios_metal_known_read_mask of an earlier process
+ * (or this one) filed in the stage cache, read back without translating anything: the count, or -2 when it is on no
+ * disk (then hakios_metal_known_read_mask takes it, and files it) */
+int hakios_metal_known_read_mask_cached(const void *fs_bitcode, size_t fs_size, const hakios_metal_constant *fs_constants,
+    unsigned fs_count, unsigned binding, unsigned char *mask, size_t length);
 /* (redfin hm-int4) this process's GPU memory in bytes: [0] the app's buffers, [1] textures, [2] the queues' pieces and slabs
  * (held or in their reuse pools), [3] program words, [4] private memory (spills), [5] tables (VSC, kernel tables), [6] of [2]
  * the reuse pools' free bytes, [7] every GEM object the process made (the rest of it: command streams). And the queues'
@@ -579,6 +597,17 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
  * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);
+/* (redfin hm-trace) HM_TRACE=2: this buffer's draws named for the trace (MODE 1: nothing else changes) or also stamped
+ * by the GPU after each (MODE 2: a CP_EVENT_WRITE RB_DONE_TS with the TIMESTAMP bit, no wait for idle; sysmem passes
+ * only). After completion, draw I: its program's name, fragment words, its pass among the pass times (0xffffffff: none),
+ * where it lies (x, y, w, h), whether its pass ran in GMEM, and the GPU microseconds it added at the end of the pipe
+ * (< 0: not stamped). Returns how many draws were recorded, -1 past the end. */
+void hakios_metal_cb_set_trace_draws(hakios_metal_cb *cb, int mode);
+int hakios_metal_cb_trace_draw(hakios_metal_cb *cb, unsigned i, const char **name, unsigned *fs_words, unsigned *pass,
+    unsigned area[4], int *gmem, double *gpu_us, double *cpu_us);
+/* the caller's CPU microseconds for the draw it just recorded (kept with the draw when it has none yet; in order with
+ * the draws when the queue records deferred) */
+void hakios_metal_cb_trace_draw_cpu(hakios_metal_cb *cb, double us);
 int hakios_metal_cb_draw_time(hakios_metal_cb *cb, unsigned i, const char **name, double *us);
 /* draw I's pass (an index of hakios_metal_cb_pass_time's) and the pixels it can touch, X0 Y0 X1 Y1; -1 past them */
 int hakios_metal_cb_draw_place(hakios_metal_cb *cb, unsigned i, unsigned *pass, unsigned area[4]);

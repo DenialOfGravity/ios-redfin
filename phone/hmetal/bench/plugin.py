@@ -3543,6 +3543,679 @@ HM_B3A8_EDITS = [
 EDITS += HM_B3A8_EDITS   # (ws-hm-alib) HM_CA_B3A8
 
 
+# ---- (redfin hm-trace) HM_TRACE=1/2: per command buffer and per draw trace, first-use events, hitches -------------------
+# HM_TRACE=1 (on top of hmv4's HM_TRACE=1 lines, unchanged): every command buffer's record in an in-memory ring
+# (HM_TRACE_RING_KB, default 4096, two halves: the older half dropped when the newer fills), written to
+# HM_TRACE_DIR (default /var/local/hmetal/trace, else DARWIN_USER_TEMP_DIR) as NAME-PID-SEQ.hmt when the trigger file
+# (HM_TRACE_TRIGGER, default /var/local/hmetal/ca/trace-go) changes its mtime, and appended to NAME-PID.hmt every
+# HM_TRACE_FLUSH_S seconds when that is set (default 0: on the trigger alone). A record ("C" line): made, slot wait,
+# made->commit, the -commit call, commit->completed, GPU ns, passes/draws/dispatches/copies, the CPU ns and calls of each
+# entry-point group (pass: encoder creation and endEncoding; pso: pipeline / depth-stencil state; bind: buffers, bytes,
+# textures, samplers; state: viewport, scissor, cull...; draw; blit; compute; commit; present; wait: waitUntil*), the
+# ms blocked (slot wait + waitUntil* on this thread + the compiler lock) and compiling; each pass's GPU time from the
+# pass stamps ("P"); the core's first-use events ("E": stage compiled / from disk / from a seed, read mask, program
+# made / specialised, GEM objects of HM_TRACE_ALLOC_KB (64) KB and up, IOSurface maps, textures, uploads, pipeline
+# states); and a "H" hitch line (also in the process log, at most 20 per 10 s) for a buffer whose made->commit passes
+# HM_TRACE_HITCH_ENC_MS (11) or commit->completed HM_TRACE_HITCH_GPU_MS (22), naming the events inside it.
+# HM_TRACE=2 adds a "D" line per draw (program, fragment words, pass, area, CPU us of the whole draw call) and, with
+# HM_TRACE_DRAW_TS=1, the GPU us each sysmem draw added (an RB_DONE_TS timestamp after it, no wait for idle: see the
+# core's CommandBuffer::traceStamp; NOT yet run on the phone, so 0 by default: then per-pass GPU only).
+# tools-claude/hm-trace.py reads the files.
+HMT_HELPERS = r'''/* ---- (redfin hm-trace) HM_TRACE=1/2 (bench/plugin.py "hm-trace"): records, first-use events, hitches ---- */
+enum { HMT_PASS, HMT_PSO, HMT_BIND, HMT_STATE, HMT_DRAW, HMT_BLIT, HMT_COMPUTE, HMT_COMMIT, HMT_PRESENT, HMT_WAIT, HMT_GROUPS };
+static const char *const hmt_group_name[HMT_GROUPS] = { "pass", "pso", "bind", "state", "draw", "blit", "compute", "commit", "present", "wait" };
+
+static int
+hmt_env_int(const char *name, int fallback)
+{
+	const char *e = getenv(name);
+	return e != NULL && e[0] != 0 ? atoi(e) : fallback;
+}
+
+static int
+hmt_level(void)
+{
+	static int level = -1;
+
+	if (level < 0) level = hmt_env_int("HM_TRACE", 0) < 0 ? 0 : hmt_env_int("HM_TRACE", 0);
+	return level;
+}
+
+static inline int64_t hmt_now(void) { return hakios_metal_trace_now_ns(); }
+
+struct hmt_buf { char *p; size_t n, cap; };
+
+static void
+hmt_buf_add(struct hmt_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void
+hmt_buf_add(struct hmt_buf *b, const char *fmt, ...)
+{
+	va_list ap;
+
+	for (int tries = 0; tries < 2; tries++) {
+		const size_t room = b->cap - b->n;
+		int k;
+
+		va_start(ap, fmt);
+		k = vsnprintf(b->p != NULL ? b->p + b->n : NULL, b->p != NULL ? room : 0, fmt, ap);
+		va_end(ap);
+		if (k < 0) return;
+		if (b->p != NULL && (size_t)k < room) {
+			b->n += (size_t)k;
+			return;
+		}
+		size_t cap = b->cap ? b->cap : 1024;
+		while (cap - b->n <= (size_t)k) cap *= 2;
+		char *q = realloc(b->p, cap);
+		if (q == NULL) return;
+		b->p = q, b->cap = cap;
+	}
+}
+
+/* a command buffer's record (HakiosMetalCommandBuffer's _hmt): written by the thread encoding it, then by the commit
+ * and the completion; emitted by whichever of those two comes second (gates), freed with the buffer */
+struct hmt_cb {
+	hakios_metal_cb *cb;
+	unsigned long long id, frameNo;
+	int64_t began, made, firstEnc, commitAt, doneAt, gpuNs;
+	int64_t ns[HMT_GROUPS];
+	unsigned n[HMT_GROUPS];
+	double blockedMs, compileWaitMs, compileMs;
+	unsigned passes, draws, dispatches, copies, clears;
+	int frame, gates, status;
+	struct hmt_buf tail;   /* its P and D lines, made at completion */
+};
+
+static int64_t hmt_t0;
+static unsigned long long hmt_ids, hmt_frames;
+static __thread int hmt_depth;
+static __thread double hmt_tl_blocked;   /* ms this thread waited (waitUntil*) not yet given to a record */
+
+/* the ring: two halves of HM_TRACE_RING_KB / 2 */
+static struct {
+	pthread_mutex_t lock;
+	char *cur, *prev;
+	size_t curN, prevN, cap;
+	unsigned long long dropped;
+	long trigMtime;
+	int trigSeen;
+	int64_t lastCheck, lastFlush;
+	unsigned seq;
+	dispatch_queue_t writer;
+} hmt_ring = { PTHREAD_MUTEX_INITIALIZER };
+
+/* recent first-use events, for the hitch lines */
+#define HMT_EV_N 512
+static struct {
+	pthread_mutex_t lock;
+	unsigned next;
+	struct { int64_t start, dur; unsigned long long bytes; char kind[24]; char what[72]; } ev[HMT_EV_N];
+} hmt_ev = { PTHREAD_MUTEX_INITIALIZER };
+
+static void
+hmt_ring_add(const char *s, size_t n)
+{
+	if (n == 0) return;
+	pthread_mutex_lock(&hmt_ring.lock);
+	if (hmt_ring.cap == 0) {
+		hmt_ring.cap = (size_t)(hmt_env_int("HM_TRACE_RING_KB", 4096) < 64 ? 64 : hmt_env_int("HM_TRACE_RING_KB", 4096)) * 512;
+	}
+	if (hmt_ring.cur == NULL) hmt_ring.cur = malloc(hmt_ring.cap), hmt_ring.curN = 0;
+	if (hmt_ring.cur != NULL && hmt_ring.curN + n > hmt_ring.cap) {
+		if (hmt_ring.prev != NULL) hmt_ring.dropped += hmt_ring.prevN;
+		free(hmt_ring.prev);
+		hmt_ring.prev = hmt_ring.cur, hmt_ring.prevN = hmt_ring.curN;
+		hmt_ring.cur = malloc(hmt_ring.cap), hmt_ring.curN = 0;
+	}
+	if (hmt_ring.cur != NULL && n <= hmt_ring.cap) {
+		memcpy(hmt_ring.cur + hmt_ring.curN, s, n);
+		hmt_ring.curN += n;
+	}
+	pthread_mutex_unlock(&hmt_ring.lock);
+}
+
+static void
+hmt_dir(char *out, size_t size)
+{
+	const char *d = getenv("HM_TRACE_DIR");
+
+	snprintf(out, size, "%s", d != NULL && d[0] ? d : "/var/local/hmetal/trace");
+	mkdir(out, 0777);
+	if (access(out, W_OK) != 0) {
+		char tmp[PATH_MAX] = "";
+
+		if (confstr(_CS_DARWIN_USER_TEMP_DIR, tmp, sizeof(tmp)) > 0) snprintf(out, size, "%s", tmp);
+		else snprintf(out, size, "/tmp");
+	}
+}
+
+/* everything in the ring to a file (on the writer queue: no completion waits for the disk) */
+static void
+hmt_flush(int trigger)
+{
+	char *a, *b;
+	size_t an, bn;
+	unsigned long long dropped;
+	unsigned seq;
+
+	pthread_mutex_lock(&hmt_ring.lock);
+	a = hmt_ring.prev, an = hmt_ring.prevN;
+	b = hmt_ring.cur, bn = hmt_ring.curN;
+	dropped = hmt_ring.dropped;
+	hmt_ring.prev = NULL, hmt_ring.prevN = 0;
+	hmt_ring.cur = NULL, hmt_ring.curN = 0;
+	hmt_ring.dropped = 0;
+	seq = trigger ? ++hmt_ring.seq : 0;
+	if (hmt_ring.writer == NULL) hmt_ring.writer = dispatch_queue_create("hakios.trace.writer", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+	pthread_mutex_unlock(&hmt_ring.lock);
+	const int64_t clockNs = hmt_now();
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	dispatch_async(hmt_ring.writer, ^{
+		char dir[PATH_MAX], path[PATH_MAX];
+		int fd;
+
+		hmt_dir(dir, sizeof(dir));
+		if (seq != 0) snprintf(path, sizeof(path), "%s/%s-%d-%u.hmt", dir, getprogname(), getpid(), seq);
+		else snprintf(path, sizeof(path), "%s/%s-%d.hmt", dir, getprogname(), getpid());
+		fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			char head[512];
+			const int k = snprintf(head, sizeof(head), "# hm-trace 1 proc=%s pid=%d level=%d t0_ns=%lld clock_ns=%lld unix=%ld.%06d "
+					       "dropped_bytes=%llu groups=pass,pso,bind,state,draw,blit,compute,commit,present,wait\n",
+					       getprogname(), getpid(), hmt_level(), (long long)hmt_t0, (long long)clockNs, (long)tv.tv_sec,
+					       (int)tv.tv_usec, dropped);
+			write(fd, head, (size_t)k);
+			if (a != NULL) write(fd, a, an);
+			if (b != NULL) write(fd, b, bn);
+			close(fd);
+			hm_print("trace: %zu KB written to %s%s\n", (an + bn) / 1024, path, dropped ? " (older lines dropped: the ring was full)" : "");
+		} else {
+			hm_print("trace: could not write %s: %s\n", path, strerror(errno));
+		}
+		free(a);
+		free(b);
+	});
+}
+
+/* the trigger file and the period, looked at no more than every 250 ms */
+static void
+hmt_maybe_flush(void)
+{
+	const int64_t now = hmt_now();
+	struct stat st;
+	int go = 0;
+	long m = 0;
+
+	if (now - hmt_ring.lastCheck < 250000000ll) return;
+	hmt_ring.lastCheck = now;
+	{
+		const char *tr = getenv("HM_TRACE_TRIGGER");
+
+		if (stat(tr != NULL && tr[0] ? tr : "/var/local/hmetal/ca/trace-go", &st) == 0) {
+			m = (long)st.st_mtime * 1000 + (long)(st.st_mtimespec.tv_nsec / 1000000);
+		}
+	}
+	if (!hmt_ring.trigSeen) {
+		hmt_ring.trigSeen = 1;
+		hmt_ring.trigMtime = m;
+	} else if (m != hmt_ring.trigMtime) {
+		hmt_ring.trigMtime = m;
+		go = 1;
+	}
+	if (go) {
+		hmt_flush(1);
+		hmt_ring.lastFlush = now;
+		return;
+	}
+	const int every = hmt_env_int("HM_TRACE_FLUSH_S", 0);
+	if (every > 0 && now - hmt_ring.lastFlush >= (int64_t)every * 1000000000ll) {
+		hmt_ring.lastFlush = now;
+		hmt_flush(0);
+	}
+}
+
+static double hmt_us(int64_t ns) { return (double)ns / 1e3; }
+static double hmt_rel_us(int64_t at) { return at != 0 ? (double)(at - hmt_t0) / 1e3 : -1; }
+
+/* the core's first-use events (any thread), and the plug-in's own */
+static void
+hmt_sink(const char *kind, const char *what, int64_t start, int64_t dur, unsigned long long bytes, void *ctx)
+{
+	char line[400];
+	(void)ctx;
+
+	pthread_mutex_lock(&hmt_ev.lock);
+	{
+		typeof(hmt_ev.ev[0]) *e = &hmt_ev.ev[hmt_ev.next++ % HMT_EV_N];
+
+		e->start = start, e->dur = dur, e->bytes = bytes;
+		snprintf(e->kind, sizeof(e->kind), "%s", kind);
+		snprintf(e->what, sizeof(e->what), "%s", what);
+	}
+	pthread_mutex_unlock(&hmt_ev.lock);
+	const int k = snprintf(line, sizeof(line), "E %.0f %.0f %llu f=%llu %s %s\n", hmt_rel_us(start), hmt_us(dur), bytes,
+			       __atomic_load_n(&hmt_frames, __ATOMIC_RELAXED), kind, what);
+	if (k > 0) hmt_ring_add(line, (size_t)k < sizeof(line) ? (size_t)k : sizeof(line) - 1);
+}
+
+static void
+hmt_event(const char *kind, const char *what, int64_t start, int64_t dur, unsigned long long bytes)
+{
+	if (hmt_level() >= 1) hmt_sink(kind, what, start, dur, bytes, NULL);
+}
+
+/* (redfin hm-trace) the stage cache's counts at 60 s and 180 s after the device opened (whatever HM_TRACE says) */
+static volatile int hmt_prewarm_ran;
+static unsigned hmt_prewarm_n[5];
+
+static void
+hmt_cache_line(const char *when)
+{
+	unsigned long long t[12];
+
+	hakios_metal_cache_totals(t);
+	hm_print("hm-cache: at %s: stages %llu compiled (%.0f ms), %llu from the disk cache (%.0f ms), %llu from a seed (%.0f ms), "
+		 "%llu from the memo; %llu written; read masks %llu translated (%.0f ms), %llu from disk, %llu written; prewarm %s "
+		 "(%u manifests, %u present, %u made)\n", when, t[0], t[1] / 1e6, t[2], t[3] / 1e6, t[4], t[5] / 1e6, t[6], t[11],
+		 t[7], t[8] / 1e6, t[9], t[10], hmt_prewarm_ran ? "done" : "not run (yet)", hmt_prewarm_n[0], hmt_prewarm_n[1],
+		 hmt_prewarm_n[2]);
+}
+
+static void
+hmt_prewarm_note(const unsigned n[5])
+{
+	memcpy(hmt_prewarm_n, n, sizeof(hmt_prewarm_n));
+	hmt_prewarm_ran = 1;
+}
+
+/* once, when the device opens: the sink when HM_TRACE >= 1, and the cache lines */
+static void
+hmt_start(void)
+{
+	static int started;
+
+	if (__sync_lock_test_and_set(&started, 1)) return;
+	hmt_t0 = hmt_now();
+	if (hmt_level() >= 1) {
+		hakios_metal_trace_set_sink(hmt_sink, NULL);
+		hm_print("trace: HM_TRACE=%d (hm-trace): per-buffer records%s, first-use events, hitches past %d ms encode / %d ms GPU; "
+			 "ring %d KB, files in HM_TRACE_DIR on a touch of %s%s\n", hmt_level(),
+			 hmt_level() >= 2 ? (hmt_env_int("HM_TRACE_DRAW_TS", 0) ? " and draws (GPU-stamped: HM_TRACE_DRAW_TS=1)" : " and draws (no GPU stamps)") : "",
+			 hmt_env_int("HM_TRACE_HITCH_ENC_MS", 11), hmt_env_int("HM_TRACE_HITCH_GPU_MS", 22), hmt_env_int("HM_TRACE_RING_KB", 4096),
+			 getenv("HM_TRACE_TRIGGER") != NULL ? getenv("HM_TRACE_TRIGGER") : "/var/local/hmetal/ca/trace-go",
+			 hmt_env_int("HM_TRACE_FLUSH_S", 0) > 0 ? " and every HM_TRACE_FLUSH_S" : "");
+	}
+	if (hmt_env_int("HM_CACHE_LINE", 1)) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60ll * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ hmt_cache_line("60 s"); });
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 180ll * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ hmt_cache_line("180 s"); });
+	}
+}
+
+static struct hmt_cb *
+hmt_new(hakios_metal_cb *cb, double beganSecs, double madeSecs)
+{
+	struct hmt_cb *r;
+
+	if (hmt_level() < 1 || cb == NULL || (r = calloc(1, sizeof(*r))) == NULL) return NULL;
+	r->cb = cb;
+	r->id = __atomic_add_fetch(&hmt_ids, 1, __ATOMIC_RELAXED);
+	r->made = hmt_now();
+	r->began = r->made - (int64_t)((madeSecs - beganSecs) * 1e9);
+	r->blockedMs = (madeSecs - beganSecs) * 1e3;   /* the slot wait */
+	return r;
+}
+
+static void
+hmt_free(void *p)
+{
+	struct hmt_cb *r = p;
+
+	if (r == NULL) return;
+	free(r->tail.p);
+	free(r);
+}
+
+struct hmt_scope { struct hmt_cb *r; int g; int64_t t0; double w0, c0; };
+
+static inline struct hmt_scope
+hmt_enter(struct hmt_cb *r, int g)
+{
+	struct hmt_scope s = { NULL, -1, 0, 0, 0 };
+
+	if (r == NULL) return s;
+	s.g = g;
+	if (hmt_depth++ == 0) {
+		s.r = r;
+		s.t0 = hmt_now();
+		if (r->firstEnc == 0 && g != HMT_WAIT) r->firstEnc = s.t0;
+		if (hmt_tl_blocked != 0 && r->commitAt == 0 && g != HMT_WAIT) {   /* waits on this thread since the last record */
+			r->blockedMs += hmt_tl_blocked;
+			hmt_tl_blocked = 0;
+		}
+		if (g == HMT_DRAW || g == HMT_PSO || g == HMT_COMPUTE) {
+			unsigned h, m;
+
+			hakios_metal_compile_stats(&s.w0, &s.c0, &h, &m);
+		}
+	}
+	return s;
+}
+
+static inline void
+hmt_leave(struct hmt_scope *s)
+{
+	if (s->g < 0) return;
+	hmt_depth--;
+	if (s->r == NULL) return;
+	const int64_t d = hmt_now() - s->t0;
+	struct hmt_cb *r = s->r;
+
+	if (s->g == HMT_WAIT) {
+		hmt_tl_blocked += d / 1e6;
+		return;
+	}
+	r->ns[s->g] += d;
+	r->n[s->g]++;
+	if (s->g == HMT_DRAW || s->g == HMT_PSO || s->g == HMT_COMPUTE) {
+		double w = 0, c = 0;
+		unsigned h, m;
+
+		hakios_metal_compile_stats(&w, &c, &h, &m);
+		r->compileWaitMs += w - s->w0;
+		r->compileMs += c - s->c0;
+		r->blockedMs += w - s->w0;
+	}
+	if (s->g == HMT_DRAW && hmt_level() >= 2) hakios_metal_cb_trace_draw_cpu(r->cb, d / 1e3);
+}
+
+/* an entry point's scope: CBO the HakiosMetalCommandBuffer (an encoder's _commandBuffer, or self) */
+#define HMT(g, cbo) struct hmt_scope hmt_s_ __attribute__((cleanup(hmt_leave), unused)) = \
+	hmt_enter((cbo) != nil ? (struct hmt_cb *)((HakiosMetalCommandBuffer *)(cbo))->_hmt : NULL, (g))
+
+static void
+hmt_emit(struct hmt_cb *r)
+{
+	struct hmt_buf b = { NULL, 0, 0 };
+	const int64_t enc = r->commitAt > r->made ? r->commitAt - r->made : 0, c2d = r->doneAt > r->commitAt ? r->doneAt - r->commitAt : 0;
+	int64_t cpu = 0;
+
+	for (int g = 0; g < HMT_GROUPS; g++) cpu += g == HMT_WAIT ? 0 : r->ns[g];
+	hmt_buf_add(&b, "C %llu fr=%d f=%llu made=%.0f slot=%.0f enc=%.0f first=%.0f commit=%.0f c2d=%.0f gpu=%.0f st=%d passes=%u draws=%u "
+		    "disp=%u copies=%u clears=%u cpu=%.0f blk=%.0f cw=%.0f cc=%.0f", r->id, r->frame, r->frameNo, hmt_rel_us(r->made),
+		    hmt_us(r->made - r->began), hmt_us(enc), r->firstEnc ? hmt_us(r->firstEnc - r->made) : -1, hmt_us(r->ns[HMT_COMMIT]),
+		    hmt_us(c2d), hmt_us(r->gpuNs), r->status, r->passes, r->draws, r->dispatches, r->copies, r->clears, hmt_us(cpu),
+		    r->blockedMs * 1e3, r->compileWaitMs * 1e3, r->compileMs * 1e3);
+	for (int g = 0; g < HMT_GROUPS; g++) {
+		if (r->n[g] != 0) hmt_buf_add(&b, " %s=%.0f/%u", hmt_group_name[g], hmt_us(r->ns[g]), r->n[g]);
+	}
+	hmt_buf_add(&b, "\n");
+	if (r->tail.n != 0) hmt_buf_add(&b, "%.*s", (int)r->tail.n, r->tail.p);
+	/* a hitch: the first-use events inside the buffer's life */
+	if (enc / 1e6 > hmt_env_int("HM_TRACE_HITCH_ENC_MS", 11) || c2d / 1e6 > hmt_env_int("HM_TRACE_HITCH_GPU_MS", 22)) {
+		struct hmt_buf h = { NULL, 0, 0 };
+		unsigned found = 0;
+		static int64_t since;
+		static unsigned said;
+
+		hmt_buf_add(&h, "H %llu fr=%d f=%llu enc=%.1f c2d=%.1f gpu=%.1f blk=%.1f cc=%.1f events:", r->id, r->frame, r->frameNo, enc / 1e6,
+			    c2d / 1e6, r->gpuNs / 1e6, r->blockedMs, r->compileMs);
+		pthread_mutex_lock(&hmt_ev.lock);
+		for (unsigned i = 0; i < HMT_EV_N && i < hmt_ev.next; i++) {
+			const typeof(hmt_ev.ev[0]) *e = &hmt_ev.ev[(hmt_ev.next - 1 - i) % HMT_EV_N];
+
+			if (e->start + e->dur < r->began || e->start > (r->doneAt ? r->doneAt : hmt_now())) continue;
+			if (found++ < 24) hmt_buf_add(&h, " %s:%.1fms:%lluKB:%s", e->kind, e->dur / 1e6, e->bytes / 1024, e->what);
+		}
+		pthread_mutex_unlock(&hmt_ev.lock);
+		if (found == 0) hmt_buf_add(&h, " none (no first-use work: look at the groups, the passes and the GPU time)");
+		else if (found > 24) hmt_buf_add(&h, " (+%u more)", found - 24);
+		hmt_buf_add(&h, "\n");
+		hmt_buf_add(&b, "%.*s", (int)h.n, h.p);
+		{
+			const int64_t now = hmt_now();
+
+			if (now - since > 10000000000ll) since = now, said = 0;
+			if (said++ < 20) hm_print("trace: hitch %.*s", (int)h.n - 2, h.p + 2);
+		}
+		free(h.p);
+	}
+	hmt_ring_add(b.p, b.n);
+	free(b.p);
+	free(r->tail.p);
+	r->tail.p = NULL, r->tail.n = r->tail.cap = 0;
+	hmt_maybe_flush();
+}
+
+static void
+hmt_gate(struct hmt_cb *r)
+{
+	if (r != NULL && __atomic_add_fetch(&r->gates, 1, __ATOMIC_ACQ_REL) == 2) hmt_emit(r);
+}
+
+/* the commit call, timed; the record's first gate */
+static void
+hmt_commit_call(void *rp, hakios_metal_cb *cb, void (*done)(hakios_metal_cb *, void *), void *ctx)
+{
+	struct hmt_cb *r = rp;
+
+	if (r == NULL) {
+		hakios_metal_cb_commit(cb, done, ctx);
+		return;
+	}
+	const int64_t t0 = hmt_now();
+	hakios_metal_cb_commit(cb, done, ctx);
+	r->ns[HMT_COMMIT] += hmt_now() - t0;
+	r->n[HMT_COMMIT]++;
+	hmt_gate(r);
+}
+
+/* -commit: when, and whether it drew the display (a frame) */
+static void
+hmt_committed(void *rp, BOOL frame)
+{
+	struct hmt_cb *r = rp;
+
+	if (r == NULL) return;
+	r->commitAt = hmt_now();
+	r->frame = frame ? 1 : 0;
+	r->frameNo = frame ? __atomic_add_fetch(&hmt_frames, 1, __ATOMIC_RELAXED) : __atomic_load_n(&hmt_frames, __ATOMIC_RELAXED);
+}
+
+/* completed: the GPU's numbers, each pass's and (HM_TRACE=2) each draw's; the record's second gate */
+static void
+hmt_done(void *rp, hakios_metal_cb *cb)
+{
+	struct hmt_cb *r = rp;
+
+	if (r == NULL) return;
+	r->doneAt = hmt_now();
+	r->gpuNs = hakios_metal_cb_gpu_nanoseconds(cb);
+	r->status = (int)hakios_metal_cb_status(cb);
+	hakios_metal_cb_counts(cb, &r->passes, &r->draws, &r->dispatches, &r->copies, &r->clears);
+	{
+		unsigned kind = 0, w = 0, h = 0, draws = 0;
+		double us = 0;
+		const int n = hakios_metal_cb_pass_time(cb, 0, &kind, &w, &h, &draws, &us);
+
+		for (int i = 0; i < n; i++) {
+			if (i > 0 && hakios_metal_cb_pass_time(cb, (unsigned)i, &kind, &w, &h, &draws, &us) < 0) break;
+			hmt_buf_add(&r->tail, "P %llu %d %s %ux%u draws=%u gpu=%.1f\n", r->id, i,
+				    kind == 0 ? "draw" : kind == 1 ? "dispatch" : kind == 2 ? "copy" : "other", w, h, draws, us);
+		}
+	}
+	if (hmt_level() >= 2) {
+		const char *name = NULL;
+		unsigned fsw = 0, pass = 0, area[4] = { 0, 0, 0, 0 };
+		int gmem = 0;
+		double gus = -1, cus = -1;
+		const int n = hakios_metal_cb_trace_draw(cb, 0, &name, &fsw, &pass, area, &gmem, &gus, &cus);
+
+		for (int i = 0; i < n; i++) {
+			if (i > 0 && hakios_metal_cb_trace_draw(cb, (unsigned)i, &name, &fsw, &pass, area, &gmem, &gus, &cus) < 0) break;
+			hmt_buf_add(&r->tail, "D %llu %d pass=%d fsw=%u area=%u,%u,%u,%u gmem=%d cpu=%.1f gpu=%.1f %s\n", r->id, i,
+				    pass == 0xffffffffu ? -1 : (int)pass, fsw, area[0], area[1], area[2], area[3], gmem, cus, gus,
+				    name != NULL ? name : "?");
+		}
+	}
+	hmt_gate(r);
+}
+
+'''
+
+HMT_EDITS = [
+    # helpers before hmv4's HM_TRACE helpers (they use hm_print and hm_now, which are earlier)
+    ('/* (redfin hmv4) HM_TRACE=1: what the window server\'s hangs are made of, cheap enough to leave on.\n',
+     HMT_HELPERS + '/* (redfin hmv4) HM_TRACE=1: what the window server\'s hangs are made of, cheap enough to leave on.\n'),
+    # the record's pointer in the command buffer
+    ('\tdouble _hmCommitSecs;                    /* (redfin hmv4) HM_TRACE: the commit call\'s time */\n',
+     '\tdouble _hmCommitSecs;                    /* (redfin hmv4) HM_TRACE: the commit call\'s time */\n'
+     '\tvoid *_hmt;                              /* (redfin hm-trace) HM_TRACE\'s record (struct hmt_cb) */\n'),
+    # made: the record, the pass stamps on, the draws named
+    ('\thm_pf_made(hmPfBegan, hm_now());\n\tif (self == nil) {\n\t\treturn nil;\n\t}\n',
+     '\tconst double hmtMade = hm_now();   /* (redfin hm-trace) */\n'
+     '\thm_pf_made(hmPfBegan, hmtMade);\n\tif (self == nil) {\n\t\treturn nil;\n\t}\n'),
+    ('\t\thakios_metal_cb_set_profile(_cb, hm_fps_on());\n',
+     '\t\thakios_metal_cb_set_profile(_cb, hm_fps_on() || hmt_level() >= 1);   /* (redfin hm-trace) pass stamps for HM_TRACE too */\n'
+     '\t\tself->_hmt = hmt_new(_cb, hmPfBegan, hmtMade);\n'
+     '\t\tif (hmt_level() >= 2) hakios_metal_cb_set_trace_draws(_cb, hmt_env_int("HM_TRACE_DRAW_TS", 0) ? 2 : 1);\n'),
+    ('- (void)dealloc\n{\n\t[self hakiosPaySlot];\n\tif (_cb != NULL) {\n\t\thakios_metal_cb_free(_cb);',
+     '- (void)dealloc\n{\n\t[self hakiosPaySlot];\n\thmt_free(self->_hmt);   /* (redfin hm-trace) */\n\tself->_hmt = NULL;\n'
+     '\tif (_cb != NULL) {\n\t\thakios_metal_cb_free(_cb);'),
+    # committed
+    ('\t_committed = YES;\n\t_committedAt = hm_now();\n\thm_tr_committed(_committedAt - _createdAt);   /* (redfin hmv4) */\n',
+     '\t_committed = YES;\n\t_committedAt = hm_now();\n\thm_tr_committed(_committedAt - _createdAt);   /* (redfin hmv4) */\n'
+     '\thmt_committed(self->_hmt, _hmFrame);   /* (redfin hm-trace) */\n'),
+    ('\t\t\thakios_metal_cb_commit(_cb, hm_completed, self);\n\t\t\tdispatch_semaphore_signal(_sent);\n',
+     '\t\t\thmt_commit_call(self->_hmt, _cb, hm_completed, self);   /* (redfin hm-trace) */\n\t\t\tdispatch_semaphore_signal(_sent);\n'),
+    ('\t\thakios_metal_cb_commit(_cb, hm_completed, self);\n\t\tself->_hmCommitSecs = hm_now() - began;   /* (redfin hmv4) */\n',
+     '\t\thmt_commit_call(self->_hmt, _cb, hm_completed, self);   /* (redfin hm-trace) */\n\t\tself->_hmCommitSecs = hm_now() - began;   /* (redfin hmv4) */\n'),
+    # completed
+    ('\t\t     hm_now() - [self hakiosCreatedAt]);   /* (redfin hmv4) HM_TRACE */\n',
+     '\t\t     hm_now() - [self hakiosCreatedAt]);   /* (redfin hmv4) HM_TRACE */\n'
+     '\thmt_done(self->_hmt, cb);   /* (redfin hm-trace) */\n'),
+    # a pipeline state made (hmv4's measure: its ms, the compiler's share)
+    ('hm_tr_pipeline(NSString *label, double ms, double waitMs, double compileMs, unsigned compiled, unsigned cached)\n{\n',
+     'hm_tr_pipeline(NSString *label, double ms, double waitMs, double compileMs, unsigned compiled, unsigned cached)\n{\n'
+     '\tif (hmt_level() >= 1) {   /* (redfin hm-trace) */\n'
+     '\t\tchar what[200];\n\n'
+     '\t\tsnprintf(what, sizeof(what), "%s (%u compiled, %u cached, compiler wait %.0f ms)", label != nil ? [label UTF8String] : "(no label)",\n'
+     '\t\t\t compiled, cached, waitMs);\n'
+     '\t\thmt_event("pipeline-state", what, hmt_now() - (int64_t)(ms * 1e6), (int64_t)(ms * 1e6), 0);\n'
+     '\t}\n'),
+    # the device: the sink, the cache lines
+    ('\t\t _targetName);\n\treturn self;\n',
+     '\t\t _targetName);\n\thmt_start();   /* (redfin hm-trace) HM_TRACE\'s sink; the hm-cache lines at 60 s and 180 s */\n\treturn self;\n'),
+    # the pre-warm's counts for the cache line
+    ('\thakios_metal_cache_rewarm(hm_prewarm_busy, NULL, n);\n',
+     '\thakios_metal_cache_rewarm(hm_prewarm_busy, NULL, n);\n\thmt_prewarm_note(n);   /* (redfin hm-trace) */\n'),
+    # HM_SPEC_MASK_DISK: the read mask from the disk cache, at once, when an earlier process filed it
+    ('\tif (hm_spec_mask_on() && _specLength <= sizeof(_specMask)) {   /* (redfin hm-int4) HM_SPEC_MASK, on a utility queue */\n',
+     '\tint hmMaskDone = 0;\n\n'
+     '\tif (hm_spec_mask_on() && _specLength <= sizeof(_specMask)) {   /* (redfin hm-trace) HM_SPEC_MASK_DISK=1: filed by an earlier process */\n'
+     '\t\tunsigned char mask[256];\n'
+     '\t\tconst int64_t t0 = hmt_now();\n'
+     '\t\tconst int r = hakios_metal_known_read_mask_cached([_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,\n'
+     '\t\t\t\t\t\t\t       (unsigned)_specBinding, mask, _specLength);\n\n'
+     '\t\tif (r >= 0) {\n'
+     '\t\t\tif ((unsigned)r < _specLength) {\n'
+     '\t\t\t\tmemcpy(_specMask, mask, _specLength);\n'
+     '\t\t\t\t__atomic_store_n(&_specMaskRead, r, __ATOMIC_RELEASE);\n'
+     '\t\t\t}\n'
+     '\t\t\thmMaskDone = 1;\n'
+     '\t\t\thm_print("spec mask: %s reads %d of %u bytes of its buffer %d: from the disk cache in %.2f ms (HM_SPEC_MASK_DISK)\\n",\n'
+     '\t\t\t\t hakios_metal_program_name(_program), r, _specLength, _specBinding, (hmt_now() - t0) / 1e6);\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\tif (!hmMaskDone && hm_spec_mask_on() && _specLength <= sizeof(_specMask)) {   /* (redfin hm-int4) HM_SPEC_MASK, on a utility queue */\n'),
+]
+
+EDITS += HMT_EDITS   # (redfin hm-trace)
+
+# (redfin hm-trace) the entry points' scopes: "HMT(GROUP, CB);" as the first statement of each method named here (a
+# method whose body is on its header line is a one-line forward to one of these, and is left alone). In nested calls
+# only the outermost scope counts (drawPrimitives -> hakiosDraw: one draw).
+HMT_SCOPES = {
+    'HakiosMetalRenderCommandEncoder': ('_commandBuffer', [
+        ('HMT_PSO', ['setRenderPipelineState:', 'setDepthStencilState:']),
+        ('HMT_BIND', ['hakiosBind:', 'setVertexBuffer:', 'setFragmentBuffer:', 'setVertexBufferOffset:', 'setFragmentBufferOffset:',
+                      'setVertexBuffers:', 'setFragmentBuffers:', 'setVertexBytes:', 'setFragmentBytes:', 'hakiosSetTexture:',
+                      'hakiosSetSampler:', 'setVertexTextures:', 'setFragmentTextures:', 'setVertexSamplerStates:',
+                      'setFragmentSamplerStates:', 'setVertexSamplerState:', 'setFragmentSamplerState:', 'setFragmentTexture:',
+                      'setVertexTexture:']),
+        ('HMT_STATE', ['setViewport:', 'setViewports:', 'setScissorRect:', 'setScissorRects:', 'setCullMode:', 'setFrontFacingWinding:',
+                       'setTriangleFillMode:', 'setDepthClipMode:', 'setBlendColorRed:', 'setDepthBias:', 'setStencilReferenceValue:',
+                       'setStencilFrontReferenceValue:', 'setVisibilityResultMode:']),
+        ('HMT_DRAW', ['hakiosDraw:', 'hakiosDrawOnce:', 'drawPrimitives:', 'drawIndexedPrimitives:', 'drawPatches:', 'drawIndexedPatches:',
+                      'executeCommandsInBuffer:']),
+        ('HMT_PASS', ['endEncoding']),
+    ]),
+    'HakiosMetalBlitCommandEncoder': ('_commandBuffer', [
+        ('HMT_BLIT', ['copyFromBuffer:', 'copyFromTexture:', 'fillBuffer:', 'generateMipmapsForTexture:']),
+        ('HMT_PASS', ['endEncoding']),
+    ]),
+    'HakiosMetalComputeCommandEncoder': ('_commandBuffer', [
+        ('HMT_PSO', ['setComputePipelineState:']),
+        ('HMT_BIND', ['setBuffer:', 'setBufferOffset:', 'setBuffers:', 'setBytes:', 'setTexture:', 'setTextures:', 'setSamplerState:',
+                      'setSamplerStates:', 'setThreadgroupMemoryLength:']),
+        ('HMT_COMPUTE', ['dispatchThreadgroups:', 'hakiosDispatch:', 'dispatchThreads:', 'dispatchThreadgroupsWithIndirectBuffer:']),
+        ('HMT_PASS', ['endEncoding']),
+    ]),
+    'HakiosMetalCommandBuffer': ('self', [
+        ('HMT_PASS', ['renderCommandEncoderWithDescriptor:', 'blitCommandEncoder', 'blitCommandEncoderWithDescriptor:',
+                      'computeCommandEncoder', 'computeCommandEncoderWithDispatchType:', 'computeCommandEncoderWithDescriptor:',
+                      'parallelRenderCommandEncoderWithDescriptor:']),
+        ('HMT_PRESENT', ['presentDrawable:']),
+        ('HMT_WAIT', ['waitUntilScheduled', 'waitUntilCompleted']),
+    ]),
+}
+
+
+def hmt_scopes(src):
+    lines = src.split('\n')
+    out = []
+    cls = None
+    done = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        if line.startswith('@implementation '):
+            name = line.split()[1]
+            cls = name if name in HMT_SCOPES else None
+            continue
+        if line.startswith('@end'):
+            cls = None
+            continue
+        if cls is None or not line.startswith('- (') or '{' in line:
+            continue
+        sel = line.split(')', 1)[1].strip()
+        var, groups = HMT_SCOPES[cls]
+        group = None
+        for g, names in groups:
+            if any(sel == n or (n.endswith(':') and sel.startswith(n)) for n in names):
+                group = g
+                break
+        if group is None:
+            continue
+        # the body's opening brace alone on a line, after the header's continuation lines (none of which opens a body)
+        k = i
+        while k < len(lines) and k < i + 5 and lines[k] != '{' and '{' not in lines[k] and not lines[k].startswith('- ('):
+            k += 1
+        if k < len(lines) and lines[k] == '{':
+            out.extend(lines[i:k + 1])
+            out.append('\tHMT(%s, %s);   /* (redfin hm-trace) */' % (group, var))
+            done[(cls, group)] = done.get((cls, group), 0) + 1
+            i = k + 1
+    for cls, (var, groups) in HMT_SCOPES.items():
+        for g, names in groups:
+            if done.get((cls, g), 0) == 0:
+                sys.exit('plugin.py: hm-trace: no method of %s in %s' % (g, cls))
+    return '\n'.join(out), done
+
+
 def apply(src, edits=EDITS):
     for e in edits:
         if len(e) == 2:
@@ -3565,8 +4238,9 @@ def apply(src, edits=EDITS):
 
 def main():
     src = apply(open(sys.argv[1]).read())
+    src, scopes = hmt_scopes(src)   # (redfin hm-trace)
     open(sys.argv[2], 'w').write(src)
-    print('plugin.py: %d edits' % len(EDITS))
+    print('plugin.py: %d edits, %d hm-trace scopes' % (len(EDITS), sum(scopes.values())))
 
 
 if __name__ == '__main__':

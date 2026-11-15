@@ -7959,3 +7959,58 @@ TEST(int6_a_gmem_auto_pass_after_a_lazy_compressed_pass_is_fenced_on_both_sides)
     }
     if (gmemRounds == 0) std::printf("       (auto kept every round in sysmem here: the GMEM half not exercised)\n");
 }
+
+// (redfin hm-trace) HM_TRACE=2: mode 1 names each draw and changes nothing the GPU runs (the same words as untraced);
+// mode 2 adds one CP_EVENT_WRITE RB_DONE_TS with the TIMESTAMP bit after each sysmem draw, no wait for idle, and the
+// GPU time each draw added is read back from the stamps (the fake's timestamps step with its packets)
+TEST(a_traced_command_buffer_names_and_stamps_its_draws) {
+    Rig r;
+    auto t = target(r), u = target(r);
+    RenderPass a, b;
+    a.color0 = t.get();
+    b.color0 = u.get();
+    size_t plainWords = 0, namedWords = 0;
+    {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        plainWords = cb->streamWords();
+    }
+    {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setTraceDraws(1);
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        namedWords = cb->streamWords();
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto d = cb->traceDraws();
+        CHECK_EQ(d.size(), size_t(2));
+        for (const auto& x : d) CHECK(!x.stamped && x.gpuUs < 0 && x.pass == 0 && !x.name.empty() && x.area[2] > 0);
+    }
+    CHECK_EQ(namedWords, plainWords);
+    auto cb = r.queue->commandBuffer();
+    cb->setProfile(true);
+    cb->setGmem(false);   // (stamps in sysmem passes alone)
+    cb->setTraceDraws(2);
+    CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(cb->draw(flatProgram(), b, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(cb->streamWords() > plainWords);
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const auto d = cb->traceDraws();
+    CHECK_EQ(d.size(), size_t(3));
+    if (d.size() == 3) {
+        CHECK(d[0].stamped && d[1].stamped && d[2].stamped);
+        CHECK_EQ(d[0].pass, 0u);
+        CHECK_EQ(d[1].pass, 0u);
+        CHECK_EQ(d[2].pass, 1u);
+        CHECK(d[1].gpuUs > 0);   // (the second draw's stamp after the first's)
+        CHECK(d[0].gpuUs >= 0 && d[2].gpuUs >= 0);
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}

@@ -31,6 +31,7 @@
 #include "util/ralloc.h"
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/render.hpp"
+#include "hakios-metal/trace.hpp"   // (redfin hm-trace)
 #endif
 
 namespace hakios::metal {
@@ -61,6 +62,10 @@ std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* wh
 int knownReadMask(const void*, size_t, const FunctionConstants&, uint32_t, size_t, std::vector<uint8_t>*, std::string* why) {
     *why = "no compiler in this build";
     return -1;
+}
+int knownReadMaskCached(const void*, size_t, const FunctionConstants&, uint32_t, size_t, std::vector<uint8_t>*) { return -2; }
+void cacheTotals(uint64_t out[12]) {
+    for (int i = 0; i < 12; i++) out[i] = 0;
 }
 
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
@@ -1807,6 +1812,11 @@ void memoKeep(const std::string& key, std::string blob) {
     }
 }
 
+// (redfin hm-trace) the process's cache counts (cacheTotals) and the trace's events for each
+std::atomic<uint64_t> gTotals[12];
+void totalsAdd(int i, uint64_t n) { gTotals[i].fetch_add(n, std::memory_order_relaxed); }
+std::string traceStageName(const std::string& name) { return name.size() > 1 ? name.substr(1, 12) : std::string("(no cache)"); }
+
 // (redfin hm-cache) HM_CACHE_MANIFEST=1 (default): beside each stage compiled into the writable cache, what made it --
 // DIR/src/NAME.src (the constants, IBO_BASE, the known buffer, the bitcode's name) and the bitcode once,
 // DIR/bc/HASH.bc -- so that a host (bench/hm-seed) can compile the same stages again into a cache-seed directory after
@@ -1996,8 +2006,79 @@ CompileStats compileStats() {
 // buffer at an offset that is not constant then reads them all (every byte 1). The bytes it does not read cannot decide
 // anything a specialisation folds, so a configuration's key may leave them out. Returns how many bytes are read, -1
 // with *why when the front end refused the stage. Kept in the front-end memo (HM_FE_MEMO) with the NIR.
+// (redfin hm-trace) HM_SPEC_MASK_DISK: where a read mask is filed, "" with no cache directory (DIR: the writable one)
+namespace {
+constexpr uint32_t kMaskMagic = 0x4b4d4d48;   // "HMMK"
+bool maskDiskOn() { return envOn("HM_SPEC_MASK_DISK", true); }
+std::string maskFileName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length) {
+    Hash128 h;
+    const char* key = cacheKeyText();
+    h.mix(key, strlen(key));
+    h.mix("read-mask", 9);
+    const uint64_t shape[3] = {uint64_t(binding), uint64_t(length), uint64_t(size)};
+    h.mix(shape, sizeof(shape));
+    h.mix(bitcode, size);
+    for (const FunctionConstant& c : constants) {
+        h.mix(&c.index, sizeof(c.index));
+        h.mix(&c.bits, sizeof(c.bits));
+    }
+    return "/mask/" + h.hex() + ".mask";
+}
+int maskParse(const std::string& data, size_t length, std::vector<uint8_t>* mask) {
+    CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
+    if (r.u32() != kMaskMagic || r.u32() != uint32_t(length)) return -2;
+    const int n = int(r.u32());
+    std::vector<uint8_t> m(length);
+    if (!r.raw(m.data(), length) || !r.ok || r.p != r.end) return -2;
+    *mask = std::move(m);
+    return n;
+}
+void maskSave(const std::string& file, size_t length, const std::vector<uint8_t>& mask, int n) {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir == nullptr || dir[0] == 0 || mask.size() != length) return;
+    if (access((std::string(dir) + file).c_str(), F_OK) == 0) return;   // (filed already)
+    mkdir((std::string(dir) + "/mask").c_str(), 0755);
+    CacheWriter w;
+    w.u32(kMaskMagic);
+    w.u32(uint32_t(length));
+    w.u32(uint32_t(n));
+    w.raw(mask.data(), length);
+    if (writeFileAtomically(std::string(dir) + file, w.out)) totalsAdd(10, 1);
+}
+}  // namespace
+
+int knownReadMaskCached(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
+                        std::vector<uint8_t>* mask) {
+    if (!maskDiskOn()) return -2;
+    const int64_t t0 = hakios::trace::nowNs();
+    const std::string file = maskFileName(bitcode, size, constants, binding, length);
+    std::vector<std::string> dirs;
+    if (const char* d = getenv("HAKIOS_METAL_CACHE"); d != nullptr && d[0] != 0) dirs.push_back(d);
+    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+    for (const char* p = seed; p != nullptr && *p != 0;) {
+        const char* colon = strchr(p, ':');
+        dirs.emplace_back(p, colon != nullptr ? size_t(colon - p) : strlen(p));
+        p = colon != nullptr ? colon + 1 : nullptr;
+    }
+    for (const std::string& d : dirs) {
+        std::string data;
+        if (d.empty() || !readFile(d + file, &data)) continue;
+        const int n = maskParse(data, length, mask);
+        if (n < 0) continue;
+        totalsAdd(9, 1);
+        if (hakios::trace::on()) hakios::trace::event("mask-disk", file.substr(6, 12), t0, hakios::trace::nowNs() - t0, length);
+        return n;
+    }
+    return -2;
+}
+
+void cacheTotals(uint64_t out[12]) {
+    for (int i = 0; i < 12; i++) out[i] = gTotals[i].load(std::memory_order_relaxed);
+}
+
 int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
                   std::vector<uint8_t>* mask, std::string* why) {
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace)
     CompileTurn turn;
     Translation t;
     FrontEndMemo* m = nullptr;
@@ -2007,7 +2088,9 @@ int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& con
         for (const auto& r : m->readMasks) {
             if (r.first == binding && r.second.size() == length) {
                 *mask = r.second;
-                return int(std::count(mask->begin(), mask->end(), uint8_t(1)));
+                const int count = int(std::count(mask->begin(), mask->end(), uint8_t(1)));
+                if (maskDiskOn()) maskSave(maskFileName(bitcode, size, constants, binding, length), length, r.second, count);   // (redfin hm-trace)
+                return count;
             }
         }
     }
@@ -2037,7 +2120,14 @@ int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& con
         m->readMasks.emplace_back(binding, r);
     }
     *mask = r;
-    return int(std::count(r.begin(), r.end(), uint8_t(1)));
+    const int count = int(std::count(r.begin(), r.end(), uint8_t(1)));
+    {   // (redfin hm-trace) counted, traced, and filed for the next process (HM_SPEC_MASK_DISK)
+        const int64_t d = hakios::trace::nowNs() - trT0;
+        totalsAdd(7, 1), totalsAdd(8, uint64_t(d));
+        if (hakios::trace::on()) hakios::trace::event("mask-translate", "", trT0, d, length);
+        if (maskDiskOn()) maskSave(maskFileName(bitcode, size, constants, binding, length), length, r, count);
+    }
+    return count;
 }
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
@@ -2064,14 +2154,19 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     if (std::unique_ptr<CompiledStage> s = memoFind(memoKey)) {
         tStats.hits++;
         tStats.memoHits++;
+        totalsAdd(6, 1);   // (redfin hm-trace)
         verifyLater(name, "memo", *s, bitcode, size, constants, iboBase, known);
         return s;
     }
     const std::string cached = stageCacheWritable(name);
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace) a read from disk or a compile: an event
     if (!cached.empty()) {
         std::string blob;
         if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached, &blob)) {
             tStats.hits++;
+            const int64_t d = hakios::trace::nowNs() - trT0;
+            totalsAdd(2, 1), totalsAdd(3, uint64_t(d));
+            if (hakios::trace::on()) hakios::trace::event("stage-disk", s->name + " " + traceStageName(name), trT0, d, blob.size());
             memoKeep(memoKey, std::move(blob));
             verifyLater(name, "cache", *s, bitcode, size, constants, iboBase, known);
             return s;
@@ -2088,6 +2183,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name, &blob)) {
                 tStats.hits++;
                 tStats.seedHits++;
+                const int64_t d = hakios::trace::nowNs() - trT0;   // (redfin hm-trace)
+                totalsAdd(4, 1), totalsAdd(5, uint64_t(d));
+                if (hakios::trace::on()) hakios::trace::event("stage-seed", s->name + " " + traceStageName(name), trT0, d, blob.size());
                 memoKeep(memoKey, std::move(blob));
                 verifyLater(name, "seed " + dir, *s, bitcode, size, constants, iboBase, known);
                 return s;
@@ -2095,6 +2193,16 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         }
     }
     std::unique_ptr<CompiledStage> chosen = compileStageFresh(bitcode, size, why, constants, iboBase, known);
+    {   // (redfin hm-trace)
+        const int64_t d = hakios::trace::nowNs() - trT0;
+        totalsAdd(0, 1), totalsAdd(1, uint64_t(d));
+        if (hakios::trace::on())
+            hakios::trace::event(known != nullptr ? "stage-compile-spec" : "stage-compile",
+                                 (chosen != nullptr ? chosen->name : std::string("(refused)")) + " " + traceStageName(name) +
+                                     (chosen != nullptr ? " " + std::to_string(chosen->words.size()) + "w" : std::string()),
+                                 trT0, d, size);
+    }
+    if (chosen != nullptr && !cached.empty()) totalsAdd(11, 1);
     if (chosen != nullptr) {
         std::string blob = stageCacheBlob(*chosen);
         if (!cached.empty() && known != nullptr && cacheWriteAsyncOn()) {   // (redfin hm-int5) after returning
@@ -2286,14 +2394,19 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
     if (std::unique_ptr<CompiledKernel> k = kernelMemoFind(memoKey)) {
         tStats.hits++;
         tStats.memoHits++;
+        totalsAdd(6, 1);   // (redfin hm-trace)
         verifyKernelLater(name, "memo", *k, bitcode, size, constants);
         return k;
     }
     const std::string cached = stageCacheWritable(name);
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace)
     if (!cached.empty()) {
         std::string blob;
         if (std::unique_ptr<CompiledKernel> k = kernelCacheLoad(cached, &blob)) {
             tStats.hits++;
+            const int64_t d = hakios::trace::nowNs() - trT0;
+            totalsAdd(2, 1), totalsAdd(3, uint64_t(d));
+            if (hakios::trace::on()) hakios::trace::event("kernel-disk", k->name + " " + traceStageName(name), trT0, d, blob.size());
             memoKeep(memoKey, std::move(blob));
             verifyKernelLater(name, "cache", *k, bitcode, size, constants);
             return k;
@@ -2310,6 +2423,9 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
             if (std::unique_ptr<CompiledKernel> k = kernelCacheLoad(dir + name, &blob)) {
                 tStats.hits++;
                 tStats.seedHits++;
+                const int64_t d = hakios::trace::nowNs() - trT0;   // (redfin hm-trace)
+                totalsAdd(4, 1), totalsAdd(5, uint64_t(d));
+                if (hakios::trace::on()) hakios::trace::event("kernel-seed", k->name + " " + traceStageName(name), trT0, d, blob.size());
                 memoKeep(memoKey, std::move(blob));
                 verifyKernelLater(name, "seed " + dir, *k, bitcode, size, constants);
                 return k;
@@ -2317,6 +2433,13 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
         }
     }
     std::unique_ptr<CompiledKernel> k = compileAirFresh(bitcode, size, why, constants);
+    {   // (redfin hm-trace)
+        const int64_t d = hakios::trace::nowNs() - trT0;
+        totalsAdd(0, 1), totalsAdd(1, uint64_t(d));
+        if (k != nullptr && !cached.empty()) totalsAdd(11, 1);
+        if (hakios::trace::on())
+            hakios::trace::event("kernel-compile", (k != nullptr ? k->name : std::string("(refused)")) + " " + traceStageName(name), trT0, d, size);
+    }
     if (k != nullptr) {
         std::string blob = kernelCacheBlob(*k);
         if (!cached.empty() && writeFileAtomically(cached, blob)) stageManifestSave(name, bitcode, size, constants, kKernelCacheTag, nullptr);

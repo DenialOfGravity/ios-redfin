@@ -1684,3 +1684,36 @@ TEST(a_compute_kernel_goes_through_the_stage_cache) {
     rmdir(base);
     unsetenv("HAKIOS_METAL_CACHE");
 }
+
+// (redfin hm-trace) HM_SPEC_MASK_DISK: a read mask taken once is filed beside the stage cache and read back by a later
+// process without a translation (knownReadMaskCached); not on disk it answers -2, as with HM_SPEC_MASK_DISK=0
+TEST(a_read_mask_is_filed_and_read_back_from_the_cache) {
+    if (!hasCompiler()) return;
+    std::vector<uint8_t> bc = bitcodeOf("tri_cflat_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    char base[] = "/tmp/hakios-metal-mask-test-XXXXXX";
+    CHECK(mkdtemp(base) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", base, 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    std::vector<uint8_t> mask, back;
+    std::string why;
+    CHECK_EQ(knownReadMaskCached(bc.data(), bc.size(), {}, 0, 32, &back), -2);
+    uint64_t t0[12], t1[12];
+    cacheTotals(t0);
+    CHECK_EQ(knownReadMask(bc.data(), bc.size(), {}, 0, 32, &mask, &why), 16);
+    CHECK_EQ(knownReadMaskCached(bc.data(), bc.size(), {}, 0, 32, &back), 16);
+    CHECK(back == mask);
+    CHECK_EQ(knownReadMaskCached(bc.data(), bc.size(), {}, 0, 48, &back), -2);   // (another length: another file)
+    cacheTotals(t1);
+    CHECK(t1[9] == t0[9] + 1);   // (one read back)
+    // (as a seed, read-only: found there too)
+    setenv("HAKIOS_METAL_CACHE", (std::string(base) + "/none").c_str(), 1);
+    setenv("HAKIOS_METAL_CACHE_SEED", base, 1);
+    CHECK_EQ(knownReadMaskCached(bc.data(), bc.size(), {}, 0, 32, &back), 16);
+    setenv("HM_SPEC_MASK_DISK", "0", 1);
+    CHECK_EQ(knownReadMaskCached(bc.data(), bc.size(), {}, 0, 32, &back), -2);
+    unsetenv("HM_SPEC_MASK_DISK");
+    unsetenv("HAKIOS_METAL_CACHE");
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+}

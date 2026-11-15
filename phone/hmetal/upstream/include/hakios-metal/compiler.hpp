@@ -149,6 +149,17 @@ CompileStats compileStats();
 // (redfin hm-int4) which of the first LENGTH bytes of the stage's constant buffer at [[buffer(BINDING)]] it reads at
 // constant offsets (MASK[i] 1/0; every byte 1 when it reads the buffer at an offset not constant): how many, or -1
 // with *why. A specialisation's KnownBuffer may zero the others: no fold can depend on them (compiler.cpp)
+// (redfin hm-trace) HM_SPEC_MASK_DISK=1 (default): the mask knownReadMask took is also filed in the stage cache's
+// directory (DIR/mask/HASH.mask, HASH over the cache's key text, the bitcode, the constants, BINDING and LENGTH), and
+// knownReadMaskCached reads it back -- from the writable cache or a seed -- without translating anything: what the
+// plug-in asks for when a pipeline is made, so that a cold boot's first specialisations are keyed by the mask, not by
+// bytes the stage never reads. -2: not on disk (or HM_SPEC_MASK_DISK=0); the count of bytes read otherwise.
+int knownReadMaskCached(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
+                        std::vector<uint8_t>* mask);
+// (redfin hm-trace) the process's stage-cache counts since it started, every thread's: [0] stages and kernels compiled,
+// [1] their ns, [2] read from the writable cache, [3] their ns, [4] read from a seed, [5] their ns, [6] memo hits,
+// [7] masks translated, [8] their ns, [9] masks read from disk, [10] masks written, [11] stages written to the cache
+void cacheTotals(uint64_t out[12]);
 int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
                   std::vector<uint8_t>* mask, std::string* why);
 void setCompileBackground(bool on);

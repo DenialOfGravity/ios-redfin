@@ -881,3 +881,54 @@ TEST(c_api_the_device_counts_what_it_has_allocated) {
     CHECK_EQ(hakios_metal_device_allocated_bytes(d), before);
     hakios_metal_close(d);
 }
+
+// (redfin hm-trace) HM_TRACE's first-use events: with a sink set, a large GEM object, a render target and a large upload
+// each reach it with a duration and their bytes; with the sink cleared nothing does
+namespace {
+struct TraceSeen {
+    std::vector<std::string> kinds;
+    std::vector<unsigned long long> bytes;
+    std::vector<int64_t> dur;
+};
+void traceSink(const char* kind, const char*, int64_t start, int64_t dur, unsigned long long bytes, void* ctx) {
+    auto* s = static_cast<TraceSeen*>(ctx);
+    s->kinds.push_back(kind);
+    s->bytes.push_back(bytes);
+    s->dur.push_back(start > 0 ? dur : -1);
+}
+size_t countOf(const TraceSeen& s, const char* kind) {
+    size_t n = 0;
+    for (const std::string& k : s.kinds) n += k == kind;
+    return n;
+}
+}  // namespace
+
+TEST(c_api_trace_sink_hears_first_use_work) {
+    hakios_metal_device* d = hakios_metal_open_fake();
+    CHECK(d != nullptr);
+    TraceSeen seen;
+    hakios_metal_trace_set_sink(traceSink, &seen);
+    CHECK(hakios_metal_trace_now_ns() > 0);
+    hakios_metal_buffer* big = hakios_metal_buffer_new(d, 1 << 20);
+    hakios_metal_buffer* small = hakios_metal_buffer_new(d, 4096);
+    CHECK(countOf(seen, "gem-new") == 1);   // (the 4 KB one is under HM_TRACE_ALLOC_KB)
+    hakios_metal_texture* rt = hakios_metal_texture_new(d, 2, 70, 256, 256, 4 | 1);   // RGBA8, shader read + render target
+    CHECK(rt != nullptr);
+    CHECK_EQ(countOf(seen, "rt-new"), size_t(1));
+    std::vector<uint8_t> px(256 * 256 * 4, 0x7f);
+    CHECK_EQ(hakios_metal_texture_replace(rt, 0, 0, 256, 256, px.data(), 256 * 4), 0);
+    CHECK_EQ(countOf(seen, "upload"), size_t(1));
+    for (size_t i = 0; i < seen.kinds.size(); i++) CHECK(seen.dur[i] >= 0);
+    hakios_metal_trace_set_sink(nullptr, nullptr);
+    const size_t before = seen.kinds.size();
+    hakios_metal_buffer* big2 = hakios_metal_buffer_new(d, 1 << 20);
+    CHECK_EQ(seen.kinds.size(), before);
+    unsigned long long t[12];
+    hakios_metal_cache_totals(t);   // (no compile here: the counts are just readable)
+    CHECK(t[0] < (1ull << 40));
+    hakios_metal_buffer_free(big);
+    hakios_metal_buffer_free(big2);
+    hakios_metal_buffer_free(small);
+    hakios_metal_texture_free(rt);
+    hakios_metal_close(d);
+}

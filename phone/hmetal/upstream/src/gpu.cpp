@@ -1,6 +1,7 @@
 #include "hakios-metal/gpu.hpp"
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/trace.hpp"   // (redfin hm-trace)
 
 #include <cerrno>
 #include <cstring>
@@ -71,6 +72,17 @@ std::unique_ptr<Bo> Gpu::newBo(uint64_t size, uint32_t flags, int* error) {
         *error = EINVAL;
         return nullptr;
     }
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace) a large GEM object made: an event
+    struct TraceNew {
+        int64_t t0;
+        uint64_t size;
+        const bool* ok;
+        ~TraceNew() {
+            if (*ok && size >= hakios::trace::bigBytes() && hakios::trace::on()) hakios::trace::event("gem-new", "", t0, hakios::trace::nowNs() - t0, size);
+        }
+    };
+    bool trOk = false;
+    TraceNew trace{trT0, (size + kPage - 1) & ~(kPage - 1), &trOk};
     MsmGemNew n{};
     n.size = (size + kPage - 1) & ~(kPage - 1);
     n.flags = flags;
@@ -95,6 +107,7 @@ std::unique_ptr<Bo> Gpu::newBo(uint64_t size, uint32_t flags, int* error) {
     std::unique_ptr<Bo> bo(new Bo(*this, n.handle, n.size, info.value, cpu));
     bo->counted_ = true;
     allocated_ += n.size;
+    trOk = true;
     return bo;
 }
 
@@ -113,7 +126,12 @@ std::unique_ptr<Bo> Gpu::surfaceBo(uint32_t surfaceId, SurfaceInfo* out, int* er
         return nullptr;
     }
     *out = SurfaceInfo{s.size, s.offset, s.rowBytes, s.width, s.height, s.pixelFormat, s.planes};
-    return std::unique_ptr<Bo>(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
+    const int64_t trT0 = hakios::trace::nowNs();   // (redfin hm-trace) the surface's mapping (the kernel calls before it are short)
+    std::unique_ptr<Bo> bo(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
+    if (hakios::trace::on())
+        hakios::trace::event("surface-map", "surface " + std::to_string(surfaceId) + " " + std::to_string(s.width) + "x" + std::to_string(s.height), trT0,
+                             hakios::trace::nowNs() - trT0, s.size);
+    return bo;
 }
 
 int Gpu::surfaceUbwc(uint32_t surfaceId, HakiosSurfaceUbwc* out) {

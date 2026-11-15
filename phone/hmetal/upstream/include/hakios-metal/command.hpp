@@ -218,6 +218,19 @@ public:
     static constexpr uint32_t kMaxProfiledDraws = 512;
     void setProfileDraws(bool on) { profileDraws_ = on; }
     std::vector<DrawTime> drawTimes() const;
+    // (redfin hm-trace) HM_TRACE=2: each draw named for the trace without changing how it runs (mode 1), or with an
+    // RB_DONE_TS event carrying the GPU's timestamp written after it (mode 2, HM_TRACE_DRAW_TS=1): no wait for idle, so
+    // the draws still overlap and the difference between two stamps is the time the second one added at the end of the
+    // pipe. A GMEM pass's draws are named but never stamped (each runs once per tile). PASS: its pass among passTimes'
+    // (0xffffffff: past kMaxProfiled or the profile off); GPU_US < 0: not stamped.
+    struct TraceDraw { std::string name; uint32_t fsWords = 0, vertices = 0, pass = 0xffffffffu, area[4] = {}; bool gmem = false, stamped = false; double gpuUs = -1, cpuUs = -1; };
+    static constexpr uint32_t kMaxTraceDraws = 2048;
+    void setTraceDraws(int mode) { traceDrawMode_ = mode; }
+    // the caller's CPU time for the draw just recorded (the plug-in's whole draw call), when it has none yet
+    void traceDrawCpu(double us) {
+        if (!traceDraws_.empty() && traceDraws_.back().cpuUs < 0) traceDraws_.back().cpuUs = us;
+    }
+    std::vector<TraceDraw> traceDraws() const;
     // render::Options::gmem for this buffer's draws besides each draw's own (both must allow it): the C API's switch
     void setGmem(bool on) { gmem_ = on; }
     // GMEM's refinements off, for a bisect on the phone: kGmemWholeArea tiles the whole window whatever the draws touch,
@@ -288,6 +301,11 @@ private:
     bool tuning_ = false;     // setGmemTuned's (cleared by a failed stamp buffer too)
     bool profileDraws_ = false;
     std::vector<DrawTime> drawsProfiled_;
+    int traceDrawMode_ = 0;                      // (redfin hm-trace)
+    uint32_t tracePass_ = 0xffffffffu;           // the open draw pass's index among profiled_
+    std::vector<TraceDraw> traceDraws_;
+    std::shared_ptr<Buffer> traceStamps_;
+    void traceStamp(uint32_t slot);
     std::shared_ptr<Buffer> drawStamps_;
     void drawStamp(uint32_t slot);
     bool gmem_ = true;

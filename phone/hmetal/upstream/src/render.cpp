@@ -3837,6 +3837,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             const Texture* first = pass.color0 != nullptr ? pass.color0 : pass.depth;
             const size_t stamped = profiled_.size();
             stampStart(kPassDraw, first ? first->width() : 0, first ? first->height() : 0);
+            tracePass_ = profiled_.size() > stamped ? uint32_t(profiled_.size() - 1) : 0xffffffffu;   // (redfin hm-trace)
             if (profiled_.size() > stamped) {
                 profiled_.back().tuneKey = tuneKey;
                 // (redfin hmv2, HM_PROF) the targets' format, layout and cleared bytes (load and store: the GMEM tail's)
@@ -3934,8 +3935,22 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         drawsProfiled_.push_back(dt);
         drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
     }
+    // (redfin hm-trace) HM_TRACE=2: the draw named (mode 1) and stamped after it (mode 2, sysmem alone)
+    const bool traced = traceDrawMode_ != 0 && !timed && traceDraws_.size() < kMaxTraceDraws;
+    const bool traceTs = traced && traceDrawMode_ >= 2 && !open_->gmem;
+    if (traced) {
+        TraceDraw t;
+        t.name = program.name != nullptr ? program.name : "?";
+        t.fsWords = program.fs.k.numWords;
+        t.vertices = d.vertexCount;
+        t.pass = tracePass_;
+        t.gmem = open_->gmem;
+        t.stamped = traceTs;
+        render::drawArea(pass, d, t.area);
+        traceDraws_.push_back(std::move(t));
+    }
     // (redfin hm-int4) HM_DEADFILL: this draw may be taken back by the next: the stream and dedup state from before it
-    const bool dfArm = dfRole != 0 && !open_->gmem && !open_->dual && &into == &stream_ && !timed;
+    const bool dfArm = dfRole != 0 && !open_->gmem && !open_->dual && &into == &stream_ && !timed && !traceTs;   // (hm-trace: a stamped draw is not taken back)
     if (dfArm) {
         open_->df.start = stream_.size();
         open_->df.regs = open_->regs;
@@ -3951,6 +3966,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         if (open_->dual) appendStream(open_->sysStream, bodySys);
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
+    if (traceTs) traceStamp(uint32_t(traceDraws_.size() - 1));   // (redfin hm-trace)
     if (dfArm) {
         open_->df.end = stream_.size();
         open_->df.key = std::move(dfKey);
