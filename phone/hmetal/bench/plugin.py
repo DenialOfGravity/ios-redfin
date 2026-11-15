@@ -75,6 +75,11 @@ phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline 
     completed | committed with an earlier frame unretired X of N (most in flight) | not sent", per frame = a buffer that
     drew the display's IOSurface; the kernel submit times come from hakios_metal_cb_submit_times (core, hm-int8).
     CoreAnimation's own swap-ring wait (SwapWait / can_update_) is outside hm: it shows as the gap. Default unchanged.
+  - (ws-hm-defer) HM_DEFER=0 (default, as before) | 1 (CoreAnimation's queues in backboardd) | 2 (every queue): upstream's
+    deferred recording (core hakios_metal_queue_set_deferred2), the thread named HM_DEFER_NAME (hakios.metal.defer) at the
+    caller's scheduling; the hooks that asked the core on the caller's thread answer from the plug-in's own marks; the
+    commit's "sent" mark posted after it (waitUntilScheduled waits for the kernel submit); HM_PROF>=2 "prof: pace ...
+    defer" line, HM_TRACE C records dq= dj= qd= dl= ks= (HMD_EDITS)
 """
 import sys
 
@@ -4132,6 +4137,319 @@ HMT_EDITS = [
 ]
 
 EDITS += HMT_EDITS   # (redfin hm-trace)
+
+# (ws-hm-defer) HM_DEFER: upstream's deferred recording (hakios_metal_queue_set_deferred, core c_api.cpp Deferrer) behind a
+# switch, and every hook of ours made right with a command buffer recorded on the queue's own thread. Read once:
+#   0 (default) as before (boot-arg metal_defer=1 still defers every queue, as upstream)
+#   1 CoreAnimation's queues in backboardd: a queue whose first command buffer is made on a thread named
+#     HM_DEFER_THREAD* (default "com.apple.coreanimation.", the render server's) in backboardd
+#   2 every queue of the process
+# The thread is named HM_DEFER_NAME (default "hakios.metal.defer": a fixed prefix for the kernel's big-core tagging) and
+# takes the scheduling of the thread posting to it (CoreAnimation's render thread: fixed priority 54). Per hook:
+#   - -status, -addCompletedHandler:, the SHADOW users' and write-backs' "completed?" and -error: a deferred buffer's are
+#     answered from the plug-in's own completion marks (_hmDone, _hmWbDone, set where the handlers and write-backs are
+#     taken), not from the core, whose answer waits for the thread -- and, asked under @synchronized(self) while a commit
+#     refused on the thread completes the buffer under the same lock, would never come
+#   - -commit: the turned framebuffers' 2D copies and the "sent" mark (dispatch semaphore _sent, the scheduled handlers)
+#     go to the thread after the commit (hakios_metal_cb_post): -waitUntilScheduled / -commitAndWaitUntilSubmitted /
+#     -waitUntilCompleted wait for the kernel submit, so CoreAnimation still swaps only a frame the kernel has (0989's
+#     per-pid gate); held commits (an event wait) post the same mark from the queue's serial queue
+#   - -endEncoding's owed Clear and resolves: the buffer's error is not asked while its draws are still queued (the core
+#     skips work on a failed buffer itself)
+#   - HM_PROF=2: a second pace line ("prof: pace ... defer"): hm's time on the caller's thread a frame (entry points
+#     timed), the frame buffer's deferred-thread time, commit -> core commit (the wait in the thread's queue), the queue's
+#     depth at the commit, the threads' busy time, the callers' waits for them, the thread's name and scheduling;
+#     HM_TRACE's C record: dq= (thread us) dj= (jobs) qd= (depth at commit) dl= (commit -> core commit us) ks= (commit ->
+#     kernel submit returned us); cpu= stays the caller's
+HMD_HELPERS = r"""/* ---- (ws-hm-defer) HM_DEFER (bench/plugin.py "ws-hm-defer") ---- */
+static int
+hm_defer_mode(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		const char *e = getenv("HM_DEFER");
+		int m = e != NULL && e[0] != '\0' ? atoi(e) : 0;
+
+		mode = m < 0 || m > 2 ? 0 : m;
+	}
+	return mode;
+}
+
+static const char *
+hm_defer_name(void)
+{
+	const char *e = getenv("HM_DEFER_NAME");
+	return e != NULL && e[0] != '\0' ? e : "hakios.metal.defer";
+}
+
+static int64_t
+hmd_cont_ns(void)   /* the core's transport clock (mach_continuous_time), as hm_pf_cont_ns */
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	return (int64_t)(mach_continuous_time() * tb.numer / tb.denom);
+}
+
+static int64_t hmd_caller_done_ns;                   /* the caller's hm time of buffers completed since the last frame (atomic) */
+static hakios_metal_queue *volatile hmd_queue_seen;  /* a deferred queue, for the pace line's thread */
+
+/* a deferred buffer's "sent" mark, on the thread after its commit (or here, not deferred): the held-commit semaphore, the
+ * scheduled handlers, the reference -commit took for it */
+static void hmd_sent(void *context);
+/* a turned framebuffer's 2D copy into its surface, on the thread in the buffer's order: { texture, buffer } retained */
+static void hmd_turn(void *context);
+
+"""
+
+HMD_DECIDE = r"""/* (ws-hm-defer) HM_DEFER, decided at the queue's first command buffer (none is being recorded yet): 1 a queue whose first
+ * buffer is made on CoreAnimation's render server thread in backboardd (HM_DEFER_THREAD, default "com.apple.coreanimation."),
+ * 2 every queue. The thread is named HM_DEFER_NAME and follows the scheduling of the thread posting to it. */
+- (void)hmdDecide
+{
+	@synchronized (self) {
+		if (_hmdDecided) return;
+		char name[64] = "";
+		const char *prefix = getenv("HM_DEFER_THREAD"), *prog = getprogname();
+		const int mode = hm_defer_mode();
+		int policy = 0;
+		struct sched_param sp = { 0 };
+		static int said;
+
+		pthread_getname_np(pthread_self(), name, sizeof(name));
+		pthread_getschedparam(pthread_self(), &policy, &sp);
+		if (prefix == NULL || prefix[0] == '\0') prefix = "com.apple.coreanimation.";
+		const BOOL ca = prog != NULL && strcmp(prog, "backboardd") == 0 && strncmp(name, prefix, strlen(prefix)) == 0;
+		if (!hakios_metal_queue_deferred(_queue) && (mode == 2 || (mode == 1 && ca))) {
+			hakios_metal_queue_set_deferred2(_queue, 1, hm_defer_name());
+		}
+		if (hakios_metal_queue_deferred(_queue)) hmd_queue_seen = _queue;
+		if (mode != 0 && said++ < 12) {
+			hm_print("defer: queue %p %s (HM_DEFER=%d): first command buffer made on thread '%s' (policy %d priority %d)%s%s\n", (void *)self,
+				 hakios_metal_queue_deferred(_queue) ? "records deferred" : "records on the caller's thread", mode, name, policy,
+				 sp.sched_priority, hakios_metal_queue_deferred(_queue) ? "; recording thread " : "",
+				 hakios_metal_queue_deferred(_queue) ? hm_defer_name() : "");
+		}
+		_hmdDecided = YES;
+	}
+}
+
+- (id)commandBuffer
+{
+	if (!_hmdDecided) [self hmdDecide];   /* (ws-hm-defer) */
+	return [[[HakiosMetalCommandBuffer alloc] initWithHakiosQueue:self] autorelease];
+}
+"""
+
+HMD_STATUS = r"""- (MTLCommandBufferStatus)status
+{
+	/* (ws-hm-defer) a deferred buffer with jobs still queued: committed (by -commit) or not, without waiting for them */
+	if (_hmDeferred && !_hmDone && hakios_metal_cb_pending(_cb) > 0) {
+		return _committed ? MTLCommandBufferStatusCommitted : MTLCommandBufferStatusNotEnqueued;
+	}
+	return (MTLCommandBufferStatus)hakios_metal_cb_status(_cb);
+}
+
+/* (ws-hm-defer) completed (or failed): the core's answer, or for a deferred buffer the plug-in's own mark, set where its
+ * completed handlers are taken (asking the core would wait for the deferred thread) */
+- (BOOL)hmdCompleted
+{
+	if (_hmDeferred) return __atomic_load_n(&_hmDone, __ATOMIC_ACQUIRE) != 0;
+	return hakios_metal_cb_status(_cb) >= HAKIOS_METAL_COMPLETED;
+}
+"""
+
+HMD_CALLBACKS = r"""/* (ws-hm-defer) the held / deferred commit has reached the core (and the kernel): -waitUntilScheduled's semaphore, then
+ * the scheduled handlers */
+- (void)hmdMarkSent
+{
+	dispatch_semaphore_signal(_sent);
+	[self hakiosDeliverScheduled];
+}
+
+/* (ws-hm-defer) hmd_sent / hmd_turn: run on the deferred thread (in the buffer's order) or, not deferred, at once */
+static void
+hmd_sent(void *context)
+{
+	HakiosMetalCommandBuffer *self = (HakiosMetalCommandBuffer *)context;
+
+	@autoreleasepool {
+		[self hmdMarkSent];
+	}
+	[self release];
+}
+
+static void
+hmd_turn(void *context)
+{
+	NSArray *a = (NSArray *)context;
+
+	@autoreleasepool {
+		[(HakiosMetalTexture *)[a objectAtIndex:0] hakiosTurnInto:[(HakiosMetalCommandBuffer *)[a objectAtIndex:1] hakiosCommandBuffer]];
+	}
+	[a release];
+}
+
+"""
+
+HMD_PACE = r"""		{   /* (ws-hm-defer) the caller's hm time, the deferred thread's, its queue, the callers' waits for it */
+			double cm, cq, dm, dqq, lm, lq, qm, qq;
+			unsigned long long dc[6];
+			const unsigned nd = hm_pf.nd;
+			float qdmax = 0;
+			hakios_metal_queue *dqueue = hmd_queue_seen;
+			char tn[64] = "-";
+			int pol = 0, pri = 0, qos = 0, ap = 0;
+
+			for (unsigned k = 0; k < nd; k++) qdmax = hm_pf.qd[k] > qdmax ? hm_pf.qd[k] : qdmax;
+			hm_pf_stat(hm_pf.cal, nd, &cm, &cq);
+			hm_pf_stat(hm_pf.dq, nd, &dm, &dqq);
+			hm_pf_stat(hm_pf.dl, nd, &lm, &lq);
+			hm_pf_stat(hm_pf.qd, nd, &qm, &qq);
+			hakios_metal_defer_counts(dc);
+			if (dqueue != NULL) hakios_metal_queue_defer_thread(dqueue, tn, sizeof(tn), &pol, &pri, &qos, &ap);
+			hm_print("prof: pace %.1f s: defer (HM_DEFER=%d): mean/p95 ms a frame: hm on the caller's thread %.2f/%.2f | deferred "
+				 "thread on the frame's buffer %.2f/%.2f | commit -> core commit %.2f/%.2f | queue depth at commit %.1f/%.0f (max "
+				 "%.0f) | deferred threads busy %.2f a frame (%llu jobs) | callers waited for them %llu times, %.2f ms a frame | "
+				 "deepest queue %llu | thread '%s' policy %d priority %d qos %#x %s\n",
+				 secs, hm_defer_mode(), cm, cq, dm, dqq, lm, lq, qm, qq, qdmax, (dc[0] - hm_pf.dc[0]) / 1e6 / fr,
+				 dc[1] - hm_pf.dc[1], dc[2] - hm_pf.dc[2], (dc[3] - hm_pf.dc[3]) / 1e6 / fr, dc[5], tn, pol, pri, qos,
+				 dqueue == NULL ? "(no deferred queue)" : ap > 0 ? "(taken)" : ap < 0 ? "(REFUSED by the system)" : "(not yet)");
+			memcpy(hm_pf.dc, dc, sizeof(dc));
+		}
+"""
+
+HMD_EDITS = [
+    # helpers, before HM_TRACE's (whose scope uses them)
+    ('/* ---- (redfin hm-trace) HM_TRACE=1/2 (bench/plugin.py "hm-trace"): records, first-use events, hitches ---- */\n',
+     HMD_HELPERS + '/* ---- (redfin hm-trace) HM_TRACE=1/2 (bench/plugin.py "hm-trace"): records, first-use events, hitches ---- */\n'),
+    # ivars: the queue's decision, the buffer's marks and its caller time
+    ('\tlong _deferring;                         /* commits on _deferred not yet made (atomic) */\n}\n',
+     '\tlong _deferring;                         /* commits on _deferred not yet made (atomic) */\n'
+     '\tBOOL _hmdDecided;                        /* (ws-hm-defer) HM_DEFER looked at, at the first command buffer */\n}\n'),
+    ('\tBOOL _hmFrame;                           /* (redfin hmv3, public: hm_completed is a C function) a render pass here drew the display\'s IOSurface (hm_frame_target) */\n',
+     '\tBOOL _hmFrame;                           /* (redfin hmv3, public: hm_completed is a C function) a render pass here drew the display\'s IOSurface (hm_frame_target) */\n'
+     '\tBOOL _hmDeferred;                        /* (ws-hm-defer) recorded by its queue\'s deferred thread */\n'
+     '\tint _hmDone, _hmWbDone;                  /* (ws-hm-defer) its completed handlers / write-backs taken (atomic) */\n'
+     '\tint64_t _hmCallerNs;                     /* (ws-hm-defer) hm\'s time on the caller\'s thread for it (HM_PROF>=2, atomic) */\n'),
+    ('- (BOOL)hakiosCommitted;   /* (redfin hmv12) */\n',
+     '- (BOOL)hakiosCommitted;   /* (redfin hmv12) */\n'
+     '- (BOOL)hmdCompleted;      /* (ws-hm-defer) completed, without waiting for a deferred thread */\n'
+     '- (void)hmdMarkSent;       /* (ws-hm-defer) */\n'),
+    # the scope: also hm's time on the caller's thread for the buffer (HM_PROF>=2), with or without HM_TRACE's record
+    ('struct hmt_scope { struct hmt_cb *r; int g; int64_t t0; double w0, c0; };\n\nstatic inline struct hmt_scope\nhmt_enter(struct hmt_cb *r, int g)\n{\n'
+     '\tstruct hmt_scope s = { NULL, -1, 0, 0, 0 };\n\n\tif (r == NULL) return s;\n\ts.g = g;\n\tif (hmt_depth++ == 0) {\n\t\ts.r = r;\n\t\ts.t0 = hmt_now();\n',
+     'struct hmt_scope { struct hmt_cb *r; int g; int64_t t0; double w0, c0; int64_t *acc; };\n\nstatic inline struct hmt_scope\nhmt_enter(struct hmt_cb *r, int g, int64_t *acc)\n{\n'
+     '\tstruct hmt_scope s = { NULL, -1, 0, 0, 0, NULL };\n\n\tif (r == NULL && acc == NULL) return s;\n\ts.g = g;\n\tif (hmt_depth++ == 0) {\n'
+     '\t\ts.t0 = hmt_now();\n\t\tif (g != HMT_WAIT) s.acc = acc;   /* (ws-hm-defer) the caller\'s time, waits apart */\n\t\tif (r == NULL) return s;\n\t\ts.r = r;\n'),
+    ('\tif (s->g < 0) return;\n\thmt_depth--;\n\tif (s->r == NULL) return;\n\tconst int64_t d = hmt_now() - s->t0;\n',
+     '\tif (s->g < 0) return;\n\thmt_depth--;\n\tif (s->r == NULL && s->acc == NULL) return;\n\tconst int64_t d = hmt_now() - s->t0;\n\n'
+     '\tif (s->acc != NULL) __atomic_add_fetch(s->acc, d, __ATOMIC_RELAXED);   /* (ws-hm-defer) */\n\tif (s->r == NULL) return;\n'),
+    ('\thmt_enter((cbo) != nil ? (struct hmt_cb *)((HakiosMetalCommandBuffer *)(cbo))->_hmt : NULL, (g))\n',
+     '\thmt_enter((cbo) != nil ? (struct hmt_cb *)((HakiosMetalCommandBuffer *)(cbo))->_hmt : NULL, (g), \\\n'
+     '\t\t  (cbo) != nil && hm_prof_level() >= 2 ? &((HakiosMetalCommandBuffer *)(cbo))->_hmCallerNs : NULL)\n'),
+    # HM_TRACE's record: the deferred thread's share
+    ('\tint frame, gates, status;\n\tstruct hmt_buf tail;   /* its P and D lines, made at completion */\n};\n',
+     '\tint frame, gates, status;\n\tstruct hmt_buf tail;   /* its P and D lines, made at completion */\n'
+     '\tint64_t commitCont, dqNs, dlNs, ksNs;   /* (ws-hm-defer) -commit (transport clock); the thread\'s time; commit -> core commit, -> kernel submit returned */\n'
+     '\tunsigned dj, qd;                        /* (ws-hm-defer) its jobs on the thread; the queue\'s depth at its commit */\n};\n'),
+    ('\t\t    "disp=%u copies=%u clears=%u cpu=%.0f blk=%.0f cw=%.0f cc=%.0f", r->id, r->frame, r->frameNo, hmt_rel_us(r->made),\n',
+     '\t\t    "disp=%u copies=%u clears=%u cpu=%.0f blk=%.0f cw=%.0f cc=%.0f dq=%.0f dj=%u qd=%u dl=%.0f ks=%.0f", r->id, r->frame, r->frameNo,\n'
+     '\t\t    hmt_rel_us(r->made),\n'),
+    ('\t\t    r->blockedMs * 1e3, r->compileWaitMs * 1e3, r->compileMs * 1e3);\n',
+     '\t\t    r->blockedMs * 1e3, r->compileWaitMs * 1e3, r->compileMs * 1e3, hmt_us(r->dqNs), r->dj, r->qd, hmt_us(r->dlNs), hmt_us(r->ksNs));\n'),
+    ('\tif (r == NULL) return;\n\tr->commitAt = hmt_now();\n',
+     '\tif (r == NULL) return;\n\tr->commitAt = hmt_now();\n\tr->commitCont = hmd_cont_ns();   /* (ws-hm-defer) */\n'),
+    ('\tr->doneAt = hmt_now();\n\tr->gpuNs = hakios_metal_cb_gpu_nanoseconds(cb);\n',
+     '\tr->doneAt = hmt_now();\n\tr->gpuNs = hakios_metal_cb_gpu_nanoseconds(cb);\n'
+     '\t{   /* (ws-hm-defer) the deferred thread\'s share, and commit -> core commit / kernel submit (transport clock) */\n'
+     '\t\tint64_t w = 0, cns = 0, kin = 0, kout = 0;\n\t\tunsigned j = 0, qd = 0;\n\n'
+     '\t\tif (hakios_metal_cb_defer_stats(cb, &w, &j, &qd) == 0) r->dqNs = w, r->dj = j, r->qd = qd;\n'
+     '\t\tif (r->commitCont != 0 && hakios_metal_cb_submit_times(cb, &cns, &kin, &kout) == 0) {\n'
+     '\t\t\tr->dlNs = cns > r->commitCont ? cns - r->commitCont : 0;\n'
+     '\t\t\tr->ksNs = kout > r->commitCont ? kout - r->commitCont : 0;\n\t\t}\n\t}\n'),
+    # the queue: HM_DEFER at its first command buffer
+    ('- (id)commandBuffer\n{\n\treturn [[[HakiosMetalCommandBuffer alloc] initWithHakiosQueue:self] autorelease];\n}\n', HMD_DECIDE),
+    # the buffer: deferred or not, from its core buffer
+    ('\t_cb = hakios_metal_cb_new([queue hakiosQueue]);\n',
+     '\t_cb = hakios_metal_cb_new([queue hakiosQueue]);\n\t_hmDeferred = _cb != NULL && hakios_metal_cb_deferred(_cb);   /* (ws-hm-defer) */\n'),
+    # -status: a deferred buffer whose jobs are still queued answers from the plug-in's own marks
+    ('- (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)hakios_metal_cb_status(_cb); }\n', HMD_STATUS),
+    ('\t@synchronized (self) {\n\t\tif (hakios_metal_cb_status(_cb) < HAKIOS_METAL_COMPLETED) {\n\t\t\tif (_writeBacks == nil)',
+     '\t@synchronized (self) {\n\t\tif (_hmDeferred ? !__atomic_load_n(&_hmWbDone, __ATOMIC_ACQUIRE) : hakios_metal_cb_status(_cb) < HAKIOS_METAL_COMPLETED) {   /* (ws-hm-defer) */\n\t\t\tif (_writeBacks == nil)'),
+    ('\t@synchronized (self) {\n\t\tlist = _writeBacks;\n\t\t_writeBacks = nil;\n\t}\n',
+     '\t@synchronized (self) {\n\t\tlist = _writeBacks;\n\t\t_writeBacks = nil;\n\t\t__atomic_store_n(&_hmWbDone, 1, __ATOMIC_RELEASE);   /* (ws-hm-defer) */\n\t}\n'),
+    ('\t@synchronized (self) {\n\t\tif (hakios_metal_cb_status(_cb) < HAKIOS_METAL_COMPLETED) {\n\t\t\tif (_completed == nil)',
+     '\t@synchronized (self) {\n\t\tif (_hmDeferred ? !__atomic_load_n(&_hmDone, __ATOMIC_ACQUIRE) : hakios_metal_cb_status(_cb) < HAKIOS_METAL_COMPLETED) {   /* (ws-hm-defer) */\n\t\t\tif (_completed == nil)'),
+    ('\t@synchronized (self) {\n\t\tcompleted = _completed;\n\t\t_completed = nil;\n\t}\n',
+     '\t@synchronized (self) {\n\t\tcompleted = _completed;\n\t\t_completed = nil;\n\t\t__atomic_store_n(&_hmDone, 1, __ATOMIC_RELEASE);   /* (ws-hm-defer) */\n\t}\n'),
+    # -error: the core's status asked outside the lock (a deferred buffer's waits for the thread), and not at all for a
+    # deferred buffer not yet committed (it cannot have ended in error)
+    ('\t@synchronized (self) {\n\t\tif (_error == nil && hakios_metal_cb_status(_cb) == HAKIOS_METAL_ERROR) {\n',
+     '\t/* (ws-hm-defer) the status before the lock: a deferred buffer\'s waits for its thread, where a refused commit completes\n'
+     '\t * the buffer under this same lock */\n'
+     '\tconst int hmdStatus = _error != nil || (_hmDeferred && !_committed) ? 0 : (int)hakios_metal_cb_status(_cb);\n\n'
+     '\t@synchronized (self) {\n\t\tif (_error == nil && hmdStatus == HAKIOS_METAL_ERROR) {\n'),
+    # the SHADOW copies' users
+    ('(![[u objectAtIndex:1] boolValue] && hakios_metal_cb_status([b hakiosCommandBuffer]) >= HAKIOS_METAL_COMPLETED)) {',
+     '(![[u objectAtIndex:1] boolValue] && [b hmdCompleted])) {   /* (ws-hm-defer) */'),
+    ('\t\t\t\tif (b != cb && [[u objectAtIndex:1] boolValue] && [b hakiosCommitted] &&\n\t\t\t\t    hakios_metal_cb_status([b hakiosCommandBuffer]) < HAKIOS_METAL_COMPLETED) {\n',
+     '\t\t\t\tif (b != cb && [[u objectAtIndex:1] boolValue] && [b hakiosCommitted] && ![b hmdCompleted]) {   /* (ws-hm-defer) */\n'),
+    # -endEncoding's owed Clear and resolves: not the error of a buffer whose draws are still queued
+    ('\tif (hm_owes_clear(&_pass) && hakios_metal_cb_error([self hakiosCb])[0] == \'\\0\' &&\n',
+     '\tif (hm_owes_clear(&_pass) && (hakios_metal_cb_pending([self hakiosCb]) > 0 || hakios_metal_cb_error([self hakiosCb])[0] == \'\\0\') &&   /* (ws-hm-defer) */\n'),
+    ('\t\tif (!_resolving[i] || hakios_metal_cb_error([self hakiosCb])[0] != \'\\0\') {\n',
+     '\t\tif (!_resolving[i] || (hakios_metal_cb_pending([self hakiosCb]) == 0 && hakios_metal_cb_error([self hakiosCb])[0] != \'\\0\')) {   /* (ws-hm-defer) */\n'),
+    # -commit: the turned copies and the sent mark on the thread
+    ('\t/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */\n'
+     '\tfor (HakiosMetalTexture *t in _turned) {\n\t\t[t hakiosTurnInto:_cb];\n\t}\n\t[self retain];\n',
+     '\t[self retain];   /* (ws-hm-defer: before the turned copies, which may run on the deferred thread) */\n'
+     '\t/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */\n'
+     '\tfor (HakiosMetalTexture *t in _turned) {\n'
+     '\t\tif (_hmDeferred) {   /* (ws-hm-defer) on the thread, after the draws (a 2D copy here would wait for them all) */\n'
+     '\t\t\thakios_metal_cb_post(_cb, hmd_turn, [[NSArray alloc] initWithObjects:t, self, nil]);\n'
+     '\t\t\tcontinue;\n\t\t}\n'
+     '\t\t[t hakiosTurnInto:_cb];\n\t}\n'),
+    ('\t\t\thmt_commit_call(self->_hmt, _cb, hm_completed, self);   /* (redfin hm-trace) */\n\t\t\tdispatch_semaphore_signal(_sent);\n'
+     '\t\t\t[self hakiosDeliverScheduled];\n\t\t\t[self release];\n\t\t}];\n\t\treturn;\n\t}\n',
+     '\t\t\thmt_commit_call(self->_hmt, _cb, hm_completed, self);   /* (redfin hm-trace) */\n'
+     '\t\t\thakios_metal_cb_post(_cb, hmd_sent, self);   /* (ws-hm-defer) sent once the core has committed it (here, or on the thread) */\n'
+     '\t\t}];\n\t\treturn;\n\t}\n'
+     '\tif (_hmDeferred) {   /* (ws-hm-defer) the commit goes to the thread: "sent" (and the scheduled handlers) once it is done */\n'
+     '\t\tconst double began = hm_now();\n\n'
+     '\t\t_sent = dispatch_semaphore_create(0);\n'
+     '\t\t[self retain];   /* (hmd_sent\'s) */\n'
+     '\t\thmt_commit_call(self->_hmt, _cb, hm_completed, self);   /* (redfin hm-trace) */\n'
+     '\t\thakios_metal_cb_post(_cb, hmd_sent, self);\n'
+     '\t\tself->_hmCommitSecs = hm_now() - began;\n'
+     '\t\thm_fps_commit(hm_now() - began);\n'
+     '\t\treturn;\n\t}\n'),
+    # the two thread callbacks, after -commit
+    ('/* abstract in _MTLCommandBuffer (its body is doesNotRecognizeSelector:), so inheriting it aborts. The deadline is\n',
+     HMD_CALLBACKS + '/* abstract in _MTLCommandBuffer (its body is doesNotRecognizeSelector:), so inheriting it aborts. The deadline is\n'),
+    # HM_PROF=2 pace: the caller's hm time a frame (buffers completed since the last frame), the deferred thread's
+    ('\thmt_done(self->_hmt, cb);   /* (redfin hm-trace) */\n\tif (self->_hmFrame) hm_pf_done(cb, self->_hmPfCommitNs);   /* (redfin hm-int8) HM_PROF>=2 pace */\n',
+     '\thmt_done(self->_hmt, cb);   /* (redfin hm-trace) */\n'
+     '\tif (hm_prof_level() >= 2) {   /* (ws-hm-defer) */\n'
+     '\t\t__atomic_add_fetch(&hmd_caller_done_ns, __atomic_exchange_n(&self->_hmCallerNs, 0, __ATOMIC_RELAXED), __ATOMIC_RELAXED);\n\t}\n'
+     '\tif (self->_hmFrame) hm_pf_done(cb, self->_hmPfCommitNs);   /* (redfin hm-int8) HM_PROF>=2 pace */\n'),
+    ('\tfloat blk[HM_PF_N], gap[HM_PF_N], enc[HM_PF_N], c2k[HM_PF_N], kcall[HM_PF_N], c2d[HM_PF_N];\n',
+     '\tfloat blk[HM_PF_N], gap[HM_PF_N], enc[HM_PF_N], c2k[HM_PF_N], kcall[HM_PF_N], c2d[HM_PF_N];\n'
+     '\tfloat cal[HM_PF_N], dq[HM_PF_N], dl[HM_PF_N], qd[HM_PF_N];   /* (ws-hm-defer) caller hm ms, thread ms, commit -> core commit ms, depth */\n'
+     '\tunsigned long long dc[6];   /* (ws-hm-defer) hakios_metal_defer_counts at the window\'s start */\n'),
+    ('\t\thm_pf.c2d[i] = now > commitNs ? (float)((now - commitNs) / 1e6) : 0;\n\t}\n',
+     '\t\thm_pf.c2d[i] = now > commitNs ? (float)((now - commitNs) / 1e6) : 0;\n'
+     '\t\t{   /* (ws-hm-defer) */\n'
+     '\t\t\tint64_t w = 0;\n\t\t\tunsigned j = 0, d = 0;\n\n'
+     '\t\t\thm_pf.cal[i] = (float)(__atomic_exchange_n(&hmd_caller_done_ns, 0, __ATOMIC_RELAXED) / 1e6);\n'
+     '\t\t\thm_pf.dq[i] = hakios_metal_cb_defer_stats(cb, &w, &j, &d) == 0 ? (float)(w / 1e6) : 0;\n'
+     '\t\t\thm_pf.qd[i] = (float)d;\n'
+     '\t\t\thm_pf.dl[i] = sent == 0 && cns > commitNs ? (float)((cns - commitNs) / 1e6) : 0;\n\t\t}\n\t}\n'),
+    ('\t\thm_pf.since = t;\n\t\thm_pf.frames = hm_pf.overlapped = hm_pf.done = hm_pf.noKernel = 0;\n',
+     HMD_PACE + '\t\thm_pf.since = t;\n\t\thm_pf.frames = hm_pf.overlapped = hm_pf.done = hm_pf.noKernel = 0;\n'),
+]
+EDITS += HMD_EDITS   # (ws-hm-defer)
 
 # (redfin hm-trace) the entry points' scopes: "HMT(GROUP, CB);" as the first statement of each method named here (a
 # method whose body is on its header line is a one-line forward to one of these, and is left alone). In nested calls

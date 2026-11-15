@@ -9,6 +9,8 @@ records before the touch; and NAME-PID.hmt every HM_TRACE_FLUSH_S seconds when t
 
 Lines (all times in microseconds, "made" relative to the process's trace start):
   C id fr= f= made= slot= enc= first= commit= c2d= gpu= st= passes= draws= disp= copies= clears= cpu= blk= cw= cc= GROUP=us/calls...
+    (ws-hm-defer) and dq= deferred thread us, dj= its jobs, qd= its queue depth at the commit, dl= commit -> core commit us,
+    ks= commit -> kernel submit returned us (0 when not deferred / not sent)
       one command buffer: slot wait, made->commit (enc), the -commit call, commit->completed (c2d), the GPU's ns,
       CPU per entry-point group, blocked (slot + waitUntil* + compiler lock), compiler wait, compiling
   P id i kind WxH draws= gpu=        a pass's GPU time (stamps at its start and after its tail)

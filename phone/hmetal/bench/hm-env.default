@@ -136,3 +136,13 @@ HM_PREWARM=1
 # (hm-trace) read masks of the uber shaders filed in the stage cache and read back at pipeline creation (1, default):
 # a cold boot's first specialisations are keyed by the bytes the shader reads, so they come from the disk cache
 #HM_SPEC_MASK_DISK=1
+
+# (ws-hm-defer) HM_DEFER: deferred recording (upstream's hakios_metal_queue_set_deferred): 0 (default) the caller's thread
+# records, as before (boot-arg metal_defer=1 still defers every queue); 1 CoreAnimation's queues in backboardd (the first
+# command buffer made on a thread named HM_DEFER_THREAD*, default com.apple.coreanimation.); 2 every queue. The recording
+# thread is named HM_DEFER_NAME (default hakios.metal.defer) and takes the caller's scheduling (CA: fixed priority 54).
+# With HM_PROF=2 a second pace line "prof: pace ... defer" gives hm's time on the caller's thread a frame beside the
+# deferred thread's. Roll back: HM_DEFER=0 and restart backboardd.
+#HM_DEFER=0
+#HM_DEFER_NAME=hakios.metal.defer
+#HM_DEFER_THREAD=com.apple.coreanimation.

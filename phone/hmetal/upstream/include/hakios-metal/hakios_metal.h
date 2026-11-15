@@ -546,6 +546,29 @@ void hakios_metal_queue_free(hakios_metal_queue *queue);
  * fills, blits, dispatches and anything asked back wait for what was told before them. Set it with no command buffer
  * of the queue being recorded. */
 void hakios_metal_queue_set_deferred(hakios_metal_queue *queue, int on);
+/* (redfin ws-hm-defer) the same, the thread named NAME (NULL: "hakios.metal.defer"; Linux keeps 15 bytes of it). The
+ * thread takes the scheduling (pthread policy and priority; QoS class on Darwin) of the thread that posts to it, read at
+ * the first post and at each commit. A refusal on it is also said through hakios_metal_set_notice's sink. */
+void hakios_metal_queue_set_deferred2(hakios_metal_queue *queue, int on, const char *name);
+/* 1 when QUEUE records deferred */
+int hakios_metal_queue_deferred(hakios_metal_queue *queue);
+/* the deferred thread's name and the scheduling it follows (APPLIED 1 taken, 0 not yet, -1 refused by the system); -1
+ * when QUEUE does not record deferred. Any pointer may be NULL. */
+int hakios_metal_queue_defer_thread(hakios_metal_queue *queue, char *name, unsigned long size, int *policy, int *priority, int *qos,
+				    int *applied);
+/* 1 when CB records deferred (its queue did when it was made) */
+int hakios_metal_cb_deferred(hakios_metal_cb *cb);
+/* CB's jobs posted to the deferred thread and not yet done, without waiting (0 when not deferred) */
+int hakios_metal_cb_pending(hakios_metal_cb *cb);
+/* FN(CONTEXT) in CB's order: on the deferred thread after everything told before it (a commit included), or here and now
+ * when CB does not record deferred (or this is that thread) */
+void hakios_metal_cb_post(hakios_metal_cb *cb, void (*fn)(void *context), void *context);
+/* CB's deferred tally, once its jobs are done (waits for them): the thread's time on them, how many, and the jobs queued
+ * (every buffer's, the running one included) when its commit was posted. -1 (zeros) when CB does not record deferred. */
+int hakios_metal_cb_defer_stats(hakios_metal_cb *cb, int64_t *work_ns, unsigned *jobs, unsigned *depth_at_commit);
+/* the process's deferred threads, running totals: [0] busy ns, [1] jobs run, [2] the callers' waits for a thread (a query,
+ * a copy, a blit, a dispatch, a wait), [3] their ns, [4] jobs posted; [5] the deepest queue since the last call */
+void hakios_metal_defer_counts(unsigned long long out[6]);
 
 hakios_metal_cb *hakios_metal_cb_new(hakios_metal_queue *queue);
 /* the command buffer is released by its owner; one still in flight is waited for first. It may be freed inside its
