@@ -13,6 +13,12 @@
  *                when locationd stops/cancels, its QMUX session closes, or the word goes away.
  *   session=N    P0b: a standalone test session of N seconds (max 600) without locationd, stopped after N s or 5
  *                good fixes; once per loc.on change. pds=1 wins if both want the engine.
+ * Kernel router (xnu 1122, kern.sweet_bb & 2): CommCenter's QMUX is routed by the kernel, not abpbridge. With pds=1
+ *   wland says HELLO to the kernel's relay (QRTR DATA from port PDSR_WPORT to node 1 port PDSR_KPORT, every 10 s; BYE when
+ *   the word goes); with kern.sweet_qmux_pds 1 the kernel then sends every PDS request (REQ: pipe, sess, cid, SDU) here,
+ *   answered at once by pdsemu (RESP flags 1) or "not mine" (flags 0: the kernel's policy answers); EVENT_REPORTs go back
+ *   as IND records; GONE (session closed / client gone) and CID release end locationd's client as abpbridge's session end.
+ *   Record: struct pdsr below (24 bytes, LE) + data, the same layout as bsd/dev/sweet_qmux.c.
  * Never sent: SET_ENGINE_LOCK, SET_OPERATION_MODE, SUPL/NI settings, any NV/EFS write, XTRA/time/position injects.
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
  * changes ("loc: DROPPED"). Status: /var/local/loc.status (`wland loc`). Coordinates are logged rounded to 0.01 deg.
@@ -23,6 +29,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include "abpbridge.h"
 #include "link.h"
 #include "loc.h"
@@ -70,6 +79,79 @@ static struct pds_state pds;
 static int pds_inited;
 
 static unsigned long long now_ms(void) { return (unsigned long long)link_ms(); }
+
+/* ---- xnu 1122: the kernel router's PDS relay ---- */
+#define PDSR_MAGIC	0x52534450u
+struct pdsr {
+	uint32_t magic;
+	uint8_t op, cid;
+	uint16_t flags;
+	uint32_t pipe, sess, tag;
+	uint16_t code, len;
+};
+static int kr_hello_sent, kr_ack = -1;
+static uint64_t kr_next_hello;
+static unsigned kr_reqs, kr_mine, kr_inds;
+int loc_fake_kernel_router;
+
+int loc_kernel_router(void)
+{
+#ifdef __APPLE__
+	static int v = -1;
+	if (v < 0) {
+		int b = 0;
+		size_t n = sizeof(b);
+		v = !sysctlbyname("kern.sweet_bb", &b, &n, NULL, 0) && (b & 2);
+	}
+	return v;
+#else
+	return loc_fake_kernel_router;
+#endif
+}
+
+static int kr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag, unsigned code,
+		   const uint8_t *d, uint32_t len)
+{
+	uint8_t b[sizeof(struct pdsr) + 1024];
+	struct pdsr h = { PDSR_MAGIC, op, (uint8_t)cid, (uint16_t)flags, pipe, sess, tag, (uint16_t)code, (uint16_t)len };
+	if (len > 1024)
+		return -1;
+	memcpy(b, &h, sizeof(h));
+	if (len)
+		memcpy(b + sizeof(h), d, len);
+	return qrtr_send(QRTR_TYPE_DATA, PDSR_WPORT, QRTR_NODE_APPS, PDSR_KPORT, b, (uint32_t)sizeof(h) + len);
+}
+
+/* an indication for locationd's PDS client: through the kernel's relay when it is on, else abpbridge (router mode) */
+static int pds_send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn)
+{
+	if (kr_hello_sent && kr_ack == 1) {
+		if (kr_send(3, cid, 0, pipe, sess, 0, msg, tl, tn) != 0)
+			return -1;
+		kr_inds++;
+		return 0;
+	}
+	return abpbridge_send_ind(pipe, sess, svc, cid, msg, tl, tn);
+}
+
+static void kr_poll(uint64_t now)
+{
+	int want = loc_pds_on() && loc_kernel_router();
+	if (want && now >= kr_next_hello) {
+		kr_next_hello = now + 10000;
+		if (!kr_hello_sent)
+			printf("[%6llu] loc: PDS relay: HELLO to the kernel router (port %#x -> 1:%#x)\n", now_ms(), PDSR_WPORT, PDSR_KPORT);
+		kr_send(1, 0, 0, 0, 0, 0, 0, NULL, 0);
+		kr_hello_sent = 1;
+	} else if (!want && kr_hello_sent) {
+		kr_send(4, 0, 0, 0, 0, 0, 0, NULL, 0);
+		printf("[%6llu] loc: PDS relay: BYE (%u requests, %u answered here, %u indications)\n", now_ms(), kr_reqs, kr_mine,
+		       kr_inds);
+		kr_hello_sent = 0;
+		kr_ack = -1;
+		kr_next_hello = 0;
+	}
+}
 
 int loc_pds_on(void)
 {
@@ -352,6 +434,7 @@ void loc_poll(void)
 	if (!on_present && sess == 0)
 		qn = 0;		/* probe requests still queued: not sent once the file is gone */
 	send_next();
+	kr_poll(now);		/* xnu 1122 */
 	write_status();
 }
 
@@ -411,7 +494,7 @@ static void on_position(const uint8_t *tl, uint32_t tn)
 	uint32_t n = pdsemu_event_report(&f, b, sizeof(b));
 	if (!n)
 		return;
-	if (abpbridge_send_ind(pds.client.pipe, pds.client.sess, PDS_SVC, pds.client.cid, PDS_EVENT_REPORT, b, n) == 0) {
+	if (pds_send_ind(pds.client.pipe, pds.client.sess, PDS_SVC, pds.client.cid, PDS_EVENT_REPORT, b, n) == 0) {
 		npos_sent++;
 		pds.nind++;
 		if (npos_sent <= 3)
@@ -516,6 +599,55 @@ int loc_pds_request(uint32_t pipe, uint32_t sess_id, unsigned cid, const uint8_t
 	*what = a.what;
 	status_dirty = 1;
 	return 1;
+}
+
+void loc_pdsr_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
+{
+	struct pdsr r;
+	(void)h;
+	if (n < sizeof(r))
+		return;
+	memcpy(&r, d, sizeof(r));
+	if (r.magic != PDSR_MAGIC || r.len > n - sizeof(r))
+		return;
+	const uint8_t *data = d + sizeof(r);
+	switch (r.op) {
+	case 0x84:
+		if (kr_ack != (int)r.flags)
+			printf("[%6llu] loc: PDS relay: kernel says kern.sweet_qmux_pds %u (%s)\n", now_ms(), r.flags,
+			       r.flags == 1 ? "locationd's PDS comes here" : "the kernel answers PDS itself");
+		kr_ack = r.flags;
+		break;
+	case 0x81: {
+		int fl = 0, code = 0;
+		const uint8_t *tl = NULL;
+		uint16_t tn = 0;
+		const char *w = "";
+		kr_reqs++;
+		int mine = loc_pds_request(r.pipe, r.sess, r.cid, data, r.len, &fl, &code, &tl, &tn, &w);
+		unsigned msg = r.len >= 5 ? (unsigned)(data[3] | data[4] << 8) : 0;
+		if (mine)
+			kr_mine++;
+		if (kr_reqs <= 40)
+			printf("[%6llu] loc: PDS relay: 0x%04x from pipe %u sess %u cid %u -> %s%s\n", now_ms(), msg, r.pipe, r.sess,
+			       r.cid, mine ? (fl ? "error " : "answered ") : "not ours (kernel policy)", mine ? w : "");
+		kr_send(2, r.cid, (mine ? 1u : 0u) | (mine && fl ? 2u : 0u), r.pipe, r.sess, r.tag, (unsigned)code, tl, tl ? tn : 0);
+		break;
+	}
+	case 0x82:
+		printf("[%6llu] loc: PDS relay: pipe %u sess %u gone (%.*s)\n", now_ms(), r.pipe, r.sess, r.len < 40 ? r.len : 40,
+		       (const char *)data);
+		loc_pds_session_gone(r.pipe, r.sess);
+		break;
+	case 0x83:
+		printf("[%6llu] loc: PDS relay: pipe %u sess %u PDS client id %u %s\n", now_ms(), r.pipe, r.sess, r.cid,
+		       r.flags ? "allocated" : "released");
+		if (!r.flags && pds.client.valid && pds.client.pipe == r.pipe && pds.client.sess == r.sess && pds.client.cid == r.cid)
+			loc_pds_session_gone(r.pipe, r.sess);
+		break;
+	default:
+		break;
+	}
 }
 
 void loc_pds_session_gone(uint32_t pipe, uint32_t sess_id)

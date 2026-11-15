@@ -797,6 +797,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			loc_handle(h, d, n);	/* only with /var/local/loc.on (loc.c) */
 			return;
 		}
+		if (h->dst_port == PDSR_WPORT) {
+			loc_pdsr_handle(h, d, n);	/* xnu 1122: the kernel router's PDS relay (loc.c, pds=1) */
+			return;
+		}
 		if (h->dst_port == SSCTL_PORT) {
 			ssctl_handle(h, d, n);	/* ssctladsp=1 in cell.on (ssctl.c) */
 			return;
