@@ -1,0 +1,123 @@
+From 8d0387f1ccb3b42a9036c9cfaa524f85bdebd0fc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 14:29:18 +0100
+Subject: [PATCH] 1112 redfin: frame queue by default (tribuf 2, queue 1, gate
+ 1); boot-arg sweetframeq=0 restores tribuf 0 / queue 0
+
+j1115 (rk2n4) and the owner's slow-motion film: tribuf 2 + queue 1 with gate 1
+showed no tearing or artefacts, raised moving fps on home pages by ~4.5 and in
+Settings by ~8, removed gate waits and drops. It becomes the default at the
+scanout's start. kern.sweet_scangate_tribuf / _queue / _mode stay writable
+(before the start the written value is taken at the start, as 1105).
+Boot-arg sweetframeq=0: the old defaults (tribuf 0, or 1 with sweetfbx 0x40;
+queue 0). New klog line at the start:
+"SWEET SCANOUT: start: gate G tribuf T queue Q (1112: frame queue default|off, ...)".
+---
+ bsd/dev/sweet_gpu.c                   |  4 +--
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 40 +++++++++++++++++++++++++--
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 91f2c66..e660ad6 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2623,9 +2623,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTL
+  * With tribuf 2 the queued swaps answer Busy, so CA's 3-page ring throttles it to one pending frame behind the one on screen.
+  */
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_queue, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    (void *)2, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: newer swaps queue behind a pending one (1110)");
++    (void *)2, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: newer swaps queue behind a pending one (1110; default 1 since 1112, boot-arg sweetframeq=0: 0)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109)");
++    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109; default 2 since 1112)");
+ 
+ /*
+  * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f77ba0d..fc46332 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -4527,12 +4527,40 @@ sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec)
+  * scanout has started (no thread yet) the value is kept and taken at the start instead of the boot-arg.
+  */
+ static int sweet_scan_gate_req = -1, sweet_scan_tribuf_req = -1;
++static int sweet_scan_queue_req = -1;   /* 1112: kern.sweet_scangate_queue written before the scanout's start */
++
++/*
++ * 1112: the frame queue is the default: tribuf 2 (SwapWait busy until a later swap latched, 1109) + queue 1 (a newer swap
++ * queues behind a pending one, 1110), with the gate's default 1 (boot-arg sweetscangate). Boot-arg sweetframeq=0 restores
++ * the old defaults (tribuf 0, or 1 with sweetfbx 0x40; queue 0). kern.sweet_scangate_tribuf / _queue / _mode stay
++ * writable and win over these defaults (before or after the scanout's start).
++ */
++static int
++sweet_frameq_boot(void)
++{
++	static int fq = -1;
++	if (fq < 0) {
++		uint32_t v = 1;
++		PE_parse_boot_argn("sweetframeq", &v, sizeof(v));
++		fq = v != 0;
++	}
++	return fq;
++}
++
++static int
++sweet_scan_tribuf_default(void)
++{
++	return sweet_frameq_boot() ? 2 : ((sweet_fbx & SWEET_FBX_TRIBUF) != 0);
++}
+ 
+ extern "C" int sweet_scan_gate_get(int what);
+ int
+ sweet_scan_gate_get(int what)
+ {
+ 	if (what == 2) {
++		if (!sweet_scan.thread) {
++			return sweet_scan_queue_req >= 0 ? sweet_scan_queue_req : sweet_frameq_boot();   /* 1112 */
++		}
+ 		return sweet_scan.queue ? 1 : 0;        /* 1110 */
+ 	}
+ 	if (!sweet_scan.thread) {
+@@ -4545,7 +4573,7 @@ sweet_scan_gate_get(int what)
+ 			PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
+ 			return g <= 4 ? (int)g : 1;
+ 		}
+-		return (sweet_fbx & SWEET_FBX_TRIBUF) != 0;
++		return sweet_scan_tribuf_default();     /* 1112 */
+ 	}
+ 	return what == 0 ? (int)sweet_scan.gate : (sweet_scan.pollRel ? 2 : (sweet_scan.tribuf ? 1 : 0));
+ }
+@@ -4561,6 +4589,7 @@ sweet_scan_gate_put(int what, int v)
+ 	if (what == 2) {
+ 		/* 1110: the field alone (fLock not needed: read under fLock at each SwapEnd, a change takes the next one) */
+ 		sweet_scan.queue = v != 0;
++		sweet_scan_queue_req = v;       /* 1112: also the value at the scanout's start */
+ 		IOLog("SWEET SCANOUT: queue %d (%s)\n", v, v ? "a newer swap queues behind a pending one (no replacement until 3 wait)" :
+ 		    "a newer swap replaces a pending one (gate 2 queues)");
+ 		return 0;
+@@ -4610,7 +4639,11 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+ 		uint32_t g = 1;         /* 0989: boot-arg sweetscangate=0|1|2 (default 1, the CPU gate); 1105: 3 */
+ 		PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
+ 		sweet_scan.gate = g <= 4 ? g : 1;
+-		sweet_scan.tribuf = (sweet_fbx & SWEET_FBX_TRIBUF) != 0;     /* 0996 */
++		/* 0996; 1112: tribuf 2 + queue 1 unless boot-arg sweetframeq=0 */
++		int tb = sweet_scan_tribuf_default();
++		sweet_scan.tribuf = tb != 0;
++		sweet_scan.pollRel = tb == 2;
++		sweet_scan.queue = (sweet_scan_queue_req >= 0 ? sweet_scan_queue_req : sweet_frameq_boot()) != 0;
+ 		if (sweet_scan_gate_req >= 0) {
+ 			sweet_scan.gate = (uint32_t)sweet_scan_gate_req;        /* 1105: kern.sweet_scangate_mode before the start */
+ 		}
+@@ -4618,6 +4651,9 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
+ 			sweet_scan.tribuf = sweet_scan_tribuf_req != 0;         /* 1105: kern.sweet_scangate_tribuf */
+ 			sweet_scan.pollRel = sweet_scan_tribuf_req == 2;        /* 1109 */
+ 		}
++		IOLog("SWEET SCANOUT: start: gate %u tribuf %u queue %u (1112: frame queue %s, boot-arg sweetframeq)\n",
++		    sweet_scan.gate, sweet_scan.pollRel ? 2 : (sweet_scan.tribuf ? 1 : 0), sweet_scan.queue ? 1 : 0,
++		    sweet_frameq_boot() ? "default" : "off");
+ 		sweet_scan.thread = IOCreateThread(sweet_scan_thread, fb) != NULL;
+ 		if (!sweet_scan.thread) {
+ 			IOLog("SWEET SCANOUT: no thread: stays off\n");
+-- 
+2.53.0
+

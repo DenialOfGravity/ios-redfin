@@ -1,0 +1,495 @@
+From 826ff86123b691b89de29f90b42c2198ca59cd5a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 14:31:08 +0100
+Subject: [PATCH] 1113 redfin: per-frame pacing trace (kern.sweet_pace_trace,
+ default 0)
+
+j1115: with the frame queue ~28% of home-page frames take 3+ vsyncs (p95 ~52 ms)
+while GPU time is ~9 ms a frame, and nothing says where a slow frame loses its
+time. Per CA swap id (ring of 8, keyed by the IOMFB swap id): SwapBegin entry
+and the vsync tick before it, the swapper's first submit and last display
+submit since its previous SwapEnd (entry and scanout-gate release), SwapEnd
+(fence, frames still ahead of it), GPU done (first time the kernel saw the
+fence landed: scanout thread 1 ms looks / GPU irq, or at SwapEnd), flip,
+latch; vsyncs per frame from latch to latch as SCANOUT 5s frames.
+
+kern.sweet_pace_trace 1: every 5 s two lines
+  SWEET PACE: 5s frames N | vsyncs 1:a 2:b 3:c 4+:d | ... | slow(3+) n S mean/p95 ms:
+    idle | swap->sub | gate | sub->gpudone | gpudone->latch (wait flip->latch) |
+    swap->swapend | slow with: idle>1v gpu>1v prevgpu>1v ahead>=2 wait>1v gate>1ms
+  SWEET PACE: 5s all n N mean ms: (same stages for every frame) | done at SwapEnd |
+    sub before SwapBegin | no SwapBegin | slow lines / lost
+2: also "SWEET PACE: slow swap ID vsyncs K | ..." per 3+ vsync frame (16 per
+5 s, buffered, printed with the 5 s lines, never from the latch path).
+No new locks: a try-lock word (as 1107); the vsync time is 1107's sweet_tt.tick.
+Off: one load per hook (SwapBegin, submit, SwapEnd, scanout step).
+---
+ bsd/dev/sweet_gpu.c                   |   9 +
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 348 +++++++++++++++++++++++++-
+ 2 files changed, 356 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e660ad6..db5dff0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2564,6 +2564,11 @@ uint32_t sweet_scan_submit_gate(uint32_t gf);  /* 0985: SweetFramebuffer.cpp; 09
+ /* 1107: SweetFramebuffer.cpp (touch -> latch stages); kern.sweet_touch_trace 0|1, default 1 */
+ void sweet_touch_trace_submit(int pid, uint64_t now);
+ extern uint32_t sweet_touch_trace;
++/* 1113: SweetFramebuffer.cpp, per-frame pacing trace (SWEET PACE lines); 0 off (default), 1 5 s lines, 2 + slow frames */
++void sweet_pace_trace_submit(int pid, uint32_t gf, uint64_t t0, uint64_t t1);
++extern uint32_t sweet_pace_trace;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pace_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_trace, 0,
++    "SWEET PACE: per-frame pacing trace, 1 5 s lines, 2 also one line per 3+ vsync frame (1113, default 0)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
+     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
+ 
+@@ -2706,6 +2711,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
+ 	int pid = proc_selfpid();
+ 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
+ 	sweet_touch_trace_submit(pid, mach_absolute_time());    /* 1107: touch -> first submit, vsync -> submit */
++	uint64_t pt_abs = __improbable(sweet_pace_trace) ? mach_absolute_time() : 0;     /* 1113 */
+ 	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
+ 	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
+ 	if (sweet_scangate_flag) {
+@@ -2717,6 +2723,9 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
+ 		}
+ 	}
+ 	uint32_t wait_ref = sweet_scan_submit_gate(gf);
++	if (__improbable(pt_abs != 0)) {
++		sweet_pace_trace_submit(pid, gf, pt_abs, mach_absolute_time());       /* 1113: entry, gate released */
++	}
+ 	lck_mtx_lock(&sweet_gpu_lock);
+ 	gpu_note_submit_locked();
+ 	uint64_t gpu_ticks = 0;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fc46332..cfffee9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,7 @@ extern int sweet_fb_early_retire;               /* 1035: bsd/dev/sweet_gpu.c, ke
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ uint32_t sweet_gpu_fence_submitted(void);       /* 0949: CPU present after the GPU has drawn the frame */
+ int sweet_gpu_fence_wait_soft(uint32_t fence, unsigned ms);
++bool sweet_gpu_fence_done(uint32_t fence);      /* 1113: look once */
+ struct processor;                               /* 0946: the present thread on a big core (osfmk/kern/sched_prim.h) */
+ struct processor *thread_bind(struct processor *processor);
+ struct processor *cpu_to_processor(int cpu);
+@@ -469,6 +470,13 @@ static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
+ static void sweet_tt_tick(uint64_t now);        /* 1107 */
+ static void sweet_tt_swap(uint32_t id, uint64_t now);
+ static void sweet_tt_latch(uint32_t swapId, uint64_t now);
++static void sweet_pt_begin(uint32_t id, uint64_t now);  /* 1113 */
++static void sweet_pt_swap(uint32_t id, uint64_t now, uint32_t fence, uint32_t ahead);
++static void sweet_pt_poll(uint64_t now);
++static void sweet_pt_flip(uint32_t id, uint64_t now);
++static void sweet_pt_latch(uint32_t id, uint64_t now, uint64_t per);
++static void sweet_pt_line(void);
++extern "C" uint32_t sweet_pace_trace;
+ 
+ static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
+ static volatile bool sweet_scan_auto_armed;     /* 1046: sweetscanout=2 (default): direct on at the first slot swap */
+@@ -3587,6 +3595,9 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		sweet_scan.stFrames++;
+ 		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.later[i].swap, sweet_scan.later[i].seq, 1, sweet_scan.depth);    /* 0994 */
+ 		sweet_tt_swap(sweet_scan.later[i].swap, now);   /* 1107 */
++		if (__improbable(sweet_pace_trace)) {
++			sweet_pt_swap(sweet_scan.later[i].swap, now, fence, (sweet_scan.flipping != NULL) + 1 + i);   /* 1113 */
++		}
+ 		IOLockWakeup(fb->fLock, &sweet_scan, false);
+ 		IOLockUnlock(fb->fLock);
+ 		return true;
+@@ -3620,6 +3631,9 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	sweet_scan.stFrames++;
+ 	SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.nextSwap, seq, 0, sweet_scan.depth);    /* 0994 */
+ 	sweet_tt_swap(sweet_scan.nextSwap, now);        /* 1107 */
++	if (__improbable(sweet_pace_trace)) {
++		sweet_pt_swap(sweet_scan.nextSwap, now, fence, sweet_scan.flipping != NULL);  /* 1113 */
++	}
+ 	IOLockWakeup(fb->fLock, &sweet_scan, false);
+ 	/*
+ 	 * Back pressure (0979: by CA's chain depth N, the different surfaces of the last 8 slot frames). CA draws frame
+@@ -4129,6 +4143,319 @@ sweet_tt_line(void)
+ 	    tn1, TT2(v[1]));
+ #undef TT2
+ }
++/*
++ * 1113: kern.sweet_pace_trace (default 0; bsd/dev/sweet_gpu.c): where a presented frame loses its time. Per CA swap id
++ * (ring of 8): SwapBegin (IOMFB user client entry), the vsync tick before it, the swapper's first GPU submit and its last
++ * display submit since the previous SwapEnd (entry, and return from the scanout gate = release), SwapEnd (+ its fence and
++ * the frames still ahead of it: flipping / next / queued), GPU done (first time the kernel saw the fence landed: the
++ * scanout thread's 1 ms looks / GPU interrupt, or SwapEnd if it had landed by then), flip (programmed into the pipes:
++ * after the queue/previous latch released it), latch. Vsyncs per frame from latch to latch (as SCANOUT 5s frames).
++ * Line every 5 s: SWEET PACE: 5s ... with mean/p95 of each stage for 3+ vsync frames and the mean for all frames, plus
++ * counts of what the slow frames coincide with. 2 = also one SWEET PACE: slow line per 3+ vsync frame (16 per 5 s,
++ * kept in a buffer and printed with the 5 s line, never from the latch path). No locks: a try-lock word as 1107; the
++ * vsync tick is 1107's sweet_tt.tick (stored on every tick already). 0 = one load per hook.
++ */
++extern "C" uint32_t sweet_pace_trace;
++uint32_t sweet_pace_trace = 0;
++#define SWEET_PT_BINS   256             /* 0.5 ms bins to 128 ms */
++#define SWEET_PT_ST     8               /* idle, swap->sub, gate, sub->gpudone, gpudone->latch, wait (done->flip), flip->latch, swap->swapend */
++#define SWEET_PT_SLOW   16
++static struct {
++	volatile SInt32 busy;
++	struct {
++		uint32_t id, fence, ahead;
++		uint64_t begin, tick, sub0, subD, rel, end, done, flip;
++	} f[8];
++	uint64_t pSub0, pSubD, pRel;    /* the swapper's submits since its last SwapEnd */
++	uint32_t pSubN;
++	uint64_t lastLatch, lastLatchTick, prevGpu;
++	/* window */
++	uint32_t n, per[4], pauses, unmatched, doneAtEnd, subBeforeBegin, noBegin;
++	uint64_t sumAll[SWEET_PT_ST], sumSlow[SWEET_PT_ST];
++	uint32_t nAll, nSlow;
++	uint16_t h[SWEET_PT_ST][SWEET_PT_BINS];
++	uint32_t cIdle, cGpu, cPrevGpu, cAhead, cWait, cGate;   /* slow frames: idle > 1 vsync, GPU > 1 vsync, ... */
++	uint32_t subsAll;
++	struct { uint32_t id, k, ahead, phase, prevGpu, nsub; uint32_t st[SWEET_PT_ST]; } slow[SWEET_PT_SLOW];
++	uint32_t slowN, slowLost;
++} sweet_pt;
++
++static bool
++sweet_pt_take(void)
++{
++	return OSCompareAndSwap(0, 1, (volatile UInt32 *)&sweet_pt.busy);
++}
++
++static void
++sweet_pt_give(void)
++{
++	OSCompareAndSwap(1, 0, (volatile UInt32 *)&sweet_pt.busy);
++}
++
++static uint32_t
++sweet_pt_us(uint64_t a, uint64_t b)    /* b - a in us, 0 if either is unset or b < a */
++{
++	if (a == 0 || b == 0 || b <= a) {
++		return 0;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(b - a, &ns);
++	return ns / 1000 > 0xffffffffULL ? 0xffffffffu : (uint32_t)(ns / 1000);
++}
++
++/* SwapBegin (any process: only the swapper swaps) */
++static void
++sweet_pt_begin(uint32_t id, uint64_t now)
++{
++	if (!sweet_pt_take()) {
++		return;
++	}
++	bzero(&sweet_pt.f[id & 7], sizeof(sweet_pt.f[0]));
++	sweet_pt.f[id & 7].id = id;
++	sweet_pt.f[id & 7].begin = now;
++	sweet_pt.f[id & 7].tick = sweet_tt.tick;
++	sweet_pt_give();
++}
++
++/* sweet_gpu_submit_v2: entry t0, after the scanout gate t1 */
++extern "C" void sweet_pace_trace_submit(int pid, uint32_t gf, uint64_t t0, uint64_t t1);
++void
++sweet_pace_trace_submit(int pid, uint32_t gf, uint64_t t0, uint64_t t1)
++{
++	if (pid != sweet_scan.gatePid || pid == 0 || !sweet_pt_take()) {
++		return;
++	}
++	if (sweet_pt.pSub0 == 0) {
++		sweet_pt.pSub0 = t0;
++	}
++	sweet_pt.pSubN++;
++	if ((gf & 3u) != 2u) {          /* a display submit (or unflagged): the frame's own, its fence is the SwapEnd's */
++		sweet_pt.pSubD = t0;
++		sweet_pt.pRel = t1;
++	}
++	sweet_pt_give();
++}
++
++/* SwapEnd taken by the direct scanout (with fLock): ahead = frames not latched yet in front of it */
++static void
++sweet_pt_swap(uint32_t id, uint64_t now, uint32_t fence, uint32_t ahead)
++{
++	if (sweet_pace_trace == 0 || !sweet_pt_take()) {
++		return;
++	}
++	auto *f = &sweet_pt.f[id & 7];
++	if (f->id != id || f->end != 0) {
++		bzero(f, sizeof(*f));   /* no SwapBegin seen for it (trace just turned on) */
++		f->id = id;
++	}
++	f->sub0 = sweet_pt.pSub0;
++	f->subD = sweet_pt.pSubD;
++	f->rel = sweet_pt.pRel;
++	f->end = now;
++	f->fence = fence;
++	f->ahead = ahead | (sweet_pt.pSubN << 8);
++	if (fence == 0 || sweet_gpu_fence_done(fence)) {
++		f->done = now;
++		sweet_pt.doneAtEnd++;
++	}
++	sweet_pt.pSub0 = sweet_pt.pSubD = sweet_pt.pRel = 0;
++	sweet_pt.pSubN = 0;
++	sweet_pt_give();
++}
++
++/* scanout thread, with fLock: fences of frames swapped and not yet seen done */
++static void
++sweet_pt_poll(uint64_t now)
++{
++	if (!sweet_pt_take()) {
++		return;
++	}
++	for (int i = 0; i < 8; i++) {
++		auto *f = &sweet_pt.f[i];
++		if (f->end != 0 && f->done == 0 && sweet_gpu_fence_done(f->fence)) {
++			f->done = now;
++		}
++	}
++	sweet_pt_give();
++}
++
++static void
++sweet_pt_flip(uint32_t id, uint64_t now)
++{
++	if (sweet_pace_trace == 0 || !sweet_pt_take()) {
++		return;
++	}
++	auto *f = &sweet_pt.f[id & 7];
++	if (f->id == id && f->end != 0) {
++		if (f->done == 0) {
++			f->done = now;  /* the flip saw it landed this same look */
++		}
++		f->flip = now;
++	}
++	sweet_pt_give();
++}
++
++static void
++sweet_pt_latch(uint32_t id, uint64_t now, uint64_t per)
++{
++	if (sweet_pace_trace == 0 || !sweet_pt_take()) {
++		return;
++	}
++	auto *f = &sweet_pt.f[id & 7];
++	uint64_t prev = sweet_pt.lastLatch;
++	sweet_pt.lastLatch = now;
++	uint32_t k = 0;
++	if (prev != 0 && now > prev) {
++		uint32_t us = sweet_pt_us(prev, now);
++		if (us >= 100000) {
++			sweet_pt.pauses++;
++		} else {
++			k = (uint32_t)((now - prev + per / 2) / per);
++			k = k < 1 ? 1 : k;
++			sweet_pt.per[k >= 4 ? 3 : k - 1]++;
++			sweet_pt.n++;
++		}
++	}
++	if (k == 0) {
++		bzero(f, sizeof(*f));
++		sweet_pt_give();
++		return;
++	}
++	if (f->id != id || f->end == 0 || f->flip == 0) {
++		sweet_pt.unmatched++;
++		bzero(f, sizeof(*f));
++		sweet_pt_give();
++		return;
++	}
++	uint64_t start = f->begin != 0 ? f->begin : f->sub0;
++	if (f->begin == 0) {
++		sweet_pt.noBegin++;
++	}
++	if (f->begin != 0 && f->subD != 0 && f->subD < f->begin) {
++		sweet_pt.subBeforeBegin++;
++	}
++	uint64_t done = f->done != 0 ? f->done : f->flip;
++	uint32_t st[SWEET_PT_ST];
++	st[0] = sweet_pt_us(prev, start);                       /* idle: previous latch -> this frame's SwapBegin */
++	st[1] = sweet_pt_us(f->begin, f->subD);                 /* SwapBegin -> display submit (CA's CPU work) */
++	st[2] = sweet_pt_us(f->subD, f->rel);                   /* scanout gate */
++	st[3] = sweet_pt_us(f->rel != 0 ? f->rel : f->subD, done);     /* submit (released) -> GPU done seen */
++	st[4] = sweet_pt_us(done, now);                         /* GPU done -> latch */
++	st[5] = sweet_pt_us(done > f->end ? done : f->end, f->flip);  /* done and swapped -> flipped (queue / prev latch) */
++	st[6] = sweet_pt_us(f->flip, now);                      /* flip -> latch (the panel edge) */
++	st[7] = sweet_pt_us(f->begin, f->end);                  /* SwapBegin -> SwapEnd */
++	sweet_pt.nAll++;
++	for (int i = 0; i < SWEET_PT_ST; i++) {
++		sweet_pt.sumAll[i] += st[i];
++	}
++	uint32_t perUs = sweet_pt_us(1, 1 + per);
++	if (k >= 3) {
++		sweet_pt.nSlow++;
++		for (int i = 0; i < SWEET_PT_ST; i++) {
++			sweet_pt.sumSlow[i] += st[i];
++			uint32_t b = st[i] / 500;
++			b = b < SWEET_PT_BINS ? b : SWEET_PT_BINS - 1;
++			if (sweet_pt.h[i][b] != 0xffff) {
++				sweet_pt.h[i][b]++;
++			}
++		}
++		sweet_pt.cIdle += st[0] > perUs;
++		sweet_pt.cGpu += st[3] > perUs;
++		sweet_pt.cPrevGpu += sweet_pt.prevGpu > perUs;
++		sweet_pt.cAhead += (f->ahead & 0xff) >= 2;
++		sweet_pt.cWait += st[5] > perUs;
++		sweet_pt.cGate += st[2] > 1000;
++		if (sweet_pace_trace >= 2) {
++			if (sweet_pt.slowN < SWEET_PT_SLOW) {
++				auto *r = &sweet_pt.slow[sweet_pt.slowN++];
++				r->id = id;
++				r->k = k;
++				r->ahead = f->ahead & 0xff;
++				r->nsub = f->ahead >> 8;
++				r->phase = f->begin != 0 && f->tick != 0 ? sweet_pt_us(f->tick, f->begin) : 0;
++				r->prevGpu = (uint32_t)sweet_pt.prevGpu;
++				memcpy(r->st, st, sizeof(st));
++			} else {
++				sweet_pt.slowLost++;
++			}
++		}
++	}
++	sweet_pt.prevGpu = st[3];
++	bzero(f, sizeof(*f));
++	sweet_pt_give();
++}
++
++static uint32_t
++sweet_pt_p95(const uint16_t *h, uint32_t n)
++{
++	uint32_t want = (n * 95 + 99) / 100, acc = 0;
++	for (uint32_t i = 0; n != 0 && i < SWEET_PT_BINS; i++) {
++		acc += h[i];
++		if (acc >= want) {
++			return i * 5 + 5;       /* upper edge, 0.1 ms */
++		}
++	}
++	return 0;
++}
++
++/* with fLock, from the 5 s stats */
++static void
++sweet_pt_line(void)
++{
++	if (sweet_pace_trace == 0 || !sweet_pt_take()) {
++		return;
++	}
++	if (sweet_pt.n == 0 && sweet_pt.unmatched == 0) {
++		sweet_pt_give();
++		return;
++	}
++	uint32_t ma[SWEET_PT_ST], ms[SWEET_PT_ST], p[SWEET_PT_ST];
++	for (int i = 0; i < SWEET_PT_ST; i++) {
++		ma[i] = sweet_pt.nAll ? (uint32_t)(sweet_pt.sumAll[i] / sweet_pt.nAll / 100) : 0;     /* 0.1 ms */
++		ms[i] = sweet_pt.nSlow ? (uint32_t)(sweet_pt.sumSlow[i] / sweet_pt.nSlow / 100) : 0;
++		p[i] = sweet_pt_p95(sweet_pt.h[i], sweet_pt.nSlow);
++	}
++#define PT1(a) (a) / 10, (a) % 10
++#define PT2(i) PT1(ms[i]), PT1(p[i])
++	IOLog("SWEET PACE: 5s frames %u | vsyncs 1:%u 2:%u 3:%u 4+:%u | pauses %u unmatched %u | slow(3+) n %u mean/p95 ms: "
++	    "idle %u.%u/%u.%u | swap->sub %u.%u/%u.%u | gate %u.%u/%u.%u | sub->gpudone %u.%u/%u.%u | gpudone->latch %u.%u/%u.%u "
++	    "(wait %u.%u/%u.%u flip->latch %u.%u/%u.%u) | swap->swapend %u.%u/%u.%u | slow with: idle>1v %u gpu>1v %u "
++	    "prevgpu>1v %u ahead>=2 %u wait>1v %u gate>1ms %u\n",
++	    sweet_pt.n, sweet_pt.per[0], sweet_pt.per[1], sweet_pt.per[2], sweet_pt.per[3], sweet_pt.pauses, sweet_pt.unmatched,
++	    sweet_pt.nSlow, PT2(0), PT2(1), PT2(2), PT2(3), PT2(4), PT2(5), PT2(6), PT2(7), sweet_pt.cIdle, sweet_pt.cGpu,
++	    sweet_pt.cPrevGpu, sweet_pt.cAhead, sweet_pt.cWait, sweet_pt.cGate);
++	IOLog("SWEET PACE: 5s all n %u mean ms: idle %u.%u | swap->sub %u.%u | gate %u.%u | sub->gpudone %u.%u | "
++	    "gpudone->latch %u.%u (wait %u.%u flip->latch %u.%u) | swap->swapend %u.%u | done at SwapEnd %u | sub before "
++	    "SwapBegin %u | no SwapBegin %u | slow lines %u lost %u\n", sweet_pt.nAll, PT1(ma[0]), PT1(ma[1]), PT1(ma[2]),
++	    PT1(ma[3]), PT1(ma[4]), PT1(ma[5]), PT1(ma[6]), PT1(ma[7]), sweet_pt.doneAtEnd, sweet_pt.subBeforeBegin,
++	    sweet_pt.noBegin, sweet_pt.slowN, sweet_pt.slowLost);
++	for (uint32_t j = 0; j < sweet_pt.slowN; j++) {
++		auto *r = &sweet_pt.slow[j];
++		uint32_t s[SWEET_PT_ST];
++		for (int i = 0; i < SWEET_PT_ST; i++) {
++			s[i] = r->st[i] / 100;
++		}
++		IOLog("SWEET PACE: slow swap %u vsyncs %u | idle %u.%u | swap->sub %u.%u | gate %u.%u | sub->gpudone %u.%u | "
++		    "gpudone->latch %u.%u (wait %u.%u flip->latch %u.%u) | swap->swapend %u.%u | ahead %u | submits %u | "
++		    "prev gpu %u.%u | SwapBegin %u.%u ms after tick\n", r->id, r->k, PT1(s[0]), PT1(s[1]), PT1(s[2]), PT1(s[3]),
++		    PT1(s[4]), PT1(s[5]), PT1(s[6]), PT1(s[7]), r->ahead, r->nsub, PT1(r->prevGpu / 100), PT1(r->phase / 100));
++	}
++#undef PT2
++#undef PT1
++	uint64_t ll = sweet_pt.lastLatch, pg = sweet_pt.prevGpu;
++	sweet_pt.n = sweet_pt.pauses = sweet_pt.unmatched = sweet_pt.doneAtEnd = sweet_pt.subBeforeBegin = sweet_pt.noBegin = 0;
++	bzero(sweet_pt.per, sizeof(sweet_pt.per));
++	bzero(sweet_pt.sumAll, sizeof(sweet_pt.sumAll));
++	bzero(sweet_pt.sumSlow, sizeof(sweet_pt.sumSlow));
++	bzero(sweet_pt.h, sizeof(sweet_pt.h));
++	sweet_pt.nAll = sweet_pt.nSlow = 0;
++	sweet_pt.cIdle = sweet_pt.cGpu = sweet_pt.cPrevGpu = sweet_pt.cAhead = sweet_pt.cWait = sweet_pt.cGate = 0;
++	sweet_pt.slowN = sweet_pt.slowLost = 0;
++	sweet_pt.lastLatch = ll;
++	sweet_pt.prevGpu = pg;
++	sweet_pt_give();
++}
++
+ #define SWEET_SF_BINS   1000                            /* 0.1 ms bins to 100 ms */
+ static struct {
+ 	uint64_t lastLatch, prevIntv;
+@@ -4215,6 +4542,9 @@ sweet_sf_line_locked(void)
+ static bool
+ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ {
++	if (__improbable(sweet_pace_trace)) {
++		sweet_pt_poll(now);     /* 1113: GPU done of the frames swapped and not flipped yet */
++	}
+ 	if (sweet_scan.flipping != NULL) {
+ 		/*
+ 		 * 0979: on screen once INTF1's frame counter (0x6b8ac, the one that works; the tear-check TE counter reads 0)
+@@ -4237,6 +4567,13 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		uint64_t l = now - sweet_scan.flipSwapAbs;
+ 		sweet_scan_frame_latched(fb, now, sweet_scan.flipSwapAbs);    /* 1044 */
+ 		sweet_tt_latch(sweet_scan.flipSwap, now);       /* 1107 */
++		if (__improbable(sweet_pace_trace)) {
++			uint64_t per = fb->fFcPeriod;   /* 1113: as sweet_scan_frame_latched */
++			if (per == 0) {
++				nanoseconds_to_absolutetime(fb->fHz == 90 ? 11111111ULL : 16666667ULL, &per);
++			}
++			sweet_pt_latch(sweet_scan.flipSwap, now, per);
++		}
+ 		OSAddAtomic64(1, &sweet_fb_frames);    /* 1060 */
+ 		sweet_scan.stLatched++;
+ 		sweet_scan.stLatchN++;
+@@ -4338,6 +4675,9 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 	sweet_scan.flipping = s;
+ 	sweet_scan.flipSeq = sSeq;
+ 	sweet_scan.flipSwap = sSwap;
++	if (__improbable(sweet_pace_trace)) {
++		sweet_pt_flip(sSwap, now);      /* 1113 */
++	}
+ 	sweet_scan.flipSwapAbs = sAbs;
+ 	sweet_scan.flipAbs = now;
+ 	sweet_scan.stFlips++;
+@@ -4379,6 +4719,7 @@ sweet_scan_stats_locked(uint64_t now)
+ 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
+ 	sweet_sf_line_locked();         /* 1044 */
+ 	sweet_tt_line();                /* 1107 */
++	sweet_pt_line();                /* 1113 */
+ 	{
+ 		uint64_t gw = 0;    /* 0985 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+@@ -5725,13 +6066,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
+ 		outCount = 1;
+ 		break;
+-	case kSweetFBSwapBegin:
++	case kSweetFBSwapBegin: {
++		uint64_t ptAbs = __improbable(sweet_pace_trace) ? mach_absolute_time() : 0;    /* 1113 */
+ 		IOLockLock(fFB->fLock);
+ 		out[0] = ++fFB->fSwapID;
+ 		IOLockUnlock(fFB->fLock);
++		if (ptAbs != 0) {
++			sweet_pt_begin((uint32_t)out[0], ptAbs);
++		}
+ 		outCount = 1;
+ 		sweet_swaptrace('B', (uint32_t)out[0]);  /* 0987 */
+ 		break;
++	}
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+ 		if (args->structureInputDescriptor != NULL ||
+-- 
+2.53.0
+
