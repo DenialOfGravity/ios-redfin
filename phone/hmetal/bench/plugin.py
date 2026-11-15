@@ -297,6 +297,8 @@ static struct {
 	double gpuUs, passUs;
 	unsigned long long cleared, loaded, stored;
 	unsigned hist[6];   /* draw passes by their draws: 0, 1, 2-4, 5-15, 16-55, 56 and more */
+	unsigned long long sync[24];   /* (ws-hm-perf2) hakios_metal_cb_sync_counts summed over the buffers */
+	unsigned synced;
 	struct hm_prof_class cls[HM_PROF_CLASSES];
 } hm_prof = { PTHREAD_MUTEX_INITIALIZER };
 
@@ -326,6 +328,17 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 	} else if (cb != NULL) {
 		hm_prof.buffers++;
 		hm_prof.gpuUs += gpu * 1e6;
+		{   /* (ws-hm-perf2) the sync line: the GPU's own time, the census, the pass switches' counts */
+			unsigned long long v[24];
+			const int got = hakios_metal_cb_sync_counts(cb, v, 24);
+
+			for (int k = 0; k < got; k++) {
+				hm_prof.sync[k] += v[k];
+			}
+			if (got > 0) {
+				hm_prof.synced++;
+			}
+		}
 		for (unsigned i = 0;; i++) {
 			unsigned kind = 0, w = 0, h = 0, draws = 0, format = 0, tiling = 0, gmem, la = 255, sa = 255;
 			unsigned long long c = 0, l = 0, st = 0;
@@ -387,6 +400,25 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 			 hm_prof.loads[0], hm_prof.loads[1], hm_prof.loads[2], hm_prof.loads[3],
 			 hm_presents_seen ? "frames = presentDrawable" : "frames = buffers that drew the display's IOSurface",
 			 hm_prof.other != 0 ? " (passes past the classes not listed)" : "");
+		{   /* (ws-hm-perf2) the sync line, a frame: the GPU's stamped time against the passes' stamps, what lies outside them */
+			static unsigned long long was[4];
+			unsigned long long sp[4];
+			const unsigned long long *y = hm_prof.sync;
+			const double gpuMs = y[0] / 1e6 / frames, preMs = y[1] / 1e6 / frames, passMs = hm_prof.passUs / 1e3 / frames;
+
+			hakios_metal_pass_splits(sp);
+			hm_print("prof: sync: a frame: GPU stamped %.2f ms (+%.2f in decode buffers), passes' stamps %.2f, outside them %.2f; "
+				 "%.1f passes, %.1f WFIs, CCU flushes %.1f colour %.1f depth, %.1f cache flushes, %.1f waits, %.1f CACHE_INVALIDATE, "
+				 "%.1f CCU invalidates, %.0f words (%.0f register), %.0f words by CP_MEMCPY, %.1f CP copies/fills (%.0f KB, unstamped), "
+				 "%.1f blits; HM_PASS_FLUSH tails left out %.1f, barriers %.1f full %.1f invalidate, %.1f late tails; HM_PASS_STATIC heads carried %.1f; "
+				 "HM_PASS_MERGE store joins %.1f; reopened on the same target (5 s) by a Clear %llu, state %llu, GMEM %llu, between %llu (%s)\n",
+				 gpuMs, preMs, passMs, gpuMs - passMs, y[20] / frames, y[4] / frames, y[5] / frames, y[6] / frames, y[7] / frames,
+				 y[8] / frames, y[9] / frames, y[10] / frames, y[2] / frames, y[3] / frames, y[11] / frames, y[18] / frames,
+				 y[19] / 1e3 / frames, y[22] / frames, y[12] / frames, y[13] / frames, y[14] / frames, y[15] / frames, y[16] / frames,
+				 y[17] / frames, sp[0] - was[0], sp[1] - was[1], sp[2] - was[2], sp[3] - was[3],
+				 getenv("HM_PASS_FLUSH") ? getenv("HM_PASS_FLUSH") : "lazy");
+			memcpy(was, sp, sizeof(was));
+		}
 		qsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);
 		for (int k = 0; k < 12 && hm_prof.cls[k].count != 0; k++) {
 			const struct hm_prof_class *x = &hm_prof.cls[k];

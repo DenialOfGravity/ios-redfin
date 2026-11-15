@@ -92,3 +92,12 @@ HM_PREWARM=1
 # refuses the flag once and it is turned off for the process (default 0 until the kernel side exists)
 #HM_GATE_FLAG=1
 #HM_GATE_FLAG_SURF=1125x2436
+# ---- (ws-hm-perf2) pass switches, each at its compiled default (uncomment to change) ----
+# a sysmem pass that another draw pass follows ends without its tail (CCU flush + cache flush, each waited for); a
+# barrier (CCU flush + CACHE_INVALIDATE) goes before whatever reads what it drew; always = hm-int5's tail after every pass
+#HM_PASS_FLUSH=always
+# a draw pass right after a sysmem pass leaves out the batch start (invalidates, ~100 static registers, VFD sizes) and
+# the CCU set-up with its WFI, and dedups its registers against what that pass left: 0 = every pass its own head
+#HM_PASS_STATIC=0
+# a pass into the open sysmem pass's attachments that differs only by store actions joins it: 0 = a pass of its own
+#HM_PASS_MERGE=0
