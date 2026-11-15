@@ -1450,6 +1450,16 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         return nullptr;
     }
     const std::string name = "IOSurface " + n(surfaceId);
+    // (redfin ws-hm-ubwc) a surface the kernel made compressed (a UBWC scanout surface: kHakiosSurfaceUbwc answers its
+    // layout) is drawn into and sampled as a compressed render target over the surface's own memory, under
+    // HM_UBWC_DISPLAY=1; under 0 (the default) it is refused by name, since linear rows drawn into it would be scanned
+    // out through flags that say otherwise. A transport or kernel that does not answer leaves every surface linear.
+    {
+        HakiosSurfaceUbwc u{};
+        if (!info->twoPlane && gpu.surfaceUbwc(surfaceId, &u) == 0) {
+            return wrapUbwcSurface(gpu, std::move(buffer), s, u, name, desc, info, surfaceId, why);
+        }
+    }
     if (info->twoPlane) {
         std::shared_ptr<Texture> t = wrapTwoPlanes(std::move(buffer), s, name, desc, info, chroma, why);
         if (t != nullptr) t->surface_ = surfaceId;
@@ -1518,6 +1528,76 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         t->surfaceH_ = s.height;
     }
     return t;
+}
+
+// (redfin ws-hm-ubwc) HM_UBWC_DISPLAY: 0 (default) a UBWC surface is refused; 1 it is drawn compressed
+bool ubwcDisplayOn() {
+    const char* e = getenv("HM_UBWC_DISPLAY");   // (read at each compressed surface's wrap: a few a second at most)
+    return e != nullptr && atoi(e) != 0;
+}
+
+// (redfin ws-hm-ubwc) a UBWC surface (wrapSurface): the kernel's layout checked against the one fdl6 gives this chip for
+// the surface's size -- the GPU and the display engine read the same planes only if they agree on every pitch and
+// offset -- then a compressed texture over the surface's memory: the flag plane at META, the colour plane at DATA.
+// One level of 2D, single-sampled, the whole surface, RGBA8-sized ('BGRA' or 'RGBA'), not shader-written; the same
+// highest bank bit as the GPU's (the MDP must decode with the swizzle the GPU encoded with).
+std::shared_ptr<Texture> Texture::wrapUbwcSurface(Gpu& gpu, std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const HakiosSurfaceUbwc& u,
+                                                  const std::string& name, const TextureDesc& desc, const FormatInfo* info, uint32_t surfaceId,
+                                                  std::string* why) {
+    if (!ubwcDisplayOn()) {
+        refuse(why, name + " is UBWC-compressed (the kernel's layout, UBWC " + n(u.version) + ") and HM_UBWC_DISPLAY is 0: rows drawn linear "
+                    "into it would be scanned out through flags that say otherwise");
+        return nullptr;
+    }
+#ifdef HAKIOS_METAL_MESA
+    const bool fourcc = s.pixelFormat == 0x42475241u || s.pixelFormat == 0x52474241u;   // 'BGRA', 'RGBA'
+    if (!fourcc || s.planes != 1 || info->fmt6 != FMT6_8_8_8_8_UNORM || info->bytesPerPixel != 4 || desc.width != s.width || desc.height != s.height ||
+        desc.mipLevels != 1 || desc.samples != 1 || (desc.usage & kTextureUsageWrite) != 0 || u.version < 3) {
+        refuse(why, "a " + std::string(info->name) + " " + n(desc.width) + "x" + n(desc.height) + " texture over the compressed " + name + " (" + n(s.width) + "x" +
+                        n(s.height) + ", format " + n(s.pixelFormat) + ", " + n(s.planes) + " plane(s), UBWC " + n(u.version) +
+                        "): the whole surface as one level of RGBA8-sized 2D, not shader-written, UBWC 3 or later, is what is served");
+        return nullptr;
+    }
+    fd_dev_id id{};
+    id.chip_id = a6xx::chip().chipId;
+    const struct ::fd_dev_info* dev = ::fd_dev_info_raw(&id);
+    fdl_layout l{};
+    l.ubwc = true;
+    l.tile_mode = a6xx::TILE6_3;
+    if (dev == nullptr || !fdl6_layout(&l, dev, PIPE_FORMAT_R8G8B8A8_UNORM, 1, desc.width, desc.height, 1, 1, 1, false, false, true, nullptr) || !l.ubwc) {
+        refuse(why, "no UBWC layout for the " + n(desc.width) + " x " + n(desc.height) + " " + name + " on this chip");
+        return nullptr;
+    }
+    const uint64_t rows = (uint64_t(desc.height) + 15) / 16 * 16;
+    const bool agrees = u.dataPitch == fdl_pitch(&l, 0) && u.metaPitch == fdl_ubwc_pitch(&l, 0) && u.metaSize >= l.ubwc_layer_size &&
+                        u.metaOffset % 4096 == 0 && u.dataOffset % 4096 == 0 && u.dataOffset >= u.metaOffset + l.ubwc_layer_size &&
+                        uint64_t(s.offset) + u.metaOffset + u.metaSize <= s.size && uint64_t(s.offset) + u.dataOffset + uint64_t(u.dataPitch) * rows <= s.size &&
+                        s.offset % 4096 == 0 && u.highestBankBit == gpu.ubwc().highestBankBit;
+    if (!agrees) {
+        refuse(why, name + "'s UBWC layout (meta at " + n(u.metaOffset) + " pitch " + n(u.metaPitch) + " size " + n(u.metaSize) + ", colour at " + n(u.dataOffset) +
+                        " pitch " + n(u.dataPitch) + ", highest bank bit " + n(u.highestBankBit) + ", in " + n(s.size) + " bytes from " + n(s.offset) +
+                        ") is not this GPU's for the size (meta pitch " + n(fdl_ubwc_pitch(&l, 0)) + " size " + n(uint64_t(l.ubwc_layer_size)) + ", colour pitch " +
+                        n(fdl_pitch(&l, 0)) + ", highest bank bit " + n(gpu.ubwc().highestBankBit) + ")");
+        return nullptr;
+    }
+    uint32_t bw = 0, bh = 0;
+    fdl6_get_ubwc_blockwidth(&l, &bw, &bh);
+    auto log2ceil = [](uint32_t v) { uint32_t r = 0; while ((1u << r) < v) r++; return r; };
+    Texture* t = new Texture(std::move(buffer), desc, info, u.dataPitch, uint64_t(s.offset) + u.dataOffset, l.pitchalign - 6, surfaceId);
+    t->ubwc_ = true;
+    t->ubwcOffset_ = uint64_t(s.offset) + u.metaOffset;
+    t->ubwcPitch_ = u.metaPitch;
+    t->ubwcLayerSize_ = l.ubwc_layer_size;
+    t->ubwcLogW_ = log2ceil((desc.width + bw - 1) / bw);
+    t->ubwcLogH_ = log2ceil((desc.height + bh - 1) / bh);
+    t->surfaceW_ = s.width;
+    t->surfaceH_ = s.height;
+    return adopt(t);
+#else
+    (void)gpu, (void)buffer, (void)s, (void)desc, (void)info, (void)surfaceId;
+    refuse(why, name + " is UBWC-compressed and this build has no Mesa (the UBWC layout is fdl6's)");
+    return nullptr;
+#endif
 }
 
 // A '420f' or '420v' surface as one YCbCr8_420_2P texture: plane 0 the luma rows the kernel describes, plane 1 the

@@ -3802,6 +3802,75 @@ TEST(a_depth16_attachment_is_drawn_tested_cleared_and_sampled) {
 
 // --- a texture over an IOSurface: the path to the screen's memory -----------------------------------------------------------
 
+// (redfin ws-hm-ubwc) HM_UBWC_DISPLAY: a surface the kernel made compressed (its layout answered by kHakiosSurfaceUbwc,
+// the redfin kernel's BO metadata) is refused under 0 (linear rows into it would be scanned out wrong), and under 1 is a
+// compressed render target over the surface's memory: the flag plane at the kernel's meta offset, the colour plane at
+// its data offset, drawn through RB_MRT's flags and sampled through a FLAG descriptor; a layout that is not fdl6's for
+// the size (another meta pitch) or another highest bank bit is refused by name.
+TEST(a_compressed_display_surface_is_drawn_through_its_flags_only_under_HM_UBWC_DISPLAY) {
+    using namespace a6xx;
+    Rig r;
+    const uint32_t kBGRA = 0x42475241u, W = 128, H = 72;
+    // the layout fdl6 gives (the kernel must allocate the same): from a compressed render target of the size
+    auto probe = ubwcTarget(r, W, H);
+    if (probe == nullptr) return;
+    const uint32_t metaSize = (probe->flagLayerSize() + 4095) & ~4095u;
+    HakiosSurfaceUbwc u{0, 3, 0, probe->flagPitch(), metaSize, metaSize, uint32_t(probe->level(0).pitch), r.gpu->ubwc().highestBankBit};
+    r.fake->addSurface(21, W, H, uint32_t(probe->level(0).pitch), kBGRA);
+    r.fake->addSurfaceUbwc(21, u);
+    TextureDesc d;
+    d.format = PixelFormat::kBGRA8Unorm;
+    d.width = W;
+    d.height = H;
+    d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    std::string why;
+    unsetenv("HM_UBWC_DISPLAY");
+    CHECK(Texture::wrapSurface(*r.gpu, 21, d, &why) == nullptr);
+    CHECK(has(why, "HM_UBWC_DISPLAY is 0"));
+    setenv("HM_UBWC_DISPLAY", "1", 1);
+    auto t = Texture::wrapSurface(*r.gpu, 21, d, &why);
+    CHECK(t != nullptr);
+    if (t == nullptr) { std::printf("       %s\n", why.c_str()); unsetenv("HM_UBWC_DISPLAY"); return; }
+    CHECK(t->compressed() && t->contents() == nullptr && t->surface() == 21u);
+    CHECK_EQ(t->flagAddress(), t->buffer()->gpuAddress());
+    CHECK_EQ(t->gpuAddress(), t->buffer()->gpuAddress() + metaSize);
+    RenderPass pass;
+    pass.color0 = t.get();
+    pass.load = LoadAction::kClear;
+    auto out = target(r);
+    RenderPass op;
+    op.color0 = out.get();
+    Sampler smp = nearestClamp();
+    Bindings fsb;
+    fsb.textures = {t.get()};
+    fsb.samplers = {&smp};
+    const auto before = r.fake->stats();
+    CHECK(runAll(r, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pass, wholeDraw(6, W, H), Bindings{}, Bindings{}));
+        CHECK(cb.draw(texProgram(), op, wholeDraw(6), Bindings{}, fsb));
+    }));
+    CHECK_EQ(r.fake->stats().ubwcFills - before.ubwcFills, 1u);
+    CHECK_EQ(r.fake->stats().ubwcDraws - before.ubwcDraws, 1u);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    // a layout the GPU does not share: refused
+    r.fake->addSurface(22, W, H, uint32_t(probe->level(0).pitch), kBGRA);
+    HakiosSurfaceUbwc bad = u;
+    bad.metaPitch *= 2;
+    r.fake->addSurfaceUbwc(22, bad);
+    CHECK(Texture::wrapSurface(*r.gpu, 22, d, &why) == nullptr);
+    CHECK(has(why, "is not this GPU's for the size"));
+    r.fake->addSurface(23, W, H, uint32_t(probe->level(0).pitch), kBGRA);
+    bad = u;
+    bad.highestBankBit = 15;
+    r.fake->addSurfaceUbwc(23, bad);
+    CHECK(Texture::wrapSurface(*r.gpu, 23, d, &why) == nullptr);
+    // and a surface the kernel did not compress stays linear under 1
+    r.fake->addSurface(24, W, H, 512, kBGRA);
+    auto lin = Texture::wrapSurface(*r.gpu, 24, d, &why);
+    CHECK(lin != nullptr && !lin->compressed());
+    unsetenv("HM_UBWC_DISPLAY");
+}
+
 TEST(a_texture_over_an_iosurface_draws_into_the_surfaces_memory) {
     Rig r;
     const uint32_t kBGRA = 0x42475241u, kRGBA = 0x52474241u;

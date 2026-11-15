@@ -31,6 +31,9 @@ enum Request : uint32_t {
     kSubmitQueueNew = 0x4a,
     kSubmitQueueClose = 0x4b,
     kHakiosSurface = 0x7e,   // hakios's own (hakios.gpu.cpp surfaceBuffer): an IOSurface's memory as a buffer, by the surface's ID
+    // (redfin ws-hm-ubwc) an IOSurface's UBWC layout, when the kernel made the surface compressed (HakiosSurfaceUbwc;
+    // ENOENT for a linear surface, EINVAL from a transport that has no such request): asked after kHakiosSurface
+    kHakiosSurfaceUbwc = 0x7c,   // (0x7d is the NativeAdreno transport's kUserMemory, 0x7f hakios's "show")
 };
 
 struct MsmTimespec { int64_t seconds, nanoseconds; };
@@ -63,6 +66,15 @@ static_assert(sizeof(MsmParam) == 24 && sizeof(MsmGemNew) == 16 && sizeof(MsmGem
 static_assert(sizeof(MsmSubmitCmd) == 32 && sizeof(MsmSubmitBo) == 16 && sizeof(MsmGemSubmit) == 72, "msm_drm.h layout");
 static_assert(sizeof(MsmWaitFence) == 32, "msm_drm.h layout");
 static_assert(sizeof(HakiosSurface) == 40, "hakios.gpu.cpp layout");
+// (redfin ws-hm-ubwc) a compressed (UBWC) surface's layout as the kernel allocated it, offsets from the surface's base
+// address (IOSurfaceGetBaseAddress): the flag (meta) plane first, then the colour plane, as both Mesa's fdl6_layout and
+// the display engine's UBWC RGBA8888 layout put them (msm_media_info.h COLOR_FMT_RGBA8888_UBWC: meta pitch
+// align(ceil(w / 16), 64), meta rows align(ceil(h / 4), 16), colour pitch align(w * 4, 256), colour rows align(h, 16),
+// each plane 4 KiB aligned). VERSION is the UBWC version (3 on SM7250), 0 for none. The redfin kernel says it as the
+// imported surface buffer's NativeAdreno metadata (kSurfaceUbwcMagic then these eight words, see docs).
+struct HakiosSurfaceUbwc { uint32_t surface, version, metaOffset, metaPitch, metaSize, dataOffset, dataPitch, highestBankBit; };
+static_assert(sizeof(HakiosSurfaceUbwc) == 32, "kHakiosSurfaceUbwc layout");
+constexpr uint32_t kSurfaceUbwcMagic = 0x43574255u;   // 'UBWC' little-endian: the metadata's first word
 
 // what the kernel says of an IOSurface whose memory became a buffer
 struct SurfaceInfo {
@@ -187,6 +199,8 @@ public:
     // (command.cpp: surfaceBuffer). nullptr with *error: ENOENT no such surface, ENOTSUP a surface around a program's
     // own memory, ENOMEM.
     std::unique_ptr<Bo> surfaceBo(uint32_t surfaceId, SurfaceInfo* info, int* error);
+    // (redfin ws-hm-ubwc) the surface's UBWC layout (kHakiosSurfaceUbwc): 0 and *out when the kernel says it is compressed
+    int surfaceUbwc(uint32_t surfaceId, HakiosSurfaceUbwc* out);
     // a Bo whose handle another Bo already owns (surfaceBo's second answer for a surface): its mapping undone, the
     // handle left open for the owner to close
     void disown(std::unique_ptr<Bo> bo);

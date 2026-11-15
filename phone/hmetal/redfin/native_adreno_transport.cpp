@@ -179,6 +179,7 @@ public:
             return errnoOf(method(NativeAdrenoMethodCloseQueue, &c, sizeof(c), nullptr, 0), NativeAdrenoMethodCloseQueue);
         }
         case kHakiosSurface: return size == sizeof(HakiosSurface) ? surface(*static_cast<HakiosSurface*>(data)) : EINVAL;
+        case kHakiosSurfaceUbwc: return size == sizeof(HakiosSurfaceUbwc) ? surfaceUbwc(*static_cast<HakiosSurfaceUbwc*>(data)) : EINVAL;
         case nativeadreno::kUserMemory: {
             if (size != sizeof(nativeadreno::UserMemory)) return EINVAL;
             auto* u = static_cast<nativeadreno::UserMemory*>(data);
@@ -369,6 +370,32 @@ private:
             return e;
         }
         return 0;
+    }
+
+    // (redfin ws-hm-ubwc) a surface's UBWC layout: the kernel says it as the imported surface buffer's metadata
+    // (NativeAdrenoMethodGetMetadata on the BO: kSurfaceUbwcMagic, then HakiosSurfaceUbwc's words from VERSION on,
+    // offsets from the surface's base address). A buffer without (the kernel's answer today: 0 bytes) is linear: ENOENT.
+    // Asked after kHakiosSurface imported the surface (Texture::wrapSurface).
+    int surfaceUbwc(HakiosSurfaceUbwc& u) {
+        const Bo* found = nullptr;
+        for (const auto& [h, b] : bos_) {
+            if (b.surfaceId == u.surface && b.surface != nullptr) found = &b;
+        }
+        if (found == nullptr) return ENOENT;
+        NativeAdrenoAbiMetadata in{};
+        in.handle = found->handle;
+        in.bytes = NativeAdrenoAbiMetadataBytes;
+        NativeAdrenoAbiMetadata out{};
+        if (kern_return_t k = method(NativeAdrenoMethodGetMetadata, &in, sizeof(in), &out, sizeof(out))) return errnoOf(k, NativeAdrenoMethodGetMetadata);
+        uint32_t w[7] = {};   // version, metaOffset, metaPitch, metaSize, dataOffset, dataPitch, highestBankBit
+        if (out.bytes < 4 + sizeof(w) || out.bytes > NativeAdrenoAbiMetadataBytes) return ENOENT;
+        uint32_t magic = 0;
+        memcpy(&magic, out.text, 4);
+        if (magic != kSurfaceUbwcMagic) return ENOENT;
+        memcpy(w, out.text + 4, sizeof(w));
+        const uint32_t surface = u.surface;
+        u = HakiosSurfaceUbwc{surface, w[0], w[1], w[2], w[3], w[4], w[5], w[6]};
+        return u.version != 0 ? 0 : ENOENT;
     }
 
     void unmapLocked(Bo& bo) {

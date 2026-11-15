@@ -194,6 +194,9 @@ public:
     void addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t rowBytes, uint32_t pixelFormat, uint32_t offset = 0, uint32_t planes = 1,
                     bool client = false);
     std::vector<uint8_t> surfaceBytes(uint32_t id);   // the surface's whole memory as it is now
+    // (redfin ws-hm-ubwc) surface ID is compressed with LAYOUT (kHakiosSurfaceUbwc answers it), as the redfin kernel says
+    // of a UBWC scanout surface; offsets from the surface's base
+    void addSurfaceUbwc(uint32_t id, const HakiosSurfaceUbwc& layout);
     std::vector<uint8_t> memory(uint64_t iova, uint64_t length);   // LENGTH bytes at a GPU address as they are now; empty outside every buffer
     void writeSurface(uint32_t id, uint64_t at, const void* bytes, uint64_t length);   // what another program drew there
     // stop running submissions until resume(): to see what a program does while the GPU is behind
@@ -288,6 +291,7 @@ private:
     };
     std::map<uint32_t, Surface> surfaces_;
     std::map<uint32_t, uint32_t> bufferSurface_;   // an open surface buffer's handle -> the surface's ID
+    std::map<uint32_t, HakiosSurfaceUbwc> surfaceUbwc_;   // (redfin ws-hm-ubwc) addSurfaceUbwc's
     std::set<uint32_t> queues_;
     // one counter for every queue, as the kernel keeps it (it reads no queue id): the last fence handed out, the last done
     uint32_t submitted_ = 0, completed_ = 0;

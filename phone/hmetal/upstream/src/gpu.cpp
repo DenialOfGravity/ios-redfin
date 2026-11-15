@@ -116,6 +116,16 @@ std::unique_ptr<Bo> Gpu::surfaceBo(uint32_t surfaceId, SurfaceInfo* out, int* er
     return std::unique_ptr<Bo>(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
 }
 
+int Gpu::surfaceUbwc(uint32_t surfaceId, HakiosSurfaceUbwc* out) {
+    HakiosSurfaceUbwc u{};
+    u.surface = surfaceId;
+    const int e = t_->call(kHakiosSurfaceUbwc, &u, sizeof(u));
+    if (e != 0) return e;
+    if (u.version == 0) return ENOENT;
+    *out = u;
+    return 0;
+}
+
 void Gpu::disown(std::unique_ptr<Bo> bo) {
     if (bo == nullptr) return;
     if (bo->cpu_ != nullptr) {

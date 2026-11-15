@@ -232,6 +232,20 @@ void FakeGpu::addSurface(uint32_t id, uint32_t width, uint32_t height, uint32_t 
     surfaces_[id] = std::move(s);
 }
 
+void FakeGpu::addSurfaceUbwc(uint32_t id, const HakiosSurfaceUbwc& layout) {
+    std::lock_guard<std::mutex> g(lock_);
+    surfaceUbwc_[id] = layout;
+    surfaceUbwc_[id].surface = id;
+    // (the surface's memory holds both planes: the colour plane's rows counted to 16, as the tiled layout counts them)
+    auto it = surfaces_.find(id);
+    if (it != surfaces_.end()) {
+        const uint64_t end = std::max<uint64_t>(uint64_t(layout.metaOffset) + layout.metaSize,
+                                                uint64_t(layout.dataOffset) + uint64_t(layout.dataPitch) * ((it->second.height + 15) / 16 * 16));
+        const uint64_t bytes = (uint64_t(it->second.offset) + end + 0xfff) & ~0xfffull;
+        if (it->second.bytes.size() < bytes) it->second.bytes.resize(bytes);
+    }
+}
+
 std::vector<uint8_t> FakeGpu::surfaceBytes(uint32_t id) {
     std::lock_guard<std::mutex> g(lock_);
     auto it = surfaces_.find(id);
@@ -2686,6 +2700,14 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         }
         return buffers_.erase(handle) ? 0 : ENOENT;
     }
+    case kHakiosSurfaceUbwc: {   // (redfin ws-hm-ubwc) a compressed surface's layout, as addSurfaceUbwc gave it
+        if (size != sizeof(HakiosSurfaceUbwc)) return EINVAL;
+        auto* u = static_cast<HakiosSurfaceUbwc*>(data);
+        auto it = surfaceUbwc_.find(u->surface);
+        if (it == surfaceUbwc_.end()) return ENOENT;
+        *u = it->second;
+        return 0;
+    }
     case kHakiosSurface: {
         if (size != sizeof(HakiosSurface)) return EINVAL;
         auto* r = static_cast<HakiosSurface*>(data);
@@ -2695,6 +2717,7 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         if (s.client) return ENOTSUP;                      // kIOReturnUnsupported: memory of a program's own
         r->size = (uint64_t(s.offset) + uint64_t(s.rowBytes) * s.height + (s.planes == 2 ? uint64_t(s.rowBytes) * ((s.height + 1) / 2) : 0) + 0xfff) &
                   ~0xfffull;
+        r->size = std::max<uint64_t>(r->size, s.bytes.size());   // (redfin ws-hm-ubwc: a UBWC surface's planes, addSurfaceUbwc)
         r->offset = s.offset;
         r->rowBytes = s.rowBytes;
         r->width = s.width;
