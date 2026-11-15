@@ -2766,6 +2766,342 @@ HM_PACE_EDITS = [
 EDITS += HM_PACE_EDITS   # (redfin hm-int8)
 
 
+# (ws-hm-alib) HM_DD=1: what a frame's draws sample, where each texture came from, and what it holds. For the App
+# Library's settled backdrop (black when static): one capture tells a cached render target, an IOSurface another process
+# wrote (SpringBoard's MPS blur, VideoToolbox's VTMTSComputeFunction), a blit copy or a compute output apart, and says
+# whether the texture's memory is zero when the draw samples it.
+#   HM_DD=1          on (off: nothing collected, no cost)
+#   HM_DD_PASSES=5   a buffer of 1..N render passes is printed (at most one every HM_DD_EVERY=3 s, HM_DD_MAX=20 in all)
+#   trigger file     /var/local/hmetal/ca/dd-go (HM_DD_TRIGGER): when its mtime changes, the next HM_DD_FORCE=3 buffers
+#                    are printed whatever their passes
+#   compute          every buffer with a dispatch is printed (HM_DD_MAX_COMPUTE=60 in all), and its dispatches' textures
+#                    probed again when it completes ("dd: buffer N done:")
+# Lines start "dd: ". A texture: object, core, WxH, fmt, usage, storage kind, origin (0 own, 1 IOSurface, 2 buffer,
+# 3 compressed), the surface (id, size, fourcc, seed, SHADOW), a view's parent, its label, the last write this process
+# made to it (render pass / blit / compute / replaceRegion, which buffer, how long ago) and a probe: how many of 9 texels
+# on a 3x3 grid are not all-zero bytes, and the centre texel's bytes.
+HM_DD_HELPERS = r'''/* (ws-hm-alib) HM_DD: see bench/plugin.py */
+static pthread_mutex_t hm_dd_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long hm_dd_seq;   /* command buffers this process committed */
+#define HM_DD_W 4096
+static struct { const void *t; unsigned long long seq; double at; char kind[40]; unsigned a, b; } hm_dd_w[HM_DD_W];
+static NSMutableDictionary *hm_dd_bufs;   /* NSValue(command buffer) -> { lines, passes, probe, targets } */
+static unsigned long long hm_dd_count;    /* "dd: on" lines and buffers printed (the counter the capture checks) */
+
+static int
+hm_dd_env(const char *name, int dflt)
+{
+	const char *e = getenv(name);
+	return e != NULL && e[0] != '\0' ? atoi(e) : dflt;
+}
+
+static int
+hm_dd_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_DD");
+		on = e != NULL && e[0] == '1';
+		if (on) {
+			const char *tr = getenv("HM_DD_TRIGGER");
+			hm_print("dd: on (HM_DD=1): buffers of 1..%d render passes every %d s (at most %d), every buffer with a dispatch (at most %d), "
+				 "the next %d after %s changes\n", hm_dd_env("HM_DD_PASSES", 5), hm_dd_env("HM_DD_EVERY", 3), hm_dd_env("HM_DD_MAX", 20),
+				 hm_dd_env("HM_DD_MAX_COMPUTE", 60), hm_dd_env("HM_DD_FORCE", 3), tr != NULL ? tr : "/var/local/hmetal/ca/dd-go");
+		}
+	}
+	return on;
+}
+
+static void
+hm_dd_note(const void *t, const char *kind, unsigned a, unsigned b)
+{
+	if (t == NULL || !hm_dd_on()) return;
+	pthread_mutex_lock(&hm_dd_lock);
+	unsigned i = (unsigned)(((uintptr_t)t >> 4) % HM_DD_W);
+	for (unsigned k = 0; k < 32; k++) {
+		const unsigned j = (i + k) % HM_DD_W;
+		if (hm_dd_w[j].t == t || hm_dd_w[j].t == NULL) { i = j; break; }
+	}
+	hm_dd_w[i].t = t;
+	hm_dd_w[i].seq = hm_dd_seq;
+	hm_dd_w[i].at = hm_now();
+	strlcpy(hm_dd_w[i].kind, kind != NULL ? kind : "?", sizeof(hm_dd_w[i].kind));
+	hm_dd_w[i].a = a, hm_dd_w[i].b = b;
+	pthread_mutex_unlock(&hm_dd_lock);
+}
+
+static void
+hm_dd_writer(const void *t, char *out, size_t n)
+{
+	snprintf(out, n, "none seen in this process");
+	if (t == NULL) return;
+	pthread_mutex_lock(&hm_dd_lock);
+	const unsigned i = (unsigned)(((uintptr_t)t >> 4) % HM_DD_W);
+	for (unsigned k = 0; k < 32; k++) {
+		const unsigned j = (i + k) % HM_DD_W;
+		if (hm_dd_w[j].t == NULL) break;
+		if (hm_dd_w[j].t == t) {
+			snprintf(out, n, "%s %u/%u in buffer %llu (%llu buffers ago, %.2f s)", hm_dd_w[j].kind, hm_dd_w[j].a, hm_dd_w[j].b,
+				 hm_dd_w[j].seq + 1, hm_dd_seq - hm_dd_w[j].seq, hm_now() - hm_dd_w[j].at);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&hm_dd_lock);
+}
+
+/* 9 texels on a 3x3 grid: how many are not all zero bytes, and the centre's bytes */
+static NSString *
+hm_dd_probe(hakios_metal_texture *t)
+{
+	if (t == NULL) return @"-";
+	const unsigned origin = hakios_metal_texture_origin(t), bpp = hakios_metal_texture_bytes_per_pixel(t);
+	const unsigned w = hakios_metal_texture_width(t), h = hakios_metal_texture_height(t);
+	if (origin == 3 || bpp == 0 || bpp > 16 || w == 0 || h == 0 || hakios_metal_texture_samples(t) != 1) return @"(not probed)";
+	unsigned nz = 0;
+	char hex[40] = "";
+	for (unsigned j = 0; j < 3; j++) {
+		for (unsigned i = 0; i < 3; i++) {
+			uint8_t px[16];
+			memset(px, 0, sizeof(px));
+			if (hakios_metal_texture_read(t, w * (1 + 2 * i) / 6, h * (1 + 2 * j) / 6, 1, 1, px, 16) != 0) return @"(read refused)";
+			BOOL any = NO;
+			for (unsigned k = 0; k < bpp; k++) any = any || px[k] != 0;
+			nz += any;
+			if (i == 1 && j == 1) {
+				for (unsigned k = 0; k < bpp; k++) snprintf(hex + 2 * k, 3, "%02x", px[k]);
+			}
+		}
+	}
+	return [NSString stringWithFormat:@"%u/9 not zero, centre %s", nz, hex];
+}
+
+static NSString *
+hm_dd_fourcc(uint32_t f)
+{
+	char c[5] = { (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, 0 };
+	for (int i = 0; i < 4; i++) if (c[i] < 32 || c[i] > 126) return [NSString stringWithFormat:@"0x%x", f];
+	return [NSString stringWithUTF8String:c];
+}
+
+@interface HakiosMetalTexture (HMDD)
+- (NSString *)hmddDescribe;
+- (hakios_metal_texture *)hmddCore;
+@end
+
+@implementation HakiosMetalTexture (HMDD)
+- (hakios_metal_texture *)hmddCore
+{
+	return _texture;
+}
+- (NSString *)hmddDescribe
+{
+	char wr[200];
+	hm_dd_writer(_texture, wr, sizeof(wr));
+	NSMutableString *s = [NSMutableString stringWithFormat:@"%p core %p %lux%lu fmt %lu usage 0x%lx kind %u origin %u", self, _texture,
+		(unsigned long)[self width], (unsigned long)[self height], (unsigned long)[self pixelFormat], (unsigned long)_usage,
+		[self hakiosStorageKind], _texture != NULL ? hakios_metal_texture_origin(_texture) : 99u];
+	if (_iosurface != NULL) {
+		[s appendFormat:@" surface %u (%lux%lu %@ seed %u plane %lu%s)", IOSurfaceGetID(_iosurface), (unsigned long)IOSurfaceGetWidth(_iosurface),
+			(unsigned long)IOSurfaceGetHeight(_iosurface), hm_dd_fourcc(IOSurfaceGetPixelFormat(_iosurface)), IOSurfaceGetSeed(_iosurface),
+			(unsigned long)_iosurfacePlane, _shadow ? " SHADOW" : ""];
+	}
+	if (_parent != nil) {
+		char pw[200];
+		hm_dd_writer([_parent hmddCore], pw, sizeof(pw));
+		[s appendFormat:@" view of %p (level %lu slice %lu%s%s; parent's writer: %s)", _parent, (unsigned long)_parentLevel,
+			(unsigned long)_parentSlice, _ownsView ? " own core" : "", _swizzled ? " swizzled" : "", pw];
+	}
+	if (_ycbcr != 0) [s appendFormat:@" ycbcr %d%s", _ycbcr, _ycbcrNative ? " native" : ""];
+	NSString *label = [self respondsToSelector:@selector(label)] ? [(id<MTLTexture>)self label] : nil;
+	if (label != nil) [s appendFormat:@" label '%@'", label];
+	[s appendFormat:@"; writer: %s; probe %@", wr, hm_dd_probe(_texture)];
+	return s;
+}
+@end
+
+static NSMutableDictionary *
+hm_dd_entry(id cb)
+{
+	NSValue *key = [NSValue valueWithPointer:(const void *)cb];
+	if (hm_dd_bufs == nil) hm_dd_bufs = [[NSMutableDictionary alloc] init];
+	NSMutableDictionary *e = [hm_dd_bufs objectForKey:key];
+	if (e == nil) {
+		e = [NSMutableDictionary dictionaryWithObjectsAndKeys:[NSMutableArray array], @"lines", [NSMutableArray array], @"probe",
+			[NSMutableArray array], @"targets", [NSNumber numberWithUnsignedInt:0], @"passes", [NSNumber numberWithUnsignedInt:0], @"draws", nil];
+		[hm_dd_bufs setObject:e forKey:key];
+	}
+	return e;
+}
+
+static void
+hm_dd_line(id cb, NSString *line, BOOL pass, BOOL draw)
+{
+	if (!hm_dd_on() || cb == nil) return;
+	@synchronized ([HakiosMetalTexture class]) {
+		NSMutableDictionary *e = hm_dd_entry(cb);
+		NSMutableArray *lines = [e objectForKey:@"lines"];
+		if (pass) [e setObject:[NSNumber numberWithUnsignedInt:[[e objectForKey:@"passes"] unsignedIntValue] + 1] forKey:@"passes"];
+		if (draw) [e setObject:[NSNumber numberWithUnsignedInt:[[e objectForKey:@"draws"] unsignedIntValue] + 1] forKey:@"draws"];
+		if ([lines count] < 600) [lines addObject:line];
+	}
+}
+
+static void
+hm_dd_keep(id cb, NSString *what, id texture)
+{
+	if (!hm_dd_on() || cb == nil || texture == nil) return;
+	@synchronized ([HakiosMetalTexture class]) {
+		[[hm_dd_entry(cb) objectForKey:what] addObject:texture];
+	}
+}
+
+static unsigned
+hm_dd_passes(id cb)
+{
+	if (!hm_dd_on() || cb == nil) return 0;
+	@synchronized ([HakiosMetalTexture class]) {
+		return [[hm_dd_entry(cb) objectForKey:@"passes"] unsignedIntValue];
+	}
+}
+
+/* -commit: print the buffer's lines or drop them */
+static void
+hm_dd_commit(id cb)
+{
+	if (!hm_dd_on()) return;
+	static double lastCheck, lastAuto;
+	static long baseMtime = -1;
+	static int forced, autoN, computeN;
+	const double now = hm_now();
+	unsigned long long seq;
+
+	pthread_mutex_lock(&hm_dd_lock);
+	seq = ++hm_dd_seq;
+	pthread_mutex_unlock(&hm_dd_lock);
+	NSDictionary *e;
+	@synchronized ([HakiosMetalTexture class]) {
+		NSValue *key = [NSValue valueWithPointer:(const void *)cb];
+		e = [[[hm_dd_bufs objectForKey:key] retain] autorelease];
+		if (e != nil) [hm_dd_bufs removeObjectForKey:key];
+		if (now - lastCheck >= 0.25) {
+			struct stat st;
+			const char *tr = getenv("HM_DD_TRIGGER");
+			const long m = stat(tr != NULL ? tr : "/var/local/hmetal/ca/dd-go", &st) == 0 ? (long)st.st_mtime * 1000 + (long)(st.st_mtimespec.tv_nsec / 1000000) : 0;
+			lastCheck = now;
+			if (baseMtime < 0) {
+				baseMtime = m;
+			} else if (m != baseMtime) {
+				baseMtime = m;
+				forced = hm_dd_env("HM_DD_FORCE", 3);
+				hm_print("dd: trigger seen: the next %d buffers are printed (buffer %llu)\n", forced, seq + 1);
+			}
+		}
+	}
+	if (e == nil) return;
+	const unsigned passes = [[e objectForKey:@"passes"] unsignedIntValue], draws = [[e objectForKey:@"draws"] unsignedIntValue];
+	NSArray *probe = [e objectForKey:@"probe"], *targets = [e objectForKey:@"targets"], *lines = [e objectForKey:@"lines"];
+	const char *why = NULL;
+	if (forced > 0) {
+		forced--, why = "trigger";
+	} else if ([probe count] != 0 && computeN < hm_dd_env("HM_DD_MAX_COMPUTE", 60)) {
+		computeN++, why = "dispatch";
+	} else if (passes >= 1 && (int)passes <= hm_dd_env("HM_DD_PASSES", 5) && now - lastAuto >= hm_dd_env("HM_DD_EVERY", 3) &&
+		   autoN < hm_dd_env("HM_DD_MAX", 20)) {
+		autoN++, lastAuto = now, why = "few passes";
+	}
+	if (why == NULL) return;
+	hm_dd_count++;
+	hm_print("dd: buffer %llu (%s; dumped %llu): %u render passes, %u draws, %lu dispatched textures\n", seq, why, hm_dd_count, passes, draws,
+		 (unsigned long)[probe count]);
+	for (NSString *l in lines) hm_print("dd: %s\n", [l UTF8String]);
+	if ([probe count] != 0 || [targets count] != 0) {
+		NSArray *p = [[probe copy] autorelease], *t = [[targets copy] autorelease];
+		[(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+			(void)done;
+			for (HakiosMetalTexture *x in p) hm_print("dd: buffer %llu done: dispatched %s\n", seq, [[x hmddDescribe] UTF8String]);
+			for (HakiosMetalTexture *x in t) hm_print("dd: buffer %llu done: target %s\n", seq, [[x hmddDescribe] UTF8String]);
+		}];
+	}
+}
+
+@implementation HakiosMetalDepthStencilState
+'''
+
+HM_DD_EDITS = [
+    ('static int hm_prof_level(void);   /* (ws-hm-sbar) HM_PROF=3 */',
+     'static void hm_dd_note(const void *t, const char *kind, unsigned a, unsigned b);   /* (ws-hm-alib) HM_DD */\n'
+     'static int hm_prof_level(void);   /* (ws-hm-sbar) HM_PROF=3 */'),
+    ('@implementation HakiosMetalDepthStencilState\n', HM_DD_HELPERS),
+    # -commit: the buffer's lines printed or dropped (after the committed-twice check)
+    ('\t_committed = YES;\n\t_committedAt = hm_now();\n',
+     '\thm_dd_commit(self);   /* (ws-hm-alib) HM_DD */\n\t_committed = YES;\n\t_committedAt = hm_now();\n'),
+    # a render pass: its target, actions, and the target noted as written
+    ('\t\tif (hm_frame_target(texture)) _hmFrame = YES;   /* (redfin hmv3) */\n',
+     '\t\tif (hm_frame_target(texture)) _hmFrame = YES;   /* (redfin hmv3) */\n'
+     '\t\tif (hm_dd_on()) {   /* (ws-hm-alib) HM_DD */\n'
+     '\t\t\tunsigned more = 0;\n'
+     '\t\t\tfor (NSUInteger i = 1; i < 8; i++) more += [[descriptor colorAttachments] objectAtIndexedSubscript:i].texture != nil;\n'
+     '\t\t\thm_dd_line(self, [NSString stringWithFormat:@"pass %u: load %u store %u clear (%.3f %.3f %.3f %.3f), %u more colour attachments, depth %s; target %@",\n'
+     '\t\t\t\thm_dd_passes(self) + 1, pass.load_action, pass.store_action, pass.clear_color[0], pass.clear_color[1], pass.clear_color[2],\n'
+     '\t\t\t\tpass.clear_color[3], more, [[descriptor depthAttachment] texture] != nil ? "yes" : "no",\n'
+     '\t\t\t\ttexture != nil ? [texture hmddDescribe] : @"none"], YES, NO);\n'
+     '\t\t\thm_dd_keep(self, @"targets", texture);\n'
+     '\t\t\tif (texture != nil) hm_dd_note([texture hmddCore], "render pass load/store", pass.load_action, pass.store_action);\n'
+     '\t\t}\n'),
+    # a draw: the pipeline, the vertex buffer's first floats, every texture it samples
+    ('\thm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);\n',
+     '\thm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);\n'
+     '\tif (hm_dd_on()) {   /* (ws-hm-alib) HM_DD */\n'
+     '\t\tNSString *pl = [(id<MTLRenderPipelineState>)_pipeline label];\n'
+     '\t\tNSMutableString *d = [NSMutableString stringWithFormat:@"  draw in pass %u: %@ [%s] prim %lu count %lu inst %lu into %ux%u",\n'
+     '\t\t\thm_dd_passes(_commandBuffer), pl != nil ? pl : @"-", hakios_metal_program_name(program), (unsigned long)primitive,\n'
+     '\t\t\t(unsigned long)count, (unsigned long)instances, _pass.color0 != NULL ? hakios_metal_texture_width(_pass.color0) : 0,\n'
+     '\t\t\t_pass.color0 != NULL ? hakios_metal_texture_height(_pass.color0) : 0];\n'
+     '\t\tif (_vsHighest > 1 && vs[1] != NULL && _vsOffsets[1] + 64 <= hakios_metal_buffer_length(vs[1])) {\n'
+     '\t\t\tconst float *v = (const float *)((const uint8_t *)hakios_metal_buffer_contents(vs[1]) + _vsOffsets[1]);\n'
+     '\t\t\t[d appendString:@" vb1"];\n'
+     '\t\t\tfor (unsigned k = 0; k < 16; k++) [d appendFormat:@" %g", v[k]];\n'
+     '\t\t}\n'
+     '\t\tfor (unsigned k = 0; k < _fsHighestTexture; k++) {\n'
+     '\t\t\tif (_fsTextures[k] != nil) [d appendFormat:@"\\ndd:     fs t%u = %@", k, [_fsTextures[k] hmddDescribe]];\n'
+     '\t\t}\n'
+     '\t\tfor (unsigned k = 0; k < _vsHighestTexture; k++) {\n'
+     '\t\t\tif (_vsTextures[k] != nil) [d appendFormat:@"\\ndd:     vs t%u = %@", k, [_vsTextures[k] hmddDescribe]];\n'
+     '\t\t}\n'
+     '\t\thm_dd_line(_commandBuffer, d, NO, YES);\n'
+     '\t}\n'),
+    # a dispatch: the kernel, its textures (all noted as written: the kernel decides), probed again at completion
+    ('\thakios_metal_cb_set_threadgroup_length(cb, (unsigned)_threadgroupLength);\n',
+     '\tif (hm_dd_on()) {   /* (ws-hm-alib) HM_DD */\n'
+     '\t\tconst char *kn = hakios_metal_kernel_name([_pipeline hakiosKernel]);\n'
+     '\t\tNSMutableString *d = [NSMutableString stringWithFormat:@"dispatch %s: %ux%ux%u groups of %ux%ux%u", kn != NULL ? kn : "?",\n'
+     '\t\t\tg[0], g[1], g[2], t[0], t[1], t[2]];\n'
+     '\t\tfor (unsigned k = 0; k < _highestTexture; k++) {\n'
+     '\t\t\tif (_textures[k] == nil) continue;\n'
+     '\t\t\t[d appendFormat:@"\\ndd:     t%u = %@", k, [_textures[k] hmddDescribe]];\n'
+     '\t\t\thm_dd_keep(_commandBuffer, @"probe", _textures[k]);\n'
+     '\t\t\tchar kind[40];\n'
+     '\t\t\tsnprintf(kind, sizeof(kind), "dispatch %s t", kn != NULL ? kn : "?");\n'
+     '\t\t\thm_dd_note([_textures[k] hmddCore], kind, k, 0);\n'
+     '\t\t}\n'
+     '\t\thm_dd_line(_commandBuffer, d, NO, NO);\n'
+     '\t}\n'
+     '\thakios_metal_cb_set_threadgroup_length(cb, (unsigned)_threadgroupLength);\n'),
+    # -replaceRegion: (level form) and blit destinations noted as writes
+    ('\tif (hakios_metal_texture_replace_level(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,\n',
+     '\thm_dd_note(_texture, "replaceRegion", (unsigned)region.size.width, (unsigned)region.size.height);   /* (ws-hm-alib) HM_DD */\n'
+     '\tif (hakios_metal_texture_replace_level(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,\n'),
+    ('hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)\n{\n',
+     'hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)\n{\n'
+     '\tif (hm_dd_on() && strcmp(what, "source") != 0 && [object isKindOfClass:[HakiosMetalTexture class]]) {   /* (ws-hm-alib) HM_DD */\n'
+     '\t\thm_dd_note([(HakiosMetalTexture *)object hmddCore], what[0] == \'d\' ? "blit destination" : "blit (mipmaps)", 0, 0);\n'
+     '\t}\n'),
+]
+
+EDITS += HM_DD_EDITS   # (ws-hm-alib)
+
+
 def apply(src, edits=EDITS):
     for e in edits:
         if len(e) == 2:
