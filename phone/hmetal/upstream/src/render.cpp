@@ -3476,8 +3476,16 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             ordinal = ordinals_[kind]++;
             const uint32_t last = queue_.lastDraws(kind, ordinal);
             const uint32_t cls = last <= 1 ? 0 : last < 16 ? 1 : last < 64 ? 2 : last < 128 ? 3 : 4;
-            tuneKey = (kind * 0x100000001b3ull ^ (uint64_t(ordinal) << 8 | cls)) | 1;
-            gmem = queue_.preferGmem(tuneKey);
+            if (gmemAuto_ && last <= 5) {
+                // (redfin ws-hm-ubwc, HM_GMEM=auto) turnip's fallback_use_bypass: 5 draws or fewer (its like's last time, 0
+                // for one never seen) is sysmem, and never measured in GMEM -- a light full-screen pass in tiles still
+                // loads (unless Clear/DontCare) and stores the whole target, 2.5-5 ms against well under 1 in sysmem
+                gmem = false;
+                gmemWhy_ = "auto: its like had " + std::to_string(last) + " draws last time (5 or fewer: sysmem)";
+            } else {
+                tuneKey = (kind * 0x100000001b3ull ^ (uint64_t(ordinal) << 8 | cls)) | 1;
+                gmem = queue_.preferGmem(tuneKey);
+            }
         }
     }
     Piece passTable;

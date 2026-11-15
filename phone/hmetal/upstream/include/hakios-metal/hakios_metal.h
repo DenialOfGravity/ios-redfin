@@ -556,6 +556,9 @@ void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
 void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
 /* (redfin hmv3) GMEM only for a pass of at most TILES tiles (CommandBuffer::setGmemMaxTiles); 0: no limit */
 void hakios_metal_cb_set_gmem_max_tiles(hakios_metal_cb *cb, unsigned tiles);
+/* (redfin ws-hm-ubwc) HM_GMEM=auto: with the tuner on, a pass whose like had 5 draws or fewer stays in sysmem unmeasured
+ * (turnip's fallback_use_bypass); the rest measured both ways, the cheaper kept (CommandBuffer::setGmemAuto) */
+void hakios_metal_cb_set_gmem_auto(hakios_metal_cb *cb, int on);
 /* CB's GMEM passes binned by the hardware first, each tile drawing only the draws that reach it (CommandBuffer::setGmemBinning) */
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
 /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */

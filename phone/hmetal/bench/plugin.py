@@ -438,10 +438,17 @@ HMV3_HELPERS = r'''
  *          metal_gmem=1 and metal_gmem_off as before; the default when the boot-args name either
  *   N >= 2 GMEM for a pass of at least N draws
  *   ...,T  (any of the above) and only where the pass's plan has at most T tiles (bins)
+ *   auto   (redfin ws-hm-ubwc) per pass, turnip's autotuner as far as it applies here: a pass whose like had 5 draws or
+ *          fewer last time stays in sysmem (tu_autotune.cc fallback_use_bypass), a compressed (UBWC) target always does
+ *          (gmemPlan: the tiles' loads and stores take linear targets), a plan of more than T tiles (default 8: the full
+ *          1125x2436 BGRA8 screen is 24 bins of 576x208 and never qualifies) does; the rest is measured both ways by the
+ *          passes' own GPU stamps and the cheaper kept (CommandQueue::preferGmem). Loads skipped for Clear/DontCare,
+ *          stores for DontCare, binning as metal_gmem_off says, as for 1.
  * Why 0: hmt4 on the A620 (512 KiB GMEM) drew the 1125x2436 BGRA8 screen in 52 tiles. A GMEM pass of ~91 draws took
  * 15.2 ms (0.29 ms a tile; each pass loading ~11 MB and storing 11-22 MB, ~2.5-3 ms of bandwidth alone, and every
  * draw replayed in each tile it reaches), 62-66 % of the GPU's time; a full-screen sysmem pass of ~18 draws took 1.7 ms,
  * so ~91 draws in sysmem come to ~8-9 ms, and m2v (Turnip, sysmem) draws the same frames in 8.9 ms. */
+#define HM_GMEM_AUTO 1000   /* (redfin ws-hm-ubwc) HM_GMEM=auto */
 static int
 hm_gmem_mode(unsigned *tiles)
 {
@@ -458,13 +465,18 @@ hm_gmem_mode(unsigned *tiles)
 
 		if (e == NULL || e[0] == '\0') {
 			m = bootarg ? 1 : 0;
+		} else if (strncmp(e, "auto", 4) == 0) {   /* (redfin ws-hm-ubwc) */
+			m = HM_GMEM_AUTO;
+			limit = 8;
+			if ((comma = strchr(e, ',')) != NULL && atoi(comma + 1) > 0) limit = (unsigned)atoi(comma + 1);
 		} else {
 			m = atoi(e);
 			if (m < 0) m = 0;
 			if ((comma = strchr(e, ',')) != NULL && atoi(comma + 1) > 0) limit = (unsigned)atoi(comma + 1);
 		}
 		hm_print("HM_GMEM=%s: %s%s%u%s\n", e != NULL ? e : (bootarg ? "unset (boot-arg metal_gmem*: upstream's rule)" : "unset (default 0)"),
-			 m == 0 ? "every pass in sysmem" : m == 1 ? "upstream's rule (metal_gmem_draws, 56 unless the boot-arg says)" : "GMEM for passes of at least N draws",
+			 m == 0 ? "every pass in sysmem" : m == 1 ? "upstream's rule (metal_gmem_draws, 56 unless the boot-arg says)" :
+			 m == HM_GMEM_AUTO ? "per pass (auto: sysmem for 5 draws or fewer and for UBWC targets, else the measured cheaper)" : "GMEM for passes of at least N draws",
 			 limit != 0 ? ", at most " : "", limit, limit != 0 ? " tiles" : "");
 		mode = m;
 	}
@@ -1322,8 +1334,9 @@ EDITS = [
      '\t\t\tunsigned tiles = 0;\n'
      '\t\t\tconst int mode = hm_gmem_mode(&tiles);\n\n'
      '\t\t\thakios_metal_cb_set_gmem(_cb, mode == 1 ? (hm_gmem_on() || hm_gmem_draws() != 0) : mode >= 2);\n'
-     '\t\t\thakios_metal_cb_set_gmem_min_draws(_cb, mode == 1 ? hm_gmem_draws() : mode >= 2 ? (unsigned)mode : 0);\n'
+     '\t\t\thakios_metal_cb_set_gmem_min_draws(_cb, mode == 1 ? hm_gmem_draws() : mode >= 2 && mode != HM_GMEM_AUTO ? (unsigned)mode : 0);\n'
      '\t\t\thakios_metal_cb_set_gmem_max_tiles(_cb, tiles);\n'
+     '\t\t\thakios_metal_cb_set_gmem_auto(_cb, mode == HM_GMEM_AUTO);   /* (redfin ws-hm-ubwc) */\n'
      '\t\t}\n'),
     # (hmv3) a frame: the command buffer that drew the display's IOSurface (the window server presents no drawable)
     ('\tNSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */\n',

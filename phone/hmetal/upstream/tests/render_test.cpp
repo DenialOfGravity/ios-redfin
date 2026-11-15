@@ -5955,6 +5955,72 @@ TEST(the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target) {
     CHECK_EQ(u->counts().gmemPasses, 1u);
 }
 
+// (redfin ws-hm-ubwc) HM_GMEM=auto: with the tuner, a pass whose like had 5 draws or fewer last time stays in sysmem and
+// is never tried in GMEM (turnip's fallback_use_bypass) -- the tuner alone tries GMEM on its second round, as above --
+// while a pass of more draws is measured both ways as before; a plan of more tiles than the limit stays in sysmem; and a
+// compressed target always does (gmemPlan refuses it)
+TEST(gmem_auto_keeps_light_passes_and_compressed_targets_in_sysmem) {
+    Rig r;
+    auto t = target(r);
+    RenderPass a;
+    a.color0 = t.get();
+    // (blended draws: a full-target opaque draw is a dead fill, dropped by the next one in sysmem -- HM_DEADFILL)
+    Program over = texProgram();
+    over.blend.enabled = true;
+    over.blend.dstRgb = over.blend.dstAlpha = 5;   // OneMinusSourceAlpha: source-over
+    auto tex = target(r, 4, 4, kTextureUsageRead);
+    Sampler smp = nearestClamp();
+    Bindings fsb;
+    fsb.textures = {tex.get()};
+    fsb.samplers = {&smp};
+    auto rounds = [&](int draws, bool autoOn, uint32_t maxTiles, const RenderPass& pass) {
+        uint32_t gmemPasses = 0;
+        for (int round = 0; round < 3; round++) {
+            auto cb = r.queue->commandBuffer();
+            cb->setGmemTuned(true);
+            cb->setGmemAuto(autoOn);
+            cb->setGmemMaxTiles(maxTiles);
+            for (int i = 0; i < draws; i++) CHECK(cb->draw(over, pass, wholeDraw(6), Bindings{}, fsb));
+            cb->commit();
+            cb->waitUntilCompleted();
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            gmemPasses += cb->counts().gmemPasses;
+        }
+        return gmemPasses;
+    };
+    CHECK_EQ(rounds(3, true, 8, a), 0u);   // light: sysmem every time under auto
+    auto t2 = target(r, 64, 48);           // (another kind of pass: the queue's history is per target size and format)
+    RenderPass b;
+    b.color0 = t2.get();
+    CHECK(rounds(3, false, 0, b) >= 1u);   // ...which the tuner alone tries in GMEM
+    auto t3 = target(r, 64, 32);
+    RenderPass c;
+    c.color0 = t3.get();
+    CHECK(rounds(8, true, 8, c) >= 1u);    // heavier: measured both ways under auto
+    auto t4 = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    RenderPass full;
+    full.color0 = t4.get();
+    Draw fd = wholeDraw(6, 1125, 2436);
+    uint32_t fullGmem = 0;
+    for (int round = 0; round < 3; round++) {
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemTuned(true);
+        cb->setGmemAuto(true);
+        cb->setGmemMaxTiles(8);
+        for (int i = 0; i < 8; i++) CHECK(cb->draw(over, full, fd, Bindings{}, fsb));
+        cb->commit();
+        cb->waitUntilCompleted();
+        fullGmem += cb->counts().gmemPasses;
+    }
+    CHECK_EQ(fullGmem, 0u);                // the full screen: 24 bins, past auto's 8
+    auto u = ubwcTarget(r, 64, 64);
+    if (u == nullptr) return;
+    RenderPass d;
+    d.color0 = u.get();
+    CHECK_EQ(rounds(8, true, 8, d), 0u);   // compressed: sysmem
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 // (redfin hm-int4) the host's encode cost of a draw, as hmbench W3 measures it on the phone (CPU only, the fake GPU):
 // HM_BENCH_DRAWS=N records N passes of 40 draws with a texture and a buffer bound each and prints us a draw. Off (a
 // return) without the variable, so the suite's time is not touched
