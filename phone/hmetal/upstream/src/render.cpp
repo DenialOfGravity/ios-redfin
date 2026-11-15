@@ -144,7 +144,10 @@ MrtWords mrtWords(const Texture& t, uint32_t level, uint32_t slice = 0) {
     MrtWords m{};
     // (a layer, a face or a depth plane: the slices are one 2D layout each, sliceBytes apart -- fd6_layout.c's layer_size)
     const uint64_t base = t.levelAddress(level) + (slice != 0 ? uint64_t(slice) * t.sliceBytes() : 0);
-    m.bufInfo = rbMrtBufInfo(colorFmt(f), t.compressed() ? TILE6_3 : TILE6_LINEAR, f.swap);
+    // (redfin ws-hm-ubwc) a compressed target's swap is WZYX, as fd6_color_swap gives it for every tiled layout ("CCU
+    // ignores swap and always uses WZYX when tiled", fd6_format_table.c): the order the TP's WZYX descriptor
+    // (ubwcDescriptor), the 2D engine's UBWC source and destination, and the fill all take the layout in
+    m.bufInfo = rbMrtBufInfo(colorFmt(f), t.compressed() ? TILE6_3 : TILE6_LINEAR, t.compressed() ? WZYX : f.swap);
     if (t.compressed()) {
         // its flag buffer, as tu6_emit_mrt / fd6 emit_mrt write it (fd6_view.c's FLAG_BUFFER_PITCH: the pitch, the layer
         // size over 4); RB_RENDER_CNTL.FLAG_MRTS turns its use on
@@ -2642,9 +2645,11 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     if (sf.depth || df.depth) {
         return refuse(why, std::string("a copy of a ") + (sf.depth ? sf.name : df.name) + " texture: a depth texture is tiled, the 2D copy is written for linear ones");
     }
-    if (src.compressed() && (srcLevel != 0 || src.samples() != 1 || dst.compressed())) {
+    if (src.compressed() && (srcLevel != 0 || src.samples() != 1)) {
         // (redfin hmv2: a compressed render target, HM_UBWC_RT, is read by the 2D engine through its flags, r2d_src)
-        return refuse(why, "a copy from a compressed texture: its level 0 into a linear texture is what is served");
+        // (redfin ws-hm-ubwc: into a compressed one too, flags at both ends, as turnip's r2d copies UBWC to UBWC --
+        // CoreAnimation's backdrop capture copies one of its targets into another)
+        return refuse(why, "a copy from a compressed texture: its level 0, single-sampled, is what is served");
     }
     if (dst.compressed() && (sf.fmt6 != df.fmt6 || dstLevel != 0 || linear)) {
         return refuse(why, "a copy into a compressed texture: from its own format, pixel for pixel, into level 0 is what is served");

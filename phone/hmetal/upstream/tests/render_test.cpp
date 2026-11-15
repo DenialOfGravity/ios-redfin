@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <thread>
 #include <vector>
@@ -1588,7 +1589,7 @@ TEST(the_fake_refuses_a_draw_whose_target_does_not_hold_together) {
     {
         Twin w;
         w.at(regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, 0)) = rbMrtBufInfo(FMT6_8_8_8_8_UNORM, a6xx_tile_mode(3), WZYX);   // TILE6_3 (a6xx.xml.h:60), which the enum here does not name
-        CHECK(has(w.fault(), "RB_MRT_BUF_INFO[0]: tile mode 3: only linear targets are what this GPU model runs"));
+        CHECK(has(w.fault(), "RB_MRT_BUF_INFO[0]: tile mode 3 without its FLAG_MRTS bit"));   // (redfin ws-hm-ubwc: a UBWC target needs its bit)
     }
     {
         Twin w;
@@ -3048,6 +3049,198 @@ TEST(a_compressed_texture_is_copied_in_before_a_draw_samples_it_after_its_rows_c
     CHECK_EQ(copiesFor(1), 1u);
     CHECK_EQ(r.fake->stats().faults, 0u);
     if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+}
+
+// (redfin ws-hm-ubwc) HM_UBWC_RT: a compressed render target of CoreAnimation's kind (2D, one level, one sample, BGRA8,
+// render target and shader read). Null when this build has no Mesa (the UBWC layout is fdl6's).
+std::shared_ptr<Texture> ubwcTarget(Rig& r, uint32_t w, uint32_t h, PixelFormat format = PixelFormat::kBGRA8Unorm) {
+    TextureDesc d;
+    d.format = format;
+    d.width = w;
+    d.height = h;
+    d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    d.compressed = true;
+    std::string why;
+    auto t = Texture::make(*r.gpu, d, &why);
+    if (t == nullptr && why.find("this build has none") != std::string::npos) {
+        std::printf("       (no Mesa in this build: %s; the UBWC render target test did not run)\n", why.c_str());
+        return nullptr;
+    }
+    CHECK(t != nullptr);
+    if (t == nullptr) std::printf("       %s\n", why.c_str());
+    if (t != nullptr) CHECK(t->compressed() && t->staging() == nullptr && t->contents() == nullptr);
+    return t;
+}
+
+bool runAll(Rig& r, const std::function<void(CommandBuffer&)>& record) {
+    auto cb = r.queue->commandBuffer();
+    record(*cb);
+    cb->commit();
+    cb->waitUntilCompleted();
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    return cb->status() == CommandBuffer::kCompleted;
+}
+
+// A compressed render target as the RB writes it (tu6_emit_mrt, tu6_emit_render_cntl): TILE6_3, WZYX whatever the
+// format's swap (the CCU ignores the swap of a tiled layout), its flag buffer in RB_MRT_FLAG_BUFFER[0] and its bit in
+// RB_RENDER_CNTL.FLAG_MRTS; its flag buffer zeroed when it is made; then Cleared (a 2D fill through its flags), drawn,
+// and sampled by the next pass through a FLAG descriptor -- the fake faulting on any linear read or write of it.
+TEST(a_compressed_render_target_is_cleared_drawn_and_sampled_through_its_flags) {
+    using namespace a6xx;
+    Rig r;
+    auto u = ubwcTarget(r, 64, 64);
+    if (u == nullptr) return;
+    // (a fresh buffer is zero in the fake; the made texture's flags are zero whatever the buffer held)
+    CHECK_EQ(u->flagAddress() - u->buffer()->gpuAddress() + u->flagLayerSize() <= u->buffer()->length(), true);
+    RenderPass up;
+    up.color0 = u.get();
+    up.load = LoadAction::kClear;
+    up.clearColor[0] = 0.25;
+    up.clearColor[3] = 1.0;
+    Encoded e(r, flatProgram(), up, wholeDraw());
+    CHECK(e.ok);
+    const uint32_t info = e.reg(REG_A6XX_RB_MRT_BUF_INFO);
+    CHECK_EQ((info & A6XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE__MASK) >> A6XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE__SHIFT, uint32_t(TILE6_3));
+    CHECK_EQ((info & A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK) >> A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__SHIFT, uint32_t(WZYX));
+    CHECK_EQ(e.reg(REG_A6XX_RB_MRT_FLAG_BUFFER_ADDR), uint32_t(u->flagAddress()));
+    CHECK_EQ((e.reg(REG_A6XX_RB_RENDER_CNTL) & A6XX_RB_RENDER_CNTL_FLAG_MRTS__MASK) >> A6XX_RB_RENDER_CNTL_FLAG_MRTS__SHIFT, 1u);
+    auto t = target(r);
+    RenderPass tp;
+    tp.color0 = t.get();
+    Sampler smp = nearestClamp();
+    Bindings fsb;
+    fsb.textures = {u.get()};
+    fsb.samplers = {&smp};
+    const auto before = r.fake->stats();
+    CHECK(runAll(r, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), up, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(texProgram(), tp, wholeDraw(6), Bindings{}, fsb));
+    }));
+    const auto after = r.fake->stats();
+    CHECK_EQ(after.ubwcFills - before.ubwcFills, 1u);
+    CHECK_EQ(after.ubwcDraws - before.ubwcDraws, 1u);
+    CHECK(after.ubwcSamples - before.ubwcSamples >= 1u);
+    CHECK_EQ(after.faults, 0u);
+    // the sampled descriptor: TILE6_3, FLAG and TILE_ALL, WZYX, the flag buffer in dwords 7-8
+    const TexConst d = u->sampledDescriptor();
+    CHECK_EQ((d.dword[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_3));
+    CHECK_EQ((d.dword[0] & A6XX_TEX_CONST_0_SWAP__MASK) >> A6XX_TEX_CONST_0_SWAP__SHIFT, uint32_t(WZYX));
+    CHECK((d.dword[3] & A6XX_TEX_CONST_3_FLAG) != 0 && (d.dword[3] & A6XX_TEX_CONST_3_TILE_ALL) != 0);
+    CHECK_EQ(d.dword[7], uint32_t(u->flagAddress()));
+    // a view in the format of the same storage reads it compressed; one with the other swap (RGBA8 over BGRA8) is refused
+    std::string why;
+    auto srgb = Texture::view(u, PixelFormat::kBGRA8UnormSrgb, TextureType::k2D, 0, 1, 0, 1, &why);
+    CHECK(srgb != nullptr && srgb->compressed());
+    CHECK(Texture::view(u, PixelFormat::kRGBA8Unorm, TextureType::k2D, 0, 1, 0, 1, &why) == nullptr);
+}
+
+// The model catches the bug behind HM_UBWC_RT's whitish-green dock (hmt4): a UBWC target read through a LINEAR
+// descriptor (what Texture::levelDescriptor gave a framebuffer fetch before hmv3) -- its compressed blocks taken as
+// pixels. Here a linear texture over the target's data, as that descriptor described it, sampled after a draw.
+TEST(the_fake_faults_on_a_linear_read_of_a_compressed_render_target) {
+    Rig r;
+    auto u = ubwcTarget(r, 64, 64);
+    if (u == nullptr) return;
+    RenderPass up;
+    up.color0 = u.get();
+    up.load = LoadAction::kClear;
+    CHECK(runAll(r, [&](CommandBuffer& cb) { CHECK(cb.draw(flatProgram(), up, wholeDraw(), Bindings{}, Bindings{})); }));
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    TextureDesc ld;
+    ld.format = PixelFormat::kBGRA8Unorm;
+    ld.width = 64;
+    ld.height = 64;
+    ld.usage = kTextureUsageRead;
+    std::string why;
+    auto linear = Texture::overBuffer(u->buffer(), u->gpuAddress() - u->buffer()->gpuAddress(), u->level(0).pitch, ld, &why);
+    CHECK(linear != nullptr);
+    if (linear == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    auto t = target(r);
+    RenderPass tp;
+    tp.color0 = t.get();
+    Sampler smp = nearestClamp();
+    Bindings fsb;
+    fsb.textures = {linear.get()};
+    fsb.samplers = {&smp};
+    runAll(r, [&](CommandBuffer& cb) { CHECK(cb.draw(texProgram(), tp, wholeDraw(6), Bindings{}, fsb)); });
+    CHECK_EQ(r.fake->stats().faults, 1u);
+    CHECK(r.fake->stats().lastFault.find("linear read") != std::string::npos);
+}
+
+// A framebuffer fetch from a compressed target in sysmem (CoreAnimation's materials blend by fetch): the slot gets the
+// target's level descriptor WITH its tiles and flags (hmv3's levelDescriptor fix), after the CCU flush and the cache
+// invalidate; two fetching draws in one pass, the fake judging the descriptor (a linear one is a fault, above).
+TEST(a_framebuffer_fetch_from_a_compressed_target_reads_it_through_its_flags) {
+    using namespace a6xx;
+    Rig r;
+    auto u = ubwcTarget(r, 64, 64);
+    if (u == nullptr) return;
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    RenderPass up;
+    up.color0 = u.get();
+    up.load = LoadAction::kClear;
+    render::Options sysmem;
+    sysmem.gmem = false;
+    sysmem.fbReadOrdered = false;
+    const auto before = r.fake->stats();
+    CHECK(runAll(r, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), up, wholeDraw(6), Bindings{}, Bindings{}, sysmem));
+        RenderPass again = up;
+        again.load = LoadAction::kLoad;
+        CHECK(cb.draw(fb, again, wholeDraw(6), Bindings{}, Bindings{}, sysmem));
+        CHECK(cb.draw(fb, again, wholeDraw(6), Bindings{}, Bindings{}, sysmem));
+    }));
+    const auto after = r.fake->stats();
+    CHECK_EQ(after.faults, 0u);
+    CHECK(after.ubwcSamples - before.ubwcSamples >= 2u);
+    const auto d = r.fake->memory(after.lastDraw.fsTexConst, 64);
+    const TexConst want = u->levelDescriptor(0);
+    CHECK(d.size() == 64 && memcmp(d.data(), want.dword, 64) == 0);
+    CHECK((want.dword[3] & A6XX_TEX_CONST_3_FLAG) != 0);
+}
+
+// CoreAnimation's blur chain over compressed targets: a full-size target drawn, downsampled by a draw sampling it
+// into a half-size compressed target, that one sampled into a quarter-size linear one; the full one copied into another
+// compressed target (the backdrop capture: UBWC to UBWC by the 2D engine, flags at both ends) and resolved into linear
+// rows (UBWC to linear, what a consumer that cannot take UBWC is given). No linear read or write of any UBWC image.
+TEST(a_blur_chain_runs_over_compressed_targets_with_copies_in_and_out_of_them) {
+    Rig r;
+    auto full = ubwcTarget(r, 256, 128), half = ubwcTarget(r, 128, 64), capture = ubwcTarget(r, 256, 128);
+    if (full == nullptr || half == nullptr || capture == nullptr) return;
+    auto quarter = target(r, 64, 32, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto rows = target(r, 256, 128, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    Sampler smp = nearestClamp();
+    RenderPass fp, hp, qp;
+    fp.color0 = full.get();
+    fp.load = LoadAction::kClear;
+    hp.color0 = half.get();
+    hp.load = LoadAction::kDontCare;
+    qp.color0 = quarter.get();
+    qp.load = LoadAction::kDontCare;
+    Bindings fromFull, fromHalf;
+    fromFull.textures = {full.get()};
+    fromFull.samplers = {&smp};
+    fromHalf.textures = {half.get()};
+    fromHalf.samplers = {&smp};
+    const auto before = r.fake->stats();
+    CHECK(runAll(r, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), fp, wholeDraw(6, 256, 128), Bindings{}, Bindings{}));
+        CHECK(cb.draw(texProgram(), hp, wholeDraw(6, 128, 64), Bindings{}, fromFull));
+        CHECK(cb.draw(texProgram(), qp, wholeDraw(6, 64, 32), Bindings{}, fromHalf));
+        CHECK(cb.blit(*full, 0, render::BlitRect{0, 0, 256, 128}, *capture, 0, render::BlitRect{0, 0, 256, 128}, false));
+        CHECK(cb.blit(*full, 0, render::BlitRect{16, 8, 64, 32}, *capture, 0, render::BlitRect{32, 16, 64, 32}, false));
+        CHECK(cb.blit(*capture, 0, render::BlitRect{0, 0, 256, 128}, *rows, 0, render::BlitRect{0, 0, 256, 128}, false));
+    }));
+    const auto after = r.fake->stats();
+    CHECK_EQ(after.faults, 0u);
+    CHECK_EQ(after.ubwcDraws - before.ubwcDraws, 2u);
+    CHECK(after.ubwcSamples - before.ubwcSamples >= 2u);
+    CHECK_EQ(after.ubwcToUbwcCopies - before.ubwcToUbwcCopies, 2u);
+    CHECK_EQ(after.ubwcResolves - before.ubwcResolves, 1u);
+    // what still refuses: a scaled or filtered copy into a compressed target, a copy from a level past 0
+    std::string why;
+    auto cb = r.queue->commandBuffer();
+    CHECK(!cb->blit(*full, 0, render::BlitRect{0, 0, 256, 128}, *half, 0, render::BlitRect{0, 0, 128, 64}, true));
 }
 
 TEST(a_draw_samples_a_texture_through_the_fs_prefetch) {

@@ -974,6 +974,14 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         t->ubwcLogH_ = log2ceil((desc.height + bh - 1) / bh);
         t->stale_ = staging != nullptr;
         t->staging_ = std::move(staging);   // (its first draw copies the rows in, zeros or not: the flag buffer's zeros are not known to read as them)
+        // (redfin ws-hm-ubwc) a compressed render target's flag buffer zeroed, as freedreno clears a new UBWC resource's
+        // flags before first use (needs_ubwc_clear): the kernel hands a client back a freed buffer of the same size
+        // without zeroing it (xnu 0156, the per-client reuse list), and flags left by whatever that buffer held before
+        // describe compressed blocks the data under them is not -- a first pass that loads, or draws part of the target,
+        // would then read and sample garbage colours. Zero flags with the data as it lies is what a fresh one reads.
+        if ((desc.usage & kTextureUsageRenderTarget) != 0 && t->buffer()->contents() != nullptr && t->ubwcOffset_ + t->ubwcLayerSize_ <= t->buffer()->length()) {
+            std::memset(static_cast<uint8_t*>(t->buffer()->contents()) + t->ubwcOffset_, 0, t->ubwcLayerSize_);
+        }
         return adopt(t);
 #else
         refuse(why, "a compressed texture: the UBWC layout is Mesa's, and this build has none");
@@ -1711,7 +1719,9 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         // (redfin hmv2) a compressed render target (HM_UBWC_RT) has no rows to reinterpret: a view of it in a format of the
         // same storage (its sRGB twin), as the whole 2D texture, reads it compressed; any other is refused
         const FormatInfo* vi = formatInfo(format);
-        if (vi == nullptr || vi->fmt6 != parent->info_->fmt6 || vi->bytesPerPixel != parent->info_->bytesPerPixel || type != TextureType::k2D ||
+        // (redfin ws-hm-ubwc) and the same swap: the layout holds the parent's components in WZYX order whatever its
+        // format, so an RGBA8 view of a BGRA8 target would read red where Metal's view reads the parent's blue
+        if (vi == nullptr || vi->fmt6 != parent->info_->fmt6 || vi->swap != parent->info_->swap || vi->bytesPerPixel != parent->info_->bytesPerPixel || type != TextureType::k2D ||
             baseLevel != 0 || levels != 1 || baseSlice != 0 || slices != 1) {
             refuse(why, "a view in pixel format " + n(uint32_t(format)) + " of a compressed " + parent->info_->name +
                             " render target: its own storage format as the whole 2D texture is what is served");
