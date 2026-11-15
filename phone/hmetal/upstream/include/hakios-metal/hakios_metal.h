@@ -82,6 +82,9 @@ int hakios_metal_surface_cpu_access(hakios_metal_device *device, uint32_t surfac
 /* (ws-hm-int6) process-wide running totals: [0] blends HM_BLEND_OPT encoded as plain writes (blendsMadeWrites), [1]
  * compressed textures made, [2] of them render targets whose flag buffer was zeroed at creation */
 void hakios_metal_ubwc_counts(unsigned long long out[3]);
+/* (ws-hm-sbar) process-wide running totals: [0] framebuffer-fetch barriers encoded in sysmem passes, [1] fetching draws
+ * ordered by GRAS_SC_CNTL alone without one (HM_FETCH_ORDER=1/2), [2] HM_FETCH_ORDER's value */
+void hakios_metal_fetch_counts(unsigned long long out[3]);
 /* (ws-hm-ubwc2) HM_UBWC_RT's rule set (HM_UBWC_MIN, HM_UBWC_ALIGN; Mesa's 16-wide floor): 1 when a render target of
  * WIDTH x HEIGHT with USAGE may be made compressed, 0 when it stays linear (the reason in the HM_UBWC_LOG line) */
 int hakios_metal_ubwc_rt_ok(unsigned width, unsigned height, unsigned usage);

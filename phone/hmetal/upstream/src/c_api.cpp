@@ -279,6 +279,12 @@ void hakios_metal_ubwc_counts(unsigned long long out[3]) {   // (ws-hm-int6)
     out[2] = made[1];
 }
 
+void hakios_metal_fetch_counts(unsigned long long out[3]) {   // (ws-hm-sbar)
+    uint64_t v[3];
+    render::fetchCounts(v);
+    for (int i = 0; i < 3; i++) out[i] = v[i];
+}
+
 int hakios_metal_ubwc_rt_ok(unsigned width, unsigned height, unsigned usage) {   // (ws-hm-ubwc2)
     return ubwcRenderTargetEligible(width, height, usage) ? 1 : 0;
 }

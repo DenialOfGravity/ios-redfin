@@ -309,6 +309,58 @@ hm_prof_cmp(const void *a, const void *b)
 	return x < y ? 1 : x > y ? -1 : 0;
 }
 
+/* (ws-hm-sbar) HM_PROF=3: HM_PROF=2 and every draw of a sysmem pass timed alone (a wait for idle before and after it, so
+ * the frame rate drops: for finding WHICH draws cost, not how fast things are), every 5 s by the target's size and the
+ * program's name (the core adds " FETCH" for a framebuffer-fetching draw), with where the draws lie; and how many draws
+ * of the display-sized passes lie in the status bar's rows (0-169 of 2436: the bar is 132) */
+#define HM_PROF_DRAWS 96
+static struct {
+	unsigned n, fetchN, sbN, sbFetchN;
+	double us, fetchUs, sbUs;
+	struct { unsigned w, h, count, sb; double us, aw, ah, ay; char name[160]; } d[HM_PROF_DRAWS];
+	unsigned other;
+} hm_prof_draws;
+
+static void
+hm_prof_draw_add(unsigned w, unsigned h, const char *name, double us, const unsigned area[4])
+{
+	const BOOL fetch = strstr(name, " FETCH") != NULL;
+	const BOOL screen = w >= 1000 && h >= 2000;
+	const BOOL sb = screen && area[3] < 170;
+	int k;
+
+	hm_prof_draws.n++, hm_prof_draws.us += us;
+	if (fetch) hm_prof_draws.fetchN++, hm_prof_draws.fetchUs += us;
+	if (sb) hm_prof_draws.sbN++, hm_prof_draws.sbUs += us, hm_prof_draws.sbFetchN += fetch ? 1 : 0;
+	for (k = 0; k < HM_PROF_DRAWS; k++) {
+		if (hm_prof_draws.d[k].count == 0 || (hm_prof_draws.d[k].w == w && hm_prof_draws.d[k].h == h &&
+		    strncmp(hm_prof_draws.d[k].name, name, sizeof(hm_prof_draws.d[k].name) - 1) == 0)) {
+			break;
+		}
+	}
+	if (k == HM_PROF_DRAWS) {
+		hm_prof_draws.other++;
+		return;
+	}
+	if (hm_prof_draws.d[k].count == 0) {
+		hm_prof_draws.d[k].w = w, hm_prof_draws.d[k].h = h;
+		strlcpy(hm_prof_draws.d[k].name, name, sizeof(hm_prof_draws.d[k].name));
+	}
+	hm_prof_draws.d[k].count++;
+	hm_prof_draws.d[k].sb += sb ? 1 : 0;
+	hm_prof_draws.d[k].us += us;
+	hm_prof_draws.d[k].aw += area[2] >= area[0] ? area[2] - area[0] + 1 : 0;
+	hm_prof_draws.d[k].ah += area[3] >= area[1] ? area[3] - area[1] + 1 : 0;
+	hm_prof_draws.d[k].ay += area[1];
+}
+
+static int
+hm_prof_draw_cmp(const void *a, const void *b)
+{
+	const double x = ((const __typeof__(hm_prof_draws.d[0]) *)a)->us, y = ((const __typeof__(hm_prof_draws.d[0]) *)b)->us;
+	return x < y ? 1 : x > y ? -1 : 0;
+}
+
 static void
 hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 {
@@ -385,6 +437,18 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 				x->cleared += c, x->loaded += l, x->stored += st;
 			}
 		}
+		for (unsigned i = 0; hm_prof_level() >= 3; i++) {   /* (ws-hm-sbar) HM_PROF=3: the buffer's draws, each timed alone */
+			const char *name = NULL;
+			unsigned pass = 0, area[4] = {0, 0, 0, 0}, kind = 0, w = 0, h = 0, draws = 0;
+			double dus = 0, pus = 0;
+
+			if (hakios_metal_cb_draw_time(cb, i, &name, &dus) <= (int)i || name == NULL ||
+			    hakios_metal_cb_draw_place(cb, i, &pass, area) <= (int)i) {
+				break;
+			}
+			hakios_metal_cb_pass_time(cb, pass, &kind, &w, &h, &draws, &pus);
+			hm_prof_draw_add(w, h, name, dus, area);
+		}
 	}
 	if (now - hm_prof.since >= 5.0) {
 		const double secs = now - hm_prof.since;
@@ -432,6 +496,32 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 				 getenv("HM_BLEND_OPT") ? getenv("HM_BLEND_OPT") : "unset", u[1], u[1] - wasU[1], u[2], u[2] - wasU[2],
 				 getenv("HM_UBWC_RT") ? getenv("HM_UBWC_RT") : "unset", getenv("HM_GMEM") ? getenv("HM_GMEM") : "unset");
 			memcpy(wasU, u, sizeof(wasU));
+		}
+		{   /* (ws-hm-sbar) HM_FETCH_ORDER: framebuffer-fetch barriers in sysmem passes, and fetching draws ordered without one */
+			static unsigned long long wasF[2];
+			unsigned long long f[3];
+
+			hakios_metal_fetch_counts(f);
+			hm_print("prof: sync: fetch: a frame: %.1f fetch barriers, %.1f fetching draws ordered without one (HM_FETCH_ORDER=%llu)\n",
+				 (f[0] - wasF[0]) / frames, (f[1] - wasF[1]) / frames, f[2]);
+			wasF[0] = f[0], wasF[1] = f[1];
+		}
+		if (hm_prof_level() >= 3 && hm_prof_draws.n != 0) {   /* (ws-hm-sbar) HM_PROF=3's draw table */
+			hm_print("prof: draws: %u timed alone (%.1f a frame), %.2f ms a frame; FETCH %.1f a frame, %.2f ms; status-bar rows of "
+				 "display-sized passes: %.1f a frame (%.1f FETCH), %.2f ms%s\n",
+				 hm_prof_draws.n, hm_prof_draws.n / frames, hm_prof_draws.us / 1e3 / frames, hm_prof_draws.fetchN / frames,
+				 hm_prof_draws.fetchUs / 1e3 / frames, hm_prof_draws.sbN / frames, hm_prof_draws.sbFetchN / frames,
+				 hm_prof_draws.sbUs / 1e3 / frames, hm_prof_draws.other != 0 ? " (draws past the table not listed)" : "");
+			qsort(hm_prof_draws.d, HM_PROF_DRAWS, sizeof(hm_prof_draws.d[0]), hm_prof_draw_cmp);
+			for (int k = 0; k < 24 && hm_prof_draws.d[k].count != 0; k++) {
+				const double n = hm_prof_draws.d[k].count;
+
+				hm_print("prof:   draw into %4ux%-4u %5.1f a frame, %7.1f us each, %6.2f ms a frame; ~%.0fx%.0f at y %.0f; %u in the bar rows | %s\n",
+					 hm_prof_draws.d[k].w, hm_prof_draws.d[k].h, n / frames, hm_prof_draws.d[k].us / n, hm_prof_draws.d[k].us / 1e3 / frames,
+					 hm_prof_draws.d[k].aw / n, hm_prof_draws.d[k].ah / n, hm_prof_draws.d[k].ay / n, hm_prof_draws.d[k].sb,
+					 hm_prof_draws.d[k].name);
+			}
+			memset(&hm_prof_draws, 0, sizeof(hm_prof_draws));
 		}
 		qsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);
 		for (int k = 0; k < 12 && hm_prof.cls[k].count != 0; k++) {
@@ -2426,7 +2516,10 @@ HMI4_PROF_NEW = '''			 hm_presents_seen ? "frames = presentDrawable" : "frames =
 		}
 '''
 HMI4_EDITS += [
-    ('static BOOL hm_fps_on(void);', 'static BOOL hm_fps_on(void);\nstatic void hm_pool_note(double now, int force);   /* (redfin hm-int4) HM_POOL_LOG */'),
+    ('static BOOL hm_fps_on(void);', 'static BOOL hm_fps_on(void);\nstatic void hm_pool_note(double now, int force);   /* (redfin hm-int4) HM_POOL_LOG */\n'
+     'static int hm_prof_level(void);   /* (ws-hm-sbar) HM_PROF=3 */'),
+    ('\t\thakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());',
+     '\t\thakios_metal_cb_set_profile_draws(_cb, hm_fps_draws() || hm_prof_level() >= 3);   /* (ws-hm-sbar) HM_PROF=3 */'),
     (HMI4_POOL_FN_OLD, HMI4_POOL_FN_NEW),
     (HMI4_POOL_OLD, HMI4_POOL_NEW),
     (HMI4_PROF_OLD, HMI4_PROF_NEW),
