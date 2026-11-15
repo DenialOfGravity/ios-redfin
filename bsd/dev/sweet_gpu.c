@@ -2623,9 +2623,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTL
  * With tribuf 2 the queued swaps answer Busy, so CA's 3-page ring throttles it to one pending frame behind the one on screen.
  */
 SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_queue, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    (void *)2, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: newer swaps queue behind a pending one (1110)");
+    (void *)2, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: newer swaps queue behind a pending one (1110; default 1 since 1112, boot-arg sweetframeq=0: 0)");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109)");
+    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109; default 2 since 1112)");
 
 /*
  * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait

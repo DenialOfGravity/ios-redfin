@@ -4527,12 +4527,40 @@ sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec)
  * scanout has started (no thread yet) the value is kept and taken at the start instead of the boot-arg.
  */
 static int sweet_scan_gate_req = -1, sweet_scan_tribuf_req = -1;
+static int sweet_scan_queue_req = -1;   /* 1112: kern.sweet_scangate_queue written before the scanout's start */
+
+/*
+ * 1112: the frame queue is the default: tribuf 2 (SwapWait busy until a later swap latched, 1109) + queue 1 (a newer swap
+ * queues behind a pending one, 1110), with the gate's default 1 (boot-arg sweetscangate). Boot-arg sweetframeq=0 restores
+ * the old defaults (tribuf 0, or 1 with sweetfbx 0x40; queue 0). kern.sweet_scangate_tribuf / _queue / _mode stay
+ * writable and win over these defaults (before or after the scanout's start).
+ */
+static int
+sweet_frameq_boot(void)
+{
+	static int fq = -1;
+	if (fq < 0) {
+		uint32_t v = 1;
+		PE_parse_boot_argn("sweetframeq", &v, sizeof(v));
+		fq = v != 0;
+	}
+	return fq;
+}
+
+static int
+sweet_scan_tribuf_default(void)
+{
+	return sweet_frameq_boot() ? 2 : ((sweet_fbx & SWEET_FBX_TRIBUF) != 0);
+}
 
 extern "C" int sweet_scan_gate_get(int what);
 int
 sweet_scan_gate_get(int what)
 {
 	if (what == 2) {
+		if (!sweet_scan.thread) {
+			return sweet_scan_queue_req >= 0 ? sweet_scan_queue_req : sweet_frameq_boot();   /* 1112 */
+		}
 		return sweet_scan.queue ? 1 : 0;        /* 1110 */
 	}
 	if (!sweet_scan.thread) {
@@ -4545,7 +4573,7 @@ sweet_scan_gate_get(int what)
 			PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
 			return g <= 4 ? (int)g : 1;
 		}
-		return (sweet_fbx & SWEET_FBX_TRIBUF) != 0;
+		return sweet_scan_tribuf_default();     /* 1112 */
 	}
 	return what == 0 ? (int)sweet_scan.gate : (sweet_scan.pollRel ? 2 : (sweet_scan.tribuf ? 1 : 0));
 }
@@ -4561,6 +4589,7 @@ sweet_scan_gate_put(int what, int v)
 	if (what == 2) {
 		/* 1110: the field alone (fLock not needed: read under fLock at each SwapEnd, a change takes the next one) */
 		sweet_scan.queue = v != 0;
+		sweet_scan_queue_req = v;       /* 1112: also the value at the scanout's start */
 		IOLog("SWEET SCANOUT: queue %d (%s)\n", v, v ? "a newer swap queues behind a pending one (no replacement until 3 wait)" :
 		    "a newer swap replaces a pending one (gate 2 queues)");
 		return 0;
@@ -4610,7 +4639,11 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
 		uint32_t g = 1;         /* 0989: boot-arg sweetscangate=0|1|2 (default 1, the CPU gate); 1105: 3 */
 		PE_parse_boot_argn("sweetscangate", &g, sizeof(g));
 		sweet_scan.gate = g <= 4 ? g : 1;
-		sweet_scan.tribuf = (sweet_fbx & SWEET_FBX_TRIBUF) != 0;     /* 0996 */
+		/* 0996; 1112: tribuf 2 + queue 1 unless boot-arg sweetframeq=0 */
+		int tb = sweet_scan_tribuf_default();
+		sweet_scan.tribuf = tb != 0;
+		sweet_scan.pollRel = tb == 2;
+		sweet_scan.queue = (sweet_scan_queue_req >= 0 ? sweet_scan_queue_req : sweet_frameq_boot()) != 0;
 		if (sweet_scan_gate_req >= 0) {
 			sweet_scan.gate = (uint32_t)sweet_scan_gate_req;        /* 1105: kern.sweet_scangate_mode before the start */
 		}
@@ -4618,6 +4651,9 @@ sweet_scan_set(AppleCLCD *fb, bool on, const char *why)
 			sweet_scan.tribuf = sweet_scan_tribuf_req != 0;         /* 1105: kern.sweet_scangate_tribuf */
 			sweet_scan.pollRel = sweet_scan_tribuf_req == 2;        /* 1109 */
 		}
+		IOLog("SWEET SCANOUT: start: gate %u tribuf %u queue %u (1112: frame queue %s, boot-arg sweetframeq)\n",
+		    sweet_scan.gate, sweet_scan.pollRel ? 2 : (sweet_scan.tribuf ? 1 : 0), sweet_scan.queue ? 1 : 0,
+		    sweet_frameq_boot() ? "default" : "off");
 		sweet_scan.thread = IOCreateThread(sweet_scan_thread, fb) != NULL;
 		if (!sweet_scan.thread) {
 			IOLog("SWEET SCANOUT: no thread: stays off\n");
