@@ -44,7 +44,7 @@
 #include "SweetSurface.h"
 #include "SweetGPUABI.h"
 #include "SweetTrace.h"     /* 0994 */
-#define SWEET_V2_SUBMIT_FLAGS   NativeAdrenoAbiSubmitWritesDisplay      /* 1104: the submit flags this kernel takes */
+#define SWEET_V2_SUBMIT_FLAGS   (NativeAdrenoAbiSubmitWritesDisplay | NativeAdrenoAbiSubmitSurfaceMask)  /* 1104; 1105: + surface id */
 #define SWEET_V2_IB_HW  128     /* 1038: = A6_SUBMIT_MAX_HW (bsd/dev/sweet_a6xx.h) */
 
 extern "C" {

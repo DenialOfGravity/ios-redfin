@@ -2567,6 +2567,36 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &s
     "SWEET SCANOUT: gate only display-writing submits of processes that flag them (1104, default 1)");
 
 /*
+ * 1105: kern.sweet_scangate_mode 0|1|2|3 (= p scanout gate N; boot default 1 = boot-arg sweetscangate): 0 SwapEnd back
+ * pressure, 1 the swapper's GPU submits wait on the CPU for the last swap's latch, 2 the CP waits for it, 3 per surface:
+ * a display submit that names its surface (flags bits 8..31) waits only while that surface is on screen or queued for a
+ * latch; one that does not is gated as 1. kern.sweet_scangate_tribuf 0|1 (= p scanout tribuf; default 0 = boot sweetfbx
+ * 0x40): honest SwapWait polls, so CoreAnimation keeps K-1's ring entry until K is latched and draws K+1 into a third
+ * surface (its swap ring holds 3). Either may be set before the scanout starts (then it is the start value).
+ */
+extern int sweet_scan_gate_get(int what);               /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+extern int sweet_scan_gate_put(int what, int value);
+static int
+sysctl_sweet_scangate SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg2)
+	int what = (int)(uintptr_t)arg1;
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_scan_gate_get(what), sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > (what == 0 ? 3 : 1)) {
+		return EINVAL;
+	}
+	return sweet_scan_gate_put(what, value);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    (void *)0, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: gate 0 back pressure, 1 CPU, 2 CP, 3 per surface (1105)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: honest SwapWait polls, 3-surface chain (0996 tribuf)");
+
+/*
  * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
  * for (p scanout gate 2); and each process's last fence (the swapper's frame is done at its own last submit, not at
  * the latest of anyone's: r39's fence waits included other clients' work queued after it).
@@ -2645,7 +2675,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
 	int pid = proc_selfpid();
 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
 	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
-	uint32_t gf = flags & 1u;
+	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
 	if (sweet_scangate_flag) {
 		if (gf) {
 			scangate_flag_pid = pid;

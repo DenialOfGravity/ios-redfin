@@ -92,6 +92,13 @@ struct NativeAdrenoAbiSubmit {
 };
 /* redfin 1104: NativeAdrenoAbiSubmit.flags bit 0: this submission writes a display (swap-chain) surface */
 #define NativeAdrenoAbiSubmitWritesDisplay 1u
+/*
+ * redfin 1105: flags bits 8..31 (optional, with bit 0): the IOSurface id of the display surface this submission writes.
+ * Scanout gate 3 holds the submission only while that surface is on screen or queued for a latch; 0 = not given (the
+ * submission is gated as with gate 1). Bits 1..7 must be zero.
+ */
+#define NativeAdrenoAbiSubmitSurfaceShift  8
+#define NativeAdrenoAbiSubmitSurfaceMask   0xffffff00u
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
     uint32_t bytes;               /* set: length; get: requested capacity */
