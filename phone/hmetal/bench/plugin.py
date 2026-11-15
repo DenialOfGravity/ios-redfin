@@ -297,7 +297,7 @@ static struct {
 	double gpuUs, passUs;
 	unsigned long long cleared, loaded, stored;
 	unsigned hist[6];   /* draw passes by their draws: 0, 1, 2-4, 5-15, 16-55, 56 and more */
-	unsigned long long sync[24];   /* (ws-hm-perf2) hakios_metal_cb_sync_counts summed over the buffers */
+	unsigned long long sync[28];   /* (ws-hm-perf2) hakios_metal_cb_sync_counts summed over the buffers ((ws-hm-int6) 28: the UBWC classes) */
 	unsigned synced;
 	struct hm_prof_class cls[HM_PROF_CLASSES];
 } hm_prof = { PTHREAD_MUTEX_INITIALIZER };
@@ -329,8 +329,8 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 		hm_prof.buffers++;
 		hm_prof.gpuUs += gpu * 1e6;
 		{   /* (ws-hm-perf2) the sync line: the GPU's own time, the census, the pass switches' counts */
-			unsigned long long v[24];
-			const int got = hakios_metal_cb_sync_counts(cb, v, 24);
+			unsigned long long v[28];
+			const int got = hakios_metal_cb_sync_counts(cb, v, 28);
 
 			for (int k = 0; k < got; k++) {
 				hm_prof.sync[k] += v[k];
@@ -418,6 +418,20 @@ hm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)
 				 y[17] / frames, sp[0] - was[0], sp[1] - was[1], sp[2] - was[2], sp[3] - was[3],
 				 getenv("HM_PASS_FLUSH") ? getenv("HM_PASS_FLUSH") : "lazy");
 			memcpy(was, sp, sizeof(was));
+		}
+		{   /* (ws-hm-int6) the UBWC pass classes a frame, and HM_BLEND_OPT's / the flag zeroing's running totals */
+			static unsigned long long wasU[3];
+			unsigned long long u[3];
+			const unsigned long long *y = hm_prof.sync;
+
+			hakios_metal_ubwc_counts(u);
+			hm_print("prof: sync: ubwc: a frame: %.1f UBWC draw passes (%.1f in GMEM), %.1f UBWC 2D copies, %.1f compressed/linear switches; "
+				 "blendsMadeWrites %llu (+%llu, HM_BLEND_OPT=%s), UBWC textures made %llu (+%llu), flag buffers zeroed %llu (+%llu); "
+				 "HM_UBWC_RT=%s HM_GMEM=%s\n",
+				 y[24] / frames, y[25] / frames, y[26] / frames, y[27] / frames, u[0], u[0] - wasU[0],
+				 getenv("HM_BLEND_OPT") ? getenv("HM_BLEND_OPT") : "unset", u[1], u[1] - wasU[1], u[2], u[2] - wasU[2],
+				 getenv("HM_UBWC_RT") ? getenv("HM_UBWC_RT") : "unset", getenv("HM_GMEM") ? getenv("HM_GMEM") : "unset");
+			memcpy(wasU, u, sizeof(wasU));
 		}
 		qsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);
 		for (int k = 0; k < 12 && hm_prof.cls[k].count != 0; k++) {

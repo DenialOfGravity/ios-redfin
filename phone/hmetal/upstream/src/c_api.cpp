@@ -267,6 +267,18 @@ int hakios_metal_ubwc(hakios_metal_device* d, unsigned* hbb, unsigned* swizzle, 
     return u.fromDriver ? 1 : 0;
 }
 
+int hakios_metal_surface_cpu_access(hakios_metal_device* d, uint32_t surface) {   // (ws-hm-int6)
+    return d->gpu->cpuAccess(0, surface);
+}
+
+void hakios_metal_ubwc_counts(unsigned long long out[3]) {   // (ws-hm-int6)
+    uint64_t made[2];
+    ubwcMadeCounts(made);
+    out[0] = render::blendsMadeWrites();
+    out[1] = made[0];
+    out[2] = made[1];
+}
+
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
 
 void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses) {
@@ -1818,14 +1830,14 @@ int hakios_metal_cb_sync_counts(hakios_metal_cb* cb, unsigned long long* out, in
     const CommandBuffer& c = *cb->cb;
     const render::SyncCensus& s = c.syncCensus();
     const CommandBuffer::Counts& k = c.counts();
-    const unsigned long long v[24] = {(unsigned long long)std::max<int64_t>(0, c.gpuStampedNanoseconds()),
+    const unsigned long long v[28] = {(unsigned long long)std::max<int64_t>(0, c.gpuStampedNanoseconds()),
                                       (unsigned long long)std::max<int64_t>(0, c.preGpuNanoseconds()),
                                       s.words, s.registerWords, s.wfis, s.ccuColorFlushes, s.ccuDepthFlushes, s.cacheFlushes, s.waits,
                                       s.cacheInvalidates, s.ccuInvalidates, s.memcpyWords, k.tailsSkipped, k.barriers, k.invalidates,
                                       k.lazyTails, k.headsCarried, k.storeMerges, k.cpCopies, k.cpCopyBytes, k.passes, k.draws, s.blits,
-                                      s.markers};
+                                      s.markers, k.ubwcPasses, k.ubwcGmemPasses, k.ubwcCopies, k.ubwcSwitches};
     if (out == nullptr || n <= 0) return 0;
-    const int m = std::min(n, 24);
+    const int m = std::min(n, 28);
     for (int i = 0; i < m; i++) out[i] = v[i];
     return m;
 }

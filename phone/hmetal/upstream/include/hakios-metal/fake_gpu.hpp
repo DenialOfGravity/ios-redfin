@@ -166,6 +166,7 @@ public:
         // (ws-hm-perf2) sysmem FS textures read over memory still in the CCU or flushed without a CACHE_INVALIDATE since
         // (a stale read on the GPU), and the last such read named
         uint32_t staleSamples = 0;
+        uint32_t staleBlitReads = 0;   // (ws-hm-int6) of them, the 2D engine's source reads (a copy's source or its flags)
         std::string lastStale;
     };
 
@@ -308,6 +309,13 @@ private:
     // texture caches were not dropped since; the extent each target of the draw being judged writes
     std::vector<std::pair<uint64_t, uint64_t>> ccuDirty_, cacheStale_;
     uint64_t drawExtent_[8] = {};
+    // (ws-hm-int6) ...and the flag buffer each UBWC target of that draw writes (lo, hi; 0, 0 for a linear one): the RB
+    // writes a compressed target's flags through the CCU as it writes its blocks
+    uint64_t drawFlags_[8][2] = {};
+    // (ws-hm-int6) a read at ADDR by WHO (a FS texture, the 2D engine's source, a UBWC image's flags) judged against the
+    // coherence model: Stats::staleSamples and lastStale when it meets memory still in the CCU or flushed without a
+    // CACHE_INVALIDATE since
+    void staleRead(const std::string& who, uint64_t addr);
     CsState cs_;
     StageLoads vs_, fs_;
     bool gfxIbosLoaded_ = false;   // the 3D IBO table's load into SB6_IBO in this submission

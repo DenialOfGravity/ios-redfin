@@ -185,7 +185,12 @@ public:
                     // a blit, a dispatch, a clear or the end), heads that went on from the pass before (no batch start, no
                     // CCU set-up), draws joined to the open pass although their store actions differ; and the command
                     // processor's own copies and fills (copy, fill), which no pass stamp times, with their bytes
-                    tailsSkipped = 0, barriers = 0, invalidates = 0, lazyTails = 0, headsCarried = 0, storeMerges = 0, cpCopies = 0;
+                    tailsSkipped = 0, barriers = 0, invalidates = 0, lazyTails = 0, headsCarried = 0, storeMerges = 0, cpCopies = 0,
+                    // (ws-hm-int6) the UBWC pass classes (HM_PROF's "prof: sync: ubwc" line): draw passes with a compressed
+                    // colour attachment, of them drawn in GMEM, 2D copies with a compressed source or destination, and
+                    // draw passes whose compressed-or-linear class differs from the draw pass before (each re-emits
+                    // RB_MRT_FLAG_BUFFER and RB_RENDER_CNTL.FLAG_MRTS whatever HM_PASS_STATIC carried)
+                    ubwcPasses = 0, ubwcGmemPasses = 0, ubwcCopies = 0, ubwcSwitches = 0;
                     uint64_t cpCopyBytes = 0; };   // (redfin hm-int4) fillsDropped: HM_DEADFILL's draws taken back (render.cpp)   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -410,6 +415,7 @@ private:
     void carryKeep(size_t before) { if (carryOk_ && before == carryEnd_) carryEnd_ = stream_.size(); }
     // a barrier as encodeBarrier puts it, into the stream (a draw's read of dirty or flushed memory); false: no memory
     bool barrier(bool full);
+    int lastPassUbwc_ = -1;   // (ws-hm-int6) the class of the draw pass opened last: 1 compressed, 0 linear, -1 none yet
     std::unique_ptr<OpenPass> open_;
     const Texture* lastClosed_ = nullptr;   // (redfin hmv4) the colour attachment 0 of the pass closed last (pass splits)
 public:
@@ -448,7 +454,9 @@ public:
     // (ws-hm-perf2) HM_PROF's sync line: the submitted stream's census (render::census, made at submit when profiling)
     // and the GPU's own time for it and for the decode buffers sent before it (CP_ALWAYS_ON_COUNTER stamps, ns; 0 none)
     const render::SyncCensus& syncCensus() const { return census_; }
-    void setCensus(bool on) { censusOn_ = on; }   // (the census without profiling: a test's, of the stream as it runs unstamped)
+    void setCensus(bool on) { censusOn_ = on; }
+    // (ws-hm-int6) tests: STREAM appended to this buffer's stream as it stands (an open pass stays open)
+    bool appendRawForTesting(const pm4::Stream& stream);   // (the census without profiling: a test's, of the stream as it runs unstamped)
     int64_t gpuStampedNanoseconds() const;
     int64_t preGpuNanoseconds() const { return int64_t(preGpuTicks_.load(std::memory_order_relaxed)) * 625 / 12; }
     // (redfin hm-int5) HM_XR_WB=gpu (default): every extended-range companion this buffer drew is written into its

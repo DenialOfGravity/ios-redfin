@@ -957,6 +957,16 @@ bool FakeGpu::checkStageProgram(const char* what, const StageLoads& xs, uint32_t
 // the copy render::encodeBlit writes (clear false: SP_PS_2D_SRC_* the source, GRAS_2D_SRC_* its rectangle): texel for
 // texel at the same size, bilinear at another with FILTER (each destination pixel's centre mapped into the source),
 // nearest without. Only between linear images of one format: a conversion is not modelled.
+void FakeGpu::staleRead(const std::string& who, uint64_t addr) {
+    bool inCcu = false, inCache = false;
+    for (const auto& r : ccuDirty_) inCcu = inCcu || (addr >= r.first && addr < r.second);
+    for (const auto& r : cacheStale_) inCache = inCache || (addr >= r.first && addr < r.second);
+    if (!inCcu && !inCache) return;
+    stats_.staleSamples++;
+    stats_.lastStale = who + text(" at %#llx: ", addr) +
+                       (inCcu ? "still in the CCU (no PC_CCU_FLUSH_COLOR_TS since it was written)" : "flushed, but no CACHE_INVALIDATE since");
+}
+
 bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     using namespace a6xx;
     if (count != 1 || fieldOf(p[0], CP_BLIT_0_OP__MASK, CP_BLIT_0_OP__SHIFT) != BLIT_OP_SCALE) {
@@ -1036,6 +1046,21 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     const uint32_t sinfo = reg(REG_A6XX_SP_PS_2D_SRC_INFO);
     const uint64_t sbase = reg64(REG_A6XX_SP_PS_2D_SRC);
     const bool srcUbwc = copy && fieldOf(sinfo, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT) == TILE6_3 && (sinfo & 0x1000u) != 0;
+    // (ws-hm-int6) the coherence model for the 2D engine: its source is read through the texture caches (SP_PS_2D_SRC,
+    // the TP), so a source -- and a UBWC source's flags -- a draw, fill or copy left in the CCU, or flushed without a
+    // CACHE_INVALIDATE since, is a stale read; its destination (and a UBWC destination's flags, which precede the
+    // blocks in fdl6's layout and the kernel's) is written through the CCU as a draw's colour is
+    if (copy && !inTile_) {
+        const uint32_t before = stats_.staleSamples;
+        staleRead("the 2D source", sbase);
+        if (srcUbwc) staleRead("the 2D source's UBWC flags", reg64(REG_A6XX_SP_PS_2D_SRC_FLAGS));
+        stats_.staleBlitReads += stats_.staleSamples - before;
+    }
+    if (!inTile_) {
+        ccuDirty_.push_back({base + uint64_t(y0) * pitch, base + (uint64_t(y1) + 16) * pitch});
+        const uint64_t dflags = reg64(REG_A6XX_RB_2D_DST_FLAGS);
+        if ((info & A6XX_RB_2D_DST_INFO_FLAGS) != 0 && dflags != 0) ccuDirty_.push_back({dflags, dflags < base ? base : dflags + 64});
+    }
     if (copy && srcUbwc) {
         const uint64_t sflags = reg64(REG_A6XX_SP_PS_2D_SRC_FLAGS);
         auto f = ubwcFlags_.find(sbase);
@@ -1620,6 +1645,9 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         d.mrtBases[t] = base;
         d.mrtFormats[t] = format;
         drawExtent_[t] = counted * pitch;   // (ws-hm-perf2) what the coherence model takes the draw to write
+        // (ws-hm-int6) a UBWC target's flag buffer, up to its blocks (fdl6 and the kernel put the flags first)
+        drawFlags_[t][0] = ubwcTarget ? mrtFlags : 0;
+        drawFlags_[t][1] = ubwcTarget ? (mrtFlags < base ? base : mrtFlags + 64) : 0;
         if (t == 0) {
             d.mrtFormat = format;
             d.mrtTileMode = tile;
@@ -1796,13 +1824,12 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         if (td == nullptr) continue;
         const uint64_t base = td[4] | uint64_t(fieldOf(td[5], A6XX_TEX_CONST_5_BASE_HI__MASK, A6XX_TEX_CONST_5_BASE_HI__SHIFT)) << 32;
         if (base == 0) continue;
-        bool inCcu = false, inCache = false;
-        for (const auto& r : ccuDirty_) inCcu = inCcu || (base >= r.first && base < r.second);
-        for (const auto& r : cacheStale_) inCache = inCache || (base >= r.first && base < r.second);
-        if (inCcu || inCache) {
-            stats_.staleSamples++;
-            stats_.lastStale = text("FS texture %llu at %#llx: ", i, base) +
-                               (inCcu ? "still in the CCU (no PC_CCU_FLUSH_COLOR_TS since it was written)" : "flushed, but no CACHE_INVALIDATE since");
+        staleRead(text("FS texture %llu", i), base);
+        // (ws-hm-int6) a UBWC texture (TILE6_3 with a flag buffer, TEX_CONST 7-8) reads its flags too: flags a draw or a
+        // copy left in the CCU are as stale as its blocks
+        const uint64_t flags = uint64_t(td[7]) | uint64_t(td[8] & 0x1ffff) << 32;
+        if (fieldOf(td[0], A6XX_TEX_CONST_0_TILE_MODE__MASK, A6XX_TEX_CONST_0_TILE_MODE__SHIFT) == TILE6_3 && flags != 0) {
+            staleRead(text("FS texture %llu's UBWC flags", i), flags);
         }
     }
     {
@@ -2133,6 +2160,7 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     if (!inTile_) {
         for (uint32_t t = 0; t < d.mrtCount; t++) {
             if (((unwrittenMask >> t) & 1) == 0 && d.mrtBases[t] != 0) ccuDirty_.push_back({d.mrtBases[t], d.mrtBases[t] + drawExtent_[t]});
+            if (((unwrittenMask >> t) & 1) == 0 && drawFlags_[t][0] != 0) ccuDirty_.push_back({drawFlags_[t][0], drawFlags_[t][1]});   // (ws-hm-int6)
         }
     }
     samples_ += uint64_t(d.numIndices) * d.numInstances;

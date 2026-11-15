@@ -22,6 +22,7 @@ struct Counts {
     uint32_t allocs = 0, imports = 0, maps = 0, frees = 0, submits = 0, waits = 0, cpuMaps = 0, queuesMade = 0;
     uint32_t cleans = 0, invalidates = 0, unsupported = 0;
     uint32_t flaggedSubmits = 0;   // (redfin hm-int5) submissions with NativeAdrenoAbiSubmit.reserved bit 0 (HM_GATE_FLAG)
+    uint32_t lastSubmitFlags = 0;  // (ws-hm-int6) the last accepted submission's flags word (bit 0, surface id in bits 8-31)
     uint64_t lastSubmitIova = 0, lastSubmitBytes = 0;
 };
 

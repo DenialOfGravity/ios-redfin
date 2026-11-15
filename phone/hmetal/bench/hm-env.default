@@ -96,15 +96,24 @@ HM_PREWARM=1
 # the first N companions said ("xr: companion WxH for surface S ... through a WxH texture ..."; default 12)
 #*:HM_XR_TRACE=12
 # the scanout gate's submit flag (backboardd): needs a kernel that honours NativeAdrenoAbiSubmit flag 1; an older kernel
-# refuses the flag once and it is turned off for the process (default 0 until the kernel side exists)
+# refuses the flag once and it is turned off for the process (default 0 until the kernel side exists). (ws-hm-int6)
+# the flag word also carries the written surface's IOSurface id in bits 8-31 (kernel ws-int-k2 gate mode 3, xnu 1105)
 #HM_GATE_FLAG=1
 #HM_GATE_FLAG_SURF=1125x2436
-# ---- (ws-hm-perf2) pass switches, each at its compiled default (uncomment to change) ----
+# ---- (ws-hm-perf2) pass switches, each at its compiled default (uncomment to change; the int5 behaviour is
+# *:HM_PASS_FLUSH=always *:HM_PASS_STATIC=0 *:HM_PASS_MERGE=0, the A/B baseline of ws-hm-int6) ----
 # a sysmem pass that another draw pass follows ends without its tail (CCU flush + cache flush, each waited for); a
 # barrier (CCU flush + CACHE_INVALIDATE) goes before whatever reads what it drew; always = hm-int5's tail after every pass
-#HM_PASS_FLUSH=always
+#*:HM_PASS_FLUSH=always
 # a draw pass right after a sysmem pass leaves out the batch start (invalidates, ~100 static registers, VFD sizes) and
 # the CCU set-up with its WFI, and dedups its registers against what that pass left: 0 = every pass its own head
-#HM_PASS_STATIC=0
+#*:HM_PASS_STATIC=0
 # a pass into the open sysmem pass's attachments that differs only by store actions joins it: 0 = a pass of its own
-#HM_PASS_MERGE=0
+#*:HM_PASS_MERGE=0
+# ---- (ws-hm-int6) the transport's invalidate after a fence (waitFence, "flushAfter"): always (compiled default) =
+# every imported surface the GPU wrote, ~1-2 ms a buffer for the 11.2 MB display surface; lazy = the display surfaces'
+# (HM_FLUSH_AFTER_SURF, default HM_GATE_FLAG_SURF's size) left until a CPU access in this process (Texture read/replace,
+# XR write-back, hakios_metal_surface_cpu_access) or the buffer's close. NOT safe for a CPU reader of the display
+# surface in another process (a screenshot or recorder's IOSurfaceLock) or a kernel CPU copy: an A/B switch, not a default
+#*:HM_FLUSH_AFTER=lazy
+#*:HM_FLUSH_AFTER_SURF=1125x2436

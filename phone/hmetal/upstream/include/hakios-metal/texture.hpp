@@ -31,6 +31,8 @@
 #include "hakios-metal/kernel.hpp"
 
 namespace hakios::metal {
+// (ws-hm-int6) compressed textures made, and compressed render targets whose flag buffer was zeroed, in this process
+void ubwcMadeCounts(uint64_t out[2]);
 
 // The MTLPixelFormat values served (MTLPixelFormat.h); every other value is refused by name at creation.
 enum class PixelFormat : uint32_t {

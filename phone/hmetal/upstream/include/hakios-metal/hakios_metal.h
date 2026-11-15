@@ -75,6 +75,13 @@ uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 /* (redfin) UBWC as the driver says the kernel programmed it (highest bank bit, swizzle levels, macrotile mode); returns 1
  * when those are the driver's words, 0 when they are the chip table's */
 int hakios_metal_ubwc(hakios_metal_device *device, unsigned *highest_bank_bit, unsigned *swizzle_levels, unsigned *macrotile_mode);
+/* (ws-hm-int6) before a CPU read or write of IOSurface SURFACE's pages in this process: an invalidate the transport left
+ * pending after a GPU write (HM_FLUSH_AFTER=lazy) is done now. 0, or ENOENT (not imported here), EINVAL (no transport
+ * support: nothing is ever pending there) */
+int hakios_metal_surface_cpu_access(hakios_metal_device *device, uint32_t surface);
+/* (ws-hm-int6) process-wide running totals: [0] blends HM_BLEND_OPT encoded as plain writes (blendsMadeWrites), [1]
+ * compressed textures made, [2] of them render targets whose flag buffer was zeroed at creation */
+void hakios_metal_ubwc_counts(unsigned long long out[3]);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
 /* (redfin hmv4) this thread's compiles so far: ms waiting for the compiler, ms compiling, stages read from the disk cache
@@ -645,7 +652,9 @@ int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *e
  * ended passes, [16] heads that went on from the pass before (HM_PASS_STATIC), [17] joins across store actions
  * (HM_PASS_MERGE), [18] copies and fills by the command processor (unstamped), [19] their bytes, [20] passes,
  * [21] draws, [22] CP_BLIT packets, [23] CP_SET_MARKER packets. The census ([2]-[11], [22], [23]) is made only for a
- * profiled buffer (hakios_metal_cb_set_profile). */
+ * profiled buffer (hakios_metal_cb_set_profile). (ws-hm-int6, N at most 28) the UBWC pass classes: [24] draw passes with a
+ * compressed colour attachment, [25] of them drawn in GMEM, [26] 2D copies with a compressed source or destination,
+ * [27] draw passes whose class (compressed or linear) differs from the draw pass before in the buffer. */
 int hakios_metal_cb_sync_counts(hakios_metal_cb *cb, unsigned long long *out, int n);
 
 #ifdef __cplusplus

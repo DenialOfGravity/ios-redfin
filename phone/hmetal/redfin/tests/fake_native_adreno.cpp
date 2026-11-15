@@ -219,8 +219,10 @@ IOReturn method(Service& s, uint32_t m, const void* in, size_t inSize, void* out
         IN(NativeAdrenoAbiSubmit);
         OUT(NativeAdrenoAbiSubmitReply);
         // (redfin hm-int5) flags: refused as every kernel so far does, unless setSubmitFlagsAccepted (HM_GATE_FLAG's kernel)
-        if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || (rq->reserved && !gFlagsAccepted) || (rq->reserved & ~1u)) return kIOReturnBadArgument;
+        // (ws-hm-int6) as redfin xnu 1105 (ws-int-k2): bit 0, and the surface id in bits 8-31; bits 1-7 refused
+        if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || (rq->reserved && !gFlagsAccepted) || (rq->reserved & 0xfeu)) return kIOReturnBadArgument;
         if (rq->reserved & 1u) s.counts.flaggedSubmits++;
+        s.counts.lastSubmitFlags = rq->reserved;
         if (rq->buffer_count != 1) return kIOReturnUnsupported;   // (this fake: one IB, as the transport sends)
         const NativeAdrenoAbiSubmitBuffer& ib = rq->buffers[0];
         if ((ib.bytes & 3) || ib.bytes == 0 || ib.iova < kWinBase || ib.iova + ib.bytes > kWinBase + kWinSize) return kIOReturnBadArgument;

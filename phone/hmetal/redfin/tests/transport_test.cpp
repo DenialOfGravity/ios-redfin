@@ -236,18 +236,37 @@ TEST(transport_flags_the_submission_that_writes_the_display_surface) {
     CHECK_EQ(run(r, *ib, memWrite(disp->gpuAddress() + 64, {1}), {{disp.get(), true}}, &fence), 0);
     CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
     CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 1);
+    // (ws-hm-int6) gate mode 3's surface id: bit 0 | id << 8 (NativeAdrenoAbiSubmitSurfaceShift), bits 1-7 zero
+    CHECK_EQ(fakena::counts().lastSubmitFlags, 1u | (81u << 8));
     CHECK_EQ(run(r, *ib, memWrite(ib->gpuAddress() + 2048, {2}), {{disp.get(), false}}, &fence), 0);   // read only
+    CHECK_EQ(fakena::counts().lastSubmitFlags, 0u);
     CHECK_EQ(run(r, *ib, memWrite(other->gpuAddress() + 64, {3}), {{other.get(), true}}, &fence), 0);   // another size
     CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
     CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 1);
     CHECK_EQ(fakena::counts().submits, c0.submits + 3);
+    {
+        // (ws-hm-int6) an id past 24 bits: bit 0 alone (gate 1|2 still holds it; gate 3 cannot name it)
+        const uint32_t big = (1u << 24) + 5;
+        fakena::addSurface(big, 64, 16, 256, 0x42475241);
+        auto wide = r.gpu->surfaceBo(big, &info, &e);
+        CHECK(wide != nullptr);
+        if (wide != nullptr) {
+            CHECK_EQ(run(r, *ib, memWrite(wide->gpuAddress() + 64, {6}), {{wide.get(), true}}, &fence), 0);
+            CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+            CHECK_EQ(fakena::counts().lastSubmitFlags, 1u);
+            CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 2);
+        }
+        wide.reset();
+    }
+    const auto c1 = fakena::counts();
     // a kernel without the flag: refused once, sent again bare, and not flagged again
     fakena::setSubmitFlagsAccepted(false);
     CHECK_EQ(run(r, *ib, memWrite(disp->gpuAddress() + 64, {4}), {{disp.get(), true}}, &fence), 0);
     CHECK_EQ(run(r, *ib, memWrite(disp->gpuAddress() + 64, {5}), {{disp.get(), true}}, &fence), 0);
     CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
-    CHECK_EQ(fakena::counts().submits, c0.submits + 5);
-    CHECK_EQ(fakena::counts().flaggedSubmits, c0.flaggedSubmits + 1);
+    CHECK_EQ(fakena::counts().submits, c1.submits + 2);
+    CHECK_EQ(fakena::counts().flaggedSubmits, c1.flaggedSubmits);
+    CHECK_EQ(fakena::counts().lastSubmitFlags, 0u);
     disp.reset();
     other.reset();
 }
@@ -349,4 +368,66 @@ TEST(transport_runs_the_cores_blits) {
     CHECK(got[0] == 0xee && got[8191] == 0xee && got[8192 + 20000] == 0xee);
     CHECK(memcmp(got + 8192, static_cast<const uint8_t*>(a->contents()) + 4096, 20000) == 0);
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// (ws-hm-int6) HM_FLUSH_AFTER=lazy: a display-size surface (HM_FLUSH_AFTER_SURF) the GPU wrote is not invalidated at
+// the fence -- the CPU still sees what it cached -- but at the CPU's access (kHakiosCpuAccess by buffer or by surface,
+// as Texture::read / replace / the XR write-back and hakios_metal_surface_cpu_access ask it) or at the buffer's close
+// (a CPU write's dc civac before the next submission also clears it; the fake models a clean as a copy, so that is
+// not asked here); any other surface is invalidated at the fence as before. Unset
+// (always, the default): every one at the fence.
+TEST(transport_flush_after_lazy_leaves_the_display_surfaces_invalidate_for_the_cpu) {
+    setenv("HM_FLUSH_AFTER_SURF", "64x16", 1);
+    struct Back { ~Back() { unsetenv("HM_FLUSH_AFTER"); unsetenv("HM_FLUSH_AFTER_SURF"); } } back;
+    Rig r;
+    uint8_t* disp = fakena::addSurface(91, 64, 16, 256, 0x42475241);
+    uint8_t* other = fakena::addSurface(92, 32, 16, 128, 0x42475241);
+    memset(disp, 0x11, 256 * 16);
+    memset(other, 0x22, 128 * 16);
+    fakena::setSurfaceSeed(91, 5);   // no CPU writer: one clean, at the first submission
+    fakena::setSurfaceSeed(92, 5);
+    SurfaceInfo info;
+    int e = 0;
+    auto d = r.gpu->surfaceBo(91, &info, &e);
+    auto o = r.gpu->surfaceBo(92, &info, &e);
+    auto ib = r.gpu->newBo(4096, 0, &e);
+    CHECK(d != nullptr && o != nullptr && ib != nullptr);
+    if (d == nullptr || o == nullptr || ib == nullptr) return;
+    uint32_t fence = 0;
+    auto word = [](const uint8_t* p) { uint32_t v = 0; memcpy(&v, p, 4); return v; };
+    // always (unset): both invalidated at the fence
+    CHECK_EQ(run(r, *ib, memWrite(d->gpuAddress() + 64, {0xa1}), {{d.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(word(disp + 64), 0xa1u);
+    // lazy
+    setenv("HM_FLUSH_AFTER", "lazy", 1);
+    auto c0 = fakena::counts();
+    CHECK_EQ(run(r, *ib, memWrite(d->gpuAddress() + 128, {0xb2}), {{d.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);   // (one command buffer, ib, rewritten by the next run)
+    CHECK_EQ(fakena::counts().invalidates, c0.invalidates);
+    CHECK_EQ(run(r, *ib, memWrite(o->gpuAddress() + 64, {0xc3}), {{o.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK_EQ(fakena::counts().invalidates, c0.invalidates + 1);   // the other surface's alone
+    CHECK_EQ(word(other + 64), 0xc3u);
+    CHECK(word(disp + 128) != 0xb2u);   // the display surface's CPU view: not invalidated yet
+    // on demand, by buffer
+    CHECK_EQ(r.gpu->cpuAccess(d->handle(), 0), 0);
+    CHECK_EQ(fakena::counts().invalidates, c0.invalidates + 2);
+    CHECK_EQ(word(disp + 128), 0xb2u);
+    CHECK_EQ(r.gpu->cpuAccess(d->handle(), 0), 0);                // nothing pending: nothing done
+    CHECK_EQ(fakena::counts().invalidates, c0.invalidates + 2);
+    // on demand, by surface id (hakios_metal_surface_cpu_access)
+    CHECK_EQ(run(r, *ib, memWrite(d->gpuAddress() + 192, {0xd4}), {{d.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK(word(disp + 192) != 0xd4u);
+    CHECK_EQ(r.gpu->cpuAccess(0, 91), 0);
+    CHECK_EQ(word(disp + 192), 0xd4u);
+    CHECK_EQ(r.gpu->cpuAccess(0, 4242), ENOENT);
+    // pending at the buffer's close: done then
+    CHECK_EQ(run(r, *ib, memWrite(d->gpuAddress() + 320, {0xf6}), {{d.get(), true}}, &fence), 0);
+    CHECK_EQ(r.gpu->wait(0, fence, 1000000000), 0);
+    CHECK(word(disp + 320) != 0xf6u);
+    d.reset();
+    CHECK_EQ(word(disp + 320), 0xf6u);
+    o.reset();
 }

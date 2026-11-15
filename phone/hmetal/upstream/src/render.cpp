@@ -925,7 +925,7 @@ bool blendOptOn() {
     }
     return v != 0;
 }
-std::atomic<uint64_t> gBlendsMadeWrites{0};   // ...how many draws' targets it turned (HM_PROF reads nothing of it yet)
+std::atomic<uint64_t> gBlendsMadeWrites{0};   // ...how many draws' targets it turned (HM_PROF: hakios_metal_ubwc_counts [0])
 
 struct BlendWords {
     bool enabled;
@@ -2985,6 +2985,13 @@ bool memoryOf(const Texture* t, uint64_t* lo, uint64_t* hi) {
     if (t == nullptr || t->buffer() == nullptr) return false;
     *lo = t->buffer()->gpuAddress();
     *hi = *lo + std::max<uint64_t>(t->buffer()->length(), 1);
+    // (ws-hm-int6) a compressed texture's flag buffer is memory the RB writes and the TP / 2D engine read with its
+    // blocks: inside its buffer in both layouts made here (fdl6's, flags first; the kernel's surface metadata, checked
+    // against its size by wrapUbwcSurface), and taken in explicitly so the range is data + flags whatever the layout
+    if (t->compressed()) {
+        *lo = std::min<uint64_t>(*lo, t->flagAddress());
+        *hi = std::max<uint64_t>(*hi, t->flagAddress() + std::max<uint64_t>(t->flagLayerSize(), 1));
+    }
     return true;
 }
 bool memoryOf(const Buffer* b, uint64_t* lo, uint64_t* hi) {
@@ -3793,6 +3800,13 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         open_->ordinal = ordinal;
         useAttachments(pass);
         counts_.passes++;
+        {   // (ws-hm-int6) the UBWC pass classes
+            bool ubwc = pass.color0 != nullptr && pass.color0->compressed();
+            for (const ColorAttachment& a : pass.more) ubwc = ubwc || (a.texture != nullptr && a.texture->compressed());
+            if (ubwc) counts_.ubwcPasses++;
+            if (lastPassUbwc_ >= 0 && lastPassUbwc_ != int(ubwc)) counts_.ubwcSwitches++;
+            lastPassUbwc_ = int(ubwc);
+        }
     }
     if (open_->gmem) {
         uint32_t a[4];
@@ -3957,6 +3971,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
         return refuseWork(why);
     }
     counts_.copies++;
+    if (src.compressed() || dst.compressed()) counts_.ubwcCopies++;   // (ws-hm-int6)
     stampStart(kPassCopy, d.w, d.h);
     appendStream(stream_, added);
     stampEnd();
@@ -4517,6 +4532,11 @@ void CommandBuffer::setPassModesForTesting(int lazy, int carry, int merge) {
 
 // (ws-hm-perf2) what a tail just flushed: the memory dirty_ named and the pass's attachments, in memory now, the texture
 // caches perhaps still holding what they read of it before (a CACHE_INVALIDATE drops that: the batch start's, a barrier's)
+bool CommandBuffer::appendRawForTesting(const pm4::Stream& stream) {   // (ws-hm-int6)
+    appendStream(stream_, stream);
+    return true;
+}
+
 void CommandBuffer::noteFlushed(const RenderPass& pass) {
     for (const Range& r : dirty_) flushed_.push_back(r);
     dirty_.clear();
@@ -4646,6 +4666,11 @@ void CommandBuffer::closePass(bool lazy) {
                            open_->clears, open_->clearWords, vsc);
         appendStream(stream_, tiles);
         counts_.gmemPasses++;
+        {   // (ws-hm-int6)
+            bool ubwc = open_->pass.color0 != nullptr && open_->pass.color0->compressed();
+            for (const ColorAttachment& a : open_->pass.more) ubwc = ubwc || (a.texture != nullptr && a.texture->compressed());
+            if (ubwc) counts_.ubwcGmemPasses++;
+        }
         if (vsc != 0) counts_.binnedPasses++;
         counts_.tiles += plan.tiles();
         if ((profile_ || tuning_) && !profiled_.empty()) {

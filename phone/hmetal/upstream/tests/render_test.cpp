@@ -7393,3 +7393,259 @@ TEST(a_coreanimation_like_frame_census_and_encode_cost) {
         }
     }
 }
+
+// ---- (ws-hm-int6) ws-hm-perf2's lazy pass flushes, carried heads and store merges over ws-hm-ubwc's compressed targets
+
+// HM_PASS_FLUSH=lazy: a compressed target drawn in pass A and sampled in pass B (into a linear and into a compressed
+// target): A ends without its tail, B's draw gets the full barrier first (the target's range, its flag buffer with it),
+// and the fake's coherence model, which now also judges a UBWC texture's flags, sees no stale read. Without the
+// barrier (sampled inside the pass that draws it) the model does see one.
+TEST(int6_a_compressed_target_drawn_then_sampled_gets_the_lazy_barrier) {
+    Rig r;
+    auto a = ubwcTarget(r, 64, 64), c = ubwcTarget(r, 64, 64);
+    if (a == nullptr || c == nullptr) return;
+    auto b = target(r);
+    {
+        PassModes m(1, 1, 1);
+        const auto before = r.fake->stats();
+        const PassRun x = runPasses(r, {{a.get(), nullptr}, {b.get(), a.get()}});
+        CHECK(x.status == CommandBuffer::kCompleted);
+        CHECK_EQ(x.faults, 0u);
+        CHECK_EQ(x.stale, 0u);
+        CHECK_EQ(x.counts.tailsSkipped, 1u);
+        CHECK_EQ(x.counts.barriers, 1u);
+        CHECK_EQ(x.counts.ubwcPasses, 1u);
+        CHECK_EQ(x.counts.ubwcSwitches, 1u);
+        CHECK(r.fake->stats().ubwcSamples > before.ubwcSamples);
+        const PassRun y = runPasses(r, {{a.get(), nullptr}, {c.get(), a.get()}});   // compressed into compressed
+        CHECK(y.status == CommandBuffer::kCompleted);
+        CHECK_EQ(y.faults, 0u);
+        CHECK_EQ(y.stale, 0u);
+        CHECK_EQ(y.counts.barriers, 1u);
+        CHECK_EQ(y.counts.ubwcPasses, 2u);
+        CHECK_EQ(y.counts.ubwcSwitches, 0u);
+        if (x.stale != 0 || y.stale != 0) std::printf("       %s\n", r.fake->stats().lastStale.c_str());
+    }
+    {
+        PassModes m(0, 0, 0);
+        const PassRun self = runPasses(r, {{a.get(), nullptr}, {a.get(), a.get()}});
+        CHECK(self.stale >= 1);
+        CHECK_EQ(self.faults, 0u);
+    }
+}
+
+// A backdrop capture as CoreAnimation makes one: a compressed target drawn, copied at once into another compressed
+// target (UBWC -> UBWC 2D copy) and into linear rows (resolve), the capture sampled by the next pass. The copy is a
+// read: the lazily ended pass gets its full tail before it (lazyTails), the 2D engine's source -- blocks and flags --
+// reads nothing stale (Stats::staleBlitReads), and the capture, written through the CCU by the 2D engine and flushed
+// by the copy's own tail, samples clean.
+TEST(int6_a_backdrop_ubwc_to_ubwc_copy_right_after_a_draw_pass_reads_flushed_memory) {
+    Rig r;
+    auto full = ubwcTarget(r, 128, 64), capture = ubwcTarget(r, 128, 64);
+    if (full == nullptr || capture == nullptr) return;
+    auto rows = target(r, 128, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto out = target(r, 128, 64);
+    auto other = target(r, 128, 64);
+    Sampler smp = nearestClamp();
+    for (int lazy = 1; lazy >= 0; lazy--) {
+        PassModes m(lazy, lazy, lazy);
+        const auto before = r.fake->stats();
+        auto cb = r.queue->commandBuffer();
+        cb->setCensus(true);
+        RenderPass fp, op, xp;
+        fp.color0 = full.get();
+        fp.load = LoadAction::kClear;
+        xp.color0 = other.get();
+        xp.load = LoadAction::kClear;
+        op.color0 = out.get();
+        op.load = LoadAction::kDontCare;
+        Bindings fromCapture;
+        fromCapture.textures = {capture.get()};
+        fromCapture.samplers = {&smp};
+        CHECK(cb->draw(flatProgram(), fp, wholeDraw(6, 128, 64), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), xp, wholeDraw(6, 128, 64), Bindings{}, Bindings{}));   // (full: ended lazily by this one)
+        CHECK(cb->blit(*full, 0, render::BlitRect{0, 0, 128, 64}, *capture, 0, render::BlitRect{0, 0, 128, 64}, false));
+        CHECK(cb->blit(*full, 0, render::BlitRect{0, 0, 128, 64}, *rows, 0, render::BlitRect{0, 0, 128, 64}, false));
+        CHECK(cb->draw(texProgram(), op, wholeDraw(6, 128, 64), Bindings{}, fromCapture));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        const auto after = r.fake->stats();
+        CHECK_EQ(after.faults, before.faults);
+        CHECK_EQ(after.staleSamples, before.staleSamples);
+        CHECK_EQ(after.staleBlitReads, before.staleBlitReads);
+        if (after.staleSamples != before.staleSamples) std::printf("       lazy %d: %s\n", lazy, after.lastStale.c_str());
+        CHECK_EQ(after.ubwcToUbwcCopies - before.ubwcToUbwcCopies, 1u);
+        CHECK_EQ(after.ubwcResolves - before.ubwcResolves, 1u);
+        CHECK_EQ(cb->counts().ubwcCopies, 2u);
+        if (lazy) {
+            CHECK_EQ(cb->counts().tailsSkipped, 1u);   // full's, ended lazily by other's pass; the copy closes other's with
+                                                       // its full tail, which flushes full's colour and flags with it
+        } else {
+            CHECK_EQ(cb->counts().tailsSkipped, 0u);
+        }
+    }
+}
+
+// The fake's coherence model for the 2D engine: a copy whose source is still in the CCU is a stale read. Made by
+// hand (the core never encodes one): a draw into a compressed target, then the 2D copy's packets with no flush between.
+TEST(int6_the_fakes_coherence_model_sees_a_2d_read_of_colour_still_in_the_ccu) {
+    Rig r;
+    auto full = ubwcTarget(r, 64, 64), capture = ubwcTarget(r, 64, 64);
+    if (full == nullptr || capture == nullptr) return;
+    PassModes m(1, 1, 1);
+    auto cb = r.queue->commandBuffer();
+    RenderPass fp;
+    fp.color0 = full.get();
+    fp.load = LoadAction::kClear;
+    render::Options so;
+    so.gmem = false;
+    CHECK(cb->draw(flatProgram(), fp, wholeDraw(6, 64, 64), Bindings{}, Bindings{}, so));
+    // (the open pass's colour is in the CCU: a raw 2D copy appended now reads it before any tail)
+    std::string why;
+    auto tableBuf = newBuffer(*r.gpu, render::kTableBytes, &why);
+    pm4::Stream raw;
+    const bool encoded = tableBuf != nullptr &&
+                         render::encodeBlit(raw, *full, 0, render::BlitRect{0, 0, 64, 64}, *capture, 0, render::BlitRect{0, 0, 64, 64}, false,
+                                            tableBuf->gpuAddress(), static_cast<uint8_t*>(tableBuf->contents()), &why);
+    CHECK(encoded);
+    const uint32_t stale = r.fake->stats().staleBlitReads;
+    if (encoded) CHECK(cb->appendRawForTesting(raw));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(r.fake->stats().staleBlitReads > stale);
+}
+
+// HM_PASS_STATIC: a linear pass right after a compressed one, and a compressed one after that, carry their heads from
+// the pass before -- whose RB_MRT_FLAG_BUFFER words and RB_RENDER_CNTL.FLAG_MRTS differ. Every such register is in the
+// carried shadow (the head's plain type-4 writes), so each is written again where it differs: the fake faults on a
+// FLAG_MRTS bit for a linear target and on a compressed target without its flag buffer, and sees neither.
+TEST(int6_carried_heads_rewrite_the_flag_registers_between_compressed_and_linear_passes) {
+    Rig r;
+    auto u = ubwcTarget(r, 64, 64), u2 = ubwcTarget(r, 64, 64);
+    if (u == nullptr || u2 == nullptr) return;
+    auto l = target(r), l2 = target(r);
+    PassModes m(1, 1, 1);
+    const PassRun x = runPasses(r, {{u.get(), nullptr}, {l.get(), nullptr}, {u2.get(), nullptr}, {l2.get(), nullptr}, {u.get(), nullptr}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.faults, 0u);
+    CHECK_EQ(x.counts.headsCarried, 4u);
+    CHECK_EQ(x.counts.ubwcPasses, 3u);
+    CHECK_EQ(x.counts.ubwcSwitches, 4u);
+    CHECK_EQ(x.stale, 0u);
+    if (x.faults != 0) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+    // the reverse order too, starting linear
+    const PassRun y = runPasses(r, {{l.get(), nullptr}, {u.get(), nullptr}, {l2.get(), nullptr}});
+    CHECK(y.status == CommandBuffer::kCompleted);
+    CHECK_EQ(y.faults, 0u);
+    CHECK_EQ(y.counts.headsCarried, 2u);
+}
+
+// HM_PASS_MERGE over a compressed target: a draw differing only by its store action joins the open sysmem pass (one
+// pass, Store kept), the flags and blocks it wrote are tracked as the pass's, and the pass that samples it after gets
+// the barrier with no stale read; without the switch it is two passes, the first ending lazily.
+TEST(int6_a_compressed_pass_merges_across_store_actions_and_is_read_clean_after) {
+    Rig r;
+    auto u = ubwcTarget(r, 64, 64);
+    if (u == nullptr) return;
+    auto b = target(r);
+    Sampler smp = nearestClamp();
+    auto run = [&]() {
+        const auto before = r.fake->stats();
+        auto cb = r.queue->commandBuffer();
+        render::Options o;
+        o.gmem = false;
+        RenderPass p;
+        p.color0 = u.get();
+        p.load = LoadAction::kClear;
+        p.store = StoreAction::kStore;
+        CHECK(cb->draw(flatProgram(), p, wholeDraw(3), Bindings{}, Bindings{}, o));
+        p.load = LoadAction::kLoad;
+        p.store = StoreAction::kDontCare;
+        CHECK(cb->draw(flatProgram(), p, wholeDraw(6), Bindings{}, Bindings{}, o));
+        RenderPass q;
+        q.color0 = b.get();
+        Bindings fsb;
+        fsb.textures = {u.get()};
+        fsb.samplers = {&smp};
+        CHECK(cb->draw(texProgram(), q, wholeDraw(6), Bindings{}, fsb, o));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        const auto after = r.fake->stats();
+        CHECK_EQ(after.faults, before.faults);
+        CHECK_EQ(after.staleSamples, before.staleSamples);
+        CHECK_EQ(after.ubwcDraws - before.ubwcDraws, 2u);
+        return cb->counts();
+    };
+    {
+        PassModes m(1, 1, 1);
+        const auto c = run();
+        CHECK_EQ(c.passes, 2u);
+        CHECK_EQ(c.storeMerges, 1u);
+        CHECK_EQ(c.ubwcPasses, 1u);
+        CHECK_EQ(c.barriers, 1u);
+    }
+    {
+        PassModes m(1, 1, 0);
+        const auto c = run();
+        CHECK_EQ(c.passes, 3u);
+        CHECK_EQ(c.storeMerges, 0u);
+        CHECK_EQ(c.ubwcPasses, 2u);
+        CHECK_EQ(c.barriers, 1u);
+    }
+}
+
+// HM_GMEM=auto after a lazily ended compressed pass: the tuner's GMEM pass (recorded both ways, dual) gets the full
+// barrier before it begins -- its tiles load through the caches -- and ends with its full tail (never left out: a GMEM
+// pass is not lazily ended), so the sysmem pass sampling it after needs no barrier and reads nothing stale.
+TEST(int6_a_gmem_auto_pass_after_a_lazy_compressed_pass_is_fenced_on_both_sides) {
+    PassModes m(1, 1, 1);
+    Rig r;
+    auto u = ubwcTarget(r, 64, 32);
+    if (u == nullptr) return;
+    auto t = target(r, 64, 32), out = target(r, 64, 32);
+    Sampler smp = nearestClamp();
+    Bindings fromU, fromT;
+    fromU.textures = {u.get()};
+    fromU.samplers = {&smp};
+    fromT.textures = {t.get()};
+    fromT.samplers = {&smp};
+    uint32_t gmemRounds = 0;
+    for (int round = 0; round < 4; round++) {
+        const auto before = r.fake->stats();
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemTuned(true);
+        cb->setGmemAuto(true);
+        cb->setGmemMaxTiles(8);
+        RenderPass up, tp, op;
+        up.color0 = u.get();
+        up.load = LoadAction::kClear;
+        tp.color0 = t.get();
+        tp.load = LoadAction::kClear;
+        op.color0 = out.get();
+        op.load = LoadAction::kDontCare;
+        CHECK(cb->draw(flatProgram(), up, wholeDraw(6, 64, 32), Bindings{}, Bindings{}));
+        for (int i = 0; i < 8; i++) {
+            CHECK(cb->draw(texProgram(), tp, wholeDraw(3 + 3 * i, 64, 32), Bindings{}, fromU));
+            tp.load = LoadAction::kLoad;   // (one pass of 8 draws)
+        }
+        CHECK(cb->draw(texProgram(), op, wholeDraw(6, 64, 32), Bindings{}, fromT));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        const auto after = r.fake->stats();
+        CHECK_EQ(after.faults, before.faults);
+        CHECK_EQ(after.staleSamples, before.staleSamples);
+        if (after.staleSamples != before.staleSamples) std::printf("       round %d: %s\n", round, after.lastStale.c_str());
+        const auto c = cb->counts();
+        CHECK_EQ(c.tailsSkipped, c.gmemPasses == 1 ? 1u : 2u);   // the compressed pass's; the GMEM pass's never
+        CHECK(c.barriers >= 1u);
+        if (c.gmemPasses == 1) {
+            gmemRounds++;
+            CHECK_EQ(c.barriers, 1u);       // before the GMEM pass; none before the pass reading its stored colour
+            CHECK_EQ(c.ubwcGmemPasses, 0u);
+        }
+    }
+    if (gmemRounds == 0) std::printf("       (auto kept every round in sysmem here: the GMEM half not exercised)\n");
+}

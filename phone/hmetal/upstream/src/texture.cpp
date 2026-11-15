@@ -14,6 +14,13 @@
 #endif
 
 namespace hakios::metal {
+// (ws-hm-int6) compressed textures made by Texture::make, and of them render targets whose flag buffer was zeroed
+// (hakios_metal_ubwc_counts [1], [2])
+std::atomic<uint64_t> gUbwcMade[2];
+void ubwcMadeCounts(uint64_t out[2]) {
+    out[0] = gUbwcMade[0].load(std::memory_order_relaxed);
+    out[1] = gUbwcMade[1].load(std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -629,6 +636,7 @@ std::shared_ptr<Texture::XrTarget> Texture::xrLive() const {
 void Texture::xrWriteBack(const XrTarget& t, uint32_t w, uint32_t h) const {
     const uint32_t W = w != 0 ? std::min(w, t.tex->width()) : desc_.width, H = h != 0 ? std::min(h, t.tex->height()) : desc_.height;
     uint8_t* rows = buffer_->contents() != nullptr ? static_cast<uint8_t*>(buffer_->contents()) + offset_ : nullptr;
+    if (rows != nullptr && surface_ != 0) buffer_->bo().cpuAccess();   // (ws-hm-int6) HM_FLUSH_AFTER=lazy
     const uint8_t* from = static_cast<const uint8_t*>(t.tex->contents());
     if (rows == nullptr || from == nullptr) return;
     const uint8_t xr = info_->xr;
@@ -981,7 +989,9 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         // would then read and sample garbage colours. Zero flags with the data as it lies is what a fresh one reads.
         if ((desc.usage & kTextureUsageRenderTarget) != 0 && t->buffer()->contents() != nullptr && t->ubwcOffset_ + t->ubwcLayerSize_ <= t->buffer()->length()) {
             std::memset(static_cast<uint8_t*>(t->buffer()->contents()) + t->ubwcOffset_, 0, t->ubwcLayerSize_);
+            gUbwcMade[1].fetch_add(1, std::memory_order_relaxed);   // (ws-hm-int6)
         }
+        gUbwcMade[0].fetch_add(1, std::memory_order_relaxed);
         return adopt(t);
 #else
         refuse(why, "a compressed texture: the UBWC layout is Mesa's, and this build has none");
@@ -1143,6 +1153,9 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
         return ok;
     }
     if (ubwc_) return refuse(why, "a compressed render target: its pixels are the GPU's alone, in a layout this processor does not write");
+    // (ws-hm-int6) HM_FLUSH_AFTER=lazy: a pending invalidate first (a partial-line write into a line cached before the
+    // GPU wrote memory would put the stale rest of the line back over the GPU's bytes)
+    if (surface_ != 0 && buffer_ != nullptr) buffer_->bo().cpuAccess();
     if (info_->pvrtcBpp != 0) {
         // PVRTC: the whole level, as Metal requires of it (its blocks are read by their neighbours' texels), decoded
         // into the RGBA8 this texture holds
@@ -1203,6 +1216,7 @@ bool Texture::read(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t 
     if (!regionFits(*this, level, x, y, w, h, bytesPerRow, why)) {
         return false;
     }
+    if (surface_ != 0) buffer_->bo().cpuAccess();   // (ws-hm-int6) HM_FLUSH_AFTER=lazy: a pending invalidate first
     const TextureLevel L = this->level(level);
     uint64_t row = uint64_t(blocksAcross(*info_, w)) * info_->bytesPerPixel;
     auto* src = static_cast<const uint8_t*>(contents()) + L.offset + uint64_t(y / info_->blockH) * L.pitch + uint64_t(x / info_->blockW) * info_->bytesPerPixel;

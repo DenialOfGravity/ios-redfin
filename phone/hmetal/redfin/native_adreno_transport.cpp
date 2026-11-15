@@ -74,6 +74,33 @@ bool flushAll() {
     return all;
 }
 
+// (ws-hm-int6) HM_FLUSH_AFTER=always (default) or lazy: the invalidate of an imported surface's pages after a fence
+// that covers a GPU write of them (waitFence, "flushAfter": 0.85-1.86 ms a buffer for the 11.2 MB display surface in
+// perf2's profile). It is for a CPU that reads the pages next: without it the CPU may read lines it (or a speculative
+// fill) cached before the GPU wrote memory, and a partial-line CPU write may merge into such a line and write it back
+// over the GPU's bytes. lazy: for the display surfaces (an IOSurface of HM_FLUSH_AFTER_SURF, default HM_GATE_FLAG_SURF's
+// size, default 1125x2436: CoreAnimation's swap-chain surfaces, read by the display engine and the GPU only) the
+// invalidate is left pending and done on demand -- kHakiosCpuAccess (the core's Texture read/replace and its XR
+// write-back, hakios_metal_surface_cpu_access for the plug-in), a CPU-written seed's clean before the next submission
+// (dc civac: the same invalidate), or the buffer's close here. NOT covered: a CPU read of the surface in ANOTHER
+// process (IOSurfaceLock there: a screenshot, a recorder) and a CPU copy in the kernel; hence the default always.
+bool flushAfterLazy() {   // (read at every fence that passes with work to flush: a test switches it)
+    const char* e = getenv("HM_FLUSH_AFTER");
+    return e != nullptr && strcmp(e, "lazy") == 0;
+}
+// the display surfaces' size: HM_FLUSH_AFTER_SURF, else HM_GATE_FLAG_SURF, else 1125x2436 (WxH)
+void displaySurfaceSize(const char* first, uint32_t* w, uint32_t* h) {
+    *w = 1125, *h = 2436;
+    for (const char* name : {first, "HM_GATE_FLAG_SURF"}) {
+        const char* sz = name != nullptr ? getenv(name) : nullptr;
+        unsigned a = 0, b = 0;
+        if (sz != nullptr && sscanf(sz, "%ux%u", &a, &b) == 2) {
+            *w = a, *h = b;
+            return;
+        }
+    }
+}
+
 int errnoOf(kern_return_t r, uint32_t method) {
     switch (r) {
     case KERN_SUCCESS: return 0;
@@ -152,6 +179,11 @@ public:
             return b->second.lastFence == 0 ? 0 : waitFence(g, b->second.lastFence, p->timeout);
         }
         case kGemCpuFini: return size == sizeof(MsmGemCpuFini) ? 0 : EINVAL;
+        case kHakiosCpuAccess: {   // (ws-hm-int6) HM_FLUSH_AFTER=lazy: a pending invalidate done before the CPU's access
+            if (size != sizeof(HakiosCpuAccess)) return EINVAL;
+            auto* a = static_cast<HakiosCpuAccess*>(data);
+            return cpuAccess(g, a->handle, a->surface);
+        }
         case kGemSubmit: return size == sizeof(MsmGemSubmit) ? submit(*static_cast<MsmGemSubmit*>(data)) : EINVAL;
         case kWaitFence: {
             if (size != sizeof(MsmWaitFence)) return EINVAL;
@@ -243,6 +275,7 @@ private:
         uint32_t writeFence = 0; // ...that named it as written (imported: invalidate once this passed)
         uint32_t cleanSeed = 0;  // a surface's: its seed at the last clean/invalidate here (seedKnown)
         bool seedKnown = false;
+        bool invalPending = false;   // (ws-hm-int6) HM_FLUSH_AFTER=lazy: the fence's invalidate left for a CPU access
     };
 
     kern_return_t method(uint32_t m, const void* in, size_t inSize, void* out, size_t outSize) {
@@ -406,6 +439,36 @@ private:
         bo.token = 0;
     }
 
+    // (ws-hm-int6) the pending invalidates of the buffer HANDLE (non-zero) or of every buffer over IOSurface SURFACE,
+    // done now (outside the lock as waitFence's are; the buffers held by flushing_ meanwhile)
+    uint32_t lazySkipped_ = 0, lazyOnDemand_ = 0;
+    uint64_t lazySkippedBytes_ = 0;
+    int cpuAccess(std::unique_lock<std::mutex>& g, uint32_t handle, uint32_t surface) {
+        std::vector<std::pair<void*, uint64_t>> ranges;
+        bool found = false;
+        for (auto& [h, b] : bos_) {
+            if (!(handle != 0 ? h == handle : (surface != 0 && b.surfaceId == surface))) continue;
+            found = true;
+            if (!b.invalPending) continue;
+            b.invalPending = false;
+            ranges.emplace_back(b.importBase, b.bytes);
+        }
+        if (!ranges.empty()) {
+            prof::Scope t(prof::kFlushAfter);
+            lazyOnDemand_++;
+            flushing_++;
+            g.unlock();
+            for (const auto& [p, n] : ranges) {
+                dcacheFlush(p, n, false);
+                prof::bytes(false, n, false);
+            }
+            g.lock();
+            flushing_--;
+            flushed_.notify_all();
+        }
+        return found ? 0 : ENOENT;
+    }
+
     int closeBo(uint32_t handle, std::unique_lock<std::mutex>* g = nullptr) {
         // (an imported buffer's pages stay the caller's while a fence's flush outside the lock may still touch them:
         // wait for that before the import goes)
@@ -414,6 +477,12 @@ private:
         if (b == bos_.end()) return ENOENT;
         Bo bo = b->second;
         bos_.erase(b);
+        // (ws-hm-int6) a pending invalidate is done before the import goes: the surface outlives this buffer, and a CPU
+        // that reads it later (here or elsewhere) must not find lines cached before the GPU wrote it
+        if (bo.invalPending && bo.importBase != nullptr) {
+            dcacheFlush(bo.importBase, bo.bytes, false);
+            lazyOnDemand_++;
+        }
         // (redfin hmv6) what it was, for a submission that names it after this (ENOENT): the last 256 closed
         closed_[handle] = Closed{bo.surfaceId, bo.bytes, bo.iova, bo.imported, nowNs()};
         if (closed_.size() > 256) closed_.erase(closed_.begin());
@@ -432,23 +501,25 @@ private:
     // NativeAdrenoAbiSubmit.reserved, for a kernel whose scanout gate (p scanout gate 1|2) holds only flagged submissions
     // of the swapper; every other submission is sent bare and passes the gate. A kernel that refuses the field (all before
     // it) turns the flag off for the process at its first refusal (the submission is sent again without it).
+    // (ws-hm-int6) ...and, for the kernel's gate mode 3 (redfin xnu 1105, ws-int-k2: NativeAdrenoAbiSubmit.flags, the
+    // union over reserved), the surface's IOSurface id in bits 8-31 (NativeAdrenoAbiSubmitSurfaceShift/Mask): gate 3
+    // holds the submission only while that surface is on screen or queued for a latch. An id that does not fit in 24
+    // bits is left out (bit 0 alone, which gate 1|2 reads as before); bits 1-7 stay zero.
     static constexpr uint32_t kSubmitFlagWritesDisplay = 1u;
+    static constexpr uint32_t kSubmitSurfaceShift = 8;
     bool gateFlagRefused_ = false;
     uint32_t gateFlagged_ = 0, gateBare_ = 0;
     uint32_t gateFlag(const MsmSubmitBo* bos, const std::vector<Bo*>& named, uint32_t n) {
         const char* e = getenv("HM_GATE_FLAG");
         if (gateFlagRefused_ || e == nullptr || atoi(e) == 0) return 0;
         uint32_t w = 1125, h = 2436;
-        if (const char* sz = getenv("HM_GATE_FLAG_SURF")) {
-            unsigned a = 0, b = 0;
-            if (sscanf(sz, "%ux%u", &a, &b) == 2) w = a, h = b;
-        }
+        displaySurfaceSize(nullptr, &w, &h);
         for (uint32_t i = 0; i < n; i++) {
             const Bo* b = named[i];
             if ((bos[i].flags & kSubmitBoWrite) == 0 || !b->imported || b->surface == nullptr) continue;
             if (IOSurfaceGetWidth(b->surface) == w && IOSurfaceGetHeight(b->surface) == h) {
                 if (gateFlagged_++ == 0) fprintf(stderr, "hakios-metal: HM_GATE_FLAG: first submission flagged (writes IOSurface %u, %ux%u)\n", b->surfaceId, w, h);
-                return kSubmitFlagWritesDisplay;
+                return kSubmitFlagWritesDisplay | (b->surfaceId < (1u << 24) ? b->surfaceId << kSubmitSurfaceShift : 0);
             }
         }
         gateBare_++;
@@ -495,6 +566,7 @@ private:
                 b->seedKnown = true;
             }
             dcacheFlush(b->importBase, b->bytes, true);
+            b->invalPending = false;   // (ws-hm-int6) dc civac: cleaned and invalidated
         }
         NativeAdrenoAbiSubmit q{};
         q.buffer_count = 1;
@@ -546,8 +618,22 @@ private:
         // the ranges are taken under the lock and flushed without it: a submission on the caller's thread does not
         // wait for megabytes of dc civac here. The BO is held meanwhile (flushing_: closeBo waits for it).
         std::vector<std::pair<void*, uint64_t>> ranges;
+        const bool lazy = flushAfterLazy();
+        uint32_t dw = 0, dh = 0;
+        if (lazy) displaySurfaceSize("HM_FLUSH_AFTER_SURF", &dw, &dh);
         for (auto& [h, b] : bos_) {
             if (b.imported && b.writeFence != 0 && b.writeFence <= passedFence_) {
+                if (lazy && b.surface != nullptr && IOSurfaceGetWidth(b.surface) == dw && IOSurfaceGetHeight(b.surface) == dh) {
+                    // (ws-hm-int6) HM_FLUSH_AFTER=lazy: a display surface's invalidate waits for a CPU access
+                    b.writeFence = 0;
+                    b.invalPending = true;
+                    if (lazySkipped_++ == 0) {
+                        fprintf(stderr, "hakios-metal: HM_FLUSH_AFTER=lazy: first fence invalidate left pending (IOSurface %u, %ux%u, %llu KB)\n", b.surfaceId, dw, dh,
+                                (unsigned long long)(b.bytes >> 10));
+                    }
+                    lazySkippedBytes_ += b.bytes;
+                    continue;
+                }
                 ranges.emplace_back(b.importBase, b.bytes);
                 b.writeFence = 0;
                 if (b.surface != nullptr && b.seedKnown) b.cleanSeed = IOSurfaceGetSeed(b.surface);   // (just invalidated: clean)

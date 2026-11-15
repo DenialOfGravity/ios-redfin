@@ -233,4 +233,11 @@ void Gpu::cpuFini(const Bo& bo) {
     t_->call(kGemCpuFini, &f, sizeof(f));
 }
 
+int Gpu::cpuAccess(uint32_t handle, uint32_t surface) {
+    HakiosCpuAccess a{handle, surface};
+    return t_->call(kHakiosCpuAccess, &a, sizeof(a));
+}
+
+void Bo::cpuAccess() const { gpu_.cpuAccess(handle_, 0); }
+
 }  // namespace hakios::metal

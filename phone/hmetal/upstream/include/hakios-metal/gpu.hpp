@@ -34,7 +34,12 @@ enum Request : uint32_t {
     // (redfin ws-hm-ubwc) an IOSurface's UBWC layout, when the kernel made the surface compressed (HakiosSurfaceUbwc;
     // ENOENT for a linear surface, EINVAL from a transport that has no such request): asked after kHakiosSurface
     kHakiosSurfaceUbwc = 0x7c,   // (0x7d is the NativeAdreno transport's kUserMemory, 0x7f hakios's "show")
+    // (ws-hm-int6) the CPU is about to read or write an imported buffer (HANDLE) or every buffer over an IOSurface
+    // (SURFACE, HANDLE 0): an invalidate the transport left pending (HM_FLUSH_AFTER=lazy) is done first (HakiosCpuAccess;
+    // ENOENT when no such buffer is open here, EINVAL from a transport without the request: nothing pending there)
+    kHakiosCpuAccess = 0x7b,
 };
+struct HakiosCpuAccess { uint32_t handle, surface; };
 
 struct MsmTimespec { int64_t seconds, nanoseconds; };
 struct MsmParam { uint32_t pipe, param; uint64_t value; uint32_t len, pad; };
@@ -147,6 +152,7 @@ public:
     uint64_t size() const { return size_; }
     uint64_t gpuAddress() const { return iova_; }
     void* cpu() const { return cpu_; }      // write-combined: write it in order, read it rarely
+    void cpuAccess() const;                 // (ws-hm-int6) Gpu::cpuAccess for this buffer: before a CPU access of an import
 
 private:
     friend class Gpu;
@@ -220,6 +226,8 @@ public:
     // until the GPU is done with the buffer (as Metal's -waitUntilCompleted needs for a buffer the CPU reads next)
     int cpuPrep(const Bo& bo, uint32_t op, int64_t timeoutNs);
     void cpuFini(const Bo& bo);
+    // (ws-hm-int6) kHakiosCpuAccess: before the CPU reads or writes BO's pages (or SURFACE's, by id)
+    int cpuAccess(uint32_t handle, uint32_t surface);
 
     Transport& transport() { return *t_; }
 
