@@ -44,6 +44,7 @@
 #include "SweetSurface.h"
 #include "SweetGPUABI.h"
 #include "SweetTrace.h"     /* 0994 */
+#define SWEET_V2_SUBMIT_FLAGS   NativeAdrenoAbiSubmitWritesDisplay      /* 1104: the submit flags this kernel takes */
 #define SWEET_V2_IB_HW  128     /* 1038: = A6_SUBMIT_MAX_HW (bsd/dev/sweet_a6xx.h) */
 
 extern "C" {
@@ -61,7 +62,7 @@ int sweet_gpu_window_alloc(uint64_t *base, uint64_t *size);
 void sweet_gpu_window_free(uint64_t base);
 int sweet_gpu_map_at(uint64_t iova, const uint64_t *pages, uint32_t npages);
 void sweet_gpu_unmap_at(uint64_t iova, uint64_t len);
-uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy);
+uint32_t sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, uint32_t flags, bool *busy);  /* 1104: flags */
 unsigned sweet_gpu_ibmax(void);         /* 1038: kern.sweet_gpu_ibmax */
 int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
 bool sweet_gpu_lost(uint64_t *epoch, uint32_t last_fence);
@@ -1138,7 +1139,8 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 		}
 		uint32_t nbuf = rq->buffer_count;
 		uint32_t extra = nbuf > NativeAdrenoAbiMaxBuffers ? nbuf - NativeAdrenoAbiMaxBuffers : 0;
-		if (nbuf == 0 || nbuf > nmax || nbuf > SWEET_V2_IB_HW || rq->reserved ||
+		/* 1104: flags bit 0 (NativeAdrenoAbiSubmitWritesDisplay) accepted, any other bit refused as before */
+		if (nbuf == 0 || nbuf > nmax || nbuf > SWEET_V2_IB_HW || (rq->flags & ~SWEET_V2_SUBMIT_FLAGS) ||
 		    inSize != sizeof(NativeAdrenoAbiSubmit) + extra * sizeof(NativeAdrenoAbiSubmitBuffer)) {
 			return kIOReturnBadArgument;
 		}
@@ -1159,7 +1161,7 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 			return kIOReturnTimeout;
 		}
 		bool busy = false;
-		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, &busy);
+		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, rq->flags, &busy);
 		if (fence == 0) {
 			v2_err_log("submit", busy ? "busy (ring full)" : "not ready (GPU down)");
 			return busy ? kIOReturnBusy : kIOReturnNotReady;

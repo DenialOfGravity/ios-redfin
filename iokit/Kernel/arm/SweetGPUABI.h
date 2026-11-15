@@ -81,12 +81,17 @@ struct NativeAdrenoAbiSubmitBuffer {
 };
 struct NativeAdrenoAbiSubmit {
     uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBuffers */
-    uint32_t reserved;            /* zero */
+    union {                       /* redfin 1104: was reserved (zero); both names stay valid */
+        uint32_t reserved;
+        uint32_t flags;           /* NativeAdrenoAbiSubmitWritesDisplay; kernels before 1104 refuse non-zero */
+    };
     uint64_t queue;               /* open queue; 0 is created by open() */
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
     NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
 };
+/* redfin 1104: NativeAdrenoAbiSubmit.flags bit 0: this submission writes a display (swap-chain) surface */
+#define NativeAdrenoAbiSubmitWritesDisplay 1u
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
     uint32_t bytes;               /* set: length; get: requested capacity */

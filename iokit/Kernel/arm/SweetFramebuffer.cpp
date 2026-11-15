@@ -3093,6 +3093,7 @@ static struct {
 	volatile uint64_t gateSeq;
 	uint64_t      stGateAbs;
 	uint32_t      stGate, stGateWait, stGateTimeout;
+	uint32_t      stFlagDisp, stFlagBare, stUnflagged;      /* 1104: the swapper's submits flagged display / bare (not gated) / from a process that never flagged */
 	bool          geom;             /* the pipes are in the scaled direct geometry (fLock) */
 	bool          entering;
 	bool          thread;
@@ -3449,14 +3450,24 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
  * SwapEnd K waits until frame K is on screen (30 ms at most). K's own work is in the ring before its SwapEnd (0949),
  * so this cannot hold up K's fence.
  */
-extern "C" uint32_t sweet_scan_submit_gate(void);
+/*
+ * 1104: gf (sweet_gpu.c, kern.sweet_scangate_flag): bit 0 the submission writes the display surface, bit 1 its process
+ * flags its display submissions. A bare submission (bit 1 without bit 0) of the swapper is not gated: offscreen passes,
+ * compute, pre-buffers. Counted in the 5 s gate line (flag display / bare / unflagged).
+ */
+extern "C" uint32_t sweet_scan_submit_gate(uint32_t gf);
 uint32_t
-sweet_scan_submit_gate(void)
+sweet_scan_submit_gate(uint32_t gf)
 {
 	AppleCLCD *fb = sweet_fb_instance;
 	if (!sweet_scan.on || !sweet_scan.geom || sweet_scan.gate == 0 || fb == NULL || proc_selfpid() != sweet_scan.gatePid) {
 		return 0;
 	}
+	if ((gf & 3u) == 2u) {
+		OSIncrementAtomic((volatile SInt32 *)&sweet_scan.stFlagBare);     /* 1104: not the display: never gated */
+		return 0;
+	}
+	OSIncrementAtomic((volatile SInt32 *)((gf & 1u) ? &sweet_scan.stFlagDisp : &sweet_scan.stUnflagged));
 	IOLockLock(fb->fLock);
 	sweet_scan.stGate++;
 	SWEET_TRACE(SWT_GPU_GATE, sweet_scan.gate, sweet_scan.gateSeq, sweet_scan.shownSeq, sweet_scan.word);      /* 0994 */
@@ -3868,10 +3879,12 @@ sweet_scan_stats_locked(uint64_t now)
 		uint64_t cw = 0;    /* 0986 */
 		absolutetime_to_nanoseconds(sweet_scan.stCornerAbs, &cw);
 		IOLog("SWEET SCANOUT: 5s gate %u: submits %u waited %u (avg %llu us) timeout %u | cp waits %u released %u queued %u "
-		    "overflow %u | corners %u (avg %llu us)\n", sweet_scan.gate, sweet_scan.stGate, sweet_scan.stGateWait,
-		    sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0, sweet_scan.stGateTimeout, sweet_scan.stGpuWait,
-		    sweet_scan.stGpuRelease, sweet_scan.stQueued, sweet_scan.stOverflow, sweet_scan.stCorners,
-		    sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0);
+		    "overflow %u | corners %u (avg %llu us) | flag display %u bare %u unflagged %u\n", sweet_scan.gate, sweet_scan.stGate,
+		    sweet_scan.stGateWait, sweet_scan.stGateWait ? gw / 1000 / sweet_scan.stGateWait : 0, sweet_scan.stGateTimeout,
+		    sweet_scan.stGpuWait, sweet_scan.stGpuRelease, sweet_scan.stQueued, sweet_scan.stOverflow, sweet_scan.stCorners,
+		    sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0, sweet_scan.stFlagDisp, sweet_scan.stFlagBare,
+		    sweet_scan.stUnflagged);
+		sweet_scan.stFlagDisp = sweet_scan.stFlagBare = sweet_scan.stUnflagged = 0;     /* 1104 */
 		sweet_scan.stGpuWait = sweet_scan.stGpuRelease = sweet_scan.stQueued = sweet_scan.stOverflow = 0;
 		sweet_scan.stCornerAbs = 0;
 		sweet_scan.stCorners = 0;

@@ -2549,7 +2549,22 @@ sweet_gpu_unmap_at(uint64_t iova, uint64_t len)
 	lck_mtx_unlock(&sweet_gpu_lock);
 }
 
-uint32_t sweet_scan_submit_gate(void);         /* 0985: SweetFramebuffer.cpp; 0989: a GPU-side wait's reference */
+uint32_t sweet_scan_submit_gate(uint32_t gf);  /* 0985: SweetFramebuffer.cpp; 0989: a GPU-side wait's reference; 1104: gf */
+
+/*
+ * 1104: kern.sweet_scangate_flag 0|1 (default 1). A v2 submission may carry NativeAdrenoAbiSubmit.flags bit 0
+ * (NativeAdrenoAbiSubmitWritesDisplay: hakios-metal HM_GATE_FLAG=1 sets it on a submission that writes the display
+ * surface). With 1, once a process has sent one flagged submission, the scanout gate (p scanout gate 1|2|3) holds only
+ * its flagged submissions: its offscreen passes, compute and pre-buffers go into the ring at once. A process that never
+ * flagged (Turnip, hm without HM_GATE_FLAG, every kernel client) is gated as before (all of the swapper's submits).
+ * 0 = the flag is ignored (accepted, every submission of the swapper gated as before 1104).
+ * The flagged process is one pid (the newest that flagged): only the swapper (backboardd) is ever gated, and a new
+ * backboardd is gated in full until its first flagged submission.
+ */
+int sweet_scangate_flag = 1;
+static volatile int scangate_flag_pid = -1;
+SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scangate_flag, 0,
+    "SWEET SCANOUT: gate only display-writing submits of processes that flag them (1104, default 1)");
 
 /*
  * 0989: the direct scanout's "latched frame" word (scratch + A6_SCAN_WORD_OFF), which gated submits make the CP wait
@@ -2615,7 +2630,7 @@ sweet_gpu_ibmax(void)
 
 /* Queue up to kern.sweet_gpu_ibmax IBs: the fence, 0 when the GPU is not usable, or 0 with *busy when the ring is full. */
 uint32_t
-sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bool *busy)
+sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, uint32_t flags, bool *busy)
 {
 	*busy = false;
 	if (!gpu_ready) {
@@ -2629,7 +2644,17 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, bo
 	/* 0985: CA's next frame waits for its last one on screen (direct scanout): here (gate 1) or in the CP (0989, gate 2) */
 	int pid = proc_selfpid();
 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
-	uint32_t wait_ref = sweet_scan_submit_gate();
+	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
+	uint32_t gf = flags & 1u;
+	if (sweet_scangate_flag) {
+		if (gf) {
+			scangate_flag_pid = pid;
+		}
+		if (pid == scangate_flag_pid) {
+			gf |= 2u;
+		}
+	}
+	uint32_t wait_ref = sweet_scan_submit_gate(gf);
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
 	uint64_t gpu_ticks = 0;
