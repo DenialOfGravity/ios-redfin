@@ -1,7 +1,7 @@
-From 6c70187ceacd485be7fe98ce46b8ef4bec2fa088 Mon Sep 17 00:00:00 2001
+From 1f06dd93713eace0ff6ed5c8548bdb9f48a9c3f9 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 02:48:30 +0100
-Subject: [PATCH 5/5] 1108 redfin: kern.sweet_data_fwd default 0 (CommCenter
+Subject: [PATCH 2/2] 1108 redfin: kern.sweet_data_fwd default 0 (CommCenter
  data forwarding only when testing data)
 
 The owner wants telephony data forwarding off unless data is being tested;

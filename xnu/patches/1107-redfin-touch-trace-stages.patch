@@ -1,7 +1,7 @@
-From b20f42e47a79e46a1fac617d5346578df7066858 Mon Sep 17 00:00:00 2001
+From fcc22cea9c488975fc9c54afec88dfa6eec9ef8b Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 02:48:18 +0100
-Subject: [PATCH 4/5] 1107 redfin: touch -> latch in stages
+Subject: [PATCH 1/2] 1107 redfin: touch -> latch in stages
  (kern.sweet_touch_trace, default 1)
 
 One touch event at a time is followed: sample IRQ time -> HID event dispatched
@@ -13,9 +13,9 @@ or a later one's latch; abandoned after 200 ms. Per vsync notification also:
 word, no locks taken; a few loads/stores per event. 0 = off.
 ---
  bsd/dev/sweet_gpu.c                   |   7 +
- iokit/Kernel/arm/SweetFramebuffer.cpp | 198 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 200 ++++++++++++++++++++++++++
  iokit/Kernel/arm/hid/SweetHID.cpp     |   5 +-
- 3 files changed, 209 insertions(+), 1 deletion(-)
+ 3 files changed, 211 insertions(+), 1 deletion(-)
 
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 index 46945c5..87f6b00 100644
@@ -43,18 +43,20 @@ index 46945c5..87f6b00 100644
  	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
  	if (sweet_scangate_flag) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 69359ff..3c48027 100644
+index 69359ff..19d5c3c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -466,6 +466,7 @@ static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uin
+@@ -466,6 +466,9 @@ static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uin
  static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
  static IOReturn sweet_scan_poll(AppleCLCD *fb, uint32_t id);    /* 0996 */
  static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
 +static void sweet_tt_tick(uint64_t now);        /* 1107 */
++static void sweet_tt_swap(uint32_t id, uint64_t now);
++static void sweet_tt_latch(uint32_t swapId, uint64_t now);
  
  static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
  static volatile bool sweet_scan_auto_armed;     /* 1046: sweetscanout=2 (default): direct on at the first slot swap */
-@@ -1471,6 +1472,7 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+@@ -1471,6 +1474,7 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
  
  	fPaceSwapped = false;
  	fPaceLastAbs = now;     /* 0983 */
@@ -62,7 +64,7 @@ index 69359ff..3c48027 100644
  	sweet_swaptrace('V', (uint32_t)count);  /* 0987 */
  	if (SWEET_TRACE_ON()) {        /* 0994 */
  		uint32_t on = 0;
-@@ -3368,6 +3370,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+@@ -3368,6 +3372,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
  		sweet_scan.stQueued++;
  		sweet_scan.stFrames++;
  		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.later[i].swap, sweet_scan.later[i].seq, 1, sweet_scan.depth);    /* 0994 */
@@ -70,7 +72,7 @@ index 69359ff..3c48027 100644
  		IOLockWakeup(fb->fLock, &sweet_scan, false);
  		IOLockUnlock(fb->fLock);
  		return true;
-@@ -3400,6 +3403,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+@@ -3400,6 +3405,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
  	sweet_scan.nextAbs = now;
  	sweet_scan.stFrames++;
  	SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.nextSwap, seq, 0, sweet_scan.depth);    /* 0994 */
@@ -78,7 +80,7 @@ index 69359ff..3c48027 100644
  	IOLockWakeup(fb->fLock, &sweet_scan, false);
  	/*
  	 * Back pressure (0979: by CA's chain depth N, the different surfaces of the last 8 slot frames). CA draws frame
-@@ -3704,6 +3708,198 @@ sweet_scan_corners(AppleCLCD *fb, SweetSurface *s)
+@@ -3704,6 +3710,198 @@ sweet_scan_corners(AppleCLCD *fb, SweetSurface *s)
   * Second line of the 5 s report: SWEET SCANOUT: 5s frames: ...
   */
  extern "C" volatile uint64_t sweet_hid_touch_abs[2];   /* iokit/Kernel/arm/hid/SweetHID.cpp: newest, previous */
@@ -277,7 +279,7 @@ index 69359ff..3c48027 100644
  #define SWEET_SF_BINS   1000                            /* 0.1 ms bins to 100 ms */
  static struct {
  	uint64_t lastLatch, prevIntv;
-@@ -3811,6 +4007,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+@@ -3811,6 +4009,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
  		sweet_scan.shownSwap = sweet_scan.flipSwap;
  		uint64_t l = now - sweet_scan.flipSwapAbs;
  		sweet_scan_frame_latched(fb, now, sweet_scan.flipSwapAbs);    /* 1044 */
@@ -285,7 +287,7 @@ index 69359ff..3c48027 100644
  		OSAddAtomic64(1, &sweet_fb_frames);    /* 1060 */
  		sweet_scan.stLatched++;
  		sweet_scan.stLatchN++;
-@@ -3941,6 +4138,7 @@ sweet_scan_stats_locked(uint64_t now)
+@@ -3941,6 +4140,7 @@ sweet_scan_stats_locked(uint64_t now)
  	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
  	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
  	sweet_sf_line_locked();         /* 1044 */
