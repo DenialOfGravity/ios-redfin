@@ -6745,6 +6745,7 @@ PassRun runPasses(Rig& r, std::initializer_list<PassStep> steps, bool profile = 
     const uint32_t stale = r.fake->stats().staleSamples, faults = r.fake->stats().faults;
     auto cb = r.queue->commandBuffer();
     cb->setProfile(profile);
+    cb->setCensus(true);
     const auto t0 = std::chrono::steady_clock::now();
     for (const PassStep& s : steps) {
         RenderPass p;
@@ -6864,9 +6865,12 @@ TEST(the_display_surface_pass_sees_the_icons_drawn_before_it_and_ends_flushed) {
     d.width = d.height = 64;
     d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
     std::string why;
-    auto screen = Texture::wrapSurface(*r.gpu, 9, d, &why);
-    CHECK(screen != nullptr);
-    if (screen == nullptr) return;
+    std::shared_ptr<Texture> screen = Texture::wrapSurface(*r.gpu, 9, d, &why);
+    if (screen == nullptr) {
+        // (a transport without surfaces -- the e2e run's NativeAdreno fake: a plain BGRA8 target stands in for it)
+        std::printf("       (no IOSurface here: %s; a plain target stands in)\n", why.c_str());
+        screen = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    }
     auto icon = target(r, 16, 16);
     const PassRun x = runPasses(r, {{screen.get(), nullptr}, {icon.get(), nullptr, false, LoadAction::kClear, 3}, {screen.get(), icon.get(), false, LoadAction::kLoad, 2}});
     CHECK(x.status == CommandBuffer::kCompleted);
@@ -7013,7 +7017,7 @@ TEST(a_coreanimation_like_frame_census_and_encode_cost) {
     const int n = e != nullptr && atoi(e) > 0 ? atoi(e) : 0;
     for (const auto& [name, lazy, carry] : {std::tuple<const char*, int, int>{"always (hm-int5)", 0, 0}, {"lazy", 1, 0}, {"lazy+static", 1, 1}}) {
         PassModes m(lazy, carry, 1);
-        const PassRun x = frame(true);
+        const PassRun x = frame(false);   // (unprofiled: no stamps, no stamp WFIs -- the stream as the phone runs it without HM_PROF)
         CHECK(x.status == CommandBuffer::kCompleted);
         CHECK_EQ(x.faults, 0u);
         CHECK_EQ(x.stale, 0u);

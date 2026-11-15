@@ -444,6 +444,7 @@ public:
     // (ws-hm-perf2) HM_PROF's sync line: the submitted stream's census (render::census, made at submit when profiling)
     // and the GPU's own time for it and for the decode buffers sent before it (CP_ALWAYS_ON_COUNTER stamps, ns; 0 none)
     const render::SyncCensus& syncCensus() const { return census_; }
+    void setCensus(bool on) { censusOn_ = on; }   // (the census without profiling: a test's, of the stream as it runs unstamped)
     int64_t gpuStampedNanoseconds() const;
     int64_t preGpuNanoseconds() const { return int64_t(preGpuTicks_.load(std::memory_order_relaxed)) * 625 / 12; }
     // (redfin hm-int5) HM_XR_WB=gpu (default): every extended-range companion this buffer drew is written into its
@@ -537,6 +538,7 @@ private:
     std::atomic<int64_t> preRunningNs_{0};
     std::atomic<uint64_t> preGpuTicks_{0};   // (ws-hm-perf2) the decode buffers' own GPU time, stamped (preGpuNanoseconds)
     render::SyncCensus census_;
+    bool censusOn_ = false;
     Piece gpuStamps_;                                   // (redfin) the two counter stamps, when gpuStamps_.buffer (until finish)
     uint64_t gpuTicks_[2] = {0, 0};                     // ...as finish read them
     bool unsubmitted_ = false;                          // (redfin) empty: completed in order without the GPU

@@ -941,7 +941,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();
-    if (cb->profile_) render::census(cb->stream_.words(), &cb->census_);   // (ws-hm-perf2) HM_PROF's sync line
+    if (cb->profile_ || cb->censusOn_) render::census(cb->stream_.words(), &cb->census_);   // (ws-hm-perf2) HM_PROF's sync line
     // (redfin hmv10) HM_XR_LATE: the extended-range surfaces' copies, now (a ring barrier first); (redfin hmv11) HM_XR_GPU:
     // or a buffer of GPU decodes, sent first so the ring runs it between WebKit's writes and this buffer's draws
     if (std::shared_ptr<CommandBuffer> pre = cb->xrDecodeDeferred()) {
