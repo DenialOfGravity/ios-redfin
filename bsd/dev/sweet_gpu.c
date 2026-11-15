@@ -2564,6 +2564,11 @@ uint32_t sweet_scan_submit_gate(uint32_t gf);  /* 0985: SweetFramebuffer.cpp; 09
 /* 1107: SweetFramebuffer.cpp (touch -> latch stages); kern.sweet_touch_trace 0|1, default 1 */
 void sweet_touch_trace_submit(int pid, uint64_t now);
 extern uint32_t sweet_touch_trace;
+/* 1113: SweetFramebuffer.cpp, per-frame pacing trace (SWEET PACE lines); 0 off (default), 1 5 s lines, 2 + slow frames */
+void sweet_pace_trace_submit(int pid, uint32_t gf, uint64_t t0, uint64_t t1);
+extern uint32_t sweet_pace_trace;
+SYSCTL_UINT(_kern, OID_AUTO, sweet_pace_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_trace, 0,
+    "SWEET PACE: per-frame pacing trace, 1 5 s lines, 2 also one line per 3+ vsync frame (1113, default 0)");
 SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
 
@@ -2706,6 +2711,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
 	int pid = proc_selfpid();
 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
 	sweet_touch_trace_submit(pid, mach_absolute_time());    /* 1107: touch -> first submit, vsync -> submit */
+	uint64_t pt_abs = __improbable(sweet_pace_trace) ? mach_absolute_time() : 0;     /* 1113 */
 	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
 	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
 	if (sweet_scangate_flag) {
@@ -2717,6 +2723,9 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
 		}
 	}
 	uint32_t wait_ref = sweet_scan_submit_gate(gf);
+	if (__improbable(pt_abs != 0)) {
+		sweet_pace_trace_submit(pid, gf, pt_abs, mach_absolute_time());       /* 1113: entry, gate released */
+	}
 	lck_mtx_lock(&sweet_gpu_lock);
 	gpu_note_submit_locked();
 	uint64_t gpu_ticks = 0;
