@@ -9,8 +9,13 @@
  *   gpio6/7 WEST 0x0f506000/0x0f507000, gpio12 EAST 0x0f90c000, gpio31 EAST 0x0f91f000,
  *   gpio34 EAST 0x0f922000, gpio35 EAST 0x0f923000, gpio58 WEST 0x0f53a000, gpio69 EAST 0x0f945000.
  *
- * Boot-arg sweetnfc (default 0): 0 = nothing at all is touched (no pin read, no bus, no thread).
- * sweetnfc=1, from a kernel thread 1 s after sweet_nfc_init(), never on the boot path:
+ * 1117: a runtime switch, no boot-arg needed. By default nothing at all is touched at boot (no pin read, no bus,
+ * no thread). Writing kern.sweet_nfc_probe=1 on the running phone runs the probe below once, in a kernel thread
+ * (again on each later write of 1; EBUSY while one runs; EPERM once state is "loader", latched until reboot).
+ * The SE7 bus is brought up lazily by the first probe if the mic driver has not done it yet
+ * (sweet_se7_init_nfc(): a failed bring-up from here is not latched, so the mic can still try it later).
+ * The boot-arg sweetnfc=1 still works as an alternative: it starts the same probe 1 s after sweet_nfc_init().
+ * The probe, from a kernel thread, never on the boot path:
  *   1. log the TLMM config of gpio6/7/12/31/34/35/58/69 (read only)
  *   2. VEN high, then Android st21nfc's PULSE_RESET (20 ms low, 10 ms high, 20 ms low, high)
  *   3. wait up to 100 ms for IRQ high (gpio34 polled), read the packet the chip sends: 3-byte header with
@@ -29,7 +34,7 @@
  * touched (gpio35 is only read). No firmware download, no configuration writes.
  *
  * Sysctls: kern.sweet_nfc_state (off/probing/router/loader/error:<why>), kern.sweet_nfc_ver (decoded
- * versions), kern.sweet_nfc_probe (write 1: probe again; only with sweetnfc=1 and not after loader mode).
+ * versions), kern.sweet_nfc_probe (reads the number of probes run; write 1: probe now; refused after loader mode).
  * Log lines: "SWEET NFC: ...".
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -48,7 +53,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
 extern kern_return_t thread_terminate(thread_t thread);
-extern bool sweet_se7_init(void);
+extern bool sweet_se7_init_nfc(void);
 extern int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
 void sweet_nfc_init(void);
 bool sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt);
@@ -353,7 +358,7 @@ nfc_probe(void)
 	}
 	pins_log("pins");
 	lines_log("before");
-	if (!sweet_se7_init()) {
+	if (!sweet_se7_init_nfc()) {     /* 1117: lazy; brings SE7 up if the mic driver has not */
 		set_state("error:i2c_bus");
 		SAY("SE7 I2C bus not up: nothing sent\n");
 		return;
@@ -469,7 +474,7 @@ nfc_start(bool at_boot)
 {
 	thread_t thread;
 
-	if (nfc_bootarg != 1 || nfc_loader) {
+	if (nfc_loader) {               /* (1117: no longer needs sweetnfc=1; loader mode stays latched) */
 		return EPERM;
 	}
 	if (__atomic_exchange_n(&nfc_busy, true, __ATOMIC_ACQ_REL)) {
@@ -516,17 +521,17 @@ sysctl_nfc_probe SYSCTL_HANDLER_ARGS
 	return value == 1 ? nfc_start(false) : EINVAL;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_probe, "I",
-    "redfin 1115: write 1 to probe the NFC controller again (sweetnfc=1 only; never after loader mode)");
+    "redfin 1117: write 1 to run the read-only NFC probe now (no boot-arg needed; never after loader mode)");
 
 void
 sweet_nfc_init(void)
 {
 	if (!PE_parse_boot_argn("sweetnfc", &nfc_bootarg, sizeof(nfc_bootarg)) || nfc_bootarg == 0) {
 		nfc_bootarg = 0;
-		return;                 /* nothing touched */
+		return;                 /* nothing touched (1117: kern.sweet_nfc_probe=1 probes on demand) */
 	}
 	if (nfc_bootarg != 1) {
-		SAY("sweetnfc=%u is not a P0 value (1): off\n", nfc_bootarg);
+		SAY("sweetnfc=%u is not a P0 value (1): no probe at boot\n", nfc_bootarg);
 		return;
 	}
 	SAY("sweetnfc=1: read-only probe of the ST54J at SE7 0x08 in 1 s\n");

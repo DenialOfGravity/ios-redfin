@@ -162,9 +162,10 @@ static struct {
 } bus;
 
 /*
- * 1115: the bus is shared with the NFC controller (ST54J at 0x08, bsd/dev/sweet_nfc.c, boot-arg sweetnfc=1).
+ * 1115: the bus is shared with the NFC controller (ST54J at 0x08, bsd/dev/sweet_nfc.c; 1117: probed only on
+ * kern.sweet_nfc_probe=1 or boot-arg sweetnfc=1).
  * sweet_se7_init() / sweet_se7_xfer() take se7_lock around bus_init() and around each transfer, so the
- * codec's write+read pairs and NFC's packets never interleave. Without sweetnfc nobody else takes the lock.
+ * codec's write+read pairs and NFC's packets never interleave. Until an NFC probe runs nobody else takes the lock.
  */
 #define SE7_RX_MAX              64u     /* longest read; reads over 8 bytes drain the FIFO while it fills */
 #define NFC_ADDR_SE7            0x08
@@ -172,6 +173,7 @@ static LCK_GRP_DECLARE(se7_lock_group, "sweet-se7");
 static LCK_MTX_DECLARE(se7_lock, &se7_lock_group);
 extern bool sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt);
 bool sweet_se7_init(void);
+bool sweet_se7_init_nfc(void);
 int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
 
 static bool
@@ -224,11 +226,12 @@ bus_init(void)
 	if (bus.dead) {
 		return false;
 	}
-	bus.se = ml_io_map(SE7_PA, 0x1000);
-	bus.g18 = ml_io_map(GCC_PAGE_18, 0x1000);
-	bus.g23 = ml_io_map(GCC_PAGE_23, 0x1000);
-	bus.g52 = ml_io_map(GCC_PAGE_52, 0x1000);
-	bus.west6 = ml_io_map(TLMM_WEST_PA + 0x6000u, 0x2000);          /* gpio6, gpio7 */
+	/* (1117: map once; a retry after sweet_se7_init_nfc() un-latched a failure reuses the mappings) */
+	bus.se = bus.se ? bus.se : ml_io_map(SE7_PA, 0x1000);
+	bus.g18 = bus.g18 ? bus.g18 : ml_io_map(GCC_PAGE_18, 0x1000);
+	bus.g23 = bus.g23 ? bus.g23 : ml_io_map(GCC_PAGE_23, 0x1000);
+	bus.g52 = bus.g52 ? bus.g52 : ml_io_map(GCC_PAGE_52, 0x1000);
+	bus.west6 = bus.west6 ? bus.west6 : ml_io_map(TLMM_WEST_PA + 0x6000u, 0x2000);  /* gpio6, gpio7 */
 	if (!bus.se || !bus.g18 || !bus.g23 || !bus.g52 || !bus.west6 || !bus_clocks()) {
 		bus.dead = true;
 		return false;
@@ -379,6 +382,29 @@ sweet_se7_init(void)
 
 	lck_mtx_lock(&se7_lock);
 	ok = bus_init();
+	lck_mtx_unlock(&se7_lock);
+	return ok;
+}
+
+/*
+ * 1117: the NFC probe's lazy bring-up (kern.sweet_nfc_probe=1 may come before the mic's first use). The same
+ * bus_init() under the same lock; if the bus was not up and this attempt fails, the failure is not latched
+ * (bus.dead cleared), so the mic's own first use still tries the bring-up as it does without NFC. A bus the
+ * mic already gave up on stays given up.
+ */
+bool
+sweet_se7_init_nfc(void)
+{
+	bool ok, was_dead;
+
+	lck_mtx_lock(&se7_lock);
+	was_dead = bus.dead;
+	ok = bus_init();
+	if (!ok && !was_dead) {
+		bus.dead = false;
+		bus.ready = false;
+		SAY("SE7 bring-up for NFC failed; not latched, the mic will try again on its first use\n");
+	}
 	lck_mtx_unlock(&se7_lock);
 	return ok;
 }
