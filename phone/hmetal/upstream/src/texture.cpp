@@ -1,4 +1,5 @@
 #include "hakios-metal/texture.hpp"
+#include "hakios-metal/render.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -6,12 +7,18 @@
 #include <mutex>
 #include <unordered_map>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <set>
 
 #ifdef HAKIOS_METAL_MESA
 // (Mesa's headers carry their own C++ guards)
 #include "fdl/freedreno_layout.h"
 #include "common/freedreno_dev_info.h"
 #endif
+
+// Mesa's FDL_MIN_UBWC_WIDTH (freedreno_layout.h), here also in a build without Mesa
+#define FDL_MIN_UBWC_WIDTH_HM 16u
 
 namespace hakios::metal {
 // (ws-hm-int6) compressed textures made by Texture::make, and of them render targets whose flag buffer was zeroed
@@ -20,6 +27,90 @@ std::atomic<uint64_t> gUbwcMade[2];
 void ubwcMadeCounts(uint64_t out[2]) {
     out[0] = gUbwcMade[0].load(std::memory_order_relaxed);
     out[1] = gUbwcMade[1].load(std::memory_order_relaxed);
+}
+
+// (ws-hm-ubwc2) HM_UBWC_MIN / HM_UBWC_ALIGN / HM_UBWC_FETCH / HM_UBWC_ZERO / HM_UBWC_LOG (texture.hpp)
+namespace {
+UbwcRules rulesFromEnvironment() {
+    UbwcRules r;
+    if (const char* e = getenv("HM_UBWC_MIN"); e != nullptr && e[0] != 0) {
+        unsigned w = 0, h = 0;
+        if (std::sscanf(e, "%ux%u", &w, &h) == 2) {
+            r.minWidth = w, r.minHeight = h;
+        } else if (std::sscanf(e, "%u", &w) == 1) {
+            r.minWidth = r.minHeight = w;
+        }
+    }
+    if (const char* e = getenv("HM_UBWC_ALIGN"); e != nullptr && e[0] != 0) r.aligned = atoi(e) != 0;
+    if (const char* e = getenv("HM_UBWC_FETCH"); e != nullptr && e[0] != 0) r.fetch = atoi(e);
+    if (const char* e = getenv("HM_UBWC_ZERO"); e != nullptr && e[0] != 0) r.zeroKiB = uint32_t(strtoul(e, nullptr, 0));
+    if (const char* e = getenv("HM_UBWC_LOG"); e != nullptr && e[0] != 0) r.log = atoi(e) != 0;
+    return r;
+}
+std::mutex gUbwcRulesLock;
+UbwcRules gUbwcRules;
+std::atomic<bool> gUbwcRulesRead{false};
+std::mutex gUbwcLogLock;
+std::set<std::string> gUbwcLogSeen;
+}  // namespace
+
+const UbwcRules& ubwcRules() {
+    if (!gUbwcRulesRead.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> g(gUbwcRulesLock);
+        if (!gUbwcRulesRead.load(std::memory_order_relaxed)) {
+            gUbwcRules = rulesFromEnvironment();
+            gUbwcRulesRead.store(true, std::memory_order_release);
+            if (gUbwcRules.log) {
+                char line[256];
+                std::snprintf(line, sizeof line, "ubwc: rules: HM_UBWC_MIN=%ux%u HM_UBWC_ALIGN=%d HM_UBWC_FETCH=%d HM_UBWC_ZERO=%u KiB (Mesa's floor: 16 wide)",
+                              gUbwcRules.minWidth, gUbwcRules.minHeight, int(gUbwcRules.aligned), gUbwcRules.fetch, gUbwcRules.zeroKiB);
+                render::notify(line);
+            }
+        }
+    }
+    return gUbwcRules;
+}
+
+void setUbwcRules(const UbwcRules& r) {
+    std::lock_guard<std::mutex> g(gUbwcRulesLock);
+    gUbwcRules = r;
+    gUbwcRulesRead.store(true, std::memory_order_release);
+}
+
+void resetUbwcRules() {
+    std::lock_guard<std::mutex> g(gUbwcRulesLock);
+    gUbwcRules = rulesFromEnvironment();
+    gUbwcRulesRead.store(true, std::memory_order_release);
+}
+
+void ubwcLog(const std::string& line) {
+    if (!ubwcRules().log) return;
+    {
+        std::lock_guard<std::mutex> g(gUbwcLogLock);
+        if (gUbwcLogSeen.size() >= 400 || !gUbwcLogSeen.insert(line).second) return;
+    }
+    render::notify("ubwc: " + line);
+}
+
+bool ubwcRenderTargetEligible(uint32_t width, uint32_t height, uint32_t usage, std::string* why) {
+    const UbwcRules& r = ubwcRules();
+    char text[200];
+    text[0] = 0;
+    if (width < FDL_MIN_UBWC_WIDTH_HM) {
+        std::snprintf(text, sizeof text, "%ux%u stays linear: under %u wide (Mesa's FDL_MIN_UBWC_WIDTH)", width, height, FDL_MIN_UBWC_WIDTH_HM);
+    } else if (width < r.minWidth || height < r.minHeight) {
+        std::snprintf(text, sizeof text, "%ux%u stays linear: under HM_UBWC_MIN=%ux%u", width, height, r.minWidth, r.minHeight);
+    } else if (r.aligned && (width % 16 != 0 || height % 4 != 0)) {
+        std::snprintf(text, sizeof text, "%ux%u stays linear: not whole 16x4 UBWC blocks (HM_UBWC_ALIGN=1)", width, height);
+    } else if ((usage & kTextureUsageWrite) != 0) {
+        std::snprintf(text, sizeof text, "%ux%u stays linear: shader-written", width, height);
+    }
+    if (text[0] != 0) {
+        if (why != nullptr) *why = text;
+        ubwcLog(text);
+        return false;
+    }
+    return true;
 }
 
 namespace {
@@ -949,6 +1040,12 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
             refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm or BGRA8Unorm (or sRGB), not shader-written, is what is served");
             return nullptr;
         }
+        // (ws-hm-ubwc2) Mesa's floor: fdl6_layout makes nothing under 16 wide UBWC unless forced (turnip and freedreno
+        // never force it for an image of their own), and its level is linear there (fdl_level_linear)
+        if (desc.width < FDL_MIN_UBWC_WIDTH_HM) {
+            refuse(why, "a compressed texture " + n(desc.width) + " wide: under Mesa's FDL_MIN_UBWC_WIDTH (16), which fdl6 lays out linear");
+            return nullptr;
+        }
         // (rows for this processor only for one it does not draw into: a render target's truth is what the GPU drew,
         // in the compressed layout alone, and replace and read refuse it)
         std::shared_ptr<Texture> staging;
@@ -987,9 +1084,29 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         // without zeroing it (xnu 0156, the per-client reuse list), and flags left by whatever that buffer held before
         // describe compressed blocks the data under them is not -- a first pass that loads, or draws part of the target,
         // would then read and sample garbage colours. Zero flags with the data as it lies is what a fresh one reads.
+        // (ws-hm-ubwc2) HM_UBWC_ZERO: a small one's pixels too (the whole layout), so that a first pass that loads it, or
+        // draws part of it, reads what a fresh GEM object reads -- zero flags over zero data -- not zero flags over the
+        // bytes a recycled buffer held
+        bool zeroedAll = false;
         if ((desc.usage & kTextureUsageRenderTarget) != 0 && t->buffer()->contents() != nullptr && t->ubwcOffset_ + t->ubwcLayerSize_ <= t->buffer()->length()) {
-            std::memset(static_cast<uint8_t*>(t->buffer()->contents()) + t->ubwcOffset_, 0, t->ubwcLayerSize_);
+            const UbwcRules& rules = ubwcRules();
+            if (rules.zeroKiB != 0 && l.size <= uint64_t(rules.zeroKiB) * 1024 && l.size <= t->buffer()->length()) {
+                std::memset(t->buffer()->contents(), 0, l.size);
+                zeroedAll = true;
+            } else {
+                std::memset(static_cast<uint8_t*>(t->buffer()->contents()) + t->ubwcOffset_, 0, t->ubwcLayerSize_);
+            }
             gUbwcMade[1].fetch_add(1, std::memory_order_relaxed);   // (ws-hm-int6)
+        }
+        if (ubwcRules().log) {
+            char line[320];
+            std::snprintf(line, sizeof line, "made %ux%u fmt %u usage %#x: UBWC, layout %u bytes (flags %u at +%llu, pitch %u, blocks %ux%u of %ux%u), %s%s",
+                          desc.width, desc.height, unsigned(desc.format), unsigned(desc.usage), unsigned(l.size), unsigned(t->ubwcLayerSize_),
+                          (unsigned long long)t->ubwcOffset_, t->ubwcPitch_, (desc.width + bw - 1) / bw, (desc.height + bh - 1) / bh, bw, bh,
+                          (desc.usage & kTextureUsageRenderTarget) == 0 ? "rows staged (copied in before a draw samples it)"
+                          : zeroedAll ? "flags and pixels zeroed" : "flags zeroed",
+                          (desc.width % bw != 0 || desc.height % bh != 0) ? "; partial edge blocks" : "");
+            ubwcLog(line);
         }
         gUbwcMade[0].fetch_add(1, std::memory_order_relaxed);
         return adopt(t);

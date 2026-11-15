@@ -17,6 +17,14 @@ HM_GMEM=0
 #HM_GMEM=auto
 #*:HM_BLEND_OPT=1
 #HM_UBWC_DISPLAY=1
+# (ws-hm-ubwc2) with HM_UBWC_RT=1: HM_UBWC_MIN=WxH (default 512x512) smaller targets stay linear (CA's low-res blur
+# intermediates; Mesa's 16-wide floor always); HM_UBWC_ALIGN=1 whole 16x4 blocks only (default 0); HM_UBWC_FETCH=1
+# (default) a sysmem fetch from a UBWC target runs FLUSH_PER_OVERLAP_AND_OVERWRITE as turnip (0 int6's NO_FLUSH, 2 every
+# sysmem fetch); HM_UBWC_ZERO=KiB (default 2048) small new UBWC targets zeroed whole, not only their flags (0: flags only);
+# HM_UBWC_LOG=1 one line per UBWC target made/kept linear, fetch, partial draw, first non-Clear use, partial copy
+#HM_UBWC_MIN=512x512
+#HM_UBWC_FETCH=1
+#HM_UBWC_LOG=1
 HM_TRACE=0
 HM_HANG_BLAME=1
 

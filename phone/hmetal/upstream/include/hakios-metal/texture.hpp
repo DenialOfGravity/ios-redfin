@@ -34,6 +34,40 @@ namespace hakios::metal {
 // (ws-hm-int6) compressed textures made, and compressed render targets whose flag buffer was zeroed, in this process
 void ubwcMadeCounts(uint64_t out[2]);
 
+// (ws-hm-ubwc2) which render targets HM_UBWC_RT may make compressed, how a compressed one is drawn when a draw reads it
+// back (framebuffer fetch), and the UBWC log. Read from the environment at first use; setUbwcRules for the tests.
+//   HM_UBWC_MIN=WxH   (default 512x512) a target narrower than W or lower than H stays linear: CoreAnimation's low-
+//                     resolution blur intermediates (284x611, 146x310, 74x156, 128x64...) are where hm-ubwc's only
+//                     visual defect was (the folder backdrop's white texels) and carry almost none of the bandwidth;
+//                     the full-screen 1125x2436-class and half-size 565x1220-class targets stay eligible. Mesa's own
+//                     floor (FDL_MIN_UBWC_WIDTH, 16 wide) holds whatever this says.
+//   HM_UBWC_ALIGN=1   (default 0) also whole UBWC blocks only: width a multiple of 16, height of 4 (RGBA8)
+//   HM_UBWC_FETCH=N   1 (default) a draw in sysmem whose fragment shader reads a compressed target it writes runs with
+//                     GRAS_SC_CNTL.SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE, as turnip does for every sysmem
+//                     feedback loop (tu6_emit_prim_mode_sysmem: "the main buffer and flags buffer can get out-of-sync if
+//                     only one is flushed"); 2 every sysmem fetching draw so, linear targets too (turnip's exact rule);
+//                     0 NO_FLUSH as int6 (the A/B control)
+//   HM_UBWC_ZERO=KiB  (default 2048) a new compressed render target whose whole layout is at most this has its pixels
+//                     zeroed with its flags (as a fresh GEM object is), not only the flags; 0 flags only (int6)
+//   HM_UBWC_LOG=1     (default 0) one line per compressed target made or kept linear by these rules, per pass that
+//                     fetches from a compressed target or draws part of one, per first use of one that is not a Clear,
+//                     per copy into or out of one by a part or an unaligned rectangle (identical lines once, at most
+//                     400 a process), to the plug-in's log
+struct UbwcRules {
+    uint32_t minWidth = 512, minHeight = 512;
+    bool aligned = false;
+    int fetch = 1;
+    uint32_t zeroKiB = 2048;
+    bool log = false;
+};
+const UbwcRules& ubwcRules();
+void setUbwcRules(const UbwcRules& r);   // (tests; and the rules as the environment gave them come back with resetUbwcRules)
+void resetUbwcRules();
+// HM_UBWC_RT's question for a CoreAnimation render target of W x H with USAGE: may it be compressed? (false: *why)
+bool ubwcRenderTargetEligible(uint32_t width, uint32_t height, uint32_t usage, std::string* why = nullptr);
+// HM_UBWC_LOG's line (nothing when the log is off)
+void ubwcLog(const std::string& line);
+
 // The MTLPixelFormat values served (MTLPixelFormat.h); every other value is refused by name at creation.
 enum class PixelFormat : uint32_t {
     kA8Unorm = 1,
@@ -492,6 +526,11 @@ private:
     SurfacePlane chroma_{0, 0};   // a two-plane format's second plane, in the buffer
     bool overBuffer_ = false;     // made by overBuffer: its rows a Buffer's, which the CPU writes as it likes
     bool ubwc_ = false;           // TextureDesc::compressed: TILE6_3 and a flag buffer
+  public:
+    // (ws-hm-ubwc2) HM_UBWC_LOG: whether anything has written this compressed texture yet (a draw, a fill, a copy)
+    bool ubwcFirstUse() const { return !ubwcUsed_.exchange(true, std::memory_order_relaxed); }
+  private:
+    mutable std::atomic<bool> ubwcUsed_{false};
     // ...and the linear rows this processor writes and reads (replace, read): copied into the compressed layout by the
     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
     std::shared_ptr<Texture> staging_;

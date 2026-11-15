@@ -279,6 +279,10 @@ void hakios_metal_ubwc_counts(unsigned long long out[3]) {   // (ws-hm-int6)
     out[2] = made[1];
 }
 
+int hakios_metal_ubwc_rt_ok(unsigned width, unsigned height, unsigned usage) {   // (ws-hm-ubwc2)
+    return ubwcRenderTargetEligible(width, height, usage) ? 1 : 0;
+}
+
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
 
 void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses) {

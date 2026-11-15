@@ -27,6 +27,7 @@
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
+#include "hakios-metal/hakios_metal.h"   // (ws-hm-ubwc2) hakios_metal_ubwc_rt_ok
 #include "fixtures/xr_encode_bc.hpp"   // (redfin hm-int5)
 #include "fixtures/end_only.hpp"
 #include "fixtures/tri_attr_vs_air.hpp"
@@ -3242,6 +3243,267 @@ TEST(a_blur_chain_runs_over_compressed_targets_with_copies_in_and_out_of_them) {
     std::string why;
     auto cb = r.queue->commandBuffer();
     CHECK(!cb->blit(*full, 0, render::BlitRect{0, 0, 256, 128}, *half, 0, render::BlitRect{0, 0, 128, 64}, true));
+}
+
+// (ws-hm-ubwc2) HM_UBWC_RT's rule set: Mesa's 16-wide floor always (fdl6 lays out narrower images linear), and
+// HM_UBWC_MIN (default 512x512) keeping CoreAnimation's low-resolution blur intermediates linear while the full-screen
+// 1125x2436-class and half-size targets stay compressed; HM_UBWC_ALIGN=1 whole 16x4 blocks only
+TEST(ubwc2_the_rule_set_keeps_small_intermediates_linear_and_full_screen_targets_compressed) {
+    const UbwcRules saved = ubwcRules();
+    const uint32_t rt = kTextureUsageRenderTarget | kTextureUsageRead;
+    UbwcRules r;   // the defaults
+    setUbwcRules(r);
+    CHECK(ubwcRenderTargetEligible(1125, 2436, rt));
+    CHECK(ubwcRenderTargetEligible(1127, 2438, rt));
+    CHECK(ubwcRenderTargetEligible(1131, 2442, rt));
+    CHECK(ubwcRenderTargetEligible(565, 1220, rt));
+    CHECK(ubwcRenderTargetEligible(1028, 2052, rt));
+    std::string why;
+    for (auto [w, h] : {std::pair<uint32_t, uint32_t>{284, 611}, {146, 310}, {74, 156}, {76, 158}, {128, 64}, {192, 64}, {269, 107}, {173, 384}, {8, 8}}) {
+        CHECK(!ubwcRenderTargetEligible(w, h, rt, &why));
+        CHECK(why.find("stays linear") != std::string::npos);
+    }
+    CHECK(!ubwcRenderTargetEligible(1125, 2436, rt | kTextureUsageWrite, &why));
+    r.minWidth = 16;
+    r.minHeight = 4;
+    setUbwcRules(r);
+    CHECK(ubwcRenderTargetEligible(74, 156, rt));
+    CHECK(ubwcRenderTargetEligible(16, 4, rt));
+    CHECK(!ubwcRenderTargetEligible(15, 64, rt, &why));
+    CHECK(why.find("FDL_MIN_UBWC_WIDTH") != std::string::npos);
+    r.minWidth = r.minHeight = 0;   // (Mesa's floor holds whatever HM_UBWC_MIN says)
+    setUbwcRules(r);
+    CHECK(!ubwcRenderTargetEligible(8, 8, rt));
+    r.aligned = true;
+    setUbwcRules(r);
+    CHECK(!ubwcRenderTargetEligible(1127, 2438, rt, &why));
+    CHECK(why.find("16x4") != std::string::npos);
+    CHECK(ubwcRenderTargetEligible(1136, 2436, rt));
+    CHECK_EQ(hakios_metal_ubwc_rt_ok(1136, 2436, rt), 1);
+    CHECK_EQ(hakios_metal_ubwc_rt_ok(1127, 2438, rt), 0);
+    setUbwcRules(saved);
+    // and Texture::make itself refuses a compressed texture under 16 wide (the plug-in asks the rules first)
+    Rig rig;
+    TextureDesc d;
+    d.format = PixelFormat::kBGRA8Unorm;
+    d.width = 8;
+    d.height = 64;
+    d.usage = rt;
+    d.compressed = true;
+    CHECK(Texture::make(*rig.gpu, d, &why) == nullptr);
+    CHECK(why.find("16") != std::string::npos);
+}
+
+// (ws-hm-ubwc2) the folder backdrop's white texels: a framebuffer fetch from a small, odd-sized compressed target in
+// a downsample chain (a full target, a 75x38 one drawn from it -- partial 16x4 blocks at its right and bottom edges --
+// then fetched from twice in sysmem). Under HM_UBWC_FETCH=1 (the default) the fetching draws run FLUSH_PER_OVERLAP_
+// AND_OVERWRITE, as turnip's sysmem feedback loops do; under 0 (int6's NO_FLUSH) the model names both as out-of-step
+// reads: the RB's blocks and flags leave the CCU apart inside the draw, and another primitive's fetch reads them so
+TEST(ubwc2_a_fetch_from_a_small_odd_sized_compressed_intermediate_flushes_per_overlap_in_sysmem) {
+    using namespace a6xx;
+    const UbwcRules saved = ubwcRules();
+    Rig r;
+    auto full = ubwcTarget(r, 300, 152), small = ubwcTarget(r, 75, 38);
+    if (full == nullptr || small == nullptr) return;
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    Sampler smp = nearestClamp();
+    RenderPass fp, sp;
+    fp.color0 = full.get();
+    fp.load = LoadAction::kClear;
+    sp.color0 = small.get();
+    sp.load = LoadAction::kDontCare;
+    RenderPass again = sp;
+    again.load = LoadAction::kLoad;
+    Bindings fromFull;
+    fromFull.textures = {full.get()};
+    fromFull.samplers = {&smp};
+    render::Options sysmem;
+    sysmem.gmem = false;
+    sysmem.fbReadOrdered = false;
+    auto chain = [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), fp, wholeDraw(6, 300, 152), Bindings{}, Bindings{}, sysmem));
+        CHECK(cb.draw(texProgram(), sp, wholeDraw(6, 75, 38), Bindings{}, fromFull, sysmem));
+        CHECK(cb.draw(fb, again, wholeDraw(6, 75, 38), Bindings{}, Bindings{}, sysmem));
+        CHECK(cb.draw(fb, again, wholeDraw(6, 75, 38), Bindings{}, Bindings{}, sysmem));
+    };
+    UbwcRules on = saved;
+    on.fetch = 1;
+    setUbwcRules(on);
+    auto before = r.fake->stats();
+    CHECK(runAll(r, chain));
+    auto after = r.fake->stats();
+    CHECK_EQ(after.faults, 0u);
+    CHECK_EQ(after.ubwcFetchDraws - before.ubwcFetchDraws, 2u);
+    CHECK_EQ(after.ubwcFetchFlushed - before.ubwcFetchFlushed, 2u);
+    {   // the word itself, and a linear target's fetch keeps NO_FLUSH under 1 (int6's, the known-good) and gets it under 2
+        Encoded e(r, fb, again, wholeDraw(6, 75, 38), sysmem);
+        CHECK(e.ok);
+        CHECK_EQ((e.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) >> A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT,
+                 uint32_t(FLUSH_PER_OVERLAP_AND_OVERWRITE));
+        auto lin = target(r, 75, 38, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass lp;
+        lp.color0 = lin.get();
+        Encoded l1(r, fb, lp, wholeDraw(6, 75, 38), sysmem);
+        CHECK_EQ((l1.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) >> A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT, uint32_t(NO_FLUSH));
+        UbwcRules all = on;
+        all.fetch = 2;
+        setUbwcRules(all);
+        Encoded l2(r, fb, lp, wholeDraw(6, 75, 38), sysmem);
+        CHECK_EQ((l2.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) >> A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT,
+                 uint32_t(FLUSH_PER_OVERLAP_AND_OVERWRITE));
+        // a non-fetching draw into the compressed target keeps NO_FLUSH
+        setUbwcRules(on);
+        Encoded plain(r, flatProgram(), sp, wholeDraw(6, 75, 38), sysmem);
+        CHECK_EQ((plain.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) >> A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT, uint32_t(NO_FLUSH));
+    }
+    // int6's encoding (HM_UBWC_FETCH=0): the model names the out-of-step fetches
+    UbwcRules off = saved;
+    off.fetch = 0;
+    setUbwcRules(off);
+    before = r.fake->stats();
+    CHECK(runAll(r, chain));
+    after = r.fake->stats();
+    CHECK_EQ(after.ubwcFetchDraws - before.ubwcFetchDraws, 2u);
+    CHECK_EQ(after.ubwcFetchFlushed - before.ubwcFetchFlushed, 0u);
+    CHECK(after.lastUbwcFetch.find("SINGLE_PRIM_MODE 0") != std::string::npos);
+    setUbwcRules(saved);
+}
+
+// (ws-hm-ubwc2) a compressed target made over a recycled buffer (the kernel's reuse list hands a client back a closed
+// buffer of the same size without zeroing it, xnu 0156; the fake's recycleBuffers): its make clears the flags the last
+// owner left -- and, for a small one under HM_UBWC_ZERO, its pixels too -- so a first pass that draws only part of it
+// (a scissor) and the sample after read what a fresh buffer reads. A make that left the flags (scribbled here after
+// it) is what the model faults on at the first write.
+TEST(ubwc2_a_reused_buffer_under_a_new_compressed_target_starts_from_clean_flags) {
+    const UbwcRules saved = ubwcRules();
+    Rig r;
+    r.fake->recycleBuffers(true);
+    uint64_t flagsAt = 0, dataAt = 0, length = 0;
+    {
+        auto a = ubwcTarget(r, 120, 40);
+        if (a == nullptr) { r.fake->recycleBuffers(false); return; }
+        RenderPass ap;
+        ap.color0 = a.get();
+        ap.load = LoadAction::kClear;
+        CHECK(runAll(r, [&](CommandBuffer& cb) { CHECK(cb.draw(flatProgram(), ap, wholeDraw(6, 120, 40), Bindings{}, Bindings{})); }));
+        flagsAt = a->flagAddress();
+        dataAt = a->gpuAddress();
+        length = a->buffer()->length();
+        // what the GPU left in it: flags and blocks of some other content
+        std::vector<uint8_t> junk(length, 0xa5);
+        CHECK(r.fake->scribble(a->buffer()->gpuAddress(), junk.data(), length));
+    }
+    auto drawPart = [&](const Texture& t, std::string* fault) {
+        auto out = target(r);
+        RenderPass bp;
+        bp.color0 = &t;
+        bp.load = LoadAction::kLoad;
+        Draw part = wholeDraw(6, 120, 40);
+        part.scissor = Scissor{16, 8, 40, 16};
+        RenderPass op;
+        op.color0 = out.get();
+        Sampler smp = nearestClamp();
+        Bindings fsb;
+        fsb.textures = {&t};
+        fsb.samplers = {&smp};
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(flatProgram(), bp, part, Bindings{}, Bindings{}));
+        CHECK(cb->draw(texProgram(), op, wholeDraw(6), Bindings{}, fsb));
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (fault != nullptr) *fault = r.fake->stats().lastFault;
+        return cb->status() == CommandBuffer::kCompleted;
+    };
+    UbwcRules z = saved;
+    z.zeroKiB = 2048;
+    setUbwcRules(z);
+    {
+        auto b = ubwcTarget(r, 120, 40);
+        CHECK(b != nullptr);
+        if (b == nullptr) { setUbwcRules(saved); return; }
+        CHECK_EQ(b->flagAddress(), flagsAt);   // the same memory
+        CHECK_EQ(b->gpuAddress(), dataAt);
+        const auto flags = r.fake->memory(flagsAt, dataAt - flagsAt), pixels = r.fake->memory(dataAt, 64);
+        CHECK(!flags.empty() && std::all_of(flags.begin(), flags.end(), [](uint8_t v) { return v == 0; }));
+        CHECK(!pixels.empty() && std::all_of(pixels.begin(), pixels.end(), [](uint8_t v) { return v == 0; }));   // (HM_UBWC_ZERO: a small one's pixels too)
+        const auto faults = r.fake->stats().faults;
+        CHECK(drawPart(*b, nullptr));
+        CHECK_EQ(r.fake->stats().faults, faults);
+        std::vector<uint8_t> junk(length, 0x5a);
+        CHECK(r.fake->scribble(b->buffer()->gpuAddress(), junk.data(), length));
+    }
+    z.zeroKiB = 0;   // int6's: flags only, the pixels as the buffer held them
+    setUbwcRules(z);
+    {
+        auto c = ubwcTarget(r, 120, 40);
+        CHECK(c != nullptr && c->flagAddress() == flagsAt);
+        if (c == nullptr) { setUbwcRules(saved); return; }
+        const auto flags = r.fake->memory(flagsAt, dataAt - flagsAt), pixels = r.fake->memory(dataAt, 64);
+        CHECK(std::all_of(flags.begin(), flags.end(), [](uint8_t v) { return v == 0; }));
+        CHECK(std::all_of(pixels.begin(), pixels.end(), [](uint8_t v) { return v == 0x5a; }));
+        // a make that left the last owner's flags: the first write into it is the model's fault
+        std::vector<uint8_t> stale(dataAt - flagsAt, 0x3c);
+        CHECK(r.fake->scribble(flagsAt, stale.data(), stale.size()));
+        std::string fault;
+        CHECK(!drawPart(*c, &fault));
+        CHECK(fault.find("flag byte") != std::string::npos);
+    }
+    setUbwcRules(saved);
+    r.fake->recycleBuffers(false);
+}
+
+// (ws-hm-ubwc2) HM_UBWC_LOG: the lines one phone run settles the folder backdrop with -- each compressed target made
+// (size, layout, partial edge blocks), each kept linear by the rules, a first use that is not a Clear, a fetch and the
+// SINGLE_PRIM_MODE it gets, a draw of part of one, a copy by a part or off the block bounds; none with the log off
+TEST(ubwc2_the_ubwc_log_names_targets_fetches_partial_draws_and_copies) {
+    const UbwcRules saved = ubwcRules();
+    static std::string said;
+    said.clear();
+    render::setNotice([](const char* text) { said += text; said += "\n"; });
+    UbwcRules quiet = saved;
+    quiet.log = false;
+    setUbwcRules(quiet);
+    Rig r;
+    CHECK(!ubwcRenderTargetEligible(100, 100, kTextureUsageRenderTarget));
+    auto q = ubwcTarget(r, 64, 64);
+    CHECK(said.empty());
+    UbwcRules loud = saved;
+    loud.log = true;
+    setUbwcRules(loud);
+    CHECK(!ubwcRenderTargetEligible(101, 99, kTextureUsageRenderTarget));
+    auto u = ubwcTarget(r, 75, 38), v = ubwcTarget(r, 80, 40);
+    if (u == nullptr || v == nullptr) { render::setNotice(nullptr); setUbwcRules(saved); return; }
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    RenderPass up;
+    up.color0 = u.get();
+    up.load = LoadAction::kDontCare;
+    Draw part = wholeDraw(6, 75, 38);
+    part.scissor = Scissor{0, 0, 40, 20};
+    render::Options sysmem;
+    sysmem.gmem = false;
+    CHECK(runAll(r, [&](CommandBuffer& cb) {
+        RenderPass vp;
+        vp.color0 = v.get();
+        vp.load = LoadAction::kClear;
+        CHECK(cb.draw(flatProgram(), vp, wholeDraw(6, 80, 40), Bindings{}, Bindings{}, sysmem));
+        CHECK(cb.draw(flatProgram(), up, part, Bindings{}, Bindings{}, sysmem));
+        RenderPass again = up;
+        again.load = LoadAction::kLoad;
+        CHECK(cb.draw(fb, again, wholeDraw(6, 75, 38), Bindings{}, Bindings{}, sysmem));
+        CHECK(cb.blit(*v, 0, render::BlitRect{0, 0, 40, 20}, *u, 0, render::BlitRect{3, 5, 40, 20}, false));
+    }));
+    render::setNotice(nullptr);
+    setUbwcRules(saved);
+    if (getenv("HM_TEST_SAY")) std::printf("%s", said.c_str());
+    CHECK(said.find("ubwc: 101x99 stays linear: under HM_UBWC_MIN") != std::string::npos);
+    CHECK(said.find("ubwc: made 75x38 fmt 80") != std::string::npos);
+    CHECK(said.find("partial edge blocks") != std::string::npos);
+    CHECK(said.find("ubwc: first use of UBWC 75x38 (attachment 0) by a dontcare pass, not a Clear") != std::string::npos);
+    CHECK(said.find("ubwc: part of UBWC 75x38 drawn (dontcare pass): scissor 0,0 40x20") != std::string::npos);
+    CHECK(said.find("ubwc: fetch from UBWC 75x38 (attachment 0, load pass, tri_fb): sysmem SINGLE_PRIM_MODE FLUSH_PER_OVERLAP_AND_OVERWRITE") != std::string::npos);
+    CHECK(said.find("ubwc: copy UBWC 80x40 [0,0 40x20] -> UBWC 75x38 [3,5 40x20], not on 16x4 block bounds") != std::string::npos);
+    CHECK(said.find("first use of UBWC 80x40") == std::string::npos);   // (a Clear is not said)
+    if (said.find("ubwc: fetch from") == std::string::npos) std::printf("%s", said.c_str());
 }
 
 TEST(a_draw_samples_a_texture_through_the_fs_prefetch) {

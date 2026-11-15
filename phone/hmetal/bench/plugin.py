@@ -464,14 +464,21 @@ hm_ubwc_rt(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	if (on < 0) {
 		const char *e = getenv("HM_UBWC_RT");
 		on = e != NULL && e[0] == '1';
-		hm_print("HM_UBWC_RT=%s: render targets %s\n", e != NULL ? e : "unset", on ? "compressed (UBWC) where served" : "linear");
+		hm_print("HM_UBWC_RT=%s: render targets %s (ws-hm-ubwc2: HM_UBWC_MIN=%s HM_UBWC_ALIGN=%s HM_UBWC_FETCH=%s HM_UBWC_ZERO=%s HM_UBWC_LOG=%s)\n",
+			 e != NULL ? e : "unset", on ? "compressed (UBWC) where served" : "linear",
+			 getenv("HM_UBWC_MIN") ? getenv("HM_UBWC_MIN") : "unset(512x512)", getenv("HM_UBWC_ALIGN") ? getenv("HM_UBWC_ALIGN") : "unset(0)",
+			 getenv("HM_UBWC_FETCH") ? getenv("HM_UBWC_FETCH") : "unset(1)", getenv("HM_UBWC_ZERO") ? getenv("HM_UBWC_ZERO") : "unset(2048)",
+			 getenv("HM_UBWC_LOG") ? getenv("HM_UBWC_LOG") : "unset(0)");
 	}
 	return on && [descriptor textureType] == MTLTextureType2D && [descriptor mipmapLevelCount] == 1 && [descriptor sampleCount] == 1 &&
 	       ([descriptor pixelFormat] == MTLPixelFormatRGBA8Unorm || [descriptor pixelFormat] == MTLPixelFormatBGRA8Unorm ||
 		[descriptor pixelFormat] == MTLPixelFormatRGBA8Unorm_sRGB || [descriptor pixelFormat] == MTLPixelFormatBGRA8Unorm_sRGB) &&
 	       (usage & MTLTextureUsageRenderTarget) != 0 && (usage & MTLTextureUsageShaderWrite) == 0 &&
 	       (usage & ~(MTLTextureUsage)(MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead)) == 0 &&
-	       [descriptor storageMode] == MTLStorageModePrivate;
+	       [descriptor storageMode] == MTLStorageModePrivate &&
+	       /* (ws-hm-ubwc2) the core's rule set: HM_UBWC_MIN (default 512x512), HM_UBWC_ALIGN, Mesa's 16-wide floor; a
+	        * target it keeps linear is made linear here (the reason in HM_UBWC_LOG's line), never refused */
+	       hakios_metal_ubwc_rt_ok((unsigned)[descriptor width], (unsigned)[descriptor height], (unsigned)usage);
 }
 '''
 

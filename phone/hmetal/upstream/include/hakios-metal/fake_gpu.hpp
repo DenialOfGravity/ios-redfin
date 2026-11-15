@@ -159,6 +159,11 @@ public:
         // Clear), copies from one into another, copies from one into linear rows (judged, not carried out), and samples
         // of one through a FLAG descriptor; a linear read or write of any of them is a fault
         uint32_t ubwcDraws = 0, ubwcFills = 0, ubwcToUbwcCopies = 0, ubwcResolves = 0, ubwcSamples = 0;
+        // (ws-hm-ubwc2) sysmem draws that read a UBWC target they write (a feedback loop: a framebuffer fetch), of them
+        // those under FLUSH_PER_OVERLAP_AND_OVERWRITE (turnip's tu6_emit_prim_mode_sysmem); the rest are out-of-step reads
+        // and the last one that was not, named
+        uint32_t ubwcFetchDraws = 0, ubwcFetchFlushed = 0;
+        std::string lastUbwcFetch;
         uint32_t tileLoads = 0, tileStores = 0;   // event blits, carried out between memory and the model's GMEM
         uint32_t tileClears = 0;    // ...and clears in GMEM
         uint32_t binningPasses = 0, binnedDraws = 0, binData = 0;   // binning passes, the draws in them, tiles told their streams
@@ -202,6 +207,14 @@ public:
     // (redfin ws-hm-ubwc) surface ID is compressed with LAYOUT (kHakiosSurfaceUbwc answers it), as the redfin kernel says
     // of a UBWC scanout surface; offsets from the surface's base
     void addSurfaceUbwc(uint32_t id, const HakiosSurfaceUbwc& layout);
+    // (ws-hm-ubwc2) the kernel's per-client reuse list (xnu 0156): a buffer closed is kept, and the next one asked of
+    // the same size is it again -- same address, its bytes as they were (not zeroed). What this model knew of UBWC
+    // images inside it (written, through which flags) goes with the close: the new owner's flags are whatever the bytes
+    // say, and a first write into a UBWC image whose flag bytes are not all zero is a fault (stale flags)
+    void recycleBuffers(bool on);
+    // (ws-hm-ubwc2) write LENGTH bytes at a GPU address as a GPU write would leave them (a test's stand-in for what an
+    // earlier owner of a recycled buffer, or a UBWC draw, left in it)
+    bool scribble(uint64_t iova, const void* bytes, uint64_t length);
     std::vector<uint8_t> memory(uint64_t iova, uint64_t length);   // LENGTH bytes at a GPU address as they are now; empty outside every buffer
     void writeSurface(uint32_t id, uint64_t at, const void* bytes, uint64_t length);   // what another program drew there
     // stop running submissions until resume(): to see what a program does while the GPU is behind
@@ -345,6 +358,11 @@ private:
     uint64_t samples_ = 0;
     uint32_t nextHandle_ = 1, nextQueue_ = 1;
     uint64_t nextIova_ = 0x100000000ull;
+    bool recycle_ = false;                 // (ws-hm-ubwc2) recycleBuffers
+    std::vector<Buffer> recycled_;         // ...closed buffers kept for the next of their size
+    // (ws-hm-ubwc2) a first write into the UBWC image at BASE through FLAGS: false (a fault named) when its flag bytes
+    // are not all zero -- a recycled buffer's flags a make did not clear
+    bool ubwcFlagsClean(uint64_t base, uint64_t flags, const std::string& who);
     Stats stats_;
     bool async_, paused_ = false, quit_ = false, recovers_;
     uint32_t delayUs_;

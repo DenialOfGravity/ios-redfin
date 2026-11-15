@@ -1349,6 +1349,20 @@ namespace {
 // A draw, either WHOLE (its own pass: the batch start, the pass begin, the clears, the draw, the tail) or inside a pass
 // encodeBegin opened (the draw's state and the draw alone: TABLE is then the draw's own, holding only its descriptors;
 // the pass's table, which the batch start pointed the border colours at and the tail writes, is the pass's)
+// (ws-hm-ubwc2) whether a fetching draw in sysmem (SYSMEM_FETCH) into PASS runs FLUSH_PER_OVERLAP_AND_OVERWRITE
+// (HM_UBWC_FETCH: 0 never, 1 with a compressed colour target, 2 always)
+bool sysmemFetchFlush(bool sysmemFetch, const RenderPass& pass) {
+    if (!sysmemFetch) return false;
+    const int mode = ubwcRules().fetch;
+    if (mode <= 0) return false;
+    if (mode >= 2) return true;
+    if (pass.color0 != nullptr && pass.color0->compressed()) return true;
+    for (const ColorAttachment& a : pass.more) {
+        if (a.texture != nullptr && a.texture->compressed()) return true;
+    }
+    return false;
+}
+
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
                 const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
@@ -2090,8 +2104,18 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // a framebuffer fetch in raster order, as Metal's programmable blending reads: the rasterizer holds back a
         // fragment over one not yet written and flushes between them (turnip's rasterization_order_attachment_access,
         // tu_pipeline.cc:3351-3380 and 3955-3983: FLUSH_PER_OVERLAP_AND_OVERWRITE in sysmem, FLUSH_PER_OVERLAP in GMEM)
+        // (ws-hm-ubwc2) a fetching draw in sysmem into a compressed target (HM_UBWC_FETCH 1, the default; 2 any target):
+        // FLUSH_PER_OVERLAP_AND_OVERWRITE, as turnip sets for every sysmem feedback loop (tu6_emit_prim_mode_sysmem):
+        // the barrier above orders this draw after the ones before it, but within the draw the RB's writes of a 16x4
+        // UBWC block and of its flag byte leave the colour CCU apart, and a fragment of a later primitive fetching
+        // another pixel of that block through the TP can read new flags over old data or the reverse -- a few texels
+        // decoded as garbage (hm-ubwc's folder backdrop: white texels in a low-resolution blur intermediate). A linear
+        // target has no such pairing (its pixels are independent), so int6's NO_FLUSH stays there
         reg(stream, REG_A6XX_GRAS_SC_CNTL,
-            ordered ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP) : grasScCntlSysmem());
+            ordered ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP)
+            : sysmemFetchFlush(fs.fbRead != 0 && gmem == nullptr, pass)
+                ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP_AND_OVERWRITE)
+                : grasScCntlSysmem());
         // primitive restart on for an indexed draw (Metal restarts at the all-ones index; tu6_draw_common's primitive_restart,
         // :5851-5862, which is off for a draw without indices, where the index register would be stale)
         reg(stream, REG_A6XX_PC_PRIMITIVE_CNTL_0, draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u);
@@ -3285,6 +3309,42 @@ std::vector<uint8_t> deadFillKey(const Program& program, const Draw& d, const Bi
 }
 uint64_t fillsDropped() { return gFillsDropped.load(std::memory_order_relaxed); }
 
+namespace {
+const char* loadName(LoadAction a) { return a == LoadAction::kClear ? "clear" : a == LoadAction::kLoad ? "load" : "dontcare"; }
+
+// (ws-hm-ubwc2) HM_UBWC_LOG's lines for a draw into a compressed target: its first use when that is not a Clear (zero
+// flags at creation over whatever the pixels are), a fetching draw (and the SINGLE_PRIM_MODE it gets in sysmem), and a
+// draw whose viewport or scissor covers only part of the target
+void ubwcDrawLog(const Program& program, const RenderPass& pass, const Draw& d) {
+    auto one = [&](const Texture* t, uint32_t index, LoadAction load) {
+        if (t == nullptr || !t->compressed()) return;
+        const uint32_t W = t->width(), H = t->height();
+        char line[400];
+        const bool first = t->ubwcFirstUse();
+        if (first && load != LoadAction::kClear) {
+            std::snprintf(line, sizeof line, "first use of UBWC %ux%u (attachment %u) by a %s pass, not a Clear: its pixels as made (%s)", W, H, index,
+                          loadName(load), uint64_t(t->buffer()->length()) <= uint64_t(ubwcRules().zeroKiB) * 1024 ? "zeroed" : "flags zeroed over the buffer's bytes");
+            ubwcLog(line);
+        }
+        if (program.fs.fbRead) {
+            std::snprintf(line, sizeof line, "fetch from UBWC %ux%u (attachment %u, %s pass, %s): sysmem SINGLE_PRIM_MODE %s", W, H, index, loadName(load),
+                          program.name != nullptr ? program.name : "?", render::sysmemFetchFlush(true, pass) ? "FLUSH_PER_OVERLAP_AND_OVERWRITE" : "NO_FLUSH (HM_UBWC_FETCH=0)");
+            ubwcLog(line);
+        }
+        const bool scissorPart = d.scissor.width != 0 && (d.scissor.x != 0 || d.scissor.y != 0 || d.scissor.width < W || d.scissor.height < H);
+        const bool viewportPart = d.viewport.width != 0 && (d.viewport.x > 0 || d.viewport.y > 0 || d.viewport.x + d.viewport.width < W || d.viewport.y + d.viewport.height < H);
+        if (scissorPart || viewportPart) {
+            std::snprintf(line, sizeof line, "part of UBWC %ux%u drawn (%s pass): scissor %u,%u %ux%u viewport %.0f,%.0f %.0fx%.0f%s", W, H, loadName(load),
+                          d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height, d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
+                          first ? ", its first use" : "");
+            ubwcLog(line);
+        }
+    };
+    one(pass.color0, 0, pass.load);
+    for (uint32_t i = 0; i < kMaxColorOutputs - 1; i++) one(pass.more[i].texture, i + 1, pass.more[i].load);
+}
+}  // namespace
+
 bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, const Draw& d, const Bindings& vsGiven, const Bindings& fsGiven,
                          const render::Options& options) {
     if (status_ > kEnqueued) {
@@ -3295,6 +3355,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     const RenderPass* passIn = &passGiven;
     if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
     const RenderPass& pass = *passIn;
+    if (ubwcRules().log) ubwcDrawLog(program, pass, d);   // (ws-hm-ubwc2) HM_UBWC_LOG
     if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP
         const Texture* t = pass.color0;
         mark(Mark{uint32_t(stream_.words().size()), kMarkDraw, 0, t != nullptr ? t->width() : 0, t != nullptr ? t->height() : 0,
@@ -3932,6 +3993,20 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
                              const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("blit after commit");
+    }
+    if ((src.compressed() || dst.compressed()) && ubwcRules().log) {   // (ws-hm-ubwc2) HM_UBWC_LOG
+        const bool srcPart = s.x != 0 || s.y != 0 || s.w != src.width() || s.h != src.height();
+        const bool dstPart = d.x != 0 || d.y != 0 || d.w != dst.width() || d.h != dst.height();
+        const bool unaligned = dst.compressed() && (d.x % 16 != 0 || d.y % 4 != 0 || (d.w % 16 != 0 && d.x + d.w != dst.width()) ||
+                                                    (d.h % 4 != 0 && d.y + d.h != dst.height()));
+        const bool first = dst.compressed() && dst.ubwcFirstUse();
+        if (srcPart || dstPart || unaligned || s.w != d.w || s.h != d.h) {
+            char line[400];
+            std::snprintf(line, sizeof line, "copy %s %ux%u [%u,%u %ux%u] -> %s %ux%u [%u,%u %ux%u]%s%s%s", src.compressed() ? "UBWC" : "linear", src.width(), src.height(),
+                          s.x, s.y, s.w, s.h, dst.compressed() ? "UBWC" : "linear", dst.width(), dst.height(), d.x, d.y, d.w, d.h,
+                          (s.w != d.w || s.h != d.h) ? ", scaled" : "", unaligned ? ", not on 16x4 block bounds" : "", first && dstPart ? ", part of a UBWC target's first use" : "");
+            ubwcLog(line);
+        }
     }
     if (hangDumpOn()) {   // (redfin hmv6) HM_HANG_DUMP: the source's size and format, the destination's in COUNT (w<<16|h)
         mark(Mark{uint32_t(stream_.words().size()), kMarkBlit, 0, src.width(), src.height(), uint32_t(src.format()),
@@ -4744,6 +4819,7 @@ bool CommandBuffer::clear(const RenderPass& passGiven, const render::Options& op
     const RenderPass* passIn = &passGiven;
     if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
     const RenderPass& pass = *passIn;
+    if (ubwcRules().log && pass.load == LoadAction::kClear && pass.color0 != nullptr && pass.color0->compressed()) pass.color0->ubwcFirstUse();   // (ws-hm-ubwc2)
     if (hangDumpOn() && pass.color0 != nullptr) {   // (redfin hmv6) HM_HANG_DUMP
         mark(Mark{uint32_t(stream_.words().size()), kMarkClear, 0, pass.color0->width(), pass.color0->height(), uint32_t(pass.color0->format()), 0, 0, 0,
                   pass.color0, nullptr});

@@ -1,5 +1,6 @@
 #include "hakios-metal/fake_gpu.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <chrono>
@@ -617,6 +618,10 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
             fault(who + ": a UBWC texture read before anything wrote it in compressed form");
             return false;
         }
+        if (width < 16) {   // (ws-hm-ubwc2) fdl6 lays out nothing under FDL_MIN_UBWC_WIDTH compressed (fdl_level_linear)
+            fault(who + text(": a UBWC texture %llu wide, under Mesa's FDL_MIN_UBWC_WIDTH (16)", width));
+            return false;
+        }
         // (redfin ws-hm-ubwc) through the flag buffer it was written with, in the order the CCU wrote it (WZYX: the
         // CCU ignores the swap of a tiled layout, fd6_pipe2swap), with the flag buffer's pitch given
         const uint64_t flags = uint64_t(d[7]) | uint64_t(d[8] & 0x1ffff) << 32;
@@ -1093,6 +1098,9 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
             fault(text("a write into the UBWC image at %#llx through ", base) + text("flags at %#llx", flags) + text(", written before with %#llx", f->second));
             return false;
         }
+        // (ws-hm-ubwc2) a copy (which may cover part of the image) into one nothing wrote yet reads its flags as they lie;
+        // a fill is a Clear of the whole image and writes every flag
+        if (copy && !ubwcFlagsClean(base, flags, "a copy")) return false;
         ubwcWritten_.insert(base);
         ubwcFlags_[base] = flags;
         if (copy) {
@@ -1602,6 +1610,7 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                       text(", written before with %#llx", f->second));
                 return false;
             }
+            if (!ubwcFlagsClean(base, mrtFlags, "RB_MRT[" + which + "]")) return false;   // (ws-hm-ubwc2)
             ubwcWritten_.insert(base);
             ubwcFlags_[base] = mrtFlags;
             stats_.ubwcDraws++;
@@ -1831,6 +1840,29 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         if (fieldOf(td[0], A6XX_TEX_CONST_0_TILE_MODE__MASK, A6XX_TEX_CONST_0_TILE_MODE__SHIFT) == TILE6_3 && flags != 0) {
             staleRead(text("FS texture %llu's UBWC flags", i), flags);
         }
+    }
+    // (ws-hm-ubwc2) a sysmem feedback loop over a UBWC target -- an FS texture over the memory of a compressed target
+    // this draw writes (a framebuffer fetch) -- needs GRAS_SC_CNTL.SINGLE_PRIM_MODE FLUSH_PER_OVERLAP_AND_OVERWRITE:
+    // under NO_FLUSH the RB's block writes and flag writes leave the CCU apart within the draw, and a later primitive's
+    // fetch of another pixel of a block reads new flags over old data or the reverse (turnip, tu6_emit_prim_mode_sysmem)
+    for (uint32_t i = 0; !inTile_ && i < d.fsTextureCount; i++) {
+        const uint32_t* td = reinterpret_cast<const uint32_t*>(at(d.fsTexConst + 64ull * i, 64));
+        if (td == nullptr) continue;
+        const uint64_t base = td[4] | uint64_t(fieldOf(td[5], A6XX_TEX_CONST_5_BASE_HI__MASK, A6XX_TEX_CONST_5_BASE_HI__SHIFT)) << 32;
+        bool loop = false;
+        for (uint32_t t = 0; t < d.mrtCount; t++) loop = loop || (drawFlags_[t][0] != 0 && base == d.mrtBases[t]);
+        if (!loop) continue;
+        stats_.ubwcFetchDraws++;
+        const uint32_t mode = fieldOf(reg(REG_A6XX_GRAS_SC_CNTL), A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK, A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT);
+        if (mode != FLUSH_PER_OVERLAP_AND_OVERWRITE) {
+            // (counted and named, not a fault: the model cannot tell a fetch from a plain sample of the target, which
+            // the coherence tests make on purpose; a test asks for it)
+            stats_.lastUbwcFetch = text("FS texture %llu reads the UBWC target it writes in sysmem under GRAS_SC_CNTL.SINGLE_PRIM_MODE %llu", i, mode) +
+                                   ": FLUSH_PER_OVERLAP_AND_OVERWRITE keeps its flags and blocks in step (tu6_emit_prim_mode_sysmem)";
+            break;
+        }
+        stats_.ubwcFetchFlushed++;
+        break;
     }
     {
         const uint32_t cntl = reg(REG_A6XX_SP_FS_PREFETCH_CNTL);
@@ -2703,6 +2735,34 @@ void FakeGpu::worker() {
     }
 }
 
+void FakeGpu::recycleBuffers(bool on) {   // (ws-hm-ubwc2)
+    std::lock_guard<std::mutex> g(lock_);
+    recycle_ = on;
+    if (!on) recycled_.clear();
+}
+
+bool FakeGpu::scribble(uint64_t iova, const void* bytes, uint64_t length) {   // (ws-hm-ubwc2)
+    std::lock_guard<std::mutex> g(lock_);
+    uint8_t* p = at(iova, length);
+    if (p == nullptr) return false;
+    std::memcpy(p, bytes, length);
+    return true;
+}
+
+bool FakeGpu::ubwcFlagsClean(uint64_t base, uint64_t flags, const std::string& who) {   // (ws-hm-ubwc2)
+    if (ubwcWritten_.count(base) != 0 || flags == 0 || flags >= base) return true;
+    const uint8_t* f = at(flags, base - flags);
+    if (f == nullptr) return true;   // (reach is judged where the flags are taken)
+    for (uint64_t i = 0; i < base - flags; i++) {
+        if (f[i] != 0) {
+            fault(who + text(": the first write into the UBWC image at %#llx finds flag byte %llu nonzero", base, i) +
+                  text(" (%#llx): flags a recycled buffer held, which the image's make did not clear", f[i]));
+            return false;
+        }
+    }
+    return true;
+}
+
 int FakeGpu::call(uint32_t request, void* data, size_t size) {
     std::unique_lock<std::mutex> g(lock_);
     switch (request) {
@@ -2732,8 +2792,15 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         if (size != sizeof(MsmGemNew)) return EINVAL;
         auto* n = static_cast<MsmGemNew*>(data);
         if (n->size == 0 || n->size > (256ull << 20)) return EINVAL;
-        Buffer b{nextIova_, std::vector<uint8_t>(n->size)};
-        nextIova_ += (n->size + 0xffff) & ~0xffffull;
+        Buffer b{0, {}};
+        auto again = std::find_if(recycled_.begin(), recycled_.end(), [&](const Buffer& r) { return r.bytes.size() == n->size; });
+        if (recycle_ && again != recycled_.end()) {   // (ws-hm-ubwc2) the reuse list: the same memory, not zeroed
+            b = std::move(*again);
+            recycled_.erase(again);
+        } else {
+            b = Buffer{nextIova_, std::vector<uint8_t>(n->size)};
+            nextIova_ += (n->size + 0xffff) & ~0xffffull;
+        }
         n->handle = nextHandle_++;
         buffers_.emplace(n->handle, std::move(b));
         return 0;
@@ -2758,7 +2825,16 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
             s.handle = 0;
             bufferSurface_.erase(sb);
         }
-        return buffers_.erase(handle) ? 0 : ENOENT;
+        auto gone = buffers_.find(handle);
+        if (gone == buffers_.end()) return ENOENT;
+        {   // (ws-hm-ubwc2) what was known of UBWC images inside it goes with it
+            const uint64_t lo = gone->second.iova, hi = lo + gone->second.bytes.size();
+            for (auto it = ubwcWritten_.begin(); it != ubwcWritten_.end();) it = (*it >= lo && *it < hi) ? ubwcWritten_.erase(it) : std::next(it);
+            for (auto it = ubwcFlags_.begin(); it != ubwcFlags_.end();) it = (it->first >= lo && it->first < hi) ? ubwcFlags_.erase(it) : std::next(it);
+        }
+        if (recycle_ && !gone->second.bytes.empty()) recycled_.push_back(std::move(gone->second));
+        buffers_.erase(gone);
+        return 0;
     }
     case kHakiosSurfaceUbwc: {   // (redfin ws-hm-ubwc) a compressed surface's layout, as addSurfaceUbwc gave it
         if (size != sizeof(HakiosSurfaceUbwc)) return EINVAL;
