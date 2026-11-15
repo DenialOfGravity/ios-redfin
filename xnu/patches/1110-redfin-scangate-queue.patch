@@ -1,0 +1,157 @@
+From f296d127f986d7eadf8fbd2cbb3f76dcd8130db8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 03:30:23 +0100
+Subject: [PATCH] 1110 redfin: kern.sweet_scangate_queue (newer swaps queue
+ behind a pending one), short only without tribuf 2
+
+1109 run: with the gate waits gone CA's SwapEnd K+1 often came while K's GPU
+work was still running (K in `next`, fence not landed); outside gate 2 that
+replaced K (dropped 20 -> 77 per run). K's GPU work was wasted, K+1 could not
+be shown any sooner (one in-order ring), and a replaced swap answers SwapWait
+"complete" at once, freeing its CA ring page early so CA ran further ahead.
+
+kern.sweet_scangate_queue 1 (default 0): with any gate, a newer swap queues
+behind the pending one (0991's later[] of 3, flipped in order, each at the
+latch after the previous one); only a full queue replaces the oldest. Queued
+swaps answer Busy to tribuf 2 polls, so CA's 3-page ring holds it at one
+pending frame behind the one on screen. Tribuf line: queue N: queued /
+replaced / overflow / late. 0996's "short" is no longer counted with tribuf 2
+(CA reuses a surface only after its swap is off screen: a missed depth
+prediction, not a hazard; "swapped held" counts real ones).
+---
+ bsd/dev/sweet_gpu.c                   |  9 ++++++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 36 +++++++++++++++++++--------
+ 2 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5edaca9..bb08fed 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2592,13 +2592,20 @@ sysctl_sweet_scangate SYSCTL_HANDLER_ARGS
+ 	if (error || !changed) {
+ 		return error;
+ 	}
+-	if (value < 0 || value > (what == 0 ? 4 : 2)) {        /* 1109: gate 4 (none), tribuf 2 (complete when off screen) */
++	if (value < 0 || value > (what == 0 ? 4 : (what == 1 ? 2 : 1))) {    /* 1109: gate 4, tribuf 2; 1110: queue 0|1 */
+ 		return EINVAL;
+ 	}
+ 	return sweet_scan_gate_put(what, value);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     (void *)0, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: gate 0 back pressure, 1 CPU, 2 CP, 3 per surface (1105), 4 none (1109)");
++/*
++ * 1110: kern.sweet_scangate_queue 0|1 (default 0): a SwapEnd that finds the previous swap still pending (its GPU fence not
++ * landed) queues behind it (up to 3, flipped in order at the following latches) instead of replacing it, with any gate.
++ * With tribuf 2 the queued swaps answer Busy, so CA's 3-page ring throttles it to one pending frame behind the one on screen.
++ */
++SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_queue, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    (void *)2, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: newer swaps queue behind a pending one (1110)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109)");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 52e41ea..d2a0b6f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3093,6 +3093,7 @@ static struct {
+ 	uint32_t      stTbBusy, stTbDone, stTbStale, stTbShort, stTbGate3;
+ 	/* 1109: tribuf 2 = SwapWait polls answer "complete" only once the swap is off screen (a later one latched) */
+ 	bool          pollRel;
++	bool          queue;            /* 1110: kern.sweet_scangate_queue: a newer swap queues behind a pending one (any gate) */
+ 	uint32_t      stRelShown, stHeldSwap, stRepeatSwap, lastSurf;
+ 	uint64_t      stCornerAbs;
+ 	uint32_t      stCorners;
+@@ -3346,8 +3347,10 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		sweet_scan.stHeldSwap++;
+ 	}
+ 	sweet_scan.lastSurf = s->id;
+-	if (sweet_scan.tribuf && sweet_scan.gateDepth > sweet_scan.depth) {
+-		sweet_scan.stTbShort++;         /* 0996: drawn into a surface the relaxed gate did not wait for */
++	if (sweet_scan.tribuf && !sweet_scan.pollRel && sweet_scan.gateDepth > sweet_scan.depth) {
++		/* 0996: drawn into a surface the relaxed gate did not wait for. 1110: not with tribuf 2, where CA reuses a
++		 * surface only after its swap is off screen (a prediction miss, no hazard; "swapped held" counts real ones) */
++		sweet_scan.stTbShort++;
+ 	}
+ 	sweet_scan.chain[sweet_scan.chainNext] = s->id;
+ 	sweet_scan.chainSeq[sweet_scan.chainNext] = sweet_scan.seq + 1;
+@@ -3366,8 +3369,8 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		return false;
+ 	}
+ 	sweet_scan_pop_locked();
+-	if (sweet_scan.next != NULL && sweet_scan.gate == 2 && sweet_scan.laterN < 3) {
+-		/* 0991: queued behind the waiting one, not dropped */
++	if (sweet_scan.next != NULL && (sweet_scan.gate == 2 || sweet_scan.queue) && sweet_scan.laterN < 3) {
++		/* 0991: queued behind the waiting one, not dropped; 1110: also with kern.sweet_scangate_queue 1 (any gate) */
+ 		sweet_scan_hold(s);
+ 		s->release();
+ 		uint32_t i = sweet_scan.laterN++;
+@@ -3396,8 +3399,8 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	if (sweet_scan.next != NULL) {
+ 		sweet_scan.stDropped++;         /* a newer frame before the last one was flipped */
+ 		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.nextSwap, sweet_scan.nextSeq, 2, 0);    /* 0994: this one is replaced */
+-		if (sweet_scan.gate == 2) {
+-			sweet_scan.stOverflow++;        /* 0991: never shown: its CP waiters go on */
++		if (sweet_scan.gate == 2 || sweet_scan.queue) {
++			sweet_scan.stOverflow++;        /* 0991: never shown: its CP waiters go on; 1110: queue full */
+ 			sweet_scan_word_locked((uint32_t)sweet_scan.nextSeq);
+ 		}
+ 		sweet_scan_drop(&sweet_scan.next);
+@@ -4182,7 +4185,7 @@ sweet_scan_stats_locked(uint64_t now)
+ 		    sweet_scan.stCorners ? cw / 1000 / sweet_scan.stCorners : 0, sweet_scan.stFlagDisp, sweet_scan.stFlagBare,
+ 		    sweet_scan.stUnflagged);
+ 		sweet_scan.stFlagDisp = sweet_scan.stFlagBare = sweet_scan.stUnflagged = 0;     /* 1104 */
+-		sweet_scan.stGpuWait = sweet_scan.stGpuRelease = sweet_scan.stQueued = sweet_scan.stOverflow = 0;
++		sweet_scan.stGpuWait = sweet_scan.stGpuRelease = 0;    /* 1110: queued / overflow reset below (tribuf line) */
+ 		sweet_scan.stCornerAbs = 0;
+ 		sweet_scan.stCorners = 0;
+ 		sweet_scan.stGateAbs = 0;
+@@ -4213,13 +4216,16 @@ sweet_scan_stats_locked(uint64_t now)
+ 	if (sweet_scan.tribuf) {
+ 		/* 0996 */
+ 		IOLog("SWEET SCANOUT: 5s tribuf %u: polls busy %u done %u stale %u | gate at K-1 %u | short %u | chain %u-%u | "
+-		    "on-screen busy %u | swapped held %u repeat %u\n", sweet_scan.pollRel ? 2 : 1,
++		    "on-screen busy %u | swapped held %u repeat %u | queue %u: queued %u replaced %u overflow %u late %u\n",
++		    sweet_scan.pollRel ? 2 : 1,
+ 		    sweet_scan.stTbBusy, sweet_scan.stTbDone, sweet_scan.stTbStale, sweet_scan.stTbGate3, sweet_scan.stTbShort,
+-		    sweet_scan.stDepthMin, sweet_scan.stDepthMax, sweet_scan.stRelShown, sweet_scan.stHeldSwap, sweet_scan.stRepeatSwap);
++		    sweet_scan.stDepthMin, sweet_scan.stDepthMax, sweet_scan.stRelShown, sweet_scan.stHeldSwap, sweet_scan.stRepeatSwap,
++		    sweet_scan.queue ? 1 : 0, sweet_scan.stQueued, sweet_scan.stDropped, sweet_scan.stOverflow, sweet_scan.stLate);
+ 		sweet_scan.stTbBusy = sweet_scan.stTbDone = sweet_scan.stTbStale = sweet_scan.stTbGate3 = sweet_scan.stTbShort = 0;
+ 		sweet_scan.stRelShown = 0;
+ 	}
+ 	sweet_scan.stHeldSwap = sweet_scan.stRepeatSwap = 0;    /* 1109 */
++	sweet_scan.stQueued = sweet_scan.stOverflow = 0;        /* 1110 */
+ 	sweet_scan.stFenceAbs = sweet_scan.stLatchAbs = sweet_scan.stLatchMax = 0;
+ 	sweet_scan.stFrames = sweet_scan.stFlips = sweet_scan.stLatched = sweet_scan.stDropped = sweet_scan.stNonslot = 0;
+ 	sweet_scan.stLate = sweet_scan.stBp = sweet_scan.stBpTimeout = sweet_scan.stWait = sweet_scan.stWaitTimeout = 0;
+@@ -4320,6 +4326,9 @@ extern "C" int sweet_scan_gate_get(int what);
+ int
+ sweet_scan_gate_get(int what)
+ {
++	if (what == 2) {
++		return sweet_scan.queue ? 1 : 0;        /* 1110 */
++	}
+ 	if (!sweet_scan.thread) {
+ 		int r = what == 0 ? sweet_scan_gate_req : sweet_scan_tribuf_req;
+ 		if (r >= 0) {
+@@ -4340,9 +4349,16 @@ int
+ sweet_scan_gate_put(int what, int v)
+ {
+ 	AppleCLCD *fb = sweet_fb_instance;
+-	if (v < 0 || v > (what == 0 ? 4 : 2)) {             /* 1109: gate 4, tribuf 2 */
++	if (v < 0 || v > (what == 0 ? 4 : (what == 1 ? 2 : 1))) {     /* 1109: gate 4, tribuf 2; 1110: queue 0|1 */
+ 		return 22;     /* EINVAL (no errno.h in this file) */
+ 	}
++	if (what == 2) {
++		/* 1110: the field alone (fLock not needed: read under fLock at each SwapEnd, a change takes the next one) */
++		sweet_scan.queue = v != 0;
++		IOLog("SWEET SCANOUT: queue %d (%s)\n", v, v ? "a newer swap queues behind a pending one (no replacement until 3 wait)" :
++		    "a newer swap replaces a pending one (gate 2 queues)");
++		return 0;
++	}
+ 	if (what == 0) {
+ 		sweet_scan_gate_req = v;
+ 	} else {
+-- 
+2.53.0
+
