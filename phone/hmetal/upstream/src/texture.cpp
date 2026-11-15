@@ -1556,6 +1556,8 @@ bool Texture::isShaped(const KernelTexture& t) const {
     return false;
 }
 
+bool ubwcDisplayOn();   // (redfin ws-hm-ubwc3) below
+
 std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why, const SurfacePlane* chroma) {
     const FormatInfo* info = formatInfo(desc.format);
     if (info == nullptr || desc.type != TextureType::k2D) {
@@ -1587,7 +1589,10 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     // out through flags that say otherwise. A transport or kernel that does not answer leaves every surface linear.
     {
         HakiosSurfaceUbwc u{};
-        if (!info->twoPlane && gpu.surfaceUbwc(surfaceId, &u) == 0) {
+        // (redfin ws-hm-ubwc3) asked only under HM_UBWC_DISPLAY=1: the redfin kernel (1111) turns a UBWC-ready display
+        // surface compressed for the display engine when its metadata is asked, so a client that would refuse it must
+        // not ask (it then stays a linear surface, scanned out linear)
+        if (!info->twoPlane && ubwcDisplayOn() && gpu.surfaceUbwc(surfaceId, &u) == 0) {
             return wrapUbwcSurface(gpu, std::move(buffer), s, u, name, desc, info, surfaceId, why);
         }
     }

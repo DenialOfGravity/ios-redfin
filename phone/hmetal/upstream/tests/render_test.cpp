@@ -4066,7 +4066,7 @@ TEST(a_depth16_attachment_is_drawn_tested_cleared_and_sampled) {
 // --- a texture over an IOSurface: the path to the screen's memory -----------------------------------------------------------
 
 // (redfin ws-hm-ubwc) HM_UBWC_DISPLAY: a surface the kernel made compressed (its layout answered by kHakiosSurfaceUbwc,
-// the redfin kernel's BO metadata) is refused under 0 (linear rows into it would be scanned out wrong), and under 1 is a
+// the redfin kernel's BO metadata) is not asked under 0 (ws-hm-ubwc3: the surface stays linear), and under 1 is a
 // compressed render target over the surface's memory: the flag plane at the kernel's meta offset, the colour plane at
 // its data offset, drawn through RB_MRT's flags and sampled through a FLAG descriptor; a layout that is not fdl6's for
 // the size (another meta pitch) or another highest bank bit is refused by name.
@@ -4088,8 +4088,10 @@ TEST(a_compressed_display_surface_is_drawn_through_its_flags_only_under_HM_UBWC_
     d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
     std::string why;
     unsetenv("HM_UBWC_DISPLAY");
-    CHECK(Texture::wrapSurface(*r.gpu, 21, d, &why) == nullptr);
-    CHECK(has(why, "HM_UBWC_DISPLAY is 0"));
+    {   // (redfin ws-hm-ubwc3) under 0 the layout is not asked (the kernel would commit the surface): a linear texture
+        auto lin = Texture::wrapSurface(*r.gpu, 21, d, &why);
+        CHECK(lin != nullptr && !lin->compressed());
+    }
     setenv("HM_UBWC_DISPLAY", "1", 1);
     auto t = Texture::wrapSurface(*r.gpu, 21, d, &why);
     CHECK(t != nullptr);
