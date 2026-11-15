@@ -6931,6 +6931,50 @@ TEST(an_extended_range_targets_write_back_is_done_at_completion) {
     CHECK_EQ(s1[8] - s0[8], 1u);
 }
 
+// (ws-hm-alib) a 'b3a8' surface (CoreAnimation's deep snapshot: an XR10 colour plane and an A8 plane, Metal's
+// RGB10A8_2P_XR10) is served as BGR10_XR over its colour plane: drawn into through the companion and written back as XR
+// codes, then sampled (decoded). An XR format over a two-plane surface of another FourCC is still refused.
+TEST(a_b3a8_surfaces_colour_plane_is_drawn_and_read_as_bgr10_xr) {
+    CommandBuffer::setXrGpuForTesting(0);
+    struct Back { ~Back() { CommandBuffer::setXrGpuForTesting(-1); } } back;
+    Rig r;
+    r.fake->addSurface(41, 64, 16, 256, 0x62336138u, 0, 2);   // 'b3a8', two planes
+    TextureDesc d;
+    d.format = PixelFormat::kBGR10_XR;
+    d.width = 64;
+    d.height = 16;
+    d.usage = kTextureUsageRead | kTextureUsageRenderTarget;
+    std::string why;
+    auto x = Texture::wrapSurface(*r.gpu, 41, d, &why);
+    CHECK(x != nullptr);
+    if (x == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    auto cb = clearOnce(r, clearPass(x.get(), 0.25, 0.5, 1.0, 1.0));
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const uint32_t word = 894u | 639u << 10 | 512u << 20;
+    uint8_t want[4];
+    memcpy(want, &word, 4);
+    CHECK(allPixels(*x, want, 4));
+    auto t = target(r, 64, 16);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {x.get()};
+    fsb.samplers = {&smp};
+    uint64_t s0[10], s1[10];
+    CommandBuffer::xrStats(s0);
+    auto cb2 = r.queue->commandBuffer();
+    CHECK(cb2->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb2->commit();
+    cb2->waitUntilCompleted();
+    CHECK(cb2->status() == CommandBuffer::kCompleted);
+    CommandBuffer::xrStats(s1);
+    CHECK_EQ(s1[1] - s0[1], 1u);   // the colour plane decoded once for the draw
+    r.fake->addSurface(42, 64, 16, 256, 0x34323066u, 0, 2);   // '420f': two planes, not 'b3a8'
+    CHECK(Texture::wrapSurface(*r.gpu, 42, d, &why) == nullptr);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 // (redfin hm-int5) HM_XR_WB=gpu: xr_encode's table is the processor write-back's codes (round(v * 510 + 384), clamped;
 // the sRGB twin's half beside it), and the kernel compiles
 TEST(the_gpu_encode_table_is_the_processor_write_backs) {

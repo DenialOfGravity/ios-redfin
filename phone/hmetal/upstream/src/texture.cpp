@@ -1603,7 +1603,10 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     }
     // (redfin hmv4) a 'b3a8' surface (CoreAnimation's deep layer: BGRA plane + A8 plane, Metal's RGB10A8_2P_XR10 550) read
     // as BGRA8 over its first plane, the alpha plane left out, as SweetMetal2 serves it (HM_XR10=0 asks for that format)
-    const bool b3a8 = s.pixelFormat == 0x62336138u && s.planes == 2 && info->bytesPerPixel == 4 && info->xr == 0;
+    // (ws-hm-alib) and as BGR10_XR (or its _sRGB twin) over that plane: what the plug-in serves for Metal's
+    // RGB10A8_2P_XR10 under HM_CA_B3A8 (CoreAnimation's deep snapshots: the App Library's backdrop), the codes decoded
+    // for a draw and written back after one, as over a 'w30r' surface; the alpha plane is not read (alpha 1)
+    const bool b3a8 = s.pixelFormat == 0x62336138u && s.planes == 2 && info->bytesPerPixel == 4 && (info->xr == 0 || info->xr == 1 || info->xr == 2);
     if (s.planes > 1 && !b3a8) {
         refuse(why, name + " has " + n(s.planes) + " planes: a single-plane surface is what is served");
         return nullptr;

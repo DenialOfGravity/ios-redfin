@@ -2771,7 +2771,11 @@ EDITS += HM_PACE_EDITS   # (redfin hm-int8)
 # wrote (SpringBoard's MPS blur, VideoToolbox's VTMTSComputeFunction), a blit copy or a compute output apart, and says
 # whether the texture's memory is zero when the draw samples it.
 #   HM_DD=1          on (off: nothing collected, no cost)
-#   HM_DD_PASSES=5   a buffer of 1..N render passes is printed (at most one every HM_DD_EVERY=3 s, HM_DD_MAX=20 in all)
+#   HM_DD_PASSES=5   a buffer of 1..N render passes is printed (at most one every HM_DD_EVERY=3 s, HM_DD_MAX=20 in all);
+#                    0: whatever its number of passes (the App Library's settled redraw has more than 5)
+#   scope            the env file's plain HM_DD=1 line is backboardd's alone (bench/m2shim.m shim_env): SpringBoard:HM_DD=1
+#                    (NAME:KEY=VALUE, getprogname) or *:HM_DD=1 for the others; the "dd: on" line names the process
+#   lines            every line is one hm_print with the log's prefix, a texture's ("dd:     fs t3 = ...") too
 #   trigger file     /var/local/hmetal/ca/dd-go (HM_DD_TRIGGER): when its mtime changes, the next HM_DD_FORCE=3 buffers
 #                    are printed whatever their passes
 #   compute          every buffer with a dispatch is printed (HM_DD_MAX_COMPUTE=60 in all), and its dispatches' textures
@@ -2805,8 +2809,13 @@ hm_dd_on(void)
 		on = e != NULL && e[0] == '1';
 		if (on) {
 			const char *tr = getenv("HM_DD_TRIGGER");
-			hm_print("dd: on (HM_DD=1): buffers of 1..%d render passes every %d s (at most %d), every buffer with a dispatch (at most %d), "
-				 "the next %d after %s changes\n", hm_dd_env("HM_DD_PASSES", 5), hm_dd_env("HM_DD_EVERY", 3), hm_dd_env("HM_DD_MAX", 20),
+			const int np = hm_dd_env("HM_DD_PASSES", 5);
+			char passes[24];
+			if (np > 0) snprintf(passes, sizeof(passes), "1..%d", np); else strlcpy(passes, "any number of", sizeof(passes));
+			/* (ws-hm-alib) the process named: the env file's plain HM_DD=1 is backboardd's alone (m2shim.m shim_env);
+			 * SpringBoard:HM_DD=1 or *:HM_DD=1 for the others */
+			hm_print("dd: on (HM_DD=1 in %s): buffers of %s render passes (HM_DD_PASSES, 0 any) every %d s (at most %d), every buffer with a dispatch (at most %d), "
+				 "the next %d after %s changes\n", getprogname(), passes, hm_dd_env("HM_DD_EVERY", 3), hm_dd_env("HM_DD_MAX", 20),
 				 hm_dd_env("HM_DD_MAX_COMPUTE", 60), hm_dd_env("HM_DD_FORCE", 3), tr != NULL ? tr : "/var/local/hmetal/ca/dd-go");
 		}
 	}
@@ -3006,7 +3015,7 @@ hm_dd_commit(id cb)
 		forced--, why = "trigger";
 	} else if ([probe count] != 0 && computeN < hm_dd_env("HM_DD_MAX_COMPUTE", 60)) {
 		computeN++, why = "dispatch";
-	} else if (passes >= 1 && (int)passes <= hm_dd_env("HM_DD_PASSES", 5) && now - lastAuto >= hm_dd_env("HM_DD_EVERY", 3) &&
+	} else if (passes >= 1 && (hm_dd_env("HM_DD_PASSES", 5) <= 0 || (int)passes <= hm_dd_env("HM_DD_PASSES", 5)) && now - lastAuto >= hm_dd_env("HM_DD_EVERY", 3) &&
 		   autoN < hm_dd_env("HM_DD_MAX", 20)) {
 		autoN++, lastAuto = now, why = "few passes";
 	}
@@ -3014,7 +3023,13 @@ hm_dd_commit(id cb)
 	hm_dd_count++;
 	hm_print("dd: buffer %llu (%s; dumped %llu): %u render passes, %u draws, %lu dispatched textures\n", seq, why, hm_dd_count, passes, draws,
 		 (unsigned long)[probe count]);
-	for (NSString *l in lines) hm_print("dd: %s\n", [l UTF8String]);
+	/* (ws-hm-alib) one hm_print a line: a draw's or a dispatch's texture lines ("dd:     fs t3 = ...") carry the log's
+	 * process-and-time prefix too, so a grep for the prefix keeps them (k4-1115's dd-bbd.txt had lost every one) */
+	for (NSString *l in lines) {
+		for (NSString *piece in [l componentsSeparatedByString:@"\n"]) {
+			hm_print("%s%s\n", [piece hasPrefix:@"dd:"] ? "" : "dd: ", [piece UTF8String]);
+		}
+	}
 	if ([probe count] != 0 || [targets count] != 0) {
 		NSArray *p = [[probe copy] autorelease], *t = [[targets copy] autorelease];
 		[(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -3437,6 +3452,95 @@ HM_BLIT_WB_EDITS = [
 ]
 
 EDITS += HM_BLIT_WB_EDITS   # (ws-hm-alib) HM_BLIT_WB
+
+
+# (ws-hm-alib) HM_CA_B3A8=1 (default 0: the known-good behaviour, nothing changes): the App Library's black static
+# backdrop (alib2-1115). When the App Library settles, its backdrop is a deep render-server snapshot: the snapshot
+# surface is 'b3a8' (CARenderServerCreateSnapshots with the deep option: an XR10 colour plane and an A8 plane, Metal's
+# RGB10A8_2P_XR10 550). backboardd's CoreAnimation takes a 'b3a8' surface only if its Metal context's limits have the
+# bit MTLGPUFamilyApple3 sets (QuartzCore new_metal_context: supportsFamily:1003 -> limits 0x100;
+# four_cc_to_mtl_format('b3a8') -> 550 only with it). This device's feature profile 1 answers Apple1 and Apple2 alone,
+# so CA logged "Unexpected framebuffer format b3a8" (MetalContext::get_surface, the snapshot not drawn) and then
+# "unsupported surface format: b3a8" ~11 times a second (MetalContext::update_surface, the layer left without
+# contents): the solid black fill (PBGRAXm_A2Xhf) where the blurred wallpaper belongs. Under HM_CA_B3A8=1:
+#   - -supportsFamily:1003 answers YES when QuartzCore asks (the caller's return address in QuartzCore's image; its
+#     only two questions for 1003 are in new_metal_context: the 'b3a8' bit, and a set_surface divisor of 128 that is
+#     then left 0). Every other caller, and every other family, gets the base class's answer.
+#   - a texture of 550/551 over a 'b3a8' surface's plane 0 is BGR10_XR (554/555) over it: the codes decoded for a draw
+#     and written back after one, as over a 'w30r' surface (core: Texture::wrapSurface's 'b3a8' exception now takes
+#     the 4-byte XR formats). The alpha plane is not read: alpha 1, which a snapshot of the opaque screen is.
+#   - plane 1 of a 'b3a8' surface (its A8 plane) is a texture of its own of the asked format (drawn into, never read
+#     back into the surface), not a refusal that would fail the whole snapshot.
+HM_B3A8_HELPERS = r"""/* (ws-hm-alib) HM_CA_B3A8: see bench/plugin.py */
+static int
+hm_ca_b3a8_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("HM_CA_B3A8");
+		on = e != NULL && atoi(e) != 0;
+	}
+	return on;
+}
+
+static BOOL
+hm_b3a8_surface(IOSurfaceRef s)
+{
+	if (s == NULL) return NO;
+	const OSType f = IOSurfaceGetPixelFormat(s);
+	return f == 0x62336138u || f == 0x26623338u;   /* 'b3a8', '&b38' */
+}
+
+/* RA (a method's return address) is in QuartzCore's image */
+static BOOL
+hm_caller_is_quartzcore(const void *ra)
+{
+	static const void *base;
+	Dl_info info;
+
+	if (ra == NULL || dladdr(ra, &info) == 0 || info.dli_fbase == NULL) return NO;
+	if (base != NULL) return info.dli_fbase == base;
+	if (info.dli_fname != NULL && strstr(info.dli_fname, "/QuartzCore.framework/QuartzCore") != NULL) {
+		base = info.dli_fbase;
+		return YES;
+	}
+	return NO;
+}
+
+"""
+
+HM_B3A8_EDITS = [
+    ('static MTLTextureDescriptor *\nhm_xr10_descriptor(MTLTextureDescriptor *d)\n{\n',
+     HM_B3A8_HELPERS + 'static MTLTextureDescriptor *\nhm_xr10_descriptor(MTLTextureDescriptor *d)\n{\n'),
+    ('/* (redfin hmv4) HM_XR10 (see hm_xr10_on) */\n- (BOOL)supportsExtendedXR10Formats\n',
+     '/* (ws-hm-alib) HM_CA_B3A8: QuartzCore\'s Apple3 question (its \'b3a8\' surfaces), see bench/plugin.py */\n'
+     '- (BOOL)supportsFamily:(MTLGPUFamily)family\n{\n'
+     '\tif (family == (MTLGPUFamily)1003 && hm_ca_b3a8_on() && hm_caller_is_quartzcore(__builtin_return_address(0))) {\n'
+     '\t\tHM_ONCE("HM_CA_B3A8=1: QuartzCore asked for MTLGPUFamilyApple3: YES (its Metal context then takes \'b3a8\' surfaces; '
+     'RGB10A8_2P_XR10 is served as BGR10_XR over the colour plane)\\n");\n'
+     '\t\treturn YES;\n\t}\n'
+     '\tstruct objc_super sup = { self, class_getSuperclass([HakiosMetalDevice class]) };\n'
+     '\treturn ((BOOL (*)(struct objc_super *, SEL, MTLGPUFamily))objc_msgSendSuper)(&sup, _cmd, family);\n}\n\n'
+     '/* (redfin hmv4) HM_XR10 (see hm_xr10_on) */\n- (BOOL)supportsExtendedXR10Formats\n'),
+    ('\tdescriptor = hm_xr10_descriptor(descriptor);   /* (redfin hmv4) HM_XR10=0: 550/551 (a b3a8 surface) as BGRA8 over its first plane */\n',
+     '\tif (hm_ca_b3a8_on() && hm_b3a8_surface(surface) && descriptor != nil) {   /* (ws-hm-alib) HM_CA_B3A8 */\n'
+     '\t\tconst MTLPixelFormat f = [descriptor pixelFormat];\n'
+     '\t\tif (plane == 0 && (f == (MTLPixelFormat)550 || f == (MTLPixelFormat)551)) {\n'
+     '\t\t\tHM_ONCE("HM_CA_B3A8=1: format %lu over the \'b3a8\' surface %u (%zux%zu) served as BGR10_XR%s over its colour plane, alpha 1\\n",\n'
+     '\t\t\t\t(unsigned long)f, IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), f == 551 ? "_sRGB" : "");\n'
+     '\t\t\tdescriptor = [[descriptor copy] autorelease];\n'
+     '\t\t\t[descriptor setPixelFormat:f == (MTLPixelFormat)550 ? (MTLPixelFormat)554 : (MTLPixelFormat)555];\n'
+     '\t\t} else if (plane == 1) {\n'
+     '\t\t\tHM_ONCE("HM_CA_B3A8=1: plane 1 (alpha) of the \'b3a8\' surface %u as a texture of its own, format %lu (not read back)\\n",\n'
+     '\t\t\t\tIOSurfaceGetID(surface), (unsigned long)f);\n'
+     '\t\t\treturn [self newTextureWithDescriptor:descriptor];\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\tdescriptor = hm_xr10_descriptor(descriptor);   /* (redfin hmv4) HM_XR10=0: 550/551 (a b3a8 surface) as BGRA8 over its first plane */\n'),
+]
+
+EDITS += HM_B3A8_EDITS   # (ws-hm-alib) HM_CA_B3A8
 
 
 def apply(src, edits=EDITS):
