@@ -2669,7 +2669,8 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char 
 /* redfin 0982: every property read from the sweetbtnub stand-in nubs (iokit/Kernel/arm/SweetBTNub.cpp) */
 extern "C" bool SweetBTNubIs(const void *entry);
 extern "C" bool SweetABPIs(const void *entry);      /* 1061: the AppleBasebandPCI stand-ins (SweetABP.cpp) */
-static uint32_t sweet_btnub_reads, sweet_abp_reads;
+extern "C" bool SweetNFCIs(const void *entry);      /* 1119: stockholm nub + AppleStockholmControl (SweetNFC.cpp) */
+static uint32_t sweet_btnub_reads, sweet_abp_reads, sweet_nfc_reads;
 
 static void
 sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
@@ -2682,6 +2683,17 @@ sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
 			IOLog("SWEET ABP: %s reads %s.%s (%s) -> %s\n", pn, entry->getName(), key ? key : "*", how,
 			    key ? (av ? "found" : "MISSING") : "all");
 			OSSafeReleaseNULL(av);
+		}
+		return;
+	}
+	if (SweetNFCIs(entry)) {
+		if (sweet_nfc_reads++ < 300) {
+			char pn[32];
+			proc_selfname(pn, (int)sizeof(pn));
+			OSObject *nv = key ? entry->copyProperty(key) : NULL;
+			IOLog("SWEET NFC: %s reads %s.%s (%s) -> %s\n", pn, entry->getName(), key ? key : "*", how,
+			    key ? (nv ? "found" : "MISSING") : "all");
+			OSSafeReleaseNULL(nv);
 		}
 		return;
 	}
