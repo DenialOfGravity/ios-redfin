@@ -2592,13 +2592,20 @@ sysctl_sweet_scangate SYSCTL_HANDLER_ARGS
 	if (error || !changed) {
 		return error;
 	}
-	if (value < 0 || value > (what == 0 ? 4 : 2)) {        /* 1109: gate 4 (none), tribuf 2 (complete when off screen) */
+	if (value < 0 || value > (what == 0 ? 4 : (what == 1 ? 2 : 1))) {    /* 1109: gate 4, tribuf 2; 1110: queue 0|1 */
 		return EINVAL;
 	}
 	return sweet_scan_gate_put(what, value);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     (void *)0, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: gate 0 back pressure, 1 CPU, 2 CP, 3 per surface (1105), 4 none (1109)");
+/*
+ * 1110: kern.sweet_scangate_queue 0|1 (default 0): a SwapEnd that finds the previous swap still pending (its GPU fence not
+ * landed) queues behind it (up to 3, flipped in order at the following latches) instead of replacing it, with any gate.
+ * With tribuf 2 the queued swaps answer Busy, so CA's 3-page ring throttles it to one pending frame behind the one on screen.
+ */
+SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_queue, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    (void *)2, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: newer swaps queue behind a pending one (1110)");
 SYSCTL_PROC(_kern, OID_AUTO, sweet_scangate_tribuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     (void *)1, 0, sysctl_sweet_scangate, "I", "SWEET SCANOUT: SwapWait polls 1 busy until latched (0996), 2 until off screen (1109)");
 
