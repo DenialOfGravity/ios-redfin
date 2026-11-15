@@ -1,0 +1,321 @@
+From b20f42e47a79e46a1fac617d5346578df7066858 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 02:48:18 +0100
+Subject: [PATCH 4/5] 1107 redfin: touch -> latch in stages
+ (kern.sweet_touch_trace, default 1)
+
+One touch event at a time is followed: sample IRQ time -> HID event dispatched
+(SweetHID::touch) -> the swapper's first GPU submit after it (submit entry,
+before the scanout gate) -> the first direct SwapEnd after that -> that swap's
+or a later one's latch; abandoned after 200 ms. Per vsync notification also:
+-> the swapper's first submit, -> its first SwapEnd (CA's tick-to-work time).
+0.2 ms bins; 5 s line "SWEET TOUCH: 5s stages" with p50/p95 each. Try-lock
+word, no locks taken; a few loads/stores per event. 0 = off.
+---
+ bsd/dev/sweet_gpu.c                   |   7 +
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 198 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/hid/SweetHID.cpp     |   5 +-
+ 3 files changed, 209 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 46945c5..87f6b00 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2561,6 +2561,12 @@ uint32_t sweet_scan_submit_gate(uint32_t gf);  /* 0985: SweetFramebuffer.cpp; 09
+  * The flagged process is one pid (the newest that flagged): only the swapper (backboardd) is ever gated, and a new
+  * backboardd is gated in full until its first flagged submission.
+  */
++/* 1107: SweetFramebuffer.cpp (touch -> latch stages); kern.sweet_touch_trace 0|1, default 1 */
++void sweet_touch_trace_submit(int pid, uint64_t now);
++extern uint32_t sweet_touch_trace;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
++    "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
++
+ int sweet_scangate_flag = 1;
+ static volatile int scangate_flag_pid = -1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scangate_flag, 0,
+@@ -2674,6 +2680,7 @@ sweet_gpu_submit_v2(const uint64_t *iova, const uint32_t *dwords, unsigned n, ui
+ 	/* 0985: CA's next frame waits for its last one on screen (direct scanout): here (gate 1) or in the CP (0989, gate 2) */
+ 	int pid = proc_selfpid();
+ 	SWEET_TRACE_START(SWT_GPU_SUBMIT, pid, n, 0, 0);     /* 0994 */
++	sweet_touch_trace_submit(pid, mach_absolute_time());    /* 1107: touch -> first submit, vsync -> submit */
+ 	/* 1104: gf bit 0 = writes the display (the client's flag), bit 1 = this pid flags its display submits */
+ 	uint32_t gf = flags & 1u ? flags & 0xffffff01u : 0;   /* 1105: bits 8..31 = the display surface's id (gate 3) */
+ 	if (sweet_scangate_flag) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 69359ff..3c48027 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -466,6 +466,7 @@ static bool sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uin
+ static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
+ static IOReturn sweet_scan_poll(AppleCLCD *fb, uint32_t id);    /* 0996 */
+ static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
++static void sweet_tt_tick(uint64_t now);        /* 1107 */
+ 
+ static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
+ static volatile bool sweet_scan_auto_armed;     /* 1046: sweetscanout=2 (default): direct on at the first slot swap */
+@@ -1471,6 +1472,7 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+ 
+ 	fPaceSwapped = false;
+ 	fPaceLastAbs = now;     /* 0983 */
++	sweet_tt_tick(now);     /* 1107: vsync -> submit / SwapEnd */
+ 	sweet_swaptrace('V', (uint32_t)count);  /* 0987 */
+ 	if (SWEET_TRACE_ON()) {        /* 0994 */
+ 		uint32_t on = 0;
+@@ -3368,6 +3370,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 		sweet_scan.stQueued++;
+ 		sweet_scan.stFrames++;
+ 		SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.later[i].swap, sweet_scan.later[i].seq, 1, sweet_scan.depth);    /* 0994 */
++		sweet_tt_swap(sweet_scan.later[i].swap, now);   /* 1107 */
+ 		IOLockWakeup(fb->fLock, &sweet_scan, false);
+ 		IOLockUnlock(fb->fLock);
+ 		return true;
+@@ -3400,6 +3403,7 @@ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ 	sweet_scan.nextAbs = now;
+ 	sweet_scan.stFrames++;
+ 	SWEET_TRACE(SWT_SCAN_SWAP, sweet_scan.nextSwap, seq, 0, sweet_scan.depth);    /* 0994 */
++	sweet_tt_swap(sweet_scan.nextSwap, now);        /* 1107 */
+ 	IOLockWakeup(fb->fLock, &sweet_scan, false);
+ 	/*
+ 	 * Back pressure (0979: by CA's chain depth N, the different surfaces of the last 8 slot frames). CA draws frame
+@@ -3704,6 +3708,198 @@ sweet_scan_corners(AppleCLCD *fb, SweetSurface *s)
+  * Second line of the 5 s report: SWEET SCANOUT: 5s frames: ...
+  */
+ extern "C" volatile uint64_t sweet_hid_touch_abs[2];   /* iokit/Kernel/arm/hid/SweetHID.cpp: newest, previous */
++
++/*
++ * 1107: kern.sweet_touch_trace (default 1; bsd/dev/sweet_gpu.c): touch -> latch in stages. One touch event at a time is
++ * followed (the next is taken once it has latched, or after 200 ms: abandoned): its time (the sample's IRQ time, SweetHID)
++ * -> its HID event dispatched (SweetHID::touch, dispatchEvent returned: queued for backboardd) -> the swapper's first GPU
++ * submit after that (sweet_gpu_submit_v2 entry, before the scanout gate) -> the first direct SwapEnd after that submit ->
++ * that swap's (or a later one's) latch. Also per vsync notification: -> the swapper's first submit, -> its first SwapEnd
++ * (CA's tick-to-work timing). 0.2 ms bins to 200 ms (50 ms for the vsync pair); p50/p95 in the 5 s line SWEET TOUCH.
++ * No locks taken: a try-lock word; a busy one drops the sample. Cost: a few loads and stores per event/submit/swap/latch.
++ */
++extern "C" uint32_t sweet_touch_trace;
++uint32_t sweet_touch_trace = 1;
++#define SWEET_TT_BINS   1000            /* 0.2 ms */
++static struct {
++	volatile SInt32 busy;
++	uint32_t state;                 /* 0 free, 1 dispatched, 2 submitted, 3 swapped */
++	uint64_t irq, hid, sub, swap;
++	uint32_t swapId, n, abandoned;
++	uint16_t h[5][SWEET_TT_BINS];   /* irq->hid, hid->submit, submit->swapend, swapend->latch, total */
++	volatile uint64_t tick;
++	volatile bool tickSub, tickSwap;
++	uint16_t tv[2][250];            /* vsync -> submit, vsync -> SwapEnd */
++	uint32_t tvn[2];
++} sweet_tt;
++
++static bool
++sweet_tt_take(void)
++{
++	return sweet_touch_trace != 0 && OSCompareAndSwap(0, 1, (volatile UInt32 *)&sweet_tt.busy);
++}
++
++static void
++sweet_tt_give(void)
++{
++	OSCompareAndSwap(1, 0, (volatile UInt32 *)&sweet_tt.busy);
++}
++
++static void
++sweet_tt_bin(uint16_t *h, uint32_t bins, uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	uint64_t b = ns / 200000;
++	if (b < bins && h[b] != 0xffff) {
++		h[b]++;
++	}
++}
++
++static void
++sweet_tt_tick(uint64_t now)
++{
++	sweet_tt.tick = now;
++	sweet_tt.tickSub = false;
++	sweet_tt.tickSwap = false;
++}
++
++extern "C" void sweet_touch_trace_event(uint64_t irq, uint64_t hid);
++void
++sweet_touch_trace_event(uint64_t irq, uint64_t hid)
++{
++	if (!sweet_tt_take()) {
++		return;
++	}
++	if (sweet_tt.state != 0) {
++		uint64_t lim;
++		nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &lim);
++		if (hid > sweet_tt.hid && hid - sweet_tt.hid > lim) {
++			sweet_tt.abandoned++;
++			sweet_tt.state = 0;
++		}
++	}
++	if (sweet_tt.state == 0 && irq != 0 && hid >= irq) {
++		sweet_tt.irq = irq;
++		sweet_tt.hid = hid;
++		sweet_tt.state = 1;
++	}
++	sweet_tt_give();
++}
++
++extern "C" void sweet_touch_trace_submit(int pid, uint64_t now);
++void
++sweet_touch_trace_submit(int pid, uint64_t now)
++{
++	if (pid != sweet_scan.gatePid || pid == 0 || sweet_touch_trace == 0) {
++		return;
++	}
++	if (!sweet_tt.tickSub && sweet_tt.tick != 0 && now > sweet_tt.tick) {
++		sweet_tt.tickSub = true;
++		if (sweet_tt_take()) {
++			sweet_tt_bin(sweet_tt.tv[0], 250, now - sweet_tt.tick);
++			sweet_tt.tvn[0]++;
++			sweet_tt_give();
++		}
++	}
++	if (sweet_tt.state == 1 && sweet_tt_take()) {
++		if (sweet_tt.state == 1 && now >= sweet_tt.hid) {
++			sweet_tt.sub = now;
++			sweet_tt.state = 2;
++		}
++		sweet_tt_give();
++	}
++}
++
++static void
++sweet_tt_swap(uint32_t id, uint64_t now)
++{
++	if (sweet_touch_trace == 0) {
++		return;
++	}
++	if (!sweet_tt.tickSwap && sweet_tt.tick != 0 && now > sweet_tt.tick) {
++		sweet_tt.tickSwap = true;
++		if (sweet_tt_take()) {
++			sweet_tt_bin(sweet_tt.tv[1], 250, now - sweet_tt.tick);
++			sweet_tt.tvn[1]++;
++			sweet_tt_give();
++		}
++	}
++	if (sweet_tt.state == 2 && sweet_tt_take()) {
++		if (sweet_tt.state == 2 && now >= sweet_tt.sub) {
++			sweet_tt.swap = now;
++			sweet_tt.swapId = id;
++			sweet_tt.state = 3;
++		}
++		sweet_tt_give();
++	}
++}
++
++static void
++sweet_tt_latch(uint32_t swapId, uint64_t now)
++{
++	if (sweet_tt.state != 3 || (int32_t)(swapId - sweet_tt.swapId) < 0 || !sweet_tt_take()) {
++		return;
++	}
++	if (sweet_tt.state == 3 && (int32_t)(swapId - sweet_tt.swapId) >= 0 && now >= sweet_tt.swap) {
++		sweet_tt_bin(sweet_tt.h[0], SWEET_TT_BINS, sweet_tt.hid - sweet_tt.irq);
++		sweet_tt_bin(sweet_tt.h[1], SWEET_TT_BINS, sweet_tt.sub - sweet_tt.hid);
++		sweet_tt_bin(sweet_tt.h[2], SWEET_TT_BINS, sweet_tt.swap - sweet_tt.sub);
++		sweet_tt_bin(sweet_tt.h[3], SWEET_TT_BINS, now - sweet_tt.swap);
++		sweet_tt_bin(sweet_tt.h[4], SWEET_TT_BINS, now - sweet_tt.irq);
++		sweet_tt.n++;
++		sweet_tt.state = 0;
++	}
++	sweet_tt_give();
++}
++
++static uint32_t
++sweet_tt_pct(const uint16_t *h, uint32_t bins, uint32_t pct)
++{
++	uint32_t n = 0, acc = 0;
++	for (uint32_t i = 0; i < bins; i++) {
++		n += h[i];
++	}
++	uint32_t want = (n * pct + 99) / 100;
++	for (uint32_t i = 0; n != 0 && i < bins; i++) {
++		acc += h[i];
++		if (acc >= want) {
++			return 2 * i;   /* in 0.1 ms */
++		}
++	}
++	return 0;
++}
++
++static void
++sweet_tt_line(void)
++{
++	if (sweet_touch_trace == 0 || !sweet_tt_take()) {
++		return;
++	}
++	uint32_t p[5][2], v[2][2];
++	for (int k = 0; k < 5; k++) {
++		p[k][0] = sweet_tt_pct(sweet_tt.h[k], SWEET_TT_BINS, 50);
++		p[k][1] = sweet_tt_pct(sweet_tt.h[k], SWEET_TT_BINS, 95);
++	}
++	for (int k = 0; k < 2; k++) {
++		v[k][0] = sweet_tt_pct(sweet_tt.tv[k], 250, 50);
++		v[k][1] = sweet_tt_pct(sweet_tt.tv[k], 250, 95);
++	}
++	uint32_t n = sweet_tt.n, ab = sweet_tt.abandoned, tn0 = sweet_tt.tvn[0], tn1 = sweet_tt.tvn[1];
++	bzero(sweet_tt.h, sizeof(sweet_tt.h));
++	bzero(sweet_tt.tv, sizeof(sweet_tt.tv));
++	sweet_tt.n = sweet_tt.abandoned = sweet_tt.tvn[0] = sweet_tt.tvn[1] = 0;
++	sweet_tt_give();
++	if (n == 0 && ab == 0 && tn0 == 0) {
++		return;
++	}
++#define TT2(a) (a)[0] / 10, (a)[0] % 10, (a)[1] / 10, (a)[1] % 10
++	IOLog("SWEET TOUCH: 5s stages n %u abandoned %u | p50/p95 ms: irq->hid %u.%u/%u.%u | hid->submit %u.%u/%u.%u | "
++	    "submit->swapend %u.%u/%u.%u | swapend->latch %u.%u/%u.%u | total %u.%u/%u.%u | vsync->submit n %u %u.%u/%u.%u | "
++	    "vsync->swapend n %u %u.%u/%u.%u\n", n, ab, TT2(p[0]), TT2(p[1]), TT2(p[2]), TT2(p[3]), TT2(p[4]), tn0, TT2(v[0]),
++	    tn1, TT2(v[1]));
++#undef TT2
++}
+ #define SWEET_SF_BINS   1000                            /* 0.1 ms bins to 100 ms */
+ static struct {
+ 	uint64_t lastLatch, prevIntv;
+@@ -3811,6 +4007,7 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		sweet_scan.shownSwap = sweet_scan.flipSwap;
+ 		uint64_t l = now - sweet_scan.flipSwapAbs;
+ 		sweet_scan_frame_latched(fb, now, sweet_scan.flipSwapAbs);    /* 1044 */
++		sweet_tt_latch(sweet_scan.flipSwap, now);       /* 1107 */
+ 		OSAddAtomic64(1, &sweet_fb_frames);    /* 1060 */
+ 		sweet_scan.stLatched++;
+ 		sweet_scan.stLatchN++;
+@@ -3941,6 +4138,7 @@ sweet_scan_stats_locked(uint64_t now)
+ 	    sweet_scan.stClean, sweet_scan.stEnter, sweet_scan.stLeave,
+ 	    sweet_scan.stHold, sweet_scan.stLatchFc, sweet_scan.geom ? "direct" : "panel buffer");
+ 	sweet_sf_line_locked();         /* 1044 */
++	sweet_tt_line();                /* 1107 */
+ 	{
+ 		uint64_t gw = 0;    /* 0985 */
+ 		absolutetime_to_nanoseconds(sweet_scan.stGateAbs, &gw);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7a666fa..060fd9b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -565,6 +565,7 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
+ }
+ 
+ extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
++extern "C" void sweet_touch_trace_event(uint64_t irq, uint64_t hid);     /* 1107 */
+ /* 1044: the newest two touch event times (IRQ time with sectouchx 0x1), for SweetFramebuffer's touch -> latch */
+ extern "C" volatile uint64_t sweet_hid_touch_abs[2];
+ volatile uint64_t sweet_hid_touch_abs[2];
+@@ -694,7 +695,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+ 	}
+ 	uint64_t t1 = mach_absolute_time();
+ 	dispatchEvent(collection);
+-	uint32_t dispUs = sweetTouchUs(mach_absolute_time() - t1);
++	uint64_t t2 = mach_absolute_time();
++	sweet_touch_trace_event(now, t2);       /* 1107: SweetFramebuffer.cpp, touch -> latch stages */
++	uint32_t dispUs = sweetTouchUs(t2 - t1);
+ 	collection->release();
+ 	sweetTouchStat(fLock, fDown, finger, was, down, moved, now, x, y, dispUs);
+ }
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From ea39b384c557189918fb21b8af0e3c46f63e0753 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 15 Nov 2026 02:44:27 +0100
-Subject: [PATCH 2/2] 1105 redfin: scanout gate 3 (per surface) and
+Subject: [PATCH 2/5] 1105 redfin: scanout gate 3 (per surface) and
  kern.sweet_scangate_mode / _tribuf
 
 Gate 3: a display submit that names its surface (NativeAdrenoAbiSubmit.flags

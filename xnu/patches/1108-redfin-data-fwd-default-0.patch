@@ -1,0 +1,46 @@
+From 6c70187ceacd485be7fe98ce46b8ef4bec2fa088 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 02:48:30 +0100
+Subject: [PATCH 5/5] 1108 redfin: kern.sweet_data_fwd default 0 (CommCenter
+ data forwarding only when testing data)
+
+The owner wants telephony data forwarding off unless data is being tested;
+it booted as 1. The sysctl stays (write 1 to test, live, no reboot).
+---
+ bsd/dev/sweet_qmux.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 3ef7e75..a60d06a 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -3190,7 +3190,7 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
+ /*
+  * ---- 1080 (P4 M3c): CommCenter owns cellular data ----
+  * Active only when sweetbb & 0x10 (SBB_DATA: 1075 pdp_ip + 1076 kernel IPA) AND kern.sweet_qmi_rules = 1 AND
+- * kern.sweet_data_fwd = 1 (default 1; write 0 = data services answered err 0x5e again, no reboot: live calls stopped,
++ * kern.sweet_data_fwd = 1 (1108: default 0, set 1 to test data; write 0 = data services answered err 0x5e again, no reboot: live calls stopped,
+  * data clients given back). Otherwise nothing below runs and the router behaves exactly as before.
+  *   - WDS 0x01, WDA 0x1a, QOS 0x04, DSD 0x2a, DFS 0x30 forwarded per client (the policy text's exact/wildcard lines still
+  *     win); DPM stays err (the kernel IPA opens the DPM port itself). WDS/QOS clients are never pooled: released (CTL
+@@ -3244,7 +3244,7 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
+ #define D_BAK_MAX               (48u << 10)
+ #define D_NGATE                 8
+ 
+-static int data_fwd = 1, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default */
++static int data_fwd = 0, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default; 1108: data_fwd default 0 (1 only to test data) */
+ static int data_was;                    /* data_active() as the thread saw it last (logs + kill switch) */
+ static uint16_t gate_ids[D_NGATE] = { 0x0027, 0x0028, 0x0029, 0x004a, 0x0093 };     /* [0..2] always */
+ static int ngate = 5;
+@@ -5352,7 +5352,7 @@ sweet_qmux_start(void)
+ 	if (sweet_bb & SBB_DATA) {      /* 1080: the data section's state (active only with kern.sweet_qmi_rules 1) */
+ 		D = kalloc_data(sizeof(*D), Z_WAITOK | Z_ZERO);
+ 		printf("SWEET QMUX: data section %s (%lu bytes): CommCenter owns data when kern.sweet_qmi_rules = 1 and "
+-		    "kern.sweet_data_fwd = 1\n", D ? "ready" : "NO MEMORY: off", (unsigned long)sizeof(*D));
++		    "kern.sweet_data_fwd = 1 (1108: default 0)\n", D ? "ready" : "NO MEMORY: off", (unsigned long)sizeof(*D));
+ 	}
+ 	PE_parse_boot_argn("sweetqmifilter", &qmi_filter, sizeof(qmi_filter));
+ 	PE_parse_boot_argn("sweetqmirules", &qmi_rules, sizeof(qmi_rules));
+-- 
+2.53.0
+
