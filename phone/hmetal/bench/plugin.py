@@ -3102,6 +3102,343 @@ HM_DD_EDITS = [
 EDITS += HM_DD_EDITS   # (ws-hm-alib)
 
 
+# (ws-hm-alib) HM_BLIT_WB=1 (default; 0 the old behaviour for A/B): a SHADOW copy (an IOSurface whose rows the GPU cannot
+# use directly, drawn through a private copy) that a BLIT writes is written back into the surface when its command buffer
+# completes, as passes and kernels were -- before, a blit into one left the surface as it was (zeros), which other
+# processes (backboardd showing SpringBoard's pre-blurred App Library backdrop) then drew. Under the same switch:
+#   - copyFromTexture: (every form: region, slices/levels, whole), copyFromBuffer:toTexture: (both forms; also the
+#     layered/3D and block-format paths) refresh the target's copy from the surface first and list it for write-back,
+#     once a buffer however many blits land on it. Only bytes the GPU changed from the copy's base go back (the existing
+#     diff of hakiosWriteBackShadow, over level 0); a blit into level > 0 or into a YCbCr copy is counted and not written.
+#   - a blit SOURCE that is a SHADOW copy (copyFromTexture: source, copyFromTexture:toBuffer:, generateMipmaps' level 0)
+#     is refreshed from the surface when the seed moved, as a sampled texture is (and listed as a reader for HM_SHADOW_WAIT).
+#   - a texture VIEW of a SHADOW copy counts as SHADOW (hakiosIsShadow): passes and kernels writing through a view write
+#     back too (they did not: only the view's parent had _shadow set).
+#   - replaceRegion: on a SHADOW copy (2D, level 0) also writes the caller's rows into the surface (and the copy's base).
+# HM_WB_SYNC=1 (default; 0 the old handlers for passes and kernels): every write-back runs on the completing thread in
+# hakiosCompletedNow BEFORE the buffer's shared events are signalled and before its completed handlers are delivered --
+# before, they were completed handlers themselves, dispatched to the daemon's completion queue, so -waitUntilCompleted
+# could return (and an event be signalled) before the surface had the new rows. Blits always use this path.
+# Proof in a capture: HM_PROF>=2 "prof: shadow write-backs: ..." every 5 s; HM_DD=1 "dd: blit wb: surface ID WxH fmt ..."
+# per blit write-back (at most HM_DD_MAX_WB=200) and "dd: replaceRegion wb: ...".
+def _tabs(s):
+    out = []
+    for line in s.split('\n'):
+        n = len(line) - len(line.lstrip(' '))
+        out.append('\t' * (n // 4) + ' ' * (n % 4) + line[n:])
+    return '\n'.join(out)
+
+
+HM_BLIT_WB_HELPERS = _tabs(r'''/* (ws-hm-alib) HM_BLIT_WB / HM_WB_SYNC: see bench/plugin.py */
+static volatile long hm_wb_blit, hm_wb_blit_deferred, hm_wb_blit_skipped, hm_wb_blit_reads, hm_wb_put, hm_wb_sync_runs;
+static int
+hm_blit_wb(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("HM_BLIT_WB");
+
+        on = e == NULL || e[0] != '0';
+    }
+    return on;
+}
+static int
+hm_wb_sync(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("HM_WB_SYNC");
+
+        on = e == NULL || e[0] != '0';
+    }
+    return on;
+}
+
+''')
+
+HM_BLIT_WB_PROF = _tabs(r'''        {   /* (ws-hm-alib) HM_BLIT_WB */
+            static long wbB, wbD, wbS, wbR, wbP, wbY;
+            const long b = hm_wb_blit, d = hm_wb_blit_deferred, sk = hm_wb_blit_skipped, r = hm_wb_blit_reads, p = hm_wb_put, y = hm_wb_sync_runs;
+
+            hm_print("prof: shadow write-backs: blit targets written back %ld, deferred to a later writer %ld, not written (level/YCbCr) %ld; "
+                     "blit sources refreshed %ld; replaceRegion %ld; write-backs run at completion %ld (HM_BLIT_WB=%d HM_WB_SYNC=%d)\n",
+                     b - wbB, d - wbD, sk - wbS, r - wbR, p - wbP, y - wbY, hm_blit_wb(), hm_wb_sync());
+            wbB = b, wbD = d, wbS = sk, wbR = r, wbP = p, wbY = y;
+        }
+''')
+
+HM_BLIT_WB_IFACE = _tabs(r'''
+/* (ws-hm-alib) HM_BLIT_WB: blits, views and replaceRegion over a SHADOW copy (see bench/plugin.py) */
+@interface HakiosMetalTexture (HMBlitWB)
+- (HakiosMetalTexture *)hmwbRoot;
+- (void)hmwbBlitRead:(id)cb;
+- (BOOL)hmwbBlitWrite:(id)cb level:(NSUInteger)level;
+- (void)hmwbPutRegion:(MTLRegion)region level:(NSUInteger)level bytes:(const void *)bytes bytesPerRow:(NSUInteger)bytesPerRow;
+- (void)hmwbNoteBlitWriteBack:(id)cb deferred:(BOOL)deferred seed:(uint32_t)seed ms:(double)ms;
+@end
+''')
+
+HM_BLIT_WB_IMPL = _tabs(r'''
+/* (ws-hm-alib) HM_BLIT_WB: 9 elements of a surface's memory on a 3x3 grid, as hm_dd_probe does for a texture */
+static NSString *
+hm_wb_surface_probe(IOSurfaceRef s)
+{
+    if (s == NULL || IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return @"(not probed)";
+    const size_t bpe = IOSurfaceGetBytesPerElement(s), w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s);
+    const uint8_t *base = IOSurfaceGetBaseAddress(s);
+    unsigned nz = 0;
+    char hex[40] = "";
+
+    if (base != NULL && bpe != 0 && bpe <= 16 && w != 0 && h != 0) {
+        for (unsigned j = 0; j < 3; j++) {
+            for (unsigned i = 0; i < 3; i++) {
+                const uint8_t *px = base + (h * (1 + 2 * j) / 6) * bpr + (w * (1 + 2 * i) / 6) * bpe;
+                BOOL any = NO;
+
+                for (size_t k = 0; k < bpe; k++) any = any || px[k] != 0;
+                nz += any;
+                if (i == 1 && j == 1) {
+                    for (size_t k = 0; k < bpe; k++) snprintf(hex + 2 * k, 3, "%02x", px[k]);
+                }
+            }
+        }
+    }
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    return [NSString stringWithFormat:@"%u/9 not zero, centre %s", nz, hex];
+}
+
+@implementation HakiosMetalTexture (HMBlitWB)
+
+/* the SHADOW texture whose copy this is: itself, or the one a view (of a view) is of; nil for any other */
+- (HakiosMetalTexture *)hmwbRoot
+{
+    if (_parent != nil) return [_parent hmwbRoot];
+    return _shadow && _iosurface != NULL ? self : nil;
+}
+
+/* a blit reads this texture: the copy as the surface is now (the seed moved), as for a sampled texture */
+- (void)hmwbBlitRead:(id)cb
+{
+    if (!hm_blit_wb() || [self hmwbRoot] == nil) return;
+    [self hakiosRefreshShadow];
+    [self hakiosShadowUse:cb writer:NO];
+    __sync_fetch_and_add(&hm_wb_blit_reads, 1);
+}
+
+/* a blit writes this texture at LEVEL: the copy made current first (a blit into part of it keeps the rest), a base kept
+ * (what the write-back tells the blit's bytes from), and the copy written back when CB completes -- listed once a buffer */
+- (BOOL)hmwbBlitWrite:(id)cb level:(NSUInteger)level
+{
+    HakiosMetalTexture *root = hm_blit_wb() ? [self hmwbRoot] : nil;
+
+    if (root == nil || cb == nil || ![cb isKindOfClass:[HakiosMetalCommandBuffer class]]) return NO;
+    if (level + (_parent != nil ? _parentLevel : 0) != 0 || root->_ycbcr != 0 || root->_ycbcrNative) {
+        __sync_fetch_and_add(&hm_wb_blit_skipped, 1);
+        HM_ONCE("blit wb: a blit into level %lu of a surface's copy (or a YCbCr copy) is not written back: a surface has level 0 only\n",
+                (unsigned long)level);
+        return NO;
+    }
+    root->_blitWritten = YES;
+    [root hakiosRefreshShadow];
+    if (root->_shadowBase == NULL) {
+        const size_t bytes = IOSurfaceGetBytesPerRow(root->_iosurface) * IOSurfaceGetHeight(root->_iosurface);
+
+        if (IOSurfaceLock(root->_iosurface, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {
+            uint8_t *b = malloc(bytes);
+
+            if (b != NULL) memcpy(b, IOSurfaceGetBaseAddress(root->_iosurface), bytes);
+            IOSurfaceUnlock(root->_iosurface, kIOSurfaceLockReadOnly, NULL);
+            root->_shadowBase = b;
+        }
+    }
+    if ([(HakiosMetalCommandBuffer *)cb hakiosAddWriteBack:root blit:YES]) {
+        [root hakiosShadowUse:cb writer:YES];   /* HM_SHADOW_WAIT: a writer until its write-back has run */
+    }
+    return YES;
+}
+
+/* replaceRegion on a SHADOW copy: the caller's rows into the surface too (and the copy's base, so a later write-back
+ * does not take them for GPU drawing); 2D level 0 of an uncompressed format of the copy's own pixel size */
+- (void)hmwbPutRegion:(MTLRegion)region level:(NSUInteger)level bytes:(const void *)bytes bytesPerRow:(NSUInteger)bytesPerRow
+{
+    HakiosMetalTexture *root = hm_blit_wb() ? [self hmwbRoot] : nil;
+
+    if (root == nil || bytes == NULL || level + (_parent != nil ? _parentLevel : 0) != 0 || root->_ycbcr != 0 || root->_ycbcrNative) return;
+    IOSurfaceRef s = root->_iosurface;
+    const unsigned bpp = hakios_metal_texture_bytes_per_pixel(root->_texture), fmt = hakios_metal_texture_format(root->_texture);
+    const size_t bpr = IOSurfaceGetBytesPerRow(s);
+
+    if (bpp == 0 || (fmt >= 130 && fmt <= 236) || hakios_metal_texture_bytes_per_pixel(_texture) != bpp ||
+        region.origin.x + region.size.width > IOSurfaceGetWidth(s) || region.origin.y + region.size.height > IOSurfaceGetHeight(s) ||
+        (region.origin.x + region.size.width) * bpp > bpr || bytesPerRow < region.size.width * bpp) {
+        HM_ONCE("replaceRegion wb: a region of a surface's copy is not written into the surface (format %u, %u bytes a pixel)\n", fmt, bpp);
+        return;
+    }
+    if (IOSurfaceLock(s, 0, NULL) != kIOReturnSuccess) return;
+    uint8_t *surface = IOSurfaceGetBaseAddress(s);
+
+    for (NSUInteger y = 0; y < region.size.height; y++) {
+        const size_t at = (region.origin.y + y) * bpr + region.origin.x * bpp;
+        const uint8_t *row = (const uint8_t *)bytes + y * bytesPerRow;
+
+        memcpy(surface + at, row, region.size.width * bpp);
+        if (root->_shadowBase != NULL) memcpy(root->_shadowBase + at, row, region.size.width * bpp);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+    root->_shadowSeed = IOSurfaceGetSeed(s);
+    __sync_fetch_and_add(&hm_wb_put, 1);
+    if (hm_dd_on()) {
+        hm_print("dd: replaceRegion wb: surface %u %lux%lu at (%lu, %lu) of %lux%lu fmt %s, seed now %u\n", IOSurfaceGetID(s),
+                 (unsigned long)region.size.width, (unsigned long)region.size.height, (unsigned long)region.origin.x, (unsigned long)region.origin.y,
+                 (unsigned long)IOSurfaceGetWidth(s), (unsigned long)IOSurfaceGetHeight(s), [hm_dd_fourcc(IOSurfaceGetPixelFormat(s)) UTF8String],
+                 IOSurfaceGetSeed(s));
+    }
+}
+
+/* a blit target's write-back has run (or was deferred to a later writer's, which carries it): counted, and with HM_DD
+ * one line, the surface's own memory probed after it */
+- (void)hmwbNoteBlitWriteBack:(id)cb deferred:(BOOL)deferred seed:(uint32_t)seed ms:(double)ms
+{
+    static long lines;
+
+    __sync_fetch_and_add(deferred ? &hm_wb_blit_deferred : &hm_wb_blit, 1);
+    if (!hm_dd_on() || _iosurface == NULL || lines >= hm_dd_env("HM_DD_MAX_WB", 200)) return;
+    lines++;
+    hm_print("dd: blit wb: surface %u %lux%lu fmt %s (texture fmt %lu, rows %lu) seed %u -> %u, %.2f ms, buffer %p%s; surface probe %s\n",
+             IOSurfaceGetID(_iosurface), (unsigned long)IOSurfaceGetWidth(_iosurface), (unsigned long)IOSurfaceGetHeight(_iosurface),
+             [hm_dd_fourcc(IOSurfaceGetPixelFormat(_iosurface)) UTF8String], (unsigned long)[self pixelFormat],
+             (unsigned long)IOSurfaceGetBytesPerRow(_iosurface), seed, IOSurfaceGetSeed(_iosurface), ms, (void *)cb,
+             deferred ? " DEFERRED to a later writer's write-back" : "", [hm_wb_surface_probe(_iosurface) UTF8String]);
+}
+@end
+''')
+
+HM_BLIT_WB_CB = _tabs(r'''
+/* (ws-hm-alib) HM_BLIT_WB / HM_WB_SYNC: a SHADOW copy's write-back into its surface, run on the completing thread before
+ * this buffer's shared events are signalled and before its completed handlers are delivered (on the daemon's completion
+ * queue or here): -waitUntilCompleted, every handler and a waiter on an event see the surface's new rows. A blit target
+ * is listed once a buffer (NO: already listed); a pass's or a kernel's once a binding, as their handlers were. */
+- (BOOL)hakiosAddWriteBack:(id)texture blit:(BOOL)blit
+{
+    NSArray *entry = [NSArray arrayWithObjects:texture, [NSNumber numberWithBool:blit], nil];
+
+    @synchronized (self) {
+        if (hakios_metal_cb_status(_cb) < HAKIOS_METAL_COMPLETED) {
+            if (_writeBacks == nil) _writeBacks = [[NSMutableArray alloc] init];
+            if (blit) {
+                for (NSArray *e in _writeBacks) {
+                    if ([e objectAtIndex:0] == texture && [[e objectAtIndex:1] boolValue]) return NO;
+                }
+            }
+            [_writeBacks addObject:entry];
+            return YES;
+        }
+    }
+    [self hakiosRunWriteBack:entry];   /* (completed already: at once, as a late completed handler is) */
+    return YES;
+}
+
+- (void)hakiosRunWriteBack:(NSArray *)entry
+{
+    HakiosMetalTexture *t = [entry objectAtIndex:0];
+    const BOOL blit = [[entry objectAtIndex:1] boolValue];
+    const long d0 = hm_shadow_wb_deferred;
+    const uint32_t seed = [t iosurface] != NULL ? IOSurfaceGetSeed([t iosurface]) : 0;
+    const double began = hm_now();
+
+    [t hakiosWriteBackShadowFrom:self];
+    __sync_fetch_and_add(&hm_wb_sync_runs, 1);
+    if (blit) [t hmwbNoteBlitWriteBack:self deferred:hm_shadow_wb_deferred != d0 seed:seed ms:(hm_now() - began) * 1e3];
+}
+
+- (void)hakiosRunWriteBacks
+{
+    NSArray *list;
+
+    @synchronized (self) {
+        list = _writeBacks;
+        _writeBacks = nil;
+    }
+    for (NSArray *e in list) [self hakiosRunWriteBack:e];
+    [list release];
+}
+''')
+
+HM_BLIT_WB_EDITS = [
+    ('static void\nhm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)\n{\n',
+     HM_BLIT_WB_HELPERS + 'static void\nhm_prof_note(hakios_metal_cb *cb, double gpu, BOOL present)\n{\n'),
+    ('\t\tqsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);\n',
+     HM_BLIT_WB_PROF + '\t\tqsort(hm_prof.cls, HM_PROF_CLASSES, sizeof(hm_prof.cls[0]), hm_prof_cmp);\n'),
+    ('\tuint8_t *_shadowBase;',
+     '\tBOOL _blitWritten;                  /* (ws-hm-alib) HM_BLIT_WB: a blit wrote this copy: a base kept, written back as a writer\'s */\n'
+     '\tuint8_t *_shadowBase;'),
+    ('- (unsigned)hakiosStorageKind;   /* metal_fps=timeline: 0 a surface\'s, else 1 + its storage mode */\n@end\n',
+     '- (unsigned)hakiosStorageKind;   /* metal_fps=timeline: 0 a surface\'s, else 1 + its storage mode */\n@end\n' + HM_BLIT_WB_IFACE),
+    ('\tNSMutableArray *_turned;',
+     '\tNSMutableArray *_writeBacks;             /* (ws-hm-alib) { SHADOW texture, blit? }: written back at completion, before events and handlers */\n'
+     '\tNSMutableArray *_turned;'),
+    ('- (BOOL)hakiosCommitted;   /* (redfin hmv12) */\n',
+     '- (BOOL)hakiosCommitted;   /* (redfin hmv12) */\n- (BOOL)hakiosAddWriteBack:(id)texture blit:(BOOL)blit;   /* (ws-hm-alib) HM_BLIT_WB */\n'),
+    ('- (BOOL)hakiosIsShadow { return _shadow; }',
+     '- (BOOL)hakiosIsShadow { return _shadow || (_parent != nil && hm_blit_wb() && [_parent hakiosIsShadow]); }   /* (ws-hm-alib) a view of a copy too */'),
+    ('(_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) == 0) {',
+     '((_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) == 0 && !_blitWritten)) {   /* (ws-hm-alib) */'),
+    ('\t\tif ((_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0) {\n\t\t\tconst size_t bytes',
+     '\t\tif ((_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0 || _blitWritten) {   /* (ws-hm-alib) */\n\t\t\tconst size_t bytes'),
+    ('(_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0 ||\n\t\t    _shadowFrame',
+     '(_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0 || _blitWritten ||\n\t\t    _shadowFrame'),
+    ('\t[s appendFormat:@"; writer: %s; probe %@", wr, hm_dd_probe(_texture)];\n\treturn s;\n}\n@end\n',
+     '\t[s appendFormat:@"; writer: %s; probe %@", wr, hm_dd_probe(_texture)];\n\treturn s;\n}\n@end\n' + HM_BLIT_WB_IMPL),
+    ('\tif (hakios_metal_texture_replace_level(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,\n'
+     '\t\t\t\t\t       (unsigned)region.size.width, (unsigned)region.size.height, bytes, bytesPerRow) != 0) {\n',
+     '\tconst BOOL hmwbOk = hakios_metal_texture_replace_level(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,\n'
+     '\t\t\t\t\t       (unsigned)region.size.width, (unsigned)region.size.height, bytes, bytesPerRow) == 0;\n'
+     '\tif (hmwbOk) [self hmwbPutRegion:region level:level bytes:bytes bytesPerRow:bytesPerRow];   /* (ws-hm-alib) HM_BLIT_WB */\n'
+     '\tif (!hmwbOk) {\n'),
+    ('\t[_turned release];\n\t[_waits release];\n',
+     '\t[_turned release];\n\t[_waits release];\n\t[_writeBacks release];   /* (ws-hm-alib) */\n'),
+    ('- (BOOL)hakiosCommitted { return _committed; }   /* (redfin hmv12) a held commit too, before its send */\n',
+     '- (BOOL)hakiosCommitted { return _committed; }   /* (redfin hmv12) a held commit too, before its send */\n' + HM_BLIT_WB_CB),
+    ('\t/* the events this buffer signals, now that its work is done: before its handlers, which may read them */\n',
+     '\t[self hakiosRunWriteBacks];   /* (ws-hm-alib) HM_BLIT_WB / HM_WB_SYNC: surfaces written before events and handlers */\n'
+     '\t/* the events this buffer signals, now that its work is done: before its handlers, which may read them */\n'),
+    ('\t\t{\n\t\t\tHakiosMetalTexture *drawn = [(HakiosMetalTexture *)t retain];\n',
+     '\t\tif (hm_wb_sync()) {   /* (ws-hm-alib) HM_WB_SYNC */\n'
+     '\t\t\t[(HakiosMetalCommandBuffer *)cb hakiosAddWriteBack:t blit:NO];\n'
+     '\t\t} else {\n\t\t\tHakiosMetalTexture *drawn = [(HakiosMetalTexture *)t retain];\n'),
+    ('\t\tHakiosMetalTexture *written = [(HakiosMetalTexture *)texture retain];\n'
+     '\t\t[_commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {\n'
+     '\t\t\t(void)cb;\n\t\t\t[written hakiosWriteBackShadowFrom:cb];   /* (redfin hmv12) */\n\t\t\t[written release];\n\t\t}];\n',
+     '\t\tif (hm_wb_sync()) {   /* (ws-hm-alib) HM_WB_SYNC */\n'
+     '\t\t\t[(HakiosMetalCommandBuffer *)_commandBuffer hakiosAddWriteBack:texture blit:NO];\n'
+     '\t\t} else {\n'
+     '\t\tHakiosMetalTexture *written = [(HakiosMetalTexture *)texture retain];\n'
+     '\t\t[_commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {\n'
+     '\t\t\t(void)cb;\n\t\t\t[written hakiosWriteBackShadowFrom:cb];   /* (redfin hmv12) */\n\t\t\t[written release];\n\t\t}];\n'
+     '\t\t}\n'),
+    ('\tif (hakios_metal_cb_blit(cb, from, (unsigned)sourceLevel, (unsigned)sourceOrigin.x, (unsigned)sourceOrigin.y, (unsigned)sourceSize.width,\n',
+     '\t[(HakiosMetalTexture *)sourceTexture hmwbBlitRead:_commandBuffer];   /* (ws-hm-alib) HM_BLIT_WB */\n'
+     '\t[(HakiosMetalTexture *)destinationTexture hmwbBlitWrite:_commandBuffer level:destinationLevel];\n'
+     '\tif (hakios_metal_cb_blit(cb, from, (unsigned)sourceLevel, (unsigned)sourceOrigin.x, (unsigned)sourceOrigin.y, (unsigned)sourceSize.width,\n'),
+    ('\tif (to == NULL) {\n\t\treturn;\n\t}\n\t/* a layer of an array or cube',
+     '\tif (to == NULL) {\n\t\treturn;\n\t}\n'
+     '\t[(HakiosMetalTexture *)destinationTexture hmwbBlitWrite:_commandBuffer level:destinationLevel];   /* (ws-hm-alib) HM_BLIT_WB */\n'
+     '\t/* a layer of an array or cube'),
+    ('\tif (from == NULL) {\n\t\treturn;\n\t}\n\tif (to == NULL) {\n\t\thakios_metal_cb_refuse(cb, "a texture-to-buffer copy',
+     '\tif (from == NULL) {\n\t\treturn;\n\t}\n'
+     '\t[(HakiosMetalTexture *)sourceTexture hmwbBlitRead:_commandBuffer];   /* (ws-hm-alib) HM_BLIT_WB */\n'
+     '\tif (to == NULL) {\n\t\thakios_metal_cb_refuse(cb, "a texture-to-buffer copy'),
+    ('\tif (t != NULL && hakios_metal_cb_generate_mipmaps(cb, t) != 0) {\n',
+     '\tif (t != NULL) {   /* (ws-hm-alib) HM_BLIT_WB: level 0 is read; the levels written are none of a surface\'s */\n'
+     '\t\t[(HakiosMetalTexture *)texture hmwbBlitRead:_commandBuffer];\n\t}\n'
+     '\tif (t != NULL && hakios_metal_cb_generate_mipmaps(cb, t) != 0) {\n'),
+]
+
+EDITS += HM_BLIT_WB_EDITS   # (ws-hm-alib) HM_BLIT_WB
+
+
 def apply(src, edits=EDITS):
     for e in edits:
         if len(e) == 2:
