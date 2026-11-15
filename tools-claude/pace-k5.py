@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """pace-k5.py KLOG [RUN]: xnu 1114 pacing ring (SWEET PACE: f lines from kern.sweet_pace_dump=1) per fpsbench phase.
 
+xnu 1118 (ws-int-k6+) prints each frame as four lines 'SWEET PACE: f1'..'f4' (each under the kernel log's 255-byte
+cut), all starting '<latch s.ms> id <id>'; they are joined by (latch, id) into the 1114 record, wherever other lines
+fall in between. 1114's single 'SWEET PACE: f' lines are still read (whole ones only; for the cut ones on
+ws-int-k5 use logs/hmetal/k5-1115/pace-k5t.py). Frames missing a part are counted and skipped.
+
 Each frame line carries its latch time; phases come from the SWEET PHASE lines (fpsbench "p phase NAME"), touches
 from SWEET HID: touch N down/up. Per phase: slow (3+ vsync) frames split into
   cadence  no touch down and lifted > 300 ms before SwapBegin, GPU < 1 ms, 7+ vsyncs (the ~89 ms idle bursts)
@@ -26,6 +31,20 @@ F = re.compile(r'SWEET PACE: f ([\d.]+) id (\d+) v (\d+) \| idle ([\d.]+) sub ([
                r'(\S+) wait ([\d.]+) cpu (\d+) cls (\d+) pend-at-tick (\d+) \| disp run ([\d.]+)/([\d.]+) wait '
                r'([\d.]+)/([\d.]+) \| rs run ([\d.]+)/([\d.]+) wait ([\d.]+)/([\d.]+) \| sb run ([\d.]+)/([\d.]+) '
                r'wait ([\d.]+)/([\d.]+) \| touch down (\d+) up (\d+) ev (\d+) n (\d+) \| ahead (\d+) subs (\d+)')
+# 1118: the same fields in four lines (F1 v + stages, F2 tick classes + swapper, F3 run/wait, F4 touch + ahead/subs)
+P = r'([\d.]+) id (\d+)'
+F1 = re.compile(r'SWEET PACE: f1 ' + P + r' v (\d+) \| idle ([\d.]+) sub ([\d.]+) gate ([\d.]+) gpu ([\d.]+) '
+                r'done->latch ([\d.]+) \(wait ([\d.]+) flip->latch ([\d.]+)\)')
+F2 = re.compile(r'SWEET PACE: f2 ' + P + r' \| ticks (\d+) swap-gap busy (\d+) none (\d+) ok (\d+) pend (\d+) off (\d+) '
+                r'polls (\d+)/(\d+) busy \| tick->begin ([\d.]+) on-core (\S+) wait ([\d.]+) cpu (\d+) cls (\d+) '
+                r'pend-at-tick (\d+)')
+F3 = re.compile(r'SWEET PACE: f3 ' + P + r' \| disp run ([\d.]+)/([\d.]+) wait ([\d.]+)/([\d.]+) \| rs run '
+                r'([\d.]+)/([\d.]+) wait ([\d.]+)/([\d.]+) \| sb run ([\d.]+)/([\d.]+) wait ([\d.]+)/([\d.]+)')
+F4 = re.compile(r'SWEET PACE: f4 ' + P + r' \| touch down (\d+) up (\d+) ev (\d+) n (\d+) \| ahead (\d+) subs (\d+)')
+PARTS = [(F1, ['v', 'idle', 'sub', 'gate', 'gpu', 'dl', 'wait', 'fl']),
+         (F2, ['ticks', 'busy', 'none', 'ok', 'pend', 'off', 'polls', 'pbusy', 'tb', 'oc', 'cw', 'cpu', 'cls', 'pat']),
+         (F3, ['drb', 'drl', 'dwb', 'dwl', 'rrb', 'rrl', 'rwb', 'rwl', 'srb', 'srl', 'swb', 'swl']),
+         (F4, ['down', 'up', 'ev', 'evn', 'ahead', 'subs'])]
 K = ['t', 'id', 'v', 'idle', 'sub', 'gate', 'gpu', 'dl', 'wait', 'fl', 'ticks', 'busy', 'none', 'ok', 'pend', 'off',
      'polls', 'pbusy', 'tb', 'oc', 'cw', 'cpu', 'cls', 'pat', 'drb', 'drl', 'dwb', 'dwl', 'rrb', 'rrl', 'rwb', 'rwl',
      'srb', 'srl', 'swb', 'swl', 'down', 'up', 'ev', 'evn', 'ahead', 'subs']
@@ -47,6 +66,7 @@ def main():
     else:
         lo, hi = 0.0, 1e12
     ph, fr, five = [], [], []
+    parts = collections.defaultdict(dict)       # 1118: (t, id) -> fields from f1..f4
     for l in L:
         m = re.match(r'\[\s*([\d.]+)\]', l)
         t = float(m.group(1)) if m else None
@@ -61,8 +81,25 @@ def main():
                 d[name] = v if name == 'oc' else float(v)
             if lo <= d['t'] <= hi:
                 fr.append(d)
+        for rx, names in PARTS:
+            for m in rx.finditer(l):
+                d = parts[(m.group(1), m.group(2))]
+                d['t'], d['id'] = float(m.group(1)), float(m.group(2))
+                for i, name in enumerate(names):
+                    v = m.group(i + 3)
+                    d[name] = v if name == 'oc' else float(v)
         if 'SWEET PACE: 5s ticks' in l and t is not None and lo <= t <= hi:
             five.append((t, l.split('SWEET PACE: ')[1]))
+
+    partial = 0
+    for d in parts.values():
+        if all(name in d for name in K):
+            if lo <= d['t'] <= hi:
+                fr.append(d)
+        else:
+            partial += 1
+    if parts:
+        print(f"1118 split records: {len(parts) - partial} joined, {partial} incomplete (skipped)")
 
     def phase(t):
         p = 'pre'
