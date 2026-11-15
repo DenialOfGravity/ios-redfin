@@ -14,4 +14,6 @@ void abpbridge_poll(void);		/* from wland's idle loop */
 void abpbridge_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port);	/* NEW_SERVER */
 void abpbridge_server_gone(uint32_t node, uint32_t port);				/* DEL_SERVER / BYE */
 void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n);		/* DATA to ABP_PORT0.. */
+/* loc.c: an indication (svc, msg, TLVs) to one CommCenter client; 0 sent, -1 no live session/client */
+int abpbridge_send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn);
 #endif

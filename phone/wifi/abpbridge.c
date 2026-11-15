@@ -84,6 +84,7 @@
 #include <sys/sysctl.h>
 #include "abpbridge.h"
 #include "cell.h"
+#include "loc.h"
 #include "link.h"
 #include "qmi.h"
 
@@ -1332,6 +1333,7 @@ static void sess_end(uint32_t pipe, uint32_t sess)
 		if (st[i].sess == sess && st[i].pipe == pipe)
 			memset(&st[i], 0, sizeof(st[i]));
 	cl_free_sess(pipe, sess, "session closed");
+	loc_pds_session_gone(pipe, sess);	/* loc.c: locationd's PDS client went with the session */
 }
 
 static int cid_alloc(unsigned svc)
@@ -2029,6 +2031,24 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 		svc_local(pipe, svc, cid, s, 1, err_code);
 		return;
 	}
+	if (svc == 0x06 && loc_pds_on()) {	/* loc.on pds=1: locationd's PDS session requests go to the LOC bridge (loc.c) */
+		int pf = 0, pc = 0;
+		const uint8_t *ptl = NULL;
+		uint16_t ptn = 0;
+		const char *pw = "";
+		if (loc_pds_request(pipe, cur_sess, cid, s, sn, &pf, &pc, &ptl, &ptn, &pw)) {
+			note_seen(svc, msg, "pdsemu", pw);
+			struct mst *mp = mst_get(svc, msg);
+			if (mp) {
+				mp->count++;
+				mp->act = ACT_RESP;
+				mst_dirty = 1;
+			}
+			cnt.local_ok++;
+			svc_local_tlv(pipe, svc, cid, s, pf, pc, ptl, ptn);
+			return;
+		}
+	}
 	int code;
 	const char *why;
 	char wb[128];
@@ -2548,4 +2568,13 @@ void abpbridge_poll(void)
 			off += (uint32_t)sizeof(h) + h.len;
 		}
 	}
+}
+
+/* loc.c (pds=1): an indication for one CommCenter client; 0 = sent, -1 = no such live session/client (dropped) */
+int abpbridge_send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn)
+{
+	if (fd < 0 || mode < 2 || pipe >= NPIPES || !sess_live(pipe, sess) || !cid_live(pipe, sess, svc, cid))
+		return -1;
+	send_ind(pipe, sess, svc, cid, msg, tl, tn);
+	return 0;
 }

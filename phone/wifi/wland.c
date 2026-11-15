@@ -48,6 +48,7 @@
 #include "bridge.h"
 #include "abpbridge.h"
 #include "cell.h"
+#include "loc.h"
 #include "ssctl.h"
 #include "ipa.h"
 #include "ipaqmi.h"
@@ -792,6 +793,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			cell_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port == LOC_PORT) {
+			loc_handle(h, d, n);	/* only with /var/local/loc.on (loc.c) */
+			return;
+		}
 		if (h->dst_port == SSCTL_PORT) {
 			ssctl_handle(h, d, n);	/* ssctladsp=1 in cell.on (ssctl.c) */
 			return;
@@ -825,16 +830,19 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		if (w[1] == WLFW_SERVICE)
 			wlfw_new_server(w[3], w[4]);
 		cell_server(w[1], w[2], w[3], w[4]);
+		loc_server(w[1], w[2], w[3], w[4]);
 		ssctl_server(w[1], w[2], w[3], w[4]);
 		ipaqmi_server(w[1], w[2], w[3], w[4]);
 		abpbridge_server(w[1], w[2], w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_DEL_SERVER) {
 		cell_server_gone(w[3], w[4]);
+		loc_server_gone(w[3], w[4]);
 		ssctl_server_gone(w[3], w[4]);
 		ipaqmi_server_gone(w[3], w[4]);
 		abpbridge_server_gone(w[3], w[4]);
 	} else if (w[0] == QRTR_TYPE_BYE) {
 		cell_server_gone(h->src_node, 0xffffffffu);
+		loc_server_gone(h->src_node, 0xffffffffu);
 		ssctl_server_gone(h->src_node, 0xffffffffu);
 		ipaqmi_server_gone(h->src_node, 0xffffffffu);
 		abpbridge_server_gone(h->src_node, 0xffffffffu);
@@ -980,6 +988,7 @@ static void net_idle(void)
 	join_poll();
 	ipa_auto_poll();	/* before cell_poll: its holds are in place before cell's first PIN verify could go */
 	cell_poll();	/* read-only modem status, only with /var/local/cell.on (cell.c) */
+	loc_poll();	/* QMI LOC client + locationd PDS bridge, only with /var/local/loc.on (loc.c) */
 	ssctl_poll();	/* SSCTL adsp after-powerup to the modem, only with ssctladsp=1 in cell.on (ssctl.c) */
 	ipaqmi_poll();	/* the AP IPA QMI service, only with ipaqmi=1/2 in cell.on (ipaqmi.c) */
 	ipagsi_poll();	/* the IPA/GSI data path and its utun, only after cell.c started it (ipagsi.c) */
@@ -1631,7 +1640,7 @@ static int auto_up(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: wland smem | smp2p | cell | ipa show|init-driver | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
+		fprintf(stderr, "usage: wland smem | smp2p | cell | loc | ipa show|init-driver | vote RES LVL | levels RES | boot | sysctl NAME [VALUE]\n");
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);	/* a stalled bus access must not swallow the output */
@@ -1655,6 +1664,8 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(argv[1], "cell"))
 		return cell_print();	/* the last read-only modem status line (cell.c; needs /var/local/cell.on) */
+	if (!strcmp(argv[1], "loc"))
+		return loc_print();	/* GNSS / PDS bridge status (loc.c; needs /var/local/loc.on) */
 	if (!strcmp(argv[1], "ipa") && argc > 2 && (!strcmp(argv[2], "show") || !strcmp(argv[2], "init-driver")))
 		return ipaqmi_cmd(argc, argv);	/* INIT_DRIVER bytes / one INIT_DRIVER via the running wland (ipaqmi.c) */
 	pm_init();
