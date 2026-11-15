@@ -530,6 +530,24 @@ to_wland(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 }
 
+/* 1122: a DATA packet from the kernel (node 1) to wland's port, through wland's read queue only (never the modem) */
+int
+sbb_wland_data(uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len)
+{
+	struct sbb_qrtr_hdr h = { 1, SBB_QRTR_DATA, SBB_NODE_APPS, src_port, 0, len, SBB_NODE_APPS, dst_port };
+	if (!dev.open) {
+		return -1;
+	}
+	to_wland(&h, (const uint8_t *)data, len);
+	return 0;
+}
+
+bool
+sbb_wland_open(void)
+{
+	return dev.open;
+}
+
 static void
 to_router(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
 {
@@ -1287,7 +1305,10 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
 		}
 		e = uiomove((caddr_t)b, (int)rest, uio);
 	}
-	if (e == 0) {
+	if (e == 0 && (sweet_bb & SBB_QMUX) && h.type == SBB_QRTR_DATA && h.dst_node == SBB_NODE_APPS &&
+	    h.dst_port == SBB_PDSR_PORT) {
+		sweet_qmux_c2w(0, h.src_port, SBB_PDSR_C2W, b, len);    /* 1122: wland's PDS relay records, kept in the kernel */
+	} else if (e == 0) {
 		e = qrtr_send_hdr(&h, b, len);
 	}
 	if (b) {

@@ -224,6 +224,8 @@ static struct qbig {
 static int nmst, mst_dirty, nhold;
 
 static uint32_t cur_pipe, cur_sess;
+static void pdsr_gone(uint32_t pipe, uint32_t sess, const char *why);   /* 1122 */
+static void pdsr_cid(int alloc, unsigned cid);                          /* 1122 */
 static unsigned nframes_in, nframes_out, nseen;
 static struct { uint8_t svc; uint16_t msg; } seen[1024];
 static struct {
@@ -2014,6 +2016,7 @@ sess_end(uint32_t pipe, uint32_t sess)
 		}
 	}
 	cl_free_sess(pipe, sess, "session closed");
+	pdsr_gone(pipe, sess, "session closed");        /* 1122 */
 }
 
 static int
@@ -2078,6 +2081,9 @@ ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 		if (t == 0x01 && msg == 0x23 && l >= 2 && i + 3 + l <= tn) {
 			unsigned sv = tl[i + 3], c = tl[i + 4];
 			sess_cids(cur_pipe, cur_sess)[sv][c / 8] &= (uint8_t) ~(1u << (c % 8));
+			if (sv == 0x06) {
+				pdsr_cid(0, c);                 /* 1122 */
+			}
 			struct cl *k = cl_get(cur_pipe, cur_sess, sv, c, 0);
 			if (k) {
 				cl_free(k, "ReleaseClientId");
@@ -2108,6 +2114,9 @@ ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 			put_tlv(b, &o, 0x02, res, 4);
 			uint8_t v[2] = { (uint8_t)req_svc, (uint8_t)c };
 			put_tlv(b, &o, 0x01, v, 2);
+			if (req_svc == 0x06) {
+				pdsr_cid(1, (unsigned)c);       /* 1122 */
+			}
 		}
 	} else if (msg == 0x23) {
 		put_tlv(b, &o, 0x02, res, 4);
@@ -4409,7 +4418,299 @@ data_stats(char *buf, size_t len)
 static bool
 d_port_reserved(uint32_t port)
 {
-	return D != NULL && (port == D_PROF_PORT || port == D_WDA_PORT);
+	return port == SBB_PDSR_PORT || (D != NULL && (port == D_PROF_PORT || port == D_WDA_PORT));  /* 1122: PDSR always */
+}
+
+/*
+ * ---- 1122: PDS relay to wland (kern.sweet_qmux_pds; logs/research/gnss-plan-2026-11-15.md "Important for testing") ----
+ * The modem has no PDS (0x06): locationd's PDS requests are answered here by the policy (RESET ok, VERSION/STATE resp,
+ * the rest ok). wland's pdsemu.c (ws-gnss-c, word pds=1 in /var/local/loc.on) speaks PDS to locationd and LOC to the
+ * modem, but on the kernel router it never sees PDS. With kern.sweet_qmux_pds 1 every PDS request of every CommCenter
+ * client goes to wland, and wland's answer (or "not mine") comes back; wland's EVENT_REPORT indications go to the client.
+ * Channel: QRTR DATA on /dev/sweet-mqrtr between wland's port and node 1 port SBB_PDSR_PORT (sweet_bb.c keeps those packets
+ * in the kernel; nothing of it reaches the modem). Record: struct pdsr (24 bytes, LE) + data:
+ *   wland -> kernel: 1 HELLO (every 10 s while pds=1; alive 30 s), 2 RESP tag (flags 1 handled, 2 QMI failure; code = QMI
+ *     error; data = result TLVs after 0x02), 3 IND pipe/sess/cid, code = msg id, data = TLVs, 4 BYE.
+ *   kernel -> wland: 0x81 REQ pipe/sess/cid/tag, data = the SDU (flags, txn, msg, len, TLVs as abpbridge hands it),
+ *     0x82 GONE pipe/sess (session closed, or an indication for a client that is gone), 0x83 CID (flags 1 GetClientId,
+ *     0 ReleaseClientId of PDS: cid), 0x84 HELLO answer (flags = kern.sweet_qmux_pds).
+ * Fallback = today's answers exactly: the request frame is kept and handled by the policy when wland is not there (no
+ * HELLO in 30 s, /dev/sweet-mqrtr closed), says "not mine", or does not answer in kern.sweet_qmux_pds_ms (default 400);
+ * 3 timeouts in a row = wland treated as gone until its next HELLO. Late answers are dropped. Default 0: no relay at
+ * all, wland's HELLO is only answered (flags 0). PDS is never forwarded to the modem.
+ */
+#define PDSR_MAGIC      0x52534450u     /* 'PDSR' */
+#define NPDSR           32
+struct pdsr {
+	uint32_t magic;
+	uint8_t  op, cid;
+	uint16_t flags;
+	uint32_t pipe, sess, tag;
+	uint16_t code, len;
+};
+static int pds_relay = 0, pds_relay_ms = 400;
+static struct {
+	uint32_t port;                          /* wland's QRTR port (0 = not there) */
+	uint64_t hello;
+	int fails;
+	uint32_t reqs, resp, unhandled, timeouts, local, inds, inds_drop, late, said;
+} pr;
+static struct {
+	int used;
+	uint32_t tag, pipe, sess, n;
+	uint64_t t;
+	uint8_t *f;
+} prp[NPDSR];
+static uint32_t pr_tag;
+static int pdsr_bypass;
+static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n);
+
+static int
+pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag, unsigned code,
+    const uint8_t *data, uint32_t len)
+{
+	if (pr.port == 0 || len > 8192) {
+		return -1;
+	}
+	uint8_t *b = kalloc_data(sizeof(struct pdsr) + len, Z_WAITOK);
+	if (b == NULL) {
+		return -1;
+	}
+	struct pdsr h = { PDSR_MAGIC, op, (uint8_t)cid, (uint16_t)flags, pipe, sess, tag, (uint16_t)code, (uint16_t)len };
+	memcpy(b, &h, sizeof(h));
+	if (len) {
+		memcpy(b + sizeof(h), data, len);
+	}
+	int e = sbb_wland_data(SBB_PDSR_PORT, pr.port, b, (uint32_t)sizeof(h) + len);
+	kfree_data(b, sizeof(struct pdsr) + len);
+	return e;
+}
+
+static bool
+pdsr_live(uint64_t now)
+{
+	return pds_relay == 1 && pr.port != 0 && sbb_wland_open() && now - pr.hello < 30000;
+}
+
+static void
+pdsr_free(int i)
+{
+	if (prp[i].f) {
+		kfree_data(prp[i].f, prp[i].n);
+	}
+	bzero(&prp[i], sizeof(prp[i]));
+}
+
+/* the request frame through the policy, as without the relay */
+static void
+pdsr_local(int i, const char *why)
+{
+	uint32_t pipe = prp[i].pipe, sess = prp[i].sess, n = prp[i].n;
+	uint8_t *f = prp[i].f;
+	prp[i].f = NULL;
+	pdsr_free(i);
+	pr.local++;
+	if (f == NULL) {
+		return;
+	}
+	if (sess_live(pipe, sess)) {
+		if (pr.local <= 20) {
+			LOG("PDS relay: msg 0x%04x of %s/%u answered here (%s)\n", n >= 13 ? (unsigned)(f[9] | (f[10] << 8)) : 0,
+			    pipe < NPIPES ? pipe_name[pipe] : "?", sess, why);
+		}
+		pdsr_bypass = 1;
+		handle(pipe, sess, 0, f, n);
+		pdsr_bypass = 0;
+	}
+	kfree_data(f, n);
+}
+
+/* handle(): a PDS request; 1 = sent to wland (answered later), 0 = answer it here as before */
+static int
+pdsr_relay(unsigned pipe, uint32_t sess, unsigned cid, unsigned msg, const uint8_t *d, uint32_t n, const uint8_t *s,
+    uint32_t sn)
+{
+	uint64_t now = sbb_ms();
+	if (pdsr_bypass || !pdsr_live(now)) {
+		return 0;
+	}
+	int k = -1;
+	for (int i = 0; i < NPDSR && k < 0; i++) {
+		if (!prp[i].used) {
+			k = i;
+		}
+	}
+	uint8_t *f = k < 0 ? NULL : kalloc_data(n, Z_WAITOK);
+	if (f == NULL) {
+		return 0;
+	}
+	memcpy(f, d, n);
+	uint32_t tag = ++pr_tag ? pr_tag : ++pr_tag;
+	if (pdsr_send(0x81, cid, 0, pipe, sess, tag, 0, s, sn) != 0) {
+		kfree_data(f, n);
+		return 0;
+	}
+	prp[k].used = 1;
+	prp[k].tag = tag;
+	prp[k].pipe = pipe;
+	prp[k].sess = sess;
+	prp[k].n = n;
+	prp[k].t = now;
+	prp[k].f = f;
+	pr.reqs++;
+	note_seen(0x06, msg, "wland", "1122: PDS relayed to wland (kern.sweet_qmux_pds 1)");
+	return 1;
+}
+
+static void
+pdsr_drop_all(const char *why)
+{
+	for (int i = 0; i < NPDSR; i++) {
+		if (prp[i].used) {
+			pdsr_local(i, why);
+		}
+	}
+}
+
+static void
+pdsr_gone(uint32_t pipe, uint32_t sess, const char *why)
+{
+	for (int i = 0; i < NPDSR; i++) {
+		if (prp[i].used && prp[i].pipe == pipe && prp[i].sess == sess) {
+			pdsr_free(i);           /* the client went: nothing to answer */
+		}
+	}
+	if (pr.port != 0 && pds_relay == 1) {
+		(void)pdsr_send(0x82, 0, 0, pipe, sess, 0, 0, (const uint8_t *)why, (uint32_t)strlen(why));
+	}
+}
+
+static void
+pdsr_cid(int alloc, unsigned cid)
+{
+	if (pr.port != 0 && pds_relay == 1) {
+		(void)pdsr_send(0x83, cid, alloc ? 1u : 0u, cur_pipe, cur_sess, 0, 0, NULL, 0);
+	}
+}
+
+/* a record from wland (the router thread, from the c2w queue) */
+static void
+pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
+{
+	struct pdsr h;
+	if (n < sizeof(h)) {
+		return;
+	}
+	memcpy(&h, d, sizeof(h));
+	if (h.magic != PDSR_MAGIC || h.len > n - sizeof(h)) {
+		if (pr.said++ < 10) {
+			LOG("PDS relay: bad record from wland port %#x (%u bytes)\n", port, n);
+		}
+		return;
+	}
+	const uint8_t *data = d + sizeof(h);
+	uint64_t now = sbb_ms();
+	switch (h.op) {
+	case 1:         /* HELLO */
+		if (pr.port != port || now - pr.hello >= 30000 || pr.fails >= 3) {
+			LOG("PDS relay: wland at port %#x (kern.sweet_qmux_pds %d: %s)\n", port, pds_relay,
+			    pds_relay == 1 ? "locationd's PDS goes to wland" : "not used, PDS answered here");
+		}
+		pr.port = port;
+		pr.hello = now;
+		pr.fails = 0;
+		(void)pdsr_send(0x84, 0, (unsigned)pds_relay, 0, 0, 0, 0, NULL, 0);
+		break;
+	case 4:         /* BYE */
+		LOG("PDS relay: wland said bye (%u relayed, %u answered by wland, %u not its own, %u timeouts, %u inds)\n", pr.reqs,
+		    pr.resp, pr.unhandled, pr.timeouts, pr.inds);
+		pr.port = 0;
+		pdsr_drop_all("wland said bye");
+		break;
+	case 2: {       /* RESP */
+		int k = -1;
+		for (int i = 0; i < NPDSR && k < 0; i++) {
+			if (prp[i].used && prp[i].tag == h.tag) {
+				k = i;
+			}
+		}
+		if (k < 0) {
+			if (pr.late++ < 10) {
+				LOG("PDS relay: wland's answer to request %u came late (answered here already)\n", h.tag);
+			}
+			break;
+		}
+		pr.fails = 0;
+		if (!(h.flags & 1)) {
+			pr.unhandled++;
+			pdsr_local(k, "wland: not its message");
+			break;
+		}
+		uint32_t pipe = prp[k].pipe, sess = prp[k].sess;
+		uint8_t *f = prp[k].f;
+		if (f != NULL && prp[k].n >= 13 && sess_live(pipe, sess)) {
+			uint32_t sp = cur_pipe, ss = cur_sess;
+			cur_pipe = pipe;
+			cur_sess = sess;
+			svc_local_tlv(pipe, 0x06, f[5], f + 6, (h.flags & 2) != 0, h.code, h.len ? data : NULL, h.len);
+			cur_pipe = sp;
+			cur_sess = ss;
+			pr.resp++;
+		}
+		pdsr_free(k);
+		break;
+	}
+	case 3:         /* IND */
+		if (pds_relay == 1 && sess_live(h.pipe, h.sess) && cid_live(h.pipe, h.sess, 0x06, h.cid)) {
+			send_ind(h.pipe, h.sess, 0x06, h.cid, h.code, data, h.len);
+			if (pr.inds++ < 3) {
+				LOG("PDS relay: indication 0x%04x from wland to %s/%u cid %u (%u TLV bytes)\n", h.code,
+				    h.pipe < NPIPES ? pipe_name[h.pipe] : "?", h.sess, h.cid, h.len);
+			}
+		} else {
+			pr.inds_drop++;
+			if (pr.port == port) {
+				(void)pdsr_send(0x82, 0, 0, h.pipe, h.sess, 0, 0, (const uint8_t *)"no such client", 14);
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void
+pdsr_poll(uint64_t now)
+{
+	static uint64_t next;
+	static uint32_t last_reqs;
+	for (int i = 0; i < NPDSR; i++) {
+		if (prp[i].used && now > prp[i].t && now - prp[i].t > (uint64_t)(pds_relay_ms > 0 ? pds_relay_ms : 400)) {
+			pr.timeouts++;
+			if (++pr.fails == 3) {
+				LOG("PDS relay: wland did not answer 3 times: PDS answered here until its next HELLO\n");
+			}
+			pdsr_local(i, "wland's answer timed out");
+		}
+	}
+	if (pr.fails >= 3 && pr.port != 0) {
+		pr.port = 0;
+		pdsr_drop_all("wland gone");
+	}
+	if (pds_relay != 1 || (pr.port != 0 && !sbb_wland_open())) {
+		if (pr.port != 0 && !sbb_wland_open()) {
+			pr.port = 0;
+		}
+		pdsr_drop_all("relay off");
+	}
+	if (now >= next) {
+		next = now + 60000;
+		if (pr.reqs != last_reqs) {
+			last_reqs = pr.reqs;
+			LOG("PDS relay: %u relayed, %u answered by wland, %u not its own, %u timeouts, %u answered here, %u inds (%u dropped), "
+			    "%u late\n", pr.reqs, pr.resp, pr.unhandled, pr.timeouts, pr.local, pr.inds, pr.inds_drop, pr.late);
+		}
+	}
 }
 
 /* one record from SweetABP (CommCenter wrote a frame / opened, closed, started, aborted a pipe) */
@@ -4463,6 +4764,9 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
 		dst.local5564++;
 		svc_local(pipe, svc, cid, s, 0, 0);
 		return;
+	}
+	if (svc == 0x06 && pdsr_relay(pipe, sess, cid, msg, d, n, s, sn)) {
+		return;                                         /* 1122: kern.sweet_qmux_pds 1: wland answers (or the timeout) */
 	}
 	int a = decide(svc, msg, s + 7, rl, &code, wb, sizeof(wb));
 	if (a == ACT_FWD && dec_rate >= 0) {
@@ -5275,7 +5579,11 @@ sweet_qmux_poll(void)
 		if (!r) {
 			break;
 		}
-		handle(r->pipe, r->sess, r->type, r->d, r->len);
+		if (r->type == SBB_PDSR_C2W) {
+			pdsr_in(r->sess, r->d, r->len);         /* 1122: from wland (sess = its QRTR port) */
+		} else {
+			handle(r->pipe, r->sess, r->type, r->d, r->len);
+		}
 		kfree_data(r, sizeof(*r) + r->len);
 	}
 	now = sbb_ms();                 /* 1089: the records above stamped pending/held/own entries later than the old now */
@@ -5316,6 +5624,7 @@ sweet_qmux_poll(void)
 	}
 	data_poll(now);                 /* 1080 */
 	voc_poll();                     /* 1093 */
+	pdsr_poll(sbb_ms());            /* 1122 */
 	if (now >= next_stats) {
 		if (next_stats) {
 			int ncl = 0, nidle = 0;
@@ -5428,6 +5737,8 @@ QINT(sweet_qmi_codec_tlv, qmi_codec_tlv, "redfin 1093: that indication's codec T
 QINT(sweet_qmux_kick, kickon, "redfin 1068: 1 = RESUME_TX kick after 5 s without an answer (abpkick, default 1)");
 QINT(sweet_qmux_holdnas, holdnas, "redfin 1068: NAS indications held until BSP activation (abpholdnas: 0 off, 1 = 5 s, >= 100 ms)");
 QINT(sweet_qmux_holddly, holddly, "redfin 1068: ms after the BSP activation indication before held NAS indications go (abpholddly, 500)");
+QINT(sweet_qmux_pds, pds_relay, "redfin 1122: 0 PDS answered here as before (default), 1 relayed to wland (loc.on pds=1) with local fallback");
+QINT(sweet_qmux_pds_ms, pds_relay_ms, "redfin 1122: ms to wait for wland's PDS answer before the local answer (default 400)");
 QINT(sweet_qmi_republish_ms, repub_ms, "redfin 1073: ms after the BSP activation indication before the auto re-publish GETs (20)");
 
 static int

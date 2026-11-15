@@ -22,6 +22,13 @@
 
 #define SBB_QMUX_PORT0          0x4000u /* router client ports (as wland's ABP_PORT0): one per (pipe, session, svc, cid) */
 #define SBB_QMUX_NPORTS         0x400u
+/*
+ * 1122: the router's PDS relay port (kern.sweet_qmux_pds, sweet_qmux.c): wland writes QRTR DATA to node 1 port
+ * SBB_PDSR_PORT on /dev/sweet-mqrtr and the kernel keeps it (sweet_qmux_c2w type SBB_PDSR_C2W, never to the modem);
+ * the router's records to wland come from this port. Never one of the router's client ports.
+ */
+#define SBB_PDSR_PORT           (SBB_QMUX_PORT0 + SBB_QMUX_NPORTS - 3u)
+#define SBB_PDSR_C2W            0x50u
 
 enum {
 	SBB_QRTR_DATA = 1, SBB_QRTR_HELLO, SBB_QRTR_BYE, SBB_QRTR_NEW_SERVER, SBB_QRTR_DEL_SERVER, SBB_QRTR_DEL_CLIENT,
@@ -42,6 +49,8 @@ int sbb_link_state(void);               /* 1071: kern.sweet_mdm_up (0 down, 1 ve
 bool sbb_server(uint32_t svc, uint32_t inst, uint32_t *node, uint32_t *port, uint32_t *version);
 bool sbb_server_svc(uint32_t svc, uint32_t *node, uint32_t *port, uint32_t *verinst);       /* 1076 */
 int sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
+int sbb_wland_data(uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len);      /* 1122: DATA to wland only */
+bool sbb_wland_open(void);                                                                      /* 1122 */
 
 /* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
 bool sweet_qmux_on(void);
