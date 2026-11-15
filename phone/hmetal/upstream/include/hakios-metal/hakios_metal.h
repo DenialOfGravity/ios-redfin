@@ -649,6 +649,9 @@ void hakios_metal_cb_gpu_split(hakios_metal_cb *cb, int64_t *queued, int64_t *ru
 /* (redfin) the GPU's own start and end of a completed buffer (CP_ALWAYS_ON_COUNTER stamps), as nanoseconds after its
  * commit (*start_ns may be negative by the calibration's error): 0, or -1 when there are none (not completed, HM_GPU_STAMPS=0) */
 int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *end_ns);
+/* (redfin hm-int8) the core's commit (CommandQueue::submit's entry) and the kernel submit call's entry and return, in the
+ * transport's clock (on the phone mach_continuous_time in ns): 0, or -1 when it never reached the kernel (any may be NULL) */
+int hakios_metal_cb_submit_times(hakios_metal_cb *cb, int64_t *committed_ns, int64_t *kernel_in_ns, int64_t *kernel_out_ns);
 /* (ws-hm-perf2) a completed buffer's sync line for HM_PROF, into OUT[0..N-1] (N at most 24; the count filled is returned):
  * [0] the GPU's own time for it, ns (its CP_ALWAYS_ON_COUNTER stamps; 0 none), [1] the same for the decode buffers sent
  * just before it, [2] stream words, [3] of them register writes, [4] CP_WAIT_FOR_IDLE, [5] PC_CCU_FLUSH_COLOR_TS,

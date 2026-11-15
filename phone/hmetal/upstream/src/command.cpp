@@ -1009,7 +1009,9 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     int e;
     {
         prof::Scope t(prof::kGpuSubmit);
+        cb->kernelInAt_ = gpu_.transport().nowNs();   // (redfin hm-int8) HM_PROF=2 pace line
         e = gpu_.submit(id_, *cb->commands_, 0, uint32_t(total), cb->uses_, &cb->fence_);
+        cb->kernelOutAt_ = gpu_.transport().nowNs();
     }
     if (e != 0) {
         cb->error_ = std::string("the driver refused the submission: ") + strerror(e);

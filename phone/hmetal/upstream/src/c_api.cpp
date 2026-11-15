@@ -1852,6 +1852,15 @@ int hakios_metal_cb_sync_counts(hakios_metal_cb* cb, unsigned long long* out, in
     return m;
 }
 
+int hakios_metal_cb_submit_times(hakios_metal_cb* cb, int64_t* committed_ns, int64_t* kernel_in_ns, int64_t* kernel_out_ns) {
+    syncOne(cb);
+    const CommandBuffer& c = *cb->cb;
+    if (committed_ns != nullptr) *committed_ns = c.committedNs();
+    if (kernel_in_ns != nullptr) *kernel_in_ns = c.kernelInNs();
+    if (kernel_out_ns != nullptr) *kernel_out_ns = c.kernelOutNs();
+    return c.kernelOutNs() != 0 ? 0 : -1;
+}
+
 int hakios_metal_cb_gpu_times(hakios_metal_cb* cb, int64_t* start_ns, int64_t* end_ns) {
     syncOne(cb);
     int64_t s = 0, e = 0;

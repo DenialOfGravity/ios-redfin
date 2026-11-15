@@ -7217,6 +7217,8 @@ TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) {
     cb->waitUntilCompleted();
     CHECK(cb->status() == CommandBuffer::kCompleted);
     CHECK_EQ(cb->queuedNanoseconds() + cb->runningNanoseconds(), cb->gpuNanoseconds());
+    // (redfin hm-int8) the kernel submit call's times, in order after the commit
+    CHECK(cb->kernelInNs() >= cb->committedNs() && cb->kernelOutNs() >= cb->kernelInNs() && cb->kernelOutNs() != 0);
     CommandBuffer::ycbcrStats(y1);
     bool decode = true;
     uint64_t gen = 7;

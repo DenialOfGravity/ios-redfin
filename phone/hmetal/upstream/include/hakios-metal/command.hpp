@@ -115,6 +115,9 @@ public:
     // buffer has not completed, carried no stamps, or the stamps are not in order; committedNs is nowNs at the commit.
     bool gpuTimes(int64_t* startNs, int64_t* endNs) const;
     int64_t committedNs() const { return committedAt_; }
+    // (redfin hm-int8) HM_PROF=2's pace line: the kernel submit call's entry and return (the transport's clock; 0 not sent)
+    int64_t kernelInNs() const { return kernelInAt_; }
+    int64_t kernelOutNs() const { return kernelOutAt_; }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -543,6 +546,7 @@ private:
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
+    int64_t kernelInAt_ = 0, kernelOutAt_ = 0;   // (redfin hm-int8) gpu_.submit's entry and return
     int64_t startedAt_ = 0;   // (redfin hm-cache) when the ring got to it: the completion of the buffer before it
     // (redfin hm-int3) a decode buffer: the buffer it was sent for (its running time is added to that one's
     // preRunningNs_ at completion); and, on that buffer, the sum of its decode buffers' running times

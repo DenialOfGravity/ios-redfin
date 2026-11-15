@@ -70,6 +70,11 @@ Edits, each by exact text, refused if the text is not found once (a span edit: i
 The variant tables are not in this repository or in the build: the plug-in reads them at run time from the phone's
 own QuartzCore (default.pipelinelib/pipelines.desc + functions). bench/ca-variants.py reads the same files off the
 phone (apple-ref/<version>/) to compare versions and to replay a log's pipeline labels through the same choice.
+  - (hm-int8) HM_PROF>=2: "prof: pace 5.0 s: N frames | mean/p95 ms a frame: blocked (buffer slot, waitUntil*) | gap last
+    commit -> first buffer made | encode first buffer made -> commit | commit -> kernel submit (kernel call) | commit ->
+    completed | committed with an earlier frame unretired X of N (most in flight) | not sent", per frame = a buffer that
+    drew the display's IOSurface; the kernel submit times come from hakios_metal_cb_submit_times (core, hm-int8).
+    CoreAnimation's own swap-ring wait (SwapWait / can_update_) is outside hm: it shows as the gap. Default unchanged.
 """
 import sys
 
@@ -2584,6 +2589,181 @@ HMI5_EDITS += [
      '\t\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n'),
 ]
 EDITS += HMI5_EDITS
+
+
+# (redfin hm-int8) HM_PROF>=2's pace line: where a frame's CPU-side time goes, per frame (a frame = the command buffer that
+# drew the display's IOSurface, _hmFrame, or one presented). Every 5 s: "prof: pace ..." (bench/plugin.py docstring).
+HM_PACE_HELPERS = r'''/* (redfin hm-int8) HM_PROF>=2: per frame (a buffer that drew the display's IOSurface): blocked (the buffer slot wait in
+ * -initWithHakiosQueue: and the waitUntilScheduled / waitUntilCompleted calls since the last frame's commit), the gap
+ * from the last frame's commit to this frame's first buffer made (time outside hm: CoreAnimation's swap ring wait, its
+ * layout), the CPU encode from the first buffer made to the frame's commit, commit -> kernel submit returned (held
+ * commits, the core's stream copy, the kernel call with its scanout gate), that kernel call alone, commit -> completed,
+ * and frames committed while an earlier frame was still unretired. A line "prof: pace" every 5 s. */
+#define HM_PF_N 512
+static struct {
+	pthread_mutex_t lock;
+	double since, firstMade, lastCommit, blocked, slot, waits;
+	int open, inflight, maxInflight;
+	unsigned frames, overlapped, done, noKernel;
+	float blk[HM_PF_N], gap[HM_PF_N], enc[HM_PF_N], c2k[HM_PF_N], kcall[HM_PF_N], c2d[HM_PF_N];
+	unsigned nb, nd;
+	double slotSum, waitSum;
+} hm_pf = { PTHREAD_MUTEX_INITIALIZER };
+
+static int64_t
+hm_pf_cont_ns(void)    /* the core's transport clock (iokit_transport.cpp nowNs: mach_continuous_time) */
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	return (int64_t)(mach_continuous_time() * tb.numer / tb.denom);
+}
+
+/* a command buffer made: began = before the slot wait, made = after it */
+static void
+hm_pf_made(double began, double made)
+{
+	if (hm_prof_level() < 2) return;
+	pthread_mutex_lock(&hm_pf.lock);
+	if (!hm_pf.open) {
+		hm_pf.open = 1;
+		hm_pf.firstMade = began;
+		hm_pf.slot = hm_pf.waits = 0;
+	}
+	hm_pf.slot += made - began;
+	pthread_mutex_unlock(&hm_pf.lock);
+}
+
+static void
+hm_pf_wait(double secs)
+{
+	if (hm_prof_level() < 2) return;
+	pthread_mutex_lock(&hm_pf.lock);
+	hm_pf.waits += secs;
+	pthread_mutex_unlock(&hm_pf.lock);
+}
+
+/* a frame's buffer committed (the -commit call's time): its commit time in the transport's clock */
+static int64_t
+hm_pf_commit(double at)
+{
+	if (hm_prof_level() < 2) return 0;
+	const int64_t ns = hm_pf_cont_ns();
+	pthread_mutex_lock(&hm_pf.lock);
+	if (hm_pf.nb < HM_PF_N) {
+		const unsigned i = hm_pf.nb++;
+		hm_pf.blk[i] = (float)((hm_pf.open ? hm_pf.slot + hm_pf.waits : 0) * 1e3);
+		hm_pf.gap[i] = (float)(hm_pf.open && hm_pf.lastCommit != 0 && hm_pf.firstMade > hm_pf.lastCommit ?
+				       (hm_pf.firstMade - hm_pf.lastCommit) * 1e3 : 0);
+		hm_pf.enc[i] = (float)(hm_pf.open && at > hm_pf.firstMade ? (at - hm_pf.firstMade) * 1e3 : 0);
+	}
+	if (hm_pf.open) hm_pf.slotSum += hm_pf.slot, hm_pf.waitSum += hm_pf.waits;
+	hm_pf.frames++;
+	if (hm_pf.inflight > 0) hm_pf.overlapped++;
+	hm_pf.inflight++;
+	if (hm_pf.inflight > hm_pf.maxInflight) hm_pf.maxInflight = hm_pf.inflight;
+	hm_pf.lastCommit = at;
+	hm_pf.open = 0;
+	pthread_mutex_unlock(&hm_pf.lock);
+	return ns;
+}
+
+static int
+hm_pf_cmp(const void *a, const void *b)
+{
+	const float x = *(const float *)a, y = *(const float *)b;
+	return x < y ? -1 : x > y;
+}
+
+static void
+hm_pf_stat(float *v, unsigned n, double *mean, double *p95)
+{
+	double sum = 0;
+
+	*mean = *p95 = 0;
+	if (n == 0) return;
+	for (unsigned i = 0; i < n; i++) sum += v[i];
+	qsort(v, n, sizeof(v[0]), hm_pf_cmp);
+	*mean = sum / n;
+	*p95 = v[(n * 95 + 99) / 100 - 1];
+}
+
+/* a frame's buffer completed (the completion handler): commit -> kernel submit, the kernel call, commit -> completed */
+static void
+hm_pf_done(hakios_metal_cb *cb, int64_t commitNs)
+{
+	if (hm_prof_level() < 2 || commitNs == 0) return;
+	int64_t cns = 0, kin = 0, kout = 0;
+	const int sent = hakios_metal_cb_submit_times(cb, &cns, &kin, &kout);
+	const int64_t now = hm_pf_cont_ns();
+	const double t = hm_now();
+	pthread_mutex_lock(&hm_pf.lock);
+	if (hm_pf.inflight > 0) hm_pf.inflight--;
+	if (hm_pf.since == 0) hm_pf.since = t;
+	if (hm_pf.nd < HM_PF_N) {
+		const unsigned i = hm_pf.nd++;
+		hm_pf.c2k[i] = sent == 0 && kout > commitNs ? (float)((kout - commitNs) / 1e6) : 0;
+		hm_pf.kcall[i] = sent == 0 && kout > kin ? (float)((kout - kin) / 1e6) : 0;
+		hm_pf.c2d[i] = now > commitNs ? (float)((now - commitNs) / 1e6) : 0;
+	}
+	hm_pf.done++;
+	if (sent != 0) hm_pf.noKernel++;
+	if (t - hm_pf.since >= 5.0) {
+		double m[6], q[6];
+		const double secs = t - hm_pf.since, fr = hm_pf.frames ? hm_pf.frames : 1;
+
+		hm_pf_stat(hm_pf.blk, hm_pf.nb, &m[0], &q[0]);
+		hm_pf_stat(hm_pf.gap, hm_pf.nb, &m[1], &q[1]);
+		hm_pf_stat(hm_pf.enc, hm_pf.nb, &m[2], &q[2]);
+		hm_pf_stat(hm_pf.c2k, hm_pf.nd, &m[3], &q[3]);
+		hm_pf_stat(hm_pf.kcall, hm_pf.nd, &m[4], &q[4]);
+		hm_pf_stat(hm_pf.c2d, hm_pf.nd, &m[5], &q[5]);
+		hm_print("prof: pace %.1f s: %u frames (%.1f fps) | mean/p95 ms a frame: blocked %.2f/%.2f (buffer slot %.2f, "
+			 "waitUntil* %.2f) | gap last commit -> first buffer made %.2f/%.2f | encode first buffer made -> commit "
+			 "%.2f/%.2f | commit -> kernel submit %.2f/%.2f (kernel call %.2f/%.2f) | commit -> completed %.2f/%.2f | "
+			 "committed with an earlier frame unretired %u of %u (most in flight %d) | not sent %u\n",
+			 secs, hm_pf.frames, hm_pf.frames / secs, m[0], q[0], hm_pf.slotSum * 1e3 / fr, hm_pf.waitSum * 1e3 / fr,
+			 m[1], q[1], m[2], q[2], m[3], q[3], m[4], q[4], m[5], q[5], hm_pf.overlapped, hm_pf.frames,
+			 hm_pf.maxInflight, hm_pf.noKernel);
+		hm_pf.since = t;
+		hm_pf.frames = hm_pf.overlapped = hm_pf.done = hm_pf.noKernel = 0;
+		hm_pf.nb = hm_pf.nd = 0;
+		hm_pf.slotSum = hm_pf.waitSum = 0;
+		hm_pf.maxInflight = hm_pf.inflight;
+	}
+	pthread_mutex_unlock(&hm_pf.lock);
+}
+
+'''
+HM_PACE_EDITS = [
+    ('#define HM_PROF_CLASSES 24\n',
+     '/* (redfin hm-int8) HM_PROF>=2 pace line (defined before hm_completed) */\n'
+     'static void hm_pf_made(double began, double made);\nstatic void hm_pf_wait(double secs);\n'
+     'static int64_t hm_pf_commit(double at);\nstatic void hm_pf_done(hakios_metal_cb *cb, int64_t commitNs);\n'
+     '#define HM_PROF_CLASSES 24\n'),
+    ('static void\nhm_completed(hakios_metal_cb *cb, void *context)\n{\n',
+     HM_PACE_HELPERS + 'static void\nhm_completed(hakios_metal_cb *cb, void *context)\n{\n'),
+    ('\tself = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];\n',
+     '\tconst double hmPfBegan = hm_now();   /* (redfin hm-int8) the slot wait below, for HM_PROF>=2\'s pace line */\n'
+     '\tself = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];\n'
+     '\thm_pf_made(hmPfBegan, hm_now());\n'),
+    ('@public\n\tdouble _hmCommitSecs;',
+     '@public\n\tint64_t _hmPfCommitNs;                   /* (redfin hm-int8) HM_PROF>=2 pace: a frame\'s commit (transport clock) */\n\tdouble _hmCommitSecs;'),
+    ('\thm_tr_committed(_committedAt - _createdAt);   /* (redfin hmv4) */\n',
+     '\thm_tr_committed(_committedAt - _createdAt);   /* (redfin hmv4) */\n'
+     '\tif (_hmFrame) self->_hmPfCommitNs = hm_pf_commit(_committedAt);   /* (redfin hm-int8) */\n'),
+    ('\t\t__sync_fetch_and_add(&hm_sched_waits, 1);\n\t\tdispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);\n',
+     '\t\tconst double hmPfW = hm_now();   /* (redfin hm-int8) */\n'
+     '\t\t__sync_fetch_and_add(&hm_sched_waits, 1);\n\t\tdispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);\n'
+     '\t\thm_pf_wait(hm_now() - hmPfW);\n'),
+    ('\t\thm_fps_waited(hm_now() - began);\n',
+     '\t\thm_fps_waited(hm_now() - began);\n\t\thm_pf_wait(hm_now() - began);   /* (redfin hm-int8) */\n'),
+    ('\t\t     hm_now() - [self hakiosCreatedAt]);   /* (redfin hmv4) HM_TRACE */\n',
+     '\t\t     hm_now() - [self hakiosCreatedAt]);   /* (redfin hmv4) HM_TRACE */\n'
+     '\tif (self->_hmFrame) hm_pf_done(cb, self->_hmPfCommitNs);   /* (redfin hm-int8) HM_PROF>=2 pace */\n'),
+]
+
+EDITS += HM_PACE_EDITS   # (redfin hm-int8)
 
 
 def apply(src, edits=EDITS):
