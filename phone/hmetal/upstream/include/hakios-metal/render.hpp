@@ -634,6 +634,9 @@ struct BlitRect {
 // read from the environment at first use, set here by the tests; and how many draws' targets it turned so far
 void setBlendOpt(bool on);
 uint64_t blendsMadeWrites();
+// (ws-hm-sbar) HM_FETCH_ORDER (render.cpp): [0] fetch barriers encoded in sysmem, [1] fetching draws ordered without one, [2] the mode
+int fetchOrderMode();
+void fetchCounts(uint64_t out[3]);
 
 bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, BlitRect s, const Texture& dst, uint32_t dstLevel, BlitRect d, bool linear,
                 uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o = Options{});

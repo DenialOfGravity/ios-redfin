@@ -927,6 +927,20 @@ bool blendOptOn() {
 }
 std::atomic<uint64_t> gBlendsMadeWrites{0};   // ...how many draws' targets it turned (HM_PROF: hakios_metal_ubwc_counts [0])
 
+// (ws-hm-sbar) HM_FETCH_ORDER: how a framebuffer-fetching draw in a SYSMEM pass is ordered after what was drawn before it.
+//   0 (default, as ws-hm-ubwc2) every fetching draw gets the full barrier (WFI, CCU colour flush waited for,
+//     CACHE_INVALIDATE, WFI): the whole GPU drains before each one, mid full-screen pass included
+//   1 a fetching draw right after another fetching draw of the same pass gets no barrier and runs with
+//     GRAS_SC_CNTL.SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE (turnip's sysmem rule for a raster-order feedback loop,
+//     tu_pipeline.cc); the first fetching draw after a non-fetching one keeps the barrier (GMEM's afterFetch rule)
+//   2 as 1, and the barrier only for the first fetching draw of a pass (every later one: the hardware's overlap flush alone)
+// Counted for HM_PROF (hakios_metal_fetch_counts): barriers encoded, fetching draws ordered without one.
+int fetchOrderModeEnv() {
+    static const int m = [] { const char* e = getenv("HM_FETCH_ORDER"); return e != nullptr && e[0] != 0 ? atoi(e) : 0; }();
+    return m;
+}
+std::atomic<uint64_t> gFetchBarriers{0}, gFetchOrdered{0};
+
 struct BlendWords {
     bool enabled;
     uint32_t mrtControl, mrtBlendControl;
@@ -1714,8 +1728,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // ordering alone showed a widget's text cut by a band and the App Library's blur in blocks.
     // (in GMEM only: in sysmem the ordering bought nothing measurable over the barrier -- SpringBoard's heaviest passes
     // took some 50 ms either way -- and the barrier is what SpringBoard was looked at with)
-    const bool ordered = fs.fbRead && o.fbReadOrdered && gmem != nullptr;
+    // (ws-hm-sbar) HM_FETCH_ORDER=1/2: sysmem too (FLUSH_PER_OVERLAP_AND_OVERWRITE below; the call site widens afterFetch for 2)
+    const bool sysOrdered = fs.fbRead && o.fbReadOrdered && gmem == nullptr && fetchOrderModeEnv() > 0;
+    const bool ordered = (fs.fbRead && o.fbReadOrdered && gmem != nullptr) || sysOrdered;
     const bool barrier = fs.fbRead && o.fbReadBarrier && (!ordered || !afterFetch);
+    if (fs.fbRead && gmem == nullptr) (barrier ? gFetchBarriers : gFetchOrdered).fetch_add(1, std::memory_order_relaxed);
     if (barrier && gmem != nullptr) {
         stream.waitForIdle();
         event(stream, CACHE_INVALIDATE);
@@ -2112,7 +2129,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // decoded as garbage (hm-ubwc's folder backdrop: white texels in a low-resolution blur intermediate). A linear
         // target has no such pairing (its pixels are independent), so int6's NO_FLUSH stays there
         reg(stream, REG_A6XX_GRAS_SC_CNTL,
-            ordered ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP)
+            ordered && gmem == nullptr   // (ws-hm-sbar) HM_FETCH_ORDER in sysmem
+                ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP_AND_OVERWRITE)
+            : ordered ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP)
             : sysmemFetchFlush(fs.fbRead != 0 && gmem == nullptr, pass)
                 ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP_AND_OVERWRITE)
                 : grasScCntlSysmem());
@@ -2735,6 +2754,12 @@ uint32_t halfBitsOf(float f) { return halfOf(f); }
 
 void setBlendOpt(bool on) { gBlendOpt.store(on ? 1 : 0, std::memory_order_relaxed); }   // (redfin ws-hm-ubwc) tests
 uint64_t blendsMadeWrites() { return gBlendsMadeWrites.load(std::memory_order_relaxed); }
+void fetchCounts(uint64_t out[3]) {   // (ws-hm-sbar)
+    out[0] = gFetchBarriers.load(std::memory_order_relaxed);
+    out[1] = gFetchOrdered.load(std::memory_order_relaxed);
+    out[2] = uint64_t(fetchOrderModeEnv());
+}
+int fetchOrderMode() { return fetchOrderModeEnv(); }
 
 bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, BlitRect s, const Texture& dst, uint32_t dstLevel, BlitRect d, bool linear,
                 uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
@@ -3788,7 +3813,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
     if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
-                              gmem ? &plan : nullptr, joins && open_->lastFetched)) {
+                              gmem ? &plan : nullptr, joins && (open_->lastFetched || render::fetchOrderMode() >= 2))) {
         gmemClears_ = 0;
         return refuseWork(why);
     }
@@ -3802,7 +3827,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         render::Options sysOptions = encodeOptions;
         sysOptions.visCullUse = options.visCullUse;
         if (!render::encodeInPass(bodySys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysTable.contents(), &why,
-                                  sysOptions, nullptr, joins && open_->lastFetched)) {
+                                  sysOptions, nullptr, joins && (open_->lastFetched || render::fetchOrderMode() >= 2))) {
             gmemClears_ = 0;
             return refuseWork(why);
         }
@@ -3888,7 +3913,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     const bool timed = profileDraws_ && !open_->gmem && drawsProfiled_.size() < kMaxProfiledDraws;
     if (timed) {
         DrawTime dt{program.name != nullptr ? program.name : "?", 0};
-        dt.name += " fs:" + std::to_string(program.fs.k.numWords) + "w v:" + std::to_string(d.vertexCount) + (program.blend.enabled ? " blend" : "");   // (which variant: one function's pipelines differ by their constants)
+        dt.name += " fs:" + std::to_string(program.fs.k.numWords) + "w v:" + std::to_string(d.vertexCount) + (program.blend.enabled ? " blend" : "") + (program.fs.fbRead ? " FETCH" : "");   // (ws-hm-sbar)   // (which variant: one function's pipelines differ by their constants)
         // (and what its fragment stage samples: a draw's cost is mostly its texture reads, which the name does not tell)
         for (size_t i = 0; i < fsBindings.textures.size(); i++) {
             const Texture* t = fsBindings.textures[i];
