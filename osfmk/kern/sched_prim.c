@@ -5040,6 +5040,24 @@ int sweet_ui_bigcore = 1;      /* 1046: default 1 (CA display threads; was 0); s
 static uint32_t sweet_ui_tagged;
 static uint32_t sweet_ui_st_idle, sweet_ui_st_preempt, sweet_ui_st_fallback;
 static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display, render-server][big, little] */
+/*
+ * redfin 1106: kern.sweet_ui_bigcore bits beyond 1 (display) and 2 (render-server), all off by default (default stays 1):
+ *   4  split: display threads try the gold core (CPU6) first, render-server threads the prime core (CPU7) first, each
+ *      then the other big core (without 4 both follow sweetbig's order, CPU7 first by default)
+ *   8  no cross-preemption: a tagged thread does not preempt a big core running a thread of the other tagged class (it
+ *      takes the other big core or falls back); keeps the display thread and the render server from kicking each other
+ *   16 equal priority: a tagged thread also preempts an untagged thread of its own priority on a big core (not only a
+ *      lower one); the preempted thread goes back to the run queue and takes any free core
+ * Topology (SM7250, Kryo 475): CPU0-5 silver (A55, 1.8 GHz), CPU6 gold (A76, 2.2 GHz), CPU7 prime (A76, 2.4 GHz); one
+ * clutch pset; sweetgov's touch/frame boost (bsd/dev/sweet_cpufreq.c) holds both the gold and the prime domain.
+ * sweet_ui_cpu_cls[cpu]: the tagged class running on each CPU (processor_state_update_from_thread; 0 none, 1 render-server,
+ * 2 display). Stats per class: placed idle / preempt on CPU6 / CPU7, fallbacks (both big cores busy: at least one with
+ * a tagged thread, or both with equal/higher priority), on-CPU ms on gold / prime / little, priority range seen.
+ */
+volatile uint8_t sweet_ui_cpu_cls[MAX_SCHED_CPUS];
+static uint32_t sweet_ui_st_cls[2][6];          /* [display, rs][idle6, idle7, pre6, pre7, fb tagged, fb busy] */
+static uint64_t sweet_ui_abs3[2][3];            /* [display, rs][gold, prime, little] */
+static int sweet_ui_pri_lo[2] = { 255, 255 }, sweet_ui_pri_hi[2];
 
 void sweet_ui_thread_named(void *uth, const char *name);
 void
@@ -5078,6 +5096,7 @@ sweet_ui_account(thread_t thread, processor_t processor)
 	uint64_t ran = processor->last_dispatch > thread->computation_epoch ? processor->last_dispatch - thread->computation_epoch : 0;
 	os_atomic_inc(&sweet_ui_runs[c][b], relaxed);
 	os_atomic_add(&sweet_ui_abs[c][b], ran, relaxed);
+	os_atomic_add(&sweet_ui_abs3[c][processor->cpu_id == 6 ? 0 : (processor->cpu_id == 7 ? 1 : 2)], ran, relaxed);   /* 1106 */
 }
 
 void sweet_ui_bigcore_log(void);
@@ -5100,6 +5119,28 @@ sweet_ui_bigcore_log(void)
 	printf("SWEET UI: bigcore 5s: runs big/little, ms: display %llu/%llu, %llu/%llu | render-server %llu/%llu, %llu/%llu | "
 	    "placed idle %u preempt %u fallback %u | mode %d tagged %u\n", r[0][0], r[0][1], ms[0][0], ms[0][1], r[1][0], r[1][1],
 	    ms[1][0], ms[1][1], pi, pp, pf, sweet_ui_bigcore, sweet_ui_tagged);
+	/* 1106: per class: ms on gold (CPU6) / prime (CPU7) / little; placements; fallbacks; priority range */
+	uint64_t m3[2][3];
+	uint32_t st[2][6];
+	int lo[2], hi[2];
+	for (int c = 0; c < 2; c++) {
+		for (int k = 0; k < 3; k++) {
+			absolutetime_to_nanoseconds(os_atomic_xchg(&sweet_ui_abs3[c][k], 0, relaxed), &m3[c][k]);
+			m3[c][k] /= NSEC_PER_MSEC;
+		}
+		for (int k = 0; k < 6; k++) {
+			st[c][k] = os_atomic_xchg(&sweet_ui_st_cls[c][k], 0, relaxed);
+		}
+		lo[c] = sweet_ui_pri_lo[c];
+		hi[c] = sweet_ui_pri_hi[c];
+		sweet_ui_pri_lo[c] = 255;
+		sweet_ui_pri_hi[c] = 0;
+	}
+	printf("SWEET UI: bigcore2 5s: ms gold/prime/little: display %llu/%llu/%llu render-server %llu/%llu/%llu | display: idle "
+	    "6:%u 7:%u preempt 6:%u 7:%u fallback tagged %u busy %u pri %d-%d | render-server: idle 6:%u 7:%u preempt 6:%u 7:%u "
+	    "fallback tagged %u busy %u pri %d-%d | mode %#x\n", m3[0][0], m3[0][1], m3[0][2], m3[1][0], m3[1][1], m3[1][2],
+	    st[0][0], st[0][1], st[0][2], st[0][3], st[0][4], st[0][5], lo[0] == 255 ? 0 : lo[0], hi[0],
+	    st[1][0], st[1][1], st[1][2], st[1][3], st[1][4], st[1][5], lo[1] == 255 ? 0 : lo[1], hi[1], sweet_ui_bigcore);
 }
 
 uint64_t
@@ -5190,17 +5231,40 @@ choose_processor(
 		int ui = ((thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((thread->sched_flags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
 		if (__improbable(ui & sweet_ui_bigcore)) {
 			processor_t idle = PROCESSOR_NULL, low = PROCESSOR_NULL;
+			int mode = sweet_ui_bigcore, c = (ui & 1) ? 0 : 1;     /* 1106: class index (display first) */
+			int other = c == 0 ? 1 : 2;                             /* 1106: sweet_ui_cpu_cls value of the other class */
+			bool tagged_busy = false;
+			int pri = thread->sched_pri;
+			if (pri < sweet_ui_pri_lo[c]) {
+				sweet_ui_pri_lo[c] = pri;
+			}
+			if (pri > sweet_ui_pri_hi[c]) {
+				sweet_ui_pri_hi[c] = pri;
+			}
 			for (int k = 0; k < 2; k++) {
 				int i = sweet_big == 2 ? 6 + k : 7 - k;
+				if (mode & 4) {
+					i = c == 0 ? 6 + k : 7 - k;     /* 1106: display gold first, render-server prime first */
+				}
 				processor_t bp = processor_array[i];
 				if (bp == PROCESSOR_NULL || bp->processor_set != pset || !bp->is_recommended) {
 					continue;
 				}
+				int running = sweet_ui_cpu_cls[i];
 				if (bp->state == PROCESSOR_IDLE) {
 					if (idle == PROCESSOR_NULL) {
 						idle = bp;
 					}
-				} else if (bp->state == PROCESSOR_RUNNING && bp->current_pri < thread->sched_pri &&
+					continue;
+				}
+				if (running != 0) {
+					tagged_busy = true;
+				}
+				if ((mode & 8) && running == other) {
+					continue;               /* 1106: never kick the other tagged class */
+				}
+				bool lower = bp->current_pri < pri || ((mode & 16) && running == 0 && bp->current_pri == pri);
+				if (bp->state == PROCESSOR_RUNNING && lower &&
 				    !bit_test(pset->pending_AST_URGENT_cpu_mask, bp->cpu_id) &&
 				    (low == PROCESSOR_NULL || bp->current_pri < low->current_pri)) {
 					low = bp;
@@ -5209,12 +5273,15 @@ choose_processor(
 			if (idle != PROCESSOR_NULL) {
 				processor = idle;       /* an idle hint is taken as is below (RT: if a fast-track candidate) */
 				sweet_ui_st_idle++;
+				sweet_ui_st_cls[c][idle->cpu_id == 6 ? 0 : 1]++;
 			} else if (low != PROCESSOR_NULL && (thread->sched_pri < BASEPRI_RTQUEUES ||
 			    processor_is_fast_track_candidate_for_realtime_thread(pset, low))) {
 				sweet_ui_st_preempt++;
+				sweet_ui_st_cls[c][low->cpu_id == 6 ? 2 : 3]++;
 				return low;             /* pset locked; processor_setrun / realtime_setrun preempt it */
 			} else {
 				sweet_ui_st_fallback++;
+				sweet_ui_st_cls[c][tagged_busy ? 4 : 5]++;
 			}
 		}
 	}

@@ -218,16 +218,17 @@ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
 	if (error || !changed) {
 		return error;
 	}
-	if (value < 0 || value > 3) {
+	if (value < 0 || value > 31) {
 		return EINVAL;
 	}
 	sweet_ui_bigcore = value;
-	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower)\n",
+	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower; "
+	    "1106: 4 display gold / render-server prime first, 8 no preempting the other class, 16 preempt equal priority)\n",
 	    value);
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off)");
+    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri)");
 
 /* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
 static unsigned

@@ -443,6 +443,10 @@ processor_state_update_idle(processor_t processor)
 	sched_update_pset_load_average(processor->processor_set, 0);
 }
 
+#if defined(__arm64__)
+extern volatile uint8_t sweet_ui_cpu_cls[];     /* redfin 1106: osfmk/kern/sched_prim.c */
+#endif
+
 void
 processor_state_update_from_thread(processor_t processor, thread_t thread, boolean_t pset_lock_held)
 {
@@ -465,6 +469,10 @@ processor_state_update_from_thread(processor_t processor, thread_t thread, boole
 	processor->current_is_NO_SMT = thread_no_smt(thread);
 	processor->current_is_bound = thread->bound_processor != PROCESSOR_NULL;
 	processor->current_is_eagerpreempt = thread_is_eager_preempt(thread);
+#if defined(__arm64__)
+	/* redfin 1106: the tagged CA class on this CPU (0 none, 1 render-server, 2 display; sched_prim.c choose_processor) */
+	sweet_ui_cpu_cls[processor->cpu_id] = (uint8_t)((thread->sched_flags & TH_SFLAG_SWEET_UI_MASK) >> 29);
+#endif
 	if (pset_lock_held) {
 		/* Only update the pset load average when the pset lock is held */
 		sched_update_pset_load_average(processor->processor_set, 0);
@@ -475,6 +483,9 @@ void
 processor_state_update_explicit(processor_t processor, int pri, sfi_class_id_t sfi_class,
     pset_cluster_type_t pset_type, perfcontrol_class_t perfctl_class, thread_urgency_t urgency, __unused sched_bucket_t bucket)
 {
+#if defined(__arm64__)
+	sweet_ui_cpu_cls[processor->cpu_id] = 0;        /* redfin 1106: idle / explicit state: no tagged thread */
+#endif
 	processor->current_pri = pri;
 	processor->current_sfi_class = sfi_class;
 	processor->current_recommended_pset_type = pset_type;
