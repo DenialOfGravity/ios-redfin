@@ -3565,6 +3565,13 @@ thread_dispatch(
 			}
 
 #if defined(__arm64__)
+			{
+				extern uint32_t sweet_pace_sched;
+				extern void sweet_pace_account(thread_t thread, processor_t processor);
+				if (__improbable(sweet_pace_sched != 0)) {
+					sweet_pace_account(thread, processor);  /* 1114 */
+				}
+			}
 			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
 				extern void sweet_ui_account(thread_t thread, processor_t processor);
 				sweet_ui_account(thread, processor);    /* 1041 */
@@ -5097,6 +5104,111 @@ sweet_ui_account(thread_t thread, processor_t processor)
 	os_atomic_inc(&sweet_ui_runs[c][b], relaxed);
 	os_atomic_add(&sweet_ui_abs[c][b], ran, relaxed);
 	os_atomic_add(&sweet_ui_abs3[c][processor->cpu_id == 6 ? 0 : (processor->cpu_id == 7 ? 1 : 2)], ran, relaxed);   /* 1106 */
+}
+
+/*
+ * redfin 1114: kern.sweet_pace_trace & 4 sets sweet_pace_sched (bsd/dev/sweet_gpu.c): per class (0 CA display threads,
+ * 1 CA render-server threads, 2 SpringBoard's main thread, found by kern.sweet_pace_trace / kern.sweet_pace_dump writes)
+ * cumulative on-CPU and runnable-but-not-running time on big (CPU6/7) and little cores, counted when a run ends
+ * (thread_dispatch: run = last_dispatch - computation_epoch, wait = computation_epoch - last_made_runnable_time), and
+ * the first CA display-thread run that starts after each vsync tick (SweetFramebuffer.cpp writes the tick). Read by
+ * SweetFramebuffer.cpp's SWEET PACE lines. Off: one load per context switch.
+ */
+uint32_t sweet_pace_sched;
+thread_t sweet_pace_sb_thread;
+volatile uint64_t sweet_pace_tick_abs;
+static uint64_t sweet_pace_acc[3][5];           /* run big, run little, wait big, wait little, runs */
+static volatile uint64_t sweet_pace_wake_tick, sweet_pace_wake_on;
+static volatile uint32_t sweet_pace_wake_cpu;
+
+void sweet_pace_account(thread_t thread, processor_t processor);
+void
+sweet_pace_account(thread_t thread, processor_t processor)
+{
+	int c;
+	if (thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) {
+		c = 0;
+	} else if (thread->sched_flags & TH_SFLAG_SWEET_UI_RS) {
+		c = 1;
+	} else if (thread == sweet_pace_sb_thread) {
+		c = 2;
+	} else {
+		return;
+	}
+	uint64_t ep = thread->computation_epoch, end = processor->last_dispatch, mr = thread->last_made_runnable_time;
+	int l = processor->cpu_id >= 6 ? 0 : 1;
+	os_atomic_add(&sweet_pace_acc[c][l], end > ep ? end - ep : 0, relaxed);
+	if (mr != THREAD_NOT_RUNNABLE && mr != 0 && ep > mr) {
+		os_atomic_add(&sweet_pace_acc[c][2 + l], ep - mr, relaxed);
+	}
+	os_atomic_inc(&sweet_pace_acc[c][4], relaxed);
+	if (c == 0) {
+		uint64_t tk = sweet_pace_tick_abs;
+		if (tk != 0 && ep >= tk && sweet_pace_wake_tick != tk) {
+			sweet_pace_wake_on = ep;
+			sweet_pace_wake_cpu = processor->cpu_id;
+			sweet_pace_wake_tick = tk;
+		}
+	}
+}
+
+/* the current thread: its run's start, when it was made runnable, its CPU, its class (1 CA display, 2 render-server) */
+void sweet_pace_cur_thread(uint64_t *epoch, uint64_t *made, uint32_t *cpu, uint32_t *cls);
+void
+sweet_pace_cur_thread(uint64_t *epoch, uint64_t *made, uint32_t *cpu, uint32_t *cls)
+{
+	thread_t th = current_thread();
+	*epoch = th->computation_epoch;
+	*made = th->last_made_runnable_time;
+	*cpu = (uint32_t)cpu_number();
+	*cls = (th->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : ((th->sched_flags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
+}
+
+void sweet_pace_acc_read(uint64_t out[15]);
+void
+sweet_pace_acc_read(uint64_t out[15])
+{
+	for (int c = 0; c < 3; c++) {
+		for (int j = 0; j < 5; j++) {
+			out[c * 5 + j] = os_atomic_load(&sweet_pace_acc[c][j], relaxed);
+		}
+	}
+}
+
+void sweet_pace_wake_read(uint64_t *tick, uint64_t *on, uint32_t *cpu);
+void
+sweet_pace_wake_read(uint64_t *tick, uint64_t *on, uint32_t *cpu)
+{
+	*on = sweet_pace_wake_on;
+	*cpu = sweet_pace_wake_cpu;
+	*tick = sweet_pace_wake_tick;
+}
+
+/* SpringBoard's main thread (the task's first thread); consumes the task reference; returns its tid (0 = none) */
+uint64_t sweet_pace_set_sb(task_t task);
+uint64_t
+sweet_pace_set_sb(task_t task)
+{
+	thread_t th = THREAD_NULL, t, old;
+	uint64_t tid = 0;
+	if (task != TASK_NULL) {
+		task_lock(task);
+		queue_iterate(&task->threads, t, thread_t, task_threads) {
+			th = t;
+			break;
+		}
+		if (th != THREAD_NULL) {
+			thread_reference(th);
+			tid = thread_tid(th);
+		}
+		task_unlock(task);
+		task_deallocate(task);
+	}
+	old = os_atomic_xchg(&sweet_pace_sb_thread, th, relaxed);
+	if (old != THREAD_NULL) {
+		thread_deallocate(old);
+	}
+	return tid;
 }
 
 void sweet_ui_bigcore_log(void);

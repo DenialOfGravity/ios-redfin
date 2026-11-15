@@ -2567,8 +2567,69 @@ extern uint32_t sweet_touch_trace;
 /* 1113: SweetFramebuffer.cpp, per-frame pacing trace (SWEET PACE lines); 0 off (default), 1 5 s lines, 2 + slow frames */
 void sweet_pace_trace_submit(int pid, uint32_t gf, uint64_t t0, uint64_t t1);
 extern uint32_t sweet_pace_trace;
-SYSCTL_UINT(_kern, OID_AUTO, sweet_pace_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_trace, 0,
-    "SWEET PACE: per-frame pacing trace, 1 5 s lines, 2 also one line per 3+ vsync frame (1113, default 0)");
+/*
+ * 1114: kern.sweet_pace_trace bits: 1 5 s lines, 2 one line per 3+ vsync frame (16 per 5 s; 1113), 4 tick classes,
+ * thread run/wait, touch state into a ring of frames (3+ vsyncs; 8 = every frame) printed by kern.sweet_pace_dump=1
+ * (SweetFramebuffer.cpp). Writing a value with 4 looks up SpringBoard's main thread for the scheduler accounting
+ * (osfmk/kern/sched_prim.c sweet_pace_sched). Default 0.
+ */
+extern uint32_t sweet_pace_sched;
+extern uint32_t sweet_pace_dump(void);
+extern uint64_t sweet_pace_set_sb(task_t task);
+extern task_t sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len);
+
+static void
+sweet_pace_sb_refresh(void)
+{
+	int pid = -1;
+	char nm[32] = "";
+	task_t t = sweet_prof_find_task("SpringBoard", 11, -1, &pid, nm, sizeof(nm));
+	uint64_t tid = sweet_pace_set_sb(t);
+	printf("SWEET PACE: SpringBoard pid %d main thread %llu (1114 scheduler accounting)\n", t != TASK_NULL ? pid : -1, tid);
+}
+
+static int
+sysctl_sweet_pace_trace SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = (int)sweet_pace_trace, changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 15) {
+		return EINVAL;
+	}
+	if (value & 4) {
+		sweet_pace_sb_refresh();
+	}
+	sweet_pace_sched = (value & 4) ? 1 : 0;
+	sweet_pace_trace = (uint32_t)value;
+	printf("SWEET PACE: trace %d (1113: 1 5 s lines, 2 slow lines; 1114: 4 ring + tick classes + threads + touch, "
+	    "8 ring keeps every frame; kern.sweet_pace_dump=1 prints the ring)\n", value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_trace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_pace_trace, "I",
+    "SWEET PACE: 1 5 s lines, 2 slow lines (1113); 4 frame ring + ticks/threads/touch, 8 every frame (1114); default 0");
+
+static int
+sysctl_sweet_pace_dump SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, 0, sizeof(value), &value, &changed);
+	if (error || !changed || value <= 0) {
+		return error;
+	}
+	if (sweet_pace_trace & 4) {
+		uint32_t n = sweet_pace_dump();
+		sweet_pace_sb_refresh();        /* SpringBoard may have restarted */
+		printf("SWEET PACE: dump done, %u frames\n", n);
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_pace_dump, "I",
+    "SWEET PACE: write 1 = print the frame ring since the last dump (1114; needs kern.sweet_pace_trace & 4)");
 SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
 

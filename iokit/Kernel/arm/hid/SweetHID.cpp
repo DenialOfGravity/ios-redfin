@@ -566,6 +566,8 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
 
 extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
 extern "C" void sweet_touch_trace_event(uint64_t irq, uint64_t hid);     /* 1107 */
+extern "C" uint32_t sweet_pace_trace;                                   /* 1114: SweetFramebuffer.cpp */
+extern "C" void sweet_pace_trace_touch(int finger, bool down, bool was, uint64_t now);
 /* 1044: the newest two touch event times (IRQ time with sectouchx 0x1), for SweetFramebuffer's touch -> latch */
 extern "C" volatile uint64_t sweet_hid_touch_abs[2];
 volatile uint64_t sweet_hid_touch_abs[2];
@@ -688,6 +690,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
 	collection->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, cmask);
 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
 	IOLockUnlock(fLock);
+	if (__improbable(sweet_pace_trace & 4)) {
+		sweet_pace_trace_touch(finger, down, was, now);         /* 1114: touch state / move intervals for SWEET PACE */
+	}
 
 	if (was != down) {
 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
