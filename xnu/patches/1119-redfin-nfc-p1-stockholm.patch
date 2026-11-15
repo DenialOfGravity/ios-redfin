@@ -1,0 +1,1405 @@
+From e5822b2663ed775f03554cc42a533d08f3787692 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 21:07:34 +0100
+Subject: [PATCH] 1119 redfin: NFC P1 AppleStockholmControl +
+ com.apple.uart.stockholm + NCI gateway (kern.sweet_nfc_p1, default 0)
+
+---
+ bsd/dev/sweet_nfc.c           | 1074 ++++++++++++++++++++++++++++++++-
+ iokit/Kernel/IOUserClient.cpp |   14 +-
+ iokit/Kernel/arm/SweetNFC.cpp |  211 +++++++
+ iokit/conf/files.arm64        |    1 +
+ 4 files changed, 1295 insertions(+), 5 deletions(-)
+ create mode 100644 iokit/Kernel/arm/SweetNFC.cpp
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index e135d42..83b5f70 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -36,6 +36,10 @@
+  * Sysctls: kern.sweet_nfc_state (off/probing/router/loader/error:<why>), kern.sweet_nfc_ver (decoded
+  * versions), kern.sweet_nfc_probe (reads the number of probes run; write 1: probe now; refused after loader mode).
+  * Log lines: "SWEET NFC: ...".
++ *
++ * 1119 (P1): AppleStockholmControl + com.apple.uart.stockholm + the NCI gateway, behind kern.sweet_nfc_p1 (default 0);
++ * see the P1 section at the end of this file. sweet_nfc_tx_allowed() also lets a host packet through to 0x08, but
++ * only in gateway mode 1 with a chip session and only if the section-4 filter forwards it unchanged.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/clock.h>
+@@ -48,6 +52,9 @@
+ #include <sys/errno.h>
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -57,6 +64,11 @@ extern bool sweet_se7_init_nfc(void);
+ extern int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
+ void sweet_nfc_init(void);
+ bool sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt);
++int sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v);         /* 1119: SweetNFC.cpp's user client */
++void sweet_nfc_uc_event(int open, uint32_t type);
++extern int SweetNFCPublish(bool on, const char *why);                  /* 1119: iokit/Kernel/arm/SweetNFC.cpp */
++static bool gw_bus_ok(const uint8_t *tx, unsigned nt);
++static void nfc_p1_boot_thread(void *arg, wait_result_t wr);
+ 
+ #define SAY(...)                printf("SWEET NFC: " __VA_ARGS__)
+ 
+@@ -86,15 +98,18 @@ static unsigned nfc_refused;
+ bool
+ sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt)
+ {
+-	if (nfc_loader || !nfc_tx_open || tx == NULL) {
++	if (nfc_loader || tx == NULL) {
+ 		nfc_refused++;
+ 		return false;
+ 	}
+-	for (unsigned i = 0; i < sizeof(nfc_tx_ok) / sizeof(nfc_tx_ok[0]); i++) {
++	for (unsigned i = 0; nfc_tx_open && i < sizeof(nfc_tx_ok) / sizeof(nfc_tx_ok[0]); i++) {
+ 		if (nt == nfc_tx_ok[i].n && memcmp(tx, nfc_tx_ok[i].b, nt) == 0) {
+ 			return true;
+ 		}
+ 	}
++	if (gw_bus_ok(tx, nt)) {        /* 1119: a filtered host packet, gateway mode 1 session only */
++		return true;
++	}
+ 	nfc_refused++;
+ 	return false;
+ }
+@@ -526,15 +541,1066 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
+ void
+ sweet_nfc_init(void)
+ {
++	thread_t th;
++
+ 	if (!PE_parse_boot_argn("sweetnfc", &nfc_bootarg, sizeof(nfc_bootarg)) || nfc_bootarg == 0) {
+ 		nfc_bootarg = 0;
+ 		return;                 /* nothing touched (1117: kern.sweet_nfc_probe=1 probes on demand) */
+ 	}
+-	if (nfc_bootarg != 1) {
+-		SAY("sweetnfc=%u is not a P0 value (1): no probe at boot\n", nfc_bootarg);
++	if (nfc_bootarg & 2) {          /* 1119: the P1 surface 2 s after init (as kern.sweet_nfc_p1=1) */
++		SAY("sweetnfc bit 2: AppleStockholmControl + com.apple.uart.stockholm in 2 s\n");
++		if (kernel_thread_start(nfc_p1_boot_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		}
++	}
++	if (!(nfc_bootarg & 1)) {
+ 		return;
+ 	}
+ 	SAY("sweetnfc=1: read-only probe of the ST54J at SE7 0x08 in 1 s\n");
+ 	(void)nfc_start(true);
+ }
++
++/* ==== 1119: NFC P1 - the kernel interface nfcd expects (plan section 5 P1; logs/research/nfc-plan-2026-11-15.md) ====
++ *
++ * Switch kern.sweet_nfc_p1 (default 0 = nothing below is published; the kernel behaves as 1117/1118). Writing 1
++ * publishes, from the writer's thread:
++ *   - IOKit: a "stockholm" nub under the platform expert and, on it, AppleStockholmControl with IONameMatched =
++ *     "nfc,primary,gpio" and IOUserClientClass AppleStockholmControlUserClient (iokit/Kernel/arm/SweetNFC.cpp).
++ *     libNFC_HAL's lookup is IOServiceNameMatching("AppleStockholmControl") + IOPropertyMatch {IONameMatched:
++ *     "nfc,primary,gpio"} (sub_1f5de1650), so no ADT node is needed. No AppleStockholmSPMI: interface type 1 (UART).
++ *   - the kernel control com.apple.uart.stockholm (SOCK_STREAM, unprivileged: nfcd runs as mobile), one client.
++ * Writing 0 takes both away again (EBUSY while a client is connected). Boot-arg sweetnfc bit 2 (2 or 3) publishes
++ * 2 s after sweet_nfc_init instead (bit 1 is still the P0 probe at boot).
++ *
++ * Gateway kern.sweet_nfc_gw:
++ *   0 (default): nothing reaches the chip. Every host packet is logged (hex, rate-limited). CORE_RESET_CMD gets a
++ *     local NCI 1.0 CORE_RESET_RSP and (kern.sweet_nfc_id bit 0, default on) a CORE_RESET_NTF carrying an NXP
++ *     identity (manufacturer 0x04, info kern.sweet_nfc_id_info = hw/rom/fw-major/fw-minor, default 51 02 01 6A:
++ *     PN552_FW_02_01_6A). kern.sweet_nfc_id bit 1 (default off) also answers CORE_INIT_CMD locally with an NCI 1.0
++ *     CORE_INIT_RSP carrying the same identity. Every other command gets STATUS_REJECTED; data is dropped.
++ *   1 (for later; off): host CORE_RESET powers and resets the chip (VEN pulse, ST CORE_RESET_NTF, the driver's own
++ *     CORE_INIT and PROP_NFC_MODE_SET), answers the host locally as in mode 0, then forwards the section-4 whitelist
++ *     (filtered) and sends the chip's packets up (no NCI 2.0 -> 1.0 rewriting yet: P2). The SE7 FIFO code sends at
++ *     most 8 bytes per write, so longer host commands are refused (reason bus_len) until a FIFO-refill TX exists.
++ *
++ * HARD RULES (all modes, no switch): gw_filter() below, and the same filter again at the bus in
++ * sweet_nfc_tx_allowed() (a host packet reaches 0x08 only if the filter forwards it byte-for-byte unchanged):
++ *   no host packet with first byte 0x2F (GID 0x0F) ever; only MT=CMD (unsegmented) or MT=DATA from the host
++ *   (download frames are invalid or data off-session); AppleStockholmControl DownloadRequest=1 refused; NFCEE_*:
++ *   DISCOVER answered "0 NFCEEs" locally, everything else refused; CORE_CONN_CREATE to an NFCEE refused;
++ *   RF_SET/GET_LISTEN_MODE_ROUTING refused; data on conn 1 (HCI) refused, data only on conn 0 while an RF interface
++ *   is active; CORE_SET_CONFIG passes ids 0x00-0x7F only (others stripped, logged); CORE_GET_CONFIG standard ids
++ *   only; RF_DISCOVER and RF_DISCOVER_MAP lose every listen entry; anything not on the list is refused; loader mode
++ *   latches (nothing from the host is accepted until reboot). The only pin driven is gpio12 (VEN): spi@980000,
++ *   gpio26/35/55/67 are never touched by this file.
++ *
++ * Counters: kern.sweet_nfc_host_pkts, kern.sweet_nfc_refused ("bus=N prop2f=N ..."). Log lines "SWEET NFC:".
++ */
++
++enum {
++	RF_PROP, RF_INVALID, RF_DOWNLOAD, RF_NFCEE, RF_HCI, RF_LROUTING, RF_CONN_NFCEE, RF_CFG, RF_LISTEN, RF_UNLISTED,
++	RF_LOADER, RF_MODE0, RF_DATA, RF_BUSLEN, RF_CHIP, RF_N
++};
++static const char *const rf_names[RF_N] = {
++	"prop2f", "invalid", "download", "nfcee", "hci", "listen_routing", "conn_nfcee", "config_ids", "listen_modes",
++	"unlisted", "loader", "mode0", "data", "bus_len", "chip"
++};
++enum { V_FWD, V_LOCAL, V_REJ };
++
++static LCK_MTX_DECLARE(gw_lock, &nfc_lock_group);
++static LCK_MTX_DECLARE(p1_lock, &nfc_lock_group);
++static kern_ctl_ref gw_ctl;
++static uint32_t nfc_p1, nfc_gw_mode;
++static uint32_t nfc_id_bits = 1, nfc_id_info = 0x5102016au;
++static uint32_t gw_refused[RF_N];
++static uint32_t gw_host_pkts, gw_host_bytes, gw_up_pkts, gw_up_fail, gw_said, gw_opt_said, gw_sel_said, gw_chip_said;
++static volatile bool gw_session, gw_rx_running;
++static struct {
++	bool connected, rf_active;
++	uint32_t unit, crc, on_demand;
++	char who[32];
++	unsigned asm_n;
++	uint8_t asm_buf[3 + 255];
++	uint8_t termios[72];
++} gw;
++
++static bool
++hdr_ok(uint8_t b0)
++{
++	return (b0 >> 5) <= 1;          /* MT 0 = data, 1 = command: all a host may send */
++}
++
++/*
++ * The section-4 filter. p/n: one whole host packet. V_FWD: o/on = the bytes the chip may get (maybe stripped);
++ * V_LOCAL: the gateway answers itself (CORE_RESET, CORE_INIT, NFCEE_DISCOVER, nothing left after stripping);
++ * V_REJ: refused. *why: the refuse/strip reason or -1.
++ */
++static int
++gw_filter(const uint8_t *p, unsigned n, uint8_t *o, unsigned *on, int *why)
++{
++	unsigned mt, gid, oid, i, k, at;
++
++	*why = -1;
++	*on = 0;
++	if (n < 3 || n != 3u + p[2] || !hdr_ok(p[0])) {
++		*why = RF_INVALID;
++		return V_REJ;
++	}
++	mt = p[0] >> 5;
++	if (mt == 0) {                  /* data: conn id in the low nibble, byte 1 RFU */
++		unsigned conn = p[0] & 0x0fu;
++		if ((p[0] & 0x10u) || p[1] != 0) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		if (conn == 1) {
++			*why = RF_HCI;
++			return V_REJ;
++		}
++		if (conn != 0 || !gw.rf_active) {
++			*why = RF_DATA;
++			return V_REJ;
++		}
++		memcpy(o, p, n);
++		*on = n;
++		return V_FWD;
++	}
++	gid = p[0] & 0x0fu;
++	oid = p[1] & 0x3fu;
++	if ((p[0] & 0x10u) || (p[1] & 0xc0u)) {    /* segmented command or RFU bits: not NCI as nfcd writes it */
++		*why = RF_INVALID;
++		return V_REJ;
++	}
++	if (gid == 0x0f) {
++		*why = RF_PROP;
++		return V_REJ;
++	}
++	switch (gid << 8 | oid) {
++	case 0x000:                     /* CORE_RESET */
++	case 0x001:                     /* CORE_INIT */
++		return V_LOCAL;
++	case 0x002:                     /* CORE_SET_CONFIG: standard ids 0x00-0x7F only */
++		if (n < 4) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		memcpy(o, p, 4);
++		at = 4;
++		k = 0;
++		for (i = 0, *on = 4; i < p[3]; i++) {
++			if (at + 2 > n || at + 2u + p[at + 1] > n) {
++				*why = RF_INVALID;
++				return V_REJ;
++			}
++			if (p[at] < 0x80) {
++				memcpy(o + *on, p + at, 2u + p[at + 1]);
++				*on += 2u + p[at + 1];
++				k++;
++			} else {
++				*why = RF_CFG;
++			}
++			at += 2u + p[at + 1];
++		}
++		if (at != n) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		o[2] = (uint8_t)(*on - 3);
++		o[3] = (uint8_t)k;
++		return k ? V_FWD : V_LOCAL;
++	case 0x003:                     /* CORE_GET_CONFIG: standard ids only */
++		if (n < 4 || n != 4u + p[3]) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		for (i = 0; i < p[3]; i++) {
++			if (p[4 + i] >= 0x80) {
++				*why = RF_CFG;
++				return V_REJ;
++			}
++		}
++		break;
++	case 0x004:                     /* CORE_CONN_CREATE: loopback (1) or remote NFC endpoint (2) only */
++		if (n < 4) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		if (p[3] == 0x03) {
++			*why = RF_CONN_NFCEE;
++			return V_REJ;
++		}
++		if (p[3] != 0x01 && p[3] != 0x02) {
++			*why = RF_UNLISTED;
++			return V_REJ;
++		}
++		break;
++	case 0x005:                     /* CORE_CONN_CLOSE */
++		if (n != 4 || p[3] == 0 || p[3] == 1) {
++			*why = n != 4 ? RF_INVALID : RF_HCI;
++			return V_REJ;
++		}
++		break;
++	case 0x100:                     /* RF_DISCOVER_MAP: entries (protocol, mode, interface); poll bit (1) only */
++		if (n < 4 || n != 4u + 3u * p[3]) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		memcpy(o, p, 4);
++		for (i = 0, k = 0, *on = 4; i < p[3]; i++) {
++			const uint8_t *e = p + 4 + 3 * i;
++			if (e[1] & 0x02u) {
++				*why = RF_LISTEN;
++			}
++			if (e[1] & 0x01u) {
++				o[*on] = e[0];
++				o[*on + 1] = 0x01;
++				o[*on + 2] = e[2];
++				*on += 3;
++				k++;
++			}
++		}
++		o[2] = (uint8_t)(*on - 3);
++		o[3] = (uint8_t)k;
++		return k ? V_FWD : V_LOCAL;
++	case 0x101:                     /* RF_SET_LISTEN_MODE_ROUTING */
++	case 0x102:                     /* RF_GET_LISTEN_MODE_ROUTING */
++		*why = RF_LROUTING;
++		return V_REJ;
++	case 0x103:                     /* RF_DISCOVER: entries (tech & mode, frequency); poll modes (< 0x80) only */
++		if (n < 4 || n != 4u + 2u * p[3]) {
++			*why = RF_INVALID;
++			return V_REJ;
++		}
++		memcpy(o, p, 4);
++		for (i = 0, k = 0, *on = 4; i < p[3]; i++) {
++			const uint8_t *e = p + 4 + 2 * i;
++			if (e[0] >= 0x80) {
++				*why = RF_LISTEN;
++				continue;
++			}
++			o[*on] = e[0];
++			o[*on + 1] = e[1];
++			*on += 2;
++			k++;
++		}
++		if (k == 0) {
++			*why = RF_LISTEN;
++			*on = 0;
++			return V_REJ;
++		}
++		o[2] = (uint8_t)(*on - 3);
++		o[3] = (uint8_t)k;
++		return V_FWD;
++	case 0x104:                     /* RF_DISCOVER_SELECT */
++	case 0x106:                     /* RF_DEACTIVATE */
++	case 0x108:                     /* RF_T3T_POLLING */
++	case 0x110:                     /* RF_ISO_DEP_NAK_PRESENCE (NCI 2.0) */
++		break;
++	case 0x200:                     /* NFCEE_DISCOVER: "0 NFCEEs", locally */
++		*why = RF_NFCEE;
++		return V_LOCAL;
++	default:
++		*why = gid == 0x02 ? RF_NFCEE : RF_UNLISTED;
++		return V_REJ;
++	}
++	memcpy(o, p, n);
++	*on = n;
++	return V_FWD;
++}
++
++/* Bus-level check (sweet_nfc_tx_allowed): a host packet only if the filter forwards it unchanged. */
++static bool
++gw_bus_ok(const uint8_t *tx, unsigned nt)
++{
++	uint8_t o[3 + 255];
++	unsigned on = 0;
++	int why;
++
++	if (!gw_session || nfc_gw_mode != 1 || nt < 3 || nt > sizeof(o)) {
++		return false;
++	}
++	return gw_filter(tx, nt, o, &on, &why) == V_FWD && on == nt && memcmp(o, tx, nt) == 0;
++}
++
++static void
++gw_hexlog(const char *dir, const uint8_t *b, unsigned n, const char *note)
++{
++	char h[3 * 60 + 4];
++
++	hex(h, sizeof(h), b, n > 60 ? 60 : n);
++	SAY("%s %u [%s%s]%s%s\n", dir, n, h, n > 60 ? " .." : "", note ? " " : "", note ? note : "");
++}
++
++/* append a packet to the reply buffer (sent up after gw_lock is dropped) */
++static void
++out_put(uint8_t *out, unsigned *no, unsigned cap, const uint8_t *b, unsigned n)
++{
++	if (*no + n <= cap) {
++		memcpy(out + *no, b, n);
++		*no += n;
++	}
++}
++
++static void
++out_status(uint8_t *out, unsigned *no, unsigned cap, uint8_t gid, uint8_t oid, uint8_t status)
++{
++	const uint8_t r[4] = { (uint8_t)(0x40u | gid), oid, 1, status };
++
++	out_put(out, no, cap, r, sizeof(r));
++}
++
++/* the identity: hw, rom, fw major, fw minor (kern.sweet_nfc_id_info, default 51 02 01 6A) */
++static void
++id_bytes(uint8_t *b)
++{
++	uint32_t v = nfc_id_info;
++
++	b[0] = (uint8_t)(v >> 24);
++	b[1] = (uint8_t)(v >> 16);
++	b[2] = (uint8_t)(v >> 8);
++	b[3] = (uint8_t)v;
++}
++
++static void
++local_reset(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap)
++{
++	uint8_t cfg = (n >= 4 && p[3]) ? 1 : 0;
++	const uint8_t rsp[6] = { 0x40, 0x00, 0x03, 0x00, 0x10, cfg };   /* NCI 1.0: status, version 1.0, config status */
++	uint8_t nt[12] = { 0x60, 0x00, 0x09, 0x02, cfg, 0x10, 0x04, 0x04 };    /* reason: CORE_RESET_CMD; NXP; 4 info bytes */
++
++	id_bytes(nt + 8);
++	out_put(out, no, cap, rsp, sizeof(rsp));
++	if (nfc_id_bits & 1) {
++		out_put(out, no, cap, nt, sizeof(nt));
++	}
++	SAY("gw: CORE_RESET_CMD (%s form, type %u) answered locally: RSP NCI 1.0%s, id %02x %02x %02x %02x\n",
++	    n == 4 ? "1-byte" : "odd", cfg, (nfc_id_bits & 1) ? " + NTF" : "", nt[8], nt[9], nt[10], nt[11]);
++}
++
++static void
++local_init(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap)
++{
++	/* NCI 1.0 CORE_INIT_RSP: status, features(4), RF interfaces (n + list), max logical conns, max routing table
++	 * size(2), max control payload, max large-parameter size(2), manufacturer id, manufacturer info(4) */
++	uint8_t r[3 + 24] = { 0x40, 0x01, 0,
++		              0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x01, 0x00, 0x00, 0xff, 0x00, 0x00, 0x04 };
++	unsigned len = 19;
++
++	(void)p;
++	id_bytes(r + len);
++	len += 4;
++	r[2] = (uint8_t)(len - 3);
++	out_put(out, no, cap, r, len);
++	SAY("gw: CORE_INIT_CMD (%s, %u payload bytes) answered locally: NCI 1.0 CORE_INIT_RSP, manuf 0x04 id %02x %02x %02x %02x\n",
++	    n == 3 ? "NCI 1.0 form" : n == 5 ? "NCI 2.0 form" : "odd form", n - 3, r[len - 4], r[len - 3], r[len - 2], r[len - 1]);
++}
++
++static void
++gw_refuse(int why)
++{
++	if (why >= 0 && why < RF_N) {
++		gw_refused[why]++;
++	}
++}
++
++static void gw_session_stop(const char *why);
++static int gw_chip_tx(const uint8_t *b, unsigned n);
++
++/* one host packet; gw_lock held. *want_up: mode 1 asks for a chip bring-up after the lock is dropped */
++static void
++gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap, bool *want_up)
++{
++	uint8_t fwd[3 + 255];
++	unsigned fn = 0;
++	int why, v;
++	bool cmd = (p[0] >> 5) == 1;
++	uint8_t gid = (uint8_t)(p[0] & 0x0fu), oid = (uint8_t)(p[1] & 0x3fu);
++	bool say;
++
++	gw_host_pkts++;
++	say = gw_said < 300 || (gw_host_pkts % 50) == 0;
++	if (nfc_loader) {
++		gw_refuse(RF_LOADER);
++		if (say) {
++			gw_said++;
++			gw_hexlog("host>", p, n, "REFUSED: loader mode latched");
++		}
++		if (cmd) {
++			out_status(out, no, cap, gid, oid, 0x01);
++		}
++		return;
++	}
++	v = gw_filter(p, n, fwd, &fn, &why);
++	gw_refuse(why);
++	if (say) {
++		gw_said++;
++		gw_hexlog("host>", p, n, why >= 0 ? rf_names[why] : NULL);
++	}
++	if (v == V_LOCAL && cmd && gid == 0 && oid == 0) {
++		local_reset(p, n, out, no, cap);
++		gw.rf_active = false;
++		if (nfc_gw_mode == 1) {
++			*want_up = true;
++		}
++		return;
++	}
++	if (nfc_gw_mode != 1) {         /* mode 0: nothing reaches the chip */
++		if (v == V_LOCAL && gid == 0 && oid == 1 && (nfc_id_bits & 2)) {
++			local_init(p, n, out, no, cap);
++			return;
++		}
++		if (v != V_REJ) {
++			gw_refuse(RF_MODE0);
++		}
++		if (cmd) {
++			out_status(out, no, cap, gid, oid, 0x01);
++		}
++		return;
++	}
++	if (v == V_LOCAL) {
++		if (gid == 0 && oid == 1) {
++			local_init(p, n, out, no, cap);
++		} else if (gid == 2) {
++			const uint8_t r[5] = { 0x42, 0x00, 0x02, 0x00, 0x00 };  /* NFCEE_DISCOVER_RSP: OK, 0 NFCEEs */
++			out_put(out, no, cap, r, sizeof(r));
++		} else {
++			out_status(out, no, cap, gid, oid, 0x00);     /* nothing left after stripping: OK */
++			if (gid == 0 && oid == 2) {
++				out[*no - 2] = 2;       /* CORE_SET_CONFIG_RSP: status OK, 0 invalid ids */
++				const uint8_t z = 0;
++				out_put(out, no, cap, &z, 1);
++			}
++		}
++		return;
++	}
++	if (v == V_REJ) {
++		if (cmd) {
++			out_status(out, no, cap, gid, oid, 0x01);
++		}
++		return;
++	}
++	if (!gw_session) {
++		gw_refuse(RF_CHIP);
++	} else if (fn > 8) {
++		gw_refuse(RF_BUSLEN);
++	} else if (gw_chip_tx(fwd, fn) == 0) {
++		return;
++	} else {
++		gw_refuse(RF_CHIP);
++	}
++	if (cmd) {
++		out_status(out, no, cap, gid, oid, 0x01);
++	}
++}
++
++/* ---- mode 1: the chip session ---------------------------------------------------------------------------------- */
++
++static int
++gw_chip_tx(const uint8_t *b, unsigned n)
++{
++	int err = sweet_se7_xfer(NFC_ADDR, b, n, NULL, 0);     /* the bus checks gw_bus_ok() again */
++
++	if (gw_chip_said < 200) {
++		gw_chip_said++;
++		gw_hexlog("->chip", b, n, err ? "FAILED" : NULL);
++	}
++	return err;
++}
++
++static void
++gw_up(const uint8_t *b, unsigned n)
++{
++	uint32_t unit;
++
++	lck_mtx_lock(&gw_lock);
++	unit = gw.connected ? gw.unit : 0;
++	lck_mtx_unlock(&gw_lock);
++	if (unit == 0 || gw_ctl == NULL || n == 0) {
++		return;
++	}
++	if (ctl_enqueuedata(gw_ctl, unit, (void *)(uintptr_t)b, n, 0) == 0) {
++		gw_up_pkts++;
++	} else {
++		gw_up_fail++;
++	}
++}
++
++static void
++gw_chip_packet(const uint8_t *p, unsigned n)
++{
++	const char *note = NULL;
++	bool up = true;
++
++	if ((p[0] == 0x61 && p[1] == 0x05)) {
++		gw.rf_active = true;
++	} else if ((p[0] == 0x61 || p[0] == 0x41) && p[1] == 0x06) {
++		gw.rf_active = false;
++	}
++	if ((p[0] & 0x0fu) == 0x0f && (p[0] >> 5) != 0) {
++		up = false;
++		note = "ST proprietary: kept";
++	} else if ((p[0] == 0x40 || p[0] == 0x60) && p[1] == 0x00) {
++		up = false;
++		note = "reset: driver-owned, kept";
++	} else if (p[0] == 0x40 && p[1] == 0x01) {
++		up = false;
++		note = "init: driver-owned, kept";
++	}
++	if (gw_chip_said < 200) {
++		gw_chip_said++;
++		gw_hexlog("chip>", p, n, note);
++	}
++	if (up) {
++		gw_up(p, n);
++	}
++}
++
++static void
++gw_rx_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static uint8_t p[3 + 255];
++	unsigned n;
++
++	while (gw_session) {
++		if (!pin_in(P_IRQ)) {
++			sleep_ms(2);
++			continue;
++		}
++		if (nfc_read_pkt(p, &n, 0) != 0) {
++			sleep_ms(2);
++			continue;
++		}
++		if (p[0] == 0x60 && p[1] == 0x00 && n >= 4 &&
++		    ((p[2] == 0x39 && p[3] == 0xa1) || (p[2] == 0x41 && p[3] == 0xa2))) {
++			nfc_loader = true;
++			gw_session = false;
++			ven(false);
++			gw_hexlog("chip>", p, n, "LOADER MODE - STOPPED, VEN low, latched until reboot");
++			set_state("loader");
++			break;
++		}
++		gw_chip_packet(p, n);
++	}
++	gw_rx_running = false;
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* VEN pulse, ST CORE_RESET_NTF, the driver's CORE_INIT (+ MODE_SET ON once if rejected), then the RX thread */
++static int
++gw_session_start(void)
++{
++	unsigned n = 0, m = 0;
++	int err;
++	thread_t th;
++
++	if (nfc_loader) {
++		return EPERM;
++	}
++	if (gw_session) {
++		gw_session_stop("host reset");
++	}
++	if (__atomic_exchange_n(&nfc_busy, true, __ATOMIC_ACQ_REL)) {
++		SAY("gw: chip busy (P0 probe running): no session\n");
++		return EBUSY;
++	}
++	if (!pins_map() || !sweet_se7_init_nfc()) {
++		nfc_busy = false;
++		SAY("gw: pins or SE7 bus not available: no session\n");
++		return ENXIO;
++	}
++	nfc_tx_open = true;
++	ven(true);
++	sleep_ms(10);
++	ven(false);
++	sleep_ms(20);
++	ven(true);
++	sleep_ms(10);
++	ven(false);
++	sleep_ms(20);
++	ven(true);
++	err = nfc_wait_for(0x60, 0x00, ntf, &n, NFC_WAIT_MS);
++	if (err == 0 && ((ntf[2] == 0x39 && ntf[3] == 0xa1) || (ntf[2] == 0x41 && ntf[3] == 0xa2))) {
++		nfc_loader = true;
++		nfc_tx_open = false;
++		ven(false);
++		set_state("loader");
++		SAY("gw: chip in LOADER MODE - STOPPED, VEN low, nothing more is sent until reboot\n");
++		nfc_busy = false;
++		return EPERM;
++	}
++	if (err == 0) {
++		err = nfc_wr(TX_CORE_INIT, sizeof(TX_CORE_INIT), "CORE_INIT_CMD");
++		err = err ? err : nfc_wait_for(0x40, 0x01, pkt, &m, NFC_WAIT_MS);
++		if (err || m < 4 || pkt[3] != 0) {
++			if (nfc_wr(TX_MODE_ON, sizeof(TX_MODE_ON), "PROP_NFC_MODE_SET_ON") == 0) {
++				(void)nfc_wait_for(0x4f, 0x02, pkt, &m, NFC_WAIT_MS);
++			}
++			err = nfc_wr(TX_CORE_INIT, sizeof(TX_CORE_INIT), "CORE_INIT_CMD (2nd)");
++			err = err ? err : nfc_wait_for(0x40, 0x01, pkt, &m, NFC_WAIT_MS);
++			if (!err && (m < 4 || pkt[3] != 0)) {
++				err = EPROTO;
++			}
++		}
++	}
++	nfc_tx_open = false;
++	if (err) {
++		ven(false);
++		nfc_busy = false;
++		set_state("gw:chip_error");
++		SAY("gw: chip bring-up failed (%d): VEN low, no session\n", err);
++		return err;
++	}
++	gw.rf_active = false;
++	gw_session = true;
++	gw_rx_running = true;
++	if (kernel_thread_start(gw_rx_thread, NULL, &th) != KERN_SUCCESS) {
++		gw_session = false;
++		gw_rx_running = false;
++		ven(false);
++		nfc_busy = false;
++		return ENOMEM;
++	}
++	thread_deallocate(th);
++	set_state("gw:session");
++	SAY("gw: chip session up (mode 1): filtered host packets now reach the chip\n");
++	return 0;
++}
++
++static void
++gw_session_stop(const char *why)
++{
++	if (!gw_session && !gw_rx_running) {
++		return;
++	}
++	gw_session = false;
++	for (unsigned i = 0; gw_rx_running && i < 500; i++) {
++		sleep_ms(1);
++	}
++	ven(false);
++	gw.rf_active = false;
++	nfc_busy = false;
++	if (!nfc_loader) {
++		set_state("off");
++	}
++	SAY("gw: chip session stopped (%s): VEN low\n", why);
++}
++
++/* ---- the kernel control com.apple.uart.stockholm ---------------------------------------------------------------- */
++
++static errno_t
++gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	char who[32] = "?";
++
++	proc_selfname(who, sizeof(who));
++	*unitinfo = NULL;
++	lck_mtx_lock(&gw_lock);
++	if (gw.connected) {
++		lck_mtx_unlock(&gw_lock);
++		SAY("com.apple.uart.stockholm: second connect by %s (pid %d) refused (EBUSY), %s holds it\n", who,
++		    proc_selfpid(), gw.who);
++		return EBUSY;
++	}
++	gw.connected = true;
++	gw.unit = sac->sc_unit;
++	gw.asm_n = 0;
++	gw.rf_active = false;
++	gw.crc = gw.on_demand = 0;
++	strlcpy(gw.who, who, sizeof(gw.who));
++	lck_mtx_unlock(&gw_lock);
++	SAY("com.apple.uart.stockholm: OPEN by %s (pid %d), unit %u, gateway mode %u\n", who, proc_selfpid(), sac->sc_unit,
++	    nfc_gw_mode);
++	return 0;
++}
++
++static errno_t
++gw_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
++{
++	char who[32];
++
++	lck_mtx_lock(&gw_lock);
++	if (gw.unit == unit) {
++		gw.connected = false;
++		gw.unit = 0;
++	}
++	strlcpy(who, gw.who, sizeof(who));
++	lck_mtx_unlock(&gw_lock);
++	SAY("com.apple.uart.stockholm: CLOSE (%s, unit %u): host packets %u (%u bytes), sent up %u (failed %u)\n", who, unit,
++	    gw_host_pkts, gw_host_bytes, gw_up_pkts, gw_up_fail);
++	gw_session_stop("client closed");
++	return 0;
++}
++
++static errno_t
++gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
++{
++	static uint8_t out[1024];       /* replies, sent after gw_lock is dropped; one sender at a time (gw_lock) */
++	uint8_t copy[1024];
++	unsigned no = 0;
++	bool want_up = false;
++
++	lck_mtx_lock(&gw_lock);
++	for (mbuf_t b = m; b != NULL; b = mbuf_next(b)) {
++		const uint8_t *d = mbuf_data(b);
++		size_t len = mbuf_len(b), i = 0;
++
++		gw_host_bytes += (uint32_t)len;
++		while (i < len) {
++			if (gw.asm_n == 0 && gw.crc && len - i == 2) {
++				SAY("host> 2 trailing bytes [%02x %02x] after a packet with CRC on: taken as CRC16, dropped\n", d[i],
++				    d[i + 1]);
++				break;
++			}
++			if (gw.asm_n == 0 && !hdr_ok(d[i])) {
++				gw_refuse(RF_INVALID);
++				gw_hexlog("host>", d + i, (unsigned)(len - i), "INVALID first byte (not NCI cmd/data): rest of chunk dropped");
++				break;
++			}
++			if (gw.asm_n < 3) {
++				gw.asm_buf[gw.asm_n++] = d[i++];
++				continue;
++			}
++			unsigned need = 3u + gw.asm_buf[2], take = need - gw.asm_n;
++			if (take > len - i) {
++				take = (unsigned)(len - i);
++			}
++			memcpy(gw.asm_buf + gw.asm_n, d + i, take);
++			gw.asm_n += take;
++			i += take;
++			if (gw.asm_n == need) {
++				gw_host_packet(gw.asm_buf, need, out, &no, sizeof(out), &want_up);
++				gw.asm_n = 0;
++			}
++		}
++		/* a header with a zero-length payload completes at the third byte */
++		if (gw.asm_n == 3 && gw.asm_buf[2] == 0) {
++			gw_host_packet(gw.asm_buf, 3, out, &no, sizeof(out), &want_up);
++			gw.asm_n = 0;
++		}
++	}
++	memcpy(copy, out, no);
++	lck_mtx_unlock(&gw_lock);
++	mbuf_freem(m);
++	if (want_up) {
++		(void)gw_session_start();
++	}
++	if (no) {
++		if (gw_said < 300) {
++			gw_hexlog("host<", copy, no, "(local)");
++		}
++		if (ctl_enqueuedata(gw_ctl, unit, copy, no, 0) == 0) {
++			gw_up_pkts++;
++		} else {
++			gw_up_fail++;
++		}
++	}
++	return 0;
++}
++
++static const char *
++opt_name(uint32_t opt)
++{
++	switch (opt) {
++	case 0x80047301u: return "IO_STOCKHOLM_CRC";
++	case 0x80047302u: return "IO_STOCKHOLM_ON_DEMAND_CLIENT";
++	case 0x40407303u: return "IO_STOCKHOLM_SPMIERRORS";
++	case 0x40487413u: return "TIOCGETA";
++	case 0x80487414u: return "TIOCSETA";
++	case 0x80047410u: return "TIOCFLUSH";
++	case 0x4004746au: return "TIOCMGET";
++	default: return "unknown";
++	}
++}
++
++static errno_t
++gw_ctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t len)
++{
++	uint32_t o = (uint32_t)opt, v = 0;
++	uint64_t cflag = 0, ispeed = 0, ospeed = 0;
++
++	if (data != NULL && len >= 4) {
++		memcpy(&v, data, 4);
++	}
++	lck_mtx_lock(&gw_lock);
++	switch (o) {
++	case 0x80047301u:
++		gw.crc = v;
++		break;
++	case 0x80047302u:
++		gw.on_demand = v;
++		break;
++	case 0x80487414u:
++		if (data != NULL && len <= sizeof(gw.termios)) {
++			memcpy(gw.termios, data, len);
++		}
++		if (len >= 72) {
++			memcpy(&cflag, (uint8_t *)data + 16, 8);
++			memcpy(&ispeed, (uint8_t *)data + 56, 8);
++			memcpy(&ospeed, (uint8_t *)data + 64, 8);
++		}
++		break;
++	case 0x80047410u:
++		gw.asm_n = 0;           /* flush: drop a half-assembled host packet */
++		break;
++	default:
++		break;
++	}
++	lck_mtx_unlock(&gw_lock);
++	if (gw_opt_said++ < 200) {
++		if (o == 0x80487414u) {
++			SAY("setopt %#x %s (%zu bytes): c_cflag %#llx ispeed %llu ospeed %llu\n", o, opt_name(o), len, cflag, ispeed, ospeed);
++		} else {
++			SAY("setopt %#x %s (%zu bytes) = %u%s\n", o, opt_name(o), len, v,
++			    o == 0x80047301u && v ? " (CRC ON: framing unknown; 2-byte trailers are logged and dropped)" : "");
++		}
++	}
++	return 0;
++}
++
++static errno_t
++gw_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t *len)
++{
++	uint32_t o = (uint32_t)opt;
++	size_t want = len ? *len : 0;
++
++	if (data != NULL && len != NULL) {
++		bzero(data, *len);
++		if (o == 0x40487413u) {                         /* TIOCGETA */
++			lck_mtx_lock(&gw_lock);
++			size_t k = *len < sizeof(gw.termios) ? *len : sizeof(gw.termios);
++			memcpy(data, gw.termios, k);
++			lck_mtx_unlock(&gw_lock);
++			*len = k;
++		} else if (o == 0x4004746au && *len >= 4) {     /* TIOCMGET: CTS asserted */
++			const uint32_t lines = 0x20u;           /* TIOCM_CTS */
++			memcpy(data, &lines, 4);
++			*len = 4;
++		} else if (o == 0x40407303u) {                  /* IO_STOCKHOLM_SPMIERRORS: 64 bytes of zeros */
++			*len = *len < 64 ? *len : 64;
++		}
++	}
++	if (gw_opt_said++ < 200) {
++		SAY("getopt %#x %s (%zu bytes asked, %zu given)\n", o, opt_name(o), want, len ? *len : 0);
++	}
++	return 0;
++}
++
++static void
++gw_ctl_rcvd(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, __unused int flags)
++{
++}
++
++static errno_t
++gw_ctl_register(void)
++{
++	struct kern_ctl_reg reg;
++	uint64_t cflag = 0x4b00, speed = 115200;        /* CS8 | CREAD | CLOCAL until nfcd sets its own */
++	errno_t e;
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, "com.apple.uart.stockholm", sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM | CTL_FLAG_REG_EXTENDED;
++	reg.ctl_sendsize = 16 * 1024;
++	reg.ctl_recvsize = 16 * 1024;
++	reg.ctl_connect = gw_ctl_connect;
++	reg.ctl_disconnect = gw_ctl_disconnect;
++	reg.ctl_send = gw_ctl_send;
++	reg.ctl_setopt = gw_ctl_setopt;
++	reg.ctl_getopt = gw_ctl_getopt;
++	reg.ctl_rcvd = gw_ctl_rcvd;
++	bzero(gw.termios, sizeof(gw.termios));
++	memcpy(gw.termios + 16, &cflag, 8);
++	memcpy(gw.termios + 56, &speed, 8);
++	memcpy(gw.termios + 64, &speed, 8);
++	e = ctl_register(&reg, &gw_ctl);
++	SAY("kernel control com.apple.uart.stockholm -> %d (id %u)\n", e, reg.ctl_id);
++	if (e) {
++		gw_ctl = NULL;
++	}
++	return e;
++}
++
++/* ---- AppleStockholmControlUserClient (SweetNFC.cpp) calls ------------------------------------------------------ */
++
++/* 0 ok, 1 not permitted, 2 unsupported, 3 bad argument */
++int
++sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v)
++{
++	static const char *const names[9] = { "Power", "DownloadRequest", "PMUStandbyPower", "DeviceWake", "(4)", "VBAT",
++		                              "ValidateSPMIConfig", "ConfigureHammerfestSPMI", "SPMISlaveReset" };
++	int r = 0;
++	const char *what = "";
++	char who[32];
++
++	proc_selfname(who, sizeof(who));
++	if (sel > 8 || ((sel <= 3 || sel == 5 || sel == 8) && nin < 1)) {
++		r = 3;
++	} else if (sel == 0) {
++		if (v && nfc_loader) {
++			r = 1;
++			what = "loader mode latched: VEN stays low";
++		} else if (nfc_busy && !gw_session) {
++			what = "P0 probe running: VEN left to the probe";
++		} else if (!pins_map()) {
++			r = 2;
++			what = "pins not mapped";
++		} else {
++			if (!v && gw_session) {
++				gw_session_stop("Power 0");
++			}
++			ven(v != 0);
++			what = v ? "VEN (gpio12) high" : "VEN (gpio12) low";
++		}
++	} else if (sel == 1) {
++		if (v == 1) {
++			r = 1;
++			gw_refused[RF_DOWNLOAD]++;
++			what = "REFUSED: no download mode on this port";
++		} else {
++			what = "download request off: accepted";
++		}
++	} else if (sel == 2 || sel == 3 || sel == 5) {
++		what = "accepted, no-op";
++	} else {
++		r = 2;
++		what = sel == 4 ? "unsupported" : "SPMI only: unsupported";
++	}
++	if (gw_sel_said++ < 200 || sel == 1) {
++		SAY("AppleStockholmControlUserClient: %s sel %u %s(%llu) [%u in] -> %s%s\n", who, sel, sel <= 8 ? names[sel] : "?",
++		    v, nin, r == 0 ? "ok" : r == 1 ? "kIOReturnNotPermitted" : r == 2 ? "kIOReturnUnsupported" : "kIOReturnBadArgument",
++		    *what ? ": " : "");
++		if (*what) {
++			SAY("  ... %s\n", what);
++		}
++	}
++	return r;
++}
++
++void
++sweet_nfc_uc_event(int open, uint32_t type)
++{
++	char who[32];
++
++	proc_selfname(who, sizeof(who));
++	SAY("AppleStockholmControlUserClient: %s by %s (pid %d), type %u\n", open ? "OPEN" : "CLOSE", who, proc_selfpid(),
++	    type);
++	if (!open && !gw_session && !(nfc_busy) && pins_map()) {
++		ven(false);             /* the client is gone: chip off */
++	}
++}
++
++/* ---- the P1 switch ------------------------------------------------------------------------------------------------ */
++
++static int
++nfc_p1_set(uint32_t v, const char *why)
++{
++	int e = 0;
++
++	lck_mtx_lock(&p1_lock);
++	if (v == nfc_p1) {
++		lck_mtx_unlock(&p1_lock);
++		return 0;
++	}
++	if (v == 1) {
++		e = SweetNFCPublish(true, why);
++		if (e == 0 || e == EALREADY) {
++			e = gw_ctl_register();
++			if (e) {
++				(void)SweetNFCPublish(false, "control registration failed");
++			}
++		}
++		if (e == 0) {
++			nfc_p1 = 1;
++		}
++	} else {
++		if (gw.connected) {
++			e = EBUSY;
++		} else if (gw_ctl != NULL && (e = ctl_deregister(gw_ctl)) == 0) {
++			gw_ctl = NULL;
++		}
++		if (e == 0) {
++			(void)SweetNFCPublish(false, why);
++			nfc_p1 = 0;
++		}
++	}
++	lck_mtx_unlock(&p1_lock);
++	SAY("P1 %s (%s) -> %d\n", v ? "publish" : "withdraw", why, e);
++	return e;
++}
++
++static void
++nfc_p1_boot_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	sleep_ms(2000);
++	for (unsigned i = 0; i < 30 && nfc_p1_set(1, "boot-arg sweetnfc bit 2") == ENXIO; i++) {
++		sleep_ms(1000);         /* no platform expert yet */
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++sysctl_nfc_p1 SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, (int)nfc_p1, sizeof(value), &value, &changed);
++
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 0 && value != 1) {
++		return EINVAL;
++	}
++	return nfc_p1_set((uint32_t)value, value ? "kern.sweet_nfc_p1=1" : "kern.sweet_nfc_p1=0");
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_p1, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_p1, "I",
++    "redfin 1119: 1 = publish AppleStockholmControl + com.apple.uart.stockholm (default 0: nothing published)");
++
++static int
++sysctl_nfc_gw SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, (int)nfc_gw_mode, sizeof(value), &value, &changed);
++
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 0 && value != 1) {
++		return EINVAL;
++	}
++	nfc_gw_mode = (uint32_t)value;
++	if (value == 0) {
++		gw_session_stop("kern.sweet_nfc_gw=0");
++	}
++	SAY("gateway mode %d%s\n", value, value ? " (pass-through of the filtered whitelist from the next host CORE_RESET)" :
++	    " (log + reject, nothing reaches the chip)");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_gw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_gw, "I",
++    "redfin 1119: NFC gateway mode (0 = log and reject, nothing to the chip; 1 = filtered pass-through)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_id_bits, 0,
++    "redfin 1119: bit 0 = CORE_RESET_NTF after the local RSP (default 1); bit 1 = local CORE_INIT_RSP in mode 0");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id_info, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_id_info, 0,
++    "redfin 1119: identity bytes hw.rom.fwmajor.fwminor (default 0x5102016a = PN552 FW 02.01.6A)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_host_pkts, CTLFLAG_RD | CTLFLAG_LOCKED, &gw_host_pkts, 0,
++    "redfin 1119: NCI packets received from the host on com.apple.uart.stockholm");
++
++static int
++sysctl_nfc_refused SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char b[400];
++	size_t o = 0;
++
++	o += (size_t)snprintf(b, sizeof(b), "bus=%u", nfc_refused);
++	for (unsigned i = 0; i < RF_N && o < sizeof(b); i++) {
++		o += (size_t)snprintf(b + o, sizeof(b) - o, " %s=%u", rf_names[i], gw_refused[i]);
++	}
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_refused, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_refused, "A",
++    "redfin 1119: refused / stripped host traffic by reason (bus = writes the SE7 bus check refused)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 02b07e2..3b06727 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2669,7 +2669,8 @@ sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char
+ /* redfin 0982: every property read from the sweetbtnub stand-in nubs (iokit/Kernel/arm/SweetBTNub.cpp) */
+ extern "C" bool SweetBTNubIs(const void *entry);
+ extern "C" bool SweetABPIs(const void *entry);      /* 1061: the AppleBasebandPCI stand-ins (SweetABP.cpp) */
+-static uint32_t sweet_btnub_reads, sweet_abp_reads;
++extern "C" bool SweetNFCIs(const void *entry);      /* 1119: stockholm nub + AppleStockholmControl (SweetNFC.cpp) */
++static uint32_t sweet_btnub_reads, sweet_abp_reads, sweet_nfc_reads;
+ 
+ static void
+ sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
+@@ -2685,6 +2686,17 @@ sweet_btnub_read(IORegistryEntry *entry, const char *key, const char *how)
+ 		}
+ 		return;
+ 	}
++	if (SweetNFCIs(entry)) {
++		if (sweet_nfc_reads++ < 300) {
++			char pn[32];
++			proc_selfname(pn, (int)sizeof(pn));
++			OSObject *nv = key ? entry->copyProperty(key) : NULL;
++			IOLog("SWEET NFC: %s reads %s.%s (%s) -> %s\n", pn, entry->getName(), key ? key : "*", how,
++			    key ? (nv ? "found" : "MISSING") : "all");
++			OSSafeReleaseNULL(nv);
++		}
++		return;
++	}
+ 	if (!SweetBTNubIs(entry) || sweet_btnub_reads >= 500) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetNFC.cpp b/iokit/Kernel/arm/SweetNFC.cpp
+new file mode 100644
+index 0000000..d774d21
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNFC.cpp
+@@ -0,0 +1,211 @@
++/*
++ * redfin 1119: NFC P1, the IOKit half (bsd/dev/sweet_nfc.c holds the switch, the kernel control and the gateway).
++ *
++ * iOS 16.7's libNFC_HAL finds the NFC controller with IOServiceNameMatching("AppleStockholmControl") plus
++ * IOPropertyMatch { IONameMatched = "nfc,primary,gpio" } (sub_1f5de1650 in NFHardwareSerialGetDefaultInterfaceType,
++ * retried 100 x 100 ms after a slow tree walk), then IOServiceOpen(type 0) and IOConnectCallScalarMethod(sel, 1 in).
++ * On an iPhone the kext matched the device-tree nub /arm-io/uart3/stockholm by IONameMatch "nfc,primary,gpio" and
++ * so carries IONameMatched; here a kernel nub "stockholm" (the D22 node's plain properties, no GPIO phandles, no
++ * rf-config-tlvs / rf-clock-tlv / calibration, required-gpios without support_download_request) and an
++ * AppleStockholmControl on it with that property set by hand stand in. No ADT change, no new image needed for the
++ * name lookup. Published and withdrawn only by sweet_nfc.c (kern.sweet_nfc_p1 / boot-arg sweetnfc bit 2), whose
++ * p1 lock serialises the calls. Property reads on both are logged (IOUserClient.cpp, "SWEET NFC: ... reads").
++ *
++ * AppleStockholmControlUserClient selectors (libNFC_HAL _NFHardwareGPIOSetBoolean): 0 Power (VEN, gpio12),
++ * 1 DownloadRequest (1 is REFUSED: kIOReturnNotPermitted), 2 PMU standby, 3 DeviceWake, 5 VBAT (accepted no-ops),
++ * 6/7/8 SPMI only (kIOReturnUnsupported). All decided and logged in sweet_nfc_uc_call().
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSString.h>
++
++extern "C" {
++#include <sys/errno.h>
++int SweetNFCPublish(bool on, const char *why);
++bool SweetNFCIs(const void *entry);
++int sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v);
++void sweet_nfc_uc_event(int open, uint32_t type);
++}
++
++class SweetStockholmNub : public IOService
++{
++	OSDeclareDefaultStructors(SweetStockholmNub);
++};
++OSDefineMetaClassAndStructors(SweetStockholmNub, IOService);
++
++class AppleStockholmControl : public IOService
++{
++	OSDeclareDefaultStructors(AppleStockholmControl);
++};
++OSDefineMetaClassAndStructors(AppleStockholmControl, IOService);
++
++class AppleStockholmControlUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleStockholmControlUserClient);
++	UInt32 fType;
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleStockholmControlUserClient, IOUserClient);
++
++bool
++AppleStockholmControlUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fType = type;
++	sweet_nfc_uc_event(1, type);
++	return true;
++}
++
++IOReturn
++AppleStockholmControlUserClient::clientClose(void)
++{
++	sweet_nfc_uc_event(0, fType);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleStockholmControlUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	uint64_t v = (args->scalarInputCount && args->scalarInput) ? args->scalarInput[0] : 0;
++	int r = sweet_nfc_uc_call(selector, args->scalarInputCount, v);
++
++	for (uint32_t i = 0; args->scalarOutput && i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	switch (r) {
++	case 0:
++		return kIOReturnSuccess;
++	case 1:
++		return kIOReturnNotPermitted;
++	case 2:
++		return kIOReturnUnsupported;
++	default:
++		return kIOReturnBadArgument;
++	}
++}
++
++static IOService *nfc_nub, *nfc_ctl;
++
++static void
++put_data(IORegistryEntry *e, const char *key, const void *bytes, unsigned len)
++{
++	OSData *v = OSData::withBytes(bytes, len);
++	if (v) {
++		e->setProperty(key, v);
++		v->release();
++	}
++}
++
++/* D22AP /arm-io/uart3/stockholm, plain properties only (NUL-terminated strings, as the device tree stores them) */
++static void
++put_stockholm(IORegistryEntry *e)
++{
++	static const char compat[] = "nfc,primary,gpio";
++	static const char rgpio[] = "support_wake_stockholm|support_device_wake|support_venable";
++	static const uint8_t one[4] = { 1, 0, 0, 0 };
++
++	put_data(e, "compatible", compat, sizeof(compat));
++	put_data(e, "device_type", "stockholm", 10);
++	put_data(e, "nfcWithRadio", one, sizeof(one));
++	put_data(e, "supports-nfc-reader-mode", "", 0);
++	put_data(e, "rf-antenna-name", "RTM4_1", 7);
++	put_data(e, "required-gpios", rgpio, sizeof(rgpio));
++	e->setProperty("SweetNFC", true);
++}
++
++static bool
++start_on(IOService *svc, IOService *provider, const char *name)
++{
++	if (!svc->attach(provider)) {
++		svc->release();
++		return false;
++	}
++	svc->setName(name);
++	if (!svc->start(provider)) {
++		svc->detach(provider);
++		svc->release();
++		return false;
++	}
++	svc->registerService();
++	return true;
++}
++
++/* 0 ok, EALREADY in that state already, ENXIO no platform expert yet, ENOMEM. Caller: sweet_nfc.c, p1 lock held. */
++int
++SweetNFCPublish(bool on, const char *why)
++{
++	if (!on) {
++		if (nfc_ctl == NULL && nfc_nub == NULL) {
++			return EALREADY;
++		}
++		IOService *c = nfc_ctl, *n = nfc_nub;
++		nfc_ctl = NULL;
++		nfc_nub = NULL;
++		if (c) {
++			c->terminate(kIOServiceSynchronous);
++			c->release();
++		}
++		if (n) {
++			n->terminate(kIOServiceSynchronous);
++			n->release();
++		}
++		IOLog("SWEET NFC: AppleStockholmControl and the stockholm nub withdrawn (%s)\n", why);
++		return 0;
++	}
++	if (nfc_ctl != NULL) {
++		return EALREADY;
++	}
++	IOService *platform = IOService::getPlatform();
++	if (platform == NULL) {
++		return ENXIO;
++	}
++	SweetStockholmNub *nub = OSTypeAlloc(SweetStockholmNub);
++	if (nub == NULL || !nub->init()) {
++		OSSafeReleaseNULL(nub);
++		return ENOMEM;
++	}
++	put_stockholm(nub);
++	if (!start_on(nub, platform, "stockholm")) {
++		return ENOMEM;
++	}
++	AppleStockholmControl *ctl = OSTypeAlloc(AppleStockholmControl);
++	if (ctl == NULL || !ctl->init()) {
++		OSSafeReleaseNULL(ctl);
++		nub->terminate(kIOServiceSynchronous);
++		nub->release();
++		return ENOMEM;
++	}
++	put_stockholm(ctl);
++	ctl->setProperty("IONameMatched", "nfc,primary,gpio");     /* what libNFC_HAL's IOPropertyMatch asks for */
++	ctl->setProperty(kIOUserClientClassKey, "AppleStockholmControlUserClient");
++	if (!start_on(ctl, nub, "AppleStockholmControl")) {
++		nub->terminate(kIOServiceSynchronous);
++		nub->release();
++		return ENOMEM;
++	}
++	nfc_nub = nub;                  /* attach keeps the registry's references; these are ours */
++	nfc_ctl = ctl;
++	IOLog("SWEET NFC: published stockholm nub under %s and AppleStockholmControl (IONameMatched nfc,primary,gpio, "
++	    "user client AppleStockholmControlUserClient) (%s); no AppleStockholmSPMI: nfcd picks interface type 1, "
++	    "com.apple.uart.stockholm\n", platform->getName(), why);
++	return 0;
++}
++
++bool
++SweetNFCIs(const void *entry)
++{
++	return entry != NULL && (entry == nfc_nub || entry == nfc_ctl);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 01771e3..51d817b 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -21,6 +21,7 @@ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitc
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBTNub.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetABP.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetNFC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+-- 
+2.53.0
+
