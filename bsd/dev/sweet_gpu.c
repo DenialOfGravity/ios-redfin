@@ -2700,6 +2700,17 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_sspp, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet
     "SWEET MDP: VIG UBWC_STATIC value for compressed scanout (1111, 0 = by decoder version)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_mdss, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_mdss, 0,
     "SWEET MDP: MDSS UBWC_STATIC (1111, 0 = auto if zero, 1 = never write, else the value)");
+/*
+ * 1120: kern.sweet_ubwc_errclr how SSPP_UBWC_ERROR_STATUS is cleared (0 BIT(31) as upstream, 1 BIT(31) then 0, 2 write
+ * back the value read); kern.sweet_ubwc_mdss2 0x1XY writes MDSS UBWC_CTRL_2 = Y, PREDICTION_MODE = X at the next switch
+ * to compressed (0 = never written, default).
+ */
+int sweet_ubwc_errclr = 0;
+int sweet_ubwc_mdss2 = 0;
+SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_errclr, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_errclr, 0,
+    "SWEET MDP: UBWC error clear 0 BIT31 (upstream) 1 BIT31 then 0 2 write-1-to-clear (1120)");
+SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_mdss2, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_mdss2, 0,
+    "SWEET MDP: 0x1XY = MDSS UBWC_CTRL_2 Y, PREDICTION_MODE X at the next UBWC switch (1120, 0 never)");
 
 int sweet_scangate_flag = 1;
 static volatile int scangate_flag_pid = -1;
