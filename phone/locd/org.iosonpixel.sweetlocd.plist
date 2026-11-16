@@ -6,6 +6,9 @@
   merged there as /System/Library/LaunchDaemons/org.iosonpixel.sweetlocd.plist; not installed by default.
   Never on by default: no RunAtLoad. launchd starts it only while /var/local/loc.on exists (KeepAlive PathState); it exits 0
   when the file is absent at start or gone 15 s (after STOP to the modem), and is not restarted after a clean exit.
+  ws-gnss-e: also while /var/local/locd.lock-orig exists (written only by unlock=mi/none before changing the modem's engine
+  lock, removed after the restore is confirmed): then it restores that value even with loc.on absent (at most 5 runs).
+  ExitTimeOut 25: SIGTERM waits for the engine lock restore (SET + GET, at most 15 s).
   Needs kern.sweet_mqrtr_aux=1 (xnu 1124) for /dev/sweet-mqrtr-aux; until then it retries the open every 10 s and does
   nothing. Binary /var/local/bin/sweetlocd; log /var/local/locd.log; status: sweetlocd status.
   By hand without launchd: /var/local/bin/sweetlocd & (stop: kill -TERM).
@@ -26,6 +29,8 @@
 		<dict>
 			<key>/var/local/loc.on</key>
 			<true/>
+			<key>/var/local/locd.lock-orig</key>
+			<true/>
 		</dict>
 		<key>SuccessfulExit</key>
 		<false/>
@@ -33,7 +38,7 @@
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>ExitTimeOut</key>
-	<integer>5</integer>
+	<integer>25</integer>
 	<key>UserName</key>
 	<string>root</string>
 	<key>StandardErrorPath</key>

@@ -36,4 +36,6 @@ extern int loc_fake_kernel_router;
 int loc_on_present(void);
 void loc_shutdown(const char *why);
 int loc_quiet(void);
+/* 1 while an engine lock change/restore/repair (unlock= word, /var/local/locd.lock-orig) is running or due */
+int loc_lock_busy(void);
 #endif

@@ -10,10 +10,13 @@
  * client and its session even after a crash). If the device cannot be opened (old kernel, sysctl 0, EBUSY) it is tried
  * again every 10 s, one log line per new error.
  *
- * Switch /var/local/loc.on (words probe=1 / session=N / pds=1, as before; loc.c header). Without it nothing goes to the
- * modem; the daemon exits 0 when the file is absent at start, or once it has been gone 15 s and the session is stopped
- * (launchd job com.sweet.locd: started while the file exists, KeepAlive PathState). SIGTERM/SIGINT/SIGHUP: STOP + REG_EVENTS 0
- * for a running session, BYE to the relay, wait for the answers (at most 3 s), close, exit 0.
+ * Switch /var/local/loc.on (words probe=1 / session=N / pds=1 / unlock=mi / unlock=none; loc.c header). Without it
+ * nothing goes to the modem, except the engine lock repair: when /var/local/locd.lock-orig exists (an earlier run unlocked
+ * and did not restore) the daemon also runs with loc.on absent, restores that value (GET, SET, GET; at most 5 runs) and
+ * exits. Otherwise it exits 0 when loc.on is absent at start, or once it has been gone 15 s and the session is stopped
+ * (launchd job org.iosonpixel.sweetlocd: KeepAlive PathState loc.on or locd.lock-orig). SIGTERM/SIGINT/SIGHUP: STOP +
+ * REG_EVENTS 0 for a running session, BYE to the relay, the engine lock restore if we changed it, wait for the answers
+ * (at most 3 s, 15 s while engine lock work is due), close, exit 0.
  *
  *   sweetlocd            daemon; log appended to /var/local/locd.log (SWEETLOCD_LOG=- : stdout)
  *   sweetlocd status     /var/local/loc.status (the daemon rewrites it every 2 s while something changes)
@@ -28,6 +31,7 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include "englock.h"
 #include "link.h"
 #include "loc.h"
 
@@ -35,6 +39,7 @@
 #define LOCD_LOG	"/var/local/locd.log"
 #define GONE_EXIT_MS	15000
 #define SHUTDOWN_MS	3000
+#define LOCK_SHUTDOWN_MS 15000	/* engine lock restore: SET + GET (+ a second try); launchd ExitTimeOut is 25 */
 
 static int fd = -1;
 static volatile sig_atomic_t stop_sig;
@@ -184,11 +189,18 @@ int main(int argc, char **argv)
 	char ts[64];
 	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&wall));
 	link_ms();
+	int repair_only = 0;
 	if (access(LOC_ON, F_OK)) {
-		printf("[%6llu] sweetlocd: start %s pid %d: %s absent, nothing to do, exit 0\n", 0ull, ts, (int)getpid(), LOC_ON);
-		return 0;
+		if (access(LOCK_ORIG, F_OK)) {
+			printf("[%6llu] sweetlocd: start %s pid %d: %s absent, nothing to do, exit 0\n", 0ull, ts, (int)getpid(), LOC_ON);
+			return 0;
+		}
+		repair_only = 1;
+		printf("[%6llu] sweetlocd: start %s pid %d: %s absent but %s present: engine lock repair only\n", 0ull, ts,
+		       (int)getpid(), LOC_ON, LOCK_ORIG);
+	} else {
+		printf("[%6llu] sweetlocd: start %s pid %d (%s present)\n", 0ull, ts, (int)getpid(), LOC_ON);
 	}
-	printf("[%6llu] sweetlocd: start %s pid %d (%s present)\n", 0ull, ts, (int)getpid(), LOC_ON);
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_sig;	/* no SA_RESTART: select returns at once */
@@ -218,8 +230,10 @@ int main(int argc, char **argv)
 				gone_since = 0;
 			else if (!gone_since)
 				gone_since = now;
-			else if (now - gone_since >= GONE_EXIT_MS)
-				why = LOC_ON " gone";
+			else if (now - gone_since >= GONE_EXIT_MS && !loc_lock_busy())
+				why = repair_only ? "repair run over" : LOC_ON " gone";
+			else if (now - gone_since >= 4 * GONE_EXIT_MS)
+				why = repair_only ? "repair not finished in 60 s" : LOC_ON " gone (engine lock work unfinished)";
 		}
 		if (why && !down_at) {
 			loc_shutdown(why);
@@ -227,7 +241,7 @@ int main(int argc, char **argv)
 		}
 		if (down_at) {
 			loc_poll();
-			if (loc_quiet() || fd < 0 || now - down_at >= SHUTDOWN_MS)
+			if (loc_quiet() || fd < 0 || now - down_at >= (loc_lock_busy() ? LOCK_SHUTDOWN_MS : SHUTDOWN_MS))
 				break;
 		}
 	}
