@@ -28,6 +28,10 @@
 #include <IOKit/IOLocks.h>
 #include <pexpert/pexpert.h>
 #include "sweet_spmi.h"
+#include <kern/thread.h>      /* 1130 */
+#include <kern/clock.h>
+#include <kern/cpu_number.h>
+#include <mach/mach_time.h>
 
 /*
  * 1129 (port of Yofuness/ios-flame xnu 0197 + 0201, MIT, "Copyright (c) 2026 dipa-studio"; sunfish PM6150 ->
@@ -45,6 +49,7 @@ static char sp_pon_line[384] = "SWEET PON: not read yet";
 SYSCTL_STRING(_kern, OID_AUTO, sweet_pon, CTLFLAG_RD | CTLFLAG_LOCKED, sp_pon_line, sizeof(sp_pon_line),
     "1129: PM8150 PON reason registers at boot (read only)");
 static void sp_pon_boot(void);
+static void sp_crumb_boot(void);   /* 1130 */
 
 /*
  * 1062: the shared SPMI transaction lock (sweet_spmi.h). r5au1f's boot: sweet_keys.c and sweet_torch.c
@@ -179,8 +184,82 @@ sweet_spmi_init(void)
 	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
 	    arb_version, sp_count);
 	sp_pon_boot();          /* 1129 */
+	sp_crumb_boot();        /* 1130 */
 	return 0;
 }
+
+/*
+ * 1130 (port of Yofuness/ios-flame xnu 0269 "watchdog pet crumb", MIT, "Copyright (c) 2026 dipa-studio"): a klog
+ * line every N seconds, "SWEET CRUMB: t SEC.MS n COUNT cpu C", so after a silent reset the last crumb in the
+ * rescued klog (0x... uncached mirror, sweet_ufs.c) says when the kernel was last alive. On sunfish it rode on the
+ * watchdog pet; redfin's ABL leaves the APSS WDT off (NOTES "Watchdog"), so here it is its own thread.
+ * kern.sweet_crumb (RW int, seconds 0-3600) / boot-arg sweetcrumb=N; 0 (default) = no lines, no thread. The
+ * thread starts at the first nonzero value and then idles (1 s checks) while the value is 0.
+ */
+static int sp_crumb_s;
+static int sp_crumb_started;
+
+static void
+sp_crumb_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	unsigned n = 0;
+	for (;;) {
+		int s = sp_crumb_s;
+		if (s <= 0) {
+			delay_for_interval(1000, NSEC_PER_MSEC);
+			continue;
+		}
+		uint64_t ns;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		printf("SWEET CRUMB: t %llu.%03llu n %u cpu %d\n", ns / NSEC_PER_SEC, (ns / NSEC_PER_MSEC) % 1000, n++,
+		    cpu_number());
+		delay_for_interval((uint32_t)s * 1000, NSEC_PER_MSEC);
+	}
+}
+
+static void
+sp_crumb_start(void)
+{
+	thread_t thread;
+	if (sp_crumb_s <= 0 || __atomic_exchange_n(&sp_crumb_started, 1, __ATOMIC_ACQ_REL)) {
+		return;
+	}
+	if (kernel_thread_start(sp_crumb_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		printf("SWEET CRUMB: every %d s (kern.sweet_crumb)\n", sp_crumb_s);
+	} else {
+		__atomic_store_n(&sp_crumb_started, 0, __ATOMIC_RELEASE);
+	}
+}
+
+static void
+sp_crumb_boot(void)
+{
+	int s = 0;
+	if (PE_parse_boot_argn("sweetcrumb", &s, sizeof(s)) && s > 0 && s <= 3600) {
+		sp_crumb_s = s;
+		sp_crumb_start();
+	}
+}
+
+static int
+sysctl_sweet_crumb SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int v = sp_crumb_s;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err || !req->newptr) {
+		return err;
+	}
+	if (v < 0 || v > 3600) {
+		return EINVAL;
+	}
+	sp_crumb_s = v;
+	sp_crumb_start();
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_crumb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_crumb, "I",
+    "1130: klog crumb every N s (0 = off)");
 
 /* 1129: see the comment at the top (sweet_pon). Runs once, from sweet_spmi_init (thread context). */
 static void
