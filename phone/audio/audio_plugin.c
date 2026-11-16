@@ -50,6 +50,43 @@
  * device, and leaves it there -- its routing tables keep the iPhone X's speaker in software volume
  * mode, so the volume buttons and Control Center scale the samples themselves, and at 0 what is
  * written is silence (on which the kernel keeps the amplifiers off).
+ *
+ * The receiver (ws-n-call-route; only with the flag file /var/local/redwood-call-route, read when the plug-in loads:
+ * absent or 0 = all of the above and nothing more). VirtualAudio's codec device (Device_Codec_Aspen, the one made for
+ * the UID "Codec") makes its output ports from the codec's output mute controls: "Built-In Receiver" when the device
+ * has kAudioDevicePropertyMute on output element 3, "Built-In Speaker" on element 4 (AudioObjectHasProperty({'mute',
+ * 'outp', 3|4}), VirtualAudio 0x24006c/0x240358). Without a receiver port a call has one output only and the in-call
+ * screen shows no route (Speaker) button. So with the flag:
+ *   1  "Codec" also gets a stereo output (what iOS plays to the receiver; thrown away: call audio runs in the DSP) and a
+ *      mute control on output element 3 = the receiver port
+ *   2  as 1, and a mute control on element 4 too (the speaker port then comes from the codec as on an iPhone; an
+ *      experiment: today's speaker port comes from "Speaker", and two of them may upset VirtualAudio)
+ * What VirtualAudio does with the mutes is how it picks the port: the receiver unmuted = Receiver, the receiver muted
+ * (or element 4 unmuted) = Speaker. Each change goes to the kernel (ioctl REDWOOD_AUDIO_SET_CALL_ROUTE, xnu 1086:
+ * kern.sweet_voice_route), which moves a running call between the earpiece and speaker amplifiers. Logged by the
+ * kernel as "SWEET VOICE: iOS route: Receiver|Speaker".
+ *   3  as 1 (no element 4), and a fifth device, "Baseband Voice" (experiment S1a, research/cc/BBA-design-study.md):
+ *      VirtualAudio's call routing (RoutingHandler_Call_GenericConfig2) looks up the device with that UID first and gives
+ *      up ("could not get baseband device") without it, so no phone-call route is built. This one is a silent stub in the
+ *      shape of the iPhone X's I2S baseband device (mca3/mca3a/audio-baseband-voice): one input stream (the downlink, what
+ *      the network sends: silence here) and one output stream (the uplink, what iOS sends: thrown away), mono 16-bit,
+ *      8000 or 16000 Hz, the system clock (the same as the other devices' clocks), and a clock source control with the one
+ *      item 'bb2w' ("Baseband"), which VirtualAudio selects when it is there. Call audio stays in the DSP (xnu 1065/1086);
+ *      the stub only lets iOS build the call route. Its I/O, its rate/format/clock-source changes and the mutes are logged.
+ *   4  as 3, but "Baseband Voice" carries the call (BBA stage 4; kernel: kern.sweet_voice_proxy 2, xnu 1091 + 1095, and the
+ *      IOService "Baseband Voice" of 1092 so that BasebandVoice.driver stands down). While its I/O runs it holds
+ *      /dev/redwood-voice: the downlink (10 ms frames of S16 mono that the kernel takes from AFE RT proxy port 0x2000 once
+ *      per 10 ms of the AP clock) goes through a small FIFO into the input stream; what iOS writes on the output stream
+ *      (its voice-processed microphone) is written to the device, which sends it to port 0x2001. The device's rate
+ *      (VirtualAudio sets it to the telephony rate) is given to the kernel for the next call (REDWOOD_VOICE_SET_RATE); a
+ *      call that runs at the other rate is converted 2:1 / 1:2 here. And because iOS itself now plays the call: what it
+ *      plays to the receiver port ("Codec" output) goes to /dev/redwood-audio while the receiver is unmuted (the kernel's
+ *      call amplifier is the earpiece's then: 1086), and the speaker device's writes give way while the receiver plays.
+ *      Zero timestamps: the system clock at the nominal rate, as the other devices (the kernel's proxy reads are paced on
+ *      that clock, 1095); GET_TIME is only measured (drift in ppm, logged).
+ *   5  as 4, with the zero timestamps following GET_TIME: the device's period follows the rate the kernel reports
+ *      (frames given vs mach time over the call, at most 1000 ppm from nominal) - the variant if 4 drifts.
+ * Without the flag (or 0..3) nothing of 4/5 runs: the device stays closed, the receiver is thrown away as before.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFPlugInCOM.h>
@@ -163,7 +200,7 @@ enum {
 	kAudioDevicePropertySafetyOffset = 'saft', kAudioDevicePropertyNominalSampleRate = 'nsrt',
 	kAudioDevicePropertyAvailableNominalSampleRates = 'nsr#', kAudioDevicePropertyIsHidden = 'hidn',
 	kAudioDevicePropertyPreferredChannelsForStereo = 'dch2', kAudioDevicePropertyZeroTimeStampPeriod = 'ring',
-	kAudioSelectorControlClassID = 'slct', kAudioDataSourceControlClassID = 'dsrc',
+	kAudioSelectorControlClassID = 'slct', kAudioDataSourceControlClassID = 'dsrc', kAudioClockSourceControlClassID = 'clck',
 	kAudioSelectorControlPropertyCurrentItem = 'scci', kAudioSelectorControlPropertyAvailableItems = 'scai',
 	kAudioSelectorControlPropertyItemName = 'scin', kAudioSelectorControlPropertyItemKind = 'clkk',
 
@@ -197,8 +234,27 @@ enum {
 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
-	OBJECT_LAST = OBJECT_CODEC_SOURCE
+	OBJECT_CODEC_OUTPUT,            /* call route: the codec's output (the receiver's), with the flag file only */
+	OBJECT_RECEIVER_MUTE,           /* call route: the codec output's mute, element 3 (the receiver port) */
+	OBJECT_SPEAKER_MUTE,            /* call route: the codec output's mute, element 4 (flag 2 only) */
+	OBJECT_BB, OBJECT_BB_OUTPUT, OBJECT_BB_INPUT,   /* flags 3-5: "Baseband Voice", its uplink and downlink */
+	OBJECT_BB_CLOCK,                /* flags 3-5: its clock source control ('bb2w') */
+	OBJECT_LAST = OBJECT_BB_CLOCK
 };
+
+#define CALL_ROUTE_FILE         "/private/var/local/redwood-call-route"
+#define RECEIVER_ELEMENT        3
+#define SPEAKER_ELEMENT         4
+#define kAudioBooleanControlClassID     'togl'
+#define kAudioMuteControlClassID        'mute'
+#define kAudioBooleanControlPropertyValue 'bcvl'
+static int call_route;                  /* the flag: 0 none, 1 receiver, 2 receiver + speaker on the codec, 3 = 1 + baseband,
+                                           4/5 = 3 with the call's PCM through /dev/redwood-voice (stage 4) */
+#define BB_PRESENT              (call_route >= 3)
+#define BB_LIVE                 (call_route >= 4)
+static UInt32 mutes[2] = { 1, 1 };      /* the receiver's and the codec speaker's mute, as VirtualAudio set them */
+static int route_told;                  /* what the kernel was told last: 0 nothing yet */
+static UInt64 receiver_frames;
 
 #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
 
@@ -207,6 +263,7 @@ struct device {
 	CFStringRef uid;                /* the name the virtual audio device knows it by */
 	AudioObjectID output, input;    /* its streams; 0 = none */
 	UInt32 output_channels, input_channels;
+	Float64 rate;                   /* its sample rate; 0 = REDWOOD_AUDIO_RATE */
 	/* its clock, running while anybody does I/O */
 	unsigned running;               /* how many clients have started I/O */
 	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
@@ -219,8 +276,74 @@ static struct device devices[] = {
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
 	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
+	/* flags 3-5 (devices_present = 5): the baseband voice device (3: silent stub; 4, 5: the call through /dev/redwood-voice) */
+	{ .object = OBJECT_BB, .uid = CFSTR("Baseband Voice"), .output = OBJECT_BB_OUTPUT, .input = OBJECT_BB_INPUT,
+	  .output_channels = 1, .input_channels = 1, .rate = 16000 },
 };
-#define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
+static unsigned devices_present = 4;    /* the first so many of devices[] exist: 5 with the flags 3-5 */
+#define DEVICES                 devices_present
+#define BB_CLOCK_SOURCE         'bb2w'
+#define BB_MANUFACTURER         CFSTR("Apple Inc.")     /* as BasebandVoice.driver says; VirtualAudio does not look */
+static const Float64 bb_rates[] = { 8000, 16000 };
+#define BB_RATES                (sizeof(bb_rates) / sizeof(bb_rates[0]))
+static UInt64 bb_read, bb_written;      /* frames since the stub's I/O started: downlink given (silence), uplink taken */
+static int bb_peak;                     /* the uplink's peak (what iOS would send to the network) */
+static Boolean bb_first_read, bb_first_write;
+static UInt64 bb_starts;
+
+/*
+ * Stage 4 (flags 4, 5): /dev/redwood-voice (xnu 1091, bsd/dev/sweet_voicedev.c; a copy of its interface, which must
+ * stay byte for byte the same). One opener at a time; node uid/gid 501 mode 0660 (mediaserverd runs as mobile; root
+ * may open it too). read(): whole 10 ms frames only (a buffer under one frame: EINVAL), O_NONBLOCK: EAGAIN when none,
+ * 0 without a call. write(): any even count, never blocks (over 200 ms queued: dropped by the kernel).
+ */
+#define REDWOOD_VOICE_DEVICE    "/dev/redwood-voice"
+struct redwood_voice_state {            /* 32 bytes */
+	uint32_t call_up, rate, frame_samples, mode, dl_queued, ul_queued, call_count, reserved;
+};
+struct redwood_voice_time {             /* 24 bytes */
+	uint64_t sample, mach_time;
+	uint32_t rate, call_count;
+};
+struct redwood_voice_counters {         /* 32 bytes, this call */
+	uint32_t dl_frames, ul_frames, dl_dropped, ul_dropped, ul_underruns, dl_unread, slips, reserved;
+};
+#define REDWOOD_VOICE_GET_STATE         _IOR('v', 1, struct redwood_voice_state)
+#define REDWOOD_VOICE_SET_RATE          _IOW('v', 2, uint32_t)
+#define REDWOOD_VOICE_GET_TIME          _IOR('v', 3, struct redwood_voice_time)
+#define REDWOOD_VOICE_GET_COUNTERS      _IOR('v', 4, struct redwood_voice_counters)
+_Static_assert(REDWOOD_VOICE_GET_STATE == 0x40207601, "1091 ioctl number");
+_Static_assert(REDWOOD_VOICE_SET_RATE == 0x80047602, "1091 ioctl number");
+_Static_assert(REDWOOD_VOICE_GET_TIME == 0x40187603, "1091 ioctl number");
+_Static_assert(REDWOOD_VOICE_GET_COUNTERS == 0x40207604, "1091 ioctl number");
+
+#define BB_FIFO                 8192            /* downlink samples at the device's rate (512 ms at 16 kHz), power of 2 */
+#define BB_KBUF                 1600            /* one read: up to 100 ms at 16 kHz (10 whole frames) */
+static int voice = -1;                  /* /dev/redwood-voice while the baseband's I/O runs (flags 4, 5) */
+static int voice_errno;                 /* why the last open failed (said once per I/O run) */
+static UInt64 voice_retry;              /* mach time of the next open attempt */
+static int16_t bb_fifo[BB_FIFO];        /* downlink at the device's rate; only the I/O thread touches it */
+static UInt32 bb_fifo_head, bb_fifo_tail;
+static Boolean bb_primed;               /* the FIFO filled to its start level since the last underrun */
+static UInt32 bb_call_seen;             /* call_count of the call the FIFO belongs to */
+static struct redwood_voice_state bb_state;     /* the kernel's, polled every 100 ms from the I/O thread */
+static UInt64 bb_state_next, bb_stats_next;
+static UInt32 bb_stats_n;
+/* this I/O run (zeroed at StartIO) */
+static struct {
+	UInt64 dl_got, dl_under, dl_trim, dl_conv, ul_put, ul_trim, ul_err, rd_err, stats_dl_got, stats_ul_put;
+	int dl_peak, ul_peak, s_dl_peak, s_ul_peak;
+	UInt32 calls;
+	Boolean said_mismatch, said_rd_err;
+} bb;
+/* GET_TIME: the call's first point and the rate measured since (ticks per frame); flag 5 uses it for the clock */
+static UInt64 bb_t0_sample, bb_t0_mach;
+static UInt32 bb_t0_call;
+static Float64 bb_tpf;                  /* the baseband clock's mach ticks per frame (flag 5), 0 = nominal */
+static UInt64 bb_period_host;           /* flag 5: host time of the device's current zero-timestamp period */
+/* the receiver to /dev/redwood-audio (flags 4, 5) */
+static volatile UInt64 rx_last;         /* mach time of the receiver's latest write that went to the sink */
+static UInt64 rx_played, rx_dropped, spk_yielded;
 
 #define TRANSPORT_BUILT_IN      'bltn'
 /*
@@ -239,6 +362,7 @@ static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sink = -1;                   /* /dev/redwood-audio */
 static Float64 ticks_per_frame;
+static Float64 ticks_per_second;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
@@ -309,7 +433,7 @@ format_of(AudioObjectID stream)
 	UInt32 channels = stream == d->output ? d->output_channels : d->input_channels;
 
 	return (AudioStreamBasicDescription) {
-		       .mSampleRate = REDWOOD_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
+		       .mSampleRate = d->rate != 0 ? d->rate : REDWOOD_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
 		       .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
 		       .mBytesPerPacket = 2 * channels, .mFramesPerPacket = 1, .mBytesPerFrame = 2 * channels,
 		       .mChannelsPerFrame = channels, .mBitsPerChannel = 16,
@@ -342,6 +466,86 @@ release(__unused void *driver)
 	return 1;
 }
 
+/*
+ * Call route: the receiver unmuted = Receiver (1); else the speaker element unmuted (flag 2) or the receiver muted =
+ * Speaker (2). Told to the kernel when it changes. With the lock held.
+ */
+static void
+route_to_kernel(const char *why)
+{
+	uint32_t route = !mutes[0] ? 1 : 2;
+
+	if (call_route < 1 || (int)route == route_told) {
+		return;
+	}
+	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_ROUTE, &route) < 0) {
+		say("redwood: audio: call route %s (%s) could not be given to the kernel (%s)\n", route == 1 ? "Receiver" : "Speaker", why,
+		    strerror(errno));
+		return;
+	}
+	route_told = (int)route;
+	say("redwood: audio: call route %s (%s: receiver %s, codec speaker %s)\n", route == 1 ? "Receiver" : "Speaker", why,
+	    mutes[0] ? "muted" : "on", mutes[1] ? "muted" : "on");
+}
+
+static void
+call_route_flag(void)
+{
+	char buf[8] = "";
+	int f = open(CALL_ROUTE_FILE, O_RDONLY);
+
+	if (f >= 0) {
+		ssize_t n = read(f, buf, sizeof(buf) - 1);
+
+		buf[n > 0 ? n : 0] = 0;
+		close(f);
+	}
+	call_route = buf[0] >= '1' && buf[0] <= '5' ? buf[0] - '0' : 0;
+	if (call_route >= 1) {
+		devices[3].output = OBJECT_CODEC_OUTPUT;        /* "Codec" */
+		devices[3].output_channels = 2;
+	}
+	if (BB_PRESENT) {
+		devices_present = 5;            /* + "Baseband Voice" */
+	}
+	say("redwood: audio: call route %d (%s): %s\n", call_route, CALL_ROUTE_FILE, call_route == 0 ? "no receiver (as before)" :
+	    call_route == 1 ? "the codec has the receiver (output element 3)" : call_route == 2 ?
+	    "the codec has the receiver and a speaker (elements 3, 4)" : call_route == 3 ?
+	    "the codec has the receiver (output element 3), and a silent stub device \"Baseband Voice\" (S1a)" : call_route == 4 ?
+	    "the codec has the receiver (output element 3, played), and \"Baseband Voice\" carries the call through "
+	    REDWOOD_VOICE_DEVICE " (stage 4, system clock)" :
+	    "the codec has the receiver (output element 3, played), and \"Baseband Voice\" carries the call through "
+	    REDWOOD_VOICE_DEVICE " (stage 4, clock from GET_TIME)");
+}
+
+/*
+ * Stage 4: the next call's rate to the kernel (REDWOOD_VOICE_SET_RATE; the running call keeps its own). Through the open
+ * device while the I/O runs, else opened for the moment. Not on the I/O thread.
+ */
+static void
+voice_set_rate(Float64 rate, const char *why)
+{
+	uint32_t r = (uint32_t)rate;
+	int f = voice, opened_here = 0;
+
+	if (!BB_LIVE) {
+		return;
+	}
+	if (f < 0) {
+		f = open(REDWOOD_VOICE_DEVICE, O_RDWR | O_NONBLOCK);
+		opened_here = f >= 0;
+	}
+	if (f < 0 || ioctl(f, REDWOOD_VOICE_SET_RATE, &r) < 0) {
+		say("redwood: audio: baseband: rate %u Hz for the next call could not be given to the kernel (%s; %s)\n", r, why,
+		    strerror(errno));
+	} else {
+		say("redwood: audio: baseband: rate %u Hz for the next call given to the kernel (%s)\n", r, why);
+	}
+	if (opened_here) {
+		close(f);
+	}
+}
+
 static OSStatus
 initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef the_host)
 {
@@ -349,8 +553,10 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 
 	host = the_host;
 	mach_timebase_info(&timebase);
-	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / REDWOOD_AUDIO_RATE;
+	ticks_per_second = 1e9 * timebase.denom / timebase.numer;
+	ticks_per_frame = ticks_per_second / REDWOOD_AUDIO_RATE;
 	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+	call_route_flag();
 	say("redwood: audio: the speaker is with the HAL (%s: %s)\n", REDWOOD_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
 	return 0;
 }
@@ -382,19 +588,43 @@ configuration_change(__unused AudioServerPlugInDriverRef driver, __unused AudioO
 	return 0;
 }
 
+/* The stub's rate change, asked for by set_property_data() through the host: action = the new rate in Hz. */
+static OSStatus
+perform_configuration_change(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, UInt64 action,
+    __unused void *info)
+{
+	if (object == OBJECT_BB && BB_PRESENT) {
+		pthread_mutex_lock(&lock);
+		say("redwood: audio: baseband: rate %.0f -> %llu Hz%s\n", devices[4].rate, action,
+		    devices[4].running ? " (while running: clock restarted)" : "");
+		devices[4].rate = (Float64)action;
+		devices[4].anchor = mach_absolute_time();
+		devices[4].periods = 0;
+		bb_period_host = devices[4].anchor;
+		bb_tpf = 0;
+		bb_fifo_head = bb_fifo_tail = 0;        /* the FIFO is at the device's rate: start over */
+		bb_primed = false;
+		pthread_mutex_unlock(&lock);
+		voice_set_rate((Float64)action, "VirtualAudio set the device's rate");
+	}
+	return 0;
+}
+
 /* A property's value: `size` bytes of it, or a list with nothing in it, or (neither) no such property. */
 struct value {
 	UInt32 size;
 	bool empty;
 	bool string;                    /* a CFString: whoever is given it gets a reference of their own */
 	union {
-		UInt32 words[4];
+		UInt32 words[8];
 		Float64 number;
 		Float32 decimal;
 		CFStringRef string;
 		AudioValueRange range;
 		AudioStreamBasicDescription format;
 		AudioStreamRangedDescription ranged;
+		AudioStreamRangedDescription ranged_list[2];
+		AudioValueRange range_list[2];
 	} u;
 };
 
@@ -444,6 +674,72 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		case kAudioLevelControlPropertyConvertScalarToDecibels:
 		case kAudioLevelControlPropertyConvertDecibelsToScalar:
 			FLOAT(0);       /* (converts what it is given: get_property_data()) */
+			break;
+		}
+		return v;
+	}
+	if ((object == OBJECT_RECEIVER_MUTE && call_route >= 1) || (object == OBJECT_SPEAKER_MUTE && call_route == 2)) {
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioBooleanControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioMuteControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_CODEC);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(object == OBJECT_RECEIVER_MUTE ? RECEIVER_ELEMENT : SPEAKER_ELEMENT);
+			break;
+		case kAudioBooleanControlPropertyValue:
+			WORD(mutes[object == OBJECT_SPEAKER_MUTE]);
+			break;
+		}
+		return v;
+	}
+	if (object == OBJECT_RECEIVER_MUTE || object == OBJECT_SPEAKER_MUTE) {
+		return v;               /* not there without the flag */
+	}
+	if (object == OBJECT_BB_CLOCK) {
+		if (!BB_PRESENT) {
+			return v;
+		}
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioSelectorControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioClockSourceControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_BB);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeGlobal);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(0);
+			break;
+		case kAudioSelectorControlPropertyCurrentItem:
+		case kAudioSelectorControlPropertyAvailableItems:
+			WORD(BB_CLOCK_SOURCE);
+			break;
+		case kAudioSelectorControlPropertyItemName:
+			if (qualifier_size == sizeof(UInt32) && qualifier != NULL && *(const UInt32 *)qualifier == BB_CLOCK_SOURCE) {
+				STRING(CFSTR("Baseband"));
+			} else {
+				STRING(CFSTR(""));
+			}
 			break;
 		}
 		return v;
@@ -529,7 +825,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 	} else if (object == d->object) {
 		switch (selector) {
 		case kAudioObjectPropertyManufacturer:
-			STRING(MANUFACTURER);
+			STRING(d->object == OBJECT_BB ? BB_MANUFACTURER : MANUFACTURER);
 			break;
 		case kAudioObjectPropertyName:
 		case kAudioDevicePropertyDeviceUID:
@@ -553,7 +849,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-			WORD(d->output != 0);
+			WORD(d->output != 0 && d->object != OBJECT_BB);     /* the baseband is never a default device */
 			break;
 		case kAudioDevicePropertyDeviceIsRunning:
 			WORD(d->running != 0);
@@ -573,6 +869,16 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
 				LIST(OBJECT_CODEC_SOURCE);
 			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeInput &&
+			    call_route >= 1) {
+				LIST(OBJECT_RECEIVER_MUTE);
+				if (call_route == 2) {
+					LIST(OBJECT_SPEAKER_MUTE);
+				}
+			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_BB && scope == kAudioObjectPropertyScopeGlobal) {
+				LIST(OBJECT_BB_CLOCK);
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
@@ -581,18 +887,37 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			}
 			if (d->object == OBJECT_CODEC) {
 				LIST(OBJECT_CODEC_SOURCE);
+				if (call_route >= 1) {
+					LIST(OBJECT_RECEIVER_MUTE);
+				}
+				if (call_route == 2) {
+					LIST(OBJECT_SPEAKER_MUTE);
+				}
+			}
+			if (d->object == OBJECT_BB) {
+				LIST(OBJECT_BB_CLOCK);
 			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioDevicePropertyNominalSampleRate:
-			v.u.number = REDWOOD_AUDIO_RATE;
+			v.u.number = d->rate != 0 ? d->rate : REDWOOD_AUDIO_RATE;
 			v.size = sizeof(Float64);
 			break;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
+			if (d->object == OBJECT_BB) {
+				for (unsigned i = 0; i < BB_RATES; i++) {
+					v.u.range_list[i].mMinimum = v.u.range_list[i].mMaximum = bb_rates[i];
+				}
+				v.size = BB_RATES * sizeof(AudioValueRange);
+				break;
+			}
 			v.u.range.mMinimum = v.u.range.mMaximum = REDWOOD_AUDIO_RATE;
 			v.size = sizeof(AudioValueRange);
 			break;
 		case kAudioDevicePropertyPreferredChannelsForStereo:
+			if (d->object == OBJECT_BB) {
+				break;          /* mono: none (asked of it = logged) */
+			}
 			v.u.words[0] = 1;
 			v.u.words[1] = 2;
 			v.size = 2 * sizeof(UInt32);
@@ -625,6 +950,16 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats:
+			if (d->object == OBJECT_BB) {
+				/* mono S16 at each of the rates (BasebandVoice.driver's format: LPCM, flags 0xC, 16 bits, 1 channel) */
+				for (unsigned i = 0; i < BB_RATES; i++) {
+					v.u.ranged_list[i].mFormat = format_of(object);
+					v.u.ranged_list[i].mFormat.mSampleRate = bb_rates[i];
+					v.u.ranged_list[i].mSampleRateRange.mMinimum = v.u.ranged_list[i].mSampleRateRange.mMaximum = bb_rates[i];
+				}
+				v.size = BB_RATES * sizeof(AudioStreamRangedDescription);
+				break;
+			}
 			v.u.ranged.mFormat = format_of(object);
 			v.u.ranged.mSampleRateRange.mMinimum = v.u.ranged.mSampleRateRange.mMaximum = REDWOOD_AUDIO_RATE;
 			v.size = sizeof(AudioStreamRangedDescription);
@@ -642,7 +977,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
  * What the HAL (or the virtual audio device through it) asks of an object that it does not have,
  * the first times for each object, selector and scope: what a device it will not take may lack.
  */
-#define UNKNOWN_TOLD            64
+#define UNKNOWN_TOLD            192
 static UInt32 unknown_told[UNKNOWN_TOLD][3];
 static unsigned unknown_count;
 
@@ -698,8 +1033,10 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	if (object == OBJECT_SPEAKER_VOLUME) {
 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
-	} else if (object == OBJECT_CODEC_SOURCE) {
+	} else if (object == OBJECT_CODEC_SOURCE || object == OBJECT_BB_CLOCK) {
 		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
+	} else if (object == OBJECT_RECEIVER_MUTE || object == OBJECT_SPEAKER_MUTE) {
+		*settable = address->mSelector == kAudioBooleanControlPropertyValue;
 	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
@@ -749,7 +1086,7 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	if (v.size > room) {
 		/* a list may be asked for in part; anything else must fit */
 		if (address->mSelector != kAudioObjectPropertyOwnedObjects && address->mSelector != kAudioDevicePropertyStreams &&
-		    address->mSelector != kAudioPlugInPropertyDeviceList) {
+		    address->mSelector != kAudioPlugInPropertyDeviceList && address->mSelector != kAudioObjectPropertyControlList) {
 			return kAudioHardwareBadPropertySizeError;
 		}
 		v.size = room - room % sizeof(UInt32);
@@ -797,6 +1134,36 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		return 0;
 	}
+	if (object == OBJECT_RECEIVER_MUTE || object == OBJECT_SPEAKER_MUTE) {
+		AudioObjectPropertyAddress changed = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, 0 };
+
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&lock);
+		if (BB_PRESENT) {
+			say("redwood: audio: baseband: VirtualAudio sets the %s mute (element %d) to %u\n",
+			    object == OBJECT_SPEAKER_MUTE ? "codec speaker" : "receiver",
+			    object == OBJECT_SPEAKER_MUTE ? SPEAKER_ELEMENT : RECEIVER_ELEMENT, (unsigned)*(const UInt32 *)data);
+		}
+		mutes[object == OBJECT_SPEAKER_MUTE] = *(const UInt32 *)data != 0;
+		route_to_kernel(object == OBJECT_SPEAKER_MUTE ? "speaker mute" : "receiver mute");
+		pthread_mutex_unlock(&lock);
+		if (host != NULL) {
+			host->PropertiesChanged(host, object, 1, &changed);
+		}
+		return 0;
+	}
+	if (object == OBJECT_BB_CLOCK) {
+		/* the one clock source there is, 'bb2w' (VirtualAudio's Device_Baseband_Voice selects it) */
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		say("redwood: audio: baseband: clock source '%c%c%c%c' asked for%s\n", (int)(*(const UInt32 *)data >> 24 & 0xff),
+		    (int)(*(const UInt32 *)data >> 16 & 0xff), (int)(*(const UInt32 *)data >> 8 & 0xff), (int)(*(const UInt32 *)data & 0xff),
+		    *(const UInt32 *)data == BB_CLOCK_SOURCE ? "" : " (refused)");
+		return *(const UInt32 *)data == BB_CLOCK_SOURCE ? 0 : kAudioHardwareIllegalOperationError;
+	}
 	if (object == OBJECT_CODEC_SOURCE) {
 		/* the one microphone there is */
 		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
@@ -809,6 +1176,48 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		pthread_mutex_lock(&lock);
 		inactive[object] = *(const UInt32 *)data == 0;
 		pthread_mutex_unlock(&lock);
+		if (object == OBJECT_BB_INPUT || object == OBJECT_BB_OUTPUT) {
+			say("redwood: audio: baseband: %s stream %s\n", object == OBJECT_BB_INPUT ? "downlink (input)" : "uplink (output)",
+			    *(const UInt32 *)data ? "active" : "inactive");
+		}
+		return 0;
+	}
+	if (object == OBJECT_BB || object == OBJECT_BB_INPUT || object == OBJECT_BB_OUTPUT) {
+		Float64 wanted_rate;
+
+		if (address->mSelector == kAudioDevicePropertyNominalSampleRate) {
+			if (size != sizeof(Float64)) {
+				return kAudioHardwareBadPropertySizeError;
+			}
+			wanted_rate = *(const Float64 *)data;
+		} else if (size != sizeof(AudioStreamBasicDescription)) {
+			return kAudioHardwareBadPropertySizeError;
+		} else {
+			const AudioStreamBasicDescription *f = data;
+
+			say("redwood: audio: baseband: %s format asked for: %.0f Hz '%c%c%c%c' flags %#x, %u ch, %u bits\n",
+			    object == OBJECT_BB_INPUT ? "downlink" : "uplink", f->mSampleRate, (int)(f->mFormatID >> 24 & 0xff),
+			    (int)(f->mFormatID >> 16 & 0xff), (int)(f->mFormatID >> 8 & 0xff), (int)(f->mFormatID & 0xff),
+			    (unsigned)f->mFormatFlags, (unsigned)f->mChannelsPerFrame, (unsigned)f->mBitsPerChannel);
+			if (f->mFormatID != kAudioFormatLinearPCM || f->mChannelsPerFrame != 1 || f->mBitsPerChannel != 16 ||
+			    !(f->mFormatFlags & kAudioFormatFlagIsSignedInteger) || (f->mFormatFlags & kAudioFormatFlagIsFloat)) {
+				return kAudioDeviceUnsupportedFormatError;
+			}
+			wanted_rate = f->mSampleRate;
+		}
+		if (wanted_rate != bb_rates[0] && wanted_rate != bb_rates[1]) {
+			say("redwood: audio: baseband: rate %.0f Hz refused (8000 or 16000)\n", wanted_rate);
+			return kAudioDeviceUnsupportedFormatError;
+		}
+		if (wanted_rate == devices[4].rate) {
+			say("redwood: audio: baseband: rate %.0f Hz (already)\n", wanted_rate);
+			return 0;
+		}
+		/* a rate change goes through the host, which stops I/O around it and then calls perform_configuration_change() */
+		say("redwood: audio: baseband: rate %.0f -> %.0f Hz asked for\n", devices[4].rate, wanted_rate);
+		if (host == NULL || host->RequestDeviceConfigurationChange(host, OBJECT_BB, (UInt64)wanted_rate, NULL) != 0) {
+			return kAudioHardwareUnsupportedOperationError;
+		}
 		return 0;
 	}
 	if (address->mSelector == kAudioDevicePropertyNominalSampleRate) {
@@ -879,6 +1288,347 @@ codec_read(int16_t *samples, UInt32 frames)
 	mic_heard += have;
 }
 
+/*
+ * Stage 4 (flags 4, 5): "Baseband Voice" on /dev/redwood-voice. Everything below runs on the HAL's I/O thread except
+ * bb_live_start()/bb_live_stop() (StartIO/StopIO, lock held). Nothing here waits: the device is O_NONBLOCK.
+ *   downlink: each ReadInput drains the kernel's whole frames into bb_fifo (at the device's rate; a call at the other
+ *             rate is converted 2:1 or 1:2), then gives the HAL its frames once the FIFO has held one HAL buffer + 10 ms
+ *             (after an underrun it fills to that again: silence meanwhile). More than that + 50 ms: trimmed to + 30 ms.
+ *   uplink:   each WriteMix is written to the device (converted likewise); while the kernel holds more than 80 ms of it,
+ *             the excess over 30 ms is not written (counted).
+ * Lines: "redwood: audio: baseband: ..." (open, call up/down, 2 s statistics for the first 20 s of a run, then every 10 s).
+ */
+static UInt64
+ms_ticks(UInt32 ms)
+{
+	return (UInt64)(ticks_per_second * ms / 1000.0);
+}
+
+static void
+bb_open(UInt64 now)
+{
+	uint32_t r = (uint32_t)devices[4].rate;
+
+	if (voice >= 0 || now < voice_retry) {
+		return;
+	}
+	voice = open(REDWOOD_VOICE_DEVICE, O_RDWR | O_NONBLOCK);
+	if (voice < 0) {
+		if (errno != voice_errno) {
+			say("redwood: audio: baseband: %s cannot be opened (%s): the call is silent both ways until it is "
+			    "(tried again each second)\n", REDWOOD_VOICE_DEVICE, strerror(errno));
+		}
+		voice_errno = errno;
+		voice_retry = now + ms_ticks(1000);
+		return;
+	}
+	say("redwood: audio: baseband: %s open (fd %d%s)\n", REDWOOD_VOICE_DEVICE, voice, voice_errno ? ", after retries" : "");
+	voice_errno = 0;
+	if (ioctl(voice, REDWOOD_VOICE_SET_RATE, &r) < 0) {
+		say("redwood: audio: baseband: REDWOOD_VOICE_SET_RATE %u failed (%s)\n", r, strerror(errno));
+	}
+	bb_state_next = 0;
+}
+
+static void
+bb_live_start(struct device *d)
+{
+	memset(&bb, 0, sizeof(bb));
+	bb_fifo_head = bb_fifo_tail = 0;
+	bb_primed = false;
+	bb_call_seen = 0;
+	bb_t0_call = 0;
+	bb_tpf = 0;
+	bb_period_host = d->anchor;
+	memset(&bb_state, 0, sizeof(bb_state));
+	bb_state_next = bb_stats_next = 0;
+	bb_stats_n = 0;
+	voice_retry = 0;
+	voice_errno = 0;
+	bb_open(mach_absolute_time());
+}
+
+static void
+bb_live_stop(struct device *d)
+{
+	struct redwood_voice_counters c;
+
+	memset(&c, 0, sizeof(c));
+	if (voice >= 0) {
+		(void)ioctl(voice, REDWOOD_VOICE_GET_COUNTERS, &c);
+	}
+	say("redwood: audio: baseband: I/O stopped (#%llu) at %.0f Hz, %u call(s): dl %llu frames given, %llu underrun, %llu "
+	    "trimmed, %llu converted, peak %d; ul %llu written, %llu trimmed, %llu errors, peak %d\n", bb_starts, d->rate, bb.calls,
+	    bb.dl_got, bb.dl_under, bb.dl_trim, bb.dl_conv, bb.dl_peak, bb.ul_put, bb.ul_trim, bb.ul_err, bb.ul_peak);
+	say("redwood: audio: baseband: kernel (last call): dl %u frames, %u unread, %u dropped; ul %u frames, %u underrun samples, "
+	    "%u dropped\n", c.dl_frames, c.dl_unread, c.dl_dropped, c.ul_frames, c.ul_underruns, c.ul_dropped);
+	if (voice >= 0) {
+		close(voice);
+	}
+	voice = -1;
+}
+
+/* GET_TIME: the kernel's downlink clock against mach time over this call; flag 5 takes it as the device's period. */
+static Float64
+bb_clock(void)
+{
+	struct redwood_voice_time t;
+	Float64 ppm = 0, krate = bb_state.rate ? bb_state.rate : 16000, drate = devices[4].rate;
+
+	if (voice < 0 || ioctl(voice, REDWOOD_VOICE_GET_TIME, &t) < 0 || t.mach_time == 0 || t.rate == 0) {
+		return 0;
+	}
+	if (t.call_count != bb_t0_call) {
+		bb_t0_call = t.call_count;
+		bb_t0_sample = t.sample;
+		bb_t0_mach = t.mach_time;
+		return 0;
+	}
+	if (t.sample <= bb_t0_sample || t.mach_time <= bb_t0_mach + ms_ticks(2000)) {
+		return 0;
+	}
+	krate = t.rate;
+	{
+		Float64 tpf = (Float64)(t.mach_time - bb_t0_mach) / (Float64)(t.sample - bb_t0_sample);   /* per kernel sample */
+		Float64 nominal = ticks_per_second / krate;
+
+		ppm = (nominal / tpf - 1) * 1e6;        /* > 0: the kernel's downlink runs fast against mach time */
+		if (call_route == 5 && t.mach_time > bb_t0_mach + ms_ticks(10000)) {
+			Float64 want = tpf * krate / drate, dev = ticks_per_second / drate;
+
+			want = want < dev * (1 - 1e-3) ? dev * (1 - 1e-3) : want > dev * (1 + 1e-3) ? dev * (1 + 1e-3) : want;
+			pthread_mutex_lock(&lock);
+			bb_tpf = bb_tpf == 0 ? want : bb_tpf + (want - bb_tpf) / 4;
+			pthread_mutex_unlock(&lock);
+		}
+	}
+	return ppm;
+}
+
+static void
+bb_stats(UInt64 now)
+{
+	struct redwood_voice_counters c;
+	Float64 drate = devices[4].rate, ppm = bb_clock();
+	UInt32 fifo_ms = (UInt32)((bb_fifo_head - bb_fifo_tail) * 1000 / (UInt32)drate);
+
+	memset(&c, 0, sizeof(c));
+	if (voice >= 0) {
+		(void)ioctl(voice, REDWOOD_VOICE_GET_COUNTERS, &c);
+	}
+	bb_stats_n++;
+	bb_stats_next = now + ms_ticks(bb_stats_n < 10 ? 2000 : 10000);
+	say("redwood: audio: baseband: stats: call %s #%u at %u Hz (device %.0f) | dl +%llu frames, fifo %u ms, under %llu trim %llu "
+	    "peak %d | ul +%llu samples written, peak %d, trim %llu | clock %+.0f ppm%s\n", bb_state.call_up ? "up" : "down", bb_state.call_count,
+	    bb_state.rate, drate, bb.dl_got - bb.stats_dl_got, fifo_ms, bb.dl_under, bb.dl_trim, bb.s_dl_peak,
+	    bb.ul_put - bb.stats_ul_put, bb.s_ul_peak, bb.ul_trim, ppm, call_route == 5 ? " (followed)" : "");
+	say("redwood: audio: baseband: kernel: dl %u frames (%u unread, %u dropped, %u queued), ul %u frames (%u underrun samples, "
+	    "%u dropped, %u queued)%s\n", c.dl_frames, c.dl_unread, c.dl_dropped, bb_state.dl_queued, c.ul_frames, c.ul_underruns,
+	    c.ul_dropped, bb_state.ul_queued, voice < 0 ? " - device NOT open" : "");
+	bb.stats_dl_got = bb.dl_got;
+	bb.stats_ul_put = bb.ul_put;
+	bb.s_dl_peak = bb.s_ul_peak = 0;
+}
+
+static void
+bb_poll(UInt64 now, Boolean force)
+{
+	struct redwood_voice_state s;
+
+	if (voice < 0) {
+		bb_open(now);
+	}
+	if (voice >= 0 && (force || now >= bb_state_next) && ioctl(voice, REDWOOD_VOICE_GET_STATE, &s) == 0) {
+		bb_state_next = now + ms_ticks(100);
+		if (s.call_up && s.call_count != bb_call_seen) {
+			bb_call_seen = s.call_count;
+			bb.calls++;
+			bb_fifo_head = bb_fifo_tail = 0;
+			bb_primed = false;
+			bb.said_mismatch = false;
+			say("redwood: audio: baseband: call #%u up (kernel mode %u): %u Hz, %u-sample frames; device %.0f Hz%s\n",
+			    s.call_count, s.mode, s.rate, s.frame_samples, devices[4].rate, s.rate == (uint32_t)devices[4].rate ? "" :
+			    " - converted here (VirtualAudio's rate came after the call started, or the kernel ignored SET_RATE)");
+		} else if (!s.call_up && bb_state.call_up) {
+			say("redwood: audio: baseband: call #%u down\n", bb_state.call_count);
+		}
+		bb_state = s;
+	}
+	if (now >= bb_stats_next) {
+		bb_stats(now);
+	}
+}
+
+static void
+bb_fifo_push(int16_t v)
+{
+	if (bb_fifo_head - bb_fifo_tail >= BB_FIFO) {
+		bb_fifo_tail++;
+		bb.dl_trim++;
+	}
+	bb_fifo[bb_fifo_head++ & (BB_FIFO - 1)] = v;
+}
+
+/* the kernel's samples (n, at krate) into the FIFO at the device's rate */
+static void
+bb_fifo_put(const int16_t *s, UInt32 n, UInt32 krate, UInt32 drate)
+{
+	static int16_t prev;
+
+	for (UInt32 i = 0; i < n; i++) {
+		int v = s[i] < 0 ? -s[i] : s[i];
+
+		bb.dl_peak = v > bb.dl_peak ? v : bb.dl_peak;
+		bb.s_dl_peak = v > bb.s_dl_peak ? v : bb.s_dl_peak;
+	}
+	if (krate == drate || (krate != 2 * drate && drate != 2 * krate)) {
+		if (krate != drate && !bb.said_mismatch) {
+			bb.said_mismatch = true;
+			say("redwood: audio: baseband: call at %u Hz, device at %u Hz: not convertible, passed as it is\n", krate, drate);
+		}
+		for (UInt32 i = 0; i < n; i++) {
+			bb_fifo_push(s[i]);
+		}
+	} else if (krate == 2 * drate) {
+		for (UInt32 i = 0; i + 1 < n; i += 2) {
+			bb_fifo_push((int16_t)(((int32_t)s[i] + s[i + 1]) / 2));
+		}
+		bb.dl_conv += n;
+	} else {
+		for (UInt32 i = 0; i < n; i++) {
+			bb_fifo_push((int16_t)(((int32_t)prev + s[i]) / 2));
+			bb_fifo_push(s[i]);
+			prev = s[i];
+		}
+		bb.dl_conv += n;
+	}
+	if (n > 0) {
+		prev = s[n - 1];
+	}
+}
+
+/* ReadInput of the baseband's input stream: the downlink */
+static void
+bb_downlink(int16_t *out, UInt32 frames)
+{
+	UInt64 now = mach_absolute_time();
+	UInt32 drate = (UInt32)devices[4].rate, dfs = drate / 100, avail, n = 0;
+
+	bb_poll(now, false);
+	if (voice >= 0) {
+		int16_t k[BB_KBUF];
+
+		for (int i = 0; i < 4; i++) {
+			ssize_t got = read(voice, k, sizeof(k));
+
+			if (got < 0) {
+				if (errno != EAGAIN && errno != EINTR) {
+					bb.rd_err++;
+					if (!bb.said_rd_err) {
+						bb.said_rd_err = true;
+						say("redwood: audio: baseband: read: %s\n", strerror(errno));
+					}
+				}
+				break;
+			}
+			if (got == 0) {
+				break;          /* no call */
+			}
+			if (!bb_state.call_up) {
+				bb_poll(now, true);     /* frames before the 100 ms poll saw the call: its rate now */
+			}
+			bb_fifo_put(k, (UInt32)got / 2, bb_state.rate ? bb_state.rate : drate, drate);
+			if ((size_t)got < sizeof(k)) {
+				break;
+			}
+		}
+	}
+	avail = bb_fifo_head - bb_fifo_tail;
+	if (!bb_primed && avail >= frames + dfs) {
+		bb_primed = true;
+	}
+	if (bb_primed) {
+		n = avail < frames ? avail : frames;
+		for (UInt32 i = 0; i < n; i++) {
+			out[i] = bb_fifo[bb_fifo_tail++ & (BB_FIFO - 1)];
+		}
+		if (n < frames) {
+			bb.dl_under += frames - n;
+			bb_primed = false;
+		}
+		bb.dl_got += n;
+		avail = bb_fifo_head - bb_fifo_tail;
+		if (avail > frames + 5 * dfs) {
+			UInt32 drop = avail - (frames + 3 * dfs);
+
+			bb_fifo_tail += drop;
+			bb.dl_trim += drop;
+		}
+	}
+	if (n < frames) {
+		memset(out + n, 0, (size_t)(frames - n) * 2);
+	}
+}
+
+/* WriteMix of the baseband's output stream: the uplink */
+static void
+bb_uplink(const int16_t *in, UInt32 frames)
+{
+	UInt64 now = mach_absolute_time();
+	UInt32 drate = (UInt32)devices[4].rate, krate, kfs, skip = 0;
+	int16_t k[2048];
+
+	for (UInt32 i = 0; i < frames; i++) {
+		int v = in[i] < 0 ? -in[i] : in[i];
+
+		bb.ul_peak = v > bb.ul_peak ? v : bb.ul_peak;
+		bb.s_ul_peak = v > bb.s_ul_peak ? v : bb.s_ul_peak;
+	}
+	bb_poll(now, false);
+	if (voice < 0 || !bb_state.call_up) {
+		return;                 /* no mode-2 call: the kernel would throw it away */
+	}
+	krate = bb_state.rate ? bb_state.rate : drate;
+	kfs = krate / 100;
+	if (bb_state.ul_queued > 8 * kfs) {
+		skip = bb_state.ul_queued - 3 * kfs;    /* in kernel samples */
+		bb_state.ul_queued -= skip;             /* (until the next poll) */
+	}
+	for (UInt32 at = 0; at < frames; ) {
+		UInt32 chunk = frames - at > 1024 ? 1024 : frames - at, m = 0;
+
+		if (krate == drate || (krate != 2 * drate && drate != 2 * krate)) {
+			memcpy(k, in + at, (size_t)chunk * 2);
+			m = chunk;
+		} else if (krate == 2 * drate) {
+			for (UInt32 i = 0; i < chunk; i++) {
+				k[m++] = in[at + i];
+				k[m++] = in[at + i];
+			}
+		} else {
+			for (UInt32 i = 0; i + 1 < chunk; i += 2) {
+				k[m++] = (int16_t)(((int32_t)in[at + i] + in[at + i + 1]) / 2);
+			}
+		}
+		at += chunk;
+		if (skip >= m) {
+			skip -= m;
+			bb.ul_trim += m;
+			continue;
+		}
+		if (write(voice, k + skip, (size_t)(m - skip) * 2) < 0) {
+			bb.ul_err++;
+		} else {
+			bb.ul_put += m - skip;
+		}
+		bb.ul_trim += skip;
+		skip = 0;
+	}
+}
+
+static void actuator_start(void);
+static void actuator_stop(void);
+
 static OSStatus
 start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
 {
@@ -891,12 +1641,28 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	if (d->running++ == 0) {
 		d->anchor = mach_absolute_time();
 		d->periods = 0;
-		if (d->output != 0) {
+		if (d->output != 0 && d->object != OBJECT_CODEC && d->object != OBJECT_BB) {
 			written = refused = 0;
 			say("redwood: audio: playing\n");
 		}
+		if (d->object == OBJECT_BB) {
+			bb_read = bb_written = 0;
+			bb_peak = 0;
+			bb_first_read = bb_first_write = false;
+			bb_starts++;
+			say("redwood: audio: baseband: I/O started (#%llu) at %.0f Hz: downlink %s, uplink %s; codec %s, speaker %s, "
+			    "receiver %s\n", bb_starts, d->rate, inactive[OBJECT_BB_INPUT] ? "inactive" : "active",
+			    inactive[OBJECT_BB_OUTPUT] ? "inactive" : "active", devices[3].running ? "running" : "idle",
+			    devices[0].running ? "running" : "idle", mutes[0] ? "muted" : "on");
+			if (BB_LIVE) {
+				bb_live_start(d);
+			}
+		}
 		if (d->object == OBJECT_CODEC) {
 			codec_open();
+		}
+		if (d->object == OBJECT_ACTUATOR) {
+			actuator_start();
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -913,8 +1679,28 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	}
 	pthread_mutex_lock(&lock);
 	if (d->running != 0 && --d->running == 0) {
-		if (d->object == OBJECT_CODEC) {
+		if (d->object == OBJECT_ACTUATOR) {
+			actuator_stop();
+		}
+		if (d->object == OBJECT_BB && BB_LIVE) {
+			bb_live_stop(d);
+		} else if (d->object == OBJECT_BB) {
+			say("redwood: audio: baseband: I/O stopped (#%llu) at %.0f Hz: %llu.%02llu s of downlink given (silence), "
+			    "%llu.%02llu s of uplink taken and thrown away (peak %d of 32768)\n", bb_starts, d->rate,
+			    bb_read / (UInt64)d->rate, bb_read % (UInt64)d->rate * 100 / (UInt64)d->rate,
+			    bb_written / (UInt64)d->rate, bb_written % (UInt64)d->rate * 100 / (UInt64)d->rate, bb_peak);
+		} else if (d->object == OBJECT_CODEC) {
 			codec_close();
+			if (receiver_frames > 0) {
+				say("redwood: audio: the receiver was played %llu frames (%s)\n", receiver_frames, BB_LIVE ?
+				    "to /dev/redwood-audio while unmuted" : "thrown away");
+				receiver_frames = 0;
+			}
+			if (BB_LIVE && (rx_played > 0 || rx_dropped > 0 || spk_yielded > 0)) {
+				say("redwood: audio: receiver: %llu frames to the sink, %llu while muted (not played); the speaker gave way "
+				    "for %llu frames\n", rx_played, rx_dropped, spk_yielded);
+				rx_played = rx_dropped = spk_yielded = 0;
+			}
 		} else if (d->output != 0) {
 			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
 			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
@@ -929,7 +1715,7 @@ static OSStatus
 get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client,
     Float64 *sample_time, UInt64 *host_time, UInt64 *seed)
 {
-	Float64 ticks_per_period = ticks_per_frame * TIMESTAMP_PERIOD;
+	Float64 ticks_per_period;
 	UInt64 now = mach_absolute_time();
 	struct device *d = device_of(object);
 
@@ -937,6 +1723,26 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
+	if (d->object == OBJECT_BB && call_route == 5) {
+		/*
+		 * Flag 5: the period follows the rate measured from GET_TIME (bb_tpf, set in bb_stats()); kept as the host time of
+		 * the current period, so a new rate moves only the periods after it (no jump backwards).
+		 */
+		ticks_per_period = (bb_tpf != 0 ? bb_tpf : ticks_per_second / d->rate) * TIMESTAMP_PERIOD;
+		if (bb_period_host == 0 || bb_period_host < d->anchor) {
+			bb_period_host = d->anchor;
+		}
+		while (now >= bb_period_host + (UInt64)ticks_per_period) {
+			bb_period_host += (UInt64)ticks_per_period;
+			d->periods++;
+		}
+		*sample_time = (Float64)d->periods * TIMESTAMP_PERIOD;
+		*host_time = bb_period_host;
+		*seed = 1;
+		pthread_mutex_unlock(&lock);
+		return 0;
+	}
+	ticks_per_period = (d->rate != 0 ? ticks_per_second / d->rate : ticks_per_frame) * TIMESTAMP_PERIOD;
 	while (now >= d->anchor + (UInt64)((Float64)(d->periods + 1) * ticks_per_period)) {
 		d->periods++;
 	}
@@ -966,16 +1772,189 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 /*
  * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
  * CoreHaptics' patterns, UIKit's feedbacks, as waveforms of one channel -- goes to the kernel's motor
- * driver (/dev/redwood-haptic, bsd/dev/redwood_haptic.c, haptic=5), which plays Android's own
- * waveforms on the phone's motor by it. (iOS plays on this device at all only because the device
- * tree says the phone's haptics are "closed-loop": see mkidentity.py.) Said the first times, with
- * how loud.
+ * driver (/dev/redwood-haptic, bsd/dev/sweet_audio.c, xnu 0914), which turns each write's peak into a
+ * DRV2624 drive level. (iOS plays on this device at all only because the device tree says the phone's
+ * haptics are "closed-loop": see mkadt.py.)
+ *
+ * Haptics apart from sound (ws-haptic-decouple). The virtual audio device runs the actuator together
+ * with the speaker: every "playing" comes twice, and the actuator's frames add up to about half the
+ * speaker's (r63a / live 2026-11-05: 109 s of actuator for 204 s of speaker), with peaks pinned at
+ * 17681 (AUHapticsProtection's ceiling in 'd22_actuator_general'), so what is played reaches the motor
+ * and the phone buzzes with its speaker. A DRV2624 is not a Taptic Engine: it cannot render audio, and
+ * the kernel's level follower drives it flat out for anything over a third of full scale. So what the
+ * actuator plays is judged in bursts (activity over HAP_ACTIVE, ended by HAP_BURST_END of quiet):
+ *
+ *   mode 0 (default, decoupled): a burst that starts while the speaker is silent is a haptic and is felt
+ *          whole (taps, UIKit/CoreHaptics feedback, vibrate, the ringer's vibration with no tone). A burst
+ *          that starts with sound on the speaker (within HAP_NEAR of its onset) is felt for its first
+ *          HAP_PAIRED ms only -- the tap iOS pairs with a click, the keyboard, the charger -- and then
+ *          silenced for as long as the speaker stays audible: what follows is the sound's copy.
+ *   mode 1 (coupled, the old behaviour): everything goes to the motor.
+ *   mode 2 (strict): nothing reaches the motor while the speaker is audible (within HAP_NEAR).
+ *
+ * The mode is the number in /private/var/local/haptic-audio (missing or unreadable: 0), read each time
+ * the actuator starts, so it changes without a restart. Silenced frames go to the kernel as zeros.
+ * Each actuator run ends with one line: its bursts, how they were judged, how long was felt and muted.
  */
-static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
+#define HAPTIC_MODE_FILE        "/private/var/local/haptic-audio"
+#define HAP_ACTIVE              1000    /* the kernel's HAP_FLOOR: under it the motor is off anyway */
+#define SPK_AUDIBLE             64      /* a speaker block's peak over this (-54 dBFS): sound */
+#define HAP_BURST_END_MS        30
+#define HAP_NEAR_MS             30
+#define HAP_DECIDE_MS           12      /* a burst's onset is judged once its first 12 ms are in */
+#define HAP_PAIRED_MS           60
+#define HAP_RECHECK_MS          100     /* ... and once more at 100 ms, when the speaker's blocks are surely in */
+#define SPK_BLOCKS              64      /* the speaker's last writes: >= 1.3 s at 1024 frames */
+#define HAP_SAID_MAX            400
+
+static int haptic = -1;          /* the motor driver; -2: not there */
 static unsigned haptic_said;
+static int haptic_mode;
+
+/* The speaker's recent writes, by host time: written on its I/O thread, read on the actuator's. */
+static struct {
+	volatile UInt64 start, end;
+	volatile int peak;
+} spk[SPK_BLOCKS];
+static volatile unsigned spk_next;
+
+static UInt64
+frames_to_ticks(UInt64 frames)
+{
+	return (UInt64)((Float64)frames * ticks_per_frame);
+}
+
+static UInt64
+io_host_time(const AudioServerPlugInIOCycleInfo *cycle)
+{
+	return cycle != NULL && cycle->mOutputTime.mHostTime != 0 ? cycle->mOutputTime.mHostTime : mach_absolute_time();
+}
 
 static void
-actuator_write(const int16_t *samples, UInt32 frames)
+speaker_note(const int16_t *samples, UInt32 frames, UInt64 when)
+{
+	int peak = 0;
+	unsigned i = spk_next % SPK_BLOCKS;
+
+	for (UInt32 k = 0; k < frames * REDWOOD_AUDIO_CHANNELS; k++) {
+		int v = samples[k] < 0 ? -samples[k] : samples[k];
+
+		peak = v > peak ? v : peak;
+	}
+	spk[i].end = 0;                 /* invalid while it changes */
+	spk[i].start = when;
+	spk[i].peak = peak;
+	spk[i].end = when + frames_to_ticks(frames);
+	spk_next++;
+}
+
+/* Is the speaker audible anywhere in [from, to]? */
+static Boolean
+speaker_audible(UInt64 from, UInt64 to)
+{
+	for (unsigned i = 0; i < SPK_BLOCKS; i++) {
+		UInt64 end = spk[i].end, start = spk[i].start;
+
+		if (end != 0 && spk[i].peak > SPK_AUDIBLE && start <= to && end >= from) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* this actuator run */
+static struct {
+	Boolean in_burst, decided, with_sound, rechecked;
+	UInt64 onset, last_active;      /* host times */
+	unsigned bursts, haptic_bursts, sound_bursts;
+	UInt64 felt, muted, frames;     /* frames */
+	int peak;
+} hr;
+
+static void
+actuator_start(void)
+{
+	char buf[16] = "";
+	int f = open(HAPTIC_MODE_FILE, O_RDONLY);
+
+	if (f >= 0) {
+		ssize_t n = read(f, buf, sizeof(buf) - 1);
+
+		buf[n > 0 ? n : 0] = 0;
+		close(f);
+	}
+	haptic_mode = buf[0] >= '0' && buf[0] <= '2' ? buf[0] - '0' : 0;
+	memset(&hr, 0, sizeof(hr));
+}
+
+static void
+actuator_stop(void)
+{
+	if ((hr.bursts > 0 || hr.peak > 0) && haptic_said < HAP_SAID_MAX) {
+		haptic_said++;
+		say("redwood: audio: actuator run %llu.%02llu s, mode %d: %u bursts (%u haptic, %u with sound), felt %llu ms, "
+		    "muted %llu ms, peak %d of 32768%s\n", hr.frames / REDWOOD_AUDIO_RATE,
+		    hr.frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, haptic_mode, hr.bursts, hr.haptic_bursts,
+		    hr.sound_bursts, hr.felt * 1000 / REDWOOD_AUDIO_RATE, hr.muted * 1000 / REDWOOD_AUDIO_RATE, hr.peak,
+		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
+	}
+}
+
+/* Should this block (of an actuator run, at host time when, with this peak) reach the motor? */
+static Boolean
+actuator_felt(int peak, UInt64 when, UInt32 frames)
+{
+	UInt64 near = frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_NEAR_MS / 1000);
+	UInt64 end = when + frames_to_ticks(frames);
+
+	if (peak >= HAP_ACTIVE) {
+		if (!hr.in_burst || when > hr.last_active + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_BURST_END_MS / 1000)) {
+			hr.in_burst = true;
+			hr.decided = hr.with_sound = hr.rechecked = false;
+			hr.onset = when;
+			hr.bursts++;
+		}
+		hr.last_active = end;
+	}
+	if (haptic_mode == 1) {
+		return true;
+	}
+	if (haptic_mode == 2) {
+		return !speaker_audible(when - near, end + near);
+	}
+	if (!hr.in_burst) {
+		return true;            /* quiet: nothing to feel either way */
+	}
+	if (!hr.decided && end >= hr.onset + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_DECIDE_MS / 1000)) {
+		hr.decided = true;
+		hr.with_sound = speaker_audible(hr.onset - near, hr.onset + near);
+		if (hr.with_sound) {
+			hr.sound_bursts++;
+		} else {
+			hr.haptic_bursts++;
+		}
+	}
+	if (hr.decided && !hr.with_sound && !hr.rechecked &&
+	    end >= hr.onset + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_RECHECK_MS / 1000)) {
+		/* the speaker's blocks for the onset may have come after the first judgement: once more */
+		hr.rechecked = true;
+		if (speaker_audible(hr.onset - near, hr.onset + near)) {
+			hr.with_sound = true;
+			hr.haptic_bursts--;
+			hr.sound_bursts++;
+		}
+	}
+	if (!hr.decided || !hr.with_sound) {
+		return true;
+	}
+	if (when < hr.onset + frames_to_ticks(REDWOOD_AUDIO_RATE * HAP_PAIRED_MS / 1000)) {
+		return true;            /* the tap paired with a sound */
+	}
+	return !speaker_audible(when - near, end + near);
+}
+
+static void
+actuator_write(int16_t *samples, UInt32 frames, UInt64 when)
 {
 	int peak = 0;
 
@@ -984,6 +1963,14 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 		peak = v > peak ? v : peak;
 	}
+	hr.frames += frames;
+	hr.peak = peak > hr.peak ? peak : hr.peak;
+	if (!actuator_felt(peak, when, frames)) {
+		memset(samples, 0, (size_t)frames * 2);  /* in place: the HAL's own buffer, done with after this */
+		hr.muted += frames;
+	} else if (peak >= HAP_ACTIVE) {
+		hr.felt += frames;
+	}
 	if (haptic == -1) {
 		haptic = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
 		haptic = haptic >= 0 ? haptic : -2;
@@ -991,16 +1978,11 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	if (haptic >= 0) {
 		(void)write(haptic, samples, (size_t)frames * 2);
 	}
-	if (peak > 0 && haptic_said < 12) {
-		haptic_said++;
-		say("redwood: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
-		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
-	}
 }
 
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
-    __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
+    __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
     __unused void *secondary)
 {
 	const struct device *d = device_of(stream);
@@ -1010,12 +1992,72 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	}
 	if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_CODEC_INPUT) {
 		codec_read(buffer, frames);
+	} else if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_BB_INPUT && BB_LIVE) {
+		bb_downlink(buffer, frames);    /* stage 4: the call's downlink from /dev/redwood-voice */
+		if (!bb_first_read) {
+			bb_first_read = true;
+			say("redwood: audio: baseband: first downlink read, %u frames\n", (unsigned)frames);
+		}
+		bb_read += frames;
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_BB_OUTPUT && BB_LIVE) {
+		bb_uplink(buffer, frames);      /* stage 4: iOS's uplink to /dev/redwood-voice */
+		if (!bb_first_write) {
+			bb_first_write = true;
+			say("redwood: audio: baseband: first uplink write, %u frames\n", (unsigned)frames);
+		}
+		bb_written += frames;
+	} else if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_BB_INPUT) {
+		/* the downlink: silence (the call's audio is in the DSP) */
+		memset(buffer, 0, (size_t)frames * 2);
+		if (!bb_first_read) {
+			bb_first_read = true;
+			say("redwood: audio: baseband: first downlink read, %u frames\n", (unsigned)frames);
+		}
+		bb_read += frames;
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_BB_OUTPUT) {
+		/* the uplink: thrown away; its peak is kept to show whether iOS sends the microphone here */
+		const int16_t *samples = buffer;
+
+		for (UInt32 i = 0; i < frames; i++) {
+			int v = samples[i] < 0 ? -samples[i] : samples[i];
+
+			bb_peak = v > bb_peak ? v : bb_peak;
+		}
+		if (!bb_first_write) {
+			bb_first_write = true;
+			say("redwood: audio: baseband: first uplink write, %u frames\n", (unsigned)frames);
+		}
+		bb_written += frames;
 	} else if (operation == kAudioServerPlugInIOOperationReadInput) {
 		/* the speaker's and Hawking's inputs: silence */
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_CODEC_OUTPUT && BB_LIVE) {
+		/*
+		 * Stage 4: iOS plays the call itself; on the receiver port it comes here. Unmuted = the receiver is the route: to
+		 * /dev/redwood-audio (same format as the speaker's), where the call's amplifier is the earpiece's (1086 route,
+		 * from the mutes). Muted = VirtualAudio's speaker route: not played.
+		 */
+		receiver_frames += frames;
+		if (!mutes[0]) {
+			if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
+				refused += frames;
+			}
+			rx_last = io_host_time(cycle);
+			rx_played += frames;
+		} else {
+			rx_dropped += frames;
+		}
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_CODEC_OUTPUT) {
+		receiver_frames += frames;      /* the receiver: thrown away (a call's audio runs in the DSP, xnu 1065) */
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_SPEAKER_OUTPUT && BB_LIVE && !mutes[0] &&
+	    rx_last != 0 && io_host_time(cycle) < rx_last + ms_ticks(100)) {
+		/* stage 4: the receiver plays (one writer on the sink at a time): the speaker gives way */
+		spk_yielded += frames;
+		written += frames;
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
-		actuator_write(buffer, frames);
+		actuator_write(buffer, frames, io_host_time(cycle));
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+		speaker_note(buffer, frames, io_host_time(cycle));
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
 			refused += frames;
@@ -1027,7 +2069,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 
 static AudioServerPlugInDriverInterface interface = {
 	NULL, query_interface, add_ref, release, initialize, create_device, destroy_device, device_client, device_client,
-	configuration_change, configuration_change, has_property, is_property_settable, get_property_data_size,
+	perform_configuration_change, configuration_change, has_property, is_property_settable, get_property_data_size,
 	get_property_data, set_property_data, start_io, stop_io, get_zero_time_stamp, will_do_io_operation,
 	begin_end_io_operation, do_io_operation, begin_end_io_operation,
 };

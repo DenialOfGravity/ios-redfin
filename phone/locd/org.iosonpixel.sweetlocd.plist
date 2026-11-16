@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  sweetlocd, the GNSS daemon (QMI LOC client + locationd PDS bridge; phone/locd). Same install pattern as our other
+  daemons (org.iosonpixel.fastrpcd/sensd): iOS 16's launchd reads /System/Library/xpc/launchd.plist, so this dictionary is
+  merged there as /System/Library/LaunchDaemons/org.iosonpixel.sweetlocd.plist; not installed by default.
+  Never on by default: no RunAtLoad. launchd starts it only while /var/local/loc.on exists (KeepAlive PathState); it exits 0
+  when the file is absent at start or gone 15 s (after STOP to the modem), and is not restarted after a clean exit.
+  ws-gnss-e: also while /var/local/locd.lock-orig exists (written only by unlock=mi/none before changing the modem's engine
+  lock, removed after the restore is confirmed): then it restores that value even with loc.on absent (at most 5 runs).
+  ExitTimeOut 25: SIGTERM waits for the engine lock restore (SET + GET, at most 15 s).
+  Needs kern.sweet_mqrtr_aux=1 (xnu 1124) for /dev/sweet-mqrtr-aux; until then it retries the open every 10 s and does
+  nothing. Binary /var/local/bin/sweetlocd; log /var/local/locd.log; status: sweetlocd status.
+  By hand without launchd: /var/local/bin/sweetlocd & (stop: kill -TERM).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.iosonpixel.sweetlocd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/sweetlocd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/var/local/loc.on</key>
+			<true/>
+			<key>/var/local/locd.lock-orig</key>
+			<true/>
+		</dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>25</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardErrorPath</key>
+	<string>/var/local/locd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

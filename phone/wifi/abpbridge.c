@@ -62,6 +62,13 @@
  * dropped and logged ("abp: MALFORMED"), as one truncated PBM indication ABM-ASSERTed CommCenter in P2 run1.
  * Every new (svc, msg) is logged once with the action and why ("abp: NEW ..."); a policy reload logs them again.
  *
+ * n12z (2026-11-12) abpholdnas=N (cell.on, default 1): NAS (svc 0x03) indications to CommCenter (state replays, 'on' line
+ * indications and the modem's own) are HELD while no BSP activation indication (0xe2 0xb00c ind) has gone to a live
+ * CommCenter session, and released in order right after it is sent (or after the hold timeout: 1 = 5000 ms, N >= 100 = N ms;
+ * a timeout opens the gate for that session too). The gate opens abpholddly=N ms (default 500) after the activation
+ * indication, as CommCenter only reaches kProvisioned ~10 ms after "Baseband is now activated". P5 SOS: the SysInfo replay said "registered" ~0.2 s before activation, so
+ * CommCenter published kEmergencyOnly (service not yet provisioned) and never re-published. abpholdnas=0: no hold (f651489).
+ *
  * READY: the kernel (1063, sweetabp & 8) publishes the baseband services only after ABPB_IOC_READY 1. Mode 1 says
  * ready right after opening; mode 2 once the modem's DMS, NAS and UIM servers are known on QRTR, and not ready
  * when one of them goes away.
@@ -74,6 +81,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include "abpbridge.h"
 #include "cell.h"
 #include "link.h"
@@ -177,6 +185,9 @@ static struct pend {
 	uint16_t ind_msg;
 	/* P2 reg: the request's TLVs (first 96 bytes), for 'if <tlv>' triggers on its answer */
 	uint8_t rqn, rq[96];
+	/* n12b: the router's own EF read (SIM identity); its answer never reaches CommCenter */
+	uint8_t simread;
+	uint16_t file;
 } pend[NPEND];
 static uint16_t replay_txn = 0xff00;	/* router-made GETs use txn 0xff00..0xfffe */
 
@@ -221,8 +232,9 @@ struct pol {
 	const char *why;
 };
 
+struct fref { int tlv, off, len, add, hasadd; };	/* n12b: a request field "RQ<tlv>:<off>:<len>[+<n>]" */
 /* r3 trigger lines ("on svc msg ind|replay ...") */
-enum { TRG_IND, TRG_REPLAY };
+enum { TRG_IND, TRG_REPLAY, TRG_BBRESET };
 #define NTRG	64
 static struct trg {
 	int svc, msg, kind;
@@ -232,6 +244,10 @@ static struct trg {
 	const uint8_t *data;		/* ind: TLVs */
 	uint16_t dlen;
 	int cond;			/* P2 reg 'if <tlv>': only when the request had TLV <tlv> with a non-zero first byte; -1 always */
+	const char *tmpl;		/* n12b: ind data with placeholders (expanded at send time) */
+	int ceq;			/* n12b 'if RQ..=RQ..': only when both request fields are equal */
+	int tosvc;			/* n12b 'ind <svc>:<msg>': to every CommCenter client of service <svc> (0 = the requester) */
+	struct fref fa, fb;
 } trg[NTRG];
 static int ntrg;
 static uint8_t pol_data[16384];	/* hex data of resp/ind lines (one policy load) */
@@ -381,7 +397,7 @@ static const struct pol abp_builtin[] = {
 
 #define NOVR	256
 static struct pol ovr[NOVR];
-static struct { const uint8_t *data; uint16_t dlen; } ovr_data[NOVR];	/* r3: resp:<hex> of ovr[i] */
+static struct { const uint8_t *data; uint16_t dlen; const char *tmpl; } ovr_data[NOVR];	/* r3: resp:<hex> of ovr[i]; n12b: template */
 static int novr;
 static time_t ovr_mtime;
 static off_t ovr_size;
@@ -445,6 +461,215 @@ static int tlvs_ok(const uint8_t *p, uint32_t n)
 	return 1;
 }
 
+/*
+ * n12b (2026-11-12): templates in resp:<hex> and 'on .. ind <msg> <hex>' data, expanded when the message is sent.
+ * After UniXNU/QcomBaseband (BSD-2-Clause, baseband/coachz_bb_data.h + coachz_baseband.cpp): an Apple modem answers the
+ * BSP activation register (0xe2 0xb00c) with an indication carrying the SIM's ICCID and IMSI it read itself, and acks each
+ * carrier-bundle segment (0xe2 0xa000) with the next segment number. Placeholders (inside the hex, no spaces):
+ *   <id>{ICCID}   TLV <id> = 10 bytes, the ICCID in reading order (BCD, F-padded), as wland read it from the card
+ *   <id>{IMSI}    TLV <id> = 8 bytes, the IMSI in reading order (BCD, F-padded)
+ *                 (both include the TLV length; while not known the whole TLV is left out, and an indication with one is
+ *                  deferred until the card has been read; it is sent again whenever the card's identity changes)
+ *   {RQ<tlv>:<off>:<len>[+<n>]}   <len> bytes copied from the request's TLV <tlv> (hex) at byte <off>; with +<n> (len 1, 2
+ *                 or 4) the little-endian value plus n. A request without that field gets QMI error 0x11 (missing arg) for a
+ *                 resp line, and no indication for an 'on' line.
+ * 'on' lines may also end in "if RQ<a>=RQ<b>" (two field references, compared as numbers), e.g. last segment:
+ *   0xe2 0xa000 resp:400200{RQ01:2:2+1}
+ *   on 0xe2 0xa000 ind 0xa001 010200{RQ01:0:1}0010010001 if RQ01:2:2+1=RQ01:4:2
+ * ICCID/IMSI values are never logged (lengths only).
+ */
+#define SIM_ICCID_LEN	10
+#define SIM_IMSI_LEN	8
+static struct {
+	uint8_t iccid[SIM_ICCID_LEN], imsi[SIM_IMSI_LEN];
+	uint8_t iccid_ef[SIM_ICCID_LEN], imsi_ef[9];	/* as on the card: only for redacting the frame log */
+	int have_iccid, have_imsi, refresh, tries;
+	unsigned gen, reads, snoops;
+	uint64_t next;
+} simid;
+static char pol_text[8192];	/* template texts of one policy load */
+static uint32_t pol_tlen;
+
+
+/* "RQ<tlv>:<off>:<len>[+<n>]" (s up to '}' or '=' or end); 0 ok */
+static int parse_fref(const char *s, struct fref *f)
+{
+	unsigned t;
+	int off, len, add = 0, k = 0;
+	memset(f, 0, sizeof(*f));
+	if (s[0] >= '0' && s[0] <= '9') {	/* a number: "if RQ01:0:1=4" */
+		char *e;
+		long v = strtol(s, &e, 0);
+		if (e == s)
+			return -1;
+		f->tlv = -1;
+		f->len = 1;
+		f->add = (int)v;
+		return 0;
+	}
+	if ((s[0] != 'R' && s[0] != 'r') || (s[1] != 'Q' && s[1] != 'q'))
+		return -1;
+	if (sscanf(s + 2, "%x:%d:%d%n", &t, &off, &len, &k) != 3 || t > 255 || off < 0 || off > 4096 || len < 1 || len > 64)
+		return -1;
+	s += 2 + k;
+	if (*s == '+') {
+		if (sscanf(s + 1, "%d", &add) != 1 || (len != 1 && len != 2 && len != 4))
+			return -1;
+		f->hasadd = 1;
+	}
+	f->tlv = (int)t;
+	f->off = off;
+	f->len = len;
+	f->add = add;
+	return 0;
+}
+
+/* the value of TLV id in list p (n bytes): pointer and length, NULL if absent */
+static const uint8_t *tlv_find(const uint8_t *p, uint32_t n, unsigned id, uint32_t *len)
+{
+	for (uint32_t k = 0; k + 3 <= n;) {
+		uint32_t l = (uint32_t)(p[k + 1] | (p[k + 2] << 8));
+		if (k + 3 + l > n)
+			return NULL;
+		if (p[k] == id) {
+			*len = l;
+			return p + k + 3;
+		}
+		k += 3 + l;
+	}
+	return NULL;
+}
+
+/* the field's bytes (with +n applied) into out; dummy: zeros; 0 ok, -1 the request does not have it */
+static int fref_get(const struct fref *f, const uint8_t *rq, uint32_t rqn, int dummy, uint8_t *out)
+{
+	uint32_t l = 0;
+	const uint8_t *v = dummy ? NULL : tlv_find(rq, rqn, (unsigned)f->tlv, &l);
+	if (dummy) {
+		memset(out, 0, (size_t)f->len);
+	} else {
+		if (!v || (uint32_t)f->off + (uint32_t)f->len > l)
+			return -1;
+		memcpy(out, v + f->off, (size_t)f->len);
+	}
+	if (f->hasadd) {
+		uint32_t x = 0;
+		for (int i = 0; i < f->len; i++)
+			x |= (uint32_t)out[i] << (8 * i);
+		x += (uint32_t)f->add;
+		for (int i = 0; i < f->len; i++)
+			out[i] = (uint8_t)(x >> (8 * i));
+	}
+	return 0;
+}
+
+static int fref_num(const struct fref *f, const uint8_t *rq, uint32_t rqn, uint32_t *x)
+{
+	uint8_t b[64];
+	if (f->tlv < 0) {
+		*x = (uint32_t)f->add;
+		return 0;
+	}
+	if (f->len > 4 || fref_get(f, rq, rqn, 0, b))
+		return -1;
+	*x = 0;
+	for (int i = 0; i < f->len; i++)
+		*x |= (uint32_t)b[i] << (8 * i);
+	return 0;
+}
+
+static int hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+/*
+ * expand template h: the bytes (length) into out; -1 bad template / no room, -2 a request field is missing.
+ * dummy: every placeholder as if known (load-time check). *missing: an ICCID/IMSI TLV was left out (not known yet).
+ */
+static int tmpl_expand(const char *h, const uint8_t *rq, uint32_t rqn, int dummy, uint8_t *out, uint32_t room, int *missing)
+{
+	uint32_t o = 0;
+	int hi = -1;
+	*missing = 0;
+	for (; *h; h++) {
+		if (*h == '.' || *h == '_' || *h == ':')
+			continue;
+		if (*h == '{') {
+			const char *e = strchr(h, '}');
+			if (!e || hi >= 0)
+				return -1;
+			size_t nl = (size_t)(e - h - 1);
+			if ((nl == 5 && !strncmp(h + 1, "ICCID", 5)) || (nl == 4 && !strncmp(h + 1, "IMSI", 4))) {
+				int ic = nl == 5;
+				uint32_t l = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
+				if (dummy || (ic ? simid.have_iccid : simid.have_imsi)) {
+					if (o + 2 + l > room)
+						return -1;
+					out[o++] = (uint8_t)l;
+					out[o++] = 0;
+					if (dummy)
+						memset(out + o, 0xff, l);
+					else
+						memcpy(out + o, ic ? simid.iccid : simid.imsi, l);
+					o += l;
+				} else {
+					if (!o)
+						return -1;
+					o--;		/* the TLV id: the whole TLV is left out */
+					*missing = 1;
+				}
+			} else {
+				struct fref f;
+				if (parse_fref(h + 1, &f) || o + (uint32_t)f.len > room)
+					return -1;
+				if (fref_get(&f, rq, rqn, dummy, out + o))
+					return -2;
+				o += (uint32_t)f.len;
+			}
+			h = e;
+			continue;
+		}
+		int v = hexval(*h);
+		if (v < 0)
+			return -1;
+		if (hi < 0) {
+			hi = v;
+			continue;
+		}
+		if (o >= room)
+			return -1;
+		out[o++] = (uint8_t)(hi << 4 | v);
+		hi = -1;
+	}
+	return hi >= 0 ? -1 : (int)o;
+}
+
+static int tmpl_sim(const char *h)
+{
+	return h && (strstr(h, "{ICCID}") || strstr(h, "{IMSI}"));
+}
+
+/* a template into pol_text, checked (dummy expansion must be whole TLVs); NULL if bad */
+static const char *parse_tmpl(const char *h)
+{
+	uint8_t b[4096];
+	int miss, n = tmpl_expand(h, NULL, 0, 1, b, sizeof(b), &miss);
+	size_t l = strlen(h);
+	if (n < 0 || !tlvs_ok(b, (uint32_t)n) || pol_tlen + l + 1 > sizeof(pol_text))
+		return NULL;
+	char *t = pol_text + pol_tlen;
+	memcpy(t, h, l + 1);
+	pol_tlen += (uint32_t)l + 1;
+	return t;
+}
+
 /* "on svc msg ind <msg> <hex>" / "on svc msg replay <get> <ind> [map a=b,c=d]"; 0 ok */
 static int parse_trigger(char *line, int ln)
 {
@@ -456,24 +681,50 @@ static int parse_trigger(char *line, int ln)
 	char *iff = strstr(line, " if ");
 	if (iff) {
 		unsigned c;
-		if (sscanf(iff + 4, "%x", &c) != 1 || c > 255)
-			goto bad;
-		t.cond = (int)c;
+		char *eq = strchr(iff + 4, '=');
+		while (iff[4] == ' ')
+			iff++;
+		if (eq) {		/* n12b: "if RQ..=RQ.." */
+			if (parse_fref(iff + 4, &t.fa) || parse_fref(eq + 1, &t.fb) || t.fa.len > 4 || t.fb.len > 4)
+				goto bad;
+			t.ceq = 1;
+		} else {
+			if (sscanf(iff + 4, "%x", &c) != 1 || c > 255)
+				goto bad;
+			t.cond = (int)c;
+		}
 		*iff = 0;
 	}
 	int k = sscanf(line, "%255s %255s %255s %255s %255s %255s %255s", w[0], w[1], w[2], w[3], w[4], w[5], w[6]);
 	int a, b;
+	char *colon = k >= 5 && !strcmp(w[3], "ind") ? strchr(w[4], ':') : NULL;
+	if (colon) {			/* n12b: "ind <svc>:<msg>" */
+		*colon = 0;
+		if (parse_num(w[4], &t.tosvc) || t.tosvc < 1 || t.tosvc > 255)
+			goto bad;
+		memmove(w[4], colon + 1, strlen(colon + 1) + 1);
+	}
 	if (k < 5 || ntrg >= NTRG || parse_num(w[1], &t.svc) || t.svc < 1 || t.svc > 255 || parse_num(w[2], &t.msg) ||
 	    parse_num(w[4], &a) || a < 0 || a > 0xffff)
 		goto bad;
 	t.m2 = (uint16_t)a;
 	if (!strcmp(w[3], "ind")) {
 		t.kind = TRG_IND;
-		if (k >= 6) {
+		if (k >= 6 && strchr(w[5], '{')) {
+			t.tmpl = parse_tmpl(w[5]);	/* n12b */
+			if (!t.tmpl)
+				goto bad;
+		} else if (k >= 6) {
 			t.data = parse_hex(w[5], &t.dlen);
 			if (!t.data || !tlvs_ok(t.data, t.dlen))
 				goto bad;
 		}
+	} else if (!strcmp(w[3], "bbreset")) {
+		t.kind = TRG_BBRESET;	/* n12b: m2 = ms of the reset; m3 = 1 'unpub' (un-publish the stand-ins), 0 'msg' (default) */
+		if (k >= 6 && !strcmp(w[5], "unpub"))
+			t.m3 = 1;
+		else if (k >= 6 && strcmp(w[5], "msg"))
+			goto bad;
 	} else if (!strcmp(w[3], "replay")) {
 		t.kind = TRG_REPLAY;
 		if (k < 6 || parse_num(w[5], &b) || b < 0 || b > 0xffff)
@@ -538,6 +789,7 @@ static void policy_load(int force)
 	ntrg = 0;
 	nstrip = 0;
 	pol_dlen = 0;
+	pol_tlen = 0;
 	while (fgets(line, sizeof(line), f) && n < NOVR) {
 		char a[64], b[64], c[8400];
 		ln++;
@@ -556,6 +808,7 @@ static void policy_load(int force)
 			continue;
 		struct pol p = { 0, POL_ANY, ACT_ERR, POL_ABPERR, "conf" };
 		const uint8_t *pdata = NULL;
+		const char *ptmpl = NULL;
 		uint16_t pdlen = 0;
 		if (parse_num(a, &p.svc) || p.svc < 1 || p.svc > 255 || (strcmp(b, "*") && parse_num(b, &p.msg))) {
 			printf("abp: %s line %d: bad svc/msg\n", ABP_POLICY, ln);
@@ -572,6 +825,8 @@ static void policy_load(int force)
 			p.act = ACT_ERR;
 		else if (!strcmp(c, "err"))
 			p.act = ACT_ERR;
+		else if (!strncmp(c, "resp:", 5) && strchr(c + 5, '{') && (ptmpl = parse_tmpl(c + 5)) != NULL)
+			p.act = ACT_RESP;	/* n12b: template */
 		else if (!strncmp(c, "resp:", 5) && (pdata = parse_hex(c + 5, &pdlen)) != NULL && tlvs_ok(pdata, pdlen))
 			p.act = ACT_RESP;
 		else {
@@ -581,6 +836,7 @@ static void policy_load(int force)
 		}
 		ovr_data[n].data = pdata;
 		ovr_data[n].dlen = pdlen;
+		ovr_data[n].tmpl = ptmpl;
 		ovr[n++] = p;
 	}
 	fclose(f);
@@ -592,6 +848,7 @@ static void policy_load(int force)
 
 static const uint8_t *dec_data;	/* ACT_RESP: the TLVs of the last decide() */
 static uint16_t dec_dlen;
+static const char *dec_tmpl;	/* n12b: ACT_RESP template */
 
 /* the action for (svc, msg); *err = the error code, *why = the reason (for the log) */
 static int decide(unsigned svc, unsigned msg, int *err, const char **why, char *whybuf, size_t wl)
@@ -614,11 +871,13 @@ static int decide(unsigned svc, unsigned msg, int *err, const char **why, char *
 			p = &abp_builtin[i];
 	dec_data = NULL;
 	dec_dlen = 0;
+	dec_tmpl = NULL;
 	if (p) {
 		a = p->act;
 		if (from_conf) {
 			dec_data = ovr_data[p - ovr].data;
 			dec_dlen = ovr_data[p - ovr].dlen;
+			dec_tmpl = ovr_data[p - ovr].tmpl;
 		}
 		if (p->err != POL_ABPERR)
 			*err = p->err;
@@ -696,10 +955,28 @@ static void note_seen(unsigned svc, unsigned msg, const char *act, const char *w
 }
 
 /* log one frame (abplog=1 or mode 1); dir "CC->" (CommCenter wrote it) or "->CC" (our answer / the modem's) */
+/* n12b: a copy of frame f with the SIM identity (reading order and card order) overwritten by 0xee, for the logs */
+static const uint8_t *redact(const uint8_t *f, uint32_t n)
+{
+	static uint8_t rb[6 + ABP_MAXFRAME];
+	if ((!simid.have_iccid && !simid.have_imsi) || n > sizeof(rb))
+		return f;
+	memcpy(rb, f, n);
+	const uint8_t *pat[4] = { simid.iccid, simid.iccid_ef, simid.imsi, simid.imsi_ef + 1 };
+	const uint32_t pl[4] = { SIM_ICCID_LEN, SIM_ICCID_LEN, SIM_IMSI_LEN - 1, 8 };
+	const int on[4] = { simid.have_iccid, simid.have_iccid, simid.have_imsi, simid.have_imsi };
+	for (int k = 0; k < 4; k++)
+		for (uint32_t i = 0; on[k] && i + pl[k] <= n; i++)
+			if (!memcmp(rb + i, pat[k], pl[k]))
+				memset(rb + i, 0xee, pl[k]);
+	return rb;
+}
+
 static void log_frame(unsigned pipe, const char *dir, const uint8_t *f, uint32_t n)
 {
 	if (!logframes)
 		return;
+	f = redact(f, n);	/* n12b: never the ICCID / IMSI in a log */
 	char h[3 * 96 + 8], t[600];
 	char pn[24];
 	snprintf(pn, sizeof(pn), "%s/%u", pipe < NPIPES ? pipe_name[pipe] : "?", cur_sess);
@@ -763,6 +1040,126 @@ static int send_to(unsigned pipe, uint32_t sess, const uint8_t *f, uint32_t n)
 static int send_frame(unsigned pipe, const uint8_t *f, uint32_t n)
 {
 	return send_to(pipe, cur_sess, f, n);
+}
+
+/*
+ * n12z: NAS indication hold until BSP activation (abpholdnas, see the top). The gate is one CommCenter session: the one
+ * the 0xb00c activation indication went to (or the one whose held indication timed out); it closes when that session
+ * ends (CommCenter restart), so every CommCenter start is held again.
+ */
+#define NHOLD		64
+#define HOLD_MAXF	4096
+static int holdnas = 1;			/* 0 off, 1 on (5000 ms), >= 100 on with that timeout (ms) */
+static struct hold { int used; uint32_t pipe, sess; uint8_t svc, cid; uint16_t msg; uint32_t n; uint64_t t; uint8_t f[HOLD_MAXF]; } holdq[NHOLD];
+static int nhold;			/* queued, oldest first */
+static int gate_set, holddly = 500;	/* abpholddly=N: the gate opens N ms after the activation indication (CommCenter
+					 * moves to kProvisioned ~10 ms after "Baseband is now activated"; default 500) */
+static uint64_t gate_at;
+static uint32_t gate_pipe, gate_sess;
+static unsigned held_cnt, held_rel_bsp, held_rel_to, held_drop;
+
+static int sess_live(uint32_t pipe, uint32_t sess)
+{
+	for (unsigned i = 0; i < NSESS; i++)
+		if (st[i].sess && st[i].sess == sess && st[i].pipe == pipe)
+			return 1;
+	return 0;
+}
+
+static int hold_gate_open(void)
+{
+	if (gate_set && !sess_live(gate_pipe, gate_sess)) {
+		gate_set = 0;
+		gate_at = 0;
+		printf("[%6llu] abp: holdnas: gate closed (session %s/%u ended): NAS indications held until the next BSP activation\n",
+		       (unsigned long long)link_ms(), gate_pipe < NPIPES ? pipe_name[gate_pipe] : "?", gate_sess);
+	}
+	return gate_set && link_ms() >= gate_at;
+}
+
+static int cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid);
+
+/* send the oldest k held frames (to clients that still exist) */
+static void hold_release(int k, const char *why)
+{
+	uint32_t pp = cur_pipe;
+	int sent = 0, gone = 0;
+	for (int i = 0; i < k && i < nhold; i++) {
+		struct hold *h = &holdq[i];
+		if (cid_live(h->pipe, h->sess, h->svc, h->cid)) {
+			cur_pipe = h->pipe;
+			send_to(h->pipe, h->sess, h->f, h->n);
+			sent++;
+		} else {
+			gone++;
+			held_drop++;
+		}
+	}
+	cur_pipe = pp;
+	if (k > nhold)
+		k = nhold;
+	memmove(holdq, holdq + k, sizeof(holdq[0]) * (size_t)(nhold - k));
+	nhold -= k;
+	if (sent || gone)
+		printf("[%6llu] abp: holdnas: released %d held NAS indication(s) (%s)%s%d client(s) gone\n", (unsigned long long)link_ms(),
+		       sent, why, gone ? ", dropped for " : ", ", gone);
+}
+
+static void hold_open(uint32_t pipe, uint32_t sess, int dly, const char *why)
+{
+	if (!gate_set || gate_pipe != pipe || gate_sess != sess)
+		printf("[%6llu] abp: holdnas: gate open on %s/%u in %d ms (%s), %d held\n", (unsigned long long)link_ms(),
+		       pipe < NPIPES ? pipe_name[pipe] : "?", sess, dly, why, nhold);
+	else
+		dly = 0;		/* already open there: no new delay */
+	gate_set = 1;
+	gate_pipe = pipe;
+	gate_sess = sess;
+	gate_at = link_ms() + (uint64_t)(dly > 0 ? dly : 0);
+	if (nhold && !dly)
+		hold_release(nhold, why);
+}
+
+/* a whole QMUX frame (01 | len | flags | svc | cid | SDU) for CommCenter: 1 = held here, 0 = send it now */
+static int hold_frame(uint32_t pipe, uint32_t sess, const uint8_t *f, uint32_t n)
+{
+	if (!holdnas || n < 13 || n > HOLD_MAXF || f[4] != 0x03 || f[6] != 0x04 || hold_gate_open())
+		return 0;
+	if (nhold == NHOLD)
+		hold_release(1, "queue full");
+	struct hold *h = &holdq[nhold++];
+	h->used = 1;
+	h->pipe = pipe;
+	h->sess = sess;
+	h->svc = f[4];
+	h->cid = f[5];
+	h->msg = (uint16_t)(f[9] | (f[10] << 8));
+	h->n = n;
+	h->t = link_ms();
+	memcpy(h->f, f, n);
+	held_cnt++;
+	printf("[%6llu] abp: holdnas: NAS indication 0x%04x to %s/%u cid %u held (no BSP activation yet; %d held)\n",
+	       (unsigned long long)h->t, h->msg, pipe < NPIPES ? pipe_name[pipe] : "?", sess, h->cid, nhold);
+	return 1;
+}
+
+static void hold_poll(uint64_t now)
+{
+	uint64_t to = holdnas >= 100 ? (uint64_t)holdnas : 5000;
+	if (!nhold)
+		return;
+	if (!holdnas) {
+		hold_release(nhold, "abpholdnas=0");
+		return;
+	}
+	if (hold_gate_open()) {
+		hold_release(nhold, "gate open");
+		return;
+	}
+	if (now - holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
+		held_rel_to++;
+		hold_open(holdq[0].pipe, holdq[0].sess, 0, "timeout, no BSP activation");
+	}
 }
 
 /* append TLV t to buf at *o */
@@ -1003,7 +1400,11 @@ static void ctl_answer(unsigned pipe, const uint8_t *s, uint32_t sn)
 	}
 	if (msg == 0x22) {		/* GetClientId */
 		int c = -1, e = 0;
-		if (req_svc > 0 && req_svc < 0xe0 && mode >= 2 && cidfail && srv_find((unsigned)req_svc) < 0)
+		int local_svc = 0;	/* n12b: a service the policy file answers here ("<svc> * ok|resp|err|drop") gets client ids */
+		for (int i = 0; i < novr; i++)
+			if (ovr[i].svc == req_svc && ovr[i].msg == POL_ANY && ovr[i].act != ACT_FWD)
+				local_svc = 1;
+		if (req_svc > 0 && req_svc < 0xe0 && mode >= 2 && cidfail && !local_svc && srv_find((unsigned)req_svc) < 0)
 			e = QMI_ERR_INVALID_SERVICE_TYPE;	/* abpcidfail=1: as a QMUX without that service would */
 		else
 			c = req_svc >= 0 ? cid_alloc((unsigned)req_svc) : -1;
@@ -1117,9 +1518,16 @@ static void send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, u
 	if (tn)
 		memcpy(b + 13, tl, tn);
 	finish_qmux(b, 13 + tn, svc, cid);
+	if (hold_frame(pipe, sess, b, 13 + tn))
+		return;
 	uint32_t pp = cur_pipe;
 	send_to(pipe, sess, b, 13 + tn);
 	cur_pipe = pp;
+	if (holdnas && svc == 0xe2 && msg == 0xb00c) {	/* n12z: BSP activation went out: release the held NAS state */
+		if (nhold)
+			held_rel_bsp++;
+		hold_open(pipe, sess, holddly, "BSP activation 0xb00c sent");
+	}
 }
 
 static void pend_add(struct pend *x)
@@ -1161,6 +1569,317 @@ static int tlv_byte(const uint8_t *p, uint32_t n, unsigned id)
 	return -1;
 }
 
+/*
+ * n12b: the SIM identity for {ICCID}/{IMSI} templates, read from the card through the modem as an Apple baseband does
+ * itself: CommCenter's own UIM Read Transparent answers (EF_ICCID 0x2fe2, EF_IMSI 0x6f07) are looked at on their way back,
+ * and while an indication waits for them (or after a UIM status change indication) the router reads both files itself
+ * (UIM 0x0020 from a CommCenter UIM client's port, read-only, every 5 s while needed). Indications that used them are
+ * remembered per CommCenter client and sent again when the identity changes (another SIM). Values are never logged.
+ */
+#define NSUB	8
+static struct sub {
+	int used, pending;
+	uint32_t pipe, sess;
+	uint8_t svc, cid;
+	uint16_t msg, m2;
+	uint8_t rqn, rq[96];
+	uint64_t t;
+} subs[NSUB];
+
+/* is client id cid of svc held by CommCenter session (pipe, sess)? (no session slot is taken) */
+static int cid_live(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid)
+{
+	for (unsigned i = 0; i < NSESS; i++)
+		if (st[i].sess && st[i].sess == sess && st[i].pipe == pipe)
+			return (st[i].cids[svc & 0xff][(cid & 0xff) / 8] >> (cid % 8)) & 1;
+	return 0;
+}
+
+static void sub_note(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, unsigned m2, const uint8_t *rq,
+		     uint32_t rqn, int pending)
+{
+	int k = -1;
+	for (int i = 0; i < NSUB; i++)
+		if (subs[i].used && subs[i].pipe == pipe && subs[i].sess == sess && subs[i].svc == svc && subs[i].cid == cid &&
+		    subs[i].msg == msg && subs[i].m2 == m2)
+			k = i;
+	for (int i = 0; i < NSUB && k < 0; i++)
+		if (!subs[i].used || !cid_live(subs[i].pipe, subs[i].sess, subs[i].svc, subs[i].cid))
+			k = i;
+	if (k < 0) {
+		k = 0;
+		for (int i = 1; i < NSUB; i++)
+			if (subs[i].t < subs[k].t)
+				k = i;
+	}
+	struct sub *s = &subs[k];
+	s->used = 1;
+	s->pending = pending;
+	s->pipe = pipe;
+	s->sess = sess;
+	s->svc = (uint8_t)svc;
+	s->cid = (uint8_t)cid;
+	s->msg = (uint16_t)msg;
+	s->m2 = (uint16_t)m2;
+	s->rqn = (uint8_t)(rqn < sizeof(s->rq) ? rqn : sizeof(s->rq));
+	if (rq && s->rqn)
+		memcpy(s->rq, rq, s->rqn);
+	s->t = link_ms();
+}
+
+/* an 'on .. ind' line's indication (data or template) to one client; 0 sent, 1 deferred (SIM identity unknown), -1 not sent */
+static int trg_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const struct trg *t, const uint8_t *rq,
+		   uint32_t rqn, const char *why)
+{
+	if (t->tosvc) {		/* n12b: to every CommCenter client of service tosvc */
+		static uint8_t xb[4096];
+		const uint8_t *tl = t->data;
+		uint32_t tn = t->dlen;
+		int miss = 0;
+		if (t->tmpl) {
+			int n = tmpl_expand(t->tmpl, rq, rqn, 0, xb, sizeof(xb), &miss);
+			if (n < 0 || miss || !tlvs_ok(xb, (uint32_t)n))
+				return -1;
+			tl = xb;
+			tn = (uint32_t)n;
+		}
+		unsigned sent = 0;
+		for (unsigned i = 0; i < NSESS; i++) {
+			if (!st[i].sess)
+				continue;
+			for (unsigned c = 1; c < 255; c++)
+				if ((st[i].cids[t->tosvc][c / 8] >> (c % 8)) & 1) {
+					send_ind(st[i].pipe, st[i].sess, (unsigned)t->tosvc, c, t->m2, tl, tn);
+					sent++;
+				}
+		}
+		synth_inds += sent;
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication %s(0x%02x) 0x%04x (%u TLV bytes) to %u client(s)\n", (unsigned long long)link_ms(),
+		       svc_name(svc), svc, msg, svc_name((unsigned)t->tosvc), t->tosvc, t->m2, tn, sent);
+		return sent ? 0 : -1;
+	}
+	if (!t->tmpl) {
+		synth_inds++;
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
+		       svc_name(svc), svc, msg, t->m2, t->dlen, pipe_name[pipe], sess, cid);
+		send_ind(pipe, sess, svc, cid, t->m2, t->data, t->dlen);
+		return 0;
+	}
+	static uint8_t b[4096];
+	int miss = 0, n = tmpl_expand(t->tmpl, rq, rqn, 0, b, sizeof(b), &miss);
+	if (n < 0 || !tlvs_ok(b, (uint32_t)n)) {
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x not sent (%s)\n", (unsigned long long)link_ms(), svc_name(svc), svc,
+		       msg, t->m2, n == -2 ? "the request lacks a template field" : "template does not expand to whole TLVs");
+		return -1;
+	}
+	if (tmpl_sim(t->tmpl))
+		sub_note(pipe, sess, svc, cid, msg, t->m2, rq, rqn, miss);
+	if (miss) {
+		printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x to %s/%u cid %u deferred: SIM identity not read yet (ICCID %s, IMSI %s)\n",
+		       (unsigned long long)link_ms(), svc_name(svc), svc, msg, t->m2, pipe_name[pipe], sess, cid, simid.have_iccid ? "known" : "unknown",
+		       simid.have_imsi ? "known" : "unknown");
+		return 1;
+	}
+	synth_inds++;
+	printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%d TLV bytes, template%s%s) to %s/%u cid %u\n", (unsigned long long)link_ms(),
+	       svc_name(svc), svc, msg, t->m2, n, tmpl_sim(t->tmpl) ? " with the SIM identity" : "", why, pipe_name[pipe], sess, cid);
+	send_ind(pipe, sess, svc, cid, t->m2, b, (uint32_t)n);
+	return 0;
+}
+
+/* the identity changed or became known: the remembered indications again */
+static void simid_changed(void)
+{
+	for (int i = 0; i < NSUB; i++) {
+		struct sub *s = &subs[i];
+		if (!s->used)
+			continue;
+		if (!cid_live(s->pipe, s->sess, s->svc, s->cid)) {
+			s->used = 0;
+			continue;
+		}
+		for (int k = 0; k < ntrg; k++)
+			if (trg[k].kind == TRG_IND && trg[k].svc == s->svc && trg[k].msg == s->msg && trg[k].m2 == s->m2 && trg[k].tmpl) {
+				trg_ind(s->pipe, s->sess, s->svc, s->cid, s->msg, &trg[k], s->rq, s->rqn, ", SIM identity changed");
+				break;
+			}
+	}
+}
+
+/* a successful UIM Read Transparent answer's TLVs (tl, tn) for EF file: the content (TLV 0x11 {u16 len, data}) */
+static void simid_from_read(unsigned file, const uint8_t *tl, uint32_t tn, const char *src)
+{
+	uint32_t l = 0;
+	const uint8_t *v = tlv_find(tl, tn, 0x11, &l);
+	if (!v || l < 2 || (uint32_t)(v[0] | (v[1] << 8)) + 2 > l)
+		return;
+	uint32_t cl = (uint32_t)(v[0] | (v[1] << 8));
+	const uint8_t *ef = v + 2;
+	uint8_t val[SIM_ICCID_LEN];
+	int ic;
+	if (file == 0x2fe2) {
+		/* EF_ICCID keeps each digit pair low nibble first: swapped into reading order (QcomBaseband cbd_iccid_from_ef) */
+		if (cl != SIM_ICCID_LEN)
+			return;
+		for (uint32_t i = 0; i < SIM_ICCID_LEN; i++)
+			val[i] = (uint8_t)(ef[i] << 4 | ef[i] >> 4);
+		ic = 1;
+	} else if (file == 0x6f07) {
+		/* EF_IMSI: length byte, digit 1 in the high nibble of the first byte (above the parity nibble), then pairs low
+		 * nibble first; repacked in reading order, F-padded (QcomBaseband cbd_imsi_from_ef) */
+		uint8_t dg[16];
+		uint32_t nd = 0;
+		if (cl < 2 || !ef[0] || ef[0] > 8 || cl < 1u + ef[0])
+			return;
+		for (uint32_t i = 1; i <= ef[0]; i++) {
+			uint8_t lo = ef[i] & 0xf, hi = ef[i] >> 4;
+			if (i > 1) {
+				if (lo > 9)
+					break;
+				dg[nd++] = lo;
+			}
+			if (hi > 9)
+				break;
+			dg[nd++] = hi;
+		}
+		if (nd < 6 || nd > 15)
+			return;
+		for (uint32_t i = 0; i < SIM_IMSI_LEN; i++) {
+			uint8_t a = 2 * i < nd ? dg[2 * i] : 0xf, b = 2 * i + 1 < nd ? dg[2 * i + 1] : 0xf;
+			val[i] = (uint8_t)(a << 4 | b);
+		}
+		ic = 0;
+	} else {
+		return;
+	}
+	if (ic)
+		memcpy(simid.iccid_ef, ef, SIM_ICCID_LEN);
+	else
+		memcpy(simid.imsi_ef, ef, cl < 9 ? cl : 9);
+	uint8_t *have = ic ? simid.iccid : simid.imsi;
+	int *known = ic ? &simid.have_iccid : &simid.have_imsi;
+	uint32_t len = ic ? SIM_ICCID_LEN : SIM_IMSI_LEN;
+	int changed = !*known || memcmp(have, val, len);
+	if (changed) {
+		printf("[%6llu] abp: SIM identity: %s %u bytes %s (from %s)\n", (unsigned long long)link_ms(), ic ? "ICCID" : "IMSI", len,
+		       *known ? "CHANGED" : "read", src);
+		memcpy(have, val, len);
+		*known = 1;
+		simid.gen++;
+	}
+	if (simid.have_iccid && simid.have_imsi) {
+		simid.refresh = 0;
+		simid.tries = 0;
+	}
+	if (changed)
+		simid_changed();
+}
+
+/* the router's own read of EF file from CommCenter UIM client c's port */
+static void simid_read(struct cl *c, int si, unsigned file)
+{
+	static const uint8_t iccid[20] = { 0x01, 2, 0, 0x06, 0x00, 0x02, 5, 0, 0xe2, 0x2f, 2, 0x00, 0x3f, 0x03, 4, 0, 0, 0, 0, 0 };
+	static const uint8_t imsi[22] = { 0x01, 2, 0, 0x00, 0x00, 0x02, 7, 0, 0x07, 0x6f, 4, 0x00, 0x3f, 0xff, 0x7f, 0x03, 4, 0, 0, 0, 0, 0 };
+	const uint8_t *tl = file == 0x2fe2 ? iccid : imsi;
+	uint32_t tn = file == 0x2fe2 ? sizeof(iccid) : sizeof(imsi);
+	uint8_t q[7 + 22];
+	if (++replay_txn == 0xffff)
+		replay_txn = 0xff00;
+	q[0] = 0x00;
+	q[1] = (uint8_t)replay_txn;
+	q[2] = (uint8_t)(replay_txn >> 8);
+	q[3] = 0x20;
+	q[4] = 0x00;
+	q[5] = (uint8_t)tn;
+	q[6] = 0;
+	memcpy(q + 7, tl, tn);
+	if (qrtr_send(QRTR_TYPE_DATA, c->port, srv[si].node, srv[si].port, q, 7 + tn)) {
+		cnt.sendfail++;
+		return;
+	}
+	struct pend x;
+	memset(&x, 0, sizeof(x));
+	x.port = c->port;
+	x.txn = replay_txn;
+	x.msg = 0x20;
+	x.svc = 0x0b;
+	x.simread = 1;
+	x.file = (uint16_t)file;
+	pend_add(&x);
+	simid.reads++;
+}
+
+static void simid_poll(uint64_t now)
+{
+	int need = simid.refresh;
+	for (int i = 0; i < NSUB && !need; i++)
+		if (subs[i].used && subs[i].pending && cid_live(subs[i].pipe, subs[i].sess, subs[i].svc, subs[i].cid))
+			need = 1;
+	if (!need || now < simid.next)
+		return;
+	simid.next = now + 5000;
+	if (simid.refresh && ++simid.tries > 3) {
+		simid.refresh = 0;
+		simid.tries = 0;
+		if (simid.have_iccid && simid.have_imsi)
+			return;
+	}
+	int si = srv_find(0x0b), code;
+	const char *why;
+	char wb[128];
+	if (si < 0 || decide(0x0b, 0x0020, &code, &why, wb, sizeof(wb)) != ACT_FWD)
+		return;
+	struct cl *c = NULL;
+	for (int i = 0; i < NCL && !c; i++)
+		if (cl[i].used == 1 && cl[i].svc == 0x0b)
+			c = &cl[i];
+	for (int i = 0; i < NCL && !c; i++)
+		if (cl[i].used == 2 && cl[i].svc == 0x0b)
+			c = &cl[i];
+	if (!c)
+		return;
+	printf("[%6llu] abp: SIM identity: reading EF_ICCID and EF_IMSI (UIM 0x0020 from port %#x)\n", (unsigned long long)now, c->port);
+	simid_read(c, si, 0x2fe2);
+	simid_read(c, si, 0x6f07);
+}
+
+/*
+ * n12b: "on <svc> <msg> bbreset <ms> [if ..]": an emulated baseband reset. ABM's soft reset is DMS Set Operating Mode
+ * (0x002e) to Reset (TLV 0x01 = 4), which the router answers itself (wland owns the modem's mode); ABM then waits ~12 s
+ * for "reset detection" (libBasebandManager ResetDetection: TelephonyBasebandRegisterForReset = AppleBaseband
+ * general-interest messages 0xe3ff8000 reset detected / 0xe3ff8001 alive, and TelephonyBasebandGetReset), falls back to a
+ * hard reset that fails too ("Reset failed ... kInternalError"), and the carrier-bundle push FSM treats the push as
+ * failed and starts over. 'msg' (default): 100 ms after the answer kern.sweet_abp_bbmsg=1 (kernel 1064: "reset
+ * detected" to AppleBaseband's clients), <ms> later =2 ("alive"). 'unpub': un-publish the kernel's stand-ins instead
+ * (kern.sweet_abp_publish=0, pending reads end kIOReturnAborted) and publish them again <ms> later (n12b exp5: ABM did
+ * not take that as reset detection). The real modem is not touched.
+ */
+static uint64_t bbr_unpub_at, bbr_pub_at;
+static unsigned bbresets;
+static int bbr_unpub;
+static void bbr_publish(int on)
+{
+	int v = bbr_unpub ? on : (on ? 2 : 1);
+	const char *k = bbr_unpub ? "kern.sweet_abp_publish" : "kern.sweet_abp_bbmsg";
+	if (sysctlbyname(k, NULL, NULL, &v, sizeof(v)))
+		printf("[%6llu] abp: bbreset: %s=%d: %s\n", (unsigned long long)link_ms(), k, v, strerror(errno));
+	else
+		printf("[%6llu] abp: bbreset: %s=%d (%s, emulated reset #%u)\n", (unsigned long long)link_ms(), k, v,
+		       on ? "modem back" : "modem down", bbresets);
+}
+
+static void bbr_poll(uint64_t now)
+{
+	if (bbr_unpub_at && now >= bbr_unpub_at) {
+		bbr_unpub_at = 0;
+		bbr_publish(0);
+	}
+	if (bbr_pub_at && !bbr_unpub_at && now >= bbr_pub_at) {
+		bbr_pub_at = 0;
+		bbr_publish(1);
+	}
+}
+
 static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *rq, uint32_t rqn)
 {
 	for (int i = 0; i < ntrg; i++) {
@@ -1169,11 +1888,25 @@ static void run_triggers(uint32_t pipe, uint32_t sess, unsigned svc, unsigned ci
 			continue;
 		if (t->cond >= 0 && tlv_byte(rq, rqn, (unsigned)t->cond) <= 0)
 			continue;	/* P2 reg: this request did not enable that indication */
+		if (t->ceq) {		/* n12b: "if RQ..=RQ.." */
+			uint32_t a, b;
+			if (fref_num(&t->fa, rq, rqn, &a) || fref_num(&t->fb, rq, rqn, &b) || a != b)
+				continue;
+		}
 		if (t->kind == TRG_IND) {
-			synth_inds++;
-			printf("[%6llu] abp: on %s(0x%02x) 0x%04x: indication 0x%04x (%u TLV bytes) to %s/%u cid %u\n", (unsigned long long)link_ms(),
-			       svc_name(svc), svc, msg, t->m2, t->dlen, pipe_name[pipe], sess, cid);
-			send_ind(pipe, sess, svc, cid, t->m2, t->data, t->dlen);
+			trg_ind(pipe, sess, svc, cid, msg, t, rq, rqn, "");
+			continue;
+		}
+		if (t->kind == TRG_BBRESET) {
+			if (!bbr_unpub_at && !bbr_pub_at) {
+				bbresets++;
+				bbr_unpub = t->m3 == 1;
+				bbr_unpub_at = link_ms() + 100;
+				bbr_pub_at = bbr_unpub_at + (t->m2 < 200 ? 200 : t->m2);
+				printf("[%6llu] abp: on %s(0x%02x) 0x%04x: emulated baseband reset #%u (%s in 100 ms, for %u ms)\n",
+				       (unsigned long long)link_ms(), svc_name(svc), svc, msg, bbresets, bbr_unpub ? "un-publish" : "reset-detect message",
+				       t->m2 < 200 ? 200 : t->m2);
+			}
 			continue;
 		}
 		/* replay: only a GET the policy itself would forward (protected / Apple / data messages never go out this way) */
@@ -1322,6 +2055,20 @@ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d
 		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8)));
 		break;
 	case ACT_RESP:
+		if (dec_tmpl) {		/* n12b: template, expanded with this request's TLVs */
+			static uint8_t tb[4096];
+			uint32_t rl = sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8));
+			int miss = 0, tn = tmpl_expand(dec_tmpl, s + 7, rl, 0, tb, sizeof(tb), &miss);
+			if (tn < 0 || !tlvs_ok(tb, (uint32_t)tn)) {
+				cnt.local_err++;
+				svc_local(pipe, svc, cid, s, 1, 0x11 /* QMI_ERR_MISSING_ARG */);
+				break;
+			}
+			cnt.local_ok++;
+			svc_local_tlv(pipe, svc, cid, s, 0, 0, tb, (uint16_t)tn);
+			run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, rl);
+			break;
+		}
 		cnt.local_ok++;
 		svc_local_tlv(pipe, svc, cid, s, 0, 0, dec_data, dec_dlen);
 		run_triggers(pipe, cur_sess, svc, cid, msg, s + 7, sn - 7 < (uint32_t)(s[5] | (s[6] << 8)) ? sn - 7 : (uint32_t)(s[5] | (s[6] << 8)));
@@ -1381,9 +2128,22 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		uint16_t txn = (uint16_t)(d[1] | (d[2] << 8));
 		for (int i = 0; i < NPEND; i++) {
 			struct pend *x = &pend[i];
-			if (!x->used || !x->replay || x->port != h->dst_port || x->txn != txn)
+			if (!x->used || !(x->replay || x->simread) || x->port != h->dst_port || x->txn != txn)
 				continue;
 			x->used = 0;
+			if (x->simread) {	/* n12b: the router's own EF read */
+				uint32_t sl = (uint32_t)(d[5] | (d[6] << 8)), rl2 = 0;
+				if (sl > n - 7 || !tlvs_ok(d + 7, sl))
+					return;
+				const uint8_t *r2 = tlv_find(d + 7, sl, 0x02, &rl2);
+				if (!r2 || rl2 < 4 || r2[0] | r2[1]) {
+					printf("[%6llu] abp: SIM identity: EF %04x read failed (error 0x%x)\n", (unsigned long long)link_ms(), x->file,
+					       r2 && rl2 >= 4 ? (unsigned)(r2[2] | (r2[3] << 8)) : 0xffffu);
+					return;
+				}
+				simid_from_read(x->file, d + 7, sl, "the router's read");
+				return;
+			}
 			uint32_t ml = (uint32_t)(d[5] | (d[6] << 8));
 			if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
 				malformed++;
@@ -1449,7 +2209,7 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (ml > n - 7 || !tlvs_ok(d + 7, ml)) {
 		malformed++;
 		char hx[3 * 48 + 8];
-		hexline(hx, sizeof(hx), d, n < 40 ? n : 40);
+		hexline(hx, sizeof(hx), redact(d, n), n < 40 ? n : 40);
 		printf("[%6llu] abp: MALFORMED %s from the modem for %s(0x%02x) cid %u (%u bytes, msg len %u): dropped: %s\n",
 		       (unsigned long long)link_ms(), d[0] == 0x04 ? "indication" : d[0] == 0x02 ? "response" : "frame", svc_name(c->svc), c->svc,
 		       c->cid, n, ml, hx);
@@ -1493,6 +2253,18 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			}
 		}
 	}
+	/* n12b: CommCenter's own EF_ICCID / EF_IMSI reads give the SIM identity; a UIM status change asks for a fresh read */
+	if (d[0] == 0x02 && res == 0 && c->svc == 0x0b && rmsg == 0x0020 && rqn) {
+		uint32_t fl = 0;
+		const uint8_t *fv = tlv_find(rq, rqn, 0x02, &fl);
+		if (fv && fl >= 3)
+			simid_from_read((unsigned)(fv[0] | (fv[1] << 8)), d + 7, ml, "CommCenter's read");
+	}
+	if (d[0] == 0x04 && c->svc == 0x0b && rmsg == 0x0032 && !simid.refresh) {
+		simid.refresh = 1;
+		simid.tries = 0;
+		simid.next = link_ms() + 2000;
+	}
 	uint32_t len = 7 + ml;
 	static uint8_t b[6 + ABP_MAXFRAME];
 	if (6 + len > sizeof(b))
@@ -1516,6 +2288,8 @@ void abpbridge_qrtr(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 	uint32_t pp = cur_pipe, cpipe = c->pipe, csess = c->sess;
 	unsigned csvc = c->svc, ccid = c->cid;
+	if (d[0] == 0x04 && hold_frame(c->pipe, c->sess, b, 6 + len))
+		return;		/* n12z: held until BSP activation */
 	cur_pipe = c->pipe;
 	send_to(c->pipe, c->sess, b, 6 + len);
 	cur_pipe = pp;
@@ -1565,6 +2339,8 @@ static void read_words(void)
 	cidfail = 0;
 	reuse = 1;
 	dumpword = 0;
+	holdnas = 1;
+	holddly = 500;
 	err_code = QMI_ERR_NOT_SUPPORTED;
 	if (f) {
 		size_t k = fread(b, 1, sizeof(b) - 1, f);
@@ -1585,9 +2361,23 @@ static void read_words(void)
 		kickon = w ? atoi(w + 8) : 1;
 		w = strstr(b, "abpdump=");
 		dumpword = w ? atoi(w + 8) : 0;
+		w = strstr(b, "abpholdnas=");
+		holdnas = w ? atoi(w + 11) : 1;
+		w = strstr(b, "abpholddly=");
+		holddly = w ? atoi(w + 11) : 500;
 	}
 	if (mode == 1)
 		logframes = 1;		/* P1 observe always logs every frame */
+	/* P4 phase 1 (kernel 1068): with sweetbb & 2 the kernel's router owns qmux1/qmux2 (/dev/abpbridge refuses to open) */
+	uint32_t bb = 0;
+	size_t bl = sizeof(bb);
+	if (mode && !sysctlbyname("kern.sweet_bb", &bb, &bl, NULL, 0) && (bb & 2)) {
+		static int told;
+		if (!told++)
+			printf("[%6llu] abp: abpbridge=%d ignored: kern.sweet_bb=0x%x, the kernel router answers CommCenter\n",
+			       (unsigned long long)link_ms(), mode, bb);
+		mode = 0;
+	}
 }
 
 static void dev_open(uint64_t now)
@@ -1621,6 +2411,8 @@ static void dev_open(uint64_t now)
 static void dev_close(uint64_t now, const char *why)
 {
 	cl_free_all(why);
+	nhold = 0;		/* n12z: held NAS indications die with the bridge */
+	gate_set = 0;
 	close(fd);
 	fd = -1;
 	ready = -1;
@@ -1708,6 +2500,11 @@ void abpbridge_poll(void)
 				}
 			}
 	}
+	if (mode >= 2) {
+		simid_poll(now);	/* n12b */
+		bbr_poll(now);
+		hold_poll(now);		/* n12z */
+	}
 	if (dumpword && dumpword != dumpword_old)
 		mst_table("abpdump");
 	dumpword_old = dumpword;
@@ -1722,9 +2519,10 @@ void abpbridge_poll(void)
 			}
 			printf("[%6llu] abp: stats: %u frames in, %u out; %u fwd, %u modem resp, %u ind; local ok %u, err %u, drop %u; "
 			       "%d router clients (%d idle); no server %u, send fail %u, late %u; malformed %u, replays %u, synth ind %u; "
-			       "bad records %u, kicks %u, rxq max %u drop %u, stripped %u\n",
+			       "bad records %u, kicks %u, rxq max %u drop %u, stripped %u; holdnas=%d held %u (rel bsp %u, timeout %u, gone %u)\n",
 			       (unsigned long long)now, nframes_in, nframes_out, cnt.fwd, cnt.resp, cnt.ind, cnt.local_ok, cnt.local_err, cnt.dropped,
-			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr, stripped);
+			       ncl, nidle, cnt.noserver, cnt.sendfail, late, malformed, replays, synth_inds, badrec, kicks, qmx, qdr, stripped,
+			       holdnas, held_cnt, held_rel_bsp, held_rel_to, held_drop);
 			if (mst_dirty)
 				mst_table("60 s");
 		}

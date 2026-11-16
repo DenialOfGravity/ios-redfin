@@ -49,6 +49,7 @@
 #include <stddef.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include "camera_isp.h"
 
 void redwood_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -506,6 +507,7 @@ struct stream {
 	pthread_mutex_t lock;
 	volatile bool   running;
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
+	uint64_t        asked_ms;       /* (redfin, cam-idle) when the stream was last begun (stream_begin), monotonic ms */
 	/*
 	 * redfin (B8): the worker threads. Each has the generation it was started for and goes when that is not the
 	 * stream's any more; a stop waits for them a while (workers, worker_gone), not for ever: a worker can be
@@ -670,6 +672,8 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 }
 
 static void torch_set(struct stream *s, CFTypeRef value);
+static bool torch_ui(void);
+static void torch_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 static double
 dict_number(CFDictionaryRef d, const char *name, double otherwise)
@@ -1063,6 +1067,14 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		torch_set(s, value);
 		return 0;
 	}
+	if (key_is(key, "HighCurrentTorchEnabled")) {
+		/* redfin (torch1): the flashlight sets this before TorchLevel; the kernel's current is capped anyway */
+		if (torch_ui()) {
+			torch_log("%s: HighCurrentTorchEnabled %s (taken; the current stays within sweettorch_ma)", s->camera->name,
+			    value == kCFBooleanTrue ? "true" : "false");
+		}
+		return 0;
+	}
 	/* ---- redfin (plan B4): exposure ---- */
 	if (key_is(key, "LockAENow") || key_is(key, "UnlockAENow")) {
 		double on = 1;
@@ -1231,12 +1243,155 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	return 0;
 }
 
-/* the flashlight: TorchLevel (0 to 1) as thousandths to the kernel (HackiOS: /dev/redwood-torch; redfin: a sysctl) */
+/*
+ * the flashlight: TorchLevel (0 to 1) as thousandths to the kernel (HackiOS: /dev/redwood-torch; redfin: a sysctl).
+ *
+ * redfin (torch1): Control Centre's flashlight (AVFlashlight -> mediaserverd's FigFlashlight, CMCapture) takes the
+ * back wide camera's stream from the device vendor (-[BWFigCaptureDeviceVendor copyStreamForFlashlightWithPosition:1
+ * deviceType:2 forDevice:]), sets HighCurrentTorchEnabled on it if listed, then TorchLevel (a float 0..1) for every
+ * level change and 0 for off. Its own level, availability (the vendor's active device) and overheating
+ * (FigCaptureThermalMonitor's maxTorchLevel < 1) are kept in CMCapture, not asked of the stream.
+ * Flag /var/local/camera-torch-ui (no file = on; a file starting with '0' = off, as before): every torch call is
+ * written to /var/tmp/camera-torch.log, and while lit the level is written again every TORCH_REARM_S so the
+ * kernel's on-time limit (sweettorch_secs, 120 s) does not put out a flashlight Control Centre shows as on; that
+ * stops after TORCH_MAX_S, when the camera block reaches TORCH_HOT_DC, or when the kernel no longer has it lit (a
+ * fault, or another program turned it off).
+ */
+#define TORCH_FLAG      "/var/local/camera-torch-ui"
+#define TORCH_LOG       "/var/tmp/camera-torch.log"
+#define TORCH_REARM_S   100             /* < sweettorch_secs (120) */
+#define TORCH_MAX_S     1800            /* half an hour at most, then off */
+#define TORCH_HOT_DC    600             /* kern.sweet_temp_camera, deci-degC */
+
+static pthread_mutex_t torch_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t torch_cond = PTHREAD_COND_INITIALIZER;
+static unsigned torch_want;             /* what the capture stack asked for, thousandths */
+static uint64_t torch_generation;
+static bool torch_keeper;
+
+static bool
+torch_ui(void)
+{
+	char c = '1';
+	int fd = open(TORCH_FLAG, O_RDONLY);
+
+	if (fd >= 0) {
+		if (read(fd, &c, 1) != 1) {
+			c = '1';
+		}
+		close(fd);
+	}
+	return c != '0';
+}
+
+static void torch_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+static void
+torch_log(const char *format, ...)
+{
+	char line[300];
+	struct timeval tv;
+	va_list ap;
+	int fd, n;
+
+	gettimeofday(&tv, NULL);
+	n = snprintf(line, sizeof(line), "%ld.%03d [%d] ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid());
+	va_start(ap, format);
+	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 2) {
+		n = sizeof(line) - 2;
+	}
+	say("torch: %s", line);
+	line[n++] = '\n';
+	if ((fd = open(TORCH_LOG, O_WRONLY | O_APPEND | O_CREAT, 0644)) >= 0) {
+		write(fd, line, (size_t)n);
+		close(fd);
+	}
+}
+
+static int
+sysctl_int(const char *name, int *value)
+{
+	size_t size = sizeof(*value);
+
+	return sysctlbyname(name, value, &size, NULL, 0);
+}
+
+static int
+torch_write(unsigned thousandths)
+{
+	int kernel_level = (int)thousandths;
+
+	return sysctlbyname("kern.sweet_torch", NULL, NULL, &kernel_level, sizeof(kernel_level));
+}
+
+/* while lit: the level again before the kernel's time limit; see above */
+static void *
+torch_keep(void *arg)
+{
+	uint64_t since = mach_absolute_time();
+	mach_timebase_info_data_t tb;
+
+	(void)arg;
+	mach_timebase_info(&tb);
+	pthread_mutex_lock(&torch_lock);
+	while (torch_want > 0) {
+		uint64_t generation = torch_generation;
+		struct timespec until;
+		struct timeval now;
+
+		gettimeofday(&now, NULL);
+		until.tv_sec = now.tv_sec + TORCH_REARM_S;
+		until.tv_nsec = now.tv_usec * 1000;
+		while (torch_want > 0 && generation == torch_generation &&
+		    pthread_cond_timedwait(&torch_cond, &torch_lock, &until) == 0) {
+		}
+		if (torch_want == 0) {
+			break;
+		}
+		if (generation != torch_generation) {
+			since = mach_absolute_time();   /* a new level: its own time */
+			continue;
+		}
+		unsigned want = torch_want;
+		int kernel = 0, camera = 0;
+		double lit_s = (double)(mach_absolute_time() - since) * tb.numer / tb.denom / 1e9;
+		const char *why = NULL;
+
+		if (sysctl_int("kern.sweet_torch", &kernel) != 0 || kernel == 0) {
+			why = "the kernel no longer has it lit (fault, time limit or another program)";
+		} else if (sysctl_int("kern.sweet_temp_camera", &camera) == 0 && camera >= TORCH_HOT_DC) {
+			why = "the camera block is hot";
+		} else if (lit_s >= TORCH_MAX_S) {
+			why = "on for the longest time allowed";
+		} else if (!torch_ui()) {
+			why = "flag " TORCH_FLAG " is 0";
+		}
+		if (why != NULL) {
+			torch_want = 0;
+			(void)torch_write(0);
+			torch_log("off after %.0f s: %s (kernel %d, camera %d.%d C)", lit_s, why, kernel, camera / 10, camera % 10);
+			break;
+		}
+		if (torch_write(want) != 0) {
+			torch_log("again at %u of 1000 NOT TAKEN (%s): off", want, strerror(errno));
+			torch_want = 0;
+			break;
+		}
+		torch_log("again at %u of 1000 after %.0f s (camera %d.%d C)", want, lit_s, camera / 10, camera % 10);
+	}
+	torch_keeper = false;
+	pthread_mutex_unlock(&torch_lock);
+	return NULL;
+}
+
 static void
 torch_set(struct stream *s, CFTypeRef value)
 {
 	float level = 0;
 	uint32_t thousandths;
+	bool ui = torch_ui();
 
 	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
 		CFNumberGetValue(value, kCFNumberFloatType, &level);
@@ -1244,13 +1399,34 @@ torch_set(struct stream *s, CFTypeRef value)
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
 	thousandths = (uint32_t)(level * 1000 + 0.5f);
 	/* redfin: the kernel's flashlight is sysctl kern.sweet_torch (xnu 0918, sweettorch=2), thousandths as here */
-	int kernel_level = (int)thousandths;
-	(void)s;
-	if (sysctlbyname("kern.sweet_torch", NULL, NULL, &kernel_level, sizeof(kernel_level)) != 0) {
-		say("the flashlight at %u of 1000 NOT TAKEN (kern.sweet_torch: %s)", thousandths, strerror(errno));
+	if (torch_write(thousandths) != 0) {
+		int e = errno;
+
+		say("the flashlight at %u of 1000 NOT TAKEN (kern.sweet_torch: %s)", thousandths, strerror(e));
+		if (ui) {
+			torch_log("%s: TorchLevel %.3f -> %u of 1000 NOT TAKEN (%s)", s->camera->name, level, thousandths, strerror(e));
+		}
+		thousandths = 0;
+	} else if (ui) {
+		torch_log("%s: TorchLevel %.3f -> %u of 1000", s->camera->name, level, thousandths);
 	} else {
 		say("the flashlight at %u of 1000", thousandths);
 	}
+	pthread_mutex_lock(&torch_lock);
+	torch_want = ui ? thousandths : 0;
+	torch_generation++;
+	pthread_cond_broadcast(&torch_cond);
+	if (torch_want > 0 && !torch_keeper) {
+		pthread_t t;
+
+		torch_keeper = pthread_create(&t, NULL, torch_keep, NULL) == 0;
+		if (torch_keeper) {
+			pthread_detach(t);
+		} else {
+			torch_log("no keeper thread: the kernel puts it out after its time limit");
+		}
+	}
+	pthread_mutex_unlock(&torch_lock);
 }
 
 /* ---- the frames ------------------------------------------------------------------------------------- */
@@ -1990,6 +2166,75 @@ worker_pause(const struct stream *s, unsigned generation, unsigned ms)
 	}
 }
 
+/*
+ * redfin (cam-idle): a worker whose frames nobody wants goes. mediaserverd's format probe at its start
+ * (csu_getBackings) reserves the streams and gives them back, never starting the graph: the frames went on for
+ * ever (35% of a core, the sensor on). With no graph running, no PixelBufferHandler and no photograph asked for
+ * for IDLE_MS (and no stream_begin in that time), the worker stops the stream itself and the kernel turns the
+ * sensor off; the next RequestStreams or start begins it again. /var/local/redwood-cam-keepalive: as before.
+ */
+#define IDLE_MS         2000u
+#define KEEPALIVE_FLAG  "/private/var/local/redwood-cam-keepalive"
+
+static uint64_t
+monotonic_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+static bool
+camera_keepalive(void)
+{
+	return access(KEEPALIVE_FLAG, F_OK) == 0;
+}
+
+/* whether the stream was stopped for want of anyone wanting its frames (under the stream's lock: no race with stream_begin) */
+static bool
+stream_idle(struct stream *s, unsigned generation, uint64_t *since)
+{
+	uint64_t now = monotonic_ms();
+	bool busy, stopped = false;
+
+	if (now - *since < IDLE_MS) {
+		/* (checked below only once the time is up: a lock a frame is cheap, but not needed) */
+		pthread_mutex_lock(&s->lock);
+		busy = s->graph_running || s->stills_wanted > 0;
+		for (int i = 0; !busy && i < OUTPUTS; i++) {
+			busy = s->out[i].handler != NULL;
+		}
+		if (busy) {
+			*since = now;
+		}
+		pthread_mutex_unlock(&s->lock);
+		return false;
+	}
+	if (camera_keepalive()) {
+		*since = now;
+		return false;
+	}
+	pthread_mutex_lock(&s->lock);
+	busy = s->graph_running || s->stills_wanted > 0 || now - s->asked_ms < IDLE_MS;
+	for (int i = 0; !busy && i < OUTPUTS; i++) {
+		busy = s->out[i].handler != NULL;
+	}
+	if (busy) {
+		*since = now;
+	} else if (s->running && s->generation == generation) {
+		s->running = false;
+		s->generation++;
+		stopped = true;
+	}
+	pthread_mutex_unlock(&s->lock);
+	if (stopped) {
+		say("stream: nobody has wanted the %s's frames for %u ms (no graph, no handler): they stop, the sensor off (%llu frames)",
+		    s->camera->name, IDLE_MS, (unsigned long long)s->frames);
+	}
+	return stopped;
+}
+
 /* one worker has the kernel's camera open at a time: the next waits for the last to close it */
 static pthread_mutex_t device_owner = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2027,9 +2272,14 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	struct shot shot = { 0 };
 	unsigned failures = 0;
 	const char *why = "stopped";
+	uint64_t idle_since = monotonic_ms();
 
 	isp_init(&isp);
 	while (buffer != NULL && worker_wanted(s, generation)) {
+		if (stream_idle(s, generation, &idle_since)) {
+			why = "nobody wants them";
+			break;
+		}
 		ssize_t n = read(device, buffer, bytes);
 		const struct redwood_camera_frame *f = (const void *)buffer;
 		size_t need;
@@ -2434,14 +2684,20 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	struct worker_start *start;
 	pthread_attr_t attributes;
 	pthread_t thread;
+	bool running;
 
+	/* (redfin, cam-idle: asked_ms and running under the lock, as the worker's idle stop reads and sets them) */
+	pthread_mutex_lock(&s->lock);
+	s->asked_ms = monotonic_ms();
 	if (graph) {
-		pthread_mutex_lock(&s->lock);
 		s->graph_running = true;
-		pthread_mutex_unlock(&s->lock);
+	}
+	running = s->running;
+	pthread_mutex_unlock(&s->lock);
+	if (graph) {
 		say("stream: the graph starts the stream (format %d)", s->format_index);
 	}
-	if (s->running) {
+	if (running) {
 		return 0;
 	}
 	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
@@ -2457,8 +2713,10 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	s->frames = 0;
 	s->mode_wanted = false;
 	start->o = o;
+	pthread_mutex_lock(&s->lock);
 	start->generation = ++s->generation;
 	s->running = true;
+	pthread_mutex_unlock(&s->lock);
 	pthread_mutex_lock(&s->worker_lock);
 	s->workers++;
 	pthread_mutex_unlock(&s->worker_lock);
@@ -2499,9 +2757,9 @@ stream_stop(CMBaseObjectRef o)
 	for (int i = 0; i < OUTPUTS; i++) {
 		let_go(&s->out[i]);
 	}
-	pthread_mutex_unlock(&s->lock);
 	s->running = false;
 	s->generation++;
+	pthread_mutex_unlock(&s->lock);
 	/* (redfin, B8: not for ever: the worker may be in the kernel's read while the sensor starts or stops; it goes when that returns) */
 	if (!workers_gone(s, 1500)) {
 		say("stream: its worker is still in the kernel: left to finish on its own");
@@ -2716,6 +2974,7 @@ device_request_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef op
 	 * streams through here, but it never calls the FigCaptureStream start method, so start the stream's
 	 * frame worker from the reservation. stream_start is idempotent (it no-ops when already running),
 	 * and relinquish does not stop the worker, so the reservation thrash does not tear it down.
+	 * redfin (cam-idle): a worker nobody takes frames from stops itself after IDLE_MS (stream_idle()).
 	 */
 	if (streams != NULL) {
 		CFIndex n = CFArrayGetCount(streams);
@@ -2744,10 +3003,31 @@ device_relinquish_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef
 	return 0;
 }
 
+/*
+ * redfin (cam-idle): the device going (invalidated, or its last reference gone) stops its streams' frames: the
+ * workers hold a reference to their stream each, so the stream's own finalize never comes while one runs.
+ * /var/local/redwood-cam-keepalive: as before (nothing stopped).
+ */
+static void
+device_stop_streams(struct device *d, const char *why)
+{
+	if (d->streams == NULL || camera_keepalive()) {
+		return;
+	}
+	for (CFIndex i = 0, n = CFArrayGetCount(d->streams); i < n; i++) {
+		CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(d->streams, i);
+
+		if (st != NULL && stream_of(st)->running) {
+			say("device: %s: the %s's frames stop", why, stream_of(st)->camera->name);
+			(void)stream_stop(st);
+		}
+	}
+}
+
 static OSStatus
 device_invalidate(CMBaseObjectRef o)
 {
-	(void)o;
+	device_stop_streams(derived_storage(o), "invalidated");
 	return 0;
 }
 
@@ -2756,6 +3036,7 @@ device_finalize(CMBaseObjectRef o)
 {
 	struct device *d = derived_storage(o);
 
+	device_stop_streams(d, "finalized");
 	if (d->streams) {
 		CFRelease(d->streams);
 	}

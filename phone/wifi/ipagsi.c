@@ -2169,6 +2169,8 @@ static int tblcmd_post(int bump)
  * slots/headers into tables the IPA already knows.  ipagsi_start's p2late setup reuses ev2/ch2. 0 = done or not asked. */
 int ipagsi_early(void)
 {
+	if (link_kernel_data())
+		return 0;
 	if (cell_word_int("p2early=", 0) != 1 || early_done)
 		return 0;
 	LOG("p2early: before INIT_DRIVER: ev2 + ch2 + table/header init");
@@ -2688,6 +2690,10 @@ static int read_nodefer_flag(void)
 
 void ipagsi_start(const struct ipagsi_call *c, int tables)
 {
+	if (link_kernel_data()) {
+		LOG("not starting: the kernel owns the IPA data path (kern.sweet_bb & 0x10)");
+		return;
+	}
 	if (ctx.active) {
 		LOG("start while already %s", ctx.state);
 		return;

@@ -692,6 +692,8 @@ static void check_words(void)
 	int lv;
 	uint32_t base;
 	read_words(&lv, &base);
+	if (link_kernel_data())
+		lv = 0;		/* xnu 1076: the kernel serves 0x31/1 and sends INIT_DRIVER */
 	if (forced && !lv)
 		lv = 1;			/* the IPA bring-up switched ipaqmi on: kept on (the modem was told about the IPA) */
 	if (lv == level && base == smem_base)
