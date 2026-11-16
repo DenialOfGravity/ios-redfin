@@ -352,6 +352,16 @@ uint64_t FakeGpu::reg64(uint32_t r) const { return reg(r) | uint64_t(reg(r + 1))
 // fd6_emit.h:331-334): the compute blocks by _FRAG (computerator, fd6_compute), the vertex stage's by _GEOM, the
 // fragment stage's by _FRAG; the 3D IBO table (SB6_IBO, plain CP_LOAD_STATE6) has no non-bindless witness in Mesa 25.0.7
 // and is not taken.
+// (ws-hm-int11) the queued graphics-stage loads, in order, as a draw begins
+bool FakeGpu::applyPendingLoads() {
+    std::vector<PendingLoad> q;
+    q.swap(pendingLoads_);
+    for (const PendingLoad& l : q) {
+        if (!loadState(l.opcode, l.p, l.count)) return false;
+    }
+    return true;
+}
+
 bool FakeGpu::loadState(uint32_t opcode, const uint32_t* p, uint32_t count) {
     using namespace a6xx;
     const char* op = opcode == CP_LOAD_STATE6_FRAG ? "CP_LOAD_STATE6_FRAG" : opcode == CP_LOAD_STATE6_GEOM ? "CP_LOAD_STATE6_GEOM" : "CP_LOAD_STATE6";
@@ -2226,6 +2236,15 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             for (uint32_t j = 0; j < h.count; j++) {
                 regs_[h.reg + j] = p[j];   // kept as written; a dispatch or a draw is checked against them
                 written_.insert(h.reg + j);
+                if (h.reg + j == REG_A6XX_HLSQ_INVALIDATE_CMD && !pendingLoads_.empty()) {
+                    // (ws-hm-int11) the stages' loads still queued are dropped
+                    const bool vsBit = (p[j] & A6XX_HLSQ_INVALIDATE_CMD_VS_STATE) != 0, fsBit = (p[j] & A6XX_HLSQ_INVALIDATE_CMD_FS_STATE) != 0;
+                    const size_t before = pendingLoads_.size();
+                    pendingLoads_.erase(std::remove_if(pendingLoads_.begin(), pendingLoads_.end(),
+                                                       [&](const PendingLoad& l) { return l.fs ? fsBit : vsBit; }),
+                                        pendingLoads_.end());
+                    stats_.loadsDropped += uint32_t(before - pendingLoads_.size());
+                }
                 if (!magicOk(h.reg + j, p[j])) return false;
                 if (h.reg + j == REG_A6XX_RB_CCU_CNTL) {
                     // "isn't pipelined" (tu_cmd_buffer.cc:373-377): both witnesses write it right after a CP_WAIT_FOR_IDLE
@@ -2289,11 +2308,19 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             // --- the compute dispatch's and the draw's packets ---
             case CP_LOAD_STATE6_FRAG:
             case CP_LOAD_STATE6_GEOM:
-            case CP_LOAD_STATE6:
+            case CP_LOAD_STATE6: {
+                // (ws-hm-int11) a graphics stage's load waits for the next draw
+                const uint32_t block = h.count >= 1 ? fieldOf(p[0], CP_LOAD_STATE6_0_STATE_BLOCK__MASK, CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT) : ~0u;
+                if (deferStageLoads_ && h.opcode != CP_LOAD_STATE6 &&
+                    (block == SB6_VS_TEX || block == SB6_FS_TEX || block == SB6_VS_SHADER || block == SB6_FS_SHADER)) {
+                    pendingLoads_.push_back(PendingLoad{h.opcode, p, h.count, block == SB6_FS_TEX || block == SB6_FS_SHADER});
+                    break;
+                }
                 if (!loadState(h.opcode, p, h.count)) {
                     return false;
                 }
                 break;
+            }
             case CP_SET_MARKER:
                 if (h.count != 1) {
                     fault("CP_SET_MARKER of other than 1 word");
@@ -2391,6 +2418,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 break;
             }
             case CP_DRAW_INDIRECT_MULTI: {
+                if (!applyPendingLoads()) return false;   // (ws-hm-int11)
                 // (redfin) gen1 (indirect_draw_wfm_quirk): turnip puts a CP_WAIT_FOR_ME right before it
                 if (chip_->indirectDrawWfmQuirk && !lastWasWfm_) {
                     fault("CP_DRAW_INDIRECT_MULTI without a CP_WAIT_FOR_ME right before it, on a chip with indirect_draw_wfm_quirk");
@@ -2431,7 +2459,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 break;
             }
             case CP_DRAW_INDX_OFFSET:
-                if (!execDraw(p, h.count)) {
+                if (!applyPendingLoads() || !execDraw(p, h.count)) {
                     return false;
                 }
                 break;
@@ -2679,6 +2707,7 @@ void FakeGpu::run(const Job& job) {
     cs_ = CsState{};
     vs_ = StageLoads{};
     fs_ = StageLoads{};
+    pendingLoads_.clear();   // (ws-hm-int11)
     gfxIbosLoaded_ = false;
     gfxIbosFrom_ = 0;
     gfxIboUnits_ = 0;

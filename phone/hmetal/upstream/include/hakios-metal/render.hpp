@@ -603,6 +603,12 @@ struct DrawCache {
     uint32_t fsNumTex = 0, fsNumSamp = 0;
     uint32_t fsTexWords[kSlots][16] = {};
     uint32_t fsSampWords[kSlots][4] = {};
+    // (ws-hm-int11) the HM_CULL notes (CommandBuffer's open pass, by index) of the draws that loaded the program state
+    // and the fragment textures held here (-1: a draw not noted, which HM_CULL never culls), and whether the draw
+    // given this cache left them out (encodeDraw's): a culled loader's loads are queued, never consumed by its draw,
+    // and the next draw's HLSQ_INVALIDATE_CMD drops them (CommandBuffer::cullResolve sees to it)
+    int32_t progLoader = -1, texLoader = -1;
+    bool skippedProg = false, skippedTex = false;
 };
 // (ws-hm-drawcpu) HM_DRAW_SKIP=table: the draw's table taken once its size is known: bytes LO to HI of the table's
 // layout, LO 256-aligned; TAKE returns the piece's GPU address and its processor mapping (for bytes LO on)

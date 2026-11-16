@@ -2342,6 +2342,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
             memcpy(cache->fsSampWords, fsTex.sampWords, 16ull * fsTex.numSamp);
         }
         cache->valid = true;
+        cache->skippedProg = skipProg;   // (ws-hm-int11)
+        cache->skippedTex = skipFsTex;
     }
     return true;
 }
@@ -3447,6 +3449,7 @@ uint64_t fillsDropped() { return gFillsDropped.load(std::memory_order_relaxed); 
 // Passes that may cull: sysmem only (never GMEM or recorded both ways), no depth or stencil attachment, colour 0 of
 // one sample. The level is read as a pass opens; nothing is reordered.
 std::atomic<uint64_t> gCull[8];
+std::atomic<uint64_t> gSkipCullFixes{0};   // (ws-hm-int11) HLSQ_INVALIDATE_CMD writes zeroed by HM_SKIP_CULL=inv
 int cullLevelEnv() {
     const char* e = getenv("HM_CULL");
     const int v = e != nullptr && e[0] != 0 ? atoi(e) : 0;
@@ -3706,9 +3709,15 @@ PassCullNote cullNote(const Program& program, const RenderPass& pass, const Draw
 bool cullFindDraws(const pm4::Stream& s, size_t from, PassCullNote* n) {
     const std::vector<uint32_t>& w = s.words();
     n->nAt = 0;
+    n->hasInv = false;
     for (size_t i = from; i < w.size();) {
         const pm4::Header h = pm4::decode(w[i]);
         if (h.kind == pm4::Header::kBad) return false;
+        // (ws-hm-int11) the HLSQ_INVALIDATE_CMD write's value word (programConfig's, every draw)
+        if (h.kind == pm4::Header::kRegisters && h.reg <= a6xx::REG_A6XX_HLSQ_INVALIDATE_CMD && a6xx::REG_A6XX_HLSQ_INVALIDATE_CMD < h.reg + h.count) {
+            n->inv = uint32_t(i + 1 + (a6xx::REG_A6XX_HLSQ_INVALIDATE_CMD - h.reg));
+            n->hasInv = true;
+        }
         if (h.kind == pm4::Header::kCommand && (h.opcode == a6xx::CP_DRAW_INDX_OFFSET || h.opcode == a6xx::CP_DRAW_INDIRECT_MULTI)) {
             if (n->nAt >= 2) return false;
             n->at[n->nAt++] = uint32_t(i);
@@ -4424,6 +4433,18 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         open_->cull.push_back(cullNote(program, pass, d, *vsb, *fsb, cullStart, cullDdOn()));
         PassCullNote& cn = open_->cull.back();
         if (!cullFindDraws(stream_, cullStart, &cn)) cn.victim = false;
+    }
+    // (ws-hm-int11) HM_DRAW_SKIP under HM_CULL: whose loads this draw relies on (its note), and which draw holds the
+    // pass's program / fragment-texture loads from here on (cullResolve keeps a culled loader's loads alive for them)
+    if (cache != nullptr && open_->cache.valid) {
+        const bool noted = open_->cullOk && &into == &stream_ && !open_->cull.empty() && open_->cull.back().start == cullStart;
+        const int32_t me = noted ? int32_t(open_->cull.size() - 1) : -1;
+        if (noted) {
+            open_->cull.back().progLoader = nextCache.skippedProg ? nextCache.progLoader : -1;
+            open_->cull.back().texLoader = nextCache.skippedTex ? nextCache.texLoader : -1;
+        }
+        if (!nextCache.skippedProg) open_->cache.progLoader = me;
+        if (!nextCache.skippedTex) open_->cache.texLoader = me;
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
     if (traceTs) traceStamp(uint32_t(traceDraws_.size() - 1));   // (redfin hm-trace)
@@ -5178,6 +5199,23 @@ void CommandBuffer::cullResolve() {
     const int level = open_->cullLevel;
     gCull[2].fetch_add(1, std::memory_order_relaxed);
     const bool dd = cullDdOn();
+    // (ws-hm-int11) HM_DRAW_SKIP's draws rely on the program / fragment-texture loads of an earlier draw of the pass
+    // (its loader). A culled draw's CP_LOAD_STATE6 loads stay queued (no draw consumes them), and the next draw's
+    // HLSQ_INVALIDATE_CMD (programConfig, every draw) drops them: a relying draw then ran with the state of the last
+    // draw that did draw -- another program's immediates (SpringBoard's dock platter with HM_DRAW_SKIP=prog,
+    // HM_CULL=2). HM_SKIP_CULL: inv (default) -- where a loader is culled, the invalidates of the draws from it up to
+    // each surviving draw relying on it are written 0, so its queued loads reach that draw (all the same program and
+    // pass: nothing of another program is queued); pin -- a loader something relies on is never culled; off -- as
+    // ws-hm-drawcpu (the defect, for comparison)
+    const char* fixEnv = getenv("HM_SKIP_CULL");
+    const int fix = fixEnv == nullptr || strcmp(fixEnv, "inv") == 0 ? 1 : strcmp(fixEnv, "pin") == 0 ? 2 : strcmp(fixEnv, "off") == 0 ? 0 : 1;
+    if (fix == 2) {
+        for (const PassCullNote& q : v) {
+            for (int32_t l : {q.progLoader, q.texLoader}) {
+                if (l >= 0 && size_t(l) < v.size()) v[size_t(l)].victim = false;
+            }
+        }
+    }
     for (size_t di = v.size(); di-- > 0;) {
         const PassCullNote& o = v[di];
         if (o.dead || !o.cover || (level == 1 && !o.full)) continue;
@@ -5210,6 +5248,22 @@ void CommandBuffer::cullResolve() {
                 cullDd("dd: cull" + std::to_string(level) + ": " + f.name + " " + std::to_string(f.r[2] - f.r[0]) + "x" + std::to_string(f.r[3] - f.r[1]) + "@" +
                        std::to_string(f.r[0]) + "," + std::to_string(f.r[1]) + " under " + (o.full ? "full " : "part ") + o.name + " " +
                        std::to_string(o.c[2] - o.c[0]) + "x" + std::to_string(o.c[3] - o.c[1]) + "@" + std::to_string(o.c[0]) + "," + std::to_string(o.c[1]));
+            }
+        }
+    }
+    if (fix == 1) {
+        for (size_t di = 0; di < v.size(); di++) {
+            const PassCullNote& q = v[di];
+            if (q.dead) continue;
+            for (int32_t l : {q.progLoader, q.texLoader}) {
+                if (l < 0 || size_t(l) >= di || !v[size_t(l)].dead) continue;
+                for (size_t m = size_t(l) + 1; m <= di; m++) {
+                    if (v[m].hasInv && stream_.words()[v[m].inv] != 0) {
+                        stream_.patch(v[m].inv, 0);
+                        gSkipCullFixes.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (dd) cullDd("dd: skipcull: " + q.name + " (draw " + std::to_string(di) + ") relies on culled draw " + std::to_string(l) + "'s " + (l == q.progLoader ? "program" : "texture") + " loads: invalidates " + std::to_string(l + 1) + ".." + std::to_string(di) + " zeroed");
             }
         }
     }

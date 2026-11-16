@@ -362,37 +362,62 @@ TEST(drawcpu_skip_deadfill_takeback_restores_the_cache) {
     CHECK_EQ(l.fsTex, 1u);
 }
 
-// HM_CULL: a culled draw keeps its state loads (only its draw packets become CP_NOPs), so the next draw of the same
-// program that left its preloads out still has them: one draw run, the preloads in the stream once, no fault
-TEST(drawcpu_skip_survives_a_culled_draw) {
-    SkipEnv e("all");
-    setenv("HM_CULL", "1", 1);
-    LoadRig s;
-    Program lph = dcAttr();
-    lph.vs.k.name = "fixed_vert_lph_spc";
-    lph.blend.enabled = false;
-    auto rect = [&](float x0, float y0, float x1, float y1, uint64_t at) {
-        uint8_t* v = static_cast<uint8_t*>(s.vb->contents()) + at;
-        const float xy[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
-        const uint32_t colour = 0xff0000ffu;
-        for (int i = 0; i < 6; i++) {
-            memcpy(v + 12 * i, xy[i], 8);
-            memcpy(v + 12 * i + 8, &colour, 4);
+// (ws-hm-int11) HM_CULL under HM_DRAW_SKIP: a culled draw keeps its state loads in the stream, but nothing draws them,
+// so they wait in the GPU's queue, and the next draw's HLSQ_INVALIDATE_CMD drops them (the fake GPU queues the stages'
+// loads as the A6xx does). SpringBoard's dock platter (HM_DRAW_SKIP=prog, HM_CULL=2): another program draws, then a
+// draw of the platter's program that a later cover hides (culled: its program loads dropped), then a draw of the same
+// program that left its program loads out -- run with the other program's preload and immediates. HM_SKIP_CULL=off
+// shows it (the fake GPU's "without the program preloaded" fault); inv (default) zeroes the invalidates from the culled
+// loader to the draw relying on it, so its loads reach that draw and the cull stands; pin keeps the loader (no cull)
+TEST(drawcpu_skip_culled_loader_reaches_the_draw_relying_on_it) {
+    for (const char* fix : std::vector<const char*>{"off", "inv", "pin", nullptr}) {
+        for (const char* skip : {"0", "prog", "all"}) {
+            SkipEnv e(skip);
+            setenv("HM_CULL", "2", 1);
+            if (fix != nullptr) setenv("HM_SKIP_CULL", fix, 1);
+            else unsetenv("HM_SKIP_CULL");
+            LoadRig s;
+            Program lph = dcAttr();
+            lph.vs.k.name = "fixed_vert_lph_spc";
+            lph.blend.enabled = false;
+            auto rect = [&](float x0, float y0, float x1, float y1, uint64_t at) {
+                uint8_t* v = static_cast<uint8_t*>(s.vb->contents()) + at;
+                const float xy[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
+                const uint32_t colour = 0xff0000ffu;
+                for (int i = 0; i < 6; i++) {
+                    memcpy(v + 12 * i, xy[i], 8);
+                    memcpy(v + 12 * i + 8, &colour, 4);
+                }
+                Bindings b;
+                b.buffers = {Binding{s.vb.get(), at}, Binding{s.ub.get(), 0}};
+                return b;
+            };
+            Draw d;
+            d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+            d.vertexCount = 6;
+            const uint32_t before = s.r.fake->stats().draws, faults0 = s.r.fake->stats().faults;
+            auto cb = s.r.queue->commandBuffer();
+            CHECK(s.texDraw(*cb, 0, 0));                                                           // another program (culled too)
+            CHECK(cb->draw(lph, s.pass, d, rect(-0.5f, -0.5f, 0.5f, 0.5f, 0), Bindings{}, s.o));   // hidden by the next
+            CHECK(cb->draw(lph, s.pass, d, rect(-1, -1, 1, 1, 6 * 12), Bindings{}, s.o));          // a cover, relying on it
+            cb->commit();
+            cb->waitUntilCompleted();
+            const Loads l = loadsIn(cb->streamForTesting());   // (after the commit: the cull is resolved as the pass ends)
+            const uint32_t faults = s.r.fake->stats().faults - faults0, ran = s.r.fake->stats().draws - before;
+            unsetenv("HM_CULL");
+            unsetenv("HM_SKIP_CULL");
+            const bool skipping = strcmp(skip, "0") != 0;
+            const bool off = fix != nullptr && strcmp(fix, "off") == 0, pin = fix != nullptr && strcmp(fix, "pin") == 0;
+            if (skipping && off) {
+                CHECK_EQ(faults, 1u);   // the defect: the cover ran without its program
+                continue;
+            }
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            CHECK_EQ(faults, 0u);
+            CHECK_EQ(l.preloads, skipping ? 4u : 6u);
+            // the two draws under the cover are culled (the other program's too), the platter-like one kept if pinned
+            CHECK_EQ(l.draws, skipping && pin ? 2u : 1u);
+            CHECK_EQ(ran, skipping && pin ? 2u : 1u);
         }
-        Bindings b;
-        b.buffers = {Binding{s.vb.get(), at}, Binding{s.ub.get(), 0}};
-        return b;
-    };
-    Draw d;
-    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
-    d.vertexCount = 6;
-    const uint32_t before = s.r.fake->stats().draws;
-    auto cb = s.r.queue->commandBuffer();
-    CHECK(cb->draw(lph, s.pass, d, rect(-0.5f, -0.5f, 0.5f, 0.5f, 0), Bindings{}, s.o));
-    CHECK(cb->draw(lph, s.pass, d, rect(-1, -1, 1, 1, 6 * 12), Bindings{}, s.o));
-    const Loads l = s.finish(cb);
-    unsetenv("HM_CULL");
-    CHECK_EQ(s.r.fake->stats().draws - before, 1u);
-    CHECK_EQ(l.draws, 1u);
-    CHECK_EQ(l.preloads, 2u);
+    }
 }

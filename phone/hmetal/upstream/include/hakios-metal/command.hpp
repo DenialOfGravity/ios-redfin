@@ -61,6 +61,11 @@ struct PassCullNote {
     bool fetch = false;               // reads attachments where it draws (fetch, [[color(n)]], an attachment sampled)
     bool blends = false;              // blending on an attachment it writes
     bool dead = false;
+    // (ws-hm-int11) HM_DRAW_SKIP under HM_CULL: the notes whose program / fragment-texture loads this draw left out and
+    // relies on (-1: it loaded its own), and the stream word holding the value of its HLSQ_INVALIDATE_CMD write
+    int32_t progLoader = -1, texLoader = -1;
+    uint32_t inv = 0;
+    bool hasInv = false;
     int32_t r[4] = {0, 0, 0, 0};      // pixels it may touch, X0 Y0 X1 Y1 (X1 Y1 past the last)
     int32_t c[4] = {0, 0, 0, 0};      // a cover's pixels written for certain, the same form
     std::string name;                 // its label (HM_DD only)

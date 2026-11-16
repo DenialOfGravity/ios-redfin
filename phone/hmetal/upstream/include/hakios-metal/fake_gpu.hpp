@@ -173,6 +173,9 @@ public:
         uint32_t staleSamples = 0;
         uint32_t staleBlitReads = 0;   // (ws-hm-int6) of them, the 2D engine's source reads (a copy's source or its flags)
         std::string lastStale;
+        // (ws-hm-int11) graphics-stage CP_LOAD_STATE6 loads dropped while queued (an HLSQ_INVALIDATE_CMD before any draw
+        // consumed them)
+        uint32_t loadsDropped = 0;
     };
 
     // ASYNC: submissions run on a thread of their own, after DELAY_US each, as the real GPU runs them after the call
@@ -197,6 +200,10 @@ public:
     int64_t nowNs() override;
 
     Stats stats();
+    // (ws-hm-int11) the vertex and fragment stages' CP_LOAD_STATE6 loads queued until the next draw consumes them, an
+    // HLSQ_INVALIDATE_CMD of the stage dropping those still queued (the A6xx's way: a6xx.hpp's HLSQ_INVALIDATE_CMD);
+    // off, each is applied as it is read (the model before)
+    void setDeferStageLoads(bool on) { deferStageLoads_ = on; }
     uint32_t liveBuffers();
     // An IOSurface the kernel would know by ID: its pixels at OFFSET, ROW_BYTES apart, in a buffer of whole pages, which
     // kHakiosSurface hands out (the same handle while it is open, as the kernel does) and which outlives the buffer
@@ -331,6 +338,15 @@ private:
     void staleRead(const std::string& who, uint64_t addr);
     CsState cs_;
     StageLoads vs_, fs_;
+    struct PendingLoad {
+        uint32_t opcode;
+        const uint32_t* p;
+        uint32_t count;
+        bool fs;
+    };
+    std::vector<PendingLoad> pendingLoads_;   // (ws-hm-int11)
+    bool deferStageLoads_ = true;
+    bool applyPendingLoads();
     bool gfxIbosLoaded_ = false;   // the 3D IBO table's load into SB6_IBO in this submission
     uint64_t gfxIbosFrom_ = 0;
     uint32_t gfxIboUnits_ = 0;
