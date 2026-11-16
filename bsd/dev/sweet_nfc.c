@@ -2089,8 +2089,8 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 				return true;
 			}
 			if (ese_pc_on() && n > 4 && p[3] == 0xc0 && p[4] == 0x00) {
-				/* 1139: disable: RSP, then 6F 18 (IceFall Power OFF) completes the pending mode set; no 6F 20 */
-				static const uint8_t off1[4] = { 0x6f, 0x18, 0x01, 0x00 };
+				/* 1139/1144: disable: RSP, then 6F 18 00 (IceFall Power OFF, zero-length payload) completes the pending mode set; no 6F 20 */
+				static const uint8_t off1[3] = { 0x6f, 0x18, 0x00 };   /* 1144: zero-length payload; phNciNfc_CoreUtilsValRspLen needs the length byte 0 */
 				static const uint8_t off2[5] = { 0x6f, 0x18, 0x02, 0xc0, 0x00 };
 				bool alt = (nfc_fwif_fmt & 0x8000) != 0;
 
@@ -2103,7 +2103,7 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK");
 				hci_log("<persona", alt ? off2 : off1, alt ? sizeof(off2) : sizeof(off1),
 				    alt ? "NXP 6F 18 (IceFall Power OFF) C0 status 00, fwif_fmt 0x8000 form (1139)" :
-				    "NXP 6F 18 (IceFall Power OFF) status 00: disable complete (1139)");
+				    "NXP 6F 18 00 (IceFall Power OFF, zero-length) disable complete (1144)");
 				return true;
 			}
 			if (vhci_on() && (nfc_fwif_fmt & 0x1000) && n > 4 && p[3] == 0xc0 && (p[4] == 0x00 || p[4] == 0x01)) {
@@ -3086,7 +3086,7 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
     "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
     "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2); 1138: 0x1000 = eSE EoOP NTF "
     "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value; 1139: 0x4000 = "
-    "MODE_SET C0 00 -> 6F 18 01 00 (0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
+    "MODE_SET C0 00 -> 6F 18 00 (1144; 0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
     "deferred by kern.sweet_nfc_ntf_delay_ms as its own packet, 0x20000 = no NTF after the disable RSP");
 
 static int
