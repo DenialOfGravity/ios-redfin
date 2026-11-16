@@ -46,3 +46,5 @@ build imgdump imgdump.c -lobjc
 ls -l out
 # Venus hardware video (redfin track V, off unless /var/local/venus.on): its own build, copies into the userland output
 sh ../video/build.sh || echo "WARN phone/video build failed"
+# qseeprobe (ws-qsee-a): read-only QSEE queries over /dev/pmem PMEM_SMC; host whitelist test inside
+sh ../qsee/build.sh || echo "WARN phone/qsee build failed"
