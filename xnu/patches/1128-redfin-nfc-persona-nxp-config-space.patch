@@ -1,0 +1,540 @@
+From 6b2a38388af44fd5efd1748f9b30602ea72c8a76 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 11:36:58 +0100
+Subject: [PATCH] 1128 redfin: NFC persona NXP config space: GET_CONFIG
+ answered per id (A0 0F = 64-byte EEPROM user area, bConfig C3C3A5A5 =
+ configured; A0 EC/ED/D4 = 00 SWP off), kern.sweet_nfc_cfg_set overrides,
+ SET_CONFIG A0xx logged/acked locally (fwif_fmt 0x10 mirror, 0x20 legacy GET),
+ init-table step klog lines
+
+---
+ bsd/dev/sweet_nfc.c | 459 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 451 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 92b719e..be57e13 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -962,6 +962,323 @@ local_init(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned ca
+  *   bit 2 (4) 1125 answers to 2F xx (2F 03 = 3-byte interface version, other 2F = status only), for A/B
+  *   bit 3 (8) GetFwType (2F 06) type byte 0x01 instead of 0x00
+  */
++/*
++ * 1128: NXP config space for the persona. phone run n12 (k12): CORE_GET_CONFIG [A0 0F] got the generic one zero
++ * byte, nfcd power-cycled the chip and asked DownloadRequest(1). libNFC_Comet (16.7 dyld cache):
++ *   - phLibNfc_GetEepromParams (init step 9, 0x1f51393cc) asks GET_CONFIG with only A0 0F (+4 bit 0x1000 sys-config
++ *     group, +0x244 bit 8). The TLV store phNciNfc_ProcessRfParams/StorePropParams (0x1f51d4608; A0 0F at 0x1f51d4e7c)
++ *     wants length exactly 0x40 (64): else the TLV is an error, phLibNfc_GetEepromParamsProc (0x1f51787c0) logs
++ *     "EEPROM params read failed" (+0x245 bit 0 clear), returns 0xFF, init fails -> recovery = power cycle + firmware
++ *     download. So it was our length, not a value.
++ *   - A0 0F = the MW "EEPROM user area" (64 bytes): bytes 0-7 copied to ctx+0xd68: wCurrMwVer (LE16), wCurrFwVer (LE16),
++ *     bConfig (LE32); the rest is not read. GetEepromParamsProc: bConfig 0xC3C3A5A5 -> "Skipping set config",
++ *     phLibNfc_SkipSequenceSeq(+5): steps 10-14 (InitSetConfig, SetEepromParams, SetLsntModeRtng, InitSetMapping,
++ *     ReInitialize) are skipped, next is 15. bConfig 0 or 0xA5A5C3C3 -> "Firmware updated, continue with NFCC
++ *     configurations" (ctx+0xbda = 1), any other value -> "Unexpected MW Log Area Value still forcing MW config";
++ *     both go on with step 10. The versions are only logged. phLibNfc_SetEepromParams (step 11, 0x1f5178e84) writes
++ *     SET_CONFIG A0 0F 40 {34 01, ctx+0xb2c LE16, A5 A5 C3 C3, 56 x 00}: a configured chip reads back C3C3A5A5.
++ *     Default here: {34 01, fw minor, fw major, A5 A5 C3 C3, 00..} = "already configured" (skip path).
++ *   - other A0 ids the store checks: 12/22/23/24/E9 length 1; E8/EF/F0 length 0x45; EA/EB/1E length 8; 17 <= 0x1F;
++ *     18 <= 0xD6; 02 04 07 08 13 19 D5 EC D4 ED A2 F2 44 37 F5 06 68 ... read byte 0. An A0 id it does not know is an
++ *     error. GET_CONFIG RSP status 0 needs the RSP count == the number of ids asked (phNciNfc_GetConfigRsp 0x1f51cfe74).
++ *   - step 16 SwpIntfControl (0x1f51bd958): SET_CONFIG A0 EC, A0 ED (+A0 D4 if ctx+0xafa) from ctx+0x1d0; its Proc
++ *     ignores the answer. Step 17 GetNfceeIntfCfg (0x1f5135c94): GET_CONFIG A0 EC, A0 ED (+A0 D4); Proc 0x1f5179324
++ *     needs the SWP group present (+4 bit 0x2000); value 0 = that SWP off (ctx+0x145/0x146 = 2). Step 18
++ *     EnableNfceeDisc (0x1f5179494): all of 0x145..0x148 == 2 -> no NFCEE_DISCOVER at all, straight to step 19
++ *     InitializeComplete. Default A0 EC = A0 ED = A0 D4 = 00 (no SE, like the 0-NFCEE answer).
++ *   - SET_CONFIG RSP (0x1f51cf350) needs >= 2 bytes, status 0; listen routing (21 01) and RF_DISCOVER_MAP (21 00) RSP
++ *     1 byte status 0: already answered so.
++ * kern.sweet_nfc_cfg_set (string, rw): "A00F=<hex>[,A0EC=<hex>...]" sets the value (and length) returned for that id;
++ * "A0EC=" drops one override, "clear" drops all. Read: the overrides, "id:len:first bytes". 2-byte ids are A0xx/A1xx,
++ * a standard id is written 00xx. kern.sweet_nfc_fwif_fmt bit 4 (0x10): SET_CONFIG of A0xx stored as an override (EEPROM
++ * mirror; default off), bit 5 (0x20): the 1125-1127 GET_CONFIG answer (each id = one zero byte), for A/B.
++ * SET_CONFIG is never forwarded in persona mode (mode 0: nothing reaches the chip).
++ */
++#define CFG_N   16
++#define CFG_MAX 72
++static struct { uint16_t id; uint8_t len; uint8_t val[CFG_MAX]; } nfc_cfg[CFG_N];   /* 1128: overrides; gw_lock */
++static unsigned nfc_cfg_n;
++static int persona_st = -1;             /* 1128: last init-table step index seen (-1 = none this session) */
++
++static unsigned
++cfg_default(uint16_t id, uint8_t *v)
++{
++	switch (id) {
++	case 0xa00f:                    /* EEPROM user area: MW 0x0134, FW = identity minor/major, bConfig 0xC3C3A5A5 */
++		memset(v, 0, 64);
++		v[0] = 0x34;
++		v[1] = 0x01;
++		v[2] = (uint8_t)nfc_id_info;
++		v[3] = (uint8_t)(nfc_id_info >> 8);
++		v[4] = 0xa5;
++		v[5] = 0xa5;
++		v[6] = 0xc3;
++		v[7] = 0xc3;
++		return 64;
++	case 0xa0e8:
++	case 0xa0ef:
++	case 0xa0f0:
++		memset(v, 0, 0x45);
++		return 0x45;
++	case 0xa0ea:
++	case 0xa0eb:
++	case 0xa01e:
++		memset(v, 0, 8);
++		return 8;
++	default:
++		v[0] = 0;
++		return 1;
++	}
++}
++
++/* value for a GET_CONFIG id: override, else the default. Returns the length. */
++static unsigned
++cfg_get(uint16_t id, uint8_t *v, bool *ovr)
++{
++	for (unsigned i = 0; i < nfc_cfg_n; i++) {
++		if (nfc_cfg[i].id == id) {
++			memcpy(v, nfc_cfg[i].val, nfc_cfg[i].len);
++			*ovr = true;
++			return nfc_cfg[i].len;
++		}
++	}
++	*ovr = false;
++	return cfg_default(id, v);
++}
++
++/* set (len > 0) or drop (len == 0) an override; false if the table is full */
++static bool
++cfg_put(uint16_t id, const uint8_t *v, unsigned len)
++{
++	unsigned i;
++
++	for (i = 0; i < nfc_cfg_n && nfc_cfg[i].id != id; i++) {
++	}
++	if (len == 0) {
++		if (i < nfc_cfg_n) {
++			nfc_cfg[i] = nfc_cfg[--nfc_cfg_n];
++		}
++		return true;
++	}
++	if (i == nfc_cfg_n) {
++		if (nfc_cfg_n == CFG_N) {
++			return false;
++		}
++		nfc_cfg_n++;
++	}
++	nfc_cfg[i].id = id;
++	nfc_cfg[i].len = (uint8_t)(len > CFG_MAX ? CFG_MAX : len);
++	memcpy(nfc_cfg[i].val, v, nfc_cfg[i].len);
++	return true;
++}
++
++static bool
++cfg_wide(uint8_t b)
++{
++	return (b & 0xfeu) == 0xa0u;    /* NXP 2-byte tag, as phNciNfc_TlvUtilsAddTlv / StorePropParams test it */
++}
++
++/* does the GET/SET_CONFIG payload (p+4.., count p[3]) name only ids from list? any of them? set: TLVs */
++static void
++cfg_ids_scan(const uint8_t *p, unsigned n, bool set, const uint16_t *list, unsigned ln, bool *any, bool *only,
++    unsigned *cnt)
++{
++	unsigned i = 4, k;
++
++	*any = false;
++	*only = true;
++	*cnt = 0;
++	for (k = 0; n > 3 && k < p[3] && i < n; k++) {
++		uint16_t id = p[i];
++		bool hit = false;
++
++		if (cfg_wide(p[i]) && i + 1 < n) {
++			id = (uint16_t)(p[i] << 8 | p[i + 1]);
++			i++;
++		}
++		i++;
++		if (set) {
++			if (i >= n) {
++				break;
++			}
++			i += 1u + p[i];
++		}
++		for (unsigned j = 0; j < ln; j++) {
++			hit |= list[j] == id;
++		}
++		*any |= hit;
++		*only &= hit;
++		(*cnt)++;
++	}
++	if (*cnt == 0) {
++		*only = false;
++	}
++}
++
++static const uint16_t cfg_eeprom_ids[] = { 0xa00f };
++static const uint16_t cfg_swp_ids[] = { 0xa0ec, 0xa0ed, 0xa0d4 };
++
++/* 1128: init-table step (gphLibNfc_InitializeSequence 0x2125326f8) a persona command belongs to, or -1 */
++static int
++persona_step_of(const uint8_t *p, unsigned n, const char **name)
++{
++	uint16_t op = (uint16_t)((p[0] & 0x0fu) << 8 | (p[1] & 0x3fu));
++	int st = persona_st;
++	bool any, only;
++	unsigned cnt;
++
++	*name = NULL;
++	switch (op) {
++	case 0x000:
++	case 0x001:
++		*name = op ? "CORE_INIT" : "CORE_RESET";
++		return op == 0x001 && st >= 0 ? st : st < 0 || st >= 15 ? 0 : st < 9 ? 4 : 14;
++	case 0xf03:
++		*name = st == 1 ? "ReApplyHsuBr (2F 03)" : "ConfigHsuBr (2F 03)";
++		return st == 1 ? 2 : 1;
++	case 0xf19:
++		*name = "MwFwCompatibilityChk (2F 19)";
++		return 5;
++	case 0xf02:
++		*name = "EnablePropExtn (2F 02)";
++		return st >= 9 ? 15 : 6;
++	case 0xf06:
++		*name = "GetFwType (2F 06)";
++		return 7;
++	case 0xf00:
++		*name = st >= 9 ? "SetPowerMode (2F 00, after init)" : "DisableStandbyMode (2F 00)";
++		return st >= 9 ? -1 : 8;
++	case 0x003:
++		cfg_ids_scan(p, n, false, cfg_eeprom_ids, 1, &any, &only, &cnt);
++		if (any) {
++			*name = "GetEepromParams (GET_CONFIG A0 0F)";
++			return 9;
++		}
++		cfg_ids_scan(p, n, false, cfg_swp_ids, 3, &any, &only, &cnt);
++		if (only) {
++			*name = "GetNfceeIntfCfg (GET_CONFIG A0 EC/ED/D4)";
++			return 17;
++		}
++		*name = "GET_CONFIG (not an init-table step)";
++		return -1;
++	case 0x002:
++		cfg_ids_scan(p, n, true, cfg_eeprom_ids, 1, &any, &only, &cnt);
++		if (only) {
++			*name = "SetEepromParams (SET_CONFIG A0 0F)";
++			return 11;
++		}
++		cfg_ids_scan(p, n, true, cfg_swp_ids, 3, &any, &only, &cnt);
++		if (only) {
++			*name = "SwpIntfControl (SET_CONFIG A0 EC/ED/D4)";
++			return 16;
++		}
++		if (st >= 9 && st < 10) {
++			*name = "InitSetConfig (SET_CONFIG)";
++			return 10;
++		}
++		*name = "SET_CONFIG (not an init-table step)";
++		return -1;
++	case 0x101:
++		*name = "SetLsntModeRtng (RF_SET_LISTEN_MODE_ROUTING)";
++		return st >= 10 && st < 12 ? 12 : -1;
++	case 0x100:
++		*name = "InitSetMapping (RF_DISCOVER_MAP)";
++		return st >= 10 && st < 13 ? 13 : -1;
++	case 0x200:
++		*name = "EnableNfceeDisc (NFCEE_DISCOVER)";
++		return 18;
++	default:
++		return -1;
++	}
++}
++
++/* 1128: one klog line naming the init step, with what the stack does next where it is known. gw_lock held. */
++static void
++persona_step_say(const uint8_t *p, unsigned n)
++{
++	const char *name;
++	int st = persona_step_of(p, n, &name);
++	char extra[96];
++
++	extra[0] = 0;
++	if (st < 0) {
++		if (name && persona_said < 400) {
++			SAY("persona: %s (after step %d)\n", name, persona_st);
++		}
++		return;
++	}
++	if (st == 9) {
++		uint8_t v[CFG_MAX];
++		bool ovr;
++		unsigned l = cfg_get(0xa00f, v, &ovr);
++		uint32_t bc = l >= 8 ? (uint32_t)v[4] | (uint32_t)v[5] << 8 | (uint32_t)v[6] << 16 | (uint32_t)v[7] << 24 : 0;
++
++		snprintf(extra, sizeof(extra), ": A0 0F len %u%s bConfig %#x -> %s", l, ovr ? " (override)" : "", bc,
++		    l != 64 ? "LENGTH NOT 64: EEPROM read fails" : bc == 0xc3c3a5a5u ? "skip set config, next step 15" :
++		    "full MW config, next step 10");
++	} else if (st == 17) {
++		uint8_t a[CFG_MAX], b[CFG_MAX], c[CFG_MAX];
++		bool o;
++
++		(void)cfg_get(0xa0ec, a, &o);
++		(void)cfg_get(0xa0ed, b, &o);
++		(void)cfg_get(0xa0d4, c, &o);
++		snprintf(extra, sizeof(extra), ": A0EC %02x A0ED %02x A0D4 %02x -> %s", a[0], b[0], c[0],
++		    (a[0] | b[0] | c[0]) == 0 ? "SWP off: no NFCEE_DISCOVER, next step 19 InitializeComplete" :
++		    "NFCEE_DISCOVER (step 18) next");
++	} else if (st == 18) {
++		snprintf(extra, sizeof(extra), ": 0 NFCEEs, next step 19 InitializeComplete");
++	}
++	persona_st = st;
++	if (persona_said < 400) {
++		SAY("persona: init step %d %s%s\n", st, name, extra);
++	}
++}
++
++/* 1128: SET_CONFIG in persona mode: list the ids; bit 0x10 of kern.sweet_nfc_fwif_fmt keeps A0xx values as overrides */
++static void
++persona_set_config(const uint8_t *p, unsigned n)
++{
++	char ids[96];
++	size_t o = 0;
++	unsigned i = 4, k, kept = 0;
++
++	ids[0] = 0;
++	for (k = 0; n > 3 && k < p[3] && i + 1 < n; k++) {
++		uint16_t id = p[i];
++		unsigned l;
++
++		if (cfg_wide(p[i])) {
++			id = (uint16_t)(p[i] << 8 | p[i + 1]);
++			i++;
++		}
++		i++;
++		if (i >= n) {
++			break;
++		}
++		l = p[i++];
++		if (i + l > n) {
++			break;
++		}
++		if (o + 12 < sizeof(ids)) {
++			o += (size_t)snprintf(ids + o, sizeof(ids) - o, "%s%04x/%u", k ? " " : "", id, l);
++		}
++		if (id >= 0xa000 && (nfc_fwif_fmt & 0x10) && l > 0 && cfg_put(id, p + i, l)) {
++			kept++;
++		}
++		if (id == 0xa00f && l >= 8 && persona_said < 400) {
++			SAY("persona: SET_CONFIG A0 0F (EEPROM user area) MW %02x%02x FW %02x%02x bConfig %02x%02x%02x%02x%s\n",
++			    p[i + 1], p[i], p[i + 3], p[i + 2], p[i + 7], p[i + 6], p[i + 5], p[i + 4],
++			    (nfc_fwif_fmt & 0x10) ? " (kept)" : " (not kept, fwif_fmt bit 0x10 off)");
++		}
++		i += l;
++	}
++	if (persona_said < 400) {
++		SAY("persona: SET_CONFIG %u ids [%s] acknowledged locally, not forwarded%s\n", k, ids,
++		    kept ? " (A0xx kept as overrides)" : "");
++	}
++}
++
+ static void
+ persona_note(uint16_t op)
+ {
+@@ -1050,25 +1367,47 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 			break;
+ 		}
+ 		case 0x0002:                    /* CORE_SET_CONFIG: OK, 0 invalid ids (nothing is written anywhere) */
++			persona_set_config(p, n);       /* 1128 */
+ 			r[len++] = 0x00;
+ 			r[len++] = 0x00;
+ 			what = "CORE_SET_CONFIG: OK (not applied)";
+ 			break;
+-		case 0x0003: {                  /* CORE_GET_CONFIG: each id with one zero byte */
++		case 0x0003: {                  /* CORE_GET_CONFIG: 1128 each id with its value (table/override) */
+ 			unsigned cnt = n > 3 ? p[3] : 0, i = 4, k = 0;
++			bool legacy = (nfc_fwif_fmt & 0x20) != 0;
+ 
+ 			r[len++] = 0x00;
+ 			r[len++] = 0x00;        /* count, filled below */
+-			for (; k < cnt && i < n && len + 4 < sizeof(r); k++) {
+-				if (p[i] >= 0xa0 && i + 1 < n) {        /* NXP extended (2-byte) tag */
+-					r[len++] = p[i++];
++			for (; k < cnt && i < n; k++) {
++				uint8_t v[CFG_MAX];
++				uint16_t id = p[i];
++				bool ovr = false;
++				unsigned vl, il = 1;
++
++				if ((legacy ? p[i] >= 0xa0 : cfg_wide(p[i])) && i + 1 < n) {    /* NXP extended (2-byte) tag */
++					id = (uint16_t)(p[i] << 8 | p[i + 1]);
++					il = 2;
++				}
++				if (legacy) {
++					v[0] = 0;
++					vl = 1;
++				} else {
++					vl = cfg_get(id, v, &ovr);
++				}
++				if (len + il + 1 + vl > sizeof(r) || len + il + 1 + vl > 3 + 255) {
++					break;  /* does not fit: the count stays short and the stack sees a failed GET */
+ 				}
+ 				r[len++] = p[i++];
+-				r[len++] = 0x01;
+-				r[len++] = 0x00;
++				if (il == 2) {
++					r[len++] = p[i++];
++				}
++				r[len++] = (uint8_t)vl;
++				memcpy(r + len, v, vl);
++				len += vl;
+ 			}
+ 			r[4] = (uint8_t)k;
+-			what = "CORE_GET_CONFIG: each id = 1 zero byte";
++			what = legacy ? "CORE_GET_CONFIG: each id = 1 zero byte (fmt 0x20, 1127)" :
++			    "CORE_GET_CONFIG: each id = table value (kern.sweet_nfc_cfg_set overrides)";
+ 			break;
+ 		}
+ 		case 0x0100:
+@@ -1108,6 +1447,7 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 	r[2] = (uint8_t)(len - 3);
+ 	out_put(out, no, cap, r, len);
+ 	persona_note((uint16_t)((gid << 8) | oid));
++	persona_step_say(p, n);                 /* 1128 */
+ 	if (persona_said++ < 400) {
+ 		char h[3 * 40 + 4];
+ 
+@@ -1142,6 +1482,7 @@ gw_refuse(int why)
+ }
+ 
+ static void gw_session_stop(const char *why);
++static bool persona_on(void);
+ static int gw_chip_tx(const uint8_t *b, unsigned n);
+ 
+ /* one host packet; gw_lock held. *want_up: mode 1 asks for a chip bring-up after the lock is dropped */
+@@ -1175,6 +1516,9 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 		gw_hexlog("host>", p, n, why >= 0 ? rf_names[why] : NULL);
+ 	}
+ 	if (v == V_LOCAL && cmd && gid == 0 && oid == 0) {
++		if (persona_on()) {
++			persona_step_say(p, n);         /* 1128 */
++		}
+ 		local_reset(p, n, out, no, cap);
+ 		gw.rf_active = false;
+ 		if (nfc_gw_mode == 1) {
+@@ -1478,6 +1822,7 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
+ 		gw_said = 0;            /* 1125: full packet log for each of the first three sessions */
+ 		persona_said = 0;       /* 1127: and the persona lines */
+ 	}
++	persona_st = -1;                /* 1128: init steps counted per session */
+ 	lck_mtx_unlock(&gw_lock);
+ 	SAY("com.apple.uart.stockholm: OPEN by %s (pid %d), unit %u, gateway mode %u\n", who, proc_selfpid(), sac->sc_unit,
+ 	    nfc_gw_mode);
+@@ -1977,7 +2322,105 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_f
+     "redfin 1125/1127: persona answer to NXP 2F 19 GetFwInterfaceVersion, big endian (default 0x15, what hw 0x42 needs)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif_fmt, 0,
+     "redfin 1127: persona variants: bits 0-1 reply CRC16 (0 mirror the host, 1 never, 2 always once seen/IO_STOCKHOLM_CRC); "
+-    "4 = 1125 answers to 2F xx; 8 = GetFwType type 1");
++    "4 = 1125 answers to 2F xx; 8 = GetFwType type 1; 1128: 0x10 = SET_CONFIG A0xx kept as GET values (EEPROM mirror), "
++    "0x20 = 1127 GET_CONFIG answer (each id one zero byte)");
++
++static int
++cfg_hexval(char c)
++{
++	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
++}
++
++/*
++ * 1128: kern.sweet_nfc_cfg_set: "A00F=3401..,A0EC=00" sets what the persona's CORE_GET_CONFIG returns for an id
++ * (value and length, at most 72 bytes), "A0EC=" drops it, "clear" drops all. Read: "id:len:first 8 bytes ..".
++ * Ids are 4 hex digits (A0xx/A1xx NXP, 00xx standard). Spaces, ':' and '.' inside a value are ignored.
++ */
++static int
++sysctl_nfc_cfg_set SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char b[CFG_N * 30 + 8], in[400];
++	size_t o = 0;
++	int err;
++
++	b[0] = 0;
++	lck_mtx_lock(&gw_lock);
++	for (unsigned i = 0; i < nfc_cfg_n && o + 30 < sizeof(b); i++) {
++		char h[3 * 8 + 4];
++
++		hex(h, sizeof(h), nfc_cfg[i].val, nfc_cfg[i].len > 8 ? 8 : nfc_cfg[i].len);
++		o += (size_t)snprintf(b + o, sizeof(b) - o, "%s%04X:%u:%s%s", i ? "," : "", nfc_cfg[i].id, nfc_cfg[i].len, h,
++		    nfc_cfg[i].len > 8 ? ".." : "");
++	}
++	lck_mtx_unlock(&gw_lock);
++	err = SYSCTL_OUT(req, b, strlen(b) + 1);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (req->newlen >= sizeof(in)) {
++		return EINVAL;
++	}
++	err = SYSCTL_IN(req, in, req->newlen);
++	if (err) {
++		return err;
++	}
++	in[req->newlen] = 0;
++	if (strncmp(in, "clear", 5) == 0) {
++		lck_mtx_lock(&gw_lock);
++		nfc_cfg_n = 0;
++		lck_mtx_unlock(&gw_lock);
++		SAY("1128: kern.sweet_nfc_cfg_set: all GET_CONFIG overrides dropped\n");
++		return 0;
++	}
++	for (char *c = in; *c;) {
++		uint8_t v[CFG_MAX];
++		unsigned id = 0, vl = 0, d;
++		int x;
++
++		while (*c == ',' || *c == ' ' || *c == '\n') {
++			c++;
++		}
++		if (!*c) {
++			break;
++		}
++		for (d = 0; d < 4; d++, c++) {
++			if ((x = cfg_hexval(*c)) < 0) {
++				return EINVAL;
++			}
++			id = id << 4 | (unsigned)x;
++		}
++		if (*c++ != '=') {
++			return EINVAL;
++		}
++		for (d = 0; *c && *c != ','; c++) {
++			if (*c == ' ' || *c == ':' || *c == '.') {
++				continue;
++			}
++			if ((x = cfg_hexval(*c)) < 0 || vl >= CFG_MAX) {
++				return EINVAL;
++			}
++			if (d++ & 1) {
++				v[vl - 1] = (uint8_t)(v[vl - 1] << 4 | (unsigned)x);
++			} else {
++				v[vl++] = (uint8_t)x;
++			}
++		}
++		if (d & 1) {
++			return EINVAL;  /* odd number of hex digits */
++		}
++		lck_mtx_lock(&gw_lock);
++		bool ok = cfg_put((uint16_t)id, v, vl);
++		lck_mtx_unlock(&gw_lock);
++		if (!ok) {
++			return ENOSPC;
++		}
++		SAY("1128: kern.sweet_nfc_cfg_set: GET_CONFIG %04X -> %s %u byte(s)\n", id, vl ? "override" : "default", vl);
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_cfg_set, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_cfg_set,
++    "A", "redfin 1128: persona GET_CONFIG values: \"A00F=<hex>,A0EC=<hex>\" set, \"A0EC=\" drop, \"clear\"; read = overrides");
+ 
+ static int
+ sysctl_nfc_persona SYSCTL_HANDLER_ARGS
+-- 
+2.53.0
+
