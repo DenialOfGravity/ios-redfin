@@ -1087,6 +1087,18 @@ static const uint8_t hci_credit_ntf[6] = { 0x60, 0x06, 0x03, 0x01, 0x01, 0x01 };
  * (RF_CONN_NFCEE), so nothing of this reaches the chip. Cleared on CORE_RESET and at session start/stop.
  */
 static uint8_t hci_conn;                /* 1137: dynamic conn ID of the virtual HCI network, 0 = none; gw_lock */
+/*
+ * 1138 (logs/research/nfc-ese-2026-11-16.md, follow-up "bit 0x1000"): libNFC_Comet waits for the NXP System End of
+ * Operation NTF 6F 20 {NFCEE, status} (phNciNfc_ProcessSysEoOpNtf 0x1f514a1a0): after an NFCEE_MODE_SET_RSP for any
+ * NFCEE but 01 it runs a 2000 ms set-mode timer that fails the mode set without it, and ModeSetHciNwk waits 4 s for
+ * the eSE's EoOP when none was seen. kern.sweet_nfc_fwif_fmt 0x1000 (only with 0x400 + vese_on()): 6F 20 02 C0 00 after
+ * the NFCEE_DISCOVER enable packets and right after every NFCEE_MODE_SET_RSP for C0 (mode 00/01); never for MODE_SET 01.
+ * 0x2000: GET_CONFIG A0EB (eSE session ID) returns the last value the host SET for A0EB (persona-local only).
+ * Host-bound packets only, through out_put (CRC trailer as for every reply); nothing reaches the chip.
+ */
+static const uint8_t hci_eoop_ntf[5] = { 0x6f, 0x20, 0x02, 0xc0, 0x00 };     /* EoOP: NFCEE C0, status 00 ready */
+static uint8_t a0eb_set[16];            /* 1138: last SET_CONFIG A0EB value from the host; gw_lock */
+static unsigned a0eb_len;               /* 0 = none seen */
 
 static bool
 vhci_on(void)
@@ -1229,6 +1241,10 @@ cfg_get(uint16_t id, uint8_t *v, bool *ovr)
 	if (vese_on() && swp_idx(id) >= 0 && (swp_have >> swp_idx(id) & 1)) {        /* 1134 */
 		v[0] = swp_set[swp_idx(id)];
 		return 1;
+	}
+	if (id == 0xa0eb && a0eb_len != 0 && (nfc_fwif_fmt & 0x2000) && vhci_on()) {     /* 1138 */
+		memcpy(v, a0eb_set, a0eb_len);
+		return a0eb_len;
 	}
 	return cfg_default(id, v);
 }
@@ -1380,7 +1396,36 @@ persona_step_of(const uint8_t *p, unsigned n, const char **name)
 }
 
 /* 1128: one klog line naming the init step, with what the stack does next where it is known. gw_lock held. */
+/* 1138: plain NCI name of a host command (klog labels after the ReInit's NFCEE_DISCOVER) */
+static const char *
+nci_op_name(uint16_t op)
+{
+	switch (op) {
+	case 0x000: return "CORE_RESET";
+	case 0x001: return "CORE_INIT";
+	case 0x002: return "CORE_SET_CONFIG";
+	case 0x003: return "CORE_GET_CONFIG";
+	case 0x004: return "CORE_CONN_CREATE";
+	case 0x005: return "CORE_CONN_CLOSE";
+	case 0x100: return "RF_DISCOVER_MAP";
+	case 0x101: return "RF_SET_LISTEN_MODE_ROUTING";
+	case 0x102: return "RF_GET_LISTEN_MODE_ROUTING";
+	case 0x103: return "RF_DISCOVER";
+	case 0x106: return "RF_DEACTIVATE";
+	case 0x200: return "NFCEE_DISCOVER";
+	case 0x201: return "NFCEE_MODE_SET";
+	case 0xf00: return "NXP 2F 00 (standby/power mode)";
+	case 0xf02: return "NXP 2F 02 (EnablePropExtn)";
+	case 0xf03: return "NXP 2F 03 (HSU baud rate)";
+	case 0xf06: return "NXP 2F 06 (GetFwType)";
+	case 0xf19: return "NXP 2F 19 (GetFwInterfaceVersion)";
+	default: return "NCI command";
+	}
+}
+
 /* 1134: the ReInit sequence 0x212532618 (after SET_CONFIG A0 BF = 01): one klog line per step. True = handled. */
+/* 1138: after the ReInit's NFCEE_DISCOVER enable (step 10) the HCI init / eSE child sequences run, not the ReInit
+ * table: those ops are labelled "step 11 post-discover (HCI/eSE seq)" + NCI name + bytes, no table step names. */
 static bool
 persona_ri_say(const uint8_t *p, unsigned n)
 {
@@ -1396,7 +1441,8 @@ persona_ri_say(const uint8_t *p, unsigned n)
 			st = 60;
 			name = "DeInitialize (CORE_RESET): the stack gave up on the ReInit";
 			snprintf(extra, sizeof(extra), " after step %d%s", persona_ri, persona_ri == 50 ?
-			    " (static feature cfg -> VerifySEStatus failed: eSE expected, ctx+0x146 != 1)" : "");
+			    " (static feature cfg -> VerifySEStatus failed: eSE expected, ctx+0x146 != 1)" :
+			    persona_ri == 11 ? " (post-discover HCI/eSE seq, 1138)" : "");
 		} else if (gw.chip_crc) {
 			st = 0;
 			persona_ri_hsu = 0;
@@ -1407,6 +1453,13 @@ persona_ri_say(const uint8_t *p, unsigned n)
 		}
 	} else if (persona_ri < 0 || persona_ri >= 60) {
 		return false;
+	} else if (persona_ri == 10 || persona_ri == 11) {      /* 1138: post-discover, label by opcode */
+		char h[3 * 16 + 4];
+
+		hex(h, sizeof(h), p, n > 16 ? 16 : n);
+		st = 11;
+		name = "post-discover (HCI/eSE seq):";
+		snprintf(extra, sizeof(extra), " %s [%s%s]", nci_op_name(op), h, n > 16 ? " .." : "");
 	} else if (op == 0x001) {
 		st = 2;
 		name = "ReInitialize (CORE_INIT; step 1 CrcConfig is host-only)";
@@ -1536,6 +1589,10 @@ persona_set_config(const uint8_t *p, unsigned n)
 		}
 		if (id >= 0xa000 && (nfc_fwif_fmt & 0x10) && l > 0 && cfg_put(id, p + i, l)) {
 			kept++;
+		}
+		if (id == 0xa0eb && l >= 1 && l <= sizeof(a0eb_set)) {        /* 1138: kept for fwif_fmt 0x2000 */
+			memcpy(a0eb_set, p + i, l);
+			a0eb_len = l;
 		}
 		if (swp_idx(id) >= 0 && l >= 1) {       /* 1134: what SwpIntfControl asked for (the host's SE config) */
 			swp_set[swp_idx(id)] = p[i];
@@ -1743,6 +1800,9 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 				if (en) {
 					out_put(out, no, cap, nt, sizeof(nt));
 				}
+				if (hci && (nfc_fwif_fmt & 0x1000)) {  /* 1138: eSE EoOP, so ModeSetHciNwk skips its 4 s wait */
+					out_put(out, no, cap, hci_eoop_ntf, sizeof(hci_eoop_ntf));
+				}
 				persona_note(0x0200);
 				persona_step_say(p, n);
 				if (hci) {
@@ -1751,6 +1811,10 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 					hci_log("<persona", hn, sizeof(hn), "NFCEE_DISCOVER_NTF HCI network 01, enabled, HCI access");
 					hci_log("<persona", hci_credit_ntf, sizeof(hci_credit_ntf), "CORE_CONN_CREDITS_NTF conn 1 +1");
 					hci_log("<persona", nt, sizeof(nt), "NFCEE_DISCOVER_NTF eSE C0 (1134)");
+					if (nfc_fwif_fmt & 0x1000) {
+						hci_log("<persona", hci_eoop_ntf, sizeof(hci_eoop_ntf),
+						    "NXP SYS_EoOP_NTF (6F 20) C0 status 00 ready (1138)");
+					}
 				} else if (ri_said < 200) {
 					ri_said++;
 					SAY("persona: 1134: NFCEE_DISCOVER %s: OK, %s%s\n", en ? "enable" : "disable",
@@ -1773,6 +1837,19 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 				r[2] = (uint8_t)(len - 3);
 				hci_log("host>", p, n, "NFCEE_MODE_SET HCI network 01");
 				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK (NCI 1.0, no NTF)");
+			}
+			if (vhci_on() && (nfc_fwif_fmt & 0x1000) && n > 4 && p[3] == 0xc0 && (p[4] == 0x00 || p[4] == 0x01)) {
+				/* 1138: RSP, then the eSE EoOP at once: completes the pending mode set (2 s timer) */
+				r[2] = (uint8_t)(len - 3);
+				out_put(out, no, cap, r, len);
+				out_put(out, no, cap, hci_eoop_ntf, sizeof(hci_eoop_ntf));
+				persona_note(0x0201);
+				persona_step_say(p, n);
+				hci_log("host>", p, n, p[4] ? "NFCEE_MODE_SET C0 enable" : "NFCEE_MODE_SET C0 disable");
+				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK");
+				hci_log("<persona", hci_eoop_ntf, sizeof(hci_eoop_ntf),
+				    "NXP SYS_EoOP_NTF (6F 20) C0 status 00 ready: mode set complete (1138)");
+				return true;
 			}
 			break;
 		case 0x0004: {                  /* 1136: CORE_CONN_CREATE logged; 1137: answered only for the virtual NFCEE 01 */
@@ -2719,7 +2796,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
     "4 = 1125 answers to 2F xx; 8 = GetFwType type 1; 1128: 0x10 = SET_CONFIG A0xx kept as GET values (EEPROM mirror), "
     "0x20 = 1127 GET_CONFIG answer (each id one zero byte); 1132: 0x40 = ignore SET_CONFIG A0 BF (no chip CRC), "
     "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
-    "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2)");
+    "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2); 1138: 0x1000 = eSE EoOP NTF "
+    "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value");
 
 static int
 cfg_hexval(char c)
