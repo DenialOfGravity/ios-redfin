@@ -1,0 +1,118 @@
+From efc3e91d097fa0cb47d4be3dbd6e7e86bbe690e0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 11:45:02 +0100
+Subject: [PATCH 1/3] 1129 redfin: PM8150 PON reason line at boot (SWEET PON: /
+ kern.sweet_pon, read-only SPMI; boot-arg sweetpon=0 skips). Port of
+ Yofuness/ios-flame xnu 0197+0201 (MIT, Copyright (c) 2026 dipa-studio)
+
+---
+ bsd/dev/sweet_spmi.c | 76 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index e045d32..f995f90 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -29,6 +29,23 @@
+ #include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ 
++/*
++ * 1129 (port of Yofuness/ios-flame xnu 0197 + 0201, MIT, "Copyright (c) 2026 dipa-studio"; sunfish PM6150 ->
++ * redfin PM8150, SID 0, PON peripheral 0x08): why the PMIC powered the phone on, read once when SPMI comes up
++ * (the first RTC read at boot), READ ONLY (observer EXT_READL of 0x800-0x81f and 0x88f; nothing is cleared).
++ * One klog line "SWEET PON: ..." and the same text as kern.sweet_pon (RD string). Boot-arg sweetpon=0 skips the
++ * reads (line "SWEET PON: off (sweetpon=0)"). Decoding (Linux qpnp-power-on.c, PON gen2 = PMIC5 PM8150):
++ *   0x08 PON_REASON1: hard_reset smpl rtc dc_chg usb_chg pon1 cblpwr kpdpwr (bits 0-7)
++ *   0x0a WARM_RESET_REASON1, 0x0c/0x0d FAULT_REASON1/2 (gen2 poff/fault: bit 4 mbg, 5 ovlo, 6 uvlo, 7 avdd_rb,
++ *   11 fault_n, 12 pbs_watchdog, 13 pbs_nack, 14 restart_pon, 15 otst3), 0x14 S3_RESET_REASON, 0x8f SOFT_RB_SPARE
++ *   (the shim/ABL reboot reason, NOTES "Reboot reason"). All bytes are in the line raw, decode is a guide only.
++ * smpl / hard_reset / uvlo = a PMIC-level event (rail, brown-out); warm reset reason set = a TZ/watchdog reset.
++ */
++static char sp_pon_line[384] = "SWEET PON: not read yet";
++SYSCTL_STRING(_kern, OID_AUTO, sweet_pon, CTLFLAG_RD | CTLFLAG_LOCKED, sp_pon_line, sizeof(sp_pon_line),
++    "1129: PM8150 PON reason registers at boot (read only)");
++static void sp_pon_boot(void);
++
+ /*
+  * 1062: the shared SPMI transaction lock (sweet_spmi.h). r5au1f's boot: sweet_keys.c and sweet_torch.c
+  * read at the same moment and got each other's bytes (keys pon=0x9 = the temperature alarm's TYPE,
+@@ -161,9 +178,65 @@ sweet_spmi_init(void)
+ 	sp_ready = true;
+ 	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+ 	    arb_version, sp_count);
++	sp_pon_boot();          /* 1129 */
+ 	return 0;
+ }
+ 
++/* 1129: see the comment at the top (sweet_pon). Runs once, from sweet_spmi_init (thread context). */
++static void
++sp_pon_boot(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("sweetpon", &on, sizeof(on));
++	if (!on) {
++		strlcpy(sp_pon_line, "SWEET PON: off (sweetpon=0)", sizeof(sp_pon_line));
++		printf("%s\n", sp_pon_line);
++		return;
++	}
++	uint8_t r[0x20], spare = 0;
++	unsigned bad = 0;
++	for (unsigned i = 0; i < sizeof(r); ++i) {
++		if (sweet_spmi_read(0, 0x800 + i, &r[i]) != 0) {
++			r[i] = 0xee;
++			bad++;
++			if (i < 4) {
++				break;  /* no APID / timeout: do not walk the rest */
++			}
++		}
++	}
++	if (bad && sweet_spmi_read(0, 0x800, &r[0]) != 0) {
++		strlcpy(sp_pon_line, "SWEET PON: read failed (no observer APID for 0:0x08?)", sizeof(sp_pon_line));
++		printf("%s\n", sp_pon_line);
++		return;
++	}
++	bool spare_ok = sweet_spmi_read(0, 0x88f, &spare) == 0;
++	static const char *const why[8] = { "hard_reset", "smpl", "rtc", "dc_chg", "usb_chg", "pon1", "cblpwr", "kpdpwr" };
++	static const char *const flt[16] = { "gp0", "gp1", "gp2", "gp3", "mbg", "ovlo", "uvlo", "avdd_rb", "b8", "b9",
++		                               "b10", "fault_n", "pbs_wdog", "pbs_nack", "restart_pon", "otst3" };
++	char dec[96] = "", fdec[96] = "";
++	for (unsigned b = 0; b < 8; ++b) {
++		if (r[8] & (1u << b)) {
++			strlcat(dec, dec[0] ? "|" : "", sizeof(dec));
++			strlcat(dec, why[b], sizeof(dec));
++		}
++	}
++	unsigned fb = r[0x0c] | (unsigned)r[0x0d] << 8;
++	for (unsigned b = 0; b < 16; ++b) {
++		if (fb & (1u << b)) {
++			strlcat(fdec, fdec[0] ? "|" : "", sizeof(fdec));
++			strlcat(fdec, flt[b], sizeof(fdec));
++		}
++	}
++	char raw[3 * 0x20 + 1];
++	for (unsigned i = 0; i < 0x20; ++i) {
++		snprintf(raw + 3 * i, 4, "%02x%s", r[i], i == 0x1f ? "" : " ");
++	}
++	snprintf(sp_pon_line, sizeof(sp_pon_line), "SWEET PON: reason %s | warm %#x | fault %s (%#x) | s3 %#x | spare88f %s%#x |"
++	    " type %02x/%02x | 800-81f: %s%s", dec[0] ? dec : "none", r[0x0a], fdec[0] ? fdec : "none", fb, r[0x14],
++	    spare_ok ? "" : "?", spare, r[4], r[5], raw, bad ? " (some reads failed: ee)" : "");
++	printf("%s\n", sp_pon_line);
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+@@ -175,7 +248,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	    /* 0960: Type-C (0x15), SMB misc/watchdog (0x16), QG SDAM (0xb1): read only */
+ 	    peripheral == 0x15 || peripheral == 0x16 || peripheral == 0xb1);
+ 	bool rtc = sid == 0 && peripheral == 0x60;
+-	if (!sp_ready || !out || addr > 0xffffu || !(batt || rtc)) {
++	bool pon = sid == 0 && peripheral == 0x08;  /* 1129: PM8150 PON block, read only (reset forensics) */
++	if (!sp_ready || !out || addr > 0xffffu || !(batt || rtc || pon)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+-- 
+2.53.0
+
