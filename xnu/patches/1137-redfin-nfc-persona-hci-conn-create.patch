@@ -1,0 +1,146 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 22:00:00 +0100
+Subject: [PATCH] 1137 redfin: NFC persona: CORE_CONN_CREATE for the virtual HCI
+ network NFCEE 01 answered locally (fwif_fmt 0x800), HCI responder on conn 2,
+ CORE_CONN_CLOSE
+
+---
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index a94a2ab..f4f7421 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -1077,6 +1077,16 @@ vese_on(void)
+ static unsigned hci_said;
+ static const uint8_t hci_session_id[8] = { 0x52, 0x46, 0x4e, 0x30, 0x00, 0x00, 0x00, 0x01 };     /* "RFN0" 00 00 00 01 */
+ static const uint8_t hci_credit_ntf[6] = { 0x60, 0x06, 0x03, 0x01, 0x01, 0x01 };     /* conn 1, +1 credit */
++/*
++ * 1137: phone run k17n: OpenLogConn sends CORE_CONN_CREATE 20 04 06 03 01 01 02 01 01 (destination NFCEE, TLV 01 =
++ * NFCEE 01 + protocol 01 HCI access), and 1136 refused it, so the HCI init never started. With 0x800 (and 0x400 +
++ * vese_on()) exactly that packet, the virtual HCI network, is answered here: 40 04 04 00 ff 01 02 (status, max payload,
++ * credits, conn ID 02), and conn 02 becomes the HCI connection: its HCP data gets the same local responder as static
++ * conn 1, credit NTF 60 06 03 01 02 01, and CORE_CONN_CLOSE 02 -> 40 05 01 00. Any other destination or NFCEE ID keeps
++ * the refusal. gw_filter() still refuses data on any conn but 0 (RF_DATA/RF_HCI) and every NFCEE destination
++ * (RF_CONN_NFCEE), so nothing of this reaches the chip. Cleared on CORE_RESET and at session start/stop.
++ */
++static uint8_t hci_conn;                /* 1137: dynamic conn ID of the virtual HCI network, 0 = none; gw_lock */
+ 
+ static bool
+ vhci_on(void)
+@@ -1106,7 +1116,10 @@ persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsig
+ 	unsigned rl = 0;
+ 	const char *what;
+ 
+-	hci_log("host>", p, n, "data, static conn 1");
++	uint8_t cid = (uint8_t)(p[0] & 0x0f);
++	const uint8_t cr[6] = { 0x60, 0x06, 0x03, 0x01, cid, 0x01 };    /* 1137: credit for the conn it came on */
++
++	hci_log("host>", p, n, cid == 1 ? "data, static conn 1" : "data, HCI conn (CORE_CONN_CREATE, 1137)");
+ 	if (n < 5 || n != 3u + p[2] || p[1] != 0) {
+ 		what = "short/malformed HCP: no reply";
+ 	} else if (!(p[3] & 0x80)) {
+@@ -1114,7 +1127,7 @@ persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsig
+ 	} else {
+ 		uint8_t pipe = (uint8_t)(p[3] & 0x7f), type = (uint8_t)(p[4] >> 6), ins = (uint8_t)(p[4] & 0x3f);
+ 
+-		r[0] = 0x01;
++		r[0] = cid;
+ 		r[1] = 0x00;
+ 		r[3] = (uint8_t)(0x80 | pipe);
+ 		if (type != 0) {
+@@ -1165,8 +1178,8 @@ persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsig
+ 	} else {
+ 		hci_log("(no reply)", p, n, what);
+ 	}
+-	out_put(out, no, cap, hci_credit_ntf, sizeof(hci_credit_ntf));
+-	hci_log("<persona", hci_credit_ntf, sizeof(hci_credit_ntf), "CORE_CONN_CREDITS_NTF conn 1 +1");
++	out_put(out, no, cap, cr, sizeof(cr));
++	hci_log("<persona", cr, sizeof(cr), cid == 1 ? "CORE_CONN_CREDITS_NTF conn 1 +1" : "CORE_CONN_CREDITS_NTF HCI conn +1");
+ 	return true;
+ }
+ 
+@@ -1578,7 +1591,7 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 	unsigned len = 3;
+ 	const char *what = NULL;
+ 
+-	if (n >= 3 && p[0] == 0x01 && vhci_on()) {
++	if (n >= 3 && (p[0] == 0x01 || (hci_conn != 0 && p[0] == hci_conn)) && vhci_on()) {
+ 		return persona_hci_data(p, n, out, no, cap);    /* 1136: HCP on static conn 1, local only */
+ 	}
+ 	if ((p[0] >> 5) != 1 || (p[0] & 0x10) != 0 || n < 3) {
+@@ -1762,24 +1775,41 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK (NCI 1.0, no NTF)");
+ 			}
+ 			break;
+-		case 0x0004:                    /* 1136: CORE_CONN_CREATE (OpenLogConn?), logged; answered only with 0x800 */
++		case 0x0004: {                  /* 1136: CORE_CONN_CREATE logged; 1137: answered only for the virtual NFCEE 01 */
++			/* exactly: destination 03 (NFCEE), 1 parameter, TLV 01 len 2 = NFCEE 01, protocol 01 (HCI access) */
++			bool hci_ee = n == 9 && p[2] == 6 && p[3] == 0x03 && p[4] == 0x01 && p[5] == 0x01 && p[6] == 0x02 &&
++			    p[7] == 0x01 && p[8] == 0x01;
++
+ 			if (!vhci_on()) {
+ 				return false;
+ 			}
+-			if (!(nfc_fwif_fmt & 0x800) || n < 4 || p[3] == 0x03) {
+-				hci_log("host>", p, n, n >= 4 && p[3] == 0x03 ?
+-				    "CORE_CONN_CREATE to an NFCEE: not answered (refused as before)" :
+-				    "CORE_CONN_CREATE: not answered (fwif_fmt 0x800 off; refused as before)");
++			if (!(nfc_fwif_fmt & 0x800) || !hci_ee) {
++				hci_log("host>", p, n, !(nfc_fwif_fmt & 0x800) ?
++				    "CORE_CONN_CREATE: not answered (fwif_fmt 0x800 off; refused as before)" :
++				    "CORE_CONN_CREATE: not the virtual HCI network (NFCEE 01, HCI access): refused as before");
+ 				return false;
+ 			}
++			hci_conn = 0x02;        /* the only dynamic conn the persona ever has */
+ 			r[len++] = 0x00;        /* status OK */
+ 			r[len++] = 0xff;        /* max data packet payload */
+ 			r[len++] = 0x01;        /* initial credits */
+-			r[len++] = 0x02;        /* conn ID */
++			r[len++] = hci_conn;    /* conn ID */
++			r[2] = (uint8_t)(len - 3);
++			hci_log("host>", p, n, "CORE_CONN_CREATE NFCEE 01 (virtual HCI network), HCI access");
++			hci_log("<persona", r, len, "CORE_CONN_CREATE_RSP OK, 255, 1 credit, conn 2 = HCI conn (1137)");
++			what = "1137: CORE_CONN_CREATE (virtual HCI network 01): OK, conn 2";
++			break;
++		}
++		case 0x0005:                    /* 1137: CORE_CONN_CLOSE of the HCI conn, locally */
++			if (!vhci_on() || hci_conn == 0 || n != 4 || p[3] != hci_conn) {
++				return false;
++			}
++			r[len++] = 0x00;
+ 			r[2] = (uint8_t)(len - 3);
+-			hci_log("host>", p, n, "CORE_CONN_CREATE");
+-			hci_log("<persona", r, len, "CORE_CONN_CREATE_RSP OK, 255, 1 credit, conn 2 (fwif_fmt 0x800)");
+-			what = "1136: CORE_CONN_CREATE: OK, conn 2 (fwif_fmt 0x800)";
++			hci_log("host>", p, n, "CORE_CONN_CLOSE HCI conn");
++			hci_log("<persona", r, len, "CORE_CONN_CLOSE_RSP OK (1137)");
++			hci_conn = 0;
++			what = "1137: CORE_CONN_CLOSE (HCI conn): OK";
+ 			break;
+ 		default:
+ 			return false;
+@@ -1862,6 +1892,7 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 		}
+ 		local_reset(p, n, out, no, cap);
+ 		gw.rf_active = false;
++		hci_conn = 0;                   /* 1137 */
+ 		if (nfc_gw_mode == 1) {
+ 			*want_up = true;
+ 		}
+@@ -2158,6 +2189,7 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
+ 	gw.rf_active = false;
+ 	gw.crc = gw.on_demand = 0;
+ 	gw.pend = gw.crc_rx = gw.crc_out = false;       /* 1127 */
++	hci_conn = 0;                                   /* 1137 */
+ 	gw.chip_crc = false;                            /* 1132 */
+ 	gw_crc_next = 0;
+ 	strlcpy(gw.who, who, sizeof(gw.who));
+@@ -2687,7 +2719,7 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
+     "4 = 1125 answers to 2F xx; 8 = GetFwType type 1; 1128: 0x10 = SET_CONFIG A0xx kept as GET values (EEPROM mirror), "
+     "0x20 = 1127 GET_CONFIG answer (each id one zero byte); 1132: 0x40 = ignore SET_CONFIG A0 BF (no chip CRC), "
+     "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
+-    "0x800 = also answer CORE_CONN_CREATE");
++    "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2)");
+ 
+ static int
+ cfg_hexval(char c)
