@@ -208,6 +208,14 @@ int loc_parse_position(const uint8_t *tl, uint32_t tn, struct loc_fix *f)
 #undef F
 	if ((v = find(tl, tn, 0x23, &l)) && l == 4)
 		memcpy(&f->tech, v, 4);
+	if ((v = find(tl, tn, 0x29, &l)) && l == 4) {	/* ws-gnss-k: for the log (no position) */
+		memcpy(&f->time_src, v, 4);
+		f->has_tsrc = 1;
+	}
+	if ((v = find(tl, tn, 0x2c, &l)) && l >= 1 && (uint32_t)l == 1u + 2u * v[0]) {
+		f->sv_used = v[0];
+		f->has_svused = 1;
+	}
 	if ((v = find(tl, tn, 0x24, &l)) && l == 12) {
 		memcpy(&f->pdop, v, 4);
 		memcpy(&f->hdop, v + 4, 4);

@@ -106,7 +106,9 @@
  *                fails, the RTC time with timeunc= is used as before.
  * Never sent (ws-gnss-k too): SUPL/NI/NV messages, position injection, SET_CONSTELLATION_CONTROL, any lockClient TLV.
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
- * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). Coordinates are logged rounded to 0.01 deg.
+ * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). ws-gnss-k: no line ever carries
+ * latitude, longitude or altitude (fix lines: status, h/v uncertainty, SVs used, TTFF, time source; POSITION_REPORT and
+ * any indication not known to be position-free are dumped as TLV ids/lengths only).
  * loc_shutdown() (SIGTERM, loc.on gone): STOP + REG_EVENTS 0 for a running session and BYE to the relay, then the
  * engine lock restore if we changed it (loc_quiet waits for it).
  */
@@ -210,6 +212,7 @@ static uint64_t sess_t0, test_until, last_fail_ind, status_at;
 static unsigned nfix_good, nfix_all, npos_sent, last_nsv, engine;
 static struct loc_fix last;
 static int have_last, status_dirty = 1;
+static uint64_t ttff_ms;		/* ws-gnss-k: session start -> first status-0 fix (0 = none yet) */
 static struct pds_state pds;
 static int pds_inited;
 /* engine lock (unlock=mi / unlock=none / repair; englock.h): its own one-request slot, sent before the queue */
@@ -776,6 +779,7 @@ static void session_start(int owner, uint32_t interval)
 	sess_interval = interval;
 	sess_t0 = link_ms();
 	nfix_all = nfix_good = 0;
+	ttff_ms = 0;
 	q_start(interval);
 	sess = 1;
 	status_dirty = 1;
@@ -1506,10 +1510,11 @@ static void write_status(void)
 		loc_sv_summary_str(&sv_last, sb, sizeof(sb));
 		fprintf(f, "loc: sv reports %u, last: %s\n", n_sv, sb);
 	}
-	if (have_last)
-		fprintf(f, "loc: last fix status %u lat %.2f lon %.2f unc %.0f m alt %.0f m tech 0x%x\n", last.status,
-			last.has_lat ? last.lat : 0.0, last.has_lon ? last.lon : 0.0, last.has_unc ? last.unc : -1.0f,
-			last.has_alt_ell ? last.alt_ell : 0.0f, last.tech);
+	if (have_last) {	/* ws-gnss-k: never latitude, longitude or altitude (project rule: no coordinates anywhere) */
+		char fb[200];
+		loc_fix_str(&last, fb, sizeof(fb));
+		fprintf(f, "loc: last fix %s\n", fb);
+	}
 	if (pds_inited)
 		fprintf(f, "loc: pds client %s pipe %u sess %u cid %u, svc %d auto %d cancelled %d, def interval %u accuracy %u, "
 			   "requests %u\n", pds.client.valid ? "known" : "none", pds.client.pipe, pds.client.sess, pds.client.cid,
@@ -1666,6 +1671,42 @@ void loc_server_gone(uint32_t node, uint32_t port)
 	status_dirty = 1;
 }
 
+/* ws-gnss-k: one fix as text WITHOUT latitude, longitude or altitude: status, horizontal/vertical uncertainty, SVs used,
+ * TTFF of this session, the engine's time source, tech mask */
+int loc_fix_str(const struct loc_fix *f, char *b, size_t n)
+{
+	int o = snprintf(b, n, "status %u", f->status);
+	if (f->has_unc && o > 0 && (size_t)o < n)
+		o += snprintf(b + o, n - (size_t)o, " hunc %.0f m", (double)f->unc);
+	if (f->has_vunc && o > 0 && (size_t)o < n)
+		o += snprintf(b + o, n - (size_t)o, " vunc %.0f m", (double)f->vunc);
+	if (o > 0 && (size_t)o < n)
+		o += snprintf(b + o, n - (size_t)o, f->has_svused ? " svs used %u" : " svs used n/a", f->sv_used);
+	if (o > 0 && (size_t)o < n) {
+		if (ttff_ms)
+			o += snprintf(b + o, n - (size_t)o, " ttff %llu.%llu s", (unsigned long long)(ttff_ms / 1000),
+				      (unsigned long long)(ttff_ms % 1000 / 100));
+		else
+			o += snprintf(b + o, n - (size_t)o, " ttff none");
+	}
+	if (o > 0 && (size_t)o < n)
+		o += snprintf(b + o, n - (size_t)o, f->has_tsrc ? " timesrc %u" : " timesrc n/a", f->time_src);
+	if (o > 0 && (size_t)o < n)
+		o += snprintf(b + o, n - (size_t)o, " tech 0x%x utc %s", f->tech, f->has_utc ? "yes" : "no");
+	return o;
+}
+
+/* ws-gnss-k: indications that may be dumped in hex (none of them can carry a position); all others get ids only */
+int loc_ind_hex_ok(uint16_t id)
+{
+	static const uint16_t ok[] = { LOC_IND_ENGINE_STATE, LOC_IND_FIX_SESSION, LOC_IND_INJECT_TIME_REQ, LOC_IND_XTRA_REQ,
+				       LOC_IND_INJECT_POS_REQ, LOC_IND_ENGINE_LOCK_STATE };
+	for (unsigned i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+		if (ok[i] == id)
+			return 1;
+	return 0;
+}
+
 static void on_position(const uint8_t *tl, uint32_t tn)
 {
 	struct loc_fix f;
@@ -1674,14 +1715,20 @@ static void on_position(const uint8_t *tl, uint32_t tn)
 		return;
 	}
 	nfix_all++;
-	if (f.status == 0 && f.has_lat && f.has_lon)
+	if (f.status == 0 && f.has_lat && f.has_lon) {
 		nfix_good++;
+		if (!ttff_ms && sess_t0)
+			ttff_ms = link_ms() - sess_t0 ? link_ms() - sess_t0 : 1;
+	}
 	last = f;
 	have_last = 1;
 	status_dirty = 1;
 	if (nfix_all <= 3 || nfix_all % 30 == 0 || f.status > 1)
-		printf("[%6llu] loc: fix #%u status %u lat %.2f lon %.2f unc %.0f m tech 0x%x utc %s\n", now_ms(), nfix_all, f.status,
-		       f.has_lat ? f.lat : 0.0, f.has_lon ? f.lon : 0.0, f.has_unc ? f.unc : -1.0f, f.tech, f.has_utc ? "yes" : "no");
+	{			/* ws-gnss-k: no latitude/longitude/altitude in any log line */
+		char fb[200];
+		loc_fix_str(&f, fb, sizeof(fb));
+		printf("[%6llu] loc: fix #%u %s\n", now_ms(), nfix_all, fb);
+	}
 	if (sess_owner != 1 || !pds.client.valid)
 		return;
 	if (f.status > 1) {	/* failure reports: at most one per 10 s */
@@ -1868,8 +1915,10 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		unsigned *c = m.id == LOC_IND_POSITION ? &n_pos_dump : m.id == LOC_IND_SV_INFO ? &n_sv_dump : &n_rfm_dump;
 		if (++*c <= 5 || *c % 60 == 0)
 			dump_ids(&m);
+	} else if (loc_ind_hex_ok(m.id)) {
+		qmi_dump(&m);	/* ws-gnss-f: indications known to carry no position in hex (engine state, fix session, ...) */
 	} else {
-		qmi_dump(&m);	/* ws-gnss-f: every other indication in hex (engine state, fix session, engine lock state, ...) */
+		dump_ids(&m);	/* ws-gnss-k: anything else (could carry a position): TLV ids/lengths only */
 	}
 	switch (m.id) {
 	case LOC_IND_POSITION:

@@ -3,6 +3,7 @@
 /* loc: sweetlocd's QMI LOC client (modem GNSS, service 0x10) on its own QRTR port of /dev/sweet-mqrtr-aux (xnu 1124), and
  * the PDS bridge for locationd (pdsemu.c) through the kernel router's relay (xnu 1122/1124). Off unless
  * /var/local/loc.on exists (re-read every 10 s). loc.c header. */
+#include <stddef.h>
 #include <stdint.h>
 #include "link.h"
 
@@ -44,4 +45,8 @@ int loc_efs_waiting(void);
 /* ws-gnss-i probe2=1: 1 once every probe2 GET is answered (sweetlocd then exits); the send whitelist */
 int loc_probe2_done(void);
 int loc_probe2_allowed(uint16_t id);
+/* ws-gnss-k: a fix as log text without latitude/longitude/altitude; hex-dump policy for indications */
+struct loc_fix;
+int loc_fix_str(const struct loc_fix *f, char *b, size_t n);
+int loc_ind_hex_ok(uint16_t id);
 #endif

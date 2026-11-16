@@ -70,6 +70,10 @@ struct loc_fix {
 	uint16_t gps_week;
 	uint32_t gps_tow_ms;
 	uint32_t tech;
+	int has_tsrc;			/* ws-gnss-k: TLV 0x29 timeSrc (qmiLocTimeSourceEnumT_v02) */
+	uint32_t time_src;
+	int has_svused;			/* ws-gnss-k: TLV 0x2c gnssSvUsedList (u8 count + u16 ids): the count only */
+	unsigned sv_used;
 };
 
 struct pds_state {
