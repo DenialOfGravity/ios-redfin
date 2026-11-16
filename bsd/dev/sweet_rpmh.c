@@ -105,6 +105,28 @@ static uint32_t rh_db_size;
 static unsigned rh_ncpt;
 static unsigned rh_lock;
 static bool rh_poisoned;
+/*
+ * 1135: kern.sweet_rpmh_recover (default 0 = unchanged: after a timeout the TCS is quarantined and every later
+ * vote fails EIO for the rest of the boot). Linux rpmh-rsc has no abort for an AMC in flight either: a request
+ * whose completion never comes keeps its TCS in tcs_in_use (it is never rewritten or cleared); it is freed only by
+ * the late tx-done IRQ, and other requests go on in the other ACTIVE TCS, a request for an address still in flight
+ * gets -EBUSY (check_for_req_inflight). Same here, never touching an incomplete TCS:
+ *   bit 0 (1): late completion. Before each vote/read entry, if the timed-out TCS now shows every command
+ *              ISSUED|COMPLETE and the TCS idle (it was not complete at the timeout, so this is fresh), it is
+ *              cleaned up exactly as a vote that completed in time (CONTROL, ENABLE, WAIT, own IRQ bit) and the
+ *              quarantine is lifted; the vote is recorded (1131). Still in flight: stays quarantined.
+ *   bit 1 (2): while exactly one TCS is quarantined after a clean timeout (all writes read back), later votes use
+ *              the other ACTIVE TCS (the stuck one is never selected: ENABLE != 0; a vote for an address still
+ *              enabled in it is refused EBUSY by the existing in-flight check). An uncertain write (EIO in the
+ *              middle of programming) or a second timeout keeps everything refused, as before.
+ */
+static unsigned rh_recover;
+static int rh_q_tcs = -1;               /* the TCS quarantined by a clean timeout, -1 none */
+static bool rh_q_hard;                  /* a state bit 1 must not bypass (uncertain write, second timeout) */
+static unsigned rh_q_n;
+static uint32_t rh_q_addr, rh_q_off[4], rh_q_val[4], rh_q_irqbit;
+SYSCTL_UINT(_kern, OID_AUTO, sweet_rpmh_recover, CTLFLAG_RW | CTLFLAG_LOCKED, &rh_recover, 0,
+    "1135: RPMh TCS timeout handling: 0 quarantine for the boot | 1 reclaim on late completion | 2 use the other ACTIVE TCS");
 
 static uint32_t
 rh_read(vm_offset_t base, uint32_t off)
@@ -327,6 +349,8 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
 	}
 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
 	rh_poisoned = true;
+	bool prev_hard = rh_q_hard;             /* 1135: an exit below other than success/clean timeout stays hard */
+	rh_q_hard = true;
 	uint32_t mask = (1u << n) - 1u;
 	printf("SWEET RPMH: TCS%u ACTIVE %u commands at %#x (first %#x=%u) irq-enable=%#x\n", t, n, address,
 	    offsets[0], values[0], irq_en);
@@ -367,6 +391,19 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
 	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
 	if (!done) {
 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+		if (rh_q_tcs < 0 && n <= 4 && !prev_hard) {   /* 1135: a clean timeout, the first one */
+			rh_q_tcs = (int)t;
+			rh_q_n = n;
+			rh_q_addr = address;
+			rh_q_irqbit = irq_en & bit;
+			for (unsigned c = 0; c < n; ++c) {
+				rh_q_off[c] = offsets[c];
+				rh_q_val[c] = values[c];
+			}
+			rh_q_hard = false;
+			printf("SWEET RPMH: 1135: TCS%u in flight at %#x; kern.sweet_rpmh_recover=%u (1 reclaim on late "
+			    "completion, 2 use the other ACTIVE TCS)\n", t, address, rh_recover);
+		}
 		return ETIMEDOUT;
 	}
 	/* Proven completion: clear trigger before mode, then free only our commands. */
@@ -379,7 +416,8 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
 	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
 		return EIO;
 	}
-	rh_poisoned = false;
+	rh_q_hard = prev_hard;                  /* 1135 */
+	rh_poisoned = rh_q_hard || rh_q_tcs >= 0;
 	for (unsigned c = 0; c < n; ++c) {
 		rh_last_note(address + offsets[c], values[c]);   /* 1131 */
 	}
@@ -394,6 +432,55 @@ rh_send(uint32_t address, unsigned mv)
 	const uint32_t offsets[3] = {0, 8, 4};
 	const uint32_t values[3] = {mv, 7, 1};
 	return rh_send_cmds(address, 3, offsets, values);
+}
+
+/* 1135: lift the quarantine of a timed-out TCS whose commands completed late (bit 0). Under rh_lock. */
+static void
+rh_reclaim(void)
+{
+	if (!(rh_recover & 1) || rh_q_tcs < 0 || !rh_tcs) {
+		return;
+	}
+	unsigned t = (unsigned)rh_q_tcs;
+	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
+	uint32_t idle = rh_read(rh_tcs, b + RH_STATUS), irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+	bool complete = idle != 0 && idle != 0xffffffffu && irq != 0xffffffffu;
+	for (unsigned c = 0; c < rh_q_n && complete; ++c) {
+		uint32_t st = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+		complete = st != 0xffffffffu && (st & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE) &&
+		    (rh_read(rh_tcs, b + c * RH_CMD_STRIDE + RH_ADDR) & ~3u) == ((rh_q_addr + rh_q_off[c]) & ~3u);
+	}
+	if (!complete) {
+		return;
+	}
+	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+		rh_q_hard = true;
+		printf("SWEET RPMH: 1135: TCS%u late completion but cleanup did not read back; stays quarantined\n", t);
+		return;
+	}
+	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
+	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
+	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | rh_q_irqbit)) {
+		rh_q_hard = true;
+		printf("SWEET RPMH: 1135: TCS%u late completion but IRQ cleanup failed; stays quarantined\n", t);
+		return;
+	}
+	for (unsigned c = 0; c < rh_q_n; ++c) {
+		rh_last_note(rh_q_addr + rh_q_off[c], rh_q_val[c]);
+	}
+	rh_q_tcs = -1;
+	rh_poisoned = rh_q_hard;
+	printf("SWEET RPMH: 1135: TCS%u completed late (irq=%#x idle=%#x); cleaned up, quarantine lifted%s\n", t, irq,
+	    idle, rh_poisoned ? " (an earlier uncertain write still blocks)" : "");
+}
+
+/* 1135: is every vote refused? (rh_poisoned, unless bit 1 and only one clean-timeout TCS is stuck). Under rh_lock. */
+static bool
+rh_blocked(void)
+{
+	rh_reclaim();
+	return rh_poisoned && !((rh_recover & 2) && rh_q_tcs >= 0 && !rh_q_hard);
 }
 
 /*
@@ -414,7 +501,7 @@ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uin
 	}
 	int error = EIO;
 	uint32_t address = 0;
-	if (!rh_poisoned) {
+	if (!rh_blocked()) {                    /* 1135 (was !rh_poisoned) */
 		error = rh_map();
 		if (!error) {
 			error = rh_lookup(res, &address);
@@ -445,7 +532,7 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
 	}
 	int error = EIO;
 	uint32_t address = 0;
-	if (rh_poisoned) {
+	if (rh_blocked()) {                     /* 1135 (was rh_poisoned) */
 		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
 		goto out;
 	}
@@ -481,7 +568,7 @@ rh_ro_ready(void)
 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 		return EBUSY;
 	}
-	int error = rh_poisoned ? EIO : rh_map();
+	int error = rh_blocked() ? EIO : rh_map();      /* 1135 */
 	if (!error) {
 		rh_ro_ok = true;
 	}
