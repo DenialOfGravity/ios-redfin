@@ -682,6 +682,30 @@ enum : uint32_t { kSkipProgram = 1, kSkipTextures = 2, kSkipTable = 4, kSkipAll 
 uint32_t drawSkip();
 void reloadDrawSkipForTesting();
 
+// (ws-hm-int12) HM_NOUC=1 (default 0: today's reads): no CPU read of a buffer's write-combined mapping (on the phone
+// MAIR 0x44, normal non-cacheable: every load ~100+ ns) on a draw's path as scattered loads. What a draw inspects on the
+// CPU (HM_DEADFILL's key, HM_CULL's CoreAnimation geometry, a constant range the table has no room to copy, an argument
+// buffer's member word) is read through cpuRead: from the buffer's cacheable shadow when it has one (Buffer::setShadow:
+// the plug-in's setBytes scratch), else with HM_NOUC=1 as one bulk copy of just the bytes needed into cacheable memory.
+// The words recorded are the same either way. Read once (noUcSetForTesting: 1, 0, or -1 the environment again).
+bool noUc();
+void noUcSetForTesting(int on);
+// N bytes of B from OFF (bounds checked: nullptr when out of range or unmapped) for the CPU to read: the shadow's bytes
+// when B has a shadow covering them; else with HM_NOUC=1 one copy into SCRATCH (at least N bytes) and SCRATCH; else
+// (HM_NOUC=0) the mapped bytes themselves, as before. Counted (ucReadStats).
+const uint8_t* cpuRead(const Buffer* b, uint64_t off, uint64_t n, void* scratch);
+// the mapped bytes of B from OFF (no copy) when the caller reads them itself: the shadow's when it has one covering
+// [OFF, OFF + N), else the write-combined mapping; *CACHED says which. Not counted (the caller counts with ucCount).
+const uint8_t* cpuView(const Buffer* b, uint64_t off, uint64_t n, bool* cached);
+// one CPU read of BYTES bytes of a buffer: KIND kUcScattered loads of the write-combined mapping where they were needed,
+// kUcBulk one copy (memcpy) of it, kUcShadow from the cacheable shadow
+enum : int { kUcScattered = 0, kUcBulk = 1, kUcShadow = 2 };
+void ucCount(int kind, uint64_t bytes);
+// the process's counts since the last ucResetForTesting: [0] scattered accesses (loads made where they were needed),
+// [1] their bytes, [2] bulk copies, [3] their bytes, [4] reads served from a shadow, [5] their bytes
+void ucReadStats(uint64_t out[6]);
+void ucResetForTesting();
+
 }  // namespace render
 
 }  // namespace hakios::metal

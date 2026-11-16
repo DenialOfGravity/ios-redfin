@@ -615,6 +615,17 @@ void hakios_metal_buffer_free(hakios_metal_buffer* b) { delete b; }
 void* hakios_metal_buffer_contents(hakios_metal_buffer* b) { return b->buffer->contents(); }
 uint64_t hakios_metal_buffer_length(hakios_metal_buffer* b) { return b->buffer->length(); }
 uint64_t hakios_metal_buffer_gpu_address(hakios_metal_buffer* b) { return b->buffer->gpuAddress(); }
+// (ws-hm-int12) HM_NOUC
+int hakios_metal_nouc(void) { return render::noUc() ? 1 : 0; }
+int hakios_metal_buffer_set_shadow(hakios_metal_buffer* b, const void* bytes, uint64_t length) {
+    if (b == nullptr || bytes == nullptr || length == 0 || length > b->buffer->length()) return -1;
+    b->buffer->setShadow(bytes, length);
+    return 0;
+}
+const void* hakios_metal_buffer_read(hakios_metal_buffer* b, uint64_t offset, uint64_t length, void* scratch) {
+    return b != nullptr ? render::cpuRead(b->buffer.get(), offset, length, scratch) : nullptr;
+}
+void hakios_metal_uc_stats(uint64_t out[6]) { render::ucReadStats(out); }
 
 // --- textures and samplers ---------------------------------------------------------------------------------------------
 

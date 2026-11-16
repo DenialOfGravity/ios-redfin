@@ -4781,12 +4781,42 @@ HM_PLUGCPU_EDITS = [
 ]
 
 
+# (ws-hm-int12) HM_NOUC=1 (the core's switch, hakios_metal_nouc; default 0: as before): the plug-in reads no buffer
+# memory load by load on a draw's path. The GPU's buffers are mapped write-combined, on the phone normal non-cacheable
+# memory (MAIR 0x44): every CPU load of them goes to DRAM.
+#   - -setVertexBytes:/-setFragmentBytes:'s scratch buffer: the bytes, written once, also kept as the core's cacheable
+#     shadow of it (hakios_metal_buffer_set_shadow), which the core's draw-time reads (HM_DEADFILL's key, HM_CULL's
+#     geometry) and the specialisation key below then take instead of the mapping
+#   - the specialisation key (hakiosProgramFor): the configuration's _specLength bytes taken once through
+#     hakios_metal_buffer_read (the shadow, or one bulk copy into the stack), then masked and compared there: was one
+#     single-byte load of the mapping per masked byte (~52 a draw), twice on a miss of HM_PLUG_FAST's remembered key
+# Applied to the finished text, after the plug-fast edits.
+HM_NOUC_EDITS = [
+    ('index:(NSUInteger)index\n{\n\tHakiosMetalBuffer *buffer = [[self device] newBufferWithBytes:bytes length:length options:0];\n\n\tif (buffer == nil) {\n',
+     'index:(NSUInteger)index\n{\n\tHakiosMetalBuffer *buffer = [[self device] newBufferWithBytes:bytes length:length options:0];\n\n'
+     '\tif (buffer != nil && bytes != NULL && hakios_metal_nouc() && [buffer hakiosBuffer] != NULL) {   /* (ws-hm-int12) HM_NOUC */\n'
+     '\t\t(void)hakios_metal_buffer_set_shadow([buffer hakiosBuffer], bytes, length);\n'
+     '\t}\n'
+     '\tif (buffer == nil) {\n'),
+    ('\t\treturn wait ? NULL : _program;\n\t}\n\tconst int hmMasked = __atomic_load_n(&_specMaskRead, __ATOMIC_ACQUIRE) >= 0;',
+     '\t\treturn wait ? NULL : _program;\n\t}\n'
+     '\tunsigned char hmNoucKey[256];   /* (ws-hm-int12) HM_NOUC: the configuration read once, into cacheable memory */\n'
+     '\tif (hakios_metal_nouc() && _specLength <= sizeof(hmNoucKey)) {\n'
+     '\t\tconst uint8_t *k = (const uint8_t *)hakios_metal_buffer_read(buffers[_specBinding], at, _specLength, hmNoucKey);\n\n'
+     '\t\tif (k != NULL) bytes = (const uint8_t *)((uintptr_t)k - (uintptr_t)at);   /* (bytes[at + i] below: K[i]) */\n'
+     '\t}\n'
+     '\tconst int hmMasked = __atomic_load_n(&_specMaskRead, __ATOMIC_ACQUIRE) >= 0;'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
     src = apply(src, HM_PLUGCPU_EDITS)   # (ws-hm-plugcpu) on the finished text
+    src = apply(src, HM_NOUC_EDITS)   # (ws-hm-int12) HM_NOUC
     open(sys.argv[2], 'w').write(src)
-    print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS)))
+    print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
+                                                                                      len(HM_NOUC_EDITS)))
 
 
 if __name__ == '__main__':

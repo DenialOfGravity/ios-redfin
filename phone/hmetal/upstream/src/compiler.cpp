@@ -2876,7 +2876,10 @@ bool bindArgumentBuffers(const std::vector<Resource>& resources, Bindings* b, st
             return false;
         }
         uint64_t word = 0;
-        memcpy(&word, static_cast<const uint8_t*>(set.buffer->contents()) + set.offset + r.argbufOffset, 8);
+        // (ws-hm-int12) HM_NOUC: through cpuRead (the shadow, or one 8-byte copy; counted)
+        if (const uint8_t* w = render::cpuRead(set.buffer, set.offset + r.argbufOffset, 8, &word); w != reinterpret_cast<const uint8_t*>(&word)) {
+            memcpy(&word, w != nullptr ? w : static_cast<const uint8_t*>(set.buffer->contents()) + set.offset + r.argbufOffset, 8);
+        }
         if (word == 0) continue;
         switch (r.kind) {
         case Resource::kConstantBuffer:

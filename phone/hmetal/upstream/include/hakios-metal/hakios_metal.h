@@ -156,6 +156,17 @@ void hakios_metal_buffer_free(hakios_metal_buffer *buffer);
 void *hakios_metal_buffer_contents(hakios_metal_buffer *buffer);
 uint64_t hakios_metal_buffer_length(hakios_metal_buffer *buffer);
 uint64_t hakios_metal_buffer_gpu_address(hakios_metal_buffer *buffer);
+/* (ws-hm-int12) HM_NOUC=1 (default 0): the CPU reads no buffer's write-combined (on the phone non-cacheable) mapping
+ * load by load on a draw's path. hakios_metal_nouc: the switch (read once). hakios_metal_buffer_set_shadow: LENGTH bytes
+ * the caller has just written at the buffer's start and will never write again (setBytes' scratch), kept in cacheable
+ * memory for the CPU's reads; 0, or -1 when LENGTH is 0 or past the buffer. hakios_metal_buffer_read: LENGTH bytes at
+ * OFFSET for the CPU to read -- the shadow's, or under HM_NOUC=1 one copy into SCRATCH (at least LENGTH bytes), or
+ * (HM_NOUC=0) the mapping itself; NULL when the range lies outside the buffer. hakios_metal_uc_stats: the process's CPU
+ * reads of buffer memory, [0] in place [1] their bytes [2] bulk copies [3] their bytes [4] from shadows [5] their bytes. */
+int hakios_metal_nouc(void);
+int hakios_metal_buffer_set_shadow(hakios_metal_buffer *buffer, const void *bytes, uint64_t length);
+const void *hakios_metal_buffer_read(hakios_metal_buffer *buffer, uint64_t offset, uint64_t length, void *scratch);
+void hakios_metal_uc_stats(uint64_t out[6]);
 
 /* a .metallib's bytes (thin or universal), copied; NULL when the file does not hold together, with the reason */
 hakios_metal_library *hakios_metal_library_open(const void *data, size_t size);

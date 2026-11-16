@@ -85,6 +85,13 @@ public:
     // whether it came from there
     bool recyclable() const { return recyclable_; }
     bool reused() const { return reused_; }
+    // (ws-hm-int12) HM_NOUC: a cacheable copy of the buffer's first N bytes, for a buffer whose bytes the CPU writes once
+    // as it is made and never again (the plug-in's -setVertexBytes:/-setFragmentBytes: scratch): the caller has written
+    // the same N bytes into contents(). The core's CPU reads of the buffer (render::cpuRead) take them from here instead
+    // of the write-combined (on the phone: non-cacheable) mapping. Set once, before the buffer is bound; never changed.
+    void setShadow(const void* bytes, uint64_t n);
+    const uint8_t* shadow() const { return shadow_.empty() ? nullptr : shadow_.data(); }
+    uint64_t shadowLength() const { return shadow_.size(); }
 
 private:
     friend std::shared_ptr<Buffer> newBuffer(Gpu&, uint64_t, std::string*, PoolKind, bool);
@@ -94,6 +101,7 @@ private:
     PoolKind kind_ = kPoolApp;
     bool recyclable_ = false;
     bool reused_ = false;
+    std::vector<uint8_t> shadow_;   // (ws-hm-int12) HM_NOUC
 };
 
 // RECYCLABLE (ws-hm-pool): memory whose old contents nobody may read (a render target's, undefined when made, as

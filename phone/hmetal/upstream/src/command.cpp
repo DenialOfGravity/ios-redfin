@@ -102,6 +102,10 @@ uint64_t poolKeepBytes() {   // (ws-hm-pool) HM_POOL_KEEP_MB
 Buffer::~Buffer() {
     if (counted_ != 0) gPoolBytes[kind_] -= counted_;
 }
+void Buffer::setShadow(const void* bytes, uint64_t n) {   // (ws-hm-int12) HM_NOUC
+    if (bytes == nullptr || n == 0 || n > length_) return;
+    shadow_.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + n);
+}
 void Buffer::countAs(PoolKind kind) {
     if (counted_ != 0) gPoolBytes[kind_] -= counted_;
     kind_ = kind;

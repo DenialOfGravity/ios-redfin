@@ -645,7 +645,14 @@ bool placeCopies(std::vector<PushedRange>* ranges, uint32_t* at, const Stage& st
         }
         r.copy = false;
         r.words.assign(r.units * 4, 0u);
-        memcpy(r.words.data(), static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset, r.padded ? 4ull * r.padDwords : 16ull * r.units);
+        // (ws-hm-int12) through cpuRead: the shadow, or (HM_NOUC=1) one copy straight into the words; counted
+        const uint64_t nb = r.padded ? 4ull * r.padDwords : 16ull * r.units;
+        const uint8_t* src = render::cpuRead(r.buffer, r.bufferOffset, nb, r.words.data());
+        if (src == nullptr) {
+            src = static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset;
+            render::ucCount(render::kUcBulk, nb);
+        }
+        if (src != reinterpret_cast<const uint8_t*>(r.words.data())) memcpy(r.words.data(), src, nb);
     }
     return true;
 }
@@ -3102,6 +3109,53 @@ std::atomic<uint32_t> gDrawSkip{parseDrawSkip()};
 
 uint32_t drawSkip() { return gDrawSkip.load(std::memory_order_relaxed); }
 void reloadDrawSkipForTesting() { gDrawSkip.store(parseDrawSkip()); }
+
+// (ws-hm-int12) HM_NOUC
+namespace {
+bool parseNoUc() {
+    const char* e = getenv("HM_NOUC");
+    return e != nullptr && e[0] != 0 && atoi(e) != 0;
+}
+std::atomic<bool> gNoUc{parseNoUc()};
+std::atomic<uint64_t> gUc[6];
+}  // namespace
+bool noUc() { return gNoUc.load(std::memory_order_relaxed); }
+void noUcSetForTesting(int on) { gNoUc.store(on < 0 ? parseNoUc() : on != 0); }
+void ucCount(int kind, uint64_t bytes) {
+    gUc[2 * kind].fetch_add(1, std::memory_order_relaxed);
+    gUc[2 * kind + 1].fetch_add(bytes, std::memory_order_relaxed);
+}
+void ucReadStats(uint64_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = gUc[i].load(std::memory_order_relaxed);
+}
+void ucResetForTesting() {
+    for (auto& c : gUc) c.store(0);
+}
+const uint8_t* cpuView(const Buffer* b, uint64_t off, uint64_t n, bool* cached) {
+    *cached = false;
+    if (b == nullptr || off > b->length() || n > b->length() - off) return nullptr;
+    if (noUc() && b->shadow() != nullptr && off <= b->shadowLength() && n <= b->shadowLength() - off) {
+        *cached = true;
+        return b->shadow() + off;
+    }
+    return b->contents() != nullptr ? static_cast<const uint8_t*>(b->contents()) + off : nullptr;
+}
+const uint8_t* cpuRead(const Buffer* b, uint64_t off, uint64_t n, void* scratch) {
+    bool cached = false;
+    const uint8_t* p = cpuView(b, off, n, &cached);
+    if (p == nullptr) return nullptr;
+    if (cached) {
+        ucCount(kUcShadow, n);
+        return p;
+    }
+    if (noUc() && scratch != nullptr) {
+        memcpy(scratch, p, size_t(n));
+        ucCount(kUcBulk, n);
+        return static_cast<const uint8_t*>(scratch);
+    }
+    ucCount(kUcScattered, n);
+    return p;
+}
 }  // namespace render
 
 // (redfin hmv4) The extended-range colour attachments of a pass (HM_XR_RT=1): each replaced by its RGBA16Float companion
@@ -3409,7 +3463,11 @@ std::vector<uint8_t> deadFillKey(const Program& program, const Draw& d, const Bi
         if (b.buffer != nullptr && len <= 4096 && b.buffer->contents() != nullptr) {
             const uint64_t tag = len;
             add(&tag, sizeof tag);
-            add(static_cast<const uint8_t*>(b.buffer->contents()) + b.offset, size_t(len));
+            // (ws-hm-int12) HM_NOUC: the shadow's bytes when the buffer has one (setBytes); else one bulk read as before
+            bool cached = false;
+            const uint8_t* p = render::cpuView(b.buffer, b.offset, len, &cached);
+            render::ucCount(cached ? render::kUcShadow : render::kUcBulk, len);
+            add(p, size_t(len));
         } else {
             add(&b.buffer, sizeof b.buffer);
             add(&b.offset, sizeof b.offset);
@@ -3480,13 +3538,44 @@ void cullStats(uint64_t out[8]) {
 
 namespace {
 
-// what a buffer binding holds from its offset: its bytes on the processor, or nothing
-const uint8_t* bindingBytes(const Binding& b, uint64_t* len) {
-    *len = 0;
-    if (b.buffer == nullptr || b.buffer->contents() == nullptr || b.buffer->length() <= b.offset) return nullptr;
-    *len = b.buffer->length() - b.offset;
-    return static_cast<const uint8_t*>(b.buffer->contents()) + b.offset;
-}
+// (ws-hm-int12) HM_NOUC: a binding's bytes as caGeometry loads them. In place (HM_NOUC=0: each load a read of the
+// write-combined mapping, as before; or the buffer's cacheable shadow), or with HM_NOUC=1 the range a draw needs copied
+// once into WIN (prefetch) and the loads served from there; a load outside the window reads in place (counted).
+struct GeoSrc {
+    const uint8_t* p = nullptr;
+    uint64_t len = 0;
+    bool cached = false;
+    uint64_t lo = 0, hi = 0;   // [lo, hi) of p copied into win
+    uint8_t win[2048];
+    bool open(const Buffer* b, uint64_t offset) {
+        len = 0;
+        if (b == nullptr || b->contents() == nullptr || b->length() <= offset) return false;
+        len = b->length() - offset;
+        p = render::cpuView(b, offset, len, &cached);
+        return p != nullptr;
+    }
+    bool open(const Binding& b) { return open(b.buffer, b.offset); }
+    // (HM_NOUC=1, not a shadow) [A, B) copied once, clamped to the binding
+    void prefetch(uint64_t a, uint64_t b) {
+        b = std::min(b, len);
+        if (cached || !render::noUc() || b <= a || b - a > sizeof win) return;
+        memcpy(win, p + a, size_t(b - a));
+        lo = a, hi = b;
+        render::ucCount(render::kUcBulk, b - a);
+    }
+    // N bytes at O (the caller checked O + N <= len)
+    void get(uint64_t o, void* dst, size_t n) {
+        if (cached) {
+            render::ucCount(render::kUcShadow, n);
+            memcpy(dst, p + o, n);
+        } else if (o >= lo && o + n <= hi) {
+            memcpy(dst, win + (o - lo), n);
+        } else {
+            render::ucCount(render::kUcScattered, n);
+            memcpy(dst, p + o, n);
+        }
+    }
+};
 
 // CoreAnimation's fixed_vert_lph_spc geometry in pixels: the box of its vertices (X0 Y0 X1 Y1, not rounded), and
 // whether they are exactly one rectangle drawn once (RECT). False when not known.
@@ -3500,18 +3589,18 @@ bool caGeometry(const Program& p, const Draw& d, const Bindings& vs, double box[
     if ((a.format != VertexFormat::kFloat4 && a.format != VertexFormat::kFloat2) || a.bufferIndex >= vs.buffers.size()) return false;
     const VertexLayout& layout = p.vertexDescriptor.layouts[a.bufferIndex];
     if (layout.step != VertexStep::kPerVertex || layout.stride == 0) return false;
-    uint64_t len = 0;
-    const uint8_t* src = bindingBytes(vs.buffers[a.bufferIndex], &len);
-    if (src == nullptr) return false;
+    GeoSrc src;   // (ws-hm-int12) HM_NOUC: was the mapped bytes, loaded in place
+    if (!src.open(vs.buffers[a.bufferIndex])) return false;
+    const uint64_t len = src.len;
     // the transform: the first vertex binding other than the position's, 16 floats (as SweetMetal2's dfTransform)
     const float* m = nullptr;
     float mat[16];
     for (uint32_t k = 0; k < 8 && k < vs.buffers.size(); k++) {
         if (k == a.bufferIndex || vs.buffers[k].buffer == nullptr) continue;
-        uint64_t ml = 0;
-        const uint8_t* mb = bindingBytes(vs.buffers[k], &ml);
-        if (mb == nullptr || ml < 64 || (vs.buffers[k].offset & 3) != 0) return false;
-        memcpy(mat, mb, sizeof mat);
+        GeoSrc mb;   // (ws-hm-int12) HM_NOUC: one copy of the 64 bytes (or the shadow's)
+        if (!mb.open(vs.buffers[k]) || mb.len < 64 || (vs.buffers[k].offset & 3) != 0) return false;
+        mb.prefetch(0, 64);
+        mb.get(0, mat, sizeof mat);
         m = mat;
         break;
     }
@@ -3527,29 +3616,50 @@ bool caGeometry(const Program& p, const Draw& d, const Bindings& vs, double box[
     if (!std::isfinite(vp.x) || !std::isfinite(vp.y) || !std::isfinite(vp.width) || !std::isfinite(vp.height) || !(vp.width > 0) || !(vp.height > 0)) {
         return false;
     }
-    const uint8_t* ix = nullptr;
+    GeoSrc ixs;   // (ws-hm-int12) HM_NOUC: the indices copied once, then the vertices they name (prefetch below)
+    const bool indexed = d.indexBuffer != nullptr;
     uint64_t ilen = 0;
-    if (d.indexBuffer != nullptr) {
+    if (indexed) {
         if (d.indexBuffer->contents() == nullptr || d.indexOffset >= d.indexBuffer->length()) return false;
-        ix = static_cast<const uint8_t*>(d.indexBuffer->contents()) + d.indexOffset;
-        ilen = d.indexBuffer->length() - d.indexOffset;
+        if (!ixs.open(d.indexBuffer, d.indexOffset)) return false;
+        ilen = ixs.len;
+        ixs.prefetch(0, uint64_t(d.vertexCount) * (d.indexType == 0 ? 2 : 4));
+    }
+    if (render::noUc() && !src.cached) {
+        // the vertices' span (the loop below still checks every index and vertex as before)
+        int64_t vmin = INT64_MAX, vmax = -1;
+        for (uint32_t k = 0; k < d.vertexCount; k++) {
+            int64_t v;
+            if (indexed) {
+                const uint64_t isz = d.indexType == 0 ? 2 : 4;
+                if ((k + 1) * isz > ilen) break;
+                uint32_t t = 0;
+                ixs.get(k * isz, &t, size_t(isz));
+                v = int64_t(t) + d.baseVertex;
+            } else {
+                v = int64_t(d.vertexStart) + k;
+            }
+            if (v < 0) continue;
+            vmin = std::min(vmin, v), vmax = std::max(vmax, v);
+        }
+        if (vmax >= 0) src.prefetch(uint64_t(vmin) * layout.stride + a.offset, uint64_t(vmax) * layout.stride + a.offset + (a.format == VertexFormat::kFloat4 ? 16 : 8));
     }
     const uint32_t comps = a.format == VertexFormat::kFloat4 ? 4 : 2;
     double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
     float vx[6] = {}, vy[6] = {}, z0 = 0;
     for (uint32_t k = 0; k < d.vertexCount; k++) {
         int64_t v;
-        if (ix != nullptr) {
+        if (indexed) {
             if (d.indexType == 0) {
                 if ((k + 1) * 2 > ilen) return false;
                 uint16_t t;
-                memcpy(&t, ix + k * 2, 2);
+                ixs.get(k * 2, &t, 2);
                 if (t == 0xffff) return false;   // (primitive restart)
                 v = t;
             } else {
                 if ((k + 1) * 4 > ilen) return false;
                 uint32_t t;
-                memcpy(&t, ix + k * 4, 4);
+                ixs.get(k * 4, &t, 4);
                 if (t == 0xffffffffu) return false;
                 v = t;
             }
@@ -3561,7 +3671,7 @@ bool caGeometry(const Program& p, const Draw& d, const Bindings& vs, double box[
         const uint64_t o = uint64_t(v) * layout.stride + a.offset;
         if (o + comps * 4 > len) return false;
         float q[4] = {0, 0, 0, 1};
-        memcpy(q, src + o, comps * 4);
+        src.get(o, q, comps * 4);
         if (q[3] != 1 || !std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2])) return false;
         if (k == 0) {
             z0 = q[2];
@@ -4171,8 +4281,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     bool df2Victim = false, df2Full = false;
     uint8_t df2Writes = 0, df2Over = 0;
     uint64_t df2Px = 0;
+    PassCullNote df2Note;   // (ws-hm-int12) HM_NOUC: HM_CULL's note of this draw is this one (start and label aside)
+    bool df2Noted = false;
     if (dfMode >= 2 && cullPassOk(pass)) {
         const PassCullNote cn = cullNote(program, pass, d, *vsb, *fsb, 0, false);
+        if (render::noUc()) df2Note = cn, df2Noted = true;
         df2Victim = cn.victim && cn.r[0] < cn.r[2] && cn.r[1] < cn.r[3];
         df2Writes = cn.writes;
         df2Full = cn.cover && cn.full;
@@ -4430,7 +4543,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     }
     if (open_->cullOk && &into == &stream_) {
         // (ws-hm-cull) HM_CULL: this draw noted, with where its draw packets are (before any stamp after it)
-        open_->cull.push_back(cullNote(program, pass, d, *vsb, *fsb, cullStart, cullDdOn()));
+        if (df2Noted) {
+            // (ws-hm-int12) HM_NOUC: the note HM_DEADFILL=2 made of this draw above (the same draw, bindings and pass:
+            // cullNote again would load its geometry a second time)
+            df2Note.start = cullStart;
+            if (cullDdOn()) df2Note.name = program.name != nullptr ? program.name : "?";
+            open_->cull.push_back(std::move(df2Note));
+        } else {
+            open_->cull.push_back(cullNote(program, pass, d, *vsb, *fsb, cullStart, cullDdOn()));
+        }
         PassCullNote& cn = open_->cull.back();
         if (!cullFindDraws(stream_, cullStart, &cn)) cn.victim = false;
     }

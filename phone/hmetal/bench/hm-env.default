@@ -87,6 +87,10 @@ HM_PREWARM=1
 # not a read). "prof: cull ..." with HM_PROF; "dd: cull..." lines with HM_DD=1. Plain lines are backboardd's.
 #HM_DEADFILL=2
 #HM_CULL=2
+# (ws-hm-int12) HM_NOUC=1 (default 0): no draw-time CPU loads of GPU buffer memory (mapped write-combined = non-cacheable
+# here): setBytes data kept in a cacheable shadow, other buffers read in one bulk copy; same command stream. Best with
+# HM_CULL / HM_DEADFILL=2 (their geometry reads) and the uber-shader key. Plain lines are backboardd's.
+#HM_NOUC=1
 # two-plane YCbCr ('420f'/'420v') surfaces: native = decoded on the GPU by ycbcr_decode (default); cpu = the processor copy
 #*:HM_YCBCR=cpu
 # an unseen configuration of a denied uber shader specialised on the queue, its draws left out meanwhile (default 0: waited for)
