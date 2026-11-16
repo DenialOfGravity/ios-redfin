@@ -1021,6 +1021,41 @@ static struct { uint16_t id; uint8_t len; uint8_t val[CFG_MAX]; } nfc_cfg[CFG_N]
 static unsigned nfc_cfg_n;
 static int persona_st = -1;             /* 1128: last init-table step index seen (-1 = none this session) */
 static int gw_crc_next;                 /* 1132: 1/2 = chip CRC on/off after the reply now being built; gw_lock */
+/*
+ * 1134: why the ReInit after A0 BF = 01 ends in CORE_RESET + Power 0 (phone run v15, k15). Every reply of the
+ * ReInit (0x212532618) was taken (CRCs right, no timeout); the 2F 03 ReApplyHsuBr and ChipScope SET_CONFIG steps are
+ * skipped by host-side conditions, not by a reply. GetNfceeIntfCfgProc (0x1f5179324) turned our A0 ED = 00 into
+ * ctx+0x146 = 2 (eSE off); with 0x145..0x148 all 2, ReInitializeComplete (0x1f51432dc) runs the static feature
+ * config sequence 0x2125325a8 (SetStandbyMode = our 2F 00 01 01, NfceeDisable x4 and FlushSramData send nothing),
+ * then phLibNfc_staticFeatureCfgComplete (0x1f5141880) -> VerifySEStatus (0x1f5141990). During the first init the
+ * init callback (ctx+0x16e8) is still set and 0x146 = 2 passes; after it (ReInit) the test is
+ * (0x146 != 1) == (ctx+0x1d0 bit 1), and nfcd's SE config has bit 1 set (it is what SwpIntfControl writes as
+ * SET_CONFIG A0 ED = 01: the eSE on SWP2): an eSE that is expected but not connected -> 0xFF -> "NFCC Re-Init
+ * failed" -> DeInitialize (CORE_RESET 0.3 ms later) + Power 0 -> init again (9 rounds) -> nfrestore DownloadRequest(1).
+ * ctx+0x146 = 1 is set only by the SE notification handler (phLibNfc_SENtfHandler 0x1f51332ec) for a connected eSE
+ * NFCEE (id 0xC0), so a persona without an eSE cannot pass the ReInit. Variants (kern.sweet_nfc_fwif_fmt):
+ *   bit 8 (0x100) virtual eSE: GET_CONFIG A0 EC/ED/D4 answers the value the host set (SwpIntfControl) and
+ *                 NFCEE_DISCOVER (enable) reports 1 NFCEE for A0 ED = 01: NTF 62 00 {C0, 00 enabled, 1 protocol
+ *                 00 APDU, 0 TLVs}; NFCEE_MODE_SET (22 01) answered OK (NCI 1.0: no NTF). Nothing reaches the chip.
+ *   bit 9 (0x200) the same, only while the chip CRC is on (the ReInit after A0 BF = 01; the first init unchanged).
+ * Default 0 = k15 behaviour. Each ReInit step gets a klog line `persona: 1134: ReInit #N step S <name>`.
+ */
+static int persona_ri = -1;             /* 1134: -1 no ReInit; 0..10 ReInit step; 50 static cfg seen; 60 DeInit; gw_lock */
+static unsigned persona_ri_hsu, persona_ri_n, ri_said;
+static uint8_t swp_set[3], swp_have;    /* 1134: last SET_CONFIG value of A0EC/A0ED/A0D4 (bit i of swp_have = valid) */
+
+static int
+swp_idx(uint16_t id)
+{
+	return id == 0xa0ec ? 0 : id == 0xa0ed ? 1 : id == 0xa0d4 ? 2 : -1;
+}
+
+/* 1134: the virtual eSE is on (kern.sweet_nfc_fwif_fmt 0x100, or 0x200 while the chip CRC is on) */
+static bool
+vese_on(void)
+{
+	return (nfc_fwif_fmt & 0x100) || ((nfc_fwif_fmt & 0x200) && gw.chip_crc);
+}
 
 static unsigned
 cfg_default(uint16_t id, uint8_t *v)
@@ -1065,6 +1100,10 @@ cfg_get(uint16_t id, uint8_t *v, bool *ovr)
 		}
 	}
 	*ovr = false;
+	if (vese_on() && swp_idx(id) >= 0 && (swp_have >> swp_idx(id) & 1)) {        /* 1134 */
+		v[0] = swp_set[swp_idx(id)];
+		return 1;
+	}
 	return cfg_default(id, v);
 }
 
@@ -1215,13 +1254,96 @@ persona_step_of(const uint8_t *p, unsigned n, const char **name)
 }
 
 /* 1128: one klog line naming the init step, with what the stack does next where it is known. gw_lock held. */
+/* 1134: the ReInit sequence 0x212532618 (after SET_CONFIG A0 BF = 01): one klog line per step. True = handled. */
+static bool
+persona_ri_say(const uint8_t *p, unsigned n)
+{
+	uint16_t op = (uint16_t)((p[0] & 0x0fu) << 8 | (p[1] & 0x3fu));
+	const char *name = NULL;
+	char extra[200];
+	int st = persona_ri;
+	bool say;
+
+	extra[0] = 0;
+	if (op == 0x000) {
+		if (persona_ri >= 0) {
+			st = 60;
+			name = "DeInitialize (CORE_RESET): the stack gave up on the ReInit";
+			snprintf(extra, sizeof(extra), " after step %d%s", persona_ri, persona_ri == 50 ?
+			    " (static feature cfg -> VerifySEStatus failed: eSE expected, ctx+0x146 != 1)" : "");
+		} else if (gw.chip_crc) {
+			st = 0;
+			persona_ri_hsu = 0;
+			persona_ri_n++;
+			name = "ReInitialize (CORE_RESET, chip CRC on)";
+		} else {
+			return false;
+		}
+	} else if (persona_ri < 0 || persona_ri >= 60) {
+		return false;
+	} else if (op == 0x001) {
+		st = 2;
+		name = "ReInitialize (CORE_INIT; step 1 CrcConfig is host-only)";
+	} else if (op == 0xf02) {
+		st = 3;
+		name = "EnablePropExtn (2F 02)";
+	} else if (op == 0xf03) {
+		st = persona_ri_hsu++ ? 5 : 4;
+		name = st == 4 ? "ReConfigHsuBr (2F 03)" : "ReApplyHsuBr (2F 03)";
+	} else if (op == 0x002) {
+		st = st < 6 ? 6 : 7;
+		name = "SetChipScopeLogCfg (SET_CONFIG)";
+	} else if (op == 0x003) {
+		uint8_t a[CFG_MAX], b[CFG_MAX];
+		bool o;
+		bool want = (swp_have & 2) && swp_set[1] != 0;
+
+		(void)cfg_get(0xa0ec, a, &o);
+		(void)cfg_get(0xa0ed, b, &o);
+		st = 8;
+		name = "GetNfceeIntfCfg (GET_CONFIG A0 EC/ED)";
+		snprintf(extra, sizeof(extra), ": A0EC %02x A0ED %02x (host set A0ED %s) -> %s", a[0], b[0],
+		    (swp_have & 2) ? (swp_set[1] ? "01" : "00") : "?",
+		    b[0] != 0 ? "eSE pending (0x146 = 3): NFCEE discovery next" :
+		    want ? "eSE off (0x146 = 2) but expected: ReInit will fail at VerifySEStatus (fwif_fmt 0x100/0x200 = virtual eSE)" :
+		    "eSE off, not expected: static feature cfg next");
+	} else if (op == 0x200) {
+		bool en = n > 3 && p[3] != 0;
+
+		st = en ? 10 : 9;
+		name = en ? "EnableNfceeDisc (NFCEE_DISCOVER enable)" : "ReInitDisableNfceeDisc (NFCEE_DISCOVER disable)";
+		if (en) {
+			snprintf(extra, sizeof(extra), ": %s", vese_on() && (swp_have & 2) && swp_set[1] ?
+			    "virtual eSE C0 reported (connected)" : "0 NFCEEs");
+		}
+	} else if (op == 0x201) {
+		name = "NFCEE_MODE_SET";
+	} else if (op == 0xf00) {
+		st = 50;
+		name = "ReInitializeComplete -> static feature cfg: SetStandbyMode (2F 00), then VerifySEStatus";
+	} else {
+		name = "not a ReInit-table command";
+	}
+	say = ri_said < 200;
+	if (say) {
+		ri_said++;
+		SAY("persona: 1134: ReInit #%u step %d %s%s\n", persona_ri_n, st, name, extra);
+	}
+	persona_ri = st;
+	return true;
+}
+
 static void
 persona_step_say(const uint8_t *p, unsigned n)
 {
 	const char *name;
-	int st = persona_step_of(p, n, &name);
+	int st;
 	char extra[96];
 
+	if (persona_ri_say(p, n)) {     /* 1134 */
+		return;
+	}
+	st = persona_step_of(p, n, &name);
 	extra[0] = 0;
 	if (st < 0) {
 		if (name && persona_said < 400) {
@@ -1249,7 +1371,8 @@ persona_step_say(const uint8_t *p, unsigned n)
 		    (a[0] | b[0] | c[0]) == 0 ? "SWP off: no NFCEE_DISCOVER, next step 19 InitializeComplete" :
 		    "NFCEE_DISCOVER (step 18) next");
 	} else if (st == 18) {
-		snprintf(extra, sizeof(extra), ": 0 NFCEEs, next step 19 InitializeComplete");
+		snprintf(extra, sizeof(extra), "%s", vese_on() && (swp_have & 2) && swp_set[1] && n > 3 && p[3] ?
+		    ": 1134 virtual eSE C0 reported, the SE handler completes init" : ": 0 NFCEEs, next step 19 InitializeComplete");
 	}
 	persona_st = st;
 	if (persona_said < 400) {
@@ -1287,6 +1410,10 @@ persona_set_config(const uint8_t *p, unsigned n)
 		}
 		if (id >= 0xa000 && (nfc_fwif_fmt & 0x10) && l > 0 && cfg_put(id, p + i, l)) {
 			kept++;
+		}
+		if (swp_idx(id) >= 0 && l >= 1) {       /* 1134: what SwpIntfControl asked for (the host's SE config) */
+			swp_set[swp_idx(id)] = p[i];
+			swp_have |= (uint8_t)(1u << swp_idx(id));
 		}
 		if (id == 0xa0bf && l >= 1 && !(nfc_fwif_fmt & 0x40)) {
 			/* 1132: CRC check config. The RSP to this SET_CONFIG goes out without CRC (the host sets its check
@@ -1471,8 +1598,35 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 		}
 		case 0x0200:
 			r[len++] = 0x00;
+			if (vese_on() && (swp_have & 2) && swp_set[1] != 0) {  /* 1134: virtual eSE on SWP2 */
+				bool en = n > 3 && p[3] != 0;
+				const uint8_t nt[8] = { 0x62, 0x00, 0x05, 0xc0, 0x00, 0x01, 0x00, 0x00 };
+
+				r[len++] = en ? 0x01 : 0x00;
+				r[2] = (uint8_t)(len - 3);
+				out_put(out, no, cap, r, len);
+				if (en) {
+					out_put(out, no, cap, nt, sizeof(nt));
+				}
+				persona_note(0x0200);
+				persona_step_say(p, n);
+				if (ri_said < 200) {
+					ri_said++;
+					SAY("persona: 1134: NFCEE_DISCOVER %s: OK, %s%s\n", en ? "enable" : "disable",
+					    en ? "1 NFCEE + NTF [62 00 05 c0 00 01 00 00] (virtual eSE C0, enabled, APDU)" : "0 NFCEEs",
+					    gw.crc_out ? " +CRC16" : "");
+				}
+				return true;
+			}
 			r[len++] = 0x00;
 			what = "NFCEE_DISCOVER: OK, 0 NFCEEs (end of the init sequence)";
+			break;
+		case 0x0201:
+			if (!vese_on()) {
+				return false;
+			}
+			r[len++] = 0x00;        /* 1134: NFCEE_MODE_SET for the virtual eSE: OK (NCI 1.0, no NTF) */
+			what = "1134: NFCEE_MODE_SET (virtual eSE): OK";
 			break;
 		default:
 			return false;
@@ -1859,6 +2013,9 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
 		persona_said = 0;       /* 1127: and the persona lines */
 	}
 	persona_st = -1;                /* 1128: init steps counted per session */
+	persona_ri = -1;                /* 1134 */
+	persona_ri_n = ri_said = 0;
+	swp_have = 0;
 	lck_mtx_unlock(&gw_lock);
 	SAY("com.apple.uart.stockholm: OPEN by %s (pid %d), unit %u, gateway mode %u\n", who, proc_selfpid(), sac->sc_unit,
 	    nfc_gw_mode);
@@ -2217,6 +2374,10 @@ sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v)
 				gw.chip_crc = false;    /* 1132: VEN low = the chip forgets A0 BF (bit 0x80 keeps it) */
 				gw_crc_next = 0;
 				SAY("persona: 1132: Power 0: chip CRC16 off\n");
+			}
+			if (!v && persona_ri >= 0) {
+				SAY("persona: 1134: Power 0 after ReInit #%u step %d\n", persona_ri_n, persona_ri);
+				persona_ri = -1;        /* 1134 */
 			}
 			ven(v != 0);
 			what = v ? "VEN (gpio12) high" : "VEN (gpio12) low";
