@@ -121,16 +121,50 @@ uint32_t loc_tlv_opmode_standalone(uint8_t *out);
 #define LOC_IND_INJECT_POS_REQ	0x002a
 #define LOC_EVMASK_ASSIST	0x70ull
 uint32_t loc_tlv_inject_utc(uint8_t *out, uint64_t utc_ms, uint32_t unc_ms);
-/* GNSS_SV_INFO (0x0025) TLV 0x10 svList (u8 count + count x 28-byte qmiLocSvInfoStructT_v02: validMask u32, system u32,
+/* ws-gnss-k: HAL-like init and XTRA (CLO LA.UM.9.12 location_service_v02.h/.c, LocApiV02.cpp; all default off):
+ *   REGISTER_MASTER_CLIENT 0x00BA: 0x01 key u32 0xBAABCDEF (LocApiV02::registerMasterClient); ind 0x01 status u32
+ *     (0 success, 1 invalid key, 2 already have a master, 3 internal). The master's REG_EVENTS clientStrId is "MHAL".
+ *   SET_GNSS_CONSTELL_REPORT_CONFIG 0x0088: 0x10 measReportConfig u64, 0x11 svPolyReportConfig u64 (eQMI_SYSTEM_* mask:
+ *     GPS 0x1 GLO 0x2 BDS 0x4 GAL 0x8 QZSS 0x10 NavIC 0x20); ind 0x01 status. Without it the modem sends no
+ *     EVENT_GNSS_MEASUREMENT_REPORT (0x0086) even when the event bit is registered ("Reports are generated only for the
+ *     GNSS satellite constellations that are enabled using QMI_LOC_SET_GNSS_CONSTELL_REPORT_CONFIG").
+ *   INJECT_XTRA_DATA 0x00A7 (what the stock xtra-daemon's IzatApi uses) and INJECT_PREDICTED_ORBITS_DATA 0x0035
+ *     (deprecated, same layout): 0x01 totalSize u32, 0x02 totalParts u16, 0x03 partNum u16 (from 1), 0x04 partData
+ *     (u16 length + at most 1024 bytes), 0x10 formatType u32 0 (XTRA); ind 0x01 status u32, 0x10 partNum u16,
+ *     0x11 ConstellationMask u64 (0x00A7 only).
+ *   GET_PREDICTED_ORBITS_DATA_VALIDITY 0x0037 (read-only): ind 0x01 status, 0x10 {startTimeInUTC u64, durationHours u16}. */
+#define LOC_REG_MASTER		0x00ba
+#define LOC_MASTER_KEY		0xBAABCDEFu
+#define LOC_SET_CONSTELL_REPORT	0x0088
+#define LOC_SYSTEMS_ALL		0x3full	/* eQMI_SYSTEM_ GPS|GLO|BDS|GAL|QZSS|NAVIC, as setSvMeasurementConstellation */
+#define LOC_INJECT_PRED_ORBITS	0x0035
+#define LOC_INJECT_XTRA_DATA	0x00a7
+#define LOC_GET_XTRA_VALIDITY	0x0037
+#define LOC_XTRA_PART		1024u	/* QMI_LOC_MAX_XTRA_PART_LEN_V02 = QMI_LOC_MAX_PREDICTED_ORBITS_PART_LEN_V02 */
+#define LOC_XTRA_GATE		0xffffu	/* loc.c queue marker: XTRA parts go out here, never sent itself */
+uint32_t loc_tlv_master(uint8_t *out);
+uint32_t loc_tlv_constell_report(uint8_t *out, uint64_t meas, uint64_t poly);
+/* one XTRA part (part from 1); out needs 3*4 + 7 + 2 + len + 7 bytes; returns bytes */
+uint32_t loc_tlv_xtra_part(uint8_t *out, uint32_t total, uint16_t parts, uint16_t part, const uint8_t *d, uint16_t len);
+
+/* GNSS_SV_INFO (0x0025): TLV 0x10 svList (u8 count + count x 28-byte qmiLocSvInfoStructT_v02: validMask u32, system u32,
  * gnssSvId u16, health u8, svStatus u32 (1 idle, 2 search, 3 track), svInfoMask u8, elevation f32, azimuth f32, snr f32
- * dB-Hz; snr valid with validMask 0x80). Summary only: counts, CN0, constellations; never elevation/azimuth. */
+ * dB-Hz; snr valid with validMask 0x80) and TLV 0x11 expandedSvList (u8 count + count x 29 bytes: the same struct +
+ * gloFrequency u8; max 176). ws-gnss-k: the expanded list is used when present (as LocApiV02::reportSv does: "If the
+ * service reports expandedSvList, svList is not reported"), else svList. Summary only: counts, CN0, constellations;
+ * never elevation/azimuth. System enum (qmiLocSvSystemEnumT_v02): 1 GPS, 2 GAL, 3 SBAS, 4 COMPASS (deprecated), 5 GLO,
+ * 6 BDS, 7 QZSS, 8 NavIC; ws-gnss-j and older named 4 "BDS", 6 "QZSS", 7 "NavIC" and put 8 under "other". */
+#define LOC_SV_NSYS	9
 struct loc_sv_sum {
-	unsigned listed, tracked, with_snr, ge30, ge20, entry_size;
+	unsigned listed, tracked, searching, with_snr, ge30, ge20, entry_size;
 	float best_snr, sum_top4;	/* sum_top4: the 4 best CN0 values added up (avg = sum_top4 / min(4, with_snr)) */
-	unsigned sys[8];		/* by system enum: 1 GPS, 2 GAL, 3 SBAS, 4 BDS, 5 GLO, 6 QZSS, 7 NavIC; 0 other (with snr > 0) */
+	unsigned sys[LOC_SV_NSYS];	/* SVs with CN0 > 0, by system enum (above); 0 other / system not valid */
+	unsigned lsys[LOC_SV_NSYS];	/* ws-gnss-k: every listed SV by system, CN0 or not (searched ones included) */
+	int expanded;			/* ws-gnss-k: 1 = parsed from TLV 0x11 expandedSvList */
 };
-/* 0 ok, -1 no/short TLV 0x10, -2 unexpected entry size (entry_size set) */
+/* 0 ok, -1 no/short TLV 0x10 and 0x11, -2 unexpected entry size (entry_size set) */
 int loc_sv_summary(const uint8_t *tl, uint32_t tn, struct loc_sv_sum *s);
-/* "N listed, T tracked, S with CN0 (>=30: a, >=20: b), best X dB-Hz, top4 avg Y; GPS g GLO r ..." */
+/* "N listed, T tracked, S with CN0 (>=30: a, >=20: b), best X dB-Hz, top4 avg Y; GPS g GLO r ...; listed GPS g GLO r ...
+ *  (searching s, expanded list)" */
 int loc_sv_summary_str(const struct loc_sv_sum *s, char *b, size_t n);
 #endif

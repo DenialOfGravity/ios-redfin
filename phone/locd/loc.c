@@ -65,8 +65,8 @@
  *   as IND records; GONE (session closed / client gone) and CID release end locationd's client as abpbridge's session end.
  *   Record: struct pdsr below (24 bytes, LE) + data, the same layout as bsd/dev/sweet_qmux.c.
  * Never sent: SET_ENGINE_LOCK (except unlock=/repair above: only the engine lock value, nothing else),
- * SET_OPERATION_MODE other than STANDALONE (and only with opmode=standalone), SUPL/NI settings, any NV/EFS write, XTRA or
- * position injects; INJECT_UTC_TIME only with time=1 (below).
+ * SET_OPERATION_MODE other than STANDALONE (and only with opmode=standalone), SUPL/NI settings, any NV/EFS write,
+ * position injects; INJECT_UTC_TIME only with time=1 or ntp= (below); XTRA only with xtra= (ws-gnss-k, below).
  * ws-gnss-g words (default off; Claude 2026-11-16):
  *   time=1       REG_EVENTS adds INJECT_TIME_REQ 0x10 | INJECT_PREDICTED_ORBITS_REQ 0x20 | INJECT_POSITION_REQ 0x40 (mask 0x1f3)
  *                and INJECT_UTC_TIME (0x0038: 0x01 timeUtc u64 ms since 1970, 0x02 timeUnc u32 ms) is sent from the AP's
@@ -84,6 +84,27 @@
  *                GNSS_MEASUREMENT_REPORT 0x01000000 (ind 0x0086) and BAND_MEASUREMENT_METRICS 0x40000000000 (ind 0x00CE).
  *                Logged (rfm.c): per band jammerPwr/bpAmp/PGA; per signal AGC + jammer(BP) and per-SV CN0 (gloRfLoss);
  *                SV_INFO's rfLoss[] (TLV 0x13). One line per band / signal / rfLoss per 10 s. No positions, no az/el.
+ * ws-gnss-k words (default off; Claude 2026-11-16, research logs/research/gnss-software-2026-11-16.md; CLO LA.UM.9.12
+ *   LocApiV02.cpp, location_service_v02.h/.c, stock redfin vendor xtra-daemon/gps.conf):
+ *   master=1     REGISTER_MASTER_CLIENT 0x00BA (key 0xBAABCDEF) once per LOC server, after INFORM_CLIENT_REVISION, and
+ *                REG_EVENTS clientStrId "MHAL" (with client=), as LocApiV02::registerMasterClient / locClientRegisterEventMask.
+ *                Refusal (2 = another master) is logged, never a LOC failure.
+ *   measconfig=1 SET_GNSS_CONSTELL_REPORT_CONFIG 0x0088 measReportConfig 0x3F (all systems), svPoly 0, after REG_EVENTS,
+ *                as setSvMeasurementConstellation; REG_EVENTS also gets GNSS_MEASUREMENT_REPORT 0x01000000. Reporting only:
+ *                without it 0x0086 never arrives (ws-gnss-j logs: 0 meas reports with the bit registered).
+ *   xtra=PATH    XTRA (predicted orbits) from a file the PC or the phone downloaded (stock xtra-daemon / modem list:
+ *                https://path{1,2,3}.xtracloud.net/xtra3Mgrbeji.bin): read at each session start, injected with
+ *                INJECT_XTRA_DATA 0x00A7 in 1024-byte parts (one part in flight, each part's indication checked) after
+ *                REG_EVENTS/time and before START; again on the modem's INJECT_PREDICTED_ORBITS_REQ only when the file
+ *                changed. Then GET_PREDICTED_ORBITS_DATA_VALIDITY 0x0037 (read-only) is logged. Refused when larger than
+ *                the modem's maxFileSize (0x0029) or 400 KB. Non-persistent assistance data, no NV/EFS write.
+ *   xtramsg=35   use the deprecated INJECT_PREDICTED_ORBITS_DATA 0x0035 instead (0x00A7 falls back to it by itself when the
+ *                modem answers "invalid message id"/"not supported").
+ *   ntp=HOST     (implies time=1) one SNTP query to HOST (name or IPv4, UDP 123) at session start (again after 10 min):
+ *                INJECT_UTC_TIME then carries AP time + the measured offset with uncertainty RTT/2 + 20 ms + 0.1 ms/s
+ *                since the query (Android: NtpTrustedTime, unc = RTT/2). The system clock is never set. If the query
+ *                fails, the RTC time with timeunc= is used as before.
+ * Never sent (ws-gnss-k too): SUPL/NI/NV messages, position injection, SET_CONSTELLATION_CONTROL, any lockClient TLV.
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
  * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). Coordinates are logged rounded to 0.01 deg.
  * loc_shutdown() (SIGTERM, loc.on gone): STOP + REG_EVENTS 0 for a running session and BYE to the relay, then the
@@ -100,6 +121,7 @@
 #include <sys/sysctl.h>
 #endif
 #include "englock.h"
+#include "ntp.h"
 #include "link.h"
 #include "loc.h"
 #include "pdsemu.h"
@@ -116,7 +138,7 @@
 #define EFS_WAIT_MS	900000		/* how long a confirmed restore waits for the modem's EFS write-back */
 
 struct req {
-	uint16_t id;
+	uint16_t id;		/* LOC_XTRA_GATE: a marker, XTRA parts are sent there (ws-gnss-k) */
 	uint8_t tl[64];
 	uint16_t tn;
 	uint8_t want_ind;
@@ -129,6 +151,30 @@ static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2
 static int w_client, w_clientid, w_opmode, w_start_android, w_lockclient, w_lockev;	/* ws-gnss-f; w_client 1 afw, 2 nfw */
 static int w_time;			/* ws-gnss-g time=1 */
 static int w_rfmetrics;		/* ws-gnss-j rfmetrics=1 */
+static int w_master, w_measconfig, w_xtramsg;	/* ws-gnss-k master=1, measconfig=1, xtramsg=35 */
+static char w_xtra[128], w_ntp[64];		/* ws-gnss-k xtra=PATH, ntp=HOST */
+static int master_sent;
+static unsigned n_master_ok, n_measconfig_ok, n_meas_ind;
+/* ws-gnss-k XTRA injection: state 0 idle, 1 sending, 2 done, 3 failed */
+static struct {
+	uint8_t *buf;
+	uint32_t size, parts, next, max_file, max_part;
+	int state;
+	uint16_t msg;
+	long long mtime, done_mtime;
+	long long fsize, done_size;
+	uint64_t t0, last_req;
+	unsigned n_inj, n_fail;
+	uint64_t cmask;
+} xt;
+/* ws-gnss-k ntp= */
+static struct {
+	int have, tried;
+	int64_t off;
+	uint32_t rtt;
+	uint64_t at;		/* link_ms of the query */
+	unsigned n_ok, n_fail;
+} ntp;
 static struct rfm rfm;
 static int w_probe2, probe2_state;	/* ws-gnss-i probe2=1; state 1 queued, 2 done */
 static unsigned probe2_refused;
@@ -337,6 +383,190 @@ static void fail(const char *what)
 	status_dirty = 1;
 }
 
+/* ws-gnss-k: requests whose QMI error/timeout is logged but never counts as a LOC failure */
+static int soft_id(uint16_t id)
+{
+	return id == LOC_REG_MASTER || id == LOC_SET_CONSTELL_REPORT || id == LOC_INJECT_XTRA_DATA || id == LOC_INJECT_PRED_ORBITS ||
+	       id == LOC_GET_XTRA_VALIDITY;
+}
+
+static void enqueue_front(uint16_t id, const uint8_t *tl, uint16_t tn, int want_ind, const char *why)
+{
+	if (qn >= NQ)
+		return;
+	enqueue(id, tl, tn, want_ind, why);	/* appended, then rotated to the front */
+	struct req last = q[qn - 1];
+	memmove(q + 1, q, (size_t)(qn - 1) * sizeof(q[0]));
+	q[0] = last;
+}
+
+static void xtra_free(void)
+{
+	free(xt.buf);
+	xt.buf = NULL;
+}
+
+static void xtra_end(int ok, const char *why)
+{
+	if (xt.state != 1)
+		return;
+	xt.state = ok ? 2 : 3;
+	if (ok) {
+		xt.n_inj++;
+		xt.done_mtime = xt.mtime;
+		xt.done_size = xt.fsize;
+		printf("[%6llu] loc: XTRA injected: %u bytes in %u parts with 0x%04x in %llu ms; constellation mask %#llx\n", now_ms(),
+		       xt.size, xt.parts, xt.msg, (unsigned long long)(link_ms() - xt.t0), (unsigned long long)xt.cmask);
+		enqueue_front(LOC_GET_XTRA_VALIDITY, NULL, 0, 1, "GET_PREDICTED_ORBITS_DATA_VALIDITY (after XTRA)");
+	} else {
+		xt.n_fail++;
+		printf("[%6llu] loc: XTRA NOT injected (%s) at part %u/%u\n", now_ms(), why, xt.next, xt.parts);
+	}
+	xtra_free();
+	status_dirty = 1;
+}
+
+/* read the xtra= file; 1 = a transfer is set up (the caller queues the gate) */
+static int xtra_prepare(const char *why)
+{
+	struct stat st;
+	if (!w_xtra[0] || xt.state == 1)
+		return 0;
+	if (stat(w_xtra, &st) || !S_ISREG(st.st_mode)) {
+		printf("[%6llu] loc: xtra=%s: no such file (%s): no XTRA\n", now_ms(), w_xtra, why);
+		return 0;
+	}
+#ifdef __APPLE__
+	long long mt = (long long)st.st_mtimespec.tv_sec;
+#else
+	long long mt = (long long)st.st_mtim.tv_sec;
+#endif
+	if (xt.n_inj && xt.done_mtime == mt && xt.done_size == (long long)st.st_size) {
+		printf("[%6llu] loc: xtra=%s: same file already injected (%s): not again\n", now_ms(), w_xtra, why);
+		return 0;
+	}
+	uint32_t lim = xt.max_file && xt.max_file < 400u * 1024u ? xt.max_file : 400u * 1024u;
+	if (st.st_size < 64 || (unsigned long long)st.st_size > lim) {
+		printf("[%6llu] loc: xtra=%s: %lld bytes, outside 64..%u (modem maxFileSize %u): not injected\n", now_ms(), w_xtra,
+		       (long long)st.st_size, lim, xt.max_file);
+		return 0;
+	}
+	FILE *f = fopen(w_xtra, "rb");
+	uint8_t *b = f ? malloc((size_t)st.st_size) : NULL;
+	size_t r = b ? fread(b, 1, (size_t)st.st_size, f) : 0;
+	if (f)
+		fclose(f);
+	if (!b || r != (size_t)st.st_size) {
+		free(b);
+		printf("[%6llu] loc: xtra=%s: read failed: not injected\n", now_ms(), w_xtra);
+		return 0;
+	}
+	xtra_free();
+	xt.buf = b;
+	xt.size = (uint32_t)r;
+	xt.parts = (xt.size + LOC_XTRA_PART - 1) / LOC_XTRA_PART;
+	xt.next = 1;
+	xt.state = 1;
+	xt.msg = w_xtramsg == 0x35 ? LOC_INJECT_PRED_ORBITS : LOC_INJECT_XTRA_DATA;
+	xt.mtime = mt;
+	xt.fsize = (long long)st.st_size;
+	xt.t0 = link_ms();
+	xt.cmask = 0;
+	{
+		uint32_t h = 2166136261u;	/* FNV-1a, to match the file with the PC copy (sha256 is in the research doc) */
+		for (uint32_t i = 0; i < xt.size; i++)
+			h = (h ^ b[i]) * 16777619u;
+		printf("[%6llu] loc: XTRA (%s): %s, %u bytes, %u parts of %u, fnv1a %08x, file age %lld s, with 0x%04x\n", now_ms(), why,
+		       w_xtra, xt.size, xt.parts, LOC_XTRA_PART, h, (long long)time(NULL) - mt, xt.msg);
+	}
+	status_dirty = 1;
+	return 1;
+}
+
+/* the next XTRA part at the gate; 1 = sent (or failed and ended: the gate stays for the next call), 0 = nothing to send */
+static int xtra_send_part(void)
+{
+	static uint8_t tl[LOC_XTRA_PART + 64];
+	if (xt.state != 1 || !xt.buf || xt.next > xt.parts)
+		return 0;
+	uint32_t off = (xt.next - 1) * LOC_XTRA_PART, len = xt.size - off < LOC_XTRA_PART ? xt.size - off : LOC_XTRA_PART;
+	uint32_t tn = loc_tlv_xtra_part(tl, xt.size, (uint16_t)xt.parts, (uint16_t)xt.next, xt.buf + off, (uint16_t)len);
+	struct qmi_buf b;
+	uint16_t txn = txn_next++;
+	if (!txn_next)
+		txn_next = 1;
+	qmi_start(&b, QMI_REQUEST, txn, xt.msg);
+	memcpy(b.b + b.n, tl, tn);
+	b.n += tn;
+	size_t ln = qmi_finish(&b);
+	if (!ln || qrtr_send(QRTR_TYPE_DATA, LOC_PORT, srv_node, srv_port, b.b, (uint32_t)ln)) {
+		xtra_end(0, "send failed");
+		return 0;
+	}
+	memset(&cur, 0, sizeof(cur));
+	cur.busy = 1;
+	cur.id = xt.msg;
+	cur.txn = txn;
+	cur.want_ind = 1;
+	cur.sent = link_ms();
+	cur.why = "XTRA part";
+	if (xt.next == 1 || xt.next == xt.parts || xt.next % 16 == 0)
+		printf("[%6llu] loc: > 0x%04x %s part %u/%u (%u data bytes, txn %u)\n", now_ms(), xt.msg,
+		       xt.msg == LOC_INJECT_XTRA_DATA ? "INJECT_XTRA_DATA" : "INJECT_PREDICTED_ORBITS_DATA", xt.next, xt.parts, len, txn);
+	return 1;
+}
+
+/* an XTRA part's indication (0x01 status, 0x10 partNum, 0x11 constellation mask) */
+static void xtra_ind(const struct qmi_msg *m)
+{
+	uint16_t l = 0;
+	const uint8_t *v = qmi_get(m, 0x01, &l);
+	unsigned st = v && l >= 4 ? (unsigned)(v[0] | v[1] << 8) : 0xffff;
+	unsigned pn = xt.next;
+	if ((v = qmi_get(m, 0x10, &l)) && l >= 2)
+		pn = (unsigned)(v[0] | v[1] << 8);
+	if ((v = qmi_get(m, 0x11, &l)) && l >= 8)
+		memcpy(&xt.cmask, v, 8);
+	if (xt.state != 1)
+		return;
+	if (st != 0) {
+		char w[64];
+		snprintf(w, sizeof(w), "part %u indication status %u", pn, st);
+		xtra_end(0, w);
+		return;
+	}
+	if (pn != xt.next)
+		printf("[%6llu] loc: XTRA: indication for part %u while %u was sent\n", now_ms(), pn, xt.next);
+	xt.next++;
+	if (xt.next > xt.parts)
+		xtra_end(1, "done");
+}
+
+/* ws-gnss-k ntp=: query when due (session start; at most every 10 min); blocking, at most 1.5 s */
+static void ntp_poll(const char *why)
+{
+	if (!w_ntp[0] || (ntp.tried && link_ms() - ntp.at < 600000))
+		return;
+	char err[128] = "";
+	int64_t off = 0;
+	uint32_t rtt = 0;
+	ntp.tried = 1;
+	ntp.at = link_ms();
+	if (ntp_query(w_ntp, 1500, &off, &rtt, err, sizeof(err)) == 0) {
+		ntp.have = 1;
+		ntp.off = off;
+		ntp.rtt = rtt;
+		ntp.n_ok++;
+		printf("[%6llu] loc: ntp=%s (%s): AP clock offset %+lld ms (server - AP), round trip %u ms -> time uncertainty %u ms\n",
+		       now_ms(), w_ntp, why, (long long)off, rtt, rtt / 2 + 20);
+	} else {
+		ntp.n_fail++;
+		printf("[%6llu] loc: ntp=%s (%s): %s; %s\n", now_ms(), w_ntp, why, err,
+		       ntp.have ? "keeping the last offset" : "RTC time with timeunc= is used");
+	}
+	status_dirty = 1;
+}
+
 static void send_next(void)
 {
 	if (!cur.busy && lkq.pending && srv_up) {
@@ -374,6 +604,16 @@ static void send_next(void)
 	}
 	if (cur.busy || !qn || !srv_up || (dropped && !after_drop))
 		return;
+	if (q[0].id == LOC_XTRA_GATE) {	/* ws-gnss-k: XTRA parts go out here, one at a time; then the gate goes */
+		if (xtra_send_part())
+			return;
+		if (xt.state == 1)
+			xtra_end(0, "transfer stopped");
+		memmove(q, q + 1, (size_t)(qn - 1) * sizeof(q[0]));
+		qn--;
+		send_next();
+		return;
+	}
 	if (dropped)
 		after_drop--;
 	struct req r = q[0];
@@ -388,11 +628,21 @@ static void send_next(void)
 		uint64_t ms;
 		if (!time_ok(&ms))
 			return;
-		r.tn = (uint16_t)loc_tlv_inject_utc(r.tl, ms, w_timeunc);
+		uint32_t unc = w_timeunc;
+		if (w_ntp[0] && ntp.have) {	/* ws-gnss-k: AP time corrected by the SNTP offset */
+			uint64_t age = link_ms() - ntp.at;
+			ms = (uint64_t)((int64_t)ms + ntp.off);
+			unc = ntp.rtt / 2 + 20 + (uint32_t)(age / 10000);
+		}
+		r.tn = (uint16_t)loc_tlv_inject_utc(r.tl, ms, unc);
 		time_last_inject = link_ms();
 		n_time_inj++;
-		printf("[%6llu] loc: INJECT_UTC_TIME (%s): AP UTC %llu ms, uncertainty %u ms (clock: PM8150 RTC + sweetrtcoff, "
-		       "not known to be network-synced)\n", now_ms(), r.why, (unsigned long long)ms, w_timeunc);
+		if (w_ntp[0] && ntp.have)
+			printf("[%6llu] loc: INJECT_UTC_TIME (%s): AP UTC %+lld ms (ntp=%s offset, %llu s old), uncertainty %u ms\n",
+			       now_ms(), r.why, (long long)ntp.off, w_ntp, (unsigned long long)((link_ms() - ntp.at) / 1000), unc);
+		else
+			printf("[%6llu] loc: INJECT_UTC_TIME (%s): AP UTC %llu ms, uncertainty %u ms (clock: PM8150 RTC + sweetrtcoff, "
+			       "not known to be network-synced)\n", now_ms(), r.why, (unsigned long long)ms, unc);
 	}
 	struct qmi_buf b;
 	uint16_t txn = txn_next++;
@@ -455,9 +705,15 @@ static void q_start(uint32_t interval)
 		enqueue(LOC_INFORM_CLIENT_REV, t, (uint16_t)n, 0, "INFORM_CLIENT_REVISION 2");
 		rev_sent = 1;
 	}
+	if (w_master && !master_sent) {	/* ws-gnss-k: once per LOC server, as LocApiV02::registerMasterClient */
+		n = loc_tlv_master(t);
+		enqueue(LOC_REG_MASTER, t, (uint16_t)n, 1, "REGISTER_MASTER_CLIENT key 0xBAABCDEF");
+		master_sent = 1;
+	}
 	n = loc_tlv_reg_events_ex(t, LOC_EVMASK_BRIDGE | (w_lockev ? LOC_EVMASK_ENGINE_LOCK_STATE : 0) |
-				  (w_time ? LOC_EVMASK_ASSIST : 0) | (w_rfmetrics ? LOC_EVMASK_RFMETRICS : 0), (uint32_t)w_client,
-				  w_client && w_clientid ? "HAL" : NULL);
+				  (w_time ? LOC_EVMASK_ASSIST : 0) | (w_rfmetrics ? LOC_EVMASK_RFMETRICS : 0) |
+				  (w_measconfig ? LOC_EVMASK_GNSS_MEAS : 0), (uint32_t)w_client,
+				  w_client && w_master ? "MHAL" : w_client && w_clientid ? "HAL" : NULL);
 	if (w_rfmetrics) {	/* ws-gnss-j: registration only; the 0x183/0x1f3 label below stays as before */
 		rfm_reset(&rfm);
 		printf("[%6llu] loc: rfmetrics=1: REG_EVENTS also 0x01000000 (meas report 0x0086) | 0x40000000000 (band metrics 0x00CE)\n",
@@ -467,8 +723,16 @@ static void q_start(uint32_t interval)
 		w_client == LOC_CLIENT_NFW ? "REG_EVENTS 0x1f3 clientType NFW" : "REG_EVENTS 0x1f3") :
 		w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x183 clientType AFW" :
 		w_client == LOC_CLIENT_NFW ? "REG_EVENTS 0x183 clientType NFW" : "REG_EVENTS 0x183");
-	if (w_time)		/* ws-gnss-g: the HAL injects network time when it has it; the TLV is filled at send time */
+	if (w_measconfig) {	/* ws-gnss-k: measurement reports for every system (reporting config only) */
+		n = loc_tlv_constell_report(t, LOC_SYSTEMS_ALL, 0);
+		enqueue(LOC_SET_CONSTELL_REPORT, t, (uint16_t)n, 1, "SET_GNSS_CONSTELL_REPORT_CONFIG meas 0x3f poly 0");
+	}
+	if (w_time) {		/* ws-gnss-g: the HAL injects network time when it has it; the TLV is filled at send time */
+		ntp_poll("session start");	/* ws-gnss-k ntp= */
 		time_queue("session start");
+	}
+	if (xtra_prepare("session start"))	/* ws-gnss-k xtra=: parts go out at this point of the queue */
+		enqueue(LOC_XTRA_GATE, NULL, 0, 0, "XTRA gate");
 	if (w_opmode) {
 		n = loc_tlv_opmode_standalone(t);
 		enqueue(LOC_SET_OPERATION_MODE, t, (uint16_t)n, 1, "SET_OPERATION_MODE STANDALONE");
@@ -482,7 +746,7 @@ static void q_stop(void)
 	uint8_t t[64];
 	uint32_t n = loc_tlv_stop(t);
 	enqueue(LOC_STOP, t, (uint16_t)n, 0, "STOP session 1");
-	n = loc_tlv_reg_events_ex(t, 0, (uint32_t)w_client, w_client && w_clientid ? "HAL" : NULL);
+	n = loc_tlv_reg_events_ex(t, 0, (uint32_t)w_client, w_client && w_master ? "MHAL" : w_client && w_clientid ? "HAL" : NULL);
 	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, "REG_EVENTS 0");
 }
 
@@ -1137,6 +1401,25 @@ static void read_on(void)
 	w_lockev = strstr(b, "lockev=1") != NULL;
 	w_time = strstr(b, "time=1") != NULL;
 	w_rfmetrics = strstr(b, "rfmetrics=1") != NULL;
+	w_master = strstr(b, "master=1") != NULL;		/* ws-gnss-k */
+	w_measconfig = strstr(b, "measconfig=1") != NULL;
+	w_xtramsg = strstr(b, "xtramsg=35") != NULL ? 0x35 : 0;
+	w_xtra[0] = w_ntp[0] = 0;
+	if ((w = strstr(b, "xtra="))) {
+		size_t k = strcspn(w + 5, " \t\r\n");
+		if (w[5] == '/' && k < sizeof(w_xtra))
+			snprintf(w_xtra, sizeof(w_xtra), "%.*s", (int)k, w + 5);
+		else
+			printf("[%6llu] loc: %s: xtra= needs an absolute path under %u characters: ignored\n", now_ms(), LOC_ON,
+			       (unsigned)sizeof(w_xtra));
+	}
+	if ((w = strstr(b, "ntp="))) {
+		size_t k = strcspn(w + 4, " \t\r\n");
+		if (k && k < sizeof(w_ntp))
+			snprintf(w_ntp, sizeof(w_ntp), "%.*s", (int)k, w + 4);
+		w_time = 1;	/* ntp= implies time=1 */
+	}
+	ntp.tried = 0;		/* a changed loc.on queries again */
 	w_timeunc = 5000;
 	if ((w = strstr(b, "timeunc=")))
 		w_timeunc = (uint32_t)strtoul(w + 8, NULL, 10);
@@ -1149,6 +1432,8 @@ static void read_on(void)
 	if (w_probe2) {		/* ws-gnss-i: read-only mode, every other word off */
 		w_probe = w_pds = w_session = w_unlock = w_time = w_rfmetrics = 0;
 		w_client = w_clientid = w_opmode = w_start_android = w_lockclient = w_lockev = 0;
+		w_master = w_measconfig = w_xtramsg = 0;
+		w_xtra[0] = w_ntp[0] = 0;
 		printf("[%6llu] loc: probe2=1: read-only GETs only, every other word ignored, then exit\n", now_ms());
 	}
 	if (dropped)
@@ -1164,6 +1449,10 @@ static void read_on(void)
 		       now_ms(), w_timeunc);
 	if (w_rfmetrics)
 		printf("[%6llu] loc: ws-gnss-j word: rfmetrics=1 (RF metrics indications registered with the next session)\n", now_ms());
+	if (w_master || w_measconfig || w_xtra[0] || w_ntp[0])
+		printf("[%6llu] loc: ws-gnss-k words:%s%s%s%s%s%s%s\n", now_ms(), w_master ? " master=1" : "",
+		       w_measconfig ? " measconfig=1" : "", w_xtra[0] ? " xtra=" : "", w_xtra, w_xtramsg ? " xtramsg=35" : "",
+		       w_ntp[0] ? " ntp=" : "", w_ntp);
 	if (w_client || w_clientid || w_opmode || w_start_android || w_lockclient || w_lockev)
 		printf("[%6llu] loc: ws-gnss-f words:%s%s%s%s%s%s\n", now_ms(), w_client == LOC_CLIENT_AFW ? " client=afw" :
 		       w_client == LOC_CLIENT_NFW ? " client=nfw" : "", w_clientid ? " clientid=1" : "", w_opmode ? " opmode=standalone" : "",
@@ -1207,8 +1496,13 @@ static void write_status(void)
 		   "requests %u\n", w_time ? "on" : "off", w_timeunc, n_time_req, n_time_inj, n_time_ok, n_xtra_req, n_pos_req);
 	fprintf(f, "loc: ws-gnss-j rfmetrics %s: band metrics %u, meas reports %u, rfLoss reports %u\n", w_rfmetrics ? "on" : "off",
 		rfm.n_band, rfm.n_meas, rfm.n_loss);
+	fprintf(f, "loc: ws-gnss-k master %s (ok %u), measconfig %s (ok %u, meas reports %u), xtra %s state %s (injected %u, "
+		   "failed %u, modem max %u/%u), ntp %s (ok %u, failed %u%s)\n", w_master ? "on" : "off", n_master_ok,
+		w_measconfig ? "on" : "off", n_measconfig_ok, n_meas_ind, w_xtra[0] ? w_xtra : "off",
+		xt.state == 1 ? "sending" : xt.state == 2 ? "done" : xt.state == 3 ? "failed" : "idle", xt.n_inj, xt.n_fail, xt.max_file,
+		xt.max_part, w_ntp[0] ? w_ntp : "off", ntp.n_ok, ntp.n_fail, ntp.have ? ", have offset" : "");
 	if (sv_have) {
-		char sb[200];
+		char sb[320];
 		loc_sv_summary_str(&sv_last, sb, sizeof(sb));
 		fprintf(f, "loc: sv reports %u, last: %s\n", n_sv, sb);
 	}
@@ -1256,6 +1550,9 @@ void loc_poll(void)
 			cur.busy = 0;
 			if (cur.lk) {
 				lk_event(0, NULL);
+			} else if (soft_id(cur.id)) {	/* ws-gnss-k: logged only */
+				if (cur.id == LOC_INJECT_XTRA_DATA || cur.id == LOC_INJECT_PRED_ORBITS)
+					xtra_end(0, "no response");
 			} else {
 				if (cur.id == LOC_START && sess == 1)
 					sess = 0;
@@ -1266,6 +1563,8 @@ void loc_poll(void)
 			cur.busy = 0;
 			if (cur.lk)
 				lk_event(0, NULL);
+			else if (cur.id == LOC_INJECT_XTRA_DATA || cur.id == LOC_INJECT_PRED_ORBITS)
+				xtra_end(0, "no indication");
 		}
 	}
 	int want_pds = 0, want_test = 0, hold = lk_hold();
@@ -1330,6 +1629,7 @@ void loc_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t por
 	srv_port = port;
 	srv_inst = instance;
 	rev_sent = 0;
+	master_sent = 0;	/* ws-gnss-k */
 	probe_gen_done = ~0ull;	/* a new server: probe again */
 	if (on_present)
 		printf("[%6llu] loc: LOC server (instance %#x) at %u:%x\n", now_ms(), instance, node, port);
@@ -1346,6 +1646,7 @@ void loc_server_gone(uint32_t node, uint32_t port)
 	sess = 0;
 	sess_owner = 0;
 	lkq.pending = 0;
+	xtra_end(0, "LOC server gone");	/* ws-gnss-k */
 	if (lk == LK_RD || lk == LK_RD_DV) {		/* nothing changed yet: read again when it is back */
 		lk = LK_IDLE;
 		lk_gen_done = ~0ull;
@@ -1443,8 +1744,11 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		uint16_t l = 0;
 		const uint8_t *r = qmi_get(&m, 0x02, &l);
 		unsigned res = r && l >= 4 ? (unsigned)(r[0] | r[1] << 8) : 1, err = r && l >= 4 ? (unsigned)(r[2] | r[3] << 8) : 0xffff;
-		printf("[%6llu] loc: < 0x%04x response %s (error 0x%x)\n", now_ms(), m.id, res ? "FAILED" : "ok", err);
-		qmi_dump(&m);		/* ws-gnss-f: every response in hex */
+		int xpart = (m.id == LOC_INJECT_XTRA_DATA || m.id == LOC_INJECT_PRED_ORBITS) && xt.state == 1 && !res;
+		if (!xpart || xt.next == 1 || xt.next == xt.parts) {	/* ws-gnss-k: XTRA parts: first and last only */
+			printf("[%6llu] loc: < 0x%04x response %s (error 0x%x)\n", now_ms(), m.id, res ? "FAILED" : "ok", err);
+			qmi_dump(&m);		/* ws-gnss-f: every response in hex */
+		}
 		if (w_probe2)
 			probe2_decode(&m, "response");
 		if (cur.lk) {
@@ -1454,6 +1758,19 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			} else {
 				cur.got_resp = 1;
 				cur.resp_at = link_ms();
+			}
+			return;
+		}
+		if (res && soft_id(m.id)) {	/* ws-gnss-k: refused HAL-like init / XTRA: logged, never a LOC failure */
+			cur.busy = 0;
+			printf("[%6llu] loc: 0x%04x %s refused by the modem (error 0x%x)\n", now_ms(), m.id, cur.why, err);
+			if (m.id == LOC_INJECT_XTRA_DATA && xt.state == 1 && xt.next == 1 && (err == 0x29 || err == 0x5e) && !w_xtramsg) {
+				printf("[%6llu] loc: XTRA: 0x00a7 not supported here: again with INJECT_PREDICTED_ORBITS_DATA 0x0035\n", now_ms());
+				xt.msg = LOC_INJECT_PRED_ORBITS;	/* the gate is still queued: part 1 goes again */
+			} else if (m.id == LOC_INJECT_XTRA_DATA || m.id == LOC_INJECT_PRED_ORBITS) {
+				char w[48];
+				snprintf(w, sizeof(w), "response error 0x%x", err);
+				xtra_end(0, w);
 			}
 			return;
 		}
@@ -1486,8 +1803,41 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		return;
 	uint16_t l0 = 0;
 	if (cur.busy && cur.got_resp && cur.want_ind && m.id == cur.id) {
-		printf("[%6llu] loc: < 0x%04x indication (%s)\n", now_ms(), m.id, cur.why);
-		qmi_dump(&m);
+		int xpart = m.id == LOC_INJECT_XTRA_DATA || m.id == LOC_INJECT_PRED_ORBITS;
+		if (!xpart || xt.next == 1 || xt.next >= xt.parts) {
+			printf("[%6llu] loc: < 0x%04x indication (%s)\n", now_ms(), m.id, cur.why);
+			qmi_dump(&m);
+		}
+		if (xpart) {		/* ws-gnss-k */
+			cur.busy = 0;
+			xtra_ind(&m);
+			return;
+		}
+		if (m.id == LOC_REG_MASTER || m.id == LOC_SET_CONSTELL_REPORT || m.id == LOC_GET_XTRA_VALIDITY) {
+			const uint8_t *sv = qmi_get(&m, 0x01, &l0);
+			unsigned stv = sv && l0 >= 4 ? (unsigned)(sv[0] | sv[1] << 8) : 0xffff;
+			if (m.id == LOC_REG_MASTER) {
+				n_master_ok += stv == 0;
+				printf("[%6llu] loc: REGISTER_MASTER_CLIENT status %u %s\n", now_ms(), stv, stv == 0 ? "(we are the master)" :
+				       stv == 1 ? "(invalid key)" : stv == 2 ? "(another master client exists)" : "(failed)");
+			} else if (m.id == LOC_SET_CONSTELL_REPORT) {
+				n_measconfig_ok += stv == 0;
+				printf("[%6llu] loc: SET_GNSS_CONSTELL_REPORT_CONFIG status %u%s\n", now_ms(), stv, stv == 0 ? " (success)" :
+				       stv == 4 ? " (engine busy: the HAL accepts this too)" : " (NOT accepted)");
+			} else {
+				const uint8_t *vv = qmi_get(&m, 0x10, &l0);
+				if (vv && l0 >= 10) {
+					uint64_t st0;
+					uint16_t dh;
+					memcpy(&st0, vv, 8);
+					memcpy(&dh, vv + 8, 2);
+					printf("[%6llu] loc: XTRA validity: status %u, start %llu (UTC s), %u hours\n", now_ms(), stv,
+					       (unsigned long long)st0, dh);
+				} else {
+					printf("[%6llu] loc: XTRA validity: status %u, no validity TLV\n", now_ms(), stv);
+				}
+			}
+		}
 		if (w_probe2)
 			probe2_decode(&m, "indication");
 		if (m.id == LOC_GET_ENGINE_LOCK && !cur.lk) {	/* probe reads: the value in words too */
@@ -1531,7 +1881,7 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			status_dirty = 1;
 		}
 		struct loc_sv_sum ss;	/* ws-gnss-g: one summary line per report (no elevation/azimuth, no positions) */
-		char sb[200];
+		char sb[320];
 		int sr = loc_sv_summary(m.tlv, m.len, &ss);
 		n_sv++;
 		if (sr == 0) {
@@ -1542,7 +1892,7 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			status_dirty = 1;
 		} else if (n_sv <= 5 || n_sv % 60 == 0) {
 			printf("[%6llu] loc: sv #%u: %s (entry size %u)\n", now_ms(), n_sv, sr == -1 ? "no svList TLV" :
-			       "svList entries not 28 bytes: not parsed", ss.entry_size);
+			       "svList/expandedSvList entries not 28/29 bytes: not parsed", ss.entry_size);
 		}
 		if (w_rfmetrics) {	/* ws-gnss-j: rfLoss[] (TLV 0x13), rate-limited */
 			char lb[RFM_LINE];
@@ -1551,8 +1901,9 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		}
 		break;
 	}
-	case LOC_IND_GNSS_MEAS: {	/* ws-gnss-j rfmetrics=1 */
+	case LOC_IND_GNSS_MEAS: {	/* ws-gnss-j rfmetrics=1 (ws-gnss-k: also measconfig=1) */
 		char lb[RFM_LINE];
+		n_meas_ind++;
 		if (rfm_meas(&rfm, m.tlv, m.len, link_ms(), lb, sizeof(lb)) == 1)
 			printf("[%6llu] loc: %s\n", now_ms(), lb);
 		break;
@@ -1575,11 +1926,18 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		break;
 	case LOC_IND_XTRA_REQ:		/* ws-gnss-g: logged only (no XTRA download in this step) */
 		n_xtra_req++;
-		if ((v = qmi_get(&m, 0x01, &l)) && l >= 8)
-			printf("[%6llu] loc: INJECT_PREDICTED_ORBITS_REQ: max file %u bytes, max part %u bytes\n", now_ms(),
-			       (unsigned)(v[0] | v[1] << 8 | v[2] << 16 | (unsigned)v[3] << 24),
-			       (unsigned)(v[4] | v[5] << 8 | v[6] << 16 | (unsigned)v[7] << 24));
+		if ((v = qmi_get(&m, 0x01, &l)) && l >= 8) {
+			xt.max_file = (unsigned)(v[0] | v[1] << 8 | v[2] << 16 | (unsigned)v[3] << 24);
+			xt.max_part = (unsigned)(v[4] | v[5] << 8 | v[6] << 16 | (unsigned)v[7] << 24);
+			printf("[%6llu] loc: INJECT_PREDICTED_ORBITS_REQ: max file %u bytes, max part %u bytes\n", now_ms(), xt.max_file,
+			       xt.max_part);
+		}
 		assist_log(&m, "INJECT_PREDICTED_ORBITS_REQ", 0x10, 0);
+		if (w_xtra[0] && (sess == 1 || sess == 2) && xt.state != 1 && (!xt.last_req || link_ms() - xt.last_req >= 60000)) {
+			xt.last_req = link_ms();	/* ws-gnss-k: answer with the file only if it changed (xtra_prepare checks) */
+			if (xtra_prepare("modem INJECT_PREDICTED_ORBITS_REQ"))
+				enqueue_front(LOC_XTRA_GATE, NULL, 0, 0, "XTRA gate");
+		}
 		status_dirty = 1;
 		break;
 	case LOC_IND_INJECT_POS_REQ:	/* ws-gnss-g: logged only (never injected) */
@@ -1701,6 +2059,7 @@ void loc_shutdown(const char *why)
 		session_stop(why);
 	else
 		sess_owner = 0;
+	xtra_end(0, "shutdown");	/* ws-gnss-k: the gate is dropped below */
 	for (int i = 0; i < qn;)	/* probe GETs still queued are not sent any more */
 		if (q[i].id != LOC_STOP && q[i].id != LOC_REG_EVENTS) {
 			memmove(q + i, q + i + 1, (size_t)(qn - i - 1) * sizeof(q[0]));

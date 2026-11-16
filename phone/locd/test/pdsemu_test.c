@@ -171,7 +171,7 @@ int main(void)
 		CHECK(loc_sv_summary(tl, o, &ss) == 0 && ss.listed == 4 && ss.tracked == 2 && ss.with_snr == 3 && ss.ge30 == 1 &&
 		      ss.ge20 == 2 && ss.best_snr > 34.4f && ss.sys[1] == 1 && ss.sys[5] == 1 && ss.sys[6] == 1 && ss.sys[2] == 0);
 		loc_sv_summary_str(&ss, sb, sizeof(sb));
-		CHECK(strstr(sb, "GPS 1 GLO 1 QZSS 1") != NULL && strstr(sb, "top3 avg 24.8") != NULL);
+		CHECK(strstr(sb, "GPS 1 GLO 1 BDS 1; listed GPS 1 GAL 1 GLO 1 BDS 1 (searching 2, legacy list)") != NULL && strstr(sb, "top3 avg 24.8") != NULL);
 		printf("pdsemu_test: sv summary: %s\n", sb);
 		o = 0;
 		put(tl, &o, 0x10, sl, 1 + 27);	/* wrong entry size */

@@ -387,12 +387,56 @@ uint32_t loc_tlv_inject_utc(uint8_t *out, uint64_t utc_ms, uint32_t unc_ms)
 	return o;
 }
 
+/* ws-gnss-k (pdsemu.h): REGISTER_MASTER_CLIENT 0x01 key */
+uint32_t loc_tlv_master(uint8_t *out)
+{
+	uint32_t o = 0, key = LOC_MASTER_KEY;
+	tlv(out, &o, 0x01, &key, 4);
+	return o;
+}
+
+/* ws-gnss-k: SET_GNSS_CONSTELL_REPORT_CONFIG 0x10 measReportConfig, 0x11 svPolyReportConfig */
+uint32_t loc_tlv_constell_report(uint8_t *out, uint64_t meas, uint64_t poly)
+{
+	uint32_t o = 0;
+	tlv(out, &o, 0x10, &meas, 8);
+	tlv(out, &o, 0x11, &poly, 8);
+	return o;
+}
+
+/* ws-gnss-k: INJECT_XTRA_DATA / INJECT_PREDICTED_ORBITS_DATA part */
+uint32_t loc_tlv_xtra_part(uint8_t *out, uint32_t total, uint16_t parts, uint16_t part, const uint8_t *d, uint16_t len)
+{
+	uint32_t o = 0, fmt = 0;
+	if (len > LOC_XTRA_PART)
+		return 0;
+	tlv(out, &o, 0x01, &total, 4);
+	tlv(out, &o, 0x02, &parts, 2);
+	tlv(out, &o, 0x03, &part, 2);
+	out[o] = 0x04;
+	out[o + 1] = (uint8_t)((len + 2) & 0xff);
+	out[o + 2] = (uint8_t)((len + 2) >> 8);
+	out[o + 3] = (uint8_t)(len & 0xff);
+	out[o + 4] = (uint8_t)(len >> 8);
+	memcpy(out + o + 5, d, len);
+	o += 5u + len;
+	tlv(out, &o, 0x10, &fmt, 4);
+	return o;
+}
+
 int loc_sv_summary(const uint8_t *tl, uint32_t tn, struct loc_sv_sum *s)
 {
-	uint16_t l = 0;
-	const uint8_t *v = find(tl, tn, 0x10, &l);
+	uint16_t l = 0, lx = 0;
+	const uint8_t *v = find(tl, tn, 0x10, &l), *vx = find(tl, tn, 0x11, &lx);
 	float top[4] = { 0, 0, 0, 0 };
+	unsigned esz = 28;
 	memset(s, 0, sizeof(*s));
+	if (vx && lx >= 1) {		/* ws-gnss-k: the expanded list (the HAL's choice) when the modem sends it */
+		v = vx;
+		l = lx;
+		esz = 29;
+		s->expanded = 1;
+	}
 	if (!v || l < 1)
 		return -1;
 	s->listed = v[0];
@@ -403,22 +447,26 @@ int loc_sv_summary(const uint8_t *tl, uint32_t tn, struct loc_sv_sum *s)
 		return -2;
 	}
 	s->entry_size = (uint32_t)(l - 1) / s->listed;
-	if (s->entry_size != 28)
+	if (s->entry_size != esz)
 		return -2;
 	for (unsigned i = 0; i < s->listed; i++) {
-		const uint8_t *e = v + 1 + 28 * i;
+		const uint8_t *e = v + 1 + esz * i;
 		uint32_t vm, sys, st;
 		float snr;
 		memcpy(&vm, e, 4);
 		memcpy(&sys, e + 4, 4);
 		memcpy(&st, e + 11, 4);
 		memcpy(&snr, e + 24, 4);
+		unsigned si = (vm & 0x01) && sys < LOC_SV_NSYS ? sys : 0;
+		s->lsys[si]++;
 		if ((vm & 0x08) && st == 3)
 			s->tracked++;
+		if ((vm & 0x08) && st == 2)
+			s->searching++;
 		if (!(vm & 0x80) || !(snr > 0.0f) || snr > 99.0f)
 			continue;
 		s->with_snr++;
-		s->sys[(vm & 0x01) && sys < 8 ? sys : 0]++;
+		s->sys[si]++;
 		if (snr >= 30.0f)
 			s->ge30++;
 		if (snr >= 20.0f)
@@ -440,17 +488,27 @@ int loc_sv_summary(const uint8_t *tl, uint32_t tn, struct loc_sv_sum *s)
 
 int loc_sv_summary_str(const struct loc_sv_sum *s, char *b, size_t n)
 {
-	static const char *const nm[8] = { "other", "GPS", "GAL", "SBAS", "BDS", "GLO", "QZSS", "NavIC" };
+	static const char *const nm[LOC_SV_NSYS] = { "other", "GPS", "GAL", "SBAS", "COMPASS", "GLO", "BDS", "QZSS", "NavIC" };
 	unsigned k = s->with_snr < 4 ? s->with_snr : 4;
 	int o = snprintf(b, n, "%u listed, %u tracked, %u with CN0 (>=30: %u, >=20: %u), best %.1f dB-Hz, top%u avg %.1f;",
 			 s->listed, s->tracked, s->with_snr, s->ge30, s->ge20, (double)s->best_snr, k,
 			 k ? (double)(s->sum_top4 / (float)k) : 0.0);
-	for (int i = 1; i <= 8 && o > 0 && (size_t)o < n; i++) {
-		int j = i & 7;	/* 1..7, then 0 (other) last */
+	for (int i = 1; i <= LOC_SV_NSYS && o > 0 && (size_t)o < n; i++) {
+		int j = i % LOC_SV_NSYS;	/* 1..8, then 0 (other) last */
 		if (s->sys[j])
 			o += snprintf(b + o, n - (size_t)o, " %s %u", nm[j], s->sys[j]);
 	}
 	if (!s->with_snr && o > 0 && (size_t)o < n)
 		o += snprintf(b + o, n - (size_t)o, " none");
+	if (s->listed && o > 0 && (size_t)o < n) {	/* ws-gnss-k: every listed SV by system (searched ones too) */
+		o += snprintf(b + o, n - (size_t)o, "; listed");
+		for (int i = 1; i <= LOC_SV_NSYS && o > 0 && (size_t)o < n; i++) {
+			int j = i % LOC_SV_NSYS;
+			if (s->lsys[j])
+				o += snprintf(b + o, n - (size_t)o, " %s %u", nm[j], s->lsys[j]);
+		}
+		if (o > 0 && (size_t)o < n)
+			o += snprintf(b + o, n - (size_t)o, " (searching %u, %s list)", s->searching, s->expanded ? "expanded" : "legacy");
+	}
 	return o;
 }
