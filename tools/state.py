@@ -15,6 +15,11 @@
   state.py snapshot [LABEL]          dated dump + diff under PF/state/snapshots/, prints the lines for the status doc
   state.py set KEY VALUE --temp      experiment: set a sysctl (kern.*) or a KEY=VALUE line of a flag file
                                      (/var/local/FILE:KEY) now, recorded in PF/state/temp-overrides.json
+  state.py put LOCAL REMOTE [MODE] --temp
+                                     experiment: install one file now (REMOTE.st-new, sha check, mv). The first put
+                                     keeps the phone's previous file as REMOTE.st-prev. Recorded as file:REMOTE in
+                                     temp-overrides.json; `revert file:REMOTE` restores it, `promote` writes it into
+                                     the manifest ([[file]] source = LOCAL). Used by tools-claude/pa (`pa put`).
   state.py revert KEY|all            put a temp override back to the manifest value and drop it
   state.py promote KEY --manifest FILE   write a temp override's value into the manifest file, drop it
   state.py summary                   the manifest as a short text (what KNOWN-GOOD.txt used to say)
@@ -668,6 +673,8 @@ def compute_diff(m, d):
     # files
     for f in m.get('file', []):
         p = f['path']
+        if 'file:' + p in temp:
+            continue
         cur = d.files.get(p)
         if not cur:
             dr.add('missing', p, f.get('source', ''), fix='install')
@@ -688,13 +695,16 @@ def compute_diff(m, d):
         bad = []
         for rel, h in bd.get('files', {}).items():
             q = p + '/' + rel
+            if 'file:' + q in temp:
+                continue
             if q not in d.files:
                 bad.append(f'{rel} missing')
             elif d.sha.get(q) and d.sha[q] != h:
                 bad.append(f'{rel} {d.sha[q][:12]}!={h[:12]}')
         retired_paths = {r['path'] for r in m.get('retired', [])}
         extra = [q[len(p) + 1:] for q, x in d.files.items() if q.startswith(p + '/') and x['type'] == 'f'
-                 and q[len(p) + 1:] not in bd.get('files', {}) and q not in retired_paths]
+                 and q[len(p) + 1:] not in bd.get('files', {}) and q not in retired_paths
+                 and not temp_file_path(q, temp)]
         bad += [f'{e} unexpected' for e in extra]
         if bad:
             dr.add('hash', p, '; '.join(bad[:6]) + (f' (+{len(bad) - 6})' if len(bad) > 6 else ''), fix='install')
@@ -757,6 +767,13 @@ def compute_diff(m, d):
                 dr.add('temp-lost', k, f"temp {t['value']} but running {got} (reboot?) - `state revert {k}`")
             else:
                 dr.add('temp', k, f"{t['value']} (manifest {t.get('orig')}, by {t.get('by', '?')} {t.get('at', '')})")
+        elif k.startswith('file:'):
+            got = d.sha.get(k[5:])
+            if got and got != t['value']:
+                dr.add('temp-lost', k, f"temp {t['value'][:12]} but phone {got[:12]} - `state revert {k}`")
+            else:
+                dr.add('temp', k, f"{t['value'][:12]} from {t.get('local', '?')} (manifest {str(t.get('orig'))[:12]}, "
+                                  f"by {t.get('by', '?')} {t.get('at', '')})")
         else:
             dr.add('temp', k, f"{t['value']} (manifest {t.get('orig')}, {t.get('at', '')})")
     # processes
@@ -769,6 +786,8 @@ def compute_diff(m, d):
     ret = {r['path']: r for r in m.get('retired', [])}
     for p in sorted(d.files):
         x = d.files[p]
+        if temp_file_path(p, temp):
+            continue
         if p in ret:
             dr.add('retired', p, ret[p].get('reason', ''), fix='retire')
             continue
@@ -787,11 +806,29 @@ def compute_diff(m, d):
     return dr
 
 
+def temp_file_path(p, temp):
+    """a path installed by `put --temp`, or the .st-prev copy it kept"""
+    return 'file:' + p in temp or (p.endswith('.st-prev') and 'file:' + p[:-8] in temp)
+
+
 def short_delta(want, have):
     w, h = want.splitlines(), have.splitlines()
     plus = [l for l in h if l not in w][:3]
     minus = [l for l in w if l not in h][:3]
     return '; '.join([f'phone has "{l}"' for l in plus] + [f'manifest "{l}"' for l in minus])[:300]
+
+
+def save_last_diff(dr, d, m):
+    """PF/state/last-diff.json: the counts of the last diff, for `pa snap`"""
+    cnt = {}
+    for i in dr.items:
+        cnt[i['kind']] = cnt.get(i['kind'], 0) + 1
+    try:
+        json.dump({'at': now_utc().strftime('%Y-%m-%dT%H:%M:%SZ'), 'kern.uuid': d.h.get('kern.uuid'),
+                   'manifest': m.get('_spec'), 'counts': cnt,
+                   'drift': sum(v for k, v in cnt.items() if k not in INFO_KINDS)}, open(os.path.join(STATE, 'last-diff.json'), 'w'))
+    except OSError:
+        pass
 
 
 def report(dr, d, m, as_json=False, out=sys.stdout):
@@ -1477,6 +1514,40 @@ def cmd_set(m, tp, key, value, by):
     return 0
 
 
+def cmd_put(m, tp, local, remote, mode, by):
+    """temp file override: LOCAL -> REMOTE now (atomic); the phone's previous file is kept once as REMOTE.st-prev"""
+    lp = local if os.path.isabs(local) else os.path.join(PF, local)
+    if not os.path.isfile(lp):
+        die(f'no local file {local}')
+    if not re.fullmatch(r'/[A-Za-z0-9._/+@-]+', remote) or remote.endswith('/') or remote.endswith('.st-prev'):
+        die('REMOTE: an absolute file path')
+    check_writable(m, remote)
+    mode = mode or oct(os.stat(lp).st_mode & 0o7777)[2:]
+    if not re.fullmatch(r'[0-7]{3,4}', mode):
+        die('MODE: octal')
+    key, temp, sha = 'file:' + remote, load_temp(), sha256_file(lp)
+    entry = next((x for x in m.get('file', []) if x['path'] == remote), None) or {}
+    backup = temp.get(key, {}).get('backup')
+    if key not in temp:
+        q = shlex.quote(remote)
+        r, o = tp.sh(f"if [ -e {q} ]; then {T} cp -p {q} {q}.st-prev && echo saved; else echo absent; fi")
+        if r or not ('saved' in o or 'absent' in o):
+            print(f'backup of {remote} FAILED: {o[-200:]}')
+            return r or 1
+        backup = remote + '.st-prev' if 'saved' in o else None
+    r, o = tp.put(lp, remote, mode, entry.get('owner', '0:0'))
+    if r or sha not in o:
+        print(f'install {remote}: FAILED {o[-200:]}')
+        return r or 1
+    rel = os.path.relpath(lp, PF) if lp.startswith(PF + '/') else lp
+    temp[key] = {'value': sha, 'local': rel, 'mode': mode, 'backup': backup, 'orig': entry.get('sha256'),
+                 'by': by or os.environ.get('STATE_BY', ''), 'at': now_utc().strftime('%Y-%m-%dT%H:%MZ')}
+    save_temp(temp)
+    print(f"install {remote}: ok, sha {sha[:16]}, mode {mode}" + (f"; previous -> {backup}" if backup else "; new path") +
+          f"; restart {', '.join(as_list(entry.get('restart'))) or 'whatever uses it'}")
+    return 0
+
+
 def load_flag_with_temps(f, temp):
     """flag content with temp overrides: VAR=VALUE as a whole line (env files) or as a token (cell.on: k=v k=v ...)"""
     lines = f['content'].splitlines()
@@ -1517,6 +1588,18 @@ def cmd_revert(m, tp, keys):
             else:
                 r, o = tp.sh(f'/var/local/bin/sctl {k} {v}')
                 print(o.strip())
+        elif k.startswith('file:'):
+            p = k[5:]
+            q = shlex.quote(p)
+            e = next((x for x in m.get('file', []) if x['path'] == p), None)
+            if t.get('backup'):
+                r, o = tp.sh(f"{T} cp -p {q}.st-prev {q}.st-new && {T} mv -f {q}.st-new {q} && {T} rm -f {q}.st-prev && echo restored")
+                print(f'{p}: previous file restored' if 'restored' in o else f'{p}: restore FAILED {o[-200:]}')
+            elif e:
+                install_file(tp, e, m)
+            else:
+                r, o = tp.sh(f"{T} mv -f {q} {q}.st-reverted && echo moved")
+                print(f'{p}: new path, not in the manifest: moved aside to {p}.st-reverted' if 'moved' in o else f'{p}: FAILED {o[-200:]}')
         else:
             path = k.split(':', 1)[0]
             f = next((x for x in m.get('flag', []) if x['path'] == path), None)
@@ -1540,6 +1623,14 @@ def cmd_promote(spec, keys):
         if k.startswith('kern.'):
             sec = 'sysctl_expect' if k in m.get('sysctl_expect', {}) else 'sysctl'
             m.setdefault(sec, {})[k] = int(t['value'], 0)
+        elif k.startswith('file:'):
+            e = next((x for x in m.setdefault('file', []) if x['path'] == k[5:]), None)
+            if e is None:
+                e = {'path': k[5:]}
+                m['file'].append(e)
+            e.update({'source': t['local'], 'sha256': t['value'], 'mode': t.get('mode') or e.get('mode', '755')})
+            if t.get('backup'):
+                print(f'  (the phone still has {k[5:]}.st-prev: `state apply --retire` or remove it by hand)')
         else:
             path = k.split(':', 1)[0]
             f = next(x for x in m['flag'] if x['path'] == path)
@@ -1661,6 +1752,7 @@ def main(argv):
         d = read_dump(a.dump) or Dump(take_dump(m, tp))
         dr = compute_diff(m, d)
         report(dr, d, m, as_json=a.json)
+        save_last_diff(dr, d, m)
         return 1 if [i for i in dr.items if i['kind'] not in INFO_KINDS] else 0
     if c == 'apply':
         return cmd_apply(m, tp, a)
@@ -1670,6 +1762,10 @@ def main(argv):
         if len(a.args) != 2 or not a.temp:
             die('usage: set KEY VALUE --temp   (permanent changes go into the manifest in git)')
         return cmd_set(m, tp, a.args[0], a.args[1], a.by)
+    if c == 'put':
+        if len(a.args) not in (2, 3) or not a.temp:
+            die('usage: put LOCAL REMOTE [MODE] --temp   (permanent: the file goes into the manifest, then apply)')
+        return cmd_put(m, tp, a.args[0], a.args[1], a.args[2] if len(a.args) == 3 else None, a.by)
     if c == 'revert':
         return cmd_revert(m, tp, a.args or die('revert KEY... | all'))
     die(f'unknown command {c}')
