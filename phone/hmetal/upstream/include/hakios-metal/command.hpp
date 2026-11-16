@@ -15,6 +15,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -346,7 +347,7 @@ public:
 
 private:
     friend class CommandQueue;
-    explicit CommandBuffer(CommandQueue& queue) : queue_(queue) {}
+    explicit CommandBuffer(CommandQueue& queue) : queue_(queue) { stream_.adoptRecycled(); }   // (ws-hm-int13)
     std::vector<Mark> marks_;
     uint32_t marksLost_ = 0;
     uint32_t submittedWords_ = 0;   // (redfin hmv6) the command IB as submitted: its size and GPU address
@@ -401,39 +402,136 @@ public:
     public:
         // whether REG held VALUE; it holds VALUE from now on
         bool hold(uint32_t reg, uint32_t value) {
-            if (keys_.empty() || 2 * (used_ + 1) > keys_.size()) grow();
-            const size_t mask = keys_.size() - 1;
+            if (slots_.empty() || 2 * (used_ + 1) > slots_.size()) grow();
+            const size_t mask = slots_.size() - 1;
             for (size_t i = (reg * 2654435761u) & mask;; i = (i + 1) & mask) {
-                if (keys_[i] == reg) {
-                    const bool same = values_[i] == value;
-                    values_[i] = value;
+                Slot& sl = slots_[i];
+                if (sl.key == reg) {
+                    const bool same = sl.value == value;
+                    if (!same && journaling_ && !snapped_) log_.push_back(Undo{reg, sl.value, true});
+                    sl.value = value;
                     return same;
                 }
-                if (keys_[i] == kEmpty) {
-                    keys_[i] = reg;
-                    values_[i] = value;
+                if (sl.key == kEmpty) {
+                    if (journaling_ && !snapped_) log_.push_back(Undo{reg, 0, false});
+                    sl.key = reg;
+                    sl.value = value;
                     used_++;
                     return false;
                 }
             }
         }
         void clear() {
-            std::fill(keys_.begin(), keys_.end(), kEmpty);
+            if (journaling_ && !snapped_) snapshot();
+            for (Slot& sl : slots_) sl.key = kEmpty;
             used_ = 0;
+        }
+        // (ws-hm-int13) HM_DEADFILL's take-back: what the table holds now is what rollback() returns it to. Was a copy
+        // of the whole table every draw (two vectors of 1024+ words: the draw path's biggest memmove after cullNote);
+        // now each change after mark() is logged (a draw changes a few dozen registers) and undone in reverse, the
+        // whole table copied only when clear() empties it while marked (a packet that made deduplication forget).
+        void mark() {
+            journaling_ = true;
+            snapped_ = false;
+            log_.clear();
+        }
+        void unmark() {
+            journaling_ = false;
+            snapped_ = false;
+            log_.clear();
+        }
+        void rollback() {
+            if (!journaling_) return;
+            journaling_ = false;   // (the undo below is not logged)
+            if (snapped_) {
+                slots_.swap(snap_);
+                used_ = snapUsed_;
+            } else {
+                for (size_t k = log_.size(); k-- > 0;) {
+                    const Undo& u = log_[k];
+                    if (u.present) hold(u.reg, u.value);
+                    else erase(u.reg);
+                }
+            }
+            snapped_ = false;
+            log_.clear();
         }
     private:
         static constexpr uint32_t kEmpty = ~0u;
-        void grow() {
-            std::vector<uint32_t> keys = std::move(keys_), values = std::move(values_);
-            keys_.assign(std::max<size_t>(1024, keys.size() * 2), kEmpty);
-            values_.assign(keys_.size(), 0);
-            used_ = 0;
-            for (size_t i = 0; i < keys.size(); i++) {
-                if (keys[i] != kEmpty) hold(keys[i], values[i]);
+        // (ws-hm-int13) a register and its value side by side: one cache line a lookup (were two vectors, two lines)
+        struct Slot {
+            uint32_t key, value;
+        };
+        struct Undo {
+            uint32_t reg, value;
+            bool present;   // REG held VALUE before (false: it was not in the table)
+        };
+        void snapshot() {
+            snap_ = slots_;
+            snapUsed_ = used_;
+            snapped_ = true;
+        }
+        // REG out of the table (linear probing: the entries after it in its run moved back where their probe allows)
+        void erase(uint32_t reg) {
+            if (slots_.empty()) return;
+            const size_t mask = slots_.size() - 1;
+            size_t i = (reg * 2654435761u) & mask;
+            while (slots_[i].key != reg) {
+                if (slots_[i].key == kEmpty) return;
+                i = (i + 1) & mask;
+            }
+            slots_[i].key = kEmpty;
+            used_--;
+            for (size_t j = (i + 1) & mask; slots_[j].key != kEmpty; j = (j + 1) & mask) {
+                const size_t home = (slots_[j].key * 2654435761u) & mask;
+                // the entry at J may move to the hole at I when I lies cyclically in [HOME, J)
+                const bool movable = i <= j ? (home <= i || home > j) : (home <= i && home > j);
+                if (movable) {
+                    slots_[i] = slots_[j];
+                    slots_[j].key = kEmpty;
+                    i = j;
+                }
             }
         }
-        std::vector<uint32_t> keys_, values_;
+        void grow() {
+            std::vector<Slot> old = std::move(slots_);
+            slots_.assign(std::max<size_t>(1024, old.size() * 2), Slot{kEmpty, 0});
+            used_ = 0;
+            const bool j = journaling_;
+            journaling_ = false;   // (ws-hm-int13: the rehash is not a change)
+            for (const Slot& sl : old) {
+                if (sl.key != kEmpty) hold(sl.key, sl.value);
+            }
+            journaling_ = j;
+        }
+        std::vector<Slot> slots_;
         size_t used_ = 0;
+        bool journaling_ = false, snapped_ = false;
+        std::vector<Undo> log_;
+        std::vector<Slot> snap_;
+        size_t snapUsed_ = 0;
+    };
+
+    // (ws-hm-int13) what decided a draw's program-and-pass state (render.cpp: draw), in place: was a std::vector<uint8_t>
+    // built by five inserts and copied twice a draw (three allocations); the same bytes, compared the same way
+    struct StaticKey {
+        static constexpr size_t kBytes = 2 * sizeof(const void*) + 3 * sizeof(uint32_t) + sizeof(ColorBlend) + sizeof(Program::moreBlend) +
+                                         sizeof(render::Options);
+        size_t n = 0;
+        uint8_t bytes[kBytes];
+        StaticKey() = default;
+        StaticKey(const StaticKey& o) : n(o.n) { if (n != 0) memcpy(bytes, o.bytes, n); }
+        StaticKey& operator=(const StaticKey& o) {
+            n = o.n;
+            if (n != 0 && this != &o) memcpy(bytes, o.bytes, n);
+            return *this;
+        }
+        bool empty() const { return n == 0; }
+        void add(const void* p, size_t k) {
+            memcpy(bytes + n, p, k);
+            n += k;
+        }
+        bool operator==(const StaticKey& o) const { return n == o.n && memcmp(bytes, o.bytes, n) == 0; }
     };
 
 private:
@@ -443,7 +541,7 @@ private:
         render::Options options;
         uint64_t table;   // the GPU address of the pass's table: a piece (below), kept by the command buffer
         RegShadow regs;   // what each register written in the pass holds (render.cpp: appendDeduped)
-        std::vector<uint8_t> staticKey;   // what decided the last draw's program-and-pass state (render.cpp: draw)
+        StaticKey staticKey;   // what decided the last draw's program-and-pass state (render.cpp: draw)
         // A pass drawn in GMEM (gmemPlan and every draw gmemDrawOk) is recorded rather than streamed: its draws gather
         // in BODIES, deduplicated among themselves from nothing (BODY_REGS) since each tile replays them after the
         // tile's own register writes, and closePass puts them in the tiles.
@@ -469,8 +567,8 @@ private:
         struct DeadFill {
             bool armed = false;
             size_t start = 0, end = 0;
-            RegShadow regs;
-            std::vector<uint8_t> staticKey;
+            // (the dedup state from before it: REGS marked, RegShadow::mark / rollback, ws-hm-int13)
+            StaticKey staticKey;
             render::DrawCache cache;   // (ws-hm-drawcpu)
             bool lastFetched = false;
             std::vector<uint8_t> key;
@@ -667,6 +765,7 @@ private:
     uint64_t gpuTicks_[2] = {0, 0};                     // ...as finish read them
     bool unsubmitted_ = false;                          // (redfin) empty: completed in order without the GPU
     pm4::Stream scratch_[4];                            // (redfin) draw()'s head, body, headSys, bodySys, reused
+    std::vector<uint8_t> dfKeyScratch_;                 // (ws-hm-int13) draw()'s deadFillKey, reused (swapped with df.key)
 };
 
 class CommandQueue {

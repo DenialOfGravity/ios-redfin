@@ -1411,7 +1411,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         return false;
     }
     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
-    std::vector<PushedRange> vsRanges, fsRanges;
+    // (ws-hm-int13) the four per-draw vectors below reused, this thread's (were four new ones a draw)
+    static thread_local std::vector<PushedRange> tlsVsRanges, tlsFsRanges;
+    std::vector<PushedRange>& vsRanges = tlsVsRanges;
+    std::vector<PushedRange>& fsRanges = tlsFsRanges;
+    vsRanges.clear(), fsRanges.clear();
     if (!pushedRanges(vs, vsBindings, &vsRanges, why, program.cbReadEnd[0], &program) || !pushedRanges(fs, fsBindings, &fsRanges, why, program.cbReadEnd[1], &program)) {
         return false;
     }
@@ -1546,7 +1550,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (!stageTextures(vs, vsBindings, pass, &vsTex, why, gmem) || !stageTextures(fs, fsBindings, pass, &fsTex, why, gmem)) {
         return false;
     }
-    std::vector<uint32_t> vsUbos, fsUbos;
+    static thread_local std::vector<uint32_t> tlsVsUbos, tlsFsUbos;
+    std::vector<uint32_t>& vsUbos = tlsVsUbos;
+    std::vector<uint32_t>& fsUbos = tlsFsUbos;
+    vsUbos.clear(), fsUbos.clear();
     if (!uboDescriptors(vs, vsBindings, vsProgram, &vsUbos, why) || !uboDescriptors(fs, fsBindings, fsProgram, &fsUbos, why)) {
         return false;
     }
@@ -1936,9 +1943,15 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
         if (!skipProg) loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, chip().instrCacheSize), address);
         if (s.k.numImmediates != 0 && !skipProg) {
-            std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
-            imm.resize((imm.size() + 3) & ~size_t(3), 0);
-            loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
+            // (ws-hm-int13) on the stack when it fits (was a vector a draw), the same words
+            const size_t nImm = (size_t(s.k.numImmediates) + 3) & ~size_t(3);
+            uint32_t immLocal[256];
+            std::vector<uint32_t> immHeap;
+            uint32_t* imm = immLocal;
+            if (nImm > 256) immHeap.resize(nImm), imm = immHeap.data();
+            memcpy(imm, s.k.immediates, size_t(s.k.numImmediates) * 4);
+            for (size_t z = s.k.numImmediates; z < nImm; z++) imm[z] = 0;
+            loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(nImm / 4), imm, uint32_t(nImm));
         }
         for (const PushedRange& r : ranges) {
             if (r.copy) {
@@ -2034,14 +2047,15 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
               vfdControl1(vs.vertexIdRegid, vs.instanceIdRegid, kRegidNone, kRegidNone), vfdControl2None(), vfdControl3None(), vfdControl4None(),
               vfdControl5None(), 0});
         if (fetch.count != 0) {
-            std::vector<uint32_t> dec, dst;
-            for (uint32_t loc = 0; loc < fetch.count; loc++) {
-                dec.push_back(fetch.decode[loc]);
-                dec.push_back(fetch.stepRate[loc]);
-                dst.push_back(fetch.dest[loc]);
+            uint32_t dec[2 * kMaxVertexAttributes], dst[kMaxVertexAttributes];   // (ws-hm-int13: were two vectors grown a word at a time)
+            const uint32_t nf = std::min<uint32_t>(fetch.count, kMaxVertexAttributes);
+            for (uint32_t loc = 0; loc < nf; loc++) {
+                dec[2 * loc] = fetch.decode[loc];
+                dec[2 * loc + 1] = fetch.stepRate[loc];
+                dst[loc] = fetch.dest[loc];
             }
-            stream.registers(REG_A6XX_VFD_DECODE_INSTR, dec.data(), uint32_t(dec.size()));
-            stream.registers(REG_A6XX_VFD_DEST_CNTL_INSTR, dst.data(), uint32_t(dst.size()));
+            stream.registers(REG_A6XX_VFD_DECODE_INSTR, dec, 2 * nf);
+            stream.registers(REG_A6XX_VFD_DEST_CNTL_INSTR, dst, nf);
             for (uint32_t bi = 0; bi < kMaxVertexBuffers; bi++) {
                 if (!fetch.used[bi]) continue;
                 regs(stream, regVfdFetchBase(bi), {uint32_t(fetch.base[bi]), uint32_t(fetch.base[bi] >> 32), fetch.size[bi], fetch.stride[bi]});
@@ -2143,10 +2157,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // (a depth written by the stage, into a pass with a depth attachment: its register, and FRAG_WRITES_Z, as
         // tu6_emit_fs_outputs sets them for a stage writing FRAG_RESULT_DEPTH)
         const bool fragDepth = fs.depthRegid != kRegidNone && pass.depth != nullptr;
-        std::vector<uint32_t> out = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
-                                     A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};
-        for (uint32_t i = 0; i < numOut; i++) out.push_back(spFsOutputReg(fs.colorRegid[i], fs.colorHalf[i] != 0));
-        stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out.data(), uint32_t(out.size()));
+        uint32_t out[3 + kMaxColorOutputs] = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
+                                              A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};   // (ws-hm-int13: was a vector)
+        uint32_t nOut = 3;
+        for (uint32_t i = 0; i < numOut && i < kMaxColorOutputs; i++) out[nOut++] = spFsOutputReg(fs.colorRegid[i], fs.colorHalf[i] != 0);
+        stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out, nOut);
         regs(stream, REG_A6XX_RB_FS_OUTPUT_CNTL0, {(fragDepth ? A6XX_RB_FS_OUTPUT_CNTL0_FRAG_WRITES_Z : 0u) | (dual ? A6XX_RB_FS_OUTPUT_CNTL0_DUAL_COLOR_IN_ENABLE : 0u),
                                                    A6XX_RB_FS_OUTPUT_CNTL1_MRT(numRt), components});
     }
@@ -3446,8 +3461,9 @@ uint32_t deadFillRole(const Program& program, const RenderPass& pass, const Draw
 }
 // the geometry a draw rasterises, as bytes: equal keys, equal pixels covered. A vertex buffer is named by its object and
 // offset, or, when it is a small one (setVertexBytes: at most 4 KB from the offset), by its bytes
-std::vector<uint8_t> deadFillKey(const Program& program, const Draw& d, const Bindings& vs) {
-    std::vector<uint8_t> k;
+// (ws-hm-int13) into K, emptied first (its capacity kept: was a new vector grown from nothing every draw)
+void deadFillKey(const Program& program, const Draw& d, const Bindings& vs, std::vector<uint8_t>& k) {
+    k.clear();
     auto add = [&](const void* p, size_t n) { k.insert(k.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
     const Program* pp = &program;
     add(&pp, sizeof pp);
@@ -3475,7 +3491,6 @@ std::vector<uint8_t> deadFillKey(const Program& program, const Draw& d, const Bi
     }
     for (const Texture* t : vs.textures) add(&t, sizeof t);
     for (const Sampler* s : vs.samplers) add(&s, sizeof s);
-    return k;
 }
 uint64_t fillsDropped() { return gFillsDropped.load(std::memory_order_relaxed); }
 
@@ -4272,8 +4287,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     // (redfin hm-int4) HM_DEADFILL: the pass's last draw taken back when this one overwrites every pixel of it
     const int dfMode = !profileDraws_ ? deadFillMode() : 0;
     const uint32_t dfRole = dfMode != 0 ? deadFillRole(program, pass, d) : 0;
-    std::vector<uint8_t> dfKey;
-    if (dfRole != 0) dfKey = deadFillKey(program, d, *vsb);
+    std::vector<uint8_t>& dfKey = dfKeyScratch_;   // (ws-hm-int13: reused)
+    dfKey.clear();
+    if (dfRole != 0) deadFillKey(program, d, *vsb, dfKey);
     // (ws-hm-cull) HM_DEADFILL=2: a draw of no side effect that writes any attachments may be held too (dfVictim,
     // dfWrites), and the next draw takes it back when it is a cover over the whole window (cullNote: CoreAnimation's
     // opaque rectangle) overwriting every attachment the held one writes, whatever either's geometry. CoreAnimation's
@@ -4285,7 +4301,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     bool df2Noted = false;
     if (dfMode >= 2 && cullPassOk(pass)) {
         const PassCullNote cn = cullNote(program, pass, d, *vsb, *fsb, 0, false);
-        if (render::noUc()) df2Note = cn, df2Noted = true;
+        df2Note = cn, df2Noted = true;   // (ws-hm-int13: whatever HM_NOUC; was HM_NOUC=1 alone, HM_CULL's cullNote of it a second time)
         df2Victim = cn.victim && cn.r[0] < cn.r[2] && cn.r[1] < cn.r[3];
         df2Writes = cn.writes;
         df2Full = cn.cover && cn.full;
@@ -4311,7 +4327,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             marks_.push_back(cur);
         }
         stream_.truncate(open_->df.start);
-        open_->regs = open_->df.regs;
+        open_->regs.rollback();   // (ws-hm-int13: was a copy of the table saved as the draw was armed)
         open_->staticKey = open_->df.staticKey;
         open_->cache = open_->df.cache;   // (ws-hm-drawcpu)
         open_->lastFetched = open_->df.lastFetched;
@@ -4321,19 +4337,22 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         counts_.fillsDropped++;
         gFillsDropped.fetch_add(1, std::memory_order_relaxed);
     }
-    if (open_ != nullptr) open_->df.armed = false;
+    if (open_ != nullptr) {
+        open_->df.armed = false;
+        open_->regs.unmark();   // (ws-hm-int13)
+    }
     render::Options encodeOptions = options;
     // The state a draw's program and pass alone decide (render::Options' zsNone, mrt, msaaOff, renderCntl, lrzOff, vpc,
     // fsInputs, fsOutputs: register writes and nothing else) is not encoded again for a draw whose program, blending,
     // sample count and options are the last draw's in this pass: deduplication dropped every word of it anyway, and
     // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
     // deduplication forget what the registers hold (staticKey emptied then).
-    std::vector<uint8_t> staticKey;
+    StaticKey staticKey;   // (ws-hm-int13: in place)
     bool staticSame = false;   // (ws-hm-drawcpu)
     if (options.dedupRegs) {
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
-        auto add = [&](const void* p, size_t n) { staticKey.insert(staticKey.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
+        auto add = [&](const void* p, size_t n) { staticKey.add(p, n); };
         add(ptrs, sizeof ptrs);
         add(sizes, sizeof sizes);
         add(&program.blend, sizeof program.blend);
@@ -4433,6 +4452,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         open_->table = passTable.gpuAddress();
         if (carried) {
             open_->regs = std::move(carryRegs_);
+            open_->regs.unmark();   // (ws-hm-int13)
             counts_.headsCarried++;
         }
         carryOk_ = false;
@@ -4526,7 +4546,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         open_->dfWrites = df2Writes;
         open_->dfPx = df2Px;
         open_->df.start = stream_.size();
-        open_->df.regs = open_->regs;
+        open_->regs.mark();   // (ws-hm-int13: was open_->df.regs = open_->regs, the whole table copied every draw)
         open_->df.staticKey = open_->staticKey;
         open_->df.cache = open_->cache;   // (ws-hm-drawcpu)
         open_->df.lastFetched = open_->lastFetched;
@@ -4534,7 +4554,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     if (options.dedupRegs && open_->options.dedupRegs) {
         bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
         if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
-        open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
+        open_->staticKey = forgot ? StaticKey() : staticKey;
         open_->cache = (cache != nullptr && !forgot) ? nextCache : render::DrawCache{};   // (ws-hm-drawcpu)
     } else {
         appendStream(into, body);
@@ -4571,7 +4591,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     if (traceTs) traceStamp(uint32_t(traceDraws_.size() - 1));   // (redfin hm-trace)
     if (dfArm) {
         open_->df.end = stream_.size();
-        open_->df.key = std::move(dfKey);
+        std::swap(open_->df.key, dfKey);   // (ws-hm-int13: the old key's storage reused next draw)
         open_->df.armed = true;
     }
     counts_.draws++;

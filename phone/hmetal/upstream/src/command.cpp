@@ -713,6 +713,7 @@ CommandBuffer::~CommandBuffer() {
         queue_.giveBuffer(std::move(drawStamps_));
         queue_.giveBuffer(std::move(traceStamps_));   // (redfin hm-trace)
     }
+    pm4::Stream::recycle(std::move(stream_));   // (ws-hm-int13) its storage for a later buffer's stream
 }
 
 void CommandBuffer::finish(Status s) {

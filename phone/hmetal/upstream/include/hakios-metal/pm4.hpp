@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <vector>
 
 namespace hakios::metal::pm4 {
@@ -79,9 +80,20 @@ public:
     void clear() { words_.clear(); }
     void truncate(size_t n) { if (n < words_.size()) words_.resize(n); }   // (redfin hm-int4) HM_DEADFILL's take-back
     void patch(size_t at, uint32_t word) { if (at < words_.size()) words_[at] = word; }   // (ws-hm-cull) HM_CULL: a draw packet made a CP_NOP
+    // (ws-hm-int13) a command buffer's stream takes the storage of an earlier one's (recycle / adopt: its capacity, so
+    // the stream does not grow from nothing by doubling, a copy of every word so far each time, frame after frame)
+    static void recycle(Stream&& s);
+    void adoptRecycled();
 
 private:
     void command(uint32_t opcode, uint32_t count);
+    // (ws-hm-int13) N more words at the end, uninitialised as far as the caller is concerned (it writes them all)
+    uint32_t* grow(size_t n) {
+        const size_t o = words_.size();
+        if (o + n > words_.capacity()) words_.reserve(std::max(o + n, 2 * words_.capacity()));
+        words_.resize(o + n);
+        return words_.data() + o;
+    }
     void address(uint64_t a) {
         words_.push_back(uint32_t(a));
         words_.push_back(uint32_t(a >> 32));

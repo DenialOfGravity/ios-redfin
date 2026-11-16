@@ -2845,6 +2845,10 @@ bool bindArgumentBuffers(const std::vector<Resource>& resources, Bindings* b, st
     // the sets as the caller bound them: a member's allocated index may be a set's own Metal index (the front end
     // allocates above the direct arguments, and a set is not one), so a member bound there must not change where the
     // next member's set is read from
+    // (ws-hm-int13) none: nothing to do (the copy of the table below was made for every draw, members or not)
+    bool any = false;
+    for (const Resource& r : resources) any = any || r.argbufSet != ~0u;
+    if (!any) return true;
     const std::vector<Binding> sets = b->buffers;
     for (const Resource& r : resources) {
         if (r.argbufSet == ~0u) continue;
