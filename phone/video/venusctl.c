@@ -100,6 +100,12 @@
  *   venusctl fwdump [ADDR]  read-only, on the boot after a reset, before any re-init: the HFI block at ADDR
  *                           (0xa2600000): table still ours?, queue headers, SFR (+0x2fe000), dbgq ring strings,
  *                           unread msgq packets, failure strings; the core only if its gate reads on
+ * ws-video-dec (logs/research/video-reset-2026-11-16.md): decode --clip FILE [--seconds S] [--loop] keeps an active
+ *   H.264/HEVC decode session fed for S s of wall clock (default 900), looping the clip if --loop, to test whether an
+ *   active session avoids the ~270 s idle PMIC reset. No YUV file, no per-frame log (NOCOPY + quiet); counts frames,
+ *   fps, SYS/SESSION errors; prints "survived S s, phone alive" (absent if a reset killed us). As insurance a SYS_PING
+ *   keepalive fires on any idle gap (VENUSCTL_PING_MS, default 1000 ms); VENUSCTL_INTCLR=1 also acks interrupts.
+ *   watch SECS --sysinit with VENUSCTL_PING_MS=1000 is a ping-only keepalive test (no decode). init --phys first.
  */
 #include <stdint.h>
 #include <unistd.h>
@@ -154,6 +160,8 @@ int main(int argc, char **argv)
 	int sysinit = 0;	/* redfin: watch --sysinit */
 	int no_shutdown = 0, keep = 0, frames = 5, hevc = -1;	/* 4e: -1 = from the stream */
 	uint64_t phys = 0, bufphys = 0;
+	const char *clip = NULL;	/* ws-video-dec: decode --clip FILE --seconds S --loop */
+	int seconds = 0, do_loop = 0;
 	const char *steplog = NULL;	/* redfin: --step [--step-file F] */
 	uint32_t debug = 0x18;	/* HFI_DEBUG_MSG_ERROR | FATAL (guess: msm_vidc_debug.c's default is not in our source copy) */
 	setvbuf(stdout, NULL, _IOLBF, 0);	/* a hang shows the last line */
@@ -187,6 +195,12 @@ int main(int argc, char **argv)
 			sysinit = 1;
 		else if (!strcmp(argv[i], "--dry"))
 			vc_stop_at = "ftb";
+		else if (!strcmp(argv[i], "--clip") && i + 1 < argc)
+			clip = argv[++i];
+		else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
+			seconds = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--loop"))
+			do_loop = 1;
 		else if (!strcmp(argv[i], "--hevc"))
 			hevc = 1;
 		else if (!strcmp(argv[i], "--h264"))
@@ -225,6 +239,8 @@ int main(int argc, char **argv)
 	stale_drop(AHB_STATE);
 	if (arg2 && strcmp(cmd, "memtest") && strcmp(cmd, "decode"))
 		goto usage;
+	if (!strcmp(cmd, "decode") && clip && !arg)
+		return decode_loop(debug, clip, seconds, do_loop, bufphys, hevc);
 	if (!strcmp(cmd, "decode") && arg && arg2 && !arg3 && frames > 0)
 		return decode(debug, arg, arg2, frames, bufphys, hevc);
 	if (!strcmp(cmd, "memtest") && arg && arg2 && arg3 && (!strcmp(arg3, "write") || !strcmp(arg3, "check")))
@@ -261,6 +277,7 @@ usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | rails (read-only) | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
 		"       | session [--debug MASK] | decode IN.h264|IN.h265 OUT.yuv [--frames N] [--bufphys ADDR] [--debug MASK]\n"
+		"       | decode --clip FILE [--seconds S] [--loop]  (ws-video-dec: active session S s, idle-reset test)\n"
 		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"
 		"       any command: [--step] [--step-file FILE]  (default /var/local/venus-step.log)\n"
 		"       | shutdown | smmu (read-only: SMRs for 0x1300-0x13ff, global faults) | map-sid SID (after boot --keep)\n"
@@ -269,6 +286,8 @@ usage:
 		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
 		"       | memtest ADDR SIZE write|check\n"
 		"       | fwdump [ADDR] (read-only, after a reset: SFR, debug ring, queues of the HFI block, default 0xa2600000)\n"
-		"       P0d watch env (default off): VENUSCTL_PC=1 [VENUSCTL_PC_DELAY_MS=1500] VENUSCTL_INTCLR=1\n");
+		"       P0d watch env (default off): VENUSCTL_PC=1 [VENUSCTL_PC_DELAY_MS=1500] VENUSCTL_INTCLR=1\n"
+		"       ws-video-dec: decode --clip env VENUSCTL_PING_MS (idle keepalive ms, default 1000) VENUSCTL_NOCOPY;\n"
+		"       watch --sysinit VENUSCTL_PING_MS=1000 = ping-only keepalive test\n");
 	return 2;
 }

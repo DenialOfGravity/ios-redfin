@@ -1973,6 +1973,30 @@ static int intclr_service(const char *when)
 	return wait_msg(0, 0);
 }
 
+static unsigned ping_n;
+/* ws-video-dec keepalive (logs/research/video-reset-2026-11-16.md): the firmware's reset timer, armed at
+ * auth_and_reset, is deferred by any serviced command/response (one ack reached 449 s). Send HFI_CMD_SYS_PING and
+ * drain the reply: PING_ACK (0x220002), or on some firmware a SESSION_ERROR because the cookie is read as a session
+ * id -- either way the firmware ran a command, which is the point. Non-fatal unless VENUSCTL_PING_FATAL. Used by the
+ * watch VENUSCTL_PING_MS ping-only mode and by decode-loop on an idle gap. Returns wait_msg's result (0 = acked). */
+static int sys_ping(const char *when)
+{
+	uint32_t pg[3] = { 12, 0x210002, 0x76656e75 };	/* HFI_CMD_SYS_PING; client_data: our own cookie */
+	if (q_write(pg))
+		return -1;
+	int fatal = getenv("VENUSCTL_PING_FATAL") != NULL;
+	wait_soft = !fatal;
+	int r = wait_msg(0x220002, 1000);
+	wait_soft = 0;
+	ping_n++;
+	if (!r)
+		printf("venus: ping #%u (%s): PING_ACK client_data %#x\n", ping_n, when, pkt[2]);
+	else
+		printf("venus: ping #%u (%s): no PING_ACK (firmware serviced the command; non-fatal)\n", ping_n, when);
+	pm_step("ping #%u (%s): acked %d", ping_n, when, !r);
+	return r;
+}
+
 static int pc_res = -1;	/* watch line: -1 not tried, 0 pc_ready + wfi, 1 skipped (not idle/wfi), 2 timeout */
 static double pc_ready_ms = -1, pc_wfi_ms = -1;
 
@@ -2075,6 +2099,11 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 	int pcm = env_on("VENUSCTL_PC");
 	intclr_on = env_on("VENUSCTL_INTCLR");
 	vc_decode = pcm || intclr_on;
+	int ping_ms = getenv("VENUSCTL_PING_MS") ? atoi(getenv("VENUSCTL_PING_MS")) : 0;	/* ws-video-dec ping-only keepalive */
+	if (ping_ms && !(fwq && v.sysinit))
+		printf("venus: watch: VENUSCTL_PING_MS ignored: SYS_INIT not done (watch --sysinit)\n");
+	else if (ping_ms)
+		printf("venus: watch: VENUSCTL_PING_MS=%d: SYS_PING every %d ms as a keepalive (ping-only reset test)\n", ping_ms, ping_ms);
 	if (intclr_on)
 		printf("venus: watch: VENUSCTL_INTCLR=1: a non-zero INTR_STATUS is acked as Linux does (A2HSOFTINTCLR,"
 		       " WRAPPER_INTR_CLEAR), then the queues drained; INTR_MASK untouched\n");
@@ -2084,7 +2113,7 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 		printf("venus: watch: pc: queue failure or firmware error during PC_PREP, watching on\n");
 	uint64_t s = 0x15000000ull;
 	uint32_t last[16] = { 0 };
-	double t0 = mono_ms(), tl = -1e9;
+	double t0 = mono_ms(), tl = -1e9, tp = mono_ms();
 	unsigned n = 0;
 	for (;;) {
 		double t = mono_ms();
@@ -2133,6 +2162,10 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 			printf("venus: watch: queue read failed\n");
 		if (on && fwq && wait_msg(0, 0))	/* drain + print firmware debug/messages (q_read only touches queue memory) */
 			printf("venus: watch: queue read failed\n");
+		if (on && fwq && v.sysinit && ping_ms && t - tp >= ping_ms) {	/* ws-video-dec keepalive */
+			sys_ping("watch");
+			tp = mono_ms();
+		}
 		if (on && n++ % 25 == 0)
 			win_faults("watch");
 		delay_ms(200);
@@ -3158,6 +3191,155 @@ close:
 	printf("venus: wrote %d frames %dx%d NV12 (Y, then interleaved CbCr) to %s\n", dc.frames, dc.cw, dc.ch, outp);
 	core_status("after decode");
 	printf("venus: decode %s: venusctl shutdown, then power off\n", rc ? "FAILED" : "ok (stage 3 go)");
+	return rc;
+}
+
+/* ws-video-dec (logs/research/video-reset-2026-11-16.md): keep an active H.264/HEVC decode session fed for `seconds`
+ * of wall-clock time, looping the clip (--loop) to reach it, to test whether an active HFI session avoids the
+ * ~270 s idle PMIC reset (a firmware-internal timer armed at auth_and_reset; only continuous servicing defers it).
+ * Unlike decode() this writes no YUV file and keeps no per-frame log: VENUSCTL_NOCOPY forces frame_out's count-only
+ * path and vc_quiet silences the per-buffer lines, so tens of thousands of frames don't flood the klog. `want` is
+ * left effectively unbounded so the output buffers keep recycling the whole run. The EBD/FBD traffic services the
+ * firmware continuously; as insurance, if ever there is an idle gap with no buffer-done traffic for VENUSCTL_PING_MS
+ * (default 1000) ms, a SYS_PING is sent and drained so the firmware is never left released-and-unserviced. On the
+ * deadline it sends EOS, drains, closes. VENUSCTL_INTCLR=1 also acks interrupts in the loop as Linux's ISR does
+ * (the msgq is drained every pass regardless). It counts decoded frames and fps, decodes any SYS_ERROR/SESSION_ERROR,
+ * and prints the final "survived S s, phone alive" line -- which only appears if no reset killed the process; a reset
+ * leaves the step log's last line as the last timestamp before it. */
+int decode_loop(uint32_t debug, const char *clip, int seconds, int loop, uint64_t bufphys, int hevc)
+{
+	size_t len = 0;
+	uint8_t *s = slurp(clip, &len);
+	if (!s || !len) {
+		printf("venus: refused: can't read %s\n", clip);
+		return 1;
+	}
+	static uint32_t off[NAU], alen[NAU];
+	struct h264_sps sps = { 0, 0, 0, 0, 0, 0 };
+	if (hevc < 0)	/* 4e: from the stream's first NAL header (venusctl --h264/--hevc decide) */
+		hevc = hevc_detect(s, len);
+	struct hevc_sps hs = { 0 };
+	int nau = hevc ? split_aus_hevc(s, len, off, alen, NAU, &sps, &hs) : split_aus(s, len, off, alen, NAU, &sps);
+	if (hevc && nau >= 0 && !hevc_main8(&hs)) {
+		printf("venus: refused: HEVC profile %d, chroma format %d, %d/%d bit: 8-bit 4:2:0 Main only\n", hs.profile,
+		       hs.chroma, hs.depth_y, hs.depth_c);
+		return 1;
+	}
+	if (nau < 0) {
+		nau = -nau - 1;
+		printf("venus: no SPS parsed: default 1920x1088; the firmware's SEQUENCE_CHANGED decides\n");
+		sps = (struct h264_sps){ .w = 1920, .h = 1088, .cw = 1920, .ch = 1080 };
+	}
+	if (!nau)
+		return 1;
+	if (seconds <= 0)
+		seconds = 900;
+	int ping_ms = getenv("VENUSCTL_PING_MS") ? atoi(getenv("VENUSCTL_PING_MS")) : 1000;	/* idle-gap keepalive */
+	printf("venus: decode-loop: %s: %zu bytes, %d access units%s; loop %d, target %d s, keepalive %d ms\n", clip, len,
+	       nau, hevc ? " (HEVC)" : "", loop, seconds, ping_ms);
+
+	setenv("VENUSCTL_NOCOPY", "1", 0);	/* count-only frame path (no copy-out, no per-frame line); keep any override */
+	vc_quiet = 1;				/* no ETB/EBD/FBD per-buffer lines over tens of thousands of frames */
+	int intclr = env_on("VENUSCTL_INTCLR");
+	if (intclr)
+		intclr_on = 1;
+
+	uint64_t mb = getenv("VENUSCTL_BUF_MB") ? strtoull(getenv("VENUSCTL_BUF_MB"), NULL, 0) : 64;
+	if (vdec_prepare(debug, bufphys, mb, 0x7fffffff, &sps, hevc))	/* want ~unbounded: never stop on a frame count */
+		return 1;
+	uint32_t maxau = 0;
+	for (int i = 0; i < nau; i++)
+		if (alen[i] > maxau)
+			maxau = alen[i];
+	int rc = 1, st = vdec_start(maxau);
+	if (st == 1)
+		return 1;
+	if (st == 3) {	/* --stop-at reached inside start: nothing to loop */
+		printf("venus: decode-loop: --stop-at reached before any input; nothing looped\n");
+		rc = dc.err ? 1 : 0;
+		goto close;
+	}
+	if (st)
+		goto close;
+
+	int next = 0, eos_sent = 0, reached = 0;
+	unsigned last_acts = dc.acts;
+	uint64_t fcount = 0;	/* monotonic frame number -> a never-repeating ETB timestamp across loops */
+	double t0 = now_s(), deadline = t0 + seconds, last = t0, eos_t = 0, t_act = t0, t_ping = t0;
+	while (!dc.eos && !dc.err && !fw_dead) {
+		double t = now_s();
+		int past = t >= deadline;
+		if (past && !reached) {
+			reached = 1;
+			printf("venus: decode-loop: %d s reached at %d frames; sending EOS to drain\n", seconds, dc.frames);
+		}
+		if (dc.acts != last_acts) {	/* buffer-done or other traffic = the firmware is being serviced */
+			last_acts = dc.acts;
+			t_act = t;
+		}
+		/* insurance keepalive: only when there has been an idle gap with no buffer-done traffic (not during a
+		 * healthy active loop, where EBD/FBD keep t_act fresh). A SESSION_ERROR reply would be surfaced as dc.err. */
+		if (ping_ms > 0 && !eos_sent && t - t_act >= ping_ms / 1000.0 && t - t_ping >= ping_ms / 1000.0) {
+			printf("venus: decode-loop: %.0f ms idle (no buffer-done); SYS_PING keepalive\n", (t - t_act) * 1e3);
+			sys_ping("decode idle");
+			t_ping = now_s();
+		}
+		if (dc.reconfig && reconfig())
+			goto close;
+		if (vdec_can_etb() && !eos_sent) {
+			if (!past && (loop || next < nau)) {
+				if (next >= nau)
+					next = 0;	/* loop the clip */
+				int r = vdec_etb(s + off[next], alen[next], fcount * 33333, 0, (int)fcount);
+				if (r == -2) {
+					printf("venus: STOP: AU %d (%u bytes) longer than the input buffer\n", next, alen[next]);
+					goto close;
+				}
+				if (r)
+					goto close;
+				fcount++;
+				next++;
+				continue;
+			}
+			if (vdec_etb(NULL, 0, fcount * 33333, 1, (int)fcount))	/* deadline or single-shot end: empty EOS */
+				goto close;
+			eos_sent = 1;
+			eos_t = t;
+			continue;
+		}
+		if (wait_msg(0, 20))
+			goto close;
+		if (intclr)
+			intclr_service("loop");
+		t = now_s();
+		if (t - last >= 30) {	/* a progress + step-log line every 30 s so a reset is dated */
+			double fps = dc.frames > 1 && dc.t_last > dc.t_first ? (dc.frames - 1) / (dc.t_last - dc.t_first) : 0.0;
+			printf("venus: decode-loop %.0f/%d s: %d frames, %.1f fps, ebds %u, err %#x, phone alive\n",
+			       t - t0, seconds, dc.frames, fps, dc.ebds, dc.err);
+			step_status(1);
+			last = t;
+		}
+		if (eos_sent && now_s() - eos_t > 10) {
+			printf("venus: decode-loop: EOS not returned within 10 s; ending the drain\n");
+			break;
+		}
+	}
+	double tend = now_s();
+	double fps = dc.frames > 1 && dc.t_last > dc.t_first ? (dc.frames - 1) / (dc.t_last - dc.t_first) : 0.0;
+	int survived = tend - t0 >= (double)seconds - 1.0;	/* reached the deadline without the process being killed */
+	printf("venus: decode-loop: %d frames in %.1f s, %.1f fps, err %#x%s%s\n", dc.frames, tend - t0, fps, dc.err,
+	       dc.eos ? ", EOS" : "", fw_dead ? ", firmware sys error" : "");
+	if (survived && dc.frames > 0 && !dc.err && !fw_dead)
+		printf("venus: decode-loop: survived %d s, phone alive, %d frames decoded -> PASS\n", seconds, dc.frames);
+	else
+		printf("venus: decode-loop: ended early at %.1f s (frames %d err %#x fw_dead %d eos %d); a reset would leave"
+		       " this as the last line -> FAIL/RESET\n", tend - t0, dc.frames, dc.err, fw_dead, dc.eos);
+	rc = survived && dc.frames > 0 && !dc.err && !fw_dead ? 0 : 1;
+close:
+	if (vdec_close())
+		rc = 1;
+	core_status("after decode-loop");
+	printf("venus: decode-loop %s: venusctl shutdown, then power off\n", rc ? "FAILED/RESET" : "ok");
 	return rc;
 }
 

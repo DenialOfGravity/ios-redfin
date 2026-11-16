@@ -41,6 +41,9 @@ int init(uint64_t phys);
 int ping(uint32_t debug);
 int session(uint32_t debug);
 int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t bufphys, int hevc);	/* -1: detect */
+/* ws-video-dec: keep an active decode session fed for `seconds` of wall clock (loop the clip if `loop`), no YUV out,
+ * for the idle-reset test (logs/research/video-reset-2026-11-16.md). 0 = PASS (survived, frames > 0, no error). */
+int decode_loop(uint32_t debug, const char *clip, int seconds, int loop, uint64_t bufphys, int hevc);
 int memtest(uint64_t a, uint64_t len, int write);
 int shutdown_cmd(void);
 int fwdump(uint64_t addr);	/* P0d: read-only dump of the HFI block left at addr (0: 0xa2600000) after a reset */

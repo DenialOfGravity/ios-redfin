@@ -31,6 +31,7 @@ int init(uint64_t phys) { return REC("init %#llx", (unsigned long long)phys); }
 int ping(uint32_t d) { return REC("ping %#x", d); }
 int session(uint32_t d) { return REC("session %#x", d); }
 int decode(uint32_t d, const char *in, const char *o, int w, uint64_t b, int h) { return REC("decode %s %s %d %d", in, o, w, h); }
+int decode_loop(uint32_t d, const char *clip, int s, int l, uint64_t b, int h) { return REC("decode_loop %s %d %d %d", clip, s, l, h); }
 int memtest(uint64_t a, uint64_t l, int w) { return REC("memtest %d", w); }
 int shutdown_cmd(void) { return REC("shutdown"); }
 int watch(unsigned s, int si, uint32_t d) { return REC("watch %u sysinit=%d debug=%#x", s, si, d); }
@@ -86,6 +87,9 @@ int main(void)
 	RUN("fwdump 0xa2600000", 0, "fwdump", "0xa2600000");
 	RUN("boot keep=1", 0, "boot", "--keep");
 	RUN("init 0xa2600000", 0, "init", "--phys", "0xa2600000");
+	RUN("decode in.h264 out.yuv 5 -1", 0, "decode", "in.h264", "out.yuv");
+	RUN("decode_loop clip.h264 960 1 -1", 0, "decode", "--clip", "clip.h264", "--seconds", "960", "--loop");
+	RUN("decode_loop c.h264 0 0 -1", 0, "decode", "--clip", "c.h264");
 	RUN("", 2, "frobnicate");
 	RUN("", 2, "power", "on", "x", "y");
 	printf("args_test: %s\n", fails ? "FAILED" : "all passed");
