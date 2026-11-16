@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include "../venus_rails.h"
 
 #define CMDDB	0x80860000ull
@@ -24,6 +25,8 @@ static struct vote sent[64];
 static int nsent;
 static char votes_str[1024];
 static int have_votes = 1;
+static int rpmh_rc;		/* p0c2: what the mock kernel answers (0, 60 = ETIMEDOUT, 5 = EIO) */
+static int rpmh_nonote;		/* p0c2: answer 0 without the 1131 bookkeeping (completion not confirmed) */
 static uint32_t addr_of(const char *res) { return !strcmp(res, "cx.lvl") ? 0x30010 : !strcmp(res, "mx.lvl") ? 0x30020 : 0x50000; }
 
 static void note(uint32_t addr, uint32_t val)	/* xnu 1131's bookkeeping, as text */
@@ -83,7 +86,10 @@ static int m_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32
 	snprintf(sent[nsent].res, sizeof(sent[0].res), "%s", res);
 	sent[nsent].addr = addr_of(res), sent[nsent].val = val[0];
 	nsent++;
-	note(addr_of(res), val[0]);
+	if (rpmh_rc)
+		return rpmh_rc;
+	if (!rpmh_nonote)
+		note(addr_of(res), val[0]);
 	return 0;
 }
 static int m_votes(char *b, size_t len)
@@ -124,6 +130,7 @@ static void reset(void)
 	nsent = 0;
 	votes_str[0] = 0;
 	have_votes = 1;
+	rpmh_rc = rpmh_nonote = 0;
 	memset(tcs_addr, 0, sizeof(tcs_addr));
 	memset(tcs_data, 0, sizeof(tcs_data));
 	tbu = 0x80000000u;
@@ -171,11 +178,9 @@ int main(void)
 	setenv("VENUSCTL_RAILS", "1", 1);
 	strcpy(votes_str, "30010=3 30020=4");
 	assert(rails_raise() == 0);
-	assert(nsent == 2 && !strcmp(sent[0].res, "mx.lvl") && sent[0].val == 6 && !strcmp(sent[1].res, "cx.lvl") &&
-	       sent[1].val == 6);
+	assert(nsent == 1 && !strcmp(sent[0].res, "cx.lvl") && sent[0].val == 6);	/* p0c2: cx only, mx never */
 	assert(rails_restore() == 0);
-	assert(nsent == 4 && !strcmp(sent[2].res, "cx.lvl") && sent[2].val == 3 && !strcmp(sent[3].res, "mx.lvl") &&
-	       sent[3].val == 4);
+	assert(nsent == 2 && !strcmp(sent[1].res, "cx.lvl") && sent[1].val == 3 && count_for("mx.lvl") == 0);
 	assert(access(state_path, F_OK) != 0);
 	pass++;
 
@@ -183,15 +188,15 @@ int main(void)
 	reset();
 	setenv("VENUSCTL_RAILS", "1", 1);
 	strcpy(votes_str, "30010=9 30020=2");
-	assert(rails_raise() == 0 && nsent == 1 && !strcmp(sent[0].res, "mx.lvl"));
-	assert(rails_restore() == 0 && nsent == 2 && last_for("mx.lvl") == 2 && count_for("cx.lvl") == 0);
+	assert(rails_raise() == 0 && nsent == 0);
+	assert(rails_restore() == 0 && nsent == 0);
 	pass++;
 
 	/* 4. unknown before (no xnu 1131, empty TCS): the top level, left in place at power off */
 	reset();
 	setenv("VENUSCTL_RAILS", "1", 1);
 	have_votes = 0;
-	assert(rails_raise() == 0 && last_for("mx.lvl") == 8 && last_for("cx.lvl") == 9);
+	assert(rails_raise() == 0 && count_for("mx.lvl") == 0 && last_for("cx.lvl") == 9 && nsent == 1);
 	int before = nsent;
 	assert(rails_restore() == 0 && nsent == before);
 	pass++;
@@ -212,7 +217,7 @@ int main(void)
 	have_votes = 0;
 	tcs_addr[1][2] = 0x30010, tcs_data[1][2] = 4;
 	tcs_addr[6][0] = 0x30020, tcs_data[6][0] = 0;
-	assert(rails_raise() == 0 && last_for("cx.lvl") == 6 && last_for("mx.lvl") == 6);
+	assert(rails_raise() == 0 && last_for("cx.lvl") == 6 && count_for("mx.lvl") == 0);
 	before = nsent;
 	assert(rails_restore() == 0 && nsent == before + 1 && last_for("cx.lvl") == 4);
 	pass++;
@@ -224,7 +229,7 @@ int main(void)
 	assert(rails_raise() == 0);
 	note(0x30010, 9);	/* wland boots the modem meanwhile */
 	before = nsent;
-	assert(rails_restore() == 0 && nsent == before + 1 && last_for("mx.lvl") == 4 && last_for("cx.lvl") == 6);
+	assert(rails_restore() == 0 && nsent == before && last_for("cx.lvl") == 6);
 	pass++;
 
 	/* 8. state from another boot is ignored */
@@ -257,8 +262,8 @@ int main(void)
 	reset();
 	setenv("VENUSCTL_RAILS", "1", 1);
 	strcpy(votes_str, "30010=3 30020=4");
-	assert(rails_raise() == 0 && rails_raise() == 0 && nsent == 2);
-	assert(rails_restore() == 0 && last_for("cx.lvl") == 3 && last_for("mx.lvl") == 4);
+	assert(rails_raise() == 0 && rails_raise() == 0 && nsent == 1);
+	assert(rails_restore() == 0 && last_for("cx.lvl") == 3 && count_for("mx.lvl") == 0);
 	pass++;
 
 	/* 11. read-only commands send nothing */
@@ -268,7 +273,7 @@ int main(void)
 	assert(rails_report() == 0);
 	rails_line(line, sizeof(line));
 	printf("line: %s\n", line);
-	assert(strstr(line, "up 123.4 s") && strstr(line, "cx.lvl 3/64") && strstr(line, "mx.lvl ?") && strstr(line, "tbu on"));
+	assert(strstr(line, "up 123.4 s") && strstr(line, "cx.lvl 3/64") && !strstr(line, "mx.lvl") && strstr(line, "tbu on"));
 	assert(nsent == 0 && tbu == 0x80000000u);
 	pass++;
 
@@ -291,7 +296,7 @@ int main(void)
 	setenv("VENUSCTL_RAILS", "1", 1);
 	have_votes = 0;
 	assert(rails_raise() == 0);
-	assert(last_for("mx.lvl") == 6 && last_for("mmcx.lvl") == 6 && last_for("cx.lvl") == 7);
+	assert(count_for("mx.lvl") == 0 && count_for("mmcx.lvl") == 0 && last_for("cx.lvl") == 7);
 	for (int i = 0; i < nsent; i++)
 		assert(sent[i].val != 15 && sent[i].val <= 7);
 	before = nsent;
@@ -300,15 +305,14 @@ int main(void)
 	reset();
 	setenv("VENUSCTL_RAILS", "1", 1);
 	strcpy(votes_str, "30020=f 50000=3 30010=7");
-	assert(rails_raise() == 0 && last_for("mx.lvl") == 6 && last_for("mmcx.lvl") == 5 && count_for("cx.lvl") == 0);
-	before = nsent;
-	assert(rails_restore() == 0 && nsent == before + 1 && last_for("mmcx.lvl") == 3 && last_for("mx.lvl") == 6);
+	assert(rails_raise() == 0 && nsent == 0);	/* cx already at 7 >= NOM; mx/mmcx are not video rails on redfin */
+	assert(rails_restore() == 0 && nsent == 0);
 	/* 12c. VENUSCTL_RAILS above every corner, prev unknown + VENUSCTL_RAILS_UNKNOWN: still the top defined level */
 	reset();
 	setenv("VENUSCTL_RAILS", "9999", 1);
 	setenv("VENUSCTL_RAILS_UNKNOWN", "1", 1);
 	have_votes = 0;
-	assert(rails_raise() == 0 && last_for("mx.lvl") == 6 && last_for("mmcx.lvl") == 6 && last_for("cx.lvl") == 7);
+	assert(rails_raise() == 0 && nsent == 1 && last_for("cx.lvl") == 7);
 	/* 12d. a state file whose "before" level has corner 0: not put back */
 	reset();
 	f = fopen(state_path, "w");
@@ -320,6 +324,51 @@ int main(void)
 	reset();
 	have_votes = 0;
 	assert(rails_report() == 0 && nsent == 0);
+	pass++;
+
+	/* 13. p0c2: only the DT's rails; a timeout halts every later RPMh vote; completion must be confirmed */
+	assert(rails_dt_allowed("cx.lvl") && !rails_dt_allowed("mx.lvl") && !rails_dt_allowed("mmcx.lvl") &&
+	       !rails_dt_allowed(NULL));
+	/* 13a. a p0b/p0c state file with mx.lvl and mmcx.lvl entries: neither is voted back */
+	reset();
+	f = fopen(state_path, "w");
+	fprintf(f, "boot BOOT-A\nrail mx.lvl 0x30020 prev 0x3 voted 0x6 known 1\nrail mmcx.lvl 0x50000 prev 0x2 voted 0x6 known 1\n");
+	fclose(f);
+	strcpy(votes_str, "30020=6 50000=6");
+	assert(rails_restore() == 0 && nsent == 0);
+	/* 13c. (the halt is per process: the timeout case runs in a child) cx times out: STOP, no more votes */
+	fflush(stdout);
+	pid_t pid = fork();
+	if (pid == 0) {
+		reset();
+		setenv("VENUSCTL_RAILS", "1", 1);
+		strcpy(votes_str, "30010=3");
+		rpmh_rc = 60;
+		assert(rails_raise() == 1 && nsent == 1 && rails_rpmh_halted() && strstr(rails_rpmh_halt_why(), "timeout"));
+		rpmh_rc = 0;
+		assert(rails_restore() == 1 && nsent == 1);
+		assert(rails_raise() == 1 && nsent == 1);	/* a second power on in this process votes nothing */
+		_exit(0);
+	}
+	int wst = 0;
+	assert(waitpid(pid, &wst, 0) == pid && WIFEXITED(wst) && WEXITSTATUS(wst) == 0);
+	pass++;
+	/* 13b runs in a child too (the halt is per process) */
+	fflush(stdout);
+	pid = fork();
+	if (pid == 0) {
+		/* 13b. kernel answered 0 but the vote is not in kern.sweet_rpmh_votes: STOP, halted, nothing after */
+		reset();
+		setenv("VENUSCTL_RAILS", "1", 1);
+		strcpy(votes_str, "30010=3");
+		rpmh_nonote = 1;
+		assert(rails_raise() == 1 && nsent == 1 && rails_rpmh_halted());
+		before = nsent;
+		assert(rails_restore() == 1 && nsent == before);	/* halted: cx not put back (left raised = safe) */
+		printf("halt: %s\n", rails_rpmh_halt_why());
+		_exit(0);
+	}
+	assert(waitpid(pid, &wst, 0) == pid && WIFEXITED(wst) && WEXITSTATUS(wst) == 0);
 	pass++;
 
 	unlink(state_path);

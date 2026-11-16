@@ -52,8 +52,50 @@
 #define TBU_PWR_ON	(1u << 31)
 #define MAXLVL		32
 
-static const char *const rail_names[] = { "mx.lvl", "mmcx.lvl", "cx.lvl" };	/* raise order; restore runs backwards */
+/*
+ * p0c2 (v15: the mmcx.lvl vote timed out, `SWEET RPMH: TCS0 done=0 ... cmd-status=0x101/0/0`, the kernel quarantined
+ * the TCS and every later vote got EIO): the rails are exactly what redfin's live DT (nfc-research/live.dts) gives the
+ * video hardware, nothing taken from another SoC:
+ *   qcom,videocc@ab00000 (lito-videocc)  vdd_cx-supply = <0x53> = rpmh-regulator-cxlvl pm8150_s1_level -> "cx.lvl"
+ *   qcom,vidc0 iris-ctl/vcodec/cvp-supply = mvsc/mvs0/mvs1 GDSCs (qcom,gdsc, no parent supply)
+ *   qcom,venus@aae0000 (PIL) vdd-supply = mvsc_gdsc;  gcc vdd_cx/vdd_cx_ao = cx.lvl
+ * No mx.lvl and no mmcx.lvl anywhere for video (mmcx.lvl is in cmd-db, not in the DT; MX >= CX is AOP's ARC
+ * dependency, Linux lito votes only vdd_cx through the videocc clock vdd class). arc_vote() refuses anything else.
+ */
+static const char *const rail_names[] = { "cx.lvl" };	/* raise order; restore runs backwards */
 #define NRAIL (sizeof(rail_names) / sizeof(rail_names[0]))
+
+int rails_dt_allowed(const char *res)
+{
+	for (unsigned i = 0; res && i < NRAIL; i++)
+		if (!strcmp(res, rail_names[i]))
+			return 1;
+	return 0;
+}
+
+/* p0c2: after an RPMh vote timed out (the kernel quarantines that TCS, xnu 1135 aside) or the driver refused with
+ * EIO, this process sends no more RPMh votes (rails or BCMs): a clean stop instead of votes that pile up behind it */
+#define RPMH_EIO	5	/* Darwin errno values, as the kernel returns them */
+#define RPMH_ETIMEDOUT	60
+static char halt_why[96];
+int rails_rpmh_halted(void)
+{
+	return halt_why[0] != 0;
+}
+
+void rails_rpmh_note(const char *res, int rc)
+{
+	if ((rc == RPMH_ETIMEDOUT || rc == RPMH_EIO) && !halt_why[0]) {
+		snprintf(halt_why, sizeof(halt_why), "%s -> %d (%s)", res, rc, rc == RPMH_ETIMEDOUT ? "timeout" : "EIO");
+		printf("venus: rpmh: HALT: %s: no further RPMh votes in this run (reboot, or kern.sweet_rpmh_recover)\n",
+		       halt_why);
+	}
+}
+
+const char *rails_rpmh_halt_why(void)
+{
+	return halt_why;
+}
 
 /* ---- pure helpers ---- */
 
@@ -242,8 +284,18 @@ static void st_save(const struct rstate *s)
 	rename(tmp, rails_io->state);
 }
 
-static int arc_vote(const char *res, uint32_t hlvl)
+/* one ARC vote; 0 only when it completed: the kernel returned 0 (it waits for the TCS completion) and, where
+ * kern.sweet_rpmh_votes exists, it shows addr = hlvl afterwards. Anything else stops the caller. */
+static int arc_vote(const char *res, uint32_t addr, uint32_t hlvl)
 {
+	if (!rails_dt_allowed(res)) {	/* p0c2 */
+		printf("venus: rails: refusing a vote of %s: not a video rail in redfin's DT (only cx.lvl)\n", res);
+		return -1;
+	}
+	if (rails_rpmh_halted()) {
+		printf("venus: rails: %s not voted: RPMh votes halted (%s)\n", res, halt_why);
+		return -1;
+	}
 	if (!hlvl) {	/* r17a */
 		printf("venus: rails: refusing an ARC vote of 0 for %s\n", res);
 		return -1;
@@ -255,7 +307,21 @@ static int arc_vote(const char *res, uint32_t hlvl)
 		rc = rails_io->rpmh(res, 1, off, val);
 	}
 	printf("venus: rails: vote %s level %u -> %d\n", res, hlvl, rc);
-	return rc;
+	rails_rpmh_note(res, rc);
+	if (rc)
+		return rc;
+	char votes[1024];
+	uint32_t now = 0;
+	if (rails_io->votes(votes, sizeof(votes)) == 0) {
+		if (!rails_vote_lookup(votes, addr, &now) || now != hlvl) {
+			printf("venus: rails: %s: the kernel answered 0 but kern.sweet_rpmh_votes has %s%#x for %#x, not %#x:"
+			       " completion not confirmed\n", res, now ? "" : "nothing/", now, addr, hlvl);
+			rails_rpmh_note(res, RPMH_ETIMEDOUT);
+			return RPMH_ETIMEDOUT;
+		}
+		printf("venus: rails: %s level %u confirmed (kern.sweet_rpmh_votes %#x=%#x)\n", res, hlvl, addr, now);
+	}
+	return 0;
 }
 
 /* prev of a rail: 2 = kern.sweet_rpmh_votes, 1 = TCS registers, 0 = unknown */
@@ -304,11 +370,11 @@ int rails_raise(void)
 			       rails_io->state);
 			continue;
 		}
+		if (rails_rpmh_halted()) {
+			printf("venus: rails: STOP: RPMh votes halted (%s)\n", halt_why);
+			return 1;
+		}
 		if (cmddb_find(rail_names[i], &r) || !r.n) {
-			if (!strcmp(rail_names[i], "mmcx.lvl")) {
-				printf("venus: rails: mmcx.lvl not in cmd-db (lito: video is on cx.lvl)\n");
-				continue;
-			}
 			printf("venus: rails: STOP: %s not in cmd-db\n", rail_names[i]);
 			return 1;
 		}
@@ -344,8 +410,8 @@ int rails_raise(void)
 		s.r[s.nr].addr = r.addr, s.r[s.nr].prev = prev, s.r[s.nr].voted = v, s.r[s.nr].known = src != 0;
 		s.nr++;
 		st_save(&s);
-		if (arc_vote(r.name, v)) {
-			printf("venus: rails: STOP: %s vote failed\n", r.name);
+		if (arc_vote(r.name, r.addr, v)) {
+			printf("venus: rails: STOP: %s vote failed or not confirmed: no further votes\n", r.name);
 			return 1;
 		}
 	}
@@ -363,7 +429,14 @@ int rails_restore(void)
 	int rc = 0;
 	for (int i = s.nr; i-- > 0;) {
 		uint32_t now = 0;
-		if (have && rails_vote_lookup(votes, s.r[i].addr, &now) && now != s.r[i].voted)
+		if (!rails_dt_allowed(s.r[i].name))	/* p0c2: e.g. an mx.lvl/mmcx.lvl entry left by p0b/p0c */
+			printf("venus: rails: %s: not a redfin video rail: not voted, left at %u\n", s.r[i].name,
+			       s.r[i].voted);
+		else if (rails_rpmh_halted()) {
+			printf("venus: rails: %s: RPMh votes halted (%s): not put back, left at %u\n", s.r[i].name,
+			       halt_why, s.r[i].voted);
+			rc = 1;
+		} else if (have && rails_vote_lookup(votes, s.r[i].addr, &now) && now != s.r[i].voted)
 			printf("venus: rails: %s now %#x, not our %#x (someone voted since): left\n", s.r[i].name, now,
 			       s.r[i].voted);
 		else if (!s.r[i].known)
@@ -375,7 +448,7 @@ int rails_restore(void)
 		else if (!rail_level_valid(s.r[i].name, s.r[i].prev))
 			printf("venus: rails: %s: level %u before has corner 0 (not a level): not voted, left at %u\n",
 			       s.r[i].name, s.r[i].prev, s.r[i].voted);
-		else if (arc_vote(s.r[i].name, s.r[i].prev)) {
+		else if (arc_vote(s.r[i].name, s.r[i].addr, s.r[i].prev)) {
 			printf("venus: rails: %s: putting back %u failed (left at %u)\n", s.r[i].name, s.r[i].prev,
 			       s.r[i].voted);
 			rc = 1;

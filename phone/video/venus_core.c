@@ -471,6 +471,10 @@ static int bcm(const char *res, uint32_t v)
 	if (tries < 0)
 		tries = getenv("VENUS_BCM_TRIES") && atoi(getenv("VENUS_BCM_TRIES")) > 0 ? atoi(getenv("VENUS_BCM_TRIES")) : 6;
 	uint32_t off[1] = { 0 }, val[1] = { v };
+	if (rails_rpmh_halted()) {	/* p0c2: an earlier vote timed out / EIO: no more RPMh votes in this run */
+		printf("venus: bcm %s = %#010x: not voted: RPMh votes halted (%s)\n", res, v, rails_rpmh_halt_why());
+		return 5;
+	}
 	int rc = pm_rpmh(res, 1, off, val);
 	printf("venus: bcm %s = %#010x -> %d\n", res, v, rc);
 	for (int i = 1, wait = 5, eio = 0; rc && i < tries && (rc == EBUSY || (rc == EIO && !eio++)); i++, wait *= 2) {
@@ -478,6 +482,7 @@ static int bcm(const char *res, uint32_t v)
 		rc = pm_rpmh(res, 1, off, val);
 		printf("venus: bcm %s = %#010x -> %d (try %d of %d, after %d ms)\n", res, v, rc, i + 1, tries, wait);
 	}
+	rails_rpmh_note(res, rc);	/* p0c2 */
 	if (rc == EIO)
 		printf("venus: bcm %s: EIO: the kernel's RPMh driver refuses votes (quarantined after a timeout this boot?"
 		       " kernel log \"SWEET RPMH: timeout\"): a reboot clears it\n", res);
@@ -800,15 +805,17 @@ static void ahb_hwctl_restore(void)
 
 int power_on(void)
 {
-	/* P0c (venus_rails.c, default off): VENUSCTL_RAILS raises cx/mx (raise only) before anything is clocked,
-	 * VENUSCTL_TBUVOTE holds mnoc_sf_0_tbu; power_off() puts both back */
-	if (rails_raise() || tbu_vote_on())
-		return power_off(), 1;
+	/* Linux order (msm_vidc venus_power_on: __vote_buses, then regulators, then clocks whose prepare votes the
+	 * videocc vdd_cx level): the BCMs first, then P0c (venus_rails.c, default off): VENUSCTL_RAILS raises cx.lvl
+	 * (redfin DT: the only video rail; raise only) before anything is clocked, VENUSCTL_TBUVOTE holds
+	 * mnoc_sf_0_tbu; power_off() undoes them in reverse */
 	for (unsigned i = 0; i < 2; i++)
 		if (bcm(bcms[i], BCM_ON)) {
 			printf("venus: STOP: bcm %s vote failed\n", bcms[i]);
 			return power_off(), 1;
 		}
+	if (rails_raise() || tbu_vote_on())
+		return power_off(), 1;
 	ahb_hwctl_clear();
 	if (gcc_on(GCC_VIDEO_AHB, "gcc_video_ahb", 1))	/* BRANCH_HALT-style poll, as gcc_video_axi */
 		return power_off(), 1;
@@ -901,10 +908,10 @@ int power_off(void)
 	/* gcc_video_ahb stays enabled: critical in mainline gcc-sm7150, and the GDSC parent; only HW_CTL goes back */
 	ahb_hwctl_restore();
 	int rc = 0;
+	rc |= tbu_vote_off();	/* P0c: only what power on changed */
+	rc |= rails_restore();	/* Linux order back: clocks (cx), then buses */
 	for (unsigned i = 2; i-- > 0;)
 		rc |= bcm(bcms[i], BCM_OFF);
-	rc |= tbu_vote_off();	/* P0c: only what power on changed */
-	rc |= rails_restore();
 	return rc ? 1 : 0;
 }
 

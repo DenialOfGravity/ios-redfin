@@ -35,6 +35,11 @@ int rails_level_ok(const uint16_t *vl, unsigned n, uint32_t hlvl);	/* 1: 0 < hlv
 int rails_vote_lookup(const char *votes, uint32_t addr, uint32_t *val);	/* 1: found in "ADDR=VAL ..." (hex) */
 unsigned rails_target_corner(const char *env);	/* VENUSCTL_RAILS: NULL/"0" -> 0 (off), "1" -> NOM, N -> N */
 
+int rails_dt_allowed(const char *res);	/* p0c2: 1 for the video rails of redfin's DT (cx.lvl only) */
+int rails_rpmh_halted(void);		/* p0c2: 1 after an RPMh vote timed out or got EIO in this process */
+void rails_rpmh_note(const char *res, int rc);	/* p0c2: every RPMh vote result goes through here */
+const char *rails_rpmh_halt_why(void);
+
 int rails_report(void);		/* venusctl rails: read only */
 int rails_raise(void);		/* power on, first step: VENUSCTL_RAILS; 0 ok or off */
 int rails_restore(void);	/* power off, last step */
