@@ -1,0 +1,64 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 18:00:00 +0000
+Subject: [PATCH] redfin 1143: Wi-Fi auto-join: answer RSSI_BOUNDS (106) for wifid, off by default (kern.sweet_wifi_sig 0x20)
+
+wifid's auto-join refuses every known network "Below minimum RSSI threshold" with the scan saying -40 dBm. The
+klog shows the one RSSI-limit query wifid makes when it attaches to en0, RSSI_BOUNDS (106), REFUSED. IO80211 16.7
+(dyld cache 20H392, 0x1d3ec6394) asks it with 16 bytes prefilled {1, 0, 0, 0} and turns the answer into RSSI_MIN
+(+4), RSSI_MAX (+8) and RSSI_THRESHOLD (+0xc) (int32); on an error wifid gets no bounds at all. The scan records
+themselves are read as before (noise_known +0x10 gates NOISE +0x12 / SNR +0x14, RSSI +0x16, all int16 dBm). New bit
+0x20 of kern.sweet_wifi_sig / sweetwifisig= answers 106 with version 1 and kern.sweet_wifi_rssi_min / _max / _thr
+(-100 / -20 / -80 dBm, RW); bit clear = refused as before. Klog `SWEET WIFI 1143:` (first 10 answers). Needs a wifid
+restart after setting the bit (wifid asks once per attach).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/bsd/dev/redwood_apple80211.c	2026-11-16 17:31:34.240211645 +0100
++++ b/bsd/dev/redwood_apple80211.c	2026-11-16 17:31:49.363764234 +0100
+@@ -246,6 +246,10 @@
+  *         wifid refuses known networks at -40 dBm "Below minimum RSSI threshold" while noise/snr read 0)
+  *   0x10  a link wland made by itself (/var/local/wlan.conf at boot, before wifid asks) is told to wifid as a
+  *         join's (SSID/BSSID/LINK changed): the boot auto-join wifid refuses is then wland's (bsd/dev/flame_sta.c)
++ *   0x20  (redfin 1143) RSSI_BOUNDS (106) is answered: version 1, RSSI_MIN / RSSI_MAX / RSSI_THRESHOLD (dBm) from
++ *         kern.sweet_wifi_rssi_min / _max / _thr (-100 / -20 / -80). Without it 106 is refused (EOPNOTSUPP), and
++ *         IO80211 then gives wifid no bounds: the auto-join test for "Below minimum RSSI threshold" at -40 dBm.
++ *         wifid asks once when it attaches to en0: set the bit, then restart wifid (killall wifid).
+  * kern.sweet_wifi_live_rssi (read only): the last signal wland reported, 0 when none. "SWEET WIFI 1051" lines.
+  */
+ #define NOISE_FLOOR     (-95)
+@@ -254,6 +258,11 @@
+ static int wifi_live_rssi;                      /* the joined network's last signal from wland (0: none since the link came) */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_sig, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_sig, 0, "redfin 1051: Wi-Fi signal for wifid (bits)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_live_rssi, CTLFLAG_RD | CTLFLAG_LOCKED, &wifi_live_rssi, 0, "redfin 1051: last signal, dBm");
++/* redfin 1143: RSSI_BOUNDS (106) answer, only with kern.sweet_wifi_sig & 0x20 (dBm; RSSI_THRESHOLD = the floor for joins) */
++static int wifi_rssi_min = -100, wifi_rssi_max = -20, wifi_rssi_thr = -80;
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi_min, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_rssi_min, 0, "redfin 1143: RSSI_BOUNDS min, dBm");
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi_max, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_rssi_max, 0, "redfin 1143: RSSI_BOUNDS max, dBm");
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi_thr, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_rssi_thr, 0, "redfin 1143: RSSI_BOUNDS threshold, dBm");
+ 
+ int redwood_apple80211_sig(void);
+ int
+@@ -460,6 +469,23 @@
+ 		kfree_data(answer, sizeof(*answer));
+ 		return error;
+ 	}
++	case 106: {                             /* 1143: RSSI_BOUNDS, 16 bytes as IO80211 16.7 reads them (only with bit 0x20) */
++		struct {
++			uint32_t version;
++			int32_t min, max, threshold;
++		} answer = { .version = 1, .min = wifi_rssi_min, .max = wifi_rssi_max, .threshold = wifi_rssi_thr };
++		static unsigned told;
++
++		if (!(redwood_apple80211_sig() & 0x20)) {
++			break;                          /* refused, as before 1143 */
++		}
++		if (told < 10) {
++			told++;
++			printf("SWEET WIFI 1143: RSSI_BOUNDS answered: min %d max %d threshold %d dBm\n", answer.min, answer.max,
++			    answer.threshold);
++		}
++		return give(request, &answer, sizeof(answer));
++	}
+ 	case 21:                                /* how the last join went (0: not over yet) */
+ 		lck_mtx_lock(&apple80211_lock);
+ 		request->req_val = (int32_t)join_result;
