@@ -2680,12 +2680,38 @@ gw_packet_done(unsigned need, uint8_t *out, unsigned *no, unsigned cap, bool *wa
 	gw.pend = true;
 }
 
+/* 1147: reply to the NXP HDLL GET_VERSION read in download mode with a HIGH firmware version so nfcd treats the
+ * chip firmware as in-sync and skips any firmware download/write. HDLL framing [LEN_hi LEN_lo | payload | CRC16],
+ * CRC-16/CCITT-FALSE over LEN+payload (the same nci_crc16 the NCI persona uses). GET_VERSION response payload is 8
+ * bytes: P[0]=0x42 (our hw id), P[3],P[4]=bCurrVer (ff ff = highest). Sent to the host over the same control unit
+ * nfcd writes on; nothing reaches the chip. */
+static void
+gw_dl_reply_getversion(u_int32_t unit)
+{
+	uint8_t r[12] = { 0x00, 0x08, 0x42, 0x02, 0x01, 0xff, 0xff, 0x00, 0x00, 0x00, 0x85, 0xff };
+	uint16_t c = nci_crc16(r, 10);  /* over LEN+payload; must equal the 85 ff trailer */
+
+	r[10] = (uint8_t)(c >> 8);
+	r[11] = (uint8_t)c;
+	if (c != 0x85ff) {
+		SAY("nfc-hci: persona: 1147: GET_VERSION CRC %04x != 85ff (not sent)\n", c);
+		return;
+	}
+	if (gw_ctl != NULL && ctl_enqueuedata(gw_ctl, unit, r, sizeof(r), 0) == 0) {
+		gw_up_pkts++;
+		gw_hexlog("nfc-hci", r, sizeof(r), "dnld <persona GET_VERSION high reply, CRC16 85 ff");
+	} else {
+		gw_up_fail++;
+		SAY("nfc-hci: persona: 1147: GET_VERSION reply send FAILED\n");
+	}
+}
+
 /* 1146: log the NXP HDLL frames nfcd writes while in download mode. Framing: [LEN_hi LEN_lo | payload | CRC16],
  * LEN = payload length, whole frame = 2 + LEN + 2. Each complete frame is one "nfc-hci" klog line; bytes left at
  * the end of a write are flushed as a partial line so no byte nfcd sends is lost even if our LEN read is off.
  * Nothing here reaches the chip and nothing is answered. */
 static void
-gw_dl_capture(mbuf_t m)
+gw_dl_capture(u_int32_t unit, mbuf_t m)
 {
 	for (mbuf_t b = m; b != NULL; b = mbuf_next(b)) {
 		const uint8_t *d = mbuf_data(b);
@@ -2708,7 +2734,16 @@ gw_dl_capture(mbuf_t m)
 				}
 				if (gw_dl_n == need) {
 					gw_dl_frames++;
-					gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> HDLL frame (not forwarded, no reply)");
+					/* 1147: answer the NXP HDLL GET_VERSION (payload f1 00 00 ..) with a HIGH firmware version so
+					 * nfcd treats the FW as in-sync and skips any download/write; every other download-mode frame
+					 * is logged only (not forwarded, not answered) so the next capture reveals nfcd's exit command.
+					 * Nothing reaches the chip. */
+					if (plen >= 3 && gw_dl_buf[2] == 0xf1 && gw_dl_buf[3] == 0x00 && gw_dl_buf[4] == 0x00) {
+						gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> HDLL GET_VERSION (answering high version)");
+						gw_dl_reply_getversion(unit);
+					} else {
+						gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> HDLL frame (logged only, not forwarded, not answered)");
+					}
 					gw_dl_n = 0;
 				}
 			}
@@ -2733,7 +2768,7 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, 
 		return 0;
 	}
 	if (gw_dl_mode) {               /* 1146: download capture: log HDLL frames, forward nothing, answer nothing */
-		gw_dl_capture(m);
+		gw_dl_capture(unit, m);
 		mbuf_freem(m);
 		return 0;
 	}
