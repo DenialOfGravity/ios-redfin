@@ -145,6 +145,9 @@ int main(void)
 	CHECK(sent_id[nsent - 1] == LOC_REG_EVENTS);
 	CHECK(last_mask == LOC_EVMASK_BRIDGE);
 	respond(); tick(10); respond(); tick(10);
+	wordfile(NULL);
+	for (int i = 0; i < 4; i++) { respond(); tick(10); }
+	CHECK(last_mask == 0);
 	wordfile("session=60 rfmetrics=1\n");
 	for (int i = 0; i < 6; i++) { respond(); tick(10); }
 	int got = 0;
