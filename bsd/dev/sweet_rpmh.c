@@ -9,6 +9,7 @@
 #include <sys/errno.h>
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
+#include <sys/sysctl.h>  /* 1131 */
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
@@ -51,6 +52,55 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 #define RH_TIMEOUT_US   100000u
 
 static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+/*
+ * 1131: the apps DRV's last completed ACTIVE value per RPMh address (resource + offset), for every vote this
+ * driver sent since boot (PMEM_RPMH: wland cx/mss, venus BCMs and rails, adsp lcx/lmx, ...; touch rails).
+ * Bookkeeping only: nothing about a vote changes. kern.sweet_rpmh_votes (RD string) = "ADDR=VAL ..." in hex,
+ * oldest first. RPMh keeps one vote per DRV and resource (the last write wins), and the aggregated state cannot be
+ * read from the apps side, so this is how venusctl (VENUSCTL_RAILS) learns the current apps vote of cx.lvl/mx.lvl
+ * before it raises one and what to put back. Votes before XNU (ABL) are not in it.
+ */
+#define RH_LAST_N 32u
+static struct {
+	uint32_t addr, val;
+} rh_last[RH_LAST_N];
+static unsigned rh_last_n;
+
+static void
+rh_last_note(uint32_t addr, uint32_t val)      /* under rh_lock */
+{
+	unsigned i;
+	for (i = 0; i < rh_last_n && rh_last[i].addr != addr; i++) {
+	}
+	if (i == rh_last_n && rh_last_n < RH_LAST_N) {
+		rh_last_n++;
+	}
+	if (i == RH_LAST_N) {
+		i = RH_LAST_N - 1;     /* full: drop the oldest */
+		memmove(&rh_last[0], &rh_last[1], sizeof(rh_last[0]) * (RH_LAST_N - 1));
+	} else {
+		memmove(&rh_last[i], &rh_last[i + 1], sizeof(rh_last[0]) * (rh_last_n - 1 - i));
+		i = rh_last_n - 1;     /* newest last */
+	}
+	rh_last[i].addr = addr;
+	rh_last[i].val = val;
+}
+
+static int
+sysctl_sweet_rpmh_votes SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char buf[RH_LAST_N * 24 + 1];
+	size_t o = 0;
+	buf[0] = 0;
+	unsigned n = __atomic_load_n(&rh_last_n, __ATOMIC_ACQUIRE);
+	for (unsigned i = 0; i < n && o < sizeof(buf); i++) {
+		o += (size_t)snprintf(buf + o, sizeof(buf) - o, "%s%x=%x", i ? " " : "", rh_last[i].addr, rh_last[i].val);
+	}
+	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_votes, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_sweet_rpmh_votes, "A", "1131: last ACTIVE value per RPMh address sent by XNU (hex ADDR=VAL)");
 static uint32_t rh_db_size;
 static unsigned rh_ncpt;
 static unsigned rh_lock;
@@ -330,6 +380,9 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
 		return EIO;
 	}
 	rh_poisoned = false;
+	for (unsigned c = 0; c < n; ++c) {
+		rh_last_note(address + offsets[c], values[c]);   /* 1131 */
+	}
 	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
 	return 0;
 }
