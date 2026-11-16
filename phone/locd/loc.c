@@ -609,9 +609,14 @@ static void lk_set(uint64_t mask, int with_client, const char *why)
 }
 
 /* ws-gnss-f: the restore uses the TLV kind the original GET answered with (lockClient when it reported lockClient) */
+/* ws-gnss-lk1: SWEETLOCD_LK_NORETRY=1 in the environment: a restore/repair SET is sent once, in the original's kind,
+ * and never escalated to the lockClient form (no try 2, no further runs); a mismatch is only logged. */
+static int lk_noretry;
+
 static void lk_restore_start(const char *why)
 {
 	lk_rs_tries++;
+	lk_noretry = getenv("SWEETLOCD_LK_NORETRY") != NULL;
 	lk_try = ((lk_orig & ~3ull) || (lk_orig_kind & LK_KIND_CLIENT)) ? 2 : 1;
 	printf("[%6llu] loc: engine lock: restore in the original's TLV kind: %s\n", now_ms(),
 	       lk_try == 2 ? "lockType + lockClient (the GET reported lockClient)" : "lockType only (the GET reported lockType)");
@@ -802,6 +807,14 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			       now_ms(), lk_str(lk_orig, a, sizeof(a)), LOCK_ORIG, EFS_DIR);
 			unlink(LOCK_ORIG);
 			lk = LK_IDLE;
+			break;
+		}
+		if (lk_noretry) {
+			printf("[%6llu] loc: engine lock: RESTORE NOT CONFIRMED: modem %s, wanted %s; no retry (SWEETLOCD_LK_NORETRY), %s kept\n",
+			       now_ms(), ok && mask >= 0 ? lk_str((uint64_t)mask, a, sizeof(a)) : "?", lk_str(lk_orig, b, sizeof(b)), LOCK_ORIG);
+			lk_rs_tries = 3;
+			lk = LK_RS_FAILED;
+			lk_fail_gen = on_gen;
 			break;
 		}
 		if (lk_try == 1) {
