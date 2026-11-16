@@ -1,0 +1,179 @@
+# /var/local/hmetal/env (hm-int4): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
+# KEY=V        backboardd's
+# *:KEY=V      every hakios-metal process (backboardd too)
+# NAME:KEY=V   the process NAME (getprogname)
+# Keys HAKIOS_METAL_* and HM_* only. Applied in file order, the last one wins.
+# Only the switches that differ from the build's compiled default are set here; the commented lines are opt-ins.
+
+# backboardd: as on the phone since var12, HM_TRACE now off (1: on; the log rotates at 16 MB -> bbd-hm.log.1)
+HAKIOS_METAL_CA_PICK=exact
+HM_CB_PAD=2
+HM_UBWC_RT=0
+HM_GMEM=0
+# (ws-hm-ubwc) HM_UBWC_RT=1: CA's private BGRA8/RGBA8 render targets UBWC (the phone check first); HM_GMEM=auto: per pass
+# (light passes, UBWC targets and plans over 8 tiles sysmem, the rest measured); HM_BLEND_OPT=1: One/Zero blends as
+# plain writes; HM_UBWC_DISPLAY=1 only with a kernel that makes the scanout surface UBWC (else it changes nothing)
+#HM_UBWC_RT=1
+#HM_GMEM=auto
+#*:HM_BLEND_OPT=1
+#HM_UBWC_DISPLAY=1
+# (ws-hm-ubwc2) with HM_UBWC_RT=1: HM_UBWC_MIN=WxH (default 512x512) smaller targets stay linear (CA's low-res blur
+# intermediates; Mesa's 16-wide floor always); HM_UBWC_ALIGN=1 whole 16x4 blocks only (default 0); HM_UBWC_FETCH=1
+# (default) a sysmem fetch from a UBWC target runs FLUSH_PER_OVERLAP_AND_OVERWRITE as turnip (0 int6's NO_FLUSH, 2 every
+# sysmem fetch); HM_UBWC_ZERO=KiB (default 2048) small new UBWC targets zeroed whole, not only their flags (0: flags only);
+# HM_UBWC_LOG=1 one line per UBWC target made/kept linear, fetch, partial draw, first non-Clear use, partial copy
+#HM_UBWC_MIN=512x512
+#HM_UBWC_FETCH=1
+#HM_UBWC_LOG=1
+HM_TRACE=0
+HM_HANG_BLAME=1
+
+# CoreAnimation prefs the dispatcher sets in every hakios-metal process (0 = set false, as SweetMetal2 does; 1 = CA's own)
+*:HM_CA_DEEP_FB=0
+*:HM_CA_FB_COMPRESSION=0
+*:HM_CA_IOSURFACE_COMPRESSION=0
+
+# (hm-int3) the stage cache's check, for the first days on cache format 2: one stage or kernel in 20 read from the
+# cache, the memo or a seed compiled again in the background and compared ("hm-cache: verify ok N of M" / "STALE").
+# Back to 0 (the compiled default, off) once no STALE line has shown for a few days.
+*:HM_CACHE_VERIFY=20
+
+# (hm-int3) the pre-warm (compiled default 1 in every process that loads QuartzCore's library) in backboardd alone: since
+# hm-int2 every process is on hakios-metal, and N apps re-compiling the same manifests at once after a format change is
+# N times the work for one cache. The other processes find the stages backboardd made.
+*:HM_PREWARM=0
+HM_PREWARM=1
+
+# (hm-int4) every hakios-metal process's GPU memory by kind every 30 s ("pool: N MB: app, textures, pieces (free),
+# programs, private, tables, command streams"): what mediaserverd's 252 MB is made of (debug-g1114)
+*:HM_POOL_LOG=30
+
+# ---- opt-ins and switches at their compiled default (uncomment to change) ----
+# (hm-int4) the queues' idle memory let go after HM_POOL_IDLE_S (default 10) and when the kernel refuses an allocation
+# (HM_POOL_TRIM=1); HM_POOL_SOFT_MB=N (default 0: off) trims earlier past N MB of the process's GPU memory and says so
+#*:HM_POOL_SOFT_MB=128
+#*:HM_POOL_TRIM=0
+#*:HM_POOL_IDLE_S=10
+# (ws-hm-pool) HM_POOL_KEEP_MB=N (default 0): an idle trim keeps up to N MB of a queue's free slabs/pieces, its current
+# private buffer and 32 command streams (a forced trim still lets all go); suggested 16 for backboardd
+#backboardd:HM_POOL_KEEP_MB=16
+# (ws-hm-pool) HM_RT_CACHE=N MB (default 0: off): released render targets' GEM objects reused by the next render target
+# of their size (or up to HM_RT_CACHE_SLACK %, default 25, bigger); LRU past N MB; all let go on a refused allocation
+# (then retried) or a forced trim; never one a command buffer holds. HM_RT_CACHE_ZERO_KB=K zeroes reused ones up to K KB
+# (default 0: undefined, as Metal's). HM_RT_CACHE_IDLE_S=S lets entries older than S s go (default 0: never).
+# HM_RT_PREWARM=KB[xN],... makes those sizes into the cache when the device opens (e.g. 10976x2,32x4,16x4)
+#backboardd:HM_RT_CACHE=48
+#backboardd:HM_RT_CACHE_SLACK=25
+#backboardd:HM_RT_CACHE_ZERO_KB=0
+#backboardd:HM_RT_CACHE_IDLE_S=0
+#backboardd:HM_RT_PREWARM=10976x2
+# (hm-int4) the deny list is empty: an uber shader of HM_DENY_WORDS fragment words or more (default 24576: CA's
+# frag.A2Xghfc, 32064) is drawn only through its specialisations, which take ~30 ms on the host (HM_FE_MEMO, HM_SPEC_SHRINK)
+# instead of 300-530 ms. HM_DENY=A2Xghfc (hm-int3's line) still works and changes nothing beside it.
+#HM_DENY=A2Xghfc
+#HM_DENY_WORDS=24576
+# (hm-int4) the specialiser: the front end's NIR kept per uber shader (HM_FE_MEMO=1), the folded configuration's dead paths
+# dropped before ir3 (HM_SPEC_SHRINK=1), colour outputs under a false function-constant predicate left out (HM_FC_OUTPUT_FOLD=1,
+# part of the cache key); 0 restores hm-int3's way for each
+#HM_FE_MEMO=0
+#HM_SPEC_SHRINK=0
+#HM_FC_OUTPUT_FOLD=0
+# (hm-int4) HM_DEADFILL=1 (default): a draw the next draw of the same geometry overwrites opaquely is taken back
+# (SweetMetal2's SWEET_DEADFILL mode 1); "prof: fills dropped N" with HM_PROF
+#*:HM_DEADFILL=0
+# (ws-hm-cull) HM_DEADFILL=2: also takes back a fill under the next draw when that is CA's opaque rectangle over the
+# whole target (CA's fills differ in colour: =1 never matched them). HM_CULL=1|2|3 (default 0): draws hidden by a later
+# opaque CA rectangle in the same pass become CP_NOPs (1 full-target covers, 2 part covers too = SWEET_CULL=3, 3 blending
+# not a read). "prof: cull ..." with HM_PROF; "dd: cull..." lines with HM_DD=1. Plain lines are backboardd's.
+#HM_DEADFILL=2
+#HM_CULL=2
+# (ws-hm-int12) HM_NOUC=1 (default 0): no draw-time CPU loads of GPU buffer memory (mapped write-combined = non-cacheable
+# here): setBytes data kept in a cacheable shadow, other buffers read in one bulk copy; same command stream. Best with
+# HM_CULL / HM_DEADFILL=2 (their geometry reads) and the uber-shader key. Plain lines are backboardd's.
+#HM_NOUC=1
+# two-plane YCbCr ('420f'/'420v') surfaces: native = decoded on the GPU by ycbcr_decode (default); cpu = the processor copy
+#*:HM_YCBCR=cpu
+# an unseen configuration of a denied uber shader specialised on the queue, its draws left out meanwhile (default 0: waited for)
+#HM_SPEC_ASYNC=1
+# fold CA's constant scratch config struct (default 0). Part of the cache key: turning it on compiles every stage again
+#HM_SCRATCH_FOLD=1
+# the "compile: pipeline ..." wall/CPU lines (default: on with HM_PROF>=1)
+#HM_COMPILE_LOG=1
+# the pre-warm's start, seconds after QuartzCore's library is loaded (default 60)
+#HM_PREWARM_DELAY=60
+# ca-prof (default off; was on with HM_TRACE)
+#HM_CA_PROF_US=25000
+# the HANG trace: queued + running split, buffers that only queued skipped (default 1; 0: every slow buffer as before)
+#HM_HANG_EXEC=0
+# the cache key: format (default: HAKIOS_METAL_CACHE_FORMAT + the Mesa id) | build (the old key: empty after any core change)
+#HM_CACHE_KEY=build
+# ---- (hm-int5) new switches, each at its compiled default (uncomment to change) ----
+# Depth16Unorm (250) as a depth attachment (PridePosterExtension): 0 = refused as in hm-int4
+#*:HM_DEPTH16=0
+# -setDepthBias: applied to draws with a depth attachment (GRAS_SU_POLY_OFFSET_*): 0 = ignored as in hm-int4
+#*:HM_DEPTH_BIAS=0
+# the specialiser's kept front-end NIR made SSA and shrunk once (specialisation ~2.3x faster on the host, same code): 0 = hm-int4
+#HM_FE_PRE=0
+# a specialisation's stage written to the disk cache after the compile returned (one writer thread): 0 = before returning
+#HM_CACHE_WRITE_ASYNC=0
+# a configuration queued on the specialiser's queue that a draw must wait for is compiled by the waiting thread: 0 = poll
+#HM_SPEC_STEAL=0
+# extended-range targets' write-back: gpu = xr_encode at the end of the drawing buffer (default); cpu = processor at completion
+#*:HM_XR_WB=cpu
+# the first N GPU write-backs checked against the processor's codes ("xr: encode verify ..."; default 4, 0 = none)
+#*:HM_XR_VERIFY=4
+# an XR companion sized to its IOSurface, shared by every texture over it, written back by region: 0 = the texture's size
+#*:HM_XR_SURFACE_SIZE=0
+# the first N companions said ("xr: companion WxH for surface S ... through a WxH texture ..."; default 12)
+#*:HM_XR_TRACE=12
+# the scanout gate's submit flag (backboardd): needs a kernel that honours NativeAdrenoAbiSubmit flag 1; an older kernel
+# refuses the flag once and it is turned off for the process (default 0 until the kernel side exists). (ws-hm-int6)
+# the flag word also carries the written surface's IOSurface id in bits 8-31 (kernel ws-int-k2 gate mode 3, xnu 1105)
+#HM_GATE_FLAG=1
+#HM_GATE_FLAG_SURF=1125x2436
+# ---- (ws-hm-perf2) pass switches, each at its compiled default (uncomment to change; the int5 behaviour is
+# *:HM_PASS_FLUSH=always *:HM_PASS_STATIC=0 *:HM_PASS_MERGE=0, the A/B baseline of ws-hm-int6) ----
+# a sysmem pass that another draw pass follows ends without its tail (CCU flush + cache flush, each waited for); a
+# barrier (CCU flush + CACHE_INVALIDATE) goes before whatever reads what it drew; always = hm-int5's tail after every pass
+#*:HM_PASS_FLUSH=always
+# a draw pass right after a sysmem pass leaves out the batch start (invalidates, ~100 static registers, VFD sizes) and
+# the CCU set-up with its WFI, and dedups its registers against what that pass left: 0 = every pass its own head
+#*:HM_PASS_STATIC=0
+# a pass into the open sysmem pass's attachments that differs only by store actions joins it: 0 = a pass of its own
+#*:HM_PASS_MERGE=0
+# ---- (ws-hm-int6) the transport's invalidate after a fence (waitFence, "flushAfter"): always (compiled default) =
+# every imported surface the GPU wrote, ~1-2 ms a buffer for the 11.2 MB display surface; lazy = the display surfaces'
+# (HM_FLUSH_AFTER_SURF, default HM_GATE_FLAG_SURF's size) left until a CPU access in this process (Texture read/replace,
+# XR write-back, hakios_metal_surface_cpu_access) or the buffer's close. NOT safe for a CPU reader of the display
+# surface in another process (a screenshot or recorder's IOSurfaceLock) or a kernel CPU copy: an A/B switch, not a default
+#*:HM_FLUSH_AFTER=lazy
+#*:HM_FLUSH_AFTER_SURF=1125x2436
+
+# (hm-trace) HM_TRACE=1: per command buffer records (CPU per entry-point group, blocked, GPU per pass), first-use events
+# (compiles, disk-cache reads, GEM objects, maps, uploads, pipeline states) and hitch lines, in a 4 MB ring written to
+# /var/local/hmetal/trace/NAME-PID-SEQ.hmt on a touch of /var/local/hmetal/ca/trace-go (tools-claude/hm-trace.py reads
+# them). HM_TRACE=2 adds every draw; HM_TRACE_DRAW_TS=1 GPU-stamps each sysmem draw (RB_DONE_TS, not yet run on the
+# phone). Put "HM_TRACE=1" in place of the HM_TRACE=0 above (backboardd) or "*:HM_TRACE=1" for every process.
+#HM_TRACE_DRAW_TS=0
+#HM_TRACE_FLUSH_S=0
+# (hm-trace) read masks of the uber shaders filed in the stage cache and read back at pipeline creation (1, default):
+# a cold boot's first specialisations are keyed by the bytes the shader reads, so they come from the disk cache
+#HM_SPEC_MASK_DISK=1
+
+# (ws-hm-defer) HM_DEFER: deferred recording (upstream's hakios_metal_queue_set_deferred): 0 (default) the caller's thread
+# records, as before (boot-arg metal_defer=1 still defers every queue); 1 CoreAnimation's queues in backboardd (the first
+# command buffer made on a thread named HM_DEFER_THREAD*, default com.apple.coreanimation.); 2 every queue. The recording
+# thread is named HM_DEFER_NAME (default hakios.metal.defer) and takes the caller's scheduling (CA: fixed priority 54).
+# With HM_PROF=2 a second pace line "prof: pace ... defer" gives hm's time on the caller's thread a frame beside the
+# deferred thread's. Roll back: HM_DEFER=0 and restart backboardd.
+#HM_DEFER=0
+#HM_DEFER_NAME=hakios.metal.defer
+#HM_DEFER_THREAD=com.apple.coreanimation.
+
+# (ws-hm-csdiff) HM_RD_DUMP=<dir>: the command stream as Mesa .rd files for cffdump / tools-claude/rd-summary.py (default
+# off). With it set, write a number N into <dir>/hm_<process>_<pid>.trigger to dump the next N submissions as
+# <dir>/hm_<process>_<pid>_submitNNNNN.rd; HM_RD_DUMP_BOS=all every BO of the process (default: those the submission
+# names), HM_RD_DUMP_MAXKB=4096 the largest BO whose contents go in, HM_RD_DUMP_SURF=1 IOSurface contents too,
+# HM_RD_DUMP_START=N armed for N at the start. The directory must exist and be writable (mode 777).
+#HM_RD_DUMP=/var/local/hmetal/rd
+#HM_RD_DUMP_BOS=all
