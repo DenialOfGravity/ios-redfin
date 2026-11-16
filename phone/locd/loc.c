@@ -56,7 +56,20 @@
  *   as IND records; GONE (session closed / client gone) and CID release end locationd's client as abpbridge's session end.
  *   Record: struct pdsr below (24 bytes, LE) + data, the same layout as bsd/dev/sweet_qmux.c.
  * Never sent: SET_ENGINE_LOCK (except unlock=/repair above: only the engine lock value, nothing else),
- * SET_OPERATION_MODE other than STANDALONE (and only with opmode=standalone), SUPL/NI settings, any NV/EFS write, XTRA/time/position injects.
+ * SET_OPERATION_MODE other than STANDALONE (and only with opmode=standalone), SUPL/NI settings, any NV/EFS write, XTRA or
+ * position injects; INJECT_UTC_TIME only with time=1 (below).
+ * ws-gnss-g words (default off; Claude 2026-11-16):
+ *   time=1       REG_EVENTS adds INJECT_TIME_REQ 0x10 | INJECT_PREDICTED_ORBITS_REQ 0x20 | INJECT_POSITION_REQ 0x40 (mask 0x1f3)
+ *                and INJECT_UTC_TIME (0x0038: 0x01 timeUtc u64 ms since 1970, 0x02 timeUnc u32 ms) is sent from the AP's
+ *                CLOCK_REALTIME once before each START and again on every modem INJECT_TIME_REQ (0x0028; at most one per
+ *                10 s, only while a session runs). The time is read when the request is sent, not when queued. Never
+ *                injected when the clock is before 2025 (no sweetrtcoff). A refused inject is logged, not a LOC failure.
+ *   timeunc=MS   the uncertainty sent (20..60000, default 5000): the port's clock is the PM8150 RTC + boot-arg sweetrtcoff
+ *                (kernel 0099, calibrated once against the PC, then free-running; no NTP/NITZ correction is known), so
+ *                5 s is the honest default; lower it only after checking the phone's `date` against a reference.
+ *   INJECT_PREDICTED_ORBITS_REQ (0x0029: allowed sizes, server list) and INJECT_POSITION_REQ (0x002A) are logged only.
+ *   Every GNSS_SV_INFO report gets one "loc: sv #N" line: satellites listed / tracked / with CN0, how many >= 30 and
+ *   >= 20 dB-Hz, best CN0 and the average of the best 4, per constellation counts (no elevation, azimuth or position).
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
  * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). Coordinates are logged rounded to 0.01 deg.
  * loc_shutdown() (SIGTERM, loc.on gone): STOP + REG_EVENTS 0 for a running session and BYE to the relay, then the
@@ -99,10 +112,17 @@ static int srv_up;
 static uint32_t srv_node, srv_port, srv_inst;
 static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2 none */
 static int w_client, w_clientid, w_opmode, w_start_android, w_lockclient, w_lockev;	/* ws-gnss-f; w_client 1 afw, 2 nfw */
+static int w_time;			/* ws-gnss-g time=1 */
+static uint32_t w_timeunc = 5000;	/* ws-gnss-g timeunc=MS (default 5 s: the AP clock is not known to be network-synced) */
+static uint64_t time_last_inject;	/* link_ms of the last INJECT_UTC_TIME sent (0 = none) */
+static unsigned n_time_req, n_time_inj, n_time_ok, n_xtra_req, n_pos_req, n_sv;
+static struct loc_sv_sum sv_last;
+static int sv_have;
 static char on_text[256];
 static uint64_t next_check, probe_gen_done = ~0ull, on_gen, sess_gen_done = ~0ull;
 static int fails, dropped, rev_sent, after_drop;
 static void q_stop(void);
+static int time_ok(uint64_t *ms);
 static void efs_log_now(const char *why);
 static void lk_event(int ok, const struct qmi_msg *m);
 static struct req q[NQ];
@@ -328,6 +348,16 @@ static void send_next(void)
 	struct req r = q[0];
 	memmove(q, q + 1, (size_t)(qn - 1) * sizeof(q[0]));
 	qn--;
+	if (r.id == LOC_INJECT_UTC_TIME) {	/* ws-gnss-g: the time as it is now, not when it was queued */
+		uint64_t ms;
+		if (!time_ok(&ms))
+			return;
+		r.tn = (uint16_t)loc_tlv_inject_utc(r.tl, ms, w_timeunc);
+		time_last_inject = link_ms();
+		n_time_inj++;
+		printf("[%6llu] loc: INJECT_UTC_TIME (%s): AP UTC %llu ms, uncertainty %u ms (clock: PM8150 RTC + sweetrtcoff, "
+		       "not known to be network-synced)\n", now_ms(), r.why, (unsigned long long)ms, w_timeunc);
+	}
 	struct qmi_buf b;
 	uint16_t txn = txn_next++;
 	if (!txn_next)
@@ -353,6 +383,33 @@ static void send_next(void)
 	hex_req(r.id, r.tl, r.tn);
 }
 
+/* ws-gnss-g time=1: INJECT_UTC_TIME from the AP clock. The port's wall clock is the PM8150 RTC + the boot-arg
+ * sweetrtcoff (kernel 0099, calibrated once against the PC; no NTP/NITZ correction known), so the uncertainty is
+ * timeunc= (default 5000 ms), never smaller than 20 ms. A clock before 2025 (no sweetrtcoff) is never injected. */
+#define TIME_SANE_S	1735689600LL	/* 2025-01-01 */
+static int time_ok(uint64_t *ms)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_REALTIME, &ts) || (long long)ts.tv_sec < TIME_SANE_S)
+		return 0;
+	*ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+	return 1;
+}
+
+static void time_queue(const char *why)
+{
+	uint64_t ms;
+	uint8_t t[32];
+	if (!time_ok(&ms)) {
+		printf("[%6llu] loc: time=1: AP clock before 2025 (no sweetrtcoff?): no INJECT_UTC_TIME (%s)\n", now_ms(), why);
+		return;
+	}
+	for (int i = 0; i < qn; i++)
+		if (q[i].id == LOC_INJECT_UTC_TIME)
+			return;		/* one queued is enough */
+	enqueue(LOC_INJECT_UTC_TIME, t, (uint16_t)loc_tlv_inject_utc(t, ms, w_timeunc), 1, why);
+}
+
 static void q_start(uint32_t interval)
 {
 	uint8_t t[64];
@@ -362,10 +419,14 @@ static void q_start(uint32_t interval)
 		enqueue(LOC_INFORM_CLIENT_REV, t, (uint16_t)n, 0, "INFORM_CLIENT_REVISION 2");
 		rev_sent = 1;
 	}
-	n = loc_tlv_reg_events_ex(t, LOC_EVMASK_BRIDGE | (w_lockev ? LOC_EVMASK_ENGINE_LOCK_STATE : 0), (uint32_t)w_client,
-				  w_client && w_clientid ? "HAL" : NULL);
-	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x183 clientType AFW" :
+	n = loc_tlv_reg_events_ex(t, LOC_EVMASK_BRIDGE | (w_lockev ? LOC_EVMASK_ENGINE_LOCK_STATE : 0) |
+				  (w_time ? LOC_EVMASK_ASSIST : 0), (uint32_t)w_client, w_client && w_clientid ? "HAL" : NULL);
+	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, w_time ? (w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x1f3 clientType AFW" :
+		w_client == LOC_CLIENT_NFW ? "REG_EVENTS 0x1f3 clientType NFW" : "REG_EVENTS 0x1f3") :
+		w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x183 clientType AFW" :
 		w_client == LOC_CLIENT_NFW ? "REG_EVENTS 0x183 clientType NFW" : "REG_EVENTS 0x183");
+	if (w_time)		/* ws-gnss-g: the HAL injects network time when it has it; the TLV is filled at send time */
+		time_queue("session start");
 	if (w_opmode) {
 		n = loc_tlv_opmode_standalone(t);
 		enqueue(LOC_SET_OPERATION_MODE, t, (uint16_t)n, 1, "SET_OPERATION_MODE STANDALONE");
@@ -768,13 +829,11 @@ static int lk_hold(void)
 	       (on_present && w_unlock && lk == LK_IDLE && lk_gen_done != on_gen && !shutting && !dropped);
 }
 
-static void lk_poll(void)
+/* ws-gnss-f: the modem's EFS write-back. ws-gnss-g: its own poll, run every loop even with the LOC server down or a
+ * request in flight, so the 900 s limit always ends the wait (it only stats two files) */
+static void efs_poll(void)
 {
-	if (!srv_up || cur.busy || lkq.pending || lk_active())
-		return;
-	int idle = qn == 0 && sess == 0;
-	char a[96];
-	if (efs_watch && link_ms() >= efs_next) {	/* ws-gnss-f: the modem's EFS write-back */
+	if (efs_watch && link_ms() >= efs_next) {
 		int w = 0;
 		efs_next = link_ms() + 2000;
 		if (efs_changed(efs_m, &w)) {
@@ -797,6 +856,14 @@ static void lk_poll(void)
 			status_dirty = 1;
 		}
 	}
+}
+
+static void lk_poll(void)
+{
+	if (!srv_up || cur.busy || lkq.pending || lk_active())
+		return;
+	int idle = qn == 0 && sess == 0;
+	char a[96];
 	if (lk == LK_EFS && on_present && w_unlock && !shutting && !dropped && lk_gen_done != on_gen) {
 		printf("[%6llu] loc: engine lock: a new unlock word while waiting for the EFS write: %s kept as the original\n",
 		       now_ms(), LOCK_ORIG);
@@ -924,6 +991,14 @@ static void read_on(void)
 	w_start_android = strstr(b, "start=android") != NULL;
 	w_lockclient = strstr(b, "lockclient=1") != NULL;
 	w_lockev = strstr(b, "lockev=1") != NULL;
+	w_time = strstr(b, "time=1") != NULL;
+	w_timeunc = 5000;
+	if ((w = strstr(b, "timeunc=")))
+		w_timeunc = (uint32_t)strtoul(w + 8, NULL, 10);
+	if (w_timeunc < 20)
+		w_timeunc = 20;
+	if (w_timeunc > 60000)
+		w_timeunc = 60000;
 	if (w_session > 600)
 		w_session = 600;
 	if (dropped)
@@ -934,6 +1009,9 @@ static void read_on(void)
 	printf("[%6llu] loc: %s %s:%s%s%s%s session=%d\n", now_ms(), LOC_ON, present ? "present" : "absent",
 	       w_probe ? " probe=1" : "", w_pds ? " pds=1" : "", w_unlock == 1 ? " unlock=mi" : w_unlock == 2 ? " unlock=none" : "",
 	       (!w_probe && !w_pds && !w_session && !w_unlock) ? " (no words)" : "", w_session);
+	if (w_time)
+		printf("[%6llu] loc: ws-gnss-g words: time=1 timeunc=%u ms (INJECT_UTC_TIME at session start and on INJECT_TIME_REQ)\n",
+		       now_ms(), w_timeunc);
 	if (w_client || w_clientid || w_opmode || w_start_android || w_lockclient || w_lockev)
 		printf("[%6llu] loc: ws-gnss-f words:%s%s%s%s%s%s\n", now_ms(), w_client == LOC_CLIENT_AFW ? " client=afw" :
 		       w_client == LOC_CLIENT_NFW ? " client=nfw" : "", w_clientid ? " clientid=1" : "", w_opmode ? " opmode=standalone" : "",
@@ -972,6 +1050,13 @@ static void write_status(void)
 			w_clientid ? " +id HAL" : "", w_opmode ? "standalone" : "not sent", w_start_android ? "android" : "ours", w_lockclient,
 			w_lockev, lk_orig_kind & LK_KIND_CLIENT ? "lockClient" : lk_orig_kind & LK_KIND_TYPE ? "lockType" : "-",
 			efs_watch == 2 ? "restore pending" : efs_watch == 1 ? "unlock pending" : "idle");
+	}
+	fprintf(f, "loc: ws-gnss-g time %s (unc %u ms): modem asked %u, injected %u, accepted %u; XTRA requests %u, position "
+		   "requests %u\n", w_time ? "on" : "off", w_timeunc, n_time_req, n_time_inj, n_time_ok, n_xtra_req, n_pos_req);
+	if (sv_have) {
+		char sb[200];
+		loc_sv_summary_str(&sv_last, sb, sizeof(sb));
+		fprintf(f, "loc: sv reports %u, last: %s\n", n_sv, sb);
 	}
 	if (have_last)
 		fprintf(f, "loc: last fix status %u lat %.2f lon %.2f unc %.0f m alt %.0f m tech 0x%x\n", last.status,
@@ -1066,6 +1151,7 @@ void loc_poll(void)
 	}
 	if (!on_present && sess == 0)
 		qn = 0;		/* probe requests still queued: not sent once the file is gone */
+	efs_poll();
 	lk_poll();
 	send_next();
 	kr_poll(now);		/* xnu 1122 */
@@ -1152,6 +1238,35 @@ static void on_position(const uint8_t *tl, uint32_t tn)
 	}
 }
 
+/* ws-gnss-g: a server list TLV (time servers / XTRA servers) as text: after `skip` bytes (delayThreshold), a count byte,
+ * then URL strings; printed as their printable characters with '|' between strings, so the string encoding needs no guess */
+static void assist_log(const struct qmi_msg *m, const char *what, unsigned id, unsigned skip)
+{
+	uint16_t l = 0;
+	const uint8_t *v = qmi_get(m, (uint8_t)id, &l);
+	char b[800];
+	size_t o = 0;
+	if (!v || l <= skip) {
+		printf("[%6llu] loc: %s: no server list (TLV %#x)\n", now_ms(), what, id);
+		return;
+	}
+	if (skip >= 4)
+		printf("[%6llu] loc: %s: delayThreshold %u ms\n", now_ms(), what,
+		       (unsigned)(v[0] | v[1] << 8 | v[2] << 16 | (unsigned)v[3] << 24));
+	int sep = 1;
+	for (uint16_t i = (uint16_t)(skip + 1); i < l && o + 2 < sizeof(b); i++) {
+		if (v[i] >= 0x20 && v[i] < 0x7f) {
+			b[o++] = (char)v[i];
+			sep = 0;
+		} else if (!sep) {
+			b[o++] = '|';
+			sep = 1;
+		}
+	}
+	b[o] = 0;
+	printf("[%6llu] loc: %s: %u server(s): %s\n", now_ms(), what, v[skip], b);
+}
+
 void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 {
 	struct qmi_msg m;
@@ -1177,6 +1292,11 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			}
 			return;
 		}
+		if (res && m.id == LOC_INJECT_UTC_TIME) {	/* ws-gnss-g: a refused inject is logged, never a LOC failure */
+			cur.busy = 0;
+			printf("[%6llu] loc: INJECT_UTC_TIME refused by the modem (error 0x%x)\n", now_ms(), err);
+			return;
+		}
 		if (res) {
 			cur.busy = 0;
 			if (m.id == LOC_START && sess == 1) {
@@ -1199,6 +1319,7 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 	if (m.type != QMI_INDICATION)
 		return;
+	uint16_t l0 = 0;
 	if (cur.busy && cur.got_resp && cur.want_ind && m.id == cur.id) {
 		printf("[%6llu] loc: < 0x%04x indication (%s)\n", now_ms(), m.id, cur.why);
 		qmi_dump(&m);
@@ -1209,6 +1330,13 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			int64_t pm = lk_mask(&pv);
 			printf("[%6llu] loc: engine lock (%s): %s%s%s%s\n", now_ms(), cur.why, pm >= 0 ? lk_str((uint64_t)pm, pb, sizeof(pb)) : "no value",
 			       pv.has_type ? " (lockType TLV)" : "", pv.has_sub ? " (subType TLV)" : "", pv.has_client ? " (lockClient TLV)" : "");
+		}
+		if (m.id == LOC_INJECT_UTC_TIME) {
+			const uint8_t *sv = qmi_get(&m, 0x01, &l0);
+			unsigned stv = sv && l0 >= 4 ? (unsigned)(sv[0] | sv[1] << 8) : 0xffff;
+			if (stv == 0)
+				n_time_ok++;
+			printf("[%6llu] loc: INJECT_UTC_TIME indication status %u%s\n", now_ms(), stv, stv == 0 ? " (success)" : " (NOT accepted)");
 		}
 		cur.busy = 0;
 		if (cur.lk)
@@ -1229,11 +1357,49 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	case LOC_IND_POSITION:
 		on_position(m.tlv, m.len);
 		break;
-	case LOC_IND_SV_INFO:
+	case LOC_IND_SV_INFO: {
 		if ((v = qmi_get(&m, 0x10, &l)) && l >= 1 && last_nsv != v[0]) {
 			last_nsv = v[0];
 			status_dirty = 1;
 		}
+		struct loc_sv_sum ss;	/* ws-gnss-g: one summary line per report (no elevation/azimuth, no positions) */
+		char sb[200];
+		int sr = loc_sv_summary(m.tlv, m.len, &ss);
+		n_sv++;
+		if (sr == 0) {
+			loc_sv_summary_str(&ss, sb, sizeof(sb));
+			printf("[%6llu] loc: sv #%u: %s\n", now_ms(), n_sv, sb);
+			sv_last = ss;
+			sv_have = 1;
+			status_dirty = 1;
+		} else if (n_sv <= 5 || n_sv % 60 == 0) {
+			printf("[%6llu] loc: sv #%u: %s (entry size %u)\n", now_ms(), n_sv, sr == -1 ? "no svList TLV" :
+			       "svList entries not 28 bytes: not parsed", ss.entry_size);
+		}
+		break;
+	}
+	case LOC_IND_INJECT_TIME_REQ:	/* ws-gnss-g: the modem asks for time */
+		n_time_req++;
+		assist_log(&m, "INJECT_TIME_REQ", 0x10, 4);
+		if (w_time && (sess == 1 || sess == 2) && (!time_last_inject || link_ms() - time_last_inject >= 10000))
+			time_queue("modem INJECT_TIME_REQ");
+		else if (!w_time)
+			printf("[%6llu] loc: INJECT_TIME_REQ: time=1 not set, not answered\n", now_ms());
+		status_dirty = 1;
+		break;
+	case LOC_IND_XTRA_REQ:		/* ws-gnss-g: logged only (no XTRA download in this step) */
+		n_xtra_req++;
+		if ((v = qmi_get(&m, 0x01, &l)) && l >= 8)
+			printf("[%6llu] loc: INJECT_PREDICTED_ORBITS_REQ: max file %u bytes, max part %u bytes\n", now_ms(),
+			       (unsigned)(v[0] | v[1] << 8 | v[2] << 16 | (unsigned)v[3] << 24),
+			       (unsigned)(v[4] | v[5] << 8 | v[6] << 16 | (unsigned)v[7] << 24));
+		assist_log(&m, "INJECT_PREDICTED_ORBITS_REQ", 0x10, 0);
+		status_dirty = 1;
+		break;
+	case LOC_IND_INJECT_POS_REQ:	/* ws-gnss-g: logged only (never injected) */
+		n_pos_req++;
+		printf("[%6llu] loc: INJECT_POSITION_REQ from the modem (not answered)\n", now_ms());
+		status_dirty = 1;
 		break;
 	case LOC_IND_ENGINE_STATE:
 		if ((v = qmi_get(&m, 0x01, &l)) && l == 4) {
@@ -1358,6 +1524,13 @@ void loc_shutdown(const char *why)
 		}
 	kr_poll(link_ms());
 	status_dirty = 1;
+}
+
+/* ws-gnss-g: 1 while the only engine lock work left is waiting for the modem's EFS write after a confirmed restore
+ * (nothing is sent meanwhile; efs_poll ends it at the write or after EFS_WAIT_MS) */
+int loc_efs_waiting(void)
+{
+	return lk == LK_EFS && !shutting && !(srv_up && (lk_active() || lkq.pending || (cur.busy && cur.lk)));
 }
 
 /* 1 = nothing in flight or queued for the modem (safe to close the device) */

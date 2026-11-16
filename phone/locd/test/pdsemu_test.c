@@ -145,6 +145,41 @@ int main(void)
 	pdsemu_request(&p, &c, b, req(b, 0x0021, b + 100, (uint16_t)n), &a);
 	CHECK(!pdsemu_want_session(&p, NULL));
 
+	/* ws-gnss-g: INJECT_UTC_TIME TLVs; SV summary (28-byte entries) */
+	n = loc_tlv_inject_utc(b, 0x0102030405060708ull, 5000);
+	CHECK(n == 3 + 8 + 3 + 4 && b[0] == 0x01 && b[1] == 8 && b[3] == 0x08 && b[10] == 0x01 && b[11] == 0x02 && b[12] == 4 &&
+	      b[14] == 0x88 && b[15] == 0x13);
+	{
+		uint8_t sl[1 + 28 * 4], tl[200];
+		struct { uint32_t vm, sys; float snr; uint32_t st; } e[4] = {
+			{ 0x8b, 1, 34.5f, 3 }, { 0x8b, 5, 22.0f, 3 }, { 0x0b, 2, 0.0f, 2 }, { 0x8b, 6, 18.0f, 2 } };
+		memset(sl, 0, sizeof(sl));
+		sl[0] = 4;
+		for (int i = 0; i < 4; i++) {
+			uint8_t *p8 = sl + 1 + 28 * i;
+			memcpy(p8, &e[i].vm, 4);
+			memcpy(p8 + 4, &e[i].sys, 4);
+			p8[8] = (uint8_t)(i + 1);
+			memcpy(p8 + 11, &e[i].st, 4);
+			memcpy(p8 + 24, &e[i].snr, 4);
+		}
+		uint32_t o = 0;
+		put(tl, &o, 0x01, "\x00", 1);
+		put(tl, &o, 0x10, sl, sizeof(sl));
+		struct loc_sv_sum ss;
+		char sb[200];
+		CHECK(loc_sv_summary(tl, o, &ss) == 0 && ss.listed == 4 && ss.tracked == 2 && ss.with_snr == 3 && ss.ge30 == 1 &&
+		      ss.ge20 == 2 && ss.best_snr > 34.4f && ss.sys[1] == 1 && ss.sys[5] == 1 && ss.sys[6] == 1 && ss.sys[2] == 0);
+		loc_sv_summary_str(&ss, sb, sizeof(sb));
+		CHECK(strstr(sb, "GPS 1 GLO 1 QZSS 1") != NULL && strstr(sb, "top3 avg 24.8") != NULL);
+		printf("pdsemu_test: sv summary: %s\n", sb);
+		o = 0;
+		put(tl, &o, 0x10, sl, 1 + 27);	/* wrong entry size */
+		tl[3] = 1;
+		CHECK(loc_sv_summary(tl, o, &ss) == -2);
+		CHECK(loc_sv_summary(tl, 0, &ss) == -1);
+	}
+
 	printf("pdsemu_test: %s (%d failed)\n", nfail ? "FAILED" : "all ok", nfail);
 	return nfail != 0;
 }

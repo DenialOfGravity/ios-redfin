@@ -108,4 +108,29 @@ uint32_t loc_tlv_client_rev(uint8_t *out, uint32_t rev);
 uint32_t loc_tlv_reg_events_ex(uint8_t *out, uint64_t mask, uint32_t ctype, const char *strid);
 uint32_t loc_tlv_start_android(uint8_t *out, uint32_t interval_ms);
 uint32_t loc_tlv_opmode_standalone(uint8_t *out);
+
+/* ws-gnss-g: assistance (location_service_v02.h, hardware/qcom/gps loc_api_v02):
+ *   INJECT_UTC_TIME 0x0038 req 0x01 timeUtc u64 (ms since 1970-01-01 UTC), 0x02 timeUnc u32 (ms), both mandatory;
+ *   its indication (same id) carries 0x01 status u32 (0 = success).
+ *   Event mask bits: INJECT_TIME_REQ 0x10 (ind 0x0028: opt 0x10 time server list = delayThreshold u32 + up to 3 URLs),
+ *   INJECT_PREDICTED_ORBITS_REQ 0x20 (ind 0x0029: 0x01 allowedSizes = maxFileSize u32 + maxPartSize u32, opt 0x10
+ *   server list up to 3 URLs), INJECT_POSITION_REQ 0x40 (ind 0x002A). */
+#define LOC_INJECT_UTC_TIME	0x0038
+#define LOC_IND_INJECT_TIME_REQ	0x0028
+#define LOC_IND_XTRA_REQ	0x0029
+#define LOC_IND_INJECT_POS_REQ	0x002a
+#define LOC_EVMASK_ASSIST	0x70ull
+uint32_t loc_tlv_inject_utc(uint8_t *out, uint64_t utc_ms, uint32_t unc_ms);
+/* GNSS_SV_INFO (0x0025) TLV 0x10 svList (u8 count + count x 28-byte qmiLocSvInfoStructT_v02: validMask u32, system u32,
+ * gnssSvId u16, health u8, svStatus u32 (1 idle, 2 search, 3 track), svInfoMask u8, elevation f32, azimuth f32, snr f32
+ * dB-Hz; snr valid with validMask 0x80). Summary only: counts, CN0, constellations; never elevation/azimuth. */
+struct loc_sv_sum {
+	unsigned listed, tracked, with_snr, ge30, ge20, entry_size;
+	float best_snr, sum_top4;	/* sum_top4: the 4 best CN0 values added up (avg = sum_top4 / min(4, with_snr)) */
+	unsigned sys[8];		/* by system enum: 1 GPS, 2 GAL, 3 SBAS, 4 BDS, 5 GLO, 6 QZSS, 7 NavIC; 0 other (with snr > 0) */
+};
+/* 0 ok, -1 no/short TLV 0x10, -2 unexpected entry size (entry_size set) */
+int loc_sv_summary(const uint8_t *tl, uint32_t tn, struct loc_sv_sum *s);
+/* "N listed, T tracked, S with CN0 (>=30: a, >=20: b), best X dB-Hz, top4 avg Y; GPS g GLO r ..." */
+int loc_sv_summary_str(const struct loc_sv_sum *s, char *b, size_t n);
 #endif

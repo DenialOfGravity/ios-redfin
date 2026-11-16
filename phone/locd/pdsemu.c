@@ -28,6 +28,7 @@
  * 0-7 is the same in PDS and LOC (0 success, 1 in progress, 2 failure, 3 timeout, 4 user end, 5 bad param,
  * 6 offline, 7 engine locked; PDS 8 = E911).
  */
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include "pdsemu.h"
@@ -374,5 +375,82 @@ uint32_t loc_tlv_client_rev(uint8_t *out, uint32_t rev)
 {
 	uint32_t o = 0;
 	tlv(out, &o, 0x01, &rev, 4);
+	return o;
+}
+
+/* ws-gnss-g: INJECT_UTC_TIME (0x0038): 0x01 timeUtc u64 ms since 1970, 0x02 timeUnc u32 ms */
+uint32_t loc_tlv_inject_utc(uint8_t *out, uint64_t utc_ms, uint32_t unc_ms)
+{
+	uint32_t o = 0;
+	tlv(out, &o, 0x01, &utc_ms, 8);
+	tlv(out, &o, 0x02, &unc_ms, 4);
+	return o;
+}
+
+int loc_sv_summary(const uint8_t *tl, uint32_t tn, struct loc_sv_sum *s)
+{
+	uint16_t l = 0;
+	const uint8_t *v = find(tl, tn, 0x10, &l);
+	float top[4] = { 0, 0, 0, 0 };
+	memset(s, 0, sizeof(*s));
+	if (!v || l < 1)
+		return -1;
+	s->listed = v[0];
+	if (!s->listed)
+		return 0;
+	if ((uint32_t)(l - 1) % s->listed) {
+		s->entry_size = 0;
+		return -2;
+	}
+	s->entry_size = (uint32_t)(l - 1) / s->listed;
+	if (s->entry_size != 28)
+		return -2;
+	for (unsigned i = 0; i < s->listed; i++) {
+		const uint8_t *e = v + 1 + 28 * i;
+		uint32_t vm, sys, st;
+		float snr;
+		memcpy(&vm, e, 4);
+		memcpy(&sys, e + 4, 4);
+		memcpy(&st, e + 11, 4);
+		memcpy(&snr, e + 24, 4);
+		if ((vm & 0x08) && st == 3)
+			s->tracked++;
+		if (!(vm & 0x80) || !(snr > 0.0f) || snr > 99.0f)
+			continue;
+		s->with_snr++;
+		s->sys[(vm & 0x01) && sys < 8 ? sys : 0]++;
+		if (snr >= 30.0f)
+			s->ge30++;
+		if (snr >= 20.0f)
+			s->ge20++;
+		if (snr > s->best_snr)
+			s->best_snr = snr;
+		for (int k = 0; k < 4; k++)	/* keep the 4 best */
+			if (snr > top[k]) {
+				for (int j = 3; j > k; j--)
+					top[j] = top[j - 1];
+				top[k] = snr;
+				break;
+			}
+	}
+	for (int k = 0; k < 4; k++)
+		s->sum_top4 += top[k];
+	return 0;
+}
+
+int loc_sv_summary_str(const struct loc_sv_sum *s, char *b, size_t n)
+{
+	static const char *const nm[8] = { "other", "GPS", "GAL", "SBAS", "BDS", "GLO", "QZSS", "NavIC" };
+	unsigned k = s->with_snr < 4 ? s->with_snr : 4;
+	int o = snprintf(b, n, "%u listed, %u tracked, %u with CN0 (>=30: %u, >=20: %u), best %.1f dB-Hz, top%u avg %.1f;",
+			 s->listed, s->tracked, s->with_snr, s->ge30, s->ge20, (double)s->best_snr, k,
+			 k ? (double)(s->sum_top4 / (float)k) : 0.0);
+	for (int i = 1; i <= 8 && o > 0 && (size_t)o < n; i++) {
+		int j = i & 7;	/* 1..7, then 0 (other) last */
+		if (s->sys[j])
+			o += snprintf(b + o, n - (size_t)o, " %s %u", nm[j], s->sys[j]);
+	}
+	if (!s->with_snr && o > 0 && (size_t)o < n)
+		o += snprintf(b + o, n - (size_t)o, " none");
 	return o;
 }

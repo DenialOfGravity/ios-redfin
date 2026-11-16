@@ -38,4 +38,7 @@ void loc_shutdown(const char *why);
 int loc_quiet(void);
 /* 1 while an engine lock change/restore/repair (unlock= word, /var/local/locd.lock-orig) is running or due */
 int loc_lock_busy(void);
+/* ws-gnss-g: 1 while only the EFS write-back wait (after a confirmed restore) is left: sweetlocd stays up for it, up to
+ * loc.c's EFS_WAIT_MS (900 s), instead of giving up after 60 s */
+int loc_efs_waiting(void);
 #endif

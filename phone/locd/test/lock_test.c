@@ -29,6 +29,10 @@ static uint64_t last_set_client_v;
 static int real_client, nopmode, opmode_before_start, start_has12, start_has11, start_has15, start_has18, first_set_client = -1;
 static uint32_t reg_ctype, reg_has_strid, opmode_v;
 static uint64_t reg_mask;
+/* ws-gnss-g: INJECT_UTC_TIME seen by the mock */
+static int ninject, inject_before_start = -1;
+static uint64_t inject_ms;
+static uint32_t inject_unc;
 static uint8_t outq[32][128];
 static uint32_t outn[32];
 static int nout;
@@ -120,6 +124,18 @@ int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 		nopmode++;
 		if ((v = qmi_get(&m, 0x01, &l)) && l == 4)
 			memcpy(&opmode_v, v, 4);
+		resp(m.txn, m.id, 1);
+		n = tlv(r, 0x01, &st, 4);
+		emit(QMI_INDICATION, 1, m.id, r, n);
+		break;
+	case LOC_INJECT_UTC_TIME:
+		ninject++;
+		if ((v = qmi_get(&m, 0x01, &l)) && l == 8)
+			memcpy(&inject_ms, v, 8);
+		if ((v = qmi_get(&m, 0x02, &l)) && l == 4)
+			memcpy(&inject_unc, v, 4);
+		if (inject_before_start < 0)
+			inject_before_start = nstart == 0;
 		resp(m.txn, m.id, 1);
 		n = tlv(r, 0x01, &st, 4);
 		emit(QMI_INDICATION, 1, m.id, r, n);
@@ -492,6 +508,99 @@ static void s_efs_lost(void)
 	CHECK(access(LOCK_ORIG, F_OK) != 0);
 }
 
+/* ws-gnss-g: loc.on removed after an unlock: the restore is confirmed, then the daemon waits (sending nothing) past the
+ * old 60 s limit until the modem writes its EFS (here at ~120 s), then the file goes */
+static void s_efs_gone(void)
+{
+	efs_make();
+	up();
+	wordfile("session=30 unlock=mi\n");
+	pump(300);
+	CHECK(modem == 2);
+	wordfile(NULL);
+	pump(300);
+	CHECK(modem == 3 && access(LOCK_ORIG, F_OK) == 0 && loc_efs_waiting() && loc_lock_busy());
+	int k = nlog;
+	pump(120000);
+	CHECK(nlog == k && loc_efs_waiting() && access(LOCK_ORIG, F_OK) == 0);	/* nothing sent while waiting */
+	efs_touch("modemst1.img", 80);
+	pump(3000);
+	CHECK(access(LOCK_ORIG, F_OK) != 0 && !loc_efs_waiting() && !loc_lock_busy() && nlog == k);
+}
+
+/* the same, but no EFS write ever and the LOC server goes away: the 900 s limit still ends the wait (file kept) */
+static void s_efs_gone_timeout(void)
+{
+	efs_make();
+	up();
+	wordfile("session=30 unlock=mi\n");
+	pump(300);
+	wordfile(NULL);
+	pump(300);
+	CHECK(modem == 3 && loc_efs_waiting());
+	loc_server_gone(0, 0x57);
+	pump(600000);
+	CHECK(loc_efs_waiting());
+	pump(301000);
+	CHECK(!loc_efs_waiting() && !loc_lock_busy() && access(LOCK_ORIG, F_OK) == 0);
+	unlink(LOCK_ORIG);
+}
+
+/* ws-gnss-g time=1: REG_EVENTS asks for the assistance requests, INJECT_UTC_TIME (AP clock, unc 5000) before START, again
+ * on the modem's INJECT_TIME_REQ but not twice within 10 s; timeunc= sets the uncertainty */
+static void s_time(void)
+{
+	modem = 2;
+	up();
+	wordfile("session=60 time=1\n");
+	pump(300);
+	CHECK((reg_mask & 0x70) == 0x70 && ninject == 1 && inject_before_start == 1 && inject_unc == 5000 && start_ok == 1);
+	CHECK(inject_ms / 1000 + 5 >= (uint64_t)time(NULL) && inject_ms / 1000 <= (uint64_t)time(NULL));
+	uint8_t r[64];
+	uint32_t d = 1000, n = tlv(r, 0x10, (const uint8_t *)"\xe8\x03\x00\x00\x01\x0ehttp://t.test/", 20);
+	(void)d;
+	emit(QMI_INDICATION, 1, LOC_IND_INJECT_TIME_REQ, r, n);
+	pump(300);
+	CHECK(ninject == 1);		/* the first one was under 10 s ago */
+	pump(10000);
+	emit(QMI_INDICATION, 1, LOC_IND_INJECT_TIME_REQ, r, n);
+	pump(300);
+	CHECK(ninject == 2);
+	uint32_t sz[2] = { 400000, 1024 };
+	n = tlv(r, 0x01, sz, 8);
+	emit(QMI_INDICATION, 1, LOC_IND_XTRA_REQ, r, n);
+	pump(300);
+	CHECK(ninject == 2);		/* XTRA requests are only logged */
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(loc_quiet());
+}
+
+static void s_time_unc(void)
+{
+	modem = 2;
+	up();
+	wordfile("session=60 time=1 timeunc=250\n");
+	pump(300);
+	CHECK(ninject == 1 && inject_unc == 250);
+	loc_shutdown("SIGTERM");
+	pump(300);
+}
+
+static void s_time_off(void)
+{
+	modem = 2;
+	up();
+	wordfile("session=60\n");
+	pump(300);
+	uint8_t r[8];
+	emit(QMI_INDICATION, 1, LOC_IND_INJECT_TIME_REQ, r, 0);
+	pump(300);
+	CHECK(ninject == 0 && (reg_mask & 0x70) == 0 && start_ok == 1);
+	loc_shutdown("SIGTERM");
+	pump(300);
+}
+
 static int run(const char *name, void (*f)(void), uint64_t *m)
 {
 	fflush(stdout);
@@ -551,6 +660,11 @@ int main(void)
 	m = 2;		/* the hard reboot lost the restore */
 	bad += run("s_efs_lost", s_efs_lost, &m);
 	CHECK(m == 3);
+	RUN(s_efs_gone);
+	RUN(s_efs_gone_timeout);
+	RUN(s_time);
+	RUN(s_time_unc);
+	RUN(s_time_off);
 	unlink(LOC_ON); unlink(LOC_STATUS); unlink(LOCK_ORIG);
 	printf("lock_test: %s (%d scenarios failed, %d checks failed)\n", bad || nfail ? "FAILED" : "all ok", bad, nfail);
 	return bad || nfail;

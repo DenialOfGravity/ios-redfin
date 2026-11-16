@@ -16,7 +16,9 @@
  * exits. Otherwise it exits 0 when loc.on is absent at start, or once it has been gone 15 s and the session is stopped
  * (launchd job org.iosonpixel.sweetlocd: KeepAlive PathState loc.on or locd.lock-orig). SIGTERM/SIGINT/SIGHUP: STOP +
  * REG_EVENTS 0 for a running session, BYE to the relay, the engine lock restore if we changed it, wait for the answers
- * (at most 3 s, 15 s while engine lock work is due), close, exit 0.
+ * (at most 3 s, 15 s while engine lock work is due), close, exit 0. ws-gnss-g: after loc.on goes and a confirmed restore,
+ * the daemon stays up (sending nothing) until the modem's EFS write-back is seen or loc.c's 900 s limit ends the wait,
+ * so locd.lock-orig is removed by the run that restored it (before: exit after 60 s, "engine lock work unfinished").
  *
  *   sweetlocd            daemon; log appended to /var/local/locd.log (SWEETLOCD_LOG=- : stdout)
  *   sweetlocd status     /var/local/loc.status (the daemon rewrites it every 2 s while something changes)
@@ -39,6 +41,7 @@
 #define LOCD_LOG	"/var/local/locd.log"
 #define GONE_EXIT_MS	15000
 #define SHUTDOWN_MS	3000
+#define EFS_EXIT_MS	960000	/* ws-gnss-g: loc.c EFS_WAIT_MS (900 s) + 60 s */
 #define LOCK_SHUTDOWN_MS 15000	/* engine lock restore: SET + GET (+ a second try); launchd ExitTimeOut is 25 */
 
 static int fd = -1;
@@ -209,6 +212,7 @@ int main(int argc, char **argv)
 	sigaction(SIGHUP, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 	uint64_t gone_since = 0, down_at = 0;
+	int efs_told = 0;
 	const char *why = NULL;
 	for (;;) {
 		try_open();
@@ -232,8 +236,15 @@ int main(int argc, char **argv)
 				gone_since = now;
 			else if (now - gone_since >= GONE_EXIT_MS && !loc_lock_busy())
 				why = repair_only ? "repair run over" : LOC_ON " gone";
-			else if (now - gone_since >= 4 * GONE_EXIT_MS)
+			else if (now - gone_since >= 4 * GONE_EXIT_MS && !loc_efs_waiting())
 				why = repair_only ? "repair not finished in 60 s" : LOC_ON " gone (engine lock work unfinished)";
+			else if (now - gone_since >= EFS_EXIT_MS)	/* ws-gnss-g: backstop; loc.c ends the EFS wait at 900 s */
+				why = repair_only ? "repair: EFS wait over 960 s" : LOC_ON " gone (EFS wait over 960 s)";
+			if (!why && loc_efs_waiting() && now - gone_since >= 4 * GONE_EXIT_MS && !efs_told) {
+				efs_told = 1;
+				printf("[%6llu] sweetlocd: %s gone: staying up (sending nothing) until the modem's EFS write-back is seen "
+				       "(at most 900 s; SIGTERM still exits at once)\n", (unsigned long long)now, LOC_ON);
+			}
 		}
 		if (why && !down_at) {
 			loc_shutdown(why);
