@@ -629,6 +629,14 @@ static uint32_t persona_said;
 static uint32_t gw_refused[RF_N];
 static uint32_t gw_host_pkts, gw_host_bytes, gw_up_pkts, gw_up_fail, gw_said, gw_opt_said, gw_sel_said, gw_chip_said;
 static volatile bool gw_session, gw_rx_running;
+/* 1146: NXP HDLL download/bootloader capture (kern.sweet_nfc_fwif_fmt 0x40000, with the 0x4000 eSE group).
+ * DownloadRequest(1) is accepted and latches gw_dl_mode; the HDLL frames nfcd then writes are logged and
+ * NOTHING is forwarded to the chip (persona runs in gateway mode 0; gw_bus_ok()/sweet_nfc_tx_allowed() still
+ * block all forwarding) and nothing is answered (capture only; nfcd times out on the FW-version read). */
+static volatile bool gw_dl_mode;
+static unsigned gw_dl_n;
+static uint32_t gw_dl_frames;
+static uint8_t gw_dl_buf[2 + 512 + 2];  /* [LEN_hi LEN_lo | payload | CRC16] */
 static struct {
 	bool connected, rf_active;
 	uint32_t unit, crc, on_demand;
@@ -2496,6 +2504,10 @@ gw_session_stop(const char *why)
 	if (!nfc_loader) {
 		set_state("off");
 	}
+	if (gw_dl_mode) {               /* 1146: a chip reset ends the download capture */
+		gw_dl_mode = false;
+		gw_dl_n = 0;
+	}
 	SAY("gw: chip session stopped (%s): VEN low\n", why);
 }
 
@@ -2668,6 +2680,46 @@ gw_packet_done(unsigned need, uint8_t *out, unsigned *no, unsigned cap, bool *wa
 	gw.pend = true;
 }
 
+/* 1146: log the NXP HDLL frames nfcd writes while in download mode. Framing: [LEN_hi LEN_lo | payload | CRC16],
+ * LEN = payload length, whole frame = 2 + LEN + 2. Each complete frame is one "nfc-hci" klog line; bytes left at
+ * the end of a write are flushed as a partial line so no byte nfcd sends is lost even if our LEN read is off.
+ * Nothing here reaches the chip and nothing is answered. */
+static void
+gw_dl_capture(mbuf_t m)
+{
+	for (mbuf_t b = m; b != NULL; b = mbuf_next(b)) {
+		const uint8_t *d = mbuf_data(b);
+		size_t len = mbuf_len(b), i = 0;
+
+		while (i < len) {
+			if (gw_dl_n >= sizeof(gw_dl_buf)) {
+				gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> overflow, resync");
+				gw_dl_n = 0;
+			}
+			gw_dl_buf[gw_dl_n++] = d[i++];
+			if (gw_dl_n >= 2) {
+				unsigned plen = ((unsigned)gw_dl_buf[0] << 8) | gw_dl_buf[1];
+				unsigned need = 2u + plen + 2u;
+
+				if (need > sizeof(gw_dl_buf)) {
+					gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> bad LEN, resync");
+					gw_dl_n = 0;
+					continue;
+				}
+				if (gw_dl_n == need) {
+					gw_dl_frames++;
+					gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> HDLL frame (not forwarded, no reply)");
+					gw_dl_n = 0;
+				}
+			}
+		}
+	}
+	if (gw_dl_n > 0) {
+		gw_hexlog("nfc-hci", gw_dl_buf, gw_dl_n, "dnld host> write end, LEN not satisfied (partial)");
+		gw_dl_n = 0;
+	}
+}
+
 static errno_t
 gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
 {
@@ -2677,6 +2729,11 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, 
 	bool want_up = false;
 
 	if (nfc_p1 == 0) {              /* 1125: withdrawn, waiting for the client to close */
+		mbuf_freem(m);
+		return 0;
+	}
+	if (gw_dl_mode) {               /* 1146: download capture: log HDLL frames, forward nothing, answer nothing */
+		gw_dl_capture(m);
 		mbuf_freem(m);
 		return 0;
 	}
@@ -2933,10 +2990,24 @@ sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v)
 		}
 	} else if (sel == 1) {
 		if (v == 1) {
-			r = 1;
-			gw_refused[RF_DOWNLOAD]++;
-			what = "REFUSED: no download mode on this port";
+			if ((nfc_fwif_fmt & 0x40000) && (nfc_fwif_fmt & 0x4000)) {
+				/* 1146: accept DownloadRequest and capture the NXP HDLL frames nfcd writes; nothing reaches
+				 * the chip and nothing is answered (gateway mode 0; forwarding stays blocked). */
+				gw_dl_mode = true;
+				gw_dl_n = 0;
+				gw_dl_frames = 0;
+				what = "download mode latched (fwif_fmt 0x40000): capturing HDLL frames, nothing forwarded";
+			} else {
+				r = 1;
+				gw_refused[RF_DOWNLOAD]++;
+				what = "REFUSED: no download mode on this port";
+			}
 		} else {
+			if (gw_dl_mode) {
+				gw_dl_mode = false;
+				gw_dl_n = 0;
+				SAY("nfc-hci: persona: 1146: download mode off after %u frame(s) captured\n", gw_dl_frames);
+			}
 			what = "download request off: accepted";
 		}
 	} else if (sel == 2 || sel == 3 || sel == 5) {
@@ -2964,6 +3035,10 @@ sweet_nfc_uc_event(int open, uint32_t type)
 	proc_selfname(who, sizeof(who));
 	SAY("AppleStockholmControlUserClient: %s by %s (pid %d), type %u\n", open ? "OPEN" : "CLOSE", who, proc_selfpid(),
 	    type);
+	if (!open && gw_dl_mode) {      /* 1146: client gone: end download capture */
+		gw_dl_mode = false;
+		gw_dl_n = 0;
+	}
 	if (!open && !gw_session && !(nfc_busy) && pins_map()) {
 		ven(false);             /* the client is gone: chip off */
 	}
@@ -3090,7 +3165,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
     "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2); 1138: 0x1000 = eSE EoOP NTF "
     "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value; 1139: 0x4000 = "
     "MODE_SET C0/01 00 -> 6F 18 00 (1144; 1145: also for NFCEE 01; 0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
-    "deferred by kern.sweet_nfc_ntf_delay_ms as its own packet, 0x20000 = no NTF after the disable RSP");
+    "deferred by kern.sweet_nfc_ntf_delay_ms as its own packet, 0x20000 = no NTF after the disable RSP; 1146: 0x40000 "
+    "(with 0x4000) = accept DownloadRequest and log the NXP HDLL frames nfcd writes (nfc-hci), forwarding/answering nothing");
 
 static int
 cfg_hexval(char c)
