@@ -679,6 +679,12 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
 // own table only as large as the parts of it this draw uses, its descriptors alone written: was 8 KiB a draw, 2.5 KiB
 // of it set). Read once (reloadDrawSkipForTesting reads it again).
 enum : uint32_t { kSkipProgram = 1, kSkipTextures = 2, kSkipTable = 4, kSkipAll = 7 };
+// (ws-hm-int13b) HM_SKIP_PROG, how far prog goes: imm (default) -- the shader preloads alone are left out, the
+// immediates loaded every draw (the dock platter: the A620's per-draw HLSQ_INVALIDATE_CMD leaves a draw that skipped
+// them with stale ones, as it would the pushed constants that are loaded every draw anyway); old -- the immediates
+// left out too (ws-hm-drawcpu .. int12, the defect); noinv -- as old, and the skipping draw's HLSQ_INVALIDATE_CMD
+// left out as well (an experiment: nothing invalidated, nothing reloaded)
+enum : uint32_t { kSkipProgImm = 8, kSkipProgInv = 16 };
 uint32_t drawSkip();
 void reloadDrawSkipForTesting();
 

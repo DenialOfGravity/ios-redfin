@@ -1897,8 +1897,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // 400-458): HLSQ_INVALIDATE_CMD for the five graphics stages and the 3D IBOs, then SP_xS_CONFIG / HLSQ_xS_CNTL per
     // stage with HS, DS and GS off (NTEX = NSAMP = num_samp = 0; CONSTLEN in the field's units of 4 vec4, the FS's 0 is
     // ENABLED alone), SP_IBO_COUNT 0 (fd6's nibo(fs))
+    const uint32_t skipMode = skipProg ? drawSkip() : 0;   // (ws-hm-int13b) HM_SKIP_PROG
     if (o.programConfig) {
-        reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD,
+        if (!(skipMode & kSkipProgInv)) reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD,
             A6XX_HLSQ_INVALIDATE_CMD_VS_STATE | A6XX_HLSQ_INVALIDATE_CMD_HS_STATE | A6XX_HLSQ_INVALIDATE_CMD_DS_STATE |
                 A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO);
         reg(stream, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos));
@@ -1942,7 +1943,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
               uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
         if (!skipProg) loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, chip().instrCacheSize), address);
-        if (s.k.numImmediates != 0 && !skipProg) {
+        if (s.k.numImmediates != 0 && !(skipProg && (skipMode & kSkipProgImm))) {   // (ws-hm-int13b) loaded every draw unless HM_SKIP_PROG=old/noinv
             // (ws-hm-int13) on the stack when it fits (was a vector a draw), the same words
             const size_t nImm = (size_t(s.k.numImmediates) + 3) & ~size_t(3);
             uint32_t immLocal[256];
@@ -3117,6 +3118,9 @@ uint32_t parseDrawSkip() {
     if (strstr(e, "prog") != nullptr) m |= kSkipProgram;
     if (strstr(e, "tex") != nullptr) m |= kSkipTextures;
     if (strstr(e, "table") != nullptr) m |= kSkipTable;
+    const char* q = getenv("HM_SKIP_PROG");   // (ws-hm-int13b)
+    if (q != nullptr && strcmp(q, "old") == 0) m |= kSkipProgImm;
+    if (q != nullptr && strcmp(q, "noinv") == 0) m |= kSkipProgImm | kSkipProgInv;
     return m;
 }
 std::atomic<uint32_t> gDrawSkip{parseDrawSkip()};
