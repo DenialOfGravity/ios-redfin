@@ -115,14 +115,15 @@ const char *lk_str(uint64_t mask, char *b, size_t n)
 	return b;
 }
 
-int lk_save(const char *path, uint64_t mask, unsigned tries)
+int lk_save_ex(const char *path, const struct lk_file *lf)
 {
-	char tmp[256], line[128];
+	char tmp[256], line[192];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0)
 		return -1;
-	int n = snprintf(line, sizeof(line), "mask=0x%llx tries=%u\n", (unsigned long long)mask, tries);
+	int n = snprintf(line, sizeof(line), "mask=0x%llx tries=%u kind=%u efs=%u m1=%lld m2=%lld\n", (unsigned long long)lf->mask,
+			 lf->tries, lf->kind, lf->efs, lf->m1, lf->m2);
 	if (write(fd, line, (size_t)n) != n || fsync(fd)) {
 		close(fd);
 		unlink(tmp);
@@ -134,19 +135,44 @@ int lk_save(const char *path, uint64_t mask, unsigned tries)
 	return 0;
 }
 
-int lk_load(const char *path, uint64_t *mask, unsigned *tries)
+int lk_load_ex(const char *path, struct lk_file *lf)
 {
 	FILE *f = fopen(path, "r");
 	unsigned long long m;
-	unsigned t = 0;
+	unsigned t = 0, k = 0, e = 0;
+	long long m1 = 0, m2 = 0;
 	if (!f)
 		return -1;
-	int r = fscanf(f, "mask=%llx tries=%u", &m, &t);
+	int r = fscanf(f, "mask=%llx tries=%u kind=%u efs=%u m1=%lld m2=%lld", &m, &t, &k, &e, &m1, &m2);
 	fclose(f);
 	if (r < 1)
 		return -2;		/* present but unreadable */
-	*mask = m;
+	memset(lf, 0, sizeof(*lf));
+	lf->mask = m;
+	lf->tries = r >= 2 ? t : 0;
+	lf->kind = r >= 3 ? k : 0;
+	if (r >= 6) {
+		lf->efs = e;
+		lf->m1 = m1;
+		lf->m2 = m2;
+	}
+	return 0;
+}
+
+int lk_save(const char *path, uint64_t mask, unsigned tries)
+{
+	struct lk_file lf = { .mask = mask, .tries = tries };
+	return lk_save_ex(path, &lf);
+}
+
+int lk_load(const char *path, uint64_t *mask, unsigned *tries)
+{
+	struct lk_file lf;
+	int r = lk_load_ex(path, &lf);
+	if (r)
+		return r;
+	*mask = lf.mask;
 	if (tries)
-		*tries = r >= 2 ? t : 0;
+		*tries = lf.tries;
 	return 0;
 }

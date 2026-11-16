@@ -33,6 +33,12 @@
 #define LOC_GET_FIX_CRITERIA	0x0033
 #define LOC_GET_XTRA_SOURCE	0x0036
 #define LOC_GET_ENGINE_LOCK	0x003b
+#define LOC_SET_OPERATION_MODE	0x004a		/* ws-gnss-f, opmode=standalone only */
+#define LOC_OPMODE_STANDALONE	4
+#define LOC_IND_ENGINE_LOCK_STATE 0x00bb	/* ws-gnss-f lockev=1 (event mask bit 37) */
+#define LOC_EVMASK_ENGINE_LOCK_STATE 0x2000000000ull
+#define LOC_CLIENT_AFW		1		/* REG_EVENTS TLV 0x11 qmiLocClientTypeEnumT_v02 */
+#define LOC_CLIENT_NFW		2
 
 #define LOC_EVMASK_BRIDGE	0x183ull	/* POSITION_REPORT 0x1 | GNSS_SV_INFO 0x2 | ENGINE_STATE 0x80 | FIX_SESSION_STATE 0x100 */
 #define LOC_SESSION_ID		1
@@ -99,4 +105,7 @@ uint32_t loc_tlv_reg_events(uint8_t *out, uint64_t mask);
 uint32_t loc_tlv_start(uint8_t *out, uint32_t interval_ms);
 uint32_t loc_tlv_stop(uint8_t *out);
 uint32_t loc_tlv_client_rev(uint8_t *out, uint32_t rev);
+uint32_t loc_tlv_reg_events_ex(uint8_t *out, uint64_t mask, uint32_t ctype, const char *strid);
+uint32_t loc_tlv_start_android(uint8_t *out, uint32_t interval_ms);
+uint32_t loc_tlv_opmode_standalone(uint8_t *out);
 #endif

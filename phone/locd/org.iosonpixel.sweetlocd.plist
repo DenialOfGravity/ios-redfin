@@ -8,6 +8,8 @@
   when the file is absent at start or gone 15 s (after STOP to the modem), and is not restarted after a clean exit.
   ws-gnss-e: also while /var/local/locd.lock-orig exists (written only by unlock=mi/none before changing the modem's engine
   lock, removed after the restore is confirmed): then it restores that value even with loc.on absent (at most 5 runs).
+  ws-gnss-f: after a confirmed restore the file stays (efs=1) until the modem's EFS write-back (modemst1/2.img changes),
+  so sweetlocd stays up (or is restarted) for at most 15 min per run to watch for it.
   ExitTimeOut 25: SIGTERM waits for the engine lock restore (SET + GET, at most 15 s).
   Needs kern.sweet_mqrtr_aux=1 (xnu 1124) for /dev/sweet-mqrtr-aux; until then it retries the open every 10 s and does
   nothing. Binary /var/local/bin/sweetlocd; log /var/local/locd.log; status: sweetlocd status.

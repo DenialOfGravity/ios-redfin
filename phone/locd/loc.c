@@ -29,6 +29,26 @@
  *                Any other unlock= value is ignored (logged). Every engine lock change is logged with old/new values
  *                ("ENGINE LOCK"). Crash repair: when locd.lock-orig exists and no unlock word is set (also with loc.on
  *                absent: launchd starts us for that file), its value is restored (GET, SET, GET), at most 5 runs.
+ * ws-gnss-f words (all default off; Claude 2026-11-16, sources: CLO LA.UM.9.12 location_service_v02.h/.c, loc_api_v02_client.cpp,
+ *   LocApiV02.cpp, GnssAdapter.cpp):
+ *   client=afw   REG_EVENTS carries TLV 0x11 clientType 1 (AFW) + 0x12 enablePosRequestNotification 0, as the QTI HAL's
+ *                locClientRegisterEventMask always does. Without 0x11 the modem treats a client as NFW
+ *                ("If not specified, defaults to NFW client"), so the NFW bit of the engine lock (0x2) refuses our START
+ *                with ENGINE_LOCKED even when the AFW bit is open. client=nfw sends 0x11 = 2 (for comparison only).
+ *   clientid=1   with client=: also TLV 0x10 clientStrId "HAL" (the HAL's non-master id; top-level QMI string, no prefix).
+ *   opmode=standalone  SET_OPERATION_MODE (0x004A) 0x01 = 4 STANDALONE before each START, as startFix does. No other mode.
+ *   start=android      START with the HAL's TLVs (0x01 sess 1, 0x10 periodic, 0x11 accuracy HIGH, 0x13 interval,
+ *                0x15 altitude-assumed off, 0x18 sharePosition 1; no 0x12) instead of ours (0x01, 0x10, 0x12 off, 0x13).
+ *   lockclient=1 the FIRST unlock SET_ENGINE_LOCK also carries TLV 0x11 lockClient (otherwise only on try 2).
+ *   lockev=1     REG_EVENTS also asks for ENGINE_LOCK_STATE indications (mask bit 0x2000000000, ind 0x00BB; logged in hex).
+ * Restore (ws-gnss-f): SET_ENGINE_LOCK in the same TLV kind the original GET answered with (redfin: lockClient TLV 0x12, so
+ *   lockType + lockClient = original mask + subType ALL_SUB), then GET to confirm. The modem keeps its EFS (where the lock
+ *   lives) in RAM and writes it back to modemst1/modemst2 through wland's rmtfs only now and then; a GET reads the RAM
+ *   value. So locd.lock-orig is kept (efs=1) after a confirmed restore until modemst1.img or modemst2.img in EFS_DIR
+ *   changes ("ENGINE LOCK restore reached EFS"); a hard reboot before that is repaired at the next start. If neither file
+ *   exists, the old behaviour (file removed at once).
+ * Hex: every request's TLV bytes are logged ("loc: > ... hex"), every response and indication with qmi_dump, except
+ *   POSITION_REPORT / SV_INFO (TLV ids and lengths only, plus the session status: no position bytes in the log).
  * Kernel router (xnu 1122/1124, kern.sweet_bb & 2; the only PDS path for sweetlocd: wland's abpbridge router mode is not
  *   served here): with pds=1 sweetlocd says HELLO to the kernel's relay (QRTR DATA from port PDSR_WPORT to node 1 port PDSR_KPORT, every 10 s; BYE when
  *   the word goes); with kern.sweet_qmux_pds 1 the kernel then sends every PDS request (REQ: pipe, sess, cid, SDU) here,
@@ -36,7 +56,7 @@
  *   as IND records; GONE (session closed / client gone) and CID release end locationd's client as abpbridge's session end.
  *   Record: struct pdsr below (24 bytes, LE) + data, the same layout as bsd/dev/sweet_qmux.c.
  * Never sent: SET_ENGINE_LOCK (except unlock=/repair above: only the engine lock value, nothing else),
- * SET_OPERATION_MODE, SUPL/NI settings, any NV/EFS write, XTRA/time/position injects.
+ * SET_OPERATION_MODE other than STANDALONE (and only with opmode=standalone), SUPL/NI settings, any NV/EFS write, XTRA/time/position injects.
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
  * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). Coordinates are logged rounded to 0.01 deg.
  * loc_shutdown() (SIGTERM, loc.on gone): STOP + REG_EVENTS 0 for a running session and BYE to the relay, then the
@@ -48,6 +68,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
@@ -61,6 +82,10 @@
 #define RESP_MS		5000
 #define IND_MS		3000
 #define NQ		12
+#ifndef EFS_DIR				/* wland's rmtfs files (phone/wifi/rmtfs.c RMTFS_DIR); the host test points it elsewhere */
+#define EFS_DIR		"/var/local/fw/rmtfs"
+#endif
+#define EFS_WAIT_MS	900000		/* how long a confirmed restore waits for the modem's EFS write-back */
 
 struct req {
 	uint16_t id;
@@ -73,10 +98,12 @@ struct req {
 static int srv_up;
 static uint32_t srv_node, srv_port, srv_inst;
 static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2 none */
+static int w_client, w_clientid, w_opmode, w_start_android, w_lockclient, w_lockev;	/* ws-gnss-f; w_client 1 afw, 2 nfw */
 static char on_text[256];
 static uint64_t next_check, probe_gen_done = ~0ull, on_gen, sess_gen_done = ~0ull;
 static int fails, dropped, rev_sent, after_drop;
 static void q_stop(void);
+static void efs_log_now(const char *why);
 static void lk_event(int ok, const struct qmi_msg *m);
 static struct req q[NQ];
 static int qn;
@@ -99,9 +126,19 @@ static int have_last, status_dirty = 1;
 static struct pds_state pds;
 static int pds_inited;
 /* engine lock (unlock=mi / unlock=none / repair; englock.h): its own one-request slot, sent before the queue */
-enum { LK_IDLE, LK_RD, LK_RD_DV, LK_SET, LK_CHK, LK_UNLOCKED, LK_RS_SET, LK_RS_CHK, LK_RP_RD, LK_NOOP, LK_FAILED, LK_RS_FAILED };
+enum { LK_IDLE, LK_RD, LK_RD_DV, LK_SET, LK_CHK, LK_UNLOCKED, LK_RS_SET, LK_RS_CHK, LK_RP_RD, LK_NOOP, LK_FAILED, LK_RS_FAILED,
+       LK_EFS };
 static const char *const lk_names[] = { "idle", "reading", "reading DV", "setting", "checking", "UNLOCKED", "restoring",
-					"checking restore", "repair read", "no change needed", "unlock failed", "RESTORE FAILED" };
+					"checking restore", "repair read", "no change needed", "unlock failed", "RESTORE FAILED",
+					"restored, waiting for the EFS write" };
+static unsigned lk_orig_kind;			/* ws-gnss-f: LK_KIND_* of the original GET */
+static int lk_orig_dv_known;
+static uint64_t lk_orig_dv;
+/* ws-gnss-f: modem EFS write-back watch (modemst1/2 mtimes in ns, 0 = file missing) */
+static long long efs_m[2];
+static int efs_watch;				/* 1 after an unlock (log only), 2 after a restore (LK_EFS) */
+static uint64_t efs_t0, efs_next;
+static const char *efs_why;
 static int lk, lk_try, lk_mode, lk_rs_tries, lk_verify, lk_now_known;	/* lk_mode: the word we unlocked for */
 static uint64_t lk_orig, lk_target, lk_now_mask;
 static uint64_t lk_gen_done = ~0ull, lk_fail_gen = ~0ull, lk_repair_gen = ~0ull;
@@ -113,6 +150,32 @@ static struct {
 } lkq;
 
 static unsigned long long now_ms(void) { return (unsigned long long)link_ms(); }
+
+/* ws-gnss-f: a request's TLV bytes in hex (all our requests are short: no position data is ever sent) */
+static void hex_req(uint16_t id, const uint8_t *tl, uint32_t tn)
+{
+	printf("[%6llu] loc: > 0x%04x hex:", now_ms(), id);
+	for (uint32_t i = 0; i < tn; i++)
+		printf(" %02x", tl[i]);
+	printf("%s\n", tn ? "" : " (no TLVs)");
+}
+
+/* ws-gnss-f: TLV ids/lengths only, plus 0x01 (session status / state) and 0x02 (session id) in hex: for indications that can
+ * carry a position (POSITION_REPORT, SV_INFO), so no coordinates reach the log */
+static void dump_ids(const struct qmi_msg *m)
+{
+	printf("qmi: type %u txn %u msg %#x len %u (ids only):", m->type, m->txn, m->id, m->len);
+	for (uint32_t o = 0; o + 3 <= m->len;) {
+		uint16_t l = (uint16_t)(m->tlv[o + 1] | m->tlv[o + 2] << 8);
+		printf(" [%#x/%u", m->tlv[o], l);
+		if ((m->tlv[o] == 0x01 || m->tlv[o] == 0x02) && l <= 4)
+			for (uint16_t k = 0; k < l && o + 3 + k < m->len; k++)
+				printf(" %02x", m->tlv[o + 3 + k]);
+		printf("]");
+		o += 3u + l;
+	}
+	printf("\n");
+}
 
 /* ---- xnu 1122: the kernel router's PDS relay ---- */
 #define PDSR_MAGIC	0x52534450u
@@ -255,6 +318,7 @@ static void send_next(void)
 		cur.busy = 1;
 		cur.sent = link_ms();
 		printf("[%6llu] loc: > 0x%04x %s (txn %u, %u TLV bytes)\n", now_ms(), lkq.id, lkq.why, ltxn, lkq.tn);
+		hex_req(lkq.id, lkq.tl, lkq.tn);
 		return;
 	}
 	if (cur.busy || !qn || !srv_up || (dropped && !after_drop))
@@ -286,6 +350,7 @@ static void send_next(void)
 	cur.sent = link_ms();
 	cur.why = r.why;
 	printf("[%6llu] loc: > 0x%04x %s (txn %u, %u TLV bytes)\n", now_ms(), r.id, r.why, txn, r.tn);
+	hex_req(r.id, r.tl, r.tn);
 }
 
 static void q_start(uint32_t interval)
@@ -297,10 +362,16 @@ static void q_start(uint32_t interval)
 		enqueue(LOC_INFORM_CLIENT_REV, t, (uint16_t)n, 0, "INFORM_CLIENT_REVISION 2");
 		rev_sent = 1;
 	}
-	n = loc_tlv_reg_events(t, LOC_EVMASK_BRIDGE);
-	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, "REG_EVENTS 0x183");
-	n = loc_tlv_start(t, interval);
-	enqueue(LOC_START, t, (uint16_t)n, 0, "START session 1 periodic");
+	n = loc_tlv_reg_events_ex(t, LOC_EVMASK_BRIDGE | (w_lockev ? LOC_EVMASK_ENGINE_LOCK_STATE : 0), (uint32_t)w_client,
+				  w_client && w_clientid ? "HAL" : NULL);
+	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x183 clientType AFW" :
+		w_client == LOC_CLIENT_NFW ? "REG_EVENTS 0x183 clientType NFW" : "REG_EVENTS 0x183");
+	if (w_opmode) {
+		n = loc_tlv_opmode_standalone(t);
+		enqueue(LOC_SET_OPERATION_MODE, t, (uint16_t)n, 1, "SET_OPERATION_MODE STANDALONE");
+	}
+	n = w_start_android ? loc_tlv_start_android(t, interval) : loc_tlv_start(t, interval);
+	enqueue(LOC_START, t, (uint16_t)n, 0, w_start_android ? "START session 1 periodic (HAL TLVs)" : "START session 1 periodic");
 }
 
 static void q_stop(void)
@@ -308,7 +379,7 @@ static void q_stop(void)
 	uint8_t t[64];
 	uint32_t n = loc_tlv_stop(t);
 	enqueue(LOC_STOP, t, (uint16_t)n, 0, "STOP session 1");
-	n = loc_tlv_reg_events(t, 0);
+	n = loc_tlv_reg_events_ex(t, 0, (uint32_t)w_client, w_client && w_clientid ? "HAL" : NULL);
 	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, "REG_EVENTS 0");
 }
 
@@ -355,8 +426,81 @@ static void probe_queue(void)
 	}
 	enqueue(LOC_GET_SERVICE_REV, NULL, 0, 1, "GET_SERVICE_REVISION (probe)");
 	enqueue(LOC_GET_ENGINE_LOCK, NULL, 0, 1, "GET_ENGINE_LOCK (probe, read-only)");
+	n = lk_tlv_get(t, LK_SUB_DV);
+	enqueue(LOC_GET_ENGINE_LOCK, t, (uint16_t)n, 1, "GET_ENGINE_LOCK subType DV (probe, read-only)");
+	efs_log_now("probe");
 	enqueue(LOC_GET_FIX_CRITERIA, NULL, 0, 1, "GET_FIX_CRITERIA (probe)");
 	enqueue(LOC_GET_XTRA_SOURCE, NULL, 0, 1, "GET_PREDICTED_ORBITS_DATA_SOURCE (probe)");
+}
+
+/* ---- ws-gnss-f: the modem's EFS write-back (wland's rmtfs writes modemst1.img / modemst2.img) ---- */
+static int efs_snap(long long m[2])
+{
+	static const char *const f[2] = { EFS_DIR "/modemst1.img", EFS_DIR "/modemst2.img" };
+	int found = 0;
+	for (int i = 0; i < 2; i++) {
+		struct stat st;
+		m[i] = 0;
+		if (stat(f[i], &st))
+			continue;
+		found++;
+#ifdef __APPLE__
+		m[i] = (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+		m[i] = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+		if (!m[i])
+			m[i] = 1;
+	}
+	return found;
+}
+
+static void efs_log_now(const char *why)
+{
+	long long m[2];
+	time_t now = time(NULL);
+	if (!efs_snap(m)) {
+		printf("[%6llu] loc: EFS (%s): no modemst1.img/modemst2.img in %s\n", now_ms(), why, EFS_DIR);
+		return;
+	}
+	printf("[%6llu] loc: EFS (%s): modemst1.img written %lld s ago, modemst2.img %lld s ago\n", now_ms(), why,
+	       m[0] ? (long long)now - m[0] / 1000000000LL : -1, m[1] ? (long long)now - m[1] / 1000000000LL : -1);
+}
+
+/* start watching for the next EFS write; 0 if the files are not there (nothing to wait for) */
+static int efs_watch_start(int kind, const char *why)
+{
+	if (!efs_snap(efs_m))
+		return 0;
+	efs_watch = kind;
+	efs_t0 = link_ms();
+	efs_next = efs_t0 + 2000;
+	efs_why = why;
+	return 1;
+}
+
+/* 1 = one of the files changed since the snapshot */
+static int efs_changed(const long long ref[2], int *which)
+{
+	long long m[2];
+	efs_snap(m);
+	for (int i = 0; i < 2; i++)
+		if (m[i] != ref[i] && m[i]) {
+			if (which)
+				*which = i + 1;
+			return 1;
+		}
+	return 0;
+}
+
+static int lk_save_kind(uint64_t mask, unsigned tries, int efs)
+{
+	struct lk_file lf = { .mask = mask, .tries = tries, .kind = lk_orig_kind, .efs = (unsigned)efs };
+	if (efs) {
+		lf.m1 = efs_m[0];
+		lf.m2 = efs_m[1];
+	}
+	return lk_save_ex(LOCK_ORIG, &lf);
 }
 
 /* ---- engine lock: unlock=mi / unlock=none, restore, crash repair (header; englock.h) ---- */
@@ -403,10 +547,13 @@ static void lk_set(uint64_t mask, int with_client, const char *why)
 	lk_req(LOC_SET_ENGINE_LOCK, t, lk_tlv_set(t, lk_type_of_mask(mask), with_client, mask), "SET_ENGINE_LOCK");
 }
 
+/* ws-gnss-f: the restore uses the TLV kind the original GET answered with (lockClient when it reported lockClient) */
 static void lk_restore_start(const char *why)
 {
 	lk_rs_tries++;
-	lk_try = (lk_orig & ~3ull) ? 2 : 1;
+	lk_try = ((lk_orig & ~3ull) || (lk_orig_kind & LK_KIND_CLIENT)) ? 2 : 1;
+	printf("[%6llu] loc: engine lock: restore in the original's TLV kind: %s\n", now_ms(),
+	       lk_try == 2 ? "lockType + lockClient (the GET reported lockClient)" : "lockType only (the GET reported lockType)");
 	lk_set(lk_orig, lk_try == 2, why);
 	lk = LK_RS_SET;
 }
@@ -449,7 +596,30 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		printf("[%6llu] loc: engine lock: modem %s%s%s\n", now_ms(), lk_str((uint64_t)mask, a, sizeof(a)),
 		       v.has_type ? " (lockType TLV)" : "", v.has_client ? " (lockClient TLV)" : "");
 		if (lk == LK_RP_RD) {
-			if ((uint64_t)mask == lk_orig) {
+			struct lk_file rf;
+			int rr = lk_load_ex(LOCK_ORIG, &rf);
+			if (!lk_orig_kind)
+				lk_orig_kind = (v.has_type ? LK_KIND_TYPE : 0) | (v.has_client ? LK_KIND_CLIENT : 0);
+			if ((uint64_t)mask == lk_orig && rr == 0 && rf.efs) {
+				long long ref[2] = { rf.m1, rf.m2 };
+				int w = 0;
+				if (efs_changed(ref, &w)) {
+					printf("[%6llu] loc: engine lock: repair: modem at the original %s and modemst%d.img was written since "
+					       "the restore: %s removed\n", now_ms(), lk_str(lk_orig, b, sizeof(b)), w, LOCK_ORIG);
+					unlink(LOCK_ORIG);
+					lk = LK_IDLE;
+				} else {
+					printf("[%6llu] loc: engine lock: repair: modem at the original %s but no EFS write seen since the "
+					       "restore yet: waiting for it (%s kept)\n", now_ms(), lk_str(lk_orig, b, sizeof(b)), LOCK_ORIG);
+					efs_m[0] = rf.m1;
+					efs_m[1] = rf.m2;
+					efs_watch = 2;
+					efs_t0 = link_ms();
+					efs_next = efs_t0 + 2000;
+					efs_why = "restore (repair run)";
+					lk = LK_EFS;
+				}
+			} else if ((uint64_t)mask == lk_orig) {
 				printf("[%6llu] loc: engine lock: repair: modem already at the original %s, %s removed\n", now_ms(),
 				       lk_str(lk_orig, b, sizeof(b)), LOCK_ORIG);
 				unlink(LOCK_ORIG);
@@ -459,14 +629,17 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			}
 			break;
 		}
-		uint64_t fm = 0;
-		int fr = lk_load(LOCK_ORIG, &fm, NULL);
+		struct lk_file lf;
+		int fr = lk_load_ex(LOCK_ORIG, &lf);
 		if (fr == -2) {
 			lk_fail(LK_FAILED, LOCK_ORIG " exists but is unreadable: not touching the lock");
 			break;
 		}
+		lk_orig_kind = (v.has_type ? LK_KIND_TYPE : 0) | (v.has_client ? LK_KIND_CLIENT : 0);
 		if (fr == 0) {
-			lk_orig = fm;
+			lk_orig = lf.mask;
+			if (lf.kind)
+				lk_orig_kind = lf.kind;
 			printf("[%6llu] loc: engine lock: original from %s (an earlier run did not restore): %s\n", now_ms(), LOCK_ORIG,
 			       lk_str(lk_orig, a, sizeof(a)));
 		} else {
@@ -483,9 +656,12 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			lk = LK_IDLE;
 			break;
 		}
-		if (ok && mask >= 0)
-			printf("[%6llu] loc: engine lock: DV subscription %s\n", now_ms(), lk_str((uint64_t)mask, a, sizeof(a)));
-		else
+		if (ok && mask >= 0) {
+			printf("[%6llu] loc: engine lock: DV subscription %s%s\n", now_ms(), lk_str((uint64_t)mask, a, sizeof(a)),
+			       (uint64_t)mask == lk_orig ? "" : " (DIFFERS from DD: the ALL_SUB restore will set the DD value on both)");
+			lk_orig_dv = (uint64_t)mask;
+			lk_orig_dv_known = 1;
+		} else
 			printf("[%6llu] loc: engine lock: DV subscription value not available\n", now_ms());
 		lk_target = lk_mode == 2 ? 0 : (lk_orig & ~LK_AFW);
 		if (lk_now_mask == lk_target) {
@@ -495,7 +671,7 @@ static void lk_event(int ok, const struct qmi_msg *m)
 				unlink(LOCK_ORIG);
 				lk = LK_NOOP;
 			} else {
-				if (access(LOCK_ORIG, F_OK) && lk_save(LOCK_ORIG, lk_orig, 0)) {
+				if (access(LOCK_ORIG, F_OK) && lk_save_kind(lk_orig, 0, 0)) {
 					lk_fail(LK_FAILED, "already at the target but " LOCK_ORIG " cannot be written");
 					break;
 				}
@@ -505,13 +681,13 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			}
 			break;
 		}
-		if (access(LOCK_ORIG, F_OK) && lk_save(LOCK_ORIG, lk_orig, 0)) {
+		if (access(LOCK_ORIG, F_OK) && lk_save_kind(lk_orig, 0, 0)) {
 			printf("[%6llu] loc: engine lock: cannot write %s (%s)\n", now_ms(), LOCK_ORIG, strerror(errno));
 			lk_fail(LK_FAILED, "original not saved: not unlocking");
 			break;
 		}
 		printf("[%6llu] loc: engine lock: original saved in %s\n", now_ms(), LOCK_ORIG);
-		lk_try = ((lk_target | lk_orig) & ~3ull) ? 2 : 1;
+		lk_try = (((lk_target | lk_orig) & ~3ull) || w_lockclient) ? 2 : 1;	/* lockclient=1: lockClient on try 1 */
 		lk_set(lk_target, lk_try == 2, lk_mode == 2 ? "unlock=none" : "unlock=mi");
 		lk = LK_SET;
 		break;
@@ -529,6 +705,7 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			       lk_str((uint64_t)mask, a, sizeof(a)), lk_str(lk_orig, b, sizeof(b)));
 			lk = LK_UNLOCKED;
 			lk_verify = 0;
+			efs_watch_start(1, "unlock");
 			break;
 		}
 		printf("[%6llu] loc: engine lock: unlock not confirmed: modem %s, wanted %s (try %d)\n", now_ms(),
@@ -549,12 +726,21 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		break;
 	case LK_RS_CHK:
 		if (ok && mask >= 0 && (uint64_t)mask == lk_orig) {
-			printf("[%6llu] loc: ENGINE LOCK restored to the original %s; %s removed\n", now_ms(), lk_str(lk_orig, a, sizeof(a)),
-			       LOCK_ORIG);
-			unlink(LOCK_ORIG);
-			lk = LK_IDLE;
 			lk_mode = 0;
 			lk_rs_tries = 0;
+			if (efs_watch_start(2, "restore")) {
+				lk_repair_gen = on_gen;		/* no repair run in this loc.on generation right after the wait */
+				if (lk_save_kind(lk_orig, 0, 1))
+					printf("[%6llu] loc: engine lock: cannot update %s (%s)\n", now_ms(), LOCK_ORIG, strerror(errno));
+				printf("[%6llu] loc: ENGINE LOCK restored to the original %s (GET); %s kept until the modem writes its EFS "
+				       "(modemst1/2), at most %d s\n", now_ms(), lk_str(lk_orig, a, sizeof(a)), LOCK_ORIG, EFS_WAIT_MS / 1000);
+				lk = LK_EFS;
+				break;
+			}
+			printf("[%6llu] loc: ENGINE LOCK restored to the original %s; %s removed (no EFS files in %s to watch)\n",
+			       now_ms(), lk_str(lk_orig, a, sizeof(a)), LOCK_ORIG, EFS_DIR);
+			unlink(LOCK_ORIG);
+			lk = LK_IDLE;
 			break;
 		}
 		if (lk_try == 1) {
@@ -588,6 +774,35 @@ static void lk_poll(void)
 		return;
 	int idle = qn == 0 && sess == 0;
 	char a[96];
+	if (efs_watch && link_ms() >= efs_next) {	/* ws-gnss-f: the modem's EFS write-back */
+		int w = 0;
+		efs_next = link_ms() + 2000;
+		if (efs_changed(efs_m, &w)) {
+			printf("[%6llu] loc: ENGINE LOCK %s reached EFS: modemst%d.img written %llu s after the SET was confirmed\n",
+			       now_ms(), efs_why, w, (unsigned long long)(link_ms() - efs_t0) / 1000);
+			if (efs_watch == 2 && lk == LK_EFS) {
+				unlink(LOCK_ORIG);
+				printf("[%6llu] loc: engine lock: %s removed\n", now_ms(), LOCK_ORIG);
+				lk = LK_IDLE;
+			}
+			efs_watch = 0;
+			status_dirty = 1;
+		} else if (link_ms() - efs_t0 >= EFS_WAIT_MS) {
+			printf("[%6llu] loc: engine lock: no EFS write %d s after the %s: the modem holds it in RAM only; do not hard-"
+			       "reboot yet%s\n", now_ms(), EFS_WAIT_MS / 1000, efs_why,
+			       efs_watch == 2 ? " (" LOCK_ORIG " kept: the next start checks and repairs)" : "");
+			if (lk == LK_EFS)
+				lk = LK_IDLE;
+			efs_watch = 0;
+			status_dirty = 1;
+		}
+	}
+	if (lk == LK_EFS && on_present && w_unlock && !shutting && !dropped && lk_gen_done != on_gen) {
+		printf("[%6llu] loc: engine lock: a new unlock word while waiting for the EFS write: %s kept as the original\n",
+		       now_ms(), LOCK_ORIG);
+		lk = LK_IDLE;
+		efs_watch = 0;
+	}
 	if ((lk == LK_FAILED || lk == LK_NOOP) && lk_gen_done != on_gen)
 		lk = LK_IDLE;
 	if (lk == LK_RS_FAILED && lk_fail_gen != on_gen && !shutting)
@@ -623,8 +838,13 @@ static void lk_poll(void)
 	if (lk_repair_wanted()) {
 		uint64_t m = 0;
 		unsigned tr = 0;
+		struct lk_file rf;
 		lk_repair_gen = on_gen;
-		int r = lk_load(LOCK_ORIG, &m, &tr);
+		int r = lk_load_ex(LOCK_ORIG, &rf);
+		if (!r) {
+			m = rf.mask;
+			tr = rf.tries;
+		}
 		if (r) {
 			lk_fail(LK_RS_FAILED, LOCK_ORIG " unreadable: no repair (check GET_ENGINE_LOCK, then remove it by hand)");
 			return;
@@ -633,8 +853,10 @@ static void lk_poll(void)
 			lk_fail(LK_RS_FAILED, "repair given up after 5 runs (" LOCK_ORIG " kept; check by hand)");
 			return;
 		}
-		lk_save(LOCK_ORIG, m, tr + 1);
+		rf.tries = tr + 1;
+		lk_save_ex(LOCK_ORIG, &rf);
 		lk_orig = m;
+		lk_orig_kind = rf.kind;
 		lk_mode = 0;
 		lk_rs_tries = 0;
 		printf("[%6llu] loc: engine lock: repair run %u: %s says the original was %s\n", now_ms(), tr + 1, LOCK_ORIG,
@@ -647,7 +869,8 @@ static void lk_poll(void)
 /* sweetlocd.c: 1 while an engine lock change/restore/repair is running or due (shutdown waits longer for it) */
 int loc_lock_busy(void)
 {
-	return srv_up && (lk_active() || lkq.pending || lk_restore_wanted() || lk_repair_wanted() || (cur.busy && cur.lk));
+	return (srv_up && (lk_active() || lkq.pending || lk_restore_wanted() || lk_repair_wanted() || (cur.busy && cur.lk))) ||
+	       (lk == LK_EFS && !shutting);	/* ws-gnss-f: stay up for the EFS write-back (not at SIGTERM) */
 }
 
 static void read_on(void)
@@ -679,6 +902,28 @@ static void read_on(void)
 		else
 			printf("[%6llu] loc: %s: unknown %.*s ignored (only unlock=mi or unlock=none)\n", now_ms(), LOC_ON, (int)(k + 7), w);
 	}
+	w_client = 0;
+	if ((w = strstr(b, "client="))) {
+		size_t k = strcspn(w + 7, " \t\r\n");
+		if (k == 3 && !strncmp(w + 7, "afw", 3))
+			w_client = LOC_CLIENT_AFW;
+		else if (k == 3 && !strncmp(w + 7, "nfw", 3))
+			w_client = LOC_CLIENT_NFW;
+		else
+			printf("[%6llu] loc: %s: unknown %.*s ignored (only client=afw or client=nfw)\n", now_ms(), LOC_ON, (int)(k + 7), w);
+	}
+	w_clientid = strstr(b, "clientid=1") != NULL;
+	w_opmode = 0;
+	if ((w = strstr(b, "opmode="))) {
+		size_t k = strcspn(w + 7, " \t\r\n");
+		if (k == 10 && !strncmp(w + 7, "standalone", 10))
+			w_opmode = 1;
+		else
+			printf("[%6llu] loc: %s: %.*s ignored (only opmode=standalone is ever sent)\n", now_ms(), LOC_ON, (int)(k + 7), w);
+	}
+	w_start_android = strstr(b, "start=android") != NULL;
+	w_lockclient = strstr(b, "lockclient=1") != NULL;
+	w_lockev = strstr(b, "lockev=1") != NULL;
 	if (w_session > 600)
 		w_session = 600;
 	if (dropped)
@@ -689,6 +934,10 @@ static void read_on(void)
 	printf("[%6llu] loc: %s %s:%s%s%s%s session=%d\n", now_ms(), LOC_ON, present ? "present" : "absent",
 	       w_probe ? " probe=1" : "", w_pds ? " pds=1" : "", w_unlock == 1 ? " unlock=mi" : w_unlock == 2 ? " unlock=none" : "",
 	       (!w_probe && !w_pds && !w_session && !w_unlock) ? " (no words)" : "", w_session);
+	if (w_client || w_clientid || w_opmode || w_start_android || w_lockclient || w_lockev)
+		printf("[%6llu] loc: ws-gnss-f words:%s%s%s%s%s%s\n", now_ms(), w_client == LOC_CLIENT_AFW ? " client=afw" :
+		       w_client == LOC_CLIENT_NFW ? " client=nfw" : "", w_clientid ? " clientid=1" : "", w_opmode ? " opmode=standalone" : "",
+		       w_start_android ? " start=android" : "", w_lockclient ? " lockclient=1" : "", w_lockev ? " lockev=1" : "");
 	status_dirty = 1;
 }
 
@@ -718,6 +967,11 @@ static void write_status(void)
 			w_unlock == 1 ? "unlock=mi" : w_unlock == 2 ? "unlock=none" : "none",
 			lk_now_known ? lk_str(lk_now_mask, a, sizeof(a)) : "not read", lk_orig || lk_now_known ? lk_str(lk_orig, b, sizeof(b)) : "-",
 			access(LOCK_ORIG, F_OK) ? "" : ", " LOCK_ORIG " present");
+		fprintf(f, "loc: ws-gnss-f client %s%s, opmode %s, start %s, lockclient %d, lockev %d, original kind %s, EFS watch %s\n",
+			w_client == LOC_CLIENT_AFW ? "afw" : w_client == LOC_CLIENT_NFW ? "nfw" : "none (modem default NFW)",
+			w_clientid ? " +id HAL" : "", w_opmode ? "standalone" : "not sent", w_start_android ? "android" : "ours", w_lockclient,
+			w_lockev, lk_orig_kind & LK_KIND_CLIENT ? "lockClient" : lk_orig_kind & LK_KIND_TYPE ? "lockType" : "-",
+			efs_watch == 2 ? "restore pending" : efs_watch == 1 ? "unlock pending" : "idle");
 	}
 	if (have_last)
 		fprintf(f, "loc: last fix status %u lat %.2f lon %.2f unc %.0f m alt %.0f m tech 0x%x\n", last.status,
@@ -912,8 +1166,7 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		const uint8_t *r = qmi_get(&m, 0x02, &l);
 		unsigned res = r && l >= 4 ? (unsigned)(r[0] | r[1] << 8) : 1, err = r && l >= 4 ? (unsigned)(r[2] | r[3] << 8) : 0xffff;
 		printf("[%6llu] loc: < 0x%04x response %s (error 0x%x)\n", now_ms(), m.id, res ? "FAILED" : "ok", err);
-		if (w_probe || res || cur.lk)
-			qmi_dump(&m);
+		qmi_dump(&m);		/* ws-gnss-f: every response in hex */
 		if (cur.lk) {
 			if (res) {
 				cur.busy = 0;
@@ -949,6 +1202,14 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (cur.busy && cur.got_resp && cur.want_ind && m.id == cur.id) {
 		printf("[%6llu] loc: < 0x%04x indication (%s)\n", now_ms(), m.id, cur.why);
 		qmi_dump(&m);
+		if (m.id == LOC_GET_ENGINE_LOCK && !cur.lk) {	/* probe reads: the value in words too */
+			struct lk_val pv;
+			char pb[96];
+			lk_parse(&m, &pv);
+			int64_t pm = lk_mask(&pv);
+			printf("[%6llu] loc: engine lock (%s): %s%s%s%s\n", now_ms(), cur.why, pm >= 0 ? lk_str((uint64_t)pm, pb, sizeof(pb)) : "no value",
+			       pv.has_type ? " (lockType TLV)" : "", pv.has_sub ? " (subType TLV)" : "", pv.has_client ? " (lockClient TLV)" : "");
+		}
 		cur.busy = 0;
 		if (cur.lk)
 			lk_event(1, &m);
@@ -956,6 +1217,14 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 	uint16_t l = 0;
 	const uint8_t *v;
+	static unsigned n_pos_dump, n_sv_dump;
+	if (m.id == LOC_IND_POSITION || m.id == LOC_IND_SV_INFO) {
+		unsigned *c = m.id == LOC_IND_POSITION ? &n_pos_dump : &n_sv_dump;
+		if (++*c <= 5 || *c % 60 == 0)
+			dump_ids(&m);
+	} else {
+		qmi_dump(&m);	/* ws-gnss-f: every other indication in hex (engine state, fix session, engine lock state, ...) */
+	}
 	switch (m.id) {
 	case LOC_IND_POSITION:
 		on_position(m.tlv, m.len);
@@ -978,9 +1247,8 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	case LOC_IND_FIX_SESSION:
 		break;
 	default:
-		printf("[%6llu] loc: < indication 0x%04x (%u bytes)\n", now_ms(), m.id, m.len);
-		if (w_probe)
-			qmi_dump(&m);
+		printf("[%6llu] loc: < indication 0x%04x (%u bytes)%s\n", now_ms(), m.id, m.len,
+		       m.id == LOC_IND_ENGINE_LOCK_STATE ? " ENGINE_LOCK_STATE" : "");
 		break;
 	}
 	(void)h;

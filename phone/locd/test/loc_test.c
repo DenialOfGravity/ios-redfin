@@ -128,15 +128,16 @@ int main(void)
 	respond(1); tick(10);
 	CHECK(loc_quiet());
 	int before = nsent;
-	/* probe=1: 4 GETs (client revision already sent for this server) */
+	/* probe=1: 5 GETs (client revision already sent for this server; ws-gnss-f adds GET_ENGINE_LOCK subType DV) */
 	wordfile("probe=1\n");
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		CHECK(nsent == before + i + 1);
 		respond(1);
 		tick(3100);	/* no indication: given up after 3 s, next one goes */
 	}
 	CHECK(sent_id[before] == LOC_GET_SERVICE_REV && sent_id[before + 1] == LOC_GET_ENGINE_LOCK &&
-	      sent_id[before + 2] == LOC_GET_FIX_CRITERIA && sent_id[before + 3] == LOC_GET_XTRA_SOURCE);
+	      sent_id[before + 2] == LOC_GET_ENGINE_LOCK && sent_id[before + 3] == LOC_GET_FIX_CRITERIA &&
+	      sent_id[before + 4] == LOC_GET_XTRA_SOURCE);
 	/* failures: pds session, START times out 3 times -> dropped, one last STOP (+ REG_EVENTS 0) */
 	wordfile("pds=1\n");
 	pds(0x0031, 1, 1);

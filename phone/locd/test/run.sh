@@ -7,7 +7,7 @@ mkdir -p "$T/var"
 CC=${CC:-cc}
 W="-Wall -Wextra -Wno-unused-parameter -I. -I../wifi"
 $CC -Wall -Wextra -Wno-unused-parameter -o "$T/pdsemu_test" test/pdsemu_test.c pdsemu.c -lm
-D="-DLOC_ON=\"$T/var/loc.on\" -DLOC_STATUS=\"$T/var/loc.status\" -DLOCK_ORIG=\"$T/var/locd.lock-orig\""
+D="-DLOC_ON=\"$T/var/loc.on\" -DLOC_STATUS=\"$T/var/loc.status\" -DLOCK_ORIG=\"$T/var/locd.lock-orig\" -DEFS_DIR=\"$T/efs\""
 $CC $W $D -o "$T/loc_test" test/loc_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c
 $CC $W $D -o "$T/pdsr_test" test/pdsr_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c
 $CC $W $D -o "$T/lock_test" test/lock_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c

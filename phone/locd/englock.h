@@ -56,4 +56,19 @@ const char *lk_str(uint64_t mask, char *b, size_t n);
 /* the original value, written before any SET (tmp + fsync + rename); tries = repair runs so far */
 int lk_save(const char *path, uint64_t mask, unsigned tries);
 int lk_load(const char *path, uint64_t *mask, unsigned *tries);
+/* ws-gnss-f: the same file with more fields (older files read with kind 0 / no EFS snapshot):
+ *   kind  = which TLV(s) the ORIGINAL GET answered with (LK_KIND_TYPE 0x1 lockType, LK_KIND_CLIENT 0x2 lockClient);
+ *           the restore SET uses the same kind (lockClient TLV when the GET reported lockClient).
+ *   efs   = 1 after the restore was confirmed by GET but the modem's EFS (modemst1/2 via wland's rmtfs) had not yet
+ *           been written: the file stays until a write is seen, so a hard reboot before the modem's EFS sync is
+ *           repaired at the next start. m1/m2 = the modemst1/modemst2 mtimes (ns) when the restore SET was confirmed. */
+#define LK_KIND_TYPE	0x1u
+#define LK_KIND_CLIENT	0x2u
+struct lk_file {
+	uint64_t mask;
+	unsigned tries, kind, efs;
+	long long m1, m2;
+};
+int lk_save_ex(const char *path, const struct lk_file *f);
+int lk_load_ex(const char *path, struct lk_file *f);
 #endif

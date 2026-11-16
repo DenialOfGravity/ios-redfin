@@ -8,6 +8,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
 #include "../link.h"
 #include "qmi.h"
 #include "../englock.h"
@@ -22,6 +25,10 @@ static uint16_t log_id[1024];
 static uint32_t last_set_type;
 static int last_set_client;
 static uint64_t last_set_client_v;
+/* ws-gnss-f: real_client = refuse START by the client type REG_EVENTS declared (TLV 0x11; absent = NFW), as the modem does */
+static int real_client, nopmode, opmode_before_start, start_has12, start_has11, start_has15, start_has18, first_set_client = -1;
+static uint32_t reg_ctype, reg_has_strid, opmode_v;
+static uint64_t reg_mask;
 static uint8_t outq[32][128];
 static uint32_t outn[32];
 static int nout;
@@ -81,6 +88,8 @@ int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 		last_set_client = (v = qmi_get(&m, 0x11, &l)) != NULL && l == 8;
 		if (last_set_client)
 			memcpy(&last_set_client_v, v, 8);
+		if (first_set_client < 0)
+			first_set_client = last_set_client;
 		if (set_fail) {
 			resp(m.txn, m.id, 0);
 			break;
@@ -96,9 +105,33 @@ int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 		emit(QMI_INDICATION, 1, m.id, r, n);
 		break;
 	}
+	case LOC_REG_EVENTS:
+		reg_ctype = 0;
+		reg_has_strid = 0;
+		if ((v = qmi_get(&m, 0x01, &l)) && l == 8)
+			memcpy(&reg_mask, v, 8);
+		if ((v = qmi_get(&m, 0x11, &l)) && l == 4)
+			memcpy(&reg_ctype, v, 4);
+		if ((v = qmi_get(&m, 0x10, &l)) && l == 3 && !memcmp(v, "HAL", 3))
+			reg_has_strid = 1;
+		resp(m.txn, m.id, 1);
+		break;
+	case LOC_SET_OPERATION_MODE:
+		nopmode++;
+		if ((v = qmi_get(&m, 0x01, &l)) && l == 4)
+			memcpy(&opmode_v, v, 4);
+		resp(m.txn, m.id, 1);
+		n = tlv(r, 0x01, &st, 4);
+		emit(QMI_INDICATION, 1, m.id, r, n);
+		break;
 	case LOC_START:
 		nstart++;
-		if (modem & LK_AFW) {
+		opmode_before_start = nopmode > 0;
+		start_has11 = qmi_get(&m, 0x11, &l) != NULL;
+		start_has12 = qmi_get(&m, 0x12, &l) != NULL;
+		start_has15 = qmi_get(&m, 0x15, &l) != NULL;
+		start_has18 = qmi_get(&m, 0x18, &l) != NULL;
+		if (real_client ? (modem & (reg_ctype == 1 ? LK_AFW : reg_ctype == 3 ? LK_PRIV : LK_NFW)) != 0 : (modem & LK_AFW) != 0) {
 			resp(m.txn, m.id, 0);
 			st = 7;
 			n = tlv(r, 0x01, &st, 4);
@@ -157,7 +190,8 @@ static void s_ok(void)
 	loc_shutdown("SIGTERM");
 	CHECK(!loc_quiet());
 	pump(300);
-	CHECK(modem == 3 && nset == 2 && last_set_type == LK_TYPE_ALL && !last_set_client);
+	/* ws-gnss-f: the restore uses the original's TLV kind: the mock's GET reports lockClient, so lockType ALL + lockClient 3 */
+	CHECK(modem == 3 && nset == 2 && last_set_type == LK_TYPE_ALL && last_set_client && last_set_client_v == 3);
 	CHECK(idx_last(LOC_SET_ENGINE_LOCK) > idx_last(LOC_STOP));	/* restore after the session's STOP */
 	CHECK(access(LOCK_ORIG, F_OK) != 0 && loc_quiet());
 }
@@ -209,7 +243,7 @@ static void s_type_ignored(void)
 	CHECK(modem == 2 && nset == 2 && last_set_client && last_set_client_v == 2 && start_ok == 1);
 	loc_shutdown("SIGTERM");
 	pump(300);
-	CHECK(modem == 3 && nset == 4 && last_set_client && last_set_client_v == 3 && access(LOCK_ORIG, F_OK) != 0);
+	CHECK(modem == 3 && nset == 3 && last_set_client && last_set_client_v == 3 && access(LOCK_ORIG, F_OK) != 0);
 }
 
 static void s_none(void)
@@ -320,6 +354,144 @@ static void s_none_ever(void)	/* no unlock word, no file: SET_ENGINE_LOCK never 
 	CHECK(nset == 0 && modem == 3);
 }
 
+/* ---- ws-gnss-f ---- */
+/* the phone's result: lock 0x2 (AFW open) and still ENGINE_LOCKED, because a client without clientType is NFW */
+static void s_nfw_default(void)
+{
+	real_client = 1;
+	up();
+	wordfile("session=30 unlock=mi\n");
+	pump(300);
+	CHECK(modem == 2 && reg_ctype == 0 && nstart == 1 && start_ok == 0);
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(modem == 3);
+}
+
+static void s_afw(void)
+{
+	real_client = 1;
+	up();
+	wordfile("session=30 unlock=mi client=afw\n");
+	pump(300);
+	CHECK(modem == 2 && reg_ctype == 1 && !reg_has_strid && start_ok == 1);
+	CHECK(!first_set_client);			/* without lockclient=1 the first SET is lockType only */
+	CHECK(!start_has11 && start_has12 && !nopmode);	/* our START, no SET_OPERATION_MODE */
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(modem == 3 && reg_ctype == 1 && access(LOCK_ORIG, F_OK) != 0);	/* REG_EVENTS 0 keeps the client type */
+}
+
+/* client=afw alone with the lock at 0x3: still refused (AFW locked), nothing written */
+static void s_afw_locked(void)
+{
+	real_client = 1;
+	up();
+	wordfile("session=30 client=afw clientid=1 lockev=1\n");
+	pump(300);
+	CHECK(nset == 0 && reg_ctype == 1 && reg_has_strid && (reg_mask & LOC_EVMASK_ENGINE_LOCK_STATE) && start_ok == 0);
+}
+
+static void s_android_start(void)
+{
+	real_client = 1;
+	modem = 2;
+	up();
+	wordfile("session=30 client=afw opmode=standalone start=android\n");
+	pump(300);
+	CHECK(nset == 0 && nopmode == 1 && opmode_v == LOC_OPMODE_STANDALONE && opmode_before_start && start_ok == 1);
+	CHECK(start_has11 && !start_has12 && start_has15 && start_has18);
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(nset == 0 && modem == 2);
+}
+
+static void s_lockclient(void)
+{
+	up();
+	wordfile("session=30 unlock=mi lockclient=1 opmode=msb client=priv\n");	/* unknown values ignored */
+	pump(300);
+	CHECK(modem == 2 && nset == 1 && first_set_client && last_set_client_v == 2 && nopmode == 0 && reg_ctype == 0);
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(modem == 3);
+}
+
+static void efs_touch(const char *f, int sec)
+{
+	char p[512];
+	snprintf(p, sizeof(p), "%s/%s", EFS_DIR, f);
+	FILE *o = fopen(p, "w");
+	fputs("x", o);
+	fclose(o);
+	struct timespec ts[2] = { { 1000000 + sec, 0 }, { 1000000 + sec, 0 } };
+	utimensat(AT_FDCWD, p, ts, 0);
+}
+
+static void efs_make(void)
+{
+	mkdir(EFS_DIR, 0755);
+	efs_touch("modemst1.img", 1);
+	efs_touch("modemst2.img", 2);
+}
+
+/* restore confirmed by GET, LOCK_ORIG kept until modemst2.img changes */
+static void s_efs(void)
+{
+	struct lk_file lf;
+	efs_make();
+	up();
+	wordfile("session=30 unlock=mi\n");
+	pump(300);
+	CHECK(modem == 2);
+	wordfile("session=30\n");
+	pump(300);
+	CHECK(modem == 3 && access(LOCK_ORIG, F_OK) == 0 && lk_load_ex(LOCK_ORIG, &lf) == 0 && lf.efs == 1 &&
+	      lf.kind == LK_KIND_CLIENT && lf.mask == 3);
+	CHECK(loc_lock_busy());		/* the daemon stays up for it */
+	pump(10000);
+	CHECK(access(LOCK_ORIG, F_OK) == 0);
+	efs_touch("modemst2.img", 50);
+	pump(3000);
+	CHECK(access(LOCK_ORIG, F_OK) != 0 && !loc_lock_busy());
+}
+
+/* restored but SIGTERM before the EFS write: file kept (efs=1); carried to s_efs_repair */
+static void s_efs_term(void)
+{
+	efs_make();
+	up();
+	wordfile("session=30 unlock=mi\n");
+	pump(300);
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(modem == 3 && access(LOCK_ORIG, F_OK) == 0 && loc_quiet());
+}
+
+/* next start, no reboot (modem still 3): no SET, waits for the EFS write, then removes the file */
+static void s_efs_repair(void)
+{
+	up();
+	wordfile(NULL);
+	pump(3000);
+	CHECK(nset == 0 && access(LOCK_ORIG, F_OK) == 0 && loc_lock_busy());
+	efs_touch("modemst1.img", 60);
+	pump(3000);
+	CHECK(nset == 0 && access(LOCK_ORIG, F_OK) != 0);
+}
+
+/* next start after a hard reboot that lost the restore (modem back at 2): repair SETs 3 again with lockClient */
+static void s_efs_lost(void)
+{
+	up();
+	wordfile(NULL);
+	pump(300);
+	CHECK(modem == 3 && nset == 1 && last_set_client && last_set_client_v == 3 && access(LOCK_ORIG, F_OK) == 0);
+	efs_touch("modemst1.img", 70);
+	pump(3000);
+	CHECK(access(LOCK_ORIG, F_OK) != 0);
+}
+
 static int run(const char *name, void (*f)(void), uint64_t *m)
 {
 	fflush(stdout);
@@ -366,6 +538,19 @@ int main(void)
 	bad += run("s_crash_rewant", s_crash_rewant, &m);
 	CHECK(m == 3);
 	RUN(s_cap);
+	RUN(s_nfw_default);
+	RUN(s_afw);
+	RUN(s_afw_locked);
+	RUN(s_android_start);
+	RUN(s_lockclient);
+	RUN(s_efs);
+	m = 3; bad += run("s_efs_term", s_efs_term, &m);
+	bad += run("s_efs_repair", s_efs_repair, &m);
+	CHECK(m == 3);
+	m = 3; bad += run("s_efs_term", s_efs_term, &m);
+	m = 2;		/* the hard reboot lost the restore */
+	bad += run("s_efs_lost", s_efs_lost, &m);
+	CHECK(m == 3);
 	unlink(LOC_ON); unlink(LOC_STATUS); unlink(LOCK_ORIG);
 	printf("lock_test: %s (%d scenarios failed, %d checks failed)\n", bad || nfail ? "FAILED" : "all ok", bad, nfail);
 	return bad || nfail;

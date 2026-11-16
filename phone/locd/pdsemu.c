@@ -328,6 +328,48 @@ uint32_t loc_tlv_stop(uint8_t *out)
 	return o;
 }
 
+/* ws-gnss-f: REG_EVENTS as the QTI HAL's locClientRegisterEventMask (loc_api_v02_client.cpp, LA.UM.9.12) sends it:
+ * 0x10 clientStrId (QMI string at the top level: the bytes alone, no length prefix; "HAL"), 0x11 clientType
+ * (qmiLocClientTypeEnumT_v02: 1 AFW, 2 NFW, 3 privileged; absent = NFW per location_service_v02.h), 0x12
+ * enablePosRequestNotification u8 (the HAL sends 0). ctype 0 = no 0x11/0x12; strid NULL = no 0x10. */
+uint32_t loc_tlv_reg_events_ex(uint8_t *out, uint64_t mask, uint32_t ctype, const char *strid)
+{
+	uint32_t o = 0;
+	uint8_t notif = 0;
+	tlv(out, &o, 0x01, &mask, 8);
+	if (strid)
+		tlv(out, &o, 0x10, strid, (uint16_t)strlen(strid));
+	if (ctype) {
+		tlv(out, &o, 0x11, &ctype, 4);
+		tlv(out, &o, 0x12, &notif, 1);
+	}
+	return o;
+}
+
+/* ws-gnss-f: START as LocApiV02::startFix fills it for a periodic GNSS request with preferred accuracy <= 100 m:
+ * 0x01 sessionId 1, 0x10 fixRecurrence 1 (periodic), 0x11 horizontalAccuracyLevel 3 (HIGH), 0x13 minInterval,
+ * 0x15 configAltitudeAssumed 2 (disabled), 0x18 sharePosition 1 (LocPosMode default); no 0x12 intermediate reports. */
+uint32_t loc_tlv_start_android(uint8_t *out, uint32_t interval_ms)
+{
+	uint32_t o = 0, rec = 1, acc = 3, alt = 2;
+	uint8_t id = LOC_SESSION_ID, share = 1;
+	tlv(out, &o, 0x01, &id, 1);
+	tlv(out, &o, 0x10, &rec, 4);
+	tlv(out, &o, 0x11, &acc, 4);
+	tlv(out, &o, 0x13, &interval_ms, 4);
+	tlv(out, &o, 0x15, &alt, 4);
+	tlv(out, &o, 0x18, &share, 1);
+	return o;
+}
+
+/* ws-gnss-f: SET_OPERATION_MODE 0x01 operationMode (4 = STANDALONE; the only mode we ever send) */
+uint32_t loc_tlv_opmode_standalone(uint8_t *out)
+{
+	uint32_t o = 0, mode = LOC_OPMODE_STANDALONE;
+	tlv(out, &o, 0x01, &mode, 4);
+	return o;
+}
+
 uint32_t loc_tlv_client_rev(uint8_t *out, uint32_t rev)
 {
 	uint32_t o = 0;
