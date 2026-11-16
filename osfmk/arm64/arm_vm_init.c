@@ -413,16 +413,47 @@ static const struct { uint64_t pa, end; unsigned int tier; bool venus; } sweet_x
 SECURITY_READ_ONLY_LATE(static uint32_t) sweet_xram_tier = 0;
 SECURITY_READ_ONLY_LATE(static uint32_t) sweet_xram_venus = 0;
 
+/*
+ * redfin (1142, ws-ram-a): the high bank below 4 GiB. Live DT memory <0xc0000000 0xc0000000> is plain HLOS RAM with
+ * one no-map carve-out (kregistry_mem 0xc8000000 + 64 KB); XNU's window starts at 0x100000000, so this GiB is used
+ * only by the GPU pool (sweet_gpu.c gpool_ranges, 920 MB, RAM XNU must not map: no PPL, write-combined buffers),
+ * phone/wifi's radio buffer 0xe0000000-0xe1000000, wland's rmtfs 0xe1001000-0xe1281000 (hyp-assigned to the modem)
+ * and the GPU log trail / GMU dump at 0xe2000000. 0xc0000000-0xc4000000 (64 MB) is where ABL may put a big ramdisk:
+ * dead once the shim has copied the payload into the window, and used by nothing after.
+ * The tens of xram (xram = T + 10 * H; T = the low-bank tier above, unchanged; xram=0..4 are exactly as before):
+ *   H = 0   nothing from the high bank (default)
+ *   H = 1   0xc0000000-0xc4000000 (64 MB), the GPU pool unchanged
+ *   H = 2..14  also the GPU pool's lowest RAM: the pool keeps its top max(H, 4) * 64 MB (256..896 MB) and the VM
+ *           gets the rest below that (sweet_xram_gpool_floor; sweet_gpu.c clips its ranges at it)
+ *   H >= 15 the same as 1
+ * Kept out always: kregistry 0xc8000000-0xc8400000, 0xe0000000-0xe2400000 (radio, rmtfs, GPU trail).
+ * The pool ranges here must match sweet_gpu.c gpool_ranges (A6_GPU_ID 620).
+ */
+static const struct { uint64_t pa, end; } sweet_xhram_pool[] = {
+	{ 0x0c4000000ULL, 0x0c8000000ULL },     /* 64 MB, up to kregistry */
+	{ 0x0c8400000ULL, 0x0e0000000ULL },     /* 380 MB */
+	{ 0x0e2400000ULL, 0x100000000ULL },     /* 476 MB */
+};
+#define SWEET_XHRAM_RD_PA       0x0c0000000ULL
+#define SWEET_XHRAM_RD_END      0x0c4000000ULL
+SECURITY_READ_ONLY_LATE(uint64_t) sweet_xram_gpool_floor = 0;  /* sweet_gpu.c: pool RAM below it is the VM's (0 = none) */
+SECURITY_READ_ONLY_LATE(static uint32_t) sweet_xram_hi = 0;
+SECURITY_READ_ONLY_LATE(static uint64_t) sweet_xram_gpool_keep = 0;
+
+static void hakios_extra_ram_add(uint64_t pa0, uint64_t end0, unsigned int first_pai);
+
 static void
 hakios_extra_ram_init(void)
 {
 	unsigned int first_pai = (unsigned int)atop(mem_size);
-	uint32_t tier = 0;
+	uint32_t tier = 0, hi;
 
 	if (!PE_parse_boot_argn("xram", &tier, sizeof(tier)) || tier == 0) {
 		return;
 	}
 	sweet_xram_tier = tier;
+	hi = tier / 10;                 /* 1142: the high bank (above) */
+	tier %= 10;
 	if (!PE_parse_boot_argn("sweetvenus", &sweet_xram_venus, sizeof(sweet_xram_venus))) {
 		sweet_xram_venus = 0;
 	}
@@ -437,36 +468,80 @@ hakios_extra_ram_init(void)
 		hakios_extra_ram_refused = (unsigned int)-1;
 		return;
 	}
-	for (unsigned int i = 0; i < sizeof(sweet_xram_ranges) / sizeof(sweet_xram_ranges[0]) &&
-	    hakios_extra_ram_count < HAKIOS_EXTRA_RAM_MAX; i++) {
+	for (unsigned int i = 0; tier != 0 && i < sizeof(sweet_xram_ranges) / sizeof(sweet_xram_ranges[0]); i++) {
 		if (sweet_xram_ranges[i].tier > tier || (sweet_xram_ranges[i].venus && sweet_xram_venus != 0)) {
 			continue;
 		}
-		pmap_paddr_t pa = round_page(sweet_xram_ranges[i].pa), end = trunc_page(sweet_xram_ranges[i].end);
-		bool ok = end > pa;
-
-		/* never the window, nor another range */
-		if (ok && pa < gPhysBase + real_phys_size && end > gPhysBase) {
-			ok = false;
-		}
-		for (unsigned int j = 0; ok && j < hakios_extra_ram_count; j++) {
-			ok = !(pa < hakios_extra_ram[j].end && end > hakios_extra_ram[j].pa);
-		}
-		if (!ok) {
-			hakios_extra_ram_refused++;     /* (said in arm_vm_prot_finalize(): too early for printf here) */
-			continue;
-		}
-		/* a range that starts where the last one ended joins it (one ptov entry) */
-		if (hakios_extra_ram_count != 0 && hakios_extra_ram[hakios_extra_ram_count - 1].end == pa) {
-			hakios_extra_ram[hakios_extra_ram_count - 1].end = end;
-		} else {
-			hakios_extra_ram[hakios_extra_ram_count].pa = pa;
-			hakios_extra_ram[hakios_extra_ram_count].end = end;
-			hakios_extra_ram[hakios_extra_ram_count].pai = first_pai + hakios_extra_ram_pages;
-			hakios_extra_ram_count++;
-		}
-		hakios_extra_ram_pages += (unsigned int)atop(end - pa);
+		hakios_extra_ram_add(sweet_xram_ranges[i].pa, sweet_xram_ranges[i].end, first_pai);
 	}
+	/* 1142: the high bank, after the low bank's ranges (their pages keep the indices they had) */
+	if (hi != 0) {
+		uint64_t keep = 0, floor = 0, total = 0;
+		const unsigned int np = sizeof(sweet_xhram_pool) / sizeof(sweet_xhram_pool[0]);
+
+		for (unsigned int i = 0; i < np; i++) {
+			total += sweet_xhram_pool[i].end - sweet_xhram_pool[i].pa;
+		}
+		if (hi >= 2 && hi <= 14) {
+			keep = (uint64_t)(hi < 4 ? 4 : hi) << 26;      /* units of 64 MB */
+		}
+		if (keep != 0 && keep < total) {
+			uint64_t left = keep;
+			for (unsigned int i = np; i-- > 0;) {
+				uint64_t size = sweet_xhram_pool[i].end - sweet_xhram_pool[i].pa;
+				if (left >= size) {
+					left -= size;
+					continue;
+				}
+				floor = (sweet_xhram_pool[i].end - left) & ~0x3fffffULL;        /* 4 MB down: the pool keeps >= keep */
+				break;
+			}
+		}
+		sweet_xram_hi = hi;
+		sweet_xram_gpool_keep = keep;
+		hakios_extra_ram_add(SWEET_XHRAM_RD_PA, SWEET_XHRAM_RD_END, first_pai);
+		if (floor != 0) {
+			for (unsigned int i = 0; i < np; i++) {
+				uint64_t end = sweet_xhram_pool[i].end < floor ? sweet_xhram_pool[i].end : floor;
+				if (end > sweet_xhram_pool[i].pa) {
+					hakios_extra_ram_add(sweet_xhram_pool[i].pa, end, first_pai);
+				}
+			}
+			/* the pool gives up everything below floor (sweet_gpu.c), whether or not the VM took it all */
+			sweet_xram_gpool_floor = floor;
+		}
+	}
+}
+
+/* 1054 (split out by 1142): [pa0, end0) to the VM's extra RAM, unless it meets the window or a range already taken, or the
+ * table is full; a range that starts where the last one ended joins it */
+static void
+hakios_extra_ram_add(uint64_t pa0, uint64_t end0, unsigned int first_pai)
+{
+	pmap_paddr_t pa = round_page(pa0), end = trunc_page(end0);
+	bool ok = end > pa && hakios_extra_ram_count < HAKIOS_EXTRA_RAM_MAX;
+
+	/* never the window, nor another range */
+	if (ok && pa < gPhysBase + real_phys_size && end > gPhysBase) {
+		ok = false;
+	}
+	for (unsigned int j = 0; ok && j < hakios_extra_ram_count; j++) {
+		ok = !(pa < hakios_extra_ram[j].end && end > hakios_extra_ram[j].pa);
+	}
+	if (!ok) {
+		hakios_extra_ram_refused++;     /* (said in arm_vm_prot_finalize(): too early for printf here) */
+		return;
+	}
+	/* a range that starts where the last one ended joins it (one ptov entry) */
+	if (hakios_extra_ram_count != 0 && hakios_extra_ram[hakios_extra_ram_count - 1].end == pa) {
+		hakios_extra_ram[hakios_extra_ram_count - 1].end = end;
+	} else {
+		hakios_extra_ram[hakios_extra_ram_count].pa = pa;
+		hakios_extra_ram[hakios_extra_ram_count].end = end;
+		hakios_extra_ram[hakios_extra_ram_count].pai = first_pai + hakios_extra_ram_pages;
+		hakios_extra_ram_count++;
+	}
+	hakios_extra_ram_pages += (unsigned int)atop(end - pa);
 }
 
 /* [pa, pa + len) is all in one of the extra ranges */
@@ -1850,6 +1925,16 @@ arm_vm_prot_finalize(boot_args * args __unused)
 		printf("SWEET XRAM: refused, the window is at 0x%llx, not the redfin map's 0x100000000\n", (unsigned long long)gPhysBase);
 	} else if (hakios_extra_ram_refused != 0) {
 		printf("SWEET XRAM: %u ranges refused (the window's, or each other's)\n", hakios_extra_ram_refused);
+	}
+	if (sweet_xram_hi != 0) {
+		if (sweet_xram_gpool_floor != 0) {
+			printf("SWEET XRAM: high bank (xram tens %u): 0xc0000000..0xc3ffffff + GPU pool below 0x%llx to the VM; "
+			    "the pool keeps %llu MB\n", sweet_xram_hi, (unsigned long long)sweet_xram_gpool_floor,
+			    (unsigned long long)sweet_xram_gpool_keep >> 20);
+		} else {
+			printf("SWEET XRAM: high bank (xram tens %u): 0xc0000000..0xc3ffffff to the VM; the GPU pool unchanged\n",
+			    sweet_xram_hi);
+		}
 	}
 	if (hakios_extra_ram_count != 0) {
 		printf("SWEET XRAM: xram=%u %s: %u pages (%llu MB) in %u ranges beside the window 0x%llx + 0x%llx; max_mem 0x%llx\n",

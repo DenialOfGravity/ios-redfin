@@ -2144,6 +2144,21 @@ static const struct { uint64_t pa, size; } gpool_ranges[] = {
 	{ 0xe1400000ULL, 0x1ec00000ULL },       /* 492 MB; 0xe1000000-0xe1400000 is wland's rmtfs buffer (hyp-assigned to the modem) */
 #endif
 };
+/*
+ * redfin 1142 (ws-ram-a): with boot-arg xram >= 20 (arm_vm_init.c) the VM takes the pool's RAM below
+ * sweet_xram_gpool_floor; the pool keeps the rest. 0 (default) = the ranges above, unchanged.
+ */
+extern uint64_t sweet_xram_gpool_floor;
+static void
+gpool_range(unsigned i, uint64_t *pa, uint64_t *size)
+{
+	uint64_t p = gpool_ranges[i].pa, e = gpool_ranges[i].pa + gpool_ranges[i].size, f = sweet_xram_gpool_floor;
+	if (f > p) {
+		p = f < e ? f : e;
+	}
+	*pa = p;
+	*size = e - p;
+}
 static struct { uint64_t pa, size; } gpool_free[GPOOL_FREE_MAX];       /* sorted by address, merged */
 static uint32_t gpool_nfree;
 static uint64_t gpool_used, gpool_peak;
@@ -2155,7 +2170,9 @@ sweet_gpu_pool_avail(void)
 {
 	uint64_t total = 0;
 	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
-		total += gpool_ranges[i].size;
+		uint64_t rpa, rsize;
+		gpool_range(i, &rpa, &rsize);
+		total += rsize;
 	}
 	return total - gpool_used;
 }
@@ -2214,7 +2231,9 @@ sweet_gpu_pool_dump(const char *why)
 	uint32_t nb;
 	uint64_t total = 0;
 	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
-		total += gpool_ranges[i].size;
+		uint64_t rpa, rsize;
+		gpool_range(i, &rpa, &rsize);
+		total += rsize;
 	}
 	lck_mtx_lock(&sweet_gpool_lock);
 	gpool_init_locked();
@@ -2249,8 +2268,13 @@ gpool_init_locked(void)
 {
 	if (!gpool_ready) {
 		for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
-			gpool_free[gpool_nfree].pa = gpool_ranges[i].pa;
-			gpool_free[gpool_nfree].size = gpool_ranges[i].size;
+			uint64_t rpa, rsize;
+			gpool_range(i, &rpa, &rsize);
+			if (rsize == 0) {
+				continue;
+			}
+			gpool_free[gpool_nfree].pa = rpa;
+			gpool_free[gpool_nfree].size = rsize;
 			gpool_nfree++;
 		}
 		gpool_ready = true;
