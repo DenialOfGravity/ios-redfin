@@ -80,6 +80,16 @@
  * gcc_video_ahb boots enabled but hardware-gated (0x80000003: HW_CTL set, CLK_OFF reads 1 while idle; Linux
  * clk-branch.c skips the halt check in that mode). power on clears HW_CTL first so CLK_OFF can be polled;
  * VENUSCTL_KEEP_HWCTL=1 skips that (old behaviour).
+ * P0 (video-plan-2026-11-16, venus_rails.c; all default off):
+ *   venusctl rails          read only: cmd-db cx.lvl/mx.lvl/mmcx.lvl (lito has no mmcx) and their level tables, the
+ *                           apps DRV votes (kern.sweet_rpmh_votes, xnu 1131; TCS registers), the TBU vote, the
+ *                           rails state file, and what VENUSCTL_RAILS would do. Writes nothing.
+ *   VENUSCTL_RAILS=1|CORNER power on raises mx then cx to NOM (256) or CORNER first, raise only; power off puts the
+ *                           earlier vote back (never 0; unknown before = top level voted and left). /var/tmp/venusctl.rails
+ *   VENUSCTL_TBUVOTE=1      power on clears SW_COLLAPSE of the mnoc_sf_0_tbu hlos1 vote (GCC 0x17d054), waits PWR_ON;
+ *                           power off sets it again if it was set
+ *   watch SECS              without firmware (no STATE init) = power/bus only; a line at least every second with
+ *                           the uptime, cx/mx votes and the TBU state
  */
 #include <stdint.h>
 #include <unistd.h>
@@ -91,6 +101,7 @@
 #include <sys/stat.h>
 #include "pmem.h"
 #include "venus_core.h"
+#include "venus_rails.h"
 
 /* VENUSCTL_TS=1: every output line gets "[seconds since start] " (a pipe + reader thread), to place stalls in time; the
  * host can't, since ssh delivers the output in bursts (the 13 s first-use stall, video.md v4a1/vdboot) */
@@ -208,6 +219,8 @@ int main(int argc, char **argv)
 		return decode(debug, arg, arg2, frames, bufphys, hevc);
 	if (!strcmp(cmd, "memtest") && arg && arg2 && arg3 && (!strcmp(arg3, "write") || !strcmp(arg3, "check")))
 		return memtest(strtoull(arg, NULL, 0), strtoull(arg2, NULL, 0), !strcmp(arg3, "write"));
+	if (!strcmp(cmd, "rails") && !arg)
+		return rails_report();
 	if (!strcmp(cmd, "probe") && !arg)
 		return probe();
 	if (!strcmp(cmd, "power") && arg && !strcmp(arg, "on"))
@@ -233,13 +246,14 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "smmu") && !arg)
 		return smmu_cmd();
 usage:
-	fprintf(stderr, "usage: venusctl [-v] probe | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
+	fprintf(stderr, "usage: venusctl [-v] probe | rails (read-only) | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
 		"       | session [--debug MASK] | decode IN.h264|IN.h265 OUT.yuv [--frames N] [--bufphys ADDR] [--debug MASK]\n"
 		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"
 		"       any command: [--step] [--step-file FILE]  (default /var/local/venus-step.log)\n"
 		"       | shutdown | smmu (read-only: SMRs for 0x1300-0x13ff, global faults) | map-sid SID (after boot --keep)\n"
-		"       | watch SECONDS [--sysinit] [--debug MASK] (after init: firmware/NoC/SMMU state every 200 ms)\n"
+		"       | watch SECONDS [--sysinit] [--debug MASK] (firmware/NoC/SMMU/GDSC state, a line a second; power-only without init)\n"
+		"       env (default off): VENUSCTL_RAILS=1|CORNER VENUSCTL_RAILS_UNKNOWN=1 VENUSCTL_TBUVOTE=1 (power on/off)\n"
 		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
 		"       | memtest ADDR SIZE write|check\n");
 	return 2;

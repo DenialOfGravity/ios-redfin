@@ -61,6 +61,12 @@
  *    first, then fresh credits; the pool must be the picture's size first. -ENOTSUP back, or 2 x VTVENUS_CREDITS
  *    handed back without a picture through a surface: no credits for the rest of that venusd session. A DECODED with
  *    pixels (len > 0: venusd had no credit) is copied as before. 0: no credits, the socket path only, as before.
+ *  - VTVENUS_STALL_MS (500; vtstall, video.md 2026-11-12 22:22 the page clock lag): one line when a DecodeFrame call
+ *    has been blocked this long ("send": OPEN, credits, resync, FRAME; "inflight wait": the MAX_INFLIGHT limit), one
+ *    when it returns; one when no DecodeFrame came for this long while frames are pending (outside
+ *    FinishDelayedFrames), one at the next call. Checked by the reader thread (every 250 ms or message). 0: off.
+ *  - VTVENUS_QOS (1; vtqos): kVTDecompressionPropertyKey_EnableVideoToolboxQoS is a supported read-only property and
+ *    reads true (AVD's HEVC decoder does the same), so VideoToolbox may skip frames that are late. 0: not offered.
  * Log: /var/local/vtvenus.log (0666, cut past 1 MB) + os_log. Off: touch /var/local/venus-off (both this and venusd
  * refuse), or tools/sunfish-install-vtvenus.sh remove.
  */
@@ -147,6 +153,9 @@ extern CVPixelBufferPoolRef VTDecoderSessionGetPixelBufferPool(VTVideoDecoderSes
 extern OSStatus VTDecoderSessionEmitDecodedFrame(VTVideoDecoderSession, VTVideoDecoderFrame, OSStatus, VTDecodeInfoFlags,
 						 CVImageBufferRef);
 extern const CFStringRef kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder;	/* macOS-only in the SDK */
+/* vtqos: kVTDecompressionPropertyKey_EnableVideoToolboxQoS, not in the SDK headers (exported, VideoToolbox.tbd); its
+ * value (research/re/photos/VideoToolbox.strings 0x1d69edda8, the symbol at 0x1d69aa870, research/re/vt-syms.txt) */
+#define KEY_QOS		CFSTR("EnableVideoToolboxQoS")
 
 enum {	/* VTErrors.h */
 	ERR_PROPERTY = -12900, ERR_PARAM = -12902, ERR_INVALID = -12903, ERR_NO_DECODER = -12906, ERR_BAD_DATA = -12909,
@@ -157,8 +166,8 @@ struct slot { int used; uint64_t tag; VTVideoDecoderFrame frame; int no_out; };
 
 /* vdcold switches (header) */
 static struct {
-	int cold_ms, wait_ms, lazy, reconnect, resync, recon_wait, err_gap_ms, hevc, revive_ms, surf, credits;
-} cfg = { 20000, 10000, 1, 1, 1, 1, 5000, 1, 10000, 1, 6 };	/* surf, credits: vdcredit */
+	int cold_ms, wait_ms, lazy, reconnect, resync, recon_wait, err_gap_ms, hevc, revive_ms, surf, credits, stall_ms, qos;
+} cfg = { 20000, 10000, 1, 1, 1, 1, 5000, 1, 10000, 1, 6, 500, 1 };	/* surf, credits: vdcredit; vtstall, vtqos */
 static pthread_once_t cfg_once = PTHREAD_ONCE_INIT;
 
 static void cfg_set(const char *k, const char *val)
@@ -186,13 +195,18 @@ static void cfg_set(const char *k, const char *val)
 		cfg.surf = n;
 	else if (!strcmp(k, "VTVENUS_CREDITS") && n > 0)
 		cfg.credits = n > VENUSD_MAX_CREDITS ? VENUSD_MAX_CREDITS : n;
+	else if (!strcmp(k, "VTVENUS_STALL_MS") && n >= 0)	/* vtstall */
+		cfg.stall_ms = n;
+	else if (!strcmp(k, "VTVENUS_QOS"))	/* vtqos */
+		cfg.qos = n;
 }
 
 static void cfg_load(void)
 {
 	static const char *const keys[] = { "VTVENUS_COLD_MS", "VTVENUS_WAIT_MS", "VTVENUS_LAZY_OPEN", "VTVENUS_RECONNECT",
 					    "VTVENUS_RESYNC", "VTVENUS_RECON_WAIT", "VTVENUS_ERR_GAP_MS", "VTVENUS_HEVC",
-					    "VTVENUS_REVIVE_MS", "VTVENUS_SURF", "VTVENUS_CREDITS" };
+					    "VTVENUS_REVIVE_MS", "VTVENUS_SURF", "VTVENUS_CREDITS", "VTVENUS_STALL_MS",
+					    "VTVENUS_QOS" };
 	for (size_t i = 0; i < sizeof keys / sizeof *keys; i++)
 		if (getenv(keys[i]))
 			cfg_set(keys[i], getenv(keys[i]));
@@ -250,6 +264,10 @@ struct vd {
 	uint32_t gop_off[GOP_MAX], gop_alen[GOP_MAX];
 	uint64_t gop_tag[GOP_MAX];
 	int gop_n, gop_ok;
+	/* vtstall: where DecodeFrame is (0 out of it, 1 inflight wait, 2 send, 3 FinishDelayedFrames), when the call
+	 * came, when the last one returned; stall_logged 1: a blocked line, 2: a no-call line is out */
+	int dec_phase, stall_logged;
+	double t_dec, t_dec_end;
 };
 struct storage { struct vd *v; };
 
@@ -756,13 +774,41 @@ static void decoded(struct vd *v, const struct venusd_msg *m)
 
 static void hang_up(struct vd *v);
 
+/* vtstall: seconds since boot (mach_absolute_time: venusd's and the kernel log's "[ssss.mmm]" clock) */
+static double uptime(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+}
+
+/* vtstall: the reader's check, v->mu held; the line to say into line (empty: none) */
+static void stall_check(struct vd *v, char *line, size_t n)
+{
+	double t = mono();
+	line[0] = 0;
+	if (!cfg.stall_ms || v->stall_logged)
+		return;
+	if ((v->dec_phase == 1 || v->dec_phase == 2) && t - v->t_dec > cfg.stall_ms / 1e3) {
+		v->stall_logged = 1;
+		snprintf(line, n, "DecodeFrame blocked >%d ms (%s), inflight %d (uptime %.3f)", cfg.stall_ms,
+			 v->dec_phase == 1 ? "inflight wait" : "send", v->inflight, uptime());
+	} else if (!v->dec_phase && v->inflight > 0 && v->t_dec_end && t - v->t_dec_end > cfg.stall_ms / 1e3) {
+		v->stall_logged = 2;
+		snprintf(line, n, "no DecodeFrame call for >%d ms with %d pending (uptime %.3f)", cfg.stall_ms, v->inflight,
+			 uptime());
+	}
+}
+
 static void *reader(void *arg)
 {
 	struct vd *v = arg;
 	for (;;) {
+		char sl[160];
 		pthread_mutex_lock(&v->mu);
 		int stop = v->stop, fd = v->fd, ms = io_ms(v);
+		stall_check(v, sl, sizeof sl);	/* vtstall */
 		pthread_mutex_unlock(&v->mu);
+		if (sl[0])
+			say("%s", sl);
 		if (stop)
 			break;
 		struct pollfd p = { .fd = fd, .events = POLLIN };
@@ -1142,6 +1188,10 @@ static OSStatus dec_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocato
 		*(CFTypeRef *)out = CFRetain(kCFBooleanTrue);
 		return 0;
 	}
+	if (out && key && cfg.qos && CFEqual(key, KEY_QOS)) {	/* vtqos: as AVD's HEVC decoder (H264H8.s 0x1f17bf434) */
+		*(CFTypeRef *)out = CFRetain(kCFBooleanTrue);
+		return 0;
+	}
 	return ERR_PROPERTY;
 }
 
@@ -1157,9 +1207,10 @@ static OSStatus dec_supported(CMBaseObjectRef o, CFDictionaryRef *out)
 	const void *pk[] = { kVTPropertyTypeKey, kVTPropertyReadWriteStatusKey };
 	const void *pv[] = { kVTPropertyType_Boolean, kVTPropertyReadWriteStatus_ReadOnly };
 	CFDictionaryRef p = CFDictionaryCreate(NULL, pk, pv, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	const void *k[] = { kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder };
-	const void *val[] = { p };
-	*out = p ? CFDictionaryCreate(NULL, k, val, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) : NULL;
+	const void *k[] = { kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, KEY_QOS };
+	const void *val[] = { p, p };	/* vtqos: Boolean, read-only as the first; VTVENUS_QOS=0: not listed */
+	*out = p ? CFDictionaryCreate(NULL, k, val, cfg.qos ? 2 : 1, &kCFTypeDictionaryKeyCallBacks,
+				      &kCFTypeDictionaryValueCallBacks) : NULL;
 	if (p)
 		CFRelease(p);
 	return *out ? 0 : ERR_MALFUNCTION;
@@ -1479,8 +1530,10 @@ static OSStatus submit(struct vd *v, VTVideoDecoderFrame frame, CMSampleBufferRe
 			t0 = mono();
 			continue;
 		}
+		v->dec_phase = 1;	/* vtstall */
 		wait_ms(v, 100);
 	}
+	v->dec_phase = 2;
 	int dead = v->dead || v->invalid, lost = v->lost;
 	pthread_mutex_unlock(&v->mu);
 	if (dead)
@@ -1587,22 +1640,36 @@ static OSStatus dec_decode_frame(CMBaseObjectRef o, VTVideoDecoderFrame frame, C
 		*info = 0;
 	if (!v || !frame || !sb)
 		return ERR_PARAM;
+	char sl[160] = "";
 	pthread_mutex_lock(&v->mu);
 	int bad = v->invalid || !v->session;
+	if (!bad) {	/* vtstall: the reader watches the call from here */
+		v->t_dec = mono(), v->dec_phase = 2;
+		if (v->stall_logged == 2)
+			snprintf(sl, sizeof sl, "DecodeFrame call again after %.0f ms, %d pending (uptime %.3f)",
+				 1e3 * (v->t_dec - v->t_dec_end), v->inflight, uptime()), v->stall_logged = 0;
+	}
 	pthread_mutex_unlock(&v->mu);
+	if (sl[0])
+		say("%s", sl);
 	if (bad)
 		return ERR_INVALID;
 	OSStatus st = decode_try(v, frame, sb, flags, info);
+	pthread_mutex_lock(&v->mu);
+	v->t_dec_end = mono(), v->dec_phase = 0;	/* vtstall */
+	if (v->stall_logged == 1)
+		snprintf(sl, sizeof sl, "DecodeFrame resumed after %.0f ms (status %d), inflight %d (uptime %.3f)",
+			 1e3 * (v->t_dec_end - v->t_dec), (int)st, v->inflight, uptime()), v->stall_logged = 0;
+	pthread_mutex_unlock(&v->mu);
+	if (sl[0])
+		say("%s", sl);
 	if (st)
 		hang_up(v);	/* vdleak: given up (dead): the venusd slot goes now */
 	return st;
 }
 
-static OSStatus dec_finish_delayed(CMBaseObjectRef o)
+static OSStatus finish_delayed(struct vd *v)
 {
-	struct vd *v = vd_of(o);
-	if (!v)
-		return ERR_PARAM;
 	pthread_mutex_lock(&v->mu);
 	int skip = v->invalid || v->dead || v->lost || !v->opened || v->drained || v->reopen || !v->sent_cfg;
 	v->got_eos = 0;
@@ -1629,6 +1696,27 @@ static OSStatus dec_finish_delayed(CMBaseObjectRef o)
 		ERRLOG(v, "EOS: %s (status %d) after %.0f ms", r ? "no EOS_DONE" : "EOS_DONE", st, 1e3 * (mono() - t0));
 	drop_all(v);	/* what the firmware never returned */
 	return 0;
+}
+
+static OSStatus dec_finish_delayed(CMBaseObjectRef o)
+{
+	struct vd *v = vd_of(o);
+	if (!v)
+		return ERR_PARAM;
+	char sl[160] = "";
+	pthread_mutex_lock(&v->mu);
+	v->dec_phase = 3;	/* vtstall: no stall lines while draining; a no-call stall ends here */
+	if (v->stall_logged == 2)
+		snprintf(sl, sizeof sl, "no DecodeFrame call for %.0f ms, then FinishDelayedFrames, %d pending (uptime %.3f)",
+			 1e3 * (mono() - v->t_dec_end), v->inflight, uptime()), v->stall_logged = 0;
+	pthread_mutex_unlock(&v->mu);
+	if (sl[0])
+		say("%s", sl);
+	OSStatus st = finish_delayed(v);
+	pthread_mutex_lock(&v->mu);
+	v->dec_phase = 0, v->t_dec_end = mono();
+	pthread_mutex_unlock(&v->mu);
+	return st;
 }
 
 static const struct base_class dec_base = {
@@ -1682,9 +1770,10 @@ static OSStatus create_instance(FourCharCode codec, CFAllocatorRef alloc, CMBase
 		snprintf(why, sizeof why, "no venusd at %s (%s)", VENUSD_SOCK, strerror(errno));
 	if (!__atomic_exchange_n(&process_logged, 1, __ATOMIC_ACQ_REL))
 		say("first CreateInstance in this process: %s%s (cold %d ms, wait %d ms, lazy open %d, reconnect %d, resync %d,"
-		    " reconnect wait %d, error gap %d ms, revive %d ms, surf %d, credits %d)",
+		    " reconnect wait %d, error gap %d ms, revive %d ms, surf %d, credits %d, stall %d ms, qos %d)",
 		    why[0] ? "refused, software decoder: " : "venusd connected", why, cfg.cold_ms, cfg.wait_ms, cfg.lazy,
-		    cfg.reconnect, cfg.resync, cfg.recon_wait, cfg.err_gap_ms, cfg.revive_ms, cfg.surf, cfg.credits);
+		    cfg.reconnect, cfg.resync, cfg.recon_wait, cfg.err_gap_ms, cfg.revive_ms, cfg.surf, cfg.credits,
+		    cfg.stall_ms, cfg.qos);
 	if (why[0])
 		return ERR_NO_DECODER;
 	struct vd *v = calloc(1, sizeof *v);

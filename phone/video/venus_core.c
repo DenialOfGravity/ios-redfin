@@ -47,6 +47,7 @@
 #include "pmem.h"
 #include "smmu.h"
 #include "venus_core.h"
+#include "venus_rails.h"	/* P0c */
 #include "venus_hevc.h"
 
 #define GCC		0x00100000u
@@ -799,6 +800,10 @@ static void ahb_hwctl_restore(void)
 
 int power_on(void)
 {
+	/* P0c (venus_rails.c, default off): VENUSCTL_RAILS raises cx/mx (raise only) before anything is clocked,
+	 * VENUSCTL_TBUVOTE holds mnoc_sf_0_tbu; power_off() puts both back */
+	if (rails_raise() || tbu_vote_on())
+		return power_off(), 1;
 	for (unsigned i = 0; i < 2; i++)
 		if (bcm(bcms[i], BCM_ON)) {
 			printf("venus: STOP: bcm %s vote failed\n", bcms[i]);
@@ -898,6 +903,8 @@ int power_off(void)
 	int rc = 0;
 	for (unsigned i = 2; i-- > 0;)
 		rc |= bcm(bcms[i], BCM_OFF);
+	rc |= tbu_vote_off();	/* P0c: only what power on changed */
+	rc |= rails_restore();
 	return rc ? 1 : 0;
 }
 
@@ -1916,7 +1923,7 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 			}
 		}
 		int changed = memcmp(cur, last, sizeof(cur)) != 0;
-		if (changed || t - tl >= 2000) {
+		if (changed || t - tl >= 1000) {	/* P0b: a line a second (uptime + rails), so a reset shows how long it lived */
 			tl = t;
 			char line[400];
 			snprintf(line, sizeof(line), "watch %.1f s: %s CTRL_STATUS %#010x (init %u idle %u pc_ready %u err %#x)"
@@ -1927,8 +1934,10 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 				 (cur[9] >> 8) & 1, cur[9] & 0xfe, cur[10], cur[11], (cur[11] & 0x10) ? " (WATCHDOG)" : "",
 				 cur[12], cur[13], cur[14], cur[15], cur[5], cur[6], cur[7], cur[8], cur[1], cur[2], cur[3], cur[4],
 				 tbu, tbs0, tbs1, changed ? "" : " (same)");
-			printf("venus: %s\n", line);
-			pm_step("%s", line);
+			char rl[200];
+			rails_line(rl, sizeof(rl));
+			printf("venus: %s | %s\n", line, rl);
+			pm_step("%s | %s", line, rl);
 			memcpy(last, cur, sizeof(cur));
 		}
 		if (on && fwq && wait_msg(0, 0))	/* drain + print firmware debug/messages (q_read only touches queue memory) */
@@ -2101,6 +2110,7 @@ static struct {
 	double cp_core[8];	/* v4a0: copy time per CPU (0-5 A55, 6-7 A76), counted only when the copy stayed on one core */
 	int n_core[8], n_moved;
 	unsigned acts;		/* msgq packets handled: progress for the timeout */
+	unsigned ebds;		/* vdstall: EBDs handled (venusd's stall line) */
 	int started;		/* 4a: START sent (vdec_close flushes and stops) */
 	int hevc;		/* 4e: an HEVC session (SESSION_INIT codec) */
 	uint32_t isz;		/* 4a: input buffer size */
@@ -2406,6 +2416,7 @@ static int dec_pkt(int n)
 		struct vbuf *b = find_buf(dc.in, dc.nin, p[7]);
 		if (b)
 			b->fw = 0;
+		dc.ebds++;	/* vdstall */
 		if (!vc_quiet || p[3] || !b)
 			printf("venus: EBD tag %u buf %#x error %#x filled %u flags %#x%s\n", p[6], p[7], p[3], p[5], p[9],
 			       b ? "" : " (not ours)");
@@ -2816,7 +2827,10 @@ int vdec_close(void)
 void vdec_status(struct vdec_status *st)
 {
 	*st = (struct vdec_status){ .frames = dc.frames, .eos = dc.eos, .err = dc.err, .fw_dead = fw_dead,
-		.started = dc.started, .acts = dc.acts, .cp_sum = dc.cp_sum, .cp_max = dc.cp_max, .in_size = dc.isz };
+		.started = dc.started, .acts = dc.acts, .cp_sum = dc.cp_sum, .cp_max = dc.cp_max, .in_size = dc.isz,
+		.ebds = dc.ebds };
+	for (int i = 0; i < dc.nin; i++)	/* vdstall */
+		st->in_fw += dc.in[i].fw;
 }
 
 void vdec_fw_reset(void)

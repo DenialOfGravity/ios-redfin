@@ -85,6 +85,8 @@ struct vdec_status {
 	unsigned acts;				/* msgq packets handled (progress) */
 	double cp_sum, cp_max;			/* copy-out seconds */
 	uint32_t in_size;			/* input buffer size */
+	int in_fw;				/* vdstall: input buffers with the firmware (ETB, no EBD yet) */
+	unsigned ebds;				/* vdstall: EBDs handled (changes: an input came back) */
 };
 void vdec_status(struct vdec_status *st);
 void vdec_fw_reset(void);	/* after a shutdown: the next bring-up starts with a live firmware again */
