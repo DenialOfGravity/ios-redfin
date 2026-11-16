@@ -99,11 +99,24 @@ def activation(root):
     os.makedirs(d, exist_ok=True)
     os.chown(d, MOBILE, MOBILE)
     os.chmod(d, 0o755)
-    save(os.path.join(d, 'data_ark.plist'), {
+    ark = {
         '-ActivationState': 'Activated', '-BrickState': False,
         '-BuildVersion': BUILD, '-ProductVersion': VERSION,
         '-DataMigrationCompleted': True, '-PreSydroDataMigrationCompleted': True,
-    }, MOBILE, MOBILE, 0o600)
+    }
+    # Optional CommCenter cellular-ticket test (ws-cc-ticket, phone/cc/README.md). DEFAULT OFF:
+    # the known-good image is byte-identical unless SWEET_CC_TICKET is set. Value "1" uses the
+    # minimal placeholder in phone/cc/cc-ticket.b64; any other value is used verbatim as the
+    # base64 ticket string. Prefer the live-plist route (phone/cc/mk-data-ark.py) for fast,
+    # reversible testing without a reimage; use this only to bake the ticket into an image.
+    cc_ticket = os.environ.get('SWEET_CC_TICKET')
+    if cc_ticket:
+        if cc_ticket == '1':
+            here = os.path.dirname(os.path.abspath(__file__))
+            cc_ticket = open(os.path.join(here, '../phone/cc/cc-ticket.b64')).read().strip()
+        ark['-ActivationTicket'] = cc_ticket
+        print('data ark: SWEET_CC_TICKET set -> seeding -ActivationTicket (test)')
+    save(os.path.join(d, 'data_ark.plist'), ark, MOBILE, MOBILE, 0o600)
     print('data ark', d)
 
 
