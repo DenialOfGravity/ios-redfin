@@ -36,6 +36,7 @@ int shutdown_cmd(void) { return REC("shutdown"); }
 int watch(unsigned s, int si, uint32_t d) { return REC("watch %u sysinit=%d debug=%#x", s, si, d); }
 int map_sid(uint32_t s) { return REC("map_sid %#x", s); }
 int smmu_cmd(void) { return REC("smmu"); }
+int fwdump(uint64_t a) { return REC("fwdump %#llx", (unsigned long long)a); }
 
 int venusctl_main(int argc, char **argv);
 
@@ -81,6 +82,8 @@ int main(void)
 	RUN("watch 300 sysinit=1 debug=0x18", 0, "watch", "300", "--sysinit");
 	RUN("watch 180 sysinit=0 debug=0x3f", 0, "watch", "180", "--debug", "0x3f");
 	RUN("", 2, "watch");
+	RUN("fwdump 0", 0, "fwdump");
+	RUN("fwdump 0xa2600000", 0, "fwdump", "0xa2600000");
 	RUN("boot keep=1", 0, "boot", "--keep");
 	RUN("init 0xa2600000", 0, "init", "--phys", "0xa2600000");
 	RUN("", 2, "frobnicate");

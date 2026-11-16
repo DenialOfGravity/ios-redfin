@@ -43,6 +43,7 @@ int session(uint32_t debug);
 int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t bufphys, int hevc);	/* -1: detect */
 int memtest(uint64_t a, uint64_t len, int write);
 int shutdown_cmd(void);
+int fwdump(uint64_t addr);	/* P0d: read-only dump of the HFI block left at addr (0: 0xa2600000) after a reset */
 
 /* ---- the stage 3 decoder in steps (venusctl decode runs them in its loop; venusd per client message) ---- */
 

@@ -90,6 +90,16 @@
  *                           power off sets it again if it was set
  *   watch SECS              without firmware (no STATE init) = power/bus only; a line at least every second with
  *                           the uptime, cx/mx votes and the TBU state
+ * P0d (logs/research/video-reset-2026-11-16.md Q1/Q4; all default off, Linux = msm-4.19 techpack/video hfi_common.c):
+ *   VENUSCTL_PC=1           watch, once SYS_INIT is done: after VENUSCTL_PC_DELAY_MS (1500 = pwr_collapse_delay) as
+ *                           __prepare_pc_common: needs WFI + idle, sends HFI_CMD_SYS_PC_PREP (0x10002), waits up to 2 s
+ *                           for CTRL_STATUS PC_READY (bit 8) + WRAPPER_CPU_STATUS WFI (bit 0), logs both with times.
+ *                           No power off: clocks + GDSCs stay on (SW mode), no vote changes. Watch line: pc/pc_ready.
+ *   VENUSCTL_INTCLR=1       watch: INTR_STATUS != 0 -> CPU_CS_A2HSOFTINTCLR = 1, WRAPPER_INTR_CLEAR = status (as
+ *                           __core_clear_interrupt_common), then drain + decode the queues. INTR_MASK never written.
+ *   venusctl fwdump [ADDR]  read-only, on the boot after a reset, before any re-init: the HFI block at ADDR
+ *                           (0xa2600000): table still ours?, queue headers, SFR (+0x2fe000), dbgq ring strings,
+ *                           unread msgq packets, failure strings; the core only if its gate reads on
  */
 #include <stdint.h>
 #include <unistd.h>
@@ -245,6 +255,8 @@ int main(int argc, char **argv)
 		return map_sid((uint32_t)strtoul(arg, NULL, 0));
 	if (!strcmp(cmd, "smmu") && !arg)
 		return smmu_cmd();
+	if (!strcmp(cmd, "fwdump"))
+		return fwdump(arg ? strtoull(arg, NULL, 0) : 0);
 usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | rails (read-only) | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
@@ -255,6 +267,8 @@ usage:
 		"       | watch SECONDS [--sysinit] [--debug MASK] (firmware/NoC/SMMU/GDSC state, a line a second; power-only without init)\n"
 		"       env (default off): VENUSCTL_RAILS=1|CORNER VENUSCTL_RAILS_UNKNOWN=1 VENUSCTL_TBUVOTE=1 (power on/off)\n"
 		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
-		"       | memtest ADDR SIZE write|check\n");
+		"       | memtest ADDR SIZE write|check\n"
+		"       | fwdump [ADDR] (read-only, after a reset: SFR, debug ring, queues of the HFI block, default 0xa2600000)\n"
+		"       P0d watch env (default off): VENUSCTL_PC=1 [VENUSCTL_PC_DELAY_MS=1500] VENUSCTL_INTCLR=1\n");
 	return 2;
 }
