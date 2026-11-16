@@ -246,6 +246,10 @@ static char country[3] = "XX";
  *         wifid refuses known networks at -40 dBm "Below minimum RSSI threshold" while noise/snr read 0)
  *   0x10  a link wland made by itself (/var/local/wlan.conf at boot, before wifid asks) is told to wifid as a
  *         join's (SSID/BSSID/LINK changed): the boot auto-join wifid refuses is then wland's (bsd/dev/flame_sta.c)
+ *   0x20  (redfin 1143) RSSI_BOUNDS (106) is answered: version 1, RSSI_MIN / RSSI_MAX / RSSI_THRESHOLD (dBm) from
+ *         kern.sweet_wifi_rssi_min / _max / _thr (-100 / -20 / -80). Without it 106 is refused (EOPNOTSUPP), and
+ *         IO80211 then gives wifid no bounds: the auto-join test for "Below minimum RSSI threshold" at -40 dBm.
+ *         wifid asks once when it attaches to en0: set the bit, then restart wifid (killall wifid).
  * kern.sweet_wifi_live_rssi (read only): the last signal wland reported, 0 when none. "SWEET WIFI 1051" lines.
  */
 #define NOISE_FLOOR     (-95)
@@ -254,6 +258,11 @@ static bool wifi_sig_read;
 static int wifi_live_rssi;                      /* the joined network's last signal from wland (0: none since the link came) */
 SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_sig, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_sig, 0, "redfin 1051: Wi-Fi signal for wifid (bits)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_live_rssi, CTLFLAG_RD | CTLFLAG_LOCKED, &wifi_live_rssi, 0, "redfin 1051: last signal, dBm");
+/* redfin 1143: RSSI_BOUNDS (106) answer, only with kern.sweet_wifi_sig & 0x20 (dBm; RSSI_THRESHOLD = the floor for joins) */
+static int wifi_rssi_min = -100, wifi_rssi_max = -20, wifi_rssi_thr = -80;
+SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi_min, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_rssi_min, 0, "redfin 1143: RSSI_BOUNDS min, dBm");
+SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi_max, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_rssi_max, 0, "redfin 1143: RSSI_BOUNDS max, dBm");
+SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_rssi_thr, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_rssi_thr, 0, "redfin 1143: RSSI_BOUNDS threshold, dBm");
 
 int redwood_apple80211_sig(void);
 int
@@ -459,6 +468,23 @@ get(struct apple80211req *request)
 		error = give(request, answer, sizeof(*answer));
 		kfree_data(answer, sizeof(*answer));
 		return error;
+	}
+	case 106: {                             /* 1143: RSSI_BOUNDS, 16 bytes as IO80211 16.7 reads them (only with bit 0x20) */
+		struct {
+			uint32_t version;
+			int32_t min, max, threshold;
+		} answer = { .version = 1, .min = wifi_rssi_min, .max = wifi_rssi_max, .threshold = wifi_rssi_thr };
+		static unsigned told;
+
+		if (!(redwood_apple80211_sig() & 0x20)) {
+			break;                          /* refused, as before 1143 */
+		}
+		if (told < 10) {
+			told++;
+			printf("SWEET WIFI 1143: RSSI_BOUNDS answered: min %d max %d threshold %d dBm\n", answer.min, answer.max,
+			    answer.threshold);
+		}
+		return give(request, &answer, sizeof(answer));
 	}
 	case 21:                                /* how the last join went (0: not over yet) */
 		lck_mtx_lock(&apple80211_lock);
