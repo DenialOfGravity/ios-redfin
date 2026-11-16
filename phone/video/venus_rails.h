@@ -29,7 +29,9 @@ struct rails_io {
 extern const struct rails_io *rails_io;
 
 /* pure helpers (tested on the host) */
-int rails_hlvl_for(const uint16_t *vl, unsigned n, unsigned corner);	/* smallest level >= corner; top if none; -1 if n 0 */
+int rails_hlvl_for(const uint16_t *vl, unsigned n, unsigned corner);	/* smallest level >= corner; top if none; -1 none */
+int rails_top_level(const uint16_t *vl, unsigned n);	/* highest index with a nonzero corner; -1 if none */
+int rails_level_ok(const uint16_t *vl, unsigned n, uint32_t hlvl);	/* 1: 0 < hlvl < n and corner != 0 */
 int rails_vote_lookup(const char *votes, uint32_t addr, uint32_t *val);	/* 1: found in "ADDR=VAL ..." (hex) */
 unsigned rails_target_corner(const char *env);	/* VENUSCTL_RAILS: NULL/"0" -> 0 (off), "1" -> NOM, N -> N */
 

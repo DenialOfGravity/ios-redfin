@@ -17,6 +17,12 @@
  *   prev known and < target: vote target; power off votes prev back (never 0: a 0 is left raised).
  *   prev unknown: vote the TOP level (cannot be lower than anything), left in place at power off (unknown = never
  *          lowered). VENUSCTL_RAILS_UNKNOWN=1: vote the target instead (the one place this may lower a vote).
+ *          "Removing our vote" is not possible: the apps DRV has one vote per resource shared by every XNU client (no
+ *          per-client drop; xnu 1131 is bookkeeping only), and the only way to withdraw it is an ARC 0, never sent.
+ * p0b: TOP = the highest index with a nonzero corner. cmd-db's aux tables have 16 entries and lito's undefined tail is
+ * corner 0 (mx.lvl and mmcx.lvl: [7..15] = 0, top = 6 = corner 416 / 384); r.n - 1 = 15 would have voted "corner 0"
+ * and left it at power off. No index with corner 0 is ever a target or voted; a current/previous level with corner 0
+ * is taken as unknown (raise) or not put back (restore).
  * At power off a rail goes back only if kern.sweet_rpmh_votes still shows our value (nobody voted since).
  * r17a: an mx.lvl vote back to 0 took the phone down: no ARC vote of 0 is ever sent from here.
  *
@@ -51,14 +57,27 @@ static const char *const rail_names[] = { "mx.lvl", "mmcx.lvl", "cx.lvl" };	/* r
 
 /* ---- pure helpers ---- */
 
+/* p0b: cmd-db's aux tables have 16 entries; the undefined tail is corner 0 (lito mx.lvl/mmcx.lvl: [7..15] = 0).
+ * Such an index is not a level: it is never a target and never voted. */
+int rails_top_level(const uint16_t *vl, unsigned n)
+{
+	for (unsigned i = n; i-- > 1;)
+		if (vl[i])
+			return (int)i;
+	return -1;
+}
+
+int rails_level_ok(const uint16_t *vl, unsigned n, uint32_t hlvl)
+{
+	return hlvl > 0 && hlvl < n && vl[hlvl] != 0;
+}
+
 int rails_hlvl_for(const uint16_t *vl, unsigned n, unsigned corner)
 {
-	if (!n)
-		return -1;
-	for (unsigned i = 0; i < n; i++)
-		if (vl[i] >= corner)
+	for (unsigned i = 1; i < n; i++)
+		if (vl[i] && vl[i] >= corner)
 			return (int)i;
-	return (int)n - 1;
+	return rails_top_level(vl, n);
 }
 
 int rails_vote_lookup(const char *votes, uint32_t addr, uint32_t *val)
@@ -254,6 +273,13 @@ static const char *src_name(int src)
 	return src == 2 ? "xnu" : src == 1 ? "tcs" : "unknown";
 }
 
+/* p0b: is hlvl a defined level of this rail in cmd-db (nonzero corner)? */
+static int rail_level_valid(const char *name, uint32_t hlvl)
+{
+	struct rail r;
+	return !cmddb_find(name, &r) && rails_level_ok(r.vl, r.n, hlvl);
+}
+
 /* ---- commands ---- */
 
 int rails_raise(void)
@@ -287,9 +313,18 @@ int rails_raise(void)
 			return 1;
 		}
 		int target = rails_hlvl_for(r.vl, r.n, corner);
+		if (target < 0) {
+			printf("venus: rails: STOP: %s has no level with a nonzero corner\n", r.name);
+			return 1;
+		}
 		uint32_t prev = 0;
 		unsigned tcs = 0;
 		int src = rail_prev(&r, have ? votes : NULL, &prev, &tcs);
+		if (src && prev && !rails_level_ok(r.vl, r.n, prev)) {
+			printf("venus: rails: %s: current level %u (%s) has corner 0 (not a level): taken as unknown\n", r.name,
+			       prev, src_name(src));
+			src = 0;
+		}
 		uint32_t v = (uint32_t)target;
 		if (src && prev >= (uint32_t)target) {
 			printf("venus: rails: %s %#x at level %u (corner %u, %s) >= level %u (corner %u): no vote\n", r.name,
@@ -297,9 +332,11 @@ int rails_raise(void)
 			continue;
 		}
 		if (!src && !getenv("VENUSCTL_RAILS_UNKNOWN"))
-			v = r.n - 1;	/* the top: cannot lower anybody's vote */
-		if (!v)
-			v = 1;
+			v = (uint32_t)rails_top_level(r.vl, r.n);	/* the top defined level: lowers nobody */
+		if (!rails_level_ok(r.vl, r.n, v)) {
+			printf("venus: rails: STOP: %s level %u has corner 0: not voted\n", r.name, v);
+			return 1;
+		}
 		printf("venus: rails: %s %#x: current %s%u (%s) -> level %u (corner %u; wanted corner %u)\n", r.name,
 		       r.addr, src ? "" : "? ", prev, src_name(src), v, corner_of(&r, v), corner);
 		/* recorded before the vote: a vote that may have gone through is still undone */
@@ -335,6 +372,9 @@ int rails_restore(void)
 		else if (!s.r[i].prev)
 			printf("venus: rails: %s was 0 before: not voting 0 (r17a), left at %u\n", s.r[i].name,
 			       s.r[i].voted);
+		else if (!rail_level_valid(s.r[i].name, s.r[i].prev))
+			printf("venus: rails: %s: level %u before has corner 0 (not a level): not voted, left at %u\n",
+			       s.r[i].name, s.r[i].prev, s.r[i].voted);
 		else if (arc_vote(s.r[i].name, s.r[i].prev)) {
 			printf("venus: rails: %s: putting back %u failed (left at %u)\n", s.r[i].name, s.r[i].prev,
 			       s.r[i].voted);
@@ -430,12 +470,22 @@ int rails_report(void)
 			printf("level %u (corner %u) from %s%s", prev, corner_of(&r, prev), src_name(src), src == 1 ?
 			       (tcs < 2 ? " active" : " wake") : "");
 		int tg = rails_hlvl_for(r.vl, r.n, corner ? corner : CORNER_NOM);
-		uint32_t v = !src && !getenv("VENUSCTL_RAILS_UNKNOWN") ? r.n - 1 : (uint32_t)tg;
+		if (tg < 0) {
+			printf(" | no level with a nonzero corner: VENUSCTL_RAILS would stop\n");
+			continue;
+		}
+		if (src && prev && !rails_level_ok(r.vl, r.n, prev)) {
+			printf(" (corner 0: not a level, taken as unknown)");
+			src = 0;
+		}
+		uint32_t v = !src && !getenv("VENUSCTL_RAILS_UNKNOWN") ? (uint32_t)rails_top_level(r.vl, r.n) : (uint32_t)tg;
 		printf(" | VENUSCTL_RAILS=%u would %s\n", corner ? corner : 1,
 		       src && prev >= (uint32_t)tg ? "not vote (already there)" : "vote");
 		if (!(src && prev >= (uint32_t)tg))
 			printf("rails:   ... level %u (corner %u), at power off %s\n", v, corner_of(&r, v),
-			       !src ? "left (unknown before)" : !prev ? "left (never 0)" : "back to the level before");
+			       !src ? "left at this level (unknown before; the apps DRV has one vote per resource, no per-client "
+				      "drop: the only removal is an ARC 0, never sent)" :
+			       !prev ? "left (never 0)" : "back to the level before");
 	}
 	uint32_t tv = rails_io->rd32(TBU_VOTE);
 	printf("rails: tbu mnoc_sf_0 hlos1 vote %#llx = %#010x (sw_collapse %u, PWR_ON %u)\n", TBU_VOTE, tv,

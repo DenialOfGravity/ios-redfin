@@ -272,6 +272,56 @@ int main(void)
 	assert(nsent == 0 && tbu == 0x80000000u);
 	pass++;
 
+	/* 12. p0b: lito's real 16-entry tables (cmd-db aux), undefined tail = corner 0. mx.lvl/mmcx.lvl top = 6. */
+	static const uint16_t cx16[16] = { 0, 16, 64, 128, 192, 256, 384, 416 };
+	static const uint16_t mx16[16] = { 0, 16, 128, 192, 256, 320, 416 };
+	static const uint16_t mmcx16[16] = { 0, 16, 64, 128, 192, 256, 384 };
+	static const uint16_t none16[16] = { 0 };
+	assert(rails_top_level(mx16, 16) == 6 && rails_top_level(mmcx16, 16) == 6 && rails_top_level(cx16, 16) == 7);
+	assert(rails_top_level(none16, 16) == -1 && rails_hlvl_for(none16, 16, 256) == -1);
+	assert(rails_hlvl_for(mx16, 16, 256) == 4 && rails_hlvl_for(mx16, 16, 9999) == 6);
+	assert(rails_hlvl_for(mmcx16, 16, 384) == 6 && rails_hlvl_for(mmcx16, 16, 416) == 6);
+	assert(!rails_level_ok(mx16, 16, 15) && !rails_level_ok(mx16, 16, 7) && rails_level_ok(mx16, 16, 6));
+	assert(!rails_level_ok(mx16, 16, 0) && !rails_level_ok(mx16, 16, 16));
+	db_add(0, "cx.lvl", 0x30010, cx16, 16);
+	db_add(1, "mx.lvl", 0x30020, mx16, 16);
+	db_add(2, "mmcx.lvl", 0x50000, mmcx16, 16);
+	/* 12a. unknown before (the phone's case): the top DEFINED level (6, not 15), left there at power off */
+	reset();
+	setenv("VENUSCTL_RAILS", "1", 1);
+	have_votes = 0;
+	assert(rails_raise() == 0);
+	assert(last_for("mx.lvl") == 6 && last_for("mmcx.lvl") == 6 && last_for("cx.lvl") == 7);
+	for (int i = 0; i < nsent; i++)
+		assert(sent[i].val != 15 && sent[i].val <= 7);
+	before = nsent;
+	assert(rails_restore() == 0 && nsent == before);
+	/* 12b. a recorded vote with corner 0 (an old r.n-1 = 15) is not a level: taken as unknown, top voted */
+	reset();
+	setenv("VENUSCTL_RAILS", "1", 1);
+	strcpy(votes_str, "30020=f 50000=3 30010=7");
+	assert(rails_raise() == 0 && last_for("mx.lvl") == 6 && last_for("mmcx.lvl") == 5 && count_for("cx.lvl") == 0);
+	before = nsent;
+	assert(rails_restore() == 0 && nsent == before + 1 && last_for("mmcx.lvl") == 3 && last_for("mx.lvl") == 6);
+	/* 12c. VENUSCTL_RAILS above every corner, prev unknown + VENUSCTL_RAILS_UNKNOWN: still the top defined level */
+	reset();
+	setenv("VENUSCTL_RAILS", "9999", 1);
+	setenv("VENUSCTL_RAILS_UNKNOWN", "1", 1);
+	have_votes = 0;
+	assert(rails_raise() == 0 && last_for("mx.lvl") == 6 && last_for("mmcx.lvl") == 6 && last_for("cx.lvl") == 7);
+	/* 12d. a state file whose "before" level has corner 0: not put back */
+	reset();
+	f = fopen(state_path, "w");
+	fprintf(f, "boot BOOT-A\nrail mx.lvl 0x30020 prev 0x9 voted 0x6 known 1\n");
+	fclose(f);
+	strcpy(votes_str, "30020=6");
+	assert(rails_restore() == 0 && nsent == 0);
+	/* 12e. the read-only report on these tables sends nothing */
+	reset();
+	have_votes = 0;
+	assert(rails_report() == 0 && nsent == 0);
+	pass++;
+
 	unlink(state_path);
 	printf("rails_test: %d groups passed\n", pass);
 	return 0;
