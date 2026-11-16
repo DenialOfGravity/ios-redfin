@@ -79,6 +79,11 @@
  *   INJECT_PREDICTED_ORBITS_REQ (0x0029: allowed sizes, server list) and INJECT_POSITION_REQ (0x002A) are logged only.
  *   Every GNSS_SV_INFO report gets one "loc: sv #N" line: satellites listed / tracked / with CN0, how many >= 30 and
  *   >= 20 dB-Hz, best CN0 and the average of the best 4, per constellation counts (no elevation, azimuth or position).
+ * ws-gnss-j word (default off; Claude 2026-11-16):
+ *   rfmetrics=1  read-only RF front-end metrics, registration only (no SET): a normal session's REG_EVENTS also asks for
+ *                GNSS_MEASUREMENT_REPORT 0x01000000 (ind 0x0086) and BAND_MEASUREMENT_METRICS 0x40000000000 (ind 0x00CE).
+ *                Logged (rfm.c): per band jammerPwr/bpAmp/PGA; per signal AGC + jammer(BP) and per-SV CN0 (gloRfLoss);
+ *                SV_INFO's rfLoss[] (TLV 0x13). One line per band / signal / rfLoss per 10 s. No positions, no az/el.
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
  * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). Coordinates are logged rounded to 0.01 deg.
  * loc_shutdown() (SIGTERM, loc.on gone): STOP + REG_EVENTS 0 for a running session and BYE to the relay, then the
@@ -99,6 +104,7 @@
 #include "loc.h"
 #include "pdsemu.h"
 #include "qmi.h"
+#include "rfm.h"
 
 #define MAX_FAILS	3
 #define RESP_MS		5000
@@ -122,6 +128,8 @@ static uint32_t srv_node, srv_port, srv_inst;
 static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2 none */
 static int w_client, w_clientid, w_opmode, w_start_android, w_lockclient, w_lockev;	/* ws-gnss-f; w_client 1 afw, 2 nfw */
 static int w_time;			/* ws-gnss-g time=1 */
+static int w_rfmetrics;		/* ws-gnss-j rfmetrics=1 */
+static struct rfm rfm;
 static int w_probe2, probe2_state;	/* ws-gnss-i probe2=1; state 1 queued, 2 done */
 static unsigned probe2_refused;
 static uint64_t probe2_gen_done = ~0ull;
@@ -448,7 +456,13 @@ static void q_start(uint32_t interval)
 		rev_sent = 1;
 	}
 	n = loc_tlv_reg_events_ex(t, LOC_EVMASK_BRIDGE | (w_lockev ? LOC_EVMASK_ENGINE_LOCK_STATE : 0) |
-				  (w_time ? LOC_EVMASK_ASSIST : 0), (uint32_t)w_client, w_client && w_clientid ? "HAL" : NULL);
+				  (w_time ? LOC_EVMASK_ASSIST : 0) | (w_rfmetrics ? LOC_EVMASK_RFMETRICS : 0), (uint32_t)w_client,
+				  w_client && w_clientid ? "HAL" : NULL);
+	if (w_rfmetrics) {	/* ws-gnss-j: registration only; the 0x183/0x1f3 label below stays as before */
+		rfm_reset(&rfm);
+		printf("[%6llu] loc: rfmetrics=1: REG_EVENTS also 0x01000000 (meas report 0x0086) | 0x40000000000 (band metrics 0x00CE)\n",
+		       now_ms());
+	}
 	enqueue(LOC_REG_EVENTS, t, (uint16_t)n, 0, w_time ? (w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x1f3 clientType AFW" :
 		w_client == LOC_CLIENT_NFW ? "REG_EVENTS 0x1f3 clientType NFW" : "REG_EVENTS 0x1f3") :
 		w_client == LOC_CLIENT_AFW ? "REG_EVENTS 0x183 clientType AFW" :
@@ -1122,6 +1136,7 @@ static void read_on(void)
 	w_lockclient = strstr(b, "lockclient=1") != NULL;
 	w_lockev = strstr(b, "lockev=1") != NULL;
 	w_time = strstr(b, "time=1") != NULL;
+	w_rfmetrics = strstr(b, "rfmetrics=1") != NULL;
 	w_timeunc = 5000;
 	if ((w = strstr(b, "timeunc=")))
 		w_timeunc = (uint32_t)strtoul(w + 8, NULL, 10);
@@ -1132,7 +1147,7 @@ static void read_on(void)
 	if (w_session > 600)
 		w_session = 600;
 	if (w_probe2) {		/* ws-gnss-i: read-only mode, every other word off */
-		w_probe = w_pds = w_session = w_unlock = w_time = 0;
+		w_probe = w_pds = w_session = w_unlock = w_time = w_rfmetrics = 0;
 		w_client = w_clientid = w_opmode = w_start_android = w_lockclient = w_lockev = 0;
 		printf("[%6llu] loc: probe2=1: read-only GETs only, every other word ignored, then exit\n", now_ms());
 	}
@@ -1147,6 +1162,8 @@ static void read_on(void)
 	if (w_time)
 		printf("[%6llu] loc: ws-gnss-g words: time=1 timeunc=%u ms (INJECT_UTC_TIME at session start and on INJECT_TIME_REQ)\n",
 		       now_ms(), w_timeunc);
+	if (w_rfmetrics)
+		printf("[%6llu] loc: ws-gnss-j word: rfmetrics=1 (RF metrics indications registered with the next session)\n", now_ms());
 	if (w_client || w_clientid || w_opmode || w_start_android || w_lockclient || w_lockev)
 		printf("[%6llu] loc: ws-gnss-f words:%s%s%s%s%s%s\n", now_ms(), w_client == LOC_CLIENT_AFW ? " client=afw" :
 		       w_client == LOC_CLIENT_NFW ? " client=nfw" : "", w_clientid ? " clientid=1" : "", w_opmode ? " opmode=standalone" : "",
@@ -1188,6 +1205,8 @@ static void write_status(void)
 	}
 	fprintf(f, "loc: ws-gnss-g time %s (unc %u ms): modem asked %u, injected %u, accepted %u; XTRA requests %u, position "
 		   "requests %u\n", w_time ? "on" : "off", w_timeunc, n_time_req, n_time_inj, n_time_ok, n_xtra_req, n_pos_req);
+	fprintf(f, "loc: ws-gnss-j rfmetrics %s: band metrics %u, meas reports %u, rfLoss reports %u\n", w_rfmetrics ? "on" : "off",
+		rfm.n_band, rfm.n_meas, rfm.n_loss);
 	if (sv_have) {
 		char sb[200];
 		loc_sv_summary_str(&sv_last, sb, sizeof(sb));
@@ -1494,8 +1513,9 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	uint16_t l = 0;
 	const uint8_t *v;
 	static unsigned n_pos_dump, n_sv_dump;
-	if (m.id == LOC_IND_POSITION || m.id == LOC_IND_SV_INFO) {
-		unsigned *c = m.id == LOC_IND_POSITION ? &n_pos_dump : &n_sv_dump;
+	static unsigned n_rfm_dump;
+	if (m.id == LOC_IND_POSITION || m.id == LOC_IND_SV_INFO || m.id == LOC_IND_GNSS_MEAS || m.id == LOC_IND_BAND_METRICS) {
+		unsigned *c = m.id == LOC_IND_POSITION ? &n_pos_dump : m.id == LOC_IND_SV_INFO ? &n_sv_dump : &n_rfm_dump;
 		if (++*c <= 5 || *c % 60 == 0)
 			dump_ids(&m);
 	} else {
@@ -1524,6 +1544,24 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			printf("[%6llu] loc: sv #%u: %s (entry size %u)\n", now_ms(), n_sv, sr == -1 ? "no svList TLV" :
 			       "svList entries not 28 bytes: not parsed", ss.entry_size);
 		}
+		if (w_rfmetrics) {	/* ws-gnss-j: rfLoss[] (TLV 0x13), rate-limited */
+			char lb[RFM_LINE];
+			if (rfm_rfloss(&rfm, m.tlv, m.len, link_ms(), lb, sizeof(lb)) == 1)
+				printf("[%6llu] loc: %s\n", now_ms(), lb);
+		}
+		break;
+	}
+	case LOC_IND_GNSS_MEAS: {	/* ws-gnss-j rfmetrics=1 */
+		char lb[RFM_LINE];
+		if (rfm_meas(&rfm, m.tlv, m.len, link_ms(), lb, sizeof(lb)) == 1)
+			printf("[%6llu] loc: %s\n", now_ms(), lb);
+		break;
+	}
+	case LOC_IND_BAND_METRICS: {	/* ws-gnss-j rfmetrics=1 */
+		char lb[10][RFM_LINE];
+		int k = rfm_band(&rfm, m.tlv, m.len, link_ms(), lb, 10);
+		for (int i = 0; i < k; i++)
+			printf("[%6llu] loc: %s\n", now_ms(), lb[i]);
 		break;
 	}
 	case LOC_IND_INJECT_TIME_REQ:	/* ws-gnss-g: the modem asks for time */
