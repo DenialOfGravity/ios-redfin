@@ -421,3 +421,67 @@ TEST(drawcpu_skip_culled_loader_reaches_the_draw_relying_on_it) {
         }
     }
 }
+
+// (ws-hm-int13b) HM_DRAW_SKIP=prog and the immediates. Every draw writes HLSQ_INVALIDATE_CMD (programConfig); on the
+// A620 a draw after it that did not load its immediates again ran with stale constants (SpringBoard's dock platter
+// with HM_DRAW_SKIP=prog alone, HM_CULL off too), the pushed constants being loaded every draw anyway. The stream read
+// as that GPU does: an invalidate of the fragment stage drops its constants, and a draw of a program with immediates
+// needs them loaded since. HM_SKIP_PROG=old (the drawcpu..int12 encoding) leaves draws 2..4 without; imm (default)
+// loads them every draw, the preloads still left out; noinv leaves the invalidate out with them
+TEST(drawcpu_skip_prog_keeps_the_immediates_after_the_invalidate) {
+    for (const char* mode : {"old", "imm", "noinv"}) {
+        setenv("HM_SKIP_PROG", mode, 1);
+        SkipEnv e("prog");
+        LoadRig s;
+        Program p = dcAttr();
+        static const uint32_t imm[4] = {0x3f800000u, 0x3f000000u, 0x3e800000u, 0x3f800000u};
+        const uint32_t off = (p.fs.k.constlen + 3) & ~3u;
+        if (p.fs.k.numImmediates == 0) {
+            p.fs.k.immediates = imm;
+            p.fs.k.numImmediates = 4;
+            p.fs.k.immediatesOffsetVec4 = off;
+            p.fs.k.constlen = off + 4;
+        }
+        const uint32_t immOff = uint32_t(p.fs.k.immediatesOffsetVec4);
+        auto cb = s.r.queue->commandBuffer();
+        for (uint32_t i = 0; i < 4; i++) {
+            Draw d;
+            d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+            d.vertexCount = 6;
+            Bindings vs;
+            vs.buffers = {Binding{s.vb.get(), uint64_t(i) * 6 * 12}, Binding{s.ub.get(), 0}};
+            CHECK(cb->draw(p, s.pass, d, vs, Bindings{}, s.o));
+        }
+        cb->commit();
+        cb->waitUntilCompleted();
+        unsetenv("HM_SKIP_PROG");
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(s.r.fake->stats().faults, 0u);
+        using namespace a6xx;
+        const std::vector<uint32_t> w = cb->streamForTesting();
+        bool have = false;
+        uint32_t draws = 0, stale = 0, preloads = 0;
+        for (size_t i = 0; i < w.size();) {
+            const pm4::Header h = pm4::decode(w[i]);
+            if (h.kind == pm4::Header::kBad) break;
+            if (h.kind == pm4::Header::kRegisters && h.reg <= REG_A6XX_HLSQ_INVALIDATE_CMD && REG_A6XX_HLSQ_INVALIDATE_CMD < h.reg + h.count &&
+                (w[i + 1 + (REG_A6XX_HLSQ_INVALIDATE_CMD - h.reg)] & A6XX_HLSQ_INVALIDATE_CMD_FS_STATE) != 0) {
+                have = false;
+            }
+            if (h.kind == pm4::Header::kCommand && h.opcode == CP_LOAD_STATE6_FRAG && h.count >= 1) {
+                const uint32_t w0 = w[i + 1];
+                const uint32_t type = (w0 >> 14) & 3, block = (w0 >> 18) & 0xf, dst = w0 & 0x3fff, units = w0 >> 22;
+                if (type == ST6_SHADER && block == SB6_FS_SHADER) preloads++;
+                if (type == ST6_CONSTANTS && block == SB6_FS_SHADER && dst <= immOff && immOff < dst + units) have = true;
+            }
+            if (h.kind == pm4::Header::kCommand && h.opcode == CP_DRAW_INDX_OFFSET) {
+                draws++;
+                if (!have) stale++;
+            }
+            i += 1 + h.count;
+        }
+        CHECK_EQ(draws, 4u);
+        CHECK_EQ(preloads, 1u);   // (the preloads stay left out in every mode)
+        CHECK_EQ(stale, strcmp(mode, "old") == 0 ? 3u : 0u);
+    }
+}
