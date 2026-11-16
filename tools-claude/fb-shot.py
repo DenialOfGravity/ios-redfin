@@ -13,7 +13,8 @@ fb-shot.py --where REGS [MONKLOG]  which buffer the MDP scans now. REGS = 64 byt
           +0x24. Prints "direct PA LEN WxH:STRIDE slotN" (a scanout slot surface is latched) or "blit PA LEN -"
           (the old panel buffer 0xa0000000: scanout off, or the panel-buffer path after a non-slot frame).
           MONKLOG (sweetmon's klog file) gives the slot's "SWEET SURF: scanout slot N (..., PA X) for a WxH surface"
-          line; default 1125x2436."""
+          line; default 1125x2436. "ubwc PA 0 - ..." (xnu 1111): VIG0 fetches a UBWC-compressed surface (SRC_FORMAT
+          +0x30 bits 31:30 = 2): a raw dump of it is not an image."""
 import json, os, re, struct, sys, zlib
 
 W, H, S = 1088, 2340, 4352
@@ -74,6 +75,9 @@ def where(regs, monklog=None):
     if len(r) < 0x28:
         return 'blit %s - (no regs)' % BLIT
     pa, stride = struct.unpack_from('<I', r, 0x14)[0], struct.unpack_from('<I', r, 0x24)[0] & 0xffff
+    # xnu 1111: a UBWC-compressed surface (SRC_FORMAT +0x30 fetch mode bits 31:30 = 2): its bytes are not rows, no shot
+    if len(r) >= 0x34 and (struct.unpack_from('<I', r, 0x30)[0] >> 30) == 2:
+        return 'ubwc 0x%x 0 - (compressed scanout: no raw screenshot)' % pa
     if pa == 0xa0000000 or pa == 0xa0a00000 or not stride:
         return 'blit 0x%x %d -' % (pa if pa else 0xa0000000, H * S)
     w, h, slot = 1125, 2436, '?'

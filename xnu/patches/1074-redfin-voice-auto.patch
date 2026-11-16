@@ -1,0 +1,281 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 2e29096..6b77d43 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -41,6 +41,7 @@
+  * SSCTL 0x2b; Apple-only services (>= 0xe0) and Apple message ids (>= 0x5500) are never forwarded either.
+  * Tunables (RW): kern.sweet_qmux_err (0x5e), _cidfail (0), _reuse (1), _kick (1), _holdnas (1), _holddly (500);
+  * kern.sweet_qmux_dump (write: the per-(svc, msg) table to the log). RD kern.sweet_bb_stats (sweet_bb.c).
++ * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
+  * 1073: kern.sweet_qmi_republish (0 off default, 1 auto once per CommCenter session, write 2 = now), _republish_ms (20).
+  * Log lines "SWEET QMUX:".
+  */
+@@ -55,6 +56,7 @@
+ #include <sys/kauth.h>
+ #include <kern/locks.h>
+ #include <kern/kalloc.h>
++#include <kern/thread_call.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_bb.h"
+@@ -62,6 +64,7 @@
+ extern int SweetABPDeliver(unsigned pipe, uint32_t sess, const void *data, uint32_t len);
+ extern void SweetABPBasebandMessage(uint32_t code);
+ extern int SweetABPPublish(bool on, const char *why);
++extern int sweet_voice_auto(int target, const char *why);      /* sweet_voice.c (1074) */
+ 
+ #define LOG(fmt, ...)           printf("SWEET QMUX: [%6llu] " fmt, (unsigned long long)sbb_ms(), ##__VA_ARGS__)
+ #define NPIPES                  2u
+@@ -2648,6 +2651,102 @@ handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n
+ 	}
+ }
+ 
++/*
++ * ---- 1074: automatic call audio (kern.sweet_voice_auto) ----
++ * research/cc/P3-audio-result.md s.4 B: the modem's VOICE (0x09) All Call Status indication 0x002e (TLV 0x01) and the
++ * Get All Call Info answer 0x002f (TLV 0x10) that go to CommCenter carry every call as 7 bytes: id, state, type,
++ * direction, mode, multiparty, ALS. A call ORIGINATING (1), CONVERSATION (3, also an answered incoming call) or
++ * ALERTING (5) -> sweet_voice.c starts voice in the configured mode (1 earpiece, 2 speaker) if nothing runs; INCOMING
++ * (2, ringing), WAITING, HOLD, SETUP, CC_IN_PROGRESS keep what runs; no call left (all END 9 / DISCONNECTING 8, or none)
++ * -> voice stopped, only if this trigger started it (a kern.sweet_voice set by hand is never touched). sweet_voice.c
++ * sleeps, so it is called from a thread call, never from this (sweetbb) thread. Numbers (TLV 0x10+ of the indication)
++ * are never read or logged. Log: "SWEET VOICE AUTO: call N state S -> start|stop|keep".
++ */
++#define NVCALL  8
++static struct { uint8_t used, id, state; } vcall[NVCALL];
++static thread_call_t vauto_tc;
++static volatile int vauto_req;          /* last asked of sweet_voice.c: 0 stop, 1/2 start */
++
++static const char *
++call_state_name(unsigned s)
++{
++	static const char *nm[] = { "?", "ORIGINATING", "INCOMING", "CONVERSATION", "CC_IN_PROGRESS", "ALERTING", "HOLD", "WAITING",
++		                    "DISCONNECTING", "END", "SETUP" };
++	return s < sizeof(nm) / sizeof(nm[0]) ? nm[s] : "?";
++}
++
++static void
++vauto_call(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	int t = vauto_req;
++	(void)sweet_voice_auto(t, t ? "call up (kern.sweet_voice_auto)" : "no call left (kern.sweet_voice_auto)");
++}
++
++static void
++vauto_ask(int t)
++{
++	vauto_req = t;
++	if (vauto_tc) {
++		thread_call_enter(vauto_tc);
++	}
++}
++
++static void
++vauto_parse(const uint8_t *p, uint32_t n, unsigned id, const char *src)
++{
++	uint32_t l = 0;
++	const uint8_t *v = voice_auto ? tlv_find(p, n, id, &l) : NULL;
++	if (!v || l < 1 || 1u + 7u * v[0] > l) {
++		return;
++	}
++	unsigned nc = v[0];
++	int active = 0, present = 0;
++	for (unsigned i = 0; i < nc; i++) {
++		unsigned st = v[2 + 7 * i];
++		active |= st == 1 || st == 3 || st == 5;
++		present |= st != 8 && st != 9;
++	}
++	int act = active ? voice_auto : !present ? 0 : -1;
++	const char *an = act < 0 ? "keep" : act ? "start" : "stop";
++	/* calls whose state changed */
++	for (unsigned i = 0; i < nc; i++) {
++		unsigned cidn = v[1 + 7 * i], st = v[2 + 7 * i];
++		int k = -1, fr = -1;
++		for (int j = 0; j < NVCALL; j++) {
++			if (vcall[j].used && vcall[j].id == cidn) {
++				k = j;
++			}
++			if (!vcall[j].used && fr < 0) {
++				fr = j;
++			}
++		}
++		if (k >= 0 && vcall[k].state == st) {
++			continue;
++		}
++		if (k < 0) {
++			k = fr >= 0 ? fr : 0;
++		}
++		vcall[k].used = 1;
++		vcall[k].id = (uint8_t)cidn;
++		vcall[k].state = (uint8_t)st;
++		printf("SWEET VOICE AUTO: call %u state %s -> %s (%s, %u call(s))\n", cidn, call_state_name(st), an, src, nc);
++	}
++	/* calls no longer listed */
++	for (int j = 0; j < NVCALL; j++) {
++		int listed = 0;
++		for (unsigned i = 0; i < nc && vcall[j].used; i++) {
++			listed |= v[1 + 7 * i] == vcall[j].id;
++		}
++		if (vcall[j].used && !listed) {
++			printf("SWEET VOICE AUTO: call %u state gone -> %s (%s, %u call(s))\n", vcall[j].id, an, src, nc);
++			vcall[j].used = 0;
++		}
++	}
++	if (act >= 0 && act != vauto_req) {
++		vauto_ask(act);
++	}
++}
++
+ /* ---- from the link (sweetbb thread) ---- */
+ 
+ void
+@@ -2868,6 +2967,13 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 		simid.tries = 0;
+ 		simid.next = sbb_ms() + 2000;
+ 	}
++	if (c->svc == 0x09 && voice_auto) {     /* 1074 */
++		if (d[0] == 0x04 && rmsg == 0x002e) {
++			vauto_parse(d + 7, ml, 0x01, "All Call Status ind");
++		} else if (d[0] == 0x02 && rmsg == 0x002f && res == 0) {
++			vauto_parse(d + 7, ml, 0x10, "Get All Call Info");
++		}
++	}
+ 	uint32_t len = 7 + ml;
+ 	uint8_t *b = B->ans_buf;
+ 	if (6 + len > sizeof(B->ans_buf)) {
+@@ -3089,6 +3195,7 @@ sweet_qmux_start(void)
+ 		printf("SWEET QMUX: no memory for the router (%lu bytes): off\n", (unsigned long)sizeof(*B));
+ 		return;
+ 	}
++	vauto_tc = thread_call_allocate_with_options(vauto_call, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);  /* 1074 */
+ 	PE_parse_boot_argn("sweetqmifilter", &qmi_filter, sizeof(qmi_filter));
+ 	PE_parse_boot_argn("sweetqmirules", &qmi_rules, sizeof(qmi_rules));
+ 	on = true;
+@@ -3185,6 +3292,37 @@ sysctl_repub SYSCTL_HANDLER_ARGS
+ 	printf("SWEET QMUX: kern.sweet_qmi_republish = %d\n", v);
+ 	return 0;
+ }
++static int
++sysctl_vauto SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = voice_auto, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v < 0 || v > 2) {
++		return EINVAL;
++	}
++	printf("SWEET VOICE AUTO: kern.sweet_voice_auto = %d (%s; was %d)\n", v, v == 0 ? "off" : v == 1 ? "earpiece" : "speaker",
++	    voice_auto);
++	voice_auto = v;
++	if (v == 0) {
++		bzero(vcall, sizeof(vcall));
++		if (vauto_req) {
++			vauto_ask(0);   /* stops only a session the trigger started */
++		}
++	} else if (vauto_req) {
++		vauto_ask(v);   /* a call is up: the new route */
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_auto, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_vauto, "I",
++    "redfin 1074: in-call audio follows the modem's call states: 0 off (default), 1 earpiece, 2 speaker");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_republish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_repub, "I",
+     "redfin 1073: 0 off (default), 1 = once per CommCenter session the modem's fresh NAS SysInfo/SigInfo as indications "
+     "kern.sweet_qmi_republish_ms after BSP activation; write 2 = send them now");
+diff --git a/bsd/dev/sweet_voice.c b/bsd/dev/sweet_voice.c
+index ea03880..66539c5 100644
+--- a/bsd/dev/sweet_voice.c
++++ b/bsd/dev/sweet_voice.c
+@@ -29,6 +29,7 @@
+  *   1 no dual control       2 behave as CVD < 2.2 (V2 create; no device channels / commit)
+  *   4 no media formats      8 also MFC output 2 ch (as q6voice for CVP >= 2)      16 topologies TX SM ECNS V2 /
+  *   RX default instead of NONE      32 destroy the CVS too at the end      64 RX media format 1 ch / 16 bits
++ * 1074: kern.sweet_voice_auto (sweet_qmux.c) drives the same switch from the modem's call states (sweet_voice_auto()).
+  * kern.sweet_voice_vsid: the session name's VSID (default 0x11C05000; 0 = "default modem voice").
+  * A failed start is undone and kern.sweet_voice reads 0 again. Never returns to fastboot.
+  *
+@@ -137,6 +138,7 @@ static uint16_t mvm_handle, cvs_handle, cvp_handle;
+ static int cvd_major = -1, cvd_minor;
+ static bool mic_held, port_held, dual_done, attached, started;
+ static bool thread_up;
++static bool auto_owned;                         /* 1074: the running session was started by kern.sweet_voice_auto */
+ static int voice_wake;
+ static uint32_t starts, failures;
+ static uint32_t cvs_vsid;                       /* 1066: the VSID the kept CVS was named after */
+@@ -654,6 +656,7 @@ sysctl_voice(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int
+ 	}
+ 	lck_mtx_unlock(&thread_lock);
+ 	SAY("kern.sweet_voice = %d (%s; was %d)\n", v, v == 0 ? "off" : v == 1 ? "earpiece" : "speaker", voice_target);
++	auto_owned = false;     /* 1074: set by hand: kern.sweet_voice_auto leaves this session alone */
+ 	voice_target = v;
+ 	thread_wakeup(&voice_wake);
+ 	return 0;
+@@ -661,6 +664,61 @@ sysctl_voice(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_voice, "I",
+     "redfin 1065: in-call audio through the ADSP voice services: 0 off (default), 1 earpiece, 2 speaker");
+ 
++/*
++ * 1074: the automatic trigger (kern.sweet_voice_auto in sweet_qmux.c, from the modem's VOICE call states; called on a
++ * thread call). target 1/2: start (or re-route) only if nothing runs or the running session is the trigger's own; a
++ * session set by hand (kern.sweet_voice) is left alone. target 0: stop only a session the trigger started.
++ * The same path as the sysctl: voice_target + the voice thread.
++ */
++int sweet_voice_auto(int target, const char *why);
++int
++sweet_voice_auto(int target, const char *why)
++{
++	bool wake = false;
++
++	if (target < 0 || target > 2) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&thread_lock);
++	if (target != 0) {
++		if (voice_target != 0 && !auto_owned) {
++			lck_mtx_unlock(&thread_lock);
++			SAY("auto: %s, but kern.sweet_voice %d was set by hand: left alone\n", why, voice_target);
++			return 0;
++		}
++		if (!thread_up) {
++			thread_t thread;
++
++			if (kernel_thread_start(voice_thread, NULL, &thread) != KERN_SUCCESS) {
++				lck_mtx_unlock(&thread_lock);
++				SAY("auto: no thread\n");
++				return ENOMEM;
++			}
++			thread_deallocate(thread);
++			thread_up = true;
++			redwood_adsp_apr_events_voice(voice_event);
++		}
++		auto_owned = true;
++		if (voice_target != target) {
++			SAY("auto: %s -> %s (was %d)\n", why, target == 1 ? "earpiece" : "speaker", voice_target);
++			voice_target = target;
++			wake = true;
++		}
++	} else if (auto_owned) {
++		auto_owned = false;
++		if (voice_target != 0) {
++			SAY("auto: %s -> off\n", why);
++			voice_target = 0;
++			wake = true;
++		}
++	}
++	lck_mtx_unlock(&thread_lock);
++	if (wake) {
++		thread_wakeup(&voice_wake);
++	}
++	return 0;
++}
++
+ static int
+ sysctl_voice_number(__unused struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+ {

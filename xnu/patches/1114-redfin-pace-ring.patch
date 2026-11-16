@@ -1,0 +1,682 @@
+From 0a72950a52f37525dc7574e323fe7429a2407647 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 15:55:48 +0100
+Subject: [PATCH] 1114 redfin: pacing trace ring + tick classes + thread
+ run/wait + touch state (kern.sweet_pace_trace & 4, default 0)
+
+k4-1115: 32% of home-page frames at 3+ vsyncs, but about half of them are single frames of the ~89 ms idle
+cadence (CA turns vsync notifications on for ~40 ms outside any touch, one frame, GPU < 1 ms, 8 vsyncs; the
+whole idle phase is this), and 1113 cannot place a slow frame in time or say why CA did not swap earlier
+(16 lines per 5 s, all stamped with the window's end).
+
+kern.sweet_pace_trace bit 4 (with 1 or 2; old bits unchanged):
+- per tick (sendVsync, CA's notifications on): classed at the next tick as swap (a SwapBegin followed), busy
+  (CA polled SwapWait/can_update_, every answer Busy), none (no poll, no swap), ok (polled done, no swap);
+  pend = the newest ended swap not latched at the tick (its completion cannot reach CA then)
+- per frame, in a ring of 2048 (3+ vsync frames; bit 8: every frame), printed only by kern.sweet_pace_dump=1
+  from the sysctl caller (never from the latch/tick path), each line with its latch time: 1113's stages, the
+  tick classes since the previous SwapBegin, tick -> SwapBegin, tick -> the swapping thread's run start, that
+  run's runnable wait, CPU and class, per class (CA display, CA render-server, SpringBoard main thread) run and
+  runnable-wait ms on big / little since the previous SwapBegin (osfmk/kern/sched_prim.c, counted at
+  thread_dispatch), touch down / ms since lift / ms since last event / events in the gap
+- 5 s line SWEET PACE: 5s ticks ...: tick classes, tick -> CA display thread on core p50/p95, touch events and
+  move interval p5/p50/p95/max (SweetHID hook), ring unread / lost, updates missed on the try-lock word
+- with bit 4 the 16-line slow buffer of bit 2 is not filled (the ring has every slow frame)
+No new locks: 1113's try-lock word; a hook that finds it taken drops its update (counted). Off: one load
+per hook and per context switch. kern.sweet_pace_trace is now a handler (0..15); writing a value with 4
+looks up SpringBoard's main thread (again at each dump).
+---
+ bsd/dev/sweet_gpu.c                   |  65 ++++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 339 +++++++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp     |   5 +
+ osfmk/kern/sched_prim.c               | 112 +++++++++
+ 4 files changed, 517 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index db5dff0..f595ec2 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2567,8 +2567,69 @@ extern uint32_t sweet_touch_trace;
+ /* 1113: SweetFramebuffer.cpp, per-frame pacing trace (SWEET PACE lines); 0 off (default), 1 5 s lines, 2 + slow frames */
+ void sweet_pace_trace_submit(int pid, uint32_t gf, uint64_t t0, uint64_t t1);
+ extern uint32_t sweet_pace_trace;
+-SYSCTL_UINT(_kern, OID_AUTO, sweet_pace_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_trace, 0,
+-    "SWEET PACE: per-frame pacing trace, 1 5 s lines, 2 also one line per 3+ vsync frame (1113, default 0)");
++/*
++ * 1114: kern.sweet_pace_trace bits: 1 5 s lines, 2 one line per 3+ vsync frame (16 per 5 s; 1113), 4 tick classes,
++ * thread run/wait, touch state into a ring of frames (3+ vsyncs; 8 = every frame) printed by kern.sweet_pace_dump=1
++ * (SweetFramebuffer.cpp). Writing a value with 4 looks up SpringBoard's main thread for the scheduler accounting
++ * (osfmk/kern/sched_prim.c sweet_pace_sched). Default 0.
++ */
++extern uint32_t sweet_pace_sched;
++extern uint32_t sweet_pace_dump(void);
++extern uint64_t sweet_pace_set_sb(task_t task);
++extern task_t sweet_prof_find_task(const char *name, size_t len, int pid, int *pid_out, char *name_out, size_t name_len);
++
++static void
++sweet_pace_sb_refresh(void)
++{
++	int pid = -1;
++	char nm[32] = "";
++	task_t t = sweet_prof_find_task("SpringBoard", 11, -1, &pid, nm, sizeof(nm));
++	uint64_t tid = sweet_pace_set_sb(t);
++	printf("SWEET PACE: SpringBoard pid %d main thread %llu (1114 scheduler accounting)\n", t != TASK_NULL ? pid : -1, tid);
++}
++
++static int
++sysctl_sweet_pace_trace SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)sweet_pace_trace, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 15) {
++		return EINVAL;
++	}
++	if (value & 4) {
++		sweet_pace_sb_refresh();
++	}
++	sweet_pace_sched = (value & 4) ? 1 : 0;
++	sweet_pace_trace = (uint32_t)value;
++	printf("SWEET PACE: trace %d (1113: 1 5 s lines, 2 slow lines; 1114: 4 ring + tick classes + threads + touch, "
++	    "8 ring keeps every frame; kern.sweet_pace_dump=1 prints the ring)\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_trace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_pace_trace, "I",
++    "SWEET PACE: 1 5 s lines, 2 slow lines (1113); 4 frame ring + ticks/threads/touch, 8 every frame (1114); default 0");
++
++static int
++sysctl_sweet_pace_dump SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, 0, sizeof(value), &value, &changed);
++	if (error || !changed || value <= 0) {
++		return error;
++	}
++	if (sweet_pace_trace & 4) {
++		uint32_t n = sweet_pace_dump();
++		sweet_pace_sb_refresh();        /* SpringBoard may have restarted */
++		printf("SWEET PACE: dump done, %u frames\n", n);
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_pace_dump, "I",
++    "SWEET PACE: write 1 = print the frame ring since the last dump (1114; needs kern.sweet_pace_trace & 4)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
+     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cfffee9..b5b1475 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -477,6 +477,8 @@ static void sweet_pt_flip(uint32_t id, uint64_t now);
+ static void sweet_pt_latch(uint32_t id, uint64_t now, uint64_t per);
+ static void sweet_pt_line(void);
+ extern "C" uint32_t sweet_pace_trace;
++static void sweet_pt_tick(uint64_t now, bool on);       /* 1114 */
++static void sweet_pt_wait(IOReturn ret);
+ 
+ static AppleCLCD *sweet_fb_instance;    /* 0943: for the poke commands (p fc, p hz) */
+ static volatile bool sweet_scan_auto_armed;     /* 1046: sweetscanout=2 (default): direct on at the first slot swap */
+@@ -1483,6 +1485,9 @@ AppleCLCD::sendVsync(uint64_t count, uint64_t now)
+ 	fPaceSwapped = false;
+ 	fPaceLastAbs = now;     /* 0983 */
+ 	sweet_tt_tick(now);     /* 1107: vsync -> submit / SwapEnd */
++	if (__improbable(sweet_pace_trace & 4)) {
++		sweet_pt_tick(now, vsyncOn());  /* 1114: what CA did with the previous tick; is the newest swap still pending */
++	}
+ 	sweet_swaptrace('V', (uint32_t)count);  /* 0987 */
+ 	if (SWEET_TRACE_ON()) {        /* 0994 */
+ 		uint32_t on = 0;
+@@ -4160,11 +4165,66 @@ uint32_t sweet_pace_trace = 0;
+ #define SWEET_PT_BINS   256             /* 0.5 ms bins to 128 ms */
+ #define SWEET_PT_ST     8               /* idle, swap->sub, gate, sub->gpudone, gpudone->latch, wait (done->flip), flip->latch, swap->swapend */
+ #define SWEET_PT_SLOW   16
++/*
++ * 1114: kern.sweet_pace_trace & 4 (with 1 or 2; default 0): k4-1115 found a third to a half of the "slow" (3+ vsync)
++ * frames of the home-screen phases to be single frames of ~40 ms CA bursts every ~89 ms outside any touch (GPU < 1 ms,
++ * 8 vsyncs: the idle cadence, all of the idle phase), and the in-motion slow frames to start 1-3 ticks after the
++ * previous latch with nothing ahead. Per frame, kept in a ring (SWEET_PT_RING, 3+ vsync frames; & 8 every frame) and
++ * printed only on demand (kern.sweet_pace_dump=1, from the sysctl's thread, never from the latch or tick path), each
++ * line with its latch time:
++ *   ticks between this frame's SwapBegin and the previous one, each classed at the next tick: swap (a SwapBegin came),
++ *   busy (CA polled SwapWait / can_update_ and every answer was Busy), none (no poll, no swap: nothing to draw or the
++ *   thread did not run), ok (polled, got done, no swap); pend: ticks that found the newest ended swap not latched yet
++ *   (its completion could not have reached CA); off: ticks while CA had the notifications off
++ *   tick -> SwapBegin; tick -> the swapping thread's run start (on-core; "pre" = running since before the tick), that
++ *   run's runnable wait, its CPU and class (1 CA display thread, 2 CA render-server thread)
++ *   cumulative per class (CA display, CA render-server, SpringBoard's main thread) since the previous SwapBegin: on-CPU
++ *   and runnable-waiting ms on big (CPU6/7) / little cores (osfmk/kern/sched_prim.c, counted when a run ends)
++ *   touch: down at SwapBegin, ms since the last lift and the last event, events since the previous SwapBegin
++ * 5 s line "SWEET PACE: 5s ticks ...": the tick classes, display-thread wake (tick -> on core) p50/p95, touch events
++ * and the move interval p5/p50/p95/max (synthetic finger 9 and real), ring fill / lost.
++ * No new locks: the 1113 try-lock word; a hook that finds it taken drops its update (counted: "missed").
++ */
++#define SWEET_PT_RING   2048
++#define SWEET_PT_MIN(a, b)      ((a) < (b) ? (a) : (b))
++struct sweet_pt_x {
++	uint32_t tickBegin, onCore, curWait;            /* us; onCore 0xffffffff = running since before the tick */
++	uint32_t gap[3][4];                             /* us: [display, rs, sb][run big, run little, wait big, wait little] */
++	uint16_t ticks, tBusy, tNone, tOk, tPend, tOff, polls, pollsBusy, events, upAgo, evAgo;
++	uint8_t cpu, cls, down, pendAtTick;
++};
++struct sweet_pt_rec {
++	uint64_t latch;
++	uint32_t id, st[SWEET_PT_ST];
++	uint8_t k, ahead, nsub, pad;
++	struct sweet_pt_x x;
++};
++extern "C" {
++extern volatile uint64_t sweet_pace_tick_abs;  /* osfmk/kern/sched_prim.c (1114) */
++void sweet_pace_cur_thread(uint64_t *epoch, uint64_t *made, uint32_t *cpu, uint32_t *cls);
++void sweet_pace_acc_read(uint64_t out[15]);
++void sweet_pace_wake_read(uint64_t *tick, uint64_t *on, uint32_t *cpu);
++}
+ static struct {
+ 	volatile SInt32 busy;
++	/* 1114: the tick being classed, gap counters since the last SwapBegin, 5 s counters, touch state, ring */
++	uint64_t tAbs;
++	uint32_t tPolls, tDone;
++	bool tBegan, tPend, tOn;
++	uint32_t gTicks, gBusy, gNone, gOk, gPend, gOff, gPolls, gPollsBusy, gEvents;
++	uint64_t accPrev[15];
++	bool accInit;
++	uint32_t xTicks, xSwap, xBusy, xNone, xOk, xPend, xOff, xWakeN, xWakeLittle, xMissed;
++	uint16_t xWake[250];                            /* 0.1 ms bins */
++	uint32_t tDownMask, tEvents, tSynth, tMoves, tGaps;
++	uint64_t tUpAbs, tEvAbs, tPrevAbs;
++	uint16_t tDt[256];                              /* 0.25 ms bins */
++	uint64_t ringW, ringR, ringLost;
++	struct sweet_pt_rec ring[SWEET_PT_RING];
+ 	struct {
+ 		uint32_t id, fence, ahead;
+ 		uint64_t begin, tick, sub0, subD, rel, end, done, flip;
++		struct sweet_pt_x x;    /* 1114 (kern.sweet_pace_trace & 4) */
+ 	} f[8];
+ 	uint64_t pSub0, pSubD, pRel;    /* the swapper's submits since its last SwapEnd */
+ 	uint32_t pSubN;
+@@ -4214,6 +4274,156 @@ sweet_pt_begin(uint32_t id, uint64_t now)
+ 	sweet_pt.f[id & 7].id = id;
+ 	sweet_pt.f[id & 7].begin = now;
+ 	sweet_pt.f[id & 7].tick = sweet_tt.tick;
++	if (sweet_pace_trace & 4) {
++		/* 1114 */
++		auto *x = &sweet_pt.f[id & 7].x;
++		uint64_t t = sweet_pt.tAbs, ep = 0, mr = 0, a[15];
++		uint32_t cpu = 0, cls = 0;
++		sweet_pace_cur_thread(&ep, &mr, &cpu, &cls);
++		x->tickBegin = sweet_pt_us(t, now);
++		x->onCore = t != 0 && ep >= t ? sweet_pt_us(t, ep) : 0xffffffffu;
++		x->curWait = mr != ~0ULL ? sweet_pt_us(mr, ep) : 0;
++		x->cpu = (uint8_t)cpu;
++		x->cls = (uint8_t)cls;
++		x->pendAtTick = sweet_pt.tPend;
++		x->ticks = (uint16_t)SWEET_PT_MIN(sweet_pt.gTicks, 0xffff);
++		x->tBusy = (uint16_t)SWEET_PT_MIN(sweet_pt.gBusy, 0xffff);
++		x->tNone = (uint16_t)SWEET_PT_MIN(sweet_pt.gNone, 0xffff);
++		x->tOk = (uint16_t)SWEET_PT_MIN(sweet_pt.gOk, 0xffff);
++		x->tPend = (uint16_t)SWEET_PT_MIN(sweet_pt.gPend, 0xffff);
++		x->tOff = (uint16_t)SWEET_PT_MIN(sweet_pt.gOff, 0xffff);
++		x->polls = (uint16_t)SWEET_PT_MIN(sweet_pt.gPolls, 0xffff);
++		x->pollsBusy = (uint16_t)SWEET_PT_MIN(sweet_pt.gPollsBusy, 0xffff);
++		x->events = (uint16_t)SWEET_PT_MIN(sweet_pt.gEvents, 0xffff);
++		sweet_pt.gTicks = sweet_pt.gBusy = sweet_pt.gNone = sweet_pt.gOk = sweet_pt.gPend = sweet_pt.gOff = 0;
++		sweet_pt.gPolls = sweet_pt.gPollsBusy = sweet_pt.gEvents = 0;
++		sweet_pt.tBegan = true;
++		sweet_pace_acc_read(a);
++		if (sweet_pt.accInit) {
++			for (int c = 0; c < 3; c++) {
++				for (int j = 0; j < 4; j++) {
++					uint64_t d = a[c * 5 + j] - sweet_pt.accPrev[c * 5 + j];
++					x->gap[c][j] = sweet_pt_us(1, 1 + d);
++				}
++			}
++		}
++		memcpy(sweet_pt.accPrev, a, sizeof(a));
++		sweet_pt.accInit = true;
++		uint32_t ms;
++		x->down = sweet_pt.tDownMask != 0;
++		ms = sweet_pt_us(sweet_pt.tUpAbs, now) / 1000;
++		x->upAgo = sweet_pt.tUpAbs == 0 ? 0xffff : (uint16_t)SWEET_PT_MIN(ms, 0xfffe);
++		ms = sweet_pt_us(sweet_pt.tEvAbs, now) / 1000;
++		x->evAgo = sweet_pt.tEvAbs == 0 ? 0xffff : (uint16_t)SWEET_PT_MIN(ms, 0xfffe);
++	}
++	sweet_pt_give();
++}
++
++/*
++ * 1114: a vsync notification round (sendVsync, fLock held; on = CA has them on): class the previous tick by what CA did
++ * after it, and note whether the newest ended swap is still pending (not latched: a SwapWait poll on its predecessor
++ * would answer Busy with tribuf 2, i.e. its completion cannot reach CA at this tick).
++ */
++static void
++sweet_pt_tick(uint64_t now, bool on)
++{
++	sweet_pace_tick_abs = now;      /* osfmk: the first CA display-thread run after it */
++	if (!sweet_pt_take()) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_pt.xMissed);
++		return;
++	}
++	if (sweet_pt.tAbs != 0) {
++		if (!sweet_pt.tOn) {
++			sweet_pt.xOff++;
++		} else if (sweet_pt.tBegan) {
++			sweet_pt.xSwap++;
++		} else if (sweet_pt.tPolls == 0) {
++			sweet_pt.gNone++;
++			sweet_pt.xNone++;
++		} else if (sweet_pt.tDone == 0) {
++			sweet_pt.gBusy++;
++			sweet_pt.xBusy++;
++		} else {
++			sweet_pt.gOk++;
++			sweet_pt.xOk++;
++		}
++		uint64_t wt = 0, won = 0;
++		uint32_t wc = 0;
++		sweet_pace_wake_read(&wt, &won, &wc);
++		if (sweet_pt.tOn && wt == sweet_pt.tAbs && won >= wt) {
++			uint32_t b = sweet_pt_us(wt, won + 1) / 100;
++			b = b < 250 ? b : 249;
++			if (sweet_pt.xWake[b] != 0xffff) {
++				sweet_pt.xWake[b]++;
++			}
++			sweet_pt.xWakeN++;
++			sweet_pt.xWakeLittle += wc < 6;
++		}
++	}
++	sweet_pt.tAbs = now;
++	sweet_pt.tPolls = sweet_pt.tDone = 0;
++	sweet_pt.tBegan = false;
++	sweet_pt.tOn = on;
++	sweet_pt.tPend = sweet_scan.on && sweet_scan.lastSwap != 0 && sweet_scan.shownSwap != sweet_scan.lastSwap;
++	if (on) {
++		sweet_pt.gTicks++;
++		sweet_pt.gPend += sweet_pt.tPend;
++		sweet_pt.xTicks++;
++		sweet_pt.xPend += sweet_pt.tPend;
++	} else {
++		sweet_pt.gOff++;
++	}
++	sweet_pt_give();
++}
++
++/* 1114: SwapWait (CA's can_update_ poll, or a wait): its answer */
++static void
++sweet_pt_wait(IOReturn ret)
++{
++	if (!sweet_pt_take()) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_pt.xMissed);
++		return;
++	}
++	sweet_pt.tPolls++;
++	sweet_pt.gPolls++;
++	if (ret == kIOReturnSuccess) {
++		sweet_pt.tDone++;
++	} else {
++		sweet_pt.gPollsBusy++;
++	}
++	sweet_pt_give();
++}
++
++/* 1114: iokit/Kernel/arm/hid/SweetHID.cpp, every touch event that goes out (finger 9 = the command server's swipes) */
++extern "C" void sweet_pace_trace_touch(int finger, bool down, bool was, uint64_t now);
++void
++sweet_pace_trace_touch(int finger, bool down, bool was, uint64_t now)
++{
++	if (!(sweet_pace_trace & 4) || !sweet_pt_take()) {
++		return;
++	}
++	uint32_t bit = 1u << (finger & 31);
++	sweet_pt.tEvents++;
++	sweet_pt.gEvents++;
++	sweet_pt.tSynth += finger == 9;
++	sweet_pt.tEvAbs = now;
++	if (down && was && sweet_pt.tPrevAbs != 0 && now > sweet_pt.tPrevAbs) {
++		uint32_t us = sweet_pt_us(sweet_pt.tPrevAbs, now), b = us / 250;
++		b = b < 256 ? b : 255;
++		if (sweet_pt.tDt[b] != 0xffff) {
++			sweet_pt.tDt[b]++;
++		}
++		sweet_pt.tMoves++;
++		sweet_pt.tGaps += us > 20000;
++	}
++	if (down) {
++		sweet_pt.tDownMask |= bit;
++		sweet_pt.tPrevAbs = now;
++	} else {
++		sweet_pt.tDownMask &= ~bit;
++		sweet_pt.tUpAbs = now;
++		sweet_pt.tPrevAbs = 0;
++	}
+ 	sweet_pt_give();
+ }
+ 
+@@ -4365,7 +4575,7 @@ sweet_pt_latch(uint32_t id, uint64_t now, uint64_t per)
+ 		sweet_pt.cAhead += (f->ahead & 0xff) >= 2;
+ 		sweet_pt.cWait += st[5] > perUs;
+ 		sweet_pt.cGate += st[2] > 1000;
+-		if (sweet_pace_trace >= 2) {
++		if ((sweet_pace_trace & 2) && !(sweet_pace_trace & 4)) {       /* 1114: with 4 the ring has them, uncapped */
+ 			if (sweet_pt.slowN < SWEET_PT_SLOW) {
+ 				auto *r = &sweet_pt.slow[sweet_pt.slowN++];
+ 				r->id = id;
+@@ -4380,11 +4590,108 @@ sweet_pt_latch(uint32_t id, uint64_t now, uint64_t per)
+ 			}
+ 		}
+ 	}
++	if ((sweet_pace_trace & 4) && (k >= 3 || (sweet_pace_trace & 8))) {
++		/* 1114: into the ring (overwrites the oldest; the dump counts what it never printed) */
++		auto *r = &sweet_pt.ring[sweet_pt.ringW % SWEET_PT_RING];
++		r->latch = now;
++		r->id = id;
++		memcpy(r->st, st, sizeof(st));
++		r->k = (uint8_t)SWEET_PT_MIN(k, 255u);
++		r->ahead = (uint8_t)(f->ahead & 0xff);
++		r->nsub = (uint8_t)SWEET_PT_MIN(f->ahead >> 8, 255u);
++		r->x = f->x;
++		sweet_pt.ringW++;
++	}
+ 	sweet_pt.prevGpu = st[3];
+ 	bzero(f, sizeof(*f));
+ 	sweet_pt_give();
+ }
+ 
++/* 1114: p-th percentile of a histogram (bin index; n = total) */
++static uint32_t
++sweet_pt_pct(const uint16_t *h, uint32_t bins, uint32_t n, uint32_t pct)
++{
++	uint32_t want = (n * pct + 99) / 100, acc = 0;
++	for (uint32_t i = 0; n != 0 && i < bins; i++) {
++		acc += h[i];
++		if (acc >= want) {
++			return i;
++		}
++	}
++	return 0;
++}
++
++/*
++ * 1114: kern.sweet_pace_dump=1 (bsd/dev/sweet_gpu.c, the sysctl caller's thread): print the ring since the last dump,
++ * one "SWEET PACE: f" line per frame with its latch time. The records are copied out under the try-lock (hooks that
++ * find it taken meanwhile drop their update), printed after. Returns the number printed.
++ */
++extern "C" uint32_t sweet_pace_dump(void);
++uint32_t
++sweet_pace_dump(void)
++{
++	struct sweet_pt_rec *b = (struct sweet_pt_rec *)IOMallocData(sizeof(struct sweet_pt_rec) * SWEET_PT_RING);
++	if (b == NULL) {
++		return 0;
++	}
++	int tries = 0;
++	while (!sweet_pt_take()) {
++		if (++tries > 200) {
++			IOFreeData(b, sizeof(struct sweet_pt_rec) * SWEET_PT_RING);
++			IOLog("SWEET PACE: dump: trace word busy\n");
++			return 0;
++		}
++		IOSleep(1);
++	}
++	uint64_t w = sweet_pt.ringW, r = sweet_pt.ringR, lost = 0;
++	if (w - r > SWEET_PT_RING) {
++		lost = w - r - SWEET_PT_RING;
++		r = w - SWEET_PT_RING;
++	}
++	uint32_t n = (uint32_t)(w - r);
++	for (uint32_t i = 0; i < n; i++) {
++		b[i] = sweet_pt.ring[(r + i) % SWEET_PT_RING];
++	}
++	sweet_pt.ringR = w;
++	sweet_pt.ringLost += lost;
++	uint32_t missed = sweet_pt.xMissed;
++	sweet_pt_give();
++	IOLog("SWEET PACE: dump n %u lost %llu (trace %#x; ms; tick classes: swap/busy = CA polled SwapWait, all Busy/none = no "
++	    "poll, no swap/ok = polled done, no swap; pend = newest swap not latched at the tick; run/wait = big/little ms; "
++	    "missed updates %u)\n", n, lost, sweet_pace_trace, missed);
++#define PX(a) (a) / 1000, (a) % 1000 / 100
++	for (uint32_t i = 0; i < n; i++) {
++		auto *e = &b[i];
++		auto *x = &e->x;
++		uint64_t ns;
++		absolutetime_to_nanoseconds(e->latch, &ns);
++		char oc[16];
++		if (x->onCore == 0xffffffffu) {
++			strlcpy(oc, "pre", sizeof(oc));
++		} else {
++			snprintf(oc, sizeof(oc), "%u.%u", PX(x->onCore));
++		}
++		IOLog("SWEET PACE: f %llu.%03llu id %u v %u | idle %u.%u sub %u.%u gate %u.%u gpu %u.%u done->latch %u.%u "
++		    "(wait %u.%u flip->latch %u.%u) | ticks %u swap-gap busy %u none %u ok %u pend %u off %u polls %u/%u busy | "
++		    "tick->begin %u.%u on-core %s wait %u.%u cpu %u cls %u pend-at-tick %u | disp run %u.%u/%u.%u wait %u.%u/%u.%u "
++		    "| rs run %u.%u/%u.%u wait %u.%u/%u.%u | sb run %u.%u/%u.%u wait %u.%u/%u.%u | touch down %u up %u ev %u n %u "
++		    "| ahead %u subs %u\n",
++		    ns / 1000000000ULL, ns / 1000000ULL % 1000, e->id, e->k, PX(e->st[0]), PX(e->st[1]), PX(e->st[2]),
++		    PX(e->st[3]), PX(e->st[4]), PX(e->st[5]), PX(e->st[6]), x->ticks, x->tBusy, x->tNone, x->tOk, x->tPend,
++		    x->tOff, x->polls, x->pollsBusy, PX(x->tickBegin), oc, PX(x->curWait), x->cpu, x->cls, x->pendAtTick,
++		    PX(x->gap[0][0]), PX(x->gap[0][1]), PX(x->gap[0][2]), PX(x->gap[0][3]),
++		    PX(x->gap[1][0]), PX(x->gap[1][1]), PX(x->gap[1][2]), PX(x->gap[1][3]),
++		    PX(x->gap[2][0]), PX(x->gap[2][1]), PX(x->gap[2][2]), PX(x->gap[2][3]),
++		    x->down, x->upAgo, x->evAgo, x->events, e->ahead, e->nsub);
++		if ((i & 31) == 31) {
++			IOSleep(2);
++		}
++	}
++#undef PX
++	IOFreeData(b, sizeof(struct sweet_pt_rec) * SWEET_PT_RING);
++	return n;
++}
++
+ static uint32_t
+ sweet_pt_p95(const uint16_t *h, uint32_t n)
+ {
+@@ -4405,7 +4712,7 @@ sweet_pt_line(void)
+ 	if (sweet_pace_trace == 0 || !sweet_pt_take()) {
+ 		return;
+ 	}
+-	if (sweet_pt.n == 0 && sweet_pt.unmatched == 0) {
++	if (sweet_pt.n == 0 && sweet_pt.unmatched == 0 && (!(sweet_pace_trace & 4) || sweet_pt.xTicks == 0)) {
+ 		sweet_pt_give();
+ 		return;
+ 	}
+@@ -4442,6 +4749,31 @@ sweet_pt_line(void)
+ 	}
+ #undef PT2
+ #undef PT1
++	if (sweet_pace_trace & 4) {
++		/* 1114 */
++		uint32_t wn = sweet_pt.xWakeN, mv = sweet_pt.tMoves;
++		uint32_t w50 = sweet_pt_pct(sweet_pt.xWake, 250, wn, 50), w95 = sweet_pt_pct(sweet_pt.xWake, 250, wn, 95);
++		uint32_t d[4] = { sweet_pt_pct(sweet_pt.tDt, 256, mv, 5), sweet_pt_pct(sweet_pt.tDt, 256, mv, 50),
++			          sweet_pt_pct(sweet_pt.tDt, 256, mv, 95), 0 };
++		for (int i = 255; mv != 0 && i >= 0; i--) {
++			if (sweet_pt.tDt[i] != 0) {
++				d[3] = (uint32_t)i;
++				break;
++			}
++		}
++		IOLog("SWEET PACE: 5s ticks %u (CA on) swap %u busy %u none %u ok %u off %u | newest swap pending at tick %u | "
++		    "tick->CA display thread on core n %u p50/p95 %u.%u/%u.%u ms (on little %u) | touch events %u (synthetic %u) "
++		    "moves %u dt p5/p50/p95/max %u.%02u/%u.%02u/%u.%02u/%u.%02u ms gaps>20ms %u | ring %llu unread, lost %llu | "
++		    "missed %u\n", sweet_pt.xTicks, sweet_pt.xSwap, sweet_pt.xBusy, sweet_pt.xNone, sweet_pt.xOk, sweet_pt.xOff,
++		    sweet_pt.xPend, wn, w50 / 10, w50 % 10, w95 / 10, w95 % 10, sweet_pt.xWakeLittle, sweet_pt.tEvents,
++		    sweet_pt.tSynth, mv, d[0] / 4, d[0] % 4 * 25, d[1] / 4, d[1] % 4 * 25, d[2] / 4, d[2] % 4 * 25,
++		    d[3] / 4, d[3] % 4 * 25, sweet_pt.tGaps, sweet_pt.ringW - sweet_pt.ringR, sweet_pt.ringLost, sweet_pt.xMissed);
++		sweet_pt.xTicks = sweet_pt.xSwap = sweet_pt.xBusy = sweet_pt.xNone = sweet_pt.xOk = sweet_pt.xPend = 0;
++		sweet_pt.xOff = sweet_pt.xWakeN = sweet_pt.xWakeLittle = 0;
++		bzero(sweet_pt.xWake, sizeof(sweet_pt.xWake));
++		sweet_pt.tEvents = sweet_pt.tSynth = sweet_pt.tMoves = sweet_pt.tGaps = 0;
++		bzero(sweet_pt.tDt, sizeof(sweet_pt.tDt));
++	}
+ 	uint64_t ll = sweet_pt.lastLatch, pg = sweet_pt.prevGpu;
+ 	sweet_pt.n = sweet_pt.pauses = sweet_pt.unmatched = sweet_pt.doneAtEnd = sweet_pt.subBeforeBegin = sweet_pt.noBegin = 0;
+ 	bzero(sweet_pt.per, sizeof(sweet_pt.per));
+@@ -6178,6 +6510,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			ret = fFB->erPoll((uint32_t)args->scalarInput[0]);      /* 1035 */
+ 		}
+ 		sweet_swaptrace('w', args->scalarInputCount >= 1 ? (uint32_t)args->scalarInput[0] : 0);  /* 0987 */
++		if (__improbable(sweet_pace_trace & 4)) {
++			sweet_pt_wait(ret);     /* 1114: CA's can_update_ poll and its answer */
++		}
+ 		break;
+ 	default:
+ 		break;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 060fd9b..1bca680 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -566,6 +566,8 @@ sweetTouchStat(IOLock *lock, const bool *fingersDown, int finger, bool was, bool
+ 
+ extern "C" void sweet_cpufreq_boost(int why);     /* 0970: bsd/dev/sweet_cpufreq.c */
+ extern "C" void sweet_touch_trace_event(uint64_t irq, uint64_t hid);     /* 1107 */
++extern "C" uint32_t sweet_pace_trace;                                   /* 1114: SweetFramebuffer.cpp */
++extern "C" void sweet_pace_trace_touch(int finger, bool down, bool was, uint64_t now);
+ /* 1044: the newest two touch event times (IRQ time with sectouchx 0x1), for SweetFramebuffer's touch -> latch */
+ extern "C" volatile uint64_t sweet_hid_touch_abs[2];
+ volatile uint64_t sweet_hid_touch_abs[2];
+@@ -688,6 +690,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y, uint64_t stamp)
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, cmask);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
++	if (__improbable(sweet_pace_trace & 4)) {
++		sweet_pace_trace_touch(finger, down, was, now);         /* 1114: touch state / move intervals for SWEET PACE */
++	}
+ 
+ 	if (was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8d7f5a3..f905d49 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -3565,6 +3565,13 @@ thread_dispatch(
+ 			}
+ 
+ #if defined(__arm64__)
++			{
++				extern uint32_t sweet_pace_sched;
++				extern void sweet_pace_account(thread_t thread, processor_t processor);
++				if (__improbable(sweet_pace_sched != 0)) {
++					sweet_pace_account(thread, processor);  /* 1114 */
++				}
++			}
+ 			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
+ 				extern void sweet_ui_account(thread_t thread, processor_t processor);
+ 				sweet_ui_account(thread, processor);    /* 1041 */
+@@ -5099,6 +5106,111 @@ sweet_ui_account(thread_t thread, processor_t processor)
+ 	os_atomic_add(&sweet_ui_abs3[c][processor->cpu_id == 6 ? 0 : (processor->cpu_id == 7 ? 1 : 2)], ran, relaxed);   /* 1106 */
+ }
+ 
++/*
++ * redfin 1114: kern.sweet_pace_trace & 4 sets sweet_pace_sched (bsd/dev/sweet_gpu.c): per class (0 CA display threads,
++ * 1 CA render-server threads, 2 SpringBoard's main thread, found by kern.sweet_pace_trace / kern.sweet_pace_dump writes)
++ * cumulative on-CPU and runnable-but-not-running time on big (CPU6/7) and little cores, counted when a run ends
++ * (thread_dispatch: run = last_dispatch - computation_epoch, wait = computation_epoch - last_made_runnable_time), and
++ * the first CA display-thread run that starts after each vsync tick (SweetFramebuffer.cpp writes the tick). Read by
++ * SweetFramebuffer.cpp's SWEET PACE lines. Off: one load per context switch.
++ */
++uint32_t sweet_pace_sched;
++thread_t sweet_pace_sb_thread;
++volatile uint64_t sweet_pace_tick_abs;
++static uint64_t sweet_pace_acc[3][5];           /* run big, run little, wait big, wait little, runs */
++static volatile uint64_t sweet_pace_wake_tick, sweet_pace_wake_on;
++static volatile uint32_t sweet_pace_wake_cpu;
++
++void sweet_pace_account(thread_t thread, processor_t processor);
++void
++sweet_pace_account(thread_t thread, processor_t processor)
++{
++	int c;
++	if (thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) {
++		c = 0;
++	} else if (thread->sched_flags & TH_SFLAG_SWEET_UI_RS) {
++		c = 1;
++	} else if (thread == sweet_pace_sb_thread) {
++		c = 2;
++	} else {
++		return;
++	}
++	uint64_t ep = thread->computation_epoch, end = processor->last_dispatch, mr = thread->last_made_runnable_time;
++	int l = processor->cpu_id >= 6 ? 0 : 1;
++	os_atomic_add(&sweet_pace_acc[c][l], end > ep ? end - ep : 0, relaxed);
++	if (mr != THREAD_NOT_RUNNABLE && mr != 0 && ep > mr) {
++		os_atomic_add(&sweet_pace_acc[c][2 + l], ep - mr, relaxed);
++	}
++	os_atomic_inc(&sweet_pace_acc[c][4], relaxed);
++	if (c == 0) {
++		uint64_t tk = sweet_pace_tick_abs;
++		if (tk != 0 && ep >= tk && sweet_pace_wake_tick != tk) {
++			sweet_pace_wake_on = ep;
++			sweet_pace_wake_cpu = processor->cpu_id;
++			sweet_pace_wake_tick = tk;
++		}
++	}
++}
++
++/* the current thread: its run's start, when it was made runnable, its CPU, its class (1 CA display, 2 render-server) */
++void sweet_pace_cur_thread(uint64_t *epoch, uint64_t *made, uint32_t *cpu, uint32_t *cls);
++void
++sweet_pace_cur_thread(uint64_t *epoch, uint64_t *made, uint32_t *cpu, uint32_t *cls)
++{
++	thread_t th = current_thread();
++	*epoch = th->computation_epoch;
++	*made = th->last_made_runnable_time;
++	*cpu = (uint32_t)cpu_number();
++	*cls = (th->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : ((th->sched_flags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
++}
++
++void sweet_pace_acc_read(uint64_t out[15]);
++void
++sweet_pace_acc_read(uint64_t out[15])
++{
++	for (int c = 0; c < 3; c++) {
++		for (int j = 0; j < 5; j++) {
++			out[c * 5 + j] = os_atomic_load(&sweet_pace_acc[c][j], relaxed);
++		}
++	}
++}
++
++void sweet_pace_wake_read(uint64_t *tick, uint64_t *on, uint32_t *cpu);
++void
++sweet_pace_wake_read(uint64_t *tick, uint64_t *on, uint32_t *cpu)
++{
++	*on = sweet_pace_wake_on;
++	*cpu = sweet_pace_wake_cpu;
++	*tick = sweet_pace_wake_tick;
++}
++
++/* SpringBoard's main thread (the task's first thread); consumes the task reference; returns its tid (0 = none) */
++uint64_t sweet_pace_set_sb(task_t task);
++uint64_t
++sweet_pace_set_sb(task_t task)
++{
++	thread_t th = THREAD_NULL, t, old;
++	uint64_t tid = 0;
++	if (task != TASK_NULL) {
++		task_lock(task);
++		queue_iterate(&task->threads, t, thread_t, task_threads) {
++			th = t;
++			break;
++		}
++		if (th != THREAD_NULL) {
++			thread_reference(th);
++			tid = thread_tid(th);
++		}
++		task_unlock(task);
++		task_deallocate(task);
++	}
++	old = os_atomic_xchg(&sweet_pace_sb_thread, th, relaxed);
++	if (old != THREAD_NULL) {
++		thread_deallocate(old);
++	}
++	return tid;
++}
++
+ void sweet_ui_bigcore_log(void);
+ void
+ sweet_ui_bigcore_log(void)
+-- 
+2.53.0
+

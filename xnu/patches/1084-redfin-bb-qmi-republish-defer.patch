@@ -1,0 +1,318 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index f71be70..cf65744 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -42,6 +42,7 @@
+  * Tunables (RW): kern.sweet_qmux_err (0x5e), _cidfail (0), _reuse (1), _kick (1), _holdnas (1), _holddly (500);
+  * kern.sweet_qmux_dump (write: the per-(svc, msg) table to the log). RD kern.sweet_bb_stats (sweet_bb.c).
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
++ * 1084: kern.sweet_qmi_republish 3 = BSP activation deferred until the modem has service (_wait_s 45), then the shot.
+  * 1082: re-publish clients = NAS 0x0003 TLV 0x18/0x19 (not 0x12/0x13), fallbacks, choice logged; manual line timing fixed.
+  * 1073: kern.sweet_qmi_republish (0 off default, 1 auto once per CommCenter session, write 2 = now), _republish_ms (20).
+  * Log lines "SWEET QMUX:".
+@@ -83,6 +84,8 @@ static const char *pipe_name[NPIPES] = { "qmux1", "qmux2" };
+ static int qmi_filter = 1, qmi_rules = 0, err_code = QMI_ERR_NOT_SUPPORTED, cidfail = 0, reuse = 1, kickon = 1;
+ static int holdnas = 1, holddly = 500, policy_file = 1;
+ static int repub_mode = 0, repub_ms = 20;       /* 1073: kern.sweet_qmi_republish (0 off), kern.sweet_qmi_republish_ms */
++static int repub_wait_s = 45;                   /* 1084: kern.sweet_qmi_republish_wait_s (mode 3: longest activation deferral) */
++static int act_waiting;                         /* 1084: a BSP activation indication is being deferred */
+ static volatile int repub_now;                  /* 1073: kern.sweet_qmi_republish=2 written (manual shot) */
+ static int voice_auto = 0;                      /* 1074: kern.sweet_voice_auto: 0 off, 1 earpiece, 2 speaker on a call */
+ static bool on;
+@@ -141,6 +144,7 @@ struct pend {
+ 	uint8_t simread;
+ 	uint16_t file;
+ 	uint8_t repub;                  /* 1073: a re-publish GET (1 auto, 2 manual): answer -> indication, past the NAS hold */
++	uint8_t probe;                  /* 1084: the router's own SysInfo poll while the activation waits: answer read, not sent */
+ };
+ 
+ #define NSESS   32
+@@ -1475,6 +1479,18 @@ hold_frame(uint32_t pipe, uint32_t sess, const uint8_t *f, uint32_t n)
+ 	if (hold_bypass || !holdnas || n < 13 || n > HOLD_MAXF || f[4] != 0x03 || f[6] != 0x04 || hold_gate_open()) {
+ 		return 0;
+ 	}
++	if (act_waiting) {      /* 1084: while the activation waits (up to 45 s) keep only the newest of each indication */
++		uint16_t m = (uint16_t)(f[9] | (f[10] << 8));
++		for (int i = 0; i < nhold; i++) {
++			struct hold *o = &B->holdq[i];
++			if (o->pipe == pipe && o->sess == sess && o->cid == f[5] && o->msg == m) {
++				o->n = n;
++				memcpy(o->f, f, n);
++				held_cnt++;
++				return 1;
++			}
++		}
++	}
+ 	if (nhold == NHOLD) {
+ 		hold_release(1, "queue full");
+ 	}
+@@ -1509,6 +1525,9 @@ hold_poll(uint64_t now)
+ 		hold_release(nhold, "gate open");
+ 		return;
+ 	}
++	if (act_waiting) {
++		return;         /* 1084: no hold timeout while the activation is deferred (the gate opens when it goes) */
++	}
+ 	if (now - B->holdq[0].t >= to + (gate_set ? (uint64_t)holddly : 0)) {
+ 		held_rel_to++;
+ 		hold_open(B->holdq[0].pipe, B->holdq[0].sess, 0, "timeout, no BSP activation");
+@@ -1876,6 +1895,7 @@ svc_local(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, int fail,
+ }
+ 
+ static void repub_arm(uint32_t pipe, uint32_t sess);
++static int act_defer(uint32_t pipe, uint32_t sess, unsigned cid, const uint8_t *tl, uint32_t tn);
+ 
+ static void
+ send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg, const uint8_t *tl, uint32_t tn)
+@@ -1885,6 +1905,9 @@ send_ind(uint32_t pipe, uint32_t sess, unsigned svc, unsigned cid, unsigned msg,
+ 	if (13 + tn > sizeof(B->ind_buf)) {
+ 		return;
+ 	}
++	if (svc == 0xe2 && msg == 0xb00c && act_defer(pipe, sess, cid, tl, tn)) {
++		return;         /* 1084 */
++	}
+ 	b[6] = 0x04;
+ 	b[7] = (uint8_t)itx;
+ 	b[8] = (uint8_t)(itx >> 8);
+@@ -2533,7 +2556,7 @@ repub_send(int kind, int fallback)
+ static void
+ repub_arm(uint32_t pipe, uint32_t sess)
+ {
+-	if (repub_mode != 1 || (rp_done && rp_done_pipe == pipe && rp_done_sess == sess) ||
++	if ((repub_mode != 1 && repub_mode != 3) || (rp_done && rp_done_pipe == pipe && rp_done_sess == sess) ||
+ 	    (rp_armed && rp_pipe == pipe && rp_sess == sess)) {
+ 		return;
+ 	}
+@@ -2557,7 +2580,7 @@ repub_poll(uint64_t now)
+ 	if (!rp_armed || now < rp_at) {
+ 		return;
+ 	}
+-	if (repub_mode != 1 || !sess_live(rp_pipe, rp_sess)) {
++	if ((repub_mode != 1 && repub_mode != 3) || !sess_live(rp_pipe, rp_sess)) {
+ 		rp_armed = 0;
+ 		return;
+ 	}
+@@ -2578,6 +2601,166 @@ repub_poll(uint64_t now)
+ 	}
+ }
+ 
++/*
++ * ---- 1084: kern.sweet_qmi_republish = 3: BSP activation deferred until the modem has service ----
++ * Cold boot (phone, ws-n-bb-int4): the SIM PIN is entered late, the activation indication goes out as soon as the SIM
++ * identity is known, the modem is still searching (SysInfo: LTE srv none) and the one re-publish shot carries no service,
++ * so the bar stays SOS. Mode 3 holds the 0xb00c indication (content as built, SIM identity in kernel memory only) until the
++ * router sees usable service from the modem, then delivers it, which opens the NAS hold and arms the +republish_ms shot.
++ * Safety (research/cc/P2-bsp-result.md C, run base2: no activation indication at all for 90 s -> CommCenter keeps running,
++ * 1 reset, 0 crashes; and today's SIM-identity defer already holds the activation for as long as the PIN takes, 139 s on
++ * the cold boot above, without resets): CommCenter only stays kUnavailable (no carrier-bundle push, no publish) meanwhile.
++ * "Usable" = the newest modem SysInfo (0x004d answers, 0x004e indications, our polls) has srv_status 2 (service) on any
++ * RAT TLV (0x10-0x15, NR5G 0x4a), or a Serving System (0x0024) says registered. Poll: GET 0x004d every 2 s on a router
++ * NAS port. kern.sweet_qmi_republish_wait_s (45): then the activation goes anyway. The timer starts when the indication is
++ * first deferred, i.e. once the SIM identity is known (PIN entered). While deferred, NAS indications stay held (no
++ * timeout, newest per message kept).
++ */
++static struct { int set; uint32_t pipe, sess; uint8_t cid; uint32_t tn; uint8_t tl[512]; } actq;
++static int act_bypass, act_rel_set, srv_state = -1, srv_usable;
++static uint32_t act_rel_pipe, act_rel_sess;
++static uint64_t act_since, act_next_probe;
++static unsigned act_probes;
++
++static const char *
++srv_name(int s)
++{
++	return s == 2 ? "full" : s == 1 ? "limited" : s == 0 ? "none" : "unknown";
++}
++
++/* the modem's SysInfo TLVs (answer or indication, result TLV allowed) */
++static void
++nas_srv_note(const uint8_t *p, uint32_t n)
++{
++	static const uint8_t ids[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x4a };
++	int best = -1;
++	for (unsigned i = 0; i < sizeof(ids); i++) {
++		uint32_t l = 0;
++		const uint8_t *v = tlv_find(p, n, ids[i], &l);
++		if (v && l >= 1) {
++			int s = v[0] == 2 ? 2 : (v[0] == 1 || v[0] == 3) ? 1 : 0;
++			best = s > best ? s : best;
++		}
++	}
++	if (best >= 0) {
++		srv_state = best;
++		srv_usable = best == 2;
++	}
++}
++
++/* Serving System (0x0024 answer / indication) TLV 0x01: registration state 1 = registered */
++static void
++nas_ss_note(const uint8_t *p, uint32_t n)
++{
++	uint32_t l = 0;
++	const uint8_t *v = tlv_find(p, n, 0x01, &l);
++	if (v && l >= 1 && v[0] == 1) {
++		srv_state = 2;
++		srv_usable = 1;
++	}
++}
++
++static int
++act_defer(uint32_t pipe, uint32_t sess, unsigned cid, const uint8_t *tl, uint32_t tn)
++{
++	if (act_bypass || repub_mode != 3 || srv_usable || tn > sizeof(actq.tl) ||
++	    (act_rel_set && act_rel_pipe == pipe && act_rel_sess == sess)) {
++		return 0;
++	}
++	actq.set = 1;
++	actq.pipe = pipe;
++	actq.sess = sess;
++	actq.cid = (uint8_t)cid;
++	actq.tn = tn;
++	memcpy(actq.tl, tl, tn);
++	if (!act_waiting) {
++		act_waiting = 1;
++		act_since = sbb_ms();
++		act_next_probe = act_since;
++		printf("SWEET QMUX: republish: activation deferred (modem srv %s), waiting up to %d s [%s/%u]\n", srv_name(srv_state),
++		    repub_wait_s, pipe < NPIPES ? pipe_name[pipe] : "?", sess);
++	}
++	return 1;
++}
++
++static void
++act_probe(void)
++{
++	int si = srv_find(0x03);
++	struct cl *c = NULL;
++	for (int i = 0; i < NCL && !c && si >= 0; i++) {
++		if (cl[i].used == 1 && cl[i].svc == 0x03) {
++			c = &cl[i];
++		}
++	}
++	if (!c) {
++		return;
++	}
++	if (++replay_txn == 0xffff) {
++		replay_txn = 0xff00;
++	}
++	uint8_t q[7] = { 0x00, (uint8_t)replay_txn, (uint8_t)(replay_txn >> 8), 0x4d, 0x00, 0, 0 };
++	if (sbb_qrtr_send(SBB_QRTR_DATA, c->port, srv[si].node, srv[si].port, q, sizeof(q))) {
++		cnt.sendfail++;
++		return;
++	}
++	struct pend x;
++	bzero(&x, sizeof(x));
++	x.port = c->port;
++	x.txn = replay_txn;
++	x.msg = 0x004d;
++	x.svc = 0x03;
++	x.replay = 1;
++	x.probe = 1;
++	pend_add(&x);
++	act_probes++;
++}
++
++static void
++act_poll(uint64_t now)
++{
++	if (!act_waiting) {
++		return;
++	}
++	if (!actq.set || !sess_live(actq.pipe, actq.sess)) {
++		LOG("republish: deferred activation dropped (CommCenter session %s/%u ended)\n",
++		    actq.pipe < NPIPES ? pipe_name[actq.pipe] : "?", actq.sess);
++		act_waiting = 0;
++		actq.set = 0;
++		return;
++	}
++	int go = 0;
++	if (srv_usable) {
++		printf("SWEET QMUX: republish: modem srv full after %llu ms: activation delivered (%u poll(s))\n",
++		    (unsigned long long)(now - act_since), act_probes);
++		go = 1;
++	} else if (repub_mode != 3) {
++		printf("SWEET QMUX: republish: mode %d now: deferred activation delivered after %llu ms\n", repub_mode,
++		    (unsigned long long)(now - act_since));
++		go = 1;
++	} else if (now - act_since >= (uint64_t)(repub_wait_s > 0 ? repub_wait_s : 0) * 1000) {
++		printf("SWEET QMUX: republish: no usable service in %d s (modem srv %s, %u poll(s)): activation delivered anyway\n",
++		    repub_wait_s, srv_name(srv_state), act_probes);
++		go = 1;
++	} else if (now >= act_next_probe) {
++		act_next_probe = now + 2000;
++		act_probe();
++	}
++	if (!go) {
++		return;
++	}
++	act_waiting = 0;
++	act_rel_set = 1;
++	act_rel_pipe = actq.pipe;
++	act_rel_sess = actq.sess;
++	act_probes = 0;
++	act_bypass = 1;
++	send_ind(actq.pipe, actq.sess, 0xe2, actq.cid, 0xb00c, actq.tl, actq.tn);
++	act_bypass = 0;
++	actq.set = 0;
++	bzero(actq.tl, sizeof(actq.tl));
++}
++
+ static void
+ svc_forward(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t sn)
+ {
+@@ -2908,7 +3091,15 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 			unsigned res, er;
+ 			result_of(d, n, &res, &er);
+ 			if (res != 0) {
+-				LOG("replay %s(0x%02x) GET 0x%04x: modem error 0x%x, no indication\n", svc_name(x->svc), x->svc, x->msg, er);
++				if (!x->probe) {
++					LOG("replay %s(0x%02x) GET 0x%04x: modem error 0x%x, no indication\n", svc_name(x->svc), x->svc, x->msg, er);
++				}
++				return;
++			}
++			if (x->svc == 0x03 && x->msg == 0x004d) {
++				nas_srv_note(d + 7, ml);        /* 1084 */
++			}
++			if (x->probe) {
+ 				return;
+ 			}
+ 			uint8_t *t = B->rep_buf;
+@@ -3036,6 +3227,11 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 		simid.tries = 0;
+ 		simid.next = sbb_ms() + 2000;
+ 	}
++	if (c->svc == 0x03 && ((d[0] == 0x04 && rmsg == 0x004e) || (d[0] == 0x02 && rmsg == 0x004d && res == 0))) {
++		nas_srv_note(d + 7, ml);        /* 1084 */
++	} else if (c->svc == 0x03 && rmsg == 0x0024 && (d[0] == 0x04 || res == 0)) {
++		nas_ss_note(d + 7, ml);
++	}
+ 	if (c->svc == 0x09 && voice_auto) {     /* 1074 */
+ 		if (d[0] == 0x04 && rmsg == 0x002e) {
+ 			vauto_parse(d + 7, ml, 0x01, "All Call Status ind");
+@@ -3227,6 +3423,7 @@ sweet_qmux_poll(void)
+ 	simid_poll(now);
+ 	bbr_poll(now);
+ 	hold_poll(now);
++	act_poll(now);
+ 	repub_poll(now);
+ 	if (dump_req) {
+ 		dump_req = 0;
+@@ -3348,7 +3545,7 @@ sysctl_repub SYSCTL_HANDLER_ARGS
+ 	if (proc_suser(req->p) != 0) {
+ 		return EPERM;
+ 	}
+-	if (v < 0 || v > 2) {
++	if (v < 0 || v > 3) {
+ 		return EINVAL;
+ 	}
+ 	if (v == 2) {
+@@ -3394,7 +3591,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_voice_auto, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_republish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_repub, "I",
+     "redfin 1073: 0 off (default), 1 = once per CommCenter session the modem's fresh NAS SysInfo/SigInfo as indications "
+-    "kern.sweet_qmi_republish_ms after BSP activation; write 2 = send them now");
++    "kern.sweet_qmi_republish_ms after BSP activation; write 2 = send them now; 3 = as 1, the BSP activation deferred until the "
++    "modem has service (1084)");
++QINT(sweet_qmi_republish_wait_s, repub_wait_s, "redfin 1084: mode 3: longest wait in s for modem service before the BSP activation goes anyway (45)");
+ QINT(sweet_qmi_policy_file, policy_file, "redfin 1068: 1 = /var/local/abp-policy.conf overrides the built-in default text (checked every 10 s)");
+ 
+ static int

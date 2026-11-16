@@ -1,0 +1,445 @@
+From 6f05f2ad4127413a2b027dab486818f94f07f04d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 20:24:02 +0100
+Subject: [PATCH] 1099 redfin: brightness trace (kern.sweet_bl_trace) and
+ cold-boot fix (kern.sweet_bl_fix)
+
+After every cold boot CoreBrightness sets the backlight to 1 (of 1023) and
+ignores the slider; after a backboardd restart it works.
+
+kern.sweet_bl_trace (default 3, boot-arg sweetbltrace): "SWEET BLT:" lines,
+rate-limited (20/s, bursts of 60): bit 0 user-space property reads/writes of
+AppleARMBacklight and AppleCLCD with the process, bit 1 every IOMFB
+user-client call except the swap path. The "backlight brightness" line is
+rate-limited instead of 8 a boot.
+
+kern.sweet_bl_fix (default 7, boot-arg sweetblfix):
+ 1 with AppleARMBacklight, IOMFBBrightnessLevel is CoreBrightness's
+   brightness factor (0..1.0 in 16.16), not nits: stored, no DCS (it put
+   DBV 0x4/0x6 over the backlight level at every display on/off);
+ 2 AppleCLCD starts with IOMFBBrightnessLevel 1.0, not 250 nits;
+ 4 the ALS sends a neutral 100 lux sample at its client's ReportInterval
+   until sensd's first sample (CoreBrightness starts with samples flowing,
+   as after a backboardd restart).
+---
+ bsd/dev/sweet_gpu.c                   |  10 ++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 212 +++++++++++++++++++++++++-
+ iokit/Kernel/arm/hid/SweetHID.cpp     |  44 ++++++
+ 3 files changed, 264 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c9eab7d..397f284 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1881,6 +1881,16 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_vsyncphase_grid, CTLTYPE_INT | CTLFLAG_RW | C
+ /* redfin 1060: read-only frame counter for the FPS overlay (iokit/Kernel/arm/SweetFramebuffer.cpp) */
+ extern uint64_t sweet_fb_frames;
+ extern uint32_t sweet_fb_hz;
++/*
++ * 1099: the cold-boot brightness bug (SweetFramebuffer.cpp, SweetHID.cpp). kern.sweet_bl_trace bit 0 property
++ * reads/writes of AppleARMBacklight + AppleCLCD, bit 1 IOMFB calls ("SWEET BLT:", rate-limited); kern.sweet_bl_fix
++ * bit 0 IOMFBBrightnessLevel = factor (no DCS), bit 1 boot value 1.0, bit 2 ALS keep-alive until sensd.
++ */
++extern uint32_t sweet_bl_trace, sweet_bl_fix;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_trace, 0,
++    "SWEET BLT: 1 backlight/AppleCLCD property reads+writes, 2 IOMFB user-client calls (1099)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_fix, 0,
++    "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
+     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index aa50ea6..392f8ac 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -444,11 +444,15 @@ public:
+ 	uint32_t       fBlWant, fBlHave;        /* panel DBV; fBlHave 0 = not sent yet */
+ 	uint32_t       fBlFails;
+ 	bool           fBlReq;
++	bool           fBlSvc;          /* 1099: AppleARMBacklight published (sweetbl=1) */
+ 	bool           blStart(void);
+ 	bool           dsiDcs(const uint8_t *payload, uint32_t len);
+ 	void           blSet(uint32_t level);
+ 	static void    blLoop(void *arg);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	using IOMobileFramebuffer::copyProperty;
++	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;      /* 1099: kern.sweet_bl_trace */
++	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;            /* 1099 */
+ 	void copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n);
+ 	static void presentLoop(void *arg);
+ };
+@@ -512,6 +516,131 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ #define SWEET_BL_MAX            0x3ffu
+ #define SWEET_BL_MAX_NITS       500u    /* IOMFBBrightnessLevel that maps to SWEET_BL_MAX */
+ 
++/*
++ * redfin 1099: the cold-boot brightness bug (after every cold boot CoreBrightness sets the backlight to 1 of 1023 and
++ * ignores the slider; after a backboardd restart it works). Two sysctls, boot-args sweetbltrace= / sweetblfix=.
++ *
++ * kern.sweet_bl_trace (default 3): "SWEET BLT:" lines, rate-limited (20 a second, bursts of 60; the number dropped
++ * is printed with the next line), with the calling process:
++ *   bit 0  user-space property reads (IORegistryEntryCreateCFProperty / SearchCFProperty / all properties) and
++ *          writes (IORegistryEntrySetCFProperties) of AppleARMBacklight and AppleCLCD, key and value;
++ *   bit 1  every IOMobileFramebuffer user-client call except the swap path (selectors 4, 5, 6, 77).
++ * kern.sweet_bl_fix (default 7):
++ *   bit 0  with AppleARMBacklight published, IOMFBBrightnessLevel is CoreBrightness's display brightness *factor*
++ *          (16.16, 0..1.0: -[CBCAManager displayBrightnessPropertyHandler:] divides it by 65536; klogs show exactly
++ *          0.00 at display off and 1.00 at display on, together with the ALS's IOHIDBacklightLevel 0x10000), not
++ *          nits. 0906 drove the panel from it, so every display on/off put DBV 0x4/0x6 over the backlight's level
++ *          (after a backboardd restart: 629 -> 0x275, then 0x4, then 0x6 within 0.4 s). Now it is only stored.
++ *   bit 1  AppleCLCD starts with IOMFBBrightnessLevel 1.0 (a lit display's factor) instead of 250 nits when the
++ *          backlight service is published, the value it has after a backboardd restart.
++ *   bit 2  the ALS sends a neutral 100 lux sample at its client's ReportInterval until sensd's first sample
++ *          (SweetHID.cpp), so CoreBrightness starts with ALS samples flowing, as after a backboardd restart.
++ */
++extern "C" {
++uint32_t sweet_bl_trace = 3;
++uint32_t sweet_bl_fix = 7;
++}
++static IOSimpleLock *sweet_blt_lock;
++static uint64_t sweet_blt_refill;
++static uint32_t sweet_blt_tokens, sweet_blt_dropped;
++
++static bool
++sweet_blt_take(uint32_t *dropped)
++{
++	if (sweet_blt_lock == NULL) {
++		return false;
++	}
++	uint64_t now = mach_absolute_time(), ns;
++	IOSimpleLockLock(sweet_blt_lock);
++	absolutetime_to_nanoseconds(now - sweet_blt_refill, &ns);
++	uint64_t add = ns / 50000000ULL;        /* one line per 50 ms */
++	if (add != 0) {
++		sweet_blt_tokens = (uint32_t)(sweet_blt_tokens + add > 60 ? 60 : sweet_blt_tokens + add);
++		sweet_blt_refill = now;
++	}
++	bool ok = sweet_blt_tokens != 0;
++	if (ok) {
++		sweet_blt_tokens--;
++		*dropped = sweet_blt_dropped;
++		sweet_blt_dropped = 0;
++	} else {
++		sweet_blt_dropped++;
++	}
++	IOSimpleLockUnlock(sweet_blt_lock);
++	return ok;
++}
++
++static void
++sweet_blt_fmt(const OSObject *co, char *buf, size_t len)
++{
++	OSObject *o = const_cast<OSObject *>(co);
++	OSNumber *n;
++	OSBoolean *b;
++	OSString *str;
++	OSData *d;
++	OSDictionary *dict;
++	if (o == NULL) {
++		strlcpy(buf, "ABSENT", len);
++	} else if ((n = OSDynamicCast(OSNumber, o)) != NULL) {
++		snprintf(buf, len, "%llu (%#llx)", n->unsigned64BitValue(), n->unsigned64BitValue());
++	} else if ((b = OSDynamicCast(OSBoolean, o)) != NULL) {
++		strlcpy(buf, b->isTrue() ? "true" : "false", len);
++	} else if ((str = OSDynamicCast(OSString, o)) != NULL) {
++		snprintf(buf, len, "\"%.60s\"", str->getCStringNoCopy());
++	} else if ((d = OSDynamicCast(OSData, o)) != NULL) {
++		snprintf(buf, len, "<data %u bytes>", d->getLength());
++	} else if ((dict = OSDynamicCast(OSDictionary, o)) != NULL) {
++		OSDictionary *br = OSDynamicCast(OSDictionary, dict->getObject("brightness"));
++		OSNumber *v = br ? OSDynamicCast(OSNumber, br->getObject("value")) : NULL;
++		if (v != NULL) {
++			snprintf(buf, len, "{%u keys, brightness.value %u}", dict->getCount(), v->unsigned32BitValue());
++		} else {
++			snprintf(buf, len, "{%u keys}", dict->getCount());
++		}
++	} else {
++		snprintf(buf, len, "<%s>", o->getMetaClass()->getClassName());
++	}
++}
++
++/* what: "read", "write", "read-all"; user-space callers only */
++static void
++sweet_blt_prop(const char *svc, const char *what, const char *key, const OSObject *value)
++{
++	if (!(sweet_bl_trace & 1)) {
++		return;
++	}
++	int pid = proc_selfpid();
++	uint32_t dropped = 0;
++	if (pid <= 0 || !sweet_blt_take(&dropped)) {
++		return;
++	}
++	char name[32], v[96];
++	proc_selfname(name, sizeof(name));
++	sweet_blt_fmt(value, v, sizeof(v));
++	if (dropped != 0) {
++		IOLog("SWEET BLT: (%u lines dropped by the rate limit)\n", dropped);
++	}
++	bool all = strcmp(what, "read-all") == 0;
++	IOLog("SWEET BLT: %s[%d] %s %s %s%s%s\n", name, pid, what, svc, key, all ? "" : " = ", all ? "" : v);
++}
++
++static void
++sweet_blt_props(const char *svc, OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!(sweet_bl_trace & 1) || d == NULL) {
++		return;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	if (it == NULL) {
++		return;
++	}
++	while (OSSymbol *k = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		sweet_blt_prop(svc, "write", k->getCStringNoCopy(), d->getObject(k));
++	}
++	it->release();
++}
++
+ #define DSI_CTRL                0x004
+ #define DSI_STATUS0             0x008   /* bit 2: CMD_MODE_MDP_BUSY */
+ #define DSI_CMD_DMA_CTRL        0x03c   /* bit 26: low power */
+@@ -679,11 +808,24 @@ AppleCLCD::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
++	sweet_blt_props("AppleCLCD", properties);       /* 1099 */
+ 	if (n == NULL || fBlLock == NULL) {
+ 		return kIOReturnUnsupported;
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
+ 	setProperty("IOMFBBrightnessLevel", v, 32);
++	if ((sweet_bl_fix & 1) && fBlSvc) {
++		/* 1099: CoreBrightness's brightness factor (0..1.0), not nits: the panel follows AppleARMBacklight */
++		static uint64_t last = ~0ULL;
++		if (v != last) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET BL: %s sets IOMFBBrightnessLevel %llu.%02llu (1099: a factor, panel unchanged)\n", name,
++			    v >> 16, ((v & 0xffff) * 100) >> 16);
++			last = v;
++		}
++		return kIOReturnSuccess;
++	}
+ 	static uint32_t logs;
+ 	if (logs++ < 8) {
+ 		char name[32];
+@@ -704,10 +846,48 @@ public:
+ 	void publish(uint32_t level);
+ 	void publishNits(uint32_t level);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	using IOService::copyProperty;
++	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;      /* 1099: kern.sweet_bl_trace */
++	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;            /* 1099 */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ 
++/* 1099: user-space reads of the brightness services (kern.sweet_bl_trace & 1) */
++OSPtr<OSObject>
++AppleARMBacklight::copyProperty(const char *aKey) const
++{
++	OSPtr<OSObject> obj = IOService::copyProperty(aKey);
++	if (aKey != NULL) {
++		sweet_blt_prop("AppleARMBacklight", "read", aKey, obj ? &*obj : NULL);
++	}
++	return obj;
++}
++
++bool
++AppleARMBacklight::serializeProperties(OSSerialize *s) const
++{
++	sweet_blt_prop("AppleARMBacklight", "read-all", "(all properties)", NULL);
++	return IOService::serializeProperties(s);
++}
++
++OSPtr<OSObject>
++AppleCLCD::copyProperty(const char *aKey) const
++{
++	OSPtr<OSObject> obj = IOMobileFramebuffer::copyProperty(aKey);
++	if (aKey != NULL) {
++		sweet_blt_prop("AppleCLCD", "read", aKey, obj ? &*obj : NULL);
++	}
++	return obj;
++}
++
++bool
++AppleCLCD::serializeProperties(OSSerialize *s) const
++{
++	sweet_blt_prop("AppleCLCD", "read-all", "(all properties)", NULL);
++	return IOMobileFramebuffer::serializeProperties(s);
++}
++
+ void
+ AppleARMBacklight::publish(uint32_t level)
+ {
+@@ -774,13 +954,15 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	OSNumber *b = d ? OSDynamicCast(OSNumber, d->getObject("brightness")) : NULL;
++	sweet_blt_props("AppleARMBacklight", properties);       /* 1099 */
+ 	if (b == NULL) {
+ 		return d ? kIOReturnSuccess : kIOReturnBadArgument;
+ 	}
+ 	int32_t v = (int32_t)b->unsigned32BitValue();
+ 	uint32_t level = v < 0 ? 0 : (uint32_t)v > SWEET_BL_MAX ? SWEET_BL_MAX : (uint32_t)v;
+ 	static uint32_t logs;
+-	if (logs++ < 8) {
++	uint32_t dropped = 0;
++	if (logs++ < 8 || ((sweet_bl_trace & 1) && sweet_blt_take(&dropped))) {    /* 1099: rate-limited, not 8 a boot */
+ 		IOLog("SWEET BL: backlight brightness %u\n", level);
+ 	}
+ 	fFB->blSet(level);
+@@ -939,6 +1121,11 @@ AppleCLCD::start(IOService *provider)
+ 	OSSafeReleaseNULL(linear);
+ 	OSSafeReleaseNULL(align);
+ 	publishSourceLimits();          /* 0990: sweetiomfbprops=1 */
++	if (sweet_blt_lock == NULL) {
++		sweet_blt_lock = IOSimpleLockAlloc();   /* 1099 */
++	}
++	PE_parse_boot_argn("sweetbltrace", &sweet_bl_trace, sizeof(sweet_bl_trace));
++	PE_parse_boot_argn("sweetblfix", &sweet_bl_fix, sizeof(sweet_bl_fix));
+ 	if (blStart()) {
+ 		uint32_t blOn = 0;
+ 		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+@@ -948,7 +1135,12 @@ AppleCLCD::start(IOService *provider)
+ 			bl->setProperty("backlight-control", true);
+ 			bl->publish(SWEET_BL_MAX / 2);
+ 			bl->registerService();
+-			IOLog("SWEET BL: AppleARMBacklight published (sweetbl=1)\n");
++			fBlSvc = true;
++			if (sweet_bl_fix & 2) {
++				setProperty("IOMFBBrightnessLevel", 1ULL << 16, 32);   /* 1099: a lit display's factor */
++			}
++			IOLog("SWEET BL: AppleARMBacklight published (sweetbl=1); 1099 kern.sweet_bl_fix %#x kern.sweet_bl_trace %#x\n",
++			    sweet_bl_fix, sweet_bl_trace);
+ 		}
+ 		OSSafeReleaseNULL(bl);
+ 	}
+@@ -4853,6 +5045,22 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+ 	SWEET_TRACE_END(SWT_IOMFB_SEL, selector, ret, out[0], traceSwap);      /* 0994 */
++	if ((sweet_bl_trace & 2) && selector != kSweetFBSwapBegin && selector != kSweetFBSwapEnd &&
++	    selector != kSweetFBSwapWait && selector != kSweetFBGetCurrentAbsoluteTime) {
++		uint32_t dropped = 0;
++		if (sweet_blt_take(&dropped)) {         /* 1099 */
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			if (dropped != 0) {
++				IOLog("SWEET BLT: (%u lines dropped by the rate limit)\n", dropped);
++			}
++			IOLog("SWEET BLT: %s[%d] IOMFB sel %u in %u/%u [%#llx %#llx] out %u/%u [%#llx] -> 0x%x\n", name,
++			    proc_selfpid(), selector, args->scalarInputCount, args->structureInputSize,
++			    args->scalarInputCount ? args->scalarInput[0] : 0ULL,
++			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL, args->scalarOutputCount,
++			    args->structureOutputSize, args->scalarOutputCount ? args->scalarOutput[0] : 0ULL, ret);
++		}
++	}
+ 	if (selector >= 128 || !(sweet_fb_logged[selector / 64] & (1ULL << (selector % 64)))) {
+ 		if (selector < 128) {
+ 			sweet_fb_logged[selector / 64] |= 1ULL << (selector % 64);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index f9921a4..7a666fa 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -879,6 +879,7 @@ public:
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return gSweetSensorInfo[sensorIndex()].usage; }
+ 
+ 	int post(const struct sweet_motion_sample *s, IOHIDEvent **built = NULL);
++	void noteReal(void) { OSIncrementAtomic64((volatile SInt64 *)&fReal); }     /* 1099: a sample from sensd/poke */
+ 	int status(char *buf, int len);
+ 	void want(struct sweet_motion_want *w);
+ 	void relog();
+@@ -903,6 +904,9 @@ private:
+ 	uint32_t        fLogged, fCopyTypes, fClients;
+ 	uint32_t        fInterval, fIntervalSet;
+ 	uint64_t        fEvents;
++	uint64_t        fReal;          /* 1099: samples from user space (sensd, poke m) */
++	uint64_t        fKeep;          /* 1099: keep-alive samples sent */
++	void            keepAliveArm(void);
+ };
+ OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
+ 
+@@ -1102,6 +1106,7 @@ SweetHIDSensor::setProperties(OSObject *properties)
+ 	if (!it) {
+ 		return kIOReturnNoMemory;
+ 	}
++	bool armKeep = false;
+ 	IOLockLock(fLock);
+ 	while (const OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
+ 		OSObject *value = dict->getObject(key);
+@@ -1110,6 +1115,7 @@ SweetHIDSensor::setProperties(OSObject *properties)
+ 		if (n && key->isEqualTo(kIOHIDReportIntervalKey)) {
+ 			fInterval = n->unsigned32BitValue();
+ 			fIntervalSet = 1;
++			armKeep = true;
+ 		}
+ 		/* Keep the sensor settings visible in the registry, as IOHIDEventService does. */
+ 		if (n && (key->isEqualTo(kIOHIDReportIntervalKey) || key->isEqualTo(kIOHIDBatchIntervalKey) ||
+@@ -1120,9 +1126,34 @@ SweetHIDSensor::setProperties(OSObject *properties)
+ 	}
+ 	IOLockUnlock(fLock);
+ 	it->release();
++	if (armKeep) {
++		keepAliveArm();         /* 1099 */
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * redfin 1099 (kern.sweet_bl_fix & 4, default on): until sensd's first ALS sample, a neutral 100 lux sample at the
++ * client's ReportInterval (100 ms at the fastest), as long as the client asks for samples (ReportInterval > 0).
++ * At a cold boot CoreBrightness configures the ALS and turns the display on at ~55 s, but sensd only starts at
++ * ~85 s: CoreBrightness then had one 100 lux sample (the 500 ms initial event, sent before it set ReportInterval)
++ * and nothing else; after a backboardd restart it starts with sensd's samples flowing. Log: "SWEET MOTION: als
++ * keep-alive". Stops for good at the first real sample.
++ */
++extern "C" uint32_t sweet_bl_fix;
++void
++SweetHIDSensor::keepAliveArm(void)
++{
++	if (sensorIndex() != SWEET_SENSOR_ALS || !(sweet_bl_fix & 4) || fReal != 0 || fInitTimer == NULL) {
++		return;
++	}
++	uint32_t us = fInterval;
++	if (us == 0) {
++		return;
++	}
++	fInitTimer->setTimeoutUS(us < 100000 ? 100000 : us);
++}
++
+ IOHIDEvent *
+ SweetHIDSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options)
+ {
+@@ -1179,6 +1210,18 @@ SweetHIDSensor::initialFired(OSObject *owner, IOTimerEventSource *sender __unuse
+ 		struct sweet_motion_sample s = { 12, 3, 0, { 0x42c80000 /* 100.0f */, 0, 0, 0 } };
+ 		IOLog("SWEET MOTION: als: initial 100 lux event (%u clients)\n", self->fClients);
+ 		self->post(&s);
++		self->keepAliveArm();   /* 1099 */
++	} else if (self->sensorIndex() == SWEET_SENSOR_ALS && (sweet_bl_fix & 4) && self->fReal == 0 &&
++	    self->fClients != 0 && self->fIntervalSet && self->fInterval != 0) {
++		/* 1099: keep-alive until sensd */
++		struct sweet_motion_sample s = { 12, 3, 0, { 0x42c80000 /* 100.0f */, 0, 0, 0 } };
++		uint64_t k = ++self->fKeep;
++		if (k <= 3 || (k & (k - 1)) == 0) {
++			IOLog("SWEET MOTION: als keep-alive #%llu: 100 lux every %u us until sensd (1099, kern.sweet_bl_fix & 4)\n",
++			    k, self->fInterval);
++		}
++		self->post(&s);
++		self->keepAliveArm();
+ 	}
+ }
+ 
+@@ -1435,6 +1478,7 @@ sweet_hid_sensor(const struct sweet_motion_sample *s)
+ 	if (!gSweetSensors[i]) {
+ 		return ENODEV;
+ 	}
++	gSweetSensors[i]->noteReal();   /* 1099: ends the ALS keep-alive */
+ 	return gSweetSensors[i]->post(s);
+ }
+ 
+-- 
+2.53.0
+

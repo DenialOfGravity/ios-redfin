@@ -1,0 +1,555 @@
+From ad14f56cdd05187c1ad0613a002cefc3da968f4a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 17:29:29 +0100
+Subject: [PATCH] 1097 redfin: GPU pool: live cap/reserve sysctls, best fit,
+ pool dump, drain all reuse caches
+
+---
+ bsd/dev/sweet_gpu.c                   | 290 ++++++++++++++++++++++++--
+ iokit/Kernel/arm/SweetAccelerator.cpp | 159 ++++++++++++--
+ 2 files changed, 413 insertions(+), 36 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4a30f07..ebdb8ce 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2103,13 +2103,91 @@ sweet_gpu_pool_avail(void)
+ static bool gpool_ready;
+ static LCK_MTX_DECLARE(sweet_gpool_lock, &sweet_gpu_grp);
+ 
+-/* First fit: the physical address of `bytes` (rounded to 16 KB), zeroing is the caller's. 0 = ok. */
+-int
+-sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
++/*
++ * redfin 1097: kern.sweet_gpu_pool_fit (boot-arg sweetgpufit, default 1). 0 = first fit (0115, the lowest block that
++ * is big enough); 1 = best fit (the smallest block that is big enough, lowest address on a tie), which keeps the big
++ * blocks whole for big buffers (WebKit.GPU's 13.5 MB RGBA16F companions, scanout slots). The free list was already
++ * kept sorted and coalesced on free. New allocations only.
++ */
++static uint32_t gpool_fit = 0xffffffffu;
++static uint64_t gpool_fails, gpool_allocs;
++static uint32_t gpool_fail_logged;
++static uint32_t
++gpool_fit_mode(void)
+ {
+-	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
+-	int rc = -1;
++	if (gpool_fit == 0xffffffffu) {
++		uint32_t v = 1;
++		PE_parse_boot_argn("sweetgpufit", &v, sizeof(v));
++		gpool_fit = v ? 1 : 0;
++	}
++	return gpool_fit;
++}
++
++/* Lock held: free bytes, the largest free block, blocks in the free list. */
++static void
++gpool_stats_locked(uint64_t *free_total, uint64_t *largest, uint32_t *nblocks)
++{
++	uint64_t f = 0, l = 0;
++	for (uint32_t i = 0; i < gpool_nfree; i++) {
++		f += gpool_free[i].size;
++		if (gpool_free[i].size > l) {
++			l = gpool_free[i].size;
++		}
++	}
++	*free_total = f;
++	*largest = l;
++	*nblocks = gpool_nfree;
++}
++
++static void gpool_init_locked(void);
++void sweet_mtl_clients_log(void);       /* iokit/Kernel/arm/SweetAccelerator.cpp (1097) */
++
++/*
++ * redfin 1097: the pool in the klog: "SWEET GPU: pool (why): total, free, largest free block, blocks, in use, peak,
++ * allocations, refusals", the 8 largest free blocks, then one line per v2 client (SweetAccelerator: held, peak,
++ * reuse cache, refusals). By `sctl kern.sweet_gpu_pool_dump=1` and at the first 8 refusals (then every 64th).
++ */
++void sweet_gpu_pool_dump(const char *why);
++void
++sweet_gpu_pool_dump(const char *why)
++{
++	uint64_t free_total, largest, top[8] = { 0 }, top_pa[8] = { 0 };
++	uint32_t nb;
++	uint64_t total = 0;
++	for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
++		total += gpool_ranges[i].size;
++	}
+ 	lck_mtx_lock(&sweet_gpool_lock);
++	gpool_init_locked();
++	gpool_stats_locked(&free_total, &largest, &nb);
++	for (uint32_t i = 0; i < gpool_nfree; i++) {
++		uint64_t sz = gpool_free[i].size, at = gpool_free[i].pa;
++		for (unsigned j = 0; j < 8; j++) {
++			if (sz > top[j]) {
++				uint64_t t = top[j], tp = top_pa[j];
++				top[j] = sz;
++				top_pa[j] = at;
++				sz = t;
++				at = tp;
++			}
++		}
++	}
++	uint64_t used = gpool_used, peak = gpool_peak, allocs = gpool_allocs, fails = gpool_fails;
++	uint32_t fit = gpool_fit_mode();
++	lck_mtx_unlock(&sweet_gpool_lock);
++	printf("SWEET GPU: pool (%s): total %llu MB, free %llu MB, largest free %llu KB, %u free blocks, in use %llu MB "
++	    "(peak %llu), allocs %llu, refused %llu, %s fit\n", why, total >> 20, free_total >> 20, largest >> 10, nb, used >> 20,
++	    peak >> 20, allocs, fails, fit ? "best" : "first");
++	printf("SWEET GPU: pool largest free blocks (KB@PA): %llu@%llx %llu@%llx %llu@%llx %llu@%llx %llu@%llx %llu@%llx %llu@%llx %llu@%llx\n",
++	    top[0] >> 10, top_pa[0], top[1] >> 10, top_pa[1], top[2] >> 10, top_pa[2], top[3] >> 10, top_pa[3],
++	    top[4] >> 10, top_pa[4], top[5] >> 10, top_pa[5], top[6] >> 10, top_pa[6], top[7] >> 10, top_pa[7]);
++	sweet_mtl_clients_log();
++}
++
++/* Lock held: the free list from the ranges, once. */
++static void
++gpool_init_locked(void)
++{
+ 	if (!gpool_ready) {
+ 		for (unsigned i = 0; i < sizeof(gpool_ranges) / sizeof(gpool_ranges[0]); i++) {
+ 			gpool_free[gpool_nfree].pa = gpool_ranges[i].pa;
+@@ -2118,33 +2196,205 @@ sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
+ 		}
+ 		gpool_ready = true;
+ 	}
++}
++
++/* First or best fit (kern.sweet_gpu_pool_fit): the physical address of `bytes` (rounded to 16 KB), zeroing is the caller's. 0 = ok. */
++int
++sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa)
++{
++	uint64_t size = (bytes + GPOOL_UNIT - 1) & ~(GPOOL_UNIT - 1);
++	int rc = -1;
++	bool dump = false;
++	uint64_t free_total = 0, largest = 0;
++	uint32_t nb = 0;
++	lck_mtx_lock(&sweet_gpool_lock);
++	gpool_init_locked();
++	uint32_t pick = gpool_nfree;
++	bool best = gpool_fit_mode() != 0;
+ 	for (uint32_t i = 0; i < gpool_nfree; i++) {
+ 		if (gpool_free[i].size >= size) {
+-			*pa = gpool_free[i].pa;
+-			gpool_free[i].pa += size;
+-			gpool_free[i].size -= size;
+-			if (gpool_free[i].size == 0) {
+-				memmove(&gpool_free[i], &gpool_free[i + 1], (gpool_nfree - i - 1) * sizeof(gpool_free[0]));
+-				gpool_nfree--;
+-			}
+-			gpool_used += size;
+-			if (gpool_used > gpool_peak) {
+-				gpool_peak = gpool_used;
++			if (!best) {
++				pick = i;
++				break;
+ 			}
+-			if ((gpool_used >> 25) != ((gpool_used - size) >> 25)) {
+-				a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
++			if (pick == gpool_nfree || gpool_free[i].size < gpool_free[pick].size) {
++				pick = i;
++				if (gpool_free[i].size == size) {
++					break;
++				}
+ 			}
+-			rc = 0;
+-			break;
++		}
++	}
++	if (pick < gpool_nfree) {
++		uint32_t i = pick;
++		*pa = gpool_free[i].pa;
++		gpool_free[i].pa += size;
++		gpool_free[i].size -= size;
++		if (gpool_free[i].size == 0) {
++			memmove(&gpool_free[i], &gpool_free[i + 1], (gpool_nfree - i - 1) * sizeof(gpool_free[0]));
++			gpool_nfree--;
++		}
++		gpool_used += size;
++		gpool_allocs++;
++		if (gpool_used > gpool_peak) {
++			gpool_peak = gpool_used;
++		}
++		if ((gpool_used >> 25) != ((gpool_used - size) >> 25)) {
++			a6_log("pool: %llu MB in use (peak %llu)\n", gpool_used >> 20, gpool_peak >> 20);
++		}
++		rc = 0;
++	} else {
++		gpool_fails++;
++		gpool_stats_locked(&free_total, &largest, &nb);
++		if (gpool_fail_logged < 8 || (gpool_fails & 63) == 0) {
++			gpool_fail_logged++;
++			dump = true;
+ 		}
+ 	}
+ 	lck_mtx_unlock(&sweet_gpool_lock);
+ 	if (rc) {
+-		a6_log("pool: no %llu bytes free (%llu MB in use)\n", size, gpool_used >> 20);
++		/* 1097: free total and largest block tell a full pool from a fragmented one */
++		a6_log("pool: no %llu bytes free (%llu MB in use, %llu MB free, largest free block %llu KB in %u blocks)\n", size,
++		    gpool_used >> 20, free_total >> 20, largest >> 10, nb);
++		if (dump) {
++			sweet_gpu_pool_dump("refused");
++		}
+ 	}
+ 	return rc;
+ }
+ 
++/* 1097: the largest block the pool could give now (for the v2 refusal lines) */
++uint64_t sweet_gpu_pool_largest(void);
++uint64_t
++sweet_gpu_pool_largest(void)
++{
++	uint64_t free_total, largest;
++	uint32_t nb;
++	lck_mtx_lock(&sweet_gpool_lock);
++	gpool_init_locked();
++	gpool_stats_locked(&free_total, &largest, &nb);
++	lck_mtx_unlock(&sweet_gpool_lock);
++	return largest;
++}
++
++/*
++ * redfin 1097: the v2 per-client cap and the compositor's reserve (0122: boot-args sweetgpucap / sweetgpureserve,
++ * read once) are now kern.sweet_gpu_cap_mb (0 = no cap) and kern.sweet_gpu_reserve_mb, live: the boot command line
++ * is full. Defaults unchanged: 256 and 160 MB. The boot-args still set the start values.
++ */
++uint32_t sweet_gpu_cap_mb = 0xffffffffu, sweet_gpu_reserve_mb = 0xffffffffu;
++void sweet_gpu_pool_limits(uint32_t *cap_mb, uint32_t *reserve_mb);
++void
++sweet_gpu_pool_limits(uint32_t *cap_mb, uint32_t *reserve_mb)
++{
++	if (sweet_gpu_cap_mb == 0xffffffffu) {
++		uint32_t v = 256;
++		PE_parse_boot_argn("sweetgpucap", &v, sizeof(v));
++		uint32_t r = 160;
++		PE_parse_boot_argn("sweetgpureserve", &r, sizeof(r));
++		sweet_gpu_reserve_mb = r;
++		sweet_gpu_cap_mb = v;
++	}
++	*cap_mb = sweet_gpu_cap_mb;
++	*reserve_mb = sweet_gpu_reserve_mb;
++}
++
++static int
++sysctl_sweet_gpu_cap_mb SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg2)
++	uint32_t cap, reserve;
++	sweet_gpu_pool_limits(&cap, &reserve);
++	bool is_cap = arg1 != NULL;
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, (int)(is_cap ? cap : reserve), sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 4096) {
++		return EINVAL;
++	}
++	if (is_cap) {
++		sweet_gpu_cap_mb = (uint32_t)value;
++	} else {
++		sweet_gpu_reserve_mb = (uint32_t)value;
++	}
++	printf("SWEET GPU: v2 pool %s %d MB (1097)%s\n", is_cap ? "cap per client" : "compositor reserve", value,
++	    is_cap && value == 0 ? " = no cap" : "");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_cap_mb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    (void *)1, 0, sysctl_sweet_gpu_cap_mb, "I", "SWEET GPU: v2 GPU-pool MB per non-system client (0 = no cap; boot sweetgpucap, 256)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_reserve_mb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_gpu_cap_mb, "I", "SWEET GPU: v2 GPU-pool MB kept for backboardd/SpringBoard (boot sweetgpureserve, 160)");
++
++static int
++sysctl_sweet_gpu_pool_fit SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, (int)gpool_fit_mode(), sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 1) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_gpool_lock);
++	gpool_fit = (uint32_t)value;
++	lck_mtx_unlock(&sweet_gpool_lock);
++	printf("SWEET GPU: pool %s fit (1097)\n", value ? "best" : "first");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_pool_fit, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_pool_fit, "I", "SWEET GPU: pool allocation 0 first fit, 1 best fit (default; boot sweetgpufit)");
++
++/* kern.sweet_gpu_pool_dump: write 1 = the pool and every v2 client into the klog; read = free MB, largest free block KB */
++static int
++sysctl_sweet_gpu_pool_dump SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, 0, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 0) {
++		sweet_gpu_pool_dump("sysctl");
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_pool_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_pool_dump, "I", "SWEET GPU: write 1 = GPU pool state and per-client use into the klog (1097)");
++
++/* kern.sweet_gpu_pool_info (string, read-only): "used U free F largest L blocks N peak P allocs A refused R fit best|first" (KB) */
++static int
++sysctl_sweet_gpu_pool_info SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[192];
++	uint64_t free_total, largest;
++	uint32_t nb;
++	lck_mtx_lock(&sweet_gpool_lock);
++	gpool_init_locked();
++	gpool_stats_locked(&free_total, &largest, &nb);
++	uint64_t used = gpool_used, peak = gpool_peak, allocs = gpool_allocs, fails = gpool_fails;
++	lck_mtx_unlock(&sweet_gpool_lock);
++	snprintf(buf, sizeof(buf), "used %llu free %llu largest %llu blocks %u peak %llu allocs %llu refused %llu fit %s (KB)",
++	    used >> 10, free_total >> 10, largest >> 10, nb, peak >> 10, allocs, fails, gpool_fit_mode() ? "best" : "first");
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_pool_info, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_gpu_pool_info, "A", "SWEET GPU: pool state (1097)");
++
++/*
++ * 1097: kern.sweet_gpu_pool_drainall 0|1 (default 1): when a v2 allocation finds no pool block (or would dip into
++ * the reserve), every client's 0156 reuse cache goes back to the pool and it is tried once more (was: only its own).
++ */
++uint32_t sweet_mtl_drainall = 1;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_gpu_pool_drainall, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mtl_drainall, 0,
++    "SWEET GPU: a refused v2 allocation takes back every client's reuse cache first (1097, default 1)");
++
+ void
+ sweet_gpu_pool_free(uint64_t pa, uint64_t bytes)
+ {
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index d487193..c2925ec 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -71,6 +71,12 @@ uint64_t sweet_gpu_timestamp(void);
+ int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ uint64_t sweet_gpu_pool_avail(void);
+ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
++uint64_t sweet_gpu_pool_largest(void);                                  /* 1097 */
++void sweet_gpu_pool_limits(uint32_t *cap_mb, uint32_t *reserve_mb);     /* 1097: kern.sweet_gpu_cap_mb / _reserve_mb */
++void sweet_gpu_pool_dump(const char *why);                              /* 1097 */
++void sweet_mtl_clients_log(void);                                       /* 1097: below */
++uint64_t sweet_mtl_reuse_drain_all(void);                               /* 1097: below */
++extern uint32_t sweet_mtl_drainall;                                     /* 1097: kern.sweet_gpu_pool_drainall (sweet_gpu.c) */
+ }
+ 
+ #define SWEET_V2_OPEN_TYPE      0x4147  /* the darwin backend's default ('AG', as the AGX plugin's) */
+@@ -162,7 +168,10 @@ class SweetAcceleratorUserClient : public IOUserClient {
+ 	char fName[32];
+ 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
+ 	bool fCapLogged;
++	uint32_t fRefused;              /* 1097: v2 allocations refused (cap, reserve or no pool block) */
+ 	bool v2PoolAllowed(uint64_t len);
++	friend void sweet_mtl_clients_log(void);
++	friend uint64_t sweet_mtl_reuse_drain_all(void);
+ 
+ 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
+ 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
+@@ -187,6 +196,106 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetAcceleratorUserClient, IOUserClient);
+ 
++/*
++ * redfin 1097: the open v2 clients (at most one per GPU window), for the pool dump (kern.sweet_gpu_pool_dump: who holds
++ * what) and for taking every client's reuse cache back (0156 keeps up to 64 MB of freed >= 1 MB buffers per client,
++ * counted as used by the pool) when an allocation finds no block. Lock order: sweet_mtl_reg_lock, then a client's fLock.
++ */
++#define SWEET_MTL_REG_MAX       64
++static SweetAcceleratorUserClient *sweet_mtl_reg[SWEET_MTL_REG_MAX];
++static IOLock *sweet_mtl_reg_lock;
++
++static bool
++sweet_mtl_reg_ready(void)
++{
++	if (sweet_mtl_reg_lock == NULL) {
++		IOLock *lock = IOLockAlloc();
++		if (lock != NULL && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&sweet_mtl_reg_lock)) {
++			IOLockFree(lock);
++		}
++	}
++	return sweet_mtl_reg_lock != NULL;
++}
++
++static void
++sweet_mtl_registry_add(SweetAcceleratorUserClient *c)
++{
++	if (!sweet_mtl_reg_ready()) {
++		return;
++	}
++	IOLockLock(sweet_mtl_reg_lock);
++	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
++		if (sweet_mtl_reg[i] == NULL) {
++			sweet_mtl_reg[i] = c;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_mtl_reg_lock);
++}
++
++static void
++sweet_mtl_registry_remove(SweetAcceleratorUserClient *c)
++{
++	if (sweet_mtl_reg_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_mtl_reg_lock);
++	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
++		if (sweet_mtl_reg[i] == c) {
++			sweet_mtl_reg[i] = NULL;
++		}
++	}
++	IOLockUnlock(sweet_mtl_reg_lock);
++}
++
++/* One klog line per open v2 client (the end of sweet_gpu_pool_dump). Counters read without the client's lock. */
++void
++sweet_mtl_clients_log(void)
++{
++	uint32_t cap, reserve, n = 0;
++	sweet_gpu_pool_limits(&cap, &reserve);
++	if (sweet_mtl_reg_lock == NULL) {
++		IOLog("SWEET MTL: pool clients: none yet (cap %u MB, reserve %u MB)\n", cap, reserve);
++		return;
++	}
++	IOLockLock(sweet_mtl_reg_lock);
++	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
++		SweetAcceleratorUserClient *c = sweet_mtl_reg[i];
++		if (c == NULL) {
++			continue;
++		}
++		n++;
++		IOLog("SWEET MTL: pool client %s[%d]%s: holds %llu MB (peak %llu), reuse cache %llu MB, allocs %u frees %u imports %u/%u, refused %u\n",
++		    c->fName, c->fPid, c->fSystem ? " (system)" : "", c->fPoolBytes >> 20, c->fPoolPeak >> 20, c->fReuseBytes >> 20,
++		    c->fAllocs, c->fFrees, c->fImports, c->fImportFrees, c->fRefused);
++	}
++	IOLockUnlock(sweet_mtl_reg_lock);
++	IOLog("SWEET MTL: pool clients: %u open; cap %u MB per client%s, reserve %u MB\n", n, cap, cap == 0 ? " (none)" : "", reserve);
++}
++
++/* Every client's reuse cache back to the pool: the bytes given back. Callers hold no client lock. */
++uint64_t
++sweet_mtl_reuse_drain_all(void)
++{
++	uint64_t got = 0;
++	if (sweet_mtl_reg_lock == NULL) {
++		return 0;
++	}
++	IOLockLock(sweet_mtl_reg_lock);
++	for (unsigned i = 0; i < SWEET_MTL_REG_MAX; i++) {
++		SweetAcceleratorUserClient *c = sweet_mtl_reg[i];
++		if (c == NULL || c->fLock == NULL) {
++			continue;
++		}
++		IOLockLock(c->fLock);
++		got += c->fReuseBytes;
++		c->v2ReuseDrain();
++		IOLockUnlock(c->fLock);
++	}
++	IOLockUnlock(sweet_mtl_reg_lock);
++	return got;
++}
++
+ bool
+ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -215,6 +324,7 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ 		fSystem = !strcmp(fName, "backboardd") || !strcmp(fName, "SpringBoard");
+ 		fPid = proc_selfpid();
+ 		fV2 = true;
++		sweet_mtl_registry_add(this);   /* 1097 */
+ 	}
+ 	return true;
+ }
+@@ -227,27 +337,31 @@ SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UI
+ bool
+ SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
+ {
+-	static uint32_t cap_mb, reserve_mb;
+-	if (cap_mb == 0) {
+-		uint32_t v = 256;
+-		PE_parse_boot_argn("sweetgpucap", &v, sizeof(v));
+-		reserve_mb = 160;
+-		PE_parse_boot_argn("sweetgpureserve", &reserve_mb, sizeof(reserve_mb));
+-		cap_mb = v ? v : 0xffffffffu;
+-	}
++	/* 1097: cap and reserve are kern.sweet_gpu_cap_mb / kern.sweet_gpu_reserve_mb (live; boot-args give the start values) */
++	uint32_t cap_mb, reserve_mb;
++	sweet_gpu_pool_limits(&cap_mb, &reserve_mb);
+ 	if (fSystem) {
+ 		return true;
+ 	}
+ 	const char *why = NULL;
+-	if (fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
+-		why = "its cap";
++	if (cap_mb != 0 && fPoolBytes + len > ((uint64_t)cap_mb << 20)) {
++		why = "its cap (kern.sweet_gpu_cap_mb)";
+ 	} else if (sweet_gpu_pool_avail() < len + ((uint64_t)reserve_mb << 20)) {
+-		why = "the compositor's reserve";
++		/* 1097: other clients' reuse caches count as used; give them back before refusing */
++		if (sweet_mtl_drainall != 0 && sweet_mtl_reuse_drain_all() != 0 &&
++		    sweet_gpu_pool_avail() >= len + ((uint64_t)reserve_mb << 20)) {
++			return true;
++		}
++		why = "the compositor's reserve (kern.sweet_gpu_reserve_mb)";
+ 	}
+-	if (why != NULL && !fCapLogged) {
+-		fCapLogged = true;
+-		IOLog("SWEET MTL: v2 %s: %llu MB buffer refused (holds %llu MB, %llu MB of the pool free): %s\n", fName,
+-		    len >> 20, fPoolBytes >> 20, sweet_gpu_pool_avail() >> 20, why);
++	if (why != NULL) {
++		fRefused++;
++		/* 1097: the first 4 refusals of a client and every 32nd (was: the first only) */
++		if (!fCapLogged || fRefused <= 4 || (fRefused & 31) == 0) {
++			fCapLogged = true;
++			IOLog("SWEET MTL: v2 %s: %llu MB buffer refused #%u (holds %llu MB, %llu MB of the pool free, largest block %llu KB): %s\n",
++			    fName, len >> 20, fRefused, fPoolBytes >> 20, sweet_gpu_pool_avail() >> 20, sweet_gpu_pool_largest() >> 10, why);
++		}
+ 	}
+ 	return why == NULL;
+ }
+@@ -270,6 +384,9 @@ SweetAcceleratorUserClient::free(void)
+ 	if (fLastFence != 0 && (fV2 ? sweet_gpu_wait_fence_ns(fLastFence, 2000000000ULL) : sweet_gpu_wait_fence(fLastFence, 2000))) {
+ 		IOLog("SWEET MTL: client freed with fence %u still pending\n", fLastFence);
+ 	}
++	if (fV2) {
++		sweet_mtl_registry_remove(this);        /* 1097: before anything it holds goes */
++	}
+ 	if (fBO != NULL) {
+ 		IOLog("SWEET MTL: v2 %s closed (GPU pool: %llu MB held, peak %llu MB)\n", fName, fPoolBytes >> 20, fPoolPeak >> 20);
+ 		for (uint32_t i = 0; i < fBOCap; i++) {
+@@ -778,7 +895,17 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 				v2ReuseDrain();		/* give the cache back and try once more */
+ 				IOLockUnlock(fLock);
+ 				if (sweet_gpu_pool_alloc(len, &pa)) {
+-					return kIOReturnNoMemory;
++					/* 1097: then every other client's cache (kern.sweet_gpu_pool_drainall), once more */
++					uint64_t back = sweet_mtl_drainall != 0 ? sweet_mtl_reuse_drain_all() : 0;
++					if (back == 0 || sweet_gpu_pool_alloc(len, &pa)) {
++						fRefused++;
++						if (fRefused <= 4 || (fRefused & 31) == 0) {
++							IOLog("SWEET MTL: v2 %s: no pool block of %llu bytes #%u (holds %llu MB, %llu MB of the pool free, "
++							    "largest block %llu KB, %llu MB of caches given back)\n", fName, len, fRefused, fPoolBytes >> 20,
++							    sweet_gpu_pool_avail() >> 20, sweet_gpu_pool_largest() >> 10, back >> 20);
++						}
++						return kIOReturnNoMemory;
++					}
+ 				}
+ 			}
+ 			md = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionInOut);
+-- 
+2.53.0
+

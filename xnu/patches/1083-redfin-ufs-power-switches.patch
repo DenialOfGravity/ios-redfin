@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ed94d95..1290b8a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1334,47 +1334,65 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_ufs_diag_phy, CTLFLAG_RW | CTLFLAG_LOCKED, &ud
+  * the aggregated rail state is not readable from APPS.
+  */
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+-static char ufs_pwr_state[400] = "off (boot-arg sweetufs & 4 not set)";
++static char ufs_pwr_state[640] = "off (boot-arg sweetufs & 4 not set)";
+ 
++/*
++ * 1083: every 1078 vote switchable from the same boot-arg (sweetufs, bit 4 = votes on):
++ *   0x08 skip smpa4   0x10 skip qphy.lvl   0x20 skip ldoa5   0x40 skip ldoa9   0x80 skip ldoc7
++ *   0x100 ldoa5 voltage + enable only (mode field not voted)   0x200 the same for ldoa9 and ldoc7
++ */
+ static void
+ ufs_pwr_vote(uint32_t bits)
+ {
+ 	static const struct {
+-		const char *res, *what;
++		const char *res, *what, *what_nomode;
+ 		unsigned n;
+ 		uint32_t off[3], val[3];
+-		bool s4;
++		uint32_t skip, nomode;
+ 	} v[] = {
+-		{ "qphy.lvl", "ARC level 1 (UFS PHY on)", 1, { 0 }, { 1 }, false },
+-		{ "ldoa5", "880 mV HPM on (vdda-phy)", 3, { 0, 8, 4 }, { 880, 7, 1 }, false },
+-		{ "ldoa9", "1200 mV HPM on (vdda-pll, vddp-ref-clk)", 3, { 0, 8, 4 }, { 1200, 7, 1 }, false },
+-		{ "ldoc7", "2950 mV HPM on (vcc)", 3, { 0, 8, 4 }, { 2950, 7, 1 }, false },
+-		{ "smpa4", "1800 mV AUTO on (vccq2)", 3, { 0, 8, 4 }, { 1800, 6, 1 }, true },
++		{ "qphy.lvl", "ARC level 1 (UFS PHY on)", NULL, 1, { 0 }, { 1 }, 0x10, 0 },
++		{ "ldoa5", "880 mV HPM on (vdda-phy)", "880 mV on, mode not voted (vdda-phy)", 3, { 0, 8, 4 }, { 880, 7, 1 },
++		  0x20, 0x100 },
++		{ "ldoa9", "1200 mV HPM on (vdda-pll, vddp-ref-clk)", "1200 mV on, mode not voted (vdda-pll, vddp-ref-clk)", 3,
++		  { 0, 8, 4 }, { 1200, 7, 1 }, 0x40, 0x200 },
++		{ "ldoc7", "2950 mV HPM on (vcc)", "2950 mV on, mode not voted (vcc)", 3, { 0, 8, 4 }, { 2950, 7, 1 }, 0x80, 0x200 },
++		{ "smpa4", "1800 mV AUTO on (vccq2)", NULL, 3, { 0, 8, 4 }, { 1800, 6, 1 }, 0x08, 0 },
+ 	};
+ 	uint64_t ns;
+ 	int p;
+ 
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+-	p = snprintf(ufs_pwr_state, sizeof(ufs_pwr_state), "votes at %llu.%03llu s:", ns / NSEC_PER_SEC,
+-	    (ns % NSEC_PER_SEC) / NSEC_PER_MSEC);
+-	printf("SWEET UFS PWR: holding UFS power from the apps DRV at %llu.%03llu s (sweetufs 0x%x)\n", ns / NSEC_PER_SEC,
++	p = snprintf(ufs_pwr_state, sizeof(ufs_pwr_state), "votes at %llu.%03llu s (sweetufs 0x%x):", ns / NSEC_PER_SEC,
+ 	    (ns % NSEC_PER_SEC) / NSEC_PER_MSEC, bits);
++	printf("SWEET UFS PWR: holding UFS power from the apps DRV at %llu.%03llu s (sweetufs 0x%x: skip mask 0x%x%s%s%s%s%s,"
++	    " no-mode mask 0x%x%s%s)\n", ns / NSEC_PER_SEC, (ns % NSEC_PER_SEC) / NSEC_PER_MSEC, bits, bits & 0xf8u,
++	    (bits & 0x08) ? " smpa4" : "", (bits & 0x10) ? " qphy.lvl" : "", (bits & 0x20) ? " ldoa5" : "",
++	    (bits & 0x40) ? " ldoa9" : "", (bits & 0x80) ? " ldoc7" : "", bits & 0x300u,
++	    (bits & 0x100) ? " ldoa5" : "", (bits & 0x200) ? " ldoa9+ldoc7" : "");
+ 	for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+ 		uint32_t addr = 0;
+-		if (v[i].s4 && (bits & 8)) {
+-			printf("SWEET UFS PWR: %s not voted (sweetufs & 8)\n", v[i].res);
++		if (bits & v[i].skip) {
++			printf("SWEET UFS PWR: %s not voted (sweetufs & 0x%x)\n", v[i].res, v[i].skip);
+ 			p += snprintf(ufs_pwr_state + p, sizeof(ufs_pwr_state) - (size_t)p, " %s skipped;", v[i].res);
++			if (p >= (int)sizeof(ufs_pwr_state)) {
++				p = (int)sizeof(ufs_pwr_state) - 1;
++			}
+ 			continue;
+ 		}
++		bool nomode = (bits & v[i].nomode) != 0;
++		/* without the mode: voltage (+0) then enable (+4), the order rh_send uses */
++		const uint32_t off2[2] = { v[i].off[0], v[i].off[2] }, val2[2] = { v[i].val[0], v[i].val[2] };
++		const char *what = nomode ? v[i].what_nomode : v[i].what;
+ 		int fe = sweet_rpmh_find(v[i].res, &addr);
+-		int e = fe ? fe : sweet_rpmh_write(v[i].res, v[i].n, v[i].off, v[i].val);
++		int e = fe ? fe : nomode ? sweet_rpmh_write(v[i].res, 2, off2, val2) :
++		    sweet_rpmh_write(v[i].res, v[i].n, v[i].off, v[i].val);
+ 		if (!e) {
+-			printf("SWEET UFS PWR: %s addr 0x%x %s sent/ack\n", v[i].res, addr, v[i].what);
++			printf("SWEET UFS PWR: %s addr 0x%x %s sent/ack\n", v[i].res, addr, what);
+ 		} else {
+-			printf("SWEET UFS PWR: %s addr 0x%x %s NOT acked (error %d%s)\n", v[i].res, addr, v[i].what, e,
++			printf("SWEET UFS PWR: %s addr 0x%x %s NOT acked (error %d%s)\n", v[i].res, addr, what, e,
+ 			    fe ? ", cmd-db lookup" : "");
+ 		}
+-		p += snprintf(ufs_pwr_state + p, sizeof(ufs_pwr_state) - (size_t)p, " %s %s %s;", v[i].res, v[i].what,
++		p += snprintf(ufs_pwr_state + p, sizeof(ufs_pwr_state) - (size_t)p, " %s %s %s;", v[i].res, what,
+ 		    e ? "FAILED" : "ack");
+ 		if (p >= (int)sizeof(ufs_pwr_state)) {
+ 			p = (int)sizeof(ufs_pwr_state) - 1;
+@@ -1391,7 +1409,8 @@ sysctl_sweet_ufs_pwr SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_pwr, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_ufs_pwr, "A",
+     "redfin 1078: UFS power votes held by the kernel (boot-arg sweetufs & 4)");
+ 
+-/* boot-arg sweetufs (1077/1078): 1 diag first-timeout dump + boot snapshot, 2 diag watcher, 4 power votes, 8 no smpa4 vote */
++/* boot-arg sweetufs (1077/1078/1083): 1 diag first-timeout dump + boot snapshot, 2 diag watcher, 4 power votes,
++ * 0x08-0x80 skip smpa4/qphy.lvl/ldoa5/ldoa9/ldoc7, 0x100/0x200 no mode vote for ldoa5 / ldoa9+ldoc7 */
+ static uint32_t
+ ufs_bootbits(void)
+ {

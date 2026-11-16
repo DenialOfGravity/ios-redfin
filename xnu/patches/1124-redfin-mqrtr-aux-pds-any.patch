@@ -1,0 +1,620 @@
+From 9ac2c7188fcd271aaa286f711a823f67135ffd59 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 00:49:32 +0100
+Subject: [PATCH] 1124 redfin: /dev/sweet-mqrtr-aux (second QRTR client device
+ for sweetlocd, own ports 0x4700-0x470f, DEL_CLIENT at close;
+ kern.sweet_mqrtr_aux default 0) + PDS relay to whichever client registers
+
+---
+ bsd/dev/sweet_bb.c   | 263 ++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_bb.h   |  16 +++
+ bsd/dev/sweet_qmux.c |  94 +++++++++++-----
+ 3 files changed, 343 insertions(+), 30 deletions(-)
+
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+index ffab26f..6f90215 100644
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -440,6 +440,7 @@ struct sbb_q {
+ };
+ static struct sbb_q q_router = { .max_count = 8192, .max_bytes = 4u << 20 };
+ static struct sbb_q q_wland = { .max_count = 8192, .max_bytes = 4u << 20 };
++static struct sbb_q q_aux = { .max_count = 1024, .max_bytes = 1u << 20 };     /* 1124: /dev/sweet-mqrtr-aux */
+ static struct {
+ 	bool open;
+ 	pid_t pid;
+@@ -447,6 +448,20 @@ static struct {
+ 	uint64_t writes, write_bytes, reads;
+ 	uint32_t refused;
+ } dev;
++static struct {                         /* 1124: /dev/sweet-mqrtr-aux (sweetlocd) */
++	bool open;
++	pid_t pid;
++	struct selinfo sel;
++	uint64_t writes, write_bytes, reads, delcl;
++	uint32_t refused, used;         /* used: bit i = port SBB_AUX_PORT0 + i sent DATA (DEL_CLIENT at close) */
++} aux;
++static int mqrtr_aux = 0;               /* 1124: kern.sweet_mqrtr_aux */
++
++static bool
++aux_port(uint32_t port)
++{
++	return port >= SBB_AUX_PORT0 && port < SBB_AUX_PORT0 + SBB_AUX_NPORTS;
++}
+ 
+ static void
+ pkt_free(struct sbb_pkt *p)
+@@ -548,6 +563,43 @@ sbb_wland_open(void)
+ 	return dev.open;
+ }
+ 
++/* 1124: the aux device's queue (dropped quietly when it is closed: nobody there) */
++static void
++to_aux(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	lck_mtx_lock(&q_lock);
++	bool ok = aux.open && q_put_locked(&q_aux, h, d, n);
++	if (ok) {
++		wakeup(&q_aux);
++		selwakeup(&aux.sel);
++	}
++	lck_mtx_unlock(&q_lock);
++	if (!ok && aux.open && (q_aux.dropped < 10 || q_aux.dropped % 1000 == 0)) {
++		SAY("aux queue full (%u packets): packet type %u to port %#x dropped (%llu dropped)\n", q_aux.count, h->type,
++		    h->dst_port, q_aux.dropped);
++	}
++}
++
++int
++sbb_dev_data(unsigned which, uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len)
++{
++	if (which != SBB_DEV_AUX) {
++		return sbb_wland_data(src_port, dst_port, data, len);
++	}
++	struct sbb_qrtr_hdr h = { 1, SBB_QRTR_DATA, SBB_NODE_APPS, src_port, 0, len, SBB_NODE_APPS, dst_port };
++	if (!aux.open) {
++		return -1;
++	}
++	to_aux(&h, (const uint8_t *)data, len);
++	return 0;
++}
++
++bool
++sbb_dev_open(unsigned which)
++{
++	return which == SBB_DEV_AUX ? aux.open : dev.open;
++}
++
+ static void
+ to_router(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ {
+@@ -627,6 +679,10 @@ qrtr_in(const uint8_t *d, uint32_t n)
+ 			sweet_ssr_qrtr_in(SWEET_SSR_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, p, pl);
+ 			return;
+ 		}
++		if (aux_port(h.dst_port)) {                 /* 1124: sweetlocd's ports: only its device */
++			to_aux(&h, p, pl);
++			return;
++		}
+ 		if (router_port(h.dst_port)) {
+ 			to_router(&h, p, pl);
+ 		} else {
+@@ -654,10 +710,18 @@ qrtr_in(const uint8_t *d, uint32_t n)
+ 		if (router_port(h.dst_port)) {
+ 			return;                         /* the router does not flow-control its sends */
+ 		}
++		if (aux_port(h.dst_port)) {
++			to_aux(&h, p, pl);              /* 1124 */
++			return;
++		}
+ 		break;
+ 	default:
+ 		break;
+ 	}
++	if (h.type == SBB_QRTR_NEW_SERVER || h.type == SBB_QRTR_DEL_SERVER || h.type == SBB_QRTR_BYE ||
++	    h.type == SBB_QRTR_DEL_CLIENT) {
++		to_aux(&h, p, pl);                      /* 1124: the aux client learns the servers as wland does */
++	}
+ 	if (sweet_bb & SBB_QMUX) {
+ 		to_router(&h, p, pl);
+ 	}
+@@ -1293,7 +1357,7 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
+ 	uint32_t rest = (uint32_t)(n - (user_ssize_t)sizeof(h));
+ 	uint32_t len = h.size < rest ? h.size : rest;
+ 	if (router_port(h.src_port) || h.src_port == SWEET_SSR_MDM_PORT || ((sweet_bb & SBB_DATA) && sweet_ipa_port(h.src_port)) ||
+-	    h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
++	    aux_port(h.src_port) || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {     /* 1124: aux ports are sweetlocd's */
+ 		dev.refused++;
+ 		return EPERM;
+ 	}
+@@ -1346,6 +1410,192 @@ mq_select(__unused dev_t d, int which, void *wql, proc_t p)
+ 	return ready;
+ }
+ 
++/* ---- 1124: /dev/sweet-mqrtr-aux (sweetlocd; kern.sweet_mqrtr_aux) ---- */
++
++static int
++ax_open(__unused dev_t d, __unused int flags, __unused int devtype, proc_t p)
++{
++	if (!(mqrtr_aux & 1)) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&q_lock);
++	if (aux.open) {
++		lck_mtx_unlock(&q_lock);
++		return EBUSY;
++	}
++	aux.open = true;
++	aux.pid = proc_pid(p);
++	aux.used = 0;
++	unsigned n = 0;
++	for (int i = 0; i < NSRV; i++) {
++		if (srv[i].up) {
++			struct sbb_qrtr_hdr h = { 1, SBB_QRTR_NEW_SERVER, srv[i].node, SBB_PORT_CTRL, 0, 20, SBB_NODE_APPS, SBB_PORT_CTRL };
++			uint32_t w[5] = { SBB_QRTR_NEW_SERVER, srv[i].svc, srv[i].inst, srv[i].node, srv[i].port };
++			n += q_put_locked(&q_aux, &h, (const uint8_t *)w, sizeof(w));
++		}
++	}
++	lck_mtx_unlock(&q_lock);
++	SAY("/dev/sweet-mqrtr-aux opened by pid %d (link state %d, %u servers given again)\n", aux.pid, gl.state, n);
++	return 0;
++}
++
++static int
++ax_close(__unused dev_t d, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&q_lock);
++	aux.open = false;
++	uint32_t used = aux.used;
++	aux.used = 0;
++	selthreadclear(&aux.sel);
++	wakeup(&q_aux);
++	lck_mtx_unlock(&q_lock);
++	q_clear(&q_aux);
++	unsigned sent = 0;
++	if (!(mqrtr_aux & 2) && gl.state == 2) {
++		for (unsigned i = 0; i < SBB_AUX_NPORTS; i++) {
++			if (used & (1u << i)) { /* as Linux qrtr_port_remove: the modem's services drop this client */
++				uint32_t w[5] = { SBB_QRTR_DEL_CLIENT, SBB_NODE_APPS, SBB_AUX_PORT0 + i, 0, 0 };
++				if (sbb_qrtr_send(SBB_QRTR_DEL_CLIENT, SBB_AUX_PORT0 + i, SBB_NODE_BCAST, SBB_PORT_CTRL, w, sizeof(w)) == 0) {
++					sent++;
++				}
++			}
++		}
++		aux.delcl += sent;
++	}
++	SAY("/dev/sweet-mqrtr-aux closed (pid %d): %llu packets read, %llu written (%llu bytes), %u refused, %llu dropped, "
++	    "DEL_CLIENT for %u port(s)%s\n", aux.pid, aux.reads, aux.writes, aux.write_bytes, aux.refused, q_aux.dropped, sent,
++	    (mqrtr_aux & 2) ? " (off: kern.sweet_mqrtr_aux & 2)" : "");
++	return 0;
++}
++
++static int
++ax_read(__unused dev_t d, struct uio *uio, int ioflag)
++{
++	struct sbb_pkt *p;
++	int e = 0;
++	lck_mtx_lock(&q_lock);
++	while ((p = q_aux.first) == NULL) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&q_lock);
++			return EWOULDBLOCK;
++		}
++		e = msleep(&q_aux, &q_lock, PCATCH | PZERO, "mqrtraux", NULL);
++		if (e) {
++			lck_mtx_unlock(&q_lock);
++			return e;
++		}
++	}
++	if (uio_resid(uio) < (user_ssize_t)(sizeof(p->h) + p->n)) {
++		lck_mtx_unlock(&q_lock);
++		return EMSGSIZE;
++	}
++	q_aux.first = p->next;
++	if (!q_aux.first) {
++		q_aux.last = NULL;
++	}
++	q_aux.count--;
++	q_aux.bytes -= p->n;
++	lck_mtx_unlock(&q_lock);
++	p->h.size = p->n;
++	e = uiomove((caddr_t)&p->h, sizeof(p->h), uio);
++	if (e == 0 && p->n) {
++		e = uiomove((caddr_t)p->d, (int)p->n, uio);
++	}
++	aux.reads++;
++	pkt_free(p);
++	return e;
++}
++
++/*
++ * As mq_write (header + payload in one write, blocking at most 3 s), but only from its own ports and only DATA or
++ * RESUME_TX: DATA to node 1 is allowed only to the PDS relay port (kept in the kernel); everything else goes to the modem.
++ */
++static int
++ax_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
++{
++	struct sbb_qrtr_hdr h = { 0, 0, 0, 0, 0, 0, 0, 0 };
++	user_ssize_t n = uio_resid(uio);
++	if (n < (user_ssize_t)sizeof(h) || n > (user_ssize_t)(sizeof(h) + 65536)) {
++		return EINVAL;
++	}
++	int e = uiomove((caddr_t)&h, sizeof(h), uio);
++	if (e) {
++		return e;
++	}
++	uint32_t rest = (uint32_t)(n - (user_ssize_t)sizeof(h));
++	uint32_t len = h.size < rest ? h.size : rest;
++	bool pdsr = h.type == SBB_QRTR_DATA && h.dst_node == SBB_NODE_APPS && h.dst_port == SBB_PDSR_PORT;
++	if (!aux_port(h.src_port) || (h.type != SBB_QRTR_DATA && h.type != SBB_QRTR_RESUME_TX) ||
++	    (h.dst_node == SBB_NODE_APPS && !pdsr) || (pdsr && !(sweet_bb & SBB_QMUX))) {
++		aux.refused++;
++		return EPERM;
++	}
++	uint8_t *b = NULL;
++	if (rest) {
++		b = kalloc_data(rest, Z_WAITOK);
++		if (b == NULL) {
++			return ENOMEM;
++		}
++		e = uiomove((caddr_t)b, (int)rest, uio);
++	}
++	if (e == 0 && pdsr) {
++		sweet_qmux_c2w(SBB_DEV_AUX, h.src_port, SBB_PDSR_C2W, b, len);  /* the PDS relay: never to the modem */
++	} else if (e == 0) {
++		e = qrtr_send_hdr(&h, b, len);
++		if (e == 0 && h.type == SBB_QRTR_DATA) {
++			lck_mtx_lock(&q_lock);
++			aux.used |= 1u << (h.src_port - SBB_AUX_PORT0);
++			lck_mtx_unlock(&q_lock);
++		}
++	}
++	if (b) {
++		kfree_data(b, rest);
++	}
++	if (e == 0) {
++		aux.writes++;
++		aux.write_bytes += len;
++	}
++	return e;
++}
++
++static int
++ax_ioctl(__unused dev_t d, __unused u_long cmd, __unused caddr_t data, __unused int flag, __unused proc_t p)
++{
++	return ENOTTY;                          /* no link control from here */
++}
++
++static int
++ax_select(__unused dev_t d, int which, void *wql, proc_t p)
++{
++	int ready = 1;
++	if (which == FREAD) {
++		lck_mtx_lock(&q_lock);
++		ready = q_aux.first != NULL;
++		if (!ready) {
++			selrecord(p, &aux.sel, wql);
++		}
++		lck_mtx_unlock(&q_lock);
++	}
++	return ready;
++}
++
++static const struct cdevsw ax_cdevsw = {
++	.d_open       = ax_open,
++	.d_close      = ax_close,
++	.d_read       = ax_read,
++	.d_write      = ax_write,
++	.d_ioctl      = ax_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = ax_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
+ static const struct cdevsw mq_cdevsw = {
+ 	.d_open       = mq_open,
+ 	.d_close      = mq_close,
+@@ -1367,6 +1617,8 @@ static const struct cdevsw mq_cdevsw = {
+ 
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_bb, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_bb, 0,
+     "redfin 1067: boot-arg sweetbb (0x01 kernel modem link + /dev/sweet-mqrtr, 0x02 kernel QMI router; 0 = wland does both)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_mqrtr_aux, CTLFLAG_RW | CTLFLAG_LOCKED, &mqrtr_aux, 0,
++    "redfin 1124: /dev/sweet-mqrtr-aux for sweetlocd (0 off = open fails, default; bit 0 allowed, bit 1 no DEL_CLIENT at close)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_mlink_idle_us, CTLFLAG_RW | CTLFLAG_LOCKED, &idle_us, 0,
+     "redfin 1067: the modem link's poll period after 2 s without traffic (us, >= 1000; 1 ms while there is traffic)");
+ 
+@@ -1410,10 +1662,12 @@ sysctl_bb_state SYSCTL_HANDLER_ARGS
+ 	}
+ 	int o = snprintf(s, cap, "sweetbb 0x%x | link state %d (ups %u, reinits %u) rcid %u intents %d | rx %llu pkts %llu B, tx %llu pkts %llu B, "
+ 	    "intent reqs %u, tx fail %u, unknown %u, other ch %u, too big %u | wland dev %s pid %d: queued %u (%u B) in %llu dropped %llu, "
+-	    "read %llu written %llu refused %u | router q %u in %llu dropped %llu | thread rounds %llu | servers:",
++	    "read %llu written %llu refused %u | aux dev %s pid %d: queued %u dropped %llu read %llu written %llu refused %u delclient %llu "
++	    "| router q %u in %llu dropped %llu | thread rounds %llu | servers:",
+ 	    sweet_bb, gl.state, gl.ups, gl.reinits, gl.rcid, gl.nri, gl.rx_pkts, gl.rx_bytes, gl.tx_pkts, gl.tx_bytes, gl.intent_reqs,
+ 	    gl.tx_fail, gl.unknown_cmds, gl.rx_other_ch, gl.too_big, dev.open ? "open" : "closed", dev.pid, q_wland.count, q_wland.bytes,
+-	    q_wland.in, q_wland.dropped, dev.reads, dev.writes, dev.refused, q_router.count, q_router.in, q_router.dropped, rounds);
++	    q_wland.in, q_wland.dropped, dev.reads, dev.writes, dev.refused, aux.open ? "open" : "closed", aux.pid, q_aux.count,
++	    q_aux.dropped, aux.reads, aux.writes, aux.refused, aux.delcl, q_router.count, q_router.in, q_router.dropped, rounds);
+ 	for (int i = 0; i < NSRV && o < (int)cap - 32; i++) {
+ 		if (srv[i].up) {
+ 			o += snprintf(s + o, cap - (size_t)o, " %x:%x@%u:%x", srv[i].svc, srv[i].inst, srv[i].node, srv[i].port);
+@@ -1464,6 +1718,9 @@ sweet_bb_init(void)
+ 	int major = cdevsw_add(-1, &mq_cdevsw);
+ 	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "sweet-mqrtr");
+ 	SAY("/dev/sweet-mqrtr %s (major %d)\n", node ? "made" : "FAILED", major);
++	int amajor = cdevsw_add(-1, &ax_cdevsw);       /* 1124: usable only with kern.sweet_mqrtr_aux & 1 */
++	void *anode = amajor < 0 ? NULL : devfs_make_node(makedev(amajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "sweet-mqrtr-aux");
++	SAY("/dev/sweet-mqrtr-aux %s (major %d, kern.sweet_mqrtr_aux %d)\n", anode ? "made" : "FAILED", amajor, mqrtr_aux);
+ 	if (v & SBB_REALBOOT) {
+ 		SAY("sweetbb & 0x40: real ABM baseband boot (emulated Mav17 BHI/Sahara on pipes pbl/sahara, images discarded)\n");
+ 	}
+diff --git a/bsd/dev/sweet_bb.h b/bsd/dev/sweet_bb.h
+index c8fc3bb..cb9144f 100644
+--- a/bsd/dev/sweet_bb.h
++++ b/bsd/dev/sweet_bb.h
+@@ -29,6 +29,20 @@
+  */
+ #define SBB_PDSR_PORT           (SBB_QMUX_PORT0 + SBB_QMUX_NPORTS - 3u)
+ #define SBB_PDSR_C2W            0x50u
++/*
++ * 1124: a second QRTR client device, /dev/sweet-mqrtr-aux, for our own daemons other than wland (sweetlocd). Its own
++ * read queue and its own ports SBB_AUX_PORT0..+SBB_AUX_NPORTS: DATA from the modem to those ports goes only to it, the
++ * modem's servers are given again at open and NEW_SERVER/DEL_SERVER/BYE/DEL_CLIENT are copied to it; it never sees
++ * wland's or the router's traffic, and wland may not write from its ports. No link control (no MQRTR_IOC_UP): opening,
++ * closing or a crash of its process never touches the GLINK link that carries calls/SMS. kern.sweet_mqrtr_aux (default
++ * 0 = open fails ENXIO): bit 0 allowed, bit 1 = no QRTR DEL_CLIENT to the modem for its ports at close (default: sent,
++ * as Linux does for a closed socket, so the modem's QMI services drop that client and its LOC session).
++ * The PDS relay (1122) answers whichever client says HELLO first on either device (sbb_dev_*: SBB_DEV_WLAND/AUX).
++ */
++#define SBB_AUX_PORT0           0x4700u
++#define SBB_AUX_NPORTS          0x10u
++#define SBB_DEV_WLAND           0u
++#define SBB_DEV_AUX             1u
+ 
+ enum {
+ 	SBB_QRTR_DATA = 1, SBB_QRTR_HELLO, SBB_QRTR_BYE, SBB_QRTR_NEW_SERVER, SBB_QRTR_DEL_SERVER, SBB_QRTR_DEL_CLIENT,
+@@ -51,6 +65,8 @@ bool sbb_server_svc(uint32_t svc, uint32_t *node, uint32_t *port, uint32_t *veri
+ int sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
+ int sbb_wland_data(uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len);      /* 1122: DATA to wland only */
+ bool sbb_wland_open(void);                                                                      /* 1122 */
++int sbb_dev_data(unsigned dev, uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len);  /* 1124: wland or aux */
++bool sbb_dev_open(unsigned dev);                                                                /* 1124 */
+ 
+ /* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
+ bool sweet_qmux_on(void);
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 4debcc8..62693e4 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -4438,6 +4438,10 @@ d_port_reserved(uint32_t port)
+  * HELLO in 30 s, /dev/sweet-mqrtr closed), says "not mine", or does not answer in kern.sweet_qmux_pds_ms (default 400);
+  * 3 timeouts in a row = wland treated as gone until its next HELLO. Late answers are dropped. Default 0: no relay at
+  * all, wland's HELLO is only answered (flags 0). PDS is never forwarded to the modem.
++ * 1124: "wland" above is now whichever client said HELLO first, on /dev/sweet-mqrtr (wland) or /dev/sweet-mqrtr-aux
++ * (sweetlocd, phone/locd): records are tagged with their device, the answers go back to that device and port. A second
++ * client's HELLO while the first is live (HELLO < 30 s, device open, < 3 timeouts) gets 0x84 flags 0x100 | the sysctl
++ * ("busy") and its records are ignored; the relay passes on when the first one says BYE, closes its device or goes quiet.
+  */
+ #define PDSR_MAGIC      0x52534450u     /* 'PDSR' */
+ #define NPDSR           32
+@@ -4450,7 +4454,9 @@ struct pdsr {
+ };
+ static int pds_relay = 0, pds_relay_ms = 400;
+ static struct {
+-	uint32_t port;                          /* wland's QRTR port (0 = not there) */
++	uint32_t port;                          /* the relay client's QRTR port (0 = not there) */
++	unsigned dev;                           /* 1124: its device: SBB_DEV_WLAND or SBB_DEV_AUX (sweetlocd) */
++	uint32_t busy_said;
+ 	uint64_t hello;
+ 	int fails;
+ 	uint32_t reqs, resp, unhandled, timeouts, local, inds, inds_drop, late, said;
+@@ -4465,11 +4471,18 @@ static uint32_t pr_tag;
+ static int pdsr_bypass;
+ static void handle(unsigned pipe, uint32_t sess, unsigned type, const uint8_t *d, uint32_t n);
+ 
++static const char *
++pdsr_who(unsigned which)
++{
++	return which == SBB_DEV_AUX ? "sweetlocd (aux)" : "wland";
++}
++
++/* 1124: to one client (dev, port) */
+ static int
+-pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag, unsigned code,
+-    const uint8_t *data, uint32_t len)
++pdsr_send_to(unsigned which, uint32_t port, uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag,
++    unsigned code, const uint8_t *data, uint32_t len)
+ {
+-	if (pr.port == 0 || len > 8192) {
++	if (port == 0 || len > 8192) {
+ 		return -1;
+ 	}
+ 	uint8_t *b = kalloc_data(sizeof(struct pdsr) + len, Z_WAITOK);
+@@ -4481,15 +4494,22 @@ pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess
+ 	if (len) {
+ 		memcpy(b + sizeof(h), data, len);
+ 	}
+-	int e = sbb_wland_data(SBB_PDSR_PORT, pr.port, b, (uint32_t)sizeof(h) + len);
++	int e = sbb_dev_data(which, SBB_PDSR_PORT, port, b, (uint32_t)sizeof(h) + len);
+ 	kfree_data(b, sizeof(struct pdsr) + len);
+ 	return e;
+ }
+ 
++static int
++pdsr_send(uint8_t op, unsigned cid, unsigned flags, uint32_t pipe, uint32_t sess, uint32_t tag, unsigned code,
++    const uint8_t *data, uint32_t len)
++{
++	return pdsr_send_to(pr.dev, pr.port, op, cid, flags, pipe, sess, tag, code, data, len);
++}
++
+ static bool
+ pdsr_live(uint64_t now)
+ {
+-	return pds_relay == 1 && pr.port != 0 && sbb_wland_open() && now - pr.hello < 30000;
++	return pds_relay == 1 && pr.port != 0 && sbb_dev_open(pr.dev) && now - pr.hello < 30000;
+ }
+ 
+ static void
+@@ -4558,7 +4578,7 @@ pdsr_relay(unsigned pipe, uint32_t sess, unsigned cid, unsigned msg, const uint8
+ 	prp[k].t = now;
+ 	prp[k].f = f;
+ 	pr.reqs++;
+-	note_seen(0x06, msg, "wland", "1122: PDS relayed to wland (kern.sweet_qmux_pds 1)");
++	note_seen(0x06, msg, pdsr_who(pr.dev), "1122/1124: PDS relayed to the registered client (kern.sweet_qmux_pds 1)");
+ 	return 1;
+ }
+ 
+@@ -4593,9 +4613,9 @@ pdsr_cid(int alloc, unsigned cid)
+ 	}
+ }
+ 
+-/* a record from wland (the router thread, from the c2w queue) */
++/* a record from a relay client (the router thread, from the c2w queue; which = its device, 1124) */
+ static void
+-pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
++pdsr_in(unsigned which, uint32_t port, const uint8_t *d, uint32_t n)
+ {
+ 	struct pdsr h;
+ 	if (n < sizeof(h)) {
+@@ -4604,28 +4624,47 @@ pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
+ 	memcpy(&h, d, sizeof(h));
+ 	if (h.magic != PDSR_MAGIC || h.len > n - sizeof(h)) {
+ 		if (pr.said++ < 10) {
+-			LOG("PDS relay: bad record from wland port %#x (%u bytes)\n", port, n);
++			LOG("PDS relay: bad record from %s port %#x (%u bytes)\n", pdsr_who(which), port, n);
+ 		}
+ 		return;
+ 	}
+ 	const uint8_t *data = d + sizeof(h);
+ 	uint64_t now = sbb_ms();
++	bool owner = pr.port == port && pr.dev == which;
++	if (!owner && pr.port != 0 && now - pr.hello < 30000 && pr.fails < 3 && sbb_dev_open(pr.dev)) {
++		/* 1124: another client holds the relay: it is told (0x84 flags 0x100) and nothing else of it is used */
++		if (h.op == 1) {
++			if (pr.busy_said++ < 10) {
++				LOG("PDS relay: %s at port %#x said HELLO, but %s at port %#x has the relay\n", pdsr_who(which), port,
++				    pdsr_who(pr.dev), pr.port);
++			}
++			(void)pdsr_send_to(which, port, 0x84, 0, 0x100u | (unsigned)pds_relay, 0, 0, 0, 0, NULL, 0);
++		}
++		return;
++	}
++	if (!owner && h.op != 1) {
++		return;                 /* not registered (no HELLO yet): ignored */
++	}
+ 	switch (h.op) {
+ 	case 1:         /* HELLO */
+-		if (pr.port != port || now - pr.hello >= 30000 || pr.fails >= 3) {
+-			LOG("PDS relay: wland at port %#x (kern.sweet_qmux_pds %d: %s)\n", port, pds_relay,
+-			    pds_relay == 1 ? "locationd's PDS goes to wland" : "not used, PDS answered here");
++		if (!owner || now - pr.hello >= 30000 || pr.fails >= 3) {
++			LOG("PDS relay: %s at port %#x (kern.sweet_qmux_pds %d: %s)\n", pdsr_who(which), port, pds_relay,
++			    pds_relay == 1 ? "locationd's PDS goes there" : "not used, PDS answered here");
++		}
++		if (!owner && pr.port != 0) {
++			pdsr_drop_all("relay client changed");
+ 		}
++		pr.dev = which;
+ 		pr.port = port;
+ 		pr.hello = now;
+ 		pr.fails = 0;
+ 		(void)pdsr_send(0x84, 0, (unsigned)pds_relay, 0, 0, 0, 0, NULL, 0);
+ 		break;
+ 	case 4:         /* BYE */
+-		LOG("PDS relay: wland said bye (%u relayed, %u answered by wland, %u not its own, %u timeouts, %u inds)\n", pr.reqs,
++		LOG("PDS relay: %s said bye (%u relayed, %u answered by it, %u not its own, %u timeouts, %u inds)\n", pdsr_who(pr.dev), pr.reqs,
+ 		    pr.resp, pr.unhandled, pr.timeouts, pr.inds);
+ 		pr.port = 0;
+-		pdsr_drop_all("wland said bye");
++		pdsr_drop_all("client said bye");
+ 		break;
+ 	case 2: {       /* RESP */
+ 		int k = -1;
+@@ -4636,14 +4675,14 @@ pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
+ 		}
+ 		if (k < 0) {
+ 			if (pr.late++ < 10) {
+-				LOG("PDS relay: wland's answer to request %u came late (answered here already)\n", h.tag);
++				LOG("PDS relay: %s's answer to request %u came late (answered here already)\n", pdsr_who(which), h.tag);
+ 			}
+ 			break;
+ 		}
+ 		pr.fails = 0;
+ 		if (!(h.flags & 1)) {
+ 			pr.unhandled++;
+-			pdsr_local(k, "wland: not its message");
++			pdsr_local(k, "client: not its message");
+ 			break;
+ 		}
+ 		uint32_t pipe = prp[k].pipe, sess = prp[k].sess;
+@@ -4664,7 +4703,7 @@ pdsr_in(uint32_t port, const uint8_t *d, uint32_t n)
+ 		if (pds_relay == 1 && sess_live(h.pipe, h.sess) && cid_live(h.pipe, h.sess, 0x06, h.cid)) {
+ 			send_ind(h.pipe, h.sess, 0x06, h.cid, h.code, data, h.len);
+ 			if (pr.inds++ < 3) {
+-				LOG("PDS relay: indication 0x%04x from wland to %s/%u cid %u (%u TLV bytes)\n", h.code,
++				LOG("PDS relay: indication 0x%04x from %s to %s/%u cid %u (%u TLV bytes)\n", h.code, pdsr_who(which),
+ 				    h.pipe < NPIPES ? pipe_name[h.pipe] : "?", h.sess, h.cid, h.len);
+ 			}
+ 		} else {
+@@ -4688,17 +4727,18 @@ pdsr_poll(uint64_t now)
+ 		if (prp[i].used && now > prp[i].t && now - prp[i].t > (uint64_t)(pds_relay_ms > 0 ? pds_relay_ms : 400)) {
+ 			pr.timeouts++;
+ 			if (++pr.fails == 3) {
+-				LOG("PDS relay: wland did not answer 3 times: PDS answered here until its next HELLO\n");
++				LOG("PDS relay: %s did not answer 3 times: PDS answered here until its next HELLO\n", pdsr_who(pr.dev));
+ 			}
+-			pdsr_local(i, "wland's answer timed out");
++			pdsr_local(i, "the client's answer timed out");
+ 		}
+ 	}
+ 	if (pr.fails >= 3 && pr.port != 0) {
+ 		pr.port = 0;
+-		pdsr_drop_all("wland gone");
++		pdsr_drop_all("client gone");
+ 	}
+-	if (pds_relay != 1 || (pr.port != 0 && !sbb_wland_open())) {
+-		if (pr.port != 0 && !sbb_wland_open()) {
++	if (pds_relay != 1 || (pr.port != 0 && !sbb_dev_open(pr.dev))) {
++		if (pr.port != 0 && !sbb_dev_open(pr.dev)) {
++			LOG("PDS relay: %s closed its device: PDS answered here until a client's next HELLO\n", pdsr_who(pr.dev));
+ 			pr.port = 0;
+ 		}
+ 		pdsr_drop_all("relay off");
+@@ -4707,7 +4747,7 @@ pdsr_poll(uint64_t now)
+ 		next = now + 60000;
+ 		if (pr.reqs != last_reqs) {
+ 			last_reqs = pr.reqs;
+-			LOG("PDS relay: %u relayed, %u answered by wland, %u not its own, %u timeouts, %u answered here, %u inds (%u dropped), "
++			LOG("PDS relay: %u relayed, %u answered by the client, %u not its own, %u timeouts, %u answered here, %u inds (%u dropped), "
+ 			    "%u late\n", pr.reqs, pr.resp, pr.unhandled, pr.timeouts, pr.local, pr.inds, pr.inds_drop, pr.late);
+ 		}
+ 	}
+@@ -5580,7 +5620,7 @@ sweet_qmux_poll(void)
+ 			break;
+ 		}
+ 		if (r->type == SBB_PDSR_C2W) {
+-			pdsr_in(r->sess, r->d, r->len);         /* 1122: from wland (sess = its QRTR port) */
++			pdsr_in(r->pipe, r->sess, r->d, r->len);        /* 1122/1124: from a relay client (pipe = device, sess = port) */
+ 		} else {
+ 			handle(r->pipe, r->sess, r->type, r->d, r->len);
+ 		}
+@@ -5737,8 +5777,8 @@ QINT(sweet_qmi_codec_tlv, qmi_codec_tlv, "redfin 1093: that indication's codec T
+ QINT(sweet_qmux_kick, kickon, "redfin 1068: 1 = RESUME_TX kick after 5 s without an answer (abpkick, default 1)");
+ QINT(sweet_qmux_holdnas, holdnas, "redfin 1068: NAS indications held until BSP activation (abpholdnas: 0 off, 1 = 5 s, >= 100 ms)");
+ QINT(sweet_qmux_holddly, holddly, "redfin 1068: ms after the BSP activation indication before held NAS indications go (abpholddly, 500)");
+-QINT(sweet_qmux_pds, pds_relay, "redfin 1122: 0 PDS answered here as before (default), 1 relayed to wland (loc.on pds=1) with local fallback");
+-QINT(sweet_qmux_pds_ms, pds_relay_ms, "redfin 1122: ms to wait for wland's PDS answer before the local answer (default 400)");
++QINT(sweet_qmux_pds, pds_relay, "redfin 1122/1124: 0 PDS answered here as before (default), 1 relayed to the client that said HELLO (sweetlocd or wland, loc.on pds=1) with local fallback");
++QINT(sweet_qmux_pds_ms, pds_relay_ms, "redfin 1122: ms to wait for the relay client's PDS answer before the local answer (default 400)");
+ QINT(sweet_qmi_republish_ms, repub_ms, "redfin 1073: ms after the BSP activation indication before the auto re-publish GETs (20)");
+ 
+ static int
+-- 
+2.53.0
+

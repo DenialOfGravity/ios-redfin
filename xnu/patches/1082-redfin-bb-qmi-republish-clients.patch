@@ -1,0 +1,204 @@
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index 6b77d43..f71be70 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -42,6 +42,7 @@
+  * Tunables (RW): kern.sweet_qmux_err (0x5e), _cidfail (0), _reuse (1), _kick (1), _holdnas (1), _holddly (500);
+  * kern.sweet_qmux_dump (write: the per-(svc, msg) table to the log). RD kern.sweet_bb_stats (sweet_bb.c).
+  * 1074: kern.sweet_voice_auto (0 off default, 1 earpiece, 2 speaker): the voice path follows the modem's VOICE call states.
++ * 1082: re-publish clients = NAS 0x0003 TLV 0x18/0x19 (not 0x12/0x13), fallbacks, choice logged; manual line timing fixed.
+  * 1073: kern.sweet_qmi_republish (0 off default, 1 auto once per CommCenter session, write 2 = now), _republish_ms (20).
+  * Log lines "SWEET QMUX:".
+  */
+@@ -2374,15 +2375,19 @@ static int rp_armed, rp_done;
+ static uint64_t rp_at, rp_act;
+ static uint32_t rp_pipe, rp_sess, rp_done_pipe, rp_done_sess;
+ static unsigned rp_shots;
++static uint64_t rp_shot_act;            /* 1082: the activation time of the last auto shot (manual shots: none) */
+ 
+-/* CommCenter's NAS 0x0003 (Register Indications): TLV 0x12 = SysInfo, 0x13 = SigInfo reporting */
++/*
++ * 1082: CommCenter's NAS 0x0003 (Register Indications). 1073 looked for TLV 0x12/0x13 (DDTM / serving system events), so
++ * no client ever qualified (phone, ws-n-bb-int2: "nothing sent in 5 s"). The SysInfo / SigInfo switches are TLV 0x18 /
++ * 0x19, as the policy's 'replay 0x004d 0x004e if 18' / '0x004f 0x0051 if 19' (hex) and P2-reg-result.md's capture
++ * (cid A: 10=01 23=01 13=00 18=01 ...). Every client that sent 0x0003 is recorded (any pipe/session; dead ones drop out
++ * through cid_live), with its 0x18/0x19 values (-1 = not in the request).
++ */
+ static void
+ nasreg_note(uint32_t pipe, uint32_t sess, unsigned cid, const uint8_t *rq, uint32_t rqn)
+ {
+-	int sys = tlv_byte(rq, rqn, 0x12), sig = tlv_byte(rq, rqn, 0x13), k = -1;
+-	if (sys < 0 && sig < 0) {
+-		return;
+-	}
++	int sys = tlv_byte(rq, rqn, 0x18), sig = tlv_byte(rq, rqn, 0x19), k = -1;
+ 	for (int i = 0; i < NNASREG && k < 0; i++) {
+ 		if (nasreg[i].used && nasreg[i].pipe == pipe && nasreg[i].sess == sess && nasreg[i].cid == cid) {
+ 			k = i;
+@@ -2403,10 +2408,21 @@ nasreg_note(uint32_t pipe, uint32_t sess, unsigned cid, const uint8_t *rq, uint3
+ 	r->sess = sess;
+ 	r->cid = (uint8_t)cid;
+ 	if (sys >= 0) {
+-		r->sys = sys > 0;
++		r->sys = sys == 1;
+ 	}
+ 	if (sig >= 0) {
+-		r->sig = sig > 0;
++		r->sig = sig == 1;
++	}
++	if (repub_mode) {
++		char ids[64];
++		int io = 0;
++		ids[0] = 0;
++		for (uint32_t q = 0; q + 3 <= rqn && io < (int)sizeof(ids) - 4;) {
++			io += snprintf(ids + io, sizeof(ids) - (size_t)io, "%s%02x", q ? "," : "", rq[q]);
++			q += 3 + (unsigned)(rq[q + 1] | (rq[q + 2] << 8));
++		}
++		LOG("re-publish: NAS client %s/%u cid %u registered indications (TLVs %s): sysinfo(0x18) %d, siginfo(0x19) %d\n",
++		    pipe < NPIPES ? pipe_name[pipe] : "?", sess, cid, ids, sys, sig);
+ 	}
+ }
+ 
+@@ -2442,23 +2458,75 @@ repub_get(const struct nasreg *r, unsigned get, unsigned ind, int kind)
+ 	return 1;
+ }
+ 
+-/* GETs for every live NAS client of CommCenter that registered for SysInfo / SigInfo; how many went out */
++/*
++ * 1082: which clients get the shot, best first: (1) live NAS clients that switched SysInfo / SigInfo on in 0x0003 (0x18 /
++ * 0x19 = 1: GET 0x004d / 0x004f for what each switched on); (2) else every live client that sent 0x0003 at all (both);
++ * (3) else every live NAS client of CommCenter (any pipe/session) that has a router client (both). The choice is logged.
++ * fallback: 0 = tiers 1-2 only (the auto shot waits for a registration until 5 s), 1 = tier 3 allowed.
++ */
+ static int
+-repub_send(int kind)
+-{
+-	int n = 0;
+-	for (int i = 0; i < NNASREG; i++) {
+-		struct nasreg *r = &nasreg[i];
+-		if (!r->used || !cid_live(r->pipe, r->sess, 0x03, r->cid)) {
+-			continue;
+-		}
+-		if (r->sys) {
+-			n += repub_get(r, 0x004d, 0x004e, kind);
++repub_send(int kind, int fallback)
++{
++	int n = 0, tier = 0, nc = 0;
++	char who[384];
++	int wo = 0;
++	who[0] = 0;
++	for (int t = 1; t <= 2 && !nc; t++) {
++		for (int i = 0; i < NNASREG; i++) {
++			struct nasreg *r = &nasreg[i];
++			if (!r->used || !cid_live(r->pipe, r->sess, 0x03, r->cid) || (t == 1 && !r->sys && !r->sig)) {
++				continue;
++			}
++			int a = 0, b = 0;
++			if (t == 1) {
++				a = r->sys ? repub_get(r, 0x004d, 0x004e, kind) : 0;
++				b = r->sig ? repub_get(r, 0x004f, 0x0051, kind) : 0;
++			} else {
++				a = repub_get(r, 0x004d, 0x004e, kind);
++				b = repub_get(r, 0x004f, 0x0051, kind);
++			}
++			if (a + b) {
++				nc++;
++				n += a + b;
++				tier = t;
++				if (wo < (int)sizeof(who) - 48) {
++					wo += snprintf(who + wo, sizeof(who) - (size_t)wo, " %s/%u cid %u%s%s", pipe_name[r->pipe], r->sess, r->cid,
++					    a ? " sys" : "", b ? " sig" : "");
++				}
++			}
+ 		}
+-		if (r->sig) {
+-			n += repub_get(r, 0x004f, 0x0051, kind);
++	}
++	if (!nc && fallback) {
++		for (unsigned i = 0; i < NSESS; i++) {
++			if (!B->st[i].sess || B->st[i].pipe >= NPIPES) {
++				continue;
++			}
++			for (unsigned c = 1; c < 255; c++) {
++				if (!((B->st[i].cids[0x03][c / 8] >> (c % 8)) & 1)) {
++					continue;
++				}
++				struct nasreg r;
++				bzero(&r, sizeof(r));
++				r.pipe = B->st[i].pipe;
++				r.sess = B->st[i].sess;
++				r.cid = (uint8_t)c;
++				int a = repub_get(&r, 0x004d, 0x004e, kind), b = repub_get(&r, 0x004f, 0x0051, kind);
++				if (a + b) {
++					nc++;
++					n += a + b;
++					tier = 3;
++					if (wo < (int)sizeof(who) - 48) {
++						wo += snprintf(who + wo, sizeof(who) - (size_t)wo, " %s/%u cid %u sys sig", pipe_name[r.pipe], r.sess, c);
++					}
++				}
++			}
+ 		}
+ 	}
++	if (nc) {
++		LOG("re-publish (%s): %d GET(s) for %d NAS client(s), %s:%s\n", kind == 2 ? "manual" : "auto", n, nc,
++		    tier == 1 ? "registered for SysInfo/SigInfo (0x0003 TLV 0x18/0x19 = 1)" : tier == 2 ?
++		    "fallback: sent 0x0003, none switched 0x18/0x19 on" : "fallback: every live NAS client (no 0x0003 seen)", who);
++	}
+ 	return n;
+ }
+ 
+@@ -2481,12 +2549,9 @@ repub_poll(uint64_t now)
+ {
+ 	if (repub_now) {
+ 		repub_now = 0;
+-		int n = repub_send(2);
+-		if (!n) {
+-			printf("SWEET QMUX: republish (manual): nothing sent (no live NAS client of CommCenter registered for SysInfo/SigInfo, "
++		if (!repub_send(2, 1)) {
++			printf("SWEET QMUX: republish (manual): nothing sent (no live NAS client of CommCenter with a router client, "
+ 			    "or no modem NAS server)\n");
+-		} else {
+-			LOG("re-publish (manual): %d GET(s) to the modem\n", n);
+ 		}
+ 	}
+ 	if (!rp_armed || now < rp_at) {
+@@ -2496,7 +2561,8 @@ repub_poll(uint64_t now)
+ 		rp_armed = 0;
+ 		return;
+ 	}
+-	int n = repub_send(1);
++	/* 1082: registered clients first; after 1 s more without one, every live NAS client */
++	int n = repub_send(1, now - rp_at >= 1000);
+ 	if (n) {
+ 		rp_armed = 0;
+ 		rp_done = 1;
+@@ -2504,10 +2570,11 @@ repub_poll(uint64_t now)
+ 		rp_done_sess = rp_sess;
+ 		LOG("re-publish (auto): %d GET(s) to the modem, %llu ms after the BSP activation indication on %s/%u\n", n,
+ 		    (unsigned long long)(now - rp_act), pipe_name[rp_pipe], rp_sess);
++		rp_shot_act = rp_act;
+ 	} else if (now - rp_act > 5000) {
+ 		rp_armed = 0;
+-		printf("SWEET QMUX: republish (auto): nothing sent in 5 s after the BSP activation on %s/%u (no NAS client registered "
+-		    "for SysInfo/SigInfo)\n", pipe_name[rp_pipe], rp_sess);
++		printf("SWEET QMUX: republish (auto): nothing sent in 5 s after the BSP activation on %s/%u (no live NAS client of "
++		    "CommCenter with a router client)\n", pipe_name[rp_pipe], rp_sess);
+ 	}
+ }
+ 
+@@ -2878,10 +2945,12 @@ sweet_qmux_qrtr(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 				int live = cl_get(x->rpipe, x->rsess, x->svc, x->rcid, 0) != NULL;
+ 				rp_shots++;
+ 				printf("SWEET QMUX: republish (%s) NAS GET 0x%04x -> indication 0x%04x (%u TLV bytes, modem's answer, TLVs %s%s%s) "
+-				    "to %s/%u cid %u%s [t=%llu ms, +%llu ms after BSP activation]\n", x->repub == 2 ? "manual" : "auto", x->msg,
++				    "to %s/%u cid %u%s [t=%llu ms, %s %llu ms]\n", x->repub == 2 ? "manual" : "auto", x->msg,
+ 				    x->ind_msg, o, ids, lte && ll >= 2 ? ", LTE srv " : "", lte && ll >= 2 ? (lte[0] == 2 ? "full" : lte[0] == 1 ?
+ 				    "limited" : lte[0] == 0 ? "none" : "other") : "", pipe_name[x->rpipe], x->rsess, x->rcid, live ? "" :
+-				    " (client gone: not sent)", (unsigned long long)sbb_ms(), (unsigned long long)(sbb_ms() - rp_act));
++				    " (client gone: not sent)", (unsigned long long)sbb_ms(), x->repub == 1 && rp_shot_act ?
++				    "after BSP activation +" : rp_act ? "since the last BSP activation" : "no BSP activation seen,",
++				    (unsigned long long)(x->repub == 1 && rp_shot_act ? sbb_ms() - rp_shot_act : rp_act ? sbb_ms() - rp_act : 0));
+ 				if (live) {
+ 					hold_bypass = 1;
+ 					send_ind(x->rpipe, x->rsess, x->svc, x->rcid, x->ind_msg, t, o);

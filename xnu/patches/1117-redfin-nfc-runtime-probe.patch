@@ -1,0 +1,178 @@
+From 44900eec99adaf5b3a6990a27e9012235470e9d8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 20:31:41 +0100
+Subject: [PATCH] 1117 redfin: NFC probe as a runtime switch
+ (kern.sweet_nfc_probe=1), lazy SE7 bring-up
+
+---
+ bsd/dev/sweet_mic.c | 40 +++++++++++++++++++++++++++++++++-------
+ bsd/dev/sweet_nfc.c | 23 ++++++++++++++---------
+ bsd/dev/sweet_ufs.c |  2 +-
+ 3 files changed, 48 insertions(+), 17 deletions(-)
+
+diff --git a/bsd/dev/sweet_mic.c b/bsd/dev/sweet_mic.c
+index f0caef4..8c1ba35 100644
+--- a/bsd/dev/sweet_mic.c
++++ b/bsd/dev/sweet_mic.c
+@@ -162,9 +162,10 @@ static struct {
+ } bus;
+ 
+ /*
+- * 1115: the bus is shared with the NFC controller (ST54J at 0x08, bsd/dev/sweet_nfc.c, boot-arg sweetnfc=1).
++ * 1115: the bus is shared with the NFC controller (ST54J at 0x08, bsd/dev/sweet_nfc.c; 1117: probed only on
++ * kern.sweet_nfc_probe=1 or boot-arg sweetnfc=1).
+  * sweet_se7_init() / sweet_se7_xfer() take se7_lock around bus_init() and around each transfer, so the
+- * codec's write+read pairs and NFC's packets never interleave. Without sweetnfc nobody else takes the lock.
++ * codec's write+read pairs and NFC's packets never interleave. Until an NFC probe runs nobody else takes the lock.
+  */
+ #define SE7_RX_MAX              64u     /* longest read; reads over 8 bytes drain the FIFO while it fills */
+ #define NFC_ADDR_SE7            0x08
+@@ -172,6 +173,7 @@ static LCK_GRP_DECLARE(se7_lock_group, "sweet-se7");
+ static LCK_MTX_DECLARE(se7_lock, &se7_lock_group);
+ extern bool sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt);
+ bool sweet_se7_init(void);
++bool sweet_se7_init_nfc(void);
+ int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
+ 
+ static bool
+@@ -224,11 +226,12 @@ bus_init(void)
+ 	if (bus.dead) {
+ 		return false;
+ 	}
+-	bus.se = ml_io_map(SE7_PA, 0x1000);
+-	bus.g18 = ml_io_map(GCC_PAGE_18, 0x1000);
+-	bus.g23 = ml_io_map(GCC_PAGE_23, 0x1000);
+-	bus.g52 = ml_io_map(GCC_PAGE_52, 0x1000);
+-	bus.west6 = ml_io_map(TLMM_WEST_PA + 0x6000u, 0x2000);          /* gpio6, gpio7 */
++	/* (1117: map once; a retry after sweet_se7_init_nfc() un-latched a failure reuses the mappings) */
++	bus.se = bus.se ? bus.se : ml_io_map(SE7_PA, 0x1000);
++	bus.g18 = bus.g18 ? bus.g18 : ml_io_map(GCC_PAGE_18, 0x1000);
++	bus.g23 = bus.g23 ? bus.g23 : ml_io_map(GCC_PAGE_23, 0x1000);
++	bus.g52 = bus.g52 ? bus.g52 : ml_io_map(GCC_PAGE_52, 0x1000);
++	bus.west6 = bus.west6 ? bus.west6 : ml_io_map(TLMM_WEST_PA + 0x6000u, 0x2000);  /* gpio6, gpio7 */
+ 	if (!bus.se || !bus.g18 || !bus.g23 || !bus.g52 || !bus.west6 || !bus_clocks()) {
+ 		bus.dead = true;
+ 		return false;
+@@ -383,6 +386,29 @@ sweet_se7_init(void)
+ 	return ok;
+ }
+ 
++/*
++ * 1117: the NFC probe's lazy bring-up (kern.sweet_nfc_probe=1 may come before the mic's first use). The same
++ * bus_init() under the same lock; if the bus was not up and this attempt fails, the failure is not latched
++ * (bus.dead cleared), so the mic's own first use still tries the bring-up as it does without NFC. A bus the
++ * mic already gave up on stays given up.
++ */
++bool
++sweet_se7_init_nfc(void)
++{
++	bool ok, was_dead;
++
++	lck_mtx_lock(&se7_lock);
++	was_dead = bus.dead;
++	ok = bus_init();
++	if (!ok && !was_dead) {
++		bus.dead = false;
++		bus.ready = false;
++		SAY("SE7 bring-up for NFC failed; not latched, the mic will try again on its first use\n");
++	}
++	lck_mtx_unlock(&se7_lock);
++	return ok;
++}
++
+ /*
+  * 1115: write nt bytes, then (with a repeated start) read nr bytes; or only one of them. Under the bus lock.
+  * Writes to the NFC controller's address pass only if bsd/dev/sweet_nfc.c's fixed allow-list has them.
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 7ba7c86..e135d42 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -9,8 +9,13 @@
+  *   gpio6/7 WEST 0x0f506000/0x0f507000, gpio12 EAST 0x0f90c000, gpio31 EAST 0x0f91f000,
+  *   gpio34 EAST 0x0f922000, gpio35 EAST 0x0f923000, gpio58 WEST 0x0f53a000, gpio69 EAST 0x0f945000.
+  *
+- * Boot-arg sweetnfc (default 0): 0 = nothing at all is touched (no pin read, no bus, no thread).
+- * sweetnfc=1, from a kernel thread 1 s after sweet_nfc_init(), never on the boot path:
++ * 1117: a runtime switch, no boot-arg needed. By default nothing at all is touched at boot (no pin read, no bus,
++ * no thread). Writing kern.sweet_nfc_probe=1 on the running phone runs the probe below once, in a kernel thread
++ * (again on each later write of 1; EBUSY while one runs; EPERM once state is "loader", latched until reboot).
++ * The SE7 bus is brought up lazily by the first probe if the mic driver has not done it yet
++ * (sweet_se7_init_nfc(): a failed bring-up from here is not latched, so the mic can still try it later).
++ * The boot-arg sweetnfc=1 still works as an alternative: it starts the same probe 1 s after sweet_nfc_init().
++ * The probe, from a kernel thread, never on the boot path:
+  *   1. log the TLMM config of gpio6/7/12/31/34/35/58/69 (read only)
+  *   2. VEN high, then Android st21nfc's PULSE_RESET (20 ms low, 10 ms high, 20 ms low, high)
+  *   3. wait up to 100 ms for IRQ high (gpio34 polled), read the packet the chip sends: 3-byte header with
+@@ -29,7 +34,7 @@
+  * touched (gpio35 is only read). No firmware download, no configuration writes.
+  *
+  * Sysctls: kern.sweet_nfc_state (off/probing/router/loader/error:<why>), kern.sweet_nfc_ver (decoded
+- * versions), kern.sweet_nfc_probe (write 1: probe again; only with sweetnfc=1 and not after loader mode).
++ * versions), kern.sweet_nfc_probe (reads the number of probes run; write 1: probe now; refused after loader mode).
+  * Log lines: "SWEET NFC: ...".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -48,7 +53,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t thread);
+-extern bool sweet_se7_init(void);
++extern bool sweet_se7_init_nfc(void);
+ extern int sweet_se7_xfer(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr);
+ void sweet_nfc_init(void);
+ bool sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt);
+@@ -353,7 +358,7 @@ nfc_probe(void)
+ 	}
+ 	pins_log("pins");
+ 	lines_log("before");
+-	if (!sweet_se7_init()) {
++	if (!sweet_se7_init_nfc()) {     /* 1117: lazy; brings SE7 up if the mic driver has not */
+ 		set_state("error:i2c_bus");
+ 		SAY("SE7 I2C bus not up: nothing sent\n");
+ 		return;
+@@ -469,7 +474,7 @@ nfc_start(bool at_boot)
+ {
+ 	thread_t thread;
+ 
+-	if (nfc_bootarg != 1 || nfc_loader) {
++	if (nfc_loader) {               /* (1117: no longer needs sweetnfc=1; loader mode stays latched) */
+ 		return EPERM;
+ 	}
+ 	if (__atomic_exchange_n(&nfc_busy, true, __ATOMIC_ACQ_REL)) {
+@@ -516,17 +521,17 @@ sysctl_nfc_probe SYSCTL_HANDLER_ARGS
+ 	return value == 1 ? nfc_start(false) : EINVAL;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_probe, "I",
+-    "redfin 1115: write 1 to probe the NFC controller again (sweetnfc=1 only; never after loader mode)");
++    "redfin 1117: write 1 to run the read-only NFC probe now (no boot-arg needed; never after loader mode)");
+ 
+ void
+ sweet_nfc_init(void)
+ {
+ 	if (!PE_parse_boot_argn("sweetnfc", &nfc_bootarg, sizeof(nfc_bootarg)) || nfc_bootarg == 0) {
+ 		nfc_bootarg = 0;
+-		return;                 /* nothing touched */
++		return;                 /* nothing touched (1117: kern.sweet_nfc_probe=1 probes on demand) */
+ 	}
+ 	if (nfc_bootarg != 1) {
+-		SAY("sweetnfc=%u is not a P0 value (1): off\n", nfc_bootarg);
++		SAY("sweetnfc=%u is not a P0 value (1): no probe at boot\n", nfc_bootarg);
+ 		return;
+ 	}
+ 	SAY("sweetnfc=1: read-only probe of the ST54J at SE7 0x08 in 1 s\n");
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 839d688..8ef446e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1955,7 +1955,7 @@ sweet_ufs_init(void)
+ 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
+ 	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
+ 	sweet_btbridge_init();	/* /dev/cu.bluetooth etc. <-> btd (btbridge=1): bsd/dev/sweet_btbridge.c */
+-	sweet_nfc_init();	/* 1115: NFC P0 read-only ST54J probe (sweetnfc=1; default off): bsd/dev/sweet_nfc.c */
++	sweet_nfc_init();	/* 1115/1117: NFC P0 read-only ST54J probe (kern.sweet_nfc_probe=1 or sweetnfc=1; default off): bsd/dev/sweet_nfc.c */
+ 	sweet_abp_init();	/* 1061: AppleBasebandPCI stand-in + /dev/abpbridge (sweetabp=1|2): bsd/dev/sweet_abp.c */
+ 	sweet_usb_probe();
+ 	return 0;
+-- 
+2.53.0
+

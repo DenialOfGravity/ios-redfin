@@ -1,0 +1,72 @@
+From f42d47b24aa6ee3e73e3d21ad81016868775a3fc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 21:28:33 +0100
+Subject: [PATCH 2/3] 1121 redfin: kern.sweet_ui_bigcore bit 32 tags
+ hakios.metal.defer* threads (HM_DEFER) as display class (default off)
+
+---
+ bsd/dev/sweet_cpufreq.c | 9 +++++----
+ osfmk/kern/sched_prim.c | 5 +++++
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index cf80338..3b67bac 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -206,7 +206,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTL
+  * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; 1046: default 1, was 0): 1 threads named
+  * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
+  * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
+- * normal choice (never waits). Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
++ * normal choice (never waits). 1121: 32 also tags threads named hakios.metal.defer* (hakios-metal HM_DEFER) as display class. Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
+  */
+ extern int sweet_ui_bigcore;
+ static int
+@@ -218,17 +218,18 @@ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
+ 	if (error || !changed) {
+ 		return error;
+ 	}
+-	if (value < 0 || value > 31) {
++	if (value < 0 || value > 63) {
+ 		return EINVAL;
+ 	}
+ 	sweet_ui_bigcore = value;
+ 	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower; "
+-	    "1106: 4 display gold / render-server prime first, 8 no preempting the other class, 16 preempt equal priority)\n",
++	    "1106: 4 display gold / render-server prime first, 8 no preempting the other class, 16 preempt equal priority; "
++	    "1121: 32 hakios.metal.defer* threads named from now on are display class)\n",
+ 	    value);
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri)");
++    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display)");
+ 
+ /* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
+ static unsigned
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index f905d49..340c498 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5055,6 +5055,9 @@ static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display,
+  *      takes the other big core or falls back); keeps the display thread and the render server from kicking each other
+  *   16 equal priority: a tagged thread also preempts an untagged thread of its own priority on a big core (not only a
+  *      lower one); the preempted thread goes back to the run queue and takes any free core
++ *   32 (1121) threads named hakios.metal.defer* (hakios-metal's deferred recording thread, HM_DEFER) are tagged display
++ *      class like com.apple.coreanimation.display* (then placed by bit 1). Checked when the thread is named: set it
++ *      before the process using hakios-metal starts; clearing it does not untag threads already named
+  * Topology (SM7250, Kryo 475): CPU0-5 silver (A55, 1.8 GHz), CPU6 gold (A76, 2.2 GHz), CPU7 prime (A76, 2.4 GHz); one
+  * clutch pset; sweetgov's touch/frame boost (bsd/dev/sweet_cpufreq.c) holds both the gold and the prime domain.
+  * sweet_ui_cpu_cls[cpu]: the tagged class running on each CPU (processor_state_update_from_thread; 0 none, 1 render-server,
+@@ -5079,6 +5082,8 @@ sweet_ui_thread_named(void *uth, const char *name)
+ 		f = TH_SFLAG_SWEET_UI_DISPLAY;
+ 	} else if (strncmp(name, "com.apple.coreanimation.render-server", 37) == 0) {
+ 		f = TH_SFLAG_SWEET_UI_RS;
++	} else if ((sweet_ui_bigcore & 32) && strncmp(name, "hakios.metal.defer", 18) == 0) {
++		f = TH_SFLAG_SWEET_UI_DISPLAY;  /* 1121: hakios-metal's HM_DEFER recording thread, display class (bit 1 places it) */
+ 	}
+ 	if (f == 0 && !(th->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
+ 		return;
+-- 
+2.53.0
+

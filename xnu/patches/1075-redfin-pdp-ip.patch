@@ -1,0 +1,864 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 77da757..4e88457 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -134,6 +134,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_geniuart.c		standard
+ bsd/dev/sweet_btbridge.c		standard
+ bsd/dev/sweet_abp.c			standard
++bsd/dev/sweet_pdp.c			standard
+ bsd/dev/sweet_voice.c			standard
+ bsd/dev/sweet_bb.c			standard
+ bsd/dev/sweet_qmux.c			standard
+diff --git a/bsd/dev/sweet_pdp.c b/bsd/dev/sweet_pdp.c
+new file mode 100644
+index 0000000..301ee25
+--- /dev/null
++++ b/bsd/dev/sweet_pdp.c
+@@ -0,0 +1,601 @@
++/*
++ * redfin 1075 (P4 / M3b): cellular data interfaces pdp_ip0..pdp_ip7 and the small API the future IPA driver uses.
++ *
++ * Only with boot-arg sweetbb & 0x10 (RO mirror kern.sweet_bb). With the bit clear nothing here runs: no ifnet, no
++ * protocol plumbers, the test sysctl refuses writes, and SweetABP's AppleIPAppender keeps 1061's accept-all answers.
++ *
++ * pdp_ipN: plain BSD ifnets (legacy model, no nexus), name "pdp_ip", unit N, IFT_CELLULAR / IFNET_FAMILY_CELLULAR,
++ * IFF_POINTOPOINT|IFF_MULTICAST|IFF_NOARP, raw IP (no link header; demux by the IP version nibble), MTU
++ * kern.sweet_pdp_mtu (1492). IPv4/IPv6 attach through protocol plumbers for IFNET_FAMILY_CELLULAR (only our units).
++ * CommCenter finds them by BSD name only (research/cc/P4-u2-classes.md Q2); ioctls such as SIOCGIFAFLAG_IN6,
++ * SIOCGIFNAT64PREFIX and SIOCGIFCLAT46ADDR are answered by the stack (in6_control), never by this driver.
++ * Created once, at the first SweetABP publish; never detached (no detach path to get wrong). Link (IFF_RUNNING +
++ * KEV_DL_LINK_ON/OFF) is down until the data plane calls sweet_pdp_link(unit, 1).
++ *
++ * API (sweet_pdp.h; call from thread context, never from a primary interrupt handler or with a spinlock held):
++ *   sweet_pdp_input(unit | SWEET_PDP_BY_MUX(mux), m)  one received raw IP packet; always consumes m.
++ *   sweet_pdp_set_output(fn)                          fn(unit, mux, m) owns m (must free it on every path).
++ *                                                     Until a hook is set, output frees the packet and counts a drop.
++ *   sweet_pdp_link(unit, up)                          link state.
++ *   sweet_pdp_block(index, on)                        AppleIPAppender blockPDPTraffic: output dropped while set.
++ * Sysctls: kern.sweet_pdp_mux (RW string, 8 mux ids, default unit + 1), kern.sweet_pdp_mtu (RW int),
++ * kern.sweet_pdp_stats (RO string), kern.sweet_pdp_test (RW int: N = loopback self-test on pdp_ipN, -1 = off).
++ * Self-test: unit N's link goes up and its output answers IPv4 ICMP echo requests with echo replies through
++ * sweet_pdp_input, so `ifconfig pdp_ipN 10.99.0.1 10.99.0.2 up; ping 10.99.0.2` proves the ifnet path end to end.
++ * Turning it off gives the unit back to the registered hook and the link state it had before.
++ * Sends no kABPPDP* (0xe3ff8051..805d) messages.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sockio.h>
++#include <sys/kern_event.h>
++#include <sys/proc.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <libkern/OSAtomic.h>
++#include <os/atomic_private.h>
++#include <pexpert/pexpert.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/dlil.h>
++#include <netinet/in.h>
++#include "sweet_pdp.h"
++
++#define SAY(fmt, ...)   printf("SWEET PDP: " fmt, ##__VA_ARGS__)
++
++extern uint32_t sweet_bb;               /* sweet_bb.c (RO kern.sweet_bb) */
++
++struct pdp_unit {
++	ifnet_t         ifp;
++	uint32_t        unit;
++	bool            up;             /* data plane's link state */
++	bool            test_saved_up;  /* link state before the self-test took the unit */
++	uint64_t        rx_pkts, rx_bytes, rx_drops;
++	uint64_t        tx_pkts, tx_bytes, tx_nohook, tx_down, tx_blocked, tx_err;
++	uint64_t        test_echoes, test_drops;
++};
++
++static struct pdp_unit pdp_units[SWEET_PDP_NUNITS];
++static uint32_t pdp_mux[SWEET_PDP_NUNITS] = { 1, 2, 3, 4, 5, 6, 7, 8 };
++static volatile uint32_t pdp_blocked;   /* bit per AppleIPAppender pdp index */
++static int pdp_mtu = 1492;
++static int pdp_test = -1;
++static bool pdp_created;                /* all units attached (set once, under pdp_mtx) */
++static int pdp_on = -1;                 /* -1 not read yet */
++static sweet_pdp_output_fn pdp_hook;
++static uint32_t pdp_attach_fail, pdp_noproto;
++
++static LCK_GRP_DECLARE(pdp_grp, "sweet_pdp");
++static LCK_MTX_DECLARE(pdp_mtx, &pdp_grp);
++
++#define CNT(x)  os_atomic_inc(&(x), relaxed)
++#define ADD(x, n)       os_atomic_add(&(x), (uint64_t)(n), relaxed)
++
++bool
++sweet_pdp_enabled(void)
++{
++	if (pdp_on < 0) {
++		uint32_t v = 0;
++		PE_parse_boot_argn("sweetbb", &v, sizeof(v));
++		pdp_on = ((v | sweet_bb) & SWEET_PDP_SBB_BIT) ? 1 : 0;
++	}
++	return pdp_on == 1;
++}
++
++static struct pdp_unit *
++pdp_of(ifnet_t ifp)
++{
++	struct pdp_unit *u = (struct pdp_unit *)ifnet_softc(ifp);
++	if (u < &pdp_units[0] || u >= &pdp_units[SWEET_PDP_NUNITS] || u->ifp != ifp) {
++		return NULL;
++	}
++	return u;
++}
++
++/* ---------------- receive ---------------- */
++
++static errno_t
++pdp_demux(__unused ifnet_t ifp, mbuf_t m, __unused char *frame_header, protocol_family_t *proto)
++{
++	while (m != NULL && mbuf_len(m) < 1) {
++		m = mbuf_next(m);
++	}
++	if (m == NULL) {
++		return ENOENT;
++	}
++	switch (*(const uint8_t *)mbuf_data(m) >> 4) {
++	case 4:
++		*proto = PF_INET;
++		return 0;
++	case 6:
++		*proto = PF_INET6;
++		return 0;
++	default:
++		return ENOENT;
++	}
++}
++
++static errno_t
++pdp_proto_input(ifnet_t ifp, protocol_family_t proto, mbuf_t m, __unused char *frame_header)
++{
++	if (proto_input(proto, m) != 0) {
++		mbuf_freem(m);
++		ifnet_stat_increment_in(ifp, 0, 0, 1);
++	}
++	return 0;
++}
++
++int
++sweet_pdp_input(uint32_t which, mbuf_t m)
++{
++	struct pdp_unit *u = NULL;
++	if (m == NULL) {
++		return EINVAL;
++	}
++	if (os_atomic_load(&pdp_created, acquire)) {
++		if (which & SWEET_PDP_MUX_FLAG) {
++			uint32_t mux = which & 0xff;
++			for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
++				if (pdp_mux[i] == mux) {
++					u = &pdp_units[i];
++					break;
++				}
++			}
++		} else if (which < SWEET_PDP_NUNITS) {
++			u = &pdp_units[which];
++		}
++	}
++	if (u == NULL || u->ifp == NULL || !(mbuf_flags(m) & MBUF_PKTHDR) || mbuf_pkthdr_len(m) < 1) {
++		if (u != NULL) {
++			CNT(u->rx_drops);
++		}
++		mbuf_freem(m);
++		return u == NULL ? ENXIO : EINVAL;
++	}
++	size_t len = mbuf_pkthdr_len(m);
++	mbuf_pkthdr_setrcvif(m, u->ifp);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	CNT(u->rx_pkts);
++	ADD(u->rx_bytes, len);
++	/* ifnet_input counts packets/bytes into if_data itself and consumes m on every path */
++	return ifnet_input(u->ifp, m, NULL);
++}
++
++/* ---------------- send ---------------- */
++
++/* Self-test: an IPv4 ICMP echo request comes back as the echo reply, in a fresh packet, through sweet_pdp_input. */
++static void
++pdp_test_echo(struct pdp_unit *u, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	mbuf_t n = NULL;
++	uint8_t *p;
++	if (len < 28 || len > 2048 || mbuf_getpacket(MBUF_DONTWAIT, &n) != 0 || mbuf_maxlen(n) < len) {
++		goto drop;
++	}
++	p = (uint8_t *)mbuf_data(n);
++	if (mbuf_copydata(m, 0, len, p) != 0) {
++		goto drop;
++	}
++	unsigned hl = (p[0] & 0xf) * 4u;
++	unsigned tot = ((unsigned)p[2] << 8) | p[3];
++	if ((p[0] >> 4) != 4 || hl < 20 || tot > len || tot < hl + 8 || p[9] != 1 /* ICMP */ || p[hl] != 8 /* echo */) {
++		goto drop;
++	}
++	uint8_t a[4];
++	memcpy(a, p + 12, 4);
++	memcpy(p + 12, p + 16, 4);      /* swapping the addresses leaves the IP header checksum as it is */
++	memcpy(p + 16, a, 4);
++	/* type 8 -> 0, incremental checksum update (RFC 1624): HC' = ~(~HC + ~m + m') */
++	uint16_t hc = (uint16_t)((p[hl + 2] << 8) | p[hl + 3]);
++	uint16_t mo = (uint16_t)((8u << 8) | p[hl + 1]), mn = (uint16_t)p[hl + 1];
++	uint32_t s = (uint32_t)(uint16_t)~hc + (uint16_t)~mo + mn;
++	s = (s & 0xffff) + (s >> 16);
++	s = (s & 0xffff) + (s >> 16);
++	hc = (uint16_t)~s;
++	p[hl] = 0;
++	p[hl + 2] = (uint8_t)(hc >> 8);
++	p[hl + 3] = (uint8_t)hc;
++	mbuf_setlen(n, tot);
++	mbuf_pkthdr_setlen(n, tot);
++	mbuf_freem(m);
++	CNT(u->test_echoes);
++	(void)sweet_pdp_input(u->unit, n);
++	return;
++drop:
++	CNT(u->test_drops);
++	if (n != NULL) {
++		mbuf_freem(n);
++	}
++	mbuf_freem(m);
++}
++
++static errno_t
++pdp_output(ifnet_t ifp, mbuf_t m)
++{
++	struct pdp_unit *u = pdp_of(ifp);
++	if (u == NULL) {
++		mbuf_freem(m);
++		return 0;
++	}
++	size_t len = mbuf_pkthdr_len(m);
++	if ((int)u->unit == os_atomic_load(&pdp_test, relaxed)) {
++		CNT(u->tx_pkts);
++		ADD(u->tx_bytes, len);
++		ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++		pdp_test_echo(u, m);
++		return 0;
++	}
++	sweet_pdp_output_fn fn = os_atomic_load(&pdp_hook, acquire);
++	uint64_t *why = NULL;
++	if (os_atomic_load(&pdp_blocked, relaxed) & (1u << u->unit)) {
++		why = &u->tx_blocked;
++	} else if (!u->up) {
++		why = &u->tx_down;
++	} else if (fn == NULL) {
++		why = &u->tx_nohook;
++	}
++	if (why != NULL) {
++		CNT(*why);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		mbuf_freem(m);
++		return 0;
++	}
++	if (fn(u->unit, pdp_mux[u->unit], m) != 0) {     /* the hook owns m on every path */
++		CNT(u->tx_err);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	} else {
++		CNT(u->tx_pkts);
++		ADD(u->tx_bytes, len);
++		ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++	}
++	return 0;
++}
++
++/* ---------------- ifnet plumbing ---------------- */
++
++static errno_t
++pdp_add_proto(__unused ifnet_t ifp, protocol_family_t proto, __unused const struct ifnet_demux_desc *d, __unused u_int32_t n)
++{
++	return (proto == PF_INET || proto == PF_INET6) ? 0 : ENOPROTOOPT;
++}
++
++static errno_t
++pdp_del_proto(__unused ifnet_t ifp, __unused protocol_family_t proto)
++{
++	return 0;
++}
++
++static errno_t
++pdp_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCSIFMTU: {
++		int mtu = ((struct ifreq *)data)->ifr_mtu;
++		if (mtu < 576 || mtu > 2000) {
++			return EINVAL;
++		}
++		return ifnet_set_mtu(ifp, (u_int32_t)mtu);
++	}
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;      /* the stack (in_control / in6_control) answers address, NAT64 and CLAT ioctls */
++	}
++}
++
++static void
++pdp_detached(ifnet_t ifp)
++{
++	/* never detached by this driver; if the stack ever does, keep the unit dead rather than reuse a freed ifnet */
++	struct pdp_unit *u = pdp_of(ifp);
++	SAY("%s%u detached\n", ifnet_name(ifp), ifnet_unit(ifp));
++	if (u != NULL) {
++		u->up = false;
++	}
++}
++
++static errno_t
++pdp_plumb(ifnet_t ifp, protocol_family_t proto)
++{
++	struct ifnet_attach_proto_param pp;
++	if (pdp_of(ifp) == NULL) {
++		pdp_noproto++;
++		return EOPNOTSUPP;      /* some other IFNET_FAMILY_CELLULAR interface: not ours */
++	}
++	bzero(&pp, sizeof(pp));
++	pp.input = pdp_proto_input;
++	errno_t e = ifnet_attach_protocol(ifp, proto, &pp);
++	if (e != 0 && e != EEXIST) {
++		SAY("%s%u: attach protocol %u failed %d\n", ifnet_name(ifp), ifnet_unit(ifp), proto, e);
++	}
++	return e;
++}
++
++static void
++pdp_unplumb(ifnet_t ifp, protocol_family_t proto)
++{
++	if (pdp_of(ifp) != NULL) {
++		(void)ifnet_detach_protocol(ifp, proto);
++	}
++}
++
++static void
++pdp_set_link(struct pdp_unit *u, bool up)
++{
++	if (u->ifp == NULL || u->up == up) {
++		u->up = up;
++		return;
++	}
++	u->up = up;
++	ifnet_set_flags(u->ifp, up ? IFF_RUNNING : 0, IFF_RUNNING);
++	dlil_post_msg(u->ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	SAY("pdp_ip%u link %s\n", u->unit, up ? "up" : "down");
++}
++
++void
++sweet_pdp_publish(void)
++{
++	if (!sweet_pdp_enabled()) {
++		return;
++	}
++	lck_mtx_lock(&pdp_mtx);
++	if (pdp_created) {
++		lck_mtx_unlock(&pdp_mtx);
++		return;
++	}
++	errno_t e4 = proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, pdp_plumb, pdp_unplumb);
++	errno_t e6 = proto_register_plumber(PF_INET6, IFNET_FAMILY_CELLULAR, pdp_plumb, pdp_unplumb);
++	unsigned made = 0;
++	for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
++		struct pdp_unit *u = &pdp_units[i];
++		struct ifnet_init_eparams init;
++		char uid[16];
++		u->unit = i;
++		snprintf(uid, sizeof(uid), "sweet-pdp%u", i);
++		bzero(&init, sizeof(init));
++		init.ver = IFNET_INIT_CURRENT_VERSION;
++		init.len = sizeof(init);
++		init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
++		init.uniqueid = uid;
++		init.uniqueid_len = (uint32_t)strlen(uid);
++		init.name = "pdp_ip";
++		init.unit = i;
++		init.family = IFNET_FAMILY_CELLULAR;
++		init.type = IFT_CELLULAR;
++		init.output = pdp_output;
++		init.demux = pdp_demux;
++		init.add_proto = pdp_add_proto;
++		init.del_proto = pdp_del_proto;
++		init.ioctl = pdp_ioctl;
++		init.detach = pdp_detached;
++		init.softc = u;
++		ifnet_t ifp = NULL;
++		errno_t e = ifnet_allocate_extended(&init, &ifp);
++		if (e != 0) {
++			SAY("pdp_ip%u: ifnet_allocate_extended failed %d\n", i, e);
++			pdp_attach_fail++;
++			continue;
++		}
++		ifnet_set_mtu(ifp, (u_int32_t)pdp_mtu);
++		ifnet_set_flags(ifp, IFF_POINTOPOINT | IFF_MULTICAST | IFF_NOARP, 0xffff);
++		u->ifp = ifp;                   /* before attach: pdp_of() must know it when the plumbers run */
++		e = ifnet_attach(ifp, NULL);
++		if (e != 0) {
++			SAY("pdp_ip%u: ifnet_attach failed %d\n", i, e);
++			u->ifp = NULL;
++			ifnet_release(ifp);
++			pdp_attach_fail++;
++			continue;
++		}
++		made++;
++	}
++	os_atomic_store(&pdp_created, true, release);
++	lck_mtx_unlock(&pdp_mtx);
++	SAY("created %u pdp_ip interfaces (mtu %d, plumbers v4 %d v6 %d), links down, output hook %s\n", made, pdp_mtu, e4, e6,
++	    pdp_hook ? "set" : "none (drops)");
++}
++
++void
++sweet_pdp_set_output(sweet_pdp_output_fn fn)
++{
++	os_atomic_store(&pdp_hook, fn, release);
++	SAY("output hook %s\n", fn ? "set" : "cleared");
++}
++
++int
++sweet_pdp_link(uint32_t unit, int up)
++{
++	if (unit >= SWEET_PDP_NUNITS || !os_atomic_load(&pdp_created, acquire)) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&pdp_mtx);
++	struct pdp_unit *u = &pdp_units[unit];
++	if ((int)unit == pdp_test) {
++		u->test_saved_up = up != 0;     /* applied when the self-test ends */
++	} else {
++		pdp_set_link(u, up != 0);
++	}
++	lck_mtx_unlock(&pdp_mtx);
++	return 0;
++}
++
++void
++sweet_pdp_block(uint32_t index, int on)
++{
++	if (index >= 32) {
++		return;
++	}
++	if (on) {
++		os_atomic_or(&pdp_blocked, 1u << index, relaxed);
++	} else {
++		os_atomic_andnot(&pdp_blocked, 1u << index, relaxed);
++	}
++}
++
++void
++sweet_pdp_unblock_all(void)
++{
++	os_atomic_store(&pdp_blocked, 0, relaxed);
++}
++
++/* ---------------- sysctls ---------------- */
++
++static int
++sysctl_pdp_test SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = pdp_test, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e != 0 || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (!sweet_pdp_enabled() || !os_atomic_load(&pdp_created, acquire)) {
++		return ENXIO;
++	}
++	if (v < -1 || v >= SWEET_PDP_NUNITS) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&pdp_mtx);
++	int old = pdp_test;
++	if (old >= 0) {
++		os_atomic_store(&pdp_test, -1, relaxed);
++		pdp_set_link(&pdp_units[old], pdp_units[old].test_saved_up);
++	}
++	if (v >= 0) {
++		struct pdp_unit *u = &pdp_units[v];
++		if (u->ifp == NULL) {
++			lck_mtx_unlock(&pdp_mtx);
++			return ENXIO;
++		}
++		u->test_saved_up = u->up;
++		os_atomic_store(&pdp_test, v, relaxed);
++		pdp_set_link(u, true);
++	}
++	lck_mtx_unlock(&pdp_mtx);
++	SAY("self-test %s%s%d\n", v >= 0 ? "on pdp_ip" : "off", v >= 0 ? "" : " (was pdp_ip", v >= 0 ? v : old);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_test, "I",
++    "redfin 1075: loopback self-test (N = pdp_ipN link up, its output echoes IPv4 ICMP echo requests back as replies; -1 off)");
++
++static int
++sysctl_pdp_mtu SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = pdp_mtu, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e != 0 || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v < 576 || v > 2000) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&pdp_mtx);
++	pdp_mtu = v;
++	for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
++		if (pdp_units[i].ifp != NULL) {
++			ifnet_set_mtu(pdp_units[i].ifp, (u_int32_t)v);
++		}
++	}
++	lck_mtx_unlock(&pdp_mtx);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_mtu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_mtu, "I",
++    "redfin 1075: pdp_ip MTU (default 1492; applied to all units on write)");
++
++static int
++sysctl_pdp_mux SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[96];
++	int o = 0;
++	for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
++		o += snprintf(s + o, sizeof(s) - (size_t)o, "%s%u", i ? " " : "", pdp_mux[i]);
++	}
++	int e = SYSCTL_OUT(req, s, (size_t)o + 1);
++	if (e != 0 || req->newptr == USER_ADDR_NULL) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	char in[96];
++	size_t n = req->newlen < sizeof(in) - 1 ? req->newlen : sizeof(in) - 1;
++	bzero(in, sizeof(in));
++	if ((e = SYSCTL_IN(req, in, n)) != 0) {
++		return e;
++	}
++	uint32_t t[SWEET_PDP_NUNITS], k = 0;
++	const char *p = in;
++	while (*p && k < SWEET_PDP_NUNITS) {
++		while (*p == ' ' || *p == ',' || *p == '\n') {
++			p++;
++		}
++		if (!*p) {
++			break;
++		}
++		if (*p < '0' || *p > '9') {
++			return EINVAL;
++		}
++		uint32_t v = 0;
++		while (*p >= '0' && *p <= '9') {
++			v = v * 10 + (uint32_t)(*p++ - '0');
++			if (v > 255) {
++				return EINVAL;
++			}
++		}
++		t[k++] = v;
++	}
++	if (k != SWEET_PDP_NUNITS) {
++		return EINVAL;          /* all eight, in unit order */
++	}
++	for (uint32_t i = 0; i < SWEET_PDP_NUNITS; i++) {
++		os_atomic_store(&pdp_mux[i], t[i], relaxed);
++	}
++	SAY("mux table %u %u %u %u %u %u %u %u\n", t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_mux, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_mux, "A",
++    "redfin 1075: QMAP mux id of pdp_ip0..7 (8 numbers 0-255, default unit + 1)");
++
++static int
++sysctl_pdp_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 4096;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	int o = snprintf(s, cap, "pdp on %d created %d hook %s test %d blocked 0x%x mtu %d attach-fail %u foreign-plumb %u |",
++	    sweet_pdp_enabled(), pdp_created, pdp_hook ? "set" : "none", pdp_test, pdp_blocked, pdp_mtu, pdp_attach_fail, pdp_noproto);
++	for (uint32_t i = 0; i < SWEET_PDP_NUNITS && o < (int)cap - 200; i++) {
++		struct pdp_unit *u = &pdp_units[i];
++		if (u->ifp == NULL) {
++			continue;
++		}
++		o += snprintf(s + o, cap - (size_t)o, " pdp_ip%u mux %u %s rx %llu/%llu drop %llu tx %llu/%llu nohook %llu down %llu "
++		    "blk %llu err %llu echo %llu tdrop %llu;", i, pdp_mux[i], u->up ? "up" : "down", u->rx_pkts, u->rx_bytes,
++		    u->rx_drops, u->tx_pkts, u->tx_bytes, u->tx_nohook, u->tx_down, u->tx_blocked, u->tx_err, u->test_echoes,
++		    u->test_drops);
++	}
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_stats, "A",
++    "redfin 1075: pdp_ip per unit: mux, link, rx pkts/bytes/drops, tx pkts/bytes and drops (no hook, link down, blocked, hook error)");
+diff --git a/bsd/dev/sweet_pdp.h b/bsd/dev/sweet_pdp.h
+new file mode 100644
+index 0000000..f0f6c5d
+--- /dev/null
++++ b/bsd/dev/sweet_pdp.h
+@@ -0,0 +1,25 @@
++/* redfin 1075: pdp_ip cellular data interfaces (sweet_pdp.c) and the API for the future in-kernel IPA driver. */
++#ifndef _SWEET_PDP_H_
++#define _SWEET_PDP_H_
++
++#include <sys/kpi_mbuf.h>
++
++#define SWEET_PDP_SBB_BIT       0x10u   /* boot-arg sweetbb bit (RO kern.sweet_bb) that turns all of 1075 on */
++#define SWEET_PDP_NUNITS        8u
++#define SWEET_PDP_MUX_FLAG      0x100u
++#define SWEET_PDP_BY_MUX(mux)   (SWEET_PDP_MUX_FLAG | ((mux) & 0xffu))
++
++__BEGIN_DECLS
++/* fn owns m on every path (frees it or hands it on); returns 0 when the packet was taken for sending */
++typedef int (*sweet_pdp_output_fn)(uint32_t unit, uint32_t mux, mbuf_t m);
++
++bool sweet_pdp_enabled(void);
++void sweet_pdp_publish(void);                           /* SweetABP publish: creates pdp_ip0..7 once */
++int  sweet_pdp_input(uint32_t unit_or_mux, mbuf_t m);   /* always consumes m */
++void sweet_pdp_set_output(sweet_pdp_output_fn fn);      /* NULL = drop (counted) */
++int  sweet_pdp_link(uint32_t unit, int up);
++void sweet_pdp_block(uint32_t index, int on);           /* AppleIPAppender blockPDPTraffic */
++void sweet_pdp_unblock_all(void);
++__END_DECLS
++
++#endif
+diff --git a/iokit/Kernel/arm/SweetABP.cpp b/iokit/Kernel/arm/SweetABP.cpp
+index 5a42e05..0d53b05 100644
+--- a/iokit/Kernel/arm/SweetABP.cpp
++++ b/iokit/Kernel/arm/SweetABP.cpp
+@@ -86,6 +86,11 @@ extern uint32_t sweet_abm_upwait_ms, sweet_abm_img, sweet_abm_imglen, sweet_abm_
+ extern uint32_t sweet_abp_bootstage;
+ extern uint32_t sweet_abp_flags;
+ extern uint32_t sweet_abp_readyms;
++/* 1075: bsd/dev/sweet_pdp.c (pdp_ip0..7, sweetbb & 0x10) */
++bool sweet_pdp_enabled(void);
++void sweet_pdp_publish(void);
++void sweet_pdp_block(uint32_t index, int on);
++void sweet_pdp_unblock_all(void);
+ }
+ 
+ /* 1063: sweetabp bits read here (bsd/dev/sweet_abp.c has the full list) */
+@@ -1309,7 +1314,10 @@ class AppleBasebandPCIPDPManagerBase : public IOService
+ };
+ OSDefineMetaClassAndStructors(AppleBasebandPCIPDPManagerBase, IOService);
+ 
+-/* Every selector succeeds with zeroed outputs; async requests are accepted and never completed. */
++/* Every selector succeeds with zeroed outputs; async requests are accepted and never completed.
++ * 1075: with sweetbb & 0x10, AppleIPAppender's selectors go to ipa_method() instead (below). */
++static IOReturn ipa_method(uint32_t selector, IOExternalMethodArguments *args);
++static volatile SInt32 ipa_clients;
+ static uint32_t abs_calls[2][0x20];
+ 
+ class SweetABPStubUserClient : public IOUserClient
+@@ -1327,6 +1335,9 @@ OSDefineMetaClassAndStructors(SweetABPStubUserClient, IOUserClient);
+ IOReturn
+ SweetABPStubUserClient::clientClose(void)
+ {
++	if (fKind == 0 && sweet_pdp_enabled() && ipa_clients > 0 && OSDecrementAtomic(&ipa_clients) == 1) {
++		sweet_pdp_unblock_all();        /* 1075: the last AppleIPAppender client is gone: no stale blockPDPTraffic */
++	}
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -1335,6 +1346,9 @@ IOReturn
+ SweetABPStubUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
+ {
++	if (fKind == 0 && sweet_pdp_enabled()) {
++		return ipa_method(selector, args);
++	}
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 		args->scalarOutput[i] = 0;
+ 	}
+@@ -1355,11 +1369,156 @@ SweetABPStubUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * 1075: AppleIPAppender selectors (only with sweetbb & 0x10; research/cc/P4-u2-classes.md Q3). Sizes are checked
++ * (kIOReturnBadArgument on a mismatch, which ApplePDPHelper only logs); answers: success with zeroed outputs,
++ * 0x02 getFlow returns what 0x00 addFlow stored, 0x0a no wake buffer (0 bytes), 0x11 trailer not enabled (0),
++ * 0x12 no keepalive frames (0 bytes), 0x10 blockPDPTraffic sets the pdp_ip output block flag, 0x14 accepted and never
++ * completed. One klog line per selector, the first time it is called.
++ */
++#define IPA_SO_FIXED    0u      /* struct out: caller gives >= sout, gets sout zeroed bytes */
++#define IPA_SO_EMPTY    1u      /* struct out: any size (multiple of sout if sout), answered with 0 bytes */
++#define IPA_SO_UPTO     2u      /* struct out: caller gives <= sout, all of it zeroed */
++struct ipa_sel {
++	const char *name;
++	uint8_t nin, nout, somode;
++	uint16_t sin, sout;
++};
++static const struct ipa_sel ipa_sels[] = {
++	{ "addFlow", 0, 0, IPA_SO_FIXED, 8, 0 },
++	{ "removeFlow", 1, 0, IPA_SO_FIXED, 0, 0 },
++	{ "getFlow", 1, 1, IPA_SO_FIXED, 0, 0 },
++	{ "enable", 1, 1, IPA_SO_FIXED, 0, 0 },
++	{ "setDormancyInterval", 0, 0, IPA_SO_FIXED, 8, 0 },
++	{ "getDormancyTime", 0, 1, IPA_SO_FIXED, 0, 0 },
++	{ "getTimeAdjustment", 0, 0, IPA_SO_FIXED, 0, 8 },
++	{ "getStatus", 0, 0, IPA_SO_FIXED, 0, 0xb8 },
++	{ "setLinkQualityMetric", 1, 0, IPA_SO_FIXED, 0, 0 },
++	{ "restartDormancyCheck", 0, 0, IPA_SO_FIXED, 0, 0 },
++	{ "copyWakeBuffer", 1, 0, IPA_SO_EMPTY, 0, 0 },
++	{ "reportLinkThroughput", 0, 0, IPA_SO_FIXED, 0x20, 0 },
++	{ "getOpenPortsExt", 3, 0, IPA_SO_UPTO, 0, 0x1000 },
++	{ "enableLowPowerPDPThrottle", 1, 0, IPA_SO_FIXED, 0, 0 },
++	{ "activateLowPowerPDPThrottle", 1, 0, IPA_SO_FIXED, 0, 0 },
++	{ "getNumLowPowerPDPThrottleStats", 0, 0, IPA_SO_FIXED, 0, 0xc },
++	{ "blockPDPTraffic", 2, 0, IPA_SO_FIXED, 0, 0 },
++	{ "enableMetadataTrailer", 1, 1, IPA_SO_FIXED, 0, 0 },
++	{ "getKeepaliveOffloadFrames", 1, 0, IPA_SO_EMPTY, 0, 0x84 },
++	{ "notifyDedicatedBearer", 0, 0, IPA_SO_FIXED, 0x10, 0x10 },
++	{ "registerFilterRuleCallBack", 2, 0, IPA_SO_FIXED, 0, 0 },
++};
++#define IPA_NSELS       (sizeof(ipa_sels) / sizeof(ipa_sels[0]))
++static uint8_t ipa_seen[0x20], ipa_bad_seen[0x20];
++static uint32_t ipa_flow[16];           /* addFlow: traffic class -> flow id (getFlow only) */
++
++static IOReturn
++ipa_method(uint32_t selector, IOExternalMethodArguments *args)
++{
++	const struct ipa_sel *s = selector < IPA_NSELS ? &ipa_sels[selector] : NULL;
++	uint32_t sin = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++	uint32_t soc = args->structureOutputDescriptor ? (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
++	uint32_t sout = 0;
++	IOReturn r = kIOReturnSuccess;
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (s == NULL) {
++		sout = soc;     /* not in Q3: today's answer (success, zeroed outputs) */
++	} else if (args->scalarInputCount != s->nin || args->scalarOutputCount != s->nout || sin != s->sin) {
++		r = kIOReturnBadArgument;
++	} else if (s->somode == IPA_SO_FIXED) {
++		if (soc < s->sout) {
++			r = kIOReturnBadArgument;
++		}
++		sout = s->sout;
++	} else if (s->somode == IPA_SO_EMPTY) {
++		if (s->sout && soc % s->sout) {
++			r = kIOReturnBadArgument;
++		}
++		sout = 0;
++	} else {
++		if (soc > s->sout) {
++			r = kIOReturnBadArgument;
++		}
++		sout = soc;
++	}
++	if (r == kIOReturnSuccess) {
++		uint8_t in[0x20];
++		bzero(in, sizeof(in));
++		(void)abp_struct_in(args, in, sizeof(in));
++		switch (selector) {
++		case 0x00: {    /* addFlow {u32 trafficClass, u32 flowId} */
++			uint32_t tc, fl;
++			memcpy(&tc, in, 4);
++			memcpy(&fl, in + 4, 4);
++			ipa_flow[tc & 15] = fl;
++			break;
++		}
++		case 0x01:
++			ipa_flow[args->scalarInput[0] & 15] = 0;
++			break;
++		case 0x02:
++			args->scalarOutput[0] = ipa_flow[args->scalarInput[0] & 15];
++			break;
++		case 0x10: {    /* blockPDPTraffic(pdp index, block) */
++			uint64_t idx = args->scalarInput[0], on = args->scalarInput[1] != 0;
++			if (idx < 32) {
++				sweet_pdp_block((uint32_t)idx, (int)on);
++				IOLog("SWEET ABP: 1075 blockPDPTraffic pdp %llu %s\n", idx, on ? "blocked" : "unblocked");
++			} else {
++				r = kIOReturnBadArgument;
++			}
++			break;
++		}
++		default:
++			break;
++		}
++	}
++	if (r == kIOReturnSuccess && sout) {
++		uint8_t z[256];
++		bzero(z, sizeof(z));
++		if (args->structureOutputDescriptor != NULL) {
++			for (uint32_t o = 0; o < sout; o += sizeof(z)) {
++				args->structureOutputDescriptor->writeBytes(o, z, sout - o < sizeof(z) ? sout - o : sizeof(z));
++			}
++		} else if (args->structureOutput != NULL) {
++			bzero(args->structureOutput, sout);
++		}
++	}
++	if (args->structureOutputDescriptor != NULL) {
++		args->structureOutputDescriptorSize = r == kIOReturnSuccess ? sout : 0;
++	} else {
++		args->structureOutputSize = r == kIOReturnSuccess ? sout : 0;
++	}
++	uint32_t k = selector < 0x20 ? selector : 0x1f;
++	uint8_t *seen = r == kIOReturnSuccess ? ipa_seen : ipa_bad_seen;
++	if (!seen[k]) {
++		seen[k] = 1;
++		char p[32];
++		proc_selfname(p, (int)sizeof(p));
++		IOLog("SWEET ABP: 1075 %s AppleIPAppender sel 0x%x %s%s in[%u]={0x%llx,0x%llx} struct in %u out %u/%u -> 0x%x\n", p, selector,
++		    s ? s->name : "unknown", args->asyncWakePort != MACH_PORT_NULL ? " (async)" : "", args->scalarInputCount,
++		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL, args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL,
++		    sin, sout, soc, r);
++	}
++	return r;
++}
++
+ class AppleIPAppenderUserClient : public SweetABPStubUserClient
+ {
+ 	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
+ public:
+-	bool start(IOService *provider) APPLE_KEXT_OVERRIDE { fKind = 0; return SweetABPStubUserClient::start(provider); }
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE
++	{
++		fKind = 0;
++		if (!SweetABPStubUserClient::start(provider)) {
++			return false;
++		}
++		if (sweet_pdp_enabled()) {
++			OSIncrementAtomic(&ipa_clients);
++		}
++		return true;
++	}
+ };
+ OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, SweetABPStubUserClient);
+ 
+@@ -1564,6 +1723,7 @@ SweetABPPublish(bool on, const char *why)
+ 		IOLog("SWEET ABP: publishing the baseband services (%s, publish #%u)\n", why, abp_publishes);
+ 		abp_publish_all();
+ 		IOLockUnlock(abp_svc_lock);
++		sweet_pdp_publish();            /* 1075: pdp_ip0..7 once, only with sweetbb & 0x10 */
+ 		return 0;
+ 	}
+ 	IOService *svcs[12];

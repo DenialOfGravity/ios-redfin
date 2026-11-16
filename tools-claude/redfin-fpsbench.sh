@@ -76,6 +76,7 @@ shot() {
 	rm -f "$RAW" "$rg"
 	(cd "$REPO" && timeout 20 python3 -I tools/flame-files.py read /dev/pmem 0x0ae05000 64 "$rg") >/dev/null 2>&1
 	w=$(python3 -I "$P/tools-claude/fb-shot.py" --where "$rg" "${KF:-}" 2>/dev/null)
+	[[ $w =~ ^ubwc\  ]] && { SHOTSRC=ubwc; rm -f "$rg"; echo ubwc; return; }	# xnu 1111: compressed scanout, no raw shot
 	[[ $w =~ ^(direct|blit)\ 0x[0-9a-f]+\ [0-9]+\  ]] && read -r kind pa len geo _ <<<"$w"
 	SHOTSRC=$kind
 	rm -f "$rg"

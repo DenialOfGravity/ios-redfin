@@ -1,0 +1,644 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index a19ef45..6955d41 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -410,4 +410,120 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * redfin 1077: read-only views for the UFS diagnostics (sweet_ufs.c, kern.sweet_ufs_diag). Nothing here writes a TCS
++ * register or sends a vote. The first call maps and checks the RSC and cmd-db as a vote would (rh_map, under the
++ * lock, without waiting: EBUSY if a vote is in flight); after that the reads take no lock, so a vote is never refused
++ * because of them. The TCS command registers hold what this DRV last programmed into each TCS (lito DT order: ACTIVE
++ * 0-1, SLEEP 2-4, WAKE 5-7); the aggregated RPMh state of a resource cannot be read from the APPS side.
++ */
++static bool rh_ro_ok;
++
++static int
++rh_ro_ready(void)
++{
++	if (rh_ro_ok) {
++		return 0;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_poisoned ? EIO : rh_map();
++	if (!error) {
++		rh_ro_ok = true;
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++int sweet_rpmh_tcs_peek(unsigned t, uint32_t *enable, uint32_t *addr, uint32_t *data, unsigned max, unsigned *ncmd);
++int
++sweet_rpmh_tcs_peek(unsigned t, uint32_t *enable, uint32_t *addr, uint32_t *data, unsigned max, unsigned *ncmd)
++{
++	int error = rh_ro_ready();
++	if (error) {
++		return error;
++	}
++	if (t >= RH_NORMAL_N) {
++		return EINVAL;
++	}
++	uint32_t b = t * RH_TCS_STRIDE;
++	unsigned n = MIN(rh_ncpt, max);
++	*enable = rh_read(rh_tcs, b + RH_ENABLE);
++	for (unsigned i = 0; i < n; i++) {
++		addr[i] = rh_read(rh_tcs, b + RH_ADDR + i * RH_CMD_STRIDE);
++		data[i] = rh_read(rh_tcs, b + RH_DATA + i * RH_CMD_STRIDE);
++	}
++	*ncmd = n;
++	return 0;
++}
++
++/* cmd-db walk: exact (name -> address) or nearest (address -> "name+offset", offset <= 0xc within the same slave) */
++static int
++rh_ro_walk(const char *want, uint32_t address, uint32_t *found, char *out, unsigned len)
++{
++	uint32_t best = 0, best_e = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			uint32_t a = rh_read(rh_db, e + 16);
++			if (want) {
++				char id[9];
++				uint32_t k0 = rh_read(rh_db, e), k1 = rh_read(rh_db, e + 4);
++				for (unsigned c = 0; c < 8; c++) {
++					id[c] = (char)((c < 4 ? k0 : k1) >> (8u * (c % 4)));
++				}
++				id[8] = 0;
++				if (!strncmp(id, want, 8)) {
++					*found = a;
++					return 0;
++				}
++			} else if (a <= address && address - a <= 0xcu && (a >> 16) == (address >> 16) && (!best_e || a > best)) {
++				best = a;
++				best_e = e;
++			}
++		}
++	}
++	if (want || !best_e) {
++		return ENODEV;
++	}
++	char id[9];
++	uint32_t k0 = rh_read(rh_db, best_e), k1 = rh_read(rh_db, best_e + 4);
++	for (unsigned c = 0; c < 8; c++) {
++		id[c] = (char)((c < 4 ? k0 : k1) >> (8u * (c % 4)));
++	}
++	id[8] = 0;
++	if (address == best) {
++		snprintf(out, len, "%s", id);
++	} else {
++		snprintf(out, len, "%s+%x", id, address - best);
++	}
++	return 0;
++}
++
++int sweet_rpmh_name(uint32_t address, char *out, unsigned len);
++int
++sweet_rpmh_name(uint32_t address, char *out, unsigned len)
++{
++	int error = rh_ro_ready();
++	return error ? error : rh_ro_walk(NULL, address, NULL, out, len);
++}
++
++int sweet_rpmh_find(const char *res, uint32_t *address);
++int
++sweet_rpmh_find(const char *res, uint32_t *address)
++{
++	int error = rh_ro_ready();
++	return error ? error : rh_ro_walk(res, 0, address, NULL, 0);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d5291fe..2050031 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -282,6 +282,9 @@ dma_clean(uint32_t off, uint32_t len)
+ int sweet_ufs_recover;                  /* 1069: 0 off (as before), 1 log, 2 + abort/retry, 3 + host reset (sweet_ssr.c reads it) */
+ static void ufs_diag(const char *what, uint8_t op);
+ static uint32_t ufs_sim_fail;           /* kern.sweet_ufs_recover_test=1: the next command fails without being sent */
++extern int sweet_ufs_diag;
++int sweet_ufs_diag;                     /* 1077: kern.sweet_ufs_diag (0 off) */
++static void udx_on_timeout(uint8_t op);
+ 
+ static int
+ ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+@@ -362,6 +365,9 @@ ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
++			if (sweet_ufs_diag) {
++				udx_on_timeout(cdb[0]);         /* 1077: first timeout only; before 1069 reads the UEC registers */
++			}
+ 			if (sweet_ufs_recover >= 1) {
+ 				ufs_diag("timeout", cdb[0]);
+ 			}
+@@ -824,6 +830,484 @@ sysctl_sweet_ufs_recover_stats SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_recover_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_ufs_recover_stats, "A", "redfin 1069: UFS error handling counters");
+ 
++/*
++ * redfin 1077: UFS link-death diagnostics (kern.sweet_ufs_diag, boot-arg sweetufsdiag; default 0 = nothing changes).
++ * Read-only MMIO, no UIC/DME command, no RPMh vote, no storage I/O, no sleeping on I/O, no lock that I/O holds.
++ *   0  off
++ *   1  armed: one snapshot when the link is healthy (at boot with the boot-arg, else when 1 is written) and, at the FIRST
++ *      command timeout only, the same registers again printed as "boot|now" pairs (changed ones marked '*')
++ *   2  (write) dump now against the snapshot (taken first if there is none); the mode stays as it was
++ *   3  as 1 + a 1 Hz watcher thread that logs any change of the watched clock / GDSC / PHY / reset-pin / HCI bits and any
++ *      UIC error (UECxx registers: read-to-clear, so it keeps a sticky copy that the timeout dump prints)
++ * Writing 1 or 3 again re-arms the first-timeout dump. kern.sweet_ufs_diag_phy=0 skips the PHY reads.
++ * Addresses (live redfin DT recon/live.dtb + LineageOS redbull lito sources): ufshc@1d84000 (su.regs, vendor regs
++ * ufs-qcom.h 0xc0-0xfc), ufsphy_mem@1d87000 size 0xe00 (phy-qcom-ufs-qmp-v4-lito.h: COM 0x000, PCS 0xc00; QSERDES V4
++ * CMN_STATUS 0x140 / RESET_SM_STATUS 0x144 / C_READY_STATUS 0x178), GCC qcom,gcc@100000 (gcc-lito.c UFS PHY branches
++ * 0x77xxx, GCC_UFS_PHY_BCR 0x77000, gcc_ufs_1x_clkref_clk 0x8c000) with qcom,gdsc@177004 (ufs_phy_gdsc), TLMM
++ * pinctrl@f000000 ufs_reset (pinctrl-lito.c UFS_RESET 0x5bc000: ctl, io +4 bit 0 = output level).
++ * HCI and PHY reads are skipped while ufs_phy_gdsc reads powered off (an unpowered block may not answer a read).
++ * RPMh: our driver (sweet_rpmh.c) can only send votes, the aggregated RPMh state cannot be read from APPS. What can be
++ * read without side effects is what this DRV (apps DRV2) has in its TCS command registers: ACTIVE 0-1 (our last votes),
++ * SLEEP 2-4 and WAKE 5-7 (left by the boot loader; nothing here programs them). Printed at the snapshot and again when
++ * they changed, with cmd-db names.
++ */
++static int udx_phy_on = 1;
++static bool udx_have, udx_dumped, udx_thread_on;
++static uint64_t udx_snap_ns;
++static int udx_chan;
++static vm_offset_t udx_gcc, udx_gcc2, udx_phy, udx_tlmm;
++
++extern int sweet_rpmh_tcs_peek(unsigned t, uint32_t *enable, uint32_t *addr, uint32_t *data, unsigned max, unsigned *ncmd);
++extern int sweet_rpmh_name(uint32_t address, char *out, unsigned len);
++extern int sweet_rpmh_find(const char *res, uint32_t *address);
++
++#define UDX_PA_GCC_UFS  0x177000ull     /* GCC 0x100000 + 0x77000 (UFS PHY block, ufs_phy_gdsc at +4) */
++#define UDX_PA_GCC_REF  0x18c000ull     /* GCC 0x100000 + 0x8c000 (clkref gates) */
++#define UDX_PA_PHY      0x1d87000ull    /* ufsphy_mem@1d87000 reg size 0xe00 */
++#define UDX_PA_TLMM_RST 0xf5bc000ull    /* TLMM 0xf000000 + 0x5bc000, ufs_reset */
++#define UDX_GDSCR       0x004u          /* in the GCC_UFS page */
++
++enum { UDX_HCI, UDX_PHY, UDX_GCC, UDX_GCC2, UDX_TLMM };
++#define UDX_CBCR        0x1u            /* flags: branch clock (CLK_OFF ignored by the watcher while HW_CTL is set) */
++#define UDX_HCIW        0x2u            /* HCI register the watcher may read */
++static const struct {
++	const char *name;
++	uint8_t blk, flags;
++	uint16_t off;
++	uint32_t watch;                 /* bits the watcher reports; 0 = dump only */
++} udx_regs[] = {
++	{ "CAP", UDX_HCI, 0, 0x00, 0 },                 { "VER", UDX_HCI, 0, 0x08, 0 },
++	{ "AHIT", UDX_HCI, UDX_HCIW, 0x18, ~0u },       { "IS", UDX_HCI, UDX_HCIW, 0x20, 0x00031ffeu },
++	{ "IE", UDX_HCI, 0, 0x24, 0 },                  { "HCS", UDX_HCI, UDX_HCIW, 0x30, 0x0000070fu },
++	{ "HCE", UDX_HCI, UDX_HCIW, 0x34, ~0u },        { "UTRLBA", UDX_HCI, UDX_HCIW, 0x50, ~0u },
++	{ "UTRLBAU", UDX_HCI, UDX_HCIW, 0x54, ~0u },    { "UTRLDBR", UDX_HCI, 0, 0x58, 0 },
++	{ "UTRLRSR", UDX_HCI, UDX_HCIW, 0x60, ~0u },    { "UTMRLDBR", UDX_HCI, 0, 0x78, 0 },
++	{ "UICCMD", UDX_HCI, 0, 0x90, 0 },              { "UCMDARG1", UDX_HCI, 0, 0x94, 0 },
++	{ "UCMDARG2", UDX_HCI, 0, 0x98, 0 },            { "UCMDARG3", UDX_HCI, 0, 0x9c, 0 },
++	{ "SYS1CLK_1US", UDX_HCI, UDX_HCIW, 0xc0, ~0u }, { "TX_SYMCLK", UDX_HCI, UDX_HCIW, 0xc4, ~0u },
++	{ "PA_ERR_CODE", UDX_HCI, UDX_HCIW, 0xcc, ~0u }, { "RETRY_TMR", UDX_HCI, 0, 0xd0, 0 },
++	{ "LSTART_TMR", UDX_HCI, UDX_HCIW, 0xd8, ~0u }, { "CFG1", UDX_HCI, UDX_HCIW, 0xdc, ~0u },
++	{ "CFG2", UDX_HCI, UDX_HCIW, 0xe0, ~0u },       { "HW_VER", UDX_HCI, 0, 0xe4, 0 },
++	{ "TESTBUS", UDX_HCI, 0, 0xe8, 0 },             { "UNIPRO_CFG", UDX_HCI, UDX_HCIW, 0xf8, ~0u },
++	{ "AH8_CFG", UDX_HCI, UDX_HCIW, 0xfc, ~0u },
++	{ "phy.SYSCLK_EN", UDX_PHY, 0, 0x094, ~0u },    { "phy.LOCK_CMP1", UDX_PHY, 0, 0x0ac, ~0u },
++	{ "phy.DEC_START", UDX_PHY, 0, 0x0bc, ~0u },    { "phy.CMN_STAT", UDX_PHY, 0, 0x140, ~0u },
++	{ "phy.RESET_SM", UDX_PHY, 0, 0x144, ~0u },     { "phy.C_READY", UDX_PHY, 0, 0x178, ~0u },
++	{ "pcs.START", UDX_PHY, 0, 0xc00, ~0u },        { "pcs.PWRDN", UDX_PHY, 0, 0xc04, ~0u },
++	{ "pcs.SWRST", UDX_PHY, 0, 0xc08, ~0u },        { "pcs.READY", UDX_PHY, 0, 0xd80, ~0u },
++	{ "pcs.MLANE1", UDX_PHY, 0, 0xde0, ~0u },
++	{ "gcc.BCR", UDX_GCC, 0, 0x000, ~0u },          { "gcc.GDSCR", UDX_GCC, 0, 0x004, 0x80000003u },
++	{ "gcc.GDSCCFG", UDX_GCC, 0, 0x008, 0 },        { "gcc.AXI", UDX_GCC, UDX_CBCR, 0x010, 0x80000003u },
++	{ "gcc.AHB", UDX_GCC, UDX_CBCR, 0x018, 0x80000003u }, { "gcc.TXSYM0", UDX_GCC, UDX_CBCR, 0x01c, 0x80000003u },
++	{ "gcc.RXSYM0", UDX_GCC, UDX_CBCR, 0x020, 0x80000003u }, { "gcc.RXSYM1", UDX_GCC, UDX_CBCR, 0x0b8, 0x80000003u },
++	{ "gcc.UNIPRO", UDX_GCC, UDX_CBCR, 0x05c, 0x80000003u }, { "gcc.ICE", UDX_GCC, UDX_CBCR, 0x064, 0x80000003u },
++	{ "gcc.PHYAUX", UDX_GCC, UDX_CBCR, 0x09c, 0x80000003u }, { "gcc.AGGRAXI", UDX_GCC, UDX_CBCR, 0x0cc, 0x80000003u },
++	{ "gcc.AXI_RCG", UDX_GCC, 0, 0x024, 0x80000000u }, { "gcc.AXI_CFG", UDX_GCC, 0, 0x028, ~0u },
++	{ "gcc.UNI_RCG", UDX_GCC, 0, 0x084, 0x80000000u }, { "gcc.UNI_CFG", UDX_GCC, 0, 0x088, ~0u },
++	{ "gcc.ICE_RCG", UDX_GCC, 0, 0x06c, 0x80000000u }, { "gcc.AUX_RCG", UDX_GCC, 0, 0x0a0, 0x80000000u },
++	{ "gcc.CLKREF", UDX_GCC2, UDX_CBCR, 0x000, 0x80000003u },
++	{ "tlmm.RST_CTL", UDX_TLMM, 0, 0x000, ~0u },    { "tlmm.RST_IO", UDX_TLMM, 0, 0x004, 0x1u },
++};
++#define UDX_N   (sizeof(udx_regs) / sizeof(udx_regs[0]))
++static uint32_t udx_boot_v[UDX_N], udx_last_v[UDX_N];
++static bool udx_boot_ok[UDX_N], udx_last_ok[UDX_N];
++static uint32_t udx_uec_sticky[5], udx_uec_first[5];
++static uint64_t udx_uec_first_ns;
++static const uint16_t udx_uec_off[5] = { REG_UECPA, REG_UECDL, REG_UECN, REG_UECT, REG_UECDME };
++
++/* TCS command registers of the apps DRV: 8 TCS x up to 16 commands (lito: ACTIVE 2, SLEEP 3, WAKE 3) */
++#define UDX_TCS         8u
++#define UDX_CMDS        16u
++static struct {
++	bool ok;
++	uint32_t en;
++	unsigned n;
++	uint32_t addr[UDX_CMDS], data[UDX_CMDS];
++} udx_tcs_boot[UDX_TCS];
++
++static uint32_t
++udx_mmio(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++udx_map(void)
++{
++	/* each mapping on its own; a failed one only drops its registers ("-" in the dump) */
++	if (!udx_gcc) {
++		udx_gcc = ml_io_map(UDX_PA_GCC_UFS, 0x1000);
++	}
++	if (!udx_gcc2) {
++		udx_gcc2 = ml_io_map(UDX_PA_GCC_REF, 0x1000);
++	}
++	if (!udx_phy) {
++		udx_phy = ml_io_map(UDX_PA_PHY, 0x1000);
++	}
++	if (!udx_tlmm) {
++		udx_tlmm = ml_io_map(UDX_PA_TLMM_RST, 0x1000);
++	}
++}
++
++/* ufs_phy_gdsc PWR_ON (bit 31); true when it cannot be read (the old driver reads the HCI regardless) */
++static bool
++udx_gdsc_on(void)
++{
++	return !udx_gcc || (udx_mmio(udx_gcc, UDX_GDSCR) & 0x80000000u);
++}
++
++/* one pass over the table; watcher_only: only what the 1 Hz watcher looks at */
++static void
++udx_read_all(uint32_t *v, bool *ok, bool watcher_only)
++{
++	bool gdsc = udx_gdsc_on();
++	for (unsigned i = 0; i < UDX_N; i++) {
++		vm_offset_t b = 0;
++		ok[i] = false;
++		if (watcher_only && !udx_regs[i].watch) {
++			continue;
++		}
++		switch (udx_regs[i].blk) {
++		case UDX_HCI:
++			b = (gdsc && su.regs && (!watcher_only || (udx_regs[i].flags & UDX_HCIW))) ? su.regs : 0;
++			break;
++		case UDX_PHY:
++			b = (gdsc && udx_phy_on) ? udx_phy : 0;
++			break;
++		case UDX_GCC:
++			b = udx_gcc;
++			break;
++		case UDX_GCC2:
++			b = udx_gcc2;
++			break;
++		case UDX_TLMM:
++			b = udx_tlmm;
++			break;
++		}
++		if (b) {
++			v[i] = udx_mmio(b, udx_regs[i].off);
++			ok[i] = true;
++		}
++	}
++}
++
++/* UECxx clear when read: fold what is there into the sticky copy; returns true if any error was pending */
++static bool
++udx_uec_poll(uint32_t now[5])
++{
++	bool any = false;
++	if (!su.regs || !udx_gdsc_on()) {
++		bzero(now, 5 * sizeof(now[0]));
++		return false;
++	}
++	for (int k = 0; k < 5; k++) {
++		now[k] = ufs_rd(udx_uec_off[k]);
++		if (now[k] & 0x80000000u) {
++			any = true;
++			if (!udx_uec_first[k]) {
++				udx_uec_first[k] = now[k];
++			}
++			udx_uec_sticky[k] |= now[k];
++		}
++	}
++	if (any && !udx_uec_first_ns) {
++		absolutetime_to_nanoseconds(mach_absolute_time(), &udx_uec_first_ns);
++	}
++	return any;
++}
++
++static uint32_t
++udx_mask(unsigned i, uint32_t v)
++{
++	uint32_t m = udx_regs[i].watch;
++	if ((udx_regs[i].flags & UDX_CBCR) && (v & 0x2u)) {
++		m &= ~0x80000000u;      /* HW-controlled branch: CLK_OFF follows activity */
++	}
++	return v & m;
++}
++
++static void
++udx_tcs_print(const char *tag, unsigned t, uint32_t en, unsigned n, const uint32_t *addr, const uint32_t *data)
++{
++	char line[400], nm[16];
++	int p = snprintf(line, sizeof(line), "SWEET UFSDIAG: rpmh %s tcs%u (%s) en 0x%x:", tag, t,
++	    t < 2 ? "active" : t < 5 ? "sleep" : "wake", en);
++	for (unsigned c = 0; c < n && p < (int)sizeof(line) - 40; c++) {
++		if (!(en & (1u << c)) && !addr[c]) {
++			continue;
++		}
++		if (sweet_rpmh_name(addr[c], nm, sizeof(nm)) != 0) {
++			snprintf(nm, sizeof(nm), "?");
++		}
++		p += snprintf(line + p, sizeof(line) - p, " %s%s=%x", (en & (1u << c)) ? "" : "(off)", nm, data[c]);
++	}
++	printf("%s\n", line);
++}
++
++static void
++udx_snapshot(const char *why)
++{
++	udx_map();
++	udx_read_all(udx_boot_v, udx_boot_ok, false);
++	memcpy(udx_last_v, udx_boot_v, sizeof(udx_last_v));
++	memcpy(udx_last_ok, udx_boot_ok, sizeof(udx_last_ok));
++	uint32_t uec[5];
++	(void)udx_uec_poll(uec);
++	absolutetime_to_nanoseconds(mach_absolute_time(), &udx_snap_ns);
++	udx_have = true;
++	unsigned nok = 0;
++	for (unsigned i = 0; i < UDX_N; i++) {
++		nok += udx_boot_ok[i];
++	}
++	printf("SWEET UFSDIAG: snapshot (%s): %u/%u registers (gcc %s, clkref %s, phy %s, tlmm %s, gdsc %s) | UEC pa %x dl %x n %x t %x dme %x\n",
++	    why, nok, (unsigned)UDX_N, udx_gcc ? "ok" : "unmapped", udx_gcc2 ? "ok" : "unmapped",
++	    !udx_phy ? "unmapped" : udx_phy_on ? "ok" : "off", udx_tlmm ? "ok" : "unmapped", udx_gdsc_on() ? "on" : "OFF",
++	    uec[0], uec[1], uec[2], uec[3], uec[4]);
++	/* the RPMh side: what the apps DRV has programmed, and whether cmd-db knows the PHY's level resource */
++	uint32_t qphy = 0;
++	int qe = sweet_rpmh_find("qphy.lvl", &qphy);
++	printf("SWEET UFSDIAG: cmd-db qphy.lvl (Android's UFS PHY votes it on, we never do): %s 0x%x\n",
++	    qe == 0 ? "at" : qe == ENODEV ? "absent" : "lookup failed", qphy);
++	for (unsigned t = 0; t < UDX_TCS; t++) {
++		udx_tcs_boot[t].ok = sweet_rpmh_tcs_peek(t, &udx_tcs_boot[t].en, udx_tcs_boot[t].addr, udx_tcs_boot[t].data,
++		    UDX_CMDS, &udx_tcs_boot[t].n) == 0;
++		if (udx_tcs_boot[t].ok && (udx_tcs_boot[t].en || t < 2)) {
++			udx_tcs_print("boot", t, udx_tcs_boot[t].en, udx_tcs_boot[t].n, udx_tcs_boot[t].addr, udx_tcs_boot[t].data);
++		}
++	}
++}
++
++/* the dump: "name boot|now", 4 per line, '*' where they differ; then UEC (now + sticky) and changed TCS contents */
++static void
++udx_dump(const char *why, uint8_t op)
++{
++	static uint32_t now[UDX_N];     /* (static: not on the I/O thread's stack; dumps are rare) */
++	static bool nok[UDX_N];
++	uint32_t uec[5];
++	uint64_t ns;
++
++	udx_map();
++	if (!udx_have) {
++		udx_snapshot("taken at the dump, link state unknown");
++	}
++	udx_read_all(now, nok, false);
++	(void)udx_uec_poll(uec);
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	unsigned ndiff = 0;
++	for (unsigned i = 0; i < UDX_N; i++) {
++		ndiff += (nok[i] != udx_boot_ok[i]) || (nok[i] && now[i] != udx_boot_v[i]);
++	}
++	printf("SWEET UFSDIAG: ==== %s op 0x%02x at %llu.%03llu s | snapshot %llu.%03llu s | boot|now, * = differs (%u) | gdsc %s ====\n",
++	    why, op, ns / NSEC_PER_SEC, (ns % NSEC_PER_SEC) / NSEC_PER_MSEC, udx_snap_ns / NSEC_PER_SEC,
++	    (udx_snap_ns % NSEC_PER_SEC) / NSEC_PER_MSEC, ndiff, udx_gdsc_on() ? "on" : "OFF");
++	for (unsigned i = 0; i < UDX_N;) {
++		char line[300];
++		int p = snprintf(line, sizeof(line), "SWEET UFSDIAG:");
++		for (unsigned k = 0; k < 4 && i < UDX_N; k++, i++) {
++			bool d = (nok[i] != udx_boot_ok[i]) || (nok[i] && now[i] != udx_boot_v[i]);
++			char b[12], n[12];
++			if (udx_boot_ok[i]) {
++				snprintf(b, sizeof(b), "%08x", udx_boot_v[i]);
++			} else {
++				snprintf(b, sizeof(b), "-");
++			}
++			if (nok[i]) {
++				snprintf(n, sizeof(n), "%08x", now[i]);
++			} else {
++				snprintf(n, sizeof(n), "-");
++			}
++			p += snprintf(line + p, sizeof(line) - p, " %s%s %s|%s", d ? "*" : "", udx_regs[i].name, b, n);
++		}
++		printf("%s\n", line);
++	}
++	printf("SWEET UFSDIAG: UEC now pa %x dl %x n %x t %x dme %x | sticky since snapshot pa %x dl %x n %x t %x dme %x"
++	    " | first seen %llu.%03llu s: pa %x dl %x\n", uec[0], uec[1], uec[2], uec[3], uec[4],
++	    udx_uec_sticky[0], udx_uec_sticky[1], udx_uec_sticky[2], udx_uec_sticky[3], udx_uec_sticky[4],
++	    udx_uec_first_ns / NSEC_PER_SEC, (udx_uec_first_ns % NSEC_PER_SEC) / NSEC_PER_MSEC, udx_uec_first[0], udx_uec_first[1]);
++	unsigned same = 0;
++	for (unsigned t = 0; t < UDX_TCS; t++) {
++		uint32_t en = 0, a[UDX_CMDS], dv[UDX_CMDS];
++		unsigned n = 0;
++		if (sweet_rpmh_tcs_peek(t, &en, a, dv, UDX_CMDS, &n) != 0) {
++			continue;
++		}
++		if (udx_tcs_boot[t].ok && en == udx_tcs_boot[t].en && n == udx_tcs_boot[t].n &&
++		    !memcmp(a, udx_tcs_boot[t].addr, n * sizeof(a[0])) && !memcmp(dv, udx_tcs_boot[t].data, n * sizeof(dv[0]))) {
++			same++;
++			continue;
++		}
++		udx_tcs_print("now", t, en, n, a, dv);
++	}
++	printf("SWEET UFSDIAG: ==== end (%u TCS unchanged since the snapshot) ====\n", same);
++}
++
++/* called from ufs_scsi_once's timeout branch (sweet_ufs_lock held: no lock, no sleep, no I/O here) */
++static void
++udx_on_timeout(uint8_t op)
++{
++	if (udx_dumped) {
++		return;
++	}
++	udx_dumped = true;
++	udx_dump("first timeout", op);
++}
++
++static void
++udx_watch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static uint32_t v[UDX_N];
++	static bool ok[UDX_N];
++	unsigned budget = 60;           /* change lines per minute */
++	unsigned tick = 0, dropped = 0;
++
++	printf("SWEET UFSDIAG W: watcher up (1 Hz)\n");
++	while (sweet_ufs_diag == 3) {
++		(void)tsleep(&udx_chan, PZERO, "ufsdiag", hz);
++		if (++tick % 60 == 0) {
++			if (dropped) {
++				printf("SWEET UFSDIAG W: %u change lines suppressed in the last minute\n", dropped);
++			}
++			budget = 60;
++			dropped = 0;
++		}
++		udx_read_all(v, ok, true);
++		char line[300];
++		int p = 0, nin = 0;
++		for (unsigned i = 0; i < UDX_N; i++) {
++			if (!udx_regs[i].watch) {
++				continue;
++			}
++			bool changed = ok[i] != udx_last_ok[i] ||
++			    (ok[i] && udx_mask(i, v[i]) != udx_mask(i, udx_last_v[i]));
++			if (changed) {
++				char e[64], o[12], n[12];
++				if (udx_last_ok[i]) {
++					snprintf(o, sizeof(o), "%x", udx_last_v[i]);
++				} else {
++					snprintf(o, sizeof(o), "-");
++				}
++				if (ok[i]) {
++					snprintf(n, sizeof(n), "%x", v[i]);
++				} else {
++					snprintf(n, sizeof(n), "-");
++				}
++				snprintf(e, sizeof(e), " %s %s>%s", udx_regs[i].name, o, n);
++				if (!p) {
++					p = snprintf(line, sizeof(line), "SWEET UFSDIAG W:");
++				}
++				p += snprintf(line + p, sizeof(line) - p, "%s", e);
++				nin++;
++				if (nin == 4 || p > (int)sizeof(line) - 60) {
++					if (budget) {
++						budget--;
++						printf("%s\n", line);
++					} else {
++						dropped++;
++					}
++					p = 0;
++					nin = 0;
++				}
++			}
++			if (ok[i]) {
++				udx_last_v[i] = v[i];
++			}
++			udx_last_ok[i] = ok[i];
++		}
++		if (p) {
++			if (budget) {
++				budget--;
++				printf("%s\n", line);
++			} else {
++				dropped++;
++			}
++		}
++		uint32_t uec[5];
++		if (udx_uec_poll(uec)) {
++			if (budget) {
++				budget--;
++				printf("SWEET UFSDIAG W: UIC error pa %x dl %x n %x t %x dme %x\n", uec[0], uec[1], uec[2], uec[3], uec[4]);
++			} else {
++				dropped++;
++			}
++		}
++	}
++	printf("SWEET UFSDIAG W: watcher stopped\n");
++	udx_thread_on = false;
++}
++
++static void
++udx_set(int value, const char *why)
++{
++	if (!udx_have) {
++		udx_snapshot(why);
++	}
++	if (value == 1 || value == 3) {
++		udx_dumped = false;
++	}
++	sweet_ufs_diag = value;
++	if (value == 3 && !udx_thread_on) {
++		thread_t thread;
++		udx_thread_on = true;
++		if (kernel_thread_start(udx_watch_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			udx_thread_on = false;
++			printf("SWEET UFSDIAG: no watcher thread\n");
++		}
++	}
++}
++
++/* sweet_ufs_init, after ufs_take_over_host and before the first command: the link as ABL left it */
++static void
++udx_boot(void)
++{
++	uint32_t d = 0;
++	if (!PE_parse_boot_argn("sweetufsdiag", &d, sizeof(d)) || (d != 1 && d != 3)) {
++		return;
++	}
++	udx_set((int)d, "boot, link as ABL left it");
++	printf("SWEET UFSDIAG: mode %u (%s)\n", d, d == 3 ? "first-timeout dump + 1 Hz watcher" : "first-timeout dump");
++}
++
++static int
++sysctl_sweet_ufs_diag SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_ufs_diag, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (value < 0 || value > 3) {
++		return EINVAL;
++	}
++	if (!su.regs) {
++		return ENXIO;
++	}
++	if (value == 2) {
++		udx_dump("on demand", 0);
++		return 0;
++	}
++	if (value == 0) {
++		sweet_ufs_diag = 0;     /* the watcher ends within a second */
++		printf("SWEET UFSDIAG: off\n");
++		return 0;
++	}
++	udx_set(value, "kern.sweet_ufs_diag written");
++	printf("SWEET UFSDIAG: mode %d\n", value);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ufs_diag, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_ufs_diag, "I",
++    "redfin 1077: UFS diagnostics: 0 off, 1 dump at the first timeout, 2 (write) dump now, 3 = 1 + 1 Hz watcher");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ufs_diag_phy, CTLFLAG_RW | CTLFLAG_LOCKED, &udx_phy_on, 0,
++    "redfin 1077: 0 = the UFS diagnostics skip the PHY registers");
++
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -1290,6 +1774,9 @@ sweet_ufs_init(void)
+ 	if (!error && sweet_ufs_recover >= 3) {
+ 		ufs_pm_snapshot();              /* 1069: the link as ABL made it, before anything can go wrong */
+ 	}
++	if (!error) {
++		udx_boot();                     /* 1077: boot-arg sweetufsdiag=1|3: registers while the link is healthy */
++	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */

@@ -1,0 +1,2171 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4e88457..3226c99 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -139,6 +139,7 @@ bsd/dev/sweet_voice.c			standard
+ bsd/dev/sweet_bb.c			standard
+ bsd/dev/sweet_qmux.c			standard
+ bsd/dev/sweet_ssr.c			standard
++bsd/dev/sweet_ipa.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+index 42c2ab8..690be1a 100644
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -48,6 +48,7 @@
+ #include <mach/mach_types.h>
+ #include "sweet_bb.h"
+ #include "sweet_ssr.h"                  /* 1070 */
++#include "sweet_ipa.h"                  /* 1076 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -600,6 +601,10 @@ qrtr_in(const uint8_t *d, uint32_t n)
+ 	gl.rx_bytes += pl;
+ 	gl.last_traffic = sbb_ms();
+ 	if (h.type == SBB_QRTR_DATA) {
++		if ((sweet_bb & SBB_DATA) && sweet_ipa_port(h.dst_port)) {  /* 1076: the kernel IPA QMI ports (sweet_ipa.c) */
++			sweet_ipa_qrtr_in(h.type, h.src_node, h.src_port, h.dst_port, h.confirm_rx, p, pl);
++			return;
++		}
+ 		if (h.dst_port == SWEET_SSR_MDM_PORT) {     /* 1070: the kernel's SSCTL client port (sweet_ssr.c) */
+ 			sweet_ssr_qrtr_in(SWEET_SSR_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, p, pl);
+ 			return;
+@@ -1060,6 +1065,24 @@ sbb_smem_copy(unsigned item, void *buf, uint32_t max, uint32_t *size)
+ 	return 0;
+ }
+ 
++/* 1076: the first server of a service, whatever its instance (DPM 0x2f for the IPA data port) */
++bool
++sbb_server_svc(uint32_t svc, uint32_t *node, uint32_t *port, uint32_t *verinst)
++{
++	bool found = false;
++	lck_mtx_lock(&ml_lock);
++	for (int i = 0; i < NSRV && !found; i++) {
++		if (srv[i].up && srv[i].svc == svc) {
++			*node = srv[i].node;
++			*port = srv[i].port;
++			*verinst = srv[i].inst;
++			found = true;
++		}
++	}
++	lck_mtx_unlock(&ml_lock);
++	return found;
++}
++
+ bool
+ sbb_server(uint32_t svc, uint32_t inst, uint32_t *node, uint32_t *port, uint32_t *version)
+ {
+@@ -1251,7 +1274,8 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
+ 	 */
+ 	uint32_t rest = (uint32_t)(n - (user_ssize_t)sizeof(h));
+ 	uint32_t len = h.size < rest ? h.size : rest;
+-	if (router_port(h.src_port) || h.src_port == SWEET_SSR_MDM_PORT || h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
++	if (router_port(h.src_port) || h.src_port == SWEET_SSR_MDM_PORT || ((sweet_bb & SBB_DATA) && sweet_ipa_port(h.src_port)) ||
++	    h.type == 0 || h.type > SBB_QRTR_DEL_LOOKUP) {
+ 		dev.refused++;
+ 		return EPERM;
+ 	}
+@@ -1407,7 +1431,7 @@ sweet_bb_init(void)
+ 	thread_t th;
+ 	sweet_ssr_init();                       /* 1070: modem crash reason + SSCTL notices (own boot-args, own thread) */
+ 	PE_parse_boot_argn("sweetbb", &v, sizeof(v));
+-	if (v & SBB_QMUX) {
++	if (v & (SBB_QMUX | SBB_DATA)) {       /* 1076: the kernel IPA data path needs the kernel link too */
+ 		v |= SBB_LINK;
+ 	}
+ 	sweet_bb = v;
+@@ -1427,6 +1451,9 @@ sweet_bb_init(void)
+ 	}
+ 	if (kernel_thread_start(sbb_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
++		if (v & SBB_DATA) {
++			sweet_ipa_init();       /* 1076: kernel IPA data path (its own thread; nothing mapped until wland's handoff) */
++		}
+ 	} else {
+ 		SAY("no thread: nothing will move\n");
+ 	}
+diff --git a/bsd/dev/sweet_bb.h b/bsd/dev/sweet_bb.h
+index 3b2895e..7b3abf2 100644
+--- a/bsd/dev/sweet_bb.h
++++ b/bsd/dev/sweet_bb.h
+@@ -11,4 +11,5 @@
+ #define SBB_LINK                0x01u   /* kernel GLINK/QRTR to the modem + /dev/sweet-mqrtr (wland's link backend) */
++#define SBB_DATA                0x10u   /* 1075 pdp_ip0..7 + 1076 kernel IPA data path (sweet_ipa.c; implies SBB_LINK) */
+ #define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
+ #define SBB_REALBOOT            0x40u   /* 1071 (P4 phase 2b): ABM's real baseband boot against an emulated Mav17 BHI/Sahara
+ 					 * target (pipes pbl/sahara, images discarded); the shouldBoot=0 page patch is off */
+@@ -38,6 +39,8 @@ uint64_t sbb_ms(void);
+ void sbb_wake(void);
+ bool sbb_link_open(void);
+ int sbb_link_state(void);               /* 1071: kern.sweet_mdm_up (0 down, 1 version done, 2 IPCRTR open) */
++bool sbb_server(uint32_t svc, uint32_t inst, uint32_t *node, uint32_t *port, uint32_t *version);
++bool sbb_server_svc(uint32_t svc, uint32_t *node, uint32_t *port, uint32_t *verinst);       /* 1076 */
+ int sbb_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
+ 
+ /* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
+diff --git a/bsd/dev/sweet_ipa.c b/bsd/dev/sweet_ipa.c
+new file mode 100644
+index 0000000..48c56de
+--- /dev/null
++++ b/bsd/dev/sweet_ipa.c
+@@ -0,0 +1,2020 @@
++/*
++ * redfin 1076 (P4 M3a, research/cc/P4-design.md s.2.1): the cellular data path's IPA v4.7 / GSI v4.5 hardware driver in
++ * the kernel, a port of what wland proved on the phone (branch ws-n-bb-int-w 6804ce4, cell.on.stable 2026-11-09:
++ * ipa=1 ipatbl=1 ipanotif=1 gsistart=p2late p2early=1 p2irq=1 p2irqm=63 p2join=40 p2noaggr=1 p2route=16 qmapv5=1
++ * x1keep=1 p2keep=3 p2keepidle=120). Sources: phone/wifi/ipa.c (ipa_meminit + tables_init), ipagsi.c (p2_irq_setup,
++ * ev/ch alloc/program/start, ep_program, tblcmd_post, ipagsi_early, p2_setup, the p2late join, rx/tx), ipaqmi.c
++ * (service 0x31/1, INIT_DRIVER, INIT_COMPLETE, INSTALL_FILTER_RULE + FILTER_INSTALLED_NOTIF), cell.c (DPM Open Port).
++ *
++ * Boot-arg sweetbb & 0x10 (SBB_DATA, implies the kernel modem link 0x01). Bit clear: nothing here runs, nothing is mapped,
++ * every sysctl write is refused (ENXIO). Bit set: one kernel thread "sweetipa" (polled, never interrupt context).
++ *
++ * Handoff with wland (which keeps the platform steps and the SMP2P entry, as before):
++ *   wland IPA auto steps 1-3 (IP0 vote, PAS ipa_fws, SMMU streams 0x520/0x522)
++ *   -> wland writes kern.sweet_ipa_up=1: the kernel maps the IPA, checks COMP_HW_VERSION 0x40070000 and SHARED_MEM_SIZE,
++ *      does ipa_meminit + ipatbl=1 tables (state 1); the write returns 0, or EIO (state -1)
++ *   -> wland step 5: SMP2P "ipa" = 3 (wland owns SMP2P out)
++ *   -> wland writes kern.sweet_ipa_up=2: the kernel announces 0x31/1, waits for the modem's 0x31/2 (60 s), then 2 s,
++ *      p2early (p2irq EE0 config, ev2 + ch2, ep2, HDR_INIT_LOCAL + 4 table inits on ch2), INIT_DRIVER (state 2);
++ *      kern.sweet_ipa_drv = 1 when the modem accepted it (wland releases its DMS online / PIN holds then, as at step 8)
++ *   -> INIT_COMPLETE (once the modem registered 0x20 and sent 0x35), DPM Open Port {4, 1, rx 2, tx 16} -> state 3.
++ * Data plane (state 3): armed by the first packet from the PDP side (or kern.sweet_ipa_arm=1 / sweet_ipa_call): gsi check,
++ * ERROR_LOG clear, ROUTE = def/frag pipe 16, ep2 program (wland p2_setup); then the join after kern.sweet_ipa_join_s
++ * (default 40, p2join=40) - or, opt-in kern.sweet_ipa_ee1=1, when the modem's EE1 ch 7 has been started for 5 s (wland's
++ * other trigger, one read-only EE1 register): ch 7 on ev 2, ep16 program, ch 7 start, 32 RX buffers.
++ * Packets: QMAP v5 + csum header out (mux per packet), QMAP v1/v5 deaggregation in; 1075's sweet_pdp_input(SWEET_PDP_BY_MUX)
++ * and sweet_pdp_set_output hook. pdp_ip0..7 links go up (sweet_pdp_link) at state 3 so the first packet can arm the join.
++ * Keep-alive kern.sweet_pdp_keep (s, default 3, 0 off): one ICMP echo to the call's gateway (kern.sweet_pdp_gw or
++ * sweet_ipa_call) from the address iOS last used, only while the RX/TX rings run and iOS sent within
++ * kern.sweet_pdp_keepidle s (default 120) - wland p2keep=3 p2keepidle=120.
++ * kern.sweet_ipa_state: 0 off, 1 hw up, 2 QMI handshake, 3 ready; negative = the failed step (-1 hw/meminit, -2 no modem
++ * 0x31/2, -3 p2early failed (INIT_DRIVER still sent, as wland), -4 INIT_DRIVER refused/unanswered, -5 no INIT_COMPLETE,
++ * -6 DPM Open Port failed, -7 data plane join failed, -9 the modem's IPA went away). Nothing is retried in this boot
++ * (wland's once-per-boot rule: the GSI rings stay allocated, no reset is ever issued).
++ * Never touched: the GSI inter-EE block (GSI base + 0xc000.., PA 0x1e10000..0x1e12fff: p2irqm bit 5 is NOT ported) and
++ * every other EE's registers, except the one opt-in read above. All GSI access goes through gsi_rd/gsi_wr, which refuse
++ * anything outside the EE0 window PA 0x1e13000..0x1e16fff. Log lines "SWEET IPA:". Nothing here returns to fastboot.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/kpi_mbuf.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include "sweet_bb.h"
++#include "sweet_ipa.h"
++#include "sweet_pdp.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define SAY(...)                printf("SWEET IPA: " __VA_ARGS__)
++
++/* ---- addresses (wland ipa.c / ipagsi.c) ---- */
++
++#define IPA_REG_PA              0x01e40000UL    /* ipa-reg */
++#define IPA_REG_SIZE            0x1000u
++#define IPA_SHARED_PA           0x01e50000UL    /* local memory window (0x4b20 bytes on v4.7) */
++#define IPA_SHARED_SIZE         0x4b20u
++#define GSI_BASE_PA             0x01e04000UL    /* wland GSI_BASE: offsets below are from here */
++#define GSI_EE0_LO              0xf000u         /* EE0 channel contexts .. EE0 command/irq block: PA 0x1e13000 */
++#define GSI_EE0_HI              0x13000u        /* .. PA 0x1e16fff */
++#define GSI_EE1_CH7_CTX0        0x13380u        /* EE1 (modem) ch 7 CNTXT_0: the opt-in join read, nothing else */
++
++/* IPA registers */
++#define COMP_HW_VERSION         0x030
++#define ROUTE                   0x048
++#define SHARED_MEM_SIZE         0x054
++#define FILT_ROUT_HASH_FLUSH    0x14c
++#define LOCAL_PKT_PROC_CNTXT    0x1e8
++#define EP_BASE(ep)             (0x0800u + 0x70u * (ep))
++#define EP_CTRL                 0x00
++#define EP_CFG                  0x08
++#define EP_NAT                  0x0c
++#define EP_HDR                  0x10
++#define EP_HDR_EXT              0x14
++#define EP_HDR_MASK             0x18
++#define EP_MODE                 0x20
++#define EP_AGGR                 0x24
++#define EP_HOL_EN               0x2c
++#define EP_DEAGGR               0x34
++#define EP_RSRC_GRP             0x38
++#define EP_SEQ                  0x3c
++#define EP_STATUS               0x40
++
++/* GSI EE0 registers (from GSI base) */
++#define GSI_STATUS              0x12000u
++#define GSI_CH_CMD              0x12008u
++#define GSI_EV_CH_CMD           0x12010u
++#define GSI_HW_PARAM_2          0x12040u
++#define GSI_ERROR_LOG           0x12200u
++#define CH_CTX(ch)              (0x0f000u + (ch) * 0x80u)
++#define CH_QOS(ch)              (0x0f05cu + (ch) * 0x80u)
++#define CH_SCR(ch, i)           (0x0f060u + (ch) * 0x80u + 4u * (i))
++#define CH_DB(ch)               (0x11000u + (ch) * 8u)
++#define EV_CTX(ev)              (0x10000u + (ev) * 0x80u)
++#define EV_DB(ev)               (0x11100u + (ev) * 8u)
++
++#define CH_CHTYPE_GPI           2u
++#define CH_DIR                  (1u << 3)
++#define CH_ERINDEX_SHIFT        14
++#define CH_STATE_SHIFT          20
++#define CH_ELEM_SHIFT           24
++#define EV_CHTYPE_GPI           2u
++#define EV_INTYPE               (1u << 16)
++#define EV_STATE_SHIFT          20
++#define EV_ELEM_SHIFT           24
++#define EV_MODT                 32u
++enum { CH_ST_NOT_ALLOC = 0, CH_ST_ALLOCATED = 1, CH_ST_STARTED = 2, CH_ST_STOPPED = 3 };
++enum { EV_ST_NOT_ALLOC = 0, EV_ST_ALLOCATED = 1 };
++enum { CH_CMD_ALLOCATE = 0x0, CH_CMD_START = 0x1 };
++enum { EV_CMD_ALLOCATE = 0x0 };
++
++#define RING_ELEM               16u
++#define TRE_CHAIN               (1u << 0)
++#define TRE_IEOT                (1u << 9)
++#define TRE_XFER                (2u << 16)
++#define TRE_IMMD_CMD            (3u << 16)
++#define EVT_CBCM                0x00
++#define EVT_XFER                0x22
++
++#define CH_MDM_TX               2       /* AP_MODEM_TX, endpoint 2 */
++#define CH_MDM_RX               7       /* AP_MODEM_RX, endpoint 16 */
++#define EV_SHARED               2       /* the one event ring of ch 2 and ch 7 (p2late) */
++#define EP_MDM_TX               2
++#define EP_MDM_RX               16
++#define EP_MODEM_AP_RX          14
++#define EV_CNT                  128u
++#define TX_TRE_CNT              512u
++#define RX_TRE_CNT              256u
++#define TLV_MDM_TX              16u
++#define TLV_MDM_RX              9u
++#define RX_BUFS                 32u
++#define RX_BUF_SZ               8192u
++#define TX_BUFS                 32u
++#define TX_CAP                  2048u
++#define QMAP_HDR                4u
++#define QMAP5_CSUM_HDR          4u
++#define TXQ_MAX                 128u
++
++struct gsi_evt {
++	uint64_t xfer_ptr;
++	uint16_t len;
++	uint8_t resv0;
++	uint8_t code;
++	uint16_t resv1;
++	uint8_t type;
++	uint8_t chid;
++} __attribute__((packed));
++
++struct gsi_tre {
++	uint64_t addr;
++	uint16_t len;
++	uint16_t resv;
++	uint32_t flags;
++} __attribute__((packed));
++
++struct ring {
++	uint64_t pa;
++	uint32_t cnt, wp, rp;
++};
++
++/* ---- state ---- */
++
++static LCK_GRP_DECLARE(ipa_grp, "sweet-ipa");
++static LCK_MTX_DECLARE(ipa_lock, &ipa_grp);     /* rx queue, tx queue, requests; a leaf lock: nothing is called under it */
++
++static volatile int ipa_state;                  /* kern.sweet_ipa_state */
++static volatile int ipa_drv;                    /* kern.sweet_ipa_drv: 1 INIT_DRIVER accepted, -1 refused/none */
++static bool started;
++static vm_offset_t ipa_va, sh_va, gsi_va, ee1_va;
++static uint32_t refused_mmio;
++
++/* tunables */
++static uint32_t join_s = 40;                    /* p2join=40 */
++static int use_ee1;                             /* opt-in: EE1 ch 7 started 5 s also joins */
++static uint32_t keep_s = 3, keepidle_s = 120;   /* p2keep=3 p2keepidle=120 */
++static uint32_t poll_us = 1000;                 /* wland's loop: 1 ms */
++static uint32_t gw_sysctl;                      /* kern.sweet_pdp_gw (network order) */
++
++/* requests from sysctls / other threads */
++static int up_req, up_res, up_done, arm_req;
++
++/* DMA arena: one contiguous block, cacheable, cleaned/invalidated around every access (as /dev/pmem did for wland) */
++#define ARENA_SIZE              (512u * 1024u)
++static vm_offset_t arena_va;
++static uint64_t arena_pa, arena_next;
++
++static struct ring ev[EV_SHARED + 1], ch[CH_MDM_RX + 1];
++
++/* QMI */
++static uint16_t txn = 1;
++static uint32_t m_node, m_port;                 /* the modem's 0x31/2 */
++static bool m_up, announced, reg_up, cmplt_seen, drv_ok, ind_sent, early_failed;
++static int reg_want = -1;
++static uint32_t reg_node, reg_port;
++static uint16_t drv_txn, notif_txn, dpm_txn;
++static int dpm_res;                             /* 0 pending, 1 ok, -1 refused */
++static uint64_t t_step;
++enum { Q_IDLE, Q_SERVER, Q_GAP, Q_DRV, Q_COMPLETE, Q_DPM_FIND, Q_DPM, Q_DONE };
++static int qstep;
++
++/* data plane */
++static int dp_stage;                            /* 0 idle, 1 armed (waiting to join), 2 running */
++static uint64_t dp_t0, ee1_seen;
++static uint64_t rx_buf_pa, tx_buf_pa, keep_at;
++static uint32_t rx_done, tx_wp, tx_done;
++static uint64_t last_ul_ms, last_traffic;
++static uint32_t keep_ip, keep_mux;              /* our address as iOS last used it, and its mux */
++static uint32_t gw_mux[256];
++
++static struct {
++	uint64_t rx_pkts, rx_bytes, tx_pkts, tx_bytes;
++	uint32_t rx_evts, tx_evts, unk_evts, rx_err, tx_err, tx_drop_prejoin, tx_drop_full, tx_drop_af, tx_drop_size,
++	    rx_drop_nombuf, qmap_cmds, qmap_bad, status_msgs, keep_sent, keep_replies, qmi_in, qmi_dropped, early_cmds;
++} sx;
++
++/* QRTR packets to our ports */
++#define RXQ                     8u
++#define RXQ_MAX                 16384u
++static struct qpkt {
++	uint32_t type, node, port, dport, confirm, n;
++	uint8_t *d;
++} rxq[RXQ];
++static unsigned rxq_head, rxq_count;
++
++/* packets from the PDP side */
++static struct { uint32_t mux; mbuf_t m; } txq[TXQ_MAX];
++static unsigned txq_head, txq_count;
++
++static bool wake_flag;
++
++/* ---- time ---- */
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms * 1000u, NSEC_PER_USEC);
++}
++
++static void
++ipa_wake(void)
++{
++	lck_mtx_lock(&ipa_lock);
++	wake_flag = true;
++	wakeup(&wake_flag);
++	lck_mtx_unlock(&ipa_lock);
++}
++
++static void
++set_state(int s, const char *why)
++{
++	if (s != ipa_state) {
++		SAY("state %d -> %d (%s)\n", ipa_state, s, why);
++	}
++	ipa_state = s;
++}
++
++/* ---- MMIO: bounds-checked, 32-bit only ---- */
++
++static void
++mmio_refused(const char *what, uint32_t off)
++{
++	if (refused_mmio++ < 8) {
++		SAY("REFUSED %s access at offset %#x (outside its window)\n", what, off);
++	}
++}
++
++static uint32_t
++ipa_rd(uint32_t off)
++{
++	if (!ipa_va || off >= IPA_REG_SIZE || (off & 3)) {
++		mmio_refused("ipa", off);
++		return 0xffffffffu;
++	}
++	return *(volatile uint32_t *)(ipa_va + off);
++}
++
++static void
++ipa_wr(uint32_t off, uint32_t v)
++{
++	if (!ipa_va || off >= IPA_REG_SIZE || (off & 3)) {
++		mmio_refused("ipa", off);
++		return;
++	}
++	*(volatile uint32_t *)(ipa_va + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++sh_rd(uint32_t off)
++{
++	if (!sh_va || off + 4 > IPA_SHARED_SIZE || (off & 3)) {
++		mmio_refused("ipa shared", off);
++		return 0;
++	}
++	return *(volatile uint32_t *)(sh_va + off);
++}
++
++static void
++sh_wr(uint32_t off, uint32_t v)
++{
++	if (!sh_va || off + 4 > IPA_SHARED_SIZE || (off & 3)) {
++		mmio_refused("ipa shared", off);
++		return;
++	}
++	*(volatile uint32_t *)(sh_va + off) = v;
++}
++
++/* EE0 only: GSI base + 0xf000 .. 0x12fffc (PA 0x1e13000..0x1e16ffc). The inter-EE block (+0xc000) cannot be reached. */
++static uint32_t
++gsi_rd(uint32_t off)
++{
++	if (!gsi_va || off < GSI_EE0_LO || off >= GSI_EE0_HI || (off & 3)) {
++		mmio_refused("gsi", off);
++		return 0xffffffffu;
++	}
++	return *(volatile uint32_t *)(gsi_va + (off - GSI_EE0_LO));
++}
++
++static void
++gsi_wr(uint32_t off, uint32_t v)
++{
++	if (!gsi_va || off < GSI_EE0_LO || off >= GSI_EE0_HI || (off & 3)) {
++		mmio_refused("gsi", off);
++		return;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");      /* ring/TRE memory written before any command or doorbell */
++	*(volatile uint32_t *)(gsi_va + (off - GSI_EE0_LO)) = v;
++}
++
++/* the one other-EE register: the modem's EE1 ch 7 state (read only, kern.sweet_ipa_ee1=1, as wland's join wait) */
++static unsigned
++ee1_ch7_state(void)
++{
++	if (!use_ee1) {
++		return 0;
++	}
++	if (!ee1_va) {
++		ee1_va = ml_io_map(GSI_BASE_PA + (GSI_EE1_CH7_CTX0 & ~0xfffu), 0x1000);
++		if (!ee1_va) {
++			return 0;
++		}
++	}
++	return (*(volatile uint32_t *)(ee1_va + (GSI_EE1_CH7_CTX0 & 0xfffu)) >> CH_STATE_SHIFT) & 0xf;
++}
++
++/* ---- DMA arena ---- */
++
++static bool
++arena_init(void)
++{
++	if (arena_va) {
++		return true;
++	}
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, ARENA_SIZE, PAGE_MASK, 0, (ppnum_t)(atop_64(65536) - 1),
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		SAY("no contiguous DMA memory (%u KiB)\n", ARENA_SIZE / 1024);
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		SAY("DMA memory has no physical page\n");
++		return false;
++	}
++	arena_pa = ptoa_64(pn);
++	flush_dcache64((addr64_t)arena_pa, ARENA_SIZE, TRUE);
++	arena_va = va;
++	arena_next = arena_pa;
++	SAY("DMA arena %u KiB at PA %#llx (kept for the life of the boot)\n", ARENA_SIZE / 1024, arena_pa);
++	return true;
++}
++
++static uint64_t
++dma_alloc(uint32_t size, uint32_t align)
++{
++	uint64_t at = (arena_next + align - 1) & ~((uint64_t)align - 1);
++	if (at + size > arena_pa + ARENA_SIZE) {
++		SAY("DMA arena full (%u bytes asked)\n", size);
++		return 0;
++	}
++	arena_next = at + size;
++	return at;
++}
++
++static inline uint8_t *
++dva(uint64_t pa)
++{
++	return (uint8_t *)(arena_va + (vm_offset_t)(pa - arena_pa));
++}
++
++static void
++dma_wr(uint64_t pa, const void *src, uint32_t n)
++{
++	memcpy(dva(pa), src, n);
++	flush_dcache64((addr64_t)pa, n, TRUE);
++}
++
++static void
++dma_sync(uint64_t pa, uint32_t n)
++{
++	flush_dcache64((addr64_t)pa, n, TRUE);
++}
++
++/* ---- GSI (wland ipagsi.c) ---- */
++
++static unsigned
++ch_state(int c)
++{
++	return (gsi_rd(CH_CTX(c)) >> CH_STATE_SHIFT) & 0xf;
++}
++
++static unsigned
++ev_state(int e)
++{
++	return (gsi_rd(EV_CTX(e)) >> EV_STATE_SHIFT) & 0xf;
++}
++
++/* poll the state field until it leaves `from`; at most ms */
++static int
++wait_state(uint32_t reg, unsigned shift, unsigned from, unsigned ms, const char *what)
++{
++	for (unsigned t = 0;; t++) {
++		unsigned now = (gsi_rd(reg) >> shift) & 0xf;
++		if (now != from) {
++			return 0;
++		}
++		if (t >= ms) {
++			SAY("%s stuck in state %x\n", what, now);
++			return -1;
++		}
++		sleep_ms(1);
++	}
++}
++
++static int
++ring_new(struct ring *r, uint32_t cnt)
++{
++	r->pa = dma_alloc(cnt * RING_ELEM, 4096);
++	if (!r->pa) {
++		return -1;
++	}
++	r->cnt = cnt;
++	r->wp = r->rp = 0;
++	bzero(dva(r->pa), cnt * RING_ELEM);
++	dma_sync(r->pa, cnt * RING_ELEM);
++	return 0;
++}
++
++static int
++ev_alloc_program(int e, uint32_t cnt)
++{
++	struct ring *r = &ev[e];
++	uint32_t off = EV_CTX(e), st = ev_state(e);
++	if (st != EV_ST_NOT_ALLOC) {
++		SAY("evt ring %d not free: state %x\n", e, st);
++		return -1;
++	}
++	if (ring_new(r, cnt)) {
++		return -1;
++	}
++	gsi_wr(GSI_EV_CH_CMD, EV_CMD_ALLOCATE << 24 | (unsigned)e);
++	if (wait_state(off, EV_STATE_SHIFT, EV_ST_NOT_ALLOC, 100, "evt allocate")) {
++		return -1;
++	}
++	st = ev_state(e);
++	if (st != EV_ST_ALLOCATED) {
++		SAY("evt ring %d after allocate: state %x\n", e, st);
++		return -1;
++	}
++	gsi_wr(off + 0x00, EV_CHTYPE_GPI | EV_INTYPE | (RING_ELEM << EV_ELEM_SHIFT));
++	gsi_wr(off + 0x04, cnt * RING_ELEM & 0xffff);
++	gsi_wr(off + 0x08, (uint32_t)r->pa);
++	gsi_wr(off + 0x0c, (uint32_t)(r->pa >> 32));
++	gsi_wr(off + 0x20, EV_MODT | (1u << 16));
++	gsi_wr(off + 0x24, 0);
++	gsi_wr(off + 0x28, 0);
++	gsi_wr(off + 0x2c, 0);
++	gsi_wr(off + 0x30, 0);
++	gsi_wr(off + 0x34, 0);
++	gsi_wr(EV_DB(e), (uint32_t)(r->pa + (uint64_t)(cnt - 1) * RING_ELEM));
++	SAY("gsi: evt ring %d pa %#llx cnt %u ok\n", e, r->pa, cnt);
++	return 0;
++}
++
++static int
++ch_alloc_program(int c, int e, uint32_t cnt, int toward_ipa, uint32_t tlv)
++{
++	struct ring *r = &ch[c];
++	uint32_t off = CH_CTX(c), st = ch_state(c);
++	if (st != CH_ST_NOT_ALLOC) {
++		SAY("ch %d not free: state %x\n", c, st);
++		return -1;
++	}
++	if (ring_new(r, cnt)) {
++		return -1;
++	}
++	gsi_wr(GSI_CH_CMD, CH_CMD_ALLOCATE << 24 | (unsigned)c);
++	if (wait_state(off, CH_STATE_SHIFT, CH_ST_NOT_ALLOC, 100, "ch allocate")) {
++		return -1;
++	}
++	st = ch_state(c);
++	if (st != CH_ST_ALLOCATED) {
++		SAY("ch %d after allocate: state %x\n", c, st);
++		return -1;
++	}
++	gsi_wr(off + 0x00, CH_CHTYPE_GPI | (toward_ipa ? CH_DIR : 0) | ((uint32_t)e << CH_ERINDEX_SHIFT) |
++	    (RING_ELEM << CH_ELEM_SHIFT));
++	gsi_wr(off + 0x04, cnt * RING_ELEM & 0xffff);
++	gsi_wr(off + 0x08, (uint32_t)r->pa);
++	gsi_wr(off + 0x0c, (uint32_t)(r->pa >> 32));
++	gsi_wr(CH_QOS(c), 1u << 10);                    /* data channel: WRR 0, PREFETCH_MODE escape buffer only */
++	gsi_wr(CH_SCR(c, 0), 0);
++	gsi_wr(CH_SCR(c, 1), 0);
++	gsi_wr(CH_SCR(c, 2), tlv * RING_ELEM << 16);
++	gsi_wr(CH_SCR(c, 3), (gsi_rd(CH_SCR(c, 3)) & 0xffffu) | (2u * RING_ELEM) << 16);
++	SAY("gsi: ch %d pa %#llx cnt %u evt %d %s ok\n", c, r->pa, cnt, e, toward_ipa ? "tx" : "rx");
++	return 0;
++}
++
++static int
++ch_start(int c)
++{
++	uint32_t st = ch_state(c);
++	if (st != CH_ST_ALLOCATED && st != CH_ST_STOPPED) {
++		SAY("ch %d start: bad state %x\n", c, st);
++		return -1;
++	}
++	gsi_wr(GSI_CH_CMD, CH_CMD_START << 24 | (unsigned)c);
++	if (wait_state(CH_CTX(c), CH_STATE_SHIFT, st, 100, "ch start")) {
++		SAY("ch %d ctx %08x %08x %08x %08x err %08x\n", c, gsi_rd(CH_CTX(c)), gsi_rd(CH_CTX(c) + 4), gsi_rd(CH_CTX(c) + 8),
++		    gsi_rd(CH_CTX(c) + 12), gsi_rd(GSI_ERROR_LOG));
++		return -1;
++	}
++	st = ch_state(c);
++	if (st != CH_ST_STARTED) {
++		SAY("ch %d after start: state %x\n", c, st);
++		return -1;
++	}
++	SAY("gsi: ch %d started\n", c);
++	return 0;
++}
++
++static void
++ch_doorbell(int c)
++{
++	struct ring *r = &ch[c];
++	gsi_wr(CH_DB(c), (uint32_t)(r->pa + (uint64_t)(r->wp % r->cnt) * RING_ELEM));
++}
++
++static void
++ev_doorbell(int e)
++{
++	struct ring *r = &ev[e];
++	gsi_wr(EV_DB(e), (uint32_t)(r->pa + (uint64_t)((r->rp - 1) % r->cnt) * RING_ELEM));
++}
++
++static void
++ch_post(int c, uint64_t addr, uint16_t len, uint32_t flags)
++{
++	struct ring *r = &ch[c];
++	struct gsi_tre t = { addr, len, 0, flags };
++	dma_wr(r->pa + (uint64_t)(r->wp % r->cnt) * RING_ELEM, &t, sizeof(t));
++	r->wp++;
++}
++
++/*
++ * The next event, 0 if none. Like wland: a non-zero slot is new, it is consumed and the doorbell names it. The slots are
++ * zeroed for the next lap one whole cache line (4 events) at a time, once all 4 are consumed and before the doorbell
++ * gives the last of them back: no line the GSI may be writing is ever written back from the cache.
++ */
++static int
++ev_read(int e, struct gsi_evt *out)
++{
++	struct ring *r = &ev[e];
++	uint64_t at = r->pa + (uint64_t)(r->rp % r->cnt) * RING_ELEM;
++	dma_sync(at, RING_ELEM);
++	memcpy(out, dva(at), sizeof(*out));
++	const uint8_t *b = (const uint8_t *)out;
++	bool any = false;
++	for (unsigned i = 0; i < sizeof(*out); i++) {
++		any |= b[i] != 0;
++	}
++	if (!any) {
++		return 0;
++	}
++	r->rp++;
++	if ((r->rp % 4) == 0) {
++		uint64_t line = r->pa + (uint64_t)((r->rp - 4) % r->cnt) * RING_ELEM;
++		bzero(dva(line), 4 * RING_ELEM);
++		dma_sync(line, 4 * RING_ELEM);
++	}
++	ev_doorbell(e);
++	return 1;
++}
++
++static int
++gsi_check(void)
++{
++	uint32_t hp = gsi_rd(GSI_HW_PARAM_2), st = gsi_rd(GSI_STATUS);
++	unsigned nch = (hp >> 3) & 0x1f, nev = (hp >> 8) & 0x1f;
++	SAY("gsi: status %08x hw_param_2 %08x (ch/ee %u, evt/ee %u)\n", st, hp, nch, nev);
++	if (!(st & 1) || st == 0xffffffffu) {
++		SAY("gsi: not enabled: not touching it\n");
++		return -1;
++	}
++	if (nch <= CH_MDM_RX || nev <= 3) {
++		SAY("gsi: EE0 has too few rings\n");
++		return -1;
++	}
++	char line[200];
++	int k = 0;
++	for (int c = 0; c < 8; c++) {
++		k += snprintf(line + k, sizeof(line) - (size_t)k, " ch%d:%x", c, ch_state(c));
++	}
++	for (int e = 0; e < 4; e++) {
++		k += snprintf(line + k, sizeof(line) - (size_t)k, " ev%d:%x", e, ev_state(e));
++	}
++	SAY("gsi: EE0 states%s\n", line);
++	return 0;
++}
++
++/* p2irq=1 with p2irqm=63, EE0 registers only (bit 5, the inter-EE masks at GSI base + 0xc020/0xc024, is not ported) */
++static void
++p2_irq_setup(void)
++{
++	static const uint32_t r[] = { 0x12180, 0x12088, 0x12098, 0x1209c, 0x12108, 0x120b8, 0x12120, 0x12100, 0x12118 };
++	char line[160];
++	int k = 0;
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		k += snprintf(line + k, sizeof(line) - (size_t)k, " %x", gsi_rd(r[i]));
++	}
++	SAY("p2irq: before (INTSET TYPE_MSK CH_MSK EV_MSK GLOB_EN IEOB_MSK GSI_EN GLOB_STTS GSI_STTS):%s\n", line);
++	gsi_wr(0x12180, 1);                     /* INTSET: IRQ */
++	gsi_wr(0x12088, 0);                     /* TYPE_IRQ_MSK */
++	gsi_wr(0x12098, 0);                     /* SRC_CH_IRQ_MSK */
++	gsi_wr(0x1209c, 0);                     /* SRC_EV_CH_IRQ_MSK */
++	gsi_wr(0x120b8, 0);                     /* SRC_IEOB_IRQ_MSK */
++	gsi_wr(0x12108, 0);                     /* GLOB_IRQ_EN */
++	gsi_wr(0x12108, 1);                     /* ERROR_INT */
++	gsi_wr(0x12120, 0);                     /* GSI_IRQ_EN */
++	gsi_wr(0x12120, 0xe);                   /* BUS_ERROR | CMD_FIFO_OVRFLOW | MCS_STACK_OVRFLOW */
++	gsi_wr(0x12088, 1u << 2 | 1u << 6);     /* TYPE_IRQ_MSK: GLOB_EE + GENERAL */
++	k = 0;
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		k += snprintf(line + k, sizeof(line) - (size_t)k, " %x", gsi_rd(r[i]));
++	}
++	SAY("p2irq: after:%s (inter-EE masks not touched)\n", line);
++}
++
++/* ---- IPA endpoints (wland ep_program with qmapv5=1 p2noaggr=1 p2status=1) ---- */
++
++static void
++ep_program(int ep)
++{
++	uint32_t b = EP_BASE(ep), cfg, hdr, ext, mmask = 0, st = 0;
++	if (ep == EP_MDM_TX) {
++		cfg = 1u << 1 | 1u << 3;                /* csum offload inline, csum header at word 1 */
++		hdr = 8 | 1u << 6;                      /* header 8 (QMAP + v5 csum), metadata valid at offset 0 */
++		ext = 1;                                /* big endian */
++		st = 1u | (uint32_t)EP_MODEM_AP_RX << 1;
++		ipa_wr(b + EP_CFG, cfg);
++		ipa_wr(b + EP_NAT, 0);
++		ipa_wr(b + EP_HDR, hdr);
++		ipa_wr(b + EP_HDR_EXT, ext);
++		ipa_wr(b + EP_MODE, 0);
++		ipa_wr(b + EP_DEAGGR, 0);
++		ipa_wr(b + EP_SEQ, 4);                  /* IPA_SEQ_2_PASS_SKIP_LAST_UC */
++		ipa_wr(b + EP_AGGR, 0);
++		ipa_wr(b + EP_RSRC_GRP, 0);
++		ipa_wr(b + EP_STATUS, st);
++	} else {
++		cfg = 1u << 1;
++		hdr = 8 | 1u << 6 | 1u << 7 | 1u << 19 | 2u << 20;
++		ext = 1 | 1u << 1 | 1u << 3;
++		mmask = 0xff000000u;
++		ipa_wr(b + EP_CFG, cfg);
++		ipa_wr(b + EP_HDR, hdr);
++		ipa_wr(b + EP_HDR_EXT, ext);
++		ipa_wr(b + EP_HDR_MASK, mmask);
++		ipa_wr(b + EP_AGGR, 0);                 /* p2noaggr=1 */
++		ipa_wr(b + EP_HOL_EN, 0);
++		ipa_wr(b + EP_RSRC_GRP, 0);
++		ipa_wr(b + EP_STATUS, 0);
++	}
++	uint32_t rh = ipa_rd(b + EP_HDR), re = ipa_rd(b + EP_HDR_EXT), rs = ipa_rd(b + EP_STATUS), rc = ipa_rd(b + EP_CTRL);
++	SAY("ep%d programmed: hdr %08x/%08x ext %08x/%08x status %08x/%08x ctrl %08x%s\n", ep, hdr, rh, ext, re, st, rs, rc,
++	    (rh != hdr || re != ext || rs != st) ? "  <- READBACK DIFFERS" : "");
++}
++
++/* ---- ipa_meminit + ipatbl=1 (wland ipa.c) ---- */
++
++#define FLT_EP_BITMAP           ((1u << 2 | 1u << 5 | 1u << 8) << 1)
++
++static int
++hw_up(void)
++{
++	ipa_va = ml_io_map(IPA_REG_PA, IPA_REG_SIZE);
++	sh_va = ml_io_map(IPA_SHARED_PA, 0x5000);
++	gsi_va = ml_io_map(GSI_BASE_PA + GSI_EE0_LO, GSI_EE0_HI - GSI_EE0_LO);
++	if (!ipa_va || !sh_va || !gsi_va) {
++		SAY("hw: cannot map the IPA/GSI windows\n");
++		return -1;
++	}
++	uint32_t v = ipa_rd(COMP_HW_VERSION);
++	if (v != 0x40070000u) {
++		SAY("hw: COMP_HW_VERSION %#010x, not 0x40070000 (IP0 not voted?): nothing done\n", v);
++		return -1;
++	}
++	uint32_t sm = ipa_rd(SHARED_MEM_SIZE), size = 8 * (sm & 0xffff), base = 8 * (sm >> 16);
++	if (size != 0x3000 || base != 0) {
++		SAY("hw: local memory base %#x size %#x: not the proven layout (base 0, size 0x3000): nothing done\n", base, size);
++		return -1;
++	}
++	if (!arena_init()) {
++		return -1;
++	}
++	uint64_t zero_rule = dma_alloc(4096, 4096);
++	if (!zero_rule) {
++		return -1;
++	}
++	for (uint32_t o = 0x280; o < 0x3000; o += 4) {
++		sh_wr(o, 0);
++	}
++	static const uint32_t can[] = { 0x280, 0x284, 0x300, 0x304, 0x380, 0x384, 0x400, 0x404, 0x480, 0x484, 0x500, 0x504,
++		                        0x580, 0x584, 0x600, 0x604, 0x680, 0x684, 0xac8, 0xacc, 0x1790, 0x24f0, 0x27d0, 0x27d4,
++		                        0x2ffc };
++	for (unsigned i = 0; i < sizeof(can) / sizeof(can[0]); i++) {
++		sh_wr(can[i], 0xdeadbeefu);
++	}
++	uint32_t was = ipa_rd(LOCAL_PKT_PROC_CNTXT);
++	ipa_wr(LOCAL_PKT_PROC_CNTXT, base + 0xad0);
++	/* ipatbl=1: filter bitmap ep2/5/8 in slot 0, every other filter and route slot -> the zero rule (64-bit slots) */
++	static const uint32_t flt[] = { 0x288, 0x308, 0x388, 0x408 }, rt[] = { 0x488, 0x508, 0x588, 0x608 };
++	for (unsigned t = 0; t < 4; t++) {
++		sh_wr(flt[t], FLT_EP_BITMAP);
++		sh_wr(flt[t] + 4, 0);
++		for (unsigned i = 1; i < 15; i++) {
++			sh_wr(flt[t] + 8 * i, (uint32_t)zero_rule);
++			sh_wr(flt[t] + 8 * i + 4, (uint32_t)(zero_rule >> 32));
++		}
++		for (unsigned i = 0; i < 15; i++) {
++			sh_wr(rt[t] + 8 * i, (uint32_t)zero_rule);
++			sh_wr(rt[t] + 8 * i + 4, (uint32_t)(zero_rule >> 32));
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	SAY("hw up: IPA v4.7, local memory zeroed 0x280..0x3000, 25 canaries, LOCAL_PKT_PROC_CNTXT %#x (was %#x), "
++	    "filter bitmap %#x, all filter/route slots -> zero rule %#llx\n", base + 0xad0, was, FLT_EP_BITMAP, zero_rule);
++	return 0;
++}
++
++/* ---- p2early (wland ipagsi_early + tblcmd_post(0)) ---- */
++
++static void
++post_immd(uint64_t payload, uint16_t op)
++{
++	struct ring *r = &ch[CH_MDM_TX];
++	struct gsi_tre t = { payload, op, 0, TRE_IMMD_CMD | TRE_IEOT };
++	dma_wr(r->pa + (uint64_t)(r->wp % r->cnt) * RING_ELEM, &t, sizeof(t));
++	r->wp++;
++}
++
++static int
++p2early(void)
++{
++	SAY("p2early: before INIT_DRIVER: ev2 + ch2 + table/header init\n");
++	p2_irq_setup();
++	if (ev_alloc_program(EV_SHARED, EV_CNT) || ch_alloc_program(CH_MDM_TX, EV_SHARED, TX_TRE_CNT, 1, TLV_MDM_TX)) {
++		return -1;
++	}
++	ep_program(EP_MDM_TX);
++	if (ch_start(CH_MDM_TX)) {
++		return -1;
++	}
++	uint64_t blk = dma_alloc(4096, 4096), hb = dma_alloc(4096, 4096);
++	if (!blk || !hb) {
++		return -1;
++	}
++	/* HDR_INIT_LOCAL (9): the header table 0x688 + 0x440, image = the current local memory */
++	for (uint32_t o = 0; o < 0x440; o += 4) {
++		uint32_t w = sh_rd(0x688 + o);
++		memcpy(dva(hb) + o, &w, 4);
++	}
++	dma_sync(hb, 0x440);
++	uint64_t pay[3] = { hb, (uint64_t)(0x440u | 0x688u << 12), 0 };
++	dma_wr(blk + 0xf00, pay, 16);
++	post_immd(blk + 0xf00, 9);
++	/* IP_V4/V6_FILTER_INIT (3/4), IP_V4/V6_ROUTING_INIT (7/8): images = the current SRAM tables */
++	static const struct { uint16_t op, h, n; } t[4] = { { 3, 0x288, 0x308 }, { 4, 0x388, 0x408 }, { 7, 0x488, 0x508 },
++		                                            { 8, 0x588, 0x608 } };
++	const uint32_t sz = 0x78;
++	for (int i = 0; i < 4; i++) {
++		uint64_t hi = blk + 0x100u * i, ni = hi + 0x80, pl = blk + 0x800 + 0x20u * i;
++		for (uint32_t o = 0; o < sz; o += 4) {
++			uint32_t a = sh_rd(t[i].h + o), b = sh_rd(t[i].n + o);
++			memcpy(dva(hi) + o, &a, 4);
++			memcpy(dva(ni) + o, &b, 4);
++		}
++		dma_sync(hi, 0x100);
++		pay[0] = hi;
++		pay[1] = (uint64_t)sz | (uint64_t)t[i].h << 12 | (uint64_t)sz << 28 | (uint64_t)t[i].n << 40;
++		pay[2] = ni;
++		dma_wr(pl, pay, sizeof(pay));
++		post_immd(pl, t[i].op);
++	}
++	ch_doorbell(CH_MDM_TX);
++	sleep_ms(50);
++	ipa_wr(FILT_ROUT_HASH_FLUSH, 0x1111);
++	unsigned n = 0;
++	uint64_t t0 = sbb_ms();
++	while (n < 5 && sbb_ms() - t0 < 1000) {
++		struct gsi_evt e;
++		if (ev_read(EV_SHARED, &e) == 1) {
++			n++;
++			SAY("p2early: completion %u type %02x code %02x ch %u\n", n, e.type, e.code, e.chid);
++		} else {
++			sleep_ms(5);
++		}
++	}
++	sx.early_cmds = n;
++	SAY("p2early: %u of 5 commands completed in %llu ms\n", n, sbb_ms() - t0);
++	return n == 5 ? 0 : -1;
++}
++
++/* ---- QMI (wland ipaqmi.c, cell.c DPM) ---- */
++
++#define QMI_REQ                 0u
++#define QMI_RESP                2u
++#define QMI_IND                 4u
++#define IPA_SVC                 0x31u
++#define DPM_SVC                 0x2fu
++#define MSG_INDICATION_REGISTER 0x20
++#define MSG_INIT_DRIVER         0x21
++#define MSG_INIT_COMPLETE       0x22
++#define MSG_INSTALL_FILTER_RULE 0x23
++#define MSG_FILTER_INSTALLED_NOTIF 0x24
++#define MSG_CONFIG              0x27
++#define MSG_INIT_MODEM_DRIVER_CMPLT 0x35
++#define MSG_DPM_OPEN_PORT       0x20
++#define FSPEC_EX_SIZE           173u
++#define FSPEC_EX_RULE_ID        168u
++#define MAX_FILTERS             64u
++#define MAX_Q6_RULES            35u
++
++struct qb {
++	uint8_t b[640];
++	uint32_t n;
++	bool bad;
++};
++
++static void
++q_start(struct qb *q, uint8_t type, uint16_t t, uint16_t id)
++{
++	q->b[0] = type;
++	q->b[1] = (uint8_t)t;
++	q->b[2] = (uint8_t)(t >> 8);
++	q->b[3] = (uint8_t)id;
++	q->b[4] = (uint8_t)(id >> 8);
++	q->n = 7;
++	q->bad = false;
++}
++
++static void
++q_tlv(struct qb *q, uint8_t t, const void *v, uint16_t l)
++{
++	if (q->bad || q->n + 3u + l > sizeof(q->b)) {
++		q->bad = true;
++		return;
++	}
++	q->b[q->n] = t;
++	q->b[q->n + 1] = (uint8_t)l;
++	q->b[q->n + 2] = (uint8_t)(l >> 8);
++	memcpy(q->b + q->n + 3, v, l);
++	q->n += 3u + l;
++}
++
++static void
++q_u32(struct qb *q, uint8_t t, uint32_t v)
++{
++	q_tlv(q, t, &v, 4);                     /* little-endian host, as every TLV */
++}
++
++static void
++q_pair(struct qb *q, uint8_t t, uint32_t a, uint32_t b)
++{
++	uint32_t w[2] = { a, b };
++	q_tlv(q, t, w, 8);
++}
++
++static uint32_t
++q_finish(struct qb *q)
++{
++	uint32_t l = q->n - 7;
++	q->b[5] = (uint8_t)l;
++	q->b[6] = (uint8_t)(l >> 8);
++	return q->bad ? 0 : q->n;
++}
++
++static const uint8_t *
++q_get(const uint8_t *d, uint32_t n, uint8_t t, uint16_t *len)
++{
++	uint32_t end = 7u + (uint32_t)(d[5] | d[6] << 8);
++	if (end > n) {
++		end = n;
++	}
++	for (uint32_t at = 7; at + 3 <= end;) {
++		uint16_t l = (uint16_t)(d[at + 1] | d[at + 2] << 8);
++		if (at + 3u + l > end) {
++			break;
++		}
++		if (d[at] == t) {
++			if (len) {
++				*len = l;
++			}
++			return d + at + 3;
++		}
++		at += 3u + l;
++	}
++	return NULL;
++}
++
++static uint16_t
++next_txn(void)
++{
++	uint16_t t = txn++;
++	if (!txn) {
++		txn = 1;
++	}
++	return t;
++}
++
++static int
++q_send(uint32_t from, uint32_t node, uint32_t port, struct qb *q)
++{
++	uint32_t n = q_finish(q);
++	if (!n) {
++		SAY("qmi: message does not encode\n");
++		return EINVAL;
++	}
++	return sbb_qrtr_send(SBB_QRTR_DATA, from, node, port, q->b, n);
++}
++
++static void
++reply_ok(const struct qpkt *p, uint16_t t, uint16_t id)
++{
++	struct qb q;
++	uint8_t ok[4] = { 0, 0, 0, 0 };
++	q_start(&q, QMI_RESP, t, id);
++	q_tlv(&q, 0x02, ok, 4);
++	(void)q_send(SWEET_IPA_SRV_PORT, p->node, p->port, &q);
++}
++
++static void
++announce(void)
++{
++	uint32_t pkt[5] = { SBB_QRTR_NEW_SERVER, IPA_SVC, 1u | 1u << 8, SBB_NODE_APPS, SWEET_IPA_SRV_PORT };
++	int e = sbb_qrtr_send(SBB_QRTR_NEW_SERVER, SBB_PORT_CTRL, SBB_NODE_MODEM, SBB_PORT_CTRL, pkt, sizeof(pkt));
++	announced = true;
++	SAY("qmi: serving service 0x31 instance 1 at 1:%x%s\n", SWEET_IPA_SRV_PORT, e ? " (link send failed)" : "");
++}
++
++/* INIT_DRIVER: ipa_4_7_mem_part (redbull), smem base 0, field order as downstream (wland ipaqmi_encode_init_driver) */
++static int
++send_init_driver(void)
++{
++	struct qb q;
++	drv_txn = next_txn();
++	q_start(&q, QMI_REQ, drv_txn, MSG_INIT_DRIVER);
++	q_u32(&q, 0x10, 3);                             /* platform MSM_ANDROID */
++	q_pair(&q, 0x11, 0x0688, 0x0688 + 0x0240 - 1);  /* modem header table */
++	q_pair(&q, 0x12, 0x0508, 7);                    /* v4 route nhash, max index */
++	q_pair(&q, 0x13, 0x0608, 7);
++	q_u32(&q, 0x14, 0x0308);                        /* v4 filter nhash */
++	q_u32(&q, 0x15, 0x0408);
++	q_pair(&q, 0x16, 0x27d8, 0x0800);               /* modem memory */
++	q_u32(&q, 0x17, 16);                            /* ctrl_comm_dest_end_pt: APPS_WAN_CONS ep 16 */
++	q_pair(&q, 0x19, 0x0ad0, 0x0ad0 + 0x0ac0 - 1);  /* modem hdr proc ctx */
++	q_pair(&q, 0x1b, 0x0488, 7);
++	q_pair(&q, 0x1c, 0x0588, 7);
++	q_u32(&q, 0x1d, 0x0288);
++	q_u32(&q, 0x1e, 0x0388);
++	q_u32(&q, 0x1f, 0x2500);                        /* hw stats quota */
++	q_u32(&q, 0x20, 0x30);
++	q_u32(&q, 0x21, 0x27b0);                        /* drop stats */
++	q_u32(&q, 0x22, 0x20);
++	SAY("qmi: > INIT_DRIVER txn %u to %u:%x (%u bytes, ipa_4_7_mem_part, smem base 0)\n", drv_txn, m_node, m_port,
++	    q.n);
++	return q_send(SWEET_IPA_CLI_PORT, m_node, m_port, &q);
++}
++
++static void
++maybe_init_complete(void)
++{
++	if (ind_sent || !reg_up || !cmplt_seen || !drv_ok) {
++		return;
++	}
++	struct qb q;
++	uint8_t ok[4] = { 0, 0, 0, 0 };
++	q_start(&q, QMI_IND, 0, MSG_INIT_COMPLETE);
++	q_tlv(&q, 0x02, ok, 4);
++	int e = q_send(SWEET_IPA_SRV_PORT, reg_node, reg_port, &q);
++	SAY("qmi: > INIT_COMPLETE indication to %u:%x (modem server %u:%x)%s\n", reg_node, reg_port, m_node, m_port,
++	    e ? " (link send failed, not repeated)" : "");
++	ind_sent = true;
++}
++
++static void
++on_install_filter(const struct qpkt *p, uint16_t t)
++{
++	struct qb q;
++	uint8_t ok[4] = { 0, 0, 0, 0 }, ids[1 + 4 * MAX_Q6_RULES];
++	uint16_t l = 0;
++	const uint8_t *s = q_get(p->d, p->n, 0x15, &l);
++	unsigned k = 0;
++	q_start(&q, QMI_RESP, t, MSG_INSTALL_FILTER_RULE);
++	q_tlv(&q, 0x02, ok, 4);
++	if (s) {
++		unsigned cnt = l >= 1 ? s[0] : 0;
++		if (l < 1 || cnt > MAX_FILTERS || l != 1u + cnt * FSPEC_EX_SIZE) {
++			SAY("qmi:   filter rules: 0x15 of %u bytes (count %u): success alone\n", l, cnt);
++			s = NULL;
++		} else {
++			k = cnt > MAX_Q6_RULES ? MAX_Q6_RULES : cnt;
++			ids[0] = (uint8_t)k;
++			for (unsigned r = 0; r < k; r++) {
++				memcpy(ids + 1 + 4 * r, s + 1 + r * FSPEC_EX_SIZE + FSPEC_EX_RULE_ID, 4);
++			}
++			q_tlv(&q, 0x11, ids, (uint16_t)(1 + 4 * k));
++			SAY("qmi:   install filter rule: %u rules, %u ids answered\n", cnt, k);
++		}
++	}
++	(void)q_send(SWEET_IPA_SRV_PORT, p->node, p->port, &q);
++	if (s && m_up) {                                /* ipanotif=1 */
++		uint8_t st[2] = { 0, 0 }, empty = 0;
++		notif_txn = next_txn();
++		q_start(&q, QMI_REQ, notif_txn, MSG_FILTER_INSTALLED_NOTIF);
++		q_u32(&q, 0x01, 2);
++		q_tlv(&q, 0x02, st, 2);
++		q_tlv(&q, 0x03, &empty, 1);
++		q_tlv(&q, 0x17, ids, (uint16_t)(1 + 4 * k));
++		int e = q_send(SWEET_IPA_CLI_PORT, m_node, m_port, &q);
++		SAY("qmi: > FILTER_INSTALLED_NOTIF txn %u: source pipe 2, %u rule ids%s\n", notif_txn, k, e ? " (send failed)" : "");
++	}
++}
++
++static void
++result_of(const struct qpkt *p, unsigned *res, unsigned *err)
++{
++	uint16_t l = 0;
++	const uint8_t *r = q_get(p->d, p->n, 0x02, &l);
++	*res = r && l >= 4 ? (unsigned)(r[0] | r[1] << 8) : 0xffff;
++	*err = r && l >= 4 ? (unsigned)(r[2] | r[3] << 8) : 0xffff;
++}
++
++static void
++qmi_in(const struct qpkt *p)
++{
++	if (p->confirm) {
++		uint32_t rt[5] = { SBB_QRTR_RESUME_TX, SBB_NODE_APPS, p->dport, 0, 0 };
++		(void)sbb_qrtr_send(SBB_QRTR_RESUME_TX, p->dport, p->node, p->port, rt, sizeof(rt));
++	}
++	if (p->type != SBB_QRTR_DATA || p->n < 7) {
++		return;
++	}
++	sx.qmi_in++;
++	uint8_t qt = p->d[0];
++	uint16_t t = (uint16_t)(p->d[1] | p->d[2] << 8), id = (uint16_t)(p->d[3] | p->d[4] << 8);
++	SAY("qmi: < type %u msg %#x txn %u len %u from %u:%x to %x\n", qt, id, t, p->n, p->node, p->port, p->dport);
++	if (p->node != SBB_NODE_MODEM) {
++		return;
++	}
++	unsigned res, err;
++	if (p->dport == SWEET_IPA_CLI_PORT) {
++		if (qt != QMI_RESP) {
++			return;
++		}
++		result_of(p, &res, &err);
++		if (id == MSG_INIT_DRIVER && drv_txn && t == drv_txn) {
++			uint32_t ctrl = 0xffffffffu, def = 0xffffffffu;
++			uint16_t l = 0;
++			const uint8_t *v = q_get(p->d, p->n, 0x10, &l);
++			if (v && l >= 4) {
++				memcpy(&ctrl, v, 4);
++			}
++			v = q_get(p->d, p->n, 0x11, &l);
++			if (v && l >= 4) {
++				memcpy(&def, v, 4);
++			}
++			drv_txn = 0;
++			drv_ok = res == 0;
++			ipa_drv = drv_ok ? 1 : -1;
++			SAY("qmi: INIT_DRIVER -> %s result %u error %#x ctrl_ep %d default_ep %d (%llu ms)\n",
++			    drv_ok ? "ACCEPTED" : "REFUSED", res, err, (int)ctrl, (int)def, sbb_ms() - t_step);
++			maybe_init_complete();
++		} else if (id == MSG_FILTER_INSTALLED_NOTIF && notif_txn && t == notif_txn) {
++			notif_txn = 0;
++			SAY("qmi: FILTER_INSTALLED_NOTIF -> result %u error %#x\n", res, err);
++		} else if (id == MSG_DPM_OPEN_PORT && dpm_txn && t == dpm_txn) {
++			dpm_txn = 0;
++			dpm_res = res == 0 ? 1 : -1;
++			SAY("dpm: Open Port -> %s (result %u error %#x, %llu ms)\n", res == 0 ? "ok" : "REFUSED", res, err,
++			    sbb_ms() - t_step);
++		}
++		return;
++	}
++	if (qt != QMI_REQ) {
++		return;
++	}
++	uint16_t l = 0;
++	const uint8_t *v;
++	switch (id) {
++	case MSG_INDICATION_REGISTER:
++		reply_ok(p, t, id);
++		reg_up = true;
++		reg_node = p->node;
++		reg_port = p->port;
++		v = q_get(p->d, p->n, 0x10, &l);
++		reg_want = v && l >= 1 ? v[0] : -1;
++		SAY("qmi:   indication register from %u:%x (master_driver_init_complete %d): answered\n", reg_node, reg_port,
++		    reg_want);
++		maybe_init_complete();
++		break;
++	case MSG_INIT_MODEM_DRIVER_CMPLT:
++		reply_ok(p, t, id);
++		cmplt_seen = true;
++		v = q_get(p->d, p->n, 0x01, &l);
++		SAY("qmi:   modem driver init complete (status %d): answered\n", v && l >= 1 ? v[0] : -1);
++		maybe_init_complete();
++		break;
++	case MSG_CONFIG:
++	case MSG_FILTER_INSTALLED_NOTIF:
++		reply_ok(p, t, id);
++		SAY("qmi:   %s: answered with success\n", id == MSG_CONFIG ? "config" : "filters installed");
++		break;
++	case MSG_INSTALL_FILTER_RULE:
++		on_install_filter(p, t);
++		break;
++	default:
++		SAY("qmi:   request %#x not known here: not answered\n", id);
++		break;
++	}
++}
++
++static int
++send_dpm_open(uint32_t node, uint32_t port)
++{
++	struct qb q;
++	uint8_t pl[1 + 16];
++	uint32_t v[4] = { 4, 1, EP_MDM_TX, EP_MDM_RX };        /* embedded, iface 1, modem rx = our tx ep 2, modem tx = ep 16 */
++	pl[0] = 1;
++	memcpy(pl + 1, v, 16);
++	dpm_txn = next_txn();
++	dpm_res = 0;
++	q_start(&q, QMI_REQ, dpm_txn, MSG_DPM_OPEN_PORT);
++	q_tlv(&q, 0x11, pl, sizeof(pl));
++	SAY("dpm: > Open Port txn %u to %u:%x: {ep type 4, iface 1, rx ep 2, tx ep 16}\n", dpm_txn, node, port);
++	return q_send(SWEET_IPA_CLI_PORT, node, port, &q);
++}
++
++/* ---- data plane (wland p2_setup, the p2late join, rx_event, tx_send, ipaprobe p2keep) ---- */
++
++static void
++links(int up)
++{
++	for (uint32_t u = 0; u < SWEET_PDP_NUNITS; u++) {
++		(void)sweet_pdp_link(u, up);
++	}
++	SAY("pdp_ip0..%u link %s\n", SWEET_PDP_NUNITS - 1, up ? "up" : "down");
++}
++
++/* wland ipagsi_start (gsi_check, ERROR_LOG) + p2_setup with p2route=16, p2early reused ev2/ch2 */
++static int
++dp_arm(const char *why)
++{
++	SAY("dp: armed (%s)\n", why);
++	if (gsi_check()) {
++		return -1;
++	}
++	gsi_wr(GSI_ERROR_LOG, 0);
++	uint32_t r = ipa_rd(ROUTE);
++	SAY("dp: IPA ROUTE reg %08x (def pipe %u frag pipe %u)\n", r, (r >> 1) & 31, (r >> 17) & 31);
++	ipa_wr(ROUTE, 16u << 1 | 16u << 17 | 1u << 24);
++	SAY("dp: p2route=16: ROUTE -> %08x\n", ipa_rd(ROUTE));
++	ep_program(EP_MDM_TX);
++	dp_t0 = sbb_ms();
++	ee1_seen = 0;
++	dp_stage = 1;
++	SAY("dp: tx ch up (p2early ev2 + ch2 reused); join in %u s%s\n", join_s,
++	    use_ee1 ? " or when the modem's EE1 ch 7 has been started for 5 s" : "");
++	return 0;
++}
++
++static int
++rx_post(uint32_t idx)
++{
++	ch_post(CH_MDM_RX, rx_buf_pa + (uint64_t)idx * RX_BUF_SZ, (uint16_t)RX_BUF_SZ, TRE_XFER | TRE_IEOT);
++	return 0;
++}
++
++static int
++dp_join(const char *why)
++{
++	SAY("dp: join (%s)\n", why);
++	rx_buf_pa = dma_alloc(RX_BUFS * RX_BUF_SZ, RX_BUF_SZ);
++	tx_buf_pa = dma_alloc(TX_BUFS * TX_CAP, 4096);
++	if (!rx_buf_pa || !tx_buf_pa) {
++		return -1;
++	}
++	if (ch_alloc_program(CH_MDM_RX, EV_SHARED, RX_TRE_CNT, 0, TLV_MDM_RX)) {
++		return -1;
++	}
++	ep_program(EP_MDM_RX);
++	if (ch_start(CH_MDM_RX)) {
++		return -1;
++	}
++	for (int ep = EP_MDM_TX; ep <= EP_MDM_RX; ep += EP_MDM_RX - EP_MDM_TX) {      /* read only, as ipagsi_endpoints */
++		uint32_t c = ipa_rd(EP_BASE(ep) + EP_CTRL);
++		SAY("dp: ep%d ctrl %08x cfg %08x hdr %08x aggr %08x seq %08x status %08x%s\n", ep, c, ipa_rd(EP_BASE(ep) + EP_CFG),
++		    ipa_rd(EP_BASE(ep) + EP_HDR), ipa_rd(EP_BASE(ep) + EP_AGGR), ipa_rd(EP_BASE(ep) + EP_SEQ),
++		    ipa_rd(EP_BASE(ep) + EP_STATUS), (c & 3) ? "  (suspended/delayed: data will not flow)" : "");
++	}
++	for (uint32_t i = 0; i < RX_BUFS; i++) {
++		rx_post(i);
++	}
++	ch_doorbell(CH_MDM_RX);
++	rx_done = tx_wp = tx_done = 0;
++	dp_stage = 2;
++	SAY("dp: up: %u rx buffers (%u bytes) posted, ch 2 + ch 7 on evt ring 2\n", RX_BUFS, RX_BUF_SZ);
++	return 0;
++}
++
++/* an ICMP echo reply to our keep-alive (id 0x5a5a, seq bit 0x4000): counted, not handed to iOS */
++static bool
++is_keep_reply(const uint8_t *ip, uint32_t n)
++{
++	if (n < 28 || (ip[0] >> 4) != 4 || ip[9] != 1) {
++		return false;
++	}
++	uint32_t ihl = (ip[0] & 0xfu) * 4;
++	if (ihl < 20 || n < ihl + 8) {
++		return false;
++	}
++	const uint8_t *l4 = ip + ihl;
++	return l4[0] == 0 && l4[4] == 0x5a && l4[5] == 0x5a && (l4[6] & 0x40);
++}
++
++static void
++rx_packet(uint8_t mux, const uint8_t *ip, uint32_t n)
++{
++	unsigned v = n ? ip[0] >> 4 : 0;
++	if ((v != 4 || n < 20) && (v != 6 || n < 40)) {
++		sx.rx_err++;
++		return;
++	}
++	if (is_keep_reply(ip, n)) {
++		sx.keep_replies++;
++		return;
++	}
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < n) {
++		if (m) {
++			mbuf_freem(m);
++		}
++		sx.rx_drop_nombuf++;
++		return;
++	}
++	memcpy(mbuf_data(m), ip, n);
++	mbuf_setlen(m, n);
++	mbuf_pkthdr_setlen(m, n);
++	sx.rx_pkts++;
++	sx.rx_bytes += n;
++	(void)sweet_pdp_input(SWEET_PDP_BY_MUX(mux), m);       /* always consumes m */
++}
++
++/* wland qmap_deagg: each data frame (v5 header skipped, padding stripped) on, command frames counted */
++static void
++qmap_deagg(const uint8_t *b, uint32_t len)
++{
++	uint32_t at = 0;
++	while (at + QMAP_HDR <= len) {
++		unsigned pad = b[at] & 0x3f, cmd = b[at] & 0x80, mux = b[at + 1];
++		uint32_t plen = (uint32_t)b[at + 2] << 8 | b[at + 3];
++		if (plen == 0 && !cmd && !pad && mux == 0) {
++			break;
++		}
++		uint32_t xh = (!cmd && (b[at] & 0x40)) ? QMAP5_CSUM_HDR : 0;
++		if (plen == 0 || at + QMAP_HDR + xh + plen > len || pad > plen) {
++			sx.qmap_bad++;
++			break;
++		}
++		if (cmd) {
++			sx.qmap_cmds++;
++		} else {
++			rx_packet((uint8_t)mux, b + at + QMAP_HDR + xh, plen - pad);
++		}
++		at += QMAP_HDR + xh + plen;
++	}
++}
++
++static void
++rx_event(const struct gsi_evt *e)
++{
++	uint32_t idx = rx_done % RX_BUFS;
++	uint64_t pa = rx_buf_pa + (uint64_t)idx * RX_BUF_SZ;
++	rx_done++;
++	sx.rx_evts++;
++	if (e->type != EVT_CBCM && e->type != EVT_XFER) {
++		sx.rx_err++;
++	} else if (e->len > RX_BUF_SZ) {
++		sx.rx_err++;
++	} else if (e->len) {
++		dma_sync(pa, e->len);
++		const uint8_t *b = dva(pa);
++		if (e->len == 32 && b[0] == 0x01 && (b[6] & 0x1f) == EP_MDM_TX) {
++			sx.status_msgs++;               /* an ep2 status message, not a QMAP frame */
++		} else {
++			qmap_deagg(b, e->len);
++		}
++		last_traffic = sbb_ms();
++	}
++	rx_post(idx);
++	ch_doorbell(CH_MDM_RX);
++}
++
++/* one IPv4 packet (already in a TX buffer behind room for the 8-byte header) to ch 2 as QMAP v5 + csum header */
++static void
++tx_post_frame(uint32_t idx, uint8_t mux, uint32_t len)
++{
++	uint64_t pa = tx_buf_pa + (uint64_t)idx * TX_CAP;
++	uint8_t *f = dva(pa);
++	f[0] = 0x40;
++	f[1] = mux;
++	f[2] = (uint8_t)(len >> 8);
++	f[3] = (uint8_t)len;
++	f[4] = 2u << 1;                         /* CSUM_OFFLOAD header type, no checksum asked */
++	f[5] = f[6] = f[7] = 0;
++	dma_sync(pa, len + QMAP_HDR + QMAP5_CSUM_HDR);
++	ch_post(CH_MDM_TX, pa, (uint16_t)(len + QMAP_HDR + QMAP5_CSUM_HDR), TRE_XFER | TRE_IEOT);
++	tx_wp++;
++	ch_doorbell(CH_MDM_TX);
++	sx.tx_pkts++;
++	sx.tx_bytes += len;
++	last_traffic = sbb_ms();
++}
++
++static void
++tx_pump(void)
++{
++	while (tx_wp - tx_done < TX_BUFS) {
++		uint32_t mux;
++		mbuf_t m;
++		lck_mtx_lock(&ipa_lock);
++		if (!txq_count) {
++			lck_mtx_unlock(&ipa_lock);
++			return;
++		}
++		mux = txq[txq_head].mux;
++		m = txq[txq_head].m;
++		txq_head = (txq_head + 1) % TXQ_MAX;
++		txq_count--;
++		lck_mtx_unlock(&ipa_lock);
++		size_t len = mbuf_pkthdr_len(m);
++		uint8_t h[20];
++		if (len < 20 || len > TX_CAP - QMAP_HDR - QMAP5_CSUM_HDR || mbuf_copydata(m, 0, 20, h) != 0) {
++			sx.tx_drop_size++;
++			mbuf_freem(m);
++			continue;
++		}
++		if ((h[0] >> 4) != 4) {                 /* IPv4 only, as wland's tx_pump */
++			sx.tx_drop_af++;
++			mbuf_freem(m);
++			continue;
++		}
++		uint32_t idx = tx_wp % TX_BUFS;
++		if (mbuf_copydata(m, 0, len, dva(tx_buf_pa + (uint64_t)idx * TX_CAP) + QMAP_HDR + QMAP5_CSUM_HDR) != 0) {
++			sx.tx_err++;
++			mbuf_freem(m);
++			continue;
++		}
++		mbuf_freem(m);                          /* the hardware reads only our copy */
++		memcpy(&keep_ip, h + 12, 4);
++		keep_mux = mux & 0xff;
++		last_ul_ms = sbb_ms();
++		tx_post_frame(idx, (uint8_t)mux, (uint32_t)len);
++	}
++}
++
++static uint16_t
++csum16(const uint8_t *p, uint32_t n)
++{
++	uint32_t acc = 0;
++	for (; n > 1; p += 2, n -= 2) {
++		acc += (uint32_t)(p[0] << 8 | p[1]);
++	}
++	if (n) {
++		acc += (uint32_t)p[0] << 8;
++	}
++	while (acc >> 16) {
++		acc = (acc & 0xffff) + (acc >> 16);
++	}
++	return (uint16_t)~acc;
++}
++
++/* wland ipaprobe p2keep: one ICMP echo to the gateway every keep_s s while iOS sent in the last keepidle_s s */
++static void
++keep_poll(uint64_t now)
++{
++	static uint16_t seq, ipid;
++	uint32_t gw = gw_mux[keep_mux & 0xff] ? gw_mux[keep_mux & 0xff] : gw_sysctl;
++	if (!keep_s || !keep_ip || !gw || !last_ul_ms || now - last_ul_ms >= 1000ull * keepidle_s || now < keep_at ||
++	    tx_wp - tx_done > TX_BUFS - 3) {
++		return;
++	}
++	keep_at = now + 1000ull * (keep_s > 30 ? 30 : keep_s);
++	uint32_t idx = tx_wp % TX_BUFS;
++	uint8_t *ip = dva(tx_buf_pa + (uint64_t)idx * TX_CAP) + QMAP_HDR + QMAP5_CSUM_HDR, *l4 = ip + 20;
++	const uint32_t pl = 8 + 32;
++	bzero(ip, 20 + pl);
++	l4[0] = 8;
++	l4[4] = 0x5a;
++	l4[5] = 0x5a;
++	uint16_t s = (uint16_t)(0x4000 + (seq++ & 0x3fff));
++	l4[6] = (uint8_t)(s >> 8);
++	l4[7] = (uint8_t)s;
++	memcpy(l4 + 8, "redfin-ipaprobe-echo-request...", 31);
++	uint16_t c = csum16(l4, pl);
++	l4[2] = (uint8_t)(c >> 8);
++	l4[3] = (uint8_t)c;
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)((20 + pl) >> 8);
++	ip[3] = (uint8_t)(20 + pl);
++	ip[4] = (uint8_t)(ipid >> 8);
++	ip[5] = (uint8_t)ipid;
++	ipid++;
++	ip[6] = 0x40;
++	ip[8] = 64;
++	ip[9] = 1;
++	memcpy(ip + 12, &keep_ip, 4);
++	memcpy(ip + 16, &gw, 4);
++	c = csum16(ip, 20);
++	ip[10] = (uint8_t)(c >> 8);
++	ip[11] = (uint8_t)c;
++	sx.keep_sent++;
++	tx_post_frame(idx, (uint8_t)keep_mux, 20 + pl);
++}
++
++static void
++dp_poll(uint64_t now)
++{
++	struct gsi_evt e;
++	unsigned k = 0;
++	while (k++ < 256 && ev_read(EV_SHARED, &e) == 1) {
++		if (e.chid == CH_MDM_TX) {
++			tx_done++;
++			sx.tx_evts++;
++		} else if (e.chid == CH_MDM_RX) {
++			rx_event(&e);
++		} else {
++			sx.unk_evts++;
++		}
++	}
++	tx_pump();
++	keep_poll(now);
++}
++
++/* packets that arrive before the join, or with the queue full: dropped (the stack retries) */
++static void
++txq_flush(void)
++{
++	for (;;) {
++		mbuf_t m = NULL;
++		lck_mtx_lock(&ipa_lock);
++		if (txq_count) {
++			m = txq[txq_head].m;
++			txq_head = (txq_head + 1) % TXQ_MAX;
++			txq_count--;
++		}
++		lck_mtx_unlock(&ipa_lock);
++		if (!m) {
++			return;
++		}
++		sx.tx_drop_prejoin++;
++		mbuf_freem(m);
++	}
++}
++
++/* the 1075 output hook: never blocks, always consumes m */
++static int
++ipa_output(__unused uint32_t unit, uint32_t mux, mbuf_t m)
++{
++	if (!(sweet_bb & SBB_DATA) || ipa_state != 3) {
++		mbuf_freem(m);
++		return ENETDOWN;
++	}
++	int e = 0;
++	lck_mtx_lock(&ipa_lock);
++	if (dp_stage < 2) {
++		arm_req = 1;
++	}
++	if (txq_count >= TXQ_MAX) {
++		e = ENOBUFS;
++	} else {
++		txq[(txq_head + txq_count) % TXQ_MAX].mux = mux;
++		txq[(txq_head + txq_count) % TXQ_MAX].m = m;
++		txq_count++;
++		wake_flag = true;
++		wakeup(&wake_flag);
++	}
++	lck_mtx_unlock(&ipa_lock);
++	if (e) {
++		sx.tx_drop_full++;
++		mbuf_freem(m);
++	}
++	return e;
++}
++
++/* ---- the thread ---- */
++
++static void
++fail(int s, const char *why)
++{
++	set_state(s, why);
++	qstep = Q_DONE;
++	SAY("FAILED: %s; nothing is retried in this boot\n", why);
++}
++
++static void
++qmi_step(uint64_t now)
++{
++	uint32_t node = 0, port = 0, ver = 0;
++	switch (qstep) {
++	case Q_SERVER:
++		if (sbb_server(IPA_SVC, 2, &node, &port, &ver)) {
++			m_up = true;
++			m_node = node;
++			m_port = port;
++			SAY("qmi: modem ipa server 0x31/2 (version %u) at %u:%x (%llu ms)\n", ver, node, port, now - t_step);
++			t_step = now + 2000;            /* the modem registers with our 0x31/1 first */
++			qstep = Q_GAP;
++		} else if (now - t_step > 60000) {
++			fail(-2, "the modem's ipa server 0x31/2 never showed (60 s)");
++		}
++		break;
++	case Q_GAP:
++		if (now < t_step) {
++			break;
++		}
++		if (p2early()) {
++			early_failed = true;
++			SAY("p2early FAILED (INIT_DRIVER sent anyway, as wland; no data plane in this boot)\n");
++		}
++		t_step = sbb_ms();
++		if (send_init_driver()) {
++			ipa_drv = -1;
++			fail(-4, "INIT_DRIVER: link send failed");
++			break;
++		}
++		qstep = Q_DRV;
++		break;
++	case Q_DRV:
++		if (drv_ok) {
++			t_step = now;
++			qstep = Q_COMPLETE;
++		} else if (ipa_drv < 0) {
++			fail(-4, "INIT_DRIVER refused");
++		} else if (now - t_step > 40000) {
++			drv_txn = 0;
++			ipa_drv = -1;
++			fail(-4, "INIT_DRIVER unanswered (40 s)");
++		}
++		break;
++	case Q_COMPLETE:
++		if (ind_sent) {
++			if (early_failed) {
++				fail(-3, "p2early failed: no data plane");
++				break;
++			}
++			t_step = now;
++			qstep = Q_DPM_FIND;
++		} else if (now - t_step > 60000) {
++			fail(-5, "no INIT_COMPLETE: the modem did not register (0x20) and/or send 0x35 in 60 s");
++		}
++		break;
++	case Q_DPM_FIND:
++		if (sbb_server_svc(DPM_SVC, &node, &port, &ver)) {
++			t_step = now;
++			if (send_dpm_open(node, port)) {
++				fail(-6, "DPM Open Port: link send failed");
++			} else {
++				qstep = Q_DPM;
++			}
++		} else if (now - t_step > 10000) {
++			fail(-6, "no DPM server (0x2f) known");
++		}
++		break;
++	case Q_DPM:
++		if (dpm_res > 0) {
++			qstep = Q_DONE;
++			set_state(3, "INIT_COMPLETE sent and DPM port open");
++			SAY("state 3: data plane ready (the router may release WDS Start Network)\n");
++			links(1);
++		} else if (dpm_res < 0) {
++			fail(-6, "DPM Open Port refused");
++		} else if (now - t_step > 10000) {
++			dpm_txn = 0;
++			fail(-6, "DPM Open Port unanswered (10 s)");
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* the modem's IPA went away (modem restart / BYE): stop everything here, for the rest of the boot */
++static void
++modem_gone(void)
++{
++	bool was_ready = ipa_state == 3;
++	m_up = false;
++	reg_up = cmplt_seen = drv_ok = ind_sent = false;
++	dp_stage = 0;
++	fail(-9, "the modem's ipa server 0x31/2 went away (modem restart?)");
++	if (was_ready) {
++		links(0);
++	}
++	txq_flush();
++}
++
++static void
++ipa_thread(__unused void *param, __unused wait_result_t wr)
++{
++	uint64_t srv_check = 0;
++	SAY("thread up\n");
++	for (;;) {
++		uint64_t now = sbb_ms();
++		int req = 0, arm = 0;
++		lck_mtx_lock(&ipa_lock);
++		req = up_req;
++		up_req = 0;
++		arm = arm_req;
++		arm_req = 0;
++		lck_mtx_unlock(&ipa_lock);
++		if (req == 1) {
++			int r = -1;
++			if (ipa_state == 0) {
++				r = hw_up();
++				set_state(r == 0 ? 1 : -1, r == 0 ? "hw up (meminit + tables)" : "hw/meminit failed");
++			}
++			lck_mtx_lock(&ipa_lock);
++			up_res = r;
++			up_done = 1;
++			wakeup(&up_done);
++			lck_mtx_unlock(&ipa_lock);
++		} else if (req == 2 && ipa_state == 1) {
++			set_state(2, "QMI handshake");
++			announce();
++			t_step = now;
++			qstep = Q_SERVER;
++		}
++		/* QMI packets to our ports */
++		for (;;) {
++			struct qpkt p;
++			bool got = false;
++			lck_mtx_lock(&ipa_lock);
++			if (rxq_count) {
++				p = rxq[rxq_head];
++				rxq_head = (rxq_head + 1) % RXQ;
++				rxq_count--;
++				got = true;
++			}
++			lck_mtx_unlock(&ipa_lock);
++			if (!got) {
++				break;
++			}
++			if (ipa_state >= 2) {
++				qmi_in(&p);
++			}
++			kfree_data(p.d, p.n);
++		}
++		if (ipa_state == 2) {
++			qmi_step(now);
++		}
++		if ((ipa_state == 2 || ipa_state == 3) && m_up && now >= srv_check) {
++			uint32_t n, pt, v;
++			srv_check = now + 100;
++			if (!sbb_server(IPA_SVC, 2, &n, &pt, &v) || n != m_node || pt != m_port) {
++				modem_gone();
++			}
++		}
++		if (ipa_state == 3) {
++			if (dp_stage == 0 && (arm || (use_ee1 && ee1_ch7_state() == CH_ST_STARTED))) {
++				if (dp_arm(arm ? "a packet / kern.sweet_ipa_arm / call" : "the modem's EE1 ch 7 started")) {
++					dp_stage = 0;
++					fail(-7, "data plane setup failed");
++					links(0);
++				}
++			}
++			if (dp_stage == 1) {
++				const char *go = NULL;
++				if (use_ee1) {
++					if (ee1_ch7_state() != CH_ST_STARTED) {
++						ee1_seen = 0;
++					} else if (!ee1_seen) {
++						ee1_seen = now;
++					} else if (now - ee1_seen >= 5000) {
++						go = "modem EE1 ch 7 started for 5 s";
++					}
++				}
++				if (!go && join_s && now - dp_t0 >= 1000ull * join_s) {
++					go = "timeout";
++				}
++				if (go && dp_join(go)) {
++					dp_stage = 0;
++					fail(-7, "data plane join failed");
++					links(0);
++				}
++				if (dp_stage < 2) {
++					txq_flush();
++				}
++			}
++			if (dp_stage == 2) {
++				dp_poll(now);
++			}
++		} else {
++			txq_flush();
++		}
++		uint32_t us = (ipa_state == 3 && dp_stage == 2) ? (poll_us < 500 ? 500 : poll_us) : 20000;
++		struct timespec ts = { .tv_sec = us / 1000000, .tv_nsec = (long)(us % 1000000) * 1000 };
++		lck_mtx_lock(&ipa_lock);
++		if (!wake_flag) {
++			(void)msleep(&wake_flag, &ipa_lock, PZERO, "sweetipa", &ts);
++		}
++		wake_flag = false;
++		lck_mtx_unlock(&ipa_lock);
++	}
++}
++
++/* ---- API ---- */
++
++void
++sweet_ipa_qrtr_in(uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t dst_port, uint32_t confirm,
++    const uint8_t *d, uint32_t n)
++{
++	if (!started || n > RXQ_MAX) {
++		sx.qmi_dropped++;
++		return;
++	}
++	uint8_t *c = kalloc_data(n ? n : 1, Z_NOWAIT);
++	if (c == NULL) {
++		sx.qmi_dropped++;
++		return;
++	}
++	if (n) {
++		memcpy(c, d, n);
++	}
++	lck_mtx_lock(&ipa_lock);
++	if (rxq_count < RXQ) {
++		struct qpkt *p = &rxq[(rxq_head + rxq_count) % RXQ];
++		p->type = type;
++		p->node = src_node;
++		p->port = src_port;
++		p->dport = dst_port;
++		p->confirm = confirm;
++		p->n = n ? n : 1;
++		p->d = c;
++		rxq_count++;
++		wake_flag = true;
++		wakeup(&wake_flag);
++		c = NULL;
++	}
++	lck_mtx_unlock(&ipa_lock);
++	if (c) {
++		sx.qmi_dropped++;
++		kfree_data(c, n ? n : 1);
++	}
++}
++
++int
++sweet_ipa_ready(void)
++{
++	return (sweet_bb & SBB_DATA) && ipa_state == 3;
++}
++
++void
++sweet_ipa_call(uint32_t mux, int up, uint32_t gw)
++{
++	if (!started) {
++		return;
++	}
++	if (up && gw) {
++		gw_mux[mux & 0xff] = gw;
++	}
++	if (up) {
++		lck_mtx_lock(&ipa_lock);
++		arm_req = 1;
++		lck_mtx_unlock(&ipa_lock);
++		ipa_wake();
++	}
++}
++
++void
++sweet_ipa_init(void)
++{
++	thread_t th;
++	if (!(sweet_bb & SBB_DATA) || started) {
++		return;
++	}
++	started = true;
++	sweet_pdp_set_output(ipa_output);
++	if (kernel_thread_start(ipa_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		SAY("sweetbb & 0x10: kernel IPA data path; waiting for wland's kern.sweet_ipa_up=1 (nothing mapped yet)\n");
++	} else {
++		started = false;
++		SAY("no thread: the IPA data path stays off\n");
++	}
++}
++
++/* ---- sysctls ---- */
++
++static int
++sysctl_ipa_up SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = ipa_state, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (!started) {
++		return ENXIO;
++	}
++	if (v == 1) {
++		if (ipa_state != 0) {
++			return EALREADY;
++		}
++		lck_mtx_lock(&ipa_lock);
++		up_done = 0;
++		up_req = 1;
++		wake_flag = true;
++		wakeup(&wake_flag);
++		struct timespec ts = { 10, 0 };
++		while (!up_done) {
++			if (msleep(&up_done, &ipa_lock, PZERO, "sweetipaup", &ts) == EWOULDBLOCK) {
++				break;
++			}
++		}
++		int r = up_done ? up_res : -1;
++		lck_mtx_unlock(&ipa_lock);
++		return r == 0 ? 0 : EIO;
++	}
++	if (v == 2) {
++		if (ipa_state != 1) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&ipa_lock);
++		up_req = 2;
++		wake_flag = true;
++		wakeup(&wake_flag);
++		lck_mtx_unlock(&ipa_lock);
++		return 0;
++	}
++	return EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_up, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_ipa_up, "I",
++    "redfin 1076: wland's IPA handoff: write 1 after IP0/PAS/SMMU (kernel meminit), 2 after SMP2P ipa=3 (kernel QMI); reads the state");
++
++static int
++sysctl_ipa_state SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = ipa_state;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_state, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_ipa_state, "I",
++    "redfin 1076: 0 off, 1 hw up, 2 QMI handshake, 3 ready (INIT_COMPLETE + DPM open); negative = failed step");
++
++static int
++sysctl_ipa_drv SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = ipa_drv;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_drv, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_ipa_drv, "I",
++    "redfin 1076: INIT_DRIVER 1 accepted, -1 refused/unanswered, 0 not yet");
++
++static int
++sysctl_ipa_arm SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = dp_stage, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (!started || v != 1) {
++		return started ? EINVAL : ENXIO;
++	}
++	lck_mtx_lock(&ipa_lock);
++	arm_req = 1;
++	wake_flag = true;
++	wakeup(&wake_flag);
++	lck_mtx_unlock(&ipa_lock);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_arm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_ipa_arm, "I",
++    "redfin 1076: data plane stage (0 idle, 1 armed, 2 running); write 1 = arm (as the first packet does)");
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_join_s, CTLFLAG_RW | CTLFLAG_LOCKED, &join_s, 0,
++    "redfin 1076: RX join this many s after arming (wland p2join=40; 0 = only the EE1 trigger)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ipa_ee1, CTLFLAG_RW | CTLFLAG_LOCKED, &use_ee1, 0,
++    "redfin 1076: 1 = also join when the modem's EE1 ch 7 has been started 5 s (reads one EE1 register; default 0)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pdp_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &keep_s, 0,
++    "redfin 1076: keep-alive gateway echo period in s (wland p2keep=3; 0 off, max 30)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pdp_keepidle, CTLFLAG_RW | CTLFLAG_LOCKED, &keepidle_s, 0,
++    "redfin 1076: keep-alive only within this many s of the last iOS packet (wland p2keepidle=120)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pdp_poll_us, CTLFLAG_RW | CTLFLAG_LOCKED, &poll_us, 0,
++    "redfin 1076: ring poll period while the data plane runs (us, >= 500; wland's loop: 1000)");
++
++static int
++sysctl_pdp_irq SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed || v == 0) {
++		return e;
++	}
++	SAY("kern.sweet_pdp_irq=%d refused: the IRQ mode needs GSI IEOB interrupt enables wland never wrote (polled only)\n", v);
++	return ENOTSUP;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_irq, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_irq, "I",
++    "redfin 1076: 0 = polled kernel thread (the only mode in this patch; 1 is refused)");
++
++static int
++sysctl_pdp_gw SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[20];
++	const uint8_t *g = (const uint8_t *)&gw_sysctl;
++	int changed = 0;
++	snprintf(s, sizeof(s), "%u.%u.%u.%u", g[0], g[1], g[2], g[3]);
++	int e = sysctl_io_string(req, s, sizeof(s), 0, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	uint32_t a[4] = { 0, 0, 0, 0 };
++	int i = 0;
++	for (const char *p = s; *p && i < 4; p++) {
++		if (*p == '.') {
++			i++;
++		} else if (*p >= '0' && *p <= '9') {
++			a[i] = a[i] * 10 + (uint32_t)(*p - '0');
++		} else {
++			return EINVAL;
++		}
++	}
++	if (i != 3 || a[0] > 255 || a[1] > 255 || a[2] > 255 || a[3] > 255) {
++		return EINVAL;
++	}
++	uint8_t b[4] = { (uint8_t)a[0], (uint8_t)a[1], (uint8_t)a[2], (uint8_t)a[3] };
++	memcpy(&gw_sysctl, b, 4);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pdp_gw, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_pdp_gw, "A",
++    "redfin 1076: the call's IPv4 gateway for the keep-alive (a.b.c.d; sweet_ipa_call's per-mux value wins)");
++
++static int
++sysctl_ipa_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 2048;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	const uint8_t *k = (const uint8_t *)&keep_ip;
++	snprintf(s, cap, "state %d qstep %d drv %d early %u/5%s | modem 0x31/2 %s %u:%x reg %d cmplt %d ind %d dpm %d | dp stage %d "
++	    "| rx evts %u pkts %llu bytes %llu err %u nombuf %u status %u qmap cmds %u bad %u | tx posted %u done %u evts %u pkts %llu "
++	    "bytes %llu drops prejoin %u full %u af %u size %u err %u | unk evts %u | keep %us idle %us ip %u.%u.%u.%u mux %u sent %u "
++	    "replies %u | qmi in %u dropped %u | mmio refused %u | arena %llu/%u B",
++	    ipa_state, qstep, ipa_drv, sx.early_cmds, early_failed ? " FAILED" : "", m_up ? "up" : "-", m_node, m_port, reg_up,
++	    cmplt_seen, ind_sent, dpm_res, dp_stage, sx.rx_evts, sx.rx_pkts, sx.rx_bytes, sx.rx_err, sx.rx_drop_nombuf,
++	    sx.status_msgs, sx.qmap_cmds, sx.qmap_bad, tx_wp, tx_done, sx.tx_evts, sx.tx_pkts, sx.tx_bytes, sx.tx_drop_prejoin,
++	    sx.tx_drop_full, sx.tx_drop_af, sx.tx_drop_size, sx.tx_err, sx.unk_evts, keep_s, keepidle_s, k[0], k[1], k[2], k[3],
++	    keep_mux, sx.keep_sent, sx.keep_replies, sx.qmi_in, sx.qmi_dropped, refused_mmio,
++	    arena_va ? arena_next - arena_pa : 0, ARENA_SIZE);
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_ipa_stats, "A",
++    "redfin 1076: kernel IPA data path state and counters");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ipa.h b/bsd/dev/sweet_ipa.h
+new file mode 100644
+index 0000000..427bfb2
+--- /dev/null
++++ b/bsd/dev/sweet_ipa.h
+@@ -0,0 +1,31 @@
++/*
++ * redfin 1076 (P4 M3a): the kernel IPA v4.7 / GSI data path (port of wland ipa.c meminit, ipagsi.c p2early/p2late,
++ * ipaqmi.c, cell.c DPM Open Port). Boot-arg sweetbb & 0x10 (SBB_DATA); see sweet_ipa.c.
++ */
++#ifndef _SWEET_IPA_H_
++#define _SWEET_IPA_H_
++#include <stdint.h>
++#include <stdbool.h>
++#include <sys/cdefs.h>
++
++#define SWEET_IPA_SRV_PORT      0x4600u /* our IPA QMI service 0x31/1 on the kernel's modem QRTR */
++#define SWEET_IPA_CLI_PORT      0x4601u /* our client port: INIT_DRIVER / FILTER_INSTALLED_NOTIF to 0x31/2, DPM Open Port */
++
++__BEGIN_DECLS
++void sweet_ipa_init(void);              /* sweet_bb_init, only with sweetbb & 0x10 */
++static inline bool
++sweet_ipa_port(uint32_t port)
++{
++	return port == SWEET_IPA_SRV_PORT || port == SWEET_IPA_CLI_PORT;
++}
++/* a QRTR packet to one of our ports (sweet_bb.c qrtr_in, ml_lock held: it only queues a copy) */
++void sweet_ipa_qrtr_in(uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t dst_port, uint32_t confirm,
++    const uint8_t *d, uint32_t n);
++/* 1 when the data plane is ready (kern.sweet_ipa_state 3: INIT_COMPLETE sent + DPM port open); the QMI router may hold
++ * WDS StartNetworkInterface until then. Lock-free, never blocks. */
++int sweet_ipa_ready(void);
++/* optional, for the router / PDP manager: a call came up (or went) on mux; gw = the call's IPv4 gateway (network order,
++ * 0 = unknown) for the keep-alive. Arms the RX join like the first packet does. */
++void sweet_ipa_call(uint32_t mux, int up, uint32_t gw);
++__END_DECLS
++#endif

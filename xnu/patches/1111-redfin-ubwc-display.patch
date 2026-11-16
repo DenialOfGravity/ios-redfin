@@ -1,0 +1,648 @@
+From 9a0df5f677a0f31b35e080cab04c261d5bcca813 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 13:48:04 +0100
+Subject: [PATCH] 1111 redfin: UBWC display surfaces (boot-arg sweetubwc,
+ kern.sweet_ubwc_disp; default off)
+
+The final full-screen display pass is the biggest GPU cost per frame (3.5-3.8 ms linear
+against ~1.2 ms compressed for a 1125x2436 pass). With this the pass can draw into a UBWC
+surface that VIG0/VIG1 scan out directly through their UBWC decoder (VIG pipes have one;
+the pipes, the CTL0 flush and the QSEED3LITE 1125x2436 -> 1080x2340 scale stay as they are).
+
+- boot-arg sweetubwc: 0 (default) = as 1110, nothing changes; 1 = scanout slots made
+  0xad8000 long (UBWC 1125x2436 RGBA8: meta 128x624 + colour 4608x2448), kern.sweet_ubwc_disp
+  starts 0; 2 = the same, kern.sweet_ubwc_disp starts 1.
+- kern.sweet_ubwc_disp 1: a scanout-slot surface created now is UBWC-ready (layout as fdl6
+  and msm_media_info RGBA8888_UBWC give it, meta first, colour at 0x14000; allocSize grows to
+  it). It stays linear until a GPU client asks its imported BO's NativeAdreno metadata:
+  GetMetadata answers 'UBWC' + version 3, meta off/pitch/size, colour off/pitch, hbb 14 (as
+  hakios-metal ws-hm-ubwc reads it) and the surface is compressed from then on (ubwcLive).
+- Scanout of a ubwcLive surface: SRC0 colour, SRC2 meta, YSTRIDE0/1, FORMAT fetch mode 2,
+  UNPACK R,G,B,A, OP_MODE BWC_EN, FETCH_CONFIG 0x87|1<<18, UBWC_STATIC by MDSS decoder version
+  (kern.sweet_ubwc_sspp overrides), MDSS UBWC_STATIC written msm_mdss-style only if 0
+  (kern.sweet_ubwc_mdss). Saved before the first switch, put back at restore / a linear frame.
+- Linear-row readers of a compressed surface are kept off it: present() (CPU/GPU/crop
+  copies) skips such frames, the corner mattes skip it, p mdp ca refuses it.
+- 5 s line "SWEET SCANOUT: 5s ubwc: frames ..." with the pipes' UBWC error status.
+---
+ bsd/dev/sweet_gpu.c                   |  18 ++
+ iokit/Kernel/arm/SweetAccelerator.cpp |  41 ++++-
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 233 +++++++++++++++++++++++++-
+ iokit/Kernel/arm/SweetSurface.cpp     | 119 ++++++++++++-
+ iokit/Kernel/arm/SweetSurface.h       |  28 ++++
+ 5 files changed, 427 insertions(+), 12 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index bb08fed..91f2c66 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2567,6 +2567,24 @@ extern uint32_t sweet_touch_trace;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_touch_trace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_touch_trace, 0,
+     "SWEET TOUCH: touch -> latch stage statistics (1107, default 1)");
+ 
++/*
++ * 1111: UBWC display surfaces (iokit/Kernel/arm/SweetSurface.cpp, SweetFramebuffer.cpp, SweetAccelerator.cpp). Inert
++ * unless the kernel booted with boot-arg sweetubwc=1|2 (UBWC-sized scanout slots). kern.sweet_ubwc_disp 1: scanout-slot
++ * surfaces created from now on are UBWC-ready, and a GPU client asking such a surface's BO metadata gets its UBWC
++ * layout and makes it compressed (default 0; sweetubwc=2 boots with 1). kern.sweet_ubwc_sspp / _mdss: the pipes'
++ * UBWC_STATIC value (0 auto) and the MDSS UBWC_STATIC (0 auto: written only if it reads 0; 1 never; else that value),
++ * read at each switch of the pipes to a compressed surface.
++ */
++int sweet_ubwc_disp = 0;
++int sweet_ubwc_sspp = 0;
++int sweet_ubwc_mdss = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_disp, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_disp, 0,
++    "SWEET SURF: new display surfaces UBWC-ready, compressed once hakios-metal asks (1111, needs boot-arg sweetubwc; default 0)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_sspp, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_sspp, 0,
++    "SWEET MDP: VIG UBWC_STATIC value for compressed scanout (1111, 0 = by decoder version)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_mdss, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_mdss, 0,
++    "SWEET MDP: MDSS UBWC_STATIC (1111, 0 = auto if zero, 1 = never write, else the value)");
++
+ int sweet_scangate_flag = 1;
+ static volatile int scangate_flag_pid = -1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scangate_flag, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scangate_flag, 0,
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index 4881e33..60dd032 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -1201,7 +1201,46 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+ 		return kIOReturnSuccess;        /* only for dma-buf exports, which Darwin has not */
+ 	case NativeAdrenoMethodGetMetadata: {
+ 		V2_OUT(NativeAdrenoAbiMetadata);
+-		return kIOReturnSuccess;        /* bytes 0 */
++		/*
++		 * 1111: an imported BO that is a UBWC-ready display surface (SweetSurface 1111: a scanout slot made while
++		 * kern.sweet_ubwc_disp was 1) answers its UBWC layout while kern.sweet_ubwc_disp is 1: 'UBWC', then version,
++		 * meta offset, meta pitch, meta size, colour offset, colour pitch, highest bank bit (offsets from the surface's
++		 * base, as hakios-metal's HakiosSurfaceUbwc reads them). Asking commits the surface: from then on it is
++		 * scanned out compressed (ubwcLive). Every other BO, and every BO with the sysctl 0: bytes 0 (linear), as before.
++		 */
++		const NativeAdrenoAbiMetadata *rq = in != NULL && inSize == sizeof(NativeAdrenoAbiMetadata) ?
++		    (const NativeAdrenoAbiMetadata *)in : NULL;
++		if (rq == NULL || !sweet_ubwc_disp || sweet_surface_ubwc_boot() == 0) {
++			return kIOReturnSuccess;        /* bytes 0 */
++		}
++		uint64_t pa = 0;
++		IOByteCount len = 0;
++		IOLockLock(fLock);
++		SweetV2BO *bo = v2Find(rq->handle);
++		if (bo != NULL && bo->imported) {
++			pa = bo->md->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++			len = bo->md->getLength();
++		}
++		IOLockUnlock(fLock);
++		SweetSurface *s = pa != 0 ? sweet_surface_scan_find_pa(pa) : NULL;
++		if (s == NULL || !s->ubwcReady || len < (uint64_t)s->ubwcData + (uint64_t)s->ubwcDataPitch * ((s->height + 15) & ~15u)) {
++			OSSafeReleaseNULL(s);
++			return kIOReturnSuccess;
++		}
++		uint32_t w[8] = { 0x43574255u /* 'UBWC' */, SWEET_UBWC_VERSION, s->ubwcMeta, s->ubwcMetaPitch, s->ubwcMetaSize,
++			          s->ubwcData, s->ubwcDataPitch, SWEET_UBWC_HBB };
++		if (rq->bytes >= sizeof(w)) {
++			memcpy(rp->text, w, sizeof(w));
++			rp->bytes = sizeof(w);
++			rp->handle = rq->handle;
++			if (!s->ubwcLive) {
++				s->ubwcLive = 1;
++				IOLog("SWEET MTL: v2 %s: ubwc: surface %u (slot %u, PA %#llx) compressed from now on (meta %#x/%u, colour %#x/%u)\n",
++				    fName, s->id, s->scanSlot - 1, s->scanPA, s->ubwcMeta, s->ubwcMetaPitch, s->ubwcData, s->ubwcDataPitch);
++			}
++		}
++		s->release();
++		return kIOReturnSuccess;
+ 	}
+ 	case NativeAdrenoMethodCreateQueue: {
+ 		V2_OUT(NativeAdrenoAbiQueueReply);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d2a0b6f..f77ba0d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2461,6 +2461,16 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
+ #define SSPP_SRC0               0x014u
+ #define SSPP_YSTRIDE0           0x024u
+ #define SSPP_FORMAT             0x030u  /* bit 8: alpha (SRCC3_EN) */
++/* 1111: UBWC fetch (upstream dpu_hw_sspp.c; MDSS offsets from 0x0ae00000 as every other here, msm_mdss.c) */
++#define SSPP_SRC2               0x01cu  /* UBWC: the meta plane */
++#define SSPP_YSTRIDE1           0x028u  /* UBWC: bits 15:0 the meta pitch */
++#define SSPP_UNPACK             0x034u
++#define SSPP_OP_MODE            0x038u  /* bit 0: BWC_EN */
++#define SSPP_UBWC_STATIC        0x044u
++#define SSPP_FETCH_CONFIG       0x048u
++#define SSPP_UBWC_ERROR         0x138u
++#define MDSS_UBWC_DEC_VERSION   0x058u
++#define MDSS_UBWC_STATIC        0x144u
+ #define SSPP_PE(c, r)           (0x100u + 0x10u * (c) + 4u * (r))       /* pixel extension C0/C1C2/C3: LR, TB, REQ */
+ #define QSEED                   0xa00u  /* lito DT qcom,sde-vig-qseed-off, "qseedv3lite" */
+ #define QS_VERSION              (QSEED + 0x00)
+@@ -2502,6 +2512,9 @@ static struct {
+ 	bool                active;         /* the pipes are ours; old[] holds what goes back */
+ 	bool                scan;           /* 0976: ... for the direct scanout (p scanout 0 gives them back) */
+ 	uint32_t            old[2][SWEET_MDP_NREGS];
++	bool                ufmt;           /* 1111: the pipes are set for a UBWC surface (kern.sweet_ubwc_disp) */
++	bool                usaved;         /* 1111: uold holds the format registers as they were before the first */
++	uint32_t            uold[2][7];     /* 1111: SRC2, YSTRIDE1, FORMAT, UNPACK, OP_MODE, UBWC_STATIC, FETCH_CONFIG */
+ 	vm_offset_t         smmu_va[6];
+ 	uint64_t            smmu_pa[6];
+ } sweet_mdp;
+@@ -2761,6 +2774,179 @@ sweet_mdp_flush(const char *what)
+ 	    sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
+ }
+ 
++/*
++ * ---- 1111: UBWC display surfaces (kern.sweet_ubwc_disp, boot-arg sweetubwc; SweetSurface.cpp, SweetAccelerator.cpp) ----
++ * A scanout surface whose GPU client draws it compressed (ubwcLive) is fetched by VIG0/VIG1 through their UBWC decoder
++ * (VIG pipes have one, DMA pipes do not; the pipes and the QSEED3LITE 1125x2436 -> 1080x2340 scale stay as they are:
++ * the decoder sits before the scaler). Per pipe, as upstream dpu_hw_sspp_setup_format/_sourceaddress/_rects do for
++ * DRM_FORMAT_ABGR8888 + QCOM_COMPRESSED: SRC0 the colour plane, SRC2 the meta plane, YSTRIDE0 the colour pitch,
++ * YSTRIDE1 the meta pitch, FORMAT fetch mode 2 (bits 31:30), UNPACK R,G,B,A (0x03010002: the GPU writes compressed
++ * targets with swap WZYX, so byte 0 is red whatever the IOSurface's 'BGRA' says; the only RGB order the MDP's UBWC
++ * decoder has), OP_MODE BWC_EN, FETCH_CONFIG 0x87 | hbb-13 << 18, UBWC_STATIC by the decoder version (MDSS
++ * +0x58). The first switch saves these registers (uold); restore and a linear frame put them back. Nothing here runs
++ * unless a surface went ubwcLive, which needs boot-arg sweetubwc and kern.sweet_ubwc_disp 1.
++ *
++ * kern.sweet_ubwc_sspp (0 = auto as above; else the raw SSPP UBWC_STATIC value) and kern.sweet_ubwc_mdss (0 = auto:
++ * MDSS UBWC_STATIC written msm_mdss-style only if it reads 0; 1 = never written; else the raw value written): read
++ * at each switch to UBWC, so a variant is tried by a backboardd restart, no rebuild.
++ */
++extern "C" int sweet_ubwc_sspp, sweet_ubwc_mdss;
++static struct {
++	uint32_t frames, linear, switches, skipped, corners, errs[2];
++	uint64_t win;
++	bool     logged;
++} sweet_ubwc_st;
++
++static uint32_t
++sweet_ubwc_sspp_static(uint32_t fmt, uint32_t *ver)
++{
++	const uint32_t swz = 6, hbb = SWEET_UBWC_HBB - 13;      /* as the GPU: level 2+3 swizzle, hbb 14 */
++	uint32_t v = sweet_mdp_rd(MDSS_UBWC_DEC_VERSION) >> 28;
++	*ver = v;
++	if (sweet_ubwc_sspp != 0) {
++		return (uint32_t)sweet_ubwc_sspp;
++	}
++	uint32_t fast = (fmt & (1u << 8)) ? 1u << 31 : 0;
++	switch (v) {
++	case 1:
++		return fast | (swz & 1) | 1u << 8 | hbb << 4;
++	case 2:
++		return fast | swz | hbb << 4;
++	case 4:
++		return 1u << 30;
++	default:        /* 3 (SM7250), or an unreadable version: as 3 */
++		return 1u << 30 | swz | hbb << 4;
++	}
++}
++
++static void
++sweet_ubwc_mdss_setup(uint32_t ver)
++{
++	uint32_t cur = sweet_mdp_rd(MDSS_UBWC_STATIC), want = 0;
++	if (sweet_ubwc_mdss == 1) {
++		want = cur;
++	} else if (sweet_ubwc_mdss != 0) {
++		want = (uint32_t)sweet_ubwc_mdss;
++	} else if (cur == 0) {
++		/* msm_mdss_setup_ubwc_dec_{20,30,40}: swizzle 6, ubwc_static 1, hbb 14 (1), UBWC 3.0 encoder (bit 10) */
++		want = ver == 4 ? (6u & 1) | 1u << 4 | 1u << 10 : ver == 2 ? (6u & 1) | 1u << 4 : 6u | 1u << 3 | 1u << 4 | 1u << 10;
++	} else {
++		want = cur;
++	}
++	if (want != cur) {
++		sweet_mdp_wr(MDSS_UBWC_STATIC, want);
++	}
++	if (!sweet_ubwc_st.logged || want != cur) {
++		sweet_ubwc_st.logged = true;
++		IOLog("SWEET MDP: ubwc: decoder version %u (MDSS +0x58 %#x), MDSS UBWC_STATIC %#x -> %#x\n", ver,
++		    sweet_mdp_rd(MDSS_UBWC_DEC_VERSION), cur, want);
++	}
++}
++
++/* The pipes' format registers for surface s compressed (on) or back to what they were (off). */
++static void
++sweet_mdp_ubwc_fmt(bool on, SweetSurface *s)
++{
++	static const uint16_t r[7] = { SSPP_SRC2, SSPP_YSTRIDE1, SSPP_FORMAT, SSPP_UNPACK, SSPP_OP_MODE, SSPP_UBWC_STATIC,
++		                       SSPP_FETCH_CONFIG };
++	if (on == sweet_mdp.ufmt) {
++		return;
++	}
++	if (on && !sweet_mdp.usaved) {
++		for (uint32_t p = 0; p < 2; p++) {
++			for (uint32_t i = 0; i < 7; i++) {
++				sweet_mdp.uold[p][i] = sweet_mdp_rd(MDP_VIG(p) + r[i]);
++			}
++		}
++		sweet_mdp.usaved = true;
++	}
++	if (!sweet_mdp.usaved) {
++		return;
++	}
++	uint32_t ver = 0, st = on ? sweet_ubwc_sspp_static(sweet_mdp.uold[0][2], &ver) : 0;
++	if (on) {
++		sweet_ubwc_mdss_setup(ver);
++	}
++	for (uint32_t p = 0; p < 2; p++) {
++		uint32_t b = MDP_VIG(p);
++		if (!on) {
++			for (uint32_t i = 0; i < 7; i++) {
++				sweet_mdp_wr(b + r[i], sweet_mdp.uold[p][i]);
++			}
++			continue;
++		}
++		sweet_mdp_wr(b + SSPP_YSTRIDE1, (sweet_mdp.uold[p][1] & 0xffff0000u) | s->ubwcMetaPitch);
++		sweet_mdp_wr(b + SSPP_FORMAT, (sweet_mdp.uold[p][2] & ~(3u << 30)) | 2u << 30);
++		sweet_mdp_wr(b + SSPP_UNPACK, 0x03010002u);
++		sweet_mdp_wr(b + SSPP_OP_MODE, sweet_mdp.uold[p][4] | 1u);
++		sweet_mdp_wr(b + SSPP_UBWC_STATIC, st);
++		sweet_mdp_wr(b + SSPP_FETCH_CONFIG, 0x87u | (uint32_t)(SWEET_UBWC_HBB - 13) << 18);
++		(void)sweet_mdp_rd(b + SSPP_UBWC_ERROR);
++		sweet_mdp_wr(b + SSPP_UBWC_ERROR, 1u << 31);    /* clear */
++	}
++	sweet_mdp.ufmt = on;
++	sweet_ubwc_st.switches++;
++	static uint32_t logs;
++	if (logs < 16) {
++		logs++;
++		IOLog("SWEET MDP: ubwc: pipes %s (surface %u, format %#x -> %#x, unpack %#x, op %#x, static %#x, fetch %#x)\n",
++		    on ? "compressed" : "linear again", s != NULL ? s->id : 0, sweet_mdp.uold[0][2], sweet_mdp_rd(MDP_VIG(0) + SSPP_FORMAT),
++		    sweet_mdp_rd(MDP_VIG(0) + SSPP_UNPACK), sweet_mdp_rd(MDP_VIG(0) + SSPP_OP_MODE),
++		    sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_STATIC), sweet_mdp_rd(MDP_VIG(0) + SSPP_FETCH_CONFIG));
++	}
++}
++
++/*
++ * Surface s's planes into both pipes (latched at the next CTL0 flush): before 1111 only SRC0 = scanPA was written per
++ * flip, and a linear surface still gets exactly that (the format registers go back first if the last one was UBWC).
++ */
++static void
++sweet_mdp_scan_addr(SweetSurface *s)
++{
++	bool u = s->ubwcLive != 0;
++	if (u || sweet_mdp.ufmt) {
++		sweet_mdp_ubwc_fmt(u, s);
++	}
++	for (uint32_t p = 0; p < 2; p++) {
++		uint32_t b = MDP_VIG(p);
++		if (u) {
++			sweet_mdp_wr(b + SSPP_YSTRIDE0, (sweet_mdp.old[p][MR_YSTRIDE0] & 0xffff0000u) | s->ubwcDataPitch);
++			sweet_mdp_wr(b + SSPP_SRC2, (uint32_t)(s->scanPA + s->ubwcMeta));
++			sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)(s->scanPA + s->ubwcData));
++		} else {
++			sweet_mdp_wr(b + SSPP_SRC0, (uint32_t)s->scanPA);
++		}
++	}
++	if (u) {
++		sweet_ubwc_st.frames++;
++	} else if (sweet_ubwc_st.switches != 0) {
++		sweet_ubwc_st.linear++;
++	}
++}
++
++/* restore: the format registers as they were (with sweet_mdp.lock; before the flush) */
++static void
++sweet_mdp_ubwc_restore(void)
++{
++	if (sweet_mdp.ufmt) {
++		sweet_mdp_ubwc_fmt(false, NULL);
++	}
++	sweet_mdp.usaved = false;
++}
++
++/* 1111: one line per 5 s while UBWC frames are scanned (the scanout statistics' window; fLock) */
++static void
++sweet_ubwc_stats_locked(void)
++{
++	if (sweet_ubwc_st.frames == 0 && sweet_ubwc_st.skipped == 0) {
++		return;
++	}
++	uint32_t e0 = sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_ERROR), e1 = sweet_mdp_rd(MDP_VIG(1) + SSPP_UBWC_ERROR);
++	IOLog("SWEET SCANOUT: 5s ubwc: frames %u linear %u switches %u not-presented %u corners-skipped %u | error vig0 %#x vig1 %#x\n",
++	    sweet_ubwc_st.frames, sweet_ubwc_st.linear, sweet_ubwc_st.switches, sweet_ubwc_st.skipped, sweet_ubwc_st.corners, e0, e1);
++	sweet_ubwc_st.frames = sweet_ubwc_st.linear = sweet_ubwc_st.switches = sweet_ubwc_st.skipped = sweet_ubwc_st.corners = 0;
++}
++
+ /* With sweet_mdp.lock: stop the presents, wait out a flip in flight, save the pipes. */
+ static bool
+ sweet_mdp_take(AppleCLCD *fb, const char *what)
+@@ -2812,6 +2998,7 @@ sweet_mdp_restore_locked(AppleCLCD *fb, const char *why)
+ 			sweet_mdp_wr(MDP_VIG(p) + sweet_mdp_regs[i], sweet_mdp.old[p][i]);
+ 		}
+ 	}
++	sweet_mdp_ubwc_restore();       /* 1111: nothing unless a UBWC surface was scanned */
+ 	sweet_mdp_flush("restore");
+ 	sweet_mdp_pipes("restored");
+ 	sweet_mdp.active = false;
+@@ -2958,6 +3145,11 @@ sweet_mdp_ca(uint32_t slot)
+ 		IOLog("SWEET MDP: ca: slot %u is empty: the test pattern from its memory (PA %#llx) on screen\n", slot, pa);
+ 		return true;
+ 	}
++	if (s->ubwcLive) {
++		IOLog("SWEET MDP: ca: slot %u = surface %u is UBWC-compressed: not shown as linear rows (1111)\n", slot, s->id);
++		s->release();
++		return false;
++	}
+ 	uint32_t id = s->id, bpr = s->bytesPerRow, seed = s->state != NULL ?
+ 	    *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+@@ -3240,6 +3432,9 @@ sweet_scan_enter(AppleCLCD *fb, SweetSurface *s)
+ 			sweet_mdp_restore_locked(fb, "scanout geometry refused");
+ 			ok = false;
+ 		} else {
++			if (s->ubwcLive) {
++				sweet_mdp_scan_addr(s);         /* 1111: the compressed planes and format */
++			}
+ 			sweet_mdp_flush("scanout on");
+ 			IOLockLock(fb->fLock);
+ 			sweet_scan.geom = true;
+@@ -4083,7 +4278,11 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		}
+ 	}
+ 	if (sweet_scan.corners) {
+-		sweet_scan_corners(fb, s);      /* 0986 */
++		if (s->ubwcLive) {
++			sweet_ubwc_st.corners++;        /* 1111: CPU writes into compressed planes would show as garbage */
++		} else {
++			sweet_scan_corners(fb, s);      /* 0986 */
++		}
+ 	}
+ 	sweet_scan.next = NULL;
+ 	uint64_t sSeq = sweet_scan.nextSeq, sAbs = sweet_scan.nextAbs;    /* 0979: a newer frame may come while entering */
+@@ -4127,8 +4326,12 @@ sweet_scan_step_locked(AppleCLCD *fb, uint64_t now)
+ 		IOLockWakeup(fb->fLock, &sweet_scan.shownSeq, false);
+ 		return sweet_scan.next != NULL;
+ 	}
+-	sweet_mdp_wr(MDP_VIG(0) + SSPP_SRC0, (uint32_t)s->scanPA);
+-	sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
++	if (s->ubwcLive || sweet_mdp.ufmt) {
++		sweet_mdp_scan_addr(s);         /* 1111: a UBWC surface, or the first linear one after it */
++	} else {
++		sweet_mdp_wr(MDP_VIG(0) + SSPP_SRC0, (uint32_t)s->scanPA);
++		sweet_mdp_wr(MDP_VIG(1) + SSPP_SRC0, (uint32_t)s->scanPA);
++	}
+ 	sweet_scan.flipFrame = sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT);
+ 	sweet_mdp_wr(MDP_CTL(0) + MDP_CTL_FLUSH, MDP_FLUSH_VIG01);
+ 	SWEET_TRACE(SWT_SCAN_FLIP, sSwap, sSeq, now - sAbs, sweet_scan.flipFrame);    /* 0994 */
+@@ -4155,6 +4358,9 @@ sweet_scan_stats_locked(uint64_t now)
+ 		return;
+ 	}
+ 	sweet_scan.stWin = now;
++	if (sweet_surface_ubwc_boot() != 0) {
++		sweet_ubwc_stats_locked();      /* 1111 */
++	}
+ 	if (sweet_scan.stFrames == 0 && sweet_scan.stNonslot == 0) {
+ 		return;
+ 	}
+@@ -5240,6 +5446,27 @@ AppleCLCD::present(const uint8_t *rec)
+ 		return;         /* 0948: a p mdp test owns the pipes; the latest frame goes out after p mdp restore */
+ 	}
+ 	uint32_t mask = get32(rec, 0x104);
++	/*
++	 * 1111: a compressed (UBWC) surface is only ever scanned out directly: every present below reads it as linear rows
++	 * (CPU copy, GPU blit, crop copy) and would put its compressed bytes on the panel. Such a frame is not presented
++	 * (the last one stays); the direct path shows the next.
++	 */
++	for (uint32_t l = 0; sweet_surface_ubwc_boot() != 0 && mask != 0 && l < SWEET_FB_LAYERS; l++) {
++		uint32_t id = (mask & (1u << l)) ? get32(rec, 0x54 + 4 * l) : 0;
++		SweetSurface *u = id != 0 ? sweet_surface_copy(id) : NULL;
++		bool live = u != NULL && u->ubwcLive;
++		OSSafeReleaseNULL(u);
++		if (live) {
++			static uint32_t logs;
++			sweet_ubwc_st.skipped++;
++			if (logs < 4) {
++				logs++;
++				IOLog("SWEET FB: swap %u: surface %u is UBWC-compressed: not presented (only the direct scanout shows it)\n",
++				    get32(rec, 0x50), id);
++			}
++			return;
++		}
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c70d5f8..1a56380 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -116,6 +116,96 @@ sweet_surface_scan_mode(void)
+ 	return (uint32_t)sweet_scan_boot;
+ }
+ 
++/*
++ * 1111: UBWC display surfaces. boot-arg sweetubwc: 0 (absent) = everything as 1110; 1 = the scanout slots are made
++ * SWEET_SCAN_SLOT_LEN_UBWC long (+128 KB each, from the GPU pool, as the slots themselves), kern.sweet_ubwc_disp
++ * starts 0; 2 = the same and kern.sweet_ubwc_disp starts 1. kern.sweet_ubwc_disp (bsd/dev/sweet_gpu.c) is read at
++ * each scanout-slot create: 1 makes the new surface UBWC-ready (its UBWC layout fits the slot, allocSize grows to
++ * it); a ready surface turns compressed only when a GPU client asks its metadata (SweetAccelerator GetMetadata,
++ * while the sysctl is still 1). With sweetubwc 0 the sysctl has no effect.
++ */
++static int sweet_ubwc_boot_v = -1;
++
++uint32_t
++sweet_surface_ubwc_boot(void)
++{
++	if (sweet_ubwc_boot_v < 0) {
++		int m = 0;
++		PE_parse_boot_argn("sweetubwc", &m, sizeof(m));
++		sweet_ubwc_boot_v = m < 0 || m > 2 ? 0 : m;
++	}
++	return (uint32_t)sweet_ubwc_boot_v;
++}
++
++uint64_t
++sweet_surface_scan_len(void)
++{
++	return sweet_surface_ubwc_boot() != 0 ? SWEET_SCAN_SLOT_LEN_UBWC : SWEET_SCAN_SLOT_LEN;
++}
++
++/*
++ * 1111: the UBWC layout of a W x H RGBA8 surface, as fdl6_layout (TILE6_3, ubwc, one level) and msm_media_info's
++ * COLOR_FMT_RGBA8888_UBWC both give it: 16x4-pixel blocks, one meta byte each; meta pitch align(ceil(W/16), 64),
++ * meta rows align(ceil(H/4), 16), the plane 4 KB aligned; colour pitch align(W x 4, 256), rows align(H, 16).
++ * Meta at 0, colour after it. Returns the total bytes.
++ */
++static uint64_t
++sweet_ubwc_layout(SweetSurface *s)
++{
++	uint32_t W = s->width, H = s->height;
++	uint32_t mp = (((W + 15) / 16) + 63) & ~63u, mr = (((H + 3) / 4) + 15) & ~15u;
++	uint32_t msz = (mp * mr + 4095) & ~4095u;
++	uint32_t dp = (W * 4 + 255) & ~255u, dr = (H + 15) & ~15u;
++	s->ubwcMeta = 0;
++	s->ubwcMetaPitch = mp;
++	s->ubwcMetaSize = msz;
++	s->ubwcData = msz;
++	s->ubwcDataPitch = dp;
++	return (uint64_t)msz + (((uint64_t)dp * dr + 4095) & ~4095ULL);
++}
++
++/* 1111: (with the slot claimed) a UBWC-ready layout when kern.sweet_ubwc_disp is 1; NULL or why not */
++static const char *
++sweet_ubwc_ready(SweetSurface *s)
++{
++	if (sweet_surface_ubwc_boot() == 0 || !sweet_ubwc_disp) {
++		return NULL;
++	}
++	uint64_t total = sweet_ubwc_layout(s);
++	if (total > sweet_surface_scan_len() || s->ubwcDataPitch > 0xffff || s->ubwcDataPitch < s->width * 4) {
++		s->ubwcMeta = s->ubwcMetaPitch = s->ubwcMetaSize = s->ubwcData = s->ubwcDataPitch = 0;
++		return "UBWC layout larger than the slot";
++	}
++	s->ubwcReady = 1;
++	if (total > s->allocSize) {
++		s->allocSize = (uint32_t)total;         /* the client's IOSurfaceGetAllocSize covers both planes */
++	}
++	return NULL;
++}
++
++SweetSurface *
++sweet_surface_scan_find_pa(uint64_t pa)
++{
++	uint32_t id = 0;
++	if (pa == 0 || sweet_scan_lock == NULL) {
++		return NULL;
++	}
++	IOLockLock(sweet_scan_lock);
++	for (uint32_t n = 0; n < SWEET_SCAN_SLOTS; n++) {
++		if (sweet_scan_slot[n].owner != NULL && sweet_scan_slot[n].pa == pa) {
++			id = sweet_scan_slot[n].owner->id;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_scan_lock);
++	SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++	if (s != NULL && (s->scanSlot == 0 || s->scanPA != pa)) {
++		s->release();
++		s = NULL;
++	}
++	return s;
++}
++
+ static void
+ sweet_scan_release(SweetSurface *s)
+ {
+@@ -146,14 +236,14 @@ sweet_scan_make_locked(uint32_t n)
+ 			return false;
+ 		}
+ 		pa = 0;
+-		if (sweet_gpu_pool_alloc(SWEET_SCAN_SLOT_LEN, &pa) != 0 || pa == 0 || pa + SWEET_SCAN_SLOT_LEN > (1ULL << 32)) {
++		if (sweet_gpu_pool_alloc(sweet_surface_scan_len(), &pa) != 0 || pa == 0 || pa + sweet_surface_scan_len() > (1ULL << 32)) {
+ 			IOLog("SWEET SURF: scanout slot %u: no %#llx bytes in the GPU pool below 4 GB (%#llx): no more RAM slots\n", n,
+-			    SWEET_SCAN_SLOT_LEN, pa);
++			    sweet_surface_scan_len(), pa);
+ 			sweet_scan_ram_failed = true;   /* (a pool block above 4 GB would leak: the ranges are all below) */
+ 			return false;
+ 		}
+ 	}
+-	sweet_scan_slot[n].md = IOMemoryDescriptor::withPhysicalAddress(pa, SWEET_SCAN_SLOT_LEN, kIODirectionInOut);
++	sweet_scan_slot[n].md = IOMemoryDescriptor::withPhysicalAddress(pa, sweet_surface_scan_len(), kIODirectionInOut);
+ 	sweet_scan_slot[n].pa = pa;
+ 	return sweet_scan_slot[n].md != NULL;
+ }
+@@ -183,6 +273,13 @@ sweet_surface_scan_reserve(void)
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("sweetscanslots", &want, sizeof(want));
++	if (sweet_surface_ubwc_boot() != 0) {
++		if (sweet_surface_ubwc_boot() == 2) {
++			sweet_ubwc_disp = 1;
++		}
++		IOLog("SWEET SURF: ubwc: boot-arg sweetubwc=%u: slots %#llx bytes, kern.sweet_ubwc_disp %d\n",
++		    sweet_surface_ubwc_boot(), sweet_surface_scan_len(), sweet_ubwc_disp);
++	}
+ 	if (want > SWEET_SCAN_SLOTS - 1) {
+ 		want = SWEET_SCAN_SLOTS - 1;
+ 	}
+@@ -193,7 +290,7 @@ sweet_surface_scan_reserve(void)
+ 		}
+ 		IOMemoryMap *map = n != 0 ? sweet_scan_slot[n].md->map(kIOMapWriteCombineCache) : NULL;
+ 		if (map != NULL) {
+-			bzero((void *)map->getVirtualAddress(), (size_t)SWEET_SCAN_SLOT_LEN);     /* black, not old pool data */
++			bzero((void *)map->getVirtualAddress(), (size_t)sweet_surface_scan_len());     /* black, not old pool data */
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 			map->release();
+ 		}
+@@ -234,7 +331,7 @@ sweet_scan_claim(SweetSurface *s)
+ 	    s->elementHeight != 1) {
+ 		return "not one-plane BGRA";
+ 	}
+-	if (s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > SWEET_SCAN_SLOT_LEN) {
++	if (s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > sweet_surface_scan_len()) {
+ 		return "offset, rows or size";
+ 	}
+ 	proc_selfname(name, sizeof(name));
+@@ -261,16 +358,22 @@ sweet_scan_claim(SweetSurface *s)
+ 	s->scanSlot = n + 1;
+ 	s->scanPA = sweet_scan_slot[n].pa;
+ 	IOLockUnlock(sweet_scan_lock);
++	const char *notUbwc = sweet_ubwc_ready(s);      /* 1111 */
++	if (sweet_surface_ubwc_boot() != 0) {
++		IOLog("SWEET SURF: ubwc: %ux%u surface in slot %u: %s (meta %#x pitch %u size %#x, colour %#x pitch %u, alloc %#x, "
++		    "kern.sweet_ubwc_disp %d)\n", s->width, s->height, n, s->ubwcReady ? "UBWC-ready" : notUbwc != NULL ? notUbwc : "linear",
++		    s->ubwcMeta, s->ubwcMetaPitch, s->ubwcMetaSize, s->ubwcData, s->ubwcDataPitch, s->allocSize, sweet_ubwc_disp);
++	}
+ 	IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+ 	if (b != NULL) {
+ 		s->mapCache = kIOMapDefaultCache;       /* as every surface; the scanout cleans CPU-written frames */
+-		bzero(b->getBytesNoCopy(), (size_t)SWEET_SCAN_SLOT_LEN);
+-		flush_dcache64((addr64_t)(uintptr_t)b->getBytesNoCopy(), (unsigned)SWEET_SCAN_SLOT_LEN, FALSE);
++		bzero(b->getBytesNoCopy(), (size_t)sweet_surface_scan_len());
++		flush_dcache64((addr64_t)(uintptr_t)b->getBytesNoCopy(), (unsigned)sweet_surface_scan_len(), FALSE);
+ 	} else {
+ 		s->mapCache = kIOMapWriteCombineCache;  /* as the panel's own surface */
+ 		uintptr_t va = s->kernelAddress();
+ 		if (va != 0) {
+-			bzero((void *)va, (size_t)SWEET_SCAN_SLOT_LEN);
++			bzero((void *)va, (size_t)sweet_surface_scan_len());
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 		}
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 8acc451..c6ea40b 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -44,6 +44,17 @@ public:
+ 	volatile SInt32           displayUse;   /* 0976: frames of it the display holds (queued, flipping, shown) */
+ 	volatile SInt32           clientUse;    /* 0976: IOSurfaceIncrementUseCount - Decrement from userland */
+ 	volatile SInt32           clientUse1;   /* 0983: ... category 1 */
++	/*
++	 * 1111: UBWC display surface (kern.sweet_ubwc_disp, boot-arg sweetubwc). ubwcReady: a scanout-slot surface
++	 * created while the switch was on, sized for the compressed layout below (offsets from the surface's base = its
++	 * slot PA; meta plane first, then the colour plane, as Mesa's fdl6 and msm_media_info's RGBA8888_UBWC put
++	 * them). Its pixels stay linear (bytesPerRow, offset 0) until a GPU client asks the BO's NativeAdreno metadata
++	 * (hakios-metal under HM_UBWC_DISPLAY=1): from then on ubwcLive = 1 and the display engine scans it
++	 * compressed. All zero = linear, as before 1111.
++	 */
++	uint32_t                  ubwcMeta, ubwcMetaPitch, ubwcMetaSize, ubwcData, ubwcDataPitch;
++	uint8_t                   ubwcReady;
++	volatile uint8_t          ubwcLive;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -61,6 +72,23 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+  */
+ #define SWEET_SCAN_SLOTS                7
+ #define SWEET_SCAN_SLOT_LEN             0xab8000ULL     /* 4608 x 2436, 16 KB pages */
++/*
++ * 1111: with boot-arg sweetubwc=1|2 the slots are made this long instead: a 1125x2436 RGBA8 UBWC surface, meta
++ * 128 x 624 (80 KB) + colour 4608 x 2448 (11016 KB) = 0xad6000, in 16 KB pages. Slot 0 then ends 0xa1ed8000, still
++ * below the backlight packet (0xa2200000).
++ */
++#define SWEET_SCAN_SLOT_LEN_UBWC        0xad8000ULL
++uint64_t sweet_surface_scan_len(void);
++/* 1111: boot-arg sweetubwc (0 default: as 1110; 1 UBWC-sized slots, kern.sweet_ubwc_disp 0; 2 also kern.sweet_ubwc_disp 1) */
++uint32_t sweet_surface_ubwc_boot(void);
++extern "C" int sweet_ubwc_disp;       /* 1111: kern.sweet_ubwc_disp (bsd/dev/sweet_gpu.c) */
++/*
++ * 1111: the scanout-slot surface whose memory starts at physical address pa (retained), or NULL: SweetAccelerator's
++ * GetMetadata finds the display surface behind an imported BO this way.
++ */
++SweetSurface *sweet_surface_scan_find_pa(uint64_t pa);
++#define SWEET_UBWC_VERSION              3       /* SM7250: Adreno 620 UBWC 3 */
++#define SWEET_UBWC_HBB                  14      /* SweetAccelerator GetDeviceInfo highest_bank_bit */
+ uint32_t sweet_surface_scan_mode(void);
+ SweetSurface *sweet_surface_scan_copy(uint32_t slot, uint64_t *pa);
+ /* 0979: the slots' memory made at boot (AppleCLCD::start, before userland fragments RAM); a slot's memory (retained) */
+-- 
+2.53.0
+

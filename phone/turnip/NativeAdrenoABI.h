@@ -79,12 +79,23 @@ struct NativeAdrenoAbiSubmitBuffer {
 };
 struct NativeAdrenoAbiSubmit {
     uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBuffers */
-    uint32_t reserved;            /* zero */
+    union {                       /* redfin xnu 1104: was reserved (zero); both names stay valid */
+        uint32_t reserved;
+        uint32_t flags;           /* NativeAdrenoAbiSubmitWritesDisplay (+ surface id); kernels before 1104 refuse non-zero */
+    };
     uint64_t queue;               /* open queue; 0 is created by open() */
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
     NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
 };
+/*
+ * redfin xnu 1104: flags bit 0 = this submission writes a display (swap-chain) surface (the scanout gate holds only
+ * these once a process has flagged one). 1105: bits 8..31 (with bit 0, optional) = that surface's IOSurface id; gate 3
+ * holds the submission only while that surface is on screen or queued for a latch. Bits 1..7 must be zero.
+ */
+#define NativeAdrenoAbiSubmitWritesDisplay 1u
+#define NativeAdrenoAbiSubmitSurfaceShift  8
+#define NativeAdrenoAbiSubmitSurfaceMask   0xffffff00u
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
     uint32_t bytes;               /* set: length; get: requested capacity */

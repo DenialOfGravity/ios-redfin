@@ -1,0 +1,391 @@
+From a6514fbe108bcf89e30ff4e7a5fed6a2ab3b6a7a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 04:25:17 +0100
+Subject: [PATCH] 1125 redfin: NFC PN80V persona in gateway mode 0
+ (kern.sweet_nfc_id bit 2, default off; identity 42 02 01 6A, 2F 03 -> 0x0015)
+ + P1 withdraw without EBUSY while nfcd holds it
+
+---
+ bsd/dev/sweet_nfc.c | 264 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 247 insertions(+), 17 deletions(-)
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 83b5f70..7a317cf 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -569,15 +569,20 @@ sweet_nfc_init(void)
+  *     libNFC_HAL's lookup is IOServiceNameMatching("AppleStockholmControl") + IOPropertyMatch {IONameMatched:
+  *     "nfc,primary,gpio"} (sub_1f5de1650), so no ADT node is needed. No AppleStockholmSPMI: interface type 1 (UART).
+  *   - the kernel control com.apple.uart.stockholm (SOCK_STREAM, unprivileged: nfcd runs as mobile), one client.
+- * Writing 0 takes both away again (EBUSY while a client is connected). Boot-arg sweetnfc bit 2 (2 or 3) publishes
++ * Writing 0 takes both away again. 1125: also while nfcd holds them: the IOService goes at once (nfcd's user client
++ * is terminated with it), the control refuses new connects and answers nothing, and is deregistered as soon as the
++ * client closes (no more EBUSY). Boot-arg sweetnfc bit 2 (2 or 3) publishes
+  * 2 s after sweet_nfc_init instead (bit 1 is still the P0 probe at boot).
+  *
+  * Gateway kern.sweet_nfc_gw:
+  *   0 (default): nothing reaches the chip. Every host packet is logged (hex, rate-limited). CORE_RESET_CMD gets a
+  *     local NCI 1.0 CORE_RESET_RSP and (kern.sweet_nfc_id bit 0, default on) a CORE_RESET_NTF carrying an NXP
+- *     identity (manufacturer 0x04, info kern.sweet_nfc_id_info = hw/rom/fw-major/fw-minor, default 51 02 01 6A:
+- *     PN552_FW_02_01_6A). kern.sweet_nfc_id bit 1 (default off) also answers CORE_INIT_CMD locally with an NCI 1.0
+- *     CORE_INIT_RSP carrying the same identity. Every other command gets STATUS_REJECTED; data is dropped.
++ *     identity (manufacturer 0x04, info kern.sweet_nfc_id_info = hw/rom/fw-major/fw-minor, default 42 02 01 6A:
++ *     PN80V = hw 0x42, ROM 2, PN552_FW_02_01_6A; 1125: was 51 = "Unknown platform" for libNFC_Comet).
++ *     kern.sweet_nfc_id bit 1 (default off) also answers CORE_INIT_CMD locally with an NCI 1.0 CORE_INIT_RSP
++ *     carrying the same identity. Every other command gets STATUS_REJECTED; data is dropped.
++ *     1125: kern.sweet_nfc_id bit 2 (default off) = the PN80V persona (persona_packet() below): the whole libNFC_Comet
++ *     init sequence is answered locally, nothing reaches the chip (still mode 0), no CORE_RESET_NTF (NCI 1.0).
+  *   1 (for later; off): host CORE_RESET powers and resets the chip (VEN pulse, ST CORE_RESET_NTF, the driver's own
+  *     CORE_INIT and PROP_NFC_MODE_SET), answers the host locally as in mode 0, then forwards the section-4 whitelist
+  *     (filtered) and sends the chip's packets up (no NCI 2.0 -> 1.0 rewriting yet: P2). The SE7 FIFO code sends at
+@@ -611,7 +616,12 @@ static LCK_MTX_DECLARE(gw_lock, &nfc_lock_group);
+ static LCK_MTX_DECLARE(p1_lock, &nfc_lock_group);
+ static kern_ctl_ref gw_ctl;
+ static uint32_t nfc_p1, nfc_gw_mode;
+-static uint32_t nfc_id_bits = 1, nfc_id_info = 0x5102016au;
++static uint32_t nfc_id_bits = 1, nfc_id_info = 0x4202016au;   /* 1125: hw 0x42 = PN80V (was 0x51) */
++static uint32_t nfc_fwif = 0x0015;     /* 1125: 2F 03 answer; libNFC_Comet MwFwCompatibilityChkProcess wants 0x15 for hw 0x42 */
++static volatile bool gw_dereg_pending; /* 1125: withdrawn while a client was connected: deregister at its close */
++static uint32_t gw_conns;
++static struct { uint16_t op; uint16_t n; } persona_seen[32];   /* 1125: (gid << 8 | oid, count) answered by the persona */
++static uint32_t persona_said;
+ static uint32_t gw_refused[RF_N];
+ static uint32_t gw_host_pkts, gw_host_bytes, gw_up_pkts, gw_up_fail, gw_said, gw_opt_said, gw_sel_said, gw_chip_said;
+ static volatile bool gw_session, gw_rx_running;
+@@ -849,7 +859,7 @@ out_status(uint8_t *out, unsigned *no, unsigned cap, uint8_t gid, uint8_t oid, u
+ 	out_put(out, no, cap, r, sizeof(r));
+ }
+ 
+-/* the identity: hw, rom, fw major, fw minor (kern.sweet_nfc_id_info, default 51 02 01 6A) */
++/* the identity: hw, rom, fw major, fw minor (kern.sweet_nfc_id_info, default 42 02 01 6A) */
+ static void
+ id_bytes(uint8_t *b)
+ {
+@@ -870,11 +880,14 @@ local_reset(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned c
+ 
+ 	id_bytes(nt + 8);
+ 	out_put(out, no, cap, rsp, sizeof(rsp));
+-	if (nfc_id_bits & 1) {
++	bool ntf = (nfc_id_bits & 1) && !(nfc_id_bits & 4);
++
++	if (ntf) {
+ 		out_put(out, no, cap, nt, sizeof(nt));
+ 	}
+ 	SAY("gw: CORE_RESET_CMD (%s form, type %u) answered locally: RSP NCI 1.0%s, id %02x %02x %02x %02x\n",
+-	    n == 4 ? "1-byte" : "odd", cfg, (nfc_id_bits & 1) ? " + NTF" : "", nt[8], nt[9], nt[10], nt[11]);
++	    n == 4 ? "1-byte" : "odd", cfg, ntf ? " + NTF" : (nfc_id_bits & 4) ? " (persona: no NTF)" : "", nt[8], nt[9],
++	    nt[10], nt[11]);
+ }
+ 
+ static void
+@@ -895,6 +908,152 @@ local_init(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned ca
+ 	    n == 3 ? "NCI 1.0 form" : n == 5 ? "NCI 2.0 form" : "odd form", n - 3, r[len - 4], r[len - 3], r[len - 2], r[len - 1]);
+ }
+ 
++/*
++ * 1125: the PN80V persona (kern.sweet_nfc_id bit 2, gateway mode 0 only; nothing here touches the chip).
++ * From the 16.7 dyld cache, libNFC_Comet (NXP phLibNfc/phNciNfc) init sequence gphLibNfc_InitializeSequence
++ * @0x2125326f8: Initialize (CORE_RESET + CORE_INIT) -> ConfigHsuBr -> ReApplyHsuBr -> CrcConfig -> ReInitialize ->
++ * MwFwCompatibilityChk -> EnablePropExtn -> GetFwType -> DisableStandbyMode -> GetEepromParams -> InitSetConfig ->
++ * SetEepromParams -> SetLsntModeRtng -> InitSetMapping -> ReInitialize -> EnablePropExtn -> SwpIntfControl ->
++ * GetNfceeIntfCfg -> EnableNfceeDisc -> InitializeComplete. The P1 run (k10-1116) died at the first CORE_INIT
++ * (mode 0 rejected it), after which nfcd asked for DownloadRequest(1).
++ *   - phNciNfc_ProcessInitRsp (0x1f51698d8): NCI 1.0 layout, payload >= 17, status 0, 1..8 RF interfaces, then
++ *     manufacturer id + 4 info bytes hw, rom, fw major, fw minor. Only hw 06-08/0d/1d/42/a2-a4/b1/b2/ba/d0-d2 are
++ *     known platforms (phLibNfc_GetPlatformInfo 0x1f5159764); 0x51 is "Unknown platform". hw 0x42 = model 5 =
++ *     "PN80v" (libnfrestore table @0x202d973d0); ROM 2 selects PN552_FW_02_01_6A_rev125914 (production; AF is mfg).
++ *   - phLibNfc_MwFwCompatibilityChk (0x1f513949c): for hw 0x42 (flag +0xafb set by phLibNfc_GetNfccFeatures
++ *     0x1f517ba00) FW minor 0xa0..0xdf skips the check; 0x6A sends 2F 03 (phNciNfc_GetFwInterfaceVersionCmd) and
++ *     phLibNfc_MwFwCompatibilityChkProcess (0x1f51781ec) wants interface version 0x0015 (big endian in the RSP,
++ *     status 0, 3 bytes), else "FW IS TOO OLD/NEW" (0x80/0x81 -> firmware update).
++ *   - every other NXP proprietary (2F xx) command gets STATUS_OK and no data; CORE_GET_CONFIG answers each id with
++ *     one zero byte; SET_CONFIG, RF_DISCOVER_MAP, listen routing (local only, no route exists anywhere), RF_DISCOVER
++ *     (nothing is ever found: the field stays off) and RF_DEACTIVATE are acknowledged; NFCEE_DISCOVER = 0 NFCEEs.
++ *   - not answered (refused as before): NFCEE_MODE_SET/POWER, CORE_CONN_CREATE, RF_GET_LISTEN_MODE_ROUTING,
++ *     RF_DISCOVER_SELECT, data. DownloadRequest(1) is still refused.
++ */
++static void
++persona_note(uint16_t op)
++{
++	unsigned i;
++
++	for (i = 0; i < 32 && persona_seen[i].n != 0; i++) {
++		if (persona_seen[i].op == op) {
++			persona_seen[i].n++;
++			return;
++		}
++	}
++	if (i < 32) {
++		persona_seen[i].op = op;
++		persona_seen[i].n = 1;
++	}
++}
++
++static bool
++persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap)
++{
++	uint8_t gid = (uint8_t)(p[0] & 0x0fu), oid = (uint8_t)(p[1] & 0x3fu);
++	uint8_t r[3 + 255];
++	unsigned len = 3;
++	const char *what = NULL;
++
++	if ((p[0] >> 5) != 1 || (p[0] & 0x10) != 0 || n < 3) {
++		return false;                   /* commands only, unsegmented */
++	}
++	r[0] = (uint8_t)(0x40u | gid);
++	r[1] = oid;
++	if (gid == 0x0f) {
++		r[len++] = 0x00;
++		if (oid == 0x03) {
++			r[len++] = (uint8_t)(nfc_fwif >> 8);
++			r[len++] = (uint8_t)nfc_fwif;
++			what = "NXP GetFwInterfaceVersion: OK + interface version";
++		} else {
++			what = "NXP proprietary: OK, no data";
++		}
++	} else {
++		switch ((gid << 8) | oid) {
++		case 0x0001: {                  /* CORE_INIT_RSP, NCI 1.0 */
++			static const uint8_t body[] = {
++				0x00,                                   /* status */
++				0x03, 0x1e, 0x03, 0x00,                 /* features: disc. freq/cfg, routing, power states */
++				0x05, 0x00, 0x01, 0x02, 0x03, 0x80,     /* RF interfaces: EE direct, frame, ISO-DEP, NFC-DEP, NXP MIFARE */
++				0x01,                                   /* max logical connections */
++				0x00, 0x02,                             /* max routing table size (LE) */
++				0xff,                                   /* max control packet payload */
++				0x00, 0x01,                             /* max size for large parameters (LE) */
++				0x04,                                   /* manufacturer: NXP */
++			};
++			memcpy(r + len, body, sizeof(body));
++			len += sizeof(body);
++			id_bytes(r + len);
++			len += 4;
++			what = "CORE_INIT_RSP NCI 1.0, NXP PN80V identity";
++			break;
++		}
++		case 0x0002:                    /* CORE_SET_CONFIG: OK, 0 invalid ids (nothing is written anywhere) */
++			r[len++] = 0x00;
++			r[len++] = 0x00;
++			what = "CORE_SET_CONFIG: OK (not applied)";
++			break;
++		case 0x0003: {                  /* CORE_GET_CONFIG: each id with one zero byte */
++			unsigned cnt = n > 3 ? p[3] : 0, i = 4, k = 0;
++
++			r[len++] = 0x00;
++			r[len++] = 0x00;        /* count, filled below */
++			for (; k < cnt && i < n && len + 4 < sizeof(r); k++) {
++				if (p[i] >= 0xa0 && i + 1 < n) {        /* NXP extended (2-byte) tag */
++					r[len++] = p[i++];
++				}
++				r[len++] = p[i++];
++				r[len++] = 0x01;
++				r[len++] = 0x00;
++			}
++			r[4] = (uint8_t)k;
++			what = "CORE_GET_CONFIG: each id = 1 zero byte";
++			break;
++		}
++		case 0x0100:
++			r[len++] = 0x00;
++			what = "RF_DISCOVER_MAP: OK";
++			break;
++		case 0x0101:
++			r[len++] = 0x00;
++			what = "RF_SET_LISTEN_MODE_ROUTING: OK (local only, nothing routed)";
++			break;
++		case 0x0103:
++			r[len++] = 0x00;
++			what = "RF_DISCOVER: OK (field stays off, nothing will be found)";
++			break;
++		case 0x0106: {
++			const uint8_t nt[5] = { 0x61, 0x06, 0x02, (uint8_t)(n > 3 ? p[3] : 0), 0x00 };
++
++			r[len++] = 0x00;
++			r[2] = (uint8_t)(len - 3);
++			out_put(out, no, cap, r, len);
++			out_put(out, no, cap, nt, sizeof(nt));
++			persona_note(0x0106);
++			if (persona_said++ < 400) {
++				SAY("persona: RF_DEACTIVATE: OK + NTF (type %u)\n", nt[3]);
++			}
++			return true;
++		}
++		case 0x0200:
++			r[len++] = 0x00;
++			r[len++] = 0x00;
++			what = "NFCEE_DISCOVER: OK, 0 NFCEEs (end of the init sequence)";
++			break;
++		default:
++			return false;
++		}
++	}
++	r[2] = (uint8_t)(len - 3);
++	out_put(out, no, cap, r, len);
++	persona_note((uint16_t)((gid << 8) | oid));
++	if (persona_said++ < 400) {
++		SAY("persona: %02x %02x -> %s\n", p[0], p[1], what);
++	}
++	return true;
++}
++
+ static void
+ gw_refuse(int why)
+ {
+@@ -945,6 +1104,9 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 		return;
+ 	}
+ 	if (nfc_gw_mode != 1) {         /* mode 0: nothing reaches the chip */
++		if ((nfc_id_bits & 4) && persona_packet(p, n, out, no, cap)) {
++			return;                 /* 1125: answered by the PN80V persona */
++		}
+ 		if (v == V_LOCAL && gid == 0 && oid == 1 && (nfc_id_bits & 2)) {
+ 			local_init(p, n, out, no, cap);
+ 			return;
+@@ -1188,6 +1350,26 @@ gw_session_stop(const char *why)
+ 
+ /* ---- the kernel control com.apple.uart.stockholm ---------------------------------------------------------------- */
+ 
++/* 1125: the control cannot be deregistered from inside its own disconnect callback: a short thread does it */
++static void
++gw_dereg_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	sleep_ms(20);
++	lck_mtx_lock(&p1_lock);
++	if (gw_dereg_pending && nfc_p1 == 0 && gw_ctl != NULL && !gw.connected) {
++		errno_t e = ctl_deregister(gw_ctl);
++
++		if (e == 0) {
++			gw_ctl = NULL;
++			gw_dereg_pending = false;
++		}
++		SAY("kernel control com.apple.uart.stockholm deregistered after the client closed -> %d\n", e);
++	}
++	lck_mtx_unlock(&p1_lock);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static errno_t
+ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
+ {
+@@ -1195,6 +1377,10 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
+ 
+ 	proc_selfname(who, sizeof(who));
+ 	*unitinfo = NULL;
++	if (nfc_p1 == 0) {
++		SAY("com.apple.uart.stockholm: connect by %s (pid %d) refused: P1 withdrawn\n", who, proc_selfpid());
++		return ECONNREFUSED;
++	}
+ 	lck_mtx_lock(&gw_lock);
+ 	if (gw.connected) {
+ 		lck_mtx_unlock(&gw_lock);
+@@ -1208,6 +1394,9 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
+ 	gw.rf_active = false;
+ 	gw.crc = gw.on_demand = 0;
+ 	strlcpy(gw.who, who, sizeof(gw.who));
++	if (++gw_conns <= 3) {
++		gw_said = 0;            /* 1125: full packet log for each of the first three sessions */
++	}
+ 	lck_mtx_unlock(&gw_lock);
+ 	SAY("com.apple.uart.stockholm: OPEN by %s (pid %d), unit %u, gateway mode %u\n", who, proc_selfpid(), sac->sc_unit,
+ 	    nfc_gw_mode);
+@@ -1229,6 +1418,13 @@ gw_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unit
+ 	SAY("com.apple.uart.stockholm: CLOSE (%s, unit %u): host packets %u (%u bytes), sent up %u (failed %u)\n", who, unit,
+ 	    gw_host_pkts, gw_host_bytes, gw_up_pkts, gw_up_fail);
+ 	gw_session_stop("client closed");
++	if (gw_dereg_pending) {
++		thread_t th;
++
++		if (kernel_thread_start(gw_dereg_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -1240,6 +1436,10 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo,
+ 	unsigned no = 0;
+ 	bool want_up = false;
+ 
++	if (nfc_p1 == 0) {              /* 1125: withdrawn, waiting for the client to close */
++		mbuf_freem(m);
++		return 0;
++	}
+ 	lck_mtx_lock(&gw_lock);
+ 	for (mbuf_t b = m; b != NULL; b = mbuf_next(b)) {
+ 		const uint8_t *d = mbuf_data(b);
+@@ -1505,7 +1705,8 @@ nfc_p1_set(uint32_t v, const char *why)
+ 	if (v == 1) {
+ 		e = SweetNFCPublish(true, why);
+ 		if (e == 0 || e == EALREADY) {
+-			e = gw_ctl_register();
++			gw_dereg_pending = false;
++			e = gw_ctl != NULL ? 0 : gw_ctl_register();     /* 1125: still registered after a withdraw */
+ 			if (e) {
+ 				(void)SweetNFCPublish(false, "control registration failed");
+ 			}
+@@ -1514,14 +1715,24 @@ nfc_p1_set(uint32_t v, const char *why)
+ 			nfc_p1 = 1;
+ 		}
+ 	} else {
++		/* 1125: no EBUSY. The IOService goes first (terminating nfcd's user client), the control is closed for new
++		 * clients and answers nothing; with a client still connected it is deregistered when that client closes. */
++		nfc_p1 = 0;
++		(void)SweetNFCPublish(false, why);
++		gw_session_stop(why);
+ 		if (gw.connected) {
+-			e = EBUSY;
+-		} else if (gw_ctl != NULL && (e = ctl_deregister(gw_ctl)) == 0) {
+-			gw_ctl = NULL;
++			gw_dereg_pending = true;
++		} else if (gw_ctl != NULL) {
++			e = ctl_deregister(gw_ctl);
++			if (e == 0) {
++				gw_ctl = NULL;
++			} else {
++				gw_dereg_pending = true;        /* raced with a connect: done at its close */
++				e = 0;
++			}
+ 		}
+-		if (e == 0) {
+-			(void)SweetNFCPublish(false, why);
+-			nfc_p1 = 0;
++		if (!nfc_busy && pins_map()) {
++			ven(false);
+ 		}
+ 	}
+ 	lck_mtx_unlock(&p1_lock);
+@@ -1582,9 +1793,28 @@ sysctl_nfc_gw SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_gw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_gw, "I",
+     "redfin 1119: NFC gateway mode (0 = log and reject, nothing to the chip; 1 = filtered pass-through)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_id_bits, 0,
+-    "redfin 1119: bit 0 = CORE_RESET_NTF after the local RSP (default 1); bit 1 = local CORE_INIT_RSP in mode 0");
++    "redfin 1119/1125: bit 0 = CORE_RESET_NTF after the local RSP (default 1); bit 1 = local CORE_INIT_RSP in mode 0; "
++    "bit 2 = PN80V persona in mode 0 (whole NXP init sequence answered locally, no NTF; default off)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id_info, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_id_info, 0,
+-    "redfin 1119: identity bytes hw.rom.fwmajor.fwminor (default 0x5102016a = PN552 FW 02.01.6A)");
++    "redfin 1119/1125: identity bytes hw.rom.fwmajor.fwminor (default 0x4202016a = PN80V, ROM 2, PN552 FW 02.01.6A)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif, 0,
++    "redfin 1125: persona answer to NXP 2F 03 GetFwInterfaceVersion (default 0x15, what hw 0x42 needs)");
++
++static int
++sysctl_nfc_persona SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char b[32 * 12 + 8];
++	size_t o = 0;
++
++	b[0] = 0;
++	for (unsigned i = 0; i < 32 && persona_seen[i].n != 0 && o + 12 < sizeof(b); i++) {
++		o += (size_t)snprintf(b + o, sizeof(b) - o, "%s%04x:%u", i ? " " : "", persona_seen[i].op, persona_seen[i].n);
++	}
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_persona, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_persona,
++    "A", "redfin 1125: commands answered by the PN80V persona, gid<<8|oid:count (0200 = NFCEE_DISCOVER = end of init)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_host_pkts, CTLFLAG_RD | CTLFLAG_LOCKED, &gw_host_pkts, 0,
+     "redfin 1119: NCI packets received from the host on com.apple.uart.stockholm");
+ 
+-- 
+2.53.0
+

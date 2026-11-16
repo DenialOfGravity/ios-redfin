@@ -1,0 +1,226 @@
+From 56f5470c1e0bb16e2075a9db27af21cf9ebddb17 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 21:27:59 +0100
+Subject: [PATCH 1/3] 1120 redfin: UBWC error status read at boot, cleared per
+ switch and per 5 s window, new bits decoded (kern.sweet_ubwc_errclr /
+ kern.sweet_ubwc_mdss2, default as 1111)
+
+---
+ bsd/dev/sweet_gpu.c                   |  11 +++
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 123 ++++++++++++++++++++++++--
+ 2 files changed, 126 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 30c5b84..1ea492a 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2700,6 +2700,17 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_sspp, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet
+     "SWEET MDP: VIG UBWC_STATIC value for compressed scanout (1111, 0 = by decoder version)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_mdss, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_mdss, 0,
+     "SWEET MDP: MDSS UBWC_STATIC (1111, 0 = auto if zero, 1 = never write, else the value)");
++/*
++ * 1120: kern.sweet_ubwc_errclr how SSPP_UBWC_ERROR_STATUS is cleared (0 BIT(31) as upstream, 1 BIT(31) then 0, 2 write
++ * back the value read); kern.sweet_ubwc_mdss2 0x1XY writes MDSS UBWC_CTRL_2 = Y, PREDICTION_MODE = X at the next switch
++ * to compressed (0 = never written, default).
++ */
++int sweet_ubwc_errclr = 0;
++int sweet_ubwc_mdss2 = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_errclr, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_errclr, 0,
++    "SWEET MDP: UBWC error clear 0 BIT31 (upstream) 1 BIT31 then 0 2 write-1-to-clear (1120)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_ubwc_mdss2, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ubwc_mdss2, 0,
++    "SWEET MDP: 0x1XY = MDSS UBWC_CTRL_2 Y, PREDICTION_MODE X at the next UBWC switch (1120, 0 never)");
+ 
+ int sweet_scangate_flag = 1;
+ static volatile int scangate_flag_pid = -1;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 386c67b..c9e183b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2489,6 +2489,8 @@ AppleCLCD::setHz(uint32_t hz, bool tc)
+ #define SSPP_UBWC_ERROR         0x138u
+ #define MDSS_UBWC_DEC_VERSION   0x058u
+ #define MDSS_UBWC_STATIC        0x144u
++#define MDSS_UBWC_CTRL_2        0x150u  /* 1120: msm_mdss.c REG_MDSS_UBWC_CTRL_2 (dec 4.0: 1 for a UBWC 3.0 encoder, else 2) */
++#define MDSS_UBWC_PRED_MODE     0x154u  /* 1120: REG_MDSS_UBWC_PREDICTION_MODE (dec 4.0: 0 for a 3.0 encoder, else 1) */
+ #define SSPP_PE(c, r)           (0x100u + 0x10u * (c) + 4u * (r))       /* pixel extension C0/C1C2/C3: LR, TB, REQ */
+ #define QSEED                   0xa00u  /* lito DT qcom,sde-vig-qseed-off, "qseedv3lite" */
+ #define QS_VERSION              (QSEED + 0x00)
+@@ -2808,7 +2810,7 @@ sweet_mdp_flush(const char *what)
+  * MDSS UBWC_STATIC written msm_mdss-style only if it reads 0; 1 = never written; else the raw value written): read
+  * at each switch to UBWC, so a variant is tried by a backboardd restart, no rebuild.
+  */
+-extern "C" int sweet_ubwc_sspp, sweet_ubwc_mdss;
++extern "C" int sweet_ubwc_sspp, sweet_ubwc_mdss, sweet_ubwc_mdss2, sweet_ubwc_errclr;
+ static struct {
+ 	uint32_t frames, linear, switches, skipped, corners, errs[2];
+ 	uint64_t win;
+@@ -2831,8 +2833,8 @@ sweet_ubwc_sspp_static(uint32_t fmt, uint32_t *ver)
+ 	case 2:
+ 		return fast | swz | hbb << 4;
+ 	case 4:
+-		return 1u << 30;
+-	default:        /* 3 (SM7250), or an unreadable version: as 3 */
++		return 1u << 30;        /* redfin reads 4 (MDSS +0x58 0x40000000): upstream VER_40, BIT(30) only */
++	default:        /* 3, or an unreadable version: as 3 */
+ 		return 1u << 30 | swz | hbb << 4;
+ 	}
+ }
+@@ -2854,13 +2856,91 @@ sweet_ubwc_mdss_setup(uint32_t ver)
+ 	if (want != cur) {
+ 		sweet_mdp_wr(MDSS_UBWC_STATIC, want);
+ 	}
+-	if (!sweet_ubwc_st.logged || want != cur) {
++	/* 1120: kern.sweet_ubwc_mdss2 0x1XY (bit 8 set): CTRL_2 = Y, PREDICTION_MODE = X; 0 never written */
++	uint32_t c2 = sweet_mdp_rd(MDSS_UBWC_CTRL_2), pm = sweet_mdp_rd(MDSS_UBWC_PRED_MODE);
++	bool w2 = (sweet_ubwc_mdss2 & 0x100) != 0 &&
++	    (c2 != ((uint32_t)sweet_ubwc_mdss2 & 0xf) || pm != (((uint32_t)sweet_ubwc_mdss2 >> 4) & 0xf));
++	if (w2) {
++		sweet_mdp_wr(MDSS_UBWC_CTRL_2, (uint32_t)sweet_ubwc_mdss2 & 0xf);
++		sweet_mdp_wr(MDSS_UBWC_PRED_MODE, ((uint32_t)sweet_ubwc_mdss2 >> 4) & 0xf);
++	}
++	if (!sweet_ubwc_st.logged || want != cur || w2) {
+ 		sweet_ubwc_st.logged = true;
+ 		IOLog("SWEET MDP: ubwc: decoder version %u (MDSS +0x58 %#x), MDSS UBWC_STATIC %#x -> %#x\n", ver,
+ 		    sweet_mdp_rd(MDSS_UBWC_DEC_VERSION), cur, want);
++		/* 1120: the fields (msm_mdss.c), against the GPU (sweet_a6xx.c a620: hbb 14, RBBM_NC_MODE_CNTL macrotile 0) */
++		IOLog("SWEET MDP: ubwc: MDSS static swizzle %u static %u hbb %u macrotile %u enc3.0-bit %u | ctrl2 %u -> %u pred %u -> %u"
++		    " | gpu hbb %u macrotile 0 | sspp fetch hbb %u\n", want & 7, (want >> 3) & 1, 13 + ((want >> 4) & 7),
++		    (want >> 12) & 1, (want >> 10) & 1, c2, sweet_mdp_rd(MDSS_UBWC_CTRL_2), pm, sweet_mdp_rd(MDSS_UBWC_PRED_MODE),
++		    SWEET_UBWC_HBB, SWEET_UBWC_HBB);
+ 	}
+ }
+ 
++/*
++ * ---- 1120: SSPP_UBWC_ERROR_STATUS (VIG +0x138) ----
++ * Upstream dpu_hw_sspp_setup_format writes BIT(31) there before a UBWC fetch ("clear previous UBWC error"); downstream
++ * SDE has get_ubwc_error (a plain read) and clear_ubwc_error (write BIT(31)), read and cleared per frame-done by
++ * sde_crtc. No public source names the other bits: here bit 0 "err", bits 23:16 "f16" (0xff seen), the rest raw.
++ * kern.sweet_ubwc_errclr picks the clear: 0 BIT(31) as upstream (default), 1 BIT(31) then 0, 2 write back the value
++ * read (write-1-to-clear). The value read right after a clear is the base: a window reports only bits set since
++ * (new = now & ~base) and, when the clear did not take, the bits that changed (chg = now ^ base).
++ */
++static struct {
++	uint32_t base[2], before[2];
++	uint8_t  clr[2];        /* 0 not yet, 1 the clear took (fewer bits after), 2 sticky (same value after), 3 other */
++	bool     boot, did[2];  /* did: cleared at least once (a switch to compressed) */
++} sweet_ubwc_err;
++
++static const char *const sweet_ubwc_clr_name[4] = { "-", "ok", "sticky", "odd" };
++
++static void
++sweet_ubwc_err_clear(uint32_t p)
++{
++	uint32_t r = MDP_VIG(p) + SSPP_UBWC_ERROR, v = sweet_mdp_rd(r);
++	if (sweet_ubwc_errclr == 2) {
++		sweet_mdp_wr(r, v);
++	} else {
++		sweet_mdp_wr(r, 1u << 31);
++		if (sweet_ubwc_errclr == 1) {
++			sweet_mdp_wr(r, 0);
++		}
++	}
++	uint32_t a = sweet_mdp_rd(r);
++	sweet_ubwc_err.before[p] = v;
++	sweet_ubwc_err.base[p] = a;
++	sweet_ubwc_err.did[p] = true;
++	sweet_ubwc_err.clr[p] = v == 0 ? sweet_ubwc_err.clr[p] : (a & ~v) == 0 && a != v ? 1 : a == v ? 2 : 3;
++}
++
++/* bits of v as field names, into b (at most ~40 bytes) */
++static const char *
++sweet_ubwc_err_dec(uint32_t v, char *b, size_t n)
++{
++	if (v == 0) {
++		return "";
++	}
++	snprintf(b, n, " [%s%s f16=%#x lo=%#x hi=%#x]", (v & 1) ? "err" : "-", (v >> 31) ? " b31" : "", (v >> 16) & 0xff,
++	    (v >> 1) & 0x7fff, (v >> 24) & 0x7f);
++	return b;
++}
++
++/* once, the first time the pipes are taken (before any UBWC use): the raw error and the MDSS UBWC set-up */
++static void
++sweet_ubwc_err_boot(void)
++{
++	if (sweet_ubwc_err.boot) {
++		return;
++	}
++	sweet_ubwc_err.boot = true;
++	char d0[48], d1[48];
++	uint32_t e0 = sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_ERROR), e1 = sweet_mdp_rd(MDP_VIG(1) + SSPP_UBWC_ERROR);
++	IOLog("SWEET MDP: ubwc boot: error vig0 %#x%s vig1 %#x%s | MDSS dec %#x static %#x ctrl2 %#x pred %#x | vig0 static %#x"
++	    " fetch %#x op %#x\n", e0, sweet_ubwc_err_dec(e0, d0, sizeof(d0)), e1, sweet_ubwc_err_dec(e1, d1, sizeof(d1)),
++	    sweet_mdp_rd(MDSS_UBWC_DEC_VERSION), sweet_mdp_rd(MDSS_UBWC_STATIC), sweet_mdp_rd(MDSS_UBWC_CTRL_2),
++	    sweet_mdp_rd(MDSS_UBWC_PRED_MODE), sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_STATIC),
++	    sweet_mdp_rd(MDP_VIG(0) + SSPP_FETCH_CONFIG), sweet_mdp_rd(MDP_VIG(0) + SSPP_OP_MODE));
++}
++
+ /* The pipes' format registers for surface s compressed (on) or back to what they were (off). */
+ static void
+ sweet_mdp_ubwc_fmt(bool on, SweetSurface *s)
+@@ -2899,14 +2979,18 @@ sweet_mdp_ubwc_fmt(bool on, SweetSurface *s)
+ 		sweet_mdp_wr(b + SSPP_OP_MODE, sweet_mdp.uold[p][4] | 1u);
+ 		sweet_mdp_wr(b + SSPP_UBWC_STATIC, st);
+ 		sweet_mdp_wr(b + SSPP_FETCH_CONFIG, 0x87u | (uint32_t)(SWEET_UBWC_HBB - 13) << 18);
+-		(void)sweet_mdp_rd(b + SSPP_UBWC_ERROR);
+-		sweet_mdp_wr(b + SSPP_UBWC_ERROR, 1u << 31);    /* clear */
++		sweet_ubwc_err_clear(p);                        /* 1120: kern.sweet_ubwc_errclr; base for the windows */
+ 	}
+ 	sweet_mdp.ufmt = on;
+ 	sweet_ubwc_st.switches++;
+ 	static uint32_t logs;
+ 	if (logs < 16) {
+ 		logs++;
++		if (on) {
++			IOLog("SWEET MDP: ubwc: error clear (mode %d) vig0 %#x -> %#x (%s) vig1 %#x -> %#x (%s)\n", sweet_ubwc_errclr,
++			    sweet_ubwc_err.before[0], sweet_ubwc_err.base[0], sweet_ubwc_clr_name[sweet_ubwc_err.clr[0] & 3],
++			    sweet_ubwc_err.before[1], sweet_ubwc_err.base[1], sweet_ubwc_clr_name[sweet_ubwc_err.clr[1] & 3]);
++		}
+ 		IOLog("SWEET MDP: ubwc: pipes %s (surface %u, format %#x -> %#x, unpack %#x, op %#x, static %#x, fetch %#x)\n",
+ 		    on ? "compressed" : "linear again", s != NULL ? s->id : 0, sweet_mdp.uold[0][2], sweet_mdp_rd(MDP_VIG(0) + SSPP_FORMAT),
+ 		    sweet_mdp_rd(MDP_VIG(0) + SSPP_UNPACK), sweet_mdp_rd(MDP_VIG(0) + SSPP_OP_MODE),
+@@ -2959,9 +3043,31 @@ sweet_ubwc_stats_locked(void)
+ 	if (sweet_ubwc_st.frames == 0 && sweet_ubwc_st.skipped == 0) {
+ 		return;
+ 	}
+-	uint32_t e0 = sweet_mdp_rd(MDP_VIG(0) + SSPP_UBWC_ERROR), e1 = sweet_mdp_rd(MDP_VIG(1) + SSPP_UBWC_ERROR);
++	/*
++	 * 1120: per pipe the raw value, the bits new since the last clear (decoded) and, if that clear did not take, the
++	 * bits changed; then cleared again for the next window. Before the first switch to compressed: raw only (new = chg = 0).
++	 */
++	uint32_t e[2], nw[2], ch[2];
++	char d[2][48];
++	for (uint32_t p = 0; p < 2; p++) {
++		e[p] = sweet_mdp_rd(MDP_VIG(p) + SSPP_UBWC_ERROR);
++		bool had = sweet_ubwc_err.did[p];
++		nw[p] = had ? e[p] & ~sweet_ubwc_err.base[p] : 0;
++		ch[p] = had && sweet_ubwc_err.clr[p] >= 2 ? e[p] ^ sweet_ubwc_err.base[p] : 0;
++		(void)sweet_ubwc_err_dec(nw[p], d[p], sizeof(d[p]));
++		if (nw[p] == 0) {
++			d[p][0] = 0;
++		}
++	}
+ 	IOLog("SWEET SCANOUT: 5s ubwc: frames %u linear %u switches %u not-presented %u corners-skipped %u | error vig0 %#x vig1 %#x\n",
+-	    sweet_ubwc_st.frames, sweet_ubwc_st.linear, sweet_ubwc_st.switches, sweet_ubwc_st.skipped, sweet_ubwc_st.corners, e0, e1);
++	    sweet_ubwc_st.frames, sweet_ubwc_st.linear, sweet_ubwc_st.switches, sweet_ubwc_st.skipped, sweet_ubwc_st.corners, e[0], e[1]);
++	IOLog("SWEET SCANOUT: 5s ubwc err: vig0 raw %#x new %#x%s chg %#x clr %s | vig1 raw %#x new %#x%s chg %#x clr %s\n",
++	    e[0], nw[0], d[0], ch[0], sweet_ubwc_clr_name[sweet_ubwc_err.clr[0] & 3], e[1], nw[1], d[1], ch[1],
++	    sweet_ubwc_clr_name[sweet_ubwc_err.clr[1] & 3]);
++	if (sweet_mdp.usaved) {
++		sweet_ubwc_err_clear(0);
++		sweet_ubwc_err_clear(1);
++	}
+ 	sweet_ubwc_st.frames = sweet_ubwc_st.linear = sweet_ubwc_st.switches = sweet_ubwc_st.skipped = sweet_ubwc_st.corners = 0;
+ }
+ 
+@@ -2985,6 +3091,7 @@ sweet_mdp_take(AppleCLCD *fb, const char *what)
+ 			return false;
+ 		}
+ 	}
++	sweet_ubwc_err_boot();          /* 1120: once, before any UBWC use */
+ 	sweet_gpu_mdp_own(1);
+ 	sweet_mdp_busy = true;
+ 	for (uint32_t i = 0; i < 50 && (sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH) & MDP_FLUSH_VIG01); i++) {
+-- 
+2.53.0
+

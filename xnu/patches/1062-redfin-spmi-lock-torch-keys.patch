@@ -1,0 +1,761 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 9 Nov 2026 20:49:26 +0000
+Subject: [PATCH] 1062 redfin: one SPMI transaction lock for all sweet drivers
+ (kern.sweet_spmi_lock), torch alarm probe retry + tsens fallback +
+ kern.sweet_torch_reinit, keys read sanity check
+
+---
+ bsd/dev/sweet_cam.c     |   9 +-
+ bsd/dev/sweet_cs35l41.c |   5 ++
+ bsd/dev/sweet_haptic.c  |   5 ++
+ bsd/dev/sweet_keys.c    |  71 ++++++++++++++--
+ bsd/dev/sweet_spmi.c    |  72 ++++++++++++++++
+ bsd/dev/sweet_spmi.h    |   9 ++
+ bsd/dev/sweet_thermal.c |   8 ++
+ bsd/dev/sweet_torch.c   | 176 +++++++++++++++++++++++++++++++++++-----
+ 8 files changed, 327 insertions(+), 28 deletions(-)
+
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 9c29268..c021d45 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -55,6 +55,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ #include <vm/memory_types.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -250,15 +251,21 @@ spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
+ 		return -1;
+ 	}
+ 	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		int bus = sweet_spmi_bus_lock();        /* 1062 */
+ 		if (write) {
+ 			wr(ch, 0x10, *val);
+ 		}
+ 		wr(ch, 0x00, ((write ? 0u : 1u) << 27) | ((addr & 0xffu) << 4));
+ 		uint32_t st = 0;
++		uint8_t data = 0;
+ 		unsigned i;
+ 		for (i = 0; i < 1000 && !((st = rd(ch, 0x08)) & 1u); i++) {
+ 			delay(1);
+ 		}
++		if (i < 1000 && !write && !(st & 0xeu)) {
++			data = (uint8_t)rd(ch, 0x18);
++		}
++		sweet_spmi_bus_unlock(bus);
+ 		if (i == 1000) {
+ 			printf("SWEET CAM: spmi %x:%x timeout\n", sid, addr);
+ 			return -1;
+@@ -271,7 +278,7 @@ spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
+ 			return -1;
+ 		}
+ 		if (!write) {
+-			*val = (uint8_t)rd(ch, 0x18);
++			*val = data;
+ 		}
+ 		return 0;
+ 	}
+diff --git a/bsd/dev/sweet_cs35l41.c b/bsd/dev/sweet_cs35l41.c
+index d31b74b..361d342 100644
+--- a/bsd/dev/sweet_cs35l41.c
++++ b/bsd/dev/sweet_cs35l41.c
+@@ -34,6 +34,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ 
+@@ -126,6 +127,7 @@ spmi(unsigned which, unsigned reg, bool write, uint8_t *val)
+ 		SAY("spmi %s %s reg %#x refused (apid %#x owner %u)\n", write ? "write" : "read", allowed[which].name, reg, apid, owner);
+ 		return -1;
+ 	}
++	int bus = sweet_spmi_bus_lock();        /* 1062 */
+ 	if (write) {
+ 		if (sp_chnl[which] == 0) {
+ 			sp_chnl[which] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
+@@ -141,16 +143,19 @@ spmi(unsigned which, unsigned reg, bool write, uint8_t *val)
+ 
+ 		if (st & 1u) {
+ 			if (st & 0x0eu) {
++				sweet_spmi_bus_unlock(bus);
+ 				SAY("spmi %s reg %#x status %#x\n", allowed[which].name, reg, st);
+ 				return -1;
+ 			}
+ 			if (!write) {
+ 				*val = (uint8_t)mrd(ch, 0x18);
+ 			}
++			sweet_spmi_bus_unlock(bus);
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
++	sweet_spmi_bus_unlock(bus);
+ 	SAY("spmi %s reg %#x timeout\n", allowed[which].name, reg);
+ 	return -1;
+ }
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+index a1ba3c7..e6bdc62 100644
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -38,6 +38,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -192,6 +193,7 @@ hap_spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
+ 	if (!ch) {
+ 		return -1;
+ 	}
++	int bus = sweet_spmi_bus_lock();        /* 1062 */
+ 	if (write) {
+ 		hap_wr(ch, 0x10, *val);
+ 	}
+@@ -200,16 +202,19 @@ hap_spmi(unsigned sid, unsigned addr, bool write, uint8_t *val)
+ 		uint32_t st = hap_rd(ch, 0x08);
+ 		if (st & 1u) {
+ 			if (st & 0x0eu) {
++				sweet_spmi_bus_unlock(bus);
+ 				printf("SWEET HAPTIC: spmi %x:%x status %#x\n", sid, addr, st);
+ 				return -1;
+ 			}
+ 			if (!write) {
+ 				*val = (uint8_t)hap_rd(ch, 0x18);
+ 			}
++			sweet_spmi_bus_unlock(bus);
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
++	sweet_spmi_bus_unlock(bus);
+ 	printf("SWEET HAPTIC: spmi %x:%x timeout\n", sid, addr);
+ 	return -1;
+ }
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 2cb21a5..2671939 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -33,6 +34,15 @@ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
++/*
++ * 1062: a key change is reported only if the peripheral still reads back as itself: TYPE (0x04) and
++ * SUBTYPE (0x05) equal to what init read, and the RT_STS byte reads the same again. A read that raced
++ * another driver's (r5au1f: pon=0x9, volup 0x80) is dropped. Boot-arg sweetkeyscheck=0: off.
++ */
++static uint8_t keys_pon_type, keys_pon_sub, keys_gpio_type, keys_gpio_sub;
++static bool keys_pon_id, keys_gpio_id;
++static int keys_check = 1;
++static unsigned keys_dropped;
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -68,21 +78,40 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	}
+ 	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	bool ok = false;
++	int bus = sweet_spmi_bus_lock();        /* 1062 */
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+ 		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+ 		if (keys_last_status & 1u) {
+-			if (keys_last_status & 0x0eu) {
+-				return false;
++			if (!(keys_last_status & 0x0eu)) {
++				*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++				ok = true;
+ 			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+-			return true;
++			break;
+ 		}
+ 		delay(1);
+ 	}
+-	return false;
++	sweet_spmi_bus_unlock(bus);
++	return ok;
++}
++
++/* 1062: the peripheral's TYPE/SUBTYPE as init saw them, and the RT byte again equal to val */
++static bool
++keys_still(uint16_t apid, uint16_t base, uint16_t rt, bool known, uint8_t type, uint8_t sub, uint8_t val,
++    uint8_t *t, uint8_t *s, uint8_t *again)
++{
++	if (!keys_check) {
++		return true;
++	}
++	*t = *s = *again = 0xee;
++	if (!known) {   /* init could not confirm the identity: the second read alone */
++		return keys_read(apid, rt, again) && *again == val;
++	}
++	return keys_read(apid, base + 0x04u, t) && keys_read(apid, base + 0x05u, s) &&
++	       keys_read(apid, rt, again) && *t == type && *s == sub && *again == val;
+ }
+ 
+ static void
+@@ -114,6 +143,25 @@ keys_thread(void *arg, wait_result_t result)
+ 		} else {
+ 			errors = 0;
+ 		}
++		/* 1062: a change only if the read is confirmed (keys_still) */
++		bool pchg = pok && (now[0] != state[0] || now[2] != state[2]), gchg = gok && now[1] != state[1];
++		uint8_t t, s, again;
++		if (pchg && !keys_still(keys_pon_apid, 0x0800u, KEYS_PON_RT, keys_pon_id, keys_pon_type, keys_pon_sub,
++		    pon, &t, &s, &again)) {
++			if (keys_dropped++ < 40) {
++				printf("SWEET KEYS: pon read %#x dropped: type %#x/%#x subtype %#x/%#x again %#x\n",
++				    pon, t, keys_pon_type, s, keys_pon_sub, again);
++			}
++			pok = false;
++		}
++		if (gchg && !keys_still(keys_gpio_apid, KEYS_GPIO_BASE, KEYS_GPIO_RT, keys_gpio_id, keys_gpio_type,
++		    keys_gpio_sub, gpio, &t, &s, &again)) {
++			if (keys_dropped++ < 40) {
++				printf("SWEET KEYS: volup read %#x dropped: type %#x/%#x subtype %#x/%#x again %#x\n",
++				    gpio, t, keys_gpio_type, s, keys_gpio_sub, again);
++			}
++			gok = false;
++		}
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+@@ -136,6 +184,7 @@ sweet_keys_init(void)
+ 	}
+ 	keys_started = true;
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetkeyscheck", &keys_check, sizeof(keys_check));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+@@ -176,6 +225,18 @@ sweet_keys_init(void)
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	/* 1062: the identity a later key change is checked against (two equal reads each) */
++	uint8_t t2 = 0, s2 = 0;
++	keys_pon_id = keys_read(keys_pon_apid, 0x0804u, &keys_pon_type) && keys_read(keys_pon_apid, 0x0805u, &keys_pon_sub) &&
++	    keys_read(keys_pon_apid, 0x0804u, &t2) && keys_read(keys_pon_apid, 0x0805u, &s2) &&
++	    t2 == keys_pon_type && s2 == keys_pon_sub;
++	keys_gpio_id = keys_gpio_apid != KEYS_NO_APID && keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x04u, &keys_gpio_type) &&
++	    keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &keys_gpio_sub) &&
++	    keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x04u, &t2) && keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &s2) &&
++	    t2 == keys_gpio_type && s2 == keys_gpio_sub && keys_gpio_type == 0x10;
++	printf("SWEET KEYS: check %s: pon type %#x subtype %#x%s, volup type %#x subtype %#x%s\n", keys_check ? "on" : "off",
++	    keys_pon_type, keys_pon_sub, keys_pon_id ? "" : " (unconfirmed)", keys_gpio_type, keys_gpio_sub,
++	    keys_gpio_id ? "" : " (unconfirmed)");
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 9243e51..e2303f9 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -22,10 +22,76 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/locks.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ 
++/*
++ * 1062: the shared SPMI transaction lock (sweet_spmi.h). r5au1f's boot: sweet_keys.c and sweet_torch.c
++ * read at the same moment and got each other's bytes (keys pon=0x9 = the temperature alarm's TYPE,
++ * torch subtype 0x1): the torch refused to start and keys saw fake presses.
++ * kern.sweet_spmi_lock (boot-arg sweetspmilock, default 1): 0 = every driver on its own again.
++ * kern.sweet_spmi_lock_waits (RD): transfers that found the lock taken (= would have overlapped).
++ */
++static LCK_GRP_DECLARE(sp_bus_grp, "sweet_spmi_bus");
++static LCK_MTX_DECLARE(sp_bus_mtx, &sp_bus_grp);
++static int sp_bus_on = -1;
++static unsigned sp_bus_waits;
++
++int
++sweet_spmi_bus_lock(void)
++{
++	if (sp_bus_on < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetspmilock", &v, sizeof(v));
++		sp_bus_on = v != 0;
++		printf("SWEET SPMI: shared transaction lock %s (sweetspmilock=%d)\n", sp_bus_on ? "on" : "OFF", v);
++	}
++	if (!sp_bus_on) {
++		return 0;
++	}
++	if (!lck_mtx_try_lock(&sp_bus_mtx)) {
++		__atomic_fetch_add(&sp_bus_waits, 1u, __ATOMIC_RELAXED);
++		lck_mtx_lock(&sp_bus_mtx);
++	}
++	return 1;
++}
++
++void
++sweet_spmi_bus_unlock(int held)
++{
++	if (held) {
++		lck_mtx_unlock(&sp_bus_mtx);
++	}
++}
++
++static int
++sysctl_sweet_spmi_lock SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (sp_bus_on < 0) {
++		sweet_spmi_bus_unlock(sweet_spmi_bus_lock());   /* boot-arg default, logged once */
++	}
++	int value = sp_bus_on, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 0 && value != 1) {
++		return EINVAL;
++	}
++	sp_bus_on = value;      /* a holder still unlocks with its own "held" */
++	printf("SWEET SPMI: shared transaction lock %s (sysctl)\n", value ? "on" : "OFF");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_spmi_lock, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_spmi_lock, "I", "1062: one lock for all sweet SPMI transfers (0 = off)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_spmi_lock_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &sp_bus_waits, 0,
++    "1062: SPMI transfers that waited for another driver's");
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define SP_CORE_PA 0x0c440000u
+@@ -120,6 +186,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	}
+ 	unsigned off = 0x80u * apid;
+ 	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
++	int bus = sweet_spmi_bus_lock();        /* 1062 (lock order: sp_lock, then the bus lock) */
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+@@ -127,15 +194,18 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
++				sweet_spmi_bus_unlock(bus);
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			sweet_spmi_bus_unlock(bus);
+ 			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
++	sweet_spmi_bus_unlock(bus);
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+@@ -210,6 +280,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 	}
+ 	uint32_t status = 0;
+ 	unsigned t;
++	int bus = sweet_spmi_bus_lock();        /* 1062 */
+ 	__asm__ volatile ("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(ch + 0x10u) = val;                       /* WDATA0 */
+ 	__asm__ volatile ("dmb oshst" ::: "memory");
+@@ -222,6 +293,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 		}
+ 		delay(1);
+ 	}
++	sweet_spmi_bus_unlock(bus);
+ 	if (!(status & 1u)) {
+ 		sp_poisoned[apid] = true;
+ 	}
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index a04a1c5..84c0306 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -15,6 +15,15 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+  */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ int sweet_spmi_write_enabled(void);
++/*
++ * 1062: one lock for every SPMI transaction of every sweet driver (keys, torch, camera GPIOs, haptic,
++ * CS35L41 GPIOs, battery/charger/thermal/RTC here): command, status and data of one transfer can no
++ * longer interleave with another driver's. sweet_spmi_bus_lock() returns whether it took the lock
++ * (boot-arg sweetspmilock=0 or sysctl kern.sweet_spmi_lock=0: no lock, the old behaviour); pass that
++ * to sweet_spmi_bus_unlock(). Thread context only (a mutex; the transfers spin up to 1 ms).
++ */
++int sweet_spmi_bus_lock(void);
++void sweet_spmi_bus_unlock(int held);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 22763cf..69b8e31 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -170,6 +170,14 @@ ts_sample(void)
+ 	t_max = m;
+ }
+ 
++/* 1062: for sweet_torch.c without the PMIC temperature alarm: the camera block's tsens, else the hottest; TS_NONE (-9999) = none */
++int sweet_thermal_torch_dc(void);
++int
++sweet_thermal_torch_dc(void)
++{
++	return t_camera != TS_NONE ? t_camera : t_max;
++}
++
+ /* "41.3" or "--" */
+ static const char *
+ ts_fmt(char *buf, size_t len, int v)
+diff --git a/bsd/dev/sweet_torch.c b/bsd/dev/sweet_torch.c
+index 0858c85..ef61201 100644
+--- a/bsd/dev/sweet_torch.c
++++ b/bsd/dev/sweet_torch.c
+@@ -52,8 +52,10 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_thermal_torch_dc(void);        /* 1062: sweet_thermal.c */
+ extern kern_return_t thread_terminate(thread_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+@@ -98,6 +100,17 @@ void sweet_torch_flash_off(void);
+ #define FLASH_MA_CAP     300u
+ #define FLASH_MS_CAP     100u
+ #define PREFLASH_MS_CAP  500u
++/*
++ * 1062: the temperature-alarm probe is tried ALARM_TRIES times, ALARM_GAP_MS apart (r5au1f: one read raced
++ * sweet_keys.c and the torch refused everything for the whole boot). Without the alarm the torch still works,
++ * at most sweettorch_noalarm_ma per channel (default 50, never above sweettorch_ma), and goes off when tsens
++ * (the camera block, else the hottest sensor) reaches sweettorch_tsens_dc deci-degC (default 550).
++ * sysctl kern.sweet_torch_reinit = 1: probe again (and start the driver again if it had stopped).
++ */
++#define ALARM_TRIES      5u
++#define ALARM_GAP_MS     20u
++#define NOALARM_MA_DEFAULT 50u
++#define TSENS_DC_DEFAULT 550
+ 
+ struct tc_chan {
+ 	vm_offset_t obs, chnl;  /* read (observer) and write channel of one peripheral */
+@@ -107,6 +120,9 @@ static struct {
+ 	vm_offset_t core, cnfg;
+ 	struct tc_chan fl, alarm;
+ 	bool alarm_gen2;
++	bool alarm_ok;                  /* 1062: the PMIC temperature alarm probed fine */
++	unsigned noalarm_ma;            /* 1062 */
++	int tsens_dc;                   /* 1062 */
+ 	unsigned max_ma, max_s;
+ 	bool ready, dead, lit, on_the_fly;
+ 	bool flash;                     /* 0933: lit as a flash (the safety timer running) */
+@@ -122,6 +138,10 @@ static volatile uint32_t torch_req_ms;  /* 0 = until max_s */
+ static volatile unsigned torch_level;   /* last sysctl level */
+ static LCK_GRP_DECLARE(torch_grp, "sweet_torch");
+ static LCK_MTX_DECLARE(torch_lock, &torch_grp);        /* 0933: the camera's flash calls and this thread */
++static volatile uint32_t torch_running;         /* 1062: torch_thread exists */
++static volatile uint32_t torch_reinit_req;      /* 1062: kern.sweet_torch_reinit while it runs */
++static unsigned torch_reinits;
++static int torch_alarm_pub;                     /* 1062: kern.sweet_torch_alarm */
+ 
+ static uint32_t
+ tc_rd32(vm_offset_t base, uint32_t off)
+@@ -193,11 +213,13 @@ tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
+ 		return -1;
+ 	}
+ 	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		int bus = sweet_spmi_bus_lock();        /* 1062: command, status and data as one */
+ 		if (write) {
+ 			tc_wr32(ch, 0x10, *val);
+ 		}
+ 		tc_wr32(ch, 0x00, ((write ? 0u : 1u) << 27) | ((uint32_t)reg << 4));
+ 		uint32_t st = 0;
++		uint8_t data = 0;
+ 		unsigned i;
+ 		for (i = 0; i < 1000; i++) {
+ 			st = tc_rd32(ch, 0x08);
+@@ -206,6 +228,10 @@ tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
+ 			}
+ 			delay(1);
+ 		}
++		if (i < 1000 && !write && !(st & 0xeu)) {
++			data = (uint8_t)tc_rd32(ch, 0x18);
++		}
++		sweet_spmi_bus_unlock(bus);
+ 		if (i == 1000) {
+ 			printf("SWEET TORCH: spmi %s %x:%#x timeout\n", write ? "write" : "read", c->sid, at);
+ 			tc.dead = true;
+@@ -219,7 +245,7 @@ tc_xfer(const struct tc_chan *c, bool write, uint8_t reg, uint8_t *val)
+ 			return -1;
+ 		}
+ 		if (!write) {
+-			*val = (uint8_t)tc_rd32(ch, 0x18);
++			*val = data;
+ 		}
+ 		return 0;
+ 	}
+@@ -455,7 +481,7 @@ tc_check(void)
+ 	uint8_t rt = 0, s1 = 0, s2 = 0, alarm = 0;
+ 	static uint8_t otst_said = 0xff;
+ 	if (tc_read(FL_INT_RT_STS, &rt) || tc_read(FL_STATUS1, &s1) || tc_read(FL_STATUS2, &s2) ||
+-	    tc_xfer(&tc.alarm, false, 0x08, &alarm)) {
++	    (tc.alarm_ok && tc_xfer(&tc.alarm, false, 0x08, &alarm))) {
+ 		tc.dead = true;
+ 		return false;
+ 	}
+@@ -466,6 +492,14 @@ tc_check(void)
+ 		tc.dead = true;
+ 		return false;
+ 	}
++	if (!tc.alarm_ok) {     /* 1062: tsens instead; off (not stopped) when hot */
++		int dc = sweet_thermal_torch_dc();
++		if (dc != -9999 && dc >= tc.tsens_dc) {
++			printf("SWEET TORCH: tsens %d.%d C >= %d.%d C (no temp alarm): off\n", dc / 10, dc % 10,
++			    tc.tsens_dc / 10, tc.tsens_dc % 10);
++			return false;
++		}
++	}
+ 	/*
+ 	 * r15c: STATUS1 0x1 and INT_RT_STS 0x4 for one check, 0.7 s after lighting, gone at the next read
+ 	 * with the LED still ramped up (0xd0). Linux only logs these (qpnp_flash_led_irq_handler); the
+@@ -490,8 +524,44 @@ tc_check(void)
+ 	return true;
+ }
+ 
++/* 1062: the cap per channel now (lower without the temperature alarm) */
++static unsigned
++tc_cap_ma(void)
++{
++	return tc.alarm_ok || tc.noalarm_ma > tc.max_ma ? tc.max_ma : tc.noalarm_ma;
++}
++
++/* 1062: the PM8150L temperature alarm (SID 4, 0x2400): TYPE 0x09, SUBTYPE 0x08 (GEN1) / 0x09 (GEN2), STATUS */
++static bool
++tc_probe_alarm(const char *why)
++{
++	uint8_t atype = 0, asub = 0, astatus = 0;
++	tc.alarm_ok = false;
++	torch_alarm_pub = 0;
++	for (unsigned t = 1; t <= ALARM_TRIES; t++) {
++		atype = asub = astatus = 0;
++		if (!tc_xfer(&tc.alarm, false, 0x04, &atype) && !tc_xfer(&tc.alarm, false, 0x05, &asub) &&
++		    !tc_xfer(&tc.alarm, false, 0x08, &astatus) && atype == 0x09 && (asub == 0x08 || asub == 0x09)) {
++			tc.alarm_gen2 = asub == 0x09;
++			tc.alarm_ok = true;
++			torch_alarm_pub = 1;
++			printf("SWEET TORCH: PM8150L temperature alarm GEN%u, status %#x (%s, try %u)\n", tc.alarm_gen2 ? 2 : 1,
++			    astatus, why, t);
++			return true;
++		}
++		printf("SWEET TORCH: PM8150L temperature alarm: type %#x subtype %#x: try %u of %u failed (%s)%s\n", atype, asub,
++		    t, ALARM_TRIES, why, t < ALARM_TRIES ? ", again in 20 ms" : "");
++		if (t < ALARM_TRIES) {
++			tc_sleep(ALARM_GAP_MS);
++		}
++	}
++	printf("SWEET TORCH: no temp alarm: torch limited to %u mA / thermal cutoff via tsens at %d.%d C (now %d)\n",
++	    tc_cap_ma(), tc.tsens_dc / 10, tc.tsens_dc % 10, sweet_thermal_torch_dc());
++	return false;
++}
++
+ static void
+-torch_thread(void *arg __unused, wait_result_t wr __unused)
++torch_thread(void *arg, wait_result_t wr __unused)
+ {
+ 	uint32_t mode = 0;
+ 	PE_parse_boot_argn("sweettorch", &mode, sizeof(mode));
+@@ -504,21 +574,25 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 	PE_parse_boot_argn("sweettorch_flash_ma", &tc.flash_ma, sizeof(tc.flash_ma));
+ 	tc.flash_ma = tc.flash_ma == 0 ? FLASH_MA_DEFAULT : tc.flash_ma > FLASH_MA_CAP ? FLASH_MA_CAP : tc.flash_ma;
+ 	tc.max_s = tc.max_s == 0 ? TORCH_S_DEFAULT : tc.max_s > TORCH_S_CAP ? TORCH_S_CAP : tc.max_s;
+-	tc_sleep(6000);
+-	tc.core = ml_io_map(SP_CORE_PA, 0x2000);
+-	tc.cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
+-	if (!tc.core || !tc.cnfg || !tc_find_channel(&tc.fl, FL_SID, FL_PERIPH, mode >= 2) ||
+-	    !tc_find_channel(&tc.alarm, 4, 0x24, false)) {
+-		goto out;
++	tc.noalarm_ma = NOALARM_MA_DEFAULT;
++	PE_parse_boot_argn("sweettorch_noalarm_ma", &tc.noalarm_ma, sizeof(tc.noalarm_ma));
++	tc.noalarm_ma = tc.noalarm_ma == 0 ? 1 : tc.noalarm_ma;
++	tc.tsens_dc = TSENS_DC_DEFAULT;
++	PE_parse_boot_argn("sweettorch_tsens_dc", &tc.tsens_dc, sizeof(tc.tsens_dc));
++	if (arg == NULL) {
++		tc_sleep(6000);
++	} else {
++		printf("SWEET TORCH: started again (kern.sweet_torch_reinit)\n");
+ 	}
+-	uint8_t atype = 0, asub = 0, astatus = 0;
+-	if (tc_xfer(&tc.alarm, false, 0x04, &atype) || tc_xfer(&tc.alarm, false, 0x05, &asub) ||
+-	    tc_xfer(&tc.alarm, false, 0x08, &astatus) || atype != 0x09 || (asub != 0x08 && asub != 0x09)) {
+-		printf("SWEET TORCH: PM8150L temperature alarm: type %#x subtype %#x: not usable\n", atype, asub);
++	if (!tc.core) {
++		tc.core = ml_io_map(SP_CORE_PA, 0x2000);
++		tc.cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
++	}
++	if (!tc.core || !tc.cnfg || (!tc.fl.obs && !tc_find_channel(&tc.fl, FL_SID, FL_PERIPH, mode >= 2)) ||
++	    (!tc.alarm.obs && !tc_find_channel(&tc.alarm, 4, 0x24, false))) {
+ 		goto out;
+ 	}
+-	tc.alarm_gen2 = asub == 0x09;
+-	printf("SWEET TORCH: PM8150L temperature alarm GEN%u, status %#x\n", tc.alarm_gen2 ? 2 : 1, astatus);
++	(void)tc_probe_alarm("start");  /* 1062: retried; without it the torch is limited, not refused */
+ 	uint8_t type = 0, sub = 0, chicken = 0;
+ 	if (tc_read(FL_TYPE, &type) || tc_read(FL_SUBTYPE, &sub)) {
+ 		goto out;
+@@ -542,8 +616,8 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	tc_dump("configured");
+ 	tc.ready = true;
+-	printf("SWEET TORCH: ready: at most %u mA per channel, %u s at a time; current change while lit %s\n",
+-	    tc.max_ma, tc.max_s, tc.on_the_fly ? "yes" : "no");
++	printf("SWEET TORCH: ready: at most %u mA per channel, %u s at a time; current change while lit %s%s\n",
++	    tc_cap_ma(), tc.max_s, tc.on_the_fly ? "yes" : "no", tc.alarm_ok ? "" : "; no temp alarm (tsens cutoff)");
+ 	if (mode >= 3) {
+ 		(void)sweet_torch_set(5, 400);
+ 	}
+@@ -552,19 +626,25 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 		uint64_t deadline;
+ 		clock_interval_to_deadline(tc.lit ? 100 : 60000, NSEC_PER_MSEC, &deadline);
+ 		(void)assert_wait_deadline(&torch_chan, THREAD_UNINT, deadline);
+-		if (torch_req & (1u << 31)) {
++		if ((torch_req & (1u << 31)) || torch_reinit_req) {
+ 			clear_wait(current_thread(), THREAD_AWAKENED);
+ 		} else {
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		}
+ 		lck_mtx_lock(&torch_lock);
++		if (__atomic_exchange_n(&torch_reinit_req, 0, __ATOMIC_ACQ_REL)) {
++			(void)tc_probe_alarm("kern.sweet_torch_reinit");      /* 1062 */
++			if (tc.lit && !tc.flash && tc.lit_ma > tc_cap_ma()) {
++				(void)tc_on(tc_cap_ma());
++			}
++		}
+ 		uint32_t req = __atomic_exchange_n(&torch_req, 0, __ATOMIC_ACQ_REL);
+ 		uint64_t now = mach_absolute_time();
+ 		if (req & (1u << 31)) {
+-			unsigned ma = req & 0xffffu, ms = torch_req_ms;
++			unsigned ma = req & 0xffffu, ms = torch_req_ms, cap = tc_cap_ma();
+ 			if (ma == 0) {
+ 				tc_off("asked");
+-			} else if (tc_on(ma > tc.max_ma ? tc.max_ma : ma) == 0) {
++			} else if (tc_on(ma > cap ? cap : ma) == 0) {
+ 				uint64_t span;
+ 				unsigned limit = ms && ms < tc.max_s * 1000u ? ms : tc.max_s * 1000u;
+ 				nanoseconds_to_absolutetime((uint64_t)limit * NSEC_PER_MSEC, &span);
+@@ -572,7 +652,10 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 		}
+ 		if (tc.lit) {
+-			if (!tc_check()) {
++			if (!tc_check() && !tc.dead) {
++				tc_off("tsens");       /* 1062: hot without the alarm: off, the driver stays */
++				torch_level = 0;
++			} else if (tc.dead) {
+ 				uint8_t raw[0x16];
+ 				for (unsigned i = 0; i < sizeof(raw); i++) {
+ 					if (tc_read((uint8_t)(0x06 + i), &raw[i])) {
+@@ -599,6 +682,7 @@ torch_thread(void *arg __unused, wait_result_t wr __unused)
+ 	lck_mtx_unlock(&torch_lock);
+ out:
+ 	tc.ready = false;
++	__atomic_store_n(&torch_running, 0, __ATOMIC_RELEASE);
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -673,12 +757,57 @@ sysctl_sweet_torch SYSCTL_HANDLER_ARGS
+ 		return EINVAL;
+ 	}
+ 	torch_level = (unsigned)value;
+-	unsigned ma = value == 0 ? 0 : (tc.max_ma * (unsigned)value + 999u) / 1000u;
++	unsigned ma = value == 0 ? 0 : (tc_cap_ma() * (unsigned)value + 999u) / 1000u;
+ 	return sweet_torch_set(ma, 0);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_torch, "I", "SWEET flashlight: level 0..1000 (0 off)");
+ 
++/* 1062: write 1 = probe the temperature alarm again; if the driver had stopped, start it again (no 6 s wait) */
++static int
++sysctl_sweet_torch_reinit SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, (int)torch_reinits, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value != 1) {
++		return EINVAL;
++	}
++	uint32_t mode = 0;
++	PE_parse_boot_argn("sweettorch", &mode, sizeof(mode));
++	if (!mode) {
++		return ENODEV;
++	}
++	torch_reinits++;
++	if (__atomic_load_n(&torch_running, __ATOMIC_ACQUIRE) && tc.ready && !tc.dead) {
++		__atomic_store_n(&torch_reinit_req, 1, __ATOMIC_RELEASE);
++		thread_wakeup(&torch_chan);
++		return 0;
++	}
++	uint32_t idle = 0;
++	if (!__atomic_compare_exchange_n(&torch_running, &idle, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++		return EBUSY;   /* still starting or stopping */
++	}
++	lck_mtx_lock(&torch_lock);
++	tc.dead = false;
++	tc.lit = tc.flash = false;
++	lck_mtx_unlock(&torch_lock);
++	thread_t t;
++	if (kernel_thread_start(torch_thread, (void *)1, &t) != KERN_SUCCESS) {
++		__atomic_store_n(&torch_running, 0, __ATOMIC_RELEASE);
++		return ENOMEM;
++	}
++	thread_deallocate(t);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_torch_reinit, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_torch_reinit, "I", "1062: 1 = probe the temperature alarm again / restart the torch driver");
++SYSCTL_INT(_kern, OID_AUTO, sweet_torch_alarm, CTLFLAG_RD | CTLFLAG_LOCKED, &torch_alarm_pub, 0,
++    "1062: 1 = the PMIC temperature alarm is in use");
++
+ void
+ sweet_torch_init(void)
+ {
+@@ -688,8 +817,11 @@ sweet_torch_init(void)
+ 		return;
+ 	}
+ 	thread_t t;
++	__atomic_store_n(&torch_running, 1, __ATOMIC_RELEASE);
+ 	if (kernel_thread_start(torch_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
++	} else {
++		__atomic_store_n(&torch_running, 0, __ATOMIC_RELEASE);
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.43.0
+
