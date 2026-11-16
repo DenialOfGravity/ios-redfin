@@ -617,7 +617,8 @@ static LCK_MTX_DECLARE(p1_lock, &nfc_lock_group);
 static kern_ctl_ref gw_ctl;
 static uint32_t nfc_p1, nfc_gw_mode;
 static uint32_t nfc_id_bits = 1, nfc_id_info = 0x4202016au;   /* 1125: hw 0x42 = PN80V (was 0x51) */
-static uint32_t nfc_fwif = 0x0015;     /* 1125: 2F 03 answer; libNFC_Comet MwFwCompatibilityChkProcess wants 0x15 for hw 0x42 */
+static uint32_t nfc_fwif = 0x0015;     /* 1125/1127: 2F 19 answer; MwFwCompatibilityChkProcess wants 0x15 for hw 0x42 */
+static uint32_t nfc_fwif_fmt;          /* 1127: kern.sweet_nfc_fwif_fmt, persona variants (see persona_packet) */
 static volatile bool gw_dereg_pending; /* 1125: withdrawn while a client was connected: deregister at its close */
 static uint32_t gw_conns;
 static struct { uint16_t op; uint16_t n; } persona_seen[32];   /* 1125: (gid << 8 | oid, count) answered by the persona */
@@ -632,6 +633,10 @@ static struct {
 	unsigned asm_n;
 	uint8_t asm_buf[3 + 255];
 	uint8_t termios[72];
+	bool pend, crc_rx, crc_out;     /* 1127: packet held for a CRC16 trailer; CRC seen this session; reply gets CRC */
+	unsigned pend_n, crc_k;
+	uint16_t pend_crc;
+	uint8_t pend_buf[3 + 255];
 } gw;
 
 static bool
@@ -929,6 +934,33 @@ local_init(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned ca
  *     (nothing is ever found: the field stays off) and RF_DEACTIVATE are acknowledged; NFCEE_DISCOVER = 0 NFCEEs.
  *   - not answered (refused as before): NFCEE_MODE_SET/POWER, CORE_CONN_CREATE, RF_GET_LISTEN_MODE_ROUTING,
  *     RF_DISCOVER_SELECT, data. DownloadRequest(1) is still refused.
+ * 1127: 1125 took 2F 03 for GetFwInterfaceVersion. It is not: the NXP command builders load the header {MT 1, GID 0x0F}
+ * from 0x1f51e3160 and store the OID at [sp,#8]: 2F 00 SendStandby (0x1f513d304), 2F 02 EnableExtn (0x1f51ce31c),
+ * 2F 03 ConfigHsuBr (0x1f51302c0; the host's 2F 03 08 .. is the HSU baud-rate set, init step 2 after CORE_INIT),
+ * 2F 06 GetFwType (0x1f51475c4), 2F 19 GetFwInterfaceVersion (0x1f5137d38). Response checks:
+ *   2F 03 phNciNfc_ConfigHsuBrCmdRsp 0x1f516a154: payload length must be exactly 1 and status 0. 1125's 3-byte answer
+ *     gave "Configure HSU baud rate failed!" -> power cycle -> DownloadRequest(1) (phone run p16).
+ *   2F 19 phNciNfc_GetFwInterfaceVersionRsp 0x1f5169f34: length exactly 3, status 0 (status 1 or 5 = "OLD FW" 0x80);
+ *     bytes 1,2 -> ctx+0x1120, compared after ldrh + rev16 (big endian) with 0x15 for hw 0x42
+ *     (MwFwCompatibilityChkProcess 0x1f51781ec).
+ *   2F 02 phNciNfc_EnableExtnRsp 0x1f51ce41c: length exactly 5, status 0; bytes 1..4 -> ctx+0xb30 (big endian word,
+ *     phLibNfc_EnableExtnProcess 0x1f5178430). We send the identity bytes.
+ *   2F 06 phNciNfc_GetFwTypeRsp 0x1f51476c4: length 2 (status 0 + type) or >= 22 (longer info form). We send 2.
+ *   2F 00 phNciNfc_ProcessStandbyRsp 0x1f516a054: length 1, status 0 (0xF1 = express/VAS busy).
+ * Init table gphLibNfc_InitializeSequence 0x2125326f8 (pairs cmd/process): Initialize, ConfigHsuBr (2F 03),
+ * ReApplyHsuBr (2F 03 again), CrcConfig, ReInitialize, MwFwCompatibilityChk (2F 19), EnablePropExtn (2F 02),
+ * GetFwType (2F 06), DisableStandbyMode (2F 00), GetEepromParams, InitSetConfig, ... NFCEE discovery, complete.
+ * CORE_RESET_NTF: not needed (p16: the NCI 1.0 RSP alone moved the stack on to CORE_INIT and the CORE_INIT_RSP was
+ * accepted, it went on to ConfigHsuBr).
+ * CRC: CrcConfig (0x1f5139bd8) may turn on the stack's CRC (CRC-16/CCITT-FALSE: init 0xFFFF, poly 0x1021, MSB first,
+ * appended big endian, phNciNfc_CalcCrc16 0x1f51da7ac / CoreUtilsAppendCrc 0x1f5139054); CrcConfigProcess
+ * 0x1f5177f90 sets the check flag (ctx+0x146c) and maybe IO_STOCKHOLM_CRC through phTmlNfc_IoCtl 0x46/0x47.
+ * In persona mode a host packet followed in the same write by its valid CRC16 has the trailer taken off and
+ * logged. kern.sweet_nfc_fwif_fmt (default 0) picks the variant without a rebuild:
+ *   bits 0-1  reply CRC16: 0 mirror (a reply gets a CRC iff the command it answers had one), 1 never, 2 on every
+ *             reply once the host sent one CRC frame or set IO_STOCKHOLM_CRC this session
+ *   bit 2 (4) 1125 answers to 2F xx (2F 03 = 3-byte interface version, other 2F = status only), for A/B
+ *   bit 3 (8) GetFwType (2F 06) type byte 0x01 instead of 0x00
  */
 static void
 persona_note(uint16_t op)
@@ -962,12 +994,40 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 	r[1] = oid;
 	if (gid == 0x0f) {
 		r[len++] = 0x00;
-		if (oid == 0x03) {
-			r[len++] = (uint8_t)(nfc_fwif >> 8);
-			r[len++] = (uint8_t)nfc_fwif;
-			what = "NXP GetFwInterfaceVersion: OK + interface version";
+		if (nfc_fwif_fmt & 4) {         /* 1127: the 1125 answers, for A/B */
+			if (oid == 0x03) {
+				r[len++] = (uint8_t)(nfc_fwif >> 8);
+				r[len++] = (uint8_t)nfc_fwif;
+				what = "(fmt 4, 1125) 2F 03 as interface version";
+			} else {
+				what = "(fmt 4, 1125) NXP proprietary: OK, no data";
+			}
 		} else {
-			what = "NXP proprietary: OK, no data";
+			switch (oid) {
+			case 0x00:
+				what = "NXP SetStandby/power mode (2F 00): OK";
+				break;
+			case 0x02:
+				id_bytes(r + len);
+				len += 4;
+				what = "NXP EnablePropExtn (2F 02): OK + 4 info bytes (identity)";
+				break;
+			case 0x03:
+				what = "NXP ConfigHsuBr (2F 03): OK, 1-byte status (baud rate taken, nothing changes)";
+				break;
+			case 0x06:
+				r[len++] = (nfc_fwif_fmt & 8) ? 0x01 : 0x00;
+				what = "NXP GetFwType (2F 06): OK + type";
+				break;
+			case 0x19:
+				r[len++] = (uint8_t)(nfc_fwif >> 8);
+				r[len++] = (uint8_t)nfc_fwif;
+				what = "NXP GetFwInterfaceVersion (2F 19): OK + version (big endian)";
+				break;
+			default:
+				what = "NXP proprietary: OK, no data";
+				break;
+			}
 		}
 	} else {
 		switch ((gid << 8) | oid) {
@@ -1049,9 +1109,28 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 	out_put(out, no, cap, r, len);
 	persona_note((uint16_t)((gid << 8) | oid));
 	if (persona_said++ < 400) {
-		SAY("persona: %02x %02x -> %s\n", p[0], p[1], what);
+		char h[3 * 40 + 4];
+
+		hex(h, sizeof(h), r, len > 40 ? 40 : len);
+		SAY("persona: %02x %02x -> %s: [%s%s]%s\n", p[0], p[1], what, h, len > 40 ? " .." : "",
+		    gw.crc_out ? " +CRC16" : "");
 	}
 	return true;
+}
+
+/* 1127: CRC-16/CCITT-FALSE as libNFC_Comet's phNciNfc_CalcCrc16 (init 0xFFFF, poly 0x1021, MSB first) */
+static uint16_t
+nci_crc16(const uint8_t *b, unsigned n)
+{
+	uint16_t c = 0xffff;
+
+	for (unsigned i = 0; i < n; i++) {
+		c ^= (uint16_t)((uint16_t)b[i] << 8);
+		for (int k = 0; k < 8; k++) {
+			c = (c & 0x8000) ? (uint16_t)((c << 1) ^ 0x1021) : (uint16_t)(c << 1);
+		}
+	}
+	return c;
 }
 
 static void
@@ -1393,9 +1472,11 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
 	gw.asm_n = 0;
 	gw.rf_active = false;
 	gw.crc = gw.on_demand = 0;
+	gw.pend = gw.crc_rx = gw.crc_out = false;       /* 1127 */
 	strlcpy(gw.who, who, sizeof(gw.who));
 	if (++gw_conns <= 3) {
 		gw_said = 0;            /* 1125: full packet log for each of the first three sessions */
+		persona_said = 0;       /* 1127: and the persona lines */
 	}
 	lck_mtx_unlock(&gw_lock);
 	SAY("com.apple.uart.stockholm: OPEN by %s (pid %d), unit %u, gateway mode %u\n", who, proc_selfpid(), sac->sc_unit,
@@ -1428,6 +1509,76 @@ gw_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unit
 	return 0;
 }
 
+/* 1127: the persona is on (mode 0, kern.sweet_nfc_id bit 2): host packets go through gw_pend_* */
+static bool
+persona_on(void)
+{
+	return (nfc_id_bits & 4) && nfc_gw_mode != 1;
+}
+
+/* 1127: answer the held packet; had_crc: its CRC16 trailer came and matched. gw_lock held. */
+static void
+gw_pend_flush(bool had_crc, uint8_t *out, unsigned *no, unsigned cap, bool *want_up)
+{
+	unsigned first = *no, mode = nfc_fwif_fmt & 3;
+
+	gw.pend = false;
+	gw.crc_k = 0;
+	if (had_crc && !gw.crc_rx) {
+		gw.crc_rx = true;
+		SAY("1127: host packets now carry a CRC16 trailer (first on %02x %02x, crc %04x): taken off; reply CRC mode %u\n",
+		    gw.pend_buf[0], gw.pend_buf[1], gw.pend_crc, mode);
+	}
+	gw.crc_out = mode == 0 ? had_crc : mode == 2 ? (gw.crc_rx || gw.crc != 0) : false;
+	gw_host_packet(gw.pend_buf, gw.pend_n, out, no, cap, want_up);
+	if (gw.crc_out && *no > first) {
+		uint8_t t[1024];
+		unsigned k = first, tn = 0, pk = 0;
+
+		while (k + 3 <= *no) {
+			unsigned pl = 3u + out[k + 2];
+			uint16_t c;
+
+			if (k + pl > *no || tn + pl + 2 > sizeof(t)) {
+				break;
+			}
+			memcpy(t + tn, out + k, pl);
+			c = nci_crc16(out + k, pl);
+			t[tn + pl] = (uint8_t)(c >> 8);
+			t[tn + pl + 1] = (uint8_t)c;
+			tn += pl + 2;
+			k += pl;
+			pk++;
+		}
+		if (k == *no && first + tn <= cap) {
+			memcpy(out + first, t, tn);
+			*no = first + tn;
+			if (persona_said < 400) {
+				SAY("1127: +CRC16 on %u reply packet(s)\n", pk);
+			}
+		}
+	}
+	gw.crc_out = false;
+}
+
+/* 1127: a whole host packet in gw.asm_buf: hold it for a CRC16 trailer (persona) or answer it now */
+static void
+gw_packet_done(unsigned need, uint8_t *out, unsigned *no, unsigned cap, bool *want_up)
+{
+	if (!persona_on()) {
+		gw_host_packet(gw.asm_buf, need, out, no, cap, want_up);
+		return;
+	}
+	if (gw.pend) {
+		gw_pend_flush(false, out, no, cap, want_up);
+	}
+	memcpy(gw.pend_buf, gw.asm_buf, need);
+	gw.pend_n = need;
+	gw.pend_crc = nci_crc16(gw.asm_buf, need);
+	gw.crc_k = 0;
+	gw.pend = true;
+}
+
 static errno_t
 gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
 {
@@ -1447,6 +1598,23 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, 
 
 		gw_host_bytes += (uint32_t)len;
 		while (i < len) {
+			if (gw.pend && gw.asm_n == 0) {         /* 1127: a CRC16 trailer for the held packet? */
+				uint8_t want = gw.crc_k == 0 ? (uint8_t)(gw.pend_crc >> 8) : (uint8_t)gw.pend_crc;
+
+				if (d[i] == want) {
+					i++;
+					if (++gw.crc_k == 2) {
+						gw_pend_flush(true, out, &no, sizeof(out), &want_up);
+					}
+					continue;
+				}
+				bool half = gw.crc_k == 1;
+
+				gw_pend_flush(false, out, &no, sizeof(out), &want_up);
+				if (half) {                     /* that byte was the next packet's first, not CRC */
+					gw.asm_buf[gw.asm_n++] = (uint8_t)(gw.pend_crc >> 8);
+				}
+			}
 			if (gw.asm_n == 0 && gw.crc && len - i == 2) {
 				SAY("host> 2 trailing bytes [%02x %02x] after a packet with CRC on: taken as CRC16, dropped\n", d[i],
 				    d[i + 1]);
@@ -1469,14 +1637,22 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, 
 			gw.asm_n += take;
 			i += take;
 			if (gw.asm_n == need) {
-				gw_host_packet(gw.asm_buf, need, out, &no, sizeof(out), &want_up);
+				gw_packet_done(need, out, &no, sizeof(out), &want_up);
 				gw.asm_n = 0;
 			}
 		}
 		/* a header with a zero-length payload completes at the third byte */
 		if (gw.asm_n == 3 && gw.asm_buf[2] == 0) {
-			gw_host_packet(gw.asm_buf, 3, out, &no, sizeof(out), &want_up);
+			gw_packet_done(3, out, &no, sizeof(out), &want_up);
 			gw.asm_n = 0;
+		}
+	}
+	if (gw.pend) {                  /* 1127: the write ended without a (whole) CRC16 trailer */
+		bool half = gw.crc_k == 1;
+
+		gw_pend_flush(false, out, &no, sizeof(out), &want_up);
+		if (half) {
+			gw.asm_buf[gw.asm_n++] = (uint8_t)(gw.pend_crc >> 8);
 		}
 	}
 	memcpy(copy, out, no);
@@ -1798,7 +1974,10 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_id_
 SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id_info, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_id_info, 0,
     "redfin 1119/1125: identity bytes hw.rom.fwmajor.fwminor (default 0x4202016a = PN80V, ROM 2, PN552 FW 02.01.6A)");
 SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif, 0,
-    "redfin 1125: persona answer to NXP 2F 03 GetFwInterfaceVersion (default 0x15, what hw 0x42 needs)");
+    "redfin 1125/1127: persona answer to NXP 2F 19 GetFwInterfaceVersion, big endian (default 0x15, what hw 0x42 needs)");
+SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif_fmt, 0,
+    "redfin 1127: persona variants: bits 0-1 reply CRC16 (0 mirror the host, 1 never, 2 always once seen/IO_STOCKHOLM_CRC); "
+    "4 = 1125 answers to 2F xx; 8 = GetFwType type 1");
 
 static int
 sysctl_nfc_persona SYSCTL_HANDLER_ARGS
