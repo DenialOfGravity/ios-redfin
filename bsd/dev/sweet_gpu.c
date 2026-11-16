@@ -1822,6 +1822,40 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_early_retire, CTLTYPE_INT | CTLFLAG_RW | C
     0, 0, sysctl_sweet_fb_early_retire, "I", "SWEET FB: early swap retire mask (1 tick, 2 rekick, 4 SwapWait poll)");
 
 /*
+ * 1126: sysctls over the swap-ring pokes (SweetFramebuffer.cpp), so SweetControl boot pins can hold them:
+ *   kern.sweet_swapdone   MASK, as p swapdone N / boot-arg sweetswapdone (0987: 1 tick at swap done, 2 trace); default 0
+ *   kern.sweet_pace       MODE, as p pace N / boot-arg sweetpace (0977/0984: &7 mode 0..3, 16 gate on queue); default 0
+ *   kern.sweet_pace_min   US,   as p pace MODE MIN / boot-arg sweetpace_min (0983); default 8000. 0 is refused
+ *                         (EINVAL): the poke reads MIN 0 as "keep"; the pace code clamps below 1000 us to 1000
+ * A write goes through the poke handler (fbCmd), so the pace timer/owed tick are handled exactly as for the poke.
+ * Unsigned decimal like the poke: negative values are refused.
+ */
+extern uint32_t sweet_fb_knob_get(int k);
+extern void sweet_fb_knob_set(int k, uint32_t v);
+static int
+sysctl_sweet_fb_knob SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1)
+	int k = arg2;
+	int value = (int)sweet_fb_knob_get(k), changed = 0;
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || (k == 2 && value == 0)) {
+		return EINVAL;
+	}
+	sweet_fb_knob_set(k, (uint32_t)value);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_swapdone, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_fb_knob, "I", "SWEET FB: swapdone mask (1 tick at swap done, 2 trace) = p swapdone");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_pace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 1, sysctl_sweet_fb_knob, "I", "SWEET FB: pace mode = p pace N");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_min, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 2, sysctl_sweet_fb_knob, "I", "SWEET FB: pace min interval in us (>0) = p pace MODE MIN");
+
+/*
  * 1042: kern.sweet_vsync_lock 0|1 (default 0 = as before): 0995's vsync options as a runtime switch (the cmdline is full):
  * 1 = sweetvsync 7 + sweetfb_refresh 1 (SweetFramebuffer.cpp sweet_vlock): ticks without slop on the panel's measured
  * period (INTF1 frame counter), IOMFBDisplayRefresh published from it. 0 = the values from before.

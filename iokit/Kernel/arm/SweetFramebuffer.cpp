@@ -6361,6 +6361,47 @@ sweet_fb_cmd(const char *s, const char *end)
 }
 
 /*
+ * 1126: kern.sweet_swapdone / kern.sweet_pace / kern.sweet_pace_min (bsd/dev/sweet_gpu.c) read the 0984/0987
+ * variables here and write them through fbCmd, the same code path as p swapdone N / p pace N [MIN_US] (so a pace
+ * change drops a pending mode-3 timer and releases an owed tick exactly as the poke does). Before the framebuffer
+ * has started (no instance) the variables are only stored; start() logs and uses them as for the boot-args.
+ *   k 0 swapdone, 1 pace (mode), 2 pace_min (us)
+ */
+extern "C" uint32_t sweet_fb_knob_get(int k);
+uint32_t
+sweet_fb_knob_get(int k)
+{
+	return k == 0 ? sweet_swapdone : k == 1 ? sweet_pace : sweet_pace_min;
+}
+
+extern "C" void sweet_fb_knob_set(int k, uint32_t v);
+void
+sweet_fb_knob_set(int k, uint32_t v)
+{
+	char cmd[40];
+	if (k == 0) {
+		snprintf(cmd, sizeof(cmd), "swapdone %u", v);
+	} else if (k == 1) {
+		snprintf(cmd, sizeof(cmd), "pace %u", v);       /* no MIN: the poke keeps sweet_pace_min */
+	} else {
+		snprintf(cmd, sizeof(cmd), "pace %u %u", sweet_pace, v);
+	}
+	if (sweet_fb_instance == NULL) {
+		if (k == 0) {
+			sweet_swapdone = v;
+		} else if (k == 1) {
+			sweet_pace = v;
+		} else {
+			sweet_pace_min = v;
+		}
+		IOLog("SWEET FB: 1126 sysctl %s (no framebuffer yet: stored)\n", cmd);
+		return;
+	}
+	IOLog("SWEET FB: 1126 sysctl -> p %s\n", cmd);
+	sweet_fb_instance->fbCmd(cmd, cmd + strlen(cmd));
+}
+
+/*
  * ---- 0944 (sweetfbx & 4): present at SwapEnd, ticks on the TE ----
  *
  * SwapEnd queues the frame (two at most) and wakes the present thread, which blits it at once instead of on the
