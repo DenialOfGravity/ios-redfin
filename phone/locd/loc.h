@@ -41,4 +41,7 @@ int loc_lock_busy(void);
 /* ws-gnss-g: 1 while only the EFS write-back wait (after a confirmed restore) is left: sweetlocd stays up for it, up to
  * loc.c's EFS_WAIT_MS (900 s), instead of giving up after 60 s */
 int loc_efs_waiting(void);
+/* ws-gnss-i probe2=1: 1 once every probe2 GET is answered (sweetlocd then exits); the send whitelist */
+int loc_probe2_done(void);
+int loc_probe2_allowed(uint16_t id);
 #endif

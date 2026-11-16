@@ -230,7 +230,9 @@ int main(int argc, char **argv)
 			why = stop_sig == SIGTERM ? "SIGTERM" : stop_sig == SIGINT ? "SIGINT" : "SIGHUP";
 		}
 		if (!why) {
-			if (loc_on_present())
+			if (loc_probe2_done())
+				why = "probe2 done";
+			else if (loc_on_present())
 				gone_since = 0;
 			else if (!gone_since)
 				gone_since = now;

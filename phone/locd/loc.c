@@ -9,6 +9,14 @@
  *   probe=1      P0a: once per loc.on change (and per LOC server appearance): INFORM_CLIENT_REVISION 2, then the
  *                read-only GET_SERVICE_REVISION, GET_ENGINE_LOCK, GET_FIX_CRITERIA, GET_PREDICTED_ORBITS_DATA_SOURCE;
  *                each response and its indication are logged with every TLV (qmi_dump). Changes nothing in the modem.
+ *   probe2=1     (ws-gnss-i, research gnss-signal-2026-11-16 E1) read-only: INFORM_CLIENT_REVISION 2, then the zero-TLV
+ *                GETs GET_CONSTELLATION_CONTROL 0xBF (per-constellation status TLVs 0x10-0x15 decoded: 101 disabled
+ *                internally, 103 NO_MEMORY, ...), GET_SUPPORTED_FEATURE 0xA9, GET_SUPPORTED_MSGS 0x1E, GET_BLACKLIST_SV
+ *                0xB7, GET_MULTIBAND_CONFIG 0xE1, GET_SBAS_CONFIG 0x3D, GET_NMEA_TYPES 0x3F, GET_OPERATION_MODE 0x4B,
+ *                GET_MIN_GPS_WEEK_NUMBER 0xD5, GET_EXTERNAL_POWER_CONFIG 0x52, one at a time (response + indication, every
+ *                TLV in hex), then sweetlocd exits (no EFS wait: nothing was written). While set, every other word is
+ *                ignored, engine lock work (restore/repair) is not run, and send_next refuses any message ID outside
+ *                probe2_ids[] (no SET, START, INJECT or engine lock message can leave).
  *   pds=1        the bridge: the kernel router (xnu 1122/1124 relay) hands locationd's PDS requests to pdsemu.c; while
  *                locationd's SET_AUTO_TRACKING_STATE is on, a periodic LOC session runs (REG_EVENTS 0x183, START at
  *                locationd's interval) and every LOC POSITION_REPORT becomes a PDS EVENT_REPORT indication (TLV 0x12
@@ -95,7 +103,7 @@
 #define MAX_FAILS	3
 #define RESP_MS		5000
 #define IND_MS		3000
-#define NQ		12
+#define NQ		16
 #ifndef EFS_DIR				/* wland's rmtfs files (phone/wifi/rmtfs.c RMTFS_DIR); the host test points it elsewhere */
 #define EFS_DIR		"/var/local/fw/rmtfs"
 #endif
@@ -114,6 +122,9 @@ static uint32_t srv_node, srv_port, srv_inst;
 static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2 none */
 static int w_client, w_clientid, w_opmode, w_start_android, w_lockclient, w_lockev;	/* ws-gnss-f; w_client 1 afw, 2 nfw */
 static int w_time;			/* ws-gnss-g time=1 */
+static int w_probe2, probe2_state;	/* ws-gnss-i probe2=1; state 1 queued, 2 done */
+static unsigned probe2_refused;
+static uint64_t probe2_gen_done = ~0ull;
 static uint32_t w_timeunc = 5000;	/* ws-gnss-g timeunc=MS (default 5 s: the AP clock is not known to be network-synced) */
 static uint64_t time_last_inject;	/* link_ms of the last INJECT_UTC_TIME sent (0 = none) */
 static unsigned n_time_req, n_time_inj, n_time_ok, n_xtra_req, n_pos_req, n_sv;
@@ -123,6 +134,7 @@ static char on_text[256];
 static uint64_t next_check, probe_gen_done = ~0ull, on_gen, sess_gen_done = ~0ull;
 static int fails, dropped, rev_sent, after_drop;
 static void q_stop(void);
+static int probe2_refuse(uint16_t id);
 static int time_ok(uint64_t *ms);
 static void efs_log_now(const char *why);
 static void lk_event(int ok, const struct qmi_msg *m);
@@ -297,6 +309,10 @@ static void enqueue(uint16_t id, const uint8_t *tl, uint16_t tn, int want_ind, c
 
 static void fail(const char *what)
 {
+	if (w_probe2) {		/* probe2: an unsupported GET is a result, not a failure; go on with the next */
+		printf("[%6llu] loc: probe2: %s (logged; next GET)\n", now_ms(), what);
+		return;
+	}
 	fails++;
 	printf("[%6llu] loc: %s (failure %d of %d)\n", now_ms(), what, fails, MAX_FAILS);
 	if (fails >= MAX_FAILS && !dropped) {
@@ -321,6 +337,12 @@ static void send_next(void)
 		if (!txn_next)
 			txn_next = 1;
 		lkq.pending = 0;
+		if (w_probe2) {		/* probe2: no engine lock message ever leaves (lk_poll does not run either) */
+			probe2_refuse(lkq.id);
+			if (loc_probe2_allowed(lkq.id))
+				printf("[%6llu] loc: probe2: engine lock request 0x%04x dropped\n", now_ms(), lkq.id);
+			return;
+		}
 		qmi_start(&lb, QMI_REQUEST, ltxn, lkq.id);
 		memcpy(lb.b + lb.n, lkq.tl, lkq.tn);
 		lb.n += lkq.tn;
@@ -349,6 +371,11 @@ static void send_next(void)
 	struct req r = q[0];
 	memmove(q, q + 1, (size_t)(qn - 1) * sizeof(q[0]));
 	qn--;
+	if (probe2_refuse(r.id) || (w_probe2 && r.tn && r.id != LOC_INFORM_CLIENT_REV)) {
+		if (w_probe2 && r.tn && loc_probe2_allowed(r.id))
+			printf("[%6llu] loc: probe2: REFUSED 0x%04x with %u TLV bytes (probe2 GETs carry none)\n", now_ms(), r.id, r.tn);
+		return;
+	}
 	if (r.id == LOC_INJECT_UTC_TIME) {	/* ws-gnss-g: the time as it is now, not when it was queued */
 		uint64_t ms;
 		if (!time_ok(&ms))
@@ -476,6 +503,88 @@ static void session_start(int owner, uint32_t interval)
 	status_dirty = 1;
 	printf("[%6llu] loc: session start for %s, interval %u ms\n", now_ms(), owner == 1 ? "locationd (pds=1)" : "test (session=)",
 	       interval);
+}
+
+/* ws-gnss-i probe2=1: the only message IDs probe2 mode may send (all zero-TLV GETs, plus INFORM_CLIENT_REVISION) */
+static const uint16_t probe2_ids[] = { LOC_INFORM_CLIENT_REV, 0x00bf, 0x00a9, 0x001e, 0x00b7, 0x00e1, 0x003d, 0x003f, 0x004b,
+				       0x00d5, 0x0052 };
+static const char *const probe2_names[] = { "INFORM_CLIENT_REVISION", "GET_CONSTELLATION_CONTROL", "GET_SUPPORTED_FEATURE",
+	"GET_SUPPORTED_MSGS", "GET_BLACKLIST_SV", "GET_MULTIBAND_CONFIG", "GET_SBAS_CONFIG", "GET_NMEA_TYPES",
+	"GET_OPERATION_MODE", "GET_MIN_GPS_WEEK_NUMBER", "GET_EXTERNAL_POWER_CONFIG" };
+int loc_probe2_allowed(uint16_t id)
+{
+	for (unsigned i = 0; i < sizeof(probe2_ids) / sizeof(probe2_ids[0]); i++)
+		if (probe2_ids[i] == id)
+			return 1;
+	return 0;
+}
+
+static int probe2_refuse(uint16_t id)
+{
+	if (!w_probe2 || loc_probe2_allowed(id))
+		return 0;
+	probe2_refused++;
+	printf("[%6llu] loc: probe2: REFUSED 0x%04x (not a whitelisted read-only GET): not sent\n", now_ms(), id);
+	return 1;
+}
+
+static void probe2_queue(void)
+{
+	uint8_t t[16];
+	uint32_t n = loc_tlv_client_rev(t, 2);
+	if (!rev_sent) {
+		enqueue(LOC_INFORM_CLIENT_REV, t, (uint16_t)n, 0, "INFORM_CLIENT_REVISION 2 (probe2)");
+		rev_sent = 1;
+	}
+	for (unsigned i = 1; i < sizeof(probe2_ids) / sizeof(probe2_ids[0]); i++)
+		enqueue(probe2_ids[i], NULL, 0, 1, probe2_names[i]);
+	probe2_state = 1;
+	printf("[%6llu] loc: probe2: %u read-only GETs queued (zero TLVs each)\n", now_ms(),
+	       (unsigned)(sizeof(probe2_ids) / sizeof(probe2_ids[0]) - 1));
+}
+
+static const char *cc_status(uint32_t v)
+{
+	switch (v) {
+	case 0: case 1: case 2: return "enabled";
+	case 100: return "UNSUPPORTED";
+	case 101: return "DISABLED INTERNALLY (101: NV)";
+	case 102: return "disabled by client (102)";
+	case 103: return "NO_MEMORY (103: memshare)";
+	default: return "unknown";
+	}
+}
+
+/* every TLV of a probe2 response/indication in hex, one line each; 0xBF: the per-constellation status in words */
+static void probe2_decode(const struct qmi_msg *m, const char *kind)
+{
+	for (uint32_t o = 0; o + 3 <= m->len;) {
+		uint16_t l = (uint16_t)(m->tlv[o + 1] | m->tlv[o + 2] << 8);
+		printf("[%6llu] loc: probe2 0x%04x %s TLV 0x%02x len %u:", now_ms(), m->id, kind, m->tlv[o], l);
+		for (uint16_t k = 0; k < l && o + 3 + k < m->len; k++)
+			printf(" %02x", m->tlv[o + 3 + k]);
+		printf("\n");
+		o += 3u + l;
+	}
+	if (m->id == 0x00bf && m->type == QMI_INDICATION) {
+		static const char *const cn[6] = { "GPS", "GLONASS", "BEIDOU", "QZSS", "GALILEO", "NAVIC" };
+		for (int i = 0; i < 6; i++) {
+			uint16_t l = 0;
+			const uint8_t *v = qmi_get(m, (uint8_t)(0x10 + i), &l);
+			if (v && l >= 4) {
+				uint32_t st = (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
+				printf("[%6llu] loc: constellation %s (TLV 0x%02x): status %u %s\n", now_ms(), cn[i], 0x10 + i, st,
+				       cc_status(st));
+			} else {
+				printf("[%6llu] loc: constellation %s (TLV 0x%02x): absent\n", now_ms(), cn[i], 0x10 + i);
+			}
+		}
+	}
+}
+
+int loc_probe2_done(void)
+{
+	return probe2_state == 2;
 }
 
 static void probe_queue(void)
@@ -954,6 +1063,8 @@ static void lk_poll(void)
 /* sweetlocd.c: 1 while an engine lock change/restore/repair is running or due (shutdown waits longer for it) */
 int loc_lock_busy(void)
 {
+	if (w_probe2 && !(cur.busy && cur.lk))
+		return 0;
 	return (srv_up && (lk_active() || lkq.pending || lk_restore_wanted() || lk_repair_wanted() || (cur.busy && cur.lk))) ||
 	       (lk == LK_EFS && !shutting);	/* ws-gnss-f: stay up for the EFS write-back (not at SIGTERM) */
 }
@@ -975,6 +1086,7 @@ static void read_on(void)
 	on_gen++;
 	const char *w;
 	w_probe = strstr(b, "probe=1") != NULL;
+	w_probe2 = strstr(b, "probe2=1") != NULL;
 	w_pds = strstr(b, "pds=1") != NULL;
 	w_session = (w = strstr(b, "session=")) ? atoi(w + 8) : 0;
 	w_unlock = 0;
@@ -1019,6 +1131,11 @@ static void read_on(void)
 		w_timeunc = 60000;
 	if (w_session > 600)
 		w_session = 600;
+	if (w_probe2) {		/* ws-gnss-i: read-only mode, every other word off */
+		w_probe = w_pds = w_session = w_unlock = w_time = 0;
+		w_client = w_clientid = w_opmode = w_start_android = w_lockclient = w_lockev = 0;
+		printf("[%6llu] loc: probe2=1: read-only GETs only, every other word ignored, then exit\n", now_ms());
+	}
 	if (dropped)
 		printf("[%6llu] loc: %s changed: LOC allowed again\n", now_ms(), LOC_ON);
 	dropped = 0;
@@ -1140,6 +1257,10 @@ void loc_poll(void)
 			sess_gen_done = on_gen;
 			want_test = 1;
 		}
+		if (w_probe2 && probe2_gen_done != on_gen) {
+			probe2_gen_done = on_gen;
+			probe2_queue();
+		}
 		if (w_probe && probe_gen_done != on_gen) {
 			probe_gen_done = on_gen;
 			probe_queue();
@@ -1170,7 +1291,12 @@ void loc_poll(void)
 	if (!on_present && sess == 0)
 		qn = 0;		/* probe requests still queued: not sent once the file is gone */
 	efs_poll();
-	lk_poll();
+	if (!w_probe2)
+		lk_poll();
+	if (probe2_state == 1 && !cur.busy && !qn) {
+		probe2_state = 2;
+		printf("[%6llu] loc: probe2 done (%u refused): nothing was written, no EFS wait\n", now_ms(), probe2_refused);
+	}
 	send_next();
 	kr_poll(now);		/* xnu 1122 */
 	write_status();
@@ -1300,6 +1426,8 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		unsigned res = r && l >= 4 ? (unsigned)(r[0] | r[1] << 8) : 1, err = r && l >= 4 ? (unsigned)(r[2] | r[3] << 8) : 0xffff;
 		printf("[%6llu] loc: < 0x%04x response %s (error 0x%x)\n", now_ms(), m.id, res ? "FAILED" : "ok", err);
 		qmi_dump(&m);		/* ws-gnss-f: every response in hex */
+		if (w_probe2)
+			probe2_decode(&m, "response");
 		if (cur.lk) {
 			if (res) {
 				cur.busy = 0;
@@ -1341,6 +1469,8 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	if (cur.busy && cur.got_resp && cur.want_ind && m.id == cur.id) {
 		printf("[%6llu] loc: < 0x%04x indication (%s)\n", now_ms(), m.id, cur.why);
 		qmi_dump(&m);
+		if (w_probe2)
+			probe2_decode(&m, "indication");
 		if (m.id == LOC_GET_ENGINE_LOCK && !cur.lk) {	/* probe reads: the value in words too */
 			struct lk_val pv;
 			char pb[96];

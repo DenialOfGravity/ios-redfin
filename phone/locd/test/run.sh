@@ -11,6 +11,7 @@ D="-DLOC_ON=\"$T/var/loc.on\" -DLOC_STATUS=\"$T/var/loc.status\" -DLOCK_ORIG=\"$
 $CC $W $D -o "$T/loc_test" test/loc_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c
 $CC $W $D -o "$T/pdsr_test" test/pdsr_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c
 $CC $W $D -o "$T/lock_test" test/lock_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c
+$CC $W $D -o "$T/probe2_test" test/probe2_test.c loc.c englock.c pdsemu.c ../wifi/qmi.c
 "$T/pdsemu_test"
 "$T/loc_test" > "$T/loc_test.log" 2>&1 || { cat "$T/loc_test.log"; exit 1; }
 tail -1 "$T/loc_test.log"
@@ -18,4 +19,6 @@ tail -1 "$T/loc_test.log"
 tail -1 "$T/pdsr_test.log"
 "$T/lock_test" > "$T/lock_test.log" 2>&1 || { cat "$T/lock_test.log"; exit 1; }
 tail -1 "$T/lock_test.log"
+"$T/probe2_test" > "$T/probe2_test.log" 2>&1 || { cat "$T/probe2_test.log"; exit 1; }
+tail -1 "$T/probe2_test.log"
 rm -rf "$T"
