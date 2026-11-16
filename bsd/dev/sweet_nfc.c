@@ -2680,29 +2680,32 @@ gw_packet_done(unsigned need, uint8_t *out, unsigned *no, unsigned cap, bool *wa
 	gw.pend = true;
 }
 
-/* 1147: reply to the NXP HDLL GET_VERSION read in download mode with a HIGH firmware version so nfcd treats the
- * chip firmware as in-sync and skips any firmware download/write. HDLL framing [LEN_hi LEN_lo | payload | CRC16],
+/* 1147/1148: reply to the NXP HDLL GET_VERSION read in download mode with the EXACT bundled firmware version so
+ * nfcd's major-version gate passes (ff ff is REJECTED: bNewVer[1] >= bCurrVer[1] fails -> 0x3A/0x00FF, recovery loop)
+ * and it treats the chip firmware as in-sync (no download/write). HDLL framing [LEN_hi LEN_lo | payload | CRC16],
  * CRC-16/CCITT-FALSE over LEN+payload (the same nci_crc16 the NCI persona uses). GET_VERSION response payload is 8
- * bytes: P[0]=0x42 (our hw id), P[3],P[4]=bCurrVer (ff ff = highest). Sent to the host over the same control unit
+ * bytes: P[0]=0x42 (our hw id), P[3],P[4]=bCurrVer. bCurrVer must EQUAL bNewVer read from the bundled image
+ * /usr/standalone/firmware/nfrestore/firmware/fw/PN549_FW_02_01_5A_rev88207.bin: header off 0x04 = 5a 01
+ * ([FwMinor,FwMajor]), so bCurrVer[0]=0x5a, bCurrVer[1]=0x01. Sent to the host over the same control unit
  * nfcd writes on; nothing reaches the chip. */
 static void
 gw_dl_reply_getversion(u_int32_t unit)
 {
-	uint8_t r[12] = { 0x00, 0x08, 0x42, 0x02, 0x01, 0xff, 0xff, 0x00, 0x00, 0x00, 0x85, 0xff };
-	uint16_t c = nci_crc16(r, 10);  /* over LEN+payload; must equal the 85 ff trailer */
+	uint8_t r[12] = { 0x00, 0x08, 0x42, 0x02, 0x01, 0x5a, 0x01, 0x00, 0x00, 0x00, 0xb1, 0xdb };
+	uint16_t c = nci_crc16(r, 10);  /* over LEN+payload; must equal the b1 db trailer */
 
 	r[10] = (uint8_t)(c >> 8);
 	r[11] = (uint8_t)c;
-	if (c != 0x85ff) {
-		SAY("nfc-hci: persona: 1147: GET_VERSION CRC %04x != 85ff (not sent)\n", c);
+	if (c != 0xb1db) {
+		SAY("nfc-hci: persona: 1148: GET_VERSION CRC %04x != b1db (not sent)\n", c);
 		return;
 	}
 	if (gw_ctl != NULL && ctl_enqueuedata(gw_ctl, unit, r, sizeof(r), 0) == 0) {
 		gw_up_pkts++;
-		gw_hexlog("nfc-hci", r, sizeof(r), "dnld <persona GET_VERSION high reply, CRC16 85 ff");
+		gw_hexlog("nfc-hci", r, sizeof(r), "dnld <persona GET_VERSION exact-version reply 5a 01, CRC16 b1 db");
 	} else {
 		gw_up_fail++;
-		SAY("nfc-hci: persona: 1147: GET_VERSION reply send FAILED\n");
+		SAY("nfc-hci: persona: 1148: GET_VERSION reply send FAILED\n");
 	}
 }
 
