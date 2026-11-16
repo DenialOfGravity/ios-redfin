@@ -207,7 +207,7 @@ static void s_ok(void)
 	CHECK(!loc_quiet());
 	pump(300);
 	/* ws-gnss-f: the restore uses the original's TLV kind: the mock's GET reports lockClient, so lockType ALL + lockClient 3 */
-	CHECK(modem == 3 && nset == 2 && last_set_type == LK_TYPE_ALL && last_set_client && last_set_client_v == 3);
+	CHECK(modem == 3 && nset == 2 && last_set_type == LK_TYPE_ALL && !last_set_client);	/* ws-gnss-h: lockType only */
 	CHECK(idx_last(LOC_SET_ENGINE_LOCK) > idx_last(LOC_STOP));	/* restore after the session's STOP */
 	CHECK(access(LOCK_ORIG, F_OK) != 0 && loc_quiet());
 }
@@ -256,10 +256,10 @@ static void s_type_ignored(void)
 	up();
 	wordfile("session=30 unlock=mi\n");
 	pump(300);
-	CHECK(modem == 2 && nset == 2 && last_set_client && last_set_client_v == 2 && start_ok == 1);
+	CHECK(modem == 3 && nset == 2 && !last_set_client && start_ok == 0 && access(LOCK_ORIG, F_OK) != 0);	/* ws-gnss-h: no lockClient fallback */
 	loc_shutdown("SIGTERM");
 	pump(300);
-	CHECK(modem == 3 && nset == 3 && last_set_client && last_set_client_v == 3 && access(LOCK_ORIG, F_OK) != 0);
+	CHECK(modem == 3 && nset == 2 && access(LOCK_ORIG, F_OK) != 0);
 }
 
 static void s_none(void)
@@ -427,7 +427,7 @@ static void s_lockclient(void)
 	up();
 	wordfile("session=30 unlock=mi lockclient=1 opmode=msb client=priv\n");	/* unknown values ignored */
 	pump(300);
-	CHECK(modem == 2 && nset == 1 && first_set_client && last_set_client_v == 2 && nopmode == 0 && reg_ctype == 0);
+	CHECK(modem == 2 && nset == 1 && !first_set_client && last_set_type == LK_TYPE_MT && nopmode == 0 && reg_ctype == 0);
 	loc_shutdown("SIGTERM");
 	pump(300);
 	CHECK(modem == 3);
@@ -496,13 +496,13 @@ static void s_efs_repair(void)
 	CHECK(nset == 0 && access(LOCK_ORIG, F_OK) != 0);
 }
 
-/* next start after a hard reboot that lost the restore (modem back at 2): repair SETs 3 again with lockClient */
+/* next start after a hard reboot that lost the restore (modem back at 2): repair SETs ALL again (lockType only) */
 static void s_efs_lost(void)
 {
 	up();
 	wordfile(NULL);
 	pump(300);
-	CHECK(modem == 3 && nset == 1 && last_set_client && last_set_client_v == 3 && access(LOCK_ORIG, F_OK) == 0);
+	CHECK(modem == 3 && nset == 1 && !last_set_client && last_set_type == LK_TYPE_ALL && access(LOCK_ORIG, F_OK) == 0);
 	efs_touch("modemst1.img", 70);
 	pump(3000);
 	CHECK(access(LOCK_ORIG, F_OK) != 0);

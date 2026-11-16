@@ -39,9 +39,10 @@
  *   opmode=standalone  SET_OPERATION_MODE (0x004A) 0x01 = 4 STANDALONE before each START, as startFix does. No other mode.
  *   start=android      START with the HAL's TLVs (0x01 sess 1, 0x10 periodic, 0x11 accuracy HIGH, 0x13 interval,
  *                0x15 altitude-assumed off, 0x18 sharePosition 1; no 0x12) instead of ours (0x01, 0x10, 0x12 off, 0x13).
- *   lockclient=1 the FIRST unlock SET_ENGINE_LOCK also carries TLV 0x11 lockClient (otherwise only on try 2).
+ *   lockclient=1 (ws-gnss-h: accepted but no effect) no SET_ENGINE_LOCK ever carries TLV 0x11 lockClient.
  *   lockev=1     REG_EVENTS also asks for ENGINE_LOCK_STATE indications (mask bit 0x2000000000, ind 0x00BB; logged in hex).
- * Restore (ws-gnss-f): SET_ENGINE_LOCK in the same TLV kind the original GET answered with (redfin: lockClient TLV 0x12, so
+ * Restore (ws-gnss-h): SET_ENGINE_LOCK lockType ONLY (the original as a lockType; ALL=4 if not a plain type), never
+ *   lockClient: the lockType+lockClient form left the saved lock at 0x1 after reboot. Old text (ws-gnss-f): in the same TLV kind the original GET answered with (redfin: lockClient TLV 0x12, so
  *   lockType + lockClient = original mask + subType ALL_SUB), then GET to confirm. The modem keeps its EFS (where the lock
  *   lives) in RAM and writes it back to modemst1/modemst2 through wland's rmtfs only now and then; a GET reads the RAM
  *   value. So locd.lock-orig is kept (efs=1) after a confirmed restore until modemst1.img or modemst2.img in EFS_DIR
@@ -597,25 +598,36 @@ static void lk_get(unsigned sub, const char *why)
 	lk_req(LOC_GET_ENGINE_LOCK, t, lk_tlv_get(t, sub), why);
 }
 
+/* ws-gnss-h: the lockType for a mask; anything that is not plain NONE/MI/MT/ALL (bits beyond 0-1, unknown) gives ALL (4) */
+static uint32_t lk_type_safe(uint64_t mask)
+{
+	uint32_t ty = lk_type_of_mask(mask);
+	return (mask & ~3ull) || ty < LK_TYPE_NONE || ty > LK_TYPE_ALL ? LK_TYPE_ALL : ty;
+}
+
+/* ws-gnss-h: every SET_ENGINE_LOCK is lockType (+ subType ALL_SUB) only, NEVER the lockClient TLV: a restore with
+ * lockType + lockClient (ws-gnss-f/g) left the modem's saved lock at 0x1 (NI unlocked) after a reboot; the lockType-only
+ * form survives. with_client is ignored (kept for the call sites' try numbering). */
 static void lk_set(uint64_t mask, int with_client, const char *why)
 {
 	uint8_t t[32];
 	char a[96], b[96], c[96];
-	printf("[%6llu] loc: ENGINE LOCK CHANGE (%s): SET_ENGINE_LOCK lockType %u%s%llx subType ALL_SUB = %s; modem was %s, "
-	       "original %s\n", now_ms(), why, lk_type_of_mask(mask), with_client ? " + lockClient 0x" : " (no lockClient) target 0x",
-	       (unsigned long long)mask, lk_str(mask, a, sizeof(a)), lk_now_known ? lk_str(lk_now_mask, b, sizeof(b)) : "?",
-	       lk_str(lk_orig, c, sizeof(c)));
-	lk_req(LOC_SET_ENGINE_LOCK, t, lk_tlv_set(t, lk_type_of_mask(mask), with_client, mask), "SET_ENGINE_LOCK");
+	uint32_t ty = lk_type_safe(mask);
+	(void)with_client;
+	printf("[%6llu] loc: ENGINE LOCK CHANGE (%s): SET_ENGINE_LOCK lockType %u only (no lockClient) target 0x%llx subType "
+	       "ALL_SUB = %s; modem was %s, original %s\n", now_ms(), why, ty, (unsigned long long)mask,
+	       lk_str(mask, a, sizeof(a)), lk_now_known ? lk_str(lk_now_mask, b, sizeof(b)) : "?", lk_str(lk_orig, c, sizeof(c)));
+	lk_req(LOC_SET_ENGINE_LOCK, t, lk_tlv_set(t, ty, 0, 0), "SET_ENGINE_LOCK");
 }
 
 /* ws-gnss-f: the restore uses the TLV kind the original GET answered with (lockClient when it reported lockClient) */
 static void lk_restore_start(const char *why)
 {
 	lk_rs_tries++;
-	lk_try = ((lk_orig & ~3ull) || (lk_orig_kind & LK_KIND_CLIENT)) ? 2 : 1;
-	printf("[%6llu] loc: engine lock: restore in the original's TLV kind: %s\n", now_ms(),
-	       lk_try == 2 ? "lockType + lockClient (the GET reported lockClient)" : "lockType only (the GET reported lockType)");
-	lk_set(lk_orig, lk_try == 2, why);
+	lk_try = 1;
+	printf("[%6llu] loc: engine lock: RESTORE value: lockType %u only (original 0x%llx; ALL if not a plain lockType)\n",
+	       now_ms(), lk_type_safe(lk_orig), (unsigned long long)lk_orig);
+	lk_set(lk_orig, 0, why);
 	lk = LK_RS_SET;
 }
 
@@ -707,6 +719,9 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			lk_orig = (uint64_t)mask;
 			printf("[%6llu] loc: engine lock: ORIGINAL %s\n", now_ms(), lk_str(lk_orig, a, sizeof(a)));
 		}
+		printf("[%6llu] loc: engine lock: STARTUP READ lock 0x%llx (%s%s) -> restore lockType %u\n", now_ms(),
+		       (unsigned long long)mask, v.has_type ? "lockType TLV" : "", v.has_client ? " lockClient TLV" : "",
+		       lk_type_safe(lk_orig));
 		lk_get(LK_SUB_DV, "GET_ENGINE_LOCK subType DV (read-only, for the log)");
 		lk = LK_RD_DV;
 		break;
@@ -748,12 +763,15 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			break;
 		}
 		printf("[%6llu] loc: engine lock: original saved in %s\n", now_ms(), LOCK_ORIG);
-		lk_try = (((lk_target | lk_orig) & ~3ull) || w_lockclient) ? 2 : 1;	/* lockclient=1: lockClient on try 1 */
+		lk_try = 1;	/* ws-gnss-h: lockType only on every try (lockclient=1 no longer adds the TLV) */
 		lk_set(lk_target, lk_try == 2, lk_mode == 2 ? "unlock=none" : "unlock=mi");
 		lk = LK_SET;
 		break;
 	case LK_SET:
 	case LK_RS_SET:
+		if (lk == LK_RS_SET)
+			printf("[%6llu] loc: engine lock: RESTORE SET_ENGINE_LOCK lockType %u response: %s\n", now_ms(),
+			       lk_type_safe(lk_orig), ok ? "success" : m ? "indication status not success" : "error/timeout");
 		if (!ok)
 			printf("[%6llu] loc: engine lock: SET_ENGINE_LOCK not confirmed (%s): reading back\n", now_ms(),
 			       m ? "indication status not success" : "error/timeout");
@@ -773,7 +791,7 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		       ok && mask >= 0 ? lk_str((uint64_t)mask, a, sizeof(a)) : "?", lk_str(lk_target, b, sizeof(b)), lk_try);
 		if (lk_try == 1) {
 			lk_try = 2;
-			lk_set(lk_target, 1, "unlock, try 2 with lockClient");
+			lk_set(lk_target, 0, "unlock, try 2 (lockType only)");
 			lk = LK_SET;
 			break;
 		}
@@ -806,7 +824,7 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		}
 		if (lk_try == 1) {
 			lk_try = 2;
-			lk_set(lk_orig, 1, "restore, try 2 with lockClient");
+			lk_set(lk_orig, 0, "restore, try 2 (lockType only)");
 			lk = LK_RS_SET;
 			break;
 		}
