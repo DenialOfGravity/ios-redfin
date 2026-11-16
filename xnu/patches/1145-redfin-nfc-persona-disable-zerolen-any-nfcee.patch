@@ -1,0 +1,63 @@
+From: Claude <noreply@anthropic.com>
+Date: Sun, 16 Nov 2026 23:59:00 +0100
+Subject: [PATCH] 1145 redfin: NFC persona: disable mode-set 6F 18 00
+ (zero-length) for ANY persona NFCEE (eSE C0 and HCI network 01), not just C0
+
+1144 made the eSE (NFCEE 0xC0) disable mode-set emit the zero-length completion
+6F 18 00 so phNciNfc_CoreUtilsValRspLen accepts it. But the eSE teardown then
+also disables the HCI network (NFCEE 0x01) with 22 01 02 01 00, which needs the
+SAME 6F 18 00 completion; our 0x4000 path only sent it for id 0xC0. nfcd then
+waits out the 9 s InitCompleteWdTimer and fails (DownloadRequest on main init;
+DeInit/CORE_RESET on ReInit).
+
+1145 generalizes the 0x4000 disable guard from "id == 0xC0" to "mode byte ==
+0x00" for the NFCEE ids the persona manages (0xC0 OR 0x01): any such disable now
+sends RSP 42 01 01 00 then 6F 18 00. The enable path (mode byte 01) is
+unchanged: id 0xC0 still also gets 6F 20 02 C0 00, id 0x01 stays as before (no
+6F 20). Still gated behind ese_pc_on() (fwif_fmt bit 0x4000); 0x8000 (alt
+payload) and 0x10000 (deferral) stay present. Host-bound only via out_put;
+nothing reaches the chip; gw_filter/tx_allowed untouched.
+
+Caveat (confirm on-phone via a fresh oslog): 6F 18 00 passes the length
+validator only if NFCEE 01's pending flag is set when it arrives;
+phNciNfc_NfceeModeSetSequence should set it for the NFCEE being mode-set.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC2fg7dvyvbEkjpmxxg
+---
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 8d0a120..5d75eff 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -2088,8 +2088,11 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				}
+ 				return true;
+ 			}
+-			if (ese_pc_on() && n > 4 && p[3] == 0xc0 && p[4] == 0x00) {
+-				/* 1139/1144: disable: RSP, then 6F 18 00 (IceFall Power OFF, zero-length payload) completes the pending mode set; no 6F 20 */
++			if (ese_pc_on() && n > 4 && (p[3] == 0xc0 || p[3] == 0x01) && p[4] == 0x00) {
++				/* 1139/1144/1145: disable of any persona NFCEE (eSE C0 or HCI network 01): RSP, then 6F 18 00 (IceFall
++				 * Power OFF, zero-length payload) completes the pending mode set; no 6F 20. 1145 generalizes the
++				 * id==C0 guard to mode byte==0x00 so the eSE teardown's NFCEE 01 disable (22 01 02 01 00) gets the
++				 * same 6F 18 00 the length validator needs (NFCEE 01's pending flag is set by phNciNfc_NfceeModeSetSequence) */
+ 				static const uint8_t off1[3] = { 0x6f, 0x18, 0x00 };   /* 1144: zero-length payload; phNciNfc_CoreUtilsValRspLen needs the length byte 0 */
+ 				static const uint8_t off2[5] = { 0x6f, 0x18, 0x02, 0xc0, 0x00 };
+ 				bool alt = (nfc_fwif_fmt & 0x8000) != 0;
+@@ -2099,7 +2102,7 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				out_put(out, no, cap, alt ? off2 : off1, alt ? sizeof(off2) : sizeof(off1));
+ 				persona_note(0x0201);
+ 				persona_step_say(p, n);
+-				hci_log("host>", p, n, "NFCEE_MODE_SET C0 disable");
++				hci_log("host>", p, n, p[3] == 0x01 ? "NFCEE_MODE_SET 01 (HCI network) disable" : "NFCEE_MODE_SET C0 disable");
+ 				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK");
+ 				hci_log("<persona", alt ? off2 : off1, alt ? sizeof(off2) : sizeof(off1),
+ 				    alt ? "NXP 6F 18 (IceFall Power OFF) C0 status 00, fwif_fmt 0x8000 form (1139)" :
+@@ -3086,7 +3089,7 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
+     "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
+     "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2); 1138: 0x1000 = eSE EoOP NTF "
+     "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value; 1139: 0x4000 = "
+-    "MODE_SET C0 00 -> 6F 18 00 (1144; 0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
++    "MODE_SET C0/01 00 -> 6F 18 00 (1144; 1145: also for NFCEE 01; 0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
+     "deferred by kern.sweet_nfc_ntf_delay_ms as its own packet, 0x20000 = no NTF after the disable RSP");
+ 
+ static int
