@@ -637,6 +637,7 @@ static struct {
 	unsigned pend_n, crc_k;
 	uint16_t pend_crc;
 	uint8_t pend_buf[3 + 255];
+	bool chip_crc;                  /* 1132: SET_CONFIG A0 BF = 01 answered: every later reply carries a CRC16 */
 } gw;
 
 static bool
@@ -994,11 +995,32 @@ local_init(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned ca
  * mirror; default off), bit 5 (0x20): the 1125-1127 GET_CONFIG answer (each id = one zero byte), for A/B.
  * SET_CONFIG is never forwarded in persona mode (mode 0: nothing reaches the chip).
  */
+/*
+ * 1132: the post-init CORE_RESET. phone run v14 (k14): after InitializeComplete nfcd set the NCI CRC check
+ * (phLibNfc_Ioctl_PropSetCrcChkConfig 0x1f5143194 -> phLibNfc_SM_IoctlCrcChkConfigTrans 0x1f513e808: ctx+0x146c = 1,
+ * prop config {A0 BF, 01} -> 2F 03, 2F 02, SET_CONFIG A0 BF = 01). phLibNfc_IoctlSetPropRfCfgComplete ("All Rf
+ * configs are set", 0x1f5154d08) then sets the NCI check flag (phNciNfc_UpdateCrcChkFlag 0x1f51da5fc, nci+0x16c1 =
+ * ctx+0x146c = 1) and starts the ReInit sequence 0x212532618: ReInitialize (CORE_RESET 20 00 01 00 + CORE_INIT),
+ * CrcConfig, ReInitialize, EnablePropExtn, ReConfigHsuBr, ReApplyHsuBr, ChipScopeLogCfg x2 (SET_CONFIG),
+ * GetNfceeIntfCfg, ReInitDisableNfceeDisc, EnableNfceeDisc, ReInitializeComplete. With the check flag on,
+ * phNciNfc_CoreRecvChkPktType (0x1f513cb24) runs phNciNfc_CoreUtilsVerifyCrc (0x1f513f12c) on every received packet:
+ * CRC-16/CCITT-FALSE over header+payload, 2 trailer bytes big endian after the payload (not in the NCI length);
+ * a packet without it fails ("Incorrect CRC", phNciNfc_InvokeCrcErrNtf) and is dropped. Our CORE_RESET_RSP had no
+ * trailer -> dropped -> phNciNfc_SendReset (0x1f513b48c) 2000 ms timeout -> one resend -> failure -> Power 0,
+ * DownloadRequest(0), init again (8 rounds -> DownloadRequest(1)). The RSP itself was right: phNciNfc_ProcessResetRsp
+ * (0x1f51697dc) needs payload length 3, status 0 (NCI 1.x: no CORE_RESET_NTF is waited for, as in init step 0); it
+ * copies the check flag to the append flag (nci+0x16c0 = +0x16c1), so the host's own packets carry a CRC16 from then
+ * on (1127 takes those trailers off). So: after the RSP to SET_CONFIG A0 BF = 01 (sent plain: the host turns its
+ * check on only after it), every reply gets a CRC16 trailer (gw.chip_crc) until A0 BF = 00, VEN low (Power 0) or a
+ * new connect. kern.sweet_nfc_fwif_fmt bit 6 (0x40): ignore A0 BF (k14 behaviour); bit 7 (0x80): keep the CRC state
+ * over Power 0 (EEPROM-like). Nothing is forwarded to the chip.
+ */
 #define CFG_N   16
 #define CFG_MAX 72
 static struct { uint16_t id; uint8_t len; uint8_t val[CFG_MAX]; } nfc_cfg[CFG_N];   /* 1128: overrides; gw_lock */
 static unsigned nfc_cfg_n;
 static int persona_st = -1;             /* 1128: last init-table step index seen (-1 = none this session) */
+static int gw_crc_next;                 /* 1132: 1/2 = chip CRC on/off after the reply now being built; gw_lock */
 
 static unsigned
 cfg_default(uint16_t id, uint8_t *v)
@@ -1265,6 +1287,18 @@ persona_set_config(const uint8_t *p, unsigned n)
 		}
 		if (id >= 0xa000 && (nfc_fwif_fmt & 0x10) && l > 0 && cfg_put(id, p + i, l)) {
 			kept++;
+		}
+		if (id == 0xa0bf && l >= 1 && !(nfc_fwif_fmt & 0x40)) {
+			/* 1132: CRC check config. The RSP to this SET_CONFIG goes out without CRC (the host sets its check
+			 * flag only at "All Rf configs are set", 0x1f5154d5c); from the next reply on (the CORE_RESET_RSP of
+			 * the ReInit sequence 0x212532618) every reply gets the CRC16 trailer. */
+			bool on = p[i] != 0;
+
+			if (on != gw.chip_crc || persona_said < 400) {
+				SAY("persona: 1132: SET_CONFIG A0 BF = %02x: chip CRC16 %s from the next reply (was %s)\n", p[i],
+				    on ? "ON" : "off", gw.chip_crc ? "on" : "off");
+			}
+			gw_crc_next = on ? 1 : 2;
 		}
 		if (id == 0xa00f && l >= 8 && persona_said < 400) {
 			SAY("persona: SET_CONFIG A0 0F (EEPROM user area) MW %02x%02x FW %02x%02x bConfig %02x%02x%02x%02x%s\n",
@@ -1817,6 +1851,8 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
 	gw.rf_active = false;
 	gw.crc = gw.on_demand = 0;
 	gw.pend = gw.crc_rx = gw.crc_out = false;       /* 1127 */
+	gw.chip_crc = false;                            /* 1132 */
+	gw_crc_next = 0;
 	strlcpy(gw.who, who, sizeof(gw.who));
 	if (++gw_conns <= 3) {
 		gw_said = 0;            /* 1125: full packet log for each of the first three sessions */
@@ -1875,6 +1911,9 @@ gw_pend_flush(bool had_crc, uint8_t *out, unsigned *no, unsigned cap, bool *want
 		    gw.pend_buf[0], gw.pend_buf[1], gw.pend_crc, mode);
 	}
 	gw.crc_out = mode == 0 ? had_crc : mode == 2 ? (gw.crc_rx || gw.crc != 0) : false;
+	if (gw.chip_crc && !(nfc_fwif_fmt & 0x40)) {    /* 1132: the "chip" turned its CRC on (A0 BF) */
+		gw.crc_out = true;
+	}
 	gw_host_packet(gw.pend_buf, gw.pend_n, out, no, cap, want_up);
 	if (gw.crc_out && *no > first) {
 		uint8_t t[1024];
@@ -1904,6 +1943,10 @@ gw_pend_flush(bool had_crc, uint8_t *out, unsigned *no, unsigned cap, bool *want
 		}
 	}
 	gw.crc_out = false;
+	if (gw_crc_next != 0) {                         /* 1132: A0 BF takes effect after its own RSP */
+		gw.chip_crc = gw_crc_next == 1;
+		gw_crc_next = 0;
+	}
 }
 
 /* 1127: a whole host packet in gw.asm_buf: hold it for a CRC16 trailer (persona) or answer it now */
@@ -2170,6 +2213,11 @@ sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v)
 			if (!v && gw_session) {
 				gw_session_stop("Power 0");
 			}
+			if (!v && (gw.chip_crc || gw_crc_next) && !(nfc_fwif_fmt & 0x80)) {
+				gw.chip_crc = false;    /* 1132: VEN low = the chip forgets A0 BF (bit 0x80 keeps it) */
+				gw_crc_next = 0;
+				SAY("persona: 1132: Power 0: chip CRC16 off\n");
+			}
 			ven(v != 0);
 			what = v ? "VEN (gpio12) high" : "VEN (gpio12) low";
 		}
@@ -2323,7 +2371,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_f
 SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif_fmt, 0,
     "redfin 1127: persona variants: bits 0-1 reply CRC16 (0 mirror the host, 1 never, 2 always once seen/IO_STOCKHOLM_CRC); "
     "4 = 1125 answers to 2F xx; 8 = GetFwType type 1; 1128: 0x10 = SET_CONFIG A0xx kept as GET values (EEPROM mirror), "
-    "0x20 = 1127 GET_CONFIG answer (each id one zero byte)");
+    "0x20 = 1127 GET_CONFIG answer (each id one zero byte); 1132: 0x40 = ignore SET_CONFIG A0 BF (no chip CRC), "
+    "0x80 = chip CRC state kept over Power 0");
 
 static int
 cfg_hexval(char c)
@@ -2426,17 +2475,20 @@ static int
 sysctl_nfc_persona SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
-	char b[32 * 12 + 8];
+	char b[32 * 12 + 32];
 	size_t o = 0;
 
 	b[0] = 0;
 	for (unsigned i = 0; i < 32 && persona_seen[i].n != 0 && o + 12 < sizeof(b); i++) {
 		o += (size_t)snprintf(b + o, sizeof(b) - o, "%s%04x:%u", i ? " " : "", persona_seen[i].op, persona_seen[i].n);
 	}
+	if (o + 24 < sizeof(b)) {       /* 1132: the chip CRC state (SET_CONFIG A0 BF) */
+		snprintf(b + o, sizeof(b) - o, " | crc %s", gw.chip_crc ? "on" : "off");
+	}
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_persona, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_persona,
-    "A", "redfin 1125: commands answered by the PN80V persona, gid<<8|oid:count (0200 = NFCEE_DISCOVER = end of init)");
+    "A", "redfin 1125: commands answered by the PN80V persona, gid<<8|oid:count (0200 = NFCEE_DISCOVER = end of init); 1132: | crc on/off");
 SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_host_pkts, CTLFLAG_RD | CTLFLAG_LOCKED, &gw_host_pkts, 0,
     "redfin 1119: NCI packets received from the host on com.apple.uart.stockholm");
 
