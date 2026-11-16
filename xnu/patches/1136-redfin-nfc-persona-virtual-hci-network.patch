@@ -1,0 +1,216 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 21:00:00 +0100
+Subject: [PATCH] 1136 redfin: NFC persona: kern.sweet_nfc_fwif_fmt 0x400 virtual HCI
+ network (NFCEE 01 + conn-1 credits + local HCP admin-pipe responder), 0x800
+ CORE_CONN_CREATE answer; klog "nfc-hci"
+
+---
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index e5f0577..a94a2ab 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -1057,6 +1057,119 @@ vese_on(void)
+ 	return (nfc_fwif_fmt & 0x100) || ((nfc_fwif_fmt & 0x200) && gw.chip_crc);
+ }
+ 
++/*
++ * 1136: virtual HCI network (kern.sweet_nfc_fwif_fmt 0x400, only together with 0x100/0x200, i.e. vese_on()).
++ * libNFC_Comet starts the eSE child sequence only from phLibNfc_HciInitComplete, which needs the HCI network NFCEE
++ * (ID 0x01); without it InitializeComplete/ReInitializeComplete wait ~9 s (watchdog 1 s x 9) and the init fails
++ * (logs/research/nfc-ese-2026-11-16.md, Q1-Q3). With 0x400:
++ *   NFCEE_DISCOVER enable: RSP 42 00 02 00 02, NTF 62 00 05 01 00 01 01 00 (HCI network, enabled, HCI access),
++ *     NTF 60 06 03 01 01 01 (CORE_CONN_CREDITS, static conn 1), then the 1134 NTF for the eSE C0.
++ *   NFCEE_MODE_SET 01: 42 01 01 00 (NCI 1.0, no NTF), as 1134 does for C0.
++ *   HCP on static conn 1 (01 00 LL ..): answered here. Admin pipe (0x81): ANY_OPEN_PIPE, ANY_SET_PARAMETER (WHITELIST),
++ *     ADM_CLEAR_ALL_PIPE and other admin commands -> 01 00 02 81 80 (ANY_OK); ANY_GET_PARAMETER SESSION_IDENTITY ->
++ *     ANY_OK + 8 fixed bytes; commands on other pipes -> 8p 81 (ANY_E_NOK); events/responses get no reply.
++ *     Every host data packet is followed by the credit NTF 60 06 03 01 01 01.
++ *   CORE_CONN_CREATE: logged; answered 40 04 04 00 ff 01 02 only with bit 0x800, never for destination type 03 (NFCEE).
++ * Everything is generated in persona_packet(), which runs only in gateway mode 0 (nothing is forwarded there).
++ * gw_filter() is unchanged: it still refuses conn-1 data (RF_HCI) and NFCEE_* commands for every sysctl value, and
++ * sweet_nfc_tx_allowed() re-checks at the bus. No 2F packet, no pin. Klog lines: "SWEET NFC: nfc-hci: persona: 1136: HCI".
++ */
++static unsigned hci_said;
++static const uint8_t hci_session_id[8] = { 0x52, 0x46, 0x4e, 0x30, 0x00, 0x00, 0x00, 0x01 };     /* "RFN0" 00 00 00 01 */
++static const uint8_t hci_credit_ntf[6] = { 0x60, 0x06, 0x03, 0x01, 0x01, 0x01 };     /* conn 1, +1 credit */
++
++static bool
++vhci_on(void)
++{
++	return (nfc_fwif_fmt & 0x400) && vese_on();
++}
++
++static void
++hci_log(const char *dir, const uint8_t *b, unsigned n, const char *note)
++{
++	char h[3 * 40 + 4];
++
++	if (hci_said >= 1000) {
++		return;
++	}
++	hci_said++;
++	hex(h, sizeof(h), b, n > 40 ? 40 : n);
++	SAY("nfc-hci: persona: 1136: HCI %s %u [%s%s] %s%s\n", dir, n, h, n > 40 ? " .." : "", note,
++	    gw.crc_out ? " +CRC16" : "");
++}
++
++/* 1136: one host data packet on static conn 1 (p[0] == 0x01): local HCP answer + credit NTF. gw_lock held. */
++static bool
++persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap)
++{
++	uint8_t r[3 + 2 + 8];
++	unsigned rl = 0;
++	const char *what;
++
++	hci_log("host>", p, n, "data, static conn 1");
++	if (n < 5 || n != 3u + p[2] || p[1] != 0) {
++		what = "short/malformed HCP: no reply";
++	} else if (!(p[3] & 0x80)) {
++		what = "fragmented HCP (CB = 0): no reply";
++	} else {
++		uint8_t pipe = (uint8_t)(p[3] & 0x7f), type = (uint8_t)(p[4] >> 6), ins = (uint8_t)(p[4] & 0x3f);
++
++		r[0] = 0x01;
++		r[1] = 0x00;
++		r[3] = (uint8_t)(0x80 | pipe);
++		if (type != 0) {
++			what = type == 1 ? "HCP event: no reply" : "HCP response: no reply";
++		} else if (pipe != 0x01) {
++			r[4] = 0x81;    /* response, ANY_E_NOK */
++			rl = 5;
++			what = "command on a non-admin pipe: ANY_E_NOK";
++		} else {
++			r[4] = 0x80;    /* response, ANY_OK */
++			rl = 5;
++			switch (ins) {
++			case 0x01:
++				what = (n > 5 && p[5] == 0x03) ? "admin ANY_SET_PARAMETER WHITELIST: ANY_OK" :
++				    "admin ANY_SET_PARAMETER (other register): ANY_OK";
++				break;
++			case 0x02:
++				if (n > 5 && p[5] == 0x01) {
++					memcpy(r + 5, hci_session_id, sizeof(hci_session_id));
++					rl = 5 + sizeof(hci_session_id);
++					what = "admin ANY_GET_PARAMETER SESSION_IDENTITY: ANY_OK + 8 fixed bytes";
++				} else {
++					what = "admin ANY_GET_PARAMETER (other register): ANY_OK, no data";
++				}
++				break;
++			case 0x03:
++				what = "admin ANY_OPEN_PIPE: ANY_OK";
++				break;
++			case 0x04:
++				what = "admin ANY_CLOSE_PIPE: ANY_OK";
++				break;
++			case 0x10:
++				what = "admin 0x10 (research doc: CLEAR_ALL_PIPE; ETSI 102 622: ADM_CREATE_PIPE): ANY_OK";
++				break;
++			case 0x14:
++				what = "admin ADM_CLEAR_ALL_PIPE (0x14): ANY_OK";
++				break;
++			default:
++				what = "admin other command: ANY_OK";
++				break;
++			}
++		}
++	}
++	if (rl) {
++		r[2] = (uint8_t)(rl - 3);
++		out_put(out, no, cap, r, rl);
++		hci_log("<persona", r, rl, what);
++	} else {
++		hci_log("(no reply)", p, n, what);
++	}
++	out_put(out, no, cap, hci_credit_ntf, sizeof(hci_credit_ntf));
++	hci_log("<persona", hci_credit_ntf, sizeof(hci_credit_ntf), "CORE_CONN_CREDITS_NTF conn 1 +1");
++	return true;
++}
++
+ static unsigned
+ cfg_default(uint16_t id, uint8_t *v)
+ {
+@@ -1465,6 +1578,9 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 	unsigned len = 3;
+ 	const char *what = NULL;
+ 
++	if (n >= 3 && p[0] == 0x01 && vhci_on()) {
++		return persona_hci_data(p, n, out, no, cap);    /* 1136: HCP on static conn 1, local only */
++	}
+ 	if ((p[0] >> 5) != 1 || (p[0] & 0x10) != 0 || n < 3) {
+ 		return false;                   /* commands only, unsegmented */
+ 	}
+@@ -1600,17 +1716,29 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 			r[len++] = 0x00;
+ 			if (vese_on() && (swp_have & 2) && swp_set[1] != 0) {  /* 1134: virtual eSE on SWP2 */
+ 				bool en = n > 3 && p[3] != 0;
++				bool hci = en && (nfc_fwif_fmt & 0x400);       /* 1136: + virtual HCI network */
+ 				const uint8_t nt[8] = { 0x62, 0x00, 0x05, 0xc0, 0x00, 0x01, 0x00, 0x00 };
++				static const uint8_t hn[8] = { 0x62, 0x00, 0x05, 0x01, 0x00, 0x01, 0x01, 0x00 };
+ 
+-				r[len++] = en ? 0x01 : 0x00;
++				r[len++] = en ? (hci ? 0x02 : 0x01) : 0x00;
+ 				r[2] = (uint8_t)(len - 3);
+ 				out_put(out, no, cap, r, len);
++				if (hci) {
++					out_put(out, no, cap, hn, sizeof(hn));
++					out_put(out, no, cap, hci_credit_ntf, sizeof(hci_credit_ntf));
++				}
+ 				if (en) {
+ 					out_put(out, no, cap, nt, sizeof(nt));
+ 				}
+ 				persona_note(0x0200);
+ 				persona_step_say(p, n);
+-				if (ri_said < 200) {
++				if (hci) {
++					hci_log("host>", p, n, "NFCEE_DISCOVER enable");
++					hci_log("<persona", r, len, "NFCEE_DISCOVER_RSP OK, 2 NFCEEs");
++					hci_log("<persona", hn, sizeof(hn), "NFCEE_DISCOVER_NTF HCI network 01, enabled, HCI access");
++					hci_log("<persona", hci_credit_ntf, sizeof(hci_credit_ntf), "CORE_CONN_CREDITS_NTF conn 1 +1");
++					hci_log("<persona", nt, sizeof(nt), "NFCEE_DISCOVER_NTF eSE C0 (1134)");
++				} else if (ri_said < 200) {
+ 					ri_said++;
+ 					SAY("persona: 1134: NFCEE_DISCOVER %s: OK, %s%s\n", en ? "enable" : "disable",
+ 					    en ? "1 NFCEE + NTF [62 00 05 c0 00 01 00 00] (virtual eSE C0, enabled, APDU)" : "0 NFCEEs",
+@@ -1627,6 +1755,31 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 			}
+ 			r[len++] = 0x00;        /* 1134: NFCEE_MODE_SET for the virtual eSE: OK (NCI 1.0, no NTF) */
+ 			what = "1134: NFCEE_MODE_SET (virtual eSE): OK";
++			if (vhci_on() && n > 3 && p[3] == 0x01) {       /* 1136 */
++				what = "1136: NFCEE_MODE_SET (HCI network 01): OK";
++				r[2] = (uint8_t)(len - 3);
++				hci_log("host>", p, n, "NFCEE_MODE_SET HCI network 01");
++				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK (NCI 1.0, no NTF)");
++			}
++			break;
++		case 0x0004:                    /* 1136: CORE_CONN_CREATE (OpenLogConn?), logged; answered only with 0x800 */
++			if (!vhci_on()) {
++				return false;
++			}
++			if (!(nfc_fwif_fmt & 0x800) || n < 4 || p[3] == 0x03) {
++				hci_log("host>", p, n, n >= 4 && p[3] == 0x03 ?
++				    "CORE_CONN_CREATE to an NFCEE: not answered (refused as before)" :
++				    "CORE_CONN_CREATE: not answered (fwif_fmt 0x800 off; refused as before)");
++				return false;
++			}
++			r[len++] = 0x00;        /* status OK */
++			r[len++] = 0xff;        /* max data packet payload */
++			r[len++] = 0x01;        /* initial credits */
++			r[len++] = 0x02;        /* conn ID */
++			r[2] = (uint8_t)(len - 3);
++			hci_log("host>", p, n, "CORE_CONN_CREATE");
++			hci_log("<persona", r, len, "CORE_CONN_CREATE_RSP OK, 255, 1 credit, conn 2 (fwif_fmt 0x800)");
++			what = "1136: CORE_CONN_CREATE: OK, conn 2 (fwif_fmt 0x800)";
+ 			break;
+ 		default:
+ 			return false;
+@@ -2533,7 +2686,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
+     "redfin 1127: persona variants: bits 0-1 reply CRC16 (0 mirror the host, 1 never, 2 always once seen/IO_STOCKHOLM_CRC); "
+     "4 = 1125 answers to 2F xx; 8 = GetFwType type 1; 1128: 0x10 = SET_CONFIG A0xx kept as GET values (EEPROM mirror), "
+     "0x20 = 1127 GET_CONFIG answer (each id one zero byte); 1132: 0x40 = ignore SET_CONFIG A0 BF (no chip CRC), "
+-    "0x80 = chip CRC state kept over Power 0");
++    "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
++    "0x800 = also answer CORE_CONN_CREATE");
+ 
+ static int
+ cfg_hexval(char c)
