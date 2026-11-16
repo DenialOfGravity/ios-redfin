@@ -13,32 +13,43 @@ Google's own bootloader. Nothing is flashed to the boot chain; the iOS root live
 > switched off (permissive AMFI and sandbox, stub keystore), and many parts are missing. Do not put anything
 > personal on it.
 
-## What works (2026-10-29, image r57a)
+## Status (2026-11-16)
+
+Booted RAM-only with `fastboot boot`; everything listed here has been run on the phone. Kernel patches up to 1127,
+hakios-metal int14, sweetlocd (GNSS) and SweetControl are merged into `main`.
+
+**Working**
 
 | Area | State |
 | --- | --- |
-| Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU, RAM only. Every reset lands back in fastboot (the shim sets the PMIC reboot reason) |
-| CPU | All 8 cores (1x Cortex-A76 prime 2.4 GHz, 1x Cortex-A76 gold 2.2 GHz, 6x Cortex-A55 1.8 GHz), PSCI. DVFS governor with touch/frame boost, thermal caps from the SoC temperature sensors |
-| Storage | UFS; the iOS root is an HFS+ image in `userdata`, read/write, grown to fill the partition (~109 GiB). **Files -> On My iPhone** and **Settings -> iPhone Storage** work |
-| Display | The 1080x2340 Samsung command-mode panel, **90 Hz**. iOS sees an iPhone X (1125x2436); the Adreno 620 scales each frame to fit, double-buffered, with Apple's continuous corners. Brightness slider works (panel nits published to CoreBrightness) |
-| GPU / Metal | Metal on Mesa's Turnip Vulkan driver through metal2vulkan: backboardd, SpringBoard and apps render on the GPU, with a shader cache and pipeline prewarm. Home-screen swipes reach ~60 fps; Settings scrolling is ~20 fps (GPU-bound, being worked on) |
-| Touch, buttons | Samsung sec_ts touch over SPI, interrupt-driven; power and volume keys |
-| Haptics | The DRV2624 motor plays iOS's UI haptics (RedwoodAudio.driver actuator device) |
-| Sound | Both CS35L41 speaker amps through the audio DSP: ringtones, system sounds, media, volume control. No speaker-protection firmware yet, so a software limiter keeps levels below Android's |
-| Microphone | Records from the ALC5513 (rt5514) mics |
-| Camera | **Camera.app** live preview and photos on the back (IMX363) and front (IMX355) cameras; the ultra-wide (IMX481) streams frames. Lens focus and flash are driven by the kernel |
-| Wi-Fi | The radio is driven from userland (`wland`); **Settings -> Wi-Fi works**: wifid joins at boot and rejoins after a dropped link |
-| Bluetooth | WCN3998 over UART through `btd`'s bridge: **Settings -> Bluetooth** scans and finds nearby devices; a basic connection to another phone works |
-| USB | Ethernet to the PC: SSH (dropbear), a kernel file server, a command server and the live kernel log |
-| Battery | Real percentage from the fuel gauge (seeded from the gauge, then coulomb-counted) |
-| Sensors | The DSP's sensor process stays up (`fastrpcd`); accelerometer, gyro, light, compass and pressure reach iOS as HID services through `sensd` |
-| Apps | The stock apps from the IPSW (Settings, Safari, Camera, Photos, Notes, Weather, Voice Memos, Calculator, Clock, ...) and app extensions (e.g. text-to-speech voices) |
-| Time | PMIC RTC |
+| Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU, RAM only; nothing flashed |
+| Graphics | CoreAnimation on native Metal (hakios-metal on the Adreno 620): draw culling (GPU time about 1/3 lower), no CPU reads of uncached GPU memory, render-target reuse. App Library blur fixed |
+| Frame rate | While moving, after a restart (90 Hz panel): home pages ~47-53 fps, home ~58-62, Settings ~72-75, Control Centre ~52-56 |
+| Cellular | Calls and SMS. Mobile data works but still needs final integration |
+| Wi-Fi | Joins and stays connected (userland `wland`) |
+| Sensors | Accelerometer |
+| Display | Brightness slider |
+| Charging | USB charging while iOS runs: 900 mA on USB 3 ports with charging control (`kern.sweet_chg`) |
+| Settings | SweetControl app for the port's switches, with pinned settings |
 
-**Not working yet:** charging while iOS runs (charge the phone in the bootloader), Wi-Fi signal bars (the signal
-patch is held back: it resets the phone on join), auto-rotation, auto-brightness and the proximity sensor, the
-Control Center flashlight button, Bluetooth pairing and audio profiles (untested), cellular, GPS, NFC, the
-fingerprint sensor, SEP, hardware video decode/encode, App Store and Apple ID services.
+Storage, touch, buttons, sound, microphones, haptics and the rest of the r57a (2026-10-29) baseline carry over.
+
+**Partial / in progress**
+
+- NFC: the chip probe works; iOS's `nfcd` gets through most of its start-up against a kernel persona. No tag reading yet.
+- GNSS: the `sweetlocd` daemon reaches the modem's location service; the engine-lock unlock is under test (switch, off
+  by default). Bridge to locationd / Maps next.
+- Compressed (UBWC) display surfaces: work without errors but are slower, so off by default.
+- Night Shift: the hardware colour-matrix path is built (off by default) but does not work yet.
+- Hardware video decode/encode: power-rail fix in progress.
+- Signal bars: hit or miss.
+
+**Not working / not started**
+
+Proximity sensor during calls; auto-brightness; gyroscope and compass (likely not working); True Tone (only possible
+if colour channels reach iOS); fingerprint (needs emulation plus Titan M work); camera (semi-working under the old
+Vulkan path, to be verified on native Metal); Wi-Fi auto-join and a scan stall; Bluetooth call audio; sleep / power
+management; 5G (untested). Apple Pay / card emulation is out of scope.
 
 ## How it boots
 
@@ -57,16 +68,16 @@ ABL (Google's bootloader, unlocked)
 
 ## Repository and branches
 
-`main` still carries the inherited base. **The redfin work lives on branches:**
+`main` carries the redfin work that has run on the phone (kernel, hakios-metal, userland); `redfin-int` follows it.
 
 - [`known-good-r57a-kernel`](https://github.com/DenialOfGravity/ios-redfin/tree/known-good-r57a-kernel): the
-  kernel the current known-good image runs (258 patches), with the redfin docs and tools.
+  older r57a known-good kernel (258 patches), kept as a fallback.
 - `ws-*` branches: workstreams (GPU, display pacing, Wi-Fi/Bluetooth, storage, ...), merged into integration
   branches once tested on the phone. `builds-*` branches hold CI build outputs.
 
 | Path | What |
 | --- | --- |
-| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 from ios-flame, 0125-0160 from the sunfish series, **0900-1030 for redfin** ([one line per patch](https://github.com/DenialOfGravity/ios-redfin/blob/known-good-r57a-kernel/NOTES.md#redfin-patches)) |
+| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 from ios-flame, 0125-0160 from the sunfish series, **0900-1127 for redfin** ([one line per patch](NOTES.md)) |
 | `shim/` | The bare-metal shim ABL boots (`shim/build.sh`) |
 | `tools/` | Host tools: ADT and payload, `redfin-boot.sh` (build and boot an image), root image and install scripts for WSL, log pulls, camera tables, GPU and Metal debugging |
 | `phone/` | Code that runs in iOS: `metal2/` + `turnip/` (Metal on Turnip), `audio/` (RedwoodAudio.driver), `wifi/` (wland), `bt/` (btd, bluetool), `fastrpc/` (fastrpcd), `sensors/`, `tools/` (psx, pstack, lsreg, oslog, ...) |
