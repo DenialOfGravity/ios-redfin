@@ -12,7 +12,7 @@ Protocol and design: docs/redfin/sweetmon.md (branch ws-z-mon). Python 3 stdlib 
       | gpuperf [overview | off | GROUP:COUNTABLE,...]   xnu 1158 Adreno counters (countable: number or Mesa
         name, e.g. SP:PERF_SP_BUSY_CYCLES or SP:BUSY_CYCLES); no argument: read back. now.json "gpuperf".
 
-Files (under --root, default /mnt/c/ClaudeProjects/iOS_Pixel5):
+Files (under --root, default /mnt/d/ClaudeProjects/iOS_Pixel5):
   logs/mon/now.json             latest merged snapshot (rewritten atomically every sample)
   logs/mon/metrics-YYYYMMDD.jsonl  one compact line per sample
   logs/mon/klog-<boottime>.txt  the full kernel log of that boot (gap-filled after reconnects)
@@ -39,7 +39,7 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_ROOT = '/mnt/c/ClaudeProjects/iOS_Pixel5'
+DEFAULT_ROOT = '/mnt/d/ClaudeProjects/iOS_Pixel5'
 USB_HOST = '192.168.7.2'
 USB_FAST_DEFAULT = {'poll_us': 100, 'txbatch': 16}     # xnu 1034 (r64u): 28 MB/s instead of 1.2 MB/s
 DEFAULT_KLOG_PA = '0x101d0ef08'     # r63a (builds/xnu/ws-y-ram-aca60f47b8/KLOG_PA.txt)
