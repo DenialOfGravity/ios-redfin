@@ -74,6 +74,7 @@ static int gpu_irq_chan;                /* 0999: fence waiters asleep until the 
 static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
 static LCK_MTX_DECLARE(sweet_gpu_lock, &sweet_gpu_grp);
 static void gpuperf_program_locked(const char *why);     /* 1160: below */
+static void gpuhang_dump_locked(const char *why);       /* 1161: below */
 
 /* ---- environment for sweet_a6xx.c ---- */
 
@@ -999,6 +1000,7 @@ gpu_recover_locked(const char *why)
 	lost[recoveries % LOST_RING].culprit = (int32_t)(gpu.fence - done) > 0 && (int32_t)(gpu.fence - done) <= (int32_t)A6_TS_SLOTS ?
 	    gstat_pid[(done + 1) % A6_TS_SLOTS] : -1;
 	a6_log("%s: the job of pid %d hung or faulted\n", why, lost[recoveries % LOST_RING].culprit);
+	gpuhang_dump_locked(why);       /* 1161: kern.sweet_gpuhang_dump */
 	recoveries++;
 	if (a6_recover(&gpu)) {
 		a6_log("%s: GPU not recovered\n", why);
@@ -3440,4 +3442,140 @@ sysctl_sweet_gpuperf_regs SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_gpuperf_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
     sysctl_sweet_gpuperf_regs, "A", "redfin 1160: GROUP:COUNTABLE@slot=0x<LO dword offset> ... (HI = LO + 1)");
+
+/*
+ * ---- redfin 1161: GPU hang dump ----
+ * kern.sweet_gpuhang_dump (default 0: nothing extra, as before). 1: every GPU hang/fault recovery
+ * (gpu_recover_locked, sweet_gpu_lock held, thread context) first prints to the klog, tagged "SWEET GPU HANG:",
+ * the CP state (RB rptr/wptr, IB1/IB2 base + dwords left, RBBM_STATUS..3, RBBM_INT_0_STATUS, CP_STATUS_1,
+ * CP_INTERRUPT_STATUS, CP_HW_FAULT, CP_PROTECT_STATUS, the first 8 SQE stat words), the 64 ring dwords before the
+ * read pointer and the first 64 dwords at CP_IB1_BASE when its GPU VA is mapped to pool or managed RAM
+ * (read-only page walk; anything else: "not mapped"). At most ~24 lines per recovery.
+ */
+static int gpuhang_dump;
+
+static bool
+hang_read(uint64_t pa, void *buf, size_t len)   /* len within one 4K page */
+{
+	if (in_pool(pa, len)) {
+		return a6_read(pa, buf, len) == 0;
+	}
+	if (pmap_valid_address(pa) && pmap_valid_address(pa + len - 1)) {
+		memcpy(buf, (const void *)phystokv(pa), len);
+		return true;
+	}
+	return false;
+}
+
+/* GPU VA -> PA through our page tables, without allocating; 0 = not mapped */
+static uint64_t
+hang_iova_pa(uint64_t va)
+{
+	static const unsigned sh[3] = { 30, 21, 12 };
+	uint64_t t = a6_pool_pa(&gpu, A6_OFF_GT_L1), e = 0;
+	for (int l = 0; l < 3; l++) {
+		if (!hang_read(t + 8ull * ((va >> sh[l]) & 0x1ff), &e, 8) || !(e & 1)) {
+			return 0;
+		}
+		uint64_t m = (1ull << sh[l]) - 1;
+		if (l == 2) {
+			return (e & 3) == 3 ? ((e & 0xfffffff000ull) | (va & m)) : 0;
+		}
+		if ((e & 3) == 1) {             /* block */
+			return (e & 0xfffffff000ull & ~m) | (va & m);
+		}
+		t = e & 0xfffffff000ull;
+	}
+	return 0;
+}
+
+static void
+hang_line(const char *what, uint32_t at, const uint32_t *w, unsigned n)
+{
+	char s[8 * 9 + 1];
+	int o = 0;
+	for (unsigned i = 0; i < n && i < 8; i++) {
+		o += snprintf(s + o, sizeof(s) - (size_t)o, " %08x", w[i]);
+	}
+	printf("SWEET GPU HANG: %s+%03x:%s\n", what, at, s);
+}
+
+static void
+gpuhang_dump_locked(const char *why)
+{
+	if (!gpuhang_dump) {
+		return;
+	}
+	if (!gpu_ready || !a6_gx_up()) {
+		printf("SWEET GPU HANG: %s: GPU not up, no dump\n", why);
+		return;
+	}
+	uint32_t rptr = a6_rd(A6_GREG(0x806)), hwwptr = a6_rd(A6_GREG(0x807));
+	uint64_t ib1 = (uint64_t)a6_rd(A6_GREG(0x929)) << 32 | a6_rd(A6_GREG(0x928));
+	uint64_t ib2 = (uint64_t)a6_rd(A6_GREG(0x92c)) << 32 | a6_rd(A6_GREG(0x92b));
+	uint32_t ib1rem = a6_rd(A6_GREG(0x92a)), ib2rem = a6_rd(A6_GREG(0x92d));
+	printf("SWEET GPU HANG: %s: recovery #%llu fence %u done %u | rb rptr %x wptr %x (sw %x) | ib1 %llx rem %x | "
+	    "ib2 %llx rem %x\n", why, recoveries, gpu.fence, a6_fence_read(&gpu), rptr, hwwptr, gpu.wptr, ib1, ib1rem, ib2,
+	    ib2rem);
+	printf("SWEET GPU HANG: rbbm status %08x %08x %08x %08x int0 %08x | cp status1 %08x int %08x hw_fault %08x "
+	    "protect %08x\n", a6_rd(A6_GREG(0x210)), a6_rd(A6_GREG(0x211)), a6_rd(A6_GREG(0x212)), a6_rd(A6_GREG(0x213)),
+	    a6_rd(A6_GREG(0x201)), a6_rd(A6_GREG(0x825)), a6_rd(A6_GREG(0x823)), a6_rd(A6_GREG(0x821)),
+	    a6_rd(A6_GREG(0x824)));
+	uint32_t w[64];
+	a6_wr(A6_GREG(0x908), 0);       /* CP_SQE_STAT_ADDR (kgsl snapshot); the reset follows */
+	for (int i = 0; i < 8; i++) {
+		w[i] = a6_rd(A6_GREG(0x909));
+	}
+	hang_line("sqe stat", 0, w, 8);
+	/* the 64 ring dwords before the read pointer */
+	uint32_t start = (rptr - 64u) & (A6_RING_DW - 1);
+	for (uint32_t i = 0; i < 64; i++) {
+		(void)a6_read(a6_pool_pa(&gpu, A6_OFF_RING) + 4ull * ((start + i) & (A6_RING_DW - 1)), &w[i], 4);
+	}
+	for (uint32_t i = 0; i < 64; i += 8) {
+		hang_line("ring", (start + i) & (A6_RING_DW - 1), &w[i], 8);
+	}
+	if (ib1 == 0) {
+		printf("SWEET GPU HANG: no IB1\n");
+		return;
+	}
+	unsigned got = 0;
+	while (got < 64) {
+		uint64_t va = ib1 + 4ull * got, pa = hang_iova_pa(va);
+		unsigned n = (unsigned)((0x1000 - (va & 0xfff)) / 4);
+		if (n > 64 - got) {
+			n = 64 - got;
+		}
+		if (pa == 0 || !hang_read(pa, &w[got], 4ull * n)) {
+			printf("SWEET GPU HANG: ib1 %llx not mapped (after %u dwords)\n", va, got);
+			break;
+		}
+		got += n;
+	}
+	for (unsigned i = 0; i + 8 <= got; i += 8) {
+		hang_line("ib1", i, &w[i], 8);
+	}
+	if (got & 7) {
+		hang_line("ib1", got & ~7u, &w[got & ~7u], got & 7);
+	}
+}
+
+static int
+sysctl_sweet_gpuhang_dump SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, gpuhang_dump, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	gpuhang_dump = value;
+	printf("SWEET GPU 1161: hang dump %s\n", value ? "on" : "off");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_gpuhang_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_gpuhang_dump, "I", "redfin 1161: 1 = klog CP state, ring and IB1 dwords at every GPU recovery");
 #endif /* ARM64_BOARD_CONFIG_SWEET */
