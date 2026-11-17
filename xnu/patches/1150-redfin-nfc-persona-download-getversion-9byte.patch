@@ -1,0 +1,63 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 08:30:00 +0100
+Subject: [PATCH] 1150 redfin: NFC persona: HDLL GET_VERSION reply has 9 data bytes, version switchable
+
+rk24a (1149) oslog: the status byte fixed the frame layer ("Received DNDL Error, Status:=0x42" gone);
+the next check failed: "phLibNfc_DnldGetFwVersionApiCb - Incorrect Response!!/Unknown Platform".
+libNFC_Comet 0x1f5155444: platform = GetPlatformInfo(data[0]) (0x42 -> 4); platform 4 needs wLen 9
+(5..10: 7, 0xb/0xc: 15). With 9 bytes the FW version is data[7],data[8] (out[4]=data[7],
+out[3]=data[8]); ff ff = degraded session. Reply data is now 42 02 01 00 00 00 00 <hi> <lo>,
+version from new sysctl kern.sweet_nfc_dl_ver (default 0x015a, PN549_FW_02_01_5A), so the
+comparison can be tuned without a rebuild. Same safety as 1146-1149 (host-bound only).
+
+---
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 7aa12ef..91cd545 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -637,6 +637,7 @@ static volatile bool gw_dl_mode;
+ static unsigned gw_dl_n;
+ static uint32_t gw_dl_frames;
+ static uint8_t gw_dl_buf[2 + 512 + 2];  /* [LEN_hi LEN_lo | payload | CRC16] */
++static uint32_t nfc_dl_ver = 0x015a;    /* 1150: kern.sweet_nfc_dl_ver, HDLL GET_VERSION data[7]=hi data[8]=lo */
+ static struct {
+ 	bool connected, rf_active;
+ 	uint32_t unit, crc, on_demand;
+@@ -2715,15 +2716,25 @@ gw_dl_send(u_int32_t unit, const uint8_t *pl, unsigned n, const char *note)
+ 	}
+ }
+ 
++/* 1150: phLibNfc_DnldGetFwVersionApiCb (libNFC_Comet 0x1f5155444) checks the GET_VERSION data length per platform:
++ * GetPlatformInfo(data[0]=0x42) = platform 4 -> wLen must be 9 (platforms 5..10: 7; 0xb/0xc: 15), else
++ * "Incorrect Response!!/Unknown Platform" (seen with 1149's 8 bytes). With 9 bytes the FW version is data[7],data[8]
++ * (stored as out[4]=data[7], out[3]=data[8]; bCurrVer[0]=out[3], bCurrVer[1]=out[4]), and ff ff = "FW degraded
++ * session state". bNewVer of PN549_FW_02_01_5A = [5a,01] -> data[7]=0x01, data[8]=0x5a = kern.sweet_nfc_dl_ver 0x015a.
++ * Data: 42 (hw) 02 (ROM, 1..3) 01 00 00 00 00 <ver hi> <ver lo>. Wire: 00 0a | 00 (status) | 9 data | CRC16.
++ * 0x100000 = 1148 form (8 data bytes, no status), for comparison only. */
+ static void
+ gw_dl_reply_getversion(u_int32_t unit)
+ {
+-	static const uint8_t v_st[9] = { 0x00, 0x42, 0x02, 0x01, 0x5a, 0x01, 0x00, 0x00, 0x00 };
++	uint8_t v[10] = { 0x00, 0x42, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x5a };
+ 
++	v[8] = (uint8_t)(nfc_dl_ver >> 8);
++	v[9] = (uint8_t)nfc_dl_ver;
+ 	if (nfc_fwif_fmt & 0x100000) {
+-		gw_dl_send(unit, v_st + 1, 8, "dnld <persona GET_VERSION 1148 form (no status byte)");
++		static const uint8_t old[8] = { 0x42, 0x02, 0x01, 0x5a, 0x01, 0x00, 0x00, 0x00 };
++		gw_dl_send(unit, old, 8, "dnld <persona GET_VERSION 1148 form (no status byte)");
+ 	} else {
+-		gw_dl_send(unit, v_st, 9, "dnld <persona GET_VERSION status 00 + 42 02 01 5a 01 00 00 00");
++		gw_dl_send(unit, v, 10, "dnld <persona GET_VERSION status 00 + 9 data (1150), ver = kern.sweet_nfc_dl_ver");
+ 	}
+ }
+ 
+@@ -3247,6 +3258,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_f
+     "redfin 1125/1127: persona answer to NXP 2F 19 GetFwInterfaceVersion, big endian (default 0x15, what hw 0x42 needs)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_mwlog, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_mwlog, 0,
+     "redfin 1141: N > 0 = raise nfcd's libNFC_Comet middleware log tables to N (1..4) at the first CORE_RESET of a session");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_dl_ver, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_dl_ver, 0,
++    "1150: firmware version the NFC persona reports in download mode (HDLL GET_VERSION data[7]=hi, data[8]=lo; default 0x015a)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_ntf_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_ntf_delay_ms, 0,
+     "redfin 1140: delay of the persona's deferred NTF after NFCEE_MODE_SET C0 (fwif_fmt 0x10000), ms, 0..1500 (default 100)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif_fmt, 0,
