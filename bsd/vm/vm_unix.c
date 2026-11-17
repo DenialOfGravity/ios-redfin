@@ -2084,6 +2084,7 @@ SYSCTL_INT(_vm, OID_AUTO, shared_region_persistence, CTLFLAG_RW | CTLFLAG_LOCKED
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 extern void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
+extern void sweet_cc_datacap_hook(void *p);     /* 1156: CommCenter data-capable (vf438) in the main executable */
 #endif
 int
 shared_region_check_np(
@@ -2160,6 +2161,8 @@ shared_region_check_np(
 					if (error == 0) {
 						/* redfin 1061: ABM fake boot in CommCenter (sweetabp=2): bsd/dev/sweet_abp.c */
 						sweet_abp_dyld_hook(p, start_address);
+						/* redfin 1156: CommCenter data-capable (vf438) in the main executable (kern.sweet_cc_datacap): bsd/dev/sweet_abp.c */
+						sweet_cc_datacap_hook(p);
 					}
 #endif
 					if (error != 0) {

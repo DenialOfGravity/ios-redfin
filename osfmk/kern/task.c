@@ -9135,3 +9135,18 @@ kdp_task_is_locked(task_t task)
 {
 	return kdp_lck_mtx_lock_spin_is_acquired(&task->lock);
 }
+
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/*
+ * redfin 1156: the current task's main Mach-O base (its linked 0x100000000 + ASLR
+ * slide), for userland main-executable code patches issued from BSD, where struct
+ * task is opaque (guarded by MACH_KERNEL_PRIVATE). Returns 0 when unavailable.
+ * See bsd/dev/sweet_abp.c:sweet_cc_datacap_hook().
+ */
+uint64_t
+sweet_current_task_main_macho(void)
+{
+	task_t t = current_task();
+	return t ? (uint64_t)t->mach_header_vm_address : 0;
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */

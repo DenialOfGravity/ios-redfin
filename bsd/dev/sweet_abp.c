@@ -80,6 +80,7 @@ void sweet_abp_init(void);
 void sweet_bb_init(void);       /* 1067: sweet_bb.c */
 void sweet_abp_c2w(unsigned pipe, uint32_t sess, unsigned type, const void *data, uint32_t len);
 void sweet_abp_dyld_hook(void *p, uint64_t cache_start);
+void sweet_cc_datacap_hook(void *p);    /* 1156: CommCenter data-capable (vf438) in the main executable */
 
 /* SweetABP.cpp */
 extern void SweetABPStart(void);
@@ -103,6 +104,7 @@ extern int SweetBBVPublished(void);
 
 extern kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size,
     vm_machine_attribute_t attribute, vm_machine_attribute_val_t *value);
+extern uint64_t sweet_current_task_main_macho(void);    /* 1156: current task's main Mach-O base (osfmk/kern/task.c) */
 
 #define ABP_BIT_SERVICES        1u
 #define ABP_BIT_FAKEBOOT        2u
@@ -118,6 +120,7 @@ extern kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t a
 #define ABP_NPIPES              2u
 
 uint32_t sweet_abp_flags;
+int sweet_cc_datacap;                   /* 1156: boot-arg/sysctl sweetccdatacap; 0 off (default), 1 patch CommCenter vf438 */
 uint32_t sweet_abp_bootstage = 2;       /* AppleBasebandPCIControl "bootstage": < 2 = "boot stage down" for ABM */
 
 struct abpb_hdr {
@@ -444,6 +447,7 @@ sweet_abp_init(void)
 	PE_parse_boot_argn("sweetabp", &on, sizeof(on));
 	PE_parse_boot_argn("sweetabmfake", &fake, sizeof(fake));
 	PE_parse_boot_argn("sweetabpstage", &sweet_abp_bootstage, sizeof(sweet_abp_bootstage));
+	PE_parse_boot_argn("sweetccdatacap", &sweet_cc_datacap, sizeof(sweet_cc_datacap));       /* 1156 */
 	if (fake) {
 		on |= ABP_BIT_FAKEBOOT;
 	}
@@ -597,6 +601,75 @@ out:
 	abm_pid = pid;
 }
 
+/* ---- 1156: CommCenter data-capable (vf438) in the MAIN executable ---- */
+
+#define CC_DATACAP_OFF          0x3cb48cULL     /* file off == unslid VA 0x1003cb48c - 0x100000000 */
+#define CC_INSN_MOVW0_0         0x52800000u     /* mov w0, #0  -> not data-capable */
+#define CC_INSN_MOVW0_1         0x52800020u     /* mov w0, #1  -> data-capable */
+
+void
+sweet_cc_datacap_hook(void *pv)
+{
+	proc_t p = (proc_t)pv;
+	char name[32];
+	if (!sweet_cc_datacap) {
+		return;
+	}
+	proc_selfname(name, (int)sizeof(name));
+	if (strcmp(name, "CommCenter") != 0) {
+		return;
+	}
+	int pid = proc_selfpid();
+	uint64_t mh = sweet_current_task_main_macho();
+	if (mh == 0) {
+		printf("SWEET CC: data-capable: pid %d: no main Mach-O base: refused\n", pid);
+		return;
+	}
+	uint64_t fn = mh + CC_DATACAP_OFF;
+	uint32_t cur = 0, back = 0;
+	kern_return_t kr;
+	if (copyin((user_addr_t)fn, &cur, sizeof(cur))) {
+		printf("SWEET CC: data-capable: pid %d: cannot read vf438 at 0x%llx (mh 0x%llx): refused\n", pid, fn, mh);
+		return;
+	}
+	if (cur == CC_INSN_MOVW0_1) {
+		printf("SWEET CC: data-capable: pid %d: vf438 at 0x%llx already mov w0,#1\n", pid, fn);
+		return;
+	}
+	if (cur != CC_INSN_MOVW0_0) {
+		printf("SWEET CC: data-capable: pid %d: vf438 at 0x%llx is 0x%08x (expected 0x%08x): refused\n",
+		    pid, fn, cur, CC_INSN_MOVW0_0);
+		return;
+	}
+	if (!cs_allow_invalid(p)) {
+		printf("SWEET CC: data-capable: pid %d: cs_allow_invalid refused: refused\n", pid);
+		return;
+	}
+	vm_map_t map = current_map();
+	uint64_t pmask = (uint64_t)vm_map_page_mask(map);
+	uint64_t pg = fn & ~pmask;
+	uint64_t pend = (fn + 4 + pmask) & ~pmask;
+	kr = vm_map_protect(map, pg, pend, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, FALSE);
+	if (kr != KERN_SUCCESS) {
+		printf("SWEET CC: data-capable: pid %d: vm_protect(COPY|rw) of 0x%llx failed (%d)\n", pid, pg, kr);
+		return;
+	}
+	uint32_t v = CC_INSN_MOVW0_1;
+	int ce = copyout(&v, (user_addr_t)fn, sizeof(v));
+	kr = vm_map_protect(map, pg, pend, VM_PROT_READ | VM_PROT_EXECUTE, FALSE);
+	if (ce || kr != KERN_SUCCESS) {
+		printf("SWEET CC: data-capable: pid %d: write %d / vm_protect(r-x) %d failed\n", pid, ce, kr);
+		return;
+	}
+	vm_machine_attribute_val_t mv = MATTR_VAL_CACHE_SYNC;
+	mach_vm_machine_attribute(map, fn, 4, MATTR_CACHE, &mv);
+	if (copyin((user_addr_t)fn, &back, sizeof(back)) || back != CC_INSN_MOVW0_1) {
+		printf("SWEET CC: data-capable: pid %d: read-back 0x%08x: patch not in place\n", pid, back);
+		return;
+	}
+	printf("SWEET CC: data-capable: pid %d CommCenter vf438 at 0x%llx now mov w0,#1 (mh 0x%llx)\n", pid, fn, mh);
+}
+
 /* ---- sysctls ---- */
 
 static int
@@ -616,6 +689,23 @@ sysctl_abp(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int a
 SYSCTL_PROC(_kern, OID_AUTO, sweet_abp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_abp, "I",
     "redfin 1061/1063: AppleBasebandPCI stand-in (1 services + /dev/abpbridge, 2 fake ABM boot, 4 trace, 8 publish on wland ready, "
     "0x10 no PDPManagerBase, 0x20 un-publish on bridge close); only adds bits");
+
+static int
+sysctl_cc_datacap(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = sweet_cc_datacap, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (e == 0 && changed) {
+		if (proc_suser(req->p) != 0) {
+			return EPERM;
+		}
+		printf("SWEET CC: kern.sweet_cc_datacap %d -> %d\n", sweet_cc_datacap, v ? 1 : 0);
+		sweet_cc_datacap = v ? 1 : 0;
+	}
+	return e;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_cc_datacap, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_cc_datacap, "I",
+    "redfin 1156: CommCenter data-capable gate (vf438 mov w0,#1 in the main executable); 0 off (default), 1 on");
 
 static int
 sysctl_abp_publish(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
