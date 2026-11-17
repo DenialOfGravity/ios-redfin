@@ -2,7 +2,9 @@
  * sweettrace: record a kdebug trace for the frame-pacing analysis (tools-claude/sweet-trace.py).
  *
  *   sweettrace [-t SECS] [-o FILE] [-b KBUFS] [-m MAXEVENTS] [-r MS] [-d DELAY] [-p PID,...] [-c CLASS[/SUB],...]
- *              [-S] [-I] [-n]
+ *              [-S] [-I] [-n] [-s SECS]
+ *   sweettrace -R      reset kdebug (another owner left it set up)
+ *   sweettrace -V      version and features ("rotate" = -s)
  *
  *   -t SECS     how long to record (default 10)
  *   -o FILE     output (default /var/tmp/sweettrace.swtr)
@@ -16,6 +18,17 @@
  *   -S          also syscalls (BSD and Mach traps: many events)
  *   -I          no interrupts (DBG_MACH_EXCP_INTR)
  *   -n          no thread names (skip the proc_pidinfo walk)
+ *   -s SECS     rotate: ONE kdebug session for all of -t, a new output file every SECS seconds (and on SIGUSR1),
+ *               with no gap: the kernel buffer is never released, events are split at the rotation time stamp
+ *               (file N ends at T, file N+1 starts at T). -o is a printf pattern for the file number (from 1), e.g.
+ *               -o /var/tmp/s/c%03d.swtr (no % in it: FILE.001.swtr ...). Each file is written as FILE.part while it
+ *               grows (events are streamed to it by a writer thread, so memory stays small) and renamed to FILE
+ *               when complete. Per file, stdout gets (line buffered, for pa session's chain.log):
+ *                 CHUNK N START <wall s> pid P tries 0 secs SECS rotate
+ *                 CHUNK N DONE <bytes> sweettrace: <events> events in <s> s ... -> FILE
+ *               Each file has the full header (start/end mach time, wall time at its start, wrapped/dropped for its
+ *               own span) and the thread table known at its end (kdebug's current thread map is re-read at
+ *               every rotation). Old readers read every file as a normal trace.
  *
  * Default classes: DBG_MACH/DBG_MACH_SCHED (context switches, MAKE_RUNNABLE with the waker as the current thread,
  * blocks, waits), DBG_MACH/DBG_MACH_IPC (mach_msg send/receive, KMSG_INFO sender -> receiver pid), DBG_MACH/
@@ -28,6 +41,8 @@
  * Needs root (kdebug's ktrace_configure: superuser). Another owner of ktrace (EBUSY): `sweettrace -R` resets it.
  */
 #include <errno.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -318,14 +333,356 @@ static void sleep_ms(unsigned ms)
 	}
 }
 
+/* ---- -s: rotating output (one kdebug session, a file every SECS) ---- */
+#define SWT_VERSION     "sweettrace 2 (features: rotate -s SECS, SIGUSR1 rotates now)"
+struct qitem {
+	struct qitem *next;
+	int kind;                       /* 0 events, 1 end of this file (rotate), 2 end of the last file */
+	kd_buf *ev;
+	uint64_t n;
+	uint64_t end_abs;               /* kind 1, 2 */
+	uint32_t kd_flags, reads, dropped;
+	struct swt_thread *thr;
+	uint32_t nthr;
+};
+static struct qitem *qhead, *qtail;
+static uint64_t qbytes, qmax;
+static pthread_mutex_t qmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t qcv = PTHREAD_COND_INITIALIZER;
+static volatile sig_atomic_t rotate_now, write_failed;
+static void on_usr1(int s) { (void)s; rotate_now = 1; }
+
+static struct {
+	const char *pat;
+	unsigned idx, secs;
+	char path[1024], part[1040];
+	FILE *f;
+	uint64_t start_abs, n;
+	struct swt_header h;            /* template: the fields every file shares */
+	uint64_t t0, wall0_ns;
+} rf;
+
+static uint64_t abs_ns(uint64_t a) { return a * rf.h.tb_numer / rf.h.tb_denom; }
+static uint64_t wall_of(uint64_t a) { return rf.wall0_ns + (a >= rf.t0 ? abs_ns(a - rf.t0) : 0); }
+
+static int rot_open(uint64_t start_abs)
+{
+	rf.idx++;
+	if (strchr(rf.pat, '%'))
+		snprintf(rf.path, sizeof(rf.path), rf.pat, rf.idx);
+	else {
+		size_t l = strlen(rf.pat);
+		int sfx = l > 5 && strcmp(rf.pat + l - 5, ".swtr") == 0;
+		snprintf(rf.path, sizeof(rf.path), "%.*s.%03u.swtr", (int)(sfx ? l - 5 : l), rf.pat, rf.idx);
+	}
+	snprintf(rf.part, sizeof(rf.part), "%s.part", rf.path);
+	rf.f = fopen(rf.part, "wb");
+	if (rf.f == NULL) {
+		printf("CHUNK %u FAILED %s: %s\n", rf.idx, rf.part, strerror(errno));
+		return -1;
+	}
+	setvbuf(rf.f, NULL, _IOFBF, 4 << 20);
+	struct swt_header z;
+	memset(&z, 0, sizeof(z));       /* placeholder (no magic until complete) */
+	if (fwrite(&z, sizeof(z), 1, rf.f) != 1)
+		return -1;
+	rf.start_abs = start_abs;
+	rf.n = 0;
+	return 0;
+}
+
+static void rot_start_line(void)
+{
+	uint64_t w = wall_of(rf.start_abs);
+	printf("CHUNK %u START %llu.%09llu pid %d tries 0 secs %u rotate\n", rf.idx, (unsigned long long)(w / 1000000000ull),
+	    (unsigned long long)(w % 1000000000ull), (int)getpid(), rf.secs);
+}
+
+static int rot_close(const struct qitem *it)
+{
+	struct swt_header h = rf.h;
+	h.start_abs = rf.start_abs;
+	h.end_abs = it->end_abs;
+	h.n_events = rf.n;
+	h.n_threads = it->nthr;
+	h.kd_flags = it->kd_flags;
+	h.reads = it->reads;
+	h.dropped = it->dropped;
+	h.start_wall_ns = wall_of(rf.start_abs);
+	int bad = (it->nthr && fwrite(it->thr, sizeof(*it->thr), it->nthr, rf.f) != it->nthr) || fflush(rf.f) != 0 ||
+	    fseek(rf.f, 0, SEEK_SET) != 0 || fwrite(&h, sizeof(h), 1, rf.f) != 1;
+	if (fclose(rf.f) != 0)
+		bad = 1;
+	rf.f = NULL;
+	if (bad || rename(rf.part, rf.path) != 0) {
+		printf("CHUNK %u FAILED writing %s: %s\n", rf.idx, rf.part, strerror(errno));
+		return -1;
+	}
+	struct stat st;
+	long long sz = stat(rf.path, &st) == 0 ? (long long)st.st_size : -1;
+	double s = (double)abs_ns(h.end_abs - h.start_abs) / 1e9;
+	printf("CHUNK %u DONE %lld sweettrace: %llu events in %.2f s (%.0f/s), %u threads, %u reads%s%s -> %s\n", rf.idx, sz,
+	    (unsigned long long)h.n_events, s, s > 0 ? h.n_events / s : 0, h.n_threads, h.reads,
+	    (h.kd_flags & KDBG_WRAPPED) ? ", KERNEL BUFFER WRAPPED (events lost)" : "",
+	    h.dropped ? ", writer behind (events dropped)" : "", rf.path);
+	return 0;
+}
+
+static void q_push(struct qitem *it)
+{
+	pthread_mutex_lock(&qmu);
+	it->next = NULL;
+	if (qtail)
+		qtail->next = it;
+	else
+		qhead = it;
+	qtail = it;
+	qbytes += it->n * sizeof(kd_buf);
+	pthread_cond_signal(&qcv);
+	pthread_mutex_unlock(&qmu);
+}
+
+/* the writer: streams event blocks into the current file, closes/opens files at the markers */
+static void *writer(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		pthread_mutex_lock(&qmu);
+		while (qhead == NULL)
+			pthread_cond_wait(&qcv, &qmu);
+		struct qitem *it = qhead;
+		qhead = it->next;
+		if (qhead == NULL)
+			qtail = NULL;
+		qbytes -= it->n * sizeof(kd_buf);
+		pthread_mutex_unlock(&qmu);
+		int kind = it->kind;
+		if (kind == 0) {
+			if (rf.f != NULL && it->n && fwrite(it->ev, sizeof(kd_buf), it->n, rf.f) != it->n) {
+				printf("CHUNK %u FAILED writing %s: %s\n", rf.idx, rf.part, strerror(errno));
+				fclose(rf.f);
+				rf.f = NULL;
+				write_failed = 1;
+			}
+			if (rf.f != NULL)
+				rf.n += it->n;
+		} else if (rf.f != NULL) {
+			if (rot_close(it) < 0)
+				write_failed = 1;
+			else if (kind == 1) {
+				if (rot_open(it->end_abs) < 0)
+					write_failed = 1;
+				else
+					rot_start_line();
+			}
+		}
+		free(it->ev);
+		free(it->thr);
+		free(it);
+		if (kind == 2)
+			return NULL;
+	}
+}
+
+/* hand ev[0..nev) to the writer (events with timestamp >= split go after a kind-1 marker when split != 0) */
+static uint64_t seg_dropped;
+static void q_events(kd_buf *e, uint64_t n)
+{
+	if (n == 0) {
+		free(e);
+		return;
+	}
+	pthread_mutex_lock(&qmu);
+	int full = qbytes + n * sizeof(kd_buf) > qmax;
+	pthread_mutex_unlock(&qmu);
+	if (full) {             /* the writer is too far behind: keep memory bounded, count the loss */
+		seg_dropped += n;
+		free(e);
+		return;
+	}
+	struct qitem *it = calloc(1, sizeof(*it));
+	if (it == NULL) {
+		seg_dropped += n;
+		free(e);
+		return;
+	}
+	it->ev = e;
+	it->n = n;
+	q_push(it);
+}
+
+static void q_marker(int kind, uint64_t end_abs, uint32_t reads)
+{
+	kbufinfo_t bi;
+	struct qitem *it = calloc(1, sizeof(*it));
+	if (it == NULL) {
+		perror("calloc");
+		exit(1);
+	}
+	it->kind = kind;
+	it->end_abs = end_abs;
+	it->reads = reads;
+	it->dropped = (uint32_t)seg_dropped;
+	seg_dropped = 0;
+	if (kd_info(&bi) == 0)
+		it->kd_flags = bi.flags;
+	if (nthr) {
+		it->thr = malloc(nthr * sizeof(*thr));
+		if (it->thr != NULL) {
+			memcpy(it->thr, thr, nthr * sizeof(*thr));
+			it->nthr = nthr;
+		}
+	}
+	q_push(it);
+}
+
+static void read_cur_thrmap(void)
+{
+	size_t ml = 32768 * sizeof(kd_threadmap);       /* no size query: room for 32768 threads */
+	kd_threadmap *m = malloc(ml);
+	if (m != NULL && kd(KERN_KDREADCURTHRMAP, 0, m, &ml) == 0)
+		map_kdebug(m, ml / sizeof(kd_threadmap));
+	free(m);
+}
+
+/*
+ * everything drained so far -> the writer. rotate_at > 0: start a new file at that time stamp. The split is finished
+ * one read later: events stamped before rotate_at can still come in the next read (written on another CPU while
+ * this read ran), so events >= rotate_at are held until then, and the next read's events < rotate_at still go to
+ * the old file. Returns 1 when a file was closed (its marker queued).
+ */
+static kd_buf *held;
+static uint64_t nheld, pend;
+static void split_ev(kd_buf *e, uint64_t n, uint64_t at, uint64_t *na, kd_buf **b, uint64_t *nb)
+{
+	*b = n ? malloc(n * sizeof(kd_buf)) : NULL;
+	uint64_t a = 0, k = 0;
+	for (uint64_t i = 0; i < n; i++) {
+		if (e[i].timestamp < at || *b == NULL)
+			e[a++] = e[i];
+		else
+			(*b)[k++] = e[i];
+	}
+	*na = a;
+	*nb = k;
+}
+static int q_drained(uint64_t rotate_at, uint32_t reads)
+{
+	kd_buf *e = ev, *b;
+	uint64_t n = nev, a, nb;
+	ev = NULL;
+	nev = capev = 0;
+	if (pend) {
+		split_ev(e, n, pend, &a, &b, &nb);
+		q_events(e, a);
+		read_cur_thrmap();
+		q_marker(1, pend, reads);
+		q_events(held, nheld);
+		held = NULL;
+		nheld = 0;
+		q_events(b, nb);
+		pend = 0;
+		return 1;
+	}
+	if (rotate_at) {
+		split_ev(e, n, rotate_at, &a, &b, &nb);
+		q_events(e, a);
+		held = b;
+		nheld = nb;
+		pend = rotate_at;
+		return 0;
+	}
+	q_events(e, n);
+	return 0;
+}
+
+/* -s: the trace loop of the rotating mode (kdebug is set up and enabled; t0 = enable time) */
+static int rotate_main(int argc, char **argv, uint64_t t0, struct timespec wall, mach_timebase_info_data_t tb,
+    uint64_t dur, unsigned kbufs, unsigned read_ms, int nonames)
+{
+	struct swt_header *h = &rf.h;
+	memcpy(h->magic, SWT_MAGIC, 8);
+	h->version = 1;
+	h->header_size = sizeof(*h);
+	h->tb_numer = tb.numer;
+	h->tb_denom = tb.denom;
+	{
+		int nc = 0;
+		size_t l = sizeof(nc);
+		sysctlbyname("hw.ncpu", &nc, &l, NULL, 0);
+		h->ncpu = (uint32_t)nc;
+	}
+	h->kbufs = kbufs;
+	h->tracer_pid = getpid();
+	h->read_ms = read_ms;
+	{
+		size_t w = 0;
+		for (int i = 1; i < argc && w < sizeof(h->args) - 1; i++)
+			w += (size_t)snprintf(h->args + w, sizeof(h->args) - w, "%s%s", i > 1 ? " " : "", argv[i]);
+	}
+	rf.t0 = t0;
+	rf.wall0_ns = (uint64_t)wall.tv_sec * 1000000000ull + (uint64_t)wall.tv_nsec;
+	rf.start_abs = t0;
+	fprintf(stderr, "sweettrace: %.0f s, a new file every %u s, kernel buffer %u events, reading every %u ms, pid %d -> %s\n",
+	    (double)dur * tb.numer / tb.denom / 1e9, rf.secs, kbufs, read_ms, (int)getpid(), rf.pat);
+	rot_start_line();
+	pthread_t wt;
+	if (pthread_create(&wt, NULL, writer, NULL) != 0) {
+		perror("pthread_create");
+		kd(KERN_KDENABLE, 0, NULL, NULL);
+		kd(KERN_KDREMOVE, 0, NULL, NULL);
+		return 1;
+	}
+	uint64_t rdur = (uint64_t)rf.secs * 1000000000ull * tb.denom / tb.numer, seg = t0;
+	uint32_t reads = 0;
+	int rc = 0;
+	while (!stop && !write_failed && mach_absolute_time() - t0 < dur) {
+		sleep_ms(read_ms);
+		uint64_t now = mach_absolute_time();
+		int r = rotate_now || now - seg >= rdur;
+		if (r && (now - t0 >= dur || dur - (now - t0) < rdur / 10))
+			r = 0;          /* the end is near (< 10% of a file): no file of a few hundred ms */
+		if (drain() < 0) {
+			rc = 1;
+			break;
+		}
+		reads++;
+		if (r && !pend) {
+			rotate_now = 0;
+			seg = now;
+		} else
+			r = 0;
+		if (q_drained(r ? now : 0, reads))
+			reads = 0;
+	}
+	kd(KERN_KDENABLE, 0, NULL, NULL);
+	uint64_t t1 = mach_absolute_time();
+	drain();
+	if (q_drained(0, reads))
+		reads = 0;
+	if (held != NULL || nheld) {    /* events of the file after a split pending at the end: the last file */
+		q_events(held, nheld);
+		held = NULL;
+		nheld = 0;
+	}
+	read_cur_thrmap();
+	kd(KERN_KDREMOVE, 0, NULL, NULL);
+	if (!nonames)
+		map_names();
+	q_marker(2, t1, reads);
+	pthread_join(wt, NULL);
+	return rc || write_failed;
+}
+
 int main(int argc, char **argv)
 {
 	unsigned secs = 10, read_ms = 100, delay = 0;
 	unsigned kbufs = 1u << 20;
 	const char *out = "/var/tmp/sweettrace.swtr", *pids = NULL, *extra = NULL;
 	int sysc = 0, nointr = 0, nonames = 0, reset = 0, o;
+	unsigned rot = 0;
 	maxev = 1u << 22;
-	while ((o = getopt(argc, argv, "t:o:b:m:r:d:p:c:SInR")) != -1) {
+	while ((o = getopt(argc, argv, "t:o:b:m:r:d:p:c:SInRs:V")) != -1) {
 		switch (o) {
 		case 't': secs = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'o': out = optarg; break;
@@ -339,9 +696,11 @@ int main(int argc, char **argv)
 		case 'I': nointr = 1; break;
 		case 'n': nonames = 1; break;
 		case 'R': reset = 1; break;
+		case 's': rot = (unsigned)strtoul(optarg, NULL, 0); break;
+		case 'V': printf("%s\n", SWT_VERSION); return 0;
 		default:
 			fprintf(stderr, "usage: sweettrace [-t SECS] [-o FILE] [-b KBUFS] [-m MAX] [-r MS] [-d DELAY] [-p PIDS] "
-			    "[-c CSC] [-S] [-I] [-n] [-R]\n");
+			    "[-c CSC] [-S] [-I] [-n] [-s SECS] [-R] [-V]\n");
 			return 2;
 		}
 	}
@@ -355,14 +714,32 @@ int main(int argc, char **argv)
 		printf("kdebug reset\n");
 		return 0;
 	}
-	FILE *f = fopen(out, "wb");
-	if (f == NULL)
-		return perror(out), 1;
+	FILE *f = NULL;
+	if (rot) {
+		if (secs < 1) {
+			fprintf(stderr, "-s: -t must be at least 1 s\n");
+			return 2;
+		}
+		setvbuf(stdout, NULL, _IOLBF, 0);
+		if (read_ms == 0)
+			read_ms = 100;  /* rotation needs the periodic reads */
+		rf.pat = out;
+		rf.secs = rot;
+		qmax = maxev * sizeof(kd_buf); /* -m: the most the writer may lag behind */
+		if (rot_open(0) < 0)
+			return perror(rf.part), 1;
+	} else {
+		f = fopen(out, "wb");
+		if (f == NULL)
+			return perror(out), 1;
+	}
 	if (delay)
 		sleep(delay);
 	signal(SIGINT, on_sig);
 	signal(SIGTERM, on_sig);
 	signal(SIGHUP, on_sig);
+	if (rot)
+		signal(SIGUSR1, on_usr1);
 
 	if (kd(KERN_KDREMOVE, 0, NULL, NULL) < 0) {
 		fprintf(stderr, "KERN_KDREMOVE: %s (root needed; EBUSY: someone else traces, sweettrace -R)\n", strerror(errno));
@@ -451,14 +828,15 @@ int main(int argc, char **argv)
 			map_kdebug(m, ml / sizeof(kd_threadmap));
 		free(m);
 	}
-	printf("sweettrace: %u s, kernel buffer %u events, reading every %u ms, pid %d -> %s\n", secs, kbufs, read_ms,
-	    getpid(), out);
-	fflush(stdout);
-
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	uint64_t dur = (uint64_t)secs * 1000000000ull * tb.denom / tb.numer;
 	uint32_t reads = 0;
+	if (rot)
+		return rotate_main(argc, argv, t0, wall, tb, dur, kbufs, read_ms, nonames);
+	printf("sweettrace: %u s, kernel buffer %u events, reading every %u ms, pid %d -> %s\n", secs, kbufs, read_ms,
+	    getpid(), out);
+	fflush(stdout);
 	while (!stop && mach_absolute_time() - t0 < dur) {
 		if (read_ms == 0) {
 			sleep_ms(100);
