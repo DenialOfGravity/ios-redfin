@@ -1361,7 +1361,7 @@ hci_log(const char *dir, const uint8_t *b, unsigned n, const char *note)
 static bool
 persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap)
 {
-	uint8_t r[3 + 2 + 8 + 4];
+	uint8_t r[3 + 2 + 24];
 	unsigned rl = 0;
 	const char *what;
 
@@ -1390,6 +1390,14 @@ persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsig
 			what = "HCP EVT_TRANSMIT_DATA (C-APDU): R-APDU = kern.sweet_nfc_apdu_sw (1151)";
 		} else if (type != 0) {
 			what = type == 1 ? "HCP event: no reply" : "HCP response: no reply";
+		} else if (pipe != 0x01 && ins == 0x02 && n > 5 && p[5] == 0x01 && (nfc_fwif_fmt & 0x1000000)) {
+			/* 1153: GetAtr on the eSE APDU pipe: ANY_OK + a 15-byte JCOP-style ATR (1..21 bytes accepted). */
+			static const uint8_t atr[15] = { 0x3b, 0x8a, 0x80, 0x01, 0x4a, 0x43, 0x4f, 0x50, 0x33, 0x31, 0x56, 0x32,
+				                         0x33, 0x32, 0x7a };
+			r[4] = 0x80;
+			memcpy(r + 5, atr, sizeof(atr));
+			rl = 5 + sizeof(atr);
+			what = "ANY_GET_PARAMETER reg 01 on the eSE pipe (GetAtr): ANY_OK + ATR (1153)";
 		} else if (pipe != 0x01) {
 			r[4] = 0x81;    /* response, ANY_E_NOK */
 			rl = 5;
