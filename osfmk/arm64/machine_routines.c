@@ -963,6 +963,12 @@ ml_parse_cpu_topology(void)
 		cpu_boot_arg = SWEET_SMP_MAX_CPUS;
 	}
 #endif
+#if defined(SWEET_AMP)
+	/* 1180: boot-arg sweetamp=0 = one SMP cluster; sweetampp=N = first P core (default SWEET_AMP_FIRST_P) */
+	uint32_t sweet_amp_on = 1, sweet_amp_first_p = SWEET_AMP_FIRST_P;
+	PE_parse_boot_argn("sweetamp", &sweet_amp_on, sizeof(sweet_amp_on));
+	PE_parse_boot_argn("sweetampp", &sweet_amp_first_p, sizeof(sweet_amp_first_p));
+#endif
 
 	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
 	// so that we trigger a panic later in the boot process, once serial is enabled.
@@ -1034,6 +1040,14 @@ ml_parse_cpu_topology(void)
 		cpu->cluster_type = CLUSTER_TYPE_SMP;
 
 		int cluster_type = (int)ml_readprop(child, "cluster-type", 0);
+#if defined(SWEET_AMP)
+		/* 1180: the ADT's type, else by core number (MPIDR Aff1 = core on SM7150/SM7250) */
+		if (!sweet_amp_on) {
+			cluster_type = 0;
+		} else if (cluster_type != 'E' && cluster_type != 'P') {
+			cluster_type = ((cpu->phys_id >> 8) >= sweet_amp_first_p) ? 'P' : 'E';
+		}
+#endif
 		if (cluster_type == 'E') {
 			cpu->cluster_type = CLUSTER_TYPE_E;
 		} else if (cluster_type == 'P') {

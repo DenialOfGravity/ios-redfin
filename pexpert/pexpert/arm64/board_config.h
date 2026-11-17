@@ -102,7 +102,11 @@
 
 #define MAX_L2_CLINE                   6
 #define MAX_CPUS                       8
+#if defined(SWEET_AMP) && SWEET_AMP
+#define MAX_CPU_CLUSTERS               2       /* 1180: E (A55) + P (A76) */
+#else
 #define MAX_CPU_CLUSTERS               1
+#endif
 
 #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
 

@@ -1113,6 +1113,38 @@ sched_clutch_bucket_init(
 	queue_init(&clutch_bucket->scb_thread_timeshare_queue);
 }
 
+#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
+/*
+ * redfin 1180: no CLPC registers on this port, so nothing calls
+ * sched_perfcontrol_thread_group_preferred_clusters_set() and every bucket group would keep Apple's
+ * initial preference, the boot cluster (pset0 = the A55s). With the default edge matrix
+ * (sched_edge_cpu_init_completed(): E->P migration and steal not allowed) the A76s would then run
+ * only bound threads. Boot-arg sweetedgepref: 0 = Apple's default (boot cluster); 1 (default) = what
+ * CLPC's legacy P recommendation gives (sched_perfcontrol_thread_group_recommend() with
+ * sched_edge_restrict_ut/bg): FIXPRI, FG, IN and DF of user thread groups prefer the P cluster,
+ * UT and BG, and the kernel's reserved groups (system/launchd, background, VM, IO, perf controller)
+ * the boot cluster. Used for bucket groups made after sched_edge_cpu_init_completed() (all clusters
+ * exist); earlier ones keep the boot cluster.
+ */
+static int sweet_edge_pref = -1;
+static int sweet_edge_pcluster = -1;
+
+static uint32_t
+sweet_edge_default_cluster(sched_clutch_t clutch, sched_bucket_t bucket)
+{
+	if (sweet_edge_pcluster < 0 || sweet_edge_pref <= 0 || clutch->sc_tg == NULL) {
+		return pset0.pset_cluster_id;
+	}
+	if (bucket == TH_BUCKET_SHARE_UT || bucket == TH_BUCKET_SHARE_BG) {
+		return pset0.pset_cluster_id;
+	}
+	if (thread_group_get_id(clutch->sc_tg) <= THREAD_GROUP_PERF_CONTROLLER) {
+		return pset0.pset_cluster_id;
+	}
+	return (uint32_t)sweet_edge_pcluster;
+}
+#endif /* CONFIG_SCHED_EDGE && SWEET_AMP */
+
 /*
  * sched_clutch_bucket_group_init()
  *
@@ -1136,7 +1168,11 @@ sched_clutch_bucket_group_init(
 
 	os_atomic_store(&clutch_bucket_group->scbg_timeshare_tick, 0, relaxed);
 	os_atomic_store(&clutch_bucket_group->scbg_pri_shift, INT8_MAX, relaxed);
+#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
+	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, sweet_edge_default_cluster(clutch, bucket), relaxed);
+#else
 	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, pset0.pset_cluster_id, relaxed);
+#endif
 	/*
 	 * All thread groups should be initialized to be interactive; this allows the newly launched
 	 * thread groups to fairly compete with already running thread groups.
@@ -1171,6 +1207,7 @@ sched_clutch_init_with_thread_group(
 	struct thread_group *tg)
 {
 	os_atomic_store(&clutch->sc_thr_count, 0, relaxed);
+	clutch->sc_tg = tg;     /* 1180: before the bucket groups (sweet_edge_default_cluster reads it) */
 
 	/* Initialize all the clutch buckets */
 	for (uint32_t i = 0; i < TH_BUCKET_SCHED_MAX; i++) {
@@ -4886,6 +4923,22 @@ sched_edge_cpu_init_completed(void)
 		pset_unlock(src_pset);
 	}
 	splx(s);
+#if defined(SWEET_AMP)
+	/* 1180: the first P cluster, now that every pset exists (sweet_edge_default_cluster) */
+	if (sweet_edge_pref < 0) {
+		int v = 1;
+		PE_parse_boot_argn("sweetedgepref", &v, sizeof(v));
+		sweet_edge_pref = v;
+	}
+	for (int cluster_id = 0; cluster_id < sched_edge_max_clusters; cluster_id++) {
+		if (pset_array[cluster_id] != PROCESSOR_SET_NULL && pset_array[cluster_id]->pset_type == CLUSTER_TYPE_P) {
+			sweet_edge_pcluster = cluster_id;
+			break;
+		}
+	}
+	kprintf("SWEET AMP: Edge clusters %d, P cluster %d, sweetedgepref %d\n", sched_edge_max_clusters,
+	    sweet_edge_pcluster, sweet_edge_pref);
+#endif
 }
 
 static bool

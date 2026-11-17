@@ -25,6 +25,21 @@
  */
 #define SWEET_SMP_MAX_CPUS         8
 
+/*
+ * redfin 1180 (AMP variant, branch ws-amp-*; the SMP kernel is any build without this patch): two
+ * CPU clusters, E = the six A55s (cores 0-5) and P = the two A76s (6 gold, 7 prime). __ARM_AMP__ with
+ * MAX_CPU_CLUSTERS 2 (board_config.h) gives one pset per cluster and, as this kernel is built for an
+ * XNU_TARGET_OS_OSX target, the Edge scheduler (proc_reg.h: CONFIG_SCHED_EDGE). No Apple cluster
+ * hardware is used: no HAS_CLUSTER (ml_parse_cpu_topology() numbers clusters by type, E 0 / P 1, like
+ * H10/A11), no acc-impl-reg / cpm-impl-reg in the ADT, no uncore counters.
+ * Cluster types: the ADT's cluster-type ('E'/'P'); where it is 0 (today's SMP ADT) by core number,
+ * core >= SWEET_AMP_FIRST_P is P (boot-arg sweetampp=N). Boot-arg sweetamp=0: every core SMP type,
+ * one cluster and one pset (fallback topology on this kernel).
+ */
+#define SWEET_AMP                 1
+#define SWEET_AMP_FIRST_P         6
+#define __ARM_AMP__               1
+
 #define ARM_ARCH_TIMER
 #define __ARM_ARCH__              8
 #define __ARM_VMSA__              8
