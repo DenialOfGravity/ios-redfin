@@ -1,0 +1,12 @@
+# pa tidy keep list: names or globs (image folders, build folders, log entries, worktree folders, branches) that are
+# never archived. One per line.
+# 2026-11-16 handover baseline
+r5p3a
+rk20a
+ws-int-k20-e4856b8fe4
+# NFC line in progress (2026-11-17)
+rk2[1-9]*
+ws-int-k2*
+ws-nfc-*
+# phone-state worktree
+state

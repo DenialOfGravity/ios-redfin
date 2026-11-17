@@ -31,6 +31,10 @@
 #                             pinned boot values, disk, temp overrides, and the last `state diff` counts (its age and
 #                             whether the kernel changed since). --drift runs a fresh diff first (~45 s).
 #   pa lock                   who holds the phone lock
+#   pa tidy [AREA...] [--days N] [--apply]
+#                             tools-claude/pa-tidy.py: dry run (default) of what can be archived in images, builds,
+#                             logs, worktrees, scratch; --apply AREA moves (never deletes) to PF/attic/<date> or
+#                             ~/attic/<date> with INDEX.tsv. Report in logs/tidy/. Keep list: tools-claude/tidy-keep.txt
 set -uo pipefail
 P=/mnt/d/ClaudeProjects/iOS_Pixel5
 T=$P/tools-claude
@@ -179,6 +183,7 @@ case $act in
 	snap) pa_snap "$@";;
 	revert) run "state revert $*";;
 	keep) run "state promote $*";;
+	tidy) python3 "$T/pa-tidy.py" "$@";;
 	lock) if flock -n /tmp/pa-phone.lock true 2>/dev/null; then echo "phone lock free"; else echo "held: $(cat /tmp/pa-phone.owner 2>/dev/null)"; fi;;
 	*)
 		if [[ $FORWARD == *" $act "* ]]; then queue "$act" "$@"
