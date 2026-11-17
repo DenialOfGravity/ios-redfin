@@ -20,12 +20,13 @@ note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 a
 
 # What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
 [boot]
-image = "rk27a"
+# 2026-11-17: promoted ws-int-k27-perf = ws-int-k27 (dbd0752e6f, cell data) + 1159 gpustats, 1160 perf counters, 1161 hang dump, 1162 p disp on|off (all off by default). Branch head 29b7f4c is NOTES only.
+image = "rk27p"
 base = "r5p3a"
-kernel_dir = "builds/xnu/ws-int-k27-dbd0752e6f"
-kernel_branch = "ws-int-k27"
-kernel_sha = "dbd0752e6f"
-kernel_uuid = "909CEC87-7967-3701-96ED-5CE5BEF84EB0"
+kernel_dir = "builds/xnu/ws-int-k27-perf-9b6aa022d6"
+kernel_branch = "ws-int-k27-perf"
+kernel_sha = "9b6aa022d6"
+kernel_uuid = "8311A758-A43E-380C-8486-16BE54634227"
 cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13"
 bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2"
 
@@ -576,8 +577,8 @@ sha = "2e899aa8d6"
 
 [[file]]
 path = "/var/local/bin/sweetmon"
-source = "builds/userland/645854a7340a681bf6ab1740378059cab9a7a5c9-645854a734/sweetmon"
-sha256 = "ccfe84cca1f74df86e032ab027b26fdd4e584093678c1a80895e701941fb9684"
+source = "builds/userland/ws-gpuperf-07a86585ac/sweetmon"
+sha256 = "d797b33319925212e16eec6887bc5e2e6be14a5ea4b20d329134d81206054257"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -587,8 +588,8 @@ restart = "sweetmon"
 
 [[file]]
 path = "/var/local/bin/sweettrace"
-source = "builds/userland/ws-u-lab-d9a9c25217/sweettrace"
-sha256 = "d6fd649f9b24b5dd2ba51fe399472f64ca1c8134fc44077d70762ec3146eef8b"
+source = "builds/userland/ws-gpuperf-07a86585ac/sweettrace"
+sha256 = "ecd2ccd5e815758c6c6f306df6924b986eef1e76c8988315603d0cdf4ed2857f"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -828,6 +829,12 @@ sha256 = "d76ac65bdd442803d41e5e83d8a30d537880ceb19f8e7be50c8e2d258383919c"
 mode = "644"
 owner = "0:0"
 
+[[file]]
+path = "/var/local/bin/cell-data-up.sh"
+source = "/home/rorya/ios-redfin/phone/boot/cell-data-up.sh"
+sha256 = "77fb2897f1b01c2369e38f3f89110c14f6a3bf042edd1c6bcb5c9a37c47c92b4"
+mode = "755"
+
 
 # Bundle directories: every file with its sha256; apply installs the whole bundle from source.
 [[bundle]]
@@ -889,15 +896,15 @@ note = "AirFair moved aside (FairPlay off; KNOWN-GOOD rk3a notes)"
 
 [[bundle]]
 path = "/var/local/hmetal/lib/HakiosMetal.bundle"
-source = "builds/hmetal/ws-hm-int14-3a027e8/HakiosMetal.bundle"
-target = "hmetal"
-ref = ""
-sha = ""
-note = "1 of 3 files match builds/hmetal/ws-hm-int14-3a027e8/HakiosMetal.bundle"
+source = "builds/hmetal-mesa/ws-hm-perf-ad4e7af535/bench/HakiosMetal.bundle"
+target = "hmetal-mesa"
+ref = "ws-hm-perf"
+sha = "ad4e7af535"
+note = "2026-11-17: ws-hm-perf = hm-int14 3a027e8 + HM_PERF kdebug events (MESA=1 build; plain hmetal builds have no compiler, never install them)"
 restart = "backboardd"
 CFBundleIdentifier = "org.redfin.hakios-metal-bench"
 CFBundleVersion = "1"
-files = { HakiosMetal = "ebc2c0ce59361cf289bc66f4be0409fd358fd2f6ebaea70e238d34c56bb13ba5", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "626aa5346814be39005a9a78091735c45b4985a7605a9ae7a55bc3448d29bee1" }
+files = { HakiosMetal = "4b27d15cdeff85116069757b35c93e6caada2d97d0da13edd52b6d756528c12d", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "e6dde3dcdb08d0940ca1904d80274e9552de8a269cfb6a23dfe35ec1240f97bf" }
 
 [[bundle]]
 path = "/var/local/hmetal/lib/SweetMetal2.bundle"
