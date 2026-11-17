@@ -11,6 +11,7 @@
 #   pdptest  list | ping N [COUNT]: pdp_ip interfaces of xnu 1075 and its loopback self-test
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
+#   vmpeek   PID ADDR [LEN] | PID ADDR w BYTE...: read/write another process's memory at an unslid shared-cache address
 #   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
 #   sweetmon    monitor daemon: samples, klog tail, kdebug traces over TCP 5150 (docs/redfin/sweetmon.md)
 #   expt, exq, runmigrator: one-off probes of ExtensionFoundation and DataMigration (runmigrator needs
@@ -31,7 +32,7 @@ build() {	# NAME SOURCE [FLAGS...]
 }
 # SweetControl.app + sweetctl (ws-n-ctl): first, so a failing tool below (set -e) cannot skip it
 sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
-for c in membw pstack psx sweettrace; do build $c $c.c; done
+for c in membw pstack psx sweettrace vmpeek; do build $c $c.c; done
 for m in autolock expt exq nettest openapp oslog oslogshow prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices

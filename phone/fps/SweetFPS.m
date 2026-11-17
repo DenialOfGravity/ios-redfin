@@ -13,7 +13,14 @@
  *                     bit 1 rewrite: preferredFramesPerSecond / preferredFrameRateRange whose rate (max) is
  *                           in [SWEET_FPS_MIN, TARGET) becomes TARGET (range: {min, TARGET, TARGET})
  *                     bit 3 rewrite to 0 / CAFrameRateRangeDefault instead of TARGET
+ *                     bit 4 (0x10) log every UIViewInProcessAnimationTickEntry (range, reason, creating stack)
+ *                     bit 5 (0x20) in-process animation manager ceiling: when UIKit's UIViewInProcessAnimationManager
+ *                           sets its link's range with a maximum below TARGET (the union of the running in-process
+ *                           animations, e.g. SpringBoardHome's SBFolderScrollAccessoryView page-dots / search-pill
+ *                           fades, hardcoded {20, 30, 0} reason 0x11001b: 30 Hz on every iPhone), the maximum
+ *                           becomes TARGET; min and preferred are kept. Other links are untouched.
  *   SWEET_FPS_TARGET=N (default 90), SWEET_FPS_MIN=N (default 46: requests for <= 45 fps are left alone)
+ *   The file may carry a third field, MIN ("MODE TARGET MIN").
  * Hooks: -[CADisplayLink setPreferredFramesPerSecond:], setPreferredFrameRateRange:, setFrameInterval:,
  * addToRunLoop:forMode: (logs the link's rate state and the thread when it starts, and again 2 s later); each log
  * line carries the link's own view: heartbeatRate, maximumRefreshRate, minimumFrameDuration, frameInterval,
@@ -86,6 +93,14 @@ sf_state(id link)
 	    hb, hb > 0 ? 1 / hb : 0, mr, mr > 0 ? 1 / mr : 0, mfd, fi, afps];
 }
 
+/* the queue UIViewInProcessAnimationManager sets its display link's range on (iOS 16.7 UIKitCore) */
+static bool
+sf_on_manager_queue(void)
+{
+	const char *q = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+	return q != NULL && strcmp(q, "com.apple.UIKit.inProcessAnimationManagerDisplayLinkAccessQueue") == 0;
+}
+
 static bool
 sf_rewrites(float rate)
 {
@@ -128,6 +143,10 @@ sf_hook(void)
 			float top = r.maximum > 0 ? r.maximum : r.preferred;
 			if (sf_rewrites(top)) {
 				v = (sf_mode & 8) ? CAFrameRateRangeDefault : CAFrameRateRangeMake(r.minimum, sf_target, sf_target);
+			} else if ((sf_mode & 0x20) && top > 0 && top < sf_target && sf_on_manager_queue()) {
+				/* UIKit's in-process animation manager: its link carries the union of the running animations'
+				 * ranges; raise only the ceiling, so CA's fastest interval becomes round(heartbeat / target) */
+				v = CAFrameRateRangeMake(r.minimum, sf_target, r.preferred);
 			}
 			if (sf_mode & 1) {
 				sf_log([NSString stringWithFormat:@"%p setPreferredFrameRateRange:{%g %g %g}%@ from%@", self,
@@ -179,6 +198,35 @@ sf_hook(void)
 	}
 }
 
+/* bit 4 (0x10): log every in-process animation tick entry (UIKit's UIViewInProcessAnimationManager runs all of them on
+ * one CADisplayLink whose range is the union of the entries' ranges), with its range, update reason, the callback
+ * block's invoke pointer and the creating call stack. Raw addresses: unslide with the boot's shared cache slide
+ * (vmpeek / pstack print it). */
+static void
+sf_hook_tick(void)
+{
+	Class c = objc_getClass("UIViewInProcessAnimationTickEntry");
+	SEL s = sel_registerName("initWithPreferredFrameRateRange:updateReason:velocityUsableForVFD:callback:");
+	Method m = c != Nil ? class_getInstanceMethod(c, s) : NULL;
+	if (m == NULL) {
+		sf_log(@"no UIViewInProcessAnimationTickEntry init");
+		return;
+	}
+	__block id (*orig)(id, SEL, CAFrameRateRange, unsigned, BOOL, id) = NULL;
+	IMP n = imp_implementationWithBlock(^id(id self, CAFrameRateRange r, unsigned reason, BOOL vfd, id cb) {
+		void *inv = cb != nil ? ((void **)(__bridge void *)cb)[2] : NULL;
+		NSArray<NSNumber *> *a = [NSThread callStackReturnAddresses];
+		NSMutableString *st = [NSMutableString string];
+		for (NSUInteger i = 1; i < a.count && i < 9; i++) {
+			[st appendFormat:@" %#llx", a[i].unsignedLongLongValue];
+		}
+		sf_log([NSString stringWithFormat:@"tick entry range {%g %g %g} reason %#x vfd %d invoke %p stack%@", r.minimum,
+		    r.maximum, r.preferred, reason, vfd, inv, st]);
+		return orig(self, s, r, reason, vfd, cb);
+	});
+	orig = (id (*)(id, SEL, CAFrameRateRange, unsigned, BOOL, id))method_setImplementation(m, n);
+}
+
 __attribute__((constructor)) static void
 sf_init(void)
 {
@@ -202,7 +250,11 @@ sf_init(void)
 	char *end = NULL;
 	sf_mode = (unsigned)strtoul(e, &end, 0);
 	if (end != NULL && *end == ' ') {
-		sf_target = (float)strtod(end + 1, NULL);
+		char *end2 = NULL;
+		sf_target = (float)strtod(end + 1, &end2);
+		if (end2 != NULL && *end2 == ' ') {
+			sf_min = (float)strtod(end2 + 1, NULL);
+		}
 	}
 	if ((e = getenv("SWEET_FPS_TARGET")) != NULL) {
 		sf_target = (float)atof(e);
@@ -217,6 +269,9 @@ sf_init(void)
 		sf_file = fopen("/var/tmp/sweetfps.log", "a");
 	}
 	sf_hook();
+	if (sf_mode & 0x10) {
+		sf_hook_tick();
+	}
 	if (sf_mode & 1) {
 		sf_log([NSString stringWithFormat:@"on, mode %#x target %g min %g", sf_mode, sf_target, sf_min]);
 	}
