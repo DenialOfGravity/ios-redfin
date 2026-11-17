@@ -1,0 +1,218 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 00:00:00 +0100
+Subject: [PATCH] 1140 redfin: NFC persona: MODE_SET C0 NTF deferred as its own
+ packet (fwif_fmt 0x10000, kern.sweet_nfc_ntf_delay_ms), 0x20000 no-NTF
+ diagnostic
+
+---
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index d3453eb..3e4a8b9 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -46,6 +46,7 @@
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/thread_call.h>               /* 1140: deferred persona NTF */
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <pexpert/pexpert.h>
+@@ -1122,6 +1123,124 @@ ese_pc_on(void)
+ 	return vhci_on() && (nfc_fwif_fmt & 0x1000) && (nfc_fwif_fmt & 0x4000);
+ }
+ 
++/*
++ * 1140 (research doc "Follow-up 3"): phNciNfc_Nfcee_ModeSet stores its pending callback (ctx+0x260/0xba8) only after
++ * the 22 01 write returns; the persona's NTF in the same read as the RSP is handled before that and takes the generic
++ * path, so the 2 s set-mode timer fails the mode set. kern.sweet_nfc_fwif_fmt 0x10000 (with 0x4000 etc.): MODE_SET C0
++ * 00/01 -> 42 01 01 00 alone; the 6F 18 (disable; 0x8000 form) / 6F 20 02 C0 00 (enable) follows as a separate packet
++ * after kern.sweet_nfc_ntf_delay_ms (default 100, clamped to 0..1500) from a thread_call. 0x20000 (diagnostic): after
++ * the disable RSP send nothing. The queued NTF is dropped on CORE_RESET, session open and close. The thread_call takes
++ * gw_lock (a mutex; never a spinlock), builds the packet with the CRC16 trailer if the reply it belongs to had one,
++ * drops the lock and sends with ctl_enqueuedata like gw_ctl_send. Host-bound only; nothing reaches the chip.
++ */
++static uint32_t nfc_ntf_delay_ms = 100;         /* kern.sweet_nfc_ntf_delay_ms */
++static thread_call_t ntf_call;                  /* allocated on first use (gw_lock is a mutex: may block) */
++static uint8_t ntf_q[8];
++static unsigned ntf_qn;                         /* 0 = nothing queued; gw_lock */
++static bool ntf_q_crc;
++static uint32_t ntf_q_unit, ntf_q_gen, ntf_q_ms;
++static uint64_t ntf_q_t0;
++
++static uint64_t
++ntf_now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++/* gw_lock held */
++static void
++ntf_cancel(const char *why)
++{
++	if (ntf_qn != 0) {
++		SAY("nfc-hci: persona: 1140: HCI deferred NTF %02x %02x dropped (%s) t=%llu us\n", ntf_q[0], ntf_q[1], why,
++		    (unsigned long long)ntf_now_us());
++	}
++	ntf_qn = 0;
++	ntf_q_gen++;
++	if (ntf_call != NULL) {
++		(void)thread_call_cancel(ntf_call);
++	}
++}
++
++static uint16_t nci_crc16(const uint8_t *b, unsigned n);
++
++static void
++ntf_fire(__unused thread_call_param_t p0, thread_call_param_t p1)
++{
++	uint8_t b[sizeof(ntf_q) + 2];
++	unsigned n;
++	uint32_t unit;
++	uint64_t t = ntf_now_us(), t0;
++	bool crc;
++
++	lck_mtx_lock(&gw_lock);
++	n = ntf_qn;
++	if (n == 0 || (uint32_t)(uintptr_t)p1 != ntf_q_gen) {     /* stale call: a newer NTF is queued or none */
++		lck_mtx_unlock(&gw_lock);
++		return;
++	}
++	if (!gw.connected || gw.unit != ntf_q_unit) {
++		ntf_qn = 0;
++		lck_mtx_unlock(&gw_lock);
++		return;
++	}
++	memcpy(b, ntf_q, n);
++	crc = ntf_q_crc;
++	if (crc) {
++		uint16_t c = nci_crc16(b, n);
++
++		b[n] = (uint8_t)(c >> 8);
++		b[n + 1] = (uint8_t)c;
++	}
++	unit = gw.unit;
++	t0 = ntf_q_t0;
++	ntf_qn = 0;
++	lck_mtx_unlock(&gw_lock);
++	if (gw_ctl != NULL && ctl_enqueuedata(gw_ctl, unit, b, n + (crc ? 2 : 0), 0) == 0) {
++		gw_up_pkts++;
++		SAY("nfc-hci: persona: 1140: HCI <persona deferred %u [%02x %02x %02x %02x%s]%s sent t=%llu us (+%llu us after the RSP, delay %u ms)\n",
++		    n, b[0], b[1], b[2], b[3], n > 4 ? " .." : "", crc ? " +CRC16" : "", (unsigned long long)t,
++		    (unsigned long long)(t - t0), ntf_q_ms);
++	} else {
++		gw_up_fail++;
++		SAY("nfc-hci: persona: 1140: HCI <persona deferred %02x %02x send FAILED t=%llu us\n", b[0], b[1],
++		    (unsigned long long)t);
++	}
++}
++
++/* gw_lock held: queue one NTF to go up as its own packet after kern.sweet_nfc_ntf_delay_ms */
++static void
++ntf_queue(const uint8_t *b, unsigned n)
++{
++	uint64_t dl;
++	uint32_t ms = nfc_ntf_delay_ms > 1500 ? 1500 : nfc_ntf_delay_ms;
++
++	if (n > sizeof(ntf_q)) {
++		return;
++	}
++	if (ntf_call == NULL) {
++		ntf_call = thread_call_allocate(ntf_fire, NULL);
++		if (ntf_call == NULL) {
++			SAY("nfc-hci: persona: 1140: HCI thread_call_allocate failed: NTF %02x %02x not sent\n", b[0], b[1]);
++			return;
++		}
++	}
++	ntf_cancel("replaced");
++	memcpy(ntf_q, b, n);
++	ntf_qn = n;
++	ntf_q_crc = gw.crc_out;
++	ntf_q_unit = gw.unit;
++	ntf_q_ms = ms;
++	ntf_q_t0 = ntf_now_us();
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &dl);
++	(void)thread_call_enter1_delayed(ntf_call, (thread_call_param_t)(uintptr_t)ntf_q_gen, dl);
++	SAY("nfc-hci: persona: 1140: HCI deferred NTF [%02x %02x %02x %02x%s] queued t=%llu us, delay %u ms%s\n", b[0], b[1],
++	    b[2], b[3], n > 4 ? " .." : "", (unsigned long long)ntf_q_t0, ms, ntf_q_crc ? " +CRC16" : "");
++}
++
+ static void
+ hci_log(const char *dir, const uint8_t *b, unsigned n, const char *note)
+ {
+@@ -1858,6 +1977,29 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				hci_log("host>", p, n, "NFCEE_MODE_SET HCI network 01");
+ 				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK (NCI 1.0, no NTF)");
+ 			}
++			if (ese_pc_on() && n > 4 && p[3] == 0xc0 && (p[4] == 0x00 || p[4] == 0x01) &&
++			    ((nfc_fwif_fmt & 0x10000) || (p[4] == 0x00 && (nfc_fwif_fmt & 0x20000)))) {
++				/* 1140: RSP alone; the NTF later as its own packet (0x10000), or none after a disable (0x20000) */
++				static const uint8_t d1[4] = { 0x6f, 0x18, 0x01, 0x00 };
++				static const uint8_t d2[5] = { 0x6f, 0x18, 0x02, 0xc0, 0x00 };
++				bool alt = (nfc_fwif_fmt & 0x8000) != 0;
++
++				r[2] = (uint8_t)(len - 3);
++				out_put(out, no, cap, r, len);
++				persona_note(0x0201);
++				persona_step_say(p, n);
++				hci_log("host>", p, n, p[4] ? "NFCEE_MODE_SET C0 enable" : "NFCEE_MODE_SET C0 disable");
++				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK, alone (1140)");
++				if (p[4] == 0x00 && (nfc_fwif_fmt & 0x20000)) {
++					SAY("nfc-hci: persona: 1140: HCI diagnostic 0x20000: no NTF after the disable RSP t=%llu us\n",
++					    (unsigned long long)ntf_now_us());
++				} else if (p[4] == 0x00) {
++					ntf_queue(alt ? d2 : d1, alt ? sizeof(d2) : sizeof(d1));
++				} else {
++					ntf_queue(hci_eoop_ntf, sizeof(hci_eoop_ntf));
++				}
++				return true;
++			}
+ 			if (ese_pc_on() && n > 4 && p[3] == 0xc0 && p[4] == 0x00) {
+ 				/* 1139: disable: RSP, then 6F 18 (IceFall Power OFF) completes the pending mode set; no 6F 20 */
+ 				static const uint8_t off1[4] = { 0x6f, 0x18, 0x01, 0x00 };
+@@ -2011,6 +2153,7 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 		local_reset(p, n, out, no, cap);
+ 		gw.rf_active = false;
+ 		hci_conn = 0;                   /* 1137 */
++		ntf_cancel("CORE_RESET");       /* 1140 */
+ 		if (nfc_gw_mode == 1) {
+ 			*want_up = true;
+ 		}
+@@ -2308,6 +2451,7 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
+ 	gw.crc = gw.on_demand = 0;
+ 	gw.pend = gw.crc_rx = gw.crc_out = false;       /* 1127 */
+ 	hci_conn = 0;                                   /* 1137 */
++	ntf_cancel("session open");                     /* 1140 */
+ 	gw.chip_crc = false;                            /* 1132 */
+ 	gw_crc_next = 0;
+ 	strlcpy(gw.who, who, sizeof(gw.who));
+@@ -2335,6 +2479,7 @@ gw_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unit
+ 		gw.connected = false;
+ 		gw.unit = 0;
+ 	}
++	ntf_cancel("session close");    /* 1140 */
+ 	strlcpy(who, gw.who, sizeof(who));
+ 	lck_mtx_unlock(&gw_lock);
+ 	SAY("com.apple.uart.stockholm: CLOSE (%s, unit %u): host packets %u (%u bytes), sent up %u (failed %u)\n", who, unit,
+@@ -2832,6 +2977,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id_info, CTLFLAG_RW | CTLFLAG_LOCKED, &nf
+     "redfin 1119/1125: identity bytes hw.rom.fwmajor.fwminor (default 0x4202016a = PN80V, ROM 2, PN552 FW 02.01.6A)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif, 0,
+     "redfin 1125/1127: persona answer to NXP 2F 19 GetFwInterfaceVersion, big endian (default 0x15, what hw 0x42 needs)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_ntf_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_ntf_delay_ms, 0,
++    "redfin 1140: delay of the persona's deferred NTF after NFCEE_MODE_SET C0 (fwif_fmt 0x10000), ms, 0..1500 (default 100)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif_fmt, 0,
+     "redfin 1127: persona variants: bits 0-1 reply CRC16 (0 mirror the host, 1 never, 2 always once seen/IO_STOCKHOLM_CRC); "
+     "4 = 1125 answers to 2F xx; 8 = GetFwType type 1; 1128: 0x10 = SET_CONFIG A0xx kept as GET values (EEPROM mirror), "
+@@ -2839,7 +2986,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
+     "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
+     "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2); 1138: 0x1000 = eSE EoOP NTF "
+     "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value; 1139: 0x4000 = "
+-    "MODE_SET C0 00 -> 6F 18 01 00 (0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror");
++    "MODE_SET C0 00 -> 6F 18 01 00 (0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
++    "deferred by kern.sweet_nfc_ntf_delay_ms as its own packet, 0x20000 = no NTF after the disable RSP");
+ 
+ static int
+ cfg_hexval(char c)

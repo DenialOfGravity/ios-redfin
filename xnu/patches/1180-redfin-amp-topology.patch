@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 19:39:23 +0100
+Subject: [PATCH] 1180 redfin: AMP variant: E (A55) + P (A76) clusters, Edge
+ scheduler, default P preference without CLPC (compile check, not booted)
+
+---
+ osfmk/arm64/machine_routines.c       | 14 +++++++
+ osfmk/kern/sched_clutch.c            | 53 +++++++++++++++++++++++++++
+ pexpert/pexpert/arm64/SWEET.h        | 15 ++++++++
+ pexpert/pexpert/arm64/board_config.h |  4 ++
+ 4 files changed, 86 insertions(+)
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2..65db424 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -963,6 +963,12 @@ ml_parse_cpu_topology(void)
+ 		cpu_boot_arg = SWEET_SMP_MAX_CPUS;
+ 	}
+ #endif
++#if defined(SWEET_AMP)
++	/* 1180: boot-arg sweetamp=0 = one SMP cluster; sweetampp=N = first P core (default SWEET_AMP_FIRST_P) */
++	uint32_t sweet_amp_on = 1, sweet_amp_first_p = SWEET_AMP_FIRST_P;
++	PE_parse_boot_argn("sweetamp", &sweet_amp_on, sizeof(sweet_amp_on));
++	PE_parse_boot_argn("sweetampp", &sweet_amp_first_p, sizeof(sweet_amp_first_p));
++#endif
+ 
+ 	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
+ 	// so that we trigger a panic later in the boot process, once serial is enabled.
+@@ -1034,6 +1040,14 @@ ml_parse_cpu_topology(void)
+ 		cpu->cluster_type = CLUSTER_TYPE_SMP;
+ 
+ 		int cluster_type = (int)ml_readprop(child, "cluster-type", 0);
++#if defined(SWEET_AMP)
++		/* 1180: the ADT's type, else by core number (MPIDR Aff1 = core on SM7150/SM7250) */
++		if (!sweet_amp_on) {
++			cluster_type = 0;
++		} else if (cluster_type != 'E' && cluster_type != 'P') {
++			cluster_type = ((cpu->phys_id >> 8) >= sweet_amp_first_p) ? 'P' : 'E';
++		}
++#endif
+ 		if (cluster_type == 'E') {
+ 			cpu->cluster_type = CLUSTER_TYPE_E;
+ 		} else if (cluster_type == 'P') {
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 3657d83..7152ee4 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -1113,6 +1113,38 @@ sched_clutch_bucket_init(
+ 	queue_init(&clutch_bucket->scb_thread_timeshare_queue);
+ }
+ 
++#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
++/*
++ * redfin 1180: no CLPC registers on this port, so nothing calls
++ * sched_perfcontrol_thread_group_preferred_clusters_set() and every bucket group would keep Apple's
++ * initial preference, the boot cluster (pset0 = the A55s). With the default edge matrix
++ * (sched_edge_cpu_init_completed(): E->P migration and steal not allowed) the A76s would then run
++ * only bound threads. Boot-arg sweetedgepref: 0 = Apple's default (boot cluster); 1 (default) = what
++ * CLPC's legacy P recommendation gives (sched_perfcontrol_thread_group_recommend() with
++ * sched_edge_restrict_ut/bg): FIXPRI, FG, IN and DF of user thread groups prefer the P cluster,
++ * UT and BG, and the kernel's reserved groups (system/launchd, background, VM, IO, perf controller)
++ * the boot cluster. Used for bucket groups made after sched_edge_cpu_init_completed() (all clusters
++ * exist); earlier ones keep the boot cluster.
++ */
++static int sweet_edge_pref = -1;
++static int sweet_edge_pcluster = -1;
++
++static uint32_t
++sweet_edge_default_cluster(sched_clutch_t clutch, sched_bucket_t bucket)
++{
++	if (sweet_edge_pcluster < 0 || sweet_edge_pref <= 0 || clutch->sc_tg == NULL) {
++		return pset0.pset_cluster_id;
++	}
++	if (bucket == TH_BUCKET_SHARE_UT || bucket == TH_BUCKET_SHARE_BG) {
++		return pset0.pset_cluster_id;
++	}
++	if (thread_group_get_id(clutch->sc_tg) <= THREAD_GROUP_PERF_CONTROLLER) {
++		return pset0.pset_cluster_id;
++	}
++	return (uint32_t)sweet_edge_pcluster;
++}
++#endif /* CONFIG_SCHED_EDGE && SWEET_AMP */
++
+ /*
+  * sched_clutch_bucket_group_init()
+  *
+@@ -1136,7 +1168,11 @@ sched_clutch_bucket_group_init(
+ 
+ 	os_atomic_store(&clutch_bucket_group->scbg_timeshare_tick, 0, relaxed);
+ 	os_atomic_store(&clutch_bucket_group->scbg_pri_shift, INT8_MAX, relaxed);
++#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
++	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, sweet_edge_default_cluster(clutch, bucket), relaxed);
++#else
+ 	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, pset0.pset_cluster_id, relaxed);
++#endif
+ 	/*
+ 	 * All thread groups should be initialized to be interactive; this allows the newly launched
+ 	 * thread groups to fairly compete with already running thread groups.
+@@ -1171,6 +1207,7 @@ sched_clutch_init_with_thread_group(
+ 	struct thread_group *tg)
+ {
+ 	os_atomic_store(&clutch->sc_thr_count, 0, relaxed);
++	clutch->sc_tg = tg;     /* 1180: before the bucket groups (sweet_edge_default_cluster reads it) */
+ 
+ 	/* Initialize all the clutch buckets */
+ 	for (uint32_t i = 0; i < TH_BUCKET_SCHED_MAX; i++) {
+@@ -4886,6 +4923,22 @@ sched_edge_cpu_init_completed(void)
+ 		pset_unlock(src_pset);
+ 	}
+ 	splx(s);
++#if defined(SWEET_AMP)
++	/* 1180: the first P cluster, now that every pset exists (sweet_edge_default_cluster) */
++	if (sweet_edge_pref < 0) {
++		int v = 1;
++		PE_parse_boot_argn("sweetedgepref", &v, sizeof(v));
++		sweet_edge_pref = v;
++	}
++	for (int cluster_id = 0; cluster_id < sched_edge_max_clusters; cluster_id++) {
++		if (pset_array[cluster_id] != PROCESSOR_SET_NULL && pset_array[cluster_id]->pset_type == CLUSTER_TYPE_P) {
++			sweet_edge_pcluster = cluster_id;
++			break;
++		}
++	}
++	kprintf("SWEET AMP: Edge clusters %d, P cluster %d, sweetedgepref %d\n", sched_edge_max_clusters,
++	    sweet_edge_pcluster, sweet_edge_pref);
++#endif
+ }
+ 
+ static bool
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 1a6c571..06a0be3 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -25,6 +25,21 @@
+  */
+ #define SWEET_SMP_MAX_CPUS         8
+ 
++/*
++ * redfin 1180 (AMP variant, branch ws-amp-*; the SMP kernel is any build without this patch): two
++ * CPU clusters, E = the six A55s (cores 0-5) and P = the two A76s (6 gold, 7 prime). __ARM_AMP__ with
++ * MAX_CPU_CLUSTERS 2 (board_config.h) gives one pset per cluster and, as this kernel is built for an
++ * XNU_TARGET_OS_OSX target, the Edge scheduler (proc_reg.h: CONFIG_SCHED_EDGE). No Apple cluster
++ * hardware is used: no HAS_CLUSTER (ml_parse_cpu_topology() numbers clusters by type, E 0 / P 1, like
++ * H10/A11), no acc-impl-reg / cpm-impl-reg in the ADT, no uncore counters.
++ * Cluster types: the ADT's cluster-type ('E'/'P'); where it is 0 (today's SMP ADT) by core number,
++ * core >= SWEET_AMP_FIRST_P is P (boot-arg sweetampp=N). Boot-arg sweetamp=0: every core SMP type,
++ * one cluster and one pset (fallback topology on this kernel).
++ */
++#define SWEET_AMP                 1
++#define SWEET_AMP_FIRST_P         6
++#define __ARM_AMP__               1
++
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+ #define __ARM_VMSA__              8
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..1f95f55 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,11 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
++#if defined(SWEET_AMP) && SWEET_AMP
++#define MAX_CPU_CLUSTERS               2       /* 1180: E (A55) + P (A76) */
++#else
+ #define MAX_CPU_CLUSTERS               1
++#endif
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 

@@ -1,0 +1,155 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 00:30:00 +0100
+Subject: [PATCH] 1141 redfin: NFC: kern.sweet_nfc_mwlog raises nfcd libNFC_Comet
+ middleware log tables (copyout to its own CoW data pages)
+
+---
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 3e4a8b9..3c25e81 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -47,6 +47,8 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <kern/thread_call.h>               /* 1140: deferred persona NTF */
++#include <kern/task.h>                      /* 1141: current_task() */
++#include <vm/vm_shared_region.h>            /* 1141: nfcd's dyld shared region (slide) */
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <pexpert/pexpert.h>
+@@ -1241,6 +1243,92 @@ ntf_queue(const uint8_t *b, unsigned n)
+ 	    b[2], b[3], n > 4 ? " .." : "", (unsigned long long)ntf_q_t0, ms, ntf_q_crc ? " +CRC16" : "");
+ }
+ 
++/*
++ * 1141 (research doc "Follow-up 4"): libNFC_Comet prints a middleware message only if table[component] >= level;
++ * the two per-component tables (16 x int) are libNFC_Comet's __DATA.__common 0x2125364ac and __DATA_DIRTY.__common
++ * 0x214bea2a0 (unslid dyld-cache addresses), filled once by phLogNfc_ConfigureMwLogging with {2,2,2,1,...}, so the
++ * level-4 lines (mode-set RSP/timer/6F 18 handler/notify) never print. kern.sweet_nfc_mwlog = N (default 0 = off):
++ * on the first CORE_RESET of a session, on nfcd's own write thread (gw_ctl_send, current_task() = nfcd, checked by
++ * name), copyout 16 x N (clamped 1..4) to both tables + nfcd's shared-region slide. Slide = the slid start of the
++ * cache (vm_shared_region_start_address) - the unslid address of the cache's first mapping (dyld_cache_header
++ * mapping[0], read with copyin). Both are writable data pages (copy-on-write: only nfcd's own copy changes). A failed
++ * copyout is logged and never retried this boot (no vm_protect). Nothing goes to the chip.
++ */
++static uint32_t nfc_mwlog;              /* kern.sweet_nfc_mwlog */
++static bool mwlog_done, mwlog_pending;  /* per session; gw_lock */
++static bool mwlog_failed;               /* sticky for the boot: no retry after a failure */
++
++static void
++mwlog_run(void)
++{
++	static const uint64_t tgt[2] = { 0x2125364acULL, 0x214bea2a0ULL };
++	uint32_t lv = nfc_mwlog > 4 ? 4 : nfc_mwlog < 1 ? 1 : nfc_mwlog, v[16];
++	char who[32] = "?";
++	task_t task = current_task();
++	vm_shared_region_t sr;
++	mach_vm_offset_t start = 0;
++	struct { char magic[16]; uint32_t moff, mcnt; } hdr;
++	struct { uint64_t addr, size, foff; uint32_t maxp, initp; } m;
++	uint64_t slide;
++	kern_return_t kr;
++	int fails = 0;
++
++	proc_selfname(who, sizeof(who));
++	if (strncmp(who, "nfcd", sizeof(who)) != 0) {
++		SAY("nfc-hci: 1141: mwlog: CORE_RESET written by %s (pid %d), not nfcd: skipped\n", who, proc_selfpid());
++		return;
++	}
++	sr = vm_shared_region_get(task);
++	if (sr == NULL) {
++		SAY("nfc-hci: 1141: mwlog: nfcd (pid %d) has no shared region: not done, no retry\n", proc_selfpid());
++		mwlog_failed = true;
++		return;
++	}
++	kr = vm_shared_region_start_address(sr, &start, task);
++	vm_shared_region_deallocate(sr);                /* drop the reference vm_shared_region_get took */
++	if (kr != KERN_SUCCESS) {
++		SAY("nfc-hci: 1141: mwlog: vm_shared_region_start_address -> %d: not done, no retry\n", kr);
++		mwlog_failed = true;
++		return;
++	}
++	if (copyin((user_addr_t)start, &hdr, sizeof(hdr)) != 0 || strncmp(hdr.magic, "dyld_v1", 7) != 0 ||
++	    hdr.mcnt == 0 || copyin((user_addr_t)(start + hdr.moff), &m, sizeof(m)) != 0) {
++		SAY("nfc-hci: 1141: mwlog: dyld cache header at %#llx not readable/valid: not done, no retry\n",
++		    (unsigned long long)start);
++		mwlog_failed = true;
++		return;
++	}
++	slide = start - m.addr;
++	SAY("nfc-hci: 1141: mwlog: nfcd pid %d, cache at %#llx (unslid %#llx, %u mappings), slide %#llx, level %u\n",
++	    proc_selfpid(), (unsigned long long)start, (unsigned long long)m.addr, hdr.mcnt, (unsigned long long)slide, lv);
++	for (unsigned i = 0; i < 16; i++) {
++		v[i] = lv;
++	}
++	for (unsigned t = 0; t < 2; t++) {
++		const char *where = "not in the main cache file's mappings (subcache)";
++		int e;
++
++		for (unsigned i = 0; i < hdr.mcnt && i < 16; i++) {
++			if (copyin((user_addr_t)(start + hdr.moff + 32u * i), &m, sizeof(m)) != 0) {
++				break;
++			}
++			if (tgt[t] >= m.addr && tgt[t] + sizeof(v) <= m.addr + m.size) {
++				where = (m.initp & 2) ? "in a writable mapping" : "in a READ-ONLY mapping";
++				break;
++			}
++		}
++		e = copyout(v, (user_addr_t)(tgt[t] + slide), sizeof(v));
++		SAY("nfc-hci: 1141: mwlog: table %#llx -> %#llx (%s): copyout 16 x %u -> %d%s\n", (unsigned long long)tgt[t],
++		    (unsigned long long)(tgt[t] + slide), where, lv, e, e ? " FAILED (no retry, no vm_protect)" : " ok");
++		if (e != 0) {
++			fails++;
++		}
++	}
++	if (fails) {
++		mwlog_failed = true;
++	}
++}
++
+ static void
+ hci_log(const char *dir, const uint8_t *b, unsigned n, const char *note)
+ {
+@@ -2154,6 +2242,10 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 		gw.rf_active = false;
+ 		hci_conn = 0;                   /* 1137 */
+ 		ntf_cancel("CORE_RESET");       /* 1140 */
++		if (nfc_mwlog != 0 && !mwlog_done && !mwlog_failed) {  /* 1141: once per session, after the lock is dropped */
++			mwlog_done = true;
++			mwlog_pending = true;
++		}
+ 		if (nfc_gw_mode == 1) {
+ 			*want_up = true;
+ 		}
+@@ -2452,6 +2544,7 @@ gw_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, void **uniti
+ 	gw.pend = gw.crc_rx = gw.crc_out = false;       /* 1127 */
+ 	hci_conn = 0;                                   /* 1137 */
+ 	ntf_cancel("session open");                     /* 1140 */
++	mwlog_done = mwlog_pending = false;             /* 1141 */
+ 	gw.chip_crc = false;                            /* 1132 */
+ 	gw_crc_next = 0;
+ 	strlcpy(gw.who, who, sizeof(gw.who));
+@@ -2649,8 +2742,13 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo,
+ 		}
+ 	}
+ 	memcpy(copy, out, no);
++	bool mwl = mwlog_pending;                       /* 1141 */
++	mwlog_pending = false;
+ 	lck_mtx_unlock(&gw_lock);
+ 	mbuf_freem(m);
++	if (mwl) {
++		mwlog_run();                            /* nfcd's own thread, no lock held (copyin/copyout may fault) */
++	}
+ 	if (want_up) {
+ 		(void)gw_session_start();
+ 	}
+@@ -2977,6 +3075,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_id_info, CTLFLAG_RW | CTLFLAG_LOCKED, &nf
+     "redfin 1119/1125: identity bytes hw.rom.fwmajor.fwminor (default 0x4202016a = PN80V, ROM 2, PN552 FW 02.01.6A)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif, 0,
+     "redfin 1125/1127: persona answer to NXP 2F 19 GetFwInterfaceVersion, big endian (default 0x15, what hw 0x42 needs)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_mwlog, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_mwlog, 0,
++    "redfin 1141: N > 0 = raise nfcd's libNFC_Comet middleware log tables to N (1..4) at the first CORE_RESET of a session");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_ntf_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_ntf_delay_ms, 0,
+     "redfin 1140: delay of the persona's deferred NTF after NFCEE_MODE_SET C0 (fwif_fmt 0x10000), ms, 0..1500 (default 100)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_fwif_fmt, 0,

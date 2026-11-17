@@ -1,0 +1,67 @@
+From 86bd264e448738f66d323fd0f870ec2ed798ab9a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 16:22:59 +0100
+Subject: [PATCH] 1162 redfin: p disp on|off sets the display power (pa wake /
+ pa sleep)
+
+p disp (0991) only printed the display power state; the only remote lever was the injected power key
+(0137 key 0), a toggle that iOS's press-to-wake can undo ~6.3 s later. p disp on|off now sets fPowerOff
+exactly as IOMobileFramebuffer's RequestPowerChange (selector 12, backboardd's power button / auto-lock
+path) does: same lock, fade restart, dirty redraw, 1116 PCC kick on wake, 0989 scanout leave on off;
+klog "SWEET FB: display on|off (p disp set)". No argument: unchanged read-only print.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3m6ZmN2BdPtBVKVTj
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 35 ++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3dc9984..6afad39 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -6128,7 +6128,40 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 		return;
+ 	}
+ 	if (end - s >= 4 && !strncmp(s, "disp", 4)) {
+-		/* 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh) */
++		/*
++		 * 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh, pa disp).
++		 * 1162: p disp on|off: set it, exactly as IOMobileFramebuffer's RequestPowerChange (selector 12, the power
++		 * button / auto-lock path) does, so `pa wake` / `pa sleep` are deterministic instead of toggling the
++		 * injected power key. No argument: unchanged read-only print.
++		 */
++		const char *q = s + 4;
++		while (q < end && *q == ' ') {
++			q++;
++		}
++		int want = -1;
++		if (end - q >= 2 && !strncmp(q, "on", 2)) {
++			want = 0;
++		} else if (end - q >= 3 && !strncmp(q, "off", 3)) {
++			want = 1;
++		}
++		if (want >= 0) {
++			bool off = want == 1;
++			IOLockLock(fLock);
++			if (off != fPowerOff) {
++				fPowerOff = off;
++				fFadeStep = 0;
++				fDirty = true;          /* on: redraw the latest frame */
++				if (!off && sweet_cm_st.touched) {
++					sweet_cm_kick_locked(this);     /* 1116: PCC again, in case the display power lost it */
++				}
++			}
++			IOLockUnlock(fLock);
++			if (off && sweet_scan_live()) {
++				sweet_scan_leave(this, "display off");  /* 0989: the fade goes through the panel buffer */
++			}
++			IOLog("SWEET FB: display %s (p disp set)\n", off ? "off" : "on");
++			return;
++		}
+ 		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
+ 		return;
+ 	}
+-- 
+2.53.0
+

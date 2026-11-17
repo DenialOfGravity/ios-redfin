@@ -1,0 +1,99 @@
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 23:30:00 +0100
+Subject: [PATCH] 1139 redfin: NFC persona: eSE power cycle (fwif_fmt 0x4000):
+ MODE_SET C0 00 -> 6F 18 (0x8000 alt form), A0EB mirror, repeat-safe
+
+---
+
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index b362ae5..d3453eb 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -1106,6 +1106,22 @@ vhci_on(void)
+ 	return (nfc_fwif_fmt & 0x400) && vese_on();
+ }
+ 
++/*
++ * 1139 (logs/research/nfc-ese-2026-11-16.md, "Follow-up 2"): the eSE power cycle (ClearEseSessionId -> "eSE ReInit
++ * Sequence" 0x212535298) starts with NFCEE_MODE_SET C0 00. A disable is completed by the NXP NTF 6F 18 ("IceFall Power
++ * OFF", phNciNfc_ProcessModeSetDisableNtf 0x1f513750c), not by EoOP 6F 20 (dropped for a disable: ctx+0xddc = 0).
++ * kern.sweet_nfc_fwif_fmt 0x4000 (only with 0x400 + 0x1000 + vese_on()): MODE_SET C0 00 -> 42 01 01 00 + 6F 18 01 00
++ * (0x8000: 6F 18 02 C0 00 instead), no 6F 20; MODE_SET C0 01 -> 42 01 01 00 + 6F 20 02 C0 00 (1138); NFCEE_DISCOVER
++ * disable -> 42 00 02 00 00; repeated NFCEE_DISCOVER enable / CORE_CONN_CREATE answered as the first time (conn 2
++ * re-tracked, never "already open"); GET_CONFIG A0EB = the last host-set value (as 0x2000), so ff*8 verifies on the
++ * second pass. Host-bound only via out_put; nothing reaches the chip.
++ */
++static bool
++ese_pc_on(void)
++{
++	return vhci_on() && (nfc_fwif_fmt & 0x1000) && (nfc_fwif_fmt & 0x4000);
++}
++
+ static void
+ hci_log(const char *dir, const uint8_t *b, unsigned n, const char *note)
+ {
+@@ -1242,7 +1258,7 @@ cfg_get(uint16_t id, uint8_t *v, bool *ovr)
+ 		v[0] = swp_set[swp_idx(id)];
+ 		return 1;
+ 	}
+-	if (id == 0xa0eb && a0eb_len != 0 && (nfc_fwif_fmt & 0x2000) && vhci_on()) {     /* 1138 */
++	if (id == 0xa0eb && a0eb_len != 0 && (((nfc_fwif_fmt & 0x2000) && vhci_on()) || ese_pc_on())) {   /* 1138/1139 */
+ 		memcpy(v, a0eb_set, a0eb_len);
+ 		return a0eb_len;
+ 	}
+@@ -1805,6 +1821,10 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				}
+ 				persona_note(0x0200);
+ 				persona_step_say(p, n);
++				if (!en && ese_pc_on()) {
++					hci_log("host>", p, n, "NFCEE_DISCOVER disable (eSE ReInit seq)");
++					hci_log("<persona", r, len, "NFCEE_DISCOVER_RSP OK, 0 NFCEEs (1139)");
++				}
+ 				if (hci) {
+ 					hci_log("host>", p, n, "NFCEE_DISCOVER enable");
+ 					hci_log("<persona", r, len, "NFCEE_DISCOVER_RSP OK, 2 NFCEEs");
+@@ -1838,6 +1858,24 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				hci_log("host>", p, n, "NFCEE_MODE_SET HCI network 01");
+ 				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK (NCI 1.0, no NTF)");
+ 			}
++			if (ese_pc_on() && n > 4 && p[3] == 0xc0 && p[4] == 0x00) {
++				/* 1139: disable: RSP, then 6F 18 (IceFall Power OFF) completes the pending mode set; no 6F 20 */
++				static const uint8_t off1[4] = { 0x6f, 0x18, 0x01, 0x00 };
++				static const uint8_t off2[5] = { 0x6f, 0x18, 0x02, 0xc0, 0x00 };
++				bool alt = (nfc_fwif_fmt & 0x8000) != 0;
++
++				r[2] = (uint8_t)(len - 3);
++				out_put(out, no, cap, r, len);
++				out_put(out, no, cap, alt ? off2 : off1, alt ? sizeof(off2) : sizeof(off1));
++				persona_note(0x0201);
++				persona_step_say(p, n);
++				hci_log("host>", p, n, "NFCEE_MODE_SET C0 disable");
++				hci_log("<persona", r, len, "NFCEE_MODE_SET_RSP OK");
++				hci_log("<persona", alt ? off2 : off1, alt ? sizeof(off2) : sizeof(off1),
++				    alt ? "NXP 6F 18 (IceFall Power OFF) C0 status 00, fwif_fmt 0x8000 form (1139)" :
++				    "NXP 6F 18 (IceFall Power OFF) status 00: disable complete (1139)");
++				return true;
++			}
+ 			if (vhci_on() && (nfc_fwif_fmt & 0x1000) && n > 4 && p[3] == 0xc0 && (p[4] == 0x00 || p[4] == 0x01)) {
+ 				/* 1138: RSP, then the eSE EoOP at once: completes the pending mode set (2 s timer) */
+ 				r[2] = (uint8_t)(len - 3);
+@@ -1866,6 +1904,9 @@ persona_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
+ 				    "CORE_CONN_CREATE: not the virtual HCI network (NFCEE 01, HCI access): refused as before");
+ 				return false;
+ 			}
++			if (hci_conn != 0) {    /* 1139: a repeat (eSE ReInit seq) is answered as the first, conn re-tracked */
++				hci_log("host>", p, n, "CORE_CONN_CREATE again: answered as the first time, conn 2 re-tracked (1139)");
++			}
+ 			hci_conn = 0x02;        /* the only dynamic conn the persona ever has */
+ 			r[len++] = 0x00;        /* status OK */
+ 			r[len++] = 0xff;        /* max data packet payload */
+@@ -2797,7 +2838,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
+     "0x20 = 1127 GET_CONFIG answer (each id one zero byte); 1132: 0x40 = ignore SET_CONFIG A0 BF (no chip CRC), "
+     "0x80 = chip CRC state kept over Power 0; 1134: 0x100/0x200 = virtual eSE; 1136: 0x400 = + virtual HCI network, "
+     "0x800 = 1137: also answer CORE_CONN_CREATE for the virtual NFCEE 01 (HCI conn 2); 1138: 0x1000 = eSE EoOP NTF "
+-    "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value");
++    "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value; 1139: 0x4000 = "
++    "MODE_SET C0 00 -> 6F 18 01 00 (0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror");
+ 
+ static int
+ cfg_hexval(char c)

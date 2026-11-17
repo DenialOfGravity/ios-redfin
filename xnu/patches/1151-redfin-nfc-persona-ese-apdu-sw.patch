@@ -1,0 +1,59 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 09:00:00 +0100
+Subject: [PATCH] 1151 redfin: NFC persona: virtual eSE answers C-APDUs (EVT_TRANSMIT_DATA) with a status word
+
+rk24b with GET_CONFIG A022=01/A023=01 (kern.sweet_nfc_cfg_set) and fwif bit 0x10: the eSE session
+loop and the A0xx config loop both converge; nfcd then enables the eSE (MODE_SET C0 01) and sends a
+SELECT (AID D2 76 00 00 85 41 00 00 00 00 20 00) as HCP EVT_TRANSMIT_DATA on pipe 0x19 over the HCI
+conn, waits ~11 s for an answer and restarts. New bit 0x200000: answer EVT_TRANSMIT_DATA on the same
+pipe with R-APDU = kern.sweet_nfc_apdu_sw (default 6A 82, applet not found). Host-bound only.
+
+---
+diff --git a/bsd/dev/sweet_nfc.c b/bsd/dev/sweet_nfc.c
+index 91cd545..04ed632 100644
+--- a/bsd/dev/sweet_nfc.c
++++ b/bsd/dev/sweet_nfc.c
+@@ -1087,6 +1087,7 @@ vese_on(void)
+  * sweet_nfc_tx_allowed() re-checks at the bus. No 2F packet, no pin. Klog lines: "SWEET NFC: nfc-hci: persona: 1136: HCI".
+  */
+ static unsigned hci_said;
++static uint32_t nfc_apdu_sw = 0x6a82;   /* 1151: kern.sweet_nfc_apdu_sw, R-APDU SW for eSE EVT_TRANSMIT_DATA */
+ static const uint8_t hci_session_id[8] = { 0x52, 0x46, 0x4e, 0x30, 0x00, 0x00, 0x00, 0x01 };     /* "RFN0" 00 00 00 01 */
+ static const uint8_t hci_credit_ntf[6] = { 0x60, 0x06, 0x03, 0x01, 0x01, 0x01 };     /* conn 1, +1 credit */
+ /*
+@@ -1356,7 +1357,7 @@ hci_log(const char *dir, const uint8_t *b, unsigned n, const char *note)
+ static bool
+ persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigned cap)
+ {
+-	uint8_t r[3 + 2 + 8];
++	uint8_t r[3 + 2 + 8 + 4];
+ 	unsigned rl = 0;
+ 	const char *what;
+ 
+@@ -1374,7 +1375,16 @@ persona_hci_data(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsig
+ 		r[0] = cid;
+ 		r[1] = 0x00;
+ 		r[3] = (uint8_t)(0x80 | pipe);
+-		if (type != 0) {
++		if (type == 1 && ins == 0x10 && (nfc_fwif_fmt & 0x200000)) {
++			/* 1151: EVT_TRANSMIT_DATA carrying a C-APDU to the virtual eSE: answer EVT_TRANSMIT_DATA on the same
++			 * pipe with an R-APDU that is just the status word kern.sweet_nfc_apdu_sw (default 6A 82 = applet not
++			 * found). Host-bound only; the real eSE (SPI CS1) is never touched. */
++			r[4] = 0x50;
++			r[5] = (uint8_t)(nfc_apdu_sw >> 8);
++			r[6] = (uint8_t)nfc_apdu_sw;
++			rl = 7;
++			what = "HCP EVT_TRANSMIT_DATA (C-APDU): R-APDU = kern.sweet_nfc_apdu_sw (1151)";
++		} else if (type != 0) {
+ 			what = type == 1 ? "HCP event: no reply" : "HCP response: no reply";
+ 		} else if (pipe != 0x01) {
+ 			r[4] = 0x81;    /* response, ANY_E_NOK */
+@@ -3258,6 +3268,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_f
+     "redfin 1125/1127: persona answer to NXP 2F 19 GetFwInterfaceVersion, big endian (default 0x15, what hw 0x42 needs)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_mwlog, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_mwlog, 0,
+     "redfin 1141: N > 0 = raise nfcd's libNFC_Comet middleware log tables to N (1..4) at the first CORE_RESET of a session");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_apdu_sw, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_apdu_sw, 0,
++    "1151: status word the virtual eSE returns to every C-APDU (EVT_TRANSMIT_DATA) with fwif_fmt 0x200000; default 0x6a82");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_dl_ver, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_dl_ver, 0,
+     "1150: firmware version the NFC persona reports in download mode (HDLL GET_VERSION data[7]=hi, data[8]=lo; default 0x015a)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_ntf_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &nfc_ntf_delay_ms, 0,
