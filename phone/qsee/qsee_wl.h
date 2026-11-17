@@ -21,7 +21,10 @@
 #define SMC64			0x40000000u	/* scm.c SMC64_MASK, the scm_version_mask on arm64 */
 #define TZ_OWNER_SIP		2
 #define TZ_OWNER_QSEE_OS	50
+#define TZ_OWNER_TZ_APPS	48
 #define TZ_SVC_APP_MGR		1
+#define TZ_SVC_LISTENER		2
+#define TZ_SVC_APP_ID_PLACEHOLDER 0
 #define TZ_SVC_INFO		6
 #define TZ_SVC_MEMORY_PROTECTION 12
 #define TZ_ARGS(n)		((uint64_t)(n) & 0xf)
@@ -29,18 +32,42 @@
 #define TZ_VAL			0
 #define TZ_BUF_RW		2
 
-/* the four calls qseeprobe may make (x0 as issued) */
+/* read-only calls (ws-qsee-a; x0 as issued) */
 #define QSEE_SMC_FEAT_VERSION	(TZ_SMC_ID(TZ_OWNER_SIP, TZ_SVC_INFO, 0x03) | SMC64)		/* 0x42000603 */
 #define QSEE_SMC_APP_LOOKUP	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_APP_MGR, 0x03) | SMC64)	/* 0x72000103 */
 #define QSEE_SMC_SHMB_CREATE	(TZ_SMC_ID(TZ_OWNER_SIP, TZ_SVC_MEMORY_PROTECTION, 0x1e) | SMC64) /* 0x42000c1e */
 #define QSEE_SMC_SHMB_DELETE	(TZ_SMC_ID(TZ_OWNER_SIP, TZ_SVC_MEMORY_PROTECTION, 0x1d) | SMC64) /* 0x42000c1d */
 
+/* ws-qsee-b: app load / send / unload and the abort path for listener requests (qseecomi.h 451-462, 521-548,
+ * 674-694; qseecom.c qseecom_scm_call2 590-890). Never: LOAD_SERVICES_IMAGE, listener register, RPMB, keystore,
+ * TZ_SHM_BRIDGE_ENABLE. */
+#define QSEE_SMC_APP_START	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_APP_MGR, 0x01) | SMC64)	/* 0x72000101 */
+#define QSEE_SMC_APP_SHUTDOWN	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_APP_MGR, 0x02) | SMC64)	/* 0x72000102 */
+#define QSEE_SMC_LSTNR_RESP	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x03) | SMC64)	/* 0x72000203 */
+#define QSEE_SMC_CONT_BLOCKED	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x04) | SMC64)	/* 0x72000204 */
+#define QSEE_SMC_CONT_BLOCKED_SI (TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x07) | SMC64)	/* 0x72000207 */
+#define QSEE_SMC_SEND_DATA	(TZ_SMC_ID(TZ_OWNER_TZ_APPS, TZ_SVC_APP_ID_PLACEHOLDER, 0x01) | SMC64) /* 0x70000001 */
+#define QSEE_SMC_SEND_DATA_WL	(TZ_SMC_ID(TZ_OWNER_TZ_APPS, TZ_SVC_APP_ID_PLACEHOLDER, 0x06) | SMC64) /* 0x70000006 */
+
 #define QSEE_ARGS_FEAT_VERSION	(TZ_ARGS(1) | TZ_ARG(0, TZ_VAL))				/* 0x01 */
 #define QSEE_ARGS_APP_LOOKUP	(TZ_ARGS(2) | TZ_ARG(0, TZ_BUF_RW) | TZ_ARG(1, TZ_VAL))		/* 0x22 */
 #define QSEE_ARGS_SHMB_CREATE	TZ_ARGS(4)							/* 0x04 */
 #define QSEE_ARGS_SHMB_DELETE	TZ_ARGS(1)							/* 0x01 */
+#define QSEE_ARGS_APP_START	TZ_ARGS(3)				/* mdt_len, img_len, pa: 0x03 */
+#define QSEE_ARGS_APP_SHUTDOWN	TZ_ARGS(1)				/* app_id: 0x01 */
+#define QSEE_ARGS_LSTNR_RESP	TZ_ARGS(2)				/* listener_id, status: 0x02 */
+#define QSEE_ARGS_CONT_BLOCKED	TZ_ARGS(1)				/* app or session id: 0x01 */
+#define QSEE_ARGS_SEND_DATA	(TZ_ARGS(5) | TZ_ARG(1, TZ_BUF_RW) | TZ_ARG(3, TZ_BUF_RW))			/* 0x885 */
+#define QSEE_ARGS_SEND_DATA_WL	(TZ_ARGS(7) | TZ_ARG(1, TZ_BUF_RW) | TZ_ARG(3, TZ_BUF_RW) | TZ_ARG(5, TZ_BUF_RW))	/* 0x8887 */
 
 #define QSEE_FEATURE_QSEE	10		/* qseecom_init_control: uint32_t feature = 10 */
+#define QSEE_FEATURE_WHITELIST	15		/* qseecom.c FEATURE_ID_WHITELIST; >= 1.0.0 (1 << 22) -> send-data with whitelist */
+#define QSEE_WHITELIST_V1	(1u << 22)
+#define RPMB_SERVICE		0x2000
+#define SSD_SERVICE		0x3000
+#define MAX_ION_FD		4		/* sglistinfo table: 4 entries of {indexAndFlags, sizeOrCount} */
+#define SGLIST_SET(c, s, i)	((uint32_t)((((c) & 1u) << 31) | (((s) & 1u) << 30) | ((i) & 0x3fffffffu)))
+#define N_EXT_SCM_ARGS		7		/* scm.c: args[3..9] go in a buffer whose pa is x5 when nargs > 4 */
 #define QSEE_APP_NAME_MAX	64		/* uapi qseecom.h MAX_APP_NAME_SIZE */
 #define QSEOS_RESULT_SUCCESS	0u
 #define QSEOS_RESULT_INCOMPLETE	1u

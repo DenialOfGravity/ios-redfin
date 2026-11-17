@@ -1,21 +1,28 @@
 /*
- * qseeprobe (ws-qsee-a): read-only QSEE/QTEE queries over /dev/pmem PMEM_SMC (xnu 0094), for the fingerprint track
+ * qseeprobe (ws-qsee-a, extended in ws-qsee-b): QSEE/QTEE queries over /dev/pmem PMEM_SMC (xnu 0094), for the fingerprint track
  * (PF/logs/research/fingerprint-2026-11-16.md, P2.8 "Revised first experiment"). No kernel change.
  *
  *   qseeprobe version            TZ_INFO_GET_FEATURE_VERSION(feature 10 = QSEE), as Linux qseecom_init_control.
  *                                Stock Android logs "qseecom.qsee_version = 0x1402000" (5.2.0).
  *   qseeprobe lookup [NAME...]   TZ_OS_APP_LOOKUP per name (default: keymaster64 cmnlib64 fpctzappfingerprint):
  *                                loaded or not, and the app ID. The name goes in a zeroed 4 KB PMEM_ALLOC page.
+ *   qseeprobe load NAME DIR      ws-qsee-b: TZ_OS_APP_START of DIR/NAME.mdt + NAME.bNN in one contiguous buffer
+ *   qseeprobe send-build-info ID ws-qsee-b: FPC g12/1 get_build_info to app ID (must be QSEE_APP's id)
+ *   qseeprobe unload ID          ws-qsee-b: TZ_OS_APP_SHUTDOWN of app ID (must be QSEE_APP's id, never keymaster64)
  *   qseeprobe whitelist          the SMCs this tool may issue
+ * A listener request (INCOMPLETE / BLOCKED_ON_LISTENER) is refused as Linux refuses a listener that does not exist,
+ * its id is printed as "LISTENER REQUESTED", and the exit code is 4 (qsee_app.inc).
  * Environment:
  *   QSEE_DRYRUN=1      print every SMC, issue none (no /dev/pmem needed)
- *   QSEE_SHMBRIDGE=1   lookup: register the name page with TZ_SHM_BRIDGE_CREATE first (VMID_HLOS, R|W, as Linux's
+ *   QSEE_SHMBRIDGE=1   register every buffer handed to TZ (name page, image, sb, bulk, extra-arg page); lookup: the page with TZ_SHM_BRIDGE_CREATE first (VMID_HLOS, R|W, as Linux's
  *                      default bridge) and TZ_SHM_BRIDGE_DELETE it afterwards. Default: a plain PMEM_ALLOC page.
  *                      TZ_SHM_BRIDGE_ENABLE (one-way) is never issued.
+ *   QSEE_APP=NAME      send/unload guard: the app the ID must belong to (default fpctzappfingerprint)
+ *   QSEE_SEND=wl|legacy  send-data form (default: as Linux, by TZ whitelist feature 15 >= 1.0.0)
  *   QSEE_CONSOLE=0     do not mirror the log lines to /dev/console (default: mirrored, so a hang leaves a klog line)
  *
  * Every SMC passes qsmc(): x0 and x1 must match an entry of qsee_whitelist[] (qsee_wl.c) or the tool exits before
- * the ioctl. No load/unload, send-cmd, listener, RPMB or key calls exist in this tool.
+ * the ioctl. No listener registration, services-image load, RPMB, key or bridge-enable calls exist in this tool.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -91,10 +98,15 @@ static int cmd_version(void)
 	uint32_t v = (uint32_t)x[1];
 	say("version: qsee_version %#x = %u.%u.%u (stock Android: 0x1402000)%s", v, v >> 22, (v >> 12) & 0x3ff,
 	    v & 0xfff, dryrun ? "  (dry run)" : "");
+	uint64_t y[8] = { QSEE_SMC_FEAT_VERSION, QSEE_ARGS_FEAT_VERSION, QSEE_FEATURE_WHITELIST };
+	if (!qsmc(y))
+		say("version: whitelist feature (15) %#x -> %s", (unsigned)y[1],
+		    (uint32_t)y[1] >= QSEE_WHITELIST_V1 ? "Linux would use SEND_DATA_WITH_WHITELIST" : "plain SEND_DATA");
 	return 0;
 }
 
 static uint64_t buf_pa;
+static uint32_t lookup_app_id;	/* set by lookup_one() on LOADED */
 static uint64_t bridge_handle;
 static int bridged;
 
@@ -166,6 +178,7 @@ static int lookup_one(const char *name)
 	}
 	if (result == QSEOS_RESULT_SUCCESS && type == QSEOS_APP_ID) {
 		say("lookup %s: LOADED, app id %u", name, data);
+		lookup_app_id = data;
 		return 0;
 	}
 	say("lookup %s: unexpected result %#x resp_type %#x data %#x", name, result, type, data);
@@ -206,6 +219,8 @@ out:
 	return worst == 1 ? 0 : worst;	/* "not loaded" is an answer, not an error */
 }
 
+#include "qsee_app.inc"
+
 int main(int argc, char **argv)
 {
 	const char *e;
@@ -214,8 +229,10 @@ int main(int argc, char **argv)
 	if (!(e = getenv("QSEE_CONSOLE")) || atoi(e))
 		con = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (argc < 2) {
-		fprintf(stderr, "usage: qseeprobe version | lookup [NAME...] | whitelist\n"
-				"  env QSEE_DRYRUN=1 (print SMCs only), QSEE_SHMBRIDGE=1 (bridge the lookup buffer)\n");
+		fprintf(stderr, "usage: qseeprobe version | lookup [NAME...] | load NAME DIR | send-build-info APPID |\n"
+				"       unload APPID | whitelist\n"
+				"  env QSEE_DRYRUN=1 (print SMCs only), QSEE_SHMBRIDGE=1 (bridge every buffer),\n"
+				"      QSEE_APP=NAME (send/unload guard), QSEE_SEND=wl|legacy\n");
 		return 1;
 	}
 	if (!strcmp(argv[1], "whitelist")) {
@@ -231,6 +248,12 @@ int main(int argc, char **argv)
 		return cmd_version();
 	if (!strcmp(argv[1], "lookup"))
 		return cmd_lookup(argc - 2, argv + 2);
-	fprintf(stderr, "qseeprobe: unknown command %s\n", argv[1]);
+	if (!strcmp(argv[1], "load") && argc == 4)
+		return cmd_load(argv[2], argv[3]);
+	if (!strcmp(argv[1], "send-build-info") && argc == 3)
+		return cmd_send_build_info((uint32_t)strtoul(argv[2], NULL, 0));
+	if (!strcmp(argv[1], "unload") && argc == 3)
+		return cmd_unload((uint32_t)strtoul(argv[2], NULL, 0));
+	fprintf(stderr, "qseeprobe: unknown command or arguments: %s\n", argv[1]);
 	return 1;
 }

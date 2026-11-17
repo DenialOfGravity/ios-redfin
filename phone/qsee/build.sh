@@ -1,5 +1,5 @@
 #!/bin/sh
-# qseeprobe (ws-qsee-a): read-only QSEE queries over /dev/pmem PMEM_SMC, into phone/qsee/out with work/userland/bin/ios-cc,
+# qseeprobe (ws-qsee-a, ws-qsee-b): QSEE queries + app load/send/unload over /dev/pmem PMEM_SMC, into phone/qsee/out with work/userland/bin/ios-cc,
 # signed ad hoc. The host test of the SMC whitelist runs first (any host cc) and fails the build if it fails.
 # Called by phone/tools/build.sh; copies into the userland output (../../../out, holding dropbearmulti) if it exists.
 set -e

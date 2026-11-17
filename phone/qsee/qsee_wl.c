@@ -1,4 +1,4 @@
-/* The only SMCs qseeprobe may issue (read-only QSEE queries + the shmbridge buffer registration they may need). */
+/* The only SMCs qseeprobe may issue (QSEE queries, the shmbridge registration, and since ws-qsee-b app start/send-data/shutdown plus the listener-abort path). */
 #include <stddef.h>
 #include "qsee_wl.h"
 
@@ -7,6 +7,13 @@ const struct qsee_wl_ent qsee_whitelist[] = {
 	{ QSEE_SMC_APP_LOOKUP, QSEE_ARGS_APP_LOOKUP, "TZ_OS_APP_LOOKUP" },
 	{ QSEE_SMC_SHMB_CREATE, QSEE_ARGS_SHMB_CREATE, "TZ_SHM_BRIDGE_CREATE" },
 	{ QSEE_SMC_SHMB_DELETE, QSEE_ARGS_SHMB_DELETE, "TZ_SHM_BRIDGE_DELETE" },
+	{ QSEE_SMC_APP_START, QSEE_ARGS_APP_START, "TZ_OS_APP_START" },
+	{ QSEE_SMC_APP_SHUTDOWN, QSEE_ARGS_APP_SHUTDOWN, "TZ_OS_APP_SHUTDOWN" },
+	{ QSEE_SMC_SEND_DATA, QSEE_ARGS_SEND_DATA, "TZ_APP_QSAPP_SEND_DATA" },
+	{ QSEE_SMC_SEND_DATA_WL, QSEE_ARGS_SEND_DATA_WL, "TZ_APP_QSAPP_SEND_DATA_WITH_WHITELIST" },
+	{ QSEE_SMC_LSTNR_RESP, QSEE_ARGS_LSTNR_RESP, "TZ_OS_LISTENER_RESPONSE_HANDLER" },
+	{ QSEE_SMC_CONT_BLOCKED, QSEE_ARGS_CONT_BLOCKED, "TZ_OS_CONTINUE_BLOCKED_REQUEST" },
+	{ QSEE_SMC_CONT_BLOCKED_SI, QSEE_ARGS_CONT_BLOCKED, "TZ_OS_CONTINUE_BLOCKED_REQUEST_SMCINVOKE" },
 };
 const unsigned qsee_whitelist_n = sizeof(qsee_whitelist) / sizeof(qsee_whitelist[0]);
 
