@@ -24,7 +24,8 @@ st = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(st)
 
 HM_BASE = (0x21 << 24) | (0xA6 << 16)
-HM_NAMES = {1: 'HM_ENC', 2: 'HM_LABEL', 3: 'HM_CB', 4: 'HM_PASS', 5: 'HM_SHADER', 6: 'HM_CTR'}
+HM_NAMES = {1: 'HM_ENC', 2: 'HM_LABEL', 3: 'HM_CB', 4: 'HM_PASS', 5: 'HM_SHADER', 6: 'HM_CTR', 7: 'HM_CAL'}
+STAGES = {0: 'vertex', 1: 'fragment', 2: 'compute'}
 ENC_KIND = {1: 'render', 2: 'compute', 3: 'blit'}
 CA_BASE = (0x31 << 24) | (0xCA << 16)
 GPU_PID, DISP_PID = 1000001, 1000002
@@ -129,6 +130,8 @@ def export(T, out, procs=None, t_from=None, t_to=None):
 
     # GPU clock -> mach time (same calibration as sweet-trace.py)
     cal = [(e[3], (e[4] + e[5]) / 2) for e in sw['GPU_CAL'] if e[3]]
+    if not cal:     # no kernel GPU_CAL pairs: use hakios-metal's own (HM_CAL: GPU ticks, mach_absolute_time)
+        cal = [(e[2], e[3]) for e in hm['HM_CAL'] if e[2] and e[3]]
     if len(cal) >= 2 and cal[-1][0] != cal[0][0]:
         k = (cal[-1][0] - cal[0][0]) / (cal[-1][1] - cal[0][1])
     else:
@@ -160,7 +163,7 @@ def export(T, out, procs=None, t_from=None, t_to=None):
     ctrs = collections.defaultdict(dict)
     for ts, tid, ref, *vals in hm['HM_CTR']:
         for v in vals:
-            if v:
+            if v and (v >> 56) != 0xff:
                 ctrs[ref][v >> 56] = v & ((1 << 56) - 1)
     hm_tracks = {}
 
@@ -200,8 +203,10 @@ def export(T, out, procs=None, t_from=None, t_to=None):
             ev.append({'ph': 'i', 's': 't', 'name': 'shader compile', 'pid': pid_of(tid), 'tid': tid, 'ts': us(ts),
                        'cat': 'hmetal', 'args': {'hash': hex(h), 'instr': a2 & 0xffffffff, 'alu': a2 >> 32,
                                                  'full_regs': a3 & 0xffff, 'half_regs': (a3 >> 16) & 0xffff,
-                                                 'max_waves': (a3 >> 32) & 0xffff, 'stage': a3 >> 48,
-                                                 'spills': a4 & 0xffffffff, 'compile_us': a4 >> 32}})
+                                                 'max_waves': (a3 >> 32) & 0xffff,
+                                                 'stage': STAGES.get((a3 >> 48) & 0x7fff, (a3 >> 48) & 0x7fff),
+                                                 'from_ir3': bool(a3 >> 63), 'spills': a4 & 0xffff,
+                                                 'fills': (a4 >> 16) & 0xffff, 'compile_us': a4 >> 32}})
     json.dump({'traceEvents': ev, 'displayTimeUnit': 'ms',
                'metadata': {'source': os.path.basename(T.path) if hasattr(T, 'path') else '', 'args': T.args}},
               open(out, 'w'), separators=(',', ':'))
