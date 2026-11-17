@@ -1,0 +1,336 @@
+From 5eb3b06d3c2e30069f6fc05ae7d85f1af1f3a432 Mon Sep 17 00:00:00 2001
+From: "Claude Opus 4.8" <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 12:00:00 +0100
+Subject: [PATCH] 1158 redfin: qmux retry pre-registration BindMuxDataPort
+ (kern.sweet_wds_bindfix, default on)
+
+On a cold boot the SIM PIN is entered late. CommCenter sets up its WDS data
+clients once at launch while the SIM is still PIN-locked/unregistered and binds
+a data port (WDS BindMuxDataPort 0x00a2); the modem rejects the bind (error 0x3,
+not registered). CommCenter treats the bind as done and never re-binds, so the
+cid stays unbound -> defaults to mux 0, and every later StartNetworkInterface
+targets the dead mux 0 and fails forever. Restarting CommCenter fixes it only
+because the re-bind then happens after registration.
+
+With kern.sweet_wds_bindfix = 1 (default), the router intercepts the modem's
+rejection of a BindMuxDataPort (d_answer): it flips the result TLV 0x02 to
+success {0,0} in place so CommCenter records cid->mux (and we set our own
+cid->mux to match), and records the bind as pending-retry. data_poll re-issues
+the bind to the modem on CommCenter's own WDS client port (d_own_send, so the
+modem's answer is caught by the router and not forwarded to CommCenter) every
+~1.5 s until the registered modem accepts it. The matching StartNetworkInterface
+is held (d_cid_ready) until the bind is confirmed, so it is never serviced
+against mux 0. kern.sweet_wds_bindfix = 0 restores k26 exactly (modem error
+forwarded as-is, no retry, no gating). The immediate-success bind path is
+unchanged.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvABzcjCeDywTuc6ppYmC
+---
+ bsd/dev/sweet_qmux.c | 195 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 184 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+index ba55c70..4fec877 100644
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -3252,6 +3252,8 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
+ #define D_NPROF                 24
+ #define D_BAK_MAX               (48u << 10)
+ #define D_NGATE                 8
++#define D_NBIND                 8       /* 1158: pre-registration BindMuxDataPort retries in flight */
++#define D_BIND_RETRY_MS         1500u   /* 1158: re-send a rejected bind at most this often */
+ 
+ static int data_fwd = 1, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default; 1108: data_fwd default 0; 1157: default 1 (data-enabled baseline; kern.sweet_data_fwd 0 restores k25 gated) */
+ static int data_was;                    /* data_active() as the thread saw it last (logs + kill switch) */
+@@ -3272,7 +3274,7 @@ struct dhold {
+ 	uint64_t t;
+ 	uint8_t f[D_HOLD_MAXF];
+ };
+-enum { DO_STOP = 1, DO_GW, DO_PLIST, DO_PSET, DO_WDA };
++enum { DO_STOP = 1, DO_GW, DO_PLIST, DO_PSET, DO_WDA, DO_BIND };
+ struct down {
+ 	int used, kind, ci;
+ 	uint32_t port, hd;
+@@ -3280,10 +3282,17 @@ struct down {
+ 	uint8_t idx;
+ 	uint64_t t;
+ };
++struct dbind {                          /* 1158: a WDS BindMuxDataPort the modem rejected pre-registration, awaiting modem-side retry */
++	uint8_t used, svc, cid, mux;
++	int ci;
++	uint32_t pipe, sess, port;
++	uint64_t next;
++};
+ static struct qdata {
+ 	struct dcl d[NCL];
+ 	struct dhold hold[D_NHOLD];
+ 	struct down own[D_NOWN];
++	struct dbind bind[D_NBIND];             /* 1158 */
+ 	struct { uint8_t up; uint32_t gw; uint64_t st[D_RATE_N]; } mx[256];
+ 	uint8_t wda_req[512];                   /* CommCenter's last WDA SetDataFormat TLVs, as it sent them */
+ 	uint32_t wda_n;
+@@ -3296,10 +3305,11 @@ static struct qdata {
+ static uint16_t d_txn = 0xfe00;
+ static struct {
+ 	unsigned held_start, rel_start, to_start, rate, held_prof, rel_prof, to_prof, prof_writes, wda_tr, wda_ans, bind_tr,
+-	    gw_own, gw_cc, stops_sent, starts_ok, starts_err, local5564, muxmap, ups, downs, closes;
++	    gw_own, gw_cc, stops_sent, starts_ok, starts_err, local5564, muxmap, ups, downs, closes, bind_fix, bind_rt, bind_rt_ok;
+ } dst;
+ static int pb_state;                    /* 0 none, 1 list out, 2 settings out, 3 ready (exposed), 4 acked */
+ static int sweet_wds_autoack = 1;       /* 1157: kern.sweet_wds_autoack; 1 (default) = kernel advances pb_state 3->4 itself (no userland ack); 0 = wait for kern.sweet_wds_profiles_ack */
++static int sweet_wds_bindfix = 1;       /* 1158: kern.sweet_wds_bindfix; 1 (default) = synthesize success + modem-side retry for a BindMuxDataPort the modem rejects before registration; 0 = k26 (forward the modem error as-is) */
+ static int pb_tries, pb_n;
+ static volatile int pb_ack;
+ /*
+@@ -3786,6 +3796,20 @@ d_own_answer(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 	case DO_WDA:
+ 		wda_own_answer(d + 7, ml, res, er);     /* 1088 */
+ 		break;
++	case DO_BIND: {                                 /* 1158 */
++		struct dbind *b = o->idx < D_NBIND ? &D->bind[o->idx] : NULL;
++		if (b && b->used) {
++			if (res == 0) {
++				b->used = 0;
++				dst.bind_rt_ok++;
++				LOG("data: BindMuxDataPort cid %u mux %u retried: ok\n", b->cid, b->mux);
++			} else {
++				b->next = sbb_ms() + D_BIND_RETRY_MS;
++				LOG("data: BindMuxDataPort cid %u mux %u retried: error 0x%x\n", b->cid, b->mux, er);
++			}
++		}
++		break;
++	}
+ 	default:
+ 		pb_answer(o, d, ml, res, er);
+ 		break;
+@@ -3793,6 +3817,76 @@ d_own_answer(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
+ 	return 1;
+ }
+ 
++/* ---- 1158: pre-registration BindMuxDataPort retry (kern.sweet_wds_bindfix) ----
++ * On a cold boot the SIM PIN is entered late. CommCenter binds its WDS data port
++ * (WDS 0x00a2) once, at launch, while the SIM is still PIN-locked/unregistered; the
++ * modem rejects the bind (error 0x3) and CommCenter never re-binds, so the cid stays
++ * on mux 0 and every later StartNetworkInterface targets a dead mux. With bindfix on
++ * we tell CommCenter the bind succeeded (so it records cid->mux and never falls back
++ * to mux 0), set our own cid->mux to match, and the router re-issues the bind to the
++ * modem on CommCenter's own WDS client port until the (now registered) modem accepts
++ * it; the matching StartNetworkInterface is held (d_cid_ready) until then. With it 0
++ * the modem's error is forwarded to CommCenter unchanged (k26). */
++static struct dbind *
++d_bind_find(uint32_t pipe, uint32_t sess, unsigned cid)
++{
++	for (int i = 0; i < D_NBIND; i++) {
++		struct dbind *b = &D->bind[i];
++		if (b->used && b->pipe == pipe && b->sess == sess && b->cid == cid) {
++			return b;
++		}
++	}
++	return NULL;
++}
++
++/* true unless this cid still has a BindMuxDataPort pending on the modem (1158) */
++static bool
++d_cid_ready(uint32_t pipe, uint32_t sess, unsigned cid)
++{
++	return !sweet_wds_bindfix || D == NULL || d_bind_find(pipe, sess, cid) == NULL;
++}
++
++/* record (or refresh) a cid's bind as pending-retry; returns the slot or NULL if full */
++static struct dbind *
++d_bind_pend(struct cl *c, unsigned mux)
++{
++	struct dbind *b = d_bind_find(c->pipe, c->sess, c->cid);
++	if (!b) {
++		for (int i = 0; i < D_NBIND && !b; i++) {
++			if (!D->bind[i].used) {
++				b = &D->bind[i];
++			}
++		}
++	}
++	if (!b) {
++		return NULL;
++	}
++	b->used = 1;
++	b->svc = c->svc;
++	b->cid = c->cid;
++	b->mux = (uint8_t)mux;
++	b->ci = (int)(c - cl);
++	b->pipe = c->pipe;
++	b->sess = c->sess;
++	b->port = c->port;
++	b->next = sbb_ms();
++	return b;
++}
++
++/* flip a QMI response's result TLV 0x02 to success {0,0} in place (1158) */
++static int
++d_force_ok(uint8_t *tl, uint32_t tn)
++{
++	uint32_t l = 0;
++	uint8_t *r = (uint8_t *)tlv_find(tl, tn, 0x02, &l);
++	if (!r || l < 4) {
++		return 0;
++	}
++	r[0] = r[1] = r[2] = r[3] = 0;
++	return 1;
++}
++
++
+ /* ---- CommCenter's answers / indications on data clients (in place, same lengths) ---- */
+ 
+ static void
+@@ -3851,11 +3945,33 @@ d_answer(struct cl *c, uint8_t *sdu, uint32_t len, const uint8_t *rq, uint32_t r
+ 	}
+ 	if (type == 0x02 && msg == 0x00a2) {
+ 		int mx = tlv_byte(rq, rqn, 0x11);
+-		LOG("data: WDS BindMuxDataPort %s/%u cid %u mux %d: %s 0x%x\n", pipe_name[c->pipe], c->sess, c->cid, mx, res == 0 ?
+-		    "ok" : "error", res == 0 ? 0 : er);
+-		if (res == 0 && mx > 0) {
++		if (res == 0) {
++			struct dbind *pb = sweet_wds_bindfix ? d_bind_find(c->pipe, c->sess, c->cid) : NULL;
++			if (pb) {
++				pb->used = 0;   /* 1158: CommCenter's own bind finally succeeded: drop the pending retry */
++			}
++			LOG("data: WDS BindMuxDataPort %s/%u cid %u mux %d: ok 0x0\n", pipe_name[c->pipe], c->sess, c->cid, mx);
++			if (mx > 0) {
++				x->mux = (uint8_t)mx;
++				d_mux_map((unsigned)mx);
++			}
++		} else if (sweet_wds_bindfix && mx > 0 && d_force_ok(tl, tn)) {
++			/*
++			 * 1158: the modem rejected the bind (SIM not yet registered). Tell
++			 * CommCenter it succeeded so it records cid->mux, set our own cid->mux
++			 * to match, and keep re-sending the bind to the modem (data_poll) until
++			 * it is accepted; the matching StartNetworkInterface is held until then.
++			 */
+ 			x->mux = (uint8_t)mx;
+ 			d_mux_map((unsigned)mx);
++			struct dbind *pb = d_bind_pend(c, (unsigned)mx);
++			dst.bind_fix++;
++			LOG("data: WDS BindMuxDataPort %s/%u cid %u mux %d: modem error 0x%x pre-registration -> success to "
++			    "CommCenter, bind %s for modem retry (kern.sweet_wds_bindfix)\n", pipe_name[c->pipe], c->sess, c->cid,
++			    mx, er, pb ? "queued" : "NOT queued (no slot)");
++		} else {
++			LOG("data: WDS BindMuxDataPort %s/%u cid %u mux %d: error 0x%x\n", pipe_name[c->pipe], c->sess, c->cid,
++			    mx, er);
+ 		}
+ 	} else if (type == 0x02 && msg == 0x0020) {
+ 		if (res == 0 && tlv_u32(tl, tn, 0x01, &v) == 0) {
+@@ -4189,7 +4305,7 @@ d_request(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t
+ 		pb_start("CommCenter's first WDS request");
+ 	}
+ 	if (svc == 0x01 && msg == 0x0020) {
+-		if (!d_start_ok()) {           /* 1088: IPA ready and the router's WDA SetDataFormat answered */
++		if (!d_start_ok() || !d_cid_ready(pipe, cur_sess, cid)) {           /* 1088 IPA+WDA; 1158 bind confirmed */
+ 			if (d_hold(DH_START, pipe, svc, cid, msg, s, len)) {
+ 				LOG("data: StartNetworkInterface %s/%u cid %u: IPA not ready and the hold queue is full: error 0x%x\n",
+ 				    pipe_name[pipe], cur_sess, cid, QMI_ERR_CALL_FAILED);
+@@ -4198,8 +4314,9 @@ d_request(unsigned pipe, unsigned svc, unsigned cid, const uint8_t *s, uint32_t
+ 			}
+ 			dst.held_start++;
+ 			LOG("data: StartNetworkInterface %s/%u cid %u held: %s (%u s max)\n", pipe_name[pipe], cur_sess, cid,
+-			    !sweet_ipa_ready() ? "IPA data plane not ready (kern.sweet_ipa_state != 3)" : "the router's WDA SetDataFormat "
+-			    "not answered yet (1088)", D_HELD_START_MS / 1000);
++			    !sweet_ipa_ready() ? "IPA data plane not ready (kern.sweet_ipa_state != 3)" :
++			    !d_cid_ready(pipe, cur_sess, cid) ? "its BindMuxDataPort not yet confirmed on the modem "
++			    "(kern.sweet_wds_bindfix)" : "the router's WDA SetDataFormat not answered yet (1088)", D_HELD_START_MS / 1000);
+ 			return;
+ 		}
+ 		d_start(pipe, cid, s, len);
+@@ -4310,12 +4427,44 @@ data_poll(uint64_t now)
+ 		printf("SWEET QMUX: profile backup auto-acknowledged (autoack)\n");
+ 	}
+ 	wda_own_poll(now);              /* 1088 */
++	if (sweet_wds_bindfix && act) {         /* 1158: re-send rejected pre-registration binds to the modem */
++		for (int i = 0; i < D_NBIND; i++) {
++			struct dbind *b = &D->bind[i];
++			if (!b->used || now < b->next) {
++				continue;
++			}
++			struct cl *bc = cl_get(b->pipe, b->sess, 0x01, b->cid, 0);
++			if (!bc || !bc->dat) {
++				LOG("data: pending BindMuxDataPort cid %u dropped: WDS client gone\n", b->cid);
++				b->used = 0;
++				continue;
++			}
++			b->ci = (int)(bc - cl);
++			b->port = bc->port;
++			uint8_t t[32], muxb = b->mux;
++			uint32_t o = 0, ep[2] = { 4, 1 };
++			put_tlv(t, &o, 0x10, ep, 8);
++			put_tlv(t, &o, 0x11, &muxb, 1);
++			if (data_opts & DOPT_BIND_TETH) {
++				uint32_t one = 1;
++				put_tlv(t, &o, 0x13, &one, 4);
++			}
++			cur_pipe = b->pipe;
++			cur_sess = b->sess;
++			b->next = now + D_BIND_RETRY_MS;
++			if (d_own_send(DO_BIND, b->ci, b->port, 0x01, 0x00a2, t, o, 0, (uint8_t)i) == 0) {
++				dst.bind_rt++;
++				LOG("data: BindMuxDataPort cid %u mux %u -> modem (port %#x, kern.sweet_wds_bindfix retry)\n",
++				    b->cid, b->mux, b->port);
++			}
++		}
++	}
+ 	for (int i = 0; i < D_NHOLD; i++) {
+ 		struct dhold *h = &D->hold[i];
+ 		if (!h->used) {
+ 			continue;
+ 		}
+-		if (h->kind == DH_START && act && d_start_ok()) {
++		if (h->kind == DH_START && act && d_start_ok() && d_cid_ready(h->pipe, h->sess, h->cid)) {
+ 			cur_pipe = h->pipe;
+ 			cur_sess = h->sess;
+ 			h->used = 0;
+@@ -4403,12 +4552,12 @@ data_stats(char *buf, size_t len)
+ 	o = snprintf(buf, len, "data %s (sweetbb 0x%x rules %d fwd %d opts %d) | fwd WDS %u WDA %u QOS %u DSD %u DFS %u | starts ok %u "
+ 	    "err %u held %u released %u timeout %u rate-limited %u | translations WDA %u (answers %u) bind %u | gw cc %u own %u | "
+ 	    "stops sent %u closes %u | ups %u downs %u muxmap %u | 5564 local %u | profiles: backup %s (%d) writes %u held %u "
+-	    "released %u timeout %u | handles per mux:", data_active() ? "ON" : "off", sweet_bb, qmi_rules, data_fwd, data_opts,
++	    "released %u timeout %u | bind fix %u retry %u ok %u | handles per mux:", data_active() ? "ON" : "off", sweet_bb, qmi_rules, data_fwd, data_opts,
+ 	    svc_cnt[0x01].fwd, svc_cnt[0x1a].fwd, svc_cnt[0x04].fwd, svc_cnt[0x2a].fwd, svc_cnt[0x30].fwd, dst.starts_ok,
+ 	    dst.starts_err, dst.held_start, dst.rel_start, dst.to_start, dst.rate, dst.wda_tr, dst.wda_ans, dst.bind_tr, dst.gw_cc,
+ 	    dst.gw_own, dst.stops_sent, dst.closes, dst.ups, dst.downs, dst.muxmap, dst.local5564, pb_state == 0 ? "none" :
+ 	    pb_state == 1 ? "listing" : pb_state == 2 ? "reading" : pb_state == 3 ? "ready" : "acked", pb_n, dst.prof_writes,
+-	    dst.held_prof, dst.rel_prof, dst.to_prof);
++	    dst.held_prof, dst.rel_prof, dst.to_prof, dst.bind_fix, dst.bind_rt, dst.bind_rt_ok);
+ 	for (unsigned m = 1; m < 256 && o < (int)len - 40; m++) {
+ 		int h = d_mux_handles(m);
+ 		if (h || D->mx[m].up) {
+@@ -6064,6 +6213,30 @@ sysctl_wds_autoack SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_autoack, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_autoack, "I",
+     "redfin 1157: 1 (default) = kernel auto-acknowledges the WDS profile backup (pb_state 3->4) with no userland step; 0 = wait for kern.sweet_wds_profiles_ack");
+ 
++static int
++sysctl_wds_bindfix SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_wds_bindfix, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	sweet_wds_bindfix = v;
++	printf("SWEET QMUX: kern.sweet_wds_bindfix = %d\n", v);
++	sbb_wake();
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_bindfix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_bindfix, "I",
++    "redfin 1158: 1 (default) = a BindMuxDataPort the modem rejects before registration is answered success to CommCenter and retried on the modem until accepted (StartNetworkInterface held until then); 0 = k26 (modem error forwarded as-is)");
++
++
+ static int
+ sysctl_gate_ids SYSCTL_HANDLER_ARGS
+ {
+-- 
+2.53.0
+
