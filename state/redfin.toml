@@ -20,7 +20,7 @@ note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 a
 
 # What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
 [boot]
-image = "rk20a"
+image = "rk25a"
 base = "r5p3a"
 kernel_dir = "builds/xnu/ws-int-k25-e3c17bc9cf"
 kernel_branch = "ws-int-k25"
