@@ -631,6 +631,13 @@ void encodeTail(pm4::Stream& stream, uint64_t table, const Options& options, boo
 // Without COLOR and DEPTH: the invalidate alone between the WFIs (what was flushed is in memory; the texture caches
 // may hold what they read of it before)
 void encodeBarrier(pm4::Stream& stream, uint64_t words, bool color, bool depth);
+// (ws-hm-passopt) HM_MRT_LAZY: a colour attachment's Clear filled inside an open sysmem pass, before the first draw that
+// touches the attachment (or as a Clear joins the open pass): a WFI, the colour CCU flushed and waited for (what the
+// pass's draws wrote before lands before the 2D engine's fill, which goes through the same CCU), then the fill as a pass
+// head does it (fillStream, the CCU flushed and invalidated, a WFI), CACHE_INVALIDATE and a WFI. WORDS: 16 zeroed bytes. False: a clear colour the
+// format cannot take (WHY says so)
+bool encodeMidPassFill(pm4::Stream& stream, const Texture& target, uint32_t level, uint32_t slice, const double rgba[4], uint64_t words,
+                       std::string* why);
 // (ws-hm-perf2) what a stream spends on keeping the GPU's caches coherent, packet by packet (HM_PROF's sync line)
 struct SyncCensus {
     uint32_t words = 0, registerWords = 0, wfis = 0, ccuColorFlushes = 0, ccuDepthFlushes = 0, cacheFlushes = 0, waits = 0,

@@ -124,6 +124,13 @@ void hakios_metal_cache_rewarm(int (*busy)(void *), void *ctx, unsigned out[5]);
 /* (redfin hmv4) draw passes opened on the same colour target as the pass before them, by why they did not join it:
  * [0] a Clear asked, [1] store/options/attachments differ, [2] GMEM ended it, [3] a copy/dispatch/clear/blit between */
 void hakios_metal_pass_splits(unsigned long long out[4]);
+/* (ws-hm-passopt) HM_MRT_LAZY (0 off, 1, 2; the mode answered by hakios_metal_mrt_lazy_mode), process-wide: [0] colour
+ * Clears owed (left out of a sysmem pass head, a joining pass or a clear-only pass), [1] of them filled later inside the
+ * pass, [2] dropped (no draw touched the attachment; it stored DontCare), [3] passes that joined the open sysmem pass
+ * with Clears, [4] Clears filled at once inside an open pass (mode 2), [5] clear-only passes dropped whole, [6] bytes
+ * of fills not done, [7] colour Clears storing DontCare met at a sysmem pass head or a clear-only pass in any mode */
+void hakios_metal_mrt_lazy_stats(unsigned long long out[8]);
+int hakios_metal_mrt_lazy_mode(void);
 /* (redfin hmv8) extended-range copies: [0] decoded on the processor, [1] of them over an IOSurface, [2] ring barriers before
  * such a decode (HM_XR_SYNC), [3] microseconds waited in them, [4] barriers that timed out */
 void hakios_metal_xr_stats(unsigned long long out[10]);   /* (redfin hmv10) 10: [5]-[9] HM_XR_LATE/CHECK/WB_SYNC */

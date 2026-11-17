@@ -141,6 +141,13 @@ HM_PREWARM=1
 #*:HM_PASS_STATIC=0
 # a pass into the open sysmem pass's attachments that differs only by store actions joins it: 0 = a pass of its own
 #*:HM_PASS_MERGE=0
+# ---- (ws-hm-passopt) HM_MRT_LAZY (compiled default 0 = as before): 1 = in a sysmem pass a colour attachment that asks
+# for a Clear and stores DontCare (CoreAnimation's memoryless second attachment, "c2" in HM_PASS) is filled only before
+# the first draw that writes or framebuffer-fetches it (never, when none does), a pass that differs from the open sysmem
+# pass only by such Clears joins it, and a clear-only pass leaves them out; 2 = also a Clear of a stored colour
+# attachment joins the open sysmem pass on the same attachments as a fill inside it (no tail, no head). Depth/stencil
+# Clears still begin a pass. "prof: mrt lazy" with HM_PROF (its "DontCare Clears met" counts what 1 would owe, in any mode)
+#*:HM_MRT_LAZY=1
 # ---- (ws-hm-int6) the transport's invalidate after a fence (waitFence, "flushAfter"): always (compiled default) =
 # every imported surface the GPU wrote, ~1-2 ms a buffer for the 11.2 MB display surface; lazy = the display surfaces'
 # (HM_FLUSH_AFTER_SURF, default HM_GATE_FLAG_SURF's size) left until a CPU access in this process (Texture read/replace,

@@ -587,6 +587,12 @@ private:
         pm4::Stream sysStream, headGmem;
         uint32_t clears = 0;        // the attachments a GMEM pass clears in its tiles (render::gmemClearWords), and their words
         uint32_t clearWords[kMaxColorOutputs][4] = {};
+        // (ws-hm-passopt) HM_MRT_LAZY: the colour attachments (bit I) whose Clear is still owed -- left out of the head (or
+        // asked by a pass that joined this one) because the pass that asked it stores DontCare -- and the colour each asked
+        // for. Filled before the first draw that writes or fetches the attachment (CommandBuffer::lazyFills); one no draw
+        // touches is never filled: its contents are undefined past the pass, which is what DontCare allows
+        uint32_t lazyClears = 0;
+        double lazyColor[kMaxColorOutputs][4] = {};
         uint32_t perfEnc = 0xffff;  // (ws-hm-perf) the encoder that opened it (HM_PASS)
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
@@ -618,6 +624,8 @@ private:
     // attachments noted as left in the CCU (dirty_); otherwise the tail, and what earlier lazily ended passes left
     // flushed with it (or alone, with no pass open)
     void closePass(bool lazy = false);
+    // (ws-hm-passopt) HM_MRT_LAZY: the owed Clears of MASK (the open sysmem pass's lazyClears) filled into the stream now
+    bool lazyFills(uint32_t mask, bool late = true);   // LATE: counted as filled later ([1]), else as a Clear joined ([4])
     void useAttachments(const RenderPass& pass);
     // (ws-hm-perf2) memory a lazily ended pass drew into and left in the CCU (dirty_: colour or depth), and memory a tail
     // flushed whose texture caches were not dropped since (flushed_): GPU address ranges, so that two textures over
@@ -671,6 +679,21 @@ public:
     static bool passStatic();
     static bool passMerge();
     static void setPassModesForTesting(int lazy, int carry, int merge);
+    // (ws-hm-passopt) HM_MRT_LAZY=0 (default: as before) | 1 | 2, read once from the environment. 1: in a sysmem pass a
+    // colour attachment that asks for a Clear and stores DontCare (CoreAnimation's memoryless second attachment) is filled
+    // only before the first draw that writes or fetches it -- never, when none does -- and a pass whose only difference
+    // from the open sysmem pass is such Clears joins it (the Clear owed again); a clear-only pass leaves such attachments
+    // out (and is dropped when nothing is left). 2: also a Clear of a stored colour attachment joins the open sysmem pass
+    // on the same attachments, filled there and then inside it (no tail, no head). Depth and stencil Clears still begin
+    // a pass. Tests: 0..2 whatever the environment says, -1 the environment's again
+    static int mrtLazy();
+    static void setMrtLazyForTesting(int mode);
+    // (ws-hm-passopt) process-wide: [0] Clears left out of a pass head or a clear-only pass (owed), [1] of them filled
+    // later inside the pass, [2] dropped at the pass's end (no draw touched the attachment), [3] passes that joined the
+    // open one with Clears (mode 1 owed, mode 2 filled), [4] Clears filled at once inside an open pass (mode 2),
+    // [5] clear-only passes dropped whole, [6] bytes of fills not done (the dropped ones' attachment sizes), [7] colour
+    // Clears that store DontCare met at a sysmem pass head or a clear-only pass, whatever the mode (what 1 would owe)
+    static void mrtLazyStats(uint64_t out[8]);
     // (ws-hm-perf2) HM_PROF's sync line: the submitted stream's census (render::census, made at submit when profiling)
     // and the GPU's own time for it and for the decode buffers sent before it (CP_ALWAYS_ON_COUNTER stamps, ns; 0 none)
     const render::SyncCensus& syncCensus() const { return census_; }

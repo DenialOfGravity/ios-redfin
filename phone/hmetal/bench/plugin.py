@@ -4958,6 +4958,30 @@ HM_XRREUSE_EDITS = [
 ]
 
 
+# (ws-hm-passopt) HM_MRT_LAZY's counts on HM_PROF's period line, after HM_XR_REUSE's (always printed: the Clears a frame
+# of attachments that store DontCare are what the mode would save, and with it on what it did)
+HM_PASSOPT_EDITS = [
+    ('\t\t\t\t\t r[2] - rwas[2], r[5] - rwas[5], r[3] - rwas[3], r[4] - rwas[4], hakios_metal_xr_reuse_mode());\n'
+     '\t\t\t}\n'
+     '\t\t\tmemcpy(rwas, r, sizeof(rwas));\n'
+     '\t\t}\n',
+     '\t\t\t\t\t r[2] - rwas[2], r[5] - rwas[5], r[3] - rwas[3], r[4] - rwas[4], hakios_metal_xr_reuse_mode());\n'
+     '\t\t\t}\n'
+     '\t\t\tmemcpy(rwas, r, sizeof(rwas));\n'
+     '\t\t}\n'
+     '\t\t{   /* (ws-hm-passopt) HM_MRT_LAZY */\n'
+     '\t\t\tstatic unsigned long long mwas[8];\n'
+     '\t\t\tunsigned long long m[8];\n\n'
+     '\t\t\thakios_metal_mrt_lazy_stats(m);\n'
+     '\t\t\thm_print("prof: mrt lazy %.1f s (HM_MRT_LAZY=%d): DontCare Clears met %.1f a frame; Clears owed %.1f a frame, filled later %.1f, dropped %.1f (%.1f MB a frame not '
+     'filled), passes joined with Clears %.1f, Clears filled inside a pass %.1f, clear-only passes dropped %.1f\\n", secs,\n'
+     '\t\t\t\t hakios_metal_mrt_lazy_mode(), (double)(m[7] - mwas[7]) / fr, (double)(m[0] - mwas[0]) / fr, (double)(m[1] - mwas[1]) / fr, (double)(m[2] - mwas[2]) / fr,\n'
+     '\t\t\t\t (double)(m[6] - mwas[6]) / 1e6 / fr, (double)(m[3] - mwas[3]) / fr, (double)(m[4] - mwas[4]) / fr, (double)(m[5] - mwas[5]) / fr);\n'
+     '\t\t\tmemcpy(mwas, m, sizeof(mwas));\n'
+     '\t\t}\n'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
@@ -4965,6 +4989,7 @@ def main():
     src = apply(src, HM_NOUC_EDITS)   # (ws-hm-int12) HM_NOUC
     src = hm_perf(src)   # (ws-hm-perf) HM_PERF
     src = apply(src, HM_XRREUSE_EDITS)   # (redfin xrreuse) HM_XR_REUSE
+    src = apply(src, HM_PASSOPT_EDITS)   # (ws-hm-passopt) HM_MRT_LAZY
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))

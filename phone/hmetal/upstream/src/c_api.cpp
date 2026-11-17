@@ -475,6 +475,13 @@ void hakios_metal_pass_splits(unsigned long long out[4]) {
     for (int i = 0; i < 4; i++) out[i] = v[i];
 }
 
+void hakios_metal_mrt_lazy_stats(unsigned long long out[8]) {   // (ws-hm-passopt)
+    uint64_t v[8];
+    CommandBuffer::mrtLazyStats(v);
+    for (int i = 0; i < 8; i++) out[i] = v[i];
+}
+int hakios_metal_mrt_lazy_mode(void) { return CommandBuffer::mrtLazy(); }
+
 void hakios_metal_xr_stats(unsigned long long out[10]) {
     uint64_t v[10];
     CommandBuffer::xrStats(v);

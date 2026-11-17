@@ -2420,6 +2420,21 @@ void encodeBarrier(pm4::Stream& stream, uint64_t words, bool color, bool depth) 
     stream.waitForIdle();
 }
 
+// (ws-hm-passopt) HM_MRT_LAZY's fill inside an open sysmem pass (render.hpp)
+bool encodeMidPassFill(pm4::Stream& stream, const Texture& target, uint32_t level, uint32_t slice, const double rgba[4], uint64_t words,
+                       std::string* why) {
+    ClearWords c{};
+    if (!clearWords(target.info(), rgba, &c, why)) return false;
+    stream.waitForIdle();
+    eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, words, 1, false);
+    waitForWord(stream, words, 1);
+    clearStream(stream, target, c, words + 8, level, slice);
+    // (and the texture caches dropped: a framebuffer fetch kept in raster order has no barrier of its own before it)
+    event(stream, CACHE_INVALIDATE);
+    stream.waitForIdle();
+    return true;
+}
+
 void census(const std::vector<uint32_t>& w, SyncCensus* out) {
     SyncCensus c;
     c.words = uint32_t(w.size());
@@ -3185,6 +3200,8 @@ namespace {
 std::atomic<uint64_t> gPassSplits[4];   // (redfin hmv4) CommandBuffer::passSplits
 // (ws-hm-perf2) HM_PASS_FLUSH / HM_PASS_STATIC / HM_PASS_MERGE, each -1 (the environment's) or what a test set
 std::atomic<int> gPassLazyForce{-1}, gPassStaticForce{-1}, gPassMergeForce{-1};
+std::atomic<int> gMrtLazyForce{-1};          // (ws-hm-passopt) HM_MRT_LAZY
+std::atomic<uint64_t> gMrtLazy[8];           // (ws-hm-passopt) CommandBuffer::mrtLazyStats
 bool envSwitch(const char* name, const char* offValue) {
     const char* e = getenv(name);
     return e == nullptr || strcmp(e, offValue) != 0;
@@ -4119,16 +4136,22 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     // whatever they are, and only a GMEM pass stores -- so a pass that differs from the open one by them alone joins it
     // (Store kept where either asks for it); and the slices are compared, which a pass into another layer differs by
     const bool merge = passMerge() && open_ != nullptr && !open_->gmem && !open_->dual;
+    // (ws-hm-passopt) HM_MRT_LAZY: into an open sysmem pass a colour Clear need not begin a pass -- one that stores DontCare
+    // is owed (filled before the first draw that touches the attachment), and with 2 any other is filled inside the pass
+    const int mrtMode = mrtLazy();
+    const bool lazyOpen = mrtMode != 0 && open_ != nullptr && !open_->gmem && !open_->dual;
+    auto clearJoins = [&](StoreAction st) { return lazyOpen && (st == StoreAction::kDontCare || mrtMode >= 2); };
     bool joins = open_ != nullptr && open_->pass.color0 == pass.color0 && open_->pass.level == pass.level && open_->pass.depth == pass.depth &&
                  open_->pass.stencil == pass.stencil && !(pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) &&
-                 pass.load != LoadAction::kClear &&
+                 (pass.load != LoadAction::kClear || (pass.color0 != nullptr && clearJoins(pass.store))) &&
                  !(pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) && (merge || pass.store == open_->pass.store) &&
                  (merge || pass.depthStore == open_->pass.depthStore) && std::memcmp(&open_->options, &options, sizeof options) == 0 &&
                  (!merge || (open_->pass.slice == pass.slice && open_->pass.depthSlice == pass.depthSlice));
     for (uint32_t i = 0; joins && i < kMaxColorOutputs - 1; i++) {
         // (the attachments past 0 the same textures and stores, none asking for a Clear: the same pass)
         const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
-        joins = a.texture == b.texture && a.level == b.level && (merge || a.store == b.store) && (a.texture == nullptr || a.load != LoadAction::kClear) &&
+        joins = a.texture == b.texture && a.level == b.level && (merge || a.store == b.store) &&
+                (a.texture == nullptr || a.load != LoadAction::kClear || clearJoins(a.store)) &&
                 (!merge || a.slice == b.slice);
     }
     if (joins && merge) {
@@ -4277,6 +4300,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
     pm4::Stream* streams = scratchOn() ? scratch_ : localStreams;
     for (int i = 0; i < 4; i++) streams[i].clear();
     pm4::Stream &head = streams[0], &body = streams[1], &headSys = streams[2], &bodySys = streams[3];
+    uint32_t lazySkip = 0;   // (ws-hm-passopt) HM_MRT_LAZY: the Clears the head leaves owed
     if (!joins) {
         if (!piece(render::kTableBytes, &passTable, &why)) {
             return fail(std::string("no memory for the pass's table: ") + why);
@@ -4296,7 +4320,19 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
         render::Options headOptions = options;
         if (carried) headOptions.batchStart = headOptions.ccuCntl = false;
         if (!carried && options.batchStart) flushed_.clear();   // (the batch start's CACHE_INVALIDATE)
-        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, headOptions, gmemClears_) ||
+        // (ws-hm-passopt) HM_MRT_LAZY: a sysmem pass's colour Clears that store DontCare are owed, not filled in the head
+        lazySkip = 0;
+        if (!gmem && !dual) {
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
+                const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
+                const StoreAction sa = i == 0 ? pass.store : pass.more[i - 1].store;
+                if (t != nullptr && la == LoadAction::kClear && sa == StoreAction::kDontCare) lazySkip |= 1u << i;
+            }
+        }
+        if (lazySkip != 0) gMrtLazy[7].fetch_add(uint64_t(__builtin_popcount(lazySkip)), std::memory_order_relaxed);
+        if (mrtMode == 0) lazySkip = 0;
+        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, headOptions, gmemClears_ | lazySkip) ||
             (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, options))) {
             gmemClears_ = 0;
             return refuseWork(why);
@@ -4452,7 +4488,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
                     if (i == 0) pt.format = uint32_t(t->format()), pt.tiling = t->compressed() ? 1 : 0;
                     if (i == 0) pt.loadAction = uint8_t(pass.load), pt.storeAction = uint8_t(pass.store);   // (redfin hmv3, HM_PROF)
                     const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
-                    if (la == LoadAction::kClear) pt.clearBytes += uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel;
+                    if (la == LoadAction::kClear && !((lazySkip >> i) & 1)) pt.clearBytes += uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel;
                 }
                 // (why not GMEM, pass by pass: the last reason alone named whichever pass came last, and the heavy
                 // full-screen pass of SpringBoard's "home" stayed in sysmem without its reason ever being seen)
@@ -4502,6 +4538,40 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             if (lastPassUbwc_ >= 0 && lastPassUbwc_ != int(ubwc)) counts_.ubwcSwitches++;
             lastPassUbwc_ = int(ubwc);
         }
+    }
+    // (ws-hm-passopt) HM_MRT_LAZY: the Clears owed -- those the head left out, and a joining pass's -- and those filled now
+    if (!joins && lazySkip != 0) {
+        open_->lazyClears = lazySkip;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            if ((lazySkip >> i) & 1) memcpy(open_->lazyColor[i], i == 0 ? pass.clearColor : pass.more[i - 1].clearColor, sizeof open_->lazyColor[i]);
+        }
+        gMrtLazy[0].fetch_add(uint64_t(__builtin_popcount(lazySkip)), std::memory_order_relaxed);
+    }
+    if (joins && lazyOpen) {
+        uint32_t owed = 0, now = 0;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
+            const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
+            const StoreAction sa = i == 0 ? pass.store : pass.more[i - 1].store;
+            if (t == nullptr || la != LoadAction::kClear) continue;
+            memcpy(open_->lazyColor[i], i == 0 ? pass.clearColor : pass.more[i - 1].clearColor, sizeof open_->lazyColor[i]);
+            (sa == StoreAction::kDontCare ? owed : now) |= 1u << i;
+        }
+        if (owed | now) {
+            gMrtLazy[3].fetch_add(1, std::memory_order_relaxed);
+            gMrtLazy[0].fetch_add(uint64_t(__builtin_popcount(owed)), std::memory_order_relaxed);
+            gMrtLazy[4].fetch_add(uint64_t(__builtin_popcount(now)), std::memory_order_relaxed);
+            open_->lazyClears |= owed | now;
+            if (now != 0 && !lazyFills(now, false)) return false;
+        }
+    }
+    if (open_->lazyClears != 0) {
+        // the attachments this draw writes or reads through a framebuffer fetch get their owed Clear first
+        uint32_t touch = render::drawnAttachments(program, pass);
+        for (uint32_t i = 0; i < kMaxTextureSlots && i < program.fs.k.numTextureSlots; i++) {
+            if (program.fs.k.textures[i].fbTarget != 0) touch |= 1u << (program.fs.k.textures[i].fbTarget - 1u);
+        }
+        if ((touch & open_->lazyClears) != 0 && !lazyFills(touch)) return false;
     }
     if (open_->gmem) {
         uint32_t a[4];
@@ -5299,6 +5369,50 @@ bool CommandBuffer::passMerge() {
     const int f = gPassMergeForce.load(std::memory_order_relaxed);
     return f < 0 ? env : f != 0;
 }
+int CommandBuffer::mrtLazy() {   // (ws-hm-passopt)
+    static const int env = [] {
+        const char* e = getenv("HM_MRT_LAZY");
+        const int v = e != nullptr ? atoi(e) : 0;
+        return v < 0 ? 0 : v > 2 ? 2 : v;
+    }();
+    const int f = gMrtLazyForce.load(std::memory_order_relaxed);
+    return f < 0 ? env : f;
+}
+void CommandBuffer::setMrtLazyForTesting(int mode) { gMrtLazyForce = mode; }
+void CommandBuffer::mrtLazyStats(uint64_t out[8]) {
+    for (int i = 0; i < 8; i++) out[i] = gMrtLazy[i].load(std::memory_order_relaxed);
+}
+// (ws-hm-passopt) HM_MRT_LAZY: the owed Clears of MASK filled now, inside the open sysmem pass
+bool CommandBuffer::lazyFills(uint32_t mask, bool late) {
+    mask &= open_ != nullptr ? open_->lazyClears : 0u;
+    for (uint32_t i = 0; mask != 0 && i < kMaxColorOutputs; i++) {
+        if (!((mask >> i) & 1)) continue;
+        const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+        const uint32_t level = i == 0 ? open_->pass.level : open_->pass.more[i - 1].level;
+        const uint32_t slice = i == 0 ? open_->pass.slice : open_->pass.more[i - 1].slice;
+        open_->lazyClears &= ~(1u << i);
+        if (t == nullptr) continue;
+        std::string why;
+        Piece words;
+        if (!piece(64, &words, &why)) return fail(std::string("no memory for a fill inside a pass: ") + why);
+        memset(words.contents(), 0, 16);
+        // (through the register shadow: the fill writes the 2D engine's registers, which a carried head's own Clear
+        // would otherwise be deduplicated against; its CP_BLIT makes the shadow forget, as a head's Clear does)
+        pm4::Stream fill;
+        if (!render::encodeMidPassFill(fill, *t, level, slice, open_->lazyColor[i], words.gpuAddress(), &why)) return refuseWork(why);
+        if (open_->options.dedupRegs) {
+            appendDeduped(stream_, fill, open_->regs);
+        } else {
+            appendStream(stream_, fill);
+        }
+        open_->cache = render::DrawCache{};
+        if (late) gMrtLazy[1].fetch_add(1, std::memory_order_relaxed);
+        if (tracePass_ < profiled_.size()) {
+            profiled_[tracePass_].clearBytes += uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel;
+        }
+    }
+    return true;
+}
 void CommandBuffer::setPassModesForTesting(int lazy, int carry, int merge) {
     gPassLazyForce = lazy;
     gPassStaticForce = carry;
@@ -5452,6 +5566,12 @@ void CommandBuffer::closePass(bool lazy) {
         return;
     }
     cullResolve();   // (ws-hm-cull) HM_CULL
+    for (uint32_t i = 0; open_->lazyClears != 0 && i < kMaxColorOutputs; i++) {   // (ws-hm-passopt) HM_MRT_LAZY: owed, never touched
+        if (!((open_->lazyClears >> i) & 1)) continue;
+        const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+        gMrtLazy[2].fetch_add(1, std::memory_order_relaxed);
+        if (t != nullptr) gMrtLazy[6].fetch_add(uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel, std::memory_order_relaxed);
+    }
     lastClosed_ = open_->pass.color0;
     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, open_->draws);
     if (open_->dual) {
@@ -5601,6 +5721,42 @@ bool CommandBuffer::clear(const RenderPass& passGiven, const render::Options& op
     RenderPass xrPass;
     const RenderPass* passIn = &passGiven;
     if (!xrRedirect(passGiven, &xrPass, &passIn, &why)) return refuseWork(why);
+    // (ws-hm-passopt) HM_MRT_LAZY: a colour Clear that stores DontCare leaves nothing defined past this pass of no draw:
+    // left out, and the pass with it when nothing else is left to clear
+    RenderPass lazyPass;
+    {
+        uint32_t left = 0;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const Texture* t = i == 0 ? passIn->color0 : passIn->more[i - 1].texture;
+            const LoadAction la = i == 0 ? passIn->load : passIn->more[i - 1].load;
+            const StoreAction sa = i == 0 ? passIn->store : passIn->more[i - 1].store;
+            if (t != nullptr && la == LoadAction::kClear && sa == StoreAction::kDontCare) left |= 1u << i;
+        }
+        if (left != 0) gMrtLazy[7].fetch_add(uint64_t(__builtin_popcount(left)), std::memory_order_relaxed);
+        if (left != 0 && mrtLazy() != 0) {
+            lazyPass = *passIn;
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                if (!((left >> i) & 1)) continue;
+                const Texture* t = i == 0 ? lazyPass.color0 : lazyPass.more[i - 1].texture;
+                (i == 0 ? lazyPass.load : lazyPass.more[i - 1].load) = LoadAction::kLoad;
+                gMrtLazy[0].fetch_add(1, std::memory_order_relaxed);
+                gMrtLazy[2].fetch_add(1, std::memory_order_relaxed);
+                gMrtLazy[6].fetch_add(uint64_t(t->width()) * t->height() * t->samples() * t->info().bytesPerPixel, std::memory_order_relaxed);
+            }
+            passIn = &lazyPass;
+            const bool zs = (lazyPass.depth != nullptr && lazyPass.depthLoad == LoadAction::kClear) ||
+                            (lazyPass.stencil != nullptr && lazyPass.stencilLoad == LoadAction::kClear);
+            bool colour = false;
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* t = i == 0 ? lazyPass.color0 : lazyPass.more[i - 1].texture;
+                colour = colour || (t != nullptr && (i == 0 ? lazyPass.load : lazyPass.more[i - 1].load) == LoadAction::kClear);
+            }
+            if (!colour && !zs) {
+                gMrtLazy[5].fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+    }
     const RenderPass& pass = *passIn;
     if (ubwcRules().log && pass.load == LoadAction::kClear && pass.color0 != nullptr && pass.color0->compressed()) pass.color0->ubwcFirstUse();   // (ws-hm-ubwc2)
     if (hangDumpOn() && pass.color0 != nullptr) {   // (redfin hmv6) HM_HANG_DUMP

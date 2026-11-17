@@ -8324,3 +8324,190 @@ TEST(deadfill2_takes_back_a_fill_under_a_full_target_cover_of_another_colour) {
     CHECK_EQ(c.delta(6), 2u);   // (the flat draw is the held one when the first fill comes: taken back too)
     CHECK_EQ(c.delta(0), 0u);
 }
+
+// --- (ws-hm-passopt) HM_MRT_LAZY: Clears of attachments that store DontCare owed, Clears joining the open sysmem pass ---
+
+namespace {
+struct MrtLazy {
+    explicit MrtLazy(int mode) { CommandBuffer::setMrtLazyForTesting(mode); }
+    ~MrtLazy() { CommandBuffer::setMrtLazyForTesting(-1); }
+};
+uint64_t mrtLazyStat(int i) {
+    uint64_t v[8];
+    CommandBuffer::mrtLazyStats(v);
+    return v[i];
+}
+Program mrtProgram() { return Program{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"}; }
+// CoreAnimation's pass: attachment 0 drawn into and stored, attachment 1 (memoryless) cleared and not stored
+RenderPass caPass(Texture* t0, Texture* t1, double red) {
+    RenderPass p;
+    p.color0 = t0;
+    p.more[0].texture = t1;
+    p.more[0].load = LoadAction::kClear;
+    p.more[0].store = StoreAction::kDontCare;
+    p.more[0].clearColor[0] = red;
+    p.more[0].clearColor[3] = 1.0;
+    return p;
+}
+// the same pass as the plug-in hands it on after its first draw: the Clears spent (Loads), one pass of the encoder
+RenderPass spent(RenderPass p) {
+    p.load = p.load == LoadAction::kClear ? LoadAction::kLoad : p.load;
+    for (ColorAttachment& a : p.more) a.load = a.load == LoadAction::kClear ? LoadAction::kLoad : a.load;
+    return p;
+}
+struct LazyRun {
+    uint32_t passes, fills, draws;
+    CommandBuffer::Status status;
+};
+LazyRun runLazy(Rig& r, std::initializer_list<std::pair<const Program*, RenderPass>> draws) {
+    NoDeadFill noDeadFill;
+    const auto s0 = r.fake->stats();
+    auto cb = r.queue->commandBuffer();
+    render::Options o;
+    o.gmem = false;
+    uint32_t n = 0;
+    for (const auto& [prog, pass] : draws) CHECK(cb->draw(*prog, pass, wholeDraw(3 + 3 * (n++ % 7)), Bindings{}, Bindings{}, o));
+    cb->commit();
+    cb->waitUntilCompleted();
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    const auto s1 = r.fake->stats();
+    CHECK_EQ(s1.faults, s0.faults);
+    CHECK_EQ(s1.staleSamples, s0.staleSamples);
+    return LazyRun{s1.passes - s0.passes, s1.fills - s0.fills, s1.draws - s0.draws, cb->status()};
+}
+}  // namespace
+
+// Draws that never write attachment 1: with HM_MRT_LAZY=1 its Clear is owed and dropped at the pass's end -- no fill,
+// its memory as it was -- where 0 fills it in the head
+TEST(mrt_lazy_an_untouched_dontcare_attachment_is_not_filled) {
+    Rig r;
+    auto t0 = target(r), t1 = target(r);
+    const Program flat = flatProgram();
+    const RenderPass p = caPass(t0.get(), t1.get(), 1.0), q = spent(p);
+    {
+        MrtLazy off(0);
+        const LazyRun x = runLazy(r, {{&flat, p}, {&flat, q}});
+        CHECK(x.status == CommandBuffer::kCompleted);
+        CHECK_EQ(x.fills, 1u);
+        CHECK_EQ(x.passes, 1u);
+    }
+    seed(*t1);
+    MrtLazy on(1);
+    const uint64_t owed = mrtLazyStat(0), dropped = mrtLazyStat(2);
+    const LazyRun x = runLazy(r, {{&flat, p}, {&flat, q}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.fills, 0u);
+    CHECK_EQ(x.passes, 1u);
+    CHECK_EQ(x.draws, 2u);
+    CHECK_EQ(mrtLazyStat(0) - owed, 1u);
+    CHECK_EQ(mrtLazyStat(2) - dropped, 1u);
+    const uint8_t canary[4] = {0xa5, 0xa5, 0xa5, 0xa5};
+    CHECK(allPixels(*t1, canary, 4));
+}
+
+// A draw that writes [[color(1)]] gets the owed Clear first: one fill, inside the pass, before that draw (the fake
+// rasterizes nothing, so the attachment is the clear colour); the draw before it went without
+TEST(mrt_lazy_a_draw_that_writes_the_attachment_gets_its_clear_first) {
+    using namespace a6xx;
+    Rig r;
+    auto t0 = target(r), t1 = target(r);
+    seed(*t1);
+    const Program flat = flatProgram(), mrt = mrtProgram();
+    const RenderPass p = caPass(t0.get(), t1.get(), 1.0);
+    MrtLazy on(1);
+    const uint64_t late = mrtLazyStat(1);
+    const LazyRun x = runLazy(r, {{&flat, p}, {&mrt, spent(p)}, {&mrt, spent(p)}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.fills, 1u);
+    CHECK_EQ(x.passes, 1u);
+    CHECK_EQ(x.draws, 3u);
+    CHECK_EQ(mrtLazyStat(1) - late, 1u);
+    const uint8_t red[4] = {255, 0, 0, 255};
+    CHECK(allPixels(*t1, red, 4));
+}
+
+// The next pass on the same attachments asking the same Clear of attachment 1 joins the open one (0: a pass of its own
+// each); its Clear owed again, so the attachment comes out in the second pass's colour
+TEST(mrt_lazy_a_pass_that_differs_by_dontcare_clears_joins_the_open_one) {
+    Rig r;
+    auto t0 = target(r), t1 = target(r);
+    const Program flat = flatProgram(), mrt = mrtProgram();
+    const RenderPass a = caPass(t0.get(), t1.get(), 1.0), b = caPass(t0.get(), t1.get(), 0.0);
+    {
+        MrtLazy off(0);
+        const LazyRun x = runLazy(r, {{&mrt, a}, {&mrt, b}});
+        CHECK(x.status == CommandBuffer::kCompleted);
+        CHECK_EQ(x.passes, 2u);
+        CHECK_EQ(x.fills, 2u);
+    }
+    MrtLazy on(1);
+    const uint64_t joined = mrtLazyStat(3);
+    const LazyRun x = runLazy(r, {{&mrt, a}, {&flat, spent(a)}, {&mrt, b}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.passes, 1u);
+    CHECK_EQ(x.fills, 2u);
+    CHECK_EQ(mrtLazyStat(3) - joined, 1u);
+    const uint8_t black[4] = {0, 0, 0, 255};
+    CHECK(allPixels(*t1, black, 4));
+    // a pass with another attachment 1 does not join
+    auto t2 = target(r);
+    const LazyRun y = runLazy(r, {{&mrt, a}, {&mrt, caPass(t0.get(), t2.get(), 0.0)}});
+    CHECK_EQ(y.passes, 2u);
+}
+
+// HM_MRT_LAZY=2: a Clear of a stored attachment 0 joins the open sysmem pass as a fill inside it (1: a pass of its own)
+TEST(mrt_lazy_2_a_stored_clear_is_filled_inside_the_open_pass) {
+    Rig r;
+    auto t0 = target(r);
+    const Program flat = flatProgram();
+    RenderPass load;
+    load.color0 = t0.get();
+    RenderPass clear = clearPass(t0.get(), 0.0, 1.0, 0.0, 1.0);
+    {
+        MrtLazy one(1);
+        const LazyRun x = runLazy(r, {{&flat, load}, {&flat, clear}});
+        CHECK_EQ(x.passes, 2u);
+        CHECK_EQ(x.fills, 1u);
+    }
+    seed(*t0);
+    MrtLazy two(2);
+    const uint64_t now = mrtLazyStat(4);
+    const LazyRun x = runLazy(r, {{&flat, load}, {&flat, clear}, {&flat, load}});
+    CHECK(x.status == CommandBuffer::kCompleted);
+    CHECK_EQ(x.passes, 1u);
+    CHECK_EQ(x.fills, 1u);
+    CHECK_EQ(x.draws, 3u);
+    CHECK_EQ(mrtLazyStat(4) - now, 1u);
+    const uint8_t green[4] = {0, 255, 0, 255};
+    CHECK(allPixels(*t0, green, 4));
+}
+
+// A clear-only pass (no draw) whose only Clear stores DontCare is dropped whole; one with a stored Clear beside it
+// keeps that one
+TEST(mrt_lazy_a_clear_only_pass_leaves_out_its_dontcare_clears) {
+    Rig r;
+    auto t0 = target(r), t1 = target(r);
+    RenderPass p = caPass(t0.get(), t1.get(), 1.0);
+    MrtLazy on(1);
+    const auto s0 = r.fake->stats();
+    const uint64_t whole = mrtLazyStat(5);
+    {
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->clear(p));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+    }
+    CHECK_EQ(r.fake->stats().fills - s0.fills, 0u);
+    CHECK_EQ(mrtLazyStat(5) - whole, 1u);
+    p.load = LoadAction::kClear;
+    {
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->clear(p));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+    }
+    CHECK_EQ(r.fake->stats().fills - s0.fills, 1u);
+    CHECK_EQ(r.fake->stats().faults, s0.faults);
+}
