@@ -18,7 +18,7 @@ DSC = os.environ.get('DSC', os.path.expanduser('~/redfin-work/dsc/dyld_shared_ca
 SYMDIR = os.path.join(PF, 'work', 'syms')
 FRAME = re.compile(r'\?\?\? \((?P<img>[^()]+?) \+ (?P<off>\d+)\) \[(?P<addr>0x[0-9a-f]+)\]')
 IDLE = re.compile(r'mach_msg|__psynch_cvwait|__workq_kernreturn|__semwait|kevent|__select|__ulock_wait|thread_suspend'
-                  r'|mach_absolute_time|__sigwait|semaphore_wait|nanosleep|machine_idle|thread_block|waitq|_continue \+ 0|machine_switch_context')
+                  r'|mach_absolute_time|__sigwait|semaphore_wait|nanosleep|machine_idle|thread_block|waitq|continue \+ 0|machine_switch_context')
 
 
 class Table:
