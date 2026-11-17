@@ -15,6 +15,7 @@ to "SWEET GOV: 5s" while freq is on. Details: osfmk/kern/sched_clutch.c (1182 bl
 
 ---
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index 168be61..e317262 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
@@ -295,7 +296,7 @@ index 4dc023a..1c31cb7 100644
  
  extern void machine_perfcontrol_deadline_passed(uint64_t deadline);
 diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
-index 0de268a..bd5b909 100644
+index 0de268a..523e125 100644
 --- a/osfmk/kern/sched_clutch.c
 +++ b/osfmk/kern/sched_clutch.c
 @@ -4902,6 +4902,8 @@ sched_edge_pset_made_schedulable(__unused processor_t processor, processor_set_t
@@ -323,7 +324,7 @@ index 0de268a..bd5b909 100644
  	uint64_t deadline;
  	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
  	thread_call_enter_delayed(sweet_edge_tcall, deadline);
-@@ -5083,6 +5087,669 @@ sweet_edge_late_init(void)
+@@ -5083,6 +5087,673 @@ sweet_edge_late_init(void)
  	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
  	thread_call_enter_delayed(sweet_edge_tcall, deadline);
  }
@@ -412,9 +413,13 @@ index 0de268a..bd5b909 100644
 +} sweet_clpc_slots[SWEET_CLPC_SLOTS];
 +static uint32_t sweet_clpc_nslots, sweet_clpc_slot_full;
 +
++static uint64_t sweet_clpc_nomarks;     /* if the machine data were < 8 bytes (ADT kern.thread_group_extra_bytes: 64) */
 +static inline uint64_t *
 +sweet_clpc_marks(struct thread_group *tg)
 +{
++	if (thread_group_machine_data_size() < sizeof(uint64_t)) {
++		return &sweet_clpc_nomarks;
++	}
 +	return (uint64_t *)thread_group_get_machine_data(tg);
 +}
 +
@@ -555,7 +560,7 @@ index 0de268a..bd5b909 100644
 +static void
 +sweet_clpc_cb_tg_flags(thread_group_data_t d)
 +{
-+	if (sweet_clpc_mask <= 0 || d->thread_group_data == NULL) {
++	if (sweet_clpc_mask <= 0 || d->thread_group_data == NULL || d->thread_group_size < sizeof(uint64_t)) {
 +		return;
 +	}
 +	uint64_t *mk = (uint64_t *)d->thread_group_data;
