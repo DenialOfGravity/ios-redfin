@@ -550,8 +550,11 @@ sweet_nfc_init(void)
 {
 	thread_t th;
 
-	if (!PE_parse_boot_argn("sweetnfc", &nfc_bootarg, sizeof(nfc_bootarg)) || nfc_bootarg == 0) {
-		nfc_bootarg = 0;
+	if (!PE_parse_boot_argn("sweetnfc", &nfc_bootarg, sizeof(nfc_bootarg))) {
+		nfc_bootarg = 2;        /* 1154: no boot-arg = NFC on by default (P1 published at boot, persona) */
+		SAY("1154: NFC on by default (persona, P1 at boot); boot-arg sweetnfc=0 turns it off\n");
+	}
+	if (nfc_bootarg == 0) {
 		return;                 /* nothing touched (1117: kern.sweet_nfc_probe=1 probes on demand) */
 	}
 	if (nfc_bootarg & 2) {          /* 1119: the P1 surface 2 s after init (as kern.sweet_nfc_p1=1) */
@@ -623,9 +626,10 @@ static LCK_MTX_DECLARE(gw_lock, &nfc_lock_group);
 static LCK_MTX_DECLARE(p1_lock, &nfc_lock_group);
 static kern_ctl_ref gw_ctl;
 static uint32_t nfc_p1, nfc_gw_mode;
-static uint32_t nfc_id_bits = 1, nfc_id_info = 0x4202016au;   /* 1125: hw 0x42 = PN80V (was 0x51) */
+static uint32_t nfc_id_bits = 4,   /* 1154: persona by default (was 1) */ nfc_id_info = 0x4202016au;   /* 1125: hw 0x42 = PN80V (was 0x51) */
 static uint32_t nfc_fwif = 0x0015;     /* 1125/1127: 2F 19 answer; MwFwCompatibilityChkProcess wants 0x15 for hw 0x42 */
-static uint32_t nfc_fwif_fmt;          /* 1127: kern.sweet_nfc_fwif_fmt, persona variants (see persona_packet) */
+static uint32_t nfc_fwif_fmt = 0x16C5D10;  /* 1154: working set: 0x5D00 eSE/HCI, 0x10 keep A0xx, 0x40000/0x80000
+					    * download, 0x200000 APDU, 0x400000 reader path (needs kern.sweet_nfc_reader), 0x1000000 ATR */          /* 1127: kern.sweet_nfc_fwif_fmt, persona variants (see persona_packet) */
 static volatile bool gw_dereg_pending; /* 1125: withdrawn while a client was connected: deregister at its close */
 static uint32_t gw_conns;
 static struct { uint16_t op; uint16_t n; } persona_seen[32];   /* 1125: (gid << 8 | oid, count) answered by the persona */
@@ -641,7 +645,7 @@ static volatile bool gw_dl_mode;
 static unsigned gw_dl_n;
 static uint32_t gw_dl_frames;
 static uint8_t gw_dl_buf[2 + 512 + 2];  /* [LEN_hi LEN_lo | payload | CRC16] */
-static uint32_t nfc_dl_ver = 0x015a;    /* 1150: kern.sweet_nfc_dl_ver, HDLL GET_VERSION data[7]=hi data[8]=lo */
+static uint32_t nfc_dl_ver = 0x6a01;    /* 1154: PN552_FW_02_01_6A passes nfrestore's check (was 0x015a) */    /* 1150: kern.sweet_nfc_dl_ver, HDLL GET_VERSION data[7]=hi data[8]=lo */
 static struct {
 	bool connected, rf_active;
 	uint32_t unit, crc, on_demand;
@@ -1474,6 +1478,13 @@ cfg_default(uint16_t id, uint8_t *v)
 	case 0xa01e:
 		memset(v, 0, 8);
 		return 8;
+	case 0xa022:                    /* 1154: eSE connectivity / APDU pipe status: 1 = open (GetSEPipeStatusProc */
+	case 0xa023:                    /* 0x1f517c1e4); 0 made ClearEseSessionIdSeq loop */
+		v[0] = 1;
+		return 1;
+	case 0xa118:                    /* 1154: flash write counter, u32 (NFDriverGetFlashWriteCounter needs 8-byte reply) */
+		memset(v, 0, 4);
+		return 4;
 	default:
 		v[0] = 0;
 		return 1;
