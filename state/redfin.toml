@@ -20,12 +20,14 @@ note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 a
 
 # What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
 [boot]
-image = "rk20a"
+# 2026-11-17: promoted ws-int-k27-perf = ws-int-k27 (dbd0752e6f, cell data) + 1159 gpustats, 1160 perf counters, 1161 hang dump, 1162 p disp on|off (all off by default). Branch head 29b7f4c is NOTES only.
+# 2026-11-17 (night): promoted the native two-cluster kernel ws-amp-p3 83548e279b = ws-int-k27-uirebal (k27-perf + 1163 ui_rebal + 1164 appmain, both off) + 1180 AMP topology/Edge + 1181 kern.sweet_edge_pref (1) + 1182 SweetCLPC (kern.sweet_clpc 15 below). Image rclpc2. Fallback: the SMP kernel builds/xnu/ws-int-k27-perf-9b6aa022d6 (image rk27p). Docs: claude/redfin-status-2026-11-17-amp-promoted.md.
+image = "rclpc2"
 base = "r5p3a"
-kernel_dir = "builds/xnu/ws-int-k20-e4856b8fe4"
-kernel_branch = "ws-int-k20"
-kernel_sha = "e4856b8fe4"
-kernel_uuid = "60BE0B89-A4A5-3B59-89DA-54C5600E08A9"
+kernel_dir = "builds/xnu/83548e279b42f052d6983b43e4c1db539a11b73b-83548e279b"
+kernel_branch = "ws-amp-p3"
+kernel_sha = "83548e279b"
+kernel_uuid = "69CFBE12-A17E-3D94-AC49-BF31DF18973F"
 cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13"
 bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2"
 
@@ -104,6 +106,9 @@ scratch = "/var/local/scratch"
 
 # Applied at every boot: generated into /var/local/sweet-sysctl.conf (read by /var/local/bin/sweet-sysctl.sh, started from sensd-probe.sh = launchd job org.iosonpixel.sensdprobe). apply also sets the running value.
 [sysctl]
+"kern.sweet_cc_datacap" = 1
+"kern.sweet_data_fwd" = 1
+"kern.sweet_qmi_rules" = 1
 "kern.sweet_abp_readyms" = 2000
 "kern.sweet_mdm_crash" = 1
 "kern.sweet_voice_opts" = 1920
@@ -113,6 +118,7 @@ scratch = "/var/local/scratch"
 "kern.sweet_qmi_republish_ms" = 3000
 "kern.sweet_voice_gain_rx" = 6
 "kern.sweet_voice_gain_tx" = 4
+"kern.sweet_clpc" = 15
 
 # Runtime values diff checks but that are NOT written to the conf (kernel defaults, boot-args); apply sets them with sctl.
 [sysctl_expect]
@@ -129,7 +135,6 @@ scratch = "/var/local/scratch"
 "kern.sweet_cm" = 0
 "kern.sweet_cm_trace" = 0
 "kern.sweet_crumb" = 0
-"kern.sweet_data_fwd" = 0
 "kern.sweet_data_opts" = 4
 "kern.sweet_fb_early_retire" = 0
 "kern.sweet_fb_hz" = 90
@@ -153,13 +158,13 @@ scratch = "/var/local/scratch"
 "kern.sweet_mqrtr_aux" = 0
 "kern.sweet_mtl" = 2
 "kern.sweet_nfc_fwif" = 21
-"kern.sweet_nfc_fwif_fmt" = 0
+"kern.sweet_nfc_fwif_fmt" = 23878928
 "kern.sweet_nfc_gw" = 0
-"kern.sweet_nfc_id" = 1
+"kern.sweet_nfc_id" = 4
 "kern.sweet_nfc_id_info" = 1107427690
 "kern.sweet_nfc_mwlog" = 0
 "kern.sweet_nfc_ntf_delay_ms" = 100
-"kern.sweet_nfc_p1" = 0
+"kern.sweet_nfc_p1" = 1
 "kern.sweet_pace" = 0
 "kern.sweet_pace_dump" = 0
 "kern.sweet_pace_min" = 2000
@@ -175,7 +180,6 @@ scratch = "/var/local/scratch"
 "kern.sweet_qmi_plmnblip" = 0
 "kern.sweet_qmi_plmnblip_ms" = 1500
 "kern.sweet_qmi_policy_file" = 1
-"kern.sweet_qmi_rules" = 0
 "kern.sweet_qmi_split_ms" = 300
 "kern.sweet_qmi_vocoder" = 0
 "kern.sweet_qmi_vocoder_type" = 16
@@ -575,8 +579,8 @@ sha = "2e899aa8d6"
 
 [[file]]
 path = "/var/local/bin/sweetmon"
-source = "builds/userland/645854a7340a681bf6ab1740378059cab9a7a5c9-645854a734/sweetmon"
-sha256 = "ccfe84cca1f74df86e032ab027b26fdd4e584093678c1a80895e701941fb9684"
+source = "builds/userland/ws-gpuperf-07a86585ac/sweetmon"
+sha256 = "d797b33319925212e16eec6887bc5e2e6be14a5ea4b20d329134d81206054257"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -586,8 +590,8 @@ restart = "sweetmon"
 
 [[file]]
 path = "/var/local/bin/sweettrace"
-source = "builds/userland/ws-u-lab-d9a9c25217/sweettrace"
-sha256 = "d6fd649f9b24b5dd2ba51fe399472f64ca1c8134fc44077d70762ec3146eef8b"
+source = "builds/userland/ws-gpuperf-07a86585ac/sweettrace"
+sha256 = "ecd2ccd5e815758c6c6f306df6924b986eef1e76c8988315603d0cdf4ed2857f"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -827,6 +831,12 @@ sha256 = "d76ac65bdd442803d41e5e83d8a30d537880ceb19f8e7be50c8e2d258383919c"
 mode = "644"
 owner = "0:0"
 
+[[file]]
+path = "/var/local/bin/cell-data-up.sh"
+source = "/home/rorya/ios-redfin/phone/boot/cell-data-up.sh"
+sha256 = "77fb2897f1b01c2369e38f3f89110c14f6a3bf042edd1c6bcb5c9a37c47c92b4"
+mode = "755"
+
 
 # Bundle directories: every file with its sha256; apply installs the whole bundle from source.
 [[bundle]]
@@ -888,15 +898,15 @@ note = "AirFair moved aside (FairPlay off; KNOWN-GOOD rk3a notes)"
 
 [[bundle]]
 path = "/var/local/hmetal/lib/HakiosMetal.bundle"
-source = "builds/hmetal/ws-hm-int14-3a027e8/HakiosMetal.bundle"
-target = "hmetal"
-ref = ""
-sha = ""
-note = "1 of 3 files match builds/hmetal/ws-hm-int14-3a027e8/HakiosMetal.bundle"
+source = "builds/hmetal-mesa/9ef02b6fe8c04228eaebd8f135a5afca2fc42e16-9ef02b6fe8/bench/HakiosMetal.bundle"
+target = "hmetal-mesa"
+ref = "ws-hm-xrreuse"
+sha = "9ef02b6fe8"
+note = "2026-11-17 (night): ws-hm-xrreuse 9ef02b6 = ws-hm-perf ad4e7af (hm-int14 3a027e8 + HM_PERF) + HM_XR_REUSE (env HM_XR_REUSE=1: App Library GPU 28 -> 10 ms/frame). MESA=1 build; plain hmetal builds have no compiler, never install them. Previous: builds/hmetal-mesa/ws-hm-perf-ad4e7af535"
 restart = "backboardd"
 CFBundleIdentifier = "org.redfin.hakios-metal-bench"
 CFBundleVersion = "1"
-files = { HakiosMetal = "ebc2c0ce59361cf289bc66f4be0409fd358fd2f6ebaea70e238d34c56bb13ba5", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "626aa5346814be39005a9a78091735c45b4985a7605a9ae7a55bc3448d29bee1" }
+files = { HakiosMetal = "072b74b54680d5c96e323fa89d0ba5ce1c918f6b1d517c079ce17b48d6539abe", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "7f09154ddf752ad03d11008b8dd69739c95f6da3d85949de5c08fefe8cfa90ae" }
 
 [[bundle]]
 path = "/var/local/hmetal/lib/SweetMetal2.bundle"
@@ -1240,6 +1250,7 @@ HM_DRAW_SKIP=all
 backboardd:HM_RT_CACHE=48
 backboardd:HM_POOL_KEEP_MB=16
 HM_NOUC=1
+HM_XR_REUSE=1
 """
 mode = "755"
 
