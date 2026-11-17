@@ -166,6 +166,15 @@ a { color: var(--accent); }
     <div class="kv" id="fps-kv" style="margin-top:6px"></div>
   </section>
 
+  <section class="panel c12">
+    <h2>GPU counters <span class="sub">xnu 1158 kern.sweet_gpuperf, per second</span><span class="right muted" id="gperf-sub"></span>
+      <span class="right ctl"><select id="gperf-preset"><option value="overview">overview</option><option value="off">off</option><option value="">custom:</option></select>
+      <input type="text" id="gperf-sel" placeholder="GROUP:COUNTABLE,... (number or Mesa name)" style="width:280px">
+      <button class="btn" id="gperf-set">set</button><span class="muted" id="gperf-msg"></span></span></h2>
+    <div class="kv" id="gperf-kv"></div>
+    <div class="tscroll"><table id="gperf-tab" style="margin-top:6px"><thead><tr><th>counter</th><th>countable</th><th class="n">per s</th><th class="n">value</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
   <section class="panel c7">
     <h2>Processes <span class="sub" id="proc-sub">click a row to pick it as the profiler target</span></h2>
     <div class="tscroll"><table id="proc"><thead><tr>
@@ -316,7 +325,7 @@ const TK = ['silver', 'gold', 'prime', 'gpu', 'ddr', 'aoss'];
 const TC = ['--s1', '--s2', '--s8', '--s3', '--s7', '--s4'];
 const sTemp = TK.map((k, i) => ({ name: k, color: TC[i], get: (h) => h.temp ? h.temp[k] : null }));
 const chTemp = new Chart($('#ch-temp'), { min: null, max: null, unit: '°C', dec: 1, series: sTemp });
-const chGpu = new Chart($('#ch-gpu'), { min: 0, max: 100, unit: '%', fill: true, series: [{ name: 'GPU busy', color: '--s3', get: (h) => h.gpu }] });
+const chGpu = new Chart($('#ch-gpu'), { min: 0, max: 100, unit: '%', fill: true, series: [{ name: 'GPU busy', color: '--s3', get: (h) => h.gpu }, { name: 'GPU busy (counters, 1158)', color: '--s2', get: (h) => h.gpc }] });
 const sMem = [{ name: 'used', color: '--s1', get: (h) => h.mem_used }, { name: 'free', color: '--s3', get: (h) => h.mem_free }, { name: 'compressed', color: '--s2', get: (h) => h.mem_comp }];
 const chMem = new Chart($('#ch-mem'), { min: 0, max: null, unit: 'MB', series: sMem });
 const sFps = [{ name: 'shown (5 s: FB or scanout latched)', color: '--s1', get: (h) => h.fb_fps }, { name: 'frame mode', color: '--s2', get: (h) => h.fps }];
@@ -365,6 +374,14 @@ function onSnap(s) {
   const tot = g ? Math.max(1, g.busy_ms) : 1;
   $('#gpu-own').innerHTML = g && g.owners.length ? '<table><thead><tr><th>GPU owner (5 s)</th><th class="n">submits</th><th class="n">ms</th><th style="width:45%"></th></tr></thead><tbody>' +
     g.owners.map((o) => '<tr><td>' + esc(o.name) + '</td><td class="n">' + o.submits + '</td><td class="n">' + o.ms + '</td><td><div class="bar"><span style="width:' + Math.min(100, o.ms / tot * 100) + '%;background:var(--s3)"></span></div></td></tr>').join('') + '</tbody></table>' : '';
+  // xnu 1158 GPU counters
+  const gp = s.gpuperf;
+  $('#gperf-sub').textContent = gp ? (gp.gpu_on ? 'sel ' + gp.sel + (gp.dt_s ? ', window ' + fmt(gp.dt_s, 2) + ' s (aon)' : '') : 'GPU off') : 'off (mon gpuperf overview)';
+  const GU = { gpu_mhz: 'MHz', uche_read_Bps: 'MB/s', uche_write_Bps_est: 'MB/s' };
+  $('#gperf-kv').innerHTML = gp ? Object.entries(gp.derived).map(([k, v]) => '<span class="k" title="' + esc(gp.formulas[k] || '') + '">' + esc(k) + '</span><span class="num">' +
+    (GU[k] === 'MB/s' ? fmt(v / 1e6, 1) + ' MB/s' : fmt(v, 1) + (GU[k] ? ' ' + GU[k] : '')) + '</span>').join('') : '';
+  $('#gperf-tab tbody').innerHTML = gp ? gp.counters.map((c) => '<tr><td>' + esc(c.key) + '</td><td>' + esc(c.name) + '</td><td class="n">' + (c.per_s === null ? '-' : c.per_s.toLocaleString()) +
+    '</td><td class="n">' + c.value.toLocaleString() + '</td></tr>').join('') : '';
   // memory
   const m = s.mem;
   $('#mem-kv').innerHTML = [['wired', m.wired_mb, 'MB'], ['active', m.active_mb, 'MB'], ['inactive', m.inactive_mb, 'MB'], ['pageins', m.pageins_s, '/s'], ['faults', m.faults_s, '/s'], ['processes', s.phone.nproc, '']]
@@ -433,6 +450,12 @@ $('#speedbtn').addEventListener('click', async () => {
   try { const r = await api('/api/speed', { mb: +$('#speedmb').value || 16 }); $('#speedres').textContent = r.ok ? fmt(r.mbps, 1) + ' MB/s via ' + r.via + ' (' + r.mb + ' MiB in ' + r.pc_s + ' s)' : 'failed: ' + (r.msg || (r.phone && r.phone.msg)); }
   catch (e) { $('#speedres').textContent = 'failed: ' + e; }
   $('#speedbtn').disabled = false;
+});
+$('#gperf-set').addEventListener('click', async () => {
+  const sel = $('#gperf-preset').value || $('#gperf-sel').value.trim();
+  $('#gperf-msg').textContent = ' ...';
+  try { const r = await api('/api/gpuperf', { sel }); $('#gperf-msg').textContent = ' ' + (r.ok ? 'set ' + r.set : r.msg); }
+  catch (e) { $('#gperf-msg').textContent = ' failed: ' + e; }
 });
 $('#frames-on').addEventListener('change', (e) => api('/api/frames', { on: e.target.checked }));
 $('#themebtn').addEventListener('click', () => {

@@ -67,6 +67,9 @@ T0=$(date +%s)
 waitfor 15 'd.get("link",{}).get("authed") and d["link"]["via"]=="usb" and d.get("cpu") is not None' \
 	&& ok "connect+auth over usb, sample in /api/now ($(( $(date +%s) - T0 )) s)" || bad "connect/auth"
 sleep 6
+# xnu 1158 counters (fakephone sends the overview selection): deltas, names, derived metrics
+waitfor 10 'd.get("gpuperf") and abs(d["gpuperf"]["derived"].get("gpu_busy_pct",0)-40)<1 and abs(d["gpuperf"]["derived"].get("lrz_killed_pct",0)-40)<1 and any(c["name"]=="PERF_SP_ALU_WORKING_CYCLES" for c in d["gpuperf"]["counters"])' \
+	&& ok "now.json gpuperf: busy 40 %, LRZ killed 40 %, countable names" || bad "gpuperf view: $(curl -s $API/api/now | j 'd.get("gpuperf")')"
 python3 - "$W/logs/mon/now.json" <<'EOF' && ok "now.json: busy/MHz/temps/battery/gpu owners/procs/klog tags/self/link" || bad "now.json content"
 import json, sys
 d = json.load(open(sys.argv[1]))

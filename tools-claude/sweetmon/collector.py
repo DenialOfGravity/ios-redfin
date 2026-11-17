@@ -9,6 +9,8 @@ Protocol and design: docs/redfin/sweetmon.md (branch ws-z-mon). Python 3 stdlib 
   collector.py ctl CMD ...                   client for the phone agent's `mon ...` actions (talks to the API):
       status | snap | trace NAME [kdebug|prof] [SECS] [k=v ...] | stop | traces | wait [SECS] | link usb|wifi|auto
       | speed [MB] | frames on|off | klog-pa PA | usb-fast [POLL_US TXBATCH | off] | cmd TEXT
+      | gpuperf [overview | off | GROUP:COUNTABLE,...]   xnu 1158 Adreno counters (countable: number or Mesa
+        name, e.g. SP:PERF_SP_BUSY_CYCLES or SP:BUSY_CYCLES); no argument: read back. now.json "gpuperf".
 
 Files (under --root, default /mnt/d/ClaudeProjects/iOS_Pixel5):
   logs/mon/now.json             latest merged snapshot (rewritten atomically every sample)
@@ -339,6 +341,142 @@ class Trace:
                 'transfer_mbps': round(self.zbytes / 1e6 / x_el, 2) if x_el > 0.05 else None, 'end': self.end}
 
 
+# xnu 1158 Adreno perf counters (kern.sweet_gpuperf_sel / kern.sweet_gpuperf). Presets name countables (Mesa names,
+# a6xx-perfcntrs.json) and must fit the kernel's slots: RBBM 4, CP 13 (slot 0 reserved), SP 23 (0 reserved), TP 12,
+# UCHE 12, LRZ 4.
+GPUPERF_PRESETS = {
+    'overview': ['RBBM:PERF_RBBM_ALWAYS_COUNT', 'RBBM:PERF_RBBM_STATUS_MASKED', 'CP:PERF_CP_BUSY_CYCLES',
+                 'SP:PERF_SP_BUSY_CYCLES', 'SP:PERF_SP_ALU_WORKING_CYCLES', 'SP:PERF_SP_EFU_WORKING_CYCLES',
+                 'TP:PERF_TP_L1_CACHELINE_REQUESTS', 'TP:PERF_TP_L1_CACHELINE_MISSES',
+                 'UCHE:PERF_UCHE_VBIF_READ_BEATS_CH0', 'UCHE:PERF_UCHE_VBIF_READ_BEATS_CH1',
+                 'UCHE:PERF_UCHE_RAM_WRITE_REQ', 'LRZ:PERF_LRZ_TOTAL_PIXEL', 'LRZ:PERF_LRZ_VISIBLE_PIXEL_AFTER_LRZ'],
+}
+GPUPERF_FORMULAS = {
+    'gpu_mhz': 'RBBM ALWAYS_COUNT/s / 1e6 (GPU core cycles; hw clock gating is off on redfin)',
+    'gpu_busy_pct': '100 * RBBM STATUS_MASKED / RBBM ALWAYS_COUNT (else CP BUSY_CYCLES / ALWAYS_COUNT)',
+    'cp_busy_pct': '100 * CP BUSY_CYCLES / RBBM ALWAYS_COUNT',
+    'sp_busy_pct': '100 * SP BUSY_CYCLES / RBBM ALWAYS_COUNT',
+    'sp_alu_pct': '100 * SP ALU_WORKING_CYCLES / SP BUSY_CYCLES',
+    'sp_efu_pct': '100 * SP EFU_WORKING_CYCLES / SP BUSY_CYCLES',
+    'tp_l1_miss_pct': '100 * TP L1_CACHELINE_MISSES / TP L1_CACHELINE_REQUESTS',
+    'uche_read_Bps': '32 * (UCHE VBIF_READ_BEATS_CH0 + CH1)/s (else the sum of the per-client VBIF_READ_BEATS_*)',
+    'uche_write_Bps_est': '32 * UCHE RAM_WRITE_REQ/s (estimate: one 32-byte beat per request assumed)',
+    'lrz_killed_pct': '100 * (1 - LRZ VISIBLE_PIXEL_AFTER_LRZ / LRZ TOTAL_PIXEL)',
+}
+GPUPERF_RAW = re.compile(r'([A-Z0-9]+):(\d+)@(\d+)=(\d+)$')
+
+
+class GpuPerf:
+    """per-second deltas and derived metrics from the daemon's raw kern.sweet_gpuperf line"""
+    AON_HZ = 19.2e6
+
+    def __init__(self, path):
+        self.groups = {}
+        try:
+            with open(path) as f:
+                self.groups = json.load(f).get('groups', {})
+        except (OSError, ValueError) as e:
+            log.warning('gpuperf names (%s): %s', path, e)
+        self.prev = None
+        self.view = None
+
+    def name(self, g, c):
+        return ((self.groups.get(g) or {}).get('countables') or {}).get(str(c)) or '%s_%d' % (g, c)
+
+    def resolve(self, text):
+        """PRESET | off | GROUP:COUNTABLE[,..] (number or Mesa name) -> the kernel's 'G:N,G:N' (or 'off')"""
+        text = (text or '').strip()
+        if text in ('off', '0', '', 'none'):
+            return 'off'
+        items = GPUPERF_PRESETS.get(text) or [x for x in re.split(r'[,\s]+', text) if x]
+        out, used = [], {}
+        for it in items:
+            m = re.fullmatch(r'([A-Za-z]+):(\w+)', it)
+            if not m:
+                raise ValueError('bad entry %r (GROUP:COUNTABLE)' % it)
+            g, c = m.group(1).upper(), m.group(2)
+            grp = self.groups.get(g)
+            if grp is None:
+                raise ValueError('unknown group %s (%s)' % (g, ' '.join(sorted(self.groups))))
+            if c.isdigit():
+                n = int(c)
+            else:
+                cn = c.upper()
+                cands = [k for k, v in grp['countables'].items() if v in (cn, 'PERF_%s_%s' % (g, cn))]
+                if not cands:
+                    raise ValueError('unknown %s countable %s' % (g, c))
+                n = int(cands[0])
+            used[g] = used.get(g, 0) + 1
+            if used[g] > grp['slots'] - len(grp.get('reserved') or []):
+                raise ValueError('more %s counters than its %d free slots' % (g, grp['slots'] - len(grp.get('reserved') or [])))
+            out.append('%s:%d' % (g, n))
+        if len(out) > 16:
+            raise ValueError('%d counters (max 16)' % len(out))
+        return ','.join(out) or 'off'
+
+    def update(self, gp, dt_ms):
+        """gp = the sample's {"sel","raw"} or None; returns the now.json 'gpuperf' view (None when off)"""
+        if not gp:
+            self.prev = None
+            self.view = None
+            return None
+        sel, raw = gp.get('sel') or '', gp.get('raw') or ''
+        aon, on, vals = 0, True, {}
+        for tok in raw.split():
+            if tok.startswith('aon='):
+                aon = int(tok[4:] or 0)
+            elif tok == 'gpu=off':
+                on = False
+            else:
+                m = GPUPERF_RAW.match(tok)
+                if m:
+                    vals[(m.group(1), int(m.group(2)), int(m.group(3)))] = int(m.group(4))
+        prev, self.prev = self.prev, (sel, aon, vals, on)
+        dt_s = None
+        if prev and prev[0] == sel and prev[3] and on:
+            dt_s = (aon - prev[1]) / self.AON_HZ if aon > prev[1] else (dt_ms or 1000) / 1000.0
+        ctrs, rate = [], {}
+        for (g, c, slot), v in vals.items():
+            ps = None
+            if dt_s and dt_s > 0:
+                pv = prev[2].get((g, c, slot))
+                if pv is not None and v >= pv:
+                    ps = (v - pv) / dt_s
+            nm = self.name(g, c)
+            rate[(g, nm)] = ps
+            ctrs.append({'key': '%s:%d@%d' % (g, c, slot), 'group': g, 'countable': c, 'name': nm, 'value': v,
+                         'per_s': round(ps) if ps is not None else None})
+
+        def r(g, n):
+            return rate.get((g, 'PERF_%s_%s' % (g, n)))
+
+        def pct(a, b):
+            return round(100.0 * a / b, 1) if a is not None and b else None
+        cyc = r('RBBM', 'ALWAYS_COUNT') or r('CP', 'ALWAYS_COUNT')
+        d = {'gpu_mhz': round(cyc / 1e6, 1) if cyc else None,
+             'gpu_busy_pct': pct(r('RBBM', 'STATUS_MASKED'), cyc) if r('RBBM', 'STATUS_MASKED') is not None
+             else pct(r('CP', 'BUSY_CYCLES'), cyc),
+             'cp_busy_pct': pct(r('CP', 'BUSY_CYCLES'), cyc),
+             'sp_busy_pct': pct(r('SP', 'BUSY_CYCLES'), cyc),
+             'sp_alu_pct': pct(r('SP', 'ALU_WORKING_CYCLES'), r('SP', 'BUSY_CYCLES')),
+             'sp_efu_pct': pct(r('SP', 'EFU_WORKING_CYCLES'), r('SP', 'BUSY_CYCLES')),
+             'tp_l1_miss_pct': pct(r('TP', 'L1_CACHELINE_MISSES'), r('TP', 'L1_CACHELINE_REQUESTS'))}
+        ch = [r('UCHE', 'VBIF_READ_BEATS_CH0'), r('UCHE', 'VBIF_READ_BEATS_CH1')]
+        per = [r('UCHE', 'VBIF_READ_BEATS_' + k) for k in ('TP', 'VFD', 'HLSQ', 'LRZ', 'SP', 'PC')]
+        rb = sum(x for x in ch if x is not None) if any(x is not None for x in ch) else \
+            (sum(x for x in per if x is not None) if any(x is not None for x in per) else None)
+        d['uche_read_Bps'] = round(32 * rb) if rb is not None else None
+        wr = r('UCHE', 'RAM_WRITE_REQ')
+        d['uche_write_Bps_est'] = round(32 * wr) if wr is not None else None
+        tot, vis = r('LRZ', 'TOTAL_PIXEL'), r('LRZ', 'VISIBLE_PIXEL_AFTER_LRZ')
+        d['lrz_killed_pct'] = round(100.0 * (1 - vis / tot), 1) if tot and vis is not None else None
+        d = {k: v for k, v in d.items() if v is not None}
+        self.view = {'sel': sel, 'gpu_on': on, 'aon': aon, 'dt_s': round(dt_s, 3) if dt_s else None,
+                     'counters': sorted(ctrs, key=lambda x: (x['group'], x['key'])), 'derived': d,
+                     'formulas': {k: GPUPERF_FORMULAS[k] for k in d}}
+        return self.view
+
+
 class Collector:
     def __init__(self, a):
         self.a = a
@@ -381,6 +519,7 @@ class Collector:
         self.usb_fast_warned = False
         # data
         self.hist = collections.deque()
+        self.gpuperf = GpuPerf(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'a6xx-perfcntrs.json'))
         self.snap = {}
         self.latest = {}            # parsed klog facts
         self.crashes = collections.deque(maxlen=20)
@@ -1150,6 +1289,7 @@ class Collector:
                         'since_up_s': self.latest['level'][0] if lvl else None},
             'battery': dict(bat, age_s=r1(bat_age)) if bat else None,
             'gpu': dict(gpu, age_s=r1(gpu_age)) if gpu else None,
+            'gpuperf': self.gpuperf.update(s.get('gpuperf'), dt_ms),
             'fb': dict(fb, age_s=r1(fb_age)) if fb else None,
             'mem': mem,
             'procs': {'by_cpu': self.procs_view['by_cpu'][:self.cfg['top']], 'by_wakeups': self.procs_view['by_wakeups'],
@@ -1173,7 +1313,8 @@ class Collector:
              'mem_free': mem['free_mb'], 'mem_used': mem['used_mb'], 'mem_comp': mem['compressed_mb'],
              'klog_bps': s.get('klog_bps') if s.get('klog_bps') is not None else krx, 'self_cpu': selfv['cpu_pct'],
              'self_ms': selfv['cpu_ms_s'], 'fps': fr['fps'] if fr else None,
-             'fb_fps': fb['fps'] if fb and fb_age is not None and fb_age < 12 else None, 'rtt': r1(self.rtt_ms)}
+             'fb_fps': fb['fps'] if fb and fb_age is not None and fb_age < 12 else None, 'rtt': r1(self.rtt_ms),
+             'gpc': (snap['gpuperf'] or {}).get('derived', {}).get('gpu_busy_pct') if snap.get('gpuperf') else None}
         self.hist.append(h)
         while self.hist and (t - self.hist[0]['t'] > self.a.history_secs or len(self.hist) > 40000):
             self.hist.popleft()
@@ -1757,6 +1898,23 @@ class Collector:
             st = await self.usb_fast_apply(self.host)
             return self.respond(w, 200, {'ok': not st.get('error'), 'msg': st.get('error') or 'ok', 'usb_fast': st,
                                          'usb_fast_cfg': self.cfg.get('usb_fast')})
+        if path == '/api/gpuperf':
+            # {"sel": "overview" | "off" | "GROUP:COUNTABLE,..."} sets kern.sweet_gpuperf_sel (xnu 1158) over ssh;
+            # {} reads it back. Not saved: the kernel starts with it off after every boot.
+            want = J.get('sel')
+            try:
+                val = self.gpuperf.resolve(want) if want is not None else None
+            except ValueError as e:
+                return self.respond(w, 400, {'ok': False, 'msg': str(e), 'presets': GPUPERF_PRESETS})
+            if not (self.authed and self.host):
+                return self.respond(w, 200, {'ok': False, 'msg': 'phone not connected'})
+            sctl = '/var/local/bin/sctl'
+            cmd = ('%s kern.sweet_gpuperf_sel %s; ' % (sctl, val) if val else '') + \
+                '%s kern.sweet_gpuperf_sel; %s kern.sweet_gpuperf_regs 2>&1' % (sctl, sctl)
+            rc, out = await self.ssh_run(self.host, cmd, 20)
+            ok = rc == 0 and (val is None or ' -> ' in out) and 'kern.sweet_gpuperf_regs:' in out
+            return self.respond(w, 200, {'ok': ok, 'msg': 'ok' if ok else 'failed (kernel without xnu 1158?)',
+                                         'set': val, 'out': out.strip()[-1500:]})
         if path == '/api/rate':
             ms = max(200, min(int(J.get('ms') or J.get('value') or 1000), 10000))
             self.cfg['rate_ms'] = ms
@@ -1916,6 +2074,8 @@ def ctl(argv, api):
         else:
             body = {'poll_us': int(rest[0]), 'txbatch': int(rest[1]) if len(rest) > 1 else 16}
         return out(call('/api/usb-fast', body))
+    if c == 'gpuperf':
+        return out(call('/api/gpuperf', {'sel': ' '.join(rest)} if rest else {}))
     if c == 'rate':
         return out(call('/api/rate', {'ms': int(rest[0]) if rest else 1000}))
     if c == 'cmd':

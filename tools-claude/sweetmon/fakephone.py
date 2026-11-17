@@ -525,6 +525,14 @@ class Phone:
                      'self': {'cpu_ms': random.randint(2, 9) * dt_ms // 1000, 'rss_kb': 2400,
                               'klog_bps': 900, 'tx_bps': 3000},
                      'klog_bps': None if n % 7 == 3 else 1500 + self.load * 20}     # the real daemon sometimes sends null
+                # xnu 1158 counters as sweetmon sends them with `mon gpuperf overview` (cumulative, aon 19.2 MHz)
+                gsel = 'RBBM:0,RBBM:6,CP:2,SP:0,SP:1,SP:2,TP:6,TP:7,UCHE:27,UCHE:28,UCHE:39,LRZ:17,LRZ:18'
+                gslot = '0 1 1 1 2 3 0 1 0 1 2 0 1'.split()
+                grate = (500e6, 200e6, 180e6, 150e6, 90e6, 10e6, 40e6, 4e6, 3e6, 3e6, 1e6, 50e6, 30e6)
+                self.gacc = [a + r * dt_ms / 1000 for a, r in zip(getattr(self, 'gacc', [0] * 13), grate)]
+                self.gaon = getattr(self, 'gaon', 1000) + int(19.2e6 * dt_ms / 1000)
+                s['gpuperf'] = {'sel': gsel, 'raw': 'aon=%d ' % self.gaon + ' '.join(
+                    '%s@%s=%d' % (e, sl, v) for e, sl, v in zip(gsel.split(','), gslot, self.gacc))}
                 if self.top_every and n % self.top_every == 0 and self.topn:
                     rows = []
                     for pid, name in procs:
