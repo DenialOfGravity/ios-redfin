@@ -15,17 +15,19 @@ Works: native SIM PIN, calls (2-way audio), SMS, Wi-Fi (manual join), BT media. 
 Arm new call audio: sctl bbv_service 1; sctl voice_proxy 2; restart mediaserverd. Not promoted (no regression, no 1094).
 Handover doc: claude/redfin-handover-2026-11-14.md
 2026-11-14 hm-int2 504c000 install: backups /System/Library/Extensions/SweetMetal2.bundle -> /var/local/hmetal/SweetMetal2-shim.bundle.knowngood-6740748; /var/local/hmetal/lib/HakiosMetal.bundle -> /var/local/hmetal/lib/HakiosMetal.bundle.knowngood-var12; /var/local/hmetal/ca/env -> /var/local/hmetal/ca/env.knowngood-var12; /var/local/hmetal/m2-fallback -> /var/local/hmetal/m2-fallback.pre-int2"""
+updated = "2026-11-16 baseline (written 2026-11-17)"
+note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 and 1b: kernel ws-int-k20 e4856b8fe4 (image rk20a, cmdline bb19u15-ubwc2-xr13), not the live diagnostic k23. Updated entries taken from a phone adopt on 2026-11-17 06:30Z (state/snapshots/2026-11-17T0630Z-adopt.dump): venusctl/venusd, sweetlocd(.i), qseeprobe, oslogshow, gnss scripts, vtvenus.dylib, testclip, xtra3.bin, hmetal env/env.default/m2-procs, both Metal bundles (hm-int14), sweetctl boot.conf/knobs.json, sysctl_expect from the running kernel. Not managed here (outside roots): launchd disabled.plist (9 keys), data_ark.plist (ticket-free), modem RFC files (firmware)."
 
 # What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
 [boot]
-image = "rbb2b"
+image = "rk20a"
 base = "r5p3a"
-kernel_dir = "builds/xnu/ws-n-bba2-7100798df6"
-kernel_branch = "ws-n-bba2"
-kernel_sha = "7100798df600e7862abe7c4f4b90fe0dfda64685"
-kernel_uuid = "39034499-485D-3BAF-A4D6-C1C245D81EE3"
-cmdline_file = "agent/stage/cmdline.bb19u15"
-bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 ufslogsecs=2 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=3 sweetabp=15 sweetbb=19 sweetufs=15"
+kernel_dir = "builds/xnu/ws-int-k20-e4856b8fe4"
+kernel_branch = "ws-int-k20"
+kernel_sha = "e4856b8fe4"
+kernel_uuid = "60BE0B89-A4A5-3B59-89DA-54C5600E08A9"
+cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13"
+bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2"
 
 # Paths state.py may write (roots) and how the dump is read. Outside roots or under firmware: apply refuses.
 [managed]
@@ -119,46 +121,108 @@ scratch = "/var/local/scratch"
 "kern.sweet_abp_publish" = 1
 "kern.sweet_bb" = 19
 "kern.sweet_bbv_service" = 0
+"kern.sweet_bl_fix" = 11
+"kern.sweet_bl_trace" = 3
+"kern.sweet_chg" = 1
+"kern.sweet_chg_dump" = 0
+"kern.sweet_chg_sdp_ma" = 900
+"kern.sweet_cm" = 0
+"kern.sweet_cm_trace" = 0
+"kern.sweet_crumb" = 0
 "kern.sweet_data_fwd" = 0
+"kern.sweet_data_opts" = 4
 "kern.sweet_fb_early_retire" = 0
 "kern.sweet_fb_hz" = 90
 "kern.sweet_gov_framehold" = 0
+"kern.sweet_gpu_cap_mb" = 256
 "kern.sweet_gpu_dcvs" = 0
 "kern.sweet_gpu_dcvs_boost_ms" = 1000
 "kern.sweet_gpu_dcvs_floor" = 400
 "kern.sweet_gpu_ibmax" = 16
+"kern.sweet_gpu_pool_drainall" = 1
+"kern.sweet_gpu_pool_dump" = 0
+"kern.sweet_gpu_pool_fit" = 1
+"kern.sweet_gpu_reserve_mb" = 160
 "kern.sweet_gpu_tlb" = 0
-"kern.sweet_haptic" = 196
+"kern.sweet_haptic" = 12
 "kern.sweet_ipa_arm" = 0
 "kern.sweet_ipa_drv" = 1
 "kern.sweet_ipa_ee1" = 0
 "kern.sweet_ipa_join_s" = 40
 "kern.sweet_mlink_idle_us" = 4000
+"kern.sweet_mqrtr_aux" = 0
+"kern.sweet_mtl" = 2
+"kern.sweet_nfc_fwif" = 21
+"kern.sweet_nfc_fwif_fmt" = 0
+"kern.sweet_nfc_gw" = 0
+"kern.sweet_nfc_id" = 1
+"kern.sweet_nfc_id_info" = 1107427690
+"kern.sweet_nfc_mwlog" = 0
+"kern.sweet_nfc_ntf_delay_ms" = 100
+"kern.sweet_nfc_p1" = 0
+"kern.sweet_pace" = 0
+"kern.sweet_pace_dump" = 0
+"kern.sweet_pace_min" = 2000
+"kern.sweet_pace_trace" = 0
 "kern.sweet_pdp_keep" = 3
 "kern.sweet_pdp_keepidle" = 120
 "kern.sweet_pdp_mtu" = 1492
 "kern.sweet_pdp_poll_us" = 1000
 "kern.sweet_pdp_test" = -1
+"kern.sweet_qmi_codec_ind" = 0
+"kern.sweet_qmi_codec_tlv" = 17
+"kern.sweet_qmi_filter" = 1
+"kern.sweet_qmi_plmnblip" = 0
+"kern.sweet_qmi_plmnblip_ms" = 1500
+"kern.sweet_qmi_policy_file" = 1
 "kern.sweet_qmi_rules" = 0
+"kern.sweet_qmi_split_ms" = 300
+"kern.sweet_qmi_vocoder" = 0
+"kern.sweet_qmi_vocoder_type" = 16
+"kern.sweet_qmi_withhold_s" = 600
+"kern.sweet_qmux_cidfail" = 0
 "kern.sweet_qmux_dump" = 0
+"kern.sweet_qmux_err" = 94
+"kern.sweet_qmux_holddly" = 500
+"kern.sweet_qmux_holdnas" = 1
+"kern.sweet_qmux_kick" = 1
+"kern.sweet_qmux_pds" = 0
+"kern.sweet_qmux_pds_ms" = 400
+"kern.sweet_qmux_reuse" = 1
+"kern.sweet_rpmh_recover" = 0
+"kern.sweet_scangate_flag" = 1
+"kern.sweet_scangate_mode" = 1
+"kern.sweet_scangate_queue" = 1
+"kern.sweet_scangate_tribuf" = 2
 "kern.sweet_spmi_lock" = 1
 "kern.sweet_ssr_notify" = 0
-"kern.sweet_surfkeep" = 1
+"kern.sweet_surfalign_limits" = 1
+"kern.sweet_surfkeep" = 2
+"kern.sweet_surfpad" = 1
+"kern.sweet_surfpad_grew" = 0
+"kern.sweet_swapdone" = 1
 "kern.sweet_torch" = 0
 "kern.sweet_torch_alarm" = 1
 "kern.sweet_torch_reinit" = 0
+"kern.sweet_touch_trace" = 1
+"kern.sweet_ubwc_disp" = 1
+"kern.sweet_ubwc_errclr" = 0
+"kern.sweet_ubwc_mdss" = 0
+"kern.sweet_ubwc_mdss2" = 0
+"kern.sweet_ubwc_sspp" = 0
 "kern.sweet_ufs_diag" = 3
 "kern.sweet_ufs_diag_phy" = 1
 "kern.sweet_ufs_guard" = 1
 "kern.sweet_ufs_recover" = 0
 "kern.sweet_ufs_recover_test" = 0
-"kern.sweet_ui_bigcore" = 3
+"kern.sweet_ui_bigcore" = 1
 "kern.sweet_usb_poll_us" = 100
 "kern.sweet_usb_recover" = 1
 "kern.sweet_venus" = 0
 "kern.sweet_voice" = 0
 "kern.sweet_voice_below_ear" = 240
 "kern.sweet_voice_below_spk" = 160
+"kern.sweet_voice_dtmflog" = 1
 "kern.sweet_voice_proxy" = 0
 "kern.sweet_voice_proxy_gain_dl" = 0
 "kern.sweet_voice_proxy_gain_ul" = 0
@@ -549,23 +613,23 @@ sha = "f0602dcaad"
 
 [[file]]
 path = "/var/local/bin/venusctl"
-source = "builds/userland/d4c2a0e88e47b5e8e00f171253f0fa8aef3deab1-d4c2a0e88e/venusctl"
-sha256 = "3aa8b31764687bc9946c57a4cdba6046889a4d159f4d7aacfc12124505e15c6d"
+source = "builds/userland/ws-video-dec-2c5f672d34/venusctl"
+sha256 = "0ea612bb1fb52b1f6de9573de669124989d1b950bb63552c949515cef79b6e31"
 mode = "755"
 owner = "0:0"
 target = "userland"
-ref = "d4c2a0e88e47b5e8e00f171253f0fa8aef3deab1"
-sha = "d4c2a0e88e"
+ref = ""
+sha = ""
 
 [[file]]
 path = "/var/local/bin/venusd"
-source = "builds/userland/fe5bee5df669cea69aafc117e622439e659cd894-fe5bee5df6/venusd"
-sha256 = "e85d199df5e157fc5885cc011a683017014b40d9eea9ec12ae4a16f32ecc4a4b"
+source = "builds/userland/ws-int-k12v-699fb28b94/venusd"
+sha256 = "d042feb6bb423551ba1fd6df60bba2dc48badaeff455d04abd4c0725d6795193"
 mode = "755"
 owner = "0:0"
 target = "userland"
-ref = "fe5bee5df669cea69aafc117e622439e659cd894"
-sha = "fe5bee5df6"
+ref = "ws-int-k12v"
+sha = "699fb28b94"
 
 [[file]]
 path = "/var/local/bin/vtdecode"
@@ -664,6 +728,105 @@ mode = "755"
 owner = "0:0"
 note = "boot sysctls + scratch wipe; run by the launchd job org.iosonpixel.sweetearly once launchd.plist is updated"
 
+[[file]]
+path = "/var/local/bin/sweetlocd"
+source = "builds/userland/ws-gnss-k-f4c893e815/sweetlocd"
+sha256 = "c7cc3b349bd6d4b77e07b95ea08aa65ad094758aff6aaa89954aab06389e9347"
+mode = "755"
+owner = "0:0"
+target = "userland (sweetlocd only)"
+ref = "ws-gnss-k"
+sha = "f4c893e815"
+
+[[file]]
+path = "/var/local/bin/sweetlocd.i"
+source = "builds/userland/ws-gnss-i-0efcd47c3c/sweetlocd"
+sha256 = "39cb11b4d78821f9d420f1445fd1f7a8da8ed7765cdeebeff4d9670e1bfc67fa"
+mode = "755"
+owner = "0:0"
+target = "userland (sweetlocd only)"
+ref = "ws-gnss-i"
+sha = "0efcd47c3c"
+
+[[file]]
+path = "/var/local/bin/qseeprobe"
+source = "builds/userland/ws-qsee-a-d84238f71e/qseeprobe"
+sha256 = "a1fb8a8ab46892c81cc5bf7a8cb5445bc8cd17296924bfa8e69344d73be6ecf2"
+mode = "755"
+owner = "0:0"
+target = "userland (phone/qsee only: qseeprobe)"
+ref = "ws-qsee-a"
+sha = "d84238f71e"
+
+[[file]]
+path = "/var/local/bin/oslogshow"
+source = "builds/userland/ws-video-p0c-0c405948d5/oslogshow"
+sha256 = "9c7de464d99b45947d1368fcbe22fd9d16399c5f2653339742e6a603606fc7d3"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-video-p0c"
+sha = "0c405948d5"
+
+[[file]]
+path = "/var/local/bin/gnss-run.sh"
+source = "unknown"
+sha256 = "c9eb71a5863d7cc0767c513deb734c44251e9ae634259d78d2ce9899b55303ea"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/bin/gnss-after.sh"
+source = "unknown"
+sha256 = "b45b1281d70c14514aaaa70638e169bcef52346828c1e3f53481315749a49615"
+mode = "755"
+owner = "0:0"
+
+[[file]]
+path = "/var/local/lib/vtvenus.dylib"
+source = "builds/userland/ws-video-p0d-c33c8f6912/vtvenus.dylib"
+sha256 = "11498af4a5ff01c354657c8e3d8dfc78c5a35c3fdf41987e6b6f54cf01a3911e"
+mode = "644"
+owner = "0:0"
+target = "userland (phone/video only: venusctl venusd venusc vtvenus vtstub vtdecode avplay)"
+ref = "ws-video-p0d"
+sha = "c33c8f6912"
+
+[[file]]
+path = "/var/local/testclip.h264"
+source = "builds/userland/ws-video-dec-2c5f672d34/testclip.h264"
+sha256 = "c5a131333fcad2825e2f1bd93fdcee06996c139e59123a391e958d5717266029"
+mode = "644"
+owner = "0:0"
+target = "userland"
+ref = ""
+sha = ""
+
+[[file]]
+path = "/var/local/xtra/xtra3.bin"
+source = "phone-only"
+sha256 = "0ae2d7cbaac7318bc9ada86771ca119c5255abdcce60a69f8144b928f8a3e618"
+mode = "644"
+owner = "0:0"
+note = "Google XTRA assistance data (not in git); ~7-day validity from 2026-11-16"
+
+[[file]]
+path = "/var/local/hmetal/env.default"
+source = "builds/hmetal/ws-hm-int14-3a027e8/hm-env.default"
+sha256 = "1e1e217b9ba6e761a41110548a6c0f68e588c0f62773ea7f6782ae7608d5e0c2"
+mode = "755"
+owner = "0:0"
+target = "hmetal"
+ref = ""
+sha = ""
+
+[[file]]
+path = "/var/local/sweetctl/knobs.json"
+source = "agent/stage/sweetctl/knobs.json"
+sha256 = "d76ac65bdd442803d41e5e83d8a30d537880ceb19f8e7be50c8e2d258383919c"
+mode = "644"
+owner = "0:0"
+
 
 # Bundle directories: every file with its sha256; apply installs the whole bundle from source.
 [[bundle]]
@@ -706,15 +869,16 @@ files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5
 
 [[bundle]]
 path = "/System/Library/Extensions/SweetMetal2.bundle"
-source = "builds/hmetal-mesa/ws-hm-int2-504c000bde/bench/SweetMetal2-shim.bundle"
+source = "builds/hmetal/ws-hm-int5-deepfb-4f1104b7df/SweetMetal2-shim.bundle"
+target = "hmetal"
+ref = ""
+sha = ""
+note = "1 of 3 files match builds/hmetal/ws-hm-int5-deepfb-4f1104b7df/SweetMetal2-shim.bundle"
 restart = "backboardd"
 CFBundleIdentifier = "org.iosonpixel.SweetMetal2"
-CFBundleShortVersionString = "0.2-hm-int2"
+CFBundleShortVersionString = "0.3-hm-int3"
 CFBundleVersion = "1"
-files = { "Info.plist" = "b14f9a74e5e69dafe644f3827dff0aa9d9cf752d4e64b48a4ab163b31d31c730", SweetMetal2 = "26d18922ff98ebca0773a1cc2b49b194b938d2c433adc50d36861bdd224fd11c", "_CodeSignature/CodeResources" = "0fa96e08637d3263c7e0ed5033c70b2517b8a748b587abc01fa26f207877402a" }
-target = "hmetal-mesa"
-ref = "ws-hm-int2"
-sha = "504c000bde"
+files = { "Info.plist" = "03dce88dc98d5e133f52951cb2dbd7b155ce477a882e843ea37495ac650c1d38", SweetMetal2 = "9b6ad510d4603bd409bf94ebd70b2b4cc8153f08055dcafda20be53fdc05b2c2", "_CodeSignature/CodeResources" = "efa8cd96459403d0668f19c92786050e7e93fd568e09e27d2af4d70984696205" }
 
 [[bundle]]
 path = "/var/local/disabled/SyncBundles/AirFair.syncBundle"
@@ -724,15 +888,15 @@ note = "AirFair moved aside (FairPlay off; KNOWN-GOOD rk3a notes)"
 
 [[bundle]]
 path = "/var/local/hmetal/lib/HakiosMetal.bundle"
-source = "builds/hmetal-mesa/ws-hm-int2-504c000bde/bench/HakiosMetal.bundle"
+source = "builds/hmetal/ws-hm-int14-3a027e8/HakiosMetal.bundle"
+target = "hmetal"
+ref = ""
+sha = ""
+note = "1 of 3 files match builds/hmetal/ws-hm-int14-3a027e8/HakiosMetal.bundle"
 restart = "backboardd"
 CFBundleIdentifier = "org.redfin.hakios-metal-bench"
 CFBundleVersion = "1"
-files = { HakiosMetal = "3bed764207d66a15feb41d9bfb5c372387caee65b20263c59e060bf632a849a1", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "b1e4c2303d89a38ce23f9f0d81233ebd402e7b89fac767e886b6c07a9757fe3e" }
-note = "every installed file matches the source build (the build folder also has a dSYM that is not installed)"
-target = "hmetal-mesa"
-ref = "ws-hm-int2"
-sha = "504c000bde"
+files = { HakiosMetal = "ebc2c0ce59361cf289bc66f4be0409fd358fd2f6ebaea70e238d34c56bb13ba5", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "626aa5346814be39005a9a78091735c45b4985a7605a9ae7a55bc3448d29bee1" }
 
 [[bundle]]
 path = "/var/local/hmetal/lib/SweetMetal2.bundle"
@@ -1006,11 +1170,12 @@ restart = "backboardd"
 [[flag]]
 path = "/var/local/hmetal/env"
 content = """
-# /var/local/hmetal/env (hm-int2): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
+# /var/local/hmetal/env (hm-int3): read by the dispatcher (bench/m2shim.m) in every process it puts on hakios-metal.
 # KEY=V        backboardd's
 # *:KEY=V      every hakios-metal process (backboardd too)
 # NAME:KEY=V   the process NAME (getprogname)
 # Keys HAKIOS_METAL_* and HM_* only. Applied in file order, the last one wins.
+# Only the switches that differ from the build's compiled default are set here; the commented lines are opt-ins.
 
 # backboardd: as on the phone since var12, HM_TRACE now off (1: on; the log rotates at 16 MB -> bbd-hm.log.1)
 HAKIOS_METAL_CA_PICK=exact
@@ -1025,8 +1190,58 @@ HM_HANG_BLAME=1
 *:HM_CA_DEEP_FB=0
 *:HM_CA_FB_COMPRESSION=0
 *:HM_CA_IOSURFACE_COMPRESSION=0
+
+# (hm-int3) the stage cache's check, for the first days on cache format 2: one stage or kernel in 20 read from the
+# cache, the memo or a seed compiled again in the background and compared (\"hm-cache: verify ok N of M\" / \"STALE\").
+# Back to 0 (the compiled default, off) once no STALE line has shown for a few days.
+*:HM_CACHE_VERIFY=20
+
+# (hm-int3) the pre-warm (compiled default 1 in every process that loads QuartzCore's library) in backboardd alone: since
+# hm-int2 every process is on hakios-metal, and N apps re-compiling the same manifests at once after a format change is
+# N times the work for one cache. The other processes find the stages backboardd made.
+*:HM_PREWARM=0
+HM_PREWARM=1
+
+# ---- opt-ins and switches at their compiled default (uncomment to change) ----
+# two-plane YCbCr ('420f'/'420v') surfaces: native = decoded on the GPU by ycbcr_decode (default); cpu = the processor copy
+#*:HM_YCBCR=cpu
+# an unseen configuration of a denied uber shader specialised on the queue, its draws left out meanwhile (default 0: waited for)
+#HM_SPEC_ASYNC=1
+# fold CA's constant scratch config struct (default 0). Part of the cache key: turning it on compiles every stage again
+#HM_SCRATCH_FOLD=1
+# the \"compile: pipeline ...\" wall/CPU lines (default: on with HM_PROF>=1)
+#HM_COMPILE_LOG=1
+# the pre-warm's start, seconds after QuartzCore's library is loaded (default 60)
+#HM_PREWARM_DELAY=60
+# ca-prof (default off; was on with HM_TRACE)
+#HM_CA_PROF_US=25000
+# the HANG trace: queued + running split, buffers that only queued skipped (default 1; 0: every slow buffer as before)
+#HM_HANG_EXEC=0
+# the cache key: format (default: HAKIOS_METAL_CACHE_FORMAT + the Mesa id) | build (the old key: empty after any core change)
+#HM_CACHE_KEY=build
+*:HM_POOL_LOG=30
+
+# j1115 (2026-11-15): ws-hm-ubwc2 compressed render targets, folder-backdrop clean, -0.3 ms/fr pages, -0.6 cc
+HM_UBWC_RT=1
+
+
+# k5-1115 App Library: CA b3a8 surfaces (MTLGPUFamilyApple3 answer)
+*:HM_CA_B3A8=1
+
+# k10-1116 profiling
+
+# k10-1116 7a
+HM_CULL=2
+HM_DEADFILL=2
+# k10-1116 7c base (clean CPU switches)
+HM_PLUG_FAST=1
+HM_DRAW_SKIP=all
+# k10-1116 7c
+backboardd:HM_RT_CACHE=48
+backboardd:HM_POOL_KEEP_MB=16
+HM_NOUC=1
 """
-mode = "644"
+mode = "755"
 
 [[flag]]
 path = "/var/local/hmetal/hm-only"
@@ -1039,9 +1254,12 @@ restart = "backboardd"
 [[flag]]
 path = "/var/local/hmetal/m2-procs"
 content = """
+# g1114 (19:40): Safari (MobileSafari, WebContent, WebKit.GPU) on SweetMetal2 as before hm-int3; original in m2-procs.pre-g1114
+MobileSafari
+com.apple.WebKit.WebContent
 com.apple.WebKit.GPU
 """
-mode = "666"
+mode = "644"
 restart = "backboardd"
 
 [[flag]]
@@ -1170,6 +1388,17 @@ ht=1
 """
 mode = "644"
 restart = "wland"
+
+[[flag]]
+path = "/var/local/sweetctl/boot.conf"
+content = """
+kern.sweet_chg=1
+kern.sweet_chg_sdp_ma=900
+kern.sweet_swapdone=1
+kern.sweet_pace=0
+kern.sweet_pace_min=2000
+"""
+mode = "644"
 
 
 # Must NOT exist. diff lists them while present; `apply --retire` moves them to /var/local/scratch/retired-DATE/.
