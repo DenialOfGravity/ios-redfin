@@ -145,6 +145,12 @@ hakios_metal_texture *hakios_metal_texture_new_ycbcr(hakios_metal_device *device
     uint64_t luma_offset, unsigned luma_row_bytes, uint64_t chroma_offset, unsigned chroma_row_bytes, unsigned matrix, int full, int planes);
 /* (redfin hmyc) the surface under such a texture changed (GEN: its IOSurface seed): the next draw converts it again */
 void hakios_metal_texture_ycbcr_touch(hakios_metal_texture *texture, uint64_t gen);
+/* (redfin xrreuse) HM_XR_REUSE: the IOSurface seed of an extended-range texture at a bind (ignored with HM_XR_REUSE=0 or
+ * any other texture); the mode; [0] decodes, [1] draws that took the kept copy, [2] decodes with no seed known, [3] seed
+ * unmoved but the rows sum changed (mode 2), [4] kept copies forgotten, [5] decodes after the seed or a local write moved */
+void hakios_metal_texture_xr_touch(hakios_metal_texture *texture, uint64_t seed);
+int hakios_metal_xr_reuse_mode(void);
+void hakios_metal_xr_reuse_stats(unsigned long long out[6]);
 /* (redfin hmyc) the same conversion on the processor (the HM_YCBCR=cpu copy): RGBA8 rows into OUT, bit for bit the GPU's */
 void hakios_metal_ycbcr_convert(const void *luma, uint64_t luma_row_bytes, const void *chroma, uint64_t chroma_row_bytes, unsigned width,
     unsigned height, unsigned matrix, int full, int planes, void *out, uint64_t out_row_bytes);

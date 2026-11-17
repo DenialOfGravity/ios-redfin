@@ -4908,12 +4908,63 @@ def hm_perf(src):
     return src
 
 
+# (redfin xrreuse) HM_XR_REUSE (the core's; default 0): an extended-range surface's decoded copy drawn again while its IOSurface
+# seed has not moved. The plug-in tells the core the seed of every texture over an IOSurface at each bind
+# (hakiosRefreshShadow; the core keeps it for the extended-range ones alone, and only with HM_XR_REUSE on), and its counters
+# go on HM_TRACE's 'trace: surfaces:' line and, with HM_PROF's pace line, a 'prof: xr reuse' line every 5 s.
+HM_XRREUSE_EDITS = [
+    ('\tuint32_t _ycbcrSeed;                /* (redfin hmyc) ... the surface seed it was last told */\n',
+     '\tuint32_t _ycbcrSeed;                /* (redfin hmyc) ... the surface seed it was last told */\n'
+     '\tuint32_t _xrSeed;                   /* (redfin xrreuse) HM_XR_REUSE: the seed the core was last told */\n'
+     '\tBOOL _xrSeedKnown;\n'),
+    ('\t\treturn;\n\t}\n\tuint32_t seed;\n\n\tif (!_shadow || _iosurface == NULL) {\n',
+     '\t\treturn;\n\t}\n'
+     '\tif (!_shadow && _iosurface != NULL && _texture != NULL && hakios_metal_xr_reuse_mode() != 0) {   /* (redfin xrreuse) */\n'
+     '\t\tconst uint32_t xs = IOSurfaceGetSeed(_iosurface);\n\n'
+     '\t\tif (!_xrSeedKnown || xs != _xrSeed) {\n'
+     '\t\t\t_xrSeed = xs;\n'
+     '\t\t\t_xrSeedKnown = YES;\n'
+     '\t\t\thakios_metal_texture_xr_touch(_texture, xs);\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\tuint32_t seed;\n\n\tif (!_shadow || _iosurface == NULL) {\n'),
+    ('line2[1600] = "";   /* (redfin hmv12) 800 -> 1200; (redfin hmyc) -> 1600 */\n',
+     'line2[2000] = "";   /* (redfin hmv12) 800 -> 1200; (redfin hmyc) -> 1600; (redfin xrreuse) -> 2000 */\n'),
+    ('\t\t\t\t{   /* (redfin hmyc) HM_YCBCR=native */\n',
+     '\t\t\t\t{   /* (redfin xrreuse) HM_XR_REUSE */\n'
+     '\t\t\t\t\tstatic unsigned long long rwas[6];\n'
+     '\t\t\t\t\tunsigned long long r[6];\n'
+     '\t\t\t\t\tconst int atr = (int)strlen(line2);\n\n'
+     '\t\t\t\t\thakios_metal_xr_reuse_stats(r);\n'
+     '\t\t\t\t\tsnprintf(line2 + atr, sizeof(line2) - (size_t)atr, "; XR copies decoded %llu, reused %llu (no seed %llu, seed moved %llu, "\n'
+     '\t\t\t\t\t\t "rows changed %llu, forgotten %llu) (HM_XR_REUSE=%d)", r[0] - rwas[0], r[1] - rwas[1], r[2] - rwas[2], r[5] - rwas[5],\n'
+     '\t\t\t\t\t\t r[3] - rwas[3], r[4] - rwas[4], hakios_metal_xr_reuse_mode());\n'
+     '\t\t\t\t\tmemcpy(rwas, r, sizeof(rwas));\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\t{   /* (redfin hmyc) HM_YCBCR=native */\n'),
+    ('\t\t\t hm_pf.maxInflight, hm_pf.noKernel);\n',
+     '\t\t\t hm_pf.maxInflight, hm_pf.noKernel);\n'
+     '\t\t{   /* (redfin xrreuse) HM_XR_REUSE: extended-range copies decoded / reused this period */\n'
+     '\t\t\tstatic unsigned long long rwas[6];\n'
+     '\t\t\tunsigned long long r[6];\n\n'
+     '\t\t\thakios_metal_xr_reuse_stats(r);\n'
+     '\t\t\tif (hakios_metal_xr_reuse_mode() != 0 || r[0] != rwas[0]) {\n'
+     '\t\t\t\thm_print("prof: xr reuse %.1f s: decoded %llu (%.1f a frame), reused %llu | no seed %llu, seed moved %llu, rows changed %llu, "\n'
+     '\t\t\t\t\t "forgotten %llu (HM_XR_REUSE=%d)\\n", secs, r[0] - rwas[0], (double)(r[0] - rwas[0]) / fr, r[1] - rwas[1],\n'
+     '\t\t\t\t\t r[2] - rwas[2], r[5] - rwas[5], r[3] - rwas[3], r[4] - rwas[4], hakios_metal_xr_reuse_mode());\n'
+     '\t\t\t}\n'
+     '\t\t\tmemcpy(rwas, r, sizeof(rwas));\n'
+     '\t\t}\n'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
     src = apply(src, HM_PLUGCPU_EDITS)   # (ws-hm-plugcpu) on the finished text
     src = apply(src, HM_NOUC_EDITS)   # (ws-hm-int12) HM_NOUC
     src = hm_perf(src)   # (ws-hm-perf) HM_PERF
+    src = apply(src, HM_XRREUSE_EDITS)   # (redfin xrreuse) HM_XR_REUSE
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))

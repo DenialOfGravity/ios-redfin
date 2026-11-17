@@ -404,11 +404,32 @@ public:
     // (redfin hmv10) HM_XR_LATE: xrDecode's copy (the slot's, or a new one) without its texels -- decoded later, at commit,
     // by xrDecodeLate; nullptr with *why
     std::shared_ptr<Texture> xrCopyFor(Gpu& gpu, std::string* why) const;
+    // (redfin xrreuse) HM_XR_REUSE=1 (default 0): a surface's decoded copy is kept and drawn again, with no decode buffer,
+    // while the IOSurface seed the plug-in saw at its last bind (xrTouch) and this process's own writes into extended-range
+    // rows (xrLocalWrite: write-backs, xr_encode, replace) are those of the last decode sent, as ycbcrTouch / ycbcrCopyFor
+    // for the YCbCr surfaces. HM_XR_REUSE=2 also wants a sum of every 16th row (xrRowsSum) unchanged, 3 of every row: a GPU
+    // of another process writes the rows without moving the seed. No seed yet, a seed or a write since, a decode refused or failed,
+    // HM_XR_CHECK's "changed after decode": decoded again, as before.
+    using XrReuseKey = ::hakios::metal::XrReuseKey;   // (command.hpp)
+    static int xrReuseMode();   // HM_XR_REUSE: 0 off (default), 1 seed, 2 seed and every 16th row's sum, 3 every row's
+    void xrTouch(uint64_t seed) const;   // the surface's seed at a bind (the plug-in's IOSurfaceGetSeed)
+    static void xrLocalWrite();          // this process wrote some extended-range rows (every kept copy decoded again)
+    // xrDecode(now false)'s copy, with HM_XR_REUSE: the last one decoded if its key still holds (DECODE false), else one
+    // no buffer in flight holds (DECODE true), KEY what it will hold once decoded (xrDone)
+    std::shared_ptr<Texture> xrDecodeReuse(Gpu& gpu, bool* decode, XrReuseKey* key, std::string* why) const;
+    // a decode of KEY into COPY was sent (GPU: the ring runs it before any later buffer) or done on the processor
+    void xrDone(const std::shared_ptr<Texture>& copy, const XrReuseKey& key) const;
+    void xrForget() const;   // the copy kept is not to be drawn again (a failed decode buffer, HM_XR_CHECK)
+    // [0] decodes (copies to decode at commit), [1] draws that took the kept copy, [2] decodes with no seed known, [3] decodes
+    // with the seed unmoved but the rows sum changed (HM_XR_REUSE=2), [4] kept copies forgotten, [5] decodes with HM_XR_REUSE
+    // on and the seed or a local write moved
+    static void xrReuseStats(uint64_t out[6]);
+    static void xrReuseCount(int i);
     // the rows decoded now into COPY (xrCopyFor's); false when either is mapped nowhere. SUM: xrRowsSum's as decoded
     bool xrDecodeLate(Texture& copy, uint64_t* sum = nullptr) const;
     // (redfin hmv10) HM_XR_CHECK: a sum of every 16th row of the surface's codes (this processor's lines of them dropped
     // first): one taken at the decode and one at completion differ when another process's GPU wrote the rows after
-    uint64_t xrRowsSum() const;
+    uint64_t xrRowsSum(uint32_t step = 16) const;   // (redfin xrreuse) STEP: every STEP-th row (HM_XR_REUSE=3: every row)
     // (redfin hmv11) HM_XR_GPU: the tables the xr_decode kernel reads, 3072 words each a half in its low 16 bits -- [0, 1024)
     // the codes' linear values, [1024, 2048) the _sRGB twins', [2048, 3072) alpha -- the processor decode's own
     static const std::vector<uint32_t>& xrGpuTable();
@@ -537,6 +558,9 @@ private:
     mutable std::atomic<bool> stale_{false};
     mutable std::shared_ptr<Texture> xrCopy_[2];
     mutable std::atomic<uint32_t> xrNext_{0};
+    mutable std::mutex xrReuseLock_;      // (redfin xrreuse) HM_XR_REUSE: the slot decoded last and of what
+    mutable int xrDoneSlot_ = -1;
+    mutable XrReuseKey xrDone_;
     mutable std::shared_ptr<XrTarget> xrTarget_;   // (redfin hmv4) xrTarget's, under xrLock()
     void xrDecodeInto(uint8_t* out, uint64_t outPitch) const;
     // (redfin hm-int5) W x H of the rows from the texture's start (a companion's whole surface, not the texture's size)

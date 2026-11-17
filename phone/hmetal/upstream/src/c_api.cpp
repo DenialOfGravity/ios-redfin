@@ -495,6 +495,18 @@ void hakios_metal_ycbcr_convert(const void* luma, uint64_t lumaRow, const void* 
                               full != 0, planes != 0, static_cast<uint8_t*>(out), outRow);
 }
 
+void hakios_metal_texture_xr_touch(hakios_metal_texture* t, uint64_t seed) {   // (redfin xrreuse)
+    if (t != nullptr && t->texture != nullptr) t->texture->xrTouch(seed);
+}
+
+int hakios_metal_xr_reuse_mode(void) { return Texture::xrReuseMode(); }
+
+void hakios_metal_xr_reuse_stats(unsigned long long out[6]) {
+    uint64_t v[6];
+    Texture::xrReuseStats(v);
+    for (int i = 0; i < 6; i++) out[i] = v[i];
+}
+
 void hakios_metal_xr_gpu_stats(unsigned long long out[6]) {
     uint64_t v[6];
     CommandBuffer::xrGpuStats(v);

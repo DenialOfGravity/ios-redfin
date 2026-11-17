@@ -36,6 +36,11 @@ namespace hakios::metal {
 
 class CommandQueue;
 class Texture;
+// (redfin xrreuse) HM_XR_REUSE: what an extended-range surface's decoded copy holds (Texture::xrDecodeReuse)
+struct XrReuseKey {
+    uint64_t seed = 0, epoch = 0, sum = 0;   // the plug-in's IOSurface seed, this process's XR writes, HM_XR_REUSE=2's rows sum
+    bool keyed = false;                      // the plug-in told a seed for the surface (else never reused)
+};
 
 // a buffer a program sees: a GEM object with its length (MTLBuffer's -length may be less than the object's size)
 // (redfin hm-int4) what this process's GPU memory is held for, by kind (HM_POOL accounting: hakios_metal_pool_stats):
@@ -751,6 +756,7 @@ private:
         uint64_t sum = 0;
         bool decoded = false;
         bool gpu = false;   // (redfin hmv11) decoded by xr_decode on the GPU (HM_XR_GPU): no processor sum to check
+        XrReuseKey key;   // (redfin xrreuse) HM_XR_REUSE: what the copy holds once decoded
     };
     std::vector<XrLate> xrLate_;
     // (redfin hmyc) this buffer's two-plane YCbCr copies (render.cpp), and those to decode at commit

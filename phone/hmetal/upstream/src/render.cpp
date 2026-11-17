@@ -3375,6 +3375,7 @@ bool CommandBuffer::xrRedirect(const RenderPass& given, RenderPass* out, const R
             }
         }
         if (!found) {
+            Texture::xrLocalWrite();   // (redfin xrreuse) a pass drew into an extended-range target
             auto rec = std::make_shared<XrDrawn>();
             rec->source = Texture::byResourceId(t->resourceId());
             rec->target = x;
@@ -3935,34 +3936,47 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
                 }
                 if (decoded == nullptr && t->surface() != 0 && xrLateOn()) {
                     // (redfin hmv10) HM_XR_LATE: the copy now, its texels at the commit (xrDecodeDeferred)
-                    std::shared_ptr<Texture> c = t->xrDecode(queue_.gpu(), &why, false);
+                    // (redfin xrreuse) HM_XR_REUSE: or the copy decoded last, drawn as it is while the surface has not moved
+                    bool decode = true;
+                    Texture::XrReuseKey key;
+                    std::shared_ptr<Texture> c = Texture::xrReuseMode() != 0 ? t->xrDecodeReuse(queue_.gpu(), &decode, &key, &why)
+                                                                             : t->xrDecode(queue_.gpu(), &why, false);
                     if (c == nullptr) return refuseWork("an extended-range texture: " + why);
-                    if (xrLate_.empty() && xrCheckOn()) {
-                        addCompletedHandler([](CommandBuffer& cb) {
-                            if (cb.status() != kCompleted) return;
-                            for (XrLate& l : cb.xrLate_) {
-                                if (!l.decoded || l.source == nullptr) continue;
-                                gXrStats[6]++;
-                                if (l.source->xrRowsSum() == l.sum) continue;
-                                gXrStats[7]++;
-                                static std::atomic<uint32_t> said{0};
-                                if (said.fetch_add(1) < 40) {
-                                    render::notify("XR surface " + render::n(l.source->surface()) + " (" + render::n(l.source->width()) + "x" +
-                                                   render::n(l.source->height()) + ") changed after its decode: another process's GPU wrote it "
-                                                   "after the ring barrier; the copy drawn was stale (HM_XR_CHECK)");
+                    if (Texture::xrReuseMode() == 0) Texture::xrReuseCount(0);   // (decodes counted either way)
+                    if (!decode) {
+                        keepAlive(c);
+                        xrDecoded_.emplace_back(t, c);
+                        decoded = c.get();
+                    } else {
+                        if (xrLate_.empty() && xrCheckOn()) {
+                            addCompletedHandler([](CommandBuffer& cb) {
+                                if (cb.status() != kCompleted) return;
+                                for (XrLate& l : cb.xrLate_) {
+                                    if (!l.decoded || l.source == nullptr) continue;
+                                    gXrStats[6]++;
+                                    if (l.source->xrRowsSum() == l.sum) continue;
+                                    gXrStats[7]++;
+                                    l.source->xrForget();   // (redfin xrreuse) never drawn again
+                                    static std::atomic<uint32_t> said{0};
+                                    if (said.fetch_add(1) < 40) {
+                                        render::notify("XR surface " + render::n(l.source->surface()) + " (" + render::n(l.source->width()) + "x" +
+                                                       render::n(l.source->height()) + ") changed after its decode: another process's GPU wrote it "
+                                                       "after the ring barrier; the copy drawn was stale (HM_XR_CHECK)");
+                                    }
                                 }
-                            }
-                            cb.xrLate_.clear();
-                        });
+                                cb.xrLate_.clear();
+                            });
+                        }
+                        keepAlive(c);
+                        XrLate l;
+                        l.source = Texture::byResourceId(t->resourceId());
+                        l.copy = c;
+                        l.key = key;   // (redfin xrreuse)
+                        xrLate_.push_back(std::move(l));
+                        xrDecoded_.emplace_back(t, c);
+                        decoded = c.get();
+                        gXrStats[5]++;
                     }
-                    keepAlive(c);
-                    XrLate l;
-                    l.source = Texture::byResourceId(t->resourceId());
-                    l.copy = c;
-                    xrLate_.push_back(std::move(l));
-                    xrDecoded_.emplace_back(t, c);
-                    decoded = c.get();
-                    gXrStats[5]++;
                 }
                 if (decoded == nullptr) {
                     // (redfin hmv8) HM_XR_SYNC=1 (default): a surface's rows are read on the processor here, at encode
@@ -4908,6 +4922,7 @@ void CommandBuffer::xrEncodeStats(uint64_t out[5]) {
 
 void CommandBuffer::xrEncodeAppend() {
     if (xrDrawn_.empty() || Texture::xrWriteBackMode() != 2 || !error_.empty()) return;
+    Texture::xrLocalWrite();   // (redfin xrreuse)
     const XrEncKernel* xk = xrEncodeKernel(queue_.gpu());
     bool any = false;
     for (auto& [key, r] : xrDrawn_) {
@@ -5029,6 +5044,21 @@ std::shared_ptr<CommandBuffer> CommandBuffer::xrDecodeDeferred() {
             for (XrLate& l : xrLate_) l.gpu = false;
         } else {
             gXrGpu[1]++;
+            // (redfin xrreuse) HM_XR_REUSE: later buffers take these copies as they are (the ring runs this buffer first);
+            // forgotten again if it fails
+            std::vector<std::shared_ptr<const Texture>> kept;
+            for (XrLate& l : xrLate_) {
+                if (!l.gpu || !l.key.keyed) continue;
+                l.source->xrDone(l.copy, l.key);
+                kept.push_back(l.source);
+            }
+            if (!kept.empty()) {
+                pre->addCompletedHandler([kept](CommandBuffer& cb) {
+                    if (cb.status() != kCompleted) {
+                        for (const auto& k : kept) k->xrForget();
+                    }
+                });
+            }
             // (the parameters' page back to the pool once the GPU is done; the verify on the first few)
             std::vector<std::pair<std::shared_ptr<const Texture>, std::shared_ptr<Texture>>> verify;
             for (XrLate& l : xrLate_) {
@@ -5074,6 +5104,7 @@ std::shared_ptr<CommandBuffer> CommandBuffer::xrDecodeDeferred() {
         gXrStats[0]++;
         gXrStats[1]++;
         l.decoded = l.source->xrDecodeLate(*l.copy, xrCheckOn() ? &l.sum : nullptr);
+        if (l.decoded) l.source->xrDone(l.copy, l.key);   // (redfin xrreuse) HM_XR_REUSE
     }
     if (!xrCheckOn()) xrLate_.clear();
     return pre;
