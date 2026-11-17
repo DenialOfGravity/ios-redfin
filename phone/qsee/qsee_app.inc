@@ -322,6 +322,10 @@ static int cmd_send_build_info(uint32_t appid)
 {
 	if (check_appid(appid))
 		return 2;
+	/* QSEE_DATA_NULL=1 (smoke test): no bulk buffer; the sb carries {0x418, pa 0} and the sglistinfo table is empty,
+	 * as Linux sends a command without modfd buffers; expect a TA error status, proves the send path only */
+	const char *dn = getenv("QSEE_DATA_NULL");
+	int datanull = dn && atoi(dn);
 	int wl = 1;
 	const char *e = getenv("QSEE_SEND");
 	if (e && !strcmp(e, "legacy"))
@@ -334,7 +338,9 @@ static int cmd_send_build_info(uint32_t appid)
 	struct pbuf sb, bulk, arg;
 	if (pbuf_get(&sb, 4096, 4096, 0, 0xa0000000ull))
 		return 2;
-	if (pbuf_get(&bulk, 4096, 4096, 1, 0xa0001000ull)) {
+	if (datanull)
+		memset(&bulk, 0, sizeof(bulk));
+	else if (pbuf_get(&bulk, 4096, 4096, 1, 0xa0001000ull)) {
 		pbuf_put(&sb);
 		return 2;
 	}
@@ -355,15 +361,18 @@ static int cmd_send_build_info(uint32_t appid)
 	put_u64(a + 0, rsp), put_u64(a + 8, 0x40);	/* args[3], args[4] */
 	if (wl) {
 		put_u64(a + 16, sgl), put_u64(a + 24, 8 * MAX_ION_FD);	/* args[5], args[6] */
-		put_u32(a + 0x80, SGLIST_SET(1, 0, 4)), put_u32(a + 0x84, (uint32_t)bulk.size);	/* one contiguous buf */
+		if (!datanull)	/* one contiguous buf; with QSEE_DATA_NULL the table stays all zero */
+			put_u32(a + 0x80, SGLIST_SET(1, 0, 4)), put_u32(a + 0x84, (uint32_t)bulk.size);
 	}
-	if (wr_chunks(bulk.pa, bb, sizeof(bb)) || wr_chunks(sb.pa, s, sizeof(s)) || wr_chunks(arg.pa, a, sizeof(a))) {
+	if ((!datanull && wr_chunks(bulk.pa, bb, sizeof(bb))) || wr_chunks(sb.pa, s, sizeof(s)) ||
+	    wr_chunks(arg.pa, a, sizeof(a))) {
 		pbuf_put(&arg), pbuf_put(&bulk), pbuf_put(&sb);
 		return 2;
 	}
 	say("send: app %u g12/1 get_build_info: sb %#llx (req 0x40, rsp +0x40 len 0x40), bulk %#llx len 0x418, "
 	    "extra args %#llx%s", appid, (unsigned long long)sb.pa, (unsigned long long)bulk.pa, (unsigned long long)arg.pa,
-	    wl ? ", sglistinfo at +0x80 {0x80000004, 0x1000}" : "");
+	    !wl ? "" : datanull ? ", sglistinfo at +0x80 empty (QSEE_DATA_NULL=1: data pa 0)" :
+	    ", sglistinfo at +0x80 {0x80000004, 0x1000}");
 	uint64_t x[8] = { wl ? QSEE_SMC_SEND_DATA_WL : QSEE_SMC_SEND_DATA, wl ? QSEE_ARGS_SEND_DATA_WL : QSEE_ARGS_SEND_DATA,
 			  appid, req, 0x40, arg.pa };
 	qsmc(x);
@@ -377,6 +386,13 @@ static int cmd_send_build_info(uint32_t appid)
 	} else if (result != QSEOS_RESULT_SUCCESS) {
 		say("send: result %#x resp_type %#llx data %#llx", result, (unsigned long long)x[2], (unsigned long long)x[3]);
 		rc = n_seen ? 4 : 2;
+	} else if (!dryrun && datanull && !pm_rd(sb.pa, s, sizeof(s))) {
+		say("send: SUCCESS (TZ). QSEE_DATA_NULL: resp[0] (TA status, HAL requires 0) %#x (%d)", rd_u32(s + 0x40),
+		    (int)rd_u32(s + 0x40));
+		for (int o = 0; o < 0x80; o += 16)
+			say("send: sb+%#04x: %08x %08x %08x %08x%s", o, rd_u32(s + o), rd_u32(s + o + 4), rd_u32(s + o + 8),
+			    rd_u32(s + o + 12), o == 0x40 ? "  <- resp" : "");
+		rc = rd_u32(s + 0x40) ? 5 : 0;
 	} else if (!dryrun && !pm_rd(sb.pa, s, sizeof(s)) && !pm_rd(bulk.pa, bb, sizeof(bb))) {
 		char build[0x401];
 		memcpy(build, bb + 0x18, 0x400);
