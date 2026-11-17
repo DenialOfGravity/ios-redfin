@@ -538,6 +538,7 @@ std::shared_ptr<Texture> Texture::xrDecode(Gpu& gpu, std::string* why, bool now)
 }
 
 std::shared_ptr<Texture> Texture::xrCopyFor(Gpu& gpu, std::string* why) const {
+    if (xrReuseMode() != 0) xrForget();   // (redfin xrreuse) a slot rewritten here is no longer the kept one
     const uint32_t slot = xrNext_.fetch_add(1) & 1;
     std::shared_ptr<Texture>& copy = xrCopy_[slot];
     // (redfin hmv4) a copy a buffer still in flight holds (its keepAlive: more than this slot's reference) is not
@@ -555,6 +556,102 @@ std::shared_ptr<Texture> Texture::xrCopyFor(Gpu& gpu, std::string* why) const {
     return copy;
 }
 
+// (redfin xrreuse) HM_XR_REUSE
+namespace {
+std::mutex gXrSeedLock;
+std::unordered_map<uint32_t, uint64_t> gXrSeeds;   // IOSurface id -> its seed at the plug-in's last bind
+std::atomic<uint64_t> gXrLocalWrites{0};
+std::atomic<uint64_t> gXrReuse[6];
+}
+
+int Texture::xrReuseMode() {
+    static const int m = [] { const char* e = getenv("HM_XR_REUSE"); return e != nullptr && e[0] != 0 ? atoi(e) : 0; }();
+    return m;
+}
+
+void Texture::xrTouch(uint64_t seed) const {
+    if (xrReuseMode() == 0 || info_->xr == 0 || surface_ == 0) return;
+    std::lock_guard<std::mutex> g(gXrSeedLock);
+    gXrSeeds[surface_] = seed;
+}
+
+void Texture::xrLocalWrite() { gXrLocalWrites.fetch_add(1, std::memory_order_relaxed); }
+
+void Texture::xrReuseStats(uint64_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = gXrReuse[i].load();
+}
+
+void Texture::xrReuseCount(int i) { gXrReuse[i]++; }
+
+std::shared_ptr<Texture> Texture::xrDecodeReuse(Gpu& gpu, bool* decode, XrReuseKey* key, std::string* why) const {
+    *decode = true;
+    *key = XrReuseKey{};
+    const uint8_t xr = info_->xr;
+    if (xr == 0 || xrMode() != 1) return nullptr;
+    if (desc_.type != TextureType::k2D || desc_.mipLevels != 1) {
+        refuse(why, std::string("a ") + info_->name + " texture that is not one level of 2D: the decoded copy is made of those alone");
+        return nullptr;
+    }
+    if (buffer_->contents() == nullptr) {
+        refuse(why, std::string("a ") + info_->name + " texture over IOSurface " + n(surface_) + ": mapped nowhere for this processor to decode it");
+        return nullptr;
+    }
+    // the epoch first: a local write after it is caught by the next draw
+    key->epoch = gXrLocalWrites.load(std::memory_order_relaxed);
+    if (surface_ != 0) {
+        std::lock_guard<std::mutex> g(gXrSeedLock);
+        auto it = gXrSeeds.find(surface_);
+        if (it != gXrSeeds.end()) {
+            key->seed = it->second;
+            key->keyed = true;
+        }
+    }
+    std::lock_guard<std::mutex> g(xrReuseLock_);
+    const bool same = key->keyed && xrDoneSlot_ >= 0 && xrDone_.keyed && xrDone_.seed == key->seed && xrDone_.epoch == key->epoch &&
+                      xrCopy_[xrDoneSlot_] != nullptr;
+    if (xrReuseMode() >= 2 && key->keyed) key->sum = xrRowsSum(xrReuseMode() >= 3 ? 1 : 16);
+    if (same && (xrReuseMode() < 2 || xrDone_.sum == key->sum)) {
+        *decode = false;
+        gXrReuse[1]++;
+        return xrCopy_[xrDoneSlot_];
+    }
+    gXrReuse[0]++;
+    gXrReuse[!key->keyed ? 2 : same ? 3 : 5]++;
+    // a slot neither decoded last (a buffer may be about to draw it) nor held by a buffer in flight, else a new copy
+    const int slot = xrDoneSlot_ == 0 ? 1 : 0;
+    std::shared_ptr<Texture>& copy = xrCopy_[slot];
+    if (copy != nullptr && copy.use_count() > 1) copy = nullptr;
+    if (copy == nullptr) {
+        TextureDesc d;
+        d.format = PixelFormat::kRGBA16Float;
+        d.width = desc_.width;
+        d.height = desc_.height;
+        d.usage = kTextureUsageRead;
+        copy = make(gpu, d, why);
+        if (copy == nullptr) return nullptr;
+    }
+    return copy;
+}
+
+void Texture::xrDone(const std::shared_ptr<Texture>& copy, const XrReuseKey& key) const {
+    if (!key.keyed) return;
+    std::lock_guard<std::mutex> g(xrReuseLock_);
+    for (int i = 0; i < 2; i++) {
+        if (xrCopy_[i] == copy) {
+            xrDoneSlot_ = i;
+            xrDone_ = key;
+            return;
+        }
+    }
+}
+
+void Texture::xrForget() const {
+    std::lock_guard<std::mutex> g(xrReuseLock_);
+    if (xrDoneSlot_ >= 0) gXrReuse[4]++;
+    xrDoneSlot_ = -1;
+    xrDone_ = XrReuseKey{};
+}
+
 bool Texture::xrDecodeLate(Texture& copy, uint64_t* sum) const {
     uint8_t* out = static_cast<uint8_t*>(copy.contents());
     if (out == nullptr || buffer_->contents() == nullptr || info_->xr == 0) return false;
@@ -563,12 +660,12 @@ bool Texture::xrDecodeLate(Texture& copy, uint64_t* sum) const {
     return true;
 }
 
-uint64_t Texture::xrRowsSum() const {
+uint64_t Texture::xrRowsSum(uint32_t step) const {
     if (buffer_->contents() == nullptr || info_->xr == 0) return 0;
     const uint8_t* rows = static_cast<const uint8_t*>(buffer_->contents()) + offset_;
     const uint64_t rowBytes = uint64_t(desc_.width) * info_->bytesPerPixel & ~uint64_t(7);
     uint64_t h = 1469598103934665603ull;
-    for (uint32_t y = 0; y < desc_.height; y += 16) {
+    for (uint32_t y = 0; y < desc_.height; y += std::max(step, 1u)) {
         const uint8_t* r = rows + uint64_t(y) * pitch_;
 #if defined(__aarch64__)
         for (uintptr_t a = reinterpret_cast<uintptr_t>(r) & ~uintptr_t(63); a < reinterpret_cast<uintptr_t>(r + rowBytes); a += 64)
@@ -725,6 +822,7 @@ std::shared_ptr<Texture::XrTarget> Texture::xrLive() const {
 }
 
 void Texture::xrWriteBack(const XrTarget& t, uint32_t w, uint32_t h) const {
+    xrLocalWrite();   // (redfin xrreuse)
     const uint32_t W = w != 0 ? std::min(w, t.tex->width()) : desc_.width, H = h != 0 ? std::min(h, t.tex->height()) : desc_.height;
     uint8_t* rows = buffer_->contents() != nullptr ? static_cast<uint8_t*>(buffer_->contents()) + offset_ : nullptr;
     if (rows != nullptr && surface_ != 0) buffer_->bo().cpuAccess();   // (ws-hm-int6) HM_FLUSH_AFTER=lazy

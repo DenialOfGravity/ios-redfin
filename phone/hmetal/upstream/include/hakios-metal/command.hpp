@@ -30,11 +30,17 @@
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/gpu.hpp"
 #include "hakios-metal/pm4.hpp"
+#include "hakios-metal/perf.hpp"   // (ws-hm-perf)
 
 namespace hakios::metal {
 
 class CommandQueue;
 class Texture;
+// (redfin xrreuse) HM_XR_REUSE: what an extended-range surface's decoded copy holds (Texture::xrDecodeReuse)
+struct XrReuseKey {
+    uint64_t seed = 0, epoch = 0, sum = 0;   // the plug-in's IOSurface seed, this process's XR writes, HM_XR_REUSE=2's rows sum
+    bool keyed = false;                      // the plug-in told a seed for the surface (else never reused)
+};
 
 // a buffer a program sees: a GEM object with its length (MTLBuffer's -length may be less than the object's size)
 // (redfin hm-int4) what this process's GPU memory is held for, by kind (HM_POOL accounting: hakios_metal_pool_stats):
@@ -167,6 +173,12 @@ public:
     // (redfin hm-int8) HM_PROF=2's pace line: the kernel submit call's entry and return (the transport's clock; 0 not sent)
     int64_t kernelInNs() const { return kernelInAt_; }
     int64_t kernelOutNs() const { return kernelOutAt_; }
+    // (ws-hm-perf) HM_PERF (perf.hpp): a Metal encoder's start (KIND 1 render, 2 compute, 3 blit) and its end (its label,
+    // nullptr: none). With HM_PERF 1 or 8 a stamp at each (the end after a wait for idle; with a GMEM or dual pass open
+    // then, once that pass closes, after its tiles); the events once the buffer completes. Nothing with HM_PERF unset.
+    void perfBegin(uint32_t kind);
+    void perfEnd(const char* label);
+    void perfFlush();   // the stamps that wait for a pass to close, now (closePass's end, submit)
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -386,6 +398,21 @@ private:
     void stamp(uint32_t slot);
     void stampStart(PassKind kind, uint32_t width, uint32_t height);
     void stampEnd();
+    // (ws-hm-perf) HM_PERF: the encoders begun (START / END: their stamp slots, 0xffff none yet), the slots of a
+    // buffer of the queue's (each the counter, then each of PERF_REGS_'s registers: 8 bytes apiece), and the encoders
+    // whose start or end waits for the open GMEM pass to close
+    struct PerfEnc { uint8_t kind = 0; bool ended = false; uint16_t start = 0xffff, end = 0xffff; uint32_t hash = 0; };
+    static constexpr uint32_t kPerfSlots = 256, kPerfEncs = 200;
+    std::vector<PerfEnc> perfEncs_;
+    std::vector<uint32_t> perfPendingStart_, perfPendingEnd_;
+    std::shared_ptr<Buffer> perfStamps_;
+    std::vector<uint32_t> perfRegs_;
+    uint32_t perfSlots_ = 0, perfSeq_ = 0, perfCur_ = 0xffff, perfTiles_ = 0;
+    bool perfDead_ = false;
+    size_t perfMarkEnd_ = size_t(-1);   // the stream's size right after the last stamp (an encoder with no work)
+    uint16_t perfStamp(bool idle);
+    void perfClose();   // closePass's end: HM_PASS, perfFlush
+    void perfDone(Status s);   // finish: HM_ENC, HM_CTR, HM_CB
     uint32_t skipped_ = 0;
     std::string lastSkipped_;
     // dispatch and dispatchIndirect: GROUPS, or (GROUPS null) the counts at OFFSET of ARGS
@@ -560,6 +587,7 @@ private:
         pm4::Stream sysStream, headGmem;
         uint32_t clears = 0;        // the attachments a GMEM pass clears in its tiles (render::gmemClearWords), and their words
         uint32_t clearWords[kMaxColorOutputs][4] = {};
+        uint32_t perfEnc = 0xffff;  // (ws-hm-perf) the encoder that opened it (HM_PASS)
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         // (redfin hm-int4) HM_DEADFILL: the pass's last draw, when a later draw of the same geometry may take it back
@@ -728,6 +756,7 @@ private:
         uint64_t sum = 0;
         bool decoded = false;
         bool gpu = false;   // (redfin hmv11) decoded by xr_decode on the GPU (HM_XR_GPU): no processor sum to check
+        XrReuseKey key;   // (redfin xrreuse) HM_XR_REUSE: what the copy holds once decoded
     };
     std::vector<XrLate> xrLate_;
     // (redfin hmyc) this buffer's two-plane YCbCr copies (render.cpp), and those to decode at commit

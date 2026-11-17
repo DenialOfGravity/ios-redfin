@@ -145,6 +145,12 @@ hakios_metal_texture *hakios_metal_texture_new_ycbcr(hakios_metal_device *device
     uint64_t luma_offset, unsigned luma_row_bytes, uint64_t chroma_offset, unsigned chroma_row_bytes, unsigned matrix, int full, int planes);
 /* (redfin hmyc) the surface under such a texture changed (GEN: its IOSurface seed): the next draw converts it again */
 void hakios_metal_texture_ycbcr_touch(hakios_metal_texture *texture, uint64_t gen);
+/* (redfin xrreuse) HM_XR_REUSE: the IOSurface seed of an extended-range texture at a bind (ignored with HM_XR_REUSE=0 or
+ * any other texture); the mode; [0] decodes, [1] draws that took the kept copy, [2] decodes with no seed known, [3] seed
+ * unmoved but the rows sum changed (mode 2), [4] kept copies forgotten, [5] decodes after the seed or a local write moved */
+void hakios_metal_texture_xr_touch(hakios_metal_texture *texture, uint64_t seed);
+int hakios_metal_xr_reuse_mode(void);
+void hakios_metal_xr_reuse_stats(unsigned long long out[6]);
 /* (redfin hmyc) the same conversion on the processor (the HM_YCBCR=cpu copy): RGBA8 rows into OUT, bit for bit the GPU's */
 void hakios_metal_ycbcr_convert(const void *luma, uint64_t luma_row_bytes, const void *chroma, uint64_t chroma_row_bytes, unsigned width,
     unsigned height, unsigned matrix, int full, int planes, void *out, uint64_t out_row_bytes);
@@ -724,6 +730,11 @@ void hakios_metal_cb_gpu_split(hakios_metal_cb *cb, int64_t *queued, int64_t *ru
 /* (redfin) the GPU's own start and end of a completed buffer (CP_ALWAYS_ON_COUNTER stamps), as nanoseconds after its
  * commit (*start_ns may be negative by the calibration's error): 0, or -1 when there are none (not completed, HM_GPU_STAMPS=0) */
 int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *end_ns);
+/* (ws-hm-perf) HM_PERF's bits (include/hakios-metal/perf.hpp; 0 off), and a Metal encoder's start (KIND 1 render,
+ * 2 compute, 3 blit) and end (LABEL: its label, NULL none) in CB: stamps and kdebug events, nothing with HM_PERF 0 */
+unsigned hakios_metal_perf(void);
+void hakios_metal_cb_perf_begin(hakios_metal_cb *cb, unsigned kind);
+void hakios_metal_cb_perf_end(hakios_metal_cb *cb, const char *label);
 /* (redfin hm-int8) the core's commit (CommandQueue::submit's entry) and the kernel submit call's entry and return, in the
  * transport's clock (on the phone mach_continuous_time in ns): 0, or -1 when it never reached the kernel (any may be NULL) */
 int hakios_metal_cb_submit_times(hakios_metal_cb *cb, int64_t *committed_ns, int64_t *kernel_in_ns, int64_t *kernel_out_ns);

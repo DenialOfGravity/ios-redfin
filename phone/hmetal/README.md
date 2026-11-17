@@ -175,3 +175,19 @@ Switches (all core env, set in `/var/local/hmetal/env`): `HM_CACHE_VERIFY=N` (1 
 background; "hm-cache: STALE ..." when it differs, the file replaced), `HM_STAGE_MEMO=1` (+`HM_STAGE_MEMO_MB=48`),
 `HM_CACHE_MANIFEST=1`, `HM_COMPILE_SPLIT=1` (background threads on their own ir3 compiler: the render thread never waits
 behind one). Host tool `out/bench/seed/hm-seed` (`build CACHE SEED`, `time LIB FN ...`, `compile`, `rewarm`).
+
+## HM_PERF: profiling events for sweettrace (ws-hm-perf)
+
+Default off: `HM_PERF` unset or `0` is the old behaviour byte for byte (no stamp, no extra GPU command, no event).
+Set it in `/var/local/hmetal/env` (e.g. `HM_PERF=0xf`) and restart the process. Events are kdebug, class 0x21
+subclass 0xA6 (debugid `0x21A6xxxx`, code << 2), recorded by `sweettrace`; `include/hakios-metal/perf.hpp` has the format.
+
+| Bit | What |
+|---|---|
+| 1 | CP_ALWAYS_ON_COUNTER at each Metal encoder's start and end (end after CP_WAIT_FOR_IDLE; with a GMEM pass open, at its close), one queue buffer a command buffer. Completion: code 1 HM_ENC (start/end ticks, `kind<<56 \| seq<<16 \| encoder`, label FNV-1a), code 2 HM_LABEL (once a hash), code 3 HM_CB (the existing per-CB stamps, seq, kernel fence), code 7 HM_CAL (GPU ticks, mach_absolute_time, transport ns) at each calibration. GPUStartTime/GPUEndTime (and kernelStart/EndTime) become the GPU's own times. |
+| 2 | code 4 HM_PASS as each draw pass closes: sysmem/GMEM, bins, samples, size, colour count, depth/stencil, load/store bits (LRZ always 0: not used). |
+| 4 | code 5 HM_SHADER for each stage/kernel compileStage/compileAir hands out (ir3 stats when compiled now, bit 63 set; Kernel fields for cache/memo hits). |
+| 8 | the counters in sysctl `kern.sweet_gpuperf_regs` (`G:C@slot=0xLO ...`, at most 15, re-read once a second) read with each stamp; code 6 HM_CTR deltas (index in bits 56-63, `~0` unused). |
+
+Bits 2 and 4 alone add no GPU command. Encoders merged into one pass, parallel render sub-encoders and buffers appended
+to another are not split: they share their pass's stamps or have none.
