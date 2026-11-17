@@ -1229,6 +1229,41 @@ static void sample_base(void)
 	sp.kbytes = k_bytes;
 }
 
+/*
+ * redfin 1158: Adreno perf counters. With kern.sweet_gpuperf_sel non-empty, each sample carries "gpuperf":{"sel":..,
+ * "raw": kern.sweet_gpuperf} (aon=.. GROUP:COUNTABLE@slot=value ...); the collector makes the deltas. A kernel
+ * without the sysctl (ENOENT): off for good, nothing sent.
+ */
+static void gpuperf_sample(struct jb *j)
+{
+#ifdef __APPLE__
+	static int missing;
+	char sel[256], line[2048];
+	size_t l = sizeof(sel) - 1;
+	if (missing)
+		return;
+	if (sysctlbyname("kern.sweet_gpuperf_sel", sel, &l, NULL, 0) != 0) {
+		if (errno == ENOENT)
+			missing = 1;
+		return;
+	}
+	sel[l < sizeof(sel) ? l : sizeof(sel) - 1] = 0;
+	if (sel[0] == 0)
+		return;
+	l = sizeof(line) - 1;
+	if (sysctlbyname("kern.sweet_gpuperf", line, &l, NULL, 0) != 0)
+		return;
+	line[l < sizeof(line) ? l : sizeof(line) - 1] = 0;
+	jb_pf(j, ",\"gpuperf\":{\"sel\":");
+	jb_str(j, sel, sizeof(sel));
+	jb_pf(j, ",\"raw\":");
+	jb_str(j, line, sizeof(line));
+	jb_pf(j, "}");
+#else
+	(void)j;
+#endif
+}
+
 static void sample(void)
 {
 	uint64_t now = abs_now();
@@ -1265,6 +1300,7 @@ static void sample(void)
 	else
 		jb_pf(j, "}");
 	sp.vm = v;
+	gpuperf_sample(j);
 	double la[3] = { 0, 0, 0 };
 	getloadavg(la, 3);
 	jb_pf(j, ",\"load\":[%.2f,%.2f,%.2f]", la[0], la[1], la[2]);

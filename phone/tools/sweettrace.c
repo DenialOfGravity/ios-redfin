@@ -19,7 +19,8 @@
  *
  * Default classes: DBG_MACH/DBG_MACH_SCHED (context switches, MAKE_RUNNABLE with the waker as the current thread,
  * blocks, waits), DBG_MACH/DBG_MACH_IPC (mach_msg send/receive, KMSG_INFO sender -> receiver pid), DBG_MACH/
- * DBG_MACH_EXCP_INTR (interrupts), DBG_DRIVERS/0xF5 (0994's display/GPU/touch events), DBG_TRACE (always on).
+ * DBG_MACH_EXCP_INTR (interrupts), DBG_DRIVERS/0xF5 (0994's display/GPU/touch events), DBG_APPS/0xA6 (hakios-metal's
+ * user-space kdebug_trace events, class 0x21 subclass 0xA6), DBG_TRACE (always on).
  *
  * File (little endian): header (struct swt_header), n_events kd_buf (64 bytes each: timestamp, arg1-4, arg5 =
  * thread id, debugid, cpuid, unused), n_threads struct swt_thread (tid, pid, process name, thread name).
@@ -69,6 +70,8 @@
 #define DBG_DRIVERS             6
 #define DBG_TRACE               7
 #define SWEET_SUBCLASS          0xF5
+#define DBG_APPS                0x21
+#define HAKIOS_METAL_SUBCLASS   0xA6    /* hakios-metal (DBG_APPS) */
 
 typedef struct {
 	uint64_t timestamp;
@@ -385,6 +388,7 @@ int main(int argc, char **argv)
 	if (!nointr)
 		tf_allow(tf, DBG_MACH, DBG_MACH_EXCP_INTR);
 	tf_allow(tf, DBG_DRIVERS, SWEET_SUBCLASS);
+	tf_allow(tf, DBG_APPS, HAKIOS_METAL_SUBCLASS);
 	if (sysc) {
 		tf_allow(tf, DBG_MACH, DBG_MACH_EXCP_SC);
 		tf_allow(tf, DBG_BSD, DBG_BSD_EXCP_SC);
