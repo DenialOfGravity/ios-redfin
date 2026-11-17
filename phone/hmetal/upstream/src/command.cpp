@@ -712,6 +712,7 @@ CommandBuffer::~CommandBuffer() {
         queue_.giveBuffer(std::move(profileStamps_));
         queue_.giveBuffer(std::move(drawStamps_));
         queue_.giveBuffer(std::move(traceStamps_));   // (redfin hm-trace)
+        queue_.giveBuffer(std::move(perfStamps_));    // (ws-hm-perf)
     }
     pm4::Stream::recycle(std::move(stream_));   // (ws-hm-int13) its storage for a later buffer's stream
 }
@@ -732,6 +733,7 @@ void CommandBuffer::finish(Status s) {
         gpuStamps_ = Piece{};
     }
     status_ = s;
+    perfDone(s);   // (ws-hm-perf) HM_PERF's events (nothing with it unset)
     if (s == kCompleted && counts_.binnedPasses != 0) queue_.checkVsc();
     if (s == kCompleted && tuning_) {
         for (const PassTime& t : passTimes()) {
@@ -1008,13 +1010,18 @@ void CommandQueue::calibrate() {
         if (calibrated_ && gpu_.transport().nowNs() - calibNs_ < 500000000) return;
     }
     const int64_t before = gpu_.transport().nowNs();
+    const uint64_t machBefore = perf::on(perf::kTimestamps) ? perf::machNow() : 0;   // (ws-hm-perf)
     uint64_t ticks = 0;
     if (gpu_.param(kParamTimestamp, &ticks) != 0 || ticks == 0) return;
     const int64_t after = gpu_.transport().nowNs();
+    const uint64_t machAfter = perf::on(perf::kTimestamps) ? perf::machNow() : 0;
     std::lock_guard<std::mutex> g(calibLock_);
     calibNs_ = before + (after - before) / 2;
     calibTicks_ = ticks;
     calibrated_ = true;
+    // (ws-hm-perf) HM_PERF=1's HM_CAL: the pair (GPU ticks, mach_absolute_time) this calibration took, and the transport's
+    // ns (mach_continuous_time) at it: the exporter's GPU clock when the kernel's GPU_CAL is not in the recording
+    if (perf::on(perf::kTimestamps)) perf::emit(perf::kCal, ticks, machBefore + (machAfter - machBefore) / 2, uint64_t(calibNs_), 0);
 }
 
 bool CommandQueue::ticksToNs(uint64_t ticks, int64_t* ns) {
@@ -1060,6 +1067,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     {
         prof::Scope t(prof::kClosePass);
         cb->closePass();   // the last pass's tail
+        cb->perfFlush();   // (ws-hm-perf) stamps a dropped pass left waiting
     }
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
@@ -1420,6 +1428,134 @@ void CommandQueue::waiter() {
             idle_.push_back(std::move(cb->commands_));
         }
     }
+}
+
+// --- (ws-hm-perf) HM_PERF ------------------------------------------------------------------------------------------
+
+uint16_t CommandBuffer::perfStamp(bool idle) {
+    if (!perf::on(perf::kTimestamps | perf::kCounters) || perfDead_ || perfSlots_ >= kPerfSlots) return 0xffff;
+    const uint32_t rec = 1 + uint32_t(perfRegs_.size());
+    if (perfStamps_ == nullptr) {
+        std::string why;
+        perfStamps_ = queue_.takeBuffer(8ull * rec * kPerfSlots, &why);
+        if (perfStamps_ == nullptr) {
+            perfDead_ = true;
+            return 0xffff;
+        }
+        memset(perfStamps_->contents(), 0, 8ull * rec * kPerfSlots);
+        keep(perfStamps_);
+    }
+    const size_t before = stream_.size();
+    if (idle) stream_.waitForIdle();
+    const uint64_t at = perfStamps_->gpuAddress() + 8ull * rec * perfSlots_;
+    for (uint32_t i = 0; i < rec; i++) {
+        const uint32_t reg = i == 0 ? 0x0980u : perfRegs_[i - 1];   // REG_A6XX_CP_ALWAYS_ON_COUNTER, then the counters' LO
+        const uint64_t a = at + 8ull * i;
+        const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(reg) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(a),
+                               uint32_t(a >> 32)};
+        stream_.packet(a6xx::CP_REG_TO_MEM, w, 3);
+    }
+    carryKeep(before);   // (as stamp: no register changed, the next pass may still go on from the last)
+    use(*perfStamps_, true);
+    perfMarkEnd_ = stream_.size();
+    return uint16_t(perfSlots_++);
+}
+
+void CommandBuffer::perfBegin(uint32_t kind) {
+    if (!perf::on(perf::kTimestamps | perf::kPasses | perf::kCounters)) return;
+    if (status_ > kEnqueued || perfEncs_.size() >= kPerfEncs) return;
+    if (perfSeq_ == 0) perfSeq_ = perf::nextSeq();
+    if (perfStamps_ == nullptr && perfSlots_ == 0 && perf::on(perf::kCounters)) perfRegs_ = perf::counterRegs();
+    if (open_ == nullptr) perfFlush();
+    PerfEnc e;
+    e.kind = uint8_t(kind);
+    perfCur_ = uint32_t(perfEncs_.size());
+    perfEncs_.push_back(e);
+    // a GMEM (or not yet decided) pass still open: its draws reach the stream only as it closes, so this start is that
+    // close's stamp (its draws never join such a pass's: the next draw closes it)
+    if (open_ != nullptr && (open_->gmem || open_->dual)) {
+        perfPendingStart_.push_back(perfCur_);
+    } else {
+        perfEncs_.back().start = perfStamp(false);
+    }
+}
+
+void CommandBuffer::perfEnd(const char* label) {
+    if (perfCur_ >= perfEncs_.size()) return;
+    const uint32_t i = perfCur_;
+    perfCur_ = 0xffff;
+    perfEncs_[i].ended = true;
+    perfEncs_[i].hash = perf::on(perf::kTimestamps | perf::kCounters) ? perf::labelHash(label) : 0;
+    if (open_ != nullptr && (open_->gmem || open_->dual)) {
+        perfPendingEnd_.push_back(i);
+        return;
+    }
+    if (open_ == nullptr) perfFlush();
+    PerfEnc& e = perfEncs_[i];
+    // no GPU work since its start: the start is its end too (no wait for idle, no second stamp)
+    if (e.start != 0xffff && uint32_t(e.start) + 1 == perfSlots_ && stream_.size() == perfMarkEnd_) {
+        e.end = e.start;
+        return;
+    }
+    e.end = perfStamp(true);
+}
+
+void CommandBuffer::perfFlush() {
+    if (perfPendingStart_.empty() && perfPendingEnd_.empty()) return;
+    const uint16_t s = perfStamp(true);
+    for (uint32_t i : perfPendingEnd_) perfEncs_[i].end = s;
+    for (uint32_t i : perfPendingStart_) perfEncs_[i].start = s;
+    perfPendingStart_.clear();
+    perfPendingEnd_.clear();
+}
+
+void CommandBuffer::perfClose() {
+    if (perf::bits() == 0) return;
+    if (perf::on(perf::kPasses) && open_ != nullptr) {
+        const RenderPass& p = open_->pass;
+        const Texture* t = p.color0 != nullptr ? p.color0 : p.depth;
+        uint64_t colors = p.color0 != nullptr ? 1 : 0;
+        for (const ColorAttachment& a : p.more) colors += a.texture != nullptr ? 1 : 0;
+        const uint64_t samples = t != nullptr ? t->samples() : 1;
+        const uint64_t bins = open_->gmem ? perfTiles_ : 0;
+        const uint64_t w = t != nullptr ? t->width() : 0, h = t != nullptr ? t->height() : 0;
+        // load/store: colour 0's MTLLoadAction (bits 0-1) and MTLStoreAction (2), the depth attachment's (3-4, 5)
+        const uint64_t ls = (uint64_t(p.load) & 3) | (uint64_t(p.store) & 1) << 2 | (uint64_t(p.depthLoad) & 3) << 3 | (uint64_t(p.depthStore) & 1) << 5;
+        // (no LRZ on this driver: bit 24 is always 0)
+        perf::emit(perf::kPass, uint64_t(perfSeq_) << 16 | (open_->perfEnc & 0xffff),
+                   (open_->gmem ? 1ull : 0ull) | (bins & 0xffff) << 8 | (samples & 0xf) << 28, (w & 0xffff) << 16 | (h & 0xffff),
+                   colors | uint64_t(p.depth != nullptr ? 1 : 0) << 8 | uint64_t(p.stencil != nullptr ? 1 : 0) << 9 | ls << 16);
+    }
+    perfFlush();
+}
+
+void CommandBuffer::perfDone(Status s) {
+    if (!perf::on(perf::kTimestamps | perf::kCounters) || s != kCompleted) return;
+    if (perfEncs_.empty() && gpuTicks_[0] == 0) return;   // nothing to say (an empty buffer, no stamps)
+    if (perfSeq_ == 0) perfSeq_ = perf::nextSeq();
+    const size_t rec = 1 + perfRegs_.size();
+    const volatile uint64_t* t = perfStamps_ != nullptr ? reinterpret_cast<const volatile uint64_t*>(perfStamps_->contents()) : nullptr;
+    for (size_t i = 0; t != nullptr && i < perfEncs_.size(); i++) {
+        const PerfEnc& e = perfEncs_[i];
+        if (!e.ended || e.start == 0xffff || e.end == 0xffff) continue;
+        const uint64_t id = uint64_t(perfSeq_) << 16 | (i & 0xffff);
+        if (perf::on(perf::kTimestamps)) perf::emit(perf::kEnc, t[rec * e.start], t[rec * e.end], uint64_t(e.kind) << 56 | id, e.hash);
+        if (!perf::on(perf::kCounters)) continue;
+        for (size_t c = 0; c < perfRegs_.size(); c += 3) {
+            uint64_t arg[3];
+            for (size_t k = 0; k < 3; k++) {
+                const size_t n = c + k;
+                if (n >= perfRegs_.size()) {
+                    arg[k] = ~0ull;   // (index 0xff: no counter)
+                    continue;
+                }
+                const uint64_t d = t[rec * e.end + 1 + n] - t[rec * e.start + 1 + n];
+                arg[k] = uint64_t(n) << 56 | (d & 0x00ffffffffffffffull);
+            }
+            perf::emit(perf::kCtr, id, arg[0], arg[1], arg[2]);
+        }
+    }
+    if (perf::on(perf::kTimestamps)) perf::emit(perf::kCb, gpuTicks_[0], gpuTicks_[1], perfSeq_, fence_);
 }
 
 }  // namespace hakios::metal

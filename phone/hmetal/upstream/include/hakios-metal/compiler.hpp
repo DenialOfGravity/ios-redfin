@@ -65,6 +65,14 @@ bool bindArgumentBuffers(const std::vector<Resource>& resources, Bindings* b, st
 // them), and only the front end runs. False with *why: the front end refused the function, or it has no set there.
 bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::vector<std::pair<uint32_t, uint32_t>>* members, std::string* why);
 
+// (ws-hm-perf) HM_PERF=4: ir3's own numbers for a variant compiled now (VALID false for one read back from the memo,
+// the cache or a seed): instructions (rpt expanded), ALU ones (cat 2, 3, 4), max waves, private-memory stores and loads
+// (stp / ldp: the spills and fills)
+struct Ir3Stats {
+    uint32_t instrs = 0, alu = 0, maxWaves = 0, spills = 0, fills = 0;
+    bool valid = false;
+};
+
 // a kernel compiled here, owning what its Kernel points into
 struct CompiledKernel {
     Kernel kernel{};
@@ -80,6 +88,7 @@ struct CompiledKernel {
     // a [[threadgroup(0)]] argument the encoder sizes: it starts threadgroupArgBase bytes in, past the static arrays
     bool hasThreadgroupArg = false;
     uint32_t threadgroupArgBase = 0;
+    Ir3Stats ir3;   // (ws-hm-perf)
 };
 
 // a vertex or fragment function compiled here (render.hpp's Stage), owning what its Stage points into
@@ -94,6 +103,7 @@ struct CompiledStage {
     bool writesMemory = true;                // the NIR stores to or does atomics on a device buffer (or global memory); false only when it was looked at and does not
     std::string name;
     std::string listing;
+    Ir3Stats ir3;   // (ws-hm-perf)
 };
 
 // a VS and an FS linked for one colour format (render.hpp's Program), owning both stages

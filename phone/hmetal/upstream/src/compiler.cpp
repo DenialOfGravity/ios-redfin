@@ -32,6 +32,7 @@
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/trace.hpp"   // (redfin hm-trace)
+#include "hakios-metal/perf.hpp"    // (ws-hm-perf)
 #endif
 
 namespace hakios::metal {
@@ -1081,6 +1082,18 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     return true;
 }
 
+// (ws-hm-perf) HM_PERF=4: the variant's numbers, as ir3 counted them
+Ir3Stats ir3StatsOf(const ir3_shader_variant* v) {
+    Ir3Stats s;
+    s.instrs = v->info.instrs_count;
+    s.alu = uint32_t(v->info.instrs_per_cat[2]) + v->info.instrs_per_cat[3] + v->info.instrs_per_cat[4];
+    s.maxWaves = v->info.max_waves > 0 ? uint32_t(v->info.max_waves) : 0;
+    s.spills = v->info.stp_count;
+    s.fills = v->info.ldp_count;
+    s.valid = true;
+    return s;
+}
+
 // what a CompiledKernel and a CompiledStage both own around their Kernel
 struct KernelHome {
     Kernel& k;
@@ -1459,6 +1472,7 @@ std::unique_ptr<CompiledKernel> compileAirOnce(const void* bitcode, size_t size,
     if (!compileVariant(t, PassOrder::kCompute, why)) return nullptr;
     KernelHome home{out->kernel, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;
+    out->ir3 = ir3StatsOf(t.v);   // (ws-hm-perf)
     out->threadgroupBytes = t.info.threadgroup_bytes;
     out->hasThreadgroupArg = t.info.has_threadgroup_arg;
     out->threadgroupArgBase = t.info.threadgroup_arg_base;
@@ -2130,8 +2144,8 @@ int knownReadMask(const void* bitcode, size_t size, const FunctionConstants& con
     return count;
 }
 
-std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                           const KnownBuffer* known) {
+std::unique_ptr<CompiledStage> compileStageImpl(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+                                               const KnownBuffer* known) {   // (ws-hm-perf: compileStage below)
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
     // the memo's key: the cache's name, or (no cache configured) the same hash made here
     std::string memoKey = name;
@@ -2377,7 +2391,7 @@ void verifyKernelLater(const std::string& name, const std::string& where, const 
 }
 }  // namespace
 
-std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+std::unique_ptr<CompiledKernel> compileAirImpl(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {   // (ws-hm-perf: compileAir below)
     const std::string name = stageCacheName(bitcode, size, constants, kKernelCacheTag, nullptr);
     std::string memoKey = name;
     if (memoKey.empty() && memoOn()) {
@@ -2605,6 +2619,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
     if (!compileVariant(t, PassOrder::kGraphics, why)) return nullptr;
     KernelHome home{out->stage.k, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;
+    out->ir3 = ir3StatsOf(t.v);   // (ws-hm-perf)
     cbReadEnds(t.nir, &out->resources);
     if (!fillStage(t, classes, out->stage, why)) return nullptr;
     // the fetch slots lowerFbRead made: sampled 2D floats the draw fills with the targets, and a stage that reads its
@@ -2837,6 +2852,36 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
     }
     std::sort(members->begin(), members->end());
     return true;
+}
+
+// (ws-hm-perf) HM_PERF=4: HM_SHADER for every stage and kernel handed out, compiled now (ir3's numbers, bit 63 set) or
+// read back from the memo, the cache or a seed (the Kernel's: instructions = words / 2, no ALU count, waves or spills)
+namespace {
+void perfShader(const std::string& name, const Kernel& k, const Ir3Stats& s, uint64_t stage, int64_t ns) {
+    const uint32_t h = perf::labelHash(name);
+    const uint64_t instrs = s.valid ? s.instrs : uint64_t(k.numWords) / 2;
+    const uint64_t full = uint64_t(uint32_t(k.maxReg + 1) & 0xffff), half = uint64_t(uint32_t(k.maxHalfReg + 1) & 0xffff);
+    perf::emit(perf::kShader, h, (instrs & 0xffffffffull) | uint64_t(s.alu) << 32,
+               full | half << 16 | uint64_t(s.maxWaves & 0xffff) << 32 | (stage & 0x7fff) << 48 | uint64_t(s.valid ? 1 : 0) << 63,
+               uint64_t(s.spills & 0xffff) | uint64_t(s.fills & 0xffff) << 16 | uint64_t(ns > 0 ? ns / 1000 : 0) << 32);
+}
+}  // namespace
+
+std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+                                           const KnownBuffer* known) {
+    if (!perf::on(perf::kShaders)) return compileStageImpl(bitcode, size, why, constants, iboBase, known);
+    const int64_t t0 = hakios::trace::nowNs();
+    std::unique_ptr<CompiledStage> s = compileStageImpl(bitcode, size, why, constants, iboBase, known);
+    if (s != nullptr) perfShader(s->name, s->stage.k, s->ir3, s->stage.kind == kStageFragment ? 1 : 0, hakios::trace::nowNs() - t0);
+    return s;
+}
+
+std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+    if (!perf::on(perf::kShaders)) return compileAirImpl(bitcode, size, why, constants);
+    const int64_t t0 = hakios::trace::nowNs();
+    std::unique_ptr<CompiledKernel> k = compileAirImpl(bitcode, size, why, constants);
+    if (k != nullptr) perfShader(k->name, k->kernel, k->ir3, 2, hakios::trace::nowNs() - t0);
+    return k;
 }
 
 #endif

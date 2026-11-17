@@ -2188,6 +2188,24 @@ int hakios_metal_cb_submit_times(hakios_metal_cb* cb, int64_t* committed_ns, int
     return c.kernelOutNs() != 0 ? 0 : -1;
 }
 
+// (ws-hm-perf) HM_PERF
+unsigned hakios_metal_perf(void) { return hakios::metal::perf::bits(); }
+void hakios_metal_cb_perf_begin(hakios_metal_cb* cb, unsigned kind) {
+    namespace perf = hakios::metal::perf;
+    if (cb == nullptr || !perf::on(perf::kTimestamps | perf::kPasses | perf::kCounters)) return;
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, kind] { cb->cb->perfBegin(kind); });
+    cb->cb->perfBegin(kind);
+}
+void hakios_metal_cb_perf_end(hakios_metal_cb* cb, const char* label) {
+    namespace perf = hakios::metal::perf;
+    if (cb == nullptr || !perf::on(perf::kTimestamps | perf::kPasses | perf::kCounters)) return;
+    if (deferring(cb)) {
+        std::string l = label != nullptr ? label : "";
+        return cb->deferrer->post(cb->pending, [cb, l] { cb->cb->perfEnd(l.c_str()); });
+    }
+    cb->cb->perfEnd(label);
+}
+
 int hakios_metal_cb_gpu_times(hakios_metal_cb* cb, int64_t* start_ns, int64_t* end_ns) {
     syncOne(cb);
     int64_t s = 0, e = 0;

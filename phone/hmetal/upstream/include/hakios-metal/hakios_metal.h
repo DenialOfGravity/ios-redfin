@@ -724,6 +724,11 @@ void hakios_metal_cb_gpu_split(hakios_metal_cb *cb, int64_t *queued, int64_t *ru
 /* (redfin) the GPU's own start and end of a completed buffer (CP_ALWAYS_ON_COUNTER stamps), as nanoseconds after its
  * commit (*start_ns may be negative by the calibration's error): 0, or -1 when there are none (not completed, HM_GPU_STAMPS=0) */
 int hakios_metal_cb_gpu_times(hakios_metal_cb *cb, int64_t *start_ns, int64_t *end_ns);
+/* (ws-hm-perf) HM_PERF's bits (include/hakios-metal/perf.hpp; 0 off), and a Metal encoder's start (KIND 1 render,
+ * 2 compute, 3 blit) and end (LABEL: its label, NULL none) in CB: stamps and kdebug events, nothing with HM_PERF 0 */
+unsigned hakios_metal_perf(void);
+void hakios_metal_cb_perf_begin(hakios_metal_cb *cb, unsigned kind);
+void hakios_metal_cb_perf_end(hakios_metal_cb *cb, const char *label);
 /* (redfin hm-int8) the core's commit (CommandQueue::submit's entry) and the kernel submit call's entry and return, in the
  * transport's clock (on the phone mach_continuous_time in ns): 0, or -1 when it never reached the kernel (any may be NULL) */
 int hakios_metal_cb_submit_times(hakios_metal_cb *cb, int64_t *committed_ns, int64_t *kernel_in_ns, int64_t *kernel_out_ns);

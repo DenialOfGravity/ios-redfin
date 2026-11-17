@@ -4809,11 +4809,111 @@ HM_NOUC_EDITS = [
 ]
 
 
+# (ws-hm-perf) HM_PERF (the core's switch, hakios_metal_perf; unset or 0: nothing here runs, as before): each Metal
+# encoder's start and end go to the core (hakios_metal_cb_perf_begin / _end, with the encoder's label at its end) for
+# its stamps and kdebug events, and with bit 1 GPUStartTime / GPUEndTime (and kernelStart/EndTime, which answer them) are
+# the GPU's own: the command buffer's CP_ALWAYS_ON_COUNTER stamps (hakios_metal_cb_gpu_times, ns after the core's
+# commit, on the transport's mach_continuous_time clock), put on mach_absolute_time seconds. The plug-in's own figures
+# (hm_timeline, HM_TRACE, HM_PROF's fps notes) keep the commit time they always read. Applied to the finished text, last.
+HM_PERF_HELPERS = r'''/* (ws-hm-perf) HM_PERF: hakios_metal_perf's bits, read once */
+static unsigned
+hm_perf_bits(void)
+{
+	static int bits = -1;
+
+	if (bits < 0) bits = (int)hakios_metal_perf();
+	return (unsigned)bits;
+}
+
+static void
+hm_perf_begin(hakios_metal_cb *cb, unsigned kind)
+{
+	if ((hm_perf_bits() & 11u) != 0 && cb != NULL) hakios_metal_cb_perf_begin(cb, kind);
+}
+
+static void
+hm_perf_end(hakios_metal_cb *cb, id encoder)
+{
+	if ((hm_perf_bits() & 11u) == 0 || cb == NULL) return;
+	NSString *label = [encoder label];
+	hakios_metal_cb_perf_end(cb, label != nil ? [label UTF8String] : NULL);
+}
+
+/* HM_PERF=1: the GPU's own start and end of a completed buffer, as hm_now's seconds; 0 when there are none */
+static int
+hm_perf_gpu_times(hakios_metal_cb *cb, double committedAt, double *start, double *end)
+{
+	static mach_timebase_info_data_t tb;
+	int64_t a = 0, b = 0, cns = 0, kin = 0, kout = 0;
+
+	if ((hm_perf_bits() & 1u) == 0 || cb == NULL) return 0;
+	if (hakios_metal_cb_gpu_times(cb, &a, &b) != 0 || b < a) return 0;
+	(void)hakios_metal_cb_submit_times(cb, &cns, &kin, &kout);
+	if (cns <= 0) {
+		*start = committedAt + (double)a / 1e9;
+		*end = committedAt + (double)b / 1e9;
+		return 1;
+	}
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	/* the core's clock is mach_continuous_time: less the time asleep, mach_absolute_time's */
+	const uint64_t c = mach_continuous_time(), m = mach_absolute_time();
+	const double asleep = c > m ? (double)(c - m) * tb.numer / tb.denom : 0.0;
+	*start = ((double)(cns + a) - asleep) / 1e9;
+	*end = ((double)(cns + b) - asleep) / 1e9;
+	return 1;
+}
+
+'''
+HM_PERF_EDITS = [
+    ('/* --- the private base classes, by name only ---', HM_PERF_HELPERS + '/* --- the private base classes, by name only ---'),
+    ('- (CFTimeInterval)GPUStartTime    { return _committedAt; }\n',
+     '- (CFTimeInterval)GPUStartTime    { double s, e; return hm_perf_gpu_times(_cb, _committedAt, &s, &e) ? s : _committedAt; }   /* (ws-hm-perf) */\n'),
+    ('- (CFTimeInterval)GPUEndTime      { return _committedAt + (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e9; }\n',
+     '- (CFTimeInterval)GPUEndTime\n{\n\tdouble s, e;   /* (ws-hm-perf) HM_PERF=1 */\n\n'
+     '\tif (hm_perf_gpu_times(_cb, _committedAt, &s, &e)) return e;\n'
+     '\treturn _committedAt + (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e9;\n}\n'),
+    ('- (CFTimeInterval)kernelStartTime { return self->_committedAt; }\n', '- (CFTimeInterval)kernelStartTime { return [self GPUStartTime]; }\n'),
+    ('\tHMT(HMT_PASS, self);   /* (redfin hm-trace) */\n\treturn [[[HakiosMetalComputeCommandEncoder alloc] initWithHakiosCommandBuffer:self] autorelease];',
+     '\tHMT(HMT_PASS, self);   /* (redfin hm-trace) */\n\thm_perf_begin(_cb, 2);   /* (ws-hm-perf) HM_PERF */\n'
+     '\treturn [[[HakiosMetalComputeCommandEncoder alloc] initWithHakiosCommandBuffer:self] autorelease];'),
+    ('\tHMT(HMT_PASS, self);   /* (redfin hm-trace) */\n\treturn [[[HakiosMetalBlitCommandEncoder alloc] initWithHakiosCommandBuffer:self] autorelease];',
+     '\tHMT(HMT_PASS, self);   /* (redfin hm-trace) */\n\thm_perf_begin(_cb, 3);   /* (ws-hm-perf) HM_PERF */\n'
+     '\treturn [[[HakiosMetalBlitCommandEncoder alloc] initWithHakiosCommandBuffer:self] autorelease];'),
+    ('\t\tHakiosMetalRenderCommandEncoder *encoder = [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:self pass:&pass\n',
+     '\t\thm_perf_begin(_cb, 1);   /* (ws-hm-perf) HM_PERF */\n'
+     '\t\tHakiosMetalRenderCommandEncoder *encoder = [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:self pass:&pass\n'),
+]
+
+
+def hm_perf(src):
+    n = src.count('[self GPUStartTime]')
+    if n != 6:
+        sys.exit('plugin.py: [self GPUStartTime] found %d times (hm-perf expects 6: kernelStartTime, and five in hm_completed)' % n)
+    src = src.replace('[self GPUStartTime]', 'self->_committedAt')
+    src = apply(src, HM_PERF_EDITS)
+    # each encoder's end, just before its -[super endEncoding] (after the render encoder's owed clear and resolves)
+    for cls, cb in (('HakiosMetalBlitCommandEncoder', '[_commandBuffer hakiosCommandBuffer]'),
+                    ('HakiosMetalComputeCommandEncoder', '[_commandBuffer hakiosCommandBuffer]'),
+                    ('HakiosMetalRenderCommandEncoder', '[self hakiosCb]')):
+        if src.count('@implementation %s\n' % cls) != 1:
+            sys.exit('plugin.py: hm-perf: @implementation %s not found once' % cls)
+        i = src.index('@implementation %s\n' % cls)
+        nxt = src.find('\n@implementation ', i + 1)
+        j = src.index('- (void)endEncoding\n', i)
+        k = src.index('[super endEncoding];', j)
+        if nxt != -1 and k > nxt:
+            sys.exit('plugin.py: hm-perf: no -endEncoding in %s' % cls)
+        ls = src.rindex('\n', 0, k) + 1
+        src = src[:ls] + '\thm_perf_end(%s, self);   /* (ws-hm-perf) HM_PERF */\n' % cb + src[ls:]
+    return src
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
     src = apply(src, HM_PLUGCPU_EDITS)   # (ws-hm-plugcpu) on the finished text
     src = apply(src, HM_NOUC_EDITS)   # (ws-hm-int12) HM_NOUC
+    src = hm_perf(src)   # (ws-hm-perf) HM_PERF
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))

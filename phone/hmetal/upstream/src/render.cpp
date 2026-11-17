@@ -4451,6 +4451,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& passGiven, co
             }
         }
         open_ = std::make_unique<OpenPass>();
+        open_->perfEnc = perfCur_;   // (ws-hm-perf)
         open_->pass = pass;
         open_->options = options;
         open_->table = passTable.gpuAddress();
@@ -5497,6 +5498,7 @@ void CommandBuffer::closePass(bool lazy) {
         }
         if (vsc != 0) counts_.binnedPasses++;
         counts_.tiles += plan.tiles();
+        perfTiles_ = plan.tiles();   // (ws-hm-perf) HM_PERF=2's bins
         if ((profile_ || tuning_) && !profiled_.empty()) {
             profiled_.back().tiles = plan.tiles();
             uint8_t attached = 0;
@@ -5555,6 +5557,7 @@ void CommandBuffer::closePass(bool lazy) {
         mark(Mark{uint32_t(stream_.words().size()), kMarkPassEnd, uint8_t(open_->gmem ? 1 : 0), t != nullptr ? t->width() : 0,
                   t != nullptr ? t->height() : 0, t != nullptr ? uint32_t(t->format()) : 0, open_->draws, 0, 0, t, nullptr});
     }
+    perfClose();   // (ws-hm-perf) HM_PERF: the pass's HM_PASS, and the stamps that waited for its tiles
     open_.reset();
 }
 
