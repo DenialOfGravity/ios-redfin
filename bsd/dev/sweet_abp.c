@@ -120,7 +120,7 @@ extern uint64_t sweet_current_task_main_macho(void);    /* 1156: current task's 
 #define ABP_NPIPES              2u
 
 uint32_t sweet_abp_flags;
-int sweet_cc_datacap;                   /* 1156: boot-arg/sysctl sweetccdatacap; 0 off (default), 1 patch CommCenter vf438 */
+int sweet_cc_datacap = 1;               /* 1156/1157: boot-arg/sysctl sweetccdatacap; 1157 default 1 = patch CommCenter vf438 at every launch from boot (no launch race, no sysctl); 0 off */
 uint32_t sweet_abp_bootstage = 2;       /* AppleBasebandPCIControl "bootstage": < 2 = "boot stage down" for ABM */
 
 struct abpb_hdr {

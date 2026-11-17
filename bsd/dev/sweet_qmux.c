@@ -102,7 +102,7 @@ static uint16_t voc_answer(uint8_t *b, size_t bn);
 static const char *pipe_name[NPIPES] = { "qmux1", "qmux2" };
 
 /* tunables (abpbridge.c's cell.on words) */
-static int qmi_filter = 1, qmi_rules = 0, err_code = QMI_ERR_NOT_SUPPORTED, cidfail = 0, reuse = 1, kickon = 1;
+static int qmi_filter = 1, qmi_rules = 1, err_code = QMI_ERR_NOT_SUPPORTED, cidfail = 0, reuse = 1, kickon = 1;  /* 1157: qmi_rules default 1 (data-enabled baseline; kern.sweet_qmi_rules 0 restores k25 gated) */
 static int holdnas = 1, holddly = 500, policy_file = 1;
 static int repub_mode = 0, repub_ms = 20;       /* 1073: kern.sweet_qmi_republish (0 off), kern.sweet_qmi_republish_ms */
 static int wh_s = 600;                          /* 1087: kern.sweet_qmi_withhold_s (mode 4: longest PLMN withholding) */
@@ -3253,7 +3253,7 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
 #define D_BAK_MAX               (48u << 10)
 #define D_NGATE                 8
 
-static int data_fwd = 0, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default; 1108: data_fwd default 0 (1 only to test data) */
+static int data_fwd = 1, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default; 1108: data_fwd default 0; 1157: default 1 (data-enabled baseline; kern.sweet_data_fwd 0 restores k25 gated) */
 static int data_was;                    /* data_active() as the thread saw it last (logs + kill switch) */
 static uint16_t gate_ids[D_NGATE] = { 0x0027, 0x0028, 0x0029, 0x004a, 0x0093 };     /* [0..2] always */
 static int ngate = 5;
@@ -3299,6 +3299,7 @@ static struct {
 	    gw_own, gw_cc, stops_sent, starts_ok, starts_err, local5564, muxmap, ups, downs, closes;
 } dst;
 static int pb_state;                    /* 0 none, 1 list out, 2 settings out, 3 ready (exposed), 4 acked */
+static int sweet_wds_autoack = 1;       /* 1157: kern.sweet_wds_autoack; 1 (default) = kernel advances pb_state 3->4 itself (no userland ack); 0 = wait for kern.sweet_wds_profiles_ack */
 static int pb_tries, pb_n;
 static volatile int pb_ack;
 /*
@@ -4294,6 +4295,19 @@ data_poll(uint64_t now)
 			printf("SWEET QMUX: profile backup acknowledged by userland (%d profiles saved): WDS profile writes pass, each logged\n",
 			    pb_n);
 		}
+	}
+	if (sweet_wds_autoack && pb_state == 3) {
+		/*
+		 * 1157: kernel auto-ack of the profile backup. At the instant pb_state
+		 * reaches 3 ("ready"), advance 3->4 ourselves so the held DH_PROF writes
+		 * are released by the loop below (same effect as the userland ack path),
+		 * with no userland step. D2 safety: there is no shared/exported in-kernel
+		 * file-write helper reachable from here, so we do NOT write a .bak file and
+		 * we do NOT clear D->bak -- kern.sweet_wds_profiles_bak stays readable (see
+		 * sysctl_wds_bak) so userland can still save the backup out-of-band.
+		 */
+		pb_state = 4;
+		printf("SWEET QMUX: profile backup auto-acknowledged (autoack)\n");
 	}
 	wda_own_poll(now);              /* 1088 */
 	for (int i = 0; i < D_NHOLD; i++) {
@@ -5986,7 +6000,7 @@ sysctl_wds_bak SYSCTL_HANDLER_ARGS
 	}
 	size_t n;
 	lck_mtx_lock(&bak_lock);
-	if (pb_state == 3) {
+	if (pb_state == 3 || (pb_state == 4 && D->bakn != 0)) {   /* 1157: autoack leaves the backup readable (not cleared) */
 		memcpy(b, D->bak, D->bakn);
 		n = D->bakn;
 	} else {
@@ -6026,6 +6040,29 @@ sysctl_wds_ack SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_profiles_ack, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_ack, "I",
     "redfin 1080: write 1 after saving kern.sweet_wds_profiles_bak: CommCenter's WDS profile writes then pass (EBUSY = not ready)");
+
+static int
+sysctl_wds_autoack SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int v = sweet_wds_autoack, changed = 0;
+	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (proc_suser(req->p) != 0) {
+		return EPERM;
+	}
+	if (v != 0 && v != 1) {
+		return EINVAL;
+	}
+	sweet_wds_autoack = v;
+	printf("SWEET QMUX: kern.sweet_wds_autoack = %d\n", v);
+	sbb_wake();
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_autoack, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_autoack, "I",
+    "redfin 1157: 1 (default) = kernel auto-acknowledges the WDS profile backup (pb_state 3->4) with no userland step; 0 = wait for kern.sweet_wds_profiles_ack");
 
 static int
 sysctl_gate_ids SYSCTL_HANDLER_ARGS
