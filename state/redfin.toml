@@ -20,12 +20,12 @@ note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 a
 
 # What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
 [boot]
-image = "rk25a"
+image = "rk26a"
 base = "r5p3a"
-kernel_dir = "builds/xnu/ws-int-k25-e3c17bc9cf"
-kernel_branch = "ws-int-k25"
-kernel_sha = "e3c17bc9cf"
-kernel_uuid = "8A365F90-6A11-399C-92C4-7BF20EE67C5B"
+kernel_dir = "builds/xnu/ws-int-k26-c46f549be6"
+kernel_branch = "ws-int-k26"
+kernel_sha = "c46f549be6"
+kernel_uuid = "B5318BF9-0D05-300A-9AE6-A51E35C1926E"
 cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13"
 bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2"
 
