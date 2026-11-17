@@ -231,6 +231,28 @@ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display)");
 
+/*
+ * 1163, interim until native AMP/Edge scheduling; remove with the AMP topology work: kern.sweet_ui_rebal MASK
+ * (osfmk/kern/sched_prim.c; boot-arg sweetuirebal=N; default 0 = as before): 1 hold a tagged CA thread (class on in
+ * kern.sweet_ui_bigcore) on the idle big core choose_processor gave it (soft bind for one enqueue), 2 pull a tagged
+ * thread off an A55 when CPU6/7 is about to idle. Line SWEET UI: rebal 5s every 5 s while not 0.
+ */
+extern int sweet_ui_rebal;
+extern int sweet_ui_rebal_set(int value, const char *why);
+static int
+sysctl_sweet_ui_rebal SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_ui_rebal, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	return sweet_ui_rebal_set(value, "sysctl") == 0 ? 0 : EINVAL;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_rebal, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_ui_rebal, "I", "SWEET UI 1163: 1 hold tagged CA threads on the chosen idle big core, 2 pull them off an A55 when CPU6/7 idles (0 off)");
+
 /* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
 static unsigned
 cf_hold_pos(const struct cf_dom *d, int pct)
@@ -706,6 +728,12 @@ void
 sweet_cpufreq_init(void)
 {
 	unsigned want = 1;
+	{
+		int rb = 0;      /* 1163: sweetuirebal=N sets kern.sweet_ui_rebal at boot */
+		if (PE_parse_boot_argn("sweetuirebal", &rb, sizeof(rb)) && sweet_ui_rebal_set(rb, "boot-arg sweetuirebal") != 0) {
+			printf("SWEET UI: sweetuirebal=%d ignored (0..3)\n", rb);
+		}
+	}
 	(void)PE_parse_boot_argn("flamecpufreq", &want, sizeof(want));
 	{
 		/* 0970: sweetgov=XXYY (e.g. 4060), sweetboost=MHZ, sweetboostms=MS */

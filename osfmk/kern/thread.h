@@ -474,6 +474,8 @@ struct thread {
 #define TH_SFLAG_SWEET_UI_RS           0x20000000       /* redfin 1041: named com.apple.coreanimation.render-server* */
 #define TH_SFLAG_SWEET_UI_DISPLAY      0x40000000       /* redfin 1041: named com.apple.coreanimation.display* */
 #define TH_SFLAG_SWEET_UI_MASK         (TH_SFLAG_SWEET_UI_RS | TH_SFLAG_SWEET_UI_DISPLAY)
+#define TH_SFLAG_SWEET_SOFTBIND        0x10000000       /* redfin 1163: bound_processor set by kern.sweet_ui_rebal hold (one enqueue) */
+#define TH_SFLAG_SWEET_PULLED          0x08000000       /* redfin 1163: preempted off an A55 by a kern.sweet_ui_rebal pull */
 #define TH_SFLAG_DEMOTED_MASK      (TH_SFLAG_THROTTLED | TH_SFLAG_FAILSAFE | TH_SFLAG_RT_DISALLOWED)     /* saved_mode contains previous sched_mode */
 
 	int16_t                 sched_pri;              /* scheduled (current) priority */
