@@ -1,0 +1,395 @@
+From c492e892f58b058544bde578d1a2431952a3da2c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 18:42:53 +0100
+Subject: [PATCH] 1164 redfin: app main thread class for kern.sweet_ui_bigcore
+ (default off, interim until AMP)
+
+---
+ bsd/dev/sweet_cpufreq.c    |  16 +++-
+ osfmk/kern/processor.c     |   9 +-
+ osfmk/kern/sched_prim.c    | 170 ++++++++++++++++++++++++++++++++++---
+ osfmk/kern/task_policy.c   |   9 ++
+ osfmk/kern/thread.h        |   2 +
+ osfmk/kern/thread_policy.c |  11 +++
+ 6 files changed, 199 insertions(+), 18 deletions(-)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 38bd3c4..168be61 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -206,9 +206,12 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTL
+  * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; 1046: default 1, was 0): 1 threads named
+  * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
+  * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
+- * normal choice (never waits). 1121: 32 also tags threads named hakios.metal.defer* (hakios-metal HM_DEFER) as display class. Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
++ * normal choice (never waits). 1121: 32 also tags threads named hakios.metal.defer* (hakios-metal HM_DEFER) as display class.
++ * 1164 (interim until AMP): 64 app main class: the main thread of SpringBoard and of the foreground app (darwin role
++ * TASK_FOREGROUND_APPLICATION); setting / clearing the bit tags / untags all tasks at once. Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
+  */
+ extern int sweet_ui_bigcore;
++extern void sweet_ui_appmain_sync(const char *why);   /* 1164: osfmk/kern/sched_prim.c */
+ static int
+ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
+ {
+@@ -218,18 +221,23 @@ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
+ 	if (error || !changed) {
+ 		return error;
+ 	}
+-	if (value < 0 || value > 63) {
++	if (value < 0 || value > 127) {
+ 		return EINVAL;
+ 	}
++	int old = sweet_ui_bigcore;
+ 	sweet_ui_bigcore = value;
+ 	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower; "
+ 	    "1106: 4 display gold / render-server prime first, 8 no preempting the other class, 16 preempt equal priority; "
+-	    "1121: 32 hakios.metal.defer* threads named from now on are display class)\n",
++	    "1121: 32 hakios.metal.defer* threads named from now on are display class; "
++	    "1164: 64 main thread of SpringBoard / the foreground app, after display, before render-server)\n",
+ 	    value);
++	if ((old ^ value) & 64) {
++		sweet_ui_appmain_sync("sysctl");      /* 1164: after the store */
++	}
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display)");
++    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display; 1164: 64 SpringBoard / foreground app main thread)");
+ 
+ /*
+  * 1163, interim until native AMP/Edge scheduling; remove with the AMP topology work: kern.sweet_ui_rebal MASK
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index c6d77ab..dbe5150 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -471,7 +471,14 @@ processor_state_update_from_thread(processor_t processor, thread_t thread, boole
+ 	processor->current_is_eagerpreempt = thread_is_eager_preempt(thread);
+ #if defined(__arm64__)
+ 	/* redfin 1106: the tagged CA class on this CPU (0 none, 1 render-server, 2 display; sched_prim.c choose_processor) */
+-	sweet_ui_cpu_cls[processor->cpu_id] = (uint8_t)((thread->sched_flags & TH_SFLAG_SWEET_UI_MASK) >> 29);
++	{
++		uint32_t sf = thread->sched_flags;
++		uint8_t cls = (uint8_t)((sf & TH_SFLAG_SWEET_UI_MASK) >> 29);
++		if (__improbable(cls == 0 && (sf & TH_SFLAG_SWEET_UI_APPMAIN))) {
++			cls = 3;        /* redfin 1164: app main class (interim until AMP) */
++		}
++		sweet_ui_cpu_cls[processor->cpu_id] = cls;
++	}
+ #endif
+ 	if (pset_lock_held) {
+ 		/* Only update the pset load average when the pset lock is held */
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index dd34ccc..9678787 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -3590,7 +3590,7 @@ thread_dispatch(
+ 					sweet_pace_account(thread, processor);  /* 1114 */
+ 				}
+ 			}
+-			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
++			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_ANY)) {     /* 1164: + app main */
+ 				extern void sweet_ui_account(thread_t thread, processor_t processor);
+ 				sweet_ui_account(thread, processor);    /* 1041 */
+ 			}
+@@ -5083,13 +5083,20 @@ static uint64_t sweet_ui_runs[2][2], sweet_ui_abs[2][2];     /* [class display,
+  * Topology (SM7250, Kryo 475): CPU0-5 silver (A55, 1.8 GHz), CPU6 gold (A76, 2.2 GHz), CPU7 prime (A76, 2.4 GHz); one
+  * clutch pset; sweetgov's touch/frame boost (bsd/dev/sweet_cpufreq.c) holds both the gold and the prime domain.
+  * sweet_ui_cpu_cls[cpu]: the tagged class running on each CPU (processor_state_update_from_thread; 0 none, 1 render-server,
+- * 2 display). Stats per class: placed idle / preempt on CPU6 / CPU7, fallbacks (both big cores busy: at least one with
++ * 2 display; 1164: 3 app main). Stats per class: placed idle / preempt on CPU6 / CPU7, fallbacks (both big cores busy: at least one with
+  * a tagged thread, or both with equal/higher priority), on-CPU ms on gold / prime / little, priority range seen.
+  */
+ volatile uint8_t sweet_ui_cpu_cls[MAX_SCHED_CPUS];
+-static uint32_t sweet_ui_st_cls[2][6];          /* [display, rs][idle6, idle7, pre6, pre7, fb tagged, fb busy] */
+-static uint64_t sweet_ui_abs3[2][3];            /* [display, rs][gold, prime, little] */
+-static int sweet_ui_pri_lo[2] = { 255, 255 }, sweet_ui_pri_hi[2];
++static uint32_t sweet_ui_st_cls[3][6];          /* [display, rs, 1164 app main][idle6, idle7, pre6, pre7, fb tagged, fb busy] */
++static uint64_t sweet_ui_abs3[3][3];            /* [display, rs, 1164 app main][gold, prime, little] */
++static int sweet_ui_pri_lo[3] = { 255, 255, 255 }, sweet_ui_pri_hi[3];
++
++/* sweet_ui_cpu_cls value -> its kern.sweet_ui_bigcore class bit (1 render-server 2, 2 display 1, 1164: 3 app main 64) */
++static inline int
++sweet_ui_cls_bit(uint8_t cls)
++{
++	return cls == 1 ? 2 : (cls == 2 ? 1 : (cls == 3 ? 64 : 0));
++}
+ 
+ void sweet_ui_thread_named(void *uth, const char *name);
+ void
+@@ -5126,10 +5133,13 @@ void sweet_ui_account(thread_t thread, processor_t processor);
+ void
+ sweet_ui_account(thread_t thread, processor_t processor)
+ {
+-	int c = (thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 0 : 1, b = processor->cpu_id >= 6 ? 0 : 1;
++	uint32_t sf = thread->sched_flags;
++	int c = (sf & TH_SFLAG_SWEET_UI_DISPLAY) ? 0 : ((sf & TH_SFLAG_SWEET_UI_RS) ? 1 : 2), b = processor->cpu_id >= 6 ? 0 : 1;
+ 	uint64_t ran = processor->last_dispatch > thread->computation_epoch ? processor->last_dispatch - thread->computation_epoch : 0;
+-	os_atomic_inc(&sweet_ui_runs[c][b], relaxed);
+-	os_atomic_add(&sweet_ui_abs[c][b], ran, relaxed);
++	if (c < 2) {     /* 1164: app main (2) only in sweet_ui_abs3 (SWEET UI: appmain 5s) */
++		os_atomic_inc(&sweet_ui_runs[c][b], relaxed);
++		os_atomic_add(&sweet_ui_abs[c][b], ran, relaxed);
++	}
+ 	os_atomic_add(&sweet_ui_abs3[c][processor->cpu_id == 6 ? 0 : (processor->cpu_id == 7 ? 1 : 2)], ran, relaxed);   /* 1106 */
+ }
+ 
+@@ -5238,6 +5248,106 @@ sweet_pace_set_sb(task_t task)
+ 	return tid;
+ }
+ 
++/*
++ * redfin 1164, interim until native AMP/Edge scheduling; remove with the AMP topology work.
++ * kern.sweet_ui_bigcore bit 64 (default off): a third tag class, "app main" (TH_SFLAG_SWEET_UI_APPMAIN 0x04000000,
++ * sweet_ui_cpu_cls 3): the main thread (the first thread on task->threads, the one exec created) of SpringBoard (p_comm)
++ * and of every task whose effective darwin role is TASK_FOREGROUND_APPLICATION (RunningBoard sets it for the frontmost
++ * app). Trace 2026-11-17: SpringBoard's main thread (builds and commits each frame's layer tree) ran 56-65 % of its time
++ * on A55s, every burst longer than one vsync ran there, and its median burst was 2.75 ms on an A55 vs 0.84 ms on an A76.
++ * Placement (choose_processor, with 1041's block): an idle big core (prime first with bit 4), else preempt a big core
++ * running a lower-priority untagged or render-server thread (never a display-class thread; with bit 8 not the render
++ * server either; bit 16 equal-priority untagged too), else the normal choice. A render-server thread does not preempt an
++ * app main thread while bit 64 is on: order on CPU6/7 is display > app main > render server. 1163 hold / pull apply
++ * (sweet_rebal_cls_on). The flag is set / cleared only by sweet_ui_appmain_task_locked (task locked, then each thread
++ * locked at splsched; it is the only writer of the flag, so reading it under the task lock is exact), called at: an
++ * effective role change into or out of TASK_FOREGROUND_APPLICATION (task_policy_update_internal_locked, task locked),
++ * exec / spawn (task_set_main_thread_qos: new task, its main thread) and every change of bit 64 (sweet_ui_appmain_sync:
++ * all tasks, tasks_threads_lock then each task lock, the order thread_create_internal uses). Each call recomputes the
++ * whole task: its first thread tagged iff bit 64 && task active && (SpringBoard || role foreground app), every other
++ * thread untagged; so a later role change, exec or bit change always leaves no stale flag. Bit 64 off: the role / exec
++ * hooks return at once (the sweep that cleared the bit untagged everything: bit stored before the sweep, both under
++ * the task lock). No string compares in the scheduler; the hot paths only test the flag. Line every 5 s while bit 64
++ * is on (or the 5 s had tag changes): SWEET UI: appmain 5s: ms gold/prime/little ... | tagged N untagged N.
++ */
++static uint32_t sweet_ui_am_tag, sweet_ui_am_untag, sweet_ui_am_printed;
++
++static void
++sweet_ui_appmain_task_locked(task_t task, const char *why, bool sweep)
++{
++	if (task == TASK_NULL || task == kernel_task) {
++		return;
++	}
++	int mode = os_atomic_load(&sweet_ui_bigcore, relaxed);
++	if (!(mode & 64) && !sweep) {
++		return;
++	}
++	void *bp = get_bsdtask_info(task);
++	const char *name = bp != NULL ? proc_name_address((struct proc *)bp) : "?";
++	int role = task->effective_policy.tep_role;
++	bool want = (mode & 64) && task->active && bp != NULL &&
++	    (role == TASK_FOREGROUND_APPLICATION || strncmp(name, "SpringBoard", sizeof("SpringBoard")) == 0);
++	bool first = true;
++	thread_t t;
++	queue_iterate(&task->threads, t, thread_t, task_threads) {
++		bool w = want && first, has = (t->sched_flags & TH_SFLAG_SWEET_UI_APPMAIN) != 0;
++		first = false;
++		if (has == w) {
++			continue;
++		}
++		spl_t s = splsched();
++		thread_lock(t);
++		if (w) {
++			t->sched_flags |= TH_SFLAG_SWEET_UI_APPMAIN;
++		} else {
++			t->sched_flags &= ~TH_SFLAG_SWEET_UI_APPMAIN;
++		}
++		thread_unlock(t);
++		splx(s);
++		os_atomic_inc(w ? &sweet_ui_am_tag : &sweet_ui_am_untag, relaxed);
++		if (os_atomic_inc(&sweet_ui_am_printed, relaxed) <= 8) {       /* at most 8 lines per 5 s (roles may flap) */
++			printf("SWEET UI: %s thread %llu %s (1164 app main: %s, pid %d, role %d, kern.sweet_ui_bigcore %d)\n",
++			    w ? "tagged" : "untagged", thread_tid(t), name, why, task_pid(task), role, mode);
++		}
++	}
++}
++
++/* task_policy_update_internal_locked: effective role into / out of TASK_FOREGROUND_APPLICATION (task locked) */
++void sweet_ui_appmain_role_locked(task_t task);
++void
++sweet_ui_appmain_role_locked(task_t task)
++{
++	sweet_ui_appmain_task_locked(task, "role", false);
++}
++
++/* task_set_main_thread_qos (exec / spawn): task unlocked */
++void sweet_ui_appmain_task(task_t task, const char *why);
++void
++sweet_ui_appmain_task(task_t task, const char *why)
++{
++	task_lock(task);
++	sweet_ui_appmain_task_locked(task, why, false);
++	task_unlock(task);
++}
++
++/* kern.sweet_ui_bigcore bit 64 changed (sysctl, after the store): tag / untag every task's threads */
++void sweet_ui_appmain_sync(const char *why);
++void
++sweet_ui_appmain_sync(const char *why)
++{
++	task_t task;
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		if (task == kernel_task) {
++			continue;
++		}
++		task_lock(task);
++		sweet_ui_appmain_task_locked(task, why, true);
++		task_unlock(task);
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++}
++
+ /*
+  * redfin 1163, interim until native AMP/Edge scheduling; remove with the AMP topology work.
+  * kern.sweet_ui_rebal MASK (bsd/dev/sweet_cpufreq.c; boot-arg sweetuirebal=N; default 0 = exactly as before).
+@@ -5279,7 +5389,8 @@ static uint32_t sweet_rebal_st[8];
+ static inline bool
+ sweet_rebal_cls_on(uint32_t sflags)
+ {
+-	int ui = ((sflags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((sflags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
++	int ui = ((sflags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((sflags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0) |
++	    ((sflags & TH_SFLAG_SWEET_UI_APPMAIN) ? 64 : 0);      /* 1164 */
+ 	return (ui & sweet_ui_bigcore) != 0;
+ }
+ 
+@@ -5391,7 +5502,7 @@ sweet_rebal_idle_pull(processor_t processor)
+ 	bool any = false;
+ 	for (int i = 0; i < 6; i++) {
+ 		uint8_t cls = sweet_ui_cpu_cls[i];      /* 1106: 1 render-server, 2 display (kern.sweet_ui_bigcore bit 2 / 1) */
+-		if (cls != 0 && ((3 - cls) & sweet_ui_bigcore)) {
++		if (cls != 0 && (sweet_ui_cls_bit(cls) & sweet_ui_bigcore)) {      /* 1164: + app main (3) */
+ 			any = true;
+ 		}
+ 	}
+@@ -5415,7 +5526,7 @@ sweet_rebal_idle_pull(processor_t processor)
+ 			processor_t p = processor_array[i];
+ 			uint8_t cls = sweet_ui_cpu_cls[i];
+ 			if (p == PROCESSOR_NULL || p->processor_set != pset || p->state != PROCESSOR_RUNNING || cls == 0 ||
+-			    !((3 - cls) & sweet_ui_bigcore) || p->current_pri >= BASEPRI_RTQUEUES ||
++			    !(sweet_ui_cls_bit(cls) & sweet_ui_bigcore) || p->current_pri >= BASEPRI_RTQUEUES ||
+ 			    bit_test(sweet_rebal_pull_mask, i) || p->last_dispatch > now ||
+ 			    now - p->last_dispatch < sweet_rebal_abs_200us) {
+ 				continue;
+@@ -5468,6 +5579,29 @@ sweet_ui_bigcore_log(void)
+ 	}
+ 	uint32_t pi = sweet_ui_st_idle, pp = sweet_ui_st_preempt, pf = sweet_ui_st_fallback;
+ 	sweet_ui_st_idle = sweet_ui_st_preempt = sweet_ui_st_fallback = 0;
++	{
++		/* 1164: app main class: ms gold/prime/little, placements (also counted in bigcore 5s placed), tag changes */
++		uint64_t am[3], amt = 0;
++		uint32_t ast[6];
++		for (int k = 0; k < 3; k++) {
++			absolutetime_to_nanoseconds(os_atomic_xchg(&sweet_ui_abs3[2][k], 0, relaxed), &am[k]);
++			am[k] /= NSEC_PER_MSEC;
++			amt += am[k];
++		}
++		for (int k = 0; k < 6; k++) {
++			ast[k] = os_atomic_xchg(&sweet_ui_st_cls[2][k], 0, relaxed);
++		}
++		int alo = sweet_ui_pri_lo[2], ahi = sweet_ui_pri_hi[2];
++		sweet_ui_pri_lo[2] = 255;
++		sweet_ui_pri_hi[2] = 0;
++		uint32_t tg = os_atomic_xchg(&sweet_ui_am_tag, 0, relaxed), ut = os_atomic_xchg(&sweet_ui_am_untag, 0, relaxed);
++		os_atomic_store(&sweet_ui_am_printed, 0, relaxed);
++		if (((sweet_ui_bigcore & 64) && amt + ast[0] + ast[1] + ast[2] + ast[3] + ast[4] + ast[5] != 0) || tg + ut != 0) {
++			printf("SWEET UI: appmain 5s: ms gold/prime/little %llu/%llu/%llu | idle 6:%u 7:%u preempt 6:%u 7:%u fallback "
++			    "tagged %u busy %u pri %d-%d | tagged %u untagged %u | mode %#x\n", am[0], am[1], am[2], ast[0], ast[1],
++			    ast[2], ast[3], ast[4], ast[5], alo == 255 ? 0 : alo, ahi, tg, ut, sweet_ui_bigcore);
++		}
++	}
+ 	if (r[0][0] + r[0][1] + r[1][0] + r[1][1] == 0) {
+ 		return;
+ 	}
+@@ -5584,9 +5718,13 @@ choose_processor(
+ 		}
+ 		/* 1041: kern.sweet_ui_bigcore: a tagged CA thread takes an idle big core, else preempts the lower-priority one */
+ 		int ui = ((thread->sched_flags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((thread->sched_flags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
++		if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_UI_APPMAIN)) {
++			ui |= 64;       /* 1164 (interim until AMP): app main class */
++		}
+ 		if (__improbable(ui & sweet_ui_bigcore)) {
+ 			processor_t idle = PROCESSOR_NULL, low = PROCESSOR_NULL;
+-			int mode = sweet_ui_bigcore, c = (ui & 1) ? 0 : 1;     /* 1106: class index (display first) */
++			int mode = sweet_ui_bigcore, uion = ui & mode;
++			int c = (uion & 1) ? 0 : ((uion & 2) ? 1 : 2);        /* 1106: class index (display first); 1164: 2 app main */
+ 			int other = c == 0 ? 1 : 2;                             /* 1106: sweet_ui_cpu_cls value of the other class */
+ 			bool tagged_busy = false;
+ 			int pri = thread->sched_pri;
+@@ -5618,6 +5756,12 @@ choose_processor(
+ 				if ((mode & 8) && running == other) {
+ 					continue;               /* 1106: never kick the other tagged class */
+ 				}
++				if (c == 2 && (running == 2 || ((mode & 8) && running == 1))) {
++					continue;               /* 1164: app main never kicks a display thread (8: nor the render server) */
++				}
++				if (c == 1 && running == 3 && (mode & 64)) {
++					continue;               /* 1164: the render server does not kick an app main thread */
++				}
+ 				bool lower = bp->current_pri < pri || ((mode & 16) && running == 0 && bp->current_pri == pri);
+ 				if (bp->state == PROCESSOR_RUNNING && lower &&
+ 				    !bit_test(pset->pending_AST_URGENT_cpu_mask, bp->cpu_id) &&
+@@ -6283,7 +6427,7 @@ thread_setrun(
+ 		    (uintptr_t)thread_tid(thread), (uintptr_t)-1, processor->cpu_id, processor->state, 0);
+ 		assert((pset_available_cpu_count(pset) > 0) || (processor->state != PROCESSOR_OFF_LINE && processor->is_recommended));
+ #if defined(__arm64__)
+-		if (__improbable(sweet_ui_rebal & 1) && (thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
++		if (__improbable(sweet_ui_rebal & 1) && (thread->sched_flags & TH_SFLAG_SWEET_UI_ANY)) {      /* 1164: + app main */
+ 			extern void sweet_rebal_hold(thread_t thread, processor_t processor, sched_options_t *options);
+ 			sweet_rebal_hold(thread, processor, &options);         /* 1163: pset and thread locked */
+ 		}
+diff --git a/osfmk/kern/task_policy.c b/osfmk/kern/task_policy.c
+index 461c0d9..f9aac47 100644
+--- a/osfmk/kern/task_policy.c
++++ b/osfmk/kern/task_policy.c
+@@ -1279,6 +1279,15 @@ task_policy_update_internal_locked(task_t task, bool in_create, task_pend_token_
+ 		}
+ 	}
+ 
++#if defined(__arm64__)
++	/* redfin 1164 (interim until AMP): kern.sweet_ui_bigcore 64 tags / untags the foreground app's main thread */
++	if (prev.tep_role != next.tep_role &&
++	    (prev.tep_role == TASK_FOREGROUND_APPLICATION || next.tep_role == TASK_FOREGROUND_APPLICATION)) {
++		extern void sweet_ui_appmain_role_locked(task_t task);
++		sweet_ui_appmain_role_locked(task);
++	}
++#endif
++
+ 	/*
+ 	 * Use the app-nap transitions to influence the
+ 	 * transition of the process within the jetsam band
+diff --git a/osfmk/kern/thread.h b/osfmk/kern/thread.h
+index dc60c04..3c96dfd 100644
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -476,6 +476,8 @@ struct thread {
+ #define TH_SFLAG_SWEET_UI_MASK         (TH_SFLAG_SWEET_UI_RS | TH_SFLAG_SWEET_UI_DISPLAY)
+ #define TH_SFLAG_SWEET_SOFTBIND        0x10000000       /* redfin 1163: bound_processor set by kern.sweet_ui_rebal hold (one enqueue) */
+ #define TH_SFLAG_SWEET_PULLED          0x08000000       /* redfin 1163: preempted off an A55 by a kern.sweet_ui_rebal pull */
++#define TH_SFLAG_SWEET_UI_APPMAIN      0x04000000       /* redfin 1164: main thread of SpringBoard / a foreground app (kern.sweet_ui_bigcore 64) */
++#define TH_SFLAG_SWEET_UI_ANY          (TH_SFLAG_SWEET_UI_MASK | TH_SFLAG_SWEET_UI_APPMAIN)
+ #define TH_SFLAG_DEMOTED_MASK      (TH_SFLAG_THROTTLED | TH_SFLAG_FAILSAFE | TH_SFLAG_RT_DISALLOWED)     /* saved_mode contains previous sched_mode */
+ 
+ 	int16_t                 sched_pri;              /* scheduled (current) priority */
+diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
+index 1073c7e..11e5a47 100644
+--- a/osfmk/kern/thread_policy.c
++++ b/osfmk/kern/thread_policy.c
+@@ -2980,6 +2980,17 @@ task_set_main_thread_qos(task_t task, thread_t thread)
+ 	    (IMPORTANCE_CODE(IMP_MAIN_THREAD_QOS, 0)) | DBG_FUNC_END,
+ 	    thread_tid(thread), threquested_0(thread), threquested_1(thread),
+ 	    primordial_qos, 0);
++
++#if defined(__arm64__)
++	{
++		/* redfin 1164 (interim until AMP): kern.sweet_ui_bigcore 64, SpringBoard's / a foreground app's main thread */
++		extern int sweet_ui_bigcore;
++		extern void sweet_ui_appmain_task(task_t task, const char *why);
++		if (__improbable(sweet_ui_bigcore & 64)) {
++			sweet_ui_appmain_task(task, "exec");
++		}
++	}
++#endif
+ }
+ 
+ /*
+-- 
+2.53.0
+
