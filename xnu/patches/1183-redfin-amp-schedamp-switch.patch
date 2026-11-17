@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 22:00:00 +0100
+Subject: [PATCH] 1183 redfin: AMP: build-time scheduler switch SWEET_AMP_SCHED_AMP
+ (0 = Edge, default; 1 = sched_amp as on iOS), sched_amp 5 s klog line
+
+SWEET.h gets SWEET_AMP_SCHED_AMP (default 0: nothing changes for the Edge kernels; the SMP kernel has no
+__ARM_AMP__ and is unaffected). With 1, proc_reg.h no longer defines CONFIG_SCHED_CLUTCH/CONFIG_SCHED_EDGE
+for this MacOSX-target AMP build, so sched_prim.h's SCHED() is sched_amp_dispatch ("amp", sched_amp.c +
+sched_amp_common.c, already compiled in via config_sched_multiq). 1180/1181's Edge code is all under
+CONFIG_SCHED_EDGE and compiles out; kern.sweet_edge_pref stays (reads -1, writes EINVAL).
+sched_amp kernels log "SWEET AMP: scheduler amp, E pset .. P pset .." once after CPU init and every 5 s
+"SWEET AMP: 5s sched_amp busy ms E x P y (cpu6 a cpu7 b) spill n steal m (spill s idle i) rebal r"
+to the klog ring (counters only exist in sched_amp kernels).
+
+---
+diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -2808,6 +2808,27 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_edge_pref, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
+ 
+ #endif /* CONFIG_SCHED_EDGE */
+ 
++#if !CONFIG_SCHED_EDGE && defined(SWEET_AMP)
++/*
++ * redfin 1183: sched_amp kernel (SWEET_AMP_SCHED_AMP): no Edge cluster preference. kern.sweet_edge_pref
++ * stays so tools keep working: reads -1 (= not the Edge scheduler), writes fail with EINVAL.
++ * The scheduler in use: kern.sched ("amp").
++ */
++static int
++sysctl_sweet_edge_pref SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = -1, changed = 0;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	return EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_edge_pref, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_edge_pref, "I", "SWEET AMP 1183: sched_amp kernel, no Edge preference (reads -1, writes EINVAL)");
++#endif /* !CONFIG_SCHED_EDGE && SWEET_AMP (1183) */
++
+ #endif /* __AMP__ */
+ 
+ #if SCHED_HYGIENE_DEBUG
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -87,7 +87,8 @@
+ #if __ARM_AMP__
+ 
+ /* Enable the Edge scheduler for all AS Mac platforms */
+-#if XNU_TARGET_OS_OSX
++/* redfin 1183: not with SWEET_AMP_SCHED_AMP (SWEET.h): then sched_amp, as on iOS (no clutch on AMP) */
++#if XNU_TARGET_OS_OSX && !(defined(SWEET_AMP_SCHED_AMP) && SWEET_AMP_SCHED_AMP)
+ #define CONFIG_SCHED_CLUTCH 1
+ #define CONFIG_SCHED_EDGE   1
+ #endif /* XNU_TARGET_OS_OSX */
+diff --git a/osfmk/kern/sched_amp.c b/osfmk/kern/sched_amp.c
+--- a/osfmk/kern/sched_amp.c
++++ b/osfmk/kern/sched_amp.c
+@@ -521,6 +521,12 @@ sched_amp_steal_thread(processor_set_t pset)
+ 		    (bit_count(pset->recommended_bitmask & pset->cpu_state_map[PROCESSOR_IDLE]) == 0)) {
+ 			thread = run_queue_dequeue(&pset->pset_runq, SCHED_HEADQ);
+ 			KDBG(MACHDBG_CODE(DBG_MACH_SCHED, MACH_AMP_STEAL) | DBG_FUNC_NONE, spill_pending, 0, 0, 0);
++#if defined(SWEET_AMP) && !CONFIG_SCHED_EDGE
++			{       /* 1183 */
++				extern uint64_t sweet_amp_n_steal_spill, sweet_amp_n_steal_idle;
++				os_atomic_inc(spill_pending ? &sweet_amp_n_steal_spill : &sweet_amp_n_steal_idle, relaxed);
++			}
++#endif
+ 			sched_update_pset_load_average(pset, 0);
+ 		}
+ 	}
+@@ -716,9 +722,98 @@ static char *pct_name[] = {
+ 	"PSET_AMP_P"
+ };
+ 
++#if defined(SWEET_AMP) && !CONFIG_SCHED_EDGE
++/*
++ * redfin 1183: sched_amp kernel (SWEET_AMP_SCHED_AMP). Every 5 s to the klog ring:
++ * "SWEET AMP: 5s sched_amp busy ms E x P y (cpu6 a cpu7 b) spill n steal m (spill s idle i) rebal r"
++ * busy ms = sum over the cluster's CPUs of (5 s - idle) from sweet_cpu_idle_abs() (sched_prim.c 0961);
++ * spill = P overloaded, an E core signalled; steal = threads E cores took from the P run queue (after a spill
++ * signal / idle steal); rebal = rebalance IPIs sending spilled threads back from E when a P core idles.
++ */
++#include <kern/thread_call.h>
++
++extern uint64_t sweet_cpu_idle_abs(int cpu);
++extern uint64_t sweet_amp_n_spill, sweet_amp_n_steal_spill, sweet_amp_n_steal_idle, sweet_amp_n_rebal;
++extern int sched_amp_spill_count, sched_amp_idle_steal, sched_amp_spill_steal;
++
++static thread_call_t sweet_amp_tcall;
++static uint64_t sweet_amp_last_t;
++static uint64_t sweet_amp_last_idle[MAX_CPUS];
++static uint64_t sweet_amp_last_n[4];
++
++static void
++sweet_amp_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t dt = now - sweet_amp_last_t;
++	uint64_t busy_e = 0, busy_p = 0;
++	uint64_t cpu_ms[MAX_CPUS] = {0};
++	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
++		uint64_t idle = sweet_cpu_idle_abs(cpu);
++		uint64_t di = idle - sweet_amp_last_idle[cpu];
++		if (sweet_amp_last_t && idle && di <= dt) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(dt - di, &ns);
++			cpu_ms[cpu] = ns / NSEC_PER_MSEC;
++			processor_t pr = processor_array[cpu];
++			if (pr != PROCESSOR_NULL && pr->processor_set != PROCESSOR_SET_NULL) {
++				if (pr->processor_set->pset_cluster_type == PSET_AMP_P) {
++					busy_p += cpu_ms[cpu];
++				} else {
++					busy_e += cpu_ms[cpu];
++				}
++			}
++		}
++		sweet_amp_last_idle[cpu] = idle;
++	}
++	uint64_t n[4] = {
++		os_atomic_load(&sweet_amp_n_spill, relaxed), os_atomic_load(&sweet_amp_n_steal_spill, relaxed),
++		os_atomic_load(&sweet_amp_n_steal_idle, relaxed), os_atomic_load(&sweet_amp_n_rebal, relaxed),
++	};
++	if (sweet_amp_last_t) {
++		uint64_t d[4];
++		for (int i = 0; i < 4; i++) {
++			d[i] = n[i] - sweet_amp_last_n[i];
++		}
++		printf("SWEET AMP: 5s sched_amp busy ms E %llu P %llu (cpu6 %llu cpu7 %llu) spill %llu steal %llu (spill %llu idle %llu) rebal %llu\n",
++		    (unsigned long long)busy_e, (unsigned long long)busy_p,
++		    (unsigned long long)cpu_ms[6 % MAX_CPUS], (unsigned long long)cpu_ms[7 % MAX_CPUS],
++		    (unsigned long long)d[0], (unsigned long long)(d[1] + d[2]), (unsigned long long)d[1],
++		    (unsigned long long)d[2], (unsigned long long)d[3]);
++	}
++	for (int i = 0; i < 4; i++) {
++		sweet_amp_last_n[i] = n[i];
++	}
++	sweet_amp_last_t = now;
++	uint64_t deadline;
++	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(sweet_amp_tcall, deadline);
++}
++
++static void
++sweet_amp_late_init(void)
++{
++	if (sweet_amp_tcall != NULL) {
++		return;
++	}
++	printf("SWEET AMP: scheduler %s, E pset %d (%d cpus) P pset %d (%d cpus), spill_count %d idle_steal %d spill_steal %d\n",
++	    sched_amp_dispatch.sched_name,
++	    ecore_set ? ecore_set->pset_id : -1, ecore_set ? ecore_set->cpu_set_count : 0,
++	    pcore_set ? pcore_set->pset_id : -1, pcore_set ? pcore_set->cpu_set_count : 0,
++	    sched_amp_spill_count, sched_amp_idle_steal, sched_amp_spill_steal);
++	sweet_amp_tcall = thread_call_allocate_with_options(sweet_amp_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
++	uint64_t deadline;
++	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(sweet_amp_tcall, deadline);
++}
++#endif /* SWEET_AMP && !CONFIG_SCHED_EDGE (1183) */
++
+ static void
+ sched_amp_cpu_init_completed(void)
+ {
++#if defined(SWEET_AMP) && !CONFIG_SCHED_EDGE
++	sweet_amp_late_init();  /* 1183: before the cpus= / cpumask= early return */
++#endif
+ 	if (PE_parse_boot_argn("cpus", NULL, 0) || PE_parse_boot_argn("cpumask", NULL, 0)) {
+ 		/* If number of cpus booted is restricted, these asserts may not be true */
+ 		return;
+diff --git a/osfmk/kern/sched_amp_common.c b/osfmk/kern/sched_amp_common.c
+--- a/osfmk/kern/sched_amp_common.c
++++ b/osfmk/kern/sched_amp_common.c
+@@ -89,6 +89,17 @@ int sched_amp_pcores_preempt_immediate_ipi = 1;
+ _Atomic sched_perfctl_class_policy_t sched_perfctl_policy_util = SCHED_PERFCTL_POLICY_DEFAULT;
+ _Atomic sched_perfctl_class_policy_t sched_perfctl_policy_bg = SCHED_PERFCTL_POLICY_DEFAULT;
+ 
++#if defined(SWEET_AMP) && !CONFIG_SCHED_EDGE
++/* redfin 1183: sched_amp event counts for the 5 s klog line (sched_amp.c sweet_amp_tick); relaxed, approximate */
++uint64_t sweet_amp_n_spill;             /* P overloaded: E core signalled to take a P-recommended thread */
++uint64_t sweet_amp_n_steal_spill;       /* E core took a thread from the P run queue after a spill signal */
++uint64_t sweet_amp_n_steal_idle;        /* E core took a thread from the P run queue on its own (idle steal) */
++uint64_t sweet_amp_n_rebal;             /* P core idle: spilled threads on E cores sent back (rebalance IPIs) */
++#define SWEET_AMP_COUNT(c) os_atomic_inc(&(c), relaxed)
++#else
++#define SWEET_AMP_COUNT(c) do { } while (0)
++#endif
++
+ /*
+  * sched_amp_spill_threshold()
+  *
+@@ -261,6 +272,7 @@ sched_amp_check_spill(processor_set_t pset, thread_t thread)
+ 	assert(thread->bound_processor == PROCESSOR_NULL);
+ 
+ 	if (should_spill_to_ecores(pset, thread)) {
++		SWEET_AMP_COUNT(sweet_amp_n_spill);    /* 1183 */
+ 		pset_lock(ecore_set);
+ 
+ 		pset_signal_spill(ecore_set, thread->sched_pri);
+@@ -327,6 +339,7 @@ sched_amp_balance(processor_t cprocessor, processor_set_t cpset)
+ 		    (eprocessor->current_recommended_pset_type == PSET_AMP_P)) {
+ 			ipi_type[eprocessor->cpu_id] = sched_ipi_action(eprocessor, NULL, SCHED_IPI_EVENT_REBALANCE);
+ 			if (ipi_type[eprocessor->cpu_id] != SCHED_IPI_NONE) {
++				SWEET_AMP_COUNT(sweet_amp_n_rebal);    /* 1183 */
+ 				bit_set(ast_processor_map, eprocessor->cpu_id);
+ 				assert(eprocessor != cprocessor);
+ 			}
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -39,6 +39,16 @@
+ #define SWEET_AMP                 1
+ #define SWEET_AMP_FIRST_P         6
+ #define __ARM_AMP__               1
++/*
++ * redfin 1183: scheduler of the AMP kernel (compile time; SCHED() is a direct dispatch table).
++ * 0 (default) = Edge (CONFIG_SCHED_EDGE + clutch, what a MacOSX-target __ARM_AMP__ build gets);
++ * 1 = sched_amp (osfmk/kern/sched_amp.c, the AMP scheduler of non-macOS targets such as iOS 16 on A11):
++ * one global run queue per pset, P-recommended threads spill to E above the P load threshold, E steals
++ * from P. Set to 1 only by patch 1184 (branch ws-amp-schedamp).
++ */
++#ifndef SWEET_AMP_SCHED_AMP
++#define SWEET_AMP_SCHED_AMP       0
++#endif
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8

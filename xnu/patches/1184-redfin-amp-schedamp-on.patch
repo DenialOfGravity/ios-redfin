@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 22:00:00 +0100
+Subject: [PATCH] 1184 redfin: AMP: build this kernel with sched_amp
+ (SWEET_AMP_SCHED_AMP 1; branch ws-amp-schedamp only, drop for Edge)
+
+---
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -38,6 +38,7 @@
+ #define SWEET_AMP                 1
+ #define SWEET_AMP_FIRST_P         6
+ #define __ARM_AMP__               1
++#define SWEET_AMP_SCHED_AMP       1       /* 1184: sched_amp (A/B against Edge), see 1183 below */
+ /*
+  * redfin 1183: scheduler of the AMP kernel (compile time; SCHED() is a direct dispatch table).
+  * 0 (default) = Edge (CONFIG_SCHED_EDGE + clutch, what a MacOSX-target __ARM_AMP__ build gets);
