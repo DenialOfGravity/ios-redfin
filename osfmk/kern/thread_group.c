@@ -1236,6 +1236,21 @@ thread_group_uses_immediate_ipi(struct thread_group *tg)
 	return thread_group_get_id(tg) == THREAD_GROUP_PERF_CONTROLLER && perf_controller_thread_group_immediate_ipi != 0;
 }
 
+#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
+/* redfin 1181: walk every thread group under tg_lock (sched_clutch.c kern.sweet_edge_pref). */
+void sweet_thread_group_foreach(void (*fn)(struct thread_group *, void *), void *arg);
+void
+sweet_thread_group_foreach(void (*fn)(struct thread_group *, void *), void *arg)
+{
+	struct thread_group *tg;
+	lck_mtx_lock(&tg_lock);
+	qe_foreach_element(tg, &tg_queue, tg_queue_chain) {
+		fn(tg, arg);
+	}
+	lck_mtx_unlock(&tg_lock);
+}
+#endif
+
 kern_return_t
 thread_group_iterate_stackshot(thread_group_iterate_fn_t callout, void *arg)
 {

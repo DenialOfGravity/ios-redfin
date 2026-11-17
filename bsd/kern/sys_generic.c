@@ -2787,6 +2787,25 @@ SYSCTL_INT(_kern, OID_AUTO, sched_edge_restrict_bg, CTLFLAG_RW | CTLFLAG_LOCKED,
 extern int sched_edge_migrate_ipi_immediate;
 SYSCTL_INT(_kern, OID_AUTO, sched_edge_migrate_ipi_immediate, CTLFLAG_RW | CTLFLAG_LOCKED, &sched_edge_migrate_ipi_immediate, 0, "Edge Scheduler uses immediate IPIs for migration event based on execution latency");
 
+#if defined(SWEET_AMP)
+/* redfin 1181: Edge cluster preference without CLPC (osfmk/kern/sched_clutch.c) */
+extern int sweet_edge_pref_get(void);
+extern int sweet_edge_pref_set(int v);
+static int
+sysctl_sweet_edge_pref SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int v = sweet_edge_pref_get(), changed = 0;
+	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	return sweet_edge_pref_set(v) ? EINVAL : 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_edge_pref, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_edge_pref, "I", "SWEET AMP 1181: 0 Edge defaults (all E), 1 user FIXPRI/FG/IN/DF prefer P, 2 as 1 + E->P steal/migrate, 3 all user buckets P");
+#endif
+
 #endif /* CONFIG_SCHED_EDGE */
 
 #endif /* __AMP__ */

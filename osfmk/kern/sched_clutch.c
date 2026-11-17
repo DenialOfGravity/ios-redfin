@@ -1128,6 +1128,7 @@ sched_clutch_bucket_init(
  */
 static int sweet_edge_pref = -1;
 static int sweet_edge_pcluster = -1;
+static void sweet_edge_late_init(void);
 
 static uint32_t
 sweet_edge_default_cluster(sched_clutch_t clutch, sched_bucket_t bucket)
@@ -1135,10 +1136,17 @@ sweet_edge_default_cluster(sched_clutch_t clutch, sched_bucket_t bucket)
 	if (sweet_edge_pcluster < 0 || sweet_edge_pref <= 0 || clutch->sc_tg == NULL) {
 		return pset0.pset_cluster_id;
 	}
-	if (bucket == TH_BUCKET_SHARE_UT || bucket == TH_BUCKET_SHARE_BG) {
+	if (sweet_edge_pref < 3 && (bucket == TH_BUCKET_SHARE_UT || bucket == TH_BUCKET_SHARE_BG)) {
 		return pset0.pset_cluster_id;
 	}
-	if (thread_group_get_id(clutch->sc_tg) <= THREAD_GROUP_PERF_CONTROLLER) {
+	/*
+	 * 1181: no tg_id test here. thread_group_create_and_retain() calls sched_clutch_init_with_thread_group()
+	 * before it assigns tg_id (zeroed zone memory: 0 = THREAD_GROUP_SYSTEM), so 1180's
+	 * "id <= THREAD_GROUP_PERF_CONTROLLER" sent every group to the boot cluster. The kernel's reserved
+	 * groups are made in thread_group_init(), long before sched_edge_cpu_init_completed() sets
+	 * sweet_edge_pcluster, so they get the boot cluster above; sweet_edge_apply() fixes up any group later.
+	 */
+	if (thread_group_get_flags(clutch->sc_tg) & THREAD_GROUP_FLAGS_EFFICIENT) {
 		return pset0.pset_cluster_id;
 	}
 	return (uint32_t)sweet_edge_pcluster;
@@ -4874,6 +4882,209 @@ sched_edge_pset_made_schedulable(__unused processor_t processor, processor_set_t
 	}
 }
 
+#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
+/*
+ * redfin 1181: kern.sweet_edge_pref (live; boot-arg sweetedgepref sets the start value, default 1)
+ *   0 Apple's Edge defaults: every bucket of every group prefers the boot cluster (E); E->P edge closed.
+ *   1 the 1180 policy: user groups' FIXPRI/FG/IN/DF buckets prefer P; UT/BG, efficient groups and the
+ *     kernel's reserved groups (id <= THREAD_GROUP_PERF_CONTROLLER) E. E->P edge closed (P->E spill open).
+ *   2 as 1, plus the E->P edge open (migration and steal allowed, weight sweet_edge_ep_weight), so an idle
+ *     A76 may take E-preferring work and an overloaded E cluster may spill to P.
+ *   3 every bucket of every user group prefers P (UT/BG too), E->P edge as 2. Stress / comparison only.
+ * A change rewrites the edge matrix and walks every thread group (sched_edge_tg_preferred_cluster_change(),
+ * running and runnable threads migrated). The walk also runs once on the first 5 s tick after all CPUs
+ * are up (groups made before sched_edge_cpu_init_completed() kept the boot cluster).
+ * klog: "SWEET AMP: edge_pref A -> B ..." on a change; "SWEET AMP: 5s ..." every 5 s with per-cluster busy
+ * ms (sum over the cluster's CPUs, from sweet_cpu_idle_abs()) and the number of user groups whose FG
+ * bucket prefers each cluster.
+ */
+#include <kern/thread_call.h>
+
+extern uint64_t sweet_cpu_idle_abs(int cpu);      /* sched_prim.c (0961) */
+extern void sweet_thread_group_foreach(void (*fn)(struct thread_group *, void *), void *arg);  /* thread_group.c (1181) */
+
+static uint32_t sweet_edge_ep_weight = 0;
+static thread_call_t sweet_edge_tcall;
+static bool sweet_edge_applied;
+static LCK_GRP_DECLARE(sweet_edge_lck_grp, "sweet_edge");
+static LCK_MTX_DECLARE(sweet_edge_mtx, &sweet_edge_lck_grp);
+
+static void
+sweet_edge_policy(struct thread_group *tg, int pref, uint32_t out[TH_BUCKET_SCHED_MAX])
+{
+	uint32_t e = pset0.pset_cluster_id;
+	uint32_t p = (sweet_edge_pcluster >= 0) ? (uint32_t)sweet_edge_pcluster : e;
+	bool user = thread_group_get_id(tg) > THREAD_GROUP_PERF_CONTROLLER &&
+	    !(thread_group_get_flags(tg) & THREAD_GROUP_FLAGS_EFFICIENT);
+	for (sched_bucket_t b = TH_BUCKET_FIXPRI; b < TH_BUCKET_SCHED_MAX; b++) {
+		uint32_t c = e;
+		if (user && pref >= 1) {
+			if (pref >= 3 || (b != TH_BUCKET_SHARE_UT && b != TH_BUCKET_SHARE_BG)) {
+				c = p;
+			}
+		}
+		out[b] = c;
+	}
+}
+
+static void
+sweet_edge_apply_one(struct thread_group *tg, void *arg)
+{
+	int pref = *(int *)arg;
+	uint32_t want[TH_BUCKET_SCHED_MAX];
+	sweet_edge_policy(tg, pref, want);
+	sched_edge_tg_preferred_cluster_change(tg, want,
+	    SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNING | SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNABLE);
+}
+
+struct sweet_edge_count {
+	uint32_t p, e, kern;
+};
+
+static void
+sweet_edge_count_one(struct thread_group *tg, void *arg)
+{
+	struct sweet_edge_count *c = arg;
+	if (thread_group_get_id(tg) <= THREAD_GROUP_PERF_CONTROLLER) {
+		c->kern++;
+		return;
+	}
+	sched_clutch_t clutch = sched_clutch_for_thread_group(tg);
+	uint32_t pc = sched_edge_clutch_bucket_group_preferred_cluster(&clutch->sc_clutch_groups[TH_BUCKET_SHARE_FG]);
+	if (sweet_edge_pcluster >= 0 && pc == (uint32_t)sweet_edge_pcluster) {
+		c->p++;
+	} else {
+		c->e++;
+	}
+}
+
+static void
+sweet_edge_matrix_apply(int pref)
+{
+	if (sweet_edge_pcluster < 0) {
+		return;
+	}
+	spl_t s = splsched();
+	for (int src = 0; src < sched_edge_max_clusters; src++) {
+		processor_set_t sp = pset_array[src];
+		if (sp == PROCESSOR_SET_NULL || sp->pset_type != CLUSTER_TYPE_E) {
+			continue;
+		}
+		pset_lock(sp);
+		for (int dst = 0; dst < sched_edge_max_clusters; dst++) {
+			processor_set_t dp = pset_array[dst];
+			if (dst == src || dp == PROCESSOR_SET_NULL || dp->pset_type != CLUSTER_TYPE_P) {
+				continue;
+			}
+			bool open = (pref >= 2);
+			sched_edge_config_set(src, dst, (sched_clutch_edge){.sce_migration_weight = open ? sweet_edge_ep_weight : 0,
+			    .sce_migration_allowed = open, .sce_steal_allowed = open});
+		}
+		pset_unlock(sp);
+	}
+	splx(s);
+}
+
+/* Called with sweet_edge_mtx held. */
+static struct sweet_edge_count
+sweet_edge_apply_locked(int pref)
+{
+	struct sweet_edge_count c = {0, 0, 0};
+	sweet_edge_matrix_apply(pref);
+	sweet_thread_group_foreach(sweet_edge_apply_one, &pref);
+	sweet_thread_group_foreach(sweet_edge_count_one, &c);
+	sweet_edge_applied = true;
+	return c;
+}
+
+int
+sweet_edge_pref_get(void)
+{
+	return sweet_edge_pref;
+}
+
+int
+sweet_edge_pref_set(int v)
+{
+	if (v < 0 || v > 3) {
+		return -1;
+	}
+	if (sweet_edge_pcluster < 0) {
+		sweet_edge_pref = v;    /* before CPU init: applied by sweet_edge_late_init's first tick */
+		return 0;
+	}
+	lck_mtx_lock(&sweet_edge_mtx);
+	int old = sweet_edge_pref;
+	sweet_edge_pref = v;
+	struct sweet_edge_count c = sweet_edge_apply_locked(v);
+	lck_mtx_unlock(&sweet_edge_mtx);
+	printf("SWEET AMP: edge_pref %d -> %d (1181: E->P edge %s); user tgs FG prefer P %u E %u, kernel tgs %u\n",
+	    old, v, v >= 2 ? "open" : "closed", c.p, c.e, c.kern);
+	return 0;
+}
+
+static uint64_t sweet_edge_last_t;
+static uint64_t sweet_edge_last_idle[MAX_CPUS];
+
+static void
+sweet_edge_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	lck_mtx_lock(&sweet_edge_mtx);
+	if (!sweet_edge_applied) {
+		struct sweet_edge_count c = sweet_edge_apply_locked(sweet_edge_pref);
+		printf("SWEET AMP: edge_pref %d applied after CPU init (1181: P cluster %d, E->P edge %s); user tgs FG prefer P %u E %u, kernel tgs %u\n",
+		    sweet_edge_pref, sweet_edge_pcluster, sweet_edge_pref >= 2 ? "open" : "closed", c.p, c.e, c.kern);
+	}
+	lck_mtx_unlock(&sweet_edge_mtx);
+
+	uint64_t now = mach_absolute_time();
+	uint64_t dt = now - sweet_edge_last_t;
+	uint64_t busy_ms[MAX_CPU_CLUSTERS] = {0};
+	uint64_t cpu_ms[MAX_CPUS] = {0};
+	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+		uint64_t idle = sweet_cpu_idle_abs(cpu);
+		uint64_t di = idle - sweet_edge_last_idle[cpu];
+		if (sweet_edge_last_t && idle && di <= dt) {
+			uint64_t ns;
+			absolutetime_to_nanoseconds(dt - di, &ns);
+			cpu_ms[cpu] = ns / NSEC_PER_MSEC;
+			processor_t pr = processor_array[cpu];
+			if (pr != PROCESSOR_NULL && pr->processor_set != PROCESSOR_SET_NULL &&
+			    pr->processor_set->pset_cluster_id < MAX_CPU_CLUSTERS) {
+				busy_ms[pr->processor_set->pset_cluster_id] += cpu_ms[cpu];
+			}
+		}
+		sweet_edge_last_idle[cpu] = idle;
+	}
+	bool first = (sweet_edge_last_t == 0);
+	sweet_edge_last_t = now;
+	if (!first) {
+		struct sweet_edge_count c = {0, 0, 0};
+		sweet_thread_group_foreach(sweet_edge_count_one, &c);
+		uint32_t pc = (sweet_edge_pcluster >= 0) ? (uint32_t)sweet_edge_pcluster : 0;
+		uint32_t ec = pset0.pset_cluster_id;
+		printf("SWEET AMP: 5s edge_pref %d busy ms E %llu P %llu (cpu6 %llu cpu7 %llu); user tgs FG prefer P %u E %u\n",
+		    sweet_edge_pref, (unsigned long long)busy_ms[ec], (unsigned long long)busy_ms[pc],
+		    (unsigned long long)cpu_ms[6 % MAX_CPUS], (unsigned long long)cpu_ms[7 % MAX_CPUS], c.p, c.e);
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(sweet_edge_tcall, deadline);
+}
+
+static void
+sweet_edge_late_init(void)
+{
+	if (sweet_edge_tcall != NULL) {
+		return;
+	}
+	sweet_edge_tcall = thread_call_allocate_with_options(sweet_edge_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+	uint64_t deadline;
+	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(sweet_edge_tcall, deadline);
+}
+#endif /* CONFIG_SCHED_EDGE && SWEET_AMP (1181) */
+
 /*
  * sched_edge_cpu_init_completed()
  *
@@ -4938,6 +5149,7 @@ sched_edge_cpu_init_completed(void)
 	}
 	kprintf("SWEET AMP: Edge clusters %d, P cluster %d, sweetedgepref %d\n", sched_edge_max_clusters,
 	    sweet_edge_pcluster, sweet_edge_pref);
+	sweet_edge_late_init();
 #endif
 }
 
