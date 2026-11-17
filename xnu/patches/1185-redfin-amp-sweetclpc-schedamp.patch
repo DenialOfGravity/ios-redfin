@@ -19,6 +19,7 @@ sched_amp (SWEET_AMP_SCHED_AMP 1):
  - FREQ's P waiting load: P load average above the recommended P core count.
  - sweet_amp_tick (5 s, sched_amp.c) calls sweet_clpc_tick(); the SWEET CLPC 5 s line prints whenever
    the mask is non-zero and ends "| rec P a E b SMP c (tgs P x E y SMP z) | launch n".
+thread_group.c: sweet_thread_group_foreach (1181) is built for every SWEET_AMP kernel, not only Edge.
 Both: kern.sweet_clpc_launch_ms (default 0 = off; needs FREQ): UI_APP set -> gold/prime need at the top
 step for N ms (0964 caps remain the ceiling), governor kicked from the thread call.
 kern.sweet_clpc* sysctls move out of the CONFIG_SCHED_EDGE block (both schedulers); amp_other/amp_rt read -1
@@ -1855,3 +1856,16 @@ index 93144e3..1f64e73 100644
  extern uint16_t sweet_clpc_wi_create(uint64_t wi_id, uint32_t create_flags, int pid, struct thread_group *tg, bool late);
  extern void sweet_clpc_wi_group(uint32_t create_flags, struct thread_group *tg);
  extern int sweet_clpc_wi_instance(uint16_t slot, int op);
+diff --git a/osfmk/kern/thread_group.c b/osfmk/kern/thread_group.c
+index 898ddd0..343d17c 100644
+--- a/osfmk/kern/thread_group.c
++++ b/osfmk/kern/thread_group.c
+@@ -1236,7 +1236,7 @@ thread_group_uses_immediate_ipi(struct thread_group *tg)
+ 	return thread_group_get_id(tg) == THREAD_GROUP_PERF_CONTROLLER && perf_controller_thread_group_immediate_ipi != 0;
+ }
+ 
+-#if CONFIG_SCHED_EDGE && defined(SWEET_AMP)
++#if defined(SWEET_AMP)     /* 1185: also SweetCLPC (sweet_clpc.c) with sched_amp */
+ /* redfin 1181: walk every thread group under tg_lock (sched_clutch.c kern.sweet_edge_pref). */
+ void sweet_thread_group_foreach(void (*fn)(struct thread_group *, void *), void *arg);
+ void
