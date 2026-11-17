@@ -206,9 +206,12 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gov_framehold, CTLTYPE_INT | CTLFLAG_RW | CTL
  * 1041: kern.sweet_ui_bigcore MASK (osfmk/kern/sched_prim.c, choose_processor; 1046: default 1, was 0): 1 threads named
  * com.apple.coreanimation.display* (backboardd's CA display thread), 2 com.apple.coreanimation.render-server*: an idle
  * big core (CPU6/7, sweetbig order), else preempt the big core running the lowest priority below theirs, else the
- * normal choice (never waits). 1121: 32 also tags threads named hakios.metal.defer* (hakios-metal HM_DEFER) as display class. Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
+ * normal choice (never waits). 1121: 32 also tags threads named hakios.metal.defer* (hakios-metal HM_DEFER) as display class.
+ * 1164 (interim until AMP): 64 app main class: the main thread of SpringBoard and of the foreground app (darwin role
+ * TASK_FOREGROUND_APPLICATION); setting / clearing the bit tags / untags all tasks at once. Line SWEET UI: bigcore 5s every 5 s while tagged threads run (also with 0: baseline).
  */
 extern int sweet_ui_bigcore;
+extern void sweet_ui_appmain_sync(const char *why);   /* 1164: osfmk/kern/sched_prim.c */
 static int
 sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
 {
@@ -218,18 +221,23 @@ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
 	if (error || !changed) {
 		return error;
 	}
-	if (value < 0 || value > 63) {
+	if (value < 0 || value > 127) {
 		return EINVAL;
 	}
+	int old = sweet_ui_bigcore;
 	sweet_ui_bigcore = value;
 	printf("SWEET UI: bigcore %d (1041: 1 CA display threads, 2 render-server threads on CPU6/7: idle, else preempt lower; "
 	    "1106: 4 display gold / render-server prime first, 8 no preempting the other class, 16 preempt equal priority; "
-	    "1121: 32 hakios.metal.defer* threads named from now on are display class)\n",
+	    "1121: 32 hakios.metal.defer* threads named from now on are display class; "
+	    "1164: 64 main thread of SpringBoard / the foreground app, after display, before render-server)\n",
 	    value);
+	if ((old ^ value) & 64) {
+		sweet_ui_appmain_sync("sysctl");      /* 1164: after the store */
+	}
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display)");
+    0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display; 1164: 64 SpringBoard / foreground app main thread)");
 
 /*
  * 1163, interim until native AMP/Edge scheduling; remove with the AMP topology work: kern.sweet_ui_rebal MASK

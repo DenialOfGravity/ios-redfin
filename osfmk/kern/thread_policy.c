@@ -2980,6 +2980,17 @@ task_set_main_thread_qos(task_t task, thread_t thread)
 	    (IMPORTANCE_CODE(IMP_MAIN_THREAD_QOS, 0)) | DBG_FUNC_END,
 	    thread_tid(thread), threquested_0(thread), threquested_1(thread),
 	    primordial_qos, 0);
+
+#if defined(__arm64__)
+	{
+		/* redfin 1164 (interim until AMP): kern.sweet_ui_bigcore 64, SpringBoard's / a foreground app's main thread */
+		extern int sweet_ui_bigcore;
+		extern void sweet_ui_appmain_task(task_t task, const char *why);
+		if (__improbable(sweet_ui_bigcore & 64)) {
+			sweet_ui_appmain_task(task, "exec");
+		}
+	}
+#endif
 }
 
 /*

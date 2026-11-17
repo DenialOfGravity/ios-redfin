@@ -471,7 +471,14 @@ processor_state_update_from_thread(processor_t processor, thread_t thread, boole
 	processor->current_is_eagerpreempt = thread_is_eager_preempt(thread);
 #if defined(__arm64__)
 	/* redfin 1106: the tagged CA class on this CPU (0 none, 1 render-server, 2 display; sched_prim.c choose_processor) */
-	sweet_ui_cpu_cls[processor->cpu_id] = (uint8_t)((thread->sched_flags & TH_SFLAG_SWEET_UI_MASK) >> 29);
+	{
+		uint32_t sf = thread->sched_flags;
+		uint8_t cls = (uint8_t)((sf & TH_SFLAG_SWEET_UI_MASK) >> 29);
+		if (__improbable(cls == 0 && (sf & TH_SFLAG_SWEET_UI_APPMAIN))) {
+			cls = 3;        /* redfin 1164: app main class (interim until AMP) */
+		}
+		sweet_ui_cpu_cls[processor->cpu_id] = cls;
+	}
 #endif
 	if (pset_lock_held) {
 		/* Only update the pset load average when the pset lock is held */

@@ -1279,6 +1279,15 @@ task_policy_update_internal_locked(task_t task, bool in_create, task_pend_token_
 		}
 	}
 
+#if defined(__arm64__)
+	/* redfin 1164 (interim until AMP): kern.sweet_ui_bigcore 64 tags / untags the foreground app's main thread */
+	if (prev.tep_role != next.tep_role &&
+	    (prev.tep_role == TASK_FOREGROUND_APPLICATION || next.tep_role == TASK_FOREGROUND_APPLICATION)) {
+		extern void sweet_ui_appmain_role_locked(task_t task);
+		sweet_ui_appmain_role_locked(task);
+	}
+#endif
+
 	/*
 	 * Use the app-nap transitions to influence the
 	 * transition of the process within the jetsam band
