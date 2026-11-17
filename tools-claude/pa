@@ -47,6 +47,11 @@
 #   pa trace NAME SECS [--swipe pages|cc|none] [--procs LIST] [--app NAME]
 #                             wake the display, record sweettrace (+ Core Animation and hakios-metal events) while
 #                             swiping, pull, analyse -> logs/traces/NAME-*/ report.txt, summary.json, perfetto.json
+#   pa session NAME [SECS] [--chunk S] [--shots S] [--pull auto|live|end] [--no-analyse] [--no-lock]
+#                             free-form UI session recorder (tools-claude/pa-session.sh): you use the phone, it records
+#                             sweettrace in back-to-back chunks, a screenshot every 3 s and the klog (default 180 s; no
+#                             input, no wake/sleep), then session-analyse.py -> logs/sessions/NAME-*/ report.txt/.html
+#   pa session-stop           stop a running session early
 #   pa tidy [AREA...] [--days N] [--apply]
 #                             tools-claude/pa-tidy.py: dry run (default) of what can be archived in images, builds,
 #                             logs, worktrees, scratch; --apply AREA moves (never deletes) to PF/attic/<date> or
@@ -360,6 +365,8 @@ case $act in
 	key) pk "key ${1:?pa key N (0 power, 1 vol+, 2 vol-, 3 home)} ${2:-100}";;
 	perf) pa_perf "$@";;
 	trace) pa_trace "$@";;
+	session) exec bash "$T/pa-session.sh" "$@";;
+	session-stop) touch /tmp/pa-session.stop; echo "stop requested (the session stops its current chunk, pulls and analyses)";;
 	lock) if flock -n /tmp/pa-phone.lock true 2>/dev/null; then echo "phone lock free"; else echo "held: $(cat /tmp/pa-phone.owner 2>/dev/null)"; fi;;
 	*)
 		if [[ $FORWARD == *" $act "* ]]; then queue "$act" "$@"
