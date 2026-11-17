@@ -78,6 +78,8 @@ void sweet_gpu_pool_dump(const char *why);                              /* 1097 
 void sweet_mtl_clients_log(void);                                       /* 1097: below */
 uint64_t sweet_mtl_reuse_drain_all(void);                               /* 1097: below */
 int sweet_mtl_publish(int which);                                       /* 1098: below */
+void sweet_accel_gpustats(int on, uint32_t dev, uint32_t ren, uint32_t til, uint64_t inuse, uint64_t alloc,
+    uint64_t rec);                                                      /* 1159: below */
 extern uint32_t sweet_mtl_drainall;                                     /* 1097: kern.sweet_gpu_pool_drainall (sweet_gpu.c) */
 }
 
@@ -1254,5 +1256,43 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 	}
 #undef V2_IN
 #undef V2_OUT
+}
+
+/*
+ * 1159: kern.sweet_gpustats (bsd/dev/sweet_gpu.c, its thread, once a second): Apple's IOAccelerator
+ * "PerformanceStatistics" on the published service; on = 0 removes it.
+ */
+static void
+sweet_gpustats_num(OSDictionary *d, const char *key, uint64_t v, unsigned bits)
+{
+	OSNumber *n = OSNumber::withNumber(v, bits);
+	if (n) {
+		d->setObject(key, n);
+		n->release();
+	}
+}
+
+void
+sweet_accel_gpustats(int on, uint32_t dev, uint32_t ren, uint32_t til, uint64_t inuse, uint64_t alloc, uint64_t rec)
+{
+	if (sweet_mtl_service == NULL) {
+		return;
+	}
+	if (!on) {
+		sweet_mtl_service->removeProperty("PerformanceStatistics");
+		return;
+	}
+	OSDictionary *d = OSDictionary::withCapacity(8);
+	if (d == NULL) {
+		return;
+	}
+	sweet_gpustats_num(d, "Device Utilization %", dev, 32);
+	sweet_gpustats_num(d, "Renderer Utilization %", ren, 32);
+	sweet_gpustats_num(d, "Tiler Utilization %", til, 32);
+	sweet_gpustats_num(d, "In use system memory", inuse, 64);
+	sweet_gpustats_num(d, "Alloc system memory", alloc, 64);
+	sweet_gpustats_num(d, "recoveryCount", rec, 64);
+	sweet_mtl_service->setProperty("PerformanceStatistics", d);
+	d->release();
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -3081,4 +3081,96 @@ sweet_gpu_timestamp(void)
 {
 	return gpu_ready ? a6_timestamp(&gpu) : 0;
 }
+
+/*
+ * redfin 1159: kern.sweet_gpustats (default 0: no thread, no property, as before). 1: a thread publishes Apple's
+ * IOAccelerator "PerformanceStatistics" dictionary on the SweetAccelerator service once a second (the key Instruments'
+ * GPU track, DTServiceHub graphics/sysmontap, IOAccelMemoryInfo and the Metal HUD read). Utilization = the CP's
+ * per-submit stamp ticks (start..end of each finished submit, 19.2 MHz, summed in dcvs_cp_busy by gpu_stats_locked)
+ * over the window's wall time, 0..100: the time the GPU was executing work (queue wait excluded). Renderer and Tiler =
+ * Device (no per-stage counters). Memory: the GPU pool (in use / total). recoveryCount: GPU resets. 0 again: the
+ * thread idles and the property is removed. The dictionary is built in the thread, never in interrupt context.
+ */
+void sweet_accel_gpustats(int on, uint32_t dev, uint32_t ren, uint32_t til, uint64_t inuse, uint64_t alloc,
+    uint64_t rec);      /* SweetAccelerator.cpp */
+static int gpustats_on;
+static bool gpustats_thread_up;
+static int gpustats_chan;
+
+static void
+gpustats_thread(void *arg, wait_result_t wr)
+{
+#pragma unused(arg, wr)
+	uint64_t last_abs = 0, last_cp = 0;
+	bool published = false;
+	for (;;) {
+		if (!gpustats_on) {
+			if (published) {
+				sweet_accel_gpustats(0, 0, 0, 0, 0, 0, 0);
+				published = false;
+			}
+			last_abs = 0;
+			assert_wait((event_t)&gpustats_chan, THREAD_UNINT);
+			if (!gpustats_on) {
+				thread_block(THREAD_CONTINUE_NULL);
+			} else {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			}
+			continue;
+		}
+		uint64_t cp = last_cp, now;
+		if (gpu_ready) {
+			lck_mtx_lock(&sweet_gpu_lock);
+			gpu_stats_locked();     /* drain the finished submits' stamps */
+			cp = dcvs_cp_busy;
+			lck_mtx_unlock(&sweet_gpu_lock);
+		}
+		now = mach_absolute_time();
+		if (last_abs != 0) {
+			uint64_t ns = 0, ticks, pct;
+			absolutetime_to_nanoseconds(now - last_abs, &ns);
+			ticks = ns * 192 / 10000;       /* 19.2 MHz */
+			pct = ticks ? (cp - last_cp) * 100 / ticks : 0;
+			if (pct > 100) {
+				pct = 100;
+			}
+			uint64_t avail = sweet_gpu_pool_avail();
+			sweet_accel_gpustats(1, (uint32_t)pct, (uint32_t)pct, (uint32_t)pct, gpool_used, gpool_used + avail,
+			    recoveries);
+			published = true;
+		}
+		last_abs = now;
+		last_cp = cp;
+		(void)assert_wait_timeout((event_t)&gpustats_chan, THREAD_UNINT, 1000, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+}
+
+static int
+sysctl_sweet_gpustats SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, gpustats_on, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	if (value && !gpustats_thread_up) {
+		thread_t th;
+		if (kernel_thread_start(gpustats_thread, NULL, &th) != KERN_SUCCESS) {
+			return ENOMEM;
+		}
+		thread_deallocate(th);
+		gpustats_thread_up = true;
+	}
+	gpustats_on = value;
+	thread_wakeup((event_t)&gpustats_chan);
+	printf("SWEET GPU 1159: gpustats %d (PerformanceStatistics %s)\n", value, value ? "published every 1 s" : "removed");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_gpustats, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_gpustats, "I", "SWEET GPU: publish IOAccelerator PerformanceStatistics every 1 s (1159)");
 #endif /* ARM64_BOARD_CONFIG_SWEET */
