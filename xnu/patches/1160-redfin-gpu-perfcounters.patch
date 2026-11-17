@@ -1,0 +1,323 @@
+From 4d61884ef22b7bc1b98cbb3280c8289264de877c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 14:26:29 +0100
+Subject: [PATCH 1/2] 1160 redfin: Adreno performance counters for sweetmon and
+ hakios-metal
+
+kern.sweet_gpuperf_sel (string, default "" = off: no select register written, behaviour unchanged): comma list of
+GROUP:COUNTABLE (CP RBBM PC VFD HLSQ VPC CCU TSE RAS UCHE TP SP RB VSC LRZ CMP, up to 16); each gets its group's
+first free counter slot (CP 0 and SP 0 reserved). The selects and RBBM_PERFCTR_CNTL are written under sweet_gpu_lock
+with GX up, at the write, after the boot power-up and after every GPU recovery. kern.sweet_gpuperf (RO):
+"aon=<CP_ALWAYS_ON_COUNTER> GROUP:COUNTABLE@slot=<value> ..." ("aon=0 gpu=off", values 0, with the GPU down).
+kern.sweet_gpuperf_regs (RO): "GROUP:COUNTABLE@slot=0x<LO dword offset> ..." for CP_REG_TO_MEM.
+---
+ bsd/dev/sweet_gpu.c | 267 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 267 insertions(+)
+
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index b019d01..161bc39 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -31,6 +31,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_time.h>
+ #include <sys/sysctl.h>
++#include <kern/kalloc.h>
+ #include "sweet_a6xx.h"
+ #include "../../iokit/Kernel/arm/SweetDisplayMask.h"
+ #include "../../iokit/Kernel/arm/SweetTrace.h"  /* 0994 */
+@@ -72,6 +73,7 @@ static volatile bool gpu_ready;
+ static int gpu_irq_chan;                /* 0999: fence waiters asleep until the GPU interrupt */
+ static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
+ static LCK_MTX_DECLARE(sweet_gpu_lock, &sweet_gpu_grp);
++static void gpuperf_program_locked(const char *why);     /* 1160: below */
+ 
+ /* ---- environment for sweet_a6xx.c ---- */
+ 
+@@ -422,6 +424,7 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+ 	if (!rc) {
+ 		a6_unmap_high(&gpu);
+ 		gpu_ready = true;
++		gpuperf_program_locked("power-up");     /* 1160: nothing unless kern.sweet_gpuperf_sel is set */
+ 	}
+ 	lck_mtx_unlock(&sweet_gpu_lock);
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+@@ -1000,6 +1003,8 @@ gpu_recover_locked(const char *why)
+ 	if (a6_recover(&gpu)) {
+ 		a6_log("%s: GPU not recovered\n", why);
+ 		gpu_ready = false;
++	} else {
++		gpuperf_program_locked("recovery");     /* 1160: the soft reset lost the selects */
+ 	}
+ 	a6_fence_force(&gpu);
+ 	progress_fence = gpu.fence;
+@@ -3173,4 +3178,266 @@ sysctl_sweet_gpustats SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpustats, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_gpustats, "I", "SWEET GPU: publish IOAccelerator PerformanceStatistics every 1 s (1159)");
++
++/*
++ * ---- redfin 1160: Adreno performance counters for sweetmon and hakios-metal ----
++ * kern.sweet_gpuperf_sel (string, RW, default "" = off: no select register written, nothing programmed, as before):
++ *   comma list of GROUP:COUNTABLE (a6xx group, countable number; names stay on the PC side), up to 16 entries.
++ *   Each entry gets the group's first free counter slot (CP and SP slot 0 stay reserved: the driver's
++ *   CP_PERFCTR_CP_SEL[0] = always count, Mesa's reserved SP 0). Entries past a group's slots, duplicates or unknown
++ *   groups refuse the whole write (EINVAL). "", "off" or "0" = off (selects left as they are).
++ *   The selects and RBBM_PERFCTR_CNTL are written under sweet_gpu_lock with GX up, at the write, after the boot
++ *   power-up and after every GPU recovery (the soft reset loses them). Never from interrupt context.
++ * kern.sweet_gpuperf (string, RO): "aon=<CP_ALWAYS_ON_COUNTER> GROUP:COUNTABLE@slot=<64-bit value> ..."
++ *   (cumulative, decimal); GPU not up: "aon=0 gpu=off" and every value 0.
++ * kern.sweet_gpuperf_regs (string, RO): "GROUP:COUNTABLE@slot=0x<RBBM_PERFCTR_* LO dword offset> ..." (HI = LO + 1),
++ *   the offsets CP_REG_TO_MEM takes, so a command stream can snapshot the same counters.
++ * Offsets: Mesa a6xx.xml / a6xx_perfcntrs.json (A6XX variants).
++ */
++#define GPERF_MAX       16
++struct gperf_group {
++	const char *name;
++	uint16_t sel;           /* *_PERFCTR_*_SEL_0 (dword offset) */
++	uint16_t ctr;           /* RBBM_PERFCTR_<GROUP>_0_LO (dword offset); slot n at ctr + 2n */
++	uint8_t n;              /* slots */
++	uint8_t rsv;            /* slot mask never handed out */
++};
++static const struct gperf_group gperf_groups[] = {
++	{ "CP", 0x08d0, 0x0400, 14, 1 }, { "RBBM", 0x0507, 0x041c, 4, 0 }, { "PC", 0x9e34, 0x0424, 8, 0 },
++	{ "VFD", 0xa610, 0x0434, 8, 0 }, { "HLSQ", 0xbe10, 0x0444, 6, 0 }, { "VPC", 0x9604, 0x0450, 6, 0 },
++	{ "CCU", 0x8e18, 0x045c, 5, 0 }, { "TSE", 0x8610, 0x0466, 4, 0 }, { "RAS", 0x8614, 0x046e, 4, 0 },
++	{ "UCHE", 0x0e1c, 0x0476, 12, 0 }, { "TP", 0xb610, 0x048e, 12, 0 }, { "SP", 0xae10, 0x04a6, 24, 1 },
++	{ "RB", 0x8e10, 0x04d6, 8, 0 }, { "VSC", 0x0cd8, 0x04e6, 2, 0 }, { "LRZ", 0x8618, 0x04ea, 4, 0 },
++	{ "CMP", 0x8e2c, 0x04f2, 4, 0 },
++};
++#define GPERF_NGROUPS   (sizeof(gperf_groups) / sizeof(gperf_groups[0]))
++#define A6_CP_ALWAYS_ON 0x0980
++#define A6_PERFCTR_CNTL 0x0500
++struct gperf_ent {
++	uint8_t grp, slot;
++	uint16_t countable;
++};
++static struct gperf_ent gperf_sel[GPERF_MAX];  /* sweet_gpu_lock */
++static int gperf_n;
++static uint32_t gperf_programs;
++
++static uint64_t
++gperf_rd64(uint32_t lo_off)
++{
++	uint32_t hi = a6_rd(A6_GREG(lo_off + 1)), lo = a6_rd(A6_GREG(lo_off)), hi2 = a6_rd(A6_GREG(lo_off + 1));
++	if (hi2 != hi) {
++		lo = a6_rd(A6_GREG(lo_off));
++	}
++	return (uint64_t)hi2 << 32 | lo;
++}
++
++/* With sweet_gpu_lock: write the selects (nothing when off or the GPU is down). */
++static void
++gpuperf_program_locked(const char *why)
++{
++	if (gperf_n == 0 || !gpu_ready || !a6_gx_up()) {
++		return;
++	}
++	for (int i = 0; i < gperf_n; i++) {
++		const struct gperf_group *g = &gperf_groups[gperf_sel[i].grp];
++		a6_wr(A6_GREG(g->sel + gperf_sel[i].slot), gperf_sel[i].countable);
++	}
++	a6_wr(A6_GREG(A6_PERFCTR_CNTL), 1);
++	gperf_programs++;
++	printf("SWEET GPU 1160: %d perf counter selects programmed (%s, #%u)\n", gperf_n, why, gperf_programs);
++}
++
++/* "GROUP:COUNTABLE@slot" for entry i */
++static int
++gperf_name(char *s, size_t cap, const struct gperf_ent *e)
++{
++	return snprintf(s, cap, "%s:%u@%u", gperf_groups[e->grp].name, e->countable, e->slot);
++}
++
++static int
++gperf_parse(const char *s, struct gperf_ent *out, int *nout)
++{
++	int n = 0;
++	uint32_t used[GPERF_NGROUPS];
++	for (unsigned g = 0; g < GPERF_NGROUPS; g++) {
++		used[g] = gperf_groups[g].rsv;
++	}
++	while (*s == ' ' || *s == ',') {
++		s++;
++	}
++	if (*s == 0 || !strcmp(s, "off") || !strcmp(s, "0")) {
++		*nout = 0;
++		return 0;
++	}
++	while (*s) {
++		char gname[8];
++		size_t gl = 0;
++		while (*s && *s != ':' && *s != ',' && *s != ' ') {
++			if (gl + 1 >= sizeof(gname)) {
++				return EINVAL;
++			}
++			char c = *s++;
++			gname[gl++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
++		}
++		gname[gl] = 0;
++		if (*s++ != ':') {
++			return EINVAL;
++		}
++		unsigned g;
++		for (g = 0; g < GPERF_NGROUPS && strcmp(gname, gperf_groups[g].name); g++) {
++		}
++		if (g == GPERF_NGROUPS) {
++			printf("SWEET GPU 1160: unknown counter group '%s'\n", gname);
++			return EINVAL;
++		}
++		uint32_t v = 0, digits = 0, base = 10;
++		if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++			base = 16;
++			s += 2;
++		}
++		for (;; s++) {
++			uint32_t d;
++			if (*s >= '0' && *s <= '9') {
++				d = (uint32_t)(*s - '0');
++			} else if (base == 16 && *s >= 'a' && *s <= 'f') {
++				d = (uint32_t)(*s - 'a' + 10);
++			} else if (base == 16 && *s >= 'A' && *s <= 'F') {
++				d = (uint32_t)(*s - 'A' + 10);
++			} else {
++				break;
++			}
++			v = v * base + d;
++			if (v > 0x3ff) {
++				return EINVAL;
++			}
++			digits++;
++		}
++		if (!digits || (*s && *s != ',' && *s != ' ')) {
++			return EINVAL;
++		}
++		for (int i = 0; i < n; i++) {
++			if (out[i].grp == g && out[i].countable == v) {
++				printf("SWEET GPU 1160: %s:%u selected twice\n", gname, v);
++				return EINVAL;
++			}
++		}
++		if (n == GPERF_MAX) {
++			printf("SWEET GPU 1160: more than %d counters\n", GPERF_MAX);
++			return EINVAL;
++		}
++		unsigned slot;
++		for (slot = 0; slot < gperf_groups[g].n && (used[g] & (1u << slot)); slot++) {
++		}
++		if (slot == gperf_groups[g].n) {
++			printf("SWEET GPU 1160: no free %s counter for %u (%u slots)\n", gname, v, gperf_groups[g].n);
++			return EINVAL;
++		}
++		used[g] |= 1u << slot;
++		out[n].grp = (uint8_t)g;
++		out[n].slot = (uint8_t)slot;
++		out[n].countable = (uint16_t)v;
++		n++;
++		while (*s == ' ' || *s == ',') {
++			s++;
++		}
++	}
++	*nout = n;
++	return 0;
++}
++
++static int
++sysctl_sweet_gpuperf_sel SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[256];
++	int o = 0, changed = 0;
++	s[0] = 0;
++	lck_mtx_lock(&sweet_gpu_lock);
++	for (int i = 0; i < gperf_n && o < (int)sizeof(s) - 16; i++) {
++		o += snprintf(s + o, sizeof(s) - (size_t)o, "%s%s:%u", i ? "," : "", gperf_groups[gperf_sel[i].grp].name,
++		    gperf_sel[i].countable);
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	int e = sysctl_io_string(req, s, sizeof(s), 0, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	struct gperf_ent ne[GPERF_MAX];
++	int nn = 0;
++	e = gperf_parse(s, ne, &nn);
++	if (e) {
++		return e;
++	}
++	lck_mtx_lock(&sweet_gpu_lock);
++	memcpy(gperf_sel, ne, sizeof(ne[0]) * (size_t)nn);
++	gperf_n = nn;
++	gpuperf_program_locked("sysctl");
++	lck_mtx_unlock(&sweet_gpu_lock);
++	if (!nn) {
++		printf("SWEET GPU 1160: perf counters off (selects left as they were)\n");
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpuperf_sel, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweet_gpuperf_sel, "A", "redfin 1160: Adreno perf counters, GROUP:COUNTABLE,... (max 16; empty = off)");
++
++static int
++sysctl_sweet_gpuperf SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 1024;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	uint64_t v[GPERF_MAX], aon = 0;
++	struct gperf_ent ent[GPERF_MAX];
++	lck_mtx_lock(&sweet_gpu_lock);
++	bool on = gpu_ready && a6_gx_up();
++	int n = gperf_n;
++	memcpy(ent, gperf_sel, sizeof(ent[0]) * (size_t)n);
++	if (on) {
++		aon = gperf_rd64(A6_CP_ALWAYS_ON);
++	}
++	for (int i = 0; i < n; i++) {
++		v[i] = on ? gperf_rd64(gperf_groups[ent[i].grp].ctr + 2u * ent[i].slot) : 0;
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	int o = snprintf(s, cap, "aon=%llu%s", aon, on ? "" : " gpu=off");
++	for (int i = 0; i < n && o < (int)cap - 48; i++) {
++		s[o++] = ' ';
++		o += gperf_name(s + o, cap - (size_t)o, &ent[i]);
++		o += snprintf(s + o, cap - (size_t)o, "=%llu", v[i]);
++	}
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpuperf, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_sweet_gpuperf,
++    "A", "redfin 1160: aon=<CP_ALWAYS_ON_COUNTER> GROUP:COUNTABLE@slot=<value> ... (gpu=off: all 0)");
++
++static int
++sysctl_sweet_gpuperf_regs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[512];
++	int o = 0;
++	s[0] = 0;
++	lck_mtx_lock(&sweet_gpu_lock);
++	for (int i = 0; i < gperf_n && o < (int)sizeof(s) - 32; i++) {
++		if (i) {
++			s[o++] = ' ';
++		}
++		o += gperf_name(s + o, sizeof(s) - (size_t)o, &gperf_sel[i]);
++		o += snprintf(s + o, sizeof(s) - (size_t)o, "=0x%x",
++		    gperf_groups[gperf_sel[i].grp].ctr + 2u * gperf_sel[i].slot);
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpuperf_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweet_gpuperf_regs, "A", "redfin 1160: GROUP:COUNTABLE@slot=0x<LO dword offset> ... (HI = LO + 1)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.53.0
+
