@@ -1,0 +1,29 @@
+PREFLIGHT (owner rule, 2026-11-14): learn the phone's state BEFORE every test block and after every boot/restart.
+Never assume a patch, a boot-time setting or a fallback from an earlier step still holds.
+1. Send the one-line request in tools-claude/preflight.req.txt (copy it into agent/inbox/NAME.req) and save the answer with the test results.
+2. Compare with what the test expects: kernel uuid = the kernel you booted; FALLBACK has no backboardd/SpringBoard line;
+   BACKEND lines name the backend you intend to measure and the pids match PS; HASH = the build you installed; SYS values = the values the test assumes.
+3. If anything differs: stop, report the difference, and either put the phone into the intended state explicitly or relabel the test. Do not continue on the assumption.
+4. State that resets at boot (runtime sysctls, scanout gate mode) must be set explicitly after each boot when a test needs it, and read back.
+5. A crash loop from any cause can trip a process to SweetMetal2 and the trip survives reboots (file m2-fallback): check it after every crash, reboot or kernel change.
+
+PRE-BENCHMARK CHECKLIST (added 2026-11-14 y1114 after the int5 R1-S2 rows turned out to measure a black screen)
+fpsbench counts kernel swaps ("SWEET FB: shown" + "SCANOUT latched"); it cannot tell whether anything was drawn. Before any fpsbench run:
+6. Preflight saved (step 1) within the last 2 minutes, after the last restart.
+7. Display ON: last "SWEET FB: display on/off" line in a fresh klog (or `poke p disp`) says on. Only then use `poke key 0 100`, which TOGGLES.
+8. CoreAnimation is drawing: WITH THE DISPLAY ON for >= 10 s (it reads 0 while the display is off), tools-claude/prebench.req.txt
+   (one request) gives XRFB_10S = 0. Any non-zero count = backboardd's
+   framebuffer is 'b3a8' (RGB10A8_2P_XR10) and QuartzCore draws nothing ("Unexpected framebuffer format b3a8"): STOP, the screen is black.
+   Same fact in the klog: after the newest "exec backboardd" the "SWEET SURF: backboardd surface N (fmt 0x42475241 bpr 4608): scanout slot K"
+   lines must be there; "fmt 0x62336138 bpr 5696 ... no slot" = the broken state. SCANOUT 5s lines must show "latched" > 0 when touched,
+   not only "nonslot ... | panel buffer".
+9. Screenshot (fb-shot.py --where, then the buffer it names) classified page1 (or the screen the test starts from), never dark:*:LUM<25.
+   Look at the PNG once per session. An 897-byte PNG is all black.
+10. The SpringBoard is unlocked and on home page 1 (screenshot class page1). fpsbench rows whose chk pages / chk cc column is "fail" or
+   "dark:*" are INVALID: discard them, do not quote them (R1-S2 of 2026-11-14 are invalid).
+11. Cross-check while it runs: "SWEET GPU: 5s" must show backboardd submits roughly equal to frames (int4: ~25% busy, ~8 ms/frame while
+   swiping). GPU busy < 2% with fps > 30 = nothing is being rendered.
+12. (g1115) Note the STATUS BAR state with every benchmark block (screenshot): cellular signal bars vs no-service dots / Wi-Fi icon.
+   A cold boot has bars; any SpringBoard restart (incl. every backboardd restart) leaves dots and no Wi-Fi icon (SpringBoard does
+   not get telephony status back). With bars, Settings scrolling is ~8 fps slower (k2 KC1 23.2 vs KS1 30.9) and 'fps all' ~3 lower.
+   Rows from the two states are not comparable: label them (cold/bars vs restart/dots).

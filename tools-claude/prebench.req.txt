@@ -1,0 +1,1 @@
+phone sh -c 'N=$(date +%s); echo XRFB_10S: $(/var/local/bin/oslogshow $((N-10)) $N backboardd | /var/local/tools/bin/grep -c "Unexpected framebuffer format"); date'

@@ -1,16 +1,17 @@
 #!/bin/bash
 # phone-agent: lets Claude drive the phone from this WSL session through the shared project folder.
 #
-# Start once per session, in WSL:   bash /mnt/c/ClaudeProjects/iOS_Pixel5/tools-claude/phone-agent.sh
+# Start once per session, in WSL:   bash /mnt/d/ClaudeProjects/iOS_Pixel5/tools-claude/phone-agent.sh
 # (asks for your sudo password once, for the USB network; Ctrl-C stops it).
 #
-# Claude writes one request per file into  C:\ClaudeProjects\iOS_Pixel5\agent\inbox\NAME.req  and
+# Claude writes one request per file into  D:\ClaudeProjects\iOS_Pixel5\agent\inbox\NAME.req  and
 # reads the answer from  agent\outbox\NAME.out. Only the actions below exist; there is no general
 # shell. Nothing here flashes anything: images are only ever started from RAM (fastboot boot), and
 # the file server has no delete.
 #
 #   status                     usbipd list, fastboot/adb devices, the phone's USB network
 #   attach                     usbipd attach --wsl for the phone (iOS USB Ethernet, fastboot, TWRP adb)
+#   netifs                     phone-MAC interfaces, counters, routes; net-use IFC: 192.168.7.1 only on IFC
 #   net                        USB network up (192.168.7.1) and the live kernel log -> logs/live-*.txt
 #   boot NAME                  fastboot boot NAME/redfin-NAME.img (checked against its .sha256)
 #   boot-twrp                  fastboot boot twrp-3.7.0_11-0-redfin.img
@@ -34,6 +35,8 @@
 #                              and EEPROM data are inside the sensormodule files: tools/redfin-camsensor.py -a.)
 #   twrp-pull-qol              TWRP: BT firmware (crbtfw/crnv), CS35L41/rt5514 firmware, /vendor/etc/bluetooth + audio xml,
 #                              the persist partition (sensor/camera/audio calibration), camera com.qti.tuned, BT DT nodes -> recon/fw-qol
+#   twrp-pull-venus            TWRP: /vendor/firmware/venus.mdt + venus.b0* (read only) -> recon/fw/venus
+#   twrp-pull-ipa              TWRP: /vendor/firmware/ipa_fws.* (read only) -> recon/fw/ipa
 #   twrp-pull-log              TWRP: the last 8 MiB of userdata (holds the persistent kernel log; read only) -> logs/sweetlog-<time>.bin
 #   git-pull                   git pull in the repo
 #   reload                     start this script again (after Claude updated it)
@@ -59,8 +62,23 @@
 #                              (copy in logs/cycle-NAME-klog.txt, panic/CRASH counts) -> CHECK run on the phone over SSH.
 #                              Log logs/cycle-NAME-*.log with the time of every stage; last line "cycle result ok|FAILED".
 #                              While it runs, boot/to-fastboot/boot-twrp requests are refused.
-#   cycle-status               the running/last cycle: alive?, the end of its log
+#   cycle-status               the running/last cycle, short: alive?, current stage; when done the stage times, result,
+#                              klog counts and the CHECK's last 3 lines (<= ~20 lines). cycle-log: the old 30-line tail
+#   cycle-wait [S]             block up to S s (default 150, max 170) until the cycle ends, then
+#                              print what cycle-status prints. One call instead of several polls.
 #   cycle-stop                 stop at the next stage boundary (never inside fastboot boot); cycle-kill: at once
+#
+# Phone state (ws-tools-state: tools/state.py + state/redfin.toml in git; copy in tools-claude/state.py):
+#   state diff [--json]        the phone vs the manifest: drift report (expected last line "state diff: no drift ...")
+#   state apply [--dry-run] [--retire]   install exactly the drifted files/flags, set sysctls, restart only the named
+#                              processes, re-dump and verify; never reboots or flashes (refused while a cycle runs)
+#   state snapshot [LABEL]     dated dump + diff -> state/snapshots/ (+ the line for the status doc)
+#   state dump PATH            one raw dump (phone/tools/sweetstate.sh over ssh stdin) -> PATH in the project folder
+#   state set KEY VALUE --temp | state revert KEY|all   experiment overrides, recorded in state/temp-overrides.json
+#   state put LOCAL REMOTE [MODE] --temp   experiment file install (atomic; old -> REMOTE.st-prev); revert file:REMOTE
+#   state promote KEY --manifest FILE      write a temp override into a manifest file (then commit it)
+#   state summary | state index | state adopt --out PATH
+#                              (manifest: state/manifest-ref.txt, e.g. git:origin/main:state/redfin.toml; --manifest X)
 #
 # sweetmon (live monitor; tools-claude/sweetmon/README.md; dashboard http://localhost:8765/):
 #   mon-start / mon-stop / mon-status   the collector (tools-claude/sweetmon/collector.py, log logs/mon/collector.log;
@@ -74,12 +92,12 @@
 #   build-env                  what the build host has (cores, memory, disk, toolchain, SDKs)
 #   build-apt                  sudo apt-get install the fixed package list below (the only step that uses sudo)
 #   build-setup STEP           background: lb.sh setup STEP  (toolchain into ~/redfin-build/toolchain)
-#   build TARGET [REF]         background: lb.sh build TARGET REF  (TARGET shim|userland|metal2|xnu, REF a branch
+#   build TARGET [REF]         background: lb.sh build TARGET REF  (TARGET shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu, REF a branch
 #                              or commit of DenialOfGravity/ios-flame-redfin, default redfin-qol)
 #   build-jobs                 running local builds;   build-kill  stops them all
 #   build-diag                 run localbuild/diag.sh (a throwaway inspection script Claude writes; foreground)
 set -uo pipefail
-P=/mnt/c/ClaudeProjects/iOS_Pixel5
+P=/mnt/d/ClaudeProjects/iOS_Pixel5
 REPO=${REPO:-$HOME/ios-redfin}
 IN=$P/agent/inbox OUT=$P/agent/outbox
 mkdir -p "$IN" "$OUT" "$P/logs"
@@ -88,10 +106,13 @@ USBIPD=$(command -v usbipd.exe || ls "/mnt/c/Program Files/usbipd-win/usbipd.exe
 FB=$(command -v fastboot.exe || command -v fastboot || true)
 ADB=$(command -v adb.exe || command -v adb || true)
 
+# PA_LIB=1 (set by tools-claude/pa): load the functions and run() only; no sudo, no background jobs, no loop.
+if [ -z "${PA_LIB:-}" ]; then
 echo "phone-agent: repo $REPO, fastboot ${FB:-none}, adb ${ADB:-none}, usbipd ${USBIPD:-none}"
 sudo -v || { echo "need sudo for the USB network"; exit 1; }
 ( while sleep 50; do sudo -n true 2>/dev/null || exit; done ) &
 KEEP=$!
+fi
 LIVEPIDF=/tmp/phone-agent-live.pid
 
 live_running() { [ -f $LIVEPIDF ] && kill -0 "$(cat $LIVEPIDF)" 2>/dev/null; }
@@ -136,23 +157,40 @@ auto_usb() {
 				"$USBIPD" attach --wsl --busid "$b" 2>&1 | tr -d '\r' | head -2
 			done
 		fi
+		# 2026-11-05: a usbipd re-attach leaves the old port's interface behind with the same MAC; only the
+		# newest one (highest ifindex) is the live phone, so 192.168.7.1 goes there and off the others
+		# (address flush only: "ip link set down" on a dead usbip port hung the agent).
+		ifc=; best=-1
 		for d in /sys/class/net/*; do
 			[[ $(cat "$d/address" 2>/dev/null) == 02:00:5e:77:ee:01 ]] || continue
-			ifc=${d##*/}
+			i=$(cat "$d/ifindex" 2>/dev/null || echo 0)
+			[ "$i" -gt "$best" ] && { best=$i; ifc=${d##*/}; }
+		done
+		if [ -n "$ifc" ]; then
+			for d in /sys/class/net/*; do
+				[[ $(cat "$d/address" 2>/dev/null) == 02:00:5e:77:ee:01 ]] || continue
+				o=${d##*/}
+				[ "$o" = "$ifc" ] && continue
+				if ip -4 addr show dev "$o" | grep -q 192.168.7.1/; then
+					timeout 5 sudo -n ip addr flush dev "$o"; echo "$(date +%T) auto: $o is stale, address removed"
+				fi
+			done
 			if ! ip -4 addr show dev "$ifc" | grep -q 192.168.7.1/; then
 				sudo -n ip addr flush dev "$ifc"; sudo -n ip addr add 192.168.7.1/24 dev "$ifc"; sudo -n ip link set "$ifc" up
 				echo "$(date +%T) auto: $ifc up (192.168.7.1)"
 			fi
 			live_start
 			mon_start >/dev/null
-		done
+		fi
 		sleep 3
 	done
 }
+if [ -z "${PA_LIB:-}" ]; then
 auto_usb &
 AUTO=$!
 mon_start
 trap 'kill $KEEP $AUTO 2>/dev/null; live_running && kill "$(cat $LIVEPIDF)"; mon_running && kill "$(cat $MONPIDF)"; echo "phone-agent: stopped"; exit 0' INT TERM
+fi
 
 attach() {
 	[ -n "$USBIPD" ] || { echo "no usbipd.exe"; return 1; }
@@ -177,6 +215,29 @@ net() {
 	echo "$ifc up"
 	ping -c 2 -W 2 192.168.7.2
 	live_start
+}
+
+# netifs: every interface with the phone's MAC (a usbipd re-attach can leave a stale one holding 192.168.7.1),
+# their counters and the routes; net-use IFC: 192.168.7.1 only on IFC, flushed from the other phone interfaces.
+netifs() {
+	for d in /sys/class/net/*; do
+		[[ $(cat "$d/address" 2>/dev/null) == 02:00:5e:77:ee:01 ]] || continue
+		ip -s -4 addr show dev "${d##*/}" 2>/dev/null | head -3
+		echo "  rx $(cat $d/statistics/rx_packets) tx $(cat $d/statistics/tx_packets) oper $(cat $d/operstate) carrier $(cat $d/carrier 2>/dev/null)"
+	done
+	ip route | grep 192.168.7
+	ip neigh | grep 192.168.7
+}
+net_use() {
+	[ -e "/sys/class/net/$1" ] || { echo "no interface $1"; return 1; }
+	for d in /sys/class/net/*; do
+		[[ $(cat "$d/address" 2>/dev/null) == 02:00:5e:77:ee:01 ]] || continue
+		[ "${d##*/}" = "$1" ] && continue
+		timeout 5 sudo -n ip addr flush dev "${d##*/}"; echo "${d##*/} address flushed"
+	done
+	sudo -n ip addr flush dev "$1"; sudo -n ip addr add 192.168.7.1/24 dev "$1"; sudo -n ip link set "$1" up
+	sudo -n ip neigh flush dev "$1" 2>/dev/null
+	echo "$1 up"; ping -c 2 -W 2 192.168.7.2
 }
 
 # fastboot.exe / adb.exe (Windows) take Windows paths
@@ -214,6 +275,20 @@ CYCPID=/tmp/phone-agent-cycle.pid CYCLOG=/tmp/phone-agent-cycle.log CYCSTOP=/tmp
 cycle_running() { [ -f $CYCPID ] && kill -0 "$(cat $CYCPID)" 2>/dev/null; }
 phone_up() { ping -c 1 -W 2 192.168.7.2 >/dev/null 2>&1; }
 fb_here() { [ -n "$FB" ] && timeout 10 "$FB" devices 2>/dev/null | grep -q fastboot; }
+cy_brief() {	# short cycle-status: <= ~20 lines
+	[ -f $CYCLOG ] || { echo "no cycle started by this agent"; return 0; }
+	local log; log=$(cat $CYCLOG)
+	if cycle_running; then
+		echo "running: $(grep '^\[.*\] == ' "$log" | tail -1 | sed 's/^\[\(.*\)\] == \(.*\)/stage \2 since \1/') (now $(date +%T))"
+		grep -m1 -E 'phone answers|already in fastboot' "$log"
+		return 0; fi
+	echo "done: ${log#$P/}"
+	sed -n '/^stage times:/,$p' "$log" | grep -v '^cycle result' | tr -s ' ' | paste -sd' ' | cut -c1-200
+	grep -m1 -E '^klog PA' "$log" | sed 's/ -> [^:]*//'
+	grep -E 'panic\(|CRASH' "$log" | grep -v '^klog PA' | head -3 | cut -c1-160
+	sed -n '/] == check/,/^(check exit/p' "$log" | grep -v '] == check' | tail -4
+	tail -1 "$log"
+}
 cycle_job() {	# NAME SRC BASE CLFILE SETTLE CHECK   (runs in a background subshell; output -> its log)
 	local name=$1 src=$2 base=$3 cl=$4 settle=$5 check=$6 kdir="" t_all t_b n pa blog kl
 	t_all=$(date +%s); CUR=""; CST=0; STAGES=()
@@ -280,8 +355,8 @@ cycle_job() {	# NAME SRC BASE CLFILE SETTLE CHECK   (runs in a background subshe
 		(cd "$REPO" && timeout 300 python3 "$P/tools-claude/klog.py" "$pa") 2>&1 | tail -2
 		kl=$P/logs/cycle-$name-klog.txt
 		cp -f "$P/logs/klog.txt" "$kl" 2>/dev/null && {
-			echo "klog PA $pa -> ${kl#$P/}: panic $(grep -c -i panic "$kl"), CRASH $(grep -c CRASH "$kl"), watchdog $(grep -c -i watchdog "$kl")"
-			grep -m6 -E -i 'panic|CRASH' "$kl" | cut -c1-200; }
+			echo "klog PA $pa -> ${kl#$P/}: panic $(grep -c 'panic(' "$kl"), CRASH $(grep -c CRASH "$kl"), watchdog $(grep -c -i watchdog "$kl")"
+			grep -m3 -E 'panic\(|CRASH' "$kl" | cut -c1-160; }
 	else echo "no KLOG_PA.txt in $kdir: klog skipped"; fi
 
 	if [ -n "$check" ]; then
@@ -291,7 +366,31 @@ cycle_job() {	# NAME SRC BASE CLFILE SETTLE CHECK   (runs in a background subshe
 	cy_end ok
 }
 
-run() {	# one request line
+# Phone lock (shared by this agent and tools-claude/pa): actions that drive the screen or the boot state take
+# /tmp/pa-phone.lock so that two of them never overlap; everything else runs at once. PA_LOCK_WAIT s (default 900).
+PHONE_LOCKED_ACTIONS=" boot boot-twrp to-fastboot adb-to-fastboot fb-reboot-bootloader fpsbench poke install-audio "
+run() {	# one request line, under the phone lock when it needs one
+	local a s; read -r a s _ <<<"$1"
+	# state changes on the phone (apply/set/revert/put) take their own lock: one writer at a time
+	if [[ $a == state && $s =~ ^(apply|set|revert|put)$ && -z ${PA_HAVE_SLOCK:-} ]]; then
+		(
+			flock -w "${PA_LOCK_WAIT:-900}" 8 || { echo "state busy: $(cat /tmp/pa-state.owner 2>/dev/null)"; exit 75; }
+			echo "pid $$/$BASHPID '$1' since $(date +%T)" > /tmp/pa-state.owner
+			PA_HAVE_SLOCK=1 run_action "$1"
+		) 8>>/tmp/pa-state.lock
+		return
+	fi
+	if [[ $PHONE_LOCKED_ACTIONS == *" $a "* && -z ${PA_HAVE_LOCK:-} ]]; then
+		(
+			flock -w "${PA_LOCK_WAIT:-900}" 9 || { echo "phone busy: $(cat /tmp/pa-phone.owner 2>/dev/null)"; exit 75; }
+			echo "pid $$/$BASHPID '$1' since $(date +%T)" > /tmp/pa-phone.owner
+			PA_HAVE_LOCK=1 run_action "$1"
+		) 9>>/tmp/pa-phone.lock
+		return
+	fi
+	run_action "$1"
+}
+run_action() {	# one request line
 	read -r act rest <<<"$1"
 	case $act in boot|boot-twrp|to-fastboot|adb-to-fastboot|fb-reboot-bootloader)
 		[ -z "${IN_CYCLE:-}" ] && cycle_running && { echo "a cycle is using the phone (cycle-status / cycle-stop)"; return 1; };;
@@ -306,12 +405,14 @@ run() {	# one request line
 		live_running && echo "live log running" || echo "live log not running";;
 	attach) attach;;
 	net) net;;
+	netifs) netifs;;
+	net-use) net_use $rest;;
 	boot)
 		ok_name "$rest" || { echo "bad name"; return 1; }
 		local d=$P/$rest img=$P/$rest/redfin-$rest.img
 		[ -f "$img" ] || { echo "no $img"; return 1; }
 		(cd "$d" && sha256sum -c "redfin-$rest.sha256" 2>&1 | grep "redfin-$rest.img") || { echo "checksum failed"; return 1; }
-		timeout 120 "$FB" boot "$(winpath "$FB" "$img")";;
+		timeout 120 "$FB" boot "$(winpath "$FB" "$img")" && echo "$rest" > "$P/agent/last-boot.txt";;
 	boot-twrp) timeout 120 "$FB" boot "$(winpath "$FB" "$P/twrp-3.7.0_11-0-redfin.img")";;
 	to-fastboot) (cd "$REPO" && timeout 20 python3 -I tools/flame-cmd.py --wait 2 reboot);;
 	adb-to-fastboot) timeout 20 "$ADB" -d reboot bootloader;;
@@ -366,6 +467,20 @@ run() {	# one request line
 		timeout 60 "$ADB" -d exec-out 'cd /proc/device-tree && tar cf - soc/bt_wcn3990 soc/qcom,qup_uart@894000 2>/dev/null' > "$dst/dt-bt.tar"
 		timeout 60 "$ADB" -d shell 'ls -la /vendor/firmware | grep -i -E "bt|cr|cs35|rt55|wmfw"; ls -la /mnt/vendor/persist; ls /vendor/etc/bluetooth' > "$dst/listing.txt" 2>&1
 		ls -la "$dst"; for t in "$dst"/*.tar; do echo "== $t"; tar tvf "$t" | head -30; done; cat "$dst/listing.txt";;
+	twrp-pull-venus)
+		# Venus (video) firmware, read only -> recon/fw/venus (never into git)
+		local dst=$P/ios-redfin-tree/ios-redfin/recon/fw/venus
+		mkdir -p "$dst"
+		timeout 30 "$ADB" -d shell 'mount | grep -q " /vendor " || mount -o ro /vendor'
+		timeout 120 "$ADB" -d exec-out 'cd /vendor/firmware && tar cf - venus.mdt venus.b0* 2>/dev/null' > "$dst/venus.tar"
+		(cd "$dst" && tar xf venus.tar && ls -la && sha256sum venus.mdt venus.b0* | cut -c1-16);;
+	twrp-pull-ipa)
+		# IPA firmware (cellular data), read only -> recon/fw/ipa (never into git)
+		local dst=$P/ios-redfin-tree/ios-redfin/recon/fw/ipa
+		mkdir -p "$dst"
+		timeout 30 "$ADB" -d shell 'mount | grep -q " /vendor " || mount -o ro /vendor'
+		timeout 120 "$ADB" -d exec-out 'cd /vendor/firmware && tar cf - ipa_fws.* 2>/dev/null' > "$dst/ipa.tar"
+		(cd "$dst" && tar xf ipa.tar && ls -la && sha256sum ipa_fws.* | cut -c1-16);;
 	twrp-pull-log)
 		local f=$P/logs/sweetlog-$(date +%Y%m%d-%H%M%S).bin
 		timeout 120 "$ADB" -d exec-out 'b=$(readlink -f /dev/block/by-name/userdata); n=$(( $(blockdev --getsize64 $b) / 4096 )); dd if=$b bs=4096 skip=$((n - 2048)) count=2048 2>/dev/null' > "$f"
@@ -379,6 +494,10 @@ run() {	# one request line
 	phone)
 		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 			-o ConnectTimeout=10 -o LogLevel=ERROR root@192.168.7.2 "$rest";;
+	putw)	# putw LOCAL REMOTE MODE: copy one file over Wi-Fi (ssh cat), hmt7
+		local l r m; read -r l r m <<<"$rest"
+		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+			-o ConnectTimeout=10 -o LogLevel=ERROR root@${WIFI_HOST:-192.168.0.238} "cat > '$r.tmp' && chmod ${m:-644} '$r.tmp' && mv '$r.tmp' '$r' && wc -c '$r'" < "$l"; echo "local $(wc -c < "$l")";;
 	phonew)	# same as phone, over Wi-Fi (fallback when the USB link is down); host from WIFI_HOST or 192.168.0.238
 		timeout 300 ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 			-o ConnectTimeout=10 -o LogLevel=ERROR root@${WIFI_HOST:-192.168.0.238} "$rest";;
@@ -441,10 +560,22 @@ run() {	# one request line
 		( IN_CYCLE=1; cycle_job "${pos[0]}" "${pos[1]}" "$base" "$cl" "$settle" "$check" ) </dev/null >"$log" 2>&1 &
 		echo $! > $CYCPID; echo "$log" > $CYCLOG
 		echo "started pid $! -> ${log#$P/}";;
-	cycle-status)
+	cycle-status) cy_brief;;
+	state)
+		[[ $rest =~ ^[A-Za-z0-9._=,:/@\ +-]*$ && $rest != *..* ]] || { echo "bad arguments"; return 1; }
+		case $rest in apply*|set*|revert*|put*) cycle_running && { echo "a cycle is using the phone (cycle-status / cycle-stop)"; return 1; };; esac
+		# shellcheck disable=SC2086
+		(cd "$P" && PHONE_AGENT_INSIDE=1 PF=$P REPO=$REPO timeout 900 python3 -I "$P/tools-claude/state.py" $rest);;
+	cycle-log)
 		[ -f $CYCLOG ] || { echo "no cycle started by this agent"; return 0; }
 		cycle_running && echo "running (pid $(cat $CYCPID))" || echo "not running"
 		echo "log $(cat $CYCLOG)"; tail -n 30 "$(cat $CYCLOG)";;
+	cycle-wait)
+		[ -f $CYCLOG ] || { echo "no cycle started by this agent"; return 0; }
+		local lim=${rest:-150} st0 end; [[ $lim =~ ^[0-9]+$ ]] || lim=150; [ "$lim" -gt 170 ] && lim=170
+		end=$(( $(date +%s) + lim ))
+		while cycle_running && [ "$(date +%s)" -lt $end ]; do sleep 2; done
+		cy_brief;;
 	cycle-stop)
 		cycle_running || { echo "not running"; return 0; }
 		touch $CYCSTOP && echo "stops at the next stage boundary";;
@@ -465,7 +596,9 @@ run() {	# one request line
 			[ -n "$d" ] || { echo "no builds/userland/*/sweetmon"; return 1; }
 			bin=${d%/}/sweetmon; echo "sweetmon from ${bin#$P/}"
 			[ -f "$P/agent/sweetmon.key" ] || python3 -I "$MON" --root "$P" --make-key
-			(cd "$REPO" && timeout 300 python3 -I tools/flame-files.py put "$bin" /var/local/bin/sweetmon 755) || return 1
+			# never over the live file (cs_invalid_page, README-state.txt): new name, then mv; the old one -> .pre-mon
+			(cd "$REPO" && timeout 300 python3 -I tools/flame-files.py put "$bin" /var/local/bin/sweetmon.st-new 755) || return 1
+			timeout 30 "${PSSH[@]}" 'T=/var/local/bin/toybox; cd /var/local/bin && { [ -e sweetmon ] && $T cp -p sweetmon sweetmon.pre-mon; $T mv -f sweetmon.st-new sweetmon && $T ls -l sweetmon; }' || return 1
 			timeout 30 "${PSSH[@]}" 'umask 077; cat > /var/local/sweetmon.key; chmod 600 /var/local/sweetmon.key' < "$P/agent/sweetmon.key" || return 1
 			timeout 30 "${PSSH[@]}" '/var/local/bin/sweetmon -D </dev/null >/dev/null 2>&1; sleep 1; ls -l /var/local/sweetmon.key'
 			echo "key installed, sweetmon -D started"
@@ -492,7 +625,7 @@ run() {	# one request line
 		lb_bg setup "$rest";;
 	build)
 		read -r tgt ref <<<"$rest"
-		[[ $tgt =~ ^(shim|userland|metal2|xnu)$ ]] || { echo "TARGET: shim userland metal2 xnu"; return 1; }
+		[[ $tgt =~ ^(shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu)$ ]] || { echo "TARGET: shim userland metal2 hmetal hmesa hmetal-mesa xnu"; return 1; }
 		[[ ${ref:-x} =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; return 1; }
 		lb_bg build "$tgt" ${ref:-redfin-qol};;
 	build-jobs) pgrep -af "localbuild/lb.sh" || echo "no local builds running";;
@@ -503,6 +636,7 @@ run() {	# one request line
 	esac
 }
 
+[ -n "${PA_LIB:-}" ] && return 0
 echo "phone-agent: watching $IN"
 while true; do
 	for r in "$IN"/*.req; do

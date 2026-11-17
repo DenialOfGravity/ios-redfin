@@ -1,0 +1,186 @@
+#!/bin/bash
+# pa: the phone agent as a direct command (WSL). Same actions, checks and logs as phone-agent.sh, without the
+# inbox/outbox queue: Claude (wsl__run), subagents and the user call `pa ACTION ARGS` and get the answer at once.
+# Docs: tools-claude/README-pa.md (project doc claude/redfin-pa-2026-11-16.md).
+#
+#   pa help [ACTION]          this text, or the agent's line(s) for ACTION
+#   pa ACTION ARGS            any phone-agent action (status, phone, pull, files, poke, klog, boot, cycle-status, mon,
+#                             fpsbench, build, mkimage, ...). Screen/boot actions take the shared phone lock
+#                             (/tmp/pa-phone.lock); the rest run in parallel with each other and with the agent.
+#   pa q ACTION ARGS          send ACTION through the running agent's queue instead (needs phone-agent.sh running).
+#                             Done automatically for actions that need its sudo or must outlive this command:
+#                             cycle exp mon-start mon-stop reload attach net net-use build-apt
+#
+# Combined commands (new):
+#   pa sh CMD                 run CMD on the phone over SSH: USB, or Wi-Fi when USB doesn't answer (PA_LINK=usb|wifi)
+#   pa put LOCAL REMOTE [MODE] [--kg NOTE]
+#                             test install = `state put ... --temp`: REMOTE.st-new, sha checked, mv (never over a live
+#                             file); the first put keeps the old file as REMOTE.st-prev; recorded as the temp override
+#                             file:REMOTE (shows in `state diff`). Only inside the manifest's managed roots, never
+#                             firmware. --kg also appends a KNOWN-GOOD.txt line. MODE default: LOCAL's mode.
+#   pa revert KEY|all         undo temp overrides (file:REMOTE restores REMOTE.st-prev; kern.X / FLAG:VAR back to manifest)
+#   pa keep KEY --manifest F  promote a temp override into manifest file F (a worktree's state/redfin.toml; commit it)
+#                             Permanent changes: edit the manifest, then `pa state apply`. All of `state ...` works too.
+#   pa get REMOTE LOCAL [gunzip]   = agent `pull` (ssh cat, size check, file-server fallback)
+#   pa klog [PA] [--tail N] [--grep RE] [--count RE]
+#                             kernel log ring -> logs/klog.txt; PA default: the last-booted image's KLOG_PA, else the
+#                             collector's. Prints panic/CRASH counts plus the tail (default 15 lines) or the matches.
+#   pa snap [--json] [--drift]
+#                             one-call phone snapshot: link, uptime, kern.uuid, temps, thermal, CPU, memory, top
+#                             processes, wakeups, crashes, the sysctls in tools-claude/pa-snap.sysctls, Metal env hash,
+#                             pinned boot values, disk, temp overrides, and the last `state diff` counts (its age and
+#                             whether the kernel changed since). --drift runs a fresh diff first (~45 s).
+#   pa lock                   who holds the phone lock
+set -uo pipefail
+P=/mnt/d/ClaudeProjects/iOS_Pixel5
+T=$P/tools-claude
+PA_LIB=1 source "$T/phone-agent.sh" || { echo "pa: cannot load phone-agent.sh"; exit 2; }
+set +e
+FORWARD=" cycle exp mon-start mon-stop reload attach net net-use build-apt "
+PT=/var/local/bin/toybox PTF=/var/local/bin/toybox-full
+
+pa_help() {
+	if [ -n "${1:-}" ]; then
+		grep -E "^#   (pa )?$1( |\$|/)" "$T/pa" "$T/phone-agent.sh" | sed 's/^[^#]*#   /  /' || echo "no help for $1"
+		return
+	fi
+	sed -n '2,/^set -uo/p' "$T/pa" | sed '$d; s/^# \{0,1\}//'
+	echo "Agent actions:"; sed -n '/^#   status /,/^set -uo/p' "$T/phone-agent.sh" | sed '$d' | grep -E '^#   [a-z]' | awk '{print "  " $2}' | sort -u | tr '\n' ' '; echo
+}
+
+queue() {	# ACTION ARGS through the running agent
+	pgrep -f 'tools-claude/phone-agent.sh' >/dev/null || { echo "pa: the phone agent isn't running (needed for: $1). Start it in WSL."; return 69; }
+	local n="pa-$(date +%s%N)-$$" i
+	echo "$*" > "$IN/$n.req"
+	for i in $(seq "${PA_QUEUE_WAIT:-600}"); do [ -f "$OUT/$n.out" ] && break; sleep 1; done
+	[ -f "$OUT/$n.out" ] || { echo "pa: no answer for $n yet (agent busy?); later: cat $OUT/$n.out"; return 70; }
+	sed '1d' "$OUT/$n.out"; tail -1 "$OUT/$n.out" | grep -q '== exit 0 ' 
+}
+
+wifi_host() {
+	local h; h=$(curl -s -m 2 localhost:8765/api/now 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["link"].get("wifi_host") or "")' 2>/dev/null)
+	echo "${h:-${WIFI_HOST:-192.168.0.238}}"
+}
+pick_host() {	# -> 192.168.7.2 (USB) or the Wi-Fi address
+	case ${PA_LINK:-auto} in usb) echo 192.168.7.2; return;; wifi) wifi_host; return;; esac
+	phone_up && { echo 192.168.7.2; return; }
+	local w; w=$(wifi_host); ping -c 1 -W 2 "$w" >/dev/null 2>&1 && { echo "$w"; echo "pa: USB down, using Wi-Fi $w" >&2; return; }
+	echo 192.168.7.2
+}
+ssh_to() { local h=$1; shift; timeout "${PA_SSH_TIMEOUT:-300}" ssh -i ~/.ssh/redfin-claude -o StrictHostKeyChecking=no \
+	-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes "root@$h" "$@"; }
+
+pa_put() {	# -> state.py put --temp (state lock, cycle check, managed roots, firmware refused)
+	local l= r= m= kg= rc
+	while [ $# -gt 0 ]; do case $1 in --kg) kg=$2; shift 2;; *) if [ -z "$l" ]; then l=$1; elif [ -z "$r" ]; then r=$1; else m=$1; fi; shift;; esac; done
+	[ -n "$l" ] && [ -n "$r" ] || { echo "usage: pa put LOCAL REMOTE [MODE] [--kg NOTE]"; return 2; }
+	[ -f "$l" ] || l=$(in_p "$l") || return 2
+	[ -f "$l" ] || { echo "no local file $l"; return 2; }
+	l=$(realpath "$l")
+	run "state put $l $r $m --temp --by pa"; rc=$?
+	if [ $rc = 0 ]; then
+		echo "$(date '+%F %T') $l -> $r sha $(sha256sum "$l" | cut -c1-16)" >> "$P/logs/pa-put.log"
+		[ -n "$kg" ] && { echo "$(date) pa put $r (sha $(sha256sum "$l" | cut -c1-16), from ${l#$P/}; temp override file:$r, previous -> $r.st-prev if it existed): $kg" >> "$P/KNOWN-GOOD.txt"; echo "KNOWN-GOOD.txt: line added"; }
+	fi
+	return $rc
+}
+
+klog_pa() {	# the PA for the running kernel, best guess
+	local lb kd pa
+	lb=$(tr -d '\r\n ' < "$P/agent/last-boot.txt" 2>/dev/null)
+	kd=$(sed -n 's/^kernel *\(builds\/xnu\/[^/ ]*\)\/.*/\1/p' "$P/$lb/README.txt" 2>/dev/null | head -1)
+	[ -n "$kd" ] && pa=$(grep -o -m1 '0x[0-9a-fA-F]*' "$P/$kd/KLOG_PA.txt" 2>/dev/null | head -1)
+	[ -n "$pa" ] || pa=$(curl -s -m 2 localhost:8765/api/now | python3 -c 'import json,sys; k=json.load(sys.stdin).get("klog") or {}; print(k.get("pa") or k.get("klog_pa") or "")' 2>/dev/null)
+	echo "$pa"
+}
+pa_klog() {
+	local pa= tail=15 grep= count= f=$P/logs/klog.txt
+	while [ $# -gt 0 ]; do case $1 in --tail) tail=$2; shift 2;; --grep) grep=$2; shift 2;; --count) count=$2; shift 2;; 0x*) pa=$1; shift;; *) echo "pa klog [PA] [--tail N] [--grep RE] [--count RE]"; return 2;; esac; done
+	[ -n "$pa" ] || pa=$(klog_pa)
+	[ -n "$pa" ] || { echo "no KLOG_PA known (last-boot.txt / collector): give it"; return 2; }
+	run "klog $pa" | tail -2
+	[ -s "$f" ] || return 1
+	echo "PA $pa: $(wc -l < "$f") lines, panic $(grep -c 'panic(' "$f"), CRASH $(grep -c CRASH "$f"), watchdog $(grep -ci watchdog "$f") -> logs/klog.txt"
+	if [ -n "$count" ]; then echo "count /$count/: $(grep -cE -- "$count" "$f")"
+	elif [ -n "$grep" ]; then grep -E -- "$grep" "$f" | tail -n "$tail" | cut -c1-240
+	else tail -n "$tail" "$f" | cut -c1-240; fi
+}
+
+pa_snap() {
+	local json= h names now ph a
+	for a in "$@"; do case $a in --json) json=1;; --drift) run "state diff" >/dev/null 2>&1;; esac; done
+	h=$(pick_host)
+	names=$(grep -vE '^\s*(#|$)' "$T/pa-snap.sysctls" 2>/dev/null | tr '\n' ' ')
+	now=$(curl -s -m 3 localhost:8765/api/now 2>/dev/null)
+	ph=$(ssh_to "$h" "/var/local/bin/dash -s" <<EOF 2>&1
+for n in kern.uuid $names; do o=\$(/var/local/bin/sctl \$n 2>/dev/null) && echo "\$o" || echo "\$n: (none)"; done
+[ -f /var/local/hmetal/env ] && echo "hmetal_env: \$($PTF sha256sum /var/local/hmetal/env | $PT cut -c1-8)"
+[ -f /var/local/sweetctl/boot.conf ] && echo "boot.conf: \$($PTF tr '\n' ' ' < /var/local/sweetctl/boot.conf)"
+echo "disk: \$($PT df -h /private/var | $PT tail -1)"
+EOF
+)
+	PH="$ph" NOW="$now" HOST="$h" JSON="$json" PF="$P" python3 - <<'EOF'
+import json, os
+ph = os.environ['PH']; host = os.environ['HOST']
+try: now = json.loads(os.environ['NOW'] or '{}')
+except Exception: now = {}
+kv = {}
+for line in ph.splitlines():
+    if ': ' in line:
+        k, v = line.split(': ', 1); kv[k.strip()] = v.strip()
+out = {'host': host, 'phone': kv}
+if now:
+    link = now.get('link') or {}; mem = now.get('mem') or {}; cpu = now.get('cpu') or {}
+    procs = now.get('procs') or {}
+    out['monitor'] = {'stale': now.get('stale'), 'link': f"{link.get('via')} rtt {link.get('rtt_ms')} ms",
+        'uptime_s': (now.get('phone') or {}).get('uptime_s'), 'temp_max': (now.get('temp') or {}).get('max'),
+        'thermal': (now.get('thermal') or {}).get('level'), 'cpu_avg': cpu.get('avg'),
+        'mem_free_mb': mem.get('free_mb'), 'mem_used_mb': mem.get('used_mb'),
+        'top_cpu': [f"{p['name']} {p['cpu_pct']}%" for p in (procs.get('by_cpu') or [])[:4]],
+        'top_wakeups': [f"{p['name']} {p['wakeups_s']:.0f}/s" for p in (procs.get('by_wakeups') or [])[:3]],
+        'crashes': now.get('crashes'), 'battery': now.get('battery'), 'hot': now.get('hot')}
+import time, calendar
+st = {}
+try:
+    ld = json.load(open(os.path.join(os.environ['PF'], 'state', 'last-diff.json')))
+    age = (time.time() - calendar.timegm(time.strptime(ld['at'], '%Y-%m-%dT%H:%M:%SZ'))) / 60
+    same = ld.get('kern.uuid') == kv.get('kern.uuid')
+    st['last_diff'] = (f"drift {ld['drift']} ({', '.join(f'{k} {v}' for k, v in sorted(ld['counts'].items()))}), "
+                       f"{age:.0f} min ago, {'same kernel' if same else 'OLDER KERNEL: run pa snap --drift'}")
+except Exception:
+    st['last_diff'] = 'none yet (pa snap --drift or pa state diff)'
+try:
+    tmp = json.load(open(os.path.join(os.environ['PF'], 'state', 'temp-overrides.json')))
+    st['temp_overrides'] = ', '.join(tmp) or 'none'
+except Exception:
+    st['temp_overrides'] = 'none'
+out['state'] = st
+if os.environ['JSON']:
+    print(json.dumps(out, separators=(',', ':')))
+else:
+    print(f"phone via {host}")
+    for k, v in kv.items(): print(f"  {k}: {v[:150]}")
+    if not kv: print("  (no ssh answer)\n  " + ph[:300])
+    for k, v in (out.get('monitor') or {}).items():
+        if v not in (None, [], ''): print(f"  {k}: {v if not isinstance(v, list) else ', '.join(map(str, v))}")
+    if not now: print("  (sweetmon collector not answering: pa mon-start)")
+    for k, v in st.items(): print(f"  {k}: {v}")
+EOF
+}
+
+act=${1:-help}; shift 2>/dev/null
+case $act in
+	help|-h|--help) pa_help "${1:-}";;
+	q) queue "$@";;
+	sh) [ $# -gt 0 ] || { echo "pa sh CMD"; exit 2; }; ssh_to "$(pick_host)" "$*";;
+	put) pa_put "$@";;
+	get) run "pull $*";;
+	klog) pa_klog "$@";;
+	snap) pa_snap "$@";;
+	revert) run "state revert $*";;
+	keep) run "state promote $*";;
+	lock) if flock -n /tmp/pa-phone.lock true 2>/dev/null; then echo "phone lock free"; else echo "held: $(cat /tmp/pa-phone.owner 2>/dev/null)"; fi;;
+	*)
+		if [[ $FORWARD == *" $act "* ]]; then queue "$act" "$@"
+		else run "$act $*"; fi;;
+esac

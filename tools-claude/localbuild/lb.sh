@@ -6,7 +6,7 @@
 # Runs as the user, never root. Normally started by the phone agent (build-env, build-setup, build), which puts
 # the log in builds/logs; results go to builds/<TARGET>/<REF>-<sha>/ in the project folder.
 set -uo pipefail
-P=${P:-/mnt/c/ClaudeProjects/iOS_Pixel5}
+P=${P:-/mnt/d/ClaudeProjects/iOS_Pixel5}
 HERE=$(cd "$(dirname "$0")" && pwd)
 BR=${BR:-$HOME/redfin-build}
 TC=$BR/toolchain

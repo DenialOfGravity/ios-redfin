@@ -1,0 +1,13 @@
+# sysctls `pa snap` reads (one per line; edit freely; missing ones show an sctl error line)
+kern.osversion
+kern.sweet_chg
+kern.sweet_chg_sdp_ma
+kern.sweet_swapdone
+kern.sweet_pace
+kern.sweet_pace_min
+kern.sweet_ubwc_mdss
+kern.sweet_fb_hz
+kern.sweet_fb_frames
+kern.sweet_nfc_id
+kern.sweet_mqrtr_aux
+kern.sweet_qmux_pds

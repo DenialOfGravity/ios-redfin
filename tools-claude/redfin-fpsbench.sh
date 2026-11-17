@@ -28,13 +28,19 @@
 #  - phases parsed from sweetmon's klog file (logs/mon/klog-<boot>.txt via now.json klog.file); the old end-of-run
 #    klog.py pull only when that file is not growing or lacks the end marker ('klog src' column: mon|pull).
 set -uo pipefail
-P=/mnt/c/ClaudeProjects/iOS_Pixel5
+P=/mnt/d/ClaudeProjects/iOS_Pixel5
 REPO=${REPO:-$HOME/ios-redfin}
 LABEL=${1:-run}; PA=${2:-}
 # default klog PA: the one sweetmon found for the running kernel (now.json klog.pa), else the old constant
 [ -z "$PA" ] && PA=$(python3 -I -c 'import json,sys
 try: print(json.load(open(sys.argv[1]))["klog"]["pa"])
 except Exception: pass' "$P/logs/mon/now.json" 2>/dev/null)
+# else: the KLOG_PA of the kernel in the image the phone agent booted last (agent/last-boot.txt -> NAME/README.txt)
+if ! [[ $PA =~ ^0x[0-9a-fA-F]+$ ]] && [ -f "$P/agent/last-boot.txt" ]; then
+	_lb=$(tr -d '\r\n ' < "$P/agent/last-boot.txt")
+	_kd=$(sed -n 's/^kernel *\(builds\/xnu\/[^/ ]*\)\/.*/\1/p' "$P/$_lb/README.txt" 2>/dev/null | head -1)
+	[ -n "$_kd" ] && PA=$(grep -o -m1 '0x[0-9a-fA-F]*' "$P/$_kd/KLOG_PA.txt" 2>/dev/null | head -1)
+fi
 [[ $PA =~ ^0x[0-9a-fA-F]+$ ]] || PA=0x101d4a8d8
 [[ $LABEL =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad label"; exit 1; }
 cd "$REPO" || exit 1
@@ -76,6 +82,7 @@ shot() {
 	rm -f "$RAW" "$rg"
 	(cd "$REPO" && timeout 20 python3 -I tools/flame-files.py read /dev/pmem 0x0ae05000 64 "$rg") >/dev/null 2>&1
 	w=$(python3 -I "$P/tools-claude/fb-shot.py" --where "$rg" "${KF:-}" 2>/dev/null)
+	[[ $w =~ ^ubwc\  ]] && { SHOTSRC=ubwc; rm -f "$rg"; echo ubwc; return; }	# xnu 1111: compressed scanout, no raw shot
 	[[ $w =~ ^(direct|blit)\ 0x[0-9a-f]+\ [0-9]+\  ]] && read -r kind pa len geo _ <<<"$w"
 	SHOTSRC=$kind
 	rm -f "$rg"

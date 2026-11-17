@@ -13,7 +13,7 @@
       --top N            rows per table (default 25)
       --folded OUT       folded stacks (thread;root;...;leaf count) for flamegraph.pl / speedscope; off-CPU samples
                          go to OUT with .wait appended
-BIN: the buffer read with the agent's  files read /dev/pmem PA BYTES /mnt/c/ClaudeProjects/iOS_Pixel5/logs/prof.bin
+BIN: the buffer read with the agent's  files read /dev/pmem PA BYTES /mnt/d/ClaudeProjects/iOS_Pixel5/logs/prof.bin
 (PA and BYTES from the "SWEET PROF: done" klog line). Symbol cache: logs/prof-symcache.tsv (unslid shared-cache
 addresses, valid across boots of the same iOS build)."""
 import bisect, collections, gzip, os, re, struct, sys
