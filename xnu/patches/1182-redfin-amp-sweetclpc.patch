@@ -15,7 +15,6 @@ to "SWEET GOV: 5s" while freq is on. Details: osfmk/kern/sched_clutch.c (1182 bl
 
 ---
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
-diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index 168be61..e317262 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
