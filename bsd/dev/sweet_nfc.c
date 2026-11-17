@@ -2583,7 +2583,7 @@ gw_session_stop(const char *why)
  * Klog: "SWEET NFC: rdr:" (bounded: 800 lines, then every 100th). Stats: kern.sweet_nfc_rdr.
  */
 static LCK_MTX_DECLARE(rdr_lock, &nfc_lock_group);
-static uint32_t nfc_reader;             /* kern.sweet_nfc_reader: 1 on, 2 MODE_SET ON only if needed, 4 NCI segments */
+static uint32_t nfc_reader = 1;         /* 1155: on by default (sweetnfc=0 or this = 0 turns it off). kern.sweet_nfc_reader: 1 on, 2 MODE_SET ON only if needed, 4 NCI segments */
 static volatile bool rdr_on;            /* chip up and initialised by the reader (rdr_lock) */
 static volatile bool rdr_own;           /* the reader holds nfc_busy (rdr_lock) */
 static volatile bool rdr_stale;         /* chip sent an unsolicited CORE_RESET_NTF: bring up again first */
