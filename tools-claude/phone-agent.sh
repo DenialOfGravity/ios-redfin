@@ -628,7 +628,7 @@ run_action() {	# one request line
 		[[ $tgt =~ ^(shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu)$ ]] || { echo "TARGET: shim userland metal2 hmetal hmesa hmetal-mesa xnu"; return 1; }
 		[[ ${ref:-x} =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; return 1; }
 		lb_bg build "$tgt" ${ref:-redfin-qol};;
-	build-jobs) pgrep -af "localbuild/lb.sh" || echo "no local builds running";;
+	build-jobs) pgrep -af "localbuild/(lb|build)\.sh" || echo "no local builds running";;
 	build-kill)	# lb.sh runs under setsid: its pid is the process group of the whole build
 		local k=0; for pid in $(pgrep -f "localbuild/lb.sh"); do kill -TERM -- "-$pid" 2>/dev/null && k=1; done
 		[ $k = 1 ] && echo killed || echo "nothing running";;
