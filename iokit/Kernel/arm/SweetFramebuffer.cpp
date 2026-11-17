@@ -6128,7 +6128,40 @@ AppleCLCD::fbCmd(const char *s, const char *end)
 		return;
 	}
 	if (end - s >= 4 && !strncmp(s, "disp", 4)) {
-		/* 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh) */
+		/*
+		 * 0991: p disp: the display power state, for scripts (tools-claude/redfin-fpsbench.sh, pa disp).
+		 * 1162: p disp on|off: set it, exactly as IOMobileFramebuffer's RequestPowerChange (selector 12, the power
+		 * button / auto-lock path) does, so `pa wake` / `pa sleep` are deterministic instead of toggling the
+		 * injected power key. No argument: unchanged read-only print.
+		 */
+		const char *q = s + 4;
+		while (q < end && *q == ' ') {
+			q++;
+		}
+		int want = -1;
+		if (end - q >= 2 && !strncmp(q, "on", 2)) {
+			want = 0;
+		} else if (end - q >= 3 && !strncmp(q, "off", 3)) {
+			want = 1;
+		}
+		if (want >= 0) {
+			bool off = want == 1;
+			IOLockLock(fLock);
+			if (off != fPowerOff) {
+				fPowerOff = off;
+				fFadeStep = 0;
+				fDirty = true;          /* on: redraw the latest frame */
+				if (!off && sweet_cm_st.touched) {
+					sweet_cm_kick_locked(this);     /* 1116: PCC again, in case the display power lost it */
+				}
+			}
+			IOLockUnlock(fLock);
+			if (off && sweet_scan_live()) {
+				sweet_scan_leave(this, "display off");  /* 0989: the fade goes through the panel buffer */
+			}
+			IOLog("SWEET FB: display %s (p disp set)\n", off ? "off" : "on");
+			return;
+		}
 		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
 		return;
 	}
