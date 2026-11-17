@@ -18,17 +18,24 @@ Full docs: project doc claude/redfin-pa-2026-11-16.md.
 
 ## pa session: free-form UI session recorder + slow-moment finder (2026-11-17)
 
-    pa session NAME [SECS=180] [--chunk 15] [--shots 3] [--pull auto|live|end] [--no-analyse] [--no-lock]
+    pa session NAME [SECS=180] [--chunk 15] [--shots 3] [--pull auto|live|end] [--no-analyse] [--no-lock] [--no-rotate]
     pa session-stop                                   (or Ctrl-C in the session's terminal)
     python3 tools-claude/session-analyse.py DIR [--gap-ms 50] [--resp-ms 100] [--launch-ms 600] [--worst 15]
 
 - Run it in a WSL terminal (it lasts SECS + pull + analysis; through wsl__run use start_job). Wake the phone yourself
   first: the session injects nothing, never wakes/sleeps the display, restarts nothing. It holds the phone lock and
   refuses while a cycle or another sweettrace runs. Use the phone between "RECORDING STARTED" and "STOPPED".
-- Trace: sweettrace chunks back to back on the phone (tools-claude/pa-session.sh writes a small dash loop to
-  /var/tmp/pa-sess-NAME/: chunk N+1 is retried every few ms from ~0.3 s before chunk N ends, and gets kdebug the moment
-  N releases it, before N writes its file: gaps ~0.01-0.3 s, listed in manifest.json "gaps_ms"). Same classes as
-  pa trace (0x21/0xa6, 0x31), -m 8M events, ~9-13 MB/s (180 s ~ 1.6-2.3 GB). --pull auto = keep everything on the
+- Trace (tools-claude/pa-session.sh writes a small dash script to /var/tmp/pa-sess-NAME/; session.log and
+  manifest.json "trace_mode" say which mode ran):
+  - rotate (the phone's sweettrace says "rotate" in `sweettrace -V`, sweettrace 2 from branch ws-tools-sweettrace-rotate):
+    ONE `sweettrace -t SECS -s CHUNK` for the whole session: one kdebug session, a new file every CHUNK s, no gap at all
+    (file N ends at the time stamp where N+1 starts; the analyser reads them as one trace).
+  - chunks (older sweettrace, or --no-rotate): one sweettrace per chunk; chunk N+1 is retried from 1 s before chunk N
+    ends (absolute phone clock) and gets kdebug when N releases it, before N writes its file. The first loop (hands1,
+    2026-11-17) lost 0.97-2.02 s per boundary: it counted 1 s sleeps whose process starts added ~70-140 ms each
+    under trace load, so it started the next chunk after the previous one had ended ("tries 0" every time). Gaps are
+    listed in manifest.json "gaps_ms".
+  Same classes as pa trace (0x21/0xa6, 0x31), -m 8M events, ~9-22 MB/s (hands1: ~20 MB/s while busy). --pull auto = keep everything on the
   phone and pull after the stop when /private/var has room (no ssh copies during the session), else pull + delete each
   chunk while the next records. Pull ~30 MB/s (~60 s for 180 s).
 - Screenshots: every --shots s the `pa shot` path (64 bytes of VIG0 registers, fb-shot.py --where, the scanout surface
@@ -42,7 +49,12 @@ Full docs: project doc claude/redfin-pa-2026-11-16.md.
   (writes to its session/ subfolder; --klog FILE for the boot's klog; a klog of another boot is detected and dropped).
 - Reading the report: worst list = frame gaps > 50 ms inside a running animation (or while the finger drags) and
   touch -> first frame > 100 ms from a still screen (a tap with no frame while down counts from the up) and launches
-  (tap up -> the new app's first frame) > 600 ms, each with one cause + evidence (app main thread on CPU per cluster /
+  (the gesture right before the klog exec: up -> the first frame after the app's first CONTENT commit, a >= 4 KB
+  layer tree; plus "ready", an ESTIMATE of launch -> interactable: the first 500 ms after that frame with the app's
+  main thread >= 85 % idle and no >= 2 KB commit) > 600 ms, each with one cause + evidence (app main thread on CPU per cluster /
   runnable / blocked + wakers, commits, backboardd display thread, GPU busy and frame GPU ms, SwapWait, shader builds,
   CPU load, GOV/THERMAL, CRASH/exec). "app idle until a timer fired" and low-rate app animations (commits every 2+
-  vsyncs: Apple's 20-30 fps fades) are listed separately and not counted.
+  vsyncs: Apple's 20-30 fps fades) are listed separately and not counted; so are frame gaps across a trace gap
+  (between chunk files: no data) and idle gaps (render server + app idle, no app commits, big cores < 30 %, the app
+  not blocked on another thread: nothing was animating). Gaps that end with a new touch > 100 ms into them are
+  skipped (that touch's response is measured instead).

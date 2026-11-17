@@ -47,7 +47,7 @@
 #   pa trace NAME SECS [--swipe pages|cc|none] [--procs LIST] [--app NAME]
 #                             wake the display, record sweettrace (+ Core Animation and hakios-metal events) while
 #                             swiping, pull, analyse -> logs/traces/NAME-*/ report.txt, summary.json, perfetto.json
-#   pa session NAME [SECS] [--chunk S] [--shots S] [--pull auto|live|end] [--no-analyse] [--no-lock]
+#   pa session NAME [SECS] [--chunk S] [--shots S] [--pull auto|live|end] [--no-analyse] [--no-lock] [--no-rotate]
 #                             free-form UI session recorder (tools-claude/pa-session.sh): you use the phone, it records
 #                             sweettrace in back-to-back chunks, a screenshot every 3 s and the klog (default 180 s; no
 #                             input, no wake/sleep), then session-analyse.py -> logs/sessions/NAME-*/ report.txt/.html

@@ -8,16 +8,26 @@
 
 Writes DIR/report.txt, DIR/session.json and DIR/report.html (timeline + screenshot thumbnails).
 
-What it does (sweettrace events read with sweet-trace.py's Trace; chunks are read one after the other):
+What it does (sweettrace events read with sweet-trace.py's Trace; chunks are read one after the other; files that
+are contiguous (sweettrace -s rotation: file N ends at the time stamp where N+1 starts) are read as ONE trace: the
+scheduler / IPC / call state carries over, so nothing is lost at the file boundaries):
   - interactions: TOUCH events (kernel 0994 HID samples; fallback: klog "SWEET HID: touch N down/up" lines) grouped
     into gestures: tap, long press, swipe/scroll (direction), edge swipes (home bar, top edge), multi-touch;
   - context: the touched app (the process backboardd sends messages to during the gesture = HID delivery), the
     frontmost committer (most messages to backboardd = CA commits), app launches (klog "exec NAME" after a tap, then
     that process commits), nearest screenshot;
   - per gesture: touch -> first new frame on screen (scanout latch), frames during the gesture + its settle animation
-    (fps, intervals in vsync periods 1/2/3/4+), launch time (tap up -> first frame after the app's first commit);
+    (fps, intervals in vsync periods 1/2/3/4+), launch time (the gesture right before a klog "exec APP": tap up
+    -> first frame after the app's first CONTENT commit (a burst >= 4 KB to backboardd: the first layer tree; the
+    small connection-setup messages right after exec are not a frame), and "ready" = an ESTIMATE of launch ->
+    interactable: the first 500 ms after that frame in which the app's main thread is >= 85 % idle and commits no
+    layer tree >= 2 KB;
   - slow moments: a frame gap > --gap-ms inside a running animation (or while a finger drags), and a touch -> first
-    frame > --resp-ms from a still screen; each with a cause from the evidence in its window: app main thread state
+    frame > --resp-ms from a still screen. A gap is NOT a stalled animation (listed apart, not counted) when it
+    overlaps a trace gap (between chunk files: no data), when it ends with a new touch (> 100 ms into the gap: the
+    touch's response is measured instead), or when nothing was animating: render server display thread and app main
+    thread (nearly) idle, no app commits in the gap, big cores < 30 % busy, and the app not blocked on another
+    thread or the kernel (only timers); each with a cause from the evidence in its window: app main thread state
     (on CPU per cluster / waiting for a CPU / blocked + wakers), app commits, backboardd display thread state, GPU
     busy and per-frame GPU ms (fence stamps), SwapWait / GPU waits (back-pressure), shader compiles (HM_SHADER
     events, klog HakiosMetal "compiled"/"pipeline" lines), CPU load per cluster, SWEET GOV / THERMAL lines, CRASH
@@ -79,13 +89,27 @@ class G:
         self.submits = []                   # (t, tid, fence, pid)
         self.shaders = []                   # (t, tid, compile_ms)
         self.chunks = []                    # (start_s, end_s, wall_s at start, file, events, wrapped, dropped)
+        self.contig = 0                     # files read as the continuation of the previous one (rotation)
         self.bb = set()
 
 
-def scan_chunk(path, g, log):
+def flush_carry(carry, g):
+    """close the CPU intervals still open at the end of the last file of a contiguous run"""
+    for c, tid in carry['cpu_cur'].items():
+        s = carry['cpu_on'].get(c)
+        if s is not None:
+            g.cpu[c].extend((s, carry['tend'], tid))
+
+
+def scan_chunk(path, g, log, carry=None):
+    """read one file into g; carry: the state returned for the previous file (used when this one starts exactly
+    where it ended, i.e. sweettrace -s rotation; else its open CPU intervals are closed). Returns the new state."""
     t0 = time.time()
     T = st.Trace(path)
     k = T.numer / T.denom / 1e9
+    contig = carry is not None and abs(T.start_abs * k - carry['tend']) < 2e-6
+    if carry is not None and not contig:
+        flush_carry(carry, g)
     for tid, v in T.threads.items():
         old = g.threads.get(tid)
         if old is None or v[0] >= 0:
@@ -97,12 +121,17 @@ def scan_chunk(path, g, log):
     MACH_SCHED, HANDOFF, RUNNABLE, INTR = st.MACH_SCHED, st.MACH_STACK_HANDOFF, st.MACH_MAKERUNNABLE, st.INTR
     KINFO, NEWT, TSTR, TNAME = st.IPC_KMSG_INFO, st.TRACE_NEWTHREAD, st.TRACE_STRING_GLOBAL, st.TRACE_THREADNAME
     SW, CALLS = st.SW, st.CALL_CODES
-    cpu_cur, cpu_on, cpu_intr = {}, {}, collections.defaultdict(int)
-    off_start, pend = {}, {}
+    if contig:
+        cpu_cur, cpu_on, cpu_intr = carry['cpu_cur'], carry['cpu_on'], carry['cpu_intr']
+        off_start, pend, stack, names_pending = carry['off_start'], carry['pend'], carry['stack'], carry['names']
+        g.contig += 1
+    else:
+        cpu_cur, cpu_on, cpu_intr = {}, {}, collections.defaultdict(int)
+        off_start, pend = {}, {}
+        stack = collections.defaultdict(list)
+        names_pending = {}
     gcpu, gwaits, threads = g.cpu, g.waits, g.threads
     to_bb, from_bb, sw = g.to_bb, g.from_bb, g.sw
-    stack = collections.defaultdict(list)
-    names_pending = {}
     cal, done, subs = [], [], []
     for ts, a1, a2, a3, a4, tid, dbg, cpu, _ in T.events:
         cid = dbg & ~3
@@ -180,10 +209,8 @@ def scan_chunk(path, g, log):
                 if nm:
                     threads.setdefault(tid, [-1, '?', ''])[2] = nm
     tend = T.end_abs * k
-    for c, tid in cpu_cur.items():
-        s = cpu_on.get(c)
-        if s is not None:
-            gcpu[c].extend((s, tend, tid))
+    carry = {'tend': tend, 'cpu_cur': cpu_cur, 'cpu_on': cpu_on, 'cpu_intr': cpu_intr, 'off_start': off_start,
+             'pend': pend, 'stack': stack, 'names': names_pending}
     # GPU clock -> mach seconds (as sweet-trace.py), per chunk
     if cal:
         if len(cal) >= 2 and cal[-1][0] != cal[0][0]:
@@ -203,7 +230,8 @@ def scan_chunk(path, g, log):
     g.submits.extend(subs)
     n = len(T.events)
     del T
-    log(f'  {os.path.basename(path)}: {n} events, {time.time() - t0:.1f} s')
+    log(f'  {os.path.basename(path)}: {n} events, {time.time() - t0:.1f} s' + (' (continues the previous file)' if contig else ''))
+    return carry
 
 
 # ------------------------------------------------------------------------------------------------ klog
@@ -289,6 +317,7 @@ class Ana:
         # commits (as sweet-trace.py --chain): bursts of main-thread messages to backboardd (< 0.5 ms apart) with
         # >= 3 messages or one >= 500 bytes; the time is the burst's first message
         self.commits = collections.defaultdict(list)
+        self.commit_bytes = collections.defaultdict(list)     # bytes of each burst (parallel to commits)
         cur = {}
         for t, tid, pid, sz in g.to_bb:
             if self.main.get(pid) != tid:
@@ -298,13 +327,16 @@ class Ana:
                 b[1] = t
                 b[2] += 1
                 b[3] = max(b[3], sz)
+                b[4] += sz
             else:
                 if b and (b[2] >= 3 or b[3] >= 500):
                     self.commits[pid].append(b[0])
-                cur[pid] = [t, t, 1, sz]
+                    self.commit_bytes[pid].append(b[4])
+                cur[pid] = [t, t, 1, sz, sz]
         for pid, b in cur.items():
             if b[2] >= 3 or b[3] >= 500:
                 self.commits[pid].append(b[0])
+                self.commit_bytes[pid].append(b[4])
         self.kl_exec = [(t, x[5:].strip()) for t, x in klog if x.startswith('exec ')]
         self.kl_crash = [(t, x) for t, x in klog if 'CRASH' in x or 'panic(' in x]
         self.kl_shader = [(t, x) for t, x in klog if x.startswith('HakiosMetal') and
@@ -501,6 +533,38 @@ class Ana:
             return top[1][0]
         return top[0][0]
 
+    def idle_gap(self, ev, a, b, pid):
+        """nothing was animating in [a, b]: the render server and the app idle, no app commits, big cores quiet,
+        and the app not blocked on another thread / the kernel (that would be a stall)"""
+        win = (b - a) * 1000
+        bbd, am, ld = ev.get('bb_display'), ev.get('app_main'), ev['cpu_load']
+        if bbd is None or bbd['on_ms'] > max(3.0, 0.03 * win):
+            return False
+        if am is not None:
+            if am['on_ms'] > 0.15 * win or am['runnable_ms'] > 0.1 * win:
+                return False
+            w = am['wakers']
+            if w and not w[0][0].startswith('kernel timer') and w[0][1] > 0.3 * win:
+                return False
+        if pid is not None and self.commits_in(pid, a + 2 * self.period, b - self.period):
+            return False
+        return max(ld['gold'], ld['prime']) <= 0.3
+
+    def launch_ready(self, pid, t, limit=6.0, win=0.5, step=0.05):
+        """ESTIMATE of interactable after a launch: the start of the first `win` s after t in which the app's main
+        thread is on CPU <= 15 % and commits no layer tree >= 2 KB (None: not within `limit` s)"""
+        main = self.main.get(pid)
+        if main is None:
+            return None
+        cs, cb = self.commits.get(pid, []), self.commit_bytes.get(pid, [])
+        x = t
+        while x + win <= min(t + limit, self.t1):
+            i, j = bisect.bisect_left(cs, x), bisect.bisect_right(cs, x + win)
+            if not any(cb[k] >= 2048 for k in range(i, j)) and self.thread_state(main, x, x + win)['on_ms'] <= 150 * win:
+                return x
+            x += step
+        return None
+
     def commits_in(self, pid, a, b):
         c = self.commits.get(pid, [])
         return c[bisect.bisect_left(c, a):bisect.bisect_right(c, b)]
@@ -585,6 +649,9 @@ class Ana:
         ev = {}
         main = self.main.get(pid) if pid is not None else None
         cm = self.commits_in(pid, a, b) if pid is not None else []
+        if kind == 'launch' and pid is not None:     # a launch waits for the first layer tree, not the connection setup
+            cm = [c for c, by in zip(self.commits.get(pid, []), self.commit_bytes.get(pid, [])) if a <= c <= b and
+                  by >= 4096] or cm
         first_c = cm[0] if cm else None
         ev['app'] = self.name(pid) if pid is not None else '?'
         ev['app_commits'] = len(cm)
@@ -615,7 +682,7 @@ class Ana:
         cr = self.between(self.kl_crash, a - 2, b + 1)
         if cr:
             ev['crash'] = [x[:140] for _, x in cr[:3]]
-        ex = self.between(self.kl_exec, a - 0.5, b)
+        ex = [x for x in self.between(self.kl_exec, a - 0.5, b) if x[1] not in DAEMONS]   # not toybox etc. (pa's own)
         if ex:
             ev['exec'] = [x for _, x in ex[:6]]
         gv = self.near(self.kl_gov, b + 2.5)
@@ -639,7 +706,7 @@ class Ana:
         causes = []
         app_late = first_c is None or (first_c - a) * 1000 > 0.4 * ms_win
         if self.in_gap(a, b):
-            causes.append(('trace gap (between chunks): not measured', 0))
+            causes.append(('trace gap (between chunks): not measured', float('inf')))
         if app_late:
             if am:
                 on, rn, bl = am['on_ms'], am['runnable_ms'], am['blocked_ms']
@@ -780,15 +847,24 @@ class Ana:
                 if fu is not None:
                     rec['up_resp_ms'] = round((F[fu] - u) * 1000, 1)
             # launch: an exec within 2 s after the up of a process that then commits
+            # (the gesture right before the exec: a later gesture that ends before the exec launched it, not this one)
             for t, nm in self.kl_exec:
-                if u - 0.05 <= t <= u + 2.0 and nm not in DAEMONS:
+                if u - 0.05 <= t <= u + 2.0 and nm not in DAEMONS and \
+                        not any(u < g2['up'] <= t + 0.05 for g2 in gest if g2 is not gg):
                     lp = [p for p, c in self.pname.items() if c[:15] == nm[:15] and self.commits.get(p)]
                     if lp:
-                        c0 = min(self.commits[lp[0]][0], 1e18)
-                        ff = self.frame_after(c0)
+                        cs, cb = self.commits[lp[0]], self.commit_bytes[lp[0]]
+                        c0 = next((c for c in cs if c >= t), cs[0])
+                        # the first layer tree with content (>= 4 KB): the connection setup right after exec is not
+                        cc = next((c for c, by in zip(cs, cb) if c >= t and by >= 4096), None)
+                        ff = self.frame_after(cc if cc is not None else c0)
+                        rd = self.launch_ready(lp[0], F[ff]) if ff is not None else None
                         rec['launch'] = {'app': nm, 'exec_ms': round((t - u) * 1000), 'first_commit_ms':
-                                         round((c0 - u) * 1000), 'first_frame_ms':
-                                         round((F[ff] - u) * 1000) if ff is not None else None}
+                                         round((c0 - u) * 1000), 'first_content_commit_ms':
+                                         round((cc - u) * 1000) if cc is not None else None, 'first_frame_ms':
+                                         round((F[ff] - u) * 1000) if ff is not None else None,
+                                         'ready_est_ms': round((rd - u) * 1000) if rd is not None else None}
+                        break
                         break
             res['gestures'].append(rec)
             # slow: response
@@ -801,16 +877,18 @@ class Ana:
             if rec.get('launch') and rec['launch']['first_frame_ms'] and rec['launch']['first_frame_ms'] > a.launch_ms:
                 la = rec['launch']
                 lp = [p for p, c in self.pname.items() if c[:15] == la['app'][:15] and self.commits.get(p)]
-                ff = self.frame_after(u + la['first_commit_ms'] / 1000)
+                ff = self.frame_after(u + (la['first_content_commit_ms'] if la['first_content_commit_ms'] is not None
+                                           else la['first_commit_ms']) / 1000)
                 ev = self.attribute(u, F[ff] if ff is not None else u + la['first_frame_ms'] / 1000,
                                     lp[0] if lp else tgt, ff, 'launch')
-                res['slow'].append({'type': 'app launch (tap up -> first app frame)', 't': round(self.rel(u), 3),
+                res['slow'].append({'type': 'app launch (up -> first app content frame)', 't': round(self.rel(u), 3),
                                     'ms': la['first_frame_ms'], 'gesture': n, 'kind': gg['kind'], 'app': la['app'],
                                     'ev': ev, 'shot': shot_near(u + 1)})
         # gaps in running animations (anywhere in the session)
         gap = a.gap_ms / 1000
         anim = 3.6 * per
         touch_iv = [(gg['down'], gg['up']) for gg in gest]
+        skipped = collections.Counter()
         for i in range(1, len(F)):
             dt = F[i] - F[i - 1]
             if dt <= gap or i in used_frames:
@@ -821,17 +899,29 @@ class Ana:
             if not ((prev_ok and next_ok) or (drag and (prev_ok or next_ok))):
                 continue
             a0, b0 = F[i - 1], F[i]
+            tgap = self.in_gap(a0, b0)
+            # a new touch well inside the gap: the frame after it is that touch's response (measured per gesture)
+            if not drag and not tgap and any(a0 + 0.1 < x < b0 for x, _ in touch_iv):
+                skipped['new touch'] += 1
+                continue
             gn = max((k + 1 for k, (x, y) in enumerate(touch_iv) if x - 0.05 <= b0 and y + 3 >= a0), default=None)
             pid = gpid.get(gn) if gn else None
             if pid is None:
                 pid = self.front(a0 - 0.5, b0 + 0.2)
             ev = self.attribute(a0, b0, pid, i, 'gap')
-            res['slow'].append({'type': 'frame gap in animation' + (' (finger down)' if drag else ''),
+            if not drag and not tgap and self.idle_gap(ev, a0, b0, pid):
+                ev['idle'] = True
+                ev['other_causes'] = [ev['cause']] + ev['other_causes'][:2]
+                ev['cause'] = 'idle: nothing animating (render server and app idle, no app commits): not a stall'
+            res['slow'].append({'type': ('frame gap across a trace gap' if tgap else 'frame gap in animation')
+                                + (' (finger down)' if drag else ''),
                                 't': round(self.rel(a0), 3), 'ms': round(dt * 1000, 1), 'gesture': gn,
                                 'kind': gest[gn - 1]['kind'] if gn else None,
                                 'app': ev['app'], 'ev': ev, 'shot': shot_near(a0)})
         for s in res['slow']:
-            s['counted'] = not s['ev'].get('fade') and not s['ev']['cause'].startswith('trace gap')
+            s['counted'] = not s['ev'].get('fade') and not s['ev'].get('idle') and \
+                not s['ev']['cause'].startswith('trace gap')
+        res['gaps_skipped'] = dict(skipped)
         res['slow'].sort(key=lambda s: -s['ms'])
         # cadence labels for gestures (median interval >= 2 vsync while the app commits at that rate)
         for rec in res['gestures']:
@@ -1005,8 +1095,11 @@ def main():
         sys.exit(f'{d}: no chunks/*.swtr or *.swtr')
     g = G()
     log(f'reading {len(files)} trace file(s)')
+    carry = None
     for f in files:
-        scan_chunk(f, g, log)
+        carry = scan_chunk(f, g, log, carry)
+    if carry is not None:
+        flush_carry(carry, g)
     t_read = time.time() - tstart
     lo = min(c[0] for c in g.chunks)
     hi = max(c[1] for c in g.chunks)
@@ -1040,7 +1133,9 @@ def main():
     pr(f'UI session {os.path.abspath(d)}')
     pr(f'{len(files)} trace file(s), {sum(c[4] for c in g.chunks)} events, {res["span_s"]:.1f} s from '
        f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall0))} (mach {lo:.3f} s); chunk gaps '
-       f'{[round((y - x) * 1000) for x, y in res["gaps"]]} ms; wrapped {sum(c[5] for c in g.chunks)}, dropped '
+       f'{[round((y - x) * 1000) for x, y in res["gaps"]]} ms'
+       + (f' ({g.contig} file boundaries with no gap: rotation)' if g.contig else '') + '; wrapped'
+       f' {sum(c[5] for c in g.chunks)}, dropped '
        f'{sum(c[6] for c in g.chunks)}; klog {len(klog)} lines ({os.path.basename(kpath) if kpath else "none"}); '
        f'{len(shots)} shots')
     pr(f'vsync {per:.2f} ms; {len(ana.frames)} frames on screen; display thread {ana.tname(ana.disp) if ana.disp else "?"}'
@@ -1050,7 +1145,8 @@ def main():
     pr('')
     counted = [s for s in res['slow'] if s['counted']]
     pr(f'== worst {min(a.worst, len(counted))} of {len(counted)} slow moments '
-       f'({len(res["slow"]) - len(counted)} more labelled app-paced fade / trace gap, not counted)')
+       f'({len(res["slow"]) - len(counted)} more labelled app-paced fade / trace gap / idle, not counted; '
+       f'{sum(res.get("gaps_skipped", {}).values())} gaps ending in a new touch skipped)')
     for i, s in enumerate(counted[:a.worst], 1):
         pr(f'{i:2d}. t {s["t"]:8.3f}  {s["ms"]:6.0f} ms  {s["type"]}'
            + (f' [#{s["gesture"]} {s["kind"]}]' if s['gesture'] else '') + f'  app {s["app"]}')
@@ -1064,8 +1160,9 @@ def main():
     nf = [s for s in res['slow'] if not s['counted']]
     if nf:
         pr('')
-        pr('== not counted (app-paced animations: the app commits every 2+ vsyncs and its main thread is idle; trace gaps)')
-        for s in nf[:10]:
+        pr('== not counted (app-paced animations: the app commits every 2+ vsyncs and its main thread is idle; '
+           'trace gaps; idle: nothing was animating)')
+        for s in nf[:20]:
             pr(f'    t {s["t"]:8.3f} {s["ms"]:6.0f} ms {s["type"]} app {s["app"]}: {s["ev"]["cause"]}')
     pr('')
     pr('== gestures (resp = touch -> first frame from a still screen: from the down, or for a tap with no frame while '
@@ -1080,7 +1177,9 @@ def main():
            f'{gr["frames"]:6d} {gr["fps"]:5.1f} {gr["anim_ms"]:7d}  {h.get("1", 0):3d}/{h.get("2", 0)}/{h.get("3", 0)}'
            f'/{h.get("4+", 0)}'.ljust(22) + f'   {gr["worst_interval_ms"] or "-"}'
            + (f'  LAUNCH {gr["launch"]["app"]}: exec +{gr["launch"]["exec_ms"]} ms, first commit '
-              f'+{gr["launch"]["first_commit_ms"]} ms, first frame +{gr["launch"]["first_frame_ms"]} ms'
+              f'+{gr["launch"]["first_commit_ms"]} ms, first content commit '
+              f'+{gr["launch"].get("first_content_commit_ms")} ms, first app frame +{gr["launch"]["first_frame_ms"]} ms, '
+              f'ready (estimate: main thread quiet) +{gr["launch"].get("ready_est_ms")} ms'
               if gr.get('launch') else '') + (f'  [{gr["note"]}]' if gr.get('note') else ''))
     # per app
     pr('')

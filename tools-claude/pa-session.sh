@@ -2,17 +2,23 @@
 # pa-session.sh: free-form UI session recorder (called as `pa session ...`; also runs on its own).
 #
 #   pa session NAME [SECS] [--chunk S] [--shots S] [--pull auto|live|end] [--classes LIST] [--no-analyse]
-#                          [--no-lock] [--min-free-mb N]
+#                          [--no-lock] [--min-free-mb N] [--no-rotate]
 #   pa session-stop          stop a running session early (= Ctrl-C in its terminal)
 #
 # The owner uses the phone freely (taps, swipes, apps) while this records; nothing is injected, the display is not
 # woken or slept, no process is restarted. SECS default 180 (max 900).
 #
 # What it records (everything in logs/sessions/NAME-MMDD-HHMMSS/):
-#   chunks/cNNN.swtr  sweettrace, back to back: chunk N+1 starts the moment chunk N gives up kdebug (KDREMOVE, before
-#                     N writes its file), so the gaps are ~0.1-0.3 s (measured: manifest.json "gaps_ms"). Each chunk
-#                     is `sweettrace -t CHUNK -m 8388608 -n -c CLASSES` (CLASSES default 0x21/0xa6,0x31 as pa trace;
-#                     kernel buffer 64 MB read every 100 ms). ~9-13 MB/s of trace on the phone: 180 s ~ 1.6-2.3 GB.
+#   chunks/cNNN.swtr  the trace in CHUNK-second files (CLASSES default 0x21/0xa6,0x31 as pa trace; kernel buffer 64 MB
+#                     read every 100 ms; ~9-22 MB/s of trace on the phone: 180 s ~ 1.6-4 GB). Two ways, chosen by
+#                     what the phone's sweettrace can do (`sweettrace -V` says "rotate"; session.log names the mode):
+#                     rotate (sweettrace 2): ONE `sweettrace -t SECS -s CHUNK -m 8388608 -n -c CLASSES` for the
+#                       whole session: one kdebug session, a new file every CHUNK s, NO gap between files (file N
+#                       ends at the time stamp where N+1 starts).
+#                     chunks (older sweettrace, or --no-rotate): one `sweettrace -t CHUNK ...` per chunk, back to
+#                       back; chunk N+1 starts trying 1 s before N ends (absolute phone time) and gets kdebug when N
+#                       releases it (KDREMOVE, before N writes its file). Gaps measured: manifest.json "gaps_ms"
+#                       (hands1, the old loop: 1.0-2.0 s, see below; this loop: expected ~0.1-0.3 s).
 #   --pull auto       (default) end if /private/var has room for all chunks + --min-free-mb (default 1500) to spare,
 #                     else live. end: everything stays on the phone until the session stops (no ssh copies loading the
 #                     CPU while you use it), then pulled (~30 MB/s: ~60 s for 180 s). live: each chunk is pulled
@@ -39,12 +45,12 @@ PT=/var/local/bin/toybox PTF=/var/local/bin/toybox-full ST=/var/local/bin/sweett
 STOPF=/tmp/pa-session.stop
 
 usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
-name= secs=180 chunk=15 shots=3 pull=auto classes='0x21/0xa6,0x31' analyse=1 lock=1 minfree=1500
+name= secs=180 chunk=15 shots=3 pull=auto classes='0x21/0xa6,0x31' analyse=1 lock=1 minfree=1500 rotate=auto
 while [ $# -gt 0 ]; do
 	case $1 in
 	--chunk) chunk=$2; shift 2;; --shots) shots=$2; shift 2;; --pull) pull=$2; shift 2;;
 	--classes) classes=$2; shift 2;; --no-analyse) analyse=; shift;; --no-lock) lock=; shift;;
-	--min-free-mb) minfree=$2; shift 2;; -h|--help) usage;;
+	--min-free-mb) minfree=$2; shift 2;; --no-rotate) rotate=no; shift;; -h|--help) usage;;
 	-*) echo "unknown option $1"; usage;;
 	*) if [ -z "$name" ]; then name=$1; else secs=$1; fi; shift;;
 	esac
@@ -71,6 +77,9 @@ fi
 H=192.168.7.2
 phone_up || { echo "session: the phone does not answer on USB ($H)"; exit 1; }
 ssh_to $H "test -x $ST" || { echo "session: no $ST on the phone"; exit 1; }
+# rotate: sweettrace 2 (-s SECS, one kdebug session, files with no gap); else the per-chunk loop
+stver=$(ssh_to $H "$ST -V 2>/dev/null" </dev/null | head -1 | tr -d '\r')
+if [ "$rotate" = auto ]; then case $stver in *rotate*) rotate=yes;; *) rotate=no;; esac; fi
 ssh_to $H "$PT pgrep -x sweettrace" >/dev/null 2>&1 && { echo "session: a sweettrace runs on the phone already (pa trace?)"; exit 1; }
 old=$(ssh_to $H "$PT ls /var/tmp/pa-sess-$name 2>/dev/null | $PT grep -c 'swtr\$'" </dev/null | tr -d ' \r')
 [ "${old:-0}" -gt 0 ] && { echo "session: /var/tmp/pa-sess-$name holds $old chunk(s) of an earlier session not pulled yet: pull them (pa get) or use another NAME"; exit 1; }
@@ -92,6 +101,8 @@ if [ "$free_mb" -lt $(( chunk * 14 * 3 + minfree )) ]; then
 	log "session: only $free_mb MB free on /private/var (need $(( chunk * 14 * 3 + minfree )) MB even for live pulls)"; exit 1
 fi
 log "session $name: ${secs}s, chunks ${chunk}s, shots every ${shots}s, pull $pull (phone free $free_mb MB, ~$need_mb MB needed), classes $classes -> ${dir#$P/}/"
+if [ "$rotate" = yes ]; then log "trace: rotating files, one kdebug session, no gaps ($stver)"
+else log "trace: chunk loop (${stver:-sweettrace 1: no -s}; gaps ~0.1-0.3 s expected; install sweettrace 2 for none)"; fi
 
 # ---- display state (iOS's own last change, from the sweetmon klog copy: no phone command)
 monklog=$(ls -t "$P"/logs/mon/klog-*.txt 2>/dev/null | head -1)
@@ -107,27 +118,50 @@ for i in 1 2 3; do
 	echo -e "$a\t$p\t$b" >> "$dir/clock.tsv"
 done
 
-# ---- the phone-side chain (dash): chunk after chunk, each started the moment the previous one releases kdebug
+# ---- the phone-side chain (dash)
+if [ "$rotate" = yes ]; then
+# rotate: one sweettrace for the whole session; it writes the CHUNK START/DONE lines itself (stdout, line buffered)
 cat > "$dir/chain.sh" <<EOF
 D=$D; ST=$ST; PT=$PT; SEG=$chunk; TOTAL=$secs; CLS='$classes'
 trap '' HUP
 log() { echo "\$*" >> \$D/chain.log; }
 now() { $PTF date +%s.%N 2>/dev/null || \$PT date +%s; }
-sec() { \$PT date +%s; }
-T_END=\$(( \$(sec) + TOTAL ))
-# start chunk \$1 for \$2 s; while the previous chunk still owns kdebug, sweettrace exits at once (EBUSY): retry
+log "CHAIN BEGIN \$(now) seg \$SEG total \$TOTAL rotate"
+\$ST -t \$TOTAL -s \$SEG -m 8388608 -n -c \$CLS -o \$D/c%03d.swtr >> \$D/chain.log 2> \$D/sweettrace.err &
+pid=\$!
+while kill -0 \$pid 2>/dev/null; do
+	if [ -f \$D/stop ]; then log "STOP \$(now) (stop file)"; kill -TERM \$pid 2>/dev/null; break; fi
+	\$PT sleep 0.5
+done
+wait \$pid; rc=\$?
+\$PT grep -q '^CHUNK 1 START' \$D/chain.log || log "CHUNK 1 FAILED \$(\$PT tr '\n' ' ' < \$D/sweettrace.err)"
+log "END \$(now) rc \$rc"
+EOF
+else
+# chunks: one sweettrace per chunk. Timing is absolute (phone ms clock): the old loop counted 1 s sleeps, and every
+# step's process starts (toybox sleep, date) added ~70-140 ms under trace load, so it woke 1-2 s late, after the
+# running chunk had already ended (hands1: "tries 0" on every chunk = never overlapped; gaps 0.97-2.02 s).
+cat > "$dir/chain.sh" <<EOF
+D=$D; ST=$ST; PT=$PT; SEG=$chunk; TOTAL=$secs; CLS='$classes'; LEAD=1000
+trap '' HUP
+log() { echo "\$*" >> \$D/chain.log; }
+now() { $PTF date +%s.%N 2>/dev/null || \$PT date +%s; }
+ms() { t=\$($PTF date +%s%N 2>/dev/null) && [ \${#t} -gt 12 ] && echo \$(( t / 1000000 )) || echo \$(( \$(\$PT date +%s) * 1000 )); }
+T_END=\$(( \$(ms) + TOTAL * 1000 ))
+# start chunk \$1 for \$2 s; while the previous chunk still owns kdebug, sweettrace exits at once (EBUSY): retry.
+# Sets pid and c0 (ms when the chunk was seen tracing).
 start_chunk() {
 	f=\$D/c\$(printf %03d \$1).swtr; n=0
-	while [ \$n -lt 600 ]; do
+	while [ \$n -lt 2000 ]; do
 		\$ST -t \$2 -m 8388608 -n -c \$CLS -o \$f > \$f.out 2>&1 &
 		pid=\$!; k=0
-		while [ \$k -lt 60 ]; do
-			\$PT grep -q 'kernel buffer' \$f.out 2>/dev/null && { log "CHUNK \$1 START \$(now) pid \$pid tries \$n secs \$2"; return 0; }
+		while [ \$k -lt 200 ]; do
+			\$PT grep -q 'kernel buffer' \$f.out 2>/dev/null && { c0=\$(ms); log "CHUNK \$1 START \$(now) pid \$pid tries \$n secs \$2"; return 0; }
 			kill -0 \$pid 2>/dev/null || break
-			\$PT sleep 0.005; k=\$((k+1))
+			k=\$((k+1))
 		done
-		kill -0 \$pid 2>/dev/null && { log "CHUNK \$1 START \$(now) pid \$pid tries \$n secs \$2 (late start line)"; return 0; }
-		n=\$((n+1)); \$PT sleep 0.005
+		kill -0 \$pid 2>/dev/null && { c0=\$(ms); log "CHUNK \$1 START \$(now) pid \$pid tries \$n secs \$2 (late start line)"; return 0; }
+		n=\$((n+1))
 	done
 	log "CHUNK \$1 FAILED \$(\$PT tr '\n' ' ' < \$f.out)"; return 1
 }
@@ -137,29 +171,32 @@ done_check() {	# log DONE for the previous chunk once its process has written th
 	log "CHUNK \$prevn DONE \$(\$PT stat -c %s \$D/c\$(printf %03d \$prevn).swtr 2>/dev/null) \$(\$PT tail -1 \$D/c\$(printf %03d \$prevn).swtr.out | \$PT tr -d '\n')"
 	prev=; prevn=
 }
-log "CHAIN BEGIN \$(now) seg \$SEG total \$TOTAL"
+log "CHAIN BEGIN \$(now) seg \$SEG total \$TOTAL chunks"
 i=1; prev=; prevn=
 dur=\$SEG; [ \$dur -gt \$TOTAL ] && dur=\$TOTAL
 start_chunk 1 \$dur || { log "END \$(now) failed"; exit 1; }
 cur=\$pid
 while :; do
-	# sleep to ~0.3 s before the current chunk ends (1 s steps: the stop file is seen within a second)
-	s=0; stopped=
-	while [ \$s -lt \$((dur - 1)) ]; do
+	# sleep until LEAD ms before the current chunk ends (absolute; steps of at most 1 s: the stop file is seen within 1 s)
+	stopped=
+	while :; do
 		[ -f \$D/stop ] && { stopped=1; break; }
-		\$PT sleep 1; s=\$((s + 1)); done_check
+		r=\$(( c0 + dur * 1000 - LEAD - \$(ms) ))
+		[ \$r -le 0 ] && break
+		[ \$r -gt 1000 ] && r=1000
+		\$PT sleep \$(( r / 1000 )).\$(printf %03d \$(( r % 1000 )))
+		done_check
 	done
-	[ -n "\$stopped" ] || \$PT sleep 0.6
-	left=\$(( T_END - \$(sec) ))
-	if [ -n "\$stopped" ] || [ -f \$D/stop ] || [ \$left -le 1 ]; then
+	left=\$(( T_END - \$(ms) ))
+	if [ -n "\$stopped" ] || [ -f \$D/stop ] || [ \$left -le 1500 ]; then
 		[ -n "\$stopped" ] || [ -f \$D/stop ] && { kill -TERM \$cur 2>/dev/null; log "STOP \$(now) (stop file)"; }
 		while kill -0 \$cur 2>/dev/null; do \$PT sleep 0.2; done_check; done
 		while [ -n "\$prev" ]; do \$PT sleep 0.2; done_check; done
 		prev=\$cur; prevn=\$i; done_check
 		break
 	fi
-	# next chunk: tries from now on until the current one releases kdebug (~0.3 s of EBUSY retries)
-	n2=\$SEG; [ \$n2 -gt \$((left - 1)) ] && n2=\$((left - 1))
+	# next chunk: tries from now on until the current one releases kdebug (EBUSY until its KDREMOVE)
+	n2=\$SEG; ls_=\$(( (left - LEAD + 500) / 1000 )); [ \$n2 -gt \$ls_ ] && n2=\$ls_; [ \$n2 -lt 1 ] && n2=1
 	while [ -n "\$prev" ]; do \$PT sleep 0.2; done_check; done
 	prev=\$cur; prevn=\$i
 	i=\$((i + 1))
@@ -169,6 +206,7 @@ while :; do
 done
 log "END \$(now)"
 EOF
+fi
 
 ssh_to $H "$PT rm -rf $D; $PT mkdir -p $D && $PT cat > $D/chain.sh" < "$dir/chain.sh" || { log "session: could not write the chain script"; exit 1; }
 # the chain's log, streamed (one ssh session for the whole recording)
@@ -233,7 +271,8 @@ pull_chunk() {	# N: pull cNNN.swtr (+ .out), check the size, delete it on the ph
 	sz=$(grep -m1 "^CHUNK $n DONE" "$dir/chain.log" | awk '{print $4}')
 	run "pull $D/$f ${dir#$P/}/chunks/$f" | tail -1 | sed "s/^/  chunk $n: /" | tee -a "$dir/session.log"
 	got=$(stat -c %s "$dir/chunks/$f" 2>/dev/null || echo 0)
-	ssh_to $H "$PT cat $D/$f.out" > "$dir/chunks/$f.out" 2>/dev/null
+	if [ "$rotate" = yes ]; then grep -m1 "^CHUNK $n DONE" "$dir/chain.log" | cut -d' ' -f5- > "$dir/chunks/$f.out"
+	else ssh_to $H "$PT cat $D/$f.out" > "$dir/chunks/$f.out" 2>/dev/null; fi
 	if [ -n "$sz" ] && [ "$got" = "$sz" ]; then
 		ssh_to $H "$PT rm -f $D/$f" </dev/null; pulled="$pulled$n "
 	else log "chunk $n: pulled $got of ${sz:-?} bytes: left on the phone ($D/$f)"; fi
@@ -269,7 +308,7 @@ for n in $(grep '^CHUNK [0-9]* DONE' "$dir/chain.log" | awk '{print $2}'); do
 	[[ $pulled == *" $n "* ]] || pull_chunk "$n"
 done
 [ -n "$shotpid" ] && wait "$shotpid" 2>/dev/null
-nleft=$(ssh_to $H "$PT ls $D/ | $PT grep -c 'swtr$'" | tr -d ' \r')
+nleft=$(ssh_to $H "$PT ls $D/ | $PT grep -cE 'swtr(\.part)?$'" | tr -d ' \r')
 if [ "${nleft:-1}" = 0 ]; then ssh_to $H "$PT rm -rf $D" </dev/null; else log "left on the phone: $D ($nleft chunk(s) not pulled completely)"; fi
 log "pulled in $(python3 -c "print(f'{$(now)-$tp0:.0f}')") s"
 [ -n "$lock" ] && { flock -u 9; exec 9>&-; }
