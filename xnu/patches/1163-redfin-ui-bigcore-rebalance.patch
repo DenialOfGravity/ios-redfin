@@ -1,0 +1,402 @@
+From 9346326401f39da224d9308422385817f52b12b9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 18:12:54 +0100
+Subject: [PATCH] 1163 redfin: kern.sweet_ui_rebal hold/pull for tagged CA
+ threads (default 0, interim until AMP)
+
+---
+ bsd/dev/sweet_cpufreq.c |  28 +++++
+ osfmk/kern/sched_prim.c | 264 ++++++++++++++++++++++++++++++++++++++++
+ osfmk/kern/thread.h     |   2 +
+ 3 files changed, 294 insertions(+)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 3b67bac..38bd3c4 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -231,6 +231,28 @@ sysctl_sweet_ui_bigcore SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_ui_bigcore, "I", "SWEET UI: CA threads on the big cores (1 display, 2 render-server; 0 off; 1106: 4 split, 8 no cross, 16 equal pri; 1121: 32 hakios.metal.defer* as display)");
+ 
++/*
++ * 1163, interim until native AMP/Edge scheduling; remove with the AMP topology work: kern.sweet_ui_rebal MASK
++ * (osfmk/kern/sched_prim.c; boot-arg sweetuirebal=N; default 0 = as before): 1 hold a tagged CA thread (class on in
++ * kern.sweet_ui_bigcore) on the idle big core choose_processor gave it (soft bind for one enqueue), 2 pull a tagged
++ * thread off an A55 when CPU6/7 is about to idle. Line SWEET UI: rebal 5s every 5 s while not 0.
++ */
++extern int sweet_ui_rebal;
++extern int sweet_ui_rebal_set(int value, const char *why);
++static int
++sysctl_sweet_ui_rebal SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, sweet_ui_rebal, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	return sweet_ui_rebal_set(value, "sysctl") == 0 ? 0 : EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ui_rebal, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ui_rebal, "I", "SWEET UI 1163: 1 hold tagged CA threads on the chosen idle big core, 2 pull them off an A55 when CPU6/7 idles (0 off)");
++
+ /* 1037: the lowest choosable position at or above PCT % of the top (0 = no hold) */
+ static unsigned
+ cf_hold_pos(const struct cf_dom *d, int pct)
+@@ -706,6 +728,12 @@ void
+ sweet_cpufreq_init(void)
+ {
+ 	unsigned want = 1;
++	{
++		int rb = 0;      /* 1163: sweetuirebal=N sets kern.sweet_ui_rebal at boot */
++		if (PE_parse_boot_argn("sweetuirebal", &rb, sizeof(rb)) && sweet_ui_rebal_set(rb, "boot-arg sweetuirebal") != 0) {
++			printf("SWEET UI: sweetuirebal=%d ignored (0..3)\n", rb);
++		}
++	}
+ 	(void)PE_parse_boot_argn("flamecpufreq", &want, sizeof(want));
+ 	{
+ 		/* 0970: sweetgov=XXYY (e.g. 4060), sweetboost=MHZ, sweetboostms=MS */
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 340c498..dd34ccc 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2588,6 +2588,17 @@ restart:
+ 
+ 		bool avoid_processor     = !is_yielding && SCHED(avoid_processor_enabled) && SCHED(thread_avoid_processor)(processor, thread);
+ 
++#if defined(__arm64__)
++		{
++			/* 1163 (interim until AMP): kern.sweet_ui_rebal pull pending for this CPU: the tagged thread goes back through thread_setrun */
++			extern uint64_t sweet_rebal_pull_mask;
++			extern bool sweet_rebal_pull_take(processor_t processor, thread_t thread, bool still_running);
++			if (__improbable(sweet_rebal_pull_mask != 0) && sweet_rebal_pull_take(processor, thread, still_running && !is_yielding)) {
++				avoid_processor = true;
++			}
++		}
++#endif
++
+ 		bool ok_to_run_realtime_thread = sched_ok_to_run_realtime_thread(pset, processor, true);
+ 
+ 		bool current_thread_can_keep_running = (still_running && !needs_smt_rebalance && !affinity_mismatch && !bound_elsewhere && !avoid_processor);
+@@ -2980,6 +2991,13 @@ thread_invoke(
+ 
+ 	thread_lock(thread);
+ 
++#if defined(__arm64__)
++	if (__improbable(thread->sched_flags & (TH_SFLAG_SWEET_SOFTBIND | TH_SFLAG_SWEET_PULLED))) {
++		extern void sweet_rebal_dispatched(thread_t thread, processor_t processor);
++		sweet_rebal_dispatched(thread, current_processor());       /* 1163: hold ends here (off the run queue, thread locked) */
++	}
++#endif
++
+ 	assert_thread_magic(thread);
+ 	assert((thread->state & (TH_RUN | TH_WAIT | TH_UNINT | TH_TERMINATE | TH_TERMINATE2)) == TH_RUN);
+ 	assert(thread->bound_processor == PROCESSOR_NULL || thread->bound_processor == current_processor());
+@@ -3576,6 +3594,10 @@ thread_dispatch(
+ 				extern void sweet_ui_account(thread_t thread, processor_t processor);
+ 				sweet_ui_account(thread, processor);    /* 1041 */
+ 			}
++			if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_SOFTBIND)) {
++				extern void sweet_rebal_unbind(thread_t thread, int why);
++				sweet_rebal_unbind(thread, 3);         /* 1163: safety net (thread_invoke already cleared it) */
++			}
+ #endif
+ 			thread->computation_metered += (processor->last_dispatch - thread->computation_epoch);
+ 
+@@ -5216,10 +5238,226 @@ sweet_pace_set_sb(task_t task)
+ 	return tid;
+ }
+ 
++/*
++ * redfin 1163, interim until native AMP/Edge scheduling; remove with the AMP topology work.
++ * kern.sweet_ui_rebal MASK (bsd/dev/sweet_cpufreq.c; boot-arg sweetuirebal=N; default 0 = exactly as before).
++ * This kernel runs the clutch scheduler (no __AMP__: SCHED() = sched_clutch_dispatch) with one pset for all 8 CPUs, so
++ * 1041's choice of an idle CPU6/7 is only an IPI target: the thread waits in the pset-shared clutch hierarchy and an A55
++ * already in thread_select takes it before the A76 leaves WFI (and a non-RT wakeup to an idle core may use a deferred
++ * IPI); a tagged thread that started a frame burst on an A55 also stays there after a big core goes idle.
++ *   1 hold: thread_setrun, unbound case: when choose_processor gave a tagged thread (class enabled in
++ *     kern.sweet_ui_bigcore, below RT) an idle, recommended CPU6/7, the thread is soft bound to it for this one enqueue:
++ *     bound_processor = that CPU + TH_SFLAG_SWEET_SOFTBIND, so the clutch scheduler queues it on that CPU's bound run
++ *     queue (no other CPU dequeues it; sched_clutch_choose_thread prefers the bound queue on equal priority), and the
++ *     wakeup IPI is immediate (SCHED_REBALANCE event, never deferred). The bind is set only while the thread is on no
++ *     run queue and cleared only while it is on none: when it is dispatched (thread_invoke, on any CPU), when it is
++ *     queued again before running (thread_setrun entry: priority change, thread_run_queue_reinsert; it is chosen anew)
++ *     and, as a safety net, when it goes off core (thread_dispatch). Clutch run counts: a bound thread is not counted in
++ *     its clutch bucket group (SCHED_CLUTCH_THREAD_ELIGIBLE), so binding takes the runnable thread's count out and
++ *     unbinding puts it back (only if still runnable), the same accounting sched_clutch_run_incr/decr,
++ *     sched_clutch_update_thread_bucket and the thread-group change apply to bound threads in between. RT threads are
++ *     never held (the RT run queue is pset-wide and ignores bound_processor).
++ *   2 pull: CPU6/7 about to wait for interrupt (processor_idle, at entry and after every wake that finds no work): an
++ *     A55 running a tagged thread (enabled class, below RT, running >= 200 us) gets a pull: its bit in
++ *     sweet_rebal_pull_mask (pset lock) + a REBALANCE IPI. csw_check_locked answers AST_PREEMPT|AST_URGENT for it and
++ *     thread_select treats it like avoid_processor (AST_REBALANCE), so thread_dispatch puts the thread back through
++ *     thread_setrun -> choose_processor (1041 takes the idle big core; with bit 1 it is held there). At most one pull in
++ *     flight per big core and per A55; a pull not taken within 2 ms expires. Only A55 -> big moves: no ping-pong.
++ * With the mask 0 every hook is one flag/word test; turning it off leaves no thread bound (the hooks key on the thread
++ * flags, not on the mask). Line every 5 s with the SWEET UI lines while the mask is not 0:
++ *   SWEET UI: rebal 5s: hold set N ran-on-target N ran-elsewhere N cleared-on-block N | pull sent N landed-big N | mode M
++ *   | requeued N expired N
++ */
++int sweet_ui_rebal;                     /* 1163: default 0 (off) */
++uint64_t sweet_rebal_pull_mask;         /* 1163: A55s with a pull pending (pset lock) */
++static uint8_t sweet_rebal_pull_tgt[2];         /* per big core (CPU6, CPU7): A55 cpu + 1 of its pull in flight, 0 none */
++static uint64_t sweet_rebal_pull_at[2];         /* when that pull was sent (mach absolute time) */
++static uint64_t sweet_rebal_abs_200us, sweet_rebal_abs_2ms;
++/* 0 hold set, 1 ran-on-target, 2 ran-elsewhere, 3 cleared-on-block, 4 requeued, 5 pull sent, 6 landed-big, 7 expired */
++static uint32_t sweet_rebal_st[8];
++
++static inline bool
++sweet_rebal_cls_on(uint32_t sflags)
++{
++	int ui = ((sflags & TH_SFLAG_SWEET_UI_DISPLAY) ? 1 : 0) | ((sflags & TH_SFLAG_SWEET_UI_RS) ? 2 : 0);
++	return (ui & sweet_ui_bigcore) != 0;
++}
++
++int sweet_ui_rebal_set(int value, const char *why);
++int
++sweet_ui_rebal_set(int value, const char *why)
++{
++	if (value < 0 || value > 3) {
++		return -1;
++	}
++	sweet_ui_rebal = value;
++	printf("SWEET UI: rebal %d (%s; 1163: 1 hold tagged CA threads on the idle big core choose_processor gave them, "
++	    "2 pull them off an A55 when CPU6/7 idles; 0 off; interim until AMP)\n", value, why);
++	return 0;
++}
++
++/* thread locked, on no run queue: end a hold (why: sweet_rebal_st index) */
++void sweet_rebal_unbind(thread_t thread, int why);
++void
++sweet_rebal_unbind(thread_t thread, int why)
++{
++	assert(thread->runq == PROCESSOR_NULL);
++	thread->sched_flags &= ~TH_SFLAG_SWEET_SOFTBIND;
++	thread->bound_processor = PROCESSOR_NULL;
++#if CONFIG_SCHED_CLUTCH && !__AMP__
++	if ((thread->state & (TH_RUN | TH_IDLE)) == TH_RUN) {
++		sched_clutch_thread_run_bucket_incr(thread, thread->th_sched_bucket);   /* counted again (see above) */
++	}
++#endif
++	os_atomic_inc(&sweet_rebal_st[why], relaxed);
++}
++
++/* thread_setrun, unbound case: thread and the processor's pset locked, thread on no run queue */
++void sweet_rebal_hold(thread_t thread, processor_t processor, sched_options_t *options);
++void
++sweet_rebal_hold(thread_t thread, processor_t processor, sched_options_t *options)
++{
++#if CONFIG_SCHED_CLUTCH && !__AMP__
++	if (processor->cpu_id < 6 || processor->state != PROCESSOR_IDLE || !processor->is_recommended ||
++	    processor->processor_primary != processor || thread->bound_processor != PROCESSOR_NULL ||
++	    thread->sched_pri >= BASEPRI_RTQUEUES || (thread->state & (TH_RUN | TH_IDLE)) != TH_RUN ||
++	    !sweet_rebal_cls_on(thread->sched_flags)) {
++		return;
++	}
++	sched_clutch_thread_run_bucket_decr(thread, thread->th_sched_bucket);   /* bound threads are not counted */
++	thread->bound_processor = processor;
++	thread->sched_flags |= TH_SFLAG_SWEET_SOFTBIND;
++	*options |= SCHED_REBALANCE;    /* processor_setrun: immediate IPI (SCHED_IPI_EVENT_REBALANCE), not deferred */
++	os_atomic_inc(&sweet_rebal_st[0], relaxed);
++#else
++	(void)thread; (void)processor; (void)options;
++#endif
++}
++
++/* thread_invoke: the thread is about to run on processor (thread locked, on no run queue) */
++void sweet_rebal_dispatched(thread_t thread, processor_t processor);
++void
++sweet_rebal_dispatched(thread_t thread, processor_t processor)
++{
++	if (thread->sched_flags & TH_SFLAG_SWEET_SOFTBIND) {
++		sweet_rebal_unbind(thread, thread->bound_processor == processor ? 1 : 2);
++	}
++	if (thread->sched_flags & TH_SFLAG_SWEET_PULLED) {
++		thread->sched_flags &= ~TH_SFLAG_SWEET_PULLED;
++		if (processor->cpu_id >= 6) {
++			os_atomic_inc(&sweet_rebal_st[6], relaxed);
++		}
++	}
++}
++
++/* thread_select (pset and thread locked): take this CPU's pending pull; true = the current thread leaves */
++bool sweet_rebal_pull_take(processor_t processor, thread_t thread, bool still_running);
++bool
++sweet_rebal_pull_take(processor_t processor, thread_t thread, bool still_running)
++{
++	int cpu = processor->cpu_id;
++	if (cpu >= 64 || !bit_test(sweet_rebal_pull_mask, cpu)) {
++		return false;
++	}
++	bit_clear(sweet_rebal_pull_mask, cpu);
++	for (int b = 0; b < 2; b++) {
++		if (sweet_rebal_pull_tgt[b] == cpu + 1) {
++			sweet_rebal_pull_tgt[b] = 0;            /* the big core may pull again */
++		}
++	}
++	if (!still_running || thread->sched_pri >= BASEPRI_RTQUEUES || !sweet_rebal_cls_on(thread->sched_flags)) {
++		return false;
++	}
++	thread->sched_flags |= TH_SFLAG_SWEET_PULLED;
++	return true;
++}
++
++/* processor_idle on CPU6/7, splsched, no locks held */
++static void
++sweet_rebal_idle_pull(processor_t processor)
++{
++	int b = processor->cpu_id - 6;
++	if (b < 0 || b > 1) {
++		return;
++	}
++	if (sweet_rebal_abs_2ms == 0) {
++		nanoseconds_to_absolutetime(200 * NSEC_PER_USEC, &sweet_rebal_abs_200us);
++		nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &sweet_rebal_abs_2ms);
++	}
++	uint64_t now = mach_absolute_time();
++	if (sweet_rebal_pull_tgt[b] != 0 && now - sweet_rebal_pull_at[b] < sweet_rebal_abs_2ms) {
++		return;                                 /* one pull in flight per big core (unlocked peek) */
++	}
++	bool any = false;
++	for (int i = 0; i < 6; i++) {
++		uint8_t cls = sweet_ui_cpu_cls[i];      /* 1106: 1 render-server, 2 display (kern.sweet_ui_bigcore bit 2 / 1) */
++		if (cls != 0 && ((3 - cls) & sweet_ui_bigcore)) {
++			any = true;
++		}
++	}
++	if (!any) {
++		return;
++	}
++	processor_set_t pset = processor->processor_set;
++	processor_t q = PROCESSOR_NULL;
++	sched_ipi_type_t ipi = SCHED_IPI_NONE;
++	pset_lock(pset);
++	if (processor->state == PROCESSOR_IDLE && processor->is_recommended) {
++		if (sweet_rebal_pull_tgt[b] != 0) {
++			if (now - sweet_rebal_pull_at[b] < sweet_rebal_abs_2ms) {
++				goto out;
++			}
++			bit_clear(sweet_rebal_pull_mask, sweet_rebal_pull_tgt[b] - 1);  /* expired: never taken */
++			sweet_rebal_pull_tgt[b] = 0;
++			os_atomic_inc(&sweet_rebal_st[7], relaxed);
++		}
++		for (int i = 0; i < 6; i++) {
++			processor_t p = processor_array[i];
++			uint8_t cls = sweet_ui_cpu_cls[i];
++			if (p == PROCESSOR_NULL || p->processor_set != pset || p->state != PROCESSOR_RUNNING || cls == 0 ||
++			    !((3 - cls) & sweet_ui_bigcore) || p->current_pri >= BASEPRI_RTQUEUES ||
++			    bit_test(sweet_rebal_pull_mask, i) || p->last_dispatch > now ||
++			    now - p->last_dispatch < sweet_rebal_abs_200us) {
++				continue;
++			}
++			if (q == PROCESSOR_NULL || p->last_dispatch < q->last_dispatch) {
++				q = p;                          /* the longest-running one */
++			}
++		}
++		if (q != PROCESSOR_NULL) {
++			bit_set(sweet_rebal_pull_mask, q->cpu_id);
++			sweet_rebal_pull_tgt[b] = (uint8_t)(q->cpu_id + 1);
++			sweet_rebal_pull_at[b] = now;
++			ipi = sched_ipi_action(q, THREAD_NULL, SCHED_IPI_EVENT_REBALANCE);
++			os_atomic_inc(&sweet_rebal_st[5], relaxed);
++		}
++	}
++out:
++	pset_unlock(pset);
++	if (q != PROCESSOR_NULL) {
++		sched_ipi_perform(q, ipi);
++	}
++}
++
++static void
++sweet_ui_rebal_log(void)
++{
++	uint32_t s[8];
++	for (int k = 0; k < 8; k++) {
++		s[k] = os_atomic_xchg(&sweet_rebal_st[k], 0, relaxed);
++	}
++	if (sweet_ui_rebal == 0) {
++		return;
++	}
++	printf("SWEET UI: rebal 5s: hold set %u ran-on-target %u ran-elsewhere %u cleared-on-block %u | pull sent %u "
++	    "landed-big %u | mode %d | requeued %u expired %u\n", s[0], s[1], s[2], s[3], s[5], s[6], sweet_ui_rebal, s[4], s[7]);
++}
++
+ void sweet_ui_bigcore_log(void);
+ void
+ sweet_ui_bigcore_log(void)
+ {
++	sweet_ui_rebal_log();                   /* 1163 */
+ 	uint64_t r[2][2], ms[2][2];
+ 	for (int c = 0; c < 2; c++) {
+ 		for (int b = 0; b < 2; b++) {
+@@ -5974,6 +6212,13 @@ thread_setrun(
+ 	assert((thread->state & (TH_RUN | TH_WAIT | TH_UNINT | TH_TERMINATE | TH_TERMINATE2)) == TH_RUN);
+ 	assert(thread->runq == PROCESSOR_NULL);
+ 
++#if defined(__arm64__)
++	if (__improbable(thread->sched_flags & TH_SFLAG_SWEET_SOFTBIND)) {
++		extern void sweet_rebal_unbind(thread_t thread, int why);
++		sweet_rebal_unbind(thread, 4);         /* 1163: requeued before it ran (priority change etc.): choose again */
++	}
++#endif
++
+ #if CONFIG_PREADOPT_TG
+ 	/* We know that the thread is not in the runq by virtue of being in this
+ 	 * function and the thread is not self since we are running. We can safely
+@@ -6037,6 +6282,12 @@ thread_setrun(
+ 		SCHED_DEBUG_CHOOSE_PROCESSOR_KERNEL_DEBUG_CONSTANT_IST(MACHDBG_CODE(DBG_MACH_SCHED, MACH_SCHED_CHOOSE_PROCESSOR) | DBG_FUNC_NONE,
+ 		    (uintptr_t)thread_tid(thread), (uintptr_t)-1, processor->cpu_id, processor->state, 0);
+ 		assert((pset_available_cpu_count(pset) > 0) || (processor->state != PROCESSOR_OFF_LINE && processor->is_recommended));
++#if defined(__arm64__)
++		if (__improbable(sweet_ui_rebal & 1) && (thread->sched_flags & TH_SFLAG_SWEET_UI_MASK)) {
++			extern void sweet_rebal_hold(thread_t thread, processor_t processor, sched_options_t *options);
++			sweet_rebal_hold(thread, processor, &options);         /* 1163: pset and thread locked */
++		}
++#endif
+ 	} else {
+ 		/*
+ 		 *	Bound case:
+@@ -6166,6 +6417,14 @@ csw_check_locked(
+ 		return check_reason | AST_PREEMPT;
+ 	}
+ 
++#if defined(__arm64__)
++	/* 1163: kern.sweet_ui_rebal pull from an idle big core (pset locked; consumed in thread_select) */
++	if (__improbable(sweet_rebal_pull_mask != 0) && bit_test(sweet_rebal_pull_mask, processor->cpu_id) &&
++	    sweet_rebal_cls_on(thread->sched_flags) && thread->sched_pri < BASEPRI_RTQUEUES) {
++		return check_reason | AST_PREEMPT | AST_URGENT;
++	}
++#endif
++
+ 	/*
+ 	 * Even though we could continue executing on this processor, a
+ 	 * secondary SMT core should try to shed load to another primary core.
+@@ -6748,6 +7007,11 @@ processor_idle(
+ 			}
+ 		}
+ 
++#if defined(__arm64__)
++		if (__improbable(sweet_ui_rebal & 2) && processor->cpu_id >= 6) {
++			sweet_rebal_idle_pull(processor);       /* 1163: before every WFI of CPU6/7 (no locks held) */
++		}
++#endif
+ 		IDLE_KERNEL_DEBUG_CONSTANT(
+ 			MACHDBG_CODE(DBG_MACH_SCHED, MACH_IDLE) | DBG_FUNC_NONE, (uintptr_t)thread_tid(thread), rt_runq_count(pset), SCHED(processor_runq_count)(processor), -1, 0);
+ 
+diff --git a/osfmk/kern/thread.h b/osfmk/kern/thread.h
+index be0e96f..dc60c04 100644
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -474,6 +474,8 @@ struct thread {
+ #define TH_SFLAG_SWEET_UI_RS           0x20000000       /* redfin 1041: named com.apple.coreanimation.render-server* */
+ #define TH_SFLAG_SWEET_UI_DISPLAY      0x40000000       /* redfin 1041: named com.apple.coreanimation.display* */
+ #define TH_SFLAG_SWEET_UI_MASK         (TH_SFLAG_SWEET_UI_RS | TH_SFLAG_SWEET_UI_DISPLAY)
++#define TH_SFLAG_SWEET_SOFTBIND        0x10000000       /* redfin 1163: bound_processor set by kern.sweet_ui_rebal hold (one enqueue) */
++#define TH_SFLAG_SWEET_PULLED          0x08000000       /* redfin 1163: preempted off an A55 by a kern.sweet_ui_rebal pull */
+ #define TH_SFLAG_DEMOTED_MASK      (TH_SFLAG_THROTTLED | TH_SFLAG_FAILSAFE | TH_SFLAG_RT_DISALLOWED)     /* saved_mode contains previous sched_mode */
+ 
+ 	int16_t                 sched_pri;              /* scheduled (current) priority */
+-- 
+2.53.0
+
