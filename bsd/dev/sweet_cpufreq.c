@@ -48,6 +48,7 @@
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
 #include <sys/sysctl.h>
+#include <pexpert/arm64/SWEET.h>     /* 1182: SWEET_AMP */
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern uint64_t sweet_cpu_idle_abs(int cpu);    /* osfmk/kern/sched_prim.c (0961) */
@@ -181,6 +182,33 @@ sweet_cpufreq_frame(void)
 	}
 }
 
+/* 1182: for SweetCLPC (osfmk/kern/sched_clutch.c) */
+uint32_t sweet_cpufreq_cur_khz(unsigned dom);
+uint32_t
+sweet_cpufreq_cur_khz(unsigned dom)
+{
+	if (!cf_ready || dom >= CF_NDOM || !cf[dom].base || cf[dom].req >= cf[dom].n) {
+		return 0;
+	}
+	return cf[dom].khz[cf[dom].req];
+}
+
+uint32_t sweet_cpufreq_cap_khz(unsigned dom);
+uint32_t
+sweet_cpufreq_cap_khz(unsigned dom)
+{
+	return (cf_ready && dom < CF_NDOM) ? cf[dom].cap_khz : 0;
+}
+
+void sweet_cpufreq_kick(void);
+void
+sweet_cpufreq_kick(void)
+{
+	if (cf_ready && cf_gov_on) {
+		thread_wakeup((event_t)&cf_gov_chan);   /* the governor acts now, not at its next tick */
+	}
+}
+
 static int
 sysctl_sweet_gov_framehold SYSCTL_HANDLER_ARGS
 {
@@ -271,6 +299,35 @@ cf_hold_pos(const struct cf_dom *d, int pct)
 	uint64_t want = (uint64_t)d->khz[d->ch[d->nch - 1]] * (unsigned)pct / 100;
 	unsigned p = 0;
 	while (p + 1 < d->nch && d->khz[d->ch[p]] < want) {
+		p++;
+	}
+	return p;
+}
+
+/*
+ * 1182: SweetCLPC (osfmk/kern/sched_clutch.c, kern.sweet_clpc FREQ): a frame-driven floor per domain from
+ * CA work_interval_instance finishes (need kHz, held kern.sweet_clpc_hold_ms after the last frame) and
+ * Edge's P-cluster load metric (threads waiting: gold/prime util counted as at least the step-up level).
+ * While FREQ is set it replaces 0970's touch boost and 1037's frame hold; 0964's caps stay the ceiling.
+ * Counted in the SWEET GOV 5s line as "| clpc N load M" (ticks the floor / the load raised a domain).
+ */
+#if defined(SWEET_AMP)
+extern uint32_t sweet_clpc_need_khz(unsigned dom, uint64_t now);
+extern int sweet_clpc_freq_active(void);
+extern uint32_t sweet_clpc_p_load(void);
+#else
+static inline uint32_t sweet_clpc_need_khz(unsigned dom __unused, uint64_t now __unused) { return 0; }
+static inline int sweet_clpc_freq_active(void) { return 0; }
+static inline uint32_t sweet_clpc_p_load(void) { return 0; }
+#endif
+static uint32_t cf_clpc_ticks, cf_clpc_load;
+
+/* lowest choosable position at or above khz (the top if none) */
+static unsigned
+cf_khz_pos(const struct cf_dom *d, uint32_t khz)
+{
+	unsigned p = 0;
+	while (p + 1 < d->nch && d->khz[d->ch[p]] < khz) {
 		p++;
 	}
 	return p;
@@ -529,6 +586,9 @@ cf_gov_log(uint64_t now)
 			}
 			len += snprintf(line + len, sizeof(line) - len, " ms%s", i + 1 < CF_NDOM ? " |" : "");
 		}
+		if ((sweet_clpc_freq_active() || cf_clpc_ticks || cf_clpc_load) && len < (int)sizeof(line) - 40) {
+			len += snprintf(line + len, sizeof(line) - len, " | clpc %u load %u", cf_clpc_ticks, cf_clpc_load);  /* 1182 */
+		}
 		printf("%s\n", line);
 	}
 	for (unsigned i = 0; i < CF_NDOM; ++i) {
@@ -536,6 +596,7 @@ cf_gov_log(uint64_t now)
 	}
 	cf_boosts = cf_caphits = 0;
 	cf_hold_ticks = 0;
+	cf_clpc_ticks = cf_clpc_load = 0;       /* 1182 */
 	cf_boost_seen = false;
 	cf_log_t = now;
 }
@@ -551,8 +612,15 @@ cf_gov_tick(struct cf_load *ld)
 	}
 	cf_busy(ld, busy);
 	bool boost = cf_boost_on && now < cf_boost_until;
-	cf_boost_seen |= boost;
 	int hold = cf_framehold > 0 && now < cf_frame_until ? cf_framehold : 0;      /* 1037 */
+	bool clpc = sweet_clpc_freq_active() != 0;     /* 1182: frames and Edge load instead of boost / hold */
+	uint32_t pload = 0;
+	if (clpc) {
+		boost = false;
+		hold = 0;
+		pload = sweet_clpc_p_load();
+	}
+	cf_boost_seen |= boost;
 	cf_boost_seen |= hold != 0;
 	for (unsigned i = 0; i < CF_NDOM; ++i) {
 		struct cf_dom *d = &cf[i];
@@ -567,9 +635,24 @@ cf_gov_tick(struct cf_load *ld)
 		if (d->req < d->n) {
 			d->at_ms[d->req] += (uint32_t)tick_ms;
 		}
+		uint32_t need = clpc ? sweet_clpc_need_khz(i, now) : 0;        /* 1182 */
+		unsigned np = need ? cf_khz_pos(d, need) : 0;
+		np = np > ceil ? ceil : np;
+		cf_boost_seen |= need != 0;
 		if (cf_boost_on && i > 0) {
 			/* 0970 */
+			if (pload && util < cf_up) {
+				util = cf_up;           /* 1182: threads wait on the P cluster */
+				cf_clpc_load++;
+			}
 			unsigned bw = cf_big_want(d, util, cur, ceil, now, boost);
+			if (need && np > bw) {
+				bw = np;                /* 1182 */
+				cf_clpc_ticks++;
+				if (bw > cur) {
+					d->last_up = now;
+				}
+			}
 			unsigned hp = cf_hold_pos(d, hold);     /* 1037 */
 			if (hp > bw) {
 				bw = hp > ceil ? ceil : hp;
@@ -602,6 +685,10 @@ cf_gov_tick(struct cf_load *ld)
 				want = hp;
 				cf_hold_ticks++;
 			}
+		}
+		if (need && np > want) {
+			want = np;                      /* 1182 */
+			cf_clpc_ticks++;
 		}
 		if (cur > ceil) {
 			d->down = 0;            /* above the ceiling (a new cap): down now */

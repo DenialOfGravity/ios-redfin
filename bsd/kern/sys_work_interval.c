@@ -37,6 +37,11 @@
 #include <kern/work_interval.h>
 
 #include <libkern/libkern.h>
+#include <pexpert/arm64/SWEET.h>     /* 1182: SWEET_AMP */
+
+#if defined(SWEET_AMP)
+extern int sweet_clpc_get(int which);  /* osfmk/kern/sched_clutch.c (1182) */
+#endif
 
 int
 work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
@@ -265,6 +270,38 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
 
 		break;
 
+#if defined(SWEET_AMP)
+	case 6:         /* 1182: work_interval_instance_start (iOS libsystem_kernel; not in the open-source kernel) */
+	case 7:         /* work_interval_instance_update */
+	case 8: {       /* work_interval_instance_finish */
+		struct {
+			uint64_t wi_id, instance_id, start, finish, deadline, complexity;
+			uint32_t create_flags, pad;
+		} inst;
+		_Static_assert(sizeof(inst) == 0x38, "libsystem_kernel's work_interval_instance");
+		if (sweet_clpc_get(0) <= 0) {
+			return ENOTSUP;         /* kern.sweet_clpc 0: as before 1182 */
+		}
+		if (uap->arg == USER_ADDR_NULL || uap->work_interval_id == 0 || uap->len < sizeof(inst)) {
+			return EINVAL;
+		}
+		if ((error = copyin(uap->arg, &inst, sizeof(inst)))) {
+			return error;
+		}
+		kret = kern_work_interval_instance_ctl(current_thread(), (int)operation, uap->work_interval_id,
+		    &inst.instance_id, inst.start, inst.finish, inst.deadline, inst.complexity);
+		if (kret == KERN_NOT_SUPPORTED) {
+			return ENOTSUP;
+		}
+		if (kret != KERN_SUCCESS) {
+			return EINVAL;
+		}
+		if (operation == 6) {
+			error = copyout(&inst, uap->arg, sizeof(inst));
+		}
+		break;
+	}
+#endif
 	default:
 		return ENOTSUP;
 	}

@@ -81,6 +81,10 @@ kern_work_interval_join(thread_t thread, mach_port_name_t port_name);
 
 extern kern_return_t
 kern_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_args);
+/* 1182: work_interval_instance ops 6/7/8 (SweetCLPC, SWEET_AMP kernels) */
+extern kern_return_t
+kern_work_interval_instance_ctl(thread_t thread, int op, uint64_t work_interval_id, uint64_t *instance_id,
+    uint64_t start, uint64_t finish, uint64_t deadline, uint64_t complexity);
 extern kern_return_t
 kern_work_interval_set_name(mach_port_name_t port_name, char *name, size_t len);
 extern kern_return_t

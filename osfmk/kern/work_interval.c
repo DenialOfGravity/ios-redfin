@@ -48,6 +48,15 @@
 #include <os/refcnt.h>
 
 #include <stdatomic.h>
+#include <machine/machine_routines.h>
+#include <pexpert/arm64/SWEET.h>     /* 1182: SWEET_AMP */
+
+#if defined(SWEET_AMP) && CONFIG_THREAD_GROUPS
+/* 1182: SweetCLPC, osfmk/kern/sched_clutch.c */
+extern uint16_t sweet_clpc_wi_create(uint64_t wi_id, uint32_t create_flags, int pid, struct thread_group *tg, bool late);
+extern void sweet_clpc_wi_group(uint32_t create_flags, struct thread_group *tg);
+extern int sweet_clpc_wi_instance(uint16_t slot, int op);
+#endif
 
 /*
  * With the introduction of auto-join work intervals, it is possible
@@ -196,6 +205,9 @@ struct work_interval {
 	 */
 	wi_class_t wi_class;
 	uint8_t wi_class_offset;
+#if defined(SWEET_AMP) && CONFIG_THREAD_GROUPS
+	uint16_t wi_sweet_slot;         /* 1182: SweetCLPC (process, type) table slot + 1, 0 none */
+#endif
 };
 
 #if CONFIG_SCHED_AUTO_JOIN
@@ -1013,6 +1025,66 @@ kern_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_a
 	return KERN_SUCCESS;
 }
 
+#if defined(SWEET_AMP) && CONFIG_THREAD_GROUPS
+/*
+ * 1182: work_interval_instance_start/update/finish (work_interval_ctl ops 6/7/8). iOS 16.7's libsystem_kernel
+ * sends them for every CA frame (struct of 0x38 bytes: work interval id, instance id, start, finish, deadline,
+ * complexity, create flags); the open-source kernel has no such ops and answered ENOTSUP. SweetCLPC counts
+ * them (kern.sweet_clpc DIAG) and, with FRAMES, hands them to the perfcontrol work_interval_ctl callback.
+ * Same checks as kern_work_interval_notify(): the calling thread is in the work interval, and its task made it.
+ */
+static _Atomic uint64_t sweet_wi_instance_id = 1;
+
+kern_return_t
+kern_work_interval_instance_ctl(thread_t thread, int op, uint64_t work_interval_id, uint64_t *instance_id,
+    uint64_t start, uint64_t finish, uint64_t deadline, uint64_t complexity)
+{
+	assert(thread == current_thread());
+	struct work_interval *work_interval = thread->th_work_interval;
+	if (op < 6 || op > 8 || work_interval == NULL || work_interval->wi_id != work_interval_id) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	task_t notifying_task = current_task();
+	if (work_interval->wi_creator_uniqueid != get_task_uniqueid(notifying_task) ||
+	    work_interval->wi_creator_pidversion != get_task_version(notifying_task)) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	if (work_interval->wi_sweet_slot == 0) {
+		/* made before kern.sweet_clpc was set: count it now (no-op while 0) */
+		work_interval->wi_sweet_slot = sweet_clpc_wi_create(work_interval->wi_id, work_interval->wi_create_flags,
+		    (int)work_interval->wi_creator_pid, work_interval->wi_group, true);
+		if (work_interval->wi_sweet_slot == 0) {
+			work_interval->wi_sweet_slot = UINT16_MAX;      /* table full: don't look again */
+		}
+	}
+	if (sweet_clpc_wi_instance(work_interval->wi_sweet_slot, op) <= 0) {
+		return KERN_NOT_SUPPORTED;
+	}
+	if (op != 6 && *instance_id == 0) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	struct thread_group *tg = work_interval->wi_group;
+	struct perfcontrol_work_interval_instance instance = {
+		.ctl = op == 6 ? WORK_INTERVAL_START : (op == 7 ? WORK_INTERVAL_UPDATE : WORK_INTERVAL_FINISH),
+		.create_flags = work_interval->wi_create_flags,
+		.complexity = complexity,
+		.thread_id = thread->thread_id,
+		.work_interval_id = work_interval_id,
+		.instance_id = op == 6 ? os_atomic_inc(&sweet_wi_instance_id, relaxed) : *instance_id,
+		.start = start,
+		.finish = finish,
+		.deadline = deadline,
+		.thread_group_id = tg ? thread_group_get_id(tg) : 0,
+		.thread_group_data = tg ? thread_group_get_machine_data(tg) : NULL,
+	};
+	machine_work_interval_instance_ctl(thread, &instance);
+	if (op == 6) {
+		*instance_id = instance.instance_id;
+	}
+	return KERN_SUCCESS;
+}
+#endif /* SWEET_AMP && CONFIG_THREAD_GROUPS (1182) */
+
 /* Start at 1, 0 is not a valid work interval ID */
 static _Atomic uint64_t unique_work_interval_id = 1;
 
@@ -1136,6 +1208,11 @@ kern_work_interval_create(thread_t thread,
 	/* Capture the tg_id for tracing purposes */
 	tg_id = work_interval->wi_group ? thread_group_get_id(work_interval->wi_group) : ~0;
 
+#if defined(SWEET_AMP)
+	/* 1182: SweetCLPC counts and marks the group (no-op while kern.sweet_clpc is 0) */
+	work_interval->wi_sweet_slot = sweet_clpc_wi_create(work_interval_id, create_flags,
+	    (int)work_interval->wi_creator_pid, work_interval->wi_group, false);
+#endif
 #endif /* CONFIG_THREAD_GROUPS */
 
 	if (create_flags & WORK_INTERVAL_FLAG_JOINABLE) {
@@ -1371,6 +1448,9 @@ kern_work_interval_set_workload_id(mach_port_name_t port_name,
 
 			assert(work_interval->wi_group == NULL);
 			work_interval->wi_group = tg;
+#if defined(SWEET_AMP)
+			sweet_clpc_wi_group(work_interval->wi_create_flags, tg);      /* 1182 */
+#endif
 
 			KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_WORKGROUP, WORKGROUP_INTERVAL_CREATE),
 			    work_interval->wi_id, work_interval->wi_create_flags,

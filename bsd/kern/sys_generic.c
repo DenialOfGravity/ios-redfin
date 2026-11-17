@@ -2804,6 +2804,33 @@ sysctl_sweet_edge_pref SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_edge_pref, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_edge_pref, "I", "SWEET AMP 1181: 0 Edge defaults (all E), 1 user FIXPRI/FG/IN/DF prefer P, 2 as 1 + E->P steal/migrate, 3 all user buckets P");
+
+/* redfin 1182: SweetCLPC (osfmk/kern/sched_clutch.c); arg2 selects the value */
+extern int sweet_clpc_get(int which);
+extern int sweet_clpc_set(int which, int v);
+static int
+sysctl_sweet_clpc SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1)
+	int v = sweet_clpc_get(arg2), changed = 0;
+	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	return sweet_clpc_set(arg2, v) ? EINVAL : 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_clpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_clpc, "I", "SWEET CLPC 1182 mask: 1 diag (count + log only), 2 place (UI_APP / CA / HID groups on P), 4 freq (frames drive cpufreq, implies 8), 8 frames (accept work_interval_instance ops), 16 cpu7 off under thermal cap; 0 = phase 2");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_clpc_target, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 1, sysctl_sweet_clpc, "I", "SWEET CLPC 1182: % of the frame budget a frame should use (20..100, default 75)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_clpc_hold_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 2, sysctl_sweet_clpc, "I", "SWEET CLPC 1182: ms the frame floor holds after the last frame (default 100)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_clpc_ut, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 3, sysctl_sweet_clpc, "I", "SWEET CLPC 1182: 1 = UT bucket of UI groups on P too (default 0)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_clpc_cpu7_khz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 4, sysctl_sweet_clpc, "I", "SWEET CLPC 1182: with mask 16, CPU7 not recommended while prime is capped below this (default 1500000)");
+SYSCTL_PROC(_kern, OID_AUTO, sweet_clpc_dump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 5, sysctl_sweet_clpc, "I", "SWEET CLPC 1182: write 1 to print the work interval table and UI / WI groups");
 #endif
 
 #endif /* CONFIG_SCHED_EDGE */

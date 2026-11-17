@@ -4902,6 +4902,8 @@ sched_edge_pset_made_schedulable(__unused processor_t processor, processor_set_t
 
 extern uint64_t sweet_cpu_idle_abs(int cpu);      /* sched_prim.c (0961) */
 extern void sweet_thread_group_foreach(void (*fn)(struct thread_group *, void *), void *arg);  /* thread_group.c (1181) */
+static void sweet_clpc_policy_adjust(struct thread_group *tg, uint32_t out[TH_BUCKET_SCHED_MAX]);  /* 1182 */
+static void sweet_clpc_tick(void);  /* 1182 */
 
 static uint32_t sweet_edge_ep_weight = 0;
 static thread_call_t sweet_edge_tcall;
@@ -4933,6 +4935,7 @@ sweet_edge_apply_one(struct thread_group *tg, void *arg)
 	int pref = *(int *)arg;
 	uint32_t want[TH_BUCKET_SCHED_MAX];
 	sweet_edge_policy(tg, pref, want);
+	sweet_clpc_policy_adjust(tg, want);     /* 1182: no-op unless kern.sweet_clpc has PLACE */
 	sched_edge_tg_preferred_cluster_change(tg, want,
 	    SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNING | SCHED_PERFCONTROL_PREFERRED_CLUSTER_MIGRATE_RUNNABLE);
 }
@@ -5067,6 +5070,7 @@ sweet_edge_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1
 		    sweet_edge_pref, (unsigned long long)busy_ms[ec], (unsigned long long)busy_ms[pc],
 		    (unsigned long long)cpu_ms[6 % MAX_CPUS], (unsigned long long)cpu_ms[7 % MAX_CPUS], c.p, c.e);
 	}
+	sweet_clpc_tick();      /* 1182 */
 	uint64_t deadline;
 	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(sweet_edge_tcall, deadline);
@@ -5082,6 +5086,673 @@ sweet_edge_late_init(void)
 	uint64_t deadline;
 	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(sweet_edge_tcall, deadline);
+}
+/*
+ * redfin 1182: SweetCLPC (AMP phase 3). A small stand-in for Apple's CLPC kext, registered with
+ * sched_perfcontrol_register_callbacks() (version 7: work_interval_notify, thread_group_init/deinit,
+ * thread_group_flags_update, work_interval_ctl). Live mask kern.sweet_clpc (boot-arg sweetclpc, default 0):
+ *    0  off: exactly phase 2 (1181). The callbacks (registered once the mask was ever non-zero) return at once,
+ *       work_interval_instance start/update/finish stay ENOTSUP as in the open-source kernel.
+ *    1  DIAG: count and log only. Work intervals created (type, process; one klog line per new
+ *       (process, type) pair), instance start attempts (still refused with ENOTSUP unless 8), UI_APP flag
+ *       changes (one line each), and the "SWEET CLPC: 5s ..." line. No policy change.
+ *    2  PLACE: P preference from native signals, added to kern.sweet_edge_pref's per-group rule:
+ *       FIXPRI of every user group P; FG/IN/DF (and UT with kern.sweet_clpc_ut 1) of UI groups P, where a UI
+ *       group has THREAD_GROUP_FLAGS_UI_APP (coalition focal = TASK_FOREGROUND_APPLICATION role) or holds a CA
+ *       render server / CA client / HID delivery / frame compositor work interval (its own WI group, or the
+ *       home group of a WI without WORK_INTERVAL_FLAG_GROUP). With kern.sweet_edge_pref 0 that is the only P rule.
+ *    4  FREQ: frame signals drive sweet_cpufreq (implies 8). Each finished CA/HID/FC frame gives
+ *       need = current kHz of the finishing CPU's domain * (run / budget) / kern.sweet_clpc_target %;
+ *       gold and prime (or silver) are held at >= need for kern.sweet_clpc_hold_ms after the last frame (fast
+ *       up, a quarter of the way down per frame). Replaces 0970's touch boost and 1037's frame hold while set;
+ *       0970's utilisation rule stays, with a waiting-thread floor from Edge's P-cluster load metric. 0964's
+ *       thermal caps stay the ceiling.
+ *    8  FRAMES: accept work_interval_instance start/update/finish (ops 6/7/8, which the open-source kernel
+ *       lacks: QuartzCore's per-frame calls got ENOTSUP) and pass them to the work_interval_ctl callback.
+ *   16  CPU7: take CPU7 out of the recommended cores while 0964 caps prime below kern.sweet_clpc_cpu7_khz
+ *       (checked every 5 s; off by default).
+ * kern.sweet_clpc_dump 1 prints the (process, type) table and the UI / WI groups.
+ */
+#include <sys/work_interval.h>
+#include <kern/cpu_number.h>
+#include <kern/workload_config.h>
+
+#define SWEET_CLPC_DIAG         0x01
+#define SWEET_CLPC_PLACE        0x02
+#define SWEET_CLPC_FREQ         0x04
+#define SWEET_CLPC_FRAMES       0x08
+#define SWEET_CLPC_CPU7         0x10
+#define SWEET_CLPC_ALL          0x1f
+
+#define SWEET_CLPC_WIT(f)       (((uint32_t)(f) & WORK_INTERVAL_TYPE_MASK) >> 28)
+/* CA render server 2, CA client 3, HID delivery 4, frame compositor 7 */
+#define SWEET_CLPC_UI_TYPES     ((1u << 2) | (1u << 3) | (1u << 4) | (1u << 7))
+/* marks in the first 8 bytes of a group's perfcontrol machine data (zeroed at creation, unused otherwise) */
+#define SWEET_CLPC_M_OWN(t)     (1ULL << (t))           /* the WI's own group (WORK_INTERVAL_FLAG_GROUP) */
+#define SWEET_CLPC_M_HOME(t)    (1ULL << (16 + (t)))    /* home group of a WI without its own group */
+#define SWEET_CLPC_M_UIMARKS    ((uint64_t)SWEET_CLPC_UI_TYPES | ((uint64_t)SWEET_CLPC_UI_TYPES << 16))
+#define SWEET_CLPC_M_UI         (1ULL << 32)            /* UI_APP as last synced */
+#define SWEET_CLPC_M_UICHG      (1ULL << 33)            /* UI_APP changed, not logged yet */
+
+extern uint32_t sweet_cpufreq_cur_khz(unsigned dom);    /* bsd/dev/sweet_cpufreq.c (1182) */
+extern uint32_t sweet_cpufreq_cap_khz(unsigned dom);
+extern void sweet_cpufreq_kick(void);
+
+static int sweet_clpc_mask = -1;        /* -1 until the first tick read the boot-arg */
+static int sweet_clpc_target = 75;      /* % of the frame budget the frame should use */
+static int sweet_clpc_hold_ms = 100;
+static int sweet_clpc_ut;
+static int sweet_clpc_cpu7_khz = 1500000;
+static bool sweet_clpc_registered, sweet_clpc_cpu7_off;
+static thread_call_t sweet_clpc_tcall;
+static LCK_SPIN_DECLARE(sweet_clpc_slk, &sweet_edge_lck_grp);
+
+static const char *const sweet_clpc_tname[16] = {
+	"default", "audio", "ca-rs", "ca-cl", "hid", "media", "arkit", "fc",
+	"t8", "t9", "t10", "t11", "t12", "t13", "t14", "t15",
+};
+
+static struct {
+	uint32_t wi_new[16];            /* since boot */
+	uint32_t starts, rej, upd, fins, notifies, aud;         /* 5 s window from here on */
+	uint32_t frames, miss, bad, pct_max;
+	uint64_t pct_sum;
+	uint32_t ui_set, ui_clr, gov_req, gov_kick, cpu7;
+} sweet_clpc_c;
+static int32_t sweet_clpc_tg_live;
+static volatile uint32_t sweet_clpc_need[3];
+static volatile uint64_t sweet_clpc_until[3];
+
+#define SWEET_CLPC_SLOTS        64
+static struct sweet_clpc_slot {
+	int pid;
+	uint32_t type, flags;
+	char name[20];
+	uint32_t creates, starts, rej, fins;
+} sweet_clpc_slots[SWEET_CLPC_SLOTS];
+static uint32_t sweet_clpc_nslots, sweet_clpc_slot_full;
+
+static uint64_t sweet_clpc_nomarks;     /* if the machine data were < 8 bytes (ADT kern.thread_group_extra_bytes: 64) */
+static inline uint64_t *
+sweet_clpc_marks(struct thread_group *tg)
+{
+	if (thread_group_machine_data_size() < sizeof(uint64_t)) {
+		return &sweet_clpc_nomarks;
+	}
+	return (uint64_t *)thread_group_get_machine_data(tg);
+}
+
+static bool
+sweet_clpc_ui_group(struct thread_group *tg)
+{
+	return (thread_group_get_flags(tg) & THREAD_GROUP_FLAGS_UI_APP) ||
+	       (os_atomic_load(sweet_clpc_marks(tg), relaxed) & SWEET_CLPC_M_UIMARKS);
+}
+
+/* Called from sweet_edge_apply_one() after sweet_edge_policy(). */
+static void
+sweet_clpc_policy_adjust(struct thread_group *tg, uint32_t out[TH_BUCKET_SCHED_MAX])
+{
+	int m = sweet_clpc_mask;
+	if (m <= 0 || !(m & SWEET_CLPC_PLACE) || sweet_edge_pcluster < 0 ||
+	    thread_group_get_id(tg) <= THREAD_GROUP_PERF_CONTROLLER) {
+		return;
+	}
+	uint32_t p = (uint32_t)sweet_edge_pcluster;
+	out[TH_BUCKET_FIXPRI] = p;
+	if (sweet_clpc_ui_group(tg)) {
+		out[TH_BUCKET_SHARE_FG] = p;
+		out[TH_BUCKET_SHARE_IN] = p;
+		out[TH_BUCKET_SHARE_DF] = p;
+		if (sweet_clpc_ut) {
+			out[TH_BUCKET_SHARE_UT] = p;
+		}
+	}
+}
+
+/* ---- frame signals ---- */
+static void
+sweet_clpc_frame(uint32_t t, uint64_t start, uint64_t finish, uint64_t deadline)
+{
+	if (t == 1) {
+		os_atomic_inc(&sweet_clpc_c.aud, relaxed);
+		return;
+	}
+	if (finish <= start || deadline <= start) {
+		os_atomic_inc(&sweet_clpc_c.bad, relaxed);
+		return;
+	}
+	uint64_t run = finish - start, budget = deadline - start;
+	uint32_t pct = run >= budget * 10 ? 1000 : (uint32_t)(run * 100 / budget);
+	os_atomic_inc(&sweet_clpc_c.frames, relaxed);
+	os_atomic_add(&sweet_clpc_c.pct_sum, (uint64_t)pct, relaxed);
+	if (pct > sweet_clpc_c.pct_max) {
+		sweet_clpc_c.pct_max = pct;     /* racy max: statistics only */
+	}
+	if (finish > deadline) {
+		os_atomic_inc(&sweet_clpc_c.miss, relaxed);
+	}
+	int m = sweet_clpc_mask;
+	if (m <= 0 || !(m & SWEET_CLPC_FREQ) || !((1u << t) & SWEET_CLPC_UI_TYPES)) {
+		return;
+	}
+	/* SM7250 frequency domains: silver CPU0-5, gold CPU6, prime CPU7 */
+	int cpu = cpu_number();
+	unsigned dom = cpu >= 7 ? 2 : (cpu >= 6 ? 1 : 0);
+	uint32_t cur = sweet_cpufreq_cur_khz(dom);
+	if (cur == 0) {
+		return;
+	}
+	unsigned tgt = (unsigned)sweet_clpc_target;
+	uint64_t need = (uint64_t)cur * pct / (tgt ? tgt : 75);
+	if (need > 4000000) {
+		need = 4000000;
+	}
+	uint64_t now = mach_absolute_time(), hold;
+	nanoseconds_to_absolutetime((uint64_t)sweet_clpc_hold_ms * NSEC_PER_MSEC, &hold);
+	for (unsigned d = dom ? 1 : 0; d <= (dom ? 2u : 0u); d++) {
+		uint32_t old = now < sweet_clpc_until[d] ? sweet_clpc_need[d] : 0;
+		uint32_t nw = need >= old ? (uint32_t)need : old - (old - (uint32_t)need) / 4;
+		sweet_clpc_need[d] = nw;
+		sweet_clpc_until[d] = now + hold;
+	}
+	os_atomic_inc(&sweet_clpc_c.gov_req, relaxed);
+	if (need > cur) {
+		os_atomic_inc(&sweet_clpc_c.gov_kick, relaxed);
+		sweet_cpufreq_kick();
+	}
+}
+
+/* sweet_cpufreq's governor (1182): the frame floor for a domain, 0 = none. */
+uint32_t sweet_clpc_need_khz(unsigned dom, uint64_t now);
+uint32_t
+sweet_clpc_need_khz(unsigned dom, uint64_t now)
+{
+	int m = sweet_clpc_mask;
+	if (dom >= 3 || m <= 0 || !(m & SWEET_CLPC_FREQ) || now >= sweet_clpc_until[dom]) {
+		return 0;
+	}
+	return sweet_clpc_need[dom];
+}
+
+int sweet_clpc_freq_active(void);
+int
+sweet_clpc_freq_active(void)
+{
+	int m = sweet_clpc_mask;
+	return m > 0 && (m & SWEET_CLPC_FREQ);
+}
+
+/* Edge's load metric of the P cluster (runqueue depth x average run time; 0 = no thread waits). */
+uint32_t sweet_clpc_p_load(void);
+uint32_t
+sweet_clpc_p_load(void)
+{
+	if (sweet_edge_pcluster < 0) {
+		return 0;
+	}
+	processor_set_t p = pset_array[sweet_edge_pcluster];
+	if (p == PROCESSOR_SET_NULL) {
+		return 0;
+	}
+	int load = 0;
+	for (sched_bucket_t b = TH_BUCKET_FIXPRI; b <= TH_BUCKET_SHARE_DF; b++) {
+		int l = sched_get_pset_load_average(p, b);
+		load = l > load ? l : load;
+	}
+	return (uint32_t)load;
+}
+
+/* ---- perfcontrol callbacks (no locks, no blocking; thread_call_enter is allowed) ---- */
+static void
+sweet_clpc_cb_tg_init(__unused thread_group_data_t d)
+{
+	os_atomic_inc(&sweet_clpc_tg_live, relaxed);
+}
+
+static void
+sweet_clpc_cb_tg_deinit(__unused thread_group_data_t d)
+{
+	os_atomic_dec(&sweet_clpc_tg_live, relaxed);
+}
+
+static void
+sweet_clpc_cb_tg_flags(thread_group_data_t d)
+{
+	if (sweet_clpc_mask <= 0 || d->thread_group_data == NULL || d->thread_group_size < sizeof(uint64_t)) {
+		return;
+	}
+	uint64_t *mk = (uint64_t *)d->thread_group_data;
+	bool ui = (d->thread_group_flags & THREAD_GROUP_FLAGS_UI_APP) != 0;
+	bool was = (os_atomic_load(mk, relaxed) & SWEET_CLPC_M_UI) != 0;
+	if (ui == was) {
+		return;
+	}
+	if (ui) {
+		os_atomic_or(mk, SWEET_CLPC_M_UI | SWEET_CLPC_M_UICHG, relaxed);
+		os_atomic_inc(&sweet_clpc_c.ui_set, relaxed);
+	} else {
+		os_atomic_andnot(mk, SWEET_CLPC_M_UI, relaxed);
+		os_atomic_or(mk, SWEET_CLPC_M_UICHG, relaxed);
+		os_atomic_inc(&sweet_clpc_c.ui_clr, relaxed);
+	}
+	if (sweet_clpc_tcall != NULL) {
+		thread_call_enter(sweet_clpc_tcall);
+	}
+}
+
+static void
+sweet_clpc_cb_wi_notify(__unused perfcontrol_state_t s, perfcontrol_work_interval_t wi)
+{
+	if (sweet_clpc_mask <= 0) {
+		return;
+	}
+	os_atomic_inc(&sweet_clpc_c.notifies, relaxed);
+	sweet_clpc_frame(SWEET_CLPC_WIT(wi->create_flags), wi->start, wi->finish, wi->deadline);
+}
+
+static void
+sweet_clpc_cb_wi_ctl(__unused perfcontrol_state_t s, perfcontrol_work_interval_instance_t in)
+{
+	if (sweet_clpc_mask <= 0) {
+		return;
+	}
+	switch (in->ctl) {
+	case WORK_INTERVAL_START:
+		os_atomic_inc(&sweet_clpc_c.starts, relaxed);
+		break;
+	case WORK_INTERVAL_UPDATE:
+		os_atomic_inc(&sweet_clpc_c.upd, relaxed);
+		break;
+	case WORK_INTERVAL_FINISH:
+		os_atomic_inc(&sweet_clpc_c.fins, relaxed);
+		sweet_clpc_frame(SWEET_CLPC_WIT(in->create_flags), in->start, in->finish, in->deadline);
+		break;
+	}
+}
+
+static struct sched_perfcontrol_callbacks sweet_clpc_callbacks = {
+	.version = SCHED_PERFCONTROL_CALLBACKS_VERSION_7,
+	.work_interval_notify = sweet_clpc_cb_wi_notify,
+	.thread_group_init = sweet_clpc_cb_tg_init,
+	.thread_group_deinit = sweet_clpc_cb_tg_deinit,
+	.thread_group_flags_update = sweet_clpc_cb_tg_flags,
+	.work_interval_ctl = sweet_clpc_cb_wi_ctl,
+};
+
+/* ---- work interval hooks (osfmk/kern/work_interval.c, thread context) ---- */
+extern void proc_selfname(char *buf, int size);
+
+/* late: a work interval made before kern.sweet_clpc was set, first seen at an instance op */
+uint16_t sweet_clpc_wi_create(uint64_t wi_id, uint32_t create_flags, int pid, struct thread_group *tg, bool late);
+uint16_t
+sweet_clpc_wi_create(uint64_t wi_id, uint32_t create_flags, int pid, struct thread_group *tg, bool late)
+{
+	int m = sweet_clpc_mask;
+	if (m <= 0) {
+		return 0;
+	}
+	uint32_t t = SWEET_CLPC_WIT(create_flags);
+	if (!late) {
+		os_atomic_inc(&sweet_clpc_c.wi_new[t], relaxed);
+	}
+	if (tg != NULL && thread_group_get_id(tg) > THREAD_GROUP_PERF_CONTROLLER) {
+		os_atomic_or(sweet_clpc_marks(tg),
+		    (create_flags & WORK_INTERVAL_FLAG_GROUP) ? SWEET_CLPC_M_OWN(t) : SWEET_CLPC_M_HOME(t), relaxed);
+	}
+	char name[20];
+	proc_selfname(name, sizeof(name));
+	uint16_t slot = 0;
+	bool fresh = false;
+	lck_spin_lock(&sweet_clpc_slk);
+	for (uint32_t i = 0; i < sweet_clpc_nslots; i++) {
+		struct sweet_clpc_slot *s = &sweet_clpc_slots[i];
+		if (s->pid == pid && s->type == t) {
+			slot = (uint16_t)(i + 1);
+			break;
+		}
+	}
+	if (slot == 0 && sweet_clpc_nslots < SWEET_CLPC_SLOTS) {
+		struct sweet_clpc_slot *s = &sweet_clpc_slots[sweet_clpc_nslots];
+		s->pid = pid;
+		s->type = t;
+		s->flags = create_flags;
+		strlcpy(s->name, name, sizeof(s->name));
+		slot = (uint16_t)(++sweet_clpc_nslots);
+		fresh = true;
+	} else if (slot == 0) {
+		sweet_clpc_slot_full++;
+	}
+	if (slot && !late) {
+		sweet_clpc_slots[slot - 1].creates++;
+	}
+	lck_spin_unlock(&sweet_clpc_slk);
+	if (fresh && (m & SWEET_CLPC_DIAG)) {
+		printf("SWEET CLPC: wi %s pid %d %s type %s flags 0x%x id %llu tg %llu%s tgflags 0x%x wlcfg %d\n",
+		    late ? "seen" : "new", pid, name, sweet_clpc_tname[t], create_flags, wi_id,
+		    tg ? thread_group_get_id(tg) : 0ULL, tg ? "" : " (deferred)",
+		    tg ? thread_group_get_flags(tg) : 0, (int)workload_config_available());
+	}
+	if ((m & SWEET_CLPC_PLACE) && ((1u << t) & SWEET_CLPC_UI_TYPES) && sweet_clpc_tcall != NULL) {
+		thread_call_enter(sweet_clpc_tcall);
+	}
+	return slot;
+}
+
+/* A group created later by kern_work_interval_set_workload_id() (WORK_INTERVAL_FLAG_HAS_WORKLOAD_ID). */
+void sweet_clpc_wi_group(uint32_t create_flags, struct thread_group *tg);
+void
+sweet_clpc_wi_group(uint32_t create_flags, struct thread_group *tg)
+{
+	int m = sweet_clpc_mask;
+	if (m <= 0 || tg == NULL || thread_group_get_id(tg) <= THREAD_GROUP_PERF_CONTROLLER) {
+		return;
+	}
+	uint32_t t = SWEET_CLPC_WIT(create_flags);
+	os_atomic_or(sweet_clpc_marks(tg), SWEET_CLPC_M_OWN(t), relaxed);
+	if (m & SWEET_CLPC_DIAG) {
+		printf("SWEET CLPC: wi group tg %llu %s type %s tgflags 0x%x (workload id)\n",
+		    thread_group_get_id(tg), thread_group_get_name(tg), sweet_clpc_tname[t], thread_group_get_flags(tg));
+	}
+	if ((m & SWEET_CLPC_PLACE) && ((1u << t) & SWEET_CLPC_UI_TYPES) && sweet_clpc_tcall != NULL) {
+		thread_call_enter(sweet_clpc_tcall);
+	}
+}
+
+/* work_interval_instance op 6 start / 7 update / 8 finish: -1 off (ENOTSUP, not counted), 0 counted but refused, 1 accept */
+int sweet_clpc_wi_instance(uint16_t slot, int op);
+int
+sweet_clpc_wi_instance(uint16_t slot, int op)
+{
+	int m = sweet_clpc_mask;
+	if (m <= 0) {
+		return -1;
+	}
+	bool acc = (m & SWEET_CLPC_FRAMES) != 0;
+	if (slot > 0 && slot <= SWEET_CLPC_SLOTS) {
+		struct sweet_clpc_slot *s = &sweet_clpc_slots[slot - 1];
+		if (op == 6) {
+			os_atomic_inc(acc ? &s->starts : &s->rej, relaxed);
+		} else if (op == 8 && acc) {
+			os_atomic_inc(&s->fins, relaxed);
+		}
+	}
+	if (!acc) {
+		if (op == 6) {
+			os_atomic_inc(&sweet_clpc_c.rej, relaxed);
+		}
+		return 0;
+	}
+	return 1;
+}
+
+/* ---- group walks (thread call / sysctl / 5 s tick) ---- */
+#define SWEET_CLPC_LOGN         16
+struct sweet_clpc_walk {
+	uint32_t n, more;
+	struct {
+		uint64_t id;
+		bool ui;
+		char name[THREAD_GROUP_MAXNAME];
+	} e[SWEET_CLPC_LOGN];
+	uint32_t ui_now, wi_tgs, ui_tgs;
+	bool list;      /* dump: list UI / WI groups instead of changes */
+};
+
+static void
+sweet_clpc_sync_one(struct thread_group *tg, void *arg)
+{
+	struct sweet_clpc_walk *w = arg;
+	if (thread_group_get_id(tg) <= THREAD_GROUP_PERF_CONTROLLER) {
+		return;
+	}
+	uint64_t *mk = sweet_clpc_marks(tg);
+	uint64_t mv = os_atomic_load(mk, relaxed);
+	bool ui = (thread_group_get_flags(tg) & THREAD_GROUP_FLAGS_UI_APP) != 0;
+	bool chg = false;
+	if (!w->list && ui != ((mv & SWEET_CLPC_M_UI) != 0)) {
+		/* missed by the callback (a group that had UI_APP before registration) */
+		if (ui) {
+			os_atomic_or(mk, SWEET_CLPC_M_UI, relaxed);
+		} else {
+			os_atomic_andnot(mk, SWEET_CLPC_M_UI, relaxed);
+		}
+		chg = true;
+	}
+	if (!w->list && (mv & SWEET_CLPC_M_UICHG)) {
+		os_atomic_andnot(mk, SWEET_CLPC_M_UICHG, relaxed);
+		chg = true;
+	}
+	w->ui_now += ui;
+	w->wi_tgs += (mv & SWEET_CLPC_M_UIMARKS) != 0;
+	w->ui_tgs += ui || (mv & SWEET_CLPC_M_UIMARKS);
+	bool rec = w->list ? (ui || (mv & 0xffffffffULL)) : chg;
+	if (!rec) {
+		return;
+	}
+	if (w->n < SWEET_CLPC_LOGN) {
+		w->e[w->n].id = thread_group_get_id(tg);
+		w->e[w->n].ui = ui;
+		strlcpy(w->e[w->n].name, thread_group_get_name(tg), sizeof(w->e[w->n].name));
+		w->n++;
+	} else {
+		w->more++;
+	}
+}
+
+static void
+sweet_clpc_tcall_fn(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	struct sweet_clpc_walk w;
+	bzero(&w, sizeof(w));
+	lck_mtx_lock(&sweet_edge_mtx);
+	sweet_thread_group_foreach(sweet_clpc_sync_one, &w);
+	int m = sweet_clpc_mask;
+	if (m > 0 && (m & SWEET_CLPC_PLACE) && sweet_edge_pcluster >= 0) {
+		int pref = sweet_edge_pref;
+		sweet_thread_group_foreach(sweet_edge_apply_one, &pref);
+	}
+	lck_mtx_unlock(&sweet_edge_mtx);
+	if (m > 0 && (m & SWEET_CLPC_DIAG)) {
+		for (uint32_t i = 0; i < w.n; i++) {
+			printf("SWEET CLPC: ui_app %s tg %llu %s\n", w.e[i].ui ? "set" : "clear", w.e[i].id, w.e[i].name);
+		}
+		if (w.more) {
+			printf("SWEET CLPC: ui_app +%u more changes\n", w.more);
+		}
+	}
+}
+
+static void
+sweet_clpc_dump(void)
+{
+	for (uint32_t i = 0; i < SWEET_CLPC_SLOTS; i++) {
+		struct sweet_clpc_slot s;
+		lck_spin_lock(&sweet_clpc_slk);
+		bool ok = i < sweet_clpc_nslots;
+		if (ok) {
+			s = sweet_clpc_slots[i];
+		}
+		lck_spin_unlock(&sweet_clpc_slk);
+		if (!ok) {
+			break;
+		}
+		printf("SWEET CLPC: dump wi pid %d %s type %s flags 0x%x creates %u starts %u refused %u finishes %u\n",
+		    s.pid, s.name, sweet_clpc_tname[s.type & 15], s.flags, s.creates, s.starts, s.rej, s.fins);
+	}
+	struct sweet_clpc_walk w;
+	bzero(&w, sizeof(w));
+	w.list = true;
+	lck_mtx_lock(&sweet_edge_mtx);
+	sweet_thread_group_foreach(sweet_clpc_sync_one, &w);
+	lck_mtx_unlock(&sweet_edge_mtx);
+	for (uint32_t i = 0; i < w.n; i++) {
+		printf("SWEET CLPC: dump tg %llu %s ui_app %d\n", w.e[i].id, w.e[i].name, w.e[i].ui);
+	}
+	printf("SWEET CLPC: dump end: slots %u (full %u), groups ui_app %u wi %u ui %u (+%u not listed), live tgs %d, mask %d\n",
+	    sweet_clpc_nslots, sweet_clpc_slot_full, w.ui_now, w.wi_tgs, w.ui_tgs, w.more, sweet_clpc_tg_live, sweet_clpc_mask);
+}
+
+static void
+sweet_clpc_cpu7(int m)
+{
+	uint32_t cap = sweet_cpufreq_cap_khz(2);
+	bool off = m > 0 && (m & SWEET_CLPC_CPU7) && cap != 0 && cap < (uint32_t)sweet_clpc_cpu7_khz;
+	if (off == sweet_clpc_cpu7_off) {
+		return;
+	}
+	sweet_clpc_cpu7_off = off;
+	sched_perfcontrol_update_recommended_cores(off ? ~(1u << 7) : ~0u);
+	os_atomic_inc(&sweet_clpc_c.cpu7, relaxed);
+	printf("SWEET CLPC: cpu7 %s (prime cap %u kHz, limit %d)\n", off ? "derecommended" : "recommended again",
+	    cap, sweet_clpc_cpu7_khz);
+}
+
+/* kern.sweet_clpc* (bsd/kern/sys_generic.c): 0 mask, 1 target %, 2 hold ms, 3 ut, 4 cpu7 kHz, 5 dump */
+int sweet_clpc_get(int which);
+int
+sweet_clpc_get(int which)
+{
+	switch (which) {
+	case 0: return sweet_clpc_mask < 0 ? 0 : sweet_clpc_mask;
+	case 1: return sweet_clpc_target;
+	case 2: return sweet_clpc_hold_ms;
+	case 3: return sweet_clpc_ut;
+	case 4: return sweet_clpc_cpu7_khz;
+	default: return 0;
+	}
+}
+
+int sweet_clpc_set(int which, int v);
+int
+sweet_clpc_set(int which, int v)
+{
+	switch (which) {
+	case 0:
+		break;
+	case 1:
+		if (v < 20 || v > 100) {
+			return -1;
+		}
+		sweet_clpc_target = v;
+		printf("SWEET CLPC: target %d %% of the frame budget\n", v);
+		return 0;
+	case 2:
+		if (v < 0 || v > 2000) {
+			return -1;
+		}
+		sweet_clpc_hold_ms = v;
+		printf("SWEET CLPC: hold %d ms\n", v);
+		return 0;
+	case 3:
+		if (v < 0 || v > 1) {
+			return -1;
+		}
+		sweet_clpc_ut = v;
+		printf("SWEET CLPC: ut %d (UT bucket of UI groups on %s)\n", v, v ? "P" : "the edge_pref rule");
+		if (sweet_clpc_mask > 0 && (sweet_clpc_mask & SWEET_CLPC_PLACE) && sweet_clpc_tcall) {
+			thread_call_enter(sweet_clpc_tcall);
+		}
+		return 0;
+	case 4:
+		if (v < 0 || v > 4000000) {
+			return -1;
+		}
+		sweet_clpc_cpu7_khz = v;
+		printf("SWEET CLPC: cpu7 limit %d kHz\n", v);
+		return 0;
+	case 5:
+		sweet_clpc_dump();
+		return 0;
+	default:
+		return -1;
+	}
+	/* the mask */
+	if (v < 0 || v > SWEET_CLPC_ALL) {
+		return -1;
+	}
+	if (v & SWEET_CLPC_FREQ) {
+		v |= SWEET_CLPC_FRAMES;
+	}
+	if (v && sweet_clpc_tcall == NULL) {
+		sweet_clpc_tcall = thread_call_allocate_with_options(sweet_clpc_tcall_fn, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+	}
+	lck_mtx_lock(&sweet_edge_mtx);
+	int old = sweet_clpc_mask < 0 ? 0 : sweet_clpc_mask;
+	bool reg = false;
+	if (v && !sweet_clpc_registered) {
+		/* tells us about the existing groups (thread_group_resync); stays registered, a mask of 0 makes it inert */
+		sweet_clpc_registered = true;
+		reg = true;
+		sched_perfcontrol_register_callbacks(&sweet_clpc_callbacks, 0);
+	}
+	sweet_clpc_mask = v;
+	if (((old ^ v) & SWEET_CLPC_PLACE) && sweet_edge_pcluster >= 0) {
+		(void)sweet_edge_apply_locked(sweet_edge_pref);
+	}
+	if (!(v & SWEET_CLPC_FREQ)) {
+		for (unsigned d = 0; d < 3; d++) {
+			sweet_clpc_until[d] = 0;
+		}
+	}
+	lck_mtx_unlock(&sweet_edge_mtx);
+	if (!(v & SWEET_CLPC_CPU7) && sweet_clpc_cpu7_off) {
+		sweet_clpc_cpu7(v);
+	}
+	if (v && sweet_clpc_tcall) {
+		thread_call_enter(sweet_clpc_tcall);      /* sync UI_APP marks (and placement) now */
+	}
+	printf("SWEET CLPC: mask %d -> %d (1182: diag %d place %d freq %d frames %d cpu7 %d)%s; edge_pref %d, workload config %d\n",
+	    old, v, !!(v & SWEET_CLPC_DIAG), !!(v & SWEET_CLPC_PLACE), !!(v & SWEET_CLPC_FREQ), !!(v & SWEET_CLPC_FRAMES),
+	    !!(v & SWEET_CLPC_CPU7), reg ? ", perfcontrol callbacks registered" : "", sweet_edge_pref,
+	    (int)workload_config_available());
+	return 0;
+}
+
+/* every 5 s from sweet_edge_tick() */
+static void
+sweet_clpc_tick(void)
+{
+	if (sweet_clpc_mask < 0) {
+		int v = 0;
+		sweet_clpc_mask = 0;
+		if (PE_parse_boot_argn("sweetclpc", &v, sizeof(v)) && v) {
+			(void)sweet_clpc_set(0, v);
+		}
+	}
+	int m = sweet_clpc_mask;
+	sweet_clpc_cpu7(m);
+	if (m <= 0 || !(m & SWEET_CLPC_DIAG)) {
+		return;
+	}
+	struct sweet_clpc_walk w;
+	bzero(&w, sizeof(w));
+	w.list = true;
+	lck_mtx_lock(&sweet_edge_mtx);
+	sweet_thread_group_foreach(sweet_clpc_sync_one, &w);
+	lck_mtx_unlock(&sweet_edge_mtx);
+	uint32_t *n = sweet_clpc_c.wi_new;
+	uint32_t oth = 0;
+	for (int t = 0; t < 16; t++) {
+		oth += (t == 1 || t == 2 || t == 3 || t == 4 || t == 7) ? 0 : n[t];
+	}
+	uint32_t fr = os_atomic_xchg(&sweet_clpc_c.frames, 0, relaxed);
+	uint64_t ps = os_atomic_xchg(&sweet_clpc_c.pct_sum, 0, relaxed);
+	uint64_t now = mach_absolute_time();
+	printf("SWEET CLPC: 5s mask %d | wi made ca-rs %u ca-cl %u hid %u fc %u audio %u other %u | inst start %u refused %u "
+	    "upd %u fin %u notify %u | frames %u miss %u bad %u avg %llu%% max %u%% audio %u | ui_app tgs %u (+%u -%u) wi tgs %u "
+	    "ui tgs %u | gov need gold %u prime %u silver %u MHz req %u kick %u | tgs %d\n",
+	    m, n[2], n[3], n[4], n[7], n[1], oth,
+	    os_atomic_xchg(&sweet_clpc_c.starts, 0, relaxed), os_atomic_xchg(&sweet_clpc_c.rej, 0, relaxed),
+	    os_atomic_xchg(&sweet_clpc_c.upd, 0, relaxed), os_atomic_xchg(&sweet_clpc_c.fins, 0, relaxed),
+	    os_atomic_xchg(&sweet_clpc_c.notifies, 0, relaxed),
+	    fr, os_atomic_xchg(&sweet_clpc_c.miss, 0, relaxed), os_atomic_xchg(&sweet_clpc_c.bad, 0, relaxed),
+	    fr ? ps / fr : 0ULL, os_atomic_xchg(&sweet_clpc_c.pct_max, 0, relaxed), os_atomic_xchg(&sweet_clpc_c.aud, 0, relaxed),
+	    w.ui_now, os_atomic_xchg(&sweet_clpc_c.ui_set, 0, relaxed), os_atomic_xchg(&sweet_clpc_c.ui_clr, 0, relaxed),
+	    w.wi_tgs, w.ui_tgs,
+	    sweet_clpc_need_khz(1, now) / 1000, sweet_clpc_need_khz(2, now) / 1000, sweet_clpc_need_khz(0, now) / 1000,
+	    os_atomic_xchg(&sweet_clpc_c.gov_req, 0, relaxed), os_atomic_xchg(&sweet_clpc_c.gov_kick, 0, relaxed),
+	    sweet_clpc_tg_live);
 }
 #endif /* CONFIG_SCHED_EDGE && SWEET_AMP (1181) */
 

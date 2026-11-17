@@ -746,6 +746,16 @@ machine_work_interval_notify(thread_t thread,
 	sched_perfcontrol_work_interval_notify(state, &work_interval);
 }
 
+/* 1182: work_interval_instance start/update/finish (kern_work_interval_instance_ctl, SweetCLPC) */
+void
+machine_work_interval_instance_ctl(thread_t thread, perfcontrol_work_interval_instance_t instance)
+{
+	if (sched_perfcontrol_work_interval_ctl == sched_perfcontrol_work_interval_ctl_default) {
+		return;
+	}
+	perfcontrol_state_t state = FIND_PERFCONTROL_STATE(thread);
+	sched_perfcontrol_work_interval_ctl(state, instance);
+}
 
 void
 machine_perfcontrol_deadline_passed(uint64_t deadline)

@@ -140,6 +140,8 @@ extern void machine_max_runnable_latency(uint64_t bg_max_latency,
     uint64_t realtime_max_latency);
 
 extern void machine_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_args);
+struct perfcontrol_work_interval_instance;
+extern void machine_work_interval_instance_ctl(thread_t thread, struct perfcontrol_work_interval_instance *instance); /* 1182 */
 
 
 extern void machine_perfcontrol_deadline_passed(uint64_t deadline);
