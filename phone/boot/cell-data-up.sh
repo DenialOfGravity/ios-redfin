@@ -69,7 +69,9 @@ say "restarting CommCenter (psx -k CommCenter)"
 #    "state N (...)"; when ready it returns the raw hex TLV backup (no "state " prefix).
 say "waiting up to ${BAK_TMO}s for profile backup ready (pb_state 3)..."
 ready=0
-for i in $(seq 1 "$BAK_TMO"); do
+i=0
+while [ "$i" -lt "$BAK_TMO" ]; do
+	i=$((i+1))
 	bak=$(scget kern.sweet_wds_profiles_bak)
 	case "$bak" in
 		"state 4 "*)                      # already acknowledged (e.g. fast re-register)
@@ -97,7 +99,9 @@ fi
 
 # 5. wait for the bearer and report
 say "waiting up to ${IP_TMO}s for data bearer..."
-for i in $(seq 1 "$IP_TMO"); do
+i=0
+while [ "$i" -lt "$IP_TMO" ]; do
+	i=$((i+1))
 	if data_up; then
 		say "SUCCESS: data up -- $(scget kern.sweet_ipa_stats)"
 		exit 0
