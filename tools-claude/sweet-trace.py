@@ -36,6 +36,7 @@ its waker) -> first GPU submit -> GPU done (fence end stamp) -> SwapEnd -> flip 
 with the gaps in ms; then the typical gaps, which one dominates, and the vsync tick / notification accounting.
 """
 import argparse
+import os
 import bisect
 import collections
 import json
@@ -127,9 +128,17 @@ def main():
     ap.add_argument('--ipc', action='store_true')
     ap.add_argument('--summary-json', metavar='OUT')
     ap.add_argument('--label')
+    ap.add_argument('--perfetto', metavar='OUT.json', help='write one timeline for ui.perfetto.dev and stop '
+                    '(threads, driver calls, Core Animation, GPU submits, display, hakios-metal HM_PERF events)')
+    ap.add_argument('--procs', help='--perfetto: only these processes\' threads (comma list)')
     a = ap.parse_args()
 
     T = Trace(a.trace)
+    if a.perfetto:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import swtr_perfetto
+        swtr_perfetto.export(T, a.perfetto, a.procs, a.t_from, a.t_to)
+        return
     ms = T.ms
     span = ms(T.end_abs)
     print(f'{a.trace}: {len(T.events)} events, {span:.0f} ms, {len(T.threads)} threads, {T.ncpu} CPUs, '
