@@ -71,6 +71,7 @@ int sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v);         /* 1119: 
 void sweet_nfc_uc_event(int open, uint32_t type);
 extern int SweetNFCPublish(bool on, const char *why);                  /* 1119: iokit/Kernel/arm/SweetNFC.cpp */
 static bool gw_bus_ok(const uint8_t *tx, unsigned nt);
+static bool rdr_bus_ok(const uint8_t *tx, unsigned nt);            /* 1152 */
 static void nfc_p1_boot_thread(void *arg, wait_result_t wr);
 
 #define SAY(...)                printf("SWEET NFC: " __VA_ARGS__)
@@ -109,6 +110,9 @@ sweet_nfc_tx_allowed(const uint8_t *tx, unsigned nt)
 		if (nt == nfc_tx_ok[i].n && memcmp(tx, nfc_tx_ok[i].b, nt) == 0) {
 			return true;
 		}
+	}
+	if (rdr_bus_ok(tx, nt)) {       /* 1152: hybrid reader: exactly the packet rdr_tx() checked and is writing */
+		return true;
 	}
 	if (gw_bus_ok(tx, nt)) {        /* 1119: a filtered host packet, gateway mode 1 session only */
 		return true;
@@ -2225,6 +2229,8 @@ gw_refuse(int why)
 static void gw_session_stop(const char *why);
 static bool persona_on(void);
 static int gw_chip_tx(const uint8_t *b, unsigned n);
+static bool rdr_claim(const uint8_t *p, unsigned n, int v, const uint8_t *f, unsigned fn);   /* 1152 */
+static void rdr_host_reset(void);                                                         /* 1152 */
 
 /* one host packet; gw_lock held. *want_up: mode 1 asks for a chip bring-up after the lock is dropped */
 static void
@@ -2264,6 +2270,7 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 		gw.rf_active = false;
 		hci_conn = 0;                   /* 1137 */
 		ntf_cancel("CORE_RESET");       /* 1140 */
+		rdr_host_reset();               /* 1152: reader up -> powered down after gw_lock is dropped */
 		if (nfc_mwlog != 0 && !mwlog_done && !mwlog_failed) {  /* 1141: once per session, after the lock is dropped */
 			mwlog_done = true;
 			mwlog_pending = true;
@@ -2273,7 +2280,10 @@ gw_host_packet(const uint8_t *p, unsigned n, uint8_t *out, unsigned *no, unsigne
 		}
 		return;
 	}
-	if (nfc_gw_mode != 1) {         /* mode 0: nothing reaches the chip */
+	if (nfc_gw_mode != 1) {         /* mode 0: nothing reaches the chip (1152: but the hybrid reader) */
+		if (rdr_claim(p, n, v, fwd, fn)) {
+			return;                 /* 1152: queued for the chip; answered after gw_lock is dropped */
+		}
 		if ((nfc_id_bits & 4) && persona_packet(p, n, out, no, cap)) {
 			return;                 /* 1125: answered by the PN80V persona */
 		}
@@ -2522,6 +2532,963 @@ gw_session_stop(const char *why)
 	SAY("gw: chip session stopped (%s): VEN low\n", why);
 }
 
+/* ==== 1152: hybrid reader mode ====================================================================================
+ *
+ * Gate: kern.sweet_nfc_fwif_fmt bit 0x400000 AND kern.sweet_nfc_reader bit 0, gateway mode 0 with the persona
+ * (kern.sweet_nfc_id bit 2), no loader latch. With the gate off nothing below runs (rdr_claim returns false at once,
+ * rdr_bus_ok has no approval, rdr_down's fast path returns): byte-identical to 1151.
+ * The persona keeps answering everything (init, eSE, HCI, NXP 2F, CORE_*, NFCEE, routing). Only the RF reader path
+ * goes to the ST54J (NCI 2.0):
+ *   - RF_DISCOVER_MAP (21 00): the persona answers OK as before; the poll entries (gw_filter) are kept and the chip
+ *     is brought up / given the mapping (job RJ_MAP).
+ *   - RF_DISCOVER (21 03): poll techs only (gw_filter), sent to the chip, the chip's 41 03 goes up in the persona's
+ *     framing (CRC16 iff the host's command got one, as gw_pend_flush does). Bring-up or chip failure: answered locally
+ *     41 03 01 00 as before (field off) and logged.
+ *   - while the chip is up: RF_DISCOVER_SELECT (21 04), RF_DEACTIVATE (21 06), RF_T3T_POLLING (21 08) and data on
+ *     conn 0 go to the chip; 21 06 01 00 (idle) -> RSP (+ NTF) up, then VEN low.
+ *   - chip -> host (rdr_thread polls IRQ gpio34): 61 03, 61 05, 61 06, 41 06, 60 06 (conn 0 only), 60 07, 60 08,
+ *     41 04, 61 08/41 08 (T3T polling, since 21 08 is forwarded) and data on conn 0; everything else logged + dropped.
+ * Bring-up (rdr_bringup): VEN high + st21nfc reset pulse, CORE_RESET_NTF (loader -> latch, as nfc_probe), router mode,
+ * CORE_INIT 20 01 02 00 00, PROP_NFC_MODE_SET ON 2F 02 02 02 01 (the only 2F, a constant from nfc_tx_ok[]; always,
+ * as ST's HAL does after CORE_INIT; kern.sweet_nfc_reader bit 1 = only if CORE_INIT is rejected), then the host's
+ * last RF_DISCOVER_MAP (poll entries, protocols 01-06, interfaces 01-03) or the default ISO-DEP->ISO-DEP,
+ * T1T/T2T/T3T/T5T->Frame. The SE7 write is at most 8 bytes (sweet_se7_xfer): longer packets are trimmed (map: the
+ * ISO-DEP entry, the rest falls back to Frame; discover: 2 techs, A/B/F/V first) or, with kern.sweet_nfc_reader bit 2,
+ * sent as NCI segments (PBF) of 5 payload bytes. Data over 8 bytes without bit 2 is refused (bus_len).
+ * Never sent: listen modes, routing, NFCEE, any host 2F, SET_CONFIG, HCI/eSE data (gw_filter + rdr_pkt_ok, and
+ * again at the bus: rdr_bus_ok accepts only the bytes rdr_tx just checked). No SPI, no gpio67; VEN is the only pin.
+ * Locks: rdr_lock (all reader chip I2C, reader state) before gw_lock (taken briefly to send up / copy state);
+ * gw_ctl_send queues jobs under gw_lock and runs them after dropping it, so gw_lock is never held across I2C.
+ * NCI 2.0 -> 1.0: RF_INTF_ACTIVATED_NTF goes up unchanged and is logged in full; kern.sweet_nfc_fwif_fmt 0x800000:
+ * NFC-A poll activation loses the NCI 2.0 HR length + HR bytes at the end of its tech-specific parameters.
+ * Klog: "SWEET NFC: rdr:" (bounded: 800 lines, then every 100th). Stats: kern.sweet_nfc_rdr.
+ */
+static LCK_MTX_DECLARE(rdr_lock, &nfc_lock_group);
+static uint32_t nfc_reader;             /* kern.sweet_nfc_reader: 1 on, 2 MODE_SET ON only if needed, 4 NCI segments */
+static volatile bool rdr_on;            /* chip up and initialised by the reader (rdr_lock) */
+static volatile bool rdr_own;           /* the reader holds nfc_busy (rdr_lock) */
+static volatile bool rdr_stale;         /* chip sent an unsolicited CORE_RESET_NTF: bring up again first */
+static volatile bool rdr_thr_run, rdr_thr_alive;
+static const uint8_t *volatile rdr_ap;  /* bus approval: the exact bytes being written now (rdr_lock) */
+static volatile unsigned rdr_ap_n;
+static volatile bool rdr_ap_seg;
+static bool rdr_last_crc;               /* gw_lock: the host's last reader command was answered with CRC16 */
+static uint8_t rdr_map[3 + 255];        /* gw_lock: host's last RF_DISCOVER_MAP, poll entries only */
+static unsigned rdr_map_n;
+static uint32_t rdr_said, rdr_bringups, rdr_bfail, rdr_tx_n, rdr_up_n, rdr_drop_n, rdr_refused, rdr_seg_n, rdr_trim_n,
+    rdr_xlat_n, rdr_local_n;
+static int rdr_last_err;
+
+enum { RJ_MAP = 1, RJ_DISC, RJ_CMD, RJ_DATA, RJ_DOWN };
+#define RDR_QN  4
+struct rdr_job {
+	uint8_t kind;
+	bool crc;
+	unsigned n;
+	uint8_t b[3 + 255];
+};
+static struct rdr_job rdr_q[RDR_QN];            /* gw_lock */
+static volatile unsigned rdr_qn;
+static struct rdr_job rdr_run_q[RDR_QN];        /* rdr_lock */
+static uint8_t rdr_pkt[3 + 255];                /* rdr_lock: one chip packet */
+static uint8_t rdr_xbuf[3 + 255];               /* rdr_lock: translated packet */
+static uint8_t rdr_upb[3 + 255 + 2];            /* rdr_lock: a packet on its way up (+CRC16) */
+static uint8_t rdr_cmdb[3 + 255];               /* rdr_lock: map / discover as sent to the chip */
+
+static bool
+rdr_say_ok(void)
+{
+	rdr_said++;
+	return rdr_said <= 800 || (rdr_said % 100) == 0;
+}
+
+#define RSAY(...)       do { if (rdr_say_ok()) { SAY("rdr: " __VA_ARGS__); } } while (0)
+
+/* a whole packet, 48 bytes per line */
+static void
+rdr_hexlog(const char *dir, const uint8_t *b, unsigned n, const char *note)
+{
+	char h[3 * 48 + 4];
+	unsigned at = 0;
+
+	if (!rdr_say_ok()) {
+		return;
+	}
+	do {
+		unsigned k = n - at > 48 ? 48 : n - at;
+
+		hex(h, sizeof(h), b + at, k);
+		SAY("rdr: %s %u%s [%s]%s%s\n", dir, n, at ? " (cont)" : "", h, note && !at ? " " : "", note && !at ? note : "");
+		at += 48;
+	} while (at < n);
+}
+
+static bool
+rdr_gate(void)
+{
+	return (nfc_fwif_fmt & 0x400000) && (nfc_reader & 1) && nfc_gw_mode == 0 && (nfc_id_bits & 4) && !nfc_loader;
+}
+
+/* may this whole packet go to the chip? reader RF commands and conn-0 data, through gw_filter unchanged */
+static bool
+rdr_pkt_ok(const uint8_t *b, unsigned n)
+{
+	uint8_t o[3 + 255];
+	unsigned on = 0;
+	int why;
+
+	if (b == NULL || n < 3 || n > sizeof(o) || n != 3u + b[2]) {
+		return false;
+	}
+	if (b[0] == 0x21) {
+		if (b[1] != 0x00 && b[1] != 0x03 && b[1] != 0x04 && b[1] != 0x06 && b[1] != 0x08) {
+			return false;
+		}
+	} else if (b[0] != 0x00) {
+		return false;
+	}
+	return gw_filter(b, n, o, &on, &why) == V_FWD && on == n && memcmp(o, b, n) == 0;
+}
+
+/* sweet_nfc_tx_allowed(): only the bytes rdr_tx() approved for this one write */
+static bool
+rdr_bus_ok(const uint8_t *tx, unsigned nt)
+{
+	const uint8_t *a = rdr_ap;
+	unsigned an = rdr_ap_n;
+
+	if (a == NULL || tx == NULL || an != nt || nt < 3 || nt > 8 || !rdr_gate() || memcmp(a, tx, nt) != 0) {
+		return false;
+	}
+	return rdr_ap_seg || rdr_pkt_ok(tx, nt);
+}
+
+static bool
+rdr_is_loader(const uint8_t *p, unsigned n)
+{
+	return n >= 4 && p[0] == 0x60 && p[1] == 0x00 && ((p[2] == 0x39 && p[3] == 0xa1) || (p[2] == 0x41 && p[3] == 0xa2));
+}
+
+/* rdr_lock held */
+static void
+rdr_latch_loader(const uint8_t *p, unsigned n)
+{
+	nfc_loader = true;
+	nfc_tx_open = false;
+	ven(false);
+	rdr_on = false;
+	rdr_thr_run = false;
+	if (rdr_own) {
+		rdr_own = false;
+		nfc_busy = false;
+	}
+	set_state("loader");
+	rdr_hexlog("chip>", p, n, "LOADER MODE - STOPPED, VEN low, nothing more is sent until reboot");
+}
+
+/* rdr_lock held: one of the nfc_tx_ok[] constants (nfc_tx_open) */
+static int
+rdr_wr_const(const uint8_t *b, unsigned n, const char *what)
+{
+	int err = sweet_se7_xfer(NFC_ADDR, b, n, NULL, 0);
+
+	rdr_hexlog("->chip", b, n, err ? "FAILED" : what);
+	return err;
+}
+
+/* rdr_lock held: a checked reader packet; > 8 bytes as NCI segments (kern.sweet_nfc_reader bit 2) or refused */
+static int
+rdr_tx(const uint8_t *b, unsigned n, const char *what)
+{
+	uint8_t sg[8];
+	int err = 0;
+
+	if (!rdr_pkt_ok(b, n)) {
+		rdr_refused++;
+		rdr_hexlog("->chip REFUSED (not a reader packet / gw_filter)", b, n, what);
+		return EPERM;
+	}
+	if (n <= 8) {
+		rdr_ap_seg = false;
+		rdr_ap_n = n;
+		rdr_ap = b;
+		err = sweet_se7_xfer(NFC_ADDR, b, n, NULL, 0);
+		rdr_ap = NULL;
+		rdr_ap_n = 0;
+		rdr_tx_n++;
+		rdr_hexlog("->chip", b, n, err ? "FAILED" : what);
+		return err;
+	}
+	if (!(nfc_reader & 4)) {
+		rdr_refused++;
+		gw_refuse(RF_BUSLEN);
+		rdr_hexlog("->chip REFUSED", b, n, "longer than the 8-byte SE7 write (kern.sweet_nfc_reader bit 2 = NCI segments)");
+		return EMSGSIZE;
+	}
+	for (unsigned at = 3; at < n && !err;) {
+		unsigned k = n - at > 5 ? 5 : n - at;
+		bool last = at + k == n;
+
+		sg[0] = (uint8_t)(b[0] | (last ? 0x00 : 0x10));
+		sg[1] = b[1];
+		sg[2] = (uint8_t)k;
+		memcpy(sg + 3, b + at, k);
+		rdr_ap_seg = true;
+		rdr_ap_n = 3 + k;
+		rdr_ap = sg;
+		err = sweet_se7_xfer(NFC_ADDR, sg, 3 + k, NULL, 0);
+		rdr_ap = NULL;
+		rdr_ap_n = 0;
+		rdr_ap_seg = false;
+		rdr_seg_n++;
+		at += k;
+	}
+	rdr_tx_n++;
+	rdr_hexlog("->chip (NCI segments, 5 payload bytes each)", b, n, err ? "FAILED" : what);
+	return err;
+}
+
+/* gw_lock held: CRC16 on packets the reader sends up on its own */
+static bool
+rdr_crc_now(void)
+{
+	return rdr_last_crc || (gw.chip_crc && !(nfc_fwif_fmt & 0x40));
+}
+
+/* rdr_lock held (gw_lock taken briefly). crc: 1/0, or -1 = the async rule */
+static void
+rdr_send_up(const uint8_t *p, unsigned n, int crc, const char *note)
+{
+	uint32_t unit;
+	bool c;
+
+	if (n < 3 || n > 3 + 255) {
+		return;
+	}
+	lck_mtx_lock(&gw_lock);
+	unit = gw.connected ? gw.unit : 0;
+	c = crc < 0 ? rdr_crc_now() : crc != 0;
+	if (p[0] == 0x61 && p[1] == 0x05) {
+		gw.rf_active = true;
+	} else if ((p[0] == 0x61 || p[0] == 0x41) && p[1] == 0x06) {
+		gw.rf_active = false;
+	}
+	lck_mtx_unlock(&gw_lock);
+	memcpy(rdr_upb, p, n);
+	if (c) {
+		uint16_t v = nci_crc16(p, n);
+
+		rdr_upb[n] = (uint8_t)(v >> 8);
+		rdr_upb[n + 1] = (uint8_t)v;
+	}
+	if (unit == 0 || gw_ctl == NULL) {
+		rdr_drop_n++;
+		RSAY("host gone: %02x %02x (%u bytes) not sent up\n", p[0], p[1], n);
+		return;
+	}
+	if (ctl_enqueuedata(gw_ctl, unit, rdr_upb, n + (c ? 2u : 0u), 0) == 0) {
+		rdr_up_n++;
+		gw_up_pkts++;
+		RSAY("host< %02x %02x %u bytes%s: %s\n", p[0], p[1], n, c ? " +CRC16" : "", note);
+	} else {
+		gw_up_fail++;
+		RSAY("host< %02x %02x %u bytes send FAILED (%s)\n", p[0], p[1], n, note);
+	}
+}
+
+/* chip -> host whitelist */
+static bool
+rdr_up_ok(const uint8_t *p, unsigned n, const char **why)
+{
+	if ((p[0] >> 5) == 0) {
+		if ((p[0] & 0xef) == 0x00) {
+			return true;    /* data, conn 0 (PBF allowed: the host reassembles) */
+		}
+		*why = "data not on conn 0: dropped";
+		return false;
+	}
+	switch ((uint16_t)(p[0] << 8 | p[1])) {
+	case 0x6103:            /* RF_DISCOVER_NTF */
+	case 0x6105:            /* RF_INTF_ACTIVATED_NTF */
+	case 0x6106:            /* RF_DEACTIVATE_NTF */
+	case 0x4106:            /* RF_DEACTIVATE_RSP */
+	case 0x4104:            /* RF_DISCOVER_SELECT_RSP */
+	case 0x6108:            /* RF_T3T_POLLING_NTF */
+	case 0x4108:            /* RF_T3T_POLLING_RSP */
+	case 0x6007:            /* CORE_GENERIC_ERROR_NTF */
+	case 0x6008:            /* CORE_INTERFACE_ERROR_NTF */
+		return true;
+	case 0x6006:            /* CORE_CONN_CREDITS_NTF: conn 0 entries only */
+		if (n >= 4 && p[3] > 0 && n == 4u + 2u * p[3]) {
+			for (unsigned i = 0; i < p[3]; i++) {
+				if (p[4 + 2 * i] != 0x00) {
+					*why = "CORE_CONN_CREDITS_NTF not (only) for conn 0: dropped";
+					return false;
+				}
+			}
+			return true;
+		}
+		*why = "CORE_CONN_CREDITS_NTF malformed: dropped";
+		return false;
+	default:
+		*why = "not on the reader up-list: dropped";
+		return false;
+	}
+}
+
+/* 0x800000: NCI 2.0 -> 1.0 for an NFC-A poll RF_INTF_ACTIVATED_NTF. NCI 2.0 appends HR length + HR (T1T) to the NFC-A
+ * poll tech-specific parameters (SENS_RES 2, NFCID1 length + NFCID1, SEL_RES length + SEL_RES); NCI 1.0 has not.
+ * Only a packet that parses exactly with the HR fields is changed. */
+static bool
+rdr_xlat_a(const uint8_t *p, unsigned n, uint8_t *o, unsigned *on)
+{
+	unsigned tl, k, sl, h, cut, at;
+
+	if (n < 14 || p[6] != 0x00) {
+		return false;
+	}
+	tl = p[9];
+	if (10u + tl > n || tl < 5) {
+		return false;
+	}
+	k = p[12];
+	if (4u + k > tl) {
+		return false;
+	}
+	sl = p[13 + k];
+	if (5u + k + sl > tl) {
+		return false;   /* no HR length byte: already the 1.0 form */
+	}
+	h = p[14 + k + sl];
+	if (5u + k + sl + h != tl) {
+		return false;
+	}
+	cut = 1 + h;
+	at = 10 + tl - cut;
+	memcpy(o, p, at);
+	memcpy(o + at, p + at + cut, n - at - cut);
+	o[9] = (uint8_t)(tl - cut);
+	o[2] = (uint8_t)(p[2] - cut);
+	*on = n - cut;
+	return true;
+}
+
+/* rdr_lock held: one packet from the chip outside a command's own RSP */
+static void
+rdr_chip_in(const uint8_t *p, unsigned n)
+{
+	const char *why = NULL;
+	unsigned xn = 0;
+
+	if (rdr_is_loader(p, n)) {
+		rdr_latch_loader(p, n);
+		return;
+	}
+	if (p[0] == 0x60 && p[1] == 0x00) {
+		rdr_stale = true;
+		rdr_drop_n++;
+		rdr_hexlog("chip>", p, n, "CORE_RESET_NTF unasked: dropped; bring-up again before the next reader command");
+		return;
+	}
+	if (!rdr_up_ok(p, n, &why)) {
+		rdr_drop_n++;
+		rdr_hexlog("chip>", p, n, why);
+		return;
+	}
+	if (p[0] == 0x61 && p[1] == 0x05) {
+		rdr_hexlog("chip>", p, n, "RF_INTF_ACTIVATED_NTF (NCI 2.0, full)");
+		if (n >= 10) {
+			RSAY("RF_INTF_ACTIVATED: id %u intf %#x proto %#x mode %#x max payload %u credits %u tech params %u\n", p[3],
+			    p[4], p[5], p[6], p[7], p[8], p[9]);
+		}
+		if ((nfc_fwif_fmt & 0x800000) && rdr_xlat_a(p, n, rdr_xbuf, &xn)) {
+			rdr_xlat_n++;
+			rdr_hexlog("host< (0x800000: NFC-A HR fields taken off, NCI 1.0 form)", rdr_xbuf, xn, NULL);
+			rdr_send_up(rdr_xbuf, xn, -1, "RF_INTF_ACTIVATED_NTF (translated)");
+			return;
+		}
+		rdr_send_up(p, n, -1, "RF_INTF_ACTIVATED_NTF (unchanged)");
+		return;
+	}
+	rdr_hexlog("chip>", p, n, "-> host");
+	rdr_send_up(p, n, -1, "from the chip");
+}
+
+/* rdr_lock held: packets until one starts b0 b1; others are forwarded (fwd) or logged and dropped */
+static int
+rdr_wait(uint8_t b0, uint8_t b1, uint8_t *p, unsigned *n, unsigned wait_ms, bool fwd)
+{
+	for (unsigned i = 0; i < 8; i++) {
+		int err = nfc_read_pkt(p, n, wait_ms);
+
+		if (err) {
+			RSAY("waiting for %02x %02x: nothing (%d)\n", b0, b1, err);
+			return err;
+		}
+		if (p[0] == b0 && p[1] == b1) {
+			rdr_hexlog("chip>", p, *n, NULL);
+			return 0;
+		}
+		if (rdr_is_loader(p, *n)) {
+			rdr_latch_loader(p, *n);
+			return EPERM;
+		}
+		if (fwd) {
+			rdr_chip_in(p, *n);
+		} else {
+			rdr_drop_n++;
+			rdr_hexlog("chip>", p, *n, "(during bring-up: logged, not sent up)");
+		}
+	}
+	return EPROTO;
+}
+
+/* RF_DISCOVER_MAP for the chip: the host's poll entries (protocols 01-06, interfaces 01-03) or the default */
+static unsigned
+rdr_map_build(uint8_t *o)
+{
+	static const uint8_t def[5][3] = {
+		{ 0x04, 0x01, 0x02 },   /* ISO-DEP -> ISO-DEP */
+		{ 0x01, 0x01, 0x01 },   /* T1T -> Frame */
+		{ 0x02, 0x01, 0x01 },   /* T2T -> Frame */
+		{ 0x03, 0x01, 0x01 },   /* T3T -> Frame */
+		{ 0x06, 0x01, 0x01 },   /* T5T -> Frame */
+	};
+	uint8_t h[3 + 255];
+	unsigned hn, at = 4, k = 0, j = 0;
+	const char *src = "host";
+
+	lck_mtx_lock(&gw_lock);
+	hn = rdr_map_n;
+	memcpy(h, rdr_map, hn);
+	lck_mtx_unlock(&gw_lock);
+	o[0] = 0x21;
+	o[1] = 0x00;
+	for (unsigned i = 0; hn >= 4 && i < h[3] && 4u + 3u * i + 2u < hn; i++) {
+		const uint8_t *e = h + 4 + 3 * i;
+
+		if (e[0] < 0x01 || e[0] > 0x06 || e[2] < 0x01 || e[2] > 0x03 || !(e[1] & 0x01)) {
+			RSAY("map: host entry %02x %02x %02x left out (not poll / not a standard protocol or interface)\n", e[0],
+			    e[1], e[2]);
+			continue;
+		}
+		o[at] = e[0];
+		o[at + 1] = 0x01;
+		o[at + 2] = e[2];
+		at += 3;
+		k++;
+	}
+	if (k == 0) {
+		src = hn ? "default (no usable host entry)" : "default (no host map yet)";
+		for (unsigned i = 0; i < 5; i++) {
+			memcpy(o + at, def[i], 3);
+			at += 3;
+			k++;
+		}
+	}
+	if (at > 8 && !(nfc_reader & 4)) {
+		for (unsigned i = 0; i < k; i++) {
+			if (o[4 + 3 * i] == 0x04) {
+				j = i;
+				break;
+			}
+		}
+		memmove(o + 4, o + 4 + 3 * j, 3);
+		RSAY("map: %u entries do not fit the 8-byte write: only %02x %02x %02x (the rest uses Frame)\n", k, o[4], o[5],
+		    o[6]);
+		rdr_trim_n++;
+		at = 7;
+		k = 1;
+	}
+	o[2] = (uint8_t)(at - 3);
+	o[3] = (uint8_t)k;
+	RSAY("map: %u entries from the %s\n", k, src);
+	return at;
+}
+
+/* RF_DISCOVER for the chip from the filtered host packet: standard poll techs, A/B/F/V first, 8-byte fit */
+static unsigned
+rdr_disc_build(const uint8_t *f, unsigned fn, uint8_t *o)
+{
+	static const uint8_t pri[6] = { 0x00, 0x01, 0x02, 0x06, 0x03, 0x05 };
+	unsigned at = 4, k = 0, max = (nfc_reader & 4) ? 120u : 2u, all = (fn >= 4) ? f[3] : 0;
+
+	o[0] = 0x21;
+	o[1] = 0x03;
+	for (unsigned t = 0; t < 6; t++) {
+		for (unsigned i = 0; i < all && 4u + 2u * i + 1u < fn; i++) {
+			if (f[4 + 2 * i] == pri[t] && k < max) {
+				o[at] = f[4 + 2 * i];
+				o[at + 1] = f[5 + 2 * i];
+				at += 2;
+				k++;
+			}
+		}
+	}
+	if (k < all) {
+		rdr_trim_n++;
+		RSAY("discover: %u of %u poll entries kept (8-byte write / NXP proprietary techs left out)\n", k, all);
+	}
+	o[2] = (uint8_t)(at - 3);
+	o[3] = (uint8_t)k;
+	return k ? at : 0;
+}
+
+static void rdr_thread(void *arg, wait_result_t wr);
+
+/* rdr_lock held: power, reset, CORE_INIT, MODE_SET ON, mapping, RX thread */
+static int
+rdr_bringup(const char *why)
+{
+	unsigned n = 0, m = 0, ml;
+	int err;
+	bool rej;
+	thread_t th;
+
+	if (rdr_on && !rdr_stale) {
+		return 0;
+	}
+	rdr_bringups++;
+	if (nfc_loader) {
+		RSAY("bring-up (%s) refused: loader mode latched\n", why);
+		return EPERM;
+	}
+	if (!rdr_own) {
+		if (gw_session || __atomic_exchange_n(&nfc_busy, true, __ATOMIC_ACQ_REL)) {
+			RSAY("bring-up (%s) refused: chip busy (P0 probe or mode-1 session)\n", why);
+			rdr_bfail++;
+			return EBUSY;
+		}
+		rdr_own = true;
+	}
+	if (!pins_map() || !sweet_se7_init_nfc()) {
+		RSAY("bring-up (%s): pins or SE7 bus not available\n", why);
+		err = ENXIO;
+		goto fail;
+	}
+	RSAY("bring-up (%s)%s: VEN high + reset pulse\n", why, rdr_stale ? " after a chip reset" : "");
+	rdr_stale = false;
+	nfc_tx_open = true;
+	ven(true);
+	sleep_ms(10);
+	ven(false);
+	sleep_ms(20);
+	ven(true);
+	sleep_ms(10);
+	ven(false);
+	sleep_ms(20);
+	ven(true);
+	err = rdr_wait(0x60, 0x00, ntf, &n, NFC_WAIT_MS, false);
+	if (err && !nfc_loader) {
+		RSAY("no CORE_RESET_NTF after the pulse (%d): CORE_RESET_CMD once\n", err);
+		err = rdr_wr_const(TX_CORE_RESET, sizeof(TX_CORE_RESET), "CORE_RESET_CMD");
+		err = err ? err : rdr_wait(0x60, 0x00, ntf, &n, NFC_WAIT_MS, false);
+	}
+	if (nfc_loader) {
+		return EPERM;   /* rdr_latch_loader: VEN low, busy released */
+	}
+	if (err) {
+		RSAY("chip silent (%d)\n", err);
+		goto fail;
+	}
+	if (rdr_is_loader(ntf, n)) {
+		rdr_latch_loader(ntf, n);
+		return EPERM;
+	}
+	if (n < 8 || ntf[3] == 0x00 || ntf[3] >= 0x80) {
+		rdr_hexlog("chip>", ntf, n, "CORE_RESET_NTF: not router mode, stopped");
+		err = EPROTO;
+		goto fail;
+	}
+	RSAY("CORE_RESET_NTF router mode: reason %#x nci %#x manuf %#x\n", ntf[3], ntf[5], ntf[6]);
+	err = rdr_wr_const(TX_CORE_INIT, sizeof(TX_CORE_INIT), "CORE_INIT_CMD (NCI 2.0)");
+	err = err ? err : rdr_wait(0x40, 0x01, pkt, &m, NFC_WAIT_MS, false);
+	rej = err || m < 4 || pkt[3] != 0;
+	if (rej || !(nfc_reader & 2)) {
+		if (rdr_wr_const(TX_MODE_ON, sizeof(TX_MODE_ON), "PROP_NFC_MODE_SET ON") == 0 &&
+		    rdr_wait(0x4f, 0x02, pkt, &m, NFC_WAIT_MS, false) == 0) {
+			RSAY("PROP_NFC_MODE_SET RSP status %#x\n", m >= 4 ? pkt[3] : 0xff);
+		}
+		if (rej) {
+			RSAY("CORE_INIT %s (%d): again after MODE_SET ON\n", err ? "unanswered" : "rejected", err);
+			err = rdr_wr_const(TX_CORE_INIT, sizeof(TX_CORE_INIT), "CORE_INIT_CMD (2nd)");
+			err = err ? err : rdr_wait(0x40, 0x01, pkt, &m, NFC_WAIT_MS, false);
+			if (!err && (m < 4 || pkt[3] != 0)) {
+				err = EPROTO;
+			}
+		}
+	}
+	if (nfc_loader) {
+		return EPERM;
+	}
+	if (err) {
+		RSAY("CORE_INIT failed (%d)\n", err);
+		goto fail;
+	}
+	nfc_tx_open = false;
+	rdr_on = true;          /* rdr_pkt_ok/rdr_bus_ok need the gate only; rdr_on lets the thread read */
+	ml = rdr_map_build(rdr_cmdb);
+	if (rdr_tx(rdr_cmdb, ml, "RF_DISCOVER_MAP") == 0 && rdr_wait(0x41, 0x00, pkt, &m, NFC_WAIT_MS, false) == 0) {
+		RSAY("RF_DISCOVER_MAP RSP status %#x%s\n", m >= 4 ? pkt[3] : 0xff, m >= 4 && pkt[3] ? " (going on: unmapped = Frame)" : "");
+	} else {
+		RSAY("RF_DISCOVER_MAP not taken (going on: unmapped = Frame)\n");
+	}
+	if (nfc_loader) {
+		return EPERM;
+	}
+	rdr_thr_run = true;
+	if (!rdr_thr_alive) {
+		rdr_thr_alive = true;
+		if (kernel_thread_start(rdr_thread, NULL, &th) != KERN_SUCCESS) {
+			rdr_thr_alive = false;
+			rdr_thr_run = false;
+			err = ENOMEM;
+			goto fail;
+		}
+		thread_deallocate(th);
+	}
+	set_state("rdr:up");
+	RSAY("bring-up OK (%s): chip in RF idle, reader thread polling IRQ gpio34\n", why);
+	return 0;
+fail:
+	nfc_tx_open = false;
+	ven(false);
+	rdr_on = false;
+	rdr_thr_run = false;
+	if (rdr_own) {
+		rdr_own = false;
+		nfc_busy = false;
+	}
+	rdr_bfail++;
+	rdr_last_err = err;
+	set_state("rdr:bringup_failed");
+	RSAY("bring-up FAILED (%s, %d): VEN low\n", why, err);
+	return err;
+}
+
+/* rdr_lock held. Returns whether the chip was up. */
+static bool
+rdr_down_locked(void)
+{
+	bool was = rdr_on;
+
+	rdr_thr_run = false;
+	rdr_on = false;
+	rdr_stale = false;
+	if (rdr_own) {
+		ven(false);
+		rdr_own = false;
+		nfc_busy = false;
+		if (!nfc_loader) {
+			set_state("off");
+		}
+	}
+	return was;
+}
+
+/* no gw_lock / rdr_lock held; not from rdr_thread */
+static void
+rdr_down(const char *why)
+{
+	bool was;
+
+	if (!rdr_on && !rdr_own && !rdr_thr_alive) {
+		return;
+	}
+	lck_mtx_lock(&rdr_lock);
+	was = rdr_down_locked();
+	lck_mtx_unlock(&rdr_lock);
+	for (unsigned i = 0; rdr_thr_alive && i < 500; i++) {
+		sleep_ms(1);
+	}
+	lck_mtx_lock(&gw_lock);
+	gw.rf_active = false;
+	lck_mtx_unlock(&gw_lock);
+	SAY("rdr: powered down (%s): VEN low%s%s\n", why, was ? "" : " (chip was not up)",
+	    rdr_thr_alive ? ", reader thread still running" : "");
+}
+
+static void
+rdr_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	unsigned n;
+	bool idle;
+
+	for (;;) {
+		if (!rdr_thr_run) {
+			lck_mtx_lock(&rdr_lock);
+			if (!rdr_thr_run) {
+				rdr_thr_alive = false;
+				lck_mtx_unlock(&rdr_lock);
+				break;
+			}
+			lck_mtx_unlock(&rdr_lock);
+		}
+		if (!rdr_on || !pin_in(P_IRQ)) {
+			sleep_ms(2);
+			continue;
+		}
+		idle = true;
+		lck_mtx_lock(&rdr_lock);
+		if (rdr_on && rdr_thr_run && nfc_read_pkt(rdr_pkt, &n, 0) == 0) {
+			rdr_chip_in(rdr_pkt, n);
+			idle = false;
+		}
+		lck_mtx_unlock(&rdr_lock);
+		if (idle) {
+			sleep_ms(2);
+		}
+	}
+	SAY("rdr: reader thread stopped\n");
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/* gw_lock held */
+static bool
+rdr_queue(uint8_t kind, const uint8_t *b, unsigned n)
+{
+	struct rdr_job *j;
+
+	if (rdr_qn >= RDR_QN || n > sizeof(rdr_q[0].b)) {
+		RSAY("job queue full: job %u dropped\n", kind);
+		return false;
+	}
+	j = &rdr_q[rdr_qn];
+	j->kind = kind;
+	j->crc = gw.crc_out;
+	j->n = n;
+	if (n) {
+		memcpy(j->b, b, n);
+	}
+	rdr_qn = rdr_qn + 1;
+	return true;
+}
+
+/* gw_lock held: host CORE_RESET */
+static void
+rdr_host_reset(void)
+{
+	if (rdr_on || rdr_own) {
+		(void)rdr_queue(RJ_DOWN, NULL, 0);
+	}
+}
+
+/* gw_lock held, gateway mode 0. p/n: host packet (CRC16 already taken off), v/f/fn: gw_filter's verdict and output.
+ * true = the reader owns it (no local reply now); false = the persona answers as before. */
+static bool
+rdr_claim(const uint8_t *p, unsigned n, int v, const uint8_t *f, unsigned fn)
+{
+	uint8_t kind;
+
+	if (!rdr_gate()) {
+		if (rdr_on || rdr_own) {
+			(void)rdr_queue(RJ_DOWN, NULL, 0);      /* gate turned off while up */
+		}
+		return false;
+	}
+	if (n < 3) {
+		return false;
+	}
+	if (p[0] == 0x00) {
+		if (!rdr_on) {
+			return false;
+		}
+		if (v != V_FWD) {
+			rdr_refused++;
+			rdr_hexlog("host> data REFUSED (gw_filter: no RF interface active?)", p, n, NULL);
+			return false;
+		}
+		kind = RJ_DATA;
+	} else if (p[0] == 0x21 && p[1] == 0x00) {
+		/* remembered (poll entries only); the persona answers OK as before */
+		rdr_map_n = (v == V_FWD && fn <= sizeof(rdr_map)) ? fn : 0;
+		if (rdr_map_n) {
+			memcpy(rdr_map, f, fn);
+		}
+		rdr_hexlog("host> RF_DISCOVER_MAP", p, n, rdr_map_n ? "(poll entries kept for the chip)" : "(no poll entry)");
+		(void)rdr_queue(RJ_MAP, NULL, 0);
+		return false;
+	} else if (p[0] == 0x21 && p[1] == 0x03) {
+		if (v != V_FWD) {
+			rdr_hexlog("host> RF_DISCOVER without poll entries: persona answers (field off)", p, n, NULL);
+			return false;
+		}
+		kind = RJ_DISC;
+	} else if (p[0] == 0x21 && (p[1] == 0x04 || p[1] == 0x06 || p[1] == 0x08)) {
+		if (!rdr_on || v != V_FWD) {
+			return false;
+		}
+		kind = RJ_CMD;
+	} else {
+		return false;
+	}
+	rdr_last_crc = gw.crc_out;
+	rdr_hexlog("host>", p, n, kind == RJ_DATA ? "conn 0 data -> chip" : "-> chip (queued)");
+	return rdr_queue(kind, f, fn);
+}
+
+/* rdr_lock held: what the persona would have said when the chip cannot answer */
+static void
+rdr_local(const struct rdr_job *j, int err)
+{
+	uint8_t r[4] = { (uint8_t)(0x40 | (j->b[0] & 0x0f)), j->b[1], 0x01, 0x00 };
+
+	rdr_local_n++;
+	rdr_last_err = err;
+	if (j->b[1] == 0x03) {
+		rdr_send_up(r, 4, j->crc, "RF_DISCOVER_RSP local OK as before (field off): chip did not answer");
+	} else if (j->b[1] == 0x06) {
+		const uint8_t nt[5] = { 0x61, 0x06, 0x02, (uint8_t)(j->n > 3 ? j->b[3] : 0), 0x00 };
+
+		rdr_send_up(r, 4, j->crc, "RF_DEACTIVATE_RSP local OK (chip did not answer)");
+		rdr_send_up(nt, 5, j->crc, "RF_DEACTIVATE_NTF local");
+	} else {
+		r[3] = 0x03;    /* STATUS_FAILED */
+		rdr_send_up(r, 4, j->crc, "local STATUS_FAILED (chip did not answer)");
+	}
+	RSAY("%02x %02x answered locally (%d)\n", j->b[0], j->b[1], err);
+}
+
+/* after gw_lock is dropped (gw_ctl_send, nfcd's write thread) */
+static void
+rdr_run_jobs(void)
+{
+	unsigned qn, m = 0, cl;
+	bool down = false;
+	const char *down_why = "";
+	int err;
+
+	if (rdr_qn == 0) {
+		return;
+	}
+	lck_mtx_lock(&rdr_lock);
+	lck_mtx_lock(&gw_lock);
+	qn = rdr_qn;
+	memcpy(rdr_run_q, rdr_q, qn * sizeof(rdr_q[0]));
+	rdr_qn = 0;
+	lck_mtx_unlock(&gw_lock);
+	for (unsigned i = 0; i < qn && !down; i++) {
+		struct rdr_job *j = &rdr_run_q[i];
+
+		switch (j->kind) {
+		case RJ_DOWN:
+			down = true;
+			down_why = "host CORE_RESET / gate off";
+			break;
+		case RJ_MAP:
+			if (rdr_on && !rdr_stale) {
+				cl = rdr_map_build(rdr_cmdb);
+				if (rdr_tx(rdr_cmdb, cl, "RF_DISCOVER_MAP (new host map)") == 0 &&
+				    rdr_wait(0x41, 0x00, rdr_pkt, &m, NFC_WAIT_MS, true) == 0) {
+					RSAY("RF_DISCOVER_MAP RSP status %#x (host already has the persona's OK)\n",
+					    m >= 4 ? rdr_pkt[3] : 0xff);
+				}
+			} else {
+				(void)rdr_bringup("RF_DISCOVER_MAP");
+			}
+			break;
+		case RJ_DISC:
+			err = rdr_bringup("RF_DISCOVER");
+			if (err) {
+				rdr_local(j, err);
+				break;
+			}
+			cl = rdr_disc_build(j->b, j->n, rdr_cmdb);
+			if (cl == 0) {
+				rdr_local(j, EINVAL);
+				break;
+			}
+			err = rdr_tx(rdr_cmdb, cl, "RF_DISCOVER");
+			err = err ? err : rdr_wait(0x41, 0x03, rdr_pkt, &m, NFC_WAIT_MS, true);
+			if (err) {
+				rdr_local(j, err);
+				break;
+			}
+			RSAY("RF_DISCOVER_RSP from the chip: status %#x\n", m >= 4 ? rdr_pkt[3] : 0xff);
+			rdr_send_up(rdr_pkt, m, j->crc, "RF_DISCOVER_RSP from the chip");
+			break;
+		case RJ_CMD:
+			if (!rdr_on || rdr_stale) {
+				rdr_local(j, ENXIO);
+				if (j->b[1] == 0x06 && j->n > 3 && j->b[3] == 0x00) {
+					down = true;
+					down_why = "RF_DEACTIVATE idle";
+				}
+				break;
+			}
+			err = rdr_tx(j->b, j->n, "RF command");
+			err = err ? err : rdr_wait(0x41, j->b[1], rdr_pkt, &m, NFC_WAIT_MS, true);
+			if (err) {
+				rdr_local(j, err);
+			} else {
+				rdr_send_up(rdr_pkt, m, j->crc, "RSP from the chip");
+			}
+			if (j->b[1] == 0x06 && j->n > 3 && j->b[3] == 0x00) {
+				if (!err && rdr_wait(0x61, 0x06, rdr_pkt, &m, NFC_WAIT_MS, true) == 0) {
+					rdr_send_up(rdr_pkt, m, -1, "RF_DEACTIVATE_NTF from the chip");
+				}
+				down = true;
+				down_why = "RF_DEACTIVATE idle";
+			}
+			break;
+		case RJ_DATA:
+			if (rdr_on) {
+				(void)rdr_tx(j->b, j->n, "conn 0 data");
+			} else {
+				rdr_drop_n++;
+				RSAY("conn 0 data dropped: chip not up\n");
+			}
+			break;
+		default:
+			break;
+		}
+	}
+	lck_mtx_unlock(&rdr_lock);
+	if (down) {
+		rdr_down(down_why);
+	}
+}
+
+static int
+sysctl_nfc_reader SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, (int)nfc_reader, sizeof(value), &value, &changed);
+
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 7) {
+		return EINVAL;
+	}
+	nfc_reader = (uint32_t)value;
+	if (!(value & 1)) {
+		rdr_down("kern.sweet_nfc_reader=0");
+	}
+	SAY("rdr: kern.sweet_nfc_reader = %d (%s; needs kern.sweet_nfc_fwif_fmt 0x400000, now %s)\n", value,
+	    (value & 1) ? "hybrid reader on" : "off", (nfc_fwif_fmt & 0x400000) ? "set" : "NOT set");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_reader, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_reader, "I",
+    "redfin 1152: NFC hybrid reader (with kern.sweet_nfc_fwif_fmt 0x400000): bit 0 on, bit 1 = PROP_NFC_MODE_SET ON only if "
+    "CORE_INIT is rejected, bit 2 = send packets over 8 bytes as NCI segments (default 0)");
+
+static int
+sysctl_nfc_rdr SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char b[320];
+
+	snprintf(b, sizeof(b), "gate=%u on=%u stale=%u thread=%u bringups=%u fail=%u tx=%u segs=%u up=%u drop=%u refused=%u "
+	    "trim=%u xlat=%u local=%u last_err=%d", rdr_gate(), rdr_on, rdr_stale, rdr_thr_alive, rdr_bringups, rdr_bfail,
+	    rdr_tx_n, rdr_seg_n, rdr_up_n, rdr_drop_n, rdr_refused, rdr_trim_n, rdr_xlat_n, rdr_local_n, rdr_last_err);
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_nfc_rdr, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_nfc_rdr, "A",
+    "redfin 1152: hybrid reader counters");
+
 /* ---- the kernel control com.apple.uart.stockholm ---------------------------------------------------------------- */
 
 /* 1125: the control cannot be deregistered from inside its own disconnect callback: a short thread does it */
@@ -2604,6 +3571,7 @@ gw_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unit
 	SAY("com.apple.uart.stockholm: CLOSE (%s, unit %u): host packets %u (%u bytes), sent up %u (failed %u)\n", who, unit,
 	    gw_host_pkts, gw_host_bytes, gw_up_pkts, gw_up_fail);
 	gw_session_stop("client closed");
+	rdr_down("client closed");       /* 1152 */
 	if (gw_dereg_pending) {
 		thread_t th;
 
@@ -2935,6 +3903,7 @@ gw_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, 
 			gw_up_fail++;
 		}
 	}
+	rdr_run_jobs();                 /* 1152: hybrid reader chip I/O, gw_lock not held */
 	return 0;
 }
 
@@ -3077,6 +4046,9 @@ sweet_nfc_uc_call(uint32_t sel, uint32_t nin, uint64_t v)
 	if (sel > 8 || ((sel <= 3 || sel == 5 || sel == 8) && nin < 1)) {
 		r = 3;
 	} else if (sel == 0) {
+		if (!v && (rdr_on || rdr_own)) {
+			rdr_down("Power 0");    /* 1152 */
+		}
 		if (v && nfc_loader) {
 			r = 1;
 			what = "loader mode latched: VEN stays low";
@@ -3152,6 +4124,9 @@ sweet_nfc_uc_event(int open, uint32_t type)
 		gw_dl_mode = false;
 		gw_dl_n = 0;
 	}
+	if (!open && (rdr_on || rdr_own)) {
+		rdr_down("user client closed");        /* 1152 */
+	}
 	if (!open && !gw_session && !(nfc_busy) && pins_map()) {
 		ven(false);             /* the client is gone: chip off */
 	}
@@ -3187,6 +4162,7 @@ nfc_p1_set(uint32_t v, const char *why)
 		nfc_p1 = 0;
 		(void)SweetNFCPublish(false, why);
 		gw_session_stop(why);
+		rdr_down(why);                 /* 1152 */
 		if (gw.connected) {
 			gw_dereg_pending = true;
 		} else if (gw_ctl != NULL) {
@@ -3250,6 +4226,7 @@ sysctl_nfc_gw SYSCTL_HANDLER_ARGS
 		return EINVAL;
 	}
 	nfc_gw_mode = (uint32_t)value;
+	rdr_down("kern.sweet_nfc_gw changed");       /* 1152 */
 	if (value == 0) {
 		gw_session_stop("kern.sweet_nfc_gw=0");
 	}
@@ -3283,7 +4260,7 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_nfc_fwif_fmt, CTLFLAG_RW | CTLFLAG_LOCKED, &n
     "6F 20 C0 after NFCEE_DISCOVER and MODE_SET C0, 0x2000 = GET_CONFIG A0EB returns the host-set value; 1139: 0x4000 = "
     "MODE_SET C0/01 00 -> 6F 18 00 (1144; 1145: also for NFCEE 01; 0x8000: 6F 18 02 C0 00), no 6F 20, + A0EB mirror; 1140: 0x10000 = that NTF "
     "deferred by kern.sweet_nfc_ntf_delay_ms as its own packet, 0x20000 = no NTF after the disable RSP; 1146: 0x40000 "
-    "(with 0x4000) = accept DownloadRequest, answer HDLL GET_VERSION (1149: with status byte; 0x100000 = old form), 0x80000 = also answer RESET/SESSION_STATE/INTEGRITY/WRITE; nothing forwarded");
+    "(with 0x4000) = accept DownloadRequest, answer HDLL GET_VERSION (1149: with status byte; 0x100000 = old form), 0x80000 = also answer RESET/SESSION_STATE/INTEGRITY/WRITE; nothing forwarded; 1152: 0x400000 = hybrid reader (with kern.sweet_nfc_reader), 0x800000 = NFC-A activation NCI 2.0 -> 1.0");
 
 static int
 cfg_hexval(char c)
