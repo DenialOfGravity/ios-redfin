@@ -423,7 +423,7 @@ run_action() {	# one request line
 		case $verb in put|get|mkdir|read|chmod|link) ;; *) echo "verb not allowed"; return 1;; esac
 		# shellcheck disable=SC2086
 		(cd "$REPO" && timeout 300 python3 -I tools/flame-files.py "$verb" $args);;
-	poke) (cd "$REPO" && timeout 30 python3 -I tools/flame-cmd.py --wait 3 "$rest");;
+	poke) (cd "$REPO" && timeout 30 python3 -I tools/flame-cmd.py --wait "${PA_POKE_WAIT:-3}" "$rest");;
 	install-audio)
 		ok_name "$rest" || { echo "bad name"; return 1; }
 		(cd "$REPO" && timeout 300 bash tools/redfin-install-audio.sh "$P/$rest");;

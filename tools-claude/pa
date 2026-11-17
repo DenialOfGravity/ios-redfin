@@ -31,6 +31,22 @@
 #                             pinned boot values, disk, temp overrides, and the last `state diff` counts (its age and
 #                             whether the kernel changed since). --drift runs a fresh diff first (~45 s).
 #   pa lock                   who holds the phone lock
+#   pa disp [on|off]          the panel only: report, or force it (kernel 1162 `p disp on|off`; older kernels: the
+#                             power key when it toggles the right way). Forcing on shows frames but does not wake iOS
+#   pa wake                   iOS awake and the UI usable: power key only when iOS is asleep (its last own display
+#                             change says off), an up-swipe so press-to-wake doesn't re-sleep it ~6 s later (unlocks
+#                             the lock screen; no-op on home), then p disp on. Retried once. Taps work after it.
+#   pa sleep                  iOS's own sleep (power key, only when it is awake), then p disp off
+#   pa shot [NAME]            screenshot -> logs/shots/NAME-MMDD-HHMMSS.png + .thumb.jpg (360 px, cheap to look at);
+#                             finds what the display engine scans (direct slot surface or the panel buffer) first
+#   pa tap X Y | pa swipe X1 Y1 X2 Y2 [MS] | pa key N [MS]
+#                             injected touch / buttons (panel pixels 1080x2340; key 0 power, 1 vol+, 2 vol-, 3 home)
+#   pa perf on|off [--restart] | status
+#                             GPU profiling: sweetmon counters (`mon gpuperf overview`) + HM_PERF=0xf as a temp
+#                             override of /var/local/hmetal/env (--restart: restart the render server so it applies)
+#   pa trace NAME SECS [--swipe pages|cc|none] [--procs LIST] [--app NAME]
+#                             wake the display, record sweettrace (+ Core Animation and hakios-metal events) while
+#                             swiping, pull, analyse -> logs/traces/NAME-*/ report.txt, summary.json, perfetto.json
 #   pa tidy [AREA...] [--days N] [--apply]
 #                             tools-claude/pa-tidy.py: dry run (default) of what can be archived in images, builds,
 #                             logs, worktrees, scratch; --apply AREA moves (never deletes) to PF/attic/<date> or
@@ -172,6 +188,157 @@ else:
 EOF
 }
 
+# ---------------------------------------------------------------- screen, UI input, screenshots (1162)
+pk() { PA_POKE_WAIT=${PA_POKE_WAIT:-0.3} run "poke $*"; }	# UI injection / FB command: no 3 s wait for replies
+# The display power is one flag in the framebuffer (fPowerOff). Kernels with 1162 set it with `p disp on|off`
+# (same path as backboardd's power button); older kernels only have the toggling power key (`key 0`).
+
+klog_line() {	# REGEX -> the newest kernel-log line matching it (reads the ring; quiet)
+	local pa_; pa_=$(klog_pa)
+	[ -n "$pa_" ] || return 1
+	run "klog $pa_" >/dev/null 2>&1
+	grep -aE -- "$1" "$P/logs/klog.txt" 2>/dev/null | tail -1
+}
+
+disp_state() {	# -> on | off | unknown, from a fresh `p disp` line
+	pk "p disp" >/dev/null 2>&1
+	sleep 0.3
+	local l; l=$(klog_line 'SWEET FB: display (on|off)')
+	case $l in *"display on"*) echo on;; *"display off"*) echo off;; *) echo unknown;; esac
+}
+
+pa_disp() {	# [on|off]
+	case ${1:-} in
+	on|off)
+		pk "p disp $1" >/dev/null 2>&1
+		sleep 0.4
+		local l; l=$(klog_line 'SWEET FB: display (on|off)')
+		if [[ $l == *"(p disp set)"* ]]; then
+			echo "display $1 (p disp set)"
+			return 0
+		fi
+		# kernel without 1162: the power key, only when it would toggle the right way
+		local s; s=$(disp_state)
+		if [ "$s" = "$1" ]; then
+			echo "display $1 (already; kernel without 1162)"
+			return 0
+		fi
+		[ "$s" = unknown ] && { echo "display state unknown: not pressing the power key blind"; return 1; }
+		pk "key 0 100" >/dev/null 2>&1
+		sleep 1.5
+		s=$(disp_state)
+		echo "display $s (power key; kernel without 1162)"
+		[ "$s" = "$1" ];;
+	'') echo "display $(disp_state)";;
+	*) echo "pa disp [on|off]"; return 2;;
+	esac
+}
+
+ios_state() {	# -> on | off | unknown: iOS's own view, = the last display change backboardd made (RequestPowerChange)
+	local l; l=$(klog_line 'SWEET FB: display (on|off)$')
+	case $l in *"display on") echo on;; *"display off") echo off;; *) echo unknown;; esac
+}
+
+pa_wake() {	# iOS awake + display on + UI usable (not just pixels): see the pa doc, "screen"
+	local i s
+	for i in 1 2; do
+		s=$(ios_state)
+		if [ "$s" != on ]; then
+			pk "key 0 100" >/dev/null 2>&1           # iOS asleep (or unknown at boot): power key = wake
+			sleep 1
+		fi
+		pk "swipe 540 2335 540 1500 120" >/dev/null 2>&1  # an interaction, so press-to-wake doesn't re-sleep
+		sleep 1.2                                                 # (lock screen: unlock; home: no-op home gesture)
+		pk "p disp on" >/dev/null 2>&1                      # 1162: the panel shows frames whatever happens
+		sleep 0.3
+		s=$(ios_state)
+		[ "$s" = on ] && { echo "awake (iOS display on; pa disp: $(disp_state))"; return 0; }
+	done
+	echo "wake failed: iOS display $s"
+	return 1
+}
+
+pa_sleep() {
+	if [ "$(ios_state)" = on ]; then
+		pk "key 0 100" >/dev/null 2>&1    # iOS's own sleep (it turns the display off itself)
+		sleep 1.2
+	fi
+	pa_disp off >/dev/null 2>&1                # and the panel, in case p disp on forced it
+	echo "asleep (iOS display $(ios_state); pa disp: $(disp_state))"
+}
+
+pa_shot() {	# [NAME] -> logs/shots/NAME-HHMMSS.png + .thumb.jpg, prints both paths and the fb-shot CLASS
+	local name=${1:-shot} d=$P/logs/shots stamp; stamp=$(date +%m%d-%H%M%S)
+	mkdir -p "$d"
+	local base=$d/$name-$stamp regs=$d/.vig0-$stamp.bin raw=$d/.raw-$stamp.bin
+	run "files read /dev/pmem 0x0ae05000 64 $regs" >/dev/null 2>&1 || { echo "shot: register read failed"; return 1; }
+	local mk; mk=$(ls -t "$P"/logs/mon/klog-*.txt 2>/dev/null | head -1)
+	local w; w=$(python3 "$T/fb-shot.py" --where "$regs" $mk)
+	local kind pa_ len geo; read -r kind pa_ len geo _ <<<"$w"
+	case $kind in
+	direct) run "files read /dev/pmem $pa_ $len $raw" >/dev/null 2>&1 || { echo "shot: read failed"; return 1; }
+		cls=$(python3 "$T/fb-shot.py" "$raw" "$base.png" 2 "$geo");;
+	blit) run "files read /dev/pmem $pa_ $len $raw" >/dev/null 2>&1 || { echo "shot: read failed"; return 1; }
+		cls=$(python3 "$T/fb-shot.py" "$raw" "$base.png" 2);;
+	*) echo "shot: $w"; return 1;;
+	esac
+	rm -f "$raw" "$regs" 2>/dev/null
+	python3 - "$base.png" "$base.thumb.jpg" <<'EOF' 2>/dev/null
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB'); im.thumbnail((360, 780)); im.save(sys.argv[2], quality=70)
+EOF
+	echo "${base#$P/}.png ($kind $geo) class $cls; thumbnail ${base#$P/}.thumb.jpg"
+}
+
+# ---------------------------------------------------------------- profiling (1159-1161 + hakios-metal HM_PERF)
+pa_perf() {	# on [--restart] | off [--restart] | status
+	local restart=; [ "${2:-}" = --restart ] && restart=1
+	case ${1:-status} in
+	on)
+		run "mon gpuperf overview" | tail -2
+		run "state set /var/local/hmetal/env:HM_PERF 0xf --temp --by pa-perf" | tail -2
+		[ -n "$restart" ] && { ssh_to "$(pick_host)" '/var/local/bin/sweetctl render' >/dev/null 2>&1; echo "render server restarted (HM_PERF takes effect)"; } \
+			|| echo "HM_PERF takes effect when a Metal process starts (pa perf on --restart restarts the render server)";;
+	off)
+		run "mon gpuperf off" | tail -1
+		run "state revert /var/local/hmetal/env:HM_PERF" | tail -2
+		[ -n "$restart" ] && ssh_to "$(pick_host)" '/var/local/bin/sweetctl render' >/dev/null 2>&1;;
+	status)
+		ssh_to "$(pick_host)" '/var/local/bin/sctl kern.sweet_gpuperf_sel; /var/local/bin/sctl kern.sweet_gpustats; /var/local/bin/toybox-full grep -h HM_PERF /var/local/hmetal/env' 2>&1;;
+	*) echo "pa perf on|off [--restart] | status"; return 2;;
+	esac
+}
+
+pa_trace() {	# NAME SECS [--swipe pages|cc|none] [--procs LIST] [--app NAME]
+	local name=${1:-} secs=${2:-8} swipe=pages procs=backboardd,SpringBoard app=SpringBoard
+	[ -n "$name" ] || { echo "pa trace NAME SECS [--swipe pages|cc|none] [--procs LIST] [--app NAME]"; return 2; }
+	shift 2 2>/dev/null
+	while [ $# -gt 0 ]; do case $1 in --swipe) swipe=$2; shift 2;; --procs) procs=$2; shift 2;; --app) app=$2; shift 2;; *) shift;; esac; done
+	[[ $name =~ ^[A-Za-z0-9._-]+$ && $secs =~ ^[0-9]+$ && $secs -le 60 ]] || { echo "NAME: [A-Za-z0-9._-]; SECS <= 60"; return 2; }
+	[ "$(disp_state)" = on ] || pa_wake >/dev/null || echo "warning: display not confirmed on"
+	local h; h=$(pick_host)
+	local dir=$P/logs/traces/$name-$(date +%m%d-%H%M%S); mkdir -p "$dir"
+	ssh_to "$h" "/var/local/bin/sweettrace -t $secs -d 1 -n -c 0x21/0xa6,0x31 -o /var/tmp/pa-$name.swtr > /var/tmp/pa-$name.out 2>&1 &" </dev/null
+	sleep 2
+	local end=$(( $(date +%s) + secs - 1 ))
+	while [ "$(date +%s)" -lt $end ]; do
+		case $swipe in
+		pages) pk "swipe 900 1200 180 1200 250" >/dev/null 2>&1; sleep 0.9; pk "swipe 180 1200 900 1200 250" >/dev/null 2>&1; sleep 0.9;;
+		cc) pk "swipe 950 8 950 1250 250" >/dev/null 2>&1; sleep 1.2; pk "swipe 540 2335 540 1500 120" >/dev/null 2>&1; sleep 1.2;;
+		*) sleep 1;;
+		esac
+	done
+	sleep 3
+	ssh_to "$h" "tail -1 /var/tmp/pa-$name.out" | tee "$dir/sweettrace.out"
+	run "pull /var/tmp/pa-$name.swtr ${dir#$P/}/trace.swtr" | tail -1
+	[ -s "$dir/trace.swtr" ] || { echo "trace: nothing pulled"; return 1; }
+	python3 "$T/sweet-trace.py" "$dir/trace.swtr" --app "$app" --summary-json "$dir/summary.json" > "$dir/report.txt" 2>&1
+	python3 "$T/sweet-trace.py" "$dir/trace.swtr" --perfetto "$dir/perfetto.json" --procs "$procs" | tail -1
+	grep -E '^GPU time per frame|on-screen intervals|largest gap per frame' "$dir/report.txt" | cut -c1-160
+	echo "-> ${dir#$P/}/ (report.txt, summary.json, perfetto.json for ui.perfetto.dev)"
+}
+
 act=${1:-help}; shift 2>/dev/null
 case $act in
 	help|-h|--help) pa_help "${1:-}";;
@@ -184,6 +351,15 @@ case $act in
 	revert) run "state revert $*";;
 	keep) run "state promote $*";;
 	tidy) python3 "$T/pa-tidy.py" "$@";;
+	disp) pa_disp "$@";;
+	wake) pa_wake;;
+	sleep) pa_sleep;;
+	shot) pa_shot "$@";;
+	tap) [ $# -eq 2 ] || { echo "pa tap X Y   (panel pixels 1080x2340)"; exit 2; }; pk "tap $1 $2";;
+	swipe) [ $# -ge 4 ] || { echo "pa swipe X1 Y1 X2 Y2 [MS]"; exit 2; }; pk "swipe $1 $2 $3 $4 ${5:-250}";;
+	key) pk "key ${1:?pa key N (0 power, 1 vol+, 2 vol-, 3 home)} ${2:-100}";;
+	perf) pa_perf "$@";;
+	trace) pa_trace "$@";;
 	lock) if flock -n /tmp/pa-phone.lock true 2>/dev/null; then echo "phone lock free"; else echo "held: $(cat /tmp/pa-phone.owner 2>/dev/null)"; fi;;
 	*)
 		if [[ $FORWARD == *" $act "* ]]; then queue "$act" "$@"
