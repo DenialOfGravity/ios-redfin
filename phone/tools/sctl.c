@@ -1,5 +1,7 @@
 /*
  * sctl NAME [VALUE]: read or write one sysctl (toybox has no sysctl; Apple's is not on the image).
+ * sctl -a [PREFIX]: every readable sysctl whose name starts with PREFIX (default kern.sweet_), "NAME: VALUE" lines;
+ *   walks the kernel's OID tree with {0,2} next + {0,1} name (ws-tools-state).
  *   read:  "NAME: VALUE"            (int/quad in decimal; strings as-is; opaque data as hex bytes)
  *   write: "NAME: OLD -> NEW"       (VALUE decimal or 0x hex, optional leading '-'; a string for string sysctls)
  * The output is parsed by tools-claude/sweetmon/collector.py ("NAME: INT") and agent scripts; keep its shape.
@@ -135,10 +137,58 @@ static int parse(const char *s, long long *v)
 	return 0;
 }
 
+/* -a: walk the OID tree from the top node of PREFIX ("kern" -> {1}) with {0,2} next, names via {0,1} */
+static int list_all(const char *prefix)
+{
+	char top[64];
+	snprintf(top, sizeof(top), "%s", prefix);
+	char *dot = strchr(top, '.');
+	if (dot)
+		*dot = 0;
+	int cur[CTL_MAXNAME];
+	size_t cn = CTL_MAXNAME;
+	if (sysctlnametomib(top, cur, &cn) != 0)
+		return perror(top), 1;
+	int n = 0;
+	for (int guard = 0; guard < 100000; guard++) {
+		int q[2 + CTL_MAXNAME] = { 0, 2 }, next[CTL_MAXNAME];
+		memcpy(q + 2, cur, cn * sizeof(int));
+		size_t nl = sizeof(next);
+		if (sysctl(q, (u_int)(cn + 2), next, &nl, NULL, 0) != 0)
+			break;
+		cn = nl / sizeof(int);
+		memcpy(cur, next, nl);
+		int nq[2 + CTL_MAXNAME] = { 0, 1 };
+		memcpy(nq + 2, cur, cn * sizeof(int));
+		char name[512];
+		size_t sl = sizeof(name) - 1;
+		if (sysctl(nq, (u_int)(cn + 2), name, &sl, NULL, 0) != 0)
+			continue;
+		name[sl] = 0;
+		if (strncmp(name, top, strlen(top)) != 0 || name[strlen(top)] != '.')
+			break;
+		if (strncmp(name, prefix, strlen(prefix)) != 0)
+			continue;
+		size_t l = 0;
+		char *v = get(name, &l);
+		if (!v)
+			continue;
+		int uns, kind = kind_of(name, &l, &uns);
+		printf("%s: ", name);
+		show(kind, uns, v, l);
+		printf("\n");
+		free(v);
+		n++;
+	}
+	return n ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc >= 2 && !strcmp(argv[1], "-a"))
+		return list_all(argc > 2 ? argv[2] : "kern.sweet_");
 	if (argc < 2 || argc > 3) {
-		fprintf(stderr, "usage: sctl NAME [INT|0xHEX|STRING]\n");
+		fprintf(stderr, "usage: sctl NAME [INT|0xHEX|STRING] | sctl -a [PREFIX]\n");
 		return 2;
 	}
 	const char *name = argv[1];

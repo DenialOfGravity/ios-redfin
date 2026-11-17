@@ -5,7 +5,7 @@ usage: klog.py [TOTAL_PA]   (PA of _sweet_log_total; the ring pointer follows 8 
 u-prof (2026-10-27): reads the 8-byte total first, then only the bytes in use (the whole ring once it wrapped)
 in 1 MiB pieces, each tried 3 times with its own timeout, instead of one 4 MiB read."""
 import struct, subprocess, sys, time
-OUT = '/mnt/c/ClaudeProjects/iOS_Pixel5/logs/klog.txt'
+OUT = '/mnt/d/ClaudeProjects/iOS_Pixel5/logs/klog.txt'
 TOTAL_PA = int(sys.argv[1], 0) if len(sys.argv) > 1 else 0x101d02710
 SIZE = 4 << 20
 PIECE = 1 << 20

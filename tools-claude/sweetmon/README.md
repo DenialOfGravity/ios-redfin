@@ -1,7 +1,5 @@
 # sweetmon: live monitor and one-button traces for redfin
 
-Full guide: docs/redfin/sweetmon-guide.md
-
 What runs where (design and wire protocol: `docs/redfin/sweetmon.md` on branch ws-z-mon):
 
 | Piece | Where | What it does |
@@ -19,7 +17,7 @@ The phone agent starts the collector by itself, both when the agent starts and w
 Wi-Fi works too: once the collector has seen the phone over USB, it remembers the phone's Wi-Fi address.
 To start it by hand in WSL:
 
-    python3 /mnt/c/ClaudeProjects/iOS_Pixel5/tools-claude/sweetmon/collector.py
+    python3 /mnt/d/ClaudeProjects/iOS_Pixel5/tools-claude/sweetmon/collector.py
 
 Then open **http://localhost:8765/** in a Windows browser. WSL2 forwards localhost to Windows by default.
 
