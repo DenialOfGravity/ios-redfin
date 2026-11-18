@@ -33,6 +33,8 @@ Python 3 with capstone (4.x or 5.x), run isolated (`python3 -I`), e.g. from `~/f
   `__DATA_CONST,__pool_got` slots at the same addresses. DyldExtractor's `__EXTRA_OBJC` segment can't get its own page
   (it starts 0xfa0 after __DATA_DIRTY), so it becomes a section `__DATA_DIRTY,__extra_objc`. Leading
   `__decache_pad` sections cover the alignment padding (llvm-objdump takes a segment's start from its first section).
+- **Completeness.** relink stops if any `adrp` to a page outside the image has no tracked `ldr`/`add` consumer
+  (libBKDM1: 1,630 such adrp, all consumed; only `ldr` from the pool, 2,182 sites, 217 slots).
 - **Fixups.** LC_DYLD_INFO_ONLY (classic rebase/bind opcodes, non-lazy binds only), which iOS 16 dyld accepts for
   arm64 (only arm64e new-deployment binaries require chained fixups). The source is arm64 (A11 caches), so there is no
   PAC to carry; arm64e input is refused.

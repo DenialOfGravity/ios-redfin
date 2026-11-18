@@ -325,10 +325,11 @@ def scan_text(m):
     md = cs.Cs(cs.CS_ARCH_ARM64, cs.CS_MODE_ARM)
     md.detail = True
     ldr_out = collections.Counter(); other_out = []; bl_out = []; own = collections.Counter()
+    adrp_out = set(); consumed = set()
     for s in m.sects:
         if not (s['flags'] & 0x80000400):
             continue
-        regs = {}
+        regs = {}; origin = {}
         code = bytes(m.d[s['fo']:s['fo'] + s['size']])
         pc = s['addr']
         while pc < s['addr'] + s['size']:
@@ -339,6 +340,9 @@ def scan_text(m):
                 mn, ops = ins.mnemonic, ins.operands
                 if mn == 'adrp':
                     regs[ops[0].reg] = ops[1].imm
+                    origin[ops[0].reg] = ins.address
+                    if m.seg_of(ops[1].imm) is None and m.seg_of(ops[1].imm + 0xfff) is None:
+                        adrp_out.add(ins.address)
                     continue
                 if mn in ('bl', 'b'):
                     if m.seg_of(ops[0].imm) is None:
@@ -350,10 +354,12 @@ def scan_text(m):
                 if mn == 'add' and len(ops) == 3 and ops[1].type == cs.arm64.ARM64_OP_REG and ops[1].reg in regs \
                         and ops[2].type == cs.arm64.ARM64_OP_IMM:
                     base = regs[ops[1].reg] + ops[2].imm
+                    consumed.add(origin.get(ops[1].reg))
                 elif mn[:3] in ('ldr', 'str', 'ldp', 'stp'):
                     for o in ops:
                         if o.type == cs.arm64.ARM64_OP_MEM and o.mem.base in regs:
                             base = regs[o.mem.base] + o.mem.disp
+                            consumed.add(origin.get(o.mem.base))
                 try:
                     for r in ins.regs_access()[1]:
                         regs.pop(r, None)
@@ -375,7 +381,7 @@ def scan_text(m):
                         own[sg['name']] += 1
             if not got:
                 pc += 4
-    return ldr_out, other_out, bl_out, own
+    return ldr_out, other_out, bl_out, own, sorted(adrp_out - consumed)
 
 
 # ----------------------------------------------------------------------------------------------- relink
@@ -417,7 +423,9 @@ class Relink:
         self.rep['input'] = dict(file=a.dx, flags=hex(m.flags), segments={s['name']: hex(s['vm']) for s in m.segs})
 
         # 1. text: which cache-GOT-pool slots are used; nothing else may leave the image
-        ldr_out, other_out, bl_out, own = scan_text(m)
+        ldr_out, other_out, bl_out, own, lost = scan_text(m)
+        if lost:
+            self.E('%d adrp to outside pages without a tracked consumer: %s' % (len(lost), [hex(x) for x in lost[:10]]))
         if other_out:
             self.E('non-ldr text refs outside the image: %s' % [(hex(x), y, hex(z)) for x, y, z in other_out[:10]])
         if bl_out:
@@ -426,7 +434,7 @@ class Relink:
             self.E('code references __EXTRA_OBJC directly (%d sites)' % own['__EXTRA_OBJC'])
         self.slots = sorted(ldr_out)
         self.rep['text'] = dict(pool_ldr_sites=sum(ldr_out.values()), pool_slots=len(self.slots),
-                                own_refs=dict(own), branches_out=len(bl_out))
+                                own_refs=dict(own), branches_out=len(bl_out), untracked_outside_adrp=len(lost))
         stubname = {}
         for (sa, slot, nm) in m.stubs():
             stubname.setdefault(slot, set()).add(nm)
