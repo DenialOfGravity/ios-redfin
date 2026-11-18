@@ -91,7 +91,12 @@ struct fpc_hal_cb {
 	void (*wake)(void *ctx, long ms_after_arm);
 	void (*idle)(void *ctx, long ms_since_arm);
 	void (*retry)(void *ctx, int32_t st4);		/* a round ended without a good image (then re-arm) */
+	long edge_ms;					/* > 0: the arm wait sleeps on gpio112's interrupt in slices of
+							 * this length (kern.sweet_fpc_wait_edge, xnu 1235) after
+							 * FPC_EARLY_WAKE_MS instead of the 20 ms poll */
 };
+int fpc_wait_edge(int ms);	/* xnu 1235: 1 high, 2 interrupt, 3 kicked, 0 timeout, -1 not available / error */
+void fpc_wait_edge_kick(void);	/* xnu 1235: every kern.sweet_fpc_wait_edge waiter returns at once */
 int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *cb, int32_t *st4, int *rounds);
 
 /* one QSEE/SMC user at a time */

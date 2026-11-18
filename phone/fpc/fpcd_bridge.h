@@ -107,6 +107,13 @@ _Static_assert(sizeof(struct smb_event) == 16384, "smb_event");
  */
 #define FPCD_CMD_CAT_PUT	0x110
 #define FPCD_CMD_CAT_GET	0x111
+#define FPCD_CMD_WAKEDET	0x120	/* xnu 1235, posted: {u32 on} screen-off finger detect (display off = 1);
+					 * xnu 1255: {u32 on, u32 flags}, flags FPCD_WD_* */
+#define FPCD_WD_PREMATCH	1u	/* xnu 1255 (kern.sweet_mesa_wake bit 3): identify the touch while the display is
+					 * off and send FPCD_EV_PREMATCH / FPCD_EV_PREMATCH_NOMATCH (match before wake) */
+#define FPCD_MM_EXTEND		1u	/* 4 MatchMode u32 flags: extend-enrolment (xnu 1198) */
+#define FPCD_MM_PREMATCHED	2u	/* xnu 1255: the kernel delivers the stored pre-match for this op: do not
+					 * identify the touch that was pre-matched (the next touch after a lift is matched) */
 #define FPCD_CAT_LOAD_MAGIC	0x4c435753u	/* "SWCL" */
 #define FPCD_CAT_MAX		(1024 * 1024)
 
@@ -154,6 +161,12 @@ enum fpcd_ev_code {
 	FPCD_EV_ERROR = 12,		/* TZ/TA error during an operation: status */
 	FPCD_EV_TA_FRESH = 13,		/* ws-fpcd-b: the TA was loaded empty at start (not resident): the kernel's
 					 * catacomb state goes back to "not loaded" so biometrickitd reloads the file */
+	FPCD_EV_PREMATCH = 14,		/* xnu 1255: display off, FPCD_WD_PREMATCH: the touch matched (same gates as
+					 * MATCH: listed fid, allow-match / mode 2, HAT policy); fid, score, flags
+					 * FPCD_MF_*. The kernel wakes and delivers it to the next MatchMode */
+	FPCD_EV_PREMATCH_NOMATCH = 15,	/* xnu 1255: display off: a good image that is a TA no-match (a wrong finger,
+					 * coverage >= FPCD_PM_MIN_COVERAGE): a failed attempt, no wake; score,
+					 * samples = coverage */
 };
 #define FPCD_EF_END_UNAUTH	1u	/* end_enrol refused (no hw-auth chain / HAT): enrol failed, stray id deleted */
 #define FPCD_MF_HAT_VERIFIED	1u	/* the HAT verifier accepted this identify's HAT (sweetfpcd hat_verify(); with the

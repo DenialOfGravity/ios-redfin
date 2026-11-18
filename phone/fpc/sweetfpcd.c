@@ -15,6 +15,35 @@
  * resident TA a failing set_gid falls back to load_empty_db + set_gid), get_finger_ids.
  * SIGTERM/SIGINT: cancel the operation, stop the capture thread, unload the TA (FPCD_KEEP_TA=1 / --keep-ta: keep).
  * SIGUSR1: wipe all (delete every finger id, debug).  SIGUSR2: one status line.
+ * FPCD_IO_RETRY=N (default 2): re-capture after an identify FPC_ERROR_IO instead of a no-match (0: off).
+ * ws-fpcd-e: FPCD_UPDATE_TEMPLATE=1 (default): g11/4 update_template after every identify that did not fail, as the
+ *   stock HAL; without it the TA's next identify gives FPC_ERROR_IO (-6) (bio_update_template()). 0 = old behaviour.
+ *   FPCD_IO_REIDENT=1 (default): an identify -6 is retried once on the same image (no re-capture, no lift needed).
+ *   --idtest SEQ: identify / update_template steps on the image the TA holds (diagnosis, logs only).
+ * Match before wake (xnu 1255, kern.sweet_mesa_wake bit 3 -> WAKEDET {1, FPCD_WD_PREMATCH}): the screen-off detect
+ *   identifies each touch (prematch_attempt()): FPCD_EV_PREMATCH (the kernel wakes and delivers the match to the next
+ *   MatchMode, which comes with FPCD_MM_PREMATCHED) or FPCD_EV_PREMATCH_NOMATCH (failed attempt, no wake).
+ *   FPCD_PM_SLICE_MS (300): edge wait slice then; FPCD_PM_MIN_COVERAGE (50): a no-match below it is not an attempt.
+ * FPCD_NOMATCH_CONTINUE=1 (default): a TA no-match (identify status 0, result 0, fid 0) is a NOMATCH event and the
+ *   match op goes on after the finger is lifted (one attempt per touch, as the SEP: the op ends only on a match,
+ *   Cancel, the op timeout or the kernel's lockout); 0 = old behaviour (WITHHELD, the op ends after one result).
+ * FPCD_LSNR_DIAG=1|2: listeners up around the first / every identify of a match op, requests logged (debug).
+ * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
+ * ws-fpcd-d (launchd job com.redfin.sweetfpcd, touchid-integration-2026-11-18.md):
+ *   FPCD_LOG=PATH: the daemon opens PATH itself (append) for stdout + stderr and caps it at FPCD_LOG_MAX bytes
+ *     (default 2 MiB): over the cap PATH is renamed to PATH.1 (one old file kept) and a new PATH is started.
+ *   /var/local/fpc/fpcd.off: present at start = exit 0 at once (the job's off switch; KeepAlive SuccessfulExit false
+ *     does not restart a clean exit). Waits for kern.sweet_fpc (every 2 s) and for the SweetMesaBridge service (every
+ *     1 s) instead of 10 s / 5 s: with boot-arg sweettouchid (xnu 1247) both come up 2 s after the kernel starts.
+ *   The bridge STATE (published / match gate / translate / open) is re-read every 30 s while idle and at each op
+ *     start, and a change is logged; kern.sweet_mesa_match is read at each match (as before).
+ * Screen-off wake (xnu 1235, kern.sweet_mesa_wake bit 2): FPCD_CMD_WAKEDET {1} when iOS's display goes off runs the
+ *   detect op (sensor armed, the arm wait asleep on gpio112's interrupt through kern.sweet_fpc_wait_edge in
+ *   FPCD_WAKEDET_SLICE_MS slices, default 2000, no 20 ms poll); its FINGER_DOWN is the kernel's wake press. A Cancel
+ *   or SpringBoard's 38/69 off returns to it while the display is off; {0} ends it. Nothing enrolled: not armed.
+ *   FPCD_WAKEDET=0: ignored. Every op change kicks the edge wait (write 0) so 4 MatchMode starts at once.
+ *   The wake touch's good image stays in the TA (no re-arm) for FPCD_WAKE_HOLD_MS (1500): the match op the wake starts
+ *   identifies it at once (iPhone: the finger that pressed home is matched), no new capture of the resting finger.
  *
  * Operations (one at a time; a new Enroll/Match/Detect cancels the running one) run in the capture thread, driven by
  * gpio112 (kern.sweet_fpc_wait in FPCD_WAIT_SLICE_MS slices so Cancel/SIGTERM are seen): the HAL capture sequence
@@ -72,11 +101,13 @@
 #include "../qsee/qsee_lib.h"
 #include "../qsee/qsee_gk.h"
 #include "fpcd_bridge.h"
+#include "fpcd_hold.h"
 
 #ifndef FPCD_VERSION
 #define FPCD_VERSION "dev"
 #endif
 #define ALLOW_MATCH_PATH	"/var/local/fpc/allow-match"
+#define FPCD_OFF_PATH		"/var/local/fpc/fpcd.off"	/* ws-fpcd-d: the launchd job's off switch */
 #define FPCD_WAIT_SLICE_MS	250	/* gpio112 wait slice: Cancel / SIGTERM latency */
 #define FPCD_UP_MS		150	/* armed and quiet this long after a touch = finger up */
 #define FPCD_CAPTURE_WAIT_MS	0	/* max wait after g10/3; 0 = until the op deadline (as qseeprobe / the HAL) */
@@ -106,6 +137,12 @@ static pthread_cond_t st_cv = PTHREAD_COND_INITIALIZER;
 static struct {
 	int op, busy, cancel, finger_on;
 	int extend;		/* the MatchMode is an extend-enrolment (xnu 1198: request u32 flags bit 0) */
+	int wakedet, fdet;	/* xnu 1235: screen-off finger detect on; SpringBoard's 38/69 finger detect on */
+	long held_ms;		/* xnu 1235: now_ms() of the screen-off detect's good image still in the TA (0 = none) */
+	int prematch;		/* xnu 1255: WAKEDET flag FPCD_WD_PREMATCH: identify while the display is off */
+	int pm_have, pm_skip;	/* xnu 1255: a touch was pre-matched (pm_up = up_seq then); next MatchMode skips it */
+	uint32_t pm_up;
+	uint32_t prematches, pm_nomatches, pm_ignored;
 	uint32_t up_seq;	/* finger-up count: an extend match needs a lift between touches */
 	uint32_t gen;
 	long started;
@@ -124,6 +161,40 @@ static struct {
 static struct timespec t_start;
 static pthread_mutex_t log_mx = PTHREAD_MUTEX_INITIALIZER;
 static int log_con = -1;
+static const char *log_path;		/* FPCD_LOG (ws-fpcd-d) */
+static long long log_bytes, log_max = 2LL << 20;
+static int log_rot;
+
+/* ws-fpcd-d: (re)open FPCD_LOG as stdout + stderr (append). Called with log_mx held after the first time. */
+static int log_open(void)
+{
+	int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return -1;
+	struct stat sb;
+	log_bytes = fstat(fd, &sb) == 0 ? (long long)sb.st_size : 0;
+	dup2(fd, 2);
+	dup2(fd, 1);
+	if (fd > 2)
+		close(fd);
+	return 0;
+}
+
+static void log_rotate(void)
+{
+	char old[512];
+	snprintf(old, sizeof(old), "%s.1", log_path);
+	if (rename(log_path, old) == 0 && log_open() == 0) {
+		log_rot++;
+		char line[160];
+		int n = snprintf(line, sizeof(line), "sweetfpcd: log rotated (%d; previous part in %s, cap %lld bytes)\n",
+				 log_rot, old, log_max);
+		if (n > 0 && write(2, line, (size_t)n) > 0)
+			log_bytes += n;
+	} else {
+		log_bytes = 0;	/* cannot rotate: keep writing, try again after another cap's worth */
+	}
+}
 
 static long now_ms(void)
 {
@@ -150,6 +221,9 @@ static void lg(const char *fmt, ...)
 	if (write(2, line, (size_t)n) < 0 || (log_con >= 0 && write(log_con, line, (size_t)n) < 0)) {
 		/* nowhere else to report */
 	}
+	log_bytes += n;
+	if (log_path && log_max > 0 && log_bytes > log_max)
+		log_rotate();
 	pthread_mutex_unlock(&log_mx);
 }
 
@@ -189,6 +263,7 @@ static const char *fpcd_cmd_name(uint32_t c)
 
 /* ---------------------------------------------------------------- bridge */
 static io_connect_t conn;
+static uint32_t br_flags = 0xffffffffu;	/* ws-fpcd-d: last bridge STATE flags */
 static pthread_mutex_t ev_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static int bridge_open(void)
@@ -210,10 +285,30 @@ static int bridge_open(void)
 	kr = IOConnectCallStructMethod(c, SMB_SEL_STATE, NULL, 0, &st, &sz);
 	lg("bridge: %s open; STATE %s: version %u flags %#x pending %u clients %u", SMB_SERVICE,
 	   kr ? "failed" : "ok", st.version, st.flags, st.pending, st.clients);
+	br_flags = kr ? 0xffffffffu : st.flags;
 	pthread_mutex_lock(&ev_mx);
 	conn = c;
 	pthread_mutex_unlock(&ev_mx);
 	return 0;
+}
+
+/* ws-fpcd-d: re-read the bridge STATE; log when the flags (published, match gate, translate, open) change */
+static void bridge_state_poll(const char *why)
+{
+	struct smb_state st = { 0 };
+	size_t sz = sizeof(st);
+	pthread_mutex_lock(&ev_mx);
+	io_connect_t c = conn;
+	kern_return_t kr = c ? IOConnectCallStructMethod(c, SMB_SEL_STATE, NULL, 0, &st, &sz) : KERN_FAILURE;
+	pthread_mutex_unlock(&ev_mx);
+	if (kr != KERN_SUCCESS)
+		return;
+	if (st.flags != br_flags) {
+		if (br_flags != 0xffffffffu)
+			lg("bridge: STATE flags %#x -> %#x (%s; match %u)", br_flags, st.flags, why,
+			   fpc_sysctl_u32("kern.sweet_mesa_match"));
+		br_flags = st.flags;
+	}
 }
 
 static void bridge_close(void)
@@ -370,6 +465,11 @@ static void finger_set(int on)
  */
 struct capctx { uint32_t gen; };
 static long cap3_ms = FPCD_CAPTURE_WAIT_MS;	/* env FPCD_CAP3_MS */
+static int wakedet_off;				/* env FPCD_WAKEDET=0: ignore FPCD_CMD_WAKEDET (xnu 1235) */
+static long wakedet_slice_ms = 2000;		/* env FPCD_WAKEDET_SLICE_MS: edge wait slice of the screen-off detect */
+static long held_max_ms = 1500;			/* env FPCD_WAKE_HOLD_MS: keep the wake touch's image this long (0 = off) */
+static long pm_slice_ms = 300;			/* env FPCD_PM_SLICE_MS: edge wait slice in pre-match mode (finger-up) */
+static int pm_min_cov = 50;			/* env FPCD_PM_MIN_COVERAGE: a dark no-match below it is not an attempt */
 static int cap_stop(void *c) { return cancelled(((struct capctx *)c)->gen); }
 static void cap_lock(void *c) { pthread_mutex_lock(&ta_mx); }
 static void cap_unlock(void *c) { pthread_mutex_unlock(&ta_mx); }
@@ -410,6 +510,11 @@ static int capture_once(uint32_t gen, int32_t *st4, long deadline)
 		if (rel <= 0)
 			return CAP_TIMEOUT;
 	}
+	pthread_mutex_lock(&st_mx);
+	cb.edge_ms = S.wakedet && S.op == OP_DETECT && S.gen == gen ? wakedet_slice_ms : 0;	/* xnu 1235 */
+	if (cb.edge_ms && S.prematch && pm_slice_ms > 0 && pm_slice_ms < cb.edge_ms)
+		cb.edge_ms = pm_slice_ms;	/* xnu 1255: finger-up seen within ~pm_slice_ms (next touch = next attempt) */
+	pthread_mutex_unlock(&st_mx);
 	int rounds = 0;
 	*st4 = 0;
 	int r = fpc_capture_hal(appid, rel, &cb, st4, &rounds);
@@ -522,12 +627,13 @@ static int32_t fpcd_verify_hat(uint32_t fid)
 }
 
 /*
- * The ONLY place that produces FPCD_EV_MATCH. Delivered iff: the TA's identify status is 0, the finger id is one the
+ * The ONLY place that produces FPCD_EV_MATCH (and xnu 1255's FPCD_EV_PREMATCH, same gates). Delivered iff: the TA's identify status is 0, the finger id is one the
  * TA lists, /var/local/fpc/allow-match exists, the HAT hook did not refuse (and verified it, with FPCD_REQUIRE_HAT=1).
  * Anything else -> MATCH_WITHHELD (never a match). Returns 1 iff a match was sent.
  */
-static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_t attempts, int32_t hat)
+static int match_deliver_as(unsigned code, int32_t ta_status, uint32_t fid, int32_t score, uint32_t attempts, int32_t hat)
 {
+	const char *pm = code == FPCD_EV_PREMATCH ? "pre-" : "";
 	struct stat sb;
 	uint32_t why = 0;
 	if (ta_status != 0)
@@ -544,19 +650,28 @@ static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_
 		pthread_mutex_lock(&st_mx);
 		S.withheld++;
 		pthread_mutex_unlock(&st_mx);
-		lg("match: identify status 0 fid %#x score %d WITHHELD (%s)", fid, score,
+		lg("%smatch: identify status 0 fid %#x score %d WITHHELD (%s)", pm, fid, score,
 		   why == FPCD_MW_UNKNOWN_FID ? "fid not in the TA list" :
 		   why == FPCD_MW_NO_ALLOW_FILE ? ALLOW_MATCH_PATH " absent" : "HAT not verified");
-		ev_send2(FPCD_EV_MATCH_WITHHELD, ta_status, fid, score, 0, attempts, why, 0, 0, hat);
+		if (code == FPCD_EV_MATCH)	/* a withheld pre-match is only logged: no wake, no attempt counted */
+			ev_send2(FPCD_EV_MATCH_WITHHELD, ta_status, fid, score, 0, attempts, why, 0, 0, hat);
 		return 0;
 	}
 	pthread_mutex_lock(&st_mx);
-	S.matches++;
+	if (code == FPCD_EV_MATCH)
+		S.matches++;
+	else
+		S.prematches++;
 	pthread_mutex_unlock(&st_mx);
-	lg("match: fid %#x score %d attempts %u, HAT %s", fid, score, attempts,
+	lg("%smatch: fid %#x score %d attempts %u, HAT %s", pm, fid, score, attempts,
 	   hat == FPCD_HAT_VERIFIED ? "verified" : "NOT verified (the kernel will not deliver it as a match)");
-	ev_send2(FPCD_EV_MATCH, 0, fid, score, 0, attempts, hat == FPCD_HAT_VERIFIED ? FPCD_MF_HAT_VERIFIED : 0, 0, 0, hat);
+	ev_send2(code, 0, fid, score, 0, attempts, hat == FPCD_HAT_VERIFIED ? FPCD_MF_HAT_VERIFIED : 0, 0, 0, hat);
 	return 1;
+}
+
+static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_t attempts, int32_t hat)
+{
+	return match_deliver_as(FPCD_EV_MATCH, ta_status, fid, score, attempts, hat);
 }
 
 static long op_deadline(void)
@@ -666,26 +781,102 @@ static void run_enrol(uint32_t gen)
 	}
 }
 
+static int lsnr_diag;	/* FPCD_LSNR_DIAG: listeners registered around identify (diagnosis) */
+static int io_retry = 2;	/* FPCD_IO_RETRY: re-captures per match op after an identify FPC_ERROR_IO (-6) */
+static int nomatch_continue = 1;	/* FPCD_NOMATCH_CONTINUE: a TA no-match keeps the match op running (per touch) */
+static int upd_tpl = 1;		/* FPCD_UPDATE_TEMPLATE: g11/4 after every identify with status >= 0 (the HAL's way) */
+static int io_reident = 1;	/* FPCD_IO_REIDENT: after an identify -6, identify the same image again (no re-capture) */
+
+/*
+ * ws-fpcd-e: the HAL's do_authenticate (hal.dis 0xa7e8 "do_template_update") calls fpc_tee_update_template (g11/4)
+ * after EVERY identify that did not fail (match, no match, partial): set_auth_challenge, capture, identify,
+ * [get_auth_result], update_template, store_template_db if +0xc says updated. sweetfpcd skipped g11/4 outside
+ * extend-enrolment, and the TA then answers the NEXT identify with FPC_ERROR_IO (-6): fpcd-tid23/tid28 alternate
+ * strictly OK, -6, OK, -6 (one -6 per touch), while extend-enrolment (g11/4 after each touch) never saw a -6.
+ * Returns 1 when the template db changed (TEMPLATES event: the kernel marks the catacomb dirty), 0 not changed,
+ * -1 error. Caller holds no lock.
+ */
+static int bio_update_template(const char *why)
+{
+	uint8_t u[FPC_SENSOR_LEN] = { 0 };
+	int32_t ust = 0;
+	pthread_mutex_lock(&ta_mx);
+	int ur = ta_bio(4, u, &ust);
+	uint32_t upd = rd_u32(u + 0xc);
+	if (!ur && !ust && upd)
+		dbid_refresh();
+	pthread_mutex_unlock(&ta_mx);
+	lg("%s: update_template (g11/4) rc %d status %d updated %u", why, ur, ust, upd);
+	if (ur || ust)
+		return -1;
+	if (upd)
+		ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
+	return upd != 0;
+}
+
 static void run_match(uint32_t gen)
 {
 	uint32_t attempts = 0, last_up = 0;
 	int have_last = 0;
+	int io_retries = 0;
+	uint32_t io_touch = 0;
+	/*
+	 * xnu 1235: the touch that woke the screen was captured by the screen-off detect (a real finger-down edge) and its
+	 * image is still in the TA: identify it at once, as the SEP matches the finger that pressed home. Re-capturing a
+	 * finger that rests since before the arm waits ~1 s for the sensor and its first image gives FPC_ERROR_IO (-6),
+	 * so the unlock came only after a lift and a new touch (tid25). FINGER_DOWN first: rest-to-open needs FingerOn.
+	 */
+	pthread_mutex_lock(&st_mx);
+	long held = S.held_ms && !S.extend && now_ms() - S.held_ms <= held_max_ms ? now_ms() - S.held_ms : -1;
+	S.held_ms = 0;
+	int pm_skip = S.pm_skip && !S.extend;
+	if (pm_skip) {
+		/* xnu 1255: the kernel delivers the pre-match of the touch that woke the screen; this op does not identify
+		 * that touch again (a second result would be a second match or a no-match = a failed attempt) */
+		have_last = 1;
+		last_up = S.pm_up;
+		held = -1;
+	}
+	S.pm_skip = 0;
+	pthread_mutex_unlock(&st_mx);
+	if (pm_skip)
+		lg("match: the touch was pre-matched with the display off (the kernel delivers that match): next attempt is "
+		   "the next touch after a lift");
 	while (!cancelled(gen)) {
 		int32_t st4 = 0, st = 0;
-		if (!op_capture(gen, &st4))
-			return;
-		if (st4)
-			continue;
+		if (held >= 0) {
+			lg("match: identify the image of the touch that woke the screen (%ld ms old), no new capture", held);
+			held = -1;
+			finger_set(1);
+		} else {
+			if (!op_capture(gen, &st4))
+				return;
+			if (st4)
+				continue;
+		}
 		pthread_mutex_lock(&st_mx);
-		int ext = S.extend, same_touch = ext && have_last && S.up_seq == last_up;
+		int ext = S.extend, same_touch = (ext || nomatch_continue) && have_last && S.up_seq == last_up;
+		uint32_t up_now = S.up_seq;
 		pthread_mutex_unlock(&st_mx);
+		if (nomatch_continue && up_now != io_touch) {
+			/* fpcd-tid21.log: the -6 comes on the first identify of a TOUCH, not only of an op: retries per touch */
+			io_touch = up_now;
+			io_retries = 0;
+		}
 		if (same_touch)
-			continue;	/* extend-enrolment: one match per touch; lift first */
+			continue;	/* one attempt per touch (extend-enrolment, and a match op after a no-match): lift first */
+		int reident = 0;
+	again:;
 		uint8_t d[FPC_SENSOR_LEN] = { 0 };
 		int32_t hat = FPCD_HAT_NONE;
 		pthread_mutex_lock(&ta_mx);
 		auth_challenge_set();
+		int diag = lsnr_diag && (lsnr_diag == 2 || attempts == 0) && qsee_lsnr_diag(1) == 0;
+		if (diag)
+			lg("identify %u: listeners up (FPCD_LSNR_DIAG=%d)", attempts + 1, lsnr_diag);
 		int r = ta_bio(3, d, &st);
+		if (diag)
+			qsee_lsnr_diag(0);
 		if (!r && st == 0)
 			hat = fpcd_verify_hat(rd_u32(d + 0xc));
 		auth_challenge = 0;
@@ -699,10 +890,52 @@ static void run_match(uint32_t gen)
 		int32_t score = (int32_t)rd_u32(d + 0x20);
 		lg("identify %u: status %d fid %#x score %d coverage %d quality %d result %d", attempts, st, fid, score,
 		   (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14), (int)rd_u32(d + 0x1c));
+		if (st == -6 && io_reident && !reident && !cancelled(gen)) {
+			/* ws-fpcd-e: the -6 cleared the TA's pending identify state; the image is still in the TA */
+			reident = 1;
+			attempts--;
+			lg("identify: FPC_ERROR_IO: identifying the same image again (no re-capture, FPCD_IO_REIDENT)");
+			goto again;
+		}
+		if (st == -6 && io_retries < io_retry && !cancelled(gen)) {
+			/*
+			 * FPC_ERROR_IO (-6) from identify: seen only on the first capture of a match op whose finger was
+			 * already down (wake < 25 ms: the touch that woke the screen), 8 of 10 such ops in fpcd-tid19.log,
+			 * never on later captures. Not a listener request (the TA's file I/O is only in db load/store).
+			 * Re-capture instead of sending a no-match (pad shake, fail count). FPCD_IO_RETRY=0: old behaviour.
+			 */
+			io_retries++;
+			attempts--;
+			lg("identify: FPC_ERROR_IO: re-capturing in 80 ms, no result sent (retry %d of %d)", io_retries, io_retry);
+			usleep(80000);
+			continue;
+		}
+		uint32_t tres = rd_u32(d + 0x1c);
+		if (st == 0 && tres == 0 && fid == 0 && !ext && nomatch_continue && !cancelled(gen)) {
+			/*
+			 * TA no-match: identify status 0 with result 0 and no finger id (a wrong finger: fpcd-tid20.log
+			 * 119.265 / 131.024, score 6). The SEP sends a no-identity match record and keeps the op running
+			 * until a match, Cancel or a lockout; the next attempt is the next touch (iOS counts per touch).
+			 */
+			pthread_mutex_lock(&st_mx);
+			S.nomatches++;
+			last_up = S.up_seq;
+			pthread_mutex_unlock(&st_mx);
+			have_last = 1;
+			lg("identify %u: no match (TA status 0 result 0 fid 0, score %d) -> NOMATCH; op continues, next attempt "
+			   "after a lift", attempts, score);
+			ev_send(FPCD_EV_NOMATCH, 0, 0, score, 0, attempts, 0, 0);
+			if (upd_tpl)
+				bio_update_template("no match");
+			continue;
+		}
 		if (st == 0 && !cancelled(gen)) {
 			int sent = match_deliver(st, fid, score, attempts, hat);
-			if (!ext)
+			if (!ext) {
+				if (upd_tpl)	/* after the event: the match is not delayed by the template update */
+					bio_update_template(sent ? "match" : "match withheld");
 				return;	/* one result per MatchMode: delivered or withheld */
+			}
 			/* extend-enrolment (Settings phase 2): add this touch to the template (g11/4 update_template, as
 			 * the HAL does after an authenticate), then keep matching, one result per touch, until Cancel */
 			uint8_t u[FPC_SENSOR_LEN] = { 0 };
@@ -722,6 +955,8 @@ static void run_match(uint32_t gen)
 			   sent ? "sent" : "withheld", ur, ust);
 			continue;
 		}
+		if (upd_tpl && st >= 0 && (!ext || st > 0))
+			bio_update_template("identify");	/* partial / insufficient (100-102) etc., as the HAL */
 		if (ext && !cancelled(gen)) {
 			/*
 			 * extend-enrolment (Settings phase 2, owner-approved "enable matching"): an edge capture of the finger
@@ -746,17 +981,118 @@ static void run_match(uint32_t gen)
 		}
 		pthread_mutex_lock(&st_mx);
 		S.nomatches++;
+		if (nomatch_continue) {
+			last_up = S.up_seq;	/* the next attempt is the next touch */
+			have_last = 1;
+		}
 		pthread_mutex_unlock(&st_mx);
 		ev_send(FPCD_EV_NOMATCH, st, 0, score, 0, attempts, 0, 0);
 	}
+}
+
+/*
+ * xnu 1255 (kern.sweet_mesa_wake bit 3, WAKEDET flag FPCD_WD_PREMATCH): match before wake. A good image while iOS's
+ * display is off is identified at once (same steps as run_match: (3,1), g11/3, (3,4), g11/4; a -6 is retried on the
+ * same image). One attempt per touch (the next one after a finger-up).
+ *   match (status 0, a listed fid, the match_deliver gates)  -> FPCD_EV_PREMATCH: the kernel stores it, presses the
+ *       power button and hands it to biometrickitd's next MatchMode (keybag unlock, record, padlock opens)
+ *   TA no-match (status 0, fid 0) with coverage >= FPCD_PM_MIN_COVERAGE -> FPCD_EV_PREMATCH_NOMATCH: a failed attempt
+ *       (the kernel's lockout count), no wake
+ *   anything else (partial / insufficient 100-102, a -6 twice, low coverage, a withheld match): logged, nothing sent
+ * The FINGER_DOWN of the touch went out before (the kernel consumes it while the display is off).
+ */
+static void prematch_attempt(uint32_t gen)
+{
+	pthread_mutex_lock(&st_mx);
+	uint32_t up = S.up_seq;
+	int same = S.pm_have && S.pm_up == up;
+	pthread_mutex_unlock(&st_mx);
+	if (same) {
+		if (verbose)
+			lg("pre-match: same touch as the last attempt: lift first");
+		return;
+	}
+	long t0 = now_ms();
+	for (int pass = 0; pass < 2 && !cancelled(gen); pass++) {
+		uint8_t d[FPC_SENSOR_LEN] = { 0 };
+		int32_t st = 0, hat = FPCD_HAT_NONE;
+		pthread_mutex_lock(&ta_mx);
+		auth_challenge_set();
+		int r = ta_bio(3, d, &st);
+		if (!r && st == 0)
+			hat = fpcd_verify_hat(rd_u32(d + 0xc));
+		auth_challenge = 0;
+		pthread_mutex_unlock(&ta_mx);
+		if (r) {
+			lg("pre-match: identify transport rc %d: nothing sent", r);
+			break;
+		}
+		uint32_t fid = rd_u32(d + 0xc), tres = rd_u32(d + 0x1c);
+		int32_t score = (int32_t)rd_u32(d + 0x20), cov = (int32_t)rd_u32(d + 0x10);
+		lg("pre-match: identify status %d fid %#x score %d coverage %d quality %d result %u (%ld ms after the image)",
+		   st, fid, score, cov, (int)rd_u32(d + 0x14), tres, now_ms() - t0);
+		if (st == -6 && pass == 0 && io_reident) {
+			lg("pre-match: FPC_ERROR_IO: identifying the same image again");
+			continue;
+		}
+		if (st == 0 && fid != 0) {
+			match_deliver_as(FPCD_EV_PREMATCH, st, fid, score, 1, hat);
+		} else if (st == 0 && cov >= pm_min_cov) {
+			pthread_mutex_lock(&st_mx);
+			S.pm_nomatches++;
+			pthread_mutex_unlock(&st_mx);
+			lg("pre-match: NO MATCH (score %d, coverage %d): a failed attempt, no wake", score, cov);
+			ev_send(FPCD_EV_PREMATCH_NOMATCH, 0, 0, score, 0, (uint32_t)cov, 0, 0);
+		} else {
+			pthread_mutex_lock(&st_mx);
+			S.pm_ignored++;
+			pthread_mutex_unlock(&st_mx);
+			lg("pre-match: %s: nothing sent (not an attempt)", st == 0 ? "no match with low coverage" :
+			   st == -6 ? "FPC_ERROR_IO twice" : st >= 100 ? "partial / insufficient image" : "identify error");
+		}
+		if (upd_tpl && st >= 0)
+			bio_update_template("pre-match");
+		break;
+	}
+	pthread_mutex_lock(&st_mx);
+	S.pm_have = 1;
+	S.pm_up = up;
+	pthread_mutex_unlock(&st_mx);
 }
 
 static void run_detect(uint32_t gen)
 {
 	while (!cancelled(gen)) {
 		int32_t st4 = 0;
+		pthread_mutex_lock(&st_mx);
+		int wd0 = S.wakedet;	/* the display-on WAKEDET {0} often lands right after the wake touch's image */
+		pthread_mutex_unlock(&st_mx);
 		if (!op_capture(gen, &st4))
 			return;
+		pthread_mutex_lock(&st_mx);
+		int pmode = wd0 && st4 == 0 && S.prematch;
+		int wd = !pmode && wd0 && st4 == 0 && held_max_ms > 0;
+		if (wd)
+			S.held_ms = now_ms();
+		pthread_mutex_unlock(&st_mx);
+		if (pmode) {
+			prematch_attempt(gen);	/* xnu 1255: match before wake */
+			continue;
+		}
+		if (!wd)
+			continue;
+		/*
+		 * xnu 1235: a good image while the display is off is the wake touch: keep it in the TA (no re-arm, no SMC)
+		 * for the match op that the wake starts (run_match identifies it). Not claimed within held_max_ms (no wake:
+		 * kern.sweet_mesa_wake_ms, the press refused, display stayed off): drop it and detect again.
+		 */
+		lg("screen-off detect: wake touch image kept for the match op (max %ld ms)", held_max_ms);
+		long t0 = now_ms();
+		/* fpcd_hold.c: tid26 hung here (cancelled() re-locked st_mx while it was held; the bridge's Cancel waited) */
+		const struct fpcd_hold_st h = { &st_mx, &g_stop, &S.cancel, &S.gen, &S.held_ms };
+		int hr = fpcd_hold_wait(&h, gen, held_max_ms);
+		lg("screen-off detect: wake touch image %s after %ld ms", hr == 1 ? "left for the next op" : hr == 2 ? "taken" :
+		   "not claimed, dropped; detecting again", now_ms() - t0);
 	}
 }
 
@@ -790,6 +1126,11 @@ static void *capture_thread(void *arg)
 		pthread_mutex_lock(&st_mx);
 		if (S.gen == gen)
 			S.op = OP_NONE;
+		if (S.op == OP_NONE && S.wakedet && !g_stop && now_ms() - t0 >= 1000) {
+			S.op = OP_DETECT;	/* xnu 1235: an op ended by itself while the display is off: detect again */
+			S.gen++;
+			S.started = now_ms();
+		}
 		S.busy = 0;
 		int c = S.cancel;
 		pthread_cond_broadcast(&st_cv);
@@ -833,6 +1174,7 @@ static void op_set_nowait(int op)	/* op NONE = cancel; the capture thread notice
 	S.started = now_ms();
 	pthread_cond_broadcast(&st_cv);
 	pthread_mutex_unlock(&st_mx);
+	fpc_wait_edge_kick();	/* xnu 1235: a capture thread asleep in kern.sweet_fpc_wait_edge sees the new gen now */
 }
 
 enum { JOB_RESET = 1, JOB_ENROL, JOB_DELETE, JOB_WIPE, JOB_NOCATACOMB };
@@ -1161,11 +1503,16 @@ static int h_enrol_continue(const struct smb_req *q, struct smb_reply *p)
 
 static int h_match(const struct smb_req *q, struct smb_reply *p)
 {
-	uint32_t fl = arg_u32(q, 0);	/* xnu 1198: bit 0 = extend-enrolment */
+	uint32_t fl = arg_u32(q, 0);	/* xnu 1198: bit 0 = extend-enrolment; xnu 1255: bit 1 = pre-matched */
 	pthread_mutex_lock(&st_mx);
-	S.extend = fl & 1;
+	S.extend = fl & FPCD_MM_EXTEND;
+	int pmk = (fl & FPCD_MM_PREMATCHED) && S.pm_have;
+	S.pm_skip = pmk;
+	S.pm_have = 0;
 	pthread_mutex_unlock(&st_mx);
-	lg("MatchMode: %s", fl & 1 ? "extend-enrolment (one match per touch until Cancel)" : "normal");
+	lg("MatchMode: %s%s", fl & 1 ? "extend-enrolment (one match per touch until Cancel)" : "normal",
+	   pmk ? ", pre-matched (xnu 1255: the kernel delivers the stored match)" :
+	   (fl & FPCD_MM_PREMATCHED) ? ", pre-matched flag but no pre-match here: matching as usual" : "");
 	pthread_mutex_lock(&st_mx);
 	uint32_t n = S.nids;
 	pthread_mutex_unlock(&st_mx);
@@ -1176,7 +1523,10 @@ static int h_match(const struct smb_req *q, struct smb_reply *p)
 
 static int h_cancel(const struct smb_req *q, struct smb_reply *p)
 {
-	op_set_nowait(OP_NONE);
+	pthread_mutex_lock(&st_mx);
+	int wd = S.wakedet;
+	pthread_mutex_unlock(&st_mx);
+	op_set_nowait(wd ? OP_DETECT : OP_NONE);	/* xnu 1235: display off: back to the screen-off detect */
 	return FPCD_OK;
 }
 
@@ -1186,16 +1536,46 @@ static int h_fdet(const struct smb_req *q, struct smb_reply *p)
 	 * thread and reports by EVENT */
 	uint32_t en = arg_u32(q, 1);
 	pthread_mutex_lock(&st_mx);
-	int op = S.op;
+	int op = S.op, wd = S.wakedet;
+	S.fdet = en != 0;
 	pthread_mutex_unlock(&st_mx);
 	lg("finger detect %s (op %s)", en ? "on" : "off", op_name[op]);
 	if (!en) {
-		if (op == OP_DETECT)
+		if (op == OP_DETECT && !wd)	/* xnu 1235: the screen-off detect keeps running */
 			op_set_nowait(OP_NONE);
 	} else if (op == OP_NONE) {
 		op_set_nowait(OP_DETECT);
 	}
 	return FPCD_OK;	/* enrol / match running: they report finger down/up already */
+}
+
+/*
+ * xnu 1235 FPCD_CMD_WAKEDET {u32 on} (posted by the persona, kern.sweet_mesa_wake bit 2): on = iOS's display went off:
+ * run the detect op (the sensor armed, the arm wait asleep on gpio112's interrupt); a touch's FINGER_DOWN is turned
+ * into a power button press by the kernel. off = the display came on: end it unless SpringBoard's 38/69 wants detect.
+ */
+static int h_wakedet(const struct smb_req *q, struct smb_reply *p)
+{
+	uint32_t on = arg_u32(q, 0);
+	uint32_t wfl = q->len >= 8 ? rd_u32(q->data + 4) : 0;	/* xnu 1255: flags FPCD_WD_* */
+	pthread_mutex_lock(&st_mx);
+	int op = S.op, fdet = S.fdet;
+	uint32_t n = S.nids;
+	S.wakedet = on && n > 0 && !wakedet_off;
+	int wd = S.wakedet;
+	if (on) {
+		S.prematch = wd && (wfl & FPCD_WD_PREMATCH);
+		S.pm_have = 0;	/* a new dark period: the first touch is an attempt */
+	}
+	int pmo = S.prematch;
+	pthread_mutex_unlock(&st_mx);
+	lg("screen-off finger detect %s (display %s, op %s, %u finger(s) enrolled%s%s)", wd ? "on" : "off", on ? "off" : "on",
+	   op_name[op], n, wakedet_off ? ", FPCD_WAKEDET=0" : "", on && pmo ? ", MATCH BEFORE WAKE (xnu 1255)" : "");
+	if (wd && op == OP_NONE)
+		op_set_nowait(OP_DETECT);
+	else if (!wd && op == OP_DETECT && !fdet)
+		op_set_nowait(OP_NONE);
+	return FPCD_OK;
 }
 
 static int h_remove(const struct smb_req *q, struct smb_reply *p)
@@ -1573,6 +1953,7 @@ static const struct {
 	{ FPCD_CMD_STATUS, h_status },
 	{ FPCD_CMD_WIPE_ALL, h_wipe },
 	{ FPCD_CMD_PING, h_ping },
+	{ FPCD_CMD_WAKEDET, h_wakedet },	/* xnu 1235: screen-off finger detect on / off */
 };
 
 static struct smb_req rq;
@@ -1617,6 +1998,8 @@ static void dispatch(void)
 	rp.seq = rq.seq;
 	if (rq.len > SMB_DATA_MAX)
 		rq.len = SMB_DATA_MAX;
+	if (rq.cmd == 3 || rq.cmd == 4 || rq.cmd == 38)
+		bridge_state_poll("op start");	/* ws-fpcd-d */
 	int mapped = 0;
 	for (unsigned i = 0; i < sizeof(cmd_map) / sizeof(cmd_map[0]); i++)
 		if (cmd_map[i].cmd == rq.cmd) {
@@ -1664,7 +2047,7 @@ static void dump_status(void)
 	pthread_mutex_unlock(&st_mx);
 }
 
-/* kern.sweet_fpc needs value 3 (bit 0 reset, bit 1 irq; xnu 1190). wait: poll every 10 s until it is. */
+/* kern.sweet_fpc needs value 3 (bit 0 reset, bit 1 irq; xnu 1190). wait: poll every 2 s until it is (ws-fpcd-d). */
 static int fpc_kernel_ready(int wait)
 {
 	int said = 0;
@@ -1677,7 +2060,9 @@ static int fpc_kernel_ready(int wait)
 			   v == 0xffffffffu ? "missing" : v ? "partial" : "0", wait ? "; waiting" : "");
 		if (!wait || g_stop)
 			return -1;
-		sleep(10);
+		sleep(2);
+		if (said == 1 && (v = fpc_sysctl_u32("kern.sweet_fpc")) != 0xffffffffu && (v & 3) == 3)
+			lg("kern.sweet_fpc = 3 now: going on");
 	}
 }
 
@@ -1812,8 +2197,43 @@ static int selftest(int touch_s)
 	return rc;
 }
 
+/*
+ * --idtest SEQ (ws-fpcd-e, diagnosis, no bridge, no capture): run SEQ against the image the TA holds now, one letter
+ * per step: i = (3,1) set_auth_challenge + g11/3 identify (+ (3,4) on status 0, as run_match), u = g11/4
+ * update_template. Logs only: never an event, never a match. Shows whether an identify without g11/4 after the
+ * previous one gives -6, and whether a second identify of the same image (no capture) works.
+ */
+static int idtest(const char *seq)
+{
+	int n = 0;
+	for (const char *c = seq; *c; c++) {
+		uint8_t d[FPC_SENSOR_LEN] = { 0 };
+		int32_t st = 0;
+		if (*c == 'u') {
+			pthread_mutex_lock(&ta_mx);
+			int r = ta_bio(4, d, &st);
+			pthread_mutex_unlock(&ta_mx);
+			lg("idtest step %d: update_template rc %d status %d updated %u", ++n, r, st, rd_u32(d + 0xc));
+			continue;
+		}
+		if (*c != 'i')
+			continue;
+		pthread_mutex_lock(&ta_mx);
+		auth_challenge_set();
+		int r = ta_bio(3, d, &st);
+		int32_t hat = !r && st == 0 ? fpcd_verify_hat(rd_u32(d + 0xc)) : FPCD_HAT_NONE;
+		auth_challenge = 0;
+		pthread_mutex_unlock(&ta_mx);
+		lg("idtest step %d: identify rc %d status %d fid %#x score %d coverage %d quality %d result %d hat %d", ++n, r,
+		   st, rd_u32(d + 0xc), (int)rd_u32(d + 0x20), (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14),
+		   (int)rd_u32(d + 0x1c), hat);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	const char *idseq = NULL;
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 	int self = 0, fresh = 0, touch_s = 15;
 	for (int i = 1; i < argc; i++) {
@@ -1821,12 +2241,15 @@ int main(int argc, char **argv)
 			self = 1;
 			if (i + 1 < argc && argv[i + 1][0] != '-')
 				touch_s = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--idtest") && i + 1 < argc) {
+			self = 1;
+			idseq = argv[++i];
 		} else if (!strcmp(argv[i], "--fresh")) {
 			fresh = 1;
 		} else if (!strcmp(argv[i], "--keep-ta")) {
 			keep_ta = 1;
 		} else {
-			fprintf(stderr, "usage: sweetfpcd [--selftest [SECONDS]] [--fresh] [--keep-ta]\n");
+			fprintf(stderr, "usage: sweetfpcd [--selftest [SECONDS] | --idtest SEQ] [--fresh] [--keep-ta]\n");
 			return 1;
 		}
 	}
@@ -1862,12 +2285,38 @@ int main(int argc, char **argv)
 		}
 	}
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
+	lsnr_diag = (e = getenv("FPCD_LSNR_DIAG")) ? atoi(e) : 0;
+	if ((e = getenv("FPCD_IO_RETRY")) && *e)
+		io_retry = atoi(e);	/* 1: first identify of a match op, 2: every one */
+	if ((e = getenv("FPCD_NOMATCH_CONTINUE")) && *e)
+		nomatch_continue = atoi(e) != 0;
+	if ((e = getenv("FPCD_UPDATE_TEMPLATE")) && *e)
+		upd_tpl = atoi(e) != 0;	/* ws-fpcd-e */
+	if ((e = getenv("FPCD_IO_REIDENT")) && *e)
+		io_reident = atoi(e) != 0;
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
 		cap3_ms = atol(e);
+	if ((e = getenv("FPCD_WAKEDET")) && *e)
+		wakedet_off = atoi(e) == 0;	/* xnu 1235 */
+	if ((e = getenv("FPCD_WAKEDET_SLICE_MS")) && atol(e) > 0)
+		wakedet_slice_ms = atol(e);
+	if ((e = getenv("FPCD_WAKE_HOLD_MS")) && *e)
+		held_max_ms = atol(e);
+	if ((e = getenv("FPCD_PM_SLICE_MS")) && *e)
+		pm_slice_ms = atol(e);	/* xnu 1255 */
+	if ((e = getenv("FPCD_PM_MIN_COVERAGE")) && *e)
+		pm_min_cov = atoi(e);
 	if ((e = getenv("FPCD_CONSOLE")) && atoi(e))
 		log_con = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if ((e = getenv("FPCD_LOG_MAX")) && *e)
+		log_max = atoll(e);
+	if ((e = getenv("FPCD_LOG")) && *e) {
+		log_path = e;
+		if (log_open())
+			log_path = NULL;	/* stay on launchd's stdout / stderr */
+	}
 	/* qsee_lib: its say() lines go to stdout -> our log; quiet unless FPCD_VERBOSE (fd_cmd/fpc_bio are quiet anyway) */
 	dup2(2, 1);
 	say_tag = "sweetfpcd(qsee): ";
@@ -1886,6 +2335,13 @@ int main(int argc, char **argv)
 	lg("start %s: %s, TA %s/%s (name %s), op timeout %ld ms, allow-match file %s, bridge structs %s", FPCD_VERSION,
 	   self ? "selftest" : "daemon", ta_dir, ta_file, ta_name, op_timeout_ms, ALLOW_MATCH_PATH,
 	   bridge_small ? "small (inline, FPCD_BRIDGE_SMALL=1)" : "full 16388/16384 (FPCD_BRIDGE_SMALL=0)");
+	struct stat offsb;
+	if (!self && stat(FPCD_OFF_PATH, &offsb) == 0) {
+		lg("%s exists: not starting (exit 0; the launchd job does not restart a clean exit)", FPCD_OFF_PATH);
+		return 0;
+	}
+	if (log_path)
+		lg("log: %s, cap %lld bytes (FPCD_LOG_MAX), previous part %s.1", log_path, log_max, log_path);
 	pm_init();
 	if (qsee_lib_lock("sweetfpcd"))
 		return 9;
@@ -1901,7 +2357,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (self) {
-		int rc = selftest(touch_s);
+		int rc = idseq ? idtest(idseq) : selftest(touch_s);
 		if (ta_resident)
 			keep_ta = 1;	/* a selftest leaves a TA it found loaded */
 		ta_down();
@@ -1911,6 +2367,17 @@ int main(int argc, char **argv)
 	pthread_mutex_lock(&ta_mx);
 	dbid_refresh();
 	pthread_mutex_unlock(&ta_mx);
+	if ((e = getenv("FPCD_STORE_TEST")) && atoi(e)) {
+		/* debug: one catacomb store (61's path: TA store_template_db into the in-memory VFS, SWCT blob staged) at
+		 * start, before the bridge. Reads the TA db only; nothing is written to a file or loaded back. */
+		static struct smb_req tq;
+		static struct smb_reply tp;
+		memset(&tq, 0, sizeof(tq)), memset(&tp, 0, sizeof(tp));
+		put_u32(tq.data, 501), tq.len = 4;
+		int tr = h_cat_prepare(&tq, &tp);
+		lg("store test: h_cat_prepare -> %d, reply %u bytes, value %#x, staged blob %u bytes", tr, tp.len,
+		   tp.len >= 4 ? rd_u32(tp.data) : 0, cat_out_len);
+	}
 	pthread_t th, thw, thd;
 	if (pthread_create(&thw, NULL, ta_worker, NULL) || pthread_create(&thd, NULL, watchdog_thread, NULL) ||
 	    pthread_create(&th, NULL, capture_thread, NULL)) {
@@ -1932,9 +2399,9 @@ int main(int argc, char **argv)
 			int r = bridge_open();
 			if (r) {
 				if (!said++)
-					lg("bridge: %s not available (%s); retrying every 5 s", SMB_SERVICE,
+					lg("bridge: %s not available (%s); retrying every 1 s", SMB_SERVICE,
 					   r == -1 ? "no such service: SweetMesa not booted / kern.sweet_mesa off" : "open failed");
-				for (int i = 0; i < 10 && !g_stop && !g_wipe && !g_dump; i++)
+				for (int i = 0; i < 2 && !g_stop && !g_wipe && !g_dump; i++)
 					usleep(500000);
 				continue;
 			}
@@ -1948,8 +2415,14 @@ int main(int argc, char **argv)
 		uint64_t in = FPCD_WAIT_REQ_MS;
 		size_t osz = bridge_small ? SMB_SMALL_MAX : sizeof(rq);
 		kern_return_t kr = IOConnectCallMethod(conn, SMB_SEL_WAIT, &in, 1, NULL, 0, NULL, NULL, &rq, &osz);
-		if (kr == kIOReturnTimeout)
+		if (kr == kIOReturnTimeout) {
+			static long last_poll;
+			if (now_ms() - last_poll >= 30000) {	/* ws-fpcd-d: flags may change at runtime */
+				last_poll = now_ms();
+				bridge_state_poll("idle check");
+			}
 			continue;
+		}
 		if (kr == kIOReturnNoSpace && bridge_small) {
 			/* the request needs more than 4084 data bytes (1192 keeps it queued): fetch it once at full size */
 			lg("bridge: WAIT: request larger than %d bytes: fetching it with the full-size buffer", SMB_SMALL_MAX);

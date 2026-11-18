@@ -1,15 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  sweetfpcd, the FPC fingerprint TrustZone app daemon behind SweetMesa (phone/fpc, ws-fpcd-a). NOT installed by default.
-  Install pattern as our other daemons: merged into /System/Library/xpc/launchd.plist as
-  /System/Library/LaunchDaemons/com.redfin.sweetfpcd.plist. Binary /var/local/bin/sweetfpcd, root.
-  KeepAlive while /var/local/fpc/fpcd.on exists (no RunAtLoad), so it can be switched off with one file; a crash is
-  restarted after ThrottleInterval. SIGTERM: cancels the operation; FPCD_KEEP_TA=1 keeps the TA and its templates
-  loaded (ws-fpcd-b; the next start reuses the resident TA). ExitTimeOut 15.
-  Needs kern.sweet_fpc = 3 (xnu 1190) and the TA files in /var/local/fpc/ta; it waits for the sysctl and retries the
-  SweetMesaBridge service every 5 s. Matches are reported only while /var/local/fpc/allow-match exists.
-  By hand without launchd: /var/local/bin/sweetfpcd --selftest 15 (no bridge), or /var/local/bin/sweetfpcd & .
+  sweetfpcd, the FPC fingerprint TrustZone app daemon behind SweetMesa (phone/fpc). ws-fpcd-d: the boot job
+  (logs/research/touchid-integration-2026-11-18.md). Install: merged into /System/Library/xpc/launchd.plist with
+  tools/launchd-add-job.py (key /System/Library/LaunchDaemons/com.redfin.sweetfpcd.plist), like the
+  org.iosonpixel jobs; never pa put into LaunchDaemons alone. Binary /var/local/bin/sweetfpcd, root.
+  RunAtLoad + KeepAlive {SuccessfulExit false}: starts at boot on its own, independent of biometrickitd (kernel 1245
+  makes biometrickitd's catacomb load wait for it, 1246 restarts biometrickitd if a load was lost anyway); a crash or
+  a failed start (exit 2) is restarted after ThrottleInterval. Off switch: /var/local/fpc/fpcd.off -> exit 0, not
+  restarted. It waits for kern.sweet_fpc = 3 and the SweetMesaBridge service (boot-arg sweettouchid, xnu 1247).
+  FPCD_KEEP_TA=1: a stop never unloads the TA (templates may be memory-only). SIGTERM within ExitTimeOut 15.
+  Log: FPCD_LOG, the daemon's own file, capped at FPCD_LOG_MAX bytes (old part in .1). launchd's
+  StandardErrorPath only catches what comes before main() (dyld errors).
 -->
 <plist version="1.0">
 <dict>
@@ -20,31 +22,34 @@
 		<string>/var/local/bin/sweetfpcd</string>
 	</array>
 	<key>RunAtLoad</key>
-	<false/>
+	<true/>
 	<key>KeepAlive</key>
 	<dict>
-		<key>PathState</key>
-		<dict>
-			<key>/var/local/fpc/fpcd.on</key>
-			<true/>
-		</dict>
+		<key>SuccessfulExit</key>
+		<false/>
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>ExitTimeOut</key>
 	<integer>15</integer>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
 	<key>UserName</key>
 	<string>root</string>
 	<key>StandardErrorPath</key>
-	<string>/var/local/fpc/sweetfpcd.log</string>
+	<string>/var/local/tmp/sweetfpcd.launchd.log</string>
 	<key>StandardOutPath</key>
-	<string>/var/local/fpc/sweetfpcd.log</string>
+	<string>/var/local/tmp/sweetfpcd.launchd.log</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
 		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>FPCD_KEEP_TA</key>
 		<string>1</string>
+		<key>FPCD_LOG</key>
+		<string>/var/local/tmp/sweetfpcd.log</string>
+		<key>FPCD_LOG_MAX</key>
+		<string>2097152</string>
 	</dict>
 </dict>
 </plist>
