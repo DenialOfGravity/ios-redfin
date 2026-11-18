@@ -2139,8 +2139,18 @@ attach(CVPixelBufferRef pb, CFDictionaryRef metadata)
 static void
 give(struct output *out, CVPixelBufferRef pb, const struct redwood_camera_frame *f, bool still)
 {
-	CMTime pts = CMClockMakeHostTimeFromSystemUnits(frame_time(f));
+	CMTime pts;
 
+	/* (redfin, after HakiOS 002b6d9: a NULL picture never reaches the graph -- dropped and said, not handed on) */
+	if (pb == NULL || out->handler == NULL) {
+		static unsigned dropped;
+
+		if (dropped++ % 100 == 0) {
+			say("give: a %s with no %s dropped (%u)", still ? "photograph" : "moving picture", pb == NULL ? "buffer" : "handler", dropped);
+		}
+		return;
+	}
+	pts = CMClockMakeHostTimeFromSystemUnits(frame_time(f));
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	/*
 	 * The moving picture's buffers are kept for HELD frames after they are given. The preview's pool
