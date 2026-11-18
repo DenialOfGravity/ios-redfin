@@ -1,0 +1,28 @@
+redfin 1199: SweetMesa 40 GetBiometrickitdInfo answers max identities 5 / catacomb users 1 (66 GetIdentitiesList had capacity 0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+index a4a73ad..bacbc10 100644
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -863,7 +863,17 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 	}
+ 	case 39:        /* GetSKSLockState: unlocked (SweetKeyStore) */
+ 		ANSWER(4); return kIOReturnSuccess;
+-	case 40: ANSWER(23); return kIOReturnSuccess;          /* GetBiometrickitdInfo */
++	case 40:        /* GetBiometrickitdInfo (23 bytes) */
++		/*
++		 * 1199: BiometricSupport cacheCatacombInfo keeps the first 8 bytes: +0 u32 max identities (syncTemplateList
++		 * sizes the 66 GetIdentitiesList buffer as this x 20) and +4 u32 catacomb user slots (60 GetCatacombState
++		 * buffer = this x 8). All zeros made every 66 arrive with capacity 0 ("out too small"), so biometrickitd
++		 * never re-synced its identities after an enrolment and phase 2 found none.
++		 */
++		ANSWER(23);
++		put32(out, 5);
++		put32(out + 4, 1);
++		return kIOReturnSuccess;
+ 	case 8:         /* AlignmentData (3060) */
+ 	case 17:        /* RequestTopologyOfTemplate (3060): 1198 zeros instead of unsupported (assert noise) */
+ 		if (cap == 0 || cap > 3060) {
