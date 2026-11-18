@@ -139,6 +139,8 @@ struct isp {
 	 * period or more to whole periods (the rest in gain), and below a period takes one period at less gain where it can.
 	 */
 	uint32_t        antiband_hz;
+	uint32_t        ae_settle;              /* (ws-cam-smooth) frames AE waits after a change at least, even when the
+	                                         * frames already say it (the sensor's digital gain is not in them) */
 };
 
 #define ISP_AE_TARGET   0.15f

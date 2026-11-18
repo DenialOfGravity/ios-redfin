@@ -220,6 +220,7 @@ static volatile bool camera_ae_unshaded;
 static volatile uint32_t camera_antiband;       /* redfin: /private/var/local/camera-antiband (isp.antiband_hz) */
 static volatile bool camera_awb2;       /* redfin: /private/var/local/camera-awb2 (camera_isp.c's isp.awb2) */
 static volatile double camera_min_fps;  /* redfin (ws-cam-smooth): /private/var/local/camera-minfps, AE's frame rate floor */
+static volatile uint32_t camera_ae_settle;      /* redfin (ws-cam-smooth): /private/var/local/camera-aesettle */
 
 static void
 camera_settings_check(void)
@@ -293,6 +294,29 @@ camera_settings_check(void)
 			say("AE: frame rate floor %.0f a second%s", fps, fps > 0 ? " (camera-minfps)" : " (the graph's)");
 		}
 		camera_min_fps = fps;
+	}
+	{
+		/*
+		 * redfin (ws-cam-smooth): /private/var/local/camera-aesettle, 1-8: frames AE waits after each change it asks for
+		 * before it meters again, even when the frames' header already has the new exposure and analog gain -- the
+		 * sensor's digital gain, which the header does not carry, comes a frame or two later, and AE metered frames
+		 * without it and hunted (the brightness pumping 3x and more at a frame rate floor). No file: 0 (as before).
+		 */
+		uint32_t settle = 0;
+
+		fd = open("/private/var/local/camera-aesettle", O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, text, sizeof(text) - 1);
+
+			close(fd);
+			text[n > 0 ? n : 0] = 0;
+			settle = (uint32_t)strtoul(text, NULL, 10);
+			settle = settle <= 8 ? settle : 0;
+		}
+		if (settle != camera_ae_settle) {
+			say("AE: %u frames waited after each change (camera-aesettle)", settle);
+		}
+		camera_ae_settle = settle;
 	}
 }
 
@@ -3435,6 +3459,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		isp.ae_unshaded = camera_ae_unshaded;
 		isp.awb2 = camera_awb2;
 		isp.antiband_hz = camera_antiband;
+		isp.ae_settle = camera_ae_settle;
 		isp.ae_bias = s->ae_bias;
 		memcpy(isp.ae_roi, s->ae_roi, sizeof(isp.ae_roi));
 		isp.ae_max_gain = s->ae_max_gain;

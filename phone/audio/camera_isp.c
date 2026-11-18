@@ -349,7 +349,9 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 	double knee, analog, sensor_digital = 1, digital = 1;
 
 	if (isp->asked) {
-		if (!ae_got(isp, f) && ++isp->asked_frames < AE_PATIENCE) {
+		bool waited = ++isp->asked_frames > isp->ae_settle;       /* (ws-cam-smooth: camera-aesettle) */
+
+		if ((!ae_got(isp, f) || !waited) && isp->asked_frames < AE_PATIENCE) {
 			isp->ae_stable = false;
 			return false;           /* (the last change not in the frames yet) */
 		}
