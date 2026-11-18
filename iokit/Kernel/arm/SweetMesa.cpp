@@ -214,6 +214,8 @@ static uint32_t nOpEnd;
  */
 #define MESA_FIX_IMPLICIT_END   0x1u
 #define MESA_FIX_STALE_DROP     0x2u
+#define MESA_FIX_ALIGNMENT      0x4u
+static volatile uint32_t gAlignN;       /* 1212: accepted enrol touches since the last 3 EnrollMode (AlignmentData nodes) */
 static int gFix = 0x7;                  /* kern.sweet_mesa_fix */
 static uint32_t nImplicitEnd, nStaleDropped, nAlignAnswered;    /* kern.sweet_mesa_fix_stats */
 /* 1210: op-ending statuses waiting for delivery, in order (1203 had one bit per kind, so two ends of one kind gave one) */
@@ -358,6 +360,48 @@ mesa_fill_topology(uint8_t *t)
 	pl[4] = 1;                              /* one node */
 	pl[0x2e] = 500 & 0xff; pl[0x2f] = 500 >> 8;     /* scale (divisor of the node coordinates) */
 	/* node 0 at pl + 0x30: angle 0, x 0, y 0, parent 0 (itself = root), flags 0 */
+}
+
+/*
+ * 1212: 8 AlignmentData (3060 bytes) = the node placement of the enrolment so far. Settings' BiometricKit client
+ * (-[BiometricKit enrollProgressMessage:]) pulls it after every 0x64+pct status; _ComponentSetUpdate rejected the
+ * 1198 zeros (resampleScale100 == 0 -> EINVAL, "AssertMacros: err == 0 ... BiometricKit.m, line: 1684"), so no
+ * BiometricKitEnrollProgressInfo reached BKUI and the phase-1 haptic never ran. Layout (___TranslateNodePlacement,
+ * _ComponentSetUpdate): +0 u16 size 0xbf4, +2 u16 version 3, +4 s16 count, +6 s16 insNode (new node, -1 none),
+ * +8 s16 delNode (-1), +0x2e u16 scale (!= 0), nodes at +0x30, 10 bytes each {s16 angle, x, y, parent, u8 flags, pad}.
+ * Node 0 is the root at (0,0) and its own parent; node i > 0 sits at a small distinct offset, child of node 0.
+ */
+#define PL_NODES                0x30
+#define PL_NODE_SIZE            10
+#define PL_MAX_NODES            ((TOPO_PLACEMENT_SIZE - 8 - PL_NODES) / PL_NODE_SIZE)  /* 300 */
+
+static inline void
+put16(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+
+static uint32_t
+mesa_fill_alignment(uint8_t *pl, uint32_t n)
+{
+	if (n > PL_MAX_NODES) {
+		n = PL_MAX_NODES;
+	}
+	bzero(pl, TOPO_PLACEMENT_SIZE);
+	put16(pl, TOPO_PLACEMENT_SIZE);
+	put16(pl + 2, 3);                               /* version */
+	put16(pl + 4, (uint16_t)n);                     /* count */
+	put16(pl + 6, n ? (uint16_t)(n - 1) : 0xffff);  /* insNode: the node of the touch just accepted */
+	put16(pl + 8, 0xffff);                          /* delNode: none */
+	put16(pl + 0x2e, 500);                          /* resampleScale100 */
+	for (uint32_t i = 1; i < n; i++) {
+		uint8_t *nd = pl + PL_NODES + PL_NODE_SIZE * i;
+		put16(nd + 2, (uint16_t)(int16_t)(40 * (int)(i % 4) - 60));    /* x */
+		put16(nd + 4, (uint16_t)(int16_t)(40 * (int)(i / 4) - 60));    /* y */
+		/* angle 0, parent 0 (the root), flags 0 */
+	}
+	/* node 0: angle 0, x 0, y 0, parent 0 = itself (root) */
+	return n;
 }
 
 /*
@@ -997,6 +1041,9 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 			pct = gLastPct;
 		}
 		gLastPct = pct;
+		if (gAlignN < PL_MAX_NODES) {
+			gAlignN++;              /* 1212: before the status, so the AlignmentData it triggers has the node */
+		}
 		b = mesa_zalloc(ENROLL_INFO_V2_SIZE);
 		if (b == NULL) {
 			return kIOReturnNoMemory;
@@ -1600,6 +1647,13 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 			return kIOReturnUnsupported;
 		}
 		ANSWER(cap);
+		if (cmd == 8 && cap == TOPO_PLACEMENT_SIZE && (gFix & MESA_FIX_ALIGNMENT)) {
+			uint32_t n = mesa_fill_alignment(out, gAlignN);         /* 1212 */
+			nAlignAnswered++;
+			SAY("AlignmentData answered: %u node(s), insNode %d\n", n, n ? (int)n - 1 : -1);
+			*how = "canned (node placement)";
+			return kIOReturnSuccess;
+		}
 		*how = "canned (zeros)";
 		return kIOReturnSuccess;
 	case 46: {      /* GetProtectedConfig (32 bytes) */
@@ -1707,6 +1761,7 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		/* 1192d: the identities' user id (EnrollMode v2 payload +4, 65/66 payload +0) for enrol/match records */
 		if (cmd == 3) {
 			gMatchExtend = false;
+			gAlignN = 0;            /* 1212 */
 			mesa_op_started(1, cmd);        /* 1203, 1210 */
 		} else if (cmd == 4) {
 			mesa_op_started(2, cmd);
