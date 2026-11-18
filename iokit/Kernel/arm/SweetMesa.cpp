@@ -188,8 +188,12 @@ extern "C" void sweet_touchid_init(void);
 #define FEV_V2_SIZE             80
 enum { FEV_FINGER_DOWN = 1, FEV_FINGER_UP, FEV_IMAGE, FEV_ENROL_PROGRESS, FEV_ENROL_DONE, FEV_ENROL_FAILED,
        FEV_NOMATCH, FEV_MATCH, FEV_MATCH_WITHHELD, FEV_TEMPLATES, FEV_OP_TIMEOUT, FEV_ERROR,
-       FEV_TA_FRESH /* 1206: the TA was loaded empty (sweetfpcd start without a resident TA) */ };
+       FEV_TA_FRESH /* 1206: the TA was loaded empty (sweetfpcd start without a resident TA) */,
+       FEV_PREMATCH /* 1255: display off: the touch matched (match before wake) */,
+       FEV_PREMATCH_NOMATCH /* 1255: display off: a wrong finger (failed attempt, no wake) */ };
 #define FEV_MF_HAT_VERIFIED     1u
+#define FPCD_WD_PREMATCH        1u              /* 1255: FPCD_CMD_WAKEDET {u32 on, u32 flags}: match before wake */
+#define FPCD_MM_PREMATCHED      2u              /* 1255: 4 MatchMode u32 flags: the kernel delivers the pre-match */
 
 /* Apple message indexes (0xe3ff8000 + idx) and 0xe3ff8001 status ordinals (libBKDM1 BLHelper status table) */
 #define MIDX_STATUS             0x1
@@ -1242,9 +1246,13 @@ mesa_zalloc(uint32_t len)
  * kIOReturnSuccess when the event kind is logged only. Every decision is logged.
  */
 static bool mesa_wake_finger(void);     /* 1235 */
+static void mesa_prematch_event(uint32_t code, const uint8_t *d, uint32_t len);       /* 1255 */
+static bool mesa_prematch_take(void);   /* 1255 */
+static volatile bool gPmLifted;         /* 1255: a FINGER_UP came after the stored pre-match */
 
+/* replay (1255): the stored pre-match delivered to the next MatchMode: no wake check, no stale-generation check */
 static IOReturn
-fpcd_translate(const uint8_t *d, uint32_t len)
+fpcd_translate_ex(const uint8_t *d, uint32_t len, bool replay)
 {
 	uint32_t code = le16(d + FEV_CODE);
 	int32_t st = (int32_t)le32(d + FEV_STATUS);
@@ -1255,14 +1263,21 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 	uint8_t *b;
 	IOReturn r = kIOReturnSuccess;
 
-	if (code == FEV_FINGER_DOWN && mesa_wake_finger()) {
+	if (code == FEV_FINGER_DOWN && !replay && mesa_wake_finger()) {
 		return kIOReturnSuccess;        /* 1235: display off: a wake press (or skipped), never a FingerOn */
+	}
+	if (code == FEV_PREMATCH || code == FEV_PREMATCH_NOMATCH) {
+		mesa_prematch_event(code, d, len);      /* 1255: never an Apple message by itself */
+		return kIOReturnSuccess;
+	}
+	if (code == FEV_FINGER_UP) {
+		gPmLifted = true;               /* 1255 */
 	}
 	if (gEndCount > 0) {
 		mesa_end_flush();       /* 1210: a queued op end goes out before anything of the next op */
 	}
 	const char *swhy = "";
-	if (mesa_event_stale(code, op, le32(d + FEV_OP_GEN), v2, &swhy)) {
+	if (!replay && mesa_event_stale(code, op, le32(d + FEV_OP_GEN), v2, &swhy)) {
 		nStaleDropped++;
 		SAY("dropped stale event: fpcd code %u status %d fid 0x%x gen %u (%s; kernel op %s, op gen %u)\n", code, st,
 		    fid, le32(d + FEV_OP_GEN), swhy, mesa_kind_names[gOpKind <= 3 ? gOpKind : 0], gKGen);
@@ -1467,6 +1482,12 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 		SAY("fpcd code %u status %d: logged only (no Apple message for it)\n", code, st);
 		return kIOReturnSuccess;
 	}
+}
+
+static IOReturn
+fpcd_translate(const uint8_t *d, uint32_t len)
+{
+	return fpcd_translate_ex(d, len, false);
 }
 
 /* ---- forwarding to sweetfpcd ---- */
@@ -2298,6 +2319,7 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		uint32_t flen = 0;
 		uint32_t rlen = 0;
 		uint8_t *rbuf;
+		bool pm = false;        /* 1255 */
 		MesaEndKick kick;       /* 1210 */
 
 		/* 1192d: the identities' user id (EnrollMode v2 payload +4, 65/66 payload +0) for enrol/match records */
@@ -2332,7 +2354,9 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 				    p[0xc], p[0xd], p[0xe], p[0xf], le32(p + 8), gAcmBind ? "" : " (kern.sweet_mesa_acm_bind 0: "
 				    "unlocks the keybag as before)");
 			}
-			put32(small, gMatchExtend ? 1 : 0);
+			/* 1255: a pre-match stored while the display was off is delivered to this op (thread call) */
+			pm = !gMatchExtend && mesa_prematch_take();
+			put32(small, (gMatchExtend ? 1u : 0u) | (pm ? FPCD_MM_PREMATCHED : 0u));
 			fp = small;
 			flen = 4;
 			if (gMatchExtend) {
@@ -3468,11 +3492,27 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_state, CTLTYPE_STRING | CTLFLAG_RD | CTL
  *       display goes off and ends it ({u32 0}) when the display comes on; sweetfpcd (ws-fpcd-c) arms the sensor and
  *       sleeps on the gpio112 interrupt (kern.sweet_fpc_wait_edge, sweet_fpc.c 1235): no capture loop until a touch.
  * Use 5 (wake + arm). kern.sweet_mesa_wake_state: counters. klog "SWEET MESA: wake: ...".
+ *
+ * 1255 (touchid-prematch-2026-11-18.md): bit 3 (8) MATCH BEFORE WAKE (the owner's order; Pixel style). With the display
+ *   off a finger down presses nothing; sweetfpcd (ws-fpcd-e, WAKEDET {1, FPCD_WD_PREMATCH}) identifies the touch at once:
+ *   - FPCD_EV_PREMATCH (14, a listed fid through sweetfpcd's match gates): checked like a match (kern.sweet_mesa_match:
+ *     2, or 1 with a verified HAT), then sweet_pc_bio_allowed(): allowed -> the match is stored (valid
+ *     kern.sweet_mesa_prematch_ms, default 2000, single use) and the power button pressed. biometrickitd's next
+ *     4 MatchMode (not an extend-enrolment) takes it: sweetfpcd gets the flag FPCD_MM_PREMATCHED (it does not identify
+ *     that touch again) and 30 ms later a thread call sends FingerOn and the stored match through the normal match
+ *     path (fpcd_translate: keybag unlock / ACM rules, match record, unlock delay), then FingerOff if the finger was
+ *     lifted meanwhile. Touch ID not allowed (5 failures / forced lockout, passcode after restart or 48 h, backoff):
+ *     the press still comes but nothing is stored, so the lock screen asks for the passcode as an iPhone does.
+ *   - FPCD_EV_PREMATCH_NOMATCH (15, a wrong finger with a good image): a failed attempt under the 1225 rules
+ *     (sweet_pc_bio_failed, 0xe3ff800a push), no wake. Bad images / low coverage never reach the kernel.
+ *   A touch that began within kern.sweet_mesa_wake_ms of the display going off never wakes. Bit 0 (the 1235 wake on
+ *   any finger, then iOS's own match) is ignored while bit 3 is set; use 12 (8 + 4) for match first, 5 for the old.
  */
 #define FPCD_CMD_WAKEDET        0x120           /* {u32 on}: sweetfpcd screen-off finger detect (1235) */
 #define MESA_WAKE_ON            1u
 #define MESA_WAKE_HOME          2u
 #define MESA_WAKE_ARM           4u
+#define MESA_WAKE_MATCH         8u              /* 1255 */
 #define MESA_WAKE_MIN_GAP_MS    1500u
 extern "C" void sweet_hid_key(int key, int down);
 extern "C" void sweet_mesa_display(int off);
@@ -3482,6 +3522,12 @@ static volatile bool gDispOff, gDispKnown;
 static volatile uint64_t gDispOffAt, gWakeAt;
 static thread_call_t gWakeTC;
 static SInt32 nWakes, nWakeEarly, nWakeGap, nWakeArm, nWakeArmFail;
+static int gPmMs = 2000;                        /* kern.sweet_mesa_prematch_ms (1255) */
+static volatile bool gPmEarly;                  /* 1255: the current touch began within gWakeMs of display off */
+static IOLock *gPmL;                            /* 1255: gPm / gPmRe */
+static struct { bool valid; uint64_t at; uint8_t ev[FEV_V2_SIZE]; } gPm, gPmRe;
+static thread_call_t gPmTC;
+static SInt32 nPmStored, nPmUsed, nPmExpired, nPmNoMatch, nPmRefused, nPmLocked, nPmIgnored;
 
 static void
 mesa_wake_tc(thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -3512,34 +3558,52 @@ mesa_ms_since(uint64_t t)
 	return ns / NSEC_PER_MSEC > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / NSEC_PER_MSEC);
 }
 
-/* true: this FINGER_DOWN came with iOS's display off and is consumed here (a wake, or skipped), not a FingerOn */
+/* the wake press (1235; 1255 calls it for a pre-match). false: refused (one press per MESA_WAKE_MIN_GAP_MS) */
 static bool
-mesa_wake_finger(void)
+mesa_wake_press(uint32_t off_ms, const char *why)
 {
-	if (!(gWake & MESA_WAKE_ON) || !gDispOff) {
-		return false;
-	}
-	uint32_t off_ms = mesa_ms_since(gDispOffAt);
-	if (off_ms < (uint32_t)gWakeMs) {
-		OSIncrementAtomic(&nWakeEarly);
-		SAY("wake: finger down %u ms after display off (< kern.sweet_mesa_wake_ms %d): no wake\n", off_ms, gWakeMs);
-		return true;
-	}
 	if (gWakeAt != 0 && mesa_ms_since(gWakeAt) < MESA_WAKE_MIN_GAP_MS) {
 		OSIncrementAtomic(&nWakeGap);
-		SAY("wake: finger down %u ms after the last wake press: no second press\n", mesa_ms_since(gWakeAt));
-		return true;
+		SAY("wake: %s %u ms after the last wake press: no second press\n", why, mesa_ms_since(gWakeAt));
+		return false;
 	}
 	gWakeAt = mach_absolute_time();
 	OSIncrementAtomic(&nWakes);
 	int key = (gWake & MESA_WAKE_HOME) ? 3 : 0;
 	mesa_wake_tc_alloc();
-	SAY("wake: finger down with the display off (%u ms) -> %s button press\n", off_ms, key == 3 ? "home" : "power");
+	SAY("wake: %s with the display off (%u ms) -> %s button press\n", why, off_ms, key == 3 ? "home" : "power");
 	if (gWakeTC != NULL) {
 		thread_call_enter1(gWakeTC, (thread_call_param_t)(uintptr_t)key);
 	} else {
 		SAY("wake: no thread call, no press\n");
 	}
+	return true;
+}
+
+/* true: this FINGER_DOWN came with iOS's display off and is consumed here (a wake, or skipped), not a FingerOn */
+static bool
+mesa_wake_finger(void)
+{
+	if (!(gWake & (MESA_WAKE_ON | MESA_WAKE_MATCH)) || !gDispOff) {
+		return false;
+	}
+	uint32_t off_ms = mesa_ms_since(gDispOffAt);
+	if (gWake & MESA_WAKE_MATCH) {
+		/* 1255: match first: no press now; sweetfpcd identifies the touch and sends PREMATCH / PREMATCH_NOMATCH */
+		gPmEarly = off_ms < (uint32_t)gWakeMs;
+		if (gPmEarly) {
+			OSIncrementAtomic(&nWakeEarly);
+		}
+		SAY("wake: finger down with the display off (%u ms): match first%s\n", off_ms, gPmEarly ?
+		    " (< kern.sweet_mesa_wake_ms: this touch will not wake)" : ", waiting for sweetfpcd's identify");
+		return true;
+	}
+	if (off_ms < (uint32_t)gWakeMs) {
+		OSIncrementAtomic(&nWakeEarly);
+		SAY("wake: finger down %u ms after display off (< kern.sweet_mesa_wake_ms %d): no wake\n", off_ms, gWakeMs);
+		return true;
+	}
+	mesa_wake_press(off_ms, "finger down");
 	return true;
 }
 
@@ -3549,11 +3613,13 @@ mesa_wake_arm(bool on, const char *why)
 	if (gM == NULL) {
 		return;
 	}
-	uint8_t b[4];
+	uint8_t b[8];
 	put32(b, on ? 1u : 0u);
+	put32(b + 4, (gWake & MESA_WAKE_MATCH) ? FPCD_WD_PREMATCH : 0u);       /* 1255; old sweetfpcd reads b[0..3] */
 	IOReturn r = mesa_post(FPCD_CMD_WAKEDET, b, sizeof(b));
 	OSIncrementAtomic(r == kIOReturnSuccess ? &nWakeArm : &nWakeArmFail);
-	SAY("wake: screen-off finger detect %s (%s) -> 0x%x%s\n", on ? "on" : "off", why, r,
+	SAY("wake: screen-off finger detect %s (%s%s) -> 0x%x%s\n", on ? "on" : "off", why,
+	    on && (gWake & MESA_WAKE_MATCH) ? ", match before wake" : "", r,
 	    r == kIOReturnNotReady ? " (sweetfpcd offline)" : "");
 }
 
@@ -3564,6 +3630,17 @@ sweet_mesa_display(int off)
 	bool was = gDispOff, known = gDispKnown;
 	if (off) {
 		gDispOffAt = mach_absolute_time();
+		gPmEarly = false;
+		if (gPmL != NULL && (!known || !was)) {         /* 1255: a new dark period: an unused pre-match is gone */
+			IOLockLock(gPmL);
+			bool had = gPm.valid;
+			gPm.valid = false;
+			IOLockUnlock(gPmL);
+			if (had) {
+				OSIncrementAtomic(&nPmExpired);
+				SAY("prematch: unused pre-match dropped (display off again)\n");
+			}
+		}
 	}
 	gDispOff = off != 0;
 	gDispKnown = true;
@@ -3581,23 +3658,25 @@ sysctl_sweet_mesa_wake(__unused struct sysctl_oid *oidp, __unused void *arg1, __
 	if (e || !changed) {
 		return e;
 	}
-	if (v & ~7) {
+	if (v & ~0xf) {
 		return EINVAL;
 	}
 	uint32_t old = gWake;
 	mesa_wake_tc_alloc();
 	gWake = (uint32_t)v;
 	SAY("wake: kern.sweet_mesa_wake=%d: finger wake %s (%s button), screen-off detect %s; display %s\n", v,
-	    (v & MESA_WAKE_ON) ? "on" : "off", (v & MESA_WAKE_HOME) ? "home" : "power", (v & MESA_WAKE_ARM) ? "on" : "off",
+	    (v & MESA_WAKE_MATCH) ? "MATCH FIRST (1255)" : (v & MESA_WAKE_ON) ? "on any finger" : "off",
+	    (v & MESA_WAKE_HOME) ? "home" : "power", (v & MESA_WAKE_ARM) ? "on" : "off",
 	    !gDispKnown ? "unknown" : gDispOff ? "off" : "on");
-	if (gDispOff && ((old ^ gWake) & MESA_WAKE_ARM)) {
+	if (gDispOff && ((old ^ gWake) & (MESA_WAKE_ARM | MESA_WAKE_MATCH))) {      /* 1255: bit 3 re-arms too */
 		mesa_wake_arm((gWake & MESA_WAKE_ARM) != 0, "kern.sweet_mesa_wake");
 	}
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_wake, "I", "redfin 1235: screen-off Touch ID wake: 1 a finger down with the display off presses "
-    "the power button, 2 home button instead, 4 sweetfpcd arms the sensor while the display is off (use 5; 0 = off)");
+    "the power button, 2 home button instead, 4 sweetfpcd arms the sensor while the display is off (use 5; 0 = off); "
+    "1255: 8 match before wake (only an enrolled finger wakes and unlocks; use 12)");
 
 static int
 sysctl_sweet_mesa_wake_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -3621,14 +3700,178 @@ static int
 sysctl_sweet_mesa_wake_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
 {
-	char b[200];
-	snprintf(b, sizeof(b), "wake=%u wake_ms=%d display=%s off_ms=%u wakes=%d early=%d gap=%d arm_posts=%d arm_fail=%d",
+	char b[360];
+	snprintf(b, sizeof(b), "wake=%u wake_ms=%d display=%s off_ms=%u wakes=%d early=%d gap=%d arm_posts=%d arm_fail=%d"
+	    " prematch_ms=%d pm_stored=%d pm_used=%d pm_expired=%d pm_nomatch=%d pm_refused=%d pm_locked=%d pm_ignored=%d"
+	    " pm_valid=%d",
 	    gWake, gWakeMs, !gDispKnown ? "unknown" : gDispOff ? "off" : "on", gDispOff ? mesa_ms_since(gDispOffAt) : 0,
-	    nWakes, nWakeEarly, nWakeGap, nWakeArm, nWakeArmFail);
+	    nWakes, nWakeEarly, nWakeGap, nWakeArm, nWakeArmFail, gPmMs, nPmStored, nPmUsed, nPmExpired, nPmNoMatch,
+	    nPmRefused, nPmLocked, nPmIgnored, gPm.valid ? 1 : 0);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_wake_state, "A", "redfin 1235: screen-off Touch ID wake counters");
+
+/* ---- 1255: match before wake (kern.sweet_mesa_wake bit 3; see the 1235 comment above) ---- */
+static void mesa_pm_tc(thread_call_param_t p0, thread_call_param_t p1);
+
+static void
+mesa_pm_init(void)
+{
+	if (gPmL == NULL) {
+		IOLock *l = IOLockAlloc();
+		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gPmL)) {
+			IOLockFree(l);
+		}
+	}
+	if (gPmTC == NULL) {
+		thread_call_t tc = thread_call_allocate(mesa_pm_tc, NULL);
+		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gPmTC)) {
+			thread_call_free(tc);
+		}
+	}
+}
+
+/* sweetfpcd's FPCD_EV_PREMATCH / FPCD_EV_PREMATCH_NOMATCH (fpcd_translate_ex, before the stale check) */
+static void
+mesa_prematch_event(uint32_t code, const uint8_t *d, uint32_t len)
+{
+	uint32_t fid = le32(d + FEV_FID), fl = le32(d + FEV_FLAGS);
+	int32_t score = (int32_t)le32(d + FEV_SCORE);
+	mesa_pm_init();
+	if (!(gWake & MESA_WAKE_MATCH) || !gDispOff || gPmEarly) {
+		OSIncrementAtomic(&nPmIgnored);
+		SAY("prematch: fpcd code %u fid 0x%x score %d ignored (%s)\n", code, fid, score,
+		    !(gWake & MESA_WAKE_MATCH) ? "kern.sweet_mesa_wake bit 3 off" : !gDispOff ? "display on" :
+		    "the touch began within kern.sweet_mesa_wake_ms of display off");
+		return;
+	}
+	uint32_t off_ms = mesa_ms_since(gDispOffAt);
+	if (code == FEV_PREMATCH_NOMATCH) {
+		/* a wrong finger: a failed Touch ID attempt as in fpcd_translate's no-match (1225 rules), no wake */
+		OSIncrementAtomic(&nPmNoMatch);
+		bool counted = gMatch == 2 || ((gLockout & MESA_LO_COUNT) && gMatch != 0);
+		if (counted) {
+			sweet_pc_bio_failed();
+			mesa_lockstate_kick();
+		}
+		SAY("prematch: WRONG FINGER with the display off (score %d coverage %u): no wake, %s\n", score,
+		    le32(d + FEV_SAMPLES), counted ? "counted as a failed Touch ID attempt" :
+		    "not counted (kern.sweet_mesa_match / kern.sweet_mesa_lockout bit 1)");
+		return;
+	}
+	bool verified = (fl & FEV_MF_HAT_VERIFIED) != 0;
+	if (fid == 0 || !((gMatch == 1 && verified) || gMatch == 2)) {
+		OSIncrementAtomic(&nPmRefused);
+		SAY("prematch: fid 0x%x is not a deliverable match (kern.sweet_mesa_match=%d, HAT %s): no wake\n", fid,
+		    gMatch, verified ? "verified" : "NOT verified");
+		return;
+	}
+	const char *why = "";
+	if (!sweet_pc_bio_allowed(&why)) {
+		/* chosen: an enrolled finger still wakes the phone, without a match: the lock screen asks for the passcode */
+		OSIncrementAtomic(&nPmLocked);
+		SAY("prematch: fid 0x%x matched but Touch ID may not unlock (%s): wake WITHOUT a match\n", fid, why);
+		mesa_wake_press(off_ms, "enrolled finger (Touch ID locked)");
+		return;
+	}
+	if (gPmL == NULL) {
+		SAY("prematch: no lock allocated: no wake\n");
+		return;
+	}
+	IOLockLock(gPmL);
+	bzero(gPm.ev, sizeof(gPm.ev));
+	bcopy(d, gPm.ev, len < sizeof(gPm.ev) ? len : sizeof(gPm.ev));
+	gPm.at = mach_absolute_time();
+	gPm.valid = true;
+	gPmLifted = false;
+	IOLockUnlock(gPmL);
+	OSIncrementAtomic(&nPmStored);
+	SAY("prematch: fid 0x%x score %d matched with the display off -> stored for the next MatchMode (%d ms)\n", fid,
+	    score, gPmMs);
+	mesa_wake_press(off_ms, "pre-matched finger");  /* refused (gap): the display is coming on anyway */
+}
+
+/* 4 MatchMode (not extend): take a valid stored pre-match (single use) and schedule its delivery */
+static bool
+mesa_prematch_take(void)
+{
+	if (gPmL == NULL) {
+		return false;
+	}
+	IOLockLock(gPmL);
+	bool had = gPm.valid;
+	uint32_t age = had ? mesa_ms_since(gPm.at) : 0;
+	bool ok = had && age <= (uint32_t)gPmMs;
+	gPm.valid = false;
+	if (ok) {
+		gPmRe = gPm;
+	}
+	IOLockUnlock(gPmL);
+	if (!had) {
+		return false;
+	}
+	if (!ok) {
+		OSIncrementAtomic(&nPmExpired);
+		SAY("prematch: expired (%u ms > kern.sweet_mesa_prematch_ms %d): this MatchMode matches as usual\n", age,
+		    gPmMs);
+		return false;
+	}
+	OSIncrementAtomic(&nPmUsed);
+	SAY("prematch: MatchMode %u ms after the pre-match: the stored match goes to this op\n", age);
+	if (gPmTC != NULL) {
+		uint64_t dl;
+		clock_interval_to_deadline(30, kMillisecondScale, &dl);
+		thread_call_enter_delayed(gPmTC, dl);   /* after the MatchMode command returns (1210 ordering) */
+	}
+	return true;
+}
+
+/* the delivery: FingerOn, the stored match through the normal path (keybag / ACM rules, record), FingerOff if lifted */
+static void
+mesa_pm_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint8_t ev[FEV_V2_SIZE];
+	IOLockLock(gPmL);
+	bcopy(gPmRe.ev, ev, sizeof(ev));
+	uint64_t at = gPmRe.at;
+	IOLockUnlock(gPmL);
+	uint32_t k = gOpKind;
+	if (k != 2) {
+		SAY("prematch: no match op running any more (op %s): stored match dropped\n", mesa_kind_names[k <= 3 ? k : 0]);
+		return;
+	}
+	ev[FEV_CODE] = FEV_MATCH;
+	ev[FEV_CODE + 1] = 0;
+	put32(ev + FEV_OP, 2);
+	bool lifted = gPmLifted;
+	mesa_status(ST_FINGER_ON);
+	IOReturn r = fpcd_translate_ex(ev, sizeof(ev), true);
+	if (lifted) {
+		mesa_status(ST_FINGER_OFF);
+	}
+	SAY("prematch: match delivered %u ms after the touch matched -> 0x%x%s\n", mesa_ms_since(at), r,
+	    lifted ? " (finger already lifted: FingerOff after it)" : "");
+}
+
+static int
+sysctl_sweet_mesa_prematch_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gPmMs, changed = 0;
+	int e = sysctl_io_number(req, gPmMs, sizeof(gPmMs), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 10000) {
+		return EINVAL;
+	}
+	gPmMs = v;
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_prematch_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_prematch_ms, "I", "redfin 1255: a match made with the display off is delivered to a MatchMode "
+    "that comes within this many ms (default 2000; 0 = never)");
 /* ---- 1247: boot-arg sweettouchid: the tested Touch ID set, applied in order before the persona publishes ---- */
 static int gTidBoot;
 static char gTidBootLog[512];
@@ -3649,7 +3892,8 @@ static void
 tid_boot_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	int pc = 0;
-	SAY("sweettouchid=%#x: applying the Touch ID set (bit 0 set, bit 1 wake, bit 2 locked at boot)\n", gTidBoot);
+	SAY("sweettouchid=%#x: applying the Touch ID set (bit 0 set, bit 1 wake, bit 2 locked at boot, bit 3 match before "
+	    "wake)\n", gTidBoot);
 	tid_set("kern.sweet_fpc", 3);
 	if (!PE_parse_boot_argn("sweetpasscode", &pc, sizeof(pc))) {
 		tid_set("kern.sweet_passcode", (gTidBoot & 4) ? 3 : 1);
@@ -3665,7 +3909,9 @@ tid_boot_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	tid_set("kern.sweet_mesa_fix", 0x17);
 	tid_set("kern.sweet_mesa_lockout", 0xf);
 	tid_set("kern.sweet_passcode_bio_buzz", 0x7f000c);
-	if (gTidBoot & 2) {
+	if (gTidBoot & 8) {
+		tid_set("kern.sweet_mesa_wake", 12);    /* 1255: match before wake */
+	} else if (gTidBoot & 2) {
 		tid_set("kern.sweet_mesa_wake", 5);
 	}
 	tid_set("kern.sweet_mesa_fwd_wait_ms", 15000);
