@@ -299,6 +299,40 @@ picture_y(CVPixelBufferRef pb, double *clipped)
 	return n ? (double)sum / n : 0;
 }
 
+/*
+ * (ws-cam-ife2) a picture's lens shading as it shows: the luma's mean in the middle tenth (a 10 % x 10 % box) and in the
+ * four corner boxes of the same size (2 % in from the edges), for comparing the hardware's and the processor's pictures
+ * of the same flat scene.
+ */
+static void
+picture_shading(CVPixelBufferRef pb, double *middle, double *corners)
+{
+	bool planar = CVPixelBufferGetPlaneCount(pb) >= 2;
+	const uint8_t *y;
+	size_t bpr, w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), step = planar ? 1 : 4;
+	size_t bw = w / 10, bh = h / 10, x0[5] = { (w - bw) / 2, w / 50, w - w / 50 - bw, w / 50, w - w / 50 - bw },
+	    y0[5] = { (h - bh) / 2, h / 50, h / 50, h - h / 50 - bh, h - h / 50 - bh };
+	double mean[5] = { 0 };
+
+	CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+	y = planar ? CVPixelBufferGetBaseAddressOfPlane(pb, 0) : CVPixelBufferGetBaseAddress(pb);
+	bpr = planar ? CVPixelBufferGetBytesPerRowOfPlane(pb, 0) : CVPixelBufferGetBytesPerRow(pb);
+	for (int b = 0; y != NULL && b < 5; b++) {
+		uint64_t sum = 0, n = 0;
+
+		for (size_t r = y0[b]; r < y0[b] + bh; r += 2) {
+			for (size_t x = x0[b]; x < x0[b] + bw; x += 2) {
+				sum += y[r * bpr + x * step + (planar ? 0 : 1)];
+				n++;
+			}
+		}
+		mean[b] = n ? (double)sum / n : 0;
+	}
+	CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+	*middle = mean[0];
+	*corners = (mean[1] + mean[2] + mean[3] + mean[4]) / 4;
+}
+
 /* ---- CoreMedia's derived objects, as iOS 16.5 lays them out ---------------------------------------- */
 
 typedef struct OpaqueCMBaseObject *CMBaseObjectRef;
@@ -2922,6 +2956,15 @@ sensor_exposure(const struct isp *isp, const struct redwood_camera_frame *f)
  * No file: exactly as before.
  */
 #define IFE_FLAG        "/private/var/local/camera-ife"
+/*
+ * ws-cam-ife2 (kernel 1257 r4): /private/var/local/camera-ife-still: the photograph's full mode (4032x3024) also through
+ * the IFE (FORMAT's b asks for it; without the flag, or a kernel before r4, the full mode comes as RAW10 and the
+ * processor makes the photograph as before). /private/var/local/camera-ife-noshade: the tuning's lens shading is not sent
+ * to the kernel (REDWOOD_CAMERA_COLOUR a 3; also kern.sweet_ife_lsc 0). Both looked for at each opening.
+ */
+#define IFE_STILL_FLAG  "/private/var/local/camera-ife-still"
+#define IFE_NOSHADE_FLAG "/private/var/local/camera-ife-noshade"
+#define IFE_LSC_FRAMES  15              /* a new shading at most every 15 frames */
 
 struct ife_link {
 	bool            on;
@@ -2929,6 +2972,10 @@ struct ife_link {
 	float           ccm_sent[3][3]; /* the colour matrix as the kernel has it (the frames' made with it) */
 	bool            ccm_set;
 	uint64_t        nv12_frames, raw_frames;
+	/* (ws-cam-ife2) */
+	bool            still, shade, lsc_set, lsc_failed;
+	float           lsc_sent[3][LSC_H][LSC_W];      /* the shading as the kernel has it (R, G, B) */
+	uint64_t        lsc_calls, lsc_tables;
 };
 
 static void
@@ -2939,12 +2986,16 @@ ife_start(int device, struct ife_link *l)
 		uint16_t        k[65];
 	} g = { { .command = REDWOOD_CAMERA_COLOUR, .bytes = sizeof(g.k), .a = 2 } };
 	struct redwood_camera_command fmt = { .command = REDWOOD_CAMERA_FORMAT, .a = REDWOOD_CAMERA_FORMAT_NV12 };
+	bool still = access(IFE_STILL_FLAG, F_OK) == 0, shade = access(IFE_NOSHADE_FLAG, F_OK) != 0;
 
 	size_t gn = sizeof(g.c) + sizeof(g.k);  /* (the command and its 65 knots: not the structure's padding) */
 	ssize_t wg = 0;
 
 	memset(l, 0, sizeof(*l));
 	l->on = true;
+	l->still = still;
+	l->shade = shade;
+	fmt.b = still ? 0xffffffffu : 0xfffffffeu;      /* (ws-cam-ife2) the modes wanted as NV12: mode 0 only with camera-ife-still */
 	isp_gamma_knots(g.k);
 	errno = 0;
 	if ((wg = write(device, &g, gn)) != (ssize_t)gn || write(device, &fmt, sizeof(fmt)) != (ssize_t)sizeof(fmt)) {
@@ -2953,7 +3004,80 @@ ife_start(int device, struct ife_link *l)
 		l->on = false;
 		return;
 	}
-	say("IFE pixel path: NV12 asked for (camera-ife), the gamma sent");
+	say("IFE pixel path: NV12 asked for (camera-ife), the gamma sent; photographs %s; lens shading %s", still ?
+	    "through the IFE too (camera-ife-still)" : "from RAW10 by the processor", shade ? "sent to the kernel" : "not sent (camera-ife-noshade)");
+}
+
+/*
+ * (ws-cam-ife2) the tuning's lens shading (as the processor would apply it, R G B, interpolated by light and colour
+ * temperature) to the kernel when it has moved by 1 % somewhere, at most every IFE_LSC_FRAMES frames: 17 x 13 grids of
+ * R, Gr, Gb (both the green's), B in 1/4096ths. None (no tuning): the kernel's shading off. A kernel without it
+ * (EINVAL): not asked again this opening.
+ */
+static void
+ife_shading(int device, struct ife_link *l, const struct isp *isp)
+{
+	struct {
+		struct redwood_camera_command c;
+		uint16_t        h[4];
+		uint16_t        g[4][LSC_H][LSC_W];
+	} t;
+	float moved = l->lsc_set ? 0 : 1;
+
+	if (!l->shade || l->lsc_failed || l->lsc_calls++ % IFE_LSC_FRAMES != 0) {
+		return;
+	}
+	if (!isp->lsc.on) {
+		if (l->lsc_set) {
+			struct redwood_camera_command off = { .command = REDWOOD_CAMERA_COLOUR, .a = 3 };
+
+			(void)write(device, &off, sizeof(off));
+			l->lsc_set = false;
+			say("IFE pixel path: no lens shading in the tuning: the kernel's off");
+		}
+		return;
+	}
+	for (int c = 0; c < 3; c++) {
+		for (int y = 0; y < LSC_H; y++) {
+			for (int x = 0; x < LSC_W; x++) {
+				float d = fabsf(isp->lsc.gain[c][y][x] - l->lsc_sent[c][y][x]) / (l->lsc_sent[c][y][x] > 0.1f ? l->lsc_sent[c][y][x] : 1);
+
+				moved = d > moved ? d : moved;
+			}
+		}
+	}
+	if (moved <= 0.01f) {
+		return;
+	}
+	memset(&t, 0, sizeof(t));
+	t.c.command = REDWOOD_CAMERA_COLOUR;
+	t.c.a = 3;
+	t.c.bytes = sizeof(t.h) + sizeof(t.g);
+	t.h[0] = LSC_W;
+	t.h[1] = LSC_H;
+	t.h[2] = 4;
+	t.h[3] = 12;
+	for (int y = 0; y < LSC_H; y++) {
+		for (int x = 0; x < LSC_W; x++) {
+			for (int k = 0; k < 4; k++) {
+				float v = isp->lsc.gain[k == 0 ? 0 : k == 3 ? 2 : 1][y][x] * 4096;
+
+				t.g[k][y][x] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lrintf(v));
+			}
+		}
+	}
+	errno = 0;
+	if (write(device, &t, sizeof(t)) != (ssize_t)sizeof(t)) {
+		l->lsc_failed = true;
+		say("IFE pixel path: the kernel takes no lens shading (%s): the hardware's picture unshaded", errno ? strerror(errno) : "short");
+		return;
+	}
+	memcpy(l->lsc_sent, isp->lsc.gain, sizeof(l->lsc_sent));
+	if (l->lsc_tables++ < 3) {
+		say("IFE pixel path: lens shading sent (corners R %.2f G %.2f B %.2f, middle G %.2f)", isp->lsc.gain[0][0][0],
+		    isp->lsc.gain[1][0][0], isp->lsc.gain[2][0][0], isp->lsc.gain[1][LSC_H / 2][LSC_W / 2]);
+	}
+	l->lsc_set = true;
 }
 
 /* the colour matrix, when it has moved, and the white balance (with the processor's gain), with AE's command if there is one */
@@ -2971,6 +3095,8 @@ ife_send(int device, struct ife_link *l, const struct isp *isp, struct redwood_c
 	float moved = l->ccm_set ? 0 : 1;
 	uint32_t wb[3];
 	bool wb_moved = false;
+
+	ife_shading(device, l, isp);    /* (ws-cam-ife2) */
 
 	for (int r = 0; r < 3; r++) {
 		for (int c = 0; c < 3; c++) {
@@ -3196,6 +3322,10 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 
 		struct isp_nv12 nv;
 		bool hw = nv12 && isp_nv12_of(f, ife.ccm_set ? (const float (*)[3])ife.ccm_sent : NULL, &nv);
+
+		if (hw && nv.shaded && ife.lsc_set) {
+			nv.hw_lsc = (const float (*)[LSC_H][LSC_W])ife.lsc_sent;        /* (ws-cam-ife2) measured unshaded */
+		}
 
 		if (hw) {
 			/* ws-cam-ife: the hardware's picture measured back to the sensor's levels */
@@ -3620,6 +3750,18 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				CVPixelBufferRelease(moving[k].pb);
 				moving[k].pb = NULL;
 				continue;
+			}
+			if (k == 0 && s->frames % 150 == 75) {
+				/* (ws-cam-ife2) the picture's shading, for comparing the hardware's (camera-ife) and the processor's */
+				double middle, corners, clipped, mean = 0;
+
+				picture_shading(moving[k].pb, &middle, &corners);
+				CVPixelBufferLockBaseAddress(moving[k].pb, kCVPixelBufferLock_ReadOnly);
+				mean = picture_y(moving[k].pb, &clipped);
+				CVPixelBufferUnlockBaseAddress(moving[k].pb, kCVPixelBufferLock_ReadOnly);
+				say("picture %llu (%s%s): luma mean %.1f, middle %.1f, corners %.1f, corners/middle %.3f", (unsigned long long)f->sequence,
+				    nv12 ? "the IFE's" : "the processor's", nv12 && hw && nv.shaded ? ", lens-shaded" : "", mean, middle, corners,
+				    middle > 0 ? corners / middle : 0);
 			}
 			if (camera_stamp) {
 				stamp_picture(moving[k].pb, (uint32_t)preview_number);

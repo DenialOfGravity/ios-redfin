@@ -1532,6 +1532,8 @@ isp_nv12_of(const struct redwood_camera_frame *f, const float ccm[3][3], struct 
 	v->wb[0] = x->wb_r ? x->wb_r / 256.0f : 1;
 	v->wb[1] = x->wb_g ? x->wb_g / 256.0f : 1;
 	v->wb[2] = x->wb_b ? x->wb_b / 256.0f : 1;
+	v->shaded = (x->isp & 2) != 0;
+	v->hw_lsc = NULL;
 	for (int r = 0; r < 3; r++) {
 		for (int c = 0; c < 3; c++) {
 			m[r][c] = ccm != NULL ? ccm[r][c] : r == c;
@@ -1582,6 +1584,22 @@ nv12_cell(const struct isp_nv12 *v, uint32_t px, uint32_t py, float out[3], bool
 	}
 }
 
+/* (ws-cam-ife2) a shading table's gains at (u, v), as lsc_at() */
+static inline void
+lsc_table_at(const float (*t)[LSC_H][LSC_W], float u, float v, float g[3])
+{
+	float gx = u * (LSC_W - 1), gy = v * (LSC_H - 1);
+	int x = (int)gx, y = (int)gy;
+
+	x = x < 0 ? 0 : x > LSC_W - 2 ? LSC_W - 2 : x;
+	y = y < 0 ? 0 : y > LSC_H - 2 ? LSC_H - 2 : y;
+	float fx = gx - x, fy = gy - y;
+
+	for (int c = 0; c < 3; c++) {
+		g[c] = (t[c][y][x] * (1 - fx) + t[c][y][x + 1] * fx) * (1 - fy) + (t[c][y + 1][x] * (1 - fx) + t[c][y + 1][x + 1] * fx) * fy;
+	}
+}
+
 void
 isp_measure_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, struct isp_stats *s)
 {
@@ -1613,6 +1631,15 @@ isp_measure_nv12(const struct isp *isp, const struct redwood_camera_frame *f, co
 			bool white;
 
 			nv12_cell(v, cx * 2, cy * 2, c, &white);
+			if (v->hw_lsc != NULL) {
+				/* (ws-cam-ife2) the kernel's lens shading undone: the sensor's levels, as the RAW10 frames give them */
+				float hg[3];
+
+				lsc_table_at(v->hw_lsc, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, hg);
+				for (int i = 0; i < 3; i++) {
+					c[i] = hg[i] > 0.05f ? c[i] / hg[i] : c[i];
+				}
+			}
 
 			int vr = (int)(c[0] + 0.5f), g = (int)(c[1] + 0.5f), vb = (int)(c[2] + 0.5f);
 

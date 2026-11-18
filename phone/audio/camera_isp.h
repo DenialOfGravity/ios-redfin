@@ -215,6 +215,8 @@ struct isp_nv12 {
 	uint32_t        y_stride, uv_stride;
 	float           wb[3];          /* R, G, B as the frame was made with (1 = 1x) */
 	float           unmix[3][3];    /* the colour matrix's inverse */
+	bool            shaded;         /* (ws-cam-ife2) the kernel lens-shaded it (the tail's isp bit 1) */
+	const float     (*hw_lsc)[LSC_H][LSC_W];        /* the shading it was made with (R, G, B), NULL: none undone */
 };
 bool isp_nv12_of(const struct redwood_camera_frame *f, const float ccm[3][3], struct isp_nv12 *v);
 void isp_gamma_knots(uint16_t k[65]);
