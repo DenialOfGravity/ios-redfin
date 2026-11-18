@@ -75,6 +75,7 @@ extern "C" {
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 }
 
 #define SAY(fmt, ...) IOLog("SWEET MESA: " fmt, ##__VA_ARGS__)
@@ -121,6 +122,9 @@ enum { FEV_FINGER_DOWN = 1, FEV_FINGER_UP, FEV_IMAGE, FEV_ENROL_PROGRESS, FEV_EN
 #define ST_MATCHING_FAILED      0x33
 #define ST_MATCHING_STOPPED     0x3a
 #define ST_FINGER_ON            0x3f
+#define ST_ENROLL_CANCELLED     0x42            /* 1203: op-ending statuses (libBKDM1 -> switchToNextBioOperation:) */
+#define ST_MATCHING_CANCELLED   0x50
+#define ST_FDET_CANCELLED       0x63
 #define ST_FINGER_OFF           0x40
 #define ST_ENROLL_FAILED        0x43
 #define ST_ENROLL_TIMEOUT       0x44
@@ -170,6 +174,11 @@ mesa_name(uint32_t cmd)
 /* ---- state ---- */
 static int gMesa;                       /* kern.sweet_mesa */
 static int gMatch;                      /* kern.sweet_mesa_match */
+static int gOpEnd = 1;                  /* kern.sweet_mesa_opend: Cancel ends the op with its *Cancelled status (1203) */
+static volatile UInt32 gOpKind;         /* 1203: running op: 0 none, 1 enrol (3), 2 match (4), 3 finger detect (38) */
+static volatile UInt32 gEndPend;        /* 1203: op-ending statuses to deliver (bit 0 enrol, 1 match, 2 fdet) */
+static thread_call_t gEndTC;
+static uint32_t nOpEnd;
 static int gSks = 1;                    /* kern.sweet_mesa_sks: 39 GetSKSLockState follows the passcode rules (1202) */
 static int gPcfg = 1;                   /* kern.sweet_mesa_pcfg: 46 GetProtectedConfig bits (1202) */
 static int gTopo = 1;                   /* kern.sweet_mesa_topo: synthetic match topology (1201) */
@@ -276,6 +285,58 @@ mesa_fill_topology(uint8_t *t)
 	/* node 0 at pl + 0x30: angle 0, x 0, y 0, parent 0 (itself = root), flags 0 */
 }
 
+/*
+ * 1203: libBKDM1 statusMessage:withData:timestamp: calls BiometricKitXPCServer switchToNextBioOperation: (which
+ * removes the head of activeBioOpsQueue and resumes the next operation) only for 0x42 EnrollmentCancelled,
+ * 0x50 MatchingCancelled and 0x63 FingerDetectCancelled. cancelWithClient: marks the head op cancelling, sends
+ * 12 Cancel and waits for that status; a match or enrol result never ends an operation. Without it every cancelled
+ * operation stayed at the head and all later results (matchResult:timestamp: and statusMessage go to the head's
+ * client) went to a dead client: SpringBoard never saw its lock-screen matches, Settings never saw phase 2.
+ * Delivered from a thread call, after the Cancel command has returned to biometrickitd.
+ */
+static IOReturn mesa_status(uint32_t st);
+
+static void
+mesa_end_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static const uint32_t sts[3] = { ST_ENROLL_CANCELLED, ST_MATCHING_CANCELLED, ST_FDET_CANCELLED };
+	UInt32 pend;
+	do {
+		pend = gEndPend;
+	} while (!OSCompareAndSwap(pend, 0, &gEndPend));
+	for (int i = 0; i < 3; i++) {
+		if (pend & (1u << i)) {
+			IOReturn r = mesa_status(sts[i]);
+			nOpEnd++;
+			SAY("op ended: status 0x%x (%s) -> 0x%x\n", sts[i], i == 0 ? "EnrollmentCancelled" :
+			    i == 1 ? "MatchingCancelled" : "FingerDetectCancelled", r);
+		}
+	}
+}
+
+static void
+mesa_op_started(uint32_t kind)
+{
+	gOpKind = kind;
+}
+
+static void
+mesa_op_cancelled(void)
+{
+	UInt32 k;
+	do {
+		k = gOpKind;
+	} while (!OSCompareAndSwap(k, 0, &gOpKind));
+	if (!gOpEnd || k == 0 || k > 3 || gEndTC == NULL) {
+		if (k == 0) {
+			SAY("Cancel with no running op: no op-ending status\n");
+		}
+		return;
+	}
+	OSBitOrAtomic(1u << (k - 1), &gEndPend);
+	thread_call_enter(gEndTC);
+}
+
 static void
 mesa_locks(void)
 {
@@ -289,6 +350,12 @@ mesa_locks(void)
 		IOLock *l = IOLockAlloc();
 		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gPub)) {
 			IOLockFree(l);
+		}
+	}
+	if (gEndTC == NULL) {
+		thread_call_t tc = thread_call_allocate(mesa_end_tc, NULL);
+		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gEndTC)) {
+			thread_call_free(tc);
 		}
 	}
 }
@@ -1022,6 +1089,9 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		/* 1192d: the identities' user id (EnrollMode v2 payload +4, 65/66 payload +0) for enrol/match records */
 		if (cmd == 3) {
 			gMatchExtend = false;
+			mesa_op_started(1);     /* 1203 */
+		} else if (cmd == 4) {
+			mesa_op_started(2);
 		}
 		if (cmd == 3 && plen >= 8 && le32(p + 4) != 0xffffffffu) {
 			gUser = le32(p + 4);
@@ -1053,6 +1123,11 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		default: break;
 		}
 		if (cmd == 12 || cmd == 38 || cmd == 69) {         /* 1192b: posted, never blocks the caller */
+			if (cmd == 12) {
+				mesa_op_cancelled();    /* 1203 */
+			} else if (cmd == 38) {
+				mesa_op_started(3);
+			}
 			r = mesa_post(cmd, fp, flen);
 			if (r == kIOReturnSuccess) {
 				*how = "posted";
@@ -1656,6 +1731,26 @@ sysctl_sweet_mesa_match(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_match, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
+
+static int
+sysctl_sweet_mesa_opend(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gOpEnd, changed = 0;
+	int e = sysctl_io_number(req, gOpEnd, sizeof(gOpEnd), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 1) {
+		return EINVAL;
+	}
+	gOpEnd = v;
+	SAY("op-ending statuses after Cancel %s (kern.sweet_mesa_opend=%d, %u sent so far)\n", v ? "on" : "off", v, nOpEnd);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_opend, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_opend, "I", "redfin 1203: 12 Cancel ends the running op with EnrollmentCancelled / "
+    "MatchingCancelled / FingerDetectCancelled so biometrickitd drops it from activeBioOpsQueue (default 1)");
 
 static int
 sysctl_sweet_mesa_sks(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
