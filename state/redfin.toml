@@ -22,14 +22,15 @@ note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 a
 [boot]
 # 2026-11-17: promoted ws-int-k27-perf = ws-int-k27 (dbd0752e6f, cell data) + 1159 gpustats, 1160 perf counters, 1161 hang dump, 1162 p disp on|off (all off by default). Branch head 29b7f4c is NOTES only.
 # 2026-11-17 (night): promoted the native two-cluster kernel ws-amp-p3 83548e279b = ws-int-k27-uirebal (k27-perf + 1163 ui_rebal + 1164 appmain, both off) + 1180 AMP topology/Edge + 1181 kern.sweet_edge_pref (1) + 1182 SweetCLPC (kern.sweet_clpc 15 below). Image rclpc2. Fallback: the SMP kernel builds/xnu/ws-int-k27-perf-9b6aa022d6 (image rk27p). Docs: claude/redfin-status-2026-11-17-amp-promoted.md.
-image = "rclpc2"
-base = "r5p3a"
-kernel_dir = "builds/xnu/83548e279b42f052d6983b43e4c1db539a11b73b-83548e279b"
-kernel_branch = "ws-amp-p3"
-kernel_sha = "83548e279b"
-kernel_uuid = "69CFBE12-A17E-3D94-AC49-BF31DF18973F"
-cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13"
-bootargs = "debug=0xc serial=3 cpus=8 keepsyms=1 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=0x107 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2"
+image = "r5tid17"
+base = "mesa-a1"
+kernel_dir = "builds/xnu/ws-tid-k-ec02376b5c"
+kernel_branch = "ws-tid-k"
+kernel_sha = "ec02376b5c"
+kernel_uuid = "9AF5ACA6-B162-3E61-A3A1-703C66284AA5"
+cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13-tid2"
+# 2026-11-18 (owner-confirmed Touch ID baseline): kernel ws-tid-k ec02376 (Touch ID line + sweettouchid=1), image r5tid17 = base mesa-a1 + cmdline ...-tid2 (keepsyms=1 dropped, sweetfbx=263)
+bootargs = "debug=0xc serial=3 cpus=8 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=263 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2 sweettouchid=1"
 
 # Paths state.py may write (roots) and how the dump is read. Outside roots or under firmware: apply refuses.
 [managed]
@@ -125,6 +126,21 @@ scratch = "/var/local/scratch"
 
 # Runtime values diff checks but that are NOT written to the conf (kernel defaults, boot-args); apply sets them with sctl.
 [sysctl_expect]
+# 2026-11-18 baseline: set at boot by sweettouchid=1 (xnu ws-tid-k), checked only (kern.sweet_touchid_boot lists each errno)
+"kern.sweet_fpc" = 3
+"kern.sweet_passcode" = 1
+"kern.sweet_fb_sleep_blank" = 1
+"kern.sweet_rpmb" = 1
+"kern.sweet_mesa" = 3
+"kern.sweet_mesa_match" = 2
+"kern.sweet_mesa_catacomb" = 7
+"kern.sweet_mesa_offline" = 1
+"kern.sweet_passcode_biostate" = 1
+"kern.sweet_mesa_fix" = 23
+"kern.sweet_mesa_lockout" = 15
+"kern.sweet_passcode_bio_buzz" = 8323084
+"kern.sweet_mesa_fwd_wait_ms" = 15000
+"kern.sweet_mesa_reload" = 1
 "kern.sweet_abm_upwait_ms" = 60000
 "kern.sweet_abp" = 15
 "kern.sweet_abp_publish" = 1
@@ -302,13 +318,13 @@ note = "vmd disabled 2026-10-29 (user decision; revisit with telephony)"
 
 [[file]]
 path = "/System/Library/xpc/launchd.plist"
-source = "state/files/launchd.plist-395dba3a6a"
-sha256 = "395dba3a6a2a9853fb019875609cbf48d5f4af04bf745f207db1386096eef1ed"
+source = "state/files/tid-i/launchd.plist-bfc34f770e"
+sha256 = "bfc34f770ebb6ec732f959000184651b7610d77bc3f20e6bd11106c2931d9f18"
 mode = "644"
 owner = "0:0"
 restart = "reboot"
-hold = "next boot window: adds org.iosonpixel.sweetearly (phone/boot); the phone has ae563fa8 = this minus that job"
-note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs (dropbear, wland, btd, fastrpcd, fstypeovr, sensdprobe, sweetearly), vmd moved out; made by tools/launchd-add-job.py from the phone copy; never in git"
+hold = "Touch ID image only (with the ws-tid-i kernel + sweettouchid=1): the phone's 1bca5063 (org.iosonpixel jobs + com.apple.biometrickitd.mesa) + com.redfin.sweetfpcd. sweetearly (395dba3a's hold) is NOT in it: add it with tools/launchd-add-job.py when both are wanted"
+note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs, com.apple.biometrickitd.mesa (Touch ID, 2026-11-18) and com.redfin.sweetfpcd (phone/fpc, ws-fpcd-d), vmd moved out; made by tools/launchd-add-job.py from the phone copy (state/files/tid-i/launchd.plist-phone-1bca506365); never in git"
 
 [[file]]
 path = "/var/local/bin/a2s"
@@ -675,14 +691,15 @@ owner = "0:0"
 
 [[file]]
 path = "/var/local/lib/SweetFPS.dylib"
-source = "builds/userland/27efaa0b29ea0e12a4959630fdec03dcde98d01f-27efaa0b29/SweetFPS.dylib"
-sha256 = "75766529f848e8713954cd23a53a01c0c0e8fa676c7aaf86dbf904d7472e5c8d"
+source = "builds/userland/ws-u-tidui-4f9fe4b631/SweetFPS.dylib"
+sha256 = "44dea91e9b3f61298fe649667393c3834e79f4618bb7717894fc6f65d1e0cc9e"
 mode = "644"
 owner = "0:0"
 restart = "SpringBoard"
 target = "userland"
-ref = "27efaa0b29ea0e12a4959630fdec03dcde98d01f"
-sha = "27efaa0b29"
+ref = "ws-u-tidui"
+sha = "4f9fe4b"
+note = "2026-11-18 Touch ID baseline: ws-u-tidui 4f9fe4b (padlock)"
 
 [[file]]
 path = "/var/local/lib/SweetHaptics.dylib"
@@ -757,8 +774,8 @@ sha = "0efcd47c3c"
 
 [[file]]
 path = "/var/local/bin/qseeprobe"
-source = "builds/userland/ws-qsee-a-d84238f71e/qseeprobe"
-sha256 = "a1fb8a8ab46892c81cc5bf7a8cb5445bc8cd17296924bfa8e69344d73be6ecf2"
+source = "builds/userland/ws-fpcd-a-54a263b99d/qseeprobe"
+sha256 = "faa162159b68d7e375e2903fa388d91d561d1099dd045dd7a8268e0e93608c62"
 mode = "755"
 owner = "0:0"
 target = "userland (phone/qsee only: qseeprobe)"
@@ -3756,3 +3773,77 @@ reason = "old sensd variant (1970 date, 106800 B): no source found on any branch
 path = "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver/RedwoodAudio.pre-s4"
 reason = "backup binary (dcc81fd) kept inside the plug-in bundle: the build has it in builds/userland"
 
+# ---- 2026-11-18 Touch ID native start (BASELINE, owner-confirmed; touchid-integration-2026-11-18.md) ----
+# Kernel: ws-tid-k ec02376 (Touch ID line incl. boot-arg sweettouchid). The switch set comes from
+# the boot-arg sweettouchid=1 in the image cmdline (agent/stage/cmdline.bb19u15-ubwc2-xr13-tid2), NOT from [sysctl]:
+# the conf is applied by sensdprobe after launchd starts, too late for biometrickitd's IOKit launch event.
+
+[[file]]
+path = "/usr/lib/libBKDM1.dylib"
+source = "<PF copy of ~/fpr2/bkdm1/out/libBKDM1.v3.dylib: Apple file, never in git>"
+sha256 = "c94b5e50076667056786d07dd14ef876b8569b09fb4594ae66cdf8228a66b49f"
+mode = "755"
+owner = "0:0"
+restart = "reboot"
+note = "relinked iPhone 8 20H392 libBKDM1 (fingerprint-bkdm1-relink-2026-11-18.md); Apple file: source stays in the project folder"
+
+[[file]]
+path = "/System/Library/LaunchDaemons/com.apple.biometrickitd.mesa.plist"
+source = "phone/fpc/com.apple.biometrickitd.mesa.plist"
+sha256 = "03e2c5efdf8c918f3d78b5fa7148eedd0dc373ecfdcf8934c5ef217676ffb191"
+mode = "644"
+owner = "0:0"
+restart = "reboot"
+note = "reference copy only: launchd reads the job from launchd.plist (merged)"
+
+[[file]]
+path = "/var/local/bin/sweetfpcd"
+source = "builds/userland/ws-fpcd-e-8752bdcca5/sweetfpcd"
+sha256 = "fbb371ae50938dcdbf50d56b794eddfcb5adbf35494ea831c6928604eba3906a"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "ws-fpcd-e"
+sha = "8752bdc"
+restart = "sweetfpcd"
+note = "launchd job com.redfin.sweetfpcd (KeepAlive): sweetctl kill sweetfpcd restarts it with the new binary"
+
+[[bundle]]
+path = "/var/local/fpc/ta"
+source = "firmware-copy"
+firmware = true
+files = { "fpctzappfingerprint.b00" = "1a5c5eb4296244f1189b1589d175720c4307807d14056c38f9b498463bf26794", "fpctzappfingerprint.b01" = "33b17d9f350bce5d867a88b041a35cdd5e2b73371516b5f03dfcb7192ea8b66e", "fpctzappfingerprint.b02" = "ef048bfdb15ad7127b6a6ab5a21a96a8167ba895162148b56e2c67daea706ebb", "fpctzappfingerprint.b03" = "8553f23b2bf81fd81151f3d47a8c1b98f4f93a96d379c5fa62430c2d1691ae6d", "fpctzappfingerprint.b04" = "15ade50a4b2c566be83fc5a019cf27c333ba33c4af5de0c4754f5fee673a9219", "fpctzappfingerprint.b05" = "aaf07cff6555293e06be8338d00bc06a188289cd23d867d49e790beafe0db8ca", "fpctzappfingerprint.b06" = "9fbe711e824651d845255cf12c0463171675fce8c2b50b47d5acbe98943d1410", "fpctzappfingerprint.b07" = "d54b474b9cc570635ab791297620110ebc35ce6a50002f65a59869d6374a9586", "fpctzappfingerprint.mdt" = "af350df5dd0dfdda7ddfc1781641e8d858579ffb99d55f7bfbf7d80062542f40" }
+note = "the stock FPC fingerprint TA from the phone's own vendor partition: never in git, never written by state.py"
+
+[[flag]]
+path = "/var/local/fpc/gk-test.pw"
+secret = true
+sha256 = "<adopt from the phone: secret, never printed>"
+mode = "600"
+note = "STOP-GAP enrol credential (gk-test-file) until the kernel-derived GK password (audit 5.4); not needed for matching"
+
+[[flag]]
+path = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist"
+secret = true
+sha256 = "<adopt from the phone>"
+source = "<PF copy of the phone's MG cache with the keys below>"
+restart = "reboot"
+note = "CacheExtra 8Shl+AdVKo09f1Sldkb0kA (touch-id) = true (isTouchIDPlatform, libBKDM1 init) and z5G/N9jcMdgPm8UegLwbKg = true (lock-screen padlock, touchid-lockui). MG rewrites this file: re-adopt after any MG rebuild"
+
+[[flag]]
+path = "/var/local/sweettidui"
+sha256 = "x"
+mode = "644"
+note = "1-byte switch file (\"h\") for the Touch ID lock-screen UI (SweetFPS padlock)"
+
+[[flag]]
+path = "/var/local/fpc/allow-match"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "600"
+note = "empty marker file: sweetfpcd allows matching"
+
+[[process]]
+name = "sweetfpcd"
+
+[[process]]
+name = "biometrickitd"
