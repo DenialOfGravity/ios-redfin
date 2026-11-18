@@ -192,7 +192,10 @@ static int fpc_wait_high(int ms)
  *   1 and 4 = acquired TOO_FAST (5), 3 = INSUFFICIENT (2), 2 = logged as "capture_status" error; on any non-zero
  *   result capture_image sends cmd 5 and the caller starts over at cmd 2. Negative = FPC_ERROR_* (fpc_error_str).
  * Loops until cmd 4 gives 0 (exit 0), the overall timeout (default 60000 ms, exit 6), a TA/TZ error (exit 5/3/4)
- * or QSEE_FD_MAXITER rounds (default 300). One line per round.
+ * or QSEE_FD_MAXITER rounds (default 300). QSEE_FD_NOSTOP=1 keeps going after status 0. One line per round: wake time
+ * after arming, cmd 1 status + data words +8..+0x14, cmd 4 status / tries / words, irqs since start.
+ * hal.dis: sensor_command's callers are only sensor_init (0, 5), sensor_release (5) and capture_image (2, 1, 3, 4, 5);
+ * cmd 1's return is dropped (bl at 0xec4c, w0 unused), and only cmd 4's +0x10 is kept (ctx+0x48, never read again).
  */
 static int cmd_finger_detect(uint32_t appid, int ms)
 {
@@ -200,6 +203,8 @@ static int cmd_finger_detect(uint32_t appid, int ms)
 		return 2;
 	const char *e = getenv("QSEE_FD_MAXITER");
 	int maxiter = e && atoi(e) > 0 ? atoi(e) : 300;
+	const char *ns = getenv("QSEE_FD_NOSTOP");	/* 1: keep looping after a good image (compare finger on/off) */
+	int nostop = ns && atoi(ns);
 	uint8_t d[FPC_SENSOR_LEN] = { 0 };
 	int32_t st = 0;
 	struct timespec t0;
@@ -230,11 +235,12 @@ static int cmd_finger_detect(uint32_t appid, int ms)
 			break;
 		}
 		int32_t st1 = 0;
-		r = fd_cmd(appid, d, 1, &st1);	/* the HAL ignores this status */
+		r = fd_cmd(appid, d, 1, &st1);	/* the HAL ignores this status and never reads its data */
 		if (r && r != 5) {
 			rc = r;
 			break;
 		}
+		uint32_t w1[4] = { rd_u32(d + 8), rd_u32(d + 0xc), rd_u32(d + 0x10), rd_u32(d + 0x14) };
 		int32_t st4 = 0;
 		int tries = 0, timeout = 0;
 		for (tries = 1; tries <= 4; tries++) {
@@ -252,9 +258,9 @@ static int cmd_finger_detect(uint32_t appid, int ms)
 			if (st4 != 3)
 				break;
 		}
-		say("fd %d: wake %ld ms, cmd1 %d, capture tries %d, cmd4 %d%s, result(+0x10) %#x, irqs %u", round, t_wake, st1,
-		    tries > 4 ? 4 : tries, st4, timeout ? " (timeout in capture wait)" : "", rd_u32(d + 0x10),
-		    fpc_sysctl_u32("kern.sweet_fpc_irq") - irq_start);
+		say("fd %d: wake %ld ms | cmd1 %d [+8..+0x14 %x %x %x %x] | cmd4 %d after %d tr%s [%x %x %x %x] | irqs %u",
+		    round, t_wake, st1, w1[0], w1[1], w1[2], w1[3], st4, tries > 4 ? 4 : tries, timeout ? " TIMEOUT" : "",
+		    rd_u32(d + 8), rd_u32(d + 0xc), rd_u32(d + 0x10), rd_u32(d + 0x14), fpc_sysctl_u32("kern.sweet_fpc_irq") - irq_start);
 		if (timeout)
 			break;
 		if (r && r != 5) {
@@ -263,7 +269,8 @@ static int cmd_finger_detect(uint32_t appid, int ms)
 		}
 		if (st4 == 0) {
 			rc = 0;
-			break;
+			if (!nostop)
+				break;
 		}
 		if (st4 < 0) {
 			say("fd %d: cmd 4 FPC error %d", round, st4);
