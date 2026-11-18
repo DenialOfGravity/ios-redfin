@@ -2817,6 +2817,7 @@ struct shot {
 	unsigned        frames, waited, lit;
 	uint32_t        lines, gain;    /* the exposure asked for it */
 	float           digital;        /* ... and the processor's gain with it */
+	uint32_t        dgain;          /* redfin (camera-flashae2): ... and the sensor's digital gain (EXPOSURE.d, 256 = 1x; 0: 1x as before) */
 	uint64_t        t0, asked_at, fired_at;         /* ms (redwood_camera_ms) and frame numbers */
 	unsigned        fires, lit_frames;              /* main flashes asked for (a lit frame missed: asked again), frames lit by one */
 	char            seen[96];                       /* the frames read while waiting for the lit one ("+n" after fired_at, "*" lit) */
@@ -3100,9 +3101,29 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 					want = shot.amb_e * shot.amb_digital / 4;
 				}
 				uint32_t lines = sixtieth < most_lines ? sixtieth : most_lines;
-				double g;
+				double g, sensor_dg = 1;
+				/*
+				 * redfin (2026-11-18, /private/var/local/camera-flashae2): in a dim room the photograph with the flash came
+				 * out 10x darker than without (metered 30.7 for a target of 767): it was given 1/60 s, the analog gain
+				 * (8x) and at most 4x of the processor's, with the sensor's digital gain put back to 1x -- the ambient
+				 * exposure had 66 ms x 8x x 10x of the sensor's digital gain, and the main flash (300 mA, a weak LED for
+				 * a room) adds less than the room's own light. With it: up to 1/30 s (no longer than the ambient
+				 * exposure; the kernel's 100 ms flash still lights a whole frame of that) when the analog gain is not
+				 * enough at 1/60 s, then the sensor's digital gain as AE uses it, then the processor's.
+				 */
+				bool flashae2 = access("/private/var/local/camera-flashae2", F_OK) == 0;
+				uint32_t dg_unity = f->reserved[REDWOOD_CAMERA_R_DGAIN] & 0xffff, dg_top = f->reserved[REDWOOD_CAMERA_R_DGAIN] >> 16;
+				double dg_max = dg_unity != 0 && dg_top > dg_unity ? (double)dg_top / dg_unity : 1;
 
 				lines = lines < 4 ? 4 : lines;
+				if (flashae2 && want > lines * analog_max) {
+					uint32_t thirtieth = f->line_ns ? (uint32_t)(1e9 / 30 / f->line_ns) : lines;
+					uint32_t longest = thirtieth < shot.amb_lines ? thirtieth : shot.amb_lines;
+
+					longest = longest > lines ? longest : lines;
+					lines = want / analog_max < longest ? (uint32_t)(want / analog_max) : longest;
+					lines = lines < 4 ? 4 : lines;
+				}
 				if (want < lines) {
 					lines = want < 4 ? 4 : (uint32_t)want;
 				}
@@ -3110,10 +3131,19 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				g = g < 1 ? 1 : g;
 				double analog = g < analog_max ? g : analog_max, digital = g / analog;
 
+				if (flashae2 && digital > 1 && dg_max > 1) {
+					sensor_dg = digital < dg_max ? digital : dg_max;
+					digital /= sensor_dg;
+				}
 				digital = digital > 4 ? 4 : digital < 1 ? 1 : digital;
 				shot.lines = lines;
 				shot.gain = (uint32_t)(analog * unity + 0.5);
 				shot.digital = (float)digital;
+				shot.dgain = flashae2 && dg_max > 1 ? (uint32_t)(sensor_dg * 256 + 0.5) : 0;
+				if (flashae2) {
+					say("flash: camera-flashae2: %.2f ms x %.2fx analog x %.2fx sensor x %.2fx ISP for %.0f line-gains (sensor digital "
+					    "up to %.1fx)", lines * (double)f->line_ns / 1e6, analog, sensor_dg, digital, want, dg_max);
+				}
 				shot.state = SHOT_METERED;
 				shot.frames = 0;
 				say("flash: +%llu ms frame %llu: pre-flash done (%u lit frames): ambient %.3f/unit, flash %.3f/unit at %u mA (x%.1f "
@@ -3130,10 +3160,10 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			/* (the photograph's exposure asked for, after the pre-flash's off: one FLASH command waits in the kernel at a time) */
 			bool has_dgain = (f->reserved[REDWOOD_CAMERA_R_DGAIN] >> 16) != 0;
 			struct redwood_camera_command e = { .command = REDWOOD_CAMERA_EXPOSURE, .a = shot.lines, .b = shot.gain, .c = 0,
-				.d = has_dgain ? 256 : 0 };
+				.d = has_dgain ? (shot.dgain ? shot.dgain : 256) : 0 };
 
 			(void)write(device, &e, sizeof(e));
-			isp.sensor_digital = has_dgain ? 1 : isp.sensor_digital;
+			isp.sensor_digital = has_dgain ? e.d / 256.0f : isp.sensor_digital;
 			isp.asked = false;
 			isp.digital = shot.digital;
 			shot.state = SHOT_EXPOSING;
