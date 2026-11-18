@@ -4,8 +4,8 @@ Date: Wed, 18 Nov 2026 12:00:00 +0100
 Subject: [PATCH] 1190 redfin: FPC fingerprint GPIOs (reset gpio16, irq gpio112), kern.sweet_fpc default 0
 
 bsd/dev/sweet_fpc.c: the stock fpc1020_platform_tee hw_reset sequence on
-TLMM gpio16 (kern.sweet_fpc bit 1) and the gpio112 rising-edge interrupt
-on the TLMM summary interrupt, chained from sec_ts's handler (bit 2),
+TLMM gpio16 (kern.sweet_fpc value 1) and the gpio112 rising-edge interrupt
+on the TLMM summary interrupt, chained from sec_ts's handler (value 2),
 kern.sweet_fpc_irq (count), kern.sweet_fpc_wait (block until gpio112 is
 high, N ms), kern.sweet_fpc_state. Default 0: both pins untouched, no log.
 The SPI bus stays with TrustZone.
@@ -27,7 +27,7 @@ index ca0d42a..eae0c15 100644
  bsd/dev/sweet_cam.c			standard
 diff --git a/bsd/dev/sweet_fpc.c b/bsd/dev/sweet_fpc.c
 new file mode 100644
-index 0000000..9bd1515
+index 0000000..fe384d0
 --- /dev/null
 +++ b/bsd/dev/sweet_fpc.c
 @@ -0,0 +1,300 @@
@@ -40,18 +40,18 @@ index 0000000..9bd1515
 + *   reset = TLMM gpio16 (EAST tile, active low; pinctrl fpc_reset_low/high)
 + *   irq   = TLMM gpio112 (WEST tile, input, bias pull-down; high while a sensor event is pending)
 + *
-+ * kern.sweet_fpc (RW, default 0 = untouched: gpio16 and gpio112 stay exactly as the bootloader left them and
++ * kern.sweet_fpc (RW, bit values 1 and 2, default 0 = untouched: gpio16 and gpio112 stay exactly as the bootloader left them and
 + * nothing is logged):
-+ *   bit 1  hw_reset as the stock driver: reset high 100 us, low 5 ms, high 5 ms (left released = high), gpio112
++ *   1  hw_reset as the stock driver: reset high 100 us, low 5 ms, high 5 ms (left released = high), gpio112
 + *          as input pull-down; logs "SWEET FPC reset done irq=<gpio112 level>" (stock: "IRQ after reset 1").
-+ *          Runs on every write that has the bit set.
-+ *   bit 2  gpio112 rising-edge interrupt (stock: IRQF_TRIGGER_RISING) on the TLMM summary interrupt (INTID 240,
++ *          Runs on every write that has value 1 set.
++ *   2  gpio112 rising-edge interrupt (stock: IRQF_TRIGGER_RISING) on the TLMM summary interrupt (INTID 240,
 + *          owned by sec_ts touch, which hands other pins' status to sweet_fpc_tlmm_irq()). Counts events in
 + *          kern.sweet_fpc_irq (RO) and logs each "SWEET FPC irq n=N t=US level=L" (at most 8 lines per wakeup).
-+ *          Clearing the bit restores gpio112's boot INTR_CFG.
++ *          Clearing value 2 restores gpio112's boot INTR_CFG.
 + * kern.sweet_fpc_wait (RW int): write N ms (1..60000) = block until gpio112 is high (the level, like the HAL's
 + *   fpc_irq_wait on the sysfs "irq" attribute) or N ms pass; the same call reads back 1 (high) or 0 (timeout).
-+ *   Woken by the interrupt when bit 2 is on and the summary interrupt is live; otherwise polls every 5 ms.
++ *   Woken by the interrupt when value 2 is on and the summary interrupt is live; otherwise polls every 5 ms.
 + * kern.sweet_fpc_state (RO string): "rst=gpio16 out=O oe=E cfg=C irq=gpio112 in=I cfg=C intr=C irqs=N mode=M".
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -232,7 +232,7 @@ index 0000000..9bd1515
 +	if (error || !changed) {
 +		return error;
 +	}
-+	if (value & ~6) {
++	if (value & ~3) {
 +		return EINVAL;
 +	}
 +	lck_mtx_lock(&fpc_lock);
@@ -241,18 +241,18 @@ index 0000000..9bd1515
 +		lck_mtx_unlock(&fpc_lock);
 +		return ENXIO;
 +	}
-+	if (value & 2) {
++	if (value & 1) {
 +		fpc_reset();
 +	}
-+	if ((value & 4) != (fpc_mode & 4)) {
-+		fpc_irq_enable(value & 4);
++	if ((value & 2) != (fpc_mode & 2)) {
++		fpc_irq_enable(value & 2);
 +	}
 +	fpc_mode = value;
 +	lck_mtx_unlock(&fpc_lock);
 +	return 0;
 +}
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sweet_fpc, "I", "1190 FPC fingerprint GPIOs: bit 1 reset, bit 2 irq (0 = untouched)");
++    0, 0, sysctl_sweet_fpc, "I", "1190 FPC fingerprint GPIOs: 1 reset, 2 irq, 3 both (0 = untouched)");
 +
 +SYSCTL_UINT(_kern, OID_AUTO, sweet_fpc_irq, CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)(uintptr_t)&fpc_irqs, 0,
 +    "1190 FPC gpio112 interrupts");
