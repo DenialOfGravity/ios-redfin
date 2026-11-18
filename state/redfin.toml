@@ -3778,23 +3778,23 @@ reason = "backup binary (dcc81fd) kept inside the plug-in bundle: the build has 
 # the boot-arg sweettouchid=1 in the image cmdline (agent/stage/cmdline.bb19u15-ubwc2-xr13-tid2), NOT from [sysctl]:
 # the conf is applied by sensdprobe after launchd starts, too late for biometrickitd's IOKit launch event.
 
-[[file]]
+[[flag]]
 path = "/usr/lib/libBKDM1.dylib"
-source = "<PF copy of ~/fpr2/bkdm1/out/libBKDM1.v3.dylib: Apple file, never in git>"
+secret = true
 sha256 = "c94b5e50076667056786d07dd14ef876b8569b09fb4594ae66cdf8228a66b49f"
 mode = "755"
-owner = "0:0"
 restart = "reboot"
-note = "relinked iPhone 8 20H392 libBKDM1 (fingerprint-bkdm1-relink-2026-11-18.md); Apple file: source stays in the project folder"
+source_note = "Apple file: never in git, kept in the project folder / PF only"
+note = "relinked iPhone 8 20H392 libBKDM1 (fingerprint-bkdm1-relink-2026-11-18.md); copy lives in ~/fpr2/bkdm1/out/libBKDM1.v3.dylib"
 
-[[file]]
+[[flag]]
 path = "/System/Library/LaunchDaemons/com.apple.biometrickitd.mesa.plist"
-source = "phone/fpc/com.apple.biometrickitd.mesa.plist"
+secret = true
 sha256 = "03e2c5efdf8c918f3d78b5fa7148eedd0dc373ecfdcf8934c5ef217676ffb191"
 mode = "644"
-owner = "0:0"
 restart = "reboot"
-note = "reference copy only: launchd reads the job from launchd.plist (merged)"
+source_note = "Apple file: never in git, kept in the project folder / PF only"
+note = "iPhone 8 biometrickitd.mesa plist; reference only, launchd reads the job from the merged launchd.plist"
 
 [[file]]
 path = "/var/local/bin/sweetfpcd"
