@@ -647,6 +647,7 @@ sweet_pc_lock(void)
  */
 int sweet_pc_bio_unlock(int *did_unlock, const char **why);
 void sweet_pc_bio_failed(void);
+int sweet_pc_bio_allowed(const char **why);
 
 int
 sweet_pc_bio_unlock(int *did_unlock, const char **why)
@@ -693,6 +694,36 @@ sweet_pc_bio_unlock(int *did_unlock, const char **why)
 		pc_notify("unlocked (Touch ID)");
 	}
 	return e;
+}
+
+/*
+ * 1202: the same rules as sweet_pc_bio_unlock without unlocking anything (SweetMesa 39 GetSKSLockState asks this
+ * for the "no bio lockout" bit). No passcode lock at all also counts as allowed (nothing to enforce).
+ */
+int
+sweet_pc_bio_allowed(const char **why)
+{
+	*why = "";
+	int m = sweet_pc_mode();
+	if (m == 0 || m == 2 || !sweet_pc_is_set()) {
+		return 1;
+	}
+	int ok = 0;
+	clock_sec_t now = pc_now();
+	lck_mtx_lock(&sweet_pc_lck);
+	if (pc_pass_ok_at == 0) {
+		*why = "passcode required after restart";
+	} else if (now - pc_pass_ok_at > PC_BIO_TTL_S) {
+		*why = "passcode required (48 h since the last passcode)";
+	} else if (pc_bio_fails >= PC_BIO_MAX_FAILS) {
+		*why = "passcode required (5 failed Touch ID attempts)";
+	} else if (pc_backoff_left() > 0) {
+		*why = "passcode backoff";
+	} else {
+		ok = 1;
+	}
+	lck_mtx_unlock(&sweet_pc_lck);
+	return ok;
 }
 
 void
