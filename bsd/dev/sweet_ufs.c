@@ -287,6 +287,11 @@ static uint32_t ufs_sim_fail;           /* kern.sweet_ufs_recover_test=1: the ne
 extern int sweet_ufs_diag;
 int sweet_ufs_diag;                     /* 1077: kern.sweet_ufs_diag (0 off) */
 static void udx_on_timeout(uint8_t op);
+/* 1191 (redfin-ufs-rpmb): LUN override for the RPMB W-LUN, SCSI status + autosense of the last command */
+static uint8_t ufs_lun_ovr;             /* nonzero: UPIU LUN of the next commands (0xC4 = RPMB W-LUN) */
+static bool ufs_quiet;                  /* no "failed" line (RPMB: CHECK CONDITION is an answer, not an error) */
+static uint8_t ufs_last_status;         /* SCSI status of the last command, 0xff = none (OCS error, timeout) */
+static uint8_t ufs_last_sense[18];
 
 static int
 ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
@@ -301,8 +306,9 @@ ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 
 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
-	ucd->cmd[2] = su.lun;
+	ucd->cmd[2] = ufs_lun_ovr ? ufs_lun_ovr : su.lun;
 	ucd->cmd[3] = ++su.tag;
+	ufs_last_status = 0xff;
 	ucd->cmd[12] = (uint8_t)(len >> 24);
 	ucd->cmd[13] = (uint8_t)(len >> 16);
 	ucd->cmd[14] = (uint8_t)(len >> 8);
@@ -413,6 +419,18 @@ ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 
 	uint32_t ocs = utrd->dw2 & 0xff;
 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+		bzero(ufs_last_sense, sizeof(ufs_last_sense));
+		if (!ocs && ucd->resp[0] == 0x21 && !ucd->resp[6]) {
+			uint16_t dsl = (uint16_t)(ucd->resp[10] << 8 | ucd->resp[11]);
+			uint16_t sl = (uint16_t)(ucd->resp[32] << 8 | ucd->resp[33]);
+			ufs_last_status = ucd->resp[7];
+			if (dsl >= 2 && sl) {
+				memcpy(ufs_last_sense, &ucd->resp[34], MIN(sl, sizeof(ufs_last_sense)));
+			}
+		}
+		if (ufs_quiet) {
+			return EIO;
+		}
 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
 		if (sweet_ufs_recover >= 1) {
@@ -420,6 +438,7 @@ ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 		}
 		return EIO;
 	}
+	ufs_last_status = 0;
 	return 0;
 }
 
@@ -756,6 +775,345 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 	printf("SWEET UFS REC: command 0x%02x still failing (%d): error to the caller\n", cdb[0], e);
 	return e;
 }
+
+/*
+ * 1191 (redfin-ufs-rpmb): RPMB pass-through for a userland QSEE RPMB listener (qseeprobe), as Linux qseecomd + librpmb do
+ * with SG_IO on the RPMB W-LUN. The kernel never sees the RPMB key: TrustZone builds and checks every MAC and nonce.
+ *   kern.sweet_rpmb       0 off (default, no log), 1 read-only relay (request types 2 counter read, 4 authenticated read),
+ *                         2 read + authenticated write (types 3; the result read 5 is built here). Type 1 (key
+ *                         programming) is refused at every value. Every relayed or refused request is logged at 1/2.
+ *   kern.sweet_rpmb_xfer  root only. newp = {u32 op (1 read, 2 write), u32 nframes (1..64), u32 rel_wr_count,
+ *                         frames}: read = 1 request frame, OUT 1 + IN nframes; write = nframes frames, OUT nframes,
+ *                         OUT a result request, IN 1. oldp = {s32 err, u32 scsi status, u8 sense[18], u16 0,
+ *                         u32 frames out} + the frames. Refusals return EPERM. One UNIT ATTENTION retry of the
+ *                         first OUT only, no other retry, no host reset.
+ *   kern.sweet_rpmb_info  RPMB unit descriptor (block size, count) + geometry bRPMB_ReadWriteSize (QUERY READ
+ *                         DESCRIPTOR, read only), mode and counters.
+ */
+#define RPMB_WLUN_UPIU          0xC4
+#define RPMB_FRAME              512u
+#define RPMB_MAX_FRAMES         64u
+
+static int sweet_rpmb;                  /* 0 off, 1 read only, 2 read/write */
+static struct {
+	uint32_t ops, reads, writes, refused, errors;
+	int query_err;                  /* 1 = not run yet */
+	uint8_t blk_log2, rw_size;
+	uint64_t blocks;
+	uint32_t last_counter;
+	bool have_counter;
+} rpmb = { .query_err = 1 };
+
+static inline uint16_t
+rpmb_be16(const uint8_t *p)
+{
+	return (uint16_t)(p[0] << 8 | p[1]);
+}
+
+static inline uint32_t
+rpmb_be32(const uint8_t *p)
+{
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static const char *
+rpmb_type_name(uint16_t t)
+{
+	switch (t) {
+	case 1: return "key-program";
+	case 2: return "counter-read";
+	case 3: return "auth-write";
+	case 4: return "auth-read";
+	case 5: return "result-read";
+	default: return "unknown";
+	}
+}
+
+/* QUERY REQUEST READ DESCRIPTOR in slot 0 (caller holds sweet_ufs_lock). Returns the descriptor length or -errno. */
+static int
+ufs_query_read_desc(uint8_t idn, uint8_t index, uint8_t *out, unsigned outlen)
+{
+	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
+
+	bzero(utrd, sizeof(*utrd));
+	bzero(ucd, offsetof(struct ucd, prdt));
+	ucd->cmd[0] = 0x16;                     /* QUERY REQUEST UPIU */
+	ucd->cmd[3] = ++su.tag;
+	ucd->cmd[5] = 0x01;                     /* standard read request */
+	ucd->cmd[12] = 0x01;                    /* READ DESCRIPTOR */
+	ucd->cmd[13] = idn;
+	ucd->cmd[14] = index;
+	ucd->cmd[18] = 0;
+	ucd->cmd[19] = 0xff;                    /* length */
+	utrd->dw0 = (1u << 28) | (1u << 24);
+	utrd->dw2 = 0x0f;
+	utrd->ucdba = (uint32_t)ucd_pa;
+	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+	utrd->resp = (512u / 4) << 16 | (512u / 4);
+	dma_sync(DMA_UTRL, sizeof(*utrd));
+	dma_sync(DMA_UCD, offsetof(struct ucd, prdt));
+	__builtin_arm_dsb(0xf);
+	ufs_wr(REG_UTRLDBR, 1);
+	uint64_t deadline;
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &deadline);
+	deadline += mach_absolute_time();
+	while (ufs_rd(REG_UTRLDBR) & 1) {
+		if (mach_absolute_time() > deadline) {
+			ufs_wr(REG_UTRLCLR, ~1u);
+			for (int i = 0; i < 1000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
+				delay(100);
+			}
+			ufs_wr(REG_IS, ufs_rd(REG_IS));
+			printf("SWEET RPMB: query idn %u index 0x%x timed out\n", idn, index);
+			return -ETIMEDOUT;
+		}
+		delay(1);
+	}
+	__builtin_arm_dsb(0xf);
+	ufs_wr(REG_IS, ufs_rd(REG_IS));
+	dma_sync(DMA_UTRL, sizeof(*utrd));
+	dma_sync(DMA_UCD, offsetof(struct ucd, prdt));
+	uint32_t ocs = utrd->dw2 & 0xff;
+	if (ocs || ucd->resp[0] != 0x36 || ucd->resp[6]) {
+		printf("SWEET RPMB: query idn %u index 0x%x failed: ocs 0x%x upiu 0x%x response 0x%x\n",
+		    idn, index, ocs, ucd->resp[0], ucd->resp[6]);
+		return -EIO;
+	}
+	unsigned dsl = (unsigned)ucd->resp[10] << 8 | ucd->resp[11];
+	dsl = MIN(dsl, 512u - 32u);
+	memcpy(out, &ucd->resp[32], MIN(dsl, outlen));
+	return (int)dsl;
+}
+
+static void
+rpmb_query_locked(void)
+{
+	uint8_t d[255];
+	int n = ufs_query_read_desc(0x02, RPMB_WLUN_UPIU, d, sizeof(d));      /* RPMB unit descriptor */
+	if (n < 0x13) {
+		rpmb.query_err = n < 0 ? -n : EIO;
+		return;
+	}
+	rpmb.blk_log2 = d[0x0a];
+	rpmb.blocks = 0;
+	for (int i = 0; i < 8; i++) {
+		rpmb.blocks = rpmb.blocks << 8 | d[0x0b + i];
+	}
+	n = ufs_query_read_desc(0x07, 0, d, sizeof(d));                         /* geometry descriptor */
+	if (n < 0x18) {
+		rpmb.query_err = n < 0 ? -n : EIO;
+		return;
+	}
+	rpmb.rw_size = d[0x17];
+	rpmb.query_err = 0;
+}
+
+static int
+sysctl_sweet_rpmb SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_rpmb, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	if (value < 0 || value > 2) {
+		return EINVAL;
+	}
+	sweet_rpmb = value;
+	printf("SWEET RPMB: mode %d (%s)\n", value, value == 2 ? "read/write" : value == 1 ? "read-only" : "off");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmb, "I",
+    "redfin 1191: RPMB relay 0 off, 1 read-only, 2 read/write (key programming never)");
+
+static int
+sysctl_sweet_rpmb_info SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char s[320];
+	if (su.ready && rpmb.query_err == 1) {
+		lck_mtx_lock(&sweet_ufs_lock);
+		if (rpmb.query_err == 1) {
+			rpmb_query_locked();
+		}
+		lck_mtx_unlock(&sweet_ufs_lock);
+	}
+	int n = snprintf(s, sizeof(s),
+	    "mode=%d ready=%d query_err=%d blk_log2=%u blocks=%llu bytes=%llu rw_size=%u ops=%u reads=%u writes=%u "
+	    "refused=%u errors=%u counter=%s%u",
+	    sweet_rpmb, su.ready, rpmb.query_err, rpmb.blk_log2, rpmb.blocks,
+	    rpmb.blk_log2 < 32 ? rpmb.blocks << rpmb.blk_log2 : 0, rpmb.rw_size, rpmb.ops, rpmb.reads, rpmb.writes,
+	    rpmb.refused, rpmb.errors, rpmb.have_counter ? "" : "unread:", rpmb.last_counter);
+	return SYSCTL_OUT(req, s, (size_t)MIN(n, (int)sizeof(s) - 1) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmb_info, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmb_info,
+    "A", "redfin 1191: RPMB unit (UFS descriptors), mode, counters");
+
+/* SECURITY PROTOCOL OUT (0xB5) / IN (0xA2), protocol 0xEC, SPSP 0x0001, byte length. */
+static int
+rpmb_sec(bool out, uint32_t len)
+{
+	uint8_t cdb[12] = { out ? 0xB5 : 0xA2, 0xEC, 0x00, 0x01, 0, 0,
+		            (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len, 0, 0 };
+	return ufs_scsi_once(cdb, sizeof(cdb), len, out);
+}
+
+static bool
+rpmb_unit_attention(void)
+{
+	return ufs_last_status == 0x02 && (ufs_last_sense[2] & 0x0f) == 0x06;
+}
+
+struct rpmb_xfer_res {
+	int32_t err;
+	uint32_t scsi_status;
+	uint8_t sense[18];
+	uint16_t pad;
+	uint32_t nframes;
+};
+
+static int
+sysctl_sweet_rpmb_xfer SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	if (!req->newptr) {
+		return 0;                       /* nothing to read without a request (sysctl -a) */
+	}
+	if (sweet_rpmb == 0) {
+		return ENOTSUP;
+	}
+	size_t newlen = req->newlen;
+	if (newlen < 12 + RPMB_FRAME || newlen > 12 + RPMB_MAX_FRAMES * RPMB_FRAME) {
+		return EINVAL;
+	}
+	uint32_t hdr[3];
+	int error = SYSCTL_IN(req, hdr, sizeof(hdr));
+	if (error) {
+		return error;
+	}
+	uint32_t op = hdr[0], nf = hdr[1], rwc = hdr[2];
+	uint32_t in_frames = op == 2 ? nf : 1;
+	if ((op != 1 && op != 2) || nf < 1 || nf > RPMB_MAX_FRAMES || newlen != 12 + (size_t)in_frames * RPMB_FRAME) {
+		return EINVAL;
+	}
+	size_t olen = sizeof(struct rpmb_xfer_res) + (size_t)(op == 1 ? nf : 1) * RPMB_FRAME;
+	uint8_t *buf = kalloc_data(MAX((size_t)in_frames * RPMB_FRAME, olen), Z_WAITOK | Z_ZERO);
+	if (!buf) {
+		return ENOMEM;
+	}
+	error = SYSCTL_IN(req, buf, (size_t)in_frames * RPMB_FRAME);
+	char who[32] = "?";
+	proc_selfname(who, sizeof(who));
+	uint16_t t0 = rpmb_be16(buf + 510);
+	/* The filter: every frame of the request, before anything reaches the device. */
+	const char *refuse = NULL;
+	for (uint32_t i = 0; !error && !refuse && i < in_frames; i++) {
+		uint16_t t = rpmb_be16(buf + i * RPMB_FRAME + 510);
+		if (t == 1) {
+			refuse = "key programming is never relayed";
+		} else if (op == 1 && t != 2 && t != 4) {
+			refuse = "read op with a non-read request";
+		} else if (op == 1 && t == 2 && nf != 1) {
+			refuse = "counter read must return 1 frame";
+		} else if (op == 2 && sweet_rpmb < 2) {
+			refuse = "write refused in read-only mode";
+		} else if (op == 2 && t != 3) {
+			refuse = "write op with a non-write frame";
+		} else if (op == 2 && rwc && nf > rwc) {
+			refuse = "more frames than rel_wr_count";
+		}
+	}
+	if (error || refuse) {
+		if (refuse) {
+			rpmb.refused++;
+			printf("SWEET RPMB: REFUSED op %s type 0x%04x (%s) n %u from %s: %s\n", op == 2 ? "write" : "read",
+			    t0, rpmb_type_name(t0), nf, who, refuse);
+			error = EPERM;
+		}
+		kfree_data(buf, MAX((size_t)in_frames * RPMB_FRAME, olen));
+		return error;
+	}
+	if (!su.ready) {
+		kfree_data(buf, MAX((size_t)in_frames * RPMB_FRAME, olen));
+		return ENXIO;
+	}
+
+	struct rpmb_xfer_res res = { 0 };
+	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
+	uint8_t *frames_out = buf;              /* reuse: request frames are not needed after they are sent */
+	int e;
+	lck_mtx_lock(&sweet_ufs_lock);
+	ufs_lun_ovr = RPMB_WLUN_UPIU;
+	ufs_quiet = true;
+	memcpy(bounce, buf, (size_t)in_frames * RPMB_FRAME);
+	e = rpmb_sec(true, in_frames * RPMB_FRAME);
+	if (e == EIO && rpmb_unit_attention()) {
+		printf("SWEET RPMB: unit attention on the first OUT, sent once more\n");
+		memcpy(bounce, buf, (size_t)in_frames * RPMB_FRAME);
+		e = rpmb_sec(true, in_frames * RPMB_FRAME);
+	}
+	if (!e && op == 2) {
+		/* result read request (type 5), built here like librpmb */
+		bzero(bounce, RPMB_FRAME);
+		bounce[511] = 0x05;
+		e = rpmb_sec(true, RPMB_FRAME);
+	}
+	uint32_t out_frames = op == 1 ? nf : 1;
+	if (!e) {
+		e = rpmb_sec(false, out_frames * RPMB_FRAME);
+	}
+	res.err = e;
+	res.scsi_status = ufs_last_status;
+	memcpy(res.sense, ufs_last_sense, sizeof(res.sense));
+	if (!e) {
+		res.nframes = out_frames;
+		bzero(frames_out, olen - sizeof(res));
+		memcpy(frames_out, bounce, (size_t)out_frames * RPMB_FRAME);
+	}
+	ufs_lun_ovr = 0;
+	ufs_quiet = false;
+	lck_mtx_unlock(&sweet_ufs_lock);
+
+	rpmb.ops++;
+	if (op == 1) {
+		rpmb.reads++;
+	} else {
+		rpmb.writes++;
+	}
+	if (e) {
+		rpmb.errors++;
+	}
+	const uint8_t *last = frames_out + (size_t)(res.nframes ? res.nframes - 1 : 0) * RPMB_FRAME;
+	uint16_t rtype = res.nframes ? rpmb_be16(last + 510) : 0, rresult = res.nframes ? rpmb_be16(last + 508) : 0;
+	uint32_t wc = res.nframes ? rpmb_be32(last + 500) : 0;
+	if (!e && rtype == 0x0200 && (rresult & 0x7f) == 0) {
+		rpmb.last_counter = wc;
+		rpmb.have_counter = true;
+	}
+	printf("SWEET RPMB: op %s type 0x%04x (%s) n %u from %s -> err %d status 0x%x sense %02x/%02x/%02x resp 0x%04x "
+	    "result 0x%04x counter %u\n", op == 2 ? "write" : "read", t0, rpmb_type_name(t0), nf, who, e, res.scsi_status,
+	    res.sense[2] & 0x0f, res.sense[12], res.sense[13], rtype, rresult, wc);
+
+	/* oldp: header + frames */
+	uint8_t *o = kalloc_data(olen, Z_WAITOK | Z_ZERO);
+	if (!o) {
+		kfree_data(buf, MAX((size_t)in_frames * RPMB_FRAME, olen));
+		return ENOMEM;
+	}
+	memcpy(o, &res, sizeof(res));
+	if (res.nframes) {
+		memcpy(o + sizeof(res), frames_out, (size_t)res.nframes * RPMB_FRAME);
+	}
+	error = SYSCTL_OUT(req, o, olen);
+	kfree_data(o, olen);
+	kfree_data(buf, MAX((size_t)in_frames * RPMB_FRAME, olen));
+	return error;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmb_xfer, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmb_xfer,
+    "S", "redfin 1191: RPMB frame pass-through (root, kern.sweet_rpmb >= 1)");
 
 static int
 sysctl_sweet_ufs_recover SYSCTL_HANDLER_ARGS
