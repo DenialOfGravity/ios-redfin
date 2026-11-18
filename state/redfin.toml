@@ -3825,14 +3825,14 @@ note = "STOP-GAP enrol credential (gk-test-file) until the kernel-derived GK pas
 [[flag]]
 path = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist"
 secret = true
-sha256 = "<adopt from the phone>"
+sha256 = "99ffd4fcdd65c434cb822a8465707db2918c819b26ac9a2a5677765274e01bf1"
 source = "<PF copy of the phone's MG cache with the keys below>"
 restart = "reboot"
 note = "CacheExtra 8Shl+AdVKo09f1Sldkb0kA (touch-id) = true (isTouchIDPlatform, libBKDM1 init) and z5G/N9jcMdgPm8UegLwbKg = true (lock-screen padlock, touchid-lockui). MG rewrites this file: re-adopt after any MG rebuild"
 
 [[flag]]
 path = "/var/local/sweettidui"
-sha256 = "x"
+sha256 = "aaa9402664f1a41f40ebbc52c9993eb66aeb366602958fdfaa283b71e64db123"
 mode = "644"
 note = "1-byte switch file (\"h\") for the Touch ID lock-screen UI (SweetFPS padlock)"
 
