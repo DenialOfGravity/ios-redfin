@@ -56,7 +56,7 @@
 #
 #   cycle NAME SRC [BASE] [CMDLINE_FILE] [settle=S] [-- CHECK]
 #                              background, one request per kernel test: build xnu SRC locally (SRC = branch or full
-#                              commit; or an existing builds/xnu/... folder = no build) -> mkimage NAME (BASE default from
+#                              commit; tree:REF = git-tree kernel (xnu-main); or an existing builds/xnu[-tree]/... folder = no build) -> mkimage NAME (BASE default from
 #                              agent/cycle-base.txt, '-' = mkimage's default) -> fastboot (to-fastboot if iOS runs) -> boot
 #                              NAME -> wait for "phone answers" -> wait S s (default 20) -> klog with the kernel's KLOG_PA
 #                              (copy in logs/cycle-NAME-klog.txt, panic/CRASH counts) -> CHECK run on the phone over SSH.
@@ -305,11 +305,13 @@ cycle_job() {	# NAME SRC BASE CLFILE SETTLE CHECK   (runs in a background subshe
 	if [ -d "$P/$src" ]; then kdir=${src%/}; echo "kernel folder given: $kdir (no build)"
 	else
 		cy_stage build
-		blog=$P/builds/logs/build-xnu_$(echo "$src" | tr '/' '_')-$(date +%Y%m%d-%H%M%S).log
+		local btgt=xnu bref=$src	# SRC tree:REF = REF of the git-tree kernel (xnu-main, xnu/*; target xnu-tree)
+		[[ $src == tree:* ]] && { btgt=xnu-tree; bref=${src#tree:}; }
+		blog=$P/builds/logs/build-${btgt}_$(echo "$bref" | tr '/' '_')-$(date +%Y%m%d-%H%M%S).log
 		echo "log ${blog#$P/}"
-		timeout 2400 bash "$LB" build xnu "$src" </dev/null >"$blog" 2>&1
+		timeout 2400 bash "$LB" build "$btgt" "$bref" </dev/null >"$blog" 2>&1
 		tail -1 "$blog" | grep -q '^result ok' || { grep -m8 -i -E 'error|fail' "$blog"; tail -3 "$blog"; cy_fail "build failed: ${blog#$P/}"; }
-		kdir=$(sed -n '1s/.* -> \(builds\/xnu\/[^ ]*\)$/\1/p' "$blog")
+		kdir=$(sed -n '1s/.* -> \(builds\/xnu[a-z-]*\/[^ ]*\)$/\1/p' "$blog")
 		[ -n "$kdir" ] && [ -d "$P/$kdir" ] || cy_fail "no kernel folder named in ${blog#$P/}"
 		echo "kernel $kdir"
 	fi
@@ -550,8 +552,8 @@ run_action() {	# one request line
 		[ ${#pos[@]} -ge 2 ] && [ ${#pos[@]} -le 4 ] || { echo "usage: cycle NAME SRC [BASE] [CMDLINE_FILE] [settle=S] [-- CHECK]"; return 1; }
 		ok_name "${pos[0]}" || { echo "bad name (rNN...)"; return 1; }
 		[ -e "$P/${pos[0]}" ] && { echo "${pos[0]} exists: pick a new name"; return 1; }
-		[[ ${pos[1]} =~ ^[A-Za-z0-9._/-]+$ && ${pos[1]} != *..* ]] || { echo "bad SRC"; return 1; }
-		if [ -d "$P/${pos[1]}" ] && [[ ${pos[1]} != builds/xnu/* ]]; then echo "SRC folder: builds/xnu/..."; return 1; fi
+		[[ ${pos[1]} =~ ^(tree:)?[A-Za-z0-9._/-]+$ && ${pos[1]} != *..* ]] || { echo "bad SRC"; return 1; }
+		if [ -d "$P/${pos[1]}" ] && [[ ${pos[1]} != builds/xnu/* && ${pos[1]} != builds/xnu-tree/* ]]; then echo "SRC folder: builds/xnu/... or builds/xnu-tree/..."; return 1; fi
 		local base=${pos[2]:-} cl=${pos[3]:-}
 		[ -z "$base" ] && [ -f "$P/agent/cycle-base.txt" ] && base=$(head -1 "$P/agent/cycle-base.txt" | tr -d '\r ')
 		[ "$cl" = - ] && cl=""
@@ -625,9 +627,10 @@ run_action() {	# one request line
 		lb_bg setup "$rest";;
 	build)
 		read -r tgt ref <<<"$rest"
-		[[ $tgt =~ ^(shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu)$ ]] || { echo "TARGET: shim userland metal2 hmetal hmesa hmetal-mesa xnu"; return 1; }
+		[[ $tgt =~ ^(shim|userland|metal2|hmetal|hmesa|hmetal-mesa|xnu|xnu-tree)$ ]] || { echo "TARGET: shim userland metal2 hmetal hmesa hmetal-mesa xnu xnu-tree"; return 1; }
 		[[ ${ref:-x} =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref"; return 1; }
-		lb_bg build "$tgt" ${ref:-redfin-qol};;
+		local dref=redfin-qol; [ "$tgt" = xnu-tree ] && dref=xnu-main	# xnu-tree: the git-tree kernel
+		lb_bg build "$tgt" ${ref:-$dref};;
 	build-jobs) pgrep -af "localbuild/(lb|build)\.sh" || echo "no local builds running";;
 	build-kill)	# lb.sh runs under setsid: its pid is the process group of the whole build
 		local k=0; for pid in $(pgrep -f "localbuild/lb.sh"); do kill -TERM -- "-$pid" 2>/dev/null && k=1; done
