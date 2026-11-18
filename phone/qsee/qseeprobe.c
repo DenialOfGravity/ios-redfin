@@ -11,6 +11,8 @@
  *   qseeprobe sensor-init ID     ws-qsee-b P4: FPC g10/0 then g10/5 (fpc_tee_sensor_init; QSEE_SENSOR_NO5=1: g10/0 only)
  *   qseeprobe sensor-cmd ID CMD  ws-qsee-b P4: one FPC g10/CMD (sensor_command), 0x58-byte buffer, 64-bit layout
  *   qseeprobe finger-detect ID [MS] ws-qsee-b P4: g10/2, wait for gpio112 high (kern.sweet_fpc_wait, 1190), g10/1
+ *   qseeprobe fp-ids ID          P5: get_finger_ids + db id;  fp-delete ID FID: delete_template FID
+ *   qseeprobe enrol-test ID [MS] P5: empty db, enrol, identify x5, delete (TA memory only, nothing stored)
  *   qseeprobe unload ID          ws-qsee-b: TZ_OS_APP_SHUTDOWN of app ID (must be QSEE_APP's id, never keymaster64)
  *   qseeprobe whitelist          the SMCs this tool may issue
  * A listener request (INCOMPLETE / BLOCKED_ON_LISTENER) is refused as Linux refuses a listener that does not exist,
@@ -239,7 +241,8 @@ int main(int argc, char **argv)
 		con = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (argc < 2) {
 		fprintf(stderr, "usage: qseeprobe version | lookup [NAME...] | load NAME DIR | send-build-info APPID |\n"
-				"       unload APPID | sensor-init APPID | sensor-cmd APPID CMD | finger-detect APPID [MS] | whitelist\n"
+				"       unload APPID | sensor-init APPID | sensor-cmd APPID CMD | finger-detect APPID [MS] |\n"
+				"       fp-ids APPID | fp-delete APPID FID | enrol-test APPID [MS] | whitelist\n"
 				"  env QSEE_DRYRUN=1 (print SMCs only), QSEE_SHMBRIDGE=1 (bridge every buffer),\n"
 				"      QSEE_APP=NAME (send/unload guard), QSEE_SEND=wl|legacy\n");
 		return 1;
@@ -267,6 +270,12 @@ int main(int argc, char **argv)
 		return cmd_sensor((uint32_t)strtoul(argv[2], NULL, 0), "sensor-cmd", (uint32_t)strtoul(argv[3], NULL, 0));
 	if (!strcmp(argv[1], "finger-detect") && (argc == 3 || argc == 4))
 		return cmd_finger_detect((uint32_t)strtoul(argv[2], NULL, 0), argc == 4 ? atoi(argv[3]) : 60000);
+	if (!strcmp(argv[1], "fp-ids") && argc == 3)
+		return cmd_fp_ids((uint32_t)strtoul(argv[2], NULL, 0));
+	if (!strcmp(argv[1], "fp-delete") && argc == 4)
+		return cmd_fp_delete((uint32_t)strtoul(argv[2], NULL, 0), (uint32_t)strtoul(argv[3], NULL, 0));
+	if (!strcmp(argv[1], "enrol-test") && (argc == 3 || argc == 4))
+		return cmd_enrol_test((uint32_t)strtoul(argv[2], NULL, 0), argc == 4 ? atoi(argv[3]) : 180000);
 	if (!strcmp(argv[1], "unload") && argc == 3)
 		return cmd_unload((uint32_t)strtoul(argv[2], NULL, 0));
 	fprintf(stderr, "qseeprobe: unknown command or arguments: %s\n", argv[1]);
