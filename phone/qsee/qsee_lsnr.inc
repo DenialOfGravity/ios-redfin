@@ -298,25 +298,38 @@ static uint32_t serve_rpmb(uint8_t *b, uint32_t sb_len)
 		} else if (off + 512 > sb_len || n < 1 || n > 64 || 0x14 + n * 512 > sb_len) {
 			lg("RPMB req READ: bad layout n %u len %u off %#x -> -1", n, blen, off);
 		} else {
-			uint8_t frame[512], *out = malloc((size_t)n * 512);
-			struct rpmb_res res;
-			memcpy(frame, b + off, 512);
-			int e = out ? rpmb_xfer_read(frame, n, out, &res) : ENOMEM;
-			uint16_t rt = 0, rr = 0;
-			uint32_t wc = 0;
-			if (!e && res.nframes == n) {
-				const uint8_t *last = out + (size_t)(n - 1) * 512;
-				rt = (uint16_t)(last[510] << 8 | last[511]);
-				rr = (uint16_t)(last[508] << 8 | last[509]);
-				wc = (uint32_t)last[500] << 24 | last[501] << 16 | last[502] << 8 | last[503];
+			/* librpmb rpmb_ufs_read: ceil(n / rel_wr_count) chunks; TZ puts one request frame per chunk at off,
+			 * off+512, ...; each chunk = OUT its request frame + IN min(left, rel_wr_count) frames */
+			uint32_t per = rpmb_rwc ? rpmb_rwc : n, chunks = (n + per - 1) / per, left = n, got = 0;
+			uint8_t *out = malloc((size_t)n * 512);
+			int e = out ? 0 : ENOMEM;
+			if (off + chunks * 512 > sb_len)
+				e = EINVAL;
+			for (uint32_t c = 0; !e && c < chunks; c++) {
+				uint32_t k = left < per ? left : per;
+				uint8_t frame[512];
+				struct rpmb_res res;
+				memcpy(frame, b + off + c * 512, 512);
+				uint16_t ft = (uint16_t)(frame[510] << 8 | frame[511]);
+				e = rpmb_xfer_read(frame, k, out + (size_t)got * 512, &res);
+				if (!e && res.nframes != k)
+					e = EIO;
+				const uint8_t *last = out + (size_t)(got + k - 1) * 512;
+				lg("RPMB req READ chunk %u/%u type %#06x (%s) frames %u addr %u -> kernel err %d scsi %#x sense key %#x "
+				   "asc %#x; last resp type %#06x result %#06x counter %u", c + 1, chunks, ft,
+				   ft == 2 ? "counter" : ft == 4 ? "auth-read" : "?", k, (unsigned)(frame[504] << 8 | frame[505]), e,
+				   res.scsi_status, res.sense[2] & 0xf, res.sense[12], e ? 0 : (unsigned)(last[510] << 8 | last[511]),
+				   e ? 0 : (unsigned)(last[508] << 8 | last[509]),
+				   e ? 0 : (unsigned)last[500] << 24 | last[501] << 16 | last[502] << 8 | last[503]);
+				got += e ? 0 : k;
+				left -= k;
+			}
+			if (!e) {
 				memcpy(b + 0x14, out, (size_t)n * 512);
 				st = 0;
 				rlen = n * 512;
 			}
-			lg("RPMB req READ type %#06x (%s) n %u addr %u -> kernel err %d scsi %#x sense key %#x asc %#x; resp type %#06x "
-			   "result %#06x counter %u -> status %d", t, t == 2 ? "counter" : t == 4 ? "auth-read" : "?", n,
-			   (unsigned)(frame[504] << 8 | frame[505]), e, res.scsi_status, res.sense[2] & 0xf, res.sense[12], rt, rr,
-			   wc, st);
+			lg("RPMB req READ type %#06x n %u in %u chunk(s) -> status %d", t, n, chunks, st);
 			free(out);
 		}
 		put_u32(b + 4, (uint32_t)st), put_u32(b + 8, rlen), put_u32(b + 0xc, 0x14);
