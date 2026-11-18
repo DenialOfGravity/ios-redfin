@@ -26,9 +26,9 @@ Non-zero: every surface publishes clientUse + displayUse + gpuHold (category 0) 
  bsd/dev/sweet_gpu.c                   |  31 +-
  iokit/Kernel/arm/SweetAccelerator.cpp | 103 +++++-
  iokit/Kernel/arm/SweetGPUABI.h        |  17 +
- iokit/Kernel/arm/SweetSurface.cpp     | 451 +++++++++++++++++++++++++-
+ iokit/Kernel/arm/SweetSurface.cpp     | 452 +++++++++++++++++++++++++-
  iokit/Kernel/arm/SweetSurface.h       |  23 ++
- 5 files changed, 605 insertions(+), 20 deletions(-)
+ 5 files changed, 606 insertions(+), 20 deletions(-)
 
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 index f53219e..3226be0 100644
@@ -310,7 +310,7 @@ index 5fe5400..cc4f023 100644
      uint64_t handle;              /* object identity */
      uint32_t bytes;               /* set: length; get: requested capacity */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 1a56380..7f92b44 100644
+index 1a56380..eb2c045 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -41,6 +41,8 @@
@@ -441,7 +441,7 @@ index 1a56380..7f92b44 100644
  		return;
  	}
  	char name[32];
-@@ -1475,20 +1491,425 @@ sweet_surface_client_use(void *id, void *category, int delta)
+@@ -1475,20 +1491,426 @@ sweet_surface_client_use(void *id, void *category, int delta)
  }
  
  #define SWEET_SURFACE_STATE_USE         0x18    /* 0983: u64 use counts, category 1 << 32 | category 0 */
@@ -625,13 +625,14 @@ index 1a56380..7f92b44 100644
 +		absolutetime_to_nanoseconds(now - oldest, &ns);
 +	}
 +	IOLog("SWEET SURF INUSE: 5s: mode %d | publishes %u (in use %u) | gpu holds +%u -%u timeout %u overflow %u cancel %u, "
-+	    "held %u (max %u, oldest %llu ms) | submits listed %u (named %u) all-imports %u, surfaces held %u, overflow %u | "
-+	    "imports matched %u unmatched %u | lock waits %u (%llu us, late %u) | in use now %u of %u surfaces (client %u "
-+	    "display %u gpu %u)\n", sweet_inuse_mode, sweet_inuse_st.publish, sweet_inuse_st.publishUsed, sweet_inuse_st.hold,
-+	    sweet_inuse_st.holdEnd, sweet_inuse_st.holdTimeout, sweet_inuse_st.holdOverflow, sweet_inuse_st.cancel, sweet_inuse_n,
-+	    sweet_inuse_st.maxHeld, ns / 1000000, sweet_inuse_st.subListed, sweet_inuse_st.subNamed, sweet_inuse_st.subAll,
-+	    sweet_inuse_st.subHeld, sweet_inuse_st.subOverflow, sweet_inuse_st.importHit, sweet_inuse_st.importMiss,
-+	    sweet_inuse_st.lockWait, sweet_inuse_st.lockWaitNs / 1000, sweet_inuse_st.lockWaitLate, used, total, cu, du, gu);
++	    "held %u (max %u, oldest %llu ms) | in use now %u of %u surfaces (client %u display %u gpu %u)\n", sweet_inuse_mode,
++	    sweet_inuse_st.publish, sweet_inuse_st.publishUsed, sweet_inuse_st.hold, sweet_inuse_st.holdEnd,
++	    sweet_inuse_st.holdTimeout, sweet_inuse_st.holdOverflow, sweet_inuse_st.cancel, sweet_inuse_n, sweet_inuse_st.maxHeld,
++	    ns / 1000000, used, total, cu, du, gu);
++	IOLog("SWEET SURF INUSE: 5s: submits listed %u (named %u) all-imports %u, surfaces held %u, overflow %u | imports "
++	    "matched %u unmatched %u | lock waits %u (%llu us, late %u)\n", sweet_inuse_st.subListed, sweet_inuse_st.subNamed,
++	    sweet_inuse_st.subAll, sweet_inuse_st.subHeld, sweet_inuse_st.subOverflow, sweet_inuse_st.importHit,
++	    sweet_inuse_st.importMiss, sweet_inuse_st.lockWait, sweet_inuse_st.lockWaitNs / 1000, sweet_inuse_st.lockWaitLate);
 +	bzero(&sweet_inuse_st, sizeof(sweet_inuse_st));
 +}
 +
@@ -871,7 +872,7 @@ index 1a56380..7f92b44 100644
  	sweet_surface_client_use(id, category, 1);
  	return kIOReturnSuccess;
  }
-@@ -1496,6 +1917,7 @@ IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, vo
+@@ -1496,6 +1918,7 @@ IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, vo
  IOReturn
  IOSurfaceRootUserClient::trapDecUse(void *id, void *category, void *, void *, void *, void *)
  {
@@ -879,7 +880,7 @@ index 1a56380..7f92b44 100644
  	sweet_surface_client_use(id, category, -1);
  	return kIOReturnSuccess;
  }
-@@ -1530,13 +1952,14 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+@@ -1530,13 +1953,14 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
  }
  
  IOReturn
