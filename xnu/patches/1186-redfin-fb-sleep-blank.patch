@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Wed, 18 Nov 2026 14:00:00 +0100
+Subject: [PATCH] 1186 redfin: kern.sweet_fb_sleep_blank, display off blanks the panel (DCS 0x28)
+
+Default 0: as before (display off leaves DBV 0x4 and the stale panel buffer,
+the boot logo, visible). 1: display off sends the panel's own DCS 0x28
+display off, 10 ms, DCS 0x51 0x000 on the brightness thread; brightness
+requests while blanked are stored only. Display on (always) waits two frames,
+sends DCS 0x29 and the stored level. No sleep-in (0x10), so TE/autorefresh
+keep running and no re-init is needed. Boot-arg sweetfbslp=N. klog
+"SWEET FB sleep-blank on|off".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e7631df..f53219e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1947,6 +1947,10 @@ sysctl_sweet_bl_fix SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_bl_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bl_fix, "I",
+     "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; "
+     "1100/1101: 8 backlight-calibration-parameters (live; restart backboardd)");
++/* 1186: display off blanks the panel (DCS 0x28 + 0x51 0), display on restores it (SweetFramebuffer.cpp) */
++extern uint32_t sweet_fb_sleep_blank;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
++    "SWEET FB 1186: 1 = display off blanks the panel (DCS 0x28, backlight 0), wake restores; 0 = as before");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
+     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6afad39..92b559e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -451,6 +451,9 @@ public:
+ 	uint32_t       fBlFails;
+ 	bool           fBlReq;
+ 	bool           fBlSvc;          /* 1099: AppleARMBacklight published (sweetbl=1) */
++	bool           fSlpWant, fSlpHave;      /* 1186: panel blanked (DCS 0x28) for display off: wanted / sent */
++	void           sleepBlank(bool off);
++	void           sleepBlankSend(bool off);
+ 	bool           blStart(void);
+ 	bool           dsiDcs(const uint8_t *payload, uint32_t len);
+ 	void           blSet(uint32_t level);
+@@ -795,6 +798,59 @@ AppleCLCD::dsiSend(const uint8_t *pkt, uint32_t size)
+ 	return done;
+ }
+ 
++/*
++ * redfin 1186: kern.sweet_fb_sleep_blank (boot-arg sweetfbslp=N), default 0 = as before: at display off the panel
++ * keeps its last level (DBV 0x4 after CoreBrightness's backlight 0) and shows the panel buffer (the stale boot frame).
++ * 1: display off (RequestPowerChange 0, or p disp off) also blanks the panel on the brightness thread, with the
++ * panel's own commands (dsi-panel-s6e3hc2-dvt-dsc-1080p-cmd: the off/lp1 sequences start with DCS 0x28 display off,
++ * then 10 ms; post-nolp ends with DCS 0x29 display on): DCS 0x28, 10 ms, DCS 0x51 0x000. No sleep-in (0x10): the
++ * panel stays out of sleep, so TE and the MDP's autorefresh keep running and nothing has to be re-initialised.
++ * Brightness requests while blanked are only stored. Display on (always, whatever the sysctl says now): two frames
++ * for the redraw to reach the panel RAM, DCS 0x29, then the stored level (0x51). klog "SWEET FB sleep-blank on|off".
++ */
++extern "C" {
++uint32_t sweet_fb_sleep_blank = 0;
++}
++
++void
++AppleCLCD::sleepBlankSend(bool off)
++{
++	bool ok, ok2 = true;
++	if (off) {
++		const uint8_t dispoff[4] = { 0x28, 0x00, 0x05, 0x80 };     /* DCS short write, no parameter, last */
++		ok = dsiSend(dispoff, sizeof(dispoff));
++		IODelay(10000);                                 /* the dtsi's 10 ms after 0x28 */
++		const uint8_t bl0[3] = { 0x51, 0x00, 0x00 };
++		ok2 = dsiDcs(bl0, sizeof(bl0));
++		fBlHave = 0;                                    /* the level goes out again at wake */
++	} else {
++		IODelay(34000);                                 /* two frames: the redraw reaches the panel first */
++		const uint8_t dispon[4] = { 0x29, 0x00, 0x05, 0x80 };
++		ok = dsiSend(dispon, sizeof(dispon));
++		fBlHave = 0;
++	}
++	fSlpHave = off;
++	IOLog("SWEET FB sleep-blank %s (1186: DCS %#x %s%s; level %#x %s)\n", off ? "on" : "off", off ? 0x28 : 0x29,
++	    ok ? "sent" : "NO DMA DONE", off ? (ok2 ? ", 0x51 0 sent" : ", 0x51 0 NO DMA DONE") : "", fBlWant,
++	    off ? "stored" : "follows");
++}
++
++void
++AppleCLCD::sleepBlank(bool off)
++{
++	if (fBlLock == NULL) {
++		return;
++	}
++	bool want = off && (sweet_fb_sleep_blank & 1);
++	IOLockLock(fBlLock);
++	if (want != fSlpWant) {
++		fSlpWant = want;
++		fBlReq = true;
++		IOLockWakeup(fBlLock, &fBlReq, false);
++	}
++	IOLockUnlock(fBlLock);
++}
++
+ void
+ AppleCLCD::blLoop(void *arg)
+ {
+@@ -806,9 +862,14 @@ AppleCLCD::blLoop(void *arg)
+ 		}
+ 		fb->fBlReq = false;
+ 		uint32_t want = fb->fBlWant;
++		bool slp = fb->fSlpWant;        /* 1186 */
+ 		IOLockUnlock(fb->fBlLock);
+-		if (want == fb->fBlHave || fb->fBlFails >= 3) {
+-			continue;
++		if (slp != fb->fSlpHave && fb->fBlFails < 3) {
++			fb->sleepBlankSend(slp);
++			IODelay(16000);
++		}
++		if (fb->fSlpHave || want == fb->fBlHave || fb->fBlFails >= 3) {
++			continue;               /* 1186: blanked: the level is only stored */
+ 		}
+ 		uint8_t cmd[3] = { 0x51, (uint8_t)(want >> 8), (uint8_t)want };
+ 		bool ok = fb->dsiDcs(cmd, sizeof(cmd));
+@@ -857,6 +918,7 @@ AppleCLCD::blStart(void)
+ 		fBlLock = NULL;
+ 		return false;
+ 	}
++	PE_parse_boot_argn("sweetfbslp", &sweet_fb_sleep_blank, sizeof(sweet_fb_sleep_blank));        /* 1186 */
+ 	IOLog("SWEET BL: DSI0 ctrl %#x status %#x trig %#x: brightness via DCS 0x51\n", dsi_rd(fDsi, DSI_CTRL),
+ 	    dsi_rd(fDsi, DSI_STATUS0), dsi_rd(fDsi, DSI_TRIG_CTRL));
+ 	setProperty("IOMFBBrightnessLevel", (unsigned long long)(250u << 16), 32);
+@@ -6160,6 +6222,7 @@ AppleCLCD::fbCmd(const char *s, const char *end)
+ 				sweet_scan_leave(this, "display off");  /* 0989: the fade goes through the panel buffer */
+ 			}
+ 			IOLog("SWEET FB: display %s (p disp set)\n", off ? "off" : "on");
++			sleepBlank(off);        /* 1186 */
+ 			return;
+ 		}
+ 		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
+@@ -7297,6 +7360,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				sweet_scan_leave(fFB, "display off");  /* 0989: the fade goes through the panel buffer */
+ 			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			fFB->sleepBlank(off);   /* 1186 */
+ 		}
+ 		break;
+ 	case kSweetFBGetCurrentAbsoluteTime:
