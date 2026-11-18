@@ -562,10 +562,46 @@ silent_end(id node)
 
 static IMP original_audio_source_start, original_audio_source_stop;
 
+/*
+ * redfin (flag /var/local/camera-tsfix, present = on): the capture audio's silence filling off.
+ * asn_audioUnitRenderProc (CMCapture) takes the gap since the last callback as
+ * AudioConvertHostTimeToNanos(mHostTime - _nextExpectedHostTime), unsigned: a callback one host tick
+ * early (the 48 -> 44.1 kHz conversion of AUHAL makes them) wraps. On Apple's 24 MHz timebase (125/3)
+ * the product overflows to a "negative" gap and nothing happens; on our 19.2 MHz one (625/12) it comes
+ * out as ~1.5e18 ns, which, scaled to 44.1 kHz and cut to 32 bits, asks
+ * -_createSampleBufferForTimestampedAudioBufferList:audioBufferIndex: for ~20.7 M silent frames
+ * (39 MiB) per callback: mediaserverd grew 1.5 GB/s with Live Photo on and was killed. The import
+ * cannot be rebound (the shared cache turned the stub into a direct branch to CoreAudio, there is no
+ * pointer to swap) and -_createSampleBuffer... is called directly, not by message: the node's own
+ * switch, _silenceFramesFillingDisabled, is set instead (the render proc then skips the gap check).
+ * The cost: a real dropout is no longer padded with silence (the next buffer just follows).
+ */
+static void
+audio_source_no_silence_fill(id self)
+{
+	static Ivar ivar;
+	static bool looked;
+
+	if (access("/private/var/local/camera-tsfix", F_OK) != 0) {
+		return;
+	}
+	if (!looked) {
+		looked = true;
+		ivar = class_getInstanceVariable(object_getClass(self), "_silenceFramesFillingDisabled");
+		say("redwood: mediaserverd: camera-tsfix: BWAudioSourceNode._silenceFramesFillingDisabled %s\n",
+		    ivar != NULL ? "found: set" : "NOT found: the silence filling stays on");
+	}
+	if (ivar != NULL) {
+		*((volatile BOOL *)((char *)(void *)self + ivar_getOffset(ivar))) = YES;
+	}
+}
+
 static BOOL
 audio_source_start(id self, SEL selector, id *error)
 {
+	audio_source_no_silence_fill(self);
 	BOOL started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
+	audio_source_no_silence_fill(self);
 	id made = error != NULL ? *error : NULL;
 	static bool said;
 
