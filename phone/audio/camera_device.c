@@ -1521,6 +1521,7 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 #define TORCH_FLAG      "/var/local/camera-torch-ui"
 #define TORCH_LOG       "/var/tmp/camera-torch.log"
 #define TORCH_REARM_S   100             /* < sweettorch_secs (120) */
+#define TORCH_POLL_S    2               /* the kernel's level looked at this often while lit (its own off seen soon) */
 #define TORCH_MAX_S     1800            /* half an hour at most, then off */
 #define TORCH_HOT_DC    600             /* kern.sweet_temp_camera, deci-degC */
 
@@ -1587,11 +1588,97 @@ torch_write(unsigned thousandths)
 	return sysctlbyname("kern.sweet_torch", NULL, NULL, &kernel_level, sizeof(kernel_level));
 }
 
+/*
+ * redfin (2026-11-18): the off the kernel or the keeper decided told to Control Centre. AVFlashlight (SpringBoard)
+ * follows FigFlashlightRemote's kFigFlashlightNotification_Level ({kFigFlashlightNotificationPayloadKey_Value: level}),
+ * which mediaserverd's flashlight server forwards from its FigFlashlight object on the local notification center. That
+ * object is learnt from the notifications it posts itself (a listener for any object, added at the first TorchLevel);
+ * the off is then posted as from it -- and to no object as well, while none has been seen. Each step is logged.
+ */
+typedef void (*cmnc_callback)(const void *center, const void *listener, CFStringRef name, const void *object, CFTypeRef payload);
+static const void *torch_flashlight;    /* the FigFlashlight object, as seen on its own notifications */
+
+static CFStringRef
+torch_symbol(const char *name, CFStringRef otherwise)
+{
+	CFStringRef *p = dlsym(RTLD_DEFAULT, name);
+
+	return p != NULL && *p != NULL ? *p : otherwise;
+}
+
+static void
+torch_heard(const void *center, const void *listener, CFStringRef name, const void *object, CFTypeRef payload)
+{
+	char n[64] = "?";
+	float v = -1;
+
+	(void)center;
+	(void)listener;
+	if (name != NULL) {
+		CFStringGetCString(name, n, sizeof(n), kCFStringEncodingUTF8);
+	}
+	if (payload != NULL && CFGetTypeID(payload) == CFDictionaryGetTypeID()) {
+		CFTypeRef x = CFDictionaryGetValue(payload, torch_symbol("kFigFlashlightNotificationPayloadKey_Value", CFSTR("Value")));
+
+		if (x != NULL && CFGetTypeID(x) == CFNumberGetTypeID()) {
+			CFNumberGetValue(x, kCFNumberFloatType, &v);
+		}
+	}
+	if (object != NULL && object != torch_flashlight) {
+		torch_flashlight = object;
+		torch_log("flashlight object %p learnt from its %s (%.3f)", object, n, v);
+	} else {
+		torch_log("heard %s (%.3f) from %p", n, v, object);
+	}
+}
+
+static void
+torch_ui_listen(void)
+{
+	static bool done;
+	const void *(*center)(void) = dlsym(RTLD_DEFAULT, "CMNotificationCenterGetDefaultLocalCenter");
+	OSStatus (*add)(const void *, const void *, cmnc_callback, CFStringRef, const void *, UInt32) =
+	    dlsym(RTLD_DEFAULT, "CMNotificationCenterAddListener");
+
+	if (done || center == NULL || add == NULL) {
+		return;
+	}
+	done = true;
+	add(center(), &torch_flashlight, torch_heard, torch_symbol("kFigFlashlightNotification_Level", CFSTR("FlashlightLevel")), NULL, 0);
+	add(center(), &torch_flashlight, torch_heard, torch_symbol("kFigFlashlightNotification_Available", CFSTR("FlashlightAvailable")), NULL, 0);
+}
+
+static void
+torch_ui_off(const char *why)
+{
+	const void *(*center)(void) = dlsym(RTLD_DEFAULT, "CMNotificationCenterGetDefaultLocalCenter");
+	OSStatus (*post)(const void *, CFStringRef, const void *, CFTypeRef) = dlsym(RTLD_DEFAULT, "CMNotificationCenterPostNotification");
+	float zero = 0;
+	CFNumberRef value;
+	CFDictionaryRef payload;
+	const void *k, *v;
+
+	if (center == NULL || post == NULL) {
+		torch_log("off not told to Control Centre: no CMNotificationCenter");
+		return;
+	}
+	value = CFNumberCreate(NULL, kCFNumberFloatType, &zero);
+	k = torch_symbol("kFigFlashlightNotificationPayloadKey_Value", CFSTR("Value"));
+	v = value;
+	payload = CFDictionaryCreate(NULL, &k, &v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	OSStatus e = post(center(), torch_symbol("kFigFlashlightNotification_Level", CFSTR("FlashlightLevel")), torch_flashlight, payload);
+	torch_log("off told to Control Centre (%s): Level 0 posted from %p (%d)", why, torch_flashlight, (int)e);
+	CFRelease(payload);
+	CFRelease(value);
+}
+
 /* while lit: the level again before the kernel's time limit; see above */
 static void *
 torch_keep(void *arg)
 {
 	uint64_t since = mach_absolute_time();
+	double rearmed_s = 0;
+	const char *off_why = NULL;
 	mach_timebase_info_data_t tb;
 
 	(void)arg;
@@ -1603,7 +1690,7 @@ torch_keep(void *arg)
 		struct timeval now;
 
 		gettimeofday(&now, NULL);
-		until.tv_sec = now.tv_sec + TORCH_REARM_S;
+		until.tv_sec = now.tv_sec + TORCH_POLL_S;
 		until.tv_nsec = now.tv_usec * 1000;
 		while (torch_want > 0 && generation == torch_generation &&
 		    pthread_cond_timedwait(&torch_cond, &torch_lock, &until) == 0) {
@@ -1613,6 +1700,7 @@ torch_keep(void *arg)
 		}
 		if (generation != torch_generation) {
 			since = mach_absolute_time();   /* a new level: its own time */
+			rearmed_s = 0;
 			continue;
 		}
 		unsigned want = torch_want;
@@ -1622,6 +1710,7 @@ torch_keep(void *arg)
 
 		if (sysctl_int("kern.sweet_torch", &kernel) != 0 || kernel == 0) {
 			why = "the kernel no longer has it lit (fault, time limit or another program)";
+
 		} else if (sysctl_int("kern.sweet_temp_camera", &camera) == 0 && camera >= TORCH_HOT_DC) {
 			why = "the camera block is hot";
 		} else if (lit_s >= TORCH_MAX_S) {
@@ -1633,17 +1722,26 @@ torch_keep(void *arg)
 			torch_want = 0;
 			(void)torch_write(0);
 			torch_log("off after %.0f s: %s (kernel %d, camera %d.%d C)", lit_s, why, kernel, camera / 10, camera % 10);
+			off_why = why;
 			break;
+		}
+		if (lit_s < rearmed_s + TORCH_REARM_S - TORCH_POLL_S / 2.0) {
+			continue;       /* (lit, and not yet time to write it again) */
 		}
 		if (torch_write(want) != 0) {
 			torch_log("again at %u of 1000 NOT TAKEN (%s): off", want, strerror(errno));
 			torch_want = 0;
+			off_why = "the level not taken again";
 			break;
 		}
+		rearmed_s = lit_s;
 		torch_log("again at %u of 1000 after %.0f s (camera %d.%d C)", want, lit_s, camera / 10, camera % 10);
 	}
 	torch_keeper = false;
 	pthread_mutex_unlock(&torch_lock);
+	if (off_why != NULL) {
+		torch_ui_off(off_why);  /* (outside the lock: a listener may ask for a TorchLevel) */
+	}
 	return NULL;
 }
 
@@ -1654,6 +1752,9 @@ torch_set(struct stream *s, CFTypeRef value)
 	uint32_t thousandths;
 	bool ui = torch_ui();
 
+	if (ui) {
+		torch_ui_listen();
+	}
 	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
 		CFNumberGetValue(value, kCFNumberFloatType, &level);
 	}
