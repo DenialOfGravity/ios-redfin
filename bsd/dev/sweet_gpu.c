@@ -1947,6 +1947,10 @@ sysctl_sweet_bl_fix SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, sweet_bl_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bl_fix, "I",
     "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; "
     "1100/1101: 8 backlight-calibration-parameters (live; restart backboardd)");
+/* 1186: display off blanks the panel (DCS 0x28 + 0x51 0), display on restores it (SweetFramebuffer.cpp) */
+extern uint32_t sweet_fb_sleep_blank;
+SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
+    "SWEET FB 1186: 1 = display off blanks the panel (DCS 0x28, backlight 0), wake restores; 0 = as before");
 SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
