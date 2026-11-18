@@ -112,6 +112,17 @@
  *   the 0xe3ff800d re-init. The new process reads 60 (user present, not loaded) and sends 64 again. At most once
  *   per 20 s and 3 times until a load succeeds. Cleared by any successful load (64, 49 for the user, enrol).
  *   kern.sweet_mesa_reload_state: counters.
+ * 1247: boot-arg sweettouchid=N, ONE switch for the tested Touch ID set (touchid-integration-2026-11-18.md), so no
+ *   PC bring-up is needed. Absent / 0: nothing happens (every switch keeps its default). Bit 0: 2 s after
+ *   sweet_ufs init (before launchd), a thread call writes, through the sysctl handlers (same checks and side effects
+ *   as a root `sysctl -w`), in this order: kern.sweet_fpc 3, sweet_passcode 1 (bit 2: 3 = locked at boot; skipped
+ *   when the boot-arg sweetpasscode is given), sweet_fb_sleep_blank 1, sweet_rpmb 1, sweet_mesa_match 2,
+ *   sweet_mesa_catacomb 7, sweet_mesa_offline 1, sweet_passcode_biostate 1, sweet_mesa_fix 0x17,
+ *   sweet_mesa_lockout 0xf, sweet_passcode_bio_buzz 0x7f000c, (bit 1: sweet_mesa_wake 5), sweet_mesa_fwd_wait_ms
+ *   15000, sweet_mesa_reload 1 and LAST kern.sweet_mesa 3, so the persona (and biometrickitd's IOKit launch event)
+ *   comes up with every other switch already set: no "kern.sweet_mesa 0, then 3 + kill biometrickitd" dance. Every
+ *   value stays a normal sysctl, overridable at runtime or by the manifest's boot sysctls. kern.sweet_touchid_boot
+ *   (RO): what was applied ("key=value:err ...").
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -124,6 +135,7 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBSD.h>
+#include <pexpert/pexpert.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSDictionary.h>
@@ -139,6 +151,9 @@ extern "C" {
 }
 
 #define SAY(fmt, ...) IOLog("SWEET MESA: " fmt, ##__VA_ARGS__)
+
+extern "C" int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+extern "C" void sweet_touchid_init(void);
 
 /* ---- bridge interface (phone/fpc/sweetmesa_bridge.h, part 1) ---- */
 #define SMB_DATA_MAX            16376
@@ -3614,4 +3629,79 @@ sysctl_sweet_mesa_wake_state(__unused struct sysctl_oid *oidp, __unused void *ar
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_wake_state, "A", "redfin 1235: screen-off Touch ID wake counters");
+/* ---- 1247: boot-arg sweettouchid: the tested Touch ID set, applied in order before the persona publishes ---- */
+static int gTidBoot;
+static char gTidBootLog[512];
+static thread_call_t gTidTC;
+
+static void
+tid_set(const char *name, int v)
+{
+	size_t n = strlen(gTidBootLog);
+	int e = kernel_sysctlbyname(name, NULL, NULL, &v, sizeof(v));
+	SAY("sweettouchid: %s = %#x -> %d%s\n", name, v, e, e ? " (FAILED: left as it was)" : "");
+	if (n < sizeof(gTidBootLog) - 1) {
+		snprintf(gTidBootLog + n, sizeof(gTidBootLog) - n, "%s%s=%#x:%d", n ? " " : "", name + 5, v, e);
+	}
+}
+
+static void
+tid_boot_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	int pc = 0;
+	SAY("sweettouchid=%#x: applying the Touch ID set (bit 0 set, bit 1 wake, bit 2 locked at boot)\n", gTidBoot);
+	tid_set("kern.sweet_fpc", 3);
+	if (!PE_parse_boot_argn("sweetpasscode", &pc, sizeof(pc))) {
+		tid_set("kern.sweet_passcode", (gTidBoot & 4) ? 3 : 1);
+	} else {
+		SAY("sweettouchid: kern.sweet_passcode left to the boot-arg sweetpasscode=%d\n", pc);
+	}
+	tid_set("kern.sweet_fb_sleep_blank", 1);
+	tid_set("kern.sweet_rpmb", 1);
+	tid_set("kern.sweet_mesa_match", 2);
+	tid_set("kern.sweet_mesa_catacomb", 7);
+	tid_set("kern.sweet_mesa_offline", 1);
+	tid_set("kern.sweet_passcode_biostate", 1);
+	tid_set("kern.sweet_mesa_fix", 0x17);
+	tid_set("kern.sweet_mesa_lockout", 0xf);
+	tid_set("kern.sweet_passcode_bio_buzz", 0x7f000c);
+	if (gTidBoot & 2) {
+		tid_set("kern.sweet_mesa_wake", 5);
+	}
+	tid_set("kern.sweet_mesa_fwd_wait_ms", 15000);
+	tid_set("kern.sweet_mesa_reload", 1);
+	tid_set("kern.sweet_mesa", 3);          /* last: publishes the persona; launchd starts biometrickitd on it */
+	SAY("sweettouchid: done (%s)\n", gTidBootLog);
+}
+
+extern "C" void
+sweet_touchid_init(void)
+{
+	int v = 0;
+	if (!PE_parse_boot_argn("sweettouchid", &v, sizeof(v)) || !(v & 1)) {
+		return;                 /* default: nothing touched */
+	}
+	gTidBoot = v;
+	gTidTC = thread_call_allocate(tid_boot_tc, NULL);
+	if (gTidTC == NULL) {
+		SAY("sweettouchid=%#x: no thread call: NOT applied\n", v);
+		return;
+	}
+	uint64_t dl;
+	clock_interval_to_deadline(2000, kMillisecondScale, &dl);
+	thread_call_enter_delayed(gTidTC, dl);
+	SAY("sweettouchid=%#x: the Touch ID set is applied in 2 s\n", v);
+}
+
+static int
+sysctl_sweet_touchid_boot(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char b[560];
+	snprintf(b, sizeof(b), "sweettouchid=%#x %s", gTidBoot, gTidBootLog[0] ? gTidBootLog : "(nothing applied)");
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_touchid_boot, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_touchid_boot, "A", "redfin 1247: what the boot-arg sweettouchid applied (key=value:errno)");
+
 #endif /* ARM64_BOARD_CONFIG_SWEET */

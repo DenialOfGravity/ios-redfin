@@ -78,6 +78,7 @@ extern void redwood_adsp_init(void);
 extern void sweet_geniuart_init(void);
 extern void sweet_btbridge_init(void);
 extern void sweet_nfc_init(void);
+extern void sweet_touchid_init(void);	/* 1247: iokit/Kernel/arm/SweetMesa.cpp */
 extern void sweet_abp_init(void);
 extern void sweet_cpufreq_init(void);
 extern void sweet_pmem_init(void);
@@ -2314,6 +2315,7 @@ sweet_ufs_init(void)
 	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
 	sweet_btbridge_init();	/* /dev/cu.bluetooth etc. <-> btd (btbridge=1): bsd/dev/sweet_btbridge.c */
 	sweet_nfc_init();	/* 1115/1117: NFC P0 read-only ST54J probe (kern.sweet_nfc_probe=1 or sweetnfc=1; default off): bsd/dev/sweet_nfc.c */
+	sweet_touchid_init();	/* 1247: boot-arg sweettouchid=N: the tested Touch ID set, persona last (default: nothing) */
 	sweet_abp_init();	/* 1061: AppleBasebandPCI stand-in + /dev/abpbridge (sweetabp=1|2): bsd/dev/sweet_abp.c */
 	sweet_usb_probe();
 	return 0;
