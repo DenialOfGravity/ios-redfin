@@ -1,0 +1,140 @@
+redfin 1193: FPC gpio112 storm guard (kern.sweet_fpc bit 1 only): gpio112 stays rising-edge as fpc1020_platform_tee
+(IRQF_TRIGGER_RISING | IRQF_ONESHOT); more than 100 interrupts in 100 ms masks it in the handler ("SWEET FPC irq storm,
+masked"), the next kern.sweet_fpc_wait unmasks. kern.sweet_fpc_state adds storms= masked=. kern.sweet_fpc=0: unchanged.
+
+diff --git a/bsd/dev/sweet_fpc.c b/bsd/dev/sweet_fpc.c
+index fe384d0..58067ef 100644
+--- a/bsd/dev/sweet_fpc.c
++++ b/bsd/dev/sweet_fpc.c
+@@ -19,7 +19,8 @@
+  * kern.sweet_fpc_wait (RW int): write N ms (1..60000) = block until gpio112 is high (the level, like the HAL's
+  *   fpc_irq_wait on the sysfs "irq" attribute) or N ms pass; the same call reads back 1 (high) or 0 (timeout).
+  *   Woken by the interrupt when value 2 is on and the summary interrupt is live; otherwise polls every 5 ms.
+- * kern.sweet_fpc_state (RO string): "rst=gpio16 out=O oe=E cfg=C irq=gpio112 in=I cfg=C intr=C irqs=N mode=M".
++ * kern.sweet_fpc_state (RO string): "rst=gpio16 out=O oe=E cfg=C irq=gpio112 in=I cfg=C intr=C irqs=N mode=M
++ *   storms=S masked=0|1" (1193: storm guard, see FPC_STORM_N).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -44,6 +45,16 @@ extern void thread_deallocate(thread_t);
+ #define TLMM_INTR_CFG   0x8u    /* [0] enable, [1] polarity (1 = high), [3:2] detection (1 = rising), [4] raw, [7:5] target */
+ #define TLMM_INTR_ST    0xcu    /* [0] status, write 0 to clear */
+ #define FPC_INTR_ON     ((3u << 5) | (1u << 4) | (1u << 2) | (1u << 1) | 1u)  /* apps, raw, rising edge, enabled */
++/*
++ * 1193: gpio112 is edge-triggered (rising), as the stock fpc1020_platform_tee driver asks (IRQF_TRIGGER_RISING |
++ * IRQF_ONESHOT) and as Linux pinctrl-msm programs it on lito (detection [3:2] = 1, polarity 1, raw status, KPSS
++ * target): FPC_INTR_ON above is exactly that. Storm guard: more than FPC_STORM_N interrupts within FPC_STORM_MS
++ * masks gpio112 (INTR_CFG enable bit off, status cleared) from the interrupt handler itself, logs
++ * "SWEET FPC irq storm, masked", and only the next kern.sweet_fpc_wait call unmasks it. The shared touch handler
++ * (sweet_sects.c st_irq) still services touch first; with gpio112 masked the summary line no longer carries it.
++ */
++#define FPC_STORM_N     100u
++#define FPC_STORM_MS    100u
+ 
+ static LCK_GRP_DECLARE(fpc_grp, "sweet-fpc");
+ static LCK_MTX_DECLARE(fpc_lock, &fpc_grp);
+@@ -53,6 +64,10 @@ static uint32_t fpc_boot_intr;          /* gpio112 INTR_CFG at the first bit-2 w
+ static bool fpc_boot_saved, fpc_thread_on;
+ static volatile bool fpc_irq_on;        /* read by sweet_fpc_tlmm_irq in interrupt context */
+ static volatile uint32_t fpc_irqs, fpc_logged;
++static volatile bool fpc_storm_masked;          /* 1193: set by the handler, cleared by kern.sweet_fpc_wait */
++static volatile uint32_t fpc_storms, fpc_storms_logged, fpc_win_n;
++static volatile uint64_t fpc_win_t;             /* start of the current FPC_STORM_MS window (mach time) */
++static uint64_t fpc_storm_abs;                  /* FPC_STORM_MS in mach time units, set when the irq is enabled */
+ static volatile uint64_t fpc_irq_t[8];  /* mach time of event n, at [n & 7] */
+ static int fpc_wait_chan, fpc_log_chan;
+ static int fpc_wait_last;
+@@ -126,14 +141,41 @@ sweet_fpc_tlmm_irq(void)
+ 		return false;
+ 	}
+ 	fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++	uint64_t now = mach_absolute_time();
+ 	uint32_t n = fpc_irqs + 1u;
+-	fpc_irq_t[n & 7u] = mach_absolute_time();
++	fpc_irq_t[n & 7u] = now;
+ 	fpc_irqs = n;
++	/* 1193: storm guard (interrupt context: register writes and counters only) */
++	if (fpc_win_t == 0 || now - fpc_win_t > fpc_storm_abs) {
++		fpc_win_t = now;
++		fpc_win_n = 0;
++	}
++	if (++fpc_win_n > FPC_STORM_N) {
++		fpc_wr(fpc_irqp, TLMM_INTR_CFG, FPC_INTR_ON & ~1u);
++		fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++		fpc_storm_masked = true;
++		fpc_storms++;
++		fpc_win_t = 0;
++	}
+ 	thread_wakeup(&fpc_wait_chan);
+ 	thread_wakeup(&fpc_log_chan);
+ 	return true;
+ }
+ 
++/* 1193: kern.sweet_fpc_wait unmasks gpio112 after a storm (under fpc_lock). */
++static void
++fpc_storm_unmask(void)
++{
++	if (fpc_storm_masked && fpc_irq_on && fpc_irqp) {
++		fpc_win_t = 0;
++		fpc_win_n = 0;
++		fpc_storm_masked = false;
++		fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++		fpc_wr(fpc_irqp, TLMM_INTR_CFG, FPC_INTR_ON);
++		printf("SWEET FPC irq unmasked by kern.sweet_fpc_wait (storms %u) level=%u\n", fpc_storms, fpc_level());
++	}
++}
++
+ static void
+ fpc_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -144,6 +186,11 @@ fpc_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 		} else {
+ 			clear_wait(current_thread(), THREAD_AWAKENED);
+ 		}
++		if (fpc_storms_logged != fpc_storms) {
++			fpc_storms_logged = fpc_storms;
++			printf("SWEET FPC irq storm, masked (> %u interrupts in %u ms; storms %u, irqs %u, level=%u); "
++			    "kern.sweet_fpc_wait unmasks\n", FPC_STORM_N, FPC_STORM_MS, fpc_storms, fpc_irqs, fpc_level());
++		}
+ 		uint32_t now = fpc_irqs, lines = 0;
+ 		while (fpc_logged != now && lines < 8u) {
+ 			uint32_t n = ++fpc_logged;
+@@ -177,6 +224,10 @@ fpc_irq_enable(bool on)
+ 		}
+ 		fpc_wr(fpc_irqp, TLMM_INTR_CFG, FPC_INTR_ON & ~1u);
+ 		fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++		nanoseconds_to_absolutetime((uint64_t)FPC_STORM_MS * NSEC_PER_MSEC, &fpc_storm_abs);
++		fpc_win_t = 0;
++		fpc_win_n = 0;
++		fpc_storm_masked = false;
+ 		fpc_irq_on = true;
+ 		fpc_wr(fpc_irqp, TLMM_INTR_CFG, FPC_INTR_ON);
+ 		printf("SWEET FPC irq on (gpio112 rising, INTR_CFG %#x, boot %#x) level=%u\n",
+@@ -185,6 +236,7 @@ fpc_irq_enable(bool on)
+ 		fpc_wr(fpc_irqp, TLMM_INTR_CFG, fpc_boot_intr & ~1u);
+ 		fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
+ 		fpc_irq_on = false;
++		fpc_storm_masked = false;
+ 		fpc_wr(fpc_irqp, TLMM_INTR_CFG, fpc_boot_intr);
+ 		printf("SWEET FPC irq off (INTR_CFG %#x) irqs=%u\n", fpc_rd(fpc_irqp, TLMM_INTR_CFG), fpc_irqs);
+ 	}
+@@ -241,6 +293,7 @@ sysctl_sweet_fpc_wait SYSCTL_HANDLER_ARGS
+ 	}
+ 	lck_mtx_lock(&fpc_lock);
+ 	fpc_map();
++	fpc_storm_unmask();     /* 1193 */
+ 	lck_mtx_unlock(&fpc_lock);
+ 	if (!fpc_irqp) {
+ 		return ENXIO;
+@@ -290,8 +343,9 @@ sysctl_sweet_fpc_state SYSCTL_HANDLER_ARGS
+ 	uint32_t icfg = fpc_rd(fpc_irqp, TLMM_CFG), iio = fpc_rd(fpc_irqp, TLMM_IO);
+ 	uint32_t intr = fpc_rd(fpc_irqp, TLMM_INTR_CFG);
+ 	lck_mtx_unlock(&fpc_lock);
+-	snprintf(s, sizeof(s), "rst=gpio16 out=%u oe=%u cfg=%#x irq=gpio112 in=%u cfg=%#x intr=%#x irqs=%u mode=%d",
+-	    (rio >> 1) & 1u, (rcfg >> 9) & 1u, rcfg, iio & 1u, icfg, intr, fpc_irqs, fpc_mode);
++	snprintf(s, sizeof(s), "rst=gpio16 out=%u oe=%u cfg=%#x irq=gpio112 in=%u cfg=%#x intr=%#x irqs=%u mode=%d storms=%u masked=%d",
++	    (rio >> 1) & 1u, (rcfg >> 9) & 1u, rcfg, iio & 1u, icfg, intr, fpc_irqs, fpc_mode, fpc_storms,
++	    fpc_storm_masked ? 1 : 0);
+ 	return SYSCTL_OUT(req, s, strlen(s) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
