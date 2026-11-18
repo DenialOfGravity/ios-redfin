@@ -793,6 +793,44 @@ static int irq_storm(void)
 	return 0;
 }
 
+/*
+ * xnu 1235: kern.sweet_fpc_wait_edge sleeps until gpio112 is high, a new gpio112 interrupt, a kick (write 0) or the
+ * timeout, with no polling while the interrupt is live: sweetfpcd's screen-off finger detect waits with it.
+ */
+static int edge_ok = -1;	/* -1 not tried, 0 absent (older kernel), 1 present */
+int fpc_wait_edge(int ms)
+{
+	int hit = 0;
+	size_t l = sizeof(hit);
+	if (edge_ok == 0 || dryrun)
+		return -1;
+	if (ms < 1)
+		return 0;
+	if (ms > 60000)
+		ms = 60000;
+	if (sysctlbyname("kern.sweet_fpc_wait_edge", &hit, &l, &ms, sizeof(ms))) {
+		if (errno == EINTR)
+			return 0;
+		if (errno == ENOENT) {
+			say("finger-detect: no kern.sweet_fpc_wait_edge (xnu 1235): 20 ms polling instead");
+			edge_ok = 0;
+		} else
+			say("finger-detect: kern.sweet_fpc_wait_edge: %s", strerror(errno));
+		return -1;
+	}
+	edge_ok = 1;
+	return hit;
+}
+
+void fpc_wait_edge_kick(void)
+{
+	int z = 0;
+	if (edge_ok == 0 || dryrun)
+		return;
+	if (sysctlbyname("kern.sweet_fpc_wait_edge", NULL, NULL, &z, sizeof(z)) && errno == ENOENT)
+		edge_ok = 0;
+}
+
 static int line_high(void)
 {
 	return fpc_wait_high(1) > 0;	/* returns at once when gpio112 is already high */
@@ -824,7 +862,17 @@ static int hal_wait(const struct fpc_hal_cb *cb, const struct timespec *t0, long
 		if (left <= 0)
 			return line_high() ? 1 : 0;
 		int sl = FPC_EDGE_SLICE_MS;
-		int hit = fpc_wait_high(left < sl ? (int)left : sl);
+		int hit;
+		if (cb && cb->edge_ms > 0 && armed && fpc_ms_since(&tw) >= FPC_EARLY_WAKE_MS &&
+		    (hit = fpc_wait_edge(left < cb->edge_ms ? (int)left : (int)cb->edge_ms)) >= 0) {
+			if (hit == 1 || hit == 2) {	/* level high, or a gpio112 interrupt (pulses): wake */
+				if (hit == 2 && !say_quiet)
+					say("wait: gpio112 interrupt without a high level (edge wait): wake");
+				return 1;
+			}
+			hit = 0;	/* kicked / slice over: stop, deadline and irq count checks as usual */
+		} else
+			hit = fpc_wait_high(left < sl ? (int)left : sl);
 		if (hit)
 			return hit;
 		uint32_t c = fpc_sysctl_u32("kern.sweet_fpc_irq");

@@ -107,6 +107,7 @@ _Static_assert(sizeof(struct smb_event) == 16384, "smb_event");
  */
 #define FPCD_CMD_CAT_PUT	0x110
 #define FPCD_CMD_CAT_GET	0x111
+#define FPCD_CMD_WAKEDET	0x120	/* xnu 1235, posted: {u32 on} screen-off finger detect (display off = 1) */
 #define FPCD_CAT_LOAD_MAGIC	0x4c435753u	/* "SWCL" */
 #define FPCD_CAT_MAX		(1024 * 1024)
 

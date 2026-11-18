@@ -21,6 +21,11 @@
  *   Cancel, the op timeout or the kernel's lockout); 0 = old behaviour (WITHHELD, the op ends after one result).
  * FPCD_LSNR_DIAG=1|2: listeners up around the first / every identify of a match op, requests logged (debug).
  * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
+ * Screen-off wake (xnu 1235, kern.sweet_mesa_wake bit 2): FPCD_CMD_WAKEDET {1} when iOS's display goes off runs the
+ *   detect op (sensor armed, the arm wait asleep on gpio112's interrupt through kern.sweet_fpc_wait_edge in
+ *   FPCD_WAKEDET_SLICE_MS slices, default 2000, no 20 ms poll); its FINGER_DOWN is the kernel's wake press. A Cancel
+ *   or SpringBoard's 38/69 off returns to it while the display is off; {0} ends it. Nothing enrolled: not armed.
+ *   FPCD_WAKEDET=0: ignored. Every op change kicks the edge wait (write 0) so 4 MatchMode starts at once.
  *
  * Operations (one at a time; a new Enroll/Match/Detect cancels the running one) run in the capture thread, driven by
  * gpio112 (kern.sweet_fpc_wait in FPCD_WAIT_SLICE_MS slices so Cancel/SIGTERM are seen): the HAL capture sequence
@@ -112,6 +117,7 @@ static pthread_cond_t st_cv = PTHREAD_COND_INITIALIZER;
 static struct {
 	int op, busy, cancel, finger_on;
 	int extend;		/* the MatchMode is an extend-enrolment (xnu 1198: request u32 flags bit 0) */
+	int wakedet, fdet;	/* xnu 1235: screen-off finger detect on; SpringBoard's 38/69 finger detect on */
 	uint32_t up_seq;	/* finger-up count: an extend match needs a lift between touches */
 	uint32_t gen;
 	long started;
@@ -376,6 +382,8 @@ static void finger_set(int on)
  */
 struct capctx { uint32_t gen; };
 static long cap3_ms = FPCD_CAPTURE_WAIT_MS;	/* env FPCD_CAP3_MS */
+static int wakedet_off;				/* env FPCD_WAKEDET=0: ignore FPCD_CMD_WAKEDET (xnu 1235) */
+static long wakedet_slice_ms = 2000;		/* env FPCD_WAKEDET_SLICE_MS: edge wait slice of the screen-off detect */
 static int cap_stop(void *c) { return cancelled(((struct capctx *)c)->gen); }
 static void cap_lock(void *c) { pthread_mutex_lock(&ta_mx); }
 static void cap_unlock(void *c) { pthread_mutex_unlock(&ta_mx); }
@@ -416,6 +424,9 @@ static int capture_once(uint32_t gen, int32_t *st4, long deadline)
 		if (rel <= 0)
 			return CAP_TIMEOUT;
 	}
+	pthread_mutex_lock(&st_mx);
+	cb.edge_ms = S.wakedet && S.op == OP_DETECT && S.gen == gen ? wakedet_slice_ms : 0;	/* xnu 1235 */
+	pthread_mutex_unlock(&st_mx);
 	int rounds = 0;
 	*st4 = 0;
 	int r = fpc_capture_hal(appid, rel, &cb, st4, &rounds);
@@ -847,6 +858,11 @@ static void *capture_thread(void *arg)
 		pthread_mutex_lock(&st_mx);
 		if (S.gen == gen)
 			S.op = OP_NONE;
+		if (S.op == OP_NONE && S.wakedet && !g_stop && now_ms() - t0 >= 1000) {
+			S.op = OP_DETECT;	/* xnu 1235: an op ended by itself while the display is off: detect again */
+			S.gen++;
+			S.started = now_ms();
+		}
 		S.busy = 0;
 		int c = S.cancel;
 		pthread_cond_broadcast(&st_cv);
@@ -890,6 +906,7 @@ static void op_set_nowait(int op)	/* op NONE = cancel; the capture thread notice
 	S.started = now_ms();
 	pthread_cond_broadcast(&st_cv);
 	pthread_mutex_unlock(&st_mx);
+	fpc_wait_edge_kick();	/* xnu 1235: a capture thread asleep in kern.sweet_fpc_wait_edge sees the new gen now */
 }
 
 enum { JOB_RESET = 1, JOB_ENROL, JOB_DELETE, JOB_WIPE, JOB_NOCATACOMB };
@@ -1233,7 +1250,10 @@ static int h_match(const struct smb_req *q, struct smb_reply *p)
 
 static int h_cancel(const struct smb_req *q, struct smb_reply *p)
 {
-	op_set_nowait(OP_NONE);
+	pthread_mutex_lock(&st_mx);
+	int wd = S.wakedet;
+	pthread_mutex_unlock(&st_mx);
+	op_set_nowait(wd ? OP_DETECT : OP_NONE);	/* xnu 1235: display off: back to the screen-off detect */
 	return FPCD_OK;
 }
 
@@ -1243,16 +1263,40 @@ static int h_fdet(const struct smb_req *q, struct smb_reply *p)
 	 * thread and reports by EVENT */
 	uint32_t en = arg_u32(q, 1);
 	pthread_mutex_lock(&st_mx);
-	int op = S.op;
+	int op = S.op, wd = S.wakedet;
+	S.fdet = en != 0;
 	pthread_mutex_unlock(&st_mx);
 	lg("finger detect %s (op %s)", en ? "on" : "off", op_name[op]);
 	if (!en) {
-		if (op == OP_DETECT)
+		if (op == OP_DETECT && !wd)	/* xnu 1235: the screen-off detect keeps running */
 			op_set_nowait(OP_NONE);
 	} else if (op == OP_NONE) {
 		op_set_nowait(OP_DETECT);
 	}
 	return FPCD_OK;	/* enrol / match running: they report finger down/up already */
+}
+
+/*
+ * xnu 1235 FPCD_CMD_WAKEDET {u32 on} (posted by the persona, kern.sweet_mesa_wake bit 2): on = iOS's display went off:
+ * run the detect op (the sensor armed, the arm wait asleep on gpio112's interrupt); a touch's FINGER_DOWN is turned
+ * into a power button press by the kernel. off = the display came on: end it unless SpringBoard's 38/69 wants detect.
+ */
+static int h_wakedet(const struct smb_req *q, struct smb_reply *p)
+{
+	uint32_t on = arg_u32(q, 0);
+	pthread_mutex_lock(&st_mx);
+	int op = S.op, fdet = S.fdet;
+	uint32_t n = S.nids;
+	S.wakedet = on && n > 0 && !wakedet_off;
+	int wd = S.wakedet;
+	pthread_mutex_unlock(&st_mx);
+	lg("screen-off finger detect %s (display %s, op %s, %u finger(s) enrolled%s)", wd ? "on" : "off", on ? "off" : "on",
+	   op_name[op], n, wakedet_off ? ", FPCD_WAKEDET=0" : "");
+	if (wd && op == OP_NONE)
+		op_set_nowait(OP_DETECT);
+	else if (!wd && op == OP_DETECT && !fdet)
+		op_set_nowait(OP_NONE);
+	return FPCD_OK;
 }
 
 static int h_remove(const struct smb_req *q, struct smb_reply *p)
@@ -1630,6 +1674,7 @@ static const struct {
 	{ FPCD_CMD_STATUS, h_status },
 	{ FPCD_CMD_WIPE_ALL, h_wipe },
 	{ FPCD_CMD_PING, h_ping },
+	{ FPCD_CMD_WAKEDET, h_wakedet },	/* xnu 1235: screen-off finger detect on / off */
 };
 
 static struct smb_req rq;
@@ -1928,6 +1973,10 @@ int main(int argc, char **argv)
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
 		cap3_ms = atol(e);
+	if ((e = getenv("FPCD_WAKEDET")) && *e)
+		wakedet_off = atoi(e) == 0;	/* xnu 1235 */
+	if ((e = getenv("FPCD_WAKEDET_SLICE_MS")) && atol(e) > 0)
+		wakedet_slice_ms = atol(e);
 	if ((e = getenv("FPCD_CONSOLE")) && atoi(e))
 		log_con = open("/dev/console", O_WRONLY | O_NOCTTY);
 	/* qsee_lib: its say() lines go to stdout -> our log; quiet unless FPCD_VERBOSE (fd_cmd/fpc_bio are quiet anyway) */
