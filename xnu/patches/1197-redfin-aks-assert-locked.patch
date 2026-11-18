@@ -1,0 +1,45 @@
+redfin 1197: refuse lock assertions (aks_assert_hold, sel 26) while the passcode keybag is locked
+
+1196 on r5tid2: the bag locks on screen-off (sel 8) but swipe-up still got in. SpringBoard's
+SBFUserAuthenticationController sets auth state 2 after lockSkippingGracePeriod, and _isUserAuthenticated then
+creates a grace-period SBFAuthenticationAssertion whose tracker takes MKBDeviceLockAssertion -> aks_assert_hold
+(klog: SpringBoard sel 26 arg0 2 right after "locked"). Our blanket success made the assertion valid =
+"authenticated". Real AKS refuses a hold on a locked bag ("Require Passcode: Immediately"), so the lock screen
+asks. Now sel 26 answers kIOReturnNotPermitted while kern.sweet_passcode is 1/3 and the bag is locked; unlocked,
+mode 0 and mode 2 are unchanged. Sel 26/27 are logged every time in passcode mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -39,6 +39,7 @@
+ int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
+ int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
+ void sweet_pc_lock(void);
++int sweet_pc_locked(void);
+ void sweet_acm_publish(void);
+ void sweet_aks_notify(void);
+ }
+@@ -387,6 +388,21 @@
+ 		}
+ 		*ret = kIOReturnSuccess;
+ 		return true;
++	case kAKSAssertHold:
++		/*
++		 * 1197: a lock assertion (aks_assert_hold) keeps an *unlocked* bag unlocked; real AKS refuses it while
++		 * the bag is locked. SpringBoard's grace-period assertion (SBFAuthenticationAssertionTracker ->
++		 * MKBDeviceLockAssertion, sel 26 type 2) right after aks_lock_device decides "authenticated": our
++		 * old blanket success meant the lock screen never asked. Locked -> refused; unlocked -> as before.
++		 */
++		if (!sweet_pc_locked()) {
++			return false;
++		}
++		args->scalarOutputCount = 0;
++		*ret = kIOReturnNotPermitted;
++		return true;
++	case kAKSAssertDrop:
++		return false;   /* as before, but logged every time in passcode mode */
+ 	case kAKSVerifyPassword:
+ 		args->scalarOutputCount = 0;
+ 		*ret = pc_verify_packed(args);
