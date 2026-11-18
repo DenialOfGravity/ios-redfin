@@ -890,7 +890,7 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 		value = number_f(sysctlbyname("kern.sweet_torch", &level, &size, NULL, 0) == 0 && level > 0 ? level / 1000.0 : 0);
 	} else if (key_is(key, "ExposureBias")) {
-		value = number_f(s->ae_bias);
+		value = number_i((int)lrint(exp2(s->ae_bias) * 256));   /* (8.8 linear gain, as set) */
 	} else if (key_is(key, "FlashMode")) {
 		value = number_i(s->flash_mode);
 	} else if (key_is(key, "MaxIntegrationTime")) {
@@ -1040,6 +1040,8 @@ af_window(struct stream *s, CFTypeRef value)
 #define AF_FAR          REDWOOD_CAMERA_FOCUS_MAX        /* (macro) */
 #define AF_STEP         64
 #define AF_FINE         16
+
+#define EV_BIAS_MAX     2.0             /* ExposureBias clamp, EV: Camera's own slider range */
 
 /* ---- redfin (plan B4-B7): the controls' values ------------------------------------------------------------------- */
 
@@ -1416,11 +1418,29 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		return 0;
 	}
 	if (key_is(key, "ExposureBias")) {
-		double bias = 0;
+		/*
+		 * The unit is a linear gain in 8.8 fixed point, not EV: CMCapture's FigImageControl_SetExposureBias
+		 * sends SInt32 lrintf(exp2(EV) * 256) clamped to 1..0xffff, either bare or in a dictionary with
+		 * CommandID. So Camera's default +256 is 1.0x = 0 EV. (A float, as BWFigVideoCaptureDevice's
+		 * setExposureTargetBias:requestID: wraps it, is already EV.) Clamped to Camera's slider range, +-2 EV.
+		 */
+		CFTypeRef v = value;
+		double bias = 0, raw = 256;
 
-		number_of(value, &bias);
-		s->ae_bias = (float)(bias < -8 ? -8 : bias > 8 ? 8 : bias);
+		if (v != NULL && CFGetTypeID(v) == CFDictionaryGetTypeID()) {
+			v = CFDictionaryGetValue(v, CFSTR("ExposureBias"));
+		}
+		if (v != NULL && CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberIsFloatType(v)) {
+			number_of(v, &bias);
+		} else if (number_of(v, &raw)) {
+			bias = raw > 0 ? log2(raw / 256.0) : -EV_BIAS_MAX;
+		}
+		if (!(bias == bias)) {
+			bias = 0;
+		}
+		s->ae_bias = (float)(bias < -EV_BIAS_MAX ? -EV_BIAS_MAX : bias > EV_BIAS_MAX ? EV_BIAS_MAX : bias);
 		say_once("stream: set", key, value);
+		say("stream: ExposureBias raw %.0f -> %+.2f EV", raw, s->ae_bias);
 		return 0;
 	}
 	if (key_is(key, "RegionOfInterestForCameraControls") || key_is(key, "AEWindowParams")) {
