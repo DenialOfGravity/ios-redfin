@@ -35,6 +35,7 @@
 
 extern int sweet_vfs_mkdir(const char *path, int mode);
 extern void sweet_acm_publish(void);            /* SweetACM.cpp */
+extern void sweet_aks_notify(void);             /* SweetKeyStore.cpp (1196) */
 
 int sweet_pc_mode(void);
 int sweet_pc_is_set(void);
@@ -70,6 +71,7 @@ static int pc_locked, pc_lock_at_load = 1;      /* mode 3: the first load after 
 static uint32_t pc_fails;
 static clock_sec_t pc_last_try, pc_backoff_until;
 static uint32_t pc_n_ok, pc_n_bad, pc_n_busy;
+static int pc_unlocked_event;                 /* 1196: set under the lock, sent after it */
 
 static clock_sec_t
 pc_now(void)
@@ -78,6 +80,16 @@ pc_now(void)
 	clock_usec_t us;
 	clock_get_system_microtime(&s, &us);
 	return s;
+}
+
+/* 1196: tell MobileKeyBag clients (SpringBoard) that the keybag state changed. Never with the lock held. */
+static uint32_t pc_n_notify;
+static void
+pc_notify(const char *why)
+{
+	pc_n_notify++;
+	SAY("keybag status event (%s)\n", why);
+	sweet_aks_notify();
 }
 
 static void
@@ -472,8 +484,9 @@ pc_check_locked(const uint8_t *pw, uint32_t len, int unlock)
 		pc_fails = 0;
 		pc_backoff_until = 0;
 		pc_n_ok++;
-		if (unlock) {
+		if (unlock && pc_locked) {
 			pc_locked = 0;
+			pc_unlocked_event = 1;
 		}
 		return 0;
 	}
@@ -504,9 +517,16 @@ sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock)
 	lck_mtx_lock(&sweet_pc_lck);
 	int r = pc_check_locked(pw, len, unlock);
 	uint32_t f = pc_fails;
+	int ev = pc_unlocked_event;
+	pc_unlocked_event = 0;
 	lck_mtx_unlock(&sweet_pc_lck);
 	SAY("check (len %u%s) -> %s, fails %u\n", len, unlock ? ", unlock" : "",
 	    r == 0 ? "ok" : r == EBUSY ? "backoff" : "WRONG", f);
+	if (ev) {
+		pc_notify("unlocked");
+	} else if (r == EAUTH) {
+		pc_notify("failed attempt");    /* sfa / sb changed */
+	}
 	return r;
 }
 
@@ -584,6 +604,9 @@ sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_
 	lck_mtx_unlock(&sweet_pc_lck);
 	SAY("change (old len %u, new len %u) -> %d%s\n", old_len, new_len, e,
 	    e == 0 ? (new_len ? ": verifier stored" : ": passcode removed") : e == EAUTH ? ": old passcode WRONG" : "");
+	if (e == 0) {
+		pc_notify(new_len ? "passcode set" : "passcode removed");
+	}
 out:
 	bzero(o, sizeof(o));
 	bzero(n, sizeof(n));
@@ -597,12 +620,17 @@ sweet_pc_lock(void)
 	if (m == 0 || m == 2 || !sweet_pc_is_set()) {
 		return;
 	}
+	int ev = 0;
 	lck_mtx_lock(&sweet_pc_lck);
 	if (!pc_locked) {
 		pc_locked = 1;
+		ev = 1;
 		SAY("locked\n");
 	}
 	lck_mtx_unlock(&sweet_pc_lck);
+	if (ev) {
+		pc_notify("locked");
+	}
 }
 
 /* ---- sysctls ---- */
@@ -637,6 +665,7 @@ sysctl_sweet_passcode(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
 	if (v != 0) {
 		sweet_acm_publish();
 	}
+	pc_notify("mode change");       /* SpringBoard re-reads: recovery to 0 drops its passcode state at once */
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
@@ -664,10 +693,42 @@ sysctl_sweet_passcode_reset(__unused struct sysctl_oid *oidp, __unused void *arg
 	bzero(pc_dk, sizeof(pc_dk));
 	lck_mtx_unlock(&sweet_pc_lck);
 	SAY("RESET by %s: verifier -> none (%d)\n", pn, e);
+	if (pc_mode != 0) {
+		pc_notify("reset");
+	}
 	return e;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_passcode_reset, "I", "redfin 1195: write 1 (root) to store 'no passcode' and clear lock/backoff");
+
+/*
+ * 1196: kern.sweet_passcode_notify=1 (root) sends a keybag status event by hand; =2 also locks (as
+ * aks_lock_device would), for testing the lock screen without waiting for SpringBoard. Mode != 0 only.
+ */
+static int
+sysctl_sweet_passcode_notify(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = 0, changed = 0;
+	int e = sysctl_io_number(req, 0, sizeof(int), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (sweet_pc_mode() == 0) {
+		return EPERM;
+	}
+	if (v == 2) {
+		sweet_pc_lock();        /* notifies when it locks */
+		return 0;
+	}
+	if (v != 1) {
+		return EINVAL;
+	}
+	pc_notify("sysctl");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_notify, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_passcode_notify, "I", "redfin 1196: 1 = send a keybag status event, 2 = lock now (mode != 0)");
 
 static int
 sysctl_sweet_passcode_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -680,9 +741,9 @@ sysctl_sweet_passcode_state(__unused struct sysctl_oid *oidp, __unused void *arg
 		(void)sweet_pc_is_set();
 	}
 	lck_mtx_lock(&sweet_pc_lck);
-	snprintf(b, sizeof(b), "mode=%d pinned=%d stored=%s%s locked=%d fails=%u backoff=%u iter=%u ok=%u bad=%u busy=%u",
+	snprintf(b, sizeof(b), "mode=%d pinned=%d stored=%s%s locked=%d fails=%u backoff=%u iter=%u ok=%u bad=%u busy=%u events=%u",
 	    m, pc_pinned, st[pc_stored], m == 0 ? "(ignored)" : "", m != 0 && m != 2 && pc_locked, pc_fails,
-	    pc_backoff_left(), pc_iter, pc_n_ok, pc_n_bad, pc_n_busy);
+	    pc_backoff_left(), pc_iter, pc_n_ok, pc_n_bad, pc_n_busy, pc_n_notify);
 	lck_mtx_unlock(&sweet_pc_lck);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }

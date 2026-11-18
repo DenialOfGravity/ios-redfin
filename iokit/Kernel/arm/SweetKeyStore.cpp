@@ -40,6 +40,7 @@ int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
 int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
 void sweet_pc_lock(void);
 void sweet_acm_publish(void);
+void sweet_aks_notify(void);
 }
 
 /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
@@ -79,6 +80,16 @@ enum {
  */
 #define SWEET_AKS_LOCK_STATE    0x6
 
+/*
+ * 1196: keybag status events. MobileKeyBag's MKBEventsRegister (SpringBoard's SBFMobileKeyBag, Preferences, ...)
+ * adds an IOGeneralInterest notification on AppleKeyStore; aksNotificationCB maps message 0xe3ffd00d to
+ * "keybag status changed" (SpringBoard re-reads the lock state, hasPasscodeSet) and 0xe3ffd00f to "first
+ * unlock". Without it SpringBoard kept its boot-time "no passcode" state: it never called aks_lock_device and
+ * the lock screen never asked. Sent only by sweet_passcode.c (passcode set/removed, lock, unlock, mode change).
+ */
+#define SWEET_AKS_MSG_STATUS    0xe3ffd00du
+static IOService *gAKS;
+
 class AppleKeyStore : public IOService {
 	OSDeclareDefaultStructors(AppleKeyStore);
 
@@ -95,6 +106,7 @@ AppleKeyStore::start(IOService *provider)
 		return false;
 	}
 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+	gAKS = this;
 	registerService();
 	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
 	if (sweet_pc_mode() != 0) {
@@ -191,6 +203,14 @@ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
 {
 	return args->structureOutputDescriptor != NULL ?
 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+}
+
+extern "C" void
+sweet_aks_notify(void)
+{
+	if (gAKS != NULL) {
+		gAKS->messageClients(SWEET_AKS_MSG_STATUS);
+	}
 }
 
 /* ---- 1195: passcode-mode selectors (kern.sweet_passcode != 0) ---- */
