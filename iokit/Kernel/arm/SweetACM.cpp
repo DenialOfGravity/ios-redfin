@@ -39,6 +39,7 @@ int sweet_pc_mode(void);
 int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
 void sweet_acm_publish(void);
 void sweet_acm_note_verified_match(void);
+int sweet_acm_note_match_for_context(const uint8_t *id);        /* 1216 */
 }
 
 #define SAY(fmt, ...) IOLog("SWEET ACM: " fmt, ##__VA_ARGS__)
@@ -104,6 +105,8 @@ static acm_ctx gGlobal;                 /* id all zero */
 static IOLock *gL;
 static uint64_t gSerial;
 static clock_sec_t gBioArmedAt;
+static clock_sec_t gBioArmIdAt;         /* 1216: a match armed for one context (SweetMesa, kern.sweet_mesa_acm_bind) */
+static uint8_t gBioArmId[ACM_ID];
 static volatile UInt32 gPublished;
 static uint32_t nCmds, nUnsup, nRefused, nPassOk, nPassBad, nBioOk, nBioRefused, nCtx, nPolicyYes, nPolicyNo;
 static uint32_t gLastCmd;
@@ -268,10 +271,16 @@ acm_cmd(uint32_t cmd, const uint8_t *p, uint32_t n, uint8_t *o, uint32_t ocap, u
 		}
 		if (type == kCredBiometryMatched) {
 			IOLockLock(gL);
-			bool armed = gBioArmedAt != 0 && now - gBioArmedAt <= ACM_BIO_ARM_S;
+			bool keyed = gBioArmIdAt != 0 && now - gBioArmIdAt <= ACM_BIO_ARM_S &&
+			    memcmp(p, gBioArmId, ACM_ID) == 0;        /* 1216 */
+			bool armed = keyed || (gBioArmedAt != 0 && now - gBioArmedAt <= ACM_BIO_ARM_S);
 			c = ctx_find(p);
 			if (armed && c != NULL) {
-				gBioArmedAt = 0;                        /* one match, one credential */
+				if (keyed) {
+					gBioArmIdAt = 0;
+				} else {
+					gBioArmedAt = 0;                /* one match, one credential */
+				}
 				c->bio_at = now;
 				c->creds |= 1u << kCredBiometryMatched;
 			}
@@ -547,6 +556,34 @@ sweet_acm_note_verified_match(void)
 	gBioArmedAt = acm_now();
 	IOLockUnlock(gL);
 	SAY("verified biometric match armed for %d s\n", ACM_BIO_ARM_S);
+}
+
+/*
+ * 1216: SweetMesa (kern.sweet_mesa_acm_bind=1) for a match whose MatchMode carried an ACM context: the
+ * BiometryMatched credential goes straight to that context (as the SEP's ACM does; VerifyPolicy sees it), and an
+ * AddCredential type 3 for the same context within ACM_BIO_ARM_S is accepted (coreauthd's MechTouchId path).
+ * Returns 1 if the context is known here. Kernel-only, no userland path.
+ */
+extern "C" int
+sweet_acm_note_match_for_context(const uint8_t *id)
+{
+	static const uint8_t zero[ACM_ID] = { 0 };
+	if (gL == NULL || memcmp(id, zero, ACM_ID) == 0) {
+		return 0;
+	}
+	clock_sec_t now = acm_now();
+	IOLockLock(gL);
+	acm_ctx *c = ctx_find(id);
+	if (c != NULL) {
+		c->bio_at = now;
+		c->creds |= 1u << kCredBiometryMatched;
+	}
+	memcpy(gBioArmId, id, ACM_ID);
+	gBioArmIdAt = now;
+	IOLockUnlock(gL);
+	SAY("biometric match for context %02x%02x%02x%02x..: %s; AddCredential for it armed for %d s\n", id[0], id[1],
+	    id[2], id[3], c != NULL ? "BiometryMatched added" : "context not known here", ACM_BIO_ARM_S);
+	return c != NULL;
 }
 
 static int
