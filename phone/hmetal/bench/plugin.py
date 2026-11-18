@@ -5329,6 +5329,62 @@ HM_PLANES_EDITS = [
 ]
 
 
+# (ws-hm-planes) test switches for VideoToolbox's transfer in mediaserverd (Camera preview false colour / freezes):
+# HM_PLANE_DUMP=N: the first N planes-written surfaces (after the buffer that wrote them completes) and the first N 540
+#   sources (at a bind) are written raw to /var/tmp/hmpd-PID-SURFACE-SEQ.{dst,src} (a 32-byte header: w h planes, then
+#   per plane w h rowbytes offset; then each plane's rows) for a look on the PC.
+# HM_540_FRESH=1: a format-540 texture (VideoToolbox's source, sampled by its kernel) is converted again at every bind,
+#   not only when the surface's seed moved: the camera's frames may be rewritten without the seed moving.
+HM_PLANES_DUMP_EDITS = [
+    ('static int\nhm_plane_shadow_on(void)\n',
+     '/* (ws-hm-planes) HM_PLANE_DUMP / HM_540_FRESH test switches */\n'
+     'static int\nhm_env_int(const char *name)\n{\n\tconst char *e = getenv(name);\n\n\treturn e != NULL ? atoi(e) : 0;\n}\n\n'
+     'static void\nhm_plane_dump(IOSurfaceRef s, const char *kind)\n{\n'
+     '\tstatic int budget = -1, seq;\n\n'
+     '\tif (budget < 0) budget = hm_env_int("HM_PLANE_DUMP") * 2;\n'
+     '\tif (budget <= 0 || s == NULL) return;\n'
+     '\tif (__sync_sub_and_fetch(&budget, 1) < 0) return;\n'
+     '\tchar path[160];\n'
+     '\tsnprintf(path, sizeof(path), "/var/tmp/hmpd-%d-%u-%d.%s", getpid(), IOSurfaceGetID(s), __sync_add_and_fetch(&seq, 1), kind);\n'
+     '\tif (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;\n'
+     '\tFILE *f = fopen(path, "wb");\n'
+     '\tif (f != NULL) {\n'
+     '\t\tconst size_t np = IOSurfaceGetPlaneCount(s);\n'
+     '\t\tconst uint8_t *b0 = IOSurfaceGetBaseAddress(s);\n'
+     '\t\tuint32_t h[8] = {(uint32_t)IOSurfaceGetWidth(s), (uint32_t)IOSurfaceGetHeight(s), (uint32_t)np, IOSurfaceGetPixelFormat(s),\n'
+     '\t\t\t\t IOSurfaceGetSeed(s), 0, 0, 0};\n'
+     '\t\tfwrite(h, 4, 8, f);\n'
+     '\t\tfor (size_t p = 0; p < np && p < 2; p++) {\n'
+     '\t\t\tconst uint8_t *pp = IOSurfaceGetBaseAddressOfPlane(s, p);\n'
+     '\t\t\tuint32_t q[4] = {(uint32_t)IOSurfaceGetWidthOfPlane(s, p), (uint32_t)IOSurfaceGetHeightOfPlane(s, p),\n'
+     '\t\t\t\t\t (uint32_t)IOSurfaceGetBytesPerRowOfPlane(s, p), (uint32_t)(pp - b0)};\n'
+     '\t\t\tfwrite(q, 4, 4, f);\n'
+     '\t\t}\n'
+     '\t\tfor (size_t p = 0; p < np && p < 2; p++) {\n'
+     '\t\t\tfwrite(IOSurfaceGetBaseAddressOfPlane(s, p), 1, IOSurfaceGetBytesPerRowOfPlane(s, p) * IOSurfaceGetHeightOfPlane(s, p), f);\n'
+     '\t\t}\n'
+     '\t\tfclose(f);\n'
+     '\t\thm_print("HM_PLANE_DUMP: %s\\n", path);\n'
+     '\t}\n'
+     '\tIOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);\n}\n\n'
+     'static int\nhm_540_fresh(void)\n{\n\tstatic int on = -1;\n\n\tif (on < 0) on = hm_env_int("HM_540_FRESH") != 0;\n\treturn on;\n}\n\n'
+     'static int\nhm_plane_shadow_on(void)\n'),
+    # the destination after its writer completed
+    ('\t\thm_surface_gen(IOSurfaceGetID(s), 1);\n\t\tif (written->_hmPlaneLastCb == (void *)done) written->_hmPlaneLastCb = NULL;\n',
+     '\t\thm_surface_gen(IOSurfaceGetID(s), 1);\n\t\thm_plane_dump(s, "dst");   /* HM_PLANE_DUMP */\n'
+     '\t\tif (written->_hmPlaneLastCb == (void *)done) written->_hmPlaneLastCb = NULL;\n'),
+    # the 540 source at a bind: dumped, and converted again at every bind under HM_540_FRESH
+    ('\t\tif (ys != _ycbcrSeed) {\n\t\t\t_ycbcrSeed = ys;\n\t\t\thakios_metal_texture_ycbcr_touch(_texture, ys);\n\t\t}\n',
+     '\t\tif (_ycbcrFormat == (MTLPixelFormat)540) hm_plane_dump(_iosurface, "src");   /* (ws-hm-planes) HM_PLANE_DUMP */\n'
+     '\t\tif (ys != _ycbcrSeed || (_ycbcrFormat == (MTLPixelFormat)540 && hm_540_fresh())) {   /* (ws-hm-planes) HM_540_FRESH */\n'
+     '\t\t\tstatic uint32_t fresh;\n\n'
+     '\t\t\tconst BOOL moved = ys != _ycbcrSeed;\n\n'
+     '\t\t\t_ycbcrSeed = ys;\n'
+     '\t\t\thakios_metal_texture_ycbcr_touch(_texture, moved || !hm_540_fresh() ? ys : (0x80000000u | __sync_add_and_fetch(&fresh, 1)));\n'
+     '\t\t}\n'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
@@ -5339,6 +5395,7 @@ def main():
     src = apply(src, HM_CAMFIX_EDITS)   # (ws-hm-camfix) F4 commit lifetime, F6 HM_MSAA_FALLBACK
     src = apply(src, HM_PHOTOS_EDITS)   # (ws-hm-photos) HM_PLANE_SHADOW
     src = apply(src, HM_PLANES_EDITS)   # (ws-hm-planes) HM_PLANE_NATIVE, HM_PLANE_SEED
+    src = apply(src, HM_PLANES_DUMP_EDITS)   # (ws-hm-planes) HM_PLANE_DUMP, HM_540_FRESH (test switches)
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))
