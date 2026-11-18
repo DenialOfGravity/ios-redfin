@@ -1315,6 +1315,10 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		int flash;
 
 		still_request(value, &count, &flash);
+		/* redfin (test): /private/var/local/camera-force-flash: every photograph with the flash, whatever was asked (no UI needed) */
+		if (access("/private/var/local/camera-force-flash", F_OK) == 0) {
+			flash = 1;
+		}
 		pthread_mutex_lock(&s->lock);
 		s->stills_wanted += count;      /* (redfin, B6: as many as asked for) */
 		s->still_flash = flash;
