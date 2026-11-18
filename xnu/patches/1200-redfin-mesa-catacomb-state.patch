@@ -1,0 +1,71 @@
+redfin 1200: SweetMesa 60 GetCatacombState answers state 3 (present + loaded); state 1 made biometrickitd reload an absent catacomb file, clear its identity list and RemoveTemplate each fresh enrolment
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -164,6 +164,7 @@
+ /* ---- state ---- */
+ static int gMesa;                       /* kern.sweet_mesa */
+ static int gMatch;                      /* kern.sweet_mesa_match */
++static int gCatState = 3;               /* kern.sweet_mesa_catstate: 60 GetCatacombState value (1200) */
+ static int gFwdMs = 300;                /* kern.sweet_mesa_fwd_ms (1192b: was 2000) */
+ static IOLock *gM;                      /* slot, queue, client counts */
+ static IOLock *gPub;                    /* publish / withdraw */
+@@ -891,13 +892,23 @@
+ 		 * (CatacombStateCache stateOfUserComponent:), so "no entries" deleted each fresh enrolment right after
+ 		 * its enrol result. Answer the identities' user with bit 0 set (templates live in the FPC TA).
+ 		 */
++		/*
++		 * 1200: the state bits are bit 0 catacomb present, bit 1 loaded in the "SEP", bit 2 dirty (save wanted).
++		 * BiometricKitXPCServer checkCatacombForUser: runs loadCatacombForUser: whenever (state & 3) == 1, and
++		 * loadCatacombForComponent: first does clearTemplateListForUser: and then refills the list only from the
++		 * catacomb file on disk. There is no file (templates live in TA memory, 61-64 unsupported), so state 1
++		 * emptied biometrickitd's list right after each enrolment (status 100%), and syncTemplateListForUser:
++		 * then sent 13 RemoveTemplate for the new fid ("not present in biometrickitd"). Answer 3 (present +
++		 * loaded, never dirty): no load, no save. kern.sweet_mesa_catstate=1 restores the 1192f answer.
++		 */
+ 		uint32_t n = gUser != 0 && cap >= 8 ? 1 : 0;
+ 		ANSWER(8 * n);
+ 		if (n) {
+ 			put32(out, gUser);
+-			put32(out + 4, 1);
++			put32(out + 4, (uint32_t)gCatState);
+ 		}
+-		*how = n ? "canned (user state 1)" : "canned (no user yet)";
++		*how = n ? (gCatState == 3 ? "canned (user state 3: present+loaded)" : "canned (user state from sysctl)") :
++		    "canned (no user yet)";
+ 		return kIOReturnSuccess;
+ 	}
+ 	case 67: ANSWER(28); return kIOReturnSuccess;          /* GetSystemProtectedConfig */
+@@ -1586,6 +1597,28 @@
+     sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
+ 
+ static int
++sysctl_sweet_mesa_catstate(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gCatState, changed = 0;
++	int e = sysctl_io_number(req, gCatState, sizeof(gCatState), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 7) {
++		return EINVAL;
++	}
++	char pn[32];
++	proc_selfname(pn, (int)sizeof(pn));
++	gCatState = v;
++	SAY("GetCatacombState answer set to %d by %s (kern.sweet_mesa_catstate)\n", v, pn);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_catstate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_catstate, "I", "redfin 1200: 60 GetCatacombState value for the identities' user "
++    "(bit0 present, bit1 loaded, bit2 dirty; default 3, 1 = 1192f answer)");
++
++static int
+ sysctl_sweet_mesa_fwd_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+ {
