@@ -2080,7 +2080,11 @@ void Texture::ycbcrConvertRows(const uint8_t* luma, uint64_t lumaRow, const uint
             const int32_t yv = l[x], cb = c[x & ~1u], cr = c[(x & ~1u) + 1];
             uint32_t v;
             if (planes) {
-                v = uint32_t(cr) | uint32_t(yv) << 8 | uint32_t(cb) << 16;
+                // (ws-hm-planes) HM_540_ORDER=ABC (test switch, processor decode only): the planes' values in red, green and
+                // blue as A, B, C of y, b (Cb), r (Cr); default "ryb" (red Cr, green Y, blue Cb)
+                static const char* order = [] { const char* e = getenv("HM_540_ORDER"); return e != nullptr && strlen(e) == 3 ? e : "ryb"; }();
+                auto pick = [&](char ch) { return uint32_t(ch == 'y' ? yv : ch == 'b' ? cb : cr); };
+                v = pick(order[0]) | pick(order[1]) << 8 | pick(order[2]) << 16;
             } else {
                 // (the kernel's integers: an arithmetic shift, floor((v + 0.5) * 65536 / 65536))
                 const int32_t yy = k[0] * (yv - k[5]) + 32768;
