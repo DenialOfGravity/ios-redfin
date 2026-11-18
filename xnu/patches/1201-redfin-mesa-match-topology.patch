@@ -1,0 +1,92 @@
+redfin 1201: SweetMesa identity match records carry a valid one-node match topology (an all-zero one failed GenerateMatchTemplateTopology with EINVAL, so the enrol UI ignored every phase-2 match)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -132,6 +132,12 @@
+ #define MR_FLAGS                0x14            /* match record: u32 flags (bits 0-3 no-match reason, 4 PreArm,
+                                                  * 5 Unlocked, 6 CredentialAdded, 7 HomeButton, 9 ResultIgnored) */
+ #define MR_LOTL_ITEMS           0xc84
++#define MR_TOPO                 0x7c            /* match topology (0xc08): 12-byte header + 3060-byte node placement */
++#define MR_TOPO_SIZE            0xc08
++#define TOPO_PLACEMENT          0xc             /* node placement: u16 size 0xbf4, u16 version 3, s16 nodes, ... */
++#define TOPO_PLACEMENT_SIZE     0xbf4
++static_assert(MR_TOPO + MR_TOPO_SIZE == MR_LOTL_ITEMS && TOPO_PLACEMENT + TOPO_PLACEMENT_SIZE + 8 == MR_TOPO_SIZE,
++    "match record topology layout");
+ #define MR_SIZE                 0xc88
+ #define MESA_ENTITLEMENT        "com.apple.private.applemesa.allow"
+ 
+@@ -164,6 +170,7 @@
+ /* ---- state ---- */
+ static int gMesa;                       /* kern.sweet_mesa */
+ static int gMatch;                      /* kern.sweet_mesa_match */
++static int gTopo = 1;                   /* kern.sweet_mesa_topo: synthetic match topology (1201) */
+ static int gCatState = 3;               /* kern.sweet_mesa_catstate: 60 GetCatacombState value (1200) */
+ static int gFwdMs = 300;                /* kern.sweet_mesa_fwd_ms (1192b: was 2000) */
+ static IOLock *gM;                      /* slot, queue, client counts */
+@@ -247,6 +254,25 @@
+ 	put32(p + 4, (uint32_t)(v >> 32));
+ }
+ 
++/*
++ * 1201: BiometricKit (client side) -[BiometricKit _matchResult:withDictionary:] runs createMatchInfo:withTopology:,
++ * i.e. GenerateMatchTemplateTopology() on the match record's topology (+0x7c). An all-zero topology fails its
++ * __TranslateNodePlacement check (placement u16 size must be 0xbf4, u16 version 3) with EINVAL, so the details lose
++ * "BKMatchInfo" and BKUIFingerprintEnrollViewController matchResult:withDetails: ignores the match: phase 2 of the
++ * enrolment never progresses. A one-node topology passes: header +4 s16 matched node 0 (< 300), +6/+8/+0xa angle/x/y
++ * 0; placement {0xbf4, 3, 1 node, +0x2e s16 scale}, node 0 at placement +0x30 {s16 angle, x, y, parent = itself}.
++ */
++static void
++mesa_fill_topology(uint8_t *t)
++{
++	uint8_t *pl = t + TOPO_PLACEMENT;
++	pl[0] = (uint8_t)TOPO_PLACEMENT_SIZE; pl[1] = (uint8_t)(TOPO_PLACEMENT_SIZE >> 8);
++	pl[2] = 3;                              /* version */
++	pl[4] = 1;                              /* one node */
++	pl[0x2e] = 500 & 0xff; pl[0x2f] = 500 >> 8;     /* scale (divisor of the node coordinates) */
++	/* node 0 at pl + 0x30: angle 0, x 0, y 0, parent 0 (itself = root), flags 0 */
++}
++
+ static void
+ mesa_locks(void)
+ {
+@@ -660,6 +686,9 @@
+ 			put32(b + 4, SMFP_MAGIC);
+ 			put32(b + 8, fid);
+ 			put32(b + MR_FLAGS, mflags);    /* 1198: bit 5 Unlocked only when the keybag was unlocked here */
++			if (gTopo) {
++				mesa_fill_topology(b + MR_TOPO);        /* 1201 */
++			}
+ 			OSIncrementAtomic(&nMatchDelivered);
+ 			if (!verified) {
+ 				OSIncrementAtomic(&nUnverified);
+@@ -1597,6 +1626,26 @@
+     sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
+ 
+ static int
++sysctl_sweet_mesa_topo(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gTopo, changed = 0;
++	int e = sysctl_io_number(req, gTopo, sizeof(gTopo), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 1) {
++		return EINVAL;
++	}
++	gTopo = v;
++	SAY("match topology %s (kern.sweet_mesa_topo=%d)\n", v ? "synthetic one-node" : "zeros", v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_topo, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_topo, "I", "redfin 1201: 1 = identity match records carry a valid one-node topology "
++    "(BKMatchInfo for the enrol UI), 0 = zeros");
++
++static int
+ sysctl_sweet_mesa_catstate(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+ {
