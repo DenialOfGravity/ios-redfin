@@ -19,6 +19,7 @@
  *                      TZ_SHM_BRIDGE_ENABLE (one-way) is never issued.
  *   QSEE_APP=NAME      send/unload guard: the app the ID must belong to (default fpctzappfingerprint)
  *   QSEE_DATA_NULL=1   send-build-info smoke test: no data buffer, sb {0x418, 0}, empty sglistinfo
+ *   QSEE_DATA64=1      send-build-info: data buffer anywhere, u64 pa at sb+4, sglistinfo 64-bit flag (0xc0000004)
  *   QSEE_SEND=wl|legacy  send-data form (default: as Linux, by TZ whitelist feature 15 >= 1.0.0)
  *   QSEE_CONSOLE=0     do not mirror the log lines to /dev/console (default: mirrored, so a hang leaves a klog line)
  *

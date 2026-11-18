@@ -326,6 +326,11 @@ static int cmd_send_build_info(uint32_t appid)
 	 * as Linux sends a command without modfd buffers; expect a TA error status, proves the send path only */
 	const char *dn = getenv("QSEE_DATA_NULL");
 	int datanull = dn && atoi(dn);
+	/* QSEE_DATA64=1: bulk buffer in normal PMEM_ALLOC (may be above 4 GB), its full pa as a u64 at sb+4, sglistinfo
+	 * {SGLIST_SET(1, 1, 4) = 0xc0000004, sizeOrCount = buffer length 0x1000} (qseecom.c 4327-4332: 64-bit flag,
+	 * sizeOrCount = sg->length, the page-rounded ION allocation, for nents == 1) */
+	const char *d64 = getenv("QSEE_DATA64");
+	int data64 = d64 && atoi(d64) && !datanull;
 	int wl = 1;
 	const char *e = getenv("QSEE_SEND");
 	if (e && !strcmp(e, "legacy"))
@@ -340,7 +345,7 @@ static int cmd_send_build_info(uint32_t appid)
 		return 2;
 	if (datanull)
 		memset(&bulk, 0, sizeof(bulk));
-	else if (pbuf_get(&bulk, 4096, 4096, 1, 0xa0001000ull)) {
+	else if (pbuf_get(&bulk, 4096, 4096, !data64, 0xa0001000ull)) {
 		pbuf_put(&sb);
 		return 2;
 	}
@@ -349,20 +354,24 @@ static int cmd_send_build_info(uint32_t appid)
 		pbuf_put(&sb);
 		return 2;
 	}
-	if (bulk.pa >> 32) {
+	if (!data64 && bulk.pa >> 32) {
 		say("send: bulk pa %#llx above 4 GB (the modfd patch is 32-bit)", (unsigned long long)bulk.pa);
 		pbuf_put(&arg), pbuf_put(&bulk), pbuf_put(&sb);
 		return 2;
 	}
 	uint8_t bb[0x418] = { 0 }, s[0x80] = { 0 }, a[0x100] = { 0 };
 	put_u32(bb + 0, 12), put_u32(bb + 4, 1), put_u32(bb + 0x14, 0x400);
-	put_u32(s + 0, sizeof(bb)), put_u32(s + 4, (uint32_t)bulk.pa);
+	put_u32(s + 0, sizeof(bb));
+	if (data64)
+		put_u64(s + 4, bulk.pa);
+	else
+		put_u32(s + 4, (uint32_t)bulk.pa);
 	uint64_t req = sb.pa, rsp = sb.pa + 0x40, sgl = arg.pa + 0x80;
 	put_u64(a + 0, rsp), put_u64(a + 8, 0x40);	/* args[3], args[4] */
 	if (wl) {
 		put_u64(a + 16, sgl), put_u64(a + 24, 8 * MAX_ION_FD);	/* args[5], args[6] */
 		if (!datanull)	/* one contiguous buf; with QSEE_DATA_NULL the table stays all zero */
-			put_u32(a + 0x80, SGLIST_SET(1, 0, 4)), put_u32(a + 0x84, (uint32_t)bulk.size);
+			put_u32(a + 0x80, SGLIST_SET(1, data64, 4)), put_u32(a + 0x84, (uint32_t)bulk.size);
 	}
 	if ((!datanull && wr_chunks(bulk.pa, bb, sizeof(bb))) || wr_chunks(sb.pa, s, sizeof(s)) ||
 	    wr_chunks(arg.pa, a, sizeof(a))) {
@@ -372,6 +381,7 @@ static int cmd_send_build_info(uint32_t appid)
 	say("send: app %u g12/1 get_build_info: sb %#llx (req 0x40, rsp +0x40 len 0x40), bulk %#llx len 0x418, "
 	    "extra args %#llx%s", appid, (unsigned long long)sb.pa, (unsigned long long)bulk.pa, (unsigned long long)arg.pa,
 	    !wl ? "" : datanull ? ", sglistinfo at +0x80 empty (QSEE_DATA_NULL=1: data pa 0)" :
+	    data64 ? ", QSEE_DATA64=1: u64 pa at sb+4, sglistinfo at +0x80 {0xc0000004, 0x1000}" :
 	    ", sglistinfo at +0x80 {0x80000004, 0x1000}");
 	uint64_t x[8] = { wl ? QSEE_SMC_SEND_DATA_WL : QSEE_SMC_SEND_DATA, wl ? QSEE_ARGS_SEND_DATA_WL : QSEE_ARGS_SEND_DATA,
 			  appid, req, 0x40, arg.pa };
@@ -404,6 +414,12 @@ static int cmd_send_build_info(uint32_t appid)
 		    "size %#x", rd_u32(s + 0x40), rd_u32(bb), rd_u32(bb + 4), rd_u32(bb + 8), rd_u32(bb + 0xc),
 		    rd_u32(bb + 0x14));
 		say("send: build info: \"%.400s\"", build);
+		for (int o = 0; o < 0x80; o += 16)
+			say("send: sb+%#04x: %08x %08x %08x %08x%s", o, rd_u32(s + o), rd_u32(s + o + 4), rd_u32(s + o + 8),
+			    rd_u32(s + o + 12), o == 0x40 ? "  <- resp" : "");
+		for (int o = 0; o < 0x30; o += 16)
+			say("send: data+%#04x: %08x %08x %08x %08x", o, rd_u32(bb + o), rd_u32(bb + o + 4), rd_u32(bb + o + 8),
+			    rd_u32(bb + o + 12));
 		rc = rd_u32(s + 0x40) || rd_u32(bb + 8) || rd_u32(bb + 0xc) ? 5 : 0;
 	} else if (dryrun) {
 		rc = 0;
