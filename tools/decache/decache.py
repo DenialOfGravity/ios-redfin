@@ -384,6 +384,66 @@ def scan_text(m):
     return ldr_out, other_out, bl_out, own, sorted(adrp_out - consumed)
 
 
+def eh_slots(m, E):
+    """[(kind, old slot address)] from __unwind_info personalities and the LSDAs' type tables."""
+    base = m.seg('__TEXT')['vm']; out = []
+    u = m.sect('__TEXT', '__unwind_info')
+    if not u:
+        return out
+    ver, ceo, cec, po, pc, io, ic = struct.unpack_from('<7I', m.d, u['fo'])
+    for i in range(pc):
+        out.append(('personality', base + struct.unpack_from('<I', m.d, u['fo'] + po + 4 * i)[0]))
+    if ic < 2:
+        return out
+    l0 = struct.unpack_from('<I', m.d, u['fo'] + io + 8)[0]
+    l1 = struct.unpack_from('<I', m.d, u['fo'] + io + 12 * (ic - 1) + 8)[0]
+    lsdas = sorted(set(struct.unpack_from('<I', m.d, u['fo'] + l0 + 8 * k + 4)[0] for k in range((l1 - l0) // 8)))
+    d = m.d
+    for lo in lsdas:
+        a = base + lo; p = m.a2o(a)
+        lpenc = d[p]; p += 1
+        if lpenc != 0xff:
+            E('LSDA 0x%x has an lpstart' % a); continue
+        tenc = d[p]; p += 1
+        if tenc == 0xff:
+            continue
+        toff, p = read_uleb(d, p)
+        tbase = p + toff
+        csenc = d[p]; p += 1
+        cslen, p = read_uleb(d, p)
+        cs_end = p + cslen
+        acts = set()
+        while p < cs_end:
+            if csenc == 0x01:
+                for _ in range(3):
+                    _, p = read_uleb(d, p)
+            elif csenc == 0x03:
+                p += 12
+            else:
+                E('LSDA 0x%x call-site encoding 0x%x' % (a, csenc)); break
+            act, p = read_uleb(d, p)
+            if act:
+                acts.add(cs_end + act - 1)
+        ntypes = 0
+        for q in acts:                             # follow each action chain
+            for _ in range(64):
+                f, q2 = read_sleb(d, q)
+                nxt, q3 = read_sleb(d, q2)
+                ntypes = max(ntypes, f)
+                if not nxt:
+                    break
+                q = q2 + nxt
+        if tenc != 0x9b:
+            E('LSDA 0x%x ttype encoding 0x%x' % (a, tenc)); continue
+        for k in range(1, ntypes + 1):
+            eo = tbase - 4 * k
+            v = struct.unpack_from('<i', d, eo)[0]
+            if v:
+                ea = a + (eo - m.a2o(a))
+                out.append(('lsda-type', ea + v))
+    return out
+
+
 # ----------------------------------------------------------------------------------------------- relink
 class Relink:
     def __init__(self, a):
@@ -456,6 +516,25 @@ class Relink:
                 self.E('pool slot 0x%x (value 0x%x) has no name' % (s, v or 0))
                 continue
             self.binds[s] = (nm, 0)
+        # unwind personality pointers and LSDA type-table entries (pc-relative, indirect) also use GOT slots
+        self.eh = collections.Counter()
+        for (kind, slot) in self.eh_slots():
+            self.eh[kind] += 1
+            if slot in self.binds:
+                continue
+            if m.seg_of(slot):
+                self.E('%s slot 0x%x inside the image but not a GOT slot' % (kind, slot))
+                continue
+            v = c.ptr(slot)
+            nm = self.name_at(v) if v else None
+            if not nm:
+                self.E('%s slot 0x%x (value 0x%x) unresolved' % (kind, slot, v or 0))
+                continue
+            self.binds[slot] = (nm, 0)
+            self.slots.append(slot)
+            self.eh['bound:' + nm] += 1
+        self.slots = sorted(set(self.slots))
+        self.rep['text']['eh_slots'] = dict(self.eh)
         self.pool_lo, self.pool_hi = self.slots[0], self.slots[-1] + 8
         DC = m.seg('__DATA_CONST')
         for sg in m.segs:
@@ -530,6 +609,9 @@ class Relink:
             return False
         self.write()
         return True
+
+    def eh_slots(self):
+        return eh_slots(self.m, self.E)
 
     def in_ex(self, v):
         return self.exlo <= v < self.exhi
@@ -686,14 +768,16 @@ class Relink:
             if vlo < prev_end:
                 self.E('segment %s overlaps previous after alignment' % name)
             prev_end = vhi
-            seg = dict(name=name, vm=vlo, vms=vhi - vlo, fo=fo, olds=olds, sects=[])
+            # file offset == vm offset (base 0) for every segment: dyld reads some sections (e.g.
+            # __objc_imageinfo) through the plain file mapping at mh + (sectaddr - base) before mapping segments
+            seg = dict(name=name, vm=vlo, vms=vhi - vlo, fo=vlo, olds=olds, sects=[])
             # file-backed size: up to the end of the last non-zerofill byte
             fend = max(o['vm'] + o['fs'] for o in olds) + D
             if name == '__DATA_CONST':
                 fend = max(fend, self.pool_hi + D)
             seg['fs'] = align(fend - vlo) if name != '__DATA' else align(fend - vlo)
-            seg['fs'] = min(seg['fs'], seg['vms'])
-            fo += seg['fs']
+            seg['fs'] = seg['vms']
+            fo = vhi
             segs.append(seg)
         # sections
         newsects = []
@@ -1082,6 +1166,32 @@ def verify(a):
     # objc
     ii = m.sect('__DATA_CONST', '__objc_imageinfo')
     chk(not m.u32(ii['addr'] + 4) & 8, 'objc imageinfo flags 0x%x (OptimizedByDyld clear)' % m.u32(ii['addr'] + 4))
+    # dyld reads parts of the file before mapping it: file layout must equal the vm layout, and every
+    # load-command blob must lie inside the file (and inside __LINKEDIT)
+    fsize = len(m.d)
+    base = m.seg('__TEXT')['vm']
+    lay = [s['name'] for s in m.segs if s['fo'] != s['vm'] - base or s['fo'] + s['fs'] > fsize or s['fs'] > s['vms']]
+    lay += ['%s,%s' % (x['seg'], x['name']) for x in m.sects if (x['flags'] & 0xff) != S_ZEROFILL and x['fo'] != x['addr'] - base]
+    chk(not lay, 'every segment and section: fileoff == vmaddr - base, inside the file %s' % lay)
+    le = m.seg('__LINKEDIT')
+    blobs = [('symtab', m.symoff, 16 * m.nsyms), ('strtab', m.stroff, m.strsize),
+             ('indirect', m.dys[12], 4 * m.dys[13]), ('locrel', m.dys[16], 8 * m.dys[17]), ('extrel', m.dys[14], 8 * m.dys[15])]
+    r = m.cmd(LC_DYLD_INFO_ONLY)
+    if r:
+        v = struct.unpack_from('<10I', m.d, r[0] + 8)
+        blobs += [(n, v[2 * i], v[2 * i + 1]) for i, n in enumerate(('rebase', 'bind', 'weak', 'lazy', 'export'))]
+    for c_, n in ((LC_FUNCTION_STARTS, 'fstarts'), (LC_DATA_IN_CODE, 'dic'), (LC_CODE_SIGNATURE, 'codesig'),
+                  (LC_DYLD_EXPORTS_TRIE, 'exports'), (LC_DYLD_CHAINED_FIXUPS, 'chained'), (LC_SEGMENT_SPLIT_INFO, 'split')):
+        r = m.cmd(c_)
+        if r:
+            o, sz = struct.unpack_from('<II', m.d, r[0] + 8)
+            blobs.append((n, o, sz))
+    badb = [(n, hex(o), hex(sz)) for n, o, sz in blobs if sz and not (le['fo'] <= o and o + sz <= min(fsize, le['fo'] + le['fs']))]
+    chk(not badb, '%d load-command blobs inside the file and __LINKEDIT %s' % (sum(1 for b in blobs if b[2]), badb))
+    errs = []
+    ehs = eh_slots(m, errs.append)
+    unb = [(k, hex(a_)) for k, a_ in ehs if a_ not in set(bl)]
+    chk(not errs and not unb, '%d unwind personality / LSDA type slots, all bound %s %s' % (len(ehs), unb, errs))
     objc_check(m, binds, chk, rep)
     rep['verdict'] = 'PASS' if not bad else 'FAIL'
     rep['failures'] = bad
