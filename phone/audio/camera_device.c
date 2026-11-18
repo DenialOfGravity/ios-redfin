@@ -2575,6 +2575,28 @@ mode_fits(const struct redwood_camera_frame *f, uint32_t kind)
 }
 
 /*
+ * (ws-cam-binned) With /private/var/local/camera-binned, the back camera's photo format streams the IMX363's 2x2
+ * binned mode (8: 2016x1512, a quarter of the bytes) while only the moving picture is wanted, and switches to the
+ * full mode (the photo class: 4032x3024) for a photograph and back after it. The file may hold another mode's number.
+ * ~0u: not for this camera, or no file.
+ */
+static uint32_t
+binned_mode(const struct camera *camera)
+{
+	char text[16] = "";
+	int fd = camera->sensor == 1 ? open("/private/var/local/camera-binned", O_RDONLY) : -1;
+	ssize_t n;
+
+	if (fd < 0) {
+		return ~0u;
+	}
+	n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	return n > 0 && text[0] >= '0' && text[0] <= '9' ? (uint32_t)strtoul(text, NULL, 10) : 8;
+}
+enum { BIN_OFF, BIN_PREVIEW, BIN_FULL };
+
+/*
  * The frame rate AE keeps to (redfin, B3): no slower than MinimumFrameRate -- but not below 15 a second unless the
  * graph asked for less than the format's 2 on purpose: the formats say 2, and AVFoundation passes that on as the
  * default --, no faster than MaximumFrameRate, as frame lengths in lines.
@@ -2749,6 +2771,10 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	unsigned failures = 0;
 	const char *why = "stopped";
 	uint64_t idle_since = monotonic_ms();
+	/* (ws-cam-binned) the binned mode for the moving picture; the last frame's exposure, carried over a mode change */
+	uint32_t bin_mode = binned_mode(s->camera), bin_gain = 0, bin_line_ns = 0, bin_settle = 0;
+	int bin = bin_mode != ~0u ? BIN_PREVIEW : BIN_OFF;
+	uint64_t bin_ns = 0, bin_since = 0;
 
 	isp_init(&isp);
 	while (buffer != NULL && worker_wanted(s, generation)) {
@@ -2814,14 +2840,44 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			width = f->width;
 			height = f->height;
 		}
+		/*
+		 * (ws-cam-binned) a mode change of the back camera's: the exposure kept in time, not lines (the modes' lines differ),
+		 * and AE waits for it. The photo format's binned mode is asked for with the flag; without it, one left over from
+		 * an earlier opening is not kept.
+		 */
+		const struct camera_format *fmt = &s->camera->formats[s->format_index & 1];
+		bool small = (int)f->width < fmt->width, bin_able = s->camera->sensor == 1 && fmt->kind == REDWOOD_CAMERA_MODE_PHOTO;
+		bool bin_want = bin_able && bin == BIN_PREVIEW;
+
+		if (bin != BIN_OFF && bin_ns != 0 && f->line_ns != 0 && f->line_ns != bin_line_ns &&
+		    (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_MODE_CHANGED)) {
+			struct redwood_camera_command e = { .command = REDWOOD_CAMERA_EXPOSURE, .a = (uint32_t)(bin_ns / f->line_ns), .b = bin_gain };
+
+			e.a = e.a < 4 ? 4 : e.a;
+			isp.asked = true;
+			isp.asked_lines = e.a;
+			isp.asked_gain = e.b;
+			isp.asked_frame_lines = 0;
+			isp.asked_digital = 0;
+			isp.asked_frames = 0;
+			bin_settle = 0;
+			(void)write(device, &e, sizeof(e));
+		}
+		bin_ns = (uint64_t)f->exposure_lines * f->line_ns;
+		bin_gain = f->gain;
+		bin_line_ns = f->line_ns;
 		/* the format's kind of mode (B3): asked once a format, if the frames are not of it */
-		if (s->mode_wanted || (!mode_asked && !mode_fits(f, s->camera->formats[s->format_index & 1].kind))) {
-			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = REDWOOD_CAMERA_MODE_ANY,
-				.c = s->camera->formats[s->format_index & 1].kind };
+		if (s->mode_wanted || (!mode_asked && (!mode_fits(f, fmt->kind) || (bin_able && small != bin_want)))) {
+			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor,
+				.b = bin_want ? bin_mode : REDWOOD_CAMERA_MODE_ANY, .c = fmt->kind };
 
 			s->mode_wanted = false;
 			mode_asked = true;
-			say("the format wants a %s mode: asked of the kernel", mode_name(c.c));
+			if (bin_want) {
+				say("the format's moving picture from the binned mode %u: asked of the kernel", bin_mode);
+			} else {
+				say("the format wants a %s mode: asked of the kernel", mode_name(c.c));
+			}
 			(void)write(device, &c, sizeof(c));
 		}
 
@@ -2921,6 +2977,19 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			flash = flash == 2 ? lux > 335 : flash;         /* (auto: about 8x at 1/30 s and darker) */
 			if (af_searching(&af) && af.state != AF_WATCH && shot.waited++ < 20) {
 				/* (focus first) */
+			} else if (bin != BIN_OFF && bin_able && (small || (isp.asked && bin_settle++ < 3)) &&
+			    (bin_since == 0 || monotonic_ms() - bin_since < 2000)) {
+				/* (ws-cam-binned) the full mode for the photograph first, and its exposure; the frames go on meanwhile */
+				if (bin == BIN_PREVIEW) {
+					struct redwood_camera_command m = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor,
+						.b = REDWOOD_CAMERA_MODE_ANY, .c = REDWOOD_CAMERA_MODE_PHOTO };
+
+					bin = BIN_FULL;
+					bin_since = monotonic_ms();
+					bin_settle = 0;
+					(void)write(device, &m, sizeof(m));
+					say("a photograph: the full mode asked for");
+				}
 			} else if (!flash || !has_flash) {
 				give_still = true;
 			} else {
@@ -3171,6 +3240,17 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			shot.state = SHOT_IDLE;
 			shot.waited = 0;
 			isp.asked = false;      /* (AE goes on from what the frames say) */
+			if (bin == BIN_FULL && stills_wanted <= 1) {
+				/* (ws-cam-binned) the last photograph asked for: the binned mode again */
+				struct redwood_camera_command m = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = bin_mode,
+					.c = REDWOOD_CAMERA_MODE_PHOTO };
+
+				say("a photograph from %ux%u, %llu ms after the full mode was asked for: the binned mode again", f->width,
+				    f->height, (unsigned long long)(monotonic_ms() - bin_since));
+				bin = BIN_PREVIEW;
+				bin_since = 0;
+				(void)write(device, &m, sizeof(m));
+			}
 		}
 		if (job != NULL) {
 			dispatch_async_f(still_queue(), job, still_made);
