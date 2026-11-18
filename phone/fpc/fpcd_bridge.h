@@ -66,7 +66,7 @@ _Static_assert(sizeof(struct smb_event) == 16384, "smb_event");
 /* smb_event.subtype: bits 0-7 = Apple message index (0xe3ff80xx), bits 8-31 = Apple ordinal/value (0 for fpcd's events) */
 
 /* ---- part 2: fpcd v1 payloads (proposed) ---- */
-#define FPCD_ABI_VERSION	1
+#define FPCD_ABI_VERSION	2	/* 2: struct fpcd_event grew op / percent / hat_status (80 bytes; xnu 1192d) */
 
 /* smb_reply.status: 0 ok, else one of these (negative errno values); a TA status, when there is one, is in data[0..3] */
 #define FPCD_OK			0
@@ -117,7 +117,8 @@ enum fpcd_ev_code {
 	FPCD_EV_ERROR = 12,		/* TZ/TA error during an operation: status */
 };
 #define FPCD_EF_END_UNAUTH	1u	/* end_enrol refused (no hw-auth chain / HAT): enrol failed, stray id deleted */
-#define FPCD_MF_HAT_VERIFIED	1u	/* keymaster verified the HAT (step 5; never set yet) */
+#define FPCD_MF_HAT_VERIFIED	1u	/* the HAT verifier accepted this identify's HAT (sweetfpcd hat_verify(); with the
+					 * built-in "none" verifier it is never set, so the kernel never builds a match) */
 #define FPCD_MW_NO_ALLOW_FILE	1u
 #define FPCD_MW_UNKNOWN_FID	2u
 #define FPCD_MW_HAT_REFUSED	3u
@@ -136,8 +137,20 @@ struct fpcd_event {
 	uint32_t flags;
 	uint32_t n;
 	uint32_t ids[5];
+	/* version 2 (sweetmesa_bridge.h part 2b; the kernel reads these when len >= 80) */
+	uint32_t op;		/* +64 1 enrol, 2 match, 3 detect, 0 none */
+	uint32_t percent;	/* +68 enrol progress 0..100 = samples * 100 / (samples + remaining), 100 when done */
+	int32_t hat_status;	/* +72 MATCH / WITHHELD: HAT verifier result (0 verified; FPCD_HAT_*) */
+	uint32_t reserved;	/* +76 */
 };
+_Static_assert(sizeof(struct fpcd_event) == 80, "fpcd_event v2");
 #define FPCD_EV_MAGIC		0x44435046u	/* "FPCD" */
+/* hat_status */
+#define FPCD_HAT_VERIFIED	0
+#define FPCD_HAT_NONE		(-1)	/* no HAT (get_auth_result failed) */
+#define FPCD_HAT_BAD		(-2)	/* HAT fields wrong (version, challenge, type, authenticator id) */
+#define FPCD_HAT_NO_VERIFIER	(-3)	/* no keymaster verifier available: never "verified" */
+#define FPCD_HAT_REFUSED	(-4)	/* the verifier refused it */
 
 static inline uint32_t fpcd_event_subtype(unsigned code)
 {

@@ -11,6 +11,8 @@
  *   Keymaster: only 0x200, 0x205, 0x1002 (uid 0x7e000001) are ever built; ENROLL 0x1001, DELETE_USER 0x1003,
  *   DELETE_ALL_USERS 0x1004 and every CBOR 0x2xxxx command (0x21003, 0x21004, ...) are refused by km_cmd_allowed().
  *   A write attempt ends the run after the current TA command: no further command, listeners deregistered, exit 6.
+ * ws-fpcd-a: also built as a library part by qsee_gk.c (QSEE_LSNR_LIB: no CLI commands, no qsee_lock(); the
+ * caller holds the QSEE lock), for sweetfpcd's enrol authorisation (qsee_gk.h).
  * Everything is logged to stdout, /dev/console and /var/local/tz/log/lsnr.log. One SMC user at a time:
  * /var/local/tz/qsee.lock (flock) is taken by qseeprobe's main() for every command.
  */
@@ -258,6 +260,73 @@ static void rpmb_info_load(void)
 	lg("rpmb: %s -> INIT size %u rel_wr_count %u dev_type 9", s, rpmb_size_half, rpmb_rwc);
 }
 
+/*
+ * Phase 3 (owner's go, 2026-11-18): authenticated writes relayed through kern.sweet_rpmb_xfer op 2 (kern.sweet_rpmb must
+ * be 2), only while a gatekeeper enroll/verify runs, and only when every frame is type 3 and its address range lies in the
+ * GK partition blocks read in phase 2 (1642..1689). Anything else: refused, counted as a write attempt (halt).
+ * librpmb rpmb_ufs_write: n / rel_wr_count chunks, each OUT rwc frames + OUT result request + IN 1; the result frame of
+ * the last chunk goes back at sb+0x14.
+ */
+#define GK_BLK_LO 1642u
+#define GK_BLK_HI 1690u		/* exclusive */
+static int gk_writes_allowed;
+static unsigned gk_writes_done;
+
+static int32_t rpmb_relay_write(uint8_t *b, uint32_t sb_len, uint32_t n, uint32_t off, uint32_t rwc, uint32_t *rlen)
+{
+	if (!rwc)
+		rwc = n;
+	if (n < 1 || n % rwc || rwc > 64 || off + n * 512 > sb_len) {
+		write_attempt("RPMB WRITE bad layout n %u rwc %u off %#x", n, rwc, off);
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		const uint8_t *f = b + off + i * 512;
+		uint16_t ft = (uint16_t)(f[510] << 8 | f[511]);
+		uint32_t addr = (uint32_t)(f[504] << 8 | f[505]), cnt = (uint32_t)(f[506] << 8 | f[507]);
+		if (ft != 3 || addr < GK_BLK_LO || addr + (cnt ? cnt : 1) > GK_BLK_HI) {
+			write_attempt("RPMB WRITE outside the rule: frame %u type %#06x addr %u count %u (GK range %u..%u)", i, ft,
+				      addr, cnt, GK_BLK_LO, GK_BLK_HI - 1);
+			return -1;
+		}
+	}
+	if (sysctl_int("kern.sweet_rpmb") != 2) {
+		write_attempt("RPMB WRITE while kern.sweet_rpmb != 2");
+		return -1;
+	}
+	uint8_t res_frame[512] = { 0 };
+	for (uint32_t c = 0; c < n / rwc; c++) {
+		const uint8_t *fr = b + off + c * rwc * 512;
+		uint32_t addr = (uint32_t)(fr[504] << 8 | fr[505]), cnt = (uint32_t)(fr[506] << 8 | fr[507]);
+		size_t inl = 12 + (size_t)rwc * 512, olen = sizeof(struct rpmb_res) + 512;
+		uint8_t *in = malloc(inl), o[sizeof(struct rpmb_res) + 512];
+		put_u32(in, 2), put_u32(in + 4, rwc), put_u32(in + 8, rwc);
+		memcpy(in + 12, fr, (size_t)rwc * 512);
+		int r = sysctlbyname("kern.sweet_rpmb_xfer", o, &olen, in, inl);
+		int e = r ? errno : (int)rd_u32(o);
+		free(in);
+		struct rpmb_res res;
+		memcpy(&res, o, sizeof(res));
+		uint16_t rt = 0, rr = 0;
+		uint32_t wc = 0;
+		if (!e && res.nframes == 1) {
+			memcpy(res_frame, o + sizeof(res), 512);
+			rt = (uint16_t)(res_frame[510] << 8 | res_frame[511]);
+			rr = (uint16_t)(res_frame[508] << 8 | res_frame[509]);
+			wc = (uint32_t)res_frame[500] << 24 | res_frame[501] << 16 | res_frame[502] << 8 | res_frame[503];
+		}
+		gk_writes_done++;
+		lg("RPMB WRITE #%u chunk %u/%u: %u frame(s) addr %u count %u -> kernel err %d scsi %#x; result frame type %#06x "
+		   "result %#06x write counter %u", gk_writes_done, c + 1, n / rwc, rwc, addr, cnt, e, r ? 0 : res.scsi_status,
+		   rt, rr, wc);
+		if (e)
+			return -1;
+	}
+	memcpy(b + 0x14, res_frame, 512);
+	*rlen = 512;
+	return 0;
+}
+
 static uint32_t serve_rpmb(uint8_t *b, uint32_t sb_len)
 {
 	uint32_t cmd = g32(b);
@@ -292,7 +361,9 @@ static uint32_t serve_rpmb(uint8_t *b, uint32_t sb_len)
 		note(0x2000, cmd, n, t);
 		int32_t st = -1;
 		uint32_t rlen = 0;
-		if (cmd == 0x103) {
+		if (cmd == 0x103 && gk_writes_allowed) {
+			st = rpmb_relay_write(b, sb_len, n, off, rwc, &rlen);
+		} else if (cmd == 0x103) {
 			write_attempt("RPMB WRITE request: %u frame(s), first frame type %#06x, rel_wr_count %u, req_len %u (not relayed)",
 				      n, t, rwc, blen);
 		} else if (off + 512 > sb_len || n < 1 || n > 64 || 0x14 + n * 512 > sb_len) {
@@ -545,7 +616,11 @@ static int km_cmd_allowed(uint32_t cmd, uint32_t uid)
 		return 1;
 	if (cmd == 0x1002 && uid == GK_UID)
 		return 1;
-	return 0;	/* 0x1001 enroll, 0x1003 delete_user, 0x1004 / 0x21004 delete_all, all 0x2xxxx CBOR: never */
+	if (cmd == 0x207 && uid == 0x207)	/* SET_VERSION: only the stock KeymasterUtils payload (cmd_km_setversion) */
+		return 1;
+	if (cmd == 0x1001 && uid == GK_UID && gk_writes_allowed)	/* phase 3: enroll of the private uid only */
+		return 1;
+	return 0;	/* 0x1001 other uids, 0x1003 delete_user, 0x1004 / 0x21004 delete_all, all 0x2xxxx CBOR: never */
 }
 
 /*
@@ -634,6 +709,7 @@ static int km_appid(uint32_t *id)
 	return 0;
 }
 
+#ifndef QSEE_LSNR_LIB	/* qseeprobe CLI only (qsee_gk.c builds the library part) */
 static void print_notes(void)
 {
 	lg("listener requests seen: %u", n_notes);
@@ -731,6 +807,13 @@ static int listeners_cmd_begin(void)
 	return lsnr_all_up();
 }
 
+static int listeners_cmd_begin_rw(void)
+{
+	lg("kern.sweet_rpmb = %d (phase 3: GK-range writes relayed)", sysctl_int("kern.sweet_rpmb"));
+	rpmb_info_load();
+	return lsnr_all_up();
+}
+
 static int cmd_km_authkey(void)
 {
 	uint32_t km;
@@ -790,6 +873,270 @@ static int cmd_gk_verify_dummy(void)
 	return write_attempts ? 6 : rc ? 2 : 0;
 }
 
+#endif /* QSEE_LSNR_LIB */
+
+/* ---- phase 3 ---- */
+static int rpmb_counter_now(uint32_t *wc)
+{
+	uint8_t f[512] = { 0 }, out[512] = { 0 };
+	arc4random_buf(f + 484, 16);
+	f[511] = 0x02;
+	struct rpmb_res res;
+	if (rpmb_xfer_read(f, 1, out, &res) || memcmp(out + 484, f + 484, 16) || (out[508] << 8 | out[509]) & 0x7f)
+		return -1;
+	*wc = (uint32_t)out[500] << 24 | out[501] << 16 | out[502] << 8 | out[503];
+	return 0;
+}
+
+static void counter_log(const char *when)
+{
+	uint32_t wc;
+	if (rpmb_counter_now(&wc))
+		lg("RPMB write counter %s: read failed", when);
+	else
+		lg("RPMB write counter %s: %u", when, wc);
+}
+
+#ifndef QSEE_LSNR_LIB	/* qseeprobe CLI only (qsee_gk.c builds the library part) */
+/* KeymasterUtils::KeymasterUtils: SET_VERSION {0x207, 4, 5, 4, 5, 0}, req 0x18, rsp sb+0x18 len 0x9fe8 (kmdu 0x2524) */
+static int cmd_km_setversion(void)
+{
+	uint32_t km;
+	int mode = sysctl_int("kern.sweet_rpmb");
+	if (mode != 1) {
+		lg("REFUSED: km-setversion runs with kern.sweet_rpmb = 1 (writes refused), now %d", mode);
+		return 2;
+	}
+	if (km_appid(&km) || listeners_cmd_begin())
+		return 2;
+	counter_log("before SET_VERSION");
+	uint8_t req[0x18] = { 0 }, rsp[0x20] = { 0 };
+	put_u32(req, 0x207), put_u32(req + 4, 4), put_u32(req + 8, 5), put_u32(req + 0xc, 4), put_u32(req + 0x10, 5);
+	int rc = km_send(km, req, 0x18, 0xa000, 0x18, 0x9fe8, rsp, sizeof(rsp), 0x207);
+	lg("km SET_VERSION {0x207, 4, 5, 4, 5}: rc %d status %d words %#x %#x", rc, (int)g32(rsp), g32(rsp + 4), g32(rsp + 8));
+	lsnr_all_down();
+	counter_log("after SET_VERSION");
+	print_notes();
+	return write_attempts ? 6 : rc ? 2 : (int)g32(rsp) ? 5 : 0;
+}
+
+#endif /* QSEE_LSNR_LIB */
+
+#define GK_DIR TZ_DIR "/gk"
+#define GK_HANDLE GK_DIR "/handle-7e000001"
+
+#ifndef QSEE_LSNR_LIB	/* qseeprobe CLI only (qsee_gk.c builds the library part) */
+static int read_pw(char *pw, size_t cap)
+{
+	if (!fgets(pw, (int)cap, stdin))
+		return -1;
+	pw[strcspn(pw, "\r\n")] = 0;
+	size_t n = strlen(pw);
+	return n >= 8 && n < 64 ? (int)n : -1;
+}
+
+static int gk_phase3_begin(uint32_t *km)
+{
+	int mode = sysctl_int("kern.sweet_rpmb");
+	if (mode != 2) {
+		lg("REFUSED: enroll/verify need kern.sweet_rpmb = 2 (now %d)", mode);
+		return -1;
+	}
+	if (km_appid(km) || listeners_cmd_begin_rw())
+		return -1;
+	gk_writes_allowed = 1;
+	return 0;
+}
+
+static void gk_phase3_end(void)
+{
+	gk_writes_allowed = 0;
+	lsnr_all_down();
+}
+
+/* password on stdin; the handle goes to GK_HANDLE (0600) */
+static int cmd_gk_enroll(void)
+{
+	char pw[80];
+	int plen = read_pw(pw, sizeof(pw));
+	if (plen < 0) {
+		lg("gk-enroll: password (8..63 chars) expected on stdin");
+		return 2;
+	}
+	struct stat st;
+	if (!stat(GK_HANDLE, &st)) {
+		lg("gk-enroll: %s exists: refusing a second enroll", GK_HANDLE);
+		return 2;
+	}
+	uint32_t km;
+	if (gk_phase3_begin(&km))
+		return 2;
+	counter_log("before ENROLL");
+	uint8_t req[0x20 + 64] = { 0 }, rsp[0x200] = { 0 };
+	put_u32(req, 0x1001), put_u32(req + 4, GK_UID);	/* no current handle / password */
+	put_u32(req + 0x18, 0x20), put_u32(req + 0x1c, (uint32_t)plen);
+	memcpy(req + 0x20, pw, (size_t)plen);
+	uint32_t req_len = 0x20 + (uint32_t)plen, rsp_off = (req_len + 3) & ~3u;
+	lg("gk ENROLL (legacy 0x1001): uid %#x, new password %d bytes (not shown), req %u, rsp +%#x", GK_UID, plen, req_len,
+	   rsp_off);
+	int rc = km_send(km, req, req_len, 0xa000, rsp_off, 0xa000 - rsp_off, rsp, sizeof(rsp), GK_UID);
+	memset(req, 0, sizeof(req)), memset(pw, 0, sizeof(pw));
+	int32_t kst = (int32_t)g32(rsp);
+	uint32_t hoff = g32(rsp + 4), hlen = g32(rsp + 8);
+	lg("gk ENROLL: rc %d status %d handle_off %u handle_len %u retry %#x", rc, kst, hoff, hlen, g32(rsp + 0xc));
+	gk_phase3_end();
+	counter_log("after ENROLL");
+	int ok = !rc && !kst && hlen && hlen <= 0x100 && hoff + hlen <= sizeof(rsp);
+	if (ok) {
+		const uint8_t *h = rsp + hoff;
+		uint64_t sid = 0;
+		for (int i = 8; i >= 1; i--)
+			sid = sid << 8 | h[i];	/* password_handle_t: u8 version, u64 user_id (LE) */
+		mkdir(GK_DIR, 0700);
+		int fd = open(GK_HANDLE, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd < 0 || write(fd, h, hlen) != (ssize_t)hlen)
+			ok = 0;
+		if (fd >= 0)
+			close(fd);
+		lg("gk ENROLL: handle %u bytes, version %u, secure user id (SID) %#llx, hw-backed %u -> %s%s", hlen, h[0],
+		   (unsigned long long)sid, hlen >= 58 ? h[57] : 0, GK_HANDLE, ok ? "" : " (SAVE FAILED)");
+	}
+	print_notes();
+	return write_attempts ? 6 : ok ? 0 : 5;
+}
+
+#endif /* QSEE_LSNR_LIB */
+
+/* verify with the saved handle; hat (69 bytes) returned to the caller only, never printed except id fields */
+static int gk_verify_real(uint32_t km, uint64_t challenge, const char *pw, uint8_t hat[69], uint32_t *hat_len)
+{
+	uint8_t handle[0x100];
+	int fd = open(GK_HANDLE, O_RDONLY);
+	ssize_t hl = fd >= 0 ? read(fd, handle, sizeof(handle)) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (hl <= 0) {
+		lg("gk verify: no saved handle %s", GK_HANDLE);
+		return -1;
+	}
+	uint32_t plen = (uint32_t)strlen(pw);
+	uint8_t req[0x20 + 0x100 + 64] = { 0 }, rsp[0x200] = { 0 };
+	put_u32(req, 0x1002), put_u32(req + 4, GK_UID), put_u64(req + 8, challenge);
+	put_u32(req + 0x10, 0x20), put_u32(req + 0x14, (uint32_t)hl);
+	put_u32(req + 0x18, 0x20 + (uint32_t)hl), put_u32(req + 0x1c, plen);
+	memcpy(req + 0x20, handle, (size_t)hl);
+	memcpy(req + 0x20 + hl, pw, plen);
+	uint32_t req_len = 0x20 + (uint32_t)hl + plen, rsp_off = (req_len + 3) & ~3u;
+	counter_log("before VERIFY");
+	lg("gk VERIFY (legacy 0x1002): uid %#x challenge %#llx, handle %zd bytes, password %u bytes (not shown)", GK_UID,
+	   (unsigned long long)challenge, hl, plen);
+	int rc = km_send(km, req, req_len, 0xa000, rsp_off, 0xa000 - rsp_off, rsp, sizeof(rsp), GK_UID);
+	memset(req, 0, sizeof(req));
+	int32_t kst = (int32_t)g32(rsp);
+	uint32_t hoff = g32(rsp + 4), hlen = g32(rsp + 8);
+	lg("gk VERIFY: rc %d status %d hat_off %u hat_len %u retry_timeout %#x", rc, kst, hoff, hlen, g32(rsp + 0xc));
+	*hat_len = 0;
+	if (!rc && !kst && hlen == 69 && hoff + hlen <= sizeof(rsp)) {
+		const uint8_t *t = rsp + hoff;
+		memcpy(hat, t, 69);
+		*hat_len = 69;
+		uint64_t ch = 0, uid = 0, aid = 0;
+		for (int i = 8; i >= 1; i--)
+			ch = ch << 8 | t[i];
+		for (int i = 16; i >= 9; i--)
+			uid = uid << 8 | t[i];
+		for (int i = 24; i >= 17; i--)
+			aid = aid << 8 | t[i];
+		uint32_t atype = (uint32_t)t[25] << 24 | t[26] << 16 | t[27] << 8 | t[28];
+		lg("gk VERIFY: HAT version %u challenge %#llx%s user_id(SID) %#llx authenticator_id %#llx authenticator_type %u%s "
+		   "(HMAC not shown)", t[0], (unsigned long long)ch, ch == challenge ? " (echoed)" : " (NOT the challenge)",
+		   (unsigned long long)uid, (unsigned long long)aid, atype, atype == 1 ? " PASSWORD" : "");
+	}
+	memset(rsp, 0, sizeof(rsp));
+	counter_log("after VERIFY");
+	return rc ? -1 : kst;
+}
+
+#ifndef QSEE_LSNR_LIB	/* qseeprobe CLI only */
+static int cmd_gk_verify(uint64_t challenge)
+{
+	char pw[80];
+	if (read_pw(pw, sizeof(pw)) < 0) {
+		lg("gk-verify: password expected on stdin");
+		return 2;
+	}
+	uint32_t km, hl;
+	uint8_t hat[69];
+	if (gk_phase3_begin(&km))
+		return 2;
+	int r = gk_verify_real(km, challenge, pw, hat, &hl);
+	memset(pw, 0, sizeof(pw)), memset(hat, 0, sizeof(hat));
+	gk_phase3_end();
+	print_notes();
+	return write_attempts ? 6 : r ? 5 : hl == 69 ? 0 : 5;
+}
+
+/*
+ * FPC hw-auth chain, no finger (fpc HAL: fpc_tee_init_hw_auth @0xfee8, fpc_tee_get_enrol_challenge @0xf800,
+ * fpc_tee_authorize_enrol @0xf84c): KM 0x205 key blob (memory only) -> FPC {3,5, status, len, blob} ->
+ * FPC {3,2} challenge (u64 at +0x10) -> GK verify(challenge) -> FPC {3,3, status, len, HAT} authorize_enrol.
+ * Password on stdin. kern.sweet_rpmb must be 2 (verify writes the GK failure record).
+ */
+static int cmd_fpc_hwauth(uint32_t appid)
+{
+	char pw[80];
+	if (read_pw(pw, sizeof(pw)) < 0) {
+		lg("fpc-hwauth: password expected on stdin");
+		return 2;
+	}
+	if (check_appid(appid))
+		return 2;
+	uint32_t km, hl = 0;
+	if (gk_phase3_begin(&km))
+		return 2;
+	int rc = 5;
+	uint8_t rsp[0x3c0] = { 0 }, d[0x400] = { 0 }, hat[69] = { 0 };
+	uint8_t req[0x40] = { 0 };
+	put_u32(req, 0x205), put_u32(req + 4, 2);
+	int r = km_send(km, req, 0x40, 0x1000, 0x40, 0x3c0, rsp, sizeof(rsp), 0);
+	int32_t kst = (int32_t)g32(rsp);
+	uint32_t koff = g32(rsp + 4), klen = g32(rsp + 8);
+	lg("fpc-hwauth: KM GET_AUTH_TOKEN_KEY rc %d status %d key blob length %u (not shown)", r, kst, klen);
+	if (r || kst || !klen || klen > sizeof(d) - 0x10 || koff + klen > sizeof(rsp))
+		goto out;
+	put_u32(d, 3), put_u32(d + 4, 5), put_u32(d + 0xc, klen);
+	memcpy(d + 0x10, rsp + koff, klen);
+	memset(rsp, 0, sizeof(rsp));
+	r = fpc_send64(appid, d, 0x10 + klen, "fpc init_hw_auth (3,5)");
+	int32_t ist = (int32_t)g32(d + 8);
+	lg("fpc-hwauth: init_hw_auth (3,5): send rc %d TA status %d", r, ist);
+	memset(d, 0, sizeof(d));
+	if (r || ist)
+		goto out;
+	put_u32(d, 3), put_u32(d + 4, 2);
+	r = fpc_send64(appid, d, FPC_SENSOR_LEN, "fpc get_enrol_challenge (3,2)");	/* the HAL's shared 0x58 buffer */
+	uint64_t ch = (uint64_t)g32(d + 0x10) | (uint64_t)g32(d + 0x14) << 32;
+	int32_t cst = (int32_t)g32(d + 8);
+	lg("fpc-hwauth: get_enrol_challenge (3,2): send rc %d TA status %d challenge %#llx", r, cst, (unsigned long long)ch);
+	if (r || cst || !ch)
+		goto out;
+	int v = gk_verify_real(km, ch, pw, hat, &hl);
+	if (v || hl != 69)
+		goto out;
+	memset(d, 0, sizeof(d));
+	put_u32(d, 3), put_u32(d + 4, 3), put_u32(d + 0xc, 69);
+	memcpy(d + 0x10, hat, 69);
+	r = fpc_send64(appid, d, 0x10 + 69, "fpc authorize_enrol (3,3)");
+	lg("fpc-hwauth: authorize_enrol (3,3) with the HAT: send rc %d TA status %d", r, (int)g32(d + 8));
+	rc = r || g32(d + 8) ? 5 : 0;
+out:
+	memset(pw, 0, sizeof(pw)), memset(hat, 0, sizeof(hat)), memset(d, 0, sizeof(d)), memset(rsp, 0, sizeof(rsp));
+	gk_phase3_end();
+	print_notes();
+	lg("fpc-hwauth: %s", write_attempts ? "HALTED (write attempt)" : rc ? "FAILED (see statuses)" : "ALL PASSED: enrol-test can run with a finger");
+	return write_attempts ? 6 : rc;
+}
+
 static int lock_fd = -1;
 static int qsee_lock(void)
 {
@@ -803,3 +1150,4 @@ static int qsee_lock(void)
 	lsnr_log = fopen(TZ_DIR "/log/lsnr.log", "a");
 	return 0;
 }
+#endif /* QSEE_LSNR_LIB */

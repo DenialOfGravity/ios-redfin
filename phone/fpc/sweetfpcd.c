@@ -28,13 +28,27 @@
  * Templates live in TA memory only (no store_template_db); the Apple catacomb commands answer UNSUPPORTED.
  *
  * SAFETY: a match is reported only by match_deliver(), only for a TA identify status 0 with a finger id the TA lists,
- * and only while /var/local/fpc/allow-match exists (absent by default). The kernel gates again (kern.sweet_mesa_match).
- * fpcd_verify_hat() is the step-5 hook for keymaster/HAT verification (not implemented: matches carry no
- * FPCD_MF_HAT_VERIFIED flag; FPCD_REQUIRE_HAT=1 withholds every match until it is).
+ * and only while /var/local/fpc/allow-match exists (absent by default). The kernel gates again (kern.sweet_mesa_match)
+ * and (xnu 1192d) builds an identity match only when the event carries FPCD_MF_HAT_VERIFIED.
+ *
+ * Bridge v2 (ABI 2, xnu 1192d): events carry op / percent / hat_status; the kernel turns them into Apple messages.
+ * Enrol authorisation (ENROL): before begin_enrol, the FPC hw-auth chain qsee_fpc_authorize_enrol() (phone/qsee/
+ * qsee_gk.c, moved from qseeprobe ws-qsee-b e1bf971): KM 0x205 -> (3,5) -> (3,2) challenge -> a credential source
+ * gives a gatekeeper HAT for it -> (3,3) authorize_enrol. Credential sources (env FPCD_CRED, pluggable table cred_src[]):
+ *   gk-test-file (default, STOP-GAP until iOS passcode support): gatekeeper VERIFY of the private test uid 0x7e000001
+ *     (handle from qseeprobe gk-enroll) with the password in /var/local/fpc/gk-test.pw (root-owned, mode 0600, never
+ *     logged); kern.sweet_rpmb is set to 2 only around that verify and back to 1, both logged.
+ *   none: never authorised (end_enrol refuses; the enrol fails, nothing is kept).
+ * Match HAT check (MATCH): (3,1) set_auth_challenge(random) before each identify, (3,4) get_auth_result after status 0,
+ * field check (version 0, challenge echoed, type fingerprint, authenticator id = template db id), then a HAT verifier
+ * (env FPCD_HAT_VERIFIER, table hat_vfy[]). Only "none" exists: no keymaster begin/finish client is built (the QTI
+ * keymaster64 operation protocol is not reversed and its commands are outside qsee_lsnr's whitelist), so
+ * FPCD_MF_HAT_VERIFIED is never set and no match ever reaches biometrickitd.
  *
  * Environment: FPCD_TA_DIR (/var/local/fpc/ta), FPCD_TA_FILE (fpctzappfingerprint), FPCD_TA_NAME (fingerprint),
  * FPCD_OP_TIMEOUT_MS (120000, 0 = none), FPCD_CONSOLE=1 (mirror log lines to /dev/console), FPCD_KEEP_TA=1,
- * FPCD_REQUIRE_HAT=1, FPCD_VERBOSE=1 (every SMC line of qsee_lib), QSEE_NOLOCK / QSEE_LOCK as qsee_lib.
+ * FPCD_REQUIRE_HAT=1, FPCD_VERBOSE=1 (every SMC line of qsee_lib), QSEE_NOLOCK / QSEE_LOCK as qsee_lib,
+ * FPCD_CRED (gk-test-file | none), FPCD_HAT_VERIFIER (none).
  * Log: stderr (launchd: /var/local/fpc/sweetfpcd.log). Exit codes: 0 ok, 1 usage/setup, 2 TA/sensor, 9 lock held.
  */
 #include <errno.h>
@@ -53,6 +67,7 @@
 #include <IOKit/IOKitLib.h>
 #include "../video/pmem.h"
 #include "../qsee/qsee_lib.h"
+#include "../qsee/qsee_gk.h"
 #include "fpcd_bridge.h"
 
 #ifndef FPCD_VERSION
@@ -204,16 +219,17 @@ static void bridge_close(void)
 	pthread_mutex_unlock(&ev_mx);
 }
 
-static void ev_send(unsigned code, int32_t status, uint32_t fid, int32_t score, uint32_t remaining, uint32_t samples,
-		    uint32_t flags, int with_ids)
+static void ev_send2(unsigned code, int32_t status, uint32_t fid, int32_t score, uint32_t remaining, uint32_t samples,
+		     uint32_t flags, int with_ids, uint32_t percent, int32_t hat_status)
 {
 	static struct smb_event e;	/* under ev_mx */
 	struct fpcd_event ev = { .magic = FPCD_EV_MAGIC, .version = FPCD_ABI_VERSION, .code = (uint16_t)code,
 				 .status = status, .fid = fid, .score = score, .remaining = remaining,
-				 .samples = samples, .flags = flags };
+				 .samples = samples, .flags = flags, .percent = percent, .hat_status = hat_status };
 	pthread_mutex_lock(&st_mx);
 	ev.evseq = ++S.evseq;
 	ev.op_gen = S.gen;
+	ev.op = (uint32_t)S.op;
 	if (with_ids) {
 		ev.n = S.nids;
 		memcpy(ev.ids, S.ids, sizeof(ev.ids));
@@ -234,9 +250,15 @@ static void ev_send(unsigned code, int32_t status, uint32_t fid, int32_t score, 
 					       NULL);
 	}
 	pthread_mutex_unlock(&ev_mx);
-	lg("event #%u code %u sub %#x: status %d fid %#x score %d remaining %u samples %u flags %#x n %u -> %s", ev.evseq,
-	   code, SMB_MSG_BASE + fpcd_event_subtype(code), status, fid, score, remaining, samples, flags, ev.n,
-	   !conn ? "no bridge (logged only)" : kr ? "EVENT failed" : "sent");
+	lg("event #%u code %u sub %#x: status %d fid %#x score %d remaining %u samples %u flags %#x n %u op %u pct %u hat %d"
+	   " -> %s", ev.evseq, code, SMB_MSG_BASE + fpcd_event_subtype(code), status, fid, score, remaining, samples, flags,
+	   ev.n, ev.op, percent, hat_status, !conn ? "no bridge (logged only)" : kr ? "EVENT failed" : "sent");
+}
+
+static void ev_send(unsigned code, int32_t status, uint32_t fid, int32_t score, uint32_t remaining, uint32_t samples,
+		    uint32_t flags, int with_ids)
+{
+	ev_send2(code, status, fid, score, remaining, samples, flags, with_ids, 0, 0);
 }
 
 /* ---------------------------------------------------------------- TA helpers (caller holds ta_mx) */
@@ -416,12 +438,77 @@ static int capture_once(uint32_t gen, int32_t *st4, long deadline)
 	}
 }
 
-/* Step 5 hook: keymaster verification of the FPC HAT for this identify (KM begin -> challenge -> g3/4 get_auth_result
- * -> KM update/finish). Not implemented: returns 0 = not verified (no flag). 1 = verified, -1 = refused. */
-static int fpcd_verify_hat(uint32_t fid)
+/*
+ * HAT verifiers (env FPCD_HAT_VERIFIER, default "none"). A verifier gets the identify HAT (already field-checked) and
+ * returns FPCD_HAT_VERIFIED only if keymaster64 proved the HMAC (e.g. KM begin on a key bound to the FPC authenticator
+ * id with per-operation auth, the op handle as the identify challenge, then update/finish with this HAT). No such
+ * client exists yet (QTI keymaster64 operation protocol not reversed; its commands are outside qsee_lsnr's whitelist),
+ * so the only verifier is "none": FPCD_HAT_NO_VERIFIER, never verified.
+ */
+typedef int32_t (*hat_verify_fn)(const uint8_t hat[QSEE_HAT_LEN], uint64_t challenge);
+static int32_t hat_vfy_none(const uint8_t hat[QSEE_HAT_LEN], uint64_t challenge)
 {
-	(void)fid;
-	return 0;
+	(void)hat, (void)challenge;
+	return FPCD_HAT_NO_VERIFIER;
+}
+static const struct { const char *name; hat_verify_fn fn; } hat_vfy[] = {
+	{ "none", hat_vfy_none },
+};
+static hat_verify_fn hat_verifier = hat_vfy_none;
+static const char *hat_verifier_name = "none";
+
+/* the challenge handed to the TA for the running identify (set_auth_challenge), 0 = none */
+static uint64_t auth_challenge;
+
+/* (3,1) before an identify: a fresh random challenge (a keymaster verifier would use its op handle). caller: ta_mx */
+static void auth_challenge_set(void)
+{
+	uint64_t ch = 0;
+	int32_t st = 0;
+	while (!ch)
+		arc4random_buf(&ch, sizeof(ch));
+	int r = qsee_fpc_set_auth_challenge(appid, ch, &st);
+	auth_challenge = !r && !st ? ch : 0;
+	if (r || st)
+		lg("match: set_auth_challenge (3,1) rc %d status %d: no HAT check possible for this identify", r, st);
+}
+
+/*
+ * After identify status 0 (caller: ta_mx): (3,4) get_auth_result, field check, verifier. Returns FPCD_HAT_*; the HMAC
+ * is never logged.
+ */
+static int32_t fpcd_verify_hat(uint32_t fid)
+{
+	uint8_t hat[QSEE_HAT_LEN] = { 0 };
+	int32_t st = 0, v;
+	struct qsee_hat_info hi;
+	if (!auth_challenge)
+		return FPCD_HAT_NONE;
+	int r = qsee_fpc_get_auth_result(appid, hat, &st);
+	if (r || st) {
+		lg("match: get_auth_result (3,4) rc %d status %d: no HAT", r, st);
+		return FPCD_HAT_NONE;
+	}
+	qsee_hat_parse(hat, &hi);
+	pthread_mutex_lock(&st_mx);
+	uint64_t dbid = S.dbid;
+	int dbid_ok = S.dbid_valid;
+	pthread_mutex_unlock(&st_mx);
+	int ok = hi.version == 0 && hi.challenge == auth_challenge && hi.authenticator_type == 2 &&
+		 (!dbid_ok || hi.authenticator_id == dbid);
+	lg("match: HAT fid %#x version %u challenge %s type %u authenticator id %#llx (db id %#llx%s) SID %#llx -> fields %s",
+	   fid, hi.version, hi.challenge == auth_challenge ? "echoed" : "NOT echoed", hi.authenticator_type,
+	   (unsigned long long)hi.authenticator_id, (unsigned long long)dbid, dbid_ok ? "" : ", unknown",
+	   (unsigned long long)hi.user_id, ok ? "ok" : "WRONG");
+	if (!ok)
+		v = FPCD_HAT_BAD;
+	else
+		v = hat_verifier(hat, auth_challenge);
+	memset(hat, 0, sizeof(hat));
+	auth_challenge = 0;
+	lg("match: HAT verifier \"%s\": %s", hat_verifier_name, v == FPCD_HAT_VERIFIED ? "VERIFIED" :
+	   v == FPCD_HAT_NO_VERIFIER ? "no keymaster verifier: NOT verified" : "NOT verified");
+	return v;
 }
 
 /*
@@ -429,18 +516,17 @@ static int fpcd_verify_hat(uint32_t fid)
  * TA lists, /var/local/fpc/allow-match exists, the HAT hook did not refuse (and verified it, with FPCD_REQUIRE_HAT=1).
  * Anything else -> MATCH_WITHHELD (never a match). Returns 1 iff a match was sent.
  */
-static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_t attempts)
+static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_t attempts, int32_t hat)
 {
 	struct stat sb;
 	uint32_t why = 0;
-	int hat = 0;
 	if (ta_status != 0)
 		return 0;
 	if (!fid_listed(fid))
 		why = FPCD_MW_UNKNOWN_FID;
 	else if (stat(ALLOW_MATCH_PATH, &sb))
 		why = FPCD_MW_NO_ALLOW_FILE;
-	else if ((hat = fpcd_verify_hat(fid)) < 0 || (require_hat && hat != 1))
+	else if (hat == FPCD_HAT_BAD || hat == FPCD_HAT_REFUSED || (require_hat && hat != FPCD_HAT_VERIFIED))
 		why = FPCD_MW_HAT_REFUSED;
 	if (why) {
 		pthread_mutex_lock(&st_mx);
@@ -449,14 +535,15 @@ static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_
 		lg("match: identify status 0 fid %#x score %d WITHHELD (%s)", fid, score,
 		   why == FPCD_MW_UNKNOWN_FID ? "fid not in the TA list" :
 		   why == FPCD_MW_NO_ALLOW_FILE ? ALLOW_MATCH_PATH " absent" : "HAT not verified");
-		ev_send(FPCD_EV_MATCH_WITHHELD, ta_status, fid, score, 0, attempts, why, 0);
+		ev_send2(FPCD_EV_MATCH_WITHHELD, ta_status, fid, score, 0, attempts, why, 0, 0, hat);
 		return 0;
 	}
 	pthread_mutex_lock(&st_mx);
 	S.matches++;
 	pthread_mutex_unlock(&st_mx);
-	lg("match: fid %#x score %d attempts %u, HAT %s", fid, score, attempts, hat == 1 ? "verified" : "NOT verified (step 5)");
-	ev_send(FPCD_EV_MATCH, 0, fid, score, 0, attempts, hat == 1 ? FPCD_MF_HAT_VERIFIED : 0, 0);
+	lg("match: fid %#x score %d attempts %u, HAT %s", fid, score, attempts,
+	   hat == FPCD_HAT_VERIFIED ? "verified" : "NOT verified (the kernel will not deliver it as a match)");
+	ev_send2(FPCD_EV_MATCH, 0, fid, score, 0, attempts, hat == FPCD_HAT_VERIFIED ? FPCD_MF_HAT_VERIFIED : 0, 0, 0, hat);
 	return 1;
 }
 
@@ -513,8 +600,11 @@ static void run_enrol(uint32_t gen)
 		uint32_t rem = rd_u32(d + 0xc);
 		if (st == 0 || st == 1)
 			samples++;	/* 4 partial, 5 too similar, 6 dirty: non-fatal, sample not taken; touch again */
-		lg("enrol: code %d (%s), remaining %u, accepted %d", st, enrol_code(st), rem, samples);
-		ev_send(FPCD_EV_ENROL_PROGRESS, st, 0, 0, rem, (uint32_t)samples, 0, 0);
+		uint32_t pct = st == 0 ? 100 : (samples + rem) ? (uint32_t)samples * 100 / ((uint32_t)samples + rem) : 0;
+		if (pct > 100)
+			pct = 100;
+		lg("enrol: code %d (%s), remaining %u, accepted %d, %u%%", st, enrol_code(st), rem, samples, pct);
+		ev_send2(FPCD_EV_ENROL_PROGRESS, st, 0, 0, rem, (uint32_t)samples, 0, 0, pct, 0);
 		if (st == 2 || st == 3 || st < 0) {
 			ev_send(FPCD_EV_ENROL_FAILED, st, 0, 0, rem, (uint32_t)samples, 0, 0);
 			return;
@@ -549,8 +639,8 @@ static void run_enrol(uint32_t gen)
 				lg("enrol: deleting unauthorised id %#x: delete rc %d", stray[i], fpc_delete(appid, stray[i]));
 			ids_refresh();
 			pthread_mutex_unlock(&ta_mx);
-			lg("enrol: FAILED: NOT AUTHORIZED (end_enrol rc %d status %d; needs the hw-auth chain: init_hw_auth, "
-			   "enrol challenge, gatekeeper verify, authorize_enrol with the HAT; not implemented)", r, st2);
+			lg("enrol: FAILED: NOT AUTHORIZED (end_enrol rc %d status %d; the hw-auth chain did not authorise this "
+			   "enrol: see the \"enrol: authorisation\" line)", r, st2);
 			ev_send(FPCD_EV_ENROL_FAILED, FPCD_E_NOTAUTH, 0, 0, 0, (uint32_t)samples, FPCD_EF_END_UNAUTH, 1);
 			ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
 			return;
@@ -572,8 +662,13 @@ static void run_match(uint32_t gen)
 		if (st4)
 			continue;
 		uint8_t d[FPC_SENSOR_LEN] = { 0 };
+		int32_t hat = FPCD_HAT_NONE;
 		pthread_mutex_lock(&ta_mx);
+		auth_challenge_set();
 		int r = ta_bio(3, d, &st);
+		if (!r && st == 0)
+			hat = fpcd_verify_hat(rd_u32(d + 0xc));
+		auth_challenge = 0;
 		pthread_mutex_unlock(&ta_mx);
 		if (r) {
 			ev_send(FPCD_EV_ERROR, -5, 0, 0, 0, 0, 0, 0);
@@ -585,7 +680,7 @@ static void run_match(uint32_t gen)
 		lg("identify %u: status %d fid %#x score %d coverage %d quality %d result %d", attempts, st, fid, score,
 		   (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14), (int)rd_u32(d + 0x1c));
 		if (st == 0 && !cancelled(gen)) {
-			match_deliver(st, fid, score, attempts);
+			match_deliver(st, fid, score, attempts, hat);
 			return;	/* one result per MatchMode: delivered or withheld */
 		}
 		pthread_mutex_lock(&st_mx);
@@ -884,16 +979,103 @@ static int h_catacomb_id(const struct smb_req *q, struct smb_reply *p)
 }
 
 /*
- * Enrol authorisation hook (hw-auth chain, proven by qseeprobe ws-qsee-b e1bf971 on 2026-11-18, NOT done here):
- * with the FPC TA loaded: keymaster 0x205 (auth token key), FPC g3/5 init_hw_auth, g3/2 get_enrol_challenge,
- * gatekeeper VERIFY with that challenge (needs RPMB writes + the passcode), g3/3 authorize_enrol with the HAT.
- * Until it exists this returns 1 (= not authorised): the enrol still runs (samples, progress), but end_enrol gives
- * -1 and the enrol ends with ENROL_FAILED status FPCD_E_NOTAUTH; nothing is kept.
+ * Credential sources for the enrol authorisation (env FPCD_CRED). Each gets the keymaster64 app id and the FPC enrol
+ * challenge inside qsee_fpc_authorize_enrol()'s listener window and must return 0 with a gatekeeper HAT for exactly
+ * that challenge. Add the iOS passcode source (SweetKeyStore) here when it exists; gk-test-file is a stop-gap.
+ */
+#define GK_TEST_PW_PATH		"/var/local/fpc/gk-test.pw"
+#define RPMB_SYSCTL		"kern.sweet_rpmb"
+
+static int rpmb_mode_set(int v, const char *why)
+{
+	int old = -1;
+	size_t sz = sizeof(old);
+	sysctlbyname(RPMB_SYSCTL, &old, &sz, NULL, 0);
+	int r = sysctlbyname(RPMB_SYSCTL, NULL, NULL, &v, sizeof(v));
+	lg("%s %d -> %d (%s): %s", RPMB_SYSCTL, old, v, why, r ? strerror(errno) : "ok");
+	return r ? -1 : 0;
+}
+
+/* the test password: a root-owned regular file, mode exactly 0600; 8..63 chars; the content is never logged */
+static int gk_test_pw_read(char *pw, size_t cap)
+{
+	struct stat sb;
+	if (lstat(GK_TEST_PW_PATH, &sb)) {
+		lg("cred gk-test-file: %s: %s", GK_TEST_PW_PATH, strerror(errno));
+		return -1;
+	}
+	if (!S_ISREG(sb.st_mode) || sb.st_uid != 0 || (sb.st_mode & 07777) != 0600) {
+		lg("cred gk-test-file: %s refused (must be a root-owned regular file, mode 0600; is uid %u mode %o)",
+		   GK_TEST_PW_PATH, (unsigned)sb.st_uid, (unsigned)(sb.st_mode & 07777));
+		return -1;
+	}
+	int fd = open(GK_TEST_PW_PATH, O_RDONLY | O_NOFOLLOW);
+	ssize_t n = fd >= 0 ? read(fd, pw, cap - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n <= 0) {
+		lg("cred gk-test-file: %s unreadable", GK_TEST_PW_PATH);
+		return -1;
+	}
+	pw[n] = 0;
+	pw[strcspn(pw, "\r\n")] = 0;
+	size_t len = strlen(pw);
+	if (len < 8 || len > 63) {
+		memset(pw, 0, cap);
+		lg("cred gk-test-file: password length out of range (8..63)");
+		return -1;
+	}
+	return 0;
+}
+
+static int cred_gk_test_file(void *ctx, uint32_t km, uint64_t challenge, uint8_t hat[QSEE_HAT_LEN])
+{
+	(void)ctx;
+	char pw[80];
+	uint32_t hl = 0;
+	if (gk_test_pw_read(pw, sizeof(pw)))
+		return -1;
+	if (rpmb_mode_set(2, "gatekeeper verify of the test uid 0x7e000001 only")) {
+		memset(pw, 0, sizeof(pw));
+		rpmb_mode_set(1, "restore after a failed switch");
+		return -1;
+	}
+	int r = qsee_gk_verify(km, challenge, pw, hat, &hl);
+	memset(pw, 0, sizeof(pw));
+	rpmb_mode_set(1, "gatekeeper verify done");
+	lg("cred gk-test-file: gatekeeper verify uid %#x challenge %#llx: %s (HAT %u bytes, not shown)", QSEE_GK_UID,
+	   (unsigned long long)challenge, !r && hl == QSEE_HAT_LEN ? "ok" : "FAILED", hl);
+	return !r && hl == QSEE_HAT_LEN ? 0 : -1;
+}
+
+static int cred_none(void *ctx, uint32_t km, uint64_t challenge, uint8_t hat[QSEE_HAT_LEN])
+{
+	(void)ctx, (void)km, (void)challenge, (void)hat;
+	lg("cred none: no credential source configured: enrol not authorised");
+	return -1;
+}
+
+static const struct { const char *name; qsee_hat_source_fn fn; } cred_src[] = {
+	{ "gk-test-file", cred_gk_test_file },	/* stop-gap: test uid 0x7e000001 + GK_TEST_PW_PATH */
+	{ "none", cred_none },
+	/* { "passcode", cred_passcode }: the iOS passcode via SweetKeyStore (not written yet) */
+};
+static qsee_hat_source_fn cred_fn = cred_gk_test_file;
+static const char *cred_name = "gk-test-file";
+
+/*
+ * Enrol authorisation (caller holds ta_mx; the FPC TA is loaded): the hw-auth chain with the configured credential
+ * source. 0 = authorised (end_enrol will commit the template); else the enrol still runs (samples, progress) but
+ * end_enrol refuses with -1 and the enrol ends with ENROL_FAILED FPCD_E_NOTAUTH; nothing is kept.
  */
 static int fpcd_enrol_authorize(uint32_t gid)
 {
-	lg("enrol: hw-auth chain not implemented: this enrol cannot be committed (end_enrol will refuse)");
-	return 1;
+	int32_t st = 0;
+	long t0 = now_ms();
+	int r = qsee_fpc_authorize_enrol(appid, cred_fn, NULL, &st);
+	lg("enrol: authorisation gid %u via \"%s\": %s (step %d, status %d, %ld ms)", gid, cred_name,
+	   r ? "NOT authorised (end_enrol will refuse)" : "authorised", r, st, now_ms() - t0);
+	return r ? 1 : 0;
 }
 
 static int h_enrol(const struct smb_req *q, struct smb_reply *p)
@@ -908,7 +1090,9 @@ static int h_enrol_continue(const struct smb_req *q, struct smb_reply *p)
 	pthread_mutex_lock(&st_mx);
 	int op = S.op;
 	pthread_mutex_unlock(&st_mx);
-	return op == OP_ENROL ? FPCD_OK : FPCD_E_INVAL;	/* the capture thread continues by itself */
+	if (op != OP_ENROL)
+		lg("EnrollContinue with no enrol running (late after the last sample): acknowledged");
+	return FPCD_OK;	/* libBKDM1 sends one after every progress status; the capture thread continues by itself */
 }
 
 static int h_match(const struct smb_req *q, struct smb_reply *p)
@@ -1320,6 +1504,26 @@ int main(int argc, char **argv)
 		op_timeout_ms = atol(e);
 	keep_ta |= (e = getenv("FPCD_KEEP_TA")) && atoi(e);
 	require_hat = (e = getenv("FPCD_REQUIRE_HAT")) && atoi(e);
+	if ((e = getenv("FPCD_CRED")) && *e) {
+		cred_fn = NULL;
+		for (unsigned i = 0; i < sizeof(cred_src) / sizeof(cred_src[0]); i++)
+			if (!strcmp(e, cred_src[i].name))
+				cred_fn = cred_src[i].fn, cred_name = cred_src[i].name;
+		if (!cred_fn) {
+			fprintf(stderr, "sweetfpcd: FPCD_CRED=%s unknown (gk-test-file | none)\n", e);
+			return 1;
+		}
+	}
+	if ((e = getenv("FPCD_HAT_VERIFIER")) && *e) {
+		hat_verifier = NULL;
+		for (unsigned i = 0; i < sizeof(hat_vfy) / sizeof(hat_vfy[0]); i++)
+			if (!strcmp(e, hat_vfy[i].name))
+				hat_verifier = hat_vfy[i].fn, hat_verifier_name = hat_vfy[i].name;
+		if (!hat_verifier) {
+			fprintf(stderr, "sweetfpcd: FPCD_HAT_VERIFIER=%s unknown (none)\n", e);
+			return 1;
+		}
+	}
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
