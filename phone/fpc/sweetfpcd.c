@@ -61,7 +61,7 @@
 #define ALLOW_MATCH_PATH	"/var/local/fpc/allow-match"
 #define FPCD_WAIT_SLICE_MS	250	/* gpio112 wait slice: Cancel / SIGTERM latency */
 #define FPCD_UP_MS		150	/* armed and quiet this long after a touch = finger up */
-#define FPCD_CAPTURE_WAIT_MS	3000	/* wait after g10/3 (arm capture) */
+#define FPCD_CAPTURE_WAIT_MS	0	/* max wait after g10/3; 0 = until the op deadline (as qseeprobe / the HAL) */
 #define FPCD_WAIT_REQ_MS	500	/* bridge WAIT timeout: signal latency of the main loop */
 
 enum { OP_NONE, OP_ENROL, OP_MATCH, OP_DETECT };
@@ -319,87 +319,81 @@ static void finger_set(int on)
 		ev_send(on ? FPCD_EV_FINGER_DOWN : FPCD_EV_FINGER_UP, 0, 0, 0, 0, 0, 0, 0);
 }
 
-static void sensor_release(void)
-{
-	uint8_t d[FPC_SENSOR_LEN] = { 0 };
-	int32_t st;
-	pthread_mutex_lock(&ta_mx);
-	fd_cmd(appid, d, 5, &st);
-	pthread_mutex_unlock(&ta_mx);
-}
-
 /*
- * One capture as the HAL's capture_image(wait_for_finger) (qsee_lib fpc_capture), cancellable: CAP_OK with *st4 =
- * the g10/4 status (0 = good image), CAP_CANCEL, CAP_TIMEOUT (deadline, ms since start; 0 = none), CAP_ERR.
+ * One good image through qsee_lib's fpc_capture_hal (the HAL loop of qseeprobe finger-detect: cmd 2 arm, wait,
+ * cmd 1, up to 4x {cmd 3, wait, cmd 4} while 3; any other non-zero cmd 4 or no irq after cmd 3 -> cmd 5 + re-arm).
+ * Finger-down only for a good image or a wake later than FPC_EARLY_WAKE_MS after arming (the 20-33 ms wake right
+ * after cmd 2 is not a finger); finger-up after FPCD_UP_MS armed and quiet. Rejected images (2/3) give IMAGE events.
+ * Returns CAP_OK (*st4 = 0 good image, or < 0 FPC error), CAP_CANCEL, CAP_TIMEOUT (absolute deadline, 0 = none),
+ * CAP_ERR.
  */
-static int capture_once(uint32_t gen, int32_t *st4, long deadline)
+struct capctx { uint32_t gen; };
+static long cap3_ms = FPCD_CAPTURE_WAIT_MS;	/* env FPCD_CAP3_MS */
+static int cap_stop(void *c) { return cancelled(((struct capctx *)c)->gen); }
+static void cap_lock(void *c) { pthread_mutex_lock(&ta_mx); }
+static void cap_unlock(void *c) { pthread_mutex_unlock(&ta_mx); }
+static void cap_wake(void *c, long ms)
 {
-	uint8_t d[FPC_SENSOR_LEN] = { 0 };
-	int32_t st = 0;
-	pthread_mutex_lock(&ta_mx);
-	d[0xc] = 1;
-	int r = fd_cmd(appid, d, 2, &st);
-	pthread_mutex_unlock(&ta_mx);
-	if (r) {
-		lg("capture: arm (g10/2) rc %d status %d", r, st);
-		return CAP_ERR;
-	}
-	long armed = now_ms();
-	for (;;) {
-		if (cancelled(gen)) {
-			sensor_release();
-			return CAP_CANCEL;
-		}
-		if (deadline && now_ms() >= deadline) {
-			sensor_release();
-			return CAP_TIMEOUT;
-		}
-		int hit = fpc_wait_high(FPCD_WAIT_SLICE_MS);
-		if (hit < 0) {
-			sensor_release();
-			return CAP_ERR;
-		}
-		if (hit)
-			break;
-		if (now_ms() - armed >= FPCD_UP_MS)
-			finger_set(0);
-	}
-	finger_set(1);
-	pthread_mutex_lock(&ta_mx);
-	r = fd_cmd(appid, d, 1, &st);	/* the HAL ignores this status */
-	int rc = CAP_OK;
-	*st4 = 0;
-	if (r && r != 5) {
-		rc = CAP_ERR;
-		goto out;
-	}
-	for (int tries = 1; tries <= 4; tries++) {
-		r = fd_cmd(appid, d, 3, &st);
-		if (r && r != 5) {
-			rc = CAP_ERR;
-			goto out;
-		}
-		int hit = fpc_wait_high(FPCD_CAPTURE_WAIT_MS);
-		if (hit <= 0) {
-			lg("capture: no irq %d ms after g10/3", FPCD_CAPTURE_WAIT_MS);
-			*st4 = 3;	/* treat as insufficient: start over */
-			break;
-		}
-		fd_cmd(appid, d, 4, st4);
-		if (*st4 != 3)
-			break;
-	}
-	if (*st4)
-		fd_cmd(appid, d, 5, &st);	/* capture_image's error path */
-out:
-	pthread_mutex_unlock(&ta_mx);
+	if (ms > FPC_EARLY_WAKE_MS)
+		finger_set(1);
+	else if (verbose)
+		lg("capture: early wake %ld ms after arm (not a finger)", ms);
+}
+static void cap_idle(void *c, long ms)
+{
+	if (ms >= FPCD_UP_MS)
+		finger_set(0);
+}
+static void cap_retry(void *c, int32_t st4)
+{
 	pthread_mutex_lock(&st_mx);
 	S.captures++;
-	S.good += rc == CAP_OK && *st4 == 0;
+	int on = S.finger_on;
 	pthread_mutex_unlock(&st_mx);
-	if (rc == CAP_ERR)
-		lg("capture: TZ/TA error (rc %d status %d)", r, st);
-	return rc;
+	if (verbose || (st4 != 1 && st4 != 4))
+		lg("capture: no good image (cmd 4 status %d%s): cmd 5, re-arm", st4,
+		   st4 == 3 ? " insufficient / no irq after cmd 3" : st4 == 2 ? " capture error" : "");
+	if (st4 == 2 || (st4 == 3 && on))
+		ev_send(FPCD_EV_IMAGE, st4, 0, 0, 0, 0, 0, 0);
+}
+
+static int capture_once(uint32_t gen, int32_t *st4, long deadline)
+{
+	struct capctx cx = { gen };
+	struct fpc_hal_cb cb = { .ctx = &cx, .slice_ms = FPCD_WAIT_SLICE_MS, .cap3_ms = cap3_ms,
+				 .stop = cap_stop, .lock = cap_lock, .unlock = cap_unlock, .wake = cap_wake,
+				 .idle = cap_idle, .retry = cap_retry };
+	long rel = 0;
+	if (deadline) {
+		rel = deadline - now_ms();
+		if (rel <= 0)
+			return CAP_TIMEOUT;
+	}
+	int rounds = 0;
+	*st4 = 0;
+	int r = fpc_capture_hal(appid, rel, &cb, st4, &rounds);
+	pthread_mutex_lock(&st_mx);
+	if (r == FPC_HAL_GOOD) {
+		S.captures++;
+		S.good++;
+	}
+	pthread_mutex_unlock(&st_mx);
+	switch (r) {
+	case FPC_HAL_GOOD:
+		finger_set(1);
+		lg("capture: GOOD IMAGE (cmd 4 status 0) after %d round(s)", rounds);
+		return CAP_OK;
+	case FPC_HAL_FPCERR:
+		return CAP_OK;	/* *st4 < 0: op_capture reports it */
+	case FPC_HAL_CANCEL:
+		return CAP_CANCEL;
+	case FPC_HAL_TIMEOUT:
+		finger_set(0);
+		return CAP_TIMEOUT;
+	default:
+		lg("capture: TZ/TA error (status %d) in round %d", *st4, rounds);
+		return CAP_ERR;
+	}
 }
 
 /* Step 5 hook: keymaster verification of the FPC HAT for this identify (KM begin -> challenge -> g3/4 get_auth_result
@@ -1182,6 +1176,8 @@ int main(int argc, char **argv)
 	keep_ta |= (e = getenv("FPCD_KEEP_TA")) && atoi(e);
 	require_hat = (e = getenv("FPCD_REQUIRE_HAT")) && atoi(e);
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
+	if ((e = getenv("FPCD_CAP3_MS")))
+		cap3_ms = atol(e);
 	if ((e = getenv("FPCD_CONSOLE")) && atoi(e))
 		log_con = open("/dev/console", O_WRONLY | O_NOCTTY);
 	/* qsee_lib: its say() lines go to stdout -> our log; quiet unless FPCD_VERBOSE (fd_cmd/fpc_bio are quiet anyway) */

@@ -744,6 +744,126 @@ int fpc_capture(uint32_t appid, const struct timespec *t0, int ms, int32_t *st4,
 	return 0;
 }
 
+/*
+ * The HAL capture loop (fpc_tee_capture_image with wait_for_finger, as qseeprobe finger-detect, which gave the good
+ * images and the enrol of 2026-11-18), for callers that must stay cancellable (sweetfpcd):
+ *   round: +0xc = 1; cmd 2 (arm); wait gpio112; cmd 1 (status ignored); up to 4x {cmd 3; wait; cmd 4} while
+ *   cmd 4 == 3; cmd 4 == 0 -> good image, done. Any non-zero cmd 4, or a wait timeout after cmd 3 -> cmd 5 and the
+ *   next round re-arms with cmd 2. A cmd 2 wait timeout ends with FPC_HAL_TIMEOUT (after cmd 5).
+ * Waits run in cb->slice_ms slices: cb->stop() between slices ends with FPC_HAL_CANCEL (after cmd 5). The wait after
+ * cmd 3 lasts until the deadline (as qseeprobe), or at most cb->cap3_ms when that is > 0.
+ * cb->wake(ctx, ms) is called with the time from arm to wake: the 20-33 ms wake right after arming is NOT a finger;
+ * callers report finger-down only for a good image or a wake later than FPC_EARLY_WAKE_MS.
+ * cb->idle(ctx, ms) is called after each quiet slice while armed (ms since arm) for finger-up tracking.
+ * cb->lock/unlock wrap each SMC (not the waits). deadline_ms: overall budget from the call, 0 = none.
+ * Returns FPC_HAL_GOOD (*st4 = 0), FPC_HAL_CANCEL, FPC_HAL_TIMEOUT, FPC_HAL_ERR (*st4 = last cmd 4 status, or
+ * the TA status of a failed command), or FPC_HAL_FPCERR (*st4 < 0 from cmd 4). *rounds = rounds used.
+ */
+static int hal_wait(const struct fpc_hal_cb *cb, const struct timespec *t0, long deadline_ms, long cap_ms,
+		    const struct timespec *armed)
+{
+	struct timespec tw;
+	clock_gettime(CLOCK_MONOTONIC, &tw);
+	for (;;) {
+		if (cb && cb->stop && cb->stop(cb->ctx))
+			return -2;
+		long left = deadline_ms ? deadline_ms - fpc_ms_since(t0) : 0x7fffffff;
+		if (cap_ms > 0 && cap_ms - fpc_ms_since(&tw) < left)
+			left = cap_ms - fpc_ms_since(&tw);
+		if (left <= 0)
+			return 0;
+		int sl = cb && cb->slice_ms > 0 ? cb->slice_ms : 250;
+		int hit = fpc_wait_high(left < sl ? (int)left : sl);
+		if (hit)
+			return hit;
+		if (armed && cb && cb->idle)
+			cb->idle(cb->ctx, fpc_ms_since(armed));
+	}
+}
+
+static int hal_cmd(const struct fpc_hal_cb *cb, uint32_t appid, uint8_t *d, uint32_t cmd, int32_t *st)
+{
+	if (cb && cb->lock)
+		cb->lock(cb->ctx);
+	int r = fd_cmd(appid, d, cmd, st);
+	if (cb && cb->unlock)
+		cb->unlock(cb->ctx);
+	return r;
+}
+
+int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *cb, int32_t *st4, int *rounds)
+{
+	uint8_t d[FPC_SENSOR_LEN] = { 0 };
+	int32_t st = 0, st5 = 0;
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	*st4 = 0;
+	for (int round = 1;; round++) {
+		if (rounds)
+			*rounds = round;
+		memset(d, 0, sizeof(d));
+		d[0xc] = 1;
+		int r = hal_cmd(cb, appid, d, 2, &st);
+		if (r) {
+			*st4 = st;
+			say("capture %d: arm (g10/2) rc %d status %d", round, r, st);
+			return FPC_HAL_ERR;
+		}
+		struct timespec ta;
+		clock_gettime(CLOCK_MONOTONIC, &ta);
+		int hit = hal_wait(cb, &t0, deadline_ms, 0, &ta);
+		long wake = fpc_ms_since(&ta);
+		if (hit <= 0) {
+			hal_cmd(cb, appid, d, 5, &st5);
+			if (hit == -1) {
+				*st4 = 0;
+				return FPC_HAL_ERR;
+			}
+			return hit == -2 ? FPC_HAL_CANCEL : FPC_HAL_TIMEOUT;
+		}
+		if (cb && cb->wake)
+			cb->wake(cb->ctx, wake);
+		r = hal_cmd(cb, appid, d, 1, &st);	/* the HAL ignores this status */
+		if (r && r != 5) {
+			*st4 = st;
+			return FPC_HAL_ERR;
+		}
+		int tries, why = 0;	/* 0 cmd 4 result, 1 wait timeout, 2 cancel, 3 error */
+		for (tries = 1; tries <= 4; tries++) {
+			r = hal_cmd(cb, appid, d, 3, &st);
+			if (r && r != 5) {
+				why = 3;
+				break;
+			}
+			hit = hal_wait(cb, &t0, deadline_ms, cb ? cb->cap3_ms : 0, NULL);
+			if (hit <= 0) {
+				why = hit == -2 ? 2 : hit == -1 ? 3 : 1;
+				break;
+			}
+			hal_cmd(cb, appid, d, 4, st4);
+			if (*st4 != 3)
+				break;
+		}
+		say("capture %d: wake %ld ms, cmd 4 %d after %d tr%s", round, wake, why ? 0 : *st4, tries > 4 ? 4 : tries,
+		    why == 1 ? ", no irq after cmd 3" : why == 2 ? ", cancelled" : why == 3 ? ", ERROR" : "");
+		if (!why && *st4 == 0)
+			return FPC_HAL_GOOD;
+		hal_cmd(cb, appid, d, 5, &st5);	/* capture_image's error path, then re-arm */
+		if (why == 2)
+			return FPC_HAL_CANCEL;
+		if (why == 3) {
+			*st4 = st;
+			return FPC_HAL_ERR;
+		}
+		if (!why && *st4 < 0)
+			return FPC_HAL_FPCERR;
+		if (why == 1 && deadline_ms && fpc_ms_since(&t0) >= deadline_ms)
+			return FPC_HAL_TIMEOUT;
+		if (cb && cb->retry)
+			cb->retry(cb->ctx, why ? 3 : *st4);	/* non-zero cmd 4 (or no irq after cmd 3 = 3): re-arm */
+	}
+}
+
 const char *enrol_code(int32_t s)
 {
 	switch (s) {

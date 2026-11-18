@@ -75,6 +75,21 @@ int fpc_cleanup_all(uint32_t appid, const char *what);	/* delete every listed id
 int fpc_capture(uint32_t appid, const struct timespec *t0, int ms, int32_t *st4, long *wake_ms);
 const char *enrol_code(int32_t s);
 
+/* HAL capture loop, cancellable (qsee_lib.c fpc_capture_hal) */
+#define FPC_EARLY_WAKE_MS	60	/* a wake within this many ms of arming is the normal early wake, not a finger */
+enum { FPC_HAL_GOOD, FPC_HAL_CANCEL, FPC_HAL_TIMEOUT, FPC_HAL_ERR, FPC_HAL_FPCERR };
+struct fpc_hal_cb {
+	void *ctx;
+	int slice_ms;					/* wait slice (default 250) */
+	long cap3_ms;					/* > 0: max wait after cmd 3 (default: until the deadline) */
+	int (*stop)(void *ctx);				/* non-zero: cancel */
+	void (*lock)(void *ctx), (*unlock)(void *ctx);	/* around each SMC */
+	void (*wake)(void *ctx, long ms_after_arm);
+	void (*idle)(void *ctx, long ms_since_arm);
+	void (*retry)(void *ctx, int32_t st4);		/* a round ended without a good image (then re-arm) */
+};
+int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *cb, int32_t *st4, int *rounds);
+
 /* one QSEE/SMC user at a time */
 #define QSEE_LOCK_PATH "/var/local/tz/qsee.lock"
 int qsee_lib_lock(const char *who);		/* 0 held (or skipped), -1 another process holds it */
