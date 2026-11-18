@@ -6,13 +6,14 @@ for sweetfpcd. kern.sweet_mesa default 0: nothing published. Matches only via br
 1192d: bridge v2: Apple message header fixed (+0xc version, +0x18 ordinal); kern.sweet_mesa bit 1 translates FPCD events
 into Apple statuses / enrol progress / enrol result / match records (sweetmesa_bridge.h part 3); an identity match only
 with kern.sweet_mesa_match=1 AND the event's HAT-verified flag.
+1192e: AppleBiometricServicesUserClient::message() accepts 0xe3ff8000, so deliveries no longer report 0xe00002c7.
 
 diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
 new file mode 100644
-index 0000000..af76971
+index 0000000..e4e83e0
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMesa.cpp
-@@ -0,0 +1,1517 @@
+@@ -0,0 +1,1535 @@
 +/*
 + * redfin 1192: SweetMesa, a Touch ID (Mesa) persona for Apple's unmodified biometrickitd + libBKDM1, whose real
 + * sensor work is done by a userland daemon (sweetfpcd) through a bridge user client.
@@ -59,6 +60,8 @@ index 0000000..af76971
 + * A match record WITH an identity (0xe3ff8002) is built only when kern.sweet_mesa_match = 1 AND the FPCD match
 + * event carries FPCD_MF_HAT_VERIFIED; raw (non-FPCD) match-shaped EVENTs are always dropped now. Every delivered
 + * message is logged ("message 0x... v.. ord.. len.. inline|queued").
++ * 1192e: AppleBiometricServicesUserClient::message accepts 0xe3ff8000 (the aggregate messageClients result was
++ * kIOReturnUnsupported from the user client itself, not from the interest notification).
 + */
 +#include <pexpert/arm64/board_config.h>
 +
@@ -315,8 +318,24 @@ index 0000000..af76971
 +	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 +	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
 +	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn message(UInt32 type, IOService *provider, void *argument) APPLE_KEXT_OVERRIDE;
 +};
 +OSDefineMetaClassAndStructors(AppleBiometricServicesUserClient, IOUserClient);
++
++/*
++ * 1192e: messageClients(0xe3ff8000) reaches biometrickitd through its IOGeneralInterest notification
++ * (IOServiceAddInterestNotification, libBKDM1 ___serviceStatus); the same call also messages the service's
++ * clients in the service plane, i.e. this user client, whose inherited IOService::message() answered
++ * kIOReturnUnsupported and turned every delivery's aggregate result into 0xe00002c7. Accept it here.
++ */
++IOReturn
++AppleBiometricServicesUserClient::message(UInt32 type, IOService *provider, void *argument)
++{
++	if (type == MESA_MSG) {
++		return kIOReturnSuccess;
++	}
++	return IOUserClient::message(type, provider, argument);
++}
 +
 +class SweetMesaBridge : public IOService
 +{
