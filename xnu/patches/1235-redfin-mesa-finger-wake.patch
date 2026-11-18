@@ -4,7 +4,7 @@ iOS 16.7 matches only while the screen is on (SBUIBiometricResource: matching al
 SpringBoard turns background finger detect off (69 val 0) before the display goes off; on an iPhone 8 the wake is the
 home button press and the screen-on match op then matches the resting finger. Here a sweetfpcd FINGER_DOWN while
 iOS's display is off (SweetFramebuffer RequestPowerChange -> sweet_mesa_display) is that press: kern.sweet_mesa_wake
-bit 0 posts a power button press (bit 1: home instead), not within kern.sweet_mesa_wake_ms (800) of the display going
+bit 0 posts a power button press (bit 1: home instead), not within kern.sweet_mesa_wake_ms (200) of the display going
 off, at most one per 1.5 s; bit 2 posts FPCD_CMD_WAKEDET {on} to sweetfpcd on display off/on so it arms the sensor.
 sweet_fpc.c: kern.sweet_fpc_wait_edge, an interrupt-only wait (level high / new gpio112 irq / kick, no 5 ms poll),
 write 0 = kick. kern.sweet_mesa_wake_state: counters. Default 0: nothing changes (FINGER_DOWN, statuses, waits as before).
@@ -196,7 +196,7 @@ index 7b0e438..7b008a1 100644
 +extern "C" void sweet_hid_key(int key, int down);
 +extern "C" void sweet_mesa_display(int off);
 +static uint32_t gWake;                          /* kern.sweet_mesa_wake */
-+static int gWakeMs = 800;                       /* kern.sweet_mesa_wake_ms */
++static int gWakeMs = 200;                       /* kern.sweet_mesa_wake_ms */
 +static volatile bool gDispOff, gDispKnown;
 +static volatile uint64_t gDispOffAt, gWakeAt;
 +static thread_call_t gWakeTC;
@@ -334,7 +334,7 @@ index 7b0e438..7b008a1 100644
 +	return 0;
 +}
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
-+    sysctl_sweet_mesa_wake_ms, "I", "redfin 1235: no finger wake this many ms after the display went off (default 800)");
++    sysctl_sweet_mesa_wake_ms, "I", "redfin 1235: no finger wake this many ms after the display went off (default 200)");
 +
 +static int
 +sysctl_sweet_mesa_wake_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
