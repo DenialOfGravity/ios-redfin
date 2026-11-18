@@ -234,6 +234,29 @@ static int db_lsnr_serve(uint64_t x[8], uint32_t appid, const char *what)
 	return 1;
 }
 
+/* diagnosis: register every listener (with GP fs) around ordinary TA calls and log what the TA asks for (no VFS:
+ * file system requests are answered read-only as in phase 2, GP fs ones refused). 0 ok. */
+int qsee_lsnr_diag(int on)
+{
+	if (!on) {
+		fpc_lsnr_serve = NULL;
+		lsnr_all_down();
+		gpfs_want = 0;
+		return 0;
+	}
+	lib_log_open();
+	rpmb_info_load();
+	gpfs_want = 1;
+	fs_errno = 0;
+	if (lsnr_all_up()) {
+		gpfs_want = 0;
+		lsnr_all_down();
+		return -1;
+	}
+	fpc_lsnr_serve = db_lsnr_serve;
+	return 0;
+}
+
 int qsee_fpc_db_cmd(uint32_t fpc_appid, uint32_t id, const char *path, struct qsee_vfs *v, int32_t *ta_status)
 {
 	uint8_t d[0x200] = { 0 };
@@ -244,7 +267,13 @@ int qsee_fpc_db_cmd(uint32_t fpc_appid, uint32_t id, const char *path, struct qs
 		return 1;
 	write_attempts = 0;
 	rpmb_info_load();
+	/* the TA writes / reads the db through cmnlib64's gpFileIO (GP file system listener 0x7000) after an fs-listener
+	 * size check (open / lseek): QSEE_GPFS=0 leaves 0x7000 unregistered (store fails with FPC_ERROR_IO -6) */
+	const char *ge = getenv("QSEE_GPFS");
+	gpfs_want = !(ge && *ge == '0');
+	fs_errno = 0;
 	if (lsnr_all_up()) {
+		gpfs_want = 0;
 		lsnr_all_down();
 		return 1;
 	}
@@ -262,6 +291,7 @@ int qsee_fpc_db_cmd(uint32_t fpc_appid, uint32_t id, const char *path, struct qs
 	vfs_active = NULL;
 	memset(vfd, 0, sizeof(vfd));
 	lsnr_all_down();
+	gpfs_want = 0;
 	lg("db %s \"%s\": send rc %d TA status %d | vfs opens %u reads %u (%u B) writes %u (%u B) unlinks %u",
 	   id == QSEE_FPC_DB_STORE ? "store" : "load", path, r, *ta_status, v->opens, v->reads, v->bytes_read, v->writes,
 	   v->bytes_written, v->unlinks);

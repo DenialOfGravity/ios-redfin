@@ -82,5 +82,6 @@ int qsee_vfs_rename(struct qsee_vfs *v, const char *from, const char *to);	/* 0 
 #define QSEE_FPC_DB_LOAD	0xb
 #define QSEE_FPC_DB_STORE	0xc
 int qsee_fpc_db_cmd(uint32_t fpc_appid, uint32_t id, const char *path, struct qsee_vfs *v, int32_t *ta_status);
+int qsee_lsnr_diag(int on);	/* 1: listeners up + served around the next TA calls (logged), 0: down */
 
 #endif

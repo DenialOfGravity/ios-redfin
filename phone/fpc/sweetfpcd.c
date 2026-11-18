@@ -15,6 +15,7 @@
  * resident TA a failing set_gid falls back to load_empty_db + set_gid), get_finger_ids.
  * SIGTERM/SIGINT: cancel the operation, stop the capture thread, unload the TA (FPCD_KEEP_TA=1 / --keep-ta: keep).
  * SIGUSR1: wipe all (delete every finger id, debug).  SIGUSR2: one status line.
+ * FPCD_LSNR_DIAG=1|2: listeners up around the first / every identify of a match op, requests logged (debug).
  * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
  *
  * Operations (one at a time; a new Enroll/Match/Detect cancels the running one) run in the capture thread, driven by
@@ -667,6 +668,8 @@ static void run_enrol(uint32_t gen)
 	}
 }
 
+static int lsnr_diag;	/* FPCD_LSNR_DIAG: listeners registered around identify (diagnosis) */
+
 static void run_match(uint32_t gen)
 {
 	uint32_t attempts = 0, last_up = 0;
@@ -686,7 +689,12 @@ static void run_match(uint32_t gen)
 		int32_t hat = FPCD_HAT_NONE;
 		pthread_mutex_lock(&ta_mx);
 		auth_challenge_set();
+		int diag = lsnr_diag && (lsnr_diag == 2 || attempts == 0) && qsee_lsnr_diag(1) == 0;
+		if (diag)
+			lg("identify %u: listeners up (FPCD_LSNR_DIAG=%d)", attempts + 1, lsnr_diag);
 		int r = ta_bio(3, d, &st);
+		if (diag)
+			qsee_lsnr_diag(0);
 		if (!r && st == 0)
 			hat = fpcd_verify_hat(rd_u32(d + 0xc));
 		auth_challenge = 0;
@@ -1863,6 +1871,7 @@ int main(int argc, char **argv)
 		}
 	}
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
+	lsnr_diag = (e = getenv("FPCD_LSNR_DIAG")) ? atoi(e) : 0;	/* 1: first identify of a match op, 2: every one */
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
