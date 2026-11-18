@@ -123,6 +123,15 @@
  *   comes up with every other switch already set: no "kern.sweet_mesa 0, then 3 + kill biometrickitd" dance. Every
  *   value stays a normal sysctl, overridable at runtime or by the manifest's boot sysctls. kern.sweet_touchid_boot
  *   (RO): what was applied ("key=value:err ...").
+ * 1256: the 1247 writes all failed with EPERM (kernel_sysctlbyname -> sysctl_root refuses an in-kernel write to an
+ *   OID without CTLFLAG_KERN). Each handler of the set is now split into <name>_kset(v) (checks + side effects) and
+ *   the sysctl handler (sysctl_io_number + the setter); sweettouchid calls the setters directly, same order, persona
+ *   last. kern.sweet_mesa_wake is now always in the set: 12 (screen-off detect + match before wake, 1255; bit 3 as
+ *   before) unless sweettouchid bits 4-7 give a value, bit 8 (0x100) leaves it alone, or bit 1 alone asks for 5
+ *   (1235 finger wake). kern.sweet_fb_sleep_blank
+ *   and kern.sweet_passcode are left alone when their own boot-args (sweetfbslp, sweetpasscode) are given.
+ *   kern.sweet_touchid_boot: "sweettouchid=0x1: OK: 16 ok, 0 failed, 0 skipped | fpc=0x3:ok passcode=0x1:ok ...",
+ *   FAILED: when any setter refused (errno per key), PENDING / RUNNING before it finished, off without the boot-arg.
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -152,7 +161,6 @@ extern "C" {
 
 #define SAY(fmt, ...) IOLog("SWEET MESA: " fmt, ##__VA_ARGS__)
 
-extern "C" int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 extern "C" void sweet_touchid_init(void);
 
 /* ---- bridge interface (phone/fpc/sweetmesa_bridge.h, part 1) ---- */
@@ -2976,14 +2984,11 @@ mesa_publish(bool on)
 }
 
 /* ---- sysctls ---- */
+/* 1256: kern.sweet_mesa's write (checks + side effects), also called by the boot-arg sweettouchid */
 static int
-sysctl_sweet_mesa(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+sweet_mesa_kset(int v)
 {
-	int v = gMesa, changed = 0;
-	int e = sysctl_io_number(req, gMesa, sizeof(gMesa), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
+	int e = 0;
 	if (v & ~15) {
 		return EINVAL;
 	}
@@ -3006,9 +3011,35 @@ sysctl_sweet_mesa(__unused struct sysctl_oid *oidp, __unused void *arg1, __unuse
 	SAY("kern.sweet_mesa=%d -> %d (%s)\n", v, e, e ? "unchanged" : "set");
 	return e;
 }
+
+static int
+sysctl_sweet_mesa(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int v = gMesa, changed = 0;
+	int e = sysctl_io_number(req, gMesa, sizeof(gMesa), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_mesa_kset(v);
+}
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_mesa, "I",
     "redfin 1192: SweetMesa Touch ID persona: bit0 publish, bit1 deliver FPCD-format events raw, bit2 hex dump, "
     "bit3 log struct sizes inline/descriptor");
+
+/* 1256: kern.sweet_mesa_match's write (checks + side effects), also called by the boot-arg sweettouchid */
+static int
+sweet_mesa_match_kset(int v)
+{
+	if (v < 0 || v > 2) {
+		return EINVAL;
+	}
+	char pn[32];
+	proc_selfname(pn, (int)sizeof(pn));
+	gMatch = v;
+	SAY("match gate %s by %s (kern.sweet_mesa_match=%d)\n", v == 2 ? "OPEN, UNVERIFIED matches delivered" :
+	    v ? "OPENED (verified only)" : "closed", pn, v);
+	return 0;
+}
 
 static int
 sysctl_sweet_mesa_match(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -3019,15 +3050,7 @@ sysctl_sweet_mesa_match(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 	if (e || !changed) {
 		return e;
 	}
-	if (v < 0 || v > 2) {
-		return EINVAL;
-	}
-	char pn[32];
-	proc_selfname(pn, (int)sizeof(pn));
-	gMatch = v;
-	SAY("match gate %s by %s (kern.sweet_mesa_match=%d)\n", v == 2 ? "OPEN, UNVERIFIED matches delivered" :
-	    v ? "OPENED (verified only)" : "closed", pn, v);
-	return 0;
+	return sweet_mesa_match_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_match, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
@@ -3095,15 +3118,10 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_acm_bind, CTLTYPE_INT | CTLFLAG_RW | CTL
     sysctl_sweet_mesa_acm_bind, "I", "redfin 1216: 1 = a match for a MatchMode with an ACM context adds the "
     "credential to that context only and does not unlock the keybag (default 0)");
 
+/* 1256: kern.sweet_mesa_lockout's write (checks + side effects), also called by the boot-arg sweettouchid */
 static int
-sysctl_sweet_mesa_lockout(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+sweet_mesa_lockout_kset(int v)
 {
-	int v = gLockout, changed = 0;
-	int e = sysctl_io_number(req, gLockout, sizeof(gLockout), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
 	if (v < 0 || v > 0xf) {
 		return EINVAL;
 	}
@@ -3116,10 +3134,36 @@ sysctl_sweet_mesa_lockout(__unused struct sysctl_oid *oidp, __unused void *arg1,
 	mesa_lockstate_kick();
 	return 0;
 }
+
+static int
+sysctl_sweet_mesa_lockout(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gLockout, changed = 0;
+	int e = sysctl_io_number(req, gLockout, sizeof(gLockout), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_mesa_lockout_kset(v);
+}
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_lockout, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_lockout, "I", "redfin 1225: Touch ID lockout as iOS: bit 0 39 reason bits (0x4 BioLockout after "
     "5 failed matches), bit 1 count failures in every match mode, bit 2 73/57 force the lockout, bit 3 push "
     "0xe3ff800a on changes (default 0)");
+
+/* 1256: kern.sweet_mesa_fix's write (checks + side effects), also called by the boot-arg sweettouchid */
+static int
+sweet_mesa_fix_kset(int v)
+{
+	if (v < 0 || v > 0x1f) {
+		return EINVAL;
+	}
+	gFix = v;
+	SAY("kern.sweet_mesa_fix=0x%x: implicit op end %s, stale-event drop %s, AlignmentData %s, 0x41 after enrol %s, "
+	    "TA-error no-match drop %s\n", v, (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off",
+	    (v & 8) ? "on" : "off", (v & 0x10) ? "on" : "off");
+	return 0;
+}
 
 static int
 sysctl_sweet_mesa_fix(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -3130,14 +3174,7 @@ sysctl_sweet_mesa_fix(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
 	if (e || !changed) {
 		return e;
 	}
-	if (v < 0 || v > 0x1f) {
-		return EINVAL;
-	}
-	gFix = v;
-	SAY("kern.sweet_mesa_fix=0x%x: implicit op end %s, stale-event drop %s, AlignmentData %s, 0x41 after enrol %s, "
-	    "TA-error no-match drop %s\n", v, (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off",
-	    (v & 8) ? "on" : "off", (v & 0x10) ? "on" : "off");
-	return 0;
+	return sweet_mesa_fix_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_fix, "I", "redfin 1210-1213: bit 0 implicit op end on 3/4/38, bit 1 drop stale sweetfpcd "
@@ -3260,15 +3297,10 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_catstate, CTLTYPE_INT | CTLFLAG_RW | CTL
     sysctl_sweet_mesa_catstate, "I", "redfin 1200: 60 GetCatacombState value for the identities' user "
     "(bit0 present, bit1 loaded, bit2 dirty; default 3, 1 = 1192f answer)");
 
+/* 1256: kern.sweet_mesa_catacomb's write (checks + side effects), also called by the boot-arg sweettouchid */
 static int
-sysctl_sweet_mesa_catacomb(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+sweet_mesa_catacomb_kset(int v)
 {
-	int v = gCat, changed = 0;
-	int e = sysctl_io_number(req, gCat, sizeof(gCat), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
 	if (v < 0 || v > CAT_BITS || (v != 0 && !(v & CAT_ON))) {     /* 1218: bit mask, bit 0 required */
 		return EINVAL;
 	}
@@ -3294,6 +3326,18 @@ sysctl_sweet_mesa_catacomb(__unused struct sysctl_oid *oidp, __unused void *arg1
 	SAY("catacomb persistence %s by %s (kern.sweet_mesa_catacomb=%d%s%s%s)\n", v ? "ON" : "off (1200 answers)", pn, v,
 	    (v & CAT_MASTER) ? " master" : "", (v & CAT_INFO) ? " save-info" : "", (v & CAT_SESSION) ? " session" : "");
 	return 0;
+}
+
+static int
+sysctl_sweet_mesa_catacomb(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gCat, changed = 0;
+	int e = sysctl_io_number(req, gCat, sizeof(gCat), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_mesa_catacomb_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_catacomb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_catacomb, "I", "redfin 1206: 1 = Touch ID catacomb persistence (60 state from the TA db, "
@@ -3336,6 +3380,19 @@ sysctl_sweet_mesa_cat_state(__unused struct sysctl_oid *oidp, __unused void *arg
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_cat_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_cat_state, "A", "redfin 1206: catacomb persistence state and counters");
 
+/* 1256: kern.sweet_mesa_offline's write (checks + side effects), also called by the boot-arg sweettouchid */
+static int
+sweet_mesa_offline_kset(int v)
+{
+	if (v < 0 || v > 1) {
+		return EINVAL;
+	}
+	mesa_locks();
+	gOffHonest = v;
+	SAY("offline answers %s (kern.sweet_mesa_offline=%d)\n", v ? "honest (NotReady) + 800d on connect" : "old", v);
+	return 0;
+}
+
 static int
 sysctl_sweet_mesa_offline(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
@@ -3345,17 +3402,24 @@ sysctl_sweet_mesa_offline(__unused struct sysctl_oid *oidp, __unused void *arg1,
 	if (e || !changed) {
 		return e;
 	}
-	if (v < 0 || v > 1) {
-		return EINVAL;
-	}
-	mesa_locks();
-	gOffHonest = v;
-	SAY("offline answers %s (kern.sweet_mesa_offline=%d)\n", v ? "honest (NotReady) + 800d on connect" : "old", v);
-	return 0;
+	return sweet_mesa_offline_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_offline, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_offline, "I", "redfin 1207: 1 = commands needing sweetfpcd answer NotReady while it is offline "
     "and 0xe3ff800d re-init is sent when it connects; 0 = old answers");
+
+/* 1256: kern.sweet_mesa_fwd_wait_ms's write (checks + side effects), also called by the boot-arg sweettouchid */
+static int
+sweet_mesa_fwd_wait_ms_kset(int v)
+{
+	if (v < 0 || v > 60000) {
+		return EINVAL;
+	}
+	mesa_locks();
+	gFwdWaitMs = v;
+	SAY("commands deciding biometrickitd's identities wait %d ms for sweetfpcd (kern.sweet_mesa_fwd_wait_ms)\n", v);
+	return 0;
+}
 
 static int
 sysctl_sweet_mesa_fwd_wait_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -3366,13 +3430,7 @@ sysctl_sweet_mesa_fwd_wait_ms(__unused struct sysctl_oid *oidp, __unused void *a
 	if (e || !changed) {
 		return e;
 	}
-	if (v < 0 || v > 60000) {
-		return EINVAL;
-	}
-	mesa_locks();
-	gFwdWaitMs = v;
-	SAY("commands deciding biometrickitd's identities wait %d ms for sweetfpcd (kern.sweet_mesa_fwd_wait_ms)\n", v);
-	return 0;
+	return sweet_mesa_fwd_wait_ms_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fwd_wait_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_fwd_wait_ms, "I", "redfin 1245: 15/49/56/65/66 and user 61/64 wait up to this many ms (0..60000) "
@@ -3387,15 +3445,10 @@ sysctl_sweet_mesa_fwd_wait_state(__unused struct sysctl_oid *oidp, __unused void
 	    nBrWaits, nBrWaitOk, nBrWaitTo, gBrWaitLastMs, gBridgeClients);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
+/* 1256: kern.sweet_mesa_reload's write (checks + side effects), also called by the boot-arg sweettouchid */
 static int
-sysctl_sweet_mesa_reload(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+sweet_mesa_reload_kset(int v)
 {
-	int v = gReload, changed = 0;
-	int e = sysctl_io_number(req, gReload, sizeof(gReload), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
 	if (v < 0 || v > 1) {
 		return EINVAL;
 	}
@@ -3407,6 +3460,18 @@ sysctl_sweet_mesa_reload(__unused struct sysctl_oid *oidp, __unused void *arg1, 
 		thread_call_enter(gReinitTC);
 	}
 	return 0;
+}
+
+static int
+sysctl_sweet_mesa_reload(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gReload, changed = 0;
+	int e = sysctl_io_number(req, gReload, sizeof(gReload), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_mesa_reload_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_reload, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_reload, "I", "redfin 1246: 1 = a lost catacomb load (64 while sweetfpcd was offline, or the TA "
@@ -3649,15 +3714,10 @@ sweet_mesa_display(int off)
 	}
 }
 
+/* 1256: kern.sweet_mesa_wake's write (checks + side effects), also called by the boot-arg sweettouchid */
 static int
-sysctl_sweet_mesa_wake(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+sweet_mesa_wake_kset(int v)
 {
-	int v = (int)gWake, changed = 0;
-	int e = sysctl_io_number(req, (int)gWake, sizeof(int), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
 	if (v & ~0xf) {
 		return EINVAL;
 	}
@@ -3672,6 +3732,18 @@ sysctl_sweet_mesa_wake(__unused struct sysctl_oid *oidp, __unused void *arg1, __
 		mesa_wake_arm((gWake & MESA_WAKE_ARM) != 0, "kern.sweet_mesa_wake");
 	}
 	return 0;
+}
+
+static int
+sysctl_sweet_mesa_wake(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = (int)gWake, changed = 0;
+	int e = sysctl_io_number(req, (int)gWake, sizeof(int), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_mesa_wake_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_wake, "I", "redfin 1235: screen-off Touch ID wake: 1 a finger down with the display off presses "
@@ -3872,52 +3944,123 @@ sysctl_sweet_mesa_prematch_ms(__unused struct sysctl_oid *oidp, __unused void *a
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_prematch_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_prematch_ms, "I", "redfin 1255: a match made with the display off is delivered to a MatchMode "
     "that comes within this many ms (default 2000; 0 = never)");
-/* ---- 1247: boot-arg sweettouchid: the tested Touch ID set, applied in order before the persona publishes ---- */
+/* ---- 1247/1256: boot-arg sweettouchid: the tested Touch ID set, applied in order before the persona publishes ----
+ * 1256: 1247 wrote the set with kernel_sysctlbyname(), and every write failed with EPERM: sysctl_root() refuses a
+ * write from inside the kernel to an OID without CTLFLAG_KERN (none of the sweet_* OIDs has it). Now each value goes
+ * straight to the owning subsystem's setter (<name>_kset: the same checks and side effects as the sysctl handler,
+ * which now calls it too), so no sysctl permission path is involved at all. */
+extern "C" int sweet_fpc_kset(int v);                  /* bsd/dev/sweet_fpc.c */
+extern "C" int sweet_passcode_kset(int v);             /* bsd/dev/sweet_passcode.c */
+extern "C" int sweet_passcode_biostate_kset(int v);
+extern "C" int sweet_passcode_bio_buzz_kset(int v);
+extern "C" int sweet_rpmb_kset(int v);                 /* bsd/dev/sweet_ufs.c */
+extern "C" uint32_t sweet_fb_sleep_blank;              /* SweetFramebuffer.cpp (a plain RW variable) */
+
+#define TID_WAKE_DEFAULT        (MESA_WAKE_ARM | MESA_WAKE_MATCH)      /* 12: match before wake (1255), owner's pick */
+
 static int gTidBoot;
-static char gTidBootLog[512];
+static int gTidState;                   /* 0 not asked, 1 pending, 2 running, 3 done */
+static int gTidOk, gTidFail, gTidSkip;
+static char gTidBootLog[640];
 static thread_call_t gTidTC;
 
+static int
+tid_fb_sleep_blank_kset(int v)
+{
+	if (v < 0) {
+		return EINVAL;
+	}
+	sweet_fb_sleep_blank = (uint32_t)v;     /* what the SYSCTL_UINT write does: read at the next display off */
+	return 0;
+}
+
 static void
-tid_set(const char *name, int v)
+tid_log(const char *name, int v, const char *res)
 {
 	size_t n = strlen(gTidBootLog);
-	int e = kernel_sysctlbyname(name, NULL, NULL, &v, sizeof(v));
-	SAY("sweettouchid: %s = %#x -> %d%s\n", name, v, e, e ? " (FAILED: left as it was)" : "");
 	if (n < sizeof(gTidBootLog) - 1) {
-		snprintf(gTidBootLog + n, sizeof(gTidBootLog) - n, "%s%s=%#x:%d", n ? " " : "", name + 5, v, e);
+		snprintf(gTidBootLog + n, sizeof(gTidBootLog) - n, "%s%s=%#x:%s", n ? " " : "", name + 11, v, res);
 	}
+}
+
+static void
+tid_set(const char *name, int (*set)(int), int v)
+{
+	int e = set(v);
+	char r[24];
+	if (e == 0) {
+		gTidOk++;
+		strlcpy(r, "ok", sizeof(r));
+	} else {
+		gTidFail++;
+		snprintf(r, sizeof(r), "FAILED(%d)", e);
+	}
+	SAY("sweettouchid: %s = %#x -> %s\n", name, v, e ? r : "ok");
+	tid_log(name, v, r);
+}
+
+static void
+tid_skip(const char *name, const char *why)
+{
+	gTidSkip++;
+	SAY("sweettouchid: %s left alone (%s)\n", name, why);
+	tid_log(name, 0, "skipped");
+}
+
+/* kern.sweet_mesa_wake from sweettouchid: bit 8 (0x100): leave it alone; else bits 4-7 (not 0): that value; else
+ * bit 3 (1255): 12; else bit 1: 5 (finger wake + screen-off detect, the 1235 set); else 12 (1256 default: screen-off
+ * detect + match before wake). */
+static int
+tid_wake_value(int b)
+{
+	if (b & 0x100) {
+		return -1;
+	}
+	if ((b >> 4) & 0xf) {
+		return (b >> 4) & 0xf;
+	}
+	if (b & 8) {
+		return (int)TID_WAKE_DEFAULT;
+	}
+	return (b & 2) ? (int)(MESA_WAKE_ON | MESA_WAKE_ARM) : (int)TID_WAKE_DEFAULT;
 }
 
 static void
 tid_boot_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
-	int pc = 0;
-	SAY("sweettouchid=%#x: applying the Touch ID set (bit 0 set, bit 1 wake, bit 2 locked at boot, bit 3 match before "
-	    "wake)\n", gTidBoot);
-	tid_set("kern.sweet_fpc", 3);
+	int pc = 0, slp = 0, w = tid_wake_value(gTidBoot);
+	gTidState = 2;
+	SAY("sweettouchid=%#x: applying the Touch ID set through the subsystems' setters (1256; wake %d%s)\n", gTidBoot,
+	    w, w < 0 ? " = left alone" : "");
+	tid_set("kern.sweet_fpc", sweet_fpc_kset, 3);
 	if (!PE_parse_boot_argn("sweetpasscode", &pc, sizeof(pc))) {
-		tid_set("kern.sweet_passcode", (gTidBoot & 4) ? 3 : 1);
+		tid_set("kern.sweet_passcode", sweet_passcode_kset, (gTidBoot & 4) ? 3 : 1);
 	} else {
-		SAY("sweettouchid: kern.sweet_passcode left to the boot-arg sweetpasscode=%d\n", pc);
+		tid_skip("kern.sweet_passcode", "boot-arg sweetpasscode given");
 	}
-	tid_set("kern.sweet_fb_sleep_blank", 1);
-	tid_set("kern.sweet_rpmb", 1);
-	tid_set("kern.sweet_mesa_match", 2);
-	tid_set("kern.sweet_mesa_catacomb", 7);
-	tid_set("kern.sweet_mesa_offline", 1);
-	tid_set("kern.sweet_passcode_biostate", 1);
-	tid_set("kern.sweet_mesa_fix", 0x17);
-	tid_set("kern.sweet_mesa_lockout", 0xf);
-	tid_set("kern.sweet_passcode_bio_buzz", 0x7f000c);
-	if (gTidBoot & 8) {
-		tid_set("kern.sweet_mesa_wake", 12);    /* 1255: match before wake */
-	} else if (gTidBoot & 2) {
-		tid_set("kern.sweet_mesa_wake", 5);
+	if (!PE_parse_boot_argn("sweetfbslp", &slp, sizeof(slp))) {
+		tid_set("kern.sweet_fb_sleep_blank", tid_fb_sleep_blank_kset, 1);
+	} else {
+		tid_skip("kern.sweet_fb_sleep_blank", "boot-arg sweetfbslp given");
 	}
-	tid_set("kern.sweet_mesa_fwd_wait_ms", 15000);
-	tid_set("kern.sweet_mesa_reload", 1);
-	tid_set("kern.sweet_mesa", 3);          /* last: publishes the persona; launchd starts biometrickitd on it */
-	SAY("sweettouchid: done (%s)\n", gTidBootLog);
+	tid_set("kern.sweet_rpmb", sweet_rpmb_kset, 1);
+	tid_set("kern.sweet_mesa_match", sweet_mesa_match_kset, 2);
+	tid_set("kern.sweet_mesa_catacomb", sweet_mesa_catacomb_kset, 7);
+	tid_set("kern.sweet_mesa_offline", sweet_mesa_offline_kset, 1);
+	tid_set("kern.sweet_passcode_biostate", sweet_passcode_biostate_kset, 1);
+	tid_set("kern.sweet_mesa_fix", sweet_mesa_fix_kset, 0x17);
+	tid_set("kern.sweet_mesa_lockout", sweet_mesa_lockout_kset, 0xf);
+	tid_set("kern.sweet_passcode_bio_buzz", sweet_passcode_bio_buzz_kset, 0x7f000c);
+	if (w >= 0) {
+		tid_set("kern.sweet_mesa_wake", sweet_mesa_wake_kset, w);
+	} else {
+		tid_skip("kern.sweet_mesa_wake", "sweettouchid bit 8");
+	}
+	tid_set("kern.sweet_mesa_fwd_wait_ms", sweet_mesa_fwd_wait_ms_kset, 15000);
+	tid_set("kern.sweet_mesa_reload", sweet_mesa_reload_kset, 1);
+	tid_set("kern.sweet_mesa", sweet_mesa_kset, 3);        /* last: publishes the persona; launchd starts biometrickitd on it */
+	gTidState = 3;
+	SAY("sweettouchid: done: %d ok, %d FAILED, %d skipped (%s)\n", gTidOk, gTidFail, gTidSkip, gTidBootLog);
 }
 
 extern "C" void
@@ -3933,6 +4076,7 @@ sweet_touchid_init(void)
 		SAY("sweettouchid=%#x: no thread call: NOT applied\n", v);
 		return;
 	}
+	gTidState = 1;
 	uint64_t dl;
 	clock_interval_to_deadline(2000, kMillisecondScale, &dl);
 	thread_call_enter_delayed(gTidTC, dl);
@@ -3943,11 +4087,24 @@ static int
 sysctl_sweet_touchid_boot(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
 {
-	char b[560];
-	snprintf(b, sizeof(b), "sweettouchid=%#x %s", gTidBoot, gTidBootLog[0] ? gTidBootLog : "(nothing applied)");
-	return SYSCTL_OUT(req, b, strlen(b) + 1);
+	char b[128];
+	if (gTidState == 0) {
+		snprintf(b, sizeof(b), "sweettouchid=%#x: off (nothing applied)", gTidBoot);
+	} else if (gTidState < 3) {
+		snprintf(b, sizeof(b), "sweettouchid=%#x: %s", gTidBoot, gTidState == 1 ? "PENDING (thread call not run yet)" :
+		    "RUNNING");
+	} else {
+		snprintf(b, sizeof(b), "sweettouchid=%#x: %s %d ok, %d failed, %d skipped | ", gTidBoot,
+		    gTidFail ? "FAILED:" : "OK:", gTidOk, gTidFail, gTidSkip);
+	}
+	if (gTidState < 3) {
+		return SYSCTL_OUT(req, b, strlen(b) + 1);
+	}
+	int e = SYSCTL_OUT(req, b, strlen(b));
+	return e ? e : SYSCTL_OUT(req, gTidBootLog, strlen(gTidBootLog) + 1);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_touchid_boot, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
-    sysctl_sweet_touchid_boot, "A", "redfin 1247: what the boot-arg sweettouchid applied (key=value:errno)");
+    sysctl_sweet_touchid_boot, "A", "redfin 1247/1256: what the boot-arg sweettouchid applied: OK|FAILED: counts | "
+    "key=value:ok|FAILED(errno)|skipped");
 
 #endif /* ARM64_BOARD_CONFIG_SWEET */

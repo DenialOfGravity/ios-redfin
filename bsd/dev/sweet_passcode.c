@@ -880,6 +880,19 @@ sweet_pc_bio_confirm(int *was_pending)
 	return locked && !*was_pending ? EAUTH : 0;
 }
 
+int sweet_passcode_bio_buzz_kset(int v);
+/* 1256: kern.sweet_passcode_bio_buzz's write (checks + side effects), also called by the boot-arg sweettouchid */
+int
+sweet_passcode_bio_buzz_kset(int v)
+{
+	if (v < 0 || (v & 0xffff) > 2000 || ((v >> 16) & 0xff) > 127 || (v >> 24) != 0) {
+		return EINVAL;
+	}
+	pc_bio_buzz = v;
+	SAY("kern.sweet_passcode_bio_buzz=0x%x (non-native Touch ID unlock pulse %s)\n", v, v ? "on" : "off");
+	return 0;
+}
+
 static int
 sysctl_sweet_passcode_bio_buzz(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
@@ -889,26 +902,17 @@ sysctl_sweet_passcode_bio_buzz(__unused struct sysctl_oid *oidp, __unused void *
 	if (e || !changed) {
 		return e;
 	}
-	if (v < 0 || (v & 0xffff) > 2000 || ((v >> 16) & 0xff) > 127 || (v >> 24) != 0) {
-		return EINVAL;
-	}
-	pc_bio_buzz = v;
-	SAY("kern.sweet_passcode_bio_buzz=0x%x (non-native Touch ID unlock pulse %s)\n", v, v ? "on" : "off");
-	return 0;
+	return sweet_passcode_bio_buzz_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_bio_buzz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_passcode_bio_buzz, "I", "redfin 1217 (non-native): ms | strength << 16 = one vibration pulse when "
     "Touch ID unlocks the keybag; 0 = off (default)");
 
-static int
-sysctl_sweet_passcode_biostate(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+int sweet_passcode_biostate_kset(int v);
+/* 1256: kern.sweet_passcode_biostate's write (checks + side effects), also called by the boot-arg sweettouchid */
+int
+sweet_passcode_biostate_kset(int v)
 {
-	int v = pc_biostate, changed = 0;
-	int e = sysctl_io_number(req, pc_biostate, sizeof(pc_biostate), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
 	if (v < 0 || v > 1) {
 		return EINVAL;
 	}
@@ -920,6 +924,18 @@ sysctl_sweet_passcode_biostate(__unused struct sysctl_oid *oidp, __unused void *
 	lck_mtx_unlock(&sweet_pc_lck);
 	SAY("kern.sweet_passcode_biostate=%d (InBioUnlock after a Touch ID unlock %s)\n", v, v ? "on" : "off");
 	return 0;
+}
+
+static int
+sysctl_sweet_passcode_biostate(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = pc_biostate, changed = 0;
+	int e = sysctl_io_number(req, pc_biostate, sizeof(pc_biostate), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_passcode_biostate_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_biostate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_passcode_biostate, "I", "redfin 1214: 1 = extended lock state 7 (InBioUnlock) after a Touch ID "
@@ -943,15 +959,11 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_bio, CTLTYPE_STRING | CTLFLAG_RD | C
     sysctl_sweet_passcode_bio, "A", "redfin 1198: Touch ID unlock rule state");
 
 /* ---- sysctls ---- */
-static int
-sysctl_sweet_passcode(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
-    struct sysctl_req *req)
+int sweet_passcode_kset(int v);
+/* 1256: kern.sweet_passcode's write (checks + side effects), also called by the boot-arg sweettouchid */
+int
+sweet_passcode_kset(int v)
 {
-	int v = sweet_pc_mode(), changed = 0;
-	int e = sysctl_io_number(req, pc_mode, sizeof(pc_mode), &v, &changed);
-	if (e || !changed) {
-		return e;
-	}
 	char pn[32];
 	proc_selfname(pn, (int)sizeof(pn));
 	if (pc_pinned) {
@@ -977,6 +989,18 @@ sysctl_sweet_passcode(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
 	}
 	pc_notify("mode change");       /* SpringBoard re-reads: recovery to 0 drops its passcode state at once */
 	return 0;
+}
+
+static int
+sysctl_sweet_passcode(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = sweet_pc_mode(), changed = 0;
+	int e = sysctl_io_number(req, pc_mode, sizeof(pc_mode), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	return sweet_passcode_kset(v);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_passcode, "I",

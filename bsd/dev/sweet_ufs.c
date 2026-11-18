@@ -911,6 +911,19 @@ rpmb_query_locked(void)
 	rpmb.query_err = 0;
 }
 
+int sweet_rpmb_kset(int value);
+/* 1256: kern.sweet_rpmb's write (checks + side effects), also called by the boot-arg sweettouchid */
+int
+sweet_rpmb_kset(int value)
+{
+	if (value < 0 || value > 2) {
+		return EINVAL;
+	}
+	sweet_rpmb = value;
+	printf("SWEET RPMB: mode %d (%s)\n", value, value == 2 ? "read/write" : value == 1 ? "read-only" : "off");
+	return 0;
+}
+
 static int
 sysctl_sweet_rpmb SYSCTL_HANDLER_ARGS
 {
@@ -920,12 +933,7 @@ sysctl_sweet_rpmb SYSCTL_HANDLER_ARGS
 	if (error || !changed) {
 		return error;
 	}
-	if (value < 0 || value > 2) {
-		return EINVAL;
-	}
-	sweet_rpmb = value;
-	printf("SWEET RPMB: mode %d (%s)\n", value, value == 2 ? "read/write" : value == 1 ? "read-only" : "off");
-	return 0;
+	return sweet_rpmb_kset(value);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmb, "I",
     "redfin 1191: RPMB relay 0 off, 1 read-only, 2 read/write (key programming never)");

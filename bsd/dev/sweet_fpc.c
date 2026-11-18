@@ -244,15 +244,11 @@ fpc_irq_enable(bool on)
 	}
 }
 
-static int
-sysctl_sweet_fpc SYSCTL_HANDLER_ARGS
+int sweet_fpc_kset(int value);
+/* 1256: kern.sweet_fpc's write (checks + side effects), also called by the boot-arg sweettouchid */
+int
+sweet_fpc_kset(int value)
 {
-#pragma unused(oidp, arg1, arg2)
-	int value = 0, changed = 0;
-	int error = sysctl_io_number(req, fpc_mode, sizeof(value), &value, &changed);
-	if (error || !changed) {
-		return error;
-	}
 	if (value & ~3) {
 		return EINVAL;
 	}
@@ -271,6 +267,18 @@ sysctl_sweet_fpc SYSCTL_HANDLER_ARGS
 	fpc_mode = value;
 	lck_mtx_unlock(&fpc_lock);
 	return 0;
+}
+
+static int
+sysctl_sweet_fpc SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, fpc_mode, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	return sweet_fpc_kset(value);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_fpc, "I", "1190 FPC fingerprint GPIOs: 1 reset, 2 irq, 3 both (0 = untouched)");
