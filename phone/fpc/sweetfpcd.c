@@ -19,8 +19,9 @@
  * Operations (one at a time; a new Enroll/Match/Detect cancels the running one) run in the capture thread, driven by
  * gpio112 (kern.sweet_fpc_wait in FPCD_WAIT_SLICE_MS slices so Cancel/SIGTERM are seen): the HAL capture sequence
  * g10/2 arm, wait, g10/1, then g10/3 / wait / g10/4 until not 3; g10/5 on a bad image or a cancel.
- *   enrol : good image -> g11/1 enrol; code 0 -> g11/2 end_enrol (fails without a HAT: then the new id comes from
- *           get_finger_ids, flag FPCD_EF_END_UNAUTH); events ENROL_PROGRESS / ENROL_DONE / TEMPLATES
+ *   enrol : good image -> g11/1 enrol (4 partial / 5 too similar: non-fatal); code 0 -> g11/2 end_enrol. Without the
+ *           hw-auth chain (fpcd_enrol_authorize hook) end_enrol gives -1: ENROL_FAILED status FPCD_E_NOTAUTH, flag
+ *           FPCD_EF_END_UNAUTH, any stray new id deleted. Events ENROL_PROGRESS / ENROL_DONE / ENROL_FAILED / TEMPLATES
  *   match : good image -> g11/3 identify; status 0 -> match_deliver() (the only producer of a match); else NOMATCH and
  *           the next capture, until a match, Cancel or the op timeout
  *   detect: captures only, for FINGER_DOWN / FINGER_UP events
@@ -293,6 +294,8 @@ static int ta_sensor_init(void)
 		r = fd_cmd(appid, d, 5, &st);
 		lg("ta: sensor init g10/5: rc %d status %d", r, st);
 	}
+	if (st == -12)
+		lg("ta: sensor init status -12: kern.sweet_fpc reset not done since boot? (set kern.sweet_fpc=3 first)");
 	sensor_ok = !r;
 	return r;
 }
@@ -494,8 +497,8 @@ static void run_enrol(uint32_t gen)
 			return;
 		}
 		uint32_t rem = rd_u32(d + 0xc);
-		if (st == 0 || st == 1 || st == 5)
-			samples++;
+		if (st == 0 || st == 1)
+			samples++;	/* 4 partial, 5 too similar, 6 dirty: non-fatal, sample not taken; touch again */
 		lg("enrol: code %d (%s), remaining %u, accepted %d", st, enrol_code(st), rem, samples);
 		ev_send(FPCD_EV_ENROL_PROGRESS, st, 0, 0, rem, (uint32_t)samples, 0, 0);
 		if (st == 2 || st == 3 || st < 0) {
@@ -514,22 +517,31 @@ static void run_enrol(uint32_t gen)
 		ids_refresh();
 		pthread_mutex_unlock(&ta_mx);
 		if (r || st2) {
-			fid = 0;
+			/* no hw-auth chain yet (fpcd_enrol_authorize): end_enrol refuses with -1 = NOT AUTHORIZED. Any id
+			 * the TA nevertheless lists that was not there before this enrol is deleted again, so no
+			 * unauthorised template stays behind (and none can ever match). */
+			uint32_t stray[5], ns = 0;
 			pthread_mutex_lock(&st_mx);
-			for (uint32_t i = 0; i < S.nids && !fid; i++) {
+			for (uint32_t i = 0; i < S.nids && i < 5; i++) {
 				int old = 0;
 				for (uint32_t j = 0; j < S.pre_n; j++)
 					old |= S.pre_ids[j] == S.ids[i];
 				if (!old)
-					fid = S.ids[i];
+					stray[ns++] = S.ids[i];
 			}
 			pthread_mutex_unlock(&st_mx);
-			flags |= FPCD_EF_END_UNAUTH;
-			lg("enrol: end_enrol rc %d status %d; new id from get_finger_ids: %#x%s", r, st2, fid,
-			   fid ? "" : " (none: enrol lost)");
-		} else {
-			lg("enrol: end_enrol ok, finger id %#x", fid);
+			pthread_mutex_lock(&ta_mx);
+			for (uint32_t i = 0; i < ns; i++)
+				lg("enrol: deleting unauthorised id %#x: delete rc %d", stray[i], fpc_delete(appid, stray[i]));
+			ids_refresh();
+			pthread_mutex_unlock(&ta_mx);
+			lg("enrol: FAILED: NOT AUTHORIZED (end_enrol rc %d status %d; needs the hw-auth chain: init_hw_auth, "
+			   "enrol challenge, gatekeeper verify, authorize_enrol with the HAT; not implemented)", r, st2);
+			ev_send(FPCD_EV_ENROL_FAILED, FPCD_E_NOTAUTH, 0, 0, 0, (uint32_t)samples, FPCD_EF_END_UNAUTH, 1);
+			ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
+			return;
 		}
+		lg("enrol: end_enrol ok, finger id %#x", fid);
 		ev_send(fid ? FPCD_EV_ENROL_DONE : FPCD_EV_ENROL_FAILED, st2, fid, 0, 0, (uint32_t)samples, flags, 1);
 		ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
 		return;
@@ -740,6 +752,19 @@ static int h_catacomb_id(const struct smb_req *q, struct smb_reply *p)
 	return FPCD_OK;
 }
 
+/*
+ * Enrol authorisation hook (hw-auth chain, proven by qseeprobe ws-qsee-b e1bf971 on 2026-11-18, NOT done here):
+ * with the FPC TA loaded: keymaster 0x205 (auth token key), FPC g3/5 init_hw_auth, g3/2 get_enrol_challenge,
+ * gatekeeper VERIFY with that challenge (needs RPMB writes + the passcode), g3/3 authorize_enrol with the HAT.
+ * Until it exists this returns 1 (= not authorised): the enrol still runs (samples, progress), but end_enrol gives
+ * -1 and the enrol ends with ENROL_FAILED status FPCD_E_NOTAUTH; nothing is kept.
+ */
+static int fpcd_enrol_authorize(uint32_t gid)
+{
+	lg("enrol: hw-auth chain not implemented: this enrol cannot be committed (end_enrol will refuse)");
+	return 1;
+}
+
 static int h_enrol(const struct smb_req *q, struct smb_reply *p)
 {
 	uint32_t gid = arg_u32(q, 0);
@@ -752,7 +777,8 @@ static int h_enrol(const struct smb_req *q, struct smb_reply *p)
 	int r = ta_set_gid(gid, &st);
 	if (!r && !st) {
 		memset(d, 0, sizeof(d));
-		r = ta_bio(0, d, &st);	/* begin_enrol; the HAL sends authorize_enrol (g3, HAT) first: not yet */
+		fpcd_enrol_authorize(gid);	/* 1 = not authorised: see the hook */
+		r = ta_bio(0, d, &st);	/* begin_enrol */
 	}
 	pthread_mutex_unlock(&ta_mx);
 	lg("enrol: gid %u, set_gid/begin_enrol rc %d status %d", gid, r, st);
@@ -804,11 +830,29 @@ static int h_fdet(const struct smb_req *q, struct smb_reply *p)
 
 static int h_remove(const struct smb_req *q, struct smb_reply *p)
 {
-	uint32_t fid = arg_u32(q, FPCD_FID_ALL);
-	if (fid == FPCD_FID_ALL)
-		return wipe_all("RemoveTemplate all");
-	if (q->len < 4)
+	/*
+	 * Kernel-forwarded form: Apple's raw 20 bytes {u32 user, 16-byte identity uuid}; a uuid the kernel reported
+	 * is SMB_UUID(fid) = {le32 'SMFP', le32 fid, 0, 0}, so fid = le32 at data[8]. A 20-byte request is never "all".
+	 * Private form (len 4): u32 fid, FPCD_FID_ALL = wipe all. Any other length: refused (no implicit "all").
+	 */
+	uint32_t fid;
+	if (q->len == 20) {
+		uint32_t user = rd_u32(q->data), magic = rd_u32(q->data + 4);
+		fid = rd_u32(q->data + 8);
+		if (magic != SMB_UUID_MAGIC || rd_u32(q->data + 12) || rd_u32(q->data + 16)) {
+			lg("remove: user %u uuid %08x-%08x-%08x-%08x is not an SMFP uuid: refused", user, magic, fid,
+			   rd_u32(q->data + 12), rd_u32(q->data + 16));
+			return FPCD_E_NOENT;
+		}
+		lg("remove: user %u uuid SMFP fid %#x", user, fid);
+	} else if (q->len == 4) {
+		fid = rd_u32(q->data);
+		if (fid == FPCD_FID_ALL)
+			return wipe_all("RemoveTemplate all (private u32 form)");
+	} else {
+		lg("remove: payload len %u (want 20, or 4 private): refused", q->len);
 		return FPCD_E_INVAL;
+	}
 	if (op_cancel_wait())
 		return FPCD_E_BUSY;
 	pthread_mutex_lock(&ta_mx);
@@ -891,7 +935,7 @@ static const struct {
 	{ 14, h_enrol_continue },	/* EnrollContinue: ack (the op runs on its own) */
 	{ 4, h_match },		/* MatchMode: identify op */
 	{ 12, h_cancel },	/* Cancel */
-	{ 13, h_remove },	/* RemoveTemplate: delete_template (FPCD_FID_ALL: all) */
+	{ 13, h_remove },	/* RemoveTemplate: 20 B {user, SMFP uuid}: fid at data[8] */
 	{ 72, h_remove_all },	/* RemoveUserData: delete every id */
 	{ 66, h_ids },		/* GetIdentitiesList: get_finger_ids */
 	{ 65, h_free },		/* GetFreeIdentityCount: 5 - count */

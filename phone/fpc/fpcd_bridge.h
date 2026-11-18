@@ -21,6 +21,9 @@
 #include <stdint.h>
 
 /* ---- part 1: kernel interface ---- */
+/* identical to part 1 of ws-mesa-a phone/fpc/sweetmesa_bridge.h (4e0a7c1, authoritative); either header may come first */
+#ifndef SMB_IFACE_DEFINED
+#define SMB_IFACE_DEFINED	1
 #define SMB_SERVICE		"SweetMesaBridge"
 #define SMB_UC_TYPE		0
 #define SMB_SEL_WAIT		0
@@ -56,6 +59,11 @@ struct smb_state {
 _Static_assert(sizeof(struct smb_req) == 16388, "smb_req");
 _Static_assert(sizeof(struct smb_reply) == 16388, "smb_reply");
 _Static_assert(sizeof(struct smb_event) == 16384, "smb_event");
+#endif /* SMB_IFACE_DEFINED */
+#ifndef SMB_UUID_MAGIC
+#define SMB_UUID_MAGIC		0x50464d53u	/* "SMFP": Apple identity uuid = { le32 SMB_UUID_MAGIC, le32 fid, 0, 0 } */
+#endif
+/* smb_event.subtype: bits 0-7 = Apple message index (0xe3ff80xx), bits 8-31 = Apple ordinal/value (0 for fpcd's events) */
 
 /* ---- part 2: fpcd v1 payloads (proposed) ---- */
 #define FPCD_ABI_VERSION	1
@@ -67,6 +75,7 @@ _Static_assert(sizeof(struct smb_event) == 16384, "smb_event");
 #define FPCD_E_NOENT		(-2)	/* finger id not in the TA's list */
 #define FPCD_E_INVAL		(-22)
 #define FPCD_E_NOTREADY		(-35)	/* TA not loaded / sensor not initialised */
+#define FPCD_E_NOTAUTH		(-13)	/* enrol not authorised: end_enrol -1 (no hw-auth chain / HAT yet) */
 #define FPCD_E_UNSUPPORTED	(-45)	/* command not mapped (yet) */
 
 /* request payloads (smb_req.data), all optional:
@@ -99,7 +108,7 @@ enum fpcd_ev_code {
 	FPCD_EV_IMAGE = 3,		/* image not usable: status = cmd 4 status (3 insufficient, 2 error) */
 	FPCD_EV_ENROL_PROGRESS = 4,	/* status = enrol code (0 done, 1 progress, 4 partial, 5, 6 dirty), remaining, samples */
 	FPCD_EV_ENROL_DONE = 5,		/* status = end_enrol TA status, fid, flags (FPCD_EF_*) */
-	FPCD_EV_ENROL_FAILED = 6,	/* status = enrol code or FPC error */
+	FPCD_EV_ENROL_FAILED = 6,	/* status = enrol code, FPC error, or FPCD_E_NOTAUTH (flag FPCD_EF_END_UNAUTH) */
 	FPCD_EV_NOMATCH = 7,		/* status = identify TA status (!= 0), score, attempts in samples */
 	FPCD_EV_MATCH = 8,		/* only from match_deliver(): identify status 0, allow-match present; flags FPCD_MF_* */
 	FPCD_EV_MATCH_WITHHELD = 9,	/* identify said 0 but a gate refused it (flags = reason FPCD_MW_*) */
@@ -107,7 +116,7 @@ enum fpcd_ev_code {
 	FPCD_EV_OP_TIMEOUT = 11,	/* the operation ran FPCD_OP_TIMEOUT_MS without finishing */
 	FPCD_EV_ERROR = 12,		/* TZ/TA error during an operation: status */
 };
-#define FPCD_EF_END_UNAUTH	1u	/* end_enrol failed (no HAT/HMAC key); the id came from get_finger_ids */
+#define FPCD_EF_END_UNAUTH	1u	/* end_enrol refused (no hw-auth chain / HAT): enrol failed, stray id deleted */
 #define FPCD_MF_HAT_VERIFIED	1u	/* keymaster verified the HAT (step 5; never set yet) */
 #define FPCD_MW_NO_ALLOW_FILE	1u
 #define FPCD_MW_UNKNOWN_FID	2u
