@@ -132,6 +132,30 @@ def product_camera_node(ph, flash):
     return node('camera', [ph()] + ([('flash', u32(1))] if flash else []))
 
 
+# --mesa (opt-in, default off): IODeviceTree:/arm-io/mesa, the Touch ID sensor node of the iPhone 8
+# (D20AP /arm-io/spi3/mesa), plain properties only. MobileGestalt's DeviceMesaType walks IODeviceTree:/arm-io
+# for a child named "mesa" and reads mesaType; libBKDM1 (biometrickitd -module 1) looks the sensor up with
+# IOServiceNameMatching("biosensor,mesa"). No interrupts, no function-* GPIO/power references and no reg:
+# nothing on this phone drives it; the kernel persona (SweetMesa, kern.sweet_mesa) is a separate object.
+# Timings copied from D20AP as found (no reader on our side; kept so property lookups see real values).
+def mesa_node(ph):
+    return node('mesa', [
+        ph(),
+        ('compatible', cstr('biosensor,mesa')),
+        ('device_type', cstr('mesa')),
+        ('mesaType', u32(1)),
+        ('dispatch-hid-events', u32(0)),
+        ('spi-frequency', u32(0x7a1200)),
+        ('time-between-scans', u32(0x20000)),
+        ('max-scan-time', u32(0x13333)),
+        ('scan-timer-reset-time', u32(0x9999)),
+        ('power-on-delay', u32(7)),
+        ('power-off-delay', u32(6)),
+        ('power-on-1v8-3v0-delay', u32(3)),
+        ('power-off-3v0-1v8-delay', u32(4)),
+    ])
+
+
 def node(name, props=(), children=()):
     n = adt.Node()
     n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
@@ -139,7 +163,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backlight=False, gamut=False):
+def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backlight=False, gamut=False, mesa=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     camera=True: /arm-io/isp (Camera.app on the home screen); flash=True: /product/camera flash
     (the flashlight in Control Center). See CAMERA below.
@@ -275,7 +299,7 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backl
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])] + ([isp_node(ph)] if camera else []))
+        ])] + ([isp_node(ph)] if camera else []) + ([mesa_node(ph)] if mesa else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -346,7 +370,7 @@ def build(seed=None, qemu=False, highmem=False, camera=False, flash=False, backl
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  camera='--camera' in sys.argv, flash='--flash' in sys.argv, backlight='--backlight' in sys.argv,
-                 gamut='--gamut' in sys.argv)
+                 gamut='--gamut' in sys.argv, mesa='--mesa' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

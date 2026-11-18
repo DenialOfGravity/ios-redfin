@@ -178,6 +178,14 @@ def main():
         adt = bpay[adt_off:adt_off + adt_size]
         if b'RAMDisk' in adt:
             die(f'{base}: its payload carries a ramdisk (ADT memory-map RAMDisk): not supported')
+        adt_note = ''
+        if os.environ.get('MKIMAGE_ADT_MESA') == '1':
+            # SweetMesa (Touch ID persona) test images: the base ADT plus /arm-io/mesa (tools/adt-mesa.py)
+            sys.path.insert(0, mp_dir)
+            import importlib
+            adt_mesa = importlib.import_module('adt-mesa')
+            adt, adt_note = adt_mesa.edit(adt)
+            adt_note = 'ADT edit     ' + adt_note + ' (MKIMAGE_ADT_MESA=1)'
         open(os.path.join(t, 'adt.bin'), 'wb').write(adt)
         bcl = bpay[CMDLINE_OFF:CMDLINE_OFF + BOOT_LINE_LENGTH - 16].split(b'\0', 1)[0].decode()
         ring_va, total_va = struct.unpack_from('<2Q', bpay, RAMLOG_OFF)
@@ -246,6 +254,7 @@ base           {base} (redfin-{base}.img sha256 {bsha}): boot header, shim, ADT 
                {'payload cmdline' if not clfile else 'cmdline from ' + clfile}, AVB footer parameters (salt {bi['Salt']})
 kernel         {os.path.relpath(kdir, P)}/kernel.development.sweet  sha256 {ksha}
 KLOG_PA        {klog}
+{adt_note}
 compiler       {open(os.path.join(kdir, 'COMPILER.txt')).read().strip()}
 {('build          ' + build.replace(chr(10), chr(10) + '               ')) if build else ''}
 cmdline        {name}.cmdline ({len(cl)} bytes){' (differs from the base)' if cl != bcl else ' (= base)'}

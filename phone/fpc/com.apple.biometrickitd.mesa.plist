@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- redfin SweetMesa phase 1 (ws-mesa-a, 2026-11-18): the iPhone 8 20H392 com.apple.biometrickitd.mesa.plist with
+     ProgramArguments "-module 1" (load only /usr/lib/libBKDM1.dylib, never libBKDM2: both define BLHelper/BioLog
+     and the com.apple.biometrickitd listener) and LLVM_PROFILE_FILE dropped. The IOKit LaunchEvent still matches
+     IOProviderClass AppleBiometricServices, which exists only while kern.sweet_mesa bit 0 is set (kernel 1192).
+     _LimitLoadToDeviceTree mesa is left out: whether launchd looks the name up anywhere or by path is unknown
+     (p3 doc U7), and the mesa ADT node is opt-in (mkimage MKIMAGE_ADT_MESA=1). Without the persona the job only
+     starts on a com.apple.biometrickitd lookup and finds no sensor. Same Mach service as the pearl job, which
+     _LimitLoadToDeviceTree pearl keeps unloaded on this phone. Install: pa put (see phone/fpc/README-mesa.txt). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.apple.biometrickitd.mesa</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/libexec/biometrickitd</string>
+		<string>--launchd</string>
+		<string>-module</string>
+		<string>1</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.biometrickitd</key>
+		<true/>
+	</dict>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>EnablePressuredExit</key>
+	<true/>
+	<key>EnableTransactions</key>
+	<true/>
+	<key>LaunchEvents</key>
+	<dict>
+		<key>com.apple.iokit.matching</key>
+		<dict>
+			<key>com.apple.biometrickitd</key>
+			<dict>
+				<key>IOProviderClass</key>
+				<string>AppleBiometricServices</string>
+				<key>IOMatchLaunchStream</key>
+				<true/>
+			</dict>
+		</dict>
+		<key>com.apple.notifyd.matching</key>
+		<dict>
+			<key>com.apple.managedconfiguration.passcodechanged</key>
+			<dict>
+				<key>Notification</key>
+				<string>com.apple.managedconfiguration.passcodechanged</string>
+			</dict>
+			<key>com.apple.mobile.keybagd.lock_status</key>
+			<dict>
+				<key>Notification</key>
+				<string>com.apple.mobile.keybagd.lock_status</string>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>
