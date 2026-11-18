@@ -23,6 +23,7 @@
  *   l   log what was hooked and each hooked call to /var/tmp/sweettidui.log
  */
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <stdio.h>
@@ -89,8 +90,14 @@ tu_hook_native_footer(void)
 		}
 		if (tu_log) {
 			id l = tu_get(tu_get(self_, "fixedFooterView"), "callToActionLabel");
-			tu_note([NSString stringWithFormat:@"footer update (animated %d): label %p text '%@'", anim, l,
-				tu_get(l, "text")]);
+			NSMutableString *chain = [NSMutableString string];
+			for (UIView *v = l; v != nil; v = v.superview) {
+				CGRect r = [v convertRect:v.bounds toView:nil];
+				[chain appendFormat:@" <%s h%d a%.2f %.0f,%.0f %.0fx%.0f>", object_getClassName(v), v.hidden,
+					v.alpha, r.origin.x, r.origin.y, r.size.width, r.size.height];
+			}
+			tu_note([NSString stringWithFormat:@"footer update (animated %d): text '%@' window %p:%@", anim,
+				tu_get(l, "text"), [(UIView *)l window], chain]);
 		}
 	}));
 	tu_note(@"n: CSFixedFooterViewController call to action as on a home-button device");
