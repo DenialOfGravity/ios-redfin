@@ -219,6 +219,7 @@ static volatile float camera_ae_target;         /* 0: camera_isp.c's ISP_AE_TARG
 static volatile bool camera_ae_unshaded;
 static volatile uint32_t camera_antiband;       /* redfin: /private/var/local/camera-antiband (isp.antiband_hz) */
 static volatile bool camera_awb2;       /* redfin: /private/var/local/camera-awb2 (camera_isp.c's isp.awb2) */
+static volatile double camera_min_fps;  /* redfin (ws-cam-smooth): /private/var/local/camera-minfps, AE's frame rate floor */
 
 static void
 camera_settings_check(void)
@@ -270,6 +271,28 @@ camera_settings_check(void)
 			    "60 Hz mains: exposures in whole 8.33 ms (camera-antiband)") : "off");
 		}
 		camera_antiband = hz;
+	}
+	{
+		/*
+		 * redfin (ws-cam-smooth): /private/var/local/camera-minfps, a number of frames a second (5-60): AE keeps the
+		 * frames at least that fast (longer exposures traded for gain), whatever MinimumFrameRate the graph set, but
+		 * never faster than its MaximumFrameRate. No file or 0: the graph's floor (as before).
+		 */
+		double fps = 0;
+
+		fd = open("/private/var/local/camera-minfps", O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, text, sizeof(text) - 1);
+
+			close(fd);
+			text[n > 0 ? n : 0] = 0;
+			fps = strtod(text, NULL);
+			fps = fps >= 5 && fps <= 60 ? fps : 0;
+		}
+		if (fps != camera_min_fps) {
+			say("AE: frame rate floor %.0f a second%s", fps, fps > 0 ? " (camera-minfps)" : " (the graph's)");
+		}
+		camera_min_fps = fps;
 	}
 }
 
@@ -2903,6 +2926,11 @@ static void
 fps_limits(const struct stream *s, const struct redwood_camera_frame *f, struct isp *isp)
 {
 	double min_fps = s->min_fps_set && (s->min_fps > 2.5 || s->limit_ae_range) ? s->min_fps : 15, max_fps = s->max_fps;
+
+	if (camera_min_fps > min_fps && !s->ae_manual) {
+		/* (ws-cam-smooth: camera-minfps; at most the graph's MaximumFrameRate) */
+		min_fps = max_fps > 0 && camera_min_fps > max_fps ? max_fps : camera_min_fps;
+	}
 
 	isp->max_frame_lines = 0;
 	isp->min_frame_lines = 0;
