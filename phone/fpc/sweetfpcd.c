@@ -15,6 +15,7 @@
  * resident TA a failing set_gid falls back to load_empty_db + set_gid), get_finger_ids.
  * SIGTERM/SIGINT: cancel the operation, stop the capture thread, unload the TA (FPCD_KEEP_TA=1 / --keep-ta: keep).
  * SIGUSR1: wipe all (delete every finger id, debug).  SIGUSR2: one status line.
+ * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
  *
  * Operations (one at a time; a new Enroll/Match/Detect cancels the running one) run in the capture thread, driven by
  * gpio112 (kern.sweet_fpc_wait in FPCD_WAIT_SLICE_MS slices so Cancel/SIGTERM are seen): the HAL capture sequence
@@ -1911,6 +1912,17 @@ int main(int argc, char **argv)
 	pthread_mutex_lock(&ta_mx);
 	dbid_refresh();
 	pthread_mutex_unlock(&ta_mx);
+	if ((e = getenv("FPCD_STORE_TEST")) && atoi(e)) {
+		/* debug: one catacomb store (61's path: TA store_template_db into the in-memory VFS, SWCT blob staged) at
+		 * start, before the bridge. Reads the TA db only; nothing is written to a file or loaded back. */
+		static struct smb_req tq;
+		static struct smb_reply tp;
+		memset(&tq, 0, sizeof(tq)), memset(&tp, 0, sizeof(tp));
+		put_u32(tq.data, 501), tq.len = 4;
+		int tr = h_cat_prepare(&tq, &tp);
+		lg("store test: h_cat_prepare -> %d, reply %u bytes, value %#x, staged blob %u bytes", tr, tp.len,
+		   tp.len >= 4 ? rd_u32(tp.data) : 0, cat_out_len);
+	}
 	pthread_t th, thw, thd;
 	if (pthread_create(&thw, NULL, ta_worker, NULL) || pthread_create(&thd, NULL, watchdog_thread, NULL) ||
 	    pthread_create(&th, NULL, capture_thread, NULL)) {
