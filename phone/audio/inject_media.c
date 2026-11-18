@@ -781,6 +781,95 @@ preview_format(id output, CMSampleBufferRef sample_buffer)
 	}
 }
 
+
+/*
+ * redfin (ws-cam-smooth): /private/var/local/camera-pace (looked for every 2 s): the samples each kind of node
+ * takes in the capture graph, counted and timed at the outputs that give them, said every 2 s with the longest
+ * wait between two samples into that kind of node; a wait over 250 ms into the preview's sink (BWImageQueueSinkNode,
+ * the preview on the screen) is said at once.
+ */
+#define PACE_KINDS      24
+static struct {
+	const char      *kind[PACE_KINDS];
+	unsigned        count[PACE_KINDS];
+	uint64_t        last[PACE_KINDS], gap_max[PACE_KINDS];
+	uint64_t        since, checked;
+	bool            on;
+} graph_pace;
+static pthread_mutex_t graph_pace_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static double
+graph_pace_ms(uint64_t ticks)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return (double)ticks * tb.numer / tb.denom / 1e6;
+}
+
+static void
+graph_pace_sample(id output)
+{
+	uint64_t now = mach_absolute_time();
+
+	if (graph_pace.checked == 0 || graph_pace_ms(now - graph_pace.checked) > 2000) {
+		graph_pace.checked = now;
+		graph_pace.on = access("/private/var/local/camera-pace", F_OK) == 0;
+	}
+	if (!graph_pace.on) {
+		return;
+	}
+	id connection = send_if(output, "connection");
+	id input = connection != nil ? send_if(connection, "input") : nil;
+	id node = input != nil ? send_if(input, "node") : nil;
+	const char *kind = node != nil ? object_getClassName(node) : "?";
+
+	pthread_mutex_lock(&graph_pace_lock);
+	int i;
+	for (i = 0; i < PACE_KINDS && graph_pace.kind[i] != NULL && graph_pace.kind[i] != kind; i++) {
+	}
+	if (i < PACE_KINDS) {
+		if (graph_pace.kind[i] == NULL) {
+			graph_pace.kind[i] = kind;
+		}
+		graph_pace.count[i]++;
+		if (graph_pace.last[i] != 0) {
+			uint64_t gap = now - graph_pace.last[i];
+
+			if (gap > graph_pace.gap_max[i]) {
+				graph_pace.gap_max[i] = gap;
+			}
+			if (graph_pace_ms(gap) > 250 && strcmp(kind, "BWImageQueueSinkNode") == 0) {
+				say("redwood: mediaserverd: pace: GAP %.0f ms into the preview's sink\n", graph_pace_ms(gap));
+			}
+		}
+		graph_pace.last[i] = now;
+	}
+	if (graph_pace.since == 0) {
+		graph_pace.since = now;
+	} else if (graph_pace_ms(now - graph_pace.since) >= 2000) {
+		char line[1200];
+		size_t at = 0;
+		double secs = graph_pace_ms(now - graph_pace.since) / 1000;
+
+		for (int k = 0; k < PACE_KINDS && graph_pace.kind[k] != NULL && at < sizeof(line) - 80; k++) {
+			if (graph_pace.count[k] != 0) {
+				at += snprintf(line + at, sizeof(line) - at, " %s %.1f/s max %.0f ms;", graph_pace.kind[k] + (strncmp(graph_pace.kind[k],
+				    "BW", 2) == 0 ? 2 : 0), graph_pace.count[k] / secs, graph_pace_ms(graph_pace.gap_max[k]));
+			}
+			graph_pace.count[k] = 0;
+			graph_pace.gap_max[k] = 0;
+		}
+		graph_pace.since = now;
+		for (size_t from = 0; from < at; from += 190) {
+			say("redwood: mediaserverd: pace %.1f s:%.190s\n", secs, line + from);
+		}
+	}
+	pthread_mutex_unlock(&graph_pace_lock);
+}
+
 static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 {
@@ -795,6 +884,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 	}
 	time_photo_encoder(self, sample_buffer);
 	preview_format(self, sample_buffer);
+	graph_pace_sample(self);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
 }
 
