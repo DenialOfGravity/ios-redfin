@@ -466,6 +466,30 @@ static uint32_t fs_ret(uint8_t *b, uint32_t cmd, int32_t ret)
 	return 8;
 }
 
+/* libdrmfs (fs_start 0x482c): cmd 0x21c answers {0x21c, errno of the last failed call} (stored at 0x5078 / 0x66a8).
+ * The TA asks it after a failed call; Linux errno values. */
+#define LX_ENOENT	2
+#define LX_EBADF	9
+#define LX_EACCES	13
+#define LX_EEXIST	17
+#define LX_ENOTDIR	20
+#define LX_EINVAL	22
+#define LX_EFBIG	27
+#define LX_ENOSPC	28
+#define LX_EROFS	30
+static int32_t fs_errno;
+static int32_t fs_fail(int32_t e)
+{
+	fs_errno = e;
+	return -1;
+}
+
+/* Darwin errno -> Linux (the low values are the same) */
+static int32_t lx_errno(int e)
+{
+	return e == ENOTEMPTY ? 39 : e == ENAMETOOLONG ? 36 : e == ELOOP ? 40 : e;
+}
+
 #ifdef QSEE_LSNR_LIB
 /* ---- ws-fpcd-b: in-memory directory for the FPC template db (qsee_gk.h struct qsee_vfs) ---- */
 static struct qsee_vfs *vfs_active;
@@ -549,19 +573,24 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 	const char *rel;
 	int fi, k;
 	switch (cmd) {
+	case 0x202:	/* open {cmd, path[0x100] @+4, flags @+0x104} (libdrmfs 0x660c; O_CREAT: mkdir -p dirname first) */
 	case 0x203: {	/* openat {cmd, dirfd, path @+8, flags @+0x108} */
-		uint32_t fl = g32(b + 0x108);
-		memcpy(p, b + 8, 0x100), p[0x100] = 0;
+		uint32_t fl = g32(b + (cmd == 0x202 ? 0x104 : 0x108));
+		memcpy(p, b + (cmd == 0x202 ? 4 : 8), 0x100), p[0x100] = 0;
 		if (!(rel = vfs_rel(p)))
 			return 0;
 		fi = rel[0] ? vfs_find(rel) : -1;
+		int existed = fi >= 0;
 		if (fi < 0 && rel[0] && (fl & 0x40))
 			fi = vfs_create(rel);
 		for (k = 0; k < VFS_NFD && vfd[k].used; k++)
 			;
-		if (fi < 0 || k == VFS_NFD || ((fl & 0x80) && (fl & 0x40) && vfs_active->f[fi].len)) {
-			lg("VFS open \"%s\" flags %#x -> -1 (%s)", p, fl, fi < 0 ? "no such file" : "no fd / exists");
-			*n = fs_ret(b, cmd, -1);
+		if (fi < 0 || k == VFS_NFD || ((fl & 0x80) && (fl & 0x40) && existed)) {
+			int32_t e = !rel[0] ? LX_EACCES : fi < 0 ? ((fl & 0x40) ? LX_ENOSPC : LX_ENOENT) : k == VFS_NFD ? 24 : LX_EEXIST;
+			if (fi >= 0 && !existed)
+				vfs_unlink_rel(rel, fi);
+			lg("VFS open(%#x) \"%s\" flags %#x -> -1 errno %d", cmd, p, fl, e);
+			*n = fs_ret(b, cmd, fs_fail(e));
 			return 1;
 		}
 		if (fl & 0x200)
@@ -569,7 +598,8 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		vfd[k].used = 1, vfd[k].file = fi, vfd[k].wr = (fl & 3) != 0;
 		vfd[k].pos = (fl & 0x400) ? vfs_active->f[fi].len : 0;
 		vfs_active->opens++;
-		lg("VFS open \"%s\" flags %#x -> fd %d (len %u)", p, fl, VFS_FD_BASE + k, vfs_active->f[fi].len);
+		lg("VFS open(%#x) \"%s\" flags %#x -> fd %d (len %u%s)", cmd, p, fl, VFS_FD_BASE + k, vfs_active->f[fi].len,
+		   existed ? "" : ", created");
 		*n = fs_ret(b, cmd, VFS_FD_BASE + k);
 		return 1;
 	}
@@ -583,7 +613,8 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		for (k = 0; k < VFS_NFD && vfd[k].used; k++)
 			;
 		if (fi < 0 || k == VFS_NFD) {
-			*n = fs_ret(b, cmd, -1);
+			lg("VFS creat \"%s\" -> -1", p);
+			*n = fs_ret(b, cmd, fs_fail(fi < 0 ? LX_ENOSPC : 24));
 			return 1;
 		}
 		vfs_active->f[fi].len = 0;
@@ -607,7 +638,9 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 				memcpy(b + 4, f->data + vfd[k].pos, (size_t)r);
 			vfd[k].pos += (uint32_t)r;
 			vfs_active->reads++, vfs_active->bytes_read += (uint32_t)r;
-		}
+		} else
+			fs_fail(LX_EINVAL);
+		lg("VFS read fd %d count %u -> %d (pos %u len %u)", VFS_FD_BASE + k, cnt, r, vfd[k].pos, f->len);
 		put_u32(b, cmd), put_u32(b + 0x4e24, (uint32_t)r);
 		*n = 0x4e28;
 		return 1;
@@ -644,9 +677,12 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 				vfs_active->writes++, vfs_active->bytes_written += cnt;
 			}
 		}
-		if (r < 0)
+		if (r < 0) {
+			fs_fail(vfd[k].wr ? LX_EFBIG : LX_EBADF);
 			lg("VFS write fd %d count %u at %u -> -1 (%s)", VFS_FD_BASE + k, cnt, vfd[k].pos,
 			   vfd[k].wr ? "too large" : "read-only fd");
+		} else
+			lg("VFS write fd %d count %u -> %d (len %u)", VFS_FD_BASE + k, cnt, r, f->len);
 		*n = fs_ret(b, cmd, r);
 		return 1;
 	}
@@ -668,7 +704,8 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		if (np >= 0 && np <= vfs_active->max_size)
 			vfd[k].pos = (uint32_t)np;
 		else
-			np = -1;
+			np = fs_fail(LX_EINVAL);
+		lg("VFS lseek fd %d off %d whence %d -> %lld", VFS_FD_BASE + k, off, wh, (long long)np);
 		*n = fs_ret(b, cmd, (int32_t)np);
 		return 1;
 	}
@@ -676,10 +713,12 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		if ((k = vfs_fd((int)g32(b + 4))) < 0)
 			return 0;
 		*n = vfs_stat(b, cmd, 0, vfs_active->f[vfd[k].file].len);
+		lg("VFS fstat fd %d -> len %u", VFS_FD_BASE + k, vfs_active->f[vfd[k].file].len);
 		return 1;
 	case 0x216:	/* fsync {cmd, fd} */
 		if ((k = vfs_fd((int)g32(b + 4))) < 0)
 			return 0;
+		lg("VFS fsync fd %d -> 0", VFS_FD_BASE + k);
 		*n = fs_ret(b, cmd, 0);
 		return 1;
 	case 0x20f:	/* lstat {cmd, path @+4} */
@@ -698,17 +737,53 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		if (!rel[0])
 			*n = vfs_stat(b, cmd, 1, 0);
 		else if (fi < 0)
-			*n = fs_stat_resp(b, cmd, -1, NULL);
+			*n = fs_stat_resp(b, cmd, fs_fail(LX_ENOENT), NULL);
 		else
 			*n = vfs_stat(b, cmd, 0, vfs_active->f[fi].len);
 		lg("VFS lstat \"%s\" -> %s", p, !rel[0] ? "dir" : fi < 0 ? "-1" : "file");
 		return 1;
-	case 0x202:	/* mkdir {cmd, path @+4, ...}: the directory exists */
+	case 0x210:	/* mkdir -p {cmd, path @+4} (libdrmfs 0x6d34): the directory exists; no subdirectories */
 		memcpy(p, b + 4, 0x100), p[0x100] = 0;
 		if (!(rel = vfs_rel(p)))
 			return 0;
-		lg("VFS mkdir \"%s\" -> 0", p);
-		*n = fs_ret(b, cmd, rel[0] ? -1 : 0);
+		fi = rel[0] ? vfs_find(rel) : -1;
+		lg("VFS mkdir \"%s\" -> %d", p, rel[0] ? -1 : 0);
+		*n = fs_ret(b, cmd, rel[0] ? fs_fail(fi >= 0 ? LX_EEXIST : LX_EACCES) : 0);
+		return 1;
+	case 0x217: {	/* rename {cmd, old @+4, new @+0x104} (libdrmfs 0x69b4) */
+		char q[0x101];
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		memcpy(q, b + 0x104, 0x100), q[0x100] = 0;
+		const char *r2 = vfs_rel(q);
+		if (!(rel = vfs_rel(p)) && !r2)
+			return 0;
+		int ok = rel && r2 && rel[0] && r2[0] && vfs_find(rel) >= 0;
+		if (ok && strcmp(rel, r2)) {
+			for (int j = 0; j < VFS_NFD; j++)	/* fds open on the target lose it, as on a real fs they keep the old inode */
+				if (vfd[j].used && vfs_find(r2) >= 0 && vfd[j].file == vfs_find(r2))
+					vfd[j].used = 0;
+			int fo = vfs_find(rel);
+			ok = qsee_vfs_rename(vfs_active, rel, r2) == 0;
+			if (ok) {
+				int fn = vfs_find(r2);
+				for (int j = 0; j < VFS_NFD; j++)
+					if (vfd[j].used && vfd[j].file == fo)
+						vfd[j].file = fn;
+			}
+		}
+		lg("VFS rename \"%s\" -> \"%s\": %s", p, q, ok ? "0" : "-1");
+		*n = fs_ret(b, cmd, ok ? 0 : fs_fail(rel && r2 ? LX_ENOENT : LX_EACCES));
+		return 1;
+	}
+	case 0x213:	/* remove (file or tree) {cmd, path @+4} (libdrmfs 0x67c0) */
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		fi = rel[0] ? vfs_find(rel) : -1;
+		if (fi >= 0)
+			vfs_unlink_rel(rel, fi);
+		lg("VFS remove \"%s\" -> %d", p, fi >= 0 ? 0 : -1);
+		*n = fs_ret(b, cmd, fi >= 0 ? 0 : fs_fail(rel[0] ? LX_ENOENT : LX_EACCES));
 		return 1;
 	case 0x20c:	/* unlink {cmd, path @+4} */
 		memcpy(p, b + 4, 0x100), p[0x100] = 0;
@@ -717,7 +792,9 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		fi = rel[0] ? vfs_find(rel) : -1;
 		if (fi >= 0)
 			vfs_unlink_rel(rel, fi);
-		*n = fs_ret(b, cmd, fi >= 0 ? 0 : -1);
+		else
+			lg("VFS unlink(%#x) \"%s\" -> -1", cmd, p);
+		*n = fs_ret(b, cmd, fi >= 0 ? 0 : fs_fail(LX_ENOENT));
 		return 1;
 	case 0x204:	/* unlinkat {cmd, dirfd, path @+8, flags @+0x108} */
 		memcpy(p, b + 8, 0x100), p[0x100] = 0;
@@ -726,7 +803,9 @@ static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
 		fi = rel[0] ? vfs_find(rel) : -1;
 		if (fi >= 0)
 			vfs_unlink_rel(rel, fi);
-		*n = fs_ret(b, cmd, fi >= 0 ? 0 : -1);
+		else
+			lg("VFS unlink(%#x) \"%s\" -> -1", cmd, p);
+		*n = fs_ret(b, cmd, fi >= 0 ? 0 : fs_fail(LX_ENOENT));
 		return 1;
 	case 0x20b: {	/* link {cmd, old @+4, new @+0x104} (libdrmfs link()) */
 		char q[0x101];
@@ -762,13 +841,18 @@ static uint32_t serve_fs(uint8_t *b, uint32_t sb_len)
 	}
 #endif
 	switch (cmd) {
-	case 0x203: {	/* open {cmd, dirfd, path[0x100] @+8, flags @+0x108} */
-		uint32_t flags = g32(b + 0x108);
-		memcpy(tzp, b + 8, 0x100), tzp[0x100] = 0;
+	case 0x21c:	/* errno of the last failed call (libdrmfs 0x482c) */
+		note(10, cmd, (uint32_t)fs_errno, 0);
+		lg("FS req ERRNO -> %d", fs_errno);
+		return fs_ret(b, cmd, fs_errno);
+	case 0x202:	/* open {cmd, path[0x100] @+4, flags @+0x104} */
+	case 0x203: {	/* openat {cmd, dirfd, path[0x100] @+8, flags @+0x108} */
+		uint32_t flags = g32(b + (cmd == 0x202 ? 0x104 : 0x108));
+		memcpy(tzp, b + (cmd == 0x202 ? 4 : 8), 0x100), tzp[0x100] = 0;
 		note(10, cmd, flags, 0);
 		if (flags & (0x40 | 0x200 | 0x400)) {	/* Linux O_CREAT O_TRUNC O_APPEND */
 			write_attempt("FS open \"%s\" flags %#x (create/truncate/append)", tzp, flags);
-			return fs_ret(b, cmd, -1);
+			return fs_ret(b, cmd, fs_fail(LX_EROFS));
 		}
 		int fd = -1;
 		if (map_path(tzp, path, sizeof(path)) == 0 && n_fs_fds < 32)
@@ -777,6 +861,8 @@ static uint32_t serve_fs(uint8_t *b, uint32_t sb_len)
 			rw_opens++;
 		if (fd >= 0)
 			fs_fds[n_fs_fds++] = fd;
+		else
+			fs_fail(path[0] ? lx_errno(errno) : LX_EACCES);
 		lg("FS req OPEN \"%s\" flags %#x%s -> %s fd %d", tzp, flags, flags & 3 ? " (rw: served read-only)" : "", path, fd);
 		return fs_ret(b, cmd, fd);
 	}
@@ -843,9 +929,10 @@ static uint32_t serve_fs(uint8_t *b, uint32_t sb_len)
 		memset(b, 0, 0x10);
 		put_u32(b, cmd), put_u32(b + 0xc, 0xffffffffu);
 		return 0x10;
-	case 0x202: case 0x204: case 0x206: case 0x208: case 0x20b: case 0x20c: case 0x210: case 0x211: {
-		static const char *nm[] = { [0] = "mkdir", [2] = "unlinkat", [4] = "creat", [6] = "write", [9] = "link/rename",
-					    [10] = "unlink", [14] = "link/copy", [15] = "link/copy" };
+	case 0x204: case 0x206: case 0x208: case 0x20b: case 0x20c: case 0x210: case 0x211: case 0x213: case 0x217: {
+		static const char *nm[] = { [2] = "unlinkat", [4] = "creat", [6] = "write", [9] = "link",
+					    [10] = "unlink", [14] = "mkdir -p", [15] = "copy?", [17] = "remove", [21] = "rename" };
+		fs_errno = LX_EROFS;
 		note(10, cmd, g32(b + 4), 0);
 		memcpy(tzp, b + 4, 0x100), tzp[0x100] = 0;
 		for (int i = 0; i < 0x100; i++)
@@ -857,7 +944,7 @@ static uint32_t serve_fs(uint8_t *b, uint32_t sb_len)
 	default:
 		note(10, cmd, g32(b + 4), 0);
 		lg("FS req cmd %#x word1 %#x -> -1 (not served)", cmd, g32(b + 4));
-		return fs_ret(b, cmd, -1);
+		return fs_ret(b, cmd, fs_fail(LX_EINVAL));
 	}
 }
 
