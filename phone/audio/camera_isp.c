@@ -123,6 +123,23 @@ isp_sharpness(const struct redwood_camera_frame *f, const uint8_t *raw, float x0
 
 static inline void lsc_at(const struct isp *isp, float u, float v, float g[3]);
 
+/* log2 of x > 0 to 0.005 or so (the exponent, and a parabola through the mantissa): a bin of the AWB2 histograms */
+static inline int
+awb2_bin(float x)
+{
+	union { float f; uint32_t u; } v = { .f = x };
+	float m, l;
+	int bin;
+
+	if (!(x > 0)) {
+		return 0;
+	}
+	m = (union { uint32_t u; float f; }){ .u = (v.u & 0x007fffffu) | 0x3f800000u }.f;   /* [1, 2) */
+	l = (float)((int)((v.u >> 23) & 255) - 128) + (-0.34484843f * m + 2.02466578f) * m - 0.67487759f;
+	bin = (int)((l - AWB2_LOG2_MIN) / AWB2_LOG2_STEP);
+	return bin < 0 ? 0 : bin >= AWB2_BINS ? AWB2_BINS - 1 : bin;
+}
+
 void
 isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
@@ -206,6 +223,14 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 				grey[0] += cr / cg;
 				grey[1] += cb / cg;
 				s->grey_cells++;
+				if (isp != NULL && isp->awb2) {
+					int band = (int)cg / AWB2_LUM_STEP;
+
+					band = band >= AWB2_LUMS ? AWB2_LUMS - 1 : band;
+					s->awb2_lum[band]++;
+					s->awb2_hist[band][0][awb2_bin(cr / cg)]++;
+					s->awb2_hist[band][1][awb2_bin(cb / cg)]++;
+				}
 				/*
 				 * Grey, or within a third of it in red and blue, with the white balance as it is: what
 				 * the white balance should make grey, without the coloured things around it (the
@@ -480,6 +505,61 @@ isp_cct(const struct isp *isp)
 	return t->ref[i][2] + u * (t->ref[i + 1][2] - t->ref[i][2]);
 }
 
+/*
+ * redfin (camera-awb2): grey world, but of the brightest 30 % of the cells the white balance counts (none near
+ * white or black): in a room the brightest surfaces are mostly its white walls, ceiling and paper, while its
+ * darker ones -- wood, a sofa, a floor -- have colours of their own that pull plain grey world off (a room of
+ * brown and wood: 7 % short in red and blue, the picture green). Of those cells, each colour's middle half (from
+ * the quarter to the three quarters of its ratios): what is left of a lamp, a screen or a coloured thing among
+ * them counts for nothing. False when there are too few cells for it.
+ */
+static bool
+awb2_estimate(const struct isp_stats *s, float *r, float *b)
+{
+	uint32_t total = 0, want, got = 0, hist[2][AWB2_BINS];
+	int band;
+
+	for (band = 0; band < AWB2_LUMS; band++) {
+		total += s->awb2_lum[band];
+	}
+	if (total < 200 || total * 16 < s->cells) {
+		return false;
+	}
+	want = total * 3 / 10;
+	memset(hist, 0, sizeof(hist));
+	for (band = AWB2_LUMS - 1; band >= 0 && got < want; band--) {
+		got += s->awb2_lum[band];
+		for (int c = 0; c < 2; c++) {
+			for (int i = 0; i < AWB2_BINS; i++) {
+				hist[c][i] += s->awb2_hist[band][c][i];
+			}
+		}
+	}
+	if (got < 100) {
+		return false;
+	}
+	for (int c = 0; c < 2; c++) {
+		/* the mean of log2 over the cells from got/4 to 3*got/4, bins cut where those fall */
+		double lo = got / 4.0, hi = got * 3 / 4.0, seen = 0, sum = 0, n = 0;
+
+		for (int i = 0; i < AWB2_BINS; i++) {
+			double from = seen, to = seen + hist[c][i];
+			double a = from > lo ? from : lo, z = to < hi ? to : hi;
+
+			if (z > a) {
+				sum += (z - a) * (AWB2_LOG2_MIN + (i + 0.5) * AWB2_LOG2_STEP);
+				n += z - a;
+			}
+			seen = to;
+		}
+		if (n <= 0) {
+			return false;
+		}
+		*(c == 0 ? r : b) = (float)exp2(-sum / n);
+	}
+	return true;
+}
+
 void
 isp_awb(struct isp *isp, const struct isp_stats *s)
 {
@@ -501,7 +581,9 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 		isp->awb_stable = true;
 		return;
 	}
-	if (s->neutral_cells * 32 >= s->cells && s->neutral[0] > 0.01 && s->neutral[1] > 0.01) {
+	if (isp->awb2 && awb2_estimate(s, &r, &b)) {
+		/* (r and b: the brightest surfaces' colour, white walls and paper as a room has them) */
+	} else if (s->neutral_cells * 32 >= s->cells && s->neutral[0] > 0.01 && s->neutral[1] > 0.01) {
 		r = (float)(1 / s->neutral[0]);
 		b = (float)(1 / s->neutral[1]);
 	} else if (s->grey_cells * 16 >= s->cells && s->grey[0] > 0.01 && s->grey[1] > 0.01) {

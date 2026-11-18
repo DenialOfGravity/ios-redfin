@@ -35,6 +35,18 @@ struct isp_stats {
 	 * there is no lens shading): what AE meters on unless isp->ae_unshaded
 	 */
 	double          shaded_mean, shaded_bright, roi_shaded_mean, roi_shaded_bright;
+	/*
+	 * redfin (camera-awb2): the white balance's cells (as grey[] counts them) by their lens-shaded green, in
+	 * AWB2_LUMS bands of AWB2_LUM_STEP, and in each band how many of them have each red over green and blue
+	 * over green, in AWB2_BINS steps of log2 from AWB2_LOG2_MIN (only when isp->awb2)
+	 */
+#define AWB2_LUMS       32
+#define AWB2_LUM_STEP   32
+#define AWB2_BINS       128
+#define AWB2_LOG2_MIN   (-3.0f)
+#define AWB2_LOG2_STEP  (4.0f / AWB2_BINS)
+	uint32_t        awb2_lum[AWB2_LUMS];
+	uint32_t        awb2_hist[AWB2_LUMS][2][AWB2_BINS];
 };
 
 /*
@@ -107,6 +119,7 @@ struct isp {
 	uint32_t        asked_frames;           /* frames seen since AE asked (it waits at most AE_PATIENCE for them) */
 	bool            ae_stable;              /* (AE's answer) the exposure is where AE wants it */
 	bool            awb_locked;             /* LockAWBNow: the white balance stays as it is */
+	bool            awb2;                   /* redfin (camera-awb2): the white balance from the brightest 30 % of its cells */
 	bool            awb_manual;             /* the white balance's gains are wb_manual's (green 1) */
 	float           wb_manual[3];
 	bool            awb_stable;             /* (AWB's answer) the white balance has stopped moving */

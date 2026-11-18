@@ -217,6 +217,7 @@ redwood_camera_say(const char *format, ...)
  */
 static volatile float camera_ae_target;         /* 0: camera_isp.c's ISP_AE_TARGET */
 static volatile bool camera_ae_unshaded;
+static volatile bool camera_awb2;       /* redfin: /private/var/local/camera-awb2 (camera_isp.c's isp.awb2) */
 
 static void
 camera_settings_check(void)
@@ -242,6 +243,14 @@ camera_settings_check(void)
 	}
 	camera_ae_target = target;
 	camera_ae_unshaded = unshaded;
+	{
+		bool awb2 = access("/private/var/local/camera-awb2", F_OK) == 0;
+
+		if (awb2 != camera_awb2) {
+			say("AWB: %s", awb2 ? "the brightest 30 % of the cells, their middle half (camera-awb2)" : "grey world of the near-grey cells");
+		}
+		camera_awb2 = awb2;
+	}
 }
 
 /* the mean of a picture's luma (every 8th pixel of every 8th row) and the fraction of it at 250 or above (locked) */
@@ -2940,6 +2949,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		isp.ae_locked = s->ae_locked || (shot.state != SHOT_IDLE && shot.state != SHOT_PREFLASH);
 		isp.ae_target = camera_ae_target;
 		isp.ae_unshaded = camera_ae_unshaded;
+		isp.awb2 = camera_awb2;
 		isp.ae_bias = s->ae_bias;
 		memcpy(isp.ae_roi, s->ae_roi, sizeof(isp.ae_roi));
 		isp.ae_max_gain = s->ae_max_gain;
