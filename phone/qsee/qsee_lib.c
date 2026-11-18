@@ -1,7 +1,7 @@
 /*
  * qsee_lib.c (ws-fpcd-a): qseeprobe's QSEE + FPC TA code as a library (qsee_lib.h), shared by qseeprobe and sweetfpcd.
  * The code below is moved unchanged from qseeprobe.c, qsee_app.inc and qsee_fpc.inc (ws-qsee-b 5e7263b); new here:
- * say_tag, qsee_unload() (cmd_unload without the guard) and qsee_lock().
+ * say_tag, qsee_unload() (cmd_unload without the guard) and qsee_lib_lock().
  * Every SMC passes qsmc(): x0 and x1 must match an entry of qsee_whitelist[] (qsee_wl.c) or the process exits.
  */
 #include <errno.h>
@@ -775,10 +775,10 @@ int qsee_unload(uint32_t appid)
 /*
  * One QSEE/SMC user at a time: an exclusive flock on QSEE_LOCK_PATH (env QSEE_LOCK), held until the process exits
  * (the kernel drops it on any exit, so a stale file is harmless). The holder writes "pid N WHO" into the file.
- * QSEE_NOLOCK=1 skips the lock. If the file cannot be created (no /var/local/fpc), the lock is skipped with a line.
+ * QSEE_NOLOCK=1 skips the lock. If the file cannot be created, the lock is skipped with a line.
  */
 static int lock_fd = -1;
-int qsee_lock(const char *who)
+int qsee_lib_lock(const char *who)
 {
 	const char *e = getenv("QSEE_NOLOCK"), *path = getenv("QSEE_LOCK");
 	if (!path || !*path)
@@ -789,6 +789,8 @@ int qsee_lock(const char *who)
 	}
 	if (lock_fd >= 0)
 		return 0;
+	if (!strcmp(path, QSEE_LOCK_PATH))
+		mkdir("/var/local/tz", 0700);	/* qseeprobe's qsee_lsnr.inc makes the same directory */
 	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 	if (fd < 0) {
 		say("lock: %s: %s: running without the lock", path, strerror(errno));

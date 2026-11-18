@@ -9,7 +9,7 @@
  *                             Unloads the TA at the end if this run loaded it. Exit 0 = pass.
  *   options: --fresh (unload a resident TA and load it again), --keep-ta (never unload)
  *
- * Startup: the QSEE lock (qsee_lock, /var/local/fpc/qsee.lock: the only SMC user); kern.sweet_fpc must have bits
+ * Startup: the QSEE lock (qsee_lib_lock, /var/local/tz/qsee.lock, shared with qseeprobe: the only SMC user); kern.sweet_fpc must have bits
  * 0 (reset) and 1 (irq) set, i.e. value 3 (xnu 1190); lookup "fingerprint": resident -> reuse its id (templates kept),
  * else load DIR/fpctzappfingerprint.mdt+.bNN and load_empty_db; then sensor init (g10/0, g10/5), set_gid 0 (on a
  * resident TA a failing set_gid falls back to load_empty_db + set_gid), get_finger_ids.
@@ -1158,7 +1158,7 @@ int main(int argc, char **argv)
 	lg("start %s: %s, TA %s/%s (name %s), op timeout %ld ms, allow-match file %s", FPCD_VERSION,
 	   self ? "selftest" : "daemon", ta_dir, ta_file, ta_name, op_timeout_ms, ALLOW_MATCH_PATH);
 	pm_init();
-	if (qsee_lock("sweetfpcd"))
+	if (qsee_lib_lock("sweetfpcd"))
 		return 9;
 	if (fpc_kernel_ready(!self))
 		return g_stop ? 0 : 2;

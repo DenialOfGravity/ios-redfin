@@ -5,7 +5,7 @@
  * Every SMC still goes through qsmc() and the hard whitelist (qsee_wl.c).
  *
  * Not thread-safe: one SMC at a time. A multi-threaded user (sweetfpcd) serialises every call with its own mutex.
- * Process exclusion: qsee_lock() takes an flock on QSEE_LOCK_PATH (env QSEE_LOCK overrides the path, QSEE_NOLOCK=1
+ * Process exclusion: qsee_lib_lock() takes an flock on QSEE_LOCK_PATH (env QSEE_LOCK overrides the path, QSEE_NOLOCK=1
  * skips it), so only one QSEE/SMC user (sweetfpcd or one qseeprobe) runs at a time.
  */
 #ifndef QSEE_LIB_H
@@ -76,7 +76,7 @@ int fpc_capture(uint32_t appid, const struct timespec *t0, int ms, int32_t *st4,
 const char *enrol_code(int32_t s);
 
 /* one QSEE/SMC user at a time */
-#define QSEE_LOCK_PATH "/var/local/fpc/qsee.lock"
-int qsee_lock(const char *who);		/* 0 held (or skipped), -1 another process holds it */
+#define QSEE_LOCK_PATH "/var/local/tz/qsee.lock"
+int qsee_lib_lock(const char *who);		/* 0 held (or skipped), -1 another process holds it */
 
 #endif

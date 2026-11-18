@@ -29,11 +29,21 @@
  *   QSEE_CONSOLE=0     do not mirror the log lines to /dev/console (default: mirrored, so a hang leaves a klog line)
  *
  * ws-fpcd-a: the QSEE/TA code is in qsee_lib.c (shared with sweetfpcd); every command that issues SMCs takes the
- * QSEE lock first (qsee_lock(), /var/local/fpc/qsee.lock; QSEE_NOLOCK=1 skips it), so it refuses to run beside
- * sweetfpcd. Exit code 9 = lock held.
+ * QSEE lock first (qsee_lock() from qsee_lsnr.inc, /var/local/tz/qsee.lock, the same file sweetfpcd
+ * holds via qsee_lib_lock()), so it refuses to run beside
+ * sweetfpcd. Exit code 7 = lock held.
  *
+ * Gatekeeper phase 2, READ-ONLY (qsee_lsnr.inc; PF/logs/research/fingerprint-gatekeeper-2026-11-18.md):
+ *   qseeprobe km-version        keymaster64 GET_VERSION 0x200 (no listener)
+ *   qseeprobe lsnr-test         register + deregister the RPMB 0x2000 / file system 10 / time 11 listeners, twice
+ *   qseeprobe rpmb-counter      RPMB write-counter read through kern.sweet_rpmb_xfer (1191), no TZ involved
+ *   qseeprobe rpmb-refuse-test  kern.sweet_rpmb=1 must refuse an authenticated write (EPERM, nothing sent)
+ *   qseeprobe km-authkey        keymaster64 GET_AUTH_TOKEN_KEY 0x205 with the listeners up (status + length only)
+ *   qseeprobe gk-verify-dummy   gatekeeper VERIFY 0x1002, uid 0x7e000001 only, dummy handle, kern.sweet_rpmb must be 1
+ *   Never: enroll, delete_user, delete_all_users (0x1001/0x1003/0x1004/0x21004), RPMB writes, persist writes.
+ *   Every non-dry-run command holds /var/local/tz/qsee.lock (the only SMC user at a time).
  * Every SMC passes qsmc(): x0 and x1 must match an entry of qsee_whitelist[] (qsee_wl.c) or the tool exits before
- * the ioctl. No listener registration, services-image load, RPMB, key or bridge-enable calls exist in this tool.
+ * the ioctl. No services-image load, RPMB provisioning, keystore or bridge-enable calls exist in this tool.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -528,6 +538,7 @@ static int cmd_enrol_test(uint32_t appid, int ms)
 	print_seen();
 	return !ok ? 5 : matches ? 0 : 8;
 }
+#include "qsee_lsnr.inc"
 
 int main(int argc, char **argv)
 {
@@ -539,7 +550,8 @@ int main(int argc, char **argv)
 	if (argc < 2) {
 		fprintf(stderr, "usage: qseeprobe version | lookup [NAME...] | load NAME DIR | send-build-info APPID |\n"
 				"       unload APPID | sensor-init APPID | sensor-cmd APPID CMD | finger-detect APPID [MS] |\n"
-				"       fp-ids APPID | fp-delete APPID FID | enrol-test APPID [MS] | whitelist\n"
+				"       fp-ids APPID | fp-delete APPID FID | enrol-test APPID [MS] | whitelist |\n"
+				"       km-version | lsnr-test | rpmb-counter | rpmb-refuse-test | km-authkey | gk-verify-dummy\n"
 				"  env QSEE_DRYRUN=1 (print SMCs only), QSEE_SHMBRIDGE=1 (bridge every buffer),\n"
 				"      QSEE_APP=NAME (send/unload guard), QSEE_SEND=wl|legacy\n");
 		return 1;
@@ -551,9 +563,9 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (!dryrun) {
+		if (qsee_lock())
+			return 7;
 		pm_init();
-		if (qsee_lock("qseeprobe"))
-			return 9;
 	}
 	say("start: %s%s%s", argv[1], dryrun ? " QSEE_DRYRUN=1" : "", shmbridge ? " QSEE_SHMBRIDGE=1" : "");
 	if (!strcmp(argv[1], "version"))
@@ -576,6 +588,18 @@ int main(int argc, char **argv)
 		return cmd_fp_delete((uint32_t)strtoul(argv[2], NULL, 0), (uint32_t)strtoul(argv[3], NULL, 0));
 	if (!strcmp(argv[1], "enrol-test") && (argc == 3 || argc == 4))
 		return cmd_enrol_test((uint32_t)strtoul(argv[2], NULL, 0), argc == 4 ? atoi(argv[3]) : 180000);
+	if (!strcmp(argv[1], "km-version") && argc == 2)
+		return cmd_km_version();
+	if (!strcmp(argv[1], "lsnr-test") && argc == 2)
+		return cmd_lsnr_test();
+	if (!strcmp(argv[1], "rpmb-counter") && argc == 2)
+		return cmd_rpmb_counter();
+	if (!strcmp(argv[1], "rpmb-refuse-test") && argc == 2)
+		return cmd_rpmb_refuse_test();
+	if (!strcmp(argv[1], "km-authkey") && argc == 2)
+		return cmd_km_authkey();
+	if (!strcmp(argv[1], "gk-verify-dummy") && argc == 2)
+		return cmd_gk_verify_dummy();
 	if (!strcmp(argv[1], "unload") && argc == 3)
 		return cmd_unload((uint32_t)strtoul(argv[2], NULL, 0));
 	fprintf(stderr, "qseeprobe: unknown command or arguments: %s\n", argv[1]);

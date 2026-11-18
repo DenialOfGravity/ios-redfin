@@ -20,7 +20,11 @@ int main(void)
 	CHECK(QSEE_SMC_SEND_DATA == 0x70000001ull && QSEE_SMC_SEND_DATA_WL == 0x70000006ull);
 	CHECK(QSEE_ARGS_APP_START == 0x03 && QSEE_ARGS_APP_SHUTDOWN == 0x01 && QSEE_ARGS_LSTNR_RESP == 0x02);
 	CHECK(QSEE_ARGS_SEND_DATA == 0x885 && QSEE_ARGS_SEND_DATA_WL == 0x8887);
-	CHECK(qsee_whitelist_n == 11);
+	CHECK(qsee_whitelist_n == 15);
+	CHECK(QSEE_SMC_LSTNR_REG == 0x72000201ull && QSEE_SMC_LSTNR_DEREG == 0x72000202ull);
+	CHECK(QSEE_SMC_LSTNR_RESP_WL == 0x72000205ull && QSEE_SMC_LSTNR_REG_SI == 0x72000206ull);
+	CHECK(QSEE_ARGS_LSTNR_REG == 0x83 && QSEE_ARGS_LSTNR_DEREG == 0x01 && QSEE_ARGS_LSTNR_RESP_WL == 0x204);
+	CHECK(!qsee_allowed(QSEE_SMC_LSTNR_REG_SI, 0x03));
 	for (unsigned i = 0; i < qsee_whitelist_n; i++)
 		CHECK(qsee_allowed(qsee_whitelist[i].x0, qsee_whitelist[i].arginfo) == &qsee_whitelist[i]);
 	/* right ID, wrong arginfo: refused */
@@ -33,8 +37,6 @@ int main(void)
 	static const uint64_t bad[] = {	/* every other qseecomi.h ID (| SMC64), as computed from its macros */
 		0x72000104, 0x72000105,				/* GET_STATE, REGION_NOTIF */
 		0x72000106, 0x72000107, 0x72000108,		/* REGISTER_LOG_BUFFER, LOAD/UNLOAD_SERVICES_IMAGE */
-		0x72000201, 0x72000202,				/* listener register/deregister */
-		0x72000205, 0x72000206,				/* whitelist response, smcinvoke listener register */
 		0x72000301, 0x72000302,				/* external image load/unload */
 		0x72000401, 0x72000402, 0x72000403,		/* RPMB provision/erase/check */
 		0x72000501, 0x72000502, 0x72000503, 0x72000504, 0x72000505,	/* keystore */
@@ -66,10 +68,11 @@ int main(void)
 			int ok = 0;
 			for (uint64_t ai = 0; ai < 0x100; ai++)
 				ok |= !!qsee_allowed(pages[p] | f, ai);
-			ok |= !!qsee_allowed(pages[p] | f, QSEE_ARGS_SEND_DATA) | !!qsee_allowed(pages[p] | f, QSEE_ARGS_SEND_DATA_WL);
+			ok |= !!qsee_allowed(pages[p] | f, QSEE_ARGS_SEND_DATA) | !!qsee_allowed(pages[p] | f, QSEE_ARGS_SEND_DATA_WL) |
+			      !!qsee_allowed(pages[p] | f, QSEE_ARGS_LSTNR_RESP_WL);
 			n += ok;
 		}
-	CHECK(n == 11);
+	CHECK(n == 15);
 	printf("%s: qsee whitelist test (%u entries)\n", fails ? "FAILED" : "ok", qsee_whitelist_n);
 	return fails ? 1 : 0;
 }
