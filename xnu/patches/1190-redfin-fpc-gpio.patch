@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rory Axton <roryaxton@gmail.com>
+Date: Wed, 18 Nov 2026 12:00:00 +0100
+Subject: [PATCH] 1190 redfin: FPC fingerprint GPIOs (reset gpio16, irq gpio112), kern.sweet_fpc default 0
+
+bsd/dev/sweet_fpc.c: the stock fpc1020_platform_tee hw_reset sequence on
+TLMM gpio16 (kern.sweet_fpc bit 1) and the gpio112 rising-edge interrupt
+on the TLMM summary interrupt, chained from sec_ts's handler (bit 2),
+kern.sweet_fpc_irq (count), kern.sweet_fpc_wait (block until gpio112 is
+high, N ms), kern.sweet_fpc_state. Default 0: both pins untouched, no log.
+The SPI bus stays with TrustZone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ca0d42a..eae0c15 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_motion.c			standard
+ bsd/dev/sweet_fts.c			standard
+ bsd/dev/sweet_sects.c			standard
++bsd/dev/sweet_fpc.c			standard
+ bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_torch.c			standard
+ bsd/dev/sweet_cam.c			standard
+diff --git a/bsd/dev/sweet_fpc.c b/bsd/dev/sweet_fpc.c
+new file mode 100644
+index 0000000..9bd1515
+--- /dev/null
++++ b/bsd/dev/sweet_fpc.c
+@@ -0,0 +1,300 @@
++/*
++ * 1190 redfin (Pixel 5) fingerprint sensor (FPC1028, "fpc,fpc1020"): kernel control of its two GPIOs, nothing else.
++ * The sensor's SPI bus (QUP0 SE1 0x884000, gpio0-3) belongs to TrustZone: the stock FPC TA drives it, and this file
++ * never touches it. The Linux driver (redbull drivers/input/misc/fpc_fingerprint/fpc1020_platform_tee.c) only resets
++ * the sensor and forwards its interrupt line to the HAL, and so does this one.
++ *
++ *   reset = TLMM gpio16 (EAST tile, active low; pinctrl fpc_reset_low/high)
++ *   irq   = TLMM gpio112 (WEST tile, input, bias pull-down; high while a sensor event is pending)
++ *
++ * kern.sweet_fpc (RW, default 0 = untouched: gpio16 and gpio112 stay exactly as the bootloader left them and
++ * nothing is logged):
++ *   bit 1  hw_reset as the stock driver: reset high 100 us, low 5 ms, high 5 ms (left released = high), gpio112
++ *          as input pull-down; logs "SWEET FPC reset done irq=<gpio112 level>" (stock: "IRQ after reset 1").
++ *          Runs on every write that has the bit set.
++ *   bit 2  gpio112 rising-edge interrupt (stock: IRQF_TRIGGER_RISING) on the TLMM summary interrupt (INTID 240,
++ *          owned by sec_ts touch, which hands other pins' status to sweet_fpc_tlmm_irq()). Counts events in
++ *          kern.sweet_fpc_irq (RO) and logs each "SWEET FPC irq n=N t=US level=L" (at most 8 lines per wakeup).
++ *          Clearing the bit restores gpio112's boot INTR_CFG.
++ * kern.sweet_fpc_wait (RW int): write N ms (1..60000) = block until gpio112 is high (the level, like the HAL's
++ *   fpc_irq_wait on the sysfs "irq" attribute) or N ms pass; the same call reads back 1 (high) or 0 (timeout).
++ *   Woken by the interrupt when bit 2 is on and the summary interrupt is live; otherwise polls every 5 ms.
++ * kern.sweet_fpc_state (RO string): "rst=gpio16 out=O oe=E cfg=C irq=gpio112 in=I cfg=C intr=C irqs=N mode=M".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define FPC_RST_PA      (0x0f900000u + 16u * 0x1000u)   /* TLMM EAST + gpio16 (pinctrl-lito.c) */
++#define FPC_IRQ_PA      (0x0f500000u + 112u * 0x1000u)  /* TLMM WEST + gpio112 */
++#define TLMM_CFG        0x0u    /* [1:0] pull (1 = down), [5:2] function, [8:6] drive, [9] output enable */
++#define TLMM_IO         0x4u    /* [0] in, [1] out */
++#define TLMM_INTR_CFG   0x8u    /* [0] enable, [1] polarity (1 = high), [3:2] detection (1 = rising), [4] raw, [7:5] target */
++#define TLMM_INTR_ST    0xcu    /* [0] status, write 0 to clear */
++#define FPC_INTR_ON     ((3u << 5) | (1u << 4) | (1u << 2) | (1u << 1) | 1u)  /* apps, raw, rising edge, enabled */
++
++static LCK_GRP_DECLARE(fpc_grp, "sweet-fpc");
++static LCK_MTX_DECLARE(fpc_lock, &fpc_grp);
++static vm_offset_t fpc_rst, fpc_irqp;   /* the two pins' register pages */
++static int fpc_mode;                    /* kern.sweet_fpc */
++static uint32_t fpc_boot_intr;          /* gpio112 INTR_CFG at the first bit-2 write */
++static bool fpc_boot_saved, fpc_thread_on;
++static volatile bool fpc_irq_on;        /* read by sweet_fpc_tlmm_irq in interrupt context */
++static volatile uint32_t fpc_irqs, fpc_logged;
++static volatile uint64_t fpc_irq_t[8];  /* mach time of event n, at [n & 7] */
++static int fpc_wait_chan, fpc_log_chan;
++static int fpc_wait_last;
++
++static uint32_t
++fpc_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++fpc_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Under fpc_lock. */
++static void
++fpc_map(void)
++{
++	if (!fpc_rst) {
++		fpc_rst = ml_io_map(FPC_RST_PA, 0x1000);
++		fpc_irqp = ml_io_map(FPC_IRQ_PA, 0x1000);
++	}
++}
++
++static unsigned
++fpc_level(void)
++{
++	return fpc_irqp ? (fpc_rd(fpc_irqp, TLMM_IO) & 1u) : 0u;
++}
++
++static void
++fpc_rst_set(bool high)
++{
++	fpc_wr(fpc_rst, TLMM_IO, (fpc_rd(fpc_rst, TLMM_IO) & ~2u) | (high ? 2u : 0u));
++}
++
++/* Stock hw_reset(): fpc1020_reset_active, 100 us, _reset, 5 ms, _active, 5 ms, read the irq line. */
++static void
++fpc_reset(void)
++{
++	uint32_t rcfg = fpc_rd(fpc_rst, TLMM_CFG), icfg = fpc_rd(fpc_irqp, TLMM_CFG);
++	/* gpio112: function 0 (GPIO), input, pull-down (pinctrl fpc_irq_default), as the stock probe selects it */
++	fpc_wr(fpc_irqp, TLMM_CFG, (icfg & ~0x3ffu) | 1u);
++	/* gpio16: function 0, output, 2 mA, no pull; out level set before the output is enabled */
++	fpc_rst_set(true);
++	fpc_wr(fpc_rst, TLMM_CFG, (rcfg & ~0x3ffu) | 0x200u);
++	delay(100);
++	fpc_rst_set(false);
++	delay(5000);
++	fpc_rst_set(true);
++	delay(5000);
++	printf("SWEET FPC reset done irq=%u (gpio16 cfg %#x->%#x, gpio112 cfg %#x->%#x)\n", fpc_level(),
++	    rcfg, fpc_rd(fpc_rst, TLMM_CFG), icfg, fpc_rd(fpc_irqp, TLMM_CFG));
++}
++
++/*
++ * From sec_ts's TLMM summary handler (bsd/dev/sweet_sects.c, interrupt context) when its own pin is not the one
++ * pending: true if gpio112's event was ours (status cleared).
++ */
++bool sweet_fpc_tlmm_irq(void);
++bool
++sweet_fpc_tlmm_irq(void)
++{
++	if (!fpc_irq_on || !fpc_irqp || !(fpc_rd(fpc_irqp, TLMM_INTR_ST) & 1u)) {
++		return false;
++	}
++	fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++	uint32_t n = fpc_irqs + 1u;
++	fpc_irq_t[n & 7u] = mach_absolute_time();
++	fpc_irqs = n;
++	thread_wakeup(&fpc_wait_chan);
++	thread_wakeup(&fpc_log_chan);
++	return true;
++}
++
++static void
++fpc_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)assert_wait(&fpc_log_chan, THREAD_UNINT);
++		if (fpc_logged == fpc_irqs) {
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		}
++		uint32_t now = fpc_irqs, lines = 0;
++		while (fpc_logged != now && lines < 8u) {
++			uint32_t n = ++fpc_logged;
++			uint64_t ns;
++			absolutetime_to_nanoseconds(fpc_irq_t[n & 7u], &ns);
++			printf("SWEET FPC irq n=%u t=%llu us level=%u\n", n, ns / 1000u, fpc_level());
++			lines++;
++		}
++		if (fpc_logged != now) {
++			printf("SWEET FPC irq n=%u (%u more not logged)\n", now, now - fpc_logged);
++			fpc_logged = now;
++		}
++	}
++}
++
++/* Under fpc_lock. */
++static void
++fpc_irq_enable(bool on)
++{
++	if (on) {
++		if (!fpc_boot_saved) {
++			fpc_boot_intr = fpc_rd(fpc_irqp, TLMM_INTR_CFG);
++			fpc_boot_saved = true;
++		}
++		if (!fpc_thread_on) {
++			thread_t t;
++			if (kernel_thread_start(fpc_log_thread, NULL, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++				fpc_thread_on = true;
++			}
++		}
++		fpc_wr(fpc_irqp, TLMM_INTR_CFG, FPC_INTR_ON & ~1u);
++		fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++		fpc_irq_on = true;
++		fpc_wr(fpc_irqp, TLMM_INTR_CFG, FPC_INTR_ON);
++		printf("SWEET FPC irq on (gpio112 rising, INTR_CFG %#x, boot %#x) level=%u\n",
++		    fpc_rd(fpc_irqp, TLMM_INTR_CFG), fpc_boot_intr, fpc_level());
++	} else if (fpc_boot_saved) {
++		fpc_wr(fpc_irqp, TLMM_INTR_CFG, fpc_boot_intr & ~1u);
++		fpc_wr(fpc_irqp, TLMM_INTR_ST, 0);
++		fpc_irq_on = false;
++		fpc_wr(fpc_irqp, TLMM_INTR_CFG, fpc_boot_intr);
++		printf("SWEET FPC irq off (INTR_CFG %#x) irqs=%u\n", fpc_rd(fpc_irqp, TLMM_INTR_CFG), fpc_irqs);
++	}
++}
++
++static int
++sysctl_sweet_fpc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, fpc_mode, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value & ~6) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&fpc_lock);
++	fpc_map();
++	if (!fpc_rst || !fpc_irqp) {
++		lck_mtx_unlock(&fpc_lock);
++		return ENXIO;
++	}
++	if (value & 2) {
++		fpc_reset();
++	}
++	if ((value & 4) != (fpc_mode & 4)) {
++		fpc_irq_enable(value & 4);
++	}
++	fpc_mode = value;
++	lck_mtx_unlock(&fpc_lock);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fpc, "I", "1190 FPC fingerprint GPIOs: bit 1 reset, bit 2 irq (0 = untouched)");
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fpc_irq, CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)(uintptr_t)&fpc_irqs, 0,
++    "1190 FPC gpio112 interrupts");
++
++static int
++sysctl_sweet_fpc_wait SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int ms = 0;
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, &fpc_wait_last, sizeof(fpc_wait_last));
++	}
++	int error = SYSCTL_IN(req, &ms, sizeof(ms));
++	if (error) {
++		return error;
++	}
++	if (ms < 1 || ms > 60000) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&fpc_lock);
++	fpc_map();
++	lck_mtx_unlock(&fpc_lock);
++	if (!fpc_irqp) {
++		return ENXIO;
++	}
++	uint64_t deadline, now;
++	clock_interval_to_deadline((uint32_t)ms, NSEC_PER_MSEC, &deadline);
++	int result = 0;
++	for (;;) {
++		if (fpc_level()) {
++			result = 1;
++			break;
++		}
++		now = mach_absolute_time();
++		if (now >= deadline) {
++			break;
++		}
++		uint64_t step;
++		clock_interval_to_deadline(5, NSEC_PER_MSEC, &step);
++		(void)assert_wait_deadline(&fpc_wait_chan, THREAD_ABORTSAFE, step < deadline ? step : deadline);
++		if (fpc_level()) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			result = 1;
++			break;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
++			return EINTR;
++		}
++	}
++	fpc_wait_last = result;
++	return SYSCTL_OUT(req, &result, sizeof(result));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc_wait, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fpc_wait, "I", "1190 FPC: write N ms = wait for gpio112 high; reads 1 high / 0 timeout");
++
++static int
++sysctl_sweet_fpc_state SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[200];
++	lck_mtx_lock(&fpc_lock);
++	fpc_map();
++	if (!fpc_rst || !fpc_irqp) {
++		lck_mtx_unlock(&fpc_lock);
++		return ENXIO;
++	}
++	uint32_t rcfg = fpc_rd(fpc_rst, TLMM_CFG), rio = fpc_rd(fpc_rst, TLMM_IO);
++	uint32_t icfg = fpc_rd(fpc_irqp, TLMM_CFG), iio = fpc_rd(fpc_irqp, TLMM_IO);
++	uint32_t intr = fpc_rd(fpc_irqp, TLMM_INTR_CFG);
++	lck_mtx_unlock(&fpc_lock);
++	snprintf(s, sizeof(s), "rst=gpio16 out=%u oe=%u cfg=%#x irq=gpio112 in=%u cfg=%#x intr=%#x irqs=%u mode=%d",
++	    (rio >> 1) & 1u, (rcfg >> 9) & 1u, rcfg, iio & 1u, icfg, intr, fpc_irqs, fpc_mode);
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweet_fpc_state, "A", "1190 FPC: gpio16 out level, gpio112 in level, irq count");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_sects.c b/bsd/dev/sweet_sects.c
+index c0fcacd..b897834 100644
+--- a/bsd/dev/sweet_sects.c
++++ b/bsd/dev/sweet_sects.c
+@@ -224,6 +224,7 @@ st_irq_asserted(void)
+ #define ST_INTR_CFG_ON          ((3u << 5) | (1u << 4))        /* apps, raw status, level low; | 1 enables */
+ extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
+ extern void sweet_spi_mask(uint32_t intid, bool masked);
++extern bool sweet_fpc_tlmm_irq(void);  /* 1190: bsd/dev/sweet_fpc.c */
+ static volatile bool st_irq_on;
+ static volatile uint32_t st_irqs, st_irq_others;
+ static volatile uint64_t st_irq_t;      /* 0945: mach time of the last attention interrupt */
+@@ -237,6 +238,8 @@ st_irq(__unused void *arg)
+ 		st_irq_t = mach_absolute_time();
+ 		st_irqs++;
+ 		thread_wakeup(&st_sleep_chan);
++	} else if (sweet_fpc_tlmm_irq()) {
++		/* 1190: the fingerprint sensor's gpio112 shares the TLMM summary interrupt */
+ 	} else if (++st_irq_others > 1000) {
+ 		sweet_spi_mask(ST_IRQ_INTID, true);     /* another pin holds the summary line */
+ 		st_irq_on = false;
