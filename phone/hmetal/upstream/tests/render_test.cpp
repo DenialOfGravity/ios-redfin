@@ -7212,9 +7212,12 @@ TEST(the_ycbcr_conversion_is_within_one_lsb_of_the_reference) {
 // (redfin hmyc) a known NV12 picture through both paths: a draw samples the RGBA8 copy in the two-plane texture's place,
 // decoded once on the GPU in a buffer of its own sent first (or, without a compiler, on the processor -- the same
 // bytes); a second buffer takes the copy as it is until the surface's generation moves
-TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) {
+static void ycSampledThroughCopy(int sync) {
     CommandBuffer::setYcbcrGpuForTesting(1);
-    struct Back { ~Back() { CommandBuffer::setYcbcrGpuForTesting(-1); } } back;
+    Texture::setYcbcrSyncForTesting(sync);
+    struct Back { ~Back() { CommandBuffer::setYcbcrGpuForTesting(-1); Texture::setYcbcrSyncForTesting(-1); } } back;
+    uint64_t c0[4];
+    Texture::ycbcrCopyStats(c0);
     Rig r;
     const uint32_t k420v = 0x34323076u, W = 36, H = 10, row = 64;
     r.fake->addSurface(41, W, H, row, k420v, 0, 2);
@@ -7306,8 +7309,34 @@ TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) {
     CommandBuffer::ycbcrStats(y3);
     CHECK_EQ((y3[0] + y3[2]) - (y2[0] + y2[2]), 1u);
     CHECK_EQ(y3[7], y0[7]);
+    if (sync != 0) {
+        // (redfin hm-ycsync) twice more: the copies, their buffers done, decoded again in place by turns
+        x->ycbcrTouch(5);
+        auto cb5 = r.queue->commandBuffer();
+        CHECK(cb5->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+        cb5->commit();
+        cb5->waitUntilCompleted();
+        x->ycbcrTouch(2);
+        auto cb4 = r.queue->commandBuffer();
+        CHECK(cb4->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+        cb4->commit();
+        cb4->waitUntilCompleted();
+        uint64_t c1[4];
+        Texture::ycbcrCopyStats(c1);
+        CHECK_EQ(c1[0] - c0[0], 2u);   // two copies made, each into an empty slot (the buffers done and let go: the
+        CHECK_EQ(c1[1] - c0[1], 2u);   // copies they drew from free again, finished buffers still held by the test)
+        CHECK_EQ(c1[2] - c0[2], 2u);   // the third and fourth decodes into those, in place
+        // published once its decode buffer was sent: the next buffer takes it undecoded
+        bool decode = true;
+        uint64_t g = 0;
+        auto again = x->ycbcrCopyFor(*r.gpu, &decode, &g, &why);
+        CHECK(again != nullptr && !decode && g == 2);
+    }
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
+TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy) { ycSampledThroughCopy(0); }
+// (redfin hm-ycsync) HM_YCBCR_SYNC=1: the same, with recycled copies and the decode published after its buffer is sent
+TEST(a_two_plane_surface_is_sampled_through_its_gpu_decoded_copy_ycsync) { ycSampledThroughCopy(3); }
 
 // (redfin hmyc) the GPU fallback: HM_YCBCR_GPU=0 converts on the processor, the same bytes as the reference
 TEST(a_two_plane_surface_falls_back_to_the_processor_decode) {

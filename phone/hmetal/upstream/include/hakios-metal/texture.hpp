@@ -521,6 +521,15 @@ public:
                                  uint32_t height, int matrix, bool full, bool planes, uint8_t* out, uint64_t outRow);
     // HM_YCBCR: 1 native (default), 0 cpu (the plug-in reads it; the core serves wrapSurfaceYcbcr either way)
     static int ycbcrMode();
+    // (redfin hm-ycsync) HM_YCBCR_SYNC (bits; 1 = 3 = both, 0 = as hmyc): 1 three RGBA8 copies by turns, each decoded
+    // again in place once no buffer holds it, instead of a new buffer from the kernel whenever the other of two slots is
+    // still in flight (a fresh copy every such frame); 2 a decode published (ycbcrDone: later draws take the copy undecoded) only once its decode buffer
+    // is on the ring, after submit -- never before, where another thread's buffer could reach the ring first and sample
+    // the copy undecoded. 'p' / 's' for one of them alone.
+    static int ycbcrSync();
+    static void setYcbcrSyncForTesting(int v);   // tests: 0 / 3, -1 the environment's again
+    // [0] copies made (new buffers), [1] of them into an empty slot, [2] decodes into a copy reused in place, [3] 0
+    static void ycbcrCopyStats(uint64_t out[4]);
 
 private:
     // (redfin ws-hm-ubwc) a surface the kernel made compressed, as a compressed texture over it (HM_UBWC_DISPLAY=1)
@@ -574,7 +583,8 @@ private:
     Ycbcr yc_;                                       // (redfin hmyc) wrapSurfaceYcbcr's
     mutable std::mutex ycLock_;
     mutable uint64_t ycGen_ = 0;                     // the surface's contents (ycbcrTouch)
-    mutable std::shared_ptr<Texture> ycCopy_[2];     // the copies decoded into, by turns
+    static constexpr int kYcSlots = 3;               // (redfin hm-ycsync) HM_YCBCR_SYNC bit 1: three; else slots 0 and 1 alone
+    mutable std::shared_ptr<Texture> ycCopy_[kYcSlots];   // the copies decoded into, by turns
     mutable int ycDoneSlot_ = -1;                    // the slot decoded last (sent), and of which generation
     mutable uint64_t ycDoneGen_ = 0;
 public:

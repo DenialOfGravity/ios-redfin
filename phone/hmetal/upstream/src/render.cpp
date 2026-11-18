@@ -5151,6 +5151,12 @@ const CompiledKernel* ycKernel() {
 }  // namespace
 
 void CommandBuffer::ycbcrCountReuse() { gYc[6]++; }
+void CommandBuffer::ycbcrPublish(bool sent) {
+    if (sent) {
+        for (YcLate& l : ycPublish_) l.source->ycbcrDone(l.copy, l.gen);
+    }
+    ycPublish_.clear();
+}
 void CommandBuffer::setYcbcrGpuForTesting(int on) { gYcGpuForce = on; }
 void CommandBuffer::ycbcrStats(uint64_t out[8]) {
     for (int i = 0; i < 8; i++) out[i] = gYc[i].load();
@@ -5272,10 +5278,25 @@ std::shared_ptr<CommandBuffer> CommandBuffer::ycbcrDecodeDeferred() {
                 gYc[7]++;
                 continue;
             }
+        } else if ((Texture::ycbcrSync() & 2) != 0) {
+            // (redfin hm-ycsync) published by submit once the decode buffer is on the ring (ycbcrPublish)
+            ycPublish_.push_back(l);
+            continue;
         }
         l.source->ycbcrDone(l.copy, l.gen);
     }
     ycLate_.clear();
+    {
+        // (redfin hm-ycsync) every 600th decode buffer: how the copies came (new buffers from the kernel or recycled)
+        static std::atomic<uint64_t> told{0};
+        if (pre != nullptr && told.fetch_add(1) % 600 == 0) {
+            uint64_t c[4];
+            Texture::ycbcrCopyStats(c);
+            render::notify("HM_YCBCR: " + std::to_string(gYc[0].load()) + " GPU decodes, " + std::to_string(gYc[6].load()) + " reused; copies " +
+                           std::to_string(c[0]) + " made (" + std::to_string(c[1]) + " into empty slots), " + std::to_string(c[2]) +
+                           " decoded in place (HM_YCBCR_SYNC=" + std::to_string(Texture::ycbcrSync()) + ")");
+        }
+    }
     gYc[5] += (queue_.gpu().transport().nowNs() - t0) / 1000;
     return pre;
 }

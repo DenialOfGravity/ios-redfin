@@ -1,10 +1,15 @@
 #include "hakios-metal/texture.hpp"
 #include "hakios-metal/render.hpp"
 
+#ifndef HM_YCBCR_SYNC_DEFAULT
+#define HM_YCBCR_SYNC_DEFAULT 0   // (redfin hm-ycsync) HM_YCBCR_SYNC unset: as hmyc until the phone check
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
 #include <mutex>
+#include <atomic>
 #include <unordered_map>
 #include <cstring>
 #include <cstdio>
@@ -1913,6 +1918,31 @@ void Texture::ycbcrTouch(uint64_t gen) const {
     ycGen_ = gen;
 }
 
+// (redfin hm-ycsync) [0] copies made, [1] of them into a slot that had none, [2] decodes into a copy reused in place
+namespace {
+std::atomic<uint64_t> gYcCopy[3];
+std::atomic<int> gYcSyncForce{-1};
+}  // namespace
+
+void Texture::setYcbcrSyncForTesting(int v) { gYcSyncForce = v; }
+
+int Texture::ycbcrSync() {
+    if (const int f = gYcSyncForce.load(); f >= 0) return f;
+    static const int v = [] {
+        const char* e = getenv("HM_YCBCR_SYNC");
+        if (e == nullptr || e[0] == 0) return HM_YCBCR_SYNC_DEFAULT;
+        if (e[0] == 's') return 1;
+        if (e[0] == 'p') return 2;
+        return int(strtol(e, nullptr, 0)) == 0 ? 0 : 3;
+    }();
+    return v;
+}
+
+void Texture::ycbcrCopyStats(uint64_t out[4]) {
+    for (int i = 0; i < 3; i++) out[i] = gYcCopy[i].load();
+    out[3] = 0;
+}
+
 std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t* gen, std::string* why) const {
     std::lock_guard<std::mutex> g(ycLock_);
     *gen = ycGen_;
@@ -1923,6 +1953,39 @@ std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t*
     *decode = true;
     // a slot neither decoded last (a buffer may be about to draw it) nor held by a buffer in flight (more than the slot's
     // own reference); else a new copy in the other slot (the old one lives on in the buffers that hold it)
+    if ((ycbcrSync() & 1) != 0) {
+        // (redfin hm-ycsync) kYcSlots copies by turns: the next after the one decoded last that no buffer holds any more
+        // (the slot's own reference alone), decoded again in place; else an empty slot gets a new one; only with every
+        // slot in flight does a new copy replace one (the old lives on in the buffers that hold it) -- what hmyc did each
+        // time the other of its two slots was in flight, a fresh copy from the kernel
+        int pick = -1, empty = -1;
+        for (int k = 1; k <= kYcSlots; k++) {
+            const int i = (ycDoneSlot_ + k + kYcSlots) % kYcSlots;
+            if (i == ycDoneSlot_) continue;
+            if (ycCopy_[i] == nullptr) {
+                if (empty < 0) empty = i;
+            } else if (ycCopy_[i].use_count() == 1) {
+                pick = i;
+                break;
+            }
+        }
+        if (pick >= 0) {
+            gYcCopy[2]++;
+            return ycCopy_[pick];
+        }
+        const int i = empty >= 0 ? empty : (ycDoneSlot_ + 1 + kYcSlots) % kYcSlots;
+        TextureDesc d;
+        d.format = PixelFormat::kRGBA8Unorm;
+        d.width = desc_.width;
+        d.height = desc_.height;
+        d.usage = kTextureUsageRead;
+        std::shared_ptr<Texture> c = make(gpu, d, why);
+        if (c == nullptr) return nullptr;
+        gYcCopy[0]++;
+        if (empty >= 0) gYcCopy[1]++;
+        ycCopy_[i] = c;
+        return c;
+    }
     int slot = ycDoneSlot_ == 0 ? 1 : 0;
     std::shared_ptr<Texture>& copy = ycCopy_[slot];
     if (copy != nullptr && copy.use_count() > 1) copy = nullptr;
@@ -1934,13 +1997,14 @@ std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t*
         d.usage = kTextureUsageRead;
         copy = make(gpu, d, why);
         if (copy == nullptr) return nullptr;
+        gYcCopy[0]++;
     }
     return copy;
 }
 
 void Texture::ycbcrDone(const std::shared_ptr<Texture>& copy, uint64_t gen) const {
     std::lock_guard<std::mutex> g(ycLock_);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < kYcSlots; i++) {
         if (ycCopy_[i] == copy) {
             ycDoneSlot_ = i;
             ycDoneGen_ = gen;

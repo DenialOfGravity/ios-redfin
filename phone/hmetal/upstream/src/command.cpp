@@ -749,6 +749,9 @@ void CommandBuffer::finish(Status s) {
     slab_.reset();
     queue_.giveSlabs(&slabs_);   // (done with: the GPU has finished with this buffer, or never had it)
     keptAny_.clear();
+    // (redfin hm-ycsync) HM_YCBCR_SYNC bit 1: the YCbCr copies its draws took let go too (encoding's table, read no more):
+    // a finished buffer the app still holds would keep a copy looking in flight, and the next decode would get a new one
+    if ((Texture::ycbcrSync() & 1) != 0) ycDecoded_.clear();
     {
         std::lock_guard<std::mutex> g(lock_);
         finished_ = true;
@@ -1082,7 +1085,14 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     // (redfin hmyc) HM_YCBCR=native: the two-plane YCbCr copies, decoded on the GPU in a buffer sent just before
     if (std::shared_ptr<CommandBuffer> pre = cb->ycbcrDecodeDeferred()) {
         pre->preFor_ = cb;
+        CommandBuffer* sent = pre.get();
+        std::shared_ptr<CommandBuffer> hold = pre;
         submit(std::move(pre));
+        // (redfin hm-ycsync) HM_YCBCR_SYNC bit 2: its copies are what later draws may take undecoded only now that the
+        // decode is on the ring (a buffer in error decoded nothing: not published, the next draw decodes again)
+        cb->ycbcrPublish(sent->status() != CommandBuffer::kError);
+    } else {
+        cb->ycbcrPublish(false);
     }
     // (redfin) the GPU's own start and end: the counter into a piece of this buffer's, first and after the idle above
     uint32_t pre[4] = {}, post[4] = {};

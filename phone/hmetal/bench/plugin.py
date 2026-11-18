@@ -4958,6 +4958,150 @@ HM_XRREUSE_EDITS = [
 ]
 
 
+# (ws-hm-camfix) two fixes, applied last to the finished text, each by exact text as the others:
+#  F4 -[HakiosMetalCommandBuffer commit] keeps itself alive across the whole commit. The retain hm_completed releases is
+#     taken before the core is called, so a completion that ran before cb_commit returned (on the queue's thread, or
+#     inline for a buffer whose recording had failed) together with a client that dropped its last reference in a
+#     handler (Espresso::batch_metal, mediaserverd) freed the buffer under the -hakiosDeliverScheduled that follows
+#     (sig 11, isa 0, HakiosMetal+0x1c294). Metal guarantees a buffer outlives its own -commit: one retain/release pair
+#     around the body, every path (plain, held, deferred: the deferred one also writes _hmCommitSecs after the post).
+#  F6 HM_MSAA_FALLBACK (default 1): a multisample texture hakios-metal cannot make (2D multisample Depth32Float_Stencil8:
+#     texture.cpp refuses MSAA with stencil) is made single-sample instead of refused, and reports the sample count and
+#     type it was asked for. A render pass naming one is drawn single-sample throughout: every multisample colour
+#     attachment with a resolve target is drawn straight into that target (load/store as asked, the resolve dropped:
+#     the pixels are already there), as UniXNU/AdrenoMetal's single-sample fallback does. Pipelines of rasterSampleCount
+#     > 1 draw into such a pass as they are (the core takes the pass's count for the MSAA registers). 0: refused, as
+#     before. 2: every multisample texture single-sample (A/B and the fallback for an MSAA bug).
+HM_CAMFIX_EDITS = [
+    # --- F4 ---
+    ('- (void)commit\n{\n\tBOOL met = YES;\n',
+     '- (void)commit\n{\n'
+     '\t/* (ws-hm-camfix) alive until -commit returns, whatever its completion and the handlers it runs release (Metal\'s\n'
+     '\t * guarantee; mediaserverd\'s Espresso crashed in -hakiosDeliverScheduled on a buffer freed during the commit) */\n'
+     '\t[self retain];\n\t[self hmCommitBody];\n\t[self release];\n}\n\n'
+     '- (void)hmCommitBody\n{\n\tBOOL met = YES;\n'),
+    # --- F6: the texture's asked-for count ---
+    ('\tMTLTextureUsage _usage;             /* what hakios-metal was given: ShaderRead, ShaderWrite, or both */\n',
+     '\tMTLTextureUsage _usage;             /* what hakios-metal was given: ShaderRead, ShaderWrite, or both */\n'
+     '\tNSUInteger _hmMsWanted;             /* (ws-hm-camfix) HM_MSAA_FALLBACK: the samples asked for, made as one (0: as made) */\n'),
+    ('@interface HakiosMetalTexture (HMBlitWB)\n',
+     '/* (ws-hm-camfix) HM_MSAA_FALLBACK: unset or 1 = a multisample texture the core refuses is made single-sample; 2 = every\n'
+     ' * multisample texture is; 0 = refused as before */\n'
+     'static int\nhm_msaa_fallback(void)\n{\n\tstatic int v = -1;\n\n\tif (v < 0) {\n\t\tconst char *e = getenv("HM_MSAA_FALLBACK");\n\n'
+     '\t\tv = e == NULL || e[0] == \'\\0\' ? 1 : e[0] == \'0\' ? 0 : e[0] == \'2\' ? 2 : 1;\n\t}\n\treturn v;\n}\n\n'
+     '@interface HakiosMetalTexture (HMMsaa)\n- (NSUInteger)hmMsWanted;\n- (void)hmSetMsWanted:(NSUInteger)samples;\n@end\n\n'
+     '@interface HakiosMetalTexture (HMBlitWB)\n'),
+    ('- (MTLTextureType)textureType       { return (MTLTextureType)hakios_metal_texture_type(_texture); }\n',
+     '- (MTLTextureType)textureType       { return _hmMsWanted > 1 ? MTLTextureType2DMultisample : (MTLTextureType)hakios_metal_texture_type(_texture); }\n'),
+    ('- (NSUInteger)sampleCount           { return hakios_metal_texture_samples(_texture); }\n',
+     '- (NSUInteger)sampleCount           { return _hmMsWanted > 1 ? _hmMsWanted : hakios_metal_texture_samples(_texture); }\n'
+     '- (NSUInteger)hmMsWanted            { return _hmMsWanted; }   /* (ws-hm-camfix) */\n'
+     '- (void)hmSetMsWanted:(NSUInteger)samples { _hmMsWanted = samples; }\n'),
+    # --- F6: making it ---
+    ('- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor\n{\n\thakios_metal_texture *texture;\n',
+     '- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor\n{\n\thakios_metal_texture *texture;\n'
+     '\tNSUInteger hmMsDown = 0;   /* (ws-hm-camfix) HM_MSAA_FALLBACK: made single-sample, this many asked for */\n'),
+    ('\t\ttexture = hakios_metal_texture_new_multisample(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],\n'
+     '\t\t\t\t\t\t\t       (unsigned)[descriptor height], (unsigned)[descriptor sampleCount],\n'
+     '\t\t\t\t\t\t\t       (unsigned)(usage & ~(MTLTextureUsage)MTLTextureUsageShaderWrite));\n',
+     '\t\ttexture = hm_msaa_fallback() >= 2 ? NULL :\n'
+     '\t\t\t  hakios_metal_texture_new_multisample(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],\n'
+     '\t\t\t\t\t\t       (unsigned)[descriptor height], (unsigned)[descriptor sampleCount],\n'
+     '\t\t\t\t\t\t       (unsigned)(usage & ~(MTLTextureUsage)MTLTextureUsageShaderWrite));\n'
+     '\t\tif (texture == NULL && hm_msaa_fallback() >= 1) {   /* (ws-hm-camfix) HM_MSAA_FALLBACK: one sample instead */\n'
+     '\t\t\tstatic int told;\n'
+     '\t\t\tchar was[200];\n'
+     '\t\t\tconst MTLTextureUsage u = usage & ~(MTLTextureUsage)MTLTextureUsageShaderWrite;\n\n'
+     '\t\t\tsnprintf(was, sizeof(was), "%s", hm_msaa_fallback() >= 2 ? "HM_MSAA_FALLBACK=2" : hakios_metal_error());\n'
+     '\t\t\ttexture = hakios_metal_texture_new_levels(_gpu, (unsigned)MTLTextureType2D, (unsigned)[descriptor pixelFormat],\n'
+     '\t\t\t\t\t\t\t  (unsigned)[descriptor width], (unsigned)[descriptor height], 1, (unsigned)u);\n'
+     '\t\t\tif (texture == NULL && u != MTLTextureUsageRenderTarget) {\n'
+     '\t\t\t\ttexture = hakios_metal_texture_new_levels(_gpu, (unsigned)MTLTextureType2D, (unsigned)[descriptor pixelFormat],\n'
+     '\t\t\t\t\t\t\t\t  (unsigned)[descriptor width], (unsigned)[descriptor height], 1,\n'
+     '\t\t\t\t\t\t\t\t  (unsigned)MTLTextureUsageRenderTarget);\n'
+     '\t\t\t}\n'
+     '\t\t\tif (texture != NULL) {\n'
+     '\t\t\t\thmMsDown = [descriptor sampleCount];\n'
+     '\t\t\t\tif (told++ < 8) {\n'
+     '\t\t\t\t\thm_print("msaa fallback: a %lu-sample texture %lux%lu, pixel format %lu, usage %#lx made with one sample "\n'
+     '\t\t\t\t\t\t "(HM_MSAA_FALLBACK=%d; multisample: %s)\\n", (unsigned long)hmMsDown, (unsigned long)[descriptor width],\n'
+     '\t\t\t\t\t\t (unsigned long)[descriptor height], (unsigned long)[descriptor pixelFormat], (unsigned long)usage,\n'
+     '\t\t\t\t\t\t hm_msaa_fallback(), was);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t}\n'
+     '\t\t}\n'),
+    ('\treturn [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];\n}\n',
+     '\t{\n\t\tHakiosMetalTexture *made = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];\n\n'
+     '\t\tif (made != nil && hmMsDown > 1) [made hmSetMsWanted:hmMsDown];   /* (ws-hm-camfix) */\n'
+     '\t\treturn made;\n\t}\n}\n'),
+    # --- F6: passes ---
+    ('static BOOL\nhm_read_render_pass(',
+     '/* (ws-hm-camfix) HM_MSAA_FALLBACK: a pass naming a texture made single-sample in place of a multisample one is drawn with\n'
+     ' * one sample throughout. Each multisample colour attachment that resolves is drawn straight into its resolve target (its\n'
+     ' * level, slice, depth plane; the load and clear as asked; stored, the resolve dropped). SUBST: those attachments, a bit\n'
+     ' * each (the encoder keeps them: -setColorStoreAction: of a resolve there is a Store). Returns D itself when nothing changes. */\n'
+     'static const char hm_ms_subst_key = 0;\n\n'
+     'static MTLRenderPassDescriptor *\nhm_msaa_pass(MTLRenderPassDescriptor *d, unsigned *subst)\n{\n'
+     '\tMTLRenderPassDescriptor *n = nil;\n\tBOOL down = NO;\n\tid dt, st;\n\n'
+     '\t*subst = 0;\n'
+     '\tif (hm_msaa_fallback() == 0 || d == nil || ![d isKindOfClass:[MTLRenderPassDescriptor class]]) {\n\t\treturn d;\n\t}\n'
+     '\tdt = [[d depthAttachment] texture];\n\tst = [[d stencilAttachment] texture];\n'
+     '\tdown = ([dt isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)dt hmMsWanted] > 1) ||\n'
+     '\t       ([st isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)st hmMsWanted] > 1);\n'
+     '\tfor (NSUInteger i = 0; i < 8 && !down; i++) {\n'
+     '\t\tid t = [[[d colorAttachments] objectAtIndexedSubscript:i] texture];\n\n'
+     '\t\tdown = [t isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)t hmMsWanted] > 1;\n\t}\n'
+     '\tif (!down) {\n\t\treturn d;\n\t}\n'
+     '\tfor (NSUInteger i = 0; i < 8; i++) {\n'
+     '\t\tMTLRenderPassColorAttachmentDescriptor *c = [[d colorAttachments] objectAtIndexedSubscript:i], *nc;\n'
+     '\t\tid t = [c texture], r = [c resolveTexture];\n'
+     '\t\tconst MTLStoreAction a = [c storeAction];\n\n'
+     '\t\tif (t == nil || ![t isKindOfClass:[HakiosMetalTexture class]] ||\n'
+     '\t\t    ([(HakiosMetalTexture *)t hmMsWanted] < 2 && hakios_metal_texture_samples([(HakiosMetalTexture *)t hakiosTexture]) < 2)) {\n'
+     '\t\t\tcontinue;\n\t\t}\n'
+     '\t\tif (r == nil || ![r isKindOfClass:[HakiosMetalTexture class]] || hakios_metal_texture_samples([(HakiosMetalTexture *)r hakiosTexture]) != 1 ||\n'
+     '\t\t    !(a == MTLStoreActionMultisampleResolve || a == MTLStoreActionStoreAndMultisampleResolve || a == MTLStoreActionUnknown)) {\n'
+     '\t\t\tif (hakios_metal_texture_samples([(HakiosMetalTexture *)t hakiosTexture]) > 1) {\n'
+     '\t\t\t\tHM_ONCE("msaa fallback: colour attachment %lu stays multisample (no resolve target to draw into) beside a "\n'
+     '\t\t\t\t\t"single-sample one; the pass is refused for its sample counts\\n", (unsigned long)i);\n'
+     '\t\t\t}\n\t\t\tcontinue;\n\t\t}\n'
+     '\t\tif (n == nil) {\n\t\t\tn = [[d copy] autorelease];\n\t\t}\n'
+     '\t\tnc = [[n colorAttachments] objectAtIndexedSubscript:i];\n'
+     '\t\t[nc setTexture:r];\n\t\t[nc setLevel:[c resolveLevel]];\n\t\t[nc setSlice:[c resolveSlice]];\n'
+     '\t\t[nc setDepthPlane:[c resolveDepthPlane]];\n\t\t[nc setResolveTexture:nil];\n'
+     '\t\t[nc setStoreAction:a == MTLStoreActionUnknown ? MTLStoreActionUnknown : MTLStoreActionStore];\n'
+     '\t\t*subst |= 1u << i;\n\t}\n'
+     '\t{\n\t\tstatic int told;\n\n'
+     '\t\tif (told++ < 4) {\n'
+     '\t\t\thm_print("msaa fallback: a pass with a single-sample stand-in drawn with one sample; colour attachments drawn into "\n'
+     '\t\t\t\t "their resolve targets: %#x\\n", *subst);\n\t\t}\n\t}\n'
+     '\treturn n != nil ? n : d;\n}\n\n'
+     'static BOOL\nhm_ms_substituted(id encoder, NSUInteger index)\n{\n'
+     '\tNSNumber *m = objc_getAssociatedObject(encoder, &hm_ms_subst_key);\n\n'
+     '\treturn m != nil && index < 8 && (([m unsignedIntValue] >> index) & 1) != 0;\n}\n\n'
+     'static BOOL\nhm_read_render_pass('),
+    ('\tif (!hm_read_render_pass(descriptor, &pass, &texture, why, sizeof(why))) {\n\t\thm_print("refused: a render pass: %s;',
+     '\tunsigned hmMsSubst = 0;\n\n'
+     '\tdescriptor = hm_msaa_pass(descriptor, &hmMsSubst);   /* (ws-hm-camfix) HM_MSAA_FALLBACK */\n'
+     '\tif (!hm_read_render_pass(descriptor, &pass, &texture, why, sizeof(why))) {\n\t\thm_print("refused: a render pass: %s;'),
+    ('\t\t[encoder hakiosTakeResolves:descriptor];   /* hm_read_render_pass judged them */\n',
+     '\t\t[encoder hakiosTakeResolves:descriptor];   /* hm_read_render_pass judged them */\n'
+     '\t\tif (hmMsSubst != 0) {   /* (ws-hm-camfix) */\n'
+     '\t\t\tobjc_setAssociatedObject(encoder, &hm_ms_subst_key, [NSNumber numberWithUnsignedInt:hmMsSubst], OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n'
+     '\t\t}\n'),
+    ('\tif (!hm_read_render_pass(descriptor, &pass, &texture, why, sizeof(why))) {\n\t\thm_print("refused: a parallel render pass: %s;',
+     '\tunsigned hmMsSubst = 0;\n\n'
+     '\tdescriptor = hm_msaa_pass(descriptor, &hmMsSubst);   /* (ws-hm-camfix) HM_MSAA_FALLBACK (resolves set in-pass: refused, as before) */\n'
+     '\tif (!hm_read_render_pass(descriptor, &pass, &texture, why, sizeof(why))) {\n\t\thm_print("refused: a parallel render pass: %s;'),
+    ('\t    (resolves && _resolveTo[index] == nil)) {\n',
+     '\t    (resolves && _resolveTo[index] == nil && !hm_ms_substituted(self, index))) {   /* (ws-hm-camfix) */\n'),
+    ('\t_resolving[index] = resolves;\n',
+     '\tif (resolves && hm_ms_substituted(self, index)) {   /* (ws-hm-camfix) drawn into the resolve target already: a Store */\n'
+     '\t\taction = MTLStoreActionStore;\n\t\tresolves = NO;\n\t}\n'
+     '\t_resolving[index] = resolves;\n'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
@@ -4965,6 +5109,7 @@ def main():
     src = apply(src, HM_NOUC_EDITS)   # (ws-hm-int12) HM_NOUC
     src = hm_perf(src)   # (ws-hm-perf) HM_PERF
     src = apply(src, HM_XRREUSE_EDITS)   # (redfin xrreuse) HM_XR_REUSE
+    src = apply(src, HM_CAMFIX_EDITS)   # (ws-hm-camfix) F4 commit lifetime, F6 HM_MSAA_FALLBACK
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))
