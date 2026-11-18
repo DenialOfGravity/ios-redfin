@@ -211,11 +211,16 @@ static uint32_t nOpEnd;
  *   bit 1 (0x2) 1211 sweetfpcd events of an op that has ended (Cancel / pre-empted / wrong kind) are dropped
  *   bit 2 (0x4) 1212 8 AlignmentData answers a valid node placement (one node per accepted enrol touch)
  *   bit 3 (0x8) 1213 0x41 EnrollmentComplete after a successful enrol result (1204; off: the result ends the op)
+ *   bit 4 (0x10) 1215 (default off) a sweetfpcd no-match whose status is a negative TA error (tid19: the first
+ *               identify of every match op answers -6 a few ms after the capture, the second one matches) is dropped:
+ *               no "identity match failed" (passcode pad shake / lock jiggle), no Touch ID failure counted.
  */
 #define MESA_FIX_IMPLICIT_END   0x1u
 #define MESA_FIX_STALE_DROP     0x2u
 #define MESA_FIX_ALIGNMENT      0x4u
 #define MESA_FIX_ENROLL_0X41    0x8u
+#define MESA_FIX_TA_ERR_DROP    0x10u
+static uint32_t nTaErrDropped;          /* 1215 */
 static volatile uint32_t gAlignN;       /* 1212: accepted enrol touches since the last 3 EnrollMode (AlignmentData nodes) */
 static int gFix = 0x7;                  /* kern.sweet_mesa_fix */
 static uint32_t nImplicitEnd, nStaleDropped, nAlignAnswered;    /* kern.sweet_mesa_fix_stats */
@@ -1101,6 +1106,13 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 	case FEV_NOMATCH:
 	case FEV_MATCH_WITHHELD:
 	case FEV_MATCH: {
+		if (code == FEV_NOMATCH && st < 0 && (gFix & MESA_FIX_TA_ERR_DROP)) {
+			/* 1215: an identify error is not a failed attempt; the op goes on and the next capture is matched */
+			OSIncrementAtomic(&nTaErrDropped);
+			SAY("no-match with TA status %d dropped: identify error, not a failed attempt (kern.sweet_mesa_fix "
+			    "bit 4; %u so far)\n", st, nTaErrDropped);
+			return kIOReturnSuccess;
+		}
 		bool verified = (fl & FEV_MF_HAT_VERIFIED) != 0;
 		bool identity = code == FEV_MATCH && fid != 0 && ((gMatch == 1 && verified) || gMatch == 2);
 		uint32_t mflags = 0;
@@ -2494,25 +2506,28 @@ sysctl_sweet_mesa_fix(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
 	if (e || !changed) {
 		return e;
 	}
-	if (v < 0 || v > 0xf) {
+	if (v < 0 || v > 0x1f) {
 		return EINVAL;
 	}
 	gFix = v;
-	SAY("kern.sweet_mesa_fix=0x%x: implicit op end %s, stale-event drop %s, AlignmentData %s, 0x41 after enrol %s\n", v,
-	    (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (v & 8) ? "on" : "off");
+	SAY("kern.sweet_mesa_fix=0x%x: implicit op end %s, stale-event drop %s, AlignmentData %s, 0x41 after enrol %s, "
+	    "TA-error no-match drop %s\n", v, (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off",
+	    (v & 8) ? "on" : "off", (v & 0x10) ? "on" : "off");
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_fix, "I", "redfin 1210-1213: bit 0 implicit op end on 3/4/38, bit 1 drop stale sweetfpcd "
-    "events, bit 2 AlignmentData node placement, bit 3 0x41 after the enrol result (default 0x7)");
+    "events, bit 2 AlignmentData node placement, bit 3 0x41 after the enrol result, bit 4 (1215) drop no-matches with a "
+    "TA error status (default 0x7)");
 
 static int
 sysctl_sweet_mesa_fix_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
 {
-	char b[160];
+	char b[192];
 	snprintf(b, sizeof(b), "fix=0x%x op_kind=%u op_ends=%u implicit_ends=%u end_queue=%d stale_dropped=%u "
-	    "align_answered=%u", gFix, gOpKind, nOpEnd, nImplicitEnd, gEndCount, nStaleDropped, nAlignAnswered);
+	    "align_answered=%u ta_err_dropped=%u", gFix, gOpKind, nOpEnd, nImplicitEnd, gEndCount, nStaleDropped,
+	    nAlignAnswered, nTaErrDropped);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fix_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
