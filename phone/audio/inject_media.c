@@ -1240,6 +1240,61 @@ flashlight_classes(void)
 	stream_class = make_class("RedwoodFlashlightStream", stream, sizeof(stream) / sizeof(stream[0]));
 }
 
+/* ---- (redfin ws-cam-noml) the capture graph's inference and Live Photo extras, off by a flag ------- */
+
+/*
+ * With Metal in mediaserverd (hm-int2: every process on hakios-metal) the photo preview's graph gets what an
+ * iPhone X gets: Espresso networks run on the GPU (BWEspressoInferenceProvider 101/102/103 -- MPSCNN
+ * cnnConvArray_*, TARR_* -- the smart camera's scene classification and its kin, ~27 ms a convolution and ~211 ms a
+ * command buffer on the Adreno 620), Live Photo's stabilization (kernelCornerDetect*, kernelNccMatch,
+ * kernel*Solver, kernelWarpImage) and SDOF (SDOFRenderingV3). Without Metal (before hm-int2) none of it was built.
+ * /private/var/local/camera-noml starting with '1' answers NO to the switches the graph builder reads for them, so
+ * the nodes are not made; a photograph and the Live Photo movie still are. Read at each call (the graph is built
+ * when the session starts), so a new camera session follows the file with no restart. No file, or anything else in
+ * it: the stack's own answers, as before.
+ */
+static bool
+noml_on(void)
+{
+	char c = 0;
+	int fd = open("/private/var/local/camera-noml", O_RDONLY);
+
+	if (fd < 0) {
+		return false;
+	}
+	if (read(fd, &c, 1) != 1) {
+		c = 0;
+	}
+	close(fd);
+	return c == '1';
+}
+
+#define NOML_SWITCH(fn, what)                                                                                     \
+	static IMP original_##fn;                                                                                 \
+	static BOOL                                                                                               \
+	fn(id self, SEL selector)                                                                                 \
+	{                                                                                                         \
+		BOOL asked = original_##fn != NULL ? ((BOOL (*)(id, SEL))original_##fn)(self, selector) : NO;    \
+		static bool said;                                                                                 \
+                                                                                                                  \
+		if (!asked || !noml_on()) {                                                                       \
+			return asked;                                                                             \
+		}                                                                                                 \
+		if (!said) {                                                                                      \
+			said = true;                                                                              \
+			say("redwood: mediaserverd: camera-noml: %s asked for, answered NO\n", what);             \
+		}                                                                                                 \
+		return NO;                                                                                        \
+	}
+
+NOML_SWITCH(noml_smart_camera, "the smart camera (scene classification)")
+NOML_SWITCH(noml_face_tracking_plus, "face tracking plus")
+NOML_SWITCH(noml_iris_sdof, "Live Photo SDOF")
+NOML_SWITCH(noml_iris_vis, "Live Photo stabilization")
+NOML_SWITCH(noml_preview_depth, "preview depth")
+NOML_SWITCH(noml_source_depth, "the source's depth")
+NOML_SWITCH(noml_matte, "a Live Photo's portrait effects matte")
+
 /*
  * The class methods replaced, each as soon as its class exists. `expected` is the unslid address
  * of the code in iOS 16.5 (20F66): a method that is not what it was is left alone. `original`, where
@@ -1275,6 +1330,16 @@ static struct replacement {
 	{ "BWAudioSourceNode", "stop:", 0, (IMP)audio_source_stop, &original_audio_source_stop, true, false, true },
 	{ "FigCaptureMovieFileRecordingSettings", "videoSettings", 0, (IMP)recording_video_settings, &original_video_settings, true, false,
 	  true },
+	/* (redfin ws-cam-noml) /private/var/local/camera-noml = 1: the graph's inference and Live Photo extras off */
+	{ "FigCaptureSourceConfiguration", "smartCameraEnabled", 0, (IMP)noml_smart_camera, &original_noml_smart_camera, true, false },
+	{ "FigMetadataObjectCaptureConnectionConfiguration", "faceTrackingPlusEnabled", 0, (IMP)noml_face_tracking_plus,
+	  &original_noml_face_tracking_plus, true, false },
+	{ "FigVideoCaptureConnectionConfiguration", "irisSDOFEnabled", 0, (IMP)noml_iris_sdof, &original_noml_iris_sdof, true, false },
+	{ "FigVideoCaptureConnectionConfiguration", "irisVISEnabled", 0, (IMP)noml_iris_vis, &original_noml_iris_vis, true, false },
+	{ "FigVideoCaptureConnectionConfiguration", "previewDepthDataDeliveryEnabled", 0, (IMP)noml_preview_depth,
+	  &original_noml_preview_depth, true, false },
+	{ "FigCaptureSourceConfiguration", "depthDataDeliveryEnabled", 0, (IMP)noml_source_depth, &original_noml_source_depth, true, false },
+	{ "FigCaptureIrisSinkConfiguration", "portraitEffectsMatteDeliveryEnabled", 0, (IMP)noml_matte, &original_noml_matte, true, false },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
