@@ -7,13 +7,14 @@ for sweetfpcd. kern.sweet_mesa default 0: nothing published. Matches only via br
 into Apple statuses / enrol progress / enrol result / match records (sweetmesa_bridge.h part 3); an identity match only
 with kern.sweet_mesa_match=1 AND the event's HAT-verified flag.
 1192e: AppleBiometricServicesUserClient::message() accepts 0xe3ff8000, so deliveries no longer report 0xe00002c7.
+1192f: 60 GetCatacombState answers the identities' user with state bit 0 (biometrickitd kept removing new identities).
 
 diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
 new file mode 100644
-index 0000000..e4e83e0
+index 0000000..c45288e
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMesa.cpp
-@@ -0,0 +1,1535 @@
+@@ -0,0 +1,1550 @@
 +/*
 + * redfin 1192: SweetMesa, a Touch ID (Mesa) persona for Apple's unmodified biometrickitd + libBKDM1, whose real
 + * sensor work is done by a userland daemon (sweetfpcd) through a bridge user client.
@@ -60,6 +61,7 @@ index 0000000..e4e83e0
 + * A match record WITH an identity (0xe3ff8002) is built only when kern.sweet_mesa_match = 1 AND the FPCD match
 + * event carries FPCD_MF_HAT_VERIFIED; raw (non-FPCD) match-shaped EVENTs are always dropped now. Every delivered
 + * message is logged ("message 0x... v.. ord.. len.. inline|queued").
++ * 1192f: 60 GetCatacombState answers {gUser, state 1} (an empty answer made biometrickitd drop every new identity).
 + * 1192e: AppleBiometricServicesUserClient::message accepts 0xe3ff8000 (the aggregate messageClients result was
 + * kIOReturnUnsupported from the user client itself, not from the interest notification).
 + */
@@ -839,7 +841,21 @@ index 0000000..e4e83e0
 +	case 40: ANSWER(23); return kIOReturnSuccess;          /* GetBiometrickitdInfo */
 +	case 46: ANSWER(32); return kIOReturnSuccess;          /* GetProtectedConfig: nothing enabled */
 +	case 58: ANSWER(33); return kIOReturnSuccess;          /* GetCatacombHash */
-+	case 60: ANSWER(0); return kIOReturnSuccess;           /* GetCatacombState: no entries (8 n bytes) */
++	case 60: {      /* GetCatacombState: n x catacomb_state_v1_t {u32 userID, u32 state} (8 n bytes) */
++		/*
++		 * 1192f: BiometricSupport readCatacombState removes every identity whose user's state has bit 0 clear
++		 * (CatacombStateCache stateOfUserComponent:), so "no entries" deleted each fresh enrolment right after
++		 * its enrol result. Answer the identities' user with bit 0 set (templates live in the FPC TA).
++		 */
++		uint32_t n = gUser != 0 && cap >= 8 ? 1 : 0;
++		ANSWER(8 * n);
++		if (n) {
++			put32(out, gUser);
++			put32(out + 4, 1);
++		}
++		*how = n ? "canned (user state 1)" : "canned (no user yet)";
++		return kIOReturnSuccess;
++	}
 +	case 67: ANSWER(28); return kIOReturnSuccess;          /* GetSystemProtectedConfig */
 +	case 78: ANSWER(29); *how = "canned (no match event)"; return kIOReturnSuccess;  /* GetLastMatchEvent */
 +	case 20: case 24: case 30: case 32: case 36: case 44: case 57: case 73: case 75: case 87:
