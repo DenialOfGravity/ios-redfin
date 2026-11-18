@@ -69,6 +69,10 @@ static int fpc_send64(uint32_t appid, uint8_t *data, size_t len, const char *wha
 		say("%s: QSEECom-level resp[0] %#x (HAL requires 0)", what, rd_u32(s + 0x40));
 	rc = 0;
 out:
+	if (!dryrun && bulk.pa) {	/* no key blob / HAT left in freed PMEM */
+		static const uint8_t zero[4096];
+		wr_chunks(bulk.pa, zero, sizeof(zero));
+	}
 	pbuf_put(&arg), pbuf_put(&bulk), pbuf_put(&sb);
 	return rc;
 }

@@ -35,7 +35,10 @@
  *   qseeprobe rpmb-refuse-test  kern.sweet_rpmb=1 must refuse an authenticated write (EPERM, nothing sent)
  *   qseeprobe km-authkey        keymaster64 GET_AUTH_TOKEN_KEY 0x205 with the listeners up (status + length only)
  *   qseeprobe gk-verify-dummy   gatekeeper VERIFY 0x1002, uid 0x7e000001 only, dummy handle, kern.sweet_rpmb must be 1
- *   Never: enroll, delete_user, delete_all_users (0x1001/0x1003/0x1004/0x21004), RPMB writes, persist writes.
+ * Phase 3 (writes, owner's go): km-setversion (SET_VERSION 0x207 {4,5,4,5}, writes still refused),
+ *   gk-enroll / gk-verify [CHALLENGE] (uid 0x7e000001, password on stdin, kern.sweet_rpmb=2, RPMB writes relayed only
+ *   inside GK blocks 1642..1689), fpc-hwauth APPID (0x205 key -> FPC 3,5; 3,2 challenge; verify; 3,3 authorize_enrol).
+ *   Never: delete_user, delete_all_users (0x1003/0x1004/0x21004), other uids, key programming, persist writes.
  *   Every non-dry-run command holds /var/local/tz/qsee.lock (the only SMC user at a time).
  * Every SMC passes qsmc(): x0 and x1 must match an entry of qsee_whitelist[] (qsee_wl.c) or the tool exits before
  * the ioctl. No services-image load, RPMB provisioning, keystore or bridge-enable calls exist in this tool.
@@ -253,7 +256,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: qseeprobe version | lookup [NAME...] | load NAME DIR | send-build-info APPID |\n"
 				"       unload APPID | sensor-init APPID | sensor-cmd APPID CMD | finger-detect APPID [MS] |\n"
 				"       fp-ids APPID | fp-delete APPID FID | enrol-test APPID [MS] | whitelist |\n"
-				"       km-version | lsnr-test | rpmb-counter | rpmb-refuse-test | km-authkey | gk-verify-dummy\n"
+				"       km-version | lsnr-test | rpmb-counter | rpmb-refuse-test | km-authkey | gk-verify-dummy |\n"
+				"       km-setversion | gk-enroll | gk-verify [CHALLENGE] | fpc-hwauth APPID  (passwords on stdin)\n"
 				"  env QSEE_DRYRUN=1 (print SMCs only), QSEE_SHMBRIDGE=1 (bridge every buffer),\n"
 				"      QSEE_APP=NAME (send/unload guard), QSEE_SEND=wl|legacy\n");
 		return 1;
@@ -302,6 +306,14 @@ int main(int argc, char **argv)
 		return cmd_km_authkey();
 	if (!strcmp(argv[1], "gk-verify-dummy") && argc == 2)
 		return cmd_gk_verify_dummy();
+	if (!strcmp(argv[1], "km-setversion") && argc == 2)
+		return cmd_km_setversion();
+	if (!strcmp(argv[1], "gk-enroll") && argc == 2)
+		return cmd_gk_enroll();
+	if (!strcmp(argv[1], "gk-verify") && (argc == 2 || argc == 3))
+		return cmd_gk_verify(argc == 3 ? strtoull(argv[2], NULL, 0) : 0);
+	if (!strcmp(argv[1], "fpc-hwauth") && argc == 3)
+		return cmd_fpc_hwauth((uint32_t)strtoul(argv[2], NULL, 0));
 	if (!strcmp(argv[1], "unload") && argc == 3)
 		return cmd_unload((uint32_t)strtoul(argv[2], NULL, 0));
 	fprintf(stderr, "qseeprobe: unknown command or arguments: %s\n", argv[1]);
