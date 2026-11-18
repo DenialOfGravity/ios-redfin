@@ -40,6 +40,9 @@ roots = [
   "/System/Library/xpc",
   "/Applications/SweetControl.app",
   "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches",
+  # 2026-11-18 Touch ID test: relinked iPhone 8 libBKDM1 + mesa biometrickitd plist (single files)
+  "/usr/lib/libBKDM1.dylib",
+  "/System/Library/LaunchDaemons/com.apple.biometrickitd.mesa.plist",
 ]
 ignore = [
   "/var/local/scratch/*",
