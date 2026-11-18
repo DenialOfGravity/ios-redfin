@@ -1,13 +1,14 @@
 redfin 1192: SweetMesa, the Touch ID (Mesa) persona for biometrickitd + libBKDM1, with the SweetMesaBridge user client
 for sweetfpcd. kern.sweet_mesa default 0: nothing published. Matches only via bridge EVENT and kern.sweet_mesa_match=1
 (default 0). Interface: phone/fpc/sweetmesa_bridge.h. Design: logs/research/fingerprint-p3-ios-2026-11-18.md.
+1192b: forwards wait at most kern.sweet_mesa_fwd_ms (300) then give the offline answer; 12/38/69 are posted (no wait).
 
 diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
 new file mode 100644
-index 0000000..912c742
+index 0000000..50137c1
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMesa.cpp
-@@ -0,0 +1,1176 @@
+@@ -0,0 +1,1281 @@
 +/*
 + * redfin 1192: SweetMesa, a Touch ID (Mesa) persona for Apple's unmodified biometrickitd + libBKDM1, whose real
 + * sensor work is done by a userland daemon (sweetfpcd) through a bridge user client.
@@ -36,7 +37,11 @@ index 0000000..912c742
 + *                          bit 1 also deliver sweetfpcd's own "FPCD"-format events raw (dev),
 + *                          bit 2 hex-dump the first 32 payload bytes of every command
 + *   kern.sweet_mesa_match  1 = let match-shaped bridge EVENTs through (default 0: dropped + logged)
-+ *   kern.sweet_mesa_fwd_ms how long a forwarded command waits for sweetfpcd (default 2000, 50..30000)
++ *   kern.sweet_mesa_fwd_ms how long a forwarded command waits for sweetfpcd (default 300, 50..30000); no reply
++ *                          in time = the "offline" answer (1192b)
++ * 1192b: 12 Cancel, 38 FingerDetectMode and 69 EnableBackgroundFdet are posted: success at once, queued for the
++ * next WAIT, the REPLY is only logged. No lock is held while a caller waits (IOLockSleepDeadline drops gM), and
++ * every forward is logged before it is queued ("cmd N -> bridge seq S").
 + *   kern.sweet_mesa_state  read-only summary
 + * Every command is logged: "SWEET MESA: <proc> cmd N Name v.. val.. in.. cap.. -> ret out.. [how]".
 + */
@@ -113,7 +118,7 @@ index 0000000..912c742
 +/* ---- state ---- */
 +static int gMesa;                       /* kern.sweet_mesa */
 +static int gMatch;                      /* kern.sweet_mesa_match */
-+static int gFwdMs = 2000;               /* kern.sweet_mesa_fwd_ms */
++static int gFwdMs = 300;                /* kern.sweet_mesa_fwd_ms (1192b: was 2000) */
 +static IOLock *gM;                      /* slot, queue, client counts */
 +static IOLock *gPub;                    /* publish / withdraw */
 +
@@ -128,6 +133,20 @@ index 0000000..912c742
 +} slot;
 +static uint32_t gSeq;
 +static char gEvQueued, gEvDone, gEvFree;  /* sleep events */
++
++/*
++ * 1192b: "posted" commands (12 Cancel, 38 FingerDetectMode, 69 EnableBackgroundFdet) never wait for sweetfpcd:
++ * biometrickitd gets success at once (it sends 69/38 from the display-off / lock path), the request is queued
++ * here for the next WAIT, and sweetfpcd's REPLY to it is only logged. Depth 8, the oldest is dropped when full.
++ */
++#define MESA_POSTQ              8
++static struct {
++	uint32_t seq, cmd, len;
++	uint8_t data[8];
++} gP[MESA_POSTQ];
++static int gPHead, gPCount;
++static uint32_t gPostedSeq[16];
++static int gPostedIdx;
 +
 +static struct {
 +	uint64_t ticket;
@@ -438,6 +457,7 @@ index 0000000..912c742
 +		if (IOLockSleepDeadline(gM, &gEvFree, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED && slot.state != SLOT_FREE) {
 +			IOLockUnlock(gM);
 +			OSIncrementAtomic(&nTimeouts);
++			*offline = true;
 +			return kIOReturnTimeout;
 +		}
 +	}
@@ -451,6 +471,7 @@ index 0000000..912c742
 +		bcopy(p, slot.req, plen);
 +	}
 +	slot.state = SLOT_QUEUED;
++	SAY("cmd %u %s -> bridge seq %u (%u bytes, waits <= %d ms)\n", cmd, mesa_name(cmd), slot.seq, plen, gFwdMs);
 +	IOLockWakeup(gM, &gEvQueued, false);
 +	while (slot.state != SLOT_DONE) {
 +		if (IOLockSleepDeadline(gM, &gEvDone, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED && slot.state != SLOT_DONE) {
@@ -460,6 +481,7 @@ index 0000000..912c742
 +			IOLockWakeup(gM, &gEvFree, true);
 +			IOLockUnlock(gM);
 +			OSIncrementAtomic(&nTimeouts);
++			*offline = true;        /* 1192b: answered like "no sweetfpcd" */
 +			return kIOReturnTimeout;
 +		}
 +	}
@@ -473,6 +495,43 @@ index 0000000..912c742
 +	IOLockUnlock(gM);
 +	OSIncrementAtomic(&nFwd);
 +	return fpcd_status(st);
++}
++
++/* 1192b: queue a command for sweetfpcd without waiting. kIOReturnNotReady (offline) when no bridge client. */
++static IOReturn
++mesa_post(uint32_t cmd, const uint8_t *p, uint32_t plen)
++{
++	if (plen > sizeof(gP[0].data)) {
++		return kIOReturnMessageTooLarge;
++	}
++	IOLockLock(gM);
++	if (gBridgeClients == 0) {
++		IOLockUnlock(gM);
++		return kIOReturnNotReady;
++	}
++	if (gPCount == MESA_POSTQ) {
++		SAY("posted queue full: dropping cmd %u seq %u\n", gP[gPHead].cmd, gP[gPHead].seq);
++		gPHead = (gPHead + 1) % MESA_POSTQ;
++		gPCount--;
++	}
++	int i = (gPHead + gPCount) % MESA_POSTQ;
++	if (++gSeq == 0) {
++		gSeq = 1;
++	}
++	gP[i].seq = gSeq;
++	gP[i].cmd = cmd;
++	gP[i].len = plen;
++	if (plen) {
++		bcopy(p, gP[i].data, plen);
++	}
++	gPCount++;
++	gPostedSeq[gPostedIdx] = gSeq;
++	gPostedIdx = (gPostedIdx + 1) % 16;
++	SAY("cmd %u %s -> bridge seq %u posted (no wait)\n", cmd, mesa_name(cmd), gSeq);
++	IOLockWakeup(gM, &gEvQueued, false);
++	IOLockUnlock(gM);
++	OSIncrementAtomic(&nFwd);
++	return kIOReturnSuccess;
 +}
 +
 +/* ---- the persona: one bm_cmd ---- */
@@ -596,6 +655,21 @@ index 0000000..912c742
 +		case 13: case 61: case 62: case 63: case 64: fp = p; flen = plen; break;   /* Apple raw */
 +		default: break;
 +		}
++		if (cmd == 12 || cmd == 38 || cmd == 69) {         /* 1192b: posted, never blocks the caller */
++			r = mesa_post(cmd, fp, flen);
++			if (r == kIOReturnSuccess) {
++				*how = "posted";
++				ANSWER(0);
++				return kIOReturnSuccess;
++			}
++			OSIncrementAtomic(&nOffline);
++			*how = "offline";
++			if (cmd == 38) {
++				return kIOReturnNotReady;
++			}
++			ANSWER(0);
++			return kIOReturnSuccess;
++		}
 +		rbuf = (uint8_t *)IOMallocData(SMB_DATA_MAX);
 +		if (rbuf == NULL) {
 +			return kIOReturnNoMemory;
@@ -604,7 +678,7 @@ index 0000000..912c742
 +		r = mesa_forward(cmd, fp, flen, rbuf, &rlen, &offline);
 +		if (offline) {
 +			OSIncrementAtomic(&nOffline);
-+			*how = "offline";
++			*how = r == kIOReturnTimeout ? "timeout -> offline answer" : "offline";
 +			r = kIOReturnNotReady;
 +			switch (cmd) {
 +			case 12: case 49: case 69: ANSWER_F(0); r = kIOReturnSuccess; break;
@@ -802,6 +876,9 @@ index 0000000..912c742
 +	if (fCounted) {
 +		fCounted = false;
 +		IOLockLock(gM);
++		if (gBridgeClients == 1) {
++			gPHead = gPCount = 0;   /* 1192b: posted requests die with the last bridge client */
++		}
 +		if (--gBridgeClients == 0 && (slot.state == SLOT_QUEUED || slot.state == SLOT_SENT)) {
 +			slot.status = -57;      /* ENOTCONN -> kIOReturnNotReady for the waiting command */
 +			slot.rlen = 0;
@@ -875,12 +952,30 @@ index 0000000..912c742
 +		uint64_t dl = deadline_ms(ms > 60000 ? 60000 : (uint32_t)ms);
 +		uint32_t cap = out_cap(args);
 +		IOLockLock(gM);
-+		while (slot.state != SLOT_QUEUED) {
++		while (slot.state != SLOT_QUEUED && gPCount == 0) {
 +			if (ms == 0 || (IOLockSleepDeadline(gM, &gEvQueued, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED &&
-+			    slot.state != SLOT_QUEUED)) {
++			    slot.state != SLOT_QUEUED && gPCount == 0)) {
 +				IOLockUnlock(gM);
 +				return kIOReturnTimeout;
 +			}
++		}
++		if (slot.state != SLOT_QUEUED) {        /* 1192b: a posted request (12/38/69) */
++			uint8_t pt[SMB_HDR + sizeof(gP[0].data)];
++			uint32_t plen = gP[gPHead].len, ptotal = SMB_HDR + plen;
++			if (cap < ptotal) {
++				IOLockUnlock(gM);
++				return kIOReturnNoSpace;
++			}
++			put32(pt, gP[gPHead].seq);
++			put32(pt + 4, gP[gPHead].cmd);
++			put32(pt + 8, plen);
++			if (plen) {
++				bcopy(gP[gPHead].data, pt + SMB_HDR, plen);
++			}
++			gPHead = (gPHead + 1) % MESA_POSTQ;
++			gPCount--;
++			IOLockUnlock(gM);
++			return out_write(args, pt, ptotal);
 +		}
 +		uint32_t len = slot.len, total = SMB_HDR + len;
 +		if (cap < total) {
@@ -940,12 +1035,23 @@ index 0000000..912c742
 +				slot.state = SLOT_DONE;
 +				IOLockWakeup(gM, &gEvDone, false);
 +			} else {
-+				r = kIOReturnNotFound;
++				bool posted = false;
++				for (int i = 0; i < 16; i++) {
++					posted |= seq != 0 && gPostedSeq[i] == seq;
++				}
++				/* 1192b: replies to posted requests and late replies (after the timeout) are taken and dropped */
++				if (posted) {
++					SAY("REPLY seq %u (posted) status %d len %u: logged only\n", seq, st, len);
++				} else if (seq != 0 && seq <= gSeq) {
++					SAY("REPLY seq %u status %d len %u came late (timed out already): dropped\n", seq, st, len);
++				} else {
++					r = kIOReturnNotFound;
++				}
 +			}
 +			IOLockUnlock(gM);
 +		}
 +		if (r != kIOReturnSuccess) {
-+			SAY("REPLY seq %u status %d len %u not taken (0x%x: stale or unknown seq)\n", seq, st, len, r);
++			SAY("REPLY seq %u status %d len %u not taken (0x%x: unknown seq)\n", seq, st, len, r);
 +		}
 +		IOFreeData(b, n);
 +		return r;
@@ -959,7 +1065,7 @@ index 0000000..912c742
 +		    ((gMesa & 2) ? SMB_SF_FPCD_RAW : 0) | (gBridgeClients ? SMB_SF_BRIDGE_OPEN : 0);
 +		put32(s, SMB_STATE_VERSION);
 +		put32(s + 4, fl);
-+		put32(s + 8, (slot.state == SLOT_QUEUED || slot.state == SLOT_SENT) ? 1 : 0);
++		put32(s + 8, ((slot.state == SLOT_QUEUED || slot.state == SLOT_SENT) ? 1 : 0) + (uint32_t)gPCount);
 +		put32(s + 12, (uint32_t)gAbsClients);
 +		IOLockUnlock(gM);
 +		return out_write(args, s, sizeof(s));

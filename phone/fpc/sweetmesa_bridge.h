@@ -12,9 +12,12 @@
  *   SweetMesaBridge (on IOResources), user client type 0, root only (kIOClientPrivilegeAdministrator):
  *     sweetfpcd's end. Selectors below.
  *
+ * 1192b: 12 Cancel, 38 FingerDetectMode, 69 EnableBackgroundFdet are POSTED: biometrickitd gets success at once,
+ * sweetfpcd gets them via WAIT like any request; its REPLY is only logged (reply anyway, immediately). Every other
+ * forwarded command waits at most kern.sweet_mesa_fwd_ms (default 300 ms), then gets the offline answer.
  * Sysctls: kern.sweet_mesa (bit0 publish, bit1 also deliver "FPCD"-format EVENTs raw to biometrickitd,
  * bit2 hex-dump the first 32 bytes of every command), kern.sweet_mesa_match (default 0: every match-shaped
- * EVENT is dropped and logged), kern.sweet_mesa_fwd_ms (default 2000), kern.sweet_mesa_state (read-only text).
+ * EVENT is dropped and logged), kern.sweet_mesa_fwd_ms (default 300), kern.sweet_mesa_state (read-only text).
  */
 #ifndef SWEETMESA_BRIDGE_H
 #define SWEETMESA_BRIDGE_H
@@ -140,7 +143,7 @@ struct smb_apple_msg_hdr {
  *  9  RequestCaptureBuffer        U     0    v
  * 10  RequestPreImage             U
  * 11  RequestPostImage            U
- * 12  Cancel                      F/ok  0    0
+ * 12  Cancel                      P/ok  0    0     posted
  * 13  RemoveTemplate              F/nr  20   0
  * 14  EnrollContinue              F/nr  0    0
  * 15  RequestMaxIdentityCount     F/5   0    4     u32
@@ -164,7 +167,7 @@ struct smb_apple_msg_hdr {
  * 35  U35                         U
  * 36  CacheCustomPatch            C     v    0     accepted, discarded
  * 37  CalibrateSensorFDET         U
- * 38  FingerDetectMode            F/nr  0    0
+ * 38  FingerDetectMode            P/nr  0    0     posted
  * 39  GetSKSLockState             C     4    4     u32 0 (SweetKeyStore: no passcode, unlocked)
  * 40  GetBiometrickitdInfo        C     0    23    zeros
  * 41  Diagnostics                 U     8    16
@@ -195,7 +198,7 @@ struct smb_apple_msg_hdr {
  * 66  GetIdentitiesList           F/0   4    20n   offline: 0 entries
  * 67  GetSystemProtectedConfig    C     0    28    zeros
  * 68  SetSystemProtectedConfig    C     68   0     kIOReturnNotPermitted (needs ACM authData)
- * 69  EnableBackgroundFdet        F/ok  0    0
+ * 69  EnableBackgroundFdet        P/ok  0    0     posted
  * 70  TouchIDButtonPressed        U                 (kernel-internal on Apple's side)
  * 71  U71                         U
  * 72  RemoveUserData              F/nr  4    0
