@@ -36,6 +36,7 @@
 extern int sweet_vfs_mkdir(const char *path, int mode);
 extern void sweet_acm_publish(void);            /* SweetACM.cpp */
 extern void sweet_aks_notify(void);             /* SweetKeyStore.cpp (1196) */
+extern void sweet_mesa_lockstate_changed(void); /* SweetMesa.cpp (1225): 0xe3ff800a push, kern.sweet_mesa_lockout */
 
 int sweet_pc_mode(void);
 int sweet_pc_is_set(void);
@@ -119,6 +120,7 @@ pc_notify(const char *why)
 	pc_n_notify++;
 	SAY("keybag status event (%s)\n", why);
 	sweet_aks_notify();
+	sweet_mesa_lockstate_changed();        /* 1225: no-op unless kern.sweet_mesa_lockout bit 3 */
 }
 
 static void
@@ -758,6 +760,51 @@ sweet_pc_bio_allowed(const char **why)
 	}
 	lck_mtx_unlock(&sweet_pc_lck);
 	return ok;
+}
+
+/*
+ * 1225: why Touch ID may not unlock, for SweetMesa's 39 GetSKSLockState bits (kern.sweet_mesa_lockout bit 0):
+ * 0 allowed (or no passcode lock), 1 no passcode since boot, 2 48 h since the last passcode, 3 failed-match lockout
+ * (5 no-matches, or a forced lockout: 73 / 57), 4 passcode backoff. Same order as sweet_pc_bio_allowed().
+ */
+int sweet_pc_bio_reason(void);
+void sweet_pc_bio_lockout(const char *why);
+
+int
+sweet_pc_bio_reason(void)
+{
+	int m = sweet_pc_mode();
+	if (m == 0 || m == 2 || !sweet_pc_is_set()) {
+		return 0;
+	}
+	int r = 0;
+	clock_sec_t now = pc_now();
+	lck_mtx_lock(&sweet_pc_lck);
+	if (pc_pass_ok_at == 0) {
+		r = 1;
+	} else if (now - pc_pass_ok_at > PC_BIO_TTL_S) {
+		r = 2;
+	} else if (pc_bio_fails >= PC_BIO_MAX_FAILS) {
+		r = 3;
+	} else if (pc_backoff_left() > 0) {
+		r = 4;
+	}
+	lck_mtx_unlock(&sweet_pc_lck);
+	return r;
+}
+
+/* 1225: 73 ForceBioLockout / 57 DropUnlockToken: Touch ID needs the passcode again (cleared by a passcode unlock) */
+void
+sweet_pc_bio_lockout(const char *why)
+{
+	if (sweet_pc_mode() == 0) {
+		return;
+	}
+	lck_mtx_lock(&sweet_pc_lck);
+	pc_bio_fails = PC_BIO_MAX_FAILS;
+	pc_bio_pending_at = 0;
+	lck_mtx_unlock(&sweet_pc_lck);
+	SAY("Touch ID lockout forced (%s): passcode required\n", why);
 }
 
 void

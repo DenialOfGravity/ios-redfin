@@ -357,6 +357,9 @@ static bool gMatchExtend;               /* the running MatchMode is an extend-en
 static SInt32 nUnverified, nBioUnlock, nBioRefused;
 extern "C" int sweet_pc_bio_unlock(int *did_unlock, const char **why);
 extern "C" void sweet_pc_bio_failed(void);
+extern "C" int sweet_pc_bio_reason(void);                     /* 1225 */
+extern "C" void sweet_pc_bio_lockout(const char *why);        /* 1225 */
+extern "C" void sweet_mesa_lockstate_changed(void);           /* 1225: called by sweet_passcode pc_notify */
 extern "C" int sweet_pc_bio_allowed(const char **why);
 extern "C" void sweet_acm_note_verified_match(void);
 extern "C" int sweet_acm_note_match_for_context(const uint8_t *id);    /* 1216 */
@@ -369,6 +372,29 @@ extern "C" int sweet_acm_note_match_for_context(const uint8_t *id);    /* 1216 *
  *  - MatchMode without one (lock screen, Settings): keybag unlock as before, no ACM credential armed at all.
  * The purpose is inferred from the ACM context's presence; processedFlags bits are not decoded yet.
  */
+/*
+ * 1225: Touch ID failed-match lockout as on iOS. kern.sweet_mesa_lockout (default 0 = old behaviour):
+ *   bit 0 (0x1) 39 GetSKSLockState answers the reason bits BKDevice lockoutState:fromDeviceLockoutState: maps to
+ *               SpringBoard's events (_SBUIBiometricKitInterface _eventForLockoutState:): allowed 0x8 (state 1, none),
+ *               no passcode since boot 0x10 (state 2 -> event 8 "passcode required after reboot"), 5 failed matches or
+ *               a forced lockout 0x4 (state 4 -> event 6 bio lockout; a no-match result with state 4 is event 11
+ *               "match failed caused lockout"), backoff 0x2 (state 3 -> event 5), 48 h 0 (state 5 -> event 7 expired).
+ *               Old: 0x8 or 0 (every refusal looked like "expired").
+ *   bit 1 (0x2) failed matches count for every kern.sweet_mesa_match != 0 (old: only mode 2)
+ *   bit 2 (0x4) 73 ForceBioLockout and 57 DropUnlockToken force the lockout (old: accepted no-ops; both logged now)
+ *   bit 3 (0x8) push 0xe3ff800a v1 {u32 user, u16 39-bits} (libBKDM1 serviceStatus: postGeneralLockoutStateNotification
+ *               + updateLockoutStateNotification:) whenever the 39 answer changes: lockout, keybag events (passcode
+ *               unlock resets the count), forced lockout
+ */
+#define MESA_LO_SKS     0x1u
+#define MESA_LO_COUNT   0x2u
+#define MESA_LO_FORCE   0x4u
+#define MESA_LO_PUSH    0x8u
+#define MIDX_LOCKSTATE  0xa     /* 0xe3ff800a */
+static int gLockout;
+static uint32_t gLoPushed = 0xffffffffu, nLoPush, nLoForced, nLo57, nLo73;
+static thread_call_t gLockTC;
+
 static int gAcmBind;
 static bool gMatchAcm;
 static uint8_t gMatchAcmId[16];
@@ -724,6 +750,63 @@ mesa_op_cancelled(void)
 
 static IOReturn mesa_deliver(uint32_t idx, uint32_t version, uint64_t ordinal, const uint8_t *data, uint32_t len);
 
+/* 1225: the 39 GetSKSLockState bits; *why for the log */
+static uint32_t
+mesa_sks_bits(const char **why)
+{
+	*why = "";
+	if (!gSks) {
+		*why = "canned 0 (kern.sweet_mesa_sks=0)";
+		return 0;
+	}
+	if (!(gLockout & MESA_LO_SKS)) {
+		return sweet_pc_bio_allowed(why) ? 0x8 : 0;
+	}
+	switch (sweet_pc_bio_reason()) {
+	case 0: *why = "bio unlock allowed (bit 3)"; return 0x8;
+	case 1: *why = "no passcode since boot (bit 4)"; return 0x10;
+	case 2: *why = "48 h since the last passcode (no bits: expired)"; return 0;
+	case 3: *why = "failed-match lockout (bit 2 BioLockout)"; return 0x4;
+	default: *why = "passcode backoff (bit 1)"; return 0x2;
+	}
+}
+
+/* 1225: push 0xe3ff800a when the 39 answer changed (thread call: never from the keybag or event path's locks) */
+static void
+mesa_lock_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	const char *why = "";
+	uint32_t bits = mesa_sks_bits(&why);
+	if (!(gLockout & MESA_LO_PUSH) || bits == gLoPushed) {
+		return;
+	}
+	uint8_t b[6];
+	uint32_t user = gUser ? gUser : 501;
+	put32(b, user);
+	b[4] = (uint8_t)bits;
+	b[5] = (uint8_t)(bits >> 8);
+	IOReturn r = mesa_deliver(MIDX_LOCKSTATE, 1, 0, b, sizeof(b));
+	if (r == kIOReturnSuccess) {
+		gLoPushed = bits;
+		OSIncrementAtomic(&nLoPush);
+	}
+	SAY("lock state push 0xe3ff800a user %u bits 0x%x (%s) -> 0x%x\n", user, bits, why, r);
+}
+
+static void
+mesa_lockstate_kick(void)
+{
+	if ((gLockout & MESA_LO_PUSH) && gLockTC != NULL) {
+		thread_call_enter(gLockTC);
+	}
+}
+
+extern "C" void
+sweet_mesa_lockstate_changed(void)
+{
+	mesa_lockstate_kick();
+}
+
 /* 1207: sweetfpcd connected: ask biometrickitd to re-init the sensor and re-sync its identity list */
 static void
 mesa_reinit_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -772,6 +855,12 @@ mesa_locks(void)
 	if (gEndTC == NULL) {
 		thread_call_t tc = thread_call_allocate(mesa_end_tc, NULL);
 		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gEndTC)) {
+			thread_call_free(tc);
+		}
+	}
+	if (gLockTC == NULL) {
+		thread_call_t tc = thread_call_allocate(mesa_lock_tc, NULL);
+		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gLockTC)) {
 			thread_call_free(tc);
 		}
 	}
@@ -1227,8 +1316,13 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 				}
 			}
 		}
-		if (code != FEV_MATCH && !gMatchExtend && gMatch == 2) {
-			sweet_pc_bio_failed();
+		bool counted = false;
+		if (code != FEV_MATCH && !gMatchExtend && (gMatch == 2 || ((gLockout & MESA_LO_COUNT) && gMatch != 0))) {
+			sweet_pc_bio_failed();  /* 1225 bit 1: every match mode; sweetfpcd sends one no-match per touch */
+			counted = true;
+		}
+		if (counted) {
+			mesa_lockstate_kick();  /* 1225 bit 3: 0xe3ff800a once the 5th failure locks Touch ID out */
 		}
 		if (!gMatch) {
 			/* gate closed: no 0xe3ff8002 record at all, only the MatchingFailed status */
@@ -1857,10 +1951,10 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		 * 1198 rules allow a Touch ID unlock (passcode since boot, < 48 h, < 5 failed matches, no backoff).
 		 */
 		const char *why = "";
-		uint32_t bits = (gSks && sweet_pc_bio_allowed(&why)) ? 0x8 : 0;
+		uint32_t bits = mesa_sks_bits(&why);    /* 1225: reason bits with kern.sweet_mesa_lockout bit 0 */
 		ANSWER(4);
 		put32(out, bits);
-		*how = bits ? "bio unlock allowed (bit 3)" : (gSks ? why : "canned 0 (kern.sweet_mesa_sks=0)");
+		*how = bits == 0x8 && !(gLockout & MESA_LO_SKS) ? "bio unlock allowed (bit 3)" : why;
 		return kIOReturnSuccess;
 	}
 	case 40:        /* GetBiometrickitdInfo (23 bytes) */
@@ -1968,8 +2062,20 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 	}
 	case 67: ANSWER(28); return kIOReturnSuccess;          /* GetSystemProtectedConfig */
 	case 78: ANSWER(29); *how = "canned (no match event)"; return kIOReturnSuccess;  /* GetLastMatchEvent */
-	case 20: case 24: case 30: case 32: case 36: case 44: case 57: case 73: case 75: case 87:
+	case 20: case 24: case 30: case 32: case 36: case 44: case 75: case 87:
 		ANSWER(0); *how = "accepted"; return kIOReturnSuccess;
+	case 57: case 73:       /* DropUnlockToken / ForceBioLockout (1225) */
+		ANSWER(0);
+		OSIncrementAtomic(cmd == 73 ? &nLo73 : &nLo57);
+		if (gLockout & MESA_LO_FORCE) {
+			sweet_pc_bio_lockout(cmd == 73 ? "73 ForceBioLockout" : "57 DropUnlockToken");
+			OSIncrementAtomic(&nLoForced);
+			mesa_lockstate_kick();
+			*how = "Touch ID locked out until a passcode unlock (kern.sweet_mesa_lockout bit 2)";
+		} else {
+			*how = "accepted, no-op (kern.sweet_mesa_lockout bit 2 off)";
+		}
+		return kIOReturnSuccess;
 	case 47: case 68:
 		*how = "refused (needs ACM authData)";
 		OSIncrementAtomic(&nRefused);
@@ -2780,6 +2886,32 @@ sysctl_sweet_mesa_acm_bind(__unused struct sysctl_oid *oidp, __unused void *arg1
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_acm_bind, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_acm_bind, "I", "redfin 1216: 1 = a match for a MatchMode with an ACM context adds the "
     "credential to that context only and does not unlock the keybag (default 0)");
+
+static int
+sysctl_sweet_mesa_lockout(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gLockout, changed = 0;
+	int e = sysctl_io_number(req, gLockout, sizeof(gLockout), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 0xf) {
+		return EINVAL;
+	}
+	gLockout = v;
+	gLoPushed = 0xffffffffu;        /* the next push sends the current state */
+	SAY("kern.sweet_mesa_lockout=0x%x: 39 reason bits %s, fail count %s, 73/57 lockout %s, 0xe3ff800a push %s "
+	    "(pushes %u, forced %u, cmd 57 %u, cmd 73 %u)\n", v, (v & MESA_LO_SKS) ? "on" : "off",
+	    (v & MESA_LO_COUNT) ? "every match mode" : "mode 2 only", (v & MESA_LO_FORCE) ? "on" : "off",
+	    (v & MESA_LO_PUSH) ? "on" : "off", nLoPush, nLoForced, nLo57, nLo73);
+	mesa_lockstate_kick();
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_lockout, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_lockout, "I", "redfin 1225: Touch ID lockout as iOS: bit 0 39 reason bits (0x4 BioLockout after "
+    "5 failed matches), bit 1 count failures in every match mode, bit 2 73/57 force the lockout, bit 3 push "
+    "0xe3ff800a on changes (default 0)");
 
 static int
 sysctl_sweet_mesa_fix(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
