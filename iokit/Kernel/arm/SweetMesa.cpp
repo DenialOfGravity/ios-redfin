@@ -69,6 +69,11 @@
  *   loaded: set by a successful 64, 49 NoCatacomb for the user, 3 EnrollMode, 13 / 72; cleared by sweetfpcd's
  *   TA_FRESH event (TA loaded empty). dirty: enrol done / TEMPLATES events (id list or template changed).
  *   kern.sweet_mesa_cat_ms: wait for the TA store/load (default 5000). kern.sweet_mesa_cat_state: counters.
+ * 1207: kern.sweet_mesa_offline=1 (default 0 = the old answers): while no sweetfpcd is connected, 15 / 49 / 56 / 65 /
+ *   66 / 69 answer kIOReturnNotReady instead of "5 free", "success", "0 identities" (which made biometrickitd drop
+ *   its identity list, touchid-audit-2026-11-18.md finding 10), and when the first bridge client connects the
+ *   persona sends 0xe3ff800d (libBKDM1: initSensor + syncTemplateListForUser) 1.5 s later, so biometrickitd re-reads
+ *   the sensor and the identity list from the now-live TA (after sweetfpcd's TA_FRESH event, if any).
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -206,6 +211,11 @@ static int gCatState = 3;               /* kern.sweet_mesa_catstate: 60 GetCatac
 /* 1206: catacomb persistence (kern.sweet_mesa_catacomb) */
 static int gCat;                        /* kern.sweet_mesa_catacomb: 0 = 1200 behaviour */
 static int gCatMs = 5000;               /* kern.sweet_mesa_cat_ms: wait for sweetfpcd's TA store / load */
+static int gOffHonest;                  /* kern.sweet_mesa_offline (1207): 1 = NotReady while offline + 800d on connect */
+static thread_call_t gReinitTC;
+static SInt32 nReinit;
+#define MIDX_REINIT             0xd     /* 0xe3ff800d: libBKDM1 initSensor + syncTemplateList */
+#define REINIT_DELAY_MS         1500
 static IOLock *gCatLk;                  /* one catacomb transfer at a time */
 static volatile bool gCatLoaded, gCatDirty;
 static volatile UInt32 gCatGen;         /* +1 per change of the TA db (dirtying event) */
@@ -403,6 +413,20 @@ mesa_op_cancelled(void)
 	thread_call_enter(gEndTC);
 }
 
+static IOReturn mesa_deliver(uint32_t idx, uint32_t version, uint64_t ordinal, const uint8_t *data, uint32_t len);
+
+/* 1207: sweetfpcd connected: ask biometrickitd to re-init the sensor and re-sync its identity list */
+static void
+mesa_reinit_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	if (!gOffHonest || gBridgeClients == 0) {
+		return;
+	}
+	IOReturn r = mesa_deliver(MIDX_REINIT, 1, 0, NULL, 0);
+	OSIncrementAtomic(&nReinit);
+	SAY("sweetfpcd connected: re-init message 0xe3ff800d to biometrickitd -> 0x%x (kern.sweet_mesa_offline=1)\n", r);
+}
+
 static void
 mesa_locks(void)
 {
@@ -416,6 +440,12 @@ mesa_locks(void)
 		IOLock *l = IOLockAlloc();
 		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gPub)) {
 			IOLockFree(l);
+		}
+	}
+	if (gReinitTC == NULL) {
+		thread_call_t tc = thread_call_allocate(mesa_reinit_tc, NULL);
+		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gReinitTC)) {
+			thread_call_free(tc);
 		}
 	}
 	if (gCatLk == NULL) {
@@ -1516,7 +1546,7 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 			}
 			OSIncrementAtomic(&nOffline);
 			*how = "offline";
-			if (cmd == 38) {
+			if (cmd == 38 || (gOffHonest && cmd == 69)) {   /* 1207: 69 no longer "success" while offline */
 				return kIOReturnNotReady;
 			}
 			ANSWER(0);
@@ -1532,6 +1562,11 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 			OSIncrementAtomic(&nOffline);
 			*how = r == kIOReturnTimeout ? "timeout -> offline answer" : "offline";
 			r = kIOReturnNotReady;
+			if (gOffHonest && cmd != 12 && cmd != 83) {     /* 1207: not ready, no made-up answer */
+				*how = "offline -> not ready (kern.sweet_mesa_offline=1)";
+				IOFreeData(rbuf, SMB_DATA_MAX);
+				return r;
+			}
 			switch (cmd) {
 			case 12: case 49: case 69: ANSWER_F(0); r = kIOReturnSuccess; break;
 			case 15: case 65: ANSWER_F(4); put32(out, 5); r = kIOReturnSuccess; break;
@@ -1734,7 +1769,13 @@ SweetMesaBridgeUserClient::initWithTask(task_t owningTask, void *securityID, UIn
 	}
 	IOLockLock(gM);
 	gBridgeClients++;
+	bool first = gBridgeClients == 1;
 	IOLockUnlock(gM);
+	if (first && gOffHonest && gReinitTC != NULL) {          /* 1207 */
+		uint64_t dl;
+		clock_interval_to_deadline(REINIT_DELAY_MS, kMillisecondScale, &dl);
+		thread_call_enter_delayed(gReinitTC, dl);
+	}
 	fCounted = true;
 	SAY("%s opened SweetMesaBridge\n", pn);
 	return true;
@@ -2311,13 +2352,35 @@ sysctl_sweet_mesa_cat_state(__unused struct sysctl_oid *oidp, __unused void *arg
 {
 	char b[320];
 	snprintf(b, sizeof(b), "catacomb=%d user=%u loaded=%d dirty=%d gen=%u staged=%u loads=%d load_fail=%d "
-	    "saves=%d save_fail=%d confirms=%d fresh=%d dirty_events=%d last_load=%u last_save=%u cat_ms=%d",
+	    "saves=%d save_fail=%d confirms=%d fresh=%d dirty_events=%d last_load=%u last_save=%u cat_ms=%d "
+	    "offline_honest=%d reinit_sent=%d",
 	    gCat, cat_user(), gCatLoaded, gCatDirty, (uint32_t)gCatGen, gCatSize, nCatLoads, nCatLoadFail, nCatSaves,
-	    nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv, gCatLastLoad, gCatLastSave, gCatMs);
+	    nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv, gCatLastLoad, gCatLastSave, gCatMs, gOffHonest, nReinit);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_cat_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_cat_state, "A", "redfin 1206: catacomb persistence state and counters");
+
+static int
+sysctl_sweet_mesa_offline(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gOffHonest, changed = 0;
+	int e = sysctl_io_number(req, gOffHonest, sizeof(gOffHonest), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 1) {
+		return EINVAL;
+	}
+	mesa_locks();
+	gOffHonest = v;
+	SAY("offline answers %s (kern.sweet_mesa_offline=%d)\n", v ? "honest (NotReady) + 800d on connect" : "old", v);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_offline, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_offline, "I", "redfin 1207: 1 = commands needing sweetfpcd answer NotReady while it is offline "
+    "and 0xe3ff800d re-init is sent when it connects; 0 = old answers");
 
 static int
 sysctl_sweet_mesa_fwd_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
