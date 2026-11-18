@@ -15,6 +15,7 @@
  * resident TA a failing set_gid falls back to load_empty_db + set_gid), get_finger_ids.
  * SIGTERM/SIGINT: cancel the operation, stop the capture thread, unload the TA (FPCD_KEEP_TA=1 / --keep-ta: keep).
  * SIGUSR1: wipe all (delete every finger id, debug).  SIGUSR2: one status line.
+ * FPCD_IO_RETRY=N (default 2): re-capture after an identify FPC_ERROR_IO instead of a no-match (0: off).
  * FPCD_LSNR_DIAG=1|2: listeners up around the first / every identify of a match op, requests logged (debug).
  * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
  *
@@ -669,11 +670,13 @@ static void run_enrol(uint32_t gen)
 }
 
 static int lsnr_diag;	/* FPCD_LSNR_DIAG: listeners registered around identify (diagnosis) */
+static int io_retry = 2;	/* FPCD_IO_RETRY: re-captures per match op after an identify FPC_ERROR_IO (-6) */
 
 static void run_match(uint32_t gen)
 {
 	uint32_t attempts = 0, last_up = 0;
 	int have_last = 0;
+	int io_retries = 0;
 	while (!cancelled(gen)) {
 		int32_t st4 = 0, st = 0;
 		if (!op_capture(gen, &st4))
@@ -708,6 +711,19 @@ static void run_match(uint32_t gen)
 		int32_t score = (int32_t)rd_u32(d + 0x20);
 		lg("identify %u: status %d fid %#x score %d coverage %d quality %d result %d", attempts, st, fid, score,
 		   (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14), (int)rd_u32(d + 0x1c));
+		if (st == -6 && io_retries < io_retry && !cancelled(gen)) {
+			/*
+			 * FPC_ERROR_IO (-6) from identify: seen only on the first capture of a match op whose finger was
+			 * already down (wake < 25 ms: the touch that woke the screen), 8 of 10 such ops in fpcd-tid19.log,
+			 * never on later captures. Not a listener request (the TA's file I/O is only in db load/store).
+			 * Re-capture instead of sending a no-match (pad shake, fail count). FPCD_IO_RETRY=0: old behaviour.
+			 */
+			io_retries++;
+			attempts--;
+			lg("identify: FPC_ERROR_IO: re-capturing in 80 ms, no result sent (retry %d of %d)", io_retries, io_retry);
+			usleep(80000);
+			continue;
+		}
 		if (st == 0 && !cancelled(gen)) {
 			int sent = match_deliver(st, fid, score, attempts, hat);
 			if (!ext)
@@ -1871,7 +1887,9 @@ int main(int argc, char **argv)
 		}
 	}
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
-	lsnr_diag = (e = getenv("FPCD_LSNR_DIAG")) ? atoi(e) : 0;	/* 1: first identify of a match op, 2: every one */
+	lsnr_diag = (e = getenv("FPCD_LSNR_DIAG")) ? atoi(e) : 0;
+	if ((e = getenv("FPCD_IO_RETRY")) && *e)
+		io_retry = atoi(e);	/* 1: first identify of a match op, 2: every one */
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
