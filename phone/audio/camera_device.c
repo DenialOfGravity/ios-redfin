@@ -2708,6 +2708,8 @@ struct shot {
 	uint32_t        lines, gain;    /* the exposure asked for it */
 	float           digital;        /* ... and the processor's gain with it */
 	uint64_t        t0, asked_at, fired_at;         /* ms (redwood_camera_ms) and frame numbers */
+	unsigned        fires, lit_frames;              /* main flashes asked for (a lit frame missed: asked again), frames lit by one */
+	char            seen[96];                       /* the frames read while waiting for the lit one ("+n" after fired_at, "*" lit) */
 	/* the ambient exposure before the pre-flash (put back after the photograph) and its levels */
 	uint32_t        amb_lines, amb_gain, amb_frame_lines, amb_dgain;
 	float           amb_digital, amb_sensor_digital;
@@ -3042,6 +3044,14 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				 * frame short: then the light ends early and the frame is not marked; said here)
 				 */
 				l.b = exposure_ms > frame_ms ? 2 : 1;
+				/*
+				 * (2026-11-18: one lit frame was missed -- the reader is given the newest frame and, a frame late with a
+				 * whole-sensor frame's work, steps over it. Two lit frames where the kernel's 100 ms holds them, and the
+				 * flash asked for again (once) when the frames read have gone past the lit ones)
+				 */
+				if (3 * frame_ms + 16 <= 100) {
+					l.b = 2;
+				}
 				if (2 * frame_ms + 16 > 100) {
 					say("flash: frames of %.1f ms: the kernel's 100 ms flash cannot light the whole of frame k+2", frame_ms);
 				}
@@ -3049,22 +3059,45 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				shot.state = SHOT_FIRING;
 				shot.frames = 0;
 				shot.fired_at = f->sequence;
+				shot.fires = 1;
+				shot.lit_frames = l.b;
+				shot.seen[0] = '\0';
 				say("flash: +%llu ms frame %llu: main flash %u mA for %u frame(s) (exposure %.2f ms in %.1f ms frames)%s",
 				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence, l.a, l.b, exposure_ms, frame_ms,
 				    there ? "" : " -- the exposure asked for not seen in 6 frames");
 			}
 		} else if (shot.state == SHOT_FIRING) {
+			size_t n = strlen(shot.seen);
+
 			isp.digital = shot.digital;
+			if (n + 12 < sizeof(shot.seen)) {
+				snprintf(shot.seen + n, sizeof(shot.seen) - n, "%s+%lld%s", n ? " " : "",
+				    (long long)(f->sequence - shot.fired_at), lit ? "*" : "");
+			}
 			if (lit) {
 				give_still = true;
-				say("flash: +%llu ms frame %llu lit by the main flash (asked at frame %llu, fired at %llu): the photograph; %.2f ms x "
-				    "%.2fx x %.2fx", (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence,
-				    (unsigned long long)shot.asked_at, (unsigned long long)shot.fired_at, f->exposure_lines * (double)f->line_ns / 1e6,
-				    (double)f->gain / (f->gain_unity ? f->gain_unity : 256), isp.digital);
+				say("flash: +%llu ms frame %llu lit by the main flash (asked at frame %llu, fired at %llu, try %u; frames read %s): "
+				    "the photograph; %.2f ms x %.2fx x %.2fx", (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence,
+				    (unsigned long long)shot.asked_at, (unsigned long long)shot.fired_at, shot.fires, shot.seen,
+				    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / (f->gain_unity ? f->gain_unity : 256), isp.digital);
+			} else if (f->sequence > shot.fired_at + 3 + shot.lit_frames && shot.fires < 2) {
+				/*
+				 * (asked after frame fired_at, the kernel lights frames fired_at + 3 .. + 2 + b -- one later if it was a
+				 * frame ahead of us: past that and none lit, the lit ones were stepped over; the same flash again)
+				 */
+				struct redwood_camera_command l = { .command = REDWOOD_CAMERA_FLASH, .a = MAINFLASH_MA, .b = shot.lit_frames, .c = 0 };
+
+				say("flash: +%llu ms frame %llu: the frame(s) lit by the main flash not read (frames read %s): the flash again",
+				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence, shot.seen);
+				(void)write(device, &l, sizeof(l));
+				shot.fires++;
+				shot.frames = 0;
+				shot.fired_at = f->sequence;
+				shot.seen[0] = '\0';
 			} else if (++shot.frames >= 8) {
 				give_still = true;
-				say("flash: +%llu ms frame %llu: no frame lit by the main flash (the kernel's FLASH): the photograph without it",
-				    (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence);
+				say("flash: +%llu ms frame %llu: no frame lit by the main flash (the kernel's FLASH; %u tries, frames read %s): the "
+				    "photograph without it", (unsigned long long)(now_ms - shot.t0), (unsigned long long)f->sequence, shot.fires, shot.seen);
 			}
 		}
 
