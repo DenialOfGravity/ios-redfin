@@ -122,6 +122,7 @@ enum { FEV_FINGER_DOWN = 1, FEV_FINGER_UP, FEV_IMAGE, FEV_ENROL_PROGRESS, FEV_EN
 #define ST_MATCHING_FAILED      0x33
 #define ST_MATCHING_STOPPED     0x3a
 #define ST_FINGER_ON            0x3f
+#define ST_ENROLL_COMPLETE      0x41            /* 1204 */
 #define ST_ENROLL_CANCELLED     0x42            /* 1203: op-ending statuses (libBKDM1 -> switchToNextBioOperation:) */
 #define ST_MATCHING_CANCELLED   0x50
 #define ST_FDET_CANCELLED       0x63
@@ -318,6 +319,13 @@ static void
 mesa_op_started(uint32_t kind)
 {
 	gOpKind = kind;
+}
+
+/* 1204: the SEP itself ended the op (enrol complete / failed / timeout): no Cancel status will follow */
+static void
+mesa_op_finished(uint32_t kind)
+{
+	OSCompareAndSwap(kind, 0, &gOpKind);
 }
 
 static void
@@ -688,6 +696,7 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 	case FEV_ENROL_DONE:
 		gLastPct = 0;
 		if (fid == 0) {
+			mesa_op_finished(1);    /* 1204 */
 			return mesa_status(ST_ENROLL_FAILED);
 		}
 		b = mesa_zalloc(ENROLL_RESULT_V2_SIZE);
@@ -700,13 +709,28 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 		SAY("enrol done: fid 0x%x -> enroll result user %u uuid SMFP/0x%x\n", fid, gUser, fid);
 		r = mesa_deliver(MIDX_ENROLL_RESULT, 2, 0, b, ENROLL_RESULT_V2_SIZE);
 		IOFreeData(b, ENROLL_RESULT_V2_SIZE);
+		/*
+		 * 1204: libBKDM1 ends an enrol op (switchToNextBioOperation:) only on a status 0x41-0x44; the enroll
+		 * result alone left the finished enrol op at the head of activeBioOpsQueue, so every later result went
+		 * one op behind (the extend match, then SpringBoard's lock-screen ops). After the result, as the SEP does.
+		 */
+		if (gOpEnd) {
+			mesa_op_finished(1);
+			IOReturn r2 = mesa_status(ST_ENROLL_COMPLETE);
+			nOpEnd++;
+			SAY("op ended: status 0x41 (EnrollmentComplete) -> 0x%x\n", r2);
+		}
 		return r;
 	case FEV_ENROL_FAILED:
 		gLastPct = 0;
 		SAY("enrol failed: status %d flags 0x%x -> EnrollmentFailed\n", st, fl);
+		mesa_op_finished(1);    /* 1204: 0x43 ends the op */
 		return mesa_status(ST_ENROLL_FAILED);
 	case FEV_OP_TIMEOUT:
 		gLastPct = 0;
+		if (op == 1) {
+			mesa_op_finished(1);    /* 1204: 0x44 ends the op */
+		}
 		return mesa_status(op == 1 ? ST_ENROLL_TIMEOUT : ST_MATCHING_STOPPED);
 	case FEV_ERROR:
 		return mesa_status(ST_UNKNOWN_ERROR);
