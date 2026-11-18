@@ -681,6 +681,7 @@ static void run_match(uint32_t gen)
 	uint32_t attempts = 0, last_up = 0;
 	int have_last = 0;
 	int io_retries = 0;
+	uint32_t io_touch = 0;
 	while (!cancelled(gen)) {
 		int32_t st4 = 0, st = 0;
 		if (!op_capture(gen, &st4))
@@ -689,7 +690,13 @@ static void run_match(uint32_t gen)
 			continue;
 		pthread_mutex_lock(&st_mx);
 		int ext = S.extend, same_touch = (ext || nomatch_continue) && have_last && S.up_seq == last_up;
+		uint32_t up_now = S.up_seq;
 		pthread_mutex_unlock(&st_mx);
+		if (nomatch_continue && up_now != io_touch) {
+			/* fpcd-tid21.log: the -6 comes on the first identify of a TOUCH, not only of an op: retries per touch */
+			io_touch = up_now;
+			io_retries = 0;
+		}
 		if (same_touch)
 			continue;	/* one attempt per touch (extend-enrolment, and a match op after a no-match): lift first */
 		uint8_t d[FPC_SENSOR_LEN] = { 0 };
