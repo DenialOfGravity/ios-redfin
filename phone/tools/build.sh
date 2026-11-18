@@ -9,6 +9,8 @@
 #   oslogshow FROM_EPOCH TO_EPOCH [-l] [PROC...]: the persisted unified log (log show), e.g. a past cold boot
 #   sctl     NAME [INT|0xHEX|STRING]: read/write a sysctl (strings of any length)
 #   pdptest  list | ping N [COUNT]: pdp_ip interfaces of xnu 1075 and its loopback self-test
+#   lockwatch [watch [SECS] | post NAME]: SpringBoard lock-screen/display state as CommCenter reads it
+#   simalert-check.sh [MIN]: lockwatch + CommCenter's SIM PIN alert decisions from the persisted log
 #   autolock get|never|SECONDS: Settings > Auto-Lock (ManagedConfiguration maxInactivity), for benches
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
 #   sweettrace  kdebug trace (sched, IPC, 0994 display/GPU events) for tools-claude/sweet-trace.py
@@ -35,7 +37,7 @@ sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
 for c in membw pstack psx sweettrace simpin sctl; do build $c $c.c; done
 # sweetstate: helper of the state dump (phone/tools/sweetstate.sh; tools/state.py); optional, so it cannot fail the build
 build sweetstate sweetstate.c || echo "WARN sweetstate failed"
-for m in autolock expt exq nettest openapp oslog oslogshow prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
+for m in autolock expt exq lockwatch nettest openapp oslog oslogshow prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
@@ -46,6 +48,7 @@ build pmem pmem.c
 build a2s a2s.c
 build sweetmon sweetmon.c lz4/lz4.c -DSWEETMON_VERSION="\"$(git rev-parse --short HEAD 2>/dev/null || date +%F)\""
 build imgdump imgdump.c -lobjc
+cp simalert-check.sh out/simalert-check.sh
 ls -l out
 # Venus hardware video (redfin track V, off unless /var/local/venus.on): its own build, copies into the userland output
 sh ../video/build.sh || echo "WARN phone/video build failed"
