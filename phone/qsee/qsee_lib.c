@@ -789,12 +789,21 @@ static int line_high(void)
 	return fpc_wait_high(1) > 0;	/* returns at once when gpio112 is already high */
 }
 
-/* wait for gpio112 high in slices: 1 high, 0 timeout, -1 error, -2 stop, -3 IRQ storm */
+/*
+ * wait for gpio112 high in slices: 1 high, 0 timeout, -1 error, -2 stop, -3 IRQ storm.
+ * 2026-11-18 (r5tid1): a finger after cmd 3 shows as short bursts of gpio112 pulses (kern.sweet_fpc_irq +5 in ~30 ms)
+ * that are low again before kern.sweet_fpc_wait samples the level, so a level-only wait missed every touch. A rise of
+ * the irq count since the wait began now counts as a wake too, checked every FPC_EDGE_SLICE_MS (edges in the first
+ * FPC_EARLY_WAKE_MS only rebase the count: they are the tail of the burst that woke the previous step).
+ */
+#define FPC_EDGE_SLICE_MS	20
 static int hal_wait(const struct fpc_hal_cb *cb, const struct timespec *t0, long deadline_ms, long cap_ms,
 		    const struct timespec *armed)
 {
 	struct timespec tw;
 	clock_gettime(CLOCK_MONOTONIC, &tw);
+	uint32_t c0 = fpc_sysctl_u32("kern.sweet_fpc_irq");
+	long idle_at = 0;
 	for (;;) {
 		if (irq_storm())
 			return -3;
@@ -805,12 +814,24 @@ static int hal_wait(const struct fpc_hal_cb *cb, const struct timespec *t0, long
 			left = cap_ms - fpc_ms_since(&tw);
 		if (left <= 0)
 			return line_high() ? 1 : 0;
-		int sl = cb && cb->slice_ms > 0 ? cb->slice_ms : 250;
+		int sl = FPC_EDGE_SLICE_MS;
 		int hit = fpc_wait_high(left < sl ? (int)left : sl);
 		if (hit)
 			return hit;
-		if (armed && cb && cb->idle)
+		uint32_t c = fpc_sysctl_u32("kern.sweet_fpc_irq");
+		long since = fpc_ms_since(&tw);
+		if (since < FPC_EARLY_WAKE_MS) {
+			c0 = c;		/* tail of the previous burst (the early wake after cmd 2): rebase, not a finger */
+		} else if (c0 != 0xffffffffu && c != 0xffffffffu && c != c0) {
+			if (!say_quiet)
+				say("wait: gpio112 edge(s) without a high level (irqs %u -> %u): wake", c0, c);
+			return 1;
+		}
+		int slice = cb && cb->slice_ms > 0 ? cb->slice_ms : 250;
+		if (armed && cb && cb->idle && since - idle_at >= slice) {
+			idle_at = since;
 			cb->idle(cb->ctx, fpc_ms_since(armed));
+		}
 	}
 }
 

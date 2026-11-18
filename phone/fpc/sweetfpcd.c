@@ -550,7 +550,8 @@ static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_
 static long op_deadline(void)
 {
 	pthread_mutex_lock(&st_mx);
-	long d = op_timeout_ms > 0 ? S.started + op_timeout_ms : 0;
+	/* background finger detect (38/69) runs until switched off: no op timeout (it ended detection after 120 s) */
+	long d = op_timeout_ms > 0 && S.op != OP_DETECT ? S.started + op_timeout_ms : 0;
 	pthread_mutex_unlock(&st_mx);
 	return d;
 }
