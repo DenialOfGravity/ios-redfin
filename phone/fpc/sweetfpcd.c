@@ -16,6 +16,9 @@
  * SIGTERM/SIGINT: cancel the operation, stop the capture thread, unload the TA (FPCD_KEEP_TA=1 / --keep-ta: keep).
  * SIGUSR1: wipe all (delete every finger id, debug).  SIGUSR2: one status line.
  * FPCD_IO_RETRY=N (default 2): re-capture after an identify FPC_ERROR_IO instead of a no-match (0: off).
+ * FPCD_NOMATCH_CONTINUE=1 (default): a TA no-match (identify status 0, result 0, fid 0) is a NOMATCH event and the
+ *   match op goes on after the finger is lifted (one attempt per touch, as the SEP: the op ends only on a match,
+ *   Cancel, the op timeout or the kernel's lockout); 0 = old behaviour (WITHHELD, the op ends after one result).
  * FPCD_LSNR_DIAG=1|2: listeners up around the first / every identify of a match op, requests logged (debug).
  * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
  *
@@ -671,6 +674,7 @@ static void run_enrol(uint32_t gen)
 
 static int lsnr_diag;	/* FPCD_LSNR_DIAG: listeners registered around identify (diagnosis) */
 static int io_retry = 2;	/* FPCD_IO_RETRY: re-captures per match op after an identify FPC_ERROR_IO (-6) */
+static int nomatch_continue = 1;	/* FPCD_NOMATCH_CONTINUE: a TA no-match keeps the match op running (per touch) */
 
 static void run_match(uint32_t gen)
 {
@@ -684,10 +688,10 @@ static void run_match(uint32_t gen)
 		if (st4)
 			continue;
 		pthread_mutex_lock(&st_mx);
-		int ext = S.extend, same_touch = ext && have_last && S.up_seq == last_up;
+		int ext = S.extend, same_touch = (ext || nomatch_continue) && have_last && S.up_seq == last_up;
 		pthread_mutex_unlock(&st_mx);
 		if (same_touch)
-			continue;	/* extend-enrolment: one match per touch; lift first */
+			continue;	/* one attempt per touch (extend-enrolment, and a match op after a no-match): lift first */
 		uint8_t d[FPC_SENSOR_LEN] = { 0 };
 		int32_t hat = FPCD_HAT_NONE;
 		pthread_mutex_lock(&ta_mx);
@@ -722,6 +726,23 @@ static void run_match(uint32_t gen)
 			attempts--;
 			lg("identify: FPC_ERROR_IO: re-capturing in 80 ms, no result sent (retry %d of %d)", io_retries, io_retry);
 			usleep(80000);
+			continue;
+		}
+		uint32_t tres = rd_u32(d + 0x1c);
+		if (st == 0 && tres == 0 && fid == 0 && !ext && nomatch_continue && !cancelled(gen)) {
+			/*
+			 * TA no-match: identify status 0 with result 0 and no finger id (a wrong finger: fpcd-tid20.log
+			 * 119.265 / 131.024, score 6). The SEP sends a no-identity match record and keeps the op running
+			 * until a match, Cancel or a lockout; the next attempt is the next touch (iOS counts per touch).
+			 */
+			pthread_mutex_lock(&st_mx);
+			S.nomatches++;
+			last_up = S.up_seq;
+			pthread_mutex_unlock(&st_mx);
+			have_last = 1;
+			lg("identify %u: no match (TA status 0 result 0 fid 0, score %d) -> NOMATCH; op continues, next attempt "
+			   "after a lift", attempts, score);
+			ev_send(FPCD_EV_NOMATCH, 0, 0, score, 0, attempts, 0, 0);
 			continue;
 		}
 		if (st == 0 && !cancelled(gen)) {
@@ -771,6 +792,10 @@ static void run_match(uint32_t gen)
 		}
 		pthread_mutex_lock(&st_mx);
 		S.nomatches++;
+		if (nomatch_continue) {
+			last_up = S.up_seq;	/* the next attempt is the next touch */
+			have_last = 1;
+		}
 		pthread_mutex_unlock(&st_mx);
 		ev_send(FPCD_EV_NOMATCH, st, 0, score, 0, attempts, 0, 0);
 	}
@@ -1889,7 +1914,9 @@ int main(int argc, char **argv)
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
 	lsnr_diag = (e = getenv("FPCD_LSNR_DIAG")) ? atoi(e) : 0;
 	if ((e = getenv("FPCD_IO_RETRY")) && *e)
-		io_retry = atoi(e);	/* 1: first identify of a match op, 2: every one */
+		io_retry = atoi(e);
+	if ((e = getenv("FPCD_NOMATCH_CONTINUE")) && *e)
+		nomatch_continue = atoi(e) != 0;	/* 1: first identify of a match op, 2: every one */
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
