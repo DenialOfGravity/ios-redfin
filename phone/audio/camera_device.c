@@ -1532,7 +1532,10 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 #define TORCH_REARM_S   100             /* < sweettorch_secs (120) */
 #define TORCH_POLL_S    2               /* the kernel's level looked at this often while lit (its own off seen soon) */
 #define TORCH_MAX_S     1800            /* half an hour at most, then off */
-#define TORCH_HOT_DC    600             /* kern.sweet_temp_camera, deci-degC */
+#define TORCH_HOT_DC    750             /* kern.sweet_temp_camera, deci-degC: off (redfin 2026-11-18: was 600, off within 2 s of a warm phone) */
+#define TORCH_WARM_DC   650             /* ... above this, at most TORCH_WARM_LEVEL (back to the level asked below TORCH_COOL_DC) */
+#define TORCH_COOL_DC   620
+#define TORCH_WARM_LEVEL 500            /* thousandths */
 
 static pthread_mutex_t torch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t torch_cond = PTHREAD_COND_INITIALIZER;
@@ -1689,6 +1692,7 @@ torch_keep(void *arg)
 	double rearmed_s = 0;
 	const char *off_why = NULL;
 	mach_timebase_info_data_t tb;
+	bool dimmed = false;
 
 	(void)arg;
 	mach_timebase_info(&tb);
@@ -1710,6 +1714,7 @@ torch_keep(void *arg)
 		if (generation != torch_generation) {
 			since = mach_absolute_time();   /* a new level: its own time */
 			rearmed_s = 0;
+			dimmed = false;                 /* (written as asked by torch_set: looked at again in TORCH_POLL_S) */
 			continue;
 		}
 		unsigned want = torch_want;
@@ -1733,6 +1738,17 @@ torch_keep(void *arg)
 			torch_log("off after %.0f s: %s (kernel %d, camera %d.%d C)", lit_s, why, kernel, camera / 10, camera % 10);
 			off_why = why;
 			break;
+		}
+		/* warm: a lower current; cooled: the level asked again */
+		if (!dimmed && camera >= TORCH_WARM_DC && want > TORCH_WARM_LEVEL) {
+			dimmed = true;
+			rearmed_s = -TORCH_REARM_S;     /* (written below, now) */
+		} else if (dimmed && camera > 0 && camera < TORCH_COOL_DC) {
+			dimmed = false;
+			rearmed_s = -TORCH_REARM_S;
+		}
+		if (dimmed && want > TORCH_WARM_LEVEL) {
+			want = TORCH_WARM_LEVEL;
 		}
 		if (lit_s < rearmed_s + TORCH_REARM_S - TORCH_POLL_S / 2.0) {
 			continue;       /* (lit, and not yet time to write it again) */
