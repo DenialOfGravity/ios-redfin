@@ -96,6 +96,23 @@ struct NativeAdrenoAbiSubmit {
 #define NativeAdrenoAbiSubmitWritesDisplay 1u
 #define NativeAdrenoAbiSubmitSurfaceShift  8
 #define NativeAdrenoAbiSubmitSurfaceMask   0xffffff00u
+/*
+ * redfin xnu 1258: flags bit 1: the submission names the BOs its job uses. A NativeAdrenoAbiSubmitBoList and count
+ * NativeAdrenoAbiSubmitBo entries follow the buffers; the whole record (with the 8-byte tunnel header) must stay
+ * within 4096 bytes. With kern.sweet_surf_inuse on, the IOSurfaces behind the named imports read in use
+ * (IOSurfaceIsInUse) until the submission's fence lands. Kernels before 1258 refuse the bit.
+ */
+#define NativeAdrenoAbiSubmitBoListFlag    2u
+#define NativeAdrenoAbiSubmitBoWrite       1u
+struct NativeAdrenoAbiSubmitBoList {
+    uint32_t count;
+    uint32_t reserved;            /* zero */
+};
+struct NativeAdrenoAbiSubmitBo {
+    uint64_t handle;
+    uint32_t flags;               /* NativeAdrenoAbiSubmitBoWrite */
+    uint32_t reserved;            /* zero */
+};
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
     uint32_t bytes;               /* set: length; get: requested capacity */
