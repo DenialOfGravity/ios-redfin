@@ -1,0 +1,179 @@
+redfin 1202: SweetMesa 39 GetSKSLockState sets bit 3 (no bio lockout) under the passcode rules; 46 GetProtectedConfig reports Touch ID unlock enabled
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/bsd/dev/sweet_passcode.c b/bsd/dev/sweet_passcode.c
+--- a/bsd/dev/sweet_passcode.c
++++ b/bsd/dev/sweet_passcode.c
+@@ -647,6 +647,7 @@
+  */
+ int sweet_pc_bio_unlock(int *did_unlock, const char **why);
+ void sweet_pc_bio_failed(void);
++int sweet_pc_bio_allowed(const char **why);
+ 
+ int
+ sweet_pc_bio_unlock(int *did_unlock, const char **why)
+@@ -695,6 +696,36 @@
+ 	return e;
+ }
+ 
++/*
++ * 1202: the same rules as sweet_pc_bio_unlock without unlocking anything (SweetMesa 39 GetSKSLockState asks this
++ * for the "no bio lockout" bit). No passcode lock at all also counts as allowed (nothing to enforce).
++ */
++int
++sweet_pc_bio_allowed(const char **why)
++{
++	*why = "";
++	int m = sweet_pc_mode();
++	if (m == 0 || m == 2 || !sweet_pc_is_set()) {
++		return 1;
++	}
++	int ok = 0;
++	clock_sec_t now = pc_now();
++	lck_mtx_lock(&sweet_pc_lck);
++	if (pc_pass_ok_at == 0) {
++		*why = "passcode required after restart";
++	} else if (now - pc_pass_ok_at > PC_BIO_TTL_S) {
++		*why = "passcode required (48 h since the last passcode)";
++	} else if (pc_bio_fails >= PC_BIO_MAX_FAILS) {
++		*why = "passcode required (5 failed Touch ID attempts)";
++	} else if (pc_backoff_left() > 0) {
++		*why = "passcode backoff";
++	} else {
++		ok = 1;
++	}
++	lck_mtx_unlock(&sweet_pc_lck);
++	return ok;
++}
++
+ void
+ sweet_pc_bio_failed(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -170,6 +170,8 @@
+ /* ---- state ---- */
+ static int gMesa;                       /* kern.sweet_mesa */
+ static int gMatch;                      /* kern.sweet_mesa_match */
++static int gSks = 1;                    /* kern.sweet_mesa_sks: 39 GetSKSLockState follows the passcode rules (1202) */
++static int gPcfg = 1;                   /* kern.sweet_mesa_pcfg: 46 GetProtectedConfig bits (1202) */
+ static int gTopo = 1;                   /* kern.sweet_mesa_topo: synthetic match topology (1201) */
+ static int gCatState = 3;               /* kern.sweet_mesa_catstate: 60 GetCatacombState value (1200) */
+ static int gFwdMs = 300;                /* kern.sweet_mesa_fwd_ms (1192b: was 2000) */
+@@ -223,6 +225,7 @@
+ static SInt32 nUnverified, nBioUnlock, nBioRefused;
+ extern "C" int sweet_pc_bio_unlock(int *did_unlock, const char **why);
+ extern "C" void sweet_pc_bio_failed(void);
++extern "C" int sweet_pc_bio_allowed(const char **why);
+ extern "C" void sweet_acm_note_verified_match(void);
+ 
+ class AppleMesaSEPDriver;
+@@ -883,16 +886,30 @@
+ 		ANSWER(4); put32(out, 0x20); return kIOReturnSuccess;
+ 	case 29:        /* GetSensorCalibrationStatus */
+ 	case 42:        /* GetLoggingType */
+-	case 48:        /* GetEnabledForUnlock: no */
+ 		ANSWER(1); return kIOReturnSuccess;
++	case 48:        /* GetEnabledForUnlock (1202: follows kern.sweet_mesa_pcfg bit 0) */
++		ANSWER(1); out[0] = (gPcfg & 1) ? 1 : 0; return kIOReturnSuccess;
+ 	case 50:        /* GetTemplatesValidity: valid */
+ 		ANSWER(1); out[0] = 1; return kIOReturnSuccess;
+ 	case 34: {      /* GetModuleSerialNumber */
+ 		static const char sn[] = "SWEETFPC1020";
+ 		ANSWER(17); bcopy(sn, out, sizeof(sn)); return kIOReturnSuccess;
+ 	}
+-	case 39:        /* GetSKSLockState: unlocked (SweetKeyStore) */
+-		ANSWER(4); return kIOReturnSuccess;
++	case 39: {      /* GetSKSLockState (u32 SEP bio lock-state bits) */
++		/*
++		 * 1202: BiometricKit +[BKDevice lockoutState:fromDeviceLockoutState:] maps these bits to the lockout state
++		 * SpringBoard shows: bit 8 -> 7, bit 4 -> 2, bit 1 -> 3, bit 2 -> 4, bit 3 -> 1 (no lockout), none -> 5
++		 * (bio-locked: "passcode required to enable Touch ID"); extendedLockoutState sets its bit 4 when bit 3 is
++		 * clear. The old answer 0 was therefore a permanent passcode-required lockout. Bit 3 is now set while the
++		 * 1198 rules allow a Touch ID unlock (passcode since boot, < 48 h, < 5 failed matches, no backoff).
++		 */
++		const char *why = "";
++		uint32_t bits = (gSks && sweet_pc_bio_allowed(&why)) ? 0x8 : 0;
++		ANSWER(4);
++		put32(out, bits);
++		*how = bits ? "bio unlock allowed (bit 3)" : (gSks ? why : "canned 0 (kern.sweet_mesa_sks=0)");
++		return kIOReturnSuccess;
++	}
+ 	case 40:        /* GetBiometrickitdInfo (23 bytes) */
+ 		/*
+ 		 * 1199: BiometricSupport cacheCatacombInfo keeps the first 8 bytes: +0 u32 max identities (syncTemplateList
+@@ -913,7 +930,22 @@
+ 		ANSWER(cap);
+ 		*how = "canned (zeros)";
+ 		return kIOReturnSuccess;
+-	case 46: ANSWER(32); return kIOReturnSuccess;          /* GetProtectedConfig: nothing enabled */
++	case 46: {      /* GetProtectedConfig (32 bytes) */
++		/*
++		 * 1202: libBKDM1 performGetProtectedConfigCommand: reads two UserProtectedConfig records, setCfg at +0 and
++		 * effectiveCfg at +0x10, each {u32 unlock, u32 identification, u32 login, u32 applePay}. All zeros reported
++		 * "Touch ID for iPhone Unlock" off for the user. kern.sweet_mesa_pcfg bits 0-3 = unlock, identification,
++		 * login, Apple Pay (default 1: unlock only).
++		 */
++		ANSWER(32);
++		for (int i = 0; i < 4; i++) {
++			uint32_t on = (gPcfg >> i) & 1;
++			put32(out + 4 * i, on);
++			put32(out + 0x10 + 4 * i, on);
++		}
++		*how = "canned (protected config from kern.sweet_mesa_pcfg)";
++		return kIOReturnSuccess;
++	}
+ 	case 58: ANSWER(33); return kIOReturnSuccess;          /* GetCatacombHash */
+ 	case 60: {      /* GetCatacombState: n x catacomb_state_v1_t {u32 userID, u32 state} (8 n bytes) */
+ 		/*
+@@ -1626,6 +1658,47 @@
+     sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
+ 
+ static int
++sysctl_sweet_mesa_sks(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gSks, changed = 0;
++	int e = sysctl_io_number(req, gSks, sizeof(gSks), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 1) {
++		return EINVAL;
++	}
++	gSks = v;
++	SAY("GetSKSLockState %s (kern.sweet_mesa_sks=%d)\n", v ? "follows the passcode rules" : "canned 0", v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_sks, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_sks, "I", "redfin 1202: 39 GetSKSLockState sets bit 3 (no bio lockout) while the passcode rules "
++    "allow Touch ID unlock (default 1; 0 = the old 0 = permanent lockout)");
++
++static int
++sysctl_sweet_mesa_pcfg(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gPcfg, changed = 0;
++	int e = sysctl_io_number(req, gPcfg, sizeof(gPcfg), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 15) {
++		return EINVAL;
++	}
++	gPcfg = v;
++	SAY("protected config set to 0x%x (unlock %d, identification %d, login %d, Apple Pay %d) (kern.sweet_mesa_pcfg)\n",
++	    v, v & 1, (v >> 1) & 1, (v >> 2) & 1, (v >> 3) & 1);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_pcfg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_pcfg, "I", "redfin 1202: 46 GetProtectedConfig / 48 GetEnabledForUnlock: bit0 unlock, "
++    "bit1 identification, bit2 login, bit3 Apple Pay (default 1; 0 = the old all-off answer)");
++
++static int
+ sysctl_sweet_mesa_topo(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+ {
