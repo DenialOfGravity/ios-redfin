@@ -3,6 +3,7 @@
 # there is one). Install one: python3 tools/flame-files.py put phone/tools/out/NAME /var/local/bin/NAME 755
 # (usage is at the top of each source):
 #   psx      processes without /proc; psx -k NAME kills     pstack   PID: thread backtraces (tools/flame-profile.py)
+#   pvm      PID [TOP]: footprint, compressed, regions by VM tag (resident/dirty/compressed) and the largest regions
 #   openapp  BUNDLE_ID [URL]: launch an app                   lsreg    LaunchServices registration (no uicache)
 #   netsvc   SystemConfiguration network service for an IF    nettest  DNS, TCP, then HTTPS
 #   oslog    stream the unified log                           prefs    CFPreferences read/write (no defaults)
@@ -32,7 +33,7 @@ build() {	# NAME SOURCE [FLAGS...]
 }
 # SweetControl.app + sweetctl (ws-n-ctl): first, so a failing tool below (set -e) cannot skip it
 sh ../sweetctl/build.sh || echo "WARN phone/sweetctl build failed"
-for c in membw pstack psx sweettrace simpin sctl; do build $c $c.c; done
+for c in membw pstack pvm psx sweettrace simpin sctl; do build $c $c.c; done
 # sweetstate: helper of the state dump (phone/tools/sweetstate.sh; tools/state.py); optional, so it cannot fail the build
 build sweetstate sweetstate.c || echo "WARN sweetstate failed"
 for m in autolock expt exq nettest openapp oslog oslogshow prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
