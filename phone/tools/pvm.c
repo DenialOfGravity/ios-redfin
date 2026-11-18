@@ -6,12 +6,12 @@
  * (default 12) largest regions with their tag, protection and share mode.
  */
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 struct sum { uint64_t virt, res, dirty, swapped; unsigned n; };
-struct big { mach_vm_address_t a; mach_vm_size_t s; unsigned tag, prot, share, res, swapped, dirty; };
+struct big { vm_address_t a; vm_size_t s; unsigned tag, prot, share, res, swapped, dirty; };
 
 int
 main(int argc, char **argv)
@@ -35,13 +35,13 @@ main(int argc, char **argv)
 	static struct sum s[256];
 	struct big *b = calloc(top + 1, sizeof(*b));
 	int nb = 0;
-	mach_vm_address_t a = 0;
+	vm_address_t a = 0;
 	natural_t depth = 0;
 	for (;;) {
-		mach_vm_size_t size = 0;
+		vm_size_t size = 0;
 		vm_region_submap_info_data_64_t r;
 		mach_msg_type_number_t rc = VM_REGION_SUBMAP_INFO_COUNT_64;
-		if (mach_vm_region_recurse(t, &a, &size, &depth, (vm_region_recurse_info_t)&r, &rc) != KERN_SUCCESS)
+		if (vm_region_recurse_64(t, &a, &size, &depth, (vm_region_recurse_info_t)&r, &rc) != KERN_SUCCESS)
 			break;
 		if (r.is_submap) {
 			depth++;
@@ -75,7 +75,7 @@ main(int argc, char **argv)
 			    (s[i].swapped * pg) >> 20);
 	printf("largest regions:\n");
 	for (int i = 0; i < nb; i++)
-		printf("0x%llx %6lluM tag %u prot %u share %u resM %lu swpM %lu dirtyM %lu\n", b[i].a, b[i].s >> 20, b[i].tag, b[i].prot,
+		printf("0x%llx %6lluM tag %u prot %u share %u resM %lu swpM %lu dirtyM %lu\n", (unsigned long long)b[i].a, (unsigned long long)b[i].s >> 20, b[i].tag, b[i].prot,
 		    b[i].share, (b[i].res * pg) >> 20, (b[i].swapped * pg) >> 20, (b[i].dirty * pg) >> 20);
 	return 0;
 }
