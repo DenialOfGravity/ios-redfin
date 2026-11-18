@@ -1,0 +1,1195 @@
+redfin 1192: SweetMesa, the Touch ID (Mesa) persona for biometrickitd + libBKDM1, with the SweetMesaBridge user client
+for sweetfpcd. kern.sweet_mesa default 0: nothing published. Matches only via bridge EVENT and kern.sweet_mesa_match=1
+(default 0). Interface: phone/fpc/sweetmesa_bridge.h. Design: logs/research/fingerprint-p3-ios-2026-11-18.md.
+
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+new file mode 100644
+index 0000000..912c742
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -0,0 +1,1176 @@
++/*
++ * redfin 1192: SweetMesa, a Touch ID (Mesa) persona for Apple's unmodified biometrickitd + libBKDM1, whose real
++ * sensor work is done by a userland daemon (sweetfpcd) through a bridge user client.
++ *
++ * What iOS expects (iPhone 8 kernelcache, logs/research/fingerprint-p3-ios-2026-11-18.md):
++ *   AppleMesaSEPDriver -> AppleBiometricServices -> AppleBiometricServicesUserClient, ONE selector (0) with a
++ *   variable struct in/out: in = bm_cmd ('BM' u16 0x4d42, u16 cmd 1..87, u16 version, u16 value, payload) or the
++ *   legacy 'CMCM' header (MobileGestalt), out = the command's out struct, whose exact size libBKDM1 checks.
++ *   Async results are IOGeneralInterest messages 0xe3ff8000 on AppleBiometricServices carrying a 0x28-byte header
++ *   (+ data inline when it is <= 0x17 bytes, else queued and fetched with cmd 43 RequestMessageData by ticket).
++ *
++ * Here: config/identity commands get canned answers (sizes from libBKDM1's outSize checks); sensor work goes to
++ * the bridge "SweetMesaBridge" (IOResources, user client type 0, root only; phone/fpc/sweetmesa_bridge.h):
++ *   sel 0 WAIT  scalar timeout_ms -> struct smb_req {seq, cmd, len, data}     (kIOReturnTimeout)
++ *   sel 1 REPLY struct smb_reply {seq, status, len, data}
++ *   sel 2 EVENT struct smb_event {subtype, len, data} -> message 0xe3ff8000 + (subtype & 0xff)
++ *   sel 3 STATE struct smb_state {version 1, flags, pending, clients}
++ *
++ * Trust rule: nothing canned and no sysctl produces a match. A match can only come from a bridge EVENT, and every
++ * match-shaped EVENT (message index 0xb, an "FPCD" event with code 8, or a payload >= 0xc88 bytes, the size of
++ * libBKDM1's match result) is dropped and logged unless kern.sweet_mesa_match = 1. Forwarded replies never carry
++ * a match (MatchMode has no out struct; GetLastMatchEvent is answered "none" here).
++ *
++ * Switches (all default 0: nothing is published, the kernel behaves as before this patch):
++ *   kern.sweet_mesa        bit 0 publish the persona + bridge (write 0 withdraws; EBUSY while a client is open),
++ *                          bit 1 also deliver sweetfpcd's own "FPCD"-format events raw (dev),
++ *                          bit 2 hex-dump the first 32 payload bytes of every command
++ *   kern.sweet_mesa_match  1 = let match-shaped bridge EVENTs through (default 0: dropped + logged)
++ *   kern.sweet_mesa_fwd_ms how long a forwarded command waits for sweetfpcd (default 2000, 50..30000)
++ *   kern.sweet_mesa_state  read-only summary
++ * Every command is logged: "SWEET MESA: <proc> cmd N Name v.. val.. in.. cap.. -> ret out.. [how]".
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/sysctl.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBSD.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/OSAtomic.h>
++
++extern "C" {
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++}
++
++#define SAY(fmt, ...) IOLog("SWEET MESA: " fmt, ##__VA_ARGS__)
++
++/* ---- bridge interface (phone/fpc/sweetmesa_bridge.h, part 1) ---- */
++#define SMB_DATA_MAX            16376
++#define SMB_HDR                 12              /* seq/cmd/len, seq/status/len */
++#define SMB_EV_HDR              8               /* subtype/len */
++#define SMB_STATE_VERSION       1
++#define SMB_SF_PUBLISHED        (1u << 0)
++#define SMB_SF_MATCH_GATE       (1u << 1)
++#define SMB_SF_FPCD_RAW         (1u << 2)
++#define SMB_SF_BRIDGE_OPEN      (1u << 3)
++#define MESA_MSG                0xe3ff8000u
++#define MESA_INLINE_MAX         0x17
++#define MESA_MSG_HDR            0x28
++#define MESA_MATCH_RESULT_MIN   0xc88
++#define MESA_MSGQ               16
++#define FPCD_MAGIC              0x44435046u     /* "FPCD" */
++#define FPCD_EV_MATCH           8
++#define SMFP_MAGIC              0x50464d53u     /* "SMFP": identity uuid {le32 SMFP, le32 fid, 0, 0} */
++#define MESA_ENTITLEMENT        "com.apple.private.applemesa.allow"
++
++static const char *const mesa_names[88] = {
++	"?", "GetCmdProtocolVersion", "ResetSensor", "EnrollMode", "MatchMode", "ReadCatacombSU", "U6", "U7",
++	"AlignmentData", "RequestCaptureBuffer", "RequestPreImage", "RequestPostImage", "Cancel", "RemoveTemplate",
++	"EnrollContinue", "RequestMaxIdentityCount", "GetProvisioningState", "RequestTopologyOfTemplate",
++	"ProvisionSensor", "U19", "DisplayStatusChanged", "U21", "U22", "U23", "ThermalLevelChanged",
++	"GetSignedCalibrationData", "GetCalibrationDataInfo", "GetSerialisedTemplates", "U28",
++	"GetSensorCalibrationStatus", "TemplatesExistsAtBoot", "PrepareSerialisedTemplates", "SetCalibrationData",
++	"RequestCalibrationData", "GetModuleSerialNumber", "U35", "CacheCustomPatch", "CalibrateSensorFDET",
++	"FingerDetectMode", "GetSKSLockState", "GetBiometrickitdInfo", "Diagnostics", "GetLoggingType",
++	"RequestMessageData", "BioLogEnabled", "U45", "GetProtectedConfig", "SetProtectedConfig",
++	"GetEnabledForUnlock", "NoCatacomb", "GetTemplatesValidity", "GetTimestampCollection", "U52",
++	"GetSensorInfo", "IsDisableTheDevGidSet", "UnprovisionSensor", "GetCatacombId", "DropUnlockToken",
++	"GetCatacombHash", "GetSensorSerialNumber", "GetCatacombState", "PrepareSaveCatacomb",
++	"CompleteSaveCatacomb", "ConfirmSaveCatacomb", "LoadCatacomb", "GetFreeIdentityCount", "GetIdentitiesList",
++	"GetSystemProtectedConfig", "SetSystemProtectedConfig", "EnableBackgroundFdet", "TouchIDButtonPressed",
++	"U71", "RemoveUserData", "ForceBioLockout", "SaveBioLockoutRecord", "LoadBioLockoutRecord",
++	"IsXARTAvailable", "SeaCookieHandleMessage", "GetLastMatchEvent", "GetLastWakeFromHibernation", "U80",
++	"U81", "U82", "IsSensorReady", "U84", "U85", "U86", "SystemSleepStateChanged",
++};
++
++static const char *
++mesa_name(uint32_t cmd)
++{
++	return cmd < 88 ? mesa_names[cmd] : "?";
++}
++
++/* ---- state ---- */
++static int gMesa;                       /* kern.sweet_mesa */
++static int gMatch;                      /* kern.sweet_mesa_match */
++static int gFwdMs = 2000;               /* kern.sweet_mesa_fwd_ms */
++static IOLock *gM;                      /* slot, queue, client counts */
++static IOLock *gPub;                    /* publish / withdraw */
++
++enum { SLOT_FREE = 0, SLOT_QUEUED, SLOT_SENT, SLOT_DONE };
++static struct {
++	int state;
++	uint32_t seq, cmd, len;
++	int32_t status;
++	uint32_t rlen;
++	uint8_t *req;                   /* SMB_DATA_MAX */
++	uint8_t *rep;                   /* SMB_DATA_MAX */
++} slot;
++static uint32_t gSeq;
++static char gEvQueued, gEvDone, gEvFree;  /* sleep events */
++
++static struct {
++	uint64_t ticket;
++	uint32_t len;
++	uint8_t *data;
++} gQ[MESA_MSGQ];
++static uint64_t gLastTicket;
++
++static int gAbsClients, gBridgeClients;
++static SInt32 nCmds, nCanned, nFwd, nOffline, nTimeouts, nUnsup, nEvents, nDelivered, nQueued, nMatchDropped,
++    nFpcdEv, nMsgPulled, nRefused;
++static uint32_t gLastCmd;
++static int gLastRet;
++
++class AppleMesaSEPDriver;
++class AppleBiometricServices;
++class SweetMesaBridge;
++static AppleMesaSEPDriver *gDrv;
++static AppleBiometricServices *gAbs;
++static SweetMesaBridge *gBridge;
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static inline void
++put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++static inline void
++put64(uint8_t *p, uint64_t v)
++{
++	put32(p, (uint32_t)v);
++	put32(p + 4, (uint32_t)(v >> 32));
++}
++
++static void
++mesa_locks(void)
++{
++	if (gM == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gM)) {
++			IOLockFree(l);
++		}
++	}
++	if (gPub == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gPub)) {
++			IOLockFree(l);
++		}
++	}
++}
++
++static uint64_t
++deadline_ms(uint32_t ms)
++{
++	uint64_t dl;
++	clock_interval_to_deadline(ms, kMillisecondScale, &dl);
++	return dl;
++}
++
++/* ---- IOKit classes ---- */
++class AppleMesaSEPDriver : public IOService
++{
++	OSDeclareDefaultStructors(AppleMesaSEPDriver);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleMesaSEPDriver, IOService);
++
++/* libBKDM1 setAppleMesaSEPLoggingLevel writes a property here: accept and log it, store nothing. */
++IOReturn
++AppleMesaSEPDriver::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	char pn[32];
++	proc_selfname(pn, (int)sizeof(pn));
++	if (d == NULL) {
++		SAY("%s setProperties (not a dictionary) ignored\n", pn);
++		return kIOReturnBadArgument;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	OSSymbol *k;
++	while (it && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		SAY("%s sets AppleMesaSEPDriver property %s (accepted, ignored)\n", pn, k->getCStringNoCopy());
++	}
++	OSSafeReleaseNULL(it);
++	return kIOReturnSuccess;
++}
++
++class AppleBiometricServices : public IOService
++{
++	OSDeclareDefaultStructors(AppleBiometricServices);
++};
++OSDefineMetaClassAndStructors(AppleBiometricServices, IOService);
++
++class AppleBiometricServicesUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleBiometricServicesUserClient);
++	bool fCounted;
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleBiometricServicesUserClient, IOUserClient);
++
++class SweetMesaBridge : public IOService
++{
++	OSDeclareDefaultStructors(SweetMesaBridge);
++};
++OSDefineMetaClassAndStructors(SweetMesaBridge, IOService);
++
++class SweetMesaBridgeUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(SweetMesaBridgeUserClient);
++	bool fCounted;
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetMesaBridgeUserClient, IOUserClient);
++
++/* ---- struct in/out helpers (inline or descriptor) ---- */
++static uint32_t
++in_len(IOExternalMethodArguments *a)
++{
++	return a->structureInputDescriptor ? (uint32_t)a->structureInputDescriptor->getLength() : a->structureInputSize;
++}
++
++static bool
++in_read(IOExternalMethodArguments *a, void *buf, uint32_t len)
++{
++	if (a->structureInputDescriptor) {
++		return a->structureInputDescriptor->readBytes(0, buf, len) == len;
++	}
++	if (a->structureInput == NULL && len) {
++		return false;
++	}
++	bcopy(a->structureInput, buf, len);
++	return true;
++}
++
++static uint32_t
++out_cap(IOExternalMethodArguments *a)
++{
++	return a->structureOutputDescriptor ? (uint32_t)a->structureOutputDescriptor->getLength() : a->structureOutputSize;
++}
++
++static IOReturn
++out_write(IOExternalMethodArguments *a, const void *buf, uint32_t len)
++{
++	if (a->structureOutputDescriptor) {
++		if (len > a->structureOutputDescriptor->getLength()) {
++			return kIOReturnNoSpace;
++		}
++		if (len && a->structureOutputDescriptor->writeBytes(0, buf, len) != len) {
++			return kIOReturnVMError;
++		}
++		a->structureOutputDescriptorSize = len;
++		return kIOReturnSuccess;
++	}
++	if (len > a->structureOutputSize || (len && a->structureOutput == NULL)) {
++		return kIOReturnNoSpace;
++	}
++	if (len) {
++		bcopy(buf, a->structureOutput, len);
++	}
++	a->structureOutputSize = len;
++	return kIOReturnSuccess;
++}
++
++/* ---- the message queue for cmd 43 (gM held) ---- */
++static uint64_t
++q_put(uint8_t *data, uint32_t len)
++{
++	uint64_t t = mach_absolute_time();
++	if (t <= gLastTicket) {
++		t = gLastTicket + 1;
++	}
++	gLastTicket = t;
++	int i, free_i = -1, old_i = 0;
++	for (i = 0; i < MESA_MSGQ; i++) {
++		if (gQ[i].data == NULL && free_i < 0) {
++			free_i = i;
++		}
++		if (gQ[i].data != NULL && gQ[i].ticket < gQ[old_i].ticket) {
++			old_i = i;
++		}
++	}
++	if (free_i < 0) {
++		SAY("message queue full: dropping ticket 0x%llx (%u bytes, never pulled)\n", gQ[old_i].ticket, gQ[old_i].len);
++		IOFreeData(gQ[old_i].data, gQ[old_i].len);
++		gQ[old_i].data = NULL;
++		free_i = old_i;
++	}
++	gQ[free_i].ticket = t;
++	gQ[free_i].len = len;
++	gQ[free_i].data = data;
++	return t;
++}
++
++static void
++q_clear(void)
++{
++	for (int i = 0; i < MESA_MSGQ; i++) {
++		if (gQ[i].data != NULL) {
++			IOFreeData(gQ[i].data, gQ[i].len);
++			gQ[i].data = NULL;
++		}
++	}
++}
++
++/* Send message 0xe3ff8000 (header type 0xe3ff8000 + idx) to AppleBiometricServices' interest clients. */
++static IOReturn
++mesa_deliver(uint32_t idx, uint32_t value, const uint8_t *data, uint32_t len)
++{
++	uint8_t msg[MESA_MSG_HDR + MESA_INLINE_MAX];
++	uint64_t now = mach_absolute_time(), ticket = 0;
++	AppleBiometricServices *abs;
++
++	if (len > MESA_INLINE_MAX) {
++		uint8_t *copy = (uint8_t *)IOMallocData(len);
++		if (copy == NULL) {
++			return kIOReturnNoMemory;
++		}
++		bcopy(data, copy, len);
++		IOLockLock(gM);
++		ticket = q_put(copy, len);
++		IOLockUnlock(gM);
++		now = ticket;
++		OSIncrementAtomic(&nQueued);
++	}
++	bzero(msg, sizeof(msg));
++	put64(&msg[0x00], ticket);
++	put32(&msg[0x08], MESA_MSG + idx);
++	put32(&msg[0x0c], value);
++	put64(&msg[0x10], now);
++	put64(&msg[0x18], 0);
++	put64(&msg[0x20], len);
++	if (len <= MESA_INLINE_MAX && len) {
++		bcopy(data, &msg[MESA_MSG_HDR], len);
++	}
++	IOLockLock(gM);
++	abs = gAbs;
++	if (abs) {
++		abs->retain();
++	}
++	IOLockUnlock(gM);
++	if (abs == NULL) {
++		return kIOReturnNotReady;
++	}
++	IOReturn r = abs->messageClients(MESA_MSG, msg, MESA_MSG_HDR + (len <= MESA_INLINE_MAX ? len : 0));
++	abs->release();
++	OSIncrementAtomic(&nDelivered);
++	SAY("message 0x%x value %u len %u %s ticket 0x%llx -> 0x%x\n", MESA_MSG + idx, value, len,
++	    ticket ? "queued" : "inline", ticket, r);
++	return r;
++}
++
++/* ---- forwarding to sweetfpcd ---- */
++static IOReturn
++fpcd_status(int32_t st)
++{
++	switch (st) {
++	case 0: return kIOReturnSuccess;
++	case -45: return kIOReturnUnsupported;
++	case -35: return kIOReturnNotReady;
++	case -57: return kIOReturnNotReady;
++	case -16: return kIOReturnBusy;
++	case -22: return kIOReturnBadArgument;
++	case -2: return kIOReturnNotFound;
++	case -5: return kIOReturnIOError;
++	default: return st < -4096 ? (IOReturn)st : kIOReturnError;
++	}
++}
++
++/*
++ * Queue one command for sweetfpcd and wait for its reply. Returns kIOReturnNotReady with *offline set when no
++ * bridge client is open, kIOReturnTimeout when none answers in kern.sweet_mesa_fwd_ms, else the mapped status.
++ */
++static IOReturn
++mesa_forward(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *rbuf, uint32_t *rlen, bool *offline)
++{
++	*offline = false;
++	*rlen = 0;
++	if (plen > SMB_DATA_MAX) {
++		return kIOReturnMessageTooLarge;
++	}
++	uint64_t dl = deadline_ms((uint32_t)gFwdMs);
++	IOLockLock(gM);
++	if (gBridgeClients == 0 || slot.req == NULL) {
++		IOLockUnlock(gM);
++		*offline = true;
++		return kIOReturnNotReady;
++	}
++	while (slot.state != SLOT_FREE) {
++		if (IOLockSleepDeadline(gM, &gEvFree, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED && slot.state != SLOT_FREE) {
++			IOLockUnlock(gM);
++			OSIncrementAtomic(&nTimeouts);
++			return kIOReturnTimeout;
++		}
++	}
++	if (++gSeq == 0) {
++		gSeq = 1;
++	}
++	slot.seq = gSeq;
++	slot.cmd = cmd;
++	slot.len = plen;
++	if (plen) {
++		bcopy(p, slot.req, plen);
++	}
++	slot.state = SLOT_QUEUED;
++	IOLockWakeup(gM, &gEvQueued, false);
++	while (slot.state != SLOT_DONE) {
++		if (IOLockSleepDeadline(gM, &gEvDone, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED && slot.state != SLOT_DONE) {
++			SAY("cmd %u %s seq %u: no reply from the bridge in %d ms (%s)\n", cmd, mesa_name(cmd), slot.seq,
++			    gFwdMs, slot.state == SLOT_QUEUED ? "never picked up" : "picked up, not answered");
++			slot.state = SLOT_FREE;
++			IOLockWakeup(gM, &gEvFree, true);
++			IOLockUnlock(gM);
++			OSIncrementAtomic(&nTimeouts);
++			return kIOReturnTimeout;
++		}
++	}
++	int32_t st = slot.status;
++	*rlen = slot.rlen;
++	if (slot.rlen) {
++		bcopy(slot.rep, rbuf, slot.rlen);
++	}
++	slot.state = SLOT_FREE;
++	IOLockWakeup(gM, &gEvFree, true);
++	IOLockUnlock(gM);
++	OSIncrementAtomic(&nFwd);
++	return fpcd_status(st);
++}
++
++/* ---- the persona: one bm_cmd ---- */
++static IOReturn
++mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint32_t *outLen, const char **how,
++    uint32_t *pcmd, uint32_t *pver, uint32_t *pval)
++{
++	uint32_t cmd, ver = 0, val;
++	const uint8_t *p;
++	uint32_t plen;
++	IOReturn r;
++	bool offline = false;
++
++	*outLen = 0;
++	*how = "canned";
++	if (inLen >= 8 && le16(in) == 0x4d42) {
++		cmd = le16(in + 2);
++		ver = le16(in + 4);
++		val = le16(in + 6);
++		p = in + 8;
++		plen = inLen - 8;
++	} else if (inLen >= 6 && le32(in) == 0x4d434d43) {             /* legacy 'CMCM' (MobileGestalt) */
++		switch (in[4]) {
++		case 0x01: cmd = 2; break;
++		case 0x1b: cmd = 16; break;
++		case 0x36: cmd = 34; break;
++		default: cmd = 0x1000 | in[4]; break;
++		}
++		val = in[5];
++		p = in + 6;
++		plen = inLen - 6;
++		*how = "canned (CMCM)";
++	} else {
++		*pcmd = 0;
++		*how = "bad header";
++		return kIOReturnBadArgument;
++	}
++	*pcmd = cmd;
++	*pver = ver;
++	*pval = val;
++
++#define ANSWER(n) do { if ((uint32_t)(n) > cap) { *how = "out too small"; return kIOReturnNoSpace; } \
++	    *outLen = (n); bzero(out, (n)); } while (0)
++	/* inside the forwarded switch: no return (rbuf is freed below); break leaves the inner switch */
++#define ANSWER_F(n) if ((uint32_t)(n) > cap) { *how = "out too small"; r = kIOReturnNoSpace; break; } \
++	    *outLen = (n); bzero(out, (n))
++
++	switch (cmd) {
++	/* canned */
++	case 1:         /* GetCmdProtocolVersion: u32 2 */
++		ANSWER(4); put32(out, 2); return kIOReturnSuccess;
++	case 16:        /* GetProvisioningState: kAppleBiometricSensorProvisioned */
++		ANSWER(4); put32(out, 0x20); return kIOReturnSuccess;
++	case 29:        /* GetSensorCalibrationStatus */
++	case 42:        /* GetLoggingType */
++	case 48:        /* GetEnabledForUnlock: no */
++		ANSWER(1); return kIOReturnSuccess;
++	case 50:        /* GetTemplatesValidity: valid */
++		ANSWER(1); out[0] = 1; return kIOReturnSuccess;
++	case 34: {      /* GetModuleSerialNumber */
++		static const char sn[] = "SWEETFPC1020";
++		ANSWER(17); bcopy(sn, out, sizeof(sn)); return kIOReturnSuccess;
++	}
++	case 39:        /* GetSKSLockState: unlocked (SweetKeyStore) */
++		ANSWER(4); return kIOReturnSuccess;
++	case 40: ANSWER(23); return kIOReturnSuccess;          /* GetBiometrickitdInfo */
++	case 46: ANSWER(32); return kIOReturnSuccess;          /* GetProtectedConfig: nothing enabled */
++	case 58: ANSWER(33); return kIOReturnSuccess;          /* GetCatacombHash */
++	case 60: ANSWER(0); return kIOReturnSuccess;           /* GetCatacombState: no entries (8 n bytes) */
++	case 67: ANSWER(28); return kIOReturnSuccess;          /* GetSystemProtectedConfig */
++	case 78: ANSWER(29); *how = "canned (no match event)"; return kIOReturnSuccess;  /* GetLastMatchEvent */
++	case 20: case 24: case 30: case 32: case 36: case 44: case 57: case 73: case 75: case 87:
++		ANSWER(0); *how = "accepted"; return kIOReturnSuccess;
++	case 47: case 68:
++		*how = "refused (needs ACM authData)";
++		OSIncrementAtomic(&nRefused);
++		return kIOReturnNotPermitted;
++
++	case 43: {      /* RequestMessageData: u64 ticket */
++		if (plen < 8) {
++			*how = "short ticket";
++			return kIOReturnBadArgument;
++		}
++		uint64_t t = (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
++		IOLockLock(gM);
++		for (int i = 0; i < MESA_MSGQ; i++) {
++			if (gQ[i].data != NULL && gQ[i].ticket == t) {
++				if (gQ[i].len > cap) {
++					IOLockUnlock(gM);
++					*how = "queued message larger than out";
++					return kIOReturnNoSpace;
++				}
++				bcopy(gQ[i].data, out, gQ[i].len);
++				*outLen = gQ[i].len;
++				IOFreeData(gQ[i].data, gQ[i].len);
++				gQ[i].data = NULL;
++				IOLockUnlock(gM);
++				OSIncrementAtomic(&nMsgPulled);
++				*how = "message queue";
++				return kIOReturnSuccess;
++			}
++		}
++		IOLockUnlock(gM);
++		*how = "no such ticket";
++		return kIOReturnNotFound;
++	}
++
++	/* forwarded to sweetfpcd */
++	case 2: case 3: case 4: case 12: case 13: case 14: case 15: case 38: case 49: case 56: case 61: case 62:
++	case 63: case 64: case 65: case 66: case 69: case 72: case 83: {
++		uint8_t small[4];
++		const uint8_t *fp = NULL;
++		uint32_t flen = 0;
++		uint32_t rlen = 0;
++		uint8_t *rbuf;
++
++		switch (cmd) {
++		case 3: put32(small, 0); fp = small; flen = 4; break;           /* u32 gid 0 */
++		case 38: put32(small, 1); fp = small; flen = 4; break;          /* u32 enable 1 */
++		case 69: put32(small, val); fp = small; flen = 4; break;        /* u32 enable = value */
++		case 13: case 61: case 62: case 63: case 64: fp = p; flen = plen; break;   /* Apple raw */
++		default: break;
++		}
++		rbuf = (uint8_t *)IOMallocData(SMB_DATA_MAX);
++		if (rbuf == NULL) {
++			return kIOReturnNoMemory;
++		}
++		*how = "forwarded";
++		r = mesa_forward(cmd, fp, flen, rbuf, &rlen, &offline);
++		if (offline) {
++			OSIncrementAtomic(&nOffline);
++			*how = "offline";
++			r = kIOReturnNotReady;
++			switch (cmd) {
++			case 12: case 49: case 69: ANSWER_F(0); r = kIOReturnSuccess; break;
++			case 15: case 65: ANSWER_F(4); put32(out, 5); r = kIOReturnSuccess; break;
++			case 56: ANSWER_F(16); r = kIOReturnSuccess; break;
++			case 66: ANSWER_F(0); r = kIOReturnSuccess; break;
++			case 83: ANSWER_F(1); r = kIOReturnSuccess; break;
++			default: break;
++			}
++			IOFreeData(rbuf, SMB_DATA_MAX);
++			return r;
++		}
++		if (r == kIOReturnSuccess) {
++			switch (cmd) {
++			case 15: case 65: case 61:
++				if (rlen < 4) {
++					r = kIOReturnUnderrun;
++					break;
++				}
++				ANSWER_F(4); bcopy(rbuf, out, 4);
++				break;
++			case 83:
++				if (rlen < 1) {
++					r = kIOReturnUnderrun;
++					break;
++				}
++				ANSWER_F(1); out[0] = (rlen >= 4 ? le32(rbuf) : rbuf[0]) ? 1 : 0;
++				break;
++			case 56:
++				ANSWER_F(16);
++				bcopy(rbuf, out, rlen >= 16 ? 16 : (rlen >= 8 ? 8 : 0));
++				break;
++			case 66: {
++				uint32_t n = rlen >= 4 ? le32(rbuf) : 0, user = plen >= 4 ? le32(p) : 0;
++				if (n > 5 || rlen < 4 + 4 * n) {
++					r = kIOReturnUnderrun;
++					break;
++				}
++				ANSWER_F(20 * n);
++				for (uint32_t i = 0; i < n; i++) {
++					put32(out + 20 * i, user);
++					put32(out + 20 * i + 4, SMFP_MAGIC);
++					put32(out + 20 * i + 8, le32(rbuf + 4 + 4 * i));
++				}
++				break;
++			}
++			case 62:
++				if (rlen > cap) {
++					r = kIOReturnNoSpace;
++					break;
++				}
++				ANSWER_F(rlen); bcopy(rbuf, out, rlen);
++				break;
++			default:
++				ANSWER_F(0);
++				break;
++			}
++		}
++		IOFreeData(rbuf, SMB_DATA_MAX);
++		return r;
++	}
++	default:
++		*how = "unsupported";
++		OSIncrementAtomic(&nUnsup);
++		return kIOReturnUnsupported;
++	}
++#undef ANSWER
++#undef ANSWER_F
++}
++
++/* ---- AppleBiometricServicesUserClient ---- */
++bool
++AppleBiometricServicesUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	char pn[32];
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	proc_selfname(pn, (int)sizeof(pn));
++	bool ent = IOTaskHasEntitlement(owningTask, MESA_ENTITLEMENT);
++	bool root = clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
++	if (!ent && !root) {
++		SAY("%s open (type %u) refused: no %s and not root\n", pn, (unsigned)type, MESA_ENTITLEMENT);
++		return false;
++	}
++	IOLockLock(gM);
++	gAbsClients++;
++	IOLockUnlock(gM);
++	fCounted = true;
++	SAY("%s opened AppleBiometricServices (type %u, %s)\n", pn, (unsigned)type,
++	    ent ? "entitled" : "root, WITHOUT the applemesa entitlement");
++	return true;
++}
++
++IOReturn
++AppleBiometricServicesUserClient::clientClose(void)
++{
++	if (fCounted) {
++		fCounted = false;
++		IOLockLock(gM);
++		gAbsClients--;
++		IOLockUnlock(gM);
++		SAY("AppleBiometricServices client closed\n");
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleBiometricServicesUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	char pn[32];
++	uint32_t inLen = in_len(args), cap = out_cap(args), outLen = 0, cmd = 0, ver = 0, val = 0;
++	const char *how = "";
++	IOReturn r;
++	uint8_t *in = NULL, *out = NULL;
++	uint32_t ocap = cap > SMB_DATA_MAX + 8 ? SMB_DATA_MAX + 8 : cap;
++
++	if (selector != 0) {
++		return kIOReturnUnsupported;
++	}
++	proc_selfname(pn, (int)sizeof(pn));
++	if (inLen < 6 || inLen > 0x10000) {
++		SAY("%s sel 0 with %u input bytes refused\n", pn, inLen);
++		return kIOReturnBadArgument;
++	}
++	in = (uint8_t *)IOMallocData(inLen);
++	out = (uint8_t *)IOMallocData(ocap ? ocap : 1);
++	if (in == NULL || out == NULL) {
++		r = kIOReturnNoMemory;
++		goto done;
++	}
++	if (!in_read(args, in, inLen)) {
++		r = kIOReturnVMError;
++		goto done;
++	}
++	OSIncrementAtomic(&nCmds);
++	r = mesa_command(in, inLen, out, ocap, &outLen, &how, &cmd, &ver, &val);
++	if (r == kIOReturnSuccess) {
++		r = out_write(args, out, outLen);
++	} else {
++		out_write(args, out, 0);
++	}
++	if (!strncmp(how, "canned", 6) || !strcmp(how, "accepted")) {
++		OSIncrementAtomic(&nCanned);
++	}
++	gLastCmd = cmd;
++	gLastRet = r;
++	SAY("%s cmd %u %s v%u val %u in %u cap %u -> 0x%x out %u [%s]\n", pn, cmd, mesa_name(cmd), ver, val,
++	    inLen, cap, r, outLen, how);
++	if ((gMesa & 4) && inLen > 8) {
++		uint32_t n = inLen - 8 > 32 ? 32 : inLen - 8, i;
++		char hx[3 * 32 + 1];
++		for (i = 0; i < n; i++) {
++			snprintf(&hx[3 * i], 4, "%02x ", in[8 + i]);
++		}
++		hx[3 * n] = 0;
++		SAY("  payload %s\n", hx);
++	}
++done:
++	if (in) {
++		IOFreeData(in, inLen);
++	}
++	if (out) {
++		IOFreeData(out, ocap ? ocap : 1);
++	}
++	return r;
++}
++
++/* ---- SweetMesaBridgeUserClient (sweetfpcd) ---- */
++bool
++SweetMesaBridgeUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	char pn[32];
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	proc_selfname(pn, (int)sizeof(pn));
++	if (type != 0 || clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
++		SAY("%s bridge open refused (type %u; root only, type 0)\n", pn, (unsigned)type);
++		return false;
++	}
++	IOLockLock(gM);
++	gBridgeClients++;
++	IOLockUnlock(gM);
++	fCounted = true;
++	SAY("%s opened SweetMesaBridge\n", pn);
++	return true;
++}
++
++IOReturn
++SweetMesaBridgeUserClient::clientClose(void)
++{
++	if (fCounted) {
++		fCounted = false;
++		IOLockLock(gM);
++		if (--gBridgeClients == 0 && (slot.state == SLOT_QUEUED || slot.state == SLOT_SENT)) {
++			slot.status = -57;      /* ENOTCONN -> kIOReturnNotReady for the waiting command */
++			slot.rlen = 0;
++			slot.state = SLOT_DONE;
++			IOLockWakeup(gM, &gEvDone, false);
++		}
++		IOLockUnlock(gM);
++		SAY("SweetMesaBridge client closed\n");
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++bridge_event(IOExternalMethodArguments *args)
++{
++	uint32_t n = in_len(args);
++	if (n < SMB_EV_HDR || n > SMB_EV_HDR + SMB_DATA_MAX) {
++		return kIOReturnBadArgument;
++	}
++	uint8_t *b = (uint8_t *)IOMallocData(n);
++	if (b == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOReturn r;
++	if (!in_read(args, b, n)) {
++		IOFreeData(b, n);
++		return kIOReturnVMError;
++	}
++	uint32_t sub = le32(b), len = le32(b + 4), idx = sub & 0xff, value = sub >> 8;
++	const uint8_t *d = b + SMB_EV_HDR;
++	OSIncrementAtomic(&nEvents);
++	if (len > n - SMB_EV_HDR || idx == 0 || idx > 0xd) {
++		SAY("EVENT subtype 0x%x len %u refused (bad index or length)\n", sub, len);
++		IOFreeData(b, n);
++		return kIOReturnBadArgument;
++	}
++	bool fpcd = len >= 8 && le32(d) == FPCD_MAGIC;
++	uint32_t code = fpcd ? le16(d + 6) : 0;
++	bool matchy = idx == 0xb || (fpcd && code == FPCD_EV_MATCH) || len >= MESA_MATCH_RESULT_MIN;
++	if (fpcd) {
++		OSIncrementAtomic(&nFpcdEv);
++		SAY("EVENT fpcd code %u status %d fid %u (index 0x%x, %u bytes)\n", code,
++		    len >= 20 ? (int32_t)le32(d + 16) : 0, len >= 24 ? le32(d + 20) : 0, idx, len);
++	}
++	if (matchy && !gMatch) {
++		OSIncrementAtomic(&nMatchDropped);
++		SAY("EVENT index 0x%x len %u is match-shaped: DROPPED (kern.sweet_mesa_match=0)\n", idx, len);
++		IOFreeData(b, n);
++		return kIOReturnNotPermitted;
++	}
++	if (matchy) {
++		SAY("EVENT index 0x%x len %u is match-shaped: delivered (kern.sweet_mesa_match=1)\n", idx, len);
++	}
++	if (fpcd && !(gMesa & 2)) {
++		IOFreeData(b, n);
++		return kIOReturnSuccess;        /* sweetfpcd's own format: logged, not given to biometrickitd */
++	}
++	r = mesa_deliver(idx, value, d, len);
++	IOFreeData(b, n);
++	return r;
++}
++
++IOReturn
++SweetMesaBridgeUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case 0: {       /* WAIT */
++		uint64_t ms = args->scalarInputCount ? args->scalarInput[0] : 0;
++		uint64_t dl = deadline_ms(ms > 60000 ? 60000 : (uint32_t)ms);
++		uint32_t cap = out_cap(args);
++		IOLockLock(gM);
++		while (slot.state != SLOT_QUEUED) {
++			if (ms == 0 || (IOLockSleepDeadline(gM, &gEvQueued, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED &&
++			    slot.state != SLOT_QUEUED)) {
++				IOLockUnlock(gM);
++				return kIOReturnTimeout;
++			}
++		}
++		uint32_t len = slot.len, total = SMB_HDR + len;
++		if (cap < total) {
++			IOLockUnlock(gM);
++			return kIOReturnNoSpace;
++		}
++		uint8_t *t = (uint8_t *)IOMallocData(total);
++		if (t == NULL) {
++			IOLockUnlock(gM);
++			return kIOReturnNoMemory;
++		}
++		put32(t, slot.seq);
++		put32(t + 4, slot.cmd);
++		put32(t + 8, len);
++		if (len) {
++			bcopy(slot.req, t + SMB_HDR, len);
++		}
++		slot.state = SLOT_SENT;
++		IOLockUnlock(gM);
++		IOReturn r = out_write(args, t, total);
++		if (r != kIOReturnSuccess) {
++			IOLockLock(gM);
++			if (slot.state == SLOT_SENT && slot.seq == le32(t)) {
++				slot.state = SLOT_QUEUED;       /* give it to the next WAIT */
++			}
++			IOLockUnlock(gM);
++		}
++		IOFreeData(t, total);
++		return r;
++	}
++	case 1: {       /* REPLY */
++		uint32_t n = in_len(args);
++		if (n < SMB_HDR || n > SMB_HDR + SMB_DATA_MAX) {
++			return kIOReturnBadArgument;
++		}
++		uint8_t *b = (uint8_t *)IOMallocData(n);
++		if (b == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (!in_read(args, b, n)) {
++			IOFreeData(b, n);
++			return kIOReturnVMError;
++		}
++		uint32_t seq = le32(b), len = le32(b + 8);
++		int32_t st = (int32_t)le32(b + 4);
++		IOReturn r = kIOReturnSuccess;
++		if (len > n - SMB_HDR) {
++			r = kIOReturnBadArgument;
++		} else {
++			IOLockLock(gM);
++			if (slot.state == SLOT_SENT && slot.seq == seq) {
++				slot.status = st;
++				slot.rlen = len;
++				if (len) {
++					bcopy(b + SMB_HDR, slot.rep, len);
++				}
++				slot.state = SLOT_DONE;
++				IOLockWakeup(gM, &gEvDone, false);
++			} else {
++				r = kIOReturnNotFound;
++			}
++			IOLockUnlock(gM);
++		}
++		if (r != kIOReturnSuccess) {
++			SAY("REPLY seq %u status %d len %u not taken (0x%x: stale or unknown seq)\n", seq, st, len, r);
++		}
++		IOFreeData(b, n);
++		return r;
++	}
++	case 2:         /* EVENT */
++		return bridge_event(args);
++	case 3: {       /* STATE */
++		uint8_t s[16];
++		IOLockLock(gM);
++		uint32_t fl = (gDrv ? SMB_SF_PUBLISHED : 0) | (gMatch ? SMB_SF_MATCH_GATE : 0) |
++		    ((gMesa & 2) ? SMB_SF_FPCD_RAW : 0) | (gBridgeClients ? SMB_SF_BRIDGE_OPEN : 0);
++		put32(s, SMB_STATE_VERSION);
++		put32(s + 4, fl);
++		put32(s + 8, (slot.state == SLOT_QUEUED || slot.state == SLOT_SENT) ? 1 : 0);
++		put32(s + 12, (uint32_t)gAbsClients);
++		IOLockUnlock(gM);
++		return out_write(args, s, sizeof(s));
++	}
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
++/* ---- publish / withdraw ---- */
++static bool
++start_on(IOService *svc, IOService *provider, const char *name)
++{
++	if (!svc->attach(provider)) {
++		svc->release();
++		return false;
++	}
++	svc->setName(name);
++	if (!svc->start(provider)) {
++		svc->detach(provider);
++		svc->release();
++		return false;
++	}
++	svc->registerService();
++	return true;
++}
++
++static void
++gone(IOService *s)
++{
++	if (s) {
++		s->terminate(kIOServiceSynchronous);
++		s->release();
++	}
++}
++
++/* gPub held. 0 ok, EALREADY, EBUSY (clients open), ENXIO, ENOMEM. */
++static int
++mesa_publish(bool on)
++{
++	if (!on) {
++		if (gDrv == NULL) {
++			return EALREADY;
++		}
++		IOLockLock(gM);
++		if (gAbsClients || gBridgeClients) {
++			IOLockUnlock(gM);
++			return EBUSY;
++		}
++		AppleBiometricServices *a = gAbs;
++		SweetMesaBridge *b = gBridge;
++		AppleMesaSEPDriver *d = gDrv;
++		gAbs = NULL;
++		gBridge = NULL;
++		gDrv = NULL;
++		q_clear();
++		IOLockUnlock(gM);
++		gone(a);
++		gone(b);
++		gone(d);
++		SAY("persona and bridge withdrawn\n");
++		return 0;
++	}
++	if (gDrv != NULL) {
++		return EALREADY;
++	}
++	IOService *platform = IOService::getPlatform(), *res = IOService::getResourceService();
++	if (platform == NULL || res == NULL) {
++		return ENXIO;
++	}
++	if (slot.req == NULL) {
++		slot.req = (uint8_t *)IOMallocZeroData(SMB_DATA_MAX);
++		slot.rep = (uint8_t *)IOMallocZeroData(SMB_DATA_MAX);
++		if (slot.req == NULL || slot.rep == NULL) {
++			return ENOMEM;
++		}
++	}
++	AppleMesaSEPDriver *d = OSTypeAlloc(AppleMesaSEPDriver);
++	if (d == NULL || !d->init()) {
++		OSSafeReleaseNULL(d);
++		return ENOMEM;
++	}
++	d->setProperty("SweetMesa", true);
++	if (!start_on(d, platform, "AppleMesaSEPDriver")) {
++		return ENOMEM;
++	}
++	SweetMesaBridge *b = OSTypeAlloc(SweetMesaBridge);
++	if (b == NULL || !b->init()) {
++		OSSafeReleaseNULL(b);
++		gone(d);
++		return ENOMEM;
++	}
++	b->setProperty(kIOUserClientClassKey, "SweetMesaBridgeUserClient");
++	if (!start_on(b, res, "SweetMesaBridge")) {
++		gone(d);
++		return ENOMEM;
++	}
++	AppleBiometricServices *a = OSTypeAlloc(AppleBiometricServices);
++	if (a == NULL || !a->init()) {
++		OSSafeReleaseNULL(a);
++		gone(b);
++		gone(d);
++		return ENOMEM;
++	}
++	a->setProperty(kIOUserClientClassKey, "AppleBiometricServicesUserClient");
++	a->setProperty("SweetMesa", true);
++	IOLockLock(gM);
++	gDrv = d;
++	gBridge = b;
++	gAbs = a;               /* before registerService: launchd starts biometrickitd on it */
++	IOLockUnlock(gM);
++	if (!start_on(a, d, "AppleBiometricServices")) {
++		IOLockLock(gM);
++		gAbs = NULL;
++		gBridge = NULL;
++		gDrv = NULL;
++		IOLockUnlock(gM);
++		gone(b);
++		gone(d);
++		return ENOMEM;
++	}
++	SAY("published AppleMesaSEPDriver -> AppleBiometricServices (user client AppleBiometricServicesUserClient) "
++	    "under %s, SweetMesaBridge on IOResources; match gate %s\n", platform->getName(),
++	    gMatch ? "OPEN (kern.sweet_mesa_match=1)" : "closed");
++	return 0;
++}
++
++/* ---- sysctls ---- */
++static int
++sysctl_sweet_mesa(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = gMesa, changed = 0;
++	int e = sysctl_io_number(req, gMesa, sizeof(gMesa), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v & ~7) {
++		return EINVAL;
++	}
++	mesa_locks();
++	if (gM == NULL || gPub == NULL) {
++		return ENOMEM;
++	}
++	IOLockLock(gPub);
++	bool want = (v & 1) != 0, have = gDrv != NULL;
++	if (want != have) {
++		e = mesa_publish(want);
++		if (e == EALREADY) {
++			e = 0;
++		}
++	}
++	if (e == 0) {
++		gMesa = v;
++	}
++	IOLockUnlock(gPub);
++	SAY("kern.sweet_mesa=%d -> %d (%s)\n", v, e, e ? "unchanged" : "set");
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_mesa, "I",
++    "redfin 1192: SweetMesa Touch ID persona: bit0 publish, bit1 deliver FPCD-format events raw, bit2 hex dump");
++
++static int
++sysctl_sweet_mesa_match(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gMatch, changed = 0;
++	int e = sysctl_io_number(req, gMatch, sizeof(gMatch), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	char pn[32];
++	proc_selfname(pn, (int)sizeof(pn));
++	gMatch = v;
++	SAY("match gate %s by %s (kern.sweet_mesa_match=%d)\n", v ? "OPENED" : "closed", pn, v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_match, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_match, "I", "redfin 1192: 1 = let match-shaped bridge events through (default 0: dropped)");
++
++static int
++sysctl_sweet_mesa_fwd_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gFwdMs, changed = 0;
++	int e = sysctl_io_number(req, gFwdMs, sizeof(gFwdMs), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 50 || v > 30000) {
++		return EINVAL;
++	}
++	gFwdMs = v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fwd_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_fwd_ms, "I", "redfin 1192: ms a forwarded command waits for sweetfpcd (50..30000)");
++
++static int
++sysctl_sweet_mesa_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	char b[512];
++	int q = 0;
++	if (gM) {
++		IOLockLock(gM);
++		for (int i = 0; i < MESA_MSGQ; i++) {
++			q += gQ[i].data != NULL;
++		}
++		IOLockUnlock(gM);
++	}
++	snprintf(b, sizeof(b), "mesa=%d match=%d fwd_ms=%d published=%d abs_clients=%d bridge_clients=%d slot=%d "
++	    "seq=%u cmds=%d canned=%d fwd=%d offline=%d timeouts=%d unsup=%d refused=%d events=%d fpcd_events=%d "
++	    "delivered=%d queued=%d pulled=%d msgq=%d match_dropped=%d last=%u(%s)->0x%x",
++	    gMesa, gMatch, gFwdMs, gDrv != NULL, gAbsClients, gBridgeClients, slot.state, gSeq, nCmds, nCanned, nFwd,
++	    nOffline, nTimeouts, nUnsup, nRefused, nEvents, nFpcdEv, nDelivered, nQueued, nMsgPulled, q,
++	    nMatchDropped, gLastCmd, mesa_name(gLastCmd), gLastRet);
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_state, "A", "redfin 1192: SweetMesa counters");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 51d817b..699aeb8 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -27,3 +27,4 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/SweetMesa.cpp                                   optional iokitcpp

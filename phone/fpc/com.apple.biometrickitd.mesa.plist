@@ -7,7 +7,7 @@
      _LimitLoadToDeviceTree mesa is left out: whether launchd looks the name up anywhere or by path is unknown
      (p3 doc U7), and the mesa ADT node is opt-in (mkimage MKIMAGE_ADT_MESA=1). Without the persona the job only
      starts on a com.apple.biometrickitd lookup and finds no sensor. Same Mach service as the pearl job, which
-     _LimitLoadToDeviceTree pearl keeps unloaded on this phone. Install: pa put (see phone/fpc/README-mesa.txt). -->
+     _LimitLoadToDeviceTree pearl keeps unloaded on this phone. Install: pa put to /System/Library/LaunchDaemons/ (0644). -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
