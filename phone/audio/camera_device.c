@@ -2773,6 +2773,86 @@ frame_time(const struct redwood_camera_frame *f)
 	return sof != 0 && sof <= f->time ? sof : f->time;
 }
 
+/*
+ * redfin (ws-cam-smooth): /private/var/local/camera-pace (looked for at each stream start): where the worker's time
+ * goes, frame by frame -- the wait in read(), the processing (measure, AE, AF), the photograph's work, the picture's
+ * render, the graph's handler (give) -- said once a second, and at once for a frame that came more than 250 ms after
+ * the last one, with the sensor's own frame interval and the frames the kernel skipped (sequence gaps).
+ */
+struct pace {
+	bool            on;
+	uint64_t        sec_t0, last_read, last_sof;
+	uint64_t        last_seq;
+	unsigned        reads, given, refused, lost;
+	double          gap_max, sof_max, wait_max, proc_max, still_max, render_max, give_max;
+	double          proc_sum, render_sum, give_sum;
+};
+
+static double
+pace_ms(uint64_t a, uint64_t b)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return b > a ? (double)(b - a) * tb.numer / tb.denom / 1e6 : 0;
+}
+
+#define PACE_MAX(m, v)  do { double v_ = (v); if (v_ > (m)) { (m) = v_; } } while (0)
+
+static void
+pace_frame(struct pace *p, const struct redwood_camera_frame *f, uint64_t sof, uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3,
+    uint64_t t4, uint64_t t5, int taken, unsigned given)
+{
+	double gap = p->last_read ? pace_ms(p->last_read, t1) : 0, sofd = p->last_sof ? pace_ms(p->last_sof, sof) : 0;
+	unsigned lost = p->last_seq && f->sequence > p->last_seq + 1 ? (unsigned)(f->sequence - p->last_seq - 1) : 0;
+
+	if (gap > 250) {
+		say("pace: GAP %.0f ms before frame %llu (sensor %.0f ms, %u skipped by the kernel): read wait %.1f, proc %.1f, "
+		    "still %.1f, render %.1f, give %.1f ms; exposure %.1f ms, frame %.1f ms", gap, (unsigned long long)f->sequence, sofd,
+		    lost, pace_ms(t0, t1), pace_ms(t1, t2), pace_ms(t2, t3), pace_ms(t3, t4), pace_ms(t4, t5),
+		    f->exposure_lines * (double)f->line_ns / 1e6, f->frame_lines * (double)f->line_ns / 1e6);
+	}
+	p->last_read = t1;
+	p->last_sof = sof;
+	p->last_seq = f->sequence;
+	p->reads++;
+	p->lost += lost;
+	p->given += given;
+	p->refused += taken == 0;
+	PACE_MAX(p->gap_max, gap);
+	PACE_MAX(p->sof_max, sofd);
+	PACE_MAX(p->wait_max, pace_ms(t0, t1));
+	PACE_MAX(p->proc_max, pace_ms(t1, t2));
+	PACE_MAX(p->still_max, pace_ms(t2, t3));
+	PACE_MAX(p->render_max, pace_ms(t3, t4));
+	PACE_MAX(p->give_max, pace_ms(t4, t5));
+	p->proc_sum += pace_ms(t1, t2);
+	p->render_sum += pace_ms(t3, t4);
+	p->give_sum += pace_ms(t4, t5);
+	if (p->sec_t0 == 0) {
+		p->sec_t0 = t1;
+	} else if (pace_ms(p->sec_t0, t5) >= 1000) {
+		double n = p->reads ? p->reads : 1;
+
+		say("pace: %.2f s: %u frames read (%u skipped by the kernel), %u given, %u with no pool buffer; gap max %.0f ms, sensor "
+		    "max %.0f; wait max %.0f; proc avg %.1f max %.0f; still max %.0f; render avg %.1f max %.0f; give avg %.1f max %.0f; "
+		    "exposure %.1f ms, %.1f fps", pace_ms(p->sec_t0, t5) / 1000, p->reads, p->lost, p->given, p->refused, p->gap_max,
+		    p->sof_max, p->wait_max, p->proc_sum / n, p->proc_max, p->still_max, p->render_sum / n, p->render_max, p->give_sum / n,
+		    p->give_max, f->exposure_lines * (double)f->line_ns / 1e6,
+		    f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 0);
+		bool on = p->on;
+
+		memset(p, 0, sizeof(*p));
+		p->on = on;
+		p->sec_t0 = t5;
+		p->last_read = t1;
+		p->last_sof = sof;
+		p->last_seq = f->sequence;
+	}
+}
+
 /* whether the frames are of the kind of mode the format wants (by their proportions and rate: the kernel says no more) */
 static bool
 mode_fits(const struct redwood_camera_frame *f, uint32_t kind)
@@ -3194,13 +3274,22 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	int bin = bin_mode != ~0u ? BIN_PREVIEW : BIN_OFF;
 	uint64_t bin_ns = 0, bin_since = 0;
 
+	struct pace pace = { .on = access("/private/var/local/camera-pace", F_OK) == 0 };
+	uint64_t pt0 = 0, pt1 = 0, pt2 = 0, pt3 = 0, pt4 = 0;
+
+	if (pace.on) {
+		say("pace: on (camera-pace)");
+	}
 	isp_init(&isp);
 	while (buffer != NULL && worker_wanted(s, generation)) {
 		if (stream_idle(s, generation, &idle_since)) {
 			why = "nobody wants them";
 			break;
 		}
+		pt0 = mach_absolute_time();
 		ssize_t n = read(device, buffer, bytes);
+
+		pt1 = mach_absolute_time();
 		const struct redwood_camera_frame *f = (const void *)buffer;
 		size_t need;
 
@@ -3389,6 +3478,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		}
 		af_frame(device, &af, f, raw, hw ? &nv : NULL, window, af_locked, af_mode, manual_focus);
 		s->frames++;
+		pt2 = mach_absolute_time();
 
 		/*
 		 * redfin (B6): a photograph. Not while focus is still searching (up to 20 frames). Without the flash, the next
@@ -3762,6 +3852,8 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		}
 		uint64_t preview_number = taken > 0 ? ++s->previews : s->previews;
 
+		pt3 = mach_absolute_time();
+
 		for (int k = 0; k < taken; k++) {
 			struct output *out = &s->out[moving[k].output];
 			bool made = k > 0 && moving[0].pb != NULL && copy_picture(moving[0].pb, moving[k].pb);
@@ -3788,6 +3880,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			}
 			attach(moving[k].pb, metadata);
 		}
+		pt4 = mach_absolute_time();
 		pthread_mutex_lock(&s->lock);
 		for (int k = 0; k < taken; k++) {
 			struct output *out = &s->out[moving[k].output];
@@ -3799,6 +3892,14 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			}
 		}
 		pthread_mutex_unlock(&s->lock);
+		if (pace.on) {
+			unsigned given_now = 0;
+
+			for (int k = 0; k < taken; k++) {
+				given_now += moving[k].pb != NULL;
+			}
+			pace_frame(&pace, f, frame_time(f), pt0, pt1, pt2, pt3, pt4, mach_absolute_time(), taken, given_now);
+		}
 		for (int k = 0; k < taken; k++) {
 			CFRelease(moving[k].handler);
 		}
