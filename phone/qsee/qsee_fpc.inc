@@ -149,51 +149,135 @@ static int cmd_sensor(uint32_t appid, const char *which, uint32_t cmd)
 	return rc;
 }
 
+/* fpc_sensor_cmd without its per-command lines (TZ errors still give rc 3, listeners are kept for print_seen) */
+static int fd_cmd(uint32_t appid, uint8_t *d, uint32_t cmd, int32_t *status)
+{
+	say_quiet = 1;
+	int r = fpc_sensor_cmd(appid, d, cmd, status);
+	say_quiet = 0;
+	return r;
+}
+
+static long fpc_ms_since(const struct timespec *t0)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (t.tv_sec - t0->tv_sec) * 1000 + (t.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+/* kern.sweet_fpc_wait: 1 gpio112 high, 0 timeout, -1 error */
+static int fpc_wait_high(int ms)
+{
+	int hit = 0;
+	size_t l = sizeof(hit);
+	if (ms < 1)
+		return 0;
+	if (ms > 60000)
+		ms = 60000;
+	if (dryrun)
+		return 0;
+	if (sysctlbyname("kern.sweet_fpc_wait", &hit, &l, &ms, sizeof(ms))) {
+		say("finger-detect: kern.sweet_fpc_wait: %s", strerror(errno));
+		return -1;
+	}
+	return hit;
+}
+
 /*
- * finger-detect APPID [TIMEOUT_MS]: capture_image's wait_for_finger part: +0xc = 1, cmd 2 (arm), wait for gpio112 high
- * (kern.sweet_fpc_wait, default 60000 ms), cmd 1. Exit 0 finger, 6 timeout, else as sensor_cmd.
+ * finger-detect APPID [TIMEOUT_MS]: the HAL's capture loop (fpc_tee_capture_image @0xebac with wait_for_finger, called
+ * from do_enroll @0xae50 / authenticate @0xa630 until it gives a usable image):
+ *   +0xc = 1; cmd 2 (arm); fpc_irq_wait(gpio112 high); cmd 1 (status NOT checked by the HAL);
+ *   up to 4x: cmd 3 (arm capture); fpc_irq_wait; cmd 4 -> status 3 = retry capture, else done;
+ *   cmd 4 status (capture_image's return, do_enroll's jump table @0x5304): 0 = good image (finger qualified),
+ *   1 and 4 = acquired TOO_FAST (5), 3 = INSUFFICIENT (2), 2 = logged as "capture_status" error; on any non-zero
+ *   result capture_image sends cmd 5 and the caller starts over at cmd 2. Negative = FPC_ERROR_* (fpc_error_str).
+ * Loops until cmd 4 gives 0 (exit 0), the overall timeout (default 60000 ms, exit 6), a TA/TZ error (exit 5/3/4)
+ * or QSEE_FD_MAXITER rounds (default 300). One line per round.
  */
 static int cmd_finger_detect(uint32_t appid, int ms)
 {
 	if (check_appid(appid))
 		return 2;
+	const char *e = getenv("QSEE_FD_MAXITER");
+	int maxiter = e && atoi(e) > 0 ? atoi(e) : 300;
 	uint8_t d[FPC_SENSOR_LEN] = { 0 };
 	int32_t st = 0;
-	d[0xc] = 1;
-	fpc_gpio_state("before");
-	uint32_t irq0 = fpc_sysctl_u32("kern.sweet_fpc_irq");
-	int rc = fpc_sensor_cmd(appid, d, 2, &st);
-	fpc_gpio_state("after g10/2 (armed)");
-	if (rc) {
-		say("finger-detect %u: arm FAILED (rc %d, TA status %d)", appid, rc, st);
-		print_seen();
-		return rc;
-	}
-	say("finger-detect: armed; waiting up to %d ms for gpio112 high (kern.sweet_fpc_wait)", ms);
-	int hit = 0;
-	size_t l = sizeof(hit);
-	struct timespec t0, t1;
+	struct timespec t0;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
-	if (dryrun) {
-		hit = 0;
-	} else if (sysctlbyname("kern.sweet_fpc_wait", &hit, &l, &ms, sizeof(ms))) {
-		say("finger-detect: kern.sweet_fpc_wait: %s", strerror(errno));
-		return 2;
+	fpc_gpio_state("before");
+	uint32_t irq_start = fpc_sysctl_u32("kern.sweet_fpc_irq");
+	say("finger-detect: HAL capture loop, up to %d ms / %d rounds; touch the sensor now", ms, maxiter);
+	int rc = 6, round;
+	for (round = 1; round <= maxiter; round++) {
+		long t_round = fpc_ms_since(&t0);
+		if (t_round >= ms)
+			break;
+		d[0xc] = 1;
+		int r = fd_cmd(appid, d, 2, &st);
+		if (r) {
+			say("fd %d: arm (g10/2) failed rc %d status %d", round, r, st);
+			rc = r;
+			break;
+		}
+		int hit = fpc_wait_high(ms - (int)fpc_ms_since(&t0));
+		long t_wake = fpc_ms_since(&t0) - t_round;
+		if (hit < 0) {
+			rc = 2;
+			break;
+		}
+		if (!hit) {
+			say("fd %d: armed, no irq before the timeout", round);
+			break;
+		}
+		int32_t st1 = 0;
+		r = fd_cmd(appid, d, 1, &st1);	/* the HAL ignores this status */
+		if (r && r != 5) {
+			rc = r;
+			break;
+		}
+		int32_t st4 = 0;
+		int tries = 0, timeout = 0;
+		for (tries = 1; tries <= 4; tries++) {
+			r = fd_cmd(appid, d, 3, &st);
+			if (r) {
+				say("fd %d: capture arm (g10/3) failed rc %d status %d", round, r, st);
+				break;
+			}
+			hit = fpc_wait_high(ms - (int)fpc_ms_since(&t0));
+			if (hit <= 0) {
+				timeout = 1;
+				break;
+			}
+			r = fd_cmd(appid, d, 4, &st4);
+			if (st4 != 3)
+				break;
+		}
+		say("fd %d: wake %ld ms, cmd1 %d, capture tries %d, cmd4 %d%s, result(+0x10) %#x, irqs %u", round, t_wake, st1,
+		    tries > 4 ? 4 : tries, st4, timeout ? " (timeout in capture wait)" : "", rd_u32(d + 0x10),
+		    fpc_sysctl_u32("kern.sweet_fpc_irq") - irq_start);
+		if (timeout)
+			break;
+		if (r && r != 5) {
+			rc = r;
+			break;
+		}
+		if (st4 == 0) {
+			rc = 0;
+			break;
+		}
+		if (st4 < 0) {
+			say("fd %d: cmd 4 FPC error %d", round, st4);
+			rc = 5;
+			break;
+		}
+		int32_t st5 = 0;
+		fd_cmd(appid, d, 5, &st5);	/* capture_image's error path */
 	}
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	long el = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
-	uint32_t irq1 = fpc_sysctl_u32("kern.sweet_fpc_irq");
-	say("finger-detect: wait -> %s after %ld ms, kern.sweet_fpc_irq %u -> %u", hit ? "gpio112 HIGH" : "TIMEOUT", el, irq0,
-	    irq1);
-	fpc_gpio_state("after wait");
-	if (!hit) {
-		print_seen();
-		return 6;
-	}
-	rc = fpc_sensor_cmd(appid, d, 1, &st);
-	fpc_dump("g10/1", d, FPC_SENSOR_LEN);
-	fpc_gpio_state("after g10/1");
-	say("finger-detect %u: %s (rc %d, TA status %d)", appid, rc ? "cmd 1 FAILED" : "FINGER DETECTED", rc, st);
+	fpc_dump("last", d, 0x20);
+	fpc_gpio_state("after");
+	say("finger-detect %u: %s after %d round(s), %ld ms, irqs %u", appid,
+	    rc == 0 ? "FINGER QUALIFIED (cmd 4 status 0, good image)" : rc == 6 ? "TIMEOUT / no qualified finger" : "ERROR",
+	    round > maxiter ? maxiter : round, fpc_ms_since(&t0), fpc_sysctl_u32("kern.sweet_fpc_irq") - irq_start);
 	print_seen();
 	return rc;
 }

@@ -42,8 +42,11 @@
 static int dryrun, shmbridge, con = -1;
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int say_quiet;	/* finger-detect's loop: one line per round */
 static void say(const char *fmt, ...)
 {
+	if (say_quiet)
+		return;
 	char line[512];
 	va_list ap;
 	va_start(ap, fmt);
