@@ -49,6 +49,16 @@
 #define QSEE_SMC_SEND_DATA	(TZ_SMC_ID(TZ_OWNER_TZ_APPS, TZ_SVC_APP_ID_PLACEHOLDER, 0x01) | SMC64) /* 0x70000001 */
 #define QSEE_SMC_SEND_DATA_WL	(TZ_SMC_ID(TZ_OWNER_TZ_APPS, TZ_SVC_APP_ID_PLACEHOLDER, 0x06) | SMC64) /* 0x70000006 */
 
+/* gatekeeper phase 2 (read-only): listener register (smcinvoke, legacy), deregister, whitelist response
+ * (qseecomi.h 506-521, 718-723; qseecom.c 701-731, 756-781). RPMB provision/erase (0x720004xx) stay refused. */
+#define QSEE_SMC_LSTNR_REG	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x01) | SMC64)	/* 0x72000201 */
+#define QSEE_SMC_LSTNR_DEREG	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x02) | SMC64)	/* 0x72000202 */
+#define QSEE_SMC_LSTNR_RESP_WL	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x05) | SMC64)	/* 0x72000205 */
+#define QSEE_SMC_LSTNR_REG_SI	(TZ_SMC_ID(TZ_OWNER_QSEE_OS, TZ_SVC_LISTENER, 0x06) | SMC64)	/* 0x72000206 */
+#define QSEE_ARGS_LSTNR_REG	(TZ_ARGS(3) | TZ_ARG(1, TZ_BUF_RW))	/* id, sb pa, sb len: 0x83 */
+#define QSEE_ARGS_LSTNR_DEREG	TZ_ARGS(1)				/* 0x01 */
+#define QSEE_ARGS_LSTNR_RESP_WL	(TZ_ARGS(4) | TZ_ARG(2, TZ_BUF_RW))	/* id, status, sgl pa, sgl len: 0x204 */
+
 #define QSEE_ARGS_FEAT_VERSION	(TZ_ARGS(1) | TZ_ARG(0, TZ_VAL))				/* 0x01 */
 #define QSEE_ARGS_APP_LOOKUP	(TZ_ARGS(2) | TZ_ARG(0, TZ_BUF_RW) | TZ_ARG(1, TZ_VAL))		/* 0x22 */
 #define QSEE_ARGS_SHMB_CREATE	TZ_ARGS(4)							/* 0x04 */
