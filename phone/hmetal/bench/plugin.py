@@ -5208,6 +5208,127 @@ HM_PHOTOS_EDITS = [
 ]
 
 
+# (ws-hm-planes) HM_PLANE_NATIVE=1 (default) | 0: a texture over ONE plane of a multi-plane surface (VideoToolbox's
+# transfer session, VTMTSComputeFunction, used by Photos and Camera, writes a '420f' / '420v' picture's Y plane as R32Uint
+# -- four luma bytes a texel -- or R8Uint, and its CbCr plane as RG8, usage ShaderWrite) is the plane itself, in place:
+# hakios_metal_texture_new_iosurface_plane, a linear texture over the plane's rows inside the surface's buffer (the
+# kernel imports the whole surface; the plane's offset is IOSurfaceGetBaseAddressOfPlane less IOSurfaceGetBaseAddress),
+# at the plane's pitch, for sampling, reads and shader writes (an ir3 IBO), with no copy on the processor. Where the GPU
+# cannot address the plane in place (a pitch or a start that is not a multiple of 64 bytes) the plane's copy of
+# HM_PLANE_SHADOW (ws-hm-photos) is the fallback; which path a surface's plane took is said once a surface (every one
+# under HM_TRACE, the first 32 otherwise). A command buffer that writes such a texture (a kernel binding it writable, or
+# a pass drawing into it) moves the surface's seed when it completes (HM_PLANE_SEED=1, default; a write lock and
+# unlock, as the shadow's write-back did): what converts the picture from its planes -- the YCbCr textures here and in
+# backboardd -- does it again, as after Apple's driver writes a surface. 0: refused or copied as before.
+HM_PLANES_EDITS = [
+    ('- (void)hmShadowPlane:(IOSurfaceRef)surface plane:(NSUInteger)plane;   /* (ws-hm-photos) */\n',
+     '- (void)hmShadowPlane:(IOSurfaceRef)surface plane:(NSUInteger)plane;   /* (ws-hm-photos) */\n'
+     '- (void)hmSetPlaneNative;   /* (ws-hm-planes) */\n'
+     '- (void)hmPlaneWritten:(id)cb;   /* (ws-hm-planes) */\n'),
+    ('\tBOOL _hmPlaneShadow;   /* (ws-hm-photos) HM_PLANE_SHADOW: the shadow copies one plane\'s rows */\n',
+     '\tBOOL _hmPlaneShadow;   /* (ws-hm-photos) HM_PLANE_SHADOW: the shadow copies one plane\'s rows */\n'
+     '\tBOOL _hmPlaneNative;   /* (ws-hm-planes) HM_PLANE_NATIVE: the rows are one plane of _iosurface, in place */\n'
+     '\tvoid *_hmPlaneLastCb;  /* (ws-hm-planes) the last command buffer told to move the seed (compared, never sent to) */\n'),
+    # the switches and the once-a-surface line
+    ('static int\nhm_plane_shadow_on(void)\n',
+     '/* (ws-hm-planes) HM_PLANE_NATIVE=1 (default): a texture over one plane of a multi-plane surface is that plane, in place */\n'
+     'static int\nhm_plane_native_on(void)\n{\n\tstatic int on = -1;\n\n'
+     '\tif (on < 0) {\n\t\tconst char *e = getenv("HM_PLANE_NATIVE");\n\n\t\ton = e == NULL || e[0] == 0 || atoi(e) != 0;\n'
+     '\t\tif (!on) hm_print("HM_PLANE_NATIVE=0: textures over one plane of a multi-plane surface are copies (HM_PLANE_SHADOW) or refused\\n");\n'
+     '\t}\n\treturn on;\n}\n\n'
+     '/* (ws-hm-planes) HM_PLANE_SEED=1 (default): a buffer that wrote a plane in place moves the surface\'s seed when it completes */\n'
+     'static int\nhm_plane_seed_on(void)\n{\n\tstatic int on = -1;\n\n'
+     '\tif (on < 0) {\n\t\tconst char *e = getenv("HM_PLANE_SEED");\n\n\t\ton = e == NULL || e[0] == 0 || atoi(e) != 0;\n\t}\n\treturn on;\n}\n\n'
+     '/* (ws-hm-planes) which path a surface\'s plane took, once a surface (and plane): every one under HM_TRACE, 32 otherwise */\n'
+     'static void\nhm_plane_said(IOSurfaceRef surface, NSUInteger plane, MTLTextureDescriptor *d, const char *path, uint64_t at, size_t row,\n'
+     '\t     const char *why)\n{\n'
+     '\tstatic uint32_t seen[128];\n\tstatic unsigned next, lines;\n'
+     '\tconst uint32_t key = (IOSurfaceGetID(surface) << 2) | (uint32_t)(plane & 3) | 0x80000000u;\n\n'
+     '\tfor (unsigned i = 0; i < 128; i++) {\n\t\tif (seen[i] == key) return;\n\t}\n'
+     '\tseen[next++ % 128] = key;\n'
+     '\tif (!hm_trace_on() && lines >= 32) return;\n\tlines++;\n'
+     '\thm_print("HM_PLANE: surface %u plane %lu of %zu (\'%c%c%c%c\' %zux%zu) as format %lu %lux%lu usage %#lx: %s (offset %llu, rows of %zu)%s%s\\n",\n'
+     '\t\t IOSurfaceGetID(surface), (unsigned long)plane, IOSurfaceGetPlaneCount(surface), (char)(IOSurfaceGetPixelFormat(surface) >> 24),\n'
+     '\t\t (char)(IOSurfaceGetPixelFormat(surface) >> 16), (char)(IOSurfaceGetPixelFormat(surface) >> 8), (char)IOSurfaceGetPixelFormat(surface),\n'
+     '\t\t IOSurfaceGetWidthOfPlane(surface, plane), IOSurfaceGetHeightOfPlane(surface, plane), (unsigned long)[d pixelFormat],\n'
+     '\t\t (unsigned long)[d width], (unsigned long)[d height], (unsigned long)[d usage], path, (unsigned long long)at, row,\n'
+     '\t\t why != NULL ? ": " : "", why != NULL ? why : "");\n}\n\n'
+     'static int\nhm_plane_shadow_on(void)\n'),
+    # the plane in place, before the whole-surface calls (which refuse a plane other than 0) and the shadow copy
+    ('\t\ttexture = NULL;\n\t\tif ((usage & MTLTextureUsageRenderTarget) == 0) {\n',
+     '\t\ttexture = NULL;\n'
+     '\t\tif (hm_plane_native_on() && IOSurfaceGetPlaneCount(surface) > 1 && plane < IOSurfaceGetPlaneCount(surface) &&\n'
+     '\t\t    !hm_b3a8_surface(surface)) {\n'
+     '\t\t\t/* (ws-hm-planes) HM_PLANE_NATIVE: one plane of a multi-plane surface, in place (a render target added where the\n'
+     '\t\t\t * core takes one, as below) */\n'
+     '\t\t\tconst uint8_t *b0 = IOSurfaceGetBaseAddress(surface), *pp = IOSurfaceGetBaseAddressOfPlane(surface, plane);\n'
+     '\t\t\tconst size_t prow = IOSurfaceGetBytesPerRowOfPlane(surface, plane);\n'
+     '\t\t\tconst uint64_t at = b0 != NULL && pp != NULL && pp >= b0 ? (uint64_t)(pp - b0) : 0;\n\n'
+     '\t\t\tif (b0 == NULL || pp == NULL || pp < b0) {\n'
+     '\t\t\t\thm_plane_said(surface, plane, descriptor, "copied", 0, prow, "the plane\'s base address is not inside the surface\'s");\n'
+     '\t\t\t} else {\n'
+     '\t\t\t\tconst unsigned pw = (unsigned)IOSurfaceGetWidthOfPlane(surface, plane), ph = (unsigned)IOSurfaceGetHeightOfPlane(surface, plane),\n'
+     '\t\t\t\t\t       pe = (unsigned)IOSurfaceGetBytesPerElementOfPlane(surface, plane);\n\n'
+     '\t\t\t\tif ((usage & MTLTextureUsageRenderTarget) == 0) {\n'
+     '\t\t\t\t\ttexture = hakios_metal_texture_new_iosurface_plane(_gpu, IOSurfaceGetID(surface), (unsigned)plane,\n'
+     '\t\t\t\t\t\t\t\t\t\t   (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],\n'
+     '\t\t\t\t\t\t\t\t\t\t   (unsigned)[descriptor height], (unsigned)(usage | MTLTextureUsageRenderTarget),\n'
+     '\t\t\t\t\t\t\t\t\t\t   at, (unsigned)prow, pw, ph, pe);\n'
+     '\t\t\t\t\tif (texture != NULL) usage |= MTLTextureUsageRenderTarget;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tif (texture == NULL) {\n'
+     '\t\t\t\t\ttexture = hakios_metal_texture_new_iosurface_plane(_gpu, IOSurfaceGetID(surface), (unsigned)plane,\n'
+     '\t\t\t\t\t\t\t\t\t\t   (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],\n'
+     '\t\t\t\t\t\t\t\t\t\t   (unsigned)[descriptor height], (unsigned)usage, at, (unsigned)prow, pw, ph, pe);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\thm_plane_said(surface, plane, descriptor, texture != NULL ? "native" : "copied", at, prow,\n'
+     '\t\t\t\t\t      texture != NULL ? NULL : hakios_metal_error());\n'
+     '\t\t\t}\n'
+     '\t\t\tif (texture != NULL) {\n'
+     '\t\t\t\tHM_ONCE("HM_PLANE_NATIVE: a texture over plane %lu of a %zu-plane surface (format %lu, usage %#lx) is the plane\'s rows in "\n'
+     '\t\t\t\t\t"place\\n", (unsigned long)plane, IOSurfaceGetPlaneCount(surface), (unsigned long)[descriptor pixelFormat],\n'
+     '\t\t\t\t\t(unsigned long)[descriptor usage]);\n'
+     '\t\t\t\tt = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];\n'
+     '\t\t\t\t[t hakiosSetIOSurface:surface plane:plane];\n'
+     '\t\t\t\t[t hmSetPlaneNative];\n'
+     '\t\t\t\treturn t;\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\t\tif ((usage & MTLTextureUsageRenderTarget) == 0) {\n'),
+    # the texture's side: the flag, and the seed moved after a buffer that wrote the plane
+    ('/* (ws-hm-photos) HM_PLANE_SHADOW: a copy of one plane of a multi-plane surface */\n',
+     '/* (ws-hm-planes) HM_PLANE_NATIVE: the rows are one plane of the surface, in place */\n'
+     '- (void)hmSetPlaneNative\n{\n\t_hmPlaneNative = YES;\n}\n\n'
+     '/* (ws-hm-planes) CB writes this plane (a kernel binding it writable, a pass drawing into it): when it completes, the\n'
+     ' * surface\'s seed moves (a write lock and unlock), as after Apple\'s driver writes a surface, so what converts the\n'
+     ' * picture from its planes does it again. Once a buffer. */\n'
+     '- (void)hmPlaneWritten:(id)cb\n{\n'
+     '\tif (_parent != nil) {\n\t\t[(HakiosMetalTexture *)_parent hmPlaneWritten:cb];\n\t\treturn;\n\t}\n'
+     '\tif (!_hmPlaneNative || _iosurface == NULL || cb == nil || !hm_plane_seed_on() || _hmPlaneLastCb == (void *)cb ||\n'
+     '\t    ![cb respondsToSelector:@selector(addCompletedHandler:)]) {\n\t\treturn;\n\t}\n'
+     '\t_hmPlaneLastCb = (void *)cb;\n'
+     '\tHakiosMetalTexture *written = [self retain];\n'
+     '\tIOSurfaceRef s = (IOSurfaceRef)CFRetain(_iosurface);\n\n'
+     '\t[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {\n'
+     '\t\tif (IOSurfaceLock(s, 0, NULL) == kIOReturnSuccess) {\n\t\t\tIOSurfaceUnlock(s, 0, NULL);\n\t\t}\n'
+     '\t\thm_surface_gen(IOSurfaceGetID(s), 1);\n'
+     '\t\tif (written->_hmPlaneLastCb == (void *)done) written->_hmPlaneLastCb = NULL;\n'
+     '\t\tCFRelease(s);\n\t\t[written release];\n\t}];\n}\n\n'
+     '/* (ws-hm-photos) HM_PLANE_SHADOW: a copy of one plane of a multi-plane surface */\n'),
+    # a kernel binding it writable
+    ('\tif ([(HakiosMetalTexture *)texture hakiosIsShadow] && ([(HakiosMetalTexture *)texture usage] & MTLTextureUsageShaderWrite) != 0) {\n'
+     '\t\t[(HakiosMetalTexture *)texture hakiosShadowUse:_commandBuffer writer:YES];\n',
+     '\tif (texture != nil && ([(HakiosMetalTexture *)texture usage] & MTLTextureUsageShaderWrite) != 0) {   /* (ws-hm-planes) */\n'
+     '\t\t[(HakiosMetalTexture *)texture hmPlaneWritten:_commandBuffer];\n\t}\n'
+     '\tif ([(HakiosMetalTexture *)texture hakiosIsShadow] && ([(HakiosMetalTexture *)texture usage] & MTLTextureUsageShaderWrite) != 0) {\n'
+     '\t\t[(HakiosMetalTexture *)texture hakiosShadowUse:_commandBuffer writer:YES];\n'),
+    # a pass drawing into it
+    ('\t\t\thm_surface_gen(IOSurfaceGetID([(HakiosMetalTexture *)t iosurface]), 1);   /* (redfin hmv4) a pass straight into a surface */\n',
+     '\t\t\thm_surface_gen(IOSurfaceGetID([(HakiosMetalTexture *)t iosurface]), 1);   /* (redfin hmv4) a pass straight into a surface */\n'
+     '\t\t\t[(HakiosMetalTexture *)t hmPlaneWritten:(id)cb];   /* (ws-hm-planes) */\n'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
@@ -5217,6 +5338,7 @@ def main():
     src = apply(src, HM_XRREUSE_EDITS)   # (redfin xrreuse) HM_XR_REUSE
     src = apply(src, HM_CAMFIX_EDITS)   # (ws-hm-camfix) F4 commit lifetime, F6 HM_MSAA_FALLBACK
     src = apply(src, HM_PHOTOS_EDITS)   # (ws-hm-photos) HM_PLANE_SHADOW
+    src = apply(src, HM_PLANES_EDITS)   # (ws-hm-planes) HM_PLANE_NATIVE, HM_PLANE_SEED
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))

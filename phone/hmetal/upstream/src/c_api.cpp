@@ -876,6 +876,27 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, &chroma);
 }
 
+hakios_metal_texture* hakios_metal_texture_new_iosurface_plane(hakios_metal_device* d, unsigned surfaceId, unsigned plane, unsigned pixelFormat,
+                                                               unsigned width, unsigned height, unsigned usage, uint64_t planeOffset,
+                                                               unsigned planeRowBytes, unsigned planeWidth, unsigned planeHeight,
+                                                               unsigned planeElementBytes) {
+    TextureDesc desc;
+    desc.format = PixelFormat(pixelFormat);
+    desc.width = width;
+    desc.height = height;
+    desc.usage = usage;
+    const Texture::PlaneRows rows{planeOffset, planeRowBytes, planeWidth, planeHeight, planeElementBytes};
+    std::string why;
+    std::shared_ptr<Texture> t = Texture::wrapSurfacePlane(*d->gpu, surfaceId, plane, desc, rows, &why);
+    if (t == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(t);
+    return r;
+}
+
 hakios_metal_texture* hakios_metal_texture_new_ycbcr(hakios_metal_device* d, unsigned surfaceId, unsigned width, unsigned height, uint64_t lumaOffset,
                                                      unsigned lumaRow, uint64_t chromaOffset, unsigned chromaRow, unsigned matrix, int full, int planes) {
     Texture::Ycbcr yc;

@@ -1773,6 +1773,49 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     return t;
 }
 
+// (ws-hm-planes) one plane of a multi-plane surface as a linear texture over that plane's rows (texture.hpp)
+std::shared_ptr<Texture> Texture::wrapSurfacePlane(Gpu& gpu, uint32_t surfaceId, uint32_t plane, const TextureDesc& desc, const PlaneRows& p,
+                                                   std::string* why) {
+    const FormatInfo* info = formatInfo(desc.format);
+    const std::string asked = "a texture over plane " + n(plane) + " of IOSurface " + n(surfaceId);
+    if (info == nullptr || desc.type != TextureType::k2D || info->depth || info->blockW > 1 || info->twoPlane || desc.mipLevels != 1 ||
+        desc.samples != 1) {
+        refuse(why, asked + " of pixel format " + n(uint32_t(desc.format)) + ": one level of a 2D uncompressed colour format is what a plane takes");
+        return nullptr;
+    }
+    if ((desc.usage & ~(kTextureUsageRead | kTextureUsageWrite | kTextureUsageRenderTarget)) != 0) {
+        refuse(why, asked + ": texture usage " + n(desc.usage) + " has bits other than shader read (1), shader write (2) and render target (4)");
+        return nullptr;
+    }
+    SurfaceInfo s;
+    std::shared_ptr<Buffer> buffer = surfaceBuffer(gpu, surfaceId, &s, why);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    if (s.planes < 2 || plane >= s.planes) {
+        refuse(why, asked + " of " + n(s.planes) + " plane(s): a plane of a multi-plane surface is what this takes");
+        return nullptr;
+    }
+    const uint64_t rowUsed = uint64_t(desc.width) * info->bytesPerPixel;
+    if (desc.width == 0 || desc.height == 0 || p.bytesPerElement == 0 || rowUsed > uint64_t(p.width) * p.bytesPerElement || rowUsed > p.rowBytes ||
+        desc.height > p.height) {
+        refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " " + info->name + " " + asked + " (" + n(p.width) + " x " + n(p.height) + ", " +
+                        n(p.bytesPerElement) + " bytes an element, rows of " + n(p.rowBytes) + "): the texture's rows must fit the plane's");
+        return nullptr;
+    }
+    // the rows where they lie: RB_MRT_PITCH and TEX_CONST_2's pitch in 64-byte units, the start 64-aligned (fd6_layout.c's
+    // linear base_align), as for a whole surface (wrapSurface); the plane's rows inside the surface's memory
+    if (p.rowBytes % 64 != 0 || p.offset % 64 != 0 || p.offset + uint64_t(p.rowBytes) * desc.height > s.size) {
+        refuse(why, asked + ": rows of " + n(p.rowBytes) + " bytes from offset " + n(p.offset) + " in its " + n(s.size) +
+                        " bytes: the GPU wants a pitch and a start that are multiples of 64 bytes, and the rows inside the surface");
+        return nullptr;
+    }
+    // TEX_CONST_2.PITCHALIGN: the largest k up to log2(cpp) with the pitch a multiple of 64 << k (as wrapSurface)
+    uint32_t pitchAlign = 0;
+    while (pitchAlign < log2u(info->bytesPerPixel) && p.rowBytes % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
+    return adopt(new Texture(std::move(buffer), desc, info, p.rowBytes, p.offset, pitchAlign, surfaceId));
+}
+
 // (redfin ws-hm-ubwc) HM_UBWC_DISPLAY: 0 (default) a UBWC surface is refused; 1 it is drawn compressed
 bool ubwcDisplayOn() {
     const char* e = getenv("HM_UBWC_DISPLAY");   // (read at each compressed surface's wrap: a few a second at most)
