@@ -61,6 +61,7 @@ extern void sweet_cam_init(void);
 extern void sweet_audio_init(void);
 extern void redwood_adsp_init(void);
 extern void sweet_geniuart_init(void);
+extern void sweet_btbridge_init(void);
 extern void sweet_cpufreq_init(void);
 extern void sweet_pmem_init(void);
 extern void flame_wlan_init(void);
@@ -685,6 +686,7 @@ sweet_ufs_init(void)
 	sweet_audio_init();	/* /dev/redwood-audio, /dev/redwood-haptic: bsd/dev/sweet_audio.c */
 	redwood_adsp_init();	/* the audio DSP (adsp=1): bsd/dev/sweet_adsp.c */
 	sweet_geniuart_init();	/* /dev/btuart, the Bluetooth UART (btuart=1): bsd/dev/sweet_geniuart.c */
+	sweet_btbridge_init();	/* /dev/cu.bluetooth etc. <-> btd (btbridge=1): bsd/dev/sweet_btbridge.c */
 	sweet_usb_probe();
 	return 0;
 }
