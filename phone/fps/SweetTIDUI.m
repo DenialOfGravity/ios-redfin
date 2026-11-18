@@ -3,8 +3,8 @@
  * Compiled into SweetFPS.dylib (xnu 0999 inserts it into SpringBoard); runs only in SpringBoard.
  * RE notes: PF/logs/research/touchid-lockui-2026-11-18.md.
  *
- * Switch: /var/local/sweettidui, read once at SpringBoard launch (respring to apply). No file, or neither 'h' nor
- * 'n' in it: nothing is hooked. Letters (independent, both may be set):
+ * Switch: /var/local/sweettidui, read once at SpringBoard launch (respring to apply). No file, or no 'h' in it:
+ * nothing is hooked. Letters:
  *   h   "iPhone X look": the cover sheet's padlock (proud lock) on a Touch ID device. CoverSheet creates it in
  *       -[CSCoverSheetViewController viewDidLoad] when hasPearlSupport || MG(z5G/N9jcMdgPm8UegLwbKg) ||
  *       hasPoseidonSupport, and the passcode pad when -[SBUIPasscodeLockViewBase _supportsProudLock] /
@@ -14,25 +14,15 @@
  *       nowhere else; _supportsProudLock answers YES; setShowProudLock: gets YES. The padlock then follows Touch ID
  *       natively: open when authenticated, jiggle on a failed finger (SBLockScreenManager jiggleLock ->
  *       -[CSCoverSheetViewController jiggleLockIcon]).
- *   n   "iPhone 8 style" call to action in the cover sheet footer: CoverSheet's own
- *       -[CSFixedFooterViewController _updateCallToActionTextAnimated:] (Press home to unlock / Press home to open
- *       after a match / "Try Again" with a shake after a failed finger, updateCallToActionForMesaMatchFailure) runs
- *       as on a home-button device. It returns at once when SBFEffectiveHomeButtonType() == 2 (no home button,
- *       MobileGestalt HomeButtonType, cached by -[BSPlatform homeButtonType]); while it runs, and only then,
- *       -[BSPlatform homeButtonType] answers 1. The same for -[CSFixedFooterView initWithFrame:], which otherwise
- *       creates no container (shake view) for that label. Nothing else in SpringBoard sees a home button.
- *   l   log what was hooked and each hooked call to /var/tmp/sweettidui.log
+ *   l   log what was hooked to /var/tmp/sweettidui.log
+ * (An iPhone 8 style footer variant, 'n', was tried and dropped by the owner 2026-11-18: ws-u-tidui 65bf8ba.)
  */
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <stdio.h>
 #include <string.h>
-#include <pthread.h>
 
-static int tu_footer_depth;	/* > 0 while CoverSheet's footer call-to-action update runs (main thread) */
-static pthread_t tu_main;
 static bool tu_log;
 static uintptr_t tu_vdl_lo, tu_vdl_hi;	/* -[CSCoverSheetViewController viewDidLoad] code range */
 
@@ -48,84 +38,6 @@ tu_note(NSString *what)
 		fprintf(f, "%s SpringBoard[%d] %s\n", [[NSDate date] description].UTF8String, getpid(), what.UTF8String);
 		fclose(f);
 	}
-}
-
-static id
-tu_get(id o, const char *sel)
-{
-	SEL s = sel_registerName(sel);
-	return [o respondsToSelector:s] ? ((id (*)(id, SEL))objc_msgSend)(o, s) : nil;
-}
-
-static bool
-tu_hook_native_footer(void)
-{
-	Class plat = objc_getClass("BSPlatform");
-	Class foot = objc_getClass("CSFixedFooterViewController");
-	SEL shb = sel_registerName("homeButtonType");
-	SEL sup = sel_registerName("_updateCallToActionTextAnimated:");
-	Method mhb = plat != Nil ? class_getInstanceMethod(plat, shb) : NULL;
-	Method mup = foot != Nil ? class_getInstanceMethod(foot, sup) : NULL;
-	if (mhb == NULL || mup == NULL) {
-		tu_note([NSString stringWithFormat:@"n: not hooked (BSPlatform homeButtonType %p, CSFixedFooterViewController "
-			"_updateCallToActionTextAnimated: %p)", mhb, mup]);
-		return false;
-	}
-	__block long (*ohb)(id, SEL) = NULL;
-	ohb = (long (*)(id, SEL))method_setImplementation(mhb, imp_implementationWithBlock(^long(id self_) {
-		long t = ohb(self_, shb);
-		if (tu_footer_depth > 0 && t == 2 && pthread_equal(pthread_self(), tu_main)) {
-			return 1;
-		}
-		return t;
-	}));
-	__block void (*oup)(id, SEL, BOOL) = NULL;
-	oup = (void (*)(id, SEL, BOOL))method_setImplementation(mup, imp_implementationWithBlock(^(id self_, BOOL anim) {
-		bool main = pthread_equal(pthread_self(), tu_main);
-		if (main) {
-			tu_footer_depth++;
-		}
-		oup(self_, sup, anim);
-		if (main) {
-			tu_footer_depth--;
-		}
-		if (tu_log) {
-			id l = tu_get(tu_get(self_, "fixedFooterView"), "callToActionLabel");
-			NSMutableString *chain = [NSMutableString string];
-			for (UIView *v = l; v != nil; v = v.superview) {
-				CGRect r = [v convertRect:v.bounds toView:nil];
-				[chain appendFormat:@" <%s h%d a%.2f %.0f,%.0f %.0fx%.0f>", object_getClassName(v), v.hidden,
-					v.alpha, r.origin.x, r.origin.y, r.size.width, r.size.height];
-			}
-			tu_note([NSString stringWithFormat:@"footer update (animated %d): text '%@' window %p:%@", anim,
-				tu_get(l, "text"), [(UIView *)l window], chain]);
-		}
-	}));
-	/* the label's container: -[CSFixedFooterView initWithFrame:] adds the shake view (and the page control) only
-	 * when the home button type is not 2; without it setCallToActionLabel: leaves the label without a superview */
-	Class fv = objc_getClass("CSFixedFooterView");
-	SEL sinit = sel_registerName("initWithFrame:");
-	Method minit = fv != Nil ? class_getInstanceMethod(fv, sinit) : NULL;
-	if (minit != NULL) {
-		__block id (*oinit)(id, SEL, CGRect) = NULL;
-		oinit = (id (*)(id, SEL, CGRect))method_setImplementation(minit, imp_implementationWithBlock(^id(id self_,
-			CGRect r) {
-			bool main = pthread_equal(pthread_self(), tu_main);
-			if (main) {
-				tu_footer_depth++;
-			}
-			id v = oinit(self_, sinit, r);
-			if (main) {
-				tu_footer_depth--;
-			}
-			tu_note([NSString stringWithFormat:@"n: CSFixedFooterView %p init (shake view %p)", v,
-				tu_get(v, "callToActionShakeView")]);
-			return v;
-		}));
-	}
-	tu_note([NSString stringWithFormat:@"n: CSFixedFooterViewController call to action as on a home-button device "
-		"(CSFixedFooterView initWithFrame: %s)", minit ? "hooked" : "missing"]);
-	return true;
 }
 
 static bool
@@ -204,20 +116,11 @@ tu_init(void)
 	}
 	fclose(f);
 	tu_log = strchr(buf, 'l') != NULL;
-	tu_main = pthread_self();	/* constructors run on SpringBoard's main thread */
 	tu_note([NSString stringWithFormat:@"switch '%.*s'", (int)strcspn(buf, "\n"), buf]);
-	bool want_n = strchr(buf, 'n') != NULL, want_h = strchr(buf, 'h') != NULL;
-	bool ok_n = !want_n || tu_hook_native_footer();
-	bool ok_h = !want_h || tu_hook_proud_lock();
-	if (!ok_n || !ok_h) {
+	if (strchr(buf, 'h') != NULL && !tu_hook_proud_lock()) {
 		/* CoverSheet not realized yet: try again once the main run loop runs */
 		dispatch_async(dispatch_get_main_queue(), ^{
-			if (!ok_n) {
-				tu_hook_native_footer();
-			}
-			if (!ok_h) {
-				tu_hook_proud_lock();
-			}
+			tu_hook_proud_lock();
 		});
 	}
 }

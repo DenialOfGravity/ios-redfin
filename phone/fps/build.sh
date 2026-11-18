@@ -3,7 +3,7 @@
 # ws-n-ctl: SweetHUD.m too (FPS overlay, off unless SweetControl turns it on).
 # ws-z-ui: SweetSB.m rides along (status-bar clock clear of the camera hole; off without /var/local/sweetsb.m|t).
 # ws-n-pin: SweetPIN.m rides along (SIM PIN UI -> wland; off without /var/local/sweetpin.on).
-# ws-u-tidui: SweetTIDUI.m rides along (Touch ID call to action on the lock screen; off without /var/local/sweettidui).
+# ws-u-tidui: SweetTIDUI.m rides along (Touch ID padlock on the lock screen; off without /var/local/sweettidui).
 # Install to a NEW file and rename it over (2026-11-05): files put out/SweetFPS.dylib /var/local/lib/SweetFPS.dylib.new 644;
 #   mv /var/local/lib/SweetFPS.dylib.new /var/local/lib/SweetFPS.dylib; respring. Overwriting the loaded dylib in place keeps
 #   the kernel's cached code signature on the vnode: SpringBoard goes CS-invalid, loses its entitlements and aborts in
