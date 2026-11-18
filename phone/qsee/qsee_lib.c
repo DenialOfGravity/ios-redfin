@@ -759,19 +759,52 @@ int fpc_capture(uint32_t appid, const struct timespec *t0, int ms, int32_t *st4,
  * Returns FPC_HAL_GOOD (*st4 = 0), FPC_HAL_CANCEL, FPC_HAL_TIMEOUT, FPC_HAL_ERR (*st4 = last cmd 4 status, or
  * the TA status of a failed command), or FPC_HAL_FPCERR (*st4 < 0 from cmd 4). *rounds = rounds used.
  */
+/*
+ * IRQ storm guard: gpio112 left high re-fires the (shared) interrupt every ~2.4 ms (patch 1190) and can livelock the
+ * system. kern.sweet_fpc_irq rising by more than FPC_STORM_IRQS within one second = storm.
+ */
+static uint32_t storm_base = 0xffffffffu;
+static struct timespec storm_t;
+static int irq_storm(void)
+{
+	uint32_t v = fpc_sysctl_u32("kern.sweet_fpc_irq");
+	if (v == 0xffffffffu)
+		return 0;
+	if (storm_base == 0xffffffffu || fpc_ms_since(&storm_t) >= 1000) {
+		storm_base = v;
+		clock_gettime(CLOCK_MONOTONIC, &storm_t);
+		return 0;
+	}
+	if (v - storm_base > FPC_STORM_IRQS) {
+		say("IRQ storm: kern.sweet_fpc_irq +%u in %ld ms", v - storm_base, fpc_ms_since(&storm_t));
+		storm_base = v;
+		clock_gettime(CLOCK_MONOTONIC, &storm_t);
+		return 1;
+	}
+	return 0;
+}
+
+static int line_high(void)
+{
+	return fpc_wait_high(1) > 0;	/* returns at once when gpio112 is already high */
+}
+
+/* wait for gpio112 high in slices: 1 high, 0 timeout, -1 error, -2 stop, -3 IRQ storm */
 static int hal_wait(const struct fpc_hal_cb *cb, const struct timespec *t0, long deadline_ms, long cap_ms,
 		    const struct timespec *armed)
 {
 	struct timespec tw;
 	clock_gettime(CLOCK_MONOTONIC, &tw);
 	for (;;) {
+		if (irq_storm())
+			return -3;
 		if (cb && cb->stop && cb->stop(cb->ctx))
-			return -2;
+			return line_high() ? 1 : -2;	/* a pending wake is served (cmd 1 / cmd 4) before stopping */
 		long left = deadline_ms ? deadline_ms - fpc_ms_since(t0) : 0x7fffffff;
 		if (cap_ms > 0 && cap_ms - fpc_ms_since(&tw) < left)
 			left = cap_ms - fpc_ms_since(&tw);
 		if (left <= 0)
-			return 0;
+			return line_high() ? 1 : 0;
 		int sl = cb && cb->slice_ms > 0 ? cb->slice_ms : 250;
 		int hit = fpc_wait_high(left < sl ? (int)left : sl);
 		if (hit)
@@ -791,6 +824,16 @@ static int hal_cmd(const struct fpc_hal_cb *cb, uint32_t appid, uint8_t *d, uint
 	return r;
 }
 
+static int hal_stopped(const struct fpc_hal_cb *cb)
+{
+	return cb && cb->stop && cb->stop(cb->ctx);
+}
+
+/*
+ * HAL rule kept everywhere: after ANY wake (the 20-33 ms early wake after cmd 2 included) the next SMC is issued at
+ * once (cmd 1 after the arm wait, cmd 4 after the capture wait); that drops gpio112. Callbacks (events) run only
+ * after it. A stop / timeout / storm ends with cmd 5, and only once the line has been served.
+ */
 int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *cb, int32_t *st4, int *rounds)
 {
 	uint8_t d[FPC_SENSOR_LEN] = { 0 };
@@ -813,22 +856,31 @@ int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *c
 		clock_gettime(CLOCK_MONOTONIC, &ta);
 		int hit = hal_wait(cb, &t0, deadline_ms, 0, &ta);
 		long wake = fpc_ms_since(&ta);
+		if (hit == -3) {
+			if (line_high())
+				hal_cmd(cb, appid, d, 1, &st);
+			hal_cmd(cb, appid, d, 5, &st5);
+			return FPC_HAL_STORM;
+		}
 		if (hit <= 0) {
 			hal_cmd(cb, appid, d, 5, &st5);
-			if (hit == -1) {
-				*st4 = 0;
+			if (hit == -1)
 				return FPC_HAL_ERR;
-			}
 			return hit == -2 ? FPC_HAL_CANCEL : FPC_HAL_TIMEOUT;
 		}
+		r = hal_cmd(cb, appid, d, 1, &st);	/* at once after any wake: drops the line; HAL ignores the status */
 		if (cb && cb->wake)
-			cb->wake(cb->ctx, wake);
-		r = hal_cmd(cb, appid, d, 1, &st);	/* the HAL ignores this status */
+			cb->wake(cb->ctx, wake);	/* only now: decide early wake vs finger */
 		if (r && r != 5) {
 			*st4 = st;
+			hal_cmd(cb, appid, d, 5, &st5);
 			return FPC_HAL_ERR;
 		}
-		int tries, why = 0;	/* 0 cmd 4 result, 1 wait timeout, 2 cancel, 3 error */
+		if (hal_stopped(cb)) {
+			hal_cmd(cb, appid, d, 5, &st5);
+			return FPC_HAL_CANCEL;
+		}
+		int tries, why = 0;	/* 0 cmd 4 result, 1 wait timeout, 2 cancel, 3 error, 4 storm */
 		for (tries = 1; tries <= 4; tries++) {
 			r = hal_cmd(cb, appid, d, 3, &st);
 			if (r && r != 5) {
@@ -837,19 +889,23 @@ int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *c
 			}
 			hit = hal_wait(cb, &t0, deadline_ms, cb ? cb->cap3_ms : 0, NULL);
 			if (hit <= 0) {
-				why = hit == -2 ? 2 : hit == -1 ? 3 : 1;
+				why = hit == -3 ? 4 : hit == -2 ? 2 : hit == -1 ? 3 : 1;
 				break;
 			}
-			hal_cmd(cb, appid, d, 4, st4);
-			if (*st4 != 3)
+			hal_cmd(cb, appid, d, 4, st4);	/* at once after the wake */
+			if (*st4 != 3 || hal_stopped(cb))
 				break;
 		}
 		say("capture %d: wake %ld ms, cmd 4 %d after %d tr%s", round, wake, why ? 0 : *st4, tries > 4 ? 4 : tries,
-		    why == 1 ? ", no irq after cmd 3" : why == 2 ? ", cancelled" : why == 3 ? ", ERROR" : "");
+		    why == 1 ? ", no irq after cmd 3" : why == 2 ? ", cancelled" : why == 3 ? ", ERROR" : why == 4 ? ", IRQ STORM" : "");
 		if (!why && *st4 == 0)
 			return FPC_HAL_GOOD;
+		if (why == 4 && line_high())
+			hal_cmd(cb, appid, d, 4, &st5);
 		hal_cmd(cb, appid, d, 5, &st5);	/* capture_image's error path, then re-arm */
-		if (why == 2)
+		if (why == 4)
+			return FPC_HAL_STORM;
+		if (why == 2 || hal_stopped(cb))
 			return FPC_HAL_CANCEL;
 		if (why == 3) {
 			*st4 = st;

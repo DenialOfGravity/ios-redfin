@@ -77,7 +77,8 @@ const char *enrol_code(int32_t s);
 
 /* HAL capture loop, cancellable (qsee_lib.c fpc_capture_hal) */
 #define FPC_EARLY_WAKE_MS	60	/* a wake within this many ms of arming is the normal early wake, not a finger */
-enum { FPC_HAL_GOOD, FPC_HAL_CANCEL, FPC_HAL_TIMEOUT, FPC_HAL_ERR, FPC_HAL_FPCERR };
+#define FPC_STORM_IRQS		200	/* kern.sweet_fpc_irq rise within 1 s that counts as an IRQ storm */
+enum { FPC_HAL_GOOD, FPC_HAL_CANCEL, FPC_HAL_TIMEOUT, FPC_HAL_ERR, FPC_HAL_FPCERR, FPC_HAL_STORM };
 struct fpc_hal_cb {
 	void *ctx;
 	int slice_ms;					/* wait slice (default 250) */

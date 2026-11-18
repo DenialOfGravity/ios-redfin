@@ -392,6 +392,17 @@ static int capture_once(uint32_t gen, int32_t *st4, long deadline)
 	case FPC_HAL_TIMEOUT:
 		finger_set(0);
 		return CAP_TIMEOUT;
+	case FPC_HAL_STORM: {
+		/* gpio112 interrupts > FPC_STORM_IRQS/s: the sensor was released (cmd 5); back off before any re-arm.
+		 * The capture thread sleeps here, so no op (detect from 69 included) can re-arm meanwhile. */
+		static int backoff_s = 0;
+		backoff_s = backoff_s ? (backoff_s * 2 > 60 ? 60 : backoff_s * 2) : 5;
+		lg("IRQ storm: detection cancelled (cmd 5), backing off %d s", backoff_s);
+		ev_send(FPCD_EV_ERROR, FPCD_E_IO, 0, 0, 0, 0, 0, 0);
+		for (int i = 0; i < backoff_s * 4 && !g_stop; i++)
+			usleep(250000);
+		return CAP_ERR;
+	}
 	default:
 		lg("capture: TZ/TA error (status %d) in round %d", *st4, rounds);
 		return CAP_ERR;
