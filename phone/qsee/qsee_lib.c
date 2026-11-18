@@ -483,6 +483,8 @@ void put_u64(uint8_t *p, uint64_t v) { put_u32(p, (uint32_t)v), put_u32(p + 4, (
 
 
 /* one command in a 64-bit-layout data buffer; *data (len bytes) is sent and read back; 0 = TZ SUCCESS (TA status in data+8) */
+int (*fpc_lsnr_serve)(uint64_t x[8], uint32_t appid, const char *what);
+
 int fpc_send64(uint32_t appid, uint8_t *data, size_t len, const char *what)
 {
 	struct pbuf sb, bulk, arg;
@@ -509,11 +511,18 @@ int fpc_send64(uint32_t appid, uint8_t *data, size_t len, const char *what)
 	qsmc(x);
 	say("%s: send raw x0 %#llx x1 %#llx x2 %#llx x3 %#llx", what, (unsigned long long)x[0], (unsigned long long)x[1],
 	    (unsigned long long)x[2], (unsigned long long)x[3]);
-	unsigned before = n_seen;
-	abort_listeners(x, appid, what);
-	if (n_seen != before) {
-		rc = 4;
-		goto out;
+	if (fpc_lsnr_serve) {	/* ws-fpcd-b: listeners served by the caller's hook */
+		if (fpc_lsnr_serve(x, appid, what)) {
+			rc = 4;
+			goto out;
+		}
+	} else {
+		unsigned before = n_seen;
+		abort_listeners(x, appid, what);
+		if (n_seen != before) {
+			rc = 4;
+			goto out;
+		}
 	}
 	if ((int64_t)x[0] || (uint32_t)x[1] != QSEOS_RESULT_SUCCESS) {
 		say("%s: TZ error (x0 %lld result %#x)", what, (long long)x[0], (unsigned)x[1]);

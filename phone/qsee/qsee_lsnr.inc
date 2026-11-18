@@ -466,10 +466,301 @@ static uint32_t fs_ret(uint8_t *b, uint32_t cmd, int32_t ret)
 	return 8;
 }
 
+#ifdef QSEE_LSNR_LIB
+/* ---- ws-fpcd-b: in-memory directory for the FPC template db (qsee_gk.h struct qsee_vfs) ---- */
+static struct qsee_vfs *vfs_active;
+#define VFS_FD_BASE	0x7f00
+#define VFS_NFD		16
+static struct { int used, file, wr; uint32_t pos; } vfd[VFS_NFD];
+
+/* name relative to the prefix, or NULL when p is not under it; "" for the directory itself */
+static const char *vfs_rel(const char *p)
+{
+	if (!vfs_active)
+		return NULL;
+	size_t n = strlen(vfs_active->prefix);
+	if (strncmp(p, vfs_active->prefix, n))
+		return NULL;
+	if (p[n] == 0)
+		return "";
+	if (p[n] != '/' || strchr(p + n + 1, '/') || strstr(p, ".."))
+		return NULL;
+	return p + n + 1;
+}
+
+static int vfs_find(const char *rel)
+{
+	for (int i = 0; i < QSEE_VFS_FILES; i++)
+		if (vfs_active->f[i].name[0] && !strcmp(vfs_active->f[i].name, rel))
+			return i;
+	return -1;
+}
+
+static int vfs_create(const char *rel)
+{
+	if (!rel[0] || strlen(rel) >= QSEE_VFS_NAME)
+		return -1;
+	for (int i = 0; i < QSEE_VFS_FILES; i++)
+		if (!vfs_active->f[i].name[0]) {
+			struct qsee_vfile *f = &vfs_active->f[i];
+			snprintf(f->name, sizeof(f->name), "%s", rel);
+			f->len = 0;
+			return i;
+		}
+	return -1;
+}
+
+static int vfs_fd(int fd)
+{
+	int i = fd - VFS_FD_BASE;
+	return i >= 0 && i < VFS_NFD && vfd[i].used ? i : -1;
+}
+
+static void vfs_unlink_rel(const char *rel, int i)
+{
+	struct qsee_vfile *f = &vfs_active->f[i];
+	for (int k = 0; k < VFS_NFD; k++)
+		if (vfd[k].used && vfd[k].file == i)
+			vfd[k].used = 0;
+	if (f->data)
+		memset(f->data, 0, f->cap), free(f->data);
+	memset(f, 0, sizeof(*f));
+	vfs_active->unlinks++;
+	lg("VFS unlink \"%s\"", rel);
+}
+
+static uint32_t vfs_stat(uint8_t *b, uint32_t cmd, int dir, uint32_t size)
+{
+	struct stat st;
+	memset(&st, 0, sizeof(st));
+	st.st_mode = dir ? (S_IFDIR | 0700) : (S_IFREG | 0600);
+	st.st_nlink = 1;
+	st.st_size = size;
+	st.st_blksize = 4096;
+	st.st_blocks = (size + 511) / 512;
+	return fs_stat_resp(b, cmd, 0, &st);
+}
+
+/* 1 = handled (answer in b, *n its length), 0 = not ours */
+static int vfs_serve(uint8_t *b, uint32_t sb_len, uint32_t *n)
+{
+	uint32_t cmd = g32(b);
+	char p[0x101];
+	const char *rel;
+	int fi, k;
+	switch (cmd) {
+	case 0x203: {	/* openat {cmd, dirfd, path @+8, flags @+0x108} */
+		uint32_t fl = g32(b + 0x108);
+		memcpy(p, b + 8, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		fi = rel[0] ? vfs_find(rel) : -1;
+		if (fi < 0 && rel[0] && (fl & 0x40))
+			fi = vfs_create(rel);
+		for (k = 0; k < VFS_NFD && vfd[k].used; k++)
+			;
+		if (fi < 0 || k == VFS_NFD || ((fl & 0x80) && (fl & 0x40) && vfs_active->f[fi].len)) {
+			lg("VFS open \"%s\" flags %#x -> -1 (%s)", p, fl, fi < 0 ? "no such file" : "no fd / exists");
+			*n = fs_ret(b, cmd, -1);
+			return 1;
+		}
+		if (fl & 0x200)
+			vfs_active->f[fi].len = 0;
+		vfd[k].used = 1, vfd[k].file = fi, vfd[k].wr = (fl & 3) != 0;
+		vfd[k].pos = (fl & 0x400) ? vfs_active->f[fi].len : 0;
+		vfs_active->opens++;
+		lg("VFS open \"%s\" flags %#x -> fd %d (len %u)", p, fl, VFS_FD_BASE + k, vfs_active->f[fi].len);
+		*n = fs_ret(b, cmd, VFS_FD_BASE + k);
+		return 1;
+	}
+	case 0x206: {	/* creat {cmd, path @+4, mode @+0x104} */
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		fi = rel[0] ? vfs_find(rel) : -1;
+		if (fi < 0 && rel[0])
+			fi = vfs_create(rel);
+		for (k = 0; k < VFS_NFD && vfd[k].used; k++)
+			;
+		if (fi < 0 || k == VFS_NFD) {
+			*n = fs_ret(b, cmd, -1);
+			return 1;
+		}
+		vfs_active->f[fi].len = 0;
+		vfd[k].used = 1, vfd[k].file = fi, vfd[k].wr = 1, vfd[k].pos = 0;
+		vfs_active->opens++;
+		lg("VFS creat \"%s\" -> fd %d", p, VFS_FD_BASE + k);
+		*n = fs_ret(b, cmd, VFS_FD_BASE + k);
+		return 1;
+	}
+	case 0x207: {	/* read {cmd, fd, count} -> {cmd, data[0x4e20] @+4, ret @+0x4e24} */
+		if ((k = vfs_fd((int)g32(b + 4))) < 0)
+			return 0;
+		uint32_t cnt = g32(b + 8);
+		struct qsee_vfile *f = &vfs_active->f[vfd[k].file];
+		int32_t r = -1;
+		if (cnt <= 0x4e20 && 0x4e28 <= sb_len) {
+			uint32_t avail = vfd[k].pos < f->len ? f->len - vfd[k].pos : 0;
+			r = (int32_t)(cnt < avail ? cnt : avail);
+			memset(b + 4, 0, 0x4e20);
+			if (r > 0)
+				memcpy(b + 4, f->data + vfd[k].pos, (size_t)r);
+			vfd[k].pos += (uint32_t)r;
+			vfs_active->reads++, vfs_active->bytes_read += (uint32_t)r;
+		}
+		put_u32(b, cmd), put_u32(b + 0x4e24, (uint32_t)r);
+		*n = 0x4e28;
+		return 1;
+	}
+	case 0x208: {	/* write {cmd, fd, data[0x4e20] @+8, count @+0x4e28} -> {cmd, ret} */
+		if ((k = vfs_fd((int)g32(b + 4))) < 0)
+			return 0;
+		uint32_t cnt = sb_len >= 0x4e2c ? g32(b + 0x4e28) : 0xffffffffu;
+		struct qsee_vfile *f = &vfs_active->f[vfd[k].file];
+		int32_t r = -1;
+		uint64_t end = (uint64_t)vfd[k].pos + cnt;
+		if (vfd[k].wr && cnt <= 0x4e20 && end <= vfs_active->max_size) {
+			if (end > f->cap) {
+				uint32_t nc = f->cap ? f->cap : 0x10000;
+				while (nc < end)
+					nc *= 2;
+				if (nc > vfs_active->max_size)
+					nc = vfs_active->max_size;
+				uint8_t *nd = calloc(1, nc);
+				if (nd) {
+					if (f->data)
+						memcpy(nd, f->data, f->len), memset(f->data, 0, f->cap), free(f->data);
+					f->data = nd, f->cap = nc;
+				}
+			}
+			if (end <= f->cap) {
+				if (vfd[k].pos > f->len)
+					memset(f->data + f->len, 0, vfd[k].pos - f->len);
+				memcpy(f->data + vfd[k].pos, b + 8, cnt);
+				vfd[k].pos = (uint32_t)end;
+				if (end > f->len)
+					f->len = (uint32_t)end;
+				r = (int32_t)cnt;
+				vfs_active->writes++, vfs_active->bytes_written += cnt;
+			}
+		}
+		if (r < 0)
+			lg("VFS write fd %d count %u at %u -> -1 (%s)", VFS_FD_BASE + k, cnt, vfd[k].pos,
+			   vfd[k].wr ? "too large" : "read-only fd");
+		*n = fs_ret(b, cmd, r);
+		return 1;
+	}
+	case 0x209:	/* close {cmd, fd} */
+		if ((k = vfs_fd((int)g32(b + 4))) < 0)
+			return 0;
+		lg("VFS close fd %d (\"%s\" len %u)", VFS_FD_BASE + k, vfs_active->f[vfd[k].file].name,
+		   vfs_active->f[vfd[k].file].len);
+		vfd[k].used = 0;
+		*n = fs_ret(b, cmd, 0);
+		return 1;
+	case 0x20a: {	/* lseek {cmd, fd, s32 off, whence} */
+		if ((k = vfs_fd((int)g32(b + 4))) < 0)
+			return 0;
+		int32_t off = (int32_t)g32(b + 8);
+		int wh = (int)g32(b + 0xc);
+		int64_t base = wh == 0 ? 0 : wh == 1 ? vfd[k].pos : wh == 2 ? vfs_active->f[vfd[k].file].len : -1;
+		int64_t np = base < 0 ? -1 : base + off;
+		if (np >= 0 && np <= vfs_active->max_size)
+			vfd[k].pos = (uint32_t)np;
+		else
+			np = -1;
+		*n = fs_ret(b, cmd, (int32_t)np);
+		return 1;
+	}
+	case 0x20e:	/* fstat {cmd, fd} */
+		if ((k = vfs_fd((int)g32(b + 4))) < 0)
+			return 0;
+		*n = vfs_stat(b, cmd, 0, vfs_active->f[vfd[k].file].len);
+		return 1;
+	case 0x216:	/* fsync {cmd, fd} */
+		if ((k = vfs_fd((int)g32(b + 4))) < 0)
+			return 0;
+		*n = fs_ret(b, cmd, 0);
+		return 1;
+	case 0x20f:	/* lstat {cmd, path @+4} */
+	case 0x219:	/* stat (libdrmfs 0x219 = opendir in qsee_lsnr's notes): only answered for files */
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		if (cmd == 0x219) {
+			lg("VFS cmd 0x219 \"%s\" -> -1 (not served)", p);
+			memset(b, 0, 0x10);
+			put_u32(b, cmd), put_u32(b + 0xc, 0xffffffffu);
+			*n = 0x10;
+			return 1;
+		}
+		fi = rel[0] ? vfs_find(rel) : -1;
+		if (!rel[0])
+			*n = vfs_stat(b, cmd, 1, 0);
+		else if (fi < 0)
+			*n = fs_stat_resp(b, cmd, -1, NULL);
+		else
+			*n = vfs_stat(b, cmd, 0, vfs_active->f[fi].len);
+		lg("VFS lstat \"%s\" -> %s", p, !rel[0] ? "dir" : fi < 0 ? "-1" : "file");
+		return 1;
+	case 0x202:	/* mkdir {cmd, path @+4, ...}: the directory exists */
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		lg("VFS mkdir \"%s\" -> 0", p);
+		*n = fs_ret(b, cmd, rel[0] ? -1 : 0);
+		return 1;
+	case 0x20c:	/* unlink {cmd, path @+4} */
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		fi = rel[0] ? vfs_find(rel) : -1;
+		if (fi >= 0)
+			vfs_unlink_rel(rel, fi);
+		*n = fs_ret(b, cmd, fi >= 0 ? 0 : -1);
+		return 1;
+	case 0x204:	/* unlinkat {cmd, dirfd, path @+8, flags @+0x108} */
+		memcpy(p, b + 8, 0x100), p[0x100] = 0;
+		if (!(rel = vfs_rel(p)))
+			return 0;
+		fi = rel[0] ? vfs_find(rel) : -1;
+		if (fi >= 0)
+			vfs_unlink_rel(rel, fi);
+		*n = fs_ret(b, cmd, fi >= 0 ? 0 : -1);
+		return 1;
+	case 0x20b: {	/* link {cmd, old @+4, new @+0x104} (libdrmfs link()) */
+		char q[0x101];
+		memcpy(p, b + 4, 0x100), p[0x100] = 0;
+		memcpy(q, b + 0x104, 0x100), q[0x100] = 0;
+		const char *r2 = vfs_rel(q);
+		if (!(rel = vfs_rel(p)) && !r2)
+			return 0;
+		int ok = rel && r2 && rel[0] && r2[0] && (fi = vfs_find(rel)) >= 0 && vfs_find(r2) < 0;
+		if (ok) {
+			struct qsee_vfile *f = &vfs_active->f[fi];
+			ok = qsee_vfs_put(vfs_active, r2, f->data, f->len) == 0;
+		}
+		lg("VFS link \"%s\" -> \"%s\": %s", p, q, ok ? "0" : "-1");
+		*n = fs_ret(b, cmd, ok ? 0 : -1);
+		return 1;
+	}
+	default:
+		return 0;
+	}
+}
+#endif /* QSEE_LSNR_LIB */
+
 static uint32_t serve_fs(uint8_t *b, uint32_t sb_len)
 {
 	uint32_t cmd = g32(b);
 	char tzp[0x101], path[512];
+#ifdef QSEE_LSNR_LIB
+	uint32_t vn = 0;
+	if (vfs_active && vfs_serve(b, sb_len, &vn)) {
+		note(10, cmd, 0x7f5f, 0);
+		return vn;
+	}
+#endif
 	switch (cmd) {
 	case 0x203: {	/* open {cmd, dirfd, path[0x100] @+8, flags @+0x108} */
 		uint32_t flags = g32(b + 0x108);

@@ -25,7 +25,9 @@
  *   match : good image -> g11/3 identify; status 0 -> match_deliver() (the only producer of a match); else NOMATCH and
  *           the next capture, until a match, Cancel or the op timeout
  *   detect: captures only, for FINGER_DOWN / FINGER_UP events
- * Templates live in TA memory only (no store_template_db); the Apple catacomb commands answer UNSUPPORTED.
+ * Templates live in TA memory; with xnu 1206 (kern.sweet_mesa_catacomb=1) they persist the iOS way: 61 stores the TA's
+ * encrypted template db (FPC db_command (2,12) through an in-memory file listener, qsee_fpc_db_cmd) into a "SWCT"
+ * blob that biometrickitd writes into its catacomb file, 64 loads it back ((2,11)). sweetfpcd writes no file.
  *
  * SAFETY: a match is reported only by match_deliver(), only for a TA identify status 0 with a finger id the TA lists,
  * and only while /var/local/fpc/allow-match exists (absent by default) or kern.sweet_mesa_match is 2 (owner's
@@ -179,6 +181,7 @@ static const char *fpcd_cmd_name(uint32_t c)
 	case 83: return "IsSensorReady";	case 87: return "SystemSleepStateChanged";
 	case FPCD_CMD_STATUS: return "fpcd:Status";	case FPCD_CMD_WIPE_ALL: return "fpcd:WipeAll";
 	case FPCD_CMD_PING: return "fpcd:Ping";
+	case FPCD_CMD_CAT_PUT: return "fpcd:CatPut";	case FPCD_CMD_CAT_GET: return "fpcd:CatGet";
 	case 25: case 26: case 29: case 32: case 33: case 37: return "Calibration*";
 	default: return "?";
 	}
@@ -265,6 +268,8 @@ static void ev_send(unsigned code, int32_t status, uint32_t fid, int32_t score, 
 }
 
 /* ---------------------------------------------------------------- TA helpers (caller holds ta_mx) */
+static void dbid_refresh(void);	/* caller holds ta_mx */
+
 static int ta_bio(uint32_t cmd, uint8_t *d, int32_t *st)
 {
 	int r = fpc_bio(appid, d, cmd, st);
@@ -627,6 +632,7 @@ static void run_enrol(uint32_t gen)
 		r = ta_bio(2, d, &st2);
 		fid = rd_u32(d + 0xc);
 		ids_refresh();
+		dbid_refresh();	/* ws-fpcd-b: the db id changes with the db */
 		pthread_mutex_unlock(&ta_mx);
 		if (r || st2) {
 			/* no hw-auth chain yet (fpcd_enrol_authorize): end_enrol refuses with -1 = NOT AUTHORIZED. Any id
@@ -703,7 +709,11 @@ static void run_match(uint32_t gen)
 			int32_t ust = 0;
 			pthread_mutex_lock(&ta_mx);
 			int ur = ta_bio(4, u, &ust);
+			if (!ur && !ust)
+				dbid_refresh();
 			pthread_mutex_unlock(&ta_mx);
+			if (!ur && !ust)	/* ws-fpcd-b: the template changed: the kernel marks the catacomb dirty */
+				ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
 			pthread_mutex_lock(&st_mx);
 			last_up = S.up_seq;
 			pthread_mutex_unlock(&st_mx);
@@ -866,6 +876,7 @@ static int wipe_all(const char *why)
 	pthread_mutex_lock(&ta_mx);
 	int r = fpc_cleanup_all(appid, "wipe");
 	ids_refresh();
+	dbid_refresh();
 	pthread_mutex_unlock(&ta_mx);
 	lg("wipe all (%s): %s", why, r ? "FAILED, ids left" : "OK, no finger left");
 	ev_send(FPCD_EV_TEMPLATES, r ? FPCD_E_IO : 0, 0, 0, 0, 0, 0, 1);
@@ -926,6 +937,7 @@ static void job_run(const struct job *j)
 		int listed = fid_listed(fid);
 		r = listed ? fpc_delete(appid, fid) : 0;
 		ids_refresh();
+		dbid_refresh();
 		int still = fid_listed(fid);
 		pthread_mutex_unlock(&ta_mx);
 		lg("remove %#x: %s, delete rc %d, %s", fid, listed ? "listed" : "NOT listed", r, still ? "STILL LISTED" : "gone");
@@ -1231,6 +1243,11 @@ static int h_nocatacomb(const struct smb_req *q, struct smb_reply *p)
 	 * an empty db (-8 FPC_ERROR_NOENTITY / -6 FPC_ERROR_IO alternating). Templates live in TA memory for the life
 	 * of the TA load (empty db loaded at TA start), so NoCatacomb is only acknowledged when the TA holds any id.
 	 */
+	if (q->len >= 4 && rd_u32(q->data) == 0xffffffffu) {
+		/* ws-fpcd-b (kernel catacomb mode passes the user): the master component holds no templates here */
+		lg("NoCatacomb: master component: acknowledged, TA untouched");
+		return FPCD_OK;
+	}
 	pthread_mutex_lock(&st_mx);
 	uint32_t n = S.ids_valid ? S.nids : 0;
 	pthread_mutex_unlock(&st_mx);
@@ -1275,6 +1292,255 @@ static int h_ping(const struct smb_req *q, struct smb_reply *p)
 	return FPCD_OK;
 }
 
+/* ---------------------------------------------------------------- catacomb (xnu 1206) */
+#define CAT_DIR		"/data/vendor_de/0/fpdata"	/* the stock HAL's path; served from memory, never a file */
+#define CAT_DB		"user.db"
+static struct qsee_vfs cat_vfs;		/* the TA's fpdata directory, kept in memory between store / load */
+static int cat_vfs_ready;
+static uint8_t *cat_out;		/* blob staged by 61 for the kernel's CAT_GET pulls */
+static uint32_t cat_out_len;
+static uint8_t *cat_in;			/* blob being pushed by CAT_PUT for 64 */
+static uint32_t cat_in_total, cat_in_have;
+
+static uint32_t crc32_le(const uint8_t *p, size_t n)
+{
+	uint32_t c = 0xffffffffu;
+	while (n--) {
+		c ^= *p++;
+		for (int k = 0; k < 8; k++)
+			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
+	}
+	return ~c;
+}
+
+static void cat_free(uint8_t **b, uint32_t len)
+{
+	if (*b)
+		memset(*b, 0, len), free(*b);
+	*b = NULL;
+}
+
+static void cat_vfs_setup(void)
+{
+	if (!cat_vfs_ready) {
+		qsee_vfs_init(&cat_vfs, CAT_DIR, FPCD_CAT_MAX - 4096);
+		cat_vfs_ready = 1;
+	}
+}
+
+/* wait (<= 3 s) until the TA worker has run every queued job (a queued NoCatacomb must not run after a load) */
+static void jobs_drain(void)
+{
+	for (int i = 0; i < 300; i++) {
+		pthread_mutex_lock(&st_mx);
+		int empty = jq_head == jq_tail;
+		pthread_mutex_unlock(&st_mx);
+		if (empty)
+			break;
+		usleep(10000);
+	}
+	pthread_mutex_lock(&ta_mx);	/* the job taken last has finished when the TA mutex is free */
+	pthread_mutex_unlock(&ta_mx);
+}
+
+static int h_cat_prepare(const struct smb_req *q, struct smb_reply *p)
+{
+	uint32_t user = q->len >= 4 ? rd_u32(q->data) : 0;
+	int32_t st = 0;
+	long t0 = now_ms();
+	if (!appid)
+		return FPCD_E_NOTREADY;
+	cat_vfs_setup();
+	cat_free(&cat_out, cat_out_len);
+	cat_out_len = 0;
+	pthread_mutex_lock(&ta_mx);
+	int r = qsee_fpc_db_cmd(appid, QSEE_FPC_DB_STORE, CAT_DIR "/" CAT_DB ".bak", &cat_vfs, &st);
+	if (!r && !st && qsee_vfs_get(&cat_vfs, CAT_DB ".bak"))
+		qsee_vfs_rename(&cat_vfs, CAT_DB ".bak", CAT_DB);	/* the HAL renames <db>.bak to <db> */
+	ids_refresh();
+	dbid_refresh();
+	pthread_mutex_unlock(&ta_mx);
+	if (r || st) {
+		lg("catacomb: store for user %u FAILED (rc %d TA status %d)", user, r, st);
+		put_u32(p->data, (uint32_t)st), p->len = 4;
+		return FPCD_E_IO;
+	}
+	struct swct_hdr h;
+	memset(&h, 0, sizeof(h));
+	h.magic = SWCT_MAGIC, h.version = SWCT_VERSION, h.hdr_size = sizeof(h), h.user = user;
+	snprintf(h.ta, sizeof(h.ta), "%s", ta_name);
+	pthread_mutex_lock(&st_mx);
+	h.gid = S.gid, h.dbid = S.dbid_valid ? S.dbid : 0, h.nfids = S.ids_valid ? S.nids : 0;
+	memcpy(h.fids, S.ids, sizeof(h.fids));
+	pthread_mutex_unlock(&st_mx);
+	uint64_t total = sizeof(h);
+	for (int i = 0; i < QSEE_VFS_FILES; i++)
+		if (cat_vfs.f[i].name[0]) {
+			h.nfiles++;
+			total += 8 + strlen(cat_vfs.f[i].name) + cat_vfs.f[i].len;
+		}
+	if (!qsee_vfs_get(&cat_vfs, CAT_DB) || total > FPCD_CAT_MAX) {
+		lg("catacomb: store gave %s (%llu bytes): refused", qsee_vfs_get(&cat_vfs, CAT_DB) ? "too much" : "no " CAT_DB,
+		   (unsigned long long)total);
+		return FPCD_E_IO;
+	}
+	uint8_t *b = calloc(1, (size_t)total);
+	if (!b)
+		return FPCD_E_IO;
+	size_t o = sizeof(h);
+	for (int i = 0; i < QSEE_VFS_FILES; i++) {
+		struct qsee_vfile *f = &cat_vfs.f[i];
+		if (!f->name[0])
+			continue;
+		uint32_t nl = (uint32_t)strlen(f->name);
+		put_u32(b + o, nl), put_u32(b + o + 4, f->len);
+		memcpy(b + o + 8, f->name, nl);
+		if (f->len)
+			memcpy(b + o + 8 + nl, f->data, f->len);
+		o += 8 + nl + f->len;
+	}
+	h.total = (uint32_t)total;
+	memcpy(b, &h, sizeof(h));
+	h.crc = crc32_le(b + 16, (size_t)total - 16);
+	memcpy(b, &h, sizeof(h));
+	cat_out = b, cat_out_len = (uint32_t)total;
+	char fl[64] = "";
+	for (uint32_t i = 0; i < h.nfids && i < 5; i++)
+		snprintf(fl + strlen(fl), sizeof(fl) - strlen(fl), " %#x", h.fids[i]);
+	lg("catacomb: stored for user %u: %u file(s), db %u bytes, blob %u bytes, crc %08x, db id %#llx, fids:%s (%ld ms)",
+	   user, h.nfiles, qsee_vfs_get(&cat_vfs, CAT_DB)->len, cat_out_len, h.crc, (unsigned long long)h.dbid,
+	   h.nfids ? fl : " none", now_ms() - t0);
+	return rep_u32(p, cat_out_len);
+}
+
+static int h_cat_get(const struct smb_req *q, struct smb_reply *p)
+{
+	if (q->len < 8 || !cat_out)
+		return FPCD_E_INVAL;
+	uint32_t off = rd_u32(q->data), max = rd_u32(q->data + 4);
+	if (off >= cat_out_len)
+		return FPCD_E_INVAL;
+	uint32_t n = cat_out_len - off;
+	if (n > max)
+		n = max;
+	if (n > SMB_SMALL_MAX - SMB_REQ_HDR)
+		n = SMB_SMALL_MAX - SMB_REQ_HDR;
+	memcpy(p->data, cat_out + off, n);
+	p->len = n;
+	return FPCD_OK;
+}
+
+static int h_cat_confirm(const struct smb_req *q, struct smb_reply *p)
+{
+	lg("catacomb: confirmed (biometrickitd wrote %u bytes into its catacomb file)", cat_out_len);
+	cat_free(&cat_out, cat_out_len);
+	cat_out_len = 0;
+	return FPCD_OK;
+}
+
+static int h_cat_put(const struct smb_req *q, struct smb_reply *p)
+{
+	if (q->len < 8)
+		return FPCD_E_INVAL;
+	uint32_t total = rd_u32(q->data), off = rd_u32(q->data + 4), n = q->len - 8;
+	if (!total || total > FPCD_CAT_MAX || off > total || n > total - off)
+		return FPCD_E_INVAL;
+	if (off == 0) {
+		cat_free(&cat_in, cat_in_total);
+		cat_in = calloc(1, total);
+		if (!cat_in)
+			return FPCD_E_IO;
+		cat_in_total = total, cat_in_have = 0;
+	}
+	if (!cat_in || total != cat_in_total || off != cat_in_have)
+		return FPCD_E_INVAL;
+	memcpy(cat_in + off, q->data + 8, n);
+	cat_in_have += n;
+	return FPCD_OK;
+}
+
+static int h_cat_load(const struct smb_req *q, struct smb_reply *p)
+{
+	long t0 = now_ms();
+	if (q->len < 12 || rd_u32(q->data) != FPCD_CAT_LOAD_MAGIC) {
+		lg("catacomb: LoadCatacomb without the kernel's staged form (len %u): unsupported", q->len);
+		return FPCD_E_UNSUPPORTED;
+	}
+	uint32_t total = rd_u32(q->data + 4), user = rd_u32(q->data + 8);
+	if (!appid)
+		return FPCD_E_NOTREADY;
+	if (!cat_in || cat_in_total != total || cat_in_have != total || total < sizeof(struct swct_hdr)) {
+		lg("catacomb: load: staged %u of %u bytes (want %u): refused", cat_in_have, cat_in_total, total);
+		return FPCD_E_INVAL;
+	}
+	struct swct_hdr h;
+	memcpy(&h, cat_in, sizeof(h));
+	int bad = h.magic != SWCT_MAGIC ? 1 : h.version != SWCT_VERSION ? 2 : h.hdr_size != sizeof(h) ? 3 :
+		  h.total != total ? 4 : crc32_le(cat_in + 16, total - 16) != h.crc ? 5 : h.nfids > 5 ? 6 :
+		  h.nfiles == 0 || h.nfiles > QSEE_VFS_FILES ? 7 : 0;
+	if (bad) {
+		lg("catacomb: load: blob of %u bytes is not a valid SWCT v1 image (check %d): refused, TA untouched", total, bad);
+		cat_free(&cat_in, cat_in_total);
+		return FPCD_E_INVAL;
+	}
+	if (h.user != user)
+		lg("catacomb: load: blob user %u, kernel user %u (loading anyway: one user)", h.user, user);
+	cat_vfs_setup();
+	qsee_vfs_clear(&cat_vfs);
+	size_t o = sizeof(h);
+	for (uint32_t i = 0; i < h.nfiles; i++) {
+		char nm[QSEE_VFS_NAME];
+		if (o + 8 > total)
+			bad = 8;
+		uint32_t nl = bad ? 0 : rd_u32(cat_in + o), dl = bad ? 0 : rd_u32(cat_in + o + 4);
+		if (!bad && (nl == 0 || nl >= sizeof(nm) || (uint64_t)o + 8 + nl + dl > total))
+			bad = 9;
+		if (bad)
+			break;
+		memcpy(nm, cat_in + o + 8, nl), nm[nl] = 0;
+		if (qsee_vfs_put(&cat_vfs, nm, cat_in + o + 8 + nl, dl))
+			bad = 10;
+		o += 8 + nl + dl;
+	}
+	cat_free(&cat_in, cat_in_total);
+	struct qsee_vfile *db = bad ? NULL : qsee_vfs_get(&cat_vfs, CAT_DB);
+	if (!db || !db->len) {
+		lg("catacomb: load: blob files unusable (check %d, %s): refused, TA untouched", bad, db ? "empty db" : "no db");
+		qsee_vfs_clear(&cat_vfs);
+		return FPCD_E_INVAL;
+	}
+	jobs_drain();
+	int32_t st = 0, st2 = 0;
+	pthread_mutex_lock(&ta_mx);
+	int r = qsee_fpc_db_cmd(appid, QSEE_FPC_DB_LOAD, CAT_DIR "/" CAT_DB, &cat_vfs, &st);
+	int r2 = (!r && !st) ? ta_set_gid(h.gid, &st2) : 0;	/* HAL fpc_set_active_group: load, set_gid, db id */
+	ids_refresh();
+	dbid_refresh();
+	pthread_mutex_unlock(&ta_mx);
+	if (r || st || r2 || st2) {
+		lg("catacomb: load of %u-byte db FAILED: rc %d TA status %d, set_gid rc %d status %d (biometrickitd keeps "
+		   "its file; the TA db is whatever the failed load left)", db->len, r, st, r2, st2);
+		put_u32(p->data, (uint32_t)(st ? st : st2)), p->len = 4;
+		return FPCD_E_IO;
+	}
+	pthread_mutex_lock(&st_mx);
+	uint32_t n = S.ids_valid ? S.nids : 0, ids[5];
+	memcpy(ids, S.ids, sizeof(ids));
+	uint64_t dbid = S.dbid;
+	pthread_mutex_unlock(&st_mx);
+	int same = n == h.nfids;
+	for (uint32_t i = 0; same && i < n; i++) {
+		int f = 0;
+		for (uint32_t k = 0; k < h.nfids; k++)
+			f |= ids[i] == h.fids[k];
+		same = f;
+	}
+	lg("catacomb: LOADED user %u: db %u bytes, %u finger id(s) %s the blob's (%u), db id %#llx (blob %#llx) (%ld ms)",
+	   user, db->len, n, same ? "match" : "DO NOT MATCH", h.nfids, (unsigned long long)dbid, (unsigned long long)h.dbid,
+	   now_ms() - t0);
+	return FPCD_OK;
+}
+
 /* Apple command id -> action (unlisted ids: FPCD_E_UNSUPPORTED, logged as unmapped) */
 static const struct {
 	uint32_t cmd;
@@ -1298,10 +1564,12 @@ static const struct {
 	{ 49, h_nocatacomb },	/* NoCatacomb: load_empty_db + set_gid 0 */
 	{ 78, h_last_match },	/* GetLastMatchEvent */
 	{ 5, h_unsupported },	/* ReadCatacombSU     } catacomb store/load: templates are TA-memory only (no */
-	{ 61, h_unsupported },	/* PrepareSaveCatacomb } store_template_db / load_template_db yet) */
-	{ 62, h_unsupported },	/* CompleteSaveCatacomb */
-	{ 63, h_unsupported },	/* ConfirmSaveCatacomb */
-	{ 64, h_unsupported },	/* LoadCatacomb */
+	{ 61, h_cat_prepare },	/* PrepareSaveCatacomb: store_template_db -> staged SWCT blob, u32 size (xnu 1206) */
+	{ 62, h_unsupported },	/* CompleteSaveCatacomb: the kernel pulls the blob with FPCD_CMD_CAT_GET */
+	{ 63, h_cat_confirm },	/* ConfirmSaveCatacomb: free the staged blob */
+	{ 64, h_cat_load },	/* LoadCatacomb: the blob pushed with FPCD_CMD_CAT_PUT -> load_template_db + set_gid */
+	{ FPCD_CMD_CAT_PUT, h_cat_put },
+	{ FPCD_CMD_CAT_GET, h_cat_get },
 	{ FPCD_CMD_STATUS, h_status },
 	{ FPCD_CMD_WIPE_ALL, h_wipe },
 	{ FPCD_CMD_PING, h_ping },
@@ -1671,6 +1939,11 @@ int main(int argc, char **argv)
 				continue;
 			}
 			said = 0;
+			static int fresh_sent;
+			if (!ta_resident && !fresh_sent) {	/* ws-fpcd-b: the kernel's catacomb state: not loaded */
+				fresh_sent = 1;
+				ev_send(FPCD_EV_TA_FRESH, 0, 0, 0, 0, 0, 0, 1);
+			}
 		}
 		uint64_t in = FPCD_WAIT_REQ_MS;
 		size_t osz = bridge_small ? SMB_SMALL_MAX : sizeof(rq);

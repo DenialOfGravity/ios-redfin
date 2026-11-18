@@ -60,6 +60,9 @@ void put_u64(uint8_t *p, uint64_t v);
 #define FPC_TA_BUSY (-12)
 #define FPC_MAX_FINGERS 5
 int fpc_send64(uint32_t appid, uint8_t *data, size_t len, const char *what);
+/* ws-fpcd-b: when set, fpc_send64 hands INCOMPLETE/BLOCKED results to this (listeners served, e.g. qsee_gk's
+ * in-memory file listener for the template db) instead of refusing them; non-zero return = give up (rc 4). */
+extern int (*fpc_lsnr_serve)(uint64_t x[8], uint32_t appid, const char *what);
 void fpc_dump(const char *what, const uint8_t *d, size_t len);
 int fpc_sensor_cmd(uint32_t appid, uint8_t *d, uint32_t cmd, int32_t *status);	/* 0 ok, 3 TZ, 4 listener, 5 TA status */
 int fd_cmd(uint32_t appid, uint8_t *d, uint32_t cmd, int32_t *status);	/* fpc_sensor_cmd, quiet */

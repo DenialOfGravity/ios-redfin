@@ -95,6 +95,43 @@ _Static_assert(sizeof(struct smb_event) == 16384, "smb_event");
 #define FPCD_CMD_STATUS		0x100	/* daemon status */
 #define FPCD_CMD_WIPE_ALL	0x101	/* debug: delete every finger id in the TA */
 #define FPCD_CMD_PING		0x102	/* reply: "sweetfpcd <version>" */
+/*
+ * Catacomb persistence (xnu 1206, kern.sweet_mesa_catacomb=1; logs/research/touchid-persistence-2026-11-18.md):
+ *   61 PrepareSaveCatacomb  Apple component (24 B {u32 user, u32 kind, 0..}): store_template_db into the in-memory
+ *                           fpdata directory, stage the "SWCT" blob; reply u32 blob size
+ *   FPCD_CMD_CAT_GET        {u32 offset, u32 max} -> blob bytes (the kernel pulls 62's answer in chunks)
+ *   63 ConfirmSaveCatacomb  biometrickitd wrote the file: free the staged blob
+ *   FPCD_CMD_CAT_PUT        {u32 total, u32 offset, bytes}: stage the blob of a coming 64
+ *   64 LoadCatacomb         {u32 FPCD_CAT_LOAD_MAGIC, u32 total, u32 user}: load the staged blob into the TA
+ *   49 NoCatacomb           u32 user (kernel catacomb mode): ~0 = master component, acknowledged without a TA change
+ */
+#define FPCD_CMD_CAT_PUT	0x110
+#define FPCD_CMD_CAT_GET	0x111
+#define FPCD_CAT_LOAD_MAGIC	0x4c435753u	/* "SWCL" */
+#define FPCD_CAT_MAX		(1024 * 1024)
+
+/*
+ * The blob (Apple's CatacombSecureData; biometrickitd archives it with the identities in its catacomb file).
+ * Little-endian. The Apple identity of finger id F is SMB_UUID(F) = {SMFP, F, 0, 0}, so fids[] is the
+ * identity <-> finger map; after a load sweetfpcd checks that the TA lists exactly these ids.
+ */
+#define SWCT_MAGIC		0x54435753u	/* "SWCT" */
+#define SWCT_VERSION		1
+struct swct_hdr {
+	uint32_t magic;
+	uint16_t version, hdr_size;	/* sizeof(struct swct_hdr) */
+	uint32_t total;			/* header + files */
+	uint32_t crc;			/* crc32 (zlib) of bytes [16, total) */
+	uint32_t user;			/* Apple user id of the component */
+	uint32_t gid;			/* FPC TA group id (set_gid) */
+	uint64_t dbid;			/* template db id (authenticator id) after the store */
+	uint32_t nfids, fids[5];
+	uint32_t nfiles;		/* then nfiles x {u32 name_len, u32 data_len, name (no NUL), data} */
+	uint32_t flags;
+	char ta[16];			/* TA name, e.g. "fingerprint" */
+	uint32_t reserved[4];
+};
+_Static_assert(sizeof(struct swct_hdr) == 96, "swct_hdr");
 
 struct fpcd_ids {
 	uint32_t count;
@@ -115,6 +152,8 @@ enum fpcd_ev_code {
 	FPCD_EV_TEMPLATES = 10,		/* the TA's id list changed: n, ids */
 	FPCD_EV_OP_TIMEOUT = 11,	/* the operation ran FPCD_OP_TIMEOUT_MS without finishing */
 	FPCD_EV_ERROR = 12,		/* TZ/TA error during an operation: status */
+	FPCD_EV_TA_FRESH = 13,		/* ws-fpcd-b: the TA was loaded empty at start (not resident): the kernel's
+					 * catacomb state goes back to "not loaded" so biometrickitd reloads the file */
 };
 #define FPCD_EF_END_UNAUTH	1u	/* end_enrol refused (no hw-auth chain / HAT): enrol failed, stray id deleted */
 #define FPCD_MF_HAT_VERIFIED	1u	/* the HAT verifier accepted this identify's HAT (sweetfpcd hat_verify(); with the

@@ -141,3 +141,133 @@ void qsee_hat_parse(const uint8_t t[QSEE_HAT_LEN], struct qsee_hat_info *i)
 	for (int k = 29; k <= 36; k++)
 		i->timestamp = i->timestamp << 8 | t[k];
 }
+
+/* ---- ws-fpcd-b: in-memory template db directory + FPC db_command ---- */
+void qsee_vfs_init(struct qsee_vfs *v, const char *prefix, uint32_t max_size)
+{
+	memset(v, 0, sizeof(*v));
+	snprintf(v->prefix, sizeof(v->prefix), "%s", prefix);
+	v->max_size = max_size;
+}
+
+void qsee_vfs_clear(struct qsee_vfs *v)
+{
+	for (int i = 0; i < QSEE_VFS_FILES; i++) {
+		struct qsee_vfile *f = &v->f[i];
+		if (f->data)
+			memset(f->data, 0, f->cap), free(f->data);
+		memset(f, 0, sizeof(*f));
+	}
+}
+
+struct qsee_vfile *qsee_vfs_get(struct qsee_vfs *v, const char *name)
+{
+	for (int i = 0; i < QSEE_VFS_FILES; i++)
+		if (v->f[i].name[0] && !strcmp(v->f[i].name, name))
+			return &v->f[i];
+	return NULL;
+}
+
+int qsee_vfs_put(struct qsee_vfs *v, const char *name, const uint8_t *d, uint32_t len)
+{
+	if (!name[0] || strlen(name) >= QSEE_VFS_NAME || strchr(name, '/') || len > v->max_size)
+		return -1;
+	struct qsee_vfile *f = qsee_vfs_get(v, name);
+	for (int i = 0; !f && i < QSEE_VFS_FILES; i++)
+		if (!v->f[i].name[0])
+			f = &v->f[i];
+	if (!f)
+		return -1;
+	uint32_t cap = len ? len : 1;
+	uint8_t *nd = calloc(1, cap);
+	if (!nd)
+		return -1;
+	if (len)
+		memcpy(nd, d, len);
+	if (f->data)
+		memset(f->data, 0, f->cap), free(f->data);
+	snprintf(f->name, sizeof(f->name), "%s", name);
+	f->data = nd, f->cap = cap, f->len = len;
+	return 0;
+}
+
+int qsee_vfs_rename(struct qsee_vfs *v, const char *from, const char *to)
+{
+	struct qsee_vfile *a = qsee_vfs_get(v, from), *b = qsee_vfs_get(v, to);
+	if (!a || strlen(to) >= QSEE_VFS_NAME || strchr(to, '/'))
+		return -1;
+	if (b && b != a) {
+		if (b->data)
+			memset(b->data, 0, b->cap), free(b->data);
+		memset(b, 0, sizeof(*b));
+	}
+	snprintf(a->name, sizeof(a->name), "%s", to);
+	return 0;
+}
+
+/* fpc_send64 hook: serve listener requests (file system from vfs_active) until TZ gives a final result */
+static int db_lsnr_serve(uint64_t x[8], uint32_t appid, const char *what)
+{
+	for (int round = 0; round < 4000; round++) {
+		if ((int64_t)x[0])
+			return 0;
+		uint32_t result = (uint32_t)x[1], type = (uint32_t)x[2], data = (uint32_t)x[3];
+		if (result == QSEOS_RESULT_INCOMPLETE) {
+			serve_one(x, data);
+			continue;
+		}
+		if (result == QSEOS_RESULT_BLOCKED) {
+			lg("%s: BLOCKED_ON_LISTENER %#x session %#x: continue-blocked", what, data, type);
+			uint64_t y[8] = { QSEE_SMC_CONT_BLOCKED_SI, QSEE_ARGS_CONT_BLOCKED, type };
+			if (qsmc(y)) {
+				uint64_t w[8] = { QSEE_SMC_CONT_BLOCKED, QSEE_ARGS_CONT_BLOCKED, appid };
+				qsmc(w);
+				memcpy(x, w, 4 * sizeof(uint64_t));
+			} else {
+				memcpy(x, y, 4 * sizeof(uint64_t));
+			}
+			continue;
+		}
+		return 0;
+	}
+	lg("%s: listener loop gave up after 4000 rounds", what);
+	return 1;
+}
+
+int qsee_fpc_db_cmd(uint32_t fpc_appid, uint32_t id, const char *path, struct qsee_vfs *v, int32_t *ta_status)
+{
+	uint8_t d[0x200] = { 0 };
+	size_t pl = strlen(path) + 1;
+	*ta_status = 0;
+	lib_log_open();
+	if ((id != QSEE_FPC_DB_LOAD && id != QSEE_FPC_DB_STORE) || pl > sizeof(d) - 0x10 || check_appid(fpc_appid))
+		return 1;
+	write_attempts = 0;
+	rpmb_info_load();
+	if (lsnr_all_up()) {
+		lsnr_all_down();
+		return 1;
+	}
+	vfs_active = v;
+	memset(vfd, 0, sizeof(vfd));
+	v->opens = v->reads = v->writes = v->unlinks = v->refused = 0;
+	v->bytes_read = v->bytes_written = 0;
+	put_u32(d, 2), put_u32(d + 4, id), put_u32(d + 0xc, (uint32_t)pl);
+	memcpy(d + 0x10, path, pl);
+	fpc_lsnr_serve = db_lsnr_serve;
+	int r = fpc_send64(fpc_appid, d, 0x10 + pl, id == QSEE_FPC_DB_STORE ? "fpc store_template_db (2,12)" :
+			   "fpc load_template_db (2,11)");
+	fpc_lsnr_serve = NULL;
+	*ta_status = (int32_t)g32(d + 8);
+	vfs_active = NULL;
+	memset(vfd, 0, sizeof(vfd));
+	lsnr_all_down();
+	lg("db %s \"%s\": send rc %d TA status %d | vfs opens %u reads %u (%u B) writes %u (%u B) unlinks %u",
+	   id == QSEE_FPC_DB_STORE ? "store" : "load", path, r, *ta_status, v->opens, v->reads, v->bytes_read, v->writes,
+	   v->bytes_written, v->unlinks);
+	if (write_attempts) {
+		lg("db: %u write attempt(s) outside the template db directory refused", write_attempts);
+		return 7;
+	}
+	return r;
+}

@@ -5,7 +5,8 @@
   Install pattern as our other daemons: merged into /System/Library/xpc/launchd.plist as
   /System/Library/LaunchDaemons/com.redfin.sweetfpcd.plist. Binary /var/local/bin/sweetfpcd, root.
   KeepAlive while /var/local/fpc/fpcd.on exists (no RunAtLoad), so it can be switched off with one file; a crash is
-  restarted after ThrottleInterval. SIGTERM: cancels the operation and unloads the TA (ExitTimeOut 15).
+  restarted after ThrottleInterval. SIGTERM: cancels the operation; FPCD_KEEP_TA=1 keeps the TA and its templates
+  loaded (ws-fpcd-b; the next start reuses the resident TA). ExitTimeOut 15.
   Needs kern.sweet_fpc = 3 (xnu 1190) and the TA files in /var/local/fpc/ta; it waits for the sysctl and retries the
   SweetMesaBridge service every 5 s. Matches are reported only while /var/local/fpc/allow-match exists.
   By hand without launchd: /var/local/bin/sweetfpcd --selftest 15 (no bridge), or /var/local/bin/sweetfpcd & .
@@ -42,6 +43,8 @@
 	<dict>
 		<key>PATH</key>
 		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>FPCD_KEEP_TA</key>
+		<string>1</string>
 	</dict>
 </dict>
 </plist>
