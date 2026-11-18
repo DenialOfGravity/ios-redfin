@@ -39,6 +39,7 @@ int sweet_pc_check_user(uint64_t uaddr, uint32_t len, int unlock);
 int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
 int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
 void sweet_pc_lock(void);
+int sweet_pc_locked(void);
 void sweet_acm_publish(void);
 void sweet_aks_notify(void);
 }
@@ -387,6 +388,21 @@ sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret, 
 		}
 		*ret = kIOReturnSuccess;
 		return true;
+	case kAKSAssertHold:
+		/*
+		 * 1197: a lock assertion (aks_assert_hold) keeps an *unlocked* bag unlocked; real AKS refuses it while
+		 * the bag is locked. SpringBoard's grace-period assertion (SBFAuthenticationAssertionTracker ->
+		 * MKBDeviceLockAssertion, sel 26 type 2) right after aks_lock_device decides "authenticated": our
+		 * old blanket success meant the lock screen never asked. Locked -> refused; unlocked -> as before.
+		 */
+		if (!sweet_pc_locked()) {
+			return false;
+		}
+		args->scalarOutputCount = 0;
+		*ret = kIOReturnNotPermitted;
+		return true;
+	case kAKSAssertDrop:
+		return false;   /* as before, but logged every time in passcode mode */
 	case kAKSVerifyPassword:
 		args->scalarOutputCount = 0;
 		*ret = pc_verify_packed(args);
