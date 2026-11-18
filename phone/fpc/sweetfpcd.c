@@ -28,7 +28,8 @@
  * Templates live in TA memory only (no store_template_db); the Apple catacomb commands answer UNSUPPORTED.
  *
  * SAFETY: a match is reported only by match_deliver(), only for a TA identify status 0 with a finger id the TA lists,
- * and only while /var/local/fpc/allow-match exists (absent by default). The kernel gates again (kern.sweet_mesa_match)
+ * and only while /var/local/fpc/allow-match exists (absent by default) or kern.sweet_mesa_match is 2 (owner's
+ * unverified-match mode, xnu 1198). The kernel gates again (kern.sweet_mesa_match)
  * and (xnu 1192d) builds an identity match only when the event carries FPCD_MF_HAT_VERIFIED.
  *
  * Bridge v2 (ABI 2, xnu 1192d): events carry op / percent / hat_status; the kernel turns them into Apple messages.
@@ -102,6 +103,8 @@ static pthread_mutex_t st_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t st_cv = PTHREAD_COND_INITIALIZER;
 static struct {
 	int op, busy, cancel, finger_on;
+	int extend;		/* the MatchMode is an extend-enrolment (xnu 1198: request u32 flags bit 0) */
+	uint32_t up_seq;	/* finger-up count: an extend match needs a lift between touches */
 	uint32_t gen;
 	long started;
 	uint32_t gid;
@@ -345,6 +348,8 @@ static void finger_set(int on)
 	pthread_mutex_lock(&st_mx);
 	int was = S.finger_on;
 	S.finger_on = on;
+	if (was && !on)
+		S.up_seq++;
 	pthread_mutex_unlock(&st_mx);
 	if (was != on)
 		ev_send(on ? FPCD_EV_FINGER_DOWN : FPCD_EV_FINGER_UP, 0, 0, 0, 0, 0, 0, 0);
@@ -524,7 +529,7 @@ static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_
 		return 0;
 	if (!fid_listed(fid))
 		why = FPCD_MW_UNKNOWN_FID;
-	else if (stat(ALLOW_MATCH_PATH, &sb))
+	else if (stat(ALLOW_MATCH_PATH, &sb) && fpc_sysctl_u32("kern.sweet_mesa_match") != 2)
 		why = FPCD_MW_NO_ALLOW_FILE;
 	else if (hat == FPCD_HAT_BAD || hat == FPCD_HAT_REFUSED || (require_hat && hat != FPCD_HAT_VERIFIED))
 		why = FPCD_MW_HAT_REFUSED;
@@ -655,13 +660,19 @@ static void run_enrol(uint32_t gen)
 
 static void run_match(uint32_t gen)
 {
-	uint32_t attempts = 0;
+	uint32_t attempts = 0, last_up = 0;
+	int have_last = 0;
 	while (!cancelled(gen)) {
 		int32_t st4 = 0, st = 0;
 		if (!op_capture(gen, &st4))
 			return;
 		if (st4)
 			continue;
+		pthread_mutex_lock(&st_mx);
+		int ext = S.extend, same_touch = ext && have_last && S.up_seq == last_up;
+		pthread_mutex_unlock(&st_mx);
+		if (same_touch)
+			continue;	/* extend-enrolment: one match per touch; lift first */
 		uint8_t d[FPC_SENSOR_LEN] = { 0 };
 		int32_t hat = FPCD_HAT_NONE;
 		pthread_mutex_lock(&ta_mx);
@@ -681,8 +692,23 @@ static void run_match(uint32_t gen)
 		lg("identify %u: status %d fid %#x score %d coverage %d quality %d result %d", attempts, st, fid, score,
 		   (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14), (int)rd_u32(d + 0x1c));
 		if (st == 0 && !cancelled(gen)) {
-			match_deliver(st, fid, score, attempts, hat);
-			return;	/* one result per MatchMode: delivered or withheld */
+			int sent = match_deliver(st, fid, score, attempts, hat);
+			if (!ext)
+				return;	/* one result per MatchMode: delivered or withheld */
+			/* extend-enrolment (Settings phase 2): add this touch to the template (g11/4 update_template, as
+			 * the HAL does after an authenticate), then keep matching, one result per touch, until Cancel */
+			uint8_t u[FPC_SENSOR_LEN] = { 0 };
+			int32_t ust = 0;
+			pthread_mutex_lock(&ta_mx);
+			int ur = ta_bio(4, u, &ust);
+			pthread_mutex_unlock(&ta_mx);
+			pthread_mutex_lock(&st_mx);
+			last_up = S.up_seq;
+			pthread_mutex_unlock(&st_mx);
+			have_last = 1;
+			lg("extend-enrolment: match %s, update_template rc %d status %d; next touch after a lift",
+			   sent ? "sent" : "withheld", ur, ust);
+			continue;
 		}
 		pthread_mutex_lock(&st_mx);
 		S.nomatches++;
@@ -1099,6 +1125,11 @@ static int h_enrol_continue(const struct smb_req *q, struct smb_reply *p)
 
 static int h_match(const struct smb_req *q, struct smb_reply *p)
 {
+	uint32_t fl = arg_u32(q, 0);	/* xnu 1198: bit 0 = extend-enrolment */
+	pthread_mutex_lock(&st_mx);
+	S.extend = fl & 1;
+	pthread_mutex_unlock(&st_mx);
+	lg("MatchMode: %s", fl & 1 ? "extend-enrolment (one match per touch until Cancel)" : "normal");
 	pthread_mutex_lock(&st_mx);
 	uint32_t n = S.nids;
 	pthread_mutex_unlock(&st_mx);
