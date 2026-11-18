@@ -2806,6 +2806,8 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 				struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = REDWOOD_CAMERA_MODE_ANY,
 					.c = s->camera->formats[s->format_index & 1].kind };
 
+				c.b = bin == BIN_PREVIEW && c.c == REDWOOD_CAMERA_MODE_PHOTO ? bin_mode : c.b;      /* (ws-cam-binned) */
+
 				switched = mode_asked = true;
 				s->mode_wanted = false;
 				say("the kernel's frames are camera %u's: to %u, the %s (a %s mode)", f->sensor, s->camera->sensor, s->camera->name,
