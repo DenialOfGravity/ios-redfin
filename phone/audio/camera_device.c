@@ -217,6 +217,7 @@ redwood_camera_say(const char *format, ...)
  */
 static volatile float camera_ae_target;         /* 0: camera_isp.c's ISP_AE_TARGET */
 static volatile bool camera_ae_unshaded;
+static volatile uint32_t camera_antiband;       /* redfin: /private/var/local/camera-antiband (isp.antiband_hz) */
 static volatile bool camera_awb2;       /* redfin: /private/var/local/camera-awb2 (camera_isp.c's isp.awb2) */
 
 static void
@@ -250,6 +251,25 @@ camera_settings_check(void)
 			say("AWB: %s", awb2 ? "the brightest 30 % of the cells, their middle half (camera-awb2)" : "grey world of the near-grey cells");
 		}
 		camera_awb2 = awb2;
+	}
+	{
+		/* redfin: /private/var/local/camera-antiband, "50" or "60" (the mains), "0" or no file: off (as before) */
+		uint32_t hz = 0;
+
+		fd = open("/private/var/local/camera-antiband", O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, text, sizeof(text) - 1);
+
+			close(fd);
+			text[n > 0 ? n : 0] = 0;
+			hz = (uint32_t)strtoul(text, NULL, 10);
+			hz = hz == 50 || hz == 60 ? hz : 0;
+		}
+		if (hz != camera_antiband) {
+			say("AE: anti-banding %s", hz ? (hz == 50 ? "50 Hz mains: exposures in whole 10 ms (camera-antiband)" :
+			    "60 Hz mains: exposures in whole 8.33 ms (camera-antiband)") : "off");
+		}
+		camera_antiband = hz;
 	}
 }
 
@@ -2920,11 +2940,16 @@ ife_start(int device, struct ife_link *l)
 	} g = { { .command = REDWOOD_CAMERA_COLOUR, .bytes = sizeof(g.k), .a = 2 } };
 	struct redwood_camera_command fmt = { .command = REDWOOD_CAMERA_FORMAT, .a = REDWOOD_CAMERA_FORMAT_NV12 };
 
+	size_t gn = sizeof(g.c) + sizeof(g.k);  /* (the command and its 65 knots: not the structure's padding) */
+	ssize_t wg = 0;
+
 	memset(l, 0, sizeof(*l));
 	l->on = true;
 	isp_gamma_knots(g.k);
-	if (write(device, &g, sizeof(g)) != (ssize_t)sizeof(g) || write(device, &fmt, sizeof(fmt)) != (ssize_t)sizeof(fmt)) {
-		say("IFE pixel path: the kernel takes no COLOUR/FORMAT command (%s): RAW10 frames", strerror(errno));
+	errno = 0;
+	if ((wg = write(device, &g, gn)) != (ssize_t)gn || write(device, &fmt, sizeof(fmt)) != (ssize_t)sizeof(fmt)) {
+		say("IFE pixel path: the kernel takes no COLOUR/FORMAT command (%zd of %zu bytes, %s): RAW10 frames", wg, gn,
+		    errno ? strerror(errno) : "short");
 		l->on = false;
 		return;
 	}
@@ -3146,6 +3171,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		isp.ae_target = camera_ae_target;
 		isp.ae_unshaded = camera_ae_unshaded;
 		isp.awb2 = camera_awb2;
+		isp.antiband_hz = camera_antiband;
 		isp.ae_bias = s->ae_bias;
 		memcpy(isp.ae_roi, s->ae_roi, sizeof(isp.ae_roi));
 		isp.ae_max_gain = s->ae_max_gain;

@@ -406,9 +406,17 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
 	}
 	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
+	/* (camera-antiband) an exposure of a flicker period or more that is not a whole number of them is moved even when settled */
+	double band_us = isp->antiband_hz >= 40 && isp->antiband_hz <= 70 ? 1e6 / (2.0 * isp->antiband_hz) : 0;
+	double e_now = f->exposure_lines * line_us;
+	bool off_band = band_us > 0 && e_now >= band_us * 0.95 && fabs(e_now - band_us * floor(e_now / band_us + 0.5)) > band_us * 0.03;
+
 	if (ratio > 0.94 && ratio < 1.06) {
-		isp->ae_stable = true;
-		return false;
+		if (!off_band) {
+			isp->ae_stable = true;
+			return false;
+		}
+		ratio = 1;
 	}
 	isp->ae_stable = false;
 	want = now * pow(ratio, 0.7);
@@ -423,6 +431,26 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		lines = (uint32_t)(want / knee);
 		lines = lines > longest ? longest : lines < fast ? fast : lines;
 		gain_total = want / lines;
+	}
+	if (band_us > 0) {
+		/* (camera-antiband) whole flicker periods, the same exposure times gain */
+		double e = lines * line_us, total = lines * gain_total;
+
+		if (e >= band_us) {
+			uint32_t q = (uint32_t)(floor(e / band_us) * band_us / line_us + 0.5);
+
+			if (q >= 4) {
+				lines = q;
+				gain_total = total / q;
+			}
+		} else if (gain_total > 1) {
+			uint32_t q = (uint32_t)(band_us / line_us + 0.5);
+
+			if (q <= longest && total / q >= 1) {
+				lines = q;
+				gain_total = total / q;
+			}
+		}
 	}
 split:
 	if (isp->ae_max_gain >= 1 && gain_total > isp->ae_max_gain) {

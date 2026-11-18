@@ -133,6 +133,12 @@ struct isp {
 	float           asked_isp_digital;      /* the processor's gain AE asked with: isp->digital once the frames have its exposure */
 	float           ae_metered;             /* (AE's answer) the level it metered last, above black, with the processor's gain */
 	float           ae_target_level;        /* (AE's answer) ... and the level it aimed at */
+	/*
+	 * redfin (camera-antiband): the mains' frequency (50 or 60; 0 off): lights flicker at twice it, and a rolling
+	 * shutter's exposure that is not a whole number of flicker periods shows it as dark bands. AE keeps exposures of a
+	 * period or more to whole periods (the rest in gain), and below a period takes one period at less gain where it can.
+	 */
+	uint32_t        antiband_hz;
 };
 
 #define ISP_AE_TARGET   0.15f
