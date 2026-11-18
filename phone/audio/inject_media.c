@@ -60,6 +60,9 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+void redwood_camera_log_line(const char *line, size_t n);
+void redwood_camera_log_check(const char *why);
+
 static void
 say(const char *format, ...)
 {
@@ -74,6 +77,7 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	redwood_camera_log_line(line, (size_t)n);      /* (camera_device.c: /private/var/local/camera.log, when wanted) */
 }
 
 /* (SPI of libdyld; looked up at run time, the SDK's stubs need not have it) */
@@ -558,10 +562,46 @@ silent_end(id node)
 
 static IMP original_audio_source_start, original_audio_source_stop;
 
+/*
+ * redfin (flag /var/local/camera-tsfix, present = on): the capture audio's silence filling off.
+ * asn_audioUnitRenderProc (CMCapture) takes the gap since the last callback as
+ * AudioConvertHostTimeToNanos(mHostTime - _nextExpectedHostTime), unsigned: a callback one host tick
+ * early (the 48 -> 44.1 kHz conversion of AUHAL makes them) wraps. On Apple's 24 MHz timebase (125/3)
+ * the product overflows to a "negative" gap and nothing happens; on our 19.2 MHz one (625/12) it comes
+ * out as ~1.5e18 ns, which, scaled to 44.1 kHz and cut to 32 bits, asks
+ * -_createSampleBufferForTimestampedAudioBufferList:audioBufferIndex: for ~20.7 M silent frames
+ * (39 MiB) per callback: mediaserverd grew 1.5 GB/s with Live Photo on and was killed. The import
+ * cannot be rebound (the shared cache turned the stub into a direct branch to CoreAudio, there is no
+ * pointer to swap) and -_createSampleBuffer... is called directly, not by message: the node's own
+ * switch, _silenceFramesFillingDisabled, is set instead (the render proc then skips the gap check).
+ * The cost: a real dropout is no longer padded with silence (the next buffer just follows).
+ */
+static void
+audio_source_no_silence_fill(id self)
+{
+	static Ivar ivar;
+	static bool looked;
+
+	if (access("/private/var/local/camera-tsfix", F_OK) != 0) {
+		return;
+	}
+	if (!looked) {
+		looked = true;
+		ivar = class_getInstanceVariable(object_getClass(self), "_silenceFramesFillingDisabled");
+		say("redwood: mediaserverd: camera-tsfix: BWAudioSourceNode._silenceFramesFillingDisabled %s\n",
+		    ivar != NULL ? "found: set" : "NOT found: the silence filling stays on");
+	}
+	if (ivar != NULL) {
+		*((volatile BOOL *)((char *)(void *)self + ivar_getOffset(ivar))) = YES;
+	}
+}
+
 static BOOL
 audio_source_start(id self, SEL selector, id *error)
 {
+	audio_source_no_silence_fill(self);
 	BOOL started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
+	audio_source_no_silence_fill(self);
 	id made = error != NULL ? *error : NULL;
 	static bool said;
 
@@ -984,10 +1024,26 @@ register_hevc_encoder(void)
 		    create);
 		say("redwood: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
 	}
+}
+
+/*
+ * redfin (B2): the H.264 search. Only with /private/var/local/camera-encoder-scan, and not in the constructor: r20's
+ * build asked VideoToolbox for its encoder list there (inside dyld's initializer, before the capture stack's methods
+ * were replaced) and mediaserverd crash-looped in Core Image (r19a, 2026-10-25); whether that list was the cause is
+ * not known, so it is off unless asked for, and then done on a queue of its own seconds after the start. Without
+ * it there is no H.264 encoder, and recordings that ask for avc1 are made HEVC (recording_video_settings).
+ */
+static void
+search_avc_encoder(void *context)
+{
+	void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+	int status;
+
+	(void)context;
 	if (vt == NULL) {
 		return;
 	}
-	/* redfin (B2): H.264 */
+	say("redwood: mediaserverd: the H.264 encoder search (camera-encoder-scan)\n");
 	if (software_encoder_listed(vt, 'avc1', true)) {
 		avc_encoder = true;
 		say("redwood: mediaserverd: VideoToolbox has a software H.264 encoder of its own\n");
@@ -1016,6 +1072,7 @@ register_hevc_encoder(void)
 	/* their encoder factories, and VideoToolbox's own */
 	static const char *const parts[] = { "Encoder_CreateInstance", "EncoderCreateInstance", "RegisterEncoder", "Encoder_Create", NULL };
 	struct encoder_search e = { 0 };
+
 
 	say("redwood: mediaserverd: encoder factories exported by the video codecs and VideoToolbox:\n");
 	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -1318,6 +1375,114 @@ keep_metal_from_the_capture_stack(void)
 	    ask(array, sel_registerName("count")), create() != NULL ? "A DEVICE STILL" : "nil");
 }
 
+/*
+ * redfin (r19a crash loop, 2026-10-25): every Core Image prewarm of the capture stack made a no-op, not only the
+ * portrait filters' (replacements[0]): mediaserverd died at pc 0 in Core Image from a CMCapture dispatch block ~5 s
+ * after it started (Core Image's GL path, which has no functions here). Every method whose name begins with
+ * "prewarm" (after any '_') of a class of the image BWCoreImageFilterRenderer is in, whose class name speaks of Core
+ * Image, filters or styles, and which returns nothing (or a BOOL: NO) is replaced; each is said.
+ * /private/var/local/camera-no-prewarm-fix leaves them all as they are.
+ */
+static void
+prewarm_none(void)
+{
+}
+
+static long
+prewarm_no(void)
+{
+	return 0;
+}
+
+static bool
+prewarm_class(const char *name)
+{
+	static const char *const parts[] = { "CoreImage", "Filter", "SemanticStyle", "SmartStyle", "Style", "Portrait", "DeepFusion",
+		"CIContext", "Renderer", NULL };
+
+	for (int i = 0; parts[i] != NULL; i++) {
+		if (strstr(name, parts[i]) != NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+prewarm_sweep_class(Class cls, bool meta, unsigned *count)
+{
+	unsigned n = 0;
+	Method *methods = class_copyMethodList(cls, &n);
+
+	for (unsigned i = 0; i < n; i++) {
+		const char *sel = sel_getName(method_getName(methods[i])), *types = method_getTypeEncoding(methods[i]);
+
+		while (*sel == '_') {
+			sel++;
+		}
+		if (strncasecmp(sel, "prewarm", 7) != 0 || types == NULL) {
+			continue;
+		}
+		if (strstr(sel, "ompletion") != NULL || strstr(sel, "andler") != NULL || strstr(sel, "lock") != NULL) {
+			say("redwood: mediaserverd: %c[%s %s] (takes a completion) left alone\n", meta ? '+' : '-', class_getName(cls),
+			    sel_getName(method_getName(methods[i])));
+			continue;
+		}
+		IMP was = method_getImplementation(methods[i]);
+
+		if (was == (IMP)prewarm_portrait_filter) {
+			continue;
+		}
+		if (types[0] == 'v') {
+			method_setImplementation(methods[i], (IMP)prewarm_none);
+		} else if (types[0] == 'B' || types[0] == 'c') {
+			method_setImplementation(methods[i], (IMP)prewarm_no);
+		} else {
+			say("redwood: mediaserverd: %c[%s %s] (returns %c) left alone\n", meta ? '+' : '-', class_getName(cls),
+			    sel_getName(method_getName(methods[i])), types[0]);
+			continue;
+		}
+		(*count)++;
+		say("redwood: mediaserverd: %c[%s %s] (at %#lx unslid) made a no-op\n", meta ? '+' : '-', class_getName(cls),
+		    sel_getName(method_getName(methods[i])), (uintptr_t)was - slide);
+	}
+	free(methods);
+}
+
+static void
+prewarm_sweep(void)
+{
+	static bool done;
+	Class renderer = objc_getClass("BWCoreImageFilterRenderer");
+	const char *image;
+	const char **names;
+	unsigned n = 0, count = 0;
+
+	if (done || renderer == Nil) {
+		return;
+	}
+	done = true;
+	if (access("/private/var/local/camera-no-prewarm-fix", F_OK) == 0) {
+		say("redwood: mediaserverd: the capture stack's Core Image prewarms left as they are (camera-no-prewarm-fix)\n");
+		return;
+	}
+	if ((image = class_getImageName(renderer)) == NULL || (names = objc_copyClassNamesForImage(image, &n)) == NULL) {
+		say("redwood: mediaserverd: the capture stack's classes cannot be listed: its prewarms left as they are\n");
+		return;
+	}
+	for (unsigned i = 0; i < n; i++) {
+		Class cls;
+
+		if (!prewarm_class(names[i]) || (cls = objc_getClass(names[i])) == Nil) {
+			continue;
+		}
+		prewarm_sweep_class(cls, false, &count);
+		prewarm_sweep_class(object_getClass((id)cls), true, &count);
+	}
+	free(names);
+	say("redwood: mediaserverd: %u Core Image prewarm methods of %u classes made no-ops\n", count, n);
+}
+
 static void
 image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
 {
@@ -1368,6 +1533,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		say("redwood: mediaserverd: %c[%s %s] (at %#lx unslid) replaced\n", r->instance ? '-' : '+', r->class_name, r->selector,
 		    (uintptr_t)original - slide);
 	}
+	prewarm_sweep();
 }
 
 __attribute__((constructor))
@@ -1380,6 +1546,8 @@ redwood_media_init(void)
 	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
 		return;
 	}
+	redwood_camera_log_check("load");
+	say("redwood: mediaserverd: RedwoodAudio built %s %s (camera plug-in loaded)\n", __DATE__, __TIME__);
 	shared_cache_range = (const void *(*)(size_t *))dlsym(RTLD_DEFAULT, "_dyld_get_shared_cache_range");
 	slide = shared_cache_range != NULL ? (uintptr_t)shared_cache_range(&length) - CACHE_BASE : 0;
 	/* redfin: MTL_DEVICE_ARRAY is iOS 16.5's address; on this build Metal's device list is left alone always */
@@ -1401,7 +1569,18 @@ redwood_media_init(void)
 		say("redwood: mediaserverd: no /dev/redwood-camera: the capture stack is left as it is\n");
 		return;
 	}
-	say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera); slide %#lx\n", slide);
+	say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera); slide %#lx; RedwoodAudio built %s %s\n", slide,
+	    __DATE__, __TIME__);
+	/* (what is to be replaced, said first: a crash log shows how far it got) */
+	for (size_t i = 0; i < sizeof(replacements) / sizeof(replacements[0]); i++) {
+		say("redwood: mediaserverd: to replace %c[%s %s]\n", replacements[i].instance ? '-' : '+', replacements[i].class_name,
+		    replacements[i].selector);
+	}
 	register_hevc_encoder();
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
+	say("redwood: mediaserverd: the replacements armed\n");
+	if (access("/private/var/local/camera-encoder-scan", F_OK) == 0) {
+		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL,
+		    search_avc_encoder);
+	}
 }

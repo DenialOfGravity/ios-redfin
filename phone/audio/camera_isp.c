@@ -123,18 +123,38 @@ isp_sharpness(const struct redwood_camera_frame *f, const uint8_t *raw, float x0
 
 static inline void lsc_at(const struct isp *isp, float u, float v, float g[3]);
 
+/* log2 of x > 0 to 0.005 or so (the exponent, and a parabola through the mantissa): a bin of the AWB2 histograms */
+static inline int
+awb2_bin(float x)
+{
+	union { float f; uint32_t u; } v = { .f = x };
+	float m, l;
+	int bin;
+
+	if (!(x > 0)) {
+		return 0;
+	}
+	m = (union { uint32_t u; float f; }){ .u = (v.u & 0x007fffffu) | 0x3f800000u }.f;   /* [1, 2) */
+	l = (float)((int)((v.u >> 23) & 255) - 128) + (-0.34484843f * m + 2.02466578f) * m - 0.67487759f;
+	bin = (int)((l - AWB2_LOG2_MIN) / AWB2_LOG2_STEP);
+	return bin < 0 ? 0 : bin >= AWB2_BINS ? AWB2_BINS - 1 : bin;
+}
+
 void
 isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
-	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, roi_sum[3] = { 0, 0, 0 };
+	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, roi_sum[3] = { 0, 0, 0 }, shaded = 0, roi_shaded = 0;
 	float gains[3] = { 1, 1, 1 };
-	uint32_t roi_hist[64], rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0;
+	uint32_t roi_hist[64], rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0, shaded_hist[64], roi_shaded_hist[64];
+	bool lsc = isp != NULL && isp->lsc.on;
 	bool roi = isp != NULL && isp->ae_roi[2] > isp->ae_roi[0] && isp->ae_roi[3] > isp->ae_roi[1];
 	int r, b;
 
 	memset(s, 0, sizeof(*s));
 	memset(roi_hist, 0, sizeof(roi_hist));
+	memset(shaded_hist, 0, sizeof(shaded_hist));
+	memset(roi_shaded_hist, 0, sizeof(roi_shaded_hist));
 	if (roi) {
 		/* (redfin: AE's metering window, in cells; at least a 16th of the frame each way) */
 		rx0 = (uint32_t)(isp->ae_roi[0] * cells_w);
@@ -161,11 +181,21 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 			sum[0] += v[r];
 			sum[1] += g;
 			sum[2] += v[b];
+			/* (redfin: the lens shading's gains here, once: for the shaded levels and the white balance's cells) */
+			if (lsc) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+			}
+			int gs = (int)(g * gains[1] + 0.5f);
+
+			shaded += gs;
+			shaded_hist[gs >> 4 > 63 ? 63 : gs >> 4]++;
 			if (roi && cx >= rx0 && cx < rx1 && cy >= ry0 && cy < ry1) {
 				roi_sum[0] += v[r];
 				roi_sum[1] += g;
 				roi_sum[2] += v[b];
 				roi_hist[g >> 4 > 63 ? 63 : g >> 4]++;
+				roi_shaded += gs;
+				roi_shaded_hist[gs >> 4 > 63 ? 63 : gs >> 4]++;
 				s->roi_cells++;
 			}
 			/*
@@ -180,8 +210,7 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 				 * As the picture will have it: the lens shading raises the corners several times, and
 				 * the light there counts for that much more than in the frame as it comes.
 				 */
-				if (isp != NULL && isp->lsc.on) {
-					lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+				if (lsc) {
 					cr *= gains[0];
 					cg *= gains[1];
 					cb *= gains[2];
@@ -194,6 +223,14 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 				grey[0] += cr / cg;
 				grey[1] += cb / cg;
 				s->grey_cells++;
+				if (isp != NULL && isp->awb2) {
+					int band = (int)cg / AWB2_LUM_STEP;
+
+					band = band >= AWB2_LUMS ? AWB2_LUMS - 1 : band;
+					s->awb2_lum[band]++;
+					s->awb2_hist[band][0][awb2_bin(cr / cg)]++;
+					s->awb2_hist[band][1][awb2_bin(cb / cg)]++;
+				}
 				/*
 				 * Grey, or within a third of it in red and blue, with the white balance as it is: what
 				 * the white balance should make grey, without the coloured things around it (the
@@ -237,6 +274,38 @@ isp_measure(const struct isp *isp, const struct redwood_camera_frame *f, const u
 			break;
 		}
 	}
+	s->shaded_mean = s->cells ? shaded / s->cells : 0;
+	s->roi_shaded_mean = s->roi_cells ? roi_shaded / s->roi_cells : 0;
+	for (int i = 63, above = 0; i >= 0; i--) {
+		above += shaded_hist[i];
+		if (above * 100 >= (int)s->cells) {
+			s->shaded_bright = i * 16 + 8;
+			break;
+		}
+	}
+	for (int i = 63, above = 0; s->roi_cells && i >= 0; i--) {
+		above += roi_shaded_hist[i];
+		if (above * 100 >= (int)s->roi_cells) {
+			s->roi_shaded_bright = i * 16 + 8;
+			break;
+		}
+	}
+}
+
+double
+isp_metered(const struct isp *isp, const struct isp_stats *s, double *bright)
+{
+	bool raw = isp->ae_unshaded;
+	double mean = raw ? s->mean[1] : s->shaded_mean, top = raw ? s->bright : s->shaded_bright;
+
+	if (s->roi_cells != 0) {
+		mean = 0.75 * (raw ? s->roi_mean[1] : s->roi_shaded_mean) + 0.25 * mean;
+		top = raw ? s->roi_bright : s->roi_shaded_bright;
+	}
+	if (bright != NULL) {
+		*bright = top;
+	}
+	return mean;
 }
 
 /*
@@ -288,6 +357,9 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		if (isp->asked_digital != 0) {
 			isp->sensor_digital = isp->asked_digital / 256.0f;
 		}
+		if (isp->asked_isp_digital >= 1) {
+			isp->digital = isp->asked_isp_digital;
+		}
 	}
 	if (f->frame_lines_max != 0 && ceiling > f->frame_lines_max) {
 		ceiling = f->frame_lines_max;
@@ -315,17 +387,20 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		goto split;
 	}
 	now = (double)f->exposure_lines * f->gain / unity * isp->sensor_digital * isp->digital;
-	target = 0.15 * WHITE * pow(2, isp->ae_bias < -8 ? -8 : isp->ae_bias > 8 ? 8 : isp->ae_bias);
+	target = (isp->ae_target > 0.005f && isp->ae_target < 0.8f ? isp->ae_target : ISP_AE_TARGET) * WHITE *
+	    pow(2, isp->ae_bias < -8 ? -8 : isp->ae_bias > 8 ? 8 : isp->ae_bias);
 	target = target > 0.8 * WHITE ? 0.8 * WHITE : target;
-	/* (the measured levels are the sensor's, its digital gain in them: the processor's is applied to the picture only) */
-	mean = s->mean[1];
-	bright = s->bright;
-	if (s->roi_cells != 0) {
-		mean = 0.75 * s->roi_mean[1] + 0.25 * s->mean[1];
-		bright = s->roi_bright;
-	}
+	/*
+	 * (the measured levels are the sensor's, its digital gain in them: the processor's is applied to the picture only).
+	 * redfin (2026-10-30): lens-shaded, as the picture shows them -- metered on the frame as it came, AE aimed the
+	 * middle of the frame at the target and the picture then raised it by the lens shading's gains (1x in the very
+	 * middle, several times at the corners: its mean over the frame well above 1), the photographs 1-2 EV too bright.
+	 */
+	mean = isp_metered(isp, s, &bright);
 	mean = mean * isp->digital > 0.5 ? mean * isp->digital : 0.5;
 	bright *= isp->digital;
+	isp->ae_metered = (float)mean;
+	isp->ae_target_level = (float)target;
 	ratio = target / mean;
 	if (isp->ae_bias <= 0.5f && bright * ratio > 0.9 * WHITE && bright > 0) {
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
@@ -369,7 +444,12 @@ split:
 		isp->ae_stable = true;
 		return false;           /* (the custom exposure is there already) */
 	}
-	isp->digital = (float)digital;
+	/*
+	 * redfin (2026-10-30): the processor's gain with the exposure it goes with: taken (above) when the frames have that
+	 * exposure, not at once -- the frames still on their way, of the old exposure, were made with the new gain (two or
+	 * more frames too bright or too dark at each change, a photograph among them now and then)
+	 */
+	isp->asked_isp_digital = (float)digital;
 	isp->asked_lines = lines;
 	isp->asked_gain = (uint32_t)(analog * unity + 0.5);
 	isp->asked_frame_lines = frame_lines;
@@ -425,6 +505,61 @@ isp_cct(const struct isp *isp)
 	return t->ref[i][2] + u * (t->ref[i + 1][2] - t->ref[i][2]);
 }
 
+/*
+ * redfin (camera-awb2): grey world, but of the brightest 30 % of the cells the white balance counts (none near
+ * white or black): in a room the brightest surfaces are mostly its white walls, ceiling and paper, while its
+ * darker ones -- wood, a sofa, a floor -- have colours of their own that pull plain grey world off (a room of
+ * brown and wood: 7 % short in red and blue, the picture green). Of those cells, each colour's middle half (from
+ * the quarter to the three quarters of its ratios): what is left of a lamp, a screen or a coloured thing among
+ * them counts for nothing. False when there are too few cells for it.
+ */
+static bool
+awb2_estimate(const struct isp_stats *s, float *r, float *b)
+{
+	uint32_t total = 0, want, got = 0, hist[2][AWB2_BINS];
+	int band;
+
+	for (band = 0; band < AWB2_LUMS; band++) {
+		total += s->awb2_lum[band];
+	}
+	if (total < 200 || total * 16 < s->cells) {
+		return false;
+	}
+	want = total * 3 / 10;
+	memset(hist, 0, sizeof(hist));
+	for (band = AWB2_LUMS - 1; band >= 0 && got < want; band--) {
+		got += s->awb2_lum[band];
+		for (int c = 0; c < 2; c++) {
+			for (int i = 0; i < AWB2_BINS; i++) {
+				hist[c][i] += s->awb2_hist[band][c][i];
+			}
+		}
+	}
+	if (got < 100) {
+		return false;
+	}
+	for (int c = 0; c < 2; c++) {
+		/* the mean of log2 over the cells from got/4 to 3*got/4, bins cut where those fall */
+		double lo = got / 4.0, hi = got * 3 / 4.0, seen = 0, sum = 0, n = 0;
+
+		for (int i = 0; i < AWB2_BINS; i++) {
+			double from = seen, to = seen + hist[c][i];
+			double a = from > lo ? from : lo, z = to < hi ? to : hi;
+
+			if (z > a) {
+				sum += (z - a) * (AWB2_LOG2_MIN + (i + 0.5) * AWB2_LOG2_STEP);
+				n += z - a;
+			}
+			seen = to;
+		}
+		if (n <= 0) {
+			return false;
+		}
+		*(c == 0 ? r : b) = (float)exp2(-sum / n);
+	}
+	return true;
+}
+
 void
 isp_awb(struct isp *isp, const struct isp_stats *s)
 {
@@ -446,7 +581,9 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 		isp->awb_stable = true;
 		return;
 	}
-	if (s->neutral_cells * 32 >= s->cells && s->neutral[0] > 0.01 && s->neutral[1] > 0.01) {
+	if (isp->awb2 && awb2_estimate(s, &r, &b)) {
+		/* (r and b: the brightest surfaces' colour, white walls and paper as a room has them) */
+	} else if (s->neutral_cells * 32 >= s->cells && s->neutral[0] > 0.01 && s->neutral[1] > 0.01) {
 		r = (float)(1 / s->neutral[0]);
 		b = (float)(1 / s->neutral[1]);
 	} else if (s->grey_cells * 16 >= s->cells && s->grey[0] > 0.01 && s->grey[1] > 0.01) {
