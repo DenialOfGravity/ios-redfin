@@ -21,6 +21,7 @@
  *   Woken by the interrupt when value 2 is on and the summary interrupt is live; otherwise polls every 5 ms.
  * kern.sweet_fpc_state (RO string): "rst=gpio16 out=O oe=E cfg=C irq=gpio112 in=I cfg=C intr=C irqs=N mode=M
  *   storms=S masked=0|1" (1193: storm guard, see FPC_STORM_N).
+ * kern.sweet_fpc_wait_edge (RW int, 1235): interrupt-driven wait for screen-off finger detect, see below.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -33,6 +34,7 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <libkern/OSAtomic.h>        /* 1235 */
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
@@ -327,6 +329,86 @@ sysctl_sweet_fpc_wait SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc_wait, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_sweet_fpc_wait, "I", "1190 FPC: write N ms = wait for gpio112 high; reads 1 high / 0 timeout");
+
+/*
+ * 1235 (touchid-wake-2026-11-18.md): kern.sweet_fpc_wait_edge, an interrupt-driven wait for sweetfpcd's screen-off
+ * finger detect (the sensor armed with g10/2, nothing else running). Write N ms (1..60000): block until gpio112 is
+ * high, a gpio112 interrupt arrives after the call began (a finger can show as short pulses that are low again before
+ * any level check: why hal_wait polls kern.sweet_fpc_irq every 20 ms), a kick, or N ms pass; the same call reads back
+ * 1 high, 2 interrupt, 3 kicked, 0 timeout. While the interrupt is live (kern.sweet_fpc bit 1, not storm-masked) the
+ * thread only sleeps: no 5 ms level poll. Write 0 = kick: every waiter returns 3 at once (sweetfpcd writes it when its
+ * operation changes, so a Cancel / MatchMode does not wait for the slice). Unmasks after a storm as kern.sweet_fpc_wait.
+ */
+static volatile SInt32 fpc_kicks;
+static int fpc_edge_last;
+
+static int
+sysctl_sweet_fpc_wait_edge SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int ms = 0;
+	if (req->newptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, &fpc_edge_last, sizeof(fpc_edge_last));
+	}
+	int error = SYSCTL_IN(req, &ms, sizeof(ms));
+	if (error) {
+		return error;
+	}
+	if (ms == 0) {
+		OSAddAtomic(1, &fpc_kicks);
+		thread_wakeup(&fpc_wait_chan);
+		int k = 3;
+		return SYSCTL_OUT(req, &k, sizeof(k));
+	}
+	if (ms < 0 || ms > 60000) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&fpc_lock);
+	fpc_map();
+	fpc_storm_unmask();
+	lck_mtx_unlock(&fpc_lock);
+	if (!fpc_irqp) {
+		return ENXIO;
+	}
+	uint32_t irq0 = fpc_irqs;
+	SInt32 k0 = fpc_kicks;
+	uint64_t deadline;
+	clock_interval_to_deadline((uint32_t)ms, NSEC_PER_MSEC, &deadline);
+	int result = 0;
+	for (;;) {
+		if (fpc_level()) {
+			result = 1;
+		} else if (fpc_irqs != irq0) {
+			result = 2;
+		} else if (fpc_kicks != k0) {
+			result = 3;
+		}
+		if (result || mach_absolute_time() >= deadline) {
+			break;
+		}
+		uint64_t until = deadline;
+		if (!fpc_irq_on || fpc_storm_masked) {        /* no interrupt to wake us: poll the level as kern.sweet_fpc_wait */
+			uint64_t step;
+			clock_interval_to_deadline(5, NSEC_PER_MSEC, &step);
+			if (step < until) {
+				until = step;
+			}
+		}
+		(void)assert_wait_deadline(&fpc_wait_chan, THREAD_ABORTSAFE, until);
+		if (fpc_level() || fpc_irqs != irq0 || fpc_kicks != k0) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			continue;
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
+			return EINTR;
+		}
+	}
+	fpc_edge_last = result;
+	return SYSCTL_OUT(req, &result, sizeof(result));
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_fpc_wait_edge, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_fpc_wait_edge, "I", "1235 FPC: write N ms = wait for gpio112 high or a new interrupt (no poll); "
+    "reads 1 high / 2 irq / 3 kicked / 0 timeout; write 0 = kick the waiters");
 
 static int
 sysctl_sweet_fpc_state SYSCTL_HANDLER_ARGS

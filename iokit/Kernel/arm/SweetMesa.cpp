@@ -1147,6 +1147,8 @@ mesa_zalloc(uint32_t len)
  * 1192d: one sweetfpcd "FPCD" event -> Apple message(s). Returns the IOReturn of the last delivery, or
  * kIOReturnSuccess when the event kind is logged only. Every decision is logged.
  */
+static bool mesa_wake_finger(void);     /* 1235 */
+
 static IOReturn
 fpcd_translate(const uint8_t *d, uint32_t len)
 {
@@ -1159,6 +1161,9 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 	uint8_t *b;
 	IOReturn r = kIOReturnSuccess;
 
+	if (code == FEV_FINGER_DOWN && mesa_wake_finger()) {
+		return kIOReturnSuccess;        /* 1235: display off: a wake press (or skipped), never a FingerOn */
+	}
 	if (gEndCount > 0) {
 		mesa_end_flush();       /* 1210: a queued op end goes out before anything of the next op */
 	}
@@ -3193,4 +3198,186 @@ sysctl_sweet_mesa_state(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_state, "A", "redfin 1192: SweetMesa counters");
+
+/*
+ * 1235 (touchid-wake-2026-11-18.md): screen-off Touch ID wake, kern.sweet_mesa_wake (default 0: nothing changes).
+ * iOS 16.7 allows matching only while the screen is on (SpringBoardUIServices -[SBUIBiometricResource
+ * _matchingAllowedStateMayHaveChangedForReason:]: hasBiometricAuthenticationCapabilityEnabled && screen on; oslog
+ * "Matching allowed changed to NO for reason: Screen Off"), SpringBoard switches background finger detect off (69 val 0,
+ * then 20 DisplayStatusChanged 0) as the display goes off, and no backlight change source is biometric. On an iPhone 8
+ * the screen-off wake is the home button press (a HID button event); the finger stays on the sensor, SpringBoard's
+ * screen-on match op captures it and press / rest to open unlocks. The Pixel's sensor has no button, so a finger
+ * landing while iOS's display is off stands in for that press:
+ *   bit 0 (1) wake: a sweetfpcd FINGER_DOWN while iOS's display is off (its last RequestPowerChange, SweetFramebuffer)
+ *       posts a power (lock) button press (down, 60 ms, up) from a thread call: SpringBoard wakes ("lock button"
+ *       source, as `pa wake`), matching becomes allowed, its match op captures the resting finger, and the AX
+ *       rest-to-open trigger (AXRestingHomeButtonUnlock) unlocks. Not within kern.sweet_mesa_wake_ms of the display
+ *       going off (a finger left on the sensor while the side button put the phone to sleep), at most one press per
+ *       1.5 s. While the display is off a FINGER_DOWN is never sent as a FingerOn status (no op runs then).
+ *   bit 1 (2) the home (Menu) button instead of the power button (experiment: home-button-type is 2 = none here).
+ *   bit 2 (4) arm: the persona asks sweetfpcd for its screen-off finger detect (FPCD_CMD_WAKEDET {u32 1}) when the
+ *       display goes off and ends it ({u32 0}) when the display comes on; sweetfpcd (ws-fpcd-c) arms the sensor and
+ *       sleeps on the gpio112 interrupt (kern.sweet_fpc_wait_edge, sweet_fpc.c 1235): no capture loop until a touch.
+ * Use 5 (wake + arm). kern.sweet_mesa_wake_state: counters. klog "SWEET MESA: wake: ...".
+ */
+#define FPCD_CMD_WAKEDET        0x120           /* {u32 on}: sweetfpcd screen-off finger detect (1235) */
+#define MESA_WAKE_ON            1u
+#define MESA_WAKE_HOME          2u
+#define MESA_WAKE_ARM           4u
+#define MESA_WAKE_MIN_GAP_MS    1500u
+extern "C" void sweet_hid_key(int key, int down);
+extern "C" void sweet_mesa_display(int off);
+static uint32_t gWake;                          /* kern.sweet_mesa_wake */
+static int gWakeMs = 200;                       /* kern.sweet_mesa_wake_ms */
+static volatile bool gDispOff, gDispKnown;
+static volatile uint64_t gDispOffAt, gWakeAt;
+static thread_call_t gWakeTC;
+static SInt32 nWakes, nWakeEarly, nWakeGap, nWakeArm, nWakeArmFail;
+
+static void
+mesa_wake_tc(thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	int key = (int)(uintptr_t)p0;
+	sweet_hid_key(key, 1);
+	IOSleep(60);
+	sweet_hid_key(key, 0);
+	SAY("wake: %s button pressed (60 ms)\n", key == 3 ? "home" : "power");
+}
+
+static void
+mesa_wake_tc_alloc(void)
+{
+	if (gWakeTC == NULL) {
+		thread_call_t tc = thread_call_allocate(mesa_wake_tc, NULL);
+		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gWakeTC)) {
+			thread_call_free(tc);
+		}
+	}
+}
+
+static uint32_t
+mesa_ms_since(uint64_t t)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
+	return ns / NSEC_PER_MSEC > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / NSEC_PER_MSEC);
+}
+
+/* true: this FINGER_DOWN came with iOS's display off and is consumed here (a wake, or skipped), not a FingerOn */
+static bool
+mesa_wake_finger(void)
+{
+	if (!(gWake & MESA_WAKE_ON) || !gDispOff) {
+		return false;
+	}
+	uint32_t off_ms = mesa_ms_since(gDispOffAt);
+	if (off_ms < (uint32_t)gWakeMs) {
+		OSIncrementAtomic(&nWakeEarly);
+		SAY("wake: finger down %u ms after display off (< kern.sweet_mesa_wake_ms %d): no wake\n", off_ms, gWakeMs);
+		return true;
+	}
+	if (gWakeAt != 0 && mesa_ms_since(gWakeAt) < MESA_WAKE_MIN_GAP_MS) {
+		OSIncrementAtomic(&nWakeGap);
+		SAY("wake: finger down %u ms after the last wake press: no second press\n", mesa_ms_since(gWakeAt));
+		return true;
+	}
+	gWakeAt = mach_absolute_time();
+	OSIncrementAtomic(&nWakes);
+	int key = (gWake & MESA_WAKE_HOME) ? 3 : 0;
+	mesa_wake_tc_alloc();
+	SAY("wake: finger down with the display off (%u ms) -> %s button press\n", off_ms, key == 3 ? "home" : "power");
+	if (gWakeTC != NULL) {
+		thread_call_enter1(gWakeTC, (thread_call_param_t)(uintptr_t)key);
+	} else {
+		SAY("wake: no thread call, no press\n");
+	}
+	return true;
+}
+
+static void
+mesa_wake_arm(bool on, const char *why)
+{
+	if (gM == NULL) {
+		return;
+	}
+	uint8_t b[4];
+	put32(b, on ? 1u : 0u);
+	IOReturn r = mesa_post(FPCD_CMD_WAKEDET, b, sizeof(b));
+	OSIncrementAtomic(r == kIOReturnSuccess ? &nWakeArm : &nWakeArmFail);
+	SAY("wake: screen-off finger detect %s (%s) -> 0x%x%s\n", on ? "on" : "off", why, r,
+	    r == kIOReturnNotReady ? " (sweetfpcd offline)" : "");
+}
+
+/* SweetFramebuffer kSweetFBRequestPowerChange: iOS's own display power (backboardd), after 1186's sleep blank */
+void
+sweet_mesa_display(int off)
+{
+	bool was = gDispOff, known = gDispKnown;
+	if (off) {
+		gDispOffAt = mach_absolute_time();
+	}
+	gDispOff = off != 0;
+	gDispKnown = true;
+	if ((gWake & MESA_WAKE_ARM) && (!known || was != (off != 0))) {
+		mesa_wake_arm(off != 0, off ? "display off" : "display on");
+	}
+}
+
+static int
+sysctl_sweet_mesa_wake(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = (int)gWake, changed = 0;
+	int e = sysctl_io_number(req, (int)gWake, sizeof(int), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v & ~7) {
+		return EINVAL;
+	}
+	uint32_t old = gWake;
+	mesa_wake_tc_alloc();
+	gWake = (uint32_t)v;
+	SAY("wake: kern.sweet_mesa_wake=%d: finger wake %s (%s button), screen-off detect %s; display %s\n", v,
+	    (v & MESA_WAKE_ON) ? "on" : "off", (v & MESA_WAKE_HOME) ? "home" : "power", (v & MESA_WAKE_ARM) ? "on" : "off",
+	    !gDispKnown ? "unknown" : gDispOff ? "off" : "on");
+	if (gDispOff && ((old ^ gWake) & MESA_WAKE_ARM)) {
+		mesa_wake_arm((gWake & MESA_WAKE_ARM) != 0, "kern.sweet_mesa_wake");
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_wake, "I", "redfin 1235: screen-off Touch ID wake: 1 a finger down with the display off presses "
+    "the power button, 2 home button instead, 4 sweetfpcd arms the sensor while the display is off (use 5; 0 = off)");
+
+static int
+sysctl_sweet_mesa_wake_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gWakeMs, changed = 0;
+	int e = sysctl_io_number(req, gWakeMs, sizeof(gWakeMs), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 10000) {
+		return EINVAL;
+	}
+	gWakeMs = v;
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_wake_ms, "I", "redfin 1235: no finger wake this many ms after the display went off (default 200)");
+
+static int
+sysctl_sweet_mesa_wake_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char b[200];
+	snprintf(b, sizeof(b), "wake=%u wake_ms=%d display=%s off_ms=%u wakes=%d early=%d gap=%d arm_posts=%d arm_fail=%d",
+	    gWake, gWakeMs, !gDispKnown ? "unknown" : gDispOff ? "off" : "on", gDispOff ? mesa_ms_since(gDispOffAt) : 0,
+	    nWakes, nWakeEarly, nWakeGap, nWakeArm, nWakeArmFail);
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_wake_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_wake_state, "A", "redfin 1235: screen-off Touch ID wake counters");
 #endif /* ARM64_BOARD_CONFIG_SWEET */

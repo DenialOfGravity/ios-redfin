@@ -6446,6 +6446,7 @@ AppleCLCD::fbCmd(const char *s, const char *end)
 }
 
 extern "C" void sweet_fb_cmd(const char *s, const char *end);
+extern "C" void sweet_mesa_display(int off);   /* 1235: SweetMesa.cpp */
 void
 sweet_fb_cmd(const char *s, const char *end)
 {
@@ -7361,6 +7362,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			}
 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
 			fFB->sleepBlank(off);   /* 1186 */
+			sweet_mesa_display(off);        /* 1235: SweetMesa screen-off Touch ID wake */
 		}
 		break;
 	case kSweetFBGetCurrentAbsoluteTime:
