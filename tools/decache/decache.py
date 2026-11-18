@@ -598,6 +598,10 @@ class Relink:
                     self.E('pointer 0x%x -> 0x%x outside image, unresolved' % (loc, v))
         self.rep['data'] = dict(slide_locations=len(locs), kinds=dict(kinds))
 
+        # 5a. relative method names -> the image's own __objc_selrefs (the runtime fixes those in _read_images;
+        #     it did not register selectors through DyldExtractor's slots in __EXTRA_OBJC on the phone, so lookups
+        #     of e.g. -[BiometricKitXPCServerMesa init] fell through to the superclass)
+        self.retarget_method_names()
         # 5. __EXTRA_OBJC: keep only what is referenced (strings, selector slots), zero the rest
         if EX:
             self.extra_liveness()
@@ -669,6 +673,29 @@ class Relink:
                 if ml:
                     lists.add(ml)
         return sorted(lists)
+
+    def retarget_method_names(self):
+        m = self.m
+        sr = m.sect('__DATA_CONST', '__objc_selrefs') or m.sect('__DATA', '__objc_selrefs')
+        s2r = {}
+        for a in range(sr['addr'], sr['addr'] + sr['size'], 8):
+            s2r.setdefault(m.cstr(m.u64(a)), a)
+        n = kept = 0
+        for ml in self.method_lists():
+            ef, cnt = m.u32(ml), m.u32(ml + 4)
+            if not ef & 0x80000000:
+                continue
+            for i in range(cnt):
+                e = ml + 8 + 12 * i
+                slot = e + m.s32(e)
+                if sr['addr'] <= slot < sr['addr'] + sr['size']:
+                    continue
+                name = m.cstr(m.u64(slot))
+                if name in s2r:
+                    struct.pack_into('<i', m.d, m.a2o(e), s2r[name] - e); n += 1
+                else:
+                    self.E('method name %r (entry 0x%x) has no __objc_selrefs entry' % (name, e)); kept += 1
+        self.rep['objc']['method_names_to_selrefs'] = n
 
     def extra_liveness(self):
         m = self.m
@@ -1205,6 +1232,7 @@ def objc_check(m, binds, chk, rep):
         t = m.cstr(a, 4096) if a else None
         return t is not None and len(t) > 0 and all(0x20 <= ord(ch) < 0x7f for ch in t)
     text = m.sect('__TEXT', '__text')
+    selr = m.sect('__DATA_CONST', '__objc_selrefs')
     cl = m.sect('__DATA_CONST', '__objc_classlist')
     st = collections.Counter(); probs = []
     names = []
@@ -1243,6 +1271,8 @@ def objc_check(m, binds, chk, rep):
                         e = bm + 8 + 12 * j
                         slot = e + m.s32(e)
                         sel = m.u64(slot)
+                        if not (selr['addr'] <= slot < selr['addr'] + selr['size']):
+                            probs.append('%s method %d name not via __objc_selrefs' % (nm, j))
                         ok = printable(sel) and printable(e + 4 + m.s32(e + 4)) and \
                             text['addr'] <= e + 8 + m.s32(e + 8) < text['addr'] + text['size']
                     else:

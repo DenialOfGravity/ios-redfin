@@ -59,8 +59,11 @@ Python 3 with capstone (4.x or 5.x), run isolated (`python3 -I`), e.g. from `~/f
   `__DATA_CONST,__got` (unused after the cache builder redirected loads to the pool) is bound too.
 - **ObjC.** imageinfo OptimizedByDyld (0x8) cleared. Method lists lose the "uniqued+sorted" bits (0x8000000f ->
   0x8000000c, 0x1b -> 0x18), so the runtime registers selectors and searches them linearly (their order was sorted by
-  the source cache's selector addresses). Small method list names point at selector slots in `__extra_objc`; those
-  slots are rebased and stay writable (the runtime stores the registered SEL there). Protocol fixed-up/canonical
+  the source cache's selector addresses). Small (relative) method list names are pointed at the image's own
+  `__objc_selrefs` entry for the same selector (as ld emits them), which the runtime registers in `_read_images`.
+  DyldExtractor's private selector slots in `__extra_objc` are not fixed up by objc4 on iOS 16 (phone test v2:
+  `-[BiometricKitXPCServerMesa init]` was never found and the lookup fell through to the superclass), so they are
+  dropped and zeroed. Protocol fixed-up/canonical
   flags are cleared. Everything in `__extra_objc` that nothing references any more (foreign class and protocol
   copies) is zeroed, so no source-cache address is left in the file.
 - **Kept:** LC_ID_DYLIB, the LC_LOAD_DYLIBs, build/source version, symbol table (values shifted, sections renumbered),
@@ -76,7 +79,7 @@ with `ipsw dyld macho`); every target dependency exists; no rebase/bind location
 every 8-byte value left in __DATA* in the source cache's address range is an int32 pair; GOT slots all bound and zero
 in the file; fileoff == vmaddr - base for every segment/section; every load-command blob inside the file and
 __LINKEDIT; personality/LSDA slots bound; ObjC walk (classes, metaclasses, isa/superclass/cache binds, method names/types readable, IMPs in
-__text, protocols, selrefs). Independent cross-checks: `llvm-objdump --macho --rebase/--bind/--exports-trie`,
+__text, every relative method name via __objc_selrefs, protocols, selrefs). Independent cross-checks: `llvm-objdump --macho --rebase/--bind/--exports-trie`,
 `ipsw class-dump`, `ipsw macho disass`, `ldid -S`, `ipsw macho info --sig`.
 
 ## Limits
