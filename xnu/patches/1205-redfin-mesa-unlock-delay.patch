@@ -1,0 +1,121 @@
+redfin 1205: SweetMesa kern.sweet_mesa_unlock_delay_ms defers the Touch ID keybag unlock until after the match record (or never)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC3qJq7ZgZQ9z6xoDao
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -179,6 +179,8 @@
+ static volatile UInt32 gOpKind;         /* 1203: running op: 0 none, 1 enrol (3), 2 match (4), 3 finger detect (38) */
+ static volatile UInt32 gEndPend;        /* 1203: op-ending statuses to deliver (bit 0 enrol, 1 match, 2 fdet) */
+ static thread_call_t gEndTC;
++static int gUnlockDelayMs;              /* kern.sweet_mesa_unlock_delay_ms (1205): 0 now, >0 after the record, -1 never */
++static thread_call_t gUnlockTC;
+ static uint32_t nOpEnd;
+ static int gSks = 1;                    /* kern.sweet_mesa_sks: 39 GetSKSLockState follows the passcode rules (1202) */
+ static int gPcfg = 1;                   /* kern.sweet_mesa_pcfg: 46 GetProtectedConfig bits (1202) */
+@@ -321,6 +323,29 @@
+ 	gOpKind = kind;
+ }
+ 
++/*
++ * 1205: deferred Touch ID keybag unlock. With the unlock done before the match record went out, SpringBoard saw the
++ * keybag event first ("State changed to Authenticated"), set the Mesa matching mode to None, cancelled its match op
++ * and dropped the match result, so no biometric unlock action ran (passcode pad stayed, no rest-to-open).
++ */
++static void
++mesa_unlock_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	int did = 0;
++	const char *why = "";
++	int e = sweet_pc_bio_unlock(&did, &why);
++	if (e == 0) {
++		if (did) {
++			OSIncrementAtomic(&nBioUnlock);
++		}
++		sweet_acm_note_verified_match();
++	} else {
++		OSIncrementAtomic(&nBioRefused);
++	}
++	SAY("deferred Touch ID unlock (%d ms after the match record): %s%s\n", gUnlockDelayMs,
++	    e ? "REFUSED " : did ? "keybag unlocked" : "already unlocked", e ? why : "");
++}
++
+ /* 1204: the SEP itself ended the op (enrol complete / failed / timeout): no Cancel status will follow */
+ static void
+ mesa_op_finished(uint32_t kind)
+@@ -360,6 +385,12 @@
+ 			IOLockFree(l);
+ 		}
+ 	}
++	if (gUnlockTC == NULL) {
++		thread_call_t tc = thread_call_allocate(mesa_unlock_tc, NULL);
++		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gUnlockTC)) {
++			thread_call_free(tc);
++		}
++	}
+ 	if (gEndTC == NULL) {
+ 		thread_call_t tc = thread_call_allocate(mesa_end_tc, NULL);
+ 		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gEndTC)) {
+@@ -745,7 +776,19 @@
+ 			SAY("match fid 0x%x: NOT delivered (kern.sweet_mesa_match=%d, HAT %s) -> no-match\n", fid, gMatch,
+ 			    verified ? "verified" : "NOT verified");
+ 		}
+-		if (identity && !gMatchExtend) {
++		bool unlock_later = false;
++		if (identity && !gMatchExtend && gUnlockDelayMs != 0) {
++			/* 1205: rules checked now, keybag unlocked after the record (> 0 ms) or never (-1: SpringBoard's job) */
++			const char *why = "";
++			if (!sweet_pc_bio_allowed(&why)) {
++				identity = false;
++				OSIncrementAtomic(&nBioRefused);
++				SAY("match fid 0x%x: Touch ID unlock REFUSED (%s) -> no-match\n", fid, why);
++			} else if (gUnlockDelayMs > 0) {
++				mflags |= 1u << 5;      /* BKMatchDetailUnlocked: the keybag will be unlocked for this match */
++				unlock_later = true;
++			}
++		} else if (identity && !gMatchExtend) {
+ 			/* 1198: what the SEP does for an unlock match: the keybag, then one ACM credential */
+ 			int did = 0;
+ 			const char *why = "";
+@@ -798,6 +841,11 @@
+ 		}
+ 		r = mesa_deliver(MIDX_MATCH_RESULT, 2, 0, b, sz);
+ 		IOFreeData(b, sz);
++		if (unlock_later && gUnlockTC != NULL) {
++			uint64_t dl;
++			clock_interval_to_deadline((uint32_t)gUnlockDelayMs, kMillisecondScale, &dl);
++			thread_call_enter_delayed(gUnlockTC, dl);
++		}
+ 		return r;
+ 	}
+ 	default:        /* FPCD_EV_TEMPLATES and anything newer: no Apple message */
+@@ -1757,6 +1805,27 @@
+     sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
+ 
+ static int
++sysctl_sweet_mesa_unlock_delay_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gUnlockDelayMs, changed = 0;
++	int e = sysctl_io_number(req, gUnlockDelayMs, sizeof(gUnlockDelayMs), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < -1 || v > 5000) {
++		return EINVAL;
++	}
++	gUnlockDelayMs = v;
++	SAY("Touch ID keybag unlock %s (kern.sweet_mesa_unlock_delay_ms=%d)\n", v == 0 ? "at the match (before the record)" :
++	    v < 0 ? "never (left to SpringBoard)" : "deferred after the match record", v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_unlock_delay_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_unlock_delay_ms, "I", "redfin 1205: Touch ID keybag unlock 0 = before the match record "
++    "(1198), N = N ms after it (1..5000), -1 = never (record without the Unlocked flag)");
++
++static int
+ sysctl_sweet_mesa_opend(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+ {
