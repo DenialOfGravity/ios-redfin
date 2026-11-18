@@ -3,13 +3,16 @@ for sweetfpcd. kern.sweet_mesa default 0: nothing published. Matches only via br
 (default 0). Interface: phone/fpc/sweetmesa_bridge.h. Design: logs/research/fingerprint-p3-ios-2026-11-18.md.
 1192b: forwards wait at most kern.sweet_mesa_fwd_ms (300) then give the offline answer; 12/38/69 are posted (no wait).
 1192c: struct descriptors (> 4096 bytes) are prepare()d around every copy; kern.sweet_mesa bit 3 logs in/out sizes.
+1192d: bridge v2: Apple message header fixed (+0xc version, +0x18 ordinal); kern.sweet_mesa bit 1 translates FPCD events
+into Apple statuses / enrol progress / enrol result / match records (sweetmesa_bridge.h part 3); an identity match only
+with kern.sweet_mesa_match=1 AND the event's HAT-verified flag.
 
 diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
 new file mode 100644
-index 0000000..7f5c154
+index 0000000..af76971
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMesa.cpp
-@@ -0,0 +1,1318 @@
+@@ -0,0 +1,1517 @@
 +/*
 + * redfin 1192: SweetMesa, a Touch ID (Mesa) persona for Apple's unmodified biometrickitd + libBKDM1, whose real
 + * sensor work is done by a userland daemon (sweetfpcd) through a bridge user client.
@@ -35,7 +38,7 @@ index 0000000..7f5c154
 + *
 + * Switches (all default 0: nothing is published, the kernel behaves as before this patch):
 + *   kern.sweet_mesa        bit 0 publish the persona + bridge (write 0 withdraws; EBUSY while a client is open),
-+ *                          bit 1 also deliver sweetfpcd's own "FPCD"-format events raw (dev),
++ *                          bit 1 translate sweetfpcd's "FPCD" events into Apple messages (1192d; clear: logged only),
 + *                          bit 2 hex-dump the first 32 payload bytes of every command,
 + *                          bit 3 (1192c) log every call's struct in/out sizes and inline vs descriptor
 + *   kern.sweet_mesa_match  1 = let match-shaped bridge EVENTs through (default 0: dropped + logged)
@@ -46,6 +49,16 @@ index 0000000..7f5c154
 + * every forward is logged before it is queued ("cmd N -> bridge seq S").
 + *   kern.sweet_mesa_state  read-only summary
 + * Every command is logged: "SWEET MESA: <proc> cmd N Name v.. val.. in.. cap.. -> ret out.. [how]".
++ *
++ * 1192d (bridge v2, phone/fpc/sweetmesa_bridge.h part 3): the interest message header is libBKDM1's
++ * (BiometricSupport MCDMExtractMessageData): +0x0c is the message VERSION and +0x18 the ORDINAL (1192..c put the
++ * value at +0x0c and 0 at +0x18). sweetfpcd's "FPCD" events are TRANSLATED into Apple messages when kern.sweet_mesa
++ * bit 1 is set (bit 0 clear: logged only, as before): finger on/off and enrol statuses (0xe3ff8001 v1), enrol
++ * progress (0xe3ff8001 v2, ordinal 0x64 + percent, 0xc98-byte enrollment info, zeros), enrol result (0xe3ff8003 v2,
++ * {user, SMFP uuid}), no-match (status 0x33, or with the match gate open a 0xe3ff8002 record without identity).
++ * A match record WITH an identity (0xe3ff8002) is built only when kern.sweet_mesa_match = 1 AND the FPCD match
++ * event carries FPCD_MF_HAT_VERIFIED; raw (non-FPCD) match-shaped EVENTs are always dropped now. Every delivered
++ * message is logged ("message 0x... v.. ord.. len.. inline|queued").
 + */
 +#include <pexpert/arm64/board_config.h>
 +
@@ -79,7 +92,7 @@ index 0000000..7f5c154
 +#define SMB_STATE_VERSION       1
 +#define SMB_SF_PUBLISHED        (1u << 0)
 +#define SMB_SF_MATCH_GATE       (1u << 1)
-+#define SMB_SF_FPCD_RAW         (1u << 2)
++#define SMB_SF_FPCD_RAW         (1u << 2)       /* 1192d: kern.sweet_mesa bit 1 = FPCD events translated */
 +#define SMB_SF_BRIDGE_OPEN      (1u << 3)
 +#define MESA_MSG                0xe3ff8000u
 +#define MESA_INLINE_MAX         0x17
@@ -89,6 +102,43 @@ index 0000000..7f5c154
 +#define FPCD_MAGIC              0x44435046u     /* "FPCD" */
 +#define FPCD_EV_MATCH           8
 +#define SMFP_MAGIC              0x50464d53u     /* "SMFP": identity uuid {le32 SMFP, le32 fid, 0, 0} */
++
++/* 1192d: struct fpcd_event (sweetmesa_bridge.h part 2b), little-endian offsets */
++#define FEV_CODE                6               /* u16 */
++#define FEV_STATUS              16
++#define FEV_FID                 20
++#define FEV_SCORE               24
++#define FEV_REMAINING           28
++#define FEV_SAMPLES             32
++#define FEV_FLAGS               36
++#define FEV_V1_SIZE             64
++#define FEV_OP                  64              /* v2: 1 enrol, 2 match, 3 detect */
++#define FEV_PERCENT             68              /* v2: enrol progress 0..100 */
++#define FEV_V2_SIZE             80
++enum { FEV_FINGER_DOWN = 1, FEV_FINGER_UP, FEV_IMAGE, FEV_ENROL_PROGRESS, FEV_ENROL_DONE, FEV_ENROL_FAILED,
++       FEV_NOMATCH, FEV_MATCH, FEV_MATCH_WITHHELD, FEV_TEMPLATES, FEV_OP_TIMEOUT, FEV_ERROR };
++#define FEV_MF_HAT_VERIFIED     1u
++
++/* Apple message indexes (0xe3ff8000 + idx) and 0xe3ff8001 status ordinals (libBKDM1 BLHelper status table) */
++#define MIDX_STATUS             0x1
++#define MIDX_MATCH_RESULT       0x2             /* message_match_node_v2_t, >= 0xc88 + 4 * lotlItems */
++#define MIDX_ENROLL_RESULT      0x3             /* message_enroll_node_v2_t, 0x28 */
++#define MIDX_MATCH_EVENT        0xb
++#define ST_MATCHING_FAILED      0x33
++#define ST_MATCHING_STOPPED     0x3a
++#define ST_FINGER_ON            0x3f
++#define ST_FINGER_OFF           0x40
++#define ST_ENROLL_FAILED        0x43
++#define ST_ENROLL_TIMEOUT       0x44
++#define ST_UNKNOWN_ERROR        0x45
++#define ST_IMAGE_REJECTED       0x46
++#define ST_ENROLL_PROGRESS_BASE 0x64            /* 0x64 + percent; libBKDM1 answers each with 14 EnrollContinue */
++#define ENROLL_INFO_V2_SIZE     0xc98           /* message_status_enrollment_info v2 (v1 0xc80 + 0x18) */
++#define ENROLL_RESULT_V2_SIZE   0x28            /* {u32 user, uuid[16], 0x14 reserved} */
++#define MR_FLAGS                0x14            /* match record: u32 flags (bits 0-3 no-match reason, 4 PreArm,
++                                                 * 5 Unlocked, 6 CredentialAdded, 7 HomeButton, 9 ResultIgnored) */
++#define MR_LOTL_ITEMS           0xc84
++#define MR_SIZE                 0xc88
 +#define MESA_ENTITLEMENT        "com.apple.private.applemesa.allow"
 +
 +static const char *const mesa_names[88] = {
@@ -162,6 +212,10 @@ index 0000000..7f5c154
 +    nFpcdEv, nMsgPulled, nRefused;
 +static uint32_t gLastCmd;
 +static int gLastRet;
++/* 1192d */
++static uint32_t gUser;                  /* user id of the last 3 EnrollMode / 65 / 66 payload (identities' user) */
++static uint32_t gLastPct;               /* last enrol progress percent sent (never goes backwards per enrol) */
++static SInt32 nTranslated, nLoggedOnly, nMatchDelivered, nMatchRefused;
 +
 +class AppleMesaSEPDriver;
 +class AppleBiometricServices;
@@ -405,9 +459,13 @@ index 0000000..7f5c154
 +	}
 +}
 +
-+/* Send message 0xe3ff8000 (header type 0xe3ff8000 + idx) to AppleBiometricServices' interest clients. */
++/*
++ * Send message 0xe3ff8000 (header type 0xe3ff8000 + idx) to AppleBiometricServices' interest clients. Header as
++ * BiometricSupport's MCDMExtractMessageData reads it: +0 u64 ticket (0 = inline), +8 u32 type, +0xc u32 version,
++ * +0x10 u64 timestamp, +0x18 u64 ordinal, +0x20 u64 data length.
++ */
 +static IOReturn
-+mesa_deliver(uint32_t idx, uint32_t value, const uint8_t *data, uint32_t len)
++mesa_deliver(uint32_t idx, uint32_t version, uint64_t ordinal, const uint8_t *data, uint32_t len)
 +{
 +	uint8_t msg[MESA_MSG_HDR + MESA_INLINE_MAX];
 +	uint64_t now = mach_absolute_time(), ticket = 0;
@@ -428,9 +486,9 @@ index 0000000..7f5c154
 +	bzero(msg, sizeof(msg));
 +	put64(&msg[0x00], ticket);
 +	put32(&msg[0x08], MESA_MSG + idx);
-+	put32(&msg[0x0c], value);
++	put32(&msg[0x0c], version);
 +	put64(&msg[0x10], now);
-+	put64(&msg[0x18], 0);
++	put64(&msg[0x18], ordinal);
 +	put64(&msg[0x20], len);
 +	if (len <= MESA_INLINE_MAX && len) {
 +		bcopy(data, &msg[MESA_MSG_HDR], len);
@@ -447,9 +505,136 @@ index 0000000..7f5c154
 +	IOReturn r = abs->messageClients(MESA_MSG, msg, MESA_MSG_HDR + (len <= MESA_INLINE_MAX ? len : 0));
 +	abs->release();
 +	OSIncrementAtomic(&nDelivered);
-+	SAY("message 0x%x value %u len %u %s ticket 0x%llx -> 0x%x\n", MESA_MSG + idx, value, len,
++	SAY("message 0x%x v%u ord 0x%llx len %u %s ticket 0x%llx -> 0x%x\n", MESA_MSG + idx, version, ordinal, len,
 +	    ticket ? "queued" : "inline", ticket, r);
 +	return r;
++}
++
++/* 0xe3ff8001 version 1, no data: a status for BiometricKitXPCServer statusMessage:withData:timestamp: */
++static IOReturn
++mesa_status(uint32_t st)
++{
++	return mesa_deliver(MIDX_STATUS, 1, st, NULL, 0);
++}
++
++/* allocate, fill and deliver a queued payload (zeroed, then the caller's fill) */
++static uint8_t *
++mesa_zalloc(uint32_t len)
++{
++	return (uint8_t *)IOMallocZeroData(len);
++}
++
++/*
++ * 1192d: one sweetfpcd "FPCD" event -> Apple message(s). Returns the IOReturn of the last delivery, or
++ * kIOReturnSuccess when the event kind is logged only. Every decision is logged.
++ */
++static IOReturn
++fpcd_translate(const uint8_t *d, uint32_t len)
++{
++	uint32_t code = le16(d + FEV_CODE);
++	int32_t st = (int32_t)le32(d + FEV_STATUS);
++	uint32_t fid = le32(d + FEV_FID), rem = le32(d + FEV_REMAINING), smp = le32(d + FEV_SAMPLES);
++	uint32_t fl = le32(d + FEV_FLAGS);
++	bool v2 = len >= FEV_V2_SIZE;
++	uint32_t op = v2 ? le32(d + FEV_OP) : 0, pct = v2 ? le32(d + FEV_PERCENT) : 0;
++	uint8_t *b;
++	IOReturn r = kIOReturnSuccess;
++
++	OSIncrementAtomic(&nTranslated);
++	switch (code) {
++	case FEV_FINGER_DOWN:
++		return mesa_status(ST_FINGER_ON);
++	case FEV_FINGER_UP:
++		return mesa_status(ST_FINGER_OFF);
++	case FEV_IMAGE:
++		return mesa_status(ST_IMAGE_REJECTED);
++	case FEV_ENROL_PROGRESS:
++		if (st != 0 && st != 1) {       /* 4 partial, 5 too similar, 6 dirty: sample not taken */
++			SAY("enrol progress: FPC code %d (sample not taken) -> ImageRejected\n", st);
++			return mesa_status(ST_IMAGE_REJECTED);
++		}
++		if (!v2) {
++			pct = (smp + rem) ? smp * 100 / (smp + rem) : 0;
++		}
++		if (st == 0 || pct > 100) {
++			pct = 100;
++		}
++		if (pct < gLastPct && smp > 1) {
++			pct = gLastPct;
++		}
++		gLastPct = pct;
++		b = mesa_zalloc(ENROLL_INFO_V2_SIZE);
++		if (b == NULL) {
++			return kIOReturnNoMemory;
++		}
++		SAY("enrol progress: FPC code %d samples %u remaining %u -> %u%% (status 0x%x)\n", st, smp, rem, pct,
++		    ST_ENROLL_PROGRESS_BASE + pct);
++		r = mesa_deliver(MIDX_STATUS, 2, ST_ENROLL_PROGRESS_BASE + pct, b, ENROLL_INFO_V2_SIZE);
++		IOFreeData(b, ENROLL_INFO_V2_SIZE);
++		return r;
++	case FEV_ENROL_DONE:
++		gLastPct = 0;
++		if (fid == 0) {
++			return mesa_status(ST_ENROLL_FAILED);
++		}
++		b = mesa_zalloc(ENROLL_RESULT_V2_SIZE);
++		if (b == NULL) {
++			return kIOReturnNoMemory;
++		}
++		put32(b, gUser);
++		put32(b + 4, SMFP_MAGIC);
++		put32(b + 8, fid);
++		SAY("enrol done: fid 0x%x -> enroll result user %u uuid SMFP/0x%x\n", fid, gUser, fid);
++		r = mesa_deliver(MIDX_ENROLL_RESULT, 2, 0, b, ENROLL_RESULT_V2_SIZE);
++		IOFreeData(b, ENROLL_RESULT_V2_SIZE);
++		return r;
++	case FEV_ENROL_FAILED:
++		gLastPct = 0;
++		SAY("enrol failed: status %d flags 0x%x -> EnrollmentFailed\n", st, fl);
++		return mesa_status(ST_ENROLL_FAILED);
++	case FEV_OP_TIMEOUT:
++		gLastPct = 0;
++		return mesa_status(op == 1 ? ST_ENROLL_TIMEOUT : ST_MATCHING_STOPPED);
++	case FEV_ERROR:
++		return mesa_status(ST_UNKNOWN_ERROR);
++	case FEV_NOMATCH:
++	case FEV_MATCH_WITHHELD:
++	case FEV_MATCH: {
++		bool identity = code == FEV_MATCH && gMatch && (fl & FEV_MF_HAT_VERIFIED) && fid != 0;
++		if (code == FEV_MATCH && !identity) {
++			OSIncrementAtomic(&nMatchRefused);
++			SAY("match fid 0x%x: NOT delivered (kern.sweet_mesa_match=%d, HAT %s) -> no-match\n", fid, gMatch,
++			    (fl & FEV_MF_HAT_VERIFIED) ? "verified" : "NOT verified");
++		}
++		if (!gMatch) {
++			/* gate closed: no 0xe3ff8002 record at all, only the MatchingFailed status */
++			return mesa_status(ST_MATCHING_FAILED);
++		}
++		uint32_t sz = MR_SIZE;
++		b = mesa_zalloc(sz);
++		if (b == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (identity) {
++			put32(b, gUser);
++			put32(b + 4, SMFP_MAGIC);
++			put32(b + 8, fid);
++			/* flags 0: not Unlocked, no CredentialAdded (nothing is unlocked or credentialed here) */
++			OSIncrementAtomic(&nMatchDelivered);
++			SAY("MATCH: fid 0x%x user %u, HAT verified, gate open -> match record (flags 0)\n", fid, gUser);
++		} else {
++			put32(b, 0xffffffffu);          /* no identity */
++			put32(b + MR_FLAGS, 2);         /* no-match reason: matcher */
++		}
++		r = mesa_deliver(MIDX_MATCH_RESULT, 2, 0, b, sz);
++		IOFreeData(b, sz);
++		return r;
++	}
++	default:        /* FPCD_EV_TEMPLATES and anything newer: no Apple message */
++		OSIncrementAtomic(&nLoggedOnly);
++		SAY("fpcd code %u status %d: logged only (no Apple message for it)\n", code, st);
++		return kIOReturnSuccess;
++	}
 +}
 +
 +/* ---- forwarding to sweetfpcd ---- */
@@ -683,6 +868,13 @@ index 0000000..7f5c154
 +		uint32_t rlen = 0;
 +		uint8_t *rbuf;
 +
++		/* 1192d: the identities' user id (EnrollMode v2 payload +4, 65/66 payload +0) for enrol/match records */
++		if (cmd == 3 && plen >= 8 && le32(p + 4) != 0xffffffffu) {
++			gUser = le32(p + 4);
++			gLastPct = 0;
++		} else if ((cmd == 65 || cmd == 66) && plen >= 4 && le32(p) != 0xffffffffu) {
++			gUser = le32(p);
++		}
 +		switch (cmd) {
 +		case 3: put32(small, 0); fp = small; flen = 4; break;           /* u32 gid 0 */
 +		case 38: put32(small, 1); fp = small; flen = 4; break;          /* u32 enable 1 */
@@ -952,28 +1144,36 @@ index 0000000..7f5c154
 +		IOFreeData(b, n);
 +		return kIOReturnBadArgument;
 +	}
-+	bool fpcd = len >= 8 && le32(d) == FPCD_MAGIC;
-+	uint32_t code = fpcd ? le16(d + 6) : 0;
-+	bool matchy = idx == 0xb || (fpcd && code == FPCD_EV_MATCH) || len >= MESA_MATCH_RESULT_MIN;
++	bool fpcd = len >= FEV_V1_SIZE && le32(d) == FPCD_MAGIC;
++	uint32_t code = fpcd ? le16(d + FEV_CODE) : 0;
 +	if (fpcd) {
 +		OSIncrementAtomic(&nFpcdEv);
-+		SAY("EVENT fpcd code %u status %d fid %u (index 0x%x, %u bytes)\n", code,
-+		    len >= 20 ? (int32_t)le32(d + 16) : 0, len >= 24 ? le32(d + 20) : 0, idx, len);
++		SAY("EVENT fpcd v%u code %u status %d fid 0x%x flags 0x%x (%u bytes) -> %s\n", le16(d + 4), code,
++		    (int32_t)le32(d + FEV_STATUS), le32(d + FEV_FID), le32(d + FEV_FLAGS), len,
++		    (gMesa & 2) ? "translate" : "logged only (kern.sweet_mesa bit 1 clear)");
++		if (!(gMesa & 2)) {
++			if (code == FPCD_EV_MATCH) {
++				OSIncrementAtomic(&nMatchDropped);
++			}
++			IOFreeData(b, n);
++			return kIOReturnSuccess;
++		}
++		r = fpcd_translate(d, len);
++		IOFreeData(b, n);
++		return r;
 +	}
-+	if (matchy && !gMatch) {
++	/*
++	 * Raw Apple-format events (not used by sweetfpcd): a match record (index 2), a match event (0xb) or anything
++	 * >= 0xc88 bytes carries no HAT verification, so it is always dropped (1192d).
++	 */
++	if (idx == MIDX_MATCH_RESULT || idx == MIDX_MATCH_EVENT || len >= MESA_MATCH_RESULT_MIN) {
 +		OSIncrementAtomic(&nMatchDropped);
-+		SAY("EVENT index 0x%x len %u is match-shaped: DROPPED (kern.sweet_mesa_match=0)\n", idx, len);
++		SAY("EVENT index 0x%x len %u is match-shaped raw data: DROPPED (only verified FPCD matches are delivered)\n",
++		    idx, len);
 +		IOFreeData(b, n);
 +		return kIOReturnNotPermitted;
 +	}
-+	if (matchy) {
-+		SAY("EVENT index 0x%x len %u is match-shaped: delivered (kern.sweet_mesa_match=1)\n", idx, len);
-+	}
-+	if (fpcd && !(gMesa & 2)) {
-+		IOFreeData(b, n);
-+		return kIOReturnSuccess;        /* sweetfpcd's own format: logged, not given to biometrickitd */
-+	}
-+	r = mesa_deliver(idx, value, d, len);
++	r = mesa_deliver(idx, 1, value, d, len);        /* raw: version 1, subtype bits 8-31 = ordinal */
 +	IOFreeData(b, n);
 +	return r;
 +}
@@ -1308,7 +1508,7 @@ index 0000000..7f5c154
 +sysctl_sweet_mesa_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
 +    struct sysctl_req *req)
 +{
-+	char b[512];
++	char b[640];
 +	int q = 0;
 +	if (gM) {
 +		IOLockLock(gM);
@@ -1319,10 +1519,12 @@ index 0000000..7f5c154
 +	}
 +	snprintf(b, sizeof(b), "mesa=%d match=%d fwd_ms=%d published=%d abs_clients=%d bridge_clients=%d slot=%d "
 +	    "seq=%u cmds=%d canned=%d fwd=%d offline=%d timeouts=%d unsup=%d refused=%d events=%d fpcd_events=%d "
-+	    "delivered=%d queued=%d pulled=%d msgq=%d match_dropped=%d last=%u(%s)->0x%x",
++	    "delivered=%d queued=%d pulled=%d msgq=%d match_dropped=%d translated=%d logged_only=%d match_delivered=%d "
++	    "match_refused=%d user=%u last=%u(%s)->0x%x",
 +	    gMesa, gMatch, gFwdMs, gDrv != NULL, gAbsClients, gBridgeClients, slot.state, gSeq, nCmds, nCanned, nFwd,
 +	    nOffline, nTimeouts, nUnsup, nRefused, nEvents, nFpcdEv, nDelivered, nQueued, nMsgPulled, q,
-+	    nMatchDropped, gLastCmd, mesa_name(gLastCmd), gLastRet);
++	    nMatchDropped, nTranslated, nLoggedOnly, nMatchDelivered, nMatchRefused, gUser, gLastCmd, mesa_name(gLastCmd),
++	    gLastRet);
 +	return SYSCTL_OUT(req, b, strlen(b) + 1);
 +}
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
