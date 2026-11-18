@@ -100,6 +100,18 @@
  *   and the only in-process retry (checkCatacombForUser:, from startMatchOperation: 0x1efa0d72c) is skipped when
  *   identitiesCount is 0, so a 64 that came before sweetfpcd was up was never retried. Only the calling thread
  *   sleeps (gM is dropped while waiting); other clients' commands are not held. Woken by the bridge open.
+ * 1246: kern.sweet_mesa_reload (default 0 = as before). Bit 0: a LOST LOAD makes biometrickitd start over, which is
+ *   the one path that runs loadCatacomb again (BiometricSupport has no message that re-runs it; 0xe3ff800d only
+ *   runs initSensor + syncTemplateListForUser, which with biometrickitd's list emptied by the failed load would
+ *   instead remove TA templates it does not know). Lost load = (a) a user 64 failed because sweetfpcd was not
+ *   connected / did not answer (after the 1245 wait), or (b) sweetfpcd reports TA_FRESH (TA loaded empty) while the
+ *   user catacomb was loaded, i.e. the TA lost the templates biometrickitd holds. When sweetfpcd is connected (the
+ *   1207 connect call, 1.5 s after the bridge open, also runs with kern.sweet_mesa_offline=0) and a load is lost,
+ *   the persona sends SIGKILL to the biometrickitd process that opened AppleBiometricServices (name checked; what
+ *   iOS's jetsam and the hand bring-up do; launchd starts it again on demand, EnablePressuredExit job) INSTEAD of
+ *   the 0xe3ff800d re-init. The new process reads 60 (user present, not loaded) and sends 64 again. At most once
+ *   per 20 s and 3 times until a load succeeds. Cleared by any successful load (64, 49 for the user, enrol).
+ *   kern.sweet_mesa_reload_state: counters.
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -121,6 +133,7 @@
 extern "C" {
 #include <sys/errno.h>
 #include <sys/proc.h>
+#include <sys/signal.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 }
@@ -278,6 +291,14 @@ static int gOffHonest;                  /* kern.sweet_mesa_offline (1207): 1 = N
 static int gFwdWaitMs;                  /* kern.sweet_mesa_fwd_wait_ms (1245): wait for sweetfpcd, 0 = no wait */
 static SInt32 nBrWaits, nBrWaitOk, nBrWaitTo;
 static uint32_t gBrWaitLastMs;
+static int gReload;                     /* kern.sweet_mesa_reload (1246): bit 0 relaunch biometrickitd on a lost load */
+static volatile bool gCatLost;          /* 1246: biometrickitd's catacomb load was lost (see header) */
+static const char *gCatLostWhy = "";
+static volatile int gBkdPid;            /* 1246: last biometrickitd that opened AppleBiometricServices */
+static SInt32 nLost, nRelaunch, nRelaunchSkip, nRelaunchSeq;
+static uint64_t gRelaunchAt;            /* mach_absolute_time of the last relaunch */
+#define RELAUNCH_MIN_MS         20000
+#define RELAUNCH_MAX_SEQ        3
 static thread_call_t gReinitTC;
 static SInt32 nReinit;
 #define MIDX_REINIT             0xd     /* 0xe3ff800d: libBKDM1 initSensor + syncTemplateList */
@@ -820,10 +841,56 @@ sweet_mesa_lockstate_changed(void)
 }
 
 /* 1207: sweetfpcd connected: ask biometrickitd to re-init the sensor and re-sync its identity list */
+/* 1246: SIGKILL the biometrickitd that opened AppleBiometricServices; launchd starts it again on demand */
+static bool
+mesa_relaunch_bkd(const char *why)
+{
+	int pid = gBkdPid;
+	char nm[32] = "";
+	uint64_t now = mach_absolute_time(), ns = 0;
+	if (gRelaunchAt != 0) {
+		absolutetime_to_nanoseconds(now - gRelaunchAt, &ns);
+	}
+	if (pid <= 0) {
+		OSIncrementAtomic(&nRelaunchSkip);
+		SAY("lost load (%s): no biometrickitd seen yet: its first start loads the catacomb\n", why);
+		return false;
+	}
+	if (nRelaunchSeq >= RELAUNCH_MAX_SEQ || (gRelaunchAt != 0 && ns < RELAUNCH_MIN_MS * 1000000ULL)) {
+		OSIncrementAtomic(&nRelaunchSkip);
+		SAY("lost load (%s): biometrickitd restart skipped (%d in a row without a load, last %llu ms ago)\n", why,
+		    nRelaunchSeq, ns / 1000000ULL);
+		return false;
+	}
+	proc_name(pid, nm, (int)sizeof(nm));
+	if (strncmp(nm, "biometrickitd", sizeof(nm)) != 0) {
+		OSIncrementAtomic(&nRelaunchSkip);
+		SAY("lost load (%s): pid %d is '%s' now, not biometrickitd: nothing killed (its next start loads)\n", why, pid,
+		    nm);
+		gBkdPid = 0;
+		return false;
+	}
+	gRelaunchAt = now;
+	OSIncrementAtomic(&nRelaunchSeq);
+	OSIncrementAtomic(&nRelaunch);
+	SAY("lost load (%s): restarting biometrickitd (pid %d, SIGKILL; launchd relaunches it, it loads the catacomb again)\n",
+	    why, pid);
+	proc_signal(pid, SIGKILL);
+	gBkdPid = 0;
+	return true;
+}
+
 static void
 mesa_reinit_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
-	if (!gOffHonest || gBridgeClients == 0) {
+	if (gBridgeClients == 0) {
+		return;
+	}
+	if ((gReload & 1) && gCat && gCatLost) {        /* 1246: a lost load: restart, never a sync against an empty list */
+		(void)mesa_relaunch_bkd(gCatLostWhy);
+		return;
+	}
+	if (!gOffHonest) {
 		return;
 	}
 	IOReturn r = mesa_deliver(MIDX_REINIT, 1, 0, NULL, 0);
@@ -1537,6 +1604,29 @@ cat_loaded(const char *why)
 		SAY("catacomb: loaded (%s)\n", why);
 	}
 	gCatLoaded = true;
+	if (gCatLost) {                 /* 1246 */
+		SAY("catacomb: lost load recovered (%s)\n", why);
+		gCatLost = false;
+	}
+	nRelaunchSeq = 0;
+}
+
+/* 1246: biometrickitd's identities and the TA no longer agree; recovered at the next connect (kern.sweet_mesa_reload) */
+static void
+cat_lost(const char *why)
+{
+	OSIncrementAtomic(&nLost);
+	gCatLostWhy = why;
+	if (!gCatLost) {
+		SAY("catacomb: LOST LOAD (%s)%s\n", why, (gReload & 1) ? ": biometrickitd restarts once sweetfpcd is connected" :
+		    " (kern.sweet_mesa_reload 0: biometrickitd does not reload until it restarts)");
+	}
+	gCatLost = true;
+	if ((gReload & 1) && gBridgeClients > 0 && gReinitTC != NULL) {        /* connected now: decide in 1.5 s */
+		uint64_t dl;
+		clock_interval_to_deadline(REINIT_DELAY_MS, kMillisecondScale, &dl);
+		thread_call_enter_delayed(gReinitTC, dl);
+	}
 }
 
 /* sweetfpcd events that change the TA db (called for every FPCD event, before translation) */
@@ -1562,6 +1652,9 @@ cat_note_event(uint32_t code, int32_t st, uint32_t fid)
 		break;
 	case FEV_TA_FRESH:
 		OSIncrementAtomic(&nCatFresh);
+		if (gCatLoaded) {       /* 1246: the TA lost what biometrickitd holds */
+			cat_lost("TA loaded empty while the catacomb was loaded");
+		}
 		gCatLoaded = false;
 		gCatDirty = false;
 		gCatHeld = false;       /* 1218 */
@@ -1912,6 +2005,9 @@ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint3
 			}
 			/* never 0x192 / 0x8002 / 0x8003: libBKDM1 would map it to 0x10d and biometrickitd delete the file */
 			*how = offline ? "catacomb: load, sweetfpcd offline (file kept)" : "catacomb: load FAILED (file kept)";
+			if (offline) {
+				cat_lost("64 LoadCatacomb while sweetfpcd was offline");      /* 1246 */
+			}
 			SAY("catacomb: 64 user %u blob %u bytes: load failed 0x%x%s: biometrickitd keeps the file and retries\n",
 			    user, plen, r, offline ? " (offline)" : "");
 			break;
@@ -2378,6 +2474,9 @@ AppleBiometricServicesUserClient::initWithTask(task_t owningTask, void *security
 	gAbsClients++;
 	IOLockUnlock(gM);
 	fCounted = true;
+	if (strncmp(pn, "biometrickitd", sizeof(pn)) == 0) {
+		gBkdPid = proc_selfpid();       /* 1246 */
+	}
 	if ((gCat & CAT_ON) && (gCat & CAT_SESSION) && strncmp(pn, "biometrickitd", sizeof(pn)) == 0) {
 		/* 1218: a new biometrickitd session: its identity list is rebuilt from the files (64 again) */
 		OSIncrementAtomic(&nCatSession);
@@ -2494,7 +2593,7 @@ SweetMesaBridgeUserClient::initWithTask(task_t owningTask, void *securityID, UIn
 	bool first = gBridgeClients == 1;
 	IOLockWakeup(gM, &gEvBridge, false);    /* 1245: every command waiting for sweetfpcd */
 	IOLockUnlock(gM);
-	if (first && gOffHonest && gReinitTC != NULL) {          /* 1207 */
+	if (first && (gOffHonest || (gReload & 1)) && gReinitTC != NULL) {     /* 1207, 1246 */
 		uint64_t dl;
 		clock_interval_to_deadline(REINIT_DELAY_MS, kMillisecondScale, &dl);
 		thread_call_enter_delayed(gReinitTC, dl);
@@ -3249,6 +3348,43 @@ sysctl_sweet_mesa_fwd_wait_state(__unused struct sysctl_oid *oidp, __unused void
 	    nBrWaits, nBrWaitOk, nBrWaitTo, gBrWaitLastMs, gBridgeClients);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
+static int
+sysctl_sweet_mesa_reload(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gReload, changed = 0;
+	int e = sysctl_io_number(req, gReload, sizeof(gReload), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 1) {
+		return EINVAL;
+	}
+	mesa_locks();
+	gReload = v;
+	SAY("lost catacomb load: %s (kern.sweet_mesa_reload=%d)\n", v ? "biometrickitd restarts when sweetfpcd is connected" :
+	    "no action (as before)", v);
+	if (v && gCatLost && gBridgeClients > 0 && gReinitTC != NULL) {
+		thread_call_enter(gReinitTC);
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_reload, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_reload, "I", "redfin 1246: 1 = a lost catacomb load (64 while sweetfpcd was offline, or the TA "
+    "loaded empty under a loaded catacomb) restarts biometrickitd once sweetfpcd is connected; 0 = as before");
+
+static int
+sysctl_sweet_mesa_reload_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char b[240];
+	snprintf(b, sizeof(b), "reload=%d lost=%d why=%s lost_events=%d relaunched=%d skipped=%d in_a_row=%d bkd_pid=%d",
+	    gReload, gCatLost, gCatLost ? gCatLostWhy : "-", nLost, nRelaunch, nRelaunchSkip, nRelaunchSeq, gBkdPid);
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_reload_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_reload_state, "A", "redfin 1246: lost-load recovery state");
+
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fwd_wait_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_fwd_wait_state, "A", "redfin 1245: bridge waits");
 
