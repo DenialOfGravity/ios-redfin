@@ -1619,6 +1619,7 @@ std::shared_ptr<Texture> Texture::swizzled(const std::shared_ptr<Texture>& textu
     }
     std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
     t->chroma_ = p.chroma_;
+    t->yc_ = p.yc_;   // (ws-hm-planes) a swizzled two-plane YCbCr texture (Metal's descriptor swizzle) is decoded as its parent
     t->layerPitch_ = p.layerPitch_;
     t->takeUbwc(p);   // (redfin hmv2: a compressed render target's swizzled view reads it compressed too)
     // over the parent's: a component naming red reads what the parent's red reads
@@ -2024,6 +2025,7 @@ std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t*
         d.usage = kTextureUsageRead;
         std::shared_ptr<Texture> c = make(gpu, d, why);
         if (c == nullptr) return nullptr;
+        for (int k = 0; k < 4; k++) c->swizzle_[k] = swizzle_[k];   // (ws-hm-planes) a swizzled YCbCr texture's copy reads through it
         gYcCopy[0]++;
         if (empty >= 0) gYcCopy[1]++;
         ycCopy_[i] = c;
@@ -2040,6 +2042,7 @@ std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t*
         d.usage = kTextureUsageRead;
         copy = make(gpu, d, why);
         if (copy == nullptr) return nullptr;
+        for (int k = 0; k < 4; k++) copy->swizzle_[k] = swizzle_[k];   // (ws-hm-planes)
         gYcCopy[0]++;
     }
     return copy;

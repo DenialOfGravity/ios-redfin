@@ -931,6 +931,28 @@ TEST(a_texture_over_one_plane_of_a_two_plane_surface_is_that_plane_in_place) {
     r.fake->addSurface(42, 64, 64, 256, 0x42475241u);
     CHECK(Texture::wrapSurfacePlane(*r.gpu, 42, 0, y, Texture::PlaneRows{0, 256, 64, 64, 4}, &why) == nullptr);
     CHECK(why.find("a plane of a multi-plane surface") != std::string::npos);
+    // VideoToolbox's source, format 540 over the same '420f' surface, read through its descriptor's swizzle: the swizzled
+    // texture is still the two planes, decoded as its parent (HM_540_SWIZZLE)
+    Texture::Ycbcr yc;
+    yc.matrix = 1;
+    yc.planes = true;
+    yc.lumaOffset = 0;
+    yc.lumaRow = row;
+    yc.chromaOffset = chromaAt;
+    yc.chromaRow = row;
+    auto src = Texture::wrapSurfaceYcbcr(*r.gpu, 41, W, H, yc, &why);
+    CHECK(src != nullptr);
+    if (src != nullptr) {
+        const uint8_t brg[4] = {4, 2, 3, 5};
+        auto z = Texture::swizzled(src, brg, &why);
+        CHECK(z != nullptr);
+        if (z != nullptr) {
+            CHECK(z->ycbcrDecoded());
+            CHECK(z->ycbcr().planes);
+            CHECK_EQ(z->ycbcr().chromaOffset, chromaAt);
+            CHECK_EQ(z->surface(), 41u);
+        }
+    }
 }
 
 TEST(an_image_kernel_stores_into_a_2d_array_or_a_3d_texture_through_a_layered_descriptor) {

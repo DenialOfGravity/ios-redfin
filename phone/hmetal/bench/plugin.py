@@ -5385,6 +5385,41 @@ HM_PLANES_DUMP_EDITS = [
 ]
 
 
+# (ws-hm-planes) HM_540_SWIZZLE=1 (default) | 2 | 0: a two-plane YCbCr texture over a surface (500 / 540, HM_YCBCR=native)
+# is read through the descriptor's swizzle, as Apple's driver reads it (it was ignored: VideoToolbox's transfer in
+# mediaserverd -- the Camera preview -- then wrote Cb into Y, Cr into Cb and Y into Cr: the dumps of HM_PLANE_DUMP
+# correlate 1.00 so). 2: format 540 as (blue, red, green) whatever the descriptor says (a test); 0: as before. The
+# descriptor's swizzle is said once per value.
+HM_PLANES_SWZ_EDITS = [
+    ('static int\nhm_plane_shadow_on(void)\n',
+     'static int\nhm_540_swizzle_mode(void)\n{\n\tstatic int m = -1;\n\n'
+     '\tif (m < 0) {\n\t\tconst char *e = getenv("HM_540_SWIZZLE");\n\n\t\tm = e == NULL || e[0] == 0 ? 1 : atoi(e);\n\t}\n\treturn m;\n}\n\n'
+     'static int\nhm_plane_shadow_on(void)\n'),
+    ('\t\t\tif (yt != NULL) {\n\t\t\t\tHM_ONCE("a two-plane YCbCr surface sampled as format %lu is converted on the GPU',
+     '\t\t\tif (yt != NULL) {   /* (ws-hm-planes) HM_540_SWIZZLE: the descriptor\'s swizzle */\n'
+     '\t\t\t\tconst MTLTextureSwizzleChannels sw = [descriptor swizzle];\n'
+     '\t\t\t\tunsigned r = sw.red, g = sw.green, b = sw.blue, a = sw.alpha;\n'
+     '\t\t\t\tstatic uint32_t said[8];\n'
+     '\t\t\t\tconst uint32_t key = ((uint32_t)[descriptor pixelFormat] << 12) | (r << 9) | (g << 6) | (b << 3) | a;\n'
+     '\t\t\t\tint known = 0;\n\n'
+     '\t\t\t\tfor (int i = 0; i < 8; i++) {\n\t\t\t\t\tif (said[i] == key) known = 1;\n\t\t\t\t}\n'
+     '\t\t\t\tif (!known) {\n'
+     '\t\t\t\t\tfor (int i = 0; i < 8; i++) {\n\t\t\t\t\t\tif (said[i] == 0) {\n\t\t\t\t\t\t\tsaid[i] = key;\n\t\t\t\t\t\t\tbreak;\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n'
+     '\t\t\t\t\thm_print("HM_540_SWIZZLE=%d: a two-plane YCbCr texture, format %lu, usage %#lx, descriptor swizzle (%u %u %u %u)\\n",\n'
+     '\t\t\t\t\t\t hm_540_swizzle_mode(), (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor usage], r, g, b, a);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tif (hm_540_swizzle_mode() == 2 && [descriptor pixelFormat] == (MTLPixelFormat)540) {\n'
+     '\t\t\t\t\tr = MTLTextureSwizzleBlue;\n\t\t\t\t\tg = MTLTextureSwizzleRed;\n\t\t\t\t\tb = MTLTextureSwizzleGreen;\n\t\t\t\t\ta = MTLTextureSwizzleAlpha;\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tif (hm_540_swizzle_mode() != 0 && (r != MTLTextureSwizzleRed || g != MTLTextureSwizzleGreen || b != MTLTextureSwizzleBlue ||\n'
+     '\t\t\t\t\t\t\t\t       a != MTLTextureSwizzleAlpha)) {\n'
+     '\t\t\t\t\thakios_metal_texture *z = hakios_metal_texture_new_swizzled(yt, r, g, b, a);\n\n'
+     '\t\t\t\t\tif (z != NULL) {\n\t\t\t\t\t\thakios_metal_texture_free(yt);\n\t\t\t\t\t\tyt = z;\n\t\t\t\t\t}\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tHM_ONCE("a two-plane YCbCr surface sampled as format %lu is converted on the GPU'),
+]
+
+
 def main():
     src = apply(open(sys.argv[1]).read())
     src, scopes = hmt_scopes(src)   # (redfin hm-trace)
@@ -5396,6 +5431,7 @@ def main():
     src = apply(src, HM_PHOTOS_EDITS)   # (ws-hm-photos) HM_PLANE_SHADOW
     src = apply(src, HM_PLANES_EDITS)   # (ws-hm-planes) HM_PLANE_NATIVE, HM_PLANE_SEED
     src = apply(src, HM_PLANES_DUMP_EDITS)   # (ws-hm-planes) HM_PLANE_DUMP, HM_540_FRESH (test switches)
+    src = apply(src, HM_PLANES_SWZ_EDITS)   # (ws-hm-planes) HM_540_SWIZZLE
     open(sys.argv[2], 'w').write(src)
     print('plugin.py: %d edits, %d hm-trace scopes, %d plug-fast edits, %d nouc edits' % (len(EDITS), sum(scopes.values()), len(HM_PLUGCPU_EDITS),
                                                                                       len(HM_NOUC_EDITS)))
