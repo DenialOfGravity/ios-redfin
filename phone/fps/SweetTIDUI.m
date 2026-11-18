@@ -19,7 +19,8 @@
  *       after a match / "Try Again" with a shake after a failed finger, updateCallToActionForMesaMatchFailure) runs
  *       as on a home-button device. It returns at once when SBFEffectiveHomeButtonType() == 2 (no home button,
  *       MobileGestalt HomeButtonType, cached by -[BSPlatform homeButtonType]); while it runs, and only then,
- *       -[BSPlatform homeButtonType] answers 1. Nothing else in SpringBoard sees a home button.
+ *       -[BSPlatform homeButtonType] answers 1. The same for -[CSFixedFooterView initWithFrame:], which otherwise
+ *       creates no container (shake view) for that label. Nothing else in SpringBoard sees a home button.
  *   l   log what was hooked and each hooked call to /var/tmp/sweettidui.log
  */
 #import <Foundation/Foundation.h>
@@ -100,7 +101,30 @@ tu_hook_native_footer(void)
 				tu_get(l, "text"), [(UIView *)l window], chain]);
 		}
 	}));
-	tu_note(@"n: CSFixedFooterViewController call to action as on a home-button device");
+	/* the label's container: -[CSFixedFooterView initWithFrame:] adds the shake view (and the page control) only
+	 * when the home button type is not 2; without it setCallToActionLabel: leaves the label without a superview */
+	Class fv = objc_getClass("CSFixedFooterView");
+	SEL sinit = sel_registerName("initWithFrame:");
+	Method minit = fv != Nil ? class_getInstanceMethod(fv, sinit) : NULL;
+	if (minit != NULL) {
+		__block id (*oinit)(id, SEL, CGRect) = NULL;
+		oinit = (id (*)(id, SEL, CGRect))method_setImplementation(minit, imp_implementationWithBlock(^id(id self_,
+			CGRect r) {
+			bool main = pthread_equal(pthread_self(), tu_main);
+			if (main) {
+				tu_footer_depth++;
+			}
+			id v = oinit(self_, sinit, r);
+			if (main) {
+				tu_footer_depth--;
+			}
+			tu_note([NSString stringWithFormat:@"n: CSFixedFooterView %p init (shake view %p)", v,
+				tu_get(v, "callToActionShakeView")]);
+			return v;
+		}));
+	}
+	tu_note([NSString stringWithFormat:@"n: CSFixedFooterViewController call to action as on a home-button device "
+		"(CSFixedFooterView initWithFrame: %s)", minit ? "hooked" : "missing"]);
 	return true;
 }
 
