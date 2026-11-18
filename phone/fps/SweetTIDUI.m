@@ -1,20 +1,26 @@
 /*
- * SweetTIDUI (ws-u-tidui): Touch ID feedback on the lock screen of our iPhone X rootfs (no home button), in the
- * iPhone 8 style. Compiled into SweetFPS.dylib (xnu 0999 inserts it into SpringBoard); runs only in SpringBoard.
+ * SweetTIDUI (ws-u-tidui): Touch ID feedback on the lock screen of our iPhone X rootfs (no home button).
+ * Compiled into SweetFPS.dylib (xnu 0999 inserts it into SpringBoard); runs only in SpringBoard.
  * RE notes: PF/logs/research/touchid-lockui-2026-11-18.md.
  *
- * Switch: /var/local/sweettidui, read once at SpringBoard launch (respring to apply). No file, or no 'n' in it:
- * nothing is hooked. Letters:
- *   n   "native" iPhone 8 call to action in the cover sheet footer: CoverSheet's own
+ * Switch: /var/local/sweettidui, read once at SpringBoard launch (respring to apply). No file, or neither 'h' nor
+ * 'n' in it: nothing is hooked. Letters (independent, both may be set):
+ *   h   "iPhone X look": the cover sheet's padlock (proud lock) on a Touch ID device. CoverSheet creates it in
+ *       -[CSCoverSheetViewController viewDidLoad] when hasPearlSupport || MG(z5G/N9jcMdgPm8UegLwbKg) ||
+ *       hasPoseidonSupport, and the passcode pad when -[SBUIPasscodeLockViewBase _supportsProudLock] /
+ *       -[CSPasscodeViewController setShowProudLock:]. Apple's own Touch-ID-with-padlock key z5G cannot be set
+ *       through the MG cache's CacheExtra (libMobileGestalt then drops the whole cache), so: -[SBUIBiometricResource
+ *       hasPearlSupport] answers YES for that one call site in viewDidLoad (return address inside its IMP) and
+ *       nowhere else; _supportsProudLock answers YES; setShowProudLock: gets YES. The padlock then follows Touch ID
+ *       natively: open when authenticated, jiggle on a failed finger (SBLockScreenManager jiggleLock ->
+ *       -[CSCoverSheetViewController jiggleLockIcon]).
+ *   n   "iPhone 8 style" call to action in the cover sheet footer: CoverSheet's own
  *       -[CSFixedFooterViewController _updateCallToActionTextAnimated:] (Press home to unlock / Press home to open
  *       after a match / "Try Again" with a shake after a failed finger, updateCallToActionForMesaMatchFailure) runs
  *       as on a home-button device. It returns at once when SBFEffectiveHomeButtonType() == 2 (no home button,
  *       MobileGestalt HomeButtonType, cached by -[BSPlatform homeButtonType]); while it runs, and only then,
  *       -[BSPlatform homeButtonType] answers 1. Nothing else in SpringBoard sees a home button.
- *   l   log what was hooked and each footer update to /var/tmp/sweettidui.log
- * The "iPhone X look" (the cover sheet's padlock driven by Touch ID) needs no code: it is MobileGestalt
- * z5G/N9jcMdgPm8UegLwbKg = true in the MG cache's CacheExtra (CoverSheet / SBUIPasscodeLockViewBase create the proud
- * lock when hasPearlSupport || MG(z5G) || hasPoseidonSupport), see the research doc.
+ *   l   log what was hooked and each hooked call to /var/tmp/sweettidui.log
  */
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -26,6 +32,7 @@
 static int tu_footer_depth;	/* > 0 while CoverSheet's footer call-to-action update runs (main thread) */
 static pthread_t tu_main;
 static bool tu_log;
+static uintptr_t tu_vdl_lo, tu_vdl_hi;	/* -[CSCoverSheetViewController viewDidLoad] code range */
 
 static void
 tu_note(NSString *what)
@@ -39,6 +46,13 @@ tu_note(NSString *what)
 		fprintf(f, "%s SpringBoard[%d] %s\n", [[NSDate date] description].UTF8String, getpid(), what.UTF8String);
 		fclose(f);
 	}
+}
+
+static id
+tu_get(id o, const char *sel)
+{
+	SEL s = sel_registerName(sel);
+	return [o respondsToSelector:s] ? ((id (*)(id, SEL))objc_msgSend)(o, s) : nil;
 }
 
 static bool
@@ -74,16 +88,72 @@ tu_hook_native_footer(void)
 			tu_footer_depth--;
 		}
 		if (tu_log) {
-			id v = [self_ respondsToSelector:sel_registerName("fixedFooterView")]
-				? ((id (*)(id, SEL))objc_msgSend)(self_, sel_registerName("fixedFooterView")) : nil;
-			id l = [v respondsToSelector:sel_registerName("callToActionLabel")]
-				? ((id (*)(id, SEL))objc_msgSend)(v, sel_registerName("callToActionLabel")) : nil;
-			id t = [l respondsToSelector:sel_registerName("text")]
-				? ((id (*)(id, SEL))objc_msgSend)(l, sel_registerName("text")) : nil;
-			tu_note([NSString stringWithFormat:@"footer update (animated %d): label %p text '%@'", anim, l, t]);
+			id l = tu_get(tu_get(self_, "fixedFooterView"), "callToActionLabel");
+			tu_note([NSString stringWithFormat:@"footer update (animated %d): label %p text '%@'", anim, l,
+				tu_get(l, "text")]);
 		}
 	}));
 	tu_note(@"n: CSFixedFooterViewController call to action as on a home-button device");
+	return true;
+}
+
+static bool
+tu_hook_proud_lock(void)
+{
+	Class cs = objc_getClass("CSCoverSheetViewController");
+	Class br = objc_getClass("SBUIBiometricResource");
+	Class pv = objc_getClass("SBUIPasscodeLockViewBase");
+	Class pc = objc_getClass("CSPasscodeViewController");
+	SEL svdl = sel_registerName("viewDidLoad");
+	SEL spearl = sel_registerName("hasPearlSupport");
+	SEL ssup = sel_registerName("_supportsProudLock");
+	SEL sshow = sel_registerName("setShowProudLock:");
+	/* class_getInstanceMethod also finds inherited ones: use only methods the class itself implements */
+	Method mvdl = NULL, mpearl = NULL, msup = NULL, mshow = NULL;
+	unsigned n = 0;
+	Method *ml = cs != Nil ? class_copyMethodList(cs, &n) : NULL;
+	for (unsigned i = 0; i < n; i++) {
+		if (method_getName(ml[i]) == svdl) {
+			mvdl = ml[i];
+		}
+	}
+	free(ml);
+	mpearl = br != Nil ? class_getInstanceMethod(br, spearl) : NULL;
+	msup = pv != Nil ? class_getInstanceMethod(pv, ssup) : NULL;
+	mshow = pc != Nil ? class_getInstanceMethod(pc, sshow) : NULL;
+	if (mvdl == NULL || mpearl == NULL) {
+		tu_note([NSString stringWithFormat:@"h: not hooked (CSCoverSheetViewController viewDidLoad %p, "
+			"SBUIBiometricResource hasPearlSupport %p)", mvdl, mpearl]);
+		return false;
+	}
+	/* the call is at +0x560 of the 16.7 (20H392) X cache's viewDidLoad; the method is ~0x900 long */
+	tu_vdl_lo = (uintptr_t)method_getImplementation(mvdl);
+	tu_vdl_hi = tu_vdl_lo + 0xa00;
+	__block BOOL (*opearl)(id, SEL) = NULL;
+	opearl = (BOOL (*)(id, SEL))method_setImplementation(mpearl, imp_implementationWithBlock(^BOOL(id self_) {
+		BOOL r = opearl(self_, spearl);
+		uintptr_t ra = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+		if (!r && ra >= tu_vdl_lo && ra < tu_vdl_hi) {
+			tu_note([NSString stringWithFormat:@"h: hasPearlSupport YES for CSCoverSheetViewController viewDidLoad "
+				"(+%#lx)", (unsigned long)(ra - tu_vdl_lo)]);
+			return YES;
+		}
+		return r;
+	}));
+	if (msup != NULL) {
+		method_setImplementation(msup, imp_implementationWithBlock(^BOOL(id self_) {
+			return YES;
+		}));
+	}
+	if (mshow != NULL) {
+		__block void (*oshow)(id, SEL, BOOL) = NULL;
+		oshow = (void (*)(id, SEL, BOOL))method_setImplementation(mshow, imp_implementationWithBlock(^(id self_,
+			BOOL on) {
+			oshow(self_, sshow, YES);
+		}));
+	}
+	tu_note([NSString stringWithFormat:@"h: proud lock on (viewDidLoad IMP %#lx, passcode pad _supportsProudLock %s, "
+		"setShowProudLock: %s)", (unsigned long)tu_vdl_lo, msup ? "hooked" : "missing", mshow ? "hooked" : "missing"]);
 	return true;
 }
 
@@ -105,10 +175,18 @@ tu_init(void)
 	tu_log = strchr(buf, 'l') != NULL;
 	tu_main = pthread_self();	/* constructors run on SpringBoard's main thread */
 	tu_note([NSString stringWithFormat:@"switch '%.*s'", (int)strcspn(buf, "\n"), buf]);
-	if (strchr(buf, 'n') != NULL && !tu_hook_native_footer()) {
+	bool want_n = strchr(buf, 'n') != NULL, want_h = strchr(buf, 'h') != NULL;
+	bool ok_n = !want_n || tu_hook_native_footer();
+	bool ok_h = !want_h || tu_hook_proud_lock();
+	if (!ok_n || !ok_h) {
 		/* CoverSheet not realized yet: try again once the main run loop runs */
 		dispatch_async(dispatch_get_main_queue(), ^{
-			tu_hook_native_footer();
+			if (!ok_n) {
+				tu_hook_native_footer();
+			}
+			if (!ok_h) {
+				tu_hook_proud_lock();
+			}
 		});
 	}
 }
