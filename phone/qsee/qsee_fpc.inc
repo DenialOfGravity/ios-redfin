@@ -317,18 +317,33 @@ static int fpc_bio(uint32_t appid, uint8_t *d, uint32_t cmd, int32_t *status)
 	return r;
 }
 
-static int fpc_print_ids(uint32_t appid, const char *what, uint32_t *count)
+static int fpc_get_ids(uint32_t appid, uint32_t out[5], uint32_t *count, int32_t *status)
 {
 	uint8_t d[FPC_SENSOR_LEN] = { 0 };
-	int32_t st;
 	put_u32(d + 0xc, 5);
-	int r = fpc_bio(appid, d, 7, &st);
+	int r = fpc_bio(appid, d, 7, status);
 	if (r)
 		return r;
 	uint32_t n = rd_u32(d + 0xc);
+	if (n > 5)
+		n = 5;
+	for (uint32_t i = 0; i < n; i++)
+		out[i] = rd_u32(d + 0x10 + 4 * i);
+	*count = n;
+	return 0;
+}
+
+static int fpc_print_ids(uint32_t appid, const char *what, uint32_t *count)
+{
+	uint32_t list[5] = { 0 };
+	uint32_t n = 0;
+	int32_t st;
+	int r = fpc_get_ids(appid, list, &n, &st);
+	if (r)
+		return r;
 	char ids[96] = "";
-	for (uint32_t i = 0; i < n && i < 5; i++)
-		snprintf(ids + strlen(ids), sizeof(ids) - strlen(ids), " %#x", rd_u32(d + 0x10 + 4 * i));
+	for (uint32_t i = 0; i < n; i++)
+		snprintf(ids + strlen(ids), sizeof(ids) - strlen(ids), " %#x", list[i]);
 	*count = st ? 0xffffffffu : n;
 	uint8_t e[FPC_SENSOR_LEN] = { 0 };
 	int32_t st2;
@@ -364,6 +379,27 @@ static int cmd_fp_delete(uint32_t appid, uint32_t fid)
 	uint32_t n;
 	fpc_print_ids(appid, "fp-delete after", &n);
 	return r;
+}
+
+/* delete every finger the TA currently lists; returns 0 iff get_finger_ids ends up empty */
+static int fpc_cleanup_all(uint32_t appid, const char *what)
+{
+	uint32_t list[5] = { 0 }, n = 0;
+	int32_t st;
+	if (fpc_get_ids(appid, list, &n, &st) || st) {
+		say("%s: get_finger_ids failed (status %d), cannot clean up", what, st);
+		return -1;
+	}
+	if (n == 0) {
+		say("%s: DB already empty", what);
+		return 0;
+	}
+	say("%s: deleting %u leftover finger(s)", what, n);
+	for (uint32_t i = 0; i < n; i++)
+		fpc_delete(appid, list[i]);
+	uint32_t left = 0xffffffffu;
+	fpc_print_ids(appid, what, &left);
+	return left == 0 ? 0 : -1;
 }
 
 /* one capture as capture_image(wait_for_finger): 0 + *st4 = cmd 4 status; 6 = timeout; else transport rc */
@@ -492,6 +528,7 @@ static int cmd_enrol_test(uint32_t appid, int ms)
 	if (!done) {
 		say("5 enrol NOT finished (%s) after %d captures (%d too-fast/no-finger), %d accepted", rc ? "error" : "timeout",
 		    attempts, quiet_caps, sample);
+		fpc_cleanup_all(appid, "cleanup");
 		return rc ? rc : 6;
 	}
 	memset(d, 0, sizeof(d));
@@ -500,9 +537,23 @@ static int cmd_enrol_test(uint32_t appid, int ms)
 	fid = rd_u32(d + 0xc);
 	have_fid = !st;
 	say("6 end_enrol: status %d, finger id %#x", st, fid);
+	uint32_t ids7[5] = { 0 }, n7 = 0;
+	int32_t st7;
 	fpc_print_ids(appid, "7 after enrol", &n);
-	if (!have_fid)
-		return 5;
+	fpc_get_ids(appid, ids7, &n7, &st7);
+	if (!have_fid) {
+		/* end_enrol failed (e.g. -1 = HMAC auth key not initialized / no HAT). If the TA still listed a
+		 * finger, carry on with its id so identify + delete are still exercised; else clean up and stop. */
+		if (!st7 && n7 > 0) {
+			fid = ids7[0];
+			have_fid = 1;
+			say("6b end_enrol failed but get_finger_ids shows %u finger(s); using id %#x for identify/delete", n7, fid);
+		} else {
+			say("6b end_enrol failed and no finger stored; cleaning up and stopping");
+			fpc_cleanup_all(appid, "cleanup");
+			return 5;
+		}
+	}
 	say("8 identify: touch with the SAME finger up to 5 times (lift between)");
 	int matches = 0, tries = 0;
 	while (tries < 5 && fpc_ms_since(&t0) < ms) {
@@ -529,11 +580,9 @@ static int cmd_enrol_test(uint32_t appid, int ms)
 		usleep(300000);
 	}
 	say("8 identify: %d match(es) of %d", matches, tries);
-	int dr = fpc_delete(appid, fid);
-	uint32_t left = 0xffffffffu;
-	fpc_print_ids(appid, "9 after delete", &left);
-	int ok = !dr && left == 0;
-	say("enrol-test %u: enrolled %#x with %d samples, identify %d/%d, delete %s (%ld ms)", appid, fid, sample, matches,
+	int clean = fpc_cleanup_all(appid, "9 after delete");	/* delete every id the TA lists, not just fid */
+	int ok = clean == 0;
+	say("enrol-test %u: enrolled %#x with %d samples, identify %d/%d, cleanup %s (%ld ms)", appid, fid, sample, matches,
 	    tries, ok ? "OK, DB empty" : "FAILED", fpc_ms_since(&t0));
 	print_seen();
 	return !ok ? 5 : matches ? 0 : 8;
