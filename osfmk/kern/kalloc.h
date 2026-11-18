@@ -821,11 +821,16 @@ __options_decl(kt_granule_t, uint32_t, {
  * @param ptr           the pointer whose type needs to be checked.
  * @param type          the type which the pointer will be checked against.
  */
+#ifdef __cplusplus
+#define __KT_PTR_ELEM_T(ptr) __remove_pointer(__typeof__(ptr))
+#else
+#define __KT_PTR_ELEM_T(ptr) __typeof__(*(ptr))
+#endif
 #define KALLOC_TYPE_IS_COMPATIBLE_PTR(ptr, type)                   \
 	_Pragma("clang diagnostic push")                               \
 	_Pragma("clang diagnostic ignored \"-Wvoid-ptr-dereference\"") \
-	(__builtin_xnu_types_compatible(__typeof__(*(ptr)), type) ||   \
-	    __builtin_xnu_types_compatible(__typeof__(*(ptr)), void))  \
+	(__builtin_xnu_types_compatible(__KT_PTR_ELEM_T(ptr), type) ||   \
+	    __builtin_xnu_types_compatible(__KT_PTR_ELEM_T(ptr), void))  \
 	_Pragma("clang diagnostic pop")
 
 #define KALLOC_TYPE_ASSERT_COMPATIBLE_POINTER(ptr, type) \

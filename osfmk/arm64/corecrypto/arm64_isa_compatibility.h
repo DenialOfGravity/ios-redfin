@@ -28,7 +28,7 @@
 // #include <Availability.h>
 #include <sys/cdefs.h>
 
-#if defined(__clang__) && ((defined(__apple_build_version__) && __apple_build_version__ > 5010000))
+#if defined(__clang__) && (!defined(__apple_build_version__) || __apple_build_version__ > 5010000)
 #define __USES_V_CRYPTO_INTRINSICS 1
 #else
 #define __USES_V_CRYPTO_INTRINSICS 0

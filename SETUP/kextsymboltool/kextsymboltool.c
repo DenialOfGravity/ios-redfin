@@ -98,6 +98,11 @@ seekFile(int fd, off_t offset)
 	ToolError err;
 
 	if (offset != lseek(fd, offset, SEEK_SET)) {
+		struct stat st;
+		/* Linux lseek() returns 0 on /dev/null (check_all_exports): not an error */
+		if (0 == fstat(fd, &st) && S_ISCHR(st.st_mode)) {
+			return kErrorNone;
+		}
 		err = kErrorDiskFull;
 	} else {
 		err = kErrorNone;
