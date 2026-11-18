@@ -1914,9 +1914,9 @@ int main(int argc, char **argv)
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
 	lsnr_diag = (e = getenv("FPCD_LSNR_DIAG")) ? atoi(e) : 0;
 	if ((e = getenv("FPCD_IO_RETRY")) && *e)
-		io_retry = atoi(e);
+		io_retry = atoi(e);	/* 1: first identify of a match op, 2: every one */
 	if ((e = getenv("FPCD_NOMATCH_CONTINUE")) && *e)
-		nomatch_continue = atoi(e) != 0;	/* 1: first identify of a match op, 2: every one */
+		nomatch_continue = atoi(e) != 0;
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
