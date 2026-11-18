@@ -1,0 +1,545 @@
+redfin 1206: SweetMesa kern.sweet_mesa_catacomb: Touch ID templates persist through biometrickitd's catacomb (60 state, 61-64 store/load the FPC TA db via sweetfpcd)
+
+Default 0 = 1200 behaviour. 1: 60 answers {user (gUser or 501), present | loaded | dirty}; 61 makes sweetfpcd store the
+TA template db and stage a "SWCT" blob, 62 pulls it in 4032-byte chunks, 63 clears dirty, 64 pushes the file's blob in
+chunks and loads it. A failed load never returns the codes libBKDM1 maps to 0x10d (file deleted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -53,6 +53,22 @@
+  * 1192f: 60 GetCatacombState answers {gUser, state 1} (an empty answer made biometrickitd drop every new identity).
+  * 1192e: AppleBiometricServicesUserClient::message accepts 0xe3ff8000 (the aggregate messageClients result was
+  * kIOReturnUnsupported from the user client itself, not from the interest notification).
++ * 1206: kern.sweet_mesa_catacomb=1 makes enrolled fingers persist the iOS way (default 0 = 1200's behaviour).
++ *   biometrickitd (BiometricSupport) owns the catacomb file (/var/root/Library/Catacomb/..., an NSKeyedArchiver with
++ *   CatacombVersion / CatacombUserID / CatacombIdentityList / CatacombSecureData); the SEP's part is the opaque
++ *   CatacombSecureData blob. Here that blob is sweetfpcd's "SWCT" image of the FPC TA's encrypted template db
++ *   (store_template_db / load_template_db through an in-memory file listener), so no file is written by us.
++ *   60 GetCatacombState answers {user, 1 | loaded << 1 | dirty << 2} for the identities' user (gUser, else 501):
++ *   biometrickitd loads the catacomb when (state & 3) == 1 (checkCatacombForUser:) and at its start for every
++ *   present user (loadCatacomb), and saves when bit 2 is set (getCatacombSaveListForComponents:).
++ *   61 PrepareSaveCatacomb -> sweetfpcd stores the db and stages the blob, answers its size; 62 CompleteSaveCatacomb
++ *   pulls it in chunks (FPCD_CMD_CAT_GET); 63 ConfirmSaveCatacomb clears dirty; 64 LoadCatacomb pushes the blob in
++ *   chunks (FPCD_CMD_CAT_PUT) and loads it into the TA. Bulk copies of the user structs go through in_read /
++ *   out_write (descriptor: prepare() / complete(), 1192c). A failed load never returns 0x192 / 0x8002 / 0x8003
++ *   (libBKDM1 maps those to 0x10d "catacomb corrupted", which deletes the file): the file is always kept.
++ *   loaded: set by a successful 64, 49 NoCatacomb for the user, 3 EnrollMode, 13 / 72; cleared by sweetfpcd's
++ *   TA_FRESH event (TA loaded empty). dirty: enrol done / TEMPLATES events (id list or template changed).
++ *   kern.sweet_mesa_cat_ms: wait for the TA store/load (default 5000). kern.sweet_mesa_cat_state: counters.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -111,7 +127,8 @@ extern "C" {
+ #define FEV_PERCENT             68              /* v2: enrol progress 0..100 */
+ #define FEV_V2_SIZE             80
+ enum { FEV_FINGER_DOWN = 1, FEV_FINGER_UP, FEV_IMAGE, FEV_ENROL_PROGRESS, FEV_ENROL_DONE, FEV_ENROL_FAILED,
+-       FEV_NOMATCH, FEV_MATCH, FEV_MATCH_WITHHELD, FEV_TEMPLATES, FEV_OP_TIMEOUT, FEV_ERROR };
++       FEV_NOMATCH, FEV_MATCH, FEV_MATCH_WITHHELD, FEV_TEMPLATES, FEV_OP_TIMEOUT, FEV_ERROR,
++       FEV_TA_FRESH /* 1206: the TA was loaded empty (sweetfpcd start without a resident TA) */ };
+ #define FEV_MF_HAT_VERIFIED     1u
+ 
+ /* Apple message indexes (0xe3ff8000 + idx) and 0xe3ff8001 status ordinals (libBKDM1 BLHelper status table) */
+@@ -186,6 +203,22 @@ static int gSks = 1;                    /* kern.sweet_mesa_sks: 39 GetSKSLockSta
+ static int gPcfg = 1;                   /* kern.sweet_mesa_pcfg: 46 GetProtectedConfig bits (1202) */
+ static int gTopo = 1;                   /* kern.sweet_mesa_topo: synthetic match topology (1201) */
+ static int gCatState = 3;               /* kern.sweet_mesa_catstate: 60 GetCatacombState value (1200) */
++/* 1206: catacomb persistence (kern.sweet_mesa_catacomb) */
++static int gCat;                        /* kern.sweet_mesa_catacomb: 0 = 1200 behaviour */
++static int gCatMs = 5000;               /* kern.sweet_mesa_cat_ms: wait for sweetfpcd's TA store / load */
++static IOLock *gCatLk;                  /* one catacomb transfer at a time */
++static volatile bool gCatLoaded, gCatDirty;
++static volatile UInt32 gCatGen;         /* +1 per change of the TA db (dirtying event) */
++static UInt32 gCatSavedGen;             /* gCatGen when 61 staged the blob */
++static uint32_t gCatSize;               /* size 61 answered (0: nothing staged) */
++static uint32_t gCatLastLoad, gCatLastSave;
++static SInt32 nCatLoads, nCatLoadFail, nCatSaves, nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv;
++#define CAT_MAX                 (1024 * 1024)   /* largest catacomb blob */
++#define CAT_CHUNK               4032            /* bridge chunk: requests / replies stay <= 4096 (inline) */
++#define CAT_DEFAULT_USER        501             /* iOS' mobile user, until a 3/65/66 payload names one */
++#define FPCD_CMD_CAT_PUT        0x110           /* {u32 total, u32 offset, data}: stage LoadCatacomb input */
++#define FPCD_CMD_CAT_GET        0x111           /* {u32 offset, u32 max} -> bytes of the blob staged by 61 */
++#define FPCD_CAT_LOAD_MAGIC     0x4c435753u     /* "SWCL": 64 payload {magic, total, user} = load the staged input */
+ static int gFwdMs = 300;                /* kern.sweet_mesa_fwd_ms (1192b: was 2000) */
+ static IOLock *gM;                      /* slot, queue, client counts */
+ static IOLock *gPub;                    /* publish / withdraw */
+@@ -385,6 +418,12 @@ mesa_locks(void)
+ 			IOLockFree(l);
+ 		}
+ 	}
++	if (gCatLk == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gCatLk)) {
++			IOLockFree(l);
++		}
++	}
+ 	if (gUnlockTC == NULL) {
+ 		thread_call_t tc = thread_call_allocate(mesa_unlock_tc, NULL);
+ 		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&gUnlockTC)) {
+@@ -877,14 +916,15 @@ fpcd_status(int32_t st)
+  * bridge client is open, kIOReturnTimeout when none answers in kern.sweet_mesa_fwd_ms, else the mapped status.
+  */
+ static IOReturn
+-mesa_forward(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *rbuf, uint32_t *rlen, bool *offline)
++mesa_forward_ms(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *rbuf, uint32_t *rlen, bool *offline,
++    int ms, bool quiet)
+ {
+ 	*offline = false;
+ 	*rlen = 0;
+ 	if (plen > SMB_DATA_MAX) {
+ 		return kIOReturnMessageTooLarge;
+ 	}
+-	uint64_t dl = deadline_ms((uint32_t)gFwdMs);
++	uint64_t dl = deadline_ms((uint32_t)ms);
+ 	IOLockLock(gM);
+ 	if (gBridgeClients == 0 || slot.req == NULL) {
+ 		IOLockUnlock(gM);
+@@ -909,12 +949,14 @@ mesa_forward(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *rbuf, uint3
+ 		bcopy(p, slot.req, plen);
+ 	}
+ 	slot.state = SLOT_QUEUED;
+-	SAY("cmd %u %s -> bridge seq %u (%u bytes, waits <= %d ms)\n", cmd, mesa_name(cmd), slot.seq, plen, gFwdMs);
++	if (!quiet) {
++		SAY("cmd %u %s -> bridge seq %u (%u bytes, waits <= %d ms)\n", cmd, mesa_name(cmd), slot.seq, plen, ms);
++	}
+ 	IOLockWakeup(gM, &gEvQueued, false);
+ 	while (slot.state != SLOT_DONE) {
+ 		if (IOLockSleepDeadline(gM, &gEvDone, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED && slot.state != SLOT_DONE) {
+ 			SAY("cmd %u %s seq %u: no reply from the bridge in %d ms (%s)\n", cmd, mesa_name(cmd), slot.seq,
+-			    gFwdMs, slot.state == SLOT_QUEUED ? "never picked up" : "picked up, not answered");
++			    ms, slot.state == SLOT_QUEUED ? "never picked up" : "picked up, not answered");
+ 			slot.state = SLOT_FREE;
+ 			IOLockWakeup(gM, &gEvFree, true);
+ 			IOLockUnlock(gM);
+@@ -935,6 +977,12 @@ mesa_forward(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *rbuf, uint3
+ 	return fpcd_status(st);
+ }
+ 
++static IOReturn
++mesa_forward(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *rbuf, uint32_t *rlen, bool *offline)
++{
++	return mesa_forward_ms(cmd, p, plen, rbuf, rlen, offline, gFwdMs, false);
++}
++
+ /* 1192b: queue a command for sweetfpcd without waiting. kIOReturnNotReady (offline) when no bridge client. */
+ static IOReturn
+ mesa_post(uint32_t cmd, const uint8_t *p, uint32_t plen)
+@@ -972,6 +1020,244 @@ mesa_post(uint32_t cmd, const uint8_t *p, uint32_t plen)
+ 	return kIOReturnSuccess;
+ }
+ 
++/* ---- 1206: catacomb persistence ---- */
++static uint32_t
++cat_user(void)
++{
++	return gUser ? gUser : CAT_DEFAULT_USER;
++}
++
++static void
++cat_dirty(const char *why)
++{
++	OSIncrementAtomic(&gCatGen);
++	if (!gCatDirty) {
++		SAY("catacomb: dirty (%s)%s\n", why, gCatLoaded ? "" : " (not reported until loaded)");
++	}
++	gCatDirty = true;
++}
++
++static void
++cat_loaded(const char *why)
++{
++	if (!gCatLoaded) {
++		SAY("catacomb: loaded (%s)\n", why);
++	}
++	gCatLoaded = true;
++}
++
++/* sweetfpcd events that change the TA db (called for every FPCD event, before translation) */
++static void
++cat_note_event(uint32_t code, int32_t st, uint32_t fid)
++{
++	if (!gCat) {
++		return;
++	}
++	switch (code) {
++	case FEV_ENROL_DONE:
++		if (st == 0 && fid != 0) {
++			cat_loaded("enrol done");
++			OSIncrementAtomic(&nCatDirtyEv);
++			cat_dirty("enrol done");
++		}
++		break;
++	case FEV_TEMPLATES:
++		if (st == 0) {
++			OSIncrementAtomic(&nCatDirtyEv);
++			cat_dirty("TA templates changed");
++		}
++		break;
++	case FEV_TA_FRESH:
++		OSIncrementAtomic(&nCatFresh);
++		gCatLoaded = false;
++		gCatDirty = false;
++		SAY("catacomb: sweetfpcd loaded the TA empty: state back to present / not loaded (biometrickitd reloads)\n");
++		break;
++	default:
++		break;
++	}
++}
++
++/* the user of a 61/62/63 component (v2: 24 bytes {u32 user, u32 kind, 16 x 0}; v1: u32 user); ~0 = master */
++static uint32_t
++cat_component_user(const uint8_t *p, uint32_t plen)
++{
++	return plen >= 4 ? le32(p) : 0xffffffffu;
++}
++
++static IOReturn
++mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint32_t cap, uint32_t *outLen,
++    const char **how)
++{
++	uint8_t *rbuf = (uint8_t *)IOMallocData(SMB_DATA_MAX);
++	uint8_t *cb = NULL;
++	uint32_t rlen = 0, user = 0;
++	bool offline = false;
++	IOReturn r = kIOReturnSuccess;
++
++	if (rbuf == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gCatLk);
++	switch (cmd) {
++	case 61:        /* PrepareSaveCatacomb: component -> u32 size */
++		user = cat_component_user(p, plen);
++		if (user == 0xffffffffu) {
++			*how = "catacomb: master component not kept";
++			r = kIOReturnUnsupported;
++			break;
++		}
++		gCatSize = 0;
++		gCatSavedGen = gCatGen;
++		r = mesa_forward_ms(61, p, plen, rbuf, &rlen, &offline, gCatMs, false);
++		if (r == kIOReturnSuccess && (rlen < 4 || le32(rbuf) == 0 || le32(rbuf) > CAT_MAX)) {
++			r = kIOReturnUnderrun;
++		}
++		if (r != kIOReturnSuccess) {
++			OSIncrementAtomic(&nCatSaveFail);
++			*how = offline ? "catacomb: store, sweetfpcd offline" : "catacomb: store FAILED";
++			if (offline) {
++				r = kIOReturnNotReady;
++			}
++			break;
++		}
++		gCatSize = le32(rbuf);
++		if (cap < 4) {
++			r = kIOReturnNoSpace;
++			break;
++		}
++		*outLen = 4;
++		put32(out, gCatSize);
++		*how = "catacomb: TA db stored, blob staged";
++		SAY("catacomb: 61 user %u: blob of %u bytes staged (gen %u)\n", user, gCatSize, gCatSavedGen);
++		break;
++	case 62: {      /* CompleteSaveCatacomb: component -> the staged blob */
++		uint32_t size = gCatSize, off = 0;
++		if (size == 0) {
++			*how = "catacomb: nothing staged (no 61)";
++			r = kIOReturnNotReady;
++			break;
++		}
++		if (cap < size) {
++			*how = "catacomb: out smaller than the staged blob";
++			r = kIOReturnNoSpace;
++			break;
++		}
++		while (off < size) {
++			uint8_t q[8];
++			uint32_t want = size - off > CAT_CHUNK ? CAT_CHUNK : size - off;
++			put32(q, off);
++			put32(q + 4, want);
++			r = mesa_forward_ms(FPCD_CMD_CAT_GET, q, 8, rbuf, &rlen, &offline, gFwdMs, true);
++			if (r != kIOReturnSuccess || rlen == 0 || rlen > want) {
++				SAY("catacomb: 62 chunk at %u of %u: 0x%x len %u%s\n", off, size, r, rlen,
++				    offline ? " (offline)" : "");
++				if (r == kIOReturnSuccess) {
++					r = kIOReturnUnderrun;
++				}
++				break;
++			}
++			bcopy(rbuf, out + off, rlen);
++			off += rlen;
++		}
++		if (r != kIOReturnSuccess) {
++			OSIncrementAtomic(&nCatSaveFail);
++			*how = "catacomb: blob pull FAILED";
++			break;
++		}
++		*outLen = size;
++		gCatLastSave = size;
++		*how = "catacomb: blob handed to biometrickitd";
++		SAY("catacomb: 62 user %u: %u bytes to biometrickitd (it writes the catacomb file)\n",
++		    cat_component_user(p, plen), size);
++		break;
++	}
++	case 63:        /* ConfirmSaveCatacomb: biometrickitd wrote the file */
++		r = mesa_forward_ms(63, p, plen, rbuf, &rlen, &offline, gFwdMs, false);
++		if (offline) {
++			r = kIOReturnSuccess;   /* the file is written; sweetfpcd only frees its staging buffer */
++		}
++		if (gCatSize != 0) {
++			OSIncrementAtomic(&nCatSaves);
++			if (gCatGen == gCatSavedGen) {
++				gCatDirty = false;
++			}
++		}
++		gCatSize = 0;
++		OSIncrementAtomic(&nCatConfirms);
++		*how = gCatDirty ? "catacomb: saved, changed again meanwhile (still dirty)" : "catacomb: saved, clean";
++		SAY("catacomb: 63 confirmed (%s)\n", gCatDirty ? "still dirty" : "clean");
++		break;
++	case 64: {      /* LoadCatacomb: the CatacombSecureData blob from the file */
++		uint32_t off = 0;
++		UInt32 gen = gCatGen;
++		user = cat_user();
++		if (plen == 0 || plen > CAT_MAX) {
++			*how = "catacomb: load, bad blob size";
++			r = kIOReturnBadArgument;
++			OSIncrementAtomic(&nCatLoadFail);
++			break;
++		}
++		cb = (uint8_t *)IOMallocData(CAT_CHUNK + 8);
++		if (cb == NULL) {
++			r = kIOReturnNoMemory;
++			break;
++		}
++		while (off < plen) {
++			uint32_t n = plen - off > CAT_CHUNK ? CAT_CHUNK : plen - off;
++			put32(cb, plen);
++			put32(cb + 4, off);
++			bcopy(p + off, cb + 8, n);
++			r = mesa_forward_ms(FPCD_CMD_CAT_PUT, cb, n + 8, rbuf, &rlen, &offline, gFwdMs, true);
++			if (r != kIOReturnSuccess) {
++				SAY("catacomb: 64 chunk at %u of %u: 0x%x%s\n", off, plen, r, offline ? " (offline)" : "");
++				break;
++			}
++			off += n;
++		}
++		if (r == kIOReturnSuccess) {
++			uint8_t q[12];
++			put32(q, FPCD_CAT_LOAD_MAGIC);
++			put32(q + 4, plen);
++			put32(q + 8, user);
++			r = mesa_forward_ms(64, q, 12, rbuf, &rlen, &offline, gCatMs, false);
++		}
++		if (r != kIOReturnSuccess) {
++			OSIncrementAtomic(&nCatLoadFail);
++			if (offline) {
++				r = kIOReturnNotReady;
++			}
++			/* never 0x192 / 0x8002 / 0x8003: libBKDM1 would map it to 0x10d and biometrickitd delete the file */
++			*how = offline ? "catacomb: load, sweetfpcd offline (file kept)" : "catacomb: load FAILED (file kept)";
++			SAY("catacomb: 64 user %u blob %u bytes: load failed 0x%x%s: biometrickitd keeps the file and retries\n",
++			    user, plen, r, offline ? " (offline)" : "");
++			break;
++		}
++		OSIncrementAtomic(&nCatLoads);
++		gCatLastLoad = plen;
++		cat_loaded("LoadCatacomb");
++		if (gCatGen == gen) {
++			gCatDirty = false;
++		}
++		*how = "catacomb: TA db loaded from the blob";
++		SAY("catacomb: 64 user %u: %u-byte blob loaded into the TA\n", user, plen);
++		break;
++	}
++	default:
++		r = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gCatLk);
++	if (cb != NULL) {
++		IOFreeData(cb, CAT_CHUNK + 8);
++	}
++	IOFreeData(rbuf, SMB_DATA_MAX);
++	if (offline) {
++		OSIncrementAtomic(&nOffline);
++	}
++	return r;
++}
++
+ /* ---- the persona: one bm_cmd ---- */
+ static IOReturn
+ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint32_t *outLen, const char **how,
+@@ -1011,6 +1297,10 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 	*pver = ver;
+ 	*pval = val;
+ 
++	if (gCat && gCatLk != NULL && cmd >= 61 && cmd <= 64) {      /* 1206 */
++		return mesa_catacomb(cmd, p, plen, out, cap, outLen, how);
++	}
++
+ #define ANSWER(n) do { if ((uint32_t)(n) > cap) { *how = "out too small"; return kIOReturnNoSpace; } \
+ 	    *outLen = (n); bzero(out, (n)); } while (0)
+ 	/* inside the forwarded switch: no return (rbuf is freed below); break leaves the inner switch */
+@@ -1101,6 +1391,18 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 		 * then sent 13 RemoveTemplate for the new fid ("not present in biometrickitd"). Answer 3 (present +
+ 		 * loaded, never dirty): no load, no save. kern.sweet_mesa_catstate=1 restores the 1192f answer.
+ 		 */
++		if (gCat) {     /* 1206: present, loaded, dirty from the catacomb engine */
++			uint32_t cst = 1u | (gCatLoaded ? 2u : 0u) | (gCatLoaded && gCatDirty ? 4u : 0u);
++			uint32_t cn = cap >= 8 ? 1 : 0;
++			ANSWER(8 * cn);
++			if (cn) {
++				put32(out, cat_user());
++				put32(out + 4, cst);
++			}
++			*how = cst == 1 ? "catacomb (present, not loaded: load wanted)" :
++			    cst == 3 ? "catacomb (present + loaded)" : "catacomb (present + loaded + dirty: save wanted)";
++			return kIOReturnSuccess;
++		}
+ 		uint32_t n = gUser != 0 && cap >= 8 ? 1 : 0;
+ 		ANSWER(8 * n);
+ 		if (n) {
+@@ -1192,6 +1494,12 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 		case 38: put32(small, 1); fp = small; flen = 4; break;          /* u32 enable 1 */
+ 		case 69: put32(small, val); fp = small; flen = 4; break;        /* u32 enable = value */
+ 		case 13: case 61: case 62: case 63: case 64: fp = p; flen = plen; break;   /* Apple raw */
++		case 49:        /* 1206: catacomb mode passes the user (u32; ~0 = master component) */
++			if (gCat && plen >= 4) {
++				fp = p;
++				flen = 4;
++			}
++			break;
+ 		default: break;
+ 		}
+ 		if (cmd == 12 || cmd == 38 || cmd == 69) {         /* 1192b: posted, never blocks the caller */
+@@ -1235,6 +1543,15 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 			IOFreeData(rbuf, SMB_DATA_MAX);
+ 			return r;
+ 		}
++		if (r == kIOReturnSuccess && gCat) {   /* 1206: the TA db is now what biometrickitd works with */
++			if (cmd == 3) {
++				cat_loaded("EnrollMode");
++			} else if (cmd == 13 || cmd == 72) {
++				cat_loaded(cmd == 13 ? "RemoveTemplate" : "RemoveUserData");
++			} else if (cmd == 49 && plen >= 4 && le32(p) != 0xffffffffu) {
++				cat_loaded("NoCatacomb for the user (no file)");
++			}
++		}
+ 		if (r == kIOReturnSuccess) {
+ 			switch (cmd) {
+ 			case 15: case 65: case 61:
+@@ -1347,13 +1664,12 @@ AppleBiometricServicesUserClient::externalMethod(uint32_t selector, IOExternalMe
+ 	}
+ 	io_debug("AppleBiometricServices", selector, args);
+ 	proc_selfname(pn, (int)sizeof(pn));
+-	if (inLen < 6 || inLen > 0x10000) {
++	if (inLen < 6 || inLen > (gCat ? (uint32_t)CAT_MAX + 8 : 0x10000u)) {        /* 1206: 64 carries the blob */
+ 		SAY("%s sel 0 with %u input bytes refused\n", pn, inLen);
+ 		return kIOReturnBadArgument;
+ 	}
+ 	in = (uint8_t *)IOMallocData(inLen);
+-	out = (uint8_t *)IOMallocData(ocap ? ocap : 1);
+-	if (in == NULL || out == NULL) {
++	if (in == NULL) {
+ 		r = kIOReturnNoMemory;
+ 		goto done;
+ 	}
+@@ -1361,6 +1677,15 @@ AppleBiometricServicesUserClient::externalMethod(uint32_t selector, IOExternalMe
+ 		r = kIOReturnVMError;
+ 		goto done;
+ 	}
++	/* 1206: 62 CompleteSaveCatacomb returns the whole blob (up to CAT_MAX) */
++	if (gCat && inLen >= 8 && le16(in) == 0x4d42 && le16(in + 2) == 62) {
++		ocap = cap > CAT_MAX ? CAT_MAX : cap;
++	}
++	out = (uint8_t *)IOMallocData(ocap ? ocap : 1);
++	if (out == NULL) {
++		r = kIOReturnNoMemory;
++		goto done;
++	}
+ 	OSIncrementAtomic(&nCmds);
+ 	r = mesa_command(in, inLen, out, ocap, &outLen, &how, &cmd, &ver, &val);
+ 	if (r == kIOReturnSuccess) {
+@@ -1465,6 +1790,7 @@ bridge_event(IOExternalMethodArguments *args)
+ 	uint32_t code = fpcd ? le16(d + FEV_CODE) : 0;
+ 	if (fpcd) {
+ 		OSIncrementAtomic(&nFpcdEv);
++		cat_note_event(code, (int32_t)le32(d + FEV_STATUS), le32(d + FEV_FID));       /* 1206 */
+ 		SAY("EVENT fpcd v%u code %u status %d fid 0x%x flags 0x%x (%u bytes) -> %s\n", le16(d + 4), code,
+ 		    (int32_t)le32(d + FEV_STATUS), le32(d + FEV_FID), le32(d + FEV_FLAGS), len,
+ 		    (gMesa & 2) ? "translate" : "logged only (kern.sweet_mesa bit 1 clear)");
+@@ -1928,6 +2254,71 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_catstate, CTLTYPE_INT | CTLFLAG_RW | CTL
+     sysctl_sweet_mesa_catstate, "I", "redfin 1200: 60 GetCatacombState value for the identities' user "
+     "(bit0 present, bit1 loaded, bit2 dirty; default 3, 1 = 1192f answer)");
+ 
++static int
++sysctl_sweet_mesa_catacomb(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gCat, changed = 0;
++	int e = sysctl_io_number(req, gCat, sizeof(gCat), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 1) {
++		return EINVAL;
++	}
++	mesa_locks();
++	if (gCatLk == NULL) {
++		return ENOMEM;
++	}
++	char pn[32];
++	proc_selfname(pn, (int)sizeof(pn));
++	IOLockLock(gCatLk);
++	if (v && !gCat) {
++		gCatLoaded = false;     /* a load is wanted; biometrickitd's NoCatacomb (no file) or an enrol sets it */
++		gCatDirty = false;
++		gCatSize = 0;
++	}
++	gCat = v;
++	IOLockUnlock(gCatLk);
++	SAY("catacomb persistence %s by %s (kern.sweet_mesa_catacomb=%d)\n", v ? "ON" : "off (1200 answers)", pn, v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_catacomb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_catacomb, "I", "redfin 1206: 1 = Touch ID catacomb persistence (60 state from the TA db, "
++    "61-64 store/load the FPC template db through sweetfpcd); 0 = 1200 behaviour");
++
++static int
++sysctl_sweet_mesa_cat_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gCatMs, changed = 0;
++	int e = sysctl_io_number(req, gCatMs, sizeof(gCatMs), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 300 || v > 30000) {
++		return EINVAL;
++	}
++	gCatMs = v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_cat_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_cat_ms, "I", "redfin 1206: how long 61 / 64 wait for sweetfpcd's TA store / load (300..30000)");
++
++static int
++sysctl_sweet_mesa_cat_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	char b[320];
++	snprintf(b, sizeof(b), "catacomb=%d user=%u loaded=%d dirty=%d gen=%u staged=%u loads=%d load_fail=%d "
++	    "saves=%d save_fail=%d confirms=%d fresh=%d dirty_events=%d last_load=%u last_save=%u cat_ms=%d",
++	    gCat, cat_user(), gCatLoaded, gCatDirty, (uint32_t)gCatGen, gCatSize, nCatLoads, nCatLoadFail, nCatSaves,
++	    nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv, gCatLastLoad, gCatLastSave, gCatMs);
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_cat_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_cat_state, "A", "redfin 1206: catacomb persistence state and counters");
++
+ static int
+ sysctl_sweet_mesa_fwd_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
