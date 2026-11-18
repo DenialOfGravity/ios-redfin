@@ -303,6 +303,82 @@ def extract(data, syms, encoding='auto', say=print):
     return {'encoding': enc, 'stride': stride, 'ccms': ccms, 'lscs': lscs, 'refs': refs}
 
 
+# ---- the module tree, where the symbol table names it (2026-11-18, the Pixel 5's com.google.tuned.lito2_*.bin) ----
+#
+# Found on the real files: a module's data is a run of symbols mod_<module>_<trigger>_data, each a run of records
+# whose numbers sit in 64-bit slots (a 32-bit float in the low half) but whose tables are packed 32-bit floats:
+#   aec_data records, 48 bytes: lux index (start, end), gain (start, end), u64 children, u64 the first child's id
+#   cct_data records: CCT (start, end), then the module's tables, each rounded up to 8 bytes (cc13: one 3x3 matrix, then
+#   16 bytes not used here, 72 bytes; lsc34: four 17x13 grids, 3568 bytes)
+# An aec_data symbol's records take their children, in order, from the cct_data records after it.
+
+def f32slot(data, off):
+    return struct.unpack_from('<f', data, off)[0]
+
+
+def module_tree(data, syms, module, tables, ok):
+    """
+    [{lux: (a, b), ccts: [{cct: (a, b), table: [...], at: offset}]}] of the module's largest aec group (the one with
+    the most tables that pass `ok'), or [] where the symbols do not say so
+    """
+    pads = [(n * 4 + 7) // 8 * 8 for n in tables]
+    floats = sum(tables)
+
+    def table_at(o):
+        out = []
+        for n, pad in zip(tables, pads):
+            out += struct.unpack_from('<%df' % n, data, o)
+            o += pad
+        return out
+    groups, cur = [], None
+    for name, _, _, off, size in syms:
+        if name == 'mod_%s_aec_data' % module and size % 48 == 0 and size > 0:
+            aec = []
+            for o in range(off, off + size, 48):
+                kids = struct.unpack_from('<Q', data, o + 32)[0]
+                aec.append({'lux': (f32slot(data, o), f32slot(data, o + 8)), 'kids': kids})
+            cur = {'aec': aec, 'ccts': []}
+            groups.append(cur)
+        elif name == 'mod_%s_cct_data' % module and cur is not None and size > 0:
+            rec = next((16 + sum(pads) + t for t in (16, 0) if size % (16 + sum(pads) + t) == 0), 0)
+            for o in range(off, off + size, rec) if rec else ():
+                cur['ccts'].append({'cct': (f32slot(data, o), f32slot(data, o + 8)),
+                                    'table': table_at(o + 16), 'at': o + 16})
+        elif not name.startswith('mod_%s_' % module):
+            cur = None
+    best = []
+    for g in groups:
+        if sum(a['kids'] for a in g['aec']) > len(g['ccts']) or any(a['kids'] > 64 for a in g['aec']):
+            continue
+        lights, k = [], 0
+        for a in g['aec']:
+            kids = g['ccts'][k:k + a['kids']]
+            k += a['kids']
+            kept = [c for c in kids if ok(c['table'])]
+            if kept and a['lux'][0] <= a['lux'][1]:
+                lights.append({'lux': a['lux'], 'ccts': kept})
+        if sum(len(l['ccts']) for l in lights) > sum(len(l['ccts']) for l in best):
+            best = lights
+    return best
+
+
+def tree_grid(g):
+    """a grid where the tree says one is: gains, the centre near 1 (the steep corners of a wide lens allowed)"""
+    return len(g) == GRID and all(0.5 <= x <= 16 for x in g) and 0.85 <= g[6 * LSC_W + 8] <= 2.0
+
+
+def extract_tree(data, syms):
+    """extract()'s result from the module tree (cc13's matrices, lsc34's grids), or None where it has none"""
+    ccm = module_tree(data, syms, 'cc13', [9], lambda t: is_ccm(t, 0))
+    lsc = module_tree(data, syms, 'lsc34', [GRID] * 4, lambda t: all(tree_grid(t[q * GRID:(q + 1) * GRID]) for q in range(4)))
+    if not ccm and not lsc:
+        return None
+    ccms = [{'at': c['at'], 'm': c['table'], 'cct': c['cct'], 'lux': l['lux']} for l in ccm for c in l['ccts']]
+    lscs = [{'at': c['at'], 'grids': [c['table'][q * GRID:(q + 1) * GRID] for q in range(4)], 'cct': c['cct'], 'lux': l['lux']}
+            for l in lsc for c in l['ccts']]
+    return {'encoding': 'tree', 'stride': 1, 'ccms': ccms, 'lscs': lscs, 'refs': []}
+
+
 def symbol_at(syms, offset):
     hit = [s for s in syms if s[3] <= offset < s[3] + s[4]]
     return min(hit, key=lambda s: s[4])[0] if hit else '-'
@@ -368,7 +444,8 @@ def main(argv=None):
     ap.add_argument('--dump', action='store_true', help='say what was found and where')
     ap.add_argument('--json', help='write what was found (after --ccm-*) as JSON')
     ap.add_argument('--from-json', help='make the .isp from this JSON instead of a tuning file')
-    ap.add_argument('--encoding', default='auto', choices=['auto'] + list(ENCODINGS))
+    ap.add_argument('--encoding', default='auto', choices=['auto', 'tree'] + list(ENCODINGS),
+                    help='auto: the module tree where the symbols name it, else the encoding that finds most')
     ap.add_argument('--ccm-order', default='rgb', help="the order of the matrix's colours in the file (e.g. gbr)")
     ap.add_argument('--ccm-transpose', action='store_true', help='the matrix is stored by columns')
     ap.add_argument('--refs', help='reference lights instead of the found ones: "rg,bg,cct;rg,bg,cct;..."')
@@ -378,7 +455,11 @@ def main(argv=None):
             tuning = json.load(fp)
     elif a.tuned:
         data, syms = load(a.tuned)
-        found = extract(data, syms, a.encoding)
+        found = extract_tree(data, syms) if a.encoding in ('auto', 'tree') else None
+        if found is None:
+            found = extract(data, syms, 'auto' if a.encoding == 'tree' else a.encoding)
+        else:
+            print('module tree: %d colour matrices, %d lens shading tables' % (len(found['ccms']), len(found['lscs'])))
         if a.dump:
             dump(found, syms)
         tuning = tuning_from(found, a.ccm_order, a.ccm_transpose)
