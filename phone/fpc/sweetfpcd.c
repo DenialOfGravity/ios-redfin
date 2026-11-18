@@ -710,6 +710,28 @@ static void run_match(uint32_t gen)
 			   sent ? "sent" : "withheld", ur, ust);
 			continue;
 		}
+		if (ext && !cancelled(gen)) {
+			/*
+			 * extend-enrolment (Settings phase 2, owner-approved "enable matching"): an edge capture of the finger
+			 * just enrolled need not identify against the centre template. Every good image counts as a touch of
+			 * the identity being extended (the only one the TA holds), as the SEP's extend match does.
+			 */
+			uint32_t efid = 0, n;
+			pthread_mutex_lock(&st_mx);
+			n = S.ids_valid ? S.nids : 0;
+			if (n == 1)
+				efid = S.ids[0];
+			last_up = S.up_seq;
+			pthread_mutex_unlock(&st_mx);
+			have_last = 1;
+			if (efid) {
+				int sent = match_deliver(0, efid, score, attempts, hat);
+				lg("extend-enrolment touch %u: identify status %d (%s) -> reported as fid %#x: %s", attempts, st,
+				   st == -8 ? "NOENTITY" : st == -6 ? "IO" : "no match", efid, sent ? "sent" : "withheld");
+				continue;
+			}
+			lg("extend-enrolment touch %u: identify status %d and the TA holds %u ids: no match", attempts, st, n);
+		}
 		pthread_mutex_lock(&st_mx);
 		S.nomatches++;
 		pthread_mutex_unlock(&st_mx);
@@ -1201,7 +1223,19 @@ static int h_remove_all(const struct smb_req *q, struct smb_reply *p)
 
 static int h_nocatacomb(const struct smb_req *q, struct smb_reply *p)
 {
-	/* no catacomb on disk: an empty template db (templates are TA-memory only for now); result: TEMPLATES event */
+	/*
+	 * 2026-11-18 (r5tid3): biometrickitd sends NoCatacomb right after every enrol (it cannot save a catacomb:
+	 * 61-63 unsupported), and load_empty_db here WIPED the template just enrolled, so phase 2 identified against
+	 * an empty db (-8 FPC_ERROR_NOENTITY / -6 FPC_ERROR_IO alternating). Templates live in TA memory for the life
+	 * of the TA load (empty db loaded at TA start), so NoCatacomb is only acknowledged when the TA holds any id.
+	 */
+	pthread_mutex_lock(&st_mx);
+	uint32_t n = S.ids_valid ? S.nids : 0;
+	pthread_mutex_unlock(&st_mx);
+	if (n) {
+		lg("NoCatacomb: %u template(s) in TA memory kept (no db reload)", n);
+		return FPCD_OK;
+	}
 	return job_post(JOB_NOCATACOMB, 0, "NoCatacomb");
 }
 
