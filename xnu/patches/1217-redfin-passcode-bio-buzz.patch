@@ -1,0 +1,66 @@
+redfin 1217: optional NON-NATIVE vibration pulse on a Touch ID keybag unlock, kern.sweet_passcode_bio_buzz (default 0)
+
+iOS's own feedback is SBAuthenticationFeedback initForSuccess (vibrates) after the bio-unlocked event (1214). This
+is a kernel fallback for testing: value = ms | strength << 16, via sweet_haptic_request().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/bsd/dev/sweet_passcode.c b/bsd/dev/sweet_passcode.c
+index 56aac0c..8bc1998 100644
+--- a/bsd/dev/sweet_passcode.c
++++ b/bsd/dev/sweet_passcode.c
+@@ -90,6 +90,14 @@ static uint32_t pc_bio_fails, pc_n_bio_unlock, pc_n_bio_refused;
+  * (sel 35 only; sel 17 and aks_get_lock_state still say unlocked) until confirmed, locked, or PC_BIO_STATE_S.
+  */
+ #define PC_BIO_STATE_S          30
++/*
++ * 1217: NOT native. iOS gives its own feedback for a Touch ID unlock (SBAuthenticationFeedback initForSuccess:
++ * vibrates YES, played by SpringBoard after the "bio unlocked" event that 1214 enables). If that does not reach the
++ * motor, kern.sweet_passcode_bio_buzz = ms | strength << 16 (ms 1..2000, strength 1..127; 0 = off, the default)
++ * makes the kernel play one pulse itself (sweet_haptic.c, needs boot-arg sweethaptic) when Touch ID unlocks the keybag.
++ */
++extern int sweet_haptic_request(unsigned ms, unsigned strength);
++static int pc_bio_buzz;
+ static int pc_biostate;
+ static clock_sec_t pc_bio_pending_at;
+ static uint32_t pc_n_bio_confirm, pc_n_bio_expired, pc_n_bio_nil_refused;
+@@ -713,6 +721,11 @@ sweet_pc_bio_unlock(int *did_unlock, const char **why)
+ 	    e ? *why : "", ev && pc_biostate ? " (InBioUnlock: extended lock state 7 until SpringBoard confirms)" : "");
+ 	if (ev) {
+ 		pc_notify("unlocked (Touch ID)");
++		int bz = pc_bio_buzz;
++		if (bz != 0) {
++			int he = sweet_haptic_request((unsigned)bz & 0xffffu, ((unsigned)bz >> 16) & 0xffu);
++			SAY("Touch ID unlock buzz (non-native, kern.sweet_passcode_bio_buzz 0x%x) -> %d\n", bz, he);
++		}
+ 	}
+ 	return e;
+ }
+@@ -820,6 +833,26 @@ sweet_pc_bio_confirm(int *was_pending)
+ 	return locked && !*was_pending ? EAUTH : 0;
+ }
+ 
++static int
++sysctl_sweet_passcode_bio_buzz(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = pc_bio_buzz, changed = 0;
++	int e = sysctl_io_number(req, pc_bio_buzz, sizeof(pc_bio_buzz), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || (v & 0xffff) > 2000 || ((v >> 16) & 0xff) > 127 || (v >> 24) != 0) {
++		return EINVAL;
++	}
++	pc_bio_buzz = v;
++	SAY("kern.sweet_passcode_bio_buzz=0x%x (non-native Touch ID unlock pulse %s)\n", v, v ? "on" : "off");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_bio_buzz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_passcode_bio_buzz, "I", "redfin 1217 (non-native): ms | strength << 16 = one vibration pulse when "
++    "Touch ID unlocks the keybag; 0 = off (default)");
++
+ static int
+ sysctl_sweet_passcode_biostate(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)

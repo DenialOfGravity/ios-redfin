@@ -1,0 +1,402 @@
+redfin 1218: Touch ID catacomb saves commit and load: master component, save info, session load (kern.sweet_mesa_catacomb bits)
+
+BiometricSupport always appends the master component (user 0xffffffff, master.cat) to a catacomb save and runs
+commitWrite only for the last component, so 61 master -> 0xe00002c7 left every save in Catacomb/prepare/. loadCatacomb
+sends NoCatacomb(-1) and loads no user while the master's 60 state lacks bit 0. kern.sweet_mesa_catacomb is a bit
+mask now (1 = 1206 as before): +2 master component (60 master entry, kernel SWCM blob for 61/62/63/64), +4 save info
+in 40 (+0xc last save unix time, +0x14 loaded && dirty: saves after unlocks), +8 per-biometrickitd-session load
+(not loaded on open, same-blob 64 without a TA reload). Default 0 / 1: unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+index aff9739..7b0e438 100644
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -74,6 +74,24 @@
+  *   its identity list, touchid-audit-2026-11-18.md finding 10), and when the first bridge client connects the
+  *   persona sends 0xe3ff800d (libBKDM1: initSensor + syncTemplateListForUser) 1.5 s later, so biometrickitd re-reads
+  *   the sensor and the identity list from the now-live TA (after sweetfpcd's TA_FRESH event, if any).
++ * 1218 (touchid-catacomb-commit-2026-11-18.md): kern.sweet_mesa_catacomb is a bit mask now (1 = 1206, as before):
++ *   bit 1 (2) MASTER component. BiometricSupport getCatacombSaveListForComponents: ALWAYS appends the master
++ *   component (userID 0xffffffff, file master.cat) after the dirty user components, and saveCatacombForComponents:
++ *   runs commitWrite (prepare/ -> Catacomb/) only for the LAST one, so 61 for the master failing (0xe00002c7) left
++ *   every save in prepare/ (rolled back by BKCatacomb recover at the next start). And loadCatacomb sends 49
++ *   NoCatacomb(-1) and loads NO user when the master's 60 state has bit 0 clear, so nothing could ever load.
++ *   With the bit: 60 answers {0xffffffff, 1 | master loaded << 1} before the user entry (biometrickitd's buffer
++ *   has room for it: cap 16); 61/62 for the master stage / hand out a 32-byte kernel blob "SWCM" v1 {magic, u16 ver,
++ *   u16 size, user, flags, u64 save time, fnv1a} (no sweetfpcd); 63 for the master = the transaction is committed
++ *   (it comes after commitWrite): user dirty is cleared there (user 63 comes before the commit); 64 with an SWCM
++ *   blob (64 carries no component) is accepted by the kernel; 49(-1) = empty master (loaded).
++ *   bit 2 (4) SAVE INFO: 40 GetBiometrickitdInfo +0xc u64 unix time of the last committed save (0 = none since
++ *   boot) and +0x14 u8 = loaded && dirty. saveCatacombIfDirtyWithInterval:andDelay: (unlock events: 900 s / 5 s)
++ *   saves only when +0x14 != 0 and now - (+0xc) > interval, so template updates after matches get saved.
++ *   bit 3 (8) SESSION: when biometrickitd opens AppleBiometricServices, user + master go back to "not loaded" (it
++ *   sends 64 again), and a 64 whose SWCT blob (size + crc) is the one the TA already holds (last 62 / 64, TA not
++ *   fresh, no TA change since) is answered without reloading the TA. Not needed for identities: with the master
++ *   bit, loadCatacombForComponent: skips 64 when the state says loaded and rebuilds identities from the file.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -260,6 +278,28 @@ static UInt32 gCatSavedGen;             /* gCatGen when 61 staged the blob */
+ static uint32_t gCatSize;               /* size 61 answered (0: nothing staged) */
+ static uint32_t gCatLastLoad, gCatLastSave;
+ static SInt32 nCatLoads, nCatLoadFail, nCatSaves, nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv;
++/* 1218: kern.sweet_mesa_catacomb bits */
++#define CAT_ON                  0x1             /* 1206 persistence */
++#define CAT_MASTER              0x2             /* master component (SWCM, kernel only) */
++#define CAT_INFO                0x4             /* 40 +0xc last save time, +0x14 save wanted */
++#define CAT_SESSION             0x8             /* biometrickitd open -> not loaded; same-blob 64 without TA reload */
++#define CAT_BITS                0xf
++#define CAT_MASTER_USER         0xffffffffu
++#define SWCM_MAGIC              0x4d435753u     /* "SWCM" */
++#define SWCM_VERSION            1
++#define SWCM_SIZE               32
++#define SWCT_MAGIC              0x54435753u     /* "SWCT" (sweetfpcd struct swct_hdr, 96 bytes) */
++#define SWCT_HDR                96
++static volatile bool gCatMLoaded;               /* master component loaded (64 SWCM, 49(-1), a committed save) */
++static bool gCatMStaged;
++static uint8_t gCatMBlob[SWCM_SIZE];
++static bool gCatPend;                           /* user 63 seen, waiting for the master 63 (commit) */
++static UInt32 gCatPendGen;
++static uint64_t gCatSaveUnix;                   /* unix s of the last committed save (0 = none since boot) */
++static bool gCatHeld;                           /* the TA holds the db of blob {gCatHeldTotal, gCatHeldCrc} */
++static uint32_t gCatHeldTotal, gCatHeldCrc;
++static UInt32 gCatHeldGen;
++static SInt32 nCatMSaves, nCatMLoads, nCatMBad, nCatCommits, nCatLoadSkip, nCatSession;
+ #define CAT_MAX                 (1024 * 1024)   /* largest catacomb blob */
+ #define CAT_CHUNK               4032            /* bridge chunk: requests / replies stay <= 4096 (inline) */
+ #define CAT_DEFAULT_USER        501             /* iOS' mobile user, until a 3/65/66 payload names one */
+@@ -1413,6 +1453,7 @@ cat_note_event(uint32_t code, int32_t st, uint32_t fid)
+ 		OSIncrementAtomic(&nCatFresh);
+ 		gCatLoaded = false;
+ 		gCatDirty = false;
++		gCatHeld = false;       /* 1218 */
+ 		SAY("catacomb: sweetfpcd loaded the TA empty: state back to present / not loaded (biometrickitd reloads)\n");
+ 		break;
+ 	default:
+@@ -1427,6 +1468,65 @@ cat_component_user(const uint8_t *p, uint32_t plen)
+ 	return plen >= 4 ? le32(p) : 0xffffffffu;
+ }
+ 
++/* 1218: master component blob (kernel only) */
++static uint64_t
++cat_unix_now(void)
++{
++	clock_sec_t sec = 0;
++	clock_usec_t usec = 0;
++	clock_get_calendar_microtime(&sec, &usec);
++	return (uint64_t)sec;
++}
++
++static uint32_t
++cat_fnv1a(const uint8_t *p, uint32_t n)
++{
++	uint32_t h = 0x811c9dc5u;
++	for (uint32_t i = 0; i < n; i++) {
++		h = (h ^ p[i]) * 0x01000193u;
++	}
++	return h;
++}
++
++static void
++cat_put64(uint8_t *p, uint64_t v)
++{
++	put32(p, (uint32_t)v);
++	put32(p + 4, (uint32_t)(v >> 32));
++}
++
++static uint64_t
++cat_le64(const uint8_t *p)
++{
++	return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
++}
++
++static void
++cat_master_build(void)
++{
++	uint8_t *b = gCatMBlob;
++	bzero(b, SWCM_SIZE);
++	put32(b, SWCM_MAGIC);
++	b[4] = SWCM_VERSION;
++	b[6] = SWCM_SIZE;
++	put32(b + 8, cat_user());
++	put32(b + 12, (uint32_t)gCat);
++	cat_put64(b + 16, cat_unix_now());
++	put32(b + 24, cat_fnv1a(b, 24));
++}
++
++/* the TA now holds the db of this SWCT blob (62 handed it out / 64 loaded it) */
++static void
++cat_note_held(const uint8_t *blob, uint32_t len, UInt32 gen)
++{
++	if (len >= SWCT_HDR && le32(blob) == SWCT_MAGIC && le32(blob + 8) == len) {
++		gCatHeld = true;
++		gCatHeldTotal = len;
++		gCatHeldCrc = le32(blob + 12);
++		gCatHeldGen = gen;
++	}
++}
++
+ static IOReturn
+ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint32_t cap, uint32_t *outLen,
+     const char **how)
+@@ -1445,8 +1545,21 @@ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint3
+ 	case 61:        /* PrepareSaveCatacomb: component -> u32 size */
+ 		user = cat_component_user(p, plen);
+ 		if (user == 0xffffffffu) {
+-			*how = "catacomb: master component not kept";
+-			r = kIOReturnUnsupported;
++			if (!(gCat & CAT_MASTER)) {
++				*how = "catacomb: master component not kept";
++				r = kIOReturnUnsupported;
++				break;
++			}
++			if (cap < 4) {          /* 1218: kernel-only master blob */
++				r = kIOReturnNoSpace;
++				break;
++			}
++			cat_master_build();
++			gCatMStaged = true;
++			*outLen = 4;
++			put32(out, SWCM_SIZE);
++			*how = "catacomb: master component staged (SWCM v1, kernel)";
++			SAY("catacomb: 61 master: %u-byte SWCM blob staged\n", SWCM_SIZE);
+ 			break;
+ 		}
+ 		gCatSize = 0;
+@@ -1475,6 +1588,23 @@ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint3
+ 		break;
+ 	case 62: {      /* CompleteSaveCatacomb: component -> the staged blob */
+ 		uint32_t size = gCatSize, off = 0;
++		if ((gCat & CAT_MASTER) && cat_component_user(p, plen) == CAT_MASTER_USER) {   /* 1218 */
++			if (!gCatMStaged) {
++				*how = "catacomb: master: nothing staged (no 61)";
++				r = kIOReturnNotReady;
++				break;
++			}
++			if (cap < SWCM_SIZE) {
++				*how = "catacomb: out smaller than the master blob";
++				r = kIOReturnNoSpace;
++				break;
++			}
++			bcopy(gCatMBlob, out, SWCM_SIZE);
++			*outLen = SWCM_SIZE;
++			*how = "catacomb: master blob handed to biometrickitd";
++			SAY("catacomb: 62 master: %u bytes to biometrickitd (master.cat)\n", SWCM_SIZE);
++			break;
++		}
+ 		if (size == 0) {
+ 			*how = "catacomb: nothing staged (no 61)";
+ 			r = kIOReturnNotReady;
+@@ -1509,31 +1639,82 @@ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint3
+ 		}
+ 		*outLen = size;
+ 		gCatLastSave = size;
++		cat_note_held(out, size, gCatSavedGen);         /* 1218 */
+ 		*how = "catacomb: blob handed to biometrickitd";
+ 		SAY("catacomb: 62 user %u: %u bytes to biometrickitd (it writes the catacomb file)\n",
+ 		    cat_component_user(p, plen), size);
+ 		break;
+ 	}
+ 	case 63:        /* ConfirmSaveCatacomb: biometrickitd wrote the file */
++		if ((gCat & CAT_MASTER) && cat_component_user(p, plen) == CAT_MASTER_USER) {   /* 1218 */
++			/* the master is the last component: biometrickitd ran commitWrite (prepare/ -> Catacomb/) before */
++			if (gCatMStaged) {
++				OSIncrementAtomic(&nCatMSaves);
++			}
++			gCatMStaged = false;
++			gCatMLoaded = true;
++			OSIncrementAtomic(&nCatCommits);
++			gCatSaveUnix = cat_unix_now();
++			if (gCatPend && gCatGen == gCatPendGen) {
++				gCatDirty = false;
++			}
++			gCatPend = false;
++			*how = gCatDirty ? "catacomb: committed, changed again meanwhile (still dirty)" : "catacomb: committed, clean";
++			SAY("catacomb: 63 master confirmed: save committed (Catacomb/master.cat + user file), %s\n",
++			    gCatDirty ? "still dirty" : "clean");
++			break;
++		}
+ 		r = mesa_forward_ms(63, p, plen, rbuf, &rlen, &offline, gFwdMs, false);
+ 		if (offline) {
+ 			r = kIOReturnSuccess;   /* the file is written; sweetfpcd only frees its staging buffer */
+ 		}
+ 		if (gCatSize != 0) {
+ 			OSIncrementAtomic(&nCatSaves);
+-			if (gCatGen == gCatSavedGen) {
+-				gCatDirty = false;
++			if (gCat & CAT_MASTER) {
++				/* 1218: the user 63 comes BEFORE commitWrite; dirty is cleared by the master's 63 */
++				gCatPend = true;
++				gCatPendGen = gCatSavedGen;
++			} else {
++				gCatSaveUnix = cat_unix_now();
++				if (gCatGen == gCatSavedGen) {
++					gCatDirty = false;
++				}
+ 			}
+ 		}
+ 		gCatSize = 0;
+ 		OSIncrementAtomic(&nCatConfirms);
+-		*how = gCatDirty ? "catacomb: saved, changed again meanwhile (still dirty)" : "catacomb: saved, clean";
+-		SAY("catacomb: 63 confirmed (%s)\n", gCatDirty ? "still dirty" : "clean");
++		*how = gCatPend ? "catacomb: user file written (prepare/), commit at the master's 63" :
++		    gCatDirty ? "catacomb: saved, changed again meanwhile (still dirty)" : "catacomb: saved, clean";
++		SAY("catacomb: 63 confirmed (%s)\n", gCatPend ? "user file in prepare/, waiting for the master" :
++		    gCatDirty ? "still dirty" : "clean");
+ 		break;
+ 	case 64: {      /* LoadCatacomb: the CatacombSecureData blob from the file */
+ 		uint32_t off = 0;
+ 		UInt32 gen = gCatGen;
+ 		user = cat_user();
++		if ((gCat & CAT_MASTER) && plen >= 16 && le32(p) == SWCM_MAGIC) {      /* 1218: master.cat */
++			bool ok = plen >= SWCM_SIZE && p[4] == SWCM_VERSION && p[6] == SWCM_SIZE &&
++			    le32(p + 24) == cat_fnv1a(p, 24);
++			if (!ok) {
++				OSIncrementAtomic(&nCatMBad);   /* still accepted: the master holds nothing the TA needs */
++			}
++			OSIncrementAtomic(&nCatMLoads);
++			gCatMLoaded = true;
++			*how = ok ? "catacomb: master loaded (SWCM, kernel)" : "catacomb: master loaded (SWCM, bad check, accepted)";
++			SAY("catacomb: 64 master: %u-byte SWCM v%u blob (user %u, saved at %llu)%s: loaded\n", plen, p[4],
++			    plen >= 12 ? le32(p + 8) : 0, plen >= 24 ? (unsigned long long)cat_le64(p + 16) : 0ULL,
++			    ok ? "" : " (check FAILED, accepted)");
++			break;
++		}
++		if ((gCat & CAT_SESSION) && gCatHeld && plen >= SWCT_HDR && le32(p) == SWCT_MAGIC &&
++		    plen == gCatHeldTotal && le32(p + 12) == gCatHeldCrc && gCatGen == gCatHeldGen) {
++			OSIncrementAtomic(&nCatLoadSkip);       /* 1218: the TA already holds exactly this db */
++			cat_loaded("LoadCatacomb (TA already holds this db)");
++			*how = "catacomb: TA already holds this db (no reload)";
++			SAY("catacomb: 64 user %u: %u-byte blob crc %08x is what the TA holds: no reload\n", user, plen,
++			    gCatHeldCrc);
++			break;
++		}
+ 		if (plen == 0 || plen > CAT_MAX) {
+ 			*how = "catacomb: load, bad blob size";
+ 			r = kIOReturnBadArgument;
+@@ -1581,6 +1762,7 @@ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint3
+ 		if (gCatGen == gen) {
+ 			gCatDirty = false;
+ 		}
++		cat_note_held(p, plen, gCatGen);        /* 1218 */
+ 		*how = "catacomb: TA db loaded from the blob";
+ 		SAY("catacomb: 64 user %u: %u-byte blob loaded into the TA\n", user, plen);
+ 		break;
+@@ -1691,6 +1873,15 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 		ANSWER(23);
+ 		put32(out, 5);
+ 		put32(out + 4, 1);
++		if ((gCat & CAT_ON) && (gCat & CAT_INFO)) {
++			/*
++			 * 1218: BiometricSupport saveCatacombIfDirtyWithInterval:andDelay: reads +0x14 (u8: SEP has unsaved
++			 * catacomb changes; 0 = skip) and +0xc (u64 unix time of the last save; interval check).
++			 */
++			cat_put64(out + 0xc, gCatSaveUnix);
++			out[0x14] = (gCatLoaded && gCatDirty) ? 1 : 0;
++			*how = out[0x14] ? "canned (catacomb save wanted)" : "canned (catacomb clean)";
++		}
+ 		return kIOReturnSuccess;
+ 	case 8:         /* AlignmentData (3060) */
+ 	case 17:        /* RequestTopologyOfTemplate (3060): 1198 zeros instead of unsupported (assert noise) */
+@@ -1743,6 +1934,19 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 		if (gCat) {     /* 1206: present, loaded, dirty from the catacomb engine */
+ 			uint32_t cst = 1u | (gCatLoaded ? 2u : 0u) | (gCatLoaded && gCatDirty ? 4u : 0u);
+ 			uint32_t cn = cap >= 8 ? 1 : 0;
++			if ((gCat & CAT_MASTER) && cap >= 16) {        /* 1218: master entry first */
++				ANSWER(16);
++				put32(out, CAT_MASTER_USER);
++				put32(out + 4, 1u | (gCatMLoaded ? 2u : 0u));
++				put32(out + 8, cat_user());
++				put32(out + 12, cst);
++				*how = cst == 1 ? (gCatMLoaded ? "catacomb (master loaded; user present, not loaded: load wanted)" :
++				    "catacomb (master + user present, not loaded: load wanted)") :
++				    cst == 3 ? (gCatMLoaded ? "catacomb (master + user loaded)" :
++				    "catacomb (master not loaded; user present + loaded)") :
++				    "catacomb (user present + loaded + dirty: save wanted)";
++				return kIOReturnSuccess;
++			}
+ 			ANSWER(8 * cn);
+ 			if (cn) {
+ 				put32(out, cat_user());
+@@ -1915,6 +2119,11 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 				cat_loaded(cmd == 13 ? "RemoveTemplate" : "RemoveUserData");
+ 			} else if (cmd == 49 && plen >= 4 && le32(p) != 0xffffffffu) {
+ 				cat_loaded("NoCatacomb for the user (no file)");
++			} else if (cmd == 49 && plen >= 4 && (gCat & CAT_MASTER)) {
++				if (!gCatMLoaded) {     /* 1218: no master.cat: start an empty master */
++					SAY("catacomb: master loaded (NoCatacomb(-1): no master.cat, empty master)\n");
++				}
++				gCatMLoaded = true;
+ 			}
+ 		}
+ 		if (r == kIOReturnSuccess) {
+@@ -1994,6 +2203,14 @@ AppleBiometricServicesUserClient::initWithTask(task_t owningTask, void *security
+ 	gAbsClients++;
+ 	IOLockUnlock(gM);
+ 	fCounted = true;
++	if ((gCat & CAT_ON) && (gCat & CAT_SESSION) && strncmp(pn, "biometrickitd", sizeof(pn)) == 0) {
++		/* 1218: a new biometrickitd session: its identity list is rebuilt from the files (64 again) */
++		OSIncrementAtomic(&nCatSession);
++		gCatLoaded = false;
++		gCatMLoaded = false;
++		SAY("catacomb: new biometrickitd session: master + user back to present / not loaded (TA %s)\n",
++		    gCatHeld ? "holds the last synced db" : "db not synced with a file");
++	}
+ 	SAY("%s opened AppleBiometricServices (type %u, %s)\n", pn, (unsigned)type,
+ 	    ent ? "entitled" : "root, WITHOUT the applemesa entitlement");
+ 	return true;
+@@ -2712,7 +2929,7 @@ sysctl_sweet_mesa_catacomb(__unused struct sysctl_oid *oidp, __unused void *arg1
+ 	if (e || !changed) {
+ 		return e;
+ 	}
+-	if (v < 0 || v > 1) {
++	if (v < 0 || v > CAT_BITS || (v != 0 && !(v & CAT_ON))) {     /* 1218: bit mask, bit 0 required */
+ 		return EINVAL;
+ 	}
+ 	mesa_locks();
+@@ -2727,14 +2944,21 @@ sysctl_sweet_mesa_catacomb(__unused struct sysctl_oid *oidp, __unused void *arg1
+ 		gCatDirty = false;
+ 		gCatSize = 0;
+ 	}
++	if ((v & CAT_MASTER) && !(gCat & CAT_MASTER)) {
++		gCatMLoaded = false;    /* 1218 */
++		gCatMStaged = false;
++		gCatPend = false;
++	}
+ 	gCat = v;
+ 	IOLockUnlock(gCatLk);
+-	SAY("catacomb persistence %s by %s (kern.sweet_mesa_catacomb=%d)\n", v ? "ON" : "off (1200 answers)", pn, v);
++	SAY("catacomb persistence %s by %s (kern.sweet_mesa_catacomb=%d%s%s%s)\n", v ? "ON" : "off (1200 answers)", pn, v,
++	    (v & CAT_MASTER) ? " master" : "", (v & CAT_INFO) ? " save-info" : "", (v & CAT_SESSION) ? " session" : "");
+ 	return 0;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_catacomb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_mesa_catacomb, "I", "redfin 1206: 1 = Touch ID catacomb persistence (60 state from the TA db, "
+-    "61-64 store/load the FPC template db through sweetfpcd); 0 = 1200 behaviour");
++    "61-64 store/load the FPC template db through sweetfpcd); 0 = 1200 behaviour; 1218: +2 master component "
++    "(save commits), +4 save info in 40 (saves after unlocks), +8 per-biometrickitd-session load");
+ 
+ static int
+ sysctl_sweet_mesa_cat_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+@@ -2758,12 +2982,15 @@ static int
+ sysctl_sweet_mesa_cat_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+ {
+-	char b[320];
++	char b[640];
+ 	snprintf(b, sizeof(b), "catacomb=%d user=%u loaded=%d dirty=%d gen=%u staged=%u loads=%d load_fail=%d "
+ 	    "saves=%d save_fail=%d confirms=%d fresh=%d dirty_events=%d last_load=%u last_save=%u cat_ms=%d "
+-	    "offline_honest=%d reinit_sent=%d",
++	    "offline_honest=%d reinit_sent=%d master_loaded=%d master_saves=%d master_loads=%d master_bad=%d "
++	    "commits=%d commit_pending=%d save_unix=%llu held=%d held_size=%u held_crc=%08x load_skips=%d sessions=%d",
+ 	    gCat, cat_user(), gCatLoaded, gCatDirty, (uint32_t)gCatGen, gCatSize, nCatLoads, nCatLoadFail, nCatSaves,
+-	    nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv, gCatLastLoad, gCatLastSave, gCatMs, gOffHonest, nReinit);
++	    nCatSaveFail, nCatConfirms, nCatFresh, nCatDirtyEv, gCatLastLoad, gCatLastSave, gCatMs, gOffHonest, nReinit,
++	    gCatMLoaded, nCatMSaves, nCatMLoads, nCatMBad, nCatCommits, gCatPend, (unsigned long long)gCatSaveUnix,
++	    gCatHeld, gCatHeldTotal, gCatHeldCrc, nCatLoadSkip, nCatSession);
+ 	return SYSCTL_OUT(req, b, strlen(b) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_cat_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,

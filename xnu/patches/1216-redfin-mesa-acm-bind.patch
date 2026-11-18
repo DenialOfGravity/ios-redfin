@@ -1,0 +1,204 @@
+redfin 1216: Touch ID match bound to the MatchMode's ACM context, kern.sweet_mesa_acm_bind (default 0)
+
+MatchMode payload (libBKDM1 performMatchCommand:): +0 processedFlags, +4 user, +8 u32 ACM context length and +0xc its
+external form for forCredentialSet ops. With the switch on, such a match adds BiometryMatched to that context only
+(record bit 6 CredentialAdded) and does not unlock the keybag; matches without a context unlock the keybag and arm
+no ACM credential. Off: 1198/1205 behaviour (global 5 s arm, every match unlocks).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/iokit/Kernel/arm/SweetACM.cpp b/iokit/Kernel/arm/SweetACM.cpp
+index 5f4d638..3495a2c 100644
+--- a/iokit/Kernel/arm/SweetACM.cpp
++++ b/iokit/Kernel/arm/SweetACM.cpp
+@@ -39,6 +39,7 @@ int sweet_pc_mode(void);
+ int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
+ void sweet_acm_publish(void);
+ void sweet_acm_note_verified_match(void);
++int sweet_acm_note_match_for_context(const uint8_t *id);        /* 1216 */
+ }
+ 
+ #define SAY(fmt, ...) IOLog("SWEET ACM: " fmt, ##__VA_ARGS__)
+@@ -104,6 +105,8 @@ static acm_ctx gGlobal;                 /* id all zero */
+ static IOLock *gL;
+ static uint64_t gSerial;
+ static clock_sec_t gBioArmedAt;
++static clock_sec_t gBioArmIdAt;         /* 1216: a match armed for one context (SweetMesa, kern.sweet_mesa_acm_bind) */
++static uint8_t gBioArmId[ACM_ID];
+ static volatile UInt32 gPublished;
+ static uint32_t nCmds, nUnsup, nRefused, nPassOk, nPassBad, nBioOk, nBioRefused, nCtx, nPolicyYes, nPolicyNo;
+ static uint32_t gLastCmd;
+@@ -268,10 +271,16 @@ acm_cmd(uint32_t cmd, const uint8_t *p, uint32_t n, uint8_t *o, uint32_t ocap, u
+ 		}
+ 		if (type == kCredBiometryMatched) {
+ 			IOLockLock(gL);
+-			bool armed = gBioArmedAt != 0 && now - gBioArmedAt <= ACM_BIO_ARM_S;
++			bool keyed = gBioArmIdAt != 0 && now - gBioArmIdAt <= ACM_BIO_ARM_S &&
++			    memcmp(p, gBioArmId, ACM_ID) == 0;        /* 1216 */
++			bool armed = keyed || (gBioArmedAt != 0 && now - gBioArmedAt <= ACM_BIO_ARM_S);
+ 			c = ctx_find(p);
+ 			if (armed && c != NULL) {
+-				gBioArmedAt = 0;                        /* one match, one credential */
++				if (keyed) {
++					gBioArmIdAt = 0;
++				} else {
++					gBioArmedAt = 0;                /* one match, one credential */
++				}
+ 				c->bio_at = now;
+ 				c->creds |= 1u << kCredBiometryMatched;
+ 			}
+@@ -549,6 +558,34 @@ sweet_acm_note_verified_match(void)
+ 	SAY("verified biometric match armed for %d s\n", ACM_BIO_ARM_S);
+ }
+ 
++/*
++ * 1216: SweetMesa (kern.sweet_mesa_acm_bind=1) for a match whose MatchMode carried an ACM context: the
++ * BiometryMatched credential goes straight to that context (as the SEP's ACM does; VerifyPolicy sees it), and an
++ * AddCredential type 3 for the same context within ACM_BIO_ARM_S is accepted (coreauthd's MechTouchId path).
++ * Returns 1 if the context is known here. Kernel-only, no userland path.
++ */
++extern "C" int
++sweet_acm_note_match_for_context(const uint8_t *id)
++{
++	static const uint8_t zero[ACM_ID] = { 0 };
++	if (gL == NULL || memcmp(id, zero, ACM_ID) == 0) {
++		return 0;
++	}
++	clock_sec_t now = acm_now();
++	IOLockLock(gL);
++	acm_ctx *c = ctx_find(id);
++	if (c != NULL) {
++		c->bio_at = now;
++		c->creds |= 1u << kCredBiometryMatched;
++	}
++	memcpy(gBioArmId, id, ACM_ID);
++	gBioArmIdAt = now;
++	IOLockUnlock(gL);
++	SAY("biometric match for context %02x%02x%02x%02x..: %s; AddCredential for it armed for %d s\n", id[0], id[1],
++	    id[2], id[3], c != NULL ? "BiometryMatched added" : "context not known here", ACM_BIO_ARM_S);
++	return c != NULL;
++}
++
+ static int
+ sysctl_sweet_acm_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+index f88f9f6..aff9739 100644
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -319,6 +319,20 @@ extern "C" int sweet_pc_bio_unlock(int *did_unlock, const char **why);
+ extern "C" void sweet_pc_bio_failed(void);
+ extern "C" int sweet_pc_bio_allowed(const char **why);
+ extern "C" void sweet_acm_note_verified_match(void);
++extern "C" int sweet_acm_note_match_for_context(const uint8_t *id);    /* 1216 */
++/*
++ * 1216: kern.sweet_mesa_acm_bind (default 0 = 1198/1205 behaviour: every match unlocks the keybag and arms one global
++ * BiometryMatched for 5 s). 1 = the match is tied to what the MatchMode asked for, as the SEP does:
++ *  - MatchMode with an ACM context (libBKDM1 performMatchCommand:, forCredentialSet = LocalAuthentication/coreauthd
++ *    ops: +8 u32 context length <= 32, +0xc the context's external form, SweetACM ids first): the credential goes to
++ *    that context at record time (record flag bit 6 CredentialAdded), the keybag is NOT unlocked;
++ *  - MatchMode without one (lock screen, Settings): keybag unlock as before, no ACM credential armed at all.
++ * The purpose is inferred from the ACM context's presence; processedFlags bits are not decoded yet.
++ */
++static int gAcmBind;
++static bool gMatchAcm;
++static uint8_t gMatchAcmId[16];
++static uint32_t nAcmCredOnly;
+ 
+ class AppleMesaSEPDriver;
+ class AppleBiometricServices;
+@@ -632,7 +646,9 @@ mesa_unlock_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 		if (did) {
+ 			OSIncrementAtomic(&nBioUnlock);
+ 		}
+-		sweet_acm_note_verified_match();
++		if (!gAcmBind) {
++			sweet_acm_note_verified_match();        /* 1216: bind on = no global arm */
++		}
+ 	} else {
+ 		OSIncrementAtomic(&nBioRefused);
+ 	}
+@@ -1122,7 +1138,25 @@ fpcd_translate(const uint8_t *d, uint32_t len)
+ 			    verified ? "verified" : "NOT verified");
+ 		}
+ 		bool unlock_later = false;
+-		if (identity && !gMatchExtend && gUnlockDelayMs != 0) {
++		bool acm_only = identity && !gMatchExtend && gAcmBind && gMatchAcm;
++		if (acm_only) {
++			/* 1216: a credential-set match: the credential for its context now, no keybag unlock */
++			const char *why = "";
++			if (!sweet_pc_bio_allowed(&why)) {
++				identity = false;
++				OSIncrementAtomic(&nBioRefused);
++				SAY("match fid 0x%x for an ACM context: REFUSED (%s) -> no-match\n", fid, why);
++			} else {
++				int known = sweet_acm_note_match_for_context(gMatchAcmId);
++				if (known) {
++					mflags |= 1u << 6;      /* BKMatchDetailCredentialAdded */
++				}
++				OSIncrementAtomic(&nAcmCredOnly);
++				SAY("match fid 0x%x for ACM context %02x%02x%02x%02x..: credential %s, keybag not unlocked\n", fid,
++				    gMatchAcmId[0], gMatchAcmId[1], gMatchAcmId[2], gMatchAcmId[3],
++				    known ? "added" : "armed (context unknown to SweetACM)");
++			}
++		} else if (identity && !gMatchExtend && gUnlockDelayMs != 0) {
+ 			/* 1205: rules checked now, keybag unlocked after the record (> 0 ms) or never (-1: SpringBoard's job) */
+ 			const char *why = "";
+ 			if (!sweet_pc_bio_allowed(&why)) {
+@@ -1148,7 +1182,9 @@ fpcd_translate(const uint8_t *d, uint32_t len)
+ 					mflags |= 1u << 5;      /* BKMatchDetailUnlocked */
+ 					OSIncrementAtomic(&nBioUnlock);
+ 				}
+-				sweet_acm_note_verified_match();
++				if (!gAcmBind) {
++					sweet_acm_note_verified_match();        /* 1216: bind on = no global arm */
++				}
+ 			}
+ 		}
+ 		if (code != FEV_MATCH && !gMatchExtend && gMatch == 2) {
+@@ -1797,6 +1833,15 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 			 * performMatchCommand:), ours always an SMFP uuid. sweetfpcd gets u32 flags (bit 0 extend).
+ 			 */
+ 			gMatchExtend = plen >= 0x1c && le32(p + 0xc) == SMFP_MAGIC;
++			gMatchAcm = false;      /* 1216: forCredentialSet: +8 u32 ACM context length, +0xc external form */
++			if (!gMatchExtend && plen >= 0xc + 16 && le32(p + 8) >= 16 && le32(p + 8) <= 32 &&
++			    plen >= 0xc + le32(p + 8)) {
++				memcpy(gMatchAcmId, p + 0xc, sizeof(gMatchAcmId));
++				gMatchAcm = true;
++				SAY("MatchMode: ACM context %02x%02x%02x%02x.. (external form %u bytes): credential-set match%s\n",
++				    p[0xc], p[0xd], p[0xe], p[0xf], le32(p + 8), gAcmBind ? "" : " (kern.sweet_mesa_acm_bind 0: "
++				    "unlocks the keybag as before)");
++			}
+ 			put32(small, gMatchExtend ? 1 : 0);
+ 			fp = small;
+ 			flen = 4;
+@@ -2497,6 +2542,28 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_opend, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+     sysctl_sweet_mesa_opend, "I", "redfin 1203: 12 Cancel ends the running op with EnrollmentCancelled / "
+     "MatchingCancelled / FingerDetectCancelled so biometrickitd drops it from activeBioOpsQueue (default 1)");
+ 
++static int
++sysctl_sweet_mesa_acm_bind(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gAcmBind, changed = 0;
++	int e = sysctl_io_number(req, gAcmBind, sizeof(gAcmBind), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 1) {
++		return EINVAL;
++	}
++	gAcmBind = v;
++	SAY("kern.sweet_mesa_acm_bind=%d: %s (%u credential-only matches so far)\n", v, v ?
++	    "ACM credential only for the MatchMode's context, no keybag unlock for those, no global arm" :
++	    "every match unlocks the keybag and arms one global ACM credential", nAcmCredOnly);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_acm_bind, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_acm_bind, "I", "redfin 1216: 1 = a match for a MatchMode with an ACM context adds the "
++    "credential to that context only and does not unlock the keybag (default 0)");
++
+ static int
+ sysctl_sweet_mesa_fix(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
