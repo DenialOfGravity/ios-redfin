@@ -1,0 +1,249 @@
+redfin 1214: AKS extended lock state 7 (InBioUnlock) after a Touch ID unlock, kern.sweet_passcode_biostate (default 0)
+
+SpringBoard only acts on a Touch ID unlock through SBUIBiometricResource's "bio unlocked" event (4), which it
+raises when the keybag reports authenticated with extended lock state 7. We reported 0 at once, so the passcode
+pad never autofilled/unlocked after a match and no success feedback was played. With the switch on, sel 35 reports
+7 until SpringBoard confirms with aks_unlock_device without a passcode (MKBUnlockDevice(nil)), a lock, or 30 s.
+A nil-passcode unlock while locked is refused and not counted as a wrong passcode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/bsd/dev/sweet_passcode.c b/bsd/dev/sweet_passcode.c
+index 171f949..56aac0c 100644
+--- a/bsd/dev/sweet_passcode.c
++++ b/bsd/dev/sweet_passcode.c
+@@ -77,6 +77,22 @@ static int pc_unlocked_event;                 /* 1196: set under the lock, sent
+ #define PC_BIO_MAX_FAILS        5
+ static clock_sec_t pc_pass_ok_at;
+ static uint32_t pc_bio_fails, pc_n_bio_unlock, pc_n_bio_refused;
++/*
++ * 1214: InBioUnlock. After a Touch ID keybag unlock real AKS reports the extended lock state 7 ("InBioUnlock" in
++ * SpringBoardFoundation) until SpringBoard confirms it with aks_unlock_device() without a passcode
++ * (SBFUserAuthenticationController _evaluateBiometricAttempt: -> _isInBioUnlockState -> _performNilPasscodeCheck ->
++ * MKBUnlockDevice(nil)). SBUIBiometricResource _reallySetAuthenticated:keybagState: turns "authenticated + extended
++ * lockState 7" into its "bio unlocked" event (SBUIBiometricEvent 4, "Identity match reported by the keybag -
++ * BioUnlocked"). Event 4 is what the passcode pad needs (SBUIPasscodeLockViewBase -> autofill -> passcodeEntered
++ * ViaMesa -> attemptUnlock) and what the lock screen's Mesa unlock behavior turns into bioUnlock + success feedback.
++ * Without it the pad stays up after a match and no unlock feedback is played (touchid-passcodepad-2026-11-18.md).
++ * kern.sweet_passcode_biostate: 0 = off (lock state 0 at once, as 1198), 1 = state 7 on aks_get_extended_device_state
++ * (sel 35 only; sel 17 and aks_get_lock_state still say unlocked) until confirmed, locked, or PC_BIO_STATE_S.
++ */
++#define PC_BIO_STATE_S          30
++static int pc_biostate;
++static clock_sec_t pc_bio_pending_at;
++static uint32_t pc_n_bio_confirm, pc_n_bio_expired, pc_n_bio_nil_refused;
+ 
+ static clock_sec_t
+ pc_now(void)
+@@ -491,6 +507,7 @@ pc_check_locked(const uint8_t *pw, uint32_t len, int unlock)
+ 		pc_n_ok++;
+ 		pc_pass_ok_at = pc_now();       /* 1198 */
+ 		pc_bio_fails = 0;
++		pc_bio_pending_at = 0;          /* 1214 */
+ 		if (unlock && pc_locked) {
+ 			pc_locked = 0;
+ 			pc_unlocked_event = 1;
+@@ -634,6 +651,7 @@ sweet_pc_lock(void)
+ 		ev = 1;
+ 		SAY("locked\n");
+ 	}
++	pc_bio_pending_at = 0;          /* 1214 */
+ 	lck_mtx_unlock(&sweet_pc_lck);
+ 	if (ev) {
+ 		pc_notify("locked");
+@@ -680,6 +698,9 @@ sweet_pc_bio_unlock(int *did_unlock, const char **why)
+ 			pc_locked = 0;
+ 			ev = 1;
+ 			*did_unlock = 1;
++			if (pc_biostate) {
++				pc_bio_pending_at = now ? now : 1;      /* 1214: InBioUnlock until confirmed */
++			}
+ 		}
+ 	}
+ 	if (e) {
+@@ -689,7 +710,7 @@ sweet_pc_bio_unlock(int *did_unlock, const char **why)
+ 	}
+ 	lck_mtx_unlock(&sweet_pc_lck);
+ 	SAY("Touch ID %s%s%s\n", e ? "unlock REFUSED: " : ev ? "unlocked the keybag" : "match (already unlocked)",
+-	    e ? *why : "", "");
++	    e ? *why : "", ev && pc_biostate ? " (InBioUnlock: extended lock state 7 until SpringBoard confirms)" : "");
+ 	if (ev) {
+ 		pc_notify("unlocked (Touch ID)");
+ 	}
+@@ -738,16 +759,103 @@ sweet_pc_bio_failed(void)
+ 	SAY("Touch ID no-match %u/%d%s\n", f, PC_BIO_MAX_FAILS, f >= PC_BIO_MAX_FAILS ? ": passcode required" : "");
+ }
+ 
++/*
++ * 1214: 1 while a Touch ID unlock waits for SpringBoard's confirmation (SweetKeyStore reports extended lock state 7).
++ * Dropped (no event) when locked, when the switch is turned off, or after PC_BIO_STATE_S without a confirmation.
++ */
++int sweet_pc_bio_pending(void);
++int sweet_pc_bio_confirm(int *was_pending);
++
++int
++sweet_pc_bio_pending(void)
++{
++	int r = 0, expired = 0;
++	lck_mtx_lock(&sweet_pc_lck);
++	if (pc_bio_pending_at != 0) {
++		if (!pc_biostate || pc_locked || pc_now() - pc_bio_pending_at > PC_BIO_STATE_S) {
++			pc_bio_pending_at = 0;
++			pc_n_bio_expired++;
++			expired = 1;
++		} else {
++			r = 1;
++		}
++	}
++	lck_mtx_unlock(&sweet_pc_lck);
++	if (expired) {
++		SAY("InBioUnlock dropped (not confirmed within %d s, locked, or kern.sweet_passcode_biostate off)\n",
++		    PC_BIO_STATE_S);
++	}
++	return r;
++}
++
++/*
++ * 1214: aks_unlock_device without a passcode (MKBUnlockDevice(nil), SpringBoard's _performNilPasscodeCheck).
++ * ENOTSUP = switch off / no passcode lock: the caller keeps the old path. 0 = the keybag is unlocked (InBioUnlock
++ * confirmed, or nothing pending and not locked: a late confirmation after the state expired). EAUTH = locked:
++ * a missing passcode never unlocks, and it is not counted as a wrong passcode.
++ */
++int
++sweet_pc_bio_confirm(int *was_pending)
++{
++	*was_pending = 0;
++	int m = sweet_pc_mode();
++	if (!pc_biostate || m == 0 || m == 2 || !sweet_pc_is_set()) {
++		return ENOTSUP;
++	}
++	lck_mtx_lock(&sweet_pc_lck);
++	*was_pending = pc_bio_pending_at != 0;
++	pc_bio_pending_at = 0;
++	int locked = pc_locked;
++	if (*was_pending) {
++		pc_n_bio_confirm++;
++	} else if (locked) {
++		pc_n_bio_nil_refused++;
++	}
++	lck_mtx_unlock(&sweet_pc_lck);
++	SAY("aks_unlock_device without passcode: %s\n", *was_pending ? "InBioUnlock confirmed -> Unlocked" :
++	    locked ? "REFUSED (locked, no Touch ID unlock pending; not counted)" : "already unlocked -> ok");
++	if (*was_pending) {
++		pc_notify("bio unlock confirmed");
++	}
++	return locked && !*was_pending ? EAUTH : 0;
++}
++
++static int
++sysctl_sweet_passcode_biostate(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = pc_biostate, changed = 0;
++	int e = sysctl_io_number(req, pc_biostate, sizeof(pc_biostate), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 1) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_pc_lck);
++	pc_biostate = v;
++	if (!v) {
++		pc_bio_pending_at = 0;
++	}
++	lck_mtx_unlock(&sweet_pc_lck);
++	SAY("kern.sweet_passcode_biostate=%d (InBioUnlock after a Touch ID unlock %s)\n", v, v ? "on" : "off");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_biostate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_passcode_biostate, "I", "redfin 1214: 1 = extended lock state 7 (InBioUnlock) after a Touch ID "
++    "unlock until SpringBoard confirms it (default 0)");
++
+ static int
+ sysctl_sweet_passcode_bio(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
+ {
+-	char b[160];
++	char b[256];
+ 	clock_sec_t now = pc_now();
+ 	lck_mtx_lock(&sweet_pc_lck);
+-	snprintf(b, sizeof(b), "passcode_since_boot=%d age_s=%lu bio_fails=%u bio_unlocks=%u bio_refused=%u",
++	snprintf(b, sizeof(b), "passcode_since_boot=%d age_s=%lu bio_fails=%u bio_unlocks=%u bio_refused=%u "
++	    "biostate=%d in_bio_unlock=%d bio_confirms=%u bio_expired=%u nil_refused=%u",
+ 	    pc_pass_ok_at != 0, pc_pass_ok_at ? (unsigned long)(now - pc_pass_ok_at) : 0UL, pc_bio_fails, pc_n_bio_unlock,
+-	    pc_n_bio_refused);
++	    pc_n_bio_refused, pc_biostate, pc_bio_pending_at != 0, pc_n_bio_confirm, pc_n_bio_expired, pc_n_bio_nil_refused);
+ 	lck_mtx_unlock(&sweet_pc_lck);
+ 	return SYSCTL_OUT(req, b, strlen(b) + 1);
+ }
+@@ -779,6 +887,7 @@ sysctl_sweet_passcode(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
+ 	if (v == 0) {
+ 		pc_locked = 0;
+ 	}
++	pc_bio_pending_at = 0;          /* 1214 */
+ 	pc_stored = ST_UNKNOWN;         /* re-read the file when next needed */
+ 	pc_last_try = 0;
+ 	lck_mtx_unlock(&sweet_pc_lck);
+@@ -811,6 +920,7 @@ sysctl_sweet_passcode_reset(__unused struct sysctl_oid *oidp, __unused void *arg
+ 	pc_locked = 0;
+ 	pc_fails = 0;
+ 	pc_backoff_until = 0;
++	pc_bio_pending_at = 0;          /* 1214 */
+ 	bzero(pc_dk, sizeof(pc_dk));
+ 	lck_mtx_unlock(&sweet_pc_lck);
+ 	SAY("RESET by %s: verifier -> none (%d)\n", pn, e);
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 6a361c5..ee4b774 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -40,6 +40,8 @@ int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
+ int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
+ void sweet_pc_lock(void);
+ int sweet_pc_locked(void);
++int sweet_pc_bio_pending(void);                 /* 1214 */
++int sweet_pc_bio_confirm(int *was_pending);     /* 1214 */
+ void sweet_acm_publish(void);
+ void sweet_aks_notify(void);
+ }
+@@ -272,10 +274,14 @@ pc_der_pair(uint8_t *p, const char *key, uint32_t value)
+ }
+ 
+ static IOReturn
+-pc_device_state(IOExternalMethodArguments *args)
++pc_device_state(IOExternalMethodArguments *args, bool ext)
+ {
+ 	uint32_t ss, sls, sfa, sb;
+ 	sweet_pc_aks_state(&ss, &sls, &sfa, &sb);
++	if (ext && sls == 0 && sweet_pc_bio_pending()) {
++		sls = 7;        /* 1214: InBioUnlock (extended state only), see sweet_passcode.c */
++		IOLog("SWEET KS: extended device state: lock state 7 (InBioUnlock)\n");
++	}
+ 	const struct {
+ 		const char *key;
+ 		uint32_t value;
+@@ -351,7 +357,7 @@ sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret,
+ 	case kAKSGetExtDeviceState:
+ 		*logall = false;
+ 		args->scalarOutputCount = 0;
+-		*ret = pc_device_state(args);
++		*ret = pc_device_state(args, selector == kAKSGetExtDeviceState);
+ 		return true;
+ 	case kAKSLockDevice:
+ 	case kAKSLockDeviceNow:
+@@ -361,6 +367,14 @@ sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret,
+ 		return true;
+ 	case kAKSUnlockDevice:
+ 		args->scalarOutputCount = 0;
++		if (ns >= 3 && in[2] == 0) {
++			/* 1214: no passcode = SpringBoard confirming a Touch ID unlock (kern.sweet_passcode_biostate) */
++			int wp = 0, e = sweet_pc_bio_confirm(&wp);
++			if (e != ENOTSUP) {
++				*ret = pc_ret(e);
++				return true;
++			}
++		}
+ 		*ret = ns >= 3 ? pc_ret(sweet_pc_check_user(in[1], (uint32_t)in[2], 1)) : kIOReturnBadArgument;
+ 		return true;
+ 	case kAKSUnlockBag:
