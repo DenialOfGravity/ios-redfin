@@ -8,7 +8,7 @@ CC=../../work/userland/bin/ios-cc
 V=$(git rev-parse --short HEAD 2>/dev/null || date +%F)
 mkdir -p out
 $CC -O2 -Wall -Wextra -Wno-unused-parameter -DFPCD_VERSION="\"$V\"" -o out/sweetfpcd \
-	sweetfpcd.c ../qsee/qsee_lib.c ../qsee/qsee_gk.c ../qsee/qsee_wl.c ../video/pmem.c -framework IOKit -framework CoreFoundation
+	sweetfpcd.c fpcd_hold.c ../qsee/qsee_lib.c ../qsee/qsee_gk.c ../qsee/qsee_wl.c ../video/pmem.c -framework IOKit -framework CoreFoundation
 codesign -f -s - out/sweetfpcd
 ls -la out
 U=../../../out

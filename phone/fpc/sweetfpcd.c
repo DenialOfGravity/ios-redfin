@@ -93,6 +93,7 @@
 #include "../qsee/qsee_lib.h"
 #include "../qsee/qsee_gk.h"
 #include "fpcd_bridge.h"
+#include "fpcd_hold.h"
 
 #ifndef FPCD_VERSION
 #define FPCD_VERSION "dev"
@@ -929,16 +930,11 @@ static void run_detect(uint32_t gen)
 		 */
 		lg("screen-off detect: wake touch image kept for the match op (max %ld ms)", held_max_ms);
 		long t0 = now_ms();
-		while (!cancelled(gen) && now_ms() - t0 < held_max_ms)
-			usleep(10000);
-		pthread_mutex_lock(&st_mx);
-		int claimed = S.held_ms == 0;
-		if (!cancelled(gen))
-			S.held_ms = 0;
-		pthread_mutex_unlock(&st_mx);
-		if (!cancelled(gen))
-			lg("screen-off detect: wake touch image %s after %ld ms, detecting again", claimed ? "claimed" : "unclaimed",
-			   now_ms() - t0);
+		/* fpcd_hold.c: tid26 hung here (cancelled() re-locked st_mx while it was held; the bridge's Cancel waited) */
+		const struct fpcd_hold_st h = { &st_mx, &g_stop, &S.cancel, &S.gen, &S.held_ms };
+		int hr = fpcd_hold_wait(&h, gen, held_max_ms);
+		lg("screen-off detect: wake touch image %s after %ld ms", hr == 1 ? "left for the next op" : hr == 2 ? "taken" :
+		   "not claimed, dropped; detecting again", now_ms() - t0);
 	}
 }
 
