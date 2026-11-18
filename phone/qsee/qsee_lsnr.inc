@@ -85,7 +85,7 @@ static struct lsnr lsnrs[] = {
 };
 #define N_LSNR (sizeof(lsnrs) / sizeof(lsnrs[0]))
 static struct pbuf sgl;		/* zeroed 32-byte sglistinfo table for the whitelist response */
-static uint8_t sbuf[0x6400];
+static uint8_t sbuf[0x8000];
 
 static void state_save(void)
 {
@@ -126,6 +126,8 @@ static int lsnr_register(struct lsnr *l)
 {
 	if (pbuf_get(&l->sb, l->sb_len, 4096, 0, 0xc0000000ull + l->id * 0x10000ull))
 		return -1;
+	/* Linux registers the whole ION buffer: sb_len = the dmabuf size, page-rounded (0x6400 -> 0x7000) */
+	l->sb_len = (uint32_t)l->sb.size;
 	uint64_t x[8] = { QSEE_SMC_LSTNR_REG_SI, QSEE_ARGS_LSTNR_REG, l->id, l->sb.pa, l->sb_len };
 	int64_t rc = qsmc(x);
 	l->smcinvoke = 1;
@@ -175,11 +177,18 @@ static int lsnr_all_up(void)
 	state_cleanup();
 	if (pbuf_get(&sgl, 4096, 4096, 0, 0xc1000000ull))
 		return -1;
+	const char *e = getenv("QSEE_LSNR_CONT");	/* diagnosis: try every listener even after a failure */
+	int cont = e && atoi(e), bad = 0;
 	for (unsigned i = 0; i < N_LSNR; i++)
 		if (lsnr_register(&lsnrs[i])) {
-			lsnr_all_down();
-			return -1;
+			bad = 1;
+			if (!cont)
+				break;
 		}
+	if (bad) {
+		lsnr_all_down();
+		return -1;
+	}
 	return 0;
 }
 
