@@ -914,6 +914,10 @@ int fpc_capture_hal(uint32_t appid, long deadline_ms, const struct fpc_hal_cb *c
 				break;
 			}
 			hal_cmd(cb, appid, d, 4, st4);	/* at once after the wake */
+			/* the touch itself: after an early arm wake the finger shows here, not at the arm wait; report it
+			 * now (before the image is judged) so finger-down precedes the capture result */
+			if (cb && cb->wake)
+				cb->wake(cb->ctx, fpc_ms_since(&ta));
 			if (*st4 != 3 || hal_stopped(cb))
 				break;
 		}

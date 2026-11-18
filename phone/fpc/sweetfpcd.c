@@ -726,6 +726,7 @@ static void *capture_thread(void *arg)
 			run_match(gen);
 		else
 			run_detect(gen);
+		finger_set(0);	/* an op never ends with a finger "on" that no later wake would clear */
 		pthread_mutex_lock(&st_mx);
 		if (S.gen == gen)
 			S.op = OP_NONE;
