@@ -768,6 +768,11 @@ private:
         bool gpu = false;
     };
     std::vector<YcLate> ycLate_;
+    // (redfin hm-ycsync) HM_YCBCR_SYNC bit 2: the decodes sent, published (ycbcrDone) by submit once their buffer is on the ring
+    std::vector<YcLate> ycPublish_;
+public:
+    void ycbcrPublish(bool sent);
+private:
     std::shared_ptr<Buffer> paramsYc_;   // a decode buffer's parameters, 64 bytes a dispatch
     uint32_t paramsYcUsed_ = 0;
     std::shared_ptr<Buffer> paramsXr_;   // (redfin hmv11) HM_XR_GPU: a decode buffer's parameters, 32 bytes a dispatch
