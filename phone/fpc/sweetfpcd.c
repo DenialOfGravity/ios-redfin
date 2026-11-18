@@ -247,6 +247,7 @@ static const char *fpcd_cmd_name(uint32_t c)
 
 /* ---------------------------------------------------------------- bridge */
 static io_connect_t conn;
+static uint32_t br_flags = 0xffffffffu;	/* ws-fpcd-d: last bridge STATE flags */
 static pthread_mutex_t ev_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static int bridge_open(void)
@@ -276,7 +277,6 @@ static int bridge_open(void)
 }
 
 /* ws-fpcd-d: re-read the bridge STATE; log when the flags (published, match gate, translate, open) change */
-static uint32_t br_flags = 0xffffffffu;
 static void bridge_state_poll(const char *why)
 {
 	struct smb_state st = { 0 };
