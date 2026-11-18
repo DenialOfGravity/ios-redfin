@@ -72,6 +72,12 @@ static const char *ta_dir = "/var/local/fpc/ta", *ta_file = "fpctzappfingerprint
 static uint32_t appid;
 static int ta_resident, sensor_ok, keep_ta, require_hat, verbose;
 static long op_timeout_ms = 120000;
+/* FPCD_BRIDGE_SMALL (default 1): WAIT with a 4096-byte out capacity, REPLY/EVENT with header + used bytes only, so
+ * IOKit passes every struct inline (<= 4096) instead of through a memory descriptor (1192's large-struct path). */
+static int bridge_small = 1;
+#define SMB_SMALL_MAX		4096
+#define SMB_REQ_HDR		12
+#define SMB_EV_HDR_SZ		8
 static volatile sig_atomic_t g_stop, g_wipe, g_dump;
 
 /* ta_mx serialises every qsee_lib call (one SMC user, and say_quiet etc. are globals). st_mx guards S, the id cache
@@ -224,7 +230,8 @@ static void ev_send(unsigned code, int32_t status, uint32_t fid, int32_t score, 
 		e.subtype = fpcd_event_subtype(code);
 		e.len = sizeof(ev);
 		memcpy(e.data, &ev, sizeof(ev));
-		kr = IOConnectCallStructMethod(conn, SMB_SEL_EVENT, &e, sizeof(e), NULL, NULL);
+		kr = IOConnectCallStructMethod(conn, SMB_SEL_EVENT, &e, bridge_small ? SMB_EV_HDR_SZ + e.len : sizeof(e), NULL,
+					       NULL);
 	}
 	pthread_mutex_unlock(&ev_mx);
 	lg("event #%u code %u sub %#x: status %d fid %#x score %d remaining %u samples %u flags %#x n %u -> %s", ev.evseq,
@@ -1099,7 +1106,10 @@ static void dispatch(void)
 	if (!mapped)
 		rp.status = FPCD_E_UNSUPPORTED;
 	long th = now_us() - t0u;
-	kern_return_t kr = IOConnectCallStructMethod(conn, SMB_SEL_REPLY, &rp, sizeof(rp), NULL, NULL);
+	if (rp.len > SMB_DATA_MAX)
+		rp.len = SMB_DATA_MAX;
+	size_t rsz = bridge_small ? SMB_REQ_HDR + rp.len : sizeof(rp);	/* > 4096 only for replies we never build */
+	kern_return_t kr = IOConnectCallStructMethod(conn, SMB_SEL_REPLY, &rp, rsz, NULL, NULL);
 	long tr = now_us() - t0u;
 	disp_t0_us = 0;
 	lg("cmd seq %u id %u %s len %u -> status %d len %u%s | handler %ld us, replied %ld us%s", rq.seq, rq.cmd,
@@ -1311,6 +1321,8 @@ int main(int argc, char **argv)
 	keep_ta |= (e = getenv("FPCD_KEEP_TA")) && atoi(e);
 	require_hat = (e = getenv("FPCD_REQUIRE_HAT")) && atoi(e);
 	verbose = (e = getenv("FPCD_VERBOSE")) && atoi(e);
+	if ((e = getenv("FPCD_BRIDGE_SMALL")))
+		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
 		cap3_ms = atol(e);
 	if ((e = getenv("FPCD_CONSOLE")) && atoi(e))
@@ -1330,8 +1342,9 @@ int main(int argc, char **argv)
 	sigaction(SIGUSR2, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
-	lg("start %s: %s, TA %s/%s (name %s), op timeout %ld ms, allow-match file %s", FPCD_VERSION,
-	   self ? "selftest" : "daemon", ta_dir, ta_file, ta_name, op_timeout_ms, ALLOW_MATCH_PATH);
+	lg("start %s: %s, TA %s/%s (name %s), op timeout %ld ms, allow-match file %s, bridge structs %s", FPCD_VERSION,
+	   self ? "selftest" : "daemon", ta_dir, ta_file, ta_name, op_timeout_ms, ALLOW_MATCH_PATH,
+	   bridge_small ? "small (inline, FPCD_BRIDGE_SMALL=1)" : "full 16388/16384 (FPCD_BRIDGE_SMALL=0)");
 	pm_init();
 	if (qsee_lib_lock("sweetfpcd"))
 		return 9;
@@ -1387,16 +1400,27 @@ int main(int argc, char **argv)
 			said = 0;
 		}
 		uint64_t in = FPCD_WAIT_REQ_MS;
-		size_t osz = sizeof(rq);
+		size_t osz = bridge_small ? SMB_SMALL_MAX : sizeof(rq);
 		kern_return_t kr = IOConnectCallMethod(conn, SMB_SEL_WAIT, &in, 1, NULL, 0, NULL, NULL, &rq, &osz);
 		if (kr == kIOReturnTimeout)
 			continue;
+		if (kr == kIOReturnNoSpace && bridge_small) {
+			/* the request needs more than 4084 data bytes (1192 keeps it queued): fetch it once at full size */
+			lg("bridge: WAIT: request larger than %d bytes: fetching it with the full-size buffer", SMB_SMALL_MAX);
+			in = 0;
+			osz = sizeof(rq);
+			kr = IOConnectCallMethod(conn, SMB_SEL_WAIT, &in, 1, NULL, 0, NULL, NULL, &rq, &osz);
+			if (kr == kIOReturnTimeout)
+				continue;
+		}
 		if (kr != KERN_SUCCESS || osz < offsetof(struct smb_req, data)) {
 			lg("bridge: WAIT %#x (out %zu bytes): reopening in 1 s", kr, osz);
 			bridge_close();
 			sleep(1);
 			continue;
 		}
+		if (rq.len > osz - offsetof(struct smb_req, data))
+			rq.len = (uint32_t)(osz - offsetof(struct smb_req, data));	/* never read past what WAIT wrote */
 		dispatch();
 	}
 	lg("stopping");
