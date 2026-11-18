@@ -90,6 +90,8 @@ static struct {
 	uint32_t captures, good, matches, nomatches, withheld, evseq;
 	struct fpcd_event last_match;
 	int have_last_match;
+	uint64_t dbid;
+	int dbid_valid;
 } S;
 
 /* ---------------------------------------------------------------- log */
@@ -643,31 +645,164 @@ static int op_cancel_wait(void)
 	return rc ? -1 : 0;
 }
 
-static int op_start(int op)
+/*
+ * The bridge thread never waits: no TA call (ta_mx), no capture, no op_cancel_wait. Commands that need the TA are
+ * queued here and run by ta_worker; ops (enrol/match/detect) are switched by changing S.op/S.gen, which the capture
+ * thread sees within one wait slice. Results come back as EVENTs.
+ */
+static void op_set_nowait(int op)	/* op NONE = cancel; the capture thread notices the new gen */
 {
-	if (op_cancel_wait())
-		return FPCD_E_BUSY;
 	pthread_mutex_lock(&st_mx);
 	S.op = op;
 	S.gen++;
-	S.cancel = 0;
 	S.started = now_ms();
 	pthread_cond_broadcast(&st_cv);
+	pthread_mutex_unlock(&st_mx);
+}
+
+enum { JOB_RESET = 1, JOB_ENROL, JOB_DELETE, JOB_WIPE, JOB_NOCATACOMB };
+static const char *job_name[] = { "?", "reset", "enrol-begin", "delete", "wipe-all", "no-catacomb" };
+struct job { int kind; uint32_t arg, gen; char why[40]; };
+#define JQ_N 16
+static struct job jq[JQ_N];
+static unsigned jq_head, jq_tail;	/* under st_mx */
+static pthread_cond_t jq_cv = PTHREAD_COND_INITIALIZER;
+
+static int job_post(int kind, uint32_t arg, const char *why)
+{
+	pthread_mutex_lock(&st_mx);
+	if (jq_tail - jq_head >= JQ_N) {
+		pthread_mutex_unlock(&st_mx);
+		lg("job %s (%s): queue full: refused", job_name[kind], why);
+		return FPCD_E_BUSY;
+	}
+	struct job *j = &jq[jq_tail++ % JQ_N];
+	j->kind = kind, j->arg = arg, j->gen = S.gen;
+	snprintf(j->why, sizeof(j->why), "%s", why);
+	pthread_cond_broadcast(&jq_cv);
 	pthread_mutex_unlock(&st_mx);
 	return FPCD_OK;
 }
 
-/* debug "wipe all": cancel, delete every id the TA lists; 0 iff the list ends empty */
+static void dbid_refresh(void)	/* caller holds ta_mx */
+{
+	uint8_t d[FPC_SENSOR_LEN] = { 0 };
+	int32_t st = 0;
+	int r = ta_bio(10, d, &st);
+	pthread_mutex_lock(&st_mx);
+	S.dbid_valid = !r && !st;
+	S.dbid = (uint64_t)rd_u32(d + 0x10) | (uint64_t)rd_u32(d + 0x14) << 32;
+	pthread_mutex_unlock(&st_mx);
+}
+
+/* debug "wipe all": delete every id the TA lists; 0 iff the list ends empty (worker / selftest / shutdown only) */
 static int wipe_all(const char *why)
 {
-	op_cancel_wait();
 	pthread_mutex_lock(&ta_mx);
 	int r = fpc_cleanup_all(appid, "wipe");
 	ids_refresh();
 	pthread_mutex_unlock(&ta_mx);
 	lg("wipe all (%s): %s", why, r ? "FAILED, ids left" : "OK, no finger left");
-	ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
+	ev_send(FPCD_EV_TEMPLATES, r ? FPCD_E_IO : 0, 0, 0, 0, 0, 0, 1);
 	return r ? FPCD_E_IO : FPCD_OK;
+}
+
+static int fpcd_enrol_authorize(uint32_t gid);
+
+static void job_run(const struct job *j)
+{
+	long t0 = now_ms();
+	int32_t st = 0, st2 = 0;
+	int r = 0;
+	uint8_t d[FPC_SENSOR_LEN] = { 0 };
+	switch (j->kind) {
+	case JOB_RESET:
+		pthread_mutex_lock(&ta_mx);
+		r = ta_sensor_init();
+		pthread_mutex_unlock(&ta_mx);
+		if (r)
+			ev_send(FPCD_EV_ERROR, FPCD_E_IO, 0, 0, 0, 0, 0, 0);
+		break;
+	case JOB_ENROL: {
+		uint32_t gid = j->arg;
+		pthread_mutex_lock(&ta_mx);
+		ids_refresh();
+		r = ta_set_gid(gid, &st);
+		if (!r && !st) {
+			fpcd_enrol_authorize(gid);	/* 1 = not authorised: see the hook */
+			r = ta_bio(0, d, &st);	/* begin_enrol */
+		}
+		pthread_mutex_unlock(&ta_mx);
+		lg("enrol: gid %u, set_gid/begin_enrol rc %d status %d", gid, r, st);
+		if (r || st) {
+			ev_send(FPCD_EV_ENROL_FAILED, r ? FPCD_E_IO : st, 0, 0, 0, 0, 0, 0);
+			break;
+		}
+		pthread_mutex_lock(&st_mx);
+		if (S.gen != j->gen) {	/* Cancel or another mode arrived meanwhile */
+			pthread_mutex_unlock(&st_mx);
+			lg("enrol: superseded (gen %u -> %u): not started", j->gen, S.gen);
+			break;
+		}
+		S.gid = gid;
+		memcpy(S.pre_ids, S.ids, sizeof(S.pre_ids));
+		S.pre_n = S.ids_valid ? S.nids : 0;
+		S.op = OP_ENROL;
+		S.gen++;
+		S.started = now_ms();
+		pthread_cond_broadcast(&st_cv);
+		pthread_mutex_unlock(&st_mx);
+		break;
+	}
+	case JOB_DELETE: {
+		uint32_t fid = j->arg;
+		pthread_mutex_lock(&ta_mx);
+		ids_refresh();
+		int listed = fid_listed(fid);
+		r = listed ? fpc_delete(appid, fid) : 0;
+		ids_refresh();
+		int still = fid_listed(fid);
+		pthread_mutex_unlock(&ta_mx);
+		lg("remove %#x: %s, delete rc %d, %s", fid, listed ? "listed" : "NOT listed", r, still ? "STILL LISTED" : "gone");
+		ev_send(FPCD_EV_TEMPLATES, !listed ? FPCD_E_NOENT : still ? FPCD_E_IO : 0, fid, 0, 0, 0, 0, 1);
+		break;
+	}
+	case JOB_WIPE:
+		wipe_all(j->why);
+		break;
+	case JOB_NOCATACOMB:
+		pthread_mutex_lock(&ta_mx);
+		r = ta_load_empty_db(&st);
+		if (!r && !st)
+			r = ta_set_gid(0, &st2);
+		ids_refresh();
+		dbid_refresh();
+		pthread_mutex_unlock(&ta_mx);
+		lg("NoCatacomb: load_empty_db status %d, set_gid 0 status %d", st, st2);
+		ev_send(FPCD_EV_TEMPLATES, r || st || st2 ? FPCD_E_IO : 0, 0, 0, 0, 0, 0, 1);
+		break;
+	}
+	lg("job %s (%s): done in %ld ms", job_name[j->kind], j->why, now_ms() - t0);
+}
+
+static void *ta_worker(void *arg)
+{
+	(void)arg;
+	sigset_t all;
+	sigfillset(&all);
+	pthread_sigmask(SIG_BLOCK, &all, NULL);
+	for (;;) {
+		pthread_mutex_lock(&st_mx);
+		while (!g_stop && jq_head == jq_tail)
+			pthread_cond_wait(&jq_cv, &st_mx);
+		if (g_stop) {
+			pthread_mutex_unlock(&st_mx);
+			return NULL;
+		}
+		struct job j = jq[jq_head++ % JQ_N];
+		pthread_mutex_unlock(&st_mx);
+		job_run(&j);
+	}
 }
 
 /* ---------------------------------------------------------------- command handlers */
@@ -683,13 +818,6 @@ static int rep_u32(struct smb_reply *p, uint32_t v)
 	return FPCD_OK;
 }
 
-static int rep_ta_status(struct smb_reply *p, int32_t st)
-{
-	put_u32(p->data, (uint32_t)st);
-	p->len = 4;
-	return FPCD_E_IO;
-}
-
 static int h_proto(const struct smb_req *q, struct smb_reply *p) { return rep_u32(p, 2); }
 static int h_ready(const struct smb_req *q, struct smb_reply *p) { return rep_u32(p, appid && sensor_ok); }
 static int h_maxids(const struct smb_req *q, struct smb_reply *p) { return rep_u32(p, FPC_MAX_FINGERS); }
@@ -697,21 +825,13 @@ static int h_unsupported(const struct smb_req *q, struct smb_reply *p) { return 
 
 static int h_reset(const struct smb_req *q, struct smb_reply *p)
 {
-	if (op_cancel_wait())
-		return FPCD_E_BUSY;
-	pthread_mutex_lock(&ta_mx);
-	int r = ta_sensor_init();
-	pthread_mutex_unlock(&ta_mx);
-	return r ? FPCD_E_IO : FPCD_OK;
+	op_set_nowait(OP_NONE);
+	return job_post(JOB_RESET, 0, "ResetSensor");
 }
 
 static int h_ids(const struct smb_req *q, struct smb_reply *p)
 {
-	if (!pthread_mutex_trylock(&ta_mx)) {	/* fresh list when the TA is free, else the cache */
-		ids_refresh();
-		pthread_mutex_unlock(&ta_mx);
-	}
-	struct fpcd_ids ids = { 0 };
+	struct fpcd_ids ids = { 0 };	/* the cache: refreshed by every TA change (worker / capture thread) */
 	pthread_mutex_lock(&st_mx);
 	int ok = S.ids_valid;
 	ids.count = S.nids;
@@ -734,14 +854,13 @@ static int h_free(const struct smb_req *q, struct smb_reply *p)
 
 static int h_catacomb_id(const struct smb_req *q, struct smb_reply *p)
 {
-	uint8_t d[FPC_SENSOR_LEN] = { 0 };
-	int32_t st = 0;
-	pthread_mutex_lock(&ta_mx);
-	int r = ta_bio(10, d, &st);
-	pthread_mutex_unlock(&ta_mx);
-	if (r || st)
-		return rep_ta_status(p, st);
-	memcpy(p->data, d + 0x10, 8);
+	pthread_mutex_lock(&st_mx);
+	int ok = S.dbid_valid;
+	uint64_t id = S.dbid;
+	pthread_mutex_unlock(&st_mx);
+	if (!ok)
+		return FPCD_E_NOTREADY;
+	memcpy(p->data, &id, 8);
 	p->len = 8;
 	return FPCD_OK;
 }
@@ -762,28 +881,8 @@ static int fpcd_enrol_authorize(uint32_t gid)
 static int h_enrol(const struct smb_req *q, struct smb_reply *p)
 {
 	uint32_t gid = arg_u32(q, 0);
-	if (op_cancel_wait())
-		return FPCD_E_BUSY;
-	uint8_t d[FPC_SENSOR_LEN] = { 0 };
-	int32_t st = 0;
-	pthread_mutex_lock(&ta_mx);
-	ids_refresh();
-	int r = ta_set_gid(gid, &st);
-	if (!r && !st) {
-		memset(d, 0, sizeof(d));
-		fpcd_enrol_authorize(gid);	/* 1 = not authorised: see the hook */
-		r = ta_bio(0, d, &st);	/* begin_enrol */
-	}
-	pthread_mutex_unlock(&ta_mx);
-	lg("enrol: gid %u, set_gid/begin_enrol rc %d status %d", gid, r, st);
-	if (r || st)
-		return rep_ta_status(p, st);
-	pthread_mutex_lock(&st_mx);
-	S.gid = gid;
-	memcpy(S.pre_ids, S.ids, sizeof(S.pre_ids));
-	S.pre_n = S.ids_valid ? S.nids : 0;
-	pthread_mutex_unlock(&st_mx);
-	return op_start(OP_ENROL);
+	op_set_nowait(OP_NONE);	/* stop what runs; the worker begins the enrol and starts the op */
+	return job_post(JOB_ENROL, gid, "EnrollMode");	/* failures: ENROL_FAILED event */
 }
 
 static int h_enrol_continue(const struct smb_req *q, struct smb_reply *p)
@@ -801,25 +900,31 @@ static int h_match(const struct smb_req *q, struct smb_reply *p)
 	pthread_mutex_unlock(&st_mx);
 	if (!n)
 		lg("match: no finger enrolled in the TA: every identify will fail");
-	return op_start(OP_MATCH);
+	return (op_set_nowait(OP_MATCH), FPCD_OK);
 }
 
 static int h_cancel(const struct smb_req *q, struct smb_reply *p)
 {
-	return op_cancel_wait() ? FPCD_E_BUSY : FPCD_OK;
+	op_set_nowait(OP_NONE);
+	return FPCD_OK;
 }
 
 static int h_fdet(const struct smb_req *q, struct smb_reply *p)
 {
+	/* 38 (enable = 1) / 69 (enable = bm_cmd value): set the mode and reply at once; detection runs on the capture
+	 * thread and reports by EVENT */
 	uint32_t en = arg_u32(q, 1);
 	pthread_mutex_lock(&st_mx);
 	int op = S.op;
 	pthread_mutex_unlock(&st_mx);
-	if (!en)
-		return op == OP_DETECT ? h_cancel(q, p) : FPCD_OK;
-	if (op == OP_ENROL || op == OP_MATCH)
-		return FPCD_OK;	/* those report finger down/up already */
-	return op == OP_DETECT ? FPCD_OK : op_start(OP_DETECT);
+	lg("finger detect %s (op %s)", en ? "on" : "off", op_name[op]);
+	if (!en) {
+		if (op == OP_DETECT)
+			op_set_nowait(OP_NONE);
+	} else if (op == OP_NONE) {
+		op_set_nowait(OP_DETECT);
+	}
+	return FPCD_OK;	/* enrol / match running: they report finger down/up already */
 }
 
 static int h_remove(const struct smb_req *q, struct smb_reply *p)
@@ -842,46 +947,27 @@ static int h_remove(const struct smb_req *q, struct smb_reply *p)
 	} else if (q->len == 4) {
 		fid = rd_u32(q->data);
 		if (fid == FPCD_FID_ALL)
-			return wipe_all("RemoveTemplate all (private u32 form)");
+			return job_post(JOB_WIPE, 0, "RemoveTemplate all (u32)");
 	} else {
 		lg("remove: payload len %u (want 20, or 4 private): refused", q->len);
 		return FPCD_E_INVAL;
 	}
-	if (op_cancel_wait())
-		return FPCD_E_BUSY;
-	pthread_mutex_lock(&ta_mx);
-	ids_refresh();
-	int listed = fid_listed(fid);
-	int r = listed ? fpc_delete(appid, fid) : 0;
-	ids_refresh();
-	int still = fid_listed(fid);
-	pthread_mutex_unlock(&ta_mx);
-	lg("remove %#x: %s, delete rc %d, %s", fid, listed ? "listed" : "NOT listed", r, still ? "STILL LISTED" : "gone");
-	if (listed)
-		ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
-	return !listed ? FPCD_E_NOENT : still ? FPCD_E_IO : FPCD_OK;
+	if (!fid_listed(fid)) {
+		lg("remove %#x: not in the id cache", fid);
+		return FPCD_E_NOENT;
+	}
+	return job_post(JOB_DELETE, fid, "RemoveTemplate");	/* result: TEMPLATES event (status, fid) */
 }
 
 static int h_remove_all(const struct smb_req *q, struct smb_reply *p)
 {
-	return wipe_all(fpcd_cmd_name(q->cmd));
+	return job_post(JOB_WIPE, 0, "RemoveUserData");
 }
 
 static int h_nocatacomb(const struct smb_req *q, struct smb_reply *p)
 {
-	/* no catacomb on disk: an empty template db (templates are TA-memory only for now) */
-	if (op_cancel_wait())
-		return FPCD_E_BUSY;
-	int32_t st = 0, st2 = 0;
-	pthread_mutex_lock(&ta_mx);
-	int r = ta_load_empty_db(&st);
-	if (!r && !st)
-		r = ta_set_gid(0, &st2);
-	ids_refresh();
-	pthread_mutex_unlock(&ta_mx);
-	lg("NoCatacomb: load_empty_db status %d, set_gid 0 status %d", st, st2);
-	ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
-	return r || st || st2 ? rep_ta_status(p, st ? st : st2) : FPCD_OK;
+	/* no catacomb on disk: an empty template db (templates are TA-memory only for now); result: TEMPLATES event */
+	return job_post(JOB_NOCATACOMB, 0, "NoCatacomb");
 }
 
 static int h_last_match(const struct smb_req *q, struct smb_reply *p)
@@ -910,7 +996,7 @@ static int h_status(const struct smb_req *q, struct smb_reply *p)
 	return FPCD_OK;
 }
 
-static int h_wipe(const struct smb_req *q, struct smb_reply *p) { return wipe_all("bridge WipeAll"); }
+static int h_wipe(const struct smb_req *q, struct smb_reply *p) { return job_post(JOB_WIPE, 0, "bridge WipeAll"); }
 
 static int h_ping(const struct smb_req *q, struct smb_reply *p)
 {
@@ -953,9 +1039,41 @@ static const struct {
 static struct smb_req rq;
 static struct smb_reply rp;
 
+/* reply watchdog: the bridge thread must REPLY within a few ms (the kernel blocks the Apple caller meanwhile) */
+#define FPCD_REPLY_WARN_MS	100
+static volatile long disp_t0_us;	/* != 0 while a request is being handled */
+static volatile uint32_t disp_seq, disp_cmd;
+static long now_us(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (t.tv_sec - t_start.tv_sec) * 1000000L + (t.tv_nsec - t_start.tv_nsec) / 1000;
+}
+
+static void *watchdog_thread(void *arg)
+{
+	(void)arg;
+	sigset_t all;
+	sigfillset(&all);
+	pthread_sigmask(SIG_BLOCK, &all, NULL);
+	long warned = 0;
+	while (!g_stop) {
+		usleep(20000);
+		long t0 = disp_t0_us;
+		if (t0 && t0 != warned && now_us() - t0 > FPCD_REPLY_WARN_MS * 1000L) {
+			warned = t0;
+			lg("WATCHDOG: reply to seq %u id %u %s still pending after %ld ms", disp_seq, disp_cmd,
+			   fpcd_cmd_name(disp_cmd), (now_us() - t0) / 1000);
+		}
+	}
+	return NULL;
+}
+
 static void dispatch(void)
 {
-	long t0 = now_ms();
+	long t0u = now_us();
+	disp_seq = rq.seq, disp_cmd = rq.cmd;
+	disp_t0_us = t0u ? t0u : 1;
 	memset(&rp, 0, offsetof(struct smb_reply, data) + 64);
 	rp.seq = rq.seq;
 	if (rq.len > SMB_DATA_MAX)
@@ -969,9 +1087,15 @@ static void dispatch(void)
 		}
 	if (!mapped)
 		rp.status = FPCD_E_UNSUPPORTED;
+	long th = now_us() - t0u;
 	kern_return_t kr = IOConnectCallStructMethod(conn, SMB_SEL_REPLY, &rp, sizeof(rp), NULL, NULL);
-	lg("cmd seq %u id %u %s len %u -> status %d len %u%s (%ld ms)%s", rq.seq, rq.cmd, fpcd_cmd_name(rq.cmd), rq.len,
-	   rp.status, rp.len, mapped ? "" : " UNMAPPED", now_ms() - t0, kr ? " REPLY FAILED" : "");
+	long tr = now_us() - t0u;
+	disp_t0_us = 0;
+	lg("cmd seq %u id %u %s len %u -> status %d len %u%s | handler %ld us, replied %ld us%s", rq.seq, rq.cmd,
+	   fpcd_cmd_name(rq.cmd), rq.len, rp.status, rp.len, mapped ? "" : " UNMAPPED", th, tr, kr ? " REPLY FAILED" : "");
+	if (tr > FPCD_REPLY_WARN_MS * 1000L)
+		lg("WARN: reply to seq %u id %u %s took %ld ms (> %d ms)", rq.seq, rq.cmd, fpcd_cmd_name(rq.cmd), tr / 1000,
+		   FPCD_REPLY_WARN_MS);
 	if (kr)
 		lg("bridge: REPLY seq %u: %#x", rq.seq, kr);
 }
@@ -1219,8 +1343,12 @@ int main(int argc, char **argv)
 		return rc;
 	}
 
-	pthread_t th;
-	if (pthread_create(&th, NULL, capture_thread, NULL)) {
+	pthread_mutex_lock(&ta_mx);
+	dbid_refresh();
+	pthread_mutex_unlock(&ta_mx);
+	pthread_t th, thw, thd;
+	if (pthread_create(&thw, NULL, ta_worker, NULL) || pthread_create(&thd, NULL, watchdog_thread, NULL) ||
+	    pthread_create(&th, NULL, capture_thread, NULL)) {
 		lg("pthread_create failed");
 		ta_down();
 		return 1;
@@ -1229,7 +1357,7 @@ int main(int argc, char **argv)
 	while (!g_stop) {
 		if (g_wipe) {
 			g_wipe = 0;
-			wipe_all("SIGUSR1");
+			job_post(JOB_WIPE, 0, "SIGUSR1");
 		}
 		if (g_dump) {
 			g_dump = 0;
@@ -1264,8 +1392,11 @@ int main(int argc, char **argv)
 	op_cancel_wait();
 	pthread_mutex_lock(&st_mx);
 	pthread_cond_broadcast(&st_cv);
+	pthread_cond_broadcast(&jq_cv);
 	pthread_mutex_unlock(&st_mx);
 	pthread_join(th, NULL);
+	pthread_join(thw, NULL);
+	pthread_join(thd, NULL);
 	bridge_close();
 	ta_down();
 	lg("stopped");
