@@ -1,0 +1,165 @@
+redfin 1245: SweetMesa waits (bounded) for sweetfpcd before answering a catacomb / identity command, kern.sweet_mesa_fwd_wait_ms (default 0)
+
+After a reboot biometrickitd sent 64 LoadCatacomb at first unlock while sweetfpcd was not up; the kernel answered
+0xe00002d8 (offline) and biometrickitd never loaded again: BiometricSupport loads the catacomb once per process
+(handleFirstUnlock 0x1efa13c3c -> restoreAndSyncTemplates -> loadCatacomb), a failed loadCatacombForComponent:
+clears the identity list, and the only in-process retry, checkCatacombForUser: from startMatchOperation:
+(0x1efa0d72c), is skipped when identitiesCount is 0 (dsc8 BiometricSupport, ~/fpr2/bs/bs.dis).
+With kern.sweet_mesa_fwd_wait_ms = N (0..60000), 15/49/56/65/66 and user 61/64 (not the kernel-only SWCM master)
+wait up to N ms for a bridge client when none is open; only the calling thread sleeps (gM dropped), the bridge
+open wakes every waiter. kern.sweet_mesa_fwd_wait_state: counters. 0 = fail at once, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+index a11ec31..20599e8 100644
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -92,6 +92,14 @@
+  *   sends 64 again), and a 64 whose SWCT blob (size + crc) is the one the TA already holds (last 62 / 64, TA not
+  *   fresh, no TA change since) is answered without reloading the TA. Not needed for identities: with the master
+  *   bit, loadCatacombForComponent: skips 64 when the state says loaded and rebuilds identities from the file.
++ * 1245 (touchid-integration-2026-11-18.md): kern.sweet_mesa_fwd_wait_ms (default 0 = as before). A command whose
++ *   answer decides what biometrickitd keeps (15, 49, 56, 65, 66, and 61 / 64 for a USER component; the master's
++ *   SWCM blob is kernel-only) waits up to this long for sweetfpcd's bridge client when none is open, instead of
++ *   failing at once. Why: biometrickitd loads the catacomb ONCE per process (handleFirstUnlock ->
++ *   restoreAndSyncTemplates -> loadCatacomb, BiometricSupport 0x1efa13c3c); a failed 64 clears its identity list,
++ *   and the only in-process retry (checkCatacombForUser:, from startMatchOperation: 0x1efa0d72c) is skipped when
++ *   identitiesCount is 0, so a 64 that came before sweetfpcd was up was never retried. Only the calling thread
++ *   sleeps (gM is dropped while waiting); other clients' commands are not held. Woken by the bridge open.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -267,6 +275,9 @@ static int gCatState = 3;               /* kern.sweet_mesa_catstate: 60 GetCatac
+ static int gCat;                        /* kern.sweet_mesa_catacomb: 0 = 1200 behaviour */
+ static int gCatMs = 5000;               /* kern.sweet_mesa_cat_ms: wait for sweetfpcd's TA store / load */
+ static int gOffHonest;                  /* kern.sweet_mesa_offline (1207): 1 = NotReady while offline + 800d on connect */
++static int gFwdWaitMs;                  /* kern.sweet_mesa_fwd_wait_ms (1245): wait for sweetfpcd, 0 = no wait */
++static SInt32 nBrWaits, nBrWaitOk, nBrWaitTo;
++static uint32_t gBrWaitLastMs;
+ static thread_call_t gReinitTC;
+ static SInt32 nReinit;
+ #define MIDX_REINIT             0xd     /* 0xe3ff800d: libBKDM1 initSensor + syncTemplateList */
+@@ -321,6 +332,7 @@ static struct {
+ } slot;
+ static uint32_t gSeq;
+ static char gEvQueued, gEvDone, gEvFree;  /* sleep events */
++static char gEvBridge;                  /* 1245: a bridge client opened */
+ 
+ /*
+  * 1192b: "posted" commands (12 Cancel, 38 FingerDetectMode, 69 EnableBackgroundFdet) never wait for sweetfpcd:
+@@ -1626,6 +1638,55 @@ cat_note_held(const uint8_t *blob, uint32_t len, UInt32 gen)
+ 	}
+ }
+ 
++/* 1245: does this command's answer decide what biometrickitd keeps (and so should wait for sweetfpcd)? */
++static bool
++mesa_wait_cmd(uint32_t cmd, const uint8_t *p, uint32_t plen)
++{
++	switch (cmd) {
++	case 15: case 49: case 56: case 65: case 66:
++		return true;
++	case 61:
++		return cat_component_user(p, plen) != CAT_MASTER_USER;
++	case 64:
++		return !(plen >= 4 && le32(p) == SWCM_MAGIC);    /* SWCM = the master, kernel only */
++	default:
++		return false;
++	}
++}
++
++/* 1245: wait up to kern.sweet_mesa_fwd_wait_ms for a bridge client. true when one is open. */
++static bool
++mesa_wait_bridge(uint32_t cmd)
++{
++	int ms = gFwdWaitMs;
++	if (gBridgeClients > 0) {
++		return true;
++	}
++	if (ms <= 0 || gM == NULL || gDrv == NULL) {
++		return false;
++	}
++	uint64_t t0 = mach_absolute_time(), t1, ns;
++	uint64_t dl = deadline_ms((uint32_t)ms);
++	OSIncrementAtomic(&nBrWaits);
++	SAY("cmd %u %s: sweetfpcd not connected: waiting up to %d ms for it (kern.sweet_mesa_fwd_wait_ms)\n", cmd,
++	    mesa_name(cmd), ms);
++	IOLockLock(gM);
++	while (gBridgeClients == 0) {
++		if (IOLockSleepDeadline(gM, &gEvBridge, dl, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
++			break;
++		}
++	}
++	bool ok = gBridgeClients > 0;
++	IOLockUnlock(gM);
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	gBrWaitLastMs = (uint32_t)(ns / 1000000ULL);
++	OSIncrementAtomic(ok ? &nBrWaitOk : &nBrWaitTo);
++	SAY("cmd %u %s: %s after %u ms\n", cmd, mesa_name(cmd), ok ? "sweetfpcd connected" : "still offline: giving up",
++	    gBrWaitLastMs);
++	return ok;
++}
++
+ static IOReturn
+ mesa_catacomb(uint32_t cmd, const uint8_t *p, uint32_t plen, uint8_t *out, uint32_t cap, uint32_t *outLen,
+     const char **how)
+@@ -1920,6 +1981,9 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
+ 	*pver = ver;
+ 	*pval = val;
+ 
++	if (gFwdWaitMs > 0 && gBridgeClients == 0 && mesa_wait_cmd(cmd, p, plen)) {        /* 1245 */
++		(void)mesa_wait_bridge(cmd);
++	}
+ 	if (gCat && gCatLk != NULL && cmd >= 61 && cmd <= 64) {      /* 1206 */
+ 		return mesa_catacomb(cmd, p, plen, out, cap, outLen, how);
+ 	}
+@@ -2428,6 +2492,7 @@ SweetMesaBridgeUserClient::initWithTask(task_t owningTask, void *securityID, UIn
+ 	IOLockLock(gM);
+ 	gBridgeClients++;
+ 	bool first = gBridgeClients == 1;
++	IOLockWakeup(gM, &gEvBridge, false);    /* 1245: every command waiting for sweetfpcd */
+ 	IOLockUnlock(gM);
+ 	if (first && gOffHonest && gReinitTC != NULL) {          /* 1207 */
+ 		uint64_t dl;
+@@ -3154,6 +3219,39 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_offline, CTLTYPE_INT | CTLFLAG_RW | CTLF
+     sysctl_sweet_mesa_offline, "I", "redfin 1207: 1 = commands needing sweetfpcd answer NotReady while it is offline "
+     "and 0xe3ff800d re-init is sent when it connects; 0 = old answers");
+ 
++static int
++sysctl_sweet_mesa_fwd_wait_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = gFwdWaitMs, changed = 0;
++	int e = sysctl_io_number(req, gFwdWaitMs, sizeof(gFwdWaitMs), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (v < 0 || v > 60000) {
++		return EINVAL;
++	}
++	mesa_locks();
++	gFwdWaitMs = v;
++	SAY("commands deciding biometrickitd's identities wait %d ms for sweetfpcd (kern.sweet_mesa_fwd_wait_ms)\n", v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fwd_wait_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_fwd_wait_ms, "I", "redfin 1245: 15/49/56/65/66 and user 61/64 wait up to this many ms (0..60000) "
++    "for sweetfpcd's bridge when it is not connected (0 = fail at once, as before)");
++
++static int
++sysctl_sweet_mesa_fwd_wait_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	char b[160];
++	snprintf(b, sizeof(b), "wait_ms=%d waits=%d connected=%d timed_out=%d last_ms=%u bridge_clients=%d", gFwdWaitMs,
++	    nBrWaits, nBrWaitOk, nBrWaitTo, gBrWaitLastMs, gBridgeClients);
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fwd_wait_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mesa_fwd_wait_state, "A", "redfin 1245: bridge waits");
++
+ static int
+ sysctl_sweet_mesa_fwd_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+     struct sysctl_req *req)
