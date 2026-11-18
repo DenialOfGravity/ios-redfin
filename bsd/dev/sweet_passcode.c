@@ -72,6 +72,11 @@ static uint32_t pc_fails;
 static clock_sec_t pc_last_try, pc_backoff_until;
 static uint32_t pc_n_ok, pc_n_bad, pc_n_busy;
 static int pc_unlocked_event;                 /* 1196: set under the lock, sent after it */
+/* 1198: Touch ID unlock rules (as iOS): a passcode since boot, at most 48 h ago, fewer than 5 failed matches */
+#define PC_BIO_TTL_S            (48 * 3600)
+#define PC_BIO_MAX_FAILS        5
+static clock_sec_t pc_pass_ok_at;
+static uint32_t pc_bio_fails, pc_n_bio_unlock, pc_n_bio_refused;
 
 static clock_sec_t
 pc_now(void)
@@ -484,6 +489,8 @@ pc_check_locked(const uint8_t *pw, uint32_t len, int unlock)
 		pc_fails = 0;
 		pc_backoff_until = 0;
 		pc_n_ok++;
+		pc_pass_ok_at = pc_now();       /* 1198 */
+		pc_bio_fails = 0;
 		if (unlock && pc_locked) {
 			pc_locked = 0;
 			pc_unlocked_event = 1;
@@ -632,6 +639,89 @@ sweet_pc_lock(void)
 		pc_notify("locked");
 	}
 }
+
+/*
+ * 1198: a Touch ID match (SweetMesa, kern.sweet_mesa_match=2) unlocks the keybag as the SEP would, under iOS's
+ * rules. 0 = allowed (*did_unlock = 1 when it was locked and is now unlocked); else EPERM and *why.
+ * No passcode (or mode 0 / 2): nothing is locked, allowed without unlocking.
+ */
+int sweet_pc_bio_unlock(int *did_unlock, const char **why);
+void sweet_pc_bio_failed(void);
+
+int
+sweet_pc_bio_unlock(int *did_unlock, const char **why)
+{
+	*did_unlock = 0;
+	*why = "";
+	int m = sweet_pc_mode();
+	if (m == 0 || m == 2 || !sweet_pc_is_set()) {
+		*why = "no passcode lock";
+		return 0;
+	}
+	int e = 0, ev = 0;
+	clock_sec_t now = pc_now();
+	lck_mtx_lock(&sweet_pc_lck);
+	if (pc_pass_ok_at == 0) {
+		*why = "passcode required after restart";
+		e = EPERM;
+	} else if (now - pc_pass_ok_at > PC_BIO_TTL_S) {
+		*why = "passcode required (48 h since the last passcode)";
+		e = EPERM;
+	} else if (pc_bio_fails >= PC_BIO_MAX_FAILS) {
+		*why = "passcode required (5 failed Touch ID attempts)";
+		e = EPERM;
+	} else if (pc_backoff_left() > 0) {
+		*why = "passcode backoff";
+		e = EPERM;
+	} else {
+		pc_bio_fails = 0;
+		if (pc_locked) {
+			pc_locked = 0;
+			ev = 1;
+			*did_unlock = 1;
+		}
+	}
+	if (e) {
+		pc_n_bio_refused++;
+	} else if (ev) {
+		pc_n_bio_unlock++;
+	}
+	lck_mtx_unlock(&sweet_pc_lck);
+	SAY("Touch ID %s%s%s\n", e ? "unlock REFUSED: " : ev ? "unlocked the keybag" : "match (already unlocked)",
+	    e ? *why : "", "");
+	if (ev) {
+		pc_notify("unlocked (Touch ID)");
+	}
+	return e;
+}
+
+void
+sweet_pc_bio_failed(void)
+{
+	if (sweet_pc_mode() == 0) {
+		return;
+	}
+	lck_mtx_lock(&sweet_pc_lck);
+	uint32_t f = ++pc_bio_fails;
+	lck_mtx_unlock(&sweet_pc_lck);
+	SAY("Touch ID no-match %u/%d%s\n", f, PC_BIO_MAX_FAILS, f >= PC_BIO_MAX_FAILS ? ": passcode required" : "");
+}
+
+static int
+sysctl_sweet_passcode_bio(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char b[160];
+	clock_sec_t now = pc_now();
+	lck_mtx_lock(&sweet_pc_lck);
+	snprintf(b, sizeof(b), "passcode_since_boot=%d age_s=%lu bio_fails=%u bio_unlocks=%u bio_refused=%u",
+	    pc_pass_ok_at != 0, pc_pass_ok_at ? (unsigned long)(now - pc_pass_ok_at) : 0UL, pc_bio_fails, pc_n_bio_unlock,
+	    pc_n_bio_refused);
+	lck_mtx_unlock(&sweet_pc_lck);
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_bio, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_passcode_bio, "A", "redfin 1198: Touch ID unlock rule state");
 
 /* ---- sysctls ---- */
 static int

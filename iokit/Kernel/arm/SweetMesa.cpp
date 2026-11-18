@@ -44,6 +44,12 @@
  * A match record WITH an identity (0xe3ff8002) is built only when kern.sweet_mesa_match = 1 AND the FPCD match
  * event carries FPCD_MF_HAT_VERIFIED; raw (non-FPCD) match-shaped EVENTs are always dropped now. Every delivered
  * message is logged ("message 0x... v.. ord.. len.. inline|queued").
+ * 1198 (owner decision 2026-11-18): kern.sweet_mesa_match=2 delivers TA-identified matches WITHOUT the keymaster HAT
+ *   check ("UNVERIFIED match delivered"): extend-enrolment matches (MatchMode carrying an SMFP identity, phase 2 of
+ *   Settings' enrolment) go to the enrolling client with flags 0; other matches unlock the SweetKeyStore keybag
+ *   under the passcode rules (sweet_pc_bio_unlock: passcode since boot, 48 h, 5 failed matches, backoff), set
+ *   flag 5 Unlocked when they did and arm one SweetACM BiometryMatched credential; refused -> no-identity record.
+ *   8 AlignmentData / 17 RequestTopologyOfTemplate answer zeros of the asked size.
  * 1192f: 60 GetCatacombState answers {gUser, state 1} (an empty answer made biometrickitd drop every new identity).
  * 1192e: AppleBiometricServicesUserClient::message accepts 0xe3ff8000 (the aggregate messageClients result was
  * kIOReturnUnsupported from the user client itself, not from the interest notification).
@@ -204,6 +210,12 @@ static int gLastRet;
 static uint32_t gUser;                  /* user id of the last 3 EnrollMode / 65 / 66 payload (identities' user) */
 static uint32_t gLastPct;               /* last enrol progress percent sent (never goes backwards per enrol) */
 static SInt32 nTranslated, nLoggedOnly, nMatchDelivered, nMatchRefused;
+/* 1198 */
+static bool gMatchExtend;               /* the running MatchMode is an extend-enrolment (Settings phase 2) */
+static SInt32 nUnverified, nBioUnlock, nBioRefused;
+extern "C" int sweet_pc_bio_unlock(int *did_unlock, const char **why);
+extern "C" void sweet_pc_bio_failed(void);
+extern "C" void sweet_acm_note_verified_match(void);
 
 class AppleMesaSEPDriver;
 class AppleBiometricServices;
@@ -604,11 +616,34 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 	case FEV_NOMATCH:
 	case FEV_MATCH_WITHHELD:
 	case FEV_MATCH: {
-		bool identity = code == FEV_MATCH && gMatch && (fl & FEV_MF_HAT_VERIFIED) && fid != 0;
+		bool verified = (fl & FEV_MF_HAT_VERIFIED) != 0;
+		bool identity = code == FEV_MATCH && fid != 0 && ((gMatch == 1 && verified) || gMatch == 2);
+		uint32_t mflags = 0;
 		if (code == FEV_MATCH && !identity) {
 			OSIncrementAtomic(&nMatchRefused);
 			SAY("match fid 0x%x: NOT delivered (kern.sweet_mesa_match=%d, HAT %s) -> no-match\n", fid, gMatch,
-			    (fl & FEV_MF_HAT_VERIFIED) ? "verified" : "NOT verified");
+			    verified ? "verified" : "NOT verified");
+		}
+		if (identity && !gMatchExtend) {
+			/* 1198: what the SEP does for an unlock match: the keybag, then one ACM credential */
+			int did = 0;
+			const char *why = "";
+			int e = sweet_pc_bio_unlock(&did, &why);
+			if (e != 0) {
+				identity = false;
+				OSIncrementAtomic(&nBioRefused);
+				SAY("match fid 0x%x score %d: Touch ID unlock REFUSED (%s) -> no-match\n", fid,
+				    (int32_t)le32(d + FEV_SCORE), why);
+			} else {
+				if (did) {
+					mflags |= 1u << 5;      /* BKMatchDetailUnlocked */
+					OSIncrementAtomic(&nBioUnlock);
+				}
+				sweet_acm_note_verified_match();
+			}
+		}
+		if (code != FEV_MATCH && !gMatchExtend && gMatch == 2) {
+			sweet_pc_bio_failed();
 		}
 		if (!gMatch) {
 			/* gate closed: no 0xe3ff8002 record at all, only the MatchingFailed status */
@@ -623,9 +658,16 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 			put32(b, gUser);
 			put32(b + 4, SMFP_MAGIC);
 			put32(b + 8, fid);
-			/* flags 0: not Unlocked, no CredentialAdded (nothing is unlocked or credentialed here) */
+			put32(b + MR_FLAGS, mflags);    /* 1198: bit 5 Unlocked only when the keybag was unlocked here */
 			OSIncrementAtomic(&nMatchDelivered);
-			SAY("MATCH: fid 0x%x user %u, HAT verified, gate open -> match record (flags 0)\n", fid, gUser);
+			if (!verified) {
+				OSIncrementAtomic(&nUnverified);
+				SAY("UNVERIFIED match delivered: fid 0x%x score %d user %u%s flags 0x%x (kern.sweet_mesa_match=2)\n",
+				    fid, (int32_t)le32(d + FEV_SCORE), gUser, gMatchExtend ? " extend-enrolment" : "", mflags);
+			} else {
+				SAY("MATCH: fid 0x%x user %u, HAT verified, gate open -> match record (flags 0x%x)\n", fid, gUser,
+				    mflags);
+			}
 		} else {
 			put32(b, 0xffffffffu);          /* no identity */
 			put32(b + MR_FLAGS, 2);         /* no-match reason: matcher */
@@ -822,6 +864,15 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 	case 39:        /* GetSKSLockState: unlocked (SweetKeyStore) */
 		ANSWER(4); return kIOReturnSuccess;
 	case 40: ANSWER(23); return kIOReturnSuccess;          /* GetBiometrickitdInfo */
+	case 8:         /* AlignmentData (3060) */
+	case 17:        /* RequestTopologyOfTemplate (3060): 1198 zeros instead of unsupported (assert noise) */
+		if (cap == 0 || cap > 3060) {
+			*how = "unsupported (size)";
+			return kIOReturnUnsupported;
+		}
+		ANSWER(cap);
+		*how = "canned (zeros)";
+		return kIOReturnSuccess;
 	case 46: ANSWER(32); return kIOReturnSuccess;          /* GetProtectedConfig: nothing enabled */
 	case 58: ANSWER(33); return kIOReturnSuccess;          /* GetCatacombHash */
 	case 60: {      /* GetCatacombState: n x catacomb_state_v1_t {u32 userID, u32 state} (8 n bytes) */
@@ -887,6 +938,9 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		uint8_t *rbuf;
 
 		/* 1192d: the identities' user id (EnrollMode v2 payload +4, 65/66 payload +0) for enrol/match records */
+		if (cmd == 3) {
+			gMatchExtend = false;
+		}
 		if (cmd == 3 && plen >= 8 && le32(p + 4) != 0xffffffffu) {
 			gUser = le32(p + 4);
 			gLastPct = 0;
@@ -895,6 +949,22 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		}
 		switch (cmd) {
 		case 3: put32(small, 0); fp = small; flen = 4; break;           /* u32 gid 0 */
+		case 4:
+			/*
+			 * 1198: MatchMode v2 payload (0x44 + selected identities): +0 flags, +4 user; an extend-enrolment
+			 * (BKOptionMatchForExtendEnrollment) puts the identity {u32 user, uuid} at +8 (libBKDM1
+			 * performMatchCommand:), ours always an SMFP uuid. sweetfpcd gets u32 flags (bit 0 extend).
+			 */
+			gMatchExtend = plen >= 0x1c && le32(p + 0xc) == SMFP_MAGIC;
+			put32(small, gMatchExtend ? 1 : 0);
+			fp = small;
+			flen = 4;
+			if (gMatchExtend) {
+				SAY("MatchMode: extend-enrolment of fid 0x%x user %u\n", le32(p + 0x10), le32(p + 8));
+			} else {
+				SAY("MatchMode: normal match (%u bytes)\n", plen);
+			}
+			break;
 		case 38: put32(small, 1); fp = small; flen = 4; break;          /* u32 enable 1 */
 		case 69: put32(small, val); fp = small; flen = 4; break;        /* u32 enable = value */
 		case 13: case 61: case 62: case 63: case 64: fp = p; flen = plen; break;   /* Apple raw */
@@ -1492,17 +1562,18 @@ sysctl_sweet_mesa_match(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 	if (e || !changed) {
 		return e;
 	}
-	if (v != 0 && v != 1) {
+	if (v < 0 || v > 2) {
 		return EINVAL;
 	}
 	char pn[32];
 	proc_selfname(pn, (int)sizeof(pn));
 	gMatch = v;
-	SAY("match gate %s by %s (kern.sweet_mesa_match=%d)\n", v ? "OPENED" : "closed", pn, v);
+	SAY("match gate %s by %s (kern.sweet_mesa_match=%d)\n", v == 2 ? "OPEN, UNVERIFIED matches delivered" :
+	    v ? "OPENED (verified only)" : "closed", pn, v);
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_match, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
-    sysctl_sweet_mesa_match, "I", "redfin 1192: 1 = let match-shaped bridge events through (default 0: dropped)");
+    sysctl_sweet_mesa_match, "I", "redfin 1192/1198: 0 no matches, 1 HAT-verified only, 2 TA-identified matches unverified");
 
 static int
 sysctl_sweet_mesa_fwd_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -1526,7 +1597,7 @@ static int
 sysctl_sweet_mesa_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
 {
-	char b[640];
+	char b[800];
 	int q = 0;
 	if (gM) {
 		IOLockLock(gM);
@@ -1538,10 +1609,11 @@ sysctl_sweet_mesa_state(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 	snprintf(b, sizeof(b), "mesa=%d match=%d fwd_ms=%d published=%d abs_clients=%d bridge_clients=%d slot=%d "
 	    "seq=%u cmds=%d canned=%d fwd=%d offline=%d timeouts=%d unsup=%d refused=%d events=%d fpcd_events=%d "
 	    "delivered=%d queued=%d pulled=%d msgq=%d match_dropped=%d translated=%d logged_only=%d match_delivered=%d "
-	    "match_refused=%d user=%u last=%u(%s)->0x%x",
+	    "match_refused=%d unverified=%d bio_unlock=%d bio_refused=%d extend=%d user=%u last=%u(%s)->0x%x",
 	    gMesa, gMatch, gFwdMs, gDrv != NULL, gAbsClients, gBridgeClients, slot.state, gSeq, nCmds, nCanned, nFwd,
 	    nOffline, nTimeouts, nUnsup, nRefused, nEvents, nFpcdEv, nDelivered, nQueued, nMsgPulled, q,
-	    nMatchDropped, nTranslated, nLoggedOnly, nMatchDelivered, nMatchRefused, gUser, gLastCmd, mesa_name(gLastCmd),
+	    nMatchDropped, nTranslated, nLoggedOnly, nMatchDelivered, nMatchRefused, nUnverified, nBioUnlock, nBioRefused,
+	    gMatchExtend, gUser, gLastCmd, mesa_name(gLastCmd),
 	    gLastRet);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
