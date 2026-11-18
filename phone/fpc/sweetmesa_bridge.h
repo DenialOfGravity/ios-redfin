@@ -16,7 +16,7 @@
  * sweetfpcd gets them via WAIT like any request; its REPLY is only logged (reply anyway, immediately). Every other
  * forwarded command waits at most kern.sweet_mesa_fwd_ms (default 300 ms), then gets the offline answer.
  * Sysctls: kern.sweet_mesa (bit0 publish, bit1 also deliver "FPCD"-format EVENTs raw to biometrickitd,
- * bit2 hex-dump the first 32 bytes of every command), kern.sweet_mesa_match (default 0: every match-shaped
+ * bit2 hex-dump the first 32 bytes of every command, bit3 log struct sizes inline/descriptor), kern.sweet_mesa_match (default 0: every match-shaped
  * EVENT is dropped and logged), kern.sweet_mesa_fwd_ms (default 300), kern.sweet_mesa_state (read-only text).
  */
 #ifndef SWEETMESA_BRIDGE_H

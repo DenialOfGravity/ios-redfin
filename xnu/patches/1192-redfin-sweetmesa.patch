@@ -2,13 +2,14 @@ redfin 1192: SweetMesa, the Touch ID (Mesa) persona for biometrickitd + libBKDM1
 for sweetfpcd. kern.sweet_mesa default 0: nothing published. Matches only via bridge EVENT and kern.sweet_mesa_match=1
 (default 0). Interface: phone/fpc/sweetmesa_bridge.h. Design: logs/research/fingerprint-p3-ios-2026-11-18.md.
 1192b: forwards wait at most kern.sweet_mesa_fwd_ms (300) then give the offline answer; 12/38/69 are posted (no wait).
+1192c: struct descriptors (> 4096 bytes) are prepare()d around every copy; kern.sweet_mesa bit 3 logs in/out sizes.
 
 diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
 new file mode 100644
-index 0000000..50137c1
+index 0000000..7f5c154
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMesa.cpp
-@@ -0,0 +1,1281 @@
+@@ -0,0 +1,1318 @@
 +/*
 + * redfin 1192: SweetMesa, a Touch ID (Mesa) persona for Apple's unmodified biometrickitd + libBKDM1, whose real
 + * sensor work is done by a userland daemon (sweetfpcd) through a bridge user client.
@@ -35,7 +36,8 @@ index 0000000..50137c1
 + * Switches (all default 0: nothing is published, the kernel behaves as before this patch):
 + *   kern.sweet_mesa        bit 0 publish the persona + bridge (write 0 withdraws; EBUSY while a client is open),
 + *                          bit 1 also deliver sweetfpcd's own "FPCD"-format events raw (dev),
-+ *                          bit 2 hex-dump the first 32 payload bytes of every command
++ *                          bit 2 hex-dump the first 32 payload bytes of every command,
++ *                          bit 3 (1192c) log every call's struct in/out sizes and inline vs descriptor
 + *   kern.sweet_mesa_match  1 = let match-shaped bridge EVENTs through (default 0: dropped + logged)
 + *   kern.sweet_mesa_fwd_ms how long a forwarded command waits for sweetfpcd (default 300, 50..30000); no reply
 + *                          in time = the "offline" answer (1192b)
@@ -287,11 +289,44 @@ index 0000000..50137c1
 +	return a->structureInputDescriptor ? (uint32_t)a->structureInputDescriptor->getLength() : a->structureInputSize;
 +}
 +
++/*
++ * 1192c: a struct larger than the inline limit (4096) arrives as an IOMemoryDescriptor over the caller's pages,
++ * NOT prepared. Copying through it unprepared hung the whole phone the first time sweetfpcd's 16388-byte WAIT
++ * got a request (fingerprint-freeze-bisect-2026-11-18.md). prepare() wires the pages first, complete() after.
++ */
++static bool
++md_copy(IOMemoryDescriptor *md, bool out, void *buf, uint32_t len)
++{
++	if (len == 0) {
++		return true;
++	}
++	IOReturn pr = md->prepare();
++	if (pr != kIOReturnSuccess) {
++		SAY("descriptor prepare() failed 0x%x (%s %u bytes)\n", pr, out ? "out" : "in", len);
++		return false;
++	}
++	IOByteCount n = out ? md->writeBytes(0, buf, len) : md->readBytes(0, buf, len);
++	md->complete();
++	return n == len;
++}
++
++static void
++io_debug(const char *who, uint32_t sel, IOExternalMethodArguments *a)
++{
++	if (gMesa & 8) {
++		SAY("io %s sel %u: in %u %s, out %u %s\n", who, sel,
++		    a->structureInputDescriptor ? (uint32_t)a->structureInputDescriptor->getLength() : a->structureInputSize,
++		    a->structureInputDescriptor ? "descriptor" : "inline",
++		    a->structureOutputDescriptor ? (uint32_t)a->structureOutputDescriptor->getLength() : a->structureOutputSize,
++		    a->structureOutputDescriptor ? "descriptor" : "inline");
++	}
++}
++
 +static bool
 +in_read(IOExternalMethodArguments *a, void *buf, uint32_t len)
 +{
 +	if (a->structureInputDescriptor) {
-+		return a->structureInputDescriptor->readBytes(0, buf, len) == len;
++		return md_copy(a->structureInputDescriptor, false, buf, len);
 +	}
 +	if (a->structureInput == NULL && len) {
 +		return false;
@@ -313,7 +348,7 @@ index 0000000..50137c1
 +		if (len > a->structureOutputDescriptor->getLength()) {
 +			return kIOReturnNoSpace;
 +		}
-+		if (len && a->structureOutputDescriptor->writeBytes(0, buf, len) != len) {
++		if (!md_copy(a->structureOutputDescriptor, true, (void *)(uintptr_t)buf, len)) {
 +			return kIOReturnVMError;
 +		}
 +		a->structureOutputDescriptorSize = len;
@@ -801,6 +836,7 @@ index 0000000..50137c1
 +	if (selector != 0) {
 +		return kIOReturnUnsupported;
 +	}
++	io_debug("AppleBiometricServices", selector, args);
 +	proc_selfname(pn, (int)sizeof(pn));
 +	if (inLen < 6 || inLen > 0x10000) {
 +		SAY("%s sel 0 with %u input bytes refused\n", pn, inLen);
@@ -946,6 +982,7 @@ index 0000000..50137c1
 +SweetMesaBridgeUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
 +{
++	io_debug("SweetMesaBridge", selector, args);
 +	switch (selector) {
 +	case 0: {       /* WAIT */
 +		uint64_t ms = args->scalarInputCount ? args->scalarInput[0] : 0;
@@ -1202,7 +1239,7 @@ index 0000000..50137c1
 +	if (e || !changed) {
 +		return e;
 +	}
-+	if (v & ~7) {
++	if (v & ~15) {
 +		return EINVAL;
 +	}
 +	mesa_locks();
@@ -1225,7 +1262,8 @@ index 0000000..50137c1
 +	return e;
 +}
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_mesa, "I",
-+    "redfin 1192: SweetMesa Touch ID persona: bit0 publish, bit1 deliver FPCD-format events raw, bit2 hex dump");
++    "redfin 1192: SweetMesa Touch ID persona: bit0 publish, bit1 deliver FPCD-format events raw, bit2 hex dump, "
++    "bit3 log struct sizes inline/descriptor");
 +
 +static int
 +sysctl_sweet_mesa_match(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
