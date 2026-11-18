@@ -16,6 +16,10 @@
  * SIGTERM/SIGINT: cancel the operation, stop the capture thread, unload the TA (FPCD_KEEP_TA=1 / --keep-ta: keep).
  * SIGUSR1: wipe all (delete every finger id, debug).  SIGUSR2: one status line.
  * FPCD_IO_RETRY=N (default 2): re-capture after an identify FPC_ERROR_IO instead of a no-match (0: off).
+ * ws-fpcd-e: FPCD_UPDATE_TEMPLATE=1 (default): g11/4 update_template after every identify that did not fail, as the
+ *   stock HAL; without it the TA's next identify gives FPC_ERROR_IO (-6) (bio_update_template()). 0 = old behaviour.
+ *   FPCD_IO_REIDENT=1 (default): an identify -6 is retried once on the same image (no re-capture, no lift needed).
+ *   --idtest SEQ: identify / update_template steps on the image the TA holds (diagnosis, logs only).
  * FPCD_NOMATCH_CONTINUE=1 (default): a TA no-match (identify status 0, result 0, fid 0) is a NOMATCH event and the
  *   match op goes on after the finger is lifted (one attempt per touch, as the SEP: the op ends only on a match,
  *   Cancel, the op timeout or the kernel's lockout); 0 = old behaviour (WITHHELD, the op ends after one result).
@@ -758,6 +762,35 @@ static void run_enrol(uint32_t gen)
 static int lsnr_diag;	/* FPCD_LSNR_DIAG: listeners registered around identify (diagnosis) */
 static int io_retry = 2;	/* FPCD_IO_RETRY: re-captures per match op after an identify FPC_ERROR_IO (-6) */
 static int nomatch_continue = 1;	/* FPCD_NOMATCH_CONTINUE: a TA no-match keeps the match op running (per touch) */
+static int upd_tpl = 1;		/* FPCD_UPDATE_TEMPLATE: g11/4 after every identify with status >= 0 (the HAL's way) */
+static int io_reident = 1;	/* FPCD_IO_REIDENT: after an identify -6, identify the same image again (no re-capture) */
+
+/*
+ * ws-fpcd-e: the HAL's do_authenticate (hal.dis 0xa7e8 "do_template_update") calls fpc_tee_update_template (g11/4)
+ * after EVERY identify that did not fail (match, no match, partial): set_auth_challenge, capture, identify,
+ * [get_auth_result], update_template, store_template_db if +0xc says updated. sweetfpcd skipped g11/4 outside
+ * extend-enrolment, and the TA then answers the NEXT identify with FPC_ERROR_IO (-6): fpcd-tid23/tid28 alternate
+ * strictly OK, -6, OK, -6 (one -6 per touch), while extend-enrolment (g11/4 after each touch) never saw a -6.
+ * Returns 1 when the template db changed (TEMPLATES event: the kernel marks the catacomb dirty), 0 not changed,
+ * -1 error. Caller holds no lock.
+ */
+static int bio_update_template(const char *why)
+{
+	uint8_t u[FPC_SENSOR_LEN] = { 0 };
+	int32_t ust = 0;
+	pthread_mutex_lock(&ta_mx);
+	int ur = ta_bio(4, u, &ust);
+	uint32_t upd = rd_u32(u + 0xc);
+	if (!ur && !ust && upd)
+		dbid_refresh();
+	pthread_mutex_unlock(&ta_mx);
+	lg("%s: update_template (g11/4) rc %d status %d updated %u", why, ur, ust, upd);
+	if (ur || ust)
+		return -1;
+	if (upd)
+		ev_send(FPCD_EV_TEMPLATES, 0, 0, 0, 0, 0, 0, 1);
+	return upd != 0;
+}
 
 static void run_match(uint32_t gen)
 {
@@ -798,6 +831,8 @@ static void run_match(uint32_t gen)
 		}
 		if (same_touch)
 			continue;	/* one attempt per touch (extend-enrolment, and a match op after a no-match): lift first */
+		int reident = 0;
+	again:;
 		uint8_t d[FPC_SENSOR_LEN] = { 0 };
 		int32_t hat = FPCD_HAT_NONE;
 		pthread_mutex_lock(&ta_mx);
@@ -821,6 +856,13 @@ static void run_match(uint32_t gen)
 		int32_t score = (int32_t)rd_u32(d + 0x20);
 		lg("identify %u: status %d fid %#x score %d coverage %d quality %d result %d", attempts, st, fid, score,
 		   (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14), (int)rd_u32(d + 0x1c));
+		if (st == -6 && io_reident && !reident && !cancelled(gen)) {
+			/* ws-fpcd-e: the -6 cleared the TA's pending identify state; the image is still in the TA */
+			reident = 1;
+			attempts--;
+			lg("identify: FPC_ERROR_IO: identifying the same image again (no re-capture, FPCD_IO_REIDENT)");
+			goto again;
+		}
 		if (st == -6 && io_retries < io_retry && !cancelled(gen)) {
 			/*
 			 * FPC_ERROR_IO (-6) from identify: seen only on the first capture of a match op whose finger was
@@ -849,12 +891,17 @@ static void run_match(uint32_t gen)
 			lg("identify %u: no match (TA status 0 result 0 fid 0, score %d) -> NOMATCH; op continues, next attempt "
 			   "after a lift", attempts, score);
 			ev_send(FPCD_EV_NOMATCH, 0, 0, score, 0, attempts, 0, 0);
+			if (upd_tpl)
+				bio_update_template("no match");
 			continue;
 		}
 		if (st == 0 && !cancelled(gen)) {
 			int sent = match_deliver(st, fid, score, attempts, hat);
-			if (!ext)
+			if (!ext) {
+				if (upd_tpl)	/* after the event: the match is not delayed by the template update */
+					bio_update_template(sent ? "match" : "match withheld");
 				return;	/* one result per MatchMode: delivered or withheld */
+			}
 			/* extend-enrolment (Settings phase 2): add this touch to the template (g11/4 update_template, as
 			 * the HAL does after an authenticate), then keep matching, one result per touch, until Cancel */
 			uint8_t u[FPC_SENSOR_LEN] = { 0 };
@@ -874,6 +921,8 @@ static void run_match(uint32_t gen)
 			   sent ? "sent" : "withheld", ur, ust);
 			continue;
 		}
+		if (upd_tpl && st >= 0 && (!ext || st > 0))
+			bio_update_template("identify");	/* partial / insufficient (100-102) etc., as the HAL */
 		if (ext && !cancelled(gen)) {
 			/*
 			 * extend-enrolment (Settings phase 2, owner-approved "enable matching"): an edge capture of the finger
@@ -2028,8 +2077,43 @@ static int selftest(int touch_s)
 	return rc;
 }
 
+/*
+ * --idtest SEQ (ws-fpcd-e, diagnosis, no bridge, no capture): run SEQ against the image the TA holds now, one letter
+ * per step: i = (3,1) set_auth_challenge + g11/3 identify (+ (3,4) on status 0, as run_match), u = g11/4
+ * update_template. Logs only: never an event, never a match. Shows whether an identify without g11/4 after the
+ * previous one gives -6, and whether a second identify of the same image (no capture) works.
+ */
+static int idtest(const char *seq)
+{
+	int n = 0;
+	for (const char *c = seq; *c; c++) {
+		uint8_t d[FPC_SENSOR_LEN] = { 0 };
+		int32_t st = 0;
+		if (*c == 'u') {
+			pthread_mutex_lock(&ta_mx);
+			int r = ta_bio(4, d, &st);
+			pthread_mutex_unlock(&ta_mx);
+			lg("idtest step %d: update_template rc %d status %d updated %u", ++n, r, st, rd_u32(d + 0xc));
+			continue;
+		}
+		if (*c != 'i')
+			continue;
+		pthread_mutex_lock(&ta_mx);
+		auth_challenge_set();
+		int r = ta_bio(3, d, &st);
+		int32_t hat = !r && st == 0 ? fpcd_verify_hat(rd_u32(d + 0xc)) : FPCD_HAT_NONE;
+		auth_challenge = 0;
+		pthread_mutex_unlock(&ta_mx);
+		lg("idtest step %d: identify rc %d status %d fid %#x score %d coverage %d quality %d result %d hat %d", ++n, r,
+		   st, rd_u32(d + 0xc), (int)rd_u32(d + 0x20), (int)rd_u32(d + 0x10), (int)rd_u32(d + 0x14),
+		   (int)rd_u32(d + 0x1c), hat);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	const char *idseq = NULL;
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 	int self = 0, fresh = 0, touch_s = 15;
 	for (int i = 1; i < argc; i++) {
@@ -2037,12 +2121,15 @@ int main(int argc, char **argv)
 			self = 1;
 			if (i + 1 < argc && argv[i + 1][0] != '-')
 				touch_s = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--idtest") && i + 1 < argc) {
+			self = 1;
+			idseq = argv[++i];
 		} else if (!strcmp(argv[i], "--fresh")) {
 			fresh = 1;
 		} else if (!strcmp(argv[i], "--keep-ta")) {
 			keep_ta = 1;
 		} else {
-			fprintf(stderr, "usage: sweetfpcd [--selftest [SECONDS]] [--fresh] [--keep-ta]\n");
+			fprintf(stderr, "usage: sweetfpcd [--selftest [SECONDS] | --idtest SEQ] [--fresh] [--keep-ta]\n");
 			return 1;
 		}
 	}
@@ -2083,6 +2170,10 @@ int main(int argc, char **argv)
 		io_retry = atoi(e);	/* 1: first identify of a match op, 2: every one */
 	if ((e = getenv("FPCD_NOMATCH_CONTINUE")) && *e)
 		nomatch_continue = atoi(e) != 0;
+	if ((e = getenv("FPCD_UPDATE_TEMPLATE")) && *e)
+		upd_tpl = atoi(e) != 0;	/* ws-fpcd-e */
+	if ((e = getenv("FPCD_IO_REIDENT")) && *e)
+		io_reident = atoi(e) != 0;
 	if ((e = getenv("FPCD_BRIDGE_SMALL")))
 		bridge_small = atoi(e) != 0;
 	if ((e = getenv("FPCD_CAP3_MS")))
@@ -2142,7 +2233,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (self) {
-		int rc = selftest(touch_s);
+		int rc = idseq ? idtest(idseq) : selftest(touch_s);
 		if (ta_resident)
 			keep_ta = 1;	/* a selftest leaves a TA it found loaded */
 		ta_down();
