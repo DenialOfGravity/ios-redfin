@@ -196,4 +196,29 @@ void isp_tune(struct isp *isp, float lux_index, float cct);
 /* the colour temperature the white balance is at, by the tuning's reference lights (0: there are none) */
 float isp_cct(const struct isp *isp);
 
+/*
+ * redfin (ws-cam-ife): a frame the kernel's IFE pixel path made (format 2, NV12, BT.601 full range): white balanced, the
+ * colour matrix and the gamma (isp_gamma_knots(): sRGB's curve, as isp_init()'s table) applied by the hardware, no lens
+ * shading. isp_nv12_of() finds its planes and the white balance it was made with (ccm: the colour matrix it was made
+ * with, NULL: none); the levels and the sharpness are measured back to the sensor's (10-bit steps above black) as
+ * isp_measure() and isp_sharpness() give them, so AE, AWB and AF work as they do on RAW10 frames; the pictures are the
+ * frame's middle part, scaled (bilinear) and turned as isp_render_nv12() makes them.
+ */
+struct isp_nv12 {
+	const uint8_t   *y, *uv;
+	uint32_t        y_stride, uv_stride;
+	float           wb[3];          /* R, G, B as the frame was made with (1 = 1x) */
+	float           unmix[3][3];    /* the colour matrix's inverse */
+};
+bool isp_nv12_of(const struct redwood_camera_frame *f, const float ccm[3][3], struct isp_nv12 *v);
+void isp_gamma_knots(uint16_t k[65]);
+void isp_measure_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, struct isp_stats *s);
+float isp_sharpness_nv12(const struct redwood_camera_frame *f, const struct isp_nv12 *v, float x0, float y0, float x1, float y1,
+    float *level);
+void isp_render_from_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, uint8_t *y,
+    size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row,
+    bool video_range);
+void isp_render_bgra_from_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, uint8_t *out,
+    size_t stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row);
+
 #endif

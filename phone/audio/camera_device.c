@@ -1829,6 +1829,7 @@ struct render_job {
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
 	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
+	const struct isp_nv12 *nv;      /* ws-cam-ife: an NV12 frame of the kernel's IFE pixel path (else RAW10) */
 };
 
 static void
@@ -1839,7 +1840,17 @@ render_piece(void *context, size_t i)
 
 	first &= ~1u;
 	end = i + 1 == j->pieces ? j->height : end & ~1u;
-	if (j->format == PF_BGRA) {
+	if (j->nv != NULL) {
+		/* ws-cam-ife: the hardware's picture, cropped and scaled as the processor's would be */
+		if (j->format == PF_BGRA) {
+			isp_render_bgra_from_nv12(j->isp, j->f, j->nv, CVPixelBufferGetBaseAddress(j->pb), CVPixelBufferGetBytesPerRow(j->pb),
+			    j->width, j->height, first, end);
+		} else {
+			isp_render_from_nv12(j->isp, j->f, j->nv, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0),
+			    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
+			    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->format == PF_420V);
+		}
+	} else if (j->format == PF_BGRA) {
 		isp_render_bgra(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddress(j->pb), CVPixelBufferGetBytesPerRow(j->pb), j->width,
 		    j->height, first, end);
 	} else if (j->still) {
@@ -2131,7 +2142,9 @@ render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, cons
 		layout_check(out->name, pb);
 	}
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, still && pf != PF_BGRA };
+	struct isp_nv12 nv;
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, still && pf != PF_BGRA,
+		isp_nv12_of(f, NULL, &nv) ? &nv : NULL };
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(still ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0), &job,
@@ -2477,8 +2490,8 @@ af_go(int device, struct af *af, uint32_t target)
 }
 
 static void
-af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const uint8_t *raw, const float window[4], bool locked,
-    int mode, int32_t manual)
+af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const uint8_t *raw, const struct isp_nv12 *nv,
+    const float window[4], bool locked, int mode, int32_t manual)
 {
 	float level, sharpness;
 	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
@@ -2520,7 +2533,8 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	if (af->state == AF_WATCH && (locked || af->hold)) {
 		return;                 /* (nothing to measure for) */
 	}
-	sharpness = isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);
+	sharpness = nv != NULL ? isp_sharpness_nv12(f, nv, window[0], window[1], window[2], window[3], &level) :
+	    isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);         /* (ws-cam-ife) */
 	af->sum_sharpness += sharpness;
 	af->sum_level += level;
 	if (++af->measured < needed) {
@@ -2877,6 +2891,100 @@ sensor_exposure(const struct isp *isp, const struct redwood_camera_frame *f)
 	return f->exposure_lines * (double)f->gain / (f->gain_unity ? f->gain_unity : 256) * isp->sensor_digital;
 }
 
+/*
+ * ws-cam-ife: /private/var/local/camera-ife (looked for at each opening of the kernel's camera): the back camera's moving
+ * picture from the kernel's IFE pixel path (kernel 1257 with kern.sweet_ife >= 1): FORMAT NV12 is asked for and the
+ * binned mode (camera-binned's, else 8) streams; the hardware demosaics, white balances (the gains AWB sends each
+ * frame, with the processor's digital gain), applies the colour matrix (the tuning's, sent when it moves) and the gamma
+ * (sRGB's, sent once), and the plug-in only crops and scales the NV12 into the graph's buffers. AE, AWB and AF measure
+ * the NV12 back to the sensor's levels. Photographs: the full mode, which the kernel gives as RAW10, through the
+ * processor as before. Frames that come as RAW10 (no pixel path in this kernel, or it failed) go the processor's way.
+ * No file: exactly as before.
+ */
+#define IFE_FLAG        "/private/var/local/camera-ife"
+
+struct ife_link {
+	bool            on;
+	uint32_t        wb_sent[3];     /* R, G, B, 256 = 1x */
+	float           ccm_sent[3][3]; /* the colour matrix as the kernel has it (the frames' made with it) */
+	bool            ccm_set;
+	uint64_t        nv12_frames, raw_frames;
+};
+
+static void
+ife_start(int device, struct ife_link *l)
+{
+	struct {
+		struct redwood_camera_command c;
+		uint16_t        k[65];
+	} g = { { .command = REDWOOD_CAMERA_COLOUR, .bytes = sizeof(g.k), .a = 2 } };
+	struct redwood_camera_command fmt = { .command = REDWOOD_CAMERA_FORMAT, .a = REDWOOD_CAMERA_FORMAT_NV12 };
+
+	memset(l, 0, sizeof(*l));
+	l->on = true;
+	isp_gamma_knots(g.k);
+	if (write(device, &g, sizeof(g)) != (ssize_t)sizeof(g) || write(device, &fmt, sizeof(fmt)) != (ssize_t)sizeof(fmt)) {
+		say("IFE pixel path: the kernel takes no COLOUR/FORMAT command (%s): RAW10 frames", strerror(errno));
+		l->on = false;
+		return;
+	}
+	say("IFE pixel path: NV12 asked for (camera-ife), the gamma sent");
+}
+
+/* the colour matrix, when it has moved, and the white balance (with the processor's gain), with AE's command if there is one */
+static void
+ife_send(int device, struct ife_link *l, const struct isp *isp, struct redwood_camera_command *ae, bool ae_now)
+{
+	struct {
+		struct redwood_camera_command c;
+		int32_t         m[9];
+	} cm = { { .command = REDWOOD_CAMERA_COLOUR, .bytes = sizeof(cm.m), .a = 1 } };
+	struct {
+		struct redwood_camera_command c;
+		uint32_t        wb[3];
+	} e;
+	float moved = l->ccm_set ? 0 : 1;
+	uint32_t wb[3];
+	bool wb_moved = false;
+
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			float d = fabsf(isp->ccm[r][c] - l->ccm_sent[r][c]);
+
+			moved = d > moved ? d : moved;
+		}
+	}
+	if (moved > 0.01f) {
+		for (int i = 0; i < 9; i++) {
+			cm.m[i] = (int32_t)lrintf(isp->ccm[i / 3][i % 3] * 4096);
+		}
+		if (write(device, &cm, sizeof(cm)) == (ssize_t)sizeof(cm)) {
+			memcpy(l->ccm_sent, isp->ccm, sizeof(l->ccm_sent));
+			l->ccm_set = true;
+		}
+	}
+	for (int c = 0; c < 3; c++) {
+		float g = isp->wb[c] * isp->digital * 256;
+
+		wb[c] = g < 16 ? 16 : g > 8191 ? 8191 : (uint32_t)lrintf(g);
+		wb_moved = wb_moved || wb[c] * 1000 > l->wb_sent[c] * 1004 || wb[c] * 1004 < l->wb_sent[c] * 1000;
+	}
+	if (!ae_now && !wb_moved) {
+		return;
+	}
+	if (ae_now) {
+		e.c = *ae;
+	} else {
+		memset(&e.c, 0, sizeof(e.c));
+		e.c.command = REDWOOD_CAMERA_EXPOSURE;  /* (a 0: the white balance alone) */
+	}
+	e.c.bytes = sizeof(e.wb);
+	memcpy(e.wb, wb, sizeof(wb));
+	if (write(device, &e, sizeof(e)) == (ssize_t)sizeof(e)) {
+		memcpy(l->wb_sent, wb, sizeof(wb));
+	}
+}
+
 struct worker_start {
 	CMBaseObjectRef o;
 	unsigned        generation;
@@ -2906,6 +3014,12 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	uint64_t idle_since = monotonic_ms();
 	/* (ws-cam-binned) the binned mode for the moving picture; the last frame's exposure, carried over a mode change */
 	uint32_t bin_mode = binned_mode(s->camera), bin_gain = 0, bin_line_ns = 0, bin_settle = 0;
+	struct ife_link ife = { 0 };
+
+	if (s->camera->sensor == 1 && access(IFE_FLAG, F_OK) == 0) {
+		ife_start(device, &ife);        /* (ws-cam-ife) */
+		bin_mode = ife.on && bin_mode == ~0u ? 8 : bin_mode;
+	}
 	int bin = bin_mode != ~0u ? BIN_PREVIEW : BIN_OFF;
 	uint64_t bin_ns = 0, bin_since = 0;
 
@@ -2923,9 +3037,11 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			why = "the kernel's camera has had a fault";
 			break;
 		}
+		bool nv12 = n >= (ssize_t)offsetof(struct redwood_camera_frame, reserved) && f->format == REDWOOD_CAMERA_FORMAT_NV12;
+
 		if (n < (ssize_t)offsetof(struct redwood_camera_frame, reserved) || memcmp(f->magic, REDWOOD_CAMERA_MAGIC, 8) != 0 ||
 		    f->header_bytes < offsetof(struct redwood_camera_frame, reserved) || f->header_bytes > 4096 ||
-		    f->stride < f->width * 10 / 8 || f->height == 0) {
+		    f->stride < (nv12 ? f->width : f->width * 10 / 8) || f->height == 0) {
 			if (!(n < 0 && (errno == EAGAIN || errno == EINTR)) && ++failures >= 5) {
 				why = n < 0 ? strerror(errno) : "frames that are not frames";
 				break;
@@ -2933,6 +3049,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			continue;
 		}
 		need = f->header_bytes + (size_t)f->stride * f->height;
+		need += nv12 ? (size_t)f->stride * ((f->height + 1) / 2) : 0;   /* (ws-cam-ife: the CbCr plane) */
 		if (f->sensor != s->camera->sensor) {
 			/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
 			if (!switched) {
@@ -3051,7 +3168,19 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			say("the %s's lens moves (the kernel says where it is: %u)", s->camera->name, f->focus);
 		}
 
-		isp_measure(&isp, f, raw, &st);
+		struct isp_nv12 nv;
+		bool hw = nv12 && isp_nv12_of(f, ife.ccm_set ? (const float (*)[3])ife.ccm_sent : NULL, &nv);
+
+		if (hw) {
+			/* ws-cam-ife: the hardware's picture measured back to the sensor's levels */
+			if (ife.nv12_frames++ == 0) {
+				say("IFE pixel path: NV12 frames %ux%u (WB %.2f/%.2f/%.2f)", f->width, f->height, nv.wb[0], nv.wb[1], nv.wb[2]);
+			}
+			isp_measure_nv12(&isp, f, &nv, &st);
+		} else {
+			ife.raw_frames += ife.on;
+			isp_measure(&isp, f, raw, &st);
+		}
 		isp_awb(&isp, &st);
 		if (f->sensor != tuned_for) {
 			tuned_for = f->sensor;
@@ -3067,7 +3196,11 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned;
 		fps_limits(s, f, &isp);
-		if (isp_ae(&isp, f, &st, &c)) {
+		bool ae_now = isp_ae(&isp, f, &st, &c);
+
+		if (ife.on) {
+			ife_send(device, &ife, &isp, &c, ae_now);       /* (ws-cam-ife: with the white balance and colour matrix) */
+		} else if (ae_now) {
 			(void)write(device, &c, sizeof(c));
 		}
 		if (af_now) {
@@ -3078,7 +3211,7 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			af.hold = false;
 			af.manual_at = -1;
 		}
-		af_frame(device, &af, f, raw, window, af_locked, af_mode, manual_focus);
+		af_frame(device, &af, f, raw, hw ? &nv : NULL, window, af_locked, af_mode, manual_focus);
 		s->frames++;
 
 		/*
@@ -3487,6 +3620,10 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			if (s->frames % 300 == 0) {
 				camera_settings_check();
+			}
+			if (ife.on) {
+				say("IFE pixel path: %llu NV12 frames, %llu RAW10 frames; WB sent %u/%u/%u", (unsigned long long)ife.nv12_frames,
+				    (unsigned long long)ife.raw_frames, ife.wb_sent[0], ife.wb_sent[1], ife.wb_sent[2]);
 			}
 			say("frame %llu: exposure %.1f ms, gain %.1fx, sensor digital %.2fx, digital %.2fx, green %.0f above black (lens-shaded "
 			    "%.0f); AE metered %.1f target %.1f%s; white balance R %.2f "
