@@ -121,6 +121,7 @@ extern "C" {
 
 /* 1192d: struct fpcd_event (sweetmesa_bridge.h part 2b), little-endian offsets */
 #define FEV_CODE                6               /* u16 */
+#define FEV_OP_GEN              12              /* 1211: sweetfpcd S.gen when the event was sent */
 #define FEV_STATUS              16
 #define FEV_FID                 20
 #define FEV_SCORE               24
@@ -212,6 +213,7 @@ static uint32_t nOpEnd;
  *   bit 3 (0x8) 1213 0x41 EnrollmentComplete after a successful enrol result (1204; off: the result ends the op)
  */
 #define MESA_FIX_IMPLICIT_END   0x1u
+#define MESA_FIX_STALE_DROP     0x2u
 static int gFix = 0x7;                  /* kern.sweet_mesa_fix */
 static uint32_t nImplicitEnd, nStaleDropped, nAlignAnswered;    /* kern.sweet_mesa_fix_stats */
 /* 1210: op-ending statuses waiting for delivery, in order (1203 had one bit per kind, so two ends of one kind gave one) */
@@ -223,6 +225,14 @@ static struct {
 static volatile int gEndHead, gEndCount;
 static IOLock *gEndL;                   /* end queue; held while delivering, so the statuses go out in order */
 static volatile UInt32 gEndKick;        /* 1210: an implicit end is queued; the thread call runs when the command is done */
+/* 1211: op generations */
+static int gStaleMs = 750;              /* kern.sweet_mesa_stale_ms: longest a stale sweetfpcd generation is dropped */
+static volatile uint32_t gKGen;         /* kernel op generation: +1 at every op start and every op end */
+static volatile uint32_t gEvGen;        /* sweetfpcd op_gen of the last event received */
+static volatile bool gEvGenSeen;
+static volatile bool gStale;            /* an op ended; events still carrying its sweetfpcd generation are dropped */
+static volatile uint32_t gStaleGen, gStaleKGen;
+static volatile uint64_t gStaleDl;      /* mach_absolute_time deadline of the stale window */
 static int gSks = 1;                    /* kern.sweet_mesa_sks: 39 GetSKSLockState follows the passcode rules (1202) */
 static int gPcfg = 1;                   /* kern.sweet_mesa_pcfg: 46 GetProtectedConfig bits (1202) */
 static int gTopo = 1;                   /* kern.sweet_mesa_topo: synthetic match topology (1201) */
@@ -445,6 +455,81 @@ mesa_end_kick(void)
 	}
 }
 
+/*
+ * 1211: op generations. struct fpcd_event.op_gen is sweetfpcd's S.gen at SEND time (sweetfpcd.c ev_send2), not the
+ * generation of the op that produced the event, and the replies to 3/4/38 carry no generation. So the kernel cannot
+ * know the daemon generation of an op that sent no event yet. What it does:
+ *  (a) kind rule: a result (match / no-match / withheld -> match op, enrol progress / done / failed -> enrol op, op
+ *      timeout -> its op field) that does not belong to the op the kernel has running (none after a Cancel, or another
+ *      kind after a pre-emption) is dropped. This closes the audit's "cancelled match unlocks the keybag up to ~250 ms
+ *      after the Cancel" (sweetfpcd sees the posted Cancel only at its next WAIT + one capture slice).
+ *  (b) generation window: when an op ends (12 Cancel, or pre-empted by 3/4/38) the generation of the last event seen
+ *      is taken as the ended op's. Events still carrying it are dropped (FingerOn, ImageRejected and results; never
+ *      FingerOff / errors) until sweetfpcd sends an event with another generation (it has seen the Cancel or the new
+ *      mode command; op_set_nowait() bumps S.gen) or kern.sweet_mesa_stale_ms has passed. If the ended op sent no
+ *      event at all, its generation is unknown and only rule (a) and the time window protect the next op of the same
+ *      kind. Exact fix needs sweetfpcd to stamp the op's own gen and echo it in the 3/4/38 replies.
+ */
+static void
+mesa_stale_arm(uint32_t kind, const char *why)
+{
+	uint32_t ms = gStaleMs > 0 ? (uint32_t)gStaleMs : 0;
+	uint64_t dl;
+	gKGen++;
+	if (!(gFix & MESA_FIX_STALE_DROP) || ms == 0 || !gEvGenSeen) {
+		return;
+	}
+	clock_interval_to_deadline(ms, kMillisecondScale, &dl);
+	gStaleGen = gEvGen;
+	gStaleKGen = gKGen;
+	gStaleDl = dl;
+	gStale = true;
+	if (gMesa & 4) {
+		SAY("op gen %u: %s op ended (%s): sweetfpcd gen %u is stale for up to %u ms\n", gKGen, mesa_kind_names[kind],
+		    why, gEvGen, ms);
+	}
+}
+
+/* 1211: true if sweetfpcd event `code` (op field `op`, generation `gen`) belongs to an op that has ended */
+static bool
+mesa_event_stale(uint32_t code, uint32_t op, uint32_t gen, bool v2, const char **why)
+{
+	uint32_t want = 0;
+	gEvGen = gen;
+	gEvGenSeen = true;
+	if (!(gFix & MESA_FIX_STALE_DROP)) {
+		return false;
+	}
+	switch (code) {
+	case FEV_ENROL_PROGRESS: case FEV_ENROL_DONE: case FEV_ENROL_FAILED:
+		want = 1;
+		break;
+	case FEV_NOMATCH: case FEV_MATCH: case FEV_MATCH_WITHHELD:
+		want = 2;
+		break;
+	case FEV_OP_TIMEOUT:
+		want = v2 && op >= 1 && op <= 3 ? op : 0;
+		break;
+	case FEV_FINGER_DOWN: case FEV_IMAGE:
+		break;
+	default:                /* FingerOff, errors, template list: never dropped */
+		return false;
+	}
+	if (want != 0 && gOpKind != want) {
+		*why = gOpKind == 0 ? "no op running" : "other op kind running";
+		return true;
+	}
+	if (gStale) {
+		if (gen != gStaleGen || mach_absolute_time() > gStaleDl) {
+			gStale = false;         /* sweetfpcd moved on (new generation) or the window is over */
+		} else {
+			*why = "generation of an ended op";
+			return true;
+		}
+	}
+	return false;
+}
+
 /* 1210: kicks the end thread call when the forwarded/posted command block is left (any return path) */
 struct MesaEndKick {
 	~MesaEndKick()
@@ -467,8 +552,11 @@ mesa_op_started(uint32_t kind, uint32_t cmd)
 		old = gOpKind;
 	} while (!OSCompareAndSwap(old, kind, &gOpKind));
 	if (old == 0 || old > 3) {
+		gKGen++;                /* 1211 */
 		return;
 	}
+	mesa_stale_arm(old, "pre-empted");      /* 1211 */
+	gKGen++;
 	if (!(gFix & MESA_FIX_IMPLICIT_END) || !gOpEnd || gEndTC == NULL) {
 		SAY("%s op pre-empted by cmd %u %s: no op-ending status (kern.sweet_mesa_fix bit 0 or kern.sweet_mesa_opend off)\n",
 		    mesa_kind_names[old], cmd, mesa_name(cmd));
@@ -516,6 +604,7 @@ mesa_op_cancelled(void)
 	do {
 		k = gOpKind;
 	} while (!OSCompareAndSwap(k, 0, &gOpKind));
+	mesa_stale_arm(k, "Cancel");    /* 1211 */
 	if (!gOpEnd || k == 0 || k > 3 || gEndTC == NULL) {
 		if (k == 0) {
 			SAY("Cancel with no running op: no op-ending status\n");
@@ -877,6 +966,13 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 
 	if (gEndCount > 0) {
 		mesa_end_flush();       /* 1210: a queued op end goes out before anything of the next op */
+	}
+	const char *swhy = "";
+	if (mesa_event_stale(code, op, le32(d + FEV_OP_GEN), v2, &swhy)) {
+		nStaleDropped++;
+		SAY("dropped stale event: fpcd code %u status %d fid 0x%x gen %u (%s; kernel op %s, op gen %u)\n", code, st,
+		    fid, le32(d + FEV_OP_GEN), swhy, mesa_kind_names[gOpKind <= 3 ? gOpKind : 0], gKGen);
+		return kIOReturnSuccess;
 	}
 	OSIncrementAtomic(&nTranslated);
 	switch (code) {
@@ -2362,6 +2458,26 @@ sysctl_sweet_mesa_fix_stats(__unused struct sysctl_oid *oidp, __unused void *arg
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fix_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_fix_stats, "A", "redfin 1210-1213: op-end / stale-event / AlignmentData counters");
+
+static int
+sysctl_sweet_mesa_stale_ms(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gStaleMs, changed = 0;
+	int e = sysctl_io_number(req, gStaleMs, sizeof(gStaleMs), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 5000) {
+		return EINVAL;
+	}
+	gStaleMs = v;
+	SAY("kern.sweet_mesa_stale_ms=%d (%u stale events dropped so far)\n", v, nStaleDropped);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_stale_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_stale_ms, "I", "redfin 1211: after an op ends, events with its sweetfpcd generation are dropped "
+    "for up to N ms (0 = only the op-kind rule; default 750)");
 
 static int
 sysctl_sweet_mesa_sks(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
