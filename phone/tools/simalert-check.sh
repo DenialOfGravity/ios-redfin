@@ -12,5 +12,5 @@ echo "== lockwatch"
 /var/local/bin/lockwatch
 echo "== CommCenter/SpringBoard log, last $M min"
 /var/local/bin/oslogshow "$from" "$now" CommCenter SpringBoard 2>/dev/null |
-	grep -E 'SIM unlock|unlock alert|coversheet|Coversheet active|display status|Display on|Display locked|buddy state|pending alert|pin locked|SpringBoardFinishedStartup|kSimStateLocked|kSimStateReady|RemoteAlertHandle|SIMSetup|user prefers' |
+	grep -E 'SIM unlock|unlock alert|coversheet|Coversheet active|display status|Display on|Display locked|buddy state|pending alert|pin locked|SpringBoardFinishedStartup|kSimStateLocked|kSimStateReady|RemoteAlertHandle|SIMSetup|user prefers|PIN cache|pin cache|auto unlock|#sim-pin|PIN Entry' |
 	tail -n "$N"
