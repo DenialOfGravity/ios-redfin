@@ -5,6 +5,7 @@
  * Every SMC passes qsmc(): x0 and x1 must match an entry of qsee_whitelist[] (qsee_wl.c) or the process exits.
  */
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -485,18 +486,56 @@ void put_u64(uint8_t *p, uint64_t v) { put_u32(p, (uint32_t)v), put_u32(p + 4, (
 /* one command in a 64-bit-layout data buffer; *data (len bytes) is sent and read back; 0 = TZ SUCCESS (TA status in data+8) */
 int (*fpc_lsnr_serve)(uint64_t x[8], uint32_t appid, const char *what);
 
+/*
+ * The three command buffers are kept between calls (QSEE_PBUF_CACHE=0: one set per call, the old way). Each call took
+ * three fresh 16 KB kmem_alloc_contig blocks (freed again, but ~740 contiguous allocations per 5 min Touch ID session
+ * in klog-tid23). Not with QSEE_SHMBRIDGE (registrations stay per call). sb / arg are fully rewritten below; bulk is
+ * zeroed past len so no older command's data reaches the TA.
+ */
+static pthread_mutex_t send_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct pbuf c_sb, c_bulk, c_arg;
+static int pbuf_cache = -1;
+static int send_bufs(struct pbuf *sb, struct pbuf *bulk, struct pbuf *arg, int *cached)
+{
+	if (pbuf_cache < 0) {
+		const char *e = getenv("QSEE_PBUF_CACHE");
+		pbuf_cache = !(e && *e == '0');
+	}
+	*cached = pbuf_cache && !shmbridge && !dryrun;
+	if (*cached && c_sb.pa && c_bulk.pa && c_arg.pa) {
+		*sb = c_sb, *bulk = c_bulk, *arg = c_arg;
+		return 0;
+	}
+	if (pbuf_get(sb, 4096, 4096, 0, 0xa0000000ull))
+		return 2;
+	if (pbuf_get(bulk, 4096, 4096, 0, 0xa0001000ull)) {
+		pbuf_put(sb);
+		return 2;
+	}
+	if (pbuf_get(arg, 4096, 4096, 0, 0xa0002000ull)) {
+		pbuf_put(bulk), pbuf_put(sb);
+		return 2;
+	}
+	if (*cached)
+		c_sb = *sb, c_bulk = *bulk, c_arg = *arg;
+	return 0;
+}
+
 int fpc_send64(uint32_t appid, uint8_t *data, size_t len, const char *what)
 {
 	struct pbuf sb, bulk, arg;
-	if (pbuf_get(&sb, 4096, 4096, 0, 0xa0000000ull))
-		return 2;
-	if (pbuf_get(&bulk, 4096, 4096, 0, 0xa0001000ull)) {
-		pbuf_put(&sb);
+	int cached = 0;
+	pthread_mutex_lock(&send_mx);
+	if (send_bufs(&sb, &bulk, &arg, &cached)) {
+		pthread_mutex_unlock(&send_mx);
 		return 2;
 	}
-	if (pbuf_get(&arg, 4096, 4096, 0, 0xa0002000ull)) {
-		pbuf_put(&bulk), pbuf_put(&sb);
-		return 2;
+	if (cached && len < 4096) {
+		static const uint8_t zero[4096];
+		if (wr_chunks(bulk.pa + len, zero, 4096 - len)) {
+			pthread_mutex_unlock(&send_mx);
+			return 2;
+		}
 	}
 	uint8_t s[0x80] = { 0 }, a[0x100] = { 0 };
 	put_u32(s + 0, (uint32_t)len);
@@ -539,7 +578,9 @@ int fpc_send64(uint32_t appid, uint8_t *data, size_t len, const char *what)
 		say("%s: QSEECom-level resp[0] %#x (HAL requires 0)", what, rd_u32(s + 0x40));
 	rc = 0;
 out:
-	pbuf_put(&arg), pbuf_put(&bulk), pbuf_put(&sb);
+	if (!cached)
+		pbuf_put(&arg), pbuf_put(&bulk), pbuf_put(&sb);
+	pthread_mutex_unlock(&send_mx);
 	return rc;
 }
 

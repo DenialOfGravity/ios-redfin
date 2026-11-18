@@ -26,6 +26,8 @@
  *   FPCD_WAKEDET_SLICE_MS slices, default 2000, no 20 ms poll); its FINGER_DOWN is the kernel's wake press. A Cancel
  *   or SpringBoard's 38/69 off returns to it while the display is off; {0} ends it. Nothing enrolled: not armed.
  *   FPCD_WAKEDET=0: ignored. Every op change kicks the edge wait (write 0) so 4 MatchMode starts at once.
+ *   The wake touch's good image stays in the TA (no re-arm) for FPCD_WAKE_HOLD_MS (1500): the match op the wake starts
+ *   identifies it at once (iPhone: the finger that pressed home is matched), no new capture of the resting finger.
  *
  * Operations (one at a time; a new Enroll/Match/Detect cancels the running one) run in the capture thread, driven by
  * gpio112 (kern.sweet_fpc_wait in FPCD_WAIT_SLICE_MS slices so Cancel/SIGTERM are seen): the HAL capture sequence
@@ -118,6 +120,7 @@ static struct {
 	int op, busy, cancel, finger_on;
 	int extend;		/* the MatchMode is an extend-enrolment (xnu 1198: request u32 flags bit 0) */
 	int wakedet, fdet;	/* xnu 1235: screen-off finger detect on; SpringBoard's 38/69 finger detect on */
+	long held_ms;		/* xnu 1235: now_ms() of the screen-off detect's good image still in the TA (0 = none) */
 	uint32_t up_seq;	/* finger-up count: an extend match needs a lift between touches */
 	uint32_t gen;
 	long started;
@@ -384,6 +387,7 @@ struct capctx { uint32_t gen; };
 static long cap3_ms = FPCD_CAPTURE_WAIT_MS;	/* env FPCD_CAP3_MS */
 static int wakedet_off;				/* env FPCD_WAKEDET=0: ignore FPCD_CMD_WAKEDET (xnu 1235) */
 static long wakedet_slice_ms = 2000;		/* env FPCD_WAKEDET_SLICE_MS: edge wait slice of the screen-off detect */
+static long held_max_ms = 1500;			/* env FPCD_WAKE_HOLD_MS: keep the wake touch's image this long (0 = off) */
 static int cap_stop(void *c) { return cancelled(((struct capctx *)c)->gen); }
 static void cap_lock(void *c) { pthread_mutex_lock(&ta_mx); }
 static void cap_unlock(void *c) { pthread_mutex_unlock(&ta_mx); }
@@ -693,12 +697,28 @@ static void run_match(uint32_t gen)
 	int have_last = 0;
 	int io_retries = 0;
 	uint32_t io_touch = 0;
+	/*
+	 * xnu 1235: the touch that woke the screen was captured by the screen-off detect (a real finger-down edge) and its
+	 * image is still in the TA: identify it at once, as the SEP matches the finger that pressed home. Re-capturing a
+	 * finger that rests since before the arm waits ~1 s for the sensor and its first image gives FPC_ERROR_IO (-6),
+	 * so the unlock came only after a lift and a new touch (tid25). FINGER_DOWN first: rest-to-open needs FingerOn.
+	 */
+	pthread_mutex_lock(&st_mx);
+	long held = S.held_ms && !S.extend && now_ms() - S.held_ms <= held_max_ms ? now_ms() - S.held_ms : -1;
+	S.held_ms = 0;
+	pthread_mutex_unlock(&st_mx);
 	while (!cancelled(gen)) {
 		int32_t st4 = 0, st = 0;
-		if (!op_capture(gen, &st4))
-			return;
-		if (st4)
-			continue;
+		if (held >= 0) {
+			lg("match: identify the image of the touch that woke the screen (%ld ms old), no new capture", held);
+			held = -1;
+			finger_set(1);
+		} else {
+			if (!op_capture(gen, &st4))
+				return;
+			if (st4)
+				continue;
+		}
 		pthread_mutex_lock(&st_mx);
 		int ext = S.extend, same_touch = (ext || nomatch_continue) && have_last && S.up_seq == last_up;
 		uint32_t up_now = S.up_seq;
@@ -823,8 +843,35 @@ static void run_detect(uint32_t gen)
 {
 	while (!cancelled(gen)) {
 		int32_t st4 = 0;
+		pthread_mutex_lock(&st_mx);
+		int wd0 = S.wakedet;	/* the display-on WAKEDET {0} often lands right after the wake touch's image */
+		pthread_mutex_unlock(&st_mx);
 		if (!op_capture(gen, &st4))
 			return;
+		pthread_mutex_lock(&st_mx);
+		int wd = wd0 && st4 == 0 && held_max_ms > 0;
+		if (wd)
+			S.held_ms = now_ms();
+		pthread_mutex_unlock(&st_mx);
+		if (!wd)
+			continue;
+		/*
+		 * xnu 1235: a good image while the display is off is the wake touch: keep it in the TA (no re-arm, no SMC)
+		 * for the match op that the wake starts (run_match identifies it). Not claimed within held_max_ms (no wake:
+		 * kern.sweet_mesa_wake_ms, the press refused, display stayed off): drop it and detect again.
+		 */
+		lg("screen-off detect: wake touch image kept for the match op (max %ld ms)", held_max_ms);
+		long t0 = now_ms();
+		while (!cancelled(gen) && now_ms() - t0 < held_max_ms)
+			usleep(10000);
+		pthread_mutex_lock(&st_mx);
+		int claimed = S.held_ms == 0;
+		if (!cancelled(gen))
+			S.held_ms = 0;
+		pthread_mutex_unlock(&st_mx);
+		if (!cancelled(gen))
+			lg("screen-off detect: wake touch image %s after %ld ms, detecting again", claimed ? "claimed" : "unclaimed",
+			   now_ms() - t0);
 	}
 }
 
@@ -1977,6 +2024,8 @@ int main(int argc, char **argv)
 		wakedet_off = atoi(e) == 0;	/* xnu 1235 */
 	if ((e = getenv("FPCD_WAKEDET_SLICE_MS")) && atol(e) > 0)
 		wakedet_slice_ms = atol(e);
+	if ((e = getenv("FPCD_WAKE_HOLD_MS")) && *e)
+		held_max_ms = atol(e);
 	if ((e = getenv("FPCD_CONSOLE")) && atoi(e))
 		log_con = open("/dev/console", O_WRONLY | O_NOCTTY);
 	/* qsee_lib: its say() lines go to stdout -> our log; quiet unless FPCD_VERBOSE (fd_cmd/fpc_bio are quiet anyway) */
