@@ -1,0 +1,44 @@
+redfin 1213: SweetMesa 0x41 after a successful enrol result only with kern.sweet_mesa_fix bit 3 (default off)
+
+libBKDM1 serviceStatus: already dequeues on the 0xe3ff8003 enrol result; 1204s 0x41 was a second
+switchToNextBioOperation: that could drop the extend-match op. The kernel op still ends with the result; 0x43/0x44
+on failure/timeout unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4dCbJuYfzxCtCk4D8
+---
+diff --git a/iokit/Kernel/arm/SweetMesa.cpp b/iokit/Kernel/arm/SweetMesa.cpp
+--- a/iokit/Kernel/arm/SweetMesa.cpp
++++ b/iokit/Kernel/arm/SweetMesa.cpp
+@@ -215,6 +215,7 @@ static uint32_t nOpEnd;
+ #define MESA_FIX_IMPLICIT_END   0x1u
+ #define MESA_FIX_STALE_DROP     0x2u
+ #define MESA_FIX_ALIGNMENT      0x4u
++#define MESA_FIX_ENROLL_0X41    0x8u
+ static volatile uint32_t gAlignN;       /* 1212: accepted enrol touches since the last 3 EnrollMode (AlignmentData nodes) */
+ static int gFix = 0x7;                  /* kern.sweet_mesa_fix */
+ static uint32_t nImplicitEnd, nStaleDropped, nAlignAnswered;    /* kern.sweet_mesa_fix_stats */
+@@ -1070,15 +1071,18 @@ fpcd_translate(const uint8_t *d, uint32_t len)
+ 		r = mesa_deliver(MIDX_ENROLL_RESULT, 2, 0, b, ENROLL_RESULT_V2_SIZE);
+ 		IOFreeData(b, ENROLL_RESULT_V2_SIZE);
+ 		/*
+-		 * 1204: libBKDM1 ends an enrol op (switchToNextBioOperation:) only on a status 0x41-0x44; the enroll
+-		 * result alone left the finished enrol op at the head of activeBioOpsQueue, so every later result went
+-		 * one op behind (the extend match, then SpringBoard's lock-screen ops). After the result, as the SEP does.
++		 * 1204: 0x41 EnrollmentComplete after the result. 1213: libBKDM1 serviceStatus: already calls
++		 * switchToNextBioOperation:1 for the 0xe3ff8003 enrol result itself, so the 0x41 dequeued a second op
++		 * (tid14 12:28:52, tid15 12:41:08: it could drop the extend-match op). Off unless kern.sweet_mesa_fix bit 3.
++		 * The kernel's running op ends with the result either way (no implicit end for the next MatchMode).
+ 		 */
+-		if (gOpEnd) {
+-			mesa_op_finished(1);
++		mesa_op_finished(1);
++		if (gOpEnd && (gFix & MESA_FIX_ENROLL_0X41)) {
+ 			IOReturn r2 = mesa_status(ST_ENROLL_COMPLETE);
+ 			nOpEnd++;
+ 			SAY("op ended: status 0x41 (EnrollmentComplete) -> 0x%x\n", r2);
++		} else {
++			SAY("enrol op ended by the enroll result (no 0x41: kern.sweet_mesa_fix bit 3 off)\n");
+ 		}
+ 		return r;
+ 	case FEV_ENROL_FAILED:
