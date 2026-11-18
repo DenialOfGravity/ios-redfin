@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  sweetfpcd, the FPC fingerprint TrustZone app daemon behind SweetMesa (phone/fpc, ws-fpcd-a). NOT installed by default.
+  Install pattern as our other daemons: merged into /System/Library/xpc/launchd.plist as
+  /System/Library/LaunchDaemons/com.redfin.sweetfpcd.plist. Binary /var/local/bin/sweetfpcd, root.
+  KeepAlive while /var/local/fpc/fpcd.on exists (no RunAtLoad), so it can be switched off with one file; a crash is
+  restarted after ThrottleInterval. SIGTERM: cancels the operation and unloads the TA (ExitTimeOut 15).
+  Needs kern.sweet_fpc = 3 (xnu 1190) and the TA files in /var/local/fpc/ta; it waits for the sysctl and retries the
+  SweetMesaBridge service every 5 s. Matches are reported only while /var/local/fpc/allow-match exists.
+  By hand without launchd: /var/local/bin/sweetfpcd --selftest 15 (no bridge), or /var/local/bin/sweetfpcd & .
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.redfin.sweetfpcd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/local/bin/sweetfpcd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/var/local/fpc/fpcd.on</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>15</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardErrorPath</key>
+	<string>/var/local/fpc/sweetfpcd.log</string>
+	<key>StandardOutPath</key>
+	<string>/var/local/fpc/sweetfpcd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

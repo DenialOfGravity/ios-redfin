@@ -48,3 +48,5 @@ ls -l out
 sh ../video/build.sh || echo "WARN phone/video build failed"
 # qseeprobe (ws-qsee-a): read-only QSEE queries over /dev/pmem PMEM_SMC; host whitelist test inside
 sh ../qsee/build.sh || echo "WARN phone/qsee build failed"
+# sweetfpcd (ws-fpcd-a): FPC fingerprint TA daemon for SweetMesa, on qsee_lib
+sh ../fpc/build.sh || echo "WARN phone/fpc build failed"

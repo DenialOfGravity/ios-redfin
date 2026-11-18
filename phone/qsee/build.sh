@@ -14,7 +14,7 @@ else
 fi
 CC=../../work/userland/bin/ios-cc
 mkdir -p out
-$CC -O2 -Wall -Wextra -Wno-unused-parameter -o out/qseeprobe qseeprobe.c qsee_wl.c ../video/pmem.c
+$CC -O2 -Wall -Wextra -Wno-unused-parameter -o out/qseeprobe qseeprobe.c qsee_lib.c qsee_wl.c ../video/pmem.c
 codesign -f -s - out/qseeprobe
 ls -la out
 U=../../../out
