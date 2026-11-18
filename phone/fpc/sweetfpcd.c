@@ -21,6 +21,14 @@
  *   Cancel, the op timeout or the kernel's lockout); 0 = old behaviour (WITHHELD, the op ends after one result).
  * FPCD_LSNR_DIAG=1|2: listeners up around the first / every identify of a match op, requests logged (debug).
  * FPCD_STORE_TEST=1: one catacomb store (61's path, memory only) at start, logged (debug).
+ * ws-fpcd-d (launchd job com.redfin.sweetfpcd, touchid-integration-2026-11-18.md):
+ *   FPCD_LOG=PATH: the daemon opens PATH itself (append) for stdout + stderr and caps it at FPCD_LOG_MAX bytes
+ *     (default 2 MiB): over the cap PATH is renamed to PATH.1 (one old file kept) and a new PATH is started.
+ *   /var/local/fpc/fpcd.off: present at start = exit 0 at once (the job's off switch; KeepAlive SuccessfulExit false
+ *     does not restart a clean exit). Waits for kern.sweet_fpc (every 2 s) and for the SweetMesaBridge service (every
+ *     1 s) instead of 10 s / 5 s: with boot-arg sweettouchid (xnu 1247) both come up 2 s after the kernel starts.
+ *   The bridge STATE (published / match gate / translate / open) is re-read every 30 s while idle and at each op
+ *     start, and a change is logged; kern.sweet_mesa_match is read at each match (as before).
  * Screen-off wake (xnu 1235, kern.sweet_mesa_wake bit 2): FPCD_CMD_WAKEDET {1} when iOS's display goes off runs the
  *   detect op (sensor armed, the arm wait asleep on gpio112's interrupt through kern.sweet_fpc_wait_edge in
  *   FPCD_WAKEDET_SLICE_MS slices, default 2000, no 20 ms poll); its FINGER_DOWN is the kernel's wake press. A Cancel
@@ -88,6 +96,7 @@
 #define FPCD_VERSION "dev"
 #endif
 #define ALLOW_MATCH_PATH	"/var/local/fpc/allow-match"
+#define FPCD_OFF_PATH		"/var/local/fpc/fpcd.off"	/* ws-fpcd-d: the launchd job's off switch */
 #define FPCD_WAIT_SLICE_MS	250	/* gpio112 wait slice: Cancel / SIGTERM latency */
 #define FPCD_UP_MS		150	/* armed and quiet this long after a touch = finger up */
 #define FPCD_CAPTURE_WAIT_MS	0	/* max wait after g10/3; 0 = until the op deadline (as qseeprobe / the HAL) */
@@ -136,6 +145,40 @@ static struct {
 static struct timespec t_start;
 static pthread_mutex_t log_mx = PTHREAD_MUTEX_INITIALIZER;
 static int log_con = -1;
+static const char *log_path;		/* FPCD_LOG (ws-fpcd-d) */
+static long long log_bytes, log_max = 2LL << 20;
+static int log_rot;
+
+/* ws-fpcd-d: (re)open FPCD_LOG as stdout + stderr (append). Called with log_mx held after the first time. */
+static int log_open(void)
+{
+	int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return -1;
+	struct stat sb;
+	log_bytes = fstat(fd, &sb) == 0 ? (long long)sb.st_size : 0;
+	dup2(fd, 2);
+	dup2(fd, 1);
+	if (fd > 2)
+		close(fd);
+	return 0;
+}
+
+static void log_rotate(void)
+{
+	char old[512];
+	snprintf(old, sizeof(old), "%s.1", log_path);
+	if (rename(log_path, old) == 0 && log_open() == 0) {
+		log_rot++;
+		char line[160];
+		int n = snprintf(line, sizeof(line), "sweetfpcd: log rotated (%d; previous part in %s, cap %lld bytes)\n",
+				 log_rot, old, log_max);
+		if (n > 0 && write(2, line, (size_t)n) > 0)
+			log_bytes += n;
+	} else {
+		log_bytes = 0;	/* cannot rotate: keep writing, try again after another cap's worth */
+	}
+}
 
 static long now_ms(void)
 {
@@ -162,6 +205,9 @@ static void lg(const char *fmt, ...)
 	if (write(2, line, (size_t)n) < 0 || (log_con >= 0 && write(log_con, line, (size_t)n) < 0)) {
 		/* nowhere else to report */
 	}
+	log_bytes += n;
+	if (log_path && log_max > 0 && log_bytes > log_max)
+		log_rotate();
 	pthread_mutex_unlock(&log_mx);
 }
 
@@ -222,10 +268,31 @@ static int bridge_open(void)
 	kr = IOConnectCallStructMethod(c, SMB_SEL_STATE, NULL, 0, &st, &sz);
 	lg("bridge: %s open; STATE %s: version %u flags %#x pending %u clients %u", SMB_SERVICE,
 	   kr ? "failed" : "ok", st.version, st.flags, st.pending, st.clients);
+	br_flags = kr ? 0xffffffffu : st.flags;
 	pthread_mutex_lock(&ev_mx);
 	conn = c;
 	pthread_mutex_unlock(&ev_mx);
 	return 0;
+}
+
+/* ws-fpcd-d: re-read the bridge STATE; log when the flags (published, match gate, translate, open) change */
+static uint32_t br_flags = 0xffffffffu;
+static void bridge_state_poll(const char *why)
+{
+	struct smb_state st = { 0 };
+	size_t sz = sizeof(st);
+	pthread_mutex_lock(&ev_mx);
+	io_connect_t c = conn;
+	kern_return_t kr = c ? IOConnectCallStructMethod(c, SMB_SEL_STATE, NULL, 0, &st, &sz) : KERN_FAILURE;
+	pthread_mutex_unlock(&ev_mx);
+	if (kr != KERN_SUCCESS)
+		return;
+	if (st.flags != br_flags) {
+		if (br_flags != 0xffffffffu)
+			lg("bridge: STATE flags %#x -> %#x (%s; match %u)", br_flags, st.flags, why,
+			   fpc_sysctl_u32("kern.sweet_mesa_match"));
+		br_flags = st.flags;
+	}
 }
 
 static void bridge_close(void)
@@ -1719,6 +1786,8 @@ static void dispatch(void)
 	rp.seq = rq.seq;
 	if (rq.len > SMB_DATA_MAX)
 		rq.len = SMB_DATA_MAX;
+	if (rq.cmd == 3 || rq.cmd == 4 || rq.cmd == 38)
+		bridge_state_poll("op start");	/* ws-fpcd-d */
 	int mapped = 0;
 	for (unsigned i = 0; i < sizeof(cmd_map) / sizeof(cmd_map[0]); i++)
 		if (cmd_map[i].cmd == rq.cmd) {
@@ -1766,7 +1835,7 @@ static void dump_status(void)
 	pthread_mutex_unlock(&st_mx);
 }
 
-/* kern.sweet_fpc needs value 3 (bit 0 reset, bit 1 irq; xnu 1190). wait: poll every 10 s until it is. */
+/* kern.sweet_fpc needs value 3 (bit 0 reset, bit 1 irq; xnu 1190). wait: poll every 2 s until it is (ws-fpcd-d). */
 static int fpc_kernel_ready(int wait)
 {
 	int said = 0;
@@ -1779,7 +1848,9 @@ static int fpc_kernel_ready(int wait)
 			   v == 0xffffffffu ? "missing" : v ? "partial" : "0", wait ? "; waiting" : "");
 		if (!wait || g_stop)
 			return -1;
-		sleep(10);
+		sleep(2);
+		if (said == 1 && (v = fpc_sysctl_u32("kern.sweet_fpc")) != 0xffffffffu && (v & 3) == 3)
+			lg("kern.sweet_fpc = 3 now: going on");
 	}
 }
 
@@ -1979,6 +2050,13 @@ int main(int argc, char **argv)
 		wakedet_slice_ms = atol(e);
 	if ((e = getenv("FPCD_CONSOLE")) && atoi(e))
 		log_con = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if ((e = getenv("FPCD_LOG_MAX")) && *e)
+		log_max = atoll(e);
+	if ((e = getenv("FPCD_LOG")) && *e) {
+		log_path = e;
+		if (log_open())
+			log_path = NULL;	/* stay on launchd's stdout / stderr */
+	}
 	/* qsee_lib: its say() lines go to stdout -> our log; quiet unless FPCD_VERBOSE (fd_cmd/fpc_bio are quiet anyway) */
 	dup2(2, 1);
 	say_tag = "sweetfpcd(qsee): ";
@@ -1997,6 +2075,13 @@ int main(int argc, char **argv)
 	lg("start %s: %s, TA %s/%s (name %s), op timeout %ld ms, allow-match file %s, bridge structs %s", FPCD_VERSION,
 	   self ? "selftest" : "daemon", ta_dir, ta_file, ta_name, op_timeout_ms, ALLOW_MATCH_PATH,
 	   bridge_small ? "small (inline, FPCD_BRIDGE_SMALL=1)" : "full 16388/16384 (FPCD_BRIDGE_SMALL=0)");
+	struct stat offsb;
+	if (!self && stat(FPCD_OFF_PATH, &offsb) == 0) {
+		lg("%s exists: not starting (exit 0; the launchd job does not restart a clean exit)", FPCD_OFF_PATH);
+		return 0;
+	}
+	if (log_path)
+		lg("log: %s, cap %lld bytes (FPCD_LOG_MAX), previous part %s.1", log_path, log_max, log_path);
 	pm_init();
 	if (qsee_lib_lock("sweetfpcd"))
 		return 9;
@@ -2054,9 +2139,9 @@ int main(int argc, char **argv)
 			int r = bridge_open();
 			if (r) {
 				if (!said++)
-					lg("bridge: %s not available (%s); retrying every 5 s", SMB_SERVICE,
+					lg("bridge: %s not available (%s); retrying every 1 s", SMB_SERVICE,
 					   r == -1 ? "no such service: SweetMesa not booted / kern.sweet_mesa off" : "open failed");
-				for (int i = 0; i < 10 && !g_stop && !g_wipe && !g_dump; i++)
+				for (int i = 0; i < 2 && !g_stop && !g_wipe && !g_dump; i++)
 					usleep(500000);
 				continue;
 			}
@@ -2070,8 +2155,14 @@ int main(int argc, char **argv)
 		uint64_t in = FPCD_WAIT_REQ_MS;
 		size_t osz = bridge_small ? SMB_SMALL_MAX : sizeof(rq);
 		kern_return_t kr = IOConnectCallMethod(conn, SMB_SEL_WAIT, &in, 1, NULL, 0, NULL, NULL, &rq, &osz);
-		if (kr == kIOReturnTimeout)
+		if (kr == kIOReturnTimeout) {
+			static long last_poll;
+			if (now_ms() - last_poll >= 30000) {	/* ws-fpcd-d: flags may change at runtime */
+				last_poll = now_ms();
+				bridge_state_poll("idle check");
+			}
 			continue;
+		}
 		if (kr == kIOReturnNoSpace && bridge_small) {
 			/* the request needs more than 4084 data bytes (1192 keeps it queued): fetch it once at full size */
 			lg("bridge: WAIT: request larger than %d bytes: fetching it with the full-size buffer", SMB_SMALL_MAX);
