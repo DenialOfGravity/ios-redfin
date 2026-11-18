@@ -416,6 +416,7 @@ bsd/kern/kern_credential.c		standard
 bsd/kern/kern_crossarch.c		standard
 bsd/kern/kern_cs.c			standard
 bsd/kern/sweet_amfi.c			standard
+bsd/kern/redfin_sandbox_container.c	standard
 
 # Apple OSS hfs-627.100.6, staged by xnu/patches/0026-stage-hfs.sh
 bsd/sweet_hfs/core/BTree.c		optional sweet_hfs

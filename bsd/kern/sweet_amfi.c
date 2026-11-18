@@ -279,11 +279,15 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
  * launchd reports mach lookups as "error = 159: Sandbox restriction"
  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
  * "profile not found"). SWEET runs without a sandbox: operations succeed
- * (checks allow, profile init is accepted); container paths fail with
- * ENOENT, extensions are issued and consumed (below). The first
- * use of each operation number is logged.
+ * (checks allow, profile init is accepted); container paths come from
+ * the process's CFFIXED_USER_HOME (ENOENT if it has none), extensions are
+ * issued and consumed (below). The first use of each operation number is
+ * logged.
  */
 static uint64_t sweet_sandbox_seen;
+
+/* op 4: bsd/kern/redfin_sandbox_container.c (CFFIXED_USER_HOME of the process; ENOENT if none or sweetcontainer=0) */
+int sweet_sandbox_container_path(user_addr_t arg);
 
 /*
  * Extension tokens. tccd hands the processes it allows a sandbox extension
@@ -341,6 +345,7 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 	case 6:         /* extension consume */
 		return sweet_sandbox_consume(arg);
 	case 4:         /* container path (audit token / pid) */
+		return sweet_sandbox_container_path(arg);
 	case 0x43:      /* container expected */
 		return ENOENT;
 	default:
