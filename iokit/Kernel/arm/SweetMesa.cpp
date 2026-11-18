@@ -199,11 +199,30 @@ static int gMesa;                       /* kern.sweet_mesa */
 static int gMatch;                      /* kern.sweet_mesa_match */
 static int gOpEnd = 1;                  /* kern.sweet_mesa_opend: Cancel ends the op with its *Cancelled status (1203) */
 static volatile UInt32 gOpKind;         /* 1203: running op: 0 none, 1 enrol (3), 2 match (4), 3 finger detect (38) */
-static volatile UInt32 gEndPend;        /* 1203: op-ending statuses to deliver (bit 0 enrol, 1 match, 2 fdet) */
 static thread_call_t gEndTC;
 static int gUnlockDelayMs;              /* kern.sweet_mesa_unlock_delay_ms (1205): 0 now, >0 after the record, -1 never */
 static thread_call_t gUnlockTC;
 static uint32_t nOpEnd;
+/*
+ * 1210-1213: kern.sweet_mesa_fix, one bit per fix (clear a bit = the 1203-1205 behaviour for that fix):
+ *   bit 0 (0x1) 1210 a 3 EnrollMode / 4 MatchMode / 38 FingerDetectMode that pre-empts a running op ends the old op
+ *               with its *Cancelled status (0x42 / 0x50 / 0x63)
+ *   bit 1 (0x2) 1211 sweetfpcd events of an op that has ended (Cancel / pre-empted / wrong kind) are dropped
+ *   bit 2 (0x4) 1212 8 AlignmentData answers a valid node placement (one node per accepted enrol touch)
+ *   bit 3 (0x8) 1213 0x41 EnrollmentComplete after a successful enrol result (1204; off: the result ends the op)
+ */
+#define MESA_FIX_IMPLICIT_END   0x1u
+static int gFix = 0x7;                  /* kern.sweet_mesa_fix */
+static uint32_t nImplicitEnd, nStaleDropped, nAlignAnswered;    /* kern.sweet_mesa_fix_stats */
+/* 1210: op-ending statuses waiting for delivery, in order (1203 had one bit per kind, so two ends of one kind gave one) */
+#define MESA_ENDQ               8
+static struct {
+	uint8_t kind;                   /* 1 enrol, 2 match, 3 finger detect */
+	uint8_t cause;                  /* 12 Cancel, or the 3/4/38 command that pre-empted the op */
+} gEndQ[MESA_ENDQ];
+static volatile int gEndHead, gEndCount;
+static IOLock *gEndL;                   /* end queue; held while delivering, so the statuses go out in order */
+static volatile UInt32 gEndKick;        /* 1210: an implicit end is queued; the thread call runs when the command is done */
 static int gSks = 1;                    /* kern.sweet_mesa_sks: 39 GetSKSLockState follows the passcode rules (1202) */
 static int gPcfg = 1;                   /* kern.sweet_mesa_pcfg: 46 GetProtectedConfig bits (1202) */
 static int gTopo = 1;                   /* kern.sweet_mesa_topo: synthetic match topology (1201) */
@@ -342,28 +361,122 @@ mesa_fill_topology(uint8_t *t)
  */
 static IOReturn mesa_status(uint32_t st);
 
-static void
-mesa_end_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+static const char *const mesa_kind_names[4] = { "none", "enrol", "match", "finger-detect" };
+
+static IOLock *
+mesa_endl(void)
 {
-	static const uint32_t sts[3] = { ST_ENROLL_CANCELLED, ST_MATCHING_CANCELLED, ST_FDET_CANCELLED };
-	UInt32 pend;
-	do {
-		pend = gEndPend;
-	} while (!OSCompareAndSwap(pend, 0, &gEndPend));
-	for (int i = 0; i < 3; i++) {
-		if (pend & (1u << i)) {
-			IOReturn r = mesa_status(sts[i]);
-			nOpEnd++;
-			SAY("op ended: status 0x%x (%s) -> 0x%x\n", sts[i], i == 0 ? "EnrollmentCancelled" :
-			    i == 1 ? "MatchingCancelled" : "FingerDetectCancelled", r);
+	if (gEndL == NULL) {
+		IOLock *l = IOLockAlloc();
+		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gEndL)) {
+			IOLockFree(l);
 		}
 	}
+	return gEndL;
+}
+
+/* 1210: queue the op-ending status of op `kind`; false if it cannot be delivered (no lock, queue full) */
+static bool
+mesa_end_push(uint32_t kind, uint32_t cause)
+{
+	IOLock *l = mesa_endl();
+	bool ok = false;
+	if (l == NULL || kind == 0 || kind > 3) {
+		return false;
+	}
+	IOLockLock(l);
+	if (gEndCount < MESA_ENDQ) {
+		int i = (gEndHead + gEndCount) % MESA_ENDQ;
+		gEndQ[i].kind = (uint8_t)kind;
+		gEndQ[i].cause = (uint8_t)cause;
+		gEndCount++;
+		ok = true;
+	}
+	IOLockUnlock(l);
+	if (!ok) {
+		SAY("op-ending status queue full: end of the %s op (cmd %u) LOST\n", mesa_kind_names[kind], cause);
+	}
+	return ok;
+}
+
+/*
+ * 1210: deliver every queued op-ending status, oldest first. Runs from the thread call (after the Cancel / the
+ * pre-empting command was handled) and at the start of every sweetfpcd event translation, so the old op's end always
+ * reaches biometrickitd before any status of the new op.
+ */
+static void
+mesa_end_flush(void)
+{
+	static const uint32_t sts[4] = { 0, ST_ENROLL_CANCELLED, ST_MATCHING_CANCELLED, ST_FDET_CANCELLED };
+	static const char *const stn[4] = { "", "EnrollmentCancelled", "MatchingCancelled", "FingerDetectCancelled" };
+	IOLock *l = mesa_endl();
+	if (l == NULL) {
+		return;
+	}
+	IOLockLock(l);
+	while (gEndCount > 0) {
+		uint32_t k = gEndQ[gEndHead].kind, cause = gEndQ[gEndHead].cause;
+		gEndHead = (gEndHead + 1) % MESA_ENDQ;
+		gEndCount--;
+		IOReturn r = mesa_status(sts[k]);
+		nOpEnd++;
+		if (cause == 12) {
+			SAY("op ended: status 0x%x (%s) -> 0x%x\n", sts[k], stn[k], r);
+		} else {
+			nImplicitEnd++;
+			SAY("implicit op end delivered: old %s op, status 0x%x (%s), new cmd %u %s -> 0x%x\n",
+			    mesa_kind_names[k], sts[k], stn[k], cause, mesa_name(cause), r);
+		}
+	}
+	IOLockUnlock(l);
 }
 
 static void
-mesa_op_started(uint32_t kind)
+mesa_end_tc(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
-	gOpKind = kind;
+	mesa_end_flush();
+}
+
+static void
+mesa_end_kick(void)
+{
+	if (OSCompareAndSwap(1, 0, &gEndKick) && gEndTC != NULL) {
+		thread_call_enter(gEndTC);
+	}
+}
+
+/* 1210: kicks the end thread call when the forwarded/posted command block is left (any return path) */
+struct MesaEndKick {
+	~MesaEndKick()
+	{
+		mesa_end_kick();
+	}
+};
+
+/*
+ * 1210: BiometricSupport startBioOperation: appends the new op to activeBioOpsQueue and sends 3/4/38 without
+ * cancelling the op that runs; pauseBioOperation: sends nothing. The SEP ends the pre-empted op with its *Cancelled
+ * status; without it the old op stayed at activeBioOpsQueue[0] and every later status and match went to its (dead)
+ * client: SpringBoard's lock-screen op never saw a FingerOn or a match (touchid-unlock-haptic-re 2026-11-18, B.1).
+ */
+static void
+mesa_op_started(uint32_t kind, uint32_t cmd)
+{
+	UInt32 old;
+	do {
+		old = gOpKind;
+	} while (!OSCompareAndSwap(old, kind, &gOpKind));
+	if (old == 0 || old > 3) {
+		return;
+	}
+	if (!(gFix & MESA_FIX_IMPLICIT_END) || !gOpEnd || gEndTC == NULL) {
+		SAY("%s op pre-empted by cmd %u %s: no op-ending status (kern.sweet_mesa_fix bit 0 or kern.sweet_mesa_opend off)\n",
+		    mesa_kind_names[old], cmd, mesa_name(cmd));
+		return;
+	}
+	if (mesa_end_push(old, cmd)) {
+		gEndKick = 1;
+	}
 }
 
 /*
@@ -409,8 +522,9 @@ mesa_op_cancelled(void)
 		}
 		return;
 	}
-	OSBitOrAtomic(1u << (k - 1), &gEndPend);
-	thread_call_enter(gEndTC);
+	if (mesa_end_push(k, 12)) {     /* 1210: queued, not a bit per kind */
+		thread_call_enter(gEndTC);
+	}
 }
 
 static IOReturn mesa_deliver(uint32_t idx, uint32_t version, uint64_t ordinal, const uint8_t *data, uint32_t len);
@@ -761,6 +875,9 @@ fpcd_translate(const uint8_t *d, uint32_t len)
 	uint8_t *b;
 	IOReturn r = kIOReturnSuccess;
 
+	if (gEndCount > 0) {
+		mesa_end_flush();       /* 1210: a queued op end goes out before anything of the next op */
+	}
 	OSIncrementAtomic(&nTranslated);
 	switch (code) {
 	case FEV_FINGER_DOWN:
@@ -1489,13 +1606,14 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 		uint32_t flen = 0;
 		uint32_t rlen = 0;
 		uint8_t *rbuf;
+		MesaEndKick kick;       /* 1210 */
 
 		/* 1192d: the identities' user id (EnrollMode v2 payload +4, 65/66 payload +0) for enrol/match records */
 		if (cmd == 3) {
 			gMatchExtend = false;
-			mesa_op_started(1);     /* 1203 */
+			mesa_op_started(1, cmd);        /* 1203, 1210 */
 		} else if (cmd == 4) {
-			mesa_op_started(2);
+			mesa_op_started(2, cmd);
 		}
 		if (cmd == 3 && plen >= 8 && le32(p + 4) != 0xffffffffu) {
 			gUser = le32(p + 4);
@@ -1536,7 +1654,7 @@ mesa_command(const uint8_t *in, uint32_t inLen, uint8_t *out, uint32_t cap, uint
 			if (cmd == 12) {
 				mesa_op_cancelled();    /* 1203 */
 			} else if (cmd == 38) {
-				mesa_op_started(3);
+				mesa_op_started(3, cmd);
 			}
 			r = mesa_post(cmd, fp, flen);
 			if (r == kIOReturnSuccess) {
@@ -2211,6 +2329,39 @@ sysctl_sweet_mesa_opend(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_opend, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     sysctl_sweet_mesa_opend, "I", "redfin 1203: 12 Cancel ends the running op with EnrollmentCancelled / "
     "MatchingCancelled / FingerDetectCancelled so biometrickitd drops it from activeBioOpsQueue (default 1)");
+
+static int
+sysctl_sweet_mesa_fix(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int v = gFix, changed = 0;
+	int e = sysctl_io_number(req, gFix, sizeof(gFix), &v, &changed);
+	if (e || !changed) {
+		return e;
+	}
+	if (v < 0 || v > 0xf) {
+		return EINVAL;
+	}
+	gFix = v;
+	SAY("kern.sweet_mesa_fix=0x%x: implicit op end %s, stale-event drop %s, AlignmentData %s, 0x41 after enrol %s\n", v,
+	    (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (v & 8) ? "on" : "off");
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_fix, "I", "redfin 1210-1213: bit 0 implicit op end on 3/4/38, bit 1 drop stale sweetfpcd "
+    "events, bit 2 AlignmentData node placement, bit 3 0x41 after the enrol result (default 0x7)");
+
+static int
+sysctl_sweet_mesa_fix_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	char b[160];
+	snprintf(b, sizeof(b), "fix=0x%x op_kind=%u op_ends=%u implicit_ends=%u end_queue=%d stale_dropped=%u "
+	    "align_answered=%u", gFix, gOpKind, nOpEnd, nImplicitEnd, gEndCount, nStaleDropped, nAlignAnswered);
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_mesa_fix_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    sysctl_sweet_mesa_fix_stats, "A", "redfin 1210-1213: op-end / stale-event / AlignmentData counters");
 
 static int
 sysctl_sweet_mesa_sks(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
