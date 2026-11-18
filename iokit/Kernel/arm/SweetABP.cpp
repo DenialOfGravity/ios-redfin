@@ -343,6 +343,21 @@ abp_rx_pop(abp_pipe *pp, uint32_t sess, uint8_t **buf, uint32_t *len)
 	return false;
 }
 
+/*
+ * 1194: struct descriptors (> 4096 bytes) arrive unprepared: wire them around each copy (prepare/complete).
+ * An unprepared writeBytes hung the phone in SweetMesa's bridge (fingerprint-freeze-bisect-2026-11-18.md).
+ */
+static IOByteCount
+abp_md_copy(IOMemoryDescriptor *md, IOByteCount off, void *buf, IOByteCount len, bool out)
+{
+	if (len == 0 || md->prepare() != kIOReturnSuccess) {
+		return 0;
+	}
+	IOByteCount n = out ? md->writeBytes(off, buf, len) : md->readBytes(off, buf, len);
+	md->complete();
+	return n;
+}
+
 /* Output structure (inband or descriptor) helpers. */
 static uint32_t
 abp_struct_in(IOExternalMethodArguments *args, uint8_t *dst, uint32_t max)
@@ -352,7 +367,7 @@ abp_struct_in(IOExternalMethodArguments *args, uint8_t *dst, uint32_t max)
 		if (n > max) {
 			n = max;
 		}
-		return (uint32_t)args->structureInputDescriptor->readBytes(0, dst, n);
+		return (uint32_t)abp_md_copy(args->structureInputDescriptor, 0, dst, n, false);
 	}
 	uint32_t n = args->structureInputSize;
 	if (n > max) {
@@ -371,7 +386,7 @@ abp_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
 		if (len > args->structureOutputDescriptor->getLength()) {
 			len = (uint32_t)args->structureOutputDescriptor->getLength();
 		}
-		args->structureOutputDescriptor->writeBytes(0, buf, len);
+		abp_md_copy(args->structureOutputDescriptor, 0, (void *)(uintptr_t)buf, len, true);
 		args->structureOutputDescriptorSize = len;
 		return kIOReturnSuccess;
 	}
@@ -1360,7 +1375,7 @@ SweetABPStubUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 		uint8_t z[256];
 		bzero(z, sizeof(z));
 		for (uint32_t o = 0; o < n; o += sizeof(z)) {
-			args->structureOutputDescriptor->writeBytes(o, z, n - o < sizeof(z) ? n - o : sizeof(z));
+			abp_md_copy(args->structureOutputDescriptor, o, z, n - o < sizeof(z) ? n - o : sizeof(z), true);
 		}
 		args->structureOutputDescriptorSize = n;
 	} else if (args->structureOutput && args->structureOutputSize) {
@@ -1482,7 +1497,7 @@ ipa_method(uint32_t selector, IOExternalMethodArguments *args)
 		bzero(z, sizeof(z));
 		if (args->structureOutputDescriptor != NULL) {
 			for (uint32_t o = 0; o < sout; o += sizeof(z)) {
-				args->structureOutputDescriptor->writeBytes(o, z, sout - o < sizeof(z) ? sout - o : sizeof(z));
+				abp_md_copy(args->structureOutputDescriptor, o, z, sout - o < sizeof(z) ? sout - o : sizeof(z), true);
 			}
 		} else if (args->structureOutput != NULL) {
 			bzero(args->structureOutput, sout);
