@@ -41,6 +41,8 @@
 #include <libkern/c++/OSCollectionIterator.h>
 #include <libkern/c++/OSSymbol.h>
 #include <sys/proc.h>
+#include <sys/errno.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 
 enum {
@@ -606,7 +608,7 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
 }
 
 /*
- * redfin 1048: kern.sweet_surfkeep (bsd/dev/sweet_gpu.c) / boot-arg sweetsurfkeep, default 0. 0xffffffff = not read yet.
+ * redfin 1258: kern.sweet_surfkeep (bsd/dev/sweet_gpu.c) / boot-arg sweetsurfkeep, default 0. 0xffffffff = not read yet.
  */
 extern "C" uint32_t sweet_surfkeep;
 uint32_t sweet_surfkeep = 0xffffffffu;
@@ -618,7 +620,7 @@ sweet_surface_keep_row(void)
 	if (sweet_surfkeep == 0xffffffffu) {
 		/*
 		 * 1096: default 2 (was 1 since 2026-11-05): keep the explicit row only for CA's archive-decode surfaces
-		 * (sweet_surface_archive_decode). sweetsurfkeep=1 = 1048 as it was (<= 9 keys), 0 = always round.
+		 * (sweet_surface_archive_decode). sweetsurfkeep=1 = 1258 as it was (<= 9 keys), 0 = always round.
 		 */
 		uint32_t v = 2;
 		PE_parse_boot_argn("sweetsurfkeep", &v, sizeof(v));
@@ -628,8 +630,8 @@ sweet_surface_keep_row(void)
 }
 
 /*
- * redfin 1096: kern.sweet_surfkeep 2. 1048 kept the row of every surface made from <= 9 keys with an explicit
- * IOSurfaceBytesPerRow. The surfaces it was written for (klogs 11-05..11-14, "SWEET SURF: 1048 ... kept") are CA's
+ * redfin 1096: kern.sweet_surfkeep 2. 1258 kept the row of every surface made from <= 9 keys with an explicit
+ * IOSurfaceBytesPerRow. The surfaces it was written for (klogs 11-05..11-14, "SWEET SURF: 1258 ... kept") are CA's
  * archive decoder's: 6 keys, made in the client (SpringBoard, MobilePhone, InCallService, Preferences, Quick Look),
  * small (glyph/icon size), 'LA08' or 'BGRA', CPU-written from a recorded blob, never a render target or a display
  * surface. Others in the <= 9 set were not: MobileSafari's 7-key 1125x2436 'BGRA' (4512-byte rows), Quick Look's
@@ -815,11 +817,11 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	}
 	OSArray *plane_info = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 	/*
-	 * redfin 1048 (Yofuness 0251, kern.sweet_surfkeep / boot-arg sweetsurfkeep, default 0 = as before): a surface made
+	 * redfin 1258 (Yofuness 0251, kern.sweet_surfkeep / boot-arg sweetsurfkeep, default 0 = as before): a surface made
 	 * from a recorded key set (at most 9 keys: QuartzCore's iosurface_keys_allow_list) with an explicit row keeps that
 	 * row, its planes' rows too. CA's archive decoder copies a recorded blob written at the client's (32-byte) row and
 	 * never reads the row back, so 0159's 64-byte rounding shears it: glyph stripes (Control Center). New surfaces
-	 * only. Line SWEET SURF: 1048 ... for the first 32 such surfaces whose row 0159 would round (also with 0).
+	 * only. Line SWEET SURF: 1258 ... for the first 32 such surfaces whose row 0159 would round (also with 0).
 	 */
 	bool recorded = props->getCount() <= 9 && props->getObject("IOSurfaceBytesPerRow") != NULL;
 	uint32_t keep_mode = sweet_surface_keep_row();
@@ -828,7 +830,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	if (recorded && row_align > 1 && (s->bytesPerRow & (row_align - 1)) != 0) {
 		if (sweet_surface_keep_logged < 32) {
 			sweet_surface_keep_logged++;
-			IOLog("SWEET SURF: 1048 %u keys %ux%u fmt 0x%x row %u %s (%s)\n", props->getCount(), s->width, s->height,
+			IOLog("SWEET SURF: 1258 %u keys %ux%u fmt 0x%x row %u %s (%s)\n", props->getCount(), s->width, s->height,
 			    s->pixelFormat, s->bytesPerRow, keep_row ? "kept" : "rounded", who);
 		}
 		if (keep_mode == 2 && sweet_surface_keep2_logged < 24) {
@@ -842,7 +844,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	if (!keep_row && row_align > 1 && (one_plane || plane_info == NULL || (plane_info->getCount() == 1 && planar_align > 1))) {
 		s->bytesPerRow = (s->bytesPerRow + row_align - 1) & ~(row_align - 1);
 	}
-	uint32_t plane_align = keep_row ? 0 : planar_align;      /* 1048 */
+	uint32_t plane_align = keep_row ? 0 : planar_align;      /* 1258 */
 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 
 	OSArray *planes = one_plane ? NULL : plane_info;
@@ -982,6 +984,7 @@ public:
 	IOMemoryMap  *data;
 	IOMemoryMap  *state;
 	uint32_t      count;
+	int32_t       use[2];       /* 1258: what this client added to the use counts (kern.sweet_surf_inuse != 0) */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -994,6 +997,13 @@ SweetSurfaceRef::free()
 {
 	OSSafeReleaseNULL(data);
 	OSSafeReleaseNULL(state);
+	if (surface != NULL && (use[0] != 0 || use[1] != 0)) {
+		/* 1258: a client that goes (exit, crash, last release) leaves no use count behind, as IOSurface's own */
+		OSAddAtomic(-use[0], &surface->clientUse);
+		OSAddAtomic(-use[1], &surface->clientUse1);
+		use[0] = use[1] = 0;
+		sweet_surface_publish_use(surface);
+	}
 	if (surface != NULL) {
 		sweet_surface_put(surface);
 		surface->release();
@@ -1011,6 +1021,8 @@ public:
 
 OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
 
+static void sweet_inuse_start(void);      /* 1258 */
+
 bool
 IOCoreSurfaceRoot::start(IOService *provider)
 {
@@ -1018,6 +1030,9 @@ IOCoreSurfaceRoot::start(IOService *provider)
 		return false;
 	}
 	sweet_surface_init_lock();
+	if (sweet_surface_inuse_mode() != 0) {
+		sweet_inuse_start();    /* 1258: boot-arg sweetsurfinuse */
+	}
 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
 	registerService();
 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
@@ -1048,6 +1063,7 @@ public:
 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
 	IOReturn trapIncUse(void *id, void *category, void *, void *, void *, void *);    /* 0976 */
 	IOReturn trapDecUse(void *id, void *category, void *, void *, void *, void *);
+	void refUse(void *id, void *category, int delta);       /* 1258 */
 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
@@ -1454,7 +1470,7 @@ static void
 sweet_surface_client_use(void *id, void *category, int delta)
 {
 	static uint32_t logs;
-	if (sweet_surface_scan_mode() == 0) {
+	if (sweet_surface_scan_mode() == 0 && sweet_surface_inuse_mode() == 0) {
 		return;
 	}
 	char name[32];
@@ -1475,20 +1491,426 @@ sweet_surface_client_use(void *id, void *category, int delta)
 }
 
 #define SWEET_SURFACE_STATE_USE         0x18    /* 0983: u64 use counts, category 1 << 32 | category 0 */
+
+/*
+ * 1258: kern.sweet_surf_inuse / boot-arg sweetsurfinuse (default 0).
+ *
+ * IOSurfaceIsInUse (iOS 16.7 IOSurface.framework, IOSurfaceClient: [client + 0x70] = the shared state page) is
+ *   ldr x8, [x0, #0x70]; ldr x8, [x8, #0x18]; cmp x8, #0; cset w0, ne
+ * i.e. "the u64 at state page +0x18 is not 0" (recon/mg/iosurf2.bin +0x4d0, the function after the 0xb5 flag check;
+ * the same layout as hackios MiniIOSurface's minisurf_shared.useCount, whose surf_test checks IsInUse after
+ * Increment/DecrementUseCount). 0983 wrote it for the scanout slots only, so every other surface (CVPixelBufferPool
+ * camera buffers, Photos' decode surfaces, CA's caches) always read "not in use" and pools handed them to the next
+ * writer while backboardd's GPU work still sampled them.
+ *   0      0983 exactly: scanout slots publish clientUse + displayUse, the rest never
+ *   !0     every surface publishes clientUse + displayUse + gpuHold (category 0) and clientUse1 (category 1); a
+ *          client's own use counts go away with it (SweetSurfaceRef::free). gpuHold: a GPU job that uses the surface
+ *          has not landed. A submission that names its BOs (NativeAdrenoAbiSubmitBoListFlag, hakios-metal) holds
+ *          exactly the surfaces behind its named imports; one that does not (older userland) holds every surface
+ *          its client has imported and mapped (an over-estimate). The hold is taken before the job is queued and
+ *          dropped when its fence lands (GPU interrupt; 5 ms poll fallback; 2 s cap; a GPU reset completes the
+ *          fences, so its holds go too; a client's free() waits for its last fence, then kicks).
+ *   bit 1  (2) + "SWEET SURF INUSE: 5s ..." every 5 s
+ *   bit 2  (4) no GPU holds (use counts only: tells the two effects apart)
+ *   bit 3  (8) IOSurfaceLock waits (<= 200 ms) for the GPU: a read-only lock for the last job that writes the
+ *          surface, a read-write lock for the last job that uses it (as IOSurfaceLock syncs with the GPU on iOS)
+ * One GPU ring: jobs of all processes run in order, so GPU-to-GPU use across processes needs no wait.
+ */
+static int sweet_inuse_mode = -1;
+static IOLock *sweet_inuse_lock;
+static bool sweet_inuse_thread;
+static uint32_t sweet_inuse_chan;
+#define SWEET_INUSE_MAX         1024
+static SweetSurface *sweet_inuse_held[SWEET_INUSE_MAX];        /* retained; gpuHold set (sweet_inuse_lock) */
+static uint32_t sweet_inuse_n;
+static struct {
+	uint32_t publish, publishUsed, hold, holdEnd, holdTimeout, holdOverflow, importHit, importMiss, maxHeld;
+	uint32_t subListed, subAll, subNamed, subHeld, subOverflow, cancel, lockWait, lockWaitLate;
+	uint64_t lockWaitNs;
+} sweet_inuse_st;
+extern "C" bool sweet_gpu_fence_done(uint32_t fence);
+extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
+
+extern "C" int
+sweet_surface_inuse_mode(void)
+{
+	if (sweet_inuse_mode < 0) {
+		int m = 0;
+		bool given = PE_parse_boot_argn("sweetsurfinuse", &m, sizeof(m));
+		if (m < 0 || m > 15) {
+			m = 0;
+		}
+		if (OSCompareAndSwap((UInt32)-1, (UInt32)m, (volatile UInt32 *)&sweet_inuse_mode) && given) {
+			IOLog("SWEET SURF INUSE: sweetsurfinuse=%d (1258: 0 slots only as 0983, 1 every surface + GPU holds, "
+			    "+2 5 s line, +4 no GPU holds, +8 lock waits for the GPU)\n", m);
+		}
+	}
+	return sweet_inuse_mode;
+}
+
 void
 sweet_surface_publish_use(SweetSurface *s)
 {
-	if (s == NULL || s->state == NULL || s->scanSlot == 0) {
-		return;         /* only the display's own surfaces: the others stay as before (never in use) */
+	if (s == NULL || s->state == NULL) {
+		return;
 	}
-	int32_t c0 = s->clientUse + s->displayUse, c1 = s->clientUse1;
-	uint64_t v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | (uint32_t)(c0 < 0 ? 0 : c0);
+	int mode = sweet_surface_inuse_mode();
+	uint64_t v;
+	if (mode == 0) {
+		if (s->scanSlot == 0) {
+			return;         /* only the display's own surfaces: the others stay as before (never in use) */
+		}
+		int32_t c0 = s->clientUse + s->displayUse, c1 = s->clientUse1;
+		v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | (uint32_t)(c0 < 0 ? 0 : c0);
+	} else {
+		/* 1258: each term clamped by itself (a stray decrement must not cancel a GPU hold) */
+		int32_t cu = s->clientUse, du = s->displayUse, gu = s->gpuHold, c1 = s->clientUse1;
+		uint32_t c0 = (uint32_t)(cu < 0 ? 0 : cu) + (uint32_t)(du < 0 ? 0 : du) + (uint32_t)(gu < 0 ? 0 : gu);
+		v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | c0;
+		sweet_inuse_st.publish++;
+		sweet_inuse_st.publishUsed += v != 0;
+	}
 	*(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) = v;
+}
+
+/* 1258: every surface in the table publishes again (after a mode change); mode 0 clears the non-slot ones */
+static void
+sweet_inuse_republish(int mode)
+{
+	if (sweet_surface_lock == NULL) {
+		return;
+	}
+	IOLockLock(sweet_surface_lock);
+	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
+		SweetSurface *s = sweet_surface_table[id];
+		if (s == NULL || s->state == NULL) {
+			continue;
+		}
+		if (mode == 0 && s->scanSlot == 0) {
+			*(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) = 0;
+		} else {
+			sweet_surface_publish_use(s);
+		}
+	}
+	IOLockUnlock(sweet_surface_lock);
+}
+
+uint32_t
+sweet_surface_find_pa(uint64_t pa)
+{
+	uint32_t found = 0;
+	if (pa == 0 || sweet_surface_lock == NULL) {
+		return 0;
+	}
+	IOLockLock(sweet_surface_lock);
+	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID && found == 0; id++) {
+		SweetSurface *s = sweet_surface_table[id];
+		if (s == NULL || s->memory == NULL) {
+			continue;
+		}
+		if (s->pa0 == 0) {
+			IOByteCount seg = 0;    /* every surface is wired kernel memory (buffer, slot or physical) */
+			s->pa0 = s->memory->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
+		}
+		if (s->pa0 == pa) {
+			found = id;
+		}
+	}
+	IOLockUnlock(sweet_surface_lock);
+	return found;
+}
+
+void
+sweet_surface_import_stat(bool matched)
+{
+	if (matched) {
+		sweet_inuse_st.importHit++;
+	} else {
+		sweet_inuse_st.importMiss++;
+	}
+}
+
+/* 1258: from the GPU interrupt (sweet_gpu.c gpu_irq): a fence landed, the hold thread looks now (no lock taken) */
+extern "C" void sweet_surface_gpu_kick(void);
+void
+sweet_surface_gpu_kick(void)
+{
+	if (sweet_inuse_lock != NULL && sweet_inuse_n != 0) {
+		IOLockWakeup(sweet_inuse_lock, &sweet_inuse_chan, false);
+	}
+}
+
+static void
+sweet_inuse_stats_locked(void)
+{
+	uint32_t total = 0, used = 0, cu = 0, du = 0, gu = 0;
+	IOLockLock(sweet_surface_lock);
+	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
+		SweetSurface *s = sweet_surface_table[id];
+		if (s == NULL || s->state == NULL) {
+			continue;
+		}
+		total++;
+		used += *(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) != 0;
+		cu += s->clientUse > 0 || s->clientUse1 > 0;
+		du += s->displayUse > 0;
+		gu += s->gpuHold > 0;
+	}
+	IOLockUnlock(sweet_surface_lock);
+	uint64_t oldest = 0, now = mach_absolute_time(), ns = 0;
+	for (uint32_t i = 0; i < sweet_inuse_n; i++) {
+		if (oldest == 0 || sweet_inuse_held[i]->gpuHoldAbs < oldest) {
+			oldest = sweet_inuse_held[i]->gpuHoldAbs;
+		}
+	}
+	if (oldest != 0) {
+		absolutetime_to_nanoseconds(now - oldest, &ns);
+	}
+	IOLog("SWEET SURF INUSE: 5s: mode %d | publishes %u (in use %u) | gpu holds +%u -%u timeout %u overflow %u cancel %u, "
+	    "held %u (max %u, oldest %llu ms) | in use now %u of %u surfaces (client %u display %u gpu %u)\n", sweet_inuse_mode,
+	    sweet_inuse_st.publish, sweet_inuse_st.publishUsed, sweet_inuse_st.hold, sweet_inuse_st.holdEnd,
+	    sweet_inuse_st.holdTimeout, sweet_inuse_st.holdOverflow, sweet_inuse_st.cancel, sweet_inuse_n, sweet_inuse_st.maxHeld,
+	    ns / 1000000, used, total, cu, du, gu);
+	IOLog("SWEET SURF INUSE: 5s: submits listed %u (named %u) all-imports %u, surfaces held %u, overflow %u | imports "
+	    "matched %u unmatched %u | lock waits %u (%llu us, late %u)\n", sweet_inuse_st.subListed, sweet_inuse_st.subNamed,
+	    sweet_inuse_st.subAll, sweet_inuse_st.subHeld, sweet_inuse_st.subOverflow, sweet_inuse_st.importHit,
+	    sweet_inuse_st.importMiss, sweet_inuse_st.lockWait, sweet_inuse_st.lockWaitNs / 1000, sweet_inuse_st.lockWaitLate);
+	bzero(&sweet_inuse_st, sizeof(sweet_inuse_st));
+}
+
+/*
+ * 1258: drops GPU holds whose fence has landed (woken by the GPU interrupt, else every 5 ms while any is held); a
+ * hold older than 2 s is dropped anyway (a fence lost in a GPU reset must not keep a surface in use for ever).
+ */
+static void
+sweet_inuse_loop(void *arg __unused)
+{
+	uint64_t two_s, five_s, poll, next_stats;
+	nanoseconds_to_absolutetime(2000000000ULL, &two_s);
+	nanoseconds_to_absolutetime(5000000000ULL, &five_s);
+	nanoseconds_to_absolutetime(5000000ULL, &poll);      /* a fallback: the GPU interrupt kicks */
+	next_stats = mach_absolute_time() + five_s;
+	IOLockLock(sweet_inuse_lock);
+	for (;;) {
+		uint64_t now = mach_absolute_time();
+		for (uint32_t i = 0; i < sweet_inuse_n;) {
+			SweetSurface *s = sweet_inuse_held[i];
+			bool late = now - s->gpuHoldAbs > two_s;
+			bool done = s->gpuFence != SWEET_SURF_FENCE_PENDING && sweet_gpu_fence_done(s->gpuFence);
+			if (done || late || sweet_inuse_mode == 0 || (sweet_inuse_mode & 4) != 0) {
+				s->gpuHold = 0;
+				sweet_surface_publish_use(s);
+				sweet_inuse_st.holdEnd++;
+				sweet_inuse_st.holdTimeout += late;
+				sweet_inuse_held[i] = sweet_inuse_held[--sweet_inuse_n];
+				IOLockUnlock(sweet_inuse_lock);
+				s->release();   /* maybe the last: SweetSurface::free outside our lock */
+				IOLockLock(sweet_inuse_lock);
+				continue;
+			}
+			i++;
+		}
+		bool logs = (sweet_inuse_mode & 2) != 0;
+		if (logs && now >= next_stats) {
+			sweet_inuse_stats_locked();
+			next_stats = now + five_s;
+		} else if (!logs) {
+			next_stats = now + five_s;
+		}
+		uint64_t dl = sweet_inuse_n != 0 ? now + poll : next_stats;
+		IOLockSleepDeadline(sweet_inuse_lock, &sweet_inuse_chan, dl, THREAD_UNINT);
+	}
+}
+
+static void
+sweet_inuse_start(void)
+{
+	if (sweet_inuse_lock == NULL) {
+		IOLock *l = IOLockAlloc();
+		if (!OSCompareAndSwapPtr(NULL, l, &sweet_inuse_lock)) {
+			IOLockFree(l);
+		}
+	}
+	IOLockLock(sweet_inuse_lock);
+	bool start = !sweet_inuse_thread;
+	sweet_inuse_thread = true;
+	IOLockUnlock(sweet_inuse_lock);
+	if (start && IOCreateThread(sweet_inuse_loop, NULL) == NULL) {
+		IOLog("SWEET SURF INUSE: no hold thread\n");
+		sweet_inuse_thread = false;
+	}
+}
+
+/* sysctl kern.sweet_surf_inuse (bsd/dev/sweet_gpu.c) */
+extern "C" int sweet_surface_inuse_set(int mode);
+int
+sweet_surface_inuse_set(int mode)
+{
+	if (mode < 0 || mode > 15) {
+		return EINVAL;
+	}
+	int old = sweet_surface_inuse_mode();
+	sweet_inuse_mode = mode;
+	if (mode != 0) {
+		sweet_inuse_start();
+	}
+	if ((old == 0) != (mode == 0)) {
+		sweet_inuse_republish(mode);
+	}
+	if (sweet_inuse_lock != NULL) {
+		IOLockWakeup(sweet_inuse_lock, &sweet_inuse_chan, false);      /* mode 0: the holds go now */
+	}
+	IOLog("SWEET SURF INUSE: mode %d (was %d; 1258: 0 slots only as 0983, 1 every surface + GPU holds, +2 5 s line, "
+	    "+4 no GPU holds, +8 lock waits for the GPU)\n", mode, old);
+	return 0;
+}
+
+/* 1258: SweetAccelerator.cpp: the surfaces a v2 submission uses, held before it is queued and until its fence lands */
+void
+sweet_surface_gpu_hold(const uint32_t *ids, const uint64_t *pas, const uint8_t *writes, uint32_t n, uint32_t fence)
+{
+	int mode = sweet_surface_inuse_mode();
+	if (n == 0) {
+		return;
+	}
+	if (mode == 0 || (mode & 4) != 0) {
+		if (fence != SWEET_SURF_FENCE_PENDING && fence != SWEET_SURF_FENCE_CANCEL) {
+			for (uint32_t i = 0; i < n && (mode & 8) != 0; i++) {
+				/* lock waits without holds: still know the writer */
+				SweetSurface *s = writes != NULL && writes[i] ? sweet_surface_copy(ids[i]) : NULL;
+				if (s != NULL) {
+					if (s->pa0 == pas[i]) {
+						s->gpuWriteFence = fence;
+					}
+					s->release();
+				}
+			}
+		}
+		return;
+	}
+	if (!sweet_inuse_thread) {
+		sweet_inuse_start();
+		if (!sweet_inuse_thread) {
+			return;
+		}
+	}
+	bool added = false;
+	uint64_t now = mach_absolute_time();
+	for (uint32_t i = 0; i < n; i++) {
+		SweetSurface *s = sweet_surface_copy(ids[i]);  /* retained: kept by the hold, else released below */
+		if (s == NULL) {
+			continue;
+		}
+		bool kept = false;
+		IOLockLock(sweet_inuse_lock);
+		if (s->pa0 != pas[i]) {
+			/* the id was reused by another surface since the import */
+		} else if (fence == SWEET_SURF_FENCE_CANCEL) {
+			if (s->gpuHold != 0 && s->gpuFence == SWEET_SURF_FENCE_PENDING) {
+				s->gpuHoldAbs = 0;      /* the thread drops it at its next look */
+				sweet_inuse_st.cancel++;
+				added = true;
+			}
+		} else if (s->gpuHold == 0) {
+			if (sweet_inuse_n < SWEET_INUSE_MAX) {
+				kept = true;
+				s->gpuFence = fence;
+				s->gpuHoldAbs = now;
+				s->gpuHold = 1;
+				sweet_inuse_held[sweet_inuse_n++] = s;
+				added = true;
+				sweet_inuse_st.hold++;
+				if (sweet_inuse_n > sweet_inuse_st.maxHeld) {
+					sweet_inuse_st.maxHeld = sweet_inuse_n;
+				}
+				sweet_surface_publish_use(s);
+			} else {
+				sweet_inuse_st.holdOverflow++;
+			}
+		} else if (fence != SWEET_SURF_FENCE_PENDING &&
+		    (s->gpuFence == SWEET_SURF_FENCE_PENDING || (int32_t)(fence - s->gpuFence) > 0)) {
+			s->gpuFence = fence;    /* one ring: the newest fence covers the older jobs */
+			s->gpuHoldAbs = now;
+		} else if (fence == SWEET_SURF_FENCE_PENDING) {
+			s->gpuHoldAbs = now;    /* a new job is being queued: the 2 s cap starts again */
+		}
+		if (fence != SWEET_SURF_FENCE_PENDING && fence != SWEET_SURF_FENCE_CANCEL && writes != NULL && writes[i] &&
+		    s->pa0 == pas[i]) {
+			s->gpuWriteFence = fence;
+		}
+		IOLockUnlock(sweet_inuse_lock);
+		if (!kept) {
+			s->release();
+		}
+	}
+	if (added) {
+		IOLockWakeup(sweet_inuse_lock, &sweet_inuse_chan, false);
+	}
+}
+
+void
+sweet_surface_submit_stat(bool listed, uint32_t named, uint32_t held, bool overflow)
+{
+	if (listed) {
+		sweet_inuse_st.subListed++;
+		sweet_inuse_st.subNamed += named;
+	} else {
+		sweet_inuse_st.subAll++;
+	}
+	sweet_inuse_st.subHeld += held;
+	sweet_inuse_st.subOverflow += overflow;
+}
+
+/*
+ * 1258 bit 3 (8): IOSurfaceLock waits for the GPU as on iOS: read-only for the newest job that writes the surface,
+ * read-write for the newest job that uses it. At most 200 ms (then the lock goes ahead, counted late).
+ */
+static void
+sweet_inuse_lock_wait(SweetSurface *s, bool readOnly)
+{
+	int mode = sweet_surface_inuse_mode();
+	if (mode == 0 || (mode & 8) == 0) {
+		return;
+	}
+	uint32_t f = s->gpuWriteFence;
+	if (!readOnly && s->gpuHold != 0 && s->gpuFence != SWEET_SURF_FENCE_PENDING) {
+		f = s->gpuFence;
+	}
+	if (f == 0 || sweet_gpu_fence_done(f)) {
+		return;
+	}
+	uint64_t t0 = mach_absolute_time(), ns = 0;
+	bool late = sweet_gpu_wait_fence_ns(f, 200000000ULL) != 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	sweet_inuse_st.lockWait++;
+	sweet_inuse_st.lockWaitLate += late;
+	sweet_inuse_st.lockWaitNs += ns;
+}
+
+/* 1258: with kern.sweet_surf_inuse != 0, this client's own use counts (dropped with its reference) */
+void
+IOSurfaceRootUserClient::refUse(void *id, void *category, int delta)
+{
+	if (sweet_surface_inuse_mode() == 0) {
+		return;
+	}
+	IOLockLock(fLock);
+	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
+	if (ref != NULL) {
+		int c = (uintptr_t)category == 1 ? 1 : 0;
+		if (delta > 0) {
+			ref->use[c]++;
+		} else if (ref->use[c] > 0) {
+			ref->use[c]--;
+		}
+	}
+	IOLockUnlock(fLock);
 }
 
 IOReturn
 IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, void *, void *)
 {
+	refUse(id, category, 1);
 	sweet_surface_client_use(id, category, 1);
 	return kIOReturnSuccess;
 }
@@ -1496,6 +1918,7 @@ IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, vo
 IOReturn
 IOSurfaceRootUserClient::trapDecUse(void *id, void *category, void *, void *, void *, void *)
 {
+	refUse(id, category, -1);
 	sweet_surface_client_use(id, category, -1);
 	return kIOReturnSuccess;
 }
@@ -1530,13 +1953,14 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
 }
 
 IOReturn
-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
     void *, void *, void *)
 {
 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
+	sweet_inuse_lock_wait(s, ((uintptr_t)options & kIOSurfaceLockReadOnly) != 0);     /* 1258 bit 3 */
 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
 	s->release();
 	return ret;

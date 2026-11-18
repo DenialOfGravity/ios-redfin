@@ -44,7 +44,9 @@
 #include "SweetSurface.h"
 #include "SweetGPUABI.h"
 #include "SweetTrace.h"     /* 0994 */
-#define SWEET_V2_SUBMIT_FLAGS   (NativeAdrenoAbiSubmitWritesDisplay | NativeAdrenoAbiSubmitSurfaceMask)  /* 1104; 1105: + surface id */
+#define SWEET_V2_SUBMIT_FLAGS   (NativeAdrenoAbiSubmitWritesDisplay | NativeAdrenoAbiSubmitSurfaceMask | \
+                                 NativeAdrenoAbiSubmitBoListFlag)  /* 1104; 1105: + surface id; 1258: + BO list */
+#define SWEET_V2_HOLD_MAX       128     /* 1258: surfaces held per submission (more: counted, not held) */
 #define SWEET_V2_IB_HW  128     /* 1038: = A6_SUBMIT_MAX_HW (bsd/dev/sweet_a6xx.h) */
 
 extern "C" {
@@ -96,6 +98,9 @@ struct SweetV2BO {
 	uint64_t iova;                  /* GPU address while mapped, else 0 */
 	uint64_t pool_pa;               /* allocated: its memory in the GPU pool (sweet_gpu_pool_alloc) */
 	bool imported;                  /* the client's own pages (no CPU-map token) */
+	bool surfChecked;               /* 1258: looked up among the IOSurfaces (kern.sweet_surf_inuse != 0) */
+	uint32_t surfId;                /* 1258: the IOSurface whose byte 0 the import starts at (0: none) ... */
+	uint64_t surfPA;                /* ... and that byte's physical address (ids are reused: checked at each hold) */
 };
 
 class IOAcceleratorES : public IOService {
@@ -221,6 +226,9 @@ class SweetAcceleratorUserClient : public IOUserClient {
 	SweetV2BO *v2Find(uint64_t handle);
 	IOReturn v2NewSlot(IOMemoryDescriptor *md, uint64_t bytes, bool imported, uint64_t *handle);
 	void v2Release(SweetV2BO *bo);
+	bool v2BoSurface(SweetV2BO *bo);         /* 1258 */
+	uint32_t v2CollectSurfaces(const NativeAdrenoAbiSubmitBo *list, uint32_t count, bool listed, uint32_t *ids,
+	    uint64_t *pas, uint8_t *writes);     /* 1258 */
 	/* 0156: freed pool buffers >= 1 MB kept for this client's next allocation of the same size (no new pool
 	 * range, no 10 MB bzero per CoreAnimation intermediate); never shared across clients */
 	struct { IOMemoryDescriptor *md; uint64_t pa, len; } fReuse[16];
@@ -238,6 +246,7 @@ public:
 };
 
 OSDefineMetaClassAndStructors(SweetAcceleratorUserClient, IOUserClient);
+extern "C" void sweet_surface_gpu_kick(void);   /* 1258: SweetSurface.cpp */
 
 /*
  * redfin 1097: the open v2 clients (at most one per GPU window), for the pool dump (kern.sweet_gpu_pool_dump: who holds
@@ -427,6 +436,7 @@ SweetAcceleratorUserClient::free(void)
 	if (fLastFence != 0 && (fV2 ? sweet_gpu_wait_fence_ns(fLastFence, 2000000000ULL) : sweet_gpu_wait_fence(fLastFence, 2000))) {
 		IOLog("SWEET MTL: client freed with fence %u still pending\n", fLastFence);
 	}
+	sweet_surface_gpu_kick();       /* 1258: its jobs have landed (or were reset): their surface holds go now */
 	if (fV2) {
 		sweet_mtl_registry_remove(this);        /* 1097: before anything it holds goes */
 	}
@@ -856,6 +866,64 @@ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
 	bzero(bo, sizeof(*bo));
 }
 
+/* 1258: the IOSurface an imported, GPU-mapped BO is (matched once per import by its first byte's address) */
+bool
+SweetAcceleratorUserClient::v2BoSurface(SweetV2BO *bo)
+{
+	if (bo == NULL || bo->md == NULL || !bo->imported || bo->iova == 0) {
+		return false;
+	}
+	if (!bo->surfChecked) {
+		bo->surfChecked = true;
+		IOByteCount seg = 0;
+		bo->surfPA = bo->md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
+		bo->surfId = sweet_surface_find_pa(bo->surfPA);
+		sweet_surface_import_stat(bo->surfId != 0);
+	}
+	return bo->surfId != 0;
+}
+
+/*
+ * 1258 (kern.sweet_surf_inuse != 0): the IOSurfaces a submission's job uses, to hold (IOSurfaceIsInUse true) until its
+ * fence lands. listed (NativeAdrenoAbiSubmitBoListFlag): exactly the surfaces behind the BOs the submission names (a
+ * write flag each); else (userland that does not name them) every surface this client has imported and mapped (an
+ * over-estimate: an import of a surface it no longer draws is held too). At most SWEET_V2_HOLD_MAX; returns the count.
+ */
+uint32_t
+SweetAcceleratorUserClient::v2CollectSurfaces(const NativeAdrenoAbiSubmitBo *list, uint32_t count, bool listed,
+    uint32_t *ids, uint64_t *pas, uint8_t *writes)
+{
+	uint32_t n = 0;
+	bool overflow = false;
+	IOLockLock(fLock);
+	uint32_t total = listed ? count : fBOCap;
+	for (uint32_t i = 0; i < total; i++) {
+		SweetV2BO *bo = listed ? v2Find(list[i].handle) : &fBO[i];
+		if (!v2BoSurface(bo)) {
+			continue;
+		}
+		uint8_t w = listed ? (list[i].flags & NativeAdrenoAbiSubmitBoWrite) != 0 : 0;
+		uint32_t k = 0;
+		while (k < n && ids[k] != bo->surfId) {
+			k++;        /* the same surface named twice (two imports): once, written if either writes */
+		}
+		if (k < n) {
+			writes[k] |= w;
+			continue;
+		}
+		if (n == SWEET_V2_HOLD_MAX) {
+			overflow = true;
+			break;
+		}
+		ids[n] = bo->surfId;
+		pas[n] = bo->surfPA;
+		writes[n++] = w;
+	}
+	IOLockUnlock(fLock);
+	sweet_surface_submit_stat(listed, listed ? count : 0, n, overflow);
+	return n;
+}
+
 IOReturn
 SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize)
 {
@@ -1142,8 +1210,23 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 		uint32_t nbuf = rq->buffer_count;
 		uint32_t extra = nbuf > NativeAdrenoAbiMaxBuffers ? nbuf - NativeAdrenoAbiMaxBuffers : 0;
 		/* 1104: flags bit 0 (NativeAdrenoAbiSubmitWritesDisplay) accepted, any other bit refused as before */
+		uint32_t base = (uint32_t)(sizeof(NativeAdrenoAbiSubmit) + extra * sizeof(NativeAdrenoAbiSubmitBuffer));
+		const NativeAdrenoAbiSubmitBoList *bl = NULL;
+		const NativeAdrenoAbiSubmitBo *bos = NULL;
+		if ((rq->flags & NativeAdrenoAbiSubmitBoListFlag) != 0 && extra <= SWEET_V2_IB_HW &&
+		    inSize >= base + sizeof(NativeAdrenoAbiSubmitBoList)) {
+			/* 1258: the BOs the job uses follow the buffers */
+			bl = (const NativeAdrenoAbiSubmitBoList *)((const uint8_t *)in + base);
+			bos = (const NativeAdrenoAbiSubmitBo *)(bl + 1);
+			if (bl->reserved != 0 || bl->count > (inSize - base) / sizeof(NativeAdrenoAbiSubmitBo)) {
+				return kIOReturnBadArgument;
+			}
+			base += (uint32_t)(sizeof(NativeAdrenoAbiSubmitBoList) + bl->count * sizeof(NativeAdrenoAbiSubmitBo));
+		} else if ((rq->flags & NativeAdrenoAbiSubmitBoListFlag) != 0) {
+			return kIOReturnBadArgument;
+		}
 		if (nbuf == 0 || nbuf > nmax || nbuf > SWEET_V2_IB_HW || (rq->flags & ~SWEET_V2_SUBMIT_FLAGS) ||
-		    inSize != sizeof(NativeAdrenoAbiSubmit) + extra * sizeof(NativeAdrenoAbiSubmitBuffer)) {
+		    inSize != base) {
 			return kIOReturnBadArgument;
 		}
 		V2_OUT(NativeAdrenoAbiSubmitReply);
@@ -1162,14 +1245,28 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
 			v2_err_log("submit", "wait_fence timeout");
 			return kIOReturnTimeout;
 		}
+		/*
+		 * 1258: the surfaces the job uses read in use from before it is queued (no pool sees them free between the
+		 * submission and the hold) until its fence lands.
+		 */
+		uint32_t hids[SWEET_V2_HOLD_MAX];
+		uint64_t hpas[SWEET_V2_HOLD_MAX];
+		uint8_t hwr[SWEET_V2_HOLD_MAX];
+		uint32_t nhold = 0;
+		if (sweet_surface_inuse_mode() != 0) {
+			nhold = v2CollectSurfaces(bos, bl != NULL ? bl->count : 0, bl != NULL, hids, hpas, hwr);
+			sweet_surface_gpu_hold(hids, hpas, hwr, nhold, SWEET_SURF_FENCE_PENDING);
+		}
 		bool busy = false;
-		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, rq->flags, &busy);
+		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, rq->flags & ~NativeAdrenoAbiSubmitBoListFlag, &busy);
 		if (fence == 0) {
+			sweet_surface_gpu_hold(hids, hpas, hwr, nhold, SWEET_SURF_FENCE_CANCEL);
 			v2_err_log("submit", busy ? "busy (ring full)" : "not ready (GPU down)");
 			return busy ? kIOReturnBusy : kIOReturnNotReady;
 		}
 		fLastFence = fence;
 		rp->fence = fence;
+		sweet_surface_gpu_hold(hids, hpas, hwr, nhold, fence);
 		if (fSystem && fName[0] == 'b') {
 			sweet_swaptrace('S', fence);    /* 0987: SweetFramebuffer.cpp (p swapdone trace) */
 		}

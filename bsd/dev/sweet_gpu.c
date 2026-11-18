@@ -307,6 +307,7 @@ gpu_bus_vote(void)
 extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
 extern void sweet_spi_mask(uint32_t intid, bool masked);
 extern void sweet_scan_gpu_kick(void);          /* SweetFramebuffer.cpp: the scanout thread looks now */
+extern void sweet_surface_gpu_kick(void);       /* 1258: SweetSurface.cpp: the GPU-hold thread looks now */
 /*
  * 1040: on by default on redfin (validated on r64u with p gpuirq 1: backboardd wakeups ~5000/s -> ~200/s, 23k IRQs,
  * 113 late, no fallback, no fps loss); boot-arg sweetgpuirq=0 keeps the old polling, p gpuirq 0|1 switches live.
@@ -353,6 +354,7 @@ gpu_irq(__unused void *arg)
 	SWEET_TRACE(SWT_GPU_IRQ, st, a6_fence_read(&gpu), 0, 0);
 	thread_wakeup((event_t)&gpu_irq_chan);
 	sweet_scan_gpu_kick();
+	sweet_surface_gpu_kick();
 }
 
 static int
@@ -995,6 +997,7 @@ gpu_recover_locked(const char *why)
 	    a6_rd(A6_GREG(0x92c)), a6_rd(A6_GREG(0x92b)), a6_rd(A6_GREG(0x92d)), a6_rd(A6_GREG(0x210)),
 	    a6_rd(A6_GREG(0x908)));
 	lost[recoveries % LOST_RING].lo = done;
+	sweet_surface_gpu_kick();       /* 1258: the reset completes every queued fence: their surface holds go */
 	lost[recoveries % LOST_RING].hi = gpu.fence;
 	/* 0941: whose job hung (the first not done); the fence-owner ring holds it while it is in flight */
 	lost[recoveries % LOST_RING].culprit = (int32_t)(gpu.fence - done) > 0 && (int32_t)(gpu.fence - done) <= (int32_t)A6_TS_SLOTS ?
@@ -1305,7 +1308,7 @@ sweet_gpu_mdp_own(int on)
 /* ---- surfaces ---- */
 
 /*
- * redfin 1048: kern.sweet_surfkeep 0|1 (default 0 = as before; boot-arg sweetsurfkeep=1): surfaces from a recorded key
+ * redfin 1258: kern.sweet_surfkeep 0|1 (default 0 = as before; boot-arg sweetsurfkeep=1): surfaces from a recorded key
  * set (<= 9 keys, explicit IOSurfaceBytesPerRow) keep their row, no 0159/0940 rounding (iokit/Kernel/arm/SweetSurface.cpp,
  * sweet_surface_layout). Takes effect for surfaces created after the change.
  */
@@ -1325,11 +1328,11 @@ sysctl_sweet_surfkeep SYSCTL_HANDLER_ARGS
 	}
 	sweet_surfkeep = (uint32_t)value;
 	printf("SWEET SURF: surfkeep %d (%s; new surfaces)\n", value, value == 2 ? "1096: archive-decode surfaces keep their row" :
-	    value == 1 ? "1048: recorded key sets keep their row" : "every row 64-aligned");
+	    value == 1 ? "1258: recorded key sets keep their row" : "every row 64-aligned");
 	return 0;
 }
 SYSCTL_PROC(_kern, OID_AUTO, sweet_surfkeep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    0, 0, sysctl_sweet_surfkeep, "I", "SWEET SURF: explicit rows kept: 0 none, 1 <= 9 keys (1048), 2 CA archive decode only (1096, default)");
+    0, 0, sysctl_sweet_surfkeep, "I", "SWEET SURF: explicit rows kept: 0 none, 1 <= 9 keys (1258), 2 CA archive decode only (1096, default)");
 
 /* redfin 1096: kern.sweet_surfpad (iokit/Kernel/arm/SweetSurface.cpp sweet_surface_pad): allocations cover whole 4-row groups */
 extern uint32_t sweet_surfpad, sweet_surfpad_grew;
@@ -1954,6 +1957,28 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, 
 SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
 SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
+
+/*
+ * 1258: kern.sweet_surf_inuse 0..15 (boot-arg sweetsurfinuse sets the start value; default 0 = 0983 exactly): non-zero
+ * = every IOSurface publishes its use count at state page +0x18 (what IOSurfaceIsInUse reads): userland's use counts,
+ * the display's holds and the GPU jobs that use it (until their fence lands). +2 a 5 s klog line "SWEET SURF INUSE:
+ * 5s: ...", +4 no GPU holds, +8 IOSurfaceLock waits for the GPU. SweetSurface.cpp sweet_surface_inuse_set.
+ */
+extern int sweet_surface_inuse_mode(void);
+extern int sweet_surface_inuse_set(int mode);
+static int
+sysctl_sweet_surf_inuse SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = 0, changed = 0;
+	int error = sysctl_io_number(req, sweet_surface_inuse_mode(), sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	return sweet_surface_inuse_set(value);
+}
+SYSCTL_PROC(_kern, OID_AUTO, sweet_surf_inuse, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_sweet_surf_inuse, "I", "SWEET SURF: IOSurface use counts (0 slots only, 1 all + GPU holds, +2 log, +4 no GPU, +8 lock waits)");
 
 /* ---- buffers and submissions for Metal (iokit/Kernel/arm/SweetAccelerator.cpp) ---- */
 

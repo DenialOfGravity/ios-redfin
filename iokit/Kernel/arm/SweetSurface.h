@@ -55,6 +55,12 @@ public:
 	uint32_t                  ubwcMeta, ubwcMetaPitch, ubwcMetaSize, ubwcData, ubwcDataPitch;
 	uint8_t                   ubwcReady;
 	volatile uint8_t          ubwcLive;
+	/* 1258 (kern.sweet_surf_inuse, SweetSurface.cpp sweet_inuse_*): GPU holds */
+	uint64_t                  pa0;          /* physical address of byte 0 (GPU imports are matched by it) */
+	volatile SInt32           gpuHold;      /* 1 while a GPU job that uses it has not landed */
+	uint32_t                  gpuFence;     /* the newest such job's fence (0: being submitted) */
+	uint32_t                  gpuWriteFence; /* the newest job that writes it (0: none known) */
+	uint64_t                  gpuHoldAbs;   /* when the hold began or was last moved on */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -99,6 +105,23 @@ void sweet_surface_scan_reserve(void);
  * the surface on screen as in use, as on an iPhone (IOMFB keeps a use count on what it scans out).
  */
 void sweet_surface_publish_use(SweetSurface *s);
+/*
+ * 1258: kern.sweet_surf_inuse (boot-arg sweetsurfinuse, default 0 = 0983 exactly). Non-zero: every surface publishes
+ * clientUse + displayUse + gpuHold at state page +0x18 (what IOSurfaceIsInUse reads); bit 1 (2) a 5 s klog line,
+ * bit 2 (4) no GPU holds (use counts only), bit 3 (8) IOSurfaceLock waits for the GPU jobs that use the surface.
+ * GPU imports (SweetAccelerator v2 BoImport) are matched to a surface by the physical address of their first byte.
+ */
+extern "C" int sweet_surface_inuse_mode(void);
+uint32_t sweet_surface_find_pa(uint64_t pa);    /* id of the surface whose byte 0 is at pa, else 0 */
+#define SWEET_SURF_FENCE_PENDING        0u              /* hold before the submission: its fence is not known yet */
+#define SWEET_SURF_FENCE_CANCEL         0xffffffffu     /* the submission failed: pending holds go */
+/*
+ * Each surface (by id, if its byte 0 is still at pas[i]) is in use until fence lands; writes[i]: the job writes it.
+ * Called with SWEET_SURF_FENCE_PENDING before the submission and with its fence (or CANCEL) after it.
+ */
+void sweet_surface_gpu_hold(const uint32_t *ids, const uint64_t *pas, const uint8_t *writes, uint32_t n, uint32_t fence);
+void sweet_surface_import_stat(bool matched);
+void sweet_surface_submit_stat(bool listed, uint32_t named, uint32_t held, bool overflow);
 IOMemoryDescriptor *sweet_surface_scan_md(uint32_t slot, uint64_t *pa);
 
 /*
