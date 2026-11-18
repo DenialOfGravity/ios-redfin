@@ -224,6 +224,7 @@ st_irq_asserted(void)
 #define ST_INTR_CFG_ON          ((3u << 5) | (1u << 4))        /* apps, raw status, level low; | 1 enables */
 extern bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
 extern void sweet_spi_mask(uint32_t intid, bool masked);
+extern bool sweet_fpc_tlmm_irq(void);  /* 1190: bsd/dev/sweet_fpc.c */
 static volatile bool st_irq_on;
 static volatile uint32_t st_irqs, st_irq_others;
 static volatile uint64_t st_irq_t;      /* 0945: mach time of the last attention interrupt */
@@ -237,6 +238,8 @@ st_irq(__unused void *arg)
 		st_irq_t = mach_absolute_time();
 		st_irqs++;
 		thread_wakeup(&st_sleep_chan);
+	} else if (sweet_fpc_tlmm_irq()) {
+		/* 1190: the fingerprint sensor's gpio112 shares the TLMM summary interrupt */
 	} else if (++st_irq_others > 1000) {
 		sweet_spi_mask(ST_IRQ_INTID, true);     /* another pin holds the summary line */
 		st_irq_on = false;
