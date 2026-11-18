@@ -1,0 +1,4 @@
+
+# redfin: the macOS SDK header the staged sources need, copied in by the build
+bsd/pthread/sweet_libpthread/TargetConditionals.h
+bsd/sweet_hfs/TargetConditionals.h
