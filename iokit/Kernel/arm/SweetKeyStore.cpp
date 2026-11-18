@@ -40,6 +40,8 @@ int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
 int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
 void sweet_pc_lock(void);
 int sweet_pc_locked(void);
+int sweet_pc_bio_pending(void);                 /* 1214 */
+int sweet_pc_bio_confirm(int *was_pending);     /* 1214 */
 void sweet_acm_publish(void);
 void sweet_aks_notify(void);
 }
@@ -272,10 +274,14 @@ pc_der_pair(uint8_t *p, const char *key, uint32_t value)
 }
 
 static IOReturn
-pc_device_state(IOExternalMethodArguments *args)
+pc_device_state(IOExternalMethodArguments *args, bool ext)
 {
 	uint32_t ss, sls, sfa, sb;
 	sweet_pc_aks_state(&ss, &sls, &sfa, &sb);
+	if (ext && sls == 0 && sweet_pc_bio_pending()) {
+		sls = 7;        /* 1214: InBioUnlock (extended state only), see sweet_passcode.c */
+		IOLog("SWEET KS: extended device state: lock state 7 (InBioUnlock)\n");
+	}
 	const struct {
 		const char *key;
 		uint32_t value;
@@ -351,7 +357,7 @@ sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret, 
 	case kAKSGetExtDeviceState:
 		*logall = false;
 		args->scalarOutputCount = 0;
-		*ret = pc_device_state(args);
+		*ret = pc_device_state(args, selector == kAKSGetExtDeviceState);
 		return true;
 	case kAKSLockDevice:
 	case kAKSLockDeviceNow:
@@ -361,6 +367,14 @@ sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret, 
 		return true;
 	case kAKSUnlockDevice:
 		args->scalarOutputCount = 0;
+		if (ns >= 3 && in[2] == 0) {
+			/* 1214: no passcode = SpringBoard confirming a Touch ID unlock (kern.sweet_passcode_biostate) */
+			int wp = 0, e = sweet_pc_bio_confirm(&wp);
+			if (e != ENOTSUP) {
+				*ret = pc_ret(e);
+				return true;
+			}
+		}
 		*ret = ns >= 3 ? pc_ret(sweet_pc_check_user(in[1], (uint32_t)in[2], 1)) : kIOReturnBadArgument;
 		return true;
 	case kAKSUnlockBag:
