@@ -531,6 +531,8 @@ static int match_deliver(int32_t ta_status, uint32_t fid, int32_t score, uint32_
 		why = FPCD_MW_UNKNOWN_FID;
 	else if (stat(ALLOW_MATCH_PATH, &sb) && fpc_sysctl_u32("kern.sweet_mesa_match") != 2)
 		why = FPCD_MW_NO_ALLOW_FILE;
+	else if (fpc_sysctl_u32("kern.sweet_mesa_match") == 2 && !require_hat)
+		why = 0;	/* owner's unverified-match mode: the HAT field check is informational only */
 	else if (hat == FPCD_HAT_BAD || hat == FPCD_HAT_REFUSED || (require_hat && hat != FPCD_HAT_VERIFIED))
 		why = FPCD_MW_HAT_REFUSED;
 	if (why) {
