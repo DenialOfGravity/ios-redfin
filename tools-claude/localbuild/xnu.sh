@@ -44,6 +44,18 @@ apple() {	# project -> $SRC/<project>-<tag> (shallow clone at the 13.5 tag)
 }
 
 # ---- 1. patched source ----
+PREP=$X/prep
+if [ -n "${XNU_TREE:-}" ]; then
+	# xnu-tree: the source is a git tree (ios-redfin branch xnu-main) with every change committed; no patching here.
+	# Only the macOS SDK's TargetConditionals.h is added (not in git: the staged libpthread and HFS include it).
+	rm -rf "$PREP"; mkdir -p "$PREP/xnu"
+	git -C "$XNU_TREE" archive HEAD | tar x -C "$PREP/xnu" || die "xnu tree: git archive"
+	for d in bsd/pthread/sweet_libpthread bsd/sweet_hfs; do
+		[ -d "$PREP/xnu/$d" ] || continue
+		cp "$MAC_SDK/usr/include/TargetConditionals.h" "$PREP/xnu/$d/" 2>/dev/null || cp "$TC/TargetConditionals.h" "$PREP/xnu/$d/" || die "TargetConditionals.h"
+	done
+	say "source: xnu tree $(git -C "$XNU_TREE" rev-parse HEAD) ($(git -C "$XNU_TREE" rev-list --count HEAD) commits)"
+else
 PRISTINE=$(apple xnu)
 [ "$(basename "$PRISTINE")" = "$XNU_TAG" ] || die "13.5's xnu is $(basename "$PRISTINE"), expected $XNU_TAG"
 DXB=$SRC/dxb
@@ -135,6 +147,7 @@ else:
     print('linux: kalloc.h pattern not found (changed upstream?)')
 PY
 ) || die "patching failed"
+fi
 mkdir -p "$X/xnu"
 say "sync into $X/xnu (changed files only):"
 rsync -rlc --no-times --delete --exclude .git --itemize-changes "$PREP/xnu/" "$X/xnu/" | grep -v '^\.' | head -60 || true

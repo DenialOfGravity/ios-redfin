@@ -1,6 +1,8 @@
 #!/bin/bash
 # Local builds: the same steps as .github/workflows/{shim,userland,metal2,xnu}.yml, on Linux.
-#   build.sh TARGET [REF]       TARGET shim | userland | metal2 | xnu | hmetal | hmesa | hmetal-mesa;  REF branch or commit (default redfin-qol)
+#   build.sh TARGET [REF]       TARGET shim | userland | metal2 | xnu | xnu-tree | hmetal | hmesa | hmetal-mesa;  REF branch or commit (default redfin-qol)
+#   xnu-tree builds REF of the git-tree kernel (ios-redfin branch xnu-main or xnu/*, default xnu-main) instead of the
+#   xnu/patches series. It shares xnu's build tree, so it also takes xnu's lock.
 # Source: REF of DenialOfGravity/ios-flame-redfin, fetched fresh each run into $WORK/TARGET/repo (the build trees
 # beside it are kept, so rebuilds are incremental). Result: $P/builds/TARGET/<REF>-<sha>/ (+ BUILD.txt, build.log).
 # Env: XNU_CLEAN=1 (xnu: ignore the incremental tree), XNU_KEEP_GOING=0 (stop at the first error), JOBS=N.
@@ -11,13 +13,17 @@ P=${P:-/mnt/d/ClaudeProjects/iOS_Pixel5}
 T=${1:?target}; REF=${2:-redfin-qol}
 TW=$WORK/$T; R=$TW/repo
 mkdir -p "$TW"
+MIRROR=$SRC/ios-redfin.git
+if [ "$T" = xnu-tree ]; then
+	REF=${2:-xnu-main}; [ -n "${XNU_TREE_URL:-}" ] && REPO_URL=$XNU_TREE_URL
+	exec 8>"$WORK/xnu.lock"; flock -w 1800 8 || die "an xnu build is still running"	# same $WORK/xnu build tree
+fi
 exec 9>"$TW.lock"; flock -w 1800 9 || die "another $T build is still running"	# one build per target at a time (queue)
 START=$(date +%s)
 
 # ---- source at REF ----
 # REF "agent/stage/NAME.bundle/BRANCH" (bundle path under $P) builds BRANCH from a git bundle instead of GitHub (commit not pushed yet)
 case $REF in *.bundle/*) REPO_URL=$P/${REF%%.bundle/*}.bundle; REF=${REF#*.bundle/}; [ -f "$REPO_URL" ] || die "no bundle $REPO_URL";; esac
-MIRROR=$SRC/ios-redfin.git
 [ -d "$MIRROR" ] || git init -q --bare "$MIRROR"
 git -C "$MIRROR" fetch -q "$REPO_URL" "+$REF:refs/lb/$T" || die "cannot fetch $REF"	# per target: parallel builds
 SHA=$(git -C "$MIRROR" rev-parse "refs/lb/$T")
@@ -214,6 +220,7 @@ build_hmetal-mesa() {
 
 # ---- xnu (xnu.yml) ----
 build_xnu() { bash "$HERE/xnu.sh" "$R" "$OUT"; }
+build_xnu-tree() { XNU_TREE=$R bash "$HERE/xnu.sh" "$R" "$OUT"; }
 
 LOG=$OUT/build.log
 say "log -> ${LOG#$P/}"
