@@ -28,3 +28,4 @@ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitc
 iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
 iokit/Kernel/arm/SweetMesa.cpp                                   optional iokitcpp
+iokit/Kernel/arm/SweetACM.cpp                                    optional iokitcpp

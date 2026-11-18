@@ -25,6 +25,23 @@
 #include <libkern/c++/OSString.h>
 #include <sys/proc.h>
 
+/*
+ * 1195: passcode support (bsd/dev/sweet_passcode.c), only when kern.sweet_passcode != 0. At 0 every selector
+ * takes the switch below exactly as before. The passcode is an authentication gate, never a key: wrap/unwrap
+ * (10/11) ignore it and the file layer never sees a lock (design: passcode-acm-design-2026-11-18.md).
+ */
+extern "C" {
+#include <sys/errno.h>
+int sweet_pc_mode(void);
+int sweet_pc_is_set(void);
+void sweet_pc_aks_state(uint32_t *ss, uint32_t *sls, uint32_t *sfa, uint32_t *sb);
+int sweet_pc_check_user(uint64_t uaddr, uint32_t len, int unlock);
+int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
+int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
+void sweet_pc_lock(void);
+void sweet_acm_publish(void);
+}
+
 /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
 enum {
 	kAKSOpen             = 0,
@@ -80,6 +97,9 @@ AppleKeyStore::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
 	registerService();
 	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
+	if (sweet_pc_mode() != 0) {
+		sweet_acm_publish();    /* 1195: boot-arg sweetpasscode=1..3 */
+	}
 	return true;
 }
 
@@ -173,6 +193,194 @@ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
 }
 
+/* ---- 1195: passcode-mode selectors (kern.sweet_passcode != 0) ---- */
+enum {
+	kAKSLockDevice       = 8,       /* aks_lock_device (32 = lock now) */
+	kAKSChangeSecret     = 15,      /* aks_change_secret(_se): 11 scalars */
+	kAKSGeneration       = 40,
+	kAKSVerifyPassword   = 42,      /* packed struct, item 0 = passcode */
+	kAKSLockDeviceNow    = 32,
+	kAKSChangeSecretEpilogue = 105,
+};
+#define SWEET_AKS_BAD_PASSCODE  ((IOReturn)0xe007c008)  /* MobileKeyBag -> -14; SEP status -8 */
+
+static IOReturn
+pc_ret(int e)
+{
+	switch (e) {
+	case 0:
+		return kIOReturnSuccess;
+	case EAUTH:
+		return SWEET_AKS_BAD_PASSCODE;
+	case EBUSY:
+		return kIOReturnNotPermitted;   /* backoff */
+	case EFAULT:
+	case EINVAL:
+		return kIOReturnBadArgument;
+	default:
+		return kIOReturnError;
+	}
+}
+
+/* SEQUENCE { UTF8String key, INTEGER value } with a minimal two's-complement INTEGER (0..2^31). */
+static uint32_t
+pc_der_pair(uint8_t *p, const char *key, uint32_t value)
+{
+	uint8_t iv[5];
+	uint32_t il = 0, klen = (uint32_t)strlen(key), n = 0;
+	for (int sh = 24; sh >= 0; sh -= 8) {
+		uint8_t b = (uint8_t)(value >> sh);
+		if (il == 0 && b == 0 && sh > 0) {
+			continue;
+		}
+		if (il == 0 && (b & 0x80)) {
+			iv[il++] = 0;
+		}
+		iv[il++] = b;
+	}
+	p[n++] = 0x30;
+	p[n++] = (uint8_t)(2 + klen + 2 + il);
+	p[n++] = 0x0c;
+	p[n++] = (uint8_t)klen;
+	memcpy(p + n, key, klen);
+	n += klen;
+	p[n++] = 0x02;
+	p[n++] = (uint8_t)il;
+	memcpy(p + n, iv, il);
+	return n + il;
+}
+
+static IOReturn
+pc_device_state(IOExternalMethodArguments *args)
+{
+	uint32_t ss, sls, sfa, sb;
+	sweet_pc_aks_state(&ss, &sls, &sfa, &sb);
+	const struct {
+		const char *key;
+		uint32_t value;
+	} fields[] = {
+		{ "ss", ss }, { "sls", sls }, { "sb", sb }, { "sfa", sfa },
+		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+	};
+	uint8_t buf[160];
+	uint32_t n = 2;
+	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		n += pc_der_pair(buf + n, fields[i].key, fields[i].value);
+	}
+	buf[0] = 0x31;
+	buf[1] = (uint8_t)(n - 2);
+	return sweet_aks_struct_out(args, buf, n);
+}
+
+/* aks_pack_data: u32 count, then per item u32 len + data padded to 4. Item 0 = passcode. */
+static IOReturn
+pc_verify_packed(IOExternalMethodArguments *args)
+{
+	uint8_t buf[512];
+	uint32_t len;
+	if (args->structureInputDescriptor != NULL) {
+		len = (uint32_t)args->structureInputDescriptor->getLength();
+		if (len > sizeof(buf) || args->structureInputDescriptor->prepare() != kIOReturnSuccess) {
+			return kIOReturnBadArgument;
+		}
+		args->structureInputDescriptor->readBytes(0, buf, len);
+		args->structureInputDescriptor->complete();
+	} else {
+		len = args->structureInputSize;
+		if (args->structureInput == NULL || len > sizeof(buf)) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(buf, args->structureInput, len);
+	}
+	IOReturn r = kIOReturnBadArgument;
+	uint32_t cnt, ilen;
+	if (len >= 8) {
+		memcpy(&cnt, buf, 4);
+		memcpy(&ilen, buf + 4, 4);
+		if (cnt >= 1 && ilen <= len - 8) {
+			r = pc_ret(sweet_pc_check_kbuf(buf + 8, ilen, 0));
+		}
+	}
+	bzero(buf, sizeof(buf));
+	return r;
+}
+
+/* true = handled here (ret set); false = take the existing switch. */
+static bool
+sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret, bool *logall)
+{
+	uint32_t ns = args->scalarInputCount, no = args->scalarOutputCount;
+	const uint64_t *in = args->scalarInput;
+	*logall = true;
+	switch (selector) {
+	case kAKSGetLockState: {
+		uint32_t ss, sls, sfa, sb;
+		*logall = false;
+		if (no < 1) {
+			*ret = kIOReturnBadArgument;
+			return true;
+		}
+		sweet_pc_aks_state(&ss, &sls, &sfa, &sb);
+		args->scalarOutput[0] = ss;
+		args->scalarOutputCount = 1;
+		*ret = kIOReturnSuccess;
+		return true;
+	}
+	case kAKSGetDeviceState:
+	case kAKSGetExtDeviceState:
+		*logall = false;
+		args->scalarOutputCount = 0;
+		*ret = pc_device_state(args);
+		return true;
+	case kAKSLockDevice:
+	case kAKSLockDeviceNow:
+		sweet_pc_lock();
+		args->scalarOutputCount = 0;
+		*ret = kIOReturnSuccess;
+		return true;
+	case kAKSUnlockDevice:
+		args->scalarOutputCount = 0;
+		*ret = ns >= 3 ? pc_ret(sweet_pc_check_user(in[1], (uint32_t)in[2], 1)) : kIOReturnBadArgument;
+		return true;
+	case kAKSUnlockBag:
+		if (ns < 3 || in[0] != SWEET_AKS_SYSTEM_HANDLE) {
+			return false;   /* other bags: as before */
+		}
+		args->scalarOutputCount = 0;
+		*ret = pc_ret(sweet_pc_check_user(in[1], (uint32_t)in[2], 0));
+		return true;
+	case kAKSChangeSecret:
+		if (ns < 7) {
+			*ret = kIOReturnBadArgument;
+			return true;
+		}
+		*ret = pc_ret(sweet_pc_change_user(in[3], (uint32_t)in[4], in[5], (uint32_t)in[6]));
+		if (no >= 1) {
+			args->scalarOutput[0] = 0;
+			args->scalarOutputCount = 1;
+		}
+		return true;
+	case kAKSChangeSecretEpilogue:
+	case kAKSGeneration:
+		for (uint32_t i = 0; i < no; i++) {
+			args->scalarOutput[i] = 0;
+		}
+		*ret = kIOReturnSuccess;
+		return true;
+	case kAKSVerifyPassword:
+		args->scalarOutputCount = 0;
+		*ret = pc_verify_packed(args);
+		return true;
+	case kAKSSaveBag:
+		args->scalarOutputCount = 0;
+		*ret = sweet_aks_struct_out(args, "SWEETKB1", 8);
+		return true;
+	default:
+		*logall = false;
+		return false;
+	}
+}
+
 IOReturn
 AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
@@ -186,7 +394,10 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	uint32_t out_struct = sweet_aks_struct_out_size(args);
 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
 
-	switch (selector) {
+	bool logall = false;
+	bool pc = sweet_pc_mode() != 0 && sweet_aks_pc(selector, args, &ret, &logall);
+
+	if (!pc) switch (selector) {
 	case kAKSOpen:
 	case kAKSUnloadBag:
 	case kAKSSetSystem:
@@ -279,7 +490,7 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	}
 
 	static uint32_t logged[128];            /* a few lines per selector */
-	if (selector >= 128 || logged[selector]++ < 5) {
+	if (logall || selector >= 128 || logged[selector]++ < 5) {
 		char name[32];
 		proc_selfname(name, sizeof(name));
 		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,

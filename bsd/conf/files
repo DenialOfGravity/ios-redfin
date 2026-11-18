@@ -125,6 +125,7 @@ bsd/dev/sweet_cpufreq.c			standard
 bsd/dev/sweet_thermal.c			standard
 bsd/dev/sweet_poke.c			standard
 bsd/dev/sweet_files.c			standard
+bsd/dev/sweet_passcode.c		standard
 bsd/dev/sweet_pmem.c			standard
 bsd/dev/sweet_a6xx.c			standard
 bsd/dev/sweet_gpu.c			standard
