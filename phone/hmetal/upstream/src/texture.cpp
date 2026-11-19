@@ -2,7 +2,7 @@
 #include "hakios-metal/render.hpp"
 
 #ifndef HM_YCBCR_SYNC_DEFAULT
-#define HM_YCBCR_SYNC_DEFAULT 1   // (redfin hm-ycsync, on since ws-cam-lines) HM_YCBCR_SYNC unset: stable copies + deferred publish; 0 = hmyc
+#define HM_YCBCR_SYNC_DEFAULT 0   // (redfin hm-ycsync) HM_YCBCR_SYNC unset: as hmyc until the phone check
 #endif
 
 #include <algorithm>
