@@ -3939,11 +3939,3 @@ path = "/var/local/camera-afdone"
 source = "agent/stage/flags/one"
 sha256 = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
 mode = "644"
-
-[[file]]
-path = "/var/local/loc.on"
-source = "state/files/locd/loc.on"
-sha256 = "f1556def103b89b21cb6ffbe51f1be13c9df4e8a804cf7bcd3a7353cdc49bbcf"
-mode = "644"
-owner = "0:0"
-note = "2026-11-19 locreset fix: pds=1 = sweetlocd answers locationd's PDS (tracking state from the real LOC session) via the kernel relay (kern.sweet_qmux_pds 1, kern.sweet_mqrtr_aux 1). Before, the router's canned PDS answers reported tracking inactive after locationd's SET_AUTO_TRACKING_STATE 1 -> locationd 'wrong state track' TIMEOUT -> CommCenter HardReset 'AP-triggered: locationd PDS - wrong tracking state' ~2-3 min after every boot (cell data lost; 14:50 reset preceded the 14:52 npaschedule modem crash)"
