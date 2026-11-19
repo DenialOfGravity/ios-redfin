@@ -13,9 +13,10 @@
  * (~625-670 KB). They are in no picture of the chain (ws-cam-lines: the kernel's frames, the plug-in's buffers and
  * VideoToolbox's output all dumped clean; the period followed the read speed).
  *
- * So: the slot is read again (up to PMEMSNAP_READS times, default 4) while the first read has runs of at least
- * 256 black pixels (B, G, R == 0) in reading order, and each such run's pixels are taken from a later read where that
- * one has picture there (pixel by pixel), until a read mends nothing; black that is black in two reads alike stays.
+ * So: where the first read has runs of 256 pixels to 64 rows of black (B, G, R == 0, in reading order, the rows'
+ * padding skipped), those bytes are read again (up to PMEMSNAP_READS reads in all, default 12, 20 ms apart: they are
+ * small) and each black pixel is taken from a later read that has picture there; a run three reads in a row mend
+ * nothing of is the picture's own black and stays.
  * Prints "PA LEN STRIDE MS READS RUNS LEFT MENDED" (runs: black runs in the first read; left: runs still to read
  * again when the reads ran out; mended: pixels). PMEMSNAP_VERBOSE=1: a line per read on stderr.
  * PMEMSNAP_READS=1: one plain read (the old behaviour).
@@ -32,6 +33,9 @@
 
 #define REGS_PA         0x0ae05000ull
 #define RUN_MIN         256     /* pixels: shorter black runs are left alone (text, edges) */
+#define RUN_MAX_ROWS    64      /* longer black runs are the picture's (a redraw caught by the read is ~12-14 rows) */
+#define STILL_READS     3       /* a run black in this many reads in a row (PAUSE_US apart) is the picture's own */
+#define PAUSE_US        20000   /* between reads: not the same moment of the next redraw */
 
 static uint64_t
 now_ms(void)
@@ -56,7 +60,7 @@ at(size_t k)
 	return (k / g_width) * g_stride + (k % g_width) * 4;
 }
 
-struct run { size_t i, j; };            /* visible pixels [i, j) in reading order */
+struct run { size_t i, j; int still; };        /* visible pixels [i, j) in reading order; reads that mended none */
 
 /* the runs of at least RUN_MIN black pixels of a within [i, j), appended to out (n, cap); returns their count */
 static size_t
@@ -74,7 +78,7 @@ find_runs(const uint8_t *a, size_t i, size_t j, struct run **out, size_t *n, siz
 		while (k < j && black(a + at(k))) {
 			k++;
 		}
-		if (k - i >= RUN_MIN) {
+		if (k - i >= RUN_MIN && k - i <= (size_t)RUN_MAX_ROWS * g_width) {
 			if (*n == *cap) {
 				*cap = *cap ? *cap * 2 : 256;
 				*out = realloc(*out, *cap * sizeof(**out));
@@ -82,7 +86,7 @@ find_runs(const uint8_t *a, size_t i, size_t j, struct run **out, size_t *n, siz
 					exit(1);
 				}
 			}
-			(*out)[(*n)++] = (struct run){ i, k };
+			(*out)[(*n)++] = (struct run){ i, k, 0 };
 			found++;
 		}
 		i = k;
@@ -95,7 +99,7 @@ main(int argc, char **argv)
 {
 	uint8_t regs[64];
 	uint32_t rows = argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 0) : 2436, pa, stride;
-	int fd, reads = getenv("PMEMSNAP_READS") ? atoi(getenv("PMEMSNAP_READS")) : 4, done = 1;
+	int fd, reads = getenv("PMEMSNAP_READS") ? atoi(getenv("PMEMSNAP_READS")) : 12, done = 1;
 	unsigned first_runs = 0, left = 0;
 	size_t mended = 0, mended_all = 0;
 
@@ -132,8 +136,9 @@ main(int argc, char **argv)
 		return 1;
 	}
 	/*
-	 * Read again only the bytes under the runs; a run the new read mends nothing of is the picture's own black and is
-	 * dropped; a run it mends keeps what is still black in it (>= RUN_MIN) for the next read.
+	 * Read again only the bytes under the runs (of RUN_MIN to RUN_MAX_ROWS rows' pixels), PAUSE_US apart; what a read
+	 * has picture for is taken from it, and what is still black stays a run; a run that STILL_READS reads in a row
+	 * mend nothing of is the picture's own black and is dropped.
 	 */
 	struct run *runs = NULL, *next = NULL;
 	size_t n = 0, cap = 0, nn = 0, ncap = 0;
@@ -143,6 +148,7 @@ main(int argc, char **argv)
 		uint8_t r2[64];
 		uint32_t pa2;
 
+		usleep(PAUSE_US);
 		if (pread(fd, r2, 64, (off_t)REGS_PA) != 64) {
 			break;
 		}
@@ -164,7 +170,22 @@ main(int argc, char **argv)
 			}
 			mended += got;
 			if (got > 0) {
+				size_t from_n = nn;
+
 				find_runs(a, runs[r].i, runs[r].j, &next, &nn, &ncap);
+				for (size_t q = from_n; q < nn; q++) {
+					next[q].still = 0;
+				}
+			} else if (runs[r].still + 1 < STILL_READS) {
+				if (nn == ncap) {
+					ncap = ncap ? ncap * 2 : 256;
+					next = realloc(next, ncap * sizeof(*next));
+					if (next == NULL) {
+						return 1;
+					}
+				}
+				next[nn] = runs[r];
+				next[nn++].still++;
 			}
 		}
 		mended_all += mended;
