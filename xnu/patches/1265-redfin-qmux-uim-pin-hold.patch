@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 13:55:00 +0100
+Subject: [PATCH] redfin 1265: hold CommCenter's cached SIM PIN unlock until the modem has loaded the WLAN PD
+
+Every boot since 11-17 21:05 the modem crashes ~10-20 s after READY (SFR "EX:kernel:0x0:ps_rm:0xd1/0xd2") and never
+comes back: CommCenter then hard-resets the baseband every ~7 min (ATCS_TIMEOUT), the status bar says Searching and the
+kernel link logs "cannot send ... error 60". 11-17 21:05 is the first boot with CommCenter's SIM PIN cache valid (the
+PIN was typed in the native prompt that session): the cache unlocks the SIM ~2 s after READY, while the modem is still
+reading wlanmdsp.mbn (3.8 MB TFTP from wland). Before, the PIN came minutes later and the modem never crashed.
+Test 11-19 (rsim2): the same UIM Verify PIN answered locally with DEVICE_NOT_READY -> wlanmdsp loaded (3722 blocks),
+0 link failures, no crash; CommCenter retried every ~35 s ("VerifyPin returns error 0x34 ... try again"); once
+forwarded (245 s) the SIM unlocked, the modem registered, SMS sent. rsim1 (kern.sweet_wds_bindfix=0) still crashed,
+so 1158's bind retries are not the trigger.
+
+kern.sweet_uim_pin_hold_ms (default 45000, 0 = off = forwarded at once as before): for that long after the router's
+READY (modem DMS/NAS/UIM servers known), UIM 0x0026 is answered DEVICE_NOT_READY here and not forwarded, so the SIM's
+retry counter is never touched. Klog: "SWEET QMUX: 1265: UIM Verify PIN answered DEVICE_NOT_READY ...".
+This also means the native SIM PIN prompt is not expected while the cache is valid: iOS unlocks on its own.
+---
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -122,6 +122,17 @@
+ static int dtmflog = 1;
+ static bool on;
+ static int ready = -1;
++static uint64_t ready_at_ms;            /* 1265: sbb_ms() when ready last became 1 */
++/*
++ * 1265: kern.sweet_uim_pin_hold_ms. CommCenter's SIM PIN cache unlocks the SIM ~2 s after the modem's DMS/NAS/UIM servers
++ * appear (READY). The modem is then still loading the WLAN PD (wlanmdsp.mbn over TFTP, ~10-20 s); attach starting during that
++ * load crashes MPSS (EX:kernel ps_rm 0xd1/0xd2) every boot since 11-17 21:05 (first boot with the cached PIN), and the modem
++ * never comes back. For this long after READY a UIM Verify PIN (0x0026) is answered DEVICE_NOT_READY here, not forwarded (the
++ * SIM's retry counter is untouched); CommCenter logs "VerifyPin returns error 0x34 ... try again" and retries every ~35 s.
++ * 0 = off (forwarded at once, as before 1265).
++ */
++static int sweet_uim_pin_hold_ms = 45000;
++static unsigned pinhold_n;
+ 
+ /* ---- the modem's QMI servers ---- */
+ 
+@@ -4972,6 +4983,17 @@
+ 		return;                                         /* 1122: kern.sweet_qmux_pds 1: wland answers (or the timeout) */
+ 	}
+ 	int a = decide(svc, msg, s + 7, rl, &code, wb, sizeof(wb));
++	if (a == ACT_FWD && svc == 0x0b && msg == 0x0026 && sweet_uim_pin_hold_ms > 0 && ready == 1 && ready_at_ms &&
++	    sbb_ms() - ready_at_ms < (uint64_t)sweet_uim_pin_hold_ms) {        /* 1265 */
++		uint64_t ago = sbb_ms() - ready_at_ms;
++		a = ACT_ERR;
++		code = QMI_ERR_DEVICE_NOT_READY;
++		pinhold_n++;
++		snprintf(wb, sizeof(wb), "1265 pin hold: modem ready %llu ms ago < kern.sweet_uim_pin_hold_ms %d (#%u)",
++		    (unsigned long long)ago, sweet_uim_pin_hold_ms, pinhold_n);
++		printf("SWEET QMUX: 1265: UIM Verify PIN answered DEVICE_NOT_READY (not forwarded): modem ready %llu ms ago, hold %d ms (#%u)\n",
++		    (unsigned long long)ago, sweet_uim_pin_hold_ms, pinhold_n);
++	}
+ 	if (a == ACT_FWD && dec_rate >= 0) {
+ 		uint64_t now = sbb_ms();
+ 		uint64_t *last = &rate_last[dec_rate];
+@@ -5755,6 +5777,7 @@
+ 		return;
+ 	}
+ 	ready = ok;
++	ready_at_ms = ok ? sbb_ms() : 0;        /* 1265 */
+ 	sweet_abp_set_ready(ok != 0, ok ? "kernel router (modem DMS, NAS and UIM servers known)" :
+ 	    "kernel router (a modem DMS/NAS/UIM server missing)");
+ }
+@@ -6236,6 +6259,29 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_wds_bindfix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wds_bindfix, "I",
+     "redfin 1158: 1 (default) = a BindMuxDataPort the modem rejects before registration is answered success to CommCenter and retried on the modem until accepted (StartNetworkInterface held until then); 0 = k26 (modem error forwarded as-is)");
+ 
++/* 1265: kern.sweet_uim_pin_hold_ms (see sweet_uim_pin_hold_ms) */
++static int
++sysctl_uim_pin_hold SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_uim_pin_hold_ms, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v < 0 || v > 600000) {
++		return EINVAL;
++	}
++	sweet_uim_pin_hold_ms = v;
++	printf("SWEET QMUX: kern.sweet_uim_pin_hold_ms = %d (1265; held so far %u)\n", v, pinhold_n);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_uim_pin_hold_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_uim_pin_hold, "I",
++    "redfin 1265: ms after the modem's READY during which a UIM Verify PIN is answered DEVICE_NOT_READY instead of forwarded (CommCenter retries; keeps the cached-PIN unlock off the modem while it loads the WLAN PD). Default 45000; 0 = off");
++
+ 
+ static int
+ sysctl_gate_ids SYSCTL_HANDLER_ARGS
