@@ -11,7 +11,7 @@ transparent holes); CA sends 0x7 then 0x2 (only l1), and only l1 reached the pan
 kern.sweet_present_layers 1: SwapEnd completes the record with the layers it keeps; a frame of 2-4 live layers leaves
 the direct scanout to presentGPU, which composites them with the 2D engine into the back panel buffer (layer 0 copied,
 the others blended source-over, each scaled src rect -> dst rect), corner mattes over the panel corners, then the
-normal 0905 flip. 8 GPU surface slots instead of 4 while on. 0 (default) = one layer only, as before.
+normal 0905 flip. 8 GPU surface slots instead of 4 while on. Default 1 (2026-11-19, owner-tested); 0 = one layer only, as before.
 Lines: `SWEET FB: 5s layers (1262)`; 1260's layout line gains each layer's flags `f F/U`.
 
 ---
@@ -358,10 +358,10 @@ index 7d9e275..7c452f4 100644
 + * kern.sweet_present_layers 1: every SwapEnd is completed with the layers it keeps (its record then names every live
 + * layer, so the direct scanout leaves a frame of 2+ layers to the present path) and presentGPU composites 2-4 live
 + * layers (sweet_gpu_present_layers: layer 0 copied, the ones above blended source-over, each scaled from its source
-+ * to its destination rectangle). 0 (default) = one layer only, as before 1262. The layer state is kept either way.
++ * to its destination rectangle). 1 is the default (2026-11-19); 0 = one layer only, as before 1262. The layer state is kept either way.
 + */
 +extern "C" uint32_t sweet_present_layers;
-+uint32_t sweet_present_layers = 0;
++uint32_t sweet_present_layers = 1;	/* default 1 since 2026-11-19 (owner-tested); 0 = off */
 +static struct {
 +	uint32_t id[SWEET_FB_LAYERS];
 +	uint8_t  src[SWEET_FB_LAYERS][16], dst[SWEET_FB_LAYERS][16];
