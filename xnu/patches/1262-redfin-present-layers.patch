@@ -315,7 +315,7 @@ index 06b9647..aca85d9 100644
  extern uint32_t sweet_fb_sleep_blank;
  SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 7d9e275..80ea89a 100644
+index 7d9e275..7c452f4 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -49,6 +49,16 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
@@ -435,7 +435,7 @@ index 7d9e275..80ea89a 100644
  	if (mask == 0 || (mask & (mask - 1))) {
  		return gpu_fallback(0, "not exactly one layer");
  	}
-@@ -7103,6 +7185,165 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+@@ -7103,6 +7185,181 @@ AppleCLCD::presentGPU(const uint8_t *rec)
  	return true;
  }
  
@@ -502,6 +502,22 @@ index 7d9e275..80ea89a 100644
 +		g->dy = (uint32_t)((uint64_t)dy * fHeight / lh);
 +		g->dw = (uint32_t)(((uint64_t)dx + dw) * fWidth / lw) - g->dx;
 +		g->dh = (uint32_t)(((uint64_t)dy + dh) * fHeight / lh) - g->dy;
++		/* within 3 px of a panel edge: to the edge (Photos' grid comes as 1125x2435: row 2339 would never be drawn,
++		 * as 0947 found for the single-layer fit) */
++		if (g->dx <= 3) {
++			g->dw += g->dx;
++			g->dx = 0;
++		}
++		if (g->dy <= 3) {
++			g->dh += g->dy;
++			g->dy = 0;
++		}
++		if (g->dx + g->dw < fWidth && fWidth - (g->dx + g->dw) <= 3) {
++			g->dw = fWidth - g->dx;
++		}
++		if (g->dy + g->dh < fHeight && fHeight - (g->dy + g->dh) <= 3) {
++			g->dh = fHeight - g->dy;
++		}
 +		if (g->dw == 0 || g->dh == 0) {
 +			s->release();
 +			nl--;
@@ -601,7 +617,7 @@ index 7d9e275..80ea89a 100644
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -7140,10 +7381,11 @@ AppleCLCD::presentLayoutLog(const uint8_t *rec)
+@@ -7140,10 +7397,11 @@ AppleCLCD::presentLayoutLog(const uint8_t *rec)
  		sig = sig * 1000003ULL ^ k;
  		if (n < (int)sizeof(buf) - 80) {
  			const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
@@ -616,7 +632,7 @@ index 7d9e275..80ea89a 100644
  		}
  		OSSafeReleaseNULL(s);
  	}
-@@ -7441,6 +7683,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -7441,6 +7699,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
