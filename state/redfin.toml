@@ -20,14 +20,15 @@ note_1116 = "Re-baselined from claude/redfin-handover-2026-11-16.md sections 1 a
 
 # What runs: image/kernel/cmdline. Never applied by state.py (no reboots): `cycle` / `boot` do that; diff checks kern.uuid and kern.bootargs.
 [boot]
+# 2026-11-19 (owner decision): DEFAULT = private kernel priv-simhold-4b20304d13 (local branch priv-ife 4b20304 = camera private line + redfin-int 60097d6: 1265 SIM PIN hold, 1266 bind slots), image rsim5 = base r5tid17 + that kernel, cmdline unchanged (tid2). Local only, never pushed; bundle private/camera/build/priv-simhold3.bundle. Public equivalent: builds/xnu/60097d6e2f7c9e8d4a65f544fde1cd05365e4354-60097d6e2f (no private camera code). Previous default: ws-tid-k ec02376b5c / r5tid17.
 # 2026-11-17: promoted ws-int-k27-perf = ws-int-k27 (dbd0752e6f, cell data) + 1159 gpustats, 1160 perf counters, 1161 hang dump, 1162 p disp on|off (all off by default). Branch head 29b7f4c is NOTES only.
 # 2026-11-17 (night): promoted the native two-cluster kernel ws-amp-p3 83548e279b = ws-int-k27-uirebal (k27-perf + 1163 ui_rebal + 1164 appmain, both off) + 1180 AMP topology/Edge + 1181 kern.sweet_edge_pref (1) + 1182 SweetCLPC (kern.sweet_clpc 15 below). Image rclpc2. Fallback: the SMP kernel builds/xnu/ws-int-k27-perf-9b6aa022d6 (image rk27p). Docs: claude/redfin-status-2026-11-17-amp-promoted.md.
-image = "r5tid17"
-base = "mesa-a1"
-kernel_dir = "builds/xnu/ws-tid-k-ec02376b5c"
-kernel_branch = "ws-tid-k"
-kernel_sha = "ec02376b5c"
-kernel_uuid = "9AF5ACA6-B162-3E61-A3A1-703C66284AA5"
+image = "rsim5"
+base = "r5tid17"
+kernel_dir = "builds/xnu/priv-simhold-4b20304d13"
+kernel_branch = "priv-ife"
+kernel_sha = "4b20304d13"
+kernel_uuid = "2489EDE3-AC4B-3093-9C2B-AFE3AC82D28F"
 cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13-tid2"
 # 2026-11-19 (simfix): TEMP boot = builds/xnu/priv-simhold-4b20304d13 (image rsim5) = priv-ife 1e19e5b + redfin-int ws-k-simhold (1265 kern.sweet_uim_pin_hold_ms default 45000: CommCenter cached-PIN unlock held 45 s after modem READY, fixes the modem ps_rm crash / cellular "Searching"; 1266 bind retry slots 8->32: cellular data). Local only, never pushed. Public equivalent: redfin-int 60097d6 (not built/booted). Every [boot] kernel without 1265 crashes the modem when the PIN cache is valid.
 # 2026-11-19 (final): TEMP boot = private camera kernel builds/xnu/priv-ife-1e19e5b16d (image r75all; priv-ife 1e19e5b = redfin-int 3f95250 + private 1257 r5 per-mode IFE clocks; local only, never pushed); temp sysctls kern.sweet_ife=1, kern.sweet_surf_inuse=1.
