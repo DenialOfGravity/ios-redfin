@@ -2579,7 +2579,20 @@ struct af {
 	bool            hold;           /* a one-off search (AF_MODE_AUTO) done: the lens stays until focus is asked for again */
 	int32_t         manual_at;      /* the ManualFocusNow position being gone to or held (-1: none) */
 	bool            started;        /* at and target are the kernel's */
+	/* ws-cam-af: no search goes on for ever */
+	unsigned        busy;           /* frames since this search (or move) began */
+	unsigned        moving;         /* frames in a row the kernel said LENS_MOVING */
+	uint32_t        good;           /* where the lens was last in focus (or the kernel put it): the fallback */
 };
+
+/*
+ * ws-cam-af: a search (or a walk somewhere) gets AF_BUSY_MAX frames (~6 s at 24 fps; a sweep of the whole travel in the dark is ~80);
+ * then it is given up and the lens goes back to where it was last in focus. A LENS_MOVING flag that does not clear
+ * (AF_MOVING_MAX frames in a row) is taken as stuck: the frames are measured anyway. Frames are never held back:
+ * focus only ever skips its own measurement.
+ */
+#define AF_BUSY_MAX     150u
+#define AF_MOVING_MAX   6u
 
 /* whether focus is looking for the sharpest, or the lens is on its way somewhere (AFStatus; a photograph waits for it) */
 static bool
@@ -2622,8 +2635,29 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	}
 	if (!af->started) {
 		af->started = true;
-		af->at = af->target = f->focus;         /* (where the kernel put it) */
+		af->at = af->target = af->good = f->focus;      /* (where the kernel put it) */
 		af->manual_at = -1;
+	}
+	if (af_searching(af)) {
+		if (++af->busy > AF_BUSY_MAX) {
+			say("focus: gave up after %u frames (state %d, the lens at %u for %u, moving %u): back to %u", af->busy,
+			    af->state, af->at, af->target, af->moving, af->good);
+			af->busy = 0;
+			af->moving = 0;
+			af->now = af->sweep = false;
+			af->state = AF_WATCH;
+			af->hold = true;
+			af->sharpness = 0;      /* (watching starts again from what it sees) */
+			af->unlike = 0;
+			af->wait = 0;
+			af->target = af->at;
+			if (af->at != af->good) {
+				af_go(device, af, af->good);
+			}
+			return;
+		}
+	} else {
+		af->busy = 0;
 	}
 	/* redfin (B5): ManualFocusNow: the lens there, a step at a time, and held */
 	if (manual >= 0 && manual != af->manual_at) {
@@ -2649,7 +2683,14 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	}
 	/* redfin (B5): a frame exposed while the lens moved (the kernel's LENS_MOVING) is no measure of where it is */
 	if (f->reserved[REDWOOD_CAMERA_R_FLAGS] & REDWOOD_CAMERA_LENS_MOVING) {
-		return;
+		if (++af->moving <= AF_MOVING_MAX) {
+			return;
+		}
+		if (af->moving == AF_MOVING_MAX + 1) {
+			say("focus: LENS_MOVING for %u frames in a row (the lens at %u): measured anyway", af->moving, af->at);
+		}
+	} else {
+		af->moving = 0;
 	}
 	if (af->state == AF_WATCH && (locked || af->hold)) {
 		return;                 /* (nothing to measure for) */
@@ -2775,6 +2816,7 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 		af->level = level;
 		af->unlike = 0;
 		af->hold = mode == AF_MODE_AUTO;        /* (redfin, B5: one search, and the lens stays) */
+		af->good = af->at;                      /* (ws-cam-af: the fallback) */
 		say("focus: the lens at %u after %u moves (sharpness %.3f)%s", af->at, af->steps, sharpness, af->hold ? ", held" : "");
 		return;
 	case AF_MANUAL:
