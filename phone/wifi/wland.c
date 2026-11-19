@@ -1243,7 +1243,10 @@ static void stage_init(void)
  *   5 SMP2P "ipa" = 3 (without it the modem stalls in INIT_DRIVER: "Task starvation: ipa_ctl", then crashes)
  *   6 ipaqmi on (as ipaqmi=1), wait for the modem's 0x31/2 (60 s)    7 INIT_DRIVER (as ipaqmi=2, once)
  *   8 its answer (ipaqmi gives up after 30 s).
- * (`ipahw hwinit` is not a step: the reset values already match.) From the moment ipa=1 is seen until the sequence
+ *   ipaqtime=1 in cell.on (2026-11-19, default off): step 3 also runs ipa_qtime (downstream ipa_cfg_qtime: the IPA
+ *   timers on, as ipa3_init_hw does before the modem is told anything). Without it the timers are off and a data call
+ *   that moved packets cannot be torn down (airplane mode / Cellular Data off stall the modem; ipa.c ipa_qtime).
+ * (`ipahw hwinit` is not a step.) From the moment ipa=1 is seen until the sequence
  * ended, cell.c holds the DMS online write, the SIM PIN verify and X1 (cell_ipa_hold; without the IPA the modem dies
  * in ps_rm once the unlocked SIM registers LTE). Every step logs "ipa: auto step N ..."; the first failure ends it,
  * releases the holds, and nothing is ever retried: IPA_MARK holds this boot's id from step 1 on, so neither a
@@ -1262,6 +1265,19 @@ enum { IA_OFF, IA_WAIT, IA_RUN, IA_END };
 static int ia_state, ia_step, ia_allowed, ia_waitlog;
 static uint64_t ia_first, ia_check, ia_allow_ms, ia_next, ia_since, ia_t0;
 static char ia_uuid[40] = "-", ia_bt[32] = "-";
+
+/* a word of /var/local/cell.on (substring match, as ipagsi.c cell_word_has) */
+static int cellon_has(const char *w)
+{
+	char b[1024] = "";
+	FILE *f = fopen("/var/local/cell.on", "r");
+	if (f) {
+		size_t k = fread(b, 1, sizeof(b) - 1, f);
+		b[k] = 0;
+		fclose(f);
+	}
+	return strstr(b, w) != NULL;
+}
 
 static void ipa_auto_allow(void)
 {
@@ -1375,6 +1391,10 @@ static void ipa_step(uint64_t now)
 	case 3:
 		printf("ipa: auto step 3 smmu streams 0x520/0x522\n");
 		rc = ipa_smmu();
+		if (!rc && cellon_has("ipaqtime=1")) {
+			printf("ipa: auto step 3 ipaqtime=1: IPA timers (downstream ipa_cfg_qtime)\n");
+			rc = ipa_qtime();
+		}
 		break;
 	case 4:
 		if (link_kernel_data()) {

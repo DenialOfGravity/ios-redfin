@@ -8,12 +8,16 @@
  *   wland ipahw smmu                  IPA DMA streams 0x520 (AP) and 0x522 (uC) on translation-off context banks
  *                                   (radio.c smmu_stream_identity, the same setup the WLAN stream uses)
  *   wland ipahw hwinit [--dry-run] [--route]   the registers downstream ipa3_post_init / ipa3_init_hw write on v4.7
+ *   wland ipahw qtime                 only downstream's ipa_cfg_qtime(): timestamps, timer pulse granularity, timer
+ *                                   XO clock divider on (the IPA timers; see ipa_qtime below)
  *   wland ipahw memdump [OFST LEN]    read-only dump of the local memory (default: flt/rt tables, drop stats)
  *   wland ipahw meminit [--dry-run]   local memory: zero above the uC area, canaries of downstream ipa_4_7_mem_part,
  *                                   LOCAL_PKT_PROC_CNTXT base
  *
- * ipa_smmu / ipa_meminit are also called in-process by wland's ipa=1 bring-up (wland.c, "IPA auto"). hwinit is not
- * part of it: the reset values already match what it would write (2026-11-06).
+ * ipa_smmu / ipa_meminit are also called in-process by wland's ipa=1 bring-up (wland.c, "IPA auto"); ipa_qtime too
+ * with ipaqtime=1 in cell.on. hwinit is not part of it. (The 2026-11-06 note "the reset values already match" does not
+ * hold for the timers: on 2026-11-19 a booted phone read TIMERS_XO_CLK_DIV_CFG 0x000000bf, i.e. divider set but
+ * disabled, PULSE_GRAN 0x118 and QTIME_TIMESTAMP_CFG 0x00180e0e - the IPA timers were not running.)
  *
  * Gate: nothing is written (or read beyond the gate) unless IPA_COMP_HW_VERSION reads 0x40070000, which also shows
  * the IP0 clock vote is in place (an unclocked IPA would not answer). No GSI channels, SMP2P, QMI or SMEM here.
@@ -117,6 +121,30 @@ int ipa_smmu(void)
 	int a = smmu_stream_identity(IPA_SID_AP, 0, "IPA-AP");
 	int b = smmu_stream_identity(IPA_SID_UC, 0, "IPA-uC");
 	return a || b ? 1 : 0;
+}
+
+/*
+ * ipa_qtime: downstream ipa_utils.c ipa_cfg_qtime() (IPA >= 4.5, called by ipa3_init_hw before the modem is told
+ * anything): QTIME_TIMESTAMP_CFG (dpl/tag/nat timestamp lsb, dpl_timestamp_sel), TIMERS_PULSE_GRAN_CFG (gran_0
+ * 100 us, gran_1 1 ms, gran_2 1 ms), then the timers' XO clock divider off and on again (its divider value kept).
+ * Without it the IPA timers do not run: aggregation time limits, HOLB and tag timers never expire. The modem's own
+ * pipes depend on them (its UL consumer aggregation closes on the time limit, and its data-call teardown waits for
+ * them): on the port, a data call that had moved packets could not be torn down - WDS Stop Network went unanswered,
+ * the modem's data/DMS/WDS services stalled, and ~2 min later MCPM died going offline ("qmp_msg_client.c:812:
+ * [npaschedule]", "mcpm_modem_offline: AOSS RSC sequence failed", fw_rtos asserts) - airplane mode and Cellular
+ * Data off both triggered it. Turning the divider on (2026-11-19, by hand) released a stalled modem at once.
+ */
+int ipa_qtime(void)
+{
+	if (gate())
+		return 1;
+	wrr("QTIME_TIMESTAMP_CFG", QTIME_TIMESTAMP_CFG, 0x00180e8e);
+	wrr("TIMERS_PULSE_GRAN_CFG", TIMERS_PULSE_GRAN_CFG, 0x00000123);
+	uint32_t xo = rdr(TIMERS_XO_CLK_DIV_CFG);
+	if (xo & (1u << 31))
+		wrr("TIMERS_XO_CLK_DIV_CFG", TIMERS_XO_CLK_DIV_CFG, xo & ~(1u << 31));
+	wrr("TIMERS_XO_CLK_DIV_CFG", TIMERS_XO_CLK_DIV_CFG, xo | (1u << 31));
+	return (rdr(TIMERS_XO_CLK_DIV_CFG) & (1u << 31)) ? 0 : 1;
 }
 
 static int hwinit(int route)
@@ -289,7 +317,7 @@ int ipa_main(int argc, char **argv)
 {
 	/* argv[0] = "ipahw", argv[1] = subcommand */
 	if (argc < 2) {
-		fprintf(stderr, "usage: wland ipahw regs|smmu|hwinit [--dry-run] [--route]|meminit [--dry-run]|memdump [OFST LEN]\n");
+		fprintf(stderr, "usage: wland ipahw regs|smmu|qtime|hwinit [--dry-run] [--route]|meminit [--dry-run]|memdump [OFST LEN]\n");
 		return 2;
 	}
 	int route = 0;
@@ -305,6 +333,8 @@ int ipa_main(int argc, char **argv)
 		return ipa_smmu();
 	if (!strcmp(argv[1], "hwinit"))
 		return hwinit(route);
+	if (!strcmp(argv[1], "qtime"))
+		return ipa_qtime();
 	if (!strcmp(argv[1], "meminit"))
 		return ipa_meminit();
 	if (!strcmp(argv[1], "memdump"))
