@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:10:00 +0100
+Subject: [PATCH] redfin 1266: 1158 bind retry table 8 -> 32 slots
+
+CommCenter binds 11 WDS clients (cids 2-12) at launch, before the IPA is up, so the modem rejects all of them (0x3).
+1158 has 8 retry slots: cids 10-12 were answered success but "bind NOT queued (no slot)", never bound on the modem,
+and CommCenter starts its data call on cid 12 -> StartNetworkInterface INVALID_OPERATION (0x46), retried in a flood
+(rsim4: 15750 forwarded WDS requests in 4 min), no data. The own-request pool the retries use already has 32 slots.
+---
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -3267,7 +3267,7 @@
+ #define D_NPROF                 24
+ #define D_BAK_MAX               (48u << 10)
+ #define D_NGATE                 8
+-#define D_NBIND                 8       /* 1158: pre-registration BindMuxDataPort retries in flight */
++#define D_NBIND                 32      /* 1158: pre-registration BindMuxDataPort retries in flight; 1266: 8 -> 32 (CommCenter binds 11 WDS clients at launch: cids 10-12 got "no slot", cid 12 then started data unbound -> INVALID_OPERATION 0x46 forever) */
+ #define D_BIND_RETRY_MS         1500u   /* 1158: re-send a rejected bind at most this often */
+ 
+ static int data_fwd = 1, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default; 1108: data_fwd default 0; 1157: default 1 (data-enabled baseline; kern.sweet_data_fwd 0 restores k25 gated) */
