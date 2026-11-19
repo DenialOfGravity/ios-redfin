@@ -29,6 +29,7 @@ kernel_branch = "ws-tid-k"
 kernel_sha = "ec02376b5c"
 kernel_uuid = "9AF5ACA6-B162-3E61-A3A1-703C66284AA5"
 cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13-tid2"
+# 2026-11-19 (simfix): TEMP boot = builds/xnu/priv-simhold-4b20304d13 (image rsim5) = priv-ife 1e19e5b + redfin-int ws-k-simhold (1265 kern.sweet_uim_pin_hold_ms default 45000: CommCenter cached-PIN unlock held 45 s after modem READY, fixes the modem ps_rm crash / cellular "Searching"; 1266 bind retry slots 8->32: cellular data). Local only, never pushed. Public equivalent: redfin-int 60097d6 (not built/booted). Every [boot] kernel without 1265 crashes the modem when the PIN cache is valid.
 # 2026-11-19 (final): TEMP boot = private camera kernel builds/xnu/priv-ife-1e19e5b16d (image r75all; priv-ife 1e19e5b = redfin-int 3f95250 + private 1257 r5 per-mode IFE clocks; local only, never pushed); temp sysctls kern.sweet_ife=1, kern.sweet_surf_inuse=1.
 # 2026-11-19: the phone runs a private camera kernel (priv-ife-<sha>, local only, not in git) as a TEMP boot for camera/display work: same public patches (1258 surf_inuse, 1260/1261 present fix) + the private camera patch. Its kern.sweet_ife* / kern.sweet_surf_inuse are temp sysctls, not kept here. This [boot] entry stays the baseline to return to.
 # 2026-11-18 (owner-confirmed Touch ID baseline): kernel ws-tid-k ec02376 (Touch ID line + sweettouchid=1), image r5tid17 = base mesa-a1 + cmdline ...-tid2 (keepsyms=1 dropped, sweetfbx=263)
