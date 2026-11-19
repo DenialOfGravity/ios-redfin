@@ -5385,15 +5385,16 @@ HM_PLANES_DUMP_EDITS = [
 ]
 
 
-# (ws-hm-planes) HM_540_SWIZZLE=1 (default) | 2 | 0: a two-plane YCbCr texture over a surface (500 / 540, HM_YCBCR=native)
-# is read through the descriptor's swizzle, as Apple's driver reads it (it was ignored: VideoToolbox's transfer in
-# mediaserverd -- the Camera preview -- then wrote Cb into Y, Cr into Cb and Y into Cr: the dumps of HM_PLANE_DUMP
-# correlate 1.00 so). 2: format 540 as (blue, red, green) whatever the descriptor says (a test); 0: as before. The
-# descriptor's swizzle is said once per value.
+# (ws-hm-planes) HM_540_SWIZZLE=2 (default) | 1 | 0: format 540 (RGB8_420_2P, VideoToolbox's source) over a two-plane
+# surface is read with its channels as Apple's GPU gives them: the planes' raw (Cr, Y, Cb) as hakios-metal reads them,
+# through (blue, red, green). Without it VideoToolbox's transfer in mediaserverd (the Camera preview, its thumbnail,
+# Photos' thumbnails) wrote Cb into Y, Cr into Cb and Y into Cr -- HM_PLANE_DUMP's dumps correlate 1.00 so, and 1.00
+# plane for plane with it (the descriptor's own swizzle is the identity there). The descriptor's swizzle is applied on top
+# (1: the descriptor's swizzle alone, for 500 and 540; 0: neither, as before). Said once per format and swizzle.
 HM_PLANES_SWZ_EDITS = [
     ('static int\nhm_plane_shadow_on(void)\n',
      'static int\nhm_540_swizzle_mode(void)\n{\n\tstatic int m = -1;\n\n'
-     '\tif (m < 0) {\n\t\tconst char *e = getenv("HM_540_SWIZZLE");\n\n\t\tm = e == NULL || e[0] == 0 ? 1 : atoi(e);\n\t}\n\treturn m;\n}\n\n'
+     '\tif (m < 0) {\n\t\tconst char *e = getenv("HM_540_SWIZZLE");\n\n\t\tm = e == NULL || e[0] == 0 ? 2 : atoi(e);\n\t}\n\treturn m;\n}\n\n'
      'static int\nhm_plane_shadow_on(void)\n'),
     ('\t\t\tif (yt != NULL) {\n\t\t\t\tHM_ONCE("a two-plane YCbCr surface sampled as format %lu is converted on the GPU',
      '\t\t\tif (yt != NULL) {   /* (ws-hm-planes) HM_540_SWIZZLE: the descriptor\'s swizzle */\n'
@@ -5409,7 +5410,10 @@ HM_PLANES_SWZ_EDITS = [
      '\t\t\t\t\t\t hm_540_swizzle_mode(), (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor usage], r, g, b, a);\n'
      '\t\t\t\t}\n'
      '\t\t\t\tif (hm_540_swizzle_mode() == 2 && [descriptor pixelFormat] == (MTLPixelFormat)540) {\n'
-     '\t\t\t\t\tr = MTLTextureSwizzleBlue;\n\t\t\t\t\tg = MTLTextureSwizzleRed;\n\t\t\t\t\tb = MTLTextureSwizzleGreen;\n\t\t\t\t\ta = MTLTextureSwizzleAlpha;\n'
+     '\t\t\t\t\t/* the format\'s own channel order first, the descriptor\'s swizzle over it (below) */\n'
+     '\t\t\t\t\thakios_metal_texture *o = hakios_metal_texture_new_swizzled(yt, MTLTextureSwizzleBlue, MTLTextureSwizzleRed,\n'
+     '\t\t\t\t\t\t\t\t\t\t\t   MTLTextureSwizzleGreen, MTLTextureSwizzleAlpha);\n\n'
+     '\t\t\t\t\tif (o != NULL) {\n\t\t\t\t\t\thakios_metal_texture_free(yt);\n\t\t\t\t\t\tyt = o;\n\t\t\t\t\t}\n'
      '\t\t\t\t}\n'
      '\t\t\t\tif (hm_540_swizzle_mode() != 0 && (r != MTLTextureSwizzleRed || g != MTLTextureSwizzleGreen || b != MTLTextureSwizzleBlue ||\n'
      '\t\t\t\t\t\t\t\t       a != MTLTextureSwizzleAlpha)) {\n'
