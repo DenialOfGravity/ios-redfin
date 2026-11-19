@@ -329,10 +329,10 @@ private:
 
     kern_return_t method(uint32_t m, const void* in, size_t inSize, void* out, size_t outSize) {
         // {'NTNL', method, payload} through selector 0, as v2test and the darwin backend call it
-        uint8_t buf[8 + sizeof(NativeAdrenoAbiSubmit)];
+        uint8_t buf[4096];   // (redfin xnu 1258) a submission with its BO list: up to the inline struct input
         const uint32_t hdr[2] = {kTunnel, m};
         memcpy(buf, hdr, 8);
-        if (inSize > sizeof(NativeAdrenoAbiSubmit)) return kIOReturnBadArgument;
+        if (inSize > sizeof(buf) - 8) return kIOReturnBadArgument;
         if (inSize != 0) memcpy(buf + 8, in, inSize);
         size_t o = outSize;
         return IOConnectCallStructMethod(c_, 0, buf, 8 + inSize, outSize ? out : nullptr, outSize ? &o : nullptr);
@@ -575,6 +575,46 @@ private:
         return 0;
     }
 
+    // (redfin xnu 1258) HM_SUBMIT_BOLIST (default 1): each submission names its imported BOs (write flag from the msm
+    // BO table) after the buffers, so the kernel holds exactly the IOSurfaces the job uses until its fence lands
+    // (IOSurfaceIsInUse, kern.sweet_surf_inuse); a kernel before 1258 refuses the flag once and it goes off for the
+    // process. More imports than fit in one record: sent without the list (the kernel then holds every import).
+    static constexpr uint32_t kMaxListedBos = (4096 - 8 - sizeof(NativeAdrenoAbiSubmit) - sizeof(NativeAdrenoAbiSubmitBoList)) /
+                                              sizeof(NativeAdrenoAbiSubmitBo);
+    struct SubmitWithBos {
+        NativeAdrenoAbiSubmit q;
+        NativeAdrenoAbiSubmitBoList list;
+        NativeAdrenoAbiSubmitBo bos[kMaxListedBos];
+    };
+    bool boListRefused_ = false;
+    int boListOn_ = -1;
+    uint32_t boListed_ = 0, boListTooMany_ = 0;
+    uint32_t listBos(const MsmSubmitBo* bos, const std::vector<Bo*>& named, uint32_t n, NativeAdrenoAbiSubmitBo* out) {
+        if (boListOn_ < 0) {
+            const char* e = getenv("HM_SUBMIT_BOLIST");
+            boListOn_ = e == nullptr || atoi(e) != 0;
+        }
+        if (!boListOn_ || boListRefused_) return UINT32_MAX;
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const Bo* b = named[i];
+            if (!b->imported) continue;
+            const uint32_t w = (bos[i].flags & kSubmitBoWrite) ? NativeAdrenoAbiSubmitBoWrite : 0;
+            uint32_t j = 0;
+            while (j < k && out[j].handle != b->handle) j++;
+            if (j < k) {
+                out[j].flags |= w;
+                continue;
+            }
+            if (k == kMaxListedBos) {
+                boListTooMany_++;
+                return UINT32_MAX;
+            }
+            out[k++] = NativeAdrenoAbiSubmitBo{b->handle, w, 0};
+        }
+        return k;
+    }
+
     int submit(MsmGemSubmit& s) {
         if (s.nr_cmds != 1 || s.nr_bos == 0 || (s.queueid != 0 && queues_.count(s.queueid) == 0)) return EINVAL;
         const auto* bos = reinterpret_cast<const MsmSubmitBo*>(uintptr_t(s.bos));
@@ -618,7 +658,8 @@ private:
             b->invalPending = false;   // (ws-hm-int6) dc civac: cleaned and invalidated
         }
         if (!rd_.dir.empty() && rdArmed() != 0) rdDump(s, bos, named, ib, *cmd);   // (ws-hm-csdiff) HM_RD_DUMP
-        NativeAdrenoAbiSubmit q{};
+        SubmitWithBos m{};
+        NativeAdrenoAbiSubmit& q = m.q;
         q.buffer_count = 1;
         q.queue = 0;   // one ring (xnu 0115: every queue is queue 0)
         q.reserved = gateFlag(bos, named, s.nr_bos);   // (redfin hm-int5) HM_GATE_FLAG
@@ -629,7 +670,23 @@ private:
         kern_return_t k;
         {
             prof::Scope t(prof::kIoSubmit);
-            k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+            const uint32_t nl = listBos(bos, named, s.nr_bos, m.bos);
+            if (nl != UINT32_MAX) {
+                q.flags |= NativeAdrenoAbiSubmitBoListFlag;
+                m.list.count = nl;
+                k = method(NativeAdrenoMethodSubmit, &m, sizeof(q) + sizeof(m.list) + nl * sizeof(NativeAdrenoAbiSubmitBo), &r, sizeof(r));
+                if (k == kIOReturnBadArgument) {
+                    // a kernel before 1258: off for this process, sent again without the list
+                    boListRefused_ = true;
+                    fprintf(stderr, "hakios-metal: HM_SUBMIT_BOLIST: the kernel refuses a submission's BO list (before redfin xnu 1258); off for this process\n");
+                    q.flags &= ~NativeAdrenoAbiSubmitBoListFlag;
+                    k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+                } else if (k == KERN_SUCCESS && boListed_++ == 0) {
+                    fprintf(stderr, "hakios-metal: HM_SUBMIT_BOLIST: first submission names its %u imported BOs\n", nl);
+                }
+            } else {
+                k = method(NativeAdrenoMethodSubmit, &q, sizeof(q), &r, sizeof(r));
+            }
             if (k == kIOReturnBadArgument && q.reserved != 0) {
                 // (redfin hm-int5) a kernel without the flag (it wants the field 0): off for this process, sent again bare
                 gateFlagRefused_ = true;
