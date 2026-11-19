@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 02:10:00 +0100
+Subject: [PATCH] redfin 1261: a SwapEnd layer that names no surface is off
+
+QuartzCore 16.7 sends mask 0x7 (or 0x80000007) with layers 1 and 2 naming no surface (id 0) after a Camera
+tap-to-focus, a camera switch or a backboardd restart (1260's layout line: l0 id 608 1125x2436 BGRA slot 3 | l1 id 0
+| l2 id 0). The direct scanout, the GPU fit and the CPU present all required exactly one mask bit, so every such
+frame was "not fitted" (nonslot 453, drawn 0 per 5 s): the panel froze until CA went back to mask 0x1.
+
+sweet_swap_mask(): bits 0..3 only, without layers whose surface id is 0. kern.sweet_present_nolayer 1 (default),
+0 = the raw mask as before. The 1260 5 s present line gains "off layers in N (nolayer V)" and the layout line the
+live mask.
+
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ef19949..06b9647 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1953,6 +1953,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_bl_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
+ extern uint32_t sweet_present_honest;      /* 1260 */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_present_honest, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_present_honest, 0,
+     "SWEET FB 1260: 1 = only presents that drew count as shown (5 s stats, kern.sweet_fb_frames); 0 = every present");
++extern uint32_t sweet_present_nolayer;     /* 1261 */
++SYSCTL_INT(_kern, OID_AUTO, sweet_present_nolayer, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_present_nolayer, 0,
++    "SWEET FB 1261: 1 = a swap's layer naming no surface is off (not a layer), bits above 3 ignored; 0 = raw mask");
+ /* 1186: display off blanks the panel (DCS 0x28 + 0x51 0), display on restores it (SweetFramebuffer.cpp) */
+ extern uint32_t sweet_fb_sleep_blank;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c5c230c..7d9e275 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1877,6 +1877,37 @@ get32(const uint8_t *p, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * 1261: the layers a SwapEnd sets. CA (QuartzCore 16.7) sends mask 0x7 / 0x80000007 with layers 1 and 2 naming
++ * no surface (id 0) once it has used, or wants off, a second hardware layer: after a tap-to-focus in Camera, a
++ * camera switch, a backboardd restart. Those are layers turned off, not content; bit 31 is a flag, not a layer.
++ * Every path required exactly one bit, so such frames were neither scanned out nor presented ("not fitted": the
++ * panel froze until CA went back to mask 0x1). kern.sweet_present_nolayer 1 (default): the mask without the bits
++ * above the layers and without layers that name no surface; 0 = the raw mask (before 1261).
++ */
++extern "C" uint32_t sweet_present_nolayer;
++uint32_t sweet_present_nolayer = 1;
++static uint32_t sweet_nolayer_st;       /* 1261: presented swaps whose mask the rule changed, this 5 s */
++
++static uint32_t
++sweet_swap_mask(const uint8_t *rec, bool count = false)
++{
++	uint32_t raw = get32(rec, 0x104);
++	if (!sweet_present_nolayer) {
++		return raw;
++	}
++	uint32_t mask = raw & ((1u << SWEET_FB_LAYERS) - 1);
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) == 0) {
++			mask &= ~(1u << l);
++		}
++	}
++	if (count && mask != raw) {
++		sweet_nolayer_st++;
++	}
++	return mask;
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -2098,11 +2129,14 @@ AppleCLCD::statLine(uint64_t now)
+ 		bzero(sweet_po_st, sizeof(sweet_po_st));
+ 		bzero(sweet_po_masks, sizeof(sweet_po_masks));
+ 		IOLockUnlock(fLock);
++		uint32_t nl = sweet_nolayer_st;
++		sweet_nolayer_st = 0;
+ 		if (po[0] + po[1] + po[2] + po[3] + po[4] != 0) {
+ 			IOLog("SWEET FB: 5s present (1260): drawn %u kept %u not-fitted %u ubwc %u mdp-test %u | masks 0:%u 1:%u 2:%u "
+-			    "3:%u 4:%u other %u | honest %u\n", po[SWEET_PO_DRAWN], po[SWEET_PO_KEEP], po[SWEET_PO_NOTFIT],
+-			    po[SWEET_PO_UBWC], po[SWEET_PO_MDPBUSY], pm[0], pm[1], pm[2], pm[3], pm[4],
+-			    po[0] + po[1] + po[2] + po[3] + po[4] - pm[0] - pm[1] - pm[2] - pm[3] - pm[4], sweet_present_honest);
++			    "3:%u 4:%u other %u | honest %u | off layers in %u (nolayer %u)\n", po[SWEET_PO_DRAWN], po[SWEET_PO_KEEP],
++			    po[SWEET_PO_NOTFIT], po[SWEET_PO_UBWC], po[SWEET_PO_MDPBUSY], pm[0], pm[1], pm[2], pm[3], pm[4],
++			    po[0] + po[1] + po[2] + po[3] + po[4] - pm[0] - pm[1] - pm[2] - pm[3] - pm[4], sweet_present_honest,
++			    nl, sweet_present_nolayer);
+ 		}
+ 	}
+ 	if (sweet_fb_early_retire || erAcc || erBusy || erKick) {
+@@ -4316,7 +4350,7 @@ static uint32_t sweet_scan_surf_busy_locked(uint32_t id);      /* 1105 */
+ static bool
+ sweet_scan_swap(AppleCLCD *fb, const uint8_t *rec, uint64_t now, uint32_t fence)
+ {
+-	uint32_t mask = get32(rec, 0x104);
++	uint32_t mask = sweet_swap_mask(rec);
+ 	if (mask == 0) {
+ 		return sweet_scan.geom;         /* changes no layer: the frame on screen stays */
+ 	}
+@@ -6013,7 +6047,7 @@ sweet_scan_gpu_kick(void)
+ static void
+ sweet_scan_auto(AppleCLCD *fb, const uint8_t *rec)
+ {
+-	uint32_t mask = get32(rec, 0x104);
++	uint32_t mask = sweet_swap_mask(rec);
+ 	if (mask == 0 || (mask & (mask - 1)) || fb->fPowerOff) {
+ 		return;
+ 	}
+@@ -6698,7 +6732,7 @@ bool
+ AppleCLCD::presentCPU(const uint8_t *rec)
+ {
+ 	static uint32_t why_logged, logs;
+-	uint32_t mask = get32(rec, 0x104), layer = 0, why = 0;
++	uint32_t mask = sweet_swap_mask(rec), layer = 0, why = 0;
+ 	SweetSurface *s = NULL;
+ 	uintptr_t src = 0;
+ 	if (mask == 0 || (mask & (mask - 1))) {
+@@ -6989,7 +7023,7 @@ AppleCLCD::copyRow(uint32_t x, uint32_t y, const uint32_t *src, uint32_t n)
+ bool
+ AppleCLCD::presentGPU(const uint8_t *rec)
+ {
+-	uint32_t mask = get32(rec, 0x104), layer = 0;
++	uint32_t mask = sweet_swap_mask(rec), layer = 0;
+ 	if (mask == 0 || (mask & (mask - 1))) {
+ 		return gpu_fallback(0, "not exactly one layer");
+ 	}
+@@ -7074,7 +7108,7 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	fPresentOut = SWEET_PO_DRAWN;
+ 	presentInner(rec);
+-	uint32_t mask = get32(rec, 0x104);
++	uint32_t mask = sweet_swap_mask(rec, true);
+ 	IOLockLock(fLock);
+ 	sweet_po_st[fPresentOut < SWEET_PO_N ? fPresentOut : 0]++;
+ 	sweet_po_masks[mask & 15]++;
+@@ -7127,7 +7161,8 @@ AppleCLCD::presentLayoutLog(const uint8_t *rec)
+ 	if (winN++ >= 12) {
+ 		return;
+ 	}
+-	IOLog("SWEET FB: present layout (1260): swap %u layers %#x -> %s%s\n", get32(rec, 0x50), mask,
++	IOLog("SWEET FB: present layout (1260): swap %u layers %#x (live %#x) -> %s%s\n", get32(rec, 0x50), mask,
++	    sweet_swap_mask(rec),
+ 	    sweet_po_name[fPresentOut < SWEET_PO_N ? fPresentOut : 0], buf);
+ }
+ 
+@@ -7138,7 +7173,7 @@ AppleCLCD::presentInner(const uint8_t *rec)
+ 		fPresentOut = SWEET_PO_MDPBUSY;
+ 		return;         /* 0948: a p mdp test owns the pipes; the latest frame goes out after p mdp restore */
+ 	}
+-	uint32_t mask = get32(rec, 0x104);
++	uint32_t mask = sweet_swap_mask(rec);       /* 1261 */
+ 	/*
+ 	 * 1111: a compressed (UBWC) surface is only ever scanned out directly: every present below reads it as linear rows
+ 	 * (CPU copy, GPU blit, crop copy) and would put its compressed bytes on the panel. Such a frame is not presented
