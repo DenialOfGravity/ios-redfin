@@ -29,6 +29,7 @@ kernel_branch = "ws-tid-k"
 kernel_sha = "ec02376b5c"
 kernel_uuid = "9AF5ACA6-B162-3E61-A3A1-703C66284AA5"
 cmdline_file = "agent/stage/cmdline.bb19u15-ubwc2-xr13-tid2"
+# 2026-11-19: the phone runs a private camera kernel (priv-ife-<sha>, local only, not in git) as a TEMP boot for camera/display work: same public patches (1258 surf_inuse, 1260/1261 present fix) + the private camera patch. Its kern.sweet_ife* / kern.sweet_surf_inuse are temp sysctls, not kept here. This [boot] entry stays the baseline to return to.
 # 2026-11-18 (owner-confirmed Touch ID baseline): kernel ws-tid-k ec02376 (Touch ID line + sweettouchid=1), image r5tid17 = base mesa-a1 + cmdline ...-tid2 (keepsyms=1 dropped, sweetfbx=263)
 bootargs = "debug=0xc serial=3 cpus=8 rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=90 sweetusb=2 sweetgpufreq=4 sweetbattery=1 sweetgpu=1 sweetmtl=2 sectouch=1 sweethaptic=2 sweetbl=1 sweetnull=backboardd sweettorch=2 sweetcam=2 sweetcamdev=1 flamecpufreq=2 sweetbig=2 adsp=2 adsp_sleep=1 sndgpio=1 sound=4 mic=1 micgain=51 sweetbtnub=7 btbridge=1 sweetfbx=263 sectouchx=0xd sweetfbflip=1 sweetgov=4060 sweetscanout=2 sweetrtcoff=1792779327 xram=13 sweetabp=15 sweetbb=19 sweetufs=15 sweetubwc=2 sweettouchid=1"
 
@@ -887,15 +888,15 @@ files = { "AppIcon60x60@2x.png" = "bafb34036ef3e903128e7e839af6f71074a1befc211a4
 
 [[bundle]]
 path = "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
-source = "builds/userland/a93b1bb86943466b57716125a619cf948a86e50e-a93b1bb869/RedwoodAudio.driver"
+source = "builds/userland/c8d929506bc99c7159d599f18c278be68e2d9550-c8d929506b/RedwoodAudio.driver"
 target = "userland"
-ref = "a93b1bb86943466b57716125a619cf948a86e50e"
-sha = "a93b1bb869"
-note = "all 3 bundle files match a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
+ref = "c8d929506bc99c7159d599f18c278be68e2d9550"
+sha = "c8d929506b"
+note = "2026-11-19 camera wrap-up: redfin-int c8d9295 (ws-cam-af tip: IFE preview/stills, ExposureBias 8.8, antiband, minfps, aesettle, AF timeout + afdone; flags in /var/local/camera-*). Info.plist and CodeResources unchanged since a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
 restart = "mediaserverd"
 CFBundleIdentifier = "com.redwood.audio"
 CFBundleVersion = "1"
-files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "3638a0ca4d83a999f51776f66bbc49d18ef5c170707fa0bfedeab527c896f821", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
+files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "3601e3822cbf12e0481832355b61c7d7e4eb31255b5330dbed2ea8e8c22aa8a3", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
 
 [[bundle]]
 path = "/System/Library/Extensions/SweetMetal2.bundle"
@@ -918,15 +919,15 @@ note = "AirFair moved aside (FairPlay off; KNOWN-GOOD rk3a notes)"
 
 [[bundle]]
 path = "/var/local/hmetal/lib/HakiosMetal.bundle"
-source = "builds/hmetal-mesa/9ef02b6fe8c04228eaebd8f135a5afca2fc42e16-9ef02b6fe8/bench/HakiosMetal.bundle"
+source = "builds/hmetal-mesa/c8d929506bc99c7159d599f18c278be68e2d9550-c8d929506b/bench/HakiosMetal.bundle"
 target = "hmetal-mesa"
-ref = "ws-hm-xrreuse"
-sha = "9ef02b6fe8"
-note = "2026-11-17 (night): ws-hm-xrreuse 9ef02b6 = ws-hm-perf ad4e7af (hm-int14 3a027e8 + HM_PERF) + HM_XR_REUSE (env HM_XR_REUSE=1: App Library GPU 28 -> 10 ms/frame). MESA=1 build; plain hmetal builds have no compiler, never install them. Previous: builds/hmetal-mesa/ws-hm-perf-ad4e7af535"
+ref = "redfin-int"
+sha = "c8d929506b"
+note = "2026-11-19 camera wrap-up: redfin-int c8d9295 = hm camfix + ws-hm-planes (HM_PLANE_NATIVE/HM_PLANE_SHADOW default 1, HM_540_SWIZZLE default 2) + ws-k-inuse-hm (HM_SUBMIT_BOLIST default 1, falls back when the kernel refuses the list). MESA=1 build, host tests 369/369/14/195 ok. Info.plist not reinstalled (phone copy kept)"
 restart = "backboardd"
 CFBundleIdentifier = "org.redfin.hakios-metal-bench"
 CFBundleVersion = "1"
-files = { HakiosMetal = "072b74b54680d5c96e323fa89d0ba5ce1c918f6b1d517c079ce17b48d6539abe", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "7f09154ddf752ad03d11008b8dd69739c95f6da3d85949de5c08fefe8cfa90ae" }
+files = { HakiosMetal = "100b61c51adbaab626884dc3558570f5c4a35415ec38d75d6d298425adb3b376", "Info.plist" = "4e5e31dbeee1dddbe8cee3b74cbe495dd24ffeb0849aeca21fc9b0405417aebe", "_CodeSignature/CodeResources" = "a7d2b326dabc216392c3390d07dabd8dab565783a203a5f4b000de1a9cdcc767" }
 
 [[bundle]]
 path = "/var/local/hmetal/lib/SweetMetal2.bundle"
@@ -3847,3 +3848,77 @@ name = "sweetfpcd"
 
 [[process]]
 name = "biometrickitd"
+
+# 2026-11-19 camera wrap-up (redfin-int c8d9295): phone tools and camera plug-in flags (NOTES.md "Camera ..." lines).
+# camera-ife / camera-ife-still only act with a kernel that has the IFE sysctls (private camera kernel); otherwise the plug-in falls back to RAW10.
+[[file]]
+path = "/var/local/bin/pvm"
+source = "builds/userland/c8d929506bc99c7159d599f18c278be68e2d9550-c8d929506b/pvm"
+sha256 = "305b43c5dc4ab7785d16519d486da1fe1ae7fdee11766396c1cc240735134b3a"
+mode = "755"
+
+[[file]]
+path = "/var/local/bin/surfinuse"
+source = "builds/tools/surfinuse-1258"
+sha256 = "278079d94a5e28c9d215b528e372088200dc7de0a9cd91c31f9948042bba556f"
+mode = "755"
+
+[[file]]
+path = "/var/local/camera-tsfix"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-awb2"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-flashae2"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-ife"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-ife-still"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-antiband"
+source = "agent/stage/flags/antiband-50"
+sha256 = "1a6562590ef19d1045d06c4055742d38288e9e6dcd71ccde5cee80f1d5a774eb"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-noml"
+source = "agent/stage/flags/one-nl"
+sha256 = "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-minfps"
+source = "agent/stage/flags/minfps-24"
+sha256 = "68ca3fba3b7e864770cb61aeb306d4bd4354b68ab4dd38450860c5d823e42a53"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-aesettle"
+source = "agent/stage/flags/aesettle-2"
+sha256 = "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-afdone"
+source = "agent/stage/flags/one"
+sha256 = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+mode = "644"
