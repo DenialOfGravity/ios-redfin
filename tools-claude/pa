@@ -425,9 +425,12 @@ bbd_age() {	# -> seconds since backboardd started (its pid's line in the hm star
 		END{ if (pid != "" && (pid in st) && now > 0) print now - st[pid]; else print "?" }'
 }
 
-fb_moving() {	# -> 0 when kern.sweet_fb_frames moves within ${1:-3} s (frames reach the panel)
+fb_moving() {	# -> 0 when kern.sweet_fb_frames moves within ${1:-3} s of a no-op swipe (frames reach the panel)
+	# An idle screen draws nothing (fb_frames stays put), so the check makes iOS draw: the wake's own swipe up
+	# (home: the no-op home gesture; lock screen: unlock / passcode page), then counts the frames.
 	local a b
 	a=$(PA_SSH_TIMEOUT=10 ssh_to "$(pick_host)" '/var/local/bin/sctl kern.sweet_fb_frames' 2>/dev/null | sed 's/.*: *//')
+	pk "swipe 540 2335 540 1500 120" >/dev/null 2>&1
 	sleep "${1:-3}"
 	b=$(PA_SSH_TIMEOUT=10 ssh_to "$(pick_host)" '/var/local/bin/sctl kern.sweet_fb_frames' 2>/dev/null | sed 's/.*: *//')
 	FB_DELTA="${a:-?} -> ${b:-?}"
