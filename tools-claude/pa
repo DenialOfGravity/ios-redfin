@@ -50,6 +50,8 @@
 #   pa sleep                  iOS's own sleep (power key, only when it is awake), then p disp off
 #   pa shot [NAME]            screenshot -> logs/shots/NAME-MMDD-HHMMSS.png + .thumb.jpg (360 px, cheap to look at);
 #                             finds what the display engine scans (direct slot surface or the panel buffer) first
+#                             composed: every pipe CTL0/1 stages, src rect -> dst rect, mixer blend (mdp-layers.py);
+#                             prints one line per layer (+ NAME-*.layers.txt); PA_SHOT_V1=1: VIG0 only (old)
 #   pa tap X Y | pa swipe X1 Y1 X2 Y2 [MS] | pa key N [MS]
 #                             injected touch / buttons (panel pixels 1080x2340; key 0 power, 1 vol+, 2 vol-, 3 home)
 #   pa perf on|off [--restart] | status
@@ -489,7 +491,79 @@ pa_sleep() {
 	echo "asleep (iOS display $(ios_state); pa disp: $(disp_state))"
 }
 
-pa_shot() {	# [NAME] -> logs/shots/NAME-HHMMSS.png + .thumb.jpg, prints both paths and the fb-shot CLASS
+pa_shot() {	# [NAME] -> logs/shots/NAME-MMDD-HHMMSS.png + .thumb.jpg + .layers.txt: the frame the MDP composes
+	# (ws-int-tools-shot) every pipe CTL0/1 stages (tools-claude/mdp-layers.py: CTL/SSPP/LM registers via `pmem r`,
+	# read-only, the blocks `p mdp dump` reads), each surface read raw (VIG0's through pmemsnap as before), cropped by
+	# its source rect, placed at its output rect, blended in stage order with its mixer blend op. UBWC/tiled layers
+	# are not readable raw: hatched in the PNG and named in the layer lines. PA_SHOT_V1=1: the old VIG0-only shot
+	# (also the fallback when the registers can't be read).
+	[ -n "${PA_SHOT_V1:-}" ] && { pa_shot_v1 "$@"; return; }
+	local name=${1:-shot} d=$P/logs/shots stamp; stamp=$(date +%m%d-%H%M%S)
+	mkdir -p "$d"
+	local base=$d/$name-$stamp tmp=$d/.layers-$stamp L=$T/mdp-layers.py host plan out geo cls snapinfo= flip=
+	host=$(pick_host)
+	mkdir -p "$tmp"
+	# the registers, then VIG0/VIG1's SRC0 and CTL0's FLUSH again. The SSPP registers read back what the kernel last
+	# wrote: while CTL0 FLUSH (+0x18) is pending, or between the kernel's VIG0 and VIG1 writes of a flip, they name a
+	# surface the panel does not show yet (one the GPU may still be drawing: half a frame, garbage below). So only a
+	# dump with FLUSH 0 before and after and the same SRC0s is taken (up to 12 tries, ~0.25 s each).
+	local rc i settled= src='/var/local/bin/pmem r 0x0ae05014 1; /var/local/bin/pmem r 0x0ae07014 1; /var/local/bin/pmem r 0x0ae02018 1'
+	rc="$(python3 "$L" regs-cmd); echo ===; $src"
+	for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+		PA_SSH_TIMEOUT=15 ssh_to "$host" "$rc" > "$tmp/regs2.txt" 2>/dev/null </dev/null || continue
+		sed '/^===/,$d' "$tmp/regs2.txt" > "$tmp/regs.txt"
+		if [ "$(sed '1,/^===/d' "$tmp/regs2.txt" | sort)" = "$(grep -E '^0ae0(5014|7014|2018):' "$tmp/regs.txt" | sort)" ] &&
+			grep -q '^0ae02018: 00000000' "$tmp/regs.txt"; then
+			settled=1; cp "$tmp/regs.txt" "$tmp/regs-ok.txt"
+			# one surface on both halves (the usual latched state): done; halves on two surfaces (a flip that
+			# latched one pipe first) is real but brief: try a few more times for a single-surface frame
+			[ "$(grep -E '^0ae0[57]014:' "$tmp/regs.txt" | awk '{print $2}' | sort -u | wc -l)" = 1 ] && break
+		fi
+		sleep 0.05
+	done
+	[ -f "$tmp/regs-ok.txt" ] && cp "$tmp/regs-ok.txt" "$tmp/regs.txt"
+	if ! grep -q '^0ae05014:' "$tmp/regs.txt" 2>/dev/null || ! plan=$(python3 "$L" plan "$tmp/regs.txt" 2>&1); then
+		rm -rf "$tmp"
+		echo "(shot: MDP layer registers not read: VIG0-only fallback)"
+		pa_shot_v1 "$@"; return
+	fi
+	local a n p st f s
+	while read -r _ a n p st <&3; do	# fd 3: ssh and the file server read stdin
+		[ -n "$a" ] || continue
+		f=$tmp/surf-$a.bin
+		if [ "$p" = vig0 ] && [ -z "${PA_SHOT_PLAIN:-}" ] && s=$(PA_SSH_TIMEOUT=30 ssh_to "$host" \
+			"[ -x /var/local/bin/pmemsnap ] && /var/local/bin/pmemsnap /var/tmp/pa-shot.raw /var/tmp/pa-shot.regs $((n / st)) $((st / 4))" 2>/dev/null) &&
+			[ "${s%% *}" = "$a" ] && [ "$(echo "$s" | cut -d' ' -f2)" = "$n" ] &&
+			run "pull /var/tmp/pa-shot.raw $f" >/dev/null 2>&1 && [ "$(stat -c %s "$f" 2>/dev/null)" = "$n" ]; then
+			snapinfo=" pmemsnap $(echo "$s" | cut -d' ' -f4-8)"
+		else
+			run "files read /dev/pmem $a $n $f" >/dev/null 2>&1 || { sleep 0.3; run "files read /dev/pmem $a $n $f" >/dev/null 2>&1; }
+		fi
+	done 3<<< "$(grep '^read ' <<< "$plan")" </dev/null
+	# a flip between the register read and the surface reads: the frame may mix two presents (say so)
+	local now; now=$(PA_SSH_TIMEOUT=10 ssh_to "$host" '/var/local/bin/pmem r 0x0ae05014 1; /var/local/bin/pmem r 0x0ae07014 1' 2>/dev/null)
+	for a in 0ae05014 0ae07014; do
+		[ -n "$now" ] && [ "$(grep "^$a:" <<< "$now")" != "$(grep "^$a:" "$tmp/regs.txt")" ] && flip=" FLIPPED during the read"
+	done
+	out=$(python3 "$L" compose "$tmp/regs.txt" "$tmp" "$tmp/frame.bgra" 2>&1) || { echo "shot: compose failed: $out"; rm -rf "$tmp"; return 1; }
+	geo=$(head -1 <<< "$out"); geo=${geo#frame }
+	cls=$(python3 "$T/fb-shot.py" "$tmp/frame.bgra" "$base.png" 2 "$geo")
+	rm -rf "$tmp"
+	python3 - "$base.png" "$base.thumb.jpg" <<'EOF' 2>/dev/null
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB'); im.thumbnail((360, 780)); im.save(sys.argv[2], quality=70)
+EOF
+	local nl na; nl=$(grep -c '^layer ' <<< "$out"); na=$(grep '^layer ' <<< "$out" | awk '{print $6}' | sort -u | wc -l)
+	grep '^layer ' <<< "$out" > "$base.layers.txt"
+	local st; [ -n "$settled" ] && st="latched, $i reg reads" || st="NOT SETTLED: flush pending or pipes mid-flip in $i reads, may show a frame not yet on the panel"
+	echo "${base#$P/}.png (composed: $nl layers, $na surfaces$snapinfo$flip; $st; $geo) class $cls; thumbnail ${base#$P/}.thumb.jpg"
+	sed 's/^/  /' "$base.layers.txt"
+	grep -q 'NOT READ' "$base.layers.txt" && echo "  (hatched = a layer that could not be read raw, see NOT READ above)"
+	return 0
+}
+
+pa_shot_v1() {	# [NAME] (the pre-ws-int-tools-shot shot: VIG0's surface only) -> logs/shots/NAME-HHMMSS.png + .thumb.jpg, prints both paths and the fb-shot CLASS
 	local name=${1:-shot} d=$P/logs/shots stamp; stamp=$(date +%m%d-%H%M%S)
 	mkdir -p "$d"
 	local base=$d/$name-$stamp regs=$d/.vig0-$stamp.bin raw=$d/.raw-$stamp.bin snap=
