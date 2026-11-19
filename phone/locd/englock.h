@@ -39,6 +39,11 @@
 #ifndef LOCK_ORIG			/* the host test points it elsewhere */
 #define LOCK_ORIG	"/var/local/locd.lock-orig"
 #endif
+/* ws-gnss-fix: unlock=mi-keep's record of the original lock (same format as LOCK_ORIG). Unlike LOCK_ORIG it never
+ * triggers a restore/repair or keeps sweetlocd up; only unlock=restore reads it back (then renamed to *.restored). */
+#ifndef LOCK_KEPT
+#define LOCK_KEPT	"/var/local/locd.lock-kept"
+#endif
 
 struct lk_val {
 	int has_status, has_type, has_sub, has_client;

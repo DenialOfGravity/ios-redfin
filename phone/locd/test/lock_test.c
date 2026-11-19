@@ -601,6 +601,99 @@ static void s_time_off(void)
 	pump(300);
 }
 
+/* ---- ws-gnss-fix: unlock=mi-keep (MI cleared and kept, original recorded in LOCK_KEPT) and unlock=restore ---- */
+static int kept_mask(uint64_t *m) { return lk_load(LOCK_KEPT, m, NULL); }
+static void kept_clean(void) { unlink(LOCK_KEPT); unlink(LOCK_KEPT ".restored"); unlink(LOCK_ORIG); }
+
+static void s_keep(void)
+{
+	uint64_t fm = 0;
+	kept_clean();
+	up();
+	wordfile("session=30 unlock=mi-keep\n");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 1 && last_set_type == LK_TYPE_MT && !last_set_client);	/* NI stays locked */
+	CHECK(kept_mask(&fm) == 0 && fm == 3 && access(LOCK_ORIG, F_OK) != 0);
+	CHECK(start_ok == 1 && idx_first(LOC_START) > idx_first(LOC_SET_ENGINE_LOCK));
+	loc_shutdown("SIGTERM");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 1 && loc_quiet());		/* no restore on exit */
+	CHECK(kept_mask(&fm) == 0 && fm == 3 && access(LOCK_ORIG, F_OK) != 0);
+}
+
+/* after a reboot (the modem kept 0x2 in EFS): no SET at all, sessions run */
+static void s_keep_reboot(void)
+{
+	uint64_t fm = 0;
+	up();
+	wordfile("session=30 unlock=mi-keep\n");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 0 && start_ok == 1);
+	CHECK(kept_mask(&fm) == 0 && fm == 3);			/* the original stays the recorded 0x3, not the 0x2 read */
+}
+
+/* the word goes (pds=1 alone): nothing is sent, no repair, the record stays */
+static void s_keep_gone(void)
+{
+	uint64_t fm = 0;
+	up();
+	wordfile("session=30\n");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 0 && access(LOCK_ORIG, F_OK) != 0);
+	CHECK(kept_mask(&fm) == 0 && fm == 3 && loc_quiet());
+	wordfile(NULL);
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 0 && loc_quiet());
+}
+
+/* in one run: mi-keep, then the word is removed: still no SET */
+static void s_keep_then_off(void)
+{
+	kept_clean();
+	up();
+	wordfile("session=30 unlock=mi-keep\n");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 1);
+	wordfile("session=30\n");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 1 && access(LOCK_ORIG, F_OK) != 0);
+	CHECK(start_ok >= 1);
+}
+
+static void s_restore(void)
+{
+	up();
+	wordfile("unlock=restore\n");
+	pump(300);
+	CHECK(modem == 3 && nset == 1 && last_set_type == LK_TYPE_ALL && !last_set_client);
+	CHECK(access(LOCK_KEPT, F_OK) != 0 && access(LOCK_KEPT ".restored", F_OK) == 0 && access(LOCK_ORIG, F_OK) != 0);
+	wordfile("pds=1\n");
+	pump(300);
+	CHECK(modem == 3 && nset == 1);
+}
+
+static void s_restore_norecord(void)
+{
+	kept_clean();
+	up();
+	wordfile("unlock=restore\n");
+	pump(300);
+	CHECK(modem == 2 && nset == 0);
+}
+
+/* an earlier unlock=mi left LOCK_ORIG (modem at 0x2): mi-keep takes it over, sends nothing, no repair later */
+static void s_keep_adopt(void)
+{
+	uint64_t fm = 0;
+	kept_clean();
+	lk_save(LOCK_ORIG, 3, 0);
+	up();
+	wordfile("session=30 unlock=mi-keep\n");
+	pump(300);
+	CHECK(modem == LK_NFW && nset == 0 && access(LOCK_ORIG, F_OK) != 0 && kept_mask(&fm) == 0 && fm == 3);
+	CHECK(start_ok == 1);
+}
+
 static int run(const char *name, void (*f)(void), uint64_t *m)
 {
 	fflush(stdout);
@@ -665,7 +758,17 @@ int main(void)
 	RUN(s_time);
 	RUN(s_time_unc);
 	RUN(s_time_off);
-	unlink(LOC_ON); unlink(LOC_STATUS); unlink(LOCK_ORIG);
+	m = 3; bad += run("s_keep", s_keep, &m);
+	CHECK(m == 2);
+	bad += run("s_keep_reboot", s_keep_reboot, &m);
+	bad += run("s_keep_gone", s_keep_gone, &m);
+	CHECK(m == 2);
+	bad += run("s_restore", s_restore, &m);
+	CHECK(m == 3);
+	m = 2; bad += run("s_restore_norecord", s_restore_norecord, &m);
+	m = 3; bad += run("s_keep_then_off", s_keep_then_off, &m);
+	m = 2; bad += run("s_keep_adopt", s_keep_adopt, &m);
+	unlink(LOC_ON); unlink(LOC_STATUS); unlink(LOCK_ORIG); unlink(LOCK_KEPT); unlink(LOCK_KEPT ".restored");
 	printf("lock_test: %s (%d scenarios failed, %d checks failed)\n", bad || nfail ? "FAILED" : "all ok", bad, nfail);
 	return bad || nfail;
 }

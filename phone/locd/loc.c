@@ -34,6 +34,15 @@
  *                removed) when the word goes or changes, loc.on goes, or on SIGTERM/INT/HUP, after the session is stopped.
  *   unlock=none  the same, but the target is "nothing locked": this ALSO unlocks network-initiated (NI/E911/SUPL-MT)
  *                positioning while set. Only if unlock=mi is not enough.
+ *   unlock=mi-keep  (ws-gnss-fix, owner-approved 2026-11-19) as Android: the framework keeps the engine's MI (AFW) lock
+ *                open while the user's location setting is on, and the modem keeps that in EFS. Same read/SET/GET as
+ *                unlock=mi (lockType only, MI bit cleared, NI/E911 unchanged), but the original is recorded in
+ *                /var/local/locd.lock-kept (LOCK_KEPT, written before the SET) and NOTHING is restored: not on exit, not
+ *                when the word or loc.on goes, not after a reboot (no locd.lock-orig, so no repair and launchd does not
+ *                keep sweetlocd up). After a reboot the GET finds the target already set: no SET is sent. An existing
+ *                locd.lock-orig (an unrestored unlock=mi) is taken over into locd.lock-kept. Dropping the word sends nothing.
+ *   unlock=restore  (ws-gnss-fix) the way back: SET the original recorded in locd.lock-kept (lockType only), GET to
+ *                confirm, then the record is renamed locd.lock-kept.restored. Nothing is sent without a record.
  *                Any other unlock= value is ignored (logged). Every engine lock change is logged with old/new values
  *                ("ENGINE LOCK"). Crash repair: when locd.lock-orig exists and no unlock word is set (also with loc.on
  *                absent: launchd starts us for that file), its value is restored (GET, SET, GET), at most 5 runs.
@@ -155,7 +164,7 @@ struct req {
 
 static int srv_up;
 static uint32_t srv_node, srv_port, srv_inst;
-static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2 none */
+static int on_present, w_probe, w_pds, w_session, w_unlock;	/* w_unlock: 1 mi, 2 none, 3 mi-keep, 4 restore */
 static int w_client, w_clientid, w_opmode, w_start_android, w_lockclient, w_lockev;	/* ws-gnss-f; w_client 1 afw, 2 nfw */
 static int w_time;			/* ws-gnss-g time=1 */
 static int w_rfmetrics;		/* ws-gnss-j rfmetrics=1 */
@@ -235,10 +244,10 @@ static int lockread_state;		/* 0 not asked, 1 queued/in flight, 2 done */
 static int refusal_report_pending;
 /* engine lock (unlock=mi / unlock=none / repair; englock.h): its own one-request slot, sent before the queue */
 enum { LK_IDLE, LK_RD, LK_RD_DV, LK_SET, LK_CHK, LK_UNLOCKED, LK_RS_SET, LK_RS_CHK, LK_RP_RD, LK_NOOP, LK_FAILED, LK_RS_FAILED,
-       LK_EFS };
+       LK_EFS, LK_RESTORED };
 static const char *const lk_names[] = { "idle", "reading", "reading DV", "setting", "checking", "UNLOCKED", "restoring",
 					"checking restore", "repair read", "no change needed", "unlock failed", "RESTORE FAILED",
-					"restored, waiting for the EFS write" };
+					"restored, waiting for the EFS write", "restored (unlock=restore)" };
 static unsigned lk_orig_kind;			/* ws-gnss-f: LK_KIND_* of the original GET */
 static int lk_orig_dv_known;
 static uint64_t lk_orig_dv;
@@ -258,6 +267,15 @@ static struct {
 } lkq;
 
 static unsigned long long now_ms(void) { return (unsigned long long)link_ms(); }
+
+/* ws-gnss-fix: the unlock word as text */
+static const char *lk_word(int w)
+{
+	return w == 1 ? "unlock=mi" : w == 2 ? "unlock=none" : w == 3 ? "unlock=mi-keep" : w == 4 ? "unlock=restore" : "none";
+}
+
+/* ws-gnss-fix: where the original is recorded: unlock=mi-keep / unlock=restore use LOCK_KEPT (no auto restore/repair) */
+#define LK_FILE	(lk_mode >= 3 ? LOCK_KEPT : LOCK_ORIG)
 
 /* ws-gnss-f: a request's TLV bytes in hex (all our requests are short: no position data is ever sent) */
 static void hex_req(uint16_t id, const uint8_t *tl, uint32_t tn)
@@ -1052,14 +1070,20 @@ static int efs_changed(const long long ref[2], int *which)
 	return 0;
 }
 
+static int lk_save_kind_to(const char *path, uint64_t mask, unsigned tries, int efs);
 static int lk_save_kind(uint64_t mask, unsigned tries, int efs)
+{
+	return lk_save_kind_to(LOCK_ORIG, mask, tries, efs);
+}
+
+static int lk_save_kind_to(const char *path, uint64_t mask, unsigned tries, int efs)
 {
 	struct lk_file lf = { .mask = mask, .tries = tries, .kind = lk_orig_kind, .efs = (unsigned)efs };
 	if (efs) {
 		lf.m1 = efs_m[0];
 		lf.m2 = efs_m[1];
 	}
-	return lk_save_ex(LOCK_ORIG, &lf);
+	return lk_save_ex(path, &lf);
 }
 
 /* ---- engine lock: unlock=mi / unlock=none, restore, crash repair (header; englock.h) ---- */
@@ -1068,9 +1092,15 @@ static int lk_active(void)
 	return lk == LK_RD || lk == LK_RD_DV || lk == LK_SET || lk == LK_CHK || lk == LK_RS_SET || lk == LK_RS_CHK || lk == LK_RP_RD;
 }
 
+/* ws-gnss-fix: unlock=mi-keep (lk_mode 3) is never restored by itself (the cleared MI bit stays, as Android keeps its
+ * location setting's engine lock); unlock=restore (lk_mode 4) restores only while that word is set */
 static int lk_restore_wanted(void)
 {
-	return lk == LK_UNLOCKED && (shutting || !on_present || w_unlock != lk_mode);
+	if (lk != LK_UNLOCKED || lk_mode == 3)
+		return 0;
+	if (lk_mode == 4)
+		return on_present && !shutting && w_unlock == 4;
+	return shutting || !on_present || w_unlock != lk_mode;
 }
 
 static int lk_repair_wanted(void)
@@ -1200,18 +1230,50 @@ static void lk_event(int ok, const struct qmi_msg *m)
 			break;
 		}
 		struct lk_file lf;
-		int fr = lk_load_ex(LOCK_ORIG, &lf);
+		if (lk_mode == 4) {	/* ws-gnss-fix unlock=restore: back to what unlock=mi-keep recorded */
+			if (lk_load_ex(LOCK_KEPT, &lf)) {
+				lk_fail(LK_FAILED, "unlock=restore: no readable " LOCK_KEPT ": nothing recorded, nothing changed");
+				break;
+			}
+			lk_orig = lf.mask;
+			lk_orig_kind = lf.kind ? lf.kind : (v.has_type ? LK_KIND_TYPE : 0) | (v.has_client ? LK_KIND_CLIENT : 0);
+			printf("[%6llu] loc: engine lock: unlock=restore: recorded original %s (%s), modem now %s\n", now_ms(),
+			       lk_str(lk_orig, a, sizeof(a)), LOCK_KEPT, lk_str((uint64_t)mask, b, sizeof(b)));
+			if ((uint64_t)mask == lk_orig) {
+				rename(LOCK_KEPT, LOCK_KEPT ".restored");
+				printf("[%6llu] loc: engine lock: unlock=restore: modem already at the original: %s renamed to .restored\n",
+				       now_ms(), LOCK_KEPT);
+				lk_mode = 0;
+				lk = LK_RESTORED;
+				break;
+			}
+			lk_rs_tries = 0;
+			lk_restore_start("unlock=restore");
+			break;
+		}
+		int fr = lk_load_ex(LK_FILE, &lf);
 		if (fr == -2) {
-			lk_fail(LK_FAILED, LOCK_ORIG " exists but is unreadable: not touching the lock");
+			lk_fail(LK_FAILED, "the original lock file exists but is unreadable: not touching the lock");
 			break;
 		}
 		lk_orig_kind = (v.has_type ? LK_KIND_TYPE : 0) | (v.has_client ? LK_KIND_CLIENT : 0);
+		if (fr != 0 && lk_mode == 3 && lk_load_ex(LOCK_ORIG, &lf) == 0) {
+			/* an earlier unlock=mi run left its original: adopt it as mi-keep's record (no repair/restore from now on) */
+			if (lk_save_kind_to(LOCK_KEPT, lf.mask, 0, 0)) {
+				lk_fail(LK_FAILED, "cannot write " LOCK_KEPT ": not unlocking");
+				break;
+			}
+			unlink(LOCK_ORIG);
+			printf("[%6llu] loc: engine lock: unlock=mi-keep: original %s taken over from %s into %s (removed)\n", now_ms(),
+			       lk_str(lf.mask, a, sizeof(a)), LOCK_ORIG, LOCK_KEPT);
+			fr = 0;
+		}
 		if (fr == 0) {
 			lk_orig = lf.mask;
 			if (lf.kind)
 				lk_orig_kind = lf.kind;
-			printf("[%6llu] loc: engine lock: original from %s (an earlier run did not restore): %s\n", now_ms(), LOCK_ORIG,
-			       lk_str(lk_orig, a, sizeof(a)));
+			printf("[%6llu] loc: engine lock: original from %s (%s): %s\n", now_ms(), LK_FILE,
+			       lk_mode == 3 ? "recorded by unlock=mi-keep" : "an earlier run did not restore", lk_str(lk_orig, a, sizeof(a)));
 		} else {
 			lk_orig = (uint64_t)mask;
 			printf("[%6llu] loc: engine lock: ORIGINAL %s\n", now_ms(), lk_str(lk_orig, a, sizeof(a)));
@@ -1239,29 +1301,31 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		lk_target = lk_mode == 2 ? 0 : (lk_orig & ~LK_AFW);
 		if (lk_now_mask == lk_target) {
 			if (lk_target == lk_orig) {
-				printf("[%6llu] loc: engine lock: %s already allows our sessions: nothing to set\n", now_ms(),
-				       lk_str(lk_orig, a, sizeof(a)));
-				unlink(LOCK_ORIG);
+				printf("[%6llu] loc: engine lock: %s already allows our sessions: nothing to set%s\n", now_ms(),
+				       lk_str(lk_orig, a, sizeof(a)), lk_mode == 3 ? " (no record of an earlier original)" : "");
+				if (lk_mode != 3)
+					unlink(LOCK_ORIG);
 				lk = LK_NOOP;
 			} else {
-				if (access(LOCK_ORIG, F_OK) && lk_save_kind(lk_orig, 0, 0)) {
-					lk_fail(LK_FAILED, "already at the target but " LOCK_ORIG " cannot be written");
+				if (access(LK_FILE, F_OK) && lk_save_kind_to(LK_FILE, lk_orig, 0, 0)) {
+					lk_fail(LK_FAILED, "already at the target but the original cannot be written");
 					break;
 				}
-				printf("[%6llu] loc: engine lock: modem already at the target %s (original %s kept in %s)\n", now_ms(),
-				       lk_str(lk_target, a, sizeof(a)), lk_str(lk_orig, b, sizeof(b)), LOCK_ORIG);
+				printf("[%6llu] loc: engine lock: modem already at the target %s (original %s kept in %s)%s\n", now_ms(),
+				       lk_str(lk_target, a, sizeof(a)), lk_str(lk_orig, b, sizeof(b)), LK_FILE,
+				       lk_mode == 3 ? ": MI KEPT CLEARED, no SET sent" : "");
 				lk = LK_UNLOCKED;
 			}
 			break;
 		}
-		if (access(LOCK_ORIG, F_OK) && lk_save_kind(lk_orig, 0, 0)) {
-			printf("[%6llu] loc: engine lock: cannot write %s (%s)\n", now_ms(), LOCK_ORIG, strerror(errno));
+		if (access(LK_FILE, F_OK) && lk_save_kind_to(LK_FILE, lk_orig, 0, 0)) {
+			printf("[%6llu] loc: engine lock: cannot write %s (%s)\n", now_ms(), LK_FILE, strerror(errno));
 			lk_fail(LK_FAILED, "original not saved: not unlocking");
 			break;
 		}
-		printf("[%6llu] loc: engine lock: original saved in %s\n", now_ms(), LOCK_ORIG);
+		printf("[%6llu] loc: engine lock: original saved in %s\n", now_ms(), LK_FILE);
 		lk_try = 1;	/* ws-gnss-h: lockType only on every try (lockclient=1 no longer adds the TLV) */
-		lk_set(lk_target, lk_try == 2, lk_mode == 2 ? "unlock=none" : "unlock=mi");
+		lk_set(lk_target, lk_try == 2, lk_word(lk_mode));
 		lk = LK_SET;
 		break;
 	case LK_SET:
@@ -1277,8 +1341,9 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		break;
 	case LK_CHK:
 		if (ok && mask >= 0 && (uint64_t)mask == lk_target) {
-			printf("[%6llu] loc: ENGINE LOCK now %s (original %s; restored when the word/loc.on goes or on exit)\n", now_ms(),
-			       lk_str((uint64_t)mask, a, sizeof(a)), lk_str(lk_orig, b, sizeof(b)));
+			printf("[%6llu] loc: ENGINE LOCK now %s (original %s; %s)\n", now_ms(), lk_str((uint64_t)mask, a, sizeof(a)),
+			       lk_str(lk_orig, b, sizeof(b)), lk_mode == 3 ? "KEPT: not restored on exit, record in " LOCK_KEPT
+			       ", unlock=restore puts it back" : "restored when the word/loc.on goes or on exit");
 			lk = LK_UNLOCKED;
 			lk_verify = 0;
 			efs_watch_start(1, "unlock");
@@ -1301,6 +1366,16 @@ static void lk_event(int ok, const struct qmi_msg *m)
 		lk_restore_start("unlock not confirmed: putting the original back");
 		break;
 	case LK_RS_CHK:
+		if (ok && mask >= 0 && (uint64_t)mask == lk_orig && lk_mode == 4) {	/* ws-gnss-fix unlock=restore done */
+			rename(LOCK_KEPT, LOCK_KEPT ".restored");
+			printf("[%6llu] loc: ENGINE LOCK restored to the recorded original %s (unlock=restore); %s renamed to .restored\n",
+			       now_ms(), lk_str(lk_orig, a, sizeof(a)), LOCK_KEPT);
+			efs_watch_start(1, "unlock=restore");
+			lk_mode = 0;
+			lk_rs_tries = 0;
+			lk = LK_RESTORED;
+			break;
+		}
 		if (ok && mask >= 0 && (uint64_t)mask == lk_orig) {
 			lk_mode = 0;
 			lk_rs_tries = 0;
@@ -1385,8 +1460,15 @@ static void lk_poll(void)
 		lk = LK_IDLE;
 		efs_watch = 0;
 	}
-	if ((lk == LK_FAILED || lk == LK_NOOP) && lk_gen_done != on_gen)
+	if ((lk == LK_FAILED || lk == LK_NOOP || lk == LK_RESTORED) && lk_gen_done != on_gen)
 		lk = LK_IDLE;
+	/* ws-gnss-fix: mi-keep / restore end when their word goes: the modem keeps what it has, nothing is sent */
+	if (lk == LK_UNLOCKED && lk_mode >= 3 && on_present && !shutting && w_unlock != lk_mode && !lk_verify) {
+		printf("[%6llu] loc: engine lock: %s no longer set: the modem keeps its lock as it is (nothing sent)\n", now_ms(),
+		       lk_word(lk_mode));
+		lk = LK_IDLE;
+		lk_mode = 0;
+	}
 	if (lk == LK_RS_FAILED && lk_fail_gen != on_gen && !shutting)
 		lk = lk_mode ? LK_UNLOCKED : LK_IDLE;
 	if (lk == LK_UNLOCKED && lk_verify && idle) {	/* the server went away mid-change: read back first */
@@ -1412,7 +1494,7 @@ static void lk_poll(void)
 		lk_mode = w_unlock;
 		lk_rs_tries = 0;
 		lk_verify = 0;
-		printf("[%6llu] loc: engine lock: unlock=%s requested: reading the lock first\n", now_ms(), w_unlock == 2 ? "none" : "mi");
+		printf("[%6llu] loc: engine lock: %s requested: reading the lock first\n", now_ms(), lk_word(w_unlock));
 		lk_get(0, "GET_ENGINE_LOCK (before unlock)");
 		lk = LK_RD;
 		return;
@@ -1484,8 +1566,13 @@ static void read_on(void)
 			w_unlock = 1;
 		else if (k == 4 && !strncmp(w + 7, "none", 4))
 			w_unlock = 2;
+		else if (k == 7 && !strncmp(w + 7, "mi-keep", 7))
+			w_unlock = 3;
+		else if (k == 7 && !strncmp(w + 7, "restore", 7))
+			w_unlock = 4;
 		else
-			printf("[%6llu] loc: %s: unknown %.*s ignored (only unlock=mi or unlock=none)\n", now_ms(), LOC_ON, (int)(k + 7), w);
+			printf("[%6llu] loc: %s: unknown %.*s ignored (only unlock=mi, mi-keep, restore or none)\n", now_ms(), LOC_ON,
+			       (int)(k + 7), w);
 	}
 	w_client = 0;
 	if ((w = strstr(b, "client="))) {
@@ -1564,8 +1651,8 @@ static void read_on(void)
 	dropped = 0;
 	after_drop = 0;
 	fails = 0;
-	printf("[%6llu] loc: %s %s:%s%s%s%s session=%d\n", now_ms(), LOC_ON, present ? "present" : "absent",
-	       w_probe ? " probe=1" : "", w_pds ? " pds=1" : "", w_unlock == 1 ? " unlock=mi" : w_unlock == 2 ? " unlock=none" : "",
+	printf("[%6llu] loc: %s %s:%s%s%s%s%s session=%d\n", now_ms(), LOC_ON, present ? "present" : "absent",
+	       w_probe ? " probe=1" : "", w_pds ? " pds=1" : "", w_unlock ? " " : "", w_unlock ? lk_word(w_unlock) : "",
 	       (!w_probe && !w_pds && !w_session && !w_unlock) ? " (no words)" : "", w_session);
 	if (w_time)
 		printf("[%6llu] loc: ws-gnss-g words: time=1 timeunc=%u ms (INJECT_UTC_TIME at session start and on INJECT_TIME_REQ)\n",
@@ -1606,9 +1693,9 @@ static void write_status(void)
 	{
 		char a[96], b[96];
 		fprintf(f, "loc: engine lock %s (word %s), modem %s, original %s%s\n", lk_names[lk],
-			w_unlock == 1 ? "unlock=mi" : w_unlock == 2 ? "unlock=none" : "none",
+			lk_word(w_unlock),
 			lk_now_known ? lk_str(lk_now_mask, a, sizeof(a)) : "not read", lk_orig || lk_now_known ? lk_str(lk_orig, b, sizeof(b)) : "-",
-			access(LOCK_ORIG, F_OK) ? "" : ", " LOCK_ORIG " present");
+			access(LOCK_ORIG, F_OK) ? (access(LOCK_KEPT, F_OK) ? "" : ", " LOCK_KEPT " present") : ", " LOCK_ORIG " present");
 		fprintf(f, "loc: ws-gnss-f client %s%s, opmode %s, start %s, lockclient %d, lockev %d, original kind %s, EFS watch %s\n",
 			w_client == LOC_CLIENT_AFW ? "afw" : w_client == LOC_CLIENT_NFW ? "nfw" : "none (modem default NFW)",
 			w_clientid ? " +id HAL" : "", w_opmode ? "standalone" : "not sent", w_start_android ? "android" : "ours", w_lockclient,
@@ -1851,19 +1938,22 @@ static void on_position(const uint8_t *tl, uint32_t tn)
 		return;
 	}
 	nfix_all++;
+	int first_good = 0;
 	if (f.status == 0 && f.has_lat && f.has_lon) {
 		nfix_good++;
-		if (!ttff_ms && sess_t0)
+		if (!ttff_ms && sess_t0) {
 			ttff_ms = link_ms() - sess_t0 ? link_ms() - sess_t0 : 1;
+			first_good = 1;
+		}
 	}
 	last = f;
 	have_last = 1;
 	status_dirty = 1;
-	if (nfix_all <= 3 || nfix_all % 30 == 0 || f.status > 1)
+	if (nfix_all <= 3 || nfix_all % 30 == 0 || f.status > 1 || first_good || (f.status == 0 && nfix_good <= 3))
 	{			/* ws-gnss-k: no latitude/longitude/altitude in any log line */
 		char fb[200];
 		loc_fix_str(&f, fb, sizeof(fb));
-		printf("[%6llu] loc: fix #%u %s\n", now_ms(), nfix_all, fb);
+		printf("[%6llu] loc: fix #%u %s%s\n", now_ms(), nfix_all, fb, first_good ? " (FIRST GOOD FIX)" : "");
 	}
 	if (sess_owner != 1 || !pds.client.valid)
 		return;
@@ -1877,9 +1967,12 @@ static void on_position(const uint8_t *tl, uint32_t tn)
 	if (!n)
 		return;
 	if (pds_send_ind(pds.client.pipe, pds.client.sess, PDS_SVC, pds.client.cid, PDS_EVENT_REPORT, b, n) == 0) {
+		static unsigned npos_good_sent;	/* ws-gnss-fix: the first status-0 reports to locationd are logged too */
 		npos_sent++;
 		pds.nind++;
-		if (npos_sent <= 3)
+		if (f.status == 0)
+			npos_good_sent++;
+		if (npos_sent <= 3 || (f.status == 0 && npos_good_sent <= 3))
 			printf("[%6llu] loc: EVENT_REPORT to locationd (pipe %u sess %u cid %u): %u TLV bytes, status %u\n", now_ms(),
 			       pds.client.pipe, pds.client.sess, pds.client.cid, n, f.status);
 	}
