@@ -42,6 +42,7 @@ build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServic
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
 build memwarn memwarn.c
 build sctl sctl.c
+build surfinuse surfinuse.c -framework IOSurface -framework CoreFoundation
 build pdptest pdptest.c
 build pmem pmem.c
 build a2s a2s.c
