@@ -78,7 +78,8 @@ def where(regs, monklog=None):
     # xnu 1111: a UBWC-compressed surface (SRC_FORMAT +0x30 fetch mode bits 31:30 = 2): its bytes are not rows, no shot
     if len(r) >= 0x34 and (struct.unpack_from('<I', r, 0x30)[0] >> 30) == 2:
         return 'ubwc 0x%x 0 - (compressed scanout: no raw screenshot)' % pa
-    if pa == 0xa0000000 or pa == 0xa0a00000 or not stride:
+    # xnu 1263: a composite in the third panel buffer (GPU-pool RAM, the panel buffers' 4352-byte rows)
+    if pa == 0xa0000000 or pa == 0xa0a00000 or not stride or stride == S:
         return 'blit 0x%x %d -' % (pa if pa else 0xa0000000, H * S)
     w, h, slot = 1125, 2436, '?'
     if monklog and os.path.exists(monklog):
