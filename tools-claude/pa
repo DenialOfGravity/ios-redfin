@@ -260,6 +260,7 @@ clear)
 		drop $D/m2-fallback "$n"; drop $D/trip-test "$n"
 		[ -f $D/trips/$n.why ] && $PT mv $D/trips/$n.why $D/trips/$n.why.cleared-$now
 		echo "$($PT date -u '+%Y-%m-%d %H:%M:%S UTC') $now $n CLEARED by pa fallback clear: back to hakios-metal at its next start" >> $D/fallback.log
+		$PT chmod 666 $D/fallback.log   # the dispatcher appends as the process's user (backboardd: mobile)
 		echo "cleared $n"
 	done
 	case " $* " in
