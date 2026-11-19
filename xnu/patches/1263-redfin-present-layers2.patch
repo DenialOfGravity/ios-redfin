@@ -9,6 +9,7 @@ layout from Mesa's a6xx.xml; the 2D engine does it, no shader pass). Without it 
 applied twice). The corner mattes keep the old mode (black: the same either way).
 Default 3 (bits 0 and 1; r73lay2: CA's surfaces carry no colour above their alpha, i.e. are premultiplied; the
 All Photos segment pill's edge: 1262 dark fringe, 1263 a clean ramp). 1 = 1262's blend.
+Default 7 since 2026-11-19 (owner): bits 0-2, i.e. also the third panel buffer below; 3 = two buffers.
 
 kern.sweet_present_layers bit 2 (0x4): a third panel buffer for composites (10 MB from the GPU pool below 4 GB, mapped
 for the GPU above the two splash buffers, taken at the first composite with the bit). A composite no longer waits for
@@ -401,7 +402,7 @@ index 5704379..bac75a0 100644
   */
  extern "C" uint32_t sweet_present_layers;
 -uint32_t sweet_present_layers = 1;	/* default 1 since 2026-11-19 (owner-tested); 0 = off */
-+uint32_t sweet_present_layers = 3;	/* 1263: default 3 (bit 1 premultiplied blend, checked r73lay2); 1 = 1262's blend; 0 = off; | 4 = third buffer */
++uint32_t sweet_present_layers = 7;	/* 1263: default 7 since 2026-11-19 (owner): bit 0 composite, bit 1 premultiplied, bit 2 third panel buffer; 3 = two buffers; 1 = 1262's blend; 0 = off */
  static struct {
  	uint32_t id[SWEET_FB_LAYERS];
  	uint8_t  src[SWEET_FB_LAYERS][16], dst[SWEET_FB_LAYERS][16];
