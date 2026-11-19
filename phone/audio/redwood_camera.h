@@ -91,6 +91,26 @@ struct redwood_camera_command {
 	uint32_t        a, b, c, d;
 };
 
+/*
+ * (kernel 1257, where the rear camera's binned mode can go through the IFE pixel path) FORMAT: a 1 MIPI RAW10, 2 NV12, for
+ * this opening (the last close forgets it); the frames' format says what came (a mode or sensor without the pixel path:
+ * RAW10 still). An NV12 frame: format 2, stride the luma's bytes a line, header_bytes covering a struct
+ * redwood_camera_frame_nv12 at its end (the chroma plane's place, and the white balance it was made with).
+ * EXPOSURE with bytes >= 12: three uint32_t follow, the white balance's R, G, B (256 = 1x, 0 = as it is); a 0 with
+ * them: the white balance alone. COLOUR: a 1, nine int32_t follow, the colour matrix (4096 = 1.0, rows R G B out,
+ * columns R G B in; none: the kernel's default); a 2, 65 uint16_t follow, the gamma's output (0..1023) at input i/64
+ * of white (none: the default). Both taken at a frame's start and kept until the last close.
+ */
+enum { REDWOOD_CAMERA_FORMAT = 6, REDWOOD_CAMERA_COLOUR = 7 };
+enum { REDWOOD_CAMERA_FORMAT_RAW10 = 1, REDWOOD_CAMERA_FORMAT_NV12 = 2 };
+struct redwood_camera_frame_nv12 {
+	uint32_t        plane1_offset;  /* the CbCr plane, from the frame's first byte */
+	uint32_t        plane1_stride;
+	uint32_t        wb_r, wb_g, wb_b;       /* the white balance it was made with, 256 = 1x */
+	uint32_t        isp;            /* 1: the IFE pixel path */
+	uint32_t        reserved[2];
+};
+
 /* (the camera plug-in's names for the same: WS-B wrote against the plan's contract before 0929-0934) */
 #define REDWOOD_CAMERA_MODE_AUTO        REDWOOD_CAMERA_CLASS_AUTO
 #define REDWOOD_CAMERA_MODE_PHOTO       REDWOOD_CAMERA_CLASS_PHOTO

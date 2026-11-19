@@ -349,7 +349,9 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 	double knee, analog, sensor_digital = 1, digital = 1;
 
 	if (isp->asked) {
-		if (!ae_got(isp, f) && ++isp->asked_frames < AE_PATIENCE) {
+		bool waited = ++isp->asked_frames > isp->ae_settle;       /* (ws-cam-smooth: camera-aesettle) */
+
+		if ((!ae_got(isp, f) || !waited) && isp->asked_frames < AE_PATIENCE) {
 			isp->ae_stable = false;
 			return false;           /* (the last change not in the frames yet) */
 		}
@@ -406,9 +408,17 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
 	}
 	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
+	/* (camera-antiband) an exposure of a flicker period or more that is not a whole number of them is moved even when settled */
+	double band_us = isp->antiband_hz >= 40 && isp->antiband_hz <= 70 ? 1e6 / (2.0 * isp->antiband_hz) : 0;
+	double e_now = f->exposure_lines * line_us;
+	bool off_band = band_us > 0 && e_now >= band_us * 0.95 && fabs(e_now - band_us * floor(e_now / band_us + 0.5)) > band_us * 0.03;
+
 	if (ratio > 0.94 && ratio < 1.06) {
-		isp->ae_stable = true;
-		return false;
+		if (!off_band) {
+			isp->ae_stable = true;
+			return false;
+		}
+		ratio = 1;
 	}
 	isp->ae_stable = false;
 	want = now * pow(ratio, 0.7);
@@ -423,6 +433,26 @@ isp_ae(struct isp *isp, const struct redwood_camera_frame *f, const struct isp_s
 		lines = (uint32_t)(want / knee);
 		lines = lines > longest ? longest : lines < fast ? fast : lines;
 		gain_total = want / lines;
+	}
+	if (band_us > 0) {
+		/* (camera-antiband) whole flicker periods, the same exposure times gain */
+		double e = lines * line_us, total = lines * gain_total;
+
+		if (e >= band_us) {
+			uint32_t q = (uint32_t)(floor(e / band_us) * band_us / line_us + 0.5);
+
+			if (q >= 4) {
+				lines = q;
+				gain_total = total / q;
+			}
+		} else if (gain_total > 1) {
+			uint32_t q = (uint32_t)(band_us / line_us + 0.5);
+
+			if (q <= longest && total / q >= 1) {
+				lines = q;
+				gain_total = total / q;
+			}
+		}
 	}
 split:
 	if (isp->ae_max_gain >= 1 && gain_total > isp->ae_max_gain) {
@@ -1451,4 +1481,445 @@ isp_tune(struct isp *isp, float lux_index, float cct)
 		}
 	}
 	isp->lsc.on = true;
+}
+
+/* ---- redfin (ws-cam-ife): frames the kernel's IFE pixel path made -------------------------------------------------- */
+
+static float nv12_lin[256];     /* an 8-bit sRGB-curved value back to linear (1: white) */
+
+static void
+nv12_lin_init(void)
+{
+	if (nv12_lin[255] == 1) {
+		return;
+	}
+	for (int i = 0; i < 256; i++) {
+		double v = i / 255.0;
+
+		nv12_lin[i] = (float)(v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4));
+	}
+}
+
+void
+isp_gamma_knots(uint16_t k[65])
+{
+	for (int i = 0; i <= 64; i++) {
+		double v = i / 64.0;
+
+		/* the same curve as isp_init()'s table, white at the pipeline's white */
+		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
+		k[i] = (uint16_t)(v * 1023 + 0.5);
+	}
+}
+
+bool
+isp_nv12_of(const struct redwood_camera_frame *f, const float ccm[3][3], struct isp_nv12 *v)
+{
+	const struct redwood_camera_frame_nv12 *x;
+	double m[3][3], det;
+
+	if (f->format != REDWOOD_CAMERA_FORMAT_NV12 || f->header_bytes < sizeof(*f) + sizeof(*x) || f->width < 16 || f->height < 16 ||
+	    f->stride < f->width) {
+		return false;
+	}
+	x = (const void *)((const uint8_t *)f + f->header_bytes - sizeof(*x));
+	if (x->plane1_offset < (uint64_t)f->stride * f->height || x->plane1_stride < f->width) {
+		return false;
+	}
+	nv12_lin_init();
+	v->y = (const uint8_t *)f + f->header_bytes;
+	v->uv = v->y + x->plane1_offset;
+	v->y_stride = f->stride;
+	v->uv_stride = x->plane1_stride;
+	v->wb[0] = x->wb_r ? x->wb_r / 256.0f : 1;
+	v->wb[1] = x->wb_g ? x->wb_g / 256.0f : 1;
+	v->wb[2] = x->wb_b ? x->wb_b / 256.0f : 1;
+	v->shaded = (x->isp & 2) != 0;
+	v->hw_lsc = NULL;
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			m[r][c] = ccm != NULL ? ccm[r][c] : r == c;
+			v->unmix[r][c] = r == c;
+		}
+	}
+	det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+	    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+	if (fabs(det) > 1e-6) {
+		v->unmix[0][0] = (float)((m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det);
+		v->unmix[0][1] = (float)((m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det);
+		v->unmix[0][2] = (float)((m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det);
+		v->unmix[1][0] = (float)((m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det);
+		v->unmix[1][1] = (float)((m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det);
+		v->unmix[1][2] = (float)((m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det);
+		v->unmix[2][0] = (float)((m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det);
+		v->unmix[2][1] = (float)((m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det);
+		v->unmix[2][2] = (float)((m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det);
+	}
+	return true;
+}
+
+static inline uint8_t
+clamp8(float v)
+{
+	return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f);
+}
+
+/*
+ * The 2x2 pixels at (px, py) (even) as the sensor's cell had them: R, G, B in 10-bit steps above black, undone from
+ * BT.601 full range, the sRGB curve, the colour matrix and the white balance the frame was made with. near_white: the
+ * picture has it at or near white in some colour (clipped there).
+ */
+static inline void
+nv12_cell(const struct isp_nv12 *v, uint32_t px, uint32_t py, float out[3], bool *near_white)
+{
+	const uint8_t *y0 = v->y + (size_t)py * v->y_stride + px, *y1 = y0 + v->y_stride, *c = v->uv + (size_t)(py / 2) * v->uv_stride + px;
+	float y = (y0[0] + y0[1] + y1[0] + y1[1]) * 0.25f, cb = c[0] - 128.0f, cr = c[1] - 128.0f;
+	uint8_t q[3] = { clamp8(y + 1.402f * cr), clamp8(y - 0.344136f * cb - 0.714136f * cr), clamp8(y + 1.772f * cb) };
+	float l[3] = { nv12_lin[q[0]], nv12_lin[q[1]], nv12_lin[q[2]] };
+
+	*near_white = q[0] >= 250 || q[1] >= 250 || q[2] >= 250;
+	for (int i = 0; i < 3; i++) {
+		float a = v->unmix[i][0] * l[0] + v->unmix[i][1] * l[1] + v->unmix[i][2] * l[2];
+
+		a = a * WHITE / v->wb[i];
+		out[i] = a < 0 ? 0 : a;
+	}
+}
+
+/* (ws-cam-ife2) a shading table's gains at (u, v), as lsc_at() */
+static inline void
+lsc_table_at(const float (*t)[LSC_H][LSC_W], float u, float v, float g[3])
+{
+	float gx = u * (LSC_W - 1), gy = v * (LSC_H - 1);
+	int x = (int)gx, y = (int)gy;
+
+	x = x < 0 ? 0 : x > LSC_W - 2 ? LSC_W - 2 : x;
+	y = y < 0 ? 0 : y > LSC_H - 2 ? LSC_H - 2 : y;
+	float fx = gx - x, fy = gy - y;
+
+	for (int c = 0; c < 3; c++) {
+		g[c] = (t[c][y][x] * (1 - fx) + t[c][y][x + 1] * fx) * (1 - fy) + (t[c][y + 1][x] * (1 - fx) + t[c][y + 1][x + 1] * fx) * fy;
+	}
+}
+
+void
+isp_measure_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, struct isp_stats *s)
+{
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, roi_sum[3] = { 0, 0, 0 }, shaded = 0, roi_shaded = 0;
+	float gains[3] = { 1, 1, 1 };
+	uint32_t roi_hist[64], rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0, shaded_hist[64], roi_shaded_hist[64];
+	bool lsc = isp != NULL && isp->lsc.on;
+	bool roi = isp != NULL && isp->ae_roi[2] > isp->ae_roi[0] && isp->ae_roi[3] > isp->ae_roi[1];
+
+	memset(s, 0, sizeof(*s));
+	memset(roi_hist, 0, sizeof(roi_hist));
+	memset(shaded_hist, 0, sizeof(shaded_hist));
+	memset(roi_shaded_hist, 0, sizeof(roi_shaded_hist));
+	if (roi) {
+		rx0 = (uint32_t)(isp->ae_roi[0] * cells_w);
+		rx1 = (uint32_t)(isp->ae_roi[2] * cells_w);
+		ry0 = (uint32_t)(isp->ae_roi[1] * cells_h);
+		ry1 = (uint32_t)(isp->ae_roi[3] * cells_h);
+		rx1 = rx1 < rx0 + cells_w / 16 ? rx0 + cells_w / 16 : rx1;
+		ry1 = ry1 < ry0 + cells_h / 16 ? ry0 + cells_h / 16 : ry1;
+	}
+	/* (as isp_measure(): every 4th cell of every 4th pair of lines, a cell here a 2x2 of the picture's pixels) */
+	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
+		float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
+
+		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
+			float c[3];
+			bool white;
+
+			nv12_cell(v, cx * 2, cy * 2, c, &white);
+			if (v->hw_lsc != NULL) {
+				/* (ws-cam-ife2) the kernel's lens shading undone: the sensor's levels, as the RAW10 frames give them */
+				float hg[3];
+
+				lsc_table_at(v->hw_lsc, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, hg);
+				for (int i = 0; i < 3; i++) {
+					c[i] = hg[i] > 0.05f ? c[i] / hg[i] : c[i];
+				}
+			}
+
+			int vr = (int)(c[0] + 0.5f), g = (int)(c[1] + 0.5f), vb = (int)(c[2] + 0.5f);
+
+			sum[0] += vr;
+			sum[1] += g;
+			sum[2] += vb;
+			if (lsc) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+			}
+			int gs = (int)(g * gains[1] + 0.5f);
+
+			shaded += gs;
+			shaded_hist[gs >> 4 > 63 ? 63 : gs >> 4]++;
+			if (roi && cx >= rx0 && cx < rx1 && cy >= ry0 && cy < ry1) {
+				roi_sum[0] += vr;
+				roi_sum[1] += g;
+				roi_sum[2] += vb;
+				roi_hist[g >> 4 > 63 ? 63 : g >> 4]++;
+				roi_shaded += gs;
+				roi_shaded_hist[gs >> 4 > 63 ? 63 : gs >> 4]++;
+				s->roi_cells++;
+			}
+			if (!white && g >= 24) {
+				float cr = (float)vr, cg = (float)g, cb = (float)vb;
+
+				if (lsc) {
+					cr *= gains[0];
+					cg *= gains[1];
+					cb *= gains[2];
+				}
+				grey[0] += cr / cg;
+				grey[1] += cb / cg;
+				s->grey_cells++;
+				if (isp != NULL && isp->awb2) {
+					int band = (int)cg / AWB2_LUM_STEP;
+
+					band = band >= AWB2_LUMS ? AWB2_LUMS - 1 : band;
+					s->awb2_lum[band]++;
+					s->awb2_hist[band][0][awb2_bin(cr / cg)]++;
+					s->awb2_hist[band][1][awb2_bin(cb / cg)]++;
+				}
+				if (isp != NULL) {
+					float wr = cr * isp->wb[0] / cg, wb = cb * isp->wb[2] / cg;
+
+					if (wr > 0.75f && wr < 1.33f && wb > 0.75f && wb < 1.33f) {
+						neutral[0] += cr / cg;
+						neutral[1] += cb / cg;
+						s->neutral_cells++;
+					}
+				}
+			}
+			s->hist[g >> 4 > 63 ? 63 : g >> 4]++;
+			s->cells++;
+		}
+	}
+	for (int c = 0; c < 3; c++) {
+		s->mean[c] = s->cells ? sum[c] / s->cells : 0;
+		s->roi_mean[c] = s->roi_cells ? roi_sum[c] / s->roi_cells : 0;
+	}
+	for (int c = 0; c < 2; c++) {
+		s->grey[c] = s->grey_cells ? grey[c] / s->grey_cells : 0;
+		s->neutral[c] = s->neutral_cells ? neutral[c] / s->neutral_cells : 0;
+	}
+	s->shaded_mean = s->cells ? shaded / s->cells : 0;
+	s->roi_shaded_mean = s->roi_cells ? roi_shaded / s->roi_cells : 0;
+	for (int k = 0; k < 4; k++) {
+		const uint32_t *h = k == 0 ? s->hist : k == 1 ? roi_hist : k == 2 ? shaded_hist : roi_shaded_hist;
+		uint32_t n = k == 0 || k == 2 ? s->cells : s->roi_cells;
+		double *to = k == 0 ? &s->bright : k == 1 ? &s->roi_bright : k == 2 ? &s->shaded_bright : &s->roi_shaded_bright;
+
+		for (int i = 63, above = 0; n && i >= 0; i--) {
+			above += h[i];
+			if (above * 100 >= (int)n) {
+				*to = i * 16 + 8;
+				break;
+			}
+		}
+	}
+}
+
+float
+isp_sharpness_nv12(const struct redwood_camera_frame *f, const struct isp_nv12 *v, float x0, float y0, float x1, float y1,
+    float *level)
+{
+	enum { BLOCK = 8, MAX_BLOCKS = 512 };   /* (pixels: 4x4 cells, as isp_sharpness()) */
+	uint32_t px0 = (uint32_t)(x0 * f->width), px1 = (uint32_t)(x1 * f->width), py0 = (uint32_t)(y0 * f->height),
+	    py1 = (uint32_t)(y1 * f->height);
+	float above[MAX_BLOCKS], here[MAX_BLOCKS];
+	double steps = 0, sum = 0, mean;
+	uint32_t blocks_w, rows = 0, n = 0;
+
+	px1 = px1 > f->width ? f->width : px1;
+	py1 = py1 > f->height ? f->height : py1;
+	blocks_w = px1 > px0 ? (px1 - px0) / BLOCK : 0;
+	blocks_w = blocks_w > MAX_BLOCKS ? MAX_BLOCKS : blocks_w;
+	for (uint32_t by = py0; by + BLOCK <= py1; by += BLOCK, rows++) {
+		for (uint32_t bx = 0; bx < blocks_w; bx++) {
+			float g = 0;
+
+			for (uint32_t y = by; y < by + BLOCK; y += 2) {
+				const uint8_t *l = v->y + (size_t)y * v->y_stride + px0 + bx * BLOCK;
+
+				for (uint32_t x = 0; x < BLOCK; x += 2) {
+					g += nv12_lin[l[x]];
+				}
+			}
+			here[bx] = g * WHITE / v->wb[1] / ((BLOCK / 2) * (BLOCK / 2));
+			sum += here[bx];
+			n++;
+			if (bx > 0) {
+				steps += (here[bx] - here[bx - 1]) * (here[bx] - here[bx - 1]);
+			}
+			if (rows > 0) {
+				steps += (here[bx] - above[bx]) * (here[bx] - above[bx]);
+			}
+		}
+		memcpy(above, here, blocks_w * sizeof(float));
+	}
+	mean = n ? sum / n : 0;
+	if (level != NULL) {
+		*level = (float)mean;
+	}
+	return mean > 0 ? (float)(steps / n / (mean * mean)) : 0;
+}
+
+/* the part of the frame the picture shows, in pixels: as crop() has it in cells */
+static void
+nv12_crop(const struct isp *isp, const struct redwood_camera_frame *f, uint32_t width, uint32_t height, uint32_t *x0, uint32_t *y0,
+    uint32_t *cw, uint32_t *ch)
+{
+	uint32_t w = f->width & ~1u, h = f->height & ~1u;
+	float zoom = isp->zoom < 1 ? 1 : isp->zoom;
+
+	if ((uint64_t)width * h > (uint64_t)height * w) {
+		*cw = w;
+		*ch = (uint32_t)((uint64_t)w * height / width);
+	} else {
+		*ch = h;
+		*cw = (uint32_t)((uint64_t)h * width / height);
+	}
+	*cw = (uint32_t)(*cw / zoom) < 4 ? 4 : (uint32_t)(*cw / zoom) & ~1u;
+	*ch = (uint32_t)(*ch / zoom) < 4 ? 4 : (uint32_t)(*ch / zoom) & ~1u;
+	*x0 = ((w - *cw) / 2) & ~1u;
+	*y0 = ((h - *ch) / 2) & ~1u;
+}
+
+/* a source position for each of n output places over a span of src from first (16.16), clamped for its neighbour */
+static void
+nv12_steps(uint32_t first, uint32_t span, uint32_t n, uint32_t limit, bool turned, uint32_t *at, uint16_t *frac)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t o = turned ? n - 1 - i : i;
+		int64_t p = (int64_t)first * 65536 + (((int64_t)o * 2 + 1) * span * 65536) / (2 * (int64_t)n) - 32768;
+
+		p = p < 0 ? 0 : p;
+		at[i] = (uint32_t)(p >> 16);
+		frac[i] = (uint16_t)(p & 0xffff) >> 8;
+		if (at[i] + 1 >= limit) {
+			at[i] = limit - 1;
+			frac[i] = 0;
+		}
+	}
+}
+
+static inline uint8_t
+video_y(uint32_t y)
+{
+	return (uint8_t)(16 + (y * 219 + 127) / 255);
+}
+
+static inline uint8_t
+video_c(int32_t c)
+{
+	return (uint8_t)(128 + ((c - 128) * 224 + (c >= 128 ? 127 : -127)) / 255);
+}
+
+void
+isp_render_from_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	enum { MAX = 8192 };
+	uint32_t x0, y0, cw, ch, xa[MAX], ya;
+	uint16_t xf[MAX], yf;
+	bool turned = isp->turned;
+
+	if (width > MAX || width < 2 || height < 2) {
+		return;
+	}
+	nv12_crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	end_row = end_row > height ? height : end_row;
+	first_row &= ~1u;
+	/* luma */
+	if (cw == width && ch == height && !turned && !video_range) {
+		for (uint32_t row = first_row; row < end_row; row++) {
+			memcpy(y + (size_t)row * y_stride, v->y + (size_t)(y0 + row) * v->y_stride + x0, width);
+		}
+		for (uint32_t row = first_row / 2; row < (end_row + 1) / 2; row++) {
+			memcpy(uv + (size_t)row * uv_stride, v->uv + (size_t)(y0 / 2 + row) * v->uv_stride + x0, width & ~1u);
+		}
+		return;
+	}
+	nv12_steps(x0, cw, width, f->width, turned, xa, xf);
+	for (uint32_t row = first_row; row < end_row; row++) {
+		uint8_t *o = y + (size_t)row * y_stride;
+
+		{
+			uint32_t r = turned ? height - 1 - row : row;
+			int64_t p = (int64_t)y0 * 65536 + (((int64_t)r * 2 + 1) * ch * 65536) / (2 * (int64_t)height) - 32768;
+
+			p = p < 0 ? 0 : p;
+			ya = (uint32_t)(p >> 16);
+			yf = (uint16_t)((p & 0xffff) >> 8);
+			if (ya + 1 >= f->height) {
+				ya = f->height - 1;
+				yf = 0;
+			}
+		}
+		const uint8_t *s0 = v->y + (size_t)ya * v->y_stride, *s1 = yf ? s0 + v->y_stride : s0;
+
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t a = xa[x], t = xf[x];
+			uint32_t top = s0[a] * (256 - t) + s0[a + (t ? 1 : 0)] * t, bot = s1[a] * (256 - t) + s1[a + (t ? 1 : 0)] * t;
+			uint32_t val = (top * (256 - yf) + bot * yf + 32768) >> 16;
+
+			o[x] = video_range ? video_y(val) : (uint8_t)val;
+		}
+	}
+	/* chroma: the same over the half-size plane */
+	uint32_t cwid = width / 2, chgt = height / 2, csrc_w = f->width / 2, csrc_h = f->height / 2;
+
+	nv12_steps(x0 / 2, cw / 2, cwid, csrc_w, turned, xa, xf);
+	for (uint32_t row = first_row / 2; row < (end_row + 1) / 2 && row < chgt; row++) {
+		uint32_t r = turned ? chgt - 1 - row : row;
+		int64_t p = (int64_t)(y0 / 2) * 65536 + (((int64_t)r * 2 + 1) * (ch / 2) * 65536) / (2 * (int64_t)chgt) - 32768;
+		uint8_t *o = uv + (size_t)row * uv_stride;
+
+		p = p < 0 ? 0 : p;
+		ya = (uint32_t)(p >> 16);
+		yf = (uint16_t)((p & 0xffff) >> 8);
+		if (ya + 1 >= csrc_h) {
+			ya = csrc_h - 1;
+			yf = 0;
+		}
+		const uint8_t *s0 = v->uv + (size_t)ya * v->uv_stride, *s1 = yf ? s0 + v->uv_stride : s0;
+
+		for (uint32_t x = 0; x < cwid; x++) {
+			uint32_t a = xa[x] * 2, t = xf[x], b = a + (t ? 2 : 0);
+
+			for (int k = 0; k < 2; k++) {
+				uint32_t top = s0[a + k] * (256 - t) + s0[b + k] * t, bot = s1[a + k] * (256 - t) + s1[b + k] * t;
+				uint32_t val = (top * (256 - yf) + bot * yf + 32768) >> 16;
+
+				o[2 * x + k] = video_range ? video_c((int32_t)val) : (uint8_t)val;
+			}
+		}
+	}
+}
+
+void
+isp_render_bgra_from_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_nv12 *v, uint8_t *out,
+    size_t stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
+{
+	uint32_t x0, y0, cw, ch;
+
+	nv12_crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	for (uint32_t row = first_row; row < end_row && row < height; row++) {
+		uint32_t r = isp->turned ? height - 1 - row : row, sy = y0 + (uint32_t)((uint64_t)r * ch / height);
+		uint8_t *o = out + (size_t)row * stride;
+
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t c = isp->turned ? width - 1 - x : x, sx = x0 + (uint32_t)((uint64_t)c * cw / width);
+			const uint8_t *uvp = v->uv + (size_t)(sy / 2) * v->uv_stride + (sx & ~1u);
+			float yy = v->y[(size_t)sy * v->y_stride + sx], cb = uvp[0] - 128.0f, cr = uvp[1] - 128.0f;
+
+			o[4 * x + 0] = clamp8(yy + 1.772f * cb);
+			o[4 * x + 1] = clamp8(yy - 0.344136f * cb - 0.714136f * cr);
+			o[4 * x + 2] = clamp8(yy + 1.402f * cr);
+			o[4 * x + 3] = 255;
+		}
+	}
 }
