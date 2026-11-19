@@ -770,13 +770,13 @@ note = "boot sysctls + scratch wipe; run by the launchd job org.iosonpixel.sweet
 
 [[file]]
 path = "/var/local/bin/sweetlocd"
-source = "builds/userland/ws-gnss-pdsfix-653d3d47f2/sweetlocd"
-sha256 = "8a33b523404359969da708e72a36fe4909ffb6a9e7afef7995120273806b5271"
+source = "builds/userland/ws-gnss-fix-1348045ebb/sweetlocd"
+sha256 = "9664381bc60ec3180f0aa993dca6c5ab65be71fe0ea4a103171b51a42a37f152"
 mode = "755"
 owner = "0:0"
 target = "userland (sweetlocd only)"
-ref = "ws-gnss-pdsfix"
-sha = "653d3d47f2"
+ref = "ws-gnss-fix"
+sha = "1348045ebb"
 
 [[file]]
 path = "/var/local/bin/sweetlocd.i"
@@ -845,10 +845,10 @@ sha = ""
 [[file]]
 path = "/var/local/xtra/xtra3.bin"
 source = "phone-only"
-sha256 = "0ae2d7cbaac7318bc9ada86771ca119c5255abdcce60a69f8144b928f8a3e618"
+sha256 = "a8f501f30df176ae4060b36efdb58acd6d61f2a36216170bc4d08efc0e72a83f"
 mode = "644"
 owner = "0:0"
-note = "Google XTRA assistance data (not in git); ~7-day validity from 2026-11-16"
+note = "Google XTRA assistance data (not in git; copy Stock/xtra/xtra3Mgrbeji-20261119T1614Z.bin); 168 h validity from 2026-11-19 15:38Z; the modem refused the 3-day-old 11-16 file (INJECT_XTRA_DATA status 3): refresh about daily"
 
 [[file]]
 path = "/var/local/hmetal/env.default"
@@ -3943,7 +3943,7 @@ mode = "644"
 [[file]]
 path = "/var/local/loc.on"
 source = "state/files/locd/loc.on"
-sha256 = "f1556def103b89b21cb6ffbe51f1be13c9df4e8a804cf7bcd3a7353cdc49bbcf"
+sha256 = "6fa03144ff1b7bc9b2b30d140d0c083d74ab27d945c87bd5f3f50f0bc6a1dbed"
 mode = "644"
 owner = "0:0"
-note = "2026-11-19 locreset fix: pds=1 = sweetlocd (ws-gnss-pdsfix 653d3d4) answers locationd's PDS via the kernel relay (kern.sweet_qmux_pds 1, kern.sweet_mqrtr_aux 1). locationd's PDS ping needs reported (GPS_SERVICE_STATE_IND 0x0020) and queried (GET 0x0020 TLV1 byte1) tracking state == 2 while tracking; the canned policy answered 1 and sent no indication -> 'wrong state track' TIMEOUT -> CommCenter HardReset 'AP-triggered: locationd PDS - wrong tracking state' ~2-3 min after every boot. Engine lock 0x3 untouched: LOC START refused (0x2e), reported as session status 7 with backoff."
+note = "2026-11-19 locreset fix: pds=1 = sweetlocd (ws-gnss-pdsfix 653d3d4) answers locationd's PDS via the kernel relay (kern.sweet_qmux_pds 1, kern.sweet_mqrtr_aux 1). locationd's PDS ping needs reported (GPS_SERVICE_STATE_IND 0x0020) and queried (GET 0x0020 TLV1 byte1) tracking state == 2 while tracking; the canned policy answered 1 and sent no indication -> 'wrong state track' TIMEOUT -> CommCenter HardReset 'AP-triggered: locationd PDS - wrong tracking state' ~2-3 min after every boot. 2026-11-19 evening: + unlock=mi-keep (GNSS engine lock 0x3 -> 0x2, MI open, NI/E911 locked, kept in modem EFS; original in /var/local/locd.lock-kept; undo with the word unlock=restore), time=1, xtra=. sweetlocd ws-gnss-fix 1348045."
