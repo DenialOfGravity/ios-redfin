@@ -179,6 +179,7 @@ scratch = "/var/local/scratch"
 "kern.sweet_ipa_join_s" = 40
 "kern.sweet_mlink_idle_us" = 4000
 "kern.sweet_mqrtr_aux" = 1
+"kern.sweet_wifi_sig" = 35
 "kern.sweet_mtl" = 2
 "kern.sweet_nfc_fwif" = 21
 "kern.sweet_nfc_fwif_fmt" = 23878928
@@ -1446,6 +1447,7 @@ kern.sweet_pace=0
 kern.sweet_pace_min=2000
 kern.sweet_mqrtr_aux=1
 kern.sweet_qmux_pds=1
+kern.sweet_wifi_sig=35
 """
 mode = "644"
 
