@@ -415,22 +415,65 @@ ios_state() {	# -> on | off | unknown: iOS's own view, = the last display change
 	case $l in *"display on") echo on;; *"display off") echo off;; *) echo unknown;; esac
 }
 
+bbd_age() {	# -> seconds since backboardd started (its pid's line in the hm starts file), or "?" when unknown
+	local o; o=$(PA_SSH_TIMEOUT=15 ssh_to "$(pick_host)" 'date +%s; echo ---; /var/local/bin/psx; echo ---;
+		/var/local/bin/toybox-full tail -n 40 /private/var/local/hmetal/ca/bbd-hm.starts 2>/dev/null' 2>/dev/null) || { echo "?"; return; }
+	echo "$o" | awk 'BEGIN{sec=0} /^---$/{sec++; next}
+		sec==0 && NR==1 {now=$1}
+		sec==1 && $5=="backboardd" {pid=$1}
+		sec==2 && $1 ~ /^[0-9]+$/ {st[$2]=$1}
+		END{ if (pid != "" && (pid in st) && now > 0) print now - st[pid]; else print "?" }'
+}
+
+fb_moving() {	# -> 0 when kern.sweet_fb_frames moves within ${1:-3} s (frames reach the panel)
+	local a b
+	a=$(PA_SSH_TIMEOUT=10 ssh_to "$(pick_host)" '/var/local/bin/sctl kern.sweet_fb_frames' 2>/dev/null | sed 's/.*: *//')
+	sleep "${1:-3}"
+	b=$(PA_SSH_TIMEOUT=10 ssh_to "$(pick_host)" '/var/local/bin/sctl kern.sweet_fb_frames' 2>/dev/null | sed 's/.*: *//')
+	FB_DELTA="${a:-?} -> ${b:-?}"
+	[[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] && [ "$b" -gt "$a" ]
+}
+
+wake_once() {	# the wake sequence: power key when iOS is asleep, a swipe, p disp on -> 0 when iOS's display is on
+	local s; s=$(ios_state)
+	if [ "$s" != on ]; then
+		pk "key 0 100" >/dev/null 2>&1           # iOS asleep (or unknown at boot): power key = iOS's own wake
+		sleep 1
+	fi
+	pk "swipe 540 2335 540 1500 120" >/dev/null 2>&1  # an interaction, so press-to-wake doesn't re-sleep
+	sleep 1.2                                         # (lock screen: unlock; home: no-op home gesture)
+	pk "p disp on" >/dev/null 2>&1                    # 1162: the panel shows frames whatever happens
+	sleep 0.3
+	[ "$(ios_state)" = on ]
+}
+
 pa_wake() {	# iOS awake + display on + UI usable (not just pixels): see the pa doc, "screen"
-	local i s
-	for i in 1 2; do
-		s=$(ios_state)
-		if [ "$s" != on ]; then
-			pk "key 0 100" >/dev/null 2>&1           # iOS asleep (or unknown at boot): power key = wake
-			sleep 1
-		fi
-		pk "swipe 540 2335 540 1500 120" >/dev/null 2>&1  # an interaction, so press-to-wake doesn't re-sleep
-		sleep 1.2                                                 # (lock screen: unlock; home: no-op home gesture)
-		pk "p disp on" >/dev/null 2>&1                      # 1162: the panel shows frames whatever happens
-		sleep 0.3
-		s=$(ios_state)
-		[ "$s" = on ] && { echo "awake (iOS display on; pa disp: $(disp_state))"; return 0; }
-	done
-	echo "wake failed: iOS display $s"
+	# (final 2026-11-19) No input within ${PA_WAKE_BBD_QUIET:-15} s of a backboardd start: an early touch leaves
+	# SpringBoard in a state that hangs the screen (ws-k-wakefix). Then: frames must move (kern.sweet_fb_frames within
+	# 3 s), else one real power off/on (key 0, pause, key 0) and check again.
+	local i age q=${PA_WAKE_BBD_QUIET:-15} ok=
+	age=$(bbd_age)
+	if [[ $age =~ ^[0-9]+$ ]] && [ "$age" -lt "$q" ]; then
+		echo "wake: backboardd started ${age}s ago: waiting $((q - age))s before any input"
+		sleep $((q - age))
+	elif [ "$age" = "?" ]; then
+		echo "wake: backboardd start time unknown (no starts line for its pid / no ssh): going ahead"
+	fi
+	for i in 1 2; do wake_once && { ok=1; break; }; done
+	[ -n "$ok" ] || { echo "wake failed: iOS display $(ios_state)"; return 1; }
+	if fb_moving 3; then
+		echo "awake (iOS display on; pa disp: $(disp_state); frames moving: $FB_DELTA)"
+		return 0
+	fi
+	echo "wake: iOS display on but frames NOT moving ($FB_DELTA): real power off/on"
+	pk "key 0 100" >/dev/null 2>&1; sleep 2.5
+	pk "key 0 100" >/dev/null 2>&1; sleep 1
+	wake_once >/dev/null 2>&1
+	if fb_moving 3; then
+		echo "awake after power off/on (iOS display $(ios_state); pa disp: $(disp_state); frames moving: $FB_DELTA)"
+		return 0
+	fi
+	echo "WAKE FAILED: frames still not moving after power off/on ($FB_DELTA; iOS display $(ios_state)); the screen is stuck"
 	return 1
 }
 
@@ -446,12 +489,25 @@ pa_sleep() {
 pa_shot() {	# [NAME] -> logs/shots/NAME-HHMMSS.png + .thumb.jpg, prints both paths and the fb-shot CLASS
 	local name=${1:-shot} d=$P/logs/shots stamp; stamp=$(date +%m%d-%H%M%S)
 	mkdir -p "$d"
-	local base=$d/$name-$stamp regs=$d/.vig0-$stamp.bin raw=$d/.raw-$stamp.bin
-	run "files read /dev/pmem 0x0ae05000 64 $regs" >/dev/null 2>&1 || { echo "shot: register read failed"; return 1; }
+	local base=$d/$name-$stamp regs=$d/.vig0-$stamp.bin raw=$d/.raw-$stamp.bin snap=
+	# (ws-cam-lines) /var/local/bin/pmemsnap on the phone: the scanned slot read there, read again where the first read
+	# has black runs (a ~1 s read of a slot redrawn every frame catches redraws: thin black lines that are not on the
+	# screen, e.g. over the Camera preview); without it (or PA_SHOT_PLAIN=1) the file-server read as before
+	if [ -z "${PA_SHOT_PLAIN:-}" ] && snap=$(PA_SSH_TIMEOUT=30 ssh_to "$(pick_host)" \
+		'[ -x /var/local/bin/pmemsnap ] && /var/local/bin/pmemsnap /var/tmp/pa-shot.raw /var/tmp/pa-shot.regs' 2>/dev/null) &&
+		[ -n "$snap" ] && run "pull /var/tmp/pa-shot.regs $regs" >/dev/null 2>&1; then :; else
+		snap=
+		run "files read /dev/pmem 0x0ae05000 64 $regs" >/dev/null 2>&1 || { echo "shot: register read failed"; return 1; }
+	fi
 	local mk; mk=$(ls -t "$P"/logs/mon/klog-*.txt 2>/dev/null | head -1)
 	local w; w=$(python3 "$T/fb-shot.py" --where "$regs" $mk)
 	local kind pa_ len geo; read -r kind pa_ len geo _ <<<"$w"
+	if [ -n "$snap" ] && [ "$kind" = direct ] && [ "${snap%% *}" = "$pa_" ] && [ "$(echo "$snap" | cut -d' ' -f2)" = "$len" ] &&
+		run "pull /var/tmp/pa-shot.raw $raw" >/dev/null 2>&1 && [ "$(stat -c %s "$raw" 2>/dev/null)" = "$len" ]; then
+		kind=direct-snap
+	fi
 	case $kind in
+	direct-snap) cls=$(python3 "$T/fb-shot.py" "$raw" "$base.png" 2 "$geo"); kind="direct (pmemsnap $(echo "$snap" | cut -d' ' -f4-8))";;
 	direct) run "files read /dev/pmem $pa_ $len $raw" >/dev/null 2>&1 || { echo "shot: read failed"; return 1; }
 		cls=$(python3 "$T/fb-shot.py" "$raw" "$base.png" 2 "$geo");;
 	blit) run "files read /dev/pmem $pa_ $len $raw" >/dev/null 2>&1 || { echo "shot: read failed"; return 1; }

@@ -45,6 +45,7 @@ build sctl sctl.c
 build surfinuse surfinuse.c -framework IOSurface -framework CoreFoundation
 build pdptest pdptest.c
 build pmem pmem.c
+build pmemsnap pmemsnap.c
 build a2s a2s.c
 build sweetmon sweetmon.c lz4/lz4.c -DSWEETMON_VERSION="\"$(git rev-parse --short HEAD 2>/dev/null || date +%F)\""
 build imgdump imgdump.c -lobjc

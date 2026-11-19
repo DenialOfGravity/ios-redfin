@@ -13,6 +13,12 @@ Full docs: project doc claude/redfin-pa-2026-11-16.md.
   only. `pa revert file:PATH` undoes it, `pa keep KEY --manifest FILE` makes it permanent. `pa state ...` = state.py.
 - Locks: /tmp/pa-phone.lock (screen/boot actions), /tmp/pa-state.lock (state apply/set/revert/put).
 - The desktop relay drops a wsl__run reply after ~80 s: keep calls short or use start_job.
+- `pa wake` (final 2026-11-19): no input within 15 s of a backboardd start (its pid's line in the hm starts file;
+  PA_WAKE_BBD_QUIET=N changes it), since an early touch leaves SpringBoard hanging the screen; after the wake it checks
+  kern.sweet_fb_frames moves within 3 s, else one real power off/on (key 0, pause, key 0) and checks again;
+  "WAKE FAILED: frames still not moving" = the screen is stuck.
+- `pa shot` reads through /var/local/bin/pmemsnap when it is installed (re-reads the black runs a ~1 s /dev/pmem read
+  of a slot redrawn every frame produces; PA_SHOT_PLAIN=1 = the plain file-server read).
 - `pa snap [--drift]` reads the sysctls listed in pa-snap.sysctls and shows temp overrides + the last state diff counts.
   Its first lines are the Metal driver per process: `FALLBACK: NAME -> SweetMetal2 for AGE: REASON` for each process
   the hakios-metal dispatcher tripped, or `metal: all on hm`.
