@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 02:00:00 +0100
+Subject: [PATCH] redfin 1260: honest "shown" + what each present did
+
+present() returned early without drawing (the frame kept, "not fitted", UBWC, a p mdp test) and its caller still
+counted the frame shown (SWEET FB 5s shown, kern.sweet_fb_frames): in Camera after a tap-to-focus the panel froze
+while the stats said 450 frames shown per 5 s (blitq 36 us, fence 0, vis 0).
+
+- kern.sweet_present_honest 1 (default): only presents that drew count as shown; 0 = as before. Swap retirement
+  (queue, SwapWait) is unchanged.
+- SWEET FB: 5s present (1260): drawn/kept/not-fitted/ubwc/mdp-test + the layer masks presented.
+- SWEET FB: present layout (1260): one line when the presented swaps' layout or outcome changes (<= 12 a minute).
+
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3226be0..ef19949 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1950,6 +1950,9 @@ sysctl_sweet_bl_fix SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_bl_fix, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bl_fix, "I",
+     "1099: 1 IOMFBBrightnessLevel is a factor (no DCS), 2 boot IOMFBBrightnessLevel 1.0, 4 ALS keep-alive until sensd; "
+     "1100/1101: 8 backlight-calibration-parameters (live; restart backboardd)");
++extern uint32_t sweet_present_honest;      /* 1260 */
++SYSCTL_INT(_kern, OID_AUTO, sweet_present_honest, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_present_honest, 0,
++    "SWEET FB 1260: 1 = only presents that drew count as shown (5 s stats, kern.sweet_fb_frames); 0 = every present");
+ /* 1186: display off blanks the panel (DCS 0x28 + 0x51 0), display on restores it (SweetFramebuffer.cpp) */
+ extern uint32_t sweet_fb_sleep_blank;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dd0d510..c5c230c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -236,6 +236,17 @@ uint32_t sweet_vsyncphase = 5000, sweet_vsyncphase_grid;	/* default 5000 since 2
+ extern "C" uint64_t sweet_fb_frames;
+ extern "C" uint32_t sweet_fb_hz;
+ uint64_t sweet_fb_frames;
++/*
++ * 1260: kern.sweet_present_honest 1 (default): a present that put nothing on the panel (the frame kept, not fitted,
++ * UBWC, a p mdp test) is not counted as shown (SWEET FB 5s shown, kern.sweet_fb_frames); 0 = as before 1260.
++ * The swap is retired the same either way (SwapWait/queue unchanged).
++ */
++extern "C" uint32_t sweet_present_honest;
++uint32_t sweet_present_honest = 1;
++enum { SWEET_PO_DRAWN = 0, SWEET_PO_MDPBUSY, SWEET_PO_UBWC, SWEET_PO_KEEP, SWEET_PO_NOTFIT, SWEET_PO_N };
++static uint32_t sweet_po_st[SWEET_PO_N];        /* 1260: present outcomes this 5 s */
++static uint32_t sweet_po_masks[16];             /* 1260: layer masks of the presented swaps this 5 s */
++static const char *const sweet_po_name[SWEET_PO_N] = { "drawn", "mdp-test", "ubwc", "kept", "not-fitted" };
+ uint32_t sweet_fb_hz = 60;
+ static uint32_t sweet_vphase_ticks;
+ static uint64_t sweet_vphase_late_abs, sweet_vphase_late_max;
+@@ -440,6 +451,10 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentInner(const uint8_t *rec);       /* 1260 */
++	void presentLayoutLog(const uint8_t *rec);   /* 1260 */
++	uint32_t fPresentOut;   /* 1260: SWEET_PO_* of the last present */
++	bool presentShown(void) { return fPresentOut == SWEET_PO_DRAWN || !sweet_present_honest; }   /* 1260 */
+ 	bool presentGPU(const uint8_t *rec);
+ 	bool fPresentBusy;	/* 0158: the last present was put off (GPU busy): show fPending on the next tick */
+ 	/* 0906: panel brightness (DCS 0x51 over DSI0), on its own thread: a DSI command waits for a gap
+@@ -1527,7 +1542,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fDirty = true;	/* not shown: again on the next tick (fPending, maybe newer by then) */
+ 			fb->fStDropped += fb->fPendingAbs != recAbs;	/* 0943: a newer one came meanwhile */
+ 			IOLockUnlock(fb->fLock);
+-		} else {
++		} else if (fb->presentShown()) {      /* 1260 */
+ 			fb->fStatPresents++;
+ 			fb->statShown(recAbs);
+ 		}
+@@ -1786,7 +1801,7 @@ AppleCLCD::presentLoop(void *arg)
+ 				fb->swapDone(mach_absolute_time(), 4);
+ 			}
+ 			IOLockUnlock(fb->fLock);
+-			if (shown) {
++			if (shown && fb->presentShown()) {      /* 1260 */
+ 				fb->fStatPresents++;
+ 				fb->statShown(fb->fPresentRecAbs);
+ 				if (sweet_fbx & SWEET_FBX_CPUPRESENT) {
+@@ -1822,7 +1837,7 @@ AppleCLCD::presentLoop(void *arg)
+ 				fb->fDirty = true;
+ 				fb->fStDropped += fb->fPendingAbs != fb->fPresentRecAbs;	/* 0943 */
+ 				IOLockUnlock(fb->fLock);
+-			} else {
++			} else if (fb->presentShown()) {      /* 1260 */
+ 				fb->fStatPresents++;
+ 				fb->statShown(fb->fPresentRecAbs);
+ 				if (sweet_fbx & SWEET_FBX_CPUPRESENT) {
+@@ -2074,6 +2089,22 @@ AppleCLCD::statLine(uint64_t now)
+ 	IOLog("SWEET FB: 5s: swaps %u shown %u dropped %u | le11 %u le18 %u le26 %u le35 %u gt35 %u | "
+ 	    "p50 %u.%u p95 %u.%u ms | blitq %llu us fence %llu us | hz %u | vis %llu us cpu %llu us gpuwait %llu us late %llu\n", swaps, shown,
+ 	    dropped, b[0], b[1], b[2], b[3], b[4], p50 / 10, p50 % 10, p95 / 10, p95 % 10, blitq, fence, fHz, vis, cpu, gw, gwLate);
++	{
++		/* 1260: what the presents did; the layer masks of the swaps presented (non-direct) */
++		uint32_t po[SWEET_PO_N], pm[16];
++		IOLockLock(fLock);
++		memcpy(po, sweet_po_st, sizeof(po));
++		memcpy(pm, sweet_po_masks, sizeof(pm));
++		bzero(sweet_po_st, sizeof(sweet_po_st));
++		bzero(sweet_po_masks, sizeof(sweet_po_masks));
++		IOLockUnlock(fLock);
++		if (po[0] + po[1] + po[2] + po[3] + po[4] != 0) {
++			IOLog("SWEET FB: 5s present (1260): drawn %u kept %u not-fitted %u ubwc %u mdp-test %u | masks 0:%u 1:%u 2:%u "
++			    "3:%u 4:%u other %u | honest %u\n", po[SWEET_PO_DRAWN], po[SWEET_PO_KEEP], po[SWEET_PO_NOTFIT],
++			    po[SWEET_PO_UBWC], po[SWEET_PO_MDPBUSY], pm[0], pm[1], pm[2], pm[3], pm[4],
++			    po[0] + po[1] + po[2] + po[3] + po[4] - pm[0] - pm[1] - pm[2] - pm[3] - pm[4], sweet_present_honest);
++		}
++	}
+ 	if (sweet_fb_early_retire || erAcc || erBusy || erKick) {
+ 		/* 1035: swaps retired at ring acceptance; SwapWait polls busy/done/stale; present re-kicks at the vsync tick */
+ 		IOLog("SWEET FB: early retire 5s: retired %u | polls busy %u done %u stale %u | rekick %u | mode %d\n",
+@@ -7040,8 +7071,71 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 
+ void
+ AppleCLCD::present(const uint8_t *rec)
++{
++	fPresentOut = SWEET_PO_DRAWN;
++	presentInner(rec);
++	uint32_t mask = get32(rec, 0x104);
++	IOLockLock(fLock);
++	sweet_po_st[fPresentOut < SWEET_PO_N ? fPresentOut : 0]++;
++	sweet_po_masks[mask & 15]++;
++	IOLockUnlock(fLock);
++	presentLayoutLog(rec);
++}
++
++/*
++ * 1260: one line whenever the presented swaps' layout changes (layer mask, each layer's surface: size, format, slot,
++ * UBWC, the panel's own) or the outcome does; at most 12 lines a minute.
++ */
++void
++AppleCLCD::presentLayoutLog(const uint8_t *rec)
++{
++	static uint64_t lastSig, winAbs;
++	static uint32_t lastOut = ~0u, winN;
++	uint32_t mask = get32(rec, 0x104);
++	uint64_t sig = mask;
++	char buf[300];
++	int n = 0;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		uint32_t id = get32(rec, 0x54 + 4 * l);
++		if (!(mask & (1u << l))) {
++			continue;
++		}
++		SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++		uint32_t k = s == NULL ? 1 : (s->width * 31 + s->height) ^ (s->pixelFormat * 7) ^ (s->scanSlot ? 0x100000 : 0) ^
++		    (s->ubwcLive ? 0x200000 : 0) ^ (s == fSurface ? 0x400000 : 0);
++		sig = sig * 1000003ULL ^ k;
++		if (n < (int)sizeof(buf) - 80) {
++			const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
++			n += snprintf(buf + n, sizeof(buf) - n, " | l%u id %u %ux%u fmt %#x slot %u%s%s a %ux%u b %d,%d %ux%u", l, id,
++			    s ? s->width : 0, s ? s->height : 0, s ? s->pixelFormat : 0, s ? s->scanSlot : 0,
++			    s && s->ubwcLive ? " ubwc" : "", s && s == fSurface ? " panel" : "", get32(a, 8), get32(a, 12),
++			    (int32_t)get32(b, 0), (int32_t)get32(b, 4), get32(b, 8), get32(b, 12));
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (sig == lastSig && fPresentOut == lastOut) {
++		return;
++	}
++	lastSig = sig;
++	lastOut = fPresentOut;
++	uint64_t now = mach_absolute_time(), ns = 0;
++	absolutetime_to_nanoseconds(now - winAbs, &ns);
++	if (ns > 60 * NSEC_PER_SEC) {
++		winAbs = now;
++		winN = 0;
++	}
++	if (winN++ >= 12) {
++		return;
++	}
++	IOLog("SWEET FB: present layout (1260): swap %u layers %#x -> %s%s\n", get32(rec, 0x50), mask,
++	    sweet_po_name[fPresentOut < SWEET_PO_N ? fPresentOut : 0], buf);
++}
++
++void
++AppleCLCD::presentInner(const uint8_t *rec)
+ {
+ 	if (sweet_mdp_busy) {
++		fPresentOut = SWEET_PO_MDPBUSY;
+ 		return;         /* 0948: a p mdp test owns the pipes; the latest frame goes out after p mdp restore */
+ 	}
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -7063,6 +7157,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				IOLog("SWEET FB: swap %u: surface %u is UBWC-compressed: not presented (only the direct scanout shows it)\n",
+ 				    get32(rec, 0x50), id);
+ 			}
++			fPresentOut = SWEET_PO_UBWC;
+ 			return;
+ 		}
+ 	}
+@@ -7097,6 +7192,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				logs++;
+ 				IOLog("SWEET FB: swap %u (layers %#x) kept the fitted frame on screen\n", get32(rec, 0x50), mask);
+ 			}
++			fPresentOut = SWEET_PO_KEEP;
+ 			return;
+ 		}
+ 	}
+@@ -7113,6 +7209,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			logs++;
+ 			IOLog("SWEET FB: swap %u (layers %#x) not fitted: the last frame stays\n", get32(rec, 0x50), mask);
+ 		}
++		fPresentOut = SWEET_PO_NOTFIT;
+ 		return;
+ 	}
+ 	sweet_gpu_scanout_front();	/* 0905: the CPU copy below draws into the first panel buffer */
