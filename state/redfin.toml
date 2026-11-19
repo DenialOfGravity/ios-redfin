@@ -770,13 +770,13 @@ note = "boot sysctls + scratch wipe; run by the launchd job org.iosonpixel.sweet
 
 [[file]]
 path = "/var/local/bin/sweetlocd"
-source = "builds/userland/ws-gnss-k-f4c893e815/sweetlocd"
-sha256 = "c7cc3b349bd6d4b77e07b95ea08aa65ad094758aff6aaa89954aab06389e9347"
+source = "builds/userland/ws-gnss-pdsfix-653d3d47f2/sweetlocd"
+sha256 = "8a33b523404359969da708e72a36fe4909ffb6a9e7afef7995120273806b5271"
 mode = "755"
 owner = "0:0"
 target = "userland (sweetlocd only)"
-ref = "ws-gnss-k"
-sha = "f4c893e815"
+ref = "ws-gnss-pdsfix"
+sha = "653d3d47f2"
 
 [[file]]
 path = "/var/local/bin/sweetlocd.i"
@@ -3939,3 +3939,11 @@ path = "/var/local/camera-afdone"
 source = "agent/stage/flags/one"
 sha256 = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
 mode = "644"
+
+[[file]]
+path = "/var/local/loc.on"
+source = "state/files/locd/loc.on"
+sha256 = "f1556def103b89b21cb6ffbe51f1be13c9df4e8a804cf7bcd3a7353cdc49bbcf"
+mode = "644"
+owner = "0:0"
+note = "2026-11-19 locreset fix: pds=1 = sweetlocd (ws-gnss-pdsfix 653d3d4) answers locationd's PDS via the kernel relay (kern.sweet_qmux_pds 1, kern.sweet_mqrtr_aux 1). locationd's PDS ping needs reported (GPS_SERVICE_STATE_IND 0x0020) and queried (GET 0x0020 TLV1 byte1) tracking state == 2 while tracking; the canned policy answered 1 and sent no indication -> 'wrong state track' TIMEOUT -> CommCenter HardReset 'AP-triggered: locationd PDS - wrong tracking state' ~2-3 min after every boot. Engine lock 0x3 untouched: LOC START refused (0x2e), reported as session status 7 with backoff."
