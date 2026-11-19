@@ -14,6 +14,14 @@ Full docs: project doc claude/redfin-pa-2026-11-16.md.
 - Locks: /tmp/pa-phone.lock (screen/boot actions), /tmp/pa-state.lock (state apply/set/revert/put).
 - The desktop relay drops a wsl__run reply after ~80 s: keep calls short or use start_job.
 - `pa snap [--drift]` reads the sysctls listed in pa-snap.sysctls and shows temp overrides + the last state diff counts.
+  Its first lines are the Metal driver per process: `FALLBACK: NAME -> SweetMetal2 for AGE: REASON` for each process
+  the hakios-metal dispatcher tripped, or `metal: all on hm`.
+- `pa fallback [clear PROC...|clear all|test PROC]` (ws-hm-fallback, 2026-11-19): the dispatcher's trip markers with
+  their reasons (MARKER.why, /var/local/hmetal/trips/NAME.why), the hm build (via KNOWN-GOOD.txt), fallback.log.
+  `clear` deletes the trip marker (the owner allows clearing to return to the newest driver) and restarts the process
+  once on purpose. `test PROC` arms /var/local/hmetal/trip-test: the next start trips with reason "test".
+  Deliberate restarts (`sweetctl kill NAME`, render, respring) are not counted toward a trip: sweetctl notes them in
+  /var/local/hmetal/intent/ first (backboardd and SpringBoard also intent/_ui, for the processes that go down with them).
 - Installed as ~/bin/pa (symlink). Backup of the agent before this change: phone-agent.sh.pre-pa.
 
 ## pa session: free-form UI session recorder + slow-moment finder (2026-11-17)

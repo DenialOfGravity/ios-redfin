@@ -13,7 +13,9 @@
  *   sweetctl size FILE N                 a file of N zero bytes (SweetSB's size flags); N < 0 removes it
  *   sweetctl write FILE TEXT             whole file = TEXT + newline ("" = empty file)
  *   sweetctl cat FILE                    print a file
- *   sweetctl kill NAME [SIG]             signal every process whose p_comm is NAME (default 9); launchd restarts jobs
+ *   sweetctl kill NAME [SIG]             signal every process whose p_comm is NAME (default 9); launchd restarts jobs.
+ *                                        Notes the kill in /var/local/hmetal/intent/NAME first: a restart on purpose,
+ *                                        not counted by the Metal dispatcher's crash trip (ws-hm-fallback)
  *   sweetctl respring                    kill -9 SpringBoard
  *   sweetctl render                      kill -9 backboardd (render server: Metal env, CA env; SpringBoard and apps follow)
  *   sweetctl userspace-reboot            reboot3(RB2_USERREBOOT): all of userland again, same kernel, live sysctls kept
@@ -321,6 +323,36 @@ kv(const char *path, const char *key, const char *val, int op)	/* op 0 get, 1 se
 
 /* ---- processes ---- */
 
+/* (ws-hm-fallback) a kill on purpose: the Metal dispatcher (phone/hmetal/bench/m2shim.m) does not count the killed
+ * instance's start toward its crash trip. Before signalling: HM_INTENT/NAME gets one "TIME PID SIG" line for each process
+ * signalled; a kill of backboardd or SpringBoard also HM_INTENT/_ui ("TIME": the processes that go down with the render
+ * server or SpringBoard: SpringBoard, posters, apps).
+ * Not for signals that do not end a process. */
+#define HM_INTENT	"/var/local/hmetal/intent"
+
+static int
+ends_process(int sig)
+{
+	return sig != 0 && sig != SIGSTOP && sig != SIGTSTP && sig != SIGCONT && sig != SIGCHLD && sig != SIGWINCH &&
+	       sig != SIGURG && sig != SIGINFO && sig != SIGUSR1 && sig != SIGUSR2 && sig != SIGIO;
+}
+
+static void
+note_intent(const char *name, const char *text)
+{
+	char p[256];
+	int fd;
+
+	mkdir(HM_INTENT, 0777);
+	chmod(HM_INTENT, 0777);
+	snprintf(p, sizeof(p), HM_INTENT "/%s", name);
+	if ((fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644)) >= 0) {
+		(void)!write(fd, text, strlen(text));
+		fchmod(fd, 0644);
+		close(fd);
+	}
+}
+
 static int
 kill_name(const char *name, int sig)
 {
@@ -336,6 +368,23 @@ kill_name(const char *name, int sig)
 		return die("proc list%s", "");
 	}
 	int n = (int)(len / sizeof(*p)), killed = 0;
+	if (ends_process(sig) && strchr(name, '/') == NULL && name[0] != '.' && name[0] != '\0') {
+		char text[1024] = "", line[64];
+		long now = (long)time(NULL);
+		for (int i = 0; i < n; i++) {
+			if (strcmp(p[i].kp_proc.p_comm, name) == 0 && p[i].kp_proc.p_pid > 1) {
+				snprintf(line, sizeof(line), "%ld %d %d\n", now, p[i].kp_proc.p_pid, sig);
+				if (strlen(text) + strlen(line) < sizeof(text)) strcat(text, line);
+			}
+		}
+		if (text[0]) {
+			note_intent(name, text);
+			if (!strcmp(name, "backboardd") || !strcmp(name, "SpringBoard")) {
+				snprintf(line, sizeof(line), "%ld\n", now);
+				note_intent("_ui", line);
+			}
+		}
+	}
 	for (int i = 0; i < n; i++) {
 		if (strcmp(p[i].kp_proc.p_comm, name) == 0 && p[i].kp_proc.p_pid > 1 && kill(p[i].kp_proc.p_pid, sig) == 0) {
 			printf("killed %d %s\n", p[i].kp_proc.p_pid, name);

@@ -29,6 +29,7 @@ static const char t_root[] = HM_DIR;
 static char t_tmp[256], t_cache[256];
 #define M2_REAL0 "/nonexistent/SweetMetal2"
 #define M2_CLIENTS HM_DIR "/mtl2-clients"
+#define CRASH_DIR HM_DIR "/crash"
 #define SHIM_HOST_TEST 1
 #define _CS_DARWIN_USER_TEMP_DIR 0x10001
 #define _CS_DARWIN_USER_CACHE_DIR 0x10002
@@ -180,6 +181,71 @@ main(void)
 	bundle("three");
 	CHECK(wants("backboardd", &why));
 	CHECK(access(p, F_OK) != 0);
+
+	/* (ws-hm-fallback) a restart on purpose is not counted: by pid (intent/NAME), or the start running when intent/_ui
+	 * was written (a start within 30 s of it); a trip explains itself; trip-test; a clear ("c TIME") */
+	{
+		long now = (long)time(NULL);
+		char text[256];
+		snprintf(p, sizeof(p), "%s/intent", t_root); mkdir(p, 0777);
+		snprintf(p, sizeof(p), "%s/crash", t_root); mkdir(p, 0777);
+		put("crash/Music-2026-11-19-101800.ips", "x");
+		shim_begin("Music");
+		snprintf(text, sizeof(text), "%ld 101 %s\n%ld 102 %s\n", now - 60, g_key, now - 30, g_key);
+		snprintf(p, sizeof(p), "%shakios-metal-Music.starts", t_tmp);
+		{ FILE *f = fopen(p, "w"); fputs(text, f); fclose(f); }
+		snprintf(text, sizeof(text), "%ld 101 9\n", now - 31);
+		put("intent/Music", text);
+		CHECK(wants("Music", &why));                     /* 101 killed on purpose: one unclean before this start */
+		CHECK(wants("Music", &why) == false && strcmp(why, "crash trip") == 0);   /* 102 + the last one: trips */
+		snprintf(p, sizeof(p), "%shakios-metal-Music.m2.why", t_tmp);
+		first_line(p, line, sizeof(line));
+		CHECK(strncmp(line, "reason: crash trip", 18) == 0);
+		snprintf(p, sizeof(p), "%s/trips/Music.why", t_root);
+		CHECK(access(p, F_OK) == 0);
+		{
+			char all[4096] = ""; FILE *f = fopen(p, "r"); size_t n = f ? fread(all, 1, sizeof(all) - 1, f) : 0; if (f) fclose(f); all[n] = 0;
+			CHECK(strstr(all, "pid 101") && strstr(all, "killed on purpose"));
+			CHECK(strstr(all, "pid 102 ended without a clean exit"));
+			CHECK(strstr(all, "Music-2026-11-19-101800.ips"));
+		}
+		snprintf(p, sizeof(p), "%s/fallback.log", t_root);
+		{
+			char all[4096] = ""; FILE *f = fopen(p, "r"); size_t n = f ? fread(all, 1, sizeof(all) - 1, f) : 0; if (f) fclose(f); all[n] = 0;
+			CHECK(strstr(all, "Music pid") && strstr(all, "-> SweetMetal2: crash trip"));
+		}
+		/* pa fallback clear: marker and m2-fallback line gone, "c TIME" in the starts file */
+		snprintf(p, sizeof(p), "%shakios-metal-Music.m2", t_tmp); unlink(p);
+		put("m2-fallback", "");
+		snprintf(p, sizeof(p), "%shakios-metal-Music.starts", t_tmp);
+		{ FILE *f = fopen(p, "a"); fprintf(f, "c %ld\n", now); fclose(f); }
+		CHECK(wants("Music", &why) && strcmp(why, "default") == 0);
+		/* the render server (or SpringBoard) killed on purpose: the start running then is not counted */
+		shim_begin("Posters");
+		snprintf(text, sizeof(text), "%ld 201 %s\n%ld 202 %s\n", now - 50, g_key, now - 20, g_key);
+		snprintf(p, sizeof(p), "%shakios-metal-Posters.starts", t_tmp);
+		{ FILE *f = fopen(p, "w"); fputs(text, f); fclose(f); }
+		snprintf(text, sizeof(text), "%ld\n", now - 10);
+		put("intent/_ui", text);
+		CHECK(wants("Posters", &why));
+		/* an old _ui note (past 30 s) does not excuse anything */
+		shim_begin("Posters2");
+		snprintf(text, sizeof(text), "%ld 301 %s\n%ld 302 %s\n", now - 90, g_key, now - 60, g_key);
+		snprintf(p, sizeof(p), "%shakios-metal-Posters2.starts", t_tmp);
+		{ FILE *f = fopen(p, "w"); fputs(text, f); fclose(f); }
+		snprintf(text, sizeof(text), "%ld\n", now - 55);
+		put("intent/_ui", text);
+		CHECK(!wants("Posters2", &why));
+		/* trip-test: exact names only */
+		put("trip-test", "*\n");
+		CHECK(wants("Clock", &why));
+		put("trip-test", "Clock\n");
+		CHECK(!wants("Clock", &why));
+		snprintf(p, sizeof(p), "%s/trips/Clock.why", t_root);
+		first_line(p, line, sizeof(line));
+		CHECK(strncmp(line, "reason: test", 12) == 0);
+		snprintf(p, sizeof(p), "%s/trip-test", t_root); unlink(p);
+	}
 
 	/* SweetMetal2's own gate, as SweetMetal2.mm reads it */
 	CHECK(!shim_m2_clients_has("PosterBoard"));

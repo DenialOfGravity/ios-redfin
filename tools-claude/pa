@@ -30,6 +30,17 @@
 #                             processes, wakeups, crashes, the sysctls in tools-claude/pa-snap.sysctls, Metal env hash,
 #                             pinned boot values, disk, temp overrides, and the last `state diff` counts (its age and
 #                             whether the kernel changed since). --drift runs a fresh diff first (~45 s).
+#                             Also prints the Metal driver per process: one "FALLBACK: NAME -> SweetMetal2 ..." line
+#                             per process the hakios-metal dispatcher tripped (reason, age), or "metal: all on hm".
+#   pa fallback [clear PROC...|clear all|test PROC]
+#                             (ws-hm-fallback) the hakios-metal dispatcher's fallbacks to SweetMetal2: trip markers with
+#                             their reasons (.why), m2-fallback, m2-procs, hm-off, the hm build, fallback.log's tail.
+#                             clear: deletes the trip marker; the owner allows clearing to return to the newest driver.
+#                             Removes the marker(s), .why (kept as .why.cleared-TIME), the m2-fallback and trip-test lines,
+#                             adds "c TIME" to the starts file (earlier starts no longer count), then restarts the process
+#                             once on purpose (sweetctl kill: not counted; backboardd in the list: only it is restarted,
+#                             its followers come back with it). test PROC: trip-test lists PROC and it restarts once:
+#                             its next start trips with reason "test" (undo: pa fallback clear PROC).
 #   pa lock                   who holds the phone lock
 #   pa disp [on|off]          the panel only: report, or force it (kernel 1162 `p disp on|off`; older kernels: the
 #                             power key when it toggles the right way). Forcing on shows frames but does not wake iOS
@@ -137,6 +148,7 @@ pa_snap() {
 	h=$(pick_host)
 	names=$(grep -vE '^\s*(#|$)' "$T/pa-snap.sysctls" 2>/dev/null | tr '\n' ' ')
 	now=$(curl -s -m 3 localhost:8765/api/now 2>/dev/null)
+	local fb; fb=$(HMFB_HOST=$h hmfb_run status 2>/dev/null | hmfb_render short 2>/dev/null)
 	ph=$(ssh_to "$h" "/var/local/bin/dash -s" <<EOF 2>&1
 for n in kern.uuid $names; do o=\$(/var/local/bin/sctl \$n 2>/dev/null) && echo "\$o" || echo "\$n: (none)"; done
 [ -f /var/local/hmetal/env ] && echo "hmetal_env: \$($PTF sha256sum /var/local/hmetal/env | $PT cut -c1-8)"
@@ -144,7 +156,7 @@ for n in kern.uuid $names; do o=\$(/var/local/bin/sctl \$n 2>/dev/null) && echo 
 echo "disk: \$($PT df -h /private/var | $PT tail -1)"
 EOF
 )
-	PH="$ph" NOW="$now" HOST="$h" JSON="$json" PF="$P" python3 - <<'EOF'
+	FB="$fb" PH="$ph" NOW="$now" HOST="$h" JSON="$json" PF="$P" python3 - <<'EOF'
 import json, os
 ph = os.environ['PH']; host = os.environ['HOST']
 try: now = json.loads(os.environ['NOW'] or '{}')
@@ -153,7 +165,7 @@ kv = {}
 for line in ph.splitlines():
     if ': ' in line:
         k, v = line.split(': ', 1); kv[k.strip()] = v.strip()
-out = {'host': host, 'phone': kv}
+out = {'host': host, 'phone': kv, 'metal': [l for l in os.environ.get('FB', '').splitlines() if l.strip()] or ['metal: unknown (no answer)']}
 if now:
     link = now.get('link') or {}; mem = now.get('mem') or {}; cpu = now.get('cpu') or {}
     procs = now.get('procs') or {}
@@ -184,6 +196,7 @@ if os.environ['JSON']:
     print(json.dumps(out, separators=(',', ':')))
 else:
     print(f"phone via {host}")
+    for l in out['metal']: print(l)
     for k, v in kv.items(): print(f"  {k}: {v[:150]}")
     if not kv: print("  (no ssh answer)\n  " + ph[:300])
     for k, v in (out.get('monitor') or {}).items():
@@ -191,6 +204,164 @@ else:
     if not now: print("  (sweetmon collector not answering: pa mon-start)")
     for k, v in st.items(): print(f"  {k}: {v}")
 EOF
+}
+
+# ---------------------------------------------------------------- (ws-hm-fallback) the Metal dispatcher's fallbacks
+# The dispatcher (phone/hmetal/bench/m2shim.m, /System/Library/Extensions/SweetMetal2.bundle) puts a process on
+# SweetMetal2 after a crash trip; markers: ca/bbd-hm.tripped (backboardd), DARWIN_USER_TEMP_DIR/hakios-metal-NAME.m2
+# (others: /private/var/tmp or the app container's tmp), each with MARKER.why; trips/NAME.why; m2-fallback; fallback.log.
+hmfb_phone() {	# the phone side (dash + toybox): status | clear NAME... | test NAME
+cat <<'EOS'
+PT=/var/local/bin/toybox; D=/private/var/local/hmetal; now=$($PT date +%s); mode=$1; shift
+B=$D/lib/HakiosMetal.bundle/HakiosMetal; [ -f $B ] || B=$D/ca/HakiosMetal.bundle/HakiosMetal
+K=$($PT stat -c 'm%Y-s%s' $B 2>/dev/null || echo none)
+markers() {	# NAME|'' -> marker paths
+	if [ -z "$1" ] || [ "$1" = backboardd ]; then echo $D/ca/bbd-hm.tripped; fi
+	for m in /private/var/tmp/hakios-metal-${1:-*}.m2 /private/var/mobile/tmp/hakios-metal-${1:-*}.m2 \
+		/private/var/mobile/Containers/Data/*/*/tmp/hakios-metal-${1:-*}.m2 /private/var/root/tmp/hakios-metal-${1:-*}.m2; do
+		echo "$m"
+	done
+}
+mname() { case $1 in */bbd-hm.tripped) echo backboardd;; *) n=${1##*/hakios-metal-}; echo "${n%.m2}";; esac; }
+names() { [ -f "$1" ] && $PT sed -e 's/#.*//' "$1" | while read -r n k; do [ -n "$n" ] && echo "$n $k"; done; }
+drop() {	# FILE NAME: lines naming NAME removed (in place: owner and mode kept)
+	[ -f "$1" ] || return 0
+	re=$(echo "$2" | $PT sed 's/\./\\./g')
+	$PT grep -v -E "^[[:space:]]*$re([[:space:]#]|\$)" "$1" > "$1.pa-new"; $PT cat "$1.pa-new" > "$1"; $PT rm -f "$1.pa-new"
+}
+case $mode in
+status)
+	echo "key|$K|$($PT sha256sum $B 2>/dev/null | $PT cut -c1-16)"
+	[ -e $D/hm-off ] && echo "hmoff|"
+	for m in $(markers ''); do
+		[ -f "$m" ] || continue
+		n=$(mname "$m"); k=$($PT head -1 "$m"); t=$($PT stat -c %Y "$m"); st=held; [ "$k" = "$K" ] || st=expired
+		w=; if [ -f "$m.why" ]; then w=$($PT head -1 "$m.why"); elif [ -f $D/trips/$n.why ]; then w="$($PT head -1 $D/trips/$n.why) (trips/$n.why)"; fi
+		echo "trip|$n|$st|$((now - t))|$m|${w#reason: }"
+	done
+	names $D/m2-fallback | while read -r n k; do [ "$k" = "$K" ] && echo "list|$n"; done
+	names $D/m2-procs | while read -r n k; do echo "m2procs|$n"; done
+	names $D/trip-test | while read -r n k; do echo "triptest|$n"; done
+	[ -f $D/fallback.log ] && $PT tail -n ${TAILN:-6} $D/fallback.log | while read -r l; do echo "log|$l"; done
+	echo "now|$now";;
+clear)
+	$PT mkdir -p $D/trips; $PT chmod 777 $D/trips
+	for n in "$@"; do
+		for m in $(markers "$n"); do
+			[ -f "$m" ] || continue
+			[ -f "$m.why" ] && $PT mv "$m.why" "$m.why.cleared-$now"
+			$PT rm -f "$m"; echo "removed $m"
+		done
+		for s in $D/ca/bbd-hm.starts /private/var/tmp/hakios-metal-$n.starts /private/var/mobile/tmp/hakios-metal-$n.starts \
+			/private/var/mobile/Containers/Data/*/*/tmp/hakios-metal-$n.starts; do
+			case $s in */bbd-hm.starts) [ "$n" = backboardd ] || continue;; esac
+			[ -f "$s" ] && echo "c $now" >> "$s"
+		done
+		drop $D/m2-fallback "$n"; drop $D/trip-test "$n"
+		[ -f $D/trips/$n.why ] && $PT mv $D/trips/$n.why $D/trips/$n.why.cleared-$now
+		echo "$($PT date -u '+%Y-%m-%d %H:%M:%S UTC') $now $n CLEARED by pa fallback clear: back to hakios-metal at its next start" >> $D/fallback.log
+		$PT chmod 666 $D/fallback.log   # the dispatcher appends as the process's user (backboardd: mobile)
+		echo "cleared $n"
+	done
+	case " $* " in
+	*" backboardd "*) /var/local/bin/sweetctl kill backboardd;;
+	*) for n in "$@"; do /var/local/bin/sweetctl kill "$n" 2>&1; done;;
+	esac;;
+test)
+	echo "$1" >> $D/trip-test; $PT chmod 666 $D/trip-test
+	echo "trip-test: $1 (its next start trips with reason test)"
+	/var/local/bin/sweetctl kill "$1";;
+esac
+EOS
+}
+hmfb_run() { ssh_to "${HMFB_HOST:-$(pick_host)}" "TAILN=${TAILN:-6} /var/local/bin/dash -s $*" < <(hmfb_phone); }
+
+hmfb_render() {	# status lines on stdin -> the human lines (MODE short: pa snap's; long: pa fallback's)
+	FBMODE=$1 PF="$P" python3 <(cat <<'PY'
+import os, re, sys
+mode = os.environ["FBMODE"]; P = os.environ["PF"]
+L = [l.rstrip("\n").split("|", 5) for l in sys.stdin if "|" in l]
+key = next((l for l in L if l[0] == "key"), ["key", "?", ""])
+now = int(next((l[1] for l in L if l[0] == "now"), "0") or 0)
+def age(s):
+    s = int(s); return f"{s // 3600} h {s % 3600 // 60} min" if s >= 3600 else f"{s // 60} min" if s >= 60 else f"{s} s"
+build = ""
+if mode == "long" and key[2]:
+    try:
+        for l in open(os.path.join(P, "KNOWN-GOOD.txt"), errors="replace"):
+            if "HakiosMetal" in l and "sha " + key[2] in l:
+                m = re.search(r"from (\S+?);", l); build = m.group(1) if m else l[:120]
+    except OSError: pass
+out = []
+trips = [l for l in L if l[0] == "trip" and l[2] == "held"]
+tripped = {l[1] for l in trips}
+if any(l[0] == "hmoff" for l in L):
+    out.append("FALLBACK: ALL processes -> SweetMetal2 (hm-off exists: the operator switch)")
+for l in trips:
+    out.append(f"FALLBACK: {l[1]} -> SweetMetal2 for {age(l[3])}: {l[5] or '(no .why: tripped by an older dispatcher; reason unknown)'}")
+for l in L:
+    if l[0] == "list" and l[1] not in tripped:
+        out.append(f"FALLBACK: {l[1]} -> SweetMetal2 (m2-fallback line with this bundle; no marker)"); tripped.add(l[1])
+recent = []
+for l in L:
+    if l[0] == "log":
+        f = l[1].split()
+        if len(f) > 4 and f[3].isdigit() and now - int(f[3]) < 600 and "this start only" in l[1]:
+            recent.append("FALLBACK (one start, " + age(now - int(f[3])) + " ago): " + " ".join(f[4:])[:200])
+out += recent
+m2p = [l[1] for l in L if l[0] == "m2procs"]
+tt = [l[1] for l in L if l[0] == "triptest"]
+if not out:
+    out.append("metal: all on hm" + (f" (m2-procs keeps {', '.join(m2p)} on SweetMetal2)" if m2p else ""))
+elif m2p:
+    out.append(f"metal: m2-procs keeps {', '.join(m2p)} on SweetMetal2 (operator list)")
+if tt: out.append(f"metal: trip-test armed for {', '.join(tt)} (pa fallback clear NAME disarms)")
+if mode == "short":
+    if trips or recent: out.append("  (details: pa fallback; back to hm: pa fallback clear NAME)")
+    print("\n".join(out)); sys.exit()
+print("\n".join(out))
+print(f"hm bundle: {key[1]} sha {key[2] or '?'}" + (f" = {build}" if build else " (no KNOWN-GOOD.txt line for it)"))
+for l in L:
+    if l[0] == "trip":
+        print(f"  marker {l[4]}: {l[1]} {l[2]}{' (bundle changed: ends at its next start)' if l[2] == 'expired' else ''}, {age(l[3])} old")
+logs = [l[1] for l in L if l[0] == "log"]
+if logs:
+    print("fallback.log (newest last):"); [print("  " + x[:300]) for x in logs]
+PY
+)
+}
+
+pa_fallback() {	# [clear PROC...|clear all|test PROC]
+	local h; h=$(pick_host); export HMFB_HOST=$h
+	case ${1:-} in
+	'')
+		local st n cmd=
+		st=$(TAILN=10 hmfb_run status)
+		echo "$st" | hmfb_render long
+		for n in $(echo "$st" | awk -F'|' '$1=="trip" && $3=="held" {print $2}'); do
+			cmd="$cmd echo '--- $n: why'; cat /private/var/local/hmetal/trips/$n.why 2>/dev/null ||"
+			cmd="$cmd echo '(no .why: tripped by a dispatcher older than ws-hm-fallback)';"
+		done
+		[ -n "$cmd" ] && ssh_to "$h" "$cmd" | cut -c1-400;;
+	clear)
+		shift
+		[ $# -gt 0 ] || { echo "pa fallback clear PROC...|all   (deletes the trip marker; the owner allows clearing to return to the newest driver)"; return 2; }
+		if [ "$1" = all ]; then
+			set -- $(hmfb_run status | awk -F'|' '($1=="trip" && $3=="held") || $1=="list" || $1=="triptest" {print $2}' | sort -u)
+			[ $# -gt 0 ] || { echo "nothing tripped"; return 0; }
+		fi
+		local n; for n in "$@"; do [[ $n =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad name: $n"; return 2; }; done
+		echo "clearing: $* (deletes the trip marker; the owner allows clearing to return to the newest driver)"
+		hmfb_run clear "$@"
+		sleep "${PA_FB_SETTLE:-10}"
+		hmfb_run status | hmfb_render short;;
+	test)
+		[[ ${2:-} =~ ^[A-Za-z0-9._-]+$ ]] || { echo "pa fallback test PROC"; return 2; }
+		hmfb_run test "$2"
+		sleep "${PA_FB_SETTLE:-10}"
+		hmfb_run status | hmfb_render short;;
+	*) pa_help fallback; return 2;;
+	esac
 }
 
 # ---------------------------------------------------------------- screen, UI input, screenshots (1162)
@@ -353,6 +524,7 @@ case $act in
 	get) run "pull $*";;
 	klog) pa_klog "$@";;
 	snap) pa_snap "$@";;
+	fallback) pa_fallback "$@";;
 	revert) run "state revert $*";;
 	keep) run "state promote $*";;
 	tidy) python3 "$T/pa-tidy.py" "$@";;
