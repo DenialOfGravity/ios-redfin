@@ -3267,7 +3267,7 @@ static void result_of(const uint8_t *d, uint32_t n, unsigned *res, unsigned *err
 #define D_NPROF                 24
 #define D_BAK_MAX               (48u << 10)
 #define D_NGATE                 8
-#define D_NBIND                 8       /* 1158: pre-registration BindMuxDataPort retries in flight */
+#define D_NBIND                 32      /* 1158: pre-registration BindMuxDataPort retries in flight; 1266: 8 -> 32 (CommCenter binds 11 WDS clients at launch: cids 10-12 got "no slot", cid 12 then started data unbound -> INVALID_OPERATION 0x46 forever) */
 #define D_BIND_RETRY_MS         1500u   /* 1158: re-send a rejected bind at most this often */
 
 static int data_fwd = 1, data_opts = DOPT_WDA_OWN;  /* 1088: bit 0x4 on by default; 1108: data_fwd default 0; 1157: default 1 (data-enabled baseline; kern.sweet_data_fwd 0 restores k25 gated) */
