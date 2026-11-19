@@ -2278,6 +2278,59 @@ still_dump(CVPixelBufferRef pb, uint64_t sequence)
 }
 
 /*
+ * (ws-cam-lines) /private/var/local/camera-dumpprev: moving pictures as the plug-in leaves them in the graph's buffer
+ * (both planes, whole rows of each plane's bytes per row), every 15th one up to 6 for mediaserverd's run, to
+ * /private/var/local/camera-prev-<n>.<w>x<h>.<bpr0>.<bpr1>.<fourcc> when the file or directory is writable (else the
+ * temporary directory), for finding where in the chain the preview's thin black lines come from.
+ */
+static void
+prev_dump(CVPixelBufferRef pb, uint64_t sequence)
+{
+	static unsigned dumped, seen;
+	char path[300], dir[200];
+	int fd;
+	size_t planes, bpr[2] = { 0, 0 }, rows[2] = { 0, 0 };
+	uint32_t pf = CVPixelBufferGetPixelFormatType(pb);
+	bool written = true;
+
+	if (dumped >= 6 || access("/private/var/local/camera-dumpprev", F_OK) != 0 || seen++ % 15 != 14) {
+		return;
+	}
+	planes = CVPixelBufferGetPlaneCount(pb);
+	if (planes > 2) {
+		return;
+	}
+	for (size_t p = 0; p < (planes ? planes : 1); p++) {
+		bpr[p] = planes ? CVPixelBufferGetBytesPerRowOfPlane(pb, p) : CVPixelBufferGetBytesPerRow(pb);
+		rows[p] = planes ? CVPixelBufferGetHeightOfPlane(pb, p) : CVPixelBufferGetHeight(pb);
+	}
+	char name[160];
+	snprintf(name, sizeof(name), "camera-prev-%u.%zux%zu.%zu.%zu.%c%c%c%c", dumped + 1, CVPixelBufferGetWidth(pb),
+	    CVPixelBufferGetHeight(pb), bpr[0], bpr[1], pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255);
+	snprintf(path, sizeof(path), "/private/var/local/%s", name);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) {
+		size_t got = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+
+		if (got == 0 || got > sizeof(dir)) {
+			snprintf(dir, sizeof(dir), "/private/var/tmp/");
+		}
+		snprintf(path, sizeof(path), "%s%s%s", dir, dir[strlen(dir) - 1] == '/' ? "" : "/", name);
+		if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) {
+			say("preview dump: frame %llu not dumped: %s: %s", (unsigned long long)sequence, path, strerror(errno));
+			return;
+		}
+	}
+	dumped++;
+	for (size_t p = 0; p < (planes ? planes : 1) && written; p++) {
+		const uint8_t *plane = planes ? CVPixelBufferGetBaseAddressOfPlane(pb, p) : CVPixelBufferGetBaseAddress(pb);
+
+		written = plane != NULL && write(fd, plane, bpr[p] * rows[p]) == (ssize_t)(bpr[p] * rows[p]);
+	}
+	close(fd);
+	say("preview dump: frame %llu to %s%s", (unsigned long long)sequence, path, written ? "" : " NOT WRITTEN WHOLE");
+}
+
+/*
  * A picture of the frame into a buffer of the graph's (the scalers' moving picture, or the photograph: every pixel
  * of the sensor, isp_render_still_nv12), in pieces on every core. redfin (B8): without the stream's lock, so that the
  * capture stack's property calls do not wait for it (a 12 MP photograph took a second or more).
@@ -2322,6 +2375,8 @@ render_into(struct output *out, CVPixelBufferRef pb, const struct isp *isp, cons
 		    height, (unsigned long long)f->sequence, (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6, y,
 		    clipped * 100);
 		still_dump(pb, f->sequence);
+	} else {
+		prev_dump(pb, f->sequence);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	return true;
