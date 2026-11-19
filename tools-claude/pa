@@ -273,7 +273,7 @@ test)
 esac
 EOS
 }
-hmfb_run() { ssh_to "${HMFB_HOST:-$(pick_host)}" "/var/local/bin/dash -s $*" < <(hmfb_phone); }
+hmfb_run() { ssh_to "${HMFB_HOST:-$(pick_host)}" "TAILN=${TAILN:-6} /var/local/bin/dash -s $*" < <(hmfb_phone); }
 
 hmfb_render() {	# status lines on stdin -> the human lines (MODE short: pa snap's; long: pa fallback's)
 	FBMODE=$1 PF="$P" python3 <(cat <<'PY'
@@ -334,13 +334,14 @@ pa_fallback() {	# [clear PROC...|clear all|test PROC]
 	local h; h=$(pick_host); export HMFB_HOST=$h
 	case ${1:-} in
 	'')
-		hmfb_run status | hmfb_render long
-		local n w
-		for n in $(hmfb_run status | awk -F'|' '$1=="trip" && $3=="held" {print $2}'); do
-			echo "--- $n: why"
-			if [ "$n" = backboardd ]; then w=/private/var/local/hmetal/ca/bbd-hm.tripped.why; else w=/private/var/local/hmetal/trips/$n.why; fi
-			ssh_to "$h" "cat $w 2>/dev/null || echo '(no .why: tripped by a dispatcher older than ws-hm-fallback)'" | cut -c1-400
-		done;;
+		local st n cmd=
+		st=$(TAILN=10 hmfb_run status)
+		echo "$st" | hmfb_render long
+		for n in $(echo "$st" | awk -F'|' '$1=="trip" && $3=="held" {print $2}'); do
+			cmd="$cmd echo '--- $n: why'; cat /private/var/local/hmetal/trips/$n.why 2>/dev/null ||"
+			cmd="$cmd echo '(no .why: tripped by a dispatcher older than ws-hm-fallback)';"
+		done
+		[ -n "$cmd" ] && ssh_to "$h" "$cmd" | cut -c1-400;;
 	clear)
 		shift
 		[ $# -gt 0 ] || { echo "pa fallback clear PROC...|all   (deletes the trip marker; the owner allows clearing to return to the newest driver)"; return 2; }

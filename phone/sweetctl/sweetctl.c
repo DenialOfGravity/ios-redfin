@@ -325,7 +325,8 @@ kv(const char *path, const char *key, const char *val, int op)	/* op 0 get, 1 se
 
 /* (ws-hm-fallback) a kill on purpose: the Metal dispatcher (phone/hmetal/bench/m2shim.m) does not count the killed
  * instance's start toward its crash trip. Before signalling: HM_INTENT/NAME gets one "TIME PID SIG" line for each process
- * signalled; a kill of backboardd also HM_INTENT/_render ("TIME": the processes that go down with the render server).
+ * signalled; a kill of backboardd or SpringBoard also HM_INTENT/_ui ("TIME": the processes that go down with the render
+ * server or SpringBoard: SpringBoard, posters, apps).
  * Not for signals that do not end a process. */
 #define HM_INTENT	"/var/local/hmetal/intent"
 
@@ -378,9 +379,9 @@ kill_name(const char *name, int sig)
 		}
 		if (text[0]) {
 			note_intent(name, text);
-			if (!strcmp(name, "backboardd")) {
+			if (!strcmp(name, "backboardd") || !strcmp(name, "SpringBoard")) {
 				snprintf(line, sizeof(line), "%ld\n", now);
-				note_intent("_render", line);
+				note_intent("_ui", line);
 			}
 		}
 	}

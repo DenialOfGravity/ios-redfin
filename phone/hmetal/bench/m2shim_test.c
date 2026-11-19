@@ -182,7 +182,7 @@ main(void)
 	CHECK(wants("backboardd", &why));
 	CHECK(access(p, F_OK) != 0);
 
-	/* (ws-hm-fallback) a restart on purpose is not counted: by pid (intent/NAME), or the start running when intent/_render
+	/* (ws-hm-fallback) a restart on purpose is not counted: by pid (intent/NAME), or the start running when intent/_ui
 	 * was written (a start within 30 s of it); a trip explains itself; trip-test; a clear ("c TIME") */
 	{
 		long now = (long)time(NULL);
@@ -220,21 +220,21 @@ main(void)
 		snprintf(p, sizeof(p), "%shakios-metal-Music.starts", t_tmp);
 		{ FILE *f = fopen(p, "a"); fprintf(f, "c %ld\n", now); fclose(f); }
 		CHECK(wants("Music", &why) && strcmp(why, "default") == 0);
-		/* the render server killed on purpose: the start running then is not counted */
+		/* the render server (or SpringBoard) killed on purpose: the start running then is not counted */
 		shim_begin("Posters");
 		snprintf(text, sizeof(text), "%ld 201 %s\n%ld 202 %s\n", now - 50, g_key, now - 20, g_key);
 		snprintf(p, sizeof(p), "%shakios-metal-Posters.starts", t_tmp);
 		{ FILE *f = fopen(p, "w"); fputs(text, f); fclose(f); }
 		snprintf(text, sizeof(text), "%ld\n", now - 10);
-		put("intent/_render", text);
+		put("intent/_ui", text);
 		CHECK(wants("Posters", &why));
-		/* an old _render note (past 30 s) does not excuse anything */
+		/* an old _ui note (past 30 s) does not excuse anything */
 		shim_begin("Posters2");
 		snprintf(text, sizeof(text), "%ld 301 %s\n%ld 302 %s\n", now - 90, g_key, now - 60, g_key);
 		snprintf(p, sizeof(p), "%shakios-metal-Posters2.starts", t_tmp);
 		{ FILE *f = fopen(p, "w"); fputs(text, f); fclose(f); }
 		snprintf(text, sizeof(text), "%ld\n", now - 55);
-		put("intent/_render", text);
+		put("intent/_ui", text);
 		CHECK(!wants("Posters2", &why));
 		/* trip-test: exact names only */
 		put("trip-test", "*\n");

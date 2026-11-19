@@ -36,7 +36,7 @@
  * a new bundle expires it (one line "m2shim: trip expired ..."). Clear: `pa fallback clear NAME` (marker, m2-fallback line,
  * a "c TIME" line in the starts file, then one restart on purpose).
  * (ws-hm-fallback) Restarts on purpose do not count: `sweetctl kill NAME` (and render/respring) writes intent/NAME
- * ("TIME PID SIG" lines; backboardd also intent/_render) before it signals; the killed instance's start is marked
+ * ("TIME PID SIG" lines; backboardd and SpringBoard also intent/_ui) before it signals; the killed instance's start is marked
  * "i PID" in the starts file. Every fallback explains itself: "HM FALLBACK: NAME -> SweetMetal2: REASON" (kernel log,
  * syslog, shim.log), a line in fallback.log, and for a trip MARKER.why + trips/NAME.why (time, the last starts and how
  * each ended, crash reports, bundle key). trip-test (exact names) trips a listed process at its next start ("test").
@@ -351,7 +351,8 @@ typedef struct { long t; int pid; char how; } shim_start;   /* how: 0 no clean e
 
 /* (ws-hm-fallback) an intentional restart: `sweetctl kill NAME` writes intent/NAME (NAME as p_comm: 16 characters at
  * most), one "TIME PID SIG" line for every process it signals, BEFORE it signals; a kill of backboardd (sweetctl
- * render) also intent/_render ("TIME"): the processes that go down with the render server. */
+ * render) or SpringBoard (respring) also intent/_ui ("TIME"): the processes that go down with them (SpringBoard,
+ * posters, apps). */
 typedef struct { long t; int pids[16]; int n; } shim_intent;
 
 static void
@@ -479,7 +480,7 @@ shim_explain(const char *reason, const char *marker, const shim_start *seen, int
 /* (hm-int2) the crash trip, one for every process (backboardd's files in ca/, the others' in their temp directory).
  * true: this process stays on SweetMetal2 (tripped now, or earlier with the bundle installed now).
  * (ws-hm-fallback) Only abnormal ends count: a start whose process sweetctl killed on purpose (its pid in intent/NAME,
- * or the start that was running when intent/NAME or intent/_render was written, for a start within INTENT_WINDOW s of
+ * or the start that was running when intent/NAME or intent/_ui was written, for a start within INTENT_WINDOW s of
  * it) is marked 'i' and not counted. trip-test (exact names) trips the listed process at its next start (reason
  * "test"); pa fallback test/clear write and remove it. */
 static bool
@@ -536,7 +537,7 @@ shim_tripped(bool bbd)
 	}
 	/* intentional kills: by pid, or (a start within INTENT_WINDOW s of it) the start that was running then */
 	shim_intent_read(g_name, &own);
-	shim_intent_read("_render", &rend);
+	shim_intent_read("_ui", &rend);
 	for (int i = 0; i < count; i++) {
 		for (int j = 0; j < own.n && !seen[i].how; j++) {
 			if (seen[i].pid == own.pids[j] && seen[i].t <= own.t + 1) {
@@ -554,7 +555,7 @@ shim_tripped(bool bbd)
 			snprintf(line, sizeof(line), "i %d\n", seen[i].pid);
 			shim_write(g_starts, line);
 			shim_log("start of pid %d (%ld) ended on purpose (intent/%s %ld s ago): not counted", seen[i].pid, seen[i].t,
-				 k == 0 ? g_name : "_render", now - t);
+				 k == 0 ? g_name : "_ui", now - t);
 		}
 	}
 	for (int i = 0; i < count; i++) {
