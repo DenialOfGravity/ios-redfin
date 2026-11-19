@@ -1,0 +1,628 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 03:00:00 +0100
+Subject: [PATCH] redfin 1262: composite a swap's layers (kern.sweet_present_layers)
+
+The SwapEnd record is IOMFB's swap record (Asahi's struct dcp_swap): per layer the surface id (0x54), source rect
+(0x64), surface flags (0xa4, 0xb4), destination rect (0xc4); the layers this swap sets (0x104). A layer the mask does
+not name keeps its surface. Photos' All Photos has two live full-screen layers (l0 the grid, l1 backboardd's frame with
+transparent holes); CA sends 0x7 then 0x2 (only l1), and only l1 reached the panel: a black grid.
+
+kern.sweet_present_layers 1: SwapEnd completes the record with the layers it keeps; a frame of 2-4 live layers leaves
+the direct scanout to presentGPU, which composites them with the 2D engine into the back panel buffer (layer 0 copied,
+the others blended source-over, each scaled src rect -> dst rect), corner mattes over the panel corners, then the
+normal 0905 flip. 8 GPU surface slots instead of 4 while on. 0 (default) = one layer only, as before.
+Lines: `SWEET FB: 5s layers (1262)`; 1260's layout line gains each layer's flags `f F/U`.
+
+---
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 06b9647..aca85d9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1385,7 +1385,11 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_surfalign_limits, CTLTYPE_INT | CTLFLAG_RW |
+ 
+ static int present_wait_locked(uint32_t k, const char *why);
+ 
+-#define SLOTS           4
++/* 1262: 8 surface slots; with kern.sweet_present_layers 0 only the first 4 are used (as before), with 1 all 8 (two
++ * composited rings of 3 surfaces each would otherwise remap every frame) */
++#define SLOTS           8
++extern uint32_t sweet_present_layers;
++#define SLOTS_LIVE      (sweet_present_layers ? SLOTS : 4)
+ #define SLOT_IOVA(n)    (0x100000000ULL + 0x1000000ULL * (n))
+ #define SLOT_MAX        0x1000000ULL
+ #define SLOT_PAGES      1024
+@@ -1417,7 +1421,7 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ 		return -1;
+ 	}
+ 	int s = 0;
+-	for (int i = 1; i < SLOTS; i++) {
++	for (int i = 1; i < SLOTS_LIVE; i++) {
+ 		if (slot[i].used < slot[s].used) {
+ 			s = i;
+ 		}
+@@ -1607,6 +1611,89 @@ display_mask_build(uint32_t r, uint32_t ext)
+ 	flush_dcache64((addr64_t)(uintptr_t)atlas, DISPLAY_MASK_PITCH * DISPLAY_MASK_DIM, FALSE);
+ }
+ 
++/*
++ * 1262: the end of a present, shared by sweet_gpu_present and sweet_gpu_present_layers: with the GPU lock held, puts
++ * the IB (n dwords) on the ring, unlocks, keeps the present statistics. 0 queued, 1 busy (the IB slot two presents
++ * back still queued, or put off), -1 failed.
++ */
++static int
++present_submit_unlock(uint32_t *ib, uint32_t n, uint64_t t0, uint64_t t1)
++{
++	/*
++	 * Not waited for: the vsync timer must not block behind the Metal clients' work queued ahead of it
++	 * (a waited present took 15-30 ms with metal2vulkan's frames in the ring, and the vsync notifications
++	 * CA paces on came late). Two IB slots: only the one two presents back must have landed.
++	 */
++	uint32_t k = present_next & 1;
++	/*
++	 * 0158: never block the vsync tick behind client render jobs. The present of this IB slot (two frames
++	 * back) still queued: 1, "busy" — the framebuffer keeps the frame and tries again on the next tick
++	 * (sweetpresentwait=1: the old blocking wait).
++	 */
++	static int block = -1;
++	if (block < 0 && !PE_parse_boot_argn("sweetpresentwait", &block, sizeof(block)))
++		block = 0;
++	if (!block && present_fence[k] && !a6_fence_done(&gpu, present_fence[k])) {
++		if (gpu_hung_locked(500)) {
++			gpu_recover_locked("present");
++			lck_mtx_unlock(&sweet_gpu_lock);
++			return -1;
++		}
++		stat_busy++;
++		lck_mtx_unlock(&sweet_gpu_lock);
++		return 1;
++	}
++	int rc = present_wait_locked(k, "present");
++	if (rc == 0) {
++		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
++		gpu_note_submit_locked();
++		present_fence[k] = a6_submit_ib_async(&gpu, a6_pool_va(PRESENT_IB(k)), n, 100);
++		gpu_owner_locked(present_fence[k], 0);
++		present_queued_abs[k] = present_fence[k] ? mach_absolute_time() : 0;	/* 0943 */
++		present_swap_abs[k] = present_fence[k] ? present_tag : 0;	/* 0946 */
++		rc = present_fence[k] ? 0 : -1;
++		present_next++;
++		if (fb_flip > 0 && present_fence[k]) {
++			back_fence = present_fence[k];	/* 0905: flipped to once it lands (flip_poll_locked) */
++		}
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++	uint64_t t2 = mach_absolute_time();
++	stat_clean_abs += t1 - t0;
++	stat_gpu_abs += t2 - t1;
++	/*
++	 * 0942: the present line per window of 300 frames, readable on its own: how long the window took and the
++	 * presents a second in it, the mean cache clean and blit queueing per frame, and what happened in that window
++	 * only (presents put off because the previous blit was still queued, flips, flips taken as latched by time),
++	 * with the mode (single buffer / flip) and the GPU clock step. The totals since boot follow in brackets.
++	 */
++	static uint64_t win_abs;
++	static uint32_t win_busy, win_late;
++	static uint64_t win_flips;
++	if (win_abs == 0) {
++		win_abs = t0;
++	}
++	if ((++stat_frames % 300) == 0) {
++		uint64_t c, g, span;
++		absolutetime_to_nanoseconds(stat_clean_abs, &c);
++		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
++		absolutetime_to_nanoseconds(t2 - win_abs, &span);
++		uint32_t freq = 0;
++		PE_parse_boot_argn("sweetgpufreq", &freq, sizeof(freq));
++		a6_log("present: 300 frames in %llu ms = %llu.%llu/s (%s, gpufreq %u); per frame clean %llu us, blit %llu us; "
++		    "put off %u, flips %llu, late %u [total %llu frames, put off %u, flips %llu, late %u]\n",
++		    span / 1000000, span ? 300000000000ULL / span : 0, span ? (3000000000000ULL / span) % 10 : 0,
++		    fb_flip > 0 ? "flip" : "single buffer", freq, c / 1000 / 300, g / 1000 / 300, stat_busy - win_busy,
++		    stat_flips - win_flips, stat_flip_late - win_late, stat_frames, stat_busy, stat_flips, stat_flip_late);
++		stat_clean_abs = stat_gpu_abs = 0;
++		win_abs = t2;
++		win_busy = stat_busy;
++		win_flips = stat_flips;
++		win_late = stat_flip_late;
++	}
++	return rc;
++}
++
+ /*
+  * Blit a mapped surface, scaled to fit and centred, into the panel memory
+  * (rows of fb_pitch bytes). With corner_radius, the image gets continuous
+@@ -1721,83 +1808,103 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	} else {
+ 		n = a6_blit_ib(&gpu, &frame, ib);
+ 	}
+-	/*
+-	 * Not waited for: the vsync timer must not block behind the Metal clients' work queued ahead of it
+-	 * (a waited present took 15-30 ms with metal2vulkan's frames in the ring, and the vsync notifications
+-	 * CA paces on came late). Two IB slots: only the one two presents back must have landed.
+-	 */
+-	uint32_t k = present_next & 1;
+-	/*
+-	 * 0158: never block the vsync tick behind client render jobs. The present of this IB slot (two frames
+-	 * back) still queued: 1, "busy" — the framebuffer keeps the frame and tries again on the next tick
+-	 * (sweetpresentwait=1: the old blocking wait).
+-	 */
+-	static int block = -1;
+-	if (block < 0 && !PE_parse_boot_argn("sweetpresentwait", &block, sizeof(block)))
+-		block = 0;
+-	if (!block && present_fence[k] && !a6_fence_done(&gpu, present_fence[k])) {
+-		if (gpu_hung_locked(500)) {
+-			gpu_recover_locked("present");
+-			lck_mtx_unlock(&sweet_gpu_lock);
++	int rc = present_submit_unlock(ib, n, t0, t1);
++	if (rc == 1) {
++		return 1;
++	}
++	*out_dx = frame.dx;
++	*out_dy = frame.dy;
++	*out_dw = frame.dw;
++	*out_dh = frame.dh;
++	return rc;
++}
++
++/*
++ * 1262: one swap of several layers (kern.sweet_present_layers, SweetFramebuffer.cpp), composited by the 2D engine into
++ * the panel buffer that is not on screen, as Apple's display driver composites a swap's layers in hardware: layer 0
++ * first (copied), each layer above blended over it (source-over), every layer scaled from its source rectangle to its
++ * panel rectangle; then the corner mattes over the panel's corners. Needs 0905's flip (the back buffer is never
++ * scanned out while it is drawn); layer 0 must cover the panel (there is no fill). Same IB slots, fences and statistics
++ * as sweet_gpu_present. 0 queued, 1 busy (try again on the next tick), -1 not possible (the caller says why).
++ */
++struct sweet_gpu_layer {
++	int       slot;
++	uintptr_t kva;          /* clean through it first (0: no clean) */
++	uint32_t  offset, w, h, pitch;
++	uint32_t  sx, sy, sw, sh;       /* source rectangle, surface pixels */
++	uint32_t  dx, dy, dw, dh;       /* destination rectangle, panel pixels */
++	uint32_t  blend;                /* 0 copy, 1 source-over */
++};
++int sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t fb_pitch, uint32_t corner_radius);
++int
++sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t fb_pitch, uint32_t corner_radius)
++{
++	if (!gpu_ready || nl == 0 || nl > 4 || (fb_pitch & 63) || fb_pitch < PANEL_W * 4 || !fb_flip_on()) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < nl; i++) {
++		const struct sweet_gpu_layer *l = &ly[i];
++		if (l->slot < 0 || l->slot >= SLOTS || !slot[l->slot].npages || l->w == 0 || l->h == 0 || (l->pitch & 63) ||
++		    l->sw == 0 || l->sh == 0 || l->sx + l->sw > l->w || l->sy + l->sh > l->h ||
++		    l->dw == 0 || l->dh == 0 || l->dx + l->dw > PANEL_W || l->dy + l->dh > PANEL_H) {
+ 			return -1;
+ 		}
++	}
++	if (ly[0].dx != 0 || ly[0].dy != 0 || ly[0].dw != PANEL_W || ly[0].dh != PANEL_H) {
++		return -1;
++	}
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t i = 0; i < nl; i++) {
++		if (ly[i].kva) {
++			clean_dcache64((addr64_t)ly[i].kva, (unsigned)((uint64_t)ly[i].pitch * ly[i].h + ly[i].offset), FALSE);
++		}
++	}
++	uint64_t t1 = mach_absolute_time();
++	uint32_t ext = corner_radius ? sweet_display_corner_extent(corner_radius) : 0;
++	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= PANEL_W) {
++		ext = 0;
++	}
++	static uint32_t ib[(4 + 4) * A6_BLIT_MAX_DW];
++	lck_mtx_lock(&sweet_gpu_lock);
++	present_landed_locked(mach_absolute_time());
++	flip_poll_locked();
++	if (!flip_latched_locked()) {
+ 		stat_busy++;
+ 		lck_mtx_unlock(&sweet_gpu_lock);
+ 		return 1;
+ 	}
+-	int rc = present_wait_locked(k, "present");
+-	if (rc == 0) {
+-		a6_write(a6_pool_pa(&gpu, PRESENT_IB(k)), ib, 4ULL * n);
+-		gpu_note_submit_locked();
+-		present_fence[k] = a6_submit_ib_async(&gpu, a6_pool_va(PRESENT_IB(k)), n, 100);
+-		gpu_owner_locked(present_fence[k], 0);
+-		present_queued_abs[k] = present_fence[k] ? mach_absolute_time() : 0;	/* 0943 */
+-		present_swap_abs[k] = present_fence[k] ? present_tag : 0;	/* 0946 */
+-		rc = present_fence[k] ? 0 : -1;
+-		present_next++;
+-		if (fb_flip > 0 && present_fence[k]) {
+-			back_fence = present_fence[k];	/* 0905: flipped to once it lands (flip_poll_locked) */
+-		}
+-	}
+-	lck_mtx_unlock(&sweet_gpu_lock);
+-	uint64_t t2 = mach_absolute_time();
+-	stat_clean_abs += t1 - t0;
+-	stat_gpu_abs += t2 - t1;
+-	/*
+-	 * 0942: the present line per window of 300 frames, readable on its own: how long the window took and the
+-	 * presents a second in it, the mean cache clean and blit queueing per frame, and what happened in that window
+-	 * only (presents put off because the previous blit was still queued, flips, flips taken as latched by time),
+-	 * with the mode (single buffer / flip) and the GPU clock step. The totals since boot follow in brackets.
+-	 */
+-	static uint64_t win_abs;
+-	static uint32_t win_busy, win_late;
+-	static uint64_t win_flips;
+-	if (win_abs == 0) {
+-		win_abs = t0;
++	uint64_t fb_gva = A6_GVA_FB + (scan_buf ^ 1) * A6_FB_BUF_OFF;
++	uint32_t n = 0;
++	for (uint32_t i = 0; i < nl; i++) {
++		const struct sweet_gpu_layer *l = &ly[i];
++		struct a6_blit b = {
++			.src_iova = SLOT_IOVA(l->slot) + l->offset, .src_w = l->w, .src_h = l->h, .src_pitch = l->pitch,
++			.sx = l->sx, .sy = l->sy, .sw = l->sw, .sh = l->sh,
++			.dst_iova = fb_gva, .dst_pitch = fb_pitch,
++			.dx = l->dx, .dy = l->dy, .dw = l->dw, .dh = l->dh,
++			.filter = true, .blend = l->blend != 0,
++		};
++		n += a6_blit_ib(&gpu, &b, ib + n);
+ 	}
+-	if ((++stat_frames % 300) == 0) {
+-		uint64_t c, g, span;
+-		absolutetime_to_nanoseconds(stat_clean_abs, &c);
+-		absolutetime_to_nanoseconds(stat_gpu_abs, &g);
+-		absolutetime_to_nanoseconds(t2 - win_abs, &span);
+-		uint32_t freq = 0;
+-		PE_parse_boot_argn("sweetgpufreq", &freq, sizeof(freq));
+-		a6_log("present: 300 frames in %llu ms = %llu.%llu/s (%s, gpufreq %u); per frame clean %llu us, blit %llu us; "
+-		    "put off %u, flips %llu, late %u [total %llu frames, put off %u, flips %llu, late %u]\n",
+-		    span / 1000000, span ? 300000000000ULL / span : 0, span ? (3000000000000ULL / span) % 10 : 0,
+-		    fb_flip > 0 ? "flip" : "single buffer", freq, c / 1000 / 300, g / 1000 / 300, stat_busy - win_busy,
+-		    stat_flips - win_flips, stat_flip_late - win_late, stat_frames, stat_busy, stat_flips, stat_flip_late);
+-		stat_clean_abs = stat_gpu_abs = 0;
+-		win_abs = t2;
+-		win_busy = stat_busy;
+-		win_flips = stat_flips;
+-		win_late = stat_flip_late;
++	if (ext) {
++		if (display_mask_radius != corner_radius) {
++			display_mask_build(corner_radius, ext);
++			display_mask_radius = corner_radius;
++		}
++		for (uint32_t corner = 0; corner < 4; corner++) {
++			struct a6_blit matte = {
++				.src_iova = A6_GVA_POOL + DISPLAY_MASK_OFF,
++				.src_w = DISPLAY_MASK_DIM, .src_h = DISPLAY_MASK_DIM, .src_pitch = DISPLAY_MASK_PITCH,
++				.sx = (corner & 1) * DISPLAY_MASK_SIDE, .sy = (corner >> 1) * DISPLAY_MASK_SIDE,
++				.sw = ext, .sh = ext,
++				.dst_iova = fb_gva, .dst_pitch = fb_pitch,
++				.dx = (corner & 1) ? PANEL_W - ext : 0, .dy = (corner & 2) ? PANEL_H - ext : 0,
++				.dw = ext, .dh = ext, .blend = true,
++			};
++			n += a6_blit_ib(&gpu, &matte, ib + n);
++		}
+ 	}
+-	*out_dx = frame.dx;
+-	*out_dy = frame.dy;
+-	*out_dw = frame.dw;
+-	*out_dh = frame.dh;
+-	return rc;
++	return present_submit_unlock(ib, n, t0, t1);
+ }
+ 
+ /*
+@@ -1956,6 +2063,9 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_present_honest, CTLFLAG_RW | CTLFLAG_LOCKED, &
+ extern uint32_t sweet_present_nolayer;     /* 1261 */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_present_nolayer, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_present_nolayer, 0,
+     "SWEET FB 1261: 1 = a swap's layer naming no surface is off (not a layer), bits above 3 ignored; 0 = raw mask");
++extern uint32_t sweet_present_layers;      /* 1262 */
++SYSCTL_INT(_kern, OID_AUTO, sweet_present_layers, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_present_layers, 0,
++    "SWEET FB 1262: 1 = a swap keeps the layers it does not set and its 2-4 live layers are composited by the GPU; 0 = one layer only");
+ /* 1186: display off blanks the panel (DCS 0x28 + 0x51 0), display on restores it (SweetFramebuffer.cpp) */
+ extern uint32_t sweet_fb_sleep_blank;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7d9e275..80ea89a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,16 @@ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint
+ 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
+ 	uint32_t *out_dw, uint32_t *out_dh);
+ void sweet_gpu_panel_stride(uint32_t stride);
++/* 1262: one layer of a composited swap (sweet_gpu_present_layers; the same struct in sweet_gpu.c) */
++struct sweet_gpu_layer {
++	int       slot;
++	uintptr_t kva;
++	uint32_t  offset, w, h, pitch;
++	uint32_t  sx, sy, sw, sh;
++	uint32_t  dx, dy, dw, dh;
++	uint32_t  blend;
++};
++int sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t fb_pitch, uint32_t corner_radius);
+ void sweet_gpu_flip_poll(void);         /* 0905: sweetfbflip=1 */
+ void sweet_gpu_scanout_front(void);
+ bool sweet_gpu_present_poll(void);      /* 0943: a present's blit still out (polls its fence) */
+@@ -452,6 +462,7 @@ public:
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	void presentInner(const uint8_t *rec);       /* 1260 */
++	bool presentGPULayers(const uint8_t *rec, uint32_t mask);    /* 1262 */
+ 	void presentLayoutLog(const uint8_t *rec);   /* 1260 */
+ 	uint32_t fPresentOut;   /* 1260: SWEET_PO_* of the last present */
+ 	bool presentShown(void) { return fPresentOut == SWEET_PO_DRAWN || !sweet_present_honest; }   /* 1260 */
+@@ -1908,6 +1919,64 @@ sweet_swap_mask(const uint8_t *rec, bool count = false)
+ 	return mask;
+ }
+ 
++/*
++ * 1262: a swap's layers as Apple's display driver takes them. The SwapEnd record is IOMFB's swap record (the layout
++ * the Asahi DCP driver documents as struct dcp_swap): swap id 0x50, per layer l < 4 the surface id 0x54 + 4l, the
++ * source rectangle 0x64 + 16l (x, y, w, h, surface pixels), surface flags 0xa4 + 4l, 0xb4 + 4l, the destination
++ * rectangle 0xc4 + 16l (x, y, w, h, display points 1125x2436), the layers this swap sets 0x104. A layer the mask sets
++ * takes its new surface (id 0: off, 1261); a layer the mask does not name keeps what it had. Photos' All Photos: l0 =
++ * the photo grid (Photos' own surfaces), l1 = backboardd's frame with transparent holes over it; CA sends 0x7 when
++ * both change and 0x2 while only l1 does, so every frame has two live layers.
++ * kern.sweet_present_layers 1: every SwapEnd is completed with the layers it keeps (its record then names every live
++ * layer, so the direct scanout leaves a frame of 2+ layers to the present path) and presentGPU composites 2-4 live
++ * layers (sweet_gpu_present_layers: layer 0 copied, the ones above blended source-over, each scaled from its source
++ * to its destination rectangle). 0 (default) = one layer only, as before 1262. The layer state is kept either way.
++ */
++extern "C" uint32_t sweet_present_layers;
++uint32_t sweet_present_layers = 0;
++static struct {
++	uint32_t id[SWEET_FB_LAYERS];
++	uint8_t  src[SWEET_FB_LAYERS][16], dst[SWEET_FB_LAYERS][16];
++	uint32_t flags[SWEET_FB_LAYERS], unk[SWEET_FB_LAYERS];
++} sweet_lay;
++static uint32_t sweet_lay_st[5];        /* 1262, this 5 s: swaps completed, composites, layers in them, failed, busy */
++
++static void
++put32(uint8_t *p, uint32_t off, uint32_t v)
++{
++	memcpy(p + off, &v, 4);
++}
++
++/* 1262: with the framebuffer's lock, at SwapEnd, before anything reads the record. */
++static void
++sweet_swap_layers_fill(uint8_t *rec)
++{
++	uint32_t raw = get32(rec, 0x104), set = raw & ((1u << SWEET_FB_LAYERS) - 1), add = 0;
++	if (set == 0) {
++		return;         /* changes no layer */
++	}
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if (set & (1u << l)) {
++			sweet_lay.id[l] = get32(rec, 0x54 + 4 * l);
++			memcpy(sweet_lay.src[l], rec + 0x64 + 16 * l, 16);
++			memcpy(sweet_lay.dst[l], rec + 0xc4 + 16 * l, 16);
++			sweet_lay.flags[l] = get32(rec, 0xa4 + 4 * l);
++			sweet_lay.unk[l] = get32(rec, 0xb4 + 4 * l);
++		} else if (sweet_present_layers && sweet_lay.id[l] != 0) {
++			put32(rec, 0x54 + 4 * l, sweet_lay.id[l]);
++			memcpy(rec + 0x64 + 16 * l, sweet_lay.src[l], 16);
++			memcpy(rec + 0xc4 + 16 * l, sweet_lay.dst[l], 16);
++			put32(rec, 0xa4 + 4 * l, sweet_lay.flags[l]);
++			put32(rec, 0xb4 + 4 * l, sweet_lay.unk[l]);
++			add |= 1u << l;
++		}
++	}
++	if (add != 0) {
++		put32(rec, 0x104, raw | add);
++		sweet_lay_st[0]++;
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -2138,6 +2207,16 @@ AppleCLCD::statLine(uint64_t now)
+ 			    po[0] + po[1] + po[2] + po[3] + po[4] - pm[0] - pm[1] - pm[2] - pm[3] - pm[4], sweet_present_honest,
+ 			    nl, sweet_present_nolayer);
+ 		}
++		/* 1262 */
++		uint32_t ls[5];
++		IOLockLock(fLock);
++		memcpy(ls, sweet_lay_st, sizeof(ls));
++		bzero(sweet_lay_st, sizeof(sweet_lay_st));
++		IOLockUnlock(fLock);
++		if (sweet_present_layers || ls[0] + ls[1] + ls[3] + ls[4] != 0) {
++			IOLog("SWEET FB: 5s layers (1262): completed %u | composited %u (layers %u) failed %u busy %u | layers %u\n",
++			    ls[0], ls[1], ls[2], ls[3], ls[4], sweet_present_layers);
++		}
+ 	}
+ 	if (sweet_fb_early_retire || erAcc || erBusy || erKick) {
+ 		/* 1035: swaps retired at ring acceptance; SwapWait polls busy/done/stale; present re-kicks at the vsync tick */
+@@ -7024,6 +7103,9 @@ bool
+ AppleCLCD::presentGPU(const uint8_t *rec)
+ {
+ 	uint32_t mask = sweet_swap_mask(rec), layer = 0;
++	if (sweet_present_layers && mask != 0 && (mask & (mask - 1))) {
++		return presentGPULayers(rec, mask);    /* 1262 */
++	}
+ 	if (mask == 0 || (mask & (mask - 1))) {
+ 		return gpu_fallback(0, "not exactly one layer");
+ 	}
+@@ -7103,6 +7185,165 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	return true;
+ }
+ 
++/*
++ * 1262: a swap of 2-4 live layers (kern.sweet_present_layers 1): each layer's surface mapped for the GPU as in
++ * presentGPU, its rectangles taken from the record, then one composite (sweet_gpu_present_layers). A layer whose
++ * surface is gone or is the panel's own is left out; any other layer the GPU cannot take fails the frame (the last one
++ * stays: "not fitted"), never a frame with a layer missing.
++ */
++bool
++AppleCLCD::presentGPULayers(const uint8_t *rec, uint32_t mask)
++{
++	struct sweet_gpu_layer ly[SWEET_FB_LAYERS];
++	SweetSurface *held[SWEET_FB_LAYERS];
++	uint32_t nl = 0, why = 0;
++	const char *what = NULL;
++	uint32_t lw = fLogicalW ? fLogicalW : SWEET_FB_LOGICAL_W, lh = fLogicalH ? fLogicalH : SWEET_FB_LOGICAL_H;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS && why == 0; l++) {
++		if (!(mask & (1u << l))) {
++			continue;
++		}
++		uint32_t id = get32(rec, 0x54 + 4 * l);
++		SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++		if (s == NULL || s == fSurface || s->memory == NULL) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		held[nl] = s;
++		struct sweet_gpu_layer *g = &ly[nl++];
++		bzero(g, sizeof(*g));
++		if (s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->elementWidth != 1 || s->elementHeight != 1 ||
++		    (s->bytesPerRow & 63) || s->width == 0 || s->height == 0 ||
++		    (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
++			why = 11;
++			what = "layers: a surface's format/size/pitch";
++			break;
++		}
++		const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
++		uint32_t sx = get32(a, 0), sy = get32(a, 4), sw = get32(a, 8), sh = get32(a, 12);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		uint32_t dw = get32(b, 8), dh = get32(b, 12);
++		if (sw == 0 || sh == 0) {
++			sx = sy = 0;
++			sw = s->width;
++			sh = s->height;
++		}
++		if (dw == 0 || dh == 0) {
++			dx = dy = 0;
++			dw = lw;
++			dh = lh;
++		}
++		if ((uint64_t)sx + sw > s->width || (uint64_t)sy + sh > s->height || dx < 0 || dy < 0 ||
++		    (uint64_t)dx + dw > lw || (uint64_t)dy + dh > lh) {
++			why = 12;
++			what = "layers: a rectangle outside its surface or the display";
++			break;
++		}
++		g->sx = sx;
++		g->sy = sy;
++		g->sw = sw;
++		g->sh = sh;
++		/* display points -> panel pixels (1125x2436 -> 1080x2340: the whole panel, as presentGPU's fit) */
++		g->dx = (uint32_t)((uint64_t)dx * fWidth / lw);
++		g->dy = (uint32_t)((uint64_t)dy * fHeight / lh);
++		g->dw = (uint32_t)(((uint64_t)dx + dw) * fWidth / lw) - g->dx;
++		g->dh = (uint32_t)(((uint64_t)dy + dh) * fHeight / lh) - g->dy;
++		if (g->dw == 0 || g->dh == 0) {
++			s->release();
++			nl--;
++			continue;
++		}
++		g->offset = s->offset;
++		g->w = s->width;
++		g->h = s->height;
++		g->pitch = s->bytesPerRow;
++		g->blend = nl > 1;      /* layer 0 (the lowest live one) is copied, the ones above blended over it */
++		g->kva = (sweet_fbx & SWEET_FBX_NOCLEAN) && !cpuWrote(s) ? 0 : s->kernelAddress();
++		uint64_t key = ((uint64_t)id << 48) ^ (uint64_t)(uintptr_t)s->memory;
++		int slot = sweet_gpu_surface_slot(key);
++		if (slot < 0) {
++			if (s->memory->prepare() != kIOReturnSuccess) {
++				why = 13;
++				what = "layers: prepare() failed";
++				break;
++			}
++			static uint64_t pages[1024];
++			uint64_t len = s->memory->getLength();
++			uint32_t n = 0;
++			bool ok = len <= sizeof(pages) / sizeof(pages[0]) * PAGE_SIZE;
++			for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
++				IOByteCount seg = 0;
++				addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++				ok = pa != 0 && (pa & PAGE_MASK) == 0;
++				pages[n++] = pa;
++			}
++			slot = ok ? sweet_gpu_map_surface(key, pages, n, PAGE_SIZE) : -1;
++		}
++		if (slot < 0) {
++			why = 14;
++			what = "layers: GPU mapping failed";
++			break;
++		}
++		g->slot = slot;
++	}
++	/* 1262: every layer's slot is looked up again just before the composite: a later layer's mapping may not evict
++	 * an earlier one's (LRU), checked here rather than assumed */
++	for (uint32_t i = 0; why == 0 && i < nl; i++) {
++		uint64_t key = ((uint64_t)held[i]->id << 48) ^ (uint64_t)(uintptr_t)held[i]->memory;
++		if (sweet_gpu_surface_slot(key) != ly[i].slot) {
++			why = 15;
++			what = "layers: a surface's GPU slot was reused within the frame";
++		}
++	}
++	if (why == 0 && nl == 0) {
++		why = 16;
++		what = "layers: no live layer with a surface";
++	}
++	int rc = -1;
++	if (why == 0) {
++		if (!fGPU) {
++			IOLockLock(fLock);
++			sweet_gpu_panel_stride(SWEET_FB_GPU_ROWBYTES);
++			fRowBytes = SWEET_FB_GPU_ROWBYTES;
++			bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
++			fGPU = true;
++			IOLockUnlock(fLock);
++			IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
++		}
++		sweet_gpu_present_tag(fPresentingAbs);
++		rc = sweet_gpu_present_layers(ly, nl, fRowBytes, fCornerRadius);
++		if (rc < 0) {
++			why = 17;
++			what = "layers: the GPU composite refused (no flip, layer 0 not the whole panel, or a bad rectangle)";
++		}
++	}
++	for (uint32_t i = 0; i < nl; i++) {
++		held[i]->release();
++	}
++	IOLockLock(fLock);
++	if (why != 0) {
++		sweet_lay_st[3]++;
++	} else if (rc == 1) {
++		sweet_lay_st[4]++;
++	} else {
++		sweet_lay_st[1]++;
++		sweet_lay_st[2] += nl;
++	}
++	IOLockUnlock(fLock);
++	if (why != 0) {
++		return gpu_fallback(why, what);
++	}
++	if (rc == 1) {
++		fPresentBusy = true;    /* the GPU still has the present before last: next tick (as presentGPU) */
++		return true;
++	}
++	sweet_display_fit_x = 0;
++	sweet_display_fit_y = 0;
++	sweet_display_fit_w = (int)fWidth;
++	sweet_display_fit_h = (int)fHeight;
++	return true;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -7140,10 +7381,11 @@ AppleCLCD::presentLayoutLog(const uint8_t *rec)
+ 		sig = sig * 1000003ULL ^ k;
+ 		if (n < (int)sizeof(buf) - 80) {
+ 			const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
+-			n += snprintf(buf + n, sizeof(buf) - n, " | l%u id %u %ux%u fmt %#x slot %u%s%s a %ux%u b %d,%d %ux%u", l, id,
+-			    s ? s->width : 0, s ? s->height : 0, s ? s->pixelFormat : 0, s ? s->scanSlot : 0,
++			n += snprintf(buf + n, sizeof(buf) - n, " | l%u id %u %ux%u fmt %#x slot %u%s%s a %ux%u b %d,%d %ux%u f %x/%x", l,
++			    id, s ? s->width : 0, s ? s->height : 0, s ? s->pixelFormat : 0, s ? s->scanSlot : 0,
+ 			    s && s->ubwcLive ? " ubwc" : "", s && s == fSurface ? " panel" : "", get32(a, 8), get32(a, 12),
+-			    (int32_t)get32(b, 0), (int32_t)get32(b, 4), get32(b, 8), get32(b, 12));
++			    (int32_t)get32(b, 0), (int32_t)get32(b, 4), get32(b, 8), get32(b, 12), get32(rec, 0xa4 + 4 * l),
++			    get32(rec, 0xb4 + 4 * l));
+ 		}
+ 		OSSafeReleaseNULL(s);
+ 	}
+@@ -7441,6 +7683,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
++		IOLockLock(fFB->fLock);
++		sweet_swap_layers_fill(rec);    /* 1262 */
++		IOLockUnlock(fFB->fLock);
+ 		sweet_swaptrace('E', get32(rec, 0x50));  /* 0987 */
+ 		traceSwap = get32(rec, 0x50);   /* 0994 */
+ 		fFB->swap(rec);
