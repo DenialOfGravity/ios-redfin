@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 11:20:00 +0100
+Subject: [PATCH] redfin 1264: display "hang" after sleep/wake: panel on while iOS's display is off
+
+The hang seen after a display sleep/wake or a backboardd restart (kern.sweet_fb_frames stops, swipes not shown,
+backboardd idle and healthy, a second pa sleep + pa wake brings it back) is the panel on while iOS's own display is
+off: `p disp on` (pa wake, 1162) turns the panel on whatever iOS thinks. Reproduced at will: iOS asleep by its
+power key, then p disp on: frames +0 +0 over two swipes; pa sleep + pa wake: frames again. 61 sleep/wake cycles
+(pa sleep/wake, rapid presses, real power key + unlock swipe, home and Photos) gave no display-engine stall.
+
+kern.sweet_wakefix (boot-arg sweetwakefix=N, default 3):
+bit 0: p disp on while iOS's own state (the last RequestPowerChange; unknown at boot and once the client that sent it
+closes) is off: 1.5 s later, unless iOS changed its display meanwhile or the panel is off again, one power key press
+(60 ms, as 1235's wake press, at most one per 3 s) so iOS wakes and draws.
+bit 1: klog watch: "panel on while iOS's display is off" once per period (after 3 s), and a stall line (scanout, MDP,
+queue state) when 3+ swaps come in 1 s with no frame shown. p disp also prints iOS's state. 0 = as before.
+
+---
+--- a/bsd/dev/sweet_gpu.c	2026-11-19 11:09:26.052826517 +0100
++++ b/bsd/dev/sweet_gpu.c	2026-11-19 11:09:26.054015997 +0100
+@@ -2210,6 +2210,10 @@
+ extern uint32_t sweet_fb_sleep_blank;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_sleep_blank, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_sleep_blank, 0,
+     "SWEET FB 1186: 1 = display off blanks the panel (DCS 0x28, backlight 0), wake restores; 0 = as before");
++extern uint32_t sweet_wakefix;              /* 1264 (SweetFramebuffer.cpp) */
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wakefix, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wakefix, 0,
++    "SWEET FB 1264: bit 0 = p disp on while iOS's own display is off presses the power key (1.5 s later, unless iOS woke); "
++    "bit 1 = klog watch (panel on with iOS off, swaps without frames); 0 = as before");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweet_fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_frames,
+     "SWEET FB: frames that reached the panel (panel-buffer shown + direct-scanout latched)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hz, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_hz, 0, "SWEET FB: panel refresh, Hz");
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-19 11:09:26.050328481 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-19 11:09:26.051697974 +0100
+@@ -99,6 +99,7 @@
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>     /* 1264 */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -503,6 +504,7 @@
+ static void sweet_scan_wait(AppleCLCD *fb, uint32_t id);
+ static IOReturn sweet_scan_poll(AppleCLCD *fb, uint32_t id);    /* 0996 */
+ static void sweet_scan_set(AppleCLCD *fb, bool on, const char *why);
++static void sweet_wk_tick(AppleCLCD *fb, uint64_t now);        /* 1264 */
+ static void sweet_tt_tick(uint64_t now);        /* 1107 */
+ static void sweet_tt_swap(uint32_t id, uint64_t now);
+ static void sweet_tt_latch(uint32_t swapId, uint64_t now);
+@@ -840,6 +842,114 @@
+ uint32_t sweet_fb_sleep_blank = 0;
+ }
+ 
++/*
++ * redfin 1264: kern.sweet_wakefix (boot-arg sweetwakefix=N, default 3). The "display hang after sleep/wake or a
++ * backboardd restart" (kern.sweet_fb_frames stops, swipes not shown, backboardd idle; a second sleep + wake brings it
++ * back) is the panel on while iOS's own display is off: `p disp on` (pa wake, 1162) turns the panel on whatever iOS
++ * thinks, so with iOS asleep (its last RequestPowerChange was 0) the panel shows the last frame (or the faded black
++ * buffer) and CA draws nothing until iOS itself wakes. Reproduced: iOS put to sleep by its power key, then p disp on:
++ * frames +0 +0 on two swipes, backboardd idle; pa sleep + pa wake: frames again.
++ * Bit 0 (1): `p disp on` while iOS's own state is off: 1.5 s later, if iOS has not turned its display on meanwhile
++ * (an in-flight wake) and the panel is still on, one power key press (60 ms, as 1235's wake press; not within 3 s of
++ * the last) so iOS wakes and draws. iOS's state: the last RequestPowerChange (any client), unknown again once the
++ * client that sent it closes (a backboardd restart) and before the first one (boot): no press while unknown.
++ * Bit 1 (2): watch, klog only: "panel on while iOS's display is off" once per such period (after 3 s), and a stall
++ * line (scanout / MDP / queue state) when 3+ swaps came in 1 s with no frame shown (a real display-engine stall).
++ * p disp prints iOS's state too. 0 = as before 1264.
++ */
++extern "C" {
++uint32_t sweet_wakefix = 3;
++void sweet_hid_key(int key, int down);  /* hid/SweetHID.cpp */
++}
++static struct {
++	volatile int      ios;          /* iOS's own display: -1 unknown, 0 off, 1 on (the last RequestPowerChange) */
++	volatile int      iosPid;
++	volatile uint64_t iosAbs;
++	volatile uint64_t forcedAbs;    /* the last p disp on that found iOS's display off */
++	uint64_t          pressAbs;
++	uint32_t          presses, skipped, offOn, stalls;
++	thread_call_t     tc;
++} sweet_wk = { -1, 0, 0, 0, 0, 0, 0, 0, 0, NULL };
++
++static uint32_t
++sweet_wk_ms(uint64_t since)
++{
++	uint64_t ns;
++	if (since == 0) {
++		return 0xffffffffu;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
++	return ns / NSEC_PER_MSEC > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++static const char *
++sweet_wk_ios_name(void)
++{
++	int s = sweet_wk.ios;
++	return s < 0 ? "unknown" : s ? "on" : "off";
++}
++
++/* 1264: RequestPowerChange from pid: iOS's own display state */
++static void
++sweet_wk_ios(bool off, int pid)
++{
++	sweet_wk.iosPid = pid;
++	sweet_wk.iosAbs = mach_absolute_time();
++	sweet_wk.ios = off ? 0 : 1;
++}
++
++static void
++sweet_wk_check(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	const char *skip = NULL;
++	if (!(sweet_wakefix & 1)) {
++		skip = "kern.sweet_wakefix bit 0 off";
++	} else if (sweet_wk.ios != 0 || sweet_wk.iosAbs > sweet_wk.forcedAbs) {
++		skip = "iOS changed its display itself";
++	} else if (fb == NULL || fb->fPowerOff) {
++		skip = "the panel is off again";
++	} else if (sweet_wk_ms(sweet_wk.pressAbs) < 3000) {
++		skip = "pressed less than 3 s ago";
++	}
++	if (skip != NULL) {
++		sweet_wk.skipped++;
++		IOLog("SWEET FB: wakefix (1264): no power key (%s; iOS display %s)\n", skip, sweet_wk_ios_name());
++		return;
++	}
++	sweet_wk.pressAbs = mach_absolute_time();
++	sweet_wk.presses++;
++	IOLog("SWEET FB: wakefix (1264): panel on (p disp on) with iOS's display off for %u ms (pid %d's RequestPowerChange 0):"
++	    " power key so iOS wakes and draws (%u presses)\n", sweet_wk_ms(sweet_wk.iosAbs), sweet_wk.iosPid, sweet_wk.presses);
++	sweet_hid_key(0, 1);
++	IOSleep(60);
++	sweet_hid_key(0, 0);
++}
++
++/* 1264: p disp on */
++static void
++sweet_wk_forced(AppleCLCD *fb)
++{
++	if (!(sweet_wakefix & 1) || sweet_wk.ios != 0) {
++		return;
++	}
++	if (sweet_wk.tc == NULL) {
++		thread_call_t tc = thread_call_allocate(sweet_wk_check, fb);
++		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&sweet_wk.tc)) {
++			thread_call_free(tc);
++		}
++	}
++	if (sweet_wk.tc == NULL) {
++		return;
++	}
++	sweet_wk.forcedAbs = mach_absolute_time();
++	uint64_t dl;
++	clock_interval_to_deadline(1500, kMillisecondScale, &dl);
++	thread_call_enter_delayed(sweet_wk.tc, dl);
++	IOLog("SWEET FB: wakefix (1264): p disp on while iOS's display is off (%u ms, pid %d): power key in 1.5 s unless iOS wakes\n",
++	    sweet_wk_ms(sweet_wk.iosAbs), sweet_wk.iosPid);
++}
++
+ void
+ AppleCLCD::sleepBlankSend(bool off)
+ {
+@@ -1391,6 +1501,7 @@
+ 		publishRefresh(sweet_fb_refresh > 1000 ? sweet_fb_refresh : (fHz == 90 ? 11111111ULL : SWEET_FB_VSYNC_US * 1000ULL));
+ 	}
+ 	sweet_fb_instance = this;
++	PE_parse_boot_argn("sweetwakefix", &sweet_wakefix, sizeof(sweet_wakefix));  /* 1264 */
+ 	sweet_surface_scan_reserve();   /* 0979: the scanout slots' memory before userland (sweetscanout) */
+ 	if (sweet_surface_scan_mode() == 1) {
+ 		sweet_scan_set(this, true, "boot-arg sweetscanout=1");  /* 0976 */
+@@ -1460,6 +1571,7 @@
+ 	sweet_gpu_flip_poll();	/* 0905: a finished frame in the back buffer goes on screen at this vsync */
+ 	sweet_gpu_present_poll();	/* 0943: blit->fence latency */
+ 	fb->statLine(now);		/* 0943: every 5 s, the frame statistics */
++	sweet_wk_tick(fb, now);		/* 1264 */
+ 	if ((sweet_fb_early_retire & 2) && fb->fSwapQ) {
+ 		/* 1035: the flip latched at the TE this tick follows: a put-off queued frame is tried now, not 1 ms later */
+ 		IOLockLock(fb->fLock);
+@@ -6315,6 +6427,55 @@
+ }
+ 
+ /*
++ * 1264 (kern.sweet_wakefix bit 1): on the vsync tick, klog only. (a) The panel on while iOS's display is off for 3 s:
++ * once per such period. (b) 3+ SwapEnds in 1 s while no frame reached the panel (kern.sweet_fb_frames still): one line
++ * of the scanout, MDP and queue state per stall (frames moving again re-arms it).
++ */
++static void
++sweet_wk_tick(AppleCLCD *fb, uint64_t now)
++{
++	static uint64_t fr, frAbs, sw;
++	static bool said, saidOff;
++	if (!(sweet_wakefix & 2)) {
++		return;
++	}
++	if (fb->fPowerOff) {
++		frAbs = 0;
++		saidOff = false;
++		return;
++	}
++	if (sweet_wk.ios != 0) {
++		saidOff = false;
++	} else if (!saidOff && sweet_wk_ms(sweet_wk.iosAbs) >= 3000) {
++		saidOff = true;
++		sweet_wk.offOn++;
++		IOLog("SWEET FB: wakefix (1264): panel on while iOS's display is off (%u ms, pid %d): frames stop by design until "
++		    "iOS wakes (power key / pa wake); not a display-engine hang\n", sweet_wk_ms(sweet_wk.iosAbs), sweet_wk.iosPid);
++	}
++	uint64_t f = sweet_fb_frames, s = sweet_fb_swap_count;
++	if (frAbs == 0 || f != fr) {
++		fr = f;
++		frAbs = now;
++		sw = s;
++		said = false;
++		return;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(now - frAbs, &ns);
++	if (said || s - sw < 3 || ns < NSEC_PER_SEC) {
++		return;
++	}
++	said = true;
++	sweet_wk.stalls++;
++	IOLog("SWEET FB: wakefix (1264): stall: %llu swaps in %llu ms, no frame shown | scanout on %d geom %d entering %d next %u "
++	    "flipping %u laterN %u shown %u last %u slotRun %u | mdp active %d scan %d busy %d | q %u dirty %d req %d | iOS %s | "
++	    "intf1 frames %u ctl0 flush %x\n", s - sw, ns / NSEC_PER_MSEC, sweet_scan.on, sweet_scan.geom, sweet_scan.entering,
++	    sweet_scan.nextSwap, sweet_scan.flipSwap, sweet_scan.laterN, sweet_scan.shownSwap, sweet_scan.lastSwap,
++	    sweet_scan.slotRun, sweet_mdp.active, sweet_mdp.scan, sweet_mdp_busy, fb->fQn, fb->fDirty, fb->fPresentReq,
++	    sweet_wk_ios_name(), sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
++}
++
++/*
+  * Poke commands (bsd/dev/sweet_poke.c "p WORD"):
+  *   p fc            INTF1's TE frame counter (and INTF frame counter) twice, 1 s apart: the panel's real rate,
+  *                   with the tear-check configuration
+@@ -6372,9 +6533,14 @@
+ 			}
+ 			IOLog("SWEET FB: display %s (p disp set)\n", off ? "off" : "on");
+ 			sleepBlank(off);        /* 1186 */
++			if (!off) {
++				sweet_wk_forced(this);  /* 1264 */
++			}
+ 			return;
+ 		}
+-		IOLog("SWEET FB: display %s (p disp; scanout %s)\n", fPowerOff ? "off" : "on", sweet_scan_live() ? "direct" : "panel buffer");
++		IOLog("SWEET FB: display %s (p disp; scanout %s; iOS %s %u s)\n", fPowerOff ? "off" : "on",
++		    sweet_scan_live() ? "direct" : "panel buffer", sweet_wk_ios_name(),
++		    sweet_wk.ios < 0 ? 0 : sweet_wk_ms(sweet_wk.iosAbs) / 1000);       /* 1264 */
+ 		return;
+ 	}
+ 	if (end - s >= 5 && !strncmp(s, "phase", 5)) {
+@@ -7618,6 +7784,10 @@
+ IOReturn
+ IOMobileFramebufferUserClient::clientClose(void)
+ {
++	if (fFB != NULL && fPid != 0 && fPid == sweet_wk.iosPid && sweet_wk.ios >= 0) {
++		IOLog("SWEET FB: wakefix (1264): pid %d closed: iOS display state unknown (was %s)\n", fPid, sweet_wk_ios_name());
++		sweet_wk.ios = -1;      /* 1264: a backboardd restart */
++	}
+ 	if (fFB != NULL) {
+ 		fFB->removeClient(this);
+ 		IOLockLock(fFB->fLock);
+@@ -7758,6 +7928,7 @@
+ 			if (off && sweet_scan_live()) {
+ 				sweet_scan_leave(fFB, "display off");  /* 0989: the fade goes through the panel buffer */
+ 			}
++			sweet_wk_ios(off, proc_selfpid());     /* 1264 */
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 			fFB->sleepBlank(off);   /* 1186 */
+ 			sweet_mesa_display(off);        /* 1235: SweetMesa screen-off Touch ID wake */
+-- 
+2.40.0
