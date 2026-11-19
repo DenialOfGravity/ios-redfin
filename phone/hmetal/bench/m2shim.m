@@ -33,7 +33,13 @@
  * did not exit cleanly trips: a marker (ca/bbd-hm.tripped / hakios-metal-NAME.m2) holding KEY, "NAME KEY" appended to
  * m2-fallback, and ONE line "m2shim: TRIP ..." to /dev/console (the kernel log), syslog and shim.log.
  * KEY = the installed HakiosMetal executable's mtime and size: a trip holds only while the same bundle is installed;
- * a new bundle expires it (one line "m2shim: trip expired ..."). Clear by hand: rm the marker and the m2-fallback line.
+ * a new bundle expires it (one line "m2shim: trip expired ..."). Clear: `pa fallback clear NAME` (marker, m2-fallback line,
+ * a "c TIME" line in the starts file, then one restart on purpose).
+ * (ws-hm-fallback) Restarts on purpose do not count: `sweetctl kill NAME` (and render/respring) writes intent/NAME
+ * ("TIME PID SIG" lines; backboardd also intent/_render) before it signals; the killed instance's start is marked
+ * "i PID" in the starts file. Every fallback explains itself: "HM FALLBACK: NAME -> SweetMetal2: REASON" (kernel log,
+ * syslog, shim.log), a line in fallback.log, and for a trip MARKER.why + trips/NAME.why (time, the last starts and how
+ * each ended, crash reports, bundle key). trip-test (exact names) trips a listed process at its next start ("test").
  *
  * Set in every hakios-metal process before the plug-in loads (each an env key, so a line in env flips it):
  *   HM_CA_DEEP_FB=0 (CAEnableDeepFramebuffer=false), HM_CA_FB_COMPRESSION=0 (CAEnableFramebufferCompression=false and
@@ -53,6 +59,7 @@
 #import <objc/message.h>
 #include <dispatch/dispatch.h>
 #endif
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -97,6 +104,14 @@
 #define TRIP_STARTS 3
 #define TRIP_WINDOW 120
 #define LOG_ROTATE  (16L * 1024 * 1024)
+#define HM_INTENT   HM_DIR "/intent"        /* (ws-hm-fallback) sweetctl kill's notes: a restart on purpose */
+#define HM_TRIPS    HM_DIR "/trips"         /* NAME.why for every trip */
+#define HM_FBLOG    HM_DIR "/fallback.log"  /* one line for every fallback to SweetMetal2 */
+#define HM_TRIP_TEST HM_DIR "/trip-test"    /* names: trip at the next start (reason "test") */
+#define INTENT_WINDOW 30
+#ifndef CRASH_DIR
+#define CRASH_DIR   "/private/var/mobile/Library/Logs/CrashReporter"
+#endif
 
 static char g_name[64];
 static char g_log[PATH_MAX];      /* this process's log ("" until chosen) */
@@ -330,14 +345,150 @@ shim_clean_exit(void)
 	}
 }
 
+/* (ws-hm-fallback) the starts file's lines: "TIME PID KEY" a start on hakios-metal; "x PID" its clean exit; "i PID" it
+ * was killed on purpose (sweetctl kill, below); "c TIME" every start before was cleared (pa fallback clear). */
+typedef struct { long t; int pid; char how; } shim_start;   /* how: 0 no clean exit seen, 'x', 'i', 'c' */
+
+/* (ws-hm-fallback) an intentional restart: `sweetctl kill NAME` writes intent/NAME (NAME as p_comm: 16 characters at
+ * most), one "TIME PID SIG" line for every process it signals, BEFORE it signals; a kill of backboardd (sweetctl
+ * render) also intent/_render ("TIME"): the processes that go down with the render server. */
+typedef struct { long t; int pids[16]; int n; } shim_intent;
+
+static void
+shim_intent_read(const char *name, shim_intent *in)
+{
+	char path[PATH_MAX], line[128];
+	FILE *f;
+
+	in->t = 0;
+	in->n = 0;
+	snprintf(path, sizeof(path), HM_INTENT "/%.16s", name);
+	if ((f = fopen(path, "r")) == NULL) return;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		long t;
+		int pid, k = sscanf(line, "%ld %d", &t, &pid);
+		if (k >= 1 && t > in->t) in->t = t;
+		if (k == 2 && pid > 0 && in->n < 16) in->pids[in->n++] = pid;
+	}
+	fclose(f);
+}
+
+/* the start running at time T (the last one at or before it) was ended on purpose: 'i', when no exit was seen */
+static int
+shim_intent_mark(shim_start *seen, int count, long t)
+{
+	for (int i = count - 1; i >= 0; i--) {
+		if (seen[i].t <= t + 1) {
+			if (seen[i].how) return -1;
+			seen[i].how = 'i';
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* NAME on a line of PATH, exactly ('*' does not count): the trip-test list */
+static bool
+shim_listed_exact(const char *path, const char *name)
+{
+	return shim_listed_key(path, name, NULL) && !shim_listed_key(path, "\x01", NULL);   /* a '*' line matches any name */
+}
+
+static const char *
+shim_how(char how)
+{
+	return how == 'x' ? "clean exit" : how == 'i' ? "killed on purpose" : how == 'c' ? "cleared" : "NO clean exit";
+}
+
+static void
+shim_utc(long t, char *out, size_t n)
+{
+	time_t tt = (time_t)t;
+	struct tm tm;
+
+	gmtime_r(&tt, &tm);
+	strftime(out, n, "%Y-%m-%d %H:%M:%S UTC", &tm);
+}
+
+/* (ws-hm-fallback) a fallback to SweetMetal2 explains itself: one "HM FALLBACK: NAME -> SweetMetal2: REASON" line
+ * (kernel log, syslog, shim.log), one line in fallback.log, and for a trip (MARKER non-NULL) MARKER.why and
+ * trips/NAME.why: the time, the process, the reason, the last starts, what is known of how they ended, the newest
+ * crash reports, the hakios-metal bundle */
+static void
+shim_explain(const char *reason, const char *marker, const shim_start *seen, int count)
+{
+	char now_s[40], starts[900] = "", exits[900] = "", reports[400] = "", why[PATH_MAX + 8], line[2600];
+	long now = (long)time(NULL), oldest = now;
+	int first = count > 6 ? count - 6 : 0;
+	FILE *f;
+	DIR *d;
+
+	shim_utc(now, now_s, sizeof(now_s));
+	for (int i = first; i < count; i++) {
+		char one[160];
+		snprintf(one, sizeof(one), "%s%ld (%lds ago) pid %d: %s", starts[0] ? "; " : "", seen[i].t, now - seen[i].t,
+			 seen[i].pid, shim_how(seen[i].how));
+		strlcat(starts, one, sizeof(starts));
+		if (!seen[i].how && now - seen[i].t < TRIP_WINDOW) {
+			snprintf(one, sizeof(one), "%spid %d ended without a clean exit: a signal, a crash, a hang or a watchdog kill "
+				 "(klog: CRASH %s[%d])", exits[0] ? "; " : "", seen[i].pid, g_name, seen[i].pid);
+			strlcat(exits, one, sizeof(exits));
+			if (seen[i].t < oldest) oldest = seen[i].t;
+		}
+	}
+	if (count > 0) {
+		char one[64];
+		snprintf(one, sizeof(one), "; %ld pid %d: this start", now, getpid());
+		strlcat(starts, one, sizeof(starts));
+	}
+	if ((d = opendir(CRASH_DIR)) != NULL) {
+		struct dirent *e;
+		size_t nl = strlen(g_name);
+		int n = 0;
+		while ((e = readdir(d)) != NULL && n < 3) {
+			char p[PATH_MAX];
+			struct stat st;
+			if (strncmp(e->d_name, g_name, nl) != 0 || (e->d_name[nl] != '-' && e->d_name[nl] != '.')) continue;
+			snprintf(p, sizeof(p), "%s/%s", CRASH_DIR, e->d_name);
+			if (stat(p, &st) != 0 || (long)st.st_mtime < oldest - 5) continue;
+			if (reports[0]) strlcat(reports, ", ", sizeof(reports));
+			strlcat(reports, e->d_name, sizeof(reports));
+			n++;
+		}
+		closedir(d);
+	}
+	snprintf(line, sizeof(line), "HM FALLBACK: %s -> SweetMetal2: %s", g_name, reason);
+	shim_shout("%s", line);
+	snprintf(line, sizeof(line), "%s %ld %s pid %d -> SweetMetal2: %s | starts: %s | hm bundle %s | marker %s\n", now_s, now,
+		 g_name, getpid(), reason, starts[0] ? starts : "none", g_key, marker ? marker : "none (this start only)");
+	shim_write(HM_FBLOG, line);
+	if (marker == NULL) return;
+	snprintf(line, sizeof(line),
+		 "reason: %s\ntime: %ld (%s)\nprocess: %s pid %d\nstarts (last %d, oldest first): %s\nexits: %s\n"
+		 "crash reports (%s, since the first counted start): %s\nhm bundle: %s (HakiosMetal mtime-size; pa fallback names "
+		 "its build)\nmarker: %s\nclear: pa fallback clear %s (the owner allows clearing to return to the newest driver)\n",
+		 reason, now, now_s, g_name, getpid(), count - first, starts[0] ? starts : "none",
+		 exits[0] ? exits : "none counted", CRASH_DIR, reports[0] ? reports : "none found", g_key, marker, g_name);
+	snprintf(why, sizeof(why), "%s.why", marker);
+	if ((f = fopen(why, "w")) != NULL) { fputs(line, f); fclose(f); }
+	mkdir(HM_TRIPS, 0777);
+	snprintf(why, sizeof(why), HM_TRIPS "/%s.why", g_name);
+	if ((f = fopen(why, "w")) != NULL) { fputs(line, f); fclose(f); }
+}
+
 /* (hm-int2) the crash trip, one for every process (backboardd's files in ca/, the others' in their temp directory).
- * true: this process stays on SweetMetal2 (tripped now, or earlier with the bundle installed now) */
+ * true: this process stays on SweetMetal2 (tripped now, or earlier with the bundle installed now).
+ * (ws-hm-fallback) Only abnormal ends count: a start whose process sweetctl killed on purpose (its pid in intent/NAME,
+ * or the start that was running when intent/NAME or intent/_render was written, for a start within INTENT_WINDOW s of
+ * it) is marked 'i' and not counted. trip-test (exact names) trips the listed process at its next start (reason
+ * "test"); pa fallback test/clear write and remove it. */
 static bool
 shim_tripped(bool bbd)
 {
-	char marker[PATH_MAX], held[64] = "";
+	char marker[PATH_MAX], held[64] = "", reason[300];
 	long now = (long)time(NULL), unclean = 0;
-	struct { long t; int pid; bool clean; } seen[64];
+	shim_start seen[64];
+	shim_intent own, rend;
 	int count = 0;
 	char line[160];
 	FILE *f;
@@ -355,7 +506,8 @@ shim_tripped(bool bbd)
 		fclose(f);
 		held[strcspn(held, " \t\r\n")] = '\0';
 		if (strcmp(held, g_key) == 0) {
-			shim_log("crash trip holds (%s, bundle %s): SweetMetal2", marker, g_key);
+			shim_log("crash trip holds (%s, bundle %s): SweetMetal2 (why: %s.why; pa fallback clear %s)", marker, g_key,
+				 marker, g_name);
 			return true;
 		}
 		unlink(marker);
@@ -371,19 +523,51 @@ shim_tripped(bool bbd)
 			long t;
 			int pid;
 			char k[64];
-			if (sscanf(line, "x %d", &pid) == 1) {
-				for (int i = 0; i < count; i++) if (seen[i].pid == pid) seen[i].clean = true;
+			if (sscanf(line, "x %d", &pid) == 1 || sscanf(line, "i %d", &pid) == 1) {
+				for (int i = 0; i < count; i++) if (seen[i].pid == pid) seen[i].how = line[0];
+			} else if (sscanf(line, "c %ld", &t) == 1) {
+				for (int i = 0; i < count; i++) if (!seen[i].how && seen[i].t <= t) seen[i].how = 'c';
 			} else if (sscanf(line, "%ld %d %63s", &t, &pid, k) == 3 && strcmp(k, g_key) == 0) {
 				if (count == 64) { memmove(seen, seen + 1, sizeof(seen[0]) * 63); count--; }
-				seen[count].t = t; seen[count].pid = pid; seen[count].clean = false; count++;
+				seen[count].t = t; seen[count].pid = pid; seen[count].how = 0; count++;
 			}
 		}
 		fclose(f);
 	}
+	/* intentional kills: by pid, or (a start within INTENT_WINDOW s of it) the start that was running then */
+	shim_intent_read(g_name, &own);
+	shim_intent_read("_render", &rend);
 	for (int i = 0; i < count; i++) {
-		if (!seen[i].clean && now - seen[i].t < TRIP_WINDOW) unclean++;
+		for (int j = 0; j < own.n && !seen[i].how; j++) {
+			if (seen[i].pid == own.pids[j] && seen[i].t <= own.t + 1) {
+				seen[i].how = 'i';
+				snprintf(line, sizeof(line), "i %d\n", seen[i].pid);
+				shim_write(g_starts, line);
+			}
+		}
 	}
-	if (unclean >= TRIP_STARTS - 1) {
+	for (int k = 0; k < 2; k++) {
+		long t = k == 0 ? own.t : rend.t;
+		int i;
+		if (t == 0 || now - t > INTENT_WINDOW || now < t) continue;
+		if ((i = shim_intent_mark(seen, count, t)) >= 0) {
+			snprintf(line, sizeof(line), "i %d\n", seen[i].pid);
+			shim_write(g_starts, line);
+			shim_log("start of pid %d (%ld) ended on purpose (intent/%s %ld s ago): not counted", seen[i].pid, seen[i].t,
+				 k == 0 ? g_name : "_render", now - t);
+		}
+	}
+	for (int i = 0; i < count; i++) {
+		if (!seen[i].how && now - seen[i].t < TRIP_WINDOW) unclean++;
+	}
+	reason[0] = '\0';
+	if (shim_listed_exact(HM_TRIP_TEST, g_name)) {
+		snprintf(reason, sizeof(reason), "test (trip-test lists %s; pa fallback clear %s)", g_name, g_name);
+	} else if (unclean >= TRIP_STARTS - 1) {
+		snprintf(reason, sizeof(reason), "crash trip: start %ld on hakios-metal within %d s, the %ld before it without a "
+			 "clean exit (not killed on purpose)", unclean + 1, TRIP_WINDOW, unclean);
+	}
+	if (reason[0]) {
 		bool listed = false;
 		if ((f = fopen(marker, "w")) != NULL) {
 			fprintf(f, "%s\n", g_key);
@@ -394,9 +578,9 @@ shim_tripped(bool bbd)
 			fclose(f);
 			listed = true;
 		}
-		shim_shout("TRIP %s -> SweetMetal2: start %ld on hakios-metal within %d s, the %ld before it without a clean exit; "
-			   "holds while bundle %s is installed (marker %s%s)", g_name, unclean + 1, TRIP_WINDOW, unclean, g_key, marker,
-			   listed ? ", m2-fallback" : ", m2-fallback not writable");
+		shim_explain(reason, marker, seen, count);
+		shim_shout("TRIP %s -> SweetMetal2: holds while bundle %s is installed (marker %s%s; why: %s.why)", g_name, g_key,
+			   marker, listed ? ", m2-fallback" : ", m2-fallback not writable", marker);
 		g_starts[0] = '\0';
 		return true;
 	}
@@ -405,7 +589,7 @@ shim_tripped(bool bbd)
 		if (count > 48) {
 			for (int i = count - 16; i < count; i++) {
 				fprintf(f, "%ld %d %s\n", seen[i].t, seen[i].pid, g_key);
-				if (seen[i].clean) fprintf(f, "x %d\n", seen[i].pid);
+				if (seen[i].how == 'x' || seen[i].how == 'i') fprintf(f, "%c %d\n", seen[i].how, seen[i].pid);
 			}
 		}
 		fprintf(f, "%ld %d %s\n", now, getpid(), g_key);
@@ -689,7 +873,8 @@ shim_luma_watch(void)
 			return device;
 		}
 		why = "hakios-metal gave no device";
-		shim_shout("hakios-metal gave no device: SweetMetal2 instead");
+		shim_explain("hakios-metal gave no device (this start only; the next start tries hakios-metal again; "
+			     "see this process's log)", NULL, NULL, 0);
 	}
 	setenv("SWEET_LUMA_BOOST", luma ? "1" : "0", 1);   /* the knob for SweetMetal2 (a SWEET_LUMA_BOOST line in mtl2-env/-live wins) */
 	const char *real = shim_first(M2_REAL, M2_REAL0);
