@@ -178,7 +178,7 @@ scratch = "/var/local/scratch"
 "kern.sweet_ipa_ee1" = 0
 "kern.sweet_ipa_join_s" = 40
 "kern.sweet_mlink_idle_us" = 4000
-"kern.sweet_mqrtr_aux" = 0
+"kern.sweet_mqrtr_aux" = 1
 "kern.sweet_mtl" = 2
 "kern.sweet_nfc_fwif" = 21
 "kern.sweet_nfc_fwif_fmt" = 23878928
@@ -213,7 +213,7 @@ scratch = "/var/local/scratch"
 "kern.sweet_qmux_holddly" = 500
 "kern.sweet_qmux_holdnas" = 1
 "kern.sweet_qmux_kick" = 1
-"kern.sweet_qmux_pds" = 0
+"kern.sweet_qmux_pds" = 1
 "kern.sweet_qmux_pds_ms" = 400
 "kern.sweet_qmux_reuse" = 1
 "kern.sweet_rpmh_recover" = 0
@@ -322,13 +322,13 @@ note = "vmd disabled 2026-10-29 (user decision; revisit with telephony)"
 
 [[file]]
 path = "/System/Library/xpc/launchd.plist"
-source = "state/files/tid-i/launchd.plist-bfc34f770e"
-sha256 = "bfc34f770ebb6ec732f959000184651b7610d77bc3f20e6bd11106c2931d9f18"
+source = "state/files/locd/launchd.plist-0dd2e571e8"
+sha256 = "0dd2e571e857a7fdb869d5b1368180953152ba1cc29f6253ae60c997dab5b22e"
 mode = "644"
 owner = "0:0"
 restart = "reboot"
 hold = "Touch ID image only (with the ws-tid-i kernel + sweettouchid=1): the phone's 1bca5063 (org.iosonpixel jobs + com.apple.biometrickitd.mesa) + com.redfin.sweetfpcd. sweetearly (395dba3a's hold) is NOT in it: add it with tools/launchd-add-job.py when both are wanted"
-note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs, com.apple.biometrickitd.mesa (Touch ID, 2026-11-18) and com.redfin.sweetfpcd (phone/fpc, ws-fpcd-d), vmd moved out; made by tools/launchd-add-job.py from the phone copy (state/files/tid-i/launchd.plist-phone-1bca506365); never in git"
+note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs, com.apple.biometrickitd.mesa (Touch ID, 2026-11-18) and com.redfin.sweetfpcd (phone/fpc, ws-fpcd-d), vmd moved out; made by tools/launchd-add-job.py from the phone copy (state/files/tid-i/launchd.plist-phone-1bca506365); 2026-11-19 + org.iosonpixel.sweetlocd (ws-gnss-k phone/locd job: runs while /var/local/loc.on exists; previous bfc34f770e); never in git"
 
 [[file]]
 path = "/var/local/bin/a2s"
@@ -1444,6 +1444,8 @@ kern.sweet_chg_sdp_ma=900
 kern.sweet_swapdone=1
 kern.sweet_pace=0
 kern.sweet_pace_min=2000
+kern.sweet_mqrtr_aux=1
+kern.sweet_qmux_pds=1
 """
 mode = "644"
 
@@ -3937,3 +3939,11 @@ path = "/var/local/camera-afdone"
 source = "agent/stage/flags/one"
 sha256 = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
 mode = "644"
+
+[[file]]
+path = "/var/local/loc.on"
+source = "state/files/locd/loc.on"
+sha256 = "f1556def103b89b21cb6ffbe51f1be13c9df4e8a804cf7bcd3a7353cdc49bbcf"
+mode = "644"
+owner = "0:0"
+note = "2026-11-19 locreset fix: pds=1 = sweetlocd answers locationd's PDS (tracking state from the real LOC session) via the kernel relay (kern.sweet_qmux_pds 1, kern.sweet_mqrtr_aux 1). Before, the router's canned PDS answers reported tracking inactive after locationd's SET_AUTO_TRACKING_STATE 1 -> locationd 'wrong state track' TIMEOUT -> CommCenter HardReset 'AP-triggered: locationd PDS - wrong tracking state' ~2-3 min after every boot (cell data lost; 14:50 reset preceded the 14:52 npaschedule modem crash)"
