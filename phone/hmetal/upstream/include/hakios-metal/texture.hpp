@@ -302,6 +302,21 @@ public:
     };
     static std::shared_ptr<Texture> wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why,
                                                 const SurfacePlane* chroma = nullptr);
+    // (ws-hm-planes) -newTextureWithDescriptor:iosurface:plane: for ONE plane of a multi-plane surface (VideoToolbox
+    // writes a '420f' picture's Y plane as R32Uint, four luma bytes a texel, or R8Uint, and its CbCr plane as RG8): a
+    // linear texture over that plane's rows inside the surface's buffer (the kernel imports the whole surface, so a
+    // plane is a sub-range of it) -- GPU address the buffer's plus PLANE.offset, pitch PLANE.rowBytes, DESC's width and
+    // height. What the caller reads off the surface: the plane's offset from the surface's base, its row bytes, its
+    // width and height in elements and the bytes of an element (IOSurfaceGetBytesPerElementOfPlane). The texture's row
+    // must fit the plane's (width x bytes a pixel <= the plane's width x bytes an element, and <= its row bytes), its
+    // height the plane's. nullptr with *why where the GPU cannot address it in place (a pitch or a start that is not a
+    // multiple of 64 bytes, rows past the surface): the caller then copies the plane (HM_PLANE_SHADOW).
+    struct PlaneRows {
+        uint64_t offset;
+        uint32_t rowBytes, width, height, bytesPerElement;
+    };
+    static std::shared_ptr<Texture> wrapSurfacePlane(Gpu& gpu, uint32_t surfaceId, uint32_t plane, const TextureDesc& desc,
+                                                     const PlaneRows& rows, std::string* why);
     // -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a texture whose rows are BUFFER's bytes from OFFSET,
     // BYTES_PER_ROW apart -- the same memory, so a write through either is seen through the other. One level of a
     // colour format, 1D or 2D; the rows the TP takes (a pitch and a start that are multiples of 64 bytes, as for a

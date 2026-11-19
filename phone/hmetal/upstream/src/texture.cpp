@@ -1619,6 +1619,7 @@ std::shared_ptr<Texture> Texture::swizzled(const std::shared_ptr<Texture>& textu
     }
     std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
     t->chroma_ = p.chroma_;
+    t->yc_ = p.yc_;   // (ws-hm-planes) a swizzled two-plane YCbCr texture (Metal's descriptor swizzle) is decoded as its parent
     t->layerPitch_ = p.layerPitch_;
     t->takeUbwc(p);   // (redfin hmv2: a compressed render target's swizzled view reads it compressed too)
     // over the parent's: a component naming red reads what the parent's red reads
@@ -1771,6 +1772,49 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         t->surfaceH_ = s.height;
     }
     return t;
+}
+
+// (ws-hm-planes) one plane of a multi-plane surface as a linear texture over that plane's rows (texture.hpp)
+std::shared_ptr<Texture> Texture::wrapSurfacePlane(Gpu& gpu, uint32_t surfaceId, uint32_t plane, const TextureDesc& desc, const PlaneRows& p,
+                                                   std::string* why) {
+    const FormatInfo* info = formatInfo(desc.format);
+    const std::string asked = "a texture over plane " + n(plane) + " of IOSurface " + n(surfaceId);
+    if (info == nullptr || desc.type != TextureType::k2D || info->depth || info->blockW > 1 || info->twoPlane || desc.mipLevels != 1 ||
+        desc.samples != 1) {
+        refuse(why, asked + " of pixel format " + n(uint32_t(desc.format)) + ": one level of a 2D uncompressed colour format is what a plane takes");
+        return nullptr;
+    }
+    if ((desc.usage & ~(kTextureUsageRead | kTextureUsageWrite | kTextureUsageRenderTarget)) != 0) {
+        refuse(why, asked + ": texture usage " + n(desc.usage) + " has bits other than shader read (1), shader write (2) and render target (4)");
+        return nullptr;
+    }
+    SurfaceInfo s;
+    std::shared_ptr<Buffer> buffer = surfaceBuffer(gpu, surfaceId, &s, why);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    if (s.planes < 2 || plane >= s.planes) {
+        refuse(why, asked + " of " + n(s.planes) + " plane(s): a plane of a multi-plane surface is what this takes");
+        return nullptr;
+    }
+    const uint64_t rowUsed = uint64_t(desc.width) * info->bytesPerPixel;
+    if (desc.width == 0 || desc.height == 0 || p.bytesPerElement == 0 || rowUsed > uint64_t(p.width) * p.bytesPerElement || rowUsed > p.rowBytes ||
+        desc.height > p.height) {
+        refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " " + info->name + " " + asked + " (" + n(p.width) + " x " + n(p.height) + ", " +
+                        n(p.bytesPerElement) + " bytes an element, rows of " + n(p.rowBytes) + "): the texture's rows must fit the plane's");
+        return nullptr;
+    }
+    // the rows where they lie: RB_MRT_PITCH and TEX_CONST_2's pitch in 64-byte units, the start 64-aligned (fd6_layout.c's
+    // linear base_align), as for a whole surface (wrapSurface); the plane's rows inside the surface's memory
+    if (p.rowBytes % 64 != 0 || p.offset % 64 != 0 || p.offset + uint64_t(p.rowBytes) * desc.height > s.size) {
+        refuse(why, asked + ": rows of " + n(p.rowBytes) + " bytes from offset " + n(p.offset) + " in its " + n(s.size) +
+                        " bytes: the GPU wants a pitch and a start that are multiples of 64 bytes, and the rows inside the surface");
+        return nullptr;
+    }
+    // TEX_CONST_2.PITCHALIGN: the largest k up to log2(cpp) with the pitch a multiple of 64 << k (as wrapSurface)
+    uint32_t pitchAlign = 0;
+    while (pitchAlign < log2u(info->bytesPerPixel) && p.rowBytes % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
+    return adopt(new Texture(std::move(buffer), desc, info, p.rowBytes, p.offset, pitchAlign, surfaceId));
 }
 
 // (redfin ws-hm-ubwc) HM_UBWC_DISPLAY: 0 (default) a UBWC surface is refused; 1 it is drawn compressed
@@ -1981,6 +2025,7 @@ std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t*
         d.usage = kTextureUsageRead;
         std::shared_ptr<Texture> c = make(gpu, d, why);
         if (c == nullptr) return nullptr;
+        for (int k = 0; k < 4; k++) c->swizzle_[k] = swizzle_[k];   // (ws-hm-planes) a swizzled YCbCr texture's copy reads through it
         gYcCopy[0]++;
         if (empty >= 0) gYcCopy[1]++;
         ycCopy_[i] = c;
@@ -1997,6 +2042,7 @@ std::shared_ptr<Texture> Texture::ycbcrCopyFor(Gpu& gpu, bool* decode, uint64_t*
         d.usage = kTextureUsageRead;
         copy = make(gpu, d, why);
         if (copy == nullptr) return nullptr;
+        for (int k = 0; k < 4; k++) copy->swizzle_[k] = swizzle_[k];   // (ws-hm-planes)
         gYcCopy[0]++;
     }
     return copy;
@@ -2037,7 +2083,11 @@ void Texture::ycbcrConvertRows(const uint8_t* luma, uint64_t lumaRow, const uint
             const int32_t yv = l[x], cb = c[x & ~1u], cr = c[(x & ~1u) + 1];
             uint32_t v;
             if (planes) {
-                v = uint32_t(cr) | uint32_t(yv) << 8 | uint32_t(cb) << 16;
+                // (ws-hm-planes) HM_540_ORDER=ABC (test switch, processor decode only): the planes' values in red, green and
+                // blue as A, B, C of y, b (Cb), r (Cr); default "ryb" (red Cr, green Y, blue Cb)
+                static const char* order = [] { const char* e = getenv("HM_540_ORDER"); return e != nullptr && strlen(e) == 3 ? e : "ryb"; }();
+                auto pick = [&](char ch) { return uint32_t(ch == 'y' ? yv : ch == 'b' ? cb : cr); };
+                v = pick(order[0]) | pick(order[1]) << 8 | pick(order[2]) << 16;
             } else {
                 // (the kernel's integers: an arithmetic shift, floor((v + 0.5) * 65536 / 65536))
                 const int32_t yy = k[0] * (yv - k[5]) + 32768;

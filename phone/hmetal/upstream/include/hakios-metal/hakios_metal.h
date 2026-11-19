@@ -249,6 +249,13 @@ hakios_metal_texture *hakios_metal_texture_new_iosurface(hakios_metal_device *de
  * CHROMA_ROW_BYTES its rows; both planes are sampled as one texture. */
 hakios_metal_texture *hakios_metal_texture_new_iosurface2(hakios_metal_device *device, unsigned surface_id, unsigned plane,
     unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t chroma_offset, unsigned chroma_row_bytes);
+/* (ws-hm-planes) -newTextureWithDescriptor:iosurface:plane: over PLANE of a multi-plane surface, in place: its rows from
+ * PLANE_OFFSET (IOSurfaceGetBaseAddressOfPlane less IOSurfaceGetBaseAddress), PLANE_ROW_BYTES apart; PLANE_WIDTH and
+ * PLANE_HEIGHT in elements of PLANE_ELEMENT_BYTES. NULL with the reason where the GPU cannot take the rows in place
+ * (a pitch or start that is not a multiple of 64 bytes), or the texture's rows do not fit the plane's. */
+hakios_metal_texture *hakios_metal_texture_new_iosurface_plane(hakios_metal_device *device, unsigned surface_id, unsigned plane,
+    unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t plane_offset, unsigned plane_row_bytes,
+    unsigned plane_width, unsigned plane_height, unsigned plane_element_bytes);
 /* -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a texture over BUFFER's bytes from OFFSET, BYTES_PER_ROW apart
  * (the same memory). NULL with the reason: a pitch or start that is not a multiple of 64 bytes, rows past the buffer, a
  * format, type or level count a buffer does not take. */

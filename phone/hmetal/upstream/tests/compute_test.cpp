@@ -855,6 +855,106 @@ TEST(a_dispatch_of_an_image_only_kernel_puts_a_storage_descriptor_at_ibo_0_and_n
     if (!s.lastDispatch.ibo.empty()) checkIs2d(s.lastDispatch.ibo[0], *wide, false);
 }
 
+// (ws-hm-planes) VideoToolbox's transfer (VTMTSComputeFunction) writes one plane of a two-plane '420f' picture through a
+// texture over that plane alone: the Y plane as R32Uint (four luma bytes a texel: a 376-wide plane is 94 texels) and the
+// CbCr plane as RG8Uint. Each is the surface's own memory -- the buffer's address plus the plane's offset, the plane's
+// pitch -- and a kernel writing it gets a storage descriptor at those, no copy.
+TEST(a_texture_over_one_plane_of_a_two_plane_surface_is_that_plane_in_place) {
+    Rig r;
+    const uint32_t k420f = 0x34323066u;
+    const uint32_t W = 376, H = 500, row = 384;
+    r.fake->addSurface(41, W, H, row, k420f, 0, 2);
+    const uint64_t chromaAt = uint64_t(row) * H;   // 192000: a multiple of 64
+    TextureDesc y;
+    y.format = PixelFormat::kR32Uint;
+    y.width = W / 4;
+    y.height = H;
+    y.usage = kTextureUsageRead | kTextureUsageWrite;
+    std::string why;
+    auto luma = Texture::wrapSurfacePlane(*r.gpu, 41, 0, y, Texture::PlaneRows{0, row, W, H, 1}, &why);
+    CHECK(luma != nullptr);
+    if (luma == nullptr) {
+        std::fprintf(stderr, "  %s\n", why.c_str());
+        return;
+    }
+    TextureDesc c;
+    c.format = PixelFormat::kRG8Uint;
+    c.width = W / 2;
+    c.height = H / 2;
+    c.usage = kTextureUsageRead | kTextureUsageWrite;
+    auto chroma = Texture::wrapSurfacePlane(*r.gpu, 41, 1, c, Texture::PlaneRows{chromaAt, row, W / 2, H / 2, 2}, &why);
+    CHECK(chroma != nullptr);
+    if (chroma == nullptr) {
+        std::fprintf(stderr, "  %s\n", why.c_str());
+        return;
+    }
+    // the same buffer (the kernel's import of the whole surface), plane 1 at its offset, both at the plane's pitch
+    CHECK(luma->buffer() == chroma->buffer());
+    CHECK_EQ(luma->gpuAddress(), luma->buffer()->gpuAddress());
+    CHECK_EQ(chroma->gpuAddress(), chroma->buffer()->gpuAddress() + chromaAt);
+    CHECK_EQ(luma->bytesPerRow(), uint64_t(row));
+    CHECK_EQ(chroma->bytesPerRow(), uint64_t(row));
+    CHECK_EQ(luma->width(), 94u);
+    CHECK_EQ(luma->surface(), 41u);
+    // a kernel writing plane 1: its storage descriptor is the plane's rows
+    FakeGpu::Stats s = dispatched(r, texFillLike(), bind({}, {chroma.get()}));
+    CHECK_EQ(s.lastDispatch.ibos, 1u);
+    if (!s.lastDispatch.ibo.empty()) checkIs2d(s.lastDispatch.ibo[0], *chroma, false);
+    s = dispatched(r, texFillLike(), bind({}, {luma.get()}));
+    if (!s.lastDispatch.ibo.empty()) checkIs2d(s.lastDispatch.ibo[0], *luma, false);
+    // what is written through the plane's texture lands in the plane, inside the surface's memory
+    if (chroma->contents() != nullptr) {
+        const uint8_t px[2] = {0x5a, 0xa5};
+        CHECK(chroma->replace(0, 3, 2, 1, 1, px, 2, &why));
+        std::vector<uint8_t> mem = r.fake->surfaceBytes(41);
+        const uint64_t at = chromaAt + 2 * uint64_t(row) + 3 * 2;
+        CHECK(mem.size() > at + 1);
+        if (mem.size() > at + 1) {
+            CHECK_EQ(uint32_t(mem[at]), 0x5au);
+            CHECK_EQ(uint32_t(mem[at + 1]), 0xa5u);
+        }
+    }
+    // a row wider than the plane's (95 R32Uint texels are 380 bytes of a 376-byte plane), or more rows than it has
+    TextureDesc wide = y;
+    wide.width = 95;
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 41, 0, wide, Texture::PlaneRows{0, row, W, H, 1}, &why) == nullptr);
+    CHECK(why.find("must fit the plane's") != std::string::npos);
+    TextureDesc tall = c;
+    tall.height = H / 2 + 1;
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 41, 1, tall, Texture::PlaneRows{chromaAt, row, W / 2, H / 2, 2}, &why) == nullptr);
+    // rows the GPU cannot take in place (the plug-in then copies the plane: HM_PLANE_SHADOW)
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 41, 1, c, Texture::PlaneRows{chromaAt + 16, row, W / 2, H / 2, 2}, &why) == nullptr);
+    CHECK(why.find("multiples of 64 bytes") != std::string::npos);
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 41, 0, y, Texture::PlaneRows{0, 376, W, H, 1}, &why) == nullptr);
+    // a plane past the surface's, and a single-plane surface (wrapSurface's)
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 41, 2, y, Texture::PlaneRows{0, row, W, H, 1}, &why) == nullptr);
+    r.fake->addSurface(42, 64, 64, 256, 0x42475241u);
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 42, 0, y, Texture::PlaneRows{0, 256, 64, 64, 4}, &why) == nullptr);
+    CHECK(why.find("a plane of a multi-plane surface") != std::string::npos);
+    // VideoToolbox's source, format 540 over the same '420f' surface, read through its descriptor's swizzle: the swizzled
+    // texture is still the two planes, decoded as its parent (HM_540_SWIZZLE)
+    Texture::Ycbcr yc;
+    yc.matrix = 1;
+    yc.planes = true;
+    yc.lumaOffset = 0;
+    yc.lumaRow = row;
+    yc.chromaOffset = chromaAt;
+    yc.chromaRow = row;
+    auto src = Texture::wrapSurfaceYcbcr(*r.gpu, 41, W, H, yc, &why);
+    CHECK(src != nullptr);
+    if (src != nullptr) {
+        const uint8_t brg[4] = {4, 2, 3, 5};
+        auto z = Texture::swizzled(src, brg, &why);
+        CHECK(z != nullptr);
+        if (z != nullptr) {
+            CHECK(z->ycbcrDecoded());
+            CHECK(z->ycbcr().planes);
+            CHECK_EQ(z->ycbcr().chromaOffset, chromaAt);
+            CHECK_EQ(z->surface(), 41u);
+        }
+    }
+}
+
 TEST(an_image_kernel_stores_into_a_2d_array_or_a_3d_texture_through_a_layered_descriptor) {
     // ir3 stores to both as stib.3d with the layer as z (tex_fill_arr, tex_fill_3d): what keeps layer z apart from layer
     // 0 is the descriptor's ARRAY_PITCH and DEPTH alone, so those are what is checked -- against the texture's own slice
