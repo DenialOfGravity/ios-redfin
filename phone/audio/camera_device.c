@@ -221,6 +221,7 @@ static volatile uint32_t camera_antiband;       /* redfin: /private/var/local/ca
 static volatile bool camera_awb2;       /* redfin: /private/var/local/camera-awb2 (camera_isp.c's isp.awb2) */
 static volatile double camera_min_fps;  /* redfin (ws-cam-smooth): /private/var/local/camera-minfps, AE's frame rate floor */
 static volatile uint32_t camera_ae_settle;      /* redfin (ws-cam-smooth): /private/var/local/camera-aesettle */
+static volatile bool camera_afdone;     /* redfin (ws-cam-af): /private/var/local/camera-afdone */
 
 static void
 camera_settings_check(void)
@@ -317,6 +318,21 @@ camera_settings_check(void)
 			say("AE: %u frames waited after each change (camera-aesettle)", settle);
 		}
 		camera_ae_settle = settle;
+	}
+	{
+		/*
+		 * redfin (ws-cam-af): /private/var/local/camera-afdone: the stream posts kFigCaptureStreamNotification_AFOperationCompleted
+		 * when a focus asked for (AutoFocusNow and the like, ManualFocusNow) is done, as H10ISP's stream does. Without it the
+		 * capture device's adjustingFocus never went back to NO after a tap: Camera's later taps metered only (no AF asked
+		 * for again). No file: not posted (as before).
+		 */
+		bool afdone = access("/private/var/local/camera-afdone", F_OK) == 0;
+
+		if (afdone != camera_afdone) {
+			say("focus: %s", afdone ? "AFOperationCompleted posted when a focus asked for is done (camera-afdone)" :
+			    "AFOperationCompleted not posted");
+		}
+		camera_afdone = afdone;
 	}
 }
 
@@ -837,6 +853,7 @@ back_camera(void)
 }
 
 struct stream {
+	CMBaseObjectRef self;           /* (ws-cam-af) the stream's object, not retained: the notifications' sender */
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
 	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
@@ -1743,6 +1760,29 @@ torch_symbol(const char *name, CFStringRef otherwise)
 	return p != NULL && *p != NULL ? *p : otherwise;
 }
 
+/* redfin (ws-cam-af): kFigCaptureStreamNotification_AFOperationCompleted from the stream, as H10ISP's (camera-afdone) */
+static void
+stream_post_af_done(struct stream *s, uint32_t at)
+{
+	static const void *(*center)(void);
+	static OSStatus (*post)(const void *, CFStringRef, const void *, CFTypeRef);
+	static unsigned posts;
+
+	if (center == NULL || post == NULL) {
+		center = dlsym(RTLD_DEFAULT, "CMNotificationCenterGetDefaultLocalCenter");
+		post = dlsym(RTLD_DEFAULT, "CMNotificationCenterPostNotification");
+	}
+	if (center == NULL || post == NULL || s->self == NULL) {
+		say("focus: done, but AFOperationCompleted cannot be posted (no CMNotificationCenter)");
+		return;
+	}
+	OSStatus e = post(center(), torch_symbol("kFigCaptureStreamNotification_AFOperationCompleted", CFSTR("AFOperationCompleted")),
+	    s->self, NULL);
+	if (posts++ < 20 || e != 0) {
+		say("focus: AFOperationCompleted posted (the lens at %u): %d", at, (int)e);
+	}
+}
+
 static void
 torch_heard(const void *center, const void *listener, CFStringRef name, const void *object, CFTypeRef payload)
 {
@@ -2583,6 +2623,8 @@ struct af {
 	unsigned        busy;           /* frames since this search (or move) began */
 	unsigned        moving;         /* frames in a row the kernel said LENS_MOVING */
 	uint32_t        good;           /* where the lens was last in focus (or the kernel put it): the fallback */
+	bool            op;             /* a focus asked for (AutoFocusNow, ManualFocusNow) not done yet */
+	bool            done;           /* ... done now: AFOperationCompleted to be posted (the worker clears it) */
 };
 
 /*
@@ -2631,6 +2673,8 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
 
 	if (f->focus == REDWOOD_CAMERA_NO_FOCUS) {
+		af->done |= af->op;
+		af->op = false;
 		return;
 	}
 	if (!af->started) {
@@ -2654,6 +2698,8 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 			if (af->at != af->good) {
 				af_go(device, af, af->good);
 			}
+			af->done |= af->op;
+			af->op = false;
 			return;
 		}
 	} else {
@@ -2662,6 +2708,7 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 	/* redfin (B5): ManualFocusNow: the lens there, a step at a time, and held */
 	if (manual >= 0 && manual != af->manual_at) {
 		af->manual_at = manual;
+		af->op = true;
 		af->state = AF_MANUAL;
 		af->now = af->sweep = false;
 		af_go(device, af, (uint32_t)manual);
@@ -2679,6 +2726,8 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 		af->state = AF_WATCH;
 		af->hold = true;
 		say("focus: the lens at %u, as asked", af->at);
+		af->done |= af->op;
+		af->op = false;
 		return;
 	}
 	/* redfin (B5): a frame exposed while the lens moved (the kernel's LENS_MOVING) is no measure of where it is */
@@ -2817,6 +2866,8 @@ af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const 
 		af->unlike = 0;
 		af->hold = mode == AF_MODE_AUTO;        /* (redfin, B5: one search, and the lens stays) */
 		af->good = af->at;                      /* (ws-cam-af: the fallback) */
+		af->done |= af->op;
+		af->op = false;
 		say("focus: the lens at %u after %u moves (sharpness %.3f)%s", af->at, af->steps, sharpness, af->hold ? ", held" : "");
 		return;
 	case AF_MANUAL:
@@ -3570,8 +3621,15 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 			af.sweep = af_mode != AF_MODE_CONTINUOUS;
 			af.hold = false;
 			af.manual_at = -1;
+			af.op = true;
 		}
 		af_frame(device, &af, f, raw, hw ? &nv : NULL, window, af_locked, af_mode, manual_focus);
+		if (af.done) {
+			af.done = false;
+			if (camera_afdone) {
+				stream_post_af_done(s, af.at);
+			}
+		}
 		s->frames++;
 		pt2 = mach_absolute_time();
 
@@ -4323,6 +4381,7 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	}
 	s = stream_of(o);
 	memset(s, 0, sizeof(*s));
+	s->self = o;
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
 	pthread_mutex_init(&s->worker_lock, NULL);
