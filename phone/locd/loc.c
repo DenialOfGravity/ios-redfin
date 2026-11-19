@@ -105,6 +105,12 @@
  *                since the query (Android: NtpTrustedTime, unc = RTT/2). The system clock is never set. If the query
  *                fails, the RTC time with timeunc= is used as before.
  * Never sent (ws-gnss-k too): SUPL/NI/NV messages, position injection, SET_CONSTELLATION_CONTROL, any lockClient TLV.
+ * ws-gnss-pdsfix (Claude 2026-11-19): pds=1 now registers as the QTI HAL does (client=afw, opmode=standalone,
+ *   start=android implied; pdsform=raw = the old minimal form). A START the modem refuses (engine lock 0x3) is no LOC
+ *   failure and is not restarted per request: attempt k waits 30 s * 2^(k-1) (max 10 min), at most 8 per locationd auto
+ *   tracking start; one read-only GET_ENGINE_LOCK, then one PDS EVENT_REPORT session status 7 (2 if not locked) per
+ *   refusal. Every SET_AUTO_TRACKING_STATE / service state change is followed by GPS_SERVICE_STATE_IND (pdsemu.c header:
+ *   locationd's "wrong state track" reset); the PDS relay stays up while LOC is DROPPED.
  * One request in flight, 5 s response timeout; 3 failures in a row (timeout or QMI error) drop LOC until loc.on
  * changes ("loc: DROPPED"). Status: /var/local/loc.status (`sweetlocd status`). ws-gnss-k: no line ever carries
  * latitude, longitude or altitude (fix lines: status, h/v uncertainty, SVs used, TTFF, time source; POSITION_REPORT and
@@ -215,6 +221,18 @@ static int have_last, status_dirty = 1;
 static uint64_t ttff_ms;		/* ws-gnss-k: session start -> first status-0 fix (0 = none yet) */
 static struct pds_state pds;
 static int pds_inited;
+/* ws-gnss-pdsfix: locationd's LOC session when the modem refuses START (engine lock 0x3: AFW/MI locked). No restart per
+ * request: attempt k waits 30 s * 2^(k-1) (max 10 min), at most START_TRIES_MAX per locationd auto tracking start; the PDS
+ * side stays consistent meanwhile (tracking 2 as asked, EVENT_REPORT session status 7/2 once per refusal). */
+#define START_RETRY_MIN_MS	30000ull
+#define START_RETRY_MAX_MS	600000ull
+#define START_TRIES_MAX		8
+static unsigned st_refused, st_tries, st_err, st_gen = ~0u;
+static uint64_t st_next, st_last;
+static int st_gave_up, w_pdsraw;
+static int64_t pds_lockmask = -1;	/* engine lock mask from a read-only GET_ENGINE_LOCK (-1 unknown) */
+static int lockread_state;		/* 0 not asked, 1 queued/in flight, 2 done */
+static int refusal_report_pending;
 /* engine lock (unlock=mi / unlock=none / repair; englock.h): its own one-request slot, sent before the queue */
 enum { LK_IDLE, LK_RD, LK_RD_DV, LK_SET, LK_CHK, LK_UNLOCKED, LK_RS_SET, LK_RS_CHK, LK_RP_RD, LK_NOOP, LK_FAILED, LK_RS_FAILED,
        LK_EFS };
@@ -344,8 +362,92 @@ static void kr_poll(uint64_t now)
 
 int loc_pds_on(void)
 {
-	return on_present && w_pds && !dropped;
+	return on_present && w_pds;	/* ws-gnss-pdsfix: not tied to LOC's "dropped": locationd needs consistent PDS answers */
 }
+
+/* ws-gnss-pdsfix: GPS_SERVICE_STATE_IND (0x0020) to locationd after every auto tracking / service state change, as a
+ * modem does; locationd's fReportedTrackingState comes only from it (pdsemu.c header). Pending until the relay is up. */
+static void pds_ind_flush(void)
+{
+	uint8_t b[16], svc = 0, trk = 0;
+	uint32_t n;
+	if (!pds_inited || !pds.client.valid || !(n = pdsemu_state_ind(&pds, b, sizeof(b), &svc, &trk)))
+		return;
+	if (pds_send_ind(pds.client.pipe, pds.client.sess, PDS_SVC, pds.client.cid, PDS_SVC_STATE_IND, b, n) != 0)
+		return;
+	pdsemu_state_ind_sent(&pds, svc, trk);
+	pds.nind++;
+	status_dirty = 1;
+	printf("[%6llu] loc: PDS: GPS_SERVICE_STATE_IND to locationd (pipe %u sess %u cid %u): service %u, tracking %u (%s)\n",
+	       now_ms(), pds.client.pipe, pds.client.sess, pds.client.cid, svc, trk, trk == PDS_TRK_ACTIVE ? "active" : "inactive");
+}
+
+/* ws-gnss-pdsfix: tell locationd honestly why no fix comes: EVENT_REPORT with only TLV 0x12 session status, 7 (engine
+ * locked) when the read-only lock read says AFW/MI is locked, else 2 (failure). Once per refusal. */
+static void pds_refusal_report(void)
+{
+	if (!refusal_report_pending)
+		return;
+	if (pds_lockmask < 0 && lockread_state == 1)
+		return;		/* the lock read is still on its way */
+	if (!pds.client.valid || !pds.auto_on) {
+		refusal_report_pending = 0;
+		return;
+	}
+	uint8_t b[8];
+	uint8_t st = pds_lockmask >= 0 && ((uint64_t)pds_lockmask & 0x1u) ? PDS_STATUS_ENGINE_LOCKED : PDS_STATUS_FAILURE;
+	uint32_t n = pdsemu_session_status(st, b, sizeof(b));
+	if (!n || pds_send_ind(pds.client.pipe, pds.client.sess, PDS_SVC, pds.client.cid, PDS_EVENT_REPORT, b, n) != 0)
+		return;
+	refusal_report_pending = 0;
+	pds.nind++;
+	printf("[%6llu] loc: PDS: EVENT_REPORT to locationd: session status %u (%s)\n", now_ms(), st,
+	       st == PDS_STATUS_ENGINE_LOCKED ? "engine locked" : "failure");
+}
+
+static int lk_get_queued(void);
+static void enqueue(uint16_t id, const uint8_t *tl, uint16_t tn, int want_ind, const char *why);
+
+static void start_refused(unsigned err)
+{
+	uint64_t d = START_RETRY_MIN_MS;
+	for (unsigned i = 1; i < st_tries && d < START_RETRY_MAX_MS; i++)
+		d *= 2;
+	if (d > START_RETRY_MAX_MS)
+		d = START_RETRY_MAX_MS;
+	st_refused++;
+	st_err = err;
+	st_next = link_ms() + d;
+	status_dirty = 1;
+	if (st_tries >= START_TRIES_MAX) {
+		st_gave_up = 1;
+		printf("[%6llu] loc: START refused by the modem (error 0x%x), attempt %u of %u: no more START until locationd turns "
+		       "auto tracking on again; PDS tracking stays as locationd set it\n", now_ms(), err, st_tries, START_TRIES_MAX);
+	} else {
+		printf("[%6llu] loc: START refused by the modem (error 0x%x), attempt %u of %u: next attempt in %llu s; PDS tracking "
+		       "stays as locationd set it\n", now_ms(), err, st_tries, START_TRIES_MAX, (unsigned long long)(d / 1000));
+	}
+	if (pds_lockmask < 0 && lockread_state == 0) {	/* read-only: why was it refused (nothing is changed) */
+		enqueue(LOC_GET_ENGINE_LOCK, NULL, 0, 1, "GET_ENGINE_LOCK (read-only: why START was refused)");
+		lockread_state = 1;
+	}
+	refusal_report_pending = 1;
+	pds_refusal_report();
+}
+
+/* a new locationd start (SET_AUTO_TRACKING_STATE 1) gets a new attempt budget; attempts stay >= 30 s apart */
+static int pds_start_allowed(uint64_t now)
+{
+	if (pds.auto_gen != st_gen) {
+		st_gen = pds.auto_gen;
+		st_tries = 0;
+		st_gave_up = 0;
+		if (st_next > st_last + START_RETRY_MIN_MS)	/* after a refusal: the next attempt >= 30 s after the last */
+			st_next = st_last + START_RETRY_MIN_MS;
+	}
+	return !st_gave_up && now >= st_next;
+}
+
 
 static void enqueue(uint16_t id, const uint8_t *tl, uint16_t tn, int want_ind, const char *why)
 {
@@ -390,7 +492,7 @@ static void fail(const char *what)
 static int soft_id(uint16_t id)
 {
 	return id == LOC_REG_MASTER || id == LOC_SET_CONSTELL_REPORT || id == LOC_INJECT_XTRA_DATA || id == LOC_INJECT_PRED_ORBITS ||
-	       id == LOC_GET_XTRA_VALIDITY;
+	       id == LOC_GET_XTRA_VALIDITY || id == LOC_GET_ENGINE_LOCK;	/* ws-gnss-pdsfix: the read-only lock read */
 }
 
 static void enqueue_front(uint16_t id, const uint8_t *tl, uint16_t tn, int want_ind, const char *why)
@@ -775,6 +877,10 @@ static void session_stop(const char *why)
 
 static void session_start(int owner, uint32_t interval)
 {
+	if (owner == 1) {	/* ws-gnss-pdsfix */
+		st_tries++;
+		st_last = link_ms();
+	}
 	sess_owner = owner;
 	sess_interval = interval;
 	sess_t0 = link_ms();
@@ -1433,6 +1539,19 @@ static void read_on(void)
 		w_timeunc = 60000;
 	if (w_session > 600)
 		w_session = 600;
+	/* ws-gnss-pdsfix: pds=1 registers as the QTI HAL does (clientType AFW, SET_OPERATION_MODE STANDALONE, HAL START
+	 * TLVs: the form the modem accepted at lock 0x2, ws-gnss-f cd4f655); pdsform=raw keeps the old minimal form */
+	w_pdsraw = strstr(b, "pdsform=raw") != NULL;
+	if (w_pds && !w_pdsraw) {
+		if (!w_client)
+			w_client = LOC_CLIENT_AFW;
+		w_opmode = 1;
+		w_start_android = 1;
+	}
+	st_tries = 0;
+	st_next = 0;
+	st_gave_up = 0;
+	st_gen = ~0u;
 	if (w_probe2) {		/* ws-gnss-i: read-only mode, every other word off */
 		w_probe = w_pds = w_session = w_unlock = w_time = w_rfmetrics = 0;
 		w_client = w_clientid = w_opmode = w_start_android = w_lockclient = w_lockev = 0;
@@ -1515,10 +1634,15 @@ static void write_status(void)
 		loc_fix_str(&last, fb, sizeof(fb));
 		fprintf(f, "loc: last fix %s\n", fb);
 	}
-	if (pds_inited)
+	if (pds_inited) {
 		fprintf(f, "loc: pds client %s pipe %u sess %u cid %u, svc %d auto %d cancelled %d, def interval %u accuracy %u, "
 			   "requests %u\n", pds.client.valid ? "known" : "none", pds.client.pipe, pds.client.sess, pds.client.cid,
 			pds.svc_on, pds.auto_on, pds.cancelled, pds.def_interval, pds.def_accuracy, pds.nreq);
+		fprintf(f, "loc: pds tracking %u (last indicated %u%s), indications %u, resets %u; START refused %u (last error 0x%x), "
+			   "attempt %u of %u%s, lock %s\n", pdsemu_tracking(&pds), pds.ind_trk, pds.ind_dirty ? ", one pending" : "",
+			pds.nind, pds.nreset, st_refused, st_err, st_tries, START_TRIES_MAX, st_gave_up ? " (given up)" : "",
+			pds_lockmask < 0 ? "unknown" : (pds_lockmask & 1) ? "AFW/MI locked" : "AFW/MI unlocked");
+	}
 	fclose(f);
 	rename(LOC_STATUS ".tmp", LOC_STATUS);
 }
@@ -1593,7 +1717,7 @@ void loc_poll(void)
 	if (sess == 0 || sess == 3) {
 		if (sess == 3 && !cur.busy && !qn)
 			sess = 0;
-		if (sess == 0 && want_pds && !hold)
+		if (sess == 0 && want_pds && !hold && pds_start_allowed(now))
 			session_start(1, ivl);
 		else if (sess == 0 && want_test) {
 			session_start(2, 1000);
@@ -1622,7 +1746,19 @@ void loc_poll(void)
 	}
 	send_next();
 	kr_poll(now);		/* xnu 1122 */
+	if (lockread_state == 1 && !(cur.busy && cur.id == LOC_GET_ENGINE_LOCK && !cur.lk) && !lk_get_queued())
+		lockread_state = 2;	/* ws-gnss-pdsfix: answered, refused or timed out */
+	pds_ind_flush();
+	pds_refusal_report();
 	write_status();
+}
+
+static int lk_get_queued(void)
+{
+	for (int i = 0; i < qn; i++)
+		if (q[i].id == LOC_GET_ENGINE_LOCK)
+			return 1;
+	return 0;
 }
 
 void loc_server(uint32_t service, uint32_t instance, uint32_t node, uint32_t port)
@@ -1829,14 +1965,24 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		if (res) {
 			cur.busy = 0;
 			if (m.id == LOC_START && sess == 1) {
+				int own = sess_owner;
 				sess = 0;
 				sess_owner = 0;
+				if (own == 1) {	/* ws-gnss-pdsfix: locationd's session: backoff, never a restart per request */
+					start_refused(err);
+					return;
+				}
 			}
 			fail("QMI error");
 			return;
 		}
 		fails = 0;
 		if (m.id == LOC_START && sess == 1) {
+			if (sess_owner == 1 && st_refused)
+				printf("[%6llu] loc: START accepted after %u refusals\n", now_ms(), st_refused);
+			st_tries = 0;
+			st_gave_up = 0;
+			st_next = 0;
 			sess = 2;
 			status_dirty = 1;
 		}
@@ -1892,6 +2038,8 @@ void loc_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			char pb[96];
 			lk_parse(&m, &pv);
 			int64_t pm = lk_mask(&pv);
+			if (pm >= 0)
+				pds_lockmask = pm;	/* ws-gnss-pdsfix */
 			printf("[%6llu] loc: engine lock (%s): %s%s%s%s\n", now_ms(), cur.why, pm >= 0 ? lk_str((uint64_t)pm, pb, sizeof(pb)) : "no value",
 			       pv.has_type ? " (lockType TLV)" : "", pv.has_sub ? " (subType TLV)" : "", pv.has_client ? " (lockClient TLV)" : "");
 		}
@@ -2063,10 +2211,12 @@ void loc_pdsr_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		unsigned msg = r.len >= 5 ? (unsigned)(data[3] | data[4] << 8) : 0;
 		if (mine)
 			kr_mine++;
-		if (kr_reqs <= 40)
+		if (kr_reqs <= 40 || (mine && msg != PDS_GET_SVC_STATE && msg != PDS_GET_AUTO_TRACKING) || msg == PDS_RESET)
 			printf("[%6llu] loc: PDS relay: 0x%04x from pipe %u sess %u cid %u -> %s%s\n", now_ms(), msg, r.pipe, r.sess,
 			       r.cid, mine ? (fl ? "error " : "answered ") : "not ours (kernel policy)", mine ? w : "");
 		kr_send(2, r.cid, (mine ? 1u : 0u) | (mine && fl ? 2u : 0u), r.pipe, r.sess, r.tag, (unsigned)code, tl, tl ? tn : 0);
+		if (mine)
+			pds_ind_flush();	/* ws-gnss-pdsfix: the state indication follows the answer */
 		break;
 	}
 	case 0x82:

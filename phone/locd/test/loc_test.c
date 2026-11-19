@@ -94,7 +94,7 @@ int main(void)
 	tick(100);
 	CHECK(nsent == 0 && nrel == 0);		/* no loc.on: nothing, not even the relay */
 	CHECK(!loc_pds_on() && !loc_on_present());
-	wordfile("pds=1\n");
+	wordfile("pds=1 pdsform=raw\n");
 	CHECK(loc_pds_on() && nsent == 0);	/* no session wanted yet */
 	CHECK(nrel == 1 && rel[0].op == 1);	/* HELLO to the relay */
 	kin(0x84, 1);				/* kern.sweet_qmux_pds 1 */
@@ -139,7 +139,7 @@ int main(void)
 	      sent_id[before + 2] == LOC_GET_ENGINE_LOCK && sent_id[before + 3] == LOC_GET_FIX_CRITERIA &&
 	      sent_id[before + 4] == LOC_GET_XTRA_SOURCE);
 	/* failures: pds session, START times out 3 times -> dropped, one last STOP (+ REG_EVENTS 0) */
-	wordfile("pds=1\n");
+	wordfile("pds=1 pdsform=raw\n");
 	pds(0x0031, 1, 1);
 	tick(10);
 	for (int i = 0; i < 3 && nfail < 50; i++) {
@@ -147,7 +147,7 @@ int main(void)
 		tick(10);
 	}
 	tick(10);
-	CHECK(!loc_pds_on());	/* dropped */
+	CHECK(loc_pds_on());	/* LOC dropped: the PDS emulation stays (ws-gnss-pdsfix) */
 	CHECK(sent_id[nsent - 1] == LOC_STOP);
 	respond(1); tick(10); CHECK(sent_id[nsent - 1] == LOC_REG_EVENTS);
 	respond(1); tick(10); CHECK(loc_quiet());

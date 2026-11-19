@@ -139,11 +139,34 @@ int main(void)
 	CHECK(pdsemu_want_session(&p, NULL));
 	pdsemu_client_gone(&p, 1, 7);
 	CHECK(!pdsemu_want_session(&p, NULL));
-	/* lockGps: SET_GPS_SERVICE_STATE 0 blocks a session */
+	/* ws-gnss-pdsfix: SET_GPS_SERVICE_STATE 0 ("GPS_NETWORK: Keeping service state OFF") does not stop tracking:
+	 * locationd still wants tracking 2 while auto tracking is on (CLQmiPdsManager ping @0x1004ffb6c) */
 	pdsemu_request(&p, &c, b, req(b, 0x0031, b + 100, (uint16_t)n), &a);
 	n = 0; put(b + 100, &n, 0x01, "\x00", 1);
 	pdsemu_request(&p, &c, b, req(b, 0x0021, b + 100, (uint16_t)n), &a);
-	CHECK(!pdsemu_want_session(&p, NULL));
+	CHECK(pdsemu_want_session(&p, NULL));
+	CHECK(pdsemu_request(&p, &c, b, req(b, 0x0020, NULL, 0), &a) && a.tn == 5 && !memcmp(a.tl, "\x01\x02\x00\x00\x02", 5));
+	{
+		/* the indication locationd's fReportedTrackingState comes from: 0x01 {service, tracking} */
+		uint8_t ib[16], sv = 9, tr = 9;
+		uint32_t in = pdsemu_state_ind(&p, ib, sizeof(ib), &sv, &tr);
+		CHECK(in == 5 && !memcmp(ib, "\x01\x02\x00\x00\x02", 5) && sv == 0 && tr == 2);
+		pdsemu_state_ind_sent(&p, sv, tr);
+		CHECK(pdsemu_state_ind(&p, ib, sizeof(ib), &sv, &tr) == 0);	/* nothing new */
+		/* every SET_AUTO_TRACKING_STATE gets one (even an unchanged one), stop -> tracking 1 */
+		n = 0; put(b + 100, &n, 0x01, "\x00", 1);
+		pdsemu_request(&p, &c, b, req(b, 0x0031, b + 100, (uint16_t)n), &a);
+		in = pdsemu_state_ind(&p, ib, sizeof(ib), &sv, &tr);
+		CHECK(in == 5 && tr == 1 && pdsemu_tracking(&p) == 1);
+		pdsemu_state_ind_sent(&p, sv, tr);
+		/* RESET (the kernel policy answers it): back to the start state, no indication pending */
+		n = 0; put(b + 100, &n, 0x01, "\x01", 1);
+		pdsemu_request(&p, &c, b, req(b, 0x0031, b + 100, (uint16_t)n), &a);
+		CHECK(!pdsemu_request(&p, &c, b, req(b, 0x0000, NULL, 0), &a));
+		CHECK(pdsemu_tracking(&p) == 1 && p.svc_on && pdsemu_state_ind(&p, ib, sizeof(ib), &sv, &tr) == 0 && p.nreset == 2);
+		/* the refusal report: TLV 0x12 only */
+		CHECK(pdsemu_session_status(7, ib, sizeof(ib)) == 4 && !memcmp(ib, "\x12\x01\x00\x07", 4));
+	}
 
 	/* ws-gnss-g: INJECT_UTC_TIME TLVs; SV summary (28-byte entries) */
 	n = loc_tlv_inject_utc(b, 0x0102030405060708ull, 5000);

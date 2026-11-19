@@ -18,6 +18,11 @@ $CC $W $D -o "$T/probe2_test" test/probe2_test.c loc.c englock.c pdsemu.c rfm.c 
 tail -1 "$T/loc_test.log"
 "$T/pdsr_test" > "$T/pdsr_test.log" 2>&1 || { cat "$T/pdsr_test.log"; exit 1; }
 tail -1 "$T/pdsr_test.log"
+# ws-gnss-pdsfix: locationd's tracking state check + START refusal backoff
+$CC $W $D -o "$T/pdsfix_test" test/pdsfix_test.c loc.c englock.c pdsemu.c rfm.c ntp.c ../wifi/qmi.c
+"$T/pdsfix_test" > "$T/pdsfix_test.log" 2> "$T/pdsfix_test.err" || { cat "$T/pdsfix_test.err"; tail -30 "$T/pdsfix_test.log"; exit 1; }
+cat "$T/pdsfix_test.err"
+echo "pdsfix_test: log $(wc -c < "$T/pdsfix_test.log") bytes for 2 h of refusals"
 "$T/lock_test" > "$T/lock_test.log" 2>&1 || { cat "$T/lock_test.log"; exit 1; }
 tail -1 "$T/lock_test.log"
 "$T/probe2_test" > "$T/probe2_test.log" 2>&1 || { cat "$T/probe2_test.log"; exit 1; }

@@ -24,6 +24,30 @@
  *    8 h speed (+ h vel unc), 10 heading, 11-15 h unc circ/semi-major/semi-minor/azimuth/v unc, 18 h confidence;
  *    all of 0x4f8ff + time unc <= 249 updates locationd's leap seconds.
  *  - TLV 0x17 satellite info is only logged by handleSatelliteInfo @0x10115b6a4: not sent.
+ *  - ws-gnss-pdsfix (2026-11-19): the "wrong state track" baseband reset, CLQmiPdsManager (D22 16.7 locationd):
+ *    PDS ping (timer, ~4 s on the phone) @0x1004ffb6c: sends GET_GPS_SERVICE_STATE 0x0020 (sendGetGpsServiceState
+ *    @0x1004e7008), then, only while fIsStarted (this+0x8c; set to 1 with the counters zeroed by the start-tracking
+ *    function @0x1004de724 = "Requesting continuous tracking" init @0x1004e5b50, cleared by stop/RESET @0x1004e436c..
+ *    @0x1004e57f8, RESET also zeroes both states, strh wzr this+0xbe):
+ *      fReportedTrackingState (u8 this+0xbe) == 2 && fQueriedTrackingState (u8 this+0xbf) == 2  -> mismatch counter
+ *      this+0xf0 = 0, else this+0xf0++ with "#Warning QMI: wrong state track(started) fReported.. fQueried.." from
+ *      count 2 on and, when the count is > 6 and a multiple of 7, "TIMEOUT: wrong state track" + vcall this->vtbl[0xf8]
+ *      ("PDS - wrong tracking state" @0x1004ffd48) = CommCenter's baseband HardReset "AP-triggered: locationd PDS -
+ *      wrong tracking state" (~8 pings ~ 25-30 s after the start). Same scheme with this+0xf4 for "no state response"
+ *      ("PDS - no tracking state response", reset when 7 pings get no GET answer while both states are 2).
+ *    fQueriedTrackingState: parseGpsServiceState @0x1004e8c48: GET_GPS_SERVICE_STATE response TLV 0x01 byte 0 =
+ *      service enabled (-> this+0xbc), byte 1 = tracking state ("trackingState = %d"); 1 or 2 kept, else 0; also zeroes
+ *      this+0xf4. So the answer must be 01 02 00 <svc> 02 while locationd runs (the kernel policy's 0102000101 = 1).
+ *    fReportedTrackingState: ONLY from the indication QMI_PDS_GPS_SERVICE_STATE_IND (msg 0x0020): handleIndication
+ *      @0x1004ed304 case 0x20 @0x1004ed6b8, unpackGpsServiceStateInd @0x1004f98d8 (TLV 0x01 {u8 enabled (!=0), u8
+ *      tracking 1|2, else both 0}), stored @0x1004efde4 (strb w24, [x19,#0xbe]); enabled 0 + tracking 1 also posts an
+ *      internal "GPS off" event (@0x1004ed7f0). Without that indication the reported state stays 0 -> reset.
+ *    Expected: after SET_AUTO_TRACKING_STATE 1 the modem sends GPS_SERVICE_STATE_IND {svc, 2} and GET says {svc, 2};
+ *    after 0 (stop) {svc, 1}. locationd's init sets the service state OFF ("GPS_NETWORK: Keeping service state OFF",
+ *    sendSetGpsServiceState(0) @0x1004e5e4c) while auto tracking stays on, so the tracking state must not follow the
+ *    service state (the 2026-11-19 failure: GET said 1 because svc 0, and no indication was ever sent).
+ *    EVENT_REPORT session status (TLV 0x12) other than 0/8 is only logged by Eureka ("sessionFixStatus"), so a refused
+ *    LOC START is reported honestly as status 7 (engine locked) without touching the tracking state.
  * libqmi's public PDS schema has 0x12 (u8 QmiPdsPositionSessionStatus) but no 0x13; numbering of the status values
  * 0-7 is the same in PDS and LOC (0 success, 1 in progress, 2 failure, 3 timeout, 4 user end, 5 bad param,
  * 6 offline, 7 engine locked; PDS 8 = E911).
@@ -62,11 +86,57 @@ static const uint8_t *find(const uint8_t *p, uint32_t n, unsigned id, uint16_t *
 	return NULL;
 }
 
+static void state_reset(struct pds_state *p)
+{
+	p->svc_on = 1;
+	p->auto_on = 0;
+	p->cancelled = 0;
+	p->ind_svc = 1;
+	p->ind_trk = PDS_TRK_INACTIVE;
+	p->ind_dirty = 0;
+}
+
 void pdsemu_init(struct pds_state *p)
 {
 	memset(p, 0, sizeof(*p));
-	p->svc_on = 1;
 	p->def_interval = 1;
+	state_reset(p);
+}
+
+uint8_t pdsemu_tracking(const struct pds_state *p)
+{
+	/* only SET_AUTO_TRACKING_STATE decides it: locationd keeps the service state OFF ("GPS_NETWORK: Keeping service
+	 * state OFF", init @0x1004e5e4c) while it runs continuous tracking and still wants tracking 2 (header) */
+	return p->auto_on ? PDS_TRK_ACTIVE : PDS_TRK_INACTIVE;
+}
+
+uint32_t pdsemu_state_ind(const struct pds_state *p, uint8_t *out, uint32_t room, uint8_t *svc, uint8_t *trk)
+{
+	if (!p->ind_dirty || room < 5)
+		return 0;
+	*svc = (uint8_t)(p->svc_on != 0);
+	*trk = pdsemu_tracking(p);
+	uint32_t o = 0;
+	uint8_t v[2] = { *svc, *trk };
+	tlv(out, &o, 0x01, v, 2);
+	return o;
+}
+
+void pdsemu_state_ind_sent(struct pds_state *p, uint8_t svc, uint8_t trk)
+{
+	p->ind_svc = svc;
+	p->ind_trk = trk;
+	if (svc == (uint8_t)(p->svc_on != 0) && trk == pdsemu_tracking(p))
+		p->ind_dirty = 0;
+}
+
+uint32_t pdsemu_session_status(uint8_t status, uint8_t *out, uint32_t room)
+{
+	uint32_t o = 0;
+	if (room < 4)
+		return 0;
+	tlv(out, &o, 0x12, &status, 1);
+	return o;
 }
 
 static void ok(struct pds_answer *a, const char *what)
@@ -84,7 +154,14 @@ int pdsemu_request(struct pds_state *p, const struct pds_client *c, const uint8_
 	uint32_t tn = sn - 7 < ml ? sn - 7 : ml;
 	uint16_t l = 0;
 	const uint8_t *v;
+	static char w[96];
 	switch (msg) {
+	case PDS_RESET:		/* the kernel's policy answers it; locationd starts over (it clears both tracking states) */
+		state_reset(p);
+		p->nreset++;
+		if (c && c->valid)
+			p->client = *c;
+		return 0;
 	case PDS_EVENT_REPORT:
 		ok(a, "SET_EVENT_REPORT: noted");
 		for (unsigned t = 0x10; t < 0x30; t++)
@@ -92,18 +169,26 @@ int pdsemu_request(struct pds_state *p, const struct pds_client *c, const uint8_
 				p->evmask |= 1u << (t - 0x10);
 		break;
 	case PDS_GET_SVC_STATE:
-		ok(a, "GET_GPS_SERVICE_STATE: from the bridge's state");
+		snprintf(w, sizeof(w), "GET_GPS_SERVICE_STATE: service %u, tracking %u", (unsigned)(p->svc_on != 0),
+			 (unsigned)pdsemu_tracking(p));
+		ok(a, w);
 		a->tl[0] = 0x01;
 		a->tl[1] = 2;
 		a->tl[2] = 0;
 		a->tl[3] = (uint8_t)(p->svc_on != 0);
-		a->tl[4] = p->auto_on && p->svc_on ? 2 : 1;	/* tracking session: 1 inactive, 2 active */
+		a->tl[4] = pdsemu_tracking(p);	/* tracking session: 1 inactive, 2 active (locationd's fQueriedTrackingState) */
 		a->tn = 5;
 		break;
 	case PDS_SET_SVC_STATE:
-		ok(a, "SET_GPS_SERVICE_STATE: noted");
-		if ((v = find(tl, tn, 0x01, &l)) && l >= 1)
-			p->svc_on = v[0] != 0;
+		if ((v = find(tl, tn, 0x01, &l)) && l >= 1) {
+			int on = v[0] != 0;
+			if (on != p->svc_on)
+				p->ind_dirty = 1;
+			p->svc_on = on;
+		}
+		snprintf(w, sizeof(w), "SET_GPS_SERVICE_STATE %u: noted (tracking stays %u)", (unsigned)p->svc_on,
+			 (unsigned)pdsemu_tracking(p));
+		ok(a, w);
 		break;
 	case PDS_GET_DEF_TRACKING: {
 		ok(a, "GET_DEFAULT_TRACKING_SESSION: last set values");
@@ -136,11 +221,16 @@ int pdsemu_request(struct pds_state *p, const struct pds_client *c, const uint8_
 		a->tn = 4;
 		break;
 	case PDS_SET_AUTO_TRACKING:
-		ok(a, "SET_AUTO_TRACKING_STATE: starts/stops the LOC session");
 		if ((v = find(tl, tn, 0x01, &l)) && l >= 1) {
 			p->auto_on = v[0] != 0;
 			p->cancelled = 0;
+			p->ind_dirty = 1;	/* a modem answers every auto tracking change with GPS_SERVICE_STATE_IND */
+			if (p->auto_on)
+				p->auto_gen++;
 		}
+		snprintf(w, sizeof(w), "SET_AUTO_TRACKING_STATE %u: tracking %u, LOC session %s", (unsigned)p->auto_on,
+			 (unsigned)pdsemu_tracking(p), p->auto_on ? "wanted" : "not wanted");
+		ok(a, w);
 		break;
 	case PDS_CANCEL_SESSION:
 		ok(a, "CANCEL_ONGOING_SESSION: stops the LOC session");
@@ -166,7 +256,7 @@ int pdsemu_want_session(const struct pds_state *p, uint32_t *interval_ms)
 		i = 60000;
 	if (interval_ms)
 		*interval_ms = i;
-	return p->auto_on && p->svc_on && !p->cancelled && p->client.valid;
+	return p->auto_on && !p->cancelled && p->client.valid;	/* service state OFF is locationd's normal state */
 }
 
 void pdsemu_client_gone(struct pds_state *p, uint32_t pipe, uint32_t sess)

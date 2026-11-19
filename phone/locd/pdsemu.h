@@ -12,7 +12,12 @@
 #define PDS_SVC			0x06
 #define PDS_RESET		0x0000
 #define PDS_EVENT_REPORT	0x0001	/* request SET_EVENT_REPORT and indication EVENT_REPORT_IND */
-#define PDS_GET_SVC_STATE	0x0020
+#define PDS_GET_SVC_STATE	0x0020	/* request GET_GPS_SERVICE_STATE and indication GPS_SERVICE_STATE_IND */
+#define PDS_SVC_STATE_IND	0x0020
+#define PDS_TRK_INACTIVE	1		/* qmi::pds::TrackingState (locationd unpackGpsServiceStateInd: 1 or 2) */
+#define PDS_TRK_ACTIVE		2
+#define PDS_STATUS_FAILURE	2		/* EVENT_REPORT TLV 0x12 session status */
+#define PDS_STATUS_ENGINE_LOCKED 7
 #define PDS_SET_SVC_STATE	0x0021
 #define PDS_GET_DEF_TRACKING	0x0029
 #define PDS_SET_DEF_TRACKING	0x002a
@@ -86,6 +91,11 @@ struct pds_state {
 	uint32_t evmask;		/* SET_EVENT_REPORT TLVs seen (bit = TLV id - 0x10) */
 	struct pds_client client;
 	unsigned nreq, nfix, nind;
+	/* ws-gnss-pdsfix: GPS_SERVICE_STATE_IND bookkeeping (locationd's fReportedTrackingState comes only from it) */
+	uint8_t ind_svc, ind_trk;	/* the last state indicated (or the state after init/RESET: nothing to say) */
+	int ind_dirty;			/* a SET_AUTO_TRACKING_STATE / service state change wants an indication */
+	unsigned auto_gen;		/* SET_AUTO_TRACKING_STATE 1 count (a new locationd start) */
+	unsigned nreset;
 };
 
 void pdsemu_init(struct pds_state *p);
@@ -95,6 +105,14 @@ int pdsemu_request(struct pds_state *p, const struct pds_client *c, const uint8_
 /* 1 = a LOC session should run now; *interval_ms = the fix interval */
 int pdsemu_want_session(const struct pds_state *p, uint32_t *interval_ms);
 void pdsemu_client_gone(struct pds_state *p, uint32_t pipe, uint32_t sess);
+/* ws-gnss-pdsfix: the tracking state locationd must see (GET answer and indication): 2 while auto tracking is on */
+uint8_t pdsemu_tracking(const struct pds_state *p);
+/* TLVs of a pending GPS_SERVICE_STATE_IND (0x01 {u8 service enabled, u8 tracking state}); 0 = nothing pending.
+ * *svc / *trk = the values in it; call pdsemu_state_ind_sent() once the indication went out. */
+uint32_t pdsemu_state_ind(const struct pds_state *p, uint8_t *out, uint32_t room, uint8_t *svc, uint8_t *trk);
+void pdsemu_state_ind_sent(struct pds_state *p, uint8_t svc, uint8_t trk);
+/* EVENT_REPORT with only TLV 0x12 session status (a refused/failed LOC session, no position) */
+uint32_t pdsemu_session_status(uint8_t status, uint8_t *out, uint32_t room);
 
 /* LOC POSITION_REPORT_IND TLV area -> loc_fix; 0 ok */
 int loc_parse_position(const uint8_t *tl, uint32_t tn, struct loc_fix *f);

@@ -25,6 +25,7 @@ uint64_t link_ms(void) { return t; }
 static uint16_t sent_id[64], sent_txn[64];
 static int nsent;
 static struct pdsr rel[64];
+static uint8_t rel_data[64][32];
 static int nrel;
 int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *p, uint32_t len)
 {
@@ -32,7 +33,9 @@ int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_
 	if (dst_port == PDSR_KPORT) {
 		if (src_port != PDSR_WPORT || dst_node != QRTR_NODE_APPS || type != QRTR_TYPE_DATA || len < sizeof(struct pdsr))
 			printf("FAIL bad relay packet\n"), exit(1);
-		memcpy(&rel[nrel++ % 64], b, sizeof(struct pdsr));
+		memcpy(&rel[nrel % 64], b, sizeof(struct pdsr));
+		memcpy(rel_data[nrel % 64], b + sizeof(struct pdsr), len - sizeof(struct pdsr) < 32 ? len - sizeof(struct pdsr) : 32);
+		nrel++;
 		return 0;
 	}
 	sent_txn[nsent] = (uint16_t)(b[1] | b[2] << 8);
@@ -80,7 +83,7 @@ int main(void)
 	loc_server(0x10, 2, 0, 0x57);
 	/* no kernel router: pds=1 sends nothing to the relay */
 	loc_fake_kernel_router = 0;
-	wordfile("pds=1\n");
+	wordfile("pds=1 pdsform=raw\n");
 	tick(10);
 	CHECK(nrel == 0);
 	/* kernel router: HELLO */
@@ -91,9 +94,13 @@ int main(void)
 	kin(0x84, 0, 1, 0, NULL, 0);		/* kern.sweet_qmux_pds 1 */
 	/* a request pdsemu answers, and one it does not */
 	req(0x0031, 1, 7);
-	CHECK(nrel == 2 && rel[1].op == 2 && rel[1].tag == 7 && rel[1].flags == 1 && rel[1].cid == 4);
+	CHECK(nrel == 3 && rel[1].op == 2 && rel[1].tag == 7 && rel[1].flags == 1 && rel[1].cid == 4);
+	/* ws-gnss-pdsfix: then GPS_SERVICE_STATE_IND {service 1, tracking 2} to the same client */
+	CHECK(rel[2].op == 3 && rel[2].code == 0x0020 && rel[2].cid == 4 && rel[2].pipe == 1 && rel[2].sess == 9 &&
+	      rel[2].len == 5 && !memcmp(rel_data[2], "\x01\x02\x00\x01\x02", 5));
+	tick(10); CHECK(nrel == 3);		/* once */
 	req(0x5557, -1, 8);
-	CHECK(nrel == 3 && rel[2].op == 2 && rel[2].tag == 8 && (rel[2].flags & 1) == 0);
+	CHECK(nrel == 4 && rel[3].op == 2 && rel[3].tag == 8 && (rel[3].flags & 1) == 0);
 	/* the LOC session starts (client revision, REG_EVENTS, START) */
 	tick(10); respond(); tick(10); respond(); tick(10); CHECK(sent_id[nsent - 1] == LOC_START);
 	respond(); tick(10);
