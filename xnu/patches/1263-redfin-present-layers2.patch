@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DenialOfGravity <DenialOfGravity@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0100
+Subject: [PATCH] redfin 1263: 1262's composite, premultiplied blend and statistics
+
+kern.sweet_present_layers bit 1 (0x2): the layers above layer 0 are blended as premultiplied colour (CA's surfaces
+are): RB_A2D_PIXEL_CNTL colour factors ONE, ONE_MINUS_SRC_ALPHA instead of SRC_ALPHA, ONE_MINUS_SRC_ALPHA (field
+layout from Mesa's a6xx.xml; the 2D engine does it, no shader pass). Without it soft edges came out dark (alpha
+applied twice). The corner mattes keep the old mode (black: the same either way).
+The 5 s layers line gains the composites' own GPU time (a6_submit_time), queue->fence time and the composites put off
+for an unlatched flip / a busy IB slot.
+
+---
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 9ef0cd5..7f144ff 100644
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1809,8 +1809,13 @@ uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *d
+ 	EV(EV_CACHE_INVALIDATE);
+ 	dw[n++] = a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0);
+ 
+-	/* Blend: colour src * SRC_ALPHA + dst * ONE_MINUS_SRC_ALPHA, alpha src + dst * (1 - src alpha). */
+-	REG(0x8c01, b->blend ? 0x3809c181 : 0);	/* RB_A2D_PIXEL_CNTL */
++	/*
++	 * Blend: colour src * SRC_ALPHA + dst * ONE_MINUS_SRC_ALPHA, alpha src + dst * (1 - src alpha). RB_A2D_PIXEL_CNTL
++	 * (Mesa a6xx.xml): PIXEL_OP 1:0 (1 blending), COLOR_SRC_FACTOR 10:6, COLOR_BLEND_OP 13:11, COLOR_DST_FACTOR 18:14,
++	 * ALPHA_SRC_FACTOR 23:19, ALPHA_BLEND_OP 26:24, ALPHA_DST_FACTOR 31:27; factors ONE 1, SRC_ALPHA 6,
++	 * ONE_MINUS_SRC_ALPHA 7, op ADD 0. 1263 premul: colour src * ONE (CA's surfaces are premultiplied).
++	 */
++	REG(0x8c01, !b->blend ? 0 : b->premul ? 0x3809c041 : 0x3809c181);	/* RB_A2D_PIXEL_CNTL */
+ 	uint32_t cntl = 0x00f03000 | (b->clip ? 1u << 16 : 0);
+ 	REG(0x8c00, cntl);		/* RB_A2D_BLT_CNTL: 8888 UNORM, mask f, SCISSOR */
+ 	REG(0x8400, cntl);		/* GRAS_A2D_BLT_CNTL */
+diff --git a/bsd/dev/sweet_a6xx.h b/bsd/dev/sweet_a6xx.h
+index a591e57..b11d1e7 100644
+--- a/bsd/dev/sweet_a6xx.h
++++ b/bsd/dev/sweet_a6xx.h
+@@ -189,6 +189,7 @@ struct a6_blit {
+ 	uint32_t dx, dy, dw, dh;		/* destination rectangle */
+ 	bool filter;				/* bilinear */
+ 	bool blend;				/* source-over alpha blend */
++	bool premul;				/* 1263: with blend, the source is premultiplied: ONE, ONE_MINUS_SRC_ALPHA */
+ 	bool clip;				/* write only inside the scissor: */
+ 	uint32_t cx0, cy0, cx1, cy1;		/* destination, inclusive */
+ };
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index aca85d9..4bbf449 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1390,6 +1390,7 @@ static int present_wait_locked(uint32_t k, const char *why);
+ #define SLOTS           8
+ extern uint32_t sweet_present_layers;
+ #define SLOTS_LIVE      (sweet_present_layers ? SLOTS : 4)
++#define SWEET_LAYERS_PREMUL     0x2     /* 1263: kern.sweet_present_layers bit 1: blend premultiplied (CA's surfaces) */
+ #define SLOT_IOVA(n)    (0x100000000ULL + 0x1000000ULL * (n))
+ #define SLOT_MAX        0x1000000ULL
+ #define SLOT_PAGES      1024
+@@ -1451,6 +1452,14 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
+ static uint32_t present_fence[2];      /* of the present last queued from each IB slot */
+ static uint32_t present_next;
+ static uint32_t stat_busy;	/* 0158: presents put off a tick (slot still queued) */
++/*
++ * 1263: composite statistics (kern.sweet_present_layers): which present each IB slot holds (1 = a composite), and per
++ * 5 s window the composites landed, their GPU time (a6_submit_time: the IB's own run, not the wait behind CA's render
++ * work), queue->fence time, and the composites put off because the last flip had not latched or the IB slot was busy.
++ */
++static uint8_t present_kind[2];
++static uint64_t lay_gpu_ticks, lay_land_abs;
++static uint32_t lay_landed, lay_flipwait, lay_slotbusy;
+ 
+ /* With sweet_gpu_lock: the present from IB slot k has landed (or the GPU was reset). 0, or -1 if reset. */
+ static int
+@@ -1484,6 +1493,11 @@ present_landed_locked(uint64_t now)
+ 	for (uint32_t k = 0; k < 2; k++) {
+ 		if (present_queued_abs[k] && (!present_fence[k] || a6_fence_done(&gpu, present_fence[k]))) {
+ 			present_land_abs += now - present_queued_abs[k];
++			if (present_kind[k] == 1 && present_fence[k]) {        /* 1263 */
++				lay_gpu_ticks += a6_submit_time(&gpu, present_fence[k]);
++				lay_land_abs += now - present_queued_abs[k];
++				lay_landed++;
++			}
+ 			present_land_n++;
+ 			present_queued_abs[k] = 0;
+ 			if (present_swap_abs[k] != 0 && now > present_swap_abs[k]) {	/* 0946 */
+@@ -1617,7 +1631,7 @@ display_mask_build(uint32_t r, uint32_t ext)
+  * back still queued, or put off), -1 failed.
+  */
+ static int
+-present_submit_unlock(uint32_t *ib, uint32_t n, uint64_t t0, uint64_t t1)
++present_submit_unlock(uint32_t *ib, uint32_t n, uint64_t t0, uint64_t t1, uint32_t kind)
+ {
+ 	/*
+ 	 * Not waited for: the vsync timer must not block behind the Metal clients' work queued ahead of it
+@@ -1640,6 +1654,7 @@ present_submit_unlock(uint32_t *ib, uint32_t n, uint64_t t0, uint64_t t1)
+ 			return -1;
+ 		}
+ 		stat_busy++;
++		lay_slotbusy += kind == 1;      /* 1263 */
+ 		lck_mtx_unlock(&sweet_gpu_lock);
+ 		return 1;
+ 	}
+@@ -1651,6 +1666,7 @@ present_submit_unlock(uint32_t *ib, uint32_t n, uint64_t t0, uint64_t t1)
+ 		gpu_owner_locked(present_fence[k], 0);
+ 		present_queued_abs[k] = present_fence[k] ? mach_absolute_time() : 0;	/* 0943 */
+ 		present_swap_abs[k] = present_fence[k] ? present_tag : 0;	/* 0946 */
++		present_kind[k] = (uint8_t)kind;        /* 1263 */
+ 		rc = present_fence[k] ? 0 : -1;
+ 		present_next++;
+ 		if (fb_flip > 0 && present_fence[k]) {
+@@ -1808,7 +1824,7 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	} else {
+ 		n = a6_blit_ib(&gpu, &frame, ib);
+ 	}
+-	int rc = present_submit_unlock(ib, n, t0, t1);
++	int rc = present_submit_unlock(ib, n, t0, t1, 0);
+ 	if (rc == 1) {
+ 		return 1;
+ 	}
+@@ -1819,6 +1835,30 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
+ 	return rc;
+ }
+ 
++/*
++ * 1263: the composite statistics since the last call (SweetFramebuffer's 5 s layers line): composites landed, their
++ * mean GPU time and queue->fence time (us), composites put off for an unlatched flip / a busy IB slot.
++ */
++void sweet_gpu_layers_stats(uint32_t *landed, uint32_t *gpu_us, uint32_t *land_us, uint32_t *flipwait, uint32_t *slotbusy);
++void
++sweet_gpu_layers_stats(uint32_t *landed, uint32_t *gpu_us, uint32_t *land_us, uint32_t *flipwait, uint32_t *slotbusy)
++{
++	*landed = *gpu_us = *land_us = *flipwait = *slotbusy = 0;
++	if (!gpu_ready || !lck_mtx_try_lock(&sweet_gpu_lock)) {
++		return;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(lay_land_abs, &ns);
++	*landed = lay_landed;
++	*gpu_us = lay_landed ? (uint32_t)(lay_gpu_ticks * 10 / 192 / lay_landed) : 0;
++	*land_us = lay_landed ? (uint32_t)(ns / 1000 / lay_landed) : 0;
++	*flipwait = lay_flipwait;
++	*slotbusy = lay_slotbusy;
++	lay_gpu_ticks = lay_land_abs = 0;
++	lay_landed = lay_flipwait = lay_slotbusy = 0;
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ /*
+  * 1262: one swap of several layers (kern.sweet_present_layers, SweetFramebuffer.cpp), composited by the 2D engine into
+  * the panel buffer that is not on screen, as Apple's display driver composites a swap's layers in hardware: layer 0
+@@ -1870,6 +1910,7 @@ sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t
+ 	flip_poll_locked();
+ 	if (!flip_latched_locked()) {
+ 		stat_busy++;
++		lay_flipwait++;         /* 1263 */
+ 		lck_mtx_unlock(&sweet_gpu_lock);
+ 		return 1;
+ 	}
+@@ -1883,6 +1924,7 @@ sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t
+ 			.dst_iova = fb_gva, .dst_pitch = fb_pitch,
+ 			.dx = l->dx, .dy = l->dy, .dw = l->dw, .dh = l->dh,
+ 			.filter = true, .blend = l->blend != 0,
++			.premul = (sweet_present_layers & SWEET_LAYERS_PREMUL) != 0,     /* 1263 */
+ 		};
+ 		n += a6_blit_ib(&gpu, &b, ib + n);
+ 	}
+@@ -1904,7 +1946,7 @@ sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t
+ 			n += a6_blit_ib(&gpu, &matte, ib + n);
+ 		}
+ 	}
+-	return present_submit_unlock(ib, n, t0, t1);
++	return present_submit_unlock(ib, n, t0, t1, 1);
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5704379..a5bced9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -59,6 +59,7 @@ struct sweet_gpu_layer {
+ 	uint32_t  blend;
+ };
+ int sweet_gpu_present_layers(const struct sweet_gpu_layer *ly, uint32_t nl, uint32_t fb_pitch, uint32_t corner_radius);
++void sweet_gpu_layers_stats(uint32_t *landed, uint32_t *gpu_us, uint32_t *land_us, uint32_t *flipwait, uint32_t *slotbusy);
+ void sweet_gpu_flip_poll(void);         /* 0905: sweetfbflip=1 */
+ void sweet_gpu_scanout_front(void);
+ bool sweet_gpu_present_poll(void);      /* 0943: a present's blit still out (polls its fence) */
+@@ -2214,8 +2215,11 @@ AppleCLCD::statLine(uint64_t now)
+ 		bzero(sweet_lay_st, sizeof(sweet_lay_st));
+ 		IOLockUnlock(fLock);
+ 		if (sweet_present_layers || ls[0] + ls[1] + ls[3] + ls[4] != 0) {
+-			IOLog("SWEET FB: 5s layers (1262): completed %u | composited %u (layers %u) failed %u busy %u | layers %u\n",
+-			    ls[0], ls[1], ls[2], ls[3], ls[4], sweet_present_layers);
++			uint32_t gl, gus, lus, fw, sb;
++			sweet_gpu_layers_stats(&gl, &gus, &lus, &fw, &sb);    /* 1263 */
++			IOLog("SWEET FB: 5s layers (1262): completed %u | composited %u (layers %u) failed %u busy %u | layers %#x | "
++			    "1263: landed %u gpu %u us fence %u us | busy flip %u slot %u\n",
++			    ls[0], ls[1], ls[2], ls[3], ls[4], sweet_present_layers, gl, gus, lus, fw, sb);
+ 		}
+ 	}
+ 	if (sweet_fb_early_retire || erAcc || erBusy || erKick) {
