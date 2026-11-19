@@ -689,13 +689,13 @@ owner = "0:0"
 
 [[file]]
 path = "/var/local/bin/wland"
-source = "builds/userland/ws-n-wland-int5-f0602dcaad/wland"
-sha256 = "291a65b8f3b5ffca3e3ea4894c6334ac66e6d9fe6ccabc4470ab28f997498cd7"
+source = "builds/userland/ws-mpss-lpm-4189d6e2bc/wland"
+sha256 = "14df8169539b2c1905304dd1f77e9fd51885446f6347277a37029e508ac4f22e"
 mode = "755"
 owner = "0:0"
 target = "userland"
-ref = "ws-n-wland-int5"
-sha = "f0602dcaad"
+ref = "ws-mpss-lpm"
+sha = "4189d6e2bc"
 restart = "wland"
 
 [[file]]
@@ -1188,7 +1188,7 @@ restart = "wland"
 [[flag]]
 path = "/var/local/cell.on"
 content = """
-slots=1 pin=1 online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=1 gsistart=p2late p2irq=1 p2irqm=63 p2join=40 p2noaggr=1 p2route=16 ipatbl=1 ipanotif=1 p2early=1 qmapv5=1 x1keep=1 cellroute=1 wdaps=1 p2keep=3 p2keepidle=120 pdmapadsp=1
+slots=1 pin=1 online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=1 gsistart=p2late p2irq=1 p2irqm=63 p2join=40 p2noaggr=1 p2route=16 ipatbl=1 ipanotif=1 p2early=1 qmapv5=1 x1keep=1 cellroute=1 wdaps=1 p2keep=3 p2keepidle=120 pdmapadsp=1 ipaqtime=1
 
 
 
@@ -1196,7 +1196,7 @@ slots=1 pin=1 online=1 wds=1 datatest=1 apn=sl2sfr ipa=1 x1hold=1 ipadata=1 gsis
 """
 mode = "644"
 restart = "wland"
-note = "pin=1 turns on wland's SIM PIN socket (cell.c) for /var/local/bin/simpin; the PIN itself is never in a file"
+note = "2026-11-19 ipaqtime=1 (wland ws-mpss-lpm 4189d6e): IPA qtime/timer init as Android ipa_cfg_qtime(); without it the modem cannot tear down a data call that moved traffic -> WDS 0x21 unanswered -> npaschedule/AOSS RSC modem crash on airplane mode, cellular data off or baseband reset. pin=1 turns on wland's SIM PIN socket (cell.c) for /var/local/bin/simpin; the PIN itself is never in a file"
 
 [[flag]]
 path = "/var/local/hmetal/ca/env"
