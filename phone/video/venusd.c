@@ -108,6 +108,11 @@ static uint64_t phys = 0xa2600000ull, buf_mb = 160;	/* redfin: queues 0xa2600000
 static uint32_t debug = 0x18, in_min = 1024u << 10;
 static unsigned idle_s = 60, nsess, idle_cl_s = 30;	/* idle_cl_s: VENUSD_IDLE_CLIENT_S (vdleak) */
 static double idle_since, t_open, t_first, t_last_frame, t_eos, t_prog;
+/* venus-hw: Linux's power collapse (msm_vidc venus_hfi_pm_handler): VENUSD_PC_MS (default 1500, 0 = off) after the
+ * last session the core is collapsed (venusctl suspend: PC_PREP, TZ suspend, power off; the image stays), and the next
+ * OPEN resumes it (no PIL reload). The full down (PAS shutdown) still follows after VENUSD_IDLE_S. */
+static int pc_down;
+static unsigned pc_ms = 1500;
 static uint32_t sent, hint_w, hint_h;
 static unsigned last_acts;
 static uint8_t *au;
@@ -488,6 +493,11 @@ static void down(const char *why)
 	if (fault)
 		return;
 	note("venusd: Venus down (%s)", why);
+	if (pc_down) {	/* collapsed: the PAS shutdown wants the core powered and the firmware awake */
+		if (resume_cmd())
+			note("venusd: resume before the shutdown failed, going on");
+		pc_down = 0;
+	}
 	if (shutdown_cmd()) {
 		fault = 1;
 		note("venusd: shutdown FAILED: no power off (the firmware may still run): LEFT POWERED, reboot needed");
@@ -635,6 +645,18 @@ static void do_open(int i, const struct venusd_msg *m)
 		rc = -EIO, printf("venusd: OPEN refused: Venus was left powered after a failed shutdown (reboot)\n");
 	else if (!up && up_for(i))
 		rc = -EIO;
+	else if (up && pc_down) {
+		double t0 = mono();
+		if (resume_cmd()) {
+			rc = -EIO;
+			note("venusd: resume from power collapse FAILED: Venus down");
+			pc_down = 0;
+			down("resume failed");
+		} else {
+			pc_down = 0;
+			note("venusd: resumed from power collapse in %.0f ms", 1e3 * (mono() - t0));
+		}
+	}
 	if (!rc) {
 		owner = i;
 		sess = S_OPEN;
@@ -1021,6 +1043,8 @@ int main(int argc, char **argv)
 		stdout = stderr = lf;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	vc_quiet = !(getenv("VENUSD_VERBOSE") && atoi(getenv("VENUSD_VERBOSE")));
+	if (getenv("VENUSD_PC_MS"))
+		pc_ms = (unsigned)atoi(getenv("VENUSD_PC_MS"));
 	if (getenv("VENUSD_IDLE_S"))
 		idle_s = (unsigned)atoi(getenv("VENUSD_IDLE_S"));
 	if (getenv("VENUSD_PHYS"))
@@ -1153,6 +1177,12 @@ int main(int argc, char **argv)
 				snprintf(why, sizeof why, "idle %u s, %s", idle_cl_s, i == owner ? sname[sess] : "no session");
 				drop_client(i, why);
 			}
+		if (up && !pc_down && !fault && owner < 0 && pc_ms && mono() - idle_since > pc_ms / 1e3) {
+			if (suspend_cmd())
+				note("venusd: power collapse failed (core left on)");
+			else
+				pc_down = 1, note("venusd: power collapse after %u ms idle", pc_ms);
+		}
 		if (up && owner < 0 && mono() - idle_since > idle_s)
 			down("idle");
 		if (!fstat(logfd, &sb) && sb.st_size > LOG_MAX && !ftruncate(logfd, 0))
