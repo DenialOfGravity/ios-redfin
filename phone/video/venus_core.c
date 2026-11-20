@@ -49,6 +49,7 @@
 #include "venus_core.h"
 #include "venus_rails.h"	/* P0c */
 #include "venus_hevc.h"
+#include "venus_vmmu.h"	/* venus-iommu: VENUSCTL_VMMU=1 */
 
 #define GCC		0x00100000u
 #define GCC_VIDEO_AHB	(GCC + 0xb004)	/* gcc_video_ahb_clk, GDSC parent (notes table "GDSC parent clock") */
@@ -2809,6 +2810,9 @@ static uint32_t align_up(uint32_t v, uint32_t a)
 /* /dev/pmem on the fixed region: 32-bit aligned, 64 KB per call as init's zeroing */
 static int big_io(uint64_t pa, void *buf, size_t len, int write)
 {
+	int vr = vmmu_io(pa, buf, len, write);	/* venus-iommu: a /dev/vmmu buffer: memcpy + cache maintenance */
+	if (vr)
+		return vr < 0 ? -1 : 0;
 	for (size_t o = 0; o < len; o += 0x10000) {
 		size_t n = len - o < 0x10000 ? len - o : 0x10000;
 		if (write ? pm_wr(pa + o, (uint8_t *)buf + o, n) : pm_rd(pa + o, (uint8_t *)buf + o, n))
@@ -2821,6 +2825,13 @@ static int big_io(uint64_t pa, void *buf, size_t len, int write)
 static uint32_t balloc(uint32_t size, const char *what)
 {
 	static uint8_t zeros[0x10000];
+	if (vmmu_active()) {	/* venus-iommu: ordinary memory mapped into the Venus bank, no window limit */
+		uint32_t v = vmmu_alloc(size, what);
+		if (!v)
+			printf("venus: STOP: %s: %#x bytes: no vmmu buffer\n", what, size);
+		pm_step("vmmu alloc %s %#x size %#x", what, v, size);
+		return v;
+	}
 	uint64_t a = (dc.top + 0xfff) & ~0xfffull;
 	size = align_up(size, 0x1000);
 	if (!size || a + size > dc.lim) {
@@ -2959,6 +2970,17 @@ static int place_io(uint64_t pa, const struct vdec_dest *d)
 	int whole = !dc.cx && d->ybpr == st && d->cbpr == st;
 	if (whole)
 		return big_io(y0, d->y, (size_t)dc.ch * st, 0) || big_io(c0, d->c, crows * st, 0) ? -1 : 0;
+	size_t span = (size_t)(c0 - pa) + crows * st;
+	const uint8_t *cpu = vmmu_cpu(pa, span);	/* venus-iommu: one invalidate, then rows from cached memory */
+	if (cpu) {
+		if (vmmu_sync(pa, span, 2))
+			return -1;
+		for (size_t r = 0; r < (size_t)dc.ch; r++)
+			memcpy(d->y + r * d->ybpr, cpu + (y0 - pa) + r * st, w);
+		for (size_t r = 0; r < crows; r++)
+			memcpy(d->c + r * d->cbpr, cpu + (c0 - pa) + r * st, w);
+		return 0;
+	}
 	for (size_t r = 0; r < (size_t)dc.ch; r++)
 		if (pm_rd(y0 + r * st, d->y + r * d->ybpr, w))
 			return -1;
@@ -3192,8 +3214,20 @@ static int alloc_outputs(int count)
 	if (set_prop(P_BUF_COUNT, dc.split ? B_OUTPUT2 : B_OUTPUT, (uint32_t)n, (uint32_t)n, 3, "output count"))
 		return -1;
 	dc.nopb = 0;
+	/* venus-iommu: VENUSCTL_DEC_SURF=1 (with VENUSCTL_VMMU=1): every picture buffer is an NV12 IOSurface in the
+	 * firmware's layout (stride, CbCr at stride * scanlines) mapped by id: decoded pictures land in surfaces
+	 * CoreVideo/CoreAnimation can take as they are (zero-copy output) */
+	int dsurf = vmmu_active() && getenv("VENUSCTL_DEC_SURF") && atoi(getenv("VENUSCTL_DEC_SURF"));
 	for (int i = 0; i < n; i++) {
-		uint32_t pa = balloc(sz, "output");
+		uint32_t pa, sid = 0;
+		void *sref = NULL;
+		if (dsurf) {
+			pa = vmmu_new_surface((uint32_t)dc.w, (uint32_t)dc.h, dc.ystride, dc.yscan, sz, &sid, &sref);
+			if (pa && i == 0)
+				printf("venus: output buffers = IOSurfaces (%d, first id %u at IOVA %#x, %ux%u stride %u scanlines %u)"
+				       "\n", n, sid, pa, dc.w, dc.h, dc.ystride, dc.yscan);
+		} else
+			pa = balloc(sz, "output");
 		if (!pa)
 			return -1;
 		dc.opb[dc.nopb++] = (struct vbuf){ pa, sz, 0 };
@@ -3348,6 +3382,76 @@ static int dec_close(int started)
 	return bad;
 }
 
+/* venus-iommu CVP test (VENUSCTL_NP_ASSIGN=1): window memory hyp-assigned to VMID_CP_NON_PIXEL as stock's ION secure
+ * heap does for the encoder's persist buffer (secure_buffer.c hyp_assign_table: SCM svc MP 0x0c cmd 0x16, 7 args,
+ * args 3.. in a buffer at x5; lists: {u64 addr, u64 size}, u32 source VMIDs, {u32 vm, u32 perm, u64 ctx, u32 ctx_size}
+ * packed). Assigned back to HLOS at exit. */
+#define VMID_HLOS	3u
+#define VMID_CP_NP	0xbu
+static uint64_t np_pa, np_len, np_lists;
+static int np_assigned;
+static int hyp_assign(uint64_t pa, uint64_t len, uint32_t from, uint32_t to, uint32_t perm)
+{
+	uint8_t b[0x100];
+	memset(b, 0, sizeof(b));
+	uint64_t reg[2] = { pa, len };
+	uint32_t src = from;
+	uint8_t dst[20] = { 0 };
+	memcpy(dst, &to, 4);
+	memcpy(dst + 4, &perm, 4);
+	memcpy(b, reg, 16);		/* +0x00 region list */
+	memcpy(b + 0x40, &src, 4);	/* +0x40 source list */
+	memcpy(b + 0x80, dst, 20);	/* +0x80 dest list */
+	uint64_t ext[7] = { 4, np_lists + 0x80, 20, 0, 0, 0, 0 };	/* args 3..9 */
+	memcpy(b + 0xc0, ext, sizeof(ext));
+	if (pm_wr(np_lists, b, sizeof(b)))
+		return -1;
+	uint64_t x[8] = { 0x42000c16ull, 0x1117ull, np_lists, 16, np_lists + 0x40, np_lists + 0xc0, 0, 0 };
+	pm_smc(x);
+	printf("venus: hyp assign %#llx+%#llx VMID %#x -> %#x perm %#x: x0 %#llx x1 %#llx\n", (unsigned long long)pa,
+	       (unsigned long long)len, from, to, perm, (unsigned long long)x[0], (unsigned long long)x[1]);
+	pm_step("hyp assign %#llx -> vmid %#x: %#llx", (unsigned long long)pa, to, (unsigned long long)x[0]);
+	return x[0] ? -1 : 0;
+}
+static void np_unassign(void)
+{
+	if (np_assigned && !hyp_assign(np_pa, np_len, VMID_CP_NP, VMID_HLOS, 7))
+		np_assigned = 0;
+}
+/* persist for the CVP test: window memory (bump allocator, not zeroed again), assigned to CP_NON_PIXEL, mapped at
+ * the non-pixel IOVA. Device address or 0 */
+uint32_t np_persist(uint32_t size, uint32_t iova)
+{
+	uint64_t a = (dc.top + 0xffff) & ~0xffffull, len = (size + 0xffffu) & ~0xffffull;
+	if (a + len + 0x1000 > dc.lim)
+		return 0;
+	static uint8_t z[0x10000];
+	for (uint64_t o = 0; o < len; o += sizeof(z))
+		if (pm_wr(a + o, z, sizeof(z)))
+			return 0;
+	np_lists = a + len;
+	dc.top = np_lists + 0x1000;
+	np_pa = a;
+	np_len = len;
+	if (hyp_assign(a, len, VMID_HLOS, VMID_CP_NP, 6))
+		return 0;
+	np_assigned = 1;
+	atexit(np_unassign);
+	return vmmu_map_phys(a, (uint32_t)len, iova, "persist (CP non-pixel)");
+}
+
+/* venus-iommu CVP test (VENUSCTL_NP_SMR=1): the extra non-pixel SMR, released when this process exits */
+static struct smmu_saved np_saved;
+static int np_on;
+static void np_release(void)
+{
+	if (!np_on)
+		return;
+	smmu_last = np_saved;
+	smmu_release("venus non-pixel");
+	np_on = 0;
+}
+
 /* 4a: decode's session in steps. prepare: SYS_INIT/debug config (sys_up), buffer window, layout from the SPS */
 int vdec_prepare(uint32_t debug, uint64_t bufphys, uint64_t mb, int want, const struct h264_sps *sps, int hevc)
 {
@@ -3366,6 +3470,30 @@ int vdec_prepare(uint32_t debug, uint64_t bufphys, uint64_t mb, int want, const 
 	struct vstate v;
 	if (sys_up(&v, debug, "before decode"))
 		return 1;
+	vmmu_reset("new session");	/* venus-iommu: the last session's buffers (the bump allocator restarts too) */
+	if (vmmu_want() && !vmmu_active()) {
+		int k = 0;
+		for (int i = 0; i < v.nsmr; i++)
+			if (v.sid[i] == 0x1360)
+				k = i;
+		if (!v.nsmr || vmmu_attach(v.smr[k].cb, SMMU_TBL)) {
+			printf("venus: refused: VENUSCTL_VMMU=1 but /dev/vmmu could not attach to the window bank\n");
+			return 1;
+		}
+	}
+	if (vmmu_active() && getenv("VENUSCTL_NP_SMR") && atoi(getenv("VENUSCTL_NP_SMR")) && !np_on) {
+		/* venus-iommu CVP test: stock's venus_sec_non_pixel streams (0x1304/0xe0) into the same bank */
+		int k = 0;
+		for (int i = 0; i < v.nsmr; i++)
+			if (v.sid[i] == 0x1360)
+				k = i;
+		if (smmu_add_smr("venus non-pixel", 0x1304, 0xe0, v.smr[k].cb, &v.smr[k], &np_saved)) {
+			printf("venus: refused: VENUSCTL_NP_SMR=1: no SMR for 0x1304/0xe0\n");
+			return 1;
+		}
+		np_on = 1;
+		atexit(np_release);
+	}
 	/* the buffer window: right after the queue block, 1 MB aligned, inside the free gap (range_ok) */
 	uint64_t base = bufphys ? bufphys : (v.qkind == 2 ? (v.q + QSHARED + SFR_SIZE + 0xfffff) & ~0xfffffull : 0);
 	if (!base) {
@@ -3535,7 +3663,7 @@ int vdec_etb(const uint8_t *au, uint32_t len, uint64_t ts, int eos, int n)
 			uint32_t k = len - o < sizeof(tmp) ? len - o : sizeof(tmp);
 			memset(tmp, 0, sizeof(tmp));
 			memcpy(tmp, au + o, k);
-			if (pm_wr(b->pa + o, tmp, align_up(k, 4)))
+			if (big_io(b->pa + o, tmp, align_up(k, 4), 1))
 				return -1;
 		}
 		fill = len;
@@ -3697,6 +3825,8 @@ int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t 
 	step_status(1);
 	printf("venus: decoded %d of %d frames%s%s in %.2f s\n", dc.frames, want, dc.eos ? ", EOS" : "",
 	       dc.err ? ", session error" : "", now_s() - t0);
+	if (vmmu_active())
+		vmmu_status("after decode");
 	if (dc.frames > 0)	/* v4a0: copy cost vs the decode itself (first to last frame) */
 		printf("venus: copy-out %d frames: mean %.2f ms, max %.2f ms (%zu bytes each); frame 0 -> %d: %.2f s = %.1f fps\n",
 		       dc.frames, 1e3 * dc.cp_sum / dc.frames, 1e3 * dc.cp_max,

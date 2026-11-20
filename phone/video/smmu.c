@@ -531,3 +531,41 @@ void smmu_dump(const char *name, uint32_t sid, uint64_t iova)
 	}
 	printf("smmu: %s %#x: no SMR\n", name, sid);
 }
+
+/* venus-iommu: one more SMR (SID + MASK) into an existing translating bank CB (no bank setup); saved for
+ * smmu_release (cbp/gr1 from BANK_SAVED, the bank registers as they are now, so releasing it leaves the shared bank
+ * as it is). 0 = ok. */
+int smmu_add_smr(const char *name, uint32_t sid, uint32_t mask, int cb, const struct smmu_saved *bank_saved,
+		 struct smmu_saved *saved)
+{
+	uint64_t s = SMMU_PA;
+	uint32_t nsmr = rd32(s + 0x20) & 0xff;
+	int slot = -1;
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i);
+		if ((smr >> 31) && sid_match(smr, sid, mask)) {
+			printf("smmu: %s: SMR%u %08x overlaps %#x/%#x: refused\n", name, i, smr, sid, mask);
+			return -1;
+		}
+		if (!(smr >> 31) && slot < 0)
+			slot = (int)i;
+	}
+	if (slot < 0) {
+		printf("smmu: %s: no free SMR\n", name);
+		return -1;
+	}
+	*saved = *bank_saved;	/* cbp, gr1, cb; the bank registers as they are NOW (a release leaves the bank on) */
+	saved->sctlr = rd32(bank_saved->cbp);
+	saved->cbar = rd32(bank_saved->gr1 + 4 * (uint32_t)cb);
+	saved->cba2r = rd32(bank_saved->gr1 + 0x800 + 4 * (uint32_t)cb);
+	saved->slot = slot;
+	saved->smr = rd32(s + 0x800 + 4 * slot);
+	saved->s2cr = rd32(s + 0xc00 + 4 * slot);
+	if (smmu_dry)
+		return 0;
+	wr32(s + 0xc00 + 4 * slot, (uint32_t)cb);
+	wr32(s + 0x800 + 4 * slot, 0x80000000u | (mask & 0x7fff) << 16 | (sid & 0x7fff));
+	printf("smmu: %s: SMR%d %08x S2CR %08x -> CB%d\n", name, slot, rd32(s + 0x800 + 4 * slot), rd32(s + 0xc00 + 4 * slot),
+	       cb);
+	return 0;
+}

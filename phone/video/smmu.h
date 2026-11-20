@@ -23,6 +23,8 @@ int smmu_window(const char *name, const uint16_t *sids, unsigned n, uint64_t bas
 void smmu_faults(const char *name, uint32_t sid);	/* FSR/FAR/FSYNR0 of the bank SID goes through */
 void smmu_status(const char *name, uint32_t sid);	/* sGFSR/sGFSYNR + smmu_faults, read-only */
 void smmu_dump(const char *name, uint32_t sid, uint64_t iova);	/* bank registers + table walk, read-only */
+int smmu_add_smr(const char *name, uint32_t sid, uint32_t mask, int cb, const struct smmu_saved *bank_saved,
+		 struct smmu_saved *saved);	/* venus-iommu: one more SMR into an existing bank */
 extern int smmu_dry;	/* 1: only report what would be written */
 extern uint64_t smmu_alias;	/* smmu_translate also maps IOVA | smmu_alias (default 3<<32) */
 

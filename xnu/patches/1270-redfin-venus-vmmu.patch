@@ -1,0 +1,899 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 19:45:00 +0000
+Subject: [PATCH] 1270 redfin: /dev/vmmu, page tables for the Venus SMMU bank
+ (zero-copy video buffers), kern.sweet_vmmu (default 0 = off)
+
+venus-iommu. Venus only sees the fixed 1057 window (IOVA = PA, 2 MB blocks) of the
+bank venusctl/venusd set up in userland; every frame is copied through /dev/pmem.
+/dev/vmmu (clone node, one minor per open) adds 4 KB page mappings of any memory
+to that bank: L1 slots 0-1 (IOVA 0-2 GB) point at kernel-owned L2/L3 tables
+(cached kernel pages, cleaned to PoC), the window (slot 2) stays userland's.
+VMMU_MAP pins a user range (IOMemoryDescriptor prepare, as BoImport) or retains
+an IOSurface by id (SweetSurface memory) or (flags bit 2) a physical range outside
+XNU RAM (window memory, e.g. hyp-assigned to a CP VM), maps it at a free IOVA in
+0x40000000-0x80000000 (or a fixed one from 0x01000000), TLBIASID + TLBSYNC.
+VMMU_UNMAP / client close: PTEs cleared, TLB flushed, then pages released.
+VMMU_SYNC: clean / clean+invalidate by physical page (Venus is not IO-coherent);
+every new mapping is cleaned+invalidated once (a fresh IOSurface is bzero'd through
+a cached kernel mapping: its dirty lines would later land on Venus output).
+VMMU_STATUS: maps, bytes, FSR fault bits/FAR/FSYNR0 + faulting SID (also logged once per
+new fault at every call). RW sysctl kern.sweet_vmmu: 0 (default) refuses ATTACH
+and MAP = today's behaviour; 1 on.
+
+Klog: "SWEET VMMU: /dev/vmmu ready", "attached to CBn ...", "client n closed:
+N mappings unmapped", "CBn fault FSR ... SID ...".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013SvAC4L8fevHSDuAPRVwdU
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 168bcf1..22d08e1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -127,6 +127,7 @@ bsd/dev/sweet_poke.c			standard
+ bsd/dev/sweet_files.c			standard
+ bsd/dev/sweet_passcode.c		standard
+ bsd/dev/sweet_pmem.c			standard
++bsd/dev/sweet_vmmu.c			standard
+ bsd/dev/sweet_a6xx.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index fd1c9d0..fe765d6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -2306,6 +2306,7 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	sweet_cpufreq_init();
+ 	sweet_pmem_init();       /* /dev/pmem: bsd/dev/sweet_pmem.c */
++	{ extern void sweet_vmmu_init(void); sweet_vmmu_init(); }       /* 1270: /dev/vmmu (bsd/dev/sweet_vmmu.c) */
+ 	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c */
+ 	sweet_gpu_init();        /* Adreno 640 (sweetgpu=1): bsd/dev/sweet_gpu.c */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+diff --git a/bsd/dev/sweet_vmmu.c b/bsd/dev/sweet_vmmu.c
+new file mode 100644
+index 0000000..e4157ff
+--- /dev/null
++++ b/bsd/dev/sweet_vmmu.c
+@@ -0,0 +1,695 @@
++/*
++ * 1270 redfin (venus-iommu): /dev/vmmu, real page tables for the Venus SMMU bank (zero-copy video buffers).
++ *
++ * Today Venus sees one fixed RAM window (1057: 0xa2600000-0xaca00000, IOVA = PA, 2 MB blocks) through the bank
++ * venusctl/venusd set up in userland (phone/video/smmu.c smmu_window: SMRs 0x1380/0x60 + 0x1360, 4 KB granule,
++ * T0SZ 25, L1 table at 0xa29fe000 in the queue block, ASID = bank number, nG PTEs). Every frame is copied through
++ * /dev/pmem into that window. This driver adds 4 KB page mappings of ANY memory to the same bank, so Venus reads
++ * camera IOSurfaces and writes decoded pictures into IOSurfaces directly, and buffer sets are not limited to the
++ * window:
++ *
++ *   ioctl VMMU_ATTACH {cb, l1}   the bank userland routes the video streams to and its L1 table (0 = read TTBR0);
++ *                                the kernel owns L1 slots 0-1 (IOVA 0-2 GB): own L2 + L3 tables (cached kernel
++ *                                pages, cleaned to PoC after every write), slot 2+ (the window) stays userland's
++ *   ioctl VMMU_MAP {addr,len | surface, iova, flags} -> {iova, handle, plen, info}
++ *                                pins a user range (IOMemoryDescriptor prepare, as NativeAdrenoMethodBoImport) or
++ *                                retains an IOSurface by id (SweetSurface memory: no user mapping needed), maps its
++ *                                4 KB pages at a free IOVA in 0x40000000-0x80000000 (or the fixed IOVA asked, from
++ *                                0x01000000), attr 0 (Normal non-cacheable for the device), AP RW (flags bit 0: RO);
++ *                                cleaned+invalidated once by physical page (flags bit 1: skip)
++ *   ioctl VMMU_UNMAP {iova}      PTEs cleared, cleaned, TLBIASID + TLBSYNC, then unpinned/released
++ *   ioctl VMMU_SYNC {iova,off,len,op}   CPU cache maintenance by physical page (Venus is not IO-coherent: stock
++ *                                venus_ns has no dma-coherent, maps with prot 0xb = no IOMMU_CACHE): op 1 clean
++ *                                (CPU wrote, Venus reads), 2 clean+invalidate (Venus wrote, CPU reads)
++ *   ioctl VMMU_STATUS            bank, maps, bytes, tables, FSR/FAR/FSYNR0 + the faulting SID (CBFRSYNRA)
++ *   ioctl VMMU_DETACH            unmaps everything (also done when the last client closes)
++ *
++ * Each open gets its own minor (clone node): its mappings are torn down when it closes (process exit included),
++ * before the pages are released. Faults are logged once per new FSR/FAR at every call and in STATUS.
++ * Switch: RW sysctl kern.sweet_vmmu, 0 (default) = /dev/vmmu refuses ATTACH and MAP (today's behaviour: window
++ * only), 1 = on. Turning it off keeps live mappings until they are unmapped.
++ *
++ * Klog: "SWEET VMMU: ..." (attach, first map of a client, unmap-all, faults).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/task.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern boolean_t pmap_valid_address(uint64_t pa);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++/* iokit/Kernel/arm/SweetVideoMMU.cpp */
++extern void *sweet_vmmu_pin_user(task_t task, uint64_t addr, uint64_t len, int *err);
++extern void *sweet_vmmu_pin_phys(uint64_t pa, uint64_t len, int *err);
++extern void *sweet_vmmu_pin_surface(uint32_t id, uint64_t *len, uint32_t info[4], int *err);
++extern uint64_t sweet_vmmu_pa(void *pin, uint64_t off);
++extern void sweet_vmmu_unpin(void *pin);
++void sweet_vmmu_init(void);
++
++struct vmmu_attach {
++	uint32_t cb;            /* in: bank (userland's window bank) */
++	uint32_t flags;
++	uint64_t l1;            /* in: its L1 table PA (0: read from TTBR0); out: the one used */
++};
++struct vmmu_map {
++	uint64_t addr;          /* in: user address (4 KB aligned), or 0 with surface */
++	uint64_t len;           /* in: bytes (user range) */
++	uint32_t surface;       /* in: IOSurface id (addr 0) */
++	uint32_t flags;         /* in: bit 0 = device read-only, bit 1 = no clean+invalidate at map, bit 2 = addr is a
++	                         * physical range outside XNU RAM */
++	uint64_t iova;          /* in: 0 = allocate, else a fixed 4 KB aligned IOVA; out: IOVA */
++	uint64_t handle;        /* out: = iova (for unmap) */
++	uint64_t plen;          /* out: mapped bytes (4 KB multiple) */
++	uint32_t info[4];       /* out: surface width, height, bytesPerRow, pixelFormat */
++};
++struct vmmu_sync {
++	uint64_t iova;
++	uint64_t off;
++	uint64_t len;           /* 0 = to the end of the mapping */
++	uint32_t op;            /* 1 clean, 2 clean+invalidate */
++	uint32_t pad;
++};
++struct vmmu_status {
++	uint32_t cb, maps, tables, faults;
++	uint32_t fsr, fsynr0, sid, enabled;
++	uint64_t far, bytes, l1, pad;
++};
++#define VMMU_ATTACH     _IOWR('V', 1, struct vmmu_attach)
++#define VMMU_MAP        _IOWR('V', 2, struct vmmu_map)
++#define VMMU_UNMAP      _IOW('V', 3, uint64_t)
++#define VMMU_SYNC       _IOW('V', 4, struct vmmu_sync)
++#define VMMU_STATUS     _IOR('V', 5, struct vmmu_status)
++#define VMMU_DETACH     _IO('V', 6)
++
++#define VM_SMMU_PA      0x15000000ULL
++#define VM_IOVA_LO      0x01000000ULL   /* fixed maps from here (the CP non-pixel range included: CVP test) */
++#define VM_IOVA_HI      0x80000000ULL   /* L1 slots 0-1; slot 2 holds the window (0xa2600000-) */
++#define VM_POOL_LO      0x40000000ULL   /* allocated IOVAs */
++#define VM_GAP          0x10000ULL      /* unmapped gap after each allocated mapping: an overrun faults */
++#define VM_MAPS         1024
++#define VM_CLIENTS      16
++#define VM_NL3          (VM_IOVA_HI >> 21)      /* 1024 L3 tables of 2 MB */
++#define VM_PTE_PAGE     (3ULL | 1ULL << 6 | 2ULL << 8 | 1ULL << 10 | 1ULL << 11 | 3ULL << 53)  /* attr 0, AP 01, SH 2, AF, nG, XN */
++#define VM_PTE_RO       (1ULL << 7)
++#define VM_PTE_TABLE    3ULL
++
++struct vmu_ent {
++	uint64_t iova, len;
++	void *pin;
++	uint32_t surface;
++	int client;
++};
++static struct vmu_ent vmu_ents[VM_MAPS];
++static unsigned vmu_nents;
++static uint8_t vmu_client_open[VM_CLIENTS];
++static int vmu_enabled;                  /* kern.sweet_vmmu */
++static int vmu_cb = -1;
++static uint64_t vmu_asid, vmu_l1;         /* the bank's ASID, L1 table PA (userland's) */
++static vm_offset_t vmu_smmu;             /* the whole SMMU (1 MB device mapping) */
++static uint32_t vmu_psize, vmu_npage;
++static struct { vm_offset_t va; uint64_t pa; } vmu_l2[2], vmu_l3[VM_NL3];
++static vm_offset_t vmu_pool_va;          /* 64 KB chunks carved into 4 KB tables */
++static uint64_t vmu_pool_pa;
++static unsigned vmu_pool_used = 16, vmu_tables;
++static uint64_t vmu_bytes;
++static uint32_t vmu_last_fsr, vmu_faults;
++static uint64_t vmu_last_far;
++
++static int vmu_sync(struct vmmu_sync *s);
++static LCK_GRP_DECLARE(sweet_vmmu_grp, "sweet_vmmu");
++static LCK_MTX_DECLARE(sweet_vmmu_lock, &sweet_vmmu_grp);
++
++static inline volatile uint32_t *
++vmu_reg(uint64_t off)
++{
++	return (volatile uint32_t *)(vmu_smmu + off);
++}
++static inline uint64_t
++vmu_cbp(void)
++{
++	return (uint64_t)vmu_npage * vmu_psize + (uint64_t)vmu_cb * vmu_psize;
++}
++
++/* a zeroed 4 KB table: VA + PA (cached kernel memory, cleaned to PoC by the writer) */
++static int
++vmu_table(vm_offset_t *va, uint64_t *pa)
++{
++	if (vmu_pool_used >= 16) {
++		vm_offset_t v = 0;
++		if (kmem_alloc_contig(kernel_map, &v, 0x10000, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return ENOMEM;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
++		if (!pn) {
++			kmem_free(kernel_map, v, 0x10000);
++			return ENOMEM;
++		}
++		vmu_pool_va = v;
++		vmu_pool_pa = ptoa_64(pn) + (v & PAGE_MASK);
++		clean_dcache(v, 0x10000, FALSE);
++		vmu_pool_used = 0;
++	}
++	*va = vmu_pool_va + 0x1000ULL * vmu_pool_used;
++	*pa = vmu_pool_pa + 0x1000ULL * vmu_pool_used;
++	vmu_pool_used++;
++	vmu_tables++;
++	return 0;
++}
++
++static void
++vmu_tlb_flush(void)
++{
++	uint64_t cbp = vmu_cbp();
++	__builtin_arm_dsb(0xb);         /* ISH: the cleaned PTEs before the invalidate */
++	*vmu_reg(cbp + 0x610) = (uint32_t)vmu_asid;       /* TLBIASID */
++	*vmu_reg(cbp + 0x7f0) = 0;                       /* TLBSYNC */
++	for (int i = 0; i < 100000 && (*vmu_reg(cbp + 0x7f4) & 1); i++) {
++		__builtin_arm_dsb(0xf);
++	}
++	if (*vmu_reg(cbp + 0x7f4) & 1) {
++		printf("SWEET VMMU: CB%d TLBSYNC timeout\n", vmu_cb);
++	}
++}
++
++/* fault check (logged once per new FSR/FAR); out: status */
++static void
++vmu_fault_check(struct vmmu_status *st)
++{
++	if (vmu_cb < 0) {
++		return;
++	}
++	uint64_t cbp = vmu_cbp();
++	uint32_t fsr = *vmu_reg(cbp + 0x58) & 0xc00001feu, fsynr0 = *vmu_reg(cbp + 0x68);	/* fault bits only (not FORMAT) */
++	uint64_t far = (uint64_t)*vmu_reg(cbp + 0x60) | ((uint64_t)*vmu_reg(cbp + 0x64) << 32);
++	uint32_t sid = *vmu_reg(vmu_psize + 0x400 + 4ULL * (uint32_t)vmu_cb) & 0xffff;      /* CBFRSYNRA */
++	if (fsr && (fsr != vmu_last_fsr || far != vmu_last_far)) {
++		vmu_faults++;
++		printf("SWEET VMMU: CB%d fault FSR 0x%x FAR 0x%llx FSYNR0 0x%x SID 0x%x (%s)\n", vmu_cb, fsr, far, fsynr0, sid,
++		    far >= VM_IOVA_LO && far < VM_IOVA_HI ? "in the page-table range" : "outside it");
++	}
++	vmu_last_fsr = fsr;
++	vmu_last_far = far;
++	if (st) {
++		st->fsr = fsr;
++		st->fsynr0 = fsynr0;
++		st->far = far;
++		st->sid = sid;
++	}
++}
++
++/* L1 slots 0-1 -> our L2 tables (userland's smmu_window may have zeroed its L1 since the last call) */
++static int
++vmu_l1_fix(void)
++{
++	vm_offset_t m = ml_io_map_unmappable((vm_offset_t)(vmu_l1 & ~0x3fffULL), 0x4000, VM_WIMG_IO);
++	if (!m) {
++		return ENOMEM;
++	}
++	volatile uint64_t *l1 = (volatile uint64_t *)(m + (vmu_l1 & 0x3fffULL));
++	int fixed = 0;
++	for (int s = 0; s < 2; s++) {
++		uint64_t want = vmu_l2[s].pa | VM_PTE_TABLE;
++		if (l1[s] != want) {
++			fixed |= l1[s] != 0 ? 2 : 1;
++			l1[s] = want;
++		}
++	}
++	__builtin_arm_dsb(0xf);
++	ml_io_unmap(m, 0x4000);
++	if (fixed & 2) {
++		printf("SWEET VMMU: L1 slots 0-1 at 0x%llx held other entries: replaced\n", vmu_l1);
++	}
++	if (fixed) {
++		vmu_tlb_flush();
++	}
++	return 0;
++}
++
++static int
++vmu_attach(struct vmmu_attach *a)
++{
++	if (!vmu_smmu) {
++		vmu_smmu = ml_io_map_unmappable((vm_offset_t)VM_SMMU_PA, 0x100000, VM_WIMG_IO);
++		if (!vmu_smmu) {
++			return ENOMEM;
++		}
++	}
++	uint32_t id1 = *(volatile uint32_t *)(vmu_smmu + 0x24);
++	vmu_psize = (id1 >> 31) ? 0x10000 : 0x1000;
++	vmu_npage = 1u << (((id1 >> 28) & 7) + 1);
++	if (a->cb >= (id1 & 0xff) || (uint64_t)(vmu_npage + a->cb + 1) * vmu_psize > 0x100000) {
++		return EINVAL;
++	}
++	if (vmu_nents && (int)a->cb != vmu_cb) {
++		return EBUSY;   /* live mappings in another bank */
++	}
++	uint64_t cbp = (uint64_t)vmu_npage * vmu_psize + (uint64_t)a->cb * vmu_psize;
++	uint64_t ttbr = (uint64_t)*(volatile uint32_t *)(vmu_smmu + cbp + 0x20) |
++	    ((uint64_t)*(volatile uint32_t *)(vmu_smmu + cbp + 0x24) << 32);
++	uint32_t tcr = *(volatile uint32_t *)(vmu_smmu + cbp + 0x30), sctlr = *(volatile uint32_t *)(vmu_smmu + cbp);
++	uint64_t l1 = ttbr & 0xfffffffff000ULL;
++	if (a->l1 && a->l1 != l1) {
++		printf("SWEET VMMU: CB%u TTBR0 0x%llx is not the L1 table 0x%llx asked for: refused\n", a->cb, ttbr, a->l1);
++		return EINVAL;
++	}
++	if (!(sctlr & 1) || (tcr & 0x3f) != 25 || ((tcr >> 14) & 3) != 0) {
++		printf("SWEET VMMU: CB%u SCTLR 0x%x TCR 0x%x: not a translating 4 KB / T0SZ 25 bank: refused\n", a->cb, sctlr, tcr);
++		return EINVAL;
++	}
++	for (int s = 0; s < 2; s++) {
++		if (!vmu_l2[s].va) {
++			int e = vmu_table(&vmu_l2[s].va, &vmu_l2[s].pa);
++			if (e) {
++				return e;
++			}
++		}
++	}
++	vmu_cb = (int)a->cb;
++	vmu_asid = ttbr >> 48;
++	vmu_l1 = l1;
++	a->l1 = l1;
++	int e = vmu_l1_fix();
++	vmu_tlb_flush();
++	printf("SWEET VMMU: attached to CB%d (ASID %llu, L1 0x%llx, SCTLR 0x%x, TCR 0x%x): IOVA 0x%llx-0x%llx page tables, %u maps\n",
++	    vmu_cb, vmu_asid, vmu_l1, sctlr, tcr, VM_IOVA_LO, VM_IOVA_HI, vmu_nents);
++	return e;
++}
++
++static uint64_t *
++vmu_pte(uint64_t iova, int alloc)
++{
++	unsigned i3 = (unsigned)(iova >> 21);
++	if (!vmu_l3[i3].va) {
++		if (!alloc || vmu_table(&vmu_l3[i3].va, &vmu_l3[i3].pa)) {
++			return NULL;
++		}
++		uint64_t *l2 = (uint64_t *)vmu_l2[iova >> 30].va;
++		uint64_t *d = &l2[(iova >> 21) & 511];
++		*d = vmu_l3[i3].pa | VM_PTE_TABLE;
++		clean_dcache((vm_offset_t)d, 8, FALSE);
++	}
++	return &((uint64_t *)vmu_l3[i3].va)[(iova >> 12) & 511];
++}
++
++static bool
++vmu_overlaps(uint64_t iova, uint64_t len, uint64_t gap)
++{
++	for (unsigned i = 0; i < vmu_nents; i++) {
++		if (iova < vmu_ents[i].iova + vmu_ents[i].len + gap && vmu_ents[i].iova < iova + len + gap) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static uint64_t
++vmu_alloc_iova(uint64_t len)
++{
++	uint64_t a = VM_POOL_LO;
++	for (;;) {
++		bool moved = false;
++		for (unsigned i = 0; i < vmu_nents; i++) {
++			uint64_t e = vmu_ents[i].iova + vmu_ents[i].len + VM_GAP;
++			if (a < e && vmu_ents[i].iova < a + len + VM_GAP) {
++				a = (e + 0xffffULL) & ~0xffffULL;
++				moved = true;
++			}
++		}
++		if (a + len > VM_IOVA_HI) {
++			return 0;
++		}
++		if (!moved) {
++			return a;
++		}
++	}
++}
++
++/* write (pa != 0) or clear (pa == 0) the PTEs of [iova, iova+len); dirty PTE lines cleaned per L3 table run */
++static int
++vmu_set_ptes(uint64_t iova, uint64_t len, void *pin, uint64_t flags)
++{
++	uint64_t o = 0;
++	while (o < len) {
++		uint64_t *p = vmu_pte(iova + o, pin != NULL);
++		uint64_t run = 0x200000ULL - ((iova + o) & 0x1fffffULL);
++		if (run > len - o) {
++			run = len - o;
++		}
++		if (p == NULL) {
++			if (pin != NULL) {
++				return ENOMEM;
++			}
++			o += run;       /* never mapped */
++			continue;
++		}
++		for (uint64_t k = 0; k < run; k += 0x1000) {
++			if (pin != NULL) {
++				uint64_t pa = sweet_vmmu_pa(pin, o + k);
++				if (!pa || (pa & 0xfff)) {
++					return EFAULT;
++				}
++				p[k >> 12] = pa | VM_PTE_PAGE | ((flags & 1) ? VM_PTE_RO : 0);
++			} else {
++				p[k >> 12] = 0;
++			}
++		}
++		clean_dcache((vm_offset_t)p, (unsigned)((run >> 12) * 8), FALSE);
++		o += run;
++	}
++	return 0;
++}
++
++static void
++vmu_drop(unsigned i, bool flush)
++{
++	struct vmu_ent *e = &vmu_ents[i];
++	vmu_set_ptes(e->iova, e->len, NULL, 0);
++	if (flush) {
++		vmu_tlb_flush();
++	}
++	sweet_vmmu_unpin(e->pin);
++	vmu_bytes -= e->len;
++	vmu_ents[i] = vmu_ents[--vmu_nents];
++}
++
++static int
++vmu_map(int client, struct vmmu_map *m)
++{
++	if (vmu_cb < 0) {
++		return ENXIO;
++	}
++	if (vmu_nents >= VM_MAPS) {
++		return ENOSPC;
++	}
++	int err = 0;
++	uint64_t len = 0;
++	void *pin = NULL;
++	bzero(m->info, sizeof(m->info));
++	if (m->addr && (m->flags & 4)) {
++		/* a physical range outside XNU RAM (window / carve-out memory, e.g. hyp-assigned to a CP VM) */
++		if ((m->addr & 0xfff) || !m->len || m->len > 0x10000000ULL) {
++			return EINVAL;
++		}
++		len = (m->len + 0xfffULL) & ~0xfffULL;
++		for (uint64_t o = 0; o < len; o += 0x1000) {
++			if (pmap_valid_address(m->addr + o)) {
++				printf("SWEET VMMU: physical map of 0x%llx refused: XNU RAM\n", m->addr + o);
++				return EPERM;
++			}
++		}
++		pin = sweet_vmmu_pin_phys(m->addr, len, &err);
++		m->flags |= 2;  /* no cache maintenance: not XNU RAM */
++	} else if (m->addr) {
++		if ((m->addr & 0xfff) || !m->len || m->len > 0x40000000ULL) {
++			return EINVAL;
++		}
++		len = (m->len + 0xfffULL) & ~0xfffULL;
++		lck_mtx_unlock(&sweet_vmmu_lock);       /* pinning may fault pages in */
++		pin = sweet_vmmu_pin_user(current_task(), m->addr, len, &err);
++		lck_mtx_lock(&sweet_vmmu_lock);
++	} else if (m->surface) {
++		lck_mtx_unlock(&sweet_vmmu_lock);
++		pin = sweet_vmmu_pin_surface(m->surface, &len, m->info, &err);
++		lck_mtx_lock(&sweet_vmmu_lock);
++		len = (len + 0xfffULL) & ~0xfffULL;
++	} else {
++		return EINVAL;
++	}
++	if (pin == NULL) {
++		return err ? err : EFAULT;
++	}
++	if (vmu_cb < 0 || vmu_nents >= VM_MAPS) {
++		sweet_vmmu_unpin(pin);
++		return ENXIO;
++	}
++	uint64_t iova = m->iova;
++	if (iova) {
++		if ((iova & 0xfff) || iova < VM_IOVA_LO || iova + len > VM_IOVA_HI || vmu_overlaps(iova, len, 0)) {
++			sweet_vmmu_unpin(pin);
++			return EADDRINUSE;
++		}
++	} else if (!(iova = vmu_alloc_iova(len))) {
++		sweet_vmmu_unpin(pin);
++		return ENOSPC;
++	}
++	(void)vmu_l1_fix();
++	err = vmu_set_ptes(iova, len, pin, m->flags);
++	if (err) {
++		vmu_set_ptes(iova, len, NULL, 0);
++		vmu_tlb_flush();
++		sweet_vmmu_unpin(pin);
++		printf("SWEET VMMU: map of %llu KB at 0x%llx failed (%d)\n", len >> 10, iova, err);
++		return err;
++	}
++	vmu_tlb_flush();         /* MMU-500 may hold a walk-cache entry from before (an unmapped neighbour) */
++	vmu_ents[vmu_nents++] = (struct vmu_ent){ .iova = iova, .len = len, .pin = pin, .surface = m->surface, .client = client };
++	if (!(m->flags & 2)) {
++		/* clean+invalidate the whole buffer once: a surface is bzero'd through a cached kernel mapping when it is
++		 * created, and such dirty lines evicted later would land on what Venus wrote (flags bit 1: skip) */
++		struct vmmu_sync sy = { .iova = iova, .op = 2 };
++		(void)vmu_sync(&sy);
++	}
++	vmu_bytes += len;
++	m->iova = iova;
++	m->handle = iova;
++	m->plen = len;
++	vmu_fault_check(NULL);
++	return 0;
++}
++
++static int
++vmu_find(uint64_t iova)
++{
++	for (unsigned i = 0; i < vmu_nents; i++) {
++		if (vmu_ents[i].iova == iova) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static int
++vmu_sync(struct vmmu_sync *s)
++{
++	int i = -1;
++	for (unsigned k = 0; k < vmu_nents; k++) {
++		if (s->iova >= vmu_ents[k].iova && s->iova < vmu_ents[k].iova + vmu_ents[k].len) {
++			i = (int)k;
++		}
++	}
++	if (i < 0) {
++		return ENOENT;
++	}
++	struct vmu_ent *e = &vmu_ents[i];
++	uint64_t off = s->iova - e->iova + s->off, len = s->len ? s->len : e->len - (s->iova - e->iova) - s->off;
++	if (off > e->len || len > e->len - off || (s->op != 1 && s->op != 2)) {
++		return EINVAL;
++	}
++	uint64_t end = off + len;
++	for (uint64_t o = off & ~0xfffULL; o < end; o += 0x1000) {
++		uint64_t pa = sweet_vmmu_pa(e->pin, o);
++		if (!pa || !pmap_valid_address(pa)) {
++			continue;       /* not XNU RAM (a physical surface: mapped uncached anyway) */
++		}
++		uint64_t a = o < off ? off : o, b = o + 0x1000 < end ? o + 0x1000 : end;
++		if (s->op == 1) {
++			clean_dcache64(pa + (a - o), (unsigned)(b - a), TRUE);
++		} else {
++			flush_dcache64(pa + (a - o), (unsigned)(b - a), TRUE);
++		}
++	}
++	return 0;
++}
++
++static void
++vmu_drop_client(int client, const char *why)
++{
++	unsigned n = 0;
++	uint64_t bytes = 0;
++	for (unsigned i = 0; i < vmu_nents;) {
++		if (client < 0 || vmu_ents[i].client == client) {
++			bytes += vmu_ents[i].len;
++			vmu_drop(i, false);
++			n++;
++		} else {
++			i++;
++		}
++	}
++	if (n) {
++		vmu_tlb_flush();
++		printf("SWEET VMMU: client %d %s: %u mappings (%llu KB) unmapped\n", client, why, n, bytes >> 10);
++	}
++}
++
++static int
++vmu_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	int c = minor(dev);
++	if (c < 0 || c >= VM_CLIENTS) {
++		return EMFILE;
++	}
++	lck_mtx_lock(&sweet_vmmu_lock);
++	int err = vmu_client_open[c] ? EBUSY : 0;
++	if (!err) {
++		vmu_client_open[c] = 1;
++	}
++	lck_mtx_unlock(&sweet_vmmu_lock);
++	return err;
++}
++
++static int
++vmu_close(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	int c = minor(dev);
++	lck_mtx_lock(&sweet_vmmu_lock);
++	vmu_fault_check(NULL);
++	vmu_drop_client(c, "closed");
++	if (c >= 0 && c < VM_CLIENTS) {
++		vmu_client_open[c] = 0;
++	}
++	lck_mtx_unlock(&sweet_vmmu_lock);
++	return 0;
++}
++
++static int
++vmu_clone(__unused dev_t dev, int action)
++{
++	int m = -1;
++	if (action == DEVFS_CLONE_ALLOC) {
++		lck_mtx_lock(&sweet_vmmu_lock);
++		for (int i = 0; i < VM_CLIENTS; i++) {
++			if (!vmu_client_open[i]) {
++				m = i;
++				break;
++			}
++		}
++		lck_mtx_unlock(&sweet_vmmu_lock);
++		if (m < 0) {
++			m = VM_CLIENTS;         /* vmu_open refuses it (EMFILE) */
++		}
++	} else if (action == DEVFS_CLONE_FREE) {
++		m = 0;
++	}
++	return m;
++}
++
++static int
++vmu_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	int client = minor(dev), err = 0;
++	lck_mtx_lock(&sweet_vmmu_lock);
++	if (!vmu_enabled && (cmd == VMMU_ATTACH || cmd == VMMU_MAP)) {
++		lck_mtx_unlock(&sweet_vmmu_lock);
++		return ENODEV;
++	}
++	vmu_fault_check(NULL);
++	switch (cmd) {
++	case VMMU_ATTACH:
++		err = vmu_attach((struct vmmu_attach *)data);
++		break;
++	case VMMU_MAP:
++		err = vmu_map(client, (struct vmmu_map *)data);
++		break;
++	case VMMU_UNMAP: {
++		int i = vmu_find(*(uint64_t *)data);
++		if (i < 0 || vmu_ents[i].client != client) {
++			err = ENOENT;
++		} else {
++			vmu_drop((unsigned)i, true);
++		}
++		break;
++	}
++	case VMMU_SYNC:
++		err = vmu_sync((struct vmmu_sync *)data);
++		break;
++	case VMMU_STATUS: {
++		struct vmmu_status *st = (struct vmmu_status *)data;
++		bzero(st, sizeof(*st));
++		st->cb = (uint32_t)vmu_cb;
++		st->maps = vmu_nents;
++		st->tables = vmu_tables;
++		st->bytes = vmu_bytes;
++		st->l1 = vmu_l1;
++		st->enabled = (uint32_t)vmu_enabled;
++		vmu_fault_check(st);
++		st->faults = vmu_faults;
++		break;
++	}
++	case VMMU_DETACH:
++		vmu_drop_client(client, "detached");
++		break;
++	default:
++		err = ENOTTY;
++	}
++	lck_mtx_unlock(&sweet_vmmu_lock);
++	return err;
++}
++
++static const struct cdevsw sweet_vmmu_cdevsw = {
++	.d_open       = vmu_open,
++	.d_close      = vmu_close,
++	.d_read       = eno_rdwrt,
++	.d_write      = eno_rdwrt,
++	.d_ioctl      = vmu_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static int
++sysctl_sweet_vmmu SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0, changed = 0;
++	int error = sysctl_io_number(req, vmu_enabled, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 1) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_vmmu_lock);
++	vmu_enabled = value;
++	lck_mtx_unlock(&sweet_vmmu_lock);
++	printf("SWEET VMMU: kern.sweet_vmmu %d (%u live mappings)\n", value, vmu_nents);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_vmmu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_vmmu, "I", "SWEET /dev/vmmu: Venus SMMU page tables (zero-copy video buffers), 0 off, 1 on");
++
++void
++sweet_vmmu_init(void)
++{
++	int major = cdevsw_add(-1, &sweet_vmmu_cdevsw);
++	if (major < 0) {
++		printf("SWEET VMMU: cdevsw_add failed (%d)\n", major);
++		return;
++	}
++	if (devfs_make_node_clone(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, vmu_clone, "vmmu") == NULL) {
++		printf("SWEET VMMU: devfs node failed\n");
++		return;
++	}
++	printf("SWEET VMMU: /dev/vmmu ready (major %d), kern.sweet_vmmu %d\n", major, vmu_enabled);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetVideoMMU.cpp b/iokit/Kernel/arm/SweetVideoMMU.cpp
+new file mode 100644
+index 0000000..fea22f9
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetVideoMMU.cpp
+@@ -0,0 +1,125 @@
++/*
++ * 1270 redfin (venus-iommu): the IOKit half of /dev/vmmu (bsd/dev/sweet_vmmu.c): pins the pages Venus maps.
++ *   user range: IOMemoryDescriptor::withAddressRange + prepare() in the caller's task, as SweetAccelerator's
++ *               NativeAdrenoMethodBoImport (read/write first, then read-only pages for reading)
++ *   IOSurface:  the SweetSurface retained by id; its memory descriptor (kernel buffer, wired by the surface) is used
++ *               directly, so a camera/decoder surface needs no mapping in the video daemon
++*   physical:  a range outside XNU RAM (VMMU_MAP flags bit 2), e.g. window memory hyp-assigned to a CP VM
++ * sweet_vmmu_pa() = physical address of the 4 KB page at an offset (0 = none).
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include "SweetSurface.h"
++
++struct SweetVmmuPin {
++	IOMemoryDescriptor *md;
++	SweetSurface *surface;
++	uint64_t offset;        /* the surface's byte 0 in md */
++	bool prepared;
++};
++
++extern "C" void *
++sweet_vmmu_pin_user(task_t task, uint64_t addr, uint64_t len, int *err)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(addr, len, kIODirectionInOut, task);
++	if (md != NULL && md->prepare() != kIOReturnSuccess) {
++		md->release();
++		md = IOMemoryDescriptor::withAddressRange(addr, len, kIODirectionOut, task);
++		if (md != NULL && md->prepare() != kIOReturnSuccess) {
++			md->release();
++			md = NULL;
++		}
++	}
++	if (md == NULL) {
++		*err = 14;      /* EFAULT */
++		return NULL;
++	}
++	SweetVmmuPin *p = IONew(SweetVmmuPin, 1);
++	if (p == NULL) {
++		md->complete();
++		md->release();
++		*err = 12;      /* ENOMEM */
++		return NULL;
++	}
++	p->md = md;
++	p->surface = NULL;
++	p->offset = 0;
++	p->prepared = true;
++	return p;
++}
++
++/* a physical range that is not XNU RAM (the 1057 window, a carve-out): a descriptor only, nothing to wire */
++extern "C" void *
++sweet_vmmu_pin_phys(uint64_t pa, uint64_t len, int *err)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa, (IOByteCount)len,
++	    kIODirectionInOut);
++	SweetVmmuPin *p = md != NULL ? IONew(SweetVmmuPin, 1) : NULL;
++	if (p == NULL) {
++		OSSafeReleaseNULL(md);
++		*err = 12;
++		return NULL;
++	}
++	p->md = md;
++	p->surface = NULL;
++	p->offset = 0;
++	p->prepared = md->prepare() == kIOReturnSuccess;
++	return p;
++}
++
++extern "C" void *
++sweet_vmmu_pin_surface(uint32_t id, uint64_t *len, uint32_t info[4], int *err)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		*err = 2;       /* ENOENT */
++		return NULL;
++	}
++	SweetVmmuPin *p = IONew(SweetVmmuPin, 1);
++	if (p == NULL) {
++		s->release();
++		*err = 12;
++		return NULL;
++	}
++	p->md = s->memory;
++	p->surface = s;         /* the retain keeps md alive */
++	p->offset = 0;
++	p->prepared = p->md->prepare() == kIOReturnSuccess;
++	*len = p->md->getLength();
++	info[0] = s->width;
++	info[1] = s->height;
++	info[2] = s->bytesPerRow;
++	info[3] = s->pixelFormat;
++	return p;
++}
++
++extern "C" uint64_t
++sweet_vmmu_pa(void *pin, uint64_t off)
++{
++	SweetVmmuPin *p = (SweetVmmuPin *)pin;
++	IOByteCount seg = 0;
++	addr64_t pa = p->md->getPhysicalSegment(p->offset + off, &seg, kIOMemoryMapperNone);
++	return pa;
++}
++
++extern "C" void
++sweet_vmmu_unpin(void *pin)
++{
++	SweetVmmuPin *p = (SweetVmmuPin *)pin;
++	if (p == NULL) {
++		return;
++	}
++	if (p->prepared) {
++		p->md->complete();
++	}
++	if (p->surface != NULL) {
++		p->surface->release();
++	} else {
++		p->md->release();
++	}
++	IODelete(p, SweetVmmuPin, 1);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index ec71db0..612e81e 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetVideoMMU.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBTNub.cpp                                  optional iokitcpp
+-- 
+2.43.0
