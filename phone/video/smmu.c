@@ -569,3 +569,143 @@ int smmu_add_smr(const char *name, uint32_t sid, uint32_t mask, int cb, const st
 	       cb);
 	return 0;
 }
+
+/*
+ * venus-cvp: SID/MASK through one NEW translating bank of its own, as stock's venus_sec_non_pixel context bank
+ * (arm-smmu "master side secure": a bank for the CP VMID's streams only, its page tables hyp-assigned to
+ * {HLOS RW, CP VMID R} so the walker under the CP VMID can read them). [IOVA, IOVA+LEN) -> PA as 4 KB pages (inside
+ * one 2 MB block, below 4 GB), the SM7150 reference values (R_*) as smmu_translate. PREP(tbl, len) runs after the
+ * three table pages (pm_alloc, *TBLP) are written and before the bank is programmed or any SID routed (the caller's
+ * hyp assign); nonzero = stop (tables freed). SAVED: what smmu_np_release puts back. Bank or -1.
+ */
+int smmu_np_bank(const char *name, uint32_t sid, uint32_t mask, uint64_t iova, uint64_t pa, uint64_t len,
+		 int (*prep)(uint64_t tbl, uint64_t len), uint64_t *tblp, struct smmu_saved *saved)
+{
+	uint64_t s = SMMU_PA;
+	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
+	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	uint32_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
+	uint64_t used[4] = { 0 };
+	int cb = -1, slot = -1;
+
+	*tblp = 0;
+	saved->slot = -1;
+	if (!len || (iova | pa | len) & 0xfff || iova + len > (1ull << 32) || ((iova ^ (iova + len - 1)) >> 21)) {
+		printf("smmu: %s: bad range %llx+%llx\n", name, (unsigned long long)iova, (unsigned long long)len);
+		return -1;
+	}
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
+		if ((smr >> 31) && sid_match(smr, sid, mask)) {
+			printf("smmu: %s: SMR%u %08x overlaps %#x/%#x: refused\n", name, i, smr, sid, mask);
+			return -1;
+		}
+		if ((smr >> 31) && ((s2cr >> 16) & 3) == 0)
+			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
+		if (!(smr >> 31) && slot < 0)
+			slot = (int)i;
+	}
+	for (uint32_t c = 0; c < ncb && c < 256; c++) {
+		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
+		/* free: no S2CR points at it, translation off, and CBAR never written -- or our own released bank from an
+		 * earlier run (CBAR does not go back to 0 here: CBAR = R_CBAR and TTBR0's ASID = the bank number, as written
+		 * below), so banks are not used up one per run */
+		uint32_t cbar = rd32(s + psize + 4 * c);
+		int ours = cbar == R_CBAR && (rd32(cbp + 0x24) >> 16) == c;
+		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) && (cbar == 0 || ours)) {
+			cb = (int)c;
+			break;
+		}
+	}
+	if (slot < 0 || cb < 0 || (uint64_t)(npage + cb + 1) * psize > SMMU_SIZE) {
+		printf("smmu: %s: no free %s\n", name, slot < 0 ? "SMR" : "bank");
+		return -1;
+	}
+	uint64_t gr1 = s + psize, cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
+	*saved = (struct smmu_saved){ .slot = slot, .cb = cb, .cbp = cbp, .gr1 = gr1, .smr = rd32(s + 0x800 + 4 * slot),
+				      .s2cr = rd32(s + 0xc00 + 4 * slot), .cbar = rd32(gr1 + 4 * cb),
+				      .cba2r = rd32(gr1 + 0x800 + 4 * cb), .sctlr = rd32(cbp) };
+	if (smmu_dry) {
+		printf("smmu: %s: would map %llx+%llx -> %llx through CB%d, %#x/%#x via SMR%d (dry run)\n", name,
+		       (unsigned long long)iova, (unsigned long long)len, (unsigned long long)pa, cb, sid, mask, slot);
+		saved->slot = -1;
+		return cb;
+	}
+	uint64_t tbl = pm_alloc(3 * 0x1000, 0x1000);
+	if (!tbl) {
+		printf("smmu: %s: no memory for the tables\n", name);
+		saved->slot = -1;
+		return -1;
+	}
+	uint64_t l1 = tbl, l2 = tbl + 0x1000, l3 = tbl + 0x2000, d;
+	static const uint8_t z[0x1000];
+	for (int i = 0; i < 3; i++)
+		pm_wr(tbl + 0x1000 * (uint64_t)i, z, sizeof(z));
+	d = l2 | 3;
+	pm_wr(l1 + 8 * ((iova >> 30) & 0x1ff), &d, 8);
+	d = l3 | 3;
+	pm_wr(l2 + 8 * ((iova >> 21) & 0x1ff), &d, 8);
+	for (uint64_t o = 0; o < len; o += 0x1000) {
+		d = (pa + o) | R_PAGE;
+		pm_wr(l3 + 8 * (((iova + o) >> 12) & 0x1ff), &d, 8);
+	}
+	if (prep && prep(tbl, 3 * 0x1000)) {
+		printf("smmu: %s: table prep refused: nothing routed\n", name);
+		pm_free(tbl);
+		saved->slot = -1;
+		return -1;
+	}
+	*tblp = tbl;
+	wr32(cbp, 0);
+	wr32(cbp + 0x58, 0xffffffff);			/* FSR: clear */
+	wr64(cbp + 0x20, l1 | (uint64_t)cb << 48);	/* TTBR0, ASID = bank */
+	wr64(cbp + 0x28, 0);
+	wr32(cbp + 0x30, R_TCR);
+	wr32(cbp + 0x10, R_TCR2);
+	wr32(cbp + 0x38, R_MAIR0);
+	wr32(cbp + 0x3c, 0);
+	wr32(gr1 + 0x800 + 4 * cb, CB_CBA2R);
+	wr32(gr1 + 4 * cb, R_CBAR);
+	wr32(cbp + 0x610, (uint32_t)cb);		/* TLBIASID */
+	wr32(cbp + 0x618, 0);				/* TLBIALL */
+	wr32(cbp + 0x7f0, 0);				/* TLBSYNC */
+	double t0 = mono_ms();
+	for (unsigned i = 0; (rd32(cbp + 0x7f4) & 1) && !wait_over(t0, i, 1000); i++)
+		delay_ms(1);
+	wr32(cbp, R_SCTLR);
+	int ok = (rd32(cbp) & ~0x1000u) == (R_SCTLR & ~0x1000u) && rd32(gr1 + 4 * cb) == R_CBAR;
+	printf("smmu: %s: CB%d tables %llx TTBR0 %08x%08x TCR %08x SCTLR %08x CBAR %08x -> %s\n", name, cb,
+	       (unsigned long long)tbl, rd32(cbp + 0x24), rd32(cbp + 0x20), rd32(cbp + 0x30), rd32(cbp),
+	       rd32(gr1 + 4 * cb), ok ? "ok" : "NOT as written");
+	if (!ok) {
+		wr32(cbp, saved->sctlr);
+		wr32(gr1 + 4 * cb, saved->cbar);
+		saved->slot = -1;
+		return -1;	/* tables stay with the caller (*TBLP): it undoes PREP */
+	}
+	wr32(s + 0xc00 + 4 * slot, (uint32_t)cb);
+	wr32(s + 0x800 + 4 * slot, 0x80000000u | (mask & 0x7fff) << 16 | (sid & 0x7fff));
+	wr32(s + 0x70, 0);				/* sTLBGSYNC */
+	t0 = mono_ms();
+	for (unsigned i = 0; (rd32(s + 0x74) & 1) && !wait_over(t0, i, 1000); i++)
+		delay_ms(1);
+	printf("smmu: %s %#x/%#x -> CB%d via SMR%d: SMR %08x S2CR %08x\n", name, sid, mask, cb, slot,
+	       rd32(s + 0x800 + 4 * slot), rd32(s + 0xc00 + 4 * slot));
+	return cb;
+}
+
+/* venus-cvp: undo smmu_np_bank's routing (SMR first, then S2CR and the bank), fault state printed first. 0 = ok. */
+int smmu_np_release(const char *name, struct smmu_saved *saved)
+{
+	if (saved->slot < 0)
+		return 0;
+	uint32_t fsr = rd32(saved->cbp + 0x58);
+	printf("smmu: %s CB%d before release: FSR %08x FAR %08x%08x FSYNR0 %08x\n", name, saved->cb, fsr,
+	       rd32(saved->cbp + 0x64), rd32(saved->cbp + 0x60), rd32(saved->cbp + 0x68));
+	struct smmu_saved keep = smmu_last;
+	smmu_last = *saved;
+	int rc = smmu_release(name);
+	smmu_last = keep;
+	saved->slot = -1;
+	return rc;
+}

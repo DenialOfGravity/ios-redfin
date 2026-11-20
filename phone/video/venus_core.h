@@ -48,6 +48,9 @@ struct venc_params {
 	int full_range, primaries, transfer, matrix;	/* VIDEO_SIGNAL_INFO (H.264/HEVC VUI codes; primaries 0: not sent) */
 	int nin, nout;			/* buffer counts (0: 8 + 8) */
 	uint32_t debug;			/* firmware debug mask */
+	int rc;				/* venus-cvp: 0 constant QP (RC off); 1 VBR_CFR, 2 CBR_CFR (firmware rate control: the
+					 * CVP texture pass, persist through the CP non-pixel bank as stock) */
+	uint32_t bitrate;		/* venus-cvp: target bit/s when rc != 0 */
 };
 struct venc_out {			/* one bitstream buffer back (FBD) */
 	const uint8_t *data;		/* Annex B (start codes) */

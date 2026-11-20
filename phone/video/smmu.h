@@ -25,6 +25,11 @@ void smmu_status(const char *name, uint32_t sid);	/* sGFSR/sGFSYNR + smmu_faults
 void smmu_dump(const char *name, uint32_t sid, uint64_t iova);	/* bank registers + table walk, read-only */
 int smmu_add_smr(const char *name, uint32_t sid, uint32_t mask, int cb, const struct smmu_saved *bank_saved,
 		 struct smmu_saved *saved);	/* venus-iommu: one more SMR into an existing bank */
+/* venus-cvp: SID/MASK through a new bank of its own (stock's secure non-pixel bank); PREP = the caller's hyp assign
+ * of the 3 table pages (*TBLP) before anything is routed. Bank or -1. */
+int smmu_np_bank(const char *name, uint32_t sid, uint32_t mask, uint64_t iova, uint64_t pa, uint64_t len,
+		 int (*prep)(uint64_t tbl, uint64_t len), uint64_t *tblp, struct smmu_saved *saved);
+int smmu_np_release(const char *name, struct smmu_saved *saved);
 extern int smmu_dry;	/* 1: only report what would be written */
 extern uint64_t smmu_alias;	/* smmu_translate also maps IOVA | smmu_alias (default 3<<32) */
 

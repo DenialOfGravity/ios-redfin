@@ -79,7 +79,7 @@ struct venusd_enc_open {
 	int32_t profile, level;		/* HFI values (0: High / Main, level chosen by the firmware) */
 	int32_t seqhdr;			/* 1: SPS/PPS in band before every IDR; 0: one codec-config buffer (stock) */
 	int32_t full_range, primaries, transfer, matrix;	/* VUI colour (primaries 0: none) */
-	uint32_t flags;			/* bit 0: no zero-copy (always copy) */
+	uint32_t flags;			/* bit 0: no zero-copy (always copy); bit 2: CBR when venusd runs the firmware RC (VENUSD_HWRC=1) */
 	uint32_t rsvd[3];
 };
 _Static_assert(sizeof(struct venusd_enc_open) == 64, "venusd_enc_open");

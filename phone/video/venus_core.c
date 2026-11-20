@@ -3383,62 +3383,142 @@ static int dec_close(int started)
 	return bad;
 }
 
-/* venus-iommu CVP test (VENUSCTL_NP_ASSIGN=1): window memory hyp-assigned to VMID_CP_NON_PIXEL as stock's ION secure
- * heap does for the encoder's persist buffer (secure_buffer.c hyp_assign_table: SCM svc MP 0x0c cmd 0x16, 7 args,
- * args 3.. in a buffer at x5; lists: {u64 addr, u64 size}, u32 source VMIDs, {u32 vm, u32 perm, u64 ctx, u32 ctx_size}
- * packed). Assigned back to HLOS at exit. */
+/* venus-iommu CVP test (VENUSCTL_NP_ASSIGN=1) / venus-cvp (VENUSCTL_NP_BANK=1): the encoder's persist buffer as stock's
+ * ION secure heap makes it (msm_smem.c: always secure for the encoder, ION_FLAG_CP_NON_PIXEL): zeroed, then
+ * hyp-assigned HLOS -> VMID_CP_NON_PIXEL RW (secure_buffer.c hyp_assign_table: SCM svc MP 0x0c cmd 0x16 =
+ * SMC 0x42000c16, SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) = 0x1117, x2 region list {u64 addr, u64 size}[],
+ * x3 its size, x4 source VMID list u32[], x5 -> args 3..9 = {source size, dest list, dest size, 0}; dest entry
+ * {u32 vm, u32 perm, u64 ctx, u32 ctx_size} = 24 bytes with its tail padding (venus-iommu c2 sent 20 -> -2
+ * SCM_EINVAL_ARG); lists in managed RAM as phone/wifi/scm.c, which the hyp takes). Assigned back to HLOS at exit. */
 #define VMID_HLOS	3u
 #define VMID_CP_NP	0xbu
-static uint64_t np_pa, np_len, np_lists;
-static int np_assigned;
+static int hyp_assign_vm(uint64_t pa, uint64_t len, const uint32_t *src, int nsrc, const uint32_t *dst,
+			 const uint32_t *perm, int ndst)
+{
+	if (nsrc < 1 || nsrc > 8 || ndst < 1 || ndst > 8)
+		return -1;
+	uint64_t t = pm_alloc(4096, 4096);
+	if (!t)
+		return -1;
+	uint64_t mem[2] = { pa, len };
+	struct { uint32_t vm, perm; uint64_t ctx; uint32_t ctx_size, pad; } d[8];
+	memset(d, 0, sizeof(d));
+	for (int i = 0; i < ndst; i++) {
+		d[i].vm = dst[i];
+		d[i].perm = perm[i];
+	}
+	uint64_t ext[7] = { 4ull * (uint64_t)nsrc, t + 128, sizeof(d[0]) * (uint64_t)ndst, 0, 0, 0, 0 };
+	if (pm_wr(t, mem, sizeof(mem)) || pm_wr(t + 64, src, 4ull * (uint64_t)nsrc) ||
+	    pm_wr(t + 128, d, sizeof(d[0]) * (uint64_t)ndst) || pm_wr(t + 512, ext, sizeof(ext))) {
+		pm_free(t);
+		return -1;
+	}
+	uint64_t x[8] = { 0x42000c16ull, 0x1117ull, t, sizeof(mem), t + 64, t + 512, 0, 0 };
+	pm_smc(x);
+	pm_free(t);
+	printf("venus: hyp assign %#llx+%#llx VMID %#x%s -> %#x/%#x%s: x0 %lld x1 %#llx\n", (unsigned long long)pa,
+	       (unsigned long long)len, src[0], nsrc > 1 ? "+" : "", dst[0], perm[0], ndst > 1 ? "+" : "",
+	       (long long)x[0], (unsigned long long)x[1]);
+	pm_step("hyp assign %#llx -> vmid %#x: %lld", (unsigned long long)pa, dst[0], (long long)x[0]);
+	return x[0] ? -1 : 0;
+}
 static int hyp_assign(uint64_t pa, uint64_t len, uint32_t from, uint32_t to, uint32_t perm)
 {
-	uint8_t b[0x100];
-	memset(b, 0, sizeof(b));
-	uint64_t reg[2] = { pa, len };
-	uint32_t src = from;
-	uint8_t dst[20] = { 0 };
-	memcpy(dst, &to, 4);
-	memcpy(dst + 4, &perm, 4);
-	memcpy(b, reg, 16);		/* +0x00 region list */
-	memcpy(b + 0x40, &src, 4);	/* +0x40 source list */
-	memcpy(b + 0x80, dst, 20);	/* +0x80 dest list */
-	uint64_t ext[7] = { 4, np_lists + 0x80, 20, 0, 0, 0, 0 };	/* args 3..9 */
-	memcpy(b + 0xc0, ext, sizeof(ext));
-	if (pm_wr(np_lists, b, sizeof(b)))
+	return hyp_assign_vm(pa, len, &from, 1, &to, &perm, 1);
+}
+static uint64_t np_pa, np_len, np_tbl;
+static int np_assigned, np_tbl_assigned, np_bank_on;
+int np_force_bank;
+static struct smmu_saved np_bank_saved = { .slot = -1, .cb = -1 };
+/* the bank's tables: readable by the CP VMID's walker, as arm_smmu_assign_table (master-side secure banks) */
+static int np_prep_tables(uint64_t tbl, uint64_t len)
+{
+	if (getenv("VENUSCTL_NP_TBLVM") && !atoi(getenv("VENUSCTL_NP_TBLVM")))
+		return 0;	/* variant: tables stay HLOS-only */
+	static const uint32_t src[] = { VMID_HLOS }, dst[] = { VMID_HLOS, VMID_CP_NP }, perm[] = { 6, 4 };
+	if (hyp_assign_vm(tbl, len, src, 1, dst, perm, 2))
 		return -1;
-	uint64_t x[8] = { 0x42000c16ull, 0x1117ull, np_lists, 16, np_lists + 0x40, np_lists + 0xc0, 0, 0 };
-	pm_smc(x);
-	printf("venus: hyp assign %#llx+%#llx VMID %#x -> %#x perm %#x: x0 %#llx x1 %#llx\n", (unsigned long long)pa,
-	       (unsigned long long)len, from, to, perm, (unsigned long long)x[0], (unsigned long long)x[1]);
-	pm_step("hyp assign %#llx -> vmid %#x: %#llx", (unsigned long long)pa, to, (unsigned long long)x[0]);
-	return x[0] ? -1 : 0;
+	np_tbl_assigned = 1;
+	return 0;
 }
 static void np_unassign(void)
 {
+	if (np_bank_on) {	/* stream off first, then the memory goes back */
+		pm_step("np bank: CB%d FSR %#x at release", np_bank_saved.cb, rd32(np_bank_saved.cbp + 0x58));
+		smmu_np_release("venus sec non-pixel", &np_bank_saved);
+		np_bank_on = 0;
+	}
 	if (np_assigned && !hyp_assign(np_pa, np_len, VMID_CP_NP, VMID_HLOS, 7))
 		np_assigned = 0;
+	if (np_tbl && np_tbl_assigned) {
+		static const uint32_t src[] = { VMID_HLOS, VMID_CP_NP }, dst[] = { VMID_HLOS }, perm[] = { 7 };
+		if (!hyp_assign_vm(np_tbl, 3 * 0x1000, src, 2, dst, perm, 1))
+			np_tbl_assigned = 0;
+	}
+	if (np_tbl && !np_tbl_assigned) {
+		pm_free(np_tbl);
+		np_tbl = 0;
+	} else if (np_tbl)
+		printf("venus: np tables %#llx still assigned: leaked (not freed)\n", (unsigned long long)np_tbl);
 }
-/* persist for the CVP test: window memory (bump allocator, not zeroed again), assigned to CP_NON_PIXEL, mapped at
- * the non-pixel IOVA. Device address or 0 */
+/* persist for the CVP test. NP_BANK: at a fixed place at the window's top (the same every run, so a run that died
+ * with it assigned is recovered by the next one), its own bank for 0x1304/0xe0 (stock's venus_sec_non_pixel).
+ * Else (NP_ASSIGN only): window memory from the bump allocator mapped at the non-pixel IOVA in the vmmu bank.
+ * Device address or 0 */
 uint32_t np_persist(uint32_t size, uint32_t iova)
 {
-	uint64_t a = (dc.top + 0xffff) & ~0xffffull, len = (size + 0xffffu) & ~0xffffull;
-	if (a + len + 0x1000 > dc.lim)
+	int bank = np_force_bank || (getenv("VENUSCTL_NP_BANK") && atoi(getenv("VENUSCTL_NP_BANK")));
+	uint64_t len = (size + 0xffffu) & ~0xffffull, a;
+	if (np_assigned || np_bank_on) {
+		printf("venus: np persist already in use (one per process)\n");
 		return 0;
+	}
+	if (bank) {
+		a = (dc.lim - 0x100000) & ~0xffffull;
+		if (len > 0x100000 || a < dc.top) {
+			printf("venus: np persist: no room at the window top (%#llx..%#llx)\n", (unsigned long long)dc.top,
+			       (unsigned long long)dc.lim);
+			return 0;
+		}
+		dc.lim = a;
+		np_pa = a;
+		np_len = len;
+		np_assigned = 1;	/* recovery: a run that died left it assigned? (refused when HLOS owns it) */
+		if (!hyp_assign(a, len, VMID_CP_NP, VMID_HLOS, 7))
+			printf("venus: np persist %#llx was still assigned to CP_NON_PIXEL: recovered\n",
+			       (unsigned long long)a);
+		np_assigned = 0;
+	} else {
+		a = (dc.top + 0xffff) & ~0xffffull;
+		if (a + len + 0x1000 > dc.lim)
+			return 0;
+		dc.top = a + len + 0x1000;
+		np_pa = a;
+		np_len = len;
+	}
 	static uint8_t z[0x10000];
 	for (uint64_t o = 0; o < len; o += sizeof(z))
 		if (pm_wr(a + o, z, sizeof(z)))
 			return 0;
-	np_lists = a + len;
-	dc.top = np_lists + 0x1000;
-	np_pa = a;
-	np_len = len;
+	static int reg;
+	if (!reg) {
+		atexit(np_unassign);
+		reg = 1;
+	}
 	if (hyp_assign(a, len, VMID_HLOS, VMID_CP_NP, 6))
 		return 0;
 	np_assigned = 1;
-	atexit(np_unassign);
-	return vmmu_map_phys(a, (uint32_t)len, iova, "persist (CP non-pixel)");
+	if (!bank)
+		return vmmu_map_phys(a, (uint32_t)len, iova, "persist (CP non-pixel)");
+	int cb = smmu_np_bank("venus sec non-pixel", 0x1304, 0xe0, iova, a, len, np_prep_tables, &np_tbl,
+			      &np_bank_saved);
+	pm_step("np bank: persist %#llx IOVA %#x CB%d", (unsigned long long)a, iova, cb);
+	if (cb < 0)
+		return 0;
+	np_bank_on = 1;
+	printf("venus: persist %#llx+%#llx (CP_NON_PIXEL) at IOVA %#x through its own bank CB%d\n",
+	       (unsigned long long)a, (unsigned long long)len, iova, cb);
+	return iova;
 }
 
 /* venus-iommu CVP test (VENUSCTL_NP_SMR=1): the extra non-pixel SMR, released when this process exits */
@@ -3686,9 +3766,12 @@ int vdec_poll(unsigned ms)
 	return wait_msg(0, ms);
 }
 
+static void np_unassign(void);
 int vdec_close(void)
 {
-	return dec_close(dc.started);
+	int r = dec_close(dc.started);
+	np_unassign();	/* venus-cvp: the session's CP non-pixel persist goes back (nothing if none) */
+	return r;
 }
 
 void vdec_status(struct vdec_status *st)
