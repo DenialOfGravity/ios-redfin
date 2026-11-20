@@ -483,6 +483,34 @@ static int cmddb_aux(const char *id, uint64_t *aux, uint32_t *len)
 #define BCM_OFF		(1u << 30)	/* commit, not valid: x = y = 0 (Linux tcs_cmd_gen) */
 static const char *const bcms[] = { "MM3", "MM2" };	/* vote order (notes table "RPMh BCMs") */
 
+/* rpmh-agg (xnu 1269): kern.sweet_rpmh_agg bit 0 = the kernel keeps one share per client and BCM and sends the
+ * aggregate (sum of x, max of y, as bcm-voter/msm_bus_arb_rpmh): venus then votes as its own client (PMEM_RPMH_CL id
+ * VENUSCTL_BUS_CLIENT, default 1 = venus) and the whole stock venus-ddr path with stock's values (bus_vote_kbps), so its
+ * SH0/MC0 share can no longer lower the GPU's DDR vote and its 0 at collapse drops only its own share. VENUSCTL_AGG=0|1
+ * overrides the sysctl. bus_client -1 = the shared PMEM_RPMH as before. */
+static int bus_client = -1;
+
+static int agg_on(void)
+{
+	if (getenv("VENUSCTL_AGG"))
+		return atoi(getenv("VENUSCTL_AGG")) > 0;
+	unsigned v = 0;
+	size_t l = sizeof v;
+	return sysctlbyname("kern.sweet_rpmh_agg", &v, &l, NULL, 0) == 0 && (v & 1);
+}
+
+static int bcm_send(const char *res, const uint32_t *off, const uint32_t *val)
+{
+	if (bus_client >= 0) {
+		int rc = pm_rpmh_cl((unsigned)bus_client, res, 1, off, val);
+		if (rc != ENOTTY)
+			return rc;
+		printf("venus: bcm %s: kernel without PMEM_RPMH_CL (ENOTTY): the shared PMEM_RPMH vote\n", res);
+		bus_client = -1;
+	}
+	return pm_rpmh(res, 1, off, val);
+}
+
 /* vdbcm (the 15-min Safari soak, video.md 2026-11-03: "bcm MM3 vote failed" -> 16, venusd power on failed): the
  * kernel's PMEM_RPMH answers EBUSY while another /dev/pmem user's vote holds its lock or an ACTIVE TCS (up to its
  * 100 ms timeout; bsd/dev/sweet_rpmh.c): retried, 5 ms doubling, VENUS_BCM_TRIES (6, ~155 ms in all; 1: one try as
@@ -499,11 +527,11 @@ static int bcm(const char *res, uint32_t v)
 		printf("venus: bcm %s = %#010x: not voted: RPMh votes halted (%s)\n", res, v, rails_rpmh_halt_why());
 		return 5;
 	}
-	int rc = pm_rpmh(res, 1, off, val);
-	printf("venus: bcm %s = %#010x -> %d\n", res, v, rc);
+	int rc = bcm_send(res, off, val);
+	printf("venus: bcm %s = %#010x -> %d%s\n", res, v, rc, bus_client >= 0 ? " (client)" : "");
 	for (int i = 1, wait = 5, eio = 0; rc && i < tries && (rc == EBUSY || (rc == EIO && !eio++)); i++, wait *= 2) {
 		delay_ms((unsigned)wait);
-		rc = pm_rpmh(res, 1, off, val);
+		rc = bcm_send(res, off, val);
 		printf("venus: bcm %s = %#010x -> %d (try %d of %d, after %d ms)\n", res, v, rc, i + 1, tries, wait);
 	}
 	rails_rpmh_note(res, rc);	/* p0c2 */
@@ -525,7 +553,38 @@ static int bcm(const char *res, uint32_t v)
  * the whole system. Those need a per-client aggregating vote in the kernel (see the research log). */
 static int bus_real(void)
 {
+	if (agg_on()) {	/* rpmh-agg: real votes on the whole path by default (VENUSCTL_BUS=0: the minimal MM3/MM2 vote) */
+		bus_client = getenv("VENUSCTL_BUS_CLIENT") ? atoi(getenv("VENUSCTL_BUS_CLIENT")) : (int)PMEM_RPMH_CL_VENUS;
+		return !getenv("VENUSCTL_BUS") || atoi(getenv("VENUSCTL_BUS")) > 0;
+	}
+	bus_client = -1;
 	return getenv("VENUSCTL_BUS") && atoi(getenv("VENUSCTL_BUS")) > 0;
+}
+
+/* rpmh-agg: ab -> x over buswidth * ports, ib -> y over buswidth (msm_bus_arb_rpmh bcm_update_bus_req) */
+static uint32_t bcm_cmd_abib(const char *res, uint64_t kbps, unsigned buswidth, unsigned ports)
+{
+	uint64_t aux;
+	uint32_t len;
+	if (!kbps)
+		return BCM_OFF;
+	if (cmddb_aux(res, &aux, &len) || len < 6) {
+		printf("venus: bus: %s: no cmd-db aux data: the minimal vote\n", res);
+		return BCM_ON;
+	}
+	uint32_t unit = rd32(aux), width = rd32(aux + 4) & 0xffff;
+	if (!unit || !width) {
+		printf("venus: bus: %s: aux unit %u width %u: the minimal vote\n", res, unit, width);
+		return BCM_ON;
+	}
+	uint64_t x = kbps * 1000ull * width / ((uint64_t)buswidth * ports) / unit;
+	uint64_t y = kbps * 1000ull * width / buswidth / unit;
+	x = x ? (x > 0x3fff ? 0x3fff : x) : 1;
+	y = y ? (y > 0x3fff ? 0x3fff : y) : 1;
+	uint32_t v = 1u << 30 | 1u << 29 | (uint32_t)x << 14 | (uint32_t)y;
+	printf("venus: bus: %s %llu kBps (unit %u width %u, buswidth %u x %u) -> x %llu y %llu (%#010x)\n", res,
+	       (unsigned long long)kbps, unit, width, buswidth, ports, (unsigned long long)x, (unsigned long long)y, v);
+	return v;
 }
 
 static uint32_t bcm_cmd_kbps(const char *res, uint64_t kbps, unsigned buswidth, unsigned ports)
@@ -556,7 +615,25 @@ static int bus_vote_kbps(uint64_t kbps, const char *why)
 {
 	static const struct { const char *res; unsigned bw, ports; } path[] = { { "MM3", 32, 1 }, { "MM2", 32, 1 } };
 	int rc = 0;
-	printf("venus: bus: venus-ddr %llu kBps (%s)\n", (unsigned long long)kbps, why);
+	printf("venus: bus: venus-ddr %llu kBps (%s)%s\n", (unsigned long long)kbps, why, bus_client >= 0 ? ", whole path as a client" : "");
+	if (bus_client >= 0) {
+		/* rpmh-agg: stock's venus-ddr path qxm_venus0 (MM3) -> qns_mem_noc_sf (MM2) -> qns_llcc (SH0, buswidth 16
+		 * x 2) -> ebi (MC0, 4 x 2, + ACV apps mask 0x8: msm_bus_arb_rpmh BCM_TCS_CMD_ACV_APPS) and the cfg port
+		 * slv_qhs_venus_cfg (CN0, 4 x 1) at 1 MB/s (lito-bus.dtsi; CN0/SH0/MC0 are keepalive in the kernel: at 0
+		 * the aggregate never goes below x = y = 1). Down the path when voting, back up it at 0. */
+		static const struct { const char *res; unsigned bw, ports, kind; } full[] = {
+			{ "MM3", 32, 1, 0 }, { "MM2", 32, 1, 0 }, { "SH0", 16, 2, 0 }, { "MC0", 4, 2, 0 }, { "ACV", 0, 0, 1 },
+			{ "CN0", 4, 1, 2 },
+		};
+		unsigned nf = sizeof full / sizeof full[0];
+		for (unsigned k = 0; k < nf; k++) {
+			unsigned i = kbps ? k : nf - 1 - k;
+			uint32_t v = full[i].kind == 1 ? (kbps ? 1u << 30 | 1u << 29 | 0x8u : BCM_OFF) :
+				bcm_cmd_abib(full[i].res, full[i].kind == 2 ? (kbps ? 1000 : 0) : kbps, full[i].bw, full[i].ports);
+			rc |= bcm(full[i].res, v);
+		}
+		return rc;
+	}
 	for (unsigned i = 0; i < 2; i++)
 		rc |= bcm(path[i].res, bcm_cmd_kbps(path[i].res, kbps, path[i].bw, path[i].ports));
 	return rc;
@@ -1070,9 +1147,23 @@ int power_off(void)
 	int rc = 0;
 	rc |= tbu_vote_off();	/* P0c: only what power on changed */
 	rc |= rails_restore();	/* Linux order back: clocks (cx), then buses */
-	for (unsigned i = 2; i-- > 0;)
-		rc |= bcm(bcms[i], BCM_OFF);
+	if (bus_real() && bus_client >= 0)	/* rpmh-agg: venus's share of the whole path to 0 */
+		rc |= bus_vote_kbps(0, "power off");
+	else
+		for (unsigned i = 2; i-- > 0;)
+			rc |= bcm(bcms[i], BCM_OFF);
 	return rc ? 1 : 0;
+}
+
+/* rpmh-agg test: venusctl bus KBPS votes the venus path now (env VENUSCTL_BUS_CLIENT=N: as client N, e.g. 8 = a
+ * stand-in for another user to see the sums); nothing else is touched */
+int bus_cmd(uint64_t kbps)
+{
+	if (!bus_real()) {
+		printf("venus: bus: kern.sweet_rpmh_agg is 0 and VENUSCTL_BUS unset: nothing voted\n");
+		return 1;
+	}
+	return bus_vote_kbps(kbps, "venusctl bus") ? 1 : 0;
 }
 
 /* ---- PAS check (adspboot.c boot(): metadata = ELF header + phdrs + hash segment) ---- */
