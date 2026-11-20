@@ -287,7 +287,12 @@ static void enc_frame(const struct venusd_msg *m)
 	if (j >= 0) {
 		uint32_t st, ys, uvo, sz;
 		venc_layout(&st, &ys, &uvo, &sz);
-		uint32_t off = yo & 0xfff;	/* in-page part: the ETB offset; whole pages: the address */
+		/* in-page part (CoreVideo's 64/128-byte header): the firmware ignores the ETB offset for encoder input (the
+		 * picture came out shifted by it), so the address itself points at plane 0 (VENUSD_ENC_ZC_ADDR=0: offset) */
+		static int zc_addr = -1;
+		if (zc_addr < 0)
+			zc_addr = !getenv("VENUSD_ENC_ZC_ADDR") || atoi(getenv("VENUSD_ENC_ZC_ADDR"));
+		uint32_t off = zc_addr ? 0 : yo & 0xfff;
 		iova += yo - off, len -= yo - off;
 		if (vmmu_sync(iova, sz + off < len ? sz + off : len, 1)) {
 			enc_indone(m->seq, m->surface, -EIO, 0);
