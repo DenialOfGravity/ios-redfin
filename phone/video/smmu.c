@@ -425,7 +425,10 @@ int smmu_window(const char *name, const uint16_t *sids, unsigned n, uint64_t bas
 	double t0 = mono_ms();
 	for (unsigned i = 0; (rd32(cbp + 0x7f4) & 1) && !wait_over(t0, i, 1000); i++)
 		delay_ms(1);
-	wr32(cbp, R_SCTLR);				/* SCTLR last: M | TRE | AFE | CFRE | HUPCF | ASIDPNE, no CFIE */
+	/* venus-robust (h): VENUSCTL_SMMU_STALL=1 adds CFCFG (bit 7): a faulting transaction stalls (FSR.SS) instead of
+	 * aborting back to the master, so its address and stream can be read before anything reacts to the abort */
+	uint32_t sct = R_SCTLR | (getenv("VENUSCTL_SMMU_STALL") && atoi(getenv("VENUSCTL_SMMU_STALL")) ? 0x80u : 0);
+	wr32(cbp, sct);					/* SCTLR last: M | TRE | AFE | CFRE | HUPCF | ASIDPNE, no CFIE */
 	uint64_t r1 = 0, rb = 0, re = 0;
 	pm_rd(l1 + 8 * ((base >> 30) & 0x1ff), &r1, 8);
 	pm_rd(l2 + 8 * ((base >> 21) & 0x1ff), &rb, 8);
@@ -433,7 +436,7 @@ int smmu_window(const char *name, const uint16_t *sids, unsigned n, uint64_t bas
 	uint64_t ttbr = ((uint64_t)rd32(cbp + 0x24) << 32) | rd32(cbp + 0x20);
 	int ok = r1 == (l2 | 3) && rb == (base | (R_PAGE & ~2ull)) &&
 		 re == ((base + len - 0x200000) | (R_PAGE & ~2ull)) && ttbr == (l1 | asid) && rd32(cbp + 0x30) == R_TCR &&
-		 (rd32(cbp) & ~0x1000u) == (R_SCTLR & ~0x1000u) && rd32(gr1 + 4 * cb) == R_CBAR;
+		 (rd32(cbp) & ~0x1000u) == (sct & ~0x1000u) && rd32(gr1 + 4 * cb) == R_CBAR;
 	printf("smmu: %s: CB%d window %llx-%llx (IOVA = PA), tables %llx: TTBR0 %llx TCR %08x SCTLR %08x CBAR %08x -> %s\n",
 	       name, cb, (unsigned long long)base, (unsigned long long)(base + len), (unsigned long long)tbl,
 	       (unsigned long long)ttbr, rd32(cbp + 0x30), rd32(cbp), rd32(gr1 + 4 * cb), ok ? "ok" : "NOT as written");

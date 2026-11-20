@@ -20,9 +20,9 @@ mkdir -p out
 sign() {	# FILE [ENTITLEMENTS]
 	if [ -n "${2:-}" ]; then codesign -f -s - --entitlements "$2" "$1"; else codesign -f -s - "$1"; fi
 }
-$CC $W -o out/venusctl venusctl.c venus_core.c venus_h264.c venus_hevc.c pmem.c smmu.c
+$CC $W -o out/venusctl venusctl.c venus_core.c venus_rails.c venus_h264.c venus_hevc.c pmem.c smmu.c
 sign out/venusctl
-$CC $W -o out/venusd venusd.c venus_core.c venus_h264.c venus_hevc.c pmem.c smmu.c -framework CoreFoundation -framework IOSurface
+$CC $W -o out/venusd venusd.c venus_core.c venus_rails.c venus_h264.c venus_hevc.c pmem.c smmu.c -framework CoreFoundation -framework IOSurface
 sign out/venusd
 $CC $W -o out/venusc venusc.c venus_h264.c venus_hevc.c -framework CoreFoundation -framework CoreVideo -framework IOSurface
 sign out/venusc

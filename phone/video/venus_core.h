@@ -12,6 +12,15 @@
 #ifndef STATE	/* -D for a host test build */
 #define AHB_STATE	"/var/tmp/venusctl.ahb"	/* gcc_video_ahb CBCR before power on cleared HW_CTL */
 #define STATE		"/var/tmp/venusctl.state"
+/* ws-venus-enc: the hardware encoder (venus_enc.inc, included by venus_core.c): raw NV12 file -> Annex B H.264/HEVC */
+struct venc_cfg {
+	int w, h, hevc, fps, gop, rc;	/* rc: 0 VBR_CFR, 1 CBR_CFR, 2 off; gop = frames per IDR (1 = all intra) */
+	uint32_t bitrate, debug;
+	int profile, level, frames;	/* HFI profile/level (0 = H.264 High 4.1 / HEVC Main 4 main tier); frames 0 = all */
+	uint64_t bufphys;
+};
+int encode(const struct venc_cfg *c, const char *in, const char *outp);
+int cvp_on(void);	/* venusctl power cvp: GDSC mvs1 + mvs1 branches (after power on / boot) */
 #endif
 
 extern int verbose, cvp, force;	/* venusctl -v, --cvp, --force */
@@ -41,8 +50,16 @@ int init(uint64_t phys);
 int ping(uint32_t debug);
 int session(uint32_t debug);
 int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t bufphys, int hevc);	/* -1: detect */
+/* ws-video-dec: keep an active decode session fed for `seconds` of wall clock (loop the clip if `loop`), no YUV out,
+ * for the idle-reset test (logs/research/video-reset-2026-11-16.md). 0 = PASS (survived, frames > 0, no error). */
+int decode_loop(uint32_t debug, const char *clip, int seconds, int loop, uint64_t bufphys, int hevc);
 int memtest(uint64_t a, uint64_t len, int write);
 int shutdown_cmd(void);
+int fwdump(uint64_t addr);	/* P0d: read-only dump of the HFI block left at addr (0: 0xa2600000) after a reset */
+int hwctl_cmd(int on);	/* venus-hw: mvs0 GDSC HW_CONTROL on/off (msm_vidc __hand_off_regulators, qcom,support-hw-trigger) */
+int intmask_cmd(void);	/* venus-hw: WRAPPER_INTR_MASK: unmask A2HWD (0x10) and A2H (0x4) as Linux's interrupt init */
+int suspend_cmd(void);	/* venus-hw: Linux power collapse (PC_PREP, TZ suspend, power off; image kept) */
+int resume_cmd(void);	/* venus-hw: power on, TZ resume, UC regs, CTRL_INIT (no PIL reload) */
 
 /* ---- the stage 3 decoder in steps (venusctl decode runs them in its loop; venusd per client message) ---- */
 
@@ -85,10 +102,16 @@ struct vdec_status {
 	unsigned acts;				/* msgq packets handled (progress) */
 	double cp_sum, cp_max;			/* copy-out seconds */
 	uint32_t in_size;			/* input buffer size */
+	int in_fw;				/* vdstall: input buffers with the firmware (ETB, no EBD yet) */
+	unsigned ebds;				/* vdstall: EBDs handled (changes: an input came back) */
 };
 void vdec_status(struct vdec_status *st);
 void vdec_fw_reset(void);	/* after a shutdown: the next bring-up starts with a live firmware again */
 void vdec_abort(void);		/* vdstop: forget the session after a STOP unwound it (no packets handled, no commands) */
+int vc_bus_session(unsigned w, unsigned h, unsigned fps);	/* venus-robust (f): VENUSCTL_BUS=1 session vote */
+uint64_t vc_bus_kbps_for(unsigned w, unsigned h, unsigned fps);
+unsigned vc_clk_for(unsigned w, unsigned h, unsigned fps, int two_sessions);	/* (f): 240/338/365 MHz by load */
+int vc_fw_watchdog(void);	/* venus-robust (e): read-only A2HWD check (core on, queues up); -1 = firmware dead */
 void vdec_sfr(void);		/* vdstop: print the firmware's SFR (STATE's queue block; DRAM only, no core access) */
 
 #endif

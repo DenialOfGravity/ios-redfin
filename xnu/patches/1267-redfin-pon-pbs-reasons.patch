@@ -1,0 +1,45 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] 1267 redfin: kern.sweet_pon also shows the PMIC5 PON_PBS reason bytes 0x8c0-0x8cf (ws-venus-hw)
+
+1129 decodes 0x800-0x81f (the gen1/gen2 PON layout). PM8150 is a PMIC5 part whose reset/off/fault reasons sit at
+0x8c0-0x8cf (PON_REASON1, WARM_RESET_REASON1/2, ON_REASON, POFF_REASON1/2, FAULT_REASON1/2, S3_RESET_REASON); 1129's
+line has been byte-identical on every boot, so the Venus reset could not be told from a clean reboot. Read once at boot,
+read only, appended raw to the same line: "| 8c0-8cf: ..". Nothing else changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 10bce06..457585e 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -45,7 +45,7 @@
+  *   (the shim/ABL reboot reason, NOTES "Reboot reason"). All bytes are in the line raw, decode is a guide only.
+  * smpl / hard_reset / uvlo = a PMIC-level event (rail, brown-out); warm reset reason set = a TZ/watchdog reset.
+  */
+-static char sp_pon_line[384] = "SWEET PON: not read yet";
++static char sp_pon_line[448] = "SWEET PON: not read yet";
+ SYSCTL_STRING(_kern, OID_AUTO, sweet_pon, CTLFLAG_RD | CTLFLAG_LOCKED, sp_pon_line, sizeof(sp_pon_line),
+     "1129: PM8150 PON reason registers at boot (read only)");
+ static void sp_pon_boot(void);
+@@ -313,6 +313,21 @@ sp_pon_boot(void)
+ 	snprintf(sp_pon_line, sizeof(sp_pon_line), "SWEET PON: reason %s | warm %#x | fault %s (%#x) | s3 %#x | spare88f %s%#x |"
+ 	    " type %02x/%02x | 800-81f: %s%s", dec[0] ? dec : "none", r[0x0a], fdec[0] ? fdec : "none", fb, r[0x14],
+ 	    spare_ok ? "" : "?", spare, r[4], r[5], raw, bad ? " (some reads failed: ee)" : "");
++	/*
++	 * 1267: the PMIC5 (PM8150) PON_PBS reason block at 0x8c0-0x8cf (PON_REASON1 0xc0, WARM_RESET_REASON1/2 0xc2/0xc3,
++	 * ON_REASON 0xc4/0xc5, POFF_REASON1/2 0xc7/0xc8, FAULT_REASON1/2 0xcc/0xcd, S3_RESET_REASON 0xce as in Linux's
++	 * qpnp-power-on gen3 layout); 0x800-0x81f above is the gen1/2 layout. Raw bytes, read once at boot, read only.
++	 */
++	uint8_t g[0x10];
++	char graw[3 * 0x10 + 1];
++	for (unsigned i = 0; i < sizeof(g); ++i) {
++		if (sweet_spmi_read(0, 0x8c0 + i, &g[i]) != 0) {
++			g[i] = 0xee;
++		}
++		snprintf(graw + 3 * i, 4, "%02x%s", g[i], i == 0xf ? "" : " ");
++	}
++	size_t n = strlen(sp_pon_line);
++	snprintf(sp_pon_line + n, sizeof(sp_pon_line) - n, " | 8c0-8cf: %s", graw);
+ 	printf("%s\n", sp_pon_line);
+ }
+ 

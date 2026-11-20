@@ -47,6 +47,7 @@
 #include "pmem.h"
 #include "smmu.h"
 #include "venus_core.h"
+#include "venus_rails.h"	/* P0c */
 #include "venus_hevc.h"
 
 #define GCC		0x00100000u
@@ -124,6 +125,15 @@
 #define WRAP_CPU_CLKCFG	(CORE + 0xe2000)	/* clock_config_on_enable_vpu5 (venus_hfi.c:4706) */
 #define WRAP_CPU_CGCDIS	(CORE + 0xe2010)	/* clock_config_on_enable_vpu5 (venus_hfi.c:4705) */
 #define WRAP_CPU_STATUS	(CORE + 0xe2014)	/* read only */
+/* P0d (video-reset-2026-11-16 Q1/Q4), Linux msm-4.19 techpack/video/msm/vidc (redbull = Pixel 5 kernel) hfi_io_common.h */
+#define CS_A2HSOFTINTCLR (CS + 0x1c)	/* CPU_CS_A2HSOFTINTCLR (CPU_CS_BASE_OFFS + 0x1C): written only with VENUSCTL_INTCLR=1 */
+#define WRAP_INTR_CLEAR	(CORE + 0xe0014)	/* WRAPPER_INTR_CLEAR (WRAPPER_BASE_OFFS + 0x14): only with VENUSCTL_INTCLR=1 */
+#define INTR_A2HWD	0x10u		/* WRAPPER_INTR_STATUS_A2HWD_BMSK */
+#define INTR_A2H	0x4u		/* WRAPPER_INTR_STATUS_A2H_BMSK */
+#define ST_PC_READY	(1u << 8)	/* CPU_CS_SCIACMDARG0_HFI_CTRL_PC_READY 0x100 */
+#define ST_IDLE		(1u << 30)	/* CPU_CS_SCIACMDARG0_HFI_CTRL_INIT_IDLE_MSG_BMSK 0x40000000 */
+#define CPU_WFI		1u		/* WRAPPER_CPU_STATUS bit 0 (__prepare_pc_common: BIT(0) & WRAPPER_CPU_STATUS) */
+#define HFI_SYS_PC_PREP	0x10002u	/* HFI_CMD_SYS_PC_PREP = HFI_CMD_SYS_COMMON_START + 0x002 (vidc_hfi_helper.h) */
 #define ST_INIT		1u		/* CTRL_STATUS bit 0 */
 #define ST_ERROR	0xfeu		/* CTRL_STATUS 7:1, 4 = bad UC region (venus_hfi.c:1277) */
 
@@ -286,9 +296,18 @@ static int core_ok(void)
 		fake_hit = 1;
 		return 0;
 	}
-	int ok = ahb_on() && !(rd32(GCC_VIDEO_AXI) & CLK_OFF) && (vrd(GDSC_MVSC) & PWR_ON) && (vrd(GDSC_MVS0) & PWR_ON);
+	/* venus-hw VENUSCTL_LINUX: gcc_video_axi stays off (as under stock Linux) and mvs0 may be in HW control (collapsed
+	 * by the firmware between frames, powered on demand) */
+	int lx = getenv("VENUSCTL_LINUX") != NULL;
+	/* venus-robust (h) VENUSCTL_HWCTL: mvs0/mvs1 handed to HW after CTRL_INIT: the firmware may collapse them (and
+	 * their branches read CLK_OFF); the host only touches wrapper/CPU_CS registers (mvsc domain) */
+	int hw = lx || (getenv("VENUSCTL_HWCTL") && atoi(getenv("VENUSCTL_HWCTL")));
+	int hw0 = hw && (vrd(GDSC_MVS0) & HW_CONTROL), hw1 = hw && (vrd(GDSC_MVS1) & HW_CONTROL);
+	int ok = ahb_on() && (lx || !(rd32(GCC_VIDEO_AXI) & CLK_OFF)) && (vrd(GDSC_MVSC) & PWR_ON) &&
+		 ((vrd(GDSC_MVS0) & PWR_ON) || hw0);
 	for (unsigned i = 0; i < NBR && ok; i++)
-		if (!branches[i].cvp || cvp)
+		if ((!branches[i].cvp || cvp) && !(hw0 && strstr(branches[i].name, "mvs0")) &&
+		    !(hw1 && strstr(branches[i].name, "mvs1")))
 			ok = !(vrd(branches[i].pa) & CLK_OFF);
 	return ok;
 }
@@ -350,9 +369,13 @@ static uint32_t crd(uint32_t pa)
 	return rd32(pa);
 }
 
+static int intclr_on;	/* P0d: VENUSCTL_INTCLR=1 (watch): the interrupt clear registers become writable */
+
 static int allowed(uint32_t pa)
 {
 	if (pa == GCC_VIDEO_AHB || pa == GCC_VIDEO_AXI)
+		return 1;
+	if (pa == CORE + 0xe0010)	/* venus-hw: WRAPPER_INTR_MASK (intmask, VENUSCTL_LINUX) */
 		return 1;
 	/* stage 2 steps 4-6, each from its downstream line (defines above) */
 	if (pa == WRAP_CPU_CGCDIS || pa == WRAP_CPU_CLKCFG)	/* boot: clock_config_on_enable_vpu5 */
@@ -362,6 +385,8 @@ static int allowed(uint32_t pa)
 	if (pa == CS_VMIMSG || pa == CS_VMIMSGAG0 || pa == CS_VMIMSGAG1 || pa == CTRL_INIT)	/* init */
 		return 1;
 	if (pa == IC_SOFTINT)	/* ping: doorbell */
+		return 1;
+	if ((pa == CS_A2HSOFTINTCLR || pa == WRAP_INTR_CLEAR) && intclr_on)	/* P0d VENUSCTL_INTCLR=1 only */
 		return 1;
 	if ((pa >= PLL0 && pa <= PLL_FRAC) || pa == IRIS_RCG || pa == IRIS_CFG)
 		return 1;
@@ -470,6 +495,10 @@ static int bcm(const char *res, uint32_t v)
 	if (tries < 0)
 		tries = getenv("VENUS_BCM_TRIES") && atoi(getenv("VENUS_BCM_TRIES")) > 0 ? atoi(getenv("VENUS_BCM_TRIES")) : 6;
 	uint32_t off[1] = { 0 }, val[1] = { v };
+	if (rails_rpmh_halted()) {	/* p0c2: an earlier vote timed out / EIO: no more RPMh votes in this run */
+		printf("venus: bcm %s = %#010x: not voted: RPMh votes halted (%s)\n", res, v, rails_rpmh_halt_why());
+		return 5;
+	}
 	int rc = pm_rpmh(res, 1, off, val);
 	printf("venus: bcm %s = %#010x -> %d\n", res, v, rc);
 	for (int i = 1, wait = 5, eio = 0; rc && i < tries && (rc == EBUSY || (rc == EIO && !eio++)); i++, wait *= 2) {
@@ -477,10 +506,106 @@ static int bcm(const char *res, uint32_t v)
 		rc = pm_rpmh(res, 1, off, val);
 		printf("venus: bcm %s = %#010x -> %d (try %d of %d, after %d ms)\n", res, v, rc, i + 1, tries, wait);
 	}
+	rails_rpmh_note(res, rc);	/* p0c2 */
 	if (rc == EIO)
 		printf("venus: bcm %s: EIO: the kernel's RPMh driver refuses votes (quarantined after a timeout this boot?"
 		       " kernel log \"SWEET RPMH: timeout\"): a reboot clears it\n", res);
 	return rc;
+}
+
+/* venus-robust (f): real MMNOC votes (VENUSCTL_BUS=1; default off = the x = y = 1 vote above). The venus-ddr path
+ * qxm_venus0 (MM3, buswidth 32, 1 port) -> qns_mem_noc_sf (MM2, buswidth 32, 1 port) (lito-bus.dtsi:1034-1046,
+ * 1745-1752); the BCM value as the bus driver computes it (icc-rpmh bcm_aggregate / msm_bus_rpmh): x = kBps * 1000 *
+ * width / (buswidth * ports) / unit with unit (u32) and width (u16) from the BCM's cmd-db aux data, 14 bits, ab = ib.
+ * Power on / PIL: 6533000 kBps (stock __vote_buses(INT_MAX) capped at qcom,bus-range-kbps 1000-6533000,
+ * lito-vidc.dtsi:48-56); a session: the stock figures 143 MB/s CIF30, 341 MB/s 1080p30 (TWRP capture), linear in
+ * MB/s between and beyond; collapse / power off: 0 as before (BCM_OFF). SH0/MC0/ACV (llcc, ebi) and CN0 (cfg) are NOT
+ * voted: the apps DRV holds one vote per BCM for every XNU client (last write wins) and the kernel's gpu_bus_vote
+ * (xnu 0904/0122, boot-arg sweetddr) already holds MC0 + SH0 at the top value: a Venus vote would LOWER the DDR vote of
+ * the whole system. Those need a per-client aggregating vote in the kernel (see the research log). */
+static int bus_real(void)
+{
+	return getenv("VENUSCTL_BUS") && atoi(getenv("VENUSCTL_BUS")) > 0;
+}
+
+static uint32_t bcm_cmd_kbps(const char *res, uint64_t kbps, unsigned buswidth, unsigned ports)
+{
+	uint64_t aux;
+	uint32_t len;
+	if (cmddb_aux(res, &aux, &len) || len < 6) {
+		printf("venus: bus: %s: no cmd-db aux data: the minimal vote\n", res);
+		return BCM_ON;
+	}
+	uint32_t unit = rd32(aux), width = rd32(aux + 4) & 0xffff;
+	if (!unit || !width) {
+		printf("venus: bus: %s: aux unit %u width %u: the minimal vote\n", res, unit, width);
+		return BCM_ON;
+	}
+	uint64_t x = kbps * 1000ull * width / ((uint64_t)buswidth * ports) / unit;
+	if (!x && kbps)
+		x = 1;
+	if (x > 0x3fff)
+		x = 0x3fff;
+	uint32_t v = 1u << 30 | (x ? 1u << 29 : 0) | (uint32_t)x << 14 | (uint32_t)x;
+	printf("venus: bus: %s %llu kBps (unit %u width %u, buswidth %u x %u) -> x = y = %llu (%#010x)\n", res,
+	       (unsigned long long)kbps, unit, width, buswidth, ports, (unsigned long long)x, v);
+	return v;
+}
+
+static int bus_vote_kbps(uint64_t kbps, const char *why)
+{
+	static const struct { const char *res; unsigned bw, ports; } path[] = { { "MM3", 32, 1 }, { "MM2", 32, 1 } };
+	int rc = 0;
+	printf("venus: bus: venus-ddr %llu kBps (%s)\n", (unsigned long long)kbps, why);
+	for (unsigned i = 0; i < 2; i++)
+		rc |= bcm(path[i].res, bcm_cmd_kbps(path[i].res, kbps, path[i].bw, path[i].ports));
+	return rc;
+}
+
+/* a session's vote from its macroblock rate: stock msm_comm_vote_bus figures (CIF30 143 MB/s, 1080p30 341 MB/s) */
+uint64_t vc_bus_kbps_for(unsigned w, unsigned h, unsigned fps)
+{
+	uint64_t mbs = (uint64_t)((w + 15) / 16) * ((h + 15) / 16) * (fps ? fps : 30);
+	uint64_t k = 143000 + (mbs > 11880 ? (mbs - 11880) * 850 / 1000 : 0);
+	return k > 6533000 ? 6533000 : k;
+}
+
+int vc_bus_session(unsigned w, unsigned h, unsigned fps)
+{
+	if (!bus_real())
+		return 0;
+	char why[64];
+	snprintf(why, sizeof why, "session %ux%u@%u", w, h, fps ? fps : 30);
+	return bus_vote_kbps(vc_bus_kbps_for(w, h, fps), why);
+}
+
+/* venus-robust (f): the iris clock table of lito (videocc-lito.c ftbl_video_cc_iris_clk_src, qcom,vidc0
+ * allowed-clock-rates 240/338/365 MHz, all PLL0 OUT_MAIN / 2) with the vdd_cx level each rate needs
+ * (videocc-lito.c:154-161: 240 VDD_LOWER = LOW_SVS 64, 338 VDD_LOW = SVS 128, 365 VDD_LOW_L1 = SVS_L1 192).
+ * VENUSCTL_CLK_MHZ=338|365 picks the rate at power on (Lucid: L + 16-bit alpha, 19.2 MHz ref) and, unless
+ * VENUSCTL_RAILS is set, raises cx.lvl to that corner through venus_rails (raise only; power off puts back what it
+ * may). Default (unset or 240): 240 MHz exactly as before, no CX vote. Multipipe-disabled parts stay at 192 MHz. */
+static const struct { unsigned mhz, l, alpha, corner; } clk_tab[] = {
+	{ 240, 0x19, 0x0000, 64 }, { 338, 0x23, 0x3555, 128 }, { 365, 0x26, 0x0555, 192 } };
+static int clk_pick(void)
+{
+	const char *e = getenv("VENUSCTL_CLK_MHZ");
+	unsigned m = e ? (unsigned)atoi(e) : 240;
+	for (int i = 0; i < 3; i++)
+		if (clk_tab[i].mhz == m)
+			return i;
+	printf("venus: VENUSCTL_CLK_MHZ %s not 240/338/365: 240\n", e);
+	return 0;
+}
+
+unsigned vc_clk_for(unsigned w, unsigned h, unsigned fps, int two_sessions)
+{
+	/* stock msm_vidc_calc_freq_iris1 in short: <= 1080p60 fits 240 MHz (analyst estimate: 1080p30 dec well under
+	 * 240, 4K30 dec ~250-300, 4K30 enc ~330); above that 338, above 4K30 or two sessions 365 */
+	uint64_t mbs = (uint64_t)((w + 15) / 16) * ((h + 15) / 16) * (fps ? fps : 30);
+	if (two_sessions || mbs > 979200)
+		return 365;
+	return mbs > 489600 ? 338 : 240;
 }
 
 /* ---- probe (read-only) ---- */
@@ -656,6 +781,7 @@ static void gdsc_off(uint32_t pa, const char *name)
 
 /* clk_lucid_pll_configure + alpha_pll_lucid_enable (clk-alpha-pll.c) with videocc-lito.c video_pll0_config; the same
  * steps as xnu 0921's camcc PLL0 pll0_up() on this phone */
+static uint32_t pll_alpha;	/* venus-robust (f): ALPHA_VAL for the next pll_on (0 = as before: not written) */
 static int pll_on(uint32_t l)
 {
 	uint32_t m = vrd(PLL_MODE), op = vrd(PLL_OPMODE);
@@ -664,7 +790,7 @@ static int pll_on(uint32_t l)
 		return -1;
 	}
 	if ((op & PLL_RUN) && (m & OUTCTRL)) {
-		if ((vrd(PLL_L) & 0xffff) == l) {
+		if ((vrd(PLL_L) & 0xffff) == l && (!pll_alpha || (vrd(PLL_FRAC) & 0xffff) == pll_alpha)) {
 			printf("venus: pll0 already running, L %#x (MODE %#x)\n", l, m);
 			return 0;
 		}
@@ -679,6 +805,8 @@ static int pll_on(uint32_t l)
 	}
 	/* configure (clk_lucid_pll_configure): zero fields (alpha, user_u1, test_ctl, test_u) skipped as there */
 	wr(PLL_L, l, "pll0 L");
+	if (pll_alpha || (vrd(PLL_FRAC) & 0xffff))	/* a 338/365 alpha left from an earlier power on goes back to 0 */
+		wr(PLL_FRAC, pll_alpha, "pll0 ALPHA_VAL");
 	wr(PLL_CAL_L, 0x44, "pll0 CAL_L");	/* LUCID_PLL_CAL_VAL */
 	wr(PLL_CONFIG, 0x20485699, "pll0 CONFIG_CTL");
 	wr(PLL_CONFIG_U, 0x00002261, "pll0 CONFIG_CTL_U");
@@ -699,7 +827,7 @@ static int pll_on(uint32_t l)
 	}
 	upd(PLL_USER, PLL_OUT_MASK, PLL_OUT_MASK, "pll0 outputs");
 	upd(PLL_MODE, OUTCTRL, OUTCTRL, "pll0 OUTCTRL");
-	printf("venus: pll0 locked at %.1f MHz (MODE %#010x)\n", 19.2 * l, vrd(PLL_MODE));
+	printf("venus: pll0 locked at %.1f MHz (MODE %#010x)\n", 19.2 * (l + pll_alpha / 65536.0), vrd(PLL_MODE));
 	return 0;
 }
 
@@ -799,15 +927,42 @@ static void ahb_hwctl_restore(void)
 
 int power_on(void)
 {
-	for (unsigned i = 0; i < 2; i++)
-		if (bcm(bcms[i], BCM_ON)) {
-			printf("venus: STOP: bcm %s vote failed\n", bcms[i]);
+	/* venus-hw VENUSCTL_LINUX=1: the stock msm_vidc order seen in TWRP (logs/video-1120/twrp/coreinit-seq.txt):
+	 * cvp (mvs1) powered with its clocks, gcc_video_axi left off, WRAPPER_INTR_MASK unmasked before the PIL load;
+	 * boot hands mvs0 + mvs1 to HW after auth + mem protect */
+	int lx = getenv("VENUSCTL_LINUX") != NULL;
+	if (lx)
+		cvp = 1;
+	/* Linux order (msm_vidc venus_power_on: __vote_buses, then regulators, then clocks whose prepare votes the
+	 * videocc vdd_cx level): the BCMs first, then P0c (venus_rails.c, default off): VENUSCTL_RAILS raises cx.lvl
+	 * (redfin DT: the only video rail; raise only) before anything is clocked, VENUSCTL_TBUVOTE holds
+	 * mnoc_sf_0_tbu; power_off() undoes them in reverse */
+	int ck = clk_pick();
+	if (bus_real()) {
+		uint64_t k = getenv("VENUSCTL_BUS_KBPS") ? strtoull(getenv("VENUSCTL_BUS_KBPS"), NULL, 0) : 6533000;
+		if (bus_vote_kbps(k, "power on")) {
+			printf("venus: STOP: bus vote failed\n");
 			return power_off(), 1;
 		}
+	} else {
+		for (unsigned i = 0; i < 2; i++)
+			if (bcm(bcms[i], BCM_ON)) {
+				printf("venus: STOP: bcm %s vote failed\n", bcms[i]);
+				return power_off(), 1;
+			}
+	}
+	if (ck && !getenv("VENUSCTL_RAILS")) {	/* (f): the CX corner the rate needs, before anything is clocked */
+		char c[16];
+		snprintf(c, sizeof c, "%u", clk_tab[ck].corner);
+		setenv("VENUSCTL_RAILS", c, 1);
+		printf("venus: clock %u MHz: cx.lvl corner %u (VENUSCTL_RAILS=%s)\n", clk_tab[ck].mhz, clk_tab[ck].corner, c);
+	}
+	if (rails_raise() || tbu_vote_on())
+		return power_off(), 1;
 	ahb_hwctl_clear();
 	if (gcc_on(GCC_VIDEO_AHB, "gcc_video_ahb", 1))	/* BRANCH_HALT-style poll, as gcc_video_axi */
 		return power_off(), 1;
-	int axi_late = gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 0);	/* may need the video GDSCs to report on */
+	int axi_late = lx ? 0 : gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 0);	/* may need the video GDSCs to report on */
 
 	/* videocc-lito.c video_multipipe_fixup writes L 0x14 into the config for either efuse bit, but the RCG then sets
 	 * the PLL's rate itself (CLK_SET_RATE_PARENT): with VP fmax off the table still starts at 240 MHz = PLL 480 / 2,
@@ -818,11 +973,19 @@ int power_on(void)
 		l = (uint32_t)strtoul(getenv("VENUSCTL_PLL_L"), NULL, 0) == 0x14 ? 0x14 : 0x19;	/* 0x14 or 0x19 only */
 	if (l != 0x19)
 		printf("venus: efuse %#010x: multipipe or VP fmax disabled, PLL L %#x\n", rd32(EFUSE_VIDEO), l);
+	pll_alpha = 0;
+	if (l == 0x19 && ck && !getenv("VENUSCTL_PLL_L")) {	/* (f): 338/365 MHz (not on multipipe-disabled parts) */
+		l = clk_tab[ck].l, pll_alpha = clk_tab[ck].alpha;
+		printf("venus: clock %u MHz: PLL0 L %#x alpha %#x (%.1f MHz)\n", clk_tab[ck].mhz, l, pll_alpha,
+		       19.2 * (l + pll_alpha / 65536.0));
+	}
 	if (pll_on(l) || rcg_set(1, 3, "iris rcg PLL0 main /2"))	/* F(240 MHz, PLL0_OUT_MAIN, 2): field 2*2-1 */
 		return power_off(), 1;
-	printf("venus: pll0 L %#x wanted, reads L %#x MODE %#010x OPMODE %#x: %.1f MHz, iris %.1f MHz\n", l,
-	       vrd(PLL_L) & 0xffff, vrd(PLL_MODE), vrd(PLL_OPMODE), 19.2 * (vrd(PLL_L) & 0xffff),
-	       19.2 * (vrd(PLL_L) & 0xffff) / 2);
+	{
+		double f = 19.2 * ((vrd(PLL_L) & 0xffff) + (pll_alpha ? (vrd(PLL_FRAC) & 0xffff) / 65536.0 : 0));
+		printf("venus: pll0 L %#x wanted, reads L %#x MODE %#010x OPMODE %#x: %.1f MHz, iris %.1f MHz\n", l,
+		       vrd(PLL_L) & 0xffff, vrd(PLL_MODE), vrd(PLL_OPMODE), f, f / 2);
+	}
 	/* redfin: video_cc_xo_clk is CLK_IS_CRITICAL in videocc-lito.c (always on under Linux) and the venus PIL node's
 	 * proxy clock "xo": the firmware's timers run from it. Nothing in XNU turns it on; enable it if it reads off
 	 * (left on afterwards, as Linux does). VENUSCTL_XO=0: only report it. */
@@ -846,6 +1009,11 @@ int power_on(void)
 		return power_off(), 1;
 	}
 	printf("venus: WRAPPER_HW_VERSION %#x = %#010x\n", WRAP_HW_VERSION, rd32(WRAP_HW_VERSION));
+	if (lx) {
+		uint32_t m = rd32(CORE + 0xe0010);
+		wr(CORE + 0xe0010, m & ~0x14u, "WRAPPER_INTR_MASK unmask A2HWD|A2H (Linux, before the PIL load)");
+		printf("venus: linux: WRAPPER_INTR_MASK %#x -> %#x, cvp on, gcc_video_axi left off\n", m, rd32(CORE + 0xe0010));
+	}
 	return 0;
 }
 
@@ -879,6 +1047,10 @@ int power_off(void)
 		for (unsigned i = NBR; i-- > 0;)
 			if (!branches[i].cvp || cvp || (vrd(branches[i].pa) & CBCR_EN))
 				branch_off(branches[i].pa, branches[i].name, branches[i].voted);
+		if (vrd(GDSC_MVS1) & HW_CONTROL)	/* venus-hw: Linux "Acquire regulator control from HW" */
+			upd(GDSC_MVS1, HW_CONTROL, 0, "mvs1 back to SW");
+		if (vrd(GDSC_MVS0) & HW_CONTROL)
+			upd(GDSC_MVS0, HW_CONTROL, 0, "mvs0 back to SW");
 		if (cvp || (vrd(GDSC_MVS1) & PWR_ON))
 			gdsc_off(GDSC_MVS1, "mvs1");
 		gdsc_off(GDSC_MVS0, "mvs0");
@@ -896,6 +1068,8 @@ int power_off(void)
 	/* gcc_video_ahb stays enabled: critical in mainline gcc-sm7150, and the GDSC parent; only HW_CTL goes back */
 	ahb_hwctl_restore();
 	int rc = 0;
+	rc |= tbu_vote_off();	/* P0c: only what power on changed */
+	rc |= rails_restore();	/* Linux order back: clocks (cx), then buses */
 	for (unsigned i = 2; i-- > 0;)
 		rc |= bcm(bcms[i], BCM_OFF);
 	return rc ? 1 : 0;
@@ -931,6 +1105,30 @@ static uint8_t *slurp(const char *path, size_t *len)
 	return b;
 }
 
+
+/*
+ * venus-hw: where the PAS metadata (mdt header + hash segment) lives for init_image. It was a PMEM_ALLOC page of XNU's
+ * own RAM, freed right after init_image (and in any case when venusctl exits). TZ keeps that buffer for the subsystem
+ * (upstream qcom_scm_pas_init_image: "the metadata must be kept until auth_and_reset", and it is XPU-locked while
+ * held): XNU reusing the page = a secure access violation = the silent warm reset seen at random times after
+ * init_image (2026-11-20, logs/research/venus-hw-video-2026-11-20.md). wland never frees its modem/IPA metadata and
+ * never saw it. Default now: a fixed page at the top of the Venus window (0xa2600000-0xaca00000, never XNU's RAM:
+ * xram 3/13 keep it out), not freed. VENUSCTL_META_PMEM=1: the old PMEM_ALLOC + free behaviour (A/B).
+ */
+#define META_WIN_PA	0xac9f0000ull	/* 64 KB under the window's end; the metadata is ~7 KB */
+static uint64_t meta_place(const void *meta, size_t len, int *pmem)
+{
+	*pmem = getenv("VENUSCTL_META_PMEM") != NULL;
+	uint64_t pa = *pmem ? pm_alloc(len, 0x1000) : META_WIN_PA;
+	if (!pa || len > 0x10000)
+		return 0;
+	if (pm_wr(pa, meta, (len + 3) & ~(size_t)3))
+		return 0;
+	printf("venus: metadata %zu bytes at %#llx (%s)\n", len, (unsigned long long)pa,
+	       *pmem ? "PMEM_ALLOC, freed after init_image: VENUSCTL_META_PMEM" : "Venus window, kept");
+	pm_step("metadata at %#llx (%s)", (unsigned long long)pa, *pmem ? "pmem" : "window");
+	return pa;
+}
 /* venus.mdt and its metadata (ELF header + phdrs + hash segment), shared by pas-check and boot */
 struct fwimg {
 	uint8_t *mdt, *meta;
@@ -1007,14 +1205,15 @@ int pas_check(const char *fw, int no_shutdown)
 	int64_t rc = scm(7, 1, PAS_VENUS, 0, 0, &r1);
 	printf("venus: pas supported(%d) -> %lld/%llx\n", PAS_VENUS, (long long)rc, (unsigned long long)r1);
 
-	uint64_t meta_pa = pm_alloc(meta_len, 0x1000);
+	int meta_pmem;
+	uint64_t meta_pa = meta_place(meta, meta_len, &meta_pmem);
 	if (!meta_pa)
 		return 1;
-	pm_wr(meta_pa, meta, (meta_len + 3) & ~(size_t)3);
 	printf("venus: pas init_image(%d, %llx)...\n", PAS_VENUS, (unsigned long long)meta_pa);
 	rc = scm(1, 2 | (2u << 6), PAS_VENUS, meta_pa, 0, &r1);
 	printf("venus: pas init_image -> %lld/%llx\n", (long long)rc, (unsigned long long)r1);
-	pm_free(meta_pa);
+	if (meta_pmem)
+		pm_free(meta_pa);
 	int init_ok = !rc && !r1;
 	if (no_shutdown && init_ok) {	/* review 8.5.8: record it, so shutdown can undo it */
 		FILE *sf = fopen(STATE, "w");
@@ -1120,8 +1319,14 @@ static void print_sfr(uint64_t q)
 }
 
 /* the undo for boot/init, in reverse: PAS shutdown (only powered: TZ touches the core), queue memory, SMRs */
+static void win_faults(const char *when);
 static int teardown(struct vstate *v)
 {
+	if (win_cbp && (rd32(win_cbp + 0x58) & (1u << 30))) {	/* (h) VENUSCTL_SMMU_STALL: a stalled transaction */
+		win_faults("teardown, stalled");
+		wr32(win_cbp + 0x8, 1);	/* CB_RESUME: TERMINATE (abort it) before the PAS shutdown */
+		printf("venus: window bank: stalled transaction terminated (FSR now %#010x)\n", rd32(win_cbp + 0x58));
+	}
 	if (v->pas) {
 		if (!core_ok()) {
 			printf("venus: STOP: PAS shutdown needs the power on (a clock or GDSC is off): nothing undone,"
@@ -1370,6 +1575,8 @@ int smmu_cmd(void)
 	return 0;
 }
 
+static int hwctl_early(void);
+static void hwctl_handoff(const char *when);
 int boot(const char *fw, int keep)
 {
 	struct vstate v;
@@ -1441,14 +1648,15 @@ int boot(const char *fw, int keep)
 	uint64_t r1 = 0;
 	int64_t rc = scm(7, 1, PAS_VENUS, 0, 0, &r1);
 	printf("venus: pas supported(%d) -> %lld/%llx\n", PAS_VENUS, (long long)rc, (unsigned long long)r1);
-	uint64_t meta_pa = pm_alloc(f.meta_len, 0x1000);
+	int meta_pmem;
+	uint64_t meta_pa = meta_place(f.meta, f.meta_len, &meta_pmem);
 	if (!meta_pa)
 		return boot_fail(&v);
-	pm_wr(meta_pa, f.meta, (f.meta_len + 3) & ~(size_t)3);
 	printf("venus: pas init_image(%d, %llx)...\n", PAS_VENUS, (unsigned long long)meta_pa);
 	rc = scm(1, 2 | (2u << 6), PAS_VENUS, meta_pa, 0, &r1);
 	printf("venus: pas init_image -> %lld/%llx\n", (long long)rc, (unsigned long long)r1);
-	pm_free(meta_pa);
+	if (meta_pmem)
+		pm_free(meta_pa);
 	if (rc || r1)
 		return boot_fail(&v);	/* nothing in TZ: no shutdown (adspboot adsp3) */
 	v.pas = 1;
@@ -1505,6 +1713,13 @@ int boot(const char *fw, int keep)
 			return boot_fail(&v);
 	}
 	smmu_snapshot("after mem protect");
+	if (hwctl_early() && !getenv("VENUSCTL_LINUX"))
+		hwctl_handoff("after auth + mem protect (stock __load_fw order)");
+	if (getenv("VENUSCTL_LINUX")) {	/* __hand_off_regulators: vcodec and cvp to HW control */
+		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
+		printf("venus: linux: hand off mvs0 %#010x mvs1 %#010x to HW\n", vrd(GDSC_MVS0), vrd(GDSC_MVS1));
+	}
 	core_status("after auth");
 	if (keep) {
 		printf("venus: boot ok, kept (state %s): next venusctl init, or venusctl shutdown\n", STATE);
@@ -1576,6 +1791,32 @@ static int q_write(const uint32_t *w)
 
 static uint32_t pkt[3072];	/* VIDC_IFACEQ_VAR_HUGE_PKT_SIZE */
 
+/* venus-robust (c): stock __read_queue returns tx_req_is_set = (qhdr_tx_req == 1) after every msg/debug packet read,
+ * and __iface_msgq_read / __iface_dbgq_read then raise the H2A interrupt (hfi_common.c:855, 1478-1481, 1512-1515):
+ * the firmware sets tx_req when it is blocked on a full queue and waits for that interrupt. Ours never rang for the
+ * msg/debug queues (a silent stall once a queue filled). VENUSCTL_TXREQ_DB=0: off (the old behaviour). Default on:
+ * the doorbell is the same write q_write already does, only when the firmware asks for it. */
+static int txdb_on = -1;
+static unsigned txdb_n[3], txdb_epoch, txdb_rung[3];	/* one doorbell per queue per wait_msg pass (txdb_epoch) */
+static void txreq_doorbell(unsigned i)
+{
+	if (txdb_on < 0)
+		txdb_on = (!getenv("VENUSCTL_TXREQ_DB") || atoi(getenv("VENUSCTL_TXREQ_DB"))) && !getenv("VENUSCTL_NO_TXDB");
+	/* run G: the firmware leaves tx_req at 1 for the whole backlog; stock rings once per packet read (9600
+	 * doorbells for one 10 s backlog, and the host fell behind): here at most once per queue per drain pass */
+	if (!txdb_on || (txdb_epoch && txdb_rung[i] == txdb_epoch) || rd32(qhdr(i) + QH_TX_REQ) != 1)
+		return;
+	txdb_rung[i] = txdb_epoch;
+	if (tbu_ok("tx_req doorbell"))
+		return;
+	wr(IC_SOFTINT, SOFTINT_H2A, "tx_req doorbell");
+	txdb_n[i]++;
+	if (txdb_n[i] <= 5 || !(txdb_n[i] % 100))
+		printf("venus: %s queue tx_req set: doorbell #%u (firmware waited on a full queue)\n", i == 1 ? "msg" : "dbg",
+		       txdb_n[i]);
+	pm_step("tx_req doorbell q%u #%u", i, txdb_n[i]);
+}
+
 /* one packet from queue i (1 msg, 2 debug) into pkt: words, 0 = empty, -1 = bad */
 static int q_read(unsigned i)
 {
@@ -1607,7 +1848,11 @@ static int q_read(unsigned i)
 	}
 	wr32(qhdr(i) + QH_RX_REQ, nr != wi ? 0 : want_rx);
 	wr32(qhdr(i) + QH_READ, nr);
-	if (pm_stepping() && got > 0)
+	txreq_doorbell(i);	/* venus-robust (c); ws-venus-enc's VENUSCTL_NO_TXDB=1 also turns it off */
+	static int dbghex = -1;	/* ws-venus-enc: VENUSCTL_STEP_DBGHEX=0: no hex line for debug packets (the text follows) */
+	if (dbghex < 0)
+		dbghex = !getenv("VENUSCTL_STEP_DBGHEX") || atoi(getenv("VENUSCTL_STEP_DBGHEX"));
+	if (pm_stepping() && got > 0 && (i == 1 || dbghex))
 		pm_step("HFI %s pkt %#x size %u: %08x %08x %08x %08x %08x %08x", i == 1 ? "msg" : "dbg", pkt[1], pkt[0],
 			got > 2 ? pkt[2] : 0, got > 3 ? pkt[3] : 0, got > 4 ? pkt[4] : 0, got > 5 ? pkt[5] : 0,
 			got > 6 ? pkt[6] : 0, got > 7 ? pkt[7] : 0);
@@ -1617,12 +1862,45 @@ static int q_read(unsigned i)
 int vc_frame_tag;	/* vdstop: venusd sets it: firmware debug lines get the session's frame count */
 static int sess_frames(void);	/* -1: no session started */
 
+/* P0d: with VENUSCTL_PC=1 or VENUSCTL_INTCLR=1 (watch) and in fwdump, one more line naming the system packets
+ * (vidc_hfi_helper.h HFI_MSG_SYS_* / HFI_MSG_EVENT_NOTIFY, hfi_msg_event_notify_packet {size, type, session_id,
+ * event_id, event_data1, event_data2}); SYS_DEBUG text is printed below as before. Off: output unchanged. */
+static int vc_decode;
+static void decode_pkt(int n)
+{
+	uint32_t t = pkt[1];
+	if (t == 0x20004)
+		return;
+	if (t == 0x21001 && n > 5) {
+		const char *ev = pkt[3] == 1 ? "SYS_ERROR" : pkt[3] == 2 ? "SESSION_ERROR" : NULL;
+		if (ev)
+			printf("venus: decoded: EVENT_NOTIFY %s session %#x data1 %#x data2 %#x\n", ev, pkt[2], pkt[4], pkt[5]);
+		else
+			printf("venus: decoded: EVENT_NOTIFY event %#x session %#x data1 %#x data2 %#x\n", pkt[3], pkt[2],
+			       pkt[4], pkt[5]);
+		return;
+	}
+	const char *name = t == 0x20001 ? "SYS_INIT_DONE" : t == 0x20002 ? "SYS_PC_PREP_DONE" :
+		t == 0x20003 ? "SYS_RELEASE_RESOURCE_DONE" : t == 0x20006 ? "SYS_SESSION_INIT_DONE" :
+		t == 0x20007 ? "SYS_SESSION_END_DONE" : t == 0x20008 ? "SYS_IDLE" : t == 0x20009 ? "SYS_COV" :
+		t == 0x2000a ? "SYS_PROPERTY_INFO" : t == 0x220002 ? "SYS_PING_ACK" :
+		t == 0x220004 ? "SYS_SESSION_ABORT_DONE" : NULL;
+	if (!name)
+		printf("venus: decoded: type %#x (not a system packet this decoder knows)\n", t);
+	else if (t == 0x20002 || t == 0x20001 || t == 0x20003)	/* {size, type, error_type ...} */
+		printf("venus: decoded: %s error %#x\n", name, n > 2 ? pkt[2] : 0);
+	else
+		printf("venus: decoded: %s\n", name);
+}
+
 static void print_pkt(unsigned q, int n)
 {
 	printf("venus: %s pkt type %#x size %u:", q == 1 ? "msgq" : "dbgq", pkt[1], pkt[0]);
 	for (int k = 0; k < n && k < 8; k++)
 		printf(" %08x", pkt[k]);
 	printf("\n");
+	if (vc_decode)
+		decode_pkt(n);
 	if (pkt[1] == 0x20004 && n > 6) {	/* HFI_MSG_SYS_DEBUG: msg_type, msg_size, timestamp, text */
 		char s[sizeof(pkt)];
 		size_t len = 4u * (unsigned)n - 24;
@@ -1638,6 +1916,8 @@ static void print_pkt(unsigned q, int n)
 			printf("venus: [frame %d] fw [%#x]: %s\n", fr, pkt[2], s);
 		else
 			printf("venus: fw [%#x]: %s\n", pkt[2], s);
+		if (pm_stepping())	/* venus-hw: the firmware's own words survive a reset (fsynced) */
+			pm_step("fw [%#x]: %.300s", pkt[2], s);
 	}
 }
 
@@ -1652,8 +1932,11 @@ static int fw_dead;		/* stage 3: a sys error came: no more session commands */
 static void step_status(int force_now)
 {
 	static double last;
+	static int every = -1;	/* (h): VENUSCTL_STEP_STATUS_MS (500) */
+	if (every < 0)
+		every = getenv("VENUSCTL_STEP_STATUS_MS") ? atoi(getenv("VENUSCTL_STEP_STATUS_MS")) : 500;
 	double t = mono_ms();
-	if (!force_now && t - last < 500)
+	if (!force_now && t - last < every)
 		return;
 	last = t;
 	if (!core_ok()) {
@@ -1665,9 +1948,40 @@ static void step_status(int force_now)
 		" sGFSYNR1 %#010x sGFSYNR2 %#010x sGFAR %#010x%08x", rd32(CTRL_STATUS), rd32(WRAP_CPU_STATUS),
 		rd32(WRAP_INTR_STATUS), rd32(s + 0x48), rd32(s + 0x50), rd32(s + 0x54), rd32(s + 0x58), rd32(s + 0x44),
 		rd32(s + 0x40));
+	pm_step("status: gdsc mvsc %#010x mvs0 %#010x mvs1 %#010x", vrd(GDSC_MVSC), vrd(GDSC_MVS0), vrd(GDSC_MVS1));
 	if (win_cbp)
 		pm_step("status: window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x", rd32(win_cbp + 0x58),
 			rd32(win_cbp + 0x64), rd32(win_cbp + 0x60), rd32(win_cbp + 0x68));
+	static int faulted;	/* (h): the full record (stream ID) once, when the window bank shows a fault */
+	if (win_cbp && !faulted && (rd32(win_cbp + 0x58) & 0xc00001feu))
+		faulted = 1, win_faults("step status");
+}
+
+/* venus-robust (e): stock reads WRAPPER_INTR_STATUS on every interrupt; the A2HWD bit (0x10) = the ARM9 watchdog
+ * fired = firmware dead -> HAL_SYS_WATCHDOG_TIMEOUT -> handle_sys_error (hfi_common.c:3232, 3254-3266). We poll: a
+ * read-only check of the bit every VENUSCTL_WDOG_MS (default 50; 0 = off) while waiting for packets, and from
+ * vc_fw_watchdog() (venusd's tick). A hit marks the firmware dead (fw_dead: no more session commands, venusd takes
+ * Venus down as after a sys error) and prints the SFR. Read only: nothing is cleared. */
+static int wdog_ms = -1;
+static double wdog_last;
+static int wdog_check(const char *when)
+{
+	if (wdog_ms < 0)
+		wdog_ms = getenv("VENUSCTL_WDOG_MS") ? atoi(getenv("VENUSCTL_WDOG_MS")) : 50;
+	if (!wdog_ms || fw_dead)
+		return 0;
+	double t = mono_ms();
+	if (t - wdog_last < wdog_ms)
+		return 0;
+	wdog_last = t;
+	uint32_t s = crd(WRAP_INTR_STATUS);
+	if (!(s & INTR_A2HWD))
+		return 0;
+	printf("venus: STOP: firmware watchdog (WRAPPER_INTR_STATUS %#x A2HWD) %s: firmware dead\n", s, when);
+	pm_step("watchdog A2HWD INTR_STATUS %#x (%s)", s, when);
+	fw_dead = 1;
+	print_sfr(qb);
+	return -1;
 }
 
 /* drain the debug queue, then the message queue until a packet of type want (0 = just drain); 0 = got it */
@@ -1677,8 +1991,20 @@ static int wait_msg(uint32_t want, unsigned ms)
 	unsigned t;
 	for (t = 0;; t++) {
 		int n;
-		while ((n = q_read(2)) > 0)
-			print_pkt(2, n);
+		txdb_epoch++;
+		if (wdog_check("while polling"))
+			return -1;
+		/* test hook for (c): VENUSCTL_TEST_DBG_HOLD_MS=N drains the debug queue only every N ms (a slow host), so
+		 * a chatty firmware (--debug 0x3f) can fill its 800 KB and ask for the doorbell (tx_req) */
+		static double dbg_last;
+		static int dbg_hold = -1;
+		if (dbg_hold < 0)
+			dbg_hold = getenv("VENUSCTL_TEST_DBG_HOLD_MS") ? atoi(getenv("VENUSCTL_TEST_DBG_HOLD_MS")) : 0;
+		if (!dbg_hold || mono_ms() - dbg_last >= dbg_hold) {
+			dbg_last = mono_ms();
+			while ((n = q_read(2)) > 0)
+				print_pkt(2, n);
+		}
 		while ((n = q_read(1)) > 0) {
 			if (chatty(pkt[1]))
 				print_pkt(1, n);
@@ -1705,10 +2031,80 @@ static int wait_msg(uint32_t want, unsigned ms)
 	}
 	if (!want)
 		return 0;
+	wdog_last = 0;
+	if (wdog_check("at a timeout"))
+		return -1;
 	printf("venus: %s no %#x after %u ms\n", wait_soft ? "note:" : "STOP:", want, wait_ms(t0, t));
 	core_status("timeout");
 	print_sfr(qb);
 	return -1;
+}
+
+/* venus-robust (h): stock lito is cvp_internal: a separate DSP queue table (hfi_common.c __interface_dsp_queues_init,
+ * hfi_iris1.c __setup_ucregion_memory_map_iris1) and CTRL_INIT = 3. VENUSCTL_CTRL_INIT3=1: a 1 MB DSP block right after
+ * the 3 MB queue block (q + 3 MB .. the buffer window's default start at q + 4 MB), table + 3 queues of 320 KB, never
+ * read by us (no fastcvpd here; stock's "dsp init failed" under TWRP too). */
+/* h2: q + 3 MB wiped the window bank's tables (q + 0x3fe000); h5: a 0xf0000 region = "invalid UC_REGION" (the fw
+ * wants 1 MB granules). So 1 MB at VENUSCTL_DSPQ (default 0xac800000, the window's top below the PAS metadata page;
+ * only for venusctl tests: venusd's 160 MB buffer window reaches it) */
+#define DSPQ_SIZE	0x100000u
+#define DSPQ_QSIZE	0x50000u
+static uint64_t dspq_addr(void)
+{
+	return getenv("VENUSCTL_DSPQ") ? strtoull(getenv("VENUSCTL_DSPQ"), NULL, 0) : 0xac800000ull;
+}
+static int ctrl3_on(void)
+{
+	return getenv("VENUSCTL_CTRL_INIT3") && atoi(getenv("VENUSCTL_CTRL_INIT3"));
+}
+
+static int dspq_setup(uint64_t q)
+{
+	(void)q;
+	uint64_t d = dspq_addr();
+	static uint8_t z[0x10000];
+	for (uint32_t o = 0; o < DSPQ_SIZE; o += sizeof(z))
+		if (pm_wr(d + o, z, sizeof(z)))
+			return 1;
+	uint32_t t[QTBL_SIZE / 4];
+	memset(t, 0, sizeof(t));
+	t[1] = QTBL_SIZE, t[2] = QHDR0, t[3] = QHDR_SIZE, t[4] = 3, t[5] = 3;
+	memcpy(&t[8], "msm_v4l2_vidc", 14);
+	for (unsigned i = 0; i < 3; i++) {
+		uint32_t *h = &t[(QHDR0 + QHDR_SIZE * i) / 4];
+		h[0] = 1;
+		h[1] = (uint32_t)(d + QTBL_SIZE + (uint64_t)DSPQ_QSIZE * i);
+		h[2] = 0x01010000u | i;
+		h[3] = DSPQ_QSIZE / 4;
+		h[6] = 1, h[7] = 1, h[8] = i == 2 ? 0 : 1;
+	}
+	pm_wr(d, t, sizeof(t));
+	wr(CS_VMIMSG, (uint32_t)d, "DSP_QTBL_ADDR (own block)");
+	wr(CS_VMIMSGAG0, (uint32_t)d, "DSP_UC_REGION_ADDR (own block)");
+	wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
+	printf("venus: cvp_internal: DSP queue block %#llx (%#x, 3 x %#x), CTRL_INIT 3\n", (unsigned long long)d,
+	       DSPQ_SIZE, DSPQ_QSIZE);
+	return 0;
+}
+
+static int hwctl_early(void)	/* h11: handed off after CTRL_INIT, the fw never powers mvs0 (0 FBDs even RC off):
+				 * stock hands off after auth + mem protect, BEFORE CTRL_INIT (and at resume before it) */
+{
+	return getenv("VENUSCTL_HWCTL_EARLY") && atoi(getenv("VENUSCTL_HWCTL_EARLY"));
+}
+
+/* (h) VENUSCTL_HWCTL=1: stock __hand_off_regulators (vcodec + cvp GDSCs to HW) once the firmware runs (after CTRL_INIT,
+ * so our split boot/init does not collapse mvs0 under a firmware that has not started: e11) */
+static void hwctl_handoff(const char *when)
+{
+	int m = getenv("VENUSCTL_HWCTL") ? atoi(getenv("VENUSCTL_HWCTL")) : 0;	/* 1 both, 2 mvs0 only, 3 mvs1 only */
+	if (m <= 0)
+		return;
+	if (m != 3)
+		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+	if (m != 2 && (cvp || (vrd(GDSC_MVS1) & PWR_ON)))
+		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
+	printf("venus: HWCTL %s: mvs0 %#010x mvs1 %#010x handed to HW\n", when, vrd(GDSC_MVS0), vrd(GDSC_MVS1));
 }
 
 int init(uint64_t phys)
@@ -1790,10 +2186,13 @@ int init(uint64_t phys)
 	wr(CS_VMIMSG, (uint32_t)q, "DSP_QTBL_ADDR");
 	wr(CS_VMIMSGAG0, (uint32_t)q, "DSP_UC_REGION_ADDR");
 	wr(CS_VMIMSGAG1, QSHARED, "DSP_UC_REGION_SIZE");
-	/* __boot_firmware (venus_hfi.c:1265-1290): CTRL_INIT = 1 (no CVP domain in the DT), wait for a status */
+	if (ctrl3_on() && dspq_setup(q))
+		return 1;
+	/* __boot_firmware (venus_hfi.c:1265-1290): CTRL_INIT = 1 (no CVP domain in the DT), wait for a status;
+	 * (h) VENUSCTL_CTRL_INIT3=1: 3 = BIT(1) cvp_internal as stock lito (hfi_common.c:1186-1196) */
 	if (tbu_ok("CTRL_INIT"))
 		return 1;
-	wr(CTRL_INIT, 1, "CTRL_INIT");
+	wr(CTRL_INIT, ctrl3_on() ? 3 : 1, "CTRL_INIT");
 	uint32_t st = 0;
 	unsigned ms;
 	double t0 = mono_ms();	/* lat2: 1 s on the clock; the line prints the real time (lat1: passes, "after 1 ms") */
@@ -1807,6 +2206,8 @@ int init(uint64_t phys)
 	}
 	v.init = (st & ST_INIT) && !(st & ST_ERROR);
 	state_save(&v);
+	if (v.init && !hwctl_early())
+		hwctl_handoff("after CTRL_INIT");
 	printf("venus: CTRL_STATUS %#010x after %u ms: init %u, error %#x%s\n", st, ms, st & ST_INIT, st & ST_ERROR,
 	       (st & ST_ERROR) == 4 ? " (invalid UC_REGION)" : "");
 	core_status("after init");
@@ -1872,6 +2273,164 @@ static int sys_up(struct vstate *vp, uint32_t debug, const char *what)
 	return 0;
 }
 
+/* ---- P0d (logs/research/video-reset-2026-11-16.md Q1/Q4): Linux's interrupt ack and PC_PREP, both default off ---- */
+
+static int env_on(const char *name)
+{
+	const char *e = getenv(name);
+	return e && atoi(e) > 0;
+}
+
+/* a write Linux never reads back (clear registers): the core gate and allowed() as wr(), no read before or after */
+static void wr_clear(uint32_t pa, uint32_t v, const char *why)
+{
+	if (!allowed(pa)) {
+		printf("venus: BLOCKED wr %#x = %#x (%s)\n", pa, v, why);
+		vc_stop(why);
+	}
+	core_gate(pa, why);
+	pm_step("wr %#x = %#x (%s)", pa, v, why);
+	wr32(pa, v);
+	if (verbose)
+		printf("venus: wr %#x = %#010x (no read-back)  [%s]\n", pa, v, why);
+}
+
+static unsigned intclr_n;
+/* VENUSCTL_INTCLR=1: venus_hfi_core_work_handler (hfi_common.c, msm-4.19 lito iris1_ops): core_clear_interrupt =
+ * __core_clear_interrupt_common: read WRAPPER_INTR_STATUS, write CPU_CS_A2HSOFTINTCLR = 1, then WRAPPER_INTR_CLEAR =
+ * the status as read; then __response_handler drains the queues. WRAPPER_INTR_MASK is never written (Linux's
+ * __interrupt_init_iris1 unmask is not done: nothing new unmasked or masked). 0 = ok, -1 = queue failure/sys error. */
+static int intclr_service(const char *when)
+{
+	uint32_t s = crd(WRAP_INTR_STATUS);
+	if (!s)
+		return 0;
+	wr_clear(CS_A2HSOFTINTCLR, 1, "A2HSOFTINTCLR");
+	wr_clear(WRAP_INTR_CLEAR, s, "WRAPPER_INTR_CLEAR");
+	intclr_n++;
+	uint32_t after = crd(WRAP_INTR_STATUS);
+	printf("venus: intclr #%u (%s): INTR_STATUS %#x%s%s -> A2HSOFTINTCLR 1, INTR_CLEAR %#x -> INTR_STATUS %#x\n",
+	       intclr_n, when, s, (s & INTR_A2H) ? " A2H" : "", (s & INTR_A2HWD) ? " A2HWD(WATCHDOG)" : "", s, after);
+	pm_step("intclr #%u (%s): INTR_STATUS %#x -> %#x", intclr_n, when, s, after);
+	return wait_msg(0, 0);
+}
+
+static unsigned ping_n;
+/* ws-video-dec keepalive (logs/research/video-reset-2026-11-16.md): the firmware's reset timer, armed at
+ * auth_and_reset, is deferred by any serviced command/response (one ack reached 449 s). Send HFI_CMD_SYS_PING and
+ * drain the reply: PING_ACK (0x220002), or on some firmware a SESSION_ERROR because the cookie is read as a session
+ * id -- either way the firmware ran a command, which is the point. Non-fatal unless VENUSCTL_PING_FATAL. Used by the
+ * watch VENUSCTL_PING_MS ping-only mode and by decode-loop on an idle gap. Returns wait_msg's result (0 = acked). */
+/* venus-robust (g): lito's HFI (techpack/video msm_vidc, LineageOS redbull 4.19) has no HFI_CMD_SYS_PING at all:
+ * vidc_hfi.h defines only HFI_CMD_SYS_SESSION_ABORT (0x210001) in the OX range, and the firmware takes 0x210002 as a
+ * session command, answering EVENT_NOTIFY SESSION_ERROR 0x1004 (HFI_ERR_SESSION_INVALID_SESSION_ID) for the
+ * "session" 0x76656e75. The protocol's own round trip with a reply is SYS_GET_PROPERTY IMAGE_VERSION
+ * (create_pkt_cmd_sys_image_version: {16, 0x10006, 1, HFI_PROPERTY_SYS_IMAGE_VERSION 6}) -> SYS_PROPERTY_INFO
+ * 0x2000a, which sys_up already sends after SYS_INIT; that is the ping now. VENUSCTL_PING_LEGACY=1: the old packet. */
+static int ping_legacy(void)
+{
+	return getenv("VENUSCTL_PING_LEGACY") && atoi(getenv("VENUSCTL_PING_LEGACY"));
+}
+static const uint32_t ping_new[4] = { 16, 0x10006, 1, 0x6 }, ping_old[3] = { 12, 0x210002, 0x76656e75 };
+#define PING_PKT	(ping_legacy() ? ping_old : ping_new)
+#define PING_ACK	(ping_legacy() ? 0x220002u : 0x2000au)
+
+static int sys_ping(const char *when)
+{
+	if (q_write(PING_PKT))
+		return -1;
+	int fatal = getenv("VENUSCTL_PING_FATAL") != NULL;
+	wait_soft = !fatal;
+	int r = wait_msg(PING_ACK, 1000);
+	wait_soft = 0;
+	ping_n++;
+	if (!r)
+		printf("venus: ping #%u (%s): %s\n", ping_n, when, ping_legacy() ? "PING_ACK" :
+		       "SYS_PROPERTY_INFO (image version) = ack");
+	else
+		printf("venus: ping #%u (%s): no %s (non-fatal)\n", ping_n, when, ping_legacy() ? "PING_ACK" :
+		       "SYS_PROPERTY_INFO");
+	pm_step("ping #%u (%s): acked %d", ping_n, when, !r);
+	return r;
+}
+
+static int pc_res = -1;	/* watch line: -1 not tried, 0 pc_ready + wfi, 1 skipped (not idle/wfi), 2 timeout */
+static double pc_ready_ms = -1, pc_wfi_ms = -1;
+
+/* VENUSCTL_PC=1: Linux's power collapse up to the power off. venus_hfi_pm_handler runs msm_vidc_pwr_collapse_delay
+ * (1500 ms, VENUSCTL_PC_DELAY_MS) after the last command; __power_collapse -> prepare_pc = __prepare_pc_common
+ * (hfi_common.c): already PC_READY: done; CPU_STATUS WFI and CTRL_STATUS idle (bit 30) both needed, else "Skip PC";
+ * __prepare_pc sends HFI_CMD_SYS_PC_PREP {size 8} through the command queue; then poll WRAPPER_CPU_STATUS bit 0 and
+ * CTRL_STATUS PC_READY (bit 8) (Linux: 10 x 150-250 us; here up to 2 s, 1 ms steps, times logged). Linux's next step
+ * (__power_off_common: AXI halt, clocks, GDSCs, bus unvote) is NOT done: clocks and GDSCs stay on, SW mode, no vote
+ * change. Linux retries a skipped PC after the same delay; here the precondition gets up to 2 s, then a skip. */
+static int pc_prep(int intclr)
+{
+	unsigned delay = getenv("VENUSCTL_PC_DELAY_MS") ? (unsigned)atoi(getenv("VENUSCTL_PC_DELAY_MS")) : 1500;
+	printf("venus: pc: VENUSCTL_PC=1: PC_PREP after %u ms (Linux pwr_collapse_delay), queues drained meanwhile\n", delay);
+	double t0 = mono_ms();
+	while (mono_ms() - t0 < delay) {
+		if ((intclr && intclr_service("pc delay")) || wait_msg(0, 0))
+			return pc_res = -1;
+		delay_ms(10);
+	}
+	uint32_t st = crd(CTRL_STATUS), cpu = crd(WRAP_CPU_STATUS);
+	printf("venus: pc: before PC_PREP: CTRL_STATUS %#010x (idle %u pc_ready %u) CPU_STATUS %#x (wfi %u) INTR_STATUS %#x\n",
+	       st, !!(st & ST_IDLE), !!(st & ST_PC_READY), cpu, cpu & CPU_WFI, crd(WRAP_INTR_STATUS));
+	pm_step("pc: before PC_PREP CTRL_STATUS %#x CPU_STATUS %#x", st, cpu);
+	if (st & ST_PC_READY) {
+		printf("venus: pc: already pc_ready (Linux: \"Already in pc_ready state\", no PC_PREP sent)\n");
+		pc_ready_ms = pc_wfi_ms = 0;
+		return pc_res = 0;
+	}
+	double tp = mono_ms();
+	while (!((cpu & CPU_WFI) && (st & ST_IDLE)) && mono_ms() - tp < 2000) {
+		delay_ms(1);
+		st = crd(CTRL_STATUS), cpu = crd(WRAP_CPU_STATUS);
+	}
+	if (!((cpu & CPU_WFI) && (st & ST_IDLE))) {
+		printf("venus: pc: SKIPPED after %.0f ms: wfi %u idle %u (Linux: \"Skip PC, wfi status not set\"), no PC_PREP"
+		       " sent\n", mono_ms() - tp, cpu & CPU_WFI, !!(st & ST_IDLE));
+		return pc_res = 1;
+	}
+	uint32_t cmd[2] = { 8, HFI_SYS_PC_PREP };	/* create_pkt_cmd_sys_pc_prep (hfi_packetization.c) */
+	if (q_write(cmd))
+		return pc_res = -1;
+	double ts = mono_ms(), t_both = -1;
+	unsigned wfi_drops = 0, lastwfi = 1;
+	for (;;) {
+		double t = mono_ms() - ts;
+		st = crd(CTRL_STATUS), cpu = crd(WRAP_CPU_STATUS);
+		if ((st & ST_PC_READY) && pc_ready_ms < 0)
+			pc_ready_ms = t;
+		if (!(cpu & CPU_WFI) && lastwfi)
+			wfi_drops++;
+		if ((cpu & CPU_WFI) && !lastwfi)
+			pc_wfi_ms = t;	/* the last return to WFI after the command woke the CPU */
+		lastwfi = cpu & CPU_WFI;
+		if ((st & ST_PC_READY) && (cpu & CPU_WFI)) {
+			t_both = t;
+			break;
+		}
+		if ((intclr && intclr_service("pc wait")) || wait_msg(0, 0))
+			return pc_res = -1;
+		if (t >= 2000)
+			break;
+		delay_ms(1);
+	}
+	if (pc_wfi_ms < 0 && (cpu & CPU_WFI))
+		pc_wfi_ms = 0;	/* never seen out of WFI at 1 ms sampling */
+	wait_msg(0, 0);	/* PC_PREP_DONE, if the firmware sends one */
+	pc_res = t_both >= 0 ? 0 : 2;
+	printf("venus: pc: PC_PREP %s: pc_ready %u (first at %.1f ms) wfi %u (back in WFI at %.1f ms, %u exits seen)"
+	       " | CTRL_STATUS %#010x CPU_STATUS %#x INTR_STATUS %#x | clocks + GDSCs left on (SW mode), no power off\n",
+	       pc_res ? "TIMEOUT after 2 s" : "done", !!(st & ST_PC_READY), pc_ready_ms, cpu & CPU_WFI, pc_wfi_ms,
+	       wfi_drops, st, cpu, crd(WRAP_INTR_STATUS));
+	pm_step("pc: result %d pc_ready_ms %.1f wfi_ms %.1f CTRL_STATUS %#x CPU_STATUS %#x", pc_res, pc_ready_ms, pc_wfi_ms,
+		st, cpu);
+	return pc_res;
+}
+
 /*
  * redfin rn4x: `venusctl watch SECONDS [--sysinit] [--debug MASK]`: after init, read-only watch of the firmware until
  * it dies or SECONDS pass, every 200 ms: CTRL_STATUS (init/idle/pc_ready/error), WRAPPER_CPU_STATUS (WFI),
@@ -1893,15 +2452,37 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 		qb = v.q;
 	if (sysinit && (!fwq || sys_up(&v, debug, "watch")))
 		return 1;
+	/* P0d switches (default off: watch unchanged) */
+	int pcm = env_on("VENUSCTL_PC");
+	intclr_on = env_on("VENUSCTL_INTCLR");
+	vc_decode = pcm || intclr_on;
+	int ping_ms = getenv("VENUSCTL_PING_MS") ? atoi(getenv("VENUSCTL_PING_MS")) : 0;	/* ws-video-dec ping-only keepalive */
+	if (ping_ms && !(fwq && v.sysinit))
+		printf("venus: watch: VENUSCTL_PING_MS ignored: SYS_INIT not done (watch --sysinit)\n");
+	else if (ping_ms)
+		printf("venus: watch: VENUSCTL_PING_MS=%d: SYS_PING every %d ms as a keepalive (ping-only reset test)\n", ping_ms, ping_ms);
+	if (intclr_on)
+		printf("venus: watch: VENUSCTL_INTCLR=1: a non-zero INTR_STATUS is acked as Linux does (A2HSOFTINTCLR,"
+		       " WRAPPER_INTR_CLEAR), then the queues drained; INTR_MASK untouched\n");
+	if (pcm && !(fwq && v.sysinit))
+		printf("venus: watch: VENUSCTL_PC=1 ignored: SYS_INIT not done (watch --sysinit)\n");
+	else if (pcm && core_ok() && pc_prep(intclr_on) < 0)
+		printf("venus: watch: pc: queue failure or firmware error during PC_PREP, watching on\n");
 	uint64_t s = 0x15000000ull;
-	uint32_t last[16] = { 0 };
-	double t0 = mono_ms(), tl = -1e9;
+	uint32_t last[18] = { 0 };
+	/* venus-hw: VENUSCTL_WATCH_MS (default 200): the poll period; the window bank's FSR/FAR are part of the change test */
+	unsigned watch_ms = getenv("VENUSCTL_WATCH_MS") ? (unsigned)atoi(getenv("VENUSCTL_WATCH_MS")) : 200;
+	if (watch_ms < 1 || watch_ms > 10000)
+		watch_ms = 200;
+	double t0 = mono_ms(), tl = -1e9, tp = mono_ms();
 	unsigned n = 0;
 	for (;;) {
 		double t = mono_ms();
 		if (t - t0 > secs * 1e3)
 			break;
-		uint32_t cur[16] = { 0 };
+		uint32_t cur[18] = { 0 };
+		if (win_cbp)
+			cur[16] = rd32(win_cbp + 0x58), cur[17] = rd32(win_cbp + 0x60);
 		int on = core_ok();
 		cur[0] = (uint32_t)on;
 		cur[1] = vrd(GDSC_MVSC), cur[2] = vrd(GDSC_MVS0), cur[3] = vrd(PLL_MODE), cur[4] = rd32(GCC_VIDEO_AXI);
@@ -1916,26 +2497,41 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 			}
 		}
 		int changed = memcmp(cur, last, sizeof(cur)) != 0;
-		if (changed || t - tl >= 2000) {
+		if (changed || t - tl >= 1000) {	/* P0b: a line a second (uptime + rails), so a reset shows how long it lived */
 			tl = t;
-			char line[400];
+			char line[600];
 			snprintf(line, sizeof(line), "watch %.1f s: %s CTRL_STATUS %#010x (init %u idle %u pc_ready %u err %#x)"
 				 " CPU_STATUS %#x INTR_STATUS %#x%s | NoC ERRVLD %#x LOG0 %#x LOG1 %#x LOG2 %#x | sGFSR %#x"
 				 " sGFSYNR0 %#x SYNR1 %#x SYNR2 %#x | gdsc mvsc %#x mvs0 %#x pll %#x axi %#x | tbu_sf0 vote %#x"
-				 " status %#x %#x%s",
+				 " status %#x %#x | win FSR %#x FAR %#x%s",
 				 (t - t0) / 1e3, on ? "on" : "CLOCK/GDSC OFF", cur[9], cur[9] & 1, (cur[9] >> 30) & 1,
 				 (cur[9] >> 8) & 1, cur[9] & 0xfe, cur[10], cur[11], (cur[11] & 0x10) ? " (WATCHDOG)" : "",
 				 cur[12], cur[13], cur[14], cur[15], cur[5], cur[6], cur[7], cur[8], cur[1], cur[2], cur[3], cur[4],
-				 tbu, tbs0, tbs1, changed ? "" : " (same)");
-			printf("venus: %s\n", line);
-			pm_step("%s", line);
+				 tbu, tbs0, tbs1, cur[16], cur[17], changed ? "" : " (same)");
+			char rl[200];
+			rails_line(rl, sizeof(rl));
+			if (pcm || intclr_on) {	/* P0d: the PC result and the ack count on every line */
+				size_t o = strlen(line);
+				snprintf(line + o, sizeof(line) - o, " | pc %s pc_ready %u wfi %u intclr %u",
+					 pc_res == 0 ? "ready" : pc_res == 1 ? "skipped" : pc_res == 2 ? "timeout" :
+					 pc_res == -1 && pcm ? "failed/not-run" : "off", (cur[9] >> 8) & 1, cur[10] & CPU_WFI,
+					 intclr_n);
+			}
+			printf("venus: %s | %s\n", line, rl);
+			pm_step("%s | %s", line, rl);
 			memcpy(last, cur, sizeof(cur));
 		}
+		if (on && fwq && intclr_on && cur[11] && intclr_service("watch"))	/* P0d: ack, then drain */
+			printf("venus: watch: queue read failed\n");
 		if (on && fwq && wait_msg(0, 0))	/* drain + print firmware debug/messages (q_read only touches queue memory) */
 			printf("venus: watch: queue read failed\n");
-		if (on && n++ % 25 == 0)
+		if (on && fwq && v.sysinit && ping_ms && t - tp >= ping_ms) {	/* ws-video-dec keepalive */
+			sys_ping("watch");
+			tp = mono_ms();
+		}
+		if (on && n++ % (5000 / watch_ms + 1) == 0)
 			win_faults("watch");
-		delay_ms(200);
+		delay_ms(watch_ms);
 	}
 	printf("venus: watch: %u s done, phone alive\n", secs);
 	return 0;
@@ -1946,16 +2542,15 @@ int ping(uint32_t debug)
 	struct vstate v;
 	if (sys_up(&v, debug, "before ping"))
 		return 1;
-	uint32_t pg[3] = { 12, 0x210002, 0x76656e75 };	/* HFI_CMD_SYS_PING; client_data: our own cookie */
-	if (q_write(pg))
+	if (q_write(PING_PKT))
 		return 1;
-	/* v2c: VIDEO.IR.1.2-00053 reads word 2 as a session ID (HostDriver_GetSessionIdx fail) and answers EVENT_NOTIFY
-	 * SESSION_ERROR 2, data 0x1004 (HFI_ERR_SESSION_INVALID_SESSION_ID): no PING_ACK. Not fatal: the firmware is
-	 * alive, session is the real round trip. VENUSCTL_PING_FATAL=1: a missing PING_ACK fails (old behaviour). */
+	/* v2c: VIDEO.IR.1.2-00053 reads the legacy ping's word 2 as a session ID and answers EVENT_NOTIFY SESSION_ERROR
+	 * 0x1004; venus-robust (g): the default ping is SYS_GET_PROPERTY IMAGE_VERSION (see sys_ping).
+	 * VENUSCTL_PING_FATAL=1: a missing ack fails. */
 	int fatal = getenv("VENUSCTL_PING_FATAL") != NULL;
 	lastmsg_n = 0;
 	wait_soft = !fatal;
-	int r = wait_msg(0x220002, 1000);
+	int r = wait_msg(PING_ACK, 1000);
 	wait_soft = 0;
 	if (r && fatal)
 		return 1;
@@ -1965,7 +2560,7 @@ int ping(uint32_t debug)
 			printf(" %08x", lastmsg[k]);
 		printf("%s\n", lastmsg_n ? "" : " none");
 	} else {
-		printf("venus: PING_ACK client_data %#x%s\n", pkt[2], pkt[2] == pg[2] ? "" : " (not our cookie)");
+		printf("venus: %s\n", ping_legacy() ? "PING_ACK" : "ping acked: SYS_PROPERTY_INFO (image version)");
 	}
 	wait_msg(0, 50);
 	core_status("after ping");
@@ -2101,6 +2696,7 @@ static struct {
 	double cp_core[8];	/* v4a0: copy time per CPU (0-5 A55, 6-7 A76), counted only when the copy stayed on one core */
 	int n_core[8], n_moved;
 	unsigned acts;		/* msgq packets handled: progress for the timeout */
+	unsigned ebds;		/* vdstall: EBDs handled (venusd's stall line) */
 	int started;		/* 4a: START sent (vdec_close flushes and stops) */
 	int hevc;		/* 4e: an HEVC session (SESSION_INIT codec) */
 	uint32_t isz;		/* 4a: input buffer size */
@@ -2164,7 +2760,10 @@ static int set_prop(uint32_t prop, uint32_t a, uint32_t b, uint32_t c, unsigned 
 	for (unsigned k = 0; k < nbody; k++)
 		printf(" %#x", p[5 + k]);
 	printf("\n");
-	if (q_write(p) || wait_msg(0, 20))
+	static int drain = -1;	/* ws-venus-enc: VENUSCTL_PROP_MS (default 20): the drain after each property */
+	if (drain < 0)
+		drain = getenv("VENUSCTL_PROP_MS") ? atoi(getenv("VENUSCTL_PROP_MS")) : 20;
+	if (q_write(p) || wait_msg(0, (unsigned)drain))
 		return -1;
 	return dc.err ? -1 : 0;
 }
@@ -2406,6 +3005,7 @@ static int dec_pkt(int n)
 		struct vbuf *b = find_buf(dc.in, dc.nin, p[7]);
 		if (b)
 			b->fw = 0;
+		dc.ebds++;	/* vdstall */
 		if (!vc_quiet || p[3] || !b)
 			printf("venus: EBD tag %u buf %#x error %#x filled %u flags %#x%s\n", p[6], p[7], p[3], p[5], p[9],
 			       b ? "" : " (not ours)");
@@ -2570,9 +3170,55 @@ static double now_s(void)	/* lat2: monotonic (was gettimeofday: a clock step mov
 /* the downstream close: flush all, stop, release resources, release internal buffers, session end
  * (msm_comm_try_state STOP_DONE -> CLOSE_DONE, msm_vidc_common.c:3990-4060; release 4900-4960). Notes, not STOPs:
  * every step is tried; 1 = something didn't answer. */
+/* venus-robust (e): stock's answer to a command timeout (hw-resp-timeout 1000 ms): msm_comm_kill_session ->
+ * msm_comm_session_abort: HFI_CMD_SYS_SESSION_ABORT {size 12, type 0x210001, sid} (create_pkt_cmd_session_cmd via
+ * venus_hfi_session_abort, hfi_common.c:2396), 1 s for HFI_MSG_SYS_SESSION_ABORT_DONE 0x220004; done = the firmware
+ * dropped the session and its buffers (no more commands for it, no SESSION_END: venus_hfi_session_clean is host-side
+ * only); no answer = msm_comm_generate_sys_error (SSR): here fw_dead, so the caller takes Venus down.
+ * VENUSCTL_ABORT=0: off (every close step tried and timed out in turn, as before). Returns 0 = aborted. */
+#define S_ABORT		0x210001u
+#define M_ABORT_DONE	0x220004u
+static int abort_on = -1;
+static int sess_abort(const char *why)
+{
+	if (abort_on < 0)
+		abort_on = !getenv("VENUSCTL_ABORT") || atoi(getenv("VENUSCTL_ABORT"));
+	if (!abort_on || fw_dead)
+		return -1;
+	printf("venus: %s: SESSION_ABORT (stock msm_comm_kill_session)\n", why);
+	pm_step("session abort after %s", why);
+	int ws = wait_soft;
+	wait_soft = 1;
+	int r = sess_cmd(S_ABORT) || wait_msg(M_ABORT_DONE, 1000);
+	wait_soft = ws;
+	if (!r) {
+		printf("venus: SESSION_ABORT_DONE session %#x: session gone, firmware kept\n", pkt[2]);
+		return 0;
+	}
+	if (!fw_dead) {
+		printf("venus: no SESSION_ABORT_DONE: firmware treated as dead (stock: sys error -> SSR)\n");
+		fw_dead = 1;
+	}
+	return -1;
+}
+
+/* one close step: the command, then its reply in 1 s; a timeout aborts the session (1 = aborted or failed) */
+static int close_step(int sent_bad, uint32_t want, const char *what, int *aborted)
+{
+	if (*aborted)
+		return 0;
+	if (sent_bad || fw_dead)	/* h3: after a failed abort, no more 1 s waits */
+		return 1;
+	if (!wait_msg(want, 1000))
+		return 0;
+	if (!fw_dead && !sess_abort(what))
+		*aborted = 1;
+	return 1;
+}
+
 static int dec_close(int started)
 {
-	int bad = 0;
+	int bad = 0, ab = 0;
 	dc.stopping = 1;
 	if (fw_dead) {
 		printf("venus: firmware sys error: no close sequence (shutdown stops it)\n");
@@ -2580,20 +3226,31 @@ static int dec_close(int started)
 		return 1;
 	}
 	wait_soft = 1;
-	if (started) {
+	if (getenv("VENUSCTL_TEST_ABORT") && atoi(getenv("VENUSCTL_TEST_ABORT")) && !sess_abort("test (VENUSCTL_TEST_ABORT)"))
+		ab = 1;	/* test: the abort path instead of the close sequence (does the firmware answer ABORT_DONE?) */
+	if (started && !ab) {
 		uint32_t fl[4] = { 16, S_FLUSH, SESSION_ID, FLUSH_ALL };	/* msm_comm_flush (msm_vidc_common.c:5379) */
-		bad |= q_write(fl) || wait_msg(M_FLUSH_DONE, 1000);
-		bad |= sess_cmd(S_STOP) || wait_msg(M_STOP_DONE, 1000);	/* msm_vidc_stop (3485) */
-		bad |= sess_cmd(S_REL_RES) || wait_msg(M_RELRES_DONE, 1000);	/* msm_vidc_release_res (3518) */
+		bad |= close_step(q_write(fl), M_FLUSH_DONE, "FLUSH timed out", &ab);
+		if (!ab)	/* msm_vidc_stop (3485) */
+			bad |= close_step(sess_cmd(S_STOP), M_STOP_DONE, "STOP timed out", &ab);
+		if (!ab)	/* msm_vidc_release_res (3518) */
+			bad |= close_step(sess_cmd(S_REL_RES), M_RELRES_DONE, "RELEASE_RESOURCES timed out", &ab);
 	}
-	for (int i = dc.nintl; i-- > 0;)	/* msm_comm_release_scratch/persist_buffers: response_req 1 */
-		bad |= buf_cmd(dc.intl_type[i], dc.intl[i].pa, dc.intl[i].size, 1) || wait_msg(M_RELBUF_DONE, 1000);
-	for (int i = 0; getenv("VENUSCTL_DPB_SETBUF") && i < dc.ndpb; i++)
-		bad |= buf_cmd(B_OUTPUT, dc.dpb[i].pa, dc.dpb[i].size, 1) || wait_msg(M_RELBUF_DONE, 1000);
+	for (int i = dc.nintl; !ab && i-- > 0;)	/* msm_comm_release_scratch/persist_buffers: response_req 1 */
+		bad |= close_step(buf_cmd(dc.intl_type[i], dc.intl[i].pa, dc.intl[i].size, 1), M_RELBUF_DONE,
+				  "RELEASE_BUFFERS timed out", &ab);
+	for (int i = 0; !ab && getenv("VENUSCTL_DPB_SETBUF") && i < dc.ndpb; i++)
+		bad |= close_step(buf_cmd(B_OUTPUT, dc.dpb[i].pa, dc.dpb[i].size, 1), M_RELBUF_DONE, "RELEASE_BUFFERS timed out",
+				  &ab);
 	dc.nintl = 0;
-	bad |= sess_cmd(0x10008) || wait_msg(0x20007, 1000);	/* SYS_SESSION_END (msm_comm_session_close, 3547) */
-	if (!bad)
+	if (!ab)	/* SYS_SESSION_END (msm_comm_session_close, 3547) */
+		bad |= close_step(sess_cmd(0x10008), 0x20007, "SESSION_END timed out", &ab);
+	if (!bad && !ab)
 		printf("venus: SESSION_END_DONE error %#x\n", pkt[0] >= 16 ? pkt[3] : 0);
+	if (ab) {	/* the firmware dropped the session: nothing half-closed is left (no down needed) */
+		printf("venus: session closed by SESSION_ABORT\n");
+		bad = 0;
+	}
 	wait_soft = 0;
 	on_pkt = NULL;
 	wait_msg(0, 50);
@@ -2674,6 +3331,7 @@ int vdec_start(uint32_t min_in)
 	if (stop_here("sessinit"))
 		return 3;
 	uint32_t W = (uint32_t)dc.w, H = (uint32_t)dc.h, ob = dc.split ? B_OUTPUT2 : B_OUTPUT;
+	vc_bus_session(W, H, getenv("VENUSCTL_BUS_FPS") ? (unsigned)atoi(getenv("VENUSCTL_BUS_FPS")) : 30);	/* (f) */
 	/* properties in the client's order (msm_vdec.c line of each) */
 	if (set_prop(P_FRAME_SIZE, B_INPUT, W, H, 3, "input frame size") ||	/* s_fmt OUTPUT, msm_vdec.c:735-742 */
 	    (dc.split && (set_prop(P_FMT_SEL, B_OUTPUT, CF_NV12_UBWC, 0, 2, "dpb format NV12_UBWC") ||	/* 1159 */
@@ -2816,7 +3474,10 @@ int vdec_close(void)
 void vdec_status(struct vdec_status *st)
 {
 	*st = (struct vdec_status){ .frames = dc.frames, .eos = dc.eos, .err = dc.err, .fw_dead = fw_dead,
-		.started = dc.started, .acts = dc.acts, .cp_sum = dc.cp_sum, .cp_max = dc.cp_max, .in_size = dc.isz };
+		.started = dc.started, .acts = dc.acts, .cp_sum = dc.cp_sum, .cp_max = dc.cp_max, .in_size = dc.isz,
+		.ebds = dc.ebds };
+	for (int i = 0; i < dc.nin; i++)	/* vdstall */
+		st->in_fw += dc.in[i].fw;
 }
 
 void vdec_fw_reset(void)
@@ -2833,6 +3494,18 @@ void vdec_abort(void)
 	memset(&dc, 0, sizeof(dc));
 	dc.fbuf = fbuf;
 	dc.fbuf_len = fbuf_len;
+}
+
+int vc_fw_watchdog(void)
+{
+	struct vstate v;
+	if (fw_dead)
+		return -1;
+	if (state_load(&v) || !v.q || !v.init || !core_ok())
+		return 0;
+	qb = v.q;
+	wdog_last = 0;
+	return wdog_check("idle check");
 }
 
 void vdec_sfr(void)
@@ -2956,6 +3629,155 @@ close:
 	return rc;
 }
 
+/* ws-video-dec (logs/research/video-reset-2026-11-16.md): keep an active H.264/HEVC decode session fed for `seconds`
+ * of wall-clock time, looping the clip (--loop) to reach it, to test whether an active HFI session avoids the
+ * ~270 s idle PMIC reset (a firmware-internal timer armed at auth_and_reset; only continuous servicing defers it).
+ * Unlike decode() this writes no YUV file and keeps no per-frame log: VENUSCTL_NOCOPY forces frame_out's count-only
+ * path and vc_quiet silences the per-buffer lines, so tens of thousands of frames don't flood the klog. `want` is
+ * left effectively unbounded so the output buffers keep recycling the whole run. The EBD/FBD traffic services the
+ * firmware continuously; as insurance, if ever there is an idle gap with no buffer-done traffic for VENUSCTL_PING_MS
+ * (default 1000) ms, a SYS_PING is sent and drained so the firmware is never left released-and-unserviced. On the
+ * deadline it sends EOS, drains, closes. VENUSCTL_INTCLR=1 also acks interrupts in the loop as Linux's ISR does
+ * (the msgq is drained every pass regardless). It counts decoded frames and fps, decodes any SYS_ERROR/SESSION_ERROR,
+ * and prints the final "survived S s, phone alive" line -- which only appears if no reset killed the process; a reset
+ * leaves the step log's last line as the last timestamp before it. */
+int decode_loop(uint32_t debug, const char *clip, int seconds, int loop, uint64_t bufphys, int hevc)
+{
+	size_t len = 0;
+	uint8_t *s = slurp(clip, &len);
+	if (!s || !len) {
+		printf("venus: refused: can't read %s\n", clip);
+		return 1;
+	}
+	static uint32_t off[NAU], alen[NAU];
+	struct h264_sps sps = { 0, 0, 0, 0, 0, 0 };
+	if (hevc < 0)	/* 4e: from the stream's first NAL header (venusctl --h264/--hevc decide) */
+		hevc = hevc_detect(s, len);
+	struct hevc_sps hs = { 0 };
+	int nau = hevc ? split_aus_hevc(s, len, off, alen, NAU, &sps, &hs) : split_aus(s, len, off, alen, NAU, &sps);
+	if (hevc && nau >= 0 && !hevc_main8(&hs)) {
+		printf("venus: refused: HEVC profile %d, chroma format %d, %d/%d bit: 8-bit 4:2:0 Main only\n", hs.profile,
+		       hs.chroma, hs.depth_y, hs.depth_c);
+		return 1;
+	}
+	if (nau < 0) {
+		nau = -nau - 1;
+		printf("venus: no SPS parsed: default 1920x1088; the firmware's SEQUENCE_CHANGED decides\n");
+		sps = (struct h264_sps){ .w = 1920, .h = 1088, .cw = 1920, .ch = 1080 };
+	}
+	if (!nau)
+		return 1;
+	if (seconds <= 0)
+		seconds = 900;
+	int ping_ms = getenv("VENUSCTL_PING_MS") ? atoi(getenv("VENUSCTL_PING_MS")) : 1000;	/* idle-gap keepalive */
+	printf("venus: decode-loop: %s: %zu bytes, %d access units%s; loop %d, target %d s, keepalive %d ms\n", clip, len,
+	       nau, hevc ? " (HEVC)" : "", loop, seconds, ping_ms);
+
+	setenv("VENUSCTL_NOCOPY", "1", 0);	/* count-only frame path (no copy-out, no per-frame line); keep any override */
+	vc_quiet = 1;				/* no ETB/EBD/FBD per-buffer lines over tens of thousands of frames */
+	int intclr = env_on("VENUSCTL_INTCLR");
+	if (intclr)
+		intclr_on = 1;
+
+	uint64_t mb = getenv("VENUSCTL_BUF_MB") ? strtoull(getenv("VENUSCTL_BUF_MB"), NULL, 0) : 64;
+	if (vdec_prepare(debug, bufphys, mb, 0x7fffffff, &sps, hevc))	/* want ~unbounded: never stop on a frame count */
+		return 1;
+	uint32_t maxau = 0;
+	for (int i = 0; i < nau; i++)
+		if (alen[i] > maxau)
+			maxau = alen[i];
+	int rc = 1, st = vdec_start(maxau);
+	if (st == 1)
+		return 1;
+	if (st == 3) {	/* --stop-at reached inside start: nothing to loop */
+		printf("venus: decode-loop: --stop-at reached before any input; nothing looped\n");
+		rc = dc.err ? 1 : 0;
+		goto close;
+	}
+	if (st)
+		goto close;
+
+	int next = 0, eos_sent = 0, reached = 0;
+	unsigned last_acts = dc.acts;
+	uint64_t fcount = 0;	/* monotonic frame number -> a never-repeating ETB timestamp across loops */
+	double t0 = now_s(), deadline = t0 + seconds, last = t0, eos_t = 0, t_act = t0, t_ping = t0;
+	while (!dc.eos && !dc.err && !fw_dead) {
+		double t = now_s();
+		int past = t >= deadline;
+		if (past && !reached) {
+			reached = 1;
+			printf("venus: decode-loop: %d s reached at %d frames; sending EOS to drain\n", seconds, dc.frames);
+		}
+		if (dc.acts != last_acts) {	/* buffer-done or other traffic = the firmware is being serviced */
+			last_acts = dc.acts;
+			t_act = t;
+		}
+		/* insurance keepalive: only when there has been an idle gap with no buffer-done traffic (not during a
+		 * healthy active loop, where EBD/FBD keep t_act fresh). A SESSION_ERROR reply would be surfaced as dc.err. */
+		if (ping_ms > 0 && !eos_sent && t - t_act >= ping_ms / 1000.0 && t - t_ping >= ping_ms / 1000.0) {
+			printf("venus: decode-loop: %.0f ms idle (no buffer-done); SYS_PING keepalive\n", (t - t_act) * 1e3);
+			sys_ping("decode idle");
+			t_ping = now_s();
+		}
+		if (dc.reconfig && reconfig())
+			goto close;
+		if (vdec_can_etb() && !eos_sent) {
+			if (!past && (loop || next < nau)) {
+				if (next >= nau)
+					next = 0;	/* loop the clip */
+				int r = vdec_etb(s + off[next], alen[next], fcount * 33333, 0, (int)fcount);
+				if (r == -2) {
+					printf("venus: STOP: AU %d (%u bytes) longer than the input buffer\n", next, alen[next]);
+					goto close;
+				}
+				if (r)
+					goto close;
+				fcount++;
+				next++;
+				continue;
+			}
+			if (vdec_etb(NULL, 0, fcount * 33333, 1, (int)fcount))	/* deadline or single-shot end: empty EOS */
+				goto close;
+			eos_sent = 1;
+			eos_t = t;
+			continue;
+		}
+		if (wait_msg(0, 20))
+			goto close;
+		if (intclr)
+			intclr_service("loop");
+		t = now_s();
+		if (t - last >= 30) {	/* a progress + step-log line every 30 s so a reset is dated */
+			double fps = dc.frames > 1 && dc.t_last > dc.t_first ? (dc.frames - 1) / (dc.t_last - dc.t_first) : 0.0;
+			printf("venus: decode-loop %.0f/%d s: %d frames, %.1f fps, ebds %u, err %#x, phone alive\n",
+			       t - t0, seconds, dc.frames, fps, dc.ebds, dc.err);
+			step_status(1);
+			last = t;
+		}
+		if (eos_sent && now_s() - eos_t > 10) {
+			printf("venus: decode-loop: EOS not returned within 10 s; ending the drain\n");
+			break;
+		}
+	}
+	double tend = now_s();
+	double fps = dc.frames > 1 && dc.t_last > dc.t_first ? (dc.frames - 1) / (dc.t_last - dc.t_first) : 0.0;
+	int survived = tend - t0 >= (double)seconds - 1.0;	/* reached the deadline without the process being killed */
+	printf("venus: decode-loop: %d frames in %.1f s, %.1f fps, err %#x%s%s\n", dc.frames, tend - t0, fps, dc.err,
+	       dc.eos ? ", EOS" : "", fw_dead ? ", firmware sys error" : "");
+	if (survived && dc.frames > 0 && !dc.err && !fw_dead)
+		printf("venus: decode-loop: survived %d s, phone alive, %d frames decoded -> PASS\n", seconds, dc.frames);
+	else
+		printf("venus: decode-loop: ended early at %.1f s (frames %d err %#x fw_dead %d eos %d); a reset would leave"
+		       " this as the last line -> FAIL/RESET\n", tend - t0, dc.frames, dc.err, fw_dead, dc.eos);
+	rc = survived && dc.frames > 0 && !dc.err && !fw_dead ? 0 : 1;
+close:
+	if (vdec_close())
+		rc = 1;
+	core_status("after decode-loop");
+	printf("venus: decode-loop %s: venusctl shutdown, then power off\n", rc ? "FAILED/RESET" : "ok");
+	return rc;
+}
+
 /* review 8.1: is the --phys region really unused? write a pattern, let the load run, check it (/dev/pmem as init) */
 int memtest(uint64_t a, uint64_t len, int write)
 {
@@ -3010,3 +3832,292 @@ int shutdown_cmd(void)
 	printf("venus: shutdown %s: next venusctl power off\n", r ? "FAILED" : "ok");
 	return r;
 }
+
+/*
+ * P0d R2 (logs/research/video-reset-2026-11-16.md section 4): `venusctl fwdump [ADDR]`, run on the boot after a
+ * reset, before any power on / boot / init. Read only: the HFI block left in DRAM at ADDR (default 0xa2600000, the
+ * --phys the tests use; xram=3 keeps it out of the VM), through /dev/pmem reads only. Prints: whether the queue table
+ * is still ours (DRAM kept its contents: no power loss), the three queue headers, the SFR (subsystem failure reason)
+ * page at ADDR + 0x2fe000 (venusctl's init writes that address to SFR_ADDR = CPU_CS_SCIBCMD, as Linux's
+ * __setup_ucregion_memory_map_iris1 does with its own SFR buffer; struct hfi_sfr_struct {bufSize, rg_data}, read as
+ * Linux's __print_sfr_msg / venus_hfi "SFR Message from FW", Err_Fatal classified the same way), every firmware debug
+ * string still in the debug queue ring (oldest first, the unread ones marked), unread message-queue packets (decoded),
+ * and failure-looking strings anywhere else in the block. The core is read only if the core gate reads on (normally
+ * off after a reset: not touched); no register is written, no queue index moved.
+ */
+static int has_word(const char *s, size_t n)
+{
+	static const char *const kw[] = { "fatal", "err_", "error", "watchdog", "assert", "abort", "exception", "crash",
+					  "panic", "fail" };
+	char low[160];
+	size_t m = n < sizeof(low) - 1 ? n : sizeof(low) - 1;
+	for (size_t i = 0; i < m; i++)
+		low[i] = (char)(s[i] >= 'A' && s[i] <= 'Z' ? s[i] + 32 : s[i]);
+	low[m] = 0;
+	for (unsigned k = 0; k < sizeof(kw) / sizeof(kw[0]); k++)
+		if (strstr(low, kw[k]))
+			return 1;
+	return 0;
+}
+
+int fwdump(uint64_t a)
+{
+	if (!a)
+		a = FIXED_LO;
+	if (range_ok(a, QSHARED, "fwdump"))
+		return 1;
+	uint32_t *b = malloc(QSHARED);
+	if (!b || big_io(a, b, QSHARED, 0)) {
+		printf("venus: fwdump: can't read %#llx+%#x\n", (unsigned long long)a, QSHARED);
+		free(b);
+		return 1;
+	}
+	vc_decode = 1;
+	const uint32_t *t = b;
+	int ours = t[1] == QTBL_SIZE && t[2] == QHDR0 && t[3] == QHDR_SIZE && t[4] == 3 && !memcmp(&t[8], "msm_v4l2_vidc", 13);
+	printf("venus: fwdump %#llx (read only): queue table %s (words %#x %#x %#x %#x %#x %#x)\n", (unsigned long long)a,
+	       ours ? "is venusctl's (DRAM kept its contents)" : "NOT recognised (DRAM lost or never initialised here)",
+	       t[0], t[1], t[2], t[3], t[4], t[5]);
+	uint32_t rdi[3] = { 0 }, wri[3] = { 0 };
+	for (unsigned i = 0; i < 3; i++) {
+		const uint32_t *h = b + (QHDR0 + QHDR_SIZE * i) / 4;
+		rdi[i] = h[QH_READ / 4], wri[i] = h[QH_WRITE / 4];
+		printf("venus: fwdump: %s header: status %u start %#x type %#x size %#x words, rx_req %u tx_req %u, read %u"
+		       " write %u%s\n", i == 0 ? "cmdq" : i == 1 ? "msgq" : "dbgq", h[0], h[1], h[2], h[3], h[8], h[9],
+		       rdi[i], wri[i], rdi[i] != wri[i] ? (i == 0 ? " (commands the firmware never read)" : " (UNREAD)") : "");
+	}
+	/* SFR */
+	const uint32_t *sfr = b + SFR_OFF / 4;
+	char s[SFR_SIZE];
+	memcpy(s, sfr + 1, SFR_SIZE - 4);
+	s[SFR_SIZE - 5] = 0;	/* "SFR isn't guaranteed to be NULL terminated" (Linux) */
+	size_t sl = strlen(s);
+	for (size_t k = 0; k < sl; k++)
+		if (s[k] < 0x20 || s[k] > 0x7e)
+			s[k] = '.';
+	printf("venus: fwdump: SFR %#llx bufSize %u%s: %s%s%s\n", (unsigned long long)(a + SFR_OFF), sfr[0],
+	       sfr[0] == SFR_SIZE ? "" : " (not the 4096 init wrote)",
+	       !sl ? "empty" : strstr(s, "Err_Fatal") ? "Err_Fatal - \"" : "Unknown - \"", s, sl ? "\"" : "");
+	if (!sl) {
+		printf("venus: fwdump: SFR first words:");
+		for (int k = 0; k < 8; k++)
+			printf(" %08x", sfr[k]);
+		printf("\n");
+	}
+	/* the debug queue ring: every SYS_DEBUG packet still in memory, oldest first (from the write index on) */
+	const uint32_t *dq = b + (QTBL_SIZE + QSIZE * 2) / 4;
+	unsigned shown = 0, total = 0, max = getenv("VENUSCTL_FWDUMP_MAX") ? (unsigned)atoi(getenv("VENUSCTL_FWDUMP_MAX")) : 80;
+	for (int pass = 0; pass < 2; pass++)	/* pass 0 counts, pass 1 prints the last max */
+		for (uint32_t k = 0, idx = wri[2] < QWORDS ? wri[2] : 0; k < QWORDS - 1; k++) {
+			uint32_t w = (idx + k) % QWORDS, sz = dq[w];
+			if (dq[(w + 1) % QWORDS] != 0x20004u || sz < 28 || sz > 4096 || (sz & 3))
+				continue;
+			uint32_t n = sz / 4;
+			if (pass == 0) {
+				total++;
+				continue;
+			}
+			if (++shown + max <= total)
+				continue;
+			for (uint32_t j = 0; j < n; j++)
+				pkt[j] = dq[(w + j) % QWORDS];
+			int unread = rdi[2] <= wri[2] ? (w >= rdi[2] && w < wri[2]) : (w >= rdi[2] || w < wri[2]);
+			printf("venus: fwdump: dbgq word %u%s: ", w, unread ? " UNREAD" : "");
+			char m[4096];
+			size_t len = 4u * n - 24;
+			if (pkt[3] < len)
+				len = pkt[3];
+			memcpy(m, pkt + 6, len);
+			m[len < sizeof(m) ? len : sizeof(m) - 1] = 0;
+			for (size_t c = 0; m[c]; c++)
+				if (m[c] < 0x20 || m[c] > 0x7e)
+					m[c] = ' ';
+			printf("fw [%#x]: %s\n", pkt[2], m);
+		}
+	printf("venus: fwdump: %u debug strings in the dbgq ring, the last %u shown (VENUSCTL_FWDUMP_MAX)\n", total,
+	       total < max ? total : max);
+	/* unread message-queue packets, decoded (copies: the indexes in DRAM are not moved) */
+	const uint32_t *mq = b + (QTBL_SIZE + QSIZE) / 4;
+	for (uint32_t r = rdi[1], cnt = 0; r != wri[1] && r < QWORDS && wri[1] < QWORDS && cnt < 200; cnt++) {
+		uint32_t sz = mq[r], n = sz / 4;
+		if (!n || sz > sizeof(pkt)) {
+			printf("venus: fwdump: msgq bad packet size %u at %u\n", sz, r);
+			break;
+		}
+		for (uint32_t j = 0; j < n; j++)
+			pkt[j] = mq[(r + j) % QWORDS];
+		print_pkt(1, (int)n);
+		r = (r + n) % QWORDS;
+	}
+	/* failure-looking strings elsewhere in the block (outside the table, the dbgq ring and the SFR page) */
+	const char *c = (const char *)b;
+	unsigned hits = 0;
+	for (size_t i = QTBL_SIZE; i < QSHARED && hits < 40;) {
+		size_t j = i;
+		while (j < QSHARED && c[j] >= 0x20 && c[j] <= 0x7e)
+			j++;
+		int in_dbg = i >= QTBL_SIZE + 2ull * QSIZE && i < QTBL_SIZE + 3ull * QSIZE;
+		int in_sfr = i >= SFR_OFF && i < SFR_OFF + SFR_SIZE;
+		if (j - i >= 12 && !in_dbg && !in_sfr && has_word(c + i, j - i)) {
+			printf("venus: fwdump: string at +%#zx: \"%.*s\"\n", i, (int)(j - i > 200 ? 200 : j - i), c + i);
+			hits++;
+		}
+		i = j + 1;
+	}
+	printf("venus: fwdump: %u failure-looking strings outside the dbgq/SFR\n", hits);
+	free(b);
+	/* the core, only if it is powered and clocked (normally not after a reset) */
+	if (core_ok()) {
+		core_status("fwdump");
+		printf("venus: fwdump: SFR_ADDR (CPU_CS_SCIBCMD) %#010x\n", crd(SFR_ADDR));
+	} else {
+		printf("venus: fwdump: core not read (gcc_video_ahb %#010x: clocks/GDSCs off or gated)\n", rd32(GCC_VIDEO_AHB));
+	}
+	return 0;
+}
+
+/*
+ * venus-hw (Stage 1, experiment 3): Linux-faithful pieces venusctl never did.
+ * hwctl: msm_vidc hands the vcodec GDSC (mvs0, qcom,support-hw-trigger in the redfin DT) to the hardware once the
+ * firmware is up (regulator mode FAST -> gdsc HW_CONTROL, GDSCR bit 1), so the firmware can collapse/restore vcodec
+ * itself; mvsc (iris-ctl) stays SW. off puts it back to SW (as before a power off).
+ * intmask: __interrupt_init (hfi_iris1): WRAPPER_INTR_MASK &= ~(A2HWD | A2H). The SPI stays disabled in the GIC; the
+ * status is acked by watch with VENUSCTL_INTCLR=1.
+ */
+#define WRAP_INTR_MASK	(CORE + 0xe0010)
+int hwctl_cmd(int on)
+{
+	if (!core_ok()) {
+		printf("venus: refused: power is off\n");
+		return 1;
+	}
+	uint32_t v = vrd(GDSC_MVS0);
+	upd(GDSC_MVS0, HW_CONTROL, on ? HW_CONTROL : 0, on ? "mvs0 HW_CONTROL on" : "mvs0 HW_CONTROL off");
+	printf("venus: gdsc mvs0 %#010x -> %#010x (HW_CONTROL %s)\n", v, vrd(GDSC_MVS0), on ? "on" : "off");
+	pm_step("hwctl %d: mvs0 %#x -> %#x", on, v, vrd(GDSC_MVS0));
+	return 0;
+}
+
+int intmask_cmd(void)
+{
+	if (!core_ok()) {
+		printf("venus: refused: power is off\n");
+		return 1;
+	}
+	uint32_t v = rd32(WRAP_INTR_MASK);
+	wr(WRAP_INTR_MASK, v & ~0x14u, "WRAPPER_INTR_MASK unmask A2HWD|A2H");
+	printf("venus: WRAPPER_INTR_MASK %#010x -> %#010x\n", v, rd32(WRAP_INTR_MASK));
+	return 0;
+}
+
+/*
+ * venus-hw: Linux's power collapse and resume (msm_vidc venus_hfi_pm_handler / __resume, seen in TWRP 2026-11-20):
+ *   suspend: SYS_PC_PREP, wait PC_READY + WFI, TZ "set state 0" (scm boot 0xa: TZBSP_VIDEO_SET_STATE suspend),
+ *            regulators back from HW, clocks + GDSCs off, buses unvoted. The image stays in TZ (pas 1).
+ *   resume:  power on, WRAPPER_INTR_MASK, TZ "set state 1", hand-off, UC/QTBL/SFR registers, CTRL_INIT, wait
+ *            CTRL_STATUS init. No PIL reload, no SYS_INIT (the firmware keeps its state).
+ */
+#define SCM_VIDEO_SET_STATE	0x4200010aull	/* SCM_SIP_FNID(SCM_SVC_BOOT 1, TZBSP_VIDEO_SET_STATE 0xa) */
+#define PC_FLAG	"/var/tmp/venusctl.pc"
+static int video_set_state(int st)
+{
+	uint64_t x[8] = { SCM_VIDEO_SET_STATE, 2, (uint64_t)st, 0, 0, 0, 0, 0 };
+	pm_smc(x);
+	printf("venus: TZ video set state %d -> %lld/%llx\n", st, (long long)x[0], (unsigned long long)x[1]);
+	return x[0] || x[1];
+}
+
+int suspend_cmd(void)
+{
+	struct vstate v;
+	if (state_load(&v) || !v.init || !v.q) {
+		printf("venus: refused: no initialised firmware\n");
+		return 1;
+	}
+	if (!core_ok()) {
+		printf("venus: refused: power is off (already suspended?)\n");
+		return 1;
+	}
+	qb = v.q;
+	setenv("VENUSCTL_PC_DELAY_MS", "0", 0);
+	/* test hook: VENUSCTL_TEST_PCSKIP=N: the first N suspends of this process report "not WFI + idle" without
+	 * touching the core (venusd's retry / 10-skips-fatal path) */
+	static int tskip;
+	const char *ts = getenv("VENUSCTL_TEST_PCSKIP");
+	int r = ts && tskip < atoi(ts) ? (tskip++, printf("venus: pc: test skip %d of %s (VENUSCTL_TEST_PCSKIP)\n", tskip, ts),
+					   1) : pc_prep(0);
+	/* venus-robust (d): stock __prepare_pc_common / venus_hfi_pm_handler (hfi_common.c:2929-3035): no PC_READY + WFI
+	 * = skip the power off (-EAGAIN), retry after the collapse delay, 10 skips in a row = fatal. A power off under a
+	 * busy ARM9 is the bus hang review 8.5.2 warns about. Returns 2 = skipped, still powered (the caller retries);
+	 * 1 = the queues failed (firmware dead?). VENUSCTL_PC_FORCE=1: power off anyway (the old "going on"). */
+	if (r != 0 && !(getenv("VENUSCTL_PC_FORCE") && atoi(getenv("VENUSCTL_PC_FORCE")))) {
+		printf("venus: suspend SKIPPED: PC_PREP result %d (%s): core left powered, firmware running; retry later\n",
+		       r, r == 1 ? "not WFI + idle" : r == 2 ? "no PC_READY + WFI after PC_PREP" : "queue failure");
+		pm_step("suspend skipped: pc_prep %d", r);
+		return r < 0 ? 1 : 2;
+	}
+	if (r != 0)
+		printf("venus: suspend: PC_PREP result %d; VENUSCTL_PC_FORCE: going on\n", r);
+	if (video_set_state(0))
+		printf("venus: suspend: TZ set state 0 failed, going on\n");
+	int f0 = force;
+	force = 1;	/* pas 1 stays: the image is kept for the resume */
+	int rc = power_off();
+	force = f0;
+	FILE *fl = fopen(PC_FLAG, "w");
+	if (fl)
+		fputs("1\n", fl), fclose(fl);
+	printf("venus: suspend %s (power collapsed, image kept)\n", rc ? "with errors" : "ok");
+	return rc;
+}
+
+int resume_cmd(void)
+{
+	struct vstate v;
+	if (state_load(&v) || !v.init || !v.q) {
+		printf("venus: refused: no initialised firmware to resume\n");
+		return 1;
+	}
+	if (power_on())
+		return 1;
+	if (video_set_state(1))
+		printf("venus: resume: TZ set state 1 failed, going on\n");
+	if (getenv("VENUSCTL_LINUX")) {
+		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
+	}
+	uint64_t q = v.q;
+	wr(UC_ADDR, (uint32_t)q, "UC_REGION_ADDR");
+	wr(UC_SIZE, QSHARED, "UC_REGION_SIZE");
+	wr(QTBL_ADDR, (uint32_t)q, "QTBL_ADDR");
+	wr(QTBL_INFO, 1, "QTBL_INFO");
+	wr(SFR_ADDR, (uint32_t)(q + SFR_OFF), "SFR_ADDR");
+	wr(CS_VMIMSG, (uint32_t)q, "DSP_QTBL_ADDR");
+	wr(CS_VMIMSGAG0, (uint32_t)q, "DSP_UC_REGION_ADDR");
+	wr(CS_VMIMSGAG1, QSHARED, "DSP_UC_REGION_SIZE");
+	if (ctrl3_on()) {	/* (h): the DSP queue block survives the collapse (DRAM); only the registers again */
+		wr(CS_VMIMSG, (uint32_t)dspq_addr(), "DSP_QTBL_ADDR (own block)");
+		wr(CS_VMIMSGAG0, (uint32_t)dspq_addr(), "DSP_UC_REGION_ADDR (own block)");
+		wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
+	}
+	if (hwctl_early())
+		hwctl_handoff("resume, before CTRL_INIT (stock __resume order)");
+	wr(CTRL_INIT, ctrl3_on() ? 3 : 1, "CTRL_INIT (resume)");
+	double t0 = mono_ms();
+	uint32_t st = 0;
+	for (unsigned i = 0;; i++) {
+		st = crd(CTRL_STATUS);
+		if ((st & (ST_INIT | ST_ERROR)) || wait_over(t0, i, 1000))
+			break;
+		delay_ms(1);
+	}
+	printf("venus: resume: CTRL_STATUS %#010x after %.0f ms%s\n", st, mono_ms() - t0,
+	       (st & ST_INIT) && !(st & ST_ERROR) ? " (init ok)" : " FAILED");
+	if ((st & ST_INIT) && !(st & ST_ERROR) && !hwctl_early())
+		hwctl_handoff("resume");
+	unlink(PC_FLAG);
+	return (st & ST_INIT) && !(st & ST_ERROR) ? 0 : 1;
+}
+
+/* ws-venus-enc: the encoder shares this file's statics (queues, allocator, session state) */
+#include "venus_enc.inc"

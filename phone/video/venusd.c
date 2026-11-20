@@ -52,6 +52,10 @@
  * vdstamp: every line of the log (venus_core's too) and of the console starts "[ssss.mmm] ": seconds since boot from
  * mach_absolute_time, the clock (and format) of the kernel's per-boot log lines, so they line up; the first line after
  * a minute without one, the start and each session open add "[wall YYYY-MM-DD HH:MM:SS] ". VENUSD_STAMP=0: no stamps.
+ * vdstall (video.md 2026-11-12 22:22, the page clock lag): a running session with inputs at the firmware (ETB, no EBD)
+ * and no picture for VENUSD_STALL_MS (500; since the last picture, or the decoder start) logs one line "no FBD for
+ * >N ms" (last ETB/EBD ages, credits queued; -1: none this session), then "FBD resumed after N ms" at the next picture
+ * (or "ended with the session"). Log and console. 0: no stall lines.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -102,8 +106,20 @@ static volatile sig_atomic_t term;
 static const char *fw;
 static uint64_t phys = 0xa2600000ull, buf_mb = 160;	/* redfin: queues 0xa2600000, window 0xa2a00000 + 160 MB (xnu 1057) */
 static uint32_t debug = 0x18, in_min = 1024u << 10;
-static unsigned idle_s = 60, nsess, idle_cl_s = 30;	/* idle_cl_s: VENUSD_IDLE_CLIENT_S (vdleak) */
+static unsigned idle_s = 0, nsess, idle_cl_s = 30;	/* idle_cl_s: VENUSD_IDLE_CLIENT_S (vdleak) */
 static double idle_since, t_open, t_first, t_last_frame, t_eos, t_prog;
+/* venus-hw: Linux's power collapse (msm_vidc venus_hfi_pm_handler): VENUSD_PC_MS (default 1500, 0 = off) after the
+ * last session the core is collapsed (venusctl suspend: PC_PREP, TZ suspend, power off; the image stays), and the next
+ * OPEN resumes it (no PIL reload).
+ * venus-robust (b): collapse only, as stock (lito never-unload-fw: one PIL load per boot, msm_vidc_common.c:3167-3181):
+ * VENUSD_IDLE_S now defaults to 0 = never a full down (PAS shutdown) for idleness; the warm-up's firmware stays loaded
+ * (collapsed) for the first OPEN. Down only on a sys error / watchdog / failed close / 10 collapse skips / SIGTERM.
+ * VENUSD_IDLE_S=N > 0: the old full down after N s idle (60 was the old default).
+ * venus-robust (d): suspend_cmd 2 = skipped (no PC_READY + WFI): still powered, retried after VENUSD_PC_MS; 10 in a
+ * row (VENUSD_PC_SKIPS) = fatal as stock's VIDC_MAX_PC_SKIP_COUNT: Venus down. */
+static int pc_down;
+static unsigned pc_ms = 1500, pc_skips, pc_skip_max = 10, pc_n;
+static double pc_up_t;	/* venus-robust: when the firmware was loaded (bring-up), for the log */
 static uint32_t sent, hint_w, hint_h;
 static unsigned last_acts;
 static uint8_t *au;
@@ -122,6 +138,9 @@ static struct { uint32_t id; IOSurfaceRef s; unsigned long use; } vsurf[VSURF_MA
 static unsigned long vsurf_clock;
 static IOSurfaceRef placed_s;
 static uint32_t placed_id;
+static unsigned stall_ms = 500, stall_ebds;	/* vdstall: VENUSD_STALL_MS; the EBD count last seen */
+static double t_run, t_etb, t_ebd, stall_ref;	/* decoder start, last ETB, last EBD; the stall's last picture */
+static int stalled;
 
 /* vdcold: the warm-up stream, one 320x240 grey IDR (SPS, PPS, slice; ffmpeg color=gray, libx264 constrained baseline,
  * SEI removed; 320x240 is a size stage 3 decoded bit-exact) */
@@ -476,11 +495,30 @@ static void test_file(void)
 
 /* ---- Venus up/down: tools/sunfish-venus-test.sh decode's steps and its LEFT POWERED rule ---- */
 
+/* venus-robust (e): while the firmware is up, powered and idle (no session), the read-only watchdog check once per
+ * main-loop pass (VENUSCTL_WDOG_MS paces it inside venus_core) */
+static int wdog_tick(void)
+{
+	if (!vc_fw_watchdog())
+		return 0;
+	note("venusd: firmware watchdog / dead firmware seen while idle");
+	return 1;
+}
+
 static void down(const char *why)
 {
 	if (fault)
 		return;
 	note("venusd: Venus down (%s)", why);
+	if (pc_down) {	/* collapsed: the PAS shutdown wants the core powered and the firmware awake */
+		if (resume_cmd()) {	/* venus-robust: e.g. an RPMh BCM vote timeout (TCS quarantined for the boot) */
+			fault = 1;
+			note("venusd: resume before the shutdown failed: Venus stays power-collapsed with the image in TZ (core"
+			     " off, STATE kept, no PAS shutdown possible); OPEN refused until a reboot");
+			return;
+		}
+		pc_down = 0;
+	}
 	if (shutdown_cmd()) {
 		fault = 1;
 		note("venusd: shutdown FAILED: no power off (the firmware may still run): LEFT POWERED, reboot needed");
@@ -511,7 +549,9 @@ static int bring_up(void)
 		return -1;
 	}
 	up = 1;
-	note("venusd: Venus up in %.0f ms (firmware %s, queues %#llx)", 1e3 * (mono() - t0), fw, (unsigned long long)phys);
+	pc_up_t = mono(), pc_skips = 0;
+	note("venusd: Venus up in %.0f ms (firmware %s, queues %#llx; firmware load at CLOCK_MONOTONIC %.1f s)", 1e3 * (mono() - t0),
+	     fw, (unsigned long long)phys, pc_up_t);
 	return 0;
 }
 
@@ -530,6 +570,9 @@ static void sess_log(const char *how)
 {
 	struct vdec_status st;
 	vdec_status(&st);
+	if (stalled)	/* vdstall */
+		note("venusd: session %u: no FBD stall ended with the session after %.0f ms", nsess, 1e3 * (mono() - stall_ref));
+	stalled = 0;
 	double span = t_last_frame > t_first ? t_last_frame - t_first : 0;
 	note("venusd: session %u %s: %u AUs in, %d frames, %.2f s from OPEN, first frame %.0f ms after it, %.1f fps"
 	     " (frame 0 -> %d), copy-out mean %.2f ms max %.2f ms, error %#x%s; credited %u, socket %u, handed back %u",
@@ -605,10 +648,28 @@ static const char *rd_why(void)
 	return !errno ? "EOF" : errno == EAGAIN || errno == EWOULDBLOCK ? "read timeout" : strerror(errno);
 }
 
+/* venus-robust (f): VENUSD_CLK = auto | 240 | 338 | 365 (unset: venusctl's default 240 MHz, as before): the iris rate
+ * for the next power on / resume, auto from the OPEN's size hint at 30 fps (venus_core vc_clk_for). The rate is set
+ * at power on only: a session opened while the core is still up (inside VENUSD_PC_MS) keeps the current rate. */
+static void clk_for_open(const struct venusd_msg *m)
+{
+	const char *e = getenv("VENUSD_CLK");
+	if (!e || !*e)
+		return;
+	unsigned mhz = strcmp(e, "auto") ? (unsigned)atoi(e) : vc_clk_for(m->width ? m->width : 1920,
+									    m->height ? m->height : 1088, 30, 0);
+	char b[16];
+	snprintf(b, sizeof b, "%u", mhz);
+	setenv("VENUSCTL_CLK_MHZ", b, 1);
+	note("venusd: clock for this OPEN (%ux%u, VENUSD_CLK %s): %u MHz at the next power on", m->width, m->height, e,
+	     mhz);
+}
+
 static void do_open(int i, const struct venusd_msg *m)
 {
 	struct stat sb;
 	int32_t rc = 0;
+	clk_for_open(m);
 	if (owner >= 0 && owner != i)
 		rc = -EBUSY, printf("venusd: OPEN from fd %d refused: one session at a time (fd %d has it)\n", cl[i].fd,
 				  cl[owner].fd);
@@ -625,6 +686,17 @@ static void do_open(int i, const struct venusd_msg *m)
 		rc = -EIO, printf("venusd: OPEN refused: Venus was left powered after a failed shutdown (reboot)\n");
 	else if (!up && up_for(i))
 		rc = -EIO;
+	else if (up && pc_down) {
+		double t0 = mono();
+		if (resume_cmd()) {
+			rc = -EIO;
+			note("venusd: resume from power collapse FAILED: Venus down");
+			down("resume failed");	/* venus-robust: down() resumes once more, else marks the collapsed fault */
+		} else {
+			pc_down = 0;
+			note("venusd: resumed from power collapse in %.0f ms", 1e3 * (mono() - t0));
+		}
+	}
 	if (!rc) {
 		owner = i;
 		sess = S_OPEN;
@@ -634,6 +706,7 @@ static void do_open(int i, const struct venusd_msg *m)
 		sess_hevc = m->codec == VD_CODEC_HEVC;
 		t_open = mono();
 		t_first = t_last_frame = 0;
+		t_run = t_etb = t_ebd = 0, stalled = 0;	/* vdstall */
 		cred_drop();	/* vdcredit */
 		n_placed = n_copied = n_returned = path_logged = 0;
 		wall_due = 0;	/* vdstamp: the wall clock on this line */
@@ -676,7 +749,10 @@ static int sess_start(const uint8_t *p, uint32_t len)
 	}
 	sess = S_RUN;
 	hfi = 1;
-	t_prog = mono();
+	t_prog = t_run = mono();	/* vdstall: t_run */
+	struct vdec_status st;
+	vdec_status(&st);
+	stall_ebds = st.ebds;
 	return 0;
 }
 
@@ -747,6 +823,7 @@ static void command(int i)
 			sess_fail(-EIO, m.seq);
 		} else {
 			sent++;
+			t_etb = mono();	/* vdstall */
 		}
 		return;
 	}
@@ -768,6 +845,24 @@ static void command(int i)
 	reply(i, VD_ERROR, -EINVAL, m.seq);
 }
 
+/* vdstall: inputs at the firmware and no picture for stall_ms: one line, and one when the next picture comes */
+static void stall_check(const struct vdec_status *st, double t)
+{
+	double ref = t_last_frame ? t_last_frame : t_run;
+	if (st->ebds != stall_ebds)
+		stall_ebds = st->ebds, t_ebd = t;
+	if (stalled && t_last_frame > stall_ref) {
+		note("venusd: session %u: FBD resumed after %.0f ms (frame %d)", nsess, 1e3 * (t_last_frame - stall_ref),
+		     st->frames - 1);
+		stalled = 0;
+	} else if (!stalled && stall_ms && st->in_fw && t - ref > stall_ms / 1e3) {
+		stalled = 1, stall_ref = ref;
+		note("venusd: no FBD for >%u ms: %d inputs queued, last ETB %.0f ms ago, last EBD %.0f ms ago, credits %u"
+		     " (session %u, %s, %d frames, %u AUs in)", stall_ms, st->in_fw, t_etb ? 1e3 * (t - t_etb) : -1.0,
+		     t_ebd ? 1e3 * (t - t_ebd) : -1.0, cred_n, nsess, sname[sess], st->frames, sent);
+	}
+}
+
 /* while a session runs: the queues, then what came of them */
 static void sess_poll(void)
 {
@@ -782,6 +877,7 @@ static void sess_poll(void)
 	double t = mono();
 	if (st.acts != last_acts)
 		last_acts = st.acts, t_prog = t;
+	stall_check(&st, t);	/* vdstall */
 	if (st.err || st.fw_dead) {
 		sess_fail(st.err ? st.err : -EIO, sent);
 		return;
@@ -853,8 +949,10 @@ static void warm_up(void)
 	sess_stop();
 	sess = S_NONE;
 	t_first = t_last_frame = 0;
-	if (up)
+	if (up && (idle_s || !pc_ms))	/* venus-robust (b): collapse-only keeps the firmware for the first OPEN */
 		down("warm-up done");
+	else if (up)
+		note("venusd: warm-up done: firmware stays loaded (collapse only), power collapse in %u ms", pc_ms);
 }
 
 /* vdstop: venus_core's STOP hook: back to the main loop (stop_jb) or out of recover() (rec_jb); unarmed: venus_core
@@ -987,8 +1085,12 @@ int main(int argc, char **argv)
 		stdout = stderr = lf;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	vc_quiet = !(getenv("VENUSD_VERBOSE") && atoi(getenv("VENUSD_VERBOSE")));
+	if (getenv("VENUSD_PC_MS"))
+		pc_ms = (unsigned)atoi(getenv("VENUSD_PC_MS"));
 	if (getenv("VENUSD_IDLE_S"))
 		idle_s = (unsigned)atoi(getenv("VENUSD_IDLE_S"));
+	if (getenv("VENUSD_PC_SKIPS") && atoi(getenv("VENUSD_PC_SKIPS")) > 0)
+		pc_skip_max = (unsigned)atoi(getenv("VENUSD_PC_SKIPS"));
 	if (getenv("VENUSD_PHYS"))
 		phys = strtoull(getenv("VENUSD_PHYS"), NULL, 0);
 	if (getenv("VENUSD_BUF_MB"))
@@ -1004,6 +1106,8 @@ int main(int argc, char **argv)
 	int warm = !getenv("VENUSD_WARMUP") || atoi(getenv("VENUSD_WARMUP"));
 	hevc_ok = !getenv("VENUSD_HEVC") || atoi(getenv("VENUSD_HEVC"));
 	surf_on = !getenv("VENUSD_SURF") || atoi(getenv("VENUSD_SURF"));	/* vdcredit */
+	if (getenv("VENUSD_STALL_MS"))	/* vdstall */
+		stall_ms = (unsigned)atoi(getenv("VENUSD_STALL_MS"));
 	if (!getenv("VENUSD_RECOVER") || atoi(getenv("VENUSD_RECOVER")))
 		vc_stop_hook = on_stop;
 	vc_frame_tag = !getenv("VENUSD_FW_FRAME") || atoi(getenv("VENUSD_FW_FRAME"));
@@ -1032,6 +1136,8 @@ int main(int argc, char **argv)
 	au = malloc(VENUSD_MAX_AU);
 	if (!au)
 		return 1;
+	note("venusd: venus-robust: %s, power collapse %u ms, %u skips fatal", idle_s ? "full down after idle" :
+	     "collapse only (firmware loaded once)", pc_ms, pc_skip_max);
 	note("venusd: start, pid %d, idle %u s, idle client %u s, max %d clients, queues %#llx, window %llu MB, inputs >= %u KB,"
 	     " quiet %d, cold %u s, warm-up %d, recover %d, hevc %d, surf %d", getpid(), idle_s, idle_cl_s, MAXCL,
 	     (unsigned long long)phys, (unsigned long long)buf_mb, in_min >> 10, vc_quiet, cold_s, warm, vc_stop_hook != NULL,
@@ -1117,7 +1223,28 @@ int main(int argc, char **argv)
 				snprintf(why, sizeof why, "idle %u s, %s", idle_cl_s, i == owner ? sname[sess] : "no session");
 				drop_client(i, why);
 			}
-		if (up && owner < 0 && mono() - idle_since > idle_s)
+		if (up && !pc_down && !fault && owner < 0 && wdog_tick())
+			down("firmware watchdog");
+		if (up && !pc_down && !fault && owner < 0 && pc_ms && mono() - idle_since > pc_ms / 1e3) {
+			int sr = suspend_cmd();
+			if (sr == 2 && ++pc_skips >= pc_skip_max) {
+				note("venusd: power collapse skipped %u times in a row (stock: fatal): Venus down", pc_skips);
+				pc_skips = 0;
+				down("power collapse skips");
+			} else if (sr == 2) {
+				idle_since = mono();	/* stock: re-queued after the collapse delay */
+				note("venusd: power collapse skipped (%u of %u): firmware not PC_READY + WFI, retry in %u ms",
+				     pc_skips, pc_skip_max, pc_ms);
+			} else if (sr) {
+				idle_since = mono();
+				note("venusd: power collapse failed (core left on), retry in %u ms", pc_ms);
+			} else {
+				pc_down = 1, pc_skips = 0, pc_n++;
+				note("venusd: power collapse #%u after %u ms idle (firmware loaded %.0f s ago, at CLOCK_MONOTONIC %.1f s)",
+				     pc_n, pc_ms, mono() - pc_up_t, pc_up_t);
+			}
+		}
+		if (up && idle_s && owner < 0 && mono() - idle_since > idle_s)
 			down("idle");
 		if (!fstat(logfd, &sb) && sb.st_size > LOG_MAX && !ftruncate(logfd, 0))
 			printf("venusd: log cut at %d B\n", LOG_MAX);
