@@ -36,6 +36,7 @@
 #define VE_P_BR_TYPE	0x2005031u	/* PARAM_VENC_BITRATE_TYPE {enable}: 0 = cumulative */
 #define VE_P_BITRATE	0x2006001u	/* CONFIG_VENC_TARGET_BITRATE {bitrate, layer_id} */
 #define VE_P_LOWLAT	0x2005022u	/* PARAM_VENC_LOW_LATENCY_MODE {enable} */
+#define VE_P_BLUR	0x2006010u	/* CONFIG_VENC_BLUR_FRAME_SIZE {buffer_type, width, height} */
 #define VE_P_CAC	0x2005038u	/* PARAM_VENC_BITRATE_SAVINGS {enable} (content-adaptive coding) */
 #define VE_RC_OFF	0x1000001u
 #define VE_RC_VBR_CFR	0x1000003u
@@ -338,7 +339,11 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 	    ve_prop("idr-period", VE_P_IDR, 1, 0, 0, 1) ||
 	    ve_prop("intra-period", VE_P_INTRA, c->gop > 1 ? (uint32_t)c->gop - 1 : 0, 0, 0, 2) ||
 	    (rcm != VE_RC_OFF && (ve_prop("bitrate-type", VE_P_BR_TYPE, 0, 0, 0, 1) ||
-				  ve_prop("bitrate", VE_P_BITRATE, c->bitrate, layer, 0, 2))))
+				  ve_prop("bitrate", VE_P_BITRATE, c->bitrate, layer, 0, 2))) ||
+	    /* blur (a VPSS/CVP pre-process): {INPUT, W, H} = all blur off (msm_venc_set_blur_resolution's 2), stock sends
+	     * {INPUT, 0, 0} = internal blur on. Off unless VENUSCTL_ENC_BLUR=1 (internal) */
+	    ve_prop("blur", VE_P_BLUR, B_INPUT, getenv("VENUSCTL_ENC_BLUR") ? 0u : (uint32_t)W,
+		    getenv("VENUSCTL_ENC_BLUR") ? 0u : (uint32_t)H, 3))
 		goto close;
 	if (get_bufreq())
 		goto close;
