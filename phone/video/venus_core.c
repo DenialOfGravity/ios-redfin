@@ -1944,6 +1944,7 @@ static void step_status(int force_now)
 		" sGFSYNR1 %#010x sGFSYNR2 %#010x sGFAR %#010x%08x", rd32(CTRL_STATUS), rd32(WRAP_CPU_STATUS),
 		rd32(WRAP_INTR_STATUS), rd32(s + 0x48), rd32(s + 0x50), rd32(s + 0x54), rd32(s + 0x58), rd32(s + 0x44),
 		rd32(s + 0x40));
+	pm_step("status: gdsc mvsc %#010x mvs0 %#010x mvs1 %#010x", vrd(GDSC_MVSC), vrd(GDSC_MVS0), vrd(GDSC_MVS1));
 	if (win_cbp)
 		pm_step("status: window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x", rd32(win_cbp + 0x58),
 			rd32(win_cbp + 0x64), rd32(win_cbp + 0x60), rd32(win_cbp + 0x68));
