@@ -207,15 +207,16 @@ static const char *enc_misfit(IOSurfaceRef s, uint32_t *len_out)
 		*c = IOSurfaceGetBaseAddressOfPlane(s, 1);
 	if (!b || !y || !c)
 		return "no base address";
-	if (y != b)
-		return "plane 0 not at offset 0";
+	size_t yo = (size_t)(y - b);
+	if (yo & 0xfff)
+		return "plane 0 not page aligned in the surface";	/* the Venus buffer starts at plane 0 */
 	if (IOSurfaceGetBytesPerRowOfPlane(s, 0) != st || IOSurfaceGetBytesPerRowOfPlane(s, 1) != st)
 		return "bytes per row";
-	if ((size_t)(c - b) != uvo)
+	if ((size_t)(c - y) != uvo)
 		return "CbCr offset";
-	if (IOSurfaceGetAllocSize(s) < (size_t)uvo + (size_t)st * ((enc_h + 1) / 2))
+	if (IOSurfaceGetAllocSize(s) < yo + (size_t)uvo + (size_t)st * ((enc_h + 1) / 2))
 		return "alloc size";
-	*len_out = (uint32_t)IOSurfaceGetAllocSize(s);
+	*len_out = (uint32_t)yo;	/* (the caller adds the mapped length) */
 	return NULL;
 }
 
@@ -264,8 +265,8 @@ static void enc_frame(const struct venusd_msg *m)
 		etag_next = 1;
 	int slot = (int)(tag % ETAG_N);
 	etag[slot] = (typeof(etag[0])){ tag, m->seq, m->surface, m->pts, 0 };
-	uint32_t len = 0, iova = 0;
-	const char *why = enc_misfit(s, &len);
+	uint32_t len = 0, iova = 0, yo = 0;
+	const char *why = enc_misfit(s, &yo);
 	int j = -1;
 	if (!why && enc_zc_on) {
 		j = enc_map(m->surface, &iova, &len);
@@ -281,6 +282,7 @@ static void enc_frame(const struct venusd_msg *m)
 	if (j >= 0) {
 		uint32_t st, ys, uvo, sz;
 		venc_layout(&st, &ys, &uvo, &sz);
+		iova += yo, len -= yo;	/* the Venus buffer = plane 0 on */
 		if (vmmu_sync(iova, sz < len ? sz : len, 1)) {
 			enc_indone(m->seq, m->surface, -EIO, 0);
 			return;
@@ -293,8 +295,8 @@ static void enc_frame(const struct venusd_msg *m)
 			return;
 		}
 		if (!enc_zc++)
-			note("venusd: session %u: frame %u zero-copy from IOSurface %u (IOVA %#x, %u bytes)", nsess, m->seq,
-			     m->surface, iova, len);
+			note("venusd: session %u: frame %u zero-copy from IOSurface %u (plane 0 at IOVA %#x, +%u in the surface,"
+			     " %u bytes)", nsess, m->seq, m->surface, iova, yo, len);
 	} else {
 		double t0 = enc_ms();
 		uint32_t size, S, YS;

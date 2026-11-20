@@ -76,6 +76,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
+#include <sys/qos.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include "pmem.h"
 #include "venus_core.h"
@@ -1178,6 +1180,11 @@ int main(int argc, char **argv)
 		note("venusd: kern.sweet_vmmu %d, VENUSD_VMMU %s: session buffers %s", vm, want ? "on" : "off",
 		     vmmu_want() ? "through /dev/vmmu (encoder available)" : "in the window (no encoder)");
 	}
+	/* ws-vt-venc: the queue polling (1-4 ms sleeps) stretches ~10-30x under timer coalescing when venusd is not started
+	 * as launchd's Interactive job (e.g. from a shell): the encoder open took ~1 s (30 ms a property). The main thread
+	 * asks for user-interactive QoS (tight timers) itself; VENUSD_QOS=0: not */
+	if (!getenv("VENUSD_QOS") || atoi(getenv("VENUSD_QOS")))
+		note("venusd: main thread QoS user-interactive: %d", pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0));
 	au = malloc(VENUSD_MAX_AU);
 	if (!au)
 		return 1;
