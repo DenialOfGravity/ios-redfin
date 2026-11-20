@@ -856,7 +856,16 @@ target = "userland"
 ref = "redfin-int"
 sha = "8008c6a77b"
 restart = "mediaserverd"
-note = "2026-11-20: Venus hardware VideoToolbox encoder (ws-vt-venc), loaded into mediaserverd by RedwoodAudio (inject_media.c). Registers avc1 (rating 1000, hardware); hvc1 only with VTVENC_HEVC=1 in /var/local/vtvenc-env (code default 0 since d0e0946). Off: /var/local/vtvenc-off or no /var/local/venus.on"
+note = "2026-11-20: Venus hardware VideoToolbox encoder (ws-vt-venc), loaded into mediaserverd by RedwoodAudio (inject_media.c). Registers avc1 (rating 1000, hardware); hvc1 with VTVENC_HEVC=1 in /var/local/vtvenc-env (code default 0 since d0e0946; the manifest file sets 1 since HEIC was verified 2026-11-20). Off: /var/local/vtvenc-off or no /var/local/venus.on"
+
+[[file]]
+path = "/var/local/vtvenc-env"
+source = "state/files/venusd/vtvenc-env-hevc1"
+sha256 = "b4eff87984307351807f3f2a35d907c1dd901a0505af4aaacd03b095c413d946"
+mode = "644"
+owner = "0:0"
+restart = "mediaserverd"
+note = "2026-11-20 (HEIC verified): VTVENC_HEVC=1: vtvenc registers hvc1 too (Camera High Efficiency video through Venus: HEVC Main 1080p30). HEIC photos with hvc1 registered: VT creates our hvc1 instance twice per photo and drops it before StartSession (tiles), HEIC from Apple's encoder, 4032x3024 grid of 512x512 tiles, decodes, opens in Photos. Remove the file (or VTVENC_HEVC=0) = avc1 only"
 
 [[file]]
 path = "/var/local/bin/vtenc_test"
