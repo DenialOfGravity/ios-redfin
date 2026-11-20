@@ -705,11 +705,37 @@ static void do_open(int i, const struct venusd_msg *m)
 	reply(i, VD_OPEN, rc, 0);
 }
 
+/* ws-vt-venc: session buffers through /dev/vmmu (xnu 1270) whenever the kernel allows it: VENUSD_VMMU=0 keeps the
+ * window; a VENUSCTL_VMMU set before start wins. Checked at start and again at every OPEN/ENC_OPEN while no session is
+ * open: launchd starts venusd (~4 s) before boot.conf sets kern.sweet_vmmu=1, and venus_core attaches /dev/vmmu per
+ * session (vmmu_want() && !vmmu_active()), so a later 0 -> 1 takes effect at the next session. */
+static void vmmu_check(int at_open)
+{
+	static int fixed = -1;	/* 1: VENUSCTL_VMMU came from the environment */
+	if (fixed < 0)
+		fixed = getenv("VENUSCTL_VMMU") != NULL;
+	if (fixed || (at_open && vmmu_want()))
+		return;
+	int vm = -1;
+	size_t vn = sizeof(vm);
+	if (sysctlbyname("kern.sweet_vmmu", &vm, &vn, NULL, 0))
+		vm = -1;
+	int want = !getenv("VENUSD_VMMU") || atoi(getenv("VENUSD_VMMU"));
+	if (want && vm == 1)
+		setenv("VENUSCTL_VMMU", "1", 1);
+	if (!at_open || vmmu_want())
+		note("venusd: kern.sweet_vmmu %d, VENUSD_VMMU %s%s: session buffers %s", vm, want ? "on" : "off",
+		     at_open ? " (rechecked at OPEN)" : "",
+		     vmmu_want() ? "through /dev/vmmu (encoder available)" : "in the window (no encoder)");
+}
+
 /* the checks and the bring-up (or resume) shared by OPEN and ENC_OPEN; 0 = Venus ready for a session */
 static int32_t open_common(int i, const struct venusd_msg *m, int enc)
 {
 	struct stat sb;
 	int32_t rc = 0;
+	if (owner < 0)
+		vmmu_check(1);
 	clk_for_open(m);
 	if (owner >= 0 && owner != i)
 		rc = -EBUSY, printf("venusd: OPEN from fd %d refused: one session at a time (fd %d has it)\n", cl[i].fd,
@@ -1168,18 +1194,7 @@ int main(int argc, char **argv)
 		     kv == 1 ? "write-combined window" : kv == 0 ? "device mapping (slow copy-out; boot-arg sweetvenus=1|2)" :
 		     "no xnu 1057 (device mapping, slow copy-out)");
 	}
-	{	/* ws-vt-venc: session buffers through /dev/vmmu (xnu 1270) whenever the kernel allows it: VENUSD_VMMU=0 keeps
-		 * the window; an explicit VENUSCTL_VMMU wins */
-		int vm = -1;
-		size_t vn = sizeof(vm);
-		if (sysctlbyname("kern.sweet_vmmu", &vm, &vn, NULL, 0))
-			vm = -1;
-		int want = !getenv("VENUSD_VMMU") || atoi(getenv("VENUSD_VMMU"));
-		if (!getenv("VENUSCTL_VMMU") && want && vm == 1)
-			setenv("VENUSCTL_VMMU", "1", 1);
-		note("venusd: kern.sweet_vmmu %d, VENUSD_VMMU %s: session buffers %s", vm, want ? "on" : "off",
-		     vmmu_want() ? "through /dev/vmmu (encoder available)" : "in the window (no encoder)");
-	}
+	vmmu_check(0);
 	/* ws-vt-venc: the queue polling (1-4 ms sleeps) stretches ~10-30x under timer coalescing when venusd is not started
 	 * as launchd's Interactive job (e.g. from a shell): the encoder open took ~1 s (30 ms a property). The main thread
 	 * asks for user-interactive QoS (tight timers) itself; VENUSD_QOS=0: not */
