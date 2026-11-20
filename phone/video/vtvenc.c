@@ -22,7 +22,12 @@
  *   bit rate).  VTVENC_SEQHDR (0): 1 = parameter sets in band before every IDR.  VTVENC_INFLIGHT (12): frames out
  *   at once before EncodeFrame waits.  VTVENC_LOG (0): 1 = a line per frame.  VTVENC_RC (1): host rate control: the
  *   constant QP follows the measured bit rate toward AverageBitRate (DataRateLimits as a cap), ENC_QP to venusd;
- *   0 = the QP from the bit rate guess stays (venusd's mapping).  VTVENC_EARLY_MS (40): the venusd session opens this
+ *   0 = the QP from the bit rate guess stays (venusd's mapping). The loop stays off when venusd runs the firmware's
+ *   rate control (ws-vtvenc-rc: /var/local/venusd-hwrc; its ENC_OPEN reply says VD_ENC_RC_FW): then the target goes to
+ *   the firmware instead: CBR when VT asks for a constant rate (ConstantBitRate, or DataRateLimits equal to
+ *   AverageBitRate within 2 %), else VBR at AverageBitRate (capped at 90 % of a lower DataRateLimits; the firmware has
+ *   no peak cap of its own here); a new AverageBitRate/DataRateLimits/ConstantBitRate mid-session -> ENC_RATE
+ *   (the mode, VBR or CBR, stays as opened).  VTVENC_EARLY_MS (40): the venusd session opens this
  *   long after StartSession (in the background), not at the first frame; -1 = at the first frame.
  * Off: /var/local/vtvenc-off (nothing registered) or no /var/local/venus.on.
  */
@@ -208,7 +213,9 @@ struct ve {
 	FourCharCode codec;
 	int w, h;
 	/* properties */
-	double bitrate, fps, key_dur, peak;
+	double bitrate, fps, key_dur, peak, cbr;	/* cbr: ConstantBitRate (bit/s), 0 = not set */
+	int fw_rc;		/* ws-vtvenc-rc: the ENC_OPEN reply's VD_ENC_RC_* flags (firmware rate control) */
+	double rc_sent;		/* the target bit rate venusd has (ENC_OPEN or the last ENC_RATE) */
 	/* host rate control (Venus's own needs the CVP core): bytes of the frames since the last QP change */
 	int qp, qpi, rc_n, rc_changes, gop;
 	double rc_bytes;
@@ -472,11 +479,35 @@ static int make_fmt(struct ve *v)
  * (AverageBitRate, capped by DataRateLimits); 6 QP per doubling (H.264/HEVC), half the step at a time, at most +4/-3,
  * QP 12..51; dead band 15 %. Returns the new P QP to send (I = P - 2), or 0 */
 #define RC_MIN	8
-static int rc_step(struct ve *v, size_t len)
+
+/* (under mu) ws-vtvenc-rc: does VT ask for a constant bit rate? ConstantBitRate set, or DataRateLimits (as one
+ * bytes/seconds pair) equal to AverageBitRate within 2 % */
+static int rc_wants_cbr(const struct ve *v)
 {
+	if (v->cbr > 0)
+		return 1;
+	return v->bitrate > 0 && v->peak > 0 && fabs(v->peak - v->bitrate) <= 0.02 * v->bitrate;
+}
+
+/* (under mu) the target bit rate: ConstantBitRate; else AverageBitRate, capped at 90 % of a lower DataRateLimits rate
+ * (CBR: the average itself); 0 = none */
+static double rc_target(const struct ve *v)
+{
+	if (v->cbr > 0)
+		return v->cbr;
 	double target = v->bitrate > 0 ? v->bitrate : 0;
+	if (rc_wants_cbr(v))
+		return target;
 	if (v->peak > 0 && (!target || v->peak * 0.9 < target))
 		target = v->peak * 0.9;
+	return target;
+}
+
+static int rc_step(struct ve *v, size_t len)
+{
+	double target = rc_target(v);
+	if (v->fw_rc & VD_ENC_RC_FW)
+		return 0;	/* ws-vtvenc-rc: the firmware's rate control owns the QP */
 	if (!cfg.rc || cfg.qp_i || target <= 0 || !v->qp)
 		return 0;
 	v->rc_bytes += (double)len;
@@ -653,11 +684,24 @@ static void *reader(void *arg)
 			v->open_status = m.status;
 			v->opened = !m.status;
 			v->qpi = (int)m.fbd_w, v->qp = (int)m.fbd_h, v->rc_n = 0, v->rc_bytes = 0;
+			v->fw_rc = m.status ? 0 : (int)m.flags;
 			v->open_wait = 0;
+			/* ws-vtvenc-rc: a rate property that came after the (early) ENC_OPEN went out: its target now */
+			double late = v->fw_rc & VD_ENC_RC_RATE ? rc_target(v) : 0;
+			int send_late = late > 0 && fabs(late - v->rc_sent) > 0.005 * late;
+			if (send_late)
+				v->rc_sent = late;
 			pthread_cond_broadcast(&v->cv);
 			pthread_mutex_unlock(&v->mu);
-			say("venusd encoder session %s (%d): Venus layout stride %u, scanlines %u, CbCr at %u, input %u bytes",
-			    m.status ? "REFUSED" : "open", m.status, m.stride, m.scanlines, m.crop_x, m.filled);
+			say("venusd encoder session %s (%d): Venus layout stride %u, scanlines %u, CbCr at %u, input %u bytes, rate"
+			    " control: %s", m.status ? "REFUSED" : "open", m.status, m.stride, m.scanlines, m.crop_x, m.filled,
+			    m.flags & VD_ENC_RC_FW ? (m.flags & VD_ENC_RC_CBR ? "firmware CBR (host QP loop off)" :
+			    "firmware VBR (host QP loop off)") : cfg.rc && !cfg.qp_i ? "host QP loop" : "constant QP");
+			if (send_late) {
+				struct venusd_msg q = { .type = VD_ENC_RATE, .filled = (uint32_t)late };
+				send_msg(v, &q, NULL);
+				say("target %.0f bit/s set after the open: sent to venusd", late);
+			}
 			break;
 		case VD_ENC_DATA:
 			on_data(v, &m, buf);
@@ -732,7 +776,11 @@ static int open_session(struct ve *v, CVPixelBufferRef pb)
 	struct venusd_enc_open eo = { 0 };
 	double fps = v->fps > 0 ? v->fps : 30;
 	eo.fps_q16 = (uint32_t)lround(fps * 65536.0);
-	eo.bitrate = v->bitrate > 0 ? (uint32_t)v->bitrate : 0;
+	double target = rc_target(v);
+	eo.bitrate = target > 0 ? (uint32_t)target : 0;
+	v->rc_sent = target;
+	if (rc_wants_cbr(v))
+		eo.flags |= 4;	/* CBR when venusd runs the firmware's rate control */
 	int gop = v->key_int > 0 ? v->key_int : 0;
 	if (v->key_dur > 0) {
 		int g = (int)lround(v->key_dur * fps);
@@ -784,8 +832,9 @@ static int open_session(struct ve *v, CVPixelBufferRef pb)
 			ts.tv_sec++, ts.tv_nsec -= 1000000000;
 		pthread_cond_timedwait(&v->cv, &v->mu, &ts);
 	}
-	say("%s %dx%d %.2f fps, %.0f bit/s, gop %d, profile %d level %d, colour %d/%d/%d%s: %s in %.0f ms",
-	    v->codec == kCMVideoCodecType_HEVC ? "HEVC" : "H.264", v->w, v->h, fps, v->bitrate, eo.gop, eo.profile, eo.level,
+	say("%s %dx%d %.2f fps, %.0f bit/s (AverageBitRate %.0f, DataRateLimits %.0f, ConstantBitRate %.0f: %s), gop %d,"
+	    " profile %d level %d, colour %d/%d/%d%s: %s in %.0f ms", v->codec == kCMVideoCodecType_HEVC ? "HEVC" : "H.264",
+	    v->w, v->h, fps, target, v->bitrate, v->peak, v->cbr, eo.flags & 4 ? "CBR" : "VBR", eo.gop, eo.profile, eo.level,
 	    eo.primaries, eo.transfer, eo.matrix, v->full ? " full range" : "", v->opened ? "open" : "FAILED",
 	    1e3 * (mono() - v->t_open));
 	return v->opened ? 0 : -1;
@@ -1066,6 +1115,8 @@ static OSStatus enc_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef v
 		v->peak = secs > 0 ? bytes * 8 / secs : 0;
 	} else if (!strcmp(k, "ExpectedFrameRate"))
 		v->fps = num(value);
+	else if (!strcmp(k, "ConstantBitRate"))	/* ws-vtvenc-rc: bit/s (CFNumber) */
+		v->cbr = num(value);
 	else if (!strcmp(k, "MaxKeyFrameInterval"))
 		v->key_int = (int)num(value);
 	else if (!strcmp(k, "MaxKeyFrameIntervalDuration"))
@@ -1085,11 +1136,28 @@ static OSStatus enc_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef v
 	} else
 		known = 0;
 	int opened = v->opened;
+	/* ws-vtvenc-rc: a rate property mid-session: the new target to the firmware (ENC_RATE), or the host loop takes it */
+	int rate_prop = !strcmp(k, "AverageBitRate") || !strcmp(k, "DataRateLimits") || !strcmp(k, "ConstantBitRate");
+	double target = rate_prop ? rc_target(v) : 0;
+	int send_rate = opened && rate_prop && (v->fw_rc & VD_ENC_RC_RATE) && target > 0 &&
+			fabs(target - v->rc_sent) > 0.005 * target;
+	int fw = v->fw_rc, mode_change = opened && rate_prop && (v->fw_rc & VD_ENC_RC_FW) &&
+					 !!(v->fw_rc & VD_ENC_RC_CBR) != rc_wants_cbr(v);
+	if (send_rate)
+		v->rc_sent = target;
+	if (opened && rate_prop)
+		v->rc_n = 0, v->rc_bytes = 0;
 	pthread_mutex_unlock(&v->mu);
 	if (!known && strcmp(k, "Priority") && strcmp(k, "Quality"))
-		say("property %s: accepted, not used (constant-QP Venus encoder)", k);
-	if (opened && !strcmp(k, "AverageBitRate"))
-		say("AverageBitRate %.0f after the start: the QP stays (rate control off)", num(value));
+		say("property %s: accepted, not used (Venus encoder)", k);
+	if (send_rate) {
+		struct venusd_msg q = { .type = VD_ENC_RATE, .filled = (uint32_t)target };
+		send_msg(v, &q, NULL);
+	}
+	if (opened && rate_prop)
+		say("%s %.0f after the start: target %.0f bit/s %s%s", k, num(value), target,
+		    send_rate ? "sent to the firmware" : fw & VD_ENC_RC_FW ? "(unchanged)" : "for the host QP loop",
+		    mode_change ? " (VBR/CBR stays as opened)" : "");
 	return 0;
 }
 

@@ -50,7 +50,7 @@
 #define VENUSD_MAX_CREDITS 16		/* vdcredit: credits queued per session */
 
 enum { VD_OPEN = 1, VD_FRAME, VD_DECODED, VD_EOS, VD_EOS_DONE, VD_CLOSE, VD_ERROR, VD_CREDIT, VD_UNCREDIT,
-	VD_ENC_OPEN = 16, VD_ENC_FRAME, VD_ENC_INDONE, VD_ENC_DATA, VD_ENC_QP };
+	VD_ENC_OPEN = 16, VD_ENC_FRAME, VD_ENC_INDONE, VD_ENC_DATA, VD_ENC_QP, VD_ENC_RATE };
 
 /*
  * ws-vt-venc (version 3): an ENCODER session on the same socket (one Venus session at a time, decoder or encoder;
@@ -58,7 +58,9 @@ enum { VD_OPEN = 1, VD_FRAME, VD_DECODED, VD_EOS, VD_EOS_DONE, VD_CLOSE, VD_ERRO
  *   ENC_OPEN   c->d  codec VD_CODEC_H264 | VD_CODEC_HEVC, width x height (even, 32..4096 x 32..2304), payload struct
  *                    venusd_enc_open (len = its size). Reply ENC_OPEN: status 0 (the session runs) or < 0 / > 0 as OPEN;
  *                    stride/scanlines/crop_x = the Venus NV12 layout wanted for zero-copy (Y stride, Y scanlines, the
- *                    CbCr plane's offset), filled = venusd's input buffer size.
+ *                    CbCr plane's offset), filled = venusd's input buffer size, fbd_w/fbd_h = the starting QP (I/P),
+ *                    flags (ws-vtvenc-rc) = VD_ENC_RC_*: bit 0 the firmware runs rate control (ENC_QP ignored), bit 1
+ *                    it is CBR (else VBR), bit 2 ENC_RATE is understood. 0 from an older venusd: constant QP.
  *   ENC_FRAME  c->d  surface = an IOSurface ID (2-plane 420v/420f, the session's size, any layout); pts = the client's
  *                    timestamp (echoed), seq = the client's frame number (echoed), flags bit 0 = an IDR now. The client
  *                    keeps the surface (its CVPixelBuffer) until ENC_INDONE with that seq: venusd reads it (copy into a
@@ -68,7 +70,9 @@ enum { VD_OPEN = 1, VD_FRAME, VD_DECODED, VD_EOS, VD_EOS_DONE, VD_CLOSE, VD_ERRO
  *                    (no ENC_DATA follows for it). flags bit 0: it went zero-copy.
  *   ENC_DATA   d->c  one encoded buffer, Annex B (start codes) in the payload; flags = HFI buffer flags (0x20 sync frame,
  *                    0x80 codec config = parameter sets only, seq 0), pic_type, pts + seq of the frame it encodes.
- *   ENC_QP     c->d  a new constant QP: crop_x = I, crop_y = P (dynamic, no reply).
+ *   ENC_QP     c->d  a new constant QP: crop_x = I, crop_y = P (dynamic, no reply). Ignored under firmware RC.
+ *   ENC_RATE   c->d  ws-vtvenc-rc: a new target bit rate, filled = bit/s (dynamic CONFIG_VENC_TARGET_BITRATE, no reply);
+ *                    only when the ENC_OPEN reply had VD_ENC_RC_RATE (an older venusd answers ERROR).
  *   EOS, EOS_DONE, CLOSE, ERROR: as for decode (EOS: the rest comes out, then EOS_DONE).
  */
 struct venusd_enc_open {
@@ -83,6 +87,9 @@ struct venusd_enc_open {
 	uint32_t rsvd[3];
 };
 _Static_assert(sizeof(struct venusd_enc_open) == 64, "venusd_enc_open");
+#define VD_ENC_RC_FW	1u	/* ENC_OPEN reply flags: the firmware's rate control runs */
+#define VD_ENC_RC_CBR	2u	/* ... as CBR (else VBR) */
+#define VD_ENC_RC_RATE	4u	/* ... and ENC_RATE changes its target */
 #define VD_CODEC_H264	1
 #define VD_CODEC_HEVC	2	/* 4e; FRAME payloads are HEVC Annex B access units (VPS/SPS/PPS in band) */
 
