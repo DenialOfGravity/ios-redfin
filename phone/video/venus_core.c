@@ -2087,10 +2087,12 @@ static int dspq_setup(uint64_t q)
  * so our split boot/init does not collapse mvs0 under a firmware that has not started: e11) */
 static void hwctl_handoff(const char *when)
 {
-	if (!getenv("VENUSCTL_HWCTL") || !atoi(getenv("VENUSCTL_HWCTL")))
+	int m = getenv("VENUSCTL_HWCTL") ? atoi(getenv("VENUSCTL_HWCTL")) : 0;	/* 1 both, 2 mvs0 only, 3 mvs1 only */
+	if (m <= 0)
 		return;
-	upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
-	if (cvp || (vrd(GDSC_MVS1) & PWR_ON))
+	if (m != 3)
+		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+	if (m != 2 && (cvp || (vrd(GDSC_MVS1) & PWR_ON)))
 		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
 	printf("venus: HWCTL %s: mvs0 %#010x mvs1 %#010x handed to HW\n", when, vrd(GDSC_MVS0), vrd(GDSC_MVS1));
 }
