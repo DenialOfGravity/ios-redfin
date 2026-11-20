@@ -52,6 +52,7 @@ static struct {
 	int lat_n;
 	uint8_t *rd;
 	size_t rd_len;
+	int pre[8];		/* the frame each input buffer was filled with before START (-1: none) */
 } ve;
 
 static int ve_skip(const char *name)
@@ -110,8 +111,11 @@ static void ve_fbd(const uint32_t *p, int n)
 		if (!ve.rd || big_io(pa, ve.rd, need, 0)) {
 			printf("venus: enc: can't read the bitstream at %#x\n", pa);
 		} else {
-			if (ve.out)
+			if (ve.out) {	/* flushed + synced each time: a reset keeps what came out */
 				fwrite(ve.rd + off, 1, len, ve.out);
+				fflush(ve.out);
+				fsync(fileno(ve.out));
+			}
 			ve.total += len;
 			const uint8_t *s = ve.rd + off;
 			int nal = len > 4 ? (s[2] == 1 ? s[3] : s[4]) : -1;	/* first NAL header after 00 00 01 / 00 00 00 01 */
@@ -192,13 +196,10 @@ static uint32_t ve_insize(void)
 /* one raw frame (tight NV12) into an input buffer in Venus's layout, then ETB (hfi_cmd_session_empty_buffer_
  * uncompressed_plane0_packet: size, type, sid, view_id, ts hi/lo, flags, mark x2, alloc_len, filled_len, offset,
  * input_tag, packet_buffer, extradata, rgData); eos: the empty EOS buffer */
-static int ve_etb(const uint8_t *frame, int idx, int eos)
+static int ve_fill(struct vbuf *b, const uint8_t *frame)
 {
-	struct vbuf *b = free_in();
-	if (!b)
-		return -1;
-	uint32_t W = (uint32_t)dc.w, H = (uint32_t)dc.h, S = dc.ystride, fill = 0;
-	if (!eos) {
+	uint32_t W = (uint32_t)dc.w, H = (uint32_t)dc.h, S = dc.ystride;
+	{
 		static uint8_t *img;
 		static size_t img_len;
 		size_t need = (size_t)ve_insize();
@@ -214,8 +215,24 @@ static int ve_etb(const uint8_t *frame, int idx, int eos)
 		uint8_t *uv = img + (size_t)S * dc.yscan;
 		for (uint32_t y = 0; y < (H + 1) / 2; y++)
 			memcpy(uv + (size_t)y * S, frame + (size_t)W * H + (size_t)y * W, W);
-		fill = (uint32_t)need;	/* the whole Venus NV12 buffer, as a V4L2 client's bytesused = sizeimage */
-		if (fill > b->size || big_io(b->pa, img, need, 1))
+		if (need > b->size || big_io(b->pa, img, need, 1))
+			return -1;
+	}
+	return 0;
+}
+
+static int ve_etb(const uint8_t *frame, int idx, int eos)
+{
+	struct vbuf *b = free_in();
+	if (!b)
+		return -1;
+	uint32_t fill = 0;
+	if (!eos) {
+		int k = (int)(b - dc.in);
+		fill = ve_insize();	/* the whole Venus NV12 buffer, as a V4L2 client's bytesused = sizeimage */
+		if (k >= 0 && k < 8 && ve.pre[k] == idx)
+			ve.pre[k] = -1;	/* filled before START */
+		else if (ve_fill(b, frame))
 			return -1;
 	}
 	uint64_t ts = (uint64_t)idx * 1000000ull / (uint64_t)(ve.c->fps > 0 ? ve.c->fps : 30);
@@ -381,6 +398,15 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 			goto close;
 		dc.opb[dc.nopb] = (struct vbuf){ pa, osz, 0 };
 	}
+	/* the first frames go into the input buffers now, so the ETBs follow START at once (VENUSCTL_ENC_PREFILL=0: no) */
+	for (int k = 0; k < 8; k++)
+		ve.pre[k] = -1;
+	if (!getenv("VENUSCTL_ENC_PREFILL") || atoi(getenv("VENUSCTL_ENC_PREFILL")))
+		for (int k = 0; k < dc.nin && k < nf; k++) {
+			if (ve_fill(&dc.in[k], src + fsz * (size_t)k))
+				goto close;
+			ve.pre[k] = k;
+		}
 	printf("venus: enc: %d inputs of %u bytes (NV12 stride %u, scanlines %u/%u), %d bitstream buffers of %u bytes, "
 	       "window used %llu KB\n", nin, isz, dc.ystride, dc.yscan, ve_uvscan(), nout, osz,
 	       (unsigned long long)((dc.top - dc.base) >> 10));
