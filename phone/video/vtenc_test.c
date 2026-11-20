@@ -6,6 +6,7 @@
  *                   [-p pool|own|venus] [-r 0|1 (real time pacing at FPS, default 1)] [-e ENCODER-ID] [-k KEYSECS]
  *                   [-N (don't register vtvenc)] [-L DYLIB] [-V (register VCPHEVC's software encoder first, as
  *                   mediaserverd does)] [-R (let VideoToolbox run the encoder remotely, in mediaserverd)]
+ *                   [-z N (luma noise, N/8 of +-16 per pixel, every frame)]
  *   -p pool: buffers from the session's pixel buffer pool (default); own: CVPixelBufferCreate with IOSurface (any
  *      layout CoreVideo picks); venus: own buffers in Venus's NV12 layout (stride 128, rows 32: zero-copy in venusd).
  * Prints the encoder VideoToolbox took, ms per frame, fps, sync samples, bytes, CPU of this process.
@@ -170,6 +171,7 @@ static CVPixelBufferRef make_buffer(int w, int h, const char *mode)
 	return r ? NULL : pb;
 }
 
+static int noise;
 static void fill(CVPixelBufferRef pb, int w, int h, int i, const uint8_t *src)
 {
 	CVPixelBufferLockBaseAddress(pb, 0);
@@ -181,6 +183,10 @@ static void fill(CVPixelBufferRef pb, int w, int h, int i, const uint8_t *src)
 		else
 			for (int x = 0; x < w; x++)
 				y[r * yb + x] = (uint8_t)(((x + i * 4) ^ (r + i * 2)) & 0xff) / 2 + 40 + ((x / 64 + r / 64 + i / 8) & 1) * 60;
+	if (noise)	/* sensor-like noise on luma (the camera at gain 8x): what makes the bit rate */
+		for (int r = 0; r < h; r++)
+			for (int x = 0; x < w; x++)
+				y[r * yb + x] = (uint8_t)(y[r * yb + x] + (int)((arc4random() & 31) - 16) * noise / 8);
 	for (int r = 0; r < h / 2; r++)
 		if (src)
 			memcpy(c + r * cb, src + (size_t)w * h + (size_t)r * w, (size_t)w);
@@ -198,7 +204,7 @@ int main(int argc, char **argv)
 	double fps = 30, br = 15300000, keysecs = 1;
 	int o;
 	setvbuf(stdout, NULL, _IONBF, 0);
-	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:VR")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:VRz:")) != -1) {
 		switch (o) {
 		case 'c': codec = optarg; break;
 		case 's': sscanf(optarg, "%dx%d", &w, &h); break;
@@ -215,6 +221,7 @@ int main(int argc, char **argv)
 		case 'L': dylib = optarg; break;
 		case 'V': vcp = 1; break;
 		case 'R': local = 0; break;
+		case 'z': noise = atoi(optarg); break;
 		default: fprintf(stderr, "usage: see the source header\n"); return 2;
 		}
 	}
@@ -349,7 +356,7 @@ int main(int argc, char **argv)
 			       CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
 			       (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1) - (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0),
 			       CVPixelBufferGetIOSurface(pb) ? "yes" : "no");
-		if (!pool && i >= 8 && !src)
+		if (!pool && i >= 8 && !src && !noise)
 			;	/* own buffers keep their pattern after the first 8 (no CPU per frame, as a camera) */
 		else
 			fill(pb, w, h, i, src ? src + fsz * (size_t)(i % nsrc) : NULL);

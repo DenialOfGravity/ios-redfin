@@ -64,6 +64,7 @@ int venc_etb(int k, uint32_t pa, uint32_t alloc, uint64_t ts_us, uint32_t tag, i
 int venc_eos(void);
 int venc_set_qp(uint32_t qi, uint32_t qp);
 uint32_t venc_fps_q16(void);
+extern int vc_prop_ms;	/* the drain after each set property, ms (-1: VENUSCTL_PROP_MS / 20) */
 
 const char *boot_id(void);
 void stale_drop(const char *path);	/* a state file from an earlier boot: deleted unread */

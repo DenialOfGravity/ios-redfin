@@ -22,7 +22,8 @@ static uint32_t etag_next = 1;
 static unsigned enc_zc, enc_copy, enc_bad, enc_out, enc_cfg;
 static double enc_copy_ms, enc_copy_max;
 static int enc_zc_on = 1, enc_log;
-static uint32_t enc_w, enc_h;
+static unsigned enc_qp_n;
+static uint32_t enc_w, enc_h, enc_qi, enc_qp;
 
 static double enc_ms(void)
 {
@@ -37,7 +38,7 @@ static void enc_reset(void)
 			vmmu_unmap(emap[k].iova);
 	memset(emap, 0, sizeof(emap));
 	memset(etag, 0, sizeof(etag));
-	enc_zc = enc_copy = enc_bad = enc_out = enc_cfg = 0;
+	enc_zc = enc_copy = enc_bad = enc_out = enc_cfg = enc_qp_n = 0;
 	enc_copy_ms = enc_copy_max = 0;
 }
 
@@ -59,6 +60,7 @@ static void enc_reply_open(int i, int32_t status)
 		uint32_t st, ys, uvo, sz;
 		venc_layout(&st, &ys, &uvo, &sz);
 		r.stride = st, r.scanlines = ys, r.crop_x = uvo, r.filled = sz, r.width = enc_w, r.height = enc_h;
+		r.fbd_w = enc_qi, r.fbd_h = enc_qp;	/* the starting constant QP (I, P) */
 	}
 	send_msg(i, &r, NULL);
 }
@@ -107,12 +109,18 @@ static void do_enc_open(int i, const struct venusd_msg *m, const uint8_t *payloa
 	}
 	if (getenv("VENUSD_ENC_SEQHDR"))
 		p.seqhdr = atoi(getenv("VENUSD_ENC_SEQHDR"));
-	enc_w = m->width, enc_h = m->height;
+	enc_w = m->width, enc_h = m->height, enc_qi = p.qp_i, enc_qp = p.qp_p;
 	note("venusd: session %u: encoder opened (fd %d, %s %ux%u, %.2f fps, %u bit/s -> QP %u/%u, gop %d, profile %d level %d,"
 	     " seqhdr %d, colour %d/%d/%d full %d, zero-copy %s)", nsess, cl[i].fd, sess_hevc ? "HEVC" : "H.264", m->width,
 	     m->height, fps, eo.bitrate, p.qp_i, p.qp_p, p.gop, p.profile, p.level, p.seqhdr, p.primaries, p.transfer,
 	     p.matrix, p.full_range, enc_zc_on ? "on" : "off");
+	/* the 20 ms drain after each property (venusctl's, for reading a refusal next to its property) made the open ~1.2 s;
+	 * a refusal still shows (session error at the next drain) */
+	vc_prop_ms = getenv("VENUSD_ENC_PROP_MS") ? atoi(getenv("VENUSD_ENC_PROP_MS")) : 2;
+	double t_vo = mono();
 	int r = venc_open(&p);
+	vc_prop_ms = -1;
+	note("venusd: session %u: venc_open %.0f ms", nsess, 1e3 * (mono() - t_vo));
 	if (r) {
 		struct vdec_status st;
 		vdec_status(&st);
@@ -329,8 +337,10 @@ static void enc_frame(const struct venusd_msg *m)
 			return;
 		}
 		if (!enc_copy++)
-			note("venusd: session %u: frame %u copied from IOSurface %u (%s; %zux%zu, bytes per row %zu/%zu, %.2f ms)",
-			     nsess, m->seq, m->surface, why, w, h, yb, cb, ms);
+			note("venusd: session %u: frame %u copied from IOSurface %u (%s; %zux%zu, bytes per row %zu/%zu, planes at +%td"
+			     " +%td, %zu bytes, %.2f ms)", nsess, m->seq, m->surface, why, w, h, yb, cb,
+			     y - (const uint8_t *)IOSurfaceGetBaseAddress(s), c - (const uint8_t *)IOSurfaceGetBaseAddress(s),
+			     IOSurfaceGetAllocSize(s), ms);
 	}
 	sent++;
 	t_etb = mono();
@@ -352,7 +362,9 @@ static void enc_command(int i, const struct venusd_msg *m)
 	if (m->type == VD_ENC_QP) {
 		if (sess == S_RUN && m->crop_x) {
 			venc_set_qp(m->crop_x, m->crop_y ? m->crop_y : m->crop_x + 2);
-			note("venusd: session %u: QP now %u/%u", nsess, m->crop_x, m->crop_y ? m->crop_y : m->crop_x + 2);
+			if (enc_log || enc_qp_n++ < 3)
+				note("venusd: session %u: QP now %u/%u (frame %u in)", nsess, m->crop_x,
+				     m->crop_y ? m->crop_y : m->crop_x + 2, sent);
 		}
 		return;
 	}

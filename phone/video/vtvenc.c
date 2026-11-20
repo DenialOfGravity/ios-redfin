@@ -19,7 +19,9 @@
  *   VTVENC_HEVC (1): register hvc1 too.   VTVENC_ATTR (0): 1 = ask VT for buffers in Venus's layout (bytes per row
  *   aligned to 128, rows to 32) instead of passing any 420v/420f through.  VTVENC_QP=I[:P]: fixed QP (else from the
  *   bit rate).  VTVENC_SEQHDR (0): 1 = parameter sets in band before every IDR.  VTVENC_INFLIGHT (12): frames out
- *   at once before EncodeFrame waits.  VTVENC_LOG (0): 1 = a line per frame.
+ *   at once before EncodeFrame waits.  VTVENC_LOG (0): 1 = a line per frame.  VTVENC_RC (1): host rate control: the
+ *   constant QP follows the measured bit rate toward AverageBitRate (DataRateLimits as a cap), ENC_QP to venusd;
+ *   0 = the QP from the bit rate guess stays (venusd's mapping).
  * Off: /var/local/vtvenc-off (nothing registered) or no /var/local/venus.on.
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -95,7 +97,7 @@ enum {	/* VTErrors.h */
 };
 #define INFO_DROPPED	2u	/* kVTEncodeInfo_FrameDropped */
 
-static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id; } cfg = { 1, 0, 0, 0, 0, 12, 0, 1, 1000, 1 };
+static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc; } cfg = { 1, 0, 0, 0, 0, 12, 0, 1, 1000, 1, 1 };
 static pthread_once_t cfg_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -147,12 +149,15 @@ static void cfg_set(const char *k, const char *v)
 		cfg.rating = n;
 	else if (!strcmp(k, "VTVENC_ID"))
 		cfg.id = n;
+	else if (!strcmp(k, "VTVENC_RC"))
+		cfg.rc = n;
 }
 
 static void cfg_load(void)
 {
 	static const char *const keys[] = { "VTVENC_HEVC", "VTVENC_ATTR", "VTVENC_QP", "VTVENC_SEQHDR", "VTVENC_INFLIGHT",
-		"VTVENC_LOG", "VTVENC_HW", "VTVENC_RATING", "VTVENC_ID" };
+		"VTVENC_LOG", "VTVENC_HW", "VTVENC_RATING", "VTVENC_ID",
+		"VTVENC_RC" };
 	for (unsigned i = 0; i < sizeof keys / sizeof keys[0]; i++)
 		if (getenv(keys[i]))
 			cfg_set(keys[i], getenv(keys[i]));
@@ -199,7 +204,10 @@ struct ve {
 	FourCharCode codec;
 	int w, h;
 	/* properties */
-	double bitrate, fps, key_dur;
+	double bitrate, fps, key_dur, peak;
+	/* host rate control (Venus's own needs the CVP core): bytes of the frames since the last QP change */
+	int qp, qpi, rc_n, rc_changes;
+	double rc_bytes;
 	int key_int, realtime, reorder, prof, level, entropy_cavlc;
 	int prim, transfer, matrix, full;
 	CFStringRef prim_s, transfer_s, matrix_s;
@@ -456,6 +464,41 @@ static int make_fmt(struct ve *v)
 	return 0;
 }
 
+/* (under mu) host rate control: after RC_MIN frames at the current QP, the bit rate they made against the target
+ * (AverageBitRate, capped by DataRateLimits); 6 QP per doubling (H.264/HEVC), half the step at a time, at most +4/-3,
+ * QP 12..51; dead band 15 %. Returns the new P QP to send (I = P - 2), or 0 */
+#define RC_MIN	8
+static int rc_step(struct ve *v, size_t len)
+{
+	double target = v->bitrate > 0 ? v->bitrate : 0;
+	if (v->peak > 0 && (!target || v->peak * 0.9 < target))
+		target = v->peak * 0.9;
+	if (!cfg.rc || cfg.qp_i || target <= 0 || !v->qp)
+		return 0;
+	v->rc_bytes += (double)len;
+	if (++v->rc_n < RC_MIN)
+		return 0;
+	double fps = v->fps > 0 ? v->fps : 30, actual = v->rc_bytes * 8 * fps / v->rc_n, ratio = actual / target;
+	if (ratio < 1.15 && ratio > 0.87) {
+		v->rc_n = 0, v->rc_bytes = 0;
+		return 0;
+	}
+	int step = (int)lround(3.0 * log2(ratio));
+	step = step > 4 ? 4 : step < -3 ? -3 : step;
+	if (!step)
+		step = ratio > 1 ? 1 : -1;
+	int q = v->qp + step;
+	q = q < 12 ? 12 : q > 51 ? 51 : q;
+	v->rc_n = 0, v->rc_bytes = 0;
+	if (q == v->qp)
+		return 0;
+	if (cfg.log || v->rc_changes < 12)
+		say("rate control: %.0f kbit/s against %.0f over the last frames: QP %d -> %d", actual / 1e3, target / 1e3, v->qp, q);
+	v->rc_changes++;
+	v->qp = q;
+	return q;
+}
+
 /* (reader) one ENC_DATA */
 static void on_data(struct ve *v, const struct venusd_msg *m, const uint8_t *data)
 {
@@ -512,7 +555,12 @@ static void on_data(struct ve *v, const struct venusd_msg *m, const uint8_t *dat
 		v->t_first = mono();
 	v->bytes += c.len;
 	p->emitted = 1;
+	int newqp = rc_step(v, c.len);
 	pthread_mutex_unlock(&v->mu);
+	if (newqp) {
+		struct venusd_msg q = { .type = VD_ENC_QP, .crop_x = (uint32_t)(newqp - 2), .crop_y = (uint32_t)newqp };
+		send_msg(v, &q, NULL);
+	}
 	/* emit outside the lock: VT's callback may call back into us (CompleteFrames) */
 	if (s)
 		VTEncoderSessionEmitEncodedFrame(s, token, st ? ERR_MALFUNCTION : 0, 0, st ? NULL : sb);
@@ -597,6 +645,7 @@ static void *reader(void *arg)
 			pthread_mutex_lock(&v->mu);
 			v->open_status = m.status;
 			v->opened = !m.status;
+			v->qpi = (int)m.fbd_w, v->qp = (int)m.fbd_h, v->rc_n = 0, v->rc_bytes = 0;
 			v->open_wait = 0;
 			pthread_cond_broadcast(&v->cv);
 			pthread_mutex_unlock(&v->mu);
@@ -965,7 +1014,11 @@ static OSStatus enc_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef v
 	int known = 1;
 	if (!strcmp(k, "AverageBitRate"))
 		v->bitrate = num(value);
-	else if (!strcmp(k, "ExpectedFrameRate"))
+	else if (!strcmp(k, "DataRateLimits") && value && CFGetTypeID(value) == CFArrayGetTypeID() &&
+		 CFArrayGetCount(value) >= 2) {
+		double bytes = num(CFArrayGetValueAtIndex(value, 0)), secs = num(CFArrayGetValueAtIndex(value, 1));
+		v->peak = secs > 0 ? bytes * 8 / secs : 0;
+	} else if (!strcmp(k, "ExpectedFrameRate"))
 		v->fps = num(value);
 	else if (!strcmp(k, "MaxKeyFrameInterval"))
 		v->key_int = (int)num(value);

@@ -602,7 +602,7 @@ static int ve_propv(const char *name, uint32_t prop, const uint32_t *body, unsig
 	for (unsigned k = 0; k < n; k++)
 		printf(" %#x", body[k]);
 	printf("\n");
-	if (q_write(p) || wait_msg(0, 20))
+	if (q_write(p) || wait_msg(0, vc_prop_ms >= 0 ? (unsigned)vc_prop_ms : 20u))
 		return -1;
 	if (dc.err) {
 		uint32_t e = (uint32_t)dc.err;
