@@ -3072,7 +3072,7 @@ static int sess_abort(const char *why)
 		abort_on = !getenv("VENUSCTL_ABORT") || atoi(getenv("VENUSCTL_ABORT"));
 	if (!abort_on || fw_dead)
 		return -1;
-	printf("venus: %s timed out: SESSION_ABORT (stock msm_comm_kill_session)\n", why);
+	printf("venus: %s: SESSION_ABORT (stock msm_comm_kill_session)\n", why);
 	pm_step("session abort after %s", why);
 	int ws = wait_soft;
 	wait_soft = 1;
@@ -3117,22 +3117,22 @@ static int dec_close(int started)
 		ab = 1;	/* test: the abort path instead of the close sequence (does the firmware answer ABORT_DONE?) */
 	if (started && !ab) {
 		uint32_t fl[4] = { 16, S_FLUSH, SESSION_ID, FLUSH_ALL };	/* msm_comm_flush (msm_vidc_common.c:5379) */
-		bad |= close_step(q_write(fl), M_FLUSH_DONE, "FLUSH", &ab);
+		bad |= close_step(q_write(fl), M_FLUSH_DONE, "FLUSH timed out", &ab);
 		if (!ab)	/* msm_vidc_stop (3485) */
-			bad |= close_step(sess_cmd(S_STOP), M_STOP_DONE, "STOP", &ab);
+			bad |= close_step(sess_cmd(S_STOP), M_STOP_DONE, "STOP timed out", &ab);
 		if (!ab)	/* msm_vidc_release_res (3518) */
-			bad |= close_step(sess_cmd(S_REL_RES), M_RELRES_DONE, "RELEASE_RESOURCES", &ab);
+			bad |= close_step(sess_cmd(S_REL_RES), M_RELRES_DONE, "RELEASE_RESOURCES timed out", &ab);
 	}
 	for (int i = dc.nintl; !ab && i-- > 0;)	/* msm_comm_release_scratch/persist_buffers: response_req 1 */
 		bad |= close_step(buf_cmd(dc.intl_type[i], dc.intl[i].pa, dc.intl[i].size, 1), M_RELBUF_DONE,
-				  "RELEASE_BUFFERS", &ab);
+				  "RELEASE_BUFFERS timed out", &ab);
 	for (int i = 0; !ab && getenv("VENUSCTL_DPB_SETBUF") && i < dc.ndpb; i++)
-		bad |= close_step(buf_cmd(B_OUTPUT, dc.dpb[i].pa, dc.dpb[i].size, 1), M_RELBUF_DONE, "RELEASE_BUFFERS",
+		bad |= close_step(buf_cmd(B_OUTPUT, dc.dpb[i].pa, dc.dpb[i].size, 1), M_RELBUF_DONE, "RELEASE_BUFFERS timed out",
 				  &ab);
 	dc.nintl = 0;
 	if (!ab)	/* SYS_SESSION_END (msm_comm_session_close, 3547) */
-		bad |= close_step(sess_cmd(0x10008), 0x20007, "SESSION_END", &ab);
-	if (!bad)
+		bad |= close_step(sess_cmd(0x10008), 0x20007, "SESSION_END timed out", &ab);
+	if (!bad && !ab)
 		printf("venus: SESSION_END_DONE error %#x\n", pkt[0] >= 16 ? pkt[3] : 0);
 	if (ab) {	/* the firmware dropped the session: nothing half-closed is left (no down needed) */
 		printf("venus: session closed by SESSION_ABORT\n");
@@ -3927,7 +3927,12 @@ int suspend_cmd(void)
 	}
 	qb = v.q;
 	setenv("VENUSCTL_PC_DELAY_MS", "0", 0);
-	int r = pc_prep(0);
+	/* test hook: VENUSCTL_TEST_PCSKIP=N: the first N suspends of this process report "not WFI + idle" without
+	 * touching the core (venusd's retry / 10-skips-fatal path) */
+	static int tskip;
+	const char *ts = getenv("VENUSCTL_TEST_PCSKIP");
+	int r = ts && tskip < atoi(ts) ? (tskip++, printf("venus: pc: test skip %d of %s (VENUSCTL_TEST_PCSKIP)\n", tskip, ts),
+					   1) : pc_prep(0);
 	/* venus-robust (d): stock __prepare_pc_common / venus_hfi_pm_handler (hfi_common.c:2929-3035): no PC_READY + WFI
 	 * = skip the power off (-EAGAIN), retry after the collapse delay, 10 skips in a row = fatal. A power off under a
 	 * busy ARM9 is the bus hang review 8.5.2 warns about. Returns 2 = skipped, still powered (the caller retries);

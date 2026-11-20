@@ -511,8 +511,12 @@ static void down(const char *why)
 		return;
 	note("venusd: Venus down (%s)", why);
 	if (pc_down) {	/* collapsed: the PAS shutdown wants the core powered and the firmware awake */
-		if (resume_cmd())
-			note("venusd: resume before the shutdown failed, going on");
+		if (resume_cmd()) {	/* venus-robust: e.g. an RPMh BCM vote timeout (TCS quarantined for the boot) */
+			fault = 1;
+			note("venusd: resume before the shutdown failed: Venus stays power-collapsed with the image in TZ (core"
+			     " off, STATE kept, no PAS shutdown possible); OPEN refused until a reboot");
+			return;
+		}
 		pc_down = 0;
 	}
 	if (shutdown_cmd()) {
@@ -687,8 +691,7 @@ static void do_open(int i, const struct venusd_msg *m)
 		if (resume_cmd()) {
 			rc = -EIO;
 			note("venusd: resume from power collapse FAILED: Venus down");
-			pc_down = 0;
-			down("resume failed");
+			down("resume failed");	/* venus-robust: down() resumes once more, else marks the collapsed fault */
 		} else {
 			pc_down = 0;
 			note("venusd: resumed from power collapse in %.0f ms", 1e3 * (mono() - t0));
