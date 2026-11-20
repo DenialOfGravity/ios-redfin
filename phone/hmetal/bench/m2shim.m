@@ -10,7 +10,7 @@
  * (hm-int2) hakios-metal is the default for EVERY process, backboardd included. SweetMetal2 only for:
  *   hm-off            exists: every process (backboardd too) on SweetMetal2 -- the operator's global off switch
  *   m2-procs          process names (getprogname, one a line, '#' comments, '*' = all) kept on SweetMetal2
- *   the crash trip    3 starts on hakios-metal within 120 s without a clean exit (below)
+ *   the crash trip    3 starts on hakios-metal within 120 s without a clean exit, crashes in Metal code only (below)
  *   no device         hakios-metal's bundle did not load or gave no device
  * Gone: hm-only (the staged list), all-off, and backboardd's ca/bbd-hm flag (both ignored, a line says so).
  *
@@ -40,6 +40,13 @@
  * "i PID" in the starts file. Every fallback explains itself: "HM FALLBACK: NAME -> SweetMetal2: REASON" (kernel log,
  * syslog, shim.log), a line in fallback.log, and for a trip MARKER.why + trips/NAME.why (time, the last starts and how
  * each ended, crash reports, bundle key). trip-test (exact names) trips a listed process at its next start ("test").
+ * (ws-hm-tripfilter) Only crashes that may be Metal's count: before a start trips, each counted unclean exit's crash
+ * report (CRASH_DIR/NAME-*.ips since that start, body "pid" = its pid) is read with NSJSONSerialization; when neither
+ * the crashing thread nor lastExceptionBacktrace has a Metal/GPU image (HakiosMetal, SweetMetal2, Metal*, MTL, AGX, IOGPU,
+ * IOAccelerator, MPS*, GPUCompiler, libhm*, Mesa/Turnip, QuartzCore, anything under the hm/SweetMetal2 bundles) it is
+ * marked "n PID" and not counted, with one line "NAME pid PID crash not counted: no Metal code on the crashing thread
+ * (REPORT, top: FRAME)" in fallback.log and the kernel log. No report (a hang, a watchdog, SIGKILL; waited for up to 3 s):
+ * counted. HM_DIR/trip-any exists: every unclean exit counts (the rule before).
  *
  * Set in every hakios-metal process before the plug-in loads (each an env key, so a line in env flips it):
  *   HM_CA_DEEP_FB=0 (CAEnableDeepFramebuffer=false), HM_CA_FB_COMPRESSION=0 (CAEnableFramebufferCompression=false and
@@ -347,7 +354,7 @@ shim_clean_exit(void)
 
 /* (ws-hm-fallback) the starts file's lines: "TIME PID KEY" a start on hakios-metal; "x PID" its clean exit; "i PID" it
  * was killed on purpose (sweetctl kill, below); "c TIME" every start before was cleared (pa fallback clear). */
-typedef struct { long t; int pid; char how; } shim_start;   /* how: 0 no clean exit seen, 'x', 'i', 'c' */
+typedef struct { long t; int pid; char how; } shim_start;   /* how: 0 no clean exit seen, 'x', 'i', 'c', 'n' */
 
 /* (ws-hm-fallback) an intentional restart: `sweetctl kill NAME` writes intent/NAME (NAME as p_comm: 16 characters at
  * most), one "TIME PID SIG" line for every process it signals, BEFORE it signals; a kill of backboardd (sweetctl
@@ -398,7 +405,8 @@ shim_listed_exact(const char *path, const char *name)
 static const char *
 shim_how(char how)
 {
-	return how == 'x' ? "clean exit" : how == 'i' ? "killed on purpose" : how == 'c' ? "cleared" : "NO clean exit";
+	return how == 'x' ? "clean exit" : how == 'i' ? "killed on purpose" : how == 'c' ? "cleared" :
+	       how == 'n' ? "crashed, not counted (no Metal code on the crashing thread)" : "NO clean exit";
 }
 
 static void
@@ -477,12 +485,212 @@ shim_explain(const char *reason, const char *marker, const shim_start *seen, int
 	if ((f = fopen(why, "w")) != NULL) { fputs(line, f); fclose(f); }
 }
 
+/* (ws-hm-tripfilter) the crash trip counts only crashes that may be Metal's. Before a start would trip, each earlier
+ * unclean start's crash report is looked for: CRASH_DIR/NAME-*.ips written since that start whose body's "pid" is its
+ * pid. Found, and NEITHER the crashing thread's frames NOR lastExceptionBacktrace name a Metal/GPU image
+ * (shim_metal_image): that exit is not counted ("n PID" in the starts file; one line "NAME pid PID crash not counted:
+ * ..." in fallback.log and the kernel log). No report (a hang, a watchdog, SIGKILL, a report not written yet after
+ * TRIP_REPORT_WAIT_MS): counted, as before. HM_DIR/trip-any exists: every unclean exit counts (the old rule). */
+#define HM_TRIP_ANY HM_DIR "/trip-any"
+#ifndef TRIP_REPORT_WAIT_MS
+#define TRIP_REPORT_WAIT_MS 3000          /* how long a start that would trip waits for missing crash reports */
+#endif
+
+typedef struct {
+	int pid;                  /* the body's "pid" (-1: none) */
+	bool crash;               /* it has the crashing thread's frames or a lastExceptionBacktrace */
+	bool metal;               /* a Metal/GPU image among them */
+	char metal_img[160];      /* the first one, and where */
+	char top_ft[160];         /* the first frame outside the plumbing (libsystem, libc++abi, libobjc, CoreFoundation, ...) */
+	char top_leb[160];        /*   of the crashing thread / of lastExceptionBacktrace */
+	char first[160];          /* the very first frame */
+} shim_report;
+
+/* an image that is (or drives) Metal: either driver (HakiosMetal, SweetMetal2 and everything under /var/local/hmetal or
+ * the SweetMetal2 bundles), Apple's Metal stack (Metal, MetalTools, MetalKit, MetalPerformanceShaders*, MPS*, libMTL*,
+ * AGX*, IOGPU, IOAccelerator, GPUCompiler*), Mesa/Turnip pieces, libhm*, and QuartzCore (CoreAnimation's renderer is
+ * hakios-metal's main client). Matched in the image's name or path, case ignored. Conservative: a doubt counts. */
+static bool
+shim_metal_image(const char *name, const char *path)
+{
+	static const char *const any[] = { "metal", "mtl", "gpu", "agx", "ioaccel", "hakios", "adreno", "vulkan", "turnip",
+					   "freedreno", "mesa", "quartzcore", NULL };
+	static const char *const pfx[] = { "MPS", "libhm", NULL };
+	for (int w = 0; w < 2; w++) {
+		const char *s = w == 0 ? name : path;
+		if (s == NULL || s[0] == '\0') continue;
+		for (int i = 0; any[i]; i++) if (strcasestr(s, any[i]) != NULL) return true;
+		if (w == 0) for (int i = 0; pfx[i]; i++) if (strncmp(s, pfx[i], strlen(pfx[i])) == 0) return true;
+	}
+	return false;
+}
+
+/* the plumbing every crash runs through (skipped when naming the top frame) */
+static bool
+shim_plumbing_image(const char *name)
+{
+	static const char *const p[] = { "libsystem_", "libc++abi", "libobjc", "CoreFoundation", "libdispatch", "libdyld",
+					 "dyld", "libc++.", NULL };
+	for (int i = 0; p[i]; i++) if (strncmp(name, p[i], strlen(p[i])) == 0) return true;
+	return false;
+}
+
+/* one frame of the crashing thread (LEB false) or of lastExceptionBacktrace (true), in order */
+static void
+shim_report_frame(shim_report *r, const char *name, const char *path, const char *symbol, bool leb)
+{
+	char one[160], *top = leb ? r->top_leb : r->top_ft;
+
+	snprintf(one, sizeof(one), "%s %s", name && name[0] ? name : path && path[0] ? path : "?", symbol ? symbol : "?");
+	if (r->first[0] == '\0') strlcpy(r->first, one, sizeof(r->first));
+	if (!r->metal && shim_metal_image(name, path)) {
+		r->metal = true;
+		snprintf(r->metal_img, sizeof(r->metal_img), "%s (%s)", one, leb ? "lastExceptionBacktrace" : "crashing thread");
+	}
+	if (top[0] == '\0' && name && name[0] && !shim_plumbing_image(name)) strlcpy(top, one, 160);
+}
+
+/* PATH, an iOS .ips crash report (line 1 a JSON header, the rest a JSON body), into R. false: not readable as one */
+#ifdef SHIM_HOST_TEST
+static bool shim_report_read(const char *path, shim_report *r);      /* bench/m2shim_test.c's own JSON reader */
+#else
+static void
+shim_report_frames(shim_report *r, id frames, NSArray *images, bool leb)
+{
+	if (![frames isKindOfClass:[NSArray class]]) return;
+	for (id fr in (NSArray *)frames) {
+		NSNumber *ix;
+		NSDictionary *im = nil;
+		id name = nil, ipath = nil, sym;
+		if (![fr isKindOfClass:[NSDictionary class]]) continue;
+		ix = ((NSDictionary *)fr)[@"imageIndex"];
+		sym = ((NSDictionary *)fr)[@"symbol"];
+		if ([ix isKindOfClass:[NSNumber class]] && ix.longLongValue >= 0 && ix.longLongValue < (long long)images.count)
+			im = images[(NSUInteger)ix.longLongValue];
+		if ([im isKindOfClass:[NSDictionary class]]) { name = im[@"name"]; ipath = im[@"path"]; }
+		shim_report_frame(r, [name isKindOfClass:[NSString class]] ? [name UTF8String] : NULL,
+				  [ipath isKindOfClass:[NSString class]] ? [ipath UTF8String] : NULL,
+				  [sym isKindOfClass:[NSString class]] ? [sym UTF8String] : NULL, leb);
+	}
+}
+
+static bool
+shim_report_read(const char *path, shim_report *r)
+{
+	bool ok = false;
+
+	@autoreleasepool {
+		NSData *all = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+		const char *b = (const char *)all.bytes, *nl = b ? memchr(b, '\n', all.length) : NULL;
+		if (nl != NULL) {
+			NSUInteger off = (NSUInteger)(nl + 1 - b);
+			id j = [NSJSONSerialization JSONObjectWithData:[all subdataWithRange:NSMakeRange(off, all.length - off)]
+							       options:0 error:NULL];
+			if ([j isKindOfClass:[NSDictionary class]]) {
+				NSDictionary *d = j;
+				id pid = d[@"pid"], images = d[@"usedImages"], threads = d[@"threads"], ft = d[@"faultingThread"];
+				id leb = d[@"lastExceptionBacktrace"];
+				if (![images isKindOfClass:[NSArray class]]) images = @[];
+				r->pid = [pid isKindOfClass:[NSNumber class]] ? [pid intValue] : -1;
+				if ([threads isKindOfClass:[NSArray class]] && [ft isKindOfClass:[NSNumber class]] && [ft longLongValue] >= 0 &&
+				    [ft longLongValue] < (long long)[threads count]) {
+					id th = threads[(NSUInteger)[ft longLongValue]];
+					id frames = [th isKindOfClass:[NSDictionary class]] ? th[@"frames"] : nil;
+					if ([frames isKindOfClass:[NSArray class]]) {
+						r->crash = true;
+						shim_report_frames(r, frames, images, false);
+					}
+				}
+				if ([leb isKindOfClass:[NSArray class]]) {
+					r->crash = true;
+					shim_report_frames(r, leb, images, true);
+				}
+				ok = true;
+			}
+		}
+	}
+	return ok;
+}
+#endif
+
+/* PID's crash report: a NAME-*.ips in CRASH_DIR written at or after SINCE whose body's pid is PID, with frames */
+static bool
+shim_report_find(int pid, long since, shim_report *r, char *file, size_t n)
+{
+	size_t nl = strlen(g_name);
+	bool found = false;
+	struct dirent *e;
+	DIR *d;
+
+	if ((d = opendir(CRASH_DIR)) == NULL) return false;
+	while (!found && (e = readdir(d)) != NULL) {
+		char p[PATH_MAX];
+		struct stat st;
+		if (strncmp(e->d_name, g_name, nl) != 0 || e->d_name[nl] != '-' || strstr(e->d_name, ".ips") == NULL) continue;
+		snprintf(p, sizeof(p), "%s/%s", CRASH_DIR, e->d_name);
+		if (stat(p, &st) != 0 || !S_ISREG(st.st_mode) || (long)st.st_mtime < since) continue;
+		memset(r, 0, sizeof(*r));
+		r->pid = -1;
+		if (shim_report_read(p, r) && r->crash && r->pid == pid) {
+			strlcpy(file, e->d_name, n);
+			found = true;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+/* the filter: SEEN's unclean starts within the window whose crash report shows no Metal code are marked 'n' (and
+ * "n PID" written to the starts file); returns how many. Runs only when this start would otherwise trip. */
+static long
+shim_trip_filter(shim_start *seen, int count, long now)
+{
+	bool done[64] = { false };
+	long dropped = 0;
+
+	for (int waited = 0;; waited += 250) {
+		int missing = 0;
+		for (int i = 0; i < count; i++) {
+			shim_report r;
+			char file[256], line[900], now_s[40];
+			if (done[i] || seen[i].how || now - seen[i].t >= TRIP_WINDOW) continue;
+			if (!shim_report_find(seen[i].pid, seen[i].t, &r, file, sizeof(file))) { missing++; continue; }
+			done[i] = true;
+			if (r.metal) {
+				shim_log("pid %d crash counted: Metal code in it, %s (%s)", seen[i].pid, r.metal_img, file);
+				continue;
+			}
+			seen[i].how = 'n';
+			dropped++;
+			snprintf(line, sizeof(line), "n %d\n", seen[i].pid);
+			shim_write(g_starts, line);
+			snprintf(line, sizeof(line), "%s pid %d crash not counted: no Metal code on the crashing thread (%s, top: %s)",
+				 g_name, seen[i].pid, file, r.top_leb[0] ? r.top_leb : r.top_ft[0] ? r.top_ft : r.first[0] ? r.first : "?");
+			shim_shout("%s", line);
+			shim_utc(now, now_s, sizeof(now_s));
+			{
+				char fl[1000];
+				snprintf(fl, sizeof(fl), "%s %ld %s | crash trip stays off (trip-any restores the old rule) | hm bundle %s\n",
+					 now_s, now, line, g_key);
+				shim_write(HM_FBLOG, fl);
+			}
+		}
+		if (missing == 0 || waited >= TRIP_REPORT_WAIT_MS) {
+			if (missing) shim_log("%d unclean exit(s) without a crash report after %d ms: counted", missing, waited);
+			break;
+		}
+		usleep(250000);
+	}
+	return dropped;
+}
+
 /* (hm-int2) the crash trip, one for every process (backboardd's files in ca/, the others' in their temp directory).
  * true: this process stays on SweetMetal2 (tripped now, or earlier with the bundle installed now).
  * (ws-hm-fallback) Only abnormal ends count: a start whose process sweetctl killed on purpose (its pid in intent/NAME,
  * or the start that was running when intent/NAME or intent/_ui was written, for a start within INTENT_WINDOW s of
  * it) is marked 'i' and not counted. trip-test (exact names) trips the listed process at its next start (reason
- * "test"); pa fallback test/clear write and remove it. */
+ * "test"); pa fallback test/clear write and remove it. (ws-hm-tripfilter) A crash whose report shows no Metal code is
+ * marked 'n' and not counted (shim_trip_filter; trip-any turns that off). */
 static bool
 shim_tripped(bool bbd)
 {
@@ -524,7 +732,7 @@ shim_tripped(bool bbd)
 			long t;
 			int pid;
 			char k[64];
-			if (sscanf(line, "x %d", &pid) == 1 || sscanf(line, "i %d", &pid) == 1) {
+			if (sscanf(line, "x %d", &pid) == 1 || sscanf(line, "i %d", &pid) == 1 || sscanf(line, "n %d", &pid) == 1) {
 				for (int i = 0; i < count; i++) if (seen[i].pid == pid) seen[i].how = line[0];
 			} else if (sscanf(line, "c %ld", &t) == 1) {
 				for (int i = 0; i < count; i++) if (!seen[i].how && seen[i].t <= t) seen[i].how = 'c';
@@ -561,6 +769,8 @@ shim_tripped(bool bbd)
 	for (int i = 0; i < count; i++) {
 		if (!seen[i].how && now - seen[i].t < TRIP_WINDOW) unclean++;
 	}
+	/* (ws-hm-tripfilter) about to trip: crashes without Metal code are not counted (trip-any: every one is) */
+	if (unclean >= TRIP_STARTS - 1 && access(HM_TRIP_ANY, F_OK) != 0) unclean -= shim_trip_filter(seen, count, now);
 	reason[0] = '\0';
 	if (shim_listed_exact(HM_TRIP_TEST, g_name)) {
 		snprintf(reason, sizeof(reason), "test (trip-test lists %s; pa fallback clear %s)", g_name, g_name);
@@ -590,7 +800,7 @@ shim_tripped(bool bbd)
 		if (count > 48) {
 			for (int i = count - 16; i < count; i++) {
 				fprintf(f, "%ld %d %s\n", seen[i].t, seen[i].pid, g_key);
-				if (seen[i].how == 'x' || seen[i].how == 'i') fprintf(f, "%c %d\n", seen[i].how, seen[i].pid);
+				if (seen[i].how == 'x' || seen[i].how == 'i' || seen[i].how == 'n') fprintf(f, "%c %d\n", seen[i].how, seen[i].pid);
 			}
 		}
 		fprintf(f, "%ld %d %s\n", now, getpid(), g_key);

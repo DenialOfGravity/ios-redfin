@@ -114,6 +114,7 @@ Metal opens `/System/Library/Extensions/SweetMetal2.bundle` in every process. It
 | `m2-procs` | names kept on SweetMetal2 (one a line, `#` comments, `*` = all) |
 | `luma-boost` | `1`: CoreAnimation's luma boost pass on (both drivers); absent/other: off (default). Looked at every 2 s by backboardd |
 | `m2-fallback` | `NAME KEY` lines the crash trip wrote; a line holds only while bundle KEY is installed |
+| `trip-any` | exists: every unclean exit counts toward the crash trip (default absent: only crashes with Metal code on the crashing thread or in its exception backtrace) |
 | `ca/bbd-hm.starts`, `ca/bbd-hm.tripped` | backboardd's crash-trip files (the same trip as every process's) |
 | `log/NAME.log` | each process's lines (dispatcher + plug-in) where it may append; else `$DARWIN_USER_TEMP_DIR/hakios-metal-NAME.log` |
 | `cache/` | compiled stages, written by backboardd (prewarmed: HM_PREWARM); read-only seed for every other process, whose own writable cache is `$DARWIN_USER_CACHE_DIR/hakios-metal-cache` (HM_PREWARM=0 there) |
@@ -130,6 +131,15 @@ marker (`ca/bbd-hm.tripped` / `hakios-metal-NAME.m2`) holding KEY, `NAME KEY` in
 `m2shim[pid NAME]: TRIP NAME -> SweetMetal2: ...` to /dev/console (kernel log), syslog and `ca/shim.log`. KEY is the
 installed `HakiosMetal` executable's mtime and size, so installing a new bundle expires every trip (`trip expired: ...`
 line). Clear by hand: rm the marker and the m2-fallback line.
+(ws-hm-tripfilter) Only crashes that may be Metal's count. Before a start trips, the dispatcher reads each counted
+unclean exit's crash report (`/private/var/mobile/Library/Logs/CrashReporter/NAME-*.ips` written since that start, body
+`pid` = its pid; NSJSONSerialization). When neither the crashing thread's frames nor `lastExceptionBacktrace` name a
+Metal/GPU image (HakiosMetal, SweetMetal2, Metal*, MTL, AGX*, IOGPU, IOAccelerator, MPS*, GPUCompiler*, libhm*, Mesa/Turnip,
+QuartzCore, anything under the hm or SweetMetal2 bundle paths; name or path, case ignored) that exit is not counted:
+`n pid` in the starts file and one line `NAME pid PID crash not counted: no Metal code on the crashing thread (REPORT, top:
+IMAGE SYMBOL)` in `fallback.log` and the kernel log (`pa fallback` shows it; nothing is tripped). No report (a hang, a
+watchdog, SIGKILL, a report still not written after 3 s) counts, as before. `trip-any` exists: every unclean exit counts
+(the old rule).
 
 Set in every hakios-metal process before the plug-in loads (env keys, so an env line flips each): `HM_CA_DEEP_FB=0`
 (CAEnableDeepFramebuffer=false), `HM_CA_FB_COMPRESSION=0` (CAEnableFramebufferCompression=false +

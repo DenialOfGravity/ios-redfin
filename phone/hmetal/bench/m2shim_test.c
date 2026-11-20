@@ -1,5 +1,5 @@
 /* m2shim_test.c: the dispatcher's choice (bench/m2shim.m) on the host, without Objective-C: lists, env lines, the
- * crash trip (one for every process, expiring with the bundle), CA prefs, the log and cache places. cc -Wno-format-truncation -o t m2shim_test.c && ./t */
+ * crash trip (one for every process, expiring with the bundle; only crashes with Metal code count), CA prefs, the log and cache places. cc -Wno-format-truncation -o t m2shim_test.c && ./t */
 #define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdio.h>
@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utime.h>
 
 #if defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 38))
 static size_t
@@ -30,6 +31,7 @@ static char t_tmp[256], t_cache[256];
 #define M2_REAL0 "/nonexistent/SweetMetal2"
 #define M2_CLIENTS HM_DIR "/mtl2-clients"
 #define CRASH_DIR HM_DIR "/crash"
+#define TRIP_REPORT_WAIT_MS 0         /* the host test does not wait for crash reports */
 #define SHIM_HOST_TEST 1
 #define _CS_DARWIN_USER_TEMP_DIR 0x10001
 #define _CS_DARWIN_USER_CACHE_DIR 0x10002
@@ -42,6 +44,125 @@ t_confstr(int which, char *out, size_t size)
 }
 #define confstr t_confstr
 #include "m2shim.m"
+
+/* (ws-hm-tripfilter) the test's stand-in for the dispatcher's NSJSONSerialization reader: a small JSON reader (objects,
+ * arrays, strings, numbers, true/false/null) and the same walk over the crashing thread and lastExceptionBacktrace */
+typedef struct jv { char t; char *s; double n; int len; char **keys; struct jv **vals; } jv;
+
+static void j_ws(const char **p) { while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++; }
+
+static jv *
+j_parse(const char **p)
+{
+	jv *v = calloc(1, sizeof(*v));
+	j_ws(p);
+	if (**p == '{' || **p == '[') {
+		char close = **p == '{' ? '}' : ']';
+		v->t = **p == '{' ? 'o' : 'a';
+		(*p)++;
+		for (;;) {
+			char *key = NULL;
+			jv *c;
+			j_ws(p);
+			if (**p == close) { (*p)++; break; }
+			if (v->t == 'o') {
+				jv *k = j_parse(p);
+				if (k == NULL || k->t != 's') return NULL;
+				key = k->s;
+				j_ws(p);
+				if (**p != ':') return NULL;
+				(*p)++;
+			}
+			if ((c = j_parse(p)) == NULL) return NULL;
+			v->keys = realloc(v->keys, sizeof(char *) * (size_t)(v->len + 1));
+			v->vals = realloc(v->vals, sizeof(jv *) * (size_t)(v->len + 1));
+			v->keys[v->len] = key;
+			v->vals[v->len++] = c;
+			j_ws(p);
+			if (**p == ',') (*p)++;
+			else if (**p != close) return NULL;
+		}
+	} else if (**p == '"') {
+		size_t n = 0;
+		v->t = 's';
+		v->s = malloc(strlen(*p) + 1);
+		for ((*p)++; **p && **p != '"'; (*p)++) {
+			if (**p == '\\') {
+				(*p)++;
+				if (**p == 'u') { v->s[n++] = '?'; *p += 4; continue; }
+				v->s[n++] = **p == 'n' ? '\n' : **p == 't' ? '\t' : **p;
+			} else v->s[n++] = **p;
+		}
+		if (**p != '"') return NULL;
+		(*p)++;
+		v->s[n] = '\0';
+	} else if (strncmp(*p, "true", 4) == 0 || strncmp(*p, "null", 4) == 0) {
+		v->t = **p == 't' ? 'b' : 'z'; v->n = **p == 't'; *p += 4;
+	} else if (strncmp(*p, "false", 5) == 0) {
+		v->t = 'b'; *p += 5;
+	} else {
+		char *end;
+		v->t = 'n';
+		v->n = strtod(*p, &end);
+		if (end == *p) return NULL;
+		*p = end;
+	}
+	return v;
+}
+
+static jv *
+j_get(jv *o, const char *key)
+{
+	if (o == NULL || o->t != 'o') return NULL;
+	for (int i = 0; i < o->len; i++) if (strcmp(o->keys[i], key) == 0) return o->vals[i];
+	return NULL;
+}
+
+static const char *
+j_str(jv *v)
+{
+	return v && v->t == 's' ? v->s : NULL;
+}
+
+static void
+j_frames(shim_report *r, jv *frames, jv *images, bool leb)
+{
+	for (int i = 0; i < frames->len; i++) {
+		jv *fr = frames->vals[i], *ix = j_get(fr, "imageIndex"), *im = NULL;
+		if (ix && ix->t == 'n' && images && images->t == 'a' && ix->n >= 0 && ix->n < images->len) im = images->vals[(int)ix->n];
+		shim_report_frame(r, j_str(j_get(im, "name")), j_str(j_get(im, "path")), j_str(j_get(fr, "symbol")), leb);
+	}
+}
+
+static bool
+shim_report_read(const char *path, shim_report *r)
+{
+	char *all, *nl;
+	const char *p;
+	long n;
+	jv *b, *pid, *th, *ft, *leb, *images;
+	FILE *f = fopen(path, "r");
+
+	if (f == NULL) return false;
+	fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+	all = calloc(1, (size_t)n + 1);
+	n = (long)fread(all, 1, (size_t)n, f);
+	fclose(f);
+	if ((nl = strchr(all, '\n')) == NULL) return false;
+	p = nl + 1;
+	if ((b = j_parse(&p)) == NULL || b->t != 'o') return false;
+	pid = j_get(b, "pid");
+	r->pid = pid && pid->t == 'n' ? (int)pid->n : -1;
+	images = j_get(b, "usedImages");
+	th = j_get(b, "threads");
+	ft = j_get(b, "faultingThread");
+	if (th && th->t == 'a' && ft && ft->t == 'n' && ft->n >= 0 && ft->n < th->len) {
+		jv *frames = j_get(th->vals[(int)ft->n], "frames");
+		if (frames && frames->t == 'a') { r->crash = true; j_frames(r, frames, images, false); }
+	}
+	if ((leb = j_get(b, "lastExceptionBacktrace")) != NULL && leb->t == 'a') { r->crash = true; j_frames(r, leb, images, true); }
+	return true;
+}
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -245,6 +366,98 @@ main(void)
 		first_line(p, line, sizeof(line));
 		CHECK(strncmp(line, "reason: test", 12) == 0);
 		snprintf(p, sizeof(p), "%s/trip-test", t_root); unlink(p);
+	}
+
+	/* (ws-hm-tripfilter) only crashes with Metal code count: SYNTHETIC .ips fixtures (no real report's content) */
+	{
+		long now = (long)time(NULL);
+		char text[2048], all[8192];
+		/* images: 0 the process, 1 libsystem_kernel, 2 CoreFoundation, 3 libobjc, 4 FakeCapture, 5 HakiosMetal */
+		static const char imgs[] = "\"usedImages\":[{\"name\":\"fakesrvd\",\"path\":\"/usr/sbin/fakesrvd\"},"
+			"{\"name\":\"libsystem_kernel.dylib\"},{\"name\":\"CoreFoundation\"},{\"name\":\"libobjc.A.dylib\"},"
+			"{\"name\":\"FakeCapture\",\"path\":\"/System/Library/PrivateFrameworks/FakeCapture.framework/FakeCapture\"},"
+			"{\"name\":\"HakiosMetal\",\"path\":\"/var/local/hmetal/lib/HakiosMetal.bundle/HakiosMetal\"}]";
+		static const char ft_plain[] = "\"faultingThread\":1,\"threads\":[{\"frames\":[{\"imageIndex\":5,\"symbol\":\"idle\"}]},"
+			"{\"frames\":[{\"imageIndex\":4,\"symbol\":\"-[FakeGraph stop:]\"},{\"imageIndex\":0,\"symbol\":\"main\"}]}]";
+		static const char ft_abort[] = "\"faultingThread\":0,\"threads\":[{\"frames\":[{\"imageIndex\":1,\"symbol\":\"__pthread_kill\"},"
+			"{\"imageIndex\":0,\"symbol\":\"main\"}]}]";
+		static const char ft_metal[] = "\"faultingThread\":0,\"threads\":[{\"frames\":[{\"imageIndex\":1,\"symbol\":\"__pthread_kill\"},"
+			"{\"imageIndex\":5,\"symbol\":\"-[HakiosMetalDevice newBuffer]\"}]}]";
+		static const char leb_plain[] = "\"lastExceptionBacktrace\":[{\"imageIndex\":2,\"symbol\":\"__exceptionPreprocess\"},"
+			"{\"imageIndex\":3,\"symbol\":\"objc_exception_throw\"},{\"imageIndex\":4,\"symbol\":\"fake_resetStorage\"}]";
+		static const char leb_metal[] = "\"lastExceptionBacktrace\":[{\"imageIndex\":2,\"symbol\":\"__exceptionPreprocess\"},"
+			"{\"imageIndex\":5,\"symbol\":\"hm_throw\"}]";
+#define IPS(file, pid, a, b) do { snprintf(text, sizeof(text), "{\"bug_type\":\"309\",\"name\":\"x\"}\n{\"pid\":%d,%s,%s%s%s}\n", \
+			(pid), imgs, a, b[0] ? "," : "", b); put(file, text); } while (0)
+#define STARTS(name, a, b) do { shim_begin(name); snprintf(text, sizeof(text), "%ld %d %s\n%ld %d %s\n", now - 60, (a), g_key, \
+			now - 30, (b), g_key); snprintf(p, sizeof(p), "%shakios-metal-%s.starts", t_tmp, name); \
+			{ FILE *f = fopen(p, "w"); fputs(text, f); fclose(f); } } while (0)
+#define READ(path) do { FILE *f = fopen(path, "r"); size_t n = f ? fread(all, 1, sizeof(all) - 1, f) : 0; if (f) fclose(f); \
+			all[n] = 0; } while (0)
+		/* the image set */
+		CHECK(shim_metal_image("HakiosMetal", NULL) && shim_metal_image("SweetMetal2", NULL) && shim_metal_image("Metal", NULL));
+		CHECK(shim_metal_image("MetalTools", NULL) && shim_metal_image("libMTLCapture.dylib", NULL) && shim_metal_image("AGXMetalA14", NULL));
+		CHECK(shim_metal_image("IOGPU", NULL) && shim_metal_image("IOAccelerator", NULL) && shim_metal_image("MPSCore", NULL));
+		CHECK(shim_metal_image("MetalPerformanceShadersGraph", NULL) && shim_metal_image("GPUCompiler", NULL));
+		CHECK(shim_metal_image("libhmx.dylib", NULL) && shim_metal_image(NULL, "/var/local/hmetal/lib/SweetMetal2.bundle/x"));
+		CHECK(shim_metal_image("Unnamed", "/var/local/SweetMetal2.bundle.pre-hmca/SweetMetal2"));
+		CHECK(!shim_metal_image("FakeCapture", "/System/Library/PrivateFrameworks/FakeCapture.framework/FakeCapture"));
+		CHECK(!shim_metal_image("libsystem_kernel.dylib", NULL) && !shim_metal_image("CoreFoundation", NULL) && !shim_metal_image(NULL, NULL));
+
+		/* no Metal code anywhere (crashing thread, or an exception's backtrace): not counted, said once, no trip */
+		IPS("crash/Fakesrvd-2026-11-20-000001.ips", 401, ft_plain, "");
+		IPS("crash/Fakesrvd-2026-11-20-000002.ips", 402, ft_abort, leb_plain);
+		STARTS("Fakesrvd", 401, 402);
+		CHECK(wants("Fakesrvd", &why) && strcmp(why, "default") == 0);
+		snprintf(p, sizeof(p), "%s/fallback.log", t_root);
+		READ(p);
+		CHECK(strstr(all, "Fakesrvd pid 401 crash not counted: no Metal code on the crashing thread "
+				  "(Fakesrvd-2026-11-20-000001.ips, top: FakeCapture -[FakeGraph stop:])") != NULL);
+		CHECK(strstr(all, "Fakesrvd pid 402 crash not counted: no Metal code on the crashing thread "
+				  "(Fakesrvd-2026-11-20-000002.ips, top: FakeCapture fake_resetStorage)") != NULL);
+		CHECK(strstr(all, "Fakesrvd pid 401 -> SweetMetal2") == NULL && strstr(all, "this start only") == NULL);
+		snprintf(q, sizeof(q), "%shakios-metal-Fakesrvd.starts", t_tmp);
+		READ(q);
+		CHECK(strstr(all, "n 401\n") && strstr(all, "n 402\n"));
+		CHECK(wants("Fakesrvd", &why));                  /* again: 'n' lines kept, no second log line */
+		READ(p);
+		CHECK(strstr(all, "pid 401 crash not counted") && !strstr(strstr(all, "pid 401 crash not counted") + 1, "pid 401 crash not counted"));
+		snprintf(q, sizeof(q), "%shakios-metal-Fakesrvd.m2", t_tmp);
+		CHECK(access(q, F_OK) != 0);
+
+		/* HakiosMetal on the crashing thread: counted (with the other one, no report: trips) */
+		IPS("crash/Fakemet-2026-11-20-000001.ips", 501, ft_metal, "");
+		STARTS("Fakemet", 501, 502);
+		CHECK(!wants("Fakemet", &why) && strcmp(why, "crash trip") == 0);
+		/* HakiosMetal only in lastExceptionBacktrace: counted */
+		IPS("crash/Fakeleb-2026-11-20-000001.ips", 601, ft_abort, leb_metal);
+		IPS("crash/Fakeleb-2026-11-20-000002.ips", 602, ft_metal, "");
+		STARTS("Fakeleb", 601, 602);
+		CHECK(!wants("Fakeleb", &why) && strcmp(why, "crash trip") == 0);
+		/* no report at all, a report for another pid, a report older than the start: counted */
+		IPS("crash/Fakenone-2026-11-20-000001.ips", 799, ft_plain, "");
+		IPS("crash/Fakenone-2026-11-20-000002.ips", 702, ft_plain, "");
+		snprintf(q, sizeof(q), "%s/crash/Fakenone-2026-11-20-000002.ips", t_root);
+		{ struct utimbuf u = { now - 40, now - 40 }; utime(q, &u); }   /* before 702's start (now - 30) */
+		STARTS("Fakenone", 701, 702);
+		CHECK(!wants("Fakenone", &why) && strcmp(why, "crash trip") == 0);
+		/* one Metal-free crash and one without a report: the second alone does not trip */
+		IPS("crash/Fakehalf-2026-11-20-000001.ips", 801, ft_plain, "");
+		STARTS("Fakehalf", 801, 802);
+		CHECK(wants("Fakehalf", &why));
+		/* trip-any: every unclean exit counts (the old rule) */
+		IPS("crash/Fakeany-2026-11-20-000001.ips", 901, ft_plain, "");
+		IPS("crash/Fakeany-2026-11-20-000002.ips", 902, ft_abort, leb_plain);
+		put("trip-any", "");
+		STARTS("Fakeany", 901, 902);
+		CHECK(!wants("Fakeany", &why) && strcmp(why, "crash trip") == 0);
+		snprintf(p, sizeof(p), "%s/trip-any", t_root); unlink(p);
+		snprintf(p, sizeof(p), "%s/fallback.log", t_root);
+		READ(p);
+		CHECK(strstr(all, "Fakeany pid 901 crash not counted") == NULL && strstr(all, "Fakemet pid 501 crash not counted") == NULL);
+#undef IPS
+#undef STARTS
+#undef READ
 	}
 
 	/* SweetMetal2's own gate, as SweetMetal2.mm reads it */
