@@ -738,6 +738,8 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 #define VC_NODES        4
 
+static bool venus_encoder;              /* (ws-vt-venc; set by register_venus_encoder below) */
+
 extern id objc_retain(id object);
 extern void objc_release(id object);
 
