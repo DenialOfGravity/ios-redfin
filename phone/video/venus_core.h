@@ -99,6 +99,10 @@ struct vdec_status {
 void vdec_status(struct vdec_status *st);
 void vdec_fw_reset(void);	/* after a shutdown: the next bring-up starts with a live firmware again */
 void vdec_abort(void);		/* vdstop: forget the session after a STOP unwound it (no packets handled, no commands) */
+int vc_bus_session(unsigned w, unsigned h, unsigned fps);	/* venus-robust (f): VENUSCTL_BUS=1 session vote */
+uint64_t vc_bus_kbps_for(unsigned w, unsigned h, unsigned fps);
+unsigned vc_clk_for(unsigned w, unsigned h, unsigned fps, int two_sessions);	/* (f): 240/338/365 MHz by load */
+int vc_fw_watchdog(void);	/* venus-robust (e): read-only A2HWD check (core on, queues up); -1 = firmware dead */
 void vdec_sfr(void);		/* vdstop: print the firmware's SFR (STATE's queue block; DRAM only, no core access) */
 
 #endif
