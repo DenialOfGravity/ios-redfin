@@ -92,6 +92,7 @@ int fwdump(uint64_t addr);	/* P0d: read-only dump of the HFI block left at addr 
 int hwctl_cmd(int on);	/* venus-hw: mvs0 GDSC HW_CONTROL on/off (msm_vidc __hand_off_regulators, qcom,support-hw-trigger) */
 int intmask_cmd(void);	/* venus-hw: WRAPPER_INTR_MASK: unmask A2HWD (0x10) and A2H (0x4) as Linux's interrupt init */
 int suspend_cmd(void);	/* venus-hw: Linux power collapse (PC_PREP, TZ suspend, power off; image kept) */
+int vc_resume_failed_off(void);	/* rpmh-tcs: the last resume failed in power on: still collapsed, retry ok */
 int resume_cmd(void);	/* venus-hw: power on, TZ resume, UC regs, CTRL_INIT (no PIL reload) */
 int bus_cmd(uint64_t kbps);	/* rpmh-agg: venusctl bus KBPS */
 

@@ -530,7 +530,9 @@ static int bcm(const char *res, uint32_t v)
 	}
 	int rc = bcm_send(res, off, val);
 	printf("venus: bcm %s = %#010x -> %d%s\n", res, v, rc, bus_client >= 0 ? " (client)" : "");
-	for (int i = 1, wait = 5, eio = 0; rc && i < tries && (rc == EBUSY || (rc == EIO && !eio++)); i++, wait *= 2) {
+	int soft = rails_rpmh_soft(), tmo = 0;	/* rpmh-tcs: soft mode retries a timeout once (xnu 1135 bit 0 / 1277) */
+	for (int i = 1, wait = 5, eio = 0; rc && i < tries &&
+	     (rc == EBUSY || (rc == EIO && !eio++) || (soft && rc == ETIMEDOUT && !tmo++)); i++, wait *= 2) {
 		delay_ms((unsigned)wait);
 		rc = bcm_send(res, off, val);
 		printf("venus: bcm %s = %#010x -> %d (try %d of %d, after %d ms)\n", res, v, rc, i + 1, tries, wait);
@@ -1016,6 +1018,7 @@ int power_on(void)
 	 * (redfin DT: the only video rail; raise only) before anything is clocked, VENUSCTL_TBUVOTE holds
 	 * mnoc_sf_0_tbu; power_off() undoes them in reverse */
 	int ck = clk_pick();
+	rails_rpmh_rearm();	/* rpmh-tcs: soft mode only */
 	if (bus_real()) {
 		uint64_t k = getenv("VENUSCTL_BUS_KBPS") ? strtoull(getenv("VENUSCTL_BUS_KBPS"), NULL, 0) : 6533000;
 		if (bus_vote_kbps(k, "power on")) {
@@ -4376,6 +4379,14 @@ int suspend_cmd(void)
 	return rc;
 }
 
+/* rpmh-tcs: 1 when the last resume_cmd failed in power on (e.g. a bus vote): nothing was left on, the core is still
+ * collapsed with the image in TZ, and a later resume may simply be tried again */
+static int resume_off;
+int vc_resume_failed_off(void)
+{
+	return resume_off;
+}
+
 int resume_cmd(void)
 {
 	struct vstate v;
@@ -4383,8 +4394,9 @@ int resume_cmd(void)
 		printf("venus: refused: no initialised firmware to resume\n");
 		return 1;
 	}
-	if (power_on())
-		return 1;
+	resume_off = 0;
+	if (power_on())	/* undoes itself: the core stays collapsed (rpmh-tcs: vc_resume_failed_off) */
+		return resume_off = 1, 1;
 	if (video_set_state(1))
 		printf("venus: resume: TZ set state 1 failed, going on\n");
 	if (getenv("VENUSCTL_LINUX")) {

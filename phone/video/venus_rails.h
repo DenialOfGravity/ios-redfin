@@ -39,6 +39,8 @@ int rails_dt_allowed(const char *res);	/* p0c2: 1 for the video rails of redfin'
 int rails_rpmh_halted(void);		/* p0c2: 1 after an RPMh vote timed out or got EIO in this process */
 void rails_rpmh_note(const char *res, int rc);	/* p0c2: every RPMh vote result goes through here */
 const char *rails_rpmh_halt_why(void);
+int rails_rpmh_soft(void);		/* rpmh-tcs: VENUS_RPMH_SOFT=0|1, else /var/local/venus-rpmh-soft present */
+void rails_rpmh_rearm(void);		/* rpmh-tcs: soft mode: a new power on clears the halt of an earlier attempt */
 
 int rails_report(void);		/* venusctl rails: read only */
 int rails_raise(void);		/* power on, first step: VENUSCTL_RAILS; 0 ok or off */
