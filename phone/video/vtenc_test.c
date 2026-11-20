@@ -295,8 +295,19 @@ int main(int argc, char **argv)
 	printf("vtenc_test: the session's encoder: %s, hardware %s\n", idt, hw == kCFBooleanTrue ? "yes" : hw ? "no" : "?");
 	VTCompressionSessionPrepareToEncodeFrames(s);
 	CVPixelBufferPoolRef pool = !strcmp(pool_mode, "pool") ? VTCompressionSessionGetPixelBufferPool(s) : NULL;
+	if (pool) {	/* the session's pool must give 2-plane buffers, else our own */
+		CVPixelBufferRef t = NULL;
+		if (CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &t) || !t || CVPixelBufferGetPlaneCount(t) != 2) {
+			OSType f = t ? CVPixelBufferGetPixelFormatType(t) : 0;
+			printf("vtenc_test: the session's pool gives %.4s buffers: own 420v buffers instead\n", (char *)&f);
+			pool = NULL;
+			pool_mode = "own";
+		}
+		if (t)
+			CVPixelBufferRelease(t);
+	}
 	CVPixelBufferRef bufs[8] = { 0 };
-	if (strcmp(pool_mode, "pool"))
+	if (!pool)
 		for (int i = 0; i < 8; i++)
 			bufs[i] = make_buffer(w, h, pool_mode);
 	struct rusage r0, r1;

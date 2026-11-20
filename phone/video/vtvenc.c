@@ -88,8 +88,6 @@ extern CMBaseClassID VTVideoEncoderGetClassID(void);
 extern OSStatus VTRegisterVideoEncoderWithInfo(FourCharCode, CFDictionaryRef, void *);
 extern OSStatus VTEncoderSessionSetPixelBufferAttributes(VTEncoderSessionRef, CFDictionaryRef);
 extern OSStatus VTEncoderSessionEmitEncodedFrame(VTEncoderSessionRef, void *, OSStatus, uint32_t, CMSampleBufferRef);
-extern const CFStringRef kVTVideoEncoderList_EncoderID, kVTVideoEncoderList_EncoderName,
-	kVTVideoEncoderList_IsHardwareAccelerated;
 
 enum {	/* VTErrors.h */
 	ERR_PROPERTY = -12900, ERR_PARAM = -12902, ERR_INVALID = -12903, ERR_NO_ENCODER = -12908, ERR_MALFUNCTION = -12911,
@@ -1137,12 +1135,19 @@ __attribute__((visibility("default"))) int VTVenusEncRegister(void)
 		if (i == 1 && !cfg.hevc)
 			break;
 		FourCharCode c = i ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
-		const void *k[] = { kVTVideoEncoderList_EncoderID, kVTVideoEncoderList_EncoderName,
-			kVTVideoEncoderList_IsHardwareAccelerated };
+		/* VTRegisterVideoEncoderWithInfo's registry keys (iOS 16.7 VideoToolbox: CMClassImplementationID = the
+		 * encoder ID, else "anon-N"; kVTVideoEncoder_IsHardwareAccelerated "VTIsHardwareAccelerated",
+		 * kVTVideoEncoder_Rating "VTRating" (default 0), kVTVideoEncoder_EncoderNameKey "VTEncoderName"): the
+		 * selection (vtSortRegistryItemsByVideoEncoderRating) takes the higher rating, then hardware */
+		int rating = 1000;
+		CFNumberRef rn = CFNumberCreate(NULL, kCFNumberIntType, &rating);
+		const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("VTEncoderName"), CFSTR("VTIsHardwareAccelerated"),
+			CFSTR("VTRating") };
 		const void *val[] = { i ? CFSTR("com.iosonpixel.videoencoder.hevc.venus") : CFSTR("com.iosonpixel.videoencoder.h264.venus"),
-			i ? CFSTR("HEVC (Venus)") : CFSTR("H.264 (Venus)"), kCFBooleanTrue };
-		CFDictionaryRef info = CFDictionaryCreate(NULL, k, val, 3, &kCFTypeDictionaryKeyCallBacks,
+			i ? CFSTR("HEVC (Venus)") : CFSTR("H.264 (Venus)"), kCFBooleanTrue, rn };
+		CFDictionaryRef info = CFDictionaryCreate(NULL, k, val, 4, &kCFTypeDictionaryKeyCallBacks,
 							  &kCFTypeDictionaryValueCallBacks);
+		CFRelease(rn);
 		OSStatus st = VTRegisterVideoEncoderWithInfo(c, info, (void *)create_instance);
 		CFRelease(info);
 		say("registered for %s: %d", i ? "hvc1" : "avc1", (int)st);
