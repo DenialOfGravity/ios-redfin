@@ -299,10 +299,15 @@ static int core_ok(void)
 	/* venus-hw VENUSCTL_LINUX: gcc_video_axi stays off (as under stock Linux) and mvs0 may be in HW control (collapsed
 	 * by the firmware between frames, powered on demand) */
 	int lx = getenv("VENUSCTL_LINUX") != NULL;
+	/* venus-robust (h) VENUSCTL_HWCTL: mvs0/mvs1 handed to HW after CTRL_INIT: the firmware may collapse them (and
+	 * their branches read CLK_OFF); the host only touches wrapper/CPU_CS registers (mvsc domain) */
+	int hw = lx || (getenv("VENUSCTL_HWCTL") && atoi(getenv("VENUSCTL_HWCTL")));
+	int hw0 = hw && (vrd(GDSC_MVS0) & HW_CONTROL), hw1 = hw && (vrd(GDSC_MVS1) & HW_CONTROL);
 	int ok = ahb_on() && (lx || !(rd32(GCC_VIDEO_AXI) & CLK_OFF)) && (vrd(GDSC_MVSC) & PWR_ON) &&
-		 ((vrd(GDSC_MVS0) & PWR_ON) || (lx && (vrd(GDSC_MVS0) & HW_CONTROL)));
+		 ((vrd(GDSC_MVS0) & PWR_ON) || hw0);
 	for (unsigned i = 0; i < NBR && ok; i++)
-		if (!branches[i].cvp || cvp)
+		if ((!branches[i].cvp || cvp) && !(hw0 && strstr(branches[i].name, "mvs0")) &&
+		    !(hw1 && strstr(branches[i].name, "mvs1")))
 			ok = !(vrd(branches[i].pa) & CLK_OFF);
 	return ok;
 }
@@ -1314,8 +1319,14 @@ static void print_sfr(uint64_t q)
 }
 
 /* the undo for boot/init, in reverse: PAS shutdown (only powered: TZ touches the core), queue memory, SMRs */
+static void win_faults(const char *when);
 static int teardown(struct vstate *v)
 {
+	if (win_cbp && (rd32(win_cbp + 0x58) & (1u << 30))) {	/* (h) VENUSCTL_SMMU_STALL: a stalled transaction */
+		win_faults("teardown, stalled");
+		wr32(win_cbp + 0x8, 1);	/* CB_RESUME: TERMINATE (abort it) before the PAS shutdown */
+		printf("venus: window bank: stalled transaction terminated (FSR now %#010x)\n", rd32(win_cbp + 0x58));
+	}
 	if (v->pas) {
 		if (!core_ok()) {
 			printf("venus: STOP: PAS shutdown needs the power on (a clock or GDSC is off): nothing undone,"
@@ -1786,7 +1797,7 @@ static unsigned txdb_n[3], txdb_epoch, txdb_rung[3];	/* one doorbell per queue p
 static void txreq_doorbell(unsigned i)
 {
 	if (txdb_on < 0)
-		txdb_on = !getenv("VENUSCTL_TXREQ_DB") || atoi(getenv("VENUSCTL_TXREQ_DB"));
+		txdb_on = (!getenv("VENUSCTL_TXREQ_DB") || atoi(getenv("VENUSCTL_TXREQ_DB"))) && !getenv("VENUSCTL_NO_TXDB");
 	/* run G: the firmware leaves tx_req at 1 for the whole backlog; stock rings once per packet read (9600
 	 * doorbells for one 10 s backlog, and the host fell behind): here at most once per queue per drain pass */
 	if (!txdb_on || (txdb_epoch && txdb_rung[i] == txdb_epoch) || rd32(qhdr(i) + QH_TX_REQ) != 1)
@@ -1833,8 +1844,11 @@ static int q_read(unsigned i)
 	}
 	wr32(qhdr(i) + QH_RX_REQ, nr != wi ? 0 : want_rx);
 	wr32(qhdr(i) + QH_READ, nr);
-	txreq_doorbell(i);
-	if (pm_stepping() && got > 0)
+	txreq_doorbell(i);	/* venus-robust (c); ws-venus-enc's VENUSCTL_NO_TXDB=1 also turns it off */
+	static int dbghex = -1;	/* ws-venus-enc: VENUSCTL_STEP_DBGHEX=0: no hex line for debug packets (the text follows) */
+	if (dbghex < 0)
+		dbghex = !getenv("VENUSCTL_STEP_DBGHEX") || atoi(getenv("VENUSCTL_STEP_DBGHEX"));
+	if (pm_stepping() && got > 0 && (i == 1 || dbghex))
 		pm_step("HFI %s pkt %#x size %u: %08x %08x %08x %08x %08x %08x", i == 1 ? "msg" : "dbg", pkt[1], pkt[0],
 			got > 2 ? pkt[2] : 0, got > 3 ? pkt[3] : 0, got > 4 ? pkt[4] : 0, got > 5 ? pkt[5] : 0,
 			got > 6 ? pkt[6] : 0, got > 7 ? pkt[7] : 0);
@@ -1914,8 +1928,11 @@ static int fw_dead;		/* stage 3: a sys error came: no more session commands */
 static void step_status(int force_now)
 {
 	static double last;
+	static int every = -1;	/* (h): VENUSCTL_STEP_STATUS_MS (500) */
+	if (every < 0)
+		every = getenv("VENUSCTL_STEP_STATUS_MS") ? atoi(getenv("VENUSCTL_STEP_STATUS_MS")) : 500;
 	double t = mono_ms();
-	if (!force_now && t - last < 500)
+	if (!force_now && t - last < every)
 		return;
 	last = t;
 	if (!core_ok()) {
@@ -1930,6 +1947,9 @@ static void step_status(int force_now)
 	if (win_cbp)
 		pm_step("status: window bank FSR %#010x FAR %#010x%08x FSYNR0 %#010x", rd32(win_cbp + 0x58),
 			rd32(win_cbp + 0x64), rd32(win_cbp + 0x60), rd32(win_cbp + 0x68));
+	static int faulted;	/* (h): the full record (stream ID) once, when the window bank shows a fault */
+	if (win_cbp && !faulted && (rd32(win_cbp + 0x58) & 0xc00001feu))
+		faulted = 1, win_faults("step status");
 }
 
 /* venus-robust (e): stock reads WRAPPER_INTR_STATUS on every interrupt; the A2HWD bit (0x10) = the ARM9 watchdog
@@ -2015,6 +2035,58 @@ static int wait_msg(uint32_t want, unsigned ms)
 	return -1;
 }
 
+/* venus-robust (h): stock lito is cvp_internal: a separate DSP queue table (hfi_common.c __interface_dsp_queues_init,
+ * hfi_iris1.c __setup_ucregion_memory_map_iris1) and CTRL_INIT = 3. VENUSCTL_CTRL_INIT3=1: a 1 MB DSP block right after
+ * the 3 MB queue block (q + 3 MB .. the buffer window's default start at q + 4 MB), table + 3 queues of 320 KB, never
+ * read by us (no fastcvpd here; stock's "dsp init failed" under TWRP too). */
+#define DSPQ_OFF	0x300000u
+#define DSPQ_SIZE	0x100000u
+#define DSPQ_QSIZE	0x50000u
+static int ctrl3_on(void)
+{
+	return getenv("VENUSCTL_CTRL_INIT3") && atoi(getenv("VENUSCTL_CTRL_INIT3"));
+}
+
+static int dspq_setup(uint64_t q)
+{
+	uint64_t d = q + DSPQ_OFF;
+	static uint8_t z[0x10000];
+	for (uint32_t o = 0; o < DSPQ_SIZE; o += sizeof(z))
+		if (pm_wr(d + o, z, sizeof(z)))
+			return 1;
+	uint32_t t[QTBL_SIZE / 4];
+	memset(t, 0, sizeof(t));
+	t[1] = QTBL_SIZE, t[2] = QHDR0, t[3] = QHDR_SIZE, t[4] = 3, t[5] = 3;
+	memcpy(&t[8], "msm_v4l2_vidc", 14);
+	for (unsigned i = 0; i < 3; i++) {
+		uint32_t *h = &t[(QHDR0 + QHDR_SIZE * i) / 4];
+		h[0] = 1;
+		h[1] = (uint32_t)(d + QTBL_SIZE + (uint64_t)DSPQ_QSIZE * i);
+		h[2] = 0x01010000u | i;
+		h[3] = DSPQ_QSIZE / 4;
+		h[6] = 1, h[7] = 1, h[8] = i == 2 ? 0 : 1;
+	}
+	pm_wr(d, t, sizeof(t));
+	wr(CS_VMIMSG, (uint32_t)d, "DSP_QTBL_ADDR (own block)");
+	wr(CS_VMIMSGAG0, (uint32_t)d, "DSP_UC_REGION_ADDR (own block)");
+	wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
+	printf("venus: cvp_internal: DSP queue block %#llx (1 MB, 3 x %#x), CTRL_INIT 3\n", (unsigned long long)d,
+	       DSPQ_QSIZE);
+	return 0;
+}
+
+/* (h) VENUSCTL_HWCTL=1: stock __hand_off_regulators (vcodec + cvp GDSCs to HW) once the firmware runs (after CTRL_INIT,
+ * so our split boot/init does not collapse mvs0 under a firmware that has not started: e11) */
+static void hwctl_handoff(const char *when)
+{
+	if (!getenv("VENUSCTL_HWCTL") || !atoi(getenv("VENUSCTL_HWCTL")))
+		return;
+	upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+	if (cvp || (vrd(GDSC_MVS1) & PWR_ON))
+		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
+	printf("venus: HWCTL %s: mvs0 %#010x mvs1 %#010x handed to HW\n", when, vrd(GDSC_MVS0), vrd(GDSC_MVS1));
+}
+
 int init(uint64_t phys)
 {
 	struct vstate v;
@@ -2094,10 +2166,13 @@ int init(uint64_t phys)
 	wr(CS_VMIMSG, (uint32_t)q, "DSP_QTBL_ADDR");
 	wr(CS_VMIMSGAG0, (uint32_t)q, "DSP_UC_REGION_ADDR");
 	wr(CS_VMIMSGAG1, QSHARED, "DSP_UC_REGION_SIZE");
-	/* __boot_firmware (venus_hfi.c:1265-1290): CTRL_INIT = 1 (no CVP domain in the DT), wait for a status */
+	if (ctrl3_on() && dspq_setup(q))
+		return 1;
+	/* __boot_firmware (venus_hfi.c:1265-1290): CTRL_INIT = 1 (no CVP domain in the DT), wait for a status;
+	 * (h) VENUSCTL_CTRL_INIT3=1: 3 = BIT(1) cvp_internal as stock lito (hfi_common.c:1186-1196) */
 	if (tbu_ok("CTRL_INIT"))
 		return 1;
-	wr(CTRL_INIT, 1, "CTRL_INIT");
+	wr(CTRL_INIT, ctrl3_on() ? 3 : 1, "CTRL_INIT");
 	uint32_t st = 0;
 	unsigned ms;
 	double t0 = mono_ms();	/* lat2: 1 s on the clock; the line prints the real time (lat1: passes, "after 1 ms") */
@@ -2111,6 +2186,8 @@ int init(uint64_t phys)
 	}
 	v.init = (st & ST_INIT) && !(st & ST_ERROR);
 	state_save(&v);
+	if (v.init)
+		hwctl_handoff("after CTRL_INIT");
 	printf("venus: CTRL_STATUS %#010x after %u ms: init %u, error %#x%s\n", st, ms, st & ST_INIT, st & ST_ERROR,
 	       (st & ST_ERROR) == 4 ? " (invalid UC_REGION)" : "");
 	core_status("after init");
@@ -2663,7 +2740,10 @@ static int set_prop(uint32_t prop, uint32_t a, uint32_t b, uint32_t c, unsigned 
 	for (unsigned k = 0; k < nbody; k++)
 		printf(" %#x", p[5 + k]);
 	printf("\n");
-	if (q_write(p) || wait_msg(0, 20))
+	static int drain = -1;	/* ws-venus-enc: VENUSCTL_PROP_MS (default 20): the drain after each property */
+	if (drain < 0)
+		drain = getenv("VENUSCTL_PROP_MS") ? atoi(getenv("VENUSCTL_PROP_MS")) : 20;
+	if (q_write(p) || wait_msg(0, (unsigned)drain))
 		return -1;
 	return dc.err ? -1 : 0;
 }
@@ -3995,7 +4075,12 @@ int resume_cmd(void)
 	wr(CS_VMIMSG, (uint32_t)q, "DSP_QTBL_ADDR");
 	wr(CS_VMIMSGAG0, (uint32_t)q, "DSP_UC_REGION_ADDR");
 	wr(CS_VMIMSGAG1, QSHARED, "DSP_UC_REGION_SIZE");
-	wr(CTRL_INIT, 1, "CTRL_INIT (resume)");
+	if (ctrl3_on()) {	/* (h): the DSP queue block survives the collapse (DRAM); only the registers again */
+		wr(CS_VMIMSG, (uint32_t)(q + DSPQ_OFF), "DSP_QTBL_ADDR (own block)");
+		wr(CS_VMIMSGAG0, (uint32_t)(q + DSPQ_OFF), "DSP_UC_REGION_ADDR (own block)");
+		wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
+	}
+	wr(CTRL_INIT, ctrl3_on() ? 3 : 1, "CTRL_INIT (resume)");
 	double t0 = mono_ms();
 	uint32_t st = 0;
 	for (unsigned i = 0;; i++) {
@@ -4006,6 +4091,11 @@ int resume_cmd(void)
 	}
 	printf("venus: resume: CTRL_STATUS %#010x after %.0f ms%s\n", st, mono_ms() - t0,
 	       (st & ST_INIT) && !(st & ST_ERROR) ? " (init ok)" : " FAILED");
+	if ((st & ST_INIT) && !(st & ST_ERROR))
+		hwctl_handoff("resume");
 	unlink(PC_FLAG);
 	return (st & ST_INIT) && !(st & ST_ERROR) ? 0 : 1;
 }
+
+/* ws-venus-enc: the encoder shares this file's statics (queues, allocator, session state) */
+#include "venus_enc.inc"
