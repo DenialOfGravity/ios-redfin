@@ -1782,13 +1782,16 @@ static uint32_t pkt[3072];	/* VIDC_IFACEQ_VAR_HUGE_PKT_SIZE */
  * msg/debug queues (a silent stall once a queue filled). VENUSCTL_TXREQ_DB=0: off (the old behaviour). Default on:
  * the doorbell is the same write q_write already does, only when the firmware asks for it. */
 static int txdb_on = -1;
-static unsigned txdb_n[3];
+static unsigned txdb_n[3], txdb_epoch, txdb_rung[3];	/* one doorbell per queue per wait_msg pass (txdb_epoch) */
 static void txreq_doorbell(unsigned i)
 {
 	if (txdb_on < 0)
 		txdb_on = !getenv("VENUSCTL_TXREQ_DB") || atoi(getenv("VENUSCTL_TXREQ_DB"));
-	if (!txdb_on || rd32(qhdr(i) + QH_TX_REQ) != 1)
+	/* run G: the firmware leaves tx_req at 1 for the whole backlog; stock rings once per packet read (9600
+	 * doorbells for one 10 s backlog, and the host fell behind): here at most once per queue per drain pass */
+	if (!txdb_on || (txdb_epoch && txdb_rung[i] == txdb_epoch) || rd32(qhdr(i) + QH_TX_REQ) != 1)
 		return;
+	txdb_rung[i] = txdb_epoch;
 	if (tbu_ok("tx_req doorbell"))
 		return;
 	wr(IC_SOFTINT, SOFTINT_H2A, "tx_req doorbell");
@@ -1963,6 +1966,7 @@ static int wait_msg(uint32_t want, unsigned ms)
 	unsigned t;
 	for (t = 0;; t++) {
 		int n;
+		txdb_epoch++;
 		if (wdog_check("while polling"))
 			return -1;
 		/* test hook for (c): VENUSCTL_TEST_DBG_HOLD_MS=N drains the debug queue only every N ms (a slow host), so
