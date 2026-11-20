@@ -2458,7 +2458,10 @@ static int set_prop(uint32_t prop, uint32_t a, uint32_t b, uint32_t c, unsigned 
 	for (unsigned k = 0; k < nbody; k++)
 		printf(" %#x", p[5 + k]);
 	printf("\n");
-	if (q_write(p) || wait_msg(0, 20))
+	static int drain = -1;	/* ws-venus-enc: VENUSCTL_PROP_MS (default 20): the drain after each property */
+	if (drain < 0)
+		drain = getenv("VENUSCTL_PROP_MS") ? atoi(getenv("VENUSCTL_PROP_MS")) : 20;
+	if (q_write(p) || wait_msg(0, (unsigned)drain))
 		return -1;
 	return dc.err ? -1 : 0;
 }

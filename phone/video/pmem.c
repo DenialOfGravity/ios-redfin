@@ -106,7 +106,10 @@ void pm_step(const char *fmt, ...)
 
 static void step_wr(uint64_t pa, const void *buf, size_t len)
 {
-	if (step_fd < 0)
+	static int nowr = -1;	/* ws-venus-enc: VENUSCTL_STEP_NOWR=1: no wr32/pwrite lines (fewer fsyncs: faster runs) */
+	if (nowr < 0)
+		nowr = getenv("VENUSCTL_STEP_NOWR") && atoi(getenv("VENUSCTL_STEP_NOWR"));
+	if (step_fd < 0 || nowr)
 		return;
 	if (len == 4) {
 		uint32_t v;
