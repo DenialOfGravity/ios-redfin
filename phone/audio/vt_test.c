@@ -18,6 +18,7 @@
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 static CVPixelBufferRef
@@ -162,9 +163,41 @@ encode(int width, int height, int frames, uint32_t codec, const char *encoder_id
 		VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, n);
 		CFRelease(n);
 	}
+	/* (redfin ws-cam-video) the encoder's knobs from the environment: VT_QUALITY (0..1), VT_FPS (ExpectedFrameRate),
+	 * VT_KEYINT (MaxKeyFrameInterval), VT_CORES (NumberOfParallelCores), VT_PRIO (PrioritizeEncodingSpeedOverQuality),
+	 * VT_REORDER=1 (frame reordering allowed) */
+	{
+		static const struct { const char *env; const char *key; bool real; } knobs[] = {
+			{ "VT_QUALITY", "Quality", true }, { "VT_FPS", "ExpectedFrameRate", true }, { "VT_KEYINT", "MaxKeyFrameInterval", false },
+			{ "VT_CORES", "NumberOfParallelCores", false }, { "VT_USAGE", "Usage", false },
+			{ "VT_BITRATE", "AverageBitRate", false },
+		};
+		for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) {
+			const char *v = getenv(knobs[k].env);
+			if (v == NULL) {
+				continue;
+			}
+			CFStringRef key = CFStringCreateWithCString(NULL, knobs[k].key, kCFStringEncodingUTF8);
+			double d = atof(v);
+			int32_t i32 = atoi(v);
+			CFNumberRef n = knobs[k].real ? CFNumberCreate(NULL, kCFNumberDoubleType, &d) : CFNumberCreate(NULL, kCFNumberSInt32Type, &i32);
+			printf("vt_test: encode: %s = %s: %d\n", knobs[k].key, v, (int)VTSessionSetProperty(session, key, n));
+			CFRelease(n);
+			CFRelease(key);
+		}
+		if (getenv("VT_PRIO") != NULL) {
+			printf("vt_test: encode: PrioritizeEncodingSpeedOverQuality: %d\n", (int)VTSessionSetProperty(session,
+			    CFSTR("PrioritizeEncodingSpeedOverQuality"), kCFBooleanTrue));
+		}
+		if (getenv("VT_REORDER") != NULL) {
+			VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
+		}
+	}
 	for (int i = 0; i < 4; i++) {
 		pb[i] = make(width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
 	}
+	bool noise = getenv("VT_NOISE") != NULL;      /* (a sensor's noise in the luma: harder to code than the ramp) */
+
 	encoded = encode_errors = 0;
 	encoded_bytes = 0;
 	began = mach_absolute_time();
@@ -180,7 +213,8 @@ encode(int width, int height, int frames, uint32_t codec, const char *encoder_id
 
 			for (size_t y = 0; y < rows; y++) {
 				for (size_t x = 0; x < stride; x++) {
-					b[y * stride + x] = plane == 0 ? (uint8_t)(16 + ((x + y + (size_t)i * 8) & 0xff) * 219 / 255) :
+					b[y * stride + x] = noise && plane == 0 ? (uint8_t)(60 + (rand() & 31) + ((x / 64 + y / 64 + (size_t)i) & 1) * 40) :
+					    plane == 0 ? (uint8_t)(16 + ((x + y + (size_t)i * 8) & 0xff) * 219 / 255) :
 					    (uint8_t)(128 + (int)((x * 2654435761u + y + (size_t)i) >> 28) - 8);
 				}
 			}
