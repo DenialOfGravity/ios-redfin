@@ -729,13 +729,13 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  * 0/s), the backlog grew without end (mediaserverd 680 % CPU, 85 C), the recording's stop never drained, and
  * -[BWGraph stop:] trapped after its 10 s wait when Camera was left (EXC_BREAKPOINT, CMCapture +0x89de0).
  * A real-time encoder that cannot keep up drops frames rather than queueing them. So a picture reaches the compressor
- * only while fewer than VC_IN_FLIGHT of its pictures are still being encoded (counted at the compressor's output,
+ * only when none of its pictures is still being encoded (VC_IN_FLIGHT) (counted at the compressor's output,
  * emit_sample_buffer); the others are dropped before it, as the camera drops frames it cannot read. Markers (sample
  * buffers with no picture) always go through. The video gets the frame rate the encoder can make (1-2 fps), the
  * audio and the stop work. A count that never comes back (an encoder that drops a frame itself) is let go after
  * VC_STUCK_MS. /private/var/local/camera-vid-nogate (looked for at each recording) turns this off.
  */
-#define VC_IN_FLIGHT    2
+#define VC_IN_FLIGHT    1
 #define VC_STUCK_MS     8000
 
 static IMP original_vc_render;
@@ -772,7 +772,7 @@ vc_new_node(id node, uint64_t now)
 	vc.in_flight = vc.given = vc.dropped = vc.encoded = 0;
 	vc.last_out = vc.last_given = vc.since = now;
 	say("redwood: mediaserverd: video compressor %p: %s\n", (void *)node, vc.off ? "every picture given (camera-vid-nogate)" :
-	    "given at most " "2" " pictures in flight, the others dropped before it (camera-vid-nogate turns this off)");
+	    "given one picture at a time, the others dropped before it (camera-vid-nogate turns this off)");
 }
 
 static void
