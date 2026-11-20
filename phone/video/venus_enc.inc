@@ -36,6 +36,7 @@
 #define VE_P_BR_TYPE	0x2005031u	/* PARAM_VENC_BITRATE_TYPE {enable}: 0 = cumulative */
 #define VE_P_BITRATE	0x2006001u	/* CONFIG_VENC_TARGET_BITRATE {bitrate, layer_id} */
 #define VE_P_LOWLAT	0x2005022u	/* PARAM_VENC_LOW_LATENCY_MODE {enable} */
+#define VE_P_CAC	0x2005038u	/* PARAM_VENC_BITRATE_SAVINGS {enable} (content-adaptive coding) */
 #define VE_RC_OFF	0x1000001u
 #define VE_RC_VBR_CFR	0x1000003u
 #define VE_RC_CBR_CFR	0x1000005u
@@ -328,6 +329,10 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 	    (!c->hevc && (prof == 0x4u || prof == 0x40u) && ve_prop("8x8", VE_P_8X8, 1, 0, 0, 1)) ||
 	    (!c->hevc && prof != 0x1u && prof != 0x20u && ve_prop("cabac", VE_P_ENTROPY, 2, 3, 0, 2)) ||
 	    ve_prop("rate-control", VE_P_RC, rcm, 0, 0, 1) ||
+	    /* CAC (content-adaptive "bitrate savings") runs a CVP texture pass (VPSS FTEXTURE) on the CVP core before each
+	     * frame: e6 hung there with mvs1 off. Off (0) unless VENUSCTL_ENC_CAC=1; downstream allows off with VBR_CFR only */
+	    ve_prop("bitrate-savings", VE_P_CAC, getenv("VENUSCTL_ENC_CAC") ? (uint32_t)atoi(getenv("VENUSCTL_ENC_CAC")) : 0,
+		    0, 0, 1) ||
 	    ve_prop("rc-timestamp", VE_P_RC_TS, getenv("VENUSCTL_ENC_TSRC") ? 1u : 0u, 0, 0, 1) ||
 	    ve_prop("startcodes", VE_P_NALFMT, 1, 0, 0, 1) ||
 	    ve_prop("idr-period", VE_P_IDR, 1, 0, 0, 1) ||
