@@ -21,7 +21,8 @@
  *   bit rate).  VTVENC_SEQHDR (0): 1 = parameter sets in band before every IDR.  VTVENC_INFLIGHT (12): frames out
  *   at once before EncodeFrame waits.  VTVENC_LOG (0): 1 = a line per frame.  VTVENC_RC (1): host rate control: the
  *   constant QP follows the measured bit rate toward AverageBitRate (DataRateLimits as a cap), ENC_QP to venusd;
- *   0 = the QP from the bit rate guess stays (venusd's mapping).
+ *   0 = the QP from the bit rate guess stays (venusd's mapping).  VTVENC_EARLY_MS (40): the venusd session opens this
+ *   long after StartSession (in the background), not at the first frame; -1 = at the first frame.
  * Off: /var/local/vtvenc-off (nothing registered) or no /var/local/venus.on.
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -97,7 +98,7 @@ enum {	/* VTErrors.h */
 };
 #define INFO_DROPPED	2u	/* kVTEncodeInfo_FrameDropped */
 
-static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc; } cfg = { 1, 0, 0, 0, 0, 12, 0, 1, 1000, 1, 1 };
+static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc, early_ms; } cfg = { 1, 0, 0, 0, 0, 12, 0, 1, 1000, 1, 1, 40 };
 static pthread_once_t cfg_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -151,13 +152,15 @@ static void cfg_set(const char *k, const char *v)
 		cfg.id = n;
 	else if (!strcmp(k, "VTVENC_RC"))
 		cfg.rc = n;
+	else if (!strcmp(k, "VTVENC_EARLY_MS"))
+		cfg.early_ms = n;
 }
 
 static void cfg_load(void)
 {
 	static const char *const keys[] = { "VTVENC_HEVC", "VTVENC_ATTR", "VTVENC_QP", "VTVENC_SEQHDR", "VTVENC_INFLIGHT",
 		"VTVENC_LOG", "VTVENC_HW", "VTVENC_RATING", "VTVENC_ID",
-		"VTVENC_RC" };
+		"VTVENC_RC", "VTVENC_EARLY_MS" };
 	for (unsigned i = 0; i < sizeof keys / sizeof keys[0]; i++)
 		if (getenv(keys[i]))
 			cfg_set(keys[i], getenv(keys[i]));
@@ -220,7 +223,7 @@ struct ve {
 	uint32_t seq;
 	unsigned n_in, n_out, n_drop, n_err, n_zc;
 	double t_first, t_open, bytes;
-	int force_next;
+	int force_next, early;
 };
 
 struct storage {
@@ -738,10 +741,10 @@ static int open_session(struct ve *v, CVPixelBufferRef pb)
 	eo.profile = v->prof, eo.level = v->level;
 	eo.qp_i = (uint32_t)cfg.qp_i, eo.qp_p = (uint32_t)cfg.qp_p;
 	eo.seqhdr = cfg.seqhdr;
-	OSType f = CVPixelBufferGetPixelFormatType(pb);
+	OSType f = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
 	v->full = f == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
 	eo.full_range = v->full;
-	if (!v->prim_s) {	/* the buffer's own colour, if the client set none */
+	if (!v->prim_s && pb) {	/* the buffer's own colour, if the client set none */
 		CFTypeRef p = CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, NULL),
 			t = CVBufferGetAttachment(pb, kCVImageBufferTransferFunctionKey, NULL),
 			mx = CVBufferGetAttachment(pb, kCVImageBufferYCbCrMatrixKey, NULL);
@@ -769,7 +772,7 @@ static int open_session(struct ve *v, CVPixelBufferRef pb)
 		return -1;
 	}
 	struct timespec ts;
-	while (v->open_wait && !v->failed && mono() - v->t_open < 20) {
+	while (v->open_wait && !v->failed && !v->stop && mono() - v->t_open < 20) {
 		clock_gettime(CLOCK_REALTIME, &ts);
 		ts.tv_nsec += 100000000;
 		if (ts.tv_nsec >= 1000000000)
@@ -781,6 +784,23 @@ static int open_session(struct ve *v, CVPixelBufferRef pb)
 	    eo.primaries, eo.transfer, eo.matrix, v->full ? " full range" : "", v->opened ? "open" : "FAILED",
 	    1e3 * (mono() - v->t_open));
 	return v->opened ? 0 : -1;
+}
+
+/* early open: the venusd session (Venus resume + HFI session setup, ~0.3-1 s) starts VTVENC_EARLY_MS after StartSession
+ * (the client sets its properties right after it), so the first EncodeFrame does not wait for all of it */
+static void *early_open(void *arg)
+{
+	struct ve *v = arg;
+	usleep((useconds_t)cfg.early_ms * 1000u);
+	pthread_mutex_lock(&v->mu);
+	if (!v->opened && !v->open_wait && !v->failed && !v->invalid && !v->n_in) {
+		v->early = 1;
+		if (open_session(v, NULL))
+			say("early open failed: the first frame tries again");
+	}
+	pthread_mutex_unlock(&v->mu);
+	ve_unref(v);
+	return NULL;
 }
 
 /* ---- the encoder's functions ---- */
@@ -823,6 +843,16 @@ static OSStatus enc_start_session(CMBaseObjectRef o, VTEncoderSessionRef session
 	CFRelease(fa);
 	CFRelease(f0);
 	CFRelease(f1);
+	if (cfg.early_ms >= 0) {
+		pthread_t t;
+		pthread_mutex_lock(&v->mu);
+		v->refs++;
+		pthread_mutex_unlock(&v->mu);
+		if (pthread_create(&t, NULL, early_open, v))
+			ve_unref(v);
+		else
+			pthread_detach(t);
+	}
 	say("StartSession %s %dx%d (session %p, spec %p): pixel buffer attributes %s: %d",
 	    v->codec == kCMVideoCodecType_HEVC ? "hvc1" : "avc1", dims.width, dims.height, (void *)session, (const void *)d,
 	    cfg.attr ? "Venus layout" : "420v/420f IOSurface", (int)st);
@@ -848,6 +878,17 @@ static OSStatus enc_encode_frame(CMBaseObjectRef o, void *token, CVImageBufferRe
 		VTEncoderSessionEmitEncodedFrame(v->session, token, 0, INFO_DROPPED, NULL);
 		return 0;
 	}
+	while (v->open_wait && !v->failed) {	/* the early open is under way */
+		struct timespec tw;
+		clock_gettime(CLOCK_REALTIME, &tw);
+		tw.tv_nsec += 20000000;
+		if (tw.tv_nsec >= 1000000000)
+			tw.tv_sec++, tw.tv_nsec -= 1000000000;
+		pthread_cond_timedwait(&v->cv, &v->mu, &tw);
+	}
+	if (v->opened && v->early && !v->n_in && CVPixelBufferGetPixelFormatType(image) ==
+	    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+		say("note: opened early as video range, the frames are full range (420f): the VUI says video range");
 	if (!v->opened && open_session(v, image)) {
 		v->failed = 1;
 		pthread_mutex_unlock(&v->mu);
