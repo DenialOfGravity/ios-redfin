@@ -183,10 +183,20 @@ static void fill(CVPixelBufferRef pb, int w, int h, int i, const uint8_t *src)
 		else
 			for (int x = 0; x < w; x++)
 				y[r * yb + x] = (uint8_t)(((x + i * 4) ^ (r + i * 2)) & 0xff) / 2 + 40 + ((x / 64 + r / 64 + i / 8) & 1) * 60;
-	if (noise)	/* sensor-like noise on luma (the camera at gain 8x): what makes the bit rate */
-		for (int r = 0; r < h; r++)
+	if (noise) {	/* sensor-like noise on luma (the camera at gain 8x): what makes the bit rate; a table, shifted */
+		static int8_t *tab;
+		static size_t tn;
+		if (!tab) {
+			tn = (size_t)w * h + 65536;
+			tab = malloc(tn);
+			for (size_t k = 0; tab && k < tn; k++)
+				tab[k] = (int8_t)(((int)(arc4random() & 31) - 16) * noise / 8);
+		}
+		size_t off = ((size_t)i * 7919u) % 65536u;
+		for (int r = 0; tab && r < h; r++)
 			for (int x = 0; x < w; x++)
-				y[r * yb + x] = (uint8_t)(y[r * yb + x] + (int)((arc4random() & 31) - 16) * noise / 8);
+				y[r * yb + x] = (uint8_t)(y[r * yb + x] + tab[off + (size_t)r * w + x]);
+	}
 	for (int r = 0; r < h / 2; r++)
 		if (src)
 			memcpy(c + r * cb, src + (size_t)w * h + (size_t)r * w, (size_t)w);
