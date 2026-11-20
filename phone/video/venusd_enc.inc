@@ -100,6 +100,12 @@ static void do_enc_open(int i, const struct venusd_msg *m, const uint8_t *payloa
 		.full_range = eo.full_range, .primaries = eo.primaries, .transfer = eo.transfer, .matrix = eo.matrix,
 		.debug = debug };
 	double fps = eo.fps_q16 ? eo.fps_q16 / 65536.0 : 30.0;
+	/* venus-cvp: VENUSD_HWRC=1 (default 0): the firmware's rate control at the client's bitrate (VBR, CBR with
+	 * flags bit 2), persist in the CP non-pixel bank; ENC_QP is then ignored (venc_set_qp) */
+	if (getenv("VENUSD_HWRC") && atoi(getenv("VENUSD_HWRC")) && eo.bitrate) {
+		p.rc = (eo.flags & 4) ? 2 : 1;
+		p.bitrate = eo.bitrate;
+	}
 	if (!p.qp_i)
 		enc_qp_for(eo.bitrate, m->width, m->height, fps, sess_hevc, &p.qp_i, &p.qp_p);
 	const char *e = getenv("VENUSD_ENC_QP");
@@ -113,9 +119,9 @@ static void do_enc_open(int i, const struct venusd_msg *m, const uint8_t *payloa
 		p.seqhdr = atoi(getenv("VENUSD_ENC_SEQHDR"));
 	enc_w = m->width, enc_h = m->height, enc_qi = p.qp_i, enc_qp = p.qp_p;
 	note("venusd: session %u: encoder opened (fd %d, %s %ux%u, %.2f fps, %u bit/s -> QP %u/%u, gop %d, profile %d level %d,"
-	     " seqhdr %d, colour %d/%d/%d full %d, zero-copy %s)", nsess, cl[i].fd, sess_hevc ? "HEVC" : "H.264", m->width,
+	     " seqhdr %d, colour %d/%d/%d full %d, zero-copy %s, rc %s)", nsess, cl[i].fd, sess_hevc ? "HEVC" : "H.264", m->width,
 	     m->height, fps, eo.bitrate, p.qp_i, p.qp_p, p.gop, p.profile, p.level, p.seqhdr, p.primaries, p.transfer,
-	     p.matrix, p.full_range, enc_zc_on ? "on" : "off");
+	     p.matrix, p.full_range, enc_zc_on ? "on" : "off", p.rc == 1 ? "VBR (firmware)" : p.rc == 2 ? "CBR (firmware)" : "off");
 	/* the 20 ms drain after each property (venusctl's, for reading a refusal next to its property) made the open ~1.2 s;
 	 * a refusal still shows (session error at the next drain) */
 	vc_prop_ms = getenv("VENUSD_ENC_PROP_MS") ? atoi(getenv("VENUSD_ENC_PROP_MS")) : 2;

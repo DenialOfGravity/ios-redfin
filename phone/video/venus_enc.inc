@@ -58,6 +58,7 @@ static struct {
 } ve;
 
 uint32_t np_persist(uint32_t size, uint32_t iova);
+extern int np_force_bank;	/* venus-cvp: venc_open with rate control */
 static int ve_skip(const char *name)
 {
 	const char *s = getenv("VENUSCTL_ENC_SKIP");
@@ -714,8 +715,9 @@ int venc_open(const struct venc_params *pp)
 		return 1;
 	dc.split = 0;
 	uint32_t codec = P.hevc ? VD_HFI_CODEC_HEVC : VE_CODEC_H264;
-	printf("venus: enc open %dx%d %s, %.2f fps, QP %u/%u, gop %d, profile %#x level %#x, seqhdr %d, %d+%d buffers%s\n",
-	       W, H, P.hevc ? "HEVC" : "H.264", P.fps_q16 / 65536.0, P.qp_i, P.qp_p, P.gop, P.profile, P.level, P.seqhdr,
+	np_force_bank = P.rc != 0;
+	printf("venus: enc open %dx%d %s, %.2f fps, rc %d %u bit/s, QP %u/%u, gop %d, profile %#x level %#x, seqhdr %d, %d+%d buffers%s\n",
+	       W, H, P.hevc ? "HEVC" : "H.264", P.fps_q16 / 65536.0, P.rc, P.bitrate, P.qp_i, P.qp_p, P.gop, P.profile, P.level, P.seqhdr,
 	       P.nin, P.nout, vmmu_active() ? ", vmmu" : ", window");
 	uint32_t si[5] = { 20, 0x10007, SESSION_ID, VE_DOMAIN_ENC, codec };
 	if (q_write(si) || wait_msg(0x20006, 1000))
@@ -743,13 +745,15 @@ int venc_open(const struct venc_params *pp)
 	    ve_prop("profile-level", P_PROFILE, prof, lvl, 0, 2) ||
 	    (!P.hevc && (prof == 0x4u || prof == 0x40u) && ve_prop("8x8", VE_P_8X8, 1, 0, 0, 1)) ||
 	    (!P.hevc && prof != 0x1u && prof != 0x20u && ve_prop("cabac", VE_P_ENTROPY, 2, 3, 0, 2)) ||
-	    ve_prop("rate-control", VE_P_RC, VE_RC_OFF, 0, 0, 1) ||
+	    ve_prop("rate-control", VE_P_RC, P.rc == 1 ? VE_RC_VBR_CFR : P.rc == 2 ? VE_RC_CBR_CFR : VE_RC_OFF, 0, 0, 1) ||
 	    ve_prop("bitrate-savings", VE_P_CAC, 0, 0, 0, 1) ||
 	    ve_prop("rc-timestamp", VE_P_RC_TS, 0, 0, 0, 1) ||
 	    ve_prop("startcodes", VE_P_NALFMT, 1, 0, 0, 1) ||
 	    ve_prop("idr-period", VE_P_IDR, 1, 0, 0, 1) ||
 	    ve_prop("intra-period", VE_P_INTRA, P.gop > 1 ? (uint32_t)P.gop - 1 : 0, 0, 0, 2) ||
-	    ve_propv("frame-qp", VE_P_FRAMEQP, qp, 6) ||
+	    (!P.rc && ve_propv("frame-qp", VE_P_FRAMEQP, qp, 6)) ||
+	    (P.rc && (ve_prop("bitrate-type", VE_P_BR_TYPE, 0, 0, 0, 1) ||
+		      ve_prop("bitrate", VE_P_BITRATE, P.bitrate ? P.bitrate : 10000000u, layer, 0, 2))) ||
 	    (P.primaries && ve_propv("signal-info", VE_P_SIGNAL, sig, 7)) ||
 	    ve_prop("blur", VE_P_BLUR, B_INPUT, (uint32_t)W, (uint32_t)H, 3) ||
 	    ve_propv("operating-rate", VE_P_OPRATE, &opr, 1))
@@ -784,7 +788,8 @@ int venc_open(const struct venc_params *pp)
 		if (r && r[1] && !cnt && r[3])
 			cnt = r[3];
 		for (uint32_t i = 0; r && r[1] && i < cnt && dc.nintl < 16; i++) {
-			uint32_t pa = balloc(r[1], bname(type));
+			uint32_t pa = P.rc && !strcmp(bname(type), "persist") ?	/* venus-cvp: stock's secure persist */
+				np_persist(r[1], 0x25800000u - align_up(r[1], 0x10000) * (i + 1)) : balloc(r[1], bname(type));
 			if (!pa || buf_cmd(type, pa, r[1], 0))
 				return 2;
 			dc.intl[dc.nintl] = (struct vbuf){ pa, r[1], 1 };
@@ -901,6 +906,8 @@ int venc_eos(void)
 /* dynamic: a new constant QP (I, P) */
 int venc_set_qp(uint32_t qi, uint32_t qpp)
 {
+	if (vs.p.rc)
+		return 0;	/* venus-cvp: the firmware's rate control owns the QP */
 	uint32_t qp[6] = { (qi & 0xff) | (qpp & 0xff) << 8 | (qpp & 0xff) << 16, 0xffu, 7, 0, 0, 0 };
 	uint32_t p[11] = { 44, S_SET_PROP, SESSION_ID, 1, VE_P_FRAMEQP };
 	memcpy(p + 5, qp, sizeof(qp));

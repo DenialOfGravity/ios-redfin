@@ -3428,6 +3428,7 @@ static int hyp_assign(uint64_t pa, uint64_t len, uint32_t from, uint32_t to, uin
 }
 static uint64_t np_pa, np_len, np_tbl;
 static int np_assigned, np_tbl_assigned, np_bank_on;
+int np_force_bank;
 static struct smmu_saved np_bank_saved = { .slot = -1, .cb = -1 };
 /* the bank's tables: readable by the CP VMID's walker, as arm_smmu_assign_table (master-side secure banks) */
 static int np_prep_tables(uint64_t tbl, uint64_t len)
@@ -3466,7 +3467,7 @@ static void np_unassign(void)
  * Device address or 0 */
 uint32_t np_persist(uint32_t size, uint32_t iova)
 {
-	int bank = getenv("VENUSCTL_NP_BANK") && atoi(getenv("VENUSCTL_NP_BANK"));
+	int bank = np_force_bank || (getenv("VENUSCTL_NP_BANK") && atoi(getenv("VENUSCTL_NP_BANK")));
 	uint64_t len = (size + 0xffffu) & ~0xffffull, a;
 	if (np_assigned || np_bank_on) {
 		printf("venus: np persist already in use (one per process)\n");
@@ -3765,9 +3766,12 @@ int vdec_poll(unsigned ms)
 	return wait_msg(0, ms);
 }
 
+static void np_unassign(void);
 int vdec_close(void)
 {
-	return dec_close(dc.started);
+	int r = dec_close(dc.started);
+	np_unassign();	/* venus-cvp: the session's CP non-pixel persist goes back (nothing if none) */
+	return r;
 }
 
 void vdec_status(struct vdec_status *st)
