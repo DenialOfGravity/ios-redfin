@@ -508,3 +508,21 @@ close:
 	       ve.total, outp);
 	return rc;
 }
+
+/* ws-venus-enc: `venusctl power cvp` -- the CVP domain (GDSC mvs1, then mvs1_axi + mvs1_core) on its own, e.g. after
+ * boot --keep: the encoder's texture pass (CAC, VPSS FTEXTURE) runs on the CVP core. power off takes it down again
+ * (it checks mvs1's PWR_ON). The same steps as power on --cvp's mvs1 part. */
+int cvp_on(void)
+{
+	if (!ahb_on() || !core_ok()) {
+		printf("venus: refused: power on first (video AHB/core clocks off)\n");
+		return 1;
+	}
+	if (gdsc_on(GDSC_MVS1, "mvs1"))
+		return 1;
+	for (unsigned i = 0; i < NBR; i++)
+		if (branches[i].cvp && branch_on(branches[i].pa, branches[i].name))
+			return 1;
+	pm_step("cvp on: mvs1 %#010x", vrd(GDSC_MVS1));
+	return 0;
+}

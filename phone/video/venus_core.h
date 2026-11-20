@@ -20,6 +20,7 @@ struct venc_cfg {
 	uint64_t bufphys;
 };
 int encode(const struct venc_cfg *c, const char *in, const char *outp);
+int cvp_on(void);	/* venusctl power cvp: GDSC mvs1 + mvs1 branches (after power on / boot) */
 #endif
 
 extern int verbose, cvp, force;	/* venusctl -v, --cvp, --force */

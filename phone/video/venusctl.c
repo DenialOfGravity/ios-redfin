@@ -275,6 +275,8 @@ int main(int argc, char **argv)
 		return probe();
 	if (!strcmp(cmd, "power") && arg && !strcmp(arg, "on"))
 		return power_on();
+	if (!strcmp(cmd, "power") && arg && !strcmp(arg, "cvp"))	/* ws-venus-enc */
+		return cvp_on();
 	if (!strcmp(cmd, "power") && arg && !strcmp(arg, "off"))
 		return power_off();
 	if (!strcmp(cmd, "pas-check") && !arg)
