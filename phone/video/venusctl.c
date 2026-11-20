@@ -122,6 +122,21 @@
 #include "pmem.h"
 #include "venus_core.h"
 #include "venus_rails.h"
+#include <sys/resource.h>
+
+/* venus-iommu: CPU cost of a run (VENUSCTL_RUSAGE=1): user + system seconds against wall time */
+static double ru_t0;
+static void ru_report(void)
+{
+	struct rusage r;
+	struct timeval tv;
+	getrusage(RUSAGE_SELF, &r);
+	gettimeofday(&tv, NULL);
+	double wall = tv.tv_sec + tv.tv_usec / 1e6 - ru_t0;
+	double u = r.ru_utime.tv_sec + r.ru_utime.tv_usec / 1e6, sy = r.ru_stime.tv_sec + r.ru_stime.tv_usec / 1e6;
+	printf("venusctl: rusage user %.3f s sys %.3f s wall %.3f s = %.0f%% of one core\n", u, sy, wall,
+	       wall > 0 ? 100.0 * (u + sy) / wall : 0.0);
+}
 
 /* VENUSCTL_TS=1: every output line gets "[seconds since start] " (a pipe + reader thread), to place stalls in time; the
  * host can't, since ssh delivers the output in bursts (the 13 s first-use stall, video.md v4a1/vdboot) */
@@ -160,6 +175,12 @@ static void ts_start(void)
 
 int main(int argc, char **argv)
 {
+	if (getenv("VENUSCTL_RUSAGE") && atoi(getenv("VENUSCTL_RUSAGE"))) {
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		ru_t0 = tv.tv_sec + tv.tv_usec / 1e6;
+		atexit(ru_report);
+	}
 	const char *fw = NULL, *cmd = NULL, *arg = NULL, *arg2 = NULL, *arg3 = NULL;
 	int sysinit = 0;	/* redfin: watch --sysinit */
 	int no_shutdown = 0, keep = 0, frames = 5, hevc = -1;	/* 4e: -1 = from the stream */

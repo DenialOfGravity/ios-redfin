@@ -232,8 +232,14 @@ static int ve_etb(const uint8_t *frame, int idx, int eos)
 	if (!eos) {
 		int k = (int)(b - dc.in);
 		fill = ve_insize();	/* the whole Venus NV12 buffer, as a V4L2 client's bytesused = sizeimage */
+		static int nofill = -1;	/* venus-iommu: VENUSCTL_ENC_NOFILL=1: the input buffer keeps what it holds (a
+					 * camera surface the producer filled by DMA: no CPU touch at all per frame) */
+		if (nofill < 0)
+			nofill = getenv("VENUSCTL_ENC_NOFILL") && atoi(getenv("VENUSCTL_ENC_NOFILL"));
 		if (k >= 0 && k < 8 && ve.pre[k] == idx)
 			ve.pre[k] = -1;	/* filled before START */
+		else if (nofill && idx >= dc.nin)
+			;
 		else if (ve_fill(b, frame))
 			return -1;
 	}
@@ -268,9 +274,11 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 		printf("venus: refused: %s: can't read one %dx%d NV12 frame (%zu bytes)\n", in, W, H, fsz);
 		return 1;
 	}
-	int nf = (int)(flen / fsz);
+	int nf = (int)(flen / fsz), nfile = nf;
 	if (c->frames > 0 && c->frames < nf)
 		nf = c->frames;
+	if (c->frames > nf && getenv("VENUSCTL_ENC_LOOP") && atoi(getenv("VENUSCTL_ENC_LOOP")))
+		nf = c->frames;	/* venus-iommu: the file's frames again and again (speed runs) */
 	if (nf > VE_MAXF)
 		nf = VE_MAXF;
 	memset(&ve, 0, sizeof(ve));
@@ -396,8 +404,18 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 	}
 	if (wait_msg(0, 20) || dc.err)
 		goto close;
+	/* venus-iommu: VENUSCTL_ENC_SURF=1 (with VENUSCTL_VMMU=1): each input buffer is an NV12 IOSurface in Venus's
+	 * layout mapped into the bank by id, as a camera surface would be (zero-copy input) */
+	int esurf = vmmu_active() && getenv("VENUSCTL_ENC_SURF") && atoi(getenv("VENUSCTL_ENC_SURF"));
 	for (dc.nin = 0; dc.nin < nin; dc.nin++) {
-		uint32_t pa = balloc(isz, "enc input");
+		uint32_t pa, sid = 0;
+		void *sref = NULL;
+		if (esurf) {
+			pa = vmmu_new_surface((uint32_t)W, (uint32_t)H, dc.ystride, dc.yscan, isz, &sid, &sref);
+			if (pa)
+				printf("venus: enc input %d = IOSurface %u at IOVA %#x (zero-copy)\n", dc.nin, sid, pa);
+		} else
+			pa = balloc(isz, "enc input");
 		if (!pa)
 			goto close;
 		dc.in[dc.nin] = (struct vbuf){ pa, isz, 0 };
@@ -454,7 +472,7 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 	while (!dc.eos && !dc.err) {
 		if (free_in() && (next < nf || !ve.eos_sent)) {
 			int eos = next >= nf;
-			if (ve_etb(eos ? NULL : src + fsz * (size_t)next, next, eos))
+			if (ve_etb(eos ? NULL : src + fsz * (size_t)(next % nfile), next, eos))
 				goto close;
 			if (eos)
 				ve.eos_sent = 1;
@@ -482,6 +500,8 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 	if (ve.lat_n)
 		printf("venus: enc ETB->FBD latency: mean %.2f ms, max %.2f ms over %d frames\n", ve.lat_sum / ve.lat_n,
 		       ve.lat_max, ve.lat_n);
+	if (vmmu_active())
+		vmmu_status("after encode");
 	if (ve.bytes_frames > 1 && ve.t_fbd_last > ve.t_fbd_first)
 		printf("venus: enc throughput: first->last FBD %.3f s = %.1f fps (%.2f ms/frame); first ETB->last FBD %.2f "
 		       "ms/frame; %.0f kbit/s at %d fps\n", ve.t_fbd_last - ve.t_fbd_first,

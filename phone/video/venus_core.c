@@ -49,6 +49,7 @@
 #include "venus_core.h"
 #include "venus_rails.h"	/* P0c */
 #include "venus_hevc.h"
+#include "venus_vmmu.h"	/* venus-iommu: VENUSCTL_VMMU=1 */
 
 #define GCC		0x00100000u
 #define GCC_VIDEO_AHB	(GCC + 0xb004)	/* gcc_video_ahb_clk, GDSC parent (notes table "GDSC parent clock") */
@@ -2718,6 +2719,9 @@ static uint32_t align_up(uint32_t v, uint32_t a)
 /* /dev/pmem on the fixed region: 32-bit aligned, 64 KB per call as init's zeroing */
 static int big_io(uint64_t pa, void *buf, size_t len, int write)
 {
+	int vr = vmmu_io(pa, buf, len, write);	/* venus-iommu: a /dev/vmmu buffer: memcpy + cache maintenance */
+	if (vr)
+		return vr < 0 ? -1 : 0;
 	for (size_t o = 0; o < len; o += 0x10000) {
 		size_t n = len - o < 0x10000 ? len - o : 0x10000;
 		if (write ? pm_wr(pa + o, (uint8_t *)buf + o, n) : pm_rd(pa + o, (uint8_t *)buf + o, n))
@@ -2730,6 +2734,13 @@ static int big_io(uint64_t pa, void *buf, size_t len, int write)
 static uint32_t balloc(uint32_t size, const char *what)
 {
 	static uint8_t zeros[0x10000];
+	if (vmmu_active()) {	/* venus-iommu: ordinary memory mapped into the Venus bank, no window limit */
+		uint32_t v = vmmu_alloc(size, what);
+		if (!v)
+			printf("venus: STOP: %s: %#x bytes: no vmmu buffer\n", what, size);
+		pm_step("vmmu alloc %s %#x size %#x", what, v, size);
+		return v;
+	}
 	uint64_t a = (dc.top + 0xfff) & ~0xfffull;
 	size = align_up(size, 0x1000);
 	if (!size || a + size > dc.lim) {
@@ -2868,6 +2879,17 @@ static int place_io(uint64_t pa, const struct vdec_dest *d)
 	int whole = !dc.cx && d->ybpr == st && d->cbpr == st;
 	if (whole)
 		return big_io(y0, d->y, (size_t)dc.ch * st, 0) || big_io(c0, d->c, crows * st, 0) ? -1 : 0;
+	size_t span = (size_t)(c0 - pa) + crows * st;
+	const uint8_t *cpu = vmmu_cpu(pa, span);	/* venus-iommu: one invalidate, then rows from cached memory */
+	if (cpu) {
+		if (vmmu_sync(pa, span, 2))
+			return -1;
+		for (size_t r = 0; r < (size_t)dc.ch; r++)
+			memcpy(d->y + r * d->ybpr, cpu + (y0 - pa) + r * st, w);
+		for (size_t r = 0; r < crows; r++)
+			memcpy(d->c + r * d->cbpr, cpu + (c0 - pa) + r * st, w);
+		return 0;
+	}
 	for (size_t r = 0; r < (size_t)dc.ch; r++)
 		if (pm_rd(y0 + r * st, d->y + r * d->ybpr, w))
 			return -1;
@@ -3275,6 +3297,17 @@ int vdec_prepare(uint32_t debug, uint64_t bufphys, uint64_t mb, int want, const 
 	struct vstate v;
 	if (sys_up(&v, debug, "before decode"))
 		return 1;
+	vmmu_reset("new session");	/* venus-iommu: the last session's buffers (the bump allocator restarts too) */
+	if (vmmu_want() && !vmmu_active()) {
+		int k = 0;
+		for (int i = 0; i < v.nsmr; i++)
+			if (v.sid[i] == 0x1360)
+				k = i;
+		if (!v.nsmr || vmmu_attach(v.smr[k].cb, SMMU_TBL)) {
+			printf("venus: refused: VENUSCTL_VMMU=1 but /dev/vmmu could not attach to the window bank\n");
+			return 1;
+		}
+	}
 	/* the buffer window: right after the queue block, 1 MB aligned, inside the free gap (range_ok) */
 	uint64_t base = bufphys ? bufphys : (v.qkind == 2 ? (v.q + QSHARED + SFR_SIZE + 0xfffff) & ~0xfffffull : 0);
 	if (!base) {
@@ -3444,7 +3477,7 @@ int vdec_etb(const uint8_t *au, uint32_t len, uint64_t ts, int eos, int n)
 			uint32_t k = len - o < sizeof(tmp) ? len - o : sizeof(tmp);
 			memset(tmp, 0, sizeof(tmp));
 			memcpy(tmp, au + o, k);
-			if (pm_wr(b->pa + o, tmp, align_up(k, 4)))
+			if (big_io(b->pa + o, tmp, align_up(k, 4), 1))
 				return -1;
 		}
 		fill = len;
@@ -3606,6 +3639,8 @@ int decode(uint32_t debug, const char *in, const char *outp, int want, uint64_t 
 	step_status(1);
 	printf("venus: decoded %d of %d frames%s%s in %.2f s\n", dc.frames, want, dc.eos ? ", EOS" : "",
 	       dc.err ? ", session error" : "", now_s() - t0);
+	if (vmmu_active())
+		vmmu_status("after decode");
 	if (dc.frames > 0)	/* v4a0: copy cost vs the decode itself (first to last frame) */
 		printf("venus: copy-out %d frames: mean %.2f ms, max %.2f ms (%zu bytes each); frame 0 -> %d: %.2f s = %.1f fps\n",
 		       dc.frames, 1e3 * dc.cp_sum / dc.frames, 1e3 * dc.cp_max,
