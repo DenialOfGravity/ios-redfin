@@ -81,6 +81,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include "pmem.h"
 #include "venus_core.h"
+#include "venus_rails.h"	/* rpmh-tcs: rails_rpmh_soft */
 #include "venus_hevc.h"
 #include "venus_proto.h"
 #include "venus_vmmu.h"
@@ -518,6 +519,11 @@ static void down(const char *why)
 	note("venusd: Venus down (%s)", why);
 	if (pc_down) {	/* collapsed: the PAS shutdown wants the core powered and the firmware awake */
 		if (resume_cmd()) {	/* venus-robust: e.g. an RPMh BCM vote timeout (TCS quarantined for the boot) */
+			if (rails_rpmh_soft() && vc_resume_failed_off()) {	/* rpmh-tcs */
+				note("venusd: resume before the shutdown failed in power on (rpmh soft): Venus stays"
+				     " power-collapsed with the image in TZ; the next OPEN resumes it again");
+				return;
+			}
 			fault = 1;
 			note("venusd: resume before the shutdown failed: Venus stays power-collapsed with the image in TZ (core"
 			     " off, STATE kept, no PAS shutdown possible); OPEN refused until a reboot");
@@ -759,7 +765,19 @@ static int32_t open_common(int i, const struct venusd_msg *m, int enc)
 		rc = -EIO;
 	else if (up && pc_down) {
 		double t0 = mono();
-		if (resume_cmd()) {
+		int r = resume_cmd();
+		/* rpmh-tcs: soft mode: a resume that failed in power on (a bus vote) left nothing on: try again (50, 150,
+		 * 450 ms), then answer -EIO and stay collapsed; the next OPEN tries once more. Never the LEFT POWERED fault. */
+		for (unsigned k = 0, w = 50; r && k < 3 && rails_rpmh_soft() && vc_resume_failed_off(); k++, w *= 3) {
+			note("venusd: resume failed in power on (rpmh soft): retry %u of 3 in %u ms", k + 1, w);
+			usleep(w * 1000);
+			r = resume_cmd();
+		}
+		if (r && rails_rpmh_soft() && vc_resume_failed_off()) {
+			rc = -EIO;
+			note("venusd: resume from power collapse FAILED in power on (rpmh soft): stays collapsed, the next OPEN"
+			     " retries");
+		} else if (r) {
 			rc = -EIO;
 			note("venusd: resume from power collapse FAILED: Venus down");
 			down("resume failed");	/* venus-robust: down() resumes once more, else marks the collapsed fault */

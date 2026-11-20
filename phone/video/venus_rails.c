@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "venus_rails.h"
 
 #define RSC_PA		0x18220000ull	/* apps RSC (bsd/dev/sweet_rpmh.c RH_RSC_PA), DRV 2 */
@@ -95,6 +96,27 @@ void rails_rpmh_note(const char *res, int rc)
 const char *rails_rpmh_halt_why(void)
 {
 	return halt_why;
+}
+
+/* rpmh-tcs (logs/research/venus-rpmh-timeout-2026-11-20.md): the halt above lasted for the process, so one false
+ * RPMh timeout (xnu 1277: the vote had completed) left venusd refusing OPEN until a reboot. Soft mode (default off:
+ * VENUS_RPMH_SOFT=1 or /var/local/venus-rpmh-soft): the halt still stops the attempt it happened in (no votes pile
+ * up behind it), but the next power on (resume, OPEN) starts clean and votes again; bcm() retries a timeout once. */
+int rails_rpmh_soft(void)
+{
+	const char *e = getenv("VENUS_RPMH_SOFT");
+	struct stat sb;
+	if (e && *e)
+		return atoi(e) != 0;
+	return stat("/var/local/venus-rpmh-soft", &sb) == 0;
+}
+
+void rails_rpmh_rearm(void)
+{
+	if (!halt_why[0] || !rails_rpmh_soft())
+		return;
+	printf("venus: rpmh: soft: the halt of an earlier attempt (%s) cleared: votes again\n", halt_why);
+	halt_why[0] = 0;
 }
 
 /* ---- pure helpers ---- */
