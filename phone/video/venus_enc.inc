@@ -560,3 +560,346 @@ int cvp_on(void)
 	pm_step("cvp on: mvs1 %#010x", vrd(GDSC_MVS1));
 	return 0;
 }
+
+/* ---- ws-vt-venc: the encoder in steps, for venusd's encode protocol (venus_proto.h VD_ENC_*) and the VideoToolbox
+ * encoder in mediaserverd (vtvenc.c). Same session state `dc` as the decoder (one session at a time), same close
+ * (vdec_close). Differences from venusctl encode (stock msm_venc defaults, venus-stock-vs-ours 4a):
+ *  - rate control OFF (constant QP: CVP is needed for RC, see venus-encoder-2026-11-20.md), the QP from the client
+ *    (CONFIG_VENC_FRAME_QP; venusd maps the bitrate hint to it);
+ *  - SYNC_FRAME_SEQUENCE_HEADER 0 by default: the parameter sets come once as their own CODECCONFIG buffer (stock);
+ *  - profile High/Main, level 0 = the firmware picks it (stock); VIDEO_SIGNAL_INFO when the client gives colour;
+ *    OPERATING_RATE, PERF_MODE 1 (stock); 8 inputs + 8 bitstream buffers (stock BUFFER_COUNT_ACTUAL);
+ *  - inputs: venc_etb() either the slot's own Venus-layout buffer (filled by the caller through venc_slot_cpu) or any
+ *    IOVA (an IOSurface mapped with vmmu_map_surface: zero-copy); EBD -> venc_in_done(tag); FBD -> venc_sink.
+ */
+#define VE_P_OPRATE	0x2003u		/* CONFIG_OPERATING_RATE {rate Q16} */
+#define VE_P_SIGNAL	0x200501du	/* PARAM_VENC_VIDEO_SIGNAL_INFO {enable, format, full, desc, prim, transfer, matrix} */
+#define VE_P_SYNCREQ	0x2006004u	/* CONFIG_VENC_REQUEST_SYNC_FRAME {enable} */
+#define VE_P_PERF	0x200600eu	/* CONFIG_VENC_PERF_MODE {mode}: 1 max quality (stock) */
+#define VE_P_FRAMEQP	0x2006012u	/* CONFIG_VENC_FRAME_QP hfi_quantization {qp I|P<<8|B<<16, layer, enable 7, 3 rsvd} */
+
+void (*venc_sink)(const struct venc_out *o);
+void (*venc_in_done)(uint32_t tag, uint32_t pa);
+static struct {
+	struct venc_params p;
+	uint32_t own[8];	/* each slot's own input buffer (IOVA / window PA) */
+	uint32_t osz, isz;
+	uint8_t *rd;
+	size_t rd_len;
+	unsigned outs, cfgs, ins;
+} vs;
+
+/* a property with up to 8 body words (set_prop has 3) */
+static int ve_propv(const char *name, uint32_t prop, const uint32_t *body, unsigned n)
+{
+	if (ve_skip(name)) {
+		printf("venus: enc: %s skipped (VENUSCTL_ENC_SKIP)\n", name);
+		return 0;
+	}
+	uint32_t p[13] = { 20 + 4 * n, S_SET_PROP, SESSION_ID, 1, prop };
+	memcpy(p + 5, body, 4 * (n > 8 ? 8 : n));
+	printf("venus: set %s (%#x):", name, prop);
+	for (unsigned k = 0; k < n; k++)
+		printf(" %#x", body[k]);
+	printf("\n");
+	if (q_write(p) || wait_msg(0, 20))
+		return -1;
+	if (dc.err) {
+		uint32_t e = (uint32_t)dc.err;
+		printf("venus: enc: property %s (%#x) refused (session error %#x)\n", name, prop, e);
+		if ((e == 0x1007 || e == 0x1008 || e == 0x1002) && !getenv("VENUSCTL_ENC_STRICT")) {
+			printf("venus: enc: note: %s refused with %#x, going on without it\n", name, e);
+			dc.err = 0;
+			return 0;
+		}
+		return -1;
+	}
+	return 0;
+}
+
+static int venc_pkt(int n)
+{
+	uint32_t p[64];
+	memcpy(p, pkt, 4u * (unsigned)(n < 64 ? n : 64));
+	dc.acts++;
+	if (p[1] == M_EBD && n >= 10) {
+		struct vbuf *b = find_buf(dc.in, dc.nin, p[7]);
+		if (b)
+			b->fw = 0;
+		dc.ebds++;
+		if (p[3] || !b)
+			printf("venus: enc EBD tag %u buf %#x error %#x flags %#x%s\n", p[6], p[7], p[3], p[9],
+			       b ? "" : " (not ours)");
+		if (venc_in_done)
+			venc_in_done(p[6], p[7]);
+	} else if (p[1] == M_FBD && n >= 18) {
+		uint32_t err = p[5], flags = p[6], off = p[10], len = p[12], tag = p[13], ptype = p[15], pa = p[16];
+		struct vbuf *b = find_buf(dc.opb, dc.nopb, pa);
+		if (b)
+			b->fw = 0;
+		if (err || !b)
+			printf("venus: enc FBD buf %#x error %#x%s\n", pa, err, b ? "" : " (not ours)");
+		if (len && b && (uint64_t)off + len <= b->size) {
+			size_t need = align_up(off + len, 4);
+			if (vs.rd_len < need) {
+				free(vs.rd);
+				vs.rd = malloc(need);
+				vs.rd_len = vs.rd ? need : 0;
+			}
+			if (!vs.rd || big_io(pa, vs.rd, need, 0)) {
+				printf("venus: enc: can't read the bitstream at %#x\n", pa);
+			} else {
+				struct venc_out o = { vs.rd + off, len, flags, ptype, tag, ((uint64_t)p[3] << 32) | p[4] };
+				if (flags & VE_F_CODECCFG)
+					vs.cfgs++;
+				else
+					vs.outs++, dc.frames++;
+				if (venc_sink)
+					venc_sink(&o);
+			}
+		}
+		if (flags & F_EOS) {
+			dc.eos = 1;
+			printf("venus: enc: EOS back after %u frames\n", vs.outs);
+		}
+		if (b && !dc.eos && !dc.err)
+			ftb(0, b);
+	} else if (p[1] == M_EVENT && n >= 6) {
+		if (p[3] == EV_SESSION_ERR) {
+			printf("venus: enc session error %#x data2 %#x\n", p[4], p[5]);
+			dc.err = (int)p[4];
+		} else {
+			printf("venus: enc event %#x data %#x %#x\n", p[3], p[4], p[5]);
+		}
+	} else {
+		printf("venus: enc msg %#x size %u\n", p[1], p[0]);
+	}
+	return 0;
+}
+
+int venc_open(const struct venc_params *pp)
+{
+	struct venc_params P = *pp;
+	int W = P.w, H = P.h;
+	if (W < 32 || H < 32 || W > 4096 || H > 2304 || (W & 1) || (H & 1)) {
+		printf("venus: enc: refused: frame size %dx%d (even, 32..4096 x 32..2304)\n", W, H);
+		return 1;
+	}
+	if (!P.fps_q16)
+		P.fps_q16 = 30u << 16;
+	unsigned fps = (P.fps_q16 + 0x8000) >> 16;
+	if (!fps)
+		fps = 1;
+	if (P.gop <= 0)
+		P.gop = (int)fps * 2;
+	if (!P.qp_i)
+		P.qp_i = 26;
+	if (!P.qp_p)
+		P.qp_p = P.qp_i + 2;
+	if (P.nin <= 0)
+		P.nin = 8;
+	if (P.nout <= 0)
+		P.nout = 8;
+	P.nin = P.nin > 8 ? 8 : P.nin;
+	P.nout = P.nout > 32 ? 32 : P.nout;
+	memset(&vs.own, 0, sizeof(vs.own));
+	vs.p = P;
+	vs.outs = vs.cfgs = vs.ins = 0;
+	struct h264_sps sps = { .w = W, .h = H, .cw = W, .ch = H };
+	uint64_t mb = getenv("VENUSCTL_BUF_MB") ? strtoull(getenv("VENUSCTL_BUF_MB"), NULL, 0) : 128;
+	double t0 = mono_ms();
+	if (vdec_prepare(P.debug, 0, mb, 1 << 30, &sps, P.hevc))
+		return 1;
+	dc.split = 0;
+	uint32_t codec = P.hevc ? VD_HFI_CODEC_HEVC : VE_CODEC_H264;
+	printf("venus: enc open %dx%d %s, %.2f fps, QP %u/%u, gop %d, profile %#x level %#x, seqhdr %d, %d+%d buffers%s\n",
+	       W, H, P.hevc ? "HEVC" : "H.264", P.fps_q16 / 65536.0, P.qp_i, P.qp_p, P.gop, P.profile, P.level, P.seqhdr,
+	       P.nin, P.nout, vmmu_active() ? ", vmmu" : ", window");
+	uint32_t si[5] = { 20, 0x10007, SESSION_ID, VE_DOMAIN_ENC, codec };
+	if (q_write(si) || wait_msg(0x20006, 1000))
+		return 1;
+	if (pkt[3]) {
+		printf("venus: enc SESSION_INIT_DONE error %#x\n", pkt[3]);
+		return 1;
+	}
+	on_pkt = venc_pkt;
+	vc_bus_session((unsigned)W, (unsigned)H, fps);
+	uint32_t prof = P.profile ? (uint32_t)P.profile : P.hevc ? 0x1u : 0x4u;	/* HEVC Main / H.264 High */
+	uint32_t lvl = (uint32_t)P.level;	/* 0: the firmware's choice (stock) */
+	if (P.hevc && lvl && !(lvl >> 28))
+		lvl |= 1u << 28;	/* main tier */
+	uint32_t layer = 0xffu;
+	uint32_t qp[6] = { (P.qp_i & 0xff) | (P.qp_p & 0xff) << 8 | (P.qp_p & 0xff) << 16, layer, 7, 0, 0, 0 };
+	uint32_t sig[7] = { 1, 5, P.full_range ? 1u : 0u, 1, (uint32_t)P.primaries, (uint32_t)P.transfer, (uint32_t)P.matrix };
+	uint32_t opr = P.fps_q16;
+	if (ve_prop("input-size", P_FRAME_SIZE, B_INPUT, (uint32_t)W, (uint32_t)H, 3) ||
+	    ve_prop("output-size", P_FRAME_SIZE, B_OUTPUT, (uint32_t)W, (uint32_t)H, 3) ||
+	    ve_prop("frame-rate", VE_P_FRAME_RATE, B_OUTPUT, P.fps_q16, 0, 2) ||
+	    ve_prop("realtime", VE_P_REALTIME, 1, 0, 0, 1) ||
+	    ve_prop("input-nv12", P_FMT_SEL, B_INPUT, CF_NV12, 0, 2) ||
+	    ve_prop("seq-header", VE_P_SEQHDR, P.seqhdr ? 1u : 0u, 0, 0, 1) ||
+	    ve_prop("profile-level", P_PROFILE, prof, lvl, 0, 2) ||
+	    (!P.hevc && (prof == 0x4u || prof == 0x40u) && ve_prop("8x8", VE_P_8X8, 1, 0, 0, 1)) ||
+	    (!P.hevc && prof != 0x1u && prof != 0x20u && ve_prop("cabac", VE_P_ENTROPY, 2, 3, 0, 2)) ||
+	    ve_prop("rate-control", VE_P_RC, VE_RC_OFF, 0, 0, 1) ||
+	    ve_prop("bitrate-savings", VE_P_CAC, 0, 0, 0, 1) ||
+	    ve_prop("rc-timestamp", VE_P_RC_TS, 0, 0, 0, 1) ||
+	    ve_prop("startcodes", VE_P_NALFMT, 1, 0, 0, 1) ||
+	    ve_prop("idr-period", VE_P_IDR, 1, 0, 0, 1) ||
+	    ve_prop("intra-period", VE_P_INTRA, P.gop > 1 ? (uint32_t)P.gop - 1 : 0, 0, 0, 2) ||
+	    ve_propv("frame-qp", VE_P_FRAMEQP, qp, 6) ||
+	    (P.primaries && ve_propv("signal-info", VE_P_SIGNAL, sig, 7)) ||
+	    ve_prop("blur", VE_P_BLUR, B_INPUT, (uint32_t)W, (uint32_t)H, 3) ||
+	    ve_propv("operating-rate", VE_P_OPRATE, &opr, 1))
+		return 2;
+	if (get_bufreq())
+		return 2;
+	uint32_t *ri = req_of(B_INPUT), *ro = req_of(B_OUTPUT);
+	uint32_t aw = align_up((uint32_t)W, 32), ah = align_up((uint32_t)H, 32), osz = aw * ah * 3;
+	if ((aw / 16) * (ah / 16) > 1620)
+		osz >>= 2;
+	osz <<= 1;	/* RC off */
+	if (P.hevc)
+		osz += osz >> 2;
+	if (ro && ro[1] > osz)
+		osz = ro[1];
+	osz = align_up(osz, 4096);
+	uint32_t isz = ve_insize();
+	if (ri && ri[1] > isz)
+		isz = align_up(ri[1], 4096);
+	uint32_t perf = 1;
+	if (ve_prop("input-count", P_BUF_COUNT, B_INPUT, (uint32_t)P.nin, (uint32_t)P.nin, 3) ||
+	    ve_prop("output-count", P_BUF_COUNT, B_OUTPUT, (uint32_t)P.nout, (uint32_t)P.nout, 3) ||
+	    ve_prop("work-mode", P_WORK_MODE, 2, 0, 0, 1) ||
+	    ve_prop("work-route", P_WORK_ROUTE, 2, 0, 0, 1) ||
+	    ve_propv("perf-mode", VE_P_PERF, &perf, 1) ||
+	    get_bufreq() ||
+	    ve_prop("output-size-min", P_BUF_SIZE_MIN, B_OUTPUT, osz, 0, 2))
+		return 2;
+	static const uint32_t itypes[] = { 6, 7, 8, 4, 5 };
+	for (unsigned t = 0; t < 5; t++) {
+		uint32_t type = itypes[t], *r = req_of(type), cnt = r ? r[5] : 0;
+		if (r && r[1] && !cnt && r[3])
+			cnt = r[3];
+		for (uint32_t i = 0; r && r[1] && i < cnt && dc.nintl < 16; i++) {
+			uint32_t pa = balloc(r[1], bname(type));
+			if (!pa || buf_cmd(type, pa, r[1], 0))
+				return 2;
+			dc.intl[dc.nintl] = (struct vbuf){ pa, r[1], 1 };
+			dc.intl_type[dc.nintl++] = type;
+		}
+	}
+	if (wait_msg(0, 20) || dc.err)
+		return 2;
+	for (dc.nin = 0; dc.nin < P.nin; dc.nin++) {
+		uint32_t pa = balloc(isz, "enc input");
+		if (!pa)
+			return 2;
+		vs.own[dc.nin] = pa;
+		dc.in[dc.nin] = (struct vbuf){ pa, isz, 0 };
+	}
+	for (dc.nopb = 0; dc.nopb < P.nout; dc.nopb++) {
+		uint32_t pa = balloc(osz, "bitstream");
+		if (!pa)
+			return 2;
+		dc.opb[dc.nopb] = (struct vbuf){ pa, osz, 0 };
+	}
+	vs.isz = isz, vs.osz = osz;
+	dc.isz = isz;
+	if (sess_cmd(S_LOAD_RES) || wait_msg(M_LOAD_DONE, 1000))
+		return 2;
+	if (sess_cmd(S_START))
+		return 2;
+	dc.started = 1;
+	if (wait_msg(M_START_DONE, 1000) || dc.err)
+		return 2;
+	for (int i = 0; i < dc.nopb; i++)
+		if (ftb(0, &dc.opb[i]))
+			return 2;
+	printf("venus: enc running in %.0f ms: %d inputs of %u bytes (NV12 stride %u, scanlines %u/%u), %d bitstream buffers"
+	       " of %u bytes\n", mono_ms() - t0, dc.nin, isz, dc.ystride, dc.yscan, ve_uvscan(), dc.nopb, osz);
+	return 0;
+}
+
+int venc_free_slot(void)
+{
+	for (int i = 0; i < dc.nin; i++)
+		if (!dc.in[i].fw)
+			return i;
+	return -1;
+}
+
+/* the CPU pointer of slot k's own buffer (vmmu only; NULL on the window path) and its Venus NV12 layout */
+uint8_t *venc_slot_cpu(int k, uint32_t *size, uint32_t *stride, uint32_t *yscan)
+{
+	if (k < 0 || k >= dc.nin)
+		return NULL;
+	if (size)
+		*size = vs.isz;
+	if (stride)
+		*stride = dc.ystride;
+	if (yscan)
+		*yscan = dc.yscan;
+	return vmmu_cpu(vs.own[k], vs.isz);
+}
+
+/* the Venus NV12 layout this session wants: stride, Y scanlines, the CbCr plane's offset */
+void venc_layout(uint32_t *stride, uint32_t *yscan, uint32_t *uvoff, uint32_t *size)
+{
+	*stride = dc.ystride, *yscan = dc.yscan, *uvoff = dc.ystride * dc.yscan, *size = ve_insize();
+}
+
+/* one picture: slot k; pa 0 = the slot's own buffer (written through venc_slot_cpu: cleaned here), else that IOVA
+ * (alloc bytes there, already clean); sync: an IDR now */
+int venc_etb(int k, uint32_t pa, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync)
+{
+	if (k < 0 || k >= dc.nin || dc.in[k].fw)
+		return -1;
+	uint32_t fill = ve_insize();
+	if (!pa) {
+		pa = vs.own[k];
+		alloc = vs.isz;
+		if (vmmu_cpu(pa, fill) && vmmu_sync(pa, fill, 1))
+			return -1;
+	}
+	if (fill > alloc)
+		fill = alloc;
+	if (sync) {
+		uint32_t one = 1;
+		uint32_t p[6] = { 24, S_SET_PROP, SESSION_ID, 1, VE_P_SYNCREQ, one };
+		if (q_write(p))
+			return -1;
+	}
+	uint32_t e[16] = { 64, S_ETB, SESSION_ID, 0, (uint32_t)(ts_us >> 32), (uint32_t)ts_us, 0, 0, 0, alloc, fill, 0, tag,
+		pa, 0, 0 };
+	dc.in[k].pa = pa;
+	dc.in[k].size = alloc;
+	dc.in[k].fw = 1;
+	vs.ins++;
+	return q_write(e) ? -1 : 0;
+}
+
+int venc_eos(void)
+{
+	int k = venc_free_slot();
+	if (k < 0)
+		return -1;
+	uint32_t e[16] = { 64, S_ETB, SESSION_ID, 0, 0, 0, F_EOS, 0, 0, vs.isz, 0, 0, 0, vs.own[k], 0, 0 };
+	dc.in[k].pa = vs.own[k];
+	dc.in[k].fw = 1;
+	return q_write(e) ? -1 : 0;
+}
+
+/* dynamic: a new constant QP (I, P) */
+int venc_set_qp(uint32_t qi, uint32_t qpp)
+{
+	uint32_t qp[6] = { (qi & 0xff) | (qpp & 0xff) << 8 | (qpp & 0xff) << 16, 0xffu, 7, 0, 0, 0 };
+	uint32_t p[11] = { 44, S_SET_PROP, SESSION_ID, 1, VE_P_FRAMEQP };
+	memcpy(p + 5, qp, sizeof(qp));
+	return q_write(p) ? -1 : 0;
+}
+
+uint32_t venc_fps_q16(void)
+{
+	return vs.p.fps_q16;
+}
