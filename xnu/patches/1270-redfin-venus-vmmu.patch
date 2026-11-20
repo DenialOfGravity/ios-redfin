@@ -13,8 +13,10 @@ VMMU_MAP pins a user range (IOMemoryDescriptor prepare, as BoImport) or retains
 an IOSurface by id (SweetSurface memory), maps it at a free IOVA in
 0x40000000-0x80000000 (or a fixed one from 0x01000000), TLBIASID + TLBSYNC.
 VMMU_UNMAP / client close: PTEs cleared, TLB flushed, then pages released.
-VMMU_SYNC: clean / clean+invalidate by physical page (Venus is not IO-coherent).
-VMMU_STATUS: maps, bytes, FSR/FAR/FSYNR0 + faulting SID (also logged once per
+VMMU_SYNC: clean / clean+invalidate by physical page (Venus is not IO-coherent);
+every new mapping is cleaned+invalidated once (a fresh IOSurface is bzero'd through
+a cached kernel mapping: its dirty lines would later land on Venus output).
+VMMU_STATUS: maps, bytes, FSR fault bits/FAR/FSYNR0 + faulting SID (also logged once per
 new fault at every call). RW sysctl kern.sweet_vmmu: 0 (default) refuses ATTACH
 and MAP = today's behaviour; 1 on.
 
@@ -50,10 +52,10 @@ index fd1c9d0..fe765d6 100644
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 diff --git a/bsd/dev/sweet_vmmu.c b/bsd/dev/sweet_vmmu.c
 new file mode 100644
-index 0000000..d630870
+index 0000000..30b4da6
 --- /dev/null
 +++ b/bsd/dev/sweet_vmmu.c
-@@ -0,0 +1,671 @@
+@@ -0,0 +1,679 @@
 +/*
 + * 1270 redfin (venus-iommu): /dev/vmmu, real page tables for the Venus SMMU bank (zero-copy video buffers).
 + *
@@ -71,7 +73,8 @@ index 0000000..d630870
 + *                                pins a user range (IOMemoryDescriptor prepare, as NativeAdrenoMethodBoImport) or
 + *                                retains an IOSurface by id (SweetSurface memory: no user mapping needed), maps its
 + *                                4 KB pages at a free IOVA in 0x40000000-0x80000000 (or the fixed IOVA asked, from
-+ *                                0x01000000), attr 0 (Normal non-cacheable for the device), AP RW (flags bit 0: RO)
++ *                                0x01000000), attr 0 (Normal non-cacheable for the device), AP RW (flags bit 0: RO);
++ *                                cleaned+invalidated once by physical page (flags bit 1: skip)
 + *   ioctl VMMU_UNMAP {iova}      PTEs cleared, cleaned, TLBIASID + TLBSYNC, then unpinned/released
 + *   ioctl VMMU_SYNC {iova,off,len,op}   CPU cache maintenance by physical page (Venus is not IO-coherent: stock
 + *                                venus_ns has no dma-coherent, maps with prot 0xb = no IOMMU_CACHE): op 1 clean
@@ -124,7 +127,7 @@ index 0000000..d630870
 +	uint64_t addr;          /* in: user address (4 KB aligned), or 0 with surface */
 +	uint64_t len;           /* in: bytes (user range) */
 +	uint32_t surface;       /* in: IOSurface id (addr 0) */
-+	uint32_t flags;         /* in: bit 0 = device read-only */
++	uint32_t flags;         /* in: bit 0 = device read-only, bit 1 = no clean+invalidate at map */
 +	uint64_t iova;          /* in: 0 = allocate, else a fixed 4 KB aligned IOVA; out: IOVA */
 +	uint64_t handle;        /* out: = iova (for unmap) */
 +	uint64_t plen;          /* out: mapped bytes (4 KB multiple) */
@@ -183,6 +186,7 @@ index 0000000..d630870
 +static uint32_t vmu_last_fsr, vmu_faults;
 +static uint64_t vmu_last_far;
 +
++static int vmu_sync(struct vmmu_sync *s);
 +static LCK_GRP_DECLARE(sweet_vmmu_grp, "sweet_vmmu");
 +static LCK_MTX_DECLARE(sweet_vmmu_lock, &sweet_vmmu_grp);
 +
@@ -246,7 +250,7 @@ index 0000000..d630870
 +		return;
 +	}
 +	uint64_t cbp = vmu_cbp();
-+	uint32_t fsr = *vmu_reg(cbp + 0x58), fsynr0 = *vmu_reg(cbp + 0x68);
++	uint32_t fsr = *vmu_reg(cbp + 0x58) & 0xc00001feu, fsynr0 = *vmu_reg(cbp + 0x68);	/* fault bits only (not FORMAT) */
 +	uint64_t far = (uint64_t)*vmu_reg(cbp + 0x60) | ((uint64_t)*vmu_reg(cbp + 0x64) << 32);
 +	uint32_t sid = *vmu_reg(vmu_psize + 0x400 + 4ULL * (uint32_t)vmu_cb) & 0xffff;      /* CBFRSYNRA */
 +	if (fsr && (fsr != vmu_last_fsr || far != vmu_last_far)) {
@@ -496,6 +500,12 @@ index 0000000..d630870
 +	}
 +	vmu_tlb_flush();         /* MMU-500 may hold a walk-cache entry from before (an unmapped neighbour) */
 +	vmu_ents[vmu_nents++] = (struct vmu_ent){ .iova = iova, .len = len, .pin = pin, .surface = m->surface, .client = client };
++	if (!(m->flags & 2)) {
++		/* clean+invalidate the whole buffer once: a surface is bzero'd through a cached kernel mapping when it is
++		 * created, and such dirty lines evicted later would land on what Venus wrote (flags bit 1: skip) */
++		struct vmmu_sync sy = { .iova = iova, .op = 2 };
++		(void)vmu_sync(&sy);
++	}
 +	vmu_bytes += len;
 +	m->iova = iova;
 +	m->handle = iova;
