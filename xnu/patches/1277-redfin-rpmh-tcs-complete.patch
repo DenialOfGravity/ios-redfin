@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 94abba7..34332ac 100644
+index 94abba7..20114fd 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -288,6 +288,57 @@ rh_lookup(const char *res, uint32_t *address)
+@@ -288,6 +288,58 @@ rh_lookup(const char *res, uint32_t *address)
  	return 0;
  }
  
@@ -21,7 +21,8 @@ index 94abba7..34332ac 100644
 + *              instead of waiting out the timeout.
 + *   bit 2 (4): still ambiguous after those re-triggers: accepted as completed (klog line) instead of the quarantine.
 + * kern.sweet_rpmh_tcs_test (RW, default 0, test only): busy-wait N us (max 5000) between the first trigger of a vote
-+ * and its first poll (not with bit 0): the preemption window, made on purpose, to reproduce the false timeout.
++ * and its first poll (BCM votes only, not with bit 0): the preemption window, made on purpose, to reproduce the false
++ * timeout.
 + * kern.sweet_rpmh_tcs_stats (RD): votes, fast-seen (bit 0 saw progress), ambiguous, re-triggers, accepted, timeouts,
 + * gapmax (longest trigger -> first poll, us, without bit 0).
 + */
@@ -60,7 +61,7 @@ index 94abba7..34332ac 100644
  static bool
  rh_free(unsigned t)
  {
-@@ -366,31 +417,116 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+@@ -366,31 +418,116 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
  	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
  		return EIO;
  	}
@@ -120,7 +121,7 @@ index 94abba7..34332ac 100644
 +		} else {
 +			rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
 +			t0 = mach_absolute_time();
-+			if (rh_tcstest && !retrig) {    /* 1277 test: the preemption window on purpose */
++			if (rh_tcstest && !retrig && (address >> 16) == RH_BCM) {  /* 1277 test: the window, BCMs only */
 +				delay(rh_tcstest > 5000u ? 5000u : rh_tcstest);
 +			}
 +		}
