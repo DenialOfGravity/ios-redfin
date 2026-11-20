@@ -13,6 +13,7 @@ int vmmu_want(void);				/* VENUSCTL_VMMU set (non-zero) */
 int vmmu_attach(int cb, uint64_t l1);		/* 0 = on: buffers come from vmmu_alloc from now on */
 int vmmu_active(void);
 uint32_t vmmu_alloc(uint32_t size, const char *what);	/* zeroed, cleaned; IOVA or 0 */
+uint32_t vmmu_alloc_at(uint32_t size, const char *what, uint32_t iova);	/* the same at a fixed IOVA */
 /* an IOSurface by id (no mapping in this process needed); IOVA or 0; info: width, height, bytesPerRow, format */
 uint32_t vmmu_map_surface(uint32_t id, uint32_t *len, uint32_t info[4]);
 uint32_t vmmu_map_user(void *p, size_t len, const char *what);	/* any page-aligned memory of ours */

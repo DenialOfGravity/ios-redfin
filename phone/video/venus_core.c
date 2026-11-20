@@ -3123,8 +3123,20 @@ static int alloc_outputs(int count)
 	if (set_prop(P_BUF_COUNT, dc.split ? B_OUTPUT2 : B_OUTPUT, (uint32_t)n, (uint32_t)n, 3, "output count"))
 		return -1;
 	dc.nopb = 0;
+	/* venus-iommu: VENUSCTL_DEC_SURF=1 (with VENUSCTL_VMMU=1): every picture buffer is an NV12 IOSurface in the
+	 * firmware's layout (stride, CbCr at stride * scanlines) mapped by id: decoded pictures land in surfaces
+	 * CoreVideo/CoreAnimation can take as they are (zero-copy output) */
+	int dsurf = vmmu_active() && getenv("VENUSCTL_DEC_SURF") && atoi(getenv("VENUSCTL_DEC_SURF"));
 	for (int i = 0; i < n; i++) {
-		uint32_t pa = balloc(sz, "output");
+		uint32_t pa, sid = 0;
+		void *sref = NULL;
+		if (dsurf) {
+			pa = vmmu_new_surface((uint32_t)dc.w, (uint32_t)dc.h, dc.ystride, dc.yscan, sz, &sid, &sref);
+			if (pa && i == 0)
+				printf("venus: output buffers = IOSurfaces (%d, first id %u at IOVA %#x, %ux%u stride %u scanlines %u)"
+				       "\n", n, sid, pa, dc.w, dc.h, dc.ystride, dc.yscan);
+		} else
+			pa = balloc(sz, "output");
 		if (!pa)
 			return -1;
 		dc.opb[dc.nopb++] = (struct vbuf){ pa, sz, 0 };
@@ -3279,6 +3291,18 @@ static int dec_close(int started)
 	return bad;
 }
 
+/* venus-iommu CVP test (VENUSCTL_NP_SMR=1): the extra non-pixel SMR, released when this process exits */
+static struct smmu_saved np_saved;
+static int np_on;
+static void np_release(void)
+{
+	if (!np_on)
+		return;
+	smmu_last = np_saved;
+	smmu_release("venus non-pixel");
+	np_on = 0;
+}
+
 /* 4a: decode's session in steps. prepare: SYS_INIT/debug config (sys_up), buffer window, layout from the SPS */
 int vdec_prepare(uint32_t debug, uint64_t bufphys, uint64_t mb, int want, const struct h264_sps *sps, int hevc)
 {
@@ -3307,6 +3331,19 @@ int vdec_prepare(uint32_t debug, uint64_t bufphys, uint64_t mb, int want, const 
 			printf("venus: refused: VENUSCTL_VMMU=1 but /dev/vmmu could not attach to the window bank\n");
 			return 1;
 		}
+	}
+	if (vmmu_active() && getenv("VENUSCTL_NP_SMR") && atoi(getenv("VENUSCTL_NP_SMR")) && !np_on) {
+		/* venus-iommu CVP test: stock's venus_sec_non_pixel streams (0x1304/0xe0) into the same bank */
+		int k = 0;
+		for (int i = 0; i < v.nsmr; i++)
+			if (v.sid[i] == 0x1360)
+				k = i;
+		if (smmu_add_smr("venus non-pixel", 0x1304, 0xe0, v.smr[k].cb, &v.smr[k], &np_saved)) {
+			printf("venus: refused: VENUSCTL_NP_SMR=1: no SMR for 0x1304/0xe0\n");
+			return 1;
+		}
+		np_on = 1;
+		atexit(np_release);
 	}
 	/* the buffer window: right after the queue block, 1 MB aligned, inside the free gap (range_ok) */
 	uint64_t base = bufphys ? bufphys : (v.qkind == 2 ? (v.q + QSHARED + SFR_SIZE + 0xfffff) & ~0xfffffull : 0);

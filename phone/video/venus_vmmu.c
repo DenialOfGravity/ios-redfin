@@ -108,9 +108,11 @@ static int find(uint64_t pa, size_t len)
 	return -1;
 }
 
+static uint64_t fixed_iova;	/* vmmu_alloc_at: the next map goes there */
 static uint32_t map(uint64_t addr, uint64_t len, uint32_t surface, uint32_t *plen, uint32_t info[4])
 {
-	struct vmmu_map_a m = { .addr = addr, .len = len, .surface = surface };
+	struct vmmu_map_a m = { .addr = addr, .len = len, .surface = surface, .iova = fixed_iova };
+	fixed_iova = 0;
 	if (fd < 0 || ioctl(fd, VMMU_MAP, &m)) {
 		printf("vmmu: map %s %#llx+%#llx: %s\n", surface ? "surface" : "memory", surface ? surface :
 		       (unsigned long long)addr, (unsigned long long)len, strerror(errno));
@@ -152,6 +154,17 @@ uint32_t vmmu_alloc(uint32_t size, const char *what)
 	if (getenv("VENUSCTL_VMMU_LOG"))
 		printf("vmmu: %s %#x bytes at IOVA %#x\n", what, size, iova);
 	return iova;
+}
+
+/* the same at a fixed IOVA (e.g. the CP non-pixel range below 0x25800000, as stock's encoder persist buffer) */
+uint32_t vmmu_alloc_at(uint32_t size, const char *what, uint32_t iova)
+{
+	fixed_iova = iova;
+	uint32_t r = vmmu_alloc(size, what);
+	fixed_iova = 0;
+	if (r)
+		printf("vmmu: %s %#x bytes at fixed IOVA %#x\n", what, size, r);
+	return r;
 }
 
 uint32_t vmmu_map_user(void *p, size_t len, const char *what)
@@ -323,6 +336,9 @@ uint32_t vmmu_new_surface(uint32_t w, uint32_t h, uint32_t stride, uint32_t ysca
 		CFRelease(s);
 		return 0;
 	}
+	/* the kernel zeroed the surface through a cached mapping at create time: those dirty lines must reach memory
+	 * now, or an eviction later lands on what Venus wrote (seen: 720p decode into fresh surfaces, md5 off) */
+	vmmu_sync(iova, len, 2);
 	IOSurfaceLock(s, 0, NULL);
 	set_cpu(iova, IOSurfaceGetBaseAddress(s), (void *)s);
 	*id = IOSurfaceGetID(s);

@@ -394,7 +394,12 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 		if (r && r[1] && !cnt && r[3])
 			cnt = r[3];
 		for (uint32_t i = 0; r && r[1] && i < cnt && dc.nintl < 16; i++) {
-			uint32_t pa = balloc(r[1], bname(type));
+			uint32_t pa;
+			if (vmmu_active() && !strcmp(bname(type), "persist") && getenv("VENUSCTL_NP_PERSIST") &&
+			    atoi(getenv("VENUSCTL_NP_PERSIST")))	/* venus-iommu CVP test: as stock, in the non-pixel range */
+				pa = vmmu_alloc_at(r[1], "persist (non-pixel IOVA)", 0x25800000u - align_up(r[1], 0x10000) * (i + 1));
+			else
+				pa = balloc(r[1], bname(type));
 			if (!pa || buf_cmd(type, pa, r[1], 0))
 				goto close;
 			dc.intl[dc.nintl] = (struct vbuf){ pa, r[1], 1 };
