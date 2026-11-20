@@ -42,6 +42,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "venus_proto.h"
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"	/* CVBufferGetAttachment: iOS 16.7 has it */
 
 #define LOG_PATH	"/var/local/vtvenc.log"
 #define LOG_MAX		(1 << 20)
