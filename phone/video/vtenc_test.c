@@ -5,7 +5,7 @@
  * usage: vtenc_test [-c avc1|hvc1] [-s WxH] [-n FRAMES] [-f FPS] [-b BITRATE] [-o OUT] [-i IN.nv12 (tight NV12 WxH)]
  *                   [-p pool|own|venus] [-r 0|1 (real time pacing at FPS, default 1)] [-e ENCODER-ID] [-k KEYSECS]
  *                   [-N (don't register vtvenc)] [-L DYLIB] [-V (register VCPHEVC's software encoder first, as
- *                   mediaserverd does)]
+ *                   mediaserverd does)] [-R (let VideoToolbox run the encoder remotely, in mediaserverd)]
  *   -p pool: buffers from the session's pixel buffer pool (default); own: CVPixelBufferCreate with IOSurface (any
  *      layout CoreVideo picks); venus: own buffers in Venus's NV12 layout (stride 128, rows 32: zero-copy in venusd).
  * Prints the encoder VideoToolbox took, ms per frame, fps, sync samples, bytes, CPU of this process.
@@ -194,11 +194,11 @@ int main(int argc, char **argv)
 {
 	const char *codec = "avc1", *outp = NULL, *inp = NULL, *pool_mode = "pool", *enc_id = NULL,
 		   *dylib = "/var/local/lib/vtvenc.dylib";
-	int w = 1920, h = 1080, nf = 300, rt = 1, reg = 1, vcp = 0;
+	int w = 1920, h = 1080, nf = 300, rt = 1, reg = 1, vcp = 0, local = 1;
 	double fps = 30, br = 15300000, keysecs = 1;
 	int o;
 	setvbuf(stdout, NULL, _IONBF, 0);
-	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:V")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:VR")) != -1) {
 		switch (o) {
 		case 'c': codec = optarg; break;
 		case 's': sscanf(optarg, "%dx%d", &w, &h); break;
@@ -214,6 +214,7 @@ int main(int argc, char **argv)
 		case 'N': reg = 0; break;
 		case 'L': dylib = optarg; break;
 		case 'V': vcp = 1; break;
+		case 'R': local = 0; break;
 		default: fprintf(stderr, "usage: see the source header\n"); return 2;
 		}
 	}
@@ -270,8 +271,25 @@ int main(int argc, char **argv)
 	}
 	VTCompressionSessionRef s = NULL;
 	double t0 = now();
-	OSStatus st = VTCompressionSessionCreate(NULL, w, h, hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, spec, NULL,
-						 NULL, cb, NULL, &s);
+	/* VideoToolbox runs encoders in mediaserverd (VTCompressionSessionRemote) unless the process is that server or
+	 * the session is created with kVTCompressionSessionOption_AllowClientProcessEncode (iOS 16.7 VT,
+	 * VTCompressionSessionCreateWithOptions): our encoder is registered in this process, so encode here */
+	typedef OSStatus (*cwo_t)(CFAllocatorRef, int32_t, int32_t, CMVideoCodecType, CFDictionaryRef, CFDictionaryRef,
+				  CFAllocatorRef, VTCompressionOutputCallback, void *, CFDictionaryRef, VTCompressionSessionRef *);
+	cwo_t cwo = (cwo_t)dlsym(RTLD_DEFAULT, "VTCompressionSessionCreateWithOptions");
+	CFStringRef *k_local = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTCompressionSessionOption_AllowClientProcessEncode");
+	CFDictionaryRef opts = NULL;
+	if (k_local && local) {
+		const void *ok[] = { *k_local }, *ov[] = { kCFBooleanTrue };
+		opts = CFDictionaryCreate(NULL, ok, ov, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	}
+	printf("vtenc_test: encoders %s\n", opts && cwo ? "in this process (AllowClientProcessEncode)" : "where VideoToolbox puts them");
+	OSStatus st = opts && cwo ? cwo(NULL, w, h, hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, spec, NULL, NULL, cb,
+				       NULL, opts, &s) :
+		VTCompressionSessionCreate(NULL, w, h, hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, spec, NULL,
+					   NULL, cb, NULL, &s);
+	if (opts)
+		CFRelease(opts);
 	CFRelease(spec);
 	printf("vtenc_test: VTCompressionSessionCreate %s %dx%d: %d (%.0f ms)\n", codec, w, h, (int)st, 1e3 * (now() - t0));
 	if (st || !s)
