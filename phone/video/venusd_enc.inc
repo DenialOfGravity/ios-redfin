@@ -102,7 +102,8 @@ static void do_enc_open(int i, const struct venusd_msg *m, const uint8_t *payloa
 	double fps = eo.fps_q16 ? eo.fps_q16 / 65536.0 : 30.0;
 	/* venus-cvp: VENUSD_HWRC=1 (default 0): the firmware's rate control at the client's bitrate (VBR, CBR with
 	 * flags bit 2), persist in the CP non-pixel bank; ENC_QP is then ignored (venc_set_qp) */
-	if (getenv("VENUSD_HWRC") && atoi(getenv("VENUSD_HWRC")) && eo.bitrate) {
+	if (((getenv("VENUSD_HWRC") && atoi(getenv("VENUSD_HWRC"))) || access("/var/local/venusd-hwrc", F_OK) == 0) &&
+	    eo.bitrate) {	/* the env, or the flag file present at this OPEN */
 		p.rc = (eo.flags & 4) ? 2 : 1;
 		p.bitrate = eo.bitrate;
 	}
