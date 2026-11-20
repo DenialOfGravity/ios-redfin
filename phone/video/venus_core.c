@@ -296,7 +296,11 @@ static int core_ok(void)
 		fake_hit = 1;
 		return 0;
 	}
-	int ok = ahb_on() && !(rd32(GCC_VIDEO_AXI) & CLK_OFF) && (vrd(GDSC_MVSC) & PWR_ON) && (vrd(GDSC_MVS0) & PWR_ON);
+	/* venus-hw VENUSCTL_LINUX: gcc_video_axi stays off (as under stock Linux) and mvs0 may be in HW control (collapsed
+	 * by the firmware between frames, powered on demand) */
+	int lx = getenv("VENUSCTL_LINUX") != NULL;
+	int ok = ahb_on() && (lx || !(rd32(GCC_VIDEO_AXI) & CLK_OFF)) && (vrd(GDSC_MVSC) & PWR_ON) &&
+		 ((vrd(GDSC_MVS0) & PWR_ON) || (lx && (vrd(GDSC_MVS0) & HW_CONTROL)));
 	for (unsigned i = 0; i < NBR && ok; i++)
 		if (!branches[i].cvp || cvp)
 			ok = !(vrd(branches[i].pa) & CLK_OFF);
@@ -365,6 +369,8 @@ static int intclr_on;	/* P0d: VENUSCTL_INTCLR=1 (watch): the interrupt clear reg
 static int allowed(uint32_t pa)
 {
 	if (pa == GCC_VIDEO_AHB || pa == GCC_VIDEO_AXI)
+		return 1;
+	if (pa == CORE + 0xe0010)	/* venus-hw: WRAPPER_INTR_MASK (intmask, VENUSCTL_LINUX) */
 		return 1;
 	/* stage 2 steps 4-6, each from its downstream line (defines above) */
 	if (pa == WRAP_CPU_CGCDIS || pa == WRAP_CPU_CLKCFG)	/* boot: clock_config_on_enable_vpu5 */
@@ -818,6 +824,12 @@ static void ahb_hwctl_restore(void)
 
 int power_on(void)
 {
+	/* venus-hw VENUSCTL_LINUX=1: the stock msm_vidc order seen in TWRP (logs/video-1120/twrp/coreinit-seq.txt):
+	 * cvp (mvs1) powered with its clocks, gcc_video_axi left off, WRAPPER_INTR_MASK unmasked before the PIL load;
+	 * boot hands mvs0 + mvs1 to HW after auth + mem protect */
+	int lx = getenv("VENUSCTL_LINUX") != NULL;
+	if (lx)
+		cvp = 1;
 	/* Linux order (msm_vidc venus_power_on: __vote_buses, then regulators, then clocks whose prepare votes the
 	 * videocc vdd_cx level): the BCMs first, then P0c (venus_rails.c, default off): VENUSCTL_RAILS raises cx.lvl
 	 * (redfin DT: the only video rail; raise only) before anything is clocked, VENUSCTL_TBUVOTE holds
@@ -832,7 +844,7 @@ int power_on(void)
 	ahb_hwctl_clear();
 	if (gcc_on(GCC_VIDEO_AHB, "gcc_video_ahb", 1))	/* BRANCH_HALT-style poll, as gcc_video_axi */
 		return power_off(), 1;
-	int axi_late = gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 0);	/* may need the video GDSCs to report on */
+	int axi_late = lx ? 0 : gcc_on(GCC_VIDEO_AXI, "gcc_video_axi", 0);	/* may need the video GDSCs to report on */
 
 	/* videocc-lito.c video_multipipe_fixup writes L 0x14 into the config for either efuse bit, but the RCG then sets
 	 * the PLL's rate itself (CLK_SET_RATE_PARENT): with VP fmax off the table still starts at 240 MHz = PLL 480 / 2,
@@ -871,6 +883,11 @@ int power_on(void)
 		return power_off(), 1;
 	}
 	printf("venus: WRAPPER_HW_VERSION %#x = %#010x\n", WRAP_HW_VERSION, rd32(WRAP_HW_VERSION));
+	if (lx) {
+		uint32_t m = rd32(CORE + 0xe0010);
+		wr(CORE + 0xe0010, m & ~0x14u, "WRAPPER_INTR_MASK unmask A2HWD|A2H (Linux, before the PIL load)");
+		printf("venus: linux: WRAPPER_INTR_MASK %#x -> %#x, cvp on, gcc_video_axi left off\n", m, rd32(CORE + 0xe0010));
+	}
 	return 0;
 }
 
@@ -1532,6 +1549,11 @@ int boot(const char *fw, int keep)
 			return boot_fail(&v);
 	}
 	smmu_snapshot("after mem protect");
+	if (getenv("VENUSCTL_LINUX")) {	/* __hand_off_regulators: vcodec and cvp to HW control */
+		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
+		printf("venus: linux: hand off mvs0 %#010x mvs1 %#010x to HW\n", vrd(GDSC_MVS0), vrd(GDSC_MVS1));
+	}
 	core_status("after auth");
 	if (keep) {
 		printf("venus: boot ok, kept (state %s): next venusctl init, or venusctl shutdown\n", STATE);
