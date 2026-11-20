@@ -1697,6 +1697,8 @@ static void print_pkt(unsigned q, int n)
 			printf("venus: [frame %d] fw [%#x]: %s\n", fr, pkt[2], s);
 		else
 			printf("venus: fw [%#x]: %s\n", pkt[2], s);
+		if (pm_stepping())	/* venus-hw: the firmware's own words survive a reset (fsynced) */
+			pm_step("fw [%#x]: %.300s", pkt[2], s);
 	}
 }
 
