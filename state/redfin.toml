@@ -334,13 +334,13 @@ note = "vmd disabled 2026-10-29 (user decision; revisit with telephony)"
 
 [[file]]
 path = "/System/Library/xpc/launchd.plist"
-source = "state/files/locd/launchd.plist-0dd2e571e8"
-sha256 = "0dd2e571e857a7fdb869d5b1368180953152ba1cc29f6253ae60c997dab5b22e"
+source = "state/files/venusd/launchd.plist-3a2bcd31c8"
+sha256 = "3a2bcd31c86fd428e3326c3f9d5b479ea5ee66b2838c96bb8898b585ea3a1303"
 mode = "644"
 owner = "0:0"
 restart = "reboot"
 hold = "Touch ID image only (with the ws-tid-i kernel + sweettouchid=1): the phone's 1bca5063 (org.iosonpixel jobs + com.apple.biometrickitd.mesa) + com.redfin.sweetfpcd. sweetearly (395dba3a's hold) is NOT in it: add it with tools/launchd-add-job.py when both are wanted"
-note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs, com.apple.biometrickitd.mesa (Touch ID, 2026-11-18) and com.redfin.sweetfpcd (phone/fpc, ws-fpcd-d), vmd moved out; made by tools/launchd-add-job.py from the phone copy (state/files/tid-i/launchd.plist-phone-1bca506365); 2026-11-19 + org.iosonpixel.sweetlocd (ws-gnss-k phone/locd job: runs while /var/local/loc.on exists; previous bfc34f770e); never in git"
+note = "Apple's launchd.plist (binary) + the org.iosonpixel jobs, com.apple.biometrickitd.mesa (Touch ID, 2026-11-18) and com.redfin.sweetfpcd (phone/fpc, ws-fpcd-d), vmd moved out; made by tools/launchd-add-job.py from the phone copy (state/files/tid-i/launchd.plist-phone-1bca506365); 2026-11-19 + org.iosonpixel.sweetlocd (ws-gnss-k phone/locd job: runs while /var/local/loc.on exists; previous bfc34f770e); never in git; 2026-11-20 + org.iosonpixel.venusd (phone/video/org.iosonpixel.venusd.plist via tools/launchd-add-job.py; only change vs 0dd2e571e8 = that one LaunchDaemons key; runs while /var/local/venus.on exists)"
 
 [[file]]
 path = "/var/local/bin/a2s"
@@ -674,13 +674,15 @@ sha = ""
 
 [[file]]
 path = "/var/local/bin/venusd"
-source = "builds/userland/redfin-int-42013d7b2d/venusd"
-sha256 = "4ad063ed0d87c6a421fd5fe089c768a79651941e8452a6cfa057d21139ba461c"
+source = "builds/userland/redfin-int-8008c6a77b/venusd"
+sha256 = "74fbca14f3955214555716fd85833aadb37148476652514a48055b061e733eea"
 mode = "755"
 owner = "0:0"
 target = "userland"
-ref = "ws-int-k12v"
-sha = "699fb28b94"
+ref = "redfin-int"
+sha = "8008c6a77b"
+restart = "venusd"
+note = "2026-11-20: ws-vt-venc merged (redfin-int 8008c6a): encode protocol v3 (ENC_OPEN/FRAME/DATA/QP, zero-copy IOSurface input) for vtvenc.dylib; started at boot by launchd job org.iosonpixel.venusd (needs /var/local/venus.on). Previous 4ad063ed (redfin-int 42013d7)"
 
 [[file]]
 path = "/var/local/bin/vtdecode"
@@ -845,6 +847,37 @@ ref = "ws-video-p0d"
 sha = "c33c8f6912"
 
 [[file]]
+path = "/var/local/lib/vtvenc.dylib"
+source = "builds/userland/redfin-int-8008c6a77b/vtvenc.dylib"
+sha256 = "8239e84b3734144cf8db837e728d66449c8f43ba7ff5e5a9a939002e96b4717f"
+mode = "644"
+owner = "0:0"
+target = "userland"
+ref = "redfin-int"
+sha = "8008c6a77b"
+restart = "mediaserverd"
+note = "2026-11-20: Venus hardware VideoToolbox encoder (ws-vt-venc), loaded into mediaserverd by RedwoodAudio (inject_media.c). Registers avc1 (rating 1000, hardware); hvc1 only with VTVENC_HEVC=1 in /var/local/vtvenc-env (code default 0 since d0e0946). Off: /var/local/vtvenc-off or no /var/local/venus.on"
+
+[[file]]
+path = "/var/local/bin/vtenc_test"
+source = "builds/userland/redfin-int-8008c6a77b/vtenc_test"
+sha256 = "16073deb4611f4e10c5bb9aab32848f1c4df7182abeec9d076a8cc865a0aecff"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "redfin-int"
+sha = "8008c6a77b"
+note = "VTCompressionSession test tool for vtvenc (-R = remote session through mediaserverd)"
+
+[[file]]
+path = "/var/local/venus.on"
+source = "state/files/venusd/venus.on"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+owner = "0:0"
+note = "2026-11-20: Venus video on: venusd runs (launchd org.iosonpixel.venusd PathState), vtvenc registers its encoders. Remove = video hardware off (software paths)"
+
+[[file]]
 path = "/var/local/testclip.h264"
 source = "builds/userland/ws-video-dec-2c5f672d34/testclip.h264"
 sha256 = "c5a131333fcad2825e2f1bd93fdcee06996c139e59123a391e958d5717266029"
@@ -915,15 +948,15 @@ files = { "AppIcon60x60@2x.png" = "bafb34036ef3e903128e7e839af6f71074a1befc211a4
 
 [[bundle]]
 path = "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
-source = "builds/userland/ws-cam-video-fd1dd9a522/RedwoodAudio.driver"
+source = "builds/userland/redfin-int-8008c6a77b/RedwoodAudio.driver"
 target = "userland"
-ref = "fd1dd9a522"
-sha = "fd1dd9a522"
-note = "2026-11-20: ws-cam-video fd1dd9a (merged into redfin-int 27c20b7; plug-in sources identical): video recording no longer stalls/traps mediaserverd: compressor on its own serial queue, drops frames while the software encoder is busy (camera-vid-nogate = old), bitrate cap 3 Mbit/s (camera-vid-bitrate), camera-vid-binned (back camera video from binned IFE mode 8, on), MaxIntegrationTime read as ms (camera-maxint-old = old). Interim until the Venus hardware encoder; remove the gate/binned if they get in the way of it (owner). Before: 2026-11-19 final: redfin-int 3f95250 (+ ws-cam-lines camera-dumpprev flag, off without /var/local/camera-dumpprev). Before: 2026-11-19 camera wrap-up: redfin-int c8d9295 (ws-cam-af tip: IFE preview/stills, ExposureBias 8.8, antiband, minfps, aesettle, AF timeout + afdone; flags in /var/local/camera-*). Info.plist and CodeResources unchanged since a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
+ref = "redfin-int"
+sha = "8008c6a77b"
+note = "2026-11-20 promote: redfin-int 8008c6a (ws-vt-venc): inject_media dlopens /var/local/lib/vtvenc.dylib in mediaserverd and registers the Venus encoder; while venusd answers: avc1 kept (no hvc1 rewrite), no drop gate, no bit-rate cap (camera-vid-gate / camera-vid-bitrate files bring them back); without venusd the old behaviour below. Before: ws-cam-video fd1dd9a (merged into redfin-int 27c20b7; plug-in sources identical): video recording no longer stalls/traps mediaserverd: compressor on its own serial queue, drops frames while the software encoder is busy (camera-vid-nogate = old), bitrate cap 3 Mbit/s (camera-vid-bitrate), camera-vid-binned (back camera video from binned IFE mode 8, on), MaxIntegrationTime read as ms (camera-maxint-old = old). Interim until the Venus hardware encoder; remove the gate/binned if they get in the way of it (owner). Before: 2026-11-19 final: redfin-int 3f95250 (+ ws-cam-lines camera-dumpprev flag, off without /var/local/camera-dumpprev). Before: 2026-11-19 camera wrap-up: redfin-int c8d9295 (ws-cam-af tip: IFE preview/stills, ExposureBias 8.8, antiband, minfps, aesettle, AF timeout + afdone; flags in /var/local/camera-*). Info.plist and CodeResources unchanged since a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
 restart = "mediaserverd"
 CFBundleIdentifier = "com.redwood.audio"
 CFBundleVersion = "1"
-files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "2d199a43311c56f5aca14ae45cada274bbe73670c5f688aa018c304a1b394964", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
+files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "f6765a945f3644194d554bfc48d1fd287711bb8e759d23627ea0acfb0a590bcb", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
 
 [[bundle]]
 path = "/System/Library/Extensions/SweetMetal2.bundle"
