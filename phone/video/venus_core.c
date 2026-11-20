@@ -1965,8 +1965,17 @@ static int wait_msg(uint32_t want, unsigned ms)
 		int n;
 		if (wdog_check("while polling"))
 			return -1;
-		while ((n = q_read(2)) > 0)
-			print_pkt(2, n);
+		/* test hook for (c): VENUSCTL_TEST_DBG_HOLD_MS=N drains the debug queue only every N ms (a slow host), so
+		 * a chatty firmware (--debug 0x3f) can fill its 800 KB and ask for the doorbell (tx_req) */
+		static double dbg_last;
+		static int dbg_hold = -1;
+		if (dbg_hold < 0)
+			dbg_hold = getenv("VENUSCTL_TEST_DBG_HOLD_MS") ? atoi(getenv("VENUSCTL_TEST_DBG_HOLD_MS")) : 0;
+		if (!dbg_hold || mono_ms() - dbg_last >= dbg_hold) {
+			dbg_last = mono_ms();
+			while ((n = q_read(2)) > 0)
+				print_pkt(2, n);
+		}
 		while ((n = q_read(1)) > 0) {
 			if (chatty(pkt[1]))
 				print_pkt(1, n);
