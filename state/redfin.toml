@@ -907,15 +907,15 @@ files = { "AppIcon60x60@2x.png" = "bafb34036ef3e903128e7e839af6f71074a1befc211a4
 
 [[bundle]]
 path = "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
-source = "builds/userland/3f952500334dfaaed21e3a24a55f28c265457dcd-3f95250033/RedwoodAudio.driver"
+source = "builds/userland/ws-cam-video-fd1dd9a522/RedwoodAudio.driver"
 target = "userland"
-ref = "3f952500334dfaaed21e3a24a55f28c265457dcd"
-sha = "3f95250033"
-note = "2026-11-19 final: redfin-int 3f95250 (+ ws-cam-lines camera-dumpprev flag, off without /var/local/camera-dumpprev). Before: 2026-11-19 camera wrap-up: redfin-int c8d9295 (ws-cam-af tip: IFE preview/stills, ExposureBias 8.8, antiband, minfps, aesettle, AF timeout + afdone; flags in /var/local/camera-*). Info.plist and CodeResources unchanged since a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
+ref = "fd1dd9a522"
+sha = "fd1dd9a522"
+note = "2026-11-20: ws-cam-video fd1dd9a (merged into redfin-int 27c20b7; plug-in sources identical): video recording no longer stalls/traps mediaserverd: compressor on its own serial queue, drops frames while the software encoder is busy (camera-vid-nogate = old), bitrate cap 3 Mbit/s (camera-vid-bitrate), camera-vid-binned (back camera video from binned IFE mode 8, on), MaxIntegrationTime read as ms (camera-maxint-old = old). Interim until the Venus hardware encoder; remove the gate/binned if they get in the way of it (owner). Before: 2026-11-19 final: redfin-int 3f95250 (+ ws-cam-lines camera-dumpprev flag, off without /var/local/camera-dumpprev). Before: 2026-11-19 camera wrap-up: redfin-int c8d9295 (ws-cam-af tip: IFE preview/stills, ExposureBias 8.8, antiband, minfps, aesettle, AF timeout + afdone; flags in /var/local/camera-*). Info.plist and CodeResources unchanged since a93b1bb; the 4th file on the phone, RedwoodAudio.pre-s4, is a backup copy kept INSIDE the bundle (retired)"
 restart = "mediaserverd"
 CFBundleIdentifier = "com.redwood.audio"
 CFBundleVersion = "1"
-files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "0daed5c70e8c5c798bcbdd41610ce714eb5d5a8d7c5d3e3dd5fb0ad5728196bb", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
+files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd", RedwoodAudio = "2d199a43311c56f5aca14ae45cada274bbe73670c5f688aa018c304a1b394964", "_CodeSignature/CodeResources" = "d2e2111153b1577826830721700db06230437bdd60d4373f633f81f227ab3155" }
 
 [[bundle]]
 path = "/System/Library/Extensions/SweetMetal2.bundle"
@@ -3921,6 +3921,12 @@ mode = "644"
 path = "/var/local/camera-antiband"
 source = "agent/stage/flags/antiband-50"
 sha256 = "1a6562590ef19d1045d06c4055742d38288e9e6dcd71ccde5cee80f1d5a774eb"
+mode = "644"
+
+[[file]]
+path = "/var/local/camera-vid-binned"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 mode = "644"
 
 [[file]]
