@@ -740,6 +740,15 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 
 static bool venus_encoder;              /* (ws-vt-venc; set by register_venus_encoder below) */
 
+/* ws-vt-venc: Venus's encoder registered AND venusd answering (its socket there): without venusd the encoder refuses
+ * (VideoToolbox then takes the next one: VCPHEVC for hvc1, and for avc1 its rtvc, which fails here), so the old
+ * behaviour (avc1 made hvc1, gate, cap) applies */
+static bool
+venus_up(void)
+{
+	return venus_encoder && access("/private/var/run/venusd.sock", F_OK) == 0;
+}
+
 extern id objc_retain(id object);
 extern void objc_release(id object);
 
@@ -787,7 +796,7 @@ vc_of(id node)
 	v->node = objc_retain(node);
 	/* ws-vt-venc: with Venus's encoder EncodeFrame returns at once: no gate unless /private/var/local/camera-vid-gate */
 	v->off = access("/private/var/local/camera-vid-nogate", F_OK) == 0 ||
-	    (venus_encoder && access("/private/var/local/camera-vid-gate", F_OK) != 0);
+	    (venus_up() && access("/private/var/local/camera-vid-gate", F_OK) != 0);
 	v->busy = false;
 	v->given = v->dropped = v->encoded = v->markers = 0;
 	v->first = v->since = mach_absolute_time();
@@ -1353,9 +1362,6 @@ register_venus_encoder(void)
 	reg = lib != NULL ? (int (*)(void))dlsym(lib, "VTVenusEncRegister") : NULL;
 	n = reg != NULL ? reg() : -1;
 	venus_encoder = n > 0;
-	if (venus_encoder) {
-		avc_encoder = true;
-	}
 	say("redwood: mediaserverd: Venus video encoder: %s (%d registered)\n", lib == NULL ? dlerror() : reg == NULL ?
 	    "no VTVenusEncRegister" : venus_encoder ? "registered for avc1/hvc1" : "not registered (venus.on? vtvenc-off?)", n);
 }
@@ -1449,7 +1455,7 @@ vc_bitrate_cap(void)
 	ssize_t n;
 
 	if (fd < 0) {
-		return venus_encoder ? 0 : 3000000;     /* ws-vt-venc: Venus keeps up: no cap unless the file asks */
+		return venus_up() ? 0 : 3000000;        /* ws-vt-venc: Venus keeps up: no cap unless the file asks */
 	}
 	n = read(fd, text, sizeof(text) - 1);
 	close(fd);
@@ -1490,7 +1496,7 @@ recording_video_settings(id self, SEL selector)
 	    CFGetTypeID(codec) != CFStringGetTypeID()) {
 		return settings;
 	}
-	bool to_hevc = !avc_encoder && CFEqual(codec, CFSTR("avc1"));
+	bool to_hevc = !avc_encoder && !venus_up() && CFEqual(codec, CFSTR("avc1"));
 	int64_t cap = vc_bitrate_cap(), asked = 0;
 	CFNumberRef rate = NULL;
 
