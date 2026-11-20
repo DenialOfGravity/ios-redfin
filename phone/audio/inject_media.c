@@ -721,31 +721,35 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 }
 
 /*
- * redfin (ws-cam-video, 2026-11-20): a recording's video compressor, given no more than its encoder can take.
- * The only HEVC encoder here is VCPHEVC's software one (register_hevc_encoder below), which takes 0.4 s a 1080p frame
- * on its own (vt_test encode) and 2-4 s with the camera running -- against the AVE's 33 ms on an iPhone. The capture
- * graph hands -[BWVideoCompressorNode renderSampleBuffer:forInput:] every frame (30 a second); VideoToolbox queues
- * them and then blocks the caller, which is the file coordinator's thread: its audio stopped too (AudioConverterNode
- * 0/s), the backlog grew without end (mediaserverd 680 % CPU, 85 C), the recording's stop never drained, and
- * -[BWGraph stop:] trapped after its 10 s wait when Camera was left (EXC_BREAKPOINT, CMCapture +0x89de0).
- * A real-time encoder that cannot keep up drops frames rather than queueing them. So a picture reaches the compressor
- * only when none of its pictures is still being encoded (VC_IN_FLIGHT) (counted at the compressor's output,
- * emit_sample_buffer); the others are dropped before it, as the camera drops frames it cannot read. Markers (sample
- * buffers with no picture) always go through. The video gets the frame rate the encoder can make (1-2 fps), the
- * audio and the stop work. A count that never comes back (an encoder that drops a frame itself) is let go after
- * VC_STUCK_MS. /private/var/local/camera-vid-nogate (looked for at each recording) turns this off.
+ * redfin (ws-cam-video, 2026-11-20): a recording's video compressor, given no more than its encoder can take, and never
+ * on the graph's thread. The only HEVC encoder here is VCPHEVC's software one (register_hevc_encoder below): 0.4 s a
+ * synthetic 1080p frame (vt_test encode), ~5 s a noisy one like the sensor's at gain 8x, 14 s for the first -- against
+ * the AVE's ~33 ms on an iPhone. And it encodes inside VTCompressionSessionEncodeFrame: -[BWVideoCompressorNode
+ * renderSampleBuffer:forInput:] blocked for seconds a frame on the thread that feeds the whole recording branch: the
+ * compressor got one picture every 4-5 s, the audio nothing (AudioConverterNode 0/s), the file coordinator's queue grew
+ * without end (mediaserverd 680 % CPU, 85 C), the stop never drained, and -[BWGraph stop:] trapped after its 10 s wait
+ * when Camera was left (EXC_BREAKPOINT, CMCapture +0x89de0).
+ * A hardware encoder takes a frame and comes back at once; one that cannot keep up drops frames. So here the compressor's
+ * render runs on a serial queue of its own (one per compressor node), the graph's call returns at once, and a picture
+ * that comes while the last one is still being encoded is dropped (as the camera drops frames it cannot read). Markers
+ * (sample buffers with no picture) and the end of data are queued in order behind it, never dropped. The video gets the
+ * frame rate the encoder can make; the audio, the file and the stop go on. /private/var/local/camera-vid-nogate (looked
+ * for at each new compressor) turns this off: every call straight through, on the graph's thread, as before.
  */
-#define VC_IN_FLIGHT    1
-#define VC_STUCK_MS     8000
+#define VC_NODES        4
 
-static IMP original_vc_render;
-static struct {
-	id              node;           /* (a key, not retained) */
-	bool            off;
-	unsigned        in_flight;
-	unsigned        given, dropped, encoded;
-	uint64_t        last_out, last_given, since;
-} vc;
+extern id objc_retain(id object);
+extern void objc_release(id object);
+
+static IMP original_vc_render, original_vc_end, original_vc_dropped;
+static struct vc {
+	id              node;           /* (retained while it has a queue) */
+	dispatch_queue_t queue;
+	bool            off, busy;
+	unsigned        given, dropped, encoded, markers;
+	uint64_t        first, since, began;
+	double          ms_sum, ms_max;
+} vcs[VC_NODES];
 static pthread_mutex_t vc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static double
@@ -759,81 +763,169 @@ vc_ms(uint64_t ticks)
 	return (double)ticks * tb.numer / tb.denom / 1e6;
 }
 
-/* a new recording's compressor (or the first): counts from zero, the flag looked at again */
-static void
-vc_new_node(id node, uint64_t now)
+/* (under vc_lock) the node's slot: a new compressor takes a free one, or the oldest */
+static struct vc *
+vc_of(id node)
 {
-	if (vc.node != nil && (vc.given || vc.dropped)) {
-		say("redwood: mediaserverd: video compressor: the last one had %u pictures given, %u encoded, %u dropped\n", vc.given,
-		    vc.encoded, vc.dropped);
+	static unsigned next;
+	struct vc *v;
+
+	for (int i = 0; i < VC_NODES; i++) {
+		if (vcs[i].node == node) {
+			return &vcs[i];
+		}
 	}
-	vc.node = node;
-	vc.off = access("/private/var/local/camera-vid-nogate", F_OK) == 0;
-	vc.in_flight = vc.given = vc.dropped = vc.encoded = 0;
-	vc.last_out = vc.last_given = vc.since = now;
-	say("redwood: mediaserverd: video compressor %p: %s\n", (void *)node, vc.off ? "every picture given (camera-vid-nogate)" :
-	    "given one picture at a time, the others dropped before it (camera-vid-nogate turns this off)");
+	v = &vcs[next++ % VC_NODES];
+	if (v->node != nil) {
+		say("redwood: mediaserverd: video compressor %p: done with %u pictures given, %u encoded, %u dropped\n", (void *)v->node,
+		    v->given, v->encoded, v->dropped);
+		/* (its queue is kept: work still on it holds the node it was queued for) */
+		objc_release(v->node);
+	}
+	v->node = objc_retain(node);
+	v->off = access("/private/var/local/camera-vid-nogate", F_OK) == 0;
+	v->busy = false;
+	v->given = v->dropped = v->encoded = v->markers = 0;
+	v->first = v->since = mach_absolute_time();
+	v->ms_sum = v->ms_max = 0;
+	if (v->queue == NULL) {
+		v->queue = dispatch_queue_create("redwood.video-compressor", DISPATCH_QUEUE_SERIAL);
+	}
+	say("redwood: mediaserverd: video compressor %p: %s\n", (void *)node, v->off ? "every picture given on the graph's thread "
+	    "(camera-vid-nogate)" : "encodes on a queue of its own, one picture at a time; the others dropped (camera-vid-nogate: off)");
+	return v;
+}
+
+struct vc_job {
+	struct vc       *v;
+	int             kind;           /* 0 render (sample buffer), 1 the end of data, 2 a dropped sample (object) */
+	id              node, input, object;
+	SEL             selector;
+	CMSampleBufferRef sample_buffer;
+	bool            picture;
+};
+
+static void
+vc_run(void *context)
+{
+	struct vc_job *j = context;
+	uint64_t t0 = mach_absolute_time();
+
+	if (j->kind == 0) {
+		((void (*)(id, SEL, CMSampleBufferRef, id))original_vc_render)(j->node, j->selector, j->sample_buffer, j->input);
+		CFRelease(j->sample_buffer);
+	} else if (j->kind == 1) {
+		((void (*)(id, SEL, id))original_vc_end)(j->node, j->selector, j->input);
+		say("redwood: mediaserverd: video compressor %p: the end of data passed on (%u pictures given, %u encoded, %u dropped)\n",
+		    (void *)j->node, j->v->given, j->v->encoded, j->v->dropped);
+	} else {
+		((void (*)(id, SEL, id, id))original_vc_dropped)(j->node, j->selector, j->object, j->input);
+		objc_release(j->object);
+	}
+	if (j->picture) {
+		double ms = vc_ms(mach_absolute_time() - t0);
+
+		pthread_mutex_lock(&vc_lock);
+		if (j->v->node == j->node) {
+			j->v->busy = false;
+			j->v->ms_sum += ms;
+			j->v->ms_max = ms > j->v->ms_max ? ms : j->v->ms_max;
+			if (j->v->encoded++ == 0) {
+				say("redwood: mediaserverd: video compressor: the first picture took %.0f ms\n", ms);
+			}
+		}
+		pthread_mutex_unlock(&vc_lock);
+	}
+	objc_release(j->input);
+	objc_release(j->node);
+	free(j);
+}
+
+/* (under vc_lock) a job for the node's queue */
+static void
+vc_queue(struct vc *v, int kind, id node, SEL selector, CMSampleBufferRef sample_buffer, id object, id input, bool picture)
+{
+	struct vc_job *j = calloc(1, sizeof(*j));
+
+	if (j == NULL) {
+		return;
+	}
+	j->v = v;
+	j->kind = kind;
+	j->node = objc_retain(node);
+	j->input = input != nil ? objc_retain(input) : nil;
+	j->object = object != nil ? objc_retain(object) : nil;
+	j->selector = selector;
+	j->sample_buffer = sample_buffer != NULL ? (CMSampleBufferRef)CFRetain(sample_buffer) : NULL;
+	j->picture = picture;
+	dispatch_async_f(v->queue, j, vc_run);
 }
 
 static void
 vc_render(id self, SEL selector, CMSampleBufferRef sample_buffer, id input)
 {
-	uint64_t now = mach_absolute_time();
 	bool picture = sample_buffer != NULL && CMSampleBufferGetImageBuffer(sample_buffer) != NULL;
-	bool drop = false;
+	struct vc *v;
 
 	pthread_mutex_lock(&vc_lock);
-	if (vc.node != self) {
-		vc_new_node(self, now);
+	v = vc_of(self);
+	if (v->off || sample_buffer == NULL) {
+		pthread_mutex_unlock(&vc_lock);
+		((void (*)(id, SEL, CMSampleBufferRef, id))original_vc_render)(self, selector, sample_buffer, input);
+		return;
 	}
-	if (picture && !vc.off) {
-		if (vc.in_flight >= VC_IN_FLIGHT && vc_ms(now - vc.last_out) > VC_STUCK_MS && vc_ms(now - vc.last_given) > VC_STUCK_MS) {
-			say("redwood: mediaserverd: video compressor: nothing out for %.0f ms with %u in flight: the count let go\n",
-			    vc_ms(now - vc.last_out), vc.in_flight);
-			vc.in_flight = 0;
-		}
-		if (vc.in_flight >= VC_IN_FLIGHT) {
-			drop = true;
-			vc.dropped++;
+	if (vc_ms(mach_absolute_time() - v->since) >= 5000) {
+		say("redwood: mediaserverd: video compressor: %u given, %u encoded (avg %.0f ms, max %.0f), %u dropped, %u markers\n",
+		    v->given, v->encoded, v->encoded ? v->ms_sum / v->encoded : 0, v->ms_max, v->dropped, v->markers);
+		v->since = mach_absolute_time();
+	}
+	if (picture && v->busy) {
+		v->dropped++;           /* (the encoder still has the last one) */
+	} else {
+		if (picture) {
+			v->busy = true;
+			v->given++;
 		} else {
-			vc.in_flight++;
-			vc.given++;
-			vc.last_given = now;
+			v->markers++;
 		}
-		if (vc_ms(now - vc.since) >= 5000) {
-			say("redwood: mediaserverd: video compressor: %u given, %u encoded, %u dropped so far (%u in flight)\n", vc.given,
-			    vc.encoded, vc.dropped, vc.in_flight);
-			vc.since = now;
-		}
+		vc_queue(v, 0, self, selector, sample_buffer, nil, input, picture);
 	}
 	pthread_mutex_unlock(&vc_lock);
-	if (drop) {
-		return;
-	}
-	((void (*)(id, SEL, CMSampleBufferRef, id))original_vc_render)(self, selector, sample_buffer, input);
 }
 
-/* the compressor's output: an encoded picture is one fewer in flight */
+/* -[BWVideoCompressorNode didReachEndOfDataForInput:]: behind what is queued */
 static void
-vc_emitted(id output, CMSampleBufferRef sample_buffer)
+vc_end(id self, SEL selector, id input)
 {
-	id node;
+	struct vc *v;
 
-	if (original_vc_render == NULL || vc.node == nil || (node = send_if(output, "node")) != vc.node) {
+	pthread_mutex_lock(&vc_lock);
+	v = vc_of(self);
+	if (v->off) {
+		pthread_mutex_unlock(&vc_lock);
+		((void (*)(id, SEL, id))original_vc_end)(self, selector, input);
 		return;
 	}
-	if (CMSampleBufferGetDataBuffer(sample_buffer) == NULL || CMSampleBufferGetNumSamples(sample_buffer) == 0) {
-		return;                 /* (a marker) */
-	}
+	say("redwood: mediaserverd: video compressor %p: the end of data, queued behind the picture being encoded%s\n", (void *)self,
+	    v->busy ? "" : " (none)");
+	vc_queue(v, 1, self, selector, NULL, nil, input, false);
+	pthread_mutex_unlock(&vc_lock);
+}
+
+/* -[BWVideoCompressorNode handleDroppedSample:forInput:]: in order with the rest */
+static void
+vc_dropped(id self, SEL selector, id dropped, id input)
+{
+	struct vc *v;
+
 	pthread_mutex_lock(&vc_lock);
-	if (vc.encoded++ == 0) {
-		say("redwood: mediaserverd: video compressor: the first picture encoded, %.0f ms after the first given\n",
-		    vc_ms(mach_absolute_time() - vc.since));
+	v = vc_of(self);
+	if (v->off) {
+		pthread_mutex_unlock(&vc_lock);
+		((void (*)(id, SEL, id, id))original_vc_dropped)(self, selector, dropped, input);
+		return;
 	}
-	if (vc.in_flight > 0) {
-		vc.in_flight--;
-	}
-	vc.last_out = mach_absolute_time();
+	vc_queue(v, 2, self, selector, NULL, dropped, input, false);
 	pthread_mutex_unlock(&vc_lock);
 }
 
@@ -1000,7 +1092,6 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		return;
 	}
 	time_photo_encoder(self, sample_buffer);
-	vc_emitted(self, sample_buffer);
 	preview_format(self, sample_buffer);
 	graph_pace_sample(self);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
@@ -1309,6 +1400,28 @@ search_avc_encoder(void *context)
  */
 static IMP original_video_settings;
 
+/*
+ * redfin (ws-cam-video): the software HEVC encoder's time a frame follows the bit rate it is asked for: a noisy 1080p frame
+ * (the sensor's at gain 8x) took 5.3 s at Camera.app's 15.3 Mbit/s and 0.8 s at 3 Mbit/s (vt_test encode, VT_NOISE).
+ * A recording's AverageBitRate is capped: /private/var/local/camera-vid-bitrate holds the cap in bits a second (read at
+ * each recording); no file: 3000000; 0: no cap.
+ */
+static int64_t
+vc_bitrate_cap(void)
+{
+	char text[32] = "";
+	int fd = open("/private/var/local/camera-vid-bitrate", O_RDONLY);
+	ssize_t n;
+
+	if (fd < 0) {
+		return 3000000;
+	}
+	n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	text[n > 0 ? n : 0] = 0;
+	return text[0] >= '0' && text[0] <= '9' ? strtoll(text, NULL, 10) : 3000000;
+}
+
 static id
 recording_video_settings(id self, SEL selector)
 {
@@ -1316,7 +1429,7 @@ recording_video_settings(id self, SEL selector)
 	CFTypeRef codec, properties;
 	CFMutableDictionaryRef changed;
 	static bool said;
-	static id said_for;
+	static id said_for, said_for_cap;
 
 	/* (redfin ws-cam-video) what a recording asks of the encoder, said once for each settings object */
 	if (settings != nil && settings != said_for) {
@@ -1337,25 +1450,52 @@ recording_video_settings(id self, SEL selector)
 		}
 	}
 
-	if (avc_encoder || settings == nil || CFGetTypeID((CFTypeRef)settings) != CFDictionaryGetTypeID() ||
+	if (settings == nil || CFGetTypeID((CFTypeRef)settings) != CFDictionaryGetTypeID() ||
 	    (codec = CFDictionaryGetValue((CFDictionaryRef)settings, CFSTR("AVVideoCodecKey"))) == NULL ||
-	    CFGetTypeID(codec) != CFStringGetTypeID() || !CFEqual(codec, CFSTR("avc1"))) {
+	    CFGetTypeID(codec) != CFStringGetTypeID()) {
+		return settings;
+	}
+	bool to_hevc = !avc_encoder && CFEqual(codec, CFSTR("avc1"));
+	int64_t cap = vc_bitrate_cap(), asked = 0;
+	CFNumberRef rate = NULL;
+
+	properties = CFDictionaryGetValue((CFDictionaryRef)settings, CFSTR("AVVideoCompressionPropertiesKey"));
+	if (properties != NULL && CFGetTypeID(properties) == CFDictionaryGetTypeID() &&
+	    (rate = CFDictionaryGetValue(properties, CFSTR("AverageBitRate"))) != NULL && CFGetTypeID(rate) == CFNumberGetTypeID()) {
+		CFNumberGetValue(rate, kCFNumberSInt64Type, &asked);
+	}
+	bool capped = (to_hevc || CFEqual(codec, CFSTR("hvc1"))) && cap > 0 && asked > cap;
+	if (!to_hevc && !capped) {
 		return settings;
 	}
 	changed = CFDictionaryCreateMutableCopy(NULL, 0, (CFDictionaryRef)settings);
-	CFDictionarySetValue(changed, CFSTR("AVVideoCodecKey"), CFSTR("hvc1"));
-	properties = CFDictionaryGetValue(changed, CFSTR("AVVideoCompressionPropertiesKey"));
+	if (to_hevc) {
+		CFDictionarySetValue(changed, CFSTR("AVVideoCodecKey"), CFSTR("hvc1"));
+	}
 	if (properties != NULL && CFGetTypeID(properties) == CFDictionaryGetTypeID()) {
 		CFMutableDictionaryRef p = CFDictionaryCreateMutableCopy(NULL, 0, properties);
 
-		CFDictionaryRemoveValue(p, CFSTR("ProfileLevel"));
-		CFDictionaryRemoveValue(p, CFSTR("H264EntropyMode"));
+		if (to_hevc) {
+			CFDictionaryRemoveValue(p, CFSTR("ProfileLevel"));
+			CFDictionaryRemoveValue(p, CFSTR("H264EntropyMode"));
+		}
+		if (capped) {
+			CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt64Type, &cap);
+
+			CFDictionarySetValue(p, CFSTR("AverageBitRate"), n);
+			CFRelease(n);
+		}
 		CFDictionarySetValue(changed, CFSTR("AVVideoCompressionPropertiesKey"), p);
 		CFRelease(p);
 	}
-	if (!said) {
+	if (to_hevc && !said) {
 		said = true;
 		say("redwood: mediaserverd: a recording asked for H.264, for which there is no encoder here: made HEVC\n");
+	}
+	if (capped && said_for_cap != settings) {
+		said_for_cap = settings;
+		say("redwood: mediaserverd: a recording's bit rate %lld capped at %lld for the software encoder (camera-vid-bitrate)\n",
+		    (long long)asked, (long long)cap);
 	}
 	return (id)CFAutorelease(changed);
 }
@@ -1560,6 +1700,8 @@ static struct replacement {
 	  true },
 	/* (redfin ws-cam-video) the software encoder's compressor given what it can take (camera-vid-nogate: all) */
 	{ "BWVideoCompressorNode", "renderSampleBuffer:forInput:", 0, (IMP)vc_render, &original_vc_render, true, false },
+	{ "BWVideoCompressorNode", "didReachEndOfDataForInput:", 0, (IMP)vc_end, &original_vc_end, true, false },
+	{ "BWVideoCompressorNode", "handleDroppedSample:forInput:", 0, (IMP)vc_dropped, &original_vc_dropped, true, false },
 	/* (redfin ws-cam-noml) /private/var/local/camera-noml = 1: the graph's inference and Live Photo extras off */
 	{ "FigCaptureSourceConfiguration", "smartCameraEnabled", 0, (IMP)noml_smart_camera, &original_noml_smart_camera, true, false },
 	{ "FigMetadataObjectCaptureConnectionConfiguration", "faceTrackingPlusEnabled", 0, (IMP)noml_face_tracking_plus,
