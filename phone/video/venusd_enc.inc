@@ -24,6 +24,7 @@ static double enc_copy_ms, enc_copy_max;
 static int enc_zc_on = 1, enc_log;
 static unsigned enc_qp_n;
 static uint32_t enc_w, enc_h, enc_qi, enc_qp;
+static int enc_rc;	/* ws-vtvenc-rc: this session's firmware rate control: 0 off, 1 VBR, 2 CBR */
 
 static double enc_ms(void)
 {
@@ -63,6 +64,7 @@ static void enc_reply_open(int i, int32_t status)
 		venc_layout(&st, &ys, &uvo, &sz);
 		r.stride = st, r.scanlines = ys, r.crop_x = uvo, r.filled = sz, r.width = enc_w, r.height = enc_h;
 		r.fbd_w = enc_qi, r.fbd_h = enc_qp;	/* the starting constant QP (I, P) */
+		r.flags = enc_rc ? VD_ENC_RC_FW | VD_ENC_RC_RATE | (enc_rc == 2 ? VD_ENC_RC_CBR : 0u) : 0u;	/* ws-vtvenc-rc */
 	}
 	send_msg(i, &r, NULL);
 }
@@ -118,7 +120,7 @@ static void do_enc_open(int i, const struct venusd_msg *m, const uint8_t *payloa
 	}
 	if (getenv("VENUSD_ENC_SEQHDR"))
 		p.seqhdr = atoi(getenv("VENUSD_ENC_SEQHDR"));
-	enc_w = m->width, enc_h = m->height, enc_qi = p.qp_i, enc_qp = p.qp_p;
+	enc_w = m->width, enc_h = m->height, enc_qi = p.qp_i, enc_qp = p.qp_p, enc_rc = p.rc;
 	note("venusd: session %u: encoder opened (fd %d, %s %ux%u, %.2f fps, %u bit/s -> QP %u/%u, gop %d, profile %d level %d,"
 	     " seqhdr %d, colour %d/%d/%d full %d, zero-copy %s, rc %s)", nsess, cl[i].fd, sess_hevc ? "HEVC" : "H.264", m->width,
 	     m->height, fps, eo.bitrate, p.qp_i, p.qp_p, p.gop, p.profile, p.level, p.seqhdr, p.primaries, p.transfer,
@@ -389,6 +391,14 @@ static void enc_command(int i, const struct venusd_msg *m)
 			if (enc_log || enc_qp_n++ < 3)
 				note("venusd: session %u: QP now %u/%u (frame %u in)", nsess, m->crop_x,
 				     m->crop_y ? m->crop_y : m->crop_x + 2, sent);
+		}
+		return;
+	}
+	if (m->type == VD_ENC_RATE) {	/* ws-vtvenc-rc: the client's new target (firmware RC only) */
+		if (sess == S_RUN && m->filled) {
+			int r = venc_set_bitrate(m->filled);
+			note("venusd: session %u: target bit rate now %u bit/s (frame %u in)%s", nsess, m->filled, sent,
+			     r ? ": ignored, rate control off" : "");
 		}
 		return;
 	}

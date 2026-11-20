@@ -914,6 +914,19 @@ int venc_set_qp(uint32_t qi, uint32_t qpp)
 	return q_write(p) ? -1 : 0;
 }
 
+/* ws-vtvenc-rc: dynamic: a new target bit rate for the firmware's rate control (CONFIG_VENC_TARGET_BITRATE {bitrate,
+ * layer}, as at the open); -1 when the RC is off */
+int venc_set_bitrate(uint32_t bps)
+{
+	if (!vs.p.rc || !bps)
+		return -1;
+	uint32_t p[7] = { 28, S_SET_PROP, SESSION_ID, 1, VE_P_BITRATE, bps, 0xffu };
+	if (q_write(p))
+		return -1;
+	vs.p.bitrate = bps;
+	return 0;
+}
+
 uint32_t venc_fps_q16(void)
 {
 	return vs.p.fps_q16;
