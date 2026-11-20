@@ -895,6 +895,7 @@ struct stream {
 	bool            ae_locked, ae_manual, limit_ae_range, awb_locked, awb_manual;
 	float           ae_bias, ae_roi[4], ae_max_gain, manual_gain, wb_manual[3];
 	uint32_t        ae_max_exposure_us, manual_us;
+	double          ae_max_raw;     /* (ws-cam-video) MaxIntegrationTime as the graph set it, for its getter */
 	int             af_mode;        /* AF_MODE_*: what focus does once it has found the sharpest */
 	int32_t         manual_focus;   /* ManualFocusNow: where the lens is to go (0 infinity to 1023 macro), -1: nowhere */
 	volatile bool   has_focus;      /* the frames say where the lens is (a lens motor): HasAutoFocusPositionSensor */
@@ -958,7 +959,7 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	} else if (key_is(key, "FlashMode")) {
 		value = number_i(s->flash_mode);
 	} else if (key_is(key, "MaxIntegrationTime")) {
-		value = number_i(s->ae_max_exposure_us ? s->ae_max_exposure_us : 1000000 / 15);
+		value = s->ae_max_raw > 0 ? number_f(s->ae_max_raw) : number_i(s->ae_max_exposure_us ? s->ae_max_exposure_us : 1000000 / 15);
 	} else if (key_is(key, "AEMaxGain")) {
 		value = number_f(s->ae_max_gain > 0 ? s->ae_max_gain : 64);
 
@@ -1523,7 +1524,19 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		double us = 0;
 
 		number_of(value, &us);
-		s->ae_max_exposure_us = us <= 0 ? 0 : us < 10 ? (uint32_t)(us * 1e6) : (uint32_t)us;
+		/*
+		 * redfin (ws-cam-video): the graph sets 25.0 for the video formats -- milliseconds (a 30 fps frame is 33 ms) --, which
+		 * was taken as 25 us: the video formats' AE ended at exposure 0.0 ms, gain 8x, digital 5x, green 3 above black, and the
+		 * preview and the recordings were black. Below 10: seconds; below 1000: milliseconds; else microseconds.
+		 * /private/var/local/camera-maxint-old: the old reading (below 10 seconds, else microseconds).
+		 */
+		if (access("/private/var/local/camera-maxint-old", F_OK) == 0) {
+			s->ae_max_exposure_us = us <= 0 ? 0 : us < 10 ? (uint32_t)(us * 1e6) : (uint32_t)us;
+		} else {
+			s->ae_max_exposure_us = us <= 0 ? 0 : us < 10 ? (uint32_t)(us * 1e6) : us < 1000 ? (uint32_t)(us * 1e3) : (uint32_t)us;
+		}
+		s->ae_max_raw = us;
+		say("stream: MaxIntegrationTime %.3f taken as %u us", us, s->ae_max_exposure_us);
 		say_once("stream: set", key, value);
 		return 0;
 	}
