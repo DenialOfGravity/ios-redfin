@@ -81,6 +81,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include "pmem.h"
 #include "venus_core.h"
+#include "venus_rails.h"	/* rpmh-tcs: rails_rpmh_soft */
 #include "venus_hevc.h"
 #include "venus_proto.h"
 #include "venus_vmmu.h"
