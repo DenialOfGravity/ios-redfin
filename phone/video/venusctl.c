@@ -80,6 +80,32 @@
  * gcc_video_ahb boots enabled but hardware-gated (0x80000003: HW_CTL set, CLK_OFF reads 1 while idle; Linux
  * clk-branch.c skips the halt check in that mode). power on clears HW_CTL first so CLK_OFF can be polled;
  * VENUSCTL_KEEP_HWCTL=1 skips that (old behaviour).
+ * P0 (video-plan-2026-11-16, venus_rails.c; all default off):
+ *   venusctl rails          read only: cmd-db cx.lvl/mx.lvl/mmcx.lvl (lito has no mmcx) and their level tables, the
+ *                           apps DRV votes (kern.sweet_rpmh_votes, xnu 1131; TCS registers), the TBU vote, the
+ *                           rails state file, and what VENUSCTL_RAILS would do. Writes nothing.
+ *   VENUSCTL_RAILS=1|CORNER power on raises mx then cx to NOM (256) or CORNER first, raise only; power off puts the
+ *                           earlier vote back (never 0; unknown before = top level voted and left). /var/tmp/venusctl.rails
+ *   VENUSCTL_TBUVOTE=1      power on clears SW_COLLAPSE of the mnoc_sf_0_tbu hlos1 vote (GCC 0x17d054), waits PWR_ON;
+ *                           power off sets it again if it was set
+ *   watch SECS              without firmware (no STATE init) = power/bus only; a line at least every second with
+ *                           the uptime, cx/mx votes and the TBU state
+ * P0d (logs/research/video-reset-2026-11-16.md Q1/Q4; all default off, Linux = msm-4.19 techpack/video hfi_common.c):
+ *   VENUSCTL_PC=1           watch, once SYS_INIT is done: after VENUSCTL_PC_DELAY_MS (1500 = pwr_collapse_delay) as
+ *                           __prepare_pc_common: needs WFI + idle, sends HFI_CMD_SYS_PC_PREP (0x10002), waits up to 2 s
+ *                           for CTRL_STATUS PC_READY (bit 8) + WRAPPER_CPU_STATUS WFI (bit 0), logs both with times.
+ *                           No power off: clocks + GDSCs stay on (SW mode), no vote changes. Watch line: pc/pc_ready.
+ *   VENUSCTL_INTCLR=1       watch: INTR_STATUS != 0 -> CPU_CS_A2HSOFTINTCLR = 1, WRAPPER_INTR_CLEAR = status (as
+ *                           __core_clear_interrupt_common), then drain + decode the queues. INTR_MASK never written.
+ *   venusctl fwdump [ADDR]  read-only, on the boot after a reset, before any re-init: the HFI block at ADDR
+ *                           (0xa2600000): table still ours?, queue headers, SFR (+0x2fe000), dbgq ring strings,
+ *                           unread msgq packets, failure strings; the core only if its gate reads on
+ * ws-video-dec (logs/research/video-reset-2026-11-16.md): decode --clip FILE [--seconds S] [--loop] keeps an active
+ *   H.264/HEVC decode session fed for S s of wall clock (default 900), looping the clip if --loop, to test whether an
+ *   active session avoids the ~270 s idle PMIC reset. No YUV file, no per-frame log (NOCOPY + quiet); counts frames,
+ *   fps, SYS/SESSION errors; prints "survived S s, phone alive" (absent if a reset killed us). As insurance a SYS_PING
+ *   keepalive fires on any idle gap (VENUSCTL_PING_MS, default 1000 ms); VENUSCTL_INTCLR=1 also acks interrupts.
+ *   watch SECS --sysinit with VENUSCTL_PING_MS=1000 is a ping-only keepalive test (no decode). init --phys first.
  */
 #include <stdint.h>
 #include <unistd.h>
@@ -91,6 +117,7 @@
 #include <sys/stat.h>
 #include "pmem.h"
 #include "venus_core.h"
+#include "venus_rails.h"
 
 /* VENUSCTL_TS=1: every output line gets "[seconds since start] " (a pipe + reader thread), to place stalls in time; the
  * host can't, since ssh delivers the output in bursts (the 13 s first-use stall, video.md v4a1/vdboot) */
@@ -133,6 +160,8 @@ int main(int argc, char **argv)
 	int sysinit = 0;	/* redfin: watch --sysinit */
 	int no_shutdown = 0, keep = 0, frames = 5, hevc = -1;	/* 4e: -1 = from the stream */
 	uint64_t phys = 0, bufphys = 0;
+	const char *clip = NULL;	/* ws-video-dec: decode --clip FILE --seconds S --loop */
+	int seconds = 0, do_loop = 0;
 	const char *steplog = NULL;	/* redfin: --step [--step-file F] */
 	uint32_t debug = 0x18;	/* HFI_DEBUG_MSG_ERROR | FATAL (guess: msm_vidc_debug.c's default is not in our source copy) */
 	setvbuf(stdout, NULL, _IOLBF, 0);	/* a hang shows the last line */
@@ -166,6 +195,12 @@ int main(int argc, char **argv)
 			sysinit = 1;
 		else if (!strcmp(argv[i], "--dry"))
 			vc_stop_at = "ftb";
+		else if (!strcmp(argv[i], "--clip") && i + 1 < argc)
+			clip = argv[++i];
+		else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
+			seconds = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--loop"))
+			do_loop = 1;
 		else if (!strcmp(argv[i], "--hevc"))
 			hevc = 1;
 		else if (!strcmp(argv[i], "--h264"))
@@ -204,10 +239,14 @@ int main(int argc, char **argv)
 	stale_drop(AHB_STATE);
 	if (arg2 && strcmp(cmd, "memtest") && strcmp(cmd, "decode"))
 		goto usage;
+	if (!strcmp(cmd, "decode") && clip && !arg)
+		return decode_loop(debug, clip, seconds, do_loop, bufphys, hevc);
 	if (!strcmp(cmd, "decode") && arg && arg2 && !arg3 && frames > 0)
 		return decode(debug, arg, arg2, frames, bufphys, hevc);
 	if (!strcmp(cmd, "memtest") && arg && arg2 && arg3 && (!strcmp(arg3, "write") || !strcmp(arg3, "check")))
 		return memtest(strtoull(arg, NULL, 0), strtoull(arg2, NULL, 0), !strcmp(arg3, "write"));
+	if (!strcmp(cmd, "rails") && !arg)
+		return rails_report();
 	if (!strcmp(cmd, "probe") && !arg)
 		return probe();
 	if (!strcmp(cmd, "power") && arg && !strcmp(arg, "on"))
@@ -232,15 +271,23 @@ int main(int argc, char **argv)
 		return map_sid((uint32_t)strtoul(arg, NULL, 0));
 	if (!strcmp(cmd, "smmu") && !arg)
 		return smmu_cmd();
+	if (!strcmp(cmd, "fwdump"))
+		return fwdump(arg ? strtoull(arg, NULL, 0) : 0);
 usage:
-	fprintf(stderr, "usage: venusctl [-v] probe | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
+	fprintf(stderr, "usage: venusctl [-v] probe | rails (read-only) | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
 		"       | session [--debug MASK] | decode IN.h264|IN.h265 OUT.yuv [--frames N] [--bufphys ADDR] [--debug MASK]\n"
+		"       | decode --clip FILE [--seconds S] [--loop]  (ws-video-dec: active session S s, idle-reset test)\n"
 		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"
 		"       any command: [--step] [--step-file FILE]  (default /var/local/venus-step.log)\n"
 		"       | shutdown | smmu (read-only: SMRs for 0x1300-0x13ff, global faults) | map-sid SID (after boot --keep)\n"
-		"       | watch SECONDS [--sysinit] [--debug MASK] (after init: firmware/NoC/SMMU state every 200 ms)\n"
+		"       | watch SECONDS [--sysinit] [--debug MASK] (firmware/NoC/SMMU/GDSC state, a line a second; power-only without init)\n"
+		"       env (default off): VENUSCTL_RAILS=1|CORNER VENUSCTL_RAILS_UNKNOWN=1 VENUSCTL_TBUVOTE=1 (power on/off)\n"
 		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
-		"       | memtest ADDR SIZE write|check\n");
+		"       | memtest ADDR SIZE write|check\n"
+		"       | fwdump [ADDR] (read-only, after a reset: SFR, debug ring, queues of the HFI block, default 0xa2600000)\n"
+		"       P0d watch env (default off): VENUSCTL_PC=1 [VENUSCTL_PC_DELAY_MS=1500] VENUSCTL_INTCLR=1\n"
+		"       ws-video-dec: decode --clip env VENUSCTL_PING_MS (idle keepalive ms, default 1000) VENUSCTL_NOCOPY;\n"
+		"       watch --sysinit VENUSCTL_PING_MS=1000 = ping-only keepalive test\n");
 	return 2;
 }

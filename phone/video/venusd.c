@@ -52,6 +52,10 @@
  * vdstamp: every line of the log (venus_core's too) and of the console starts "[ssss.mmm] ": seconds since boot from
  * mach_absolute_time, the clock (and format) of the kernel's per-boot log lines, so they line up; the first line after
  * a minute without one, the start and each session open add "[wall YYYY-MM-DD HH:MM:SS] ". VENUSD_STAMP=0: no stamps.
+ * vdstall (video.md 2026-11-12 22:22, the page clock lag): a running session with inputs at the firmware (ETB, no EBD)
+ * and no picture for VENUSD_STALL_MS (500; since the last picture, or the decoder start) logs one line "no FBD for
+ * >N ms" (last ETB/EBD ages, credits queued; -1: none this session), then "FBD resumed after N ms" at the next picture
+ * (or "ended with the session"). Log and console. 0: no stall lines.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -122,6 +126,9 @@ static struct { uint32_t id; IOSurfaceRef s; unsigned long use; } vsurf[VSURF_MA
 static unsigned long vsurf_clock;
 static IOSurfaceRef placed_s;
 static uint32_t placed_id;
+static unsigned stall_ms = 500, stall_ebds;	/* vdstall: VENUSD_STALL_MS; the EBD count last seen */
+static double t_run, t_etb, t_ebd, stall_ref;	/* decoder start, last ETB, last EBD; the stall's last picture */
+static int stalled;
 
 /* vdcold: the warm-up stream, one 320x240 grey IDR (SPS, PPS, slice; ffmpeg color=gray, libx264 constrained baseline,
  * SEI removed; 320x240 is a size stage 3 decoded bit-exact) */
@@ -530,6 +537,9 @@ static void sess_log(const char *how)
 {
 	struct vdec_status st;
 	vdec_status(&st);
+	if (stalled)	/* vdstall */
+		note("venusd: session %u: no FBD stall ended with the session after %.0f ms", nsess, 1e3 * (mono() - stall_ref));
+	stalled = 0;
 	double span = t_last_frame > t_first ? t_last_frame - t_first : 0;
 	note("venusd: session %u %s: %u AUs in, %d frames, %.2f s from OPEN, first frame %.0f ms after it, %.1f fps"
 	     " (frame 0 -> %d), copy-out mean %.2f ms max %.2f ms, error %#x%s; credited %u, socket %u, handed back %u",
@@ -634,6 +644,7 @@ static void do_open(int i, const struct venusd_msg *m)
 		sess_hevc = m->codec == VD_CODEC_HEVC;
 		t_open = mono();
 		t_first = t_last_frame = 0;
+		t_run = t_etb = t_ebd = 0, stalled = 0;	/* vdstall */
 		cred_drop();	/* vdcredit */
 		n_placed = n_copied = n_returned = path_logged = 0;
 		wall_due = 0;	/* vdstamp: the wall clock on this line */
@@ -676,7 +687,10 @@ static int sess_start(const uint8_t *p, uint32_t len)
 	}
 	sess = S_RUN;
 	hfi = 1;
-	t_prog = mono();
+	t_prog = t_run = mono();	/* vdstall: t_run */
+	struct vdec_status st;
+	vdec_status(&st);
+	stall_ebds = st.ebds;
 	return 0;
 }
 
@@ -747,6 +761,7 @@ static void command(int i)
 			sess_fail(-EIO, m.seq);
 		} else {
 			sent++;
+			t_etb = mono();	/* vdstall */
 		}
 		return;
 	}
@@ -768,6 +783,24 @@ static void command(int i)
 	reply(i, VD_ERROR, -EINVAL, m.seq);
 }
 
+/* vdstall: inputs at the firmware and no picture for stall_ms: one line, and one when the next picture comes */
+static void stall_check(const struct vdec_status *st, double t)
+{
+	double ref = t_last_frame ? t_last_frame : t_run;
+	if (st->ebds != stall_ebds)
+		stall_ebds = st->ebds, t_ebd = t;
+	if (stalled && t_last_frame > stall_ref) {
+		note("venusd: session %u: FBD resumed after %.0f ms (frame %d)", nsess, 1e3 * (t_last_frame - stall_ref),
+		     st->frames - 1);
+		stalled = 0;
+	} else if (!stalled && stall_ms && st->in_fw && t - ref > stall_ms / 1e3) {
+		stalled = 1, stall_ref = ref;
+		note("venusd: no FBD for >%u ms: %d inputs queued, last ETB %.0f ms ago, last EBD %.0f ms ago, credits %u"
+		     " (session %u, %s, %d frames, %u AUs in)", stall_ms, st->in_fw, t_etb ? 1e3 * (t - t_etb) : -1.0,
+		     t_ebd ? 1e3 * (t - t_ebd) : -1.0, cred_n, nsess, sname[sess], st->frames, sent);
+	}
+}
+
 /* while a session runs: the queues, then what came of them */
 static void sess_poll(void)
 {
@@ -782,6 +815,7 @@ static void sess_poll(void)
 	double t = mono();
 	if (st.acts != last_acts)
 		last_acts = st.acts, t_prog = t;
+	stall_check(&st, t);	/* vdstall */
 	if (st.err || st.fw_dead) {
 		sess_fail(st.err ? st.err : -EIO, sent);
 		return;
@@ -1004,6 +1038,8 @@ int main(int argc, char **argv)
 	int warm = !getenv("VENUSD_WARMUP") || atoi(getenv("VENUSD_WARMUP"));
 	hevc_ok = !getenv("VENUSD_HEVC") || atoi(getenv("VENUSD_HEVC"));
 	surf_on = !getenv("VENUSD_SURF") || atoi(getenv("VENUSD_SURF"));	/* vdcredit */
+	if (getenv("VENUSD_STALL_MS"))	/* vdstall */
+		stall_ms = (unsigned)atoi(getenv("VENUSD_STALL_MS"));
 	if (!getenv("VENUSD_RECOVER") || atoi(getenv("VENUSD_RECOVER")))
 		vc_stop_hook = on_stop;
 	vc_frame_tag = !getenv("VENUSD_FW_FRAME") || atoi(getenv("VENUSD_FW_FRAME"));
