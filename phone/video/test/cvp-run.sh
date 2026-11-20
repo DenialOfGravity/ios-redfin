@@ -10,7 +10,7 @@ shift 6
 L=$D/run-$TAG.log
 S=$D/step-$TAG.log
 O=$D/o-$TAG.264
-up() { echo "[$(date +%s)] $*"; sync; }
+up() { echo "[$(toybox date +%s)] $*"; sync; }
 ST="--step-file $S --step"
 [ "${STEP:-1}" = 0 ] && ST=""
 {

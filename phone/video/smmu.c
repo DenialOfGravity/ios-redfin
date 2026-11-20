@@ -607,7 +607,12 @@ int smmu_np_bank(const char *name, uint32_t sid, uint32_t mask, uint64_t iova, u
 	}
 	for (uint32_t c = 0; c < ncb && c < 256; c++) {
 		uint64_t cbp = s + (uint64_t)npage * psize + (uint64_t)c * psize;
-		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) && rd32(s + psize + 4 * c) == 0) {
+		/* free: no S2CR points at it, translation off, and CBAR never written -- or our own released bank from an
+		 * earlier run (CBAR does not go back to 0 here: CBAR = R_CBAR and TTBR0's ASID = the bank number, as written
+		 * below), so banks are not used up one per run */
+		uint32_t cbar = rd32(s + psize + 4 * c);
+		int ours = cbar == R_CBAR && (rd32(cbp + 0x24) >> 16) == c;
+		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) && (cbar == 0 || ours)) {
 			cb = (int)c;
 			break;
 		}
