@@ -3473,6 +3473,18 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 	}
 	int bin = bin_mode != ~0u ? BIN_PREVIEW : BIN_OFF;
 	uint64_t bin_ns = 0, bin_since = 0;
+	/*
+	 * redfin (ws-cam-video): /private/var/local/camera-vid-binned: the back camera's video formats stream the binned 4:3 mode
+	 * too (8, 2016x1512, through the IFE pixel path as NV12) instead of the 16:9 video mode (2016x1136), which the kernel's
+	 * IFE does not take: those frames came as RAW10 and were demosaicked here at 120-150 ms a frame on every core (7 fps,
+	 * mediaserverd ~600 % CPU, the recording's software encoder starved). The picture is the 16:9 middle of the 4:3 frame
+	 * (the NV12 render crops to the output's proportions), as the 16:9 mode's own field of view is.
+	 */
+	bool vid_bin = bin != BIN_OFF && ife.on && s->camera->sensor == 1 && access("/private/var/local/camera-vid-binned", F_OK) == 0;
+
+	if (vid_bin) {
+		say("video formats from the binned mode %u through the IFE (camera-vid-binned)", bin_mode);
+	}
 
 	struct pace pace = { .on = access("/private/var/local/camera-pace", F_OK) == 0 };
 	uint64_t pt0 = 0, pt1 = 0, pt2 = 0, pt3 = 0, pt4 = 0;
@@ -3517,6 +3529,10 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 					.c = s->camera->formats[s->format_index & 1].kind };
 
 				c.b = bin == BIN_PREVIEW && c.c == REDWOOD_CAMERA_MODE_PHOTO ? bin_mode : c.b;      /* (ws-cam-binned) */
+				if (vid_bin && c.c != REDWOOD_CAMERA_MODE_PHOTO) {
+					c.b = bin_mode;         /* (ws-cam-video: camera-vid-binned) */
+					c.c = REDWOOD_CAMERA_MODE_PHOTO;
+				}
 
 				switched = mode_asked = true;
 				s->mode_wanted = false;
@@ -3579,13 +3595,18 @@ frames(CMBaseObjectRef o, unsigned generation, int device)
 		bin_gain = f->gain;
 		bin_line_ns = f->line_ns;
 		/* the format's kind of mode (B3): asked once a format, if the frames are not of it */
-		if (s->mode_wanted || (!mode_asked && (!mode_fits(f, fmt->kind) || (bin_able && small != bin_want)))) {
+		bool video_bin = vid_bin && fmt->kind != REDWOOD_CAMERA_MODE_PHOTO;     /* (ws-cam-video: camera-vid-binned) */
+		bool fits = video_bin ? small && f->height != 0 && (double)f->width / f->height < 1.5 : mode_fits(f, fmt->kind);
+
+		if (s->mode_wanted || (!mode_asked && (!fits || (bin_able && small != bin_want)))) {
 			struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor,
-				.b = bin_want ? bin_mode : REDWOOD_CAMERA_MODE_ANY, .c = fmt->kind };
+				.b = bin_want || video_bin ? bin_mode : REDWOOD_CAMERA_MODE_ANY, .c = video_bin ? REDWOOD_CAMERA_MODE_PHOTO : fmt->kind };
 
 			s->mode_wanted = false;
 			mode_asked = true;
-			if (bin_want) {
+			if (video_bin) {
+				say("the video format's moving picture from the binned mode %u (camera-vid-binned): asked of the kernel", bin_mode);
+			} else if (bin_want) {
 				say("the format's moving picture from the binned mode %u: asked of the kernel", bin_mode);
 			} else {
 				say("the format wants a %s mode: asked of the kernel", mode_name(c.c));
