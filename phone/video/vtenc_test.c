@@ -197,6 +197,7 @@ int main(int argc, char **argv)
 	int w = 1920, h = 1080, nf = 300, rt = 1, reg = 1, vcp = 0;
 	double fps = 30, br = 15300000, keysecs = 1;
 	int o;
+	setvbuf(stdout, NULL, _IONBF, 0);
 	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:V")) != -1) {
 		switch (o) {
 		case 'c': codec = optarg; break;
