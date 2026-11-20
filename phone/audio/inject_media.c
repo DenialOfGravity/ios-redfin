@@ -738,6 +738,17 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 #define VC_NODES        4
 
+static bool venus_encoder;              /* (ws-vt-venc; set by register_venus_encoder below) */
+
+/* ws-vt-venc: Venus's encoder registered AND venusd answering (its socket there): without venusd the encoder refuses
+ * (VideoToolbox then takes the next one: VCPHEVC for hvc1, and for avc1 its rtvc, which fails here), so the old
+ * behaviour (avc1 made hvc1, gate, cap) applies */
+static bool
+venus_up(void)
+{
+	return venus_encoder && access("/private/var/run/venusd.sock", F_OK) == 0;
+}
+
 extern id objc_retain(id object);
 extern void objc_release(id object);
 
@@ -783,7 +794,9 @@ vc_of(id node)
 		objc_release(v->node);
 	}
 	v->node = objc_retain(node);
-	v->off = access("/private/var/local/camera-vid-nogate", F_OK) == 0;
+	/* ws-vt-venc: with Venus's encoder EncodeFrame returns at once: no gate unless /private/var/local/camera-vid-gate */
+	v->off = access("/private/var/local/camera-vid-nogate", F_OK) == 0 ||
+	    (venus_up() && access("/private/var/local/camera-vid-gate", F_OK) != 0);
 	v->busy = false;
 	v->given = v->dropped = v->encoded = v->markers = 0;
 	v->first = v->since = mach_absolute_time();
@@ -792,7 +805,7 @@ vc_of(id node)
 		v->queue = dispatch_queue_create("redwood.video-compressor", DISPATCH_QUEUE_SERIAL);
 	}
 	say("redwood: mediaserverd: video compressor %p: %s\n", (void *)node, v->off ? "every picture given on the graph's thread "
-	    "(camera-vid-nogate)" : "encodes on a queue of its own, one picture at a time; the others dropped (camera-vid-nogate: off)");
+	    "(camera-vid-nogate, or the Venus encoder without camera-vid-gate)" : "encodes on a queue of its own, one picture at a time; the others dropped (camera-vid-nogate: off)");
 	return v;
 }
 
@@ -1119,6 +1132,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 #endif
 
 static bool avc_encoder;                /* a software encoder for 'avc1' is there (VideoToolbox's or registered here) */
+static bool venus_encoder;              /* ws-vt-venc: Venus's hardware encoders registered (vtvenc.dylib) */
 
 typedef int (*encoder_create)(uint32_t, CFAllocatorRef, void *);
 
@@ -1326,6 +1340,33 @@ register_hevc_encoder(void)
 }
 
 /*
+ * redfin (ws-vt-venc): Venus's hardware encoders, 'avc1' and 'hvc1' (phone/video/vtvenc.c, a venusd client), registered
+ * as hardware encoders as the iPhone's AVE ones are, so a recording encodes on Venus in real time instead of in VCPHEVC's
+ * software encoder (~1 s a 1080p frame). It registers nothing without /private/var/local/venus.on or with
+ * /private/var/local/vtvenc-off; /private/var/local/camera-no-venc: not loaded at all (the software encoder as before).
+ * With it, a recording's avc1 stays avc1, the bit rate is not capped and the compressor's drop gate is off (below).
+ */
+static void
+register_venus_encoder(void)
+{
+	static const char path[] = "/private/var/local/lib/vtvenc.dylib";
+	void *lib;
+	int (*reg)(void);
+	int n;
+
+	if (access("/private/var/local/camera-no-venc", F_OK) == 0 || access(path, F_OK) != 0) {
+		say("redwood: mediaserverd: no Venus video encoder (%s)\n", access(path, F_OK) != 0 ? "no vtvenc.dylib" : "camera-no-venc");
+		return;
+	}
+	lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	reg = lib != NULL ? (int (*)(void))dlsym(lib, "VTVenusEncRegister") : NULL;
+	n = reg != NULL ? reg() : -1;
+	venus_encoder = n > 0;
+	say("redwood: mediaserverd: Venus video encoder: %s (%d registered)\n", lib == NULL ? dlerror() : reg == NULL ?
+	    "no VTVenusEncRegister" : venus_encoder ? "registered for avc1/hvc1" : "not registered (venus.on? vtvenc-off?)", n);
+}
+
+/*
  * redfin (B2): the H.264 search. Only with /private/var/local/camera-encoder-scan, and not in the constructor: r20's
  * build asked VideoToolbox for its encoder list there (inside dyld's initializer, before the capture stack's methods
  * were replaced) and mediaserverd crash-looped in Core Image (r19a, 2026-10-25); whether that list was the cause is
@@ -1414,7 +1455,7 @@ vc_bitrate_cap(void)
 	ssize_t n;
 
 	if (fd < 0) {
-		return 3000000;
+		return venus_up() ? 0 : 3000000;        /* ws-vt-venc: Venus keeps up: no cap unless the file asks */
 	}
 	n = read(fd, text, sizeof(text) - 1);
 	close(fd);
@@ -1455,7 +1496,7 @@ recording_video_settings(id self, SEL selector)
 	    CFGetTypeID(codec) != CFStringGetTypeID()) {
 		return settings;
 	}
-	bool to_hevc = !avc_encoder && CFEqual(codec, CFSTR("avc1"));
+	bool to_hevc = !avc_encoder && !venus_up() && CFEqual(codec, CFSTR("avc1"));
 	int64_t cap = vc_bitrate_cap(), asked = 0;
 	CFNumberRef rate = NULL;
 
@@ -2014,6 +2055,7 @@ redwood_media_init(void)
 		    replacements[i].selector);
 	}
 	register_hevc_encoder();
+	register_venus_encoder();
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
 	say("redwood: mediaserverd: the replacements armed\n");
 	if (access("/private/var/local/camera-encoder-scan", F_OK) == 0) {

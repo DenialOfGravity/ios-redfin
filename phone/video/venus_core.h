@@ -37,6 +37,36 @@ extern const char *vc_stop_at;	/* redfin: venusctl decode --stop-at STAGE (--dry
 extern int vc_frame_tag;	/* vdstop: 1: firmware debug lines during a session as "[frame N] fw [...]" */
 int vc_core_ok(void);		/* the core gate's check: AHB, AXI, GDSCs, branches on (no STOP) */
 
+/* ws-vt-venc: the encoder in steps (venus_enc.inc), for venusd's encode protocol. Constant QP (rate control off). */
+struct venc_params {
+	int w, h, hevc;
+	uint32_t fps_q16;		/* frame rate, Q16 (0: 30) */
+	uint32_t qp_i, qp_p;		/* constant QP (0: 26 / I + 2) */
+	int gop;			/* frames per IDR (0: 2 s) */
+	int profile, level;		/* HFI values; 0: H.264 High / HEVC Main, level chosen by the firmware */
+	int seqhdr;			/* 1: SPS/PPS in band before every IDR; 0 (stock): one CODECCONFIG buffer at the start */
+	int full_range, primaries, transfer, matrix;	/* VIDEO_SIGNAL_INFO (H.264/HEVC VUI codes; primaries 0: not sent) */
+	int nin, nout;			/* buffer counts (0: 8 + 8) */
+	uint32_t debug;			/* firmware debug mask */
+};
+struct venc_out {			/* one bitstream buffer back (FBD) */
+	const uint8_t *data;		/* Annex B (start codes) */
+	uint32_t len, flags, pic_type, tag;	/* flags: HFI buffer flags (0x20 sync, 0x80 codec config, 0x1 EOS) */
+	uint64_t ts;			/* the ETB's timestamp (us) */
+};
+extern void (*venc_sink)(const struct venc_out *o);
+extern void (*venc_in_done)(uint32_t tag, uint32_t pa);	/* an input buffer back (EBD): its tag and address */
+int venc_open(const struct venc_params *p);	/* 0 running; 1 failed, no session; 2 failed, vdec_close owed */
+int venc_free_slot(void);			/* a free input slot or -1 */
+uint8_t *venc_slot_cpu(int k, uint32_t *size, uint32_t *stride, uint32_t *yscan);	/* vmmu only */
+void venc_layout(uint32_t *stride, uint32_t *yscan, uint32_t *uvoff, uint32_t *size);
+int venc_etb(int k, uint32_t pa, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync);	/* pa 0: slot k's own */
+int venc_etb_off(int k, uint32_t pa, uint32_t off, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync);
+int venc_eos(void);
+int venc_set_qp(uint32_t qi, uint32_t qp);
+uint32_t venc_fps_q16(void);
+extern int vc_prop_ms;	/* the drain after each set property, ms (-1: VENUSCTL_PROP_MS / 20) */
+
 const char *boot_id(void);
 void stale_drop(const char *path);	/* a state file from an earlier boot: deleted unread */
 

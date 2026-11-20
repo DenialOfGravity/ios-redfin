@@ -2855,6 +2855,7 @@ static int sess_cmd(uint32_t type)	/* create_pkt_cmd_session_cmd {size 12, type,
 
 /* create_pkt_cmd_session_set_property (hfi_packetization.c:983): {size, type, sid, 1, prop, body...}; no reply on
  * success, a bad one comes back as EVENT_NOTIFY SESSION_ERROR: drain 20 ms after each */
+int vc_prop_ms = -1;	/* ws-vt-venc: the drain after each property when >= 0 (venc_open: VENUSD_ENC_PROP_MS, 2) */
 static int set_prop(uint32_t prop, uint32_t a, uint32_t b, uint32_t c, unsigned nbody, const char *what)
 {
 	uint32_t p[8] = { 20 + 4 * nbody, S_SET_PROP, SESSION_ID, 1, prop, a, b, c };
@@ -2865,7 +2866,7 @@ static int set_prop(uint32_t prop, uint32_t a, uint32_t b, uint32_t c, unsigned 
 	static int drain = -1;	/* ws-venus-enc: VENUSCTL_PROP_MS (default 20): the drain after each property */
 	if (drain < 0)
 		drain = getenv("VENUSCTL_PROP_MS") ? atoi(getenv("VENUSCTL_PROP_MS")) : 20;
-	if (q_write(p) || wait_msg(0, (unsigned)drain))
+	if (q_write(p) || wait_msg(0, (unsigned)(vc_prop_ms >= 0 ? vc_prop_ms : drain)))
 		return -1;
 	return dc.err ? -1 : 0;
 }

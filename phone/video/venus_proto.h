@@ -45,11 +45,44 @@
 #define VENUSD_SOCK	"/var/run/venusd.sock"
 #endif
 #define VENUSD_MAGIC	0x444e4556u	/* "VEND" */
-#define VENUSD_VERSION	2	/* 2: vdcredit (CREDIT, UNCREDIT, DECODED surface) */
+#define VENUSD_VERSION	3	/* 2: vdcredit (CREDIT, UNCREDIT, DECODED surface); 3: ws-vt-venc encoder (VD_ENC_*) */
 #define VENUSD_MAX_AU	(8u << 20)	/* longest FRAME payload venusd reads */
 #define VENUSD_MAX_CREDITS 16		/* vdcredit: credits queued per session */
 
-enum { VD_OPEN = 1, VD_FRAME, VD_DECODED, VD_EOS, VD_EOS_DONE, VD_CLOSE, VD_ERROR, VD_CREDIT, VD_UNCREDIT };
+enum { VD_OPEN = 1, VD_FRAME, VD_DECODED, VD_EOS, VD_EOS_DONE, VD_CLOSE, VD_ERROR, VD_CREDIT, VD_UNCREDIT,
+	VD_ENC_OPEN = 16, VD_ENC_FRAME, VD_ENC_INDONE, VD_ENC_DATA, VD_ENC_QP };
+
+/*
+ * ws-vt-venc (version 3): an ENCODER session on the same socket (one Venus session at a time, decoder or encoder;
+ * sessions follow each other on any connection, power collapse between them as for decode). Fields not named: 0.
+ *   ENC_OPEN   c->d  codec VD_CODEC_H264 | VD_CODEC_HEVC, width x height (even, 32..4096 x 32..2304), payload struct
+ *                    venusd_enc_open (len = its size). Reply ENC_OPEN: status 0 (the session runs) or < 0 / > 0 as OPEN;
+ *                    stride/scanlines/crop_x = the Venus NV12 layout wanted for zero-copy (Y stride, Y scanlines, the
+ *                    CbCr plane's offset), filled = venusd's input buffer size.
+ *   ENC_FRAME  c->d  surface = an IOSurface ID (2-plane 420v/420f, the session's size, any layout); pts = the client's
+ *                    timestamp (echoed), seq = the client's frame number (echoed), flags bit 0 = an IDR now. The client
+ *                    keeps the surface (its CVPixelBuffer) until ENC_INDONE with that seq: venusd reads it (copy into a
+ *                    Venus buffer) or Venus does (zero-copy: a surface already in Venus's layout, mapped by id).
+ *                    No reply when queued; venusd reads the next message only once an input buffer is free (backpressure).
+ *   ENC_INDONE d->c  seq, surface: done with that frame's surface (copied, or Venus's EBD); status < 0: never encoded
+ *                    (no ENC_DATA follows for it). flags bit 0: it went zero-copy.
+ *   ENC_DATA   d->c  one encoded buffer, Annex B (start codes) in the payload; flags = HFI buffer flags (0x20 sync frame,
+ *                    0x80 codec config = parameter sets only, seq 0), pic_type, pts + seq of the frame it encodes.
+ *   ENC_QP     c->d  a new constant QP: crop_x = I, crop_y = P (dynamic, no reply).
+ *   EOS, EOS_DONE, CLOSE, ERROR: as for decode (EOS: the rest comes out, then EOS_DONE).
+ */
+struct venusd_enc_open {
+	uint32_t fps_q16;		/* frame rate Q16 (0: 30) */
+	uint32_t bitrate;		/* bit/s hint: mapped to a constant QP when qp_i is 0 */
+	uint32_t qp_i, qp_p;		/* constant QP (0: from the bitrate, else 26/28) */
+	int32_t gop;			/* frames per IDR (0: 2 s) */
+	int32_t profile, level;		/* HFI values (0: High / Main, level chosen by the firmware) */
+	int32_t seqhdr;			/* 1: SPS/PPS in band before every IDR; 0: one codec-config buffer (stock) */
+	int32_t full_range, primaries, transfer, matrix;	/* VUI colour (primaries 0: none) */
+	uint32_t flags;			/* bit 0: no zero-copy (always copy) */
+	uint32_t rsvd[3];
+};
+_Static_assert(sizeof(struct venusd_enc_open) == 64, "venusd_enc_open");
 #define VD_CODEC_H264	1
 #define VD_CODEC_HEVC	2	/* 4e; FRAME payloads are HEVC Annex B access units (VPS/SPS/PPS in band) */
 

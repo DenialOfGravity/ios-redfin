@@ -34,6 +34,15 @@ for f in vtstub vtvenus; do
 	sign out/$f.dylib
 	nm -gU out/$f.dylib 2>/dev/null | grep -q '_ExampleIPBDecoderRegister' || { echo "$f: no ExampleIPBDecoderRegister export"; exit 1; }
 done
+# ws-vt-venc: the VideoToolbox hardware encoder (venusd client; registered by VTVenusEncRegister) and its test tool
+$CC $W -dynamiclib -install_name /var/local/lib/vtvenc.dylib \
+	-framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework IOSurface -framework VideoToolbox \
+	-o out/vtvenc.dylib vtvenc.c
+sign out/vtvenc.dylib
+nm -gU out/vtvenc.dylib 2>/dev/null | grep -q '_VTVenusEncRegister' || { echo "vtvenc: no VTVenusEncRegister export"; exit 1; }
+$CC $W -o out/vtenc_test vtenc_test.c -framework CoreFoundation -framework CoreMedia -framework CoreVideo \
+	-framework VideoToolbox
+sign out/vtenc_test
 $CC -O2 -Wall -fobjc-arc -o out/vtdecode vtdecode.m venus_h264.c -framework Foundation -framework AVFoundation \
 	-framework VideoToolbox -framework CoreMedia -framework CoreVideo
 sign out/vtdecode vtdecode-ents.plist
@@ -45,6 +54,7 @@ ls -la out
 U=../../../out
 if [ -f "$U/dropbearmulti" ]; then
 	cp out/venusctl out/venusd out/venusc out/vtvenus.dylib out/vtstub.dylib out/vtdecode out/avplay \
+		out/vtvenc.dylib out/vtenc_test \
 		out/org.iosonpixel.venusd.plist "$U/"
 	echo "video: copied to the userland output"
 fi

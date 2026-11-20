@@ -58,6 +58,7 @@
  * (or "ended with the session"). Log and console. 0: no stall lines.
  */
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -75,11 +76,14 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
+#include <sys/qos.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include "pmem.h"
 #include "venus_core.h"
 #include "venus_hevc.h"
 #include "venus_proto.h"
+#include "venus_vmmu.h"
 
 #define LOG_MAX		(1 << 20)
 #define MAXCL		16	/* vdleak: was 4 */
@@ -124,7 +128,9 @@ static uint32_t sent, hint_w, hint_h;
 static unsigned last_acts;
 static uint8_t *au;
 static unsigned cold_s = 20;	/* vdcold: VENUSD_COLD_S */
-static int sess_hevc, hevc_ok = 1;	/* 4e: the session's codec; VENUSD_HEVC */
+static int sess_hevc, hevc_ok = 1;
+static int sess_enc;	/* ws-vt-venc: the session is an encoder (VD_ENC_OPEN) */
+static void enc_reset(void), enc_log_end(void);	/* venusd_enc.inc */	/* 4e: the session's codec; VENUSD_HEVC */
 static jmp_buf stop_jb, rec_jb;	/* vdstop: the main loop; recover() itself */
 static int stop_armed, recovering, opening = -1, ending, warmed;
 static int nopay;	/* vdnopay: NOPAY_FILE at this session's OPEN */
@@ -616,7 +622,10 @@ static void sess_end(const char *how)
 		sess_log(how);
 	}
 	vsurf_drop();
+	enc_log_end();
+	enc_reset();	/* ws-vt-venc: frames still out told, surfaces unmapped */
 	sess = S_NONE;
+	sess_enc = 0;
 	owner = -1;
 	idle_since = mono();
 }
@@ -665,7 +674,39 @@ static void clk_for_open(const struct venusd_msg *m)
 	     mhz);
 }
 
+static int32_t open_common(int i, const struct venusd_msg *m, int enc);
+
 static void do_open(int i, const struct venusd_msg *m)
+{
+	int32_t rc = open_common(i, m, 0);
+	if (!rc) {
+		sess_enc = 0;
+		enc_reset();
+		owner = i;
+		sess = S_OPEN;
+		nsess++;
+		sent = 0;
+		hint_w = m->width, hint_h = m->height;
+		sess_hevc = m->codec == VD_CODEC_HEVC;
+		t_open = mono();
+		t_first = t_last_frame = 0;
+		t_run = t_etb = t_ebd = 0, stalled = 0;	/* vdstall */
+		cred_drop();	/* vdcredit */
+		n_placed = n_copied = n_returned = path_logged = 0;
+		wall_due = 0;	/* vdstamp: the wall clock on this line */
+		note("venusd: session %u opened (fd %d, %s, hint %ux%u)", nsess, cl[i].fd, sess_hevc ? "HEVC" : "H.264", hint_w,
+		     hint_h);
+		struct stat sb;
+		test_file();
+		nopay = !stat(NOPAY_FILE, &sb);	/* vdnopay */
+		if (nopay)
+			note("venusd: nopayload test: frames sent without pixels");
+	}
+	reply(i, VD_OPEN, rc, 0);
+}
+
+/* the checks and the bring-up (or resume) shared by OPEN and ENC_OPEN; 0 = Venus ready for a session */
+static int32_t open_common(int i, const struct venusd_msg *m, int enc)
 {
 	struct stat sb;
 	int32_t rc = 0;
@@ -675,7 +716,11 @@ static void do_open(int i, const struct venusd_msg *m)
 				  cl[owner].fd);
 	else if (owner == i)
 		rc = -EINVAL, printf("venusd: second OPEN on fd %d refused (session %s)\n", cl[i].fd, sname[sess]);
-	else if (m->codec && m->codec != VD_CODEC_H264 && (m->codec != VD_CODEC_HEVC || !hevc_ok))
+	else if (enc && (m->codec != VD_CODEC_H264 && m->codec != VD_CODEC_HEVC))
+		rc = -EINVAL, printf("venusd: ENC_OPEN codec %u refused: H.264 (1) or HEVC (2)\n", m->codec);
+	else if (enc && !vmmu_want())
+		rc = -ENOTSUP, printf("venusd: ENC_OPEN refused: the encoder needs /dev/vmmu (kern.sweet_vmmu=1, VENUSD_VMMU)\n");
+	else if (!enc && m->codec && m->codec != VD_CODEC_H264 && (m->codec != VD_CODEC_HEVC || !hevc_ok))
 		rc = -EINVAL, printf("venusd: OPEN codec %u refused: H.264 (%u)%s only\n", m->codec, VD_CODEC_H264,
 				     hevc_ok ? " or HEVC (2)" : " (VENUSD_HEVC=0)");
 	else if (!stat(OFF_FILE, &sb))
@@ -697,28 +742,10 @@ static void do_open(int i, const struct venusd_msg *m)
 			note("venusd: resumed from power collapse in %.0f ms", 1e3 * (mono() - t0));
 		}
 	}
-	if (!rc) {
-		owner = i;
-		sess = S_OPEN;
-		nsess++;
-		sent = 0;
-		hint_w = m->width, hint_h = m->height;
-		sess_hevc = m->codec == VD_CODEC_HEVC;
-		t_open = mono();
-		t_first = t_last_frame = 0;
-		t_run = t_etb = t_ebd = 0, stalled = 0;	/* vdstall */
-		cred_drop();	/* vdcredit */
-		n_placed = n_copied = n_returned = path_logged = 0;
-		wall_due = 0;	/* vdstamp: the wall clock on this line */
-		note("venusd: session %u opened (fd %d, %s, hint %ux%u)", nsess, cl[i].fd, sess_hevc ? "HEVC" : "H.264", hint_w,
-		     hint_h);
-		test_file();
-		nopay = !stat(NOPAY_FILE, &sb);	/* vdnopay */
-		if (nopay)
-			note("venusd: nopayload test: frames sent without pixels");
-	}
-	reply(i, VD_OPEN, rc, 0);
+	return rc;
 }
+
+#include "venusd_enc.inc"	/* ws-vt-venc: the encoder sessions */
 
 /* the first FRAME: the size from its SPS (else the OPEN hint, else 1920x1088 as venusctl), then the decoder start */
 static int sess_start(const uint8_t *p, uint32_t len)
@@ -778,6 +805,10 @@ static void command(int i)
 		do_open(i, &m);
 		return;
 	}
+	if (m.type == VD_ENC_OPEN) {	/* ws-vt-venc */
+		do_enc_open(i, &m, au);
+		return;
+	}
 	if (m.type == VD_CREDIT) {	/* vdcredit: before the owner and state checks: never an ERROR */
 		do_credit(i, &m);
 		return;
@@ -799,6 +830,10 @@ static void command(int i)
 	}
 	if (sess == S_FAILED) {
 		reply(i, VD_ERROR, -EIO, m.seq);
+		return;
+	}
+	if (sess_enc) {	/* ws-vt-venc: ENC_FRAME, ENC_QP, EOS */
+		enc_command(i, &m);
 		return;
 	}
 	if (m.type == VD_FRAME) {
@@ -1133,6 +1168,23 @@ int main(int argc, char **argv)
 		     kv == 1 ? "write-combined window" : kv == 0 ? "device mapping (slow copy-out; boot-arg sweetvenus=1|2)" :
 		     "no xnu 1057 (device mapping, slow copy-out)");
 	}
+	{	/* ws-vt-venc: session buffers through /dev/vmmu (xnu 1270) whenever the kernel allows it: VENUSD_VMMU=0 keeps
+		 * the window; an explicit VENUSCTL_VMMU wins */
+		int vm = -1;
+		size_t vn = sizeof(vm);
+		if (sysctlbyname("kern.sweet_vmmu", &vm, &vn, NULL, 0))
+			vm = -1;
+		int want = !getenv("VENUSD_VMMU") || atoi(getenv("VENUSD_VMMU"));
+		if (!getenv("VENUSCTL_VMMU") && want && vm == 1)
+			setenv("VENUSCTL_VMMU", "1", 1);
+		note("venusd: kern.sweet_vmmu %d, VENUSD_VMMU %s: session buffers %s", vm, want ? "on" : "off",
+		     vmmu_want() ? "through /dev/vmmu (encoder available)" : "in the window (no encoder)");
+	}
+	/* ws-vt-venc: the queue polling (1-4 ms sleeps) stretches ~10-30x under timer coalescing when venusd is not started
+	 * as launchd's Interactive job (e.g. from a shell): the encoder open took ~1 s (30 ms a property). The main thread
+	 * asks for user-interactive QoS (tight timers) itself; VENUSD_QOS=0: not */
+	if (!getenv("VENUSD_QOS") || atoi(getenv("VENUSD_QOS")))
+		note("venusd: main thread QoS user-interactive: %d", pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0));
 	au = malloc(VENUSD_MAX_AU);
 	if (!au)
 		return 1;
@@ -1156,6 +1208,8 @@ int main(int argc, char **argv)
 	signal(SIGTERM, on_term);
 	signal(SIGINT, on_term);
 	vdec_sink = sink;
+	venc_sink = enc_sink;	/* ws-vt-venc */
+	venc_in_done = enc_in_done;
 	vdec_place = place;	/* vdcredit */
 	int ls = sock_create();
 	if (ls < 0)
