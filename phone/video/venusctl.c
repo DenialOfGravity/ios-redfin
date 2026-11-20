@@ -273,9 +273,14 @@ int main(int argc, char **argv)
 		return smmu_cmd();
 	if (!strcmp(cmd, "fwdump"))
 		return fwdump(arg ? strtoull(arg, NULL, 0) : 0);
+	if (!strcmp(cmd, "hwctl") && arg && (!strcmp(arg, "on") || !strcmp(arg, "off")))
+		return hwctl_cmd(!strcmp(arg, "on"));
+	if (!strcmp(cmd, "intmask") && !arg)
+		return intmask_cmd();
 usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | rails (read-only) | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
+		"       | hwctl on|off (venus-hw: mvs0 GDSC HW_CONTROL, Linux's vcodec hand-off after boot) | intmask (unmask A2H+A2HWD)\n"
 		"       | session [--debug MASK] | decode IN.h264|IN.h265 OUT.yuv [--frames N] [--bufphys ADDR] [--debug MASK]\n"
 		"       | decode --clip FILE [--seconds S] [--loop]  (ws-video-dec: active session S s, idle-reset test)\n"
 		"         [--hevc|--h264] [--stop-at sessinit|props|workmode|intl|alloc|load|start|ftb] [--dry]\n"

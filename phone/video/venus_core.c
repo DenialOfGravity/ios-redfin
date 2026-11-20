@@ -2114,14 +2114,20 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 	else if (pcm && core_ok() && pc_prep(intclr_on) < 0)
 		printf("venus: watch: pc: queue failure or firmware error during PC_PREP, watching on\n");
 	uint64_t s = 0x15000000ull;
-	uint32_t last[16] = { 0 };
+	uint32_t last[18] = { 0 };
+	/* venus-hw: VENUSCTL_WATCH_MS (default 200): the poll period; the window bank's FSR/FAR are part of the change test */
+	unsigned watch_ms = getenv("VENUSCTL_WATCH_MS") ? (unsigned)atoi(getenv("VENUSCTL_WATCH_MS")) : 200;
+	if (watch_ms < 1 || watch_ms > 10000)
+		watch_ms = 200;
 	double t0 = mono_ms(), tl = -1e9, tp = mono_ms();
 	unsigned n = 0;
 	for (;;) {
 		double t = mono_ms();
 		if (t - t0 > secs * 1e3)
 			break;
-		uint32_t cur[16] = { 0 };
+		uint32_t cur[18] = { 0 };
+		if (win_cbp)
+			cur[16] = rd32(win_cbp + 0x58), cur[17] = rd32(win_cbp + 0x60);
 		int on = core_ok();
 		cur[0] = (uint32_t)on;
 		cur[1] = vrd(GDSC_MVSC), cur[2] = vrd(GDSC_MVS0), cur[3] = vrd(PLL_MODE), cur[4] = rd32(GCC_VIDEO_AXI);
@@ -2138,15 +2144,15 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 		int changed = memcmp(cur, last, sizeof(cur)) != 0;
 		if (changed || t - tl >= 1000) {	/* P0b: a line a second (uptime + rails), so a reset shows how long it lived */
 			tl = t;
-			char line[480];
+			char line[600];
 			snprintf(line, sizeof(line), "watch %.1f s: %s CTRL_STATUS %#010x (init %u idle %u pc_ready %u err %#x)"
 				 " CPU_STATUS %#x INTR_STATUS %#x%s | NoC ERRVLD %#x LOG0 %#x LOG1 %#x LOG2 %#x | sGFSR %#x"
 				 " sGFSYNR0 %#x SYNR1 %#x SYNR2 %#x | gdsc mvsc %#x mvs0 %#x pll %#x axi %#x | tbu_sf0 vote %#x"
-				 " status %#x %#x%s",
+				 " status %#x %#x | win FSR %#x FAR %#x%s",
 				 (t - t0) / 1e3, on ? "on" : "CLOCK/GDSC OFF", cur[9], cur[9] & 1, (cur[9] >> 30) & 1,
 				 (cur[9] >> 8) & 1, cur[9] & 0xfe, cur[10], cur[11], (cur[11] & 0x10) ? " (WATCHDOG)" : "",
 				 cur[12], cur[13], cur[14], cur[15], cur[5], cur[6], cur[7], cur[8], cur[1], cur[2], cur[3], cur[4],
-				 tbu, tbs0, tbs1, changed ? "" : " (same)");
+				 tbu, tbs0, tbs1, cur[16], cur[17], changed ? "" : " (same)");
 			char rl[200];
 			rails_line(rl, sizeof(rl));
 			if (pcm || intclr_on) {	/* P0d: the PC result and the ack count on every line */
@@ -2168,9 +2174,9 @@ int watch(unsigned secs, int sysinit, uint32_t debug)
 			sys_ping("watch");
 			tp = mono_ms();
 		}
-		if (on && n++ % 25 == 0)
+		if (on && n++ % (5000 / watch_ms + 1) == 0)
 			win_faults("watch");
-		delay_ms(200);
+		delay_ms(watch_ms);
 	}
 	printf("venus: watch: %u s done, phone alive\n", secs);
 	return 0;
@@ -3540,5 +3546,39 @@ int fwdump(uint64_t a)
 	} else {
 		printf("venus: fwdump: core not read (gcc_video_ahb %#010x: clocks/GDSCs off or gated)\n", rd32(GCC_VIDEO_AHB));
 	}
+	return 0;
+}
+
+/*
+ * venus-hw (Stage 1, experiment 3): Linux-faithful pieces venusctl never did.
+ * hwctl: msm_vidc hands the vcodec GDSC (mvs0, qcom,support-hw-trigger in the redfin DT) to the hardware once the
+ * firmware is up (regulator mode FAST -> gdsc HW_CONTROL, GDSCR bit 1), so the firmware can collapse/restore vcodec
+ * itself; mvsc (iris-ctl) stays SW. off puts it back to SW (as before a power off).
+ * intmask: __interrupt_init (hfi_iris1): WRAPPER_INTR_MASK &= ~(A2HWD | A2H). The SPI stays disabled in the GIC; the
+ * status is acked by watch with VENUSCTL_INTCLR=1.
+ */
+#define WRAP_INTR_MASK	(CORE + 0xe0010)
+int hwctl_cmd(int on)
+{
+	if (!core_ok()) {
+		printf("venus: refused: power is off\n");
+		return 1;
+	}
+	uint32_t v = vrd(GDSC_MVS0);
+	upd(GDSC_MVS0, HW_CONTROL, on ? HW_CONTROL : 0, on ? "mvs0 HW_CONTROL on" : "mvs0 HW_CONTROL off");
+	printf("venus: gdsc mvs0 %#010x -> %#010x (HW_CONTROL %s)\n", v, vrd(GDSC_MVS0), on ? "on" : "off");
+	pm_step("hwctl %d: mvs0 %#x -> %#x", on, v, vrd(GDSC_MVS0));
+	return 0;
+}
+
+int intmask_cmd(void)
+{
+	if (!core_ok()) {
+		printf("venus: refused: power is off\n");
+		return 1;
+	}
+	uint32_t v = rd32(WRAP_INTR_MASK);
+	wr(WRAP_INTR_MASK, v & ~0x14u, "WRAPPER_INTR_MASK unmask A2HWD|A2H");
+	printf("venus: WRAPPER_INTR_MASK %#010x -> %#010x\n", v, rd32(WRAP_INTR_MASK));
 	return 0;
 }
