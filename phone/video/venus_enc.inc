@@ -57,6 +57,7 @@ static struct {
 	int pre[8];		/* the frame each input buffer was filled with before START (-1: none) */
 } ve;
 
+uint32_t np_persist(uint32_t size, uint32_t iova);
 static int ve_skip(const char *name)
 {
 	const char *s = getenv("VENUSCTL_ENC_SKIP");
@@ -395,7 +396,10 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 			cnt = r[3];
 		for (uint32_t i = 0; r && r[1] && i < cnt && dc.nintl < 16; i++) {
 			uint32_t pa;
-			if (vmmu_active() && !strcmp(bname(type), "persist") && getenv("VENUSCTL_NP_PERSIST") &&
+			if (vmmu_active() && !strcmp(bname(type), "persist") && getenv("VENUSCTL_NP_ASSIGN") &&
+			    atoi(getenv("VENUSCTL_NP_ASSIGN")))	/* + hyp-assigned to CP_NON_PIXEL, as stock's secure heap */
+				pa = np_persist(r[1], 0x25800000u - align_up(r[1], 0x10000) * (i + 1));
+			else if (vmmu_active() && !strcmp(bname(type), "persist") && getenv("VENUSCTL_NP_PERSIST") &&
 			    atoi(getenv("VENUSCTL_NP_PERSIST")))	/* venus-iommu CVP test: as stock, in the non-pixel range */
 				pa = vmmu_alloc_at(r[1], "persist (non-pixel IOVA)", 0x25800000u - align_up(r[1], 0x10000) * (i + 1));
 			else

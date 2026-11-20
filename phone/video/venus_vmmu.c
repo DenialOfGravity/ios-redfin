@@ -167,6 +167,20 @@ uint32_t vmmu_alloc_at(uint32_t size, const char *what, uint32_t iova)
 	return r;
 }
 
+/* a physical range outside XNU RAM (window memory) at IOVA (0 = any); no CPU mapping (use /dev/pmem) */
+uint32_t vmmu_map_phys(uint64_t pa, uint32_t len, uint32_t iova, const char *what)
+{
+	struct vmmu_map_a m = { .addr = pa, .len = len, .flags = 4, .iova = iova };
+	if (fd < 0 || ioctl(fd, VMMU_MAP, &m)) {
+		printf("vmmu: map physical %s %#llx+%#x at %#x: %s\n", what, (unsigned long long)pa, len, iova, strerror(errno));
+		return 0;
+	}
+	if (add((uint32_t)m.iova, (uint32_t)m.plen, NULL, 0))
+		return 0;
+	printf("vmmu: %s: PA %#llx+%#x at IOVA %#x\n", what, (unsigned long long)pa, len, (uint32_t)m.iova);
+	return (uint32_t)m.iova;
+}
+
 uint32_t vmmu_map_user(void *p, size_t len, const char *what)
 {
 	uint32_t plen = 0, iova = map((uint64_t)(uintptr_t)p, len, 0, &plen, NULL);

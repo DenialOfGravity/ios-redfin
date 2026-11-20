@@ -10,7 +10,8 @@ bank venusctl/venusd set up in userland; every frame is copied through /dev/pmem
 to that bank: L1 slots 0-1 (IOVA 0-2 GB) point at kernel-owned L2/L3 tables
 (cached kernel pages, cleaned to PoC), the window (slot 2) stays userland's.
 VMMU_MAP pins a user range (IOMemoryDescriptor prepare, as BoImport) or retains
-an IOSurface by id (SweetSurface memory), maps it at a free IOVA in
+an IOSurface by id (SweetSurface memory) or (flags bit 2) a physical range outside
+XNU RAM (window memory, e.g. hyp-assigned to a CP VM), maps it at a free IOVA in
 0x40000000-0x80000000 (or a fixed one from 0x01000000), TLBIASID + TLBSYNC.
 VMMU_UNMAP / client close: PTEs cleared, TLB flushed, then pages released.
 VMMU_SYNC: clean / clean+invalidate by physical page (Venus is not IO-coherent);
@@ -52,10 +53,10 @@ index fd1c9d0..fe765d6 100644
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 diff --git a/bsd/dev/sweet_vmmu.c b/bsd/dev/sweet_vmmu.c
 new file mode 100644
-index 0000000..30b4da6
+index 0000000..e4157ff
 --- /dev/null
 +++ b/bsd/dev/sweet_vmmu.c
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,695 @@
 +/*
 + * 1270 redfin (venus-iommu): /dev/vmmu, real page tables for the Venus SMMU bank (zero-copy video buffers).
 + *
@@ -113,6 +114,7 @@ index 0000000..30b4da6
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +/* iokit/Kernel/arm/SweetVideoMMU.cpp */
 +extern void *sweet_vmmu_pin_user(task_t task, uint64_t addr, uint64_t len, int *err);
++extern void *sweet_vmmu_pin_phys(uint64_t pa, uint64_t len, int *err);
 +extern void *sweet_vmmu_pin_surface(uint32_t id, uint64_t *len, uint32_t info[4], int *err);
 +extern uint64_t sweet_vmmu_pa(void *pin, uint64_t off);
 +extern void sweet_vmmu_unpin(void *pin);
@@ -127,7 +129,8 @@ index 0000000..30b4da6
 +	uint64_t addr;          /* in: user address (4 KB aligned), or 0 with surface */
 +	uint64_t len;           /* in: bytes (user range) */
 +	uint32_t surface;       /* in: IOSurface id (addr 0) */
-+	uint32_t flags;         /* in: bit 0 = device read-only, bit 1 = no clean+invalidate at map */
++	uint32_t flags;         /* in: bit 0 = device read-only, bit 1 = no clean+invalidate at map, bit 2 = addr is a
++	                         * physical range outside XNU RAM */
 +	uint64_t iova;          /* in: 0 = allocate, else a fixed 4 KB aligned IOVA; out: IOVA */
 +	uint64_t handle;        /* out: = iova (for unmap) */
 +	uint64_t plen;          /* out: mapped bytes (4 KB multiple) */
@@ -456,7 +459,21 @@ index 0000000..30b4da6
 +	uint64_t len = 0;
 +	void *pin = NULL;
 +	bzero(m->info, sizeof(m->info));
-+	if (m->addr) {
++	if (m->addr && (m->flags & 4)) {
++		/* a physical range outside XNU RAM (window / carve-out memory, e.g. hyp-assigned to a CP VM) */
++		if ((m->addr & 0xfff) || !m->len || m->len > 0x10000000ULL) {
++			return EINVAL;
++		}
++		len = (m->len + 0xfffULL) & ~0xfffULL;
++		for (uint64_t o = 0; o < len; o += 0x1000) {
++			if (pmap_valid_address(m->addr + o)) {
++				printf("SWEET VMMU: physical map of 0x%llx refused: XNU RAM\n", m->addr + o);
++				return EPERM;
++			}
++		}
++		pin = sweet_vmmu_pin_phys(m->addr, len, &err);
++		m->flags |= 2;  /* no cache maintenance: not XNU RAM */
++	} else if (m->addr) {
 +		if ((m->addr & 0xfff) || !m->len || m->len > 0x40000000ULL) {
 +			return EINVAL;
 +		}
@@ -737,16 +754,17 @@ index 0000000..30b4da6
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/SweetVideoMMU.cpp b/iokit/Kernel/arm/SweetVideoMMU.cpp
 new file mode 100644
-index 0000000..27f10a0
+index 0000000..fea22f9
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetVideoMMU.cpp
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,125 @@
 +/*
 + * 1270 redfin (venus-iommu): the IOKit half of /dev/vmmu (bsd/dev/sweet_vmmu.c): pins the pages Venus maps.
 + *   user range: IOMemoryDescriptor::withAddressRange + prepare() in the caller's task, as SweetAccelerator's
 + *               NativeAdrenoMethodBoImport (read/write first, then read-only pages for reading)
 + *   IOSurface:  the SweetSurface retained by id; its memory descriptor (kernel buffer, wired by the surface) is used
 + *               directly, so a camera/decoder surface needs no mapping in the video daemon
++*   physical:  a range outside XNU RAM (VMMU_MAP flags bit 2), e.g. window memory hyp-assigned to a CP VM
 + * sweet_vmmu_pa() = physical address of the 4 KB page at an offset (0 = none).
 + */
 +#include <pexpert/arm64/board_config.h>
@@ -789,6 +807,25 @@ index 0000000..27f10a0
 +	p->surface = NULL;
 +	p->offset = 0;
 +	p->prepared = true;
++	return p;
++}
++
++/* a physical range that is not XNU RAM (the 1057 window, a carve-out): a descriptor only, nothing to wire */
++extern "C" void *
++sweet_vmmu_pin_phys(uint64_t pa, uint64_t len, int *err)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa, (IOByteCount)len,
++	    kIODirectionInOut);
++	SweetVmmuPin *p = md != NULL ? IONew(SweetVmmuPin, 1) : NULL;
++	if (p == NULL) {
++		OSSafeReleaseNULL(md);
++		*err = 12;
++		return NULL;
++	}
++	p->md = md;
++	p->surface = NULL;
++	p->offset = 0;
++	p->prepared = md->prepare() == kIOReturnSuccess;
 +	return p;
 +}
 +

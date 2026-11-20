@@ -16,7 +16,8 @@ uint32_t vmmu_alloc(uint32_t size, const char *what);	/* zeroed, cleaned; IOVA o
 uint32_t vmmu_alloc_at(uint32_t size, const char *what, uint32_t iova);	/* the same at a fixed IOVA */
 /* an IOSurface by id (no mapping in this process needed); IOVA or 0; info: width, height, bytesPerRow, format */
 uint32_t vmmu_map_surface(uint32_t id, uint32_t *len, uint32_t info[4]);
-uint32_t vmmu_map_user(void *p, size_t len, const char *what);	/* any page-aligned memory of ours */
+uint32_t vmmu_map_user(void *p, size_t len, const char *what);
+uint32_t vmmu_map_phys(uint64_t pa, uint32_t len, uint32_t iova, const char *what);	/* window memory */	/* any page-aligned memory of ours */
 int vmmu_unmap(uint32_t iova);
 /* buffer I/O: 1 = done (pa is a vmmu buffer), 0 = not ours (caller uses /dev/pmem), -1 = error */
 int vmmu_io(uint64_t pa, void *buf, size_t len, int write);

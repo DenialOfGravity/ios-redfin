@@ -3382,6 +3382,64 @@ static int dec_close(int started)
 	return bad;
 }
 
+/* venus-iommu CVP test (VENUSCTL_NP_ASSIGN=1): window memory hyp-assigned to VMID_CP_NON_PIXEL as stock's ION secure
+ * heap does for the encoder's persist buffer (secure_buffer.c hyp_assign_table: SCM svc MP 0x0c cmd 0x16, 7 args,
+ * args 3.. in a buffer at x5; lists: {u64 addr, u64 size}, u32 source VMIDs, {u32 vm, u32 perm, u64 ctx, u32 ctx_size}
+ * packed). Assigned back to HLOS at exit. */
+#define VMID_HLOS	3u
+#define VMID_CP_NP	0xbu
+static uint64_t np_pa, np_len, np_lists;
+static int np_assigned;
+static int hyp_assign(uint64_t pa, uint64_t len, uint32_t from, uint32_t to, uint32_t perm)
+{
+	uint8_t b[0x100];
+	memset(b, 0, sizeof(b));
+	uint64_t reg[2] = { pa, len };
+	uint32_t src = from;
+	uint8_t dst[20] = { 0 };
+	memcpy(dst, &to, 4);
+	memcpy(dst + 4, &perm, 4);
+	memcpy(b, reg, 16);		/* +0x00 region list */
+	memcpy(b + 0x40, &src, 4);	/* +0x40 source list */
+	memcpy(b + 0x80, dst, 20);	/* +0x80 dest list */
+	uint64_t ext[7] = { 4, np_lists + 0x80, 20, 0, 0, 0, 0 };	/* args 3..9 */
+	memcpy(b + 0xc0, ext, sizeof(ext));
+	if (pm_wr(np_lists, b, sizeof(b)))
+		return -1;
+	uint64_t x[8] = { 0x42000c16ull, 0x1117ull, np_lists, 16, np_lists + 0x40, np_lists + 0xc0, 0, 0 };
+	pm_smc(x);
+	printf("venus: hyp assign %#llx+%#llx VMID %#x -> %#x perm %#x: x0 %#llx x1 %#llx\n", (unsigned long long)pa,
+	       (unsigned long long)len, from, to, perm, (unsigned long long)x[0], (unsigned long long)x[1]);
+	pm_step("hyp assign %#llx -> vmid %#x: %#llx", (unsigned long long)pa, to, (unsigned long long)x[0]);
+	return x[0] ? -1 : 0;
+}
+static void np_unassign(void)
+{
+	if (np_assigned && !hyp_assign(np_pa, np_len, VMID_CP_NP, VMID_HLOS, 7))
+		np_assigned = 0;
+}
+/* persist for the CVP test: window memory (bump allocator, not zeroed again), assigned to CP_NON_PIXEL, mapped at
+ * the non-pixel IOVA. Device address or 0 */
+uint32_t np_persist(uint32_t size, uint32_t iova)
+{
+	uint64_t a = (dc.top + 0xffff) & ~0xffffull, len = (size + 0xffffu) & ~0xffffull;
+	if (a + len + 0x1000 > dc.lim)
+		return 0;
+	static uint8_t z[0x10000];
+	for (uint64_t o = 0; o < len; o += sizeof(z))
+		if (pm_wr(a + o, z, sizeof(z)))
+			return 0;
+	np_lists = a + len;
+	dc.top = np_lists + 0x1000;
+	np_pa = a;
+	np_len = len;
+	if (hyp_assign(a, len, VMID_HLOS, VMID_CP_NP, 6))
+		return 0;
+	np_assigned = 1;
+	atexit(np_unassign);
+	return vmmu_map_phys(a, (uint32_t)len, iova, "persist (CP non-pixel)");
+}
+
 /* venus-iommu CVP test (VENUSCTL_NP_SMR=1): the extra non-pixel SMR, released when this process exits */
 static struct smmu_saved np_saved;
 static int np_on;
