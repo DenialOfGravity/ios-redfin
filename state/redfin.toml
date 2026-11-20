@@ -674,15 +674,15 @@ sha = ""
 
 [[file]]
 path = "/var/local/bin/venusd"
-source = "builds/userland/redfin-int-8008c6a77b/venusd"
-sha256 = "74fbca14f3955214555716fd85833aadb37148476652514a48055b061e733eea"
+source = "builds/userland/redfin-int-1afdf8c2b7/venusd"
+sha256 = "326975bc0222e5b8b3df0f14c404dfea4e848efd3e44af17ce08ccf535f5e1d7"
 mode = "755"
 owner = "0:0"
 target = "userland"
 ref = "redfin-int"
-sha = "8008c6a77b"
+sha = "1afdf8c2b7"
 restart = "venusd"
-note = "2026-11-20: ws-vt-venc merged (redfin-int 8008c6a): encode protocol v3 (ENC_OPEN/FRAME/DATA/QP, zero-copy IOSurface input) for vtvenc.dylib; started at boot by launchd job org.iosonpixel.venusd (needs /var/local/venus.on). Previous 4ad063ed (redfin-int 42013d7)"
+note = "2026-11-20: ws-vt-venc merged (redfin-int 8008c6a): encode protocol v3 (ENC_OPEN/FRAME/DATA/QP, zero-copy IOSurface input) for vtvenc.dylib; started at boot by launchd job org.iosonpixel.venusd (needs /var/local/venus.on); 1afdf8c rechecks kern.sweet_vmmu at each OPEN (launchd starts venusd before boot.conf sets it). Previous 4ad063ed (redfin-int 42013d7)"
 
 [[file]]
 path = "/var/local/bin/vtdecode"
