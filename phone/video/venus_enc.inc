@@ -18,7 +18,7 @@
  * Switches (env): VENUSCTL_ENC_SKIP=name,name (properties not sent, names as printed), VENUSCTL_ENC_STRICT=1 (a
  * refused property (0x1002/0x1007/0x1008) stops the session; default: noted, skipped), VENUSCTL_ENC_NIN/NOUT (counts),
  * VENUSCTL_ENC_LAYER (bitrate/qp layer id, default 0xff = all layers), VENUSCTL_ENC_WORKMODE (1|2, default 2; 1 adds
- * LOW_LATENCY as downstream), VENUSCTL_ENC_TSRC=1 (firmware derives time deltas from the frame rate), VENUSCTL_BUF_MB.
+ * LOW_LATENCY as downstream), VENUSCTL_ENC_DEBUG=MASK (firmware debug mask from LOAD on), VENUSCTL_ENC_TSRC=1 (firmware derives time deltas from the frame rate), VENUSCTL_BUF_MB.
  * --stop-at STAGE: sessinit props alloc load start ftb (watch 2 s, then close).
  */
 #define VE_DOMAIN_ENC	1u		/* HFI_VIDEO_DOMAIN_ENCODER */
@@ -412,6 +412,11 @@ int encode(const struct venc_cfg *c, const char *in, const char *outp)
 	       (unsigned long long)((dc.top - dc.base) >> 10));
 	if (ve_stage("alloc", t0))
 		goto watch;
+	if (getenv("VENUSCTL_ENC_DEBUG")) {	/* the firmware's debug mask raised only now (fewer lines during setup) */
+		uint32_t dbg[7] = { 28, 0x10005, 1, 0x1, (uint32_t)strtoul(getenv("VENUSCTL_ENC_DEBUG"), NULL, 0), 1, 0 };
+		if (q_write(dbg) || wait_msg(0, 5))
+			goto close;
+	}
 	if (sess_cmd(S_LOAD_RES) || wait_msg(M_LOAD_DONE, 1000))
 		goto close;
 	if (ve_stage("load", t0))

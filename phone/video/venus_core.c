@@ -1686,7 +1686,10 @@ static int q_read(unsigned i)
 	}
 	wr32(qhdr(i) + QH_RX_REQ, nr != wi ? 0 : want_rx);
 	wr32(qhdr(i) + QH_READ, nr);
-	if (pm_stepping() && got > 0)
+	static int dbghex = -1;	/* ws-venus-enc: VENUSCTL_STEP_DBGHEX=0: no hex line for debug packets (the text follows) */
+	if (dbghex < 0)
+		dbghex = !getenv("VENUSCTL_STEP_DBGHEX") || atoi(getenv("VENUSCTL_STEP_DBGHEX"));
+	if (pm_stepping() && got > 0 && (i == 1 || dbghex))
 		pm_step("HFI %s pkt %#x size %u: %08x %08x %08x %08x %08x %08x", i == 1 ? "msg" : "dbg", pkt[1], pkt[0],
 			got > 2 ? pkt[2] : 0, got > 3 ? pkt[3] : 0, got > 4 ? pkt[4] : 0, got > 5 ? pkt[5] : 0,
 			got > 6 ? pkt[6] : 0, got > 7 ? pkt[7] : 0);
