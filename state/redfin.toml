@@ -180,6 +180,9 @@ scratch = "/var/local/scratch"
 "kern.sweet_mlink_idle_us" = 4000
 "kern.sweet_mqrtr_aux" = 1
 "kern.sweet_wifi_sig" = 35
+# 2026-11-20 (owner): camera switches of the private camera kernel ([boot] priv-simhold), set every boot via boot.conf: IFE pixel path for preview + stills, IOSurface in-use (1258). Were temp overrides lost on every reboot (stills fell back to 3088x2320 CPU path).
+"kern.sweet_ife" = 1
+"kern.sweet_surf_inuse" = 1
 "kern.sweet_mtl" = 2
 "kern.sweet_nfc_fwif" = 21
 "kern.sweet_nfc_fwif_fmt" = 23878928
@@ -1448,6 +1451,8 @@ kern.sweet_pace_min=2000
 kern.sweet_mqrtr_aux=1
 kern.sweet_qmux_pds=1
 kern.sweet_wifi_sig=35
+kern.sweet_ife=1
+kern.sweet_surf_inuse=1
 """
 mode = "644"
 
