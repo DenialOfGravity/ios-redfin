@@ -1575,6 +1575,8 @@ int smmu_cmd(void)
 	return 0;
 }
 
+static int hwctl_early(void);
+static void hwctl_handoff(const char *when);
 int boot(const char *fw, int keep)
 {
 	struct vstate v;
@@ -1711,6 +1713,8 @@ int boot(const char *fw, int keep)
 			return boot_fail(&v);
 	}
 	smmu_snapshot("after mem protect");
+	if (hwctl_early() && !getenv("VENUSCTL_LINUX"))
+		hwctl_handoff("after auth + mem protect (stock __load_fw order)");
 	if (getenv("VENUSCTL_LINUX")) {	/* __hand_off_regulators: vcodec and cvp to HW control */
 		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
 		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
@@ -2083,6 +2087,12 @@ static int dspq_setup(uint64_t q)
 	return 0;
 }
 
+static int hwctl_early(void)	/* h11: handed off after CTRL_INIT, the fw never powers mvs0 (0 FBDs even RC off):
+				 * stock hands off after auth + mem protect, BEFORE CTRL_INIT (and at resume before it) */
+{
+	return getenv("VENUSCTL_HWCTL_EARLY") && atoi(getenv("VENUSCTL_HWCTL_EARLY"));
+}
+
 /* (h) VENUSCTL_HWCTL=1: stock __hand_off_regulators (vcodec + cvp GDSCs to HW) once the firmware runs (after CTRL_INIT,
  * so our split boot/init does not collapse mvs0 under a firmware that has not started: e11) */
 static void hwctl_handoff(const char *when)
@@ -2196,7 +2206,7 @@ int init(uint64_t phys)
 	}
 	v.init = (st & ST_INIT) && !(st & ST_ERROR);
 	state_save(&v);
-	if (v.init)
+	if (v.init && !hwctl_early())
 		hwctl_handoff("after CTRL_INIT");
 	printf("venus: CTRL_STATUS %#010x after %u ms: init %u, error %#x%s\n", st, ms, st & ST_INIT, st & ST_ERROR,
 	       (st & ST_ERROR) == 4 ? " (invalid UC_REGION)" : "");
@@ -4090,6 +4100,8 @@ int resume_cmd(void)
 		wr(CS_VMIMSGAG0, (uint32_t)dspq_addr(), "DSP_UC_REGION_ADDR (own block)");
 		wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
 	}
+	if (hwctl_early())
+		hwctl_handoff("resume, before CTRL_INIT (stock __resume order)");
 	wr(CTRL_INIT, ctrl3_on() ? 3 : 1, "CTRL_INIT (resume)");
 	double t0 = mono_ms();
 	uint32_t st = 0;
@@ -4101,7 +4113,7 @@ int resume_cmd(void)
 	}
 	printf("venus: resume: CTRL_STATUS %#010x after %.0f ms%s\n", st, mono_ms() - t0,
 	       (st & ST_INIT) && !(st & ST_ERROR) ? " (init ok)" : " FAILED");
-	if ((st & ST_INIT) && !(st & ST_ERROR))
+	if ((st & ST_INIT) && !(st & ST_ERROR) && !hwctl_early())
 		hwctl_handoff("resume");
 	unlink(PC_FLAG);
 	return (st & ST_INIT) && !(st & ST_ERROR) ? 0 : 1;
