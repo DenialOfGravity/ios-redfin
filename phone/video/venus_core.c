@@ -3113,7 +3113,9 @@ static int dec_close(int started)
 		return 1;
 	}
 	wait_soft = 1;
-	if (started) {
+	if (getenv("VENUSCTL_TEST_ABORT") && atoi(getenv("VENUSCTL_TEST_ABORT")) && !sess_abort("test (VENUSCTL_TEST_ABORT)"))
+		ab = 1;	/* test: the abort path instead of the close sequence (does the firmware answer ABORT_DONE?) */
+	if (started && !ab) {
 		uint32_t fl[4] = { 16, S_FLUSH, SESSION_ID, FLUSH_ALL };	/* msm_comm_flush (msm_vidc_common.c:5379) */
 		bad |= close_step(q_write(fl), M_FLUSH_DONE, "FLUSH", &ab);
 		if (!ab)	/* msm_vidc_stop (3485) */
