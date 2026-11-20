@@ -4,7 +4,8 @@
  * written as an Annex B elementary stream (parameter sets before every sync sample) for ffprobe/ffmpeg.
  * usage: vtenc_test [-c avc1|hvc1] [-s WxH] [-n FRAMES] [-f FPS] [-b BITRATE] [-o OUT] [-i IN.nv12 (tight NV12 WxH)]
  *                   [-p pool|own|venus] [-r 0|1 (real time pacing at FPS, default 1)] [-e ENCODER-ID] [-k KEYSECS]
- *                   [-N (don't register vtvenc)] [-L DYLIB]
+ *                   [-N (don't register vtvenc)] [-L DYLIB] [-V (register VCPHEVC's software encoder first, as
+ *                   mediaserverd does)]
  *   -p pool: buffers from the session's pixel buffer pool (default); own: CVPixelBufferCreate with IOSurface (any
  *      layout CoreVideo picks); venus: own buffers in Venus's NV12 layout (stride 128, rows 32: zero-copy in venusd).
  * Prints the encoder VideoToolbox took, ms per frame, fps, sync samples, bytes, CPU of this process.
@@ -193,10 +194,10 @@ int main(int argc, char **argv)
 {
 	const char *codec = "avc1", *outp = NULL, *inp = NULL, *pool_mode = "pool", *enc_id = NULL,
 		   *dylib = "/var/local/lib/vtvenc.dylib";
-	int w = 1920, h = 1080, nf = 300, rt = 1, reg = 1;
+	int w = 1920, h = 1080, nf = 300, rt = 1, reg = 1, vcp = 0;
 	double fps = 30, br = 15300000, keysecs = 1;
 	int o;
-	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:")) != -1) {
+	while ((o = getopt(argc, argv, "c:s:n:f:b:o:i:p:r:e:k:NL:V")) != -1) {
 		switch (o) {
 		case 'c': codec = optarg; break;
 		case 's': sscanf(optarg, "%dx%d", &w, &h); break;
@@ -211,12 +212,28 @@ int main(int argc, char **argv)
 		case 'k': keysecs = atof(optarg); break;
 		case 'N': reg = 0; break;
 		case 'L': dylib = optarg; break;
+		case 'V': vcp = 1; break;
 		default: fprintf(stderr, "usage: see the source header\n"); return 2;
 		}
 	}
 	if (nf > 99999)
 		nf = 99999;
 	hevc = !strcmp(codec, "hvc1");
+	if (vcp) {
+		void *c = dlopen("/System/Library/VideoCodecs/VCPHEVC.videocodec", RTLD_NOW | RTLD_LOCAL);
+		void *create = c ? dlsym(c, "HEVCVideoEncoder_CreateInstance") : NULL;
+		int (*re)(uint32_t, CFDictionaryRef, void *) = dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
+		if (create && re) {
+			const void *k[] = { kVTVideoEncoderList_EncoderID, kVTVideoEncoderList_EncoderName,
+				kVTVideoEncoderList_IsHardwareAccelerated };
+			const void *v[] = { CFSTR("com.apple.videotoolbox.videoencoder.hevc.vcp"), CFSTR("HEVC (VCPHEVC, software)"),
+				kCFBooleanFalse };
+			CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 3, &kCFTypeDictionaryKeyCallBacks,
+								  &kCFTypeDictionaryValueCallBacks);
+			printf("vtenc_test: VCPHEVC registered for hvc1 (%d)\n", re('hvc1', info, create));
+			CFRelease(info);
+		}
+	}
 	if (reg) {
 		void *d = dlopen(dylib, RTLD_NOW | RTLD_LOCAL);
 		int (*r)(void) = d ? (int (*)(void))dlsym(d, "VTVenusEncRegister") : NULL;
