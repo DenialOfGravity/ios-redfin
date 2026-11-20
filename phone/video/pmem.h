@@ -38,6 +38,13 @@ struct pmem_rpmh {
 };
 #define PMEM_RPMH	_IOW('P', 5, struct pmem_rpmh)
 #define PMEM_ALLOC32	_IOWR('P', 6, struct pmem_alloc)	/* below 4 GB (kernel109+, xnu 0232) */
+/* xnu 1269: PMEM_RPMH as one named client (0..8; venus 1): kern.sweet_rpmh_agg aggregates the clients' BCM votes */
+struct pmem_rpmh_cl {
+	uint32_t client;
+	struct pmem_rpmh r;
+};
+#define PMEM_RPMH_CL	_IOW('P', 9, struct pmem_rpmh_cl)
+#define PMEM_RPMH_CL_VENUS	1u
 
 void pm_init(void);			/* exits if /dev/pmem is missing */
 uint32_t rd32(uint64_t pa);
@@ -52,6 +59,7 @@ int pm_free(uint64_t pa);
 void pm_smc(uint64_t x[8]);		/* x0..x7 in, x0..x3 out */
 int pm_list(struct pmem_list *l);
 int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *val);	/* errno or 0 */
+int pm_rpmh_cl(unsigned client, const char *res, unsigned n, const uint32_t *off, const uint32_t *val);	/* 1269; ENOTTY: old kernel */
 void delay_ms(unsigned ms);
 /* redfin track V: venusctl --step FILE: writes/SMCs/votes logged and fsynced before they happen */
 int pm_step_open(const char *path);

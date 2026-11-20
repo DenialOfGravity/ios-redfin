@@ -283,3 +283,18 @@ int pm_rpmh(const char *res, unsigned n, const uint32_t *off, const uint32_t *va
 	}
 	return ioctl(pm_fd, PMEM_RPMH, &r) < 0 ? errno : 0;
 }
+
+int pm_rpmh_cl(unsigned client, const char *res, unsigned n, const uint32_t *off, const uint32_t *val)
+{
+	struct pmem_rpmh_cl c;
+	memset(&c, 0, sizeof(c));
+	c.client = client;
+	snprintf(c.r.res, sizeof(c.r.res), "%s", res);
+	c.r.n = n;
+	pm_step("rpmh client %u %s n %u: off %#x val %#x", client, res, n, n ? off[0] : 0, n ? val[0] : 0);
+	for (unsigned i = 0; i < n && i < 4; i++) {
+		c.r.offset[i] = off[i];
+		c.r.value[i] = val[i];
+	}
+	return ioctl(pm_fd, PMEM_RPMH_CL, &c) < 0 ? errno : 0;
+}

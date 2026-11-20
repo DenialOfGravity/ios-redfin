@@ -328,6 +328,8 @@ int main(int argc, char **argv)
 		return suspend_cmd();
 	if (!strcmp(cmd, "resume") && !arg)
 		return resume_cmd();
+	if (!strcmp(cmd, "bus") && arg)	/* rpmh-agg */
+		return bus_cmd(strtoull(arg, NULL, 0));
 usage:
 	fprintf(stderr, "usage: venusctl [-v] probe | rails (read-only) | power on|off [--cvp] [--force] | pas-check [--fw DIR] [--no-shutdown]\n"
 		"       | boot [--fw DIR] [--keep] | init [--phys ADDR] | ping [--debug MASK]\n"
@@ -344,6 +346,7 @@ usage:
 		"         [--profile P] [--level L] [--bufphys A] [--stop-at sessinit|props|alloc|load|start|ftb]\n"
 		"         (after boot --keep + init: NV12 frames -> Annex B; env VENUSCTL_ENC_SKIP=prop,prop ...)\n"
 		"       | memtest ADDR SIZE write|check\n"
+		"       | bus KBPS (rpmh-agg: vote the venus path now; env VENUSCTL_BUS_CLIENT=N, VENUSCTL_AGG=0|1)\n"
 		"       | fwdump [ADDR] (read-only, after a reset: SFR, debug ring, queues of the HFI block, default 0xa2600000)\n"
 		"       P0d watch env (default off): VENUSCTL_PC=1 [VENUSCTL_PC_DELAY_MS=1500] VENUSCTL_INTCLR=1\n"
 		"       ws-video-dec: decode --clip env VENUSCTL_PING_MS (idle keepalive ms, default 1000) VENUSCTL_NOCOPY;\n"
