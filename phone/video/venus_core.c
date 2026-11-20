@@ -2040,8 +2040,8 @@ static int wait_msg(uint32_t want, unsigned ms)
  * the 3 MB queue block (q + 3 MB .. the buffer window's default start at q + 4 MB), table + 3 queues of 320 KB, never
  * read by us (no fastcvpd here; stock's "dsp init failed" under TWRP too). */
 #define DSPQ_OFF	0x300000u
-#define DSPQ_SIZE	0x100000u
-#define DSPQ_QSIZE	0x50000u
+#define DSPQ_SIZE	0xf0000u	/* q + 3 MB .. q + 0x3f0000: the SMMU tables sit at q + 0x3fe000 (h2 wiped them) */
+#define DSPQ_QSIZE	0x4f000u
 static int ctrl3_on(void)
 {
 	return getenv("VENUSCTL_CTRL_INIT3") && atoi(getenv("VENUSCTL_CTRL_INIT3"));
@@ -2070,8 +2070,8 @@ static int dspq_setup(uint64_t q)
 	wr(CS_VMIMSG, (uint32_t)d, "DSP_QTBL_ADDR (own block)");
 	wr(CS_VMIMSGAG0, (uint32_t)d, "DSP_UC_REGION_ADDR (own block)");
 	wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
-	printf("venus: cvp_internal: DSP queue block %#llx (1 MB, 3 x %#x), CTRL_INIT 3\n", (unsigned long long)d,
-	       DSPQ_QSIZE);
+	printf("venus: cvp_internal: DSP queue block %#llx (%#x, 3 x %#x), CTRL_INIT 3\n", (unsigned long long)d,
+	       DSPQ_SIZE, DSPQ_QSIZE);
 	return 0;
 }
 
