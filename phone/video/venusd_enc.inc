@@ -43,11 +43,13 @@ static void enc_reset(void)
 }
 
 /* the client's bit rate -> a constant QP for rate control off: ~bits per pixel, H.264 QP 30 at 0.1 bpp, 6 QP per
- * doubling (the usual log rule); clamped to 16..42 */
+ * doubling (the usual log rule), biased +6 for camera noise; clamped to 16..42 */
 static void enc_qp_for(uint32_t bitrate, uint32_t w, uint32_t h, double fps, int hevc, uint32_t *qi, uint32_t *qp)
 {
 	double bpp = bitrate && w && h && fps > 0 ? bitrate / ((double)w * h * fps) : 0.1;
-	double q = 30.0 - 6.0 * log2(bpp / 0.1) - (hevc ? 2.0 : 0.0);
+	/* +6: the camera's sensor noise (gain 8x indoors) made ~10x the bits of the rule at QP 23 (148 Mbit/s for 15.3);
+	 * the client's rate control (vtvenc) moves it from here */
+	double q = 36.0 - 6.0 * log2(bpp / 0.1) - (hevc ? 2.0 : 0.0);
 	int v = (int)lround(q);
 	v = v < 16 ? 16 : v > 42 ? 42 : v;
 	*qi = (uint32_t)(v - 1), *qp = (uint32_t)(v + 1);

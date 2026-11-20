@@ -16,8 +16,9 @@
  * The venusd session opens lazily at the first frame (the properties are set by then), closes at Invalidate.
  * Never crashes its host: every failure is a VT error or a dropped frame and a log line.
  * Switches: env or KEY=VALUE lines in /var/local/vtvenc-env (read once per process; the file wins):
- *   VTVENC_HEVC (1): register hvc1 too.   VTVENC_ATTR (0): 1 = ask VT for buffers in Venus's layout (bytes per row
- *   aligned to 128, rows to 32) instead of passing any 420v/420f through.  VTVENC_QP=I[:P]: fixed QP (else from the
+ *   VTVENC_HEVC (1): register hvc1 too.   VTVENC_ATTR (1): ask VT for buffers in Venus's layout (bytes per row aligned
+ *   to 128, rows to 32, planes page aligned): CMCapture's pool follows it, so the camera's surfaces go to Venus as they
+ *   are (zero-copy); 0 = any 420v/420f passes through (venusd copies what doesn't fit).  VTVENC_QP=I[:P]: fixed QP (else from the
  *   bit rate).  VTVENC_SEQHDR (0): 1 = parameter sets in band before every IDR.  VTVENC_INFLIGHT (12): frames out
  *   at once before EncodeFrame waits.  VTVENC_LOG (0): 1 = a line per frame.  VTVENC_RC (1): host rate control: the
  *   constant QP follows the measured bit rate toward AverageBitRate (DataRateLimits as a cap), ENC_QP to venusd;
@@ -98,7 +99,7 @@ enum {	/* VTErrors.h */
 };
 #define INFO_DROPPED	2u	/* kVTEncodeInfo_FrameDropped */
 
-static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc, early_ms; } cfg = { 1, 0, 0, 0, 0, 12, 0, 1, 1000, 1, 1, 40 };
+static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc, early_ms; } cfg = { 1, 1, 0, 0, 0, 12, 0, 1, 1000, 1, 1, 40 };
 static pthread_once_t cfg_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -491,7 +492,7 @@ static int rc_step(struct ve *v, size_t len)
 	}
 	int step = (int)lround(3.0 * log2(ratio));
 	step = step > 4 ? 4 : step < -3 ? -3 : step;
-	if (!step)
+	if (ratio < 2 && ratio > 0.5)	/* near the target: one QP at a time (noisy pictures swing ~40 % a QP step) */
 		step = ratio > 1 ? 1 : -1;
 	int q = v->qp + step;
 	q = q < 12 ? 12 : q > 51 ? 51 : q;
