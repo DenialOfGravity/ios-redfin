@@ -1,0 +1,61 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] 1268 redfin: xram=5/6 (15/16 with the high bank) = 3/4 plus a 2 MB guard around the kept-out Venus ranges (ws-venus-hw)
+
+With xram=3/4/13 the tier-1 range 0x86f00000-0x87400000 starts right after pil_video (0x86a00000-0x86f00000), so
+XNU's pages 0x86f00000-0x87000000 share pil_video's 2 MB block. Venus PAS boots (init_image + mem_setup) then reset
+the phone at random within seconds (warm, secure-side: no PMIC reason, no SMMU/NoC precursor), while the stock
+kernel in TWRP runs the same firmware for 10+ min; with xram=0 (and the PAS metadata out of XNU RAM) the Venus core
+stays up. Ones digit 5/6 = 3/4 with every xram range edge that touches a kept-out Venus range trimmed to 2 MB
+(costs 1 MB: 0x86f00000-0x87000000; the window's neighbours are already 2 MB aligned). Default and xram=0..4, 1x..4x
+unchanged. Klog: "SWEET XRAM: 1268 2 MB guard by Venus: ...".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index fe3400d..ad1f760 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -457,6 +457,17 @@ hakios_extra_ram_init(void)
+ 	if (!PE_parse_boot_argn("sweetvenus", &sweet_xram_venus, sizeof(sweet_xram_venus))) {
+ 		sweet_xram_venus = 0;
+ 	}
++	/*
++	 * 1268 (venus-hw): ones digit 5 / 6 = 3 / 4 plus a 2 MB guard: an xram range that touches a kept-out Venus range
++	 * (pil_video 0x86a00000-0x86f00000, the window 0xa2600000-0xaca00000) is trimmed to the next 2 MB boundary there,
++	 * so no XNU page shares a 2 MB block with a region TZ takes at PAS init_image/mem_setup (with 3/4, the 1 MB
++	 * 0x86f00000-0x87000000 sits in pil_video's block: Venus PAS boots reset the phone at random, 2026-11-20).
++	 */
++	bool vgap = false;
++	if (tier == 5 || tier == 6) {
++		tier -= 2;
++		vgap = true;
++	}
+ 	if (tier >= 3) {                /* 3 = 1, 4 = 2, both without the Venus ranges */
+ 		tier -= 2;
+ 		if (sweet_xram_venus == 0) {
+@@ -472,7 +483,24 @@ hakios_extra_ram_init(void)
+ 		if (sweet_xram_ranges[i].tier > tier || (sweet_xram_ranges[i].venus && sweet_xram_venus != 0)) {
+ 			continue;
+ 		}
+-		hakios_extra_ram_add(sweet_xram_ranges[i].pa, sweet_xram_ranges[i].end, first_pai);
++		uint64_t xpa = sweet_xram_ranges[i].pa, xend = sweet_xram_ranges[i].end;
++		const unsigned int nr = sizeof(sweet_xram_ranges) / sizeof(sweet_xram_ranges[0]);
++		if (vgap && sweet_xram_venus != 0) {    /* 1268 */
++			if (i > 0 && sweet_xram_ranges[i - 1].venus && sweet_xram_ranges[i - 1].end == xpa) {
++				xpa = (xpa + 0x1fffffULL) & ~0x1fffffULL;
++			}
++			if (i + 1 < nr && sweet_xram_ranges[i + 1].venus && sweet_xram_ranges[i + 1].pa == xend) {
++				xend &= ~0x1fffffULL;
++			}
++			if (xpa != sweet_xram_ranges[i].pa || xend != sweet_xram_ranges[i].end) {
++				printf("SWEET XRAM: 1268 2 MB guard by Venus: 0x%llx..0x%llx -> 0x%llx..0x%llx\n",
++				    (unsigned long long)sweet_xram_ranges[i].pa, (unsigned long long)sweet_xram_ranges[i].end,
++				    (unsigned long long)xpa, (unsigned long long)xend);
++			}
++		}
++		if (xend > xpa) {
++			hakios_extra_ram_add(xpa, xend, first_pai);
++		}
+ 	}
+ 	/* 1142: the high bank, after the low bank's ranges (their pages keep the indices they had) */
+ 	if (hi != 0) {
