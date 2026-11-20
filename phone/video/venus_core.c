@@ -2039,9 +2039,15 @@ static int wait_msg(uint32_t want, unsigned ms)
  * hfi_iris1.c __setup_ucregion_memory_map_iris1) and CTRL_INIT = 3. VENUSCTL_CTRL_INIT3=1: a 1 MB DSP block right after
  * the 3 MB queue block (q + 3 MB .. the buffer window's default start at q + 4 MB), table + 3 queues of 320 KB, never
  * read by us (no fastcvpd here; stock's "dsp init failed" under TWRP too). */
-#define DSPQ_OFF	0x300000u
-#define DSPQ_SIZE	0xf0000u	/* q + 3 MB .. q + 0x3f0000: the SMMU tables sit at q + 0x3fe000 (h2 wiped them) */
-#define DSPQ_QSIZE	0x4f000u
+/* h2: q + 3 MB wiped the window bank's tables (q + 0x3fe000); h5: a 0xf0000 region = "invalid UC_REGION" (the fw
+ * wants 1 MB granules). So 1 MB at VENUSCTL_DSPQ (default 0xac800000, the window's top below the PAS metadata page;
+ * only for venusctl tests: venusd's 160 MB buffer window reaches it) */
+#define DSPQ_SIZE	0x100000u
+#define DSPQ_QSIZE	0x50000u
+static uint64_t dspq_addr(void)
+{
+	return getenv("VENUSCTL_DSPQ") ? strtoull(getenv("VENUSCTL_DSPQ"), NULL, 0) : 0xac800000ull;
+}
 static int ctrl3_on(void)
 {
 	return getenv("VENUSCTL_CTRL_INIT3") && atoi(getenv("VENUSCTL_CTRL_INIT3"));
@@ -2049,7 +2055,8 @@ static int ctrl3_on(void)
 
 static int dspq_setup(uint64_t q)
 {
-	uint64_t d = q + DSPQ_OFF;
+	(void)q;
+	uint64_t d = dspq_addr();
 	static uint8_t z[0x10000];
 	for (uint32_t o = 0; o < DSPQ_SIZE; o += sizeof(z))
 		if (pm_wr(d + o, z, sizeof(z)))
@@ -3187,7 +3194,7 @@ static int close_step(int sent_bad, uint32_t want, const char *what, int *aborte
 {
 	if (*aborted)
 		return 0;
-	if (sent_bad)
+	if (sent_bad || fw_dead)	/* h3: after a failed abort, no more 1 s waits */
 		return 1;
 	if (!wait_msg(want, 1000))
 		return 0;
@@ -4076,8 +4083,8 @@ int resume_cmd(void)
 	wr(CS_VMIMSGAG0, (uint32_t)q, "DSP_UC_REGION_ADDR");
 	wr(CS_VMIMSGAG1, QSHARED, "DSP_UC_REGION_SIZE");
 	if (ctrl3_on()) {	/* (h): the DSP queue block survives the collapse (DRAM); only the registers again */
-		wr(CS_VMIMSG, (uint32_t)(q + DSPQ_OFF), "DSP_QTBL_ADDR (own block)");
-		wr(CS_VMIMSGAG0, (uint32_t)(q + DSPQ_OFF), "DSP_UC_REGION_ADDR (own block)");
+		wr(CS_VMIMSG, (uint32_t)dspq_addr(), "DSP_QTBL_ADDR (own block)");
+		wr(CS_VMIMSGAG0, (uint32_t)dspq_addr(), "DSP_UC_REGION_ADDR (own block)");
 		wr(CS_VMIMSGAG1, DSPQ_SIZE, "DSP_UC_REGION_SIZE (own block)");
 	}
 	wr(CTRL_INIT, ctrl3_on() ? 3 : 1, "CTRL_INIT (resume)");
