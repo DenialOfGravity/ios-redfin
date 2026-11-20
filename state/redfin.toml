@@ -221,7 +221,8 @@ scratch = "/var/local/scratch"
 "kern.sweet_qmux_pds" = 1
 "kern.sweet_qmux_pds_ms" = 400
 "kern.sweet_qmux_reuse" = 1
-"kern.sweet_rpmh_recover" = 0
+"kern.sweet_rpmh_recover" = 2
+# 2026-11-20 (owner): rpmh_recover 2 (was 0): a single RPMh vote timeout (seen twice with Venus power collapse/resume) no longer locks out all bus/power votes until a reboot; also set in boot.conf
 "kern.sweet_scangate_flag" = 1
 "kern.sweet_scangate_mode" = 1
 "kern.sweet_scangate_queue" = 1
@@ -657,8 +658,8 @@ sha = "f0602dcaad"
 
 [[file]]
 path = "/var/local/bin/venusctl"
-source = "builds/userland/ws-video-dec-2c5f672d34/venusctl"
-sha256 = "0ea612bb1fb52b1f6de9573de669124989d1b950bb63552c949515cef79b6e31"
+source = "builds/userland/ws-venus-robust-30ad4e4b75/venusctl"
+sha256 = "22c638bf76be9d4ae835fa0e5ea8a5dca0e1d196a4d7fb52dd769e1307a2e19b"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -667,8 +668,8 @@ sha = ""
 
 [[file]]
 path = "/var/local/bin/venusd"
-source = "builds/userland/ws-int-k12v-699fb28b94/venusd"
-sha256 = "d042feb6bb423551ba1fd6df60bba2dc48badaeff455d04abd4c0725d6795193"
+source = "builds/userland/ws-venus-robust-c457f4e789/venusd"
+sha256 = "00f6188568a46ae368ccb8beef266e0cb15653dcd3b83558d213d2a8aa062e3b"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -1454,6 +1455,7 @@ kern.sweet_qmux_pds=1
 kern.sweet_wifi_sig=35
 kern.sweet_ife=1
 kern.sweet_surf_inuse=1
+kern.sweet_rpmh_recover=2
 """
 mode = "644"
 
