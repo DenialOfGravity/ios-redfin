@@ -1,0 +1,196 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 94abba7..34332ac 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -288,6 +288,57 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++/*
++ * 1277: kern.sweet_rpmh_tcs (default 0 = unchanged). The "TCS0 in flight" timeouts of 2026-11-20 (venus MM3/MM2 at
++ * power on / resume) end with the TCS idle and every CMD_STATUS ISSUED|COMPLETE, the same state every completed vote
++ * leaves: the vote had completed. done=0 came from the completion test: this driver masks the TCS's IRQ, IRQ_STATUS
++ * then never sets (77 of 77 completed votes that day read irq=0), so completion rests on seeing the TCS busy or a
++ * CMD_STATUS not complete at least once ("progress"). If the thread is interrupted or preempted between the trigger
++ * write and its first poll for longer than the vote takes (camera start, GPU busy), it only sees the end state, which
++ * reads exactly like the stale state of the previous vote in that TCS: no progress, 100000 polls (~2.6 s), quarantine.
++ *   bit 0 (1): the trigger write and the first polls (until progress, at most RH_FAST_US) with interrupts off, so the
++ *              first poll follows the trigger within one register read.
++ *   bit 1 (2): an ambiguous state (idle + every command complete, no progress seen) for RH_AMBIG_POLLS polls is
++ *              re-triggered (same commands: ACTIVE writes of absolute values, idempotent) up to RH_RETRIG_N times,
++ *              instead of waiting out the timeout.
++ *   bit 2 (4): still ambiguous after those re-triggers: accepted as completed (klog line) instead of the quarantine.
++ * kern.sweet_rpmh_tcs_test (RW, default 0, test only): busy-wait N us (max 5000) between the first trigger of a vote
++ * and its first poll (not with bit 0): the preemption window, made on purpose, to reproduce the false timeout.
++ * kern.sweet_rpmh_tcs_stats (RD): votes, fast-seen (bit 0 saw progress), ambiguous, re-triggers, accepted, timeouts,
++ * gapmax (longest trigger -> first poll, us, without bit 0).
++ */
++#define RH_FAST_US      50u
++#define RH_AMBIG_POLLS  40u      /* ~1 ms at the ~26 us that delay(1) takes here */
++#define RH_RETRIG_N     3u
++static unsigned rh_tcsmode, rh_tcstest;
++static unsigned rh_tcs_votes, rh_tcs_fastseen, rh_tcs_ambig, rh_tcs_retrig, rh_tcs_accept, rh_tcs_tmo, rh_tcs_gapmax;
++static uint64_t rh_fast_abs;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_rpmh_tcs, CTLFLAG_RW | CTLFLAG_LOCKED, &rh_tcsmode, 0,
++    "1277: AMC completion: 1 trigger+first polls with IRQs off | 2 re-trigger an ambiguous end state | 4 then accept it");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_rpmh_tcs_test, CTLFLAG_RW | CTLFLAG_LOCKED, &rh_tcstest, 0,
++    "1277 test: busy-wait N us between the trigger and the first poll (not with kern.sweet_rpmh_tcs bit 0)");
++
++static int
++sysctl_sweet_rpmh_tcs_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[192];
++	snprintf(buf, sizeof(buf), "tcs=%u test=%u votes=%u fast-seen=%u ambiguous=%u retrig=%u accepted=%u timeouts=%u "
++	    "gapmax_us=%u", rh_tcsmode, rh_tcstest, rh_tcs_votes, rh_tcs_fastseen, rh_tcs_ambig, rh_tcs_retrig,
++	    rh_tcs_accept, rh_tcs_tmo, rh_tcs_gapmax);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_tcs_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweet_rpmh_tcs_stats, "A", "1277: AMC completion counters");
++
++static unsigned
++rh_abs_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000 > 0xffffffffull ? 0xffffffffu : (unsigned)(ns / 1000);
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -366,31 +417,116 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+-	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+ 	uint32_t irq = 0, idle = 0, status[4] = {0, 0, 0, 0};
+-	bool done = false, progress = false;
+-	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+-		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+-		idle = rh_read(rh_tcs, b + RH_STATUS);
+-		bool complete = true;
+-		for (unsigned c = 0; c < n; ++c) {
+-			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+-			complete &= status[c] != 0xffffffffu &&
+-			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+-		}
+-		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
+-		progress |= idle == 0 || !complete;
+-		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+-		    ((irq & bit) || progress) && complete) {
++	bool done = false, progress = false, ambiguous = false;
++	unsigned mode = rh_tcsmode, retrig = 0, gap_us = 0;     /* 1277 */
++	if (!rh_fast_abs) {
++		nanoseconds_to_absolutetime(RH_FAST_US * 1000ull, &rh_fast_abs);
++	}
++	rh_tcs_votes++;
++trigger:
++	progress = false;
++	ambiguous = false;
++	{
++		uint64_t t0, t1 = 0;
++		if (mode & 1u) {                        /* 1277 bit 0: no interrupt/preemption between trigger and poll */
++			boolean_t was = ml_set_interrupts_enabled(FALSE);
++			rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++			t0 = mach_absolute_time();
++			for (;;) {
++				uint32_t st = rh_read(rh_tcs, b + RH_STATUS);
++				bool cpl = st != 0xffffffffu;
++				for (unsigned c = 0; c < n && cpl; ++c) {
++					uint32_t cs = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++					cpl = cs != 0xffffffffu && (cs & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++				}
++				if (!t1) {
++					t1 = mach_absolute_time();
++				}
++				if (st == 0 || !cpl) {
++					progress = true;
++					break;
++				}
++				if (mach_absolute_time() - t0 >= rh_fast_abs) {
++					break;
++				}
++			}
++			ml_set_interrupts_enabled(was);
++			if (progress) {
++				rh_tcs_fastseen++;
++			}
++		} else {
++			rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++			t0 = mach_absolute_time();
++			if (rh_tcstest && !retrig) {    /* 1277 test: the preemption window on purpose */
++				delay(rh_tcstest > 5000u ? 5000u : rh_tcstest);
++			}
++		}
++		unsigned still = 0;
++		for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++			irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++			idle = rh_read(rh_tcs, b + RH_STATUS);
++			bool complete = true;
++			for (unsigned c = 0; c < n; ++c) {
++				status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++				complete &= status[c] != 0xffffffffu &&
++				    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++			}
++			if (!t1) {
++				t1 = mach_absolute_time();
++				gap_us = rh_abs_us(t1 - t0);
++				if (gap_us > rh_tcs_gapmax) {
++					rh_tcs_gapmax = gap_us;
++				}
++			}
++			/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
++			progress |= idle == 0 || !complete;
++			if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++			    ((irq & bit) || progress) && complete) {
++				done = true;
++				break;
++			}
++			/* 1277 bit 1: idle + complete and never a transition: the end state or a stale one, unknowable */
++			if ((mode & 2u) && idle && idle != 0xffffffffu && complete && ++still >= RH_AMBIG_POLLS) {
++				ambiguous = true;
++				break;
++			}
++			delay(1);
++		}
++		if (mode & 1u) {
++			gap_us = rh_abs_us(t1 - t0);
++		}
++	}
++	if (!done && ambiguous) {                       /* 1277 */
++		rh_tcs_ambig++;
++		if (retrig < RH_RETRIG_N) {
++			retrig++;
++			rh_tcs_retrig++;
++			printf("SWEET RPMH: 1277: TCS%u at %#x idle + complete with no transition seen (first poll %u us after "
++			    "the trigger): re-trigger %u of %u\n", t, address, gap_us, retrig, RH_RETRIG_N);
++			if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++			    !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++				return EIO;
++			}
++			goto trigger;
++		}
++		if (mode & 4u) {
++			rh_tcs_accept++;
++			printf("SWEET RPMH: 1277: TCS%u at %#x still idle + complete without a transition after %u re-triggers: "
++			    "accepted as completed\n", t, address, retrig);
+ 			done = true;
+-			break;
+ 		}
+-		delay(1);
++	} else if (done && retrig) {
++		printf("SWEET RPMH: 1277: TCS%u at %#x completed after re-trigger %u (first poll %u us after the trigger)\n",
++		    t, address, retrig, gap_us);
+ 	}
+ 	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+ 	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		rh_tcs_tmo++;
++		printf("SWEET RPMH: 1277: first poll %u us after the trigger, progress %d, re-triggers %u, "
++		    "kern.sweet_rpmh_tcs=%u (1 IRQs off at the trigger, 2 re-trigger, 4 accept)\n", gap_us, progress, retrig, mode);
+ 		if (rh_q_tcs < 0 && n <= 4 && !prev_hard) {   /* 1135: a clean timeout, the first one */
+ 			rh_q_tcs = (int)t;
+ 			rh_q_n = n;
