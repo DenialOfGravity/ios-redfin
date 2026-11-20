@@ -212,7 +212,7 @@ static const char *enc_misfit(IOSurfaceRef s, uint32_t *len_out)
 	 * it starts (VENUSD_ENC_ZC_OFF=0: not, copy those) */
 	static int zc_off = -1;
 	if (zc_off < 0)
-		zc_off = !getenv("VENUSD_ENC_ZC_OFF") || atoi(getenv("VENUSD_ENC_ZC_OFF"));
+		zc_off = getenv("VENUSD_ENC_ZC_OFF") && atoi(getenv("VENUSD_ENC_ZC_OFF"));	/* test only: see below */
 	if ((yo & 0xfff) && (!zc_off || (yo & 63)))
 		return "plane 0 not page aligned in the surface";
 	if (IOSurfaceGetBytesPerRowOfPlane(s, 0) != st || IOSurfaceGetBytesPerRowOfPlane(s, 1) != st)
@@ -287,11 +287,13 @@ static void enc_frame(const struct venusd_msg *m)
 	if (j >= 0) {
 		uint32_t st, ys, uvo, sz;
 		venc_layout(&st, &ys, &uvo, &sz);
-		/* in-page part (CoreVideo's 64/128-byte header): the firmware ignores the ETB offset for encoder input (the
-		 * picture came out shifted by it), so the address itself points at plane 0 (VENUSD_ENC_ZC_ADDR=0: offset) */
+		/* an in-page plane 0 (CoreVideo's 64/128-byte header) is copied by default: tested 2026-11-20, the firmware
+		 * ignores the ETB offset for encoder input (picture shifted by it), and an address that is not page aligned
+		 * is a firmware error (CTRL_STATUS error 2, Venus taken down). VENUSD_ENC_ZC_OFF=1 (+ VENUSD_ENC_ZC_ADDR=1):
+		 * those tests again */
 		static int zc_addr = -1;
 		if (zc_addr < 0)
-			zc_addr = !getenv("VENUSD_ENC_ZC_ADDR") || atoi(getenv("VENUSD_ENC_ZC_ADDR"));
+			zc_addr = getenv("VENUSD_ENC_ZC_ADDR") && atoi(getenv("VENUSD_ENC_ZC_ADDR"));
 		uint32_t off = zc_addr ? 0 : yo & 0xfff;
 		iova += yo - off, len -= yo - off;
 		if (vmmu_sync(iova, sz + off < len ? sz + off : len, 1)) {
