@@ -664,25 +664,26 @@ sha = "f0602dcaad"
 
 [[file]]
 path = "/var/local/bin/venusctl"
-source = "builds/userland/redfin-int-88a709315f/venusctl"
-sha256 = "3ecb13b535428678bb1c8820bd826d44250ec321d1240718d79bd2e3cc79d5b8"
-mode = "755"
-owner = "0:0"
-target = "userland"
-ref = ""
-sha = ""
-
-[[file]]
-path = "/var/local/bin/venusd"
-source = "builds/userland/redfin-int-88a709315f/venusd"
-sha256 = "393a40ea5e15ca93ef2a0c3a23bb413216f3a7285c45589daffe3d6d9d7cf315"
+source = "builds/userland/redfin-int-bc3f7e0255/venusctl"
+sha256 = "d3b3cb7f2ab668f3166fd72e077d99567fa02bd8a68cdd53e4850904e54bc964"
 mode = "755"
 owner = "0:0"
 target = "userland"
 ref = "redfin-int"
-sha = "1afdf8c2b7"
+sha = "bc3f7e0255"
+note = "2026-11-21: redfin-int bc3f7e0 (ws-vtvenc-rc): firmware rate control by default (flag /var/local/venusd-hwrc); venus_enc.inc venc_set_bitrate (shared code). Previous 3ecb13b5."
+
+[[file]]
+path = "/var/local/bin/venusd"
+source = "builds/userland/redfin-int-bc3f7e0255/venusd"
+sha256 = "30e28277d862fb2e5726a08c6f94ec86e760425a728fdc636b25a2afd4f744bc"
+mode = "755"
+owner = "0:0"
+target = "userland"
+ref = "redfin-int"
+sha = "bc3f7e0255"
 restart = "venusd"
-note = "2026-11-20: ws-vt-venc merged (redfin-int 8008c6a): encode protocol v3 (ENC_OPEN/FRAME/DATA/QP, zero-copy IOSurface input) for vtvenc.dylib; started at boot by launchd job org.iosonpixel.venusd (needs /var/local/venus.on); 1afdf8c rechecks kern.sweet_vmmu at each OPEN (launchd starts venusd before boot.conf sets it). Previous 4ad063ed (redfin-int 42013d7)"
+note = "2026-11-21: redfin-int bc3f7e0 (ws-vtvenc-rc): firmware rate control by default (flag /var/local/venusd-hwrc); ENC_OPEN reply reports the RC (VD_ENC_RC_*), ENC_RATE changes the target mid-session. Previous 393a40ea. 2026-11-20: ws-vt-venc merged (redfin-int 8008c6a): encode protocol v3 (ENC_OPEN/FRAME/DATA/QP, zero-copy IOSurface input) for vtvenc.dylib; started at boot by launchd job org.iosonpixel.venusd (needs /var/local/venus.on); 1afdf8c rechecks kern.sweet_vmmu at each OPEN (launchd starts venusd before boot.conf sets it). Previous 4ad063ed (redfin-int 42013d7)"
 
 [[file]]
 path = "/var/local/bin/vtdecode"
@@ -848,15 +849,15 @@ sha = "c33c8f6912"
 
 [[file]]
 path = "/var/local/lib/vtvenc.dylib"
-source = "builds/userland/redfin-int-8008c6a77b/vtvenc.dylib"
-sha256 = "8239e84b3734144cf8db837e728d66449c8f43ba7ff5e5a9a939002e96b4717f"
+source = "builds/userland/redfin-int-bc3f7e0255/vtvenc.dylib"
+sha256 = "8e4a614c79f07b5641f461fdec4151213eb8ff9f4a023d7f2424fe07608e9ec0"
 mode = "644"
 owner = "0:0"
 target = "userland"
 ref = "redfin-int"
-sha = "8008c6a77b"
+sha = "bc3f7e0255"
 restart = "mediaserverd"
-note = "2026-11-20: Venus hardware VideoToolbox encoder (ws-vt-venc), loaded into mediaserverd by RedwoodAudio (inject_media.c). Registers avc1 (rating 1000, hardware); hvc1 with VTVENC_HEVC=1 in /var/local/vtvenc-env (code default 0 since d0e0946; the manifest file sets 1 since HEIC was verified 2026-11-20). Off: /var/local/vtvenc-off or no /var/local/venus.on"
+note = "2026-11-21: redfin-int bc3f7e0 (ws-vtvenc-rc): firmware rate control by default (flag /var/local/venusd-hwrc); no host QP loop under firmware RC; CBR for ConstantBitRate / DataRateLimits == AverageBitRate, else VBR at AverageBitRate; rate properties mid-session -> ENC_RATE. Previous 8239e84b. 2026-11-20: Venus hardware VideoToolbox encoder (ws-vt-venc), loaded into mediaserverd by RedwoodAudio (inject_media.c). Registers avc1 (rating 1000, hardware); hvc1 with VTVENC_HEVC=1 in /var/local/vtvenc-env (code default 0 since d0e0946; the manifest file sets 1 since HEIC was verified 2026-11-20). Off: /var/local/vtvenc-off or no /var/local/venus.on"
 
 [[file]]
 path = "/var/local/vtvenc-env"
@@ -3975,6 +3976,13 @@ path = "/var/local/camera-antiband"
 source = "agent/stage/flags/antiband-50"
 sha256 = "1a6562590ef19d1045d06c4055742d38288e9e6dcd71ccde5cee80f1d5a774eb"
 mode = "644"
+
+[[file]]
+path = "/var/local/venusd-hwrc"
+source = "agent/stage/flags/empty"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mode = "644"
+note = "2026-11-21: venusd runs the Venus firmware's rate control (VBR, CBR when VT asks) for encoder sessions, read at each ENC_OPEN (no restart needed); vtvenc's host QP loop stays off then (redfin-int bc3f7e0). Remove to go back to constant QP + host loop."
 
 [[file]]
 path = "/var/local/camera-vid-binned"
