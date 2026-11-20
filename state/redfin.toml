@@ -919,16 +919,16 @@ files = { "Info.plist" = "8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5
 
 [[bundle]]
 path = "/System/Library/Extensions/SweetMetal2.bundle"
-source = "builds/hmetal-mesa/3f952500334dfaaed21e3a24a55f28c265457dcd-3f95250033/bench/SweetMetal2-shim.bundle"
+source = "builds/hmetal-mesa/ws-hm-tripfilter-00b6839c11/bench/SweetMetal2-shim.bundle"
 target = "hmetal-mesa"
-ref = "3f952500334dfaaed21e3a24a55f28c265457dcd"
-sha = "3f95250033"
-note = "2026-11-19 final: the Metal dispatcher (m2shim) from redfin-int 3f95250 = ws-hm-fallback: every fallback explains itself (trips/NAME.why, fallback.log), restarts on purpose (sweetctl intent) do not trip; pa snap metal line / pa fallback. All 3 files match the source build."
+ref = "00b6839c110de727b44c50e442c41fd6ac0218b0"
+sha = "00b6839c11"
+note = "2026-11-20: dispatcher from redfin-int 00b6839 (= ws-hm-tripfilter): a crash counts toward the crash trip only if Metal/GPU code (incl. QuartzCore, owner OK) is on the crashing thread or in lastExceptionBacktrace; others get a 'crash not counted' line in fallback.log; /var/local/hmetal/trip-any = old rule. Cause: 11-19 23:10Z mediaserverd tripped on Camera video-recording crashes (CMCapture, not Metal). All 3 files match the source build. Before: 2026-11-19 final: the Metal dispatcher (m2shim) from redfin-int 3f95250 = ws-hm-fallback: every fallback explains itself (trips/NAME.why, fallback.log), restarts on purpose (sweetctl intent) do not trip; pa snap metal line / pa fallback. All 3 files match the source build."
 restart = "backboardd"
 CFBundleIdentifier = "org.iosonpixel.SweetMetal2"
 CFBundleShortVersionString = "0.3-hm-int3"
 CFBundleVersion = "1"
-files = { "Info.plist" = "03dce88dc98d5e133f52951cb2dbd7b155ce477a882e843ea37495ac650c1d38", SweetMetal2 = "586964a66021e97b621348f3914e248ca9f30726ecab977238243f72d4ce3a73", "_CodeSignature/CodeResources" = "05102e1ef1beb3aff2f5ce2c6ad36472b24e9be2c660e57485b8a143b182f1b1" }
+files = { "Info.plist" = "03dce88dc98d5e133f52951cb2dbd7b155ce477a882e843ea37495ac650c1d38", SweetMetal2 = "10acb17386d64c9f7a409f1f7a8cefc37ab67187df40585fba987c9ca81598ce", "_CodeSignature/CodeResources" = "0069cb81b167747c1e5b0b162bf1a670ecba22a273ca3aa98097465ae8d10ed3" }
 
 [[bundle]]
 path = "/var/local/disabled/SyncBundles/AirFair.syncBundle"
