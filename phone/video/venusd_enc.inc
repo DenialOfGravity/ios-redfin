@@ -208,8 +208,13 @@ static const char *enc_misfit(IOSurfaceRef s, uint32_t *len_out)
 	if (!b || !y || !c)
 		return "no base address";
 	size_t yo = (size_t)(y - b);
-	if (yo & 0xfff)
-		return "plane 0 not page aligned in the surface";	/* the Venus buffer starts at plane 0 */
+	/* plane 0 page aligned: the Venus buffer starts there; else (CoreVideo's 64-byte header) the ETB offset says where
+	 * it starts (VENUSD_ENC_ZC_OFF=0: not, copy those) */
+	static int zc_off = -1;
+	if (zc_off < 0)
+		zc_off = !getenv("VENUSD_ENC_ZC_OFF") || atoi(getenv("VENUSD_ENC_ZC_OFF"));
+	if ((yo & 0xfff) && (!zc_off || (yo & 63)))
+		return "plane 0 not page aligned in the surface";
 	if (IOSurfaceGetBytesPerRowOfPlane(s, 0) != st || IOSurfaceGetBytesPerRowOfPlane(s, 1) != st)
 		return "bytes per row";
 	if ((size_t)(c - y) != uvo)
@@ -282,14 +287,15 @@ static void enc_frame(const struct venusd_msg *m)
 	if (j >= 0) {
 		uint32_t st, ys, uvo, sz;
 		venc_layout(&st, &ys, &uvo, &sz);
-		iova += yo, len -= yo;	/* the Venus buffer = plane 0 on */
-		if (vmmu_sync(iova, sz < len ? sz : len, 1)) {
+		uint32_t off = yo & 0xfff;	/* in-page part: the ETB offset; whole pages: the address */
+		iova += yo - off, len -= yo - off;
+		if (vmmu_sync(iova, sz + off < len ? sz + off : len, 1)) {
 			enc_indone(m->seq, m->surface, -EIO, 0);
 			return;
 		}
 		emap[j].busy++;
 		etag[slot].zc = 1;
-		if (venc_etb(k, iova, len, ts, tag, idr)) {
+		if (venc_etb_off(k, iova, off, len, ts, tag, idr)) {
 			emap[j].busy--;
 			sess_fail(-EIO, m->seq);
 			return;

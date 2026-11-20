@@ -61,6 +61,7 @@ int venc_free_slot(void);			/* a free input slot or -1 */
 uint8_t *venc_slot_cpu(int k, uint32_t *size, uint32_t *stride, uint32_t *yscan);	/* vmmu only */
 void venc_layout(uint32_t *stride, uint32_t *yscan, uint32_t *uvoff, uint32_t *size);
 int venc_etb(int k, uint32_t pa, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync);	/* pa 0: slot k's own */
+int venc_etb_off(int k, uint32_t pa, uint32_t off, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync);
 int venc_eos(void);
 int venc_set_qp(uint32_t qi, uint32_t qp);
 uint32_t venc_fps_q16(void);

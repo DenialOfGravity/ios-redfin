@@ -853,6 +853,12 @@ void venc_layout(uint32_t *stride, uint32_t *yscan, uint32_t *uvoff, uint32_t *s
  * (alloc bytes there, already clean); sync: an IDR now */
 int venc_etb(int k, uint32_t pa, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync)
 {
+	return venc_etb_off(k, pa, 0, alloc, ts_us, tag, sync);
+}
+
+/* the same with the picture at offset off in the buffer at pa (ETB offset, as V4L2's data_offset downstream) */
+int venc_etb_off(int k, uint32_t pa, uint32_t off, uint32_t alloc, uint64_t ts_us, uint32_t tag, int sync)
+{
 	if (k < 0 || k >= dc.nin || dc.in[k].fw)
 		return -1;
 	uint32_t fill = ve_insize();
@@ -862,15 +868,15 @@ int venc_etb(int k, uint32_t pa, uint32_t alloc, uint64_t ts_us, uint32_t tag, i
 		if (vmmu_cpu(pa, fill) && vmmu_sync(pa, fill, 1))
 			return -1;
 	}
-	if (fill > alloc)
-		fill = alloc;
+	if (fill + off > alloc)
+		fill = alloc > off ? alloc - off : 0;
 	if (sync) {
 		uint32_t one = 1;
 		uint32_t p[6] = { 24, S_SET_PROP, SESSION_ID, 1, VE_P_SYNCREQ, one };
 		if (q_write(p))
 			return -1;
 	}
-	uint32_t e[16] = { 64, S_ETB, SESSION_ID, 0, (uint32_t)(ts_us >> 32), (uint32_t)ts_us, 0, 0, 0, alloc, fill, 0, tag,
+	uint32_t e[16] = { 64, S_ETB, SESSION_ID, 0, (uint32_t)(ts_us >> 32), (uint32_t)ts_us, 0, 0, 0, alloc, fill, off, tag,
 		pa, 0, 0 };
 	dc.in[k].pa = pa;
 	dc.in[k].size = alloc;

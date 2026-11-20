@@ -209,7 +209,7 @@ struct ve {
 	/* properties */
 	double bitrate, fps, key_dur, peak;
 	/* host rate control (Venus's own needs the CVP core): bytes of the frames since the last QP change */
-	int qp, qpi, rc_n, rc_changes;
+	int qp, qpi, rc_n, rc_changes, gop;
 	double rc_bytes;
 	int key_int, realtime, reorder, prof, level, entropy_cavlc;
 	int prim, transfer, matrix, full;
@@ -482,7 +482,10 @@ static int rc_step(struct ve *v, size_t len)
 	if (++v->rc_n < RC_MIN)
 		return 0;
 	double fps = v->fps > 0 ? v->fps : 30, actual = v->rc_bytes * 8 * fps / v->rc_n, ratio = actual / target;
-	if (ratio < 1.15 && ratio > 0.87) {
+	/* a whole GOP (its IDR included) per decision once near the target; far off (x2): every RC_MIN frames */
+	if (ratio < 2 && ratio > 0.5 && v->rc_n < (v->gop > RC_MIN ? v->gop : RC_MIN))
+		return 0;
+	if (ratio < 1.12 && ratio > 0.89) {
 		v->rc_n = 0, v->rc_bytes = 0;
 		return 0;
 	}
@@ -738,6 +741,7 @@ static int open_session(struct ve *v, CVPixelBufferRef pb)
 			gop = g;
 	}
 	eo.gop = gop ? gop : (int)lround(fps);	/* the iPhone's default: an IDR a second */
+	v->gop = eo.gop;
 	eo.profile = v->prof, eo.level = v->level;
 	eo.qp_i = (uint32_t)cfg.qp_i, eo.qp_p = (uint32_t)cfg.qp_p;
 	eo.seqhdr = cfg.seqhdr;

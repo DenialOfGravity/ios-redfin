@@ -159,10 +159,11 @@ static CVPixelBufferRef make_buffer(int w, int h, const char *mode)
 	CFDictionaryRef empty = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 						   &kCFTypeDictionaryValueCallBacks);
 	CFDictionarySetValue(a, kCVPixelBufferIOSurfacePropertiesKey, empty);
-	if (!strcmp(mode, "venus")) {
+	if (!strcmp(mode, "venus") || !strcmp(mode, "venus64")) {	/* venus64: as the camera's (plane 0 at +64) */
 		dnum(a, kCVPixelBufferBytesPerRowAlignmentKey, 128);
 		dnum(a, kCVPixelBufferExtendedPixelsBottomKey, ((h + 31) & ~31) - h);
-		dnum(a, kCVPixelBufferPlaneAlignmentKey, 4096);
+		if (!strcmp(mode, "venus"))
+			dnum(a, kCVPixelBufferPlaneAlignmentKey, 4096);
 	}
 	CVPixelBufferRef pb = NULL;
 	CVReturn r = CVPixelBufferCreate(NULL, (size_t)w, (size_t)h, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, a, &pb);
