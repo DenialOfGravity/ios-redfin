@@ -3443,6 +3443,7 @@ static int np_prep_tables(uint64_t tbl, uint64_t len)
 static void np_unassign(void)
 {
 	if (np_bank_on) {	/* stream off first, then the memory goes back */
+		pm_step("np bank: CB%d FSR %#x at release", np_bank_saved.cb, rd32(np_bank_saved.cbp + 0x58));
 		smmu_np_release("venus sec non-pixel", &np_bank_saved);
 		np_bank_on = 0;
 	}
@@ -3510,6 +3511,7 @@ uint32_t np_persist(uint32_t size, uint32_t iova)
 		return vmmu_map_phys(a, (uint32_t)len, iova, "persist (CP non-pixel)");
 	int cb = smmu_np_bank("venus sec non-pixel", 0x1304, 0xe0, iova, a, len, np_prep_tables, &np_tbl,
 			      &np_bank_saved);
+	pm_step("np bank: persist %#llx IOVA %#x CB%d", (unsigned long long)a, iova, cb);
 	if (cb < 0)
 		return 0;
 	np_bank_on = 1;
