@@ -1,0 +1,275 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e0bdfaf..9538b6e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -267,6 +267,7 @@ a6_firmware(const char *name, uint32_t *len)
+ /* ---- bring-up ---- */
+ 
+ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++int sweet_rpmh_vote(unsigned client, const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+ 
+ /*
+  * DDR (BCM MC0) and the memory NoC (SH0) at their top levels: nothing else votes them for the GPU (mainline
+@@ -285,7 +286,7 @@ gpu_bus_vote(void)
+ 	static const char *const bcm[] = { "MC0", "SH0" };
+ 	for (unsigned i = 0; i < sizeof(bcm) / sizeof(bcm[0]); i++) {
+ 		uint32_t off = 0, val = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
+-		int rc = sweet_rpmh_write(bcm[i], 1, &off, &val);
++		int rc = sweet_rpmh_vote(1, bcm[i], 1, &off, &val);   /* 1269: client 1 (GPU), see sweet_rpmh.c */
+ 		a6_log("bus vote %s top -> %d\n", bcm[i], rc);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 693a064..5be3543 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -91,6 +91,18 @@ struct pmem_rpmh {
+ };
+ #define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++/*
++ * 1269: PMEM_RPMH_CL = PMEM_RPMH as one named client (id 0..8; venus = 1): with kern.sweet_rpmh_agg its BCM votes
++ * are aggregated with the other clients' (sweet_rpmh.c) and its 0 drops only its own share. PMEM_RPMH stays one
++ * shared client (2).
++ */
++struct pmem_rpmh_cl {
++	uint32_t client;        /* 0..8 */
++	struct pmem_rpmh r;
++};
++#define PMEM_RPMH_CL    _IOW('P', 9, struct pmem_rpmh_cl)
++#define PMEM_RPMH_CL_N  9u
++extern int sweet_rpmh_vote(unsigned client, const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+ 
+ #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+ #define PMEM_WIN        0x200000ULL
+@@ -420,10 +432,23 @@ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unus
+ 		struct pmem_rpmh *r = (struct pmem_rpmh *)data;
+ 		r->res[sizeof(r->res) - 1] = 0;
+ 		lck_mtx_unlock(&sweet_pmem_lock);       /* waits up to 100 ms; not under our lock */
+-		err = sweet_rpmh_write(r->res, r->n, r->offset, r->value);
++		err = sweet_rpmh_vote(2, r->res, r->n, r->offset, r->value);
+ 		printf("SWEET PMEM: rpmh %s %u cmds (%#x=%u ...) -> %d\n", r->res, r->n, r->offset[0], r->value[0], err);
+ 		return err;
+ 	}
++	case PMEM_RPMH_CL: {                    /* 1269 */
++		struct pmem_rpmh_cl *rc = (struct pmem_rpmh_cl *)data;
++		struct pmem_rpmh *r = &rc->r;
++		r->res[sizeof(r->res) - 1] = 0;
++		lck_mtx_unlock(&sweet_pmem_lock);
++		if (rc->client >= PMEM_RPMH_CL_N) {
++			return EINVAL;
++		}
++		err = sweet_rpmh_vote(3 + rc->client, r->res, r->n, r->offset, r->value);
++		printf("SWEET PMEM: rpmh client %u %s %u cmds (%#x=%#x ...) -> %d\n", rc->client, r->res, r->n, r->offset[0],
++		    r->value[0], err);
++		return err;
++	}
+ 	default:
+ 		err = ENOTTY;
+ 	}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index cd3d87c..94abba7 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -483,17 +483,191 @@ rh_blocked(void)
+ 	return rh_poisoned && !((rh_recover & 2) && rh_q_tcs >= 0 && !rh_q_hard);
+ }
+ 
++/*
++ * 1269: per-client BCM votes (kern.sweet_rpmh_agg; default 0 = unchanged: the apps DRV holds one vote per BCM and the
++ * last write of any XNU user wins). The driver keeps every client's own share of every BCM address it voted (always,
++ * also at 0, so the sysctl can be flipped at any time): x (avg) and y (peak) in BCM units, 0/0 when the command is not
++ * VALID. Clients: 0 kernel (sweet_rpmh_write: adsp, ufs, touch rails, ...), 1 GPU (gpu_bus_vote MC0/SH0), 2 /dev/pmem
++ * PMEM_RPMH (wland IP0, old venusctl), 3..11 /dev/pmem PMEM_RPMH_CL ids 0..8 (venus = 1, see sweet_pmem.c).
++ *   bit 0 (1): a BCM command is replaced by the aggregate of all clients' shares, as bcm-voter/msm_bus_arb_rpmh do
++ *              (sum of x saturated at 14 bits, max of y; ACV: OR of the enable masks), commit bit from the request,
++ *              VALID iff x or y != 0. MC0, SH0, CN0, MM0, SN0 are keepalive (mainline sm8250 bcm_*.keepalive): an
++ *              aggregate of 0 is sent as x = y = 1, never 0. So a client's 0 drops only its own share; the GPU alone
++ *              gives exactly its own command (0x6fffffff on MC0/SH0) as before.
++ *   bit 1 (2): with bit 0, a request whose every command equals the value last completed at that address is not
++ *              sent (no TCS, no RPMh round trip, answers 0): e.g. Venus's SH0/MC0 share under the GPU's top vote.
++ * Active (AMC) set only, like every vote of this driver; no sleep/wake sets. VRM/ARC commands are never touched.
++ * kern.sweet_rpmh_agg_state (RD string): per BCM "NAME@ADDR=SENT [flags] client:x/y ...".
++ */
++#define RH_CL_N         12u
++#define RH_CL_GPU       1u
++#define RH_CL_PMEM      2u
++#define RH_CL_USER      3u
++#define RH_AGG_N        24u
++#define RH_AGG_KEEP     1u
++#define RH_AGG_MASK     2u
++static unsigned rh_agg;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_rpmh_agg, CTLFLAG_RW | CTLFLAG_LOCKED, &rh_agg, 0,
++    "1269: BCM votes: 0 last write wins | 1 per-client aggregate (sum x, max y) | 3 also skip unchanged sends");
++static struct {
++	uint32_t addr, sent;
++	bool sent_ok;
++	uint8_t flags;
++	char name[9];
++	uint16_t x[RH_CL_N], y[RH_CL_N];
++} rh_bcm[RH_AGG_N];
++static unsigned rh_bcm_n, rh_agg_skips, rh_agg_full;
++
++static int
++rh_bcm_slot(uint32_t addr, const char *name)     /* under rh_lock; -1 when the table is full */
++{
++	for (unsigned i = 0; i < rh_bcm_n; i++) {
++		if (rh_bcm[i].addr == addr) {
++			return (int)i;
++		}
++	}
++	if (rh_bcm_n == RH_AGG_N) {
++		if (!rh_agg_full++) {
++			printf("SWEET RPMH: 1269: BCM table full (%u): %#x stays last-write-wins\n", RH_AGG_N, addr);
++		}
++		return -1;
++	}
++	unsigned i = rh_bcm_n++;
++	bzero(&rh_bcm[i], sizeof(rh_bcm[i]));
++	rh_bcm[i].addr = addr;
++	if (name) {
++		snprintf(rh_bcm[i].name, sizeof(rh_bcm[i].name), "%s", name);
++		static const char *const keep[] = { "MC0", "SH0", "CN0", "MM0", "SN0" };
++		for (unsigned k = 0; k < sizeof(keep) / sizeof(keep[0]); k++) {
++			if (!strcmp(name, keep[k])) {
++				rh_bcm[i].flags |= RH_AGG_KEEP;
++			}
++		}
++		if (!strcmp(name, "ACV")) {
++			rh_bcm[i].flags |= RH_AGG_MASK;
++		}
++	}
++	return (int)i;
++}
++
++static uint32_t
++rh_bcm_aggregate(unsigned s, uint32_t commit)   /* under rh_lock */
++{
++	uint32_t x = 0, y = 0;
++	for (unsigned c = 0; c < RH_CL_N; c++) {
++		if (rh_bcm[s].flags & RH_AGG_MASK) {
++			x |= rh_bcm[s].x[c];
++			y |= rh_bcm[s].y[c];
++		} else {
++			x += rh_bcm[s].x[c];
++			y = MAX(y, (uint32_t)rh_bcm[s].y[c]);
++		}
++	}
++	x = MIN(x, 0x3fffu);
++	if (!x && !y && (rh_bcm[s].flags & RH_AGG_KEEP)) {
++		x = y = 1;
++	}
++	return commit | ((x || y) ? 1u << 29 : 0) | x << 14 | y;
++}
++
++static int
++sysctl_sweet_rpmh_agg_state SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static char buf[2048];          /* diagnostics only: a racing vote may tear one line */
++	static const char *const cl[RH_CL_N] = { "k", "gpu", "pmem", "u0", "venus", "u2", "u3", "u4", "u5", "u6", "u7", "u8" };
++	size_t o = (size_t)snprintf(buf, sizeof(buf), "agg=%u skips=%u", rh_agg, rh_agg_skips);
++	unsigned n = __atomic_load_n(&rh_bcm_n, __ATOMIC_ACQUIRE);
++	for (unsigned i = 0; i < n && o < sizeof(buf); i++) {
++		o += (size_t)snprintf(buf + o, sizeof(buf) - o, "\n%s@%x=%x%s%s%s", rh_bcm[i].name, rh_bcm[i].addr,
++		    rh_bcm[i].sent, rh_bcm[i].sent_ok ? "" : "?", (rh_bcm[i].flags & RH_AGG_KEEP) ? " keep" : "",
++		    (rh_bcm[i].flags & RH_AGG_MASK) ? " mask" : "");
++		for (unsigned c = 0; c < RH_CL_N && o < sizeof(buf); c++) {
++			if (rh_bcm[i].x[c] || rh_bcm[i].y[c]) {
++				o += (size_t)snprintf(buf + o, sizeof(buf) - o, " %s:%x/%x", cl[c], rh_bcm[i].x[c], rh_bcm[i].y[c]);
++			}
++		}
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_agg_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweet_rpmh_agg_state, "A", "1269: per-client BCM shares and the last value sent per BCM");
++
++/* rh_send_cmds with the 1269 bookkeeping/aggregation of BCM commands. Under rh_lock, after rh_lookup. */
++static int
++rh_vote_cmds(unsigned client, const char *res, uint32_t address, unsigned n, const uint32_t *offsets,
++    const uint32_t *values)
++{
++	int slot[4];
++	uint16_t ox[4], oy[4];
++	uint32_t out[4];
++	bool same = true;
++	unsigned agg = rh_agg;
++	for (unsigned c = 0; c < n; c++) {
++		uint32_t a = address + offsets[c], v = values[c];
++		slot[c] = (a >> 16) == RH_BCM && client < RH_CL_N ? rh_bcm_slot(a, offsets[c] == 0 ? res : NULL) : -1;
++		out[c] = v;
++		if (slot[c] < 0) {
++			same = false;
++			continue;
++		}
++		unsigned s = (unsigned)slot[c];
++		bool valid = (v >> 29) & 1u;
++		ox[c] = rh_bcm[s].x[client];
++		oy[c] = rh_bcm[s].y[client];
++		rh_bcm[s].x[client] = valid ? (uint16_t)((v >> 14) & 0x3fffu) : 0;
++		rh_bcm[s].y[client] = valid ? (uint16_t)(v & 0x3fffu) : 0;
++		if (agg & 1u) {
++			out[c] = rh_bcm_aggregate(s, v & (1u << 30));
++			if (out[c] != v) {
++				printf("SWEET RPMH: 1269: %s+%#x client %u %#x -> aggregate %#x\n", res, offsets[c], client, v, out[c]);
++			}
++		}
++		same &= rh_bcm[s].sent_ok && rh_bcm[s].sent == out[c];
++	}
++	int error;
++	if ((agg & 3u) == 3u && same) {
++		rh_agg_skips++;
++		printf("SWEET RPMH: 1269: %s client %u: aggregate unchanged (%#x), not sent\n", res, client, out[0]);
++		return 0;
++	}
++	error = rh_send_cmds(address, n, offsets, out);
++	for (unsigned c = 0; c < n; c++) {
++		if (slot[c] < 0) {
++			continue;
++		}
++		unsigned s = (unsigned)slot[c];
++		if (error) {            /* the client's vote failed: its old share stands (a timed-out TCS stays unknown) */
++			rh_bcm[s].x[client] = ox[c];
++			rh_bcm[s].y[client] = oy[c];
++			rh_bcm[s].sent_ok = false;
++		} else {
++			rh_bcm[s].sent = out[c];
++			rh_bcm[s].sent_ok = true;
++		}
++	}
++	return error;
++}
++
+ /*
+  * Any VRM, ARC or BCM resource, 1-4 commands (offset from the resource address,
+  * value): for /dev/pmem's PMEM_RPMH (userland bring-up of the modem and
+  * WLAN: ARC levels of cx/mss, WLAN rails). No policy: a debugging path.
+  */
+ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++int sweet_rpmh_vote(unsigned client, const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+ 
+ int
+ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
+ {
+-	if (!res || n == 0 || n > 4) {
++	return sweet_rpmh_vote(0, res, n, offsets, values);
++}
++
++/* 1269: the same for one client (0 kernel, 1 GPU, 2 PMEM_RPMH, 3.. PMEM_RPMH_CL); see rh_vote_cmds */
++int
++sweet_rpmh_vote(unsigned client, const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
++{
++	if (!res || n == 0 || n > 4 || client >= RH_CL_N) {
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -507,7 +681,7 @@ sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uin
+ 			error = rh_lookup(res, &address);
+ 		}
+ 		if (!error) {
+-			error = rh_send_cmds(address, n, offsets, values);
++			error = rh_vote_cmds(client, res, address, n, offsets, values);   /* 1269 */
+ 		}
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
