@@ -48,7 +48,9 @@ int memtest(uint64_t a, uint64_t len, int write);
 int shutdown_cmd(void);
 int fwdump(uint64_t addr);
 int hwctl_cmd(int on);	/* venus-hw: mvs0 GDSC HW_CONTROL on/off (msm_vidc __hand_off_regulators, qcom,support-hw-trigger) */
-int intmask_cmd(void);	/* venus-hw: WRAPPER_INTR_MASK: unmask A2HWD (0x10) and A2H (0x4) as Linux's interrupt init */	/* P0d: read-only dump of the HFI block left at addr (0: 0xa2600000) after a reset */
+int intmask_cmd(void);
+int suspend_cmd(void);	/* venus-hw: Linux power collapse (PC_PREP, TZ suspend, power off; image kept) */
+int resume_cmd(void);	/* venus-hw: power on, TZ resume, UC regs, CTRL_INIT (no PIL reload) */	/* venus-hw: WRAPPER_INTR_MASK: unmask A2HWD (0x10) and A2H (0x4) as Linux's interrupt init */	/* P0d: read-only dump of the HFI block left at addr (0: 0xa2600000) after a reset */
 
 /* ---- the stage 3 decoder in steps (venusctl decode runs them in its loop; venusd per client message) ---- */
 

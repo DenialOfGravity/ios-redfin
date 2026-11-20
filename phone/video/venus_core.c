@@ -921,6 +921,10 @@ int power_off(void)
 		for (unsigned i = NBR; i-- > 0;)
 			if (!branches[i].cvp || cvp || (vrd(branches[i].pa) & CBCR_EN))
 				branch_off(branches[i].pa, branches[i].name, branches[i].voted);
+		if (vrd(GDSC_MVS1) & HW_CONTROL)	/* venus-hw: Linux "Acquire regulator control from HW" */
+			upd(GDSC_MVS1, HW_CONTROL, 0, "mvs1 back to SW");
+		if (vrd(GDSC_MVS0) & HW_CONTROL)
+			upd(GDSC_MVS0, HW_CONTROL, 0, "mvs0 back to SW");
 		if (cvp || (vrd(GDSC_MVS1) & PWR_ON))
 			gdsc_off(GDSC_MVS1, "mvs1");
 		gdsc_off(GDSC_MVS0, "mvs0");
@@ -3629,4 +3633,89 @@ int intmask_cmd(void)
 	wr(WRAP_INTR_MASK, v & ~0x14u, "WRAPPER_INTR_MASK unmask A2HWD|A2H");
 	printf("venus: WRAPPER_INTR_MASK %#010x -> %#010x\n", v, rd32(WRAP_INTR_MASK));
 	return 0;
+}
+
+/*
+ * venus-hw: Linux's power collapse and resume (msm_vidc venus_hfi_pm_handler / __resume, seen in TWRP 2026-11-20):
+ *   suspend: SYS_PC_PREP, wait PC_READY + WFI, TZ "set state 0" (scm boot 0xa: TZBSP_VIDEO_SET_STATE suspend),
+ *            regulators back from HW, clocks + GDSCs off, buses unvoted. The image stays in TZ (pas 1).
+ *   resume:  power on, WRAPPER_INTR_MASK, TZ "set state 1", hand-off, UC/QTBL/SFR registers, CTRL_INIT, wait
+ *            CTRL_STATUS init. No PIL reload, no SYS_INIT (the firmware keeps its state).
+ */
+#define SCM_VIDEO_SET_STATE	0x4200010aull	/* SCM_SIP_FNID(SCM_SVC_BOOT 1, TZBSP_VIDEO_SET_STATE 0xa) */
+#define PC_FLAG	"/var/tmp/venusctl.pc"
+static int video_set_state(int st)
+{
+	uint64_t x[8] = { SCM_VIDEO_SET_STATE, 2, (uint64_t)st, 0, 0, 0, 0, 0 };
+	pm_smc(x);
+	printf("venus: TZ video set state %d -> %lld/%llx\n", st, (long long)x[0], (unsigned long long)x[1]);
+	return x[0] || x[1];
+}
+
+int suspend_cmd(void)
+{
+	struct vstate v;
+	if (state_load(&v) || !v.init || !v.q) {
+		printf("venus: refused: no initialised firmware\n");
+		return 1;
+	}
+	if (!core_ok()) {
+		printf("venus: refused: power is off (already suspended?)\n");
+		return 1;
+	}
+	qb = v.q;
+	setenv("VENUSCTL_PC_DELAY_MS", "0", 0);
+	int r = pc_prep(0);
+	if (r != 0)
+		printf("venus: suspend: PC_PREP result %d (Linux skips the collapse then); going on\n", r);
+	if (video_set_state(0))
+		printf("venus: suspend: TZ set state 0 failed, going on\n");
+	int f0 = force;
+	force = 1;	/* pas 1 stays: the image is kept for the resume */
+	int rc = power_off();
+	force = f0;
+	FILE *fl = fopen(PC_FLAG, "w");
+	if (fl)
+		fputs("1\n", fl), fclose(fl);
+	printf("venus: suspend %s (power collapsed, image kept)\n", rc ? "with errors" : "ok");
+	return rc;
+}
+
+int resume_cmd(void)
+{
+	struct vstate v;
+	if (state_load(&v) || !v.init || !v.q) {
+		printf("venus: refused: no initialised firmware to resume\n");
+		return 1;
+	}
+	if (power_on())
+		return 1;
+	if (video_set_state(1))
+		printf("venus: resume: TZ set state 1 failed, going on\n");
+	if (getenv("VENUSCTL_LINUX")) {
+		upd(GDSC_MVS0, HW_CONTROL, HW_CONTROL, "mvs0 HW_CONTROL (hand off)");
+		upd(GDSC_MVS1, HW_CONTROL, HW_CONTROL, "mvs1 HW_CONTROL (hand off)");
+	}
+	uint64_t q = v.q;
+	wr(UC_ADDR, (uint32_t)q, "UC_REGION_ADDR");
+	wr(UC_SIZE, QSHARED, "UC_REGION_SIZE");
+	wr(QTBL_ADDR, (uint32_t)q, "QTBL_ADDR");
+	wr(QTBL_INFO, 1, "QTBL_INFO");
+	wr(SFR_ADDR, (uint32_t)(q + SFR_OFF), "SFR_ADDR");
+	wr(CS_VMIMSG, (uint32_t)q, "DSP_QTBL_ADDR");
+	wr(CS_VMIMSGAG0, (uint32_t)q, "DSP_UC_REGION_ADDR");
+	wr(CS_VMIMSGAG1, QSHARED, "DSP_UC_REGION_SIZE");
+	wr(CTRL_INIT, 1, "CTRL_INIT (resume)");
+	double t0 = mono_ms();
+	uint32_t st = 0;
+	for (unsigned i = 0;; i++) {
+		st = crd(CTRL_STATUS);
+		if ((st & (ST_INIT | ST_ERROR)) || wait_over(t0, i, 1000))
+			break;
+		delay_ms(1);
+	}
+	printf("venus: resume: CTRL_STATUS %#010x after %.0f ms%s\n", st, mono_ms() - t0,
+	       (st & ST_INIT) && !(st & ST_ERROR) ? " (init ok)" : " FAILED");
+	unlink(PC_FLAG);
+	return (st & ST_INIT) && !(st & ST_ERROR) ? 0 : 1;
 }
