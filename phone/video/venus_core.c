@@ -975,6 +975,30 @@ static uint8_t *slurp(const char *path, size_t *len)
 	return b;
 }
 
+
+/*
+ * venus-hw: where the PAS metadata (mdt header + hash segment) lives for init_image. It was a PMEM_ALLOC page of XNU's
+ * own RAM, freed right after init_image (and in any case when venusctl exits). TZ keeps that buffer for the subsystem
+ * (upstream qcom_scm_pas_init_image: "the metadata must be kept until auth_and_reset", and it is XPU-locked while
+ * held): XNU reusing the page = a secure access violation = the silent warm reset seen at random times after
+ * init_image (2026-11-20, logs/research/venus-hw-video-2026-11-20.md). wland never frees its modem/IPA metadata and
+ * never saw it. Default now: a fixed page at the top of the Venus window (0xa2600000-0xaca00000, never XNU's RAM:
+ * xram 3/13 keep it out), not freed. VENUSCTL_META_PMEM=1: the old PMEM_ALLOC + free behaviour (A/B).
+ */
+#define META_WIN_PA	0xac9f0000ull	/* 64 KB under the window's end; the metadata is ~7 KB */
+static uint64_t meta_place(const void *meta, size_t len, int *pmem)
+{
+	*pmem = getenv("VENUSCTL_META_PMEM") != NULL;
+	uint64_t pa = *pmem ? pm_alloc(len, 0x1000) : META_WIN_PA;
+	if (!pa || len > 0x10000)
+		return 0;
+	if (pm_wr(pa, meta, (len + 3) & ~(size_t)3))
+		return 0;
+	printf("venus: metadata %zu bytes at %#llx (%s)\n", len, (unsigned long long)pa,
+	       *pmem ? "PMEM_ALLOC, freed after init_image: VENUSCTL_META_PMEM" : "Venus window, kept");
+	pm_step("metadata at %#llx (%s)", (unsigned long long)pa, *pmem ? "pmem" : "window");
+	return pa;
+}
 /* venus.mdt and its metadata (ELF header + phdrs + hash segment), shared by pas-check and boot */
 struct fwimg {
 	uint8_t *mdt, *meta;
@@ -1051,14 +1075,15 @@ int pas_check(const char *fw, int no_shutdown)
 	int64_t rc = scm(7, 1, PAS_VENUS, 0, 0, &r1);
 	printf("venus: pas supported(%d) -> %lld/%llx\n", PAS_VENUS, (long long)rc, (unsigned long long)r1);
 
-	uint64_t meta_pa = pm_alloc(meta_len, 0x1000);
+	int meta_pmem;
+	uint64_t meta_pa = meta_place(meta, meta_len, &meta_pmem);
 	if (!meta_pa)
 		return 1;
-	pm_wr(meta_pa, meta, (meta_len + 3) & ~(size_t)3);
 	printf("venus: pas init_image(%d, %llx)...\n", PAS_VENUS, (unsigned long long)meta_pa);
 	rc = scm(1, 2 | (2u << 6), PAS_VENUS, meta_pa, 0, &r1);
 	printf("venus: pas init_image -> %lld/%llx\n", (long long)rc, (unsigned long long)r1);
-	pm_free(meta_pa);
+	if (meta_pmem)
+		pm_free(meta_pa);
 	int init_ok = !rc && !r1;
 	if (no_shutdown && init_ok) {	/* review 8.5.8: record it, so shutdown can undo it */
 		FILE *sf = fopen(STATE, "w");
@@ -1485,14 +1510,15 @@ int boot(const char *fw, int keep)
 	uint64_t r1 = 0;
 	int64_t rc = scm(7, 1, PAS_VENUS, 0, 0, &r1);
 	printf("venus: pas supported(%d) -> %lld/%llx\n", PAS_VENUS, (long long)rc, (unsigned long long)r1);
-	uint64_t meta_pa = pm_alloc(f.meta_len, 0x1000);
+	int meta_pmem;
+	uint64_t meta_pa = meta_place(f.meta, f.meta_len, &meta_pmem);
 	if (!meta_pa)
 		return boot_fail(&v);
-	pm_wr(meta_pa, f.meta, (f.meta_len + 3) & ~(size_t)3);
 	printf("venus: pas init_image(%d, %llx)...\n", PAS_VENUS, (unsigned long long)meta_pa);
 	rc = scm(1, 2 | (2u << 6), PAS_VENUS, meta_pa, 0, &r1);
 	printf("venus: pas init_image -> %lld/%llx\n", (long long)rc, (unsigned long long)r1);
-	pm_free(meta_pa);
+	if (meta_pmem)
+		pm_free(meta_pa);
 	if (rc || r1)
 		return boot_fail(&v);	/* nothing in TZ: no shutdown (adspboot adsp3) */
 	v.pas = 1;
