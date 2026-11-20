@@ -1686,6 +1686,13 @@ static int q_read(unsigned i)
 	}
 	wr32(qhdr(i) + QH_RX_REQ, nr != wi ? 0 : want_rx);
 	wr32(qhdr(i) + QH_READ, nr);
+	/* ws-venus-enc: __iface_msgq_read/dbgq_read: the firmware set tx_req (it waits for room): doorbell after a read
+	 * (VENUSCTL_NO_TXDB=1: not) */
+	static int txdb = -1;
+	if (txdb < 0)
+		txdb = !getenv("VENUSCTL_NO_TXDB");
+	if (txdb && rd32(qhdr(i) + QH_TX_REQ) == 1 && core_ok())
+		wr(IC_SOFTINT, SOFTINT_H2A, "doorbell (tx_req)");
 	static int dbghex = -1;	/* ws-venus-enc: VENUSCTL_STEP_DBGHEX=0: no hex line for debug packets (the text follows) */
 	if (dbghex < 0)
 		dbghex = !getenv("VENUSCTL_STEP_DBGHEX") || atoi(getenv("VENUSCTL_STEP_DBGHEX"));
