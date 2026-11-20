@@ -664,8 +664,8 @@ sha = "f0602dcaad"
 
 [[file]]
 path = "/var/local/bin/venusctl"
-source = "builds/userland/redfin-int-42013d7b2d/venusctl"
-sha256 = "be70af00a1b15aea50aae1f3f4696e3675b38d38f487dd41cbe2083911aa0fe3"
+source = "builds/userland/redfin-int-88a709315f/venusctl"
+sha256 = "3ecb13b535428678bb1c8820bd826d44250ec321d1240718d79bd2e3cc79d5b8"
 mode = "755"
 owner = "0:0"
 target = "userland"
@@ -674,8 +674,8 @@ sha = ""
 
 [[file]]
 path = "/var/local/bin/venusd"
-source = "builds/userland/redfin-int-1afdf8c2b7/venusd"
-sha256 = "326975bc0222e5b8b3df0f14c404dfea4e848efd3e44af17ce08ccf535f5e1d7"
+source = "builds/userland/redfin-int-88a709315f/venusd"
+sha256 = "393a40ea5e15ca93ef2a0c3a23bb413216f3a7285c45589daffe3d6d9d7cf315"
 mode = "755"
 owner = "0:0"
 target = "userland"
