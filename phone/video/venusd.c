@@ -550,7 +550,7 @@ static int bring_up(void)
 	}
 	up = 1;
 	pc_up_t = mono(), pc_skips = 0;
-	note("venusd: Venus up in %.0f ms (firmware %s, queues %#llx; firmware load at uptime %.1f s)", 1e3 * (mono() - t0),
+	note("venusd: Venus up in %.0f ms (firmware %s, queues %#llx; firmware load at CLOCK_MONOTONIC %.1f s)", 1e3 * (mono() - t0),
 	     fw, (unsigned long long)phys, pc_up_t);
 	return 0;
 }
@@ -1240,7 +1240,7 @@ int main(int argc, char **argv)
 				note("venusd: power collapse failed (core left on), retry in %u ms", pc_ms);
 			} else {
 				pc_down = 1, pc_skips = 0, pc_n++;
-				note("venusd: power collapse #%u after %u ms idle (firmware loaded %.0f s ago, at uptime %.1f s)",
+				note("venusd: power collapse #%u after %u ms idle (firmware loaded %.0f s ago, at CLOCK_MONOTONIC %.1f s)",
 				     pc_n, pc_ms, mono() - pc_up_t, pc_up_t);
 			}
 		}
