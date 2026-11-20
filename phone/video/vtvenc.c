@@ -16,7 +16,7 @@
  * The venusd session opens lazily at the first frame (the properties are set by then), closes at Invalidate.
  * Never crashes its host: every failure is a VT error or a dropped frame and a log line.
  * Switches: env or KEY=VALUE lines in /var/local/vtvenc-env (read once per process; the file wins):
- *   VTVENC_HEVC (1): register hvc1 too.   VTVENC_ATTR (1): ask VT for buffers in Venus's layout (bytes per row aligned
+ *   VTVENC_HEVC (0): 1 = register hvc1 too.   VTVENC_ATTR (1): ask VT for buffers in Venus's layout (bytes per row aligned
  *   to 128, rows to 32, planes page aligned): CMCapture's pool follows it, so the camera's surfaces go to Venus as they
  *   are (zero-copy); 0 = any 420v/420f passes through (venusd copies what doesn't fit).  VTVENC_QP=I[:P]: fixed QP (else from the
  *   bit rate).  VTVENC_SEQHDR (0): 1 = parameter sets in band before every IDR.  VTVENC_INFLIGHT (12): frames out
@@ -99,7 +99,7 @@ enum {	/* VTErrors.h */
 };
 #define INFO_DROPPED	2u	/* kVTEncodeInfo_FrameDropped */
 
-static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc, early_ms; } cfg = { 1, 1, 0, 0, 0, 12, 0, 1, 1000, 1, 1, 40 };
+static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id, rc, early_ms; } cfg = { 0, 1, 0, 0, 0, 12, 0, 1, 1000, 1, 1, 40 };
 static pthread_once_t cfg_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1226,7 +1226,7 @@ static OSStatus create_instance(FourCharCode codec, CFAllocatorRef alloc, CMBase
 	return 0;
 }
 
-/* registration: 'avc1' (+ 'hvc1' unless VTVENC_HEVC=0) as hardware encoders; the number registered */
+/* registration: 'avc1' (+ 'hvc1' with VTVENC_HEVC=1) as hardware encoders; the number registered */
 __attribute__((visibility("default"))) int VTVenusEncRegister(void)
 {
 	struct stat sb;
