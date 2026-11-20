@@ -15,7 +15,8 @@
  * (flush, stop, release resources, release internal buffers, session end).
  * Input: tightly packed NV12 (Y w*h, then interleaved CbCr w*h/2) per frame, copied into Venus's NV12 layout (Y stride
  * align(w,128), Y scanlines align(h,32), CbCr at stride*scanlines with align(h/2,16) scanlines).
- * Switches (env): VENUSCTL_ENC_SKIP=name,name (properties not sent, names as printed), VENUSCTL_ENC_NIN/NOUT (counts),
+ * Switches (env): VENUSCTL_ENC_SKIP=name,name (properties not sent, names as printed), VENUSCTL_ENC_STRICT=1 (a
+ * refused property (0x1002/0x1007/0x1008) stops the session; default: noted, skipped), VENUSCTL_ENC_NIN/NOUT (counts),
  * VENUSCTL_ENC_LAYER (bitrate/qp layer id, default 0xff = all layers), VENUSCTL_ENC_WORKMODE (1|2, default 2; 1 adds
  * LOW_LATENCY as downstream), VENUSCTL_ENC_TSRC=1 (firmware derives time deltas from the frame rate), VENUSCTL_BUF_MB.
  * --stop-at STAGE: sessinit props alloc load start ftb (watch 2 s, then close).
@@ -74,8 +75,15 @@ static int ve_prop(const char *name, uint32_t prop, uint32_t a, uint32_t b, uint
 		return 0;
 	}
 	if (set_prop(prop, a, b, c, n, name)) {
-		printf("venus: enc: property %s (%#x) refused (session error %#x)\n", name, prop, (unsigned)dc.err);
-		pm_step("enc: property %s refused, err %#x", name, (unsigned)dc.err);
+		uint32_t e = (uint32_t)dc.err;
+		printf("venus: enc: property %s (%#x) refused (session error %#x)\n", name, prop, e);
+		pm_step("enc: property %s refused, err %#x", name, e);
+		/* unsupported property/setting, invalid parameter: noted, the session goes on (VENUSCTL_ENC_STRICT=1: stop) */
+		if ((e == 0x1007 || e == 0x1008 || e == 0x1002) && !getenv("VENUSCTL_ENC_STRICT")) {
+			printf("venus: enc: note: %s refused with %#x, going on without it\n", name, e);
+			dc.err = 0;
+			return 0;
+		}
 		return -1;
 	}
 	return 0;
