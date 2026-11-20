@@ -3719,3 +3719,6 @@ int resume_cmd(void)
 	unlink(PC_FLAG);
 	return (st & ST_INIT) && !(st & ST_ERROR) ? 0 : 1;
 }
+
+/* ws-venus-enc: the encoder shares this file's statics (queues, allocator, session state) */
+#include "venus_enc.inc"

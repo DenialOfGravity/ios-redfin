@@ -12,6 +12,14 @@
 #ifndef STATE	/* -D for a host test build */
 #define AHB_STATE	"/var/tmp/venusctl.ahb"	/* gcc_video_ahb CBCR before power on cleared HW_CTL */
 #define STATE		"/var/tmp/venusctl.state"
+/* ws-venus-enc: the hardware encoder (venus_enc.inc, included by venus_core.c): raw NV12 file -> Annex B H.264/HEVC */
+struct venc_cfg {
+	int w, h, hevc, fps, gop, rc;	/* rc: 0 VBR_CFR, 1 CBR_CFR, 2 off; gop = frames per IDR (1 = all intra) */
+	uint32_t bitrate, debug;
+	int profile, level, frames;	/* HFI profile/level (0 = H.264 High 4.1 / HEVC Main 4 main tier); frames 0 = all */
+	uint64_t bufphys;
+};
+int encode(const struct venc_cfg *c, const char *in, const char *outp);
 #endif
 
 extern int verbose, cvp, force;	/* venusctl -v, --cvp, --force */

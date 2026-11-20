@@ -106,6 +106,10 @@
  *   fps, SYS/SESSION errors; prints "survived S s, phone alive" (absent if a reset killed us). As insurance a SYS_PING
  *   keepalive fires on any idle gap (VENUSCTL_PING_MS, default 1000 ms); VENUSCTL_INTCLR=1 also acks interrupts.
  *   watch SECS --sysinit with VENUSCTL_PING_MS=1000 is a ping-only keepalive test (no decode). init --phys first.
+ * ws-venus-enc (logs/research/venus-encoder-2026-11-20.md): venusctl encode IN.yuv OUT WxH [--hevc] [--fps N]
+ *   [--bitrate BPS] [--gop N] [--rc vbr|cbr|off] [--frames N] [--profile P --level L (HFI values)] [--bufphys A]
+ *   [--stop-at sessinit|props|alloc|load|start|ftb]: after boot --keep + init, a Venus encoder session on tightly
+ *   packed NV12 frames; the bitstream (Annex B, SPS/PPS before each IDR) goes to OUT. Code in venus_enc.inc.
  */
 #include <stdint.h>
 #include <unistd.h>
@@ -162,6 +166,7 @@ int main(int argc, char **argv)
 	uint64_t phys = 0, bufphys = 0;
 	const char *clip = NULL;	/* ws-video-dec: decode --clip FILE --seconds S --loop */
 	int seconds = 0, do_loop = 0;
+	struct venc_cfg ec = { .fps = 30, .gop = 30, .bitrate = 2000000 };	/* ws-venus-enc */
 	const char *steplog = NULL;	/* redfin: --step [--step-file F] */
 	uint32_t debug = 0x18;	/* HFI_DEBUG_MSG_ERROR | FATAL (guess: msm_vidc_debug.c's default is not in our source copy) */
 	setvbuf(stdout, NULL, _IOLBF, 0);	/* a hang shows the last line */
@@ -182,7 +187,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--phys") && i + 1 < argc)
 			phys = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--frames") && i + 1 < argc)
-			frames = atoi(argv[++i]);
+			frames = ec.frames = atoi(argv[++i]);	/* encode: a limit (default all) */
 		else if (!strcmp(argv[i], "--bufphys") && i + 1 < argc)
 			bufphys = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--step"))
@@ -205,6 +210,19 @@ int main(int argc, char **argv)
 			hevc = 1;
 		else if (!strcmp(argv[i], "--h264"))
 			hevc = 0;
+		else if (!strcmp(argv[i], "--fps") && i + 1 < argc)
+			ec.fps = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--bitrate") && i + 1 < argc)
+			ec.bitrate = (uint32_t)strtoul(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--gop") && i + 1 < argc)
+			ec.gop = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--rc") && i + 1 < argc) {
+			i++;
+			ec.rc = !strcmp(argv[i], "cbr") ? 1 : !strcmp(argv[i], "off") ? 2 : 0;
+		} else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
+			ec.profile = (int)strtoul(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--level") && i + 1 < argc)
+			ec.level = (int)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--debug") && i + 1 < argc)
 			debug = (uint32_t)strtoul(argv[++i], NULL, 0);
 		else if (!cmd)
@@ -237,8 +255,14 @@ int main(int argc, char **argv)
 	}
 	stale_drop(STATE);
 	stale_drop(AHB_STATE);
-	if (arg2 && strcmp(cmd, "memtest") && strcmp(cmd, "decode"))
+	if (arg2 && strcmp(cmd, "memtest") && strcmp(cmd, "decode") && strcmp(cmd, "encode"))
 		goto usage;
+	if (!strcmp(cmd, "encode") && arg && arg2 && arg3 && sscanf(arg3, "%dx%d", &ec.w, &ec.h) == 2 && ec.fps > 0) {
+		ec.hevc = hevc == 1;
+		ec.debug = debug;
+		ec.bufphys = bufphys;
+		return encode(&ec, arg, arg2);
+	}
 	if (!strcmp(cmd, "decode") && clip && !arg)
 		return decode_loop(debug, clip, seconds, do_loop, bufphys, hevc);
 	if (!strcmp(cmd, "decode") && arg && arg2 && !arg3 && frames > 0)
@@ -293,6 +317,9 @@ usage:
 		"       | watch SECONDS [--sysinit] [--debug MASK] (firmware/NoC/SMMU/GDSC state, a line a second; power-only without init)\n"
 		"       env (default off): VENUSCTL_RAILS=1|CORNER VENUSCTL_RAILS_UNKNOWN=1 VENUSCTL_TBUVOTE=1 (power on/off)\n"
 		"       VENUSCTL_SMMU=window (default) | identity | hybrid (identity 0x1380 group, window 0x1360)\n"
+		"       | encode IN.yuv OUT WxH [--hevc] [--fps N] [--bitrate BPS] [--gop N] [--rc vbr|cbr|off] [--frames N]\n"
+		"         [--profile P] [--level L] [--bufphys A] [--stop-at sessinit|props|alloc|load|start|ftb]\n"
+		"         (after boot --keep + init: NV12 frames -> Annex B; env VENUSCTL_ENC_SKIP=prop,prop ...)\n"
 		"       | memtest ADDR SIZE write|check\n"
 		"       | fwdump [ADDR] (read-only, after a reset: SFR, debug ring, queues of the HFI block, default 0xa2600000)\n"
 		"       P0d watch env (default off): VENUSCTL_PC=1 [VENUSCTL_PC_DELAY_MS=1500] VENUSCTL_INTCLR=1\n"
