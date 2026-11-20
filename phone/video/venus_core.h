@@ -60,6 +60,7 @@ int hwctl_cmd(int on);	/* venus-hw: mvs0 GDSC HW_CONTROL on/off (msm_vidc __hand
 int intmask_cmd(void);	/* venus-hw: WRAPPER_INTR_MASK: unmask A2HWD (0x10) and A2H (0x4) as Linux's interrupt init */
 int suspend_cmd(void);	/* venus-hw: Linux power collapse (PC_PREP, TZ suspend, power off; image kept) */
 int resume_cmd(void);	/* venus-hw: power on, TZ resume, UC regs, CTRL_INIT (no PIL reload) */
+int bus_cmd(uint64_t kbps);	/* rpmh-agg: venusctl bus KBPS */
 
 /* ---- the stage 3 decoder in steps (venusctl decode runs them in its loop; venusd per client message) ---- */
 
