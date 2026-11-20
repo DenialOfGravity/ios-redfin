@@ -95,7 +95,7 @@ enum {	/* VTErrors.h */
 };
 #define INFO_DROPPED	2u	/* kVTEncodeInfo_FrameDropped */
 
-static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log; } cfg = { 1, 0, 0, 0, 0, 12, 0 };
+static struct { int hevc, attr, qp_i, qp_p, seqhdr, inflight, log, hw, rating, id; } cfg = { 1, 0, 0, 0, 0, 12, 0, 1, 1000, 1 };
 static pthread_once_t cfg_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -141,12 +141,18 @@ static void cfg_set(const char *k, const char *v)
 		cfg.inflight = n < 1 ? 1 : n > NPEND - 4 ? NPEND - 4 : n;
 	else if (!strcmp(k, "VTVENC_LOG"))
 		cfg.log = n;
+	else if (!strcmp(k, "VTVENC_HW"))
+		cfg.hw = n;
+	else if (!strcmp(k, "VTVENC_RATING"))
+		cfg.rating = n;
+	else if (!strcmp(k, "VTVENC_ID"))
+		cfg.id = n;
 }
 
 static void cfg_load(void)
 {
 	static const char *const keys[] = { "VTVENC_HEVC", "VTVENC_ATTR", "VTVENC_QP", "VTVENC_SEQHDR", "VTVENC_INFLIGHT",
-		"VTVENC_LOG" };
+		"VTVENC_LOG", "VTVENC_HW", "VTVENC_RATING", "VTVENC_ID" };
 	for (unsigned i = 0; i < sizeof keys / sizeof keys[0]; i++)
 		if (getenv(keys[i]))
 			cfg_set(keys[i], getenv(keys[i]));
@@ -1139,14 +1145,18 @@ __attribute__((visibility("default"))) int VTVenusEncRegister(void)
 		 * encoder ID, else "anon-N"; kVTVideoEncoder_IsHardwareAccelerated "VTIsHardwareAccelerated",
 		 * kVTVideoEncoder_Rating "VTRating" (default 0), kVTVideoEncoder_EncoderNameKey "VTEncoderName"): the
 		 * selection (vtSortRegistryItemsByVideoEncoderRating) takes the higher rating, then hardware */
-		int rating = 1000;
+		int rating = cfg.rating;
 		CFNumberRef rn = CFNumberCreate(NULL, kCFNumberIntType, &rating);
-		const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("VTEncoderName"), CFSTR("VTIsHardwareAccelerated"),
-			CFSTR("VTRating") };
-		const void *val[] = { i ? CFSTR("com.iosonpixel.videoencoder.hevc.venus") : CFSTR("com.iosonpixel.videoencoder.h264.venus"),
-			i ? CFSTR("HEVC (Venus)") : CFSTR("H.264 (Venus)"), kCFBooleanTrue, rn };
-		CFDictionaryRef info = CFDictionaryCreate(NULL, k, val, 4, &kCFTypeDictionaryKeyCallBacks,
-							  &kCFTypeDictionaryValueCallBacks);
+		CFMutableDictionaryRef info = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+									&kCFTypeDictionaryValueCallBacks);
+		if (cfg.id)
+			CFDictionarySetValue(info, CFSTR("CMClassImplementationID"), i ? CFSTR("com.iosonpixel.videoencoder.hevc.venus") :
+					     CFSTR("com.iosonpixel.videoencoder.h264.venus"));
+		CFDictionarySetValue(info, CFSTR("VTEncoderName"), i ? CFSTR("HEVC (Venus)") : CFSTR("H.264 (Venus)"));
+		if (cfg.hw)
+			CFDictionarySetValue(info, CFSTR("VTIsHardwareAccelerated"), kCFBooleanTrue);
+		if (cfg.rating)
+			CFDictionarySetValue(info, CFSTR("VTRating"), rn);
 		CFRelease(rn);
 		OSStatus st = VTRegisterVideoEncoderWithInfo(c, info, (void *)create_instance);
 		CFRelease(info);
