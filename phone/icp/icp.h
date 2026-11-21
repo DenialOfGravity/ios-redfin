@@ -87,6 +87,8 @@
 #define PA_HFI		0x86500000ull	/* pil_npu (5 MB): HFI 1 MB | secheap 1 MB | qdss 1 MB | 2 MB unused */
 #define PA_SECHEAP	0x86600000ull
 #define PA_QDSS		0x86700000ull
+#define PA_SHBUF	0x86800000ull	/* pil_npu's last 2 MB: firmware-CPU-visible buffers at IOVA_SHBUF */
+#define SHBUF_LEN	0x00200000u
 #define PA_IO		0x87400000ull	/* pil_cdsp (30 MB): 28 MB buffers | 1 MB unused | 1 MB SMMU tables */
 #define IO_LEN		0x01c00000u
 #define PA_TBL		0x89100000ull
@@ -94,6 +96,8 @@
 /* IOVAs: the Linux layout of the "icp" bank (lito-camera.dtsi iova-mem-map) */
 #define IOVA_SHARED	0x07400000u
 #define SHARED_LEN	0x09600000u	/* told to the firmware; we back the first 1 MB */
+#define IOVA_SHBUF	0x07800000u	/* in the shared region, given to the A5 MMU by MEM_MAP (0x7500000+64 KB is mapped by the firmware itself); the A5's own MMU maps it (the IO region it does not:
+				 * a CONFIG_IO buffer at IOVA 0x10c00000 took a data abort, FSR 0x805) */
 #define IOVA_SECHEAP	0x10a00000u
 #define SECHEAP_LEN	0x00100000u
 #define IOVA_QDSS	0x10b00000u
@@ -133,6 +137,7 @@ int icp_set_prop(uint32_t prop, const uint32_t *vals, unsigned n);
 /* IO region buffers (bump allocator over PA_IO): IOVA, PA */
 uint32_t icp_io_alloc(uint32_t len, uint64_t *pa);
 uint64_t icp_io_pa(uint32_t iova);
+uint32_t icp_sh_alloc(uint32_t len, uint64_t *pa);	/* shared-region buffers (commands the firmware reads/writes) */
 void icp_regs(const char *tag);
 double icp_ms(void);
 void icp_status(void);

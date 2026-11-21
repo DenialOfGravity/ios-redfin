@@ -14,7 +14,7 @@ CC=${CC:-../../work/userland/bin/ios-cc}
 W="-O2 -Wall -Wextra -Wno-unused-parameter"
 mkdir -p out
 if [ -n "${ICP_PRIVATE_DIR:-}" ]; then
-	$CC $W -DICP_PRIVATE -I. -I"$ICP_PRIVATE_DIR/regs" -o out/icpctl icpctl.c icp_hw.c ../video/pmem.c \
+	$CC $W -DICP_PRIVATE -I. -I../video -I"$ICP_PRIVATE_DIR/regs" -o out/icpctl icpctl.c icp_hw.c ../video/pmem.c \
 		"$ICP_PRIVATE_DIR/tools/icp_ipe.c"
 else
 	$CC $W -o out/icpctl icpctl.c icp_hw.c ../video/pmem.c

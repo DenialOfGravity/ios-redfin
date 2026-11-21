@@ -398,6 +398,7 @@ int icp_smmu_up(void)
 	uint64_t d = (PA_TBL + 0x1000) | 3;
 	pm_wr(PA_TBL, &d, 8);
 	if (map_pages(0, PA_FW, FW_LEN, 1) || map_pages(IOVA_SHARED, PA_HFI, 0x100000, 0) ||
+	    map_pages(IOVA_SHBUF, PA_SHBUF, SHBUF_LEN, 0) ||
 	    map_pages(IOVA_SECHEAP, PA_SECHEAP, SECHEAP_LEN, 0) || map_pages(IOVA_QDSS, PA_QDSS, QDSS_LEN, 0) ||
 	    map_pages(IOVA_IO, PA_IO, IO_LEN, 0)) {
 		printf("icp: smmu: table space\n");
@@ -831,6 +832,19 @@ uint32_t icp_io_alloc(uint32_t len, uint64_t *pa)
 		*pa = PA_IO + o;
 	zero_range(PA_IO + o, len);
 	return IOVA_IO + o;
+}
+static uint32_t sh_next;
+uint32_t icp_sh_alloc(uint32_t len, uint64_t *pa)
+{
+	len = (len + 0xfff) & ~0xfffu;
+	if (sh_next + len > SHBUF_LEN)
+		return 0;
+	uint32_t o = sh_next;
+	sh_next += len;
+	if (pa)
+		*pa = PA_SHBUF + o;
+	zero_range(PA_SHBUF + o, len);
+	return IOVA_SHBUF + o;
 }
 uint64_t icp_io_pa(uint32_t iova)
 {
