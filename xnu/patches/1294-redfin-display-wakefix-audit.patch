@@ -1,0 +1,501 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -53,6 +53,7 @@
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++void sweet_gpu_drop_surface(uint64_t key);
+ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+ 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
+ 	uint32_t *out_dw, uint32_t *out_dh);
+@@ -1536,6 +1537,20 @@
+ 	return s;
+ }
+ 
++void
++sweet_gpu_drop_surface(uint64_t key)
++{
++	lck_mtx_lock(&sweet_gpu_lock);
++	for (int i = 0; i < SLOTS_LIVE; i++) {
++		if (slot[i].key == key) {
++			slot[i].npages = 0;
++			slot[i].key = 0;
++			slot[i].used = 0;
++		}
++	}
++	lck_mtx_unlock(&sweet_gpu_lock);
++}
++
+ #define IB_OFF          A6_OFF_FREE     /* the present IBs in the pool (two, PRESENT_IB) */
+ #define PRESENT_IB(k)   (IB_OFF + 0x4000ULL * (k))
+ 
+@@ -1811,6 +1826,8 @@
+  * its cache: clean it through kva first (0: no clean). Waits for the GPU (a
+  * few ms).
+  */
++static uint32_t sweet_present_ib[10 * A6_BLIT_MAX_DW]; /* guarded by sweet_gpu_lock */
++
+ int
+ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+ 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
+@@ -1849,8 +1866,8 @@
+ 	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= frame.dw || 2 * ext >= frame.dh) {
+ 		ext = 0;
+ 	}
+-	static uint32_t ib[10 * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
++	uint32_t *ib = sweet_present_ib;
+ 	present_landed_locked(mach_absolute_time());	/* 0943 */
+ 	uint64_t fb_gva = A6_GVA_FB;
+ 	if (fb_flip_on()) {
+@@ -2001,8 +2018,8 @@
+ 	if (ext > DISPLAY_MASK_SIDE || 2 * ext >= PANEL_W) {
+ 		ext = 0;
+ 	}
+-	static uint32_t ib[(4 + 4) * A6_BLIT_MAX_DW];
+ 	lck_mtx_lock(&sweet_gpu_lock);
++	uint32_t *ib = sweet_present_ib;
+ 	present_landed_locked(mach_absolute_time());
+ 	flip_poll_locked();
+ 	int bb = back_target_locked(true);      /* 1263: the third buffer with kern.sweet_present_layers 0x4 */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,6 +45,7 @@
+ bool sweet_gpu_ready(void);
+ int sweet_gpu_surface_slot(uint64_t key);
+ int sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++void sweet_gpu_drop_surface(uint64_t key);
+ int sweet_gpu_present(int slot, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+ 	uint32_t fb_pitch, uint32_t corner_radius, uint32_t *out_dx, uint32_t *out_dy,
+ 	uint32_t *out_dw, uint32_t *out_dh);
+@@ -866,14 +867,38 @@
+ void sweet_hid_key(int key, int down);  /* hid/SweetHID.cpp */
+ }
+ static struct {
+-	volatile int      ios;          /* iOS's own display: -1 unknown, 0 off, 1 on (the last RequestPowerChange) */
+-	volatile int      iosPid;
+-	volatile uint64_t iosAbs;
+-	volatile uint64_t forcedAbs;    /* the last p disp on that found iOS's display off */
+-	uint64_t          pressAbs;
+-	uint32_t          presses, skipped, offOn, stalls;
+-	thread_call_t     tc;
+-} sweet_wk = { -1, 0, 0, 0, 0, 0, 0, 0, 0, NULL };
++	IOLock        *lock;
++	AppleCLCD     *fb;              /* retained while referenced here */
++	int            ios;             /* iOS's own display: -1 unknown, 0 off, 1 on (the last RequestPowerChange) */
++	int            iosPid;
++	uint64_t       iosAbs;
++	uint64_t       forcedAbs;       /* the last p disp on that found iOS's display off */
++	uint64_t       pressAbs;
++	uint32_t       presses, skipped, offOn, stalls;
++	thread_call_t  tc;
++} sweet_wk = { NULL, NULL, -1, 0, 0, 0, 0, 0, 0, 0, 0, NULL };
++
++static void
++sweet_wk_lock_enter(void)
++{
++	if (sweet_wk.lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&sweet_wk.lock)) {
++			IOLockFree(l);
++		}
++	}
++	if (sweet_wk.lock != NULL) {
++		IOLockLock(sweet_wk.lock);
++	}
++}
++
++static void
++sweet_wk_lock_exit(void)
++{
++	if (sweet_wk.lock != NULL) {
++		IOLockUnlock(sweet_wk.lock);
++	}
++}
+ 
+ static uint32_t
+ sweet_wk_ms(uint64_t since)
+@@ -887,7 +912,7 @@
+ }
+ 
+ static const char *
+-sweet_wk_ios_name(void)
++sweet_wk_ios_name_locked(void)
+ {
+ 	int s = sweet_wk.ios;
+ 	return s < 0 ? "unknown" : s ? "on" : "off";
+@@ -897,34 +922,56 @@
+ static void
+ sweet_wk_ios(bool off, int pid)
+ {
++	sweet_wk_lock_enter();
+ 	sweet_wk.iosPid = pid;
+ 	sweet_wk.iosAbs = mach_absolute_time();
+ 	sweet_wk.ios = off ? 0 : 1;
++	sweet_wk_lock_exit();
+ }
+ 
+ static void
+-sweet_wk_check(thread_call_param_t p0, __unused thread_call_param_t p1)
++sweet_wk_check(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
+-	AppleCLCD *fb = (AppleCLCD *)p0;
++	sweet_wk_lock_enter();
++	AppleCLCD *fb = sweet_wk.fb;
++	if (fb != NULL) {
++		fb->retain();
++	}
++	sweet_wk_lock_exit();
++
++	bool panelOff = true;
++	if (fb != NULL) {
++		IOLockLock(fb->fLock);
++		panelOff = fb->fPowerOff;
++		IOLockUnlock(fb->fLock);
++		fb->release();
++	}
++
++	sweet_wk_lock_enter();
+ 	const char *skip = NULL;
+ 	if (!(sweet_wakefix & 1)) {
+ 		skip = "kern.sweet_wakefix bit 0 off";
+ 	} else if (sweet_wk.ios != 0 || sweet_wk.iosAbs > sweet_wk.forcedAbs) {
+ 		skip = "iOS changed its display itself";
+-	} else if (fb == NULL || fb->fPowerOff) {
++	} else if (panelOff) {
+ 		skip = "the panel is off again";
+ 	} else if (sweet_wk_ms(sweet_wk.pressAbs) < 3000) {
+ 		skip = "pressed less than 3 s ago";
+ 	}
+ 	if (skip != NULL) {
+ 		sweet_wk.skipped++;
+-		IOLog("SWEET FB: wakefix (1264): no power key (%s; iOS display %s)\n", skip, sweet_wk_ios_name());
++		const char *ios_name = sweet_wk_ios_name_locked();
++		sweet_wk_lock_exit();
++		IOLog("SWEET FB: wakefix (1264): no power key (%s; iOS display %s)\n", skip, ios_name);
+ 		return;
+ 	}
+ 	sweet_wk.pressAbs = mach_absolute_time();
+-	sweet_wk.presses++;
++	uint32_t presses = ++sweet_wk.presses;
++	uint32_t ios_ms = sweet_wk_ms(sweet_wk.iosAbs);
++	int ios_pid = sweet_wk.iosPid;
++	sweet_wk_lock_exit();
+ 	IOLog("SWEET FB: wakefix (1264): panel on (p disp on) with iOS's display off for %u ms (pid %d's RequestPowerChange 0):"
+-	    " power key so iOS wakes and draws (%u presses)\n", sweet_wk_ms(sweet_wk.iosAbs), sweet_wk.iosPid, sweet_wk.presses);
++	    " power key so iOS wakes and draws (%u presses)\n", ios_ms, ios_pid, presses);
+ 	sweet_hid_key(0, 1);
+ 	IOSleep(60);
+ 	sweet_hid_key(0, 0);
+@@ -934,24 +981,37 @@
+ static void
+ sweet_wk_forced(AppleCLCD *fb)
+ {
++	sweet_wk_lock_enter();
+ 	if (!(sweet_wakefix & 1) || sweet_wk.ios != 0) {
++		sweet_wk_lock_exit();
+ 		return;
+ 	}
+-	if (sweet_wk.tc == NULL) {
+-		thread_call_t tc = thread_call_allocate(sweet_wk_check, fb);
+-		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&sweet_wk.tc)) {
+-			thread_call_free(tc);
++	AppleCLCD *old_fb = NULL;
++	if (fb != sweet_wk.fb) {
++		old_fb = sweet_wk.fb;
++		if (fb != NULL) {
++			fb->retain();
+ 		}
++		sweet_wk.fb = fb;
++	}
++	if (sweet_wk.tc == NULL) {
++		sweet_wk.tc = thread_call_allocate(sweet_wk_check, NULL);
+ 	}
+ 	if (sweet_wk.tc == NULL) {
++		sweet_wk_lock_exit();
++		OSSafeReleaseNULL(old_fb);
+ 		return;
+ 	}
+ 	sweet_wk.forcedAbs = mach_absolute_time();
+ 	uint64_t dl;
+ 	clock_interval_to_deadline(1500, kMillisecondScale, &dl);
+ 	thread_call_enter_delayed(sweet_wk.tc, dl);
++	uint32_t ios_ms = sweet_wk_ms(sweet_wk.iosAbs);
++	int ios_pid = sweet_wk.iosPid;
++	sweet_wk_lock_exit();
++	OSSafeReleaseNULL(old_fb);
+ 	IOLog("SWEET FB: wakefix (1264): p disp on while iOS's display is off (%u ms, pid %d): power key in 1.5 s unless iOS wakes\n",
+-	    sweet_wk_ms(sweet_wk.iosAbs), sweet_wk.iosPid);
++	    ios_ms, ios_pid);
+ }
+ 
+ void
+@@ -6448,13 +6508,23 @@
+ 		saidOff = false;
+ 		return;
+ 	}
++	bool logOffOn = false;
++	uint32_t offMs = 0;
++	int offPid = 0;
++	sweet_wk_lock_enter();
+ 	if (sweet_wk.ios != 0) {
+ 		saidOff = false;
+ 	} else if (!saidOff && sweet_wk_ms(sweet_wk.iosAbs) >= 3000) {
+ 		saidOff = true;
+ 		sweet_wk.offOn++;
++		logOffOn = true;
++		offMs = sweet_wk_ms(sweet_wk.iosAbs);
++		offPid = sweet_wk.iosPid;
++	}
++	sweet_wk_lock_exit();
++	if (logOffOn) {
+ 		IOLog("SWEET FB: wakefix (1264): panel on while iOS's display is off (%u ms, pid %d): frames stop by design until "
+-		    "iOS wakes (power key / pa wake); not a display-engine hang\n", sweet_wk_ms(sweet_wk.iosAbs), sweet_wk.iosPid);
++		    "iOS wakes (power key / pa wake); not a display-engine hang\n", offMs, offPid);
+ 	}
+ 	uint64_t f = sweet_fb_frames, s = sweet_fb_swap_count;
+ 	if (frAbs == 0 || f != fr) {
+@@ -6470,13 +6540,16 @@
+ 		return;
+ 	}
+ 	said = true;
++	sweet_wk_lock_enter();
+ 	sweet_wk.stalls++;
++	const char *ios_name = sweet_wk_ios_name_locked();
++	sweet_wk_lock_exit();
+ 	IOLog("SWEET FB: wakefix (1264): stall: %llu swaps in %llu ms, no frame shown | scanout on %d geom %d entering %d next %u "
+ 	    "flipping %u laterN %u shown %u last %u slotRun %u | mdp active %d scan %d busy %d | q %u dirty %d req %d | iOS %s | "
+ 	    "intf1 frames %u ctl0 flush %x\n", s - sw, ns / NSEC_PER_MSEC, sweet_scan.on, sweet_scan.geom, sweet_scan.entering,
+ 	    sweet_scan.nextSwap, sweet_scan.flipSwap, sweet_scan.laterN, sweet_scan.shownSwap, sweet_scan.lastSwap,
+ 	    sweet_scan.slotRun, sweet_mdp.active, sweet_mdp.scan, sweet_mdp_busy, fb->fQn, fb->fDirty, fb->fPresentReq,
+-	    sweet_wk_ios_name(), sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
++	    ios_name, sweet_mdp_rd(SWEET_INTF1 + INTF_FRAME_COUNT), sweet_mdp_rd(MDP_CTL(0) + MDP_CTL_FLUSH));
+ }
+ 
+ /*
+@@ -6542,9 +6615,12 @@
+ 			}
+ 			return;
+ 		}
++		sweet_wk_lock_enter();
++		const char *ios_name = sweet_wk_ios_name_locked();
++		uint32_t ios_s = sweet_wk.ios < 0 ? 0 : sweet_wk_ms(sweet_wk.iosAbs) / 1000;
++		sweet_wk_lock_exit();
+ 		IOLog("SWEET FB: display %s (p disp; scanout %s; iOS %s %u s)\n", fPowerOff ? "off" : "on",
+-		    sweet_scan_live() ? "direct" : "panel buffer", sweet_wk_ios_name(),
+-		    sweet_wk.ios < 0 ? 0 : sweet_wk_ms(sweet_wk.iosAbs) / 1000);       /* 1264 */
++		    sweet_scan_live() ? "direct" : "panel buffer", ios_name, ios_s);       /* 1264 */
+ 		return;
+ 	}
+ 	if (end - s >= 5 && !strncmp(s, "phase", 5)) {
+@@ -7274,6 +7350,56 @@
+  * first time, the panel switches to the GPU's row stride and is cleared, so
+  * the bars stay black. False: use the CPU copy.
+  */
++static int
++sweet_fb_map_surface(uint32_t id, SweetSurface *s, int *out_slot, uint64_t *out_key, bool *prepared_here)
++{
++	uint64_t key = ((uint64_t)id << 48) ^ (uint64_t)(uintptr_t)s->memory;
++	*out_key = key;
++	*prepared_here = false;
++	int slot = sweet_gpu_surface_slot(key);
++	if (slot >= 0) {
++		*out_slot = slot;
++		return 0;
++	}
++	/* Wire the pages for the GPU (left wired: surfaces live as long as backboardd). */
++	if (s->memory->prepare() != kIOReturnSuccess) {
++		return 1;
++	}
++	uint64_t len = s->memory->getLength();
++	uint64_t npages64 = (len + PAGE_SIZE - 1) / PAGE_SIZE;
++	if (len == 0 || npages64 > 1024) {
++		s->memory->complete();
++		return 2;
++	}
++	uint32_t npages = (uint32_t)npages64;
++	size_t bytes = (size_t)npages * sizeof(uint64_t);
++	uint64_t *pages = (uint64_t *)IOMallocData(bytes);
++	if (pages == NULL) {
++		s->memory->complete();
++		return 2;
++	}
++	uint32_t n = 0;
++	bool ok = true;
++	for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
++		IOByteCount seg = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || (pa & PAGE_MASK) != 0 || n >= npages) {
++			ok = false;
++			break;
++		}
++		pages[n++] = pa;
++	}
++	slot = ok ? sweet_gpu_map_surface(key, pages, n, PAGE_SIZE) : -1;
++	IOFreeData(pages, bytes);
++	if (slot < 0) {
++		s->memory->complete();
++		return ok ? 3 : 2;
++	}
++	*out_slot = slot;
++	*prepared_here = true;
++	return 0;
++}
++
+ bool
+ AppleCLCD::presentGPU(const uint8_t *rec)
+ {
+@@ -7302,32 +7428,18 @@
+ 		s->release();
+ 		return gpu_fallback(3, "surface format/size/pitch");
+ 	}
+-	uint64_t key = ((uint64_t)id << 48) ^ (uint64_t)(uintptr_t)s->memory;
+-	int slot = sweet_gpu_surface_slot(key);
+-	if (slot < 0) {
+-		/* Wire the pages for the GPU (left wired: surfaces live as long as backboardd). */
+-		if (s->memory->prepare() != kIOReturnSuccess) {
+-			s->release();
++	int slot = -1;
++	uint64_t key = 0;
++	bool prep_here = false;
++	int mrc = sweet_fb_map_surface(id, s, &slot, &key, &prep_here);
++	if (mrc != 0) {
++		s->release();
++		if (mrc == 1) {
+ 			return gpu_fallback(4, "prepare() failed");
+ 		}
+-		static uint64_t pages[1024];
+-		uint64_t len = s->memory->getLength();
+-		uint32_t n = 0;
+-		bool ok = len <= sizeof(pages) / sizeof(pages[0]) * PAGE_SIZE;
+-		for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
+-			IOByteCount seg = 0;
+-			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+-			ok = pa != 0 && (pa & PAGE_MASK) == 0;
+-			pages[n++] = pa;
+-		}
+-		if (!ok) {
+-			s->release();
++		if (mrc == 2) {
+ 			return gpu_fallback(5, "surface pages not page-aligned physical memory");
+ 		}
+-		slot = sweet_gpu_map_surface(key, pages, n, PAGE_SIZE);
+-	}
+-	if (slot < 0) {
+-		s->release();
+ 		return gpu_fallback(6, "GPU mapping failed");
+ 	}
+ 	if (!fGPU) {
+@@ -7371,6 +7483,11 @@
+ {
+ 	struct sweet_gpu_layer ly[SWEET_FB_LAYERS];
+ 	SweetSurface *held[SWEET_FB_LAYERS];
++	uint32_t held_id[SWEET_FB_LAYERS];
++	uint64_t keys[SWEET_FB_LAYERS];
++	bool prep_here[SWEET_FB_LAYERS];
++	bzero(keys, sizeof(keys));
++	bzero(prep_here, sizeof(prep_here));
+ 	uint32_t nl = 0, why = 0;
+ 	const char *what = NULL;
+ 	uint32_t lw = fLogicalW ? fLogicalW : SWEET_FB_LOGICAL_W, lh = fLogicalH ? fLogicalH : SWEET_FB_LOGICAL_H;
+@@ -7385,6 +7502,7 @@
+ 			continue;
+ 		}
+ 		held[nl] = s;
++		held_id[nl] = id;
+ 		struct sweet_gpu_layer *g = &ly[nl++];
+ 		bzero(g, sizeof(*g));
+ 		if (s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->elementWidth != 1 || s->elementHeight != 1 ||
+@@ -7450,46 +7568,30 @@
+ 		g->pitch = s->bytesPerRow;
+ 		g->blend = nl > 1;      /* layer 0 (the lowest live one) is copied, the ones above blended over it */
+ 		g->kva = (sweet_fbx & SWEET_FBX_NOCLEAN) && !cpuWrote(s) ? 0 : s->kernelAddress();
+-		uint64_t key = ((uint64_t)id << 48) ^ (uint64_t)(uintptr_t)s->memory;
+-		int slot = sweet_gpu_surface_slot(key);
+-		if (slot < 0) {
+-			if (s->memory->prepare() != kIOReturnSuccess) {
+-				why = 13;
+-				what = "layers: prepare() failed";
+-				break;
+-			}
+-			static uint64_t pages[1024];
+-			uint64_t len = s->memory->getLength();
+-			uint32_t n = 0;
+-			bool ok = len <= sizeof(pages) / sizeof(pages[0]) * PAGE_SIZE;
+-			for (uint64_t off = 0; ok && off < len; off += PAGE_SIZE) {
+-				IOByteCount seg = 0;
+-				addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+-				ok = pa != 0 && (pa & PAGE_MASK) == 0;
+-				pages[n++] = pa;
+-			}
+-			slot = ok ? sweet_gpu_map_surface(key, pages, n, PAGE_SIZE) : -1;
+-		}
+-		if (slot < 0) {
+-			why = 14;
+-			what = "layers: GPU mapping failed";
++	}
++	if (why == 0 && nl == 0) {
++		why = 16;
++		what = "layers: no live layer with a surface";
++	}
++	/* Map surfaces only after all layers pass geometry/format checks. */
++	for (uint32_t i = 0; why == 0 && i < nl; i++) {
++		int slot = -1;
++		int mrc = sweet_fb_map_surface(held_id[i], held[i], &slot, &keys[i], &prep_here[i]);
++		if (mrc != 0) {
++			why = (mrc == 1) ? 13 : 14;
++			what = (mrc == 1) ? "layers: prepare() failed" : "layers: GPU mapping failed";
+ 			break;
+ 		}
+-		g->slot = slot;
++		ly[i].slot = slot;
+ 	}
+ 	/* 1262: every layer's slot is looked up again just before the composite: a later layer's mapping may not evict
+ 	 * an earlier one's (LRU), checked here rather than assumed */
+ 	for (uint32_t i = 0; why == 0 && i < nl; i++) {
+-		uint64_t key = ((uint64_t)held[i]->id << 48) ^ (uint64_t)(uintptr_t)held[i]->memory;
+-		if (sweet_gpu_surface_slot(key) != ly[i].slot) {
++		if (sweet_gpu_surface_slot(keys[i]) != ly[i].slot) {
+ 			why = 15;
+ 			what = "layers: a surface's GPU slot was reused within the frame";
+ 		}
+ 	}
+-	if (why == 0 && nl == 0) {
+-		why = 16;
+-		what = "layers: no live layer with a surface";
+-	}
+ 	int rc = -1;
+ 	if (why == 0) {
+ 		if (!fGPU) {
+@@ -7509,6 +7611,10 @@
+ 		}
+ 	}
+ 	for (uint32_t i = 0; i < nl; i++) {
++		if (why != 0 && prep_here[i]) {
++			sweet_gpu_drop_surface(keys[i]);
++			held[i]->memory->complete();
++		}
+ 		held[i]->release();
+ 	}
+ 	IOLockLock(fLock);
+@@ -7788,9 +7894,17 @@
+ IOReturn
+ IOMobileFramebufferUserClient::clientClose(void)
+ {
+-	if (fFB != NULL && fPid != 0 && fPid == sweet_wk.iosPid && sweet_wk.ios >= 0) {
+-		IOLog("SWEET FB: wakefix (1264): pid %d closed: iOS display state unknown (was %s)\n", fPid, sweet_wk_ios_name());
+-		sweet_wk.ios = -1;      /* 1264: a backboardd restart */
++	if (fFB != NULL && fPid != 0) {
++		const char *was = NULL;
++		sweet_wk_lock_enter();
++		if (fPid == sweet_wk.iosPid && sweet_wk.ios >= 0) {
++			was = sweet_wk_ios_name_locked();
++			sweet_wk.ios = -1;      /* 1264: a backboardd restart */
++		}
++		sweet_wk_lock_exit();
++		if (was != NULL) {
++			IOLog("SWEET FB: wakefix (1264): pid %d closed: iOS display state unknown (was %s)\n", fPid, was);
++		}
+ 	}
+ 	if (fFB != NULL) {
+ 		fFB->removeClient(this);
