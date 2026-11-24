@@ -32,3 +32,9 @@ recon/
 # devices/<dev>/pull-firmware.sh output: the vendor's firmware, never committed
 fw-redfin/
 fw-*/
+
+# iOSOnAnd tracker CLI, local tokens, and offline queue (never commit secrets)
+.env
+.env.*
+cli.mjs
+TRACKER_QUEUE.md

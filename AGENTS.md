@@ -36,3 +36,16 @@
   of hand-written hashes; `KNOWN-GOOD.txt` is no longer written by hand (`state summary` / snapshots replace it).
 - Never put a SIM PIN/PUK, ICCID, IMSI, IMEI, Wi-Fi password or `abp-policy.conf` content into the manifest,
   a status doc or a log in git. The dump replaces such values with `@PHONE@` on the phone.
+
+## iOSOnAnd tracker
+
+- This port is tracked at https://hackios.appaiproxy.com/device/pixel-5 (`DenialOfGravity/ios-redfin`, device slug
+  `pixel-5`).
+- Keep auth in `TRACKER_TOKEN` or `node cli.mjs login` (`~/.config/iosonand/tokens.json`), never in tracked files.
+- Before recording updates, read the current state first with `node cli.mjs status-get` (and `node cli.mjs areas` if
+  needed).
+- When a change makes an area work or breaks it, record it in the same session with
+  `node cli.mjs status-set pixel-5 <area> <state> --detail "<what the build, log or test showed>" --source "<commit or log link>"`
+  (plus `--os ios --version "iOS 16.7.16"`, and `feature-add` / `gpu-set` / `fork-sync` when notable features, GPU,
+  or best result change). Attach verified screenshots/clips with `--photo <file>` or `media-upload` when provided.
+- Only record what the build, log, or test directly showed; unproven stays `unknown`.
