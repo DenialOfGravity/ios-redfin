@@ -1,0 +1,1410 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 22d08e1..58eba37 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -146,6 +146,7 @@ bsd/dev/sweet_bb.c			standard
+ bsd/dev/sweet_qmux.c			standard
+ bsd/dev/sweet_ssr.c			standard
+ bsd/dev/sweet_ipa.c			standard
++bsd/dev/sweet_efs.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+index 3baf898..778477e 100644
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -758,11 +758,18 @@ router_port(uint32_t port)
+ 	return (sweet_bb & SBB_QMUX) && port >= SBB_QMUX_PORT0 && port < SBB_QMUX_PORT0 + SBB_QMUX_NPORTS;
+ }
+ 
++static bool
++efs_port(uint32_t port)
++{
++	return (sweet_bb & SBB_SVC) && (port == SBB_RMTFS_PORT || port == SBB_PDMAP_PORT || port == SBB_TFTP_PORT ||
++	    (port >= SBB_TFTP_XFER_PORT0 && port < SBB_TFTP_XFER_PORT0 + SBB_TFTP_XFERS));
++}
++
+ static bool
+ port_kernel_reserved(uint32_t port)
+ {
+ 	return router_port(port) || port == SWEET_SSR_MDM_PORT || ((sweet_bb & SBB_DATA) && sweet_ipa_port(port)) ||
+-	    aux_port(port) || qr_port(port);
++	    efs_port(port) || aux_port(port) || qr_port(port);
+ }
+ 
+ static void
+@@ -812,6 +819,10 @@ qrtr_in(const uint8_t *d, uint32_t n)
+ 			sweet_ssr_qrtr_in(SWEET_SSR_MODEM, h.type, h.src_node, h.src_port, h.confirm_rx, p, pl);
+ 			return;
+ 		}
++		if (efs_port(h.dst_port)) {
++			sweet_efs_enqueue(&h, p, pl);
++			return;
++		}
+ 		if (aux_port(h.dst_port)) {                 /* 1124: sweetlocd's ports: only its device */
+ 			chan_deliver(&chan_aux, &h, p, pl);
+ 			return;
+@@ -845,8 +856,8 @@ qrtr_in(const uint8_t *d, uint32_t n)
+ 		srv_gone(h.src_node, 0xffffffffu);
+ 		break;
+ 	case SBB_QRTR_RESUME_TX:
+-		if (router_port(h.dst_port)) {
+-			return;                         /* the router does not flow-control its sends */
++		if (router_port(h.dst_port) || efs_port(h.dst_port)) {
++			return;                         /* the router/efs do not flow-control their sends */
+ 		}
+ 		if (aux_port(h.dst_port)) {
+ 			chan_deliver(&chan_aux, &h, p, pl);
+@@ -1161,6 +1172,9 @@ link_reinit(uint32_t timeout_ms, const char *why)
+ 		if (up) {
+ 			SAY("link: IPCRTR open (rcid %u, up #%u)\n", gl.rcid, gl.ups);
+ 			sbb_wake();
++			if (sweet_bb & SBB_SVC) {
++				sweet_efs_wake();
++			}
+ 			return 0;
+ 		}
+ 		sleep_us(2000);
+@@ -1367,6 +1381,9 @@ sbb_thread(__unused void *param, __unused wait_result_t wr)
+ 			uint32_t pkt[5] = { SBB_QRTR_HELLO, 0, 0, 0, 0 };
+ 			int e = sbb_qrtr_send(SBB_QRTR_HELLO, SBB_PORT_CTRL, SBB_NODE_MODEM, SBB_PORT_CTRL, pkt, sizeof(pkt));
+ 			SAY("HELLO answered (%d)\n", e);
++			if (sweet_bb & SBB_SVC) {
++				sweet_efs_wake();
++			}
+ 		}
+ 		if (sweet_bb & SBB_QMUX) {
+ 			struct sbb_pkt *p;
+@@ -1570,6 +1587,11 @@ mq_write(__unused dev_t d, struct uio *uio, __unused int ioflag)
+ 		if (dst >= 0) {
+ 			struct sbb_qrtr_hdr lh = { 1, h.type, SBB_NODE_APPS, h.src_port, h.confirm_rx, len, SBB_NODE_APPS, h.dst_port };
+ 			chan_deliver(&qr_slots[dst].chan, &lh, b, len);
++		} else if (efs_port(h.dst_port)) {
++			if (h.type == SBB_QRTR_DATA) {
++				struct sbb_qrtr_hdr lh = { 1, h.type, SBB_NODE_APPS, h.src_port, h.confirm_rx, len, SBB_NODE_APPS, h.dst_port };
++				sweet_efs_enqueue(&lh, b, len);
++			}
+ 		} else {
+ 			e = qrtr_send_hdr(&h, b, len);
+ 		}
+@@ -2007,6 +2029,10 @@ qr_write(dev_t d, struct uio *uio, __unused int ioflag)
+ 					    SBB_NODE_APPS, h.src_port };
+ 					chan_deliver(&sl->chan, &rh, (const uint8_t *)rt, sizeof(rt));
+ 				}
++			} else if (efs_port(h.dst_port)) {
++				if (h.type == SBB_QRTR_DATA) {
++					sweet_efs_enqueue(&lh, b, len);
++				}
+ 			} else if (!port_kernel_reserved(h.dst_port)) {
+ 				lck_mtx_lock(&q_lock);
+ 				bool w_ok = chan_wland.open;
+@@ -2299,6 +2325,77 @@ sysctl_bb_stats SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_bb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_bb_stats, "A",
+     "redfin 1068: kernel QMI router counters, per service fwd/local/denied, live clients");
+ 
++/* ---- Phase 3 helpers for sweet_efs.c ---- */
++
++uint32_t
++sbb_link_ups(void)
++{
++	lck_mtx_lock(&ml_lock);
++	uint32_t u = gl.ups;
++	lck_mtx_unlock(&ml_lock);
++	return u;
++}
++
++void
++sbb_srv_register_local(uint32_t svc, uint32_t inst, uint32_t port)
++{
++	lck_mtx_lock(&ml_lock);
++	srv_add(svc, inst, SBB_NODE_APPS, port);
++	bool up = (gl.state == 2);
++	lck_mtx_unlock(&ml_lock);
++	uint32_t w[5] = { SBB_QRTR_NEW_SERVER, svc, inst, SBB_NODE_APPS, port };
++	struct sbb_qrtr_hdr ch = { 1, SBB_QRTR_NEW_SERVER, SBB_NODE_APPS, SBB_PORT_CTRL, 0, sizeof(w), SBB_NODE_BCAST, SBB_PORT_CTRL };
++	chan_broadcast_ctrl(&ch, (const uint8_t *)w, sizeof(w), -1);
++	if (up) {
++		(void)sbb_qrtr_send(SBB_QRTR_NEW_SERVER, SBB_PORT_CTRL, SBB_NODE_MODEM, SBB_PORT_CTRL, w, sizeof(w));
++	}
++}
++
++static int
++sbb_deliver_local(uint32_t type, uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len)
++{
++	struct sbb_qrtr_hdr lh = { 1, type, SBB_NODE_APPS, src_port, 0, len, SBB_NODE_APPS, dst_port };
++	if (aux_port(dst_port)) {
++		chan_deliver(&chan_aux, &lh, (const uint8_t *)data, len);
++		return 0;
++	}
++	int dst = qr_owner_port(dst_port);
++	if (dst >= 0) {
++		chan_deliver(&qr_slots[dst].chan, &lh, (const uint8_t *)data, len);
++		return 0;
++	}
++	if (!port_kernel_reserved(dst_port)) {
++		lck_mtx_lock(&q_lock);
++		bool w_ok = chan_wland.open;
++		lck_mtx_unlock(&q_lock);
++		if (w_ok) {
++			chan_deliver(&chan_wland, &lh, (const uint8_t *)data, len);
++			return 0;
++		}
++	}
++	return ECONNREFUSED;
++}
++
++int
++sbb_efs_reply(uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len)
++{
++	if (dst_node == SBB_NODE_APPS) {
++		return sbb_deliver_local(SBB_QRTR_DATA, src_port, dst_port, data, len);
++	}
++	return sbb_qrtr_send(SBB_QRTR_DATA, src_port, dst_node, dst_port, data, len);
++}
++
++void
++sbb_efs_resume_tx(uint32_t dst_port, uint32_t peer_node, uint32_t peer_port)
++{
++	uint32_t rt[5] = { SBB_QRTR_RESUME_TX, SBB_NODE_APPS, dst_port, 0, 0 };
++	if (peer_node == SBB_NODE_APPS) {
++		(void)sbb_deliver_local(SBB_QRTR_RESUME_TX, dst_port, peer_port, rt, sizeof(rt));
++		return;
++	}
++	(void)sbb_qrtr_send(SBB_QRTR_RESUME_TX, dst_port, peer_node, peer_port, rt, sizeof(rt));
++}
++
+ /* ---- start ---- */
+ 
+ void
+@@ -2308,14 +2405,15 @@ sweet_bb_init(void)
+ 	thread_t th;
+ 	sweet_ssr_init();                       /* 1070: modem crash reason + SSCTL notices (own boot-args, own thread) */
+ 	PE_parse_boot_argn("sweetbb", &v, sizeof(v));
+-	if (v & (SBB_QMUX | SBB_DATA)) {       /* 1076: the kernel IPA data path needs the kernel link too */
++	if (v & (SBB_QMUX | SBB_SVC | SBB_DATA)) { /* 1076/Phase3: kernel router, services and IPA need the kernel link */
+ 		v |= SBB_LINK;
+ 	}
+ 	sweet_bb = v;
+ 	if (!v) {
+ 		return;
+ 	}
+-	SAY("sweetbb=0x%x: modem link=%s qmux=%s%s\n", v, (v & SBB_LINK) ? "kernel" : "wland", (v & SBB_QMUX) ? "kernel" : "wland",
++	SAY("sweetbb=0x%x: modem link=%s qmux=%s svc=%s%s\n", v, (v & SBB_LINK) ? "kernel" : "wland",
++	    (v & SBB_QMUX) ? "kernel" : "wland", (v & SBB_SVC) ? "kernel" : "wland",
+ 	    (v & ~SBB_BITS) ? " (later-phase bits ignored by this kernel)" : "");
+ 	int major = cdevsw_add(-1, &mq_cdevsw);
+ 	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "sweet-mqrtr");
+@@ -2339,6 +2437,9 @@ sweet_bb_init(void)
+ 	}
+ 	if (kernel_thread_start(sbb_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
++		if (v & SBB_SVC) {
++			sweet_efs_init();       /* Phase 3: pd-mapper, rmtfs and tftp services on sweetefs thread */
++		}
+ 		if (v & SBB_DATA) {
+ 			sweet_ipa_init();       /* 1076: kernel IPA data path (its own thread; nothing mapped until wland's handoff) */
+ 		}
+diff --git a/bsd/dev/sweet_bb.h b/bsd/dev/sweet_bb.h
+index 3e2b4f5..f1a35ba 100644
+--- a/bsd/dev/sweet_bb.h
++++ b/bsd/dev/sweet_bb.h
+@@ -12,9 +12,10 @@
+ #define SBB_LINK                0x01u   /* kernel GLINK/QRTR to the modem + /dev/sweet-mqrtr (wland's link backend) */
+ #define SBB_DATA                0x10u   /* 1075 pdp_ip0..7 + 1076 kernel IPA data path (sweet_ipa.c; implies SBB_LINK) */
+ #define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
++#define SBB_SVC                 0x04u   /* Phase 3: kernel pd-mapper, rmtfs and tftp services (implies SBB_LINK) */
+ #define SBB_REALBOOT            0x40u   /* 1071 (P4 phase 2b): ABM's real baseband boot against an emulated Mav17 BHI/Sahara
+ 					 * target (pipes pbl/sahara, images discarded); the shouldBoot=0 page patch is off */
+-#define SBB_BITS                0x53u   /* bits this kernel implements (others are later phases: accepted, ignored) */
++#define SBB_BITS                0x57u   /* bits this kernel implements (others are later phases: accepted, ignored) */
+ 
+ #define SBB_NODE_MODEM          0u
+ #define SBB_NODE_APPS           1u
+@@ -55,6 +56,14 @@
+ #define SBB_DEV_AUX             1u
+ #define SBB_DEV_QR_BASE         2u
+ 
++/* Phase 3: kernel-owned modem AP service ports (gated by sweetbb & SBB_SVC) */
++#define SBB_RMTFS_PORT          0x10u
++#define SBB_PDMAP_PORT          0x11u
++#define SBB_TFTP_PORT           0x12u
++#define SBB_TFTP_XFER_PORT0     0x100u
++#define SBB_TFTP_XFERS          8u
++#define SBB_TFTP_MAX_BLKSIZE    1024u
++
+ struct sbb_qrtr_lookup {
+ 	uint32_t svc, inst, node, port;
+ };
+@@ -87,6 +96,15 @@ int sbb_wland_data(uint32_t src_port, uint32_t dst_port, const void *data, uint3
+ bool sbb_wland_open(void);                                                                      /* 1122 */
+ int sbb_dev_data(unsigned dev, uint32_t src_port, uint32_t dst_port, const void *data, uint32_t len);  /* 1124: wland or aux */
+ bool sbb_dev_open(unsigned dev);                                                                /* 1124 */
++uint32_t sbb_link_ups(void);
++void sbb_srv_register_local(uint32_t svc, uint32_t inst, uint32_t port);
++int sbb_efs_reply(uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
++void sbb_efs_resume_tx(uint32_t dst_port, uint32_t peer_node, uint32_t peer_port);
++
++/* sweet_efs.c */
++void sweet_efs_init(void);
++void sweet_efs_wake(void);
++void sweet_efs_enqueue(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n);
+ 
+ /* sweet_qmux.c (all on the sweetbb thread, except sweet_qmux_c2w and the sysctls) */
+ bool sweet_qmux_on(void);
+diff --git a/b/bsd/dev/sweet_efs.c b/bsd/dev/sweet_efs.c
+new file mode 100644
+index 0000000..49c6ac0
+--- /dev/null
++++ b/bsd/dev/sweet_efs.c
+@@ -0,0 +1,1150 @@
++/*
++ * redfin Phase 3 (1296): kernel-hosted modem AP services (pd-mapper 0x40, rmtfs 14, tftp 4096).
++ * Enabled by boot-arg sweetbb & SBB_SVC (0x04; implies SBB_LINK). Runs on its own kernel thread
++ * "sweetefs" fed by a packet queue so disk VFS operations never stall the sweetbb GLINK pump.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/mount.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <mach/mach_types.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include "sweet_bb.h"
++
++extern void sweet_smc(uint64_t x[8]);
++extern int sweet_vfs_mkdir(const char *path, int mode);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define EFS_SAY(fmt, ...)       printf("SWEET EFS: " fmt, ##__VA_ARGS__)
++
++/* ---- sysctls ---- */
++static int pdmap_adsp = -1;             /* default from adsp boot-arg (1 if adsp > 0) */
++static uint32_t tftp_max_blk = SBB_TFTP_MAX_BLKSIZE;
++
++SYSCTL_INT(_kern, OID_AUTO, sweet_pdmap_adsp, CTLFLAG_RW | CTLFLAG_LOCKED, &pdmap_adsp, 0,
++    "redfin Phase 3: pd-mapper includes ADSP/CDSP protection domains (default from adsp boot-arg)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_tftp_blksize, CTLFLAG_RW | CTLFLAG_LOCKED, &tftp_max_blk, 0,
++    "redfin Phase 3: max TFTP blksize offered to modem (clamped 128..8192, default 1024 for reusable GLINK intents)");
++
++/* ---- queue from sweet_bb / local clients ---- */
++struct efs_pkt {
++	struct efs_pkt *next;
++	struct sbb_qrtr_hdr h;
++	uint32_t n;
++	uint8_t d[];
++};
++
++static LCK_GRP_DECLARE(efs_grp, "sweet_efs");
++static LCK_MTX_DECLARE(efs_lock, &efs_grp);
++static struct efs_pkt *efs_first, *efs_last;
++static uint32_t efs_q_count, efs_q_bytes;
++static uint64_t efs_q_in, efs_q_dropped;
++static bool efs_wake_flag;
++static bool efs_ready;
++
++#define EFS_Q_MAX_COUNT         1024u
++#define EFS_Q_MAX_BYTES         (2u << 20)
++
++void
++sweet_efs_wake(void)
++{
++	if (!efs_ready) {
++		return;
++	}
++	lck_mtx_lock(&efs_lock);
++	efs_wake_flag = true;
++	wakeup(&efs_wake_flag);
++	lck_mtx_unlock(&efs_lock);
++}
++
++void
++sweet_efs_enqueue(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	if (!efs_ready) {
++		return;
++	}
++	struct efs_pkt *p = kalloc_data(sizeof(*p) + n, Z_WAITOK);
++	if (p == NULL) {
++		lck_mtx_lock(&efs_lock);
++		efs_q_dropped++;
++		lck_mtx_unlock(&efs_lock);
++		return;
++	}
++	p->next = NULL;
++	p->h = *h;
++	p->n = n;
++	if (n && d != NULL) {
++		memcpy(p->d, d, n);
++	}
++	lck_mtx_lock(&efs_lock);
++	bool full = efs_q_count >= EFS_Q_MAX_COUNT || efs_q_bytes + n > EFS_Q_MAX_BYTES;
++	if (!full) {
++		if (efs_last != NULL) {
++			efs_last->next = p;
++		} else {
++			efs_first = p;
++		}
++		efs_last = p;
++		efs_q_count++;
++		efs_q_bytes += n;
++		efs_q_in++;
++		efs_wake_flag = true;
++		wakeup(&efs_wake_flag);
++		p = NULL;
++	} else {
++		efs_q_dropped++;
++	}
++	uint64_t dropped = efs_q_dropped;
++	lck_mtx_unlock(&efs_lock);
++	if (p != NULL) {
++		kfree_data(p, sizeof(*p) + n);
++		if (dropped < 10 || dropped % 100 == 0) {
++			EFS_SAY("queue full: dropped type %u dst %#x (%llu dropped)\n", h->type, h->dst_port, dropped);
++		}
++	}
++}
++
++static struct efs_pkt *
++efs_pop(void)
++{
++	lck_mtx_lock(&efs_lock);
++	struct efs_pkt *p = efs_first;
++	if (p != NULL) {
++		efs_first = p->next;
++		if (efs_first == NULL) {
++			efs_last = NULL;
++		}
++		efs_q_count--;
++		efs_q_bytes -= p->n;
++	}
++	lck_mtx_unlock(&efs_lock);
++	return p;
++}
++
++/* ---- minimal QMI wire codec (for pd-mapper & rmtfs) ---- */
++#define QMI_REQUEST             0u
++#define QMI_RESPONSE            2u
++
++struct efs_qmi_msg {
++	uint8_t type;
++	uint16_t txn, id, len;
++	const uint8_t *tlv;
++};
++
++struct efs_qmi_buf {
++	uint8_t b[1024];
++	size_t n;
++};
++static struct efs_qmi_buf qmi_tx;       /* used strictly on sweetefs thread */
++
++static void
++qmi_start(struct efs_qmi_buf *q, uint8_t type, uint16_t txn, uint16_t id)
++{
++	q->b[0] = type;
++	memcpy(q->b + 1, &txn, 2);
++	memcpy(q->b + 3, &id, 2);
++	q->n = 7;
++}
++
++static void
++qmi_tlv(struct efs_qmi_buf *q, uint8_t t, const void *v, uint16_t len)
++{
++	if (q->n + 3 + len > sizeof(q->b)) {
++		q->n = sizeof(q->b) + 1;
++		return;
++	}
++	q->b[q->n] = t;
++	memcpy(q->b + q->n + 1, &len, 2);
++	if (len) {
++		memcpy(q->b + q->n + 3, v, len);
++	}
++	q->n += 3 + len;
++}
++
++static void
++qmi_tlv_u8(struct efs_qmi_buf *q, uint8_t t, uint8_t v)
++{
++	qmi_tlv(q, t, &v, 1);
++}
++
++static void
++qmi_tlv_u32(struct efs_qmi_buf *q, uint8_t t, uint32_t v)
++{
++	qmi_tlv(q, t, &v, 4);
++}
++
++static void
++qmi_tlv_u64(struct efs_qmi_buf *q, uint8_t t, uint64_t v)
++{
++	qmi_tlv(q, t, &v, 8);
++}
++
++static void
++qmi_tlv_result(struct efs_qmi_buf *q, uint16_t result, uint16_t error)
++{
++	uint16_t r[2] = { result, error };
++	qmi_tlv(q, 2, r, 4);
++}
++
++static uint32_t
++qmi_finish(struct efs_qmi_buf *q)
++{
++	if (q->n > sizeof(q->b) || q->n < 7) {
++		return 0;
++	}
++	uint16_t len = (uint16_t)(q->n - 7);
++	memcpy(q->b + 5, &len, 2);
++	return (uint32_t)q->n;
++}
++
++static int
++qmi_parse(const uint8_t *d, uint32_t n, struct efs_qmi_msg *m)
++{
++	if (n < 7) {
++		return -1;
++	}
++	m->type = d[0];
++	memcpy(&m->txn, d + 1, 2);
++	memcpy(&m->id, d + 3, 2);
++	memcpy(&m->len, d + 5, 2);
++	if (m->len > n - 7) {
++		m->len = (uint16_t)(n - 7);
++	}
++	m->tlv = d + 7;
++	return 0;
++}
++
++static const uint8_t *
++qmi_get(const struct efs_qmi_msg *m, uint8_t t, uint16_t *len)
++{
++	for (uint32_t o = 0; o + 3 <= m->len;) {
++		uint16_t l;
++		memcpy(&l, m->tlv + o + 1, 2);
++		if (o + 3 + l > m->len) {
++			break;
++		}
++		if (m->tlv[o] == t) {
++			if (len != NULL) {
++				*len = l;
++			}
++			return m->tlv + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++static int
++qmi_get_u32(const struct efs_qmi_msg *m, uint8_t t, uint32_t *v)
++{
++	uint16_t l = 0;
++	const uint8_t *p = qmi_get(m, t, &l);
++	if (p == NULL || l < 4) {
++		return -1;
++	}
++	memcpy(v, p, 4);
++	return 0;
++}
++
++static int
++qmi_get_u8(const struct efs_qmi_msg *m, uint8_t t, uint8_t *v)
++{
++	uint16_t l = 0;
++	const uint8_t *p = qmi_get(m, t, &l);
++	if (p == NULL || l < 1) {
++		return -1;
++	}
++	*v = p[0];
++	return 0;
++}
++
++/* ---- 1. pd-mapper (QMI 0x40 on port 0x11) ---- */
++#define PDMAP_SVC               0x40u
++#define PDMAP_VERINST           0x101u  /* instance 1, version 1 */
++#define PDMAP_GET_DOMAIN_LIST   0x21u
++#define PDMAP_PFR               0x24u
++
++static const struct {
++	const char *service;
++	const char *domain;
++	uint32_t instance;
++	bool adsp;
++} pdm_db[] = {
++	{ "tms/servreg", "msm/modem/root_pd", 180, false },
++	{ "gps/gps_service", "msm/modem/root_pd", 180, false },
++	{ "kernel/elf_loader", "msm/modem/wlan_pd", 180, false },
++	{ "tms/servreg", "msm/modem/wlan_pd", 180, false },
++	{ "wlan/fw", "msm/modem/wlan_pd", 180, false },
++	{ "tms/servreg", "msm/adsp/root_pd", 74, true },
++	{ "tms/servreg", "msm/adsp/sensor_pd", 74, true },
++	{ "tms/servreg", "msm/adsp/audio_pd", 74, true },
++	{ "avs/audio", "msm/adsp/audio_pd", 74, true },
++	{ "tms/servreg", "msm/cdsp/root_pd", 76, true },
++};
++
++static struct {
++	uint64_t queries, pfrs, errs;
++} pdm_st;
++
++static void
++pdmap_handle(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	struct efs_qmi_msg m;
++	if (qmi_parse(d, n, &m) || m.type != QMI_REQUEST) {
++		return;
++	}
++	qmi_start(&qmi_tx, QMI_RESPONSE, m.txn, m.id);
++	if (m.id == PDMAP_PFR) {
++		uint16_t l1 = 0, l2 = 0;
++		const uint8_t *svc = qmi_get(&m, 1, &l1);
++		const uint8_t *why = qmi_get(&m, 2, &l2);
++		pdm_st.pfrs++;
++		EFS_SAY("pd-mapper: PD FAILURE \"%.*s\": %.*s\n", svc ? (int)l1 : 0, svc ? (const char *)svc : "",
++		    why ? (int)l2 : 0, why ? (const char *)why : "");
++		qmi_tlv_result(&qmi_tx, 0, 0);
++	} else if (m.id != PDMAP_GET_DOMAIN_LIST) {
++		pdm_st.errs++;
++		qmi_tlv_result(&qmi_tx, 1, 0x47);
++	} else {
++		uint16_t l = 0;
++		const uint8_t *p = qmi_get(&m, 1, &l);
++		char name[80];
++		memset(name, 0, sizeof(name));
++		if (p != NULL && l > 0) {
++			uint16_t cp = l < sizeof(name) - 1 ? l : (uint16_t)(sizeof(name) - 1);
++			memcpy(name, p, cp);
++		}
++		uint32_t offset = 0;
++		(void)qmi_get_u32(&m, 0x10, &offset);
++		uint8_t list[512];
++		size_t o = 1;
++		list[0] = 0;
++		uint16_t total = 0;
++		bool adsp = pdmap_adsp != 0;
++		for (unsigned i = 0; i < sizeof(pdm_db) / sizeof(pdm_db[0]); i++) {
++			if (strcmp(pdm_db[i].service, name) != 0 || (pdm_db[i].adsp && !adsp)) {
++				continue;
++			}
++			if (total++ < offset) {
++				continue;
++			}
++			size_t nl_sz = strlen(pdm_db[i].domain);
++			if (nl_sz > 255 || o + 1 + nl_sz + 9 > sizeof(list)) {
++				break;
++			}
++			uint8_t nl = (uint8_t)nl_sz;
++			list[o++] = nl;
++			memcpy(list + o, pdm_db[i].domain, nl);
++			o += nl;
++			memcpy(list + o, &pdm_db[i].instance, 4);
++			o += 4;
++			list[o++] = 0;
++			memset(list + o, 0, 4);
++			o += 4;
++			list[0]++;
++		}
++		pdm_st.queries++;
++		if (pdm_st.queries <= 24) {
++			EFS_SAY("pd-mapper: \"%s\" -> %u domain(s)%s\n", name, total, adsp ? " (pdmapadsp=1)" : "");
++		}
++		qmi_tlv_result(&qmi_tx, 0, 0);
++		qmi_tlv(&qmi_tx, 0x10, &total, 2);
++		uint16_t rev = 1;
++		qmi_tlv(&qmi_tx, 0x11, &rev, 2);
++		qmi_tlv(&qmi_tx, 0x12, list, (uint16_t)o);
++	}
++	uint32_t plen = qmi_finish(&qmi_tx);
++	if (plen) {
++		(void)sbb_efs_reply(SBB_PDMAP_PORT, h->src_node, h->src_port, qmi_tx.b, plen);
++	}
++}
++
++/* ---- 2. rmtfs (QMI 14 on port 0x10, 0xe1001000 + 2.5 MiB carved-out buffer) ---- */
++#define RMTFS_SVC               14u
++#define RMTFS_VERINST           1u
++#define RMTFS_PA                0xe1001000ull
++#define RMTFS_SIZE              0x280000u
++#define RMTFS_SECTOR            512u
++#define RMTFS_IO_CHUNK          65536u
++#define VMID_HLOS               3u
++#define VMID_MSS_MSA            15u
++
++enum {
++	RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND,
++};
++
++static const struct {
++	const char *modem_path;
++	const char *file_path;
++} rmtfs_parts[] = {
++	{ "/boot/modem_fs1", "/var/local/fw/rmtfs/modemst1.img" },
++	{ "/boot/modem_fs2", "/var/local/fw/rmtfs/modemst2.img" },
++	{ "/boot/modem_fsg", "/var/local/fw/rmtfs/fsg.img" },
++	{ "/boot/modem_fsc", "/var/local/fw/rmtfs/fsc.img" },
++};
++#define RMTFS_NPARTS            4u
++
++static vnode_t rmtfs_vps[RMTFS_NPARTS];
++static vm_offset_t rmtfs_va;
++static bool rmtfs_hyp_done;
++static uint8_t *rmtfs_io_buf;
++
++static struct {
++	uint64_t opens, closes, reads, writes, rx_bytes, tx_bytes, errs;
++} rmtfs_st;
++
++static void
++rmtfs_close_all(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	for (unsigned i = 0; i < RMTFS_NPARTS; i++) {
++		if (rmtfs_vps[i] != NULLVP) {
++			vnode_close(rmtfs_vps[i], FREAD | FWRITE, ctx);
++			rmtfs_vps[i] = NULLVP;
++		}
++	}
++}
++
++static bool
++rmtfs_prepare(void)
++{
++	if (rmtfs_va == 0) {
++		rmtfs_va = ml_io_map_unmappable((vm_offset_t)RMTFS_PA, RMTFS_SIZE, VM_WIMG_WCOMB);
++		if (rmtfs_va == 0) {
++			EFS_SAY("rmtfs: ml_io_map_unmappable(%#llx, %#x) failed\n", (unsigned long long)RMTFS_PA, RMTFS_SIZE);
++			return false;
++		}
++	}
++	if (rmtfs_hyp_done) {
++		return true;
++	}
++	vm_offset_t scratch_va = 0;
++	if (kmem_alloc_contig(kernel_map, &scratch_va, PAGE_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		EFS_SAY("rmtfs: scratch page alloc failed\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)scratch_va);
++	if (pn == 0) {
++		kmem_free(kernel_map, scratch_va, PAGE_SIZE);
++		return false;
++	}
++	uint64_t t = ptoa_64(pn);
++	uint8_t *vp = (uint8_t *)scratch_va;
++
++	uint64_t mem[2] = { RMTFS_PA, RMTFS_SIZE };
++	uint32_t src[1] = { VMID_HLOS };
++	struct {
++		uint32_t vm, perm;
++		uint64_t ctx;
++		uint32_t ctx_size, pad;
++	} dst[2] = {
++		{ VMID_HLOS, 6, 0, 0, 0 },
++		{ VMID_MSS_MSA, 6, 0, 0, 0 },
++	};
++	uint64_t ext[4] = { 4ull, t + 128ull, sizeof(dst), 0 };
++
++	memcpy(vp, mem, sizeof(mem));
++	memcpy(vp + 64, src, sizeof(src));
++	memcpy(vp + 128, dst, sizeof(dst));
++	memcpy(vp + 512, ext, sizeof(ext));
++	flush_dcache64((addr64_t)t, PAGE_SIZE, TRUE);
++
++	uint64_t x[8] = {
++		0x42000000ull | (0xcu << 8) | 0x16u,
++		7u | (1u << 4) | (1u << 8) | (1u << 12),
++		t, sizeof(mem), t + 64, t + 512, 0, 0,
++	};
++	sweet_smc(x);
++	kmem_free(kernel_map, scratch_va, PAGE_SIZE);
++	EFS_SAY("rmtfs: hyp_assign %#llx+%#x -> %lld\n", (unsigned long long)RMTFS_PA, (unsigned)RMTFS_SIZE, (long long)x[0]);
++	if (x[0] != 0) {
++		return false;
++	}
++	rmtfs_hyp_done = true;
++	return true;
++}
++
++static int
++rmtfs_iovec(uint32_t caller, uint8_t dir, const uint8_t *v, uint16_t len)
++{
++	if (caller < 1 || caller > RMTFS_NPARTS || rmtfs_va == 0 || rmtfs_io_buf == NULL) {
++		return -1;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = rmtfs_vps[caller - 1];
++	if (vp == NULLVP) {
++		if (vnode_open(rmtfs_parts[caller - 1].file_path, FREAD | FWRITE, 0, 0, &vp, ctx) != 0) {
++			return -1;
++		}
++		rmtfs_vps[caller - 1] = vp;
++	}
++	unsigned hdr = (len % 12 == 1) ? 1u : (len % 12 == 2) ? 2u : 4u;
++	if (len < hdr) {
++		return -1;
++	}
++	unsigned n = (len - hdr) / 12u;
++	for (unsigned i = 0; i < n; i++) {
++		uint32_t e[3];
++		memcpy(e, v + hdr + 12u * i, 12);
++		uint64_t off = (uint64_t)e[0] * RMTFS_SECTOR;
++		uint64_t bytes = (uint64_t)e[2] * RMTFS_SECTOR;
++		uint64_t pa = e[1] >= (uint32_t)RMTFS_PA ? (uint64_t)e[1] : RMTFS_PA + e[1];
++		if (pa < RMTFS_PA || bytes > RMTFS_SIZE || pa - RMTFS_PA > RMTFS_SIZE - bytes) {
++			EFS_SAY("rmtfs: iovec out of buffer (%x %x %x)\n", e[0], e[1], e[2]);
++			return -1;
++		}
++		uint64_t boff = pa - RMTFS_PA;
++		uint64_t done = 0;
++		while (done < bytes) {
++			uint32_t chunk = (uint32_t)MIN((uint64_t)RMTFS_IO_CHUNK, bytes - done);
++			int resid = 0;
++			if (dir == 0) {
++				int err = vn_rdwr(UIO_READ, vp, (caddr_t)rmtfs_io_buf, (int)chunk, (off_t)(off + done), UIO_SYSSPACE,
++				    IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++				if (err != 0) {
++					return -1;
++				}
++				if (resid > 0 && (uint32_t)resid <= chunk) {
++					memset(rmtfs_io_buf + (chunk - (uint32_t)resid), 0, (size_t)resid);
++				}
++				memcpy((void *)(rmtfs_va + boff + done), rmtfs_io_buf, chunk);
++			} else {
++				memcpy(rmtfs_io_buf, (const void *)(rmtfs_va + boff + done), chunk);
++				int err = vn_rdwr(UIO_WRITE, vp, (caddr_t)rmtfs_io_buf, (int)chunk, (off_t)(off + done), UIO_SYSSPACE,
++				    IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++				if (err != 0 || resid != 0) {
++					return -1;
++				}
++			}
++			done += chunk;
++		}
++		if (dir == 0) {
++			__asm__ volatile ("dsb sy" ::: "memory");
++			rmtfs_st.reads++;
++			rmtfs_st.tx_bytes += bytes;
++		} else {
++			rmtfs_st.writes++;
++			rmtfs_st.rx_bytes += bytes;
++		}
++	}
++	if (dir != 0) {
++		(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	return 0;
++}
++
++static void
++rmtfs_handle(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	struct efs_qmi_msg m;
++	if (qmi_parse(d, n, &m) || m.type != QMI_REQUEST) {
++		return;
++	}
++	uint32_t caller = 0;
++	qmi_start(&qmi_tx, QMI_RESPONSE, m.txn, m.id);
++	(void)qmi_get_u32(&m, 1, &caller);
++	switch (m.id) {
++	case RMTFS_OPEN: {
++		uint16_t l = 0;
++		const uint8_t *p = qmi_get(&m, 1, &l);
++		char path[64];
++		memset(path, 0, sizeof(path));
++		if (p != NULL && l > 0) {
++			uint16_t cp = l < sizeof(path) - 1 ? l : (uint16_t)(sizeof(path) - 1);
++			memcpy(path, p, cp);
++		}
++		unsigned i;
++		for (i = 0; i < RMTFS_NPARTS; i++) {
++			if (strcmp(path, rmtfs_parts[i].modem_path) == 0) {
++				break;
++			}
++		}
++		int err = -1;
++		if (i < RMTFS_NPARTS) {
++			vfs_context_t ctx = vfs_context_kernel();
++			if (rmtfs_vps[i] != NULLVP) {
++				vnode_close(rmtfs_vps[i], FREAD | FWRITE, ctx);
++				rmtfs_vps[i] = NULLVP;
++			}
++			vnode_t vp = NULLVP;
++			err = vnode_open(rmtfs_parts[i].file_path, FREAD | FWRITE, 0, 0, &vp, ctx);
++			if (err == 0) {
++				rmtfs_vps[i] = vp;
++				rmtfs_st.opens++;
++			} else {
++				rmtfs_st.errs++;
++			}
++		} else {
++			rmtfs_st.errs++;
++		}
++		EFS_SAY("rmtfs: open \"%s\" -> %d (err %d)\n", path, err == 0 ? (int)i + 1 : -1, err);
++		if (err == 0) {
++			qmi_tlv_result(&qmi_tx, 0, 0);
++			qmi_tlv_u32(&qmi_tx, 0x10, i + 1);
++		} else {
++			qmi_tlv_result(&qmi_tx, 1, 3);
++		}
++		break;
++	}
++	case RMTFS_CLOSE:
++		rmtfs_st.closes++;
++		if (caller >= 1 && caller <= RMTFS_NPARTS && rmtfs_vps[caller - 1] != NULLVP) {
++			vnode_close(rmtfs_vps[caller - 1], FREAD | FWRITE, vfs_context_kernel());
++			rmtfs_vps[caller - 1] = NULLVP;
++		}
++		qmi_tlv_result(&qmi_tx, 0, 0);
++		break;
++	case RMTFS_ALLOC_BUFF: {
++		uint32_t size = 0;
++		(void)qmi_get_u32(&m, 2, &size);
++		if (size <= RMTFS_SIZE && rmtfs_va != 0 && rmtfs_hyp_done) {
++			EFS_SAY("rmtfs: alloc %u bytes for %u -> granted %#llx\n", size, caller, (unsigned long long)RMTFS_PA);
++			qmi_tlv_result(&qmi_tx, 0, 0);
++			qmi_tlv_u64(&qmi_tx, 0x10, RMTFS_PA);
++		} else {
++			rmtfs_st.errs++;
++			EFS_SAY("rmtfs: alloc %u bytes REFUSED\n", size);
++			qmi_tlv_result(&qmi_tx, 1, 3);
++		}
++		break;
++	}
++	case RMTFS_RW_IOVEC: {
++		uint8_t dir = 0;
++		uint16_t l = 0;
++		(void)qmi_get_u8(&m, 2, &dir);
++		const uint8_t *v = qmi_get(&m, 3, &l);
++		int r = v != NULL ? rmtfs_iovec(caller, dir, v, l) : -1;
++		if (r != 0) {
++			rmtfs_st.errs++;
++		}
++		qmi_tlv_result(&qmi_tx, r ? 1 : 0, r ? 3 : 0);
++		break;
++	}
++	case RMTFS_GET_DEV_ERROR:
++		qmi_tlv_result(&qmi_tx, 0, 0);
++		qmi_tlv_u8(&qmi_tx, 0x10, 0);
++		break;
++	default:
++		rmtfs_st.errs++;
++		qmi_tlv_result(&qmi_tx, 1, 0x47);
++		break;
++	}
++	uint32_t plen = qmi_finish(&qmi_tx);
++	if (plen) {
++		(void)sbb_efs_reply(SBB_RMTFS_PORT, h->src_node, h->src_port, qmi_tx.b, plen);
++	}
++}
++
++/* ---- 3. tftp (QRTR 4096 on port 0x12 + transfer ports 0x100..0x107) ---- */
++#define TFTP_SVC                4096u
++#define TFTP_VERINST            1u
++#define TFTP_RO_PREFIX          "/readonly/firmware/image/"
++#define TFTP_RW_PREFIX          "/readwrite/"
++#define TFTP_FW_DIR             "/var/local/fw/modem"
++#define TFTP_RW_DIR             "/var/local/fw/rw"
++#define TFTP_BUF_CAP            8196u
++
++enum { OP_RRQ = 1, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK };
++
++struct tftp_xfer {
++	bool used, write, done;
++	vnode_t vp;
++	uint32_t node, port;
++	uint32_t blksize, wsize;
++	uint64_t seek, rsize, size, last_ms;
++	uint32_t last_sent;
++};
++static struct tftp_xfer tftp_xf[SBB_TFTP_XFERS];
++static uint8_t *tftp_pkt_buf;
++static struct {
++	uint64_t rrq, wrq, tx_blks, rx_blks, tx_bytes, rx_bytes, errs;
++} tftp_st;
++
++static inline void
++put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)(v & 0xffu);
++}
++
++static inline uint16_t
++get16(const uint8_t *p)
++{
++	return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
++}
++
++static void
++tftp_xfer_close(int idx)
++{
++	struct tftp_xfer *x = &tftp_xf[idx];
++	if (x->vp != NULLVP) {
++		vfs_context_t ctx = vfs_context_kernel();
++		if (x->write) {
++			(void)VNOP_FSYNC(x->vp, MNT_WAIT, ctx);
++		}
++		vnode_close(x->vp, x->write ? FWRITE : FREAD, ctx);
++		x->vp = NULLVP;
++	}
++	x->used = false;
++}
++
++static void
++tftp_reset_all(void)
++{
++	for (int i = 0; i < (int)SBB_TFTP_XFERS; i++) {
++		if (tftp_xf[i].used) {
++			tftp_xfer_close(i);
++		}
++	}
++}
++
++static void
++tftp_send_error(uint32_t sport, uint32_t node, uint32_t port, uint16_t code, const char *msg)
++{
++	uint8_t b[128];
++	put16(b, OP_ERROR);
++	put16(b + 2, code);
++	size_t l = strlen(msg) + 1;
++	if (4 + l > sizeof(b)) {
++		l = sizeof(b) - 4;
++	}
++	memcpy(b + 4, msg, l);
++	b[sizeof(b) - 1] = 0;
++	(void)sbb_efs_reply(sport, node, port, b, (uint32_t)(4 + l));
++}
++
++static uint32_t
++tftp_send_block(int idx, uint32_t blk)
++{
++	if (tftp_pkt_buf == NULL) {
++		return 0;
++	}
++	struct tftp_xfer *x = &tftp_xf[idx];
++	uint64_t off = (uint64_t)(blk - 1) * x->blksize;
++	uint64_t avail = x->size > x->seek ? x->size - x->seek : 0;
++	uint64_t end = x->rsize ? MIN(x->rsize, avail) : avail;
++	uint32_t want = off >= end ? 0 : (uint32_t)MIN((uint64_t)x->blksize, end - off);
++	put16(tftp_pkt_buf, OP_DATA);
++	put16(tftp_pkt_buf + 2, (uint16_t)blk);
++	int resid = 0;
++	uint32_t got = 0;
++	if (want > 0 && x->vp != NULLVP) {
++		vfs_context_t ctx = vfs_context_kernel();
++		int err = vn_rdwr(UIO_READ, x->vp, (caddr_t)(tftp_pkt_buf + 4), (int)want, (off_t)(x->seek + off),
++		    UIO_SYSSPACE, IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (err == 0 && resid >= 0 && (uint32_t)resid <= want) {
++			got = want - (uint32_t)resid;
++		}
++	}
++	(void)sbb_efs_reply(SBB_TFTP_XFER_PORT0 + (uint32_t)idx, x->node, x->port, tftp_pkt_buf, 4u + got);
++	x->last_sent = blk;
++	x->last_ms = sbb_ms();
++	tftp_st.tx_blks++;
++	tftp_st.tx_bytes += got;
++	if (got < x->blksize) {
++		x->done = true;
++	}
++	return got;
++}
++
++static void
++tftp_send_window(int idx, uint32_t acked)
++{
++	struct tftp_xfer *x = &tftp_xf[idx];
++	for (uint32_t k = 0; k < x->wsize && !x->done; k++) {
++		(void)tftp_send_block(idx, acked + 1u + k);
++	}
++}
++
++static vnode_t
++tftp_open_path(const char *path, bool write, off_t *sz_out)
++{
++	char mapped[256];
++	if (path[0] == 0 || strnstr(path, "..", 512) != NULL) {
++		return NULLVP;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	if (strncmp(path, TFTP_RO_PREFIX, strlen(TFTP_RO_PREFIX)) == 0) {
++		if (write) {
++			return NULLVP;
++		}
++		const char *rest = path + strlen(TFTP_RO_PREFIX);
++		const char *slash = strrchr(rest, '/');
++		const char *base = slash != NULL ? slash + 1 : rest;
++		snprintf(mapped, sizeof(mapped), TFTP_FW_DIR "/%s", base);
++		for (char *c = mapped + strlen(TFTP_FW_DIR) + 1; *c; c++) {
++			if (*c >= 'A' && *c <= 'Z') {
++				*c = (char)(*c - 'A' + 'a');
++			}
++		}
++		if (vnode_open(mapped, FREAD, 0, 0, &vp, ctx) != 0) {
++			return NULLVP;
++		}
++	} else if (strncmp(path, TFTP_RW_PREFIX, strlen(TFTP_RW_PREFIX)) == 0) {
++		const char *rest = path + strlen(TFTP_RW_PREFIX);
++		if (rest[0] == 0) {
++			return NULLVP;
++		}
++		snprintf(mapped, sizeof(mapped), TFTP_RW_DIR "/%s", rest);
++		for (char *c = mapped + strlen(TFTP_RW_DIR) + 1; *c; c++) {
++			if (*c == '/') {
++				*c = '_';
++			}
++		}
++		if (write) {
++			(void)sweet_vfs_mkdir(TFTP_RW_DIR, 0755);
++			if (vnode_open(mapped, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx) != 0) {
++				return NULLVP;
++			}
++			(void)vnode_setsize(vp, 0, 0, ctx);
++		} else {
++			if (vnode_open(mapped, FREAD, 0, 0, &vp, ctx) != 0) {
++				return NULLVP;
++			}
++		}
++	} else {
++		return NULLVP;
++	}
++	*sz_out = 0;
++	(void)vnode_size(vp, sz_out, ctx);
++	return vp;
++}
++
++static uint64_t
++parse_u64_dec(const char *s)
++{
++	uint64_t v = 0;
++	for (; *s >= '0' && *s <= '9'; s++) {
++		v = v * 10u + (uint64_t)(*s - '0');
++	}
++	return v;
++}
++
++static void
++tftp_request(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n, bool write)
++{
++	char buf[512];
++	if (n < 4) {
++		return;
++	}
++	uint32_t cp = n < sizeof(buf) - 1 ? n : (uint32_t)(sizeof(buf) - 1);
++	memcpy(buf, d, cp);
++	buf[cp] = 0;
++
++	const char *end = buf + cp;
++	const char *file = buf + 2;
++	size_t flen = strnlen(file, (size_t)(end - file));
++	if (file + flen >= end) {
++		return;
++	}
++	const char *mode = file + flen + 1;
++	size_t mlen = strnlen(mode, (size_t)(end - mode));
++	const char *o = (mode + mlen < end) ? (mode + mlen + 1) : end;
++
++	uint64_t now = sbb_ms();
++	int idx = -1;
++	for (int i = 0; i < (int)SBB_TFTP_XFERS; i++) {
++		if (!tftp_xf[i].used) {
++			idx = i;
++			break;
++		}
++	}
++	if (idx < 0) {
++		for (int i = 0; i < (int)SBB_TFTP_XFERS; i++) {
++			if (now - tftp_xf[i].last_ms > 30000) {
++				tftp_xfer_close(i);
++				idx = i;
++				break;
++			}
++		}
++	}
++	if (idx < 0) {
++		tftp_st.errs++;
++		tftp_send_error(SBB_TFTP_PORT, h->src_node, h->src_port, 0, "busy");
++		return;
++	}
++	if (write) {
++		tftp_st.wrq++;
++	} else {
++		tftp_st.rrq++;
++	}
++	off_t sz = 0;
++	vnode_t vp = tftp_open_path(file, write, &sz);
++	if (vp == NULLVP) {
++		tftp_st.errs++;
++		if (tftp_st.rrq + tftp_st.wrq <= 40) {
++			EFS_SAY("tftp: %s \"%s\" -> not found\n", write ? "write" : "read", file);
++		}
++		tftp_send_error(SBB_TFTP_PORT, h->src_node, h->src_port, 1, "file not found");
++		return;
++	}
++
++	struct tftp_xfer *x = &tftp_xf[idx];
++	memset(x, 0, sizeof(*x));
++	x->used = true;
++	x->write = write;
++	x->vp = vp;
++	x->node = h->src_node;
++	x->port = h->src_port;
++	x->blksize = 512;
++	x->wsize = 1;
++	x->size = sz > 0 ? (uint64_t)sz : 0;
++	x->last_ms = now;
++
++	uint32_t max_blk = tftp_max_blk;
++	if (max_blk < 128) {
++		max_blk = 128;
++	} else if (max_blk > 8192) {
++		max_blk = 8192;
++	}
++
++	uint8_t oack[512];
++	size_t on = 2;
++	put16(oack, OP_OACK);
++	int nopts = 0;
++	char blk_s[16], tsize_s[24];
++
++	while (o < end && *o != 0) {
++		size_t kl = strnlen(o, (size_t)(end - o));
++		if (o + kl >= end) {
++			break;
++		}
++		const char *k = o;
++		const char *v = o + kl + 1;
++		size_t vl = strnlen(v, (size_t)(end - v));
++		if (v + vl >= end) {
++			break;
++		}
++		uint64_t val = parse_u64_dec(v);
++		const char *echo = v;
++		if (strcmp(k, "blksize") == 0) {
++			x->blksize = (uint32_t)(val > max_blk ? max_blk : (val < 8 ? 8 : val));
++			snprintf(blk_s, sizeof(blk_s), "%u", x->blksize);
++			echo = blk_s;
++		} else if (strcmp(k, "wsize") == 0) {
++			x->wsize = val ? (uint32_t)(val > 64 ? 64 : val) : 1u;
++		} else if (strcmp(k, "rsize") == 0) {
++			x->rsize = val;
++		} else if (strcmp(k, "seek") == 0) {
++			x->seek = val;
++		} else if (strcmp(k, "tsize") == 0) {
++			snprintf(tsize_s, sizeof(tsize_s), "%llu", (unsigned long long)x->size);
++			echo = tsize_s;
++		}
++		size_t el = strlen(echo);
++		if (on + kl + 1 + el + 1 <= sizeof(oack)) {
++			memcpy(oack + on, k, kl + 1);
++			memcpy(oack + on + kl + 1, echo, el + 1);
++			on += kl + 1 + el + 1;
++			nopts++;
++		}
++		o = v + vl + 1;
++	}
++	if (x->rsize != 0 && x->seek + x->rsize > x->size) {
++		x->rsize = x->size > x->seek ? x->size - x->seek : 0;
++	}
++	if (tftp_st.rrq + tftp_st.wrq <= 40) {
++		EFS_SAY("tftp: %s \"%s\" slot %d blk %u wsize %u size %llu\n", write ? "write" : "read", file, idx, x->blksize,
++		    x->wsize, (unsigned long long)x->size);
++	}
++	if (nopts > 0) {
++		(void)sbb_efs_reply(SBB_TFTP_XFER_PORT0 + (uint32_t)idx, x->node, x->port, oack, (uint32_t)on);
++	} else if (write) {
++		uint8_t a[4];
++		put16(a, OP_ACK);
++		put16(a + 2, 0);
++		(void)sbb_efs_reply(SBB_TFTP_XFER_PORT0 + (uint32_t)idx, x->node, x->port, a, 4);
++	} else {
++		tftp_send_window(idx, 0);
++	}
++}
++
++static void
++tftp_handle(const struct sbb_qrtr_hdr *h, const uint8_t *d, uint32_t n)
++{
++	if (n < 4) {
++		return;
++	}
++	uint16_t op = get16(d);
++	if (h->dst_port == SBB_TFTP_PORT) {
++		if (op == OP_RRQ || op == OP_WRQ) {
++			tftp_request(h, d, n, op == OP_WRQ);
++		}
++		return;
++	}
++	if (h->dst_port < SBB_TFTP_XFER_PORT0 || h->dst_port >= SBB_TFTP_XFER_PORT0 + SBB_TFTP_XFERS) {
++		return;
++	}
++	int idx = (int)(h->dst_port - SBB_TFTP_XFER_PORT0);
++	struct tftp_xfer *x = &tftp_xf[idx];
++	if (!x->used) {
++		return;
++	}
++	x->last_ms = sbb_ms();
++	uint16_t blk = get16(d + 2);
++	if (op == OP_ACK && !x->write) {
++		if (x->done && blk == (uint16_t)x->last_sent) {
++			tftp_xfer_close(idx);
++		} else {
++			uint32_t acked = x->last_sent - (uint16_t)(x->last_sent - blk);
++			x->done = false;
++			tftp_send_window(idx, acked);
++		}
++	} else if (op == OP_DATA && x->write) {
++		uint32_t len = n - 4u;
++		if (len > 0 && x->vp != NULLVP) {
++			vfs_context_t ctx = vfs_context_kernel();
++			int resid = 0;
++			uint64_t off = (uint64_t)(blk - 1) * x->blksize;
++			if (vn_rdwr(UIO_WRITE, x->vp, __DECONST(caddr_t, d + 4), (int)len, (off_t)off, UIO_SYSSPACE, IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) != 0 || resid != 0) {
++				tftp_st.errs++;
++			}
++		}
++		tftp_st.rx_blks++;
++		tftp_st.rx_bytes += len;
++		uint8_t a[4];
++		put16(a, OP_ACK);
++		put16(a + 2, blk);
++		(void)sbb_efs_reply(SBB_TFTP_XFER_PORT0 + (uint32_t)idx, x->node, x->port, a, 4);
++		if (len < x->blksize) {
++			tftp_xfer_close(idx);
++		}
++	} else if (op == OP_ERROR) {
++		tftp_xfer_close(idx);
++	}
++}
++
++/* ---- worker thread ---- */
++static void
++efs_register_servers(bool with_rmtfs)
++{
++	if (with_rmtfs) {
++		sbb_srv_register_local(RMTFS_SVC, RMTFS_VERINST, SBB_RMTFS_PORT);
++	}
++	sbb_srv_register_local(PDMAP_SVC, PDMAP_VERINST, SBB_PDMAP_PORT);
++	sbb_srv_register_local(TFTP_SVC, TFTP_VERINST, SBB_TFTP_PORT);
++}
++
++static void
++efs_thread(__unused void *param, __unused wait_result_t wr)
++{
++	rmtfs_io_buf = kalloc_data(RMTFS_IO_CHUNK, Z_WAITOK);
++	tftp_pkt_buf = kalloc_data(TFTP_BUF_CAP, Z_WAITOK);
++	if (rmtfs_io_buf == NULL || tftp_pkt_buf == NULL) {
++		EFS_SAY("failed to allocate IO scratch buffers\n");
++	}
++	/* Register local pd-mapper/tftp at startup for local /dev/qrtr clients; re-sent on modem up */
++	efs_register_servers(false);
++	uint32_t seen_ups = 0;
++
++	for (;;) {
++		uint32_t ups = sbb_link_ups();
++		if (ups != seen_ups && sbb_link_state() == 2) {
++			seen_ups = ups;
++			tftp_reset_all();
++			rmtfs_close_all();
++			bool r_ok = rmtfs_prepare();
++			efs_register_servers(r_ok);
++			EFS_SAY("link up #%u: serving pd-mapper (0x11), tftp (0x12)%s\n", ups,
++			    r_ok ? ", rmtfs (0x10)" : " (rmtfs FAILED)");
++		}
++
++		struct efs_pkt *p;
++		unsigned k = 0;
++		while (k++ < 256 && (p = efs_pop()) != NULL) {
++			if (p->h.type == SBB_QRTR_DATA) {
++				if (p->h.confirm_rx) {
++					sbb_efs_resume_tx(p->h.dst_port, p->h.src_node, p->h.src_port);
++				}
++				if (p->h.dst_port == SBB_RMTFS_PORT) {
++					rmtfs_handle(&p->h, p->d, p->n);
++				} else if (p->h.dst_port == SBB_PDMAP_PORT) {
++					pdmap_handle(&p->h, p->d, p->n);
++				} else {
++					tftp_handle(&p->h, p->d, p->n);
++				}
++			}
++			kfree_data(p, sizeof(*p) + p->n);
++		}
++
++		lck_mtx_lock(&efs_lock);
++		if (!efs_wake_flag && efs_first == NULL) {
++			struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
++			(void)msleep(&efs_wake_flag, &efs_lock, PZERO, "sweetefs", &ts);
++		}
++		efs_wake_flag = false;
++		lck_mtx_unlock(&efs_lock);
++	}
++}
++
++void
++sweet_efs_init(void)
++{
++	if (pdmap_adsp < 0) {
++		int adsp_arg = 0;
++		PE_parse_boot_argn("adsp", &adsp_arg, sizeof(adsp_arg));
++		pdmap_adsp = adsp_arg > 0 ? 1 : 0;
++	}
++	efs_ready = true;
++	thread_t th;
++	if (kernel_thread_start(efs_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		EFS_SAY("thread up (pdmapadsp=%d, tftp_blksize=%u)\n", pdmap_adsp, tftp_max_blk);
++	} else {
++		efs_ready = false;
++		EFS_SAY("failed to start worker thread\n");
++	}
++}
++
++static int
++sysctl_efs_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 1024;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	unsigned active_xf = 0;
++	for (unsigned i = 0; i < SBB_TFTP_XFERS; i++) {
++		if (tftp_xf[i].used) {
++			active_xf++;
++		}
++	}
++	snprintf(s, cap,
++	    "efs=%s | q %u in %llu drop %llu | pdmap q %llu pfr %llu err %llu adsp %d | "
++	    "rmtfs hyp %d opens %llu closes %llu r %llu (%llu B) w %llu (%llu B) err %llu | "
++	    "tftp rrq %llu wrq %llu tx %llu blks (%llu B) rx %llu blks (%llu B) active %u err %llu",
++	    (sweet_bb & SBB_SVC) ? "on" : "off", efs_q_count, efs_q_in, efs_q_dropped,
++	    pdm_st.queries, pdm_st.pfrs, pdm_st.errs, pdmap_adsp,
++	    rmtfs_hyp_done ? 1 : 0, rmtfs_st.opens, rmtfs_st.closes, rmtfs_st.reads, rmtfs_st.tx_bytes,
++	    rmtfs_st.writes, rmtfs_st.rx_bytes, rmtfs_st.errs,
++	    tftp_st.rrq, tftp_st.wrq, tftp_st.tx_blks, tftp_st.tx_bytes, tftp_st.rx_blks, tftp_st.rx_bytes,
++	    active_xf, tftp_st.errs);
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_efs_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_efs_stats, "A", "redfin Phase 3: kernel pd-mapper, rmtfs and tftp service counters");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

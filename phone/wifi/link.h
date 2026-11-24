@@ -33,6 +33,7 @@ int qrtr_resume_tx(const struct qrtr_hdr *h);
 int qrtr_kick(uint32_t our_port, uint32_t rnode, uint32_t rport);	/* unsolicited RESUME_TX (lost-resume recovery) */
 void link_queue_stats(unsigned *max, unsigned *dropped);
 int link_kernel_data(void);	/* 1: kern.sweet_bb & 0x10: the kernel drives the IPA data path (xnu 1076); logs once */
+int link_kernel_svc(void);	/* 1: kern.sweet_bb & 0x04: kernel owns pd-mapper/rmtfs/tftp (xnu 1296); logs once */
 int link_is_kernel(void);	/* 1: the kernel owns the link (sweetbb & 1, /dev/sweet-mqrtr) */
 
 #endif

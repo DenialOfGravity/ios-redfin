@@ -996,10 +996,12 @@ static int net(unsigned secs)
 	signal(SIGCHLD, SIG_IGN);	/* netsvc children (ipnet.c) reap themselves */
 	if (link_up(net_cb, 5000))
 		return -1;
-	if (rmtfs_init())
-		printf("net: no rmtfs\n");
-	if (pdmapper_init() || tftp_init())
-		printf("net: no pd-mapper/tftp\n");
+	if (!link_kernel_svc()) {
+		if (rmtfs_init())
+			printf("net: no rmtfs\n");
+		if (pdmapper_init() || tftp_init())
+			printf("net: no pd-mapper/tftp\n");
+	}
 	ipaqmi_init();	/* announces 0x31/1 only with ipaqmi=1/2 in cell.on; default: nothing */
 	read_conf();
 	role_setting();
