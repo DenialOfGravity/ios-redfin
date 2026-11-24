@@ -2,7 +2,7 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
 index 94abba7..20114fd 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -288,6 +288,58 @@ rh_lookup(const char *res, uint32_t *address)
+@@ -288,6 +288,66 @@ rh_lookup(const char *res, uint32_t *address)
  	return 0;
  }
  
@@ -43,8 +43,16 @@ index 94abba7..20114fd 100644
 +#pragma unused(oidp, arg1, arg2)
 +	char buf[192];
 +	snprintf(buf, sizeof(buf), "tcs=%u test=%u votes=%u fast-seen=%u ambiguous=%u retrig=%u accepted=%u timeouts=%u "
-+	    "gapmax_us=%u", rh_tcsmode, rh_tcstest, rh_tcs_votes, rh_tcs_fastseen, rh_tcs_ambig, rh_tcs_retrig,
-+	    rh_tcs_accept, rh_tcs_tmo, rh_tcs_gapmax);
++	    "gapmax_us=%u",
++	    __atomic_load_n(&rh_tcsmode, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcstest, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_votes, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_fastseen, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_ambig, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_retrig, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_accept, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_tmo, __ATOMIC_RELAXED),
++	    __atomic_load_n(&rh_tcs_gapmax, __ATOMIC_RELAXED));
 +	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
 +}
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_tcs_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
@@ -61,7 +69,7 @@ index 94abba7..20114fd 100644
  static bool
  rh_free(unsigned t)
  {
-@@ -366,31 +418,116 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+@@ -366,43 +426,130 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
  	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
  		return EIO;
  	}
@@ -81,7 +89,7 @@ index 94abba7..20114fd 100644
 -		progress |= idle == 0 || !complete;
 -		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
 -		    ((irq & bit) || progress) && complete) {
-+	bool done = false, progress = false, ambiguous = false;
++	bool done = false, progress = false, ambiguous = false, retrig_sync_err = false;
 +	unsigned mode = rh_tcsmode, retrig = 0, gap_us = 0;     /* 1277 */
 +	if (!rh_fast_abs) {
 +		nanoseconds_to_absolutetime(RH_FAST_US * 1000ull, &rh_fast_abs);
@@ -169,11 +177,13 @@ index 94abba7..20114fd 100644
 +			    "the trigger): re-trigger %u of %u\n", t, address, gap_us, retrig, RH_RETRIG_N);
 +			if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
 +			    !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
-+				return EIO;
++				retrig_sync_err = true;
++				printf("SWEET RPMH: 1277: TCS%u at %#x re-trigger control sync failed\n", t, address);
++			} else {
++				goto trigger;
 +			}
-+			goto trigger;
 +		}
-+		if (mode & 4u) {
++		if (!retrig_sync_err && (mode & 4u)) {
 +			rh_tcs_accept++;
 +			printf("SWEET RPMH: 1277: TCS%u at %#x still idle + complete without a transition after %u re-triggers: "
 +			    "accepted as completed\n", t, address, retrig);
@@ -195,3 +205,16 @@ index 94abba7..20114fd 100644
  		if (rh_q_tcs < 0 && n <= 4 && !prev_hard) {   /* 1135: a clean timeout, the first one */
  			rh_q_tcs = (int)t;
  			rh_q_n = n;
+ 			rh_q_addr = address;
+ 			rh_q_irqbit = irq_en & bit;
+ 			for (unsigned c = 0; c < n; ++c) {
+ 				rh_q_off[c] = offsets[c];
+ 				rh_q_val[c] = values[c];
+ 			}
+ 			rh_q_hard = false;
+ 			printf("SWEET RPMH: 1135: TCS%u in flight at %#x; kern.sweet_rpmh_recover=%u (1 reclaim on late "
+ 			    "completion, 2 use the other ACTIVE TCS)\n", t, address, rh_recover);
+ 		}
+-		return ETIMEDOUT;
++		return retrig_sync_err ? EIO : ETIMEDOUT;
+ 	}

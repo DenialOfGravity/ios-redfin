@@ -21,7 +21,7 @@ index 6955d41..74c1619 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
-@@ -51,6 +52,55 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+@@ -51,6 +52,99 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
  #define RH_TIMEOUT_US   100000u
  
  static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
@@ -38,10 +38,25 @@ index 6955d41..74c1619 100644
 +	uint32_t addr, val;
 +} rh_last[RH_LAST_N];
 +static unsigned rh_last_n;
++static unsigned rh_votes_seq;
++
++static inline void
++rh_seq_begin(unsigned *seq)
++{
++	__atomic_store_n(seq, *seq + 1u, __ATOMIC_RELAXED);
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++}
++
++static inline void
++rh_seq_end(unsigned *seq)
++{
++	__atomic_store_n(seq, *seq + 1u, __ATOMIC_RELEASE);
++}
 +
 +static void
 +rh_last_note(uint32_t addr, uint32_t val)      /* under rh_lock */
 +{
++	rh_seq_begin(&rh_votes_seq);
 +	unsigned i;
 +	for (i = 0; i < rh_last_n && rh_last[i].addr != addr; i++) {
 +	}
@@ -57,18 +72,47 @@ index 6955d41..74c1619 100644
 +	}
 +	rh_last[i].addr = addr;
 +	rh_last[i].val = val;
++	rh_seq_end(&rh_votes_seq);
 +}
 +
 +static int
 +sysctl_sweet_rpmh_votes SYSCTL_HANDLER_ARGS
 +{
 +#pragma unused(oidp, arg1, arg2)
++	struct {
++		uint32_t addr, val;
++	} snap[RH_LAST_N];
++	unsigned n = 0;
++	bool ok = false;
++	for (unsigned tries = 0; tries < 64; tries++) {
++		unsigned s = __atomic_load_n(&rh_votes_seq, __ATOMIC_ACQUIRE);
++		if (s & 1u) {
++			delay(1);
++			continue;
++		}
++		n = rh_last_n;
++		if (n > RH_LAST_N) {
++			n = RH_LAST_N;
++		}
++		memcpy(snap, rh_last, n * sizeof(snap[0]));
++		__atomic_thread_fence(__ATOMIC_ACQUIRE);
++		if (__atomic_load_n(&rh_votes_seq, __ATOMIC_RELAXED) == s) {
++			ok = true;
++			break;
++		}
++	}
++	if (!ok) {
++		return EBUSY;
++	}
 +	char buf[RH_LAST_N * 24 + 1];
 +	size_t o = 0;
 +	buf[0] = 0;
-+	unsigned n = __atomic_load_n(&rh_last_n, __ATOMIC_ACQUIRE);
 +	for (unsigned i = 0; i < n && o < sizeof(buf); i++) {
-+		o += (size_t)snprintf(buf + o, sizeof(buf) - o, "%s%x=%x", i ? " " : "", rh_last[i].addr, rh_last[i].val);
++		int w = snprintf(buf + o, sizeof(buf) - o, "%s%x=%x", i ? " " : "", snap[i].addr, snap[i].val);
++		if (w < 0) {
++			break;
++		}
++		o = (size_t)w < sizeof(buf) - o ? o + (size_t)w : sizeof(buf);
 +	}
 +	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
 +}
@@ -77,7 +121,7 @@ index 6955d41..74c1619 100644
  static uint32_t rh_db_size;
  static unsigned rh_ncpt;
  static unsigned rh_lock;
-@@ -330,6 +380,9 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
+@@ -330,6 +424,9 @@ rh_send_cmds(uint32_t address, unsigned n, const uint32_t *offsets, const uint32
  		return EIO;
  	}
  	rh_poisoned = false;
