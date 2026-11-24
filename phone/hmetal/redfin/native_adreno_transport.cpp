@@ -703,8 +703,16 @@ private:
             if ((bos[i].flags & kSubmitBoWrite) && named[i]->imported) named[i]->writeFence = fence;
         }
         s.fence = fence;
-        if (fence > highestFence_) highestFence_ = fence;
+        if (fence != 0 && fenceAfter(fence, highestFence_)) highestFence_ = fence;
         return 0;
+    }
+
+    // 32-bit wrap-safe fence ordering (0 means none / uninitialized).
+    static bool fenceAfter(uint32_t a, uint32_t b) {
+        return b == 0 || int32_t(a - b) > 0;
+    }
+    static bool fencePassed(uint32_t wf, uint32_t passed) {
+        return wf != 0 && passed != 0 && int32_t(passed - wf) >= 0;
     }
 
     // until FENCE (a deadline of nowNs's clock), then the imported BOs whose GPU writes that fence covers invalidated
@@ -721,7 +729,7 @@ private:
         }
         g.lock();
         if (e != 0) return e;
-        if (fence > passedFence_) passedFence_ = fence;
+        if (fence != 0 && fenceAfter(fence, passedFence_)) passedFence_ = fence;
         // the ranges are taken under the lock and flushed without it: a submission on the caller's thread does not
         // wait for megabytes of dc civac here. The BO is held meanwhile (flushing_: closeBo waits for it).
         std::vector<std::pair<void*, uint64_t>> ranges;
@@ -729,7 +737,7 @@ private:
         uint32_t dw = 0, dh = 0;
         if (lazy) displaySurfaceSize("HM_FLUSH_AFTER_SURF", &dw, &dh);
         for (auto& [h, b] : bos_) {
-            if (b.imported && b.writeFence != 0 && b.writeFence <= passedFence_) {
+            if (b.imported && fencePassed(b.writeFence, passedFence_)) {
                 if (lazy && b.surface != nullptr && IOSurfaceGetWidth(b.surface) == dw && IOSurfaceGetHeight(b.surface) == dh) {
                     // (ws-hm-int6) HM_FLUSH_AFTER=lazy: a display surface's invalidate waits for a CPU access
                     b.writeFence = 0;

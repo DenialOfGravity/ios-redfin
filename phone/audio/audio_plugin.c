@@ -1813,10 +1813,11 @@ static int haptic_mode;
 
 /* The speaker's recent writes, by host time: written on its I/O thread, read on the actuator's. */
 static struct {
-	volatile UInt64 start, end;
-	volatile int peak;
+	UInt64 start, end;
+	UInt32 seq;
+	int peak;
 } spk[SPK_BLOCKS];
-static volatile unsigned spk_next;
+static unsigned spk_next;
 
 static UInt64
 frames_to_ticks(UInt64 frames)
@@ -1841,10 +1842,13 @@ speaker_note(const int16_t *samples, UInt32 frames, UInt64 when)
 
 		peak = v > peak ? v : peak;
 	}
-	spk[i].end = 0;                 /* invalid while it changes */
-	spk[i].start = when;
-	spk[i].peak = peak;
-	spk[i].end = when + frames_to_ticks(frames);
+	UInt32 s = __atomic_load_n(&spk[i].seq, __ATOMIC_RELAXED);
+	__atomic_store_n(&spk[i].seq, s + 1u, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	__atomic_store_n(&spk[i].start, when, __ATOMIC_RELAXED);
+	__atomic_store_n(&spk[i].peak, peak, __ATOMIC_RELAXED);
+	__atomic_store_n(&spk[i].end, when + frames_to_ticks(frames), __ATOMIC_RELAXED);
+	__atomic_store_n(&spk[i].seq, s + 2u, __ATOMIC_RELEASE);
 	spk_next++;
 }
 
@@ -1853,10 +1857,26 @@ static Boolean
 speaker_audible(UInt64 from, UInt64 to)
 {
 	for (unsigned i = 0; i < SPK_BLOCKS; i++) {
-		UInt64 end = spk[i].end, start = spk[i].start;
+		for (unsigned tries = 0; tries < 4; tries++) {
+			UInt32 s1 = __atomic_load_n(&spk[i].seq, __ATOMIC_ACQUIRE);
 
-		if (end != 0 && spk[i].peak > SPK_AUDIBLE && start <= to && end >= from) {
-			return true;
+			if (s1 & 1u) {
+				continue;
+			}
+			UInt64 start = __atomic_load_n(&spk[i].start, __ATOMIC_RELAXED);
+			UInt64 end = __atomic_load_n(&spk[i].end, __ATOMIC_RELAXED);
+			int peak = __atomic_load_n(&spk[i].peak, __ATOMIC_RELAXED);
+
+			__atomic_thread_fence(__ATOMIC_ACQUIRE);
+			UInt32 s2 = __atomic_load_n(&spk[i].seq, __ATOMIC_RELAXED);
+
+			if (s1 != s2) {
+				continue;
+			}
+			if (end != 0 && peak > SPK_AUDIBLE && start <= to && end >= from) {
+				return true;
+			}
+			break;
 		}
 	}
 	return false;
