@@ -543,9 +543,30 @@ static int capture_once(uint32_t gen, int32_t *st4, long deadline)
 		backoff_s = backoff_s ? (backoff_s * 2 > 60 ? 60 : backoff_s * 2) : 5;
 		lg("IRQ storm: detection cancelled (cmd 5), backing off %d s", backoff_s);
 		ev_send(FPCD_EV_ERROR, FPCD_E_IO, 0, 0, 0, 0, 0, 0);
-		for (int i = 0; i < backoff_s * 4 && !g_stop; i++)
-			usleep(250000);
-		return CAP_ERR;
+		struct timespec end_ts;
+		clock_gettime(CLOCK_REALTIME, &end_ts);
+		end_ts.tv_sec += backoff_s;
+		pthread_mutex_lock(&st_mx);
+		while (!g_stop && !S.cancel && S.gen == gen) {
+			struct timespec now_ts, sl;
+			clock_gettime(CLOCK_REALTIME, &now_ts);
+			if (now_ts.tv_sec > end_ts.tv_sec ||
+			    (now_ts.tv_sec == end_ts.tv_sec && now_ts.tv_nsec >= end_ts.tv_nsec))
+				break;
+			sl = now_ts;
+			sl.tv_nsec += 250000000L;
+			if (sl.tv_nsec >= 1000000000L) {
+				sl.tv_sec++;
+				sl.tv_nsec -= 1000000000L;
+			}
+			if (sl.tv_sec > end_ts.tv_sec ||
+			    (sl.tv_sec == end_ts.tv_sec && sl.tv_nsec > end_ts.tv_nsec))
+				sl = end_ts;
+			pthread_cond_timedwait(&st_cv, &st_mx, &sl);
+		}
+		int was_cancelled = g_stop || S.cancel || S.gen != gen;
+		pthread_mutex_unlock(&st_mx);
+		return was_cancelled ? CAP_CANCEL : CAP_ERR;
 	}
 	default:
 		lg("capture: TZ/TA error (status %d) in round %d", *st4, rounds);
@@ -1035,6 +1056,12 @@ static void prematch_attempt(uint32_t gen)
 			lg("pre-match: FPC_ERROR_IO: identifying the same image again");
 			continue;
 		}
+		/* Set pm_have before FPCD_EV_PREMATCH so an immediate MatchMode(PREMATCHED) on the bridge thread sees it,
+		 * and never re-set it after bio_update_template (which runs after MatchMode may have cleared it). */
+		pthread_mutex_lock(&st_mx);
+		S.pm_have = 1;
+		S.pm_up = up;
+		pthread_mutex_unlock(&st_mx);
 		if (st == 0 && fid != 0) {
 			match_deliver_as(FPCD_EV_PREMATCH, st, fid, score, 1, hat);
 		} else if (st == 0 && cov >= pm_min_cov) {
@@ -1054,10 +1081,6 @@ static void prematch_attempt(uint32_t gen)
 			bio_update_template("pre-match");
 		break;
 	}
-	pthread_mutex_lock(&st_mx);
-	S.pm_have = 1;
-	S.pm_up = up;
-	pthread_mutex_unlock(&st_mx);
 }
 
 static void run_detect(uint32_t gen)
