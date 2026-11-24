@@ -1,0 +1,84 @@
+--- a/bsd/kern/sweet_amfi.c	2026-11-24 08:37:33.511030243 +0100
++++ b/bsd/kern/sweet_amfi.c	2026-11-24 08:37:33.522152796 +0100
+@@ -285,11 +285,72 @@
+  * logged.
+  */
+ static uint64_t sweet_sandbox_seen;
++static TUNABLE(uint32_t, sweet_sandbox_check_null, "sweetsandboxcheck", 1);
+ 
+ /* op 4: bsd/kern/redfin_sandbox_container.c (CFFIXED_USER_HOME of the process; ENOENT if none or sweetcontainer=0) */
+ int sweet_sandbox_container_path(user_addr_t arg);
+ 
+ /*
++ * op 2 (_sandbox_check_common in libsystem_sandbox.dylib):
++ *   { u64 out_ptr, s64 pid, u64 operation, u64 filter_type, u64 filter_arg, u64 flags }
++ * Non-NULL operation checks remain allowed (*out_ptr = 0). When operation == NULL
++ * (sandbox_check(pid, NULL, SANDBOX_FILTER_NONE) -- "is target process sandboxed?"),
++ * processes holding the "seatbelt-profiles" entitlement (e.g. MessagesBlastDoorService,
++ * which otherwise asserts "BlastDoor cannot run unsandboxed." and aborts every
++ * incoming SMS/iMessage unpack) get *out_ptr = 1.
++ */
++static int
++sweet_sandbox_check_null_op(struct proc *p, user_addr_t arg)
++{
++	uint64_t a[6];
++
++	if (!sweet_sandbox_check_null || arg == 0) {
++		return 0;
++	}
++	if (copyin(arg, a, sizeof(a)) != 0) {
++		return 0;
++	}
++	if (a[2] != 0 || a[0] == 0) {
++		return 0;
++	}
++	if ((a[5] & 0x80000000ULL) != 0 || a[1] == 0 || a[1] > 0x7fffffffULL) {
++		return 0;
++	}
++	int pid = (int)a[1];
++	bool self = (pid == proc_pid(p));
++	proc_t target = self ? p : proc_find(pid);
++	if (target == NULL) {
++		return 0;
++	}
++	int sandboxed = 0;
++	void *ent = sweet_proc_entitlements(target);
++	if (ent != NULL) {
++		void *obj = sweet_entitlements_copy_object(ent, "seatbelt-profiles");
++		if (obj != NULL) {
++			osobject_release(obj);
++			sandboxed = 1;
++		}
++	}
++	if (!self) {
++		proc_rele(target);
++	}
++	if (sandboxed) {
++		uint64_t res = 1;
++		if (copyout(&res, (user_addr_t)a[0], sizeof(res)) == 0) {
++			static uint32_t logged;
++			if (logged < 32) {
++				logged++;
++				char cname[32];
++				proc_name(proc_pid(p), cname, sizeof(cname));
++				printf("SWEET Sandbox: %s op 2 (NULL) pid %d -> sandboxed=1\n",
++				    cname, pid);
++			}
++		}
++	}
++	return 0;
++}
++
++/*
+  * Extension tokens. tccd hands the processes it allows a sandbox extension
+  * for the service (sandbox_extension_issue_generic("com.apple.tcc.kTCCServiceCamera")
+  * and the like), and takes a failure to issue one for a refusal: Camera.app
+@@ -340,6 +401,8 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
++	case 2:         /* sandbox_check */
++		return sweet_sandbox_check_null_op(p, arg);
+ 	case 5:         /* extension issue */
+ 		return sweet_sandbox_issue(arg);
+ 	case 6:         /* extension consume */
