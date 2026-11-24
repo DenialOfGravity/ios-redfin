@@ -1110,12 +1110,13 @@ static int tx_send(const uint8_t *ip, size_t len)
 		v5 = cell_word_int("qmapv5=", 0) == 1;
 		LOG("tx: QMAP %s", v5 ? "v5 + checksum header (qmapv5=1)" : "v1");
 	}
-	size_t n = v5 ? qmap5_frame(tx_frame, TX_CAP, ip, len, dp_mux()) : qmap_frame(tx_frame, sizeof(tx_frame), ip, len, dp_mux());
+	size_t n = v5 ? qmap5_frame(tx_frame, TX_CAP, ip, len, dp_mux()) : qmap_frame(tx_frame, TX_CAP, ip, len, dp_mux());
+	size_t wr_len = lo_on ? (n + 3) & ~(size_t) 3 : n;
 	uint32_t idx = tx_wp % TX_BUFS;
 
 	ipaprobe_pkt("tx", dp_mux(), ip, len);	/* p2pkt=2 */
 
-	if (!n) {
+	if (!n || wr_len > TX_CAP) {
 		ctx.tx_st.bad++;
 		return -1;
 	}
@@ -1133,7 +1134,7 @@ static int tx_send(const uint8_t *ip, size_t len)
 		}
 		tx_buf_pa[idx] = tx_block + (uint64_t) idx * TX_CAP;
 	}
-	if (pm_wr(tx_buf_pa[idx], tx_frame, lo_on ? (n + 3) & ~(size_t) 3 : n)) {
+	if (pm_wr(tx_buf_pa[idx], tx_frame, wr_len)) {
 		LOG("tx buffer write failed: %s", strerror(errno));
 		return -1;
 	}

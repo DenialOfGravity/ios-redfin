@@ -558,6 +558,7 @@ static int bring_up(void)
 	}
 	if (stat(STATE, &sb)) {
 		note("venusd: no %s after init: refusing to go on", STATE);
+		down("missing state");
 		return -1;
 	}
 	up = 1;
