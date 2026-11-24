@@ -56,7 +56,7 @@ new file mode 100644
 index 0000000..e4157ff
 --- /dev/null
 +++ b/bsd/dev/sweet_vmmu.c
-@@ -0,0 +1,695 @@
+@@ -0,0 +0,743 @@
 +/*
 + * 1270 redfin (venus-iommu): /dev/vmmu, real page tables for the Venus SMMU bank (zero-copy video buffers).
 + *
@@ -162,6 +162,7 @@ index 0000000..e4157ff
 +#define VM_GAP          0x10000ULL      /* unmapped gap after each allocated mapping: an overrun faults */
 +#define VM_MAPS         1024
 +#define VM_CLIENTS      16
++#define VM_MINORS       256
 +#define VM_NL3          (VM_IOVA_HI >> 21)      /* 1024 L3 tables of 2 MB */
 +#define VM_PTE_PAGE     (3ULL | 1ULL << 6 | 2ULL << 8 | 1ULL << 10 | 1ULL << 11 | 3ULL << 53)  /* attr 0, AP 01, SH 2, AF, nG, XN */
 +#define VM_PTE_RO       (1ULL << 7)
@@ -175,7 +176,9 @@ index 0000000..e4157ff
 +};
 +static struct vmu_ent vmu_ents[VM_MAPS];
 +static unsigned vmu_nents;
-+static uint8_t vmu_client_open[VM_CLIENTS];
++static uint8_t vmu_minor_open[VM_MINORS];
++static unsigned vmu_open_count;
++static int vmu_clone_next;
 +static int vmu_enabled;                  /* kern.sweet_vmmu */
 +static int vmu_cb = -1;
 +static uint64_t vmu_asid, vmu_l1;         /* the bank's ASID, L1 table PA (userland's) */
@@ -338,15 +341,23 @@ index 0000000..e4157ff
 +			}
 +		}
 +	}
++	int prev_cb = vmu_cb;
++	uint64_t prev_asid = vmu_asid, prev_l1 = vmu_l1;
 +	vmu_cb = (int)a->cb;
 +	vmu_asid = ttbr >> 48;
 +	vmu_l1 = l1;
 +	a->l1 = l1;
 +	int e = vmu_l1_fix();
++	if (e) {
++		vmu_cb = prev_cb;
++		vmu_asid = prev_asid;
++		vmu_l1 = prev_l1;
++		return e;
++	}
 +	vmu_tlb_flush();
 +	printf("SWEET VMMU: attached to CB%d (ASID %llu, L1 0x%llx, SCTLR 0x%x, TCR 0x%x): IOVA 0x%llx-0x%llx page tables, %u maps\n",
 +	    vmu_cb, vmu_asid, vmu_l1, sctlr, tcr, VM_IOVA_LO, VM_IOVA_HI, vmu_nents);
-+	return e;
++	return 0;
 +}
 +
 +static uint64_t *
@@ -379,6 +390,9 @@ index 0000000..e4157ff
 +static uint64_t
 +vmu_alloc_iova(uint64_t len)
 +{
++	if (!len || len > VM_IOVA_HI - VM_POOL_LO) {
++		return 0;
++	}
 +	uint64_t a = VM_POOL_LO;
 +	for (;;) {
 +		bool moved = false;
@@ -465,6 +479,9 @@ index 0000000..e4157ff
 +			return EINVAL;
 +		}
 +		len = (m->len + 0xfffULL) & ~0xfffULL;
++		if (m->addr > UINT64_MAX - len) {
++			return EINVAL;
++		}
 +		for (uint64_t o = 0; o < len; o += 0x1000) {
 +			if (pmap_valid_address(m->addr + o)) {
 +				printf("SWEET VMMU: physical map of 0x%llx refused: XNU RAM\n", m->addr + o);
@@ -478,6 +495,9 @@ index 0000000..e4157ff
 +			return EINVAL;
 +		}
 +		len = (m->len + 0xfffULL) & ~0xfffULL;
++		if (m->addr > UINT64_MAX - len) {
++			return EINVAL;
++		}
 +		lck_mtx_unlock(&sweet_vmmu_lock);       /* pinning may fault pages in */
 +		pin = sweet_vmmu_pin_user(current_task(), m->addr, len, &err);
 +		lck_mtx_lock(&sweet_vmmu_lock);
@@ -485,6 +505,10 @@ index 0000000..e4157ff
 +		lck_mtx_unlock(&sweet_vmmu_lock);
 +		pin = sweet_vmmu_pin_surface(m->surface, &len, m->info, &err);
 +		lck_mtx_lock(&sweet_vmmu_lock);
++		if (pin != NULL && (!len || len > VM_IOVA_HI - VM_IOVA_LO)) {
++			sweet_vmmu_unpin(pin);
++			return EINVAL;
++		}
 +		len = (len + 0xfffULL) & ~0xfffULL;
 +	} else {
 +		return EINVAL;
@@ -498,7 +522,8 @@ index 0000000..e4157ff
 +	}
 +	uint64_t iova = m->iova;
 +	if (iova) {
-+		if ((iova & 0xfff) || iova < VM_IOVA_LO || iova + len > VM_IOVA_HI || vmu_overlaps(iova, len, 0)) {
++		if ((iova & 0xfff) || iova < VM_IOVA_LO || iova >= VM_IOVA_HI || len > VM_IOVA_HI - iova ||
++		    vmu_overlaps(iova, len, 0)) {
 +			sweet_vmmu_unpin(pin);
 +			return EADDRINUSE;
 +		}
@@ -506,7 +531,12 @@ index 0000000..e4157ff
 +		sweet_vmmu_unpin(pin);
 +		return ENOSPC;
 +	}
-+	(void)vmu_l1_fix();
++	err = vmu_l1_fix();
++	if (err) {
++		sweet_vmmu_unpin(pin);
++		printf("SWEET VMMU: map of %llu KB at 0x%llx failed: L1 fix (%d)\n", len >> 10, iova, err);
++		return err;
++	}
 +	err = vmu_set_ptes(iova, len, pin, m->flags);
 +	if (err) {
 +		vmu_set_ptes(iova, len, NULL, 0);
@@ -555,8 +585,14 @@ index 0000000..e4157ff
 +		return ENOENT;
 +	}
 +	struct vmu_ent *e = &vmu_ents[i];
-+	uint64_t off = s->iova - e->iova + s->off, len = s->len ? s->len : e->len - (s->iova - e->iova) - s->off;
-+	if (off > e->len || len > e->len - off || (s->op != 1 && s->op != 2)) {
++	uint64_t base = s->iova - e->iova;
++	if (s->off > e->len - base) {
++		return EINVAL;
++	}
++	uint64_t off = base + s->off;
++	uint64_t avail = e->len - off;
++	uint64_t len = s->len ? s->len : avail;
++	if (len > avail || (s->op != 1 && s->op != 2)) {
 +		return EINVAL;
 +	}
 +	uint64_t end = off + len;
@@ -599,13 +635,18 @@ index 0000000..e4157ff
 +vmu_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 +{
 +	int c = minor(dev);
-+	if (c < 0 || c >= VM_CLIENTS) {
++	if (c < 0 || c >= VM_MINORS) {
 +		return EMFILE;
 +	}
 +	lck_mtx_lock(&sweet_vmmu_lock);
-+	int err = vmu_client_open[c] ? EBUSY : 0;
-+	if (!err) {
-+		vmu_client_open[c] = 1;
++	int err = 0;
++	if (vmu_open_count >= VM_CLIENTS) {
++		err = EMFILE;
++	} else if (vmu_minor_open[c]) {
++		err = EBUSY;
++	} else {
++		vmu_minor_open[c] = 1;
++		vmu_open_count++;
 +	}
 +	lck_mtx_unlock(&sweet_vmmu_lock);
 +	return err;
@@ -618,8 +659,11 @@ index 0000000..e4157ff
 +	lck_mtx_lock(&sweet_vmmu_lock);
 +	vmu_fault_check(NULL);
 +	vmu_drop_client(c, "closed");
-+	if (c >= 0 && c < VM_CLIENTS) {
-+		vmu_client_open[c] = 0;
++	if (c >= 0 && c < VM_MINORS && vmu_minor_open[c]) {
++		vmu_minor_open[c] = 0;
++		if (vmu_open_count > 0) {
++			vmu_open_count--;
++		}
 +	}
 +	lck_mtx_unlock(&sweet_vmmu_lock);
 +	return 0;
@@ -631,15 +675,19 @@ index 0000000..e4157ff
 +	int m = -1;
 +	if (action == DEVFS_CLONE_ALLOC) {
 +		lck_mtx_lock(&sweet_vmmu_lock);
-+		for (int i = 0; i < VM_CLIENTS; i++) {
-+			if (!vmu_client_open[i]) {
-+				m = i;
-+				break;
++		if (vmu_open_count < VM_CLIENTS) {
++			for (int k = 0; k < VM_MINORS; k++) {
++				int i = (vmu_clone_next + k) % VM_MINORS;
++				if (!vmu_minor_open[i]) {
++					m = i;
++					vmu_clone_next = (i + 1) % VM_MINORS;
++					break;
++				}
 +			}
 +		}
 +		lck_mtx_unlock(&sweet_vmmu_lock);
 +		if (m < 0) {
-+			m = VM_CLIENTS;         /* vmu_open refuses it (EMFILE) */
++			m = VM_MINORS;         /* vmu_open refuses it (EMFILE) */
 +		}
 +	} else if (action == DEVFS_CLONE_FREE) {
 +		m = 0;
@@ -757,7 +805,7 @@ new file mode 100644
 index 0000000..fea22f9
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetVideoMMU.cpp
-@@ -0,0 +1,125 @@
+@@ -0,0 +0,137 @@
 +/*
 + * 1270 redfin (venus-iommu): the IOKit half of /dev/vmmu (bsd/dev/sweet_vmmu.c): pins the pages Venus maps.
 + *   user range: IOMemoryDescriptor::withAddressRange + prepare() in the caller's task, as SweetAccelerator's
@@ -822,10 +870,16 @@ index 0000000..fea22f9
 +		*err = 12;
 +		return NULL;
 +	}
++	if (md->prepare() != kIOReturnSuccess) {
++		md->release();
++		IODelete(p, SweetVmmuPin, 1);
++		*err = 14;      /* EFAULT */
++		return NULL;
++	}
 +	p->md = md;
 +	p->surface = NULL;
 +	p->offset = 0;
-+	p->prepared = md->prepare() == kIOReturnSuccess;
++	p->prepared = true;
 +	return p;
 +}
 +
@@ -844,10 +898,16 @@ index 0000000..fea22f9
 +		*err = 12;
 +		return NULL;
 +	}
++	if (s->memory->prepare() != kIOReturnSuccess) {
++		s->release();
++		IODelete(p, SweetVmmuPin, 1);
++		*err = 14;      /* EFAULT */
++		return NULL;
++	}
 +	p->md = s->memory;
 +	p->surface = s;         /* the retain keeps md alive */
 +	p->offset = 0;
-+	p->prepared = p->md->prepare() == kIOReturnSuccess;
++	p->prepared = true;
 +	*len = p->md->getLength();
 +	info[0] = s->width;
 +	info[1] = s->height;

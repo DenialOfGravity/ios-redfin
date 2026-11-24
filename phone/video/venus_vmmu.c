@@ -100,6 +100,17 @@ static int add(uint32_t iova, uint32_t len, uint8_t *cpu, int owned)
 	return 0;
 }
 
+static int add_or_unmap(uint64_t iova, uint32_t len, uint8_t *cpu, int owned)
+{
+	if (!iova)
+		return -1;
+	if (add((uint32_t)iova, len, cpu, owned)) {
+		ioctl(fd, VMMU_UNMAP, &iova);
+		return -1;
+	}
+	return 0;
+}
+
 static int find(uint64_t pa, size_t len)
 {
 	for (int i = 0; i < nvb; i++)
@@ -146,11 +157,10 @@ uint32_t vmmu_alloc(uint32_t size, const char *what)
 	}
 	memset(p, 0, len);	/* fault every page in before the pin */
 	uint32_t plen = 0, iova = map((uint64_t)(uintptr_t)p, len, 0, &plen, NULL);
-	if (!iova || add(iova, plen, p, 1)) {
+	if (add_or_unmap(iova, plen, p, 1)) {
 		munmap(p, len);
 		return 0;
 	}
-	vmmu_sync(iova, plen, 2);	/* no dirty zero line may land on what Venus writes later */
 	if (getenv("VENUSCTL_VMMU_LOG"))
 		printf("vmmu: %s %#x bytes at IOVA %#x\n", what, size, iova);
 	return iova;
@@ -175,7 +185,7 @@ uint32_t vmmu_map_phys(uint64_t pa, uint32_t len, uint32_t iova, const char *wha
 		printf("vmmu: map physical %s %#llx+%#x at %#x: %s\n", what, (unsigned long long)pa, len, iova, strerror(errno));
 		return 0;
 	}
-	if (add((uint32_t)m.iova, (uint32_t)m.plen, NULL, 0))
+	if (add_or_unmap(m.iova, (uint32_t)m.plen, NULL, 0))
 		return 0;
 	printf("vmmu: %s: PA %#llx+%#x at IOVA %#x\n", what, (unsigned long long)pa, len, (uint32_t)m.iova);
 	return (uint32_t)m.iova;
@@ -184,7 +194,7 @@ uint32_t vmmu_map_phys(uint64_t pa, uint32_t len, uint32_t iova, const char *wha
 uint32_t vmmu_map_user(void *p, size_t len, const char *what)
 {
 	uint32_t plen = 0, iova = map((uint64_t)(uintptr_t)p, len, 0, &plen, NULL);
-	if (!iova || add(iova, plen, p, 0))
+	if (add_or_unmap(iova, plen, p, 0))
 		return 0;
 	if (getenv("VENUSCTL_VMMU_LOG"))
 		printf("vmmu: %s %#zx bytes at IOVA %#x\n", what, len, iova);
@@ -194,7 +204,7 @@ uint32_t vmmu_map_user(void *p, size_t len, const char *what)
 uint32_t vmmu_map_surface(uint32_t id, uint32_t *len, uint32_t info[4])
 {
 	uint32_t plen = 0, iova = map(0, 0, id, &plen, info);
-	if (!iova || add(iova, plen, NULL, 0))
+	if (add_or_unmap(iova, plen, NULL, 0))
 		return 0;
 	if (len)
 		*len = plen;

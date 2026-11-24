@@ -251,7 +251,7 @@ index 36d9172..8cd45f9 100644
  			return kIOReturnBadArgument;
  		}
  		V2_OUT(NativeAdrenoAbiSubmitReply);
-@@ -1162,14 +1245,28 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
+@@ -1162,14 +1245,30 @@ SweetAcceleratorUserClient::v2Method(uint32_t method, const void *in, uint32_t i
  			v2_err_log("submit", "wait_fence timeout");
  			return kIOReturnTimeout;
  		}
@@ -262,22 +262,24 @@ index 36d9172..8cd45f9 100644
 +		uint32_t hids[SWEET_V2_HOLD_MAX];
 +		uint64_t hpas[SWEET_V2_HOLD_MAX];
 +		uint8_t hwr[SWEET_V2_HOLD_MAX];
++		uint8_t hpend[SWEET_V2_HOLD_MAX];
 +		uint32_t nhold = 0;
 +		if (sweet_surface_inuse_mode() != 0) {
++			bzero(hpend, sizeof(hpend));
 +			nhold = v2CollectSurfaces(bos, bl != NULL ? bl->count : 0, bl != NULL, hids, hpas, hwr);
-+			sweet_surface_gpu_hold(hids, hpas, hwr, nhold, SWEET_SURF_FENCE_PENDING);
++			sweet_surface_gpu_hold(hids, hpas, hwr, nhold, SWEET_SURF_FENCE_PENDING, hpend);
 +		}
  		bool busy = false;
 -		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, rq->flags, &busy);
 +		uint32_t fence = sweet_gpu_submit_v2(iova, dw, nbuf, rq->flags & ~NativeAdrenoAbiSubmitBoListFlag, &busy);
  		if (fence == 0) {
-+			sweet_surface_gpu_hold(hids, hpas, hwr, nhold, SWEET_SURF_FENCE_CANCEL);
++			sweet_surface_gpu_hold(hids, hpas, hwr, nhold, SWEET_SURF_FENCE_CANCEL, hpend);
  			v2_err_log("submit", busy ? "busy (ring full)" : "not ready (GPU down)");
  			return busy ? kIOReturnBusy : kIOReturnNotReady;
  		}
  		fLastFence = fence;
  		rp->fence = fence;
-+		sweet_surface_gpu_hold(hids, hpas, hwr, nhold, fence);
++		sweet_surface_gpu_hold(hids, hpas, hwr, nhold, fence, hpend);
  		if (fSystem && fName[0] == 'b') {
  			sweet_swaptrace('S', fence);    /* 0987: SweetFramebuffer.cpp (p swapdone trace) */
  		}
@@ -441,7 +443,7 @@ index 1a56380..eb2c045 100644
  		return;
  	}
  	char name[32];
-@@ -1475,20 +1491,426 @@ sweet_surface_client_use(void *id, void *category, int delta)
+@@ -1475,20 +1491,587 @@ sweet_surface_client_use(void *id, void *category, int delta)
  }
  
  #define SWEET_SURFACE_STATE_USE         0x18    /* 0983: u64 use counts, category 1 << 32 | category 0 */
@@ -474,13 +476,14 @@ index 1a56380..eb2c045 100644
 +static IOLock *sweet_inuse_lock;
 +static bool sweet_inuse_thread;
 +static uint32_t sweet_inuse_chan;
++static uint32_t sweet_inuse_pend_chan;
 +#define SWEET_INUSE_MAX         1024
 +static SweetSurface *sweet_inuse_held[SWEET_INUSE_MAX];        /* retained; gpuHold set (sweet_inuse_lock) */
 +static uint32_t sweet_inuse_n;
 +static struct {
-+	uint32_t publish, publishUsed, hold, holdEnd, holdTimeout, holdOverflow, importHit, importMiss, maxHeld;
-+	uint32_t subListed, subAll, subNamed, subHeld, subOverflow, cancel, lockWait, lockWaitLate;
-+	uint64_t lockWaitNs;
++	volatile uint32_t publish, publishUsed, hold, holdEnd, holdTimeout, holdOverflow, importHit, importMiss, maxHeld;
++	volatile uint32_t subListed, subAll, subNamed, subHeld, subOverflow, cancel, lockWait, lockWaitLate;
++	volatile uint64_t lockWaitNs;
 +} sweet_inuse_st;
 +extern "C" bool sweet_gpu_fence_done(uint32_t fence);
 +extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
@@ -520,11 +523,15 @@ index 1a56380..eb2c045 100644
 +		v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | (uint32_t)(c0 < 0 ? 0 : c0);
 +	} else {
 +		/* 1258: each term clamped by itself (a stray decrement must not cancel a GPU hold) */
-+		int32_t cu = s->clientUse, du = s->displayUse, gu = s->gpuHold, c1 = s->clientUse1;
++		int32_t cu = s->clientUse, du = s->displayUse;
++		int32_t gu = __atomic_load_n(&s->gpuHold, __ATOMIC_RELAXED);
++		int32_t c1 = s->clientUse1;
 +		uint32_t c0 = (uint32_t)(cu < 0 ? 0 : cu) + (uint32_t)(du < 0 ? 0 : du) + (uint32_t)(gu < 0 ? 0 : gu);
 +		v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | c0;
-+		sweet_inuse_st.publish++;
-+		sweet_inuse_st.publishUsed += v != 0;
++		__atomic_fetch_add(&sweet_inuse_st.publish, 1, __ATOMIC_RELAXED);
++		if (v != 0) {
++			__atomic_fetch_add(&sweet_inuse_st.publishUsed, 1, __ATOMIC_RELAXED);
++		}
  	}
 -	int32_t c0 = s->clientUse + s->displayUse, c1 = s->clientUse1;
 -	uint64_t v = (uint64_t)(uint32_t)(c1 < 0 ? 0 : c1) << 32 | (uint32_t)(c0 < 0 ? 0 : c0);
@@ -581,10 +588,17 @@ index 1a56380..eb2c045 100644
 +void
 +sweet_surface_import_stat(bool matched)
 +{
-+	if (matched) {
-+		sweet_inuse_st.importHit++;
-+	} else {
-+		sweet_inuse_st.importMiss++;
++	__atomic_fetch_add(matched ? &sweet_inuse_st.importHit : &sweet_inuse_st.importMiss, 1, __ATOMIC_RELAXED);
++}
++
++static void
++sweet_inuse_ensure_lock(void)
++{
++	if (__atomic_load_n(&sweet_inuse_lock, __ATOMIC_ACQUIRE) == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, &sweet_inuse_lock)) {
++			IOLockFree(l);
++		}
 +	}
 +}
 +
@@ -593,8 +607,9 @@ index 1a56380..eb2c045 100644
 +void
 +sweet_surface_gpu_kick(void)
 +{
-+	if (sweet_inuse_lock != NULL && sweet_inuse_n != 0) {
-+		IOLockWakeup(sweet_inuse_lock, &sweet_inuse_chan, false);
++	IOLock *l = __atomic_load_n(&sweet_inuse_lock, __ATOMIC_ACQUIRE);
++	if (l != NULL && __atomic_load_n(&sweet_inuse_n, __ATOMIC_RELAXED) != 0) {
++		IOLockWakeup(l, &sweet_inuse_chan, false);
 +	}
 +}
 +
@@ -612,7 +627,7 @@ index 1a56380..eb2c045 100644
 +		used += *(volatile uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE) != 0;
 +		cu += s->clientUse > 0 || s->clientUse1 > 0;
 +		du += s->displayUse > 0;
-+		gu += s->gpuHold > 0;
++		gu += __atomic_load_n(&s->gpuHold, __ATOMIC_RELAXED) > 0;
 +	}
 +	IOLockUnlock(sweet_surface_lock);
 +	uint64_t oldest = 0, now = mach_absolute_time(), ns = 0;
@@ -624,16 +639,27 @@ index 1a56380..eb2c045 100644
 +	if (oldest != 0) {
 +		absolutetime_to_nanoseconds(now - oldest, &ns);
 +	}
++#define XST(f) __atomic_exchange_n(&sweet_inuse_st.f, 0, __ATOMIC_RELAXED)
++	uint32_t st_publish = XST(publish), st_publishUsed = XST(publishUsed);
++	uint32_t st_hold = XST(hold), st_holdEnd = XST(holdEnd);
++	uint32_t st_holdTimeout = XST(holdTimeout), st_holdOverflow = XST(holdOverflow);
++	uint32_t st_cancel = XST(cancel), st_maxHeld = XST(maxHeld);
++	uint32_t st_subListed = XST(subListed), st_subNamed = XST(subNamed);
++	uint32_t st_subAll = XST(subAll), st_subHeld = XST(subHeld), st_subOverflow = XST(subOverflow);
++	uint32_t st_importHit = XST(importHit), st_importMiss = XST(importMiss);
++	uint32_t st_lockWait = XST(lockWait), st_lockWaitLate = XST(lockWaitLate);
++	uint64_t st_lockWaitNs = XST(lockWaitNs);
++#undef XST
 +	IOLog("SWEET SURF INUSE: 5s: mode %d | publishes %u (in use %u) | gpu holds +%u -%u timeout %u overflow %u cancel %u, "
-+	    "held %u (max %u, oldest %llu ms) | in use now %u of %u surfaces (client %u display %u gpu %u)\n", sweet_inuse_mode,
-+	    sweet_inuse_st.publish, sweet_inuse_st.publishUsed, sweet_inuse_st.hold, sweet_inuse_st.holdEnd,
-+	    sweet_inuse_st.holdTimeout, sweet_inuse_st.holdOverflow, sweet_inuse_st.cancel, sweet_inuse_n, sweet_inuse_st.maxHeld,
++	    "held %u (max %u, oldest %llu ms) | in use now %u of %u surfaces (client %u display %u gpu %u)\n",
++	    __atomic_load_n(&sweet_inuse_mode, __ATOMIC_RELAXED),
++	    st_publish, st_publishUsed, st_hold, st_holdEnd,
++	    st_holdTimeout, st_holdOverflow, st_cancel, sweet_inuse_n, st_maxHeld,
 +	    ns / 1000000, used, total, cu, du, gu);
 +	IOLog("SWEET SURF INUSE: 5s: submits listed %u (named %u) all-imports %u, surfaces held %u, overflow %u | imports "
-+	    "matched %u unmatched %u | lock waits %u (%llu us, late %u)\n", sweet_inuse_st.subListed, sweet_inuse_st.subNamed,
-+	    sweet_inuse_st.subAll, sweet_inuse_st.subHeld, sweet_inuse_st.subOverflow, sweet_inuse_st.importHit,
-+	    sweet_inuse_st.importMiss, sweet_inuse_st.lockWait, sweet_inuse_st.lockWaitNs / 1000, sweet_inuse_st.lockWaitLate);
-+	bzero(&sweet_inuse_st, sizeof(sweet_inuse_st));
++	    "matched %u unmatched %u | lock waits %u (%llu us, late %u)\n", st_subListed, st_subNamed,
++	    st_subAll, st_subHeld, st_subOverflow, st_importHit,
++	    st_importMiss, st_lockWait, st_lockWaitNs / 1000, st_lockWaitLate);
 +}
 +
 +/*
@@ -651,16 +677,30 @@ index 1a56380..eb2c045 100644
 +	IOLockLock(sweet_inuse_lock);
 +	for (;;) {
 +		uint64_t now = mach_absolute_time();
++		int mode = __atomic_load_n(&sweet_inuse_mode, __ATOMIC_RELAXED);
 +		for (uint32_t i = 0; i < sweet_inuse_n;) {
 +			SweetSurface *s = sweet_inuse_held[i];
 +			bool late = now - s->gpuHoldAbs > two_s;
-+			bool done = s->gpuFence != SWEET_SURF_FENCE_PENDING && sweet_gpu_fence_done(s->gpuFence);
-+			if (done || late || sweet_inuse_mode == 0 || (sweet_inuse_mode & 4) != 0) {
-+				s->gpuHold = 0;
++			bool cancelled = s->gpuPending == 0 && s->gpuFence == SWEET_SURF_FENCE_PENDING;
++			bool done = s->gpuPending == 0 && s->gpuFence != SWEET_SURF_FENCE_PENDING &&
++			    sweet_gpu_fence_done(s->gpuFence);
++			if (done || cancelled || late || mode == 0 || (mode & 4) != 0) {
++				bool had_pend = s->gpuPending != 0 || s->gpuWritePending != 0;
++				__atomic_store_n(&s->gpuHold, 0, __ATOMIC_RELAXED);
++				s->gpuPending = 0;
++				s->gpuWritePending = 0;
++				s->gpuFence = 0;
 +				sweet_surface_publish_use(s);
-+				sweet_inuse_st.holdEnd++;
-+				sweet_inuse_st.holdTimeout += late;
-+				sweet_inuse_held[i] = sweet_inuse_held[--sweet_inuse_n];
++				__atomic_fetch_add(&sweet_inuse_st.holdEnd, 1, __ATOMIC_RELAXED);
++				if (late) {
++					__atomic_fetch_add(&sweet_inuse_st.holdTimeout, 1, __ATOMIC_RELAXED);
++				}
++				uint32_t nn = sweet_inuse_n - 1;
++				sweet_inuse_held[i] = sweet_inuse_held[nn];
++				__atomic_store_n(&sweet_inuse_n, nn, __ATOMIC_RELAXED);
++				if (had_pend) {
++					IOLockWakeup(sweet_inuse_lock, &sweet_inuse_pend_chan, false);
++				}
 +				IOLockUnlock(sweet_inuse_lock);
 +				s->release();   /* maybe the last: SweetSurface::free outside our lock */
 +				IOLockLock(sweet_inuse_lock);
@@ -668,7 +708,7 @@ index 1a56380..eb2c045 100644
 +			}
 +			i++;
 +		}
-+		bool logs = (sweet_inuse_mode & 2) != 0;
++		bool logs = (mode & 2) != 0;
 +		if (logs && now >= next_stats) {
 +			sweet_inuse_stats_locked();
 +			next_stats = now + five_s;
@@ -683,19 +723,18 @@ index 1a56380..eb2c045 100644
 +static void
 +sweet_inuse_start(void)
 +{
-+	if (sweet_inuse_lock == NULL) {
-+		IOLock *l = IOLockAlloc();
-+		if (!OSCompareAndSwapPtr(NULL, l, &sweet_inuse_lock)) {
-+			IOLockFree(l);
-+		}
-+	}
++	sweet_inuse_ensure_lock();
 +	IOLockLock(sweet_inuse_lock);
 +	bool start = !sweet_inuse_thread;
-+	sweet_inuse_thread = true;
++	if (start) {
++		__atomic_store_n(&sweet_inuse_thread, true, __ATOMIC_RELEASE);
++	}
 +	IOLockUnlock(sweet_inuse_lock);
 +	if (start && IOCreateThread(sweet_inuse_loop, NULL) == NULL) {
 +		IOLog("SWEET SURF INUSE: no hold thread\n");
-+		sweet_inuse_thread = false;
++		IOLockLock(sweet_inuse_lock);
++		__atomic_store_n(&sweet_inuse_thread, false, __ATOMIC_RELEASE);
++		IOLockUnlock(sweet_inuse_lock);
 +	}
 +}
 +
@@ -725,81 +764,187 @@ index 1a56380..eb2c045 100644
 +
 +/* 1258: SweetAccelerator.cpp: the surfaces a v2 submission uses, held before it is queued and until its fence lands */
 +void
-+sweet_surface_gpu_hold(const uint32_t *ids, const uint64_t *pas, const uint8_t *writes, uint32_t n, uint32_t fence)
++sweet_surface_gpu_hold(const uint32_t *ids, const uint64_t *pas, const uint8_t *writes, uint32_t n, uint32_t fence,
++    uint8_t *pend)
 +{
 +	int mode = sweet_surface_inuse_mode();
 +	if (n == 0) {
 +		return;
 +	}
 +	if (mode == 0 || (mode & 4) != 0) {
-+		if (fence != SWEET_SURF_FENCE_PENDING && fence != SWEET_SURF_FENCE_CANCEL) {
-+			for (uint32_t i = 0; i < n && (mode & 8) != 0; i++) {
-+				/* lock waits without holds: still know the writer */
-+				SweetSurface *s = writes != NULL && writes[i] ? sweet_surface_copy(ids[i]) : NULL;
-+				if (s != NULL) {
-+					if (s->pa0 == pas[i]) {
-+						s->gpuWriteFence = fence;
++		if (fence == SWEET_SURF_FENCE_PENDING) {
++			return;
++		}
++		sweet_inuse_ensure_lock();
++		bool wake_pend = false, wake_loop = false;
++		for (uint32_t i = 0; i < n; i++) {
++			bool has_pend = pend != NULL && pend[i] != 0;
++			bool wr = fence != SWEET_SURF_FENCE_CANCEL && (mode & 8) != 0 && writes != NULL && writes[i];
++			if (!has_pend && !wr) {
++				continue;
++			}
++			SweetSurface *s = sweet_surface_copy(ids[i]);
++			if (s == NULL) {
++				if (has_pend) {
++					pend[i] = 0;
++				}
++				continue;
++			}
++			IOLockLock(sweet_inuse_lock);
++			if (has_pend) {
++				uint8_t pbit = pend[i];
++				pend[i] = 0;
++				if (s->pa0 == pas[i] && s->gpuHold != 0) {
++					if (s->gpuPending > 0 && --s->gpuPending == 0) {
++						wake_pend = true;
 +					}
-+					s->release();
++					if (pbit == 2 && s->gpuWritePending > 0 && --s->gpuWritePending == 0) {
++						wake_pend = true;
++					}
++					if (s->gpuPending == 0 && s->gpuFence == SWEET_SURF_FENCE_PENDING) {
++						wake_loop = true;
++					}
 +				}
 +			}
++			if (wr && s->pa0 == pas[i] &&
++			    (s->gpuWriteFence == 0 || (int32_t)(fence - s->gpuWriteFence) > 0)) {
++				s->gpuWriteFence = fence;
++			}
++			IOLockUnlock(sweet_inuse_lock);
++			s->release();
++		}
++		if (wake_pend) {
++			IOLockWakeup(sweet_inuse_lock, &sweet_inuse_pend_chan, false);
++		}
++		if (wake_loop) {
++			IOLockWakeup(sweet_inuse_lock, &sweet_inuse_chan, false);
 +		}
 +		return;
 +	}
-+	if (!sweet_inuse_thread) {
++	if (!__atomic_load_n(&sweet_inuse_thread, __ATOMIC_ACQUIRE)) {
 +		sweet_inuse_start();
-+		if (!sweet_inuse_thread) {
++		if (!__atomic_load_n(&sweet_inuse_thread, __ATOMIC_ACQUIRE)) {
 +			return;
 +		}
 +	}
-+	bool added = false;
++	bool added = false, wake_pend = false;
 +	uint64_t now = mach_absolute_time();
 +	for (uint32_t i = 0; i < n; i++) {
 +		SweetSurface *s = sweet_surface_copy(ids[i]);  /* retained: kept by the hold, else released below */
 +		if (s == NULL) {
++			if (pend != NULL && fence != SWEET_SURF_FENCE_PENDING) {
++				pend[i] = 0;
++			}
 +			continue;
 +		}
 +		bool kept = false;
 +		IOLockLock(sweet_inuse_lock);
 +		if (s->pa0 != pas[i]) {
 +			/* the id was reused by another surface since the import */
-+		} else if (fence == SWEET_SURF_FENCE_CANCEL) {
-+			if (s->gpuHold != 0 && s->gpuFence == SWEET_SURF_FENCE_PENDING) {
-+				s->gpuHoldAbs = 0;      /* the thread drops it at its next look */
-+				sweet_inuse_st.cancel++;
-+				added = true;
++			if (pend != NULL && fence != SWEET_SURF_FENCE_PENDING) {
++				pend[i] = 0;
 +			}
-+		} else if (s->gpuHold == 0) {
-+			if (sweet_inuse_n < SWEET_INUSE_MAX) {
-+				kept = true;
-+				s->gpuFence = fence;
-+				s->gpuHoldAbs = now;
-+				s->gpuHold = 1;
-+				sweet_inuse_held[sweet_inuse_n++] = s;
-+				added = true;
-+				sweet_inuse_st.hold++;
-+				if (sweet_inuse_n > sweet_inuse_st.maxHeld) {
-+					sweet_inuse_st.maxHeld = sweet_inuse_n;
-+				}
-+				sweet_surface_publish_use(s);
-+			} else {
-+				sweet_inuse_st.holdOverflow++;
-+			}
-+		} else if (fence != SWEET_SURF_FENCE_PENDING &&
-+		    (s->gpuFence == SWEET_SURF_FENCE_PENDING || (int32_t)(fence - s->gpuFence) > 0)) {
-+			s->gpuFence = fence;    /* one ring: the newest fence covers the older jobs */
-+			s->gpuHoldAbs = now;
 +		} else if (fence == SWEET_SURF_FENCE_PENDING) {
-+			s->gpuHoldAbs = now;    /* a new job is being queued: the 2 s cap starts again */
-+		}
-+		if (fence != SWEET_SURF_FENCE_PENDING && fence != SWEET_SURF_FENCE_CANCEL && writes != NULL && writes[i] &&
-+		    s->pa0 == pas[i]) {
-+			s->gpuWriteFence = fence;
++			uint8_t pbit = (writes != NULL && writes[i]) ? 2 : 1;
++			if (s->gpuHold == 0) {
++				if (sweet_inuse_n < SWEET_INUSE_MAX) {
++					kept = true;
++					s->gpuFence = SWEET_SURF_FENCE_PENDING;
++					s->gpuPending = 1;
++					s->gpuWritePending = (pbit == 2) ? 1 : 0;
++					s->gpuHoldAbs = now;
++					__atomic_store_n(&s->gpuHold, 1, __ATOMIC_RELAXED);
++					uint32_t nn = sweet_inuse_n + 1;
++					sweet_inuse_held[sweet_inuse_n] = s;
++					__atomic_store_n(&sweet_inuse_n, nn, __ATOMIC_RELAXED);
++					added = true;
++					__atomic_fetch_add(&sweet_inuse_st.hold, 1, __ATOMIC_RELAXED);
++					if (nn > sweet_inuse_st.maxHeld) {
++						sweet_inuse_st.maxHeld = nn;
++					}
++					sweet_surface_publish_use(s);
++					if (pend != NULL) {
++						pend[i] = pbit;
++					}
++				} else {
++					__atomic_fetch_add(&sweet_inuse_st.holdOverflow, 1, __ATOMIC_RELAXED);
++				}
++			} else {
++				s->gpuPending++;
++				if (pbit == 2) {
++					s->gpuWritePending++;
++				}
++				s->gpuHoldAbs = now;    /* a new job is being queued: the 2 s cap starts again */
++				if (pend != NULL) {
++					pend[i] = pbit;
++				}
++			}
++		} else if (fence == SWEET_SURF_FENCE_CANCEL) {
++			if (pend == NULL || pend[i] != 0) {
++				uint8_t pbit = pend != NULL ? pend[i] : 1;
++				if (pend != NULL) {
++					pend[i] = 0;
++				}
++				if (s->gpuHold != 0) {
++					if (s->gpuPending > 0 && --s->gpuPending == 0) {
++						wake_pend = true;
++					}
++					if (pbit == 2 && s->gpuWritePending > 0 && --s->gpuWritePending == 0) {
++						wake_pend = true;
++					}
++					if (s->gpuPending == 0 && s->gpuFence == SWEET_SURF_FENCE_PENDING) {
++						added = true;   /* the thread drops it at its next look */
++					}
++					__atomic_fetch_add(&sweet_inuse_st.cancel, 1, __ATOMIC_RELAXED);
++				}
++			}
++		} else {
++			if (pend != NULL && pend[i] != 0) {
++				uint8_t pbit = pend[i];
++				pend[i] = 0;
++				if (s->gpuHold != 0) {
++					if (s->gpuPending > 0 && --s->gpuPending == 0) {
++						wake_pend = true;
++					}
++					if (pbit == 2 && s->gpuWritePending > 0 && --s->gpuWritePending == 0) {
++						wake_pend = true;
++					}
++				}
++			}
++			if (s->gpuHold == 0) {
++				if (sweet_inuse_n < SWEET_INUSE_MAX) {
++					kept = true;
++					s->gpuFence = fence;
++					s->gpuHoldAbs = now;
++					__atomic_store_n(&s->gpuHold, 1, __ATOMIC_RELAXED);
++					uint32_t nn = sweet_inuse_n + 1;
++					sweet_inuse_held[sweet_inuse_n] = s;
++					__atomic_store_n(&sweet_inuse_n, nn, __ATOMIC_RELAXED);
++					added = true;
++					__atomic_fetch_add(&sweet_inuse_st.hold, 1, __ATOMIC_RELAXED);
++					if (nn > sweet_inuse_st.maxHeld) {
++						sweet_inuse_st.maxHeld = nn;
++					}
++					sweet_surface_publish_use(s);
++				} else {
++					__atomic_fetch_add(&sweet_inuse_st.holdOverflow, 1, __ATOMIC_RELAXED);
++				}
++			} else if (s->gpuFence == SWEET_SURF_FENCE_PENDING || (int32_t)(fence - s->gpuFence) > 0) {
++				s->gpuFence = fence;    /* one ring: the newest fence covers the older jobs */
++				s->gpuHoldAbs = now;
++			}
++			if (writes != NULL && writes[i] &&
++			    (s->gpuWriteFence == 0 || (int32_t)(fence - s->gpuWriteFence) > 0)) {
++				s->gpuWriteFence = fence;
++			}
 +		}
 +		IOLockUnlock(sweet_inuse_lock);
 +		if (!kept) {
 +			s->release();
 +		}
++	}
++	if (wake_pend) {
++		IOLockWakeup(sweet_inuse_lock, &sweet_inuse_pend_chan, false);
 +	}
 +	if (added) {
 +		IOLockWakeup(sweet_inuse_lock, &sweet_inuse_chan, false);
@@ -810,13 +955,13 @@ index 1a56380..eb2c045 100644
 +sweet_surface_submit_stat(bool listed, uint32_t named, uint32_t held, bool overflow)
 +{
 +	if (listed) {
-+		sweet_inuse_st.subListed++;
-+		sweet_inuse_st.subNamed += named;
++		__atomic_fetch_add(&sweet_inuse_st.subListed, 1, __ATOMIC_RELAXED);
++		__atomic_fetch_add(&sweet_inuse_st.subNamed, named, __ATOMIC_RELAXED);
 +	} else {
-+		sweet_inuse_st.subAll++;
++		__atomic_fetch_add(&sweet_inuse_st.subAll, 1, __ATOMIC_RELAXED);
 +	}
-+	sweet_inuse_st.subHeld += held;
-+	sweet_inuse_st.subOverflow += overflow;
++	__atomic_fetch_add(&sweet_inuse_st.subHeld, held, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&sweet_inuse_st.subOverflow, overflow ? 1 : 0, __ATOMIC_RELAXED);
 +}
 +
 +/*
@@ -830,19 +975,37 @@ index 1a56380..eb2c045 100644
 +	if (mode == 0 || (mode & 8) == 0) {
 +		return;
 +	}
++	sweet_inuse_ensure_lock();
++	uint64_t t0 = mach_absolute_time(), budget_ns = 200000000ULL, budget_abs;
++	nanoseconds_to_absolutetime(budget_ns, &budget_abs);
++	uint64_t dl = t0 + budget_abs;
++	IOLockLock(sweet_inuse_lock);
++	while ((readOnly ? s->gpuWritePending : s->gpuPending) > 0) {
++		if (mach_absolute_time() >= dl) {
++			break;
++		}
++		IOLockSleepDeadline(sweet_inuse_lock, &sweet_inuse_pend_chan, dl, THREAD_UNINT);
++	}
 +	uint32_t f = s->gpuWriteFence;
-+	if (!readOnly && s->gpuHold != 0 && s->gpuFence != SWEET_SURF_FENCE_PENDING) {
++	if (!readOnly && s->gpuHold != 0 && s->gpuFence != SWEET_SURF_FENCE_PENDING &&
++	    (f == 0 || (int32_t)(s->gpuFence - f) > 0)) {
 +		f = s->gpuFence;
 +	}
++	IOLockUnlock(sweet_inuse_lock);
 +	if (f == 0 || sweet_gpu_fence_done(f)) {
 +		return;
 +	}
-+	uint64_t t0 = mach_absolute_time(), ns = 0;
-+	bool late = sweet_gpu_wait_fence_ns(f, 200000000ULL) != 0;
++	uint64_t now = mach_absolute_time(), elapsed_ns = 0;
++	absolutetime_to_nanoseconds(now - t0, &elapsed_ns);
++	uint64_t rem_ns = elapsed_ns < budget_ns ? budget_ns - elapsed_ns : 1;
++	bool late = sweet_gpu_wait_fence_ns(f, rem_ns) != 0;
++	uint64_t ns = 0;
 +	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
-+	sweet_inuse_st.lockWait++;
-+	sweet_inuse_st.lockWaitLate += late;
-+	sweet_inuse_st.lockWaitNs += ns;
++	__atomic_fetch_add(&sweet_inuse_st.lockWait, 1, __ATOMIC_RELAXED);
++	if (late) {
++		__atomic_fetch_add(&sweet_inuse_st.lockWaitLate, 1, __ATOMIC_RELAXED);
++	}
++	__atomic_fetch_add(&sweet_inuse_st.lockWaitNs, ns, __ATOMIC_RELAXED);
 +}
 +
 +/* 1258: with kern.sweet_surf_inuse != 0, this client's own use counts (dropped with its reference) */
@@ -872,7 +1035,7 @@ index 1a56380..eb2c045 100644
  	sweet_surface_client_use(id, category, 1);
  	return kIOReturnSuccess;
  }
-@@ -1496,6 +1918,7 @@ IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, vo
+@@ -1496,6 +2079,7 @@ IOSurfaceRootUserClient::trapIncUse(void *id, void *category, void *, void *, vo
  IOReturn
  IOSurfaceRootUserClient::trapDecUse(void *id, void *category, void *, void *, void *, void *)
  {
@@ -880,7 +1043,7 @@ index 1a56380..eb2c045 100644
  	sweet_surface_client_use(id, category, -1);
  	return kIOReturnSuccess;
  }
-@@ -1530,13 +1953,14 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+@@ -1530,13 +2114,14 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
  }
  
  IOReturn
@@ -900,20 +1063,22 @@ diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
 index c6ea40b..af3ff7b 100644
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -55,6 +55,12 @@ public:
+@@ -55,6 +55,14 @@ public:
  	uint32_t                  ubwcMeta, ubwcMetaPitch, ubwcMetaSize, ubwcData, ubwcDataPitch;
  	uint8_t                   ubwcReady;
  	volatile uint8_t          ubwcLive;
 +	/* 1258 (kern.sweet_surf_inuse, SweetSurface.cpp sweet_inuse_*): GPU holds */
 +	uint64_t                  pa0;          /* physical address of byte 0 (GPU imports are matched by it) */
 +	volatile SInt32           gpuHold;      /* 1 while a GPU job that uses it has not landed */
-+	uint32_t                  gpuFence;     /* the newest such job's fence (0: being submitted) */
++	uint32_t                  gpuPending;   /* 1258: submissions between PENDING and fence/CANCEL (sweet_inuse_lock) */
++	uint32_t                  gpuWritePending; /* 1258: write submissions between PENDING and fence/CANCEL */
++	uint32_t                  gpuFence;     /* the newest such job's fence (0: none yet) */
 +	uint32_t                  gpuWriteFence; /* the newest job that writes it (0: none known) */
 +	uint64_t                  gpuHoldAbs;   /* when the hold began or was last moved on */
  
  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
-@@ -99,6 +105,23 @@ void sweet_surface_scan_reserve(void);
+@@ -99,6 +107,24 @@ void sweet_surface_scan_reserve(void);
   * the surface on screen as in use, as on an iPhone (IOMFB keeps a use count on what it scans out).
   */
  void sweet_surface_publish_use(SweetSurface *s);
@@ -931,7 +1096,8 @@ index c6ea40b..af3ff7b 100644
 + * Each surface (by id, if its byte 0 is still at pas[i]) is in use until fence lands; writes[i]: the job writes it.
 + * Called with SWEET_SURF_FENCE_PENDING before the submission and with its fence (or CANCEL) after it.
 + */
-+void sweet_surface_gpu_hold(const uint32_t *ids, const uint64_t *pas, const uint8_t *writes, uint32_t n, uint32_t fence);
++void sweet_surface_gpu_hold(const uint32_t *ids, const uint64_t *pas, const uint8_t *writes, uint32_t n, uint32_t fence,
++    uint8_t *pend);
 +void sweet_surface_import_stat(bool matched);
 +void sweet_surface_submit_stat(bool listed, uint32_t named, uint32_t held, bool overflow);
  IOMemoryDescriptor *sweet_surface_scan_md(uint32_t slot, uint64_t *pa);
