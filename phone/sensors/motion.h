@@ -33,6 +33,7 @@ enum {
 	MOTION_TYPE_GYRO = 20, MOTION_TYPE_COMPASS = 21, MOTION_TYPE_PRESSURE = 31,
 };
 #define MOTION_FLAG_ACCURACY	0x3u
+#define MOTION_ALS_RGB		0x00010000u	/* v[1..3] are TCS3701 R, G, B counts (not CCT) */
 #define MOTION_FLAG_SYNTHETIC	0x80000000u
 
 /* Sensor service index in struct motion_want. */

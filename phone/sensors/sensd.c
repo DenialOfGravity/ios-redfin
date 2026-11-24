@@ -318,7 +318,7 @@ static int run(struct sensor *ss, int n, int daemon)
 			summary(ss, n);
 			last_print = now;
 		}
-		if (daemon && now - last_want >= 2000) {
+		if (daemon && now - last_want >= 200) {
 			last_want = now;
 			struct motion_want w;
 			int have = opt.follow && opt.motion_fd >= 0 && ioctl(opt.motion_fd, MOTION_GET_WANT, &w) == 0;

@@ -117,6 +117,7 @@ static void orient_filter(struct sensor_env *e, struct sensor *s, uint64_t ts, c
 static void sample(struct sensor_env *e, struct sensor *s, uint32_t msg_id, uint64_t ts, const uint8_t *p, size_t n)
 {
 	float d[16], v[4] = { 0, 0, 0, 0 };
+	uint32_t extra_flags = 0;
 	int status = 0, nd, nv = 0;
 
 	if (s->k->motion_type == MOTION_TYPE_PROX) {
@@ -147,7 +148,15 @@ static void sample(struct sensor_env *e, struct sensor *s, uint32_t msg_id, uint
 			break;
 		case MOTION_TYPE_ALS:
 			v[0] = d[0];		/* lux */
-			nv = 2;			/* [1] colour temperature: not reported by SEE's ambient_light */
+			if (nd >= 5) {		/* TCS3701: [1]=C [2]=R [3]=G [4]=B [5]=W */
+				v[1] = d[2];
+				v[2] = d[3];
+				v[3] = d[4];
+				nv = 4;
+				extra_flags |= MOTION_ALS_RGB;
+			} else {
+				nv = 2;		/* [1] colour temperature if provided */
+			}
 			break;
 		default:
 			nv = nd < 3 ? nd : 3;
@@ -160,7 +169,7 @@ static void sample(struct sensor_env *e, struct sensor *s, uint32_t msg_id, uint
 	s->ts = ts;
 	s->count++;
 	s->last_data_ms = sensor_now_ms();
-	emit(e, s, s->k->motion_type, (uint32_t)status & MOTION_FLAG_ACCURACY, ts, v, nv);
+	emit(e, s, s->k->motion_type, ((uint32_t)status & MOTION_FLAG_ACCURACY) | extra_flags, ts, v, nv);
 	if (e->orient && s->k->motion_type == MOTION_TYPE_ACCEL)
 		orient_filter(e, s, ts ? ts : (uint64_t)sensor_now_ms() * (TICKS_PER_S / 1000), v);
 }

@@ -1,0 +1,537 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 17:50:00 +0100
+Subject: [PATCH] 1298 redfin: Auto-Brightness fast wake ALS repost & True Tone color ALS
+
+- SweetHIDALS (kern.sweet_bl_fix & 16, default on): cache last real sensd ALS
+  sample and re-post within 15 ms on ReportInterval 0 -> >0 transitions (and
+  20 ms on open at cold boot), beating CoreBrightness's 250 ms FirstALSSampleTimeout
+  and eliminating the 435-nit wake flash.
+- SweetHIDALS + AppleARMBacklight (kern.sweet_bl_fix & 32, default on): publish
+  crgb=1, ALSSensorType=8, Placement=0, Orientation=1 on SweetHIDALS and
+  default-whitepoint-type / truetone-strength on AppleARMBacklight; convert
+  TCS3701 RGB (or CCT) into kIOHIDEventColorSpaceXYZ + CIE XYZ * pi components
+  + ColorTemperature + fractional Illuminance in pure integer math (no FP).
+- Runtime white-balance knobs: poke m knob alswr/alswg/alswb.
+---
+diff --git a/bsd/dev/sweet_motion.c b/bsd/dev/sweet_motion.c
+index 7fa5359..a89c490 100644
+--- a/bsd/dev/sweet_motion.c
++++ b/bsd/dev/sweet_motion.c
+@@ -458,7 +458,7 @@ sweet_motion_cmd(const char *s, const char *end)
+ 	} else if (!strcmp(w, "knob")) {
+ 		s = sm_word(s, end, name, sizeof(name));
+ 		if (!sm_num(&s, end, &a[0]) || sweet_hid_sensor_knob(name, a[0] / 1000)) {
+-			printf("SWEET MOTION: m knob NAME VALUE: accsign gyrodeg proxmask orientbase orientauto logmax every\n");
++			printf("SWEET MOTION: m knob NAME VALUE: accsign gyrodeg proxmask orientbase orientauto alswr alswg alswb logmax every\n");
+ 			return;
+ 		}
+ 		sweet_hid_sensor_knobs_print();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a9f37b4..a6706f4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ #include "SweetDisplayMask.h"
+ #include "SweetTrace.h"     /* 0994 */
++#include "hid/SweetMotion.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -587,10 +588,13 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+  *          backlight service is published, the value it has after a backboardd restart.
+  *   bit 2  the ALS sends a neutral 100 lux sample at its client's ReportInterval until sensd's first sample
+  *          (SweetHID.cpp), so CoreBrightness starts with ALS samples flowing, as after a backboardd restart.
++ *   bit 3  publish backlight-calibration-parameters (500/155/2 nits).
++ *   bit 4  fast wake & initial ALS delivery (<250 ms FirstALSSampleTimeout) in SweetHIDALS.
++ *   bit 5  True Tone color ALS (crgb, ALSSensorType=8, XYZHIDEvent) + AppleARMBacklight truetone-* props.
+  */
+ extern "C" {
+ uint32_t sweet_bl_trace = 3;
+-uint32_t sweet_bl_fix = 11;     /* 1102: 1 + 2 + 8 (calibration proven on rk1f); 4 (ALS keep-alive) off: pointless once the panel range is right */
++uint32_t sweet_bl_fix = 59;     /* 1 + 2 + 8 + 16 (wake cached ALS) + 32 (True Tone); bit 4 keep-alive off */
+ }
+ static IOSimpleLock *sweet_blt_lock;
+ static uint64_t sweet_blt_refill;
+@@ -1171,6 +1175,7 @@ public:
+ 	void publish(uint32_t level);
+ 	void publishNits(uint32_t level);
+ 	void publishCalibration(void);  /* 1100 */
++	void publishTrueTone(void);     /* 1298 */
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	using IOService::copyProperty;
+ 	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;      /* 1099: kern.sweet_bl_trace */
+@@ -1304,9 +1309,37 @@ AppleARMBacklight::publishNits(uint32_t level)
+  */
+ static AppleARMBacklight *sweet_bl_service;    /* 1101: for the kern.sweet_bl_fix handler; never released */
+ 
++void
++AppleARMBacklight::publishTrueTone(void)
++{
++	if (!(sweet_bl_fix & 32)) {
++		if (getProperty("default-whitepoint-type") != NULL) {
++			removeProperty("default-whitepoint-type");
++		}
++		if (getProperty("truetone-strength") != NULL) {
++			removeProperty("truetone-strength");
++		}
++		return;
++	}
++	uint32_t wp = 1;
++	static const uint32_t tt[3] = { 0x010e0000u, 0x00c8010eu, 0x00c800c8u };
++	OSData *wpd = OSData::withBytes(&wp, sizeof(wp));
++	OSData *ttd = OSData::withBytes(tt, sizeof(tt));
++	if (wpd != NULL) {
++		setProperty("default-whitepoint-type", wpd);
++		wpd->release();
++	}
++	if (ttd != NULL) {
++		setProperty("truetone-strength", ttd);
++		ttd->release();
++	}
++	IOLog("SWEET BL: 1298 True Tone properties published (kern.sweet_bl_fix & 32)\n");
++}
++
+ void
+ AppleARMBacklight::publishCalibration(void)
+ {
++	publishTrueTone();
+ 	if (!(sweet_bl_fix & 8)) {
+ 		if (getProperty("backlight-calibration-parameters") != NULL) {
+ 			removeProperty("backlight-calibration-parameters");
+@@ -1353,6 +1386,7 @@ sweet_bl_fix_changed(void)
+ 	if (sweet_bl_service != NULL) {
+ 		sweet_bl_service->publishCalibration();
+ 	}
++	sweet_hid_als_fix_changed();
+ }
+ 
+ IOReturn
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 1bca680..4e26fae 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -786,6 +786,7 @@ static const SweetSensorInfo gSweetSensorInfo[SWEET_SENSOR_COUNT] = {
+ };
+ 
+ /* Runtime knobs (`poke m knob NAME VALUE`); the defaults are guesses the phone has to confirm. */
++extern "C" uint32_t sweet_bl_fix;
+ static struct {
+ 	int accsign;            /* -1: iOS g = -(Android m/s²) / 9.80665 (CoreMotion: face up reads z = -1 g) */
+ 	int gyrodeg;            /* 1: gyro events in deg/s (HID sensor page units) instead of rad/s */
+@@ -795,7 +796,8 @@ static struct {
+ 	int orientauto;         /* derive orientation events from accel samples in the kernel */
+ 	uint32_t logmax;        /* setProperties/copyEvent log lines per service */
+ 	uint32_t every;         /* log every Nth posted sample (the first 3 always) */
+-} gSweetKnobs = { -1, 0, kIOHIDProximityDetectionLargeBodyContact | kIOHIDProximityDetectionReceiver, 100, 0, 64, 1000 };
++	int alswr, alswg, alswb; /* 1298: TCS3701 R/G/B D65 white-balance milli-weights (1000 = 1.0) */
++} gSweetKnobs = { -1, 0, kIOHIDProximityDetectionLargeBodyContact | kIOHIDProximityDetectionReceiver, 100, 0, 64, 1000, 880, 1000, 1350 };
+ 
+ /*
+  * Default: everything but prox (0x77). On the phone (2026-10-26) backboardd crash-loops with
+@@ -869,6 +871,152 @@ sweet_f2q(uint32_t bits, int64_t num, int64_t den, int frac)
+ 	return neg ? -(int64_t)t : (int64_t)t;
+ }
+ 
++/* 1298: build IEEE-754 binary64 from signed fixed-point val / 2^frac using integer math only. */
++static double
++sweet_q2d(int64_t val, int frac)
++{
++	union { uint64_t u; double d; } out;
++	if (val == 0) {
++		out.u = 0;
++		return out.d;
++	}
++	uint64_t sign = 0;
++	uint64_t mag;
++	if (val < 0) {
++		sign = 1ULL << 63;
++		mag = (uint64_t)(-(val + 1)) + 1ULL;
++	} else {
++		mag = (uint64_t)val;
++	}
++	int msb = 63 - __builtin_clzll(mag);
++	int exp = 1023 + msb - frac;
++	if (exp <= 0) {
++		out.u = 0;
++		return out.d;
++	}
++	if (exp >= 2047) {
++		out.u = sign | (0x7ffULL << 52);
++		return out.d;
++	}
++	uint64_t mant;
++	if (msb >= 52) {
++		mant = (mag >> (msb - 52)) & ((1ULL << 52) - 1ULL);
++	} else {
++		mant = (mag << (52 - msb)) & ((1ULL << 52) - 1ULL);
++	}
++	out.u = sign | ((uint64_t)exp << 52) | mant;
++	return out.d;
++}
++
++/* 1298: CCT (K) -> CIE 1931 (x, y) in Q16 (Kang et al. 2002); used when only CCT is provided. */
++static void
++sweet_cct_to_xy(int64_t t, int64_t *xq16, int64_t *yq16)
++{
++	if (t < 1667) {
++		t = 1667;
++	} else if (t > 25000) {
++		t = 25000;
++	}
++	int64_t t2 = t * t, t3 = t2 * t;
++	int64_t x;
++	if (t <= 4000) {
++		x = (-266123900LL << 16) / t3 - (234358900LL << 6) / t2 * 1024LL / 1000LL +
++		    (877696LL << 16) / (1000LL * t) + 11791;
++	} else {
++		x = (-3025846900LL << 16) / t3 + (2107037900LL << 6) / t2 * 1024LL / 1000LL +
++		    (222635LL << 16) / (1000LL * t) + 15754;
++	}
++	int64_t x2 = (x * x) >> 16;
++	int64_t x3 = (x2 * x) >> 16;
++	int64_t y;
++	if (t <= 2222) {
++		y = ((-72508LL * x3 - 88350LL * x2 + 143233LL * x) >> 16) - 13251;
++	} else if (t <= 4000) {
++		y = ((-62583LL * x3 - 90059LL * x2 + 137060LL * x) >> 16) - 10977;
++	} else {
++		y = ((201966LL * x3 - 384918LL * x2 + 245834LL * x) >> 16) - 24249;
++	}
++	*xq16 = x < 655 ? 655 : (x > 64000 ? 64000 : x);
++	*yq16 = y < 655 ? 655 : (y > 64000 ? 64000 : y);
++}
++
++/*
++ * 1298: compute CoreBrightness CIE XYZ * pi components (Q16) and CCT (K) from TCS3701 RGB or CCT.
++ * CoreBrightness CBALSEvent divides kIOHIDEventFieldAmbientLightColorComponent0..2 by pi (0x1af14b470),
++ * checks c0 != 0 && c1 != 0, and computes x = X/(X+Y+Z), y = Y/(X+Y+Z).
++ */
++static void
++sweet_als_xyz(const struct sweet_motion_sample *s, int64_t lux_q16,
++    int64_t *c0_q16, int64_t *c1_q16, int64_t *c2_q16, int64_t *cct_out)
++{
++	int64_t xu = 62290, yu = 65536, zu = 71357; /* D65 default (0.95047, 1.0, 1.08883) in Q16 */
++	int64_t cct = 6500;
++	bool has_rgb = (s->flags & SWEET_MOTION_ALS_RGB) || (s->v[2] != 0 || s->v[3] != 0);
++
++	if (has_rgb) {
++		int64_t r = sweet_f2q(s->v[1], 1, 1, 8);
++		int64_t g = sweet_f2q(s->v[2], 1, 1, 8);
++		int64_t b = sweet_f2q(s->v[3], 1, 1, 8);
++		if (r < 0) r = 0;
++		if (g < 0) g = 0;
++		if (b < 0) b = 0;
++		int64_t rn = r * gSweetKnobs.alswr;
++		int64_t gn = g * gSweetKnobs.alswg;
++		int64_t bn = b * gSweetKnobs.alswb;
++		int64_t sum = rn + gn + bn;
++		if (sum > 0) {
++			int64_t rf = (rn << 16) / sum;
++			int64_t gf = (gn << 16) / sum;
++			int64_t bf = (bn << 16) / sum;
++			/* sRGB -> CIE 1931 XYZ matrix coefficients in Q16 */
++			xu = (27031LL * rf + 23434LL * gf + 11825LL * bf) >> 16;
++			yu = (13938LL * rf + 46868LL * gf + 4730LL * bf) >> 16;
++			zu = (1267LL * rf + 7811LL * gf + 62279LL * bf) >> 16;
++			if (xu < 100) xu = 100;
++			if (yu < 100) yu = 100;
++			if (zu < 100) zu = 100;
++			int64_t xsum = xu + yu + zu;
++			int64_t cx = (xu << 16) / xsum;
++			int64_t cy = (yu << 16) / xsum;
++			/* McCamy's formula: n = (x - 0.3320) / (0.1858 - y), Q12 */
++			if (cy > 13000) {
++				int64_t n = ((cx - 21758LL) << 12) / (12177LL - cy);
++				if (n < -4096) n = -4096;
++				if (n > 4096) n = 4096;
++				int64_t n2 = (n * n) >> 12;
++				int64_t n3 = (n2 * n) >> 12;
++				cct = ((449LL * n3 + 3525LL * n2 + 6823LL * n) >> 12) + 5520;
++				if (cct < 1500) cct = 1500;
++				if (cct > 15000) cct = 15000;
++			}
++		}
++	} else {
++		int64_t in_cct = sweet_f2q(s->v[1], 1, 1, 0);
++		if (in_cct > 0) {
++			int64_t cx, cy;
++			cct = in_cct;
++			sweet_cct_to_xy(cct, &cx, &cy);
++			xu = cx;
++			yu = cy;
++			zu = 65536LL - cx - cy;
++			if (zu < 100) zu = 100;
++		}
++	}
++
++	int64_t eff_lux = lux_q16;
++	if (eff_lux < 655) {
++		eff_lux = 655;          /* >= 0.01 lux so c0, c1, c2 stay non-zero even in pitch dark */
++	} else if (eff_lux > (200000LL << 16)) {
++		eff_lux = 200000LL << 16;
++	}
++	/* Scale so Y = eff_lux * pi (205887 = round(pi * 65536)). */
++	uint64_t m = ((uint64_t)eff_lux * 205887ULL) / (uint64_t)yu;
++	*c0_q16 = (int64_t)(((uint64_t)xu * m) >> 16);
++	*c1_q16 = (int64_t)(((uint64_t)yu * m) >> 16);
++	*c2_q16 = (int64_t)(((uint64_t)zu * m) >> 16);
++	*cct_out = cct;
++}
++
+ class SweetHIDSensor : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDSensor);
+ public:
+@@ -888,6 +1036,7 @@ public:
+ 
+ 	int post(const struct sweet_motion_sample *s, IOHIDEvent **built = NULL);
+ 	void noteReal(void) { OSIncrementAtomic64((volatile SInt64 *)&fReal); }     /* 1099: a sample from sensd/poke */
++	void publishALSProps(void);     /* 1298: crgb, ALSSensorType, Placement, Orientation */
+ 	int status(char *buf, int len);
+ 	void want(struct sweet_motion_want *w);
+ 	void relog();
+@@ -915,6 +1064,8 @@ private:
+ 	uint64_t        fReal;          /* 1099: samples from user space (sensd, poke m) */
+ 	uint64_t        fKeep;          /* 1099: keep-alive samples sent */
+ 	void            keepAliveArm(void);
++	struct sweet_motion_sample fLastReal;   /* 1298: cached real ALS sample for instant wake repost */
++	bool            fHasReal, fWakePending;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
+ 
+@@ -963,6 +1114,7 @@ SweetHIDSensor::start(IOService *provider)
+ 		if (fInitTimer && _hidWorkLoop->addEventSource(fInitTimer) != kIOReturnSuccess) {
+ 			OSSafeReleaseNULL(fInitTimer);
+ 		}
++		publishALSProps();
+ 	}
+ 	setProperty("SweetSensor", info->name);
+ 	if (i == SWEET_SENSOR_PROX) {
+@@ -1022,7 +1174,8 @@ SweetHIDSensor::open(IOService *client, IOOptionBits options, void *context, Act
+ 	if (ok) {
+ 		OSIncrementAtomic((volatile SInt32 *)&fClients);
+ 		if (fInitTimer && fEvents == 0) {
+-			fInitTimer->setTimeoutMS(500);     /* an ALS reading soon after each open, as a real ALS sends */
++			/* 1298: deliver inside CoreBrightness's 250 ms FirstALSSampleTimeout */
++			fInitTimer->setTimeoutMS((sweet_bl_fix & 16) ? 20 : 500);
+ 		}
+ 	}
+ 	IOLog("SWEET MOTION: %s opened by pid %d (%s) options 0x%x -> %d, %u clients\n",
+@@ -1114,16 +1267,23 @@ SweetHIDSensor::setProperties(OSObject *properties)
+ 	if (!it) {
+ 		return kIOReturnNoMemory;
+ 	}
+-	bool armKeep = false;
++	bool armKeep = false, wakeArm = false;
+ 	IOLockLock(fLock);
+ 	while (const OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
+ 		OSObject *value = dict->getObject(key);
+ 		logProperty(key, value, pid, who);
+ 		OSNumber *n = OSDynamicCast(OSNumber, value);
+ 		if (n && key->isEqualTo(kIOHIDReportIntervalKey)) {
+-			fInterval = n->unsigned32BitValue();
++			uint32_t newInt = n->unsigned32BitValue();
++			bool wake = (sensorIndex() == SWEET_SENSOR_ALS) && (sweet_bl_fix & 16) &&
++			    newInt != 0 && (!fIntervalSet || fInterval == 0);
++			fInterval = newInt;
+ 			fIntervalSet = 1;
+ 			armKeep = true;
++			if (wake && fInitTimer) {
++				fWakePending = true;
++				wakeArm = true;
++			}
+ 		}
+ 		/* Keep the sensor settings visible in the registry, as IOHIDEventService does. */
+ 		if (n && (key->isEqualTo(kIOHIDReportIntervalKey) || key->isEqualTo(kIOHIDBatchIntervalKey) ||
+@@ -1134,7 +1294,9 @@ SweetHIDSensor::setProperties(OSObject *properties)
+ 	}
+ 	IOLockUnlock(fLock);
+ 	it->release();
+-	if (armKeep) {
++	if (wakeArm && fInitTimer) {
++		fInitTimer->setTimeoutMS(15);   /* 1298: beat CoreBrightness 250 ms FirstALSSampleTimeout */
++	} else if (armKeep) {
+ 		keepAliveArm();         /* 1099 */
+ 	}
+ 	return kIOReturnSuccess;
+@@ -1148,7 +1310,6 @@ SweetHIDSensor::setProperties(OSObject *properties)
+  * and nothing else; after a backboardd restart it starts with sensd's samples flowing. Log: "SWEET MOTION: als
+  * keep-alive". Stops for good at the first real sample.
+  */
+-extern "C" uint32_t sweet_bl_fix;
+ void
+ SweetHIDSensor::keepAliveArm(void)
+ {
+@@ -1210,13 +1371,58 @@ SweetHIDSensor::initialEvent()
+ 	return event;
+ }
+ 
++void
++SweetHIDSensor::publishALSProps(void)
++{
++	if (sensorIndex() != SWEET_SENSOR_ALS) {
++		return;
++	}
++	setProperty("Placement", 0ULL, 32);
++	setProperty("Orientation", 1ULL, 32);
++	if (sweet_bl_fix & 32) {
++		setProperty("crgb", 1ULL, 32);
++		setProperty("ALSSensorType", 8ULL, 32);
++		IOLog("SWEET MOTION: als True Tone properties published (crgb=1, ALSSensorType=8)\n");
++	} else {
++		if (getProperty("crgb") != NULL) {
++			removeProperty("crgb");
++		}
++		if (getProperty("ALSSensorType") != NULL) {
++			removeProperty("ALSSensorType");
++		}
++	}
++}
++
+ void
+ SweetHIDSensor::initialFired(OSObject *owner, IOTimerEventSource *sender __unused)
+ {
+ 	SweetHIDSensor *self = (SweetHIDSensor *)owner;
++	if (self->sensorIndex() == SWEET_SENSOR_ALS && (sweet_bl_fix & 16)) {
++		struct sweet_motion_sample cached;
++		bool wake_real = false;
++		IOLockLock(self->fLock);
++		if (self->fWakePending) {
++			self->fWakePending = false;
++			if (self->fHasReal) {
++				cached = self->fLastReal;
++				cached.ts_mach = 0;     /* stamp current mach_absolute_time */
++				cached.flags |= SWEET_MOTION_SYNTHETIC;
++				wake_real = true;
++			}
++		}
++		IOLockUnlock(self->fLock);
++		if (wake_real) {
++			IOLog("SWEET MOTION: als wake cached sample (%u clients)\n", self->fClients);
++			self->post(&cached);
++			return;
++		}
++	}
+ 	if (self->fEvents == 0) {
+-		struct sweet_motion_sample s = { 12, 3, 0, { 0x42c80000 /* 100.0f */, 0, 0, 0 } };
+-		IOLog("SWEET MOTION: als: initial 100 lux event (%u clients)\n", self->fClients);
++		/* 1298: neutral 50 lux (0x42480000) when fast-wake is on, else 100 lux (0x42c80000) */
++		uint32_t lux_bits = (sweet_bl_fix & 16) ? 0x42480000u : 0x42c80000u;
++		struct sweet_motion_sample s = { 12, 3, 0, { lux_bits, 0, 0, 0 } };
++		IOLog("SWEET MOTION: als: initial %u lux event (%u clients)\n",
++		    (sweet_bl_fix & 16) ? 50u : 100u, self->fClients);
+ 		self->post(&s);
+ 		self->keepAliveArm();   /* 1099 */
+ 	} else if (self->sensorIndex() == SWEET_SENSOR_ALS && (sweet_bl_fix & 4) && self->fReal == 0 &&
+@@ -1390,16 +1596,46 @@ SweetHIDSensor::post(const struct sweet_motion_sample *s, IOHIDEvent **built)
+ 		break;
+ 	}
+ 	case SWEET_SENSOR_ALS: {
+-		int64_t lux = sweet_f2q(s->v[0], 1, 1, 0), cct = sweet_f2q(s->v[1], 1, 1, 0);
+-		lux = lux < 0 ? 0 : lux;
+-		event = IOHIDEvent::ambientLightSensorEvent(ts, (UInt32)lux, (UInt32)lux);
+-		if (event) {
+-			event->setIntegerValue(kIOHIDEventFieldAmbientLightSensorIlluminance, (SInt32)lux);
+-			if (cct > 0) {
+-				event->setIntegerValue(kIOHIDEventFieldAmbientLightSensorColorTemperature, (SInt32)cct);
++		int64_t lux_q16 = sweet_f2q(s->v[0], 1, 1, 16);
++		if (lux_q16 < 0) {
++			lux_q16 = 0;
++		}
++		int64_t lux = (lux_q16 + 32768) >> 16;
++		if (!built && !synthetic) {
++			IOLockLock(fLock);
++			fLastReal = *s;
++			fHasReal = true;
++			fWakePending = false;
++			IOLockUnlock(fLock);
++		}
++		if (sweet_bl_fix & 32) {
++			int64_t c0_q16, c1_q16, c2_q16, cct;
++			sweet_als_xyz(s, lux_q16, &c0_q16, &c1_q16, &c2_q16, &cct);
++			event = IOHIDEvent::ambientLightSensorEvent(ts, (UInt32)lux,
++			    (UInt8)kIOHIDEventColorSpaceXYZ,
++			    sweet_q2d(c0_q16, 16), sweet_q2d(c1_q16, 16), sweet_q2d(c2_q16, 16), 0);
++			if (event) {
++				event->setDoubleValue(kIOHIDEventFieldAmbientLightSensorIlluminance,
++				    sweet_q2d(lux_q16, 16), 0);
++				if (cct > 0) {
++					event->setDoubleValue(kIOHIDEventFieldAmbientLightSensorColorTemperature,
++					    sweet_q2d(cct, 0), 0);
++				}
+ 			}
++			snprintf(line, sizeof(line), "%lld lux, %lld K, xyz16 %lld/%lld/%lld",
++			    lux, cct, c0_q16 >> 16, c1_q16 >> 16, c2_q16 >> 16);
++		} else {
++			int64_t cct = (s->flags & SWEET_MOTION_ALS_RGB) ? 0 : sweet_f2q(s->v[1], 1, 1, 0);
++			event = IOHIDEvent::ambientLightSensorEvent(ts, (UInt32)lux, (UInt32)lux);
++			if (event) {
++				event->setIntegerValue(kIOHIDEventFieldAmbientLightSensorIlluminance, (SInt32)lux);
++				if (cct > 0) {
++					event->setIntegerValue(kIOHIDEventFieldAmbientLightSensorColorTemperature,
++					    (SInt32)cct);
++				}
++			}
++			snprintf(line, sizeof(line), "%lld lux, %lld K", lux, cct);
+ 		}
+-		snprintf(line, sizeof(line), "%lld lux, %lld K", lux, cct);
+ 		break;
+ 	}
+ 	case SWEET_SENSOR_PROX: {
+@@ -1541,6 +1777,12 @@ sweet_hid_sensor_knob(const char *name, int64_t value)
+ 	} else if (!strcmp(name, "orientauto")) {
+ 		gSweetKnobs.orientauto = value != 0;
+ 		gSweetOrientCur = gSweetOrientCand = 0;
++	} else if (!strcmp(name, "alswr")) {
++		gSweetKnobs.alswr = value > 0 ? (int)value : 1;
++	} else if (!strcmp(name, "alswg")) {
++		gSweetKnobs.alswg = value > 0 ? (int)value : 1;
++	} else if (!strcmp(name, "alswb")) {
++		gSweetKnobs.alswb = value > 0 ? (int)value : 1;
+ 	} else if (!strcmp(name, "logmax")) {
+ 		gSweetKnobs.logmax = (uint32_t)value;
+ 	} else if (!strcmp(name, "every")) {
+@@ -1551,10 +1793,20 @@ sweet_hid_sensor_knob(const char *name, int64_t value)
+ 	return 0;
+ }
+ 
++extern "C" void
++sweet_hid_als_fix_changed(void)
++{
++	if (gSweetSensors[SWEET_SENSOR_ALS]) {
++		gSweetSensors[SWEET_SENSOR_ALS]->publishALSProps();
++	}
++}
++
+ extern "C" void
+ sweet_hid_sensor_knobs_print(void)
+ {
+-	IOLog("SWEET MOTION: knobs accsign %d gyrodeg %d proxmask 0x%x orientbase %d orientauto %d logmax %u every %u\n",
++	IOLog("SWEET MOTION: knobs accsign %d gyrodeg %d proxmask 0x%x orientbase %d orientauto %d "
++	    "alswr %d alswg %d alswb %d logmax %u every %u\n",
+ 	    gSweetKnobs.accsign, gSweetKnobs.gyrodeg, gSweetKnobs.proxmask, gSweetKnobs.orientbase,
+-	    gSweetKnobs.orientauto, gSweetKnobs.logmax, gSweetKnobs.every);
++	    gSweetKnobs.orientauto, gSweetKnobs.alswr, gSweetKnobs.alswg, gSweetKnobs.alswb,
++	    gSweetKnobs.logmax, gSweetKnobs.every);
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetMotion.h b/iokit/Kernel/arm/hid/SweetMotion.h
+index 0d8e789..fef4300 100644
+--- a/iokit/Kernel/arm/hid/SweetMotion.h
++++ b/iokit/Kernel/arm/hid/SweetMotion.h
+@@ -20,6 +20,7 @@ struct sweet_motion_sample {
+ 	uint32_t v[4];
+ };
+ #define SWEET_MOTION_SYNTHETIC	0x80000000u
++#define SWEET_MOTION_ALS_RGB	0x00010000u	/* ALS v[1..3] are TCS3701 R, G, B counts */
+ 
+ enum { SWEET_SENSOR_ACCEL, SWEET_SENSOR_GYRO, SWEET_SENSOR_ALS, SWEET_SENSOR_PROX, SWEET_SENSOR_COMPASS,
+ 	SWEET_SENSOR_PRESSURE, SWEET_SENSOR_ORIENT, SWEET_SENSOR_COUNT };
+@@ -45,6 +46,7 @@ void sweet_hid_sensor_want(struct sweet_motion_want *w);
+ int sweet_hid_sensor_knob(const char *name, int64_t value);
+ void sweet_hid_sensor_knobs_print(void);
+ void sweet_hid_sensor_relog(void);	/* forget which setProperties keys were logged */
++void sweet_hid_als_fix_changed(void);	/* re-publish ALS True Tone properties on kern.sweet_bl_fix change */
+ /* Service index of a motion type, or -1. */
+ int sweet_motion_index(uint32_t type);
+ 
