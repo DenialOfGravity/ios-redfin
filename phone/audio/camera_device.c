@@ -802,7 +802,7 @@ static const struct camera {
 	bool            lens_motor;     /* focus can move (where the kernel says so: the frames' focus) */
 } cameras[3] = {
 	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.38, 1.7, 1.4, 65.6,
-	  { { 4032, 3024, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 4224, 2376, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, true },  /* "Photo", "Video-60" */
+	  { { 4032, 3024, 30, REDWOOD_CAMERA_MODE_PHOTO }, { 4032, 2268, 60, REDWOOD_CAMERA_MODE_VIDEO60 } }, true },  /* "Photo", "Video-60" (16:9 of 4032px IMX363) */
 	/* redfin: the front IMX355's pictures came out upside down untouched (r18g, Camera.app's own thumbnail): turned,
 	 * as HackiOS's phone's was */
 	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.59, 2.0, 1.12, 70.9,
