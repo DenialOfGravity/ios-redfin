@@ -1,6 +1,5 @@
 #!/var/local/bin/dash
 export PATH=/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-[ -f /var/local/bin/sweet-sysctl.sh ] && /var/local/bin/dash /var/local/bin/sweet-sysctl.sh </dev/null >/dev/null 2>&1 &
 n=0; while [ $n -lt 400 ]; do grep -q 'init2 ok' /var/local/fastrpcd.log 2>/dev/null && break; /var/local/bin/toybox sleep 0.25; n=$((n+1)); done
 /var/local/bin/toybox date +%T > /var/local/sensd-probe.log
 /var/local/bin/sensd --list > /var/local/sensd-probe-1.log 2>&1

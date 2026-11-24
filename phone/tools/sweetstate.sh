@@ -114,7 +114,9 @@ ROOTS="/private/var/local=/var/local
 /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver=/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
 /System/Library/xpc=/System/Library/xpc
 /Applications/SweetControl.app=/Applications/SweetControl.app
-$MG=$MG"
+$MG=$MG
+/usr/lib/libBKDM1.dylib=/usr/lib/libBKDM1.dylib
+/System/Library/LaunchDaemons/com.apple.biometrickitd.mesa.plist=/System/Library/LaunchDaemons/com.apple.biometrickitd.mesa.plist"
 # ignored (pruned) dirs under /var/local: scratch area, caches, test output, live modem EFS
 IGN='./scratch ./tmp ./m2v-cache ./hmetal/cache ./hmetal/log ./hmetal/dump ./fw/rmtfs'
 # flag dirs: small text files here are dumped (contents)
@@ -128,6 +130,13 @@ prune_expr() {	# the find arguments that prune the ignored dirs: -path A -o -pat
 echo "$ROOTS" | while IFS='=' read -r real name; do
 	[ -e "$real" ] || { echo "E${TAB}no root $real"; continue; }
 	echo "R${TAB}$name${TAB}$real"
+	if [ -f "$real" ]; then
+		$T stat -c "f|%a|%u|%g|%s|%Y" "$real" 2>/dev/null | while IFS='|' read -r t mo u g sz mt; do
+			echo "F${TAB}$t${TAB}$mo${TAB}$u${TAB}$g${TAB}$sz${TAB}$mt${TAB}."
+		done
+		[ $QUICK = 0 ] && $T sha256sum "$real" 2>/dev/null | while read -r h _; do echo "K${TAB}$h${TAB}."; done
+		continue
+	fi
 	cd "$real" || continue
 	if [ "$name" = /var/local ]; then
 		for d in $IGN; do
