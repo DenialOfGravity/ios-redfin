@@ -13,43 +13,41 @@ Google's own bootloader. Nothing is flashed to the boot chain; the iOS root live
 > switched off (permissive AMFI and sandbox, stub keystore), and many parts are missing. Do not put anything
 > personal on it.
 
-## Status (2026-11-16)
+## Status (2026-11-24)
 
-Booted RAM-only with `fastboot boot`; everything listed here has been run on the phone. Kernel patches up to 1127,
-hakios-metal int14, sweetlocd (GNSS) and SweetControl are merged into `main`.
+Booted RAM-only with `fastboot boot`; everything listed here has been run on the phone. Kernel patches up to `1298`,
+native Metal (`HakiosMetal`), Touch ID (`sweetfpcd` + `biometrickitd`), Venus hardware video decode/encode, Night Shift,
+Auto-Brightness, True Tone, and kernel-driven MPSS/IPA/QRTR modem bring-up are on `main`.
 
 **Working**
 
 | Area | State |
 | --- | --- |
-| Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU, RAM only; nothing flashed |
-| Graphics | CoreAnimation on native Metal (hakios-metal on the Adreno 620): draw culling (GPU time about 1/3 lower), no CPU reads of uncached GPU memory, render-target reuse. App Library blur fixed |
-| Frame rate | While moving, after a restart (90 Hz panel): home pages ~47-53 fps, home ~58-62, Settings ~72-75, Control Centre ~52-56 |
-| Cellular | Calls and SMS. Mobile data works but still needs final integration |
-| Wi-Fi | Joins and stays connected (userland `wland`) |
-| Sensors | Accelerometer |
-| Display | Brightness slider |
-| Charging | USB charging while iOS runs: 900 mA on USB 3 ports with charging control (`kern.sweet_chg`) |
-| Settings | SweetControl app for the port's switches, with pinned settings |
-
-Storage, touch, buttons, sound, microphones, haptics and the rest of the r57a (2026-10-29) baseline carry over.
+| Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU, RAM only; nothing flashed. Early-boot sysctls & scratch cleanup via `sweetearly` |
+| Graphics | CoreAnimation on native Metal (`HakiosMetal` on Adreno 620): draw culling, uncached-read avoidance, render-target reuse, per-plane textures, crash-trip filter, and `IOSurface` GPU/display use-count tracking (`1258`) |
+| Display | 90 Hz panel (`1180–1182` AMP + `SweetCLPC`), multi-layer 2D composition (`1262–1264`, `1294`), brightness slider, **Night Shift** (DSPP PCC `kern.sweet_cm`), **Auto-Brightness** (fast 15 ms wake repost avoiding the 250 ms timeout flash, `1298`), and **True Tone** (`TCS3701` RGB -> CIE XYZ in XNU driving `CoreBrightness`, `1298`) |
+| Hardware video | Venus H.264/HEVC decode & VideoToolbox encode (`venusd`, `vtvenc.dylib` with firmware rate control), `/dev/vmmu` SMMU isolation (`1270`), 2 MB carveout guard (`1268`), per-client RPMh bus votes & TCS completion (`1269`, `1277`) |
+| Cellular | Calls (2-way audio), SMS RX/TX (incl. BlastDoor sandbox fix `1292`), LTE mobile data (`1265` SIM PIN hold, `1266` bind slots, `ipagsi` QMAP), Visual Voicemail (`vmd`), and XNU MPSS/IPA/QRTR/EFS bring-up (`1295–1297`) |
+| Wi-Fi & BT | `wland` Wi-Fi auto-join + RSSI reporting (`1143`) and `btd` / `btd-bridge` Bluetooth |
+| GNSS | `sweetlocd` (`pds=1`, MI-keep unlock, fresh XTRA injection) wired into `locationd` and Maps |
+| Biometrics | Touch ID unlock/matching via `fpc` + `sweetfpcd` bridged to `biometrickitd` (`1195–1256`) |
+| Sensors | Accelerometer, gyroscope, magnetometer/compass, barometer/pressure, proximity, ambient light (lux + RGB), device orientation (`sensd` + `SweetHID`) |
+| Camera | Back (IMX363 12 MP stills & 4K/1080p60 `4032x2268` video) and front (IMX355) via `RedwoodAudio.driver` |
+| Audio & Haptics | Speakers, microphones, haptics (`RedwoodAudio.driver` + ADSP FastRPC) |
+| Charging | USB charging while iOS runs: up to 900 mA on USB 3 ports (`kern.sweet_chg`) |
+| Controls & State | `SweetControl.app` (`sweetctl`) for switches/pinned boot settings; declarative phone manifest in `state/redfin.toml` (`tools/state.py`) |
 
 **Partial / in progress**
 
-- NFC: the chip probe works; iOS's `nfcd` gets through most of its start-up against a kernel persona. No tag reading yet.
-- GNSS: the `sweetlocd` daemon reaches the modem's location service; the engine-lock unlock is under test (switch, off
-  by default). Bridge to locationd / Maps next.
-- Compressed (UBWC) display surfaces: work without errors but are slower, so off by default.
-- Night Shift: the hardware colour-matrix path is built (off by default) but does not work yet.
-- Hardware video decode/encode: power-rail fix in progress.
-- Signal bars: hit or miss.
+- **NFC**: the chip probe and most of `nfcd` start-up run against a kernel persona (`1128–1134`); tag reading is incomplete.
+- **Compressed (UBWC) display surfaces**: supported via `kern.sweet_ubwc_mdss`, off by default.
+- **Camera IFE pixel path**: public `main` uses the baseline capture path; per-mode IFE clock/pixel-path tuning (`1257`) is kept local-only for now.
+- **5G NR / signal bars**: LTE voice, SMS, and data work; 5G NR and deep radio/power edge cases remain untested.
 
-**Not working / not started**
+**Not working / limitations**
 
-Proximity sensor during calls; auto-brightness; gyroscope and compass (likely not working); True Tone (only possible
-if colour channels reach iOS); fingerprint (needs emulation plus Titan M work); camera (semi-working under the old
-Vulkan path, to be verified on native Metal); Wi-Fi auto-join and a scan stall; Bluetooth call audio; sleep / power
-management; 5G (untested). Apple Pay / card emulation is out of scope.
+Deep AP sleep / full power management; Bluetooth call audio (HFP); Wi-Fi scan/roam edge cases; SEP/Titan M hardware
+keychain & FairPlay DRM (`fairplayd` disabled, Apple Pay / card emulation out of scope).
 
 ## How it boots
 
@@ -77,10 +75,10 @@ ABL (Google's bootloader, unlocked)
 
 | Path | What |
 | --- | --- |
-| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 from ios-flame, 0125-0160 from the sunfish series, **0900-1127 for redfin** ([one line per patch](NOTES.md)) |
+| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 from ios-flame, 0125-0160 from the sunfish series, **0900-1298 for redfin** ([one line per patch](NOTES.md)) |
 | `shim/` | The bare-metal shim ABL boots (`shim/build.sh`) |
 | `tools/` | Host tools: ADT and payload, `redfin-boot.sh` (build and boot an image), root image and install scripts for WSL, log pulls, camera tables, GPU and Metal debugging |
-| `phone/` | Code that runs in iOS: `metal2/` + `turnip/` (Metal on Turnip), `audio/` (RedwoodAudio.driver), `wifi/` (wland), `bt/` (btd, bluetool), `fastrpc/` (fastrpcd), `sensors/`, `tools/` (psx, pstack, lsreg, oslog, ...) |
+| `phone/` | Code that runs in iOS: `metal2/` + `turnip/` (HakiosMetal on Adreno), `audio/` (RedwoodAudio.driver), `video/` (`venusd`, `venusctl`, `vtvenc.dylib`), `wifi/` (`wland`), `bt/` (`btd`), `fastrpc/` (`fastrpcd`), `fpc/` (`sweetfpcd`), `gnss/` (`sweetlocd`), `sensors/` (`sensd`), `sweetctl/`, `tools/` (`psx`, `pstack`, `lsreg`, `oslog`, ...) |
 | `.github/workflows/` | CI builds of the kernel, shim, userland and Metal bundle |
 | [`docs/redfin/`](https://github.com/DenialOfGravity/ios-redfin/tree/known-good-r57a-kernel/docs/redfin) | Port plan and hardware map, quality-of-life plan (power, audio, sensors, Bluetooth), direct-scanout plan |
 | [NOTES.md](NOTES.md), [HANDOFF.md](HANDOFF.md) | Hardware facts, Google ABL boot image rules, patch notes; the engineering log |
