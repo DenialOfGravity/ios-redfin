@@ -1,0 +1,22 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1244,10 +1244,15 @@
+ 			printf("SWEET USB: t=%us DCFG %08x DCTL %08x DSTS %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x GCTL %08x GSTS %08x EVCNT %x\n",
+ 			    ticks / 1000, dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(0xc200),
+ 			    dwc_rd(0xc2c0), dwc_rd(GCTL), dwc_rd(0xc118), dwc_rd(GEVNTCOUNT));
+ 			if (ud_smmu_cb) {
+-				printf("SWEET USB: busERR addr %08x%08x; SMMU cb fsr %x far %08x%08x fsynr0 %x fsynr1 %x\n",
+-				    dwc_rd(0xc134), dwc_rd(0xc130), usb_rd(ud_smmu_cb, 0x58),
+-				    usb_rd(ud_smmu_cb, 0x64), usb_rd(ud_smmu_cb, 0x60),
+-				    usb_rd(ud_smmu_cb, 0x68), usb_rd(ud_smmu_cb, 0x6c));
++				uint32_t fsr = usb_rd(ud_smmu_cb, 0x58);
++				uint32_t be_hi = dwc_rd(0xc134), be_lo = dwc_rd(0xc130);
++				/* 0x400 is CBn_FSR.FORMAT (AArch64 CB from CBA2R=1), not a fault bit (0xc00001fe). */
++				if ((be_hi | be_lo) != 0 || (fsr & 0xc00001feu) != 0) {
++					printf("SWEET USB: busERR addr %08x%08x; SMMU cb fsr %x far %08x%08x fsynr0 %x fsynr1 %x\n",
++					    be_hi, be_lo, fsr,
++					    usb_rd(ud_smmu_cb, 0x64), usb_rd(ud_smmu_cb, 0x60),
++					    usb_rd(ud_smmu_cb, 0x68), usb_rd(ud_smmu_cb, 0x6c));
++				}
+ 			}
+ 		}
