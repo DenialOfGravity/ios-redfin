@@ -89,6 +89,17 @@ int link_kernel_svc(void)
 	return v;
 }
 
+int link_kernel_boot(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		v = link_sweetbb_bit(0x08);
+		if (v)
+			printf("wland: kern.sweet_bb & 0x08: the kernel owns modem PAS boot, SMP2P and link bring-up (xnu 1297)\n");
+	}
+	return v;
+}
+
 int link_is_kernel(void)
 {
 	return raw_fd >= 0;
@@ -376,6 +387,20 @@ int link_up(qrtr_cb_t cb, unsigned timeout_ms)
 		}
 	}
 	if (raw_fd >= 0) {
+		if (link_kernel_boot()) {
+			uint64_t end = now_ms() + (timeout_ms ? timeout_ms : 5000);
+			int st = 0;
+			do {
+				size_t n = sizeof(st);
+				if (!sysctlbyname("kern.sweet_mdm_up", &st, &n, NULL, 0) && st == 2) {
+					printf("glink: IPCRTR open (kernel link, %s, passive)\n", MQRTR_DEV);
+					return 0;
+				}
+				delay_ms(50);
+			} while (now_ms() < end);
+			printf("link: kernel link: IPCRTR not open (kern.sweet_mdm_up=%d)\n", st);
+			return -1;
+		}
 		uint32_t ms = timeout_ms;
 		if (ioctl(raw_fd, MQRTR_IOC_UP, &ms)) {
 			printf("link: kernel link: IPCRTR not open (%s)\n", strerror(errno));

@@ -973,7 +973,8 @@ static void net_idle(void)
 		drop_asked = 0;
 		radio_disconnect();
 	}
-	smp2p_service();
+	if (!link_kernel_boot())
+		smp2p_service();
 	radio_poll();
 	ipnet_poll();
 	bridge_poll();
@@ -1035,13 +1036,50 @@ static int net(unsigned secs)
 	return 0;
 }
 
+static int wait_kernel_modem(unsigned max_secs)
+{
+	uint64_t t0 = link_ms(), end = t0 + (uint64_t)max_secs * 1000;
+	int last_b = -999, last_u = -999;
+	for (;;) {
+		int b = 0, u = 0;
+		size_t nb = sizeof(b), nu = sizeof(u);
+		if (sysctlbyname("kern.sweet_mdm_boot", &b, &nb, NULL, 0))
+			b = 0;
+		if (sysctlbyname("kern.sweet_mdm_up", &u, &nu, NULL, 0))
+			u = 0;
+		if (b != last_b || u != last_u) {
+			printf("[%6llu] wland: waiting for kernel modem boot (boot=%d up=%d)\n",
+			       (unsigned long long)link_ms(), b, u);
+			last_b = b;
+			last_u = u;
+		}
+		if (b < 0) {
+			printf("wland: kernel modem boot failed (%d)\n", b);
+			return -1;
+		}
+		if (b >= 2 && u == 2)
+			return 0;
+		if (link_ms() >= end) {
+			printf("wland: timed out waiting for kernel modem boot (boot=%d up=%d)\n", b, u);
+			return -1;
+		}
+		usleep(200000);
+	}
+}
+
 /* everything `up` does, from a fresh boot */
 static int up(unsigned secs)
 {
 	if (smmu_wlan_identity())
 		printf("up: no WLAN SMMU stream: the radio will not start\n");
-	if (wlan_power() || smp2p_create() || boot_modem())
+	if (wlan_power())
 		return 1;
+	if (link_kernel_boot()) {
+		if (wait_kernel_modem(90))
+			return 1;
+	} else if (smp2p_create() || boot_modem()) {
+		return 1;
+	}
 	return net(secs) ? 1 : 0;
 }
 
@@ -1478,6 +1516,11 @@ static void ipa_auto_poll(void)
 {
 	if (ia_state == IA_END)
 		return;
+	if (link_kernel_boot() && link_kernel_data()) {
+		printf("ipa: auto: kernel owns modem+IPA boot (kern.sweet_bb & 0x18); skipping wland IPA bring-up\n");
+		ia_state = IA_END;
+		return;
+	}
 	uint64_t now = link_ms();
 	if (!ia_first)
 		ia_first = now ? now : 1;

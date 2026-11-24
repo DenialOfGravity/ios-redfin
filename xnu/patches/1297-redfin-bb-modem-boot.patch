@@ -1,0 +1,1359 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -147,6 +147,7 @@
+ bsd/dev/sweet_ssr.c			standard
+ bsd/dev/sweet_ipa.c			standard
+ bsd/dev/sweet_efs.c			standard
++bsd/dev/sweet_mpss.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_abp.c b/bsd/dev/sweet_abp.c
+--- a/bsd/dev/sweet_abp.c
++++ b/bsd/dev/sweet_abp.c
+@@ -444,6 +444,10 @@
+ {
+ 	uint32_t on = 0, fake = 0;
+ 	sweet_bb_init();        /* 1067: boot-arg sweetbb (kernel modem link / QMI router), before the bridge is made */
++	if ((sweet_bb & SBB_BOOT) && sweet_abp_readyms == 0) {
++		/* Phase 1: MPSS & ABP start before sweet-sysctl.sh (~95s); arm ABM reset settle early for first CommCenter. */
++		sweet_abp_readyms = 2000;
++	}
+ 	PE_parse_boot_argn("sweetabp", &on, sizeof(on));
+ 	PE_parse_boot_argn("sweetabmfake", &fake, sizeof(fake));
+ 	PE_parse_boot_argn("sweetabpstage", &sweet_abp_bootstage, sizeof(sweet_abp_bootstage));
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -162,7 +162,7 @@
+ 
+ static LCK_GRP_DECLARE(adsp_lock_group, "redwood-adsp");
+ /* (redwood_wifi.c's locks; on redfin the modem's Wi-Fi runs in userland, phone/wifi, which opens the AOP mailbox once at its start) */
+-static LCK_MTX_DECLARE(redwood_aop_mailbox_lock, &adsp_lock_group);
++LCK_MTX_DECLARE(redwood_aop_mailbox_lock, &adsp_lock_group);        /* (Phase 1: sweet_mpss.c uses QMP under it too) */
+ LCK_MTX_DECLARE(redwood_smem_alloc_lock, &adsp_lock_group);   /* (1067: sweet_bb.c allocates under it too) */
+ 
+ #define STEPS                   11
+diff --git a/bsd/dev/sweet_bb.c b/bsd/dev/sweet_bb.c
+--- a/bsd/dev/sweet_bb.c
++++ b/bsd/dev/sweet_bb.c
+@@ -1614,6 +1614,9 @@
+ 	if (cmd != MQRTR_IOC_UP) {
+ 		return ENOTTY;
+ 	}
++	if ((sweet_bb & SBB_BOOT) && gl.state == 2) {
++		return 0;               /* Phase 1: kernel owns boot/link; do not tear down a live IPCRTR session */
++	}
+ 	uint32_t ms = *(uint32_t *)(void *)data;
+ 	return link_reinit(ms > 30000 ? 30000 : ms, "MQRTR_IOC_UP");
+ }
+@@ -2385,6 +2388,47 @@
+ 	return sbb_qrtr_send(SBB_QRTR_DATA, src_port, dst_node, dst_port, data, len);
+ }
+ 
++int
++sbb_smem_alloc(unsigned item, uint32_t size, vm_offset_t *va)
++{
++	lck_mtx_lock(&ml_lock);
++	bool mapped = regs_map();
++	lck_mtx_unlock(&ml_lock);
++	if (!mapped) {
++		return -1;
++	}
++	return smem_alloc(item, size, va);
++}
++
++int
++sbb_smem_get_va(unsigned item, vm_offset_t *va, uint32_t *size)
++{
++	lck_mtx_lock(&ml_lock);
++	bool mapped = regs_map();
++	lck_mtx_unlock(&ml_lock);
++	if (!mapped) {
++		return -1;
++	}
++	return smem_get(item, va, size);
++}
++
++void
++sbb_ipcc_send(uint32_t id)
++{
++	lck_mtx_lock(&ml_lock);
++	bool mapped = regs_map();
++	lck_mtx_unlock(&ml_lock);
++	if (mapped) {
++		wr32(ipcc_va + IPCC_SEND_ID, id);
++	}
++}
++
++int
++sbb_link_up_now(uint32_t timeout_ms, const char *why)
++{
++	return link_reinit(timeout_ms, why);
++}
++
+ void
+ sbb_efs_resume_tx(uint32_t dst_port, uint32_t peer_node, uint32_t peer_port)
+ {
+@@ -2405,15 +2449,15 @@
+ 	thread_t th;
+ 	sweet_ssr_init();                       /* 1070: modem crash reason + SSCTL notices (own boot-args, own thread) */
+ 	PE_parse_boot_argn("sweetbb", &v, sizeof(v));
+-	if (v & (SBB_QMUX | SBB_SVC | SBB_DATA)) { /* 1076/Phase3: kernel router, services and IPA need the kernel link */
++	if (v & (SBB_QMUX | SBB_SVC | SBB_BOOT | SBB_DATA)) { /* Phase 1/3/1076: kernel router, services, boot and IPA need the kernel link */
+ 		v |= SBB_LINK;
+ 	}
+ 	sweet_bb = v;
+ 	if (!v) {
+ 		return;
+ 	}
+-	SAY("sweetbb=0x%x: modem link=%s qmux=%s svc=%s%s\n", v, (v & SBB_LINK) ? "kernel" : "wland",
+-	    (v & SBB_QMUX) ? "kernel" : "wland", (v & SBB_SVC) ? "kernel" : "wland",
++	SAY("sweetbb=0x%x: modem link=%s qmux=%s svc=%s boot=%s%s\n", v, (v & SBB_LINK) ? "kernel" : "wland",
++	    (v & SBB_QMUX) ? "kernel" : "wland", (v & SBB_SVC) ? "kernel" : "wland", (v & SBB_BOOT) ? "kernel" : "wland",
+ 	    (v & ~SBB_BITS) ? " (later-phase bits ignored by this kernel)" : "");
+ 	int major = cdevsw_add(-1, &mq_cdevsw);
+ 	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "sweet-mqrtr");
+@@ -2441,7 +2485,10 @@
+ 			sweet_efs_init();       /* Phase 3: pd-mapper, rmtfs and tftp services on sweetefs thread */
+ 		}
+ 		if (v & SBB_DATA) {
+-			sweet_ipa_init();       /* 1076: kernel IPA data path (its own thread; nothing mapped until wland's handoff) */
++			sweet_ipa_init();       /* 1076: kernel IPA data path (its own thread) */
++		}
++		if (v & SBB_BOOT) {
++			sweet_mpss_init();      /* Phase 1: kernel MPSS PAS boot, SMP2P, GLINK auto-up, autonomous IPA bring-up */
+ 		}
+ 	} else {
+ 		SAY("no thread: nothing will move\n");
+diff --git a/bsd/dev/sweet_bb.h b/bsd/dev/sweet_bb.h
+--- a/bsd/dev/sweet_bb.h
++++ b/bsd/dev/sweet_bb.h
+@@ -13,9 +13,10 @@
+ #define SBB_DATA                0x10u   /* 1075 pdp_ip0..7 + 1076 kernel IPA data path (sweet_ipa.c; implies SBB_LINK) */
+ #define SBB_QMUX                0x02u   /* kernel QMI router behind qmux1/qmux2 (needs SBB_LINK and sweetabp & 1) */
+ #define SBB_SVC                 0x04u   /* Phase 3: kernel pd-mapper, rmtfs and tftp services (implies SBB_LINK) */
++#define SBB_BOOT                0x08u   /* Phase 1: kernel MPSS PAS boot, SMP2P, GLINK auto-up, autonomous IPA bring-up */
+ #define SBB_REALBOOT            0x40u   /* 1071 (P4 phase 2b): ABM's real baseband boot against an emulated Mav17 BHI/Sahara
+ 					 * target (pipes pbl/sahara, images discarded); the shouldBoot=0 page patch is off */
+-#define SBB_BITS                0x57u   /* bits this kernel implements (others are later phases: accepted, ignored) */
++#define SBB_BITS                0x5fu   /* bits this kernel implements */
+ 
+ #define SBB_NODE_MODEM          0u
+ #define SBB_NODE_APPS           1u
+@@ -101,6 +102,15 @@
+ int sbb_efs_reply(uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *data, uint32_t len);
+ void sbb_efs_resume_tx(uint32_t dst_port, uint32_t peer_node, uint32_t peer_port);
+ 
++/* sweet_bb.c helpers for sweet_mpss.c */
++int sbb_smem_alloc(unsigned item, uint32_t size, vm_offset_t *va);
++int sbb_smem_get_va(unsigned item, vm_offset_t *va, uint32_t *size);
++void sbb_ipcc_send(uint32_t id);
++int sbb_link_up_now(uint32_t timeout_ms, const char *why);
++
++/* sweet_mpss.c */
++void sweet_mpss_init(void);
++
+ /* sweet_efs.c */
+ void sweet_efs_init(void);
+ void sweet_efs_wake(void);
+diff --git a/bsd/dev/sweet_ipa.c b/bsd/dev/sweet_ipa.c
+--- a/bsd/dev/sweet_ipa.c
++++ b/bsd/dev/sweet_ipa.c
+@@ -1837,22 +1837,13 @@
+ 
+ /* ---- sysctls ---- */
+ 
+-static int
+-sysctl_ipa_up SYSCTL_HANDLER_ARGS
++int
++sweet_ipa_boot(int phase)
+ {
+-#pragma unused(oidp, arg1, arg2)
+-	int v = ipa_state, changed = 0;
+-	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+-	if (e || !changed) {
+-		return e;
+-	}
+-	if (proc_suser(req->p) != 0) {
+-		return EPERM;
+-	}
+ 	if (!started) {
+ 		return ENXIO;
+ 	}
+-	if (v == 1) {
++	if (phase == 1) {
+ 		if (ipa_state != 0) {
+ 			return EALREADY;
+ 		}
+@@ -1871,7 +1862,7 @@
+ 		lck_mtx_unlock(&ipa_lock);
+ 		return r == 0 ? 0 : EIO;
+ 	}
+-	if (v == 2) {
++	if (phase == 2) {
+ 		if (ipa_state != 1) {
+ 			return EINVAL;
+ 		}
+@@ -1884,6 +1875,32 @@
+ 	}
+ 	return EINVAL;
+ }
++
++void
++sweet_ipa_status(int *state_out, int *drv_out)
++{
++	if (state_out != NULL) {
++		*state_out = ipa_state;
++	}
++	if (drv_out != NULL) {
++		*drv_out = ipa_drv;
++	}
++}
++
++static int
++sysctl_ipa_up SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = ipa_state, changed = 0;
++	int e = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	return sweet_ipa_boot(v);
++}
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_up, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_ipa_up, "I",
+     "redfin 1076: wland's IPA handoff: write 1 after IP0/PAS/SMMU (kernel meminit), 2 after SMP2P ipa=3 (kernel QMI); reads the state");
+ 
+diff --git a/bsd/dev/sweet_ipa.h b/bsd/dev/sweet_ipa.h
+--- a/bsd/dev/sweet_ipa.h
++++ b/bsd/dev/sweet_ipa.h
+@@ -28,5 +28,7 @@
+  * 0 = unknown) for the keep-alive. Arms the RX join like the first packet does; up 0 forgets the mux's gateway (1080).
+  * Called by the QMI router (sweet_qmux.c, 1080) when CommCenter's calls come and go. */
+ void sweet_ipa_call(uint32_t mux, int up, uint32_t gw);
++int sweet_ipa_boot(int phase);          /* Phase 1: in-kernel trigger identical to sysctl kern.sweet_ipa_up */
++void sweet_ipa_status(int *state_out, int *drv_out);
+ __END_DECLS
+ #endif
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/bsd/dev/sweet_mpss.c
+@@ -0,0 +1,1033 @@
++/*
++ * redfin Phase 1 (1297): kernel-owned MPSS PAS boot, SMP2P ("master-kernel" / "ipa" / SSR ack),
++ * AOSS QMP load_state, GLINK/QRTR link auto-up, and autonomous IPA v4.7 PAS/SMMU/QMI bring-up.
++ *
++ * Enabled by boot-arg sweetbb & SBB_BOOT (0x08; implies SBB_LINK).
++ * Runs on kernel thread "sweetmpss" so VFS firmware reads and TrustZone SMCs never stall boot
++ * or the sweetbb GLINK pump. Zero userland daemon dependency: works with sweetwifi=0 or
++ * /var/local/wland.off. Leave /private/var/local/mpss.off to skip kernel modem boot.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/mount.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_types.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include "sweet_bb.h"
++#include "sweet_ipa.h"
++
++extern void sweet_smc(uint64_t x[8]);
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++extern int sweet_rpmh_arc_top(const char *res, uint32_t *top_out);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern lck_mtx_t redwood_aop_mailbox_lock;
++
++#define MPSS_SAY(fmt, ...)      printf("SWEET MPSS: " fmt, ##__VA_ARGS__)
++
++/* ---- Hardware addresses & constants (wland.c / ipcc.h / ipa.c / radio.c) ---- */
++
++#define FW_MODEM_DIR            "/private/var/local/fw/modem"
++#define FW_IPA_DIR              "/private/var/local/fw/ipa"
++#define MPSS_OFF_FLAG           "/private/var/local/mpss.off"
++
++#define PAS_MODEM               4u
++#define MPSS_PA                 0x8c000000ULL   /* lito-redbull-memory.dtsi modem_wlan_mem */
++#define MPSS_SIZE               0x11800000ULL
++
++#define PAS_IPA                 15u
++#define IPA_FW_PA               0x8bc00000ULL   /* lito.dtsi pil_ipa_fw_mem */
++#define IPA_FW_SIZE             0x10000ULL
++
++#define IPA_REG_PA              0x01e40000UL
++#define IPA_COMP_HW_VERSION     0x030u
++#define IPA_SID_AP              0x520u
++#define IPA_SID_UC              0x522u
++
++#define SMMU_PA                 0x15000000UL
++#define SMMU_SIZE               0x100000ULL
++#define CB_CBAR                 0x0001f000u
++#define CB_CBA2R                0x00000001u
++#define CB_SCTLR                0x000000e0u
++
++#define DB_AOSS                 ((0u << 16) | 0u)
++#define DB_MODEM_SMP2P          ((2u << 16) | 2u)
++
++#define SMP2P_OUT               428u
++#define SMP2P_IN                435u
++#define SMP2P_MAGIC             0x504d5324u
++
++#define QMP_RAM_PA              0x0c300000UL
++#define QMP_UP                  0x0000ffffu
++
++#define SCM_PIL(cmd)            (0x42000000ULL | (2ULL << 8) | (uint64_t)(cmd))
++#define CO_WIN_SIZE             0x200000ULL
++#define SEG_BOUNCE_SIZE         (256u * 1024u)
++
++/* ---- State & sysctls ---- */
++
++static LCK_GRP_DECLARE(mpss_grp, "sweet_mpss");
++static LCK_MTX_DECLARE(mpss_lock, &mpss_grp);
++
++static int mdm_boot_state;      /* 0 off/idle, 1 booting, 2 modem ready, 3 link+IPA ready, <0 failed */
++static uint32_t vote_cx, vote_mss;
++static uint64_t mpss_bytes, ipa_bytes, boot_ms;
++static uint32_t smp2p_last_mdm = 0xffffffffu;
++static uint32_t smp2p_last_ipa_in = 0xffffffffu;
++static bool ipa_fws_ok, ipa_smmu_ok, ipa_ready_ok;
++static int ipa_last_st, ipa_last_drv;
++static vm_offset_t qmp_va;
++
++static int
++sysctl_mdm_boot SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = mdm_boot_state;
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mdm_boot, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_mdm_boot, "I",
++    "redfin Phase 1: kernel modem boot state (0 idle, 1 booting, 2 modem ready, 3 IPCRTR+IPA done, <0 error)");
++
++static int
++sysctl_mpss_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[512];
++	int n = snprintf(buf, sizeof(buf),
++	    "boot %d (ms %llu) | cx[%u] mss[%u] | mpss %llu B | ipa_fws %d smmu %d ipa_ready %d (st %d drv %d, %llu B) | smp2p mdm=%#x ipa_in=%#x",
++	    mdm_boot_state, (unsigned long long)boot_ms, vote_cx, vote_mss, (unsigned long long)mpss_bytes,
++	    ipa_fws_ok ? 1 : 0, ipa_smmu_ok ? 1 : 0, ipa_ready_ok ? 1 : 0, ipa_last_st, ipa_last_drv,
++	    (unsigned long long)ipa_bytes, smp2p_last_mdm, smp2p_last_ipa_in);
++	return SYSCTL_OUT(req, buf, (size_t)n + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mpss_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_mpss_stats, "A",
++    "redfin Phase 1: kernel MPSS + IPA PAS boot status and counters");
++
++/* ---- Helpers ---- */
++
++static inline uint32_t
++rd32(vm_offset_t va)
++{
++	return *(volatile uint32_t *)va;
++}
++
++static inline void
++wr32(vm_offset_t va, uint32_t v)
++{
++	*(volatile uint32_t *)va = v;
++}
++
++static inline void
++settle(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	struct timespec ts = {
++		.tv_sec = ms / 1000u,
++		.tv_nsec = (long)(ms % 1000u) * 1000000L,
++	};
++	lck_mtx_lock(&mpss_lock);
++	(void)msleep(&mdm_boot_state, &mpss_lock, PZERO, "sweetmpss", &ts);
++	lck_mtx_unlock(&mpss_lock);
++}
++
++static int
++rpmh_write_retry(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values)
++{
++	int e = EBUSY;
++	for (unsigned k = 0; k < 50 && e == EBUSY; k++) {
++		e = sweet_rpmh_write(res, n, offsets, values);
++		if (e == EBUSY) {
++			sleep_ms(2);
++		}
++	}
++	return e;
++}
++
++static bool
++vfs_exists(const char *path)
++{
++	if (rootvnode == NULLVP) {
++		return false;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
++static uint8_t *
++vfs_slurp(const char *path, size_t max_len, size_t *len_out)
++{
++	if (rootvnode == NULLVP) {
++		return NULL;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return NULL;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size == 0 || va.va_data_size > max_len) {
++		vnode_put(vp);
++		return NULL;
++	}
++	size_t sz = (size_t)va.va_data_size;
++	uint8_t *buf = kalloc_data(sz, Z_WAITOK);
++	if (buf == NULL) {
++		vnode_put(vp);
++		return NULL;
++	}
++	int resid = 0;
++	int err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)sz, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (err != 0 || resid != 0) {
++		kfree_data(buf, sz);
++		return NULL;
++	}
++	*len_out = sz;
++	return buf;
++}
++
++/* ---- SMP2P (items 428 out, 435 in) ---- */
++
++static void
++wr_name(vm_offset_t va, const char *name)
++{
++	char n[16];
++	bzero(n, sizeof(n));
++	strlcpy(n, name, sizeof(n));
++	for (unsigned i = 0; i < 16; i += 4) {
++		uint32_t w;
++		memcpy(&w, n + i, 4);
++		wr32(va + i, w);
++	}
++}
++
++static void
++rd_name(vm_offset_t va, char name[17])
++{
++	for (unsigned k = 0; k < 16; k++) {
++		name[k] = (char)(rd32(va + (k & ~3u)) >> (8u * (k & 3u)));
++	}
++	name[16] = 0;
++}
++
++static int
++smp2p_create(void)
++{
++	vm_offset_t pa = 0;
++	if (sbb_smem_alloc(SMP2P_OUT, 20u + 16u * 20u, &pa) != 0) {
++		MPSS_SAY("smp2p: cannot allocate item %u\n", SMP2P_OUT);
++		return -1;
++	}
++	if (rd32(pa) != SMP2P_MAGIC) {
++		wr32(pa + 8, 0u | (1u << 16));          /* local pid 0 (APPS), remote pid 1 (MODEM) */
++		wr32(pa + 12, 16u | (1u << 16));        /* total 16 entries, 1 valid */
++		wr32(pa + 16, 0u);                      /* flags */
++		wr_name(pa + 20, "master-kernel");
++		wr32(pa + 36, 0u);
++		wr32(pa + 0, SMP2P_MAGIC);              /* "$SMP" */
++		settle();
++		wr32(pa + 4, 1u | (1u << 8));           /* version 1 last, features: SSR ack */
++		settle();
++	}
++	sbb_ipcc_send(DB_MODEM_SMP2P);
++	MPSS_SAY("smp2p: outbound item %u ready, modem kicked\n", SMP2P_OUT);
++	return 0;
++}
++
++static int
++smp2p_set_out(const char *name, uint32_t val)
++{
++	vm_offset_t pa = 0;
++	uint32_t sz = 0;
++	if (sbb_smem_get_va(SMP2P_OUT, &pa, &sz) != 0 || sz < 20u || rd32(pa) != SMP2P_MAGIC) {
++		MPSS_SAY("smp2p: no outbound item %u\n", SMP2P_OUT);
++		return -1;
++	}
++	uint32_t w = rd32(pa + 12), tot = w & 0xffffu, valid = w >> 16;
++	int idx = -1;
++	for (uint32_t i = 0; i < valid && i < 16u; i++) {
++		char nm[17];
++		rd_name(pa + 20u + 20u * i, nm);
++		if (strcmp(nm, name) == 0) {
++			idx = (int)i;
++			break;
++		}
++	}
++	if (idx < 0) {
++		if (valid >= tot || valid >= 16u) {
++			MPSS_SAY("smp2p: no free outbound entry for %s (%u/%u)\n", name, valid, tot);
++			return -1;
++		}
++		idx = (int)valid;
++		wr_name(pa + 20u + 20u * (uint32_t)idx, name);
++		wr32(pa + 20u + 20u * (uint32_t)idx + 16u, 0u);
++		settle();
++		wr32(pa + 12, tot | ((valid + 1u) << 16));
++		settle();
++		sbb_ipcc_send(DB_MODEM_SMP2P);
++	}
++	vm_offset_t va = pa + 20u + 20u * (uint32_t)idx + 16u;
++	uint32_t prev = rd32(va);
++	wr32(va, val);
++	settle();
++	sbb_ipcc_send(DB_MODEM_SMP2P);
++	MPSS_SAY("smp2p: out \"%s\" %#x -> %#x\n", name, prev, val);
++	return 0;
++}
++
++static int
++smp2p_in_entry(const char *name, vm_offset_t *va)
++{
++	vm_offset_t pa = 0;
++	uint32_t sz = 0;
++	if (sbb_smem_get_va(SMP2P_IN, &pa, &sz) != 0 || sz < 20u) {
++		return -1;
++	}
++	uint32_t n = rd32(pa + 12) >> 16;
++	for (uint32_t i = 0; i < n && i < 16u; i++) {
++		vm_offset_t e = pa + 20u + 20u * i;
++		char nm[17];
++		rd_name(e, nm);
++		if (strcmp(nm, name) == 0) {
++			*va = e + 16u;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++smp2p_in_value(const char *name, uint32_t *v)
++{
++	vm_offset_t va = 0;
++	if (smp2p_in_entry(name, &va) != 0) {
++		return -1;
++	}
++	*v = rd32(va);
++	return 0;
++}
++
++static void
++smp2p_service(void)
++{
++	vm_offset_t out_pa = 0, in_pa = 0;
++	uint32_t sz = 0, v = 0;
++	if (sbb_smem_get_va(SMP2P_OUT, &out_pa, &sz) != 0 || sz < 20u) {
++		return;
++	}
++	if (sbb_smem_get_va(SMP2P_IN, &in_pa, &sz) == 0 && sz >= 20u) {
++		uint32_t want = (rd32(in_pa + 16) & 1u) ? 2u : 0u;
++		uint32_t cur = rd32(out_pa + 16);
++		if ((cur & 2u) != want) {
++			wr32(out_pa + 16, (cur & ~2u) | want);
++			settle();
++			sbb_ipcc_send(DB_MODEM_SMP2P);
++			MPSS_SAY("smp2p: restart %s\n", want ? "acked" : "ack cleared");
++		}
++	}
++	if (smp2p_in_value("slave-kernel", &v) == 0 && v != smp2p_last_mdm) {
++		MPSS_SAY("smp2p: modem state %#x%s%s%s%s\n", v,
++		    (v & 1u) ? " ERR-FATAL" : "", (v & 2u) ? " ready" : "",
++		    (v & 4u) ? " handover" : "", (v & 8u) ? " stop-ack" : "");
++		smp2p_last_mdm = v;
++	}
++	if (smp2p_in_value("ipa", &v) == 0 && v != smp2p_last_ipa_in) {
++		MPSS_SAY("smp2p: in \"ipa\" %#x -> %#x\n", smp2p_last_ipa_in, v);
++		smp2p_last_ipa_in = v;
++	}
++}
++
++/* ---- AOSS QMP ---- */
++
++static int
++qmp_wait_eq(uint32_t off, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10u; i++) {
++		if (rd32(qmp_va + off) == want) {
++			return 0;
++		}
++		delay(100);
++	}
++	return rd32(qmp_va + off) == want ? 0 : -1;
++}
++
++static int
++qmp_send(const char *msg)
++{
++	int rc = -1;
++	if (qmp_va == 0) {
++		qmp_va = ml_io_map(QMP_RAM_PA, 0x1000);
++		if (qmp_va == 0) {
++			return -1;
++		}
++	}
++	lck_mtx_lock(&redwood_aop_mailbox_lock);
++	if (rd32(qmp_va) != 0x4d41494cu || rd32(qmp_va + 4) != 1u) {
++		MPSS_SAY("qmp: bad magic %08x ver %u\n", rd32(qmp_va), rd32(qmp_va + 4));
++		goto out;
++	}
++	if (!(rd32(qmp_va + 0x24) == QMP_UP && rd32(qmp_va + 0x28) == QMP_UP &&
++	      rd32(qmp_va + 0x2c) == QMP_UP && rd32(qmp_va + 0x14) == QMP_UP &&
++	      rd32(qmp_va + 0x30) == QMP_UP)) {
++		wr32(qmp_va + 0x10, rd32(qmp_va + 0x0c));
++		wr32(qmp_va + 0x24, QMP_UP);
++		settle();
++		sbb_ipcc_send(DB_AOSS);
++		if (qmp_wait_eq(0x28, QMP_UP, 1000) != 0) {
++			MPSS_SAY("qmp: link not acked\n");
++			goto out;
++		}
++		wr32(qmp_va + 0x2c, QMP_UP);
++		settle();
++		sbb_ipcc_send(DB_AOSS);
++		if (qmp_wait_eq(0x14, QMP_UP, 1000) != 0) {
++			MPSS_SAY("qmp: ucore channel not up\n");
++			goto out;
++		}
++		wr32(qmp_va + 0x18, QMP_UP);
++		settle();
++		sbb_ipcc_send(DB_AOSS);
++		if (qmp_wait_eq(0x30, QMP_UP, 1000) != 0) {
++			MPSS_SAY("qmp: mcore channel not acked\n");
++			goto out;
++		}
++	}
++	uint32_t off = rd32(qmp_va + 0x38);
++	if (off < 0x3c || off + 68u > 0x1000u || (off & 3u) || rd32(qmp_va + off) != 0u) {
++		MPSS_SAY("qmp: mailbox busy or bad off %#x\n", off);
++		goto out;
++	}
++	uint32_t words[16];
++	bzero(words, sizeof(words));
++	strlcpy((char *)words, msg, sizeof(words));
++	for (unsigned i = 0; i < 16u; i++) {
++		wr32(qmp_va + off + 4u + 4u * i, words[i]);
++	}
++	wr32(qmp_va + off, sizeof(words));
++	(void)rd32(qmp_va + off);
++	sbb_ipcc_send(DB_AOSS);
++	rc = qmp_wait_eq(off, 0u, 1000);
++	MPSS_SAY("qmp: \"%s\" -> %s\n", msg, rc ? "TIMEOUT" : "acked");
++out:
++	lck_mtx_unlock(&redwood_aop_mailbox_lock);
++	return rc;
++}
++
++/* ---- Generic PAS Loader (MPSS + IPA) ---- */
++
++struct elf_phdr32 {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++struct co_win {
++	uint64_t win;
++	vm_offset_t va;
++};
++
++static int64_t
++pas_scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	uint64_t x[8] = { SCM_PIL(cmd), arginfo, a, b, c, 0, 0, 0 };
++	sweet_smc(x);
++	if (r1 != NULL) {
++		*r1 = x[1];
++	}
++	return (int64_t)x[0];
++}
++
++static void
++co_close(struct co_win *cm)
++{
++	if (cm->va != 0) {
++		settle();
++		ml_io_unmap(cm->va, CO_WIN_SIZE);
++		cm->va = 0;
++		cm->win = 0;
++	}
++}
++
++static vm_offset_t
++co_ptr(struct co_win *cm, uint64_t pa)
++{
++	uint64_t win = pa & ~(CO_WIN_SIZE - 1ULL);
++	if (cm->va == 0 || cm->win != win) {
++		co_close(cm);
++		cm->va = ml_io_map_unmappable((vm_offset_t)win, CO_WIN_SIZE, VM_WIMG_IO);
++		if (cm->va == 0) {
++			return 0;
++		}
++		cm->win = win;
++	}
++	return cm->va + (vm_offset_t)(pa - win);
++}
++
++static int
++co_write_words(struct co_win *cm, uint64_t pa, const uint8_t *src, uint32_t len, uint32_t total_padded)
++{
++	if (pa & 3ULL) {
++		return -1;
++	}
++	uint32_t off = 0;
++	while (off < total_padded) {
++		uint64_t cur = pa + off;
++		uint32_t in_win = (uint32_t)(CO_WIN_SIZE - (cur & (CO_WIN_SIZE - 1ULL)));
++		uint32_t chunk = total_padded - off;
++		if (chunk > in_win) {
++			chunk = in_win;
++		}
++		vm_offset_t dst = co_ptr(cm, cur);
++		if (dst == 0) {
++			return -1;
++		}
++		volatile uint32_t *p = (volatile uint32_t *)dst;
++		for (uint32_t i = 0; i < chunk; i += 4u) {
++			uint32_t w = 0;
++			uint32_t abs_o = off + i;
++			if (src != NULL && abs_o < len) {
++				uint32_t rem = len - abs_o;
++				if (rem >= 4u) {
++					memcpy(&w, src + abs_o, 4);
++				} else {
++					memcpy(&w, src + abs_o, rem);
++				}
++			}
++			p[i / 4u] = w;
++		}
++		off += chunk;
++	}
++	return 0;
++}
++
++static int
++pas_load(uint32_t pas, const char *dir, const char *name, uint64_t rpa, uint64_t rsize, bool is_modem, uint64_t *bytes_out)
++{
++	char path[128];
++	size_t mlen = 0;
++	snprintf(path, sizeof(path), "%s/%s.mdt", dir, name);
++	uint8_t *mdt = vfs_slurp(path, 256u * 1024u, &mlen);
++	if (mdt == NULL || mlen < 0x34u) {
++		MPSS_SAY("pas %u: missing/bad %s\n", pas, path);
++		if (mdt != NULL) {
++			kfree_data(mdt, mlen);
++		}
++		return -1;
++	}
++	uint32_t phoff = 0;
++	uint16_t phnum = 0;
++	memcpy(&phoff, mdt + 0x1c, 4);
++	memcpy(&phnum, mdt + 0x2c, 2);
++	if (mdt[0] != 0x7f || mdt[1] != 'E' || mdt[2] != 'L' || mdt[3] != 'F' || mdt[4] != 1 ||
++	    phnum == 0 || phnum > 64u || (uint64_t)phoff + 32ULL * phnum > mlen) {
++		MPSS_SAY("pas %u: %s invalid 32-bit ELF\n", pas, path);
++		kfree_data(mdt, mlen);
++		return -1;
++	}
++	struct elf_phdr32 ph[64];
++	memcpy(ph, mdt + phoff, 32u * phnum);
++	int hash = -1;
++	bool reloc = false;
++	uint64_t lo = ~0ULL;
++	for (uint32_t i = 0; i < phnum; i++) {
++		if (((ph[i].flags >> 24) & 7u) == 2u) {
++			hash = (int)i;
++		}
++		if (ph[i].type == 1u && ph[i].memsz != 0u && (ph[i].flags & (1u << 27))) {
++			reloc = true;
++			if (ph[i].paddr < lo) {
++				lo = ph[i].paddr;
++			}
++		}
++	}
++	if (hash < 0 || ph[hash].filesz == 0u || ph[hash].filesz > 1024u * 1024u) {
++		MPSS_SAY("pas %u: no valid hash segment\n", pas);
++		kfree_data(mdt, mlen);
++		return -1;
++	}
++	/* Validate every segment before calling TrustZone */
++	for (uint32_t i = 0; i < phnum; i++) {
++		if (ph[i].type != 1u || (int)i == hash || ph[i].memsz == 0u) {
++			continue;
++		}
++		uint64_t pa = (!is_modem && (ph[i].flags & (1u << 27))) ? rpa + (ph[i].paddr - lo) : (uint64_t)ph[i].paddr;
++		if (pa < rpa || ph[i].filesz > ph[i].memsz || pa + ph[i].memsz > rpa + rsize || (pa & 3ULL)) {
++			MPSS_SAY("pas %u: segment %u at %#llx+%#x outside %#llx+%#llx\n", pas, i,
++			    (unsigned long long)pa, ph[i].memsz, (unsigned long long)rpa, (unsigned long long)rsize);
++			kfree_data(mdt, mlen);
++			return -1;
++		}
++	}
++
++	size_t ehsz = (size_t)phoff + 32u * phnum;
++	size_t meta_len = ehsz + ph[hash].filesz;
++	vm_size_t meta_alloc = round_page(meta_len);
++	vm_offset_t meta_va = 0;
++	if (kmem_alloc_contig(kernel_map, &meta_va, meta_alloc, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		MPSS_SAY("pas %u: meta contig alloc (%zu) failed\n", pas, meta_len);
++		kfree_data(mdt, mlen);
++		return -1;
++	}
++	ppnum_t meta_pn = pmap_find_phys(kernel_pmap, (addr64_t)meta_va);
++	if (meta_pn == 0) {
++		kmem_free(kernel_map, meta_va, meta_alloc);
++		kfree_data(mdt, mlen);
++		return -1;
++	}
++	uint64_t meta_pa = ptoa_64(meta_pn);
++	memcpy((void *)meta_va, mdt, ehsz);
++	if ((uint64_t)ph[hash].offset + ph[hash].filesz <= mlen) {
++		memcpy((uint8_t *)meta_va + ehsz, mdt + ph[hash].offset, ph[hash].filesz);
++	} else {
++		size_t hl = 0;
++		snprintf(path, sizeof(path), "%s/%s.b%02d", dir, name, hash);
++		uint8_t *hb = vfs_slurp(path, ph[hash].filesz + 4096u, &hl);
++		if (hb == NULL || hl < ph[hash].filesz) {
++			MPSS_SAY("pas %u: missing/short hash %s\n", pas, path);
++			if (hb != NULL) {
++				kfree_data(hb, hl);
++			}
++			kmem_free(kernel_map, meta_va, meta_alloc);
++			kfree_data(mdt, mlen);
++			return -1;
++		}
++		memcpy((uint8_t *)meta_va + ehsz, hb, ph[hash].filesz);
++		kfree_data(hb, hl);
++	}
++	kfree_data(mdt, mlen);
++	flush_dcache64((addr64_t)meta_pa, (unsigned)meta_alloc, TRUE);
++
++	uint64_t r1 = 0;
++	int64_t rc = pas_scm(1u, 2ULL | (2ULL << 6), pas, meta_pa, 0, &r1);
++	MPSS_SAY("pas %u: init image (%zu B meta at %#llx) -> %lld/%#llx\n", pas, meta_len,
++	    (unsigned long long)meta_pa, (long long)rc, (unsigned long long)r1);
++	if (rc != 0 || r1 != 0) {
++		kmem_free(kernel_map, meta_va, meta_alloc);
++		return -1;
++	}
++	if (reloc || is_modem) {
++		rc = pas_scm(2u, 3ULL, pas, rpa, rsize, &r1);
++		MPSS_SAY("pas %u: mem setup %#llx+%#llx -> %lld/%#llx\n", pas,
++		    (unsigned long long)rpa, (unsigned long long)rsize, (long long)rc, (unsigned long long)r1);
++		if (rc != 0 || r1 != 0) {
++			kmem_free(kernel_map, meta_va, meta_alloc);
++			return -1;
++		}
++	}
++
++	uint8_t *bounce = kalloc_data(SEG_BOUNCE_SIZE, Z_WAITOK);
++	if (bounce == NULL) {
++		MPSS_SAY("pas %u: bounce alloc failed\n", pas);
++		kmem_free(kernel_map, meta_va, meta_alloc);
++		return -1;
++	}
++	struct co_win cm = { 0, 0 };
++	uint64_t tot = 0;
++	vfs_context_t ctx = vfs_context_kernel();
++	for (uint32_t i = 0; i < phnum; i++) {
++		if (ph[i].type != 1u || (int)i == hash || ph[i].memsz == 0u) {
++			continue;
++		}
++		uint64_t pa = (!is_modem && (ph[i].flags & (1u << 27))) ? rpa + (ph[i].paddr - lo) : (uint64_t)ph[i].paddr;
++		uint32_t fsz = ph[i].filesz;
++		uint32_t msz = ph[i].memsz;
++		if (fsz != 0u) {
++			vnode_t vp = NULLVP;
++			struct vnode_attr va;
++			snprintf(path, sizeof(path), "%s/%s.b%02u", dir, name, i);
++			if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++				MPSS_SAY("pas %u: missing %s\n", pas, path);
++				goto seg_fail;
++			}
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_data_size);
++			if (vnode_getattr(vp, &va, ctx) != 0 || va.va_data_size < fsz) {
++				MPSS_SAY("pas %u: short %s\n", pas, path);
++				vnode_put(vp);
++				goto seg_fail;
++			}
++			uint32_t foff = 0;
++			while (foff < fsz) {
++				uint32_t chunk = fsz - foff;
++				if (chunk > SEG_BOUNCE_SIZE) {
++					chunk = SEG_BOUNCE_SIZE;
++				}
++				/* Align intermediate chunks to 4 bytes; last chunk may have 1..3 tail bytes */
++				if (foff + chunk < fsz) {
++					chunk &= ~3u;
++				}
++				int resid = 0;
++				int err = vn_rdwr(UIO_READ, vp, (caddr_t)bounce, (int)chunk, (off_t)foff, UIO_SYSSPACE, 0,
++				    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++				if (err != 0 || resid != 0) {
++					MPSS_SAY("pas %u: read error %d on %s\n", pas, err, path);
++					vnode_put(vp);
++					goto seg_fail;
++				}
++				uint32_t pad = (chunk + 3u) & ~3u;
++				if (co_write_words(&cm, pa + foff, bounce, chunk, pad) != 0) {
++					vnode_put(vp);
++					goto seg_fail;
++				}
++				foff += chunk;
++			}
++			vnode_put(vp);
++			tot += fsz;
++		}
++		uint32_t z_off = (fsz + 3u) & ~3u;
++		uint32_t z_end = (msz + 3u) & ~3u;
++		if (z_off < z_end) {
++			if (co_write_words(&cm, pa + z_off, NULL, 0u, z_end - z_off) != 0) {
++				goto seg_fail;
++			}
++		}
++	}
++	co_close(&cm);
++	kfree_data(bounce, SEG_BOUNCE_SIZE);
++	MPSS_SAY("pas %u: %llu bytes loaded\n", pas, (unsigned long long)tot);
++	if (bytes_out != NULL) {
++		*bytes_out = tot;
++	}
++
++	if (is_modem) {
++		MPSS_SAY("pas %u: segments loaded, sending QMP load_state\n", pas);
++		(void)qmp_send("{class: image, res: load_state, name: modem, val: on}");
++		vm_offset_t ve = 0;
++		if (smp2p_in_entry("slave-kernel", &ve) == 0) {
++			wr32(ve, 0u);
++			settle();
++		}
++		smp2p_last_mdm = 0xffffffffu;
++	}
++	MPSS_SAY("pas %u: calling PAS_AUTH_AND_RESET\n", pas);
++	rc = pas_scm(5u, 1ULL, pas, 0, 0, &r1);
++	kmem_free(kernel_map, meta_va, meta_alloc);
++	MPSS_SAY("pas %u: auth and reset -> %lld/%#llx\n", pas, (long long)rc, (unsigned long long)r1);
++	return (rc != 0 || r1 != 0) ? -1 : 0;
++
++seg_fail:
++	co_close(&cm);
++	kfree_data(bounce, SEG_BOUNCE_SIZE);
++	kmem_free(kernel_map, meta_va, meta_alloc);
++	return -1;
++}
++
++/* ---- Apps SMMU identity CB for IPA streams 0x520 (AP) / 0x522 (uC) ---- */
++
++static int
++smmu_stream_identity(vm_offset_t gr0, uint32_t sid, uint32_t smask, const char *label)
++{
++	uint32_t id0 = rd32(gr0 + 0x20), id1 = rd32(gr0 + 0x24);
++	uint32_t nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++	uint32_t psize = (id1 >> 31) ? 0x10000u : 0x1000u;
++	uint32_t npage = 1u << (((id1 >> 28) & 7u) + 1u);
++	if (nsmr > 128u || ncb > 256u || (uint64_t)(npage + ncb) * psize > SMMU_SIZE) {
++		MPSS_SAY("smmu: unexpected ID0 %#x ID1 %#x\n", id0, id1);
++		return -1;
++	}
++	vm_offset_t gr1 = gr0 + psize;
++
++	uint64_t used[4] = { 0, 0, 0, 0 };
++	int slot = -1, cb = -1;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = rd32(gr0 + 0x800u + 4u * i);
++		uint32_t s2cr = rd32(gr0 + 0xc00u + 4u * i);
++		if (!(smr >> 31)) {
++			if (slot < 0) {
++				slot = (int)i;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3u) == 0u) {
++			uint32_t c = s2cr & 0xffu;
++			used[c / 64u] |= 1ULL << (c % 64u);
++		}
++		uint32_t id = smr & 0x7fffu, m = (smr >> 16) & 0x7fffu;
++		if (((id ^ sid) & ~(m | smask) & 0x7fffu) == 0u) {
++			uint32_t c = s2cr & 0xffu;
++			vm_offset_t cbp = gr0 + (vm_offset_t)((uint64_t)(npage + c) * psize);
++			bool ok = ((s2cr >> 16) & 3u) == 0u && !(rd32(cbp) & 1u);
++			MPSS_SAY("smmu: %s %#x already mapped -> CB%u (ok=%d)\n", label, sid, c, ok ? 1 : 0);
++			return ok ? 0 : -1;
++		}
++	}
++	if (slot < 0) {
++		MPSS_SAY("smmu: no free SMR for %s %#x\n", label, sid);
++		return -1;
++	}
++
++	vm_offset_t cbp = 0;
++	for (uint32_t c = 0; c < ncb; c++) {
++		if ((used[c / 64u] & (1ULL << (c % 64u))) || rd32(gr1 + 4u * c) != 0u) {
++			continue;
++		}
++		vm_offset_t p = gr0 + (vm_offset_t)((uint64_t)(npage + c) * psize);
++		if (!(rd32(p) & 1u)) {
++			cb = (int)c;
++			cbp = p;
++			break;
++		}
++	}
++	if (cb < 0 || cbp == 0) {
++		MPSS_SAY("smmu: no free CB for %s %#x\n", label, sid);
++		return -1;
++	}
++	wr32(cbp + 0x58, 0xffffffffu);
++	wr32(cbp + 0x20, 0u);
++	wr32(cbp + 0x24, 0u);
++	wr32(cbp + 0x30, 0u);
++	wr32(cbp + 0x10, 0u);
++	wr32(cbp + 0x38, 0u);
++	wr32(cbp + 0x3c, 0u);
++	wr32(gr1 + 0x800u + 4u * (uint32_t)cb, CB_CBA2R);
++	wr32(gr1 + 4u * (uint32_t)cb, CB_CBAR);
++	wr32(cbp, CB_SCTLR);
++	wr32(gr0 + 0xc00u + 4u * (uint32_t)slot, (uint32_t)cb);
++	wr32(gr0 + 0x800u + 4u * (uint32_t)slot, (1u << 31) | ((smask & 0x7fffu) << 16) | (sid & 0x7fffu));
++	settle();
++	wr32(gr0 + 0x70, 0u);
++	for (unsigned i = 0; i < 1000u && (rd32(gr0 + 0x74) & 1u); i++) {
++		delay(1000);
++	}
++	uint32_t smr = rd32(gr0 + 0x800u + 4u * (uint32_t)slot);
++	uint32_t s2cr = rd32(gr0 + 0xc00u + 4u * (uint32_t)slot);
++	bool ok = (smr >> 31) && ((s2cr >> 16) & 3u) == 0u && (s2cr & 0xffu) == (uint32_t)cb;
++	MPSS_SAY("smmu: %s %#x/%#x -> CB%d via SMR%d (SMR %08x S2CR %08x CBAR %08x SCTLR %08x) -> %s\n",
++	    label, sid, smask, cb, slot, smr, s2cr, rd32(gr1 + 4u * (uint32_t)cb), rd32(cbp), ok ? "ok" : "FAIL");
++	return ok ? 0 : -1;
++}
++
++static int
++ipa_smmu_setup(void)
++{
++	vm_offset_t ipa_va = ml_io_map_unmappable((vm_offset_t)IPA_REG_PA, PAGE_SIZE, VM_WIMG_IO);
++	if (ipa_va == 0) {
++		return -1;
++	}
++	uint32_t hwv = rd32(ipa_va + IPA_COMP_HW_VERSION);
++	ml_io_unmap(ipa_va, PAGE_SIZE);
++	if (hwv != 0x40070000u) {
++		MPSS_SAY("ipa_smmu: COMP_HW_VERSION %#010x != 0x40070000\n", hwv);
++		return -1;
++	}
++	vm_offset_t smmu_va = ml_io_map_unmappable((vm_offset_t)SMMU_PA, SMMU_SIZE, VM_WIMG_IO);
++	if (smmu_va == 0) {
++		return -1;
++	}
++	int rc = (smmu_stream_identity(smmu_va, IPA_SID_AP, 0u, "IPA-AP") == 0 &&
++	          smmu_stream_identity(smmu_va, IPA_SID_UC, 0u, "IPA-uC") == 0) ? 0 : -1;
++	ml_io_unmap(smmu_va, SMMU_SIZE);
++	return rc;
++}
++
++/* ---- Main Phase 1 Bring-Up Thread ---- */
++
++static int
++boot_sequence(void)
++{
++	uint64_t t0 = sbb_ms();
++
++	/* 1. Outbound SMP2P item 428 ("master-kernel") */
++	if (smp2p_create() != 0) {
++		return -1;
++	}
++
++	/* 2. Power votes: top levels of cx.lvl and mss.lvl */
++	uint32_t top_cx = 0, top_mss = 0;
++	if (sweet_rpmh_arc_top("cx.lvl", &top_cx) != 0 || sweet_rpmh_arc_top("mss.lvl", &top_mss) != 0) {
++		MPSS_SAY("cmd-db lookup failed for cx.lvl/mss.lvl\n");
++		return -2;
++	}
++	vote_cx = top_cx;
++	vote_mss = top_mss;
++	uint32_t off0 = 0;
++	if (rpmh_write_retry("cx.lvl", 1, &off0, &top_cx) != 0 ||
++	    rpmh_write_retry("mss.lvl", 1, &off0, &top_mss) != 0) {
++		MPSS_SAY("RPMh cx.lvl/mss.lvl vote failed\n");
++		return -2;
++	}
++	MPSS_SAY("voted cx.lvl[%u] mss.lvl[%u]\n", top_cx, top_mss);
++
++	/* 3. PAS load MPSS */
++	if (pas_load(PAS_MODEM, FW_MODEM_DIR, "modem", MPSS_PA, MPSS_SIZE, true, &mpss_bytes) != 0) {
++		return -3;
++	}
++
++	/* 4. Wait for SMP2P in "slave-kernel" ready (bit 1, not bit 0) */
++	bool ready = false;
++	for (unsigned i = 0; i < 600; i++) {
++		uint32_t v = 0;
++		smp2p_service();
++		if (smp2p_in_value("slave-kernel", &v) == 0 && (v & 2u) && !(v & 1u)) {
++			MPSS_SAY("modem ready after %u ms\n", i * 50u);
++			ready = true;
++			break;
++		}
++		sleep_ms(50);
++	}
++	if (!ready) {
++		MPSS_SAY("modem did not reach SMP2P ready in 30 s (last=%#x)\n", smp2p_last_mdm);
++		return -4;
++	}
++	mdm_boot_state = 2;
++
++	/* 5. Bring up GLINK / QRTR IPCRTR channel */
++	int le = ENXIO;
++	for (unsigned t = 0; t < 10; t++) {
++		le = sbb_link_up_now(10000, "sweetmpss boot");
++		if (le == 0) {
++			break;
++		}
++		sleep_ms(100);
++	}
++	if (le != 0) {
++		MPSS_SAY("GLINK/QRTR link up failed (%d)\n", le);
++		return -5;
++	}
++
++	/* 6. Autonomous IPA v4.7 bring-up when SBB_DATA (0x10) is set */
++	if (sweet_bb & SBB_DATA) {
++		char ipa_mdt[96];
++		snprintf(ipa_mdt, sizeof(ipa_mdt), "%s/ipa_fws.mdt", FW_IPA_DIR);
++		if (!vfs_exists(ipa_mdt)) {
++			MPSS_SAY("no %s: skipping autonomous IPA bring-up\n", ipa_mdt);
++			goto done;
++		}
++		uint32_t ip0_val = (1u << 30) | (1u << 29) | 0x3fffu;
++		if (rpmh_write_retry("IP0", 1, &off0, &ip0_val) != 0) {
++			MPSS_SAY("IP0 vote failed\n");
++			return -6;
++		}
++		if (pas_load(PAS_IPA, FW_IPA_DIR, "ipa_fws", IPA_FW_PA, IPA_FW_SIZE, false, &ipa_bytes) != 0) {
++			MPSS_SAY("ipa_fws PAS load failed\n");
++			return -6;
++		}
++		ipa_fws_ok = true;
++		if (ipa_smmu_setup() != 0) {
++			MPSS_SAY("IPA SMMU setup failed\n");
++			return -6;
++		}
++		ipa_smmu_ok = true;
++		if (sweet_ipa_boot(1) != 0) {
++			MPSS_SAY("sweet_ipa_boot(1) failed\n");
++			return -6;
++		}
++		if (smp2p_set_out("ipa", 3u) != 0) {
++			MPSS_SAY("SMP2P \"ipa\"=3 failed\n");
++			return -6;
++		}
++		if (sweet_ipa_boot(2) != 0) {
++			MPSS_SAY("sweet_ipa_boot(2) failed\n");
++			return -6;
++		}
++		for (unsigned i = 0; i < 300; i++) {
++			int st = 0, drv = 0;
++			smp2p_service();
++			sweet_ipa_status(&st, &drv);
++			ipa_last_st = st;
++			ipa_last_drv = drv;
++			if (st == 3) {
++				ipa_ready_ok = true;
++				MPSS_SAY("autonomous IPA ready (state 3, drv %d, %u ms)\n", drv, i * 100u);
++				break;
++			}
++			if (st < 0 || drv < 0) {
++				MPSS_SAY("autonomous IPA QMI failed (st %d, drv %d)\n", st, drv);
++				return -6;
++			}
++			sleep_ms(100);
++		}
++		if (!ipa_ready_ok) {
++			MPSS_SAY("autonomous IPA timed out waiting for state 3 (st %d, drv %d)\n", ipa_last_st, ipa_last_drv);
++			return -6;
++		}
++	}
++
++done:
++	boot_ms = sbb_ms() - t0;
++	mdm_boot_state = 3;
++	MPSS_SAY("boot complete in %llu ms (mdm_boot=3, ipa_ready=%d)\n", (unsigned long long)boot_ms, ipa_ready_ok ? 1 : 0);
++	return 3;
++}
++
++static void
++mpss_thread(__unused void *param, __unused wait_result_t wr)
++{
++	char mdt_path[96];
++	snprintf(mdt_path, sizeof(mdt_path), "%s/modem.mdt", FW_MODEM_DIR);
++	MPSS_SAY("thread up: waiting for %s\n", mdt_path);
++	mdm_boot_state = 1;
++
++	bool fw_seen = false;
++	for (unsigned i = 0; i < 480; i++) {
++		if (vfs_exists(MPSS_OFF_FLAG)) {
++			MPSS_SAY("%s present: kernel modem boot skipped\n", MPSS_OFF_FLAG);
++			mdm_boot_state = 0;
++			return;
++		}
++		if (vfs_exists(mdt_path)) {
++			fw_seen = true;
++			break;
++		}
++		sleep_ms(250);
++	}
++	if (!fw_seen) {
++		MPSS_SAY("timed out (120 s) waiting for %s\n", mdt_path);
++		mdm_boot_state = -1;
++		return;
++	}
++
++	int rc = boot_sequence();
++	if (rc < 0) {
++		mdm_boot_state = rc;
++	}
++
++	for (;;) {
++		smp2p_service();
++		sleep_ms(250);
++	}
++}
++
++void
++sweet_mpss_init(void)
++{
++	thread_t th;
++	if (kernel_thread_start(mpss_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		mdm_boot_state = -1;
++		MPSS_SAY("failed to start worker thread\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_qmux.c b/bsd/dev/sweet_qmux.c
+--- a/bsd/dev/sweet_qmux.c
++++ b/bsd/dev/sweet_qmux.c
+@@ -5944,6 +5944,15 @@
+ 		printf("SWEET QMUX: no memory for the router (%lu bytes): off\n", (unsigned long)sizeof(*B));
+ 		return;
+ 	}
++	if (sweet_bb & SBB_BOOT) {
++		/* Phase 1: CommCenter starts before sweet-sysctl.sh (~95s); arm mode-4 PLMN withhold before early BSP. */
++		if (repub_mode == 0) {
++			repub_mode = 4;
++		}
++		if (repub_ms == 20) {
++			repub_ms = 3000;
++		}
++	}
+ 	vauto_tc = thread_call_allocate_with_options(vauto_call, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);  /* 1074 */
+ 	if (sweet_bb & SBB_DATA) {      /* 1080: the data section's state (active only with kern.sweet_qmi_rules 1) */
+ 		D = kalloc_data(sizeof(*D), Z_WAITOK | Z_ZERO);
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1073,4 +1073,55 @@
+ 	int error = rh_ro_ready();
+ 	return error ? error : rh_ro_walk(res, 0, address, NULL, 0);
+ }
++
++int sweet_rpmh_arc_top(const char *res, uint32_t *top_out);
++int
++sweet_rpmh_arc_top(const char *res, uint32_t *top_out)
++{
++	if (!res || !top_out) {
++		return EINVAL;
++	}
++	int error = rh_ro_ready();
++	if (error) {
++		return error;
++	}
++	uint32_t key[2] = { 0, 0 };
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave != RH_ARC || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			continue;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint16_t len = rh_db16(e + 20);
++			uint16_t off = rh_db16(e + 22);
++			if (len < 2 || !rh_range(aux + off, len)) {
++				return EINVAL;
++			}
++			uint32_t top = 0;
++			for (unsigned k = 0; k < (unsigned)len / 2u; ++k) {
++				if (rh_db16(aux + off + 2u * k) != 0) {
++					top = k;
++				}
++			}
++			*top_out = top;
++			return 0;
++		}
++	}
++	return ENODEV;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
